@@ -539,7 +539,7 @@ private:
         // the tier opens at its normal size before anything else takes the card; the workspaces size to what is left
         ExpertTier* t = ops_->expert_tier(e);
         if (!t || prefill_) return;
-        short_prompt_ = t->has_homes() && n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
+        short_prompt_ = n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
         if (!short_prompt_) t->shrink();
     }
     void settle_tier() {

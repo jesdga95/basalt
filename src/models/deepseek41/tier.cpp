@@ -140,8 +140,9 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         ram_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
     if (homes_.peer == 0) peer_.reset();
 
-    reserve_ = homes_.main > 0 ? reserve.beside_homes : reserve.copies;
-    modules_ = homes_.main > 0 ? reserve.modules : 0;
+    // the base arena (homes, or copies a long prompt borrows) leaves its reserve free; grow() fills it beside a short prompt
+    reserve_ = reserve.beside_homes;
+    modules_ = reserve.modules;
     per_layer_ = homes_.main > 0 ? homes_.main : copies;
     if (homes_.main == 0 && per_layer_ < g.n_used) {
         err = "deepseek41: not enough device memory for the expert tier";
@@ -192,12 +193,9 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     pool_ = std::make_unique<kernels::cpu::ExpertPool>(workers, m_.tiers().pool_affinity_given ? m_.tiers().pool_affinity : kernels::cpu::PoolAffinity::All);
 
     if (!load_ram(err)) return false;
-    if (homes_.main > 0) {
-        grow();
-    } else {
-        seed_copies(0, per_layer_);
-        promoted_ = 0;
-    }
+    if (homes_.main == 0) seed_copies(per_layer_);
+    promoted_ = 0;
+    grow();
     // what the start picked by itself, on the server's auto line; the RAM floor the tier left free
     std::printf("auto flags: resident %.1f GB, pool-workers %d\n",
                 (double) one_each_ram * cover_ / 1e9, pool_->workers());   // the server keeps the words after the name
@@ -206,7 +204,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
                       (double) avail / 1073741824.0);
     if (peer_) basalt::log::info("basalt deepseek41", "peer GPU %d: %lld experts", peer_->device(), (long long) n_layers_ * homes_.peer);
     basalt::log::info("basalt deepseek41", "expert homes of %d per layer: main card %d, second card %d, RAM %d, file %d; main card copies %lld",
-                 n_expert_, homes_.main, homes_.peer, homes_.ram, homes_.file, (long long) (homes_.main > 0 ? ext_per_layer_ : per_layer_));
+                 n_expert_, homes_.main, homes_.peer, homes_.ram, homes_.file, (long long) (per_layer_ + ext_per_layer_ - homes_.main));
     program::warn_spill(spill(), peer_ ? "" : ", or --gpu 0,1");
     basalt::log::info("basalt deepseek41", "VRAM expert tier %.2f GiB, %lld of %d experts per layer (%.0f%%); CPU pool %d workers",
                  cache_.gib(), (long long) per_layer_, n_expert_, 100.0 * (double) per_layer_ / n_expert_, pool_->workers());
@@ -435,12 +433,12 @@ bool ExpertTier::load_rank(std::string& err) {
     return true;
 }
 
-// Copies the most routed RAM tier experts from rank `first_rank` on into `n` slots of each layer.
-void ExpertTier::seed_copies(int first_rank, int64_t n) {
+// Copies the most routed RAM tier experts the main card does not hold yet into `n` slots of each layer.
+void ExpertTier::seed_copies(int64_t n) {
     for (int l = 0; l < n_layers_; ++l) {
-        for (int64_t r = first_rank, placed = 0; r < n_expert_ && placed < n; ++r) {
+        for (int64_t r = 0, placed = 0; r < n_expert_ && placed < n; ++r) {
             const int e = ranked(l, (int) r);
-            if (!pinned(l, e)) continue;
+            if (!pinned(l, e) || res_[(size_t) l * n_expert_ + e] >= 0) continue;
             ++tick_;
             if (claim(l, e, blob_of(l, e), copy_stream_) < 0) {
                 cudaStreamSynchronize(copy_stream_);
@@ -907,12 +905,10 @@ void ExpertTier::grow() {
     busy_.resize((size_t) slot_total(), 0);
     basalt::log::info("basalt deepseek41", "VRAM expert tier %lld of %d experts per layer (%lld beside the prompt workspaces)",
                  (long long) (per_layer_ + n), n_expert_, (long long) per_layer_);
-    if (homes_.main > 0) {
-        cudaDeviceSynchronize();   // the arena's zeroing is not ordered against the copy stream
-        const int64_t promoted = promoted_;
-        seed_copies(homes_.main + homes_.peer, n);
-        promoted_ = promoted;
-    }
+    cudaDeviceSynchronize();   // the arena's zeroing is not ordered against the copy stream
+    const int64_t promoted = promoted_;
+    seed_copies(n);
+    promoted_ = promoted;
 }
 
 void ExpertTier::set_free_floor(int64_t mib) { free_floor_ = mib < 0 ? start_floor_ : (uint64_t) mib << 20; }
