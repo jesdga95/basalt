@@ -13,10 +13,12 @@
 
 namespace basalt::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest quantized activation any native layer uses (5120 values as Q8_K: 20 x 292).
+inline constexpr size_t kNativeActBytes = 6144;
+/// The widest expert intermediate a native layer may have (the float buffers between gate/up and down).
+inline constexpr int kNativeMaxFF = 2304;
+/// Bytes of the largest quantized down activation (2304 values as Q8_K: 9 x 292, or Q8_0 72 x 34).
+inline constexpr size_t kNativeHBytes = 3072;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
@@ -28,12 +30,13 @@ struct NativeFmt {
     size_t bytes = 0;                   ///< the whole blob
     size_t tail = 0;                    ///< NVFP4: the blob's last 16 bytes, FP32 {s_gate, s_up, s_down, 0}
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
+    float swiglu_limit = 0.f;           ///< > 0: gate capped at it and up clamped to +-it before the product
 };
 
-/// Whether this build has the ggml dot-product path.
-bool native_experts_available() noexcept;
-/// Fills `f` for a layer; false (with a reason) when there is no dot product for a type.
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+/// Fills `f` for a layer (`swiglu_limit`: the model's SwiGLU limit, 0 for none); false (with a reason) when there is no
+/// dot product for a type.
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
+                float swiglu_limit = 0.f);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);

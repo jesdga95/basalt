@@ -98,7 +98,7 @@ bool Runtime::try_next_line(std::string& out) {
 
 int Runtime::init_protocol() {
 
-    text_tokenizer_note = "this pack has no qwen35 tokenizer tables";
+    text_tokenizer_note = "this pack has no tokenizer tables this engine can read";
     {
         std::vector<uint8_t> vj, mj, tj, cj;
         std::string terr;
@@ -106,7 +106,8 @@ int Runtime::init_protocol() {
             basalt::core::read_range(model_file.range("tokenizer/merges.txt"), mj, terr) &&
             basalt::core::read_range(model_file.range("tokenizer/token_type.json"), tj, terr) &&
             basalt::core::read_range(model_file.range("tokenizer/tokenizer.json"), cj, terr) &&
-            std::string_view((const char*) cj.data(), cj.size()).find("\"pre\": \"qwen35\"") != std::string_view::npos) {
+            std::string_view((const char*) cj.data(), cj.size()).find("\"pre\": \"" + std::string(pre_.name) + "\"") != std::string_view::npos) {
+            text_tokenizer.set_pretokenize(pre_.split);
             if (text_tokenizer.load(std::string_view((const char*) vj.data(), vj.size()),
                                     std::string_view((const char*) mj.data(), mj.size()),
                                     std::string_view((const char*) tj.data(), tj.size()), terr))
@@ -236,7 +237,7 @@ int Runtime::init_protocol() {
     // ends on an error instead of a cancel
     ram_stop.store(false);
 
-    sp.should_stop = [&] { return halted(); };
+    after_input_start();
     {
         // what is left once everything is allocated: a GPU filled to the brim may not fail but page, and a page-in
         // while the verify graph spins on a host flag stalls the request for good
@@ -254,56 +255,11 @@ int Runtime::init_protocol() {
 }
 
 int Runtime::announce() {
-    // what the server's Monitor tab shows (the server skips unknown lines until READY)
+    print_info();
     {
-        size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
-        // "Experts in VRAM" is every stage's cache, not one card's.  The caches hold disjoint pairs, so they add.
-        const int64_t slots_primary = (int64_t) xcache.slots();
-        const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);
-        int64_t slots_all = slots_primary, mib_all = mib_primary;
-        for (const auto& st : stages) {
-            slots_all += (int64_t) st->cache.slots();
-            mib_all += (int64_t) (st->cache.bytes() >> 20);
-        }
-        // the pack's quantization label (the last word of its name, without the publisher's prefixes) and the PCI
-        // bus ids of the cards this engine computes on, primary first: what a benchmark row records
-        std::string quant_label, gpu_ids;
-        {
-            const basalt::core::Json* nm = model_file.meta().get("name");
-            std::string nmv = nm != nullptr && nm->is_string() ? nm->s : std::string();
-            quant_label = nmv.substr(nmv.rfind(' ') == std::string::npos ? 0 : nmv.rfind(' ') + 1);
-            for (const char* pre : {"NVIDIA-", "UD-"})
-                if (quant_label.rfind(pre, 0) == 0) quant_label.erase(0, std::strlen(pre));
-            if (quant_label.empty()) quant_label = "unknown";
-            for (int d : basalt::program::engine_gpu_order(o.peer_device, o.peer_devices,
-                                                           multi_gpu ? split_devs : std::vector<int>())) {
-                char bus[32] = {};
-                if (cudaDeviceGetPCIBusId(bus, sizeof bus, d) == cudaSuccess)
-                    gpu_ids += (gpu_ids.empty() ? "" : ",") + std::string(bus);
-            }
-        }
-        std::printf("INFO logit_bias=%lld context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
-                    "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
-                    "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                    "conversation_cache_mib=%lld conversation_cache_slots=%d "
-                    "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%d tail_role_token=%lld vram_elastic=%d%s quant=%s gpus=%s engine=" BASALT_VERSION "\n",
-                    (long long) n_vocab, (long long) o.max_context, o.kv.c_str(),
-                    (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
-                                     ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
-                    (long long) slots_all, (long long) mib_all,
-                    (long long) slots_primary, (long long) mib_primary,
-                    o.spec, o.mtp_max_t,
-                    o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
-                    (long long) ((o.mmap_experts ? src.resident_bytes() : basalt::kernels::cpu::expert_layout().total) >> 20),
-                    pool.workers(), o.pcie_frac,
-                    (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                    (long long) o.conversation_cache_min_free_mib, o.conversation_cache_min_tokens, (long long) o.tail_role_token, o.vram_elastic && xcache.segmented() ? 1 : 0,
-                    o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
-                                   " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                   " slot0_solo=" + std::to_string(slot0_is_solo ? 1 : 0) +
-                                   " solo_any_slot=" + std::to_string(slot0_is_solo ? 1 : 0)).c_str() : "",
-                    quant_label.c_str(), gpu_ids.c_str());
+        std::string ends;
+        for (const int64_t id : o.eos_ids) ends += (ends.empty() ? "" : ",") + std::to_string((long long) id);
+        std::printf("INFO eos_ids=%s\n", ends.c_str());
     }
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
     // a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on a flag nobody

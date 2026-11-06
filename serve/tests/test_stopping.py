@@ -1,5 +1,11 @@
 """Once shutdown has begun, a request still in flight does not start the engine again."""
 import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -43,7 +49,7 @@ class Stopping(unittest.TestCase):
         self.svc.stop()
         self.engine.close()
         req = urllib.request.Request(self.base + "/v1/chat/completions", method="POST",
-                                     data=json.dumps({"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "hi"}]}).encode(),
+                                     data=json.dumps({"model": "basalt", "messages": [{"role": "user", "content": "hi"}]}).encode(),
                                      headers={"Content-Type": "application/json"})
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(req, timeout=10)
@@ -51,10 +57,31 @@ class Stopping(unittest.TestCase):
             self.assertEqual(caught.exception.code, 503)
         self.assertEqual(self.engine.starts, 1)
 
+    @unittest.skipIf(os.name == "nt", "signals between processes")
+    def test_a_second_term_does_not_cut_the_stop_short(self):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        p = subprocess.Popen([sys.executable, "-m", "serve.server", "--mock-engine", "--port", str(port)], cwd=ROOT,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            for line in p.stdout:
+                if "[server] ready" in line:
+                    break
+            time.sleep(1)                               # the handler goes in just after this line
+            p.send_signal(signal.SIGTERM)
+            p.send_signal(signal.SIGTERM)
+            out, _ = p.communicate(timeout=30)
+        finally:
+            p.kill()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("[server] stopped", out)
+        self.assertNotIn("Traceback", out)
+
     def test_shutdown_stops_the_service_first(self):
         source = (ROOT / "serve/server.py").read_text()
-        closers = source[source.index("closers = ["):].split("\n", 1)[0]
-        self.assertLess(closers.index("svc.stop"), closers.index("engine"))
+        closers = source[source.index("closers = ["):]
+        self.assertLess(closers.index("router.stop"), closers.index("s.engine"))
 
 
 if __name__ == "__main__":

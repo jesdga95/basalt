@@ -10,6 +10,7 @@
 // how many tokens share the call; (3) the dot rows against a double reference (dequantize, then sum in double), whose
 // error is reported.  The fixture uses only the raw generator output, so it is the same on every standard library.
 // `--print` prints the hashes, `--bench` one in-cache thread's rate per format and token count.
+#include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"

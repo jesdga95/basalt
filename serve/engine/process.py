@@ -53,6 +53,8 @@ PP_SLACK = 3.0
 # for good (the engine sits idle, so no watchdog fires). Generous: a cold model load is not a hang. A process that
 # says nothing for this long is ended, and the next request starts it again.
 ENGINE_READY_S = 900.0
+QUIT_S = 20.0            # an engine's time to end after QUIT
+QUIT_DISK_S = 300.0      # ... with a disk tier: it writes the conversations it holds first
 ENGINE_REQUEST = re.compile(
     # "+ 12288 of 98179 read": a request cancelled during its prompt read
     r"prompt (?P<prompt>\d+) tokens = (?P<reused>\d+) reused \+ \d+(?: of \d+)? read in (?P<read>[\d.]+) ms "
@@ -138,7 +140,6 @@ def pump_lines(stream, sink) -> None:
 
 
 REQUEST_LINES = False    # --request-lines: echo the engine's per-request summary on stdout
-EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
 PENALTY_LAST_N_DEFAULT = 64  # the penalty window of a request that sets a penalty but no penalty_last_n
 
 
@@ -169,6 +170,7 @@ class ProcessEngine:
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
     takes_text = True                    # generate() accepts a PromptText (sent as GENT when the engine can tokenize)
     stderr_sink = None                   # callable(line): engine stderr when there is no log file
+    quit_s = QUIT_S
 
     # `last`: figures of the last DONE line; per thread with batch slots, since requests run concurrently.
     @property
@@ -218,6 +220,7 @@ class ProcessEngine:
                  env: dict | None = None, lazy: bool = False):
         self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again
         self.model_path = flag_value(args, "--model") or ""
+        self.quit_s = QUIT_DISK_S if (flag_value(args, "--conversation-cache-disk-mib") or "0") != "0" else QUIT_S
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         if "slot_cv" not in self.__dict__:               # restart() wakes waiters even when the start failed
@@ -229,7 +232,7 @@ class ProcessEngine:
             self.loading, self.load_status = False, {}
         self.asleep = False              # its GPU state suspended by the driver (sleep/wake)
         self.restore_s = 0.0             # the driver's part of the last wake
-        self.max_context = int(flag_value(args, "--max-context") or 4096)
+        self.max_context = int(flag_value(args, "--max-context") or 0)   # the engine's own at READY
         self.can_stop = False            # READY <ctx> stop
         self.last = {}
         self.slot_drafts = {}
@@ -264,7 +267,7 @@ class ProcessEngine:
         try:
             self.proc = lifeline.popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE if sink else self.log,
-                                       text=True, encoding="utf-8", bufsize=1, env=env)
+                                       text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
         except OSError as e:                            # missing or not executable: nothing started, so this is a start error
             loading.set()                               # the narrator stops and the log handle goes back
             if log:
@@ -494,6 +497,8 @@ class ProcessEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
+        if len(f) >= 13:                                  # decode lookups read from the expert file
+            self.last.update(file_reads=int(f[12]))
         if len(f) >= 15:                                  # prompt tokens actually read
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # experts read over PCIe
@@ -539,6 +544,10 @@ class ProcessEngine:
             self.asleep = False
             self._silent(why)
             raise EngineDied(why)
+
+    def eos_ids(self) -> set[int]:
+        """The ids the engine ends a reply on (INFO eos_ids=a,b)."""
+        return {int(i) for i in str(self.info.get("eos_ids") or "").split(",") if i}
 
     def _vram_command(self, command: str, timeout: float) -> dict:
         """Send a VRAM, SLEEP or WAKE command and read its VRAM line."""
@@ -1024,7 +1033,7 @@ class ProcessEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
+                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in self.eos_ids()):
                             self._carry_run(carry, first, last0, True)
                             return
                         self._carry_run(carry, first, last0, False)
@@ -1146,7 +1155,7 @@ class ProcessEngine:
                         # the slot holds the prompt and every token fed (all but the last)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         again = (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
-                                 and not (out and out[-1] in EOS_IDS))
+                                 and not (out and out[-1] in self.eos_ids()))
                         self._carry_run(carry, first, last0, not again)
                         if again:
                             # continue on the solo path
@@ -1391,7 +1400,7 @@ class ProcessEngine:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # the engine must see EOF before shutdown
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=self.quit_s)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=20)

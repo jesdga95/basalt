@@ -36,16 +36,6 @@
 
 namespace basalt::kernels::cpu {
 
-/// One expert evaluation.  `act` is SHARED and read-only across the whole batch - that sharing is the point
-/// of `s2_expert_vnni_q` and it is what saves 480 redundant activation conversions per token.
-struct ExpertJob {
-    const uint8_t* blob = nullptr;   ///< one expert's blob in the pack's layout
-    const ActQ* act = nullptr;       ///< the layer's quantized activation, shared
-    float* out = nullptr;            ///< H floats, written by exactly one worker
-    float weight = 1.0f;             ///< the router weight; applied by the HOST, not here
-    int slot = -1;                   ///< the job's index, for diagnostics
-};
-
 /// One expert for the `nt` tokens of a verify window that were routed to it.  Every token's output is bitwise the
 /// single-token job's.
 struct ExpertJobMulti {
@@ -97,20 +87,7 @@ public:
     int e_cores() const { return topo_.e_cores; }
     PoolAffinity affinity() const { return affinity_; }
 
-    /// Publish `n` jobs, then block until every one has completed.
-    /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
-    void run(ExpertJob* jobs, int n);
-
-    /// The same outputs as `run`, bitwise, with every expert split by rows across all threads (gate/up rows, then the
-    /// intermediate's quantization, then down rows).  With fewer experts than threads - the case once the VRAM tier
-    /// takes half of them - `run` leaves cores idle and each expert streams at one core's bandwidth; this streams every
-    /// expert at all of them.  At most `kMaxSplit` experts.
-    void run_split(ExpertJob* jobs, int n);
-    static constexpr int kMaxSplit = 16;
-    /// `run_split` for multi-token jobs (at most `kMaxSplitMulti`); the rows of each expert are read once for all of
-    /// its tokens.
-    void run_split_multi(ExpertJobMulti* jobs, int n);
-    /// the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
+    /// A native pack's layer (ggml-cpu arithmetic, `nact` activations): every expert split by rows across all threads.
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
     /// Row-range tasks per thread in each phase of the multi-token paths.  The cores differ in speed, so a thread
@@ -124,7 +101,7 @@ public:
     using IdleFn = void (*)(void* ctx, int worker, int workers, const std::atomic<bool>& stop);
     void idle_start(IdleFn fn, void* ctx);
     void idle_stop();
-    /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
+    /// The native batches' time shared out by bytes, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
 
@@ -150,7 +127,7 @@ public:
 
 private:
     void worker(int id);
-    void drain(int id, ExpertScratch& scratch, uint32_t epoch);
+    void drain(int id, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
     /// Rows [r0, r1) of expert `e` of the native batch: gate/up with SwiGLU into the split buffer, the intermediate's
     /// quantization, and the down projection into the job's outputs.
@@ -174,11 +151,6 @@ private:
     int n_ = 0;
     /// Workers with id < active_ take work; written only while every worker is parked, before the next publish.
     std::atomic<int> active_{0};
-    ExpertJob* jobs_ = nullptr;
-    int njobs_ = 0;
-    /// The host's own scratch .  A separate object rather than a share of `scratch_[i]`,
-    /// because a worker may own any index and the two must not be able to collide.
-    ExpertScratch host_scratch_;
     // ---- EACH ATOMIC GETS ITS OWN CACHE LINE.
     //
     // `head_`, `done_`, `parked_` and `epoch_` are the four that workers and the host contend on; sharing a cache
@@ -205,26 +177,16 @@ private:
     std::condition_variable sleep_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
     std::vector<std::thread> threads_;
-    std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // idle work (mode 7): one job per worker index
     IdleFn idle_fn_ = nullptr;
     void* idle_ctx_ = nullptr;
     bool idle_live_ = false;
     alignas(64) std::atomic<bool> idle_halt_{false};
-    // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
-    int mode_ = 0;
-    int parts_a_ = 1, parts_b_ = 1;
-    struct SplitBuf {
-        alignas(64) float ff[FF];
-        ActQ a2;
-    };
-    std::vector<SplitBuf> split_;
-    // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts (mode 8, the native path, is below)
+    int njobs_ = 0;
+    int mode_ = 0;   // 7 idle work, 8 the native batch
     ExpertJobMulti* mjobs_ = nullptr;
-    int64_t mrows_ = 0;   // rows of the current multi phase across all its experts (n * FF, then n * H)
-    int mtasks_ = 1;   // equal row ranges the phase is cut into
     struct SplitBufMulti {
-        alignas(64) float ff[MAXT][FF];
+        alignas(64) float ff[MAXT][kNativeMaxFF];
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // native down activations
     };

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts model, built for NVIDIA Blackwell (sm_120) on Linux and Windows x64. It runs on an NVIDIA Blackwell GPU, optionally with a second GPU as a peer expert tier, and system RAM holding the rest. It is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
+Basalt is a local inference engine for mixture-of-experts models, built for NVIDIA Blackwell (sm_120) on Linux and Windows x64. It runs Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash on an NVIDIA Blackwell GPU, optionally with more GPUs as peer expert tiers (up to three for Flash-Next, one for DeepSeek), and system RAM holding the rest. It is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, each model's own code under `src/models/<model>`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
 
 ## Working rules
 
@@ -13,6 +13,7 @@ Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts
 - **Don't push or publish anywhere** (GitHub, HF, any remote) without the maintainer's approval.
 - **Don't write tools nobody asked for.**
 - **No shims for removed things.** A removed or renamed flag, option, field or code path is simply gone: no alias, no fallback, no "was retired" message or list. The normal unknown-flag error covers it.
+- **A new model never regresses another.** Model code stays in its folder; shared code names no model (`tools/check_model_layering.sh`); see `docs/adding-a-model.md`.
 - **Linux and Windows are both supported; Linux is where we test, and CI compiles and CPU-tests Windows.** Changes must not remove the platform seams (`src/platform/`, CMake `if(WIN32)`); see `CONTRIBUTING.md` and `docs/platforms.md`.
 - **Headline benchmark numbers come from the maintainer's own runs.** Agent benches are development A/Bs only. Label every number with its GPU power limit.
 - **Quality gate:** PPL/KLD against the BF16 reference (`docs/precision/quality.md#the-bf16-reference`), through the decode path (`basalt-bench --quality`). Byte identity with old output is not required, but say whenever numerics change. Bitwise-neutral refactors need only the greedy-identity check.

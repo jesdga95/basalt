@@ -123,6 +123,105 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// IQ1_S: eight grid values per call from the 11-bit index, one 3-bit scale and one grid shift per 32 values; the shift
+// term rides in the half2 (scale, scale*delta) the q8_1 x q8_1 dot reads.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_s(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int   * x_qs = (int   *)  x_tile;
+    half2 * x_ds = (half2 *) (x_qs + MMQ_TILE_NE_K*2);
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR1_S);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int kqsx = threadIdx.x % threads_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_iq1_s * bxi = (const block_iq1_s *) x + kbx0 + i*stride;
+
+        const int       qs_packed = get_int_b2(bxi->qs, kqsx);
+        const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+        const int qh = bxi->qh[kqsx];
+
+#pragma unroll
+        for (int l = 0; l < QR1_S/2; ++l) {
+            const int grid = iq1s_grid_gpu[qs[l] | (((qh >> (3*l)) & 0x07) << 8)];
+
+            const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+            const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+            x_qs[i*sram_stride + 8*kqsx + (2*l+0)] = grid0;
+            x_qs[i*sram_stride + 8*kqsx + (2*l+1)] = grid1;
+        }
+
+        const float  d1q   = __half2float(bxi->d) * (((qh >> 11) & 0x0E) + 1);
+        const float  delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
+
+        x_ds[i*sram_stride + kqsx] = make_half2(d1q, d1q*delta);
+    }
+}
+
+// IQ1_M: eight grid values per 11-bit index, a grid shift of +-1/8 per eight values and a 3-bit scale per 16 values. The
+// int8 weight is 8 * (code - 1) +- 1, exact; the scale per 16 values is d * (2s + 1) / 8.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_m(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+
+    constexpr int threads_per_row = (MMQ_ITER_K / (4 * QR2_XS)) / 2;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int kqsx = threadIdx.x % threads_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_iq1_m * bxi = (const block_iq1_m *) x + kbx0 + i*stride;
+
+        const int       qs_packed = get_int_b4(bxi->qs, kqsx);
+        const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int qhl  = bxi->qh[2*kqsx + l/2] >> (4*(l%2));
+            const int grid = iq1s_grid_gpu[qs[l] | ((qhl & 0x07) << 8)];
+            const int sub  = (qhl & 0x08) ? 0xF7F7F7F7 : 0xF9F9F9F9;   // -9 or -7 in every byte
+
+            x_qs[i*sram_stride + 8*kqsx + (2*l+0)] = __vadd4(((grid >> 0) & 0x0F0F0F0F) << 3, sub);
+            x_qs[i*sram_stride + 8*kqsx + (2*l+1)] = __vadd4(((grid >> 4) & 0x0F0F0F0F) << 3, sub);
+        }
+
+        const uint16_t * sc = (const uint16_t *) bxi->scales;
+        iq1m_scale_t scale;
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+        const float d   = __half2float(scale.f16) / 8.0f;
+        const int   tmp = sc[kqsx/2] >> (6*(kqsx%2));
+
+        x_df[i*sram_stride                             + 2*kqsx+0] = d * (2*((tmp >> 0) & 0x07) + 1);
+        x_df[i*sram_stride                             + 2*kqsx+1] = d * (2*((tmp >> 3) & 0x07) + 1);
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq2_xxs(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();

@@ -8,6 +8,7 @@
 #include <string>
 
 #include "basalt/program/tokenizer.hpp"
+namespace basalt::models::qwen4exp::tokenizer { void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends); }
 
 namespace {
 
@@ -32,6 +33,7 @@ int main(int argc, char** argv) {
         basalt::program::Tokenizer t;
         std::string err;
         auto t0 = std::chrono::steady_clock::now();
+        t.set_pretokenize(basalt::models::qwen4exp::tokenizer::pretok_qwen35);
         if (!t.load(vocab, merges, types, err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
         const double load_ms = ms_since(t0);
         std::vector<int32_t> ids;
