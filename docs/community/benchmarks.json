@@ -987,6 +987,29 @@
       "prefill_64k_tps": 5023.2,
       "decode_tps": 315.6,
       "notes": "4x RTX 5070 Ti at a 250 W limit (300 W default); two cards on chipset 4.0 x4 slots; resident experts, 0 SSD spill"
+    },
+    {
+      "submitter": "WenbinHuang",
+      "date": "2026-11-05",
+      "commit": "dc047a77be",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 43.1
+        }
+      ],
+      "ram_gib": 64,
+      "cpu": "13th Gen Intel Core i7-13700K, 16 cores",
+      "ram_gbps": 70.2,
+      "os": "Windows",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 3976.2,
+      "prefill_64k_tps": 4589.6,
+      "decode_tps": 137.5
     }
   ]
 }
