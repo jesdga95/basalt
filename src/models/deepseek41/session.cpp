@@ -59,6 +59,11 @@ public:
         for (cudaEvent_t e : mix_ev_)
             if (e) cudaEventDestroy(e);
         if (mix_st_) cudaStreamDestroy(mix_st_);
+        for (cudaEvent_t e : eng_ev_)
+            if (e) cudaEventDestroy(e);
+        if (eng_go_) cudaEventDestroy(eng_go_);
+        if (eng_st_) cudaStreamDestroy(eng_st_);
+        for (float* h : erow_h_) cudaFreeHost(h);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
@@ -88,8 +93,23 @@ public:
                   buf(attn_out_, n * W) && buf(moe_out_, n * W) && buf(sh_out_, n * W) && buf(ffn_sum_, n * W) &&
                   buf(coef_a_, kHcCoef * W) && buf(coef_f_[0], kHcCoef * W) && buf(coef_f_[1], kHcCoef * W) &&
                   buf(hc_ws_, hc_mixes_workspace_floats(W)) && buf(rlogits_, (size_t) g_.n_expert * W) &&
-                  buf(rw_, 64) && buf(logits_, (size_t) g_.n_vocab * W) && buf(rows_dev_, (cols ? cols : 1) * W) &&
-                  buf(kv_dev_, 5 * n * W);
+                  buf(rw_, 64) && buf(logits_, (size_t) g_.n_vocab * W);
+        for (size_t k = 0; ok && k < m_.pack().engram.layers.size(); ++k) {
+            float *h = nullptr, *d = nullptr, *kv = nullptr;
+            void* q = nullptr;
+            ok = cudaHostAlloc((void**) &h, cols * W * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess;
+            if (h) erow_h_.push_back(h);
+            ok = ok && cudaHostGetDevicePointer((void**) &d, h, 0) == cudaSuccess && buf(kv, 5 * n * W) &&
+                 cudaMalloc(&q, kernels::native_q8_1_bytes((int) cols, W)) == cudaSuccess;
+            if (q) allocs_.push_back(q);
+            erow_d_.push_back(d);
+            ekv_.push_back(kv);
+            eq8_.push_back(q);
+            eng_ev_.push_back(nullptr);
+            ok = ok && cudaEventCreateWithFlags(&eng_ev_.back(), cudaEventDisableTiming) == cudaSuccess;
+        }
+        ok = ok && cudaStreamCreateWithFlags(&eng_st_, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaEventCreateWithFlags(&eng_go_, cudaEventDisableTiming) == cudaSuccess;
         void* v = nullptr;
         ok = ok && cudaMalloc(&v, 64 * sizeof(int32_t)) == cudaSuccess;
         ids_ = (int32_t*) v;
@@ -616,7 +636,7 @@ private:
         if (dump_dir_.empty()) return;
         std::vector<char> h(bytes);
         cudaStreamSynchronize(stream_);
-        cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDefault);   // device or mapped host memory
         const std::string path = dump_dir_ + "/" + name + "." + std::to_string(layer) + "." + std::to_string(pos) + ".bin";
         if (FILE* f = std::fopen(path.c_str(), "wb")) {
             std::fwrite(h.data(), 1, bytes, f);
@@ -632,12 +652,26 @@ private:
             if (l == il) return true;
         return false;
     }
+    // The Engram projection of layer `il` runs behind the previous layer's head (graphs only); not behind layer 0's,
+    // which starts right after the rows were asked for.
+    bool engram_ahead(int il) const { return fused_ && il > 1 && engram_at(il); }
 
     // The layer's work up to the router and the expert inputs' copy to the host, optionally behind the previous
     // layer's tail. Everything here is capturable: positions are read from device memory.
     bool enqueue_head(int il, int64_t pos, int32_t token, void* st, bool with_prev_tail, int T = 1) {
         const size_t n = (size_t) g_.n_embd;
         if (with_prev_tail && !enqueue_tail(il - 1, pos, st, T)) return false;
+        if (with_prev_tail && engram_ahead(il)) {
+            const std::vector<int>& el = m_.pack().engram.layers;
+            for (size_t k = 0; k < el.size(); ++k) {
+                if (el[k] != il) continue;
+                const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
+                if (!gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");
+                EngramArgs ea;
+                ea.n_embd = (int) n;
+                engram_apply(ekv_[k], (const float*) gw->ptr, nullptr, T, ea, x_, st);
+            }
+        }
         if (drafter_) {
             const int slot = drafter_->feature_slot(il);
             if (slot >= 0) dspark_hc_mean(x_, T, (int) n, dfeat_ + (size_t) slot * n, drafter_->feature_floats(), st);
@@ -828,32 +862,45 @@ private:
         bool tail_pending = false;
         std::string err;
 
+        // A layer's rows are dequantized into mapped memory that its projection reads, so no copy waits behind the
+        // expert copies. The projection of an Engram layer past layer 1 runs one layer ahead, behind that layer's head,
+        // while its experts run; the Engram layer's head then only adds the result.
+        const auto engram_rows = [&](size_t k) {
+            if (!m_.engram_reader().collect(tickets[k], err)) return false;
+            const int blocks = 256 / 32;
+            for (int r = 0; r < n_cols * T; ++r)
+                for (int b = 0; b < blocks; ++b)
+                    dequantize_iq4_nl(raw[k].data() + (size_t) r * en.row_bytes + (size_t) b * 18,
+                                      erow_h_[k] + (size_t) r * 256 + (size_t) b * 32);
+            return true;
+        };
+        const auto engram_project = [&](size_t k, int il, void* s) {
+            const DevTensor* kvw = m_.tensor(il, "engram_kv.weight");
+            if (!kvw) return false;
+            dense_f32(*kvw, erow_d_[k], eq8_[k], ekv_[k], n_cols * 256, (int) (5 * n), T, s);
+            return true;
+        };
+
         for (int il = 0; il < g_.n_layers; ++il) {
             // Engram
             for (size_t k = 0; k < en.layers.size(); ++k) {
                 if (en.layers[k] != il) continue;
+                if (engram_ahead(il)) {
+                    DS_CUDA(cudaStreamWaitEvent(stream_, eng_ev_[k], 0));
+                    continue;
+                }
                 if (tail_pending) {
                     if (!run_tail(il - 1, pos, T)) return false;
                     tail_pending = false;
                 }
-                if (!m_.engram_reader().collect(tickets[k], err)) return fail(err);
-                std::vector<float> rows_f((size_t) n_cols * T * 256);
-                const int blocks = 256 / 32;
-                for (int r = 0; r < n_cols * T; ++r)
-                    for (int b = 0; b < blocks; ++b)
-                        dequantize_iq4_nl(raw[k].data() + (size_t) r * en.row_bytes + (size_t) b * 18,
-                                          rows_f.data() + (size_t) r * 256 + (size_t) b * 32);
-                DS_CUDA(cudaMemcpyAsync(rows_dev_, rows_f.data(), rows_f.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
-                DS_CUDA(cudaStreamSynchronize(stream_));
-                const DevTensor* kvw = m_.tensor(il, "engram_kv.weight");
                 const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
-                if (!kvw || !gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");
-                dump("engram_rows", il, pos, rows_dev_, rows_f.size() * sizeof(float));
-                dense_f32(*kvw, rows_dev_, q8_, kv_dev_, n_cols * 256, (int) (5 * n), T, st);
-                dump("engram_kv", il, pos, kv_dev_, 5 * n * sizeof(float));
+                if (!engram_rows(k)) return fail(err);
+                dump("engram_rows", il, pos, erow_d_[k], (size_t) n_cols * T * 256 * sizeof(float));
+                if (!gw || !engram_project(k, il, st)) return fail("layer " + std::to_string(il) + " has no Engram tensors");
+                dump("engram_kv", il, pos, ekv_[k], 5 * n * sizeof(float));
                 EngramArgs ea;
                 ea.n_embd = (int) n;
-                engram_apply(kv_dev_, (const float*) gw->ptr, nullptr, T, ea, x_, st);
+                engram_apply(ekv_[k], (const float*) gw->ptr, nullptr, T, ea, x_, st);
                 dump("engram_out", il, pos, x_, 4 * n * sizeof(float));
             }
 
@@ -862,8 +909,16 @@ private:
                 if (!ops_->routed_experts_staged(il, normed_, ids_, rw_, moe_out_, st, err_)) return false;
                 if (!enqueue_tail(il, pos, st)) return false;
             } else {
-                if (!run_head(il, pos, token, tail_pending && !engram_at(il), T)) return false;
+                if (!run_head(il, pos, token, tail_pending, T)) return false;
                 tail_pending = true;
+                for (size_t k = 0; k < en.layers.size(); ++k) {
+                    if (en.layers[k] != il + 1 || !engram_ahead(il + 1)) continue;
+                    if (!engram_rows(k)) return fail(err);
+                    DS_CUDA(cudaEventRecord(eng_go_, stream_));
+                    DS_CUDA(cudaStreamWaitEvent(eng_st_, eng_go_, 0));
+                    if (!engram_project(k, il + 1, eng_st_)) return fail("layer " + std::to_string(il + 1) + " has no Engram tensors");
+                    DS_CUDA(cudaEventRecord(eng_ev_[k], eng_st_));
+                }
                 if (T == 1 ? !ops_->routed_and_shared_staged(il, normed_, ids_, rw_, ffn_sum_, sh_out_, st, err_)
                            : !ops_->routed_shared_window(il, T, rw_, ffn_sum_, sh_out_, st, err_))
                     return false;
@@ -945,8 +1000,14 @@ private:
     static constexpr const char* kSkippedRows = "deepseek41: that position's rows were left short by a prompt read: state is saved or resumed only at a read's stop";
     float *x_ = nullptr, *x2_ = nullptr, *cur_ = nullptr, *normed_ = nullptr, *attn_out_ = nullptr, *moe_out_ = nullptr,
           *sh_out_ = nullptr, *ffn_sum_ = nullptr, *coef_a_ = nullptr, *coef_f_[2] = {nullptr, nullptr},
-          *hc_ws_ = nullptr, *rlogits_ = nullptr, *rw_ = nullptr, *logits_ = nullptr, *rows_dev_ = nullptr,
-          *kv_dev_ = nullptr;
+          *hc_ws_ = nullptr, *rlogits_ = nullptr, *rw_ = nullptr, *logits_ = nullptr;
+    // per Engram layer: its dequantized rows (mapped host memory) as the host and the kernels see them, the projection's
+    // q8_1 scratch and result; the stream a projection one layer ahead runs on, its start and its end per layer
+    std::vector<float*> erow_h_, erow_d_, ekv_;
+    std::vector<void*> eq8_;
+    cudaStream_t eng_st_ = nullptr;
+    cudaEvent_t eng_go_ = nullptr;
+    std::vector<cudaEvent_t> eng_ev_;
     int32_t* ids_ = nullptr;
     int32_t *am_dev_ = nullptr, *h_next_ = nullptr;
     void* am_ws_ = nullptr;
