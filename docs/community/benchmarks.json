@@ -1010,6 +1010,29 @@
       "prefill_16k_tps": 3976.2,
       "prefill_64k_tps": 4589.6,
       "decode_tps": 137.5
+    },
+    {
+      "submitter": "wadeubuntu",
+      "date": "2026-11-05",
+      "commit": "dc047a77be",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 26.1
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "13th Gen Intel Core i7-13700K, 16 cores",
+      "ram_gbps": 69.4,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 4730.4,
+      "prefill_64k_tps": 5045.3,
+      "decode_tps": 192.3
     }
   ]
 }
