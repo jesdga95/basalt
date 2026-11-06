@@ -96,8 +96,6 @@ public:
     /// The ring depth of the current layout.
     int ring_depth() const;
     static double pinned_share();
-    /// The pack's prompt experts run on the FP4 tensor cores (NVFP4 gate/up and down in every layer).
-    static bool fp4_experts();
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);

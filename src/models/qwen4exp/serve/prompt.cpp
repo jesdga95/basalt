@@ -495,6 +495,28 @@ int QfnRuntime::init_prompt() {
     // its buffers' and the hand-off buffers' size; a larger chunk reads on CUDA0
     split_chunk_max = read_cap();
     split_ready = split_stages >= 2 && !pstages.empty();
+    // the longest chunk every stage's lent slots hold beside its weights and session: the prompt buffers of a chunk grow
+    // with the expert format, so a card may take only a shorter chunk than the main card reads
+    if (split_ready && split_chunk_max >= 4096) {
+        const int64_t cells = std::min<int64_t>(o.max_context, kSplitRefCells);
+        int64_t fit = 0;
+        for (const int64_t c : {split_chunk_max, int64_t{24576}, int64_t{16384}, int64_t{12288}, int64_t{8192}, int64_t{6144},
+                                int64_t{4096}}) {
+            if (c > split_chunk_max) continue;
+            bool all = true;
+            for (const auto& stp : pstages) {
+                uint8_t *w_at = nullptr, *s_at = nullptr, *b_at = nullptr;
+                all = all && split_region(*stp, cells, c, stp->lo, stp->hi, w_at, s_at, b_at);
+            }
+            if (all) { fit = c; break; }
+        }
+        if (fit > 0 && fit < split_chunk_max) {
+            basalt::log::info("basalt serve", "prompt split: chunks of at most %lld tokens fit the tier cards' slots",
+                              (long long) fit);
+            split_chunk_max = fit;
+        }
+        split_chunk_cap = split_chunk_max;
+    }
     for (size_t j = 0; split_ready && j < pstages.size(); ++j) {
         PromptStage& st = *pstages[j];
         const basalt::core::OnDevice on(st.dev);

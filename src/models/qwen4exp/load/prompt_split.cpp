@@ -32,8 +32,7 @@ int prompt_split(Context& context) {
     if (split_want) {
         const char* off = o.peer_exclusive ? "the tier's experts have no RAM copy (--peer-exclusive)"
                         : !src.complement_ready() ? "no RAM copy of the experts"
-                        : !o.cvec_files.empty() ? "a control vector"
-                        : !basalt::prefill::Prefill::fp4_experts() ? "priced for NVFP4 experts only" : nullptr;
+                        : !o.cvec_files.empty() ? "a control vector" : nullptr;
         if (off == nullptr && main_link_gbps <= 0) main_link_gbps = probe_pcie_h2d_gbps();   // (a set --pcie-frac skips it)
         if (off == nullptr) {
             std::vector<double> bw;
@@ -111,6 +110,7 @@ int prompt_split(Context& context) {
     // a part [a0, b0) of a prompt ending at `prompt_end` over up to `max_stages` stages, each stage with its weights'
     // layers [lo, hi) and image bytes: both prices, and the split's chunk and head chunk
     int64_t split_hand_rows = 0;   // the rows each hand-off buffer holds (0 before they exist: a chunk's)
+    int64_t split_chunk_cap = 0;   // the longest chunk every stage can hold (0 before they are laid out: no limit)
     int64_t split_peer_rows = 0;   // the longest routed-only chunk a slower tier card computes its experts' rows of
     auto split_price = [&](int64_t a0, int64_t b0, int64_t prompt_end, int max_stages) -> engine_local::SplitPricing {
         engine_local::SplitPricing sp0;
@@ -119,59 +119,63 @@ int prompt_split(Context& context) {
         // come back for it in the hand-off buffers)
         const auto [chunk, head] = serve_loans::one_card_chunks(n_tok, read_cap(), true, o.prefill_auto_fit);
         if (n_tok <= std::max(chunk, head)) return sp0;   // one chunk: read on the main card, no reason to give
+        // the stages read chunks of at most what their lent slots hold; the main card alone reads the usual chunks
+        const auto [schunk, shead] = split_chunk_cap > 0 && split_chunk_cap < chunk
+                                         ? serve_loans::one_card_chunks(n_tok, split_chunk_cap, true, o.prefill_auto_fit)
+                                         : std::make_pair(chunk, head);
         char why[160];
         // a slower tier card that computes its experts' rows of the routed-only chunks of a CUDA0 read: the split
         // gives that share up and the price does not count it, so those chunks stay on CUDA0; any other tier set keeps
         // the 4096-token floor
         if (!peer_streamed_share && split_peer_rows > 0) {
-            if (chunk <= split_peer_rows) {
+            if (schunk <= split_peer_rows) {
                 std::snprintf(why, sizeof why, "chunks of %lld tokens: CUDA0 alone reads them with the tier card "
-                              "computing its experts' rows (up to %lld tokens)", (long long) chunk,
+                              "computing its experts' rows (up to %lld tokens)", (long long) schunk,
                               (long long) split_peer_rows);
                 sp0.why = why;
                 return sp0;
             }
-        } else if (chunk < 4096) {
-            std::snprintf(why, sizeof why, "chunks of %lld tokens, below the 4096 minimum", (long long) chunk);
+        } else if (schunk < 4096) {
+            std::snprintf(why, sizeof why, "chunks of %lld tokens, below the 4096 minimum", (long long) schunk);
             sp0.why = why;
             return sp0;
         }
         basalt::program::PsPart part;
         part.cell0 = a0;
         part.tier_chunks = serve_loans::chunk_list(n_tok, chunk, head);
-        part.split_chunks = part.tier_chunks;
+        part.split_chunks = serve_loans::chunk_list(n_tok, schunk, shead);
         part.row_bytes = (uint64_t) (g.hc * g.n_embd) * sizeof(float);
         const int64_t c_last = b0 - part.split_chunks.back();
         part.draft_rows = draft_window > 0 ? std::max<int64_t>(0, c_last - std::max(a0, prompt_end - draft_window)) : 0;
         // the draft layer's rows before the kept chunk come back in the hand-off buffers: the last two chunks handed on
         // in place, earlier ones past `chunk` rows in either buffer (see read_split)
         const int64_t kept_rows =
-            basalt::program::prompt_split_draft_room(part.split_chunks, chunk, std::max(split_hand_rows, chunk));
+            basalt::program::prompt_split_draft_room(part.split_chunks, schunk, std::max(split_hand_rows, schunk));
         if (part.draft_rows > kept_rows) {
             if (draft_window >= INT64_MAX / 4)
                 std::snprintf(why, sizeof why, "the draft layer attends to every cell");
             else
                 std::snprintf(why, sizeof why, "chunks of %lld tokens: the draft layer's window needs %lld rows back, the "
-                              "hand-off buffers hold %lld", (long long) chunk, (long long) part.draft_rows,
+                              "hand-off buffers hold %lld", (long long) schunk, (long long) part.draft_rows,
                               (long long) kept_rows);
             sp0.why = why;
             return sp0;
         }
-        sp0.chunk = chunk;
-        sp0.head = head;
+        sp0.chunk = schunk;
+        sp0.head = shead;
         part.host_gbps = split_host_gbps;
         std::vector<basalt::program::PsCard> peers;
         for (const auto& st : pstages) {
             const uint64_t region = st->image_bytes + basalt::core::prompt_session_bytes(g, b0 + 64, st->lo, st->hi) +
-                                    basalt::prefill::Prefill::bytes_needed(g, ss, chunk);
+                                    basalt::prefill::Prefill::bytes_needed(g, ss, schunk);
             basalt::program::PsCard c = split_peer_side(*st, region);
             c.setup_ms = st->link_gbps > 0 ? (double) st->image_bytes / (0.85 * st->link_gbps * 1e9) * 1000.0 + 10.0 : 0.0;
             c.layer_lo = (int) st->lo;
             c.layer_hi = (int) st->hi;
             peers.push_back(std::move(c));
         }
-        const basalt::program::PsCard main_side = split_main_side(chunk);
-        sp0.price = basalt::program::price_prompt_split(main_side, main_side, peers, part, max_stages, (int) g.n_layers);
+        sp0.price = basalt::program::price_prompt_split(split_main_side(chunk), split_main_side(schunk), peers, part,
+                                                        max_stages, (int) g.n_layers);
         return sp0;
     };
     // a split's stages for the log: "layers 36-47 on CUDA1", "layers 12-23 on CUDA3, 24-35 on CUDA2, 36-47 on CUDA1"
@@ -323,6 +327,7 @@ int prompt_split(Context& context) {
     context.read_cap = read_cap;
     context.kSplitRefCells = &kSplitRefCells;
     context.split_hand_rows = &split_hand_rows;
+    context.split_chunk_cap = &split_chunk_cap;
     context.split_peer_rows = &split_peer_rows;
     context.split_price = split_price;
     context.split_layers_text = split_layers_text;
