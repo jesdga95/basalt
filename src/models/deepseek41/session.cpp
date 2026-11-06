@@ -63,6 +63,9 @@ public:
             if (e) cudaEventDestroy(e);
         if (eng_go_) cudaEventDestroy(eng_go_);
         if (eng_st_) cudaStreamDestroy(eng_st_);
+        for (cudaEvent_t e : row_ev_)
+            if (e) cudaEventDestroy(e);
+        if (row_st_) cudaStreamDestroy(row_st_);
         for (float* h : erow_h_) cudaFreeHost(h);
         if (stream_) cudaStreamDestroy(stream_);
     }
@@ -114,7 +117,10 @@ public:
             ok = ok && cudaEventCreateWithFlags(&eng_ev_.back(), cudaEventDisableTiming) == cudaSuccess;
         }
         ok = ok && cudaStreamCreateWithFlags(&eng_st_, cudaStreamNonBlocking) == cudaSuccess &&
-             cudaEventCreateWithFlags(&eng_go_, cudaEventDisableTiming) == cudaSuccess;
+             cudaEventCreateWithFlags(&eng_go_, cudaEventDisableTiming) == cudaSuccess &&
+             cudaStreamCreateWithFlags(&row_st_, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaEventCreateWithFlags(&row_ev_[0], cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&row_ev_[1], cudaEventDisableTiming) == cudaSuccess;
         void* v = nullptr;
         ok = ok && cudaMalloc(&v, 64 * sizeof(int32_t)) == cudaSuccess;
         ids_ = (int32_t*) v;
@@ -728,12 +734,17 @@ private:
         DS_CUDA(cudaEventRecord(mix_ev_[3], mix_st_));
         hc_pre_rms_norm(x2_, coef_a_, kHcCoef, wf(il, "ffn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
         dump("hc_ffn_pre", il, pos, cur_, n * sizeof(float));
+        // the routed experts' rows go out beside the router; the ids follow both
+        DS_CUDA(cudaEventRecord(row_ev_[0], stream_));
+        DS_CUDA(cudaStreamWaitEvent(row_st_, row_ev_[0], 0));
+        ops_->stage_rows(T, normed_, row_st_);
+        DS_CUDA(cudaEventRecord(row_ev_[1], row_st_));
         router(normed_, wf(il, "ffn_gate_inp.weight"), wf(il, "exp_probs_b.bias"), T, ra, rlogits_, ids_, rw_, st);
         dump("ffn_moe_logits", il, pos, rlogits_, (size_t) g_.n_expert * sizeof(float));
         dump("ffn_moe_topk", il, pos, ids_, (size_t) g_.n_used * sizeof(int32_t));
         dump("ffn_moe_weights_scaled", il, pos, rw_, (size_t) g_.n_used * sizeof(float));
-        if (T == 1) ops_->routed_stage(il, normed_, ids_, st);
-        else ops_->routed_stage_window(T, normed_, ids_, st);
+        DS_CUDA(cudaStreamWaitEvent(stream_, row_ev_[1], 0));
+        ops_->stage_ids(T, ids_, st);
         DS_CUDA(cudaStreamWaitEvent(stream_, mix_ev_[3], 0));
         // it needs no routing: it runs while the host finds the routed experts' places
         if (!fused_) return true;
@@ -995,6 +1006,8 @@ private:
     cudaStream_t stream_ = nullptr;
     cudaStream_t mix_st_ = nullptr;   // the hyper-connection mixes, a branch of the head
     cudaEvent_t mix_ev_[4] = {};      // its fork and join points: attention sublayer, FFN sublayer
+    cudaStream_t row_st_ = nullptr;   // the routed experts' rows, a branch beside the router
+    cudaEvent_t row_ev_[2] = {};      // its fork and join
     std::unique_ptr<LayerOps> ops_;
     std::unique_ptr<Prefill> prefill_;
     bool short_prompt_ = false;   // prefill_ is a short read's and stays between reads
