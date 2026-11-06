@@ -93,7 +93,6 @@ class BenchFlags(unittest.TestCase):
     def test_community_keeps_the_engine_defaults(self):
         cmd = self.command_community()
         self.assertNotIn("--spec", cmd)
-        self.assertEqual(cmd[cmd.index("--kv") + 1], "int8")
 
     def command_community(self) -> list[str]:
         r = subprocess.run([str(BENCH), "--model", "m.basalt", "--fixtures", str(self.fixtures), "--print-command",

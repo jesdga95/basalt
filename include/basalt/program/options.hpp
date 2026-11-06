@@ -10,6 +10,9 @@
 
 namespace basalt::program {
 
+/// The context of every model without --max-context.
+inline constexpr int64_t kDefaultContext = 8192;
+
 /// The flags every model takes.
 struct CommonOptions {
     virtual ~CommonOptions() = default;
@@ -19,7 +22,7 @@ struct CommonOptions {
     std::string model;                ///< --model: the .basalt file every loader reads from
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
-    int64_t max_context = 4096;
+    int64_t max_context = kDefaultContext;
     bool greedy = true;
     uint64_t seed = 0;
     int top_k = 20;
@@ -66,14 +69,18 @@ struct CommonOptions {
     bool pool_workers_given = false;     // --pool-workers on the command line
     /// Stop when the model emits an end-of-turn token (the pack's own, or --eos-ids).
     bool stop_eos = false;
+    /// --no-ram-guard: serving never sheds, delays admission or stops a request for low RAM.
+    bool no_ram_guard = false;
     std::vector<int64_t> eos_ids;
     /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
     std::string gpu;
     bool gpu_plan = false;
     std::string arch;                  ///< the --model file's architecture
     std::string ppl_base, ppl_out;     ///< --ppl-base, --ppl-out
+    std::string model_name;            ///< the adapter's community-row name, for --gpu-plan
     std::string quality_flags;         ///< the flags the quality gate starts this model with, for --gpu-plan
     int quality_window = 1;            ///< the widest window the gate scores on this model (0: as the request asks)
+    int plan_spec = 0;                 ///< the verify window this start would run, for --gpu-plan (0: plain decode)
     /// Speculative decoding with a verify window of this many tokens (the last accepted token and spec-1 drafts);
     /// 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for the exactness test).
     int spec = 0;
@@ -91,7 +98,6 @@ struct CommonOptions {
     std::vector<int64_t> image_at;
     bool image_pad_given = false;
     int64_t image_pad_id = -1;             ///< --image-pad-id: the prompt token that stands for a picture's rows (--serve)
-    bool max_context_set = false;          ///< --max-context was given (a model with its own default picks one otherwise)
     /// Stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     bool generates = true;             ///< false: this run produces no tokens (a model flag says so)

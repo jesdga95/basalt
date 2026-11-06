@@ -13,6 +13,8 @@ std::unique_ptr<program::CommonOptions> ModelAdapter::make_options() const {
     return std::make_unique<program::CommonOptions>();
 }
 
+int ModelAdapter::planned_spec(const program::CommonOptions& o) const { return o.spec >= 2 ? o.spec : 0; }
+
 namespace {
 std::map<std::string, std::unique_ptr<ModelAdapter>>& table() {
     static std::map<std::string, std::unique_ptr<ModelAdapter>> t;

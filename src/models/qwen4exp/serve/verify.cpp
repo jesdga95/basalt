@@ -202,7 +202,7 @@ int QfnRuntime::capture_windows() {
     res_at_start = host_res;
     peer_at_start = peer.valid() ? peer.residency() : std::vector<int32_t>();
     prof_rank_start = prof_rank;
-    std::printf("INFO file_experts_bytes=%llu\n", (unsigned long long) tier_file_bytes);   // experts only the file holds
+    std::printf("INFO %s\n", basalt::program::spill_words(tier_spill).c_str());   // experts only the file holds
     std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
     std::fflush(stdout);
 

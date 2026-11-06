@@ -80,7 +80,7 @@ public:
                                  std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
     }
     void mark_loop_end() { basalt::core::decode_gaps().mark(17); }
-    void shed_low() { runtime_.QfnRuntime::shed_if_low(); }
+    void shed_low() { runtime_.shed_if_low(); }
     void stamp_loop_end() { basalt::core::decode_events().stamp(2); }
     void decode_end();
     // ---- Jev: one request's decision lanes, scored on the resident model ----

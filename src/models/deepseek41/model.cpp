@@ -139,7 +139,7 @@ prefillp::Dims DsModel::prompt_dims() const {
     return d;
 }
 
-bool DsModel::resolve_context(int64_t requested, bool set, std::string& err) {
+bool DsModel::resolve_context(int64_t requested, std::string& err) {
     const Geometry& g = pack_.geo;
     const std::vector<int> ratios = cache_ratios(g);
     size_t free_b = 0, total_b = 0;
@@ -147,15 +147,14 @@ bool DsModel::resolve_context(int64_t requested, bool set, std::string& err) {
         err = "deepseek41: cannot query the free device memory";
         return false;
     }
-    const ctxp::Plan p = ctxp::plan_context(requested, set, g.context_length, free_b, ratios);
+    const ctxp::Plan p = ctxp::plan_context(requested, g.context_length, free_b, ratios);
     if (!p.error.empty()) {
         err = "deepseek41: " + p.error;
         return false;
     }
     ctx_ = p.context;
     core::LoadProgress::kv(core::LoadProgress::cuda(0), ctxp::context_bytes(0, ratios), ctx_, "", ctxp::context_bytes(ctx_, ratios));
-    basalt::log::info("basalt deepseek41", "context %lld tokens%s (caches of a full context: %.2f GiB)%s%s", (long long) ctx_,
-                 set ? "" : " (the model's maximum within the free memory)",
+    basalt::log::info("basalt deepseek41", "context %lld tokens (caches of a full context: %.2f GiB)%s%s", (long long) ctx_,
                  (double) ctxp::context_bytes(ctx_, ratios) / (1024.0 * 1024.0 * 1024.0), p.note.empty() ? "" : "; ",
                  p.note.c_str());
     return true;

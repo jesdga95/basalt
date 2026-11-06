@@ -26,12 +26,14 @@ A config file is one JSON object. `models` lists the models; `engine` applies to
   "engine": { "resident-experts": true }, "server": { "port": 8080 } }
 ```
 
+- Where a setting goes in a config file: `server` is the `server` block, `entry` a model entry or the top-level `engine`,
+  `engine` (an engine flag) the same places, `model entry` a model entry only.
 - Keys are flag names without dashes. Switches are `true`. A repeatable option (`allowed-host`, `cors-origin`, `image-url-host`,
   `image-dir`) takes a list. `model` paths are relative to the file.
-- A row marked Flash-Next only or DeepSeek only is an unknown flag for the other model, and stops its start.
-- Precedence: command line, then config file, then defaults. A wrong block or an unknown name stops the start. `api-key` cannot be in
-  a file.
-- The defaults are the fastest settings that need no knowledge of the machine. The keys that change output or memory (4,096 context,
+- A row marked Flash-Next only or DeepSeek only stops the start in a model entry or on the command line of the other model; in the top-level `engine` it is left out for that model, with a start line ([checks at start](models.md#checks-at-start)).
+- Precedence: command line, then config file, then defaults; `--model` and `--alias` do not go with `--config` (its entries name the models).
+  A wrong block or an unknown name stops the start. `api-key` cannot be in a file.
+- The defaults are the fastest settings that need no knowledge of the machine. The keys that change output or memory (8,192 context,
   fp16 KV) are kept for you to set.
 
 ## Automatic settings
@@ -48,46 +50,46 @@ always wins. It prints one `[server] auto` line:
 
 ## Server
 
-Command line `--name`, config `server` block `"name"`.
+Command line `--name`; the Where column says which config block takes it.
 
-| Setting | Type, values | Default | What it does |
-| --- | --- | --- | --- |
-| `model` | path | required | The `.basalt` file: weights, tokenizer, chat template, drafter, vision projector and default sampling. |
-| `alias` | string | name in the file | The model name the API reports. |
-| `host` | address | `127.0.0.1` | Listen address. `0.0.0.0` serves the network; never without `api-key`. |
-| `port` | integer | `8080` | TCP port. |
-| `api-key` | string | none | Require this key on `/v1/*` (`Authorization: Bearer` or `x-api-key`). Command line only. |
-| `allowed-host` | string, repeatable | none | Also answer to this `Host` name; `"*"` turns the check off. |
-| `cors-origin` | string, repeatable | none | Let web pages from this origin call `/v1/*`. |
-| `fit-max-tokens` | switch | off | Clamp `max_tokens` to the remaining context instead of a 400. |
-| `open` | switch | off | Open the web page when ready. |
-| `lazy` | switch | off | Start unloaded; load on the first request. Drops a sidecar encoder. |
-| `idle-unload` | seconds | off | Unload after this long idle. Frees VRAM for other programs. |
-| `idle-sleep` | seconds | off | Sleep after this long idle: VRAM freed, RAM kept, wake in seconds. Linux only. [running](../running.md#sleep---idle-sleep) |
-| `min-free-vram-mib` | integer | off | Load an unloaded model only when this much VRAM is free; else 503. |
-| `grammar` | switch (`--no-grammar`) | on | Hold tool calls and JSON formats (`json_object`, `json_schema`) to their schema inside the engine. Without it, other JSON formats are refused with 400. |
-| `debug` | switch | off | One log line per request, and the raw model text. |
-| `request-lines` | switch | off | Echo the per-request summary on stdout. |
-| `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling`, else the engine's | Default for a request that leaves the field out. See [sampling](sampling.md). |
-| `reasoning-budget-tokens` | integer | `0` | Thinking budget for requests that name none. A request's own value wins. |
-| `thinking-loop-tokens` | integer | `256` | End thinking when one token repeats this many times in a row; `0` turns it off. |
-| `answer-room` | switch (`--no-answer-room`) | on | Reserve room for closing the thinking and the answer (caps of 1,024 tokens or more). |
-| `config` | path | none | The config file. Command line only. |
-| `jev` | integer `0..8` | `0` (off) | Decision lane limit on the resident model, independent of chat slots. `1` enables the solo scorer. [Settings and API](decisions.md). |
-| `jev-max-pending`, `jev-timeout`, `jev-max-nodes`, `jev-tree-max` | integer | `16`, `300`, `8192`, `128` | Decision queue, deadline, compiled trie budget and automatic exhaustive-domain limit. [Ranges](decisions.md#runtime-and-settings). |
+| Setting | Where | Type, values | Default | What it does |
+| --- | --- | --- | --- | --- |
+| `model` | model entry | path | required | The `.basalt` file: weights, tokenizer, chat template, drafter, vision projector and default sampling. |
+| `alias` | model entry | string | name in the file | The model name the API reports. |
+| `host` | server | address | `127.0.0.1` | Listen address. `0.0.0.0` serves the network; never without `api-key`. |
+| `port` | server | integer | `8080` | TCP port. |
+| `api-key` | command line | string | none | Require this key on `/v1/*` (`Authorization: Bearer` or `x-api-key`). Command line only. |
+| `allowed-host` | server | string, repeatable | none | Also answer to this `Host` name; `"*"` turns the check off. |
+| `cors-origin` | server | string, repeatable | none | Let web pages from this origin call `/v1/*`. |
+| `fit-max-tokens` | entry | switch | off | Clamp `max_tokens` to the remaining context instead of a 400. |
+| `open` | server | switch | off | Open the web page when ready. |
+| `lazy` | server | switch | off | Start unloaded; load on the first request. Drops a sidecar encoder. |
+| `idle-unload` | entry | seconds | off | Unload after this long idle. Frees VRAM for other programs. |
+| `idle-sleep` | entry | seconds | off | Sleep after this long idle: VRAM freed, RAM kept, wake in seconds. Linux only. [running](../running.md#sleep---idle-sleep) |
+| `min-free-vram-mib` | entry | integer | off | Load an unloaded model only when this much VRAM is free; else 503. |
+| `grammar` | entry | switch (`--no-grammar`) | on | Hold tool calls and JSON formats (`json_object`, `json_schema`) to their schema inside the engine. Without it, other JSON formats are refused with 400. |
+| `debug` | server | switch | off | One log line per request, and the raw model text. |
+| `request-lines` | server | switch | off | Echo the per-request summary on stdout. |
+| `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | entry | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling`, else the engine's | Default for a request that leaves the field out. See [sampling](sampling.md). |
+| `reasoning-budget-tokens` | entry | integer | `0` | Thinking budget for requests that name none. A request's own value wins. |
+| `thinking-loop-tokens` | entry | integer | `256` | End thinking when one token repeats this many times in a row; `0` turns it off. |
+| `answer-room` | entry | switch (`--no-answer-room`) | on | Reserve room for closing the thinking and the answer (caps of 1,024 tokens or more). |
+| `config` | command line | path | none | The config file. Command line only. |
+| `jev` | server | integer `0..8` | `0` (off) | Decision lane limit on the resident model, independent of chat slots. `1` enables the solo scorer. [Settings and API](decisions.md). |
+| `jev-max-pending`, `jev-timeout`, `jev-max-nodes`, `jev-tree-max` | server | integer | `16`, `300`, `8192`, `128` | Decision queue, deadline, compiled trie budget and automatic exhaustive-domain limit. [Ranges](decisions.md#runtime-and-settings). |
 
 ## Model and GPUs
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `gpu` | server, `basalt`, `basalt-bench`, `basalt-probe` | `"0"`, `"0,1"`, `"auto"` | GPU 0 alone | Cards, numbered as `nvidia-smi`. The first is the main card. `auto` takes every Blackwell card and makes the fastest main. [GPUs](gpus.md) |
+| `gpu` | entry, `basalt`, `basalt-bench`, `basalt-probe` | `"0"`, `"0,1"`, `"auto"` | GPU 0 alone | Cards, numbered as `nvidia-smi`. The first is the main card. `auto` takes every Blackwell card and makes the fastest main. [GPUs](gpus.md) |
 | `peer-reserve-mib` | engine | MiB | 600 | VRAM the second card keeps free after its experts and prompt buffers. Raise it when the start says the peer's buffers do not fit. [GPUs](gpus.md#two-16-gb-cards) |
 
 ## Context and KV cache
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `max-context` | engine | tokens | 4096 (DeepSeek: the pack's maximum, lowered to fit memory) | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
+| `max-context` | engine | tokens | 8192 | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
 | `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | Flash-Next only. KV storage. `int8` halves VRAM. `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056). Not with `kv-resident`. |
 | `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. |
 | `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next only. Extend past the trained length. Fixed for the run. |
@@ -145,8 +147,8 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `parallel` | server | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. |
-| `slot-full-context` | server | switch | off | Give every slot the whole `max-context`, at N times the KV. |
+| `parallel` | entry | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. |
+| `slot-full-context` | entry | switch | off | Give every slot the whole `max-context`, at N times the KV. |
 
 ## Conversation cache
 
@@ -160,6 +162,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | `conversation-cache-mib` | engine | MiB | 0 (off) | RAM budget for parked conversations. |
 | `conversation-cache-slots` | engine | integer | 4 | Most parked conversations. |
 | `conversation-cache-min-free-mib` | engine | MiB | 2560 | Physical RAM kept free when parking. |
+| `no-ram-guard` | engine | switch | off | Serving never sheds, delays or stops a request for low RAM ([memory floors](../running.md#memory-floors)). For machines where the guard stops work that would fit; low RAM can then stop the engine or the machine. |
 | `conversation-cache-min-tokens` | engine | tokens | 0 | Park only conversations of at least this many tokens. |
 | `conversation-cache-disk-mib` | engine | MiB | 0 (off) | Disk budget for parked conversations. [running](../running.md#conversations-on-disk---conversation-cache-disk-mib) |
 | `conversation-cache-dir` | engine | directory | model cache folder | Another folder for the disk tier. |
@@ -168,7 +171,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `vision` | server | `off`, `dynamic`, `cpu`, GPU number | `off` | Image input. A GPU number runs a sidecar on that card (about 2.2 GiB of its expert cache). `cpu` is slow. Needs a model with a vision projector. 32 MiB and 64 megapixels per image. [running](../running.md#vision---vision) |
+| `vision` | entry | `off`, `dynamic`, `cpu`, GPU number | `off` | Image input. A GPU number runs a sidecar on that card (about 2.2 GiB of its expert cache). `cpu` is slow. Needs a model with a vision projector. 32 MiB and 64 megapixels per image. [running](../running.md#vision---vision) |
 | `image-url-host` | server | `HOST` or `HOST:PORT`, repeatable | none | Allow `http(s)` image URLs on this host from other machines. [image sources](image-sources.md) |
 | `image-dir` | server | directory, repeatable | none | Allow image files under this directory from other machines. [image sources](image-sources.md) |
 | `image-remote-only` | server | switch | off | Treat this machine's requests as remote too. [image sources](image-sources.md) |

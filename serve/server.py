@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable a
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
                           engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
-                          sampling_items, start_items)
+                          sampling_items, shared_line, slot_share, start_items, with_spec)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.image_source import image_sources_of  # noqa: E402
@@ -140,6 +140,13 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
             if plan.get("warning"):
                 lines.append(f"[server] warning: {plan['warning']}")
             cfg["gpu"] = plan["devices"]
+            cfg["spec"] = plan.get("spec")
+            if getattr(a, "split_default", False) and plan.get("max_context"):
+                # the engine's default context, shared by the slots
+                a.shared_context = int(plan["max_context"])
+                part = ["--max-context", str(slot_share(a.shared_context, a.parallel))]
+                cfg["args"] += part
+                cli_engine += part
             cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
             cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
     for flag in a.skipped:
@@ -147,6 +154,7 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
     cfg["items"] = start_items(file_engine, cli_engine,
                                (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
                                grammar_entry(a.grammar, sys.argv[1:], used_argv), a.debug) if pack and not a.mock_engine else []
+    cfg["items"] = with_spec(cfg["items"], cfg.get("spec"))
     if a.alias and not pack:
         cfg["model_name"] = a.alias
     if not cfg.get("model_name") and a.model:
@@ -221,7 +229,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         # ---- end Jev ----
         cdir = flag_value(engine_args(cfg), "--conversation-cache-dir")
         cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
-        if cdir and cmib != "0":
+        if cdir and cmib != "0" and a.debug:
             print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
         # always built unloaded: the load itself is the lazy path's, started by the caller instead of by a request
         engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
@@ -310,8 +318,9 @@ def main() -> int:
         fail(f"port {a.port} is in use (--port N)")
     width = max(len(c.get("model_name") or "") for c in cfgs) + 1
     shared = [x for x in cfgs[0].get("items", []) if all(x in c.get("items", []) for c in cfgs[1:])] if multi else []
-    if shared:
-        print(tagged("engine", " ".join(shared)), flush=True)
+    line, shared_sleep = shared_line(shared, [m[0].idle_sleep for m in settings])
+    if line:
+        print(tagged("engine", line), flush=True)
     for c in cfgs:
         c["shared_items"], c["name_width"] = shared, width
     services = [build_model(m[0], cfg, logs, multi, known) for m, cfg in zip(settings, cfgs)]
@@ -368,7 +377,7 @@ def main() -> int:
 
     for s, m in zip(services, (x[0] for x in settings)):
         s.start_idle_unload()
-        s.start_idle_sleep()
+        s.start_idle_sleep(announce=not shared_sleep, name=s.model if multi else None)
         s.on_loaded = announcer(s, m)
 
     # the one place the addresses and the APIs are printed: the server listens before the model loads

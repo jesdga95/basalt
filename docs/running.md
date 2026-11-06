@@ -64,6 +64,10 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - With experts on the SSD, the RAM copy keeps a floor free for the OS file cache (`RAM floor ...` in the start log).
 - While serving, the RAM guard parks conversations to disk or drops them when free RAM falls. A request waits up to 30 s for RAM to
   return. A running request stops with an error only when RAM is critical (under 1 GiB free, or below the guard under memory pressure).
+- Experts on the SSD give one warning, the same for every model: `N experts on SSD (X GiB) · free X GiB RAM`. The console
+  repeats it and the stats page turns its Experts block amber.
+- `--no-ram-guard` turns the guard off: nothing is shed, delayed or stopped for low RAM. The disk tier keeps its floor a GiB
+  above where the guard would sit.
 - `--resident-budget-gib` that would leave less than the floor is refused with the largest safe value.
 
 ## Vision: `--vision`

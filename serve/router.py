@@ -220,7 +220,7 @@ class Router:
         new.load_kind, new.loading = "weights", True    # the status routes show the load from now on
         if hasattr(new.engine, "load_status"):
             new.engine.load_status = {}
-        print(f"[server] swap: {old.model if old else '-'} -> {new.model}, {waiting} waiting", flush=True)
+        print(f"[server] {f'swap {old.model} ->' if old else 'loading'} {new.model} ({waiting} waiting)", flush=True)
         try:
             if old is not None:
                 old.swap_out()                          # at its QUIT the engine spills its conversations to disk

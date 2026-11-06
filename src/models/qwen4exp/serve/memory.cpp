@@ -23,31 +23,6 @@ uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry&
     return bytes;
 }
 
-void QfnRuntime::shed_if_low() {
-    if (basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
-    const uint64_t drop = basalt::platform::ram_guard_drops();
-    if (drop == shed_drop) return;
-    shed_drop = drop;
-    const size_t parked = conversations->size();
-    const size_t freed = conversations->clear();
-    size_t to_disk = 0;
-    for (auto& sc : conversations->take_spilled())
-        if (disk.enabled() && !disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec) &&
-            disk.put(std::move(sc), kDiskQueueCap))
-            ++to_disk;
-    if (freed > 0)
-        basalt::log::info("basalt serve", "RAM guard: %zu parked conversations (%zu MiB) leave RAM, %zu of them "
-                          "to disk", parked, freed >> 20, to_disk);
-    if (const size_t pooled = basalt::core::CheckpointBytes::allocator_type::release_pooled(); pooled > 0)
-        basalt::log::info("basalt serve", "RAM guard: freed %zu MiB of checkpoint blocks kept for reuse",
-                          pooled >> 20);
-    const uint64_t before = basalt::platform::available_memory();
-    basalt::platform::release_free_heap();
-    const uint64_t after = basalt::platform::available_memory();
-    basalt::log::info("basalt serve", "RAM guard: free heap returned to the OS, %lld MiB free now (%+lld MiB)",
-                      (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
-}
-
 // the prompt path's loan with `live` slots: its chunk as large as fits, and the first slot it covers
 int32_t QfnRuntime::loan_plan(int64_t live, int64_t& chunk) {
     PfPart& p = pf_parts[0];
@@ -282,20 +257,10 @@ int QfnRuntime::init_memory() {
         }
     }
     report_expert_tiers();
-    basalt::platform::stop_memory_watchdog();
     // from here the RAM guard watches: below its floor the engine sheds and new requests wait, and a running
-    // request stops only once the RAM is critical
-    guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes, prompt_file_bytes);
-    basalt::platform::start_ram_guard(guard_floor);
-    disk_floor = guard_floor + (1ull << 30);   // a disk-tier capture or read stays a GiB above the guard
-    // what a stop's error compares against, to tell the engine's own growth from other programs'
-    ready_avail = basalt::platform::available_memory();
-    ready_rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
-    // once per drop below the guard's floor, on the serve thread between steps: the parked conversations leave RAM
-    // (to the disk tier when it is on and holds no copy of them yet: queued for its writer, whose writes free them;
-    // the others are dropped), the checkpoint blocks kept for reuse are freed and the heap's free pages return to
-    // the OS.  The checkpoints stay: a live request's rewind and the deferred copy in flight use them.
-    shed_drop = 0;
+    // request stops only once the RAM is critical.  The checkpoints stay through a shed: a live request's rewind and
+    // the deferred copy in flight use them.
+    start_guard(tier_spill.bytes, prompt_file_bytes);
 
     // a VRAM shrink's RAM homes leave the guard's floor above the margin and the top-up's own slack free
     src.set_homes_reserve(guard_floor - std::min(guard_floor, basalt::platform::ram_margin()) + (256ull << 20));

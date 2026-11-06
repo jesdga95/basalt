@@ -3,7 +3,9 @@
 
 #include "decode_loop.hpp"
 #include "basalt/core/diag.hpp"
+#include "basalt/core/device.hpp"
 #include "basalt/core/draft_cum.hpp"
+#include "basalt/program/community_row.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/probe_rates.hpp"
 
@@ -77,14 +79,26 @@ public:
         }
         return 0;
     }
+    // the pack's quantization label and the PCI bus ids of the cards this engine computes on, primary first: what a
+    // benchmark row records
+    std::string identity_words() const {
+        const basalt::core::Json* nm = model_file.meta().get("name");
+        std::string ids;
+        for (int d : basalt::program::engine_gpu_order(o.peer_device, o.peer_devices, {})) {
+            std::string bus;
+            if (basalt::core::device_pci_bus_id(d, bus)) ids += (ids.empty() ? "" : ",") + bus;
+        }
+        return "quant=" + basalt::program::pack_quant_label(nm != nullptr && nm->is_string() ? nm->s : std::string()) +
+               " gpus=" + ids + " ";
+    }
     int init_after_input() override {
         for (auto& s : sessions_)
             if (const basalt::model::Result r = s->prepare(); !r.ok()) {
                 basalt::log::error("basalt serve", "%s", r.message.c_str());
                 return 1;
             }
-        disk_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), 0, 0) + (1ull << 30);
-        if (const std::string words = sessions_[0]->info_words(); !words.empty()) std::printf("INFO %s\n", words.c_str());
+        start_guard(0, 0);   // the margin alone: no prompt chunk is sized to reads of the file
+        std::printf("INFO %s\n", (identity_words() + sessions_[0]->info_words()).c_str());
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);
         return 0;
@@ -241,9 +255,6 @@ public:
         return false;
     }
     bool slots_share_cells() const override { return false; }
-    void shed_if_low() override {
-        if (basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok && !checks.empty()) checks.clear();
-    }
     int64_t slot_context(int) const override { return o.max_context; }
     bool slot0_solo() const override { return o.batch > 0; }
 
@@ -432,7 +443,7 @@ public:
     void observe_policy(bool, int, int, int, Clock::time_point) {}
     void mark_after_window() {}
     void mark_loop_end() {}
-    void shed_low() { rt_.SessionRuntime::shed_if_low(); }
+    void shed_low() { rt_.shed_if_low(); }
     void stamp_loop_end() {}
     void decode_end() {}
 
@@ -486,6 +497,7 @@ private:
         dc.hits = c.hits - counts0_.hits;
         dc.lookups = c.lookups - counts0_.lookups;
         dc.offloaded = c.offloaded - counts0_.offloaded;
+        dc.file_blobs = c.files - counts0_.files;
         return dc;
     }
     void report_request(const DoneCounts& dc) override { report_expert_counts(dc); }

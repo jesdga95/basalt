@@ -146,6 +146,16 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .sb-leg > div::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--c); }
 .sb-leg span { font-size: 12.5px; line-height: 1; color: var(--fg-3); }
 .sb-leg b { grid-column: 2; font: 500 14.5px/1 var(--font-mono); font-variant-numeric: tabular-nums; }
+/* Experts on the SSD: the block turns amber, the legend becomes a 2x2 grid of one-line tiers, and a note gives the fix */
+.sb-exp.spill { margin: 0 8px 8px; border: 1px solid rgba(233, 195, 65, .55); border-radius: 6px; background: rgba(233, 195, 65, .07); }
+.sb-exp.spill .sb-h, .sb-exp.spill .sb-body { padding-left: 12px; padding-right: 12px; }
+.sb-exp.spill .sb-h > span { color: var(--warn); }
+.sb-leg.q { display: grid; grid-template-columns: 1fr 1fr; column-gap: 24px; row-gap: 9px; margin-top: 12px; }
+.sb-leg.q > div { grid-template-columns: 8px auto 1fr; row-gap: 0; }
+.sb-leg.q b { grid-column: 3; justify-self: end; font-size: 13.5px; }
+.sb-note { margin-top: 14px; font-size: 12.5px; line-height: 1.45; color: var(--fg-2); }
+.sb-note b { color: var(--warn); font-weight: 600; }
+.sb-note > span { white-space: nowrap; }
 
 /* Speed: decode on the wide left, prefill on the right, one footer bar under both */
 .trio { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }

@@ -232,7 +232,7 @@ class ProcessEngine:
             self.loading, self.load_status = False, {}
         self.asleep = False              # its GPU state suspended by the driver (sleep/wake)
         self.restore_s = 0.0             # the driver's part of the last wake
-        self.max_context = int(flag_value(args, "--max-context") or 4096)
+        self.max_context = int(flag_value(args, "--max-context") or 0)   # the engine's own at READY
         self.can_stop = False            # READY <ctx> stop
         self.last = {}
         self.slot_drafts = {}
@@ -497,6 +497,8 @@ class ProcessEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
+        if len(f) >= 13:                                  # decode lookups read from the expert file
+            self.last.update(file_reads=int(f[12]))
         if len(f) >= 15:                                  # prompt tokens actually read
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # experts read over PCIe

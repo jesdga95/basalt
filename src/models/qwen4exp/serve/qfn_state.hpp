@@ -409,7 +409,6 @@ private:
     bool xq_advance(bool wait);
     bool xq_drain();
     void save_profile(const char* why);
-    void shed_if_low() override;
     void make_view(basalt::core::SessionState& v, int b);
     int32_t loan_plan(int64_t live, int64_t& chunk);
     void relend();

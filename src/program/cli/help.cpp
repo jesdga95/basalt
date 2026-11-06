@@ -1,6 +1,7 @@
 #include "help.hpp"
 
 #include "basalt/log.hpp"
+#include "basalt/program/options.hpp"
 
 namespace basalt::program::cli {
 
@@ -48,7 +49,7 @@ void usage() {
                  "  --prompt-cache-root N  --serve: checkpoint a prompt's first turn boundary when it is at least N tokens\n"
                  "                       long (default 2048, 0 = never)\n"
                  "  --max-new N          tokens to generate (default 16)\n"
-                 "  --max-context N      KV/state capacity (default 4096)\n"
+                 "  --max-context N      KV/state capacity (default %lld)\n"
                  "  --rope-scaling T     extend the context past the trained one: none, linear\n"
                  "                       (position interpolation) or yarn - llama.cpp's types and names.\n"
                  "                       Default: the model file's rope keys, else none. Fixed at startup:\n"
@@ -77,6 +78,7 @@ void usage() {
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
+                 "  --no-ram-guard       --serve: no RAM guard; low RAM never sheds, delays or stops a request\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens (default 0 = park every one)\n"
                  "  --conversation-cache-disk-mib N  --serve: park conversations on disk, at most N MiB, and read them back\n"
                  "                       when a prompt starts with one, also after a restart (default 0 = off)\n"
@@ -210,7 +212,7 @@ void usage() {
                  "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first;\n"
                  "                       auto when not set: what fits);\n"
                  "                       a budget that would leave less than the RAM floor free is refused, naming\n"
-                 "                       the largest safe value.\n");
+                 "                       the largest safe value.\n", (long long) basalt::program::kDefaultContext);
 }
 
 }  // namespace basalt::program::cli

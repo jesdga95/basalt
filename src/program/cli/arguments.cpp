@@ -36,7 +36,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             have_tokens = true;
         }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
-        else if (a == "--max-context") { o.max_context = std::atoll(next("--max-context")); o.max_context_set = true; }
+        else if (a == "--max-context") { o.max_context = std::atoll(next("--max-context")); }
         else if (a == "--diag-dump") o.diag_dump = next("--diag-dump");
         else if (a == "--diag-tier-ram") o.diag_tier_ram = std::atoi(next("--diag-tier-ram"));
         else if (a == "--diag-tier-vram") o.diag_tier_vram = std::atoi(next("--diag-tier-vram"));
@@ -94,6 +94,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             o.grammar = v == "on";
         }
         else if (a == "--stop-eos") o.stop_eos = true;
+        else if (a == "--no-ram-guard") o.no_ram_guard = true;
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--vision-mmproj") { o.vision_mmproj = next("--vision-mmproj"); o.vision = true; }
@@ -147,6 +148,8 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         }
         }
     }
+    if (o.serve && o.no_ram_guard && !o.gpu_plan)
+        basalt::log::warn("basalt", "RAM guard off (--no-ram-guard): low RAM can stop the engine or the machine");
     if (adapter != nullptr) return adapter->finish_flags(o);
     return std::nullopt;
 }

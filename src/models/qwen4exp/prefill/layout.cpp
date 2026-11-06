@@ -364,7 +364,6 @@ void Prefill::set_cpu_share(double share) { impl_->cpu_share_now = std::max(0.0,
 void Prefill::set_ring_depth(int slots) { g_ring_depth = std::max(STAGE + 1, std::min(slots, kPrefillRingDeep)); }
 int Prefill::ring_depth() const { return impl_->ring; }
 double Prefill::pinned_share() { return g_pinned_share; }
-bool Prefill::fp4_experts() { return fp4_pack(); }
 
 namespace { constexpr uint64_t kSizingSlack = 8u << 20; }   // alignment slack of a borrowed region
 

@@ -33,7 +33,7 @@ public:
         auto m = std::make_unique<DsModel>();
         std::string err;
         if (!m->load(req.paths.front(), err)) return {model::Status::Error, "deepseek41: " + err};
-        if (!m->resolve_context(req.max_context, req.max_context_set, err)) return {model::Status::Error, err};
+        if (!m->resolve_context(req.max_context, err)) return {model::Status::Error, err};
         m->set_diag_dump(req.diag_dump);
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
         m->set_tiers(req);
@@ -73,6 +73,8 @@ public:
 
     int max_expert_cards() const override { return 1; }
 
+    const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
+
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         (void) code;
         if (a == "--no-prompt-skip") o.no_prompt_skip = true;
@@ -109,10 +111,10 @@ public:
                 o.spec = 0;
             }
         }
-        if (!o.max_context_set || !opened || !file.load_meta(err)) return std::nullopt;
+        if (!opened || !file.load_meta(err)) return std::nullopt;
         const core::Json* kv = file.meta().get("gguf_kv");
         const core::Json* native = kv ? kv->get("deepseek41.context_length") : nullptr;
-        const ctxp::Plan p = ctxp::plan_context(o.max_context, true, native ? (int64_t) native->u64() : 0, UINT64_MAX, {});
+        const ctxp::Plan p = ctxp::plan_context(o.max_context, native ? (int64_t) native->u64() : 0, UINT64_MAX, {});
         if (p.error.empty()) return std::nullopt;
         basalt::log::error("basalt deepseek41", "%s", p.error.c_str());
         return 2;

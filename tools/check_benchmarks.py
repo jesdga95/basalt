@@ -7,14 +7,16 @@ import json
 import re
 import sys
 
-REQUIRED = {"submitter", "date", "commit", "preset", "gpus", "ram_gib", "os",
-            "quant", "prefill_16k_tps", "prefill_64k_tps", "decode_tps"}
+REQUIRED = {"submitter", "date", "commit", "preset", "model", "gpus", "ram_gib", "os",
+            "quant", "kv", "prefill_16k_tps", "prefill_64k_tps", "decode_tps"}
 OPTIONAL = {"notes", "cpu", "ram_gbps"}
 GPU_KEYS = {"name", "vram_gib", "power_w", "pcie", "h2d_gbps"}
 PCIE = re.compile(r"[1-9](\.0)? x(1|2|4|8|16|32)")
 PLACEHOLDER = "YOUR_NAME"
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 SYSTEMS = ("Linux", "Windows", "WSL2")
+MODELS = ("Qwen3.8-Flash-Next", "DeepSeek-V4.1-Flash")   # the engine's model names (model_name of each adapter)
+KV_FORMATS = ("fp16", "int8", "q4_0", "k8v4")            # the --kv values the engine accepts
 
 
 def is_num(v):
@@ -100,12 +102,16 @@ def check_row(r, err):
         err("os must be one of " + ", ".join(SYSTEMS))
     if "quant" in r and not is_text(r["quant"]):
         err("quant must be a non-empty string")
+    if "model" in r and r["model"] not in MODELS:
+        err("model must be one of " + ", ".join(MODELS))
+    if "kv" in r and r["kv"] not in KV_FORMATS:
+        err("kv must be one of " + ", ".join(KV_FORMATS))
     if "notes" in r and not (isinstance(r["notes"], str) and len(r["notes"]) <= 200):
         err("notes must be a string of at most 200 characters")
 
 
-ROW_ORDER = ("submitter", "date", "commit", "preset", "gpus", "ram_gib", "cpu", "ram_gbps", "os",
-             "quant", "prefill_16k_tps", "prefill_64k_tps", "decode_tps", "notes")
+ROW_ORDER = ("submitter", "date", "commit", "preset", "model", "gpus", "ram_gib", "cpu", "ram_gbps", "os",
+             "quant", "kv", "prefill_16k_tps", "prefill_64k_tps", "decode_tps", "notes")
 GPU_ORDER = ("name", "vram_gib", "power_w", "pcie", "h2d_gbps")
 TOP_ORDER = ("preset", "runs")
 FIX_HINT = "python3 tools/check_benchmarks.py --fix docs/community/benchmarks.json"

@@ -4,6 +4,7 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "../../../program/serve/state.hpp"
 #include "../load/engine_local.hpp"
+#include "basalt/program/expert_spill.hpp"
 #include "basalt/program/grammar/guard.hpp"
 #include "basalt/platform/system.hpp"
 
@@ -87,12 +88,13 @@ struct Context {
     std::function<int64_t()> read_cap;
     const int64_t& kSplitRefCells;
     int64_t& split_hand_rows;
+    int64_t& split_chunk_cap;
     int64_t& split_peer_rows;
     std::function<engine_local::SplitPricing(int64_t, int64_t, int64_t, int)> split_price;
     std::function<std::string(int, const std::vector<int>&)> split_layers_text;
     std::function<std::string(const PsPrice&)> split_stages_text;
     int& split_stages;
-    uint64_t& tier_file_bytes;
+    basalt::program::ExpertSpill& tier_spill;
     std::function<void()> report_expert_tiers;
 };
 
