@@ -27,7 +27,9 @@ from Unsloth's UD-IQ1_M GGUF. Its layout and the DSpark section: [model file](..
   than half the free memory, is refused; a quarter or more gives a warning.
 - **VRAM:** `--expert-cache` caps the slots; `--vram-reserve-mib` or `POST /v1/vram` sets what stays free. The caches, prompts and
   images take the tier's copies first (homes stay) and halve their chunks to fit above the reserve.
-- **Refused flags:** `--kv` (the caches are FP8 and FP4, [precision](../precision/deepseek41.md#where-each-stage-rounds)), `--rope-*`, `--yarn-*` (YaRN is part of the model).
+- **Cache precision:** `--kv fp8` (default) stores the caches as the model's reference rounds them, 920 bytes per position;
+  `--kv fp16` keeps the unrounded values, 3,200 bytes per position (a 1M context about 3.2 GiB). [precision](../precision/deepseek41.md#where-each-stage-rounds)
+- **Refused flags:** `--rope-*`, `--yarn-*` (YaRN is part of the model).
 
 ## Long prompts
 

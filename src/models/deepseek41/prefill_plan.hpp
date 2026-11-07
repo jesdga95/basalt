@@ -105,9 +105,9 @@ inline Fit plan_chunk(const Dims& d, uint64_t free_bytes, uint64_t margin, int t
 
 /// Positions the caches keep when a new sequence starts with `backed` positions mapped: all of them when giving the
 /// rest back would free little, else `kKeepPositions`.
-inline int64_t keep_positions(int64_t backed, const std::vector<int>& ratios) {
+inline int64_t keep_positions(int64_t backed, const std::vector<int>& ratios, CacheFormat f) {
     if (backed <= kKeepPositions) return backed;
-    return ctxp::cache_bytes(backed, ratios) - ctxp::cache_bytes(kKeepPositions, ratios) >= kTrimBytes ? kKeepPositions : backed;
+    return ctxp::cache_bytes(backed, ratios, f) - ctxp::cache_bytes(kKeepPositions, ratios, f) >= kTrimBytes ? kKeepPositions : backed;
 }
 
 }  // namespace basalt::models::deepseek41::prefillp

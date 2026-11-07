@@ -187,6 +187,8 @@ int main() {
         {"full fp8/fp4 T3", {3, 512, 136, 4096, LatentType::Fp8, LatentType::Fp4, true, {128, 128, 64}}},
         {"full fp8/fp4 T8", {8, 512, 136, 4096, LatentType::Fp8, LatentType::Fp4, true, {128, 128, 64, 1, 128, 100, 9, 128}}},
         {"window only fp8 T2", {2, 0, 136, 10, LatentType::Fp8, LatentType::Fp4, false, {128, 33}}},
+        {"full fp16 T3", {3, 512, 136, 4096, LatentType::F16, LatentType::F16, true, {128, 128, 64}}},
+        {"window only fp16 T2", {2, 0, 136, 10, LatentType::F16, LatentType::F16, false, {128, 33}}},
         {"drafter f16/f32 T4", {4, 4, 136, 300, LatentType::F16, LatentType::F32, false, {128, 128, 2, 77}}},
         {"short sel f32 T2", {2, 200, 128, 300, LatentType::F32, LatentType::F32, false, {128, 20}}},
         {"window only T4", {4, 0, 128, 10, LatentType::F32, LatentType::F32, false, {128, 5, 77, 1}}},

@@ -94,6 +94,7 @@ struct LoadRequest {
     std::string profile_dir;          ///< the engine's data/profiles, where a model finds the files its name keys
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
+    std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
 };
 
 struct DecodeRequest {

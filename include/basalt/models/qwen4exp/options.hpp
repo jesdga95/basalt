@@ -26,7 +26,6 @@ struct Options : CommonOptions {
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
     int ple_inflight = 256;   // the prompt path reads a chunk's rows at once, so the SSD stays busy
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
-    std::string kv = "fp16";   // KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
