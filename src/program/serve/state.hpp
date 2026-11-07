@@ -269,6 +269,9 @@ public:
     };
     SlotHeld slot_held{};
     std::vector<ImgKey> imgs_below(const std::vector<ImgKey>& all, int64_t L);
+    // routing feedback: SCACHE publishes only confirmed idle state and reusable checkpoints, before the terminal
+    void report_cache(int slot, bool cached, const std::vector<int32_t>& held,
+                      const std::vector<ImgKey>& images, const std::vector<ConvCheckpoint>& saved);
     bool next_line(std::string& out);
     std::vector<int64_t> cur{};
     int next_line_within(std::string& out, int ms);
