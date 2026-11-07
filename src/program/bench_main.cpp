@@ -323,7 +323,7 @@ void usage(const std::string& engine) {
         "  Make the files once, on a machine with the model, with the server's own tokenizer and template:\n"
         "    python3 -c \"import sys; sys.path[:0]=['.','tools']; from tokenizer import Tokenizer;\n"
         "      from serve.frontend import ChatTemplate; t=Tokenizer.from_gguf(GGUF_SHARD_1);\n"
-        "      c=ChatTemplate('serve/chat_template.jinja'); r=lambda p: t.encode(c.render(\n"
+        "      c=ChatTemplate.from_file('serve/chat_template.jinja'); r=lambda p: t.encode(c.render(\n"
         "      [{'role':'user','content':p}], enable_thinking=False), parse_special=True)\n"
         "      print(','.join(map(str, r(PROMPT))))\"\n"
         "  (for prefill, render with a marker in place of the body and split the ids around it)\n",
