@@ -177,13 +177,55 @@ struct RowFp4 {
 
 constexpr int kScoreRows = kAttnChunk / (kBlockThreads / 32);  // rows per warp
 constexpr int kScoreKeys = 4;                                   // keys scored per read of the query
-constexpr int kPvBatch = 32;                                   // rows whose loads are in flight together
+// Rows whose loads are in flight together. The batch also sets the size of the unrolled weighted sum, which keeps the
+// kernel's code within what the instruction cache holds at launch.
+constexpr int kPvBatch = 16;
 
-// The chunk's scores, softmax statistics and weighted sum over rows of type R. Each loop issues all its row loads
-// before using them.
+// A lane's values of kScoreKeys keys (4 at lane + 32 j of each key, j < 4), rows of type R; masked keys give zeros.
+// All row loads are issued before the first use.
 template <class R>
-__device__ __forceinline__ void mqa_chunk(const uint8_t* base, float scale, const float4* qs, float (*sc)[kAttnChunk],
-                                          const int* rowid, float* mlp0, size_t ml_head, float* o_part0, size_t o_head) {
+__device__ __forceinline__ void score_keys(const uint8_t* base, const int* rowid, int i0, float (*kv)[4][4]) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    typename R::Raw4 raw[kScoreKeys][4];
+    typename R::Scales scl[kScoreKeys];
+#pragma unroll
+    for (int u = 0; u < kScoreKeys; ++u) {
+        const int row = rowid[warp + (i0 + u) * (kBlockThreads / 32)];
+        scl[u] = typename R::Scales{};
+        if (row >= 0) scl[u] = R::scales(base + (size_t) row * R::kRowBytes);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            raw[u][j] = typename R::Raw4{};
+            if (row >= 0) raw[u][j] = R::load4(base + (size_t) row * R::kRowBytes, lane + 32 * j);
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < kScoreKeys; ++u)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) R::cvt4(raw[u][j], scl[u], j, kv[u][j]);
+}
+
+// A thread's two values of kPvBatch rows from k0, rows of type R; masked rows give zeros. All loads are issued first.
+template <class R>
+__device__ __forceinline__ void pv_rows(const uint8_t* base, const int* rowid, int k0, float (*k2)[2]) {
+    typename R::Raw2 r2[kPvBatch];
+#pragma unroll
+    for (int i = 0; i < kPvBatch; ++i) {
+        const int row = rowid[k0 + i];
+        r2[i] = typename R::Raw2{};
+        if (row >= 0) r2[i] = R::load2(base + (size_t) row * R::kRowBytes, threadIdx.x);
+    }
+#pragma unroll
+    for (int i = 0; i < kPvBatch; ++i) R::cvt2(r2[i], k2[i]);
+}
+
+// The chunk's scores, softmax statistics and weighted sum; its rows are of type W (window) or C (compressed). Only the
+// row loads and their decoding depend on the type: the arithmetic is one body for both, so the kernel's code is
+// not doubled.
+template <class W, class C>
+__device__ __forceinline__ void mqa_chunk(bool window, const uint8_t* base, float scale, const float4* qs,
+                                          float (*sc)[kAttnChunk], const int* rowid, float* mlp0, size_t ml_head,
+                                          float* o_part0, size_t o_head) {
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
 
     // scores
@@ -191,19 +233,9 @@ __device__ __forceinline__ void mqa_chunk(const uint8_t* base, float scale, cons
     // reductions keep their own order
 #pragma unroll 1
     for (int i0 = 0; i0 < kScoreRows; i0 += kScoreKeys) {
-        typename R::Raw4 raw[kScoreKeys][4];
-        typename R::Scales scl[kScoreKeys];
-#pragma unroll
-        for (int u = 0; u < kScoreKeys; ++u) {
-            const int row = rowid[warp + (i0 + u) * (kBlockThreads / 32)];
-            scl[u] = typename R::Scales{};
-            if (row >= 0) scl[u] = R::scales(base + (size_t) row * R::kRowBytes);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                raw[u][j] = typename R::Raw4{};
-                if (row >= 0) raw[u][j] = R::load4(base + (size_t) row * R::kRowBytes, lane + 32 * j);
-            }
-        }
+        float kv[kScoreKeys][4][4];
+        if (window) score_keys<W>(base, rowid, i0, kv);
+        else score_keys<C>(base, rowid, i0, kv);
         float v[kScoreKeys][kHeadsPerBlock];
 #pragma unroll
         for (int u = 0; u < kScoreKeys; ++u)
@@ -211,18 +243,15 @@ __device__ __forceinline__ void mqa_chunk(const uint8_t* base, float scale, cons
             for (int h = 0; h < kHeadsPerBlock; ++h) v[u][h] = 0.f;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            float kv[kScoreKeys][4];
-#pragma unroll
-            for (int u = 0; u < kScoreKeys; ++u) R::cvt4(raw[u][j], scl[u], j, kv[u]);
 #pragma unroll
             for (int h = 0; h < kHeadsPerBlock; ++h) {
                 const float4 q4 = qs[h * (kAttnHeadDim / 4) + lane + 32 * j];
 #pragma unroll
                 for (int u = 0; u < kScoreKeys; ++u) {
-                    v[u][h] = fmaf(q4.x, kv[u][0], v[u][h]);
-                    v[u][h] = fmaf(q4.y, kv[u][1], v[u][h]);
-                    v[u][h] = fmaf(q4.z, kv[u][2], v[u][h]);
-                    v[u][h] = fmaf(q4.w, kv[u][3], v[u][h]);
+                    v[u][h] = fmaf(q4.x, kv[u][j][0], v[u][h]);
+                    v[u][h] = fmaf(q4.y, kv[u][j][1], v[u][h]);
+                    v[u][h] = fmaf(q4.z, kv[u][j][2], v[u][h]);
+                    v[u][h] = fmaf(q4.w, kv[u][j][3], v[u][h]);
                 }
             }
         }
@@ -288,27 +317,20 @@ __device__ __forceinline__ void mqa_chunk(const uint8_t* base, float scale, cons
     for (int h = 0; h < kHeadsPerBlock; ++h) acc[h][0] = acc[h][1] = 0.f;
 #pragma unroll 1
     for (int k0 = 0; k0 < kAttnChunk; k0 += kPvBatch) {
-        typename R::Raw2 r2[kPvBatch];
-#pragma unroll
-        for (int i = 0; i < kPvBatch; ++i) {
-            const int row = rowid[k0 + i];
-            r2[i] = typename R::Raw2{};
-            if (row >= 0) r2[i] = R::load2(base + (size_t) row * R::kRowBytes, tid);
-        }
+        float k2[kPvBatch][2];
+        if (window) pv_rows<W>(base, rowid, k0, k2);
+        else pv_rows<C>(base, rowid, k0, k2);
         // masked rows hold zeros and zero weights, so their terms add exact zeros
 #pragma unroll
         for (int i4 = 0; i4 < kPvBatch; i4 += 4) {
-            float k2[4][2];
-#pragma unroll
-            for (int u = 0; u < 4; ++u) R::cvt2(r2[i4 + u], k2[u]);
 #pragma unroll
             for (int h = 0; h < kHeadsPerBlock; ++h) {
                 const float4 p4 = *reinterpret_cast<const float4*>(&sc[h][k0 + i4]);  // four rows' weights
                 const float pu[4] = {p4.x, p4.y, p4.z, p4.w};
 #pragma unroll
                 for (int u = 0; u < 4; ++u) {
-                    acc[h][0] = fmaf(pu[u], k2[u][0], acc[h][0]);
-                    acc[h][1] = fmaf(pu[u], k2[u][1], acc[h][1]);
+                    acc[h][0] = fmaf(pu[u], k2[i4 + u][0], acc[h][0]);
+                    acc[h][1] = fmaf(pu[u], k2[i4 + u][1], acc[h][1]);
                 }
             }
         }
@@ -368,12 +390,8 @@ __global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, i
     __syncthreads();
 
     float* o0 = o_part + (((size_t) t * kAttnHeads + head0) * n_chunks_total + slot) * kAttnHeadDim;
-    if (kWindow)
-        mqa_chunk<W>(static_cast<const uint8_t*>(a.win), a.scale, qs, sc, rowid, mlp0, (size_t) n_chunks_total * 2, o0,
-                     (size_t) n_chunks_total * kAttnHeadDim);
-    else
-        mqa_chunk<C>(static_cast<const uint8_t*>(a.comp), a.scale, qs, sc, rowid, mlp0, (size_t) n_chunks_total * 2, o0,
-                     (size_t) n_chunks_total * kAttnHeadDim);
+    mqa_chunk<W, C>(kWindow, static_cast<const uint8_t*>(kWindow ? a.win : a.comp), a.scale, qs, sc, rowid, mlp0,
+                    (size_t) n_chunks_total * 2, o0, (size_t) n_chunks_total * kAttnHeadDim);
 }
 
 // ---- merge of the chunks with the sink, then the inverse RoPE -------------------------------------------------
