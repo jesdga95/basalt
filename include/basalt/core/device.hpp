@@ -41,6 +41,15 @@ bool device_summary(int ordinal, std::string& name, std::string& detail);
 // The device's PCI bus id as the runtime spells it ("0000:01:00.0"); false when it cannot say.
 bool device_pci_bus_id(int ordinal, std::string& id);
 
+// Fixed facts of the device for splitting work between cards: its PCIe link's byte rate in one direction (the generation
+// the card and the system reach, the width it runs at, the per-lane rate of that generation) and its SM count times its
+// highest SM clock. Read from the driver, never timed, so a placement prices the same on every start; 0 when unknown.
+struct DeviceRates {
+    double link_bytes = 0;    // bytes per second
+    double sm_hz = 0;         // SMs x clock (cycles per second summed over SMs)
+};
+DeviceRates device_rates(int ordinal);
+
 // Pinned host-to-device copy speed of the device in GB/s: the best of several 256 MiB copies. 0 when the copy could not
 // be set up or timed. Uses the device briefly and frees everything before it returns.
 double device_h2d_gbps(int ordinal);
