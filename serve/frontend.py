@@ -160,17 +160,23 @@ def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
     if isinstance(v, str):
         return _mark(v, tags)
     if isinstance(v, dict):
-        return {k: _mark_deep(x, tags) for k, x in v.items()}
+        return {k: x if _is_source(v, k) else _mark_deep(x, tags) for k, x in v.items()}
     if isinstance(v, list):
         return [_mark_deep(x, tags) for x in v]
     return v
+
+
+def _is_source(item: dict, key: str) -> bool:
+    """An image item's source (a path, URL or base64 data URL) never reaches the prompt as text, so it is neither
+    scanned nor marked."""
+    return key == "source" and item.get("type") == "image"
 
 
 def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     if isinstance(v, str):
         return any(tag in v for tag in tags)
     if isinstance(v, dict):
-        return any(_has_tag(x, tags) for x in v.values())
+        return any(_has_tag(x, tags) for k, x in v.items() if not _is_source(v, k))
     if isinstance(v, list):
         return any(_has_tag(x, tags) for x in v)
     return False
