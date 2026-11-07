@@ -32,7 +32,8 @@ public:
         int n_expert = 0;              ///< experts per layer
         int launch_experts = 6;        ///< experts staged together, the most one launch covers
         int64_t launch_rows = 1024;    ///< rows of one launch; a group with more takes several
-        int bufs = kMaxBufs;           ///< groups staged, and launches in flight (2 or 3)
+        int stage_bufs = kMaxBufs;     ///< groups staged at once (1 to 3)
+        int bufs = kMaxBufs;           ///< launches in flight (2 or 3)
     };
     /// Device bytes on the second card, and pinned host bytes, `open` takes.
     static uint64_t peer_bytes(const Dims& d);
