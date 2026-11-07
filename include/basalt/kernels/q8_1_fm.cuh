@@ -41,26 +41,4 @@ __device__ __forceinline__ void q8_1_store_fm(float xi, Q81Fm* y, size_t ib, int
     if (lane == 0) y[ib].ds = q8_1_ds(d, sum);
 }
 
-/// Block `ib` of `y` from an aligned group of 8 lanes: lane l holds values 4 (l & 7) .. 4 (l & 7) + 3 in v. The sum
-/// adds in the order of the warp-wide butterfly above (value bits 4, 3, 2 across the lanes, then bits 1 and 0).
-__device__ __forceinline__ void q8_1_store4_fm(float4 v, Q81Fm* y, size_t ib, int lane) {
-    const unsigned mask = 0xffu << (lane & 24);
-    float amax = fm_max(fm_max(fm_abs(v.x), fm_abs(v.y)), fm_max(fm_abs(v.z), fm_abs(v.w)));
-    float s0 = v.x, s1 = v.y, s2 = v.z, s3 = v.w;
-#pragma unroll
-    for (int o = 4; o > 0; o >>= 1) {
-        amax = fm_max(amax, __shfl_xor_sync(mask, amax, o));
-        s0 = fm_add(s0, __shfl_xor_sync(mask, s0, o));
-        s1 = fm_add(s1, __shfl_xor_sync(mask, s1, o));
-        s2 = fm_add(s2, __shfl_xor_sync(mask, s2, o));
-        s3 = fm_add(s3, __shfl_xor_sync(mask, s3, o));
-    }
-    const float sum = fm_add(fm_add(s0, s2), fm_add(s1, s3));
-    const float d = q8_1_finite(fm_div(amax, 127.0f));
-    const char4 q = make_char4(q8_1_code_fm(v.x, d, amax), q8_1_code_fm(v.y, d, amax), q8_1_code_fm(v.z, d, amax),
-                               q8_1_code_fm(v.w, d, amax));
-    *reinterpret_cast<char4*>(&y[ib].qs[4 * (lane & 7)]) = q;
-    if ((lane & 7) == 0) y[ib].ds = q8_1_ds(d, sum);
-}
-
 }  // namespace basalt::kernels
