@@ -34,7 +34,7 @@ class Fixture:
     def setUpClass(cls):
         tok = ByteTokenizer()
         cls.engine = MockEngine(tok, "</think>\n\n{\"a\": 1}", max_context=4096)
-        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), grammar=cls.grammar)
+        cls.svc = Service(cls.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), grammar=cls.grammar)
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -238,7 +238,7 @@ class GrammarOn(Fixture, unittest.TestCase):
 class EngineWithoutTheFlag(unittest.TestCase):
     def test_no_key_sent(self):
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), grammar=True,
+        svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), grammar=True,
                       grammar_engine=False)
         self.assertIsNone(svc.grammar_for([TOOL], None, [STRICT_TOOL], None))
 
@@ -306,7 +306,7 @@ class EngineStart(unittest.TestCase):
             (tokdir / "vocab.json").write_text("{}")
             (tokdir / "merges.txt").write_text("")
             (tokdir / "token_type.json").write_text("[]")
-            cfg = {"engine_bin": str(eng), "args": ["--serve"], "log": None, "tokenizer": str(tokdir)}
+            cfg = {"engine_bin": str(eng), "args": ["--serve"], "log": None, "tokenizer": {n: (tokdir / n).read_bytes() for n in ("vocab.json", "merges.txt", "token_type.json")}}
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch("serve.engine.modelfile.model_config", return_value=cfg), \
                     mock.patch.dict(sys.modules, {"tokenizer": types.SimpleNamespace(Tokenizer=lambda *a, **k: ByteTokenizer())}), \

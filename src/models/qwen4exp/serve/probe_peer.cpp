@@ -33,8 +33,8 @@ public:
         dev = env.peer_device;
         k = std::max(env.top_k, kExperts);
         n_expert = (int) env.n_expert;
-        L = K::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-        if (!K::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)) { why = "format_not_covered"; return false; }
+        L = K::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, 0.0f, f.up_type);
+        if (!K::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type)) { why = "format_not_covered"; return false; }
         q2 = f.gu_type == 42;
         core::OnDevice od(dev);
         blocks_ = K::dec_moe_peer_blocks(q2);

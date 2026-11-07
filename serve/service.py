@@ -109,6 +109,7 @@ class Service:
         self.logs = LogBuffer()                         # server and engine output
         # origins allowed to call /v1/* (CORS; "*" = any); empty: no CORS headers
         self.cors_origins: list[str] = []
+        self.max_payload = 256 << 20                     # the most a JSON request body may hold, in bytes
         # origins treated as the server's own page for the load/unload/VRAM controls (no wildcard)
         self.trusted_origins: list[str] = []
         # DNS-rebinding guard: extra Host names ("*" = any) and all names answered, set by serve()
@@ -646,7 +647,9 @@ class Service:
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if busy else None}
         info = dict(getattr(self.engine, "info", {}) or {})
         spill = spill_of(info)
-        engine = {"model": self.model, "max_context": self.engine.max_context, **info, "spill": spill}
+        # a start under way reads 0; the last READY's context stands in until the new one arrives
+        engine = {"model": self.model, "max_context": self.engine.max_context or getattr(self.engine, "known_ctx", 0), **info,
+                  "spill": spill}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
         with self.status_lock:

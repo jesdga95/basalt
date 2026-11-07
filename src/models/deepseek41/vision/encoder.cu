@@ -150,7 +150,7 @@ __global__ void k_assemble(const float* aligned, const float* start, const float
 struct VisionEncoder::Impl {
     int layers = 0, proj = 0, cap = 0, ng_cap = 0, tok_cap = 0;
     float eps = 1e-6f;
-    cublasHandle_t blas = nullptr;
+    cublasHandle_t blas = nullptr;   // borrowed from the VisionBlas
     struct Layer {
         float *ln1, *ln2, *bqkv, *bo;
         __nv_bfloat16 *wqkv, *wo, *wgate, *wup, *wdown;
@@ -168,7 +168,6 @@ struct VisionEncoder::Impl {
     ~Impl() {
         for (void* p : owned) cudaFree(p);
         for (void* p : work) cudaFree(p);
-        if (blas) cublasDestroy(blas);
     }
 
     template <class T>
@@ -263,12 +262,52 @@ VisionEncoder::VisionEncoder() : impl_(new Impl) {}
 VisionEncoder::~VisionEncoder() = default;
 int VisionEncoder::width() const { return impl_->proj; }
 
-bool VisionEncoder::init(const basalt::vision::Mmproj& mp, int max_patches, std::string& err) {
-    (void) max_patches;
+struct VisionBlas::Impl {
+    cublasHandle_t blas = nullptr;
+    ~Impl() {
+        if (blas) cublasDestroy(blas);
+    }
+};
+
+VisionBlas::VisionBlas() : impl_(new Impl) {}
+VisionBlas::~VisionBlas() = default;
+
+bool VisionBlas::open(std::string& err) {
+    if (impl_->blas) return true;
     if (cublasCreate(&impl_->blas) != CUBLAS_STATUS_SUCCESS) {
+        impl_->blas = nullptr;
         err = "cannot create the product handle";
         return false;
     }
+    // the first product of each kind loads its kernels; the encoder runs an fp32 and a bf16 kind
+    constexpr int n = 64;
+    void* buf = nullptr;
+    bool ok = cudaMalloc(&buf, 3 * (size_t) n * n * sizeof(float)) == cudaSuccess;
+    if (ok) {
+        float* a = (float*) buf;
+        float* b = a + n * n;
+        float* c = b + n * n;
+        cudaMemset(buf, 0, 3 * (size_t) n * n * sizeof(float));
+        const float one = 1.f, zero = 0.f;
+        ok = cublasGemmEx(impl_->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &one, a, CUDA_R_32F, n, b, CUDA_R_32F, n, &zero, c,
+                          CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS &&
+             cublasGemmEx(impl_->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &one, a, CUDA_R_16BF, n, b, CUDA_R_16BF, n, &zero, c,
+                          CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS &&
+             cudaStreamSynchronize(nullptr) == cudaSuccess;
+        cudaFree(buf);
+    }
+    if (!ok) {
+        cublasDestroy(impl_->blas);
+        impl_->blas = nullptr;
+        err = "cannot run the first products of the image encoder";
+    }
+    return ok;
+}
+
+bool VisionEncoder::init(const basalt::vision::Mmproj& mp, int max_patches, VisionBlas& blas, std::string& err) {
+    (void) max_patches;
+    if (!blas.open(err)) return false;
+    impl_->blas = blas.impl_->blas;
     if (!impl_->load(mp, err)) {
         if (err.empty()) err = "cannot upload the projector weights";
         return false;

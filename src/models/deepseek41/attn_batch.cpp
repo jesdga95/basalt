@@ -60,7 +60,7 @@ public:
         bool ok = alloc(&xq_, xq) && alloc(&kvraw_, S * kLatent * 4) && alloc(&qr_, S * kAttnQRank * 4) &&
                   alloc(&q_, S * kAttnHeads * kAttnHeadDim * 4) && alloc(&attn_, S * kAttnHeads * kAttnHeadDim * 4) &&
                   alloc(&oa_, S * kAttnGroups * kAttnOutRank * 4) && alloc(&ident_, S * 4) &&
-                  alloc(&stage_, (size_t) kStageSlots * kLatent * 2) &&
+                  alloc(&stage_, (size_t) kStageSlots * win_row_bytes(c_.format)) &&
                   alloc(&mws_, ((size_t) kMqaT * kAttnHeads * kMqaChunks * (kAttnHeadDim + 2) + 64) * 4) &&
                   alloc(&cws_, compress_batch_workspace_bytes(kSub)) && alloc(&iws_, kIndexBudget) &&
                   alloc(&d_pos_, C * 4) && alloc(&d_start_, C * 4) && alloc(&d_n_, C * 4) && alloc(&d_lim_[0], C * 4) &&
@@ -236,6 +236,7 @@ private:
         }
         CompressArgs ca;
         ca.ratio = ratio;
+        ca.format = c_.format;
         ca.rms_eps = g_.rms_eps;
         ca.n_embd = kAttnEmbd;
         ca.w_kv = (const uint16_t*) wc->ptr;
@@ -265,12 +266,12 @@ private:
         const int32_t *d_pos = d_pos_ + s0, *d_start = d_start_ + s0, *d_n = d_n_ + s0;
         const int32_t* d_lim = ratio ? d_lim_[ratio == 2 ? 1 : 0] + s0 : nullptr;
         const int64_t p0 = pos0 + s0, pos_last = p0 + S - 1;
-        uint16_t* ring = (*c_.ring)[(size_t) il];
+        uint8_t* ring = (*c_.ring)[(size_t) il];
 
         const int64_t lo = std::max<int64_t>(0, p0 - (kWindow - 1));
-        window_stage_copy(ring, (uint16_t*) stage_, kStageSlots, lo, (int) (p0 - lo), stream);
-        kv_window_stage(kvraw_, (const float*) kvn->ptr, d_pos, S, g_.rms_eps, c_.freq[kind], (uint16_t*) stage_, kStageSlots, ring,
-                        std::max(0, S - kWindowSlots), stream);
+        window_stage_copy(ring, (uint8_t*) stage_, kStageSlots, lo, (int) (p0 - lo), c_.format, stream);
+        kv_window_stage(kvraw_, (const float*) kvn->ptr, d_pos, S, g_.rms_eps, c_.freq[kind], (uint8_t*) stage_, kStageSlots, ring,
+                        std::max(0, S - kWindowSlots), c_.format, stream);
 
         int sel = 0;
         if (ratio) {
@@ -293,6 +294,7 @@ private:
                     IndexerArgs ia;
                     ia.mode = index_mode(il);
                     ia.ratio = ratio;
+                    ia.format = c_.format;
                     ia.n_embd = kAttnEmbd;
                     ia.n_comp = std::max<int>(1, (int) ((p0 + g0 + n) / ratio));
                     ia.w_q = (const uint16_t*) iqb->ptr;
@@ -316,14 +318,13 @@ private:
             a.n_tokens = std::min(kMqaT, S - l0);
             a.q = q_ + (size_t) l0 * kAttnHeads * kAttnHeadDim;
             a.win = stage_;
-            a.win_type = LatentType::F16;
+            a.win_type = c_.format == CacheFormat::Fp8 ? LatentType::Fp8 : LatentType::F16;
             a.win_cap = kStageSlots;
             a.win_start = d_start + l0;
             a.win_n = d_n + l0;
             if (ratio) {
                 a.comp = (*c_.comp_kv)[(size_t) kv_source(il)];
-                a.comp_type = LatentType::F16;
-                a.comp_stride = kLatent;
+                a.comp_type = c_.format == CacheFormat::Fp8 ? LatentType::Fp4 : LatentType::F16;
                 a.sel = ids_ + (size_t) (s0 + l0) * kTopK;
                 a.n_sel = sel;
                 a.comp_limit = d_lim + l0;

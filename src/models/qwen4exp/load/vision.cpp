@@ -123,16 +123,17 @@ int vision(Context& context) {
         ss.ple.scratch = ple_scratch;
     }
 
-    // ---- --vision-mmproj: the image encoder's weights staged in pinned host memory, its stream and product handle made,
+    // ---- --vision: the image encoder's weights staged in pinned host memory, its stream and product handle made,
     // and one full-size encode run in a temporary region (the product library loads its kernels on first use), all
     // before the expert cache is sized: afterwards the encoder holds no VRAM until an ENC borrows cache slots
     basalt::vision::CudaEncoder vis_enc;
     const int vis_max_tokens = basalt::vision::Geometry{}.max_tokens;
-    if (!o.vision_mmproj.empty() && o.serve) {
+    if (o.vision_in_engine && o.serve) {
         const auto t0 = Clock::now();
         std::string verr;
         basalt::vision::Mmproj mp;
-        if (!mp.open(o.vision_mmproj, verr) || !vis_enc.stage(mp, true, verr) || !vis_enc.create(verr)) {
+        if (context.srcs->vision.empty()) verr = o.model + " has no vision/mmproj section";
+        if (!verr.empty() || !mp.open(context.srcs->vision, verr) || !vis_enc.stage(mp, true, verr) || !vis_enc.create(verr)) {
             basalt::log::error("basalt generate", "the image encoder: %s", verr.c_str());
             return 1;
         }

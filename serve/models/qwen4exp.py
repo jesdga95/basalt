@@ -12,8 +12,8 @@ class Qwen4Exp(Dialect):
     reasoning_close = "\n</think>\n\n"
     effort_turn = "<|im_start|>system\n{}<|im_end|>\n"
 
-    def template(self, path):
-        return frontend.ChatTemplate(path)
+    def template(self, source):
+        return frontend.ChatTemplate(source)
 
     def parser(self, thinking, tools, stream_tools=True):
         return frontend.OutputParser(thinking=thinking, tools=tools, stream_tools=stream_tools)

@@ -1,5 +1,6 @@
 // src/core/device.cu - the CUDA side of the runtime core.
 #include "basalt/core/device.hpp"
+#include "basalt/platform/dynlib.hpp"
 
 #include <cuda_runtime.h>
 
@@ -59,6 +60,35 @@ bool device_pci_bus_id(int ordinal, std::string& id) {
     }
     id = buf;
     return true;
+}
+
+DeviceRates device_rates(int ordinal) {
+    DeviceRates r;
+    std::string bus;
+    int sms = 0;
+    if (!device_pci_bus_id(ordinal, bus) || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, ordinal) != cudaSuccess) {
+        cudaGetLastError();
+        return r;
+    }
+    const platform::DynLib lib = platform::DynLib::open_nvml();
+    if (!lib) return r;
+    const auto init = lib.sym<int (*)()>("nvmlInit_v2");
+    const auto shut = lib.sym<int (*)()>("nvmlShutdown");
+    const auto by_bus = lib.sym<int (*)(const char*, void**)>("nvmlDeviceGetHandleByPciBusId_v2");
+    const auto gen = lib.sym<int (*)(void*, unsigned*)>("nvmlDeviceGetMaxPcieLinkGeneration");
+    const auto width = lib.sym<int (*)(void*, unsigned*)>("nvmlDeviceGetCurrPcieLinkWidth");
+    const auto clk = lib.sym<int (*)(void*, int, unsigned*)>("nvmlDeviceGetMaxClockInfo");
+    if (!init || !by_bus || init() != 0) return r;
+    void* h = nullptr;
+    unsigned g = 0, w = 0, mhz = 0;
+    if (by_bus(bus.c_str(), &h) == 0) {
+        // per lane and direction, after line encoding: 8b/10b to generation 2, 128b/130b from generation 3 on
+        static constexpr double kLaneBytes[] = {0, 0.25e9, 0.5e9, 0.985e9, 1.969e9, 3.938e9, 7.877e9};
+        if (gen && width && gen(h, &g) == 0 && width(h, &w) == 0 && g >= 1 && g <= 6) r.link_bytes = kLaneBytes[g] * w;
+        if (clk && clk(h, 1 /* NVML_CLOCK_SM */, &mhz) == 0) r.sm_hz = (double) sms * mhz * 1e6;
+    }
+    if (shut) shut();
+    return r;
 }
 
 double device_h2d_gbps(int ordinal) {

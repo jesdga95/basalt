@@ -79,11 +79,11 @@ int main() {
 
     // give-back: a short context keeps what it has; a long one drops to the kept positions
     const std::vector<int> ratios = {2, 2, 2, 1};
-    CHECK(keep_positions(1000, ratios) == 1000);
-    CHECK(keep_positions(kKeepPositions, ratios) == kKeepPositions);
-    CHECK(keep_positions(kKeepPositions + 4096, ratios) == kKeepPositions + 4096);   // too little to free
-    CHECK(keep_positions(700000, ratios) == kKeepPositions);
-    CHECK(keep_positions(1048576, ratios) == kKeepPositions);
+    CHECK(keep_positions(1000, ratios, basalt::models::deepseek41::CacheFormat::Fp8) == 1000);
+    CHECK(keep_positions(kKeepPositions, ratios, basalt::models::deepseek41::CacheFormat::Fp8) == kKeepPositions);
+    CHECK(keep_positions(kKeepPositions + 4096, ratios, basalt::models::deepseek41::CacheFormat::Fp8) == kKeepPositions + 4096);   // too little to free
+    CHECK(keep_positions(700000, ratios, basalt::models::deepseek41::CacheFormat::Fp8) == kKeepPositions);
+    CHECK(keep_positions(1048576, ratios, basalt::models::deepseek41::CacheFormat::Fp8) == kKeepPositions);
 
     if (g_fail) return 1;
     std::printf("prefill_plan_test: ok\n");

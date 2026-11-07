@@ -21,8 +21,16 @@ void swiglu_clamped(const float* gate, const float* up, int n, float limit, floa
 /// dst[0..n_words) = src[0..n_words) as a kernel, so mapped host memory reaches the device without a copy-engine job.
 void copy_words(const void* src, void* dst, int n_words, void* stream);
 
-/// dst[0..n) = src[0..n) (n a multiple of 4, device row to mapped host memory or back), as a kernel of vector moves.
-void copy_row(const float* src, float* dst, int n, void* stream);
+/// Most words put_words carries.
+constexpr int kPutWords = 256;
+
+/// dst[0..n_words) = src[0..n_words) (n_words <= kPutWords) for `src` in host memory: the words travel in the kernel's
+/// parameters, so the device never reads host memory, which a busy bus makes slow.
+void put_words(const void* src, void* dst, int n_words, void* stream);
+
+/// dst[0..n) = src[0..n) (n a multiple of 4, device rows to mapped host memory or back), as a kernel of one vector move
+/// per thread.
+void copy_rows(const float* src, float* dst, int n, void* stream);
 
 /// One row pointer per routed expert; a pointer may be device memory or mapped host memory.
 struct RowPtrs {

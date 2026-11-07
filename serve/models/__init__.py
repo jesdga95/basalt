@@ -22,9 +22,9 @@ class Dialect:
             raise ValueError(f"unknown reasoning effort {level!r}: use none, low, medium, high or max")
         return "xhigh" if level in ("high", "max") else level
 
-    def template(self, path):
+    def template(self, source: str):
         """The prompt renderer: an object with `render(messages, tools=, add_generation_prompt=, **kwargs)` and
-        `source`. `path` is the model's exported template file, which a dialect may ignore."""
+        `source`. `source` is the model's exported template text, which a dialect may ignore."""
         raise NotImplementedError
 
     def parser(self, thinking: bool, tools: list[dict] | None, stream_tools: bool = True):

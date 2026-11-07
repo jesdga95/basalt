@@ -5,6 +5,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstring>
+
 namespace basalt::models::deepseek41 {
 namespace {
 
@@ -60,8 +62,17 @@ __global__ void k_copy_words(const int* src, int* dst, int n) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
 }
 
-__global__ void k_copy_row(const float4* __restrict__ src, float4* __restrict__ dst, int n) {
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+struct PutWords {
+    int w[kPutWords];
+};
+
+__global__ void k_put_words(const PutWords s, int* dst, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = s.w[i];
+}
+
+__global__ void k_copy_rows(const float4* __restrict__ src, float4* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
 }
 
 constexpr int kArgmaxBlocks = 64;
@@ -145,8 +156,16 @@ void copy_words(const void* src, void* dst, int n_words, void* stream) {
     k_copy_words<<<1, 64, 0, (cudaStream_t) stream>>>((const int*) src, (int*) dst, n_words);
 }
 
-void copy_row(const float* src, float* dst, int n, void* stream) {
-    k_copy_row<<<1, 256, 0, (cudaStream_t) stream>>>(reinterpret_cast<const float4*>(src), reinterpret_cast<float4*>(dst), n / 4);
+void put_words(const void* src, void* dst, int n_words, void* stream) {
+    PutWords s{};
+    std::memcpy(s.w, src, (size_t) n_words * 4);
+    k_put_words<<<1, kPutWords, 0, (cudaStream_t) stream>>>(s, (int*) dst, n_words);
+}
+
+void copy_rows(const float* src, float* dst, int n, void* stream) {
+    const int n4 = n / 4;
+    k_copy_rows<<<(n4 + 255) / 256, 256, 0, (cudaStream_t) stream>>>(reinterpret_cast<const float4*>(src),
+                                                                      reinterpret_cast<float4*>(dst), n4);
 }
 
 void weighted_sum_row_ptrs(const RowPtrs& rows, const float* w, int n_rows, int n, float* out, void* stream,

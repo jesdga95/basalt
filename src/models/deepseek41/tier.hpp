@@ -15,7 +15,9 @@
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/prefill/peer_share.hpp"
 #include "basalt/platform/mapped_file.hpp"
+#include "models/deepseek41/prompt_host.hpp"
 #include "models/deepseek41/tier_policy.hpp"
 
 #include <cuda_runtime.h>
@@ -90,11 +92,20 @@ public:
     /// Looks up `ids[0..k)` of `layer` and stamps them as used.
     bool lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err);
     /// The CPU's share: the experts of `lk` without a device blob, over the activation `x` (n_embd floats, host).
-    /// Row i of `rows` (n_embd floats each) gets expert i's output.
-    bool run_cpu(int layer, const float* x, const Lookup& lk, float* rows, std::string& err);
+    /// Row i of `rows` (n_embd floats each) gets expert i's output. Started here, it runs on the pool's workers while
+    /// the caller launches the GPUs' shares; finish_cpu joins it. `lk` and `rows` stay as they are until then.
+    void start_cpu(int layer, const float* x, const Lookup& lk, float* rows);
     /// The same over a window: `x` holds a row per token and each expert i runs over the rows `use[i]` names, into those
     /// rows of `rows`.
-    bool run_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows, std::string& err);
+    void start_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows);
+    void finish_cpu();
+    /// The promotions' copies wait for the bus to idle: mark_gap notes the point of `main` (a layer's sum) they start
+    /// behind, and pump issues up to `pieces` of them there, after the next launches went out (the next layer's head;
+    /// at the window's end, its output). begin_token issues the rest, so every promotion still lands before the next
+    /// lookup, as if it had been copied at once.
+    void mark_gap(cudaStream_t main);
+    void pump(int pieces);
+    static constexpr int kAllPieces = 1 << 20;
     /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (policy::bus_count) into the VRAM tier; those
     /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. How many
     /// started; `await_fetch` makes `main` wait for them.
@@ -115,10 +126,14 @@ public:
     };
     Source locate(int layer, int e) const;
     core::PeerExperts* peer() const { return peer_.get(); }
+    /// The second card's share of a prompt chunk's experts; null without a second card.
+    prefill::PeerShare* peer_share() const { return share_.get(); }
+    /// What the split of a layer's experts between the cards prices them at.
+    const prefill::ShareRates& share_rates(int layer) const { return rates_[(size_t) layer]; }
+    /// The prompt path's and the images' host buffers, allocated before the RAM tier is sized.
+    PromptHost& host() { return host_; }
     kernels::cpu::ExpertPool* pool() const { return pool_.get(); }
     const kernels::cpu::NativeFmt& fmt(int layer) const { return fmt_[(size_t) layer]; }
-    /// The main card holds homes: they stay through a prompt, and a short prompt keeps the copies beside them.
-    bool has_homes() const { return homes_.main > 0; }
 
     /// The VRAM slots open now, every layer's.
     int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
@@ -141,18 +156,29 @@ private:
         int layer, expert, slot, event;
         int out = -1, place = -1;
     };
+    /// A promotion whose copies wait for an idle bus: the home's bytes out to `home_to` first, then `src` into `dst`.
+    struct Queued {
+        Pending p;
+        uint8_t* dst;
+        const uint8_t* src;
+        uint8_t* home_to;
+        uint64_t bytes, off = 0, home_off = 0;
+    };
+    /// Issues every queued promotion's remaining copies.
+    void flush_queue();
     /// `in` on its way into the second card's `slot`; `out`, which held it, on its way to RAM place `place`.
     struct PeerMove {
         int layer, in, out, slot, place;
     };
     /// A cold pinned expert (victim) replaced by a hot file-backed one (expert), read into the layer's spare slot.
     struct Swap {
-        int layer, expert, victim;
+        int layer, expert, victim, place;
     };
     bool load_ram(std::string& err);
+    bool open_share(std::string& err);
     int ranked(int layer, int r) const;
     bool load_rank(std::string& err);
-    void seed_copies(int first_rank, int64_t n);
+    void seed_copies(int64_t n);
     void preread();
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
     const uint8_t* blob_of(int layer, int e) const;
@@ -163,8 +189,10 @@ private:
     void start_swaps();
     void swap_worker();
     /// Copies (layer, e) from `src` into the least recently used free slot of the layer; the slot, or -1. With `homes_too`
-    /// that slot may be a home's, when the layer has a free RAM place for it.
-    int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false);
+    /// that slot may be a home's, when the layer has a free RAM place for it. `whole`: one copy, for a layer that waits
+    /// on it; else pieces, which let a waited copy pass. With `later` the pieces wait in the queue for pump.
+    int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false, bool whole = false,
+                  bool later = false);
     /// The least recently used free slot of the layer's main card share, or -1; `best` gets its last use.
     int32_t oldest_slot(int layer, bool homes_too, uint64_t& best) const;
     /// Moves (layer, e) into the second card when the expert it replaces there was used before any on the main card.
@@ -182,6 +210,7 @@ private:
     std::vector<int32_t> owner_;            ///< [slot] expert it holds or is receiving, or -1
     std::vector<uint8_t> busy_;             ///< [slot] a promotion is copying into it
     std::vector<Pending> pending_;
+    std::vector<Queued> queue_;             ///< promotions not yet fully issued, oldest first
     std::vector<PeerMove> peer_moves_;
     std::vector<int32_t> peer_owner_;       ///< [second card slot] expert it holds or is receiving
     std::vector<cudaEvent_t> events_;
@@ -189,6 +218,8 @@ private:
     cudaStream_t copy_stream_ = nullptr;    ///< promotions, off the token path
     cudaStream_t fetch_stream_ = nullptr;   ///< copies a layer waits for (high priority)
     cudaEvent_t fetch_ev_ = nullptr;
+    cudaEvent_t gap_ev_ = nullptr;          ///< the main stream's point the pumped pieces start behind
+    bool gap_marked_ = false;               ///< gap_ev_ was recorded for the next pump
     uint64_t tick_ = 0;
     uint64_t one_each_ = 0, reserve_ = 0, modules_ = 0;
     uint64_t start_floor_ = 0, free_floor_ = 0;
@@ -201,6 +232,7 @@ private:
     int cover_ = 0;                         ///< experts per layer in the RAM tier
     std::vector<int32_t> ram_idx_;          ///< [layer * n_expert + e] pinned slot or -1
     std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a swap, or -1
+    std::vector<uint8_t> swapping_;         ///< [layer] a file expert is being read into its spare
     std::vector<uint64_t> spare_since_;     ///< [layer] token at which the spare became free
     std::vector<uint64_t> last_miss_;       ///< [layer * n_expert + e] token + 1 of the last miss
     std::vector<std::pair<int, int>> want_; ///< file-backed experts that missed twice, in lookup order
@@ -216,10 +248,14 @@ private:
     uint64_t token_ = 0;
     int64_t swapped_ = 0;
     platform::MappedFile file_;             ///< the experts section
+    PromptHost host_;
     std::unique_ptr<core::PeerExperts> peer_;
+    std::unique_ptr<prefill::PeerShare> share_;
+    std::vector<prefill::ShareRates> rates_;    ///< [layer]
     std::vector<kernels::cpu::NativeFmt> fmt_;   ///< [layer]
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;
     uint8_t* act_ = nullptr;                ///< the quantized activation the CPU jobs share
+    kernels::cpu::ExpertJobMulti cpu_jobs_[kMaxK];   ///< the CPU share started and not yet joined
 
     int64_t hits_ = 0, cpu_ = 0, ram_hits_ = 0, promoted_ = 0, fetched_ = 0, dropped_ = 0, peer_hits_ = 0, file_hits_ = 0;
 };

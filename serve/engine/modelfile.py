@@ -1,12 +1,11 @@
-"""Engine settings, tokenizer and vision inputs for a .basalt model file, unpacked once into the cache directory."""
+"""Engine settings, tokenizer and vision inputs for a .basalt model file. Nothing is unpacked: the tokenizer is read from
+its sections into memory, and the vision programs open the projector inside the file themselves."""
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import struct
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,67 +59,26 @@ def sampling_defaults(meta: dict) -> dict:
     return {field: _short(kv[key]) for key, field in GGUF_SAMPLING.items() if kv.get(key) is not None}
 
 
-def write_section(mf: ModelFile, name: str, dest: Path) -> None:
-    """Copy a section to `dest` via a temporary name so a partial file is never used."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    off, size = mf.section(name)
-    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=dest.name + ".")
-    try:
-        with os.fdopen(fd, "wb") as out, open(mf.path, "rb") as src:
-            src.seek(off)
-            left = size
-            while left > 0:
-                b = src.read(min(left, 64 << 20))
-                if not b:
-                    raise IOError(f"{mf.path}: short read in {name}")
-                out.write(b)
-                left -= len(b)
-        os.replace(tmp, dest)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+TOKENIZER_SECTIONS = ("vocab.json", "merges.txt", "token_type.json", "tokenizer.json", "chat_template.jinja")
 
 
-def extract_tokenizer(mf: ModelFile) -> Path:
-    """The `tokenizer/*` sections as a directory, reused when present."""
-    out = cache_dir(mf) / "tokenizer"
-    if (out / "vocab.json").exists():
-        return out
-    names = [n for n in mf.names() if n.startswith("tokenizer/")]
-    if not any(n == "tokenizer/vocab.json" for n in names):
+def tokenizer_files(mf: ModelFile) -> dict[str, bytes]:
+    """The `tokenizer/*` sections the server reads, by file name (those a pack lacks are absent)."""
+    if "tokenizer/vocab.json" not in mf.sections:
         raise ValueError(f"{mf.path}: no tokenizer sections")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(dir=out.parent, prefix="tokenizer."))
-    try:
-        for n in names:
-            (tmp / n.split("/", 1)[1]).write_bytes(mf.read(n))
-        try:
-            os.rename(tmp, out)
-        except OSError:                          # another process finished first
-            if not (out / "vocab.json").exists():
-                raise
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    return out
+    return {n: mf.read("tokenizer/" + n) for n in TOKENIZER_SECTIONS if "tokenizer/" + n in mf.sections}
 
 
 def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
-    """The vision sidecar's config (the projector alone without `sidecar`); ValueError names what is missing."""
+    """The vision sidecar's config, which names the model file (the sidecar opens `vision/mmproj` inside it);
+    ValueError names what is missing."""
     engine = Path(engine_bin).resolve()
     side = engine.parent / (VISION_EXE + engine.suffix)   # with the engine's suffix: basalt-vision.exe on Windows
     if "vision/mmproj" not in mf.sections:
         raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision")
     if sidecar and not side.is_file():
         raise ValueError(f"{side} not found (build the vision sidecar), or drop --vision")
-    if "vision/text_vocab" not in mf.sections:
-        raise ValueError("this model file has no vision/text_vocab section; drop --vision")
-    vdir = cache_dir(mf) / "vision"
-    mmproj, vocab = vdir / "mmproj.gguf", vdir / "text_vocab.gguf"
-    for name, dest in (("vision/mmproj", mmproj), ("vision/text_vocab", vocab)):
-        if not dest.exists() or dest.stat().st_size != mf.section(name)[1]:
-            write_section(mf, name, dest)
-    return {"vision_bin": str(side), "mmproj": str(mmproj), "model": str(vocab)}
+    return {"vision_bin": str(side), "model": os.path.abspath(mf.path)}
 
 
 @dataclass(frozen=True)
@@ -150,22 +108,24 @@ def model_config(spec: ModelSpec, engine_bin: str) -> dict:
     cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": spec.alias or meta.get("name") or "basalt",
            "sampling": sampling_defaults(meta),
            "arch": (meta.get("gguf_kv") or {}).get("general.architecture"), "log": str(cdir / "engine.log"),
-           "tokenizer": str(extract_tokenizer(mf))}
+           "tokenizer": tokenizer_files(mf)}
     if vision and dialect_for(cfg["arch"]).in_engine_vision:
         if vision != "dynamic":
             raise ValueError(f"this model's images are encoded in the engine: --vision dynamic, not {vision}")
         if "vision/mmproj" not in mf.sections:
             raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision")
         args.append("--vision")
-        cfg["vision"] = {"mmproj": "", "mode": "dynamic", "gpu": True}
+        cfg["vision"] = {"mode": "dynamic", "gpu": True}
         return cfg
     v = vision_config(mf, engine_bin, sidecar=vision != "dynamic") if vision else None
     if v:
         v["mode"] = vision
         v["gpu"] = vision != "cpu"
         cfg["vision"] = v
-        if vision == "dynamic":     # the engine encodes: it reads the projector itself
-            args += ["--vision-mmproj", v["mmproj"]]
-        if "--vision" not in args:   # image embeddings need --vision
+        # dynamic: the engine encodes, opening the projector inside the model file itself; else the sidecar's
+        # embeddings come in with each image
+        if vision == "dynamic" and "--vision" not in args:
             args.append("--vision")
+        elif vision != "dynamic" and "--vision-external" not in args:
+            args.append("--vision-external")
     return cfg

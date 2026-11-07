@@ -37,6 +37,8 @@ constexpr int kMarkovR = 256;
 constexpr int kInjectRows = 8;       // rows of one inject launch
 constexpr float kEps = 1e-20f;
 constexpr int kMxfp4 = 39;
+constexpr int kMetaUpload = 4 * kT + kT * kT + 1;   // pos, start, n, lim, sel, the anchor
+constexpr int kMetaInts = kMetaUpload + kT;          // and the argmax of each row
 
 // What a DSpark GGUF must be for this build, whatever else the file holds.
 std::string gguf_problem(const GgufFile& g) {
@@ -101,20 +103,29 @@ struct DsparkDrafter::Impl {
           *moe_d = nullptr, *logits = nullptr, *col = nullptr, *w1p = nullptr, *dconf = nullptr, *hcout = nullptr,
           *feat = nullptr, *mainx = nullptr, *mainxn = nullptr;
     void *xq = nullptr, *xq2 = nullptr, *sh_q1 = nullptr, *sh_q2 = nullptr, *am_ws = nullptr;
-    int32_t *ids = nullptr, *dpos = nullptr, *dstart = nullptr, *dn = nullptr, *dlim = nullptr, *dsel = nullptr,
-            *dtok = nullptr, *dpos1 = nullptr;
+    int32_t *ids = nullptr, *dmeta = nullptr, *dpos = nullptr, *dstart = nullptr, *dn = nullptr, *dlim = nullptr,
+            *dsel = nullptr, *dtok = nullptr, *dpos1 = nullptr;
+    float* x_mask = nullptr;   // the mask rows of the block's input, four streams each
+
+    // the block as two graphs: the stages, then the head for the rows a window can use
+    cudaGraphExec_t g_body = nullptr;
+    cudaGraphExec_t g_head[kT + 1] = {};
 
     // pinned host staging
     float* h_feat = nullptr;     // [kInjectRows][feature floats]
     int32_t* h_pos = nullptr;    // [kInjectRows]
-    float* h_emb = nullptr;
+    float* h_emb = nullptr;      // the anchor's row, four streams
     int32_t* h_meta = nullptr;   // pos[5], start[5], n[5], lim[5], sel[25], tok0
     int32_t* h_out = nullptr;    // tok[5]
     float* h_conf = nullptr;
 
-    // which position each ring slot holds
-    std::vector<int64_t> ring_pos;
+    // per window: which position each ring slot holds; the window the stages' rings hold, and the windows handed out
+    std::vector<std::vector<int64_t>> ring_pos;
+    int live = 0, opened = 0;
+    // with more than one window, each one's rings while another's are live: [window][stage][kWindowSlots * kLatent]
+    uint16_t* store = nullptr;
     bool block_live = false;
+    int n_out = kT;   // the rows the live block drafts
     std::string kept_note;
     uint64_t bytes_taken = 0;
     int64_t blocks = 0;
@@ -133,6 +144,9 @@ struct DsparkDrafter::Impl {
         if (ev0) cudaEventDestroy(ev0);
         if (ev_body) cudaEventDestroy(ev_body);
         if (ev1) cudaEventDestroy(ev1);
+        if (g_body) cudaGraphExecDestroy(g_body);
+        for (cudaGraphExec_t e : g_head)
+            if (e) cudaGraphExecDestroy(e);
         if (st) cudaStreamDestroy(st);
     }
 
@@ -328,7 +342,11 @@ struct DsparkDrafter::Impl {
         rope_freq_table(RopeParams{}, tab);
         if (!upload(tab, sizeof(tab), (void**) &freq)) return false;
         rope = rope_table_window();
-        ring_pos.assign((size_t) kWindowSlots, -1);
+        for (std::vector<int64_t>& rp : ring_pos) rp.assign((size_t) kWindowSlots, -1);
+        if (ring_pos.size() > 1 && !buf(store, ring_pos.size() * kStages * (size_t) kWindowSlots * kLatent)) {
+            err = "dspark: out of device memory (window stores)";
+            return false;
+        }
         const size_t Tn = (size_t) kT * kN;
         const size_t ff = (size_t) kN * target_layers.size();
         const size_t Rows = std::max<size_t>(kT, kInjectRows);
@@ -347,15 +365,29 @@ struct DsparkDrafter::Impl {
                                                    kernels::native_q8_1_bytes(kN, 8), attn_out_scratch_bytes(kT), 1 << 16});
         ok = ok && alloc(&xq, xq_bytes) && alloc(&xq2, std::max<size_t>(q_path_scratch_bytes(kT), 1 << 16)) &&
              alloc(&sh_q1, kernels::native_q8_1_bytes(kN, kT)) && alloc(&sh_q2, kernels::native_q8_1_bytes(kFF, kT)) &&
-             alloc(&am_ws, argmax_workspace_bytes()) && buf(ids, kT * kUsed) && buf(dpos, kT) && buf(dstart, kT) &&
-             buf(dn, kT) && buf(dlim, kT) && buf(dsel, kT * kT) && buf(dtok, kT + 1) && buf(dpos1, kInjectRows);
+             alloc(&am_ws, argmax_workspace_bytes()) && buf(ids, kT * kUsed) && buf(dmeta, kMetaInts) &&
+             buf(dpos1, kInjectRows) && buf(x_mask, (size_t) 4 * (kT - 1) * kN);
         if (!ok) {
             err = "dspark: out of device memory (scratch)";
             return false;
         }
+        dpos = dmeta;
+        dstart = dmeta + kT;
+        dn = dmeta + 2 * kT;
+        dlim = dmeta + 3 * kT;
+        dsel = dmeta + 4 * kT;
+        dtok = dmeta + 4 * kT + kT * kT;
+        {
+            std::vector<float> rows((size_t) 4 * (kT - 1) * kN);
+            for (size_t r = 0; r < (size_t) 4 * (kT - 1); ++r) std::memcpy(rows.data() + r * kN, mask_emb.data(), (size_t) kN * 4);
+            if (cudaMemcpy(x_mask, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "dspark: cannot upload the mask rows";
+                return false;
+            }
+        }
         if (cudaHostAlloc((void**) &h_feat, (size_t) kInjectRows * ff * 4, cudaHostAllocPortable) != cudaSuccess ||
             cudaHostAlloc((void**) &h_pos, kInjectRows * 4, cudaHostAllocPortable) != cudaSuccess ||
-            cudaHostAlloc((void**) &h_emb, (size_t) 4 * Tn * 4, cudaHostAllocPortable) != cudaSuccess ||
+            cudaHostAlloc((void**) &h_emb, (size_t) 4 * kN * 4, cudaHostAllocPortable) != cudaSuccess ||
             cudaHostAlloc((void**) &h_meta, 64 * 4, cudaHostAllocPortable) != cudaSuccess ||
             cudaHostAlloc((void**) &h_out, 8 * 4, cudaHostAllocPortable) != cudaSuccess ||
             cudaHostAlloc((void**) &h_conf, 8 * 4, cudaHostAllocPortable) != cudaSuccess) {
@@ -368,6 +400,17 @@ struct DsparkDrafter::Impl {
             return false;
         }
         return true;
+    }
+
+    // The stages' rings hold window `w`'s rows: the live window's go to its store, `w`'s come back from its own.
+    void bind(int w) {
+        if (w == live) return;
+        const size_t ring = (size_t) kWindowSlots * kLatent;
+        for (int l = 0; l < kStages; ++l) {
+            cudaMemcpyAsync(store + ((size_t) live * kStages + l) * ring, stage[l].ring, ring * 2, cudaMemcpyDeviceToDevice, st);
+            cudaMemcpyAsync(stage[l].ring, store + ((size_t) w * kStages + l) * ring, ring * 2, cudaMemcpyDeviceToDevice, st);
+        }
+        live = w;
     }
 
     // Window latents of n <= kInjectRows positions from the staged features.
@@ -385,7 +428,11 @@ struct DsparkDrafter::Impl {
         }
     }
 
-    void run_block() {
+    // The block's stages: its inputs (the metadata, the anchor's row, the mask rows), then every stage over all rows.
+    void run_body() {
+        cudaMemcpyAsync(dmeta, h_meta, (size_t) kMetaUpload * 4, cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(x, h_emb, (size_t) 4 * kN * 4, cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(x + (size_t) 4 * kN, x_mask, (size_t) 4 * (kT - 1) * kN * 4, cudaMemcpyDeviceToDevice, st);
         HcArgs hca;
         hca.n_embd = kN;
         hca.rms_eps = kEps;
@@ -396,9 +443,6 @@ struct DsparkDrafter::Impl {
         ra.n_embd = kN;
         ra.k = kUsed;
         ra.weight_scale = 1.5f;
-        const size_t V = (size_t) main.geo().n_vocab;
-
-        cudaMemcpyAsync(x, h_emb, (size_t) 4 * kT * kN * 4, cudaMemcpyHostToDevice, st);
         for (int l = 0; l < kStages; ++l) {
             const Stage& s = stage[l];
             hc_mixes(x, s.hc_attn_fn, s.hc_attn_scale, s.hc_attn_base, kT, hca, hc_ws, coef_a, st);
@@ -423,7 +467,6 @@ struct DsparkDrafter::Impl {
             a.win_n = dn;
             a.comp = blockkv;
             a.comp_type = LatentType::F32;
-            a.comp_stride = kLatent;
             a.sel = dsel;
             a.n_sel = kT;
             a.comp_limit = dlim;
@@ -451,26 +494,62 @@ struct DsparkDrafter::Impl {
             dspark_moe_combine(moe_d, rw, sh_out, kT, kUsed, kN, ffn_sum, st);
             hc_post(ffn_sum, x2, coef_f[l & 1], kHcCoef, kT, kN, x, st);
         }
-        // collapse with the last FFN's pre-mix (no head mix), norm, the main model's output matrix
+        // collapse with the last FFN's pre-mix (no head mix), norm
         hc_pre(x, coef_f[(kStages - 1) & 1], kHcCoef, kT, kN, hcout, st);
         rms_norm_rows(hcout, out_norm, kT, kN, kEps, normed, st);
-        cudaEventRecord(ev_body, st);
-        kernels::native_quantize_q8_1(normed, xq, kN, kT, st);
-        kernels::native_mmvq(head.type, head.p, xq, logits, kN, (int) V, kT, st);
+    }
 
-        // the Markov chain: row i is biased by the token before it
+    // The main model's output matrix and the Markov chain over the first `n` rows (row i is biased by the token before
+    // it), their tokens and confidences to the host.
+    void run_head(int n) {
+        const size_t V = (size_t) main.geo().n_vocab;
+        kernels::native_quantize_q8_1(normed, xq, kN, n, st);
+        kernels::native_mmvq(head.type, head.p, xq, logits, kN, (int) V, n, st);
         const int32_t* tok0 = dtok;   // [0] = anchor, [i + 1] = the argmax of row i
-        for (int i = 0; i < kT; ++i) {
+        for (int i = 0; i < n; ++i) {
             dspark_markov_gather(w1, tok0 + i, w1p, st);
             dspark_markov_bias(w2, w1p, logits + (size_t) i * V, (int) V, col, st);
             argmax_index(col, (int) V, dtok + i + 1, am_ws, st);
             dspark_conf(conf_w, hcout + (size_t) i * kN, w1p, kN, dconf + i, st);
         }
+        cudaMemcpyAsync(h_out, dtok + 1, (size_t) n * 4, cudaMemcpyDeviceToHost, st);
+        cudaMemcpyAsync(h_conf, dconf, (size_t) n * 4, cudaMemcpyDeviceToHost, st);
+    }
+
+    // Captures `body` into `exec` once, then launches the instance.
+    template <class F>
+    bool launch(cudaGraphExec_t& exec, F&& body, std::string& err) {
+        if (!exec) {
+            if (cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+                err = "dspark: cannot begin a graph capture";
+                return false;
+            }
+            body();
+            cudaGraph_t g = nullptr;
+            const cudaError_t ce = cudaStreamEndCapture(st, &g);
+            const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&exec, g, 0) : ce;
+            if (g) cudaGraphDestroy(g);
+            if (ci != cudaSuccess) {
+                err = std::string("dspark: graph capture: ") + cudaGetErrorString(ci);
+                return false;
+            }
+        }
+        if (cudaGraphLaunch(exec, st) != cudaSuccess) {
+            err = "dspark: graph launch failed";
+            return false;
+        }
+        return true;
     }
 };
 
 DsparkDrafter::DsparkDrafter(std::unique_ptr<Impl> i) : p_(std::move(i)) {}
-DsparkDrafter::~DsparkDrafter() = default;
+
+DsparkDrafter::~DsparkDrafter() {
+    const Impl& d = *p_;
+    if (d.blocks == 0) return;
+    basalt::log::info("basalt deepseek41", "drafter: %lld blocks, %.2f ms each (stages %.2f, head %.2f)", (long long) d.blocks,
+                      (d.ms_body + d.ms_head) / (double) d.blocks, d.ms_body / (double) d.blocks, d.ms_head / (double) d.blocks);
+}
 
 std::vector<std::vector<int>> dspark_kept_experts(const std::vector<std::pair<int32_t, int32_t>>& ranked, int stages, int experts,
                                                   int keep) {
@@ -492,10 +571,11 @@ std::vector<std::vector<int>> dspark_kept_experts(const std::vector<std::pair<in
 }
 
 std::unique_ptr<DsparkDrafter> DsparkDrafter::create(const DsModel& main, int device, const std::string& ranking, int keep,
-                                                     std::string& err) {
+                                                     int windows, std::string& err) {
     core::OnDevice g(device);
     auto i = std::make_unique<Impl>(main);
     i->device = device;
+    i->ring_pos.resize((size_t) std::max(windows, 1));
     try {
         if (!i->load(main.pack().dspark, ranking, keep, err)) return nullptr;
     } catch (const std::exception& e) {
@@ -515,23 +595,19 @@ int DsparkDrafter::device() const { return p_->device; }
 uint64_t DsparkDrafter::device_bytes() const { return p_->bytes_taken; }
 const std::string& DsparkDrafter::kept() const { return p_->kept_note; }
 
-void DsparkDrafter::forget_from(int64_t pos) {
-    for (int64_t& rp : p_->ring_pos)
+int DsparkDrafter::open_window() { return p_->opened < (int) p_->ring_pos.size() ? p_->opened++ : -1; }
+
+void DsparkDrafter::forget_from(int w, int64_t pos) {
+    for (int64_t& rp : p_->ring_pos[(size_t) w])
         if (rp >= pos) rp = -1;
 }
 
-void DsparkDrafter::reset() { std::fill(p_->ring_pos.begin(), p_->ring_pos.end(), -1); }
+void DsparkDrafter::reset(int w) { std::fill(p_->ring_pos[(size_t) w].begin(), p_->ring_pos[(size_t) w].end(), -1); }
 
-void DsparkDrafter::report() const {
-    const Impl& d = *p_;
-    if (d.blocks == 0) return;
-    basalt::log::info("basalt deepseek41", "drafter: %lld blocks, %.2f ms each (stages %.2f, head %.2f)", (long long) d.blocks,
-                      (d.ms_body + d.ms_head) / (double) d.blocks, d.ms_body / (double) d.blocks, d.ms_head / (double) d.blocks);
-}
-
-bool DsparkDrafter::inject(int64_t pos0, int n_rows, const float* features, std::string& err) {
+bool DsparkDrafter::inject(int w, int64_t pos0, int n_rows, const float* features, std::string& err) {
     core::OnDevice g(p_->device);
     Impl& d = *p_;
+    std::vector<int64_t>& ring_pos = d.ring_pos[(size_t) w];
     try {
         const size_t ff = (size_t) feature_floats();
         for (int r = 0; r < n_rows; r += kInjectRows) {
@@ -541,8 +617,9 @@ bool DsparkDrafter::inject(int64_t pos0, int n_rows, const float* features, std:
             for (int j = 0; j < n; ++j) {
                 const int64_t p = pos0 + r + j;
                 d.h_pos[j] = (int32_t) p;
-                d.ring_pos[(size_t) (p % kWindowSlots)] = p;
+                ring_pos[(size_t) (p % kWindowSlots)] = p;
             }
+            d.bind(w);
             d.inject_staged(n);
         }
     } catch (const std::exception& e) {
@@ -552,21 +629,19 @@ bool DsparkDrafter::inject(int64_t pos0, int n_rows, const float* features, std:
     return true;
 }
 
-bool DsparkDrafter::draft_begin(int32_t anchor, int64_t pos, std::string& err) {
+bool DsparkDrafter::draft_begin(int w, int32_t anchor, int64_t pos, int n_out, std::string& err) {
     core::OnDevice g(p_->device);
     Impl& d = *p_;
+    const std::vector<int64_t>& ring_pos = d.ring_pos[(size_t) w];
+    n_out = std::clamp(n_out, 1, kT);
     try {
-        // the block's host inputs: four hyper-connection copies of each row's embedding, then the index arrays
+        // the block's host inputs: four hyper-connection copies of the anchor's embedding, then the index arrays
         cudaStreamSynchronize(d.st);   // the staging and the metadata block are reused
-        std::vector<float> emb(kN);
-        if (!d.main.embedding_row(anchor, emb.data(), err)) return false;
-        for (int t = 0; t < kT; ++t) {
-            const float* src = t == 0 ? emb.data() : d.mask_emb.data();
-            for (int s = 0; s < 4; ++s) std::memcpy(d.h_emb + ((size_t) t * 4 + s) * kN, src, (size_t) kN * 4);
-        }
+        if (!d.main.embedding_row(anchor, d.h_emb, err)) return false;
+        for (int s = 1; s < 4; ++s) std::memcpy(d.h_emb + (size_t) s * kN, d.h_emb, (size_t) kN * 4);
         // the window is the run of positions before `pos` the rings hold
         int64_t start = pos;
-        while (start > 0 && pos - start < kDsparkWindow && d.ring_pos[(size_t) ((start - 1) % kWindowSlots)] == start - 1) --start;
+        while (start > 0 && pos - start < kDsparkWindow && ring_pos[(size_t) ((start - 1) % kWindowSlots)] == start - 1) --start;
         int32_t* m = d.h_meta;
         for (int t = 0; t < kT; ++t) {
             m[t] = (int32_t) (pos + t);
@@ -576,18 +651,14 @@ bool DsparkDrafter::draft_begin(int32_t anchor, int64_t pos, std::string& err) {
             for (int j = 0; j < kT; ++j) m[4 * kT + t * kT + j] = j;
         }
         m[4 * kT + kT * kT] = anchor;
+        d.bind(w);
         cudaEventRecord(d.ev0, d.st);
-        cudaMemcpyAsync(d.dpos, m, kT * 4, cudaMemcpyHostToDevice, d.st);
-        cudaMemcpyAsync(d.dstart, m + kT, kT * 4, cudaMemcpyHostToDevice, d.st);
-        cudaMemcpyAsync(d.dn, m + 2 * kT, kT * 4, cudaMemcpyHostToDevice, d.st);
-        cudaMemcpyAsync(d.dlim, m + 3 * kT, kT * 4, cudaMemcpyHostToDevice, d.st);
-        cudaMemcpyAsync(d.dsel, m + 4 * kT, kT * kT * 4, cudaMemcpyHostToDevice, d.st);
-        cudaMemcpyAsync(d.dtok, m + 4 * kT + kT * kT, 4, cudaMemcpyHostToDevice, d.st);
-        d.run_block();
-        cudaMemcpyAsync(d.h_out, d.dtok + 1, kT * 4, cudaMemcpyDeviceToHost, d.st);
-        cudaMemcpyAsync(d.h_conf, d.dconf, kT * 4, cudaMemcpyDeviceToHost, d.st);
+        if (!d.launch(d.g_body, [&] { d.run_body(); }, err)) return false;
+        cudaEventRecord(d.ev_body, d.st);
+        if (!d.launch(d.g_head[n_out], [&] { d.run_head(n_out); }, err)) return false;
         cudaEventRecord(d.ev1, d.st);
         d.block_live = true;
+        d.n_out = n_out;
     } catch (const std::exception& e) {
         err = std::string("dspark draft: ") + e.what();
         return false;
@@ -614,7 +685,8 @@ bool DsparkDrafter::draft_end(DsparkDraft& out, std::string& err) {
     ++d.blocks;
     d.ms_body += body;
     d.ms_head += all - body;
-    for (int i = 0; i < kT; ++i) {
+    out.n = d.n_out;
+    for (int i = 0; i < d.n_out; ++i) {
         out.token[i] = d.h_out[i];
         out.conf[i] = d.h_conf[i];
     }

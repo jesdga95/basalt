@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.api.responses import input_messages  # noqa: E402
 from serve.frontend import ChatTemplate, TemplateRequestError, openai_to_messages  # noqa: E402
 
-TEMPLATE = ChatTemplate(Path(__file__).resolve().parents[1] / "chat_template.jinja")
+TEMPLATE = ChatTemplate.from_file(Path(__file__).resolve().parents[1] / "chat_template.jinja")
 HISTORY = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "What is 2+2?"},
            {"role": "assistant", "content": "4"}]
 LATE = {"role": "developer", "content": "Start every answer with OK."}

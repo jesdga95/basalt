@@ -74,7 +74,7 @@ class ImageServer(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.vision.dir, ignore_errors=True)
         tok = ByteTokenizer()
         self.svc = Service(MockEngine(tok, "</think>\n\nok", max_context=4096), tok,
-                           ChatTemplate(ROOT / "serve/chat_template.jinja"), vision=self.vision)
+                           ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), vision=self.vision)
         self.svc.image_sources = self.sources
         self.httpd = None
 
@@ -1366,7 +1366,7 @@ class LocalBounds(unittest.TestCase):
             tok = ByteTokenizer()
             vision = RecordingVision()
             self.addCleanup(shutil.rmtree, vision.dir, ignore_errors=True)
-            svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+            svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"),
                           vision=vision)
             turn_free = []
 

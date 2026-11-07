@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/batch.cpp - batch operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/protocol.hpp"
 #include "qfn_state.hpp"
 
 namespace basalt::models::qwen4exp::serve {
@@ -295,12 +296,12 @@ bool QfnRuntime::batch_step() {
         const int b = rows[sg];
         BSlot& sl = bs[(size_t) b];
         const int k = n_keep[sg];
-        std::printf("BT %d", b);   // one line per slot and window: every token it kept
+        std::string bt = "BT " + std::to_string(b);   // one line per slot and window: every token it kept
         for (int e = 0; e < k; ++e) {
             sl.ids.push_back(tok[r0s[sg] + e]);    // the window fed it: the slot's sessions hold it now
-            std::printf(" %d", (int) outb[r0s[sg] + e]);
+            bt += " " + std::to_string((int) outb[r0s[sg] + e]);
         }
-        std::printf("\n");
+        basalt::protocol::emit_text(bt + "\n");
         sl.produced += k;
         if (real) {   // the window's verdict on its drafts: the draft-length rule, the lookup history, the policy
             const int a = k - 1, Tw = lens[sg];

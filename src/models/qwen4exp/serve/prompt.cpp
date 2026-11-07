@@ -483,9 +483,8 @@ int QfnRuntime::init_prompt() {
         return 1;
     }
     if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
-    if (peer.valid() && o.peer_prefill_rows != 0) {
-        const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
-        if (!sp.set_peer(&peer, rows, peer_streamed_share, err)) {
+    if (peer.valid() && !o.no_peer_prefill) {
+        if (!sp.set_peer(&peer, peer_streamed_share, err)) {
             basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
             err.clear();
         }

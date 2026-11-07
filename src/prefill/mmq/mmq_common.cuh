@@ -50,6 +50,8 @@
     } while (0)
 
 int ggml_cuda_get_device();
+// Loads kernel `symbol` into the current context now (the driver's cuFuncLoad).
+void ggml_cuda_func_load(const void * symbol);
 
 #define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
     do {                                                                                                   \
@@ -181,7 +183,10 @@ struct ggml_cuda_type_traits;
 
 MMQ_TYPE_TRAITS(GGML_TYPE_Q2_0, QK2_0, QR2_0, QI2_0, block_q2_0);
 MMQ_TYPE_TRAITS(GGML_TYPE_Q8_0, QK8_0, QR8_0, QI8_0, block_q8_0);
+MMQ_TYPE_TRAITS(GGML_TYPE_Q5_0, QK5_0, QR5_0, QI5_0, block_q5_0);
 MMQ_TYPE_TRAITS(GGML_TYPE_Q5_1, QK5_1, QR5_1, QI5_1, block_q5_1);
+MMQ_TYPE_TRAITS(GGML_TYPE_Q2_K, QK_K, QR2_K, QI2_K, block_q2_K);
+MMQ_TYPE_TRAITS(GGML_TYPE_Q3_K, QK_K, QR3_K, QI3_K, block_q3_K);
 MMQ_TYPE_TRAITS(GGML_TYPE_Q4_K, QK_K, QR4_K, QI4_K, block_q4_K);
 MMQ_TYPE_TRAITS(GGML_TYPE_Q5_K, QK_K, QR5_K, QI5_K, block_q5_K);
 MMQ_TYPE_TRAITS(GGML_TYPE_Q6_K, QK_K, QR6_K, QI6_K, block_q6_K);

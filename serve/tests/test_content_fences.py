@@ -76,7 +76,7 @@ class OverHttp(unittest.TestCase):
 
     def ask(self, script, max_tokens=800):
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         msgs = [{"role": "user", "content": "save my notes"}]

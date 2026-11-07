@@ -1,22 +1,14 @@
 # AGENTS.md
 
-Basalt is a local inference engine for mixture-of-experts models, built for NVIDIA Blackwell (sm_120) on Linux and Windows x64. It runs Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash on an NVIDIA Blackwell GPU, optionally with more GPUs as peer expert tiers (up to three for Flash-Next, one for DeepSeek), and system RAM holding the rest. It is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, each model's own code under `src/models/<model>`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
+Basalt is a local inference engine for mixture-of-experts models, built for NVIDIA Blackwell (sm_120) on Linux and Windows x64. A model runs on one Blackwell GPU, optionally with more GPUs as peer expert tiers, and system RAM holding the rest. The C++/CUDA engine is in `src/` and `include/`, each model's own code under `src/models/<model>`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
 
-## Working rules
+## Rules
 
-`CONTRIBUTING.md` sets the project scope (CUDA + Blackwell only) and what every change must include (parity test, profile, quality check). It applies to agents too.
+[CONTRIBUTING.md](CONTRIBUTING.md) is the project's rulebook and applies to agents in full: scope, platform and model layering, one fast path, what every change must include, benchmark hygiene, commits and docs. The rules below are only for agents.
 
-- **Commits:** small and logical, message style `area: what it does`. Never amend and never force-push; always make new commits. End each message with the co-author line your tool's instructions specify.
-- **Platform code:** engine code never names an OS or a compiler. No `_WIN32`, `_MSC_VER`, `__linux__`, `<windows.h>`, `<sys/mman.h>`, `<unistd.h>` or raw OS calls (mmap, pread, pthread, fork/exec, dlopen, /proc, /sys) outside `src/platform/` and `include/basalt/platform/`. A missing seam is added there with a Linux and a Windows body; the Linux body is the code you would have written anyway. `tools/check_platform_boundary.sh` enforces it.
-- **Log lines:** every engine stderr line goes through `include/basalt/log.hpp` with its real level (`info`, `warn`, `error`); never `fprintf(stderr, ...)`. Do not change the text of lines the server parses. `tools/check_stderr_logging.sh` enforces it. Engine and server log lines are terse facts (what was decided, its value, at most the flag to change it), not prose explanations.
-- **Code comments:** brief and stateless. Say what the code does and why. No hardware names, measured numbers, dates or history in comments.
-- **Don't push or publish anywhere** (GitHub, HF, any remote) without the maintainer's approval.
+- **Design the end state first.** Before writing code, design the architecture properly and read similar code. If a model already implements the feature, reuse that logic or make it shared. Do not propose features or improvements before testing them and checking the architecture.
+- **Flag odd numbers.** Sanity-check every result before reporting it (size against speed, run-to-run spread, earlier numbers) and report anything odd with its suspected cause.
+- **Read before answering.** Check the code, docs and existing results before stating a fact about Basalt.
+- **No amends, no force-pushes.** Always make new commits.
+- **Don't push or publish anywhere** (GitHub, HF, any remote) without the user's approval.
 - **Don't write tools nobody asked for.**
-- **No shims for removed things.** A removed or renamed flag, option, field or code path is simply gone: no alias, no fallback, no "was retired" message or list. The normal unknown-flag error covers it.
-- **A new model never regresses another.** Model code stays in its folder; shared code names no model (`tools/check_model_layering.sh`); see `docs/adding-a-model.md`.
-- **Linux and Windows are both supported; Linux is where we test, and CI compiles and CPU-tests Windows.** Changes must not remove the platform seams (`src/platform/`, CMake `if(WIN32)`); see `CONTRIBUTING.md` and `docs/platforms.md`.
-- **Headline benchmark numbers come from the maintainer's own runs.** Agent benches are development A/Bs only. Label every number with its GPU power limit.
-- **Quality gate:** PPL/KLD against the BF16 reference (`docs/precision/quality.md#the-bf16-reference`), through the decode path (`basalt-bench --quality`). Byte identity with old output is not required, but say whenever numerics change. Bitwise-neutral refactors need only the greedy-identity check.
-- **Keep `docs/precision/` current.** Any engine change that can alter precision (weight formats, activation or accumulation types, KV/state formats, reduction order, decode or MTP paths) updates the page that covers it in the same change, with fresh numbers where it quotes them.
-- **Docs:** no file over 300 lines; split a longer topic into a folder of files; keep docs short, stateless and free of duplication.
-- **Basalt's own kernels are the reference.** Parity tests compare a changed kernel against the current one and against a plain CPU reference; Strata's original kernels are not kept as oracles. Every new kernel gets a parity test (random inputs + real geometry) and a microbench line.
