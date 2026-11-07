@@ -9,8 +9,7 @@ Nine packs on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Ba
 
 - `NVFP4-DQ6_K` (default) and `NVFP4-DQ8`: NVIDIA's NVFP4 experts. `D` is the dense projections' format: Q6_K, or Q8_0 for DQ8.
   DQ8 is slower than DQ6_K and has a lower KLD ([precision](../precision/qwen38-flash-next.md#6-bit-dense-projections)).
-- `UD-Q4_K_XL`, `UD-Q5_K_XL`, `UD-Q6_K_XL` and `Q8_0`: Unsloth's GGUF types.
-- `GSQ-RCO-IQ3_S`, `GSQ-RCO-IQ3_XXS` and `GSQ-RCO-Q2_0`: GSQ-RCO quants.
+- `UD-IQ1_M`, `UD-IQ2_XS`, `UD-IQ3_XXS`, `UD-Q4_K_XL`, `UD-Q5_K_XL`, `UD-Q6_K_XL` and `Q8_0`: Unsloth's GGUF types.
 
 Sizes are on the card. The layout, and how to build a pack: [model file](../model-file.md).
 
