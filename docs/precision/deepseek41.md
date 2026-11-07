@@ -47,8 +47,18 @@ Prompt chunks run MMQ products (q8_1, int8 mma, fp32 accumulation). Against deco
 | Sparse attention | fp16 tensor cores, 2e-4 relative RMS against fp32; bitwise independent of token count |
 | Router logits | 3.5e-4 relative RMS against llama.cpp's batched path |
 
-On the second card, a chunk under 8,334 tokens runs its experts of up to 16 rows on the decode kernels. Against MMQ alone, the last
-prompt row's KL is 3.3e-5 (2,500 tokens) and 8.9e-4 (4,300 tokens), top-1 the same.
+With a second card, each layer's experts split between the cards, both on MMQ. An expert gives the same bits on either card for
+the same launch, but MMQ's stream-k split depends on how many experts share a launch, so moving experts between launches moves the
+rounding on either card. The last prompt row's KL, two cards, 400 W + 180 W, RAM tier pinned:
+
+| Prompt | Split across the cards vs the main card's launches | Main card's launches halved vs whole |
+|---|---:|---:|
+| 600 tokens | 2.9e-2 | 7.4e-3 |
+| 2,500 tokens | 4.6e-3 | 1.8e-2 |
+| 15,400 tokens | 9.4e-3 | 1.4e-2 |
+
+The halved launches' smaller buffers also moved four experts a layer into the main card's homes. Greedy text parts after 3 to 24
+tokens either way. A fixed prompt on a fixed placement repeats exactly.
 
 ### Prompt skip
 
