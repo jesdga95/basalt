@@ -326,7 +326,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         ra.stats = v_.dm_->wstat;
         ra.peer_cap = 0;
         ra.rows = v_.dm_->rq != nullptr || v_.dm_->warm != nullptr;
-        if (v_.dm_->stage_src != nullptr && v_.batch_rec_) {   // batch windows: many rows, many misses
+        if (v_.dm_->stage_src != nullptr) {   // the staged share: past the count table's threshold, some CPU misses
             ra.stage_src = v_.dm_->stage_src + l * g.n_expert;
             ra.stage_k = v_.dm_->stage_k;
         }
