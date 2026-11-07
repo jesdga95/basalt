@@ -4,7 +4,7 @@
 #include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/kernels/q8_1_finite.hpp"
+#include "basalt/kernels/q8_1_fm.cuh"
 #include "smem_opt_in.cuh"
 
 #include <cuda_fp16.h>
@@ -324,31 +324,6 @@ __device__ __forceinline__ float gate_fast(float x, float raw) {
     return y;
 }
 
-// native_quantize_q8_1_kernel's block (fast-math operations spelled out): lane l holds element l of the block
-struct AttnQ81 {
-    half2 ds;
-    int8_t qs[32];
-};
-__device__ __forceinline__ float fm_max(float a, float b) { float y; asm("max.ftz.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b)); return y; }
-__device__ __forceinline__ float fm_abs(float a) { float y; asm("abs.ftz.f32 %0, %1;" : "=f"(y) : "f"(a)); return y; }
-__device__ __forceinline__ float fm_add(float a, float b) { float y; asm("add.ftz.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b)); return y; }
-__device__ __forceinline__ float fm_div(float a, float b) { float y; asm("div.approx.ftz.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b)); return y; }
-__device__ __forceinline__ void q8_1_store_fm(float xi, AttnQ81* y, size_t ib, int lane) {
-    float amax = fm_abs(xi), sum = xi;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) amax = fm_max(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) sum = fm_add(sum, __shfl_xor_sync(0xffffffffu, sum, o));
-    float d = fm_div(amax, 127.0f);
-    d = q8_1_finite(d);
-    int8_t q = 0;
-    if (amax != 0.0f) {
-        const float r = roundf(fm_div(xi, d));
-        q = (int8_t) (r > 127.0f ? 127.0f : r < -127.0f ? -127.0f : r);
-    }
-    y[ib].qs[lane] = q;
-    if (lane == 0) y[ib].ds = q8_1_ds(d, sum);
-}
 
 // One query head of one query: merge the chunks the width reaches, as attn_merge_kernel (which skips the rest).
 __device__ __forceinline__ void attn_merge_dev(const AttnArgs& a, int h, int qi, float* s_w, float* s_l, float* s_red) {
@@ -422,7 +397,7 @@ __device__ __forceinline__ void attn_merge_dev(const AttnArgs& a, int h, int qi,
         const float raw = a.q_full[((size_t) qi * n_head + h) * 2 * HD + HD + d];
         const float gv = gate_fast(o, raw);
         a.attn_gated[((size_t) qi * n_head + h) * HD + d] = gv;
-        if (a.xq != nullptr) q8_1_store_fm(gv, static_cast<AttnQ81*>(a.xq), (((size_t) qi * n_head + h) * HD + d) / 32, d & 31);
+        if (a.xq != nullptr) q8_1_store_fm(gv, static_cast<Q81Fm*>(a.xq), (((size_t) qi * n_head + h) * HD + d) / 32, d & 31);
     }
 }
 
@@ -698,7 +673,7 @@ __global__ void __launch_bounds__(THREADS) draft_merge(AttnArgs a) {
         const float raw = a.q_full[((size_t) qi * n_head + h) * 2 * HD + HD + t];
         const float gv = gate_fast(o, raw);
         a.attn_gated[((size_t) qi * n_head + h) * HD + t] = gv;
-        if (a.xq != nullptr) q8_1_store_fm(gv, static_cast<AttnQ81*>(a.xq), (((size_t) qi * n_head + h) * HD + t) / 32, t & 31);
+        if (a.xq != nullptr) q8_1_store_fm(gv, static_cast<Q81Fm*>(a.xq), (((size_t) qi * n_head + h) * HD + t) / 32, t & 31);
     }
 }
 
