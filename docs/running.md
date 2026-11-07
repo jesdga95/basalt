@@ -36,7 +36,9 @@ Each request ends with one `done` line:
 - `hit`: expert cache hit rate. `pcie`: share of routed experts read over PCIe.
 
 The engine's own `basalt ...` lines go to `~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits
-taken from the file); `[server] engine log: PATH` names it when the engine fails to start.
+taken from the file); `[server] engine log: PATH` names it when the engine fails to start. The folder also holds the conversation
+cache. Nothing is unpacked from the model file: the server reads the tokenizer from its sections, and the engine and `basalt-vision`
+read the vision projector inside it.
 
 ## The stats page
 
@@ -76,7 +78,7 @@ Basalt refuses settings that would leave the machine without memory, and never s
 ## Vision: `--vision`
 
 `--vision off | dynamic | cpu | <GPU number>` (config: `"vision"` in `server`). The encoder is Basalt's own, and all modes give bitwise
-identical embeddings.
+identical embeddings. All of them read the projector in place from the model file's `vision/mmproj` section.
 
 | Mode | Encoder runs | VRAM cost | Fresh-image TTFT (IQ3_S, 400 W): 1k / 3k / 4k image tokens |
 | --- | --- | --- | --- |
