@@ -39,8 +39,7 @@ public:
     int ring_pieces = 0;
     uint8_t* stage[2] = {};             ///< [kStageExperts][slot] each, pinned: a short read's two launches
     float* hx = nullptr;                ///< [share_rows][n_embd] a short read's activations, pinned
-    float* hrows = nullptr;             ///< [kShareRows][n_embd] rows the CPU and the second card return, pinned and mapped
-    float* xb = nullptr;                ///< [kRowBatch][n_embd] one batch to the second card, pinned
+    float* hrows = nullptr;             ///< [kShareRows][n_embd] rows the CPU returns, pinned and mapped
     uint8_t* act = nullptr;             ///< [share_rows][kNativeActBytes] the CPU's quantized activations
     int share_rows = 0;                 ///< most tokens of a short read
     std::vector<float> embed;           ///< [kEmbedRows][4 streams][n_embd]
