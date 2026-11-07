@@ -46,7 +46,7 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 
 | | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash |
 |---|---|---|
-| Packs | 10 packs, default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | 2 packs, `DeepSeek-V4.1-Flash-1017-UD-IQ1_M` and `-UD-IQ2_XXS`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) |
+| Packs | 11 packs, default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | 2 packs, `DeepSeek-V4.1-Flash-1017-UD-IQ1_M` and `-UD-IQ2_XXS`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) |
 | Context | default 8,192; `--max-context` sets it | default 8,192; `--max-context` sets it, up to 1,048,576 |
 | Drafting | MTP, on by default | DSpark, on by default |
 | Images | yes | yes |
