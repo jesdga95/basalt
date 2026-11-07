@@ -142,15 +142,20 @@ struct Setup {
     unsigned long long* ptr = nullptr;
     int32_t *start = nullptr, *n = nullptr, *dst = nullptr, *tok = nullptr;
 
+    // `up`: the up rows' format (-1: gu's)
     Setup(int gu, int dt, int64_t H, int64_t FF, int tokens, int k_per_token, int blobs_n, std::mt19937& rng,
-          cudaStream_t s) {
-        L = k::native_expert_layout(gu, dt, H, FF);
+          cudaStream_t s, int up = -1) {
+        L = k::native_expert_layout(gu, dt, H, FF, 0.0f, up);
         T = tokens; K = k_per_token; cap = T * K; n_blobs = blobs_n;
         slot = (L.bytes + 255) & ~(size_t) 255;
         blobs = dalloc<uint8_t>(slot * (size_t) n_blobs);
         for (int b = 0; b < n_blobs; ++b) {
-            // gate rows | up rows (format gu, H values each) | down rows (format dt, FF values each)
-            auto blob = random_rows(gu, 2 * FF, H, rng);
+            // gate rows | up rows (format gu, or up, H values each) | down rows (format dt, FF values each)
+            auto blob = random_rows(gu, up < 0 ? 2 * FF : FF, H, rng);
+            if (up >= 0) {
+                const auto u = random_rows(up, FF, H, rng);
+                blob.insert(blob.end(), u.begin(), u.end());
+            }
             const auto down = random_rows(dt, H, FF, rng);
             blob.insert(blob.end(), down.begin(), down.end());
             if (gu == 40) append_nvfp4_tail(blob, rng);
@@ -407,15 +412,15 @@ void bench(cudaStream_t s, std::mt19937& rng, const BenchOptions& bo) {
 // wrote, then times the 48 calls in a graph.  The launches cover n_ff 640 and the down formats IQ4_NL / Q2_0
 // (dec_moe_formats_ok); any other shape is refused.
 void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T, int pool, int rounds,
-                bool mess = false) {
+                bool mess = false, int up = -1) {
     const int64_t H = 2560;
-    if (!k::dec_moe_formats_ok(gu, dt, H, ff)) {
+    if (!k::dec_moe_formats_ok(gu, dt, H, ff, up)) {
         std::printf("glue %s/%s ff %d: not a shape the glue launches cover  FAIL\n", name_of(gu), name_of(dt), ff);
         ++g_fail;
         return;
     }
     const int KK = 10, NEXP = 256, NL = 48;
-    Setup S(gu, dt, H, ff, T, KK, pool, rng, s);
+    Setup S(gu, dt, H, ff, T, KK, pool, rng, s, up);
     std::vector<int32_t> ids((size_t) T * KK);
     {
         std::vector<int> ord(pool);
@@ -502,8 +507,9 @@ void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T
         for (int e = 0; e < P.counts[1]; ++e)
             for (int64_t c = 0; c < H; ++c) bad += h_out[(size_t) P.dst[e] * H + c] != h_ref[(size_t) P.dst[e] * H + c];
     }
-    std::printf("glue %s/%s T %d pool %d (%d groups): rows vs native_expert_grouped: %s (%zu differ)\n", name_of(gu),
-                name_of(dt), T, pool, ngroups, bad ? "FAIL" : "bitwise equal", bad);
+    std::printf("glue %s%s%s/%s T %d pool %d (%d groups): rows vs native_expert_grouped: %s (%zu differ)\n", name_of(gu),
+                up >= 0 ? "+" : "", up >= 0 ? name_of(up) : "", name_of(dt), T, pool, ngroups, bad ? "FAIL" : "bitwise equal",
+                bad);
     g_fail += bad != 0;
     cudaGraph_t g;
     cudaGraphExec_t ge;
@@ -575,6 +581,8 @@ int main(int argc, char** argv) {
                 for (int dt : {20, 42, 6})
                     for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, gu, dt, 640, T, glue_pool, 20);
             for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, 21, 20, 640, T, glue_pool, 20, true);   // odd ids
+            // a layer of IQ2_S gate with IQ2_XXS up (UD-IQ1_S)
+            for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, 22, 42, 640, T, glue_pool, 20, T == 5, 16);
         }
         std::printf("native_grouped_parity: %d failures\n", g_fail);
         return g_fail ? 1 : 0;

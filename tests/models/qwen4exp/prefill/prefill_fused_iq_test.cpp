@@ -7,7 +7,8 @@
 //     gate/up, SwiGLU, q8_1 of H, down).
 // Both round the activations and H to int8 per 32 values, differently, so this is not a bitwise test: the fused
 // path's error against the reference has to be comparable to MMQ's own (at most 1.5x its RMS and 2x its worst row).
-// The pairs cover every format the kernels take: gate/up IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_XS, down Q2_0 IQ4_NL.
+// The pairs cover every format the kernels take: gate/up IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_XS, down Q2_0 IQ4_NL,
+// and a layer whose up rows have their own format (IQ2_S gate, IQ2_XXS up: MMQ runs a product per half).
 // Part 1 (reference), per pair: 256 tokens over 64 experts, skewed routing - experts with 0 rows, with one, with
 // several 64-row tiles - an all-zero token, per-expert blobs at unrelated (2-byte aligned) addresses, three launches of
 // different expert ranges.  Part 2 (timing): one layer at the engine's chunks (2048, 3584, 8192 tokens; 512 experts,
@@ -58,21 +59,26 @@ struct Dev {
 struct Pair {
     ggml_type gu, d;
     const char* name;
+    ggml_type up_t = GGML_TYPE_COUNT;   // the up rows' format (COUNT: gu's)
+    ggml_type up() const { return up_t == GGML_TYPE_COUNT ? gu : up_t; }
+    bool mixed() const { return up() != gu; }
 };
 
 struct Geo {
-    size_t gu_row, d_row, up_off, down_off, bytes;
+    size_t gu_row, up_row, d_row, up_off, down_off, bytes;
     explicit Geo(const Pair& p) {
         gu_row = ggml_row_size(p.gu, N);
+        up_row = ggml_row_size(p.up(), N);
         d_row = ggml_row_size(p.d, FF);
         up_off = gu_row * FF;
-        down_off = 2 * up_off;
+        down_off = up_off + up_row * FF;
         bytes = down_off + d_row * N;
     }
     fused::NativeGeom native(const Pair& p) const {
         fused::NativeGeom g;
         g.gu_type = (int) p.gu; g.d_type = (int) p.d; g.gu_row = gu_row; g.d_row = d_row; g.up_off = up_off;
         g.down_off = down_off;
+        g.up_type = (int) p.up(); g.up_row = up_row;
         return g;
     }
 };
@@ -93,7 +99,8 @@ void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt199
 }
 std::vector<uint8_t> make_blob(const Pair& p, const Geo& g, std::mt19937& rng) {
     std::vector<uint8_t> b(g.bytes);
-    fill_matrix(b.data(), p.gu, 2 * FF, N, rng);
+    fill_matrix(b.data(), p.gu, p.mixed() ? FF : 2 * FF, N, rng);
+    if (p.mixed()) fill_matrix(b.data() + g.up_off, p.up(), FF, N, rng);
     fill_matrix(b.data() + g.down_off, p.d, N, FF, rng);
     return b;
 }
@@ -101,10 +108,13 @@ std::vector<uint8_t> make_blob(const Pair& p, const Geo& g, std::mt19937& rng) {
 // ggml's dequantized weights: gate [640][2560], up [640][2560], down [2560][640]
 void dequant(const Pair& p, const Geo& g, const std::vector<uint8_t>& b, std::vector<float>& gu, std::vector<float>& dn) {
     const auto* tg = ggml_get_type_traits(p.gu);
+    const auto* tu = ggml_get_type_traits(p.up());
     const auto* td = ggml_get_type_traits(p.d);
     gu.resize((size_t) 2 * FF * N);
     dn.resize((size_t) N * FF);
-    for (int r = 0; r < 2 * FF; ++r) tg->to_float(b.data() + (size_t) r * g.gu_row, gu.data() + (size_t) r * N, N);
+    for (int r = 0; r < FF; ++r) tg->to_float(b.data() + (size_t) r * g.gu_row, gu.data() + (size_t) r * N, N);
+    for (int r = 0; r < FF; ++r)
+        tu->to_float(b.data() + g.up_off + (size_t) r * g.up_row, gu.data() + (size_t) (FF + r) * N, N);
     for (int r = 0; r < N; ++r) td->to_float(b.data() + g.down_off + (size_t) r * g.d_row, dn.data() + (size_t) r * FF, FF);
 }
 
@@ -164,7 +174,7 @@ struct MmqBufs {
     MmqBufs(const Pair& p, int64_t rows, int E)
         : xq(mmq::q8_bytes(rows, N)), gu((size_t) rows * 1280 * 4), h((size_t) rows * FF * 4),
           hq(mmq::q8_bytes(rows, FF)), dm((size_t) rows * N * 4), ident((size_t) rows * 4),
-          bounds((size_t) (2 * (E + E / GROUP + 2)) * 4), grp_gu(GROUP * mmq::matrix_bytes(p.gu, 1280, N) + 4096),
+          bounds((size_t) (2 * (E + E / GROUP + 2)) * 4), grp_gu(GROUP * mmq::gu_slot_bytes(p.gu, p.up(), FF, N) + 4096),
           grp_d(GROUP * mmq::matrix_bytes(p.d, N, FF) + 4096) {}
 };
 // `direct`: no gathers - the products read the blobs where they are (they must lie at a fixed stride, every expert
@@ -172,7 +182,8 @@ struct MmqBufs {
 void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const Routing& r, const float* x_dev,
              const int32_t* src_dev, const std::vector<const uint8_t*>& blob, int64_t rows, cudaStream_t s,
              bool direct = false, size_t stride = 0) {
-    const size_t gub = mmq::matrix_bytes(p.gu, 1280, N), db = mmq::matrix_bytes(p.d, N, FF);
+    const size_t gub = mmq::gu_slot_bytes(p.gu, p.up(), FF, N), db = mmq::matrix_bytes(p.d, N, FF);
+    const size_t gb = mmq::matrix_bytes(p.gu, FF, N), ub = mmq::matrix_bytes(p.up(), FF, N);
     const int E = (int) r.cnt.size();
     std::vector<int32_t> order;
     for (int e = 0; e < E; ++e) if (r.cnt[(size_t) e] > 0) order.push_back(e);
@@ -190,8 +201,8 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
         const size_t q = j % GROUP;
         const uint8_t* bl = blob[(size_t) order[j]];
         if (!direct)
-            mmq::gather_native(bl, bl + geo.up_off, gub / 2, bl + geo.down_off, db, b.grp_gu.as<uint8_t>() + q * gub,
-                               b.grp_d.as<uint8_t>() + q * db, s);
+            mmq::gather_native(bl, bl + geo.up_off, gb, bl + geo.down_off, db, b.grp_gu.as<uint8_t>() + q * gub,
+                               b.grp_d.as<uint8_t>() + q * db, s, nullptr, nullptr, ub);
         if (q + 1 < GROUP && j + 1 < n) continue;
         const size_t j0 = j - q, g = j0 / GROUP;
         const int ngx = (int) (q + 1);
@@ -208,6 +219,11 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
         gu.expert_bytes = direct ? stride : gub;
         gu.n = ngx; gu.xq = b.xq.p; gu.bounds = b.bounds.as<int32_t>() + j0; gu.ids = b.ident.as<int32_t>();
         gu.total_rows = rows; gu.max_rows = maxr; gu.dst = b.gu.as<float>(); gu.ld_dst = 1280;
+        if (p.mixed()) {   // as expert_mmq.cpp: a product per half, the up rows at the gate's bytes into the slot
+            gu.w_rows = FF;
+            ctx.run(gu, s);
+            gu.w = (const uint8_t*) gu.w + gb; gu.type = (int) p.up(); gu.dst = b.gu.as<float>() + FF;
+        }
         ctx.run(gu, s);
         mmq::swiglu(b.gu.as<float>() + r0 * 1280, b.h.as<float>() + r0 * FF, nr, FF, false, s);
         mmq::quantize(b.h.as<float>() + r0 * FF, nullptr, b.hq.p, (int) p.d, FF, FF, nr, s);
@@ -600,7 +616,8 @@ int main(int argc, char** argv) {
         const std::vector<Pair> pairs = {
             {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S / Q2_0"},       {GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, "IQ2_XXS / Q2_0"},
             {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, "IQ2_XS / IQ4_NL"}, {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, "IQ3_XXS / IQ4_NL"},
-            {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, "IQ3_S / IQ4_NL"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0, "IQ4_XS / Q2_0"}};
+            {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, "IQ3_S / IQ4_NL"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0, "IQ4_XS / Q2_0"},
+            {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S+IQ2_XXS / Q2_0", GGML_TYPE_IQ2_XXS}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
@@ -622,7 +639,7 @@ int main(int argc, char** argv) {
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         for (const Pair& p : pairs) {
             if (only && std::string(p.name).find(only) == std::string::npos) continue;
-            if (!fused::native_supported((int) p.gu, (int) p.d))
+            if (!fused::native_supported((int) p.gu, (int) p.d, (int) p.up()))
                 throw std::runtime_error(std::string(p.name) + ": not covered by the native kernels");
             if (ref) reference_part(p, s);
         }

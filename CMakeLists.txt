@@ -789,6 +789,13 @@ basalt_gpu_test(NAME native_grouped_parity COMMAND native_grouped_parity)
 # dec_moe_glue (plan built inside, gate/up pair kernel, SwiGLU, down) bitwise vs native_expert_grouped, every covered pair
 basalt_gpu_test(NAME native_grouped_parity_glue COMMAND native_grouped_parity --glue)
 set_tests_properties(native_grouped_parity_glue PROPERTIES TIMEOUT 300)
+# a layer whose gate and up rows differ in type: the decode kernels per half bitwise vs the uniform ones, the persistent
+# kernel vs grouped, the CPU tier vs its row kernels, all against a double reference
+add_executable(mixed_gu_parity tests/models/qwen4exp/kernels/mixed_gu_parity.cpp)
+target_include_directories(mixed_gu_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(mixed_gu_parity PRIVATE model_qwen4exp_kernels kernels_cpu ${_gpu_runtime_target})
+basalt_gpu_test(NAME mixed_gu_parity COMMAND mixed_gu_parity)
+set_tests_properties(mixed_gu_parity PROPERTIES TIMEOUT 300)
 add_executable(shared_expert_parity tests/models/qwen4exp/kernels/shared_expert_parity.cpp)
 target_include_directories(shared_expert_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(shared_expert_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
