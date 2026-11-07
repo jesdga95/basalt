@@ -273,6 +273,11 @@ class Precedence(unittest.TestCase):
         _, _, _, cli_words = parse(["--route-tail-skip", "--resident-experts"])
         self.assertEqual(cli_words, ["--route-tail-skip", "--resident-experts"])
 
+    def test_no_peer_prefill_config_words(self):
+        for value, words in ((True, ["--no-peer-prefill"]), (False, [])):
+            _, _, file_words, _ = parse([], {"engine": {"no-peer-prefill": value}})
+            self.assertEqual(file_words, words)
+
     def test_route_prior_config_words(self):
         _, _, file_words, _ = parse([], {"engine": {"route-prior": 1.5}})
         self.assertEqual(file_words, ["--route-prior", "1.5"])

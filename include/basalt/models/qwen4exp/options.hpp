@@ -59,9 +59,8 @@ struct Options : CommonOptions {
     int peer_adapt_swaps = -1;
     /// The peer's experts are held only on the peer, not also in the RAM complement (needs --resident-experts).
     bool peer_exclusive = false;
-    /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
-    /// the primary
-    int64_t peer_prefill_rows = -1;
+    /// --no-peer-prefill: the prompt path stays on the primary, the peer computes none of its rows
+    bool no_peer_prefill = false;
     /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,
     /// then the routing counted since the start; the format of data/profiles); on QUIT and every
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
