@@ -33,6 +33,8 @@ All activations between stages are fp32. A decode kernel's output does not depen
 - **Repeatable.** Placement moves only at token boundaries and follows routing. A fixed prompt on a fixed memory budget repeats exactly.
   A different RAM tier size can change the text.
 - **Clamped SwiGLU** (routed and shared): gate capped, up clamped to ±limit, `silu(gate) * up` in fp32.
+- **Arm64.** The Windows on Arm build's CPU tier runs llama.cpp's NEON dots (`ggml_cpu_dots_neon.c`), which sum in another order
+  than the x86 kernels. No DeepSeek pack has been run on Arm64.
 
 ## Prompt path
 
