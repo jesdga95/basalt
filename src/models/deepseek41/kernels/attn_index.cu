@@ -96,38 +96,55 @@ __device__ __forceinline__ void rotate_pair(float& x0, float& x1, float pos, flo
 
 // ---- gemv -----------------------------------------------------------------------------------------------------
 
-// One warp per output row; the weights are read once for all tokens.
-__global__ void gemv_bf16_kernel(const uint16_t* __restrict__ w, const float* __restrict__ x, int n_tokens, int in,
-                                 int out, float* __restrict__ y) {
-    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    const int lane = threadIdx.x & 31;
-    if (row >= out) return;
-    float acc[kMaxT] = {};
+constexpr int kGemvWarps = 4;   // warps per block
+constexpr int kGemvAhead = 4;   // weight chunks a lane loads before it sums them
+
+// Stage: output `row` of token `t`, one warp. Lane l sums the 8-wide chunks l, l + 32, ... in order and the warp then
+// sums the lanes, so a (row, token) pair has the same sum whichever warp computes it.
+__device__ __forceinline__ void gemv_bf16_row(const uint16_t* __restrict__ w, const float* __restrict__ x, int in,
+                                              int out, int row, int t, float* __restrict__ y) {
+    const int lane = threadIdx.x & 31, n8 = in / 8;
     const uint4* wr = reinterpret_cast<const uint4*>(w + (size_t) row * in);
-    for (int c = lane; c < in / 8; c += 32) {
-        const uint4 q = wr[c];
-        const uint32_t u[4] = {q.x, q.y, q.z, q.w};
-        float wf[8];
+    const float* xt = x + (size_t) t * in;
+    float acc = 0.f;
+    for (int c0 = lane; c0 < n8; c0 += 32 * kGemvAhead) {
+        uint4 q[kGemvAhead];
+        float4 a[kGemvAhead], b[kGemvAhead];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            wf[2 * i] = __uint_as_float(u[i] << 16);
-            wf[2 * i + 1] = __uint_as_float(u[i] & 0xffff0000u);
-        }
-#pragma unroll
-        for (int t = 0; t < kMaxT; ++t) {
-            if (t < n_tokens) {
-                const float4 a = *reinterpret_cast<const float4*>(x + (size_t) t * in + c * 8);
-                const float4 b = *reinterpret_cast<const float4*>(x + (size_t) t * in + c * 8 + 4);
-                acc[t] += wf[0] * a.x + wf[1] * a.y + wf[2] * a.z + wf[3] * a.w + wf[4] * b.x + wf[5] * b.y +
-                          wf[6] * b.z + wf[7] * b.w;
+        for (int k = 0; k < kGemvAhead; ++k) {
+            const int c = c0 + 32 * k;
+            if (c < n8) {
+                q[k] = wr[c];
+                a[k] = *reinterpret_cast<const float4*>(xt + c * 8);
+                b[k] = *reinterpret_cast<const float4*>(xt + c * 8 + 4);
             }
         }
-    }
 #pragma unroll
-    for (int t = 0; t < kMaxT; ++t) {
-        const float s = warp_sum(acc[t]);
-        if (lane == 0 && t < n_tokens) y[(size_t) t * out + row] = s;
+        for (int k = 0; k < kGemvAhead; ++k) {
+            if (c0 + 32 * k >= n8) break;
+            const uint32_t u[4] = {q[k].x, q[k].y, q[k].z, q[k].w};
+            float wf[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                wf[2 * i] = __uint_as_float(u[i] << 16);
+                wf[2 * i + 1] = __uint_as_float(u[i] & 0xffff0000u);
+            }
+            acc += wf[0] * a[k].x + wf[1] * a[k].y + wf[2] * a[k].z + wf[3] * a[k].w + wf[4] * b[k].x +
+                   wf[5] * b[k].y + wf[6] * b[k].z + wf[7] * b[k].w;
+        }
     }
+    const float s = warp_sum(acc);
+    if (lane == 0) y[(size_t) t * out + row] = s;
+}
+
+// A warp per (output row, token): the tokens of a row run on neighbouring warps and share its weight reads in cache.
+__global__ void __launch_bounds__(32 * kGemvWarps)
+gemv_bf16_kernel(const uint16_t* __restrict__ w, const float* __restrict__ x, int n_tokens, int in, int out,
+                 float* __restrict__ y) {
+    const int g = blockIdx.x * kGemvWarps + (threadIdx.x >> 5);
+    const int row = g / n_tokens;
+    if (row >= out) return;
+    gemv_bf16_row(w, x, in, out, row, g - row * n_tokens, y);
 }
 
 inline cudaStream_t as_stream(void* s) { return static_cast<cudaStream_t>(s); }
@@ -958,7 +975,8 @@ __global__ void compress_state_kernel(const float* __restrict__ ckv, const float
 
 void gemv_bf16(const uint16_t* w, const float* x, int n_tokens, int in, int out, float* y, void* stream) {
     if (n_tokens < 1 || n_tokens > kMaxT || in % 8) throw std::invalid_argument("gemv_bf16: bad shape");
-    gemv_bf16_kernel<<<(out + 7) / 8, 256, 0, as_stream(stream)>>>(w, x, n_tokens, in, out, y);
+    gemv_bf16_kernel<<<(out * n_tokens + kGemvWarps - 1) / kGemvWarps, 32 * kGemvWarps, 0, as_stream(stream)>>>(
+        w, x, n_tokens, in, out, y);
     check_launch("gemv_bf16");
 }
 
