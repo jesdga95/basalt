@@ -23,6 +23,8 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
     PeerShare::Layer L;
     L.gu_type = mmq_gt;
     L.d_type = mmq_dt;
+    L.up_type = mmq_ut;
+    L.up_at = mmq_gb;
     const size_t n = order_peer.size();
     if (peer_fp4) {
         // a streamed chunk: the FP4 kernels in pieces of at most G rows (PeerPrefill::T_fp4), the blobs read in place
@@ -93,7 +95,7 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
             ex.push_back(x);
         }
         // a group's blobs out of the peer's slots into the MMQ layout of a group buffer (peer_down_at)
-        const size_t gub = mmq_gub, db = mmq_db, down_at = peer_down_at(mmq_plan());
+        const size_t gub = mmq_gub, gb = mmq_gb, ub = mmq_ub, db = mmq_db, down_at = peer_down_at(mmq_plan());
         const bool native = lay.native;
         const size_t up_off = f.up_off, down_off = f.down_off, tail = f.tail, bytes = f.bytes;
         L.gu_stride = gub;
@@ -104,8 +106,8 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
             for (size_t q = 0; q < blobs.size(); ++q) {
                 const uint8_t* bd = blobs[q].first;
                 if (native)
-                    mmq::gather_native(bd, bd + up_off, gub / 2, bd + down_off, db, grp + q * gub, grp_d + q * db, stream,
-                                       tail ? bd + bytes - tail : nullptr, grp_scales(grp_d) + 4 * q);
+                    mmq::gather_native(bd, bd + up_off, gb, bd + down_off, db, grp + q * gub, grp_d + q * db, stream,
+                                       tail ? bd + bytes - tail : nullptr, grp_scales(grp_d) + 4 * q, ub);
                 else
                     mmq::gather_q2(bd, grp + q * gub, grp_d + q * db, stream);
             }

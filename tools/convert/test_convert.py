@@ -278,20 +278,34 @@ class ConvertTest(unittest.TestCase):
             off += blob * N_EXPERT
         self.assertEqual(off, len(out))
 
-    def test_gate_up_type_mismatch_is_refused(self):
+    def test_gate_up_of_two_types_write_a_v7_layout(self):
         g = GGUFWriter()
         rng = np.random.default_rng(1)
         g.add("general.architecture", "qwen")
-        g.add("qwen.block_count", 1, "u32")
+        g.add("qwen.block_count", 2, "u32")
         g.add("tokenizer.ggml.tokens", TOKENS)
-        g.add_f32("blk.0.ffn_gate_inp.weight", self.router)
-        g.add_raw("blk.0.ffn_gate_exps.weight", [256, 2, N_EXPERT], "Q5_K", rng.bytes(176 * 2 * N_EXPERT))
-        g.add_raw("blk.0.ffn_up_exps.weight", [256, 2, N_EXPERT], "Q6_K", rng.bytes(210 * 2 * N_EXPERT))
-        g.add_raw("blk.0.ffn_down_exps.weight", [32, 2, N_EXPERT], "Q8_0", rng.bytes(34 * 2 * N_EXPERT))
-        bad = g.write(self.t / "bad-00001-of-00001.gguf")
-        with self.assertRaises(SystemExit) as c:
-            convert.convert(self.args(gguf=[str(bad)]))
-        self.assertIn("gate and up differ in type", str(c.exception))
+        g.add_f32("token_embd.weight", self.embd)
+        g.add_f32("per_layer_token_embd.weight", self.ple)
+        raw = {}
+        for l, (gt, ut) in enumerate((("Q5_K", "Q5_K"), ("Q5_K", "Q6_K"))):
+            g.add_f32(f"blk.{l}.ffn_gate_inp.weight", self.router)
+            for role, t, cols, nb in (("gate", gt, 256, 176), ("up", ut, 256, 176 if ut == "Q5_K" else 210),
+                                      ("down", "Q8_0", 32, 34)):
+                raw[(l, role)] = rng.bytes(nb * 2 * N_EXPERT)
+                g.add_raw(f"blk.{l}.ffn_{role}_exps.weight", [cols, 2, N_EXPERT], t, raw[(l, role)])
+        path = g.write(self.t / "mix-00001-of-00001.gguf")
+        convert.convert(self.args(gguf=[str(path)]))
+        m = self.model()
+        b0, b1 = 2 * (176 + 176 + 34), 2 * (176 + 210 + 34)
+        lines = m.read("experts.layout").decode().splitlines()
+        self.assertEqual(lines[0], f"# experts v7: layer gu_type d_type offset blob_bytes up_type "
+                                   f"(n_expert {N_EXPERT}, total {(b0 + b1) * N_EXPERT})")
+        self.assertEqual(lines[1:], [f"0 13 8 0 {b0} 13", f"1 13 8 {b0 * N_EXPERT} {b1} 14"])
+        out = m.read("experts")
+        e = 1
+        want = b"".join(raw[(1, r)][e * (len(raw[(1, r)]) // N_EXPERT):(e + 1) * (len(raw[(1, r)]) // N_EXPERT)]
+                        for r in ("gate", "up", "down"))
+        self.assertEqual(out[b0 * N_EXPERT + e * b1:b0 * N_EXPERT + (e + 1) * b1], want)
 
     def test_sections_from_with_gguf(self):
         import pack_vision

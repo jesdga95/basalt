@@ -44,7 +44,7 @@ bool fused_ring() {
     // buffers; its covered layers still take the fused kernels.
     static const bool all = [&lay] {
         for (const auto& f : lay.fmt)
-            if (!fused::native_supported(f.gu_type, f.d_type)) return false;
+            if (!fused::native_supported(f.gu_type, f.d_type, f.up_type)) return false;
         return !lay.fmt.empty();
     }();
     return all;
@@ -117,8 +117,10 @@ const MmqPlan& mmq_plan() {
         p.fallback = !on || layers <= 0;
         for (int64_t l = 0; on && l < layers; ++l) {
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-            // a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
-            if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
+            const int ut = lay.native ? lay.fmt[(size_t) l].up_type : 42;
+            // a tile on every GPU for these shapes (gate+up: 1280 rows, or 640 each when their types differ; down: N
+            // rows), else the FP16 path
+            if (!mmq::fits(gt, ut == gt ? 1280 : 640) || !mmq::fits(ut, 640) || !mmq::fits(dt, N)) {
                 // Q6_K experts never take the FP16 path: a build without their MMQ instance refuses the pack
                 if (gt == 14 || dt == 14) {
                     basalt::log::error("basalt", "prefill: layer %lld has Q6_K experts and no MMQ kernel takes them", (long long) l);
@@ -129,7 +131,7 @@ const MmqPlan& mmq_plan() {
             }
             p.layer[(size_t) l] = 1;
             p.any = true;
-            p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
+            p.gu_max = std::max(p.gu_max, mmq::gu_slot_bytes(gt, ut, 640, N));
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
         }
         return p;

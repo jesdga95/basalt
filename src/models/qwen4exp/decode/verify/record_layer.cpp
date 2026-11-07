@@ -233,7 +233,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     glue_on = false;
     if (pk_ring && v_.dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
         const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
-        glue_on = v_.dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff));
+        glue_on = v_.dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, 0.0f, f.up_type));
         if (!glue_on) note_fallback("glue off for the layer's experts", f.gu_type, f.d_type);
     }
     // the read's router items also dot the shared expert's gate input and write its q8_1 rows: its side branch is

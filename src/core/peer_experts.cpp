@@ -283,7 +283,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         return false;
     }
     const auto& f = lay.fmt[(size_t) layer];
-    const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit);
+    const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit, f.up_type);
     return launch_layout(layer, L, x, ids, n_tok, k, kind, err, out);
 }
 

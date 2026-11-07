@@ -141,14 +141,19 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         std::istringstream in(std::string(text.begin(), text.end()));
         std::string line;
         p.experts.resize((size_t) g.n_layers);
-        int seen = 0;
+        int seen = 0, version = 0;
         while (std::getline(in, line)) {
+            if (line.rfind("# experts v", 0) == 0) version = std::atoi(line.c_str() + 11);
             if (line.empty() || line[0] == '#') continue;
             std::istringstream ls(line);
-            long long l, gu, d;
+            long long l, gu, d, up = -1;
             unsigned long long off, by;
-            if (!(ls >> l >> gu >> d >> off >> by) || l < 0 || l >= g.n_layers) {
+            if (!(ls >> l >> gu >> d >> off >> by) || l < 0 || l >= g.n_layers || (version >= 7 && !(ls >> up))) {
                 err = "experts.layout: bad line '" + line + "'";
+                return false;
+            }
+            if (version >= 7 && up != gu) {   // v7: the up rows' type; this model's kernels take one gate/up type
+                err = "experts.layout: layer " + std::to_string(l) + "'s gate and up differ in type";
                 return false;
             }
             p.experts[(size_t) l] = {(int) gu, (int) d, off, by};

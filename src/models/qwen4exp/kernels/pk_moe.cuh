@@ -244,7 +244,7 @@ __global__ void pk_shared_done_kernel(unsigned int* sync) { st_release_gpu(sync 
 }  // namespace
 
 bool pk_moe_ok(const NativeExpertLayout& L) {
-    if (L.n_ff != 640 || L.n_embd != 2560) return false;
+    if (L.n_ff != 640 || L.n_embd != 2560 || L.up_type != L.gu_type) return false;
     switch (L.gu_type * 100 + L.d_type) {
 #define PK_OK(TG, TD) case TG * 100 + TD: return true;
         PK_PAIRS(PK_OK)
@@ -259,8 +259,9 @@ void pk_moe_experts(const NativeExpertLayout& L, const PkMoeArgs& a, void* scrat
     float* gate = (float*) scratch;
     float* up = gate + (size_t) kDmCap * L.n_ff;
     const int n = a.n_tok * a.k;
-    if (n > kDmCap || a.k != 10 || a.n_tok < 1) {
-        basalt::log::error("basalt", "pk_moe_experts: %d tokens, k %d", a.n_tok, a.k);
+    if (n > kDmCap || a.k != 10 || a.n_tok < 1 || L.up_type != L.gu_type) {
+        basalt::log::error("basalt", "pk_moe_experts: %d tokens, k %d, gate %d / up %d", a.n_tok, a.k, L.gu_type,
+                           L.up_type);
         std::exit(1);
     }
     const int items = (int) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS) * n;

@@ -4,7 +4,9 @@
 //   1. The layouts of real models (tests/data/native_experts: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S, IQ1_M, a second IQ2_XS)
 //      parse to the fields of each line, and the totals agree with the header's.
 //   2. A newer version, an empty text, a gap between layers, a malformed line and a blob size that does not match
-//      the formats are refused; columns past the fifth are ignored.
+//      the formats are refused; columns past the fifth are ignored before v7.
+//   3. v7's sixth column, the up rows' type: a mixed layer's offsets and sizes, a missing column and a mix that
+//      cannot share a layer refused.
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 
@@ -93,7 +95,7 @@ void refusals() {
     check(load(layout(5, blob, ""), 2, 512, err), "a v5 layout loads" + (err.empty() ? "" : ": " + err));
     check(load(layout(3, blob, " 100 200 300 shard.gguf"), 2, 512, err),
           "columns past the fifth are ignored" + (err.empty() ? "" : ": " + err));
-    check(!load(layout(7, blob, ""), 2, 512, err) && err.find("v7") != std::string::npos, "v7 is refused");
+    check(!load(layout(8, blob, ""), 2, 512, err) && err.find("v8") != std::string::npos, "v8 is refused");
     // NVFP4: the blob carries a 16-byte FP32 scale tail after down, counted in the blob size
     basalt::kernels::cpu::NativeFmt nv;
     check(basalt::kernels::cpu::native_fmt(40, 40, 2560, 640, nv, err) && nv.tail == 16 &&
@@ -110,6 +112,30 @@ void refusals() {
     check(!load(layout(5, blob + 8, ""), 2, 512, err), "a blob size that does not match the formats is refused");
     check(!load("# experts v5: x\n0 12 seven 0 1\n", 1, 512, err), "a malformed line is refused");
 }
+
+// ---- 3. v7: gate and up of their own types
+void mixed() {
+    namespace c = basalt::kernels::cpu;
+    std::string err;
+    c::NativeFmt m, s, x;
+    const bool ok = c::native_fmt(22, 42, 2560, 640, m, err, 0.f, 16) && c::native_fmt(22, 42, 2560, 640, s, err) &&
+                    c::native_fmt(16, 42, 2560, 640, x, err);
+    check(ok && m.up_type == 16 && m.gu_row == s.gu_row && m.up_row == x.gu_row && m.up_off == s.up_off &&
+              m.down_off == 640 * (s.gu_row + x.gu_row) && m.bytes == m.down_off + 2560 * s.d_row && m.gu_act == x.gu_act,
+          "IQ2_S gate with IQ2_XXS up: rows, offsets and blob from both types" + (err.empty() ? "" : ": " + err));
+    check(s.up_type == 22 && s.up_row == s.gu_row && s.down_off == 2 * s.up_off, "a uniform layer's up is its gate's");
+    const int64_t blob = (int64_t) m.bytes;
+    check(load(layout(7, blob, " 16", 2, "22 42"), 2, 512, err) && c::expert_layout().fmt[1].up_type == 16 &&
+              c::expert_layout().fmt[1].up_off == m.up_off && c::expert_layout().total == (uint64_t) (4 * blob),
+          "a v7 layout with a mixed layer loads" + (err.empty() ? "" : ": " + err));
+    check(load(layout(7, (int64_t) s.bytes, " 22", 2, "22 42"), 2, 512, err) && c::expert_layout().fmt[0].up_type == 22,
+          "a v7 uniform line loads" + (err.empty() ? "" : ": " + err));
+    check(!load(layout(7, blob, "", 2, "22 42"), 2, 512, err), "a v7 line without its up type is refused");
+    check(!load(layout(5, blob, " 16", 2, "22 42"), 2, 512, err), "a v5 layout never reads a sixth column");
+    check(!c::native_fmt(22, 42, 2560, 640, x, err, 0.f, 42) && !c::native_fmt(40, 40, 2560, 640, x, err, 0.f, 22) &&
+              !c::native_fmt(22, 42, 2560, 640, x, err, 0.f, 8),
+          "Q2_0, NVFP4 or another activation format beside a different type is refused");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -120,6 +146,7 @@ int main(int argc, char** argv) {
     }
     real_layouts(argv[1]);
     refusals();
+    mixed();
     std::printf(g_fail ? "expert_layout_test: %d FAILED\n" : "expert_layout_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

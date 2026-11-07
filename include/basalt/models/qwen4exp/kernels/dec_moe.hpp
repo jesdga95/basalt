@@ -203,8 +203,8 @@ size_t dec_moe_peer_scratch_bytes(int n_embd, int n_ff);
 /// Blocks the peer kernel runs with on the current device (all co-resident); 0 when it cannot run there.  q2: the
 /// kernel for a model with Q2_0 gate/up layers.
 int dec_moe_peer_blocks(bool q2 = false);
-/// Whether the persistent kernels cover this layer's expert formats.
-bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+/// Whether the persistent kernels cover this layer's expert formats (`up_type`: the up rows' type, -1 for gu_type's).
+bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type = -1);
 /// Launches the peer window (cooperative) on `stream` of the current device; false on a launch error.
 bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2 = false);
 /// Entries one dec_moe_table_put launch carries in its arguments.
@@ -255,10 +255,11 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
                   unsigned int* sync, void* stream, int kind = 0, int cap = kDmCap);
 
 /// The tests: the persistent kernel's per-group math against native_expert_grouped on one device, without rings.
-/// Entries [start[g], start[g+1]) of group g read q8_1 row tok[e] and write row dst[e] of `out` (device).
+/// Entries [start[g], start[g+1]) of group g read q8_1 row tok[e] and write row dst[e] of `out` (device).  `gu2`:
+/// the gate/up rows two a warp, as the peer window runs them.
 void dec_moe_peer_math_test(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* start,
                             int n_groups, const int32_t* tok, const int32_t* dst, const void* xq, void* scratch,
-                            float* out, void* stream);
+                            float* out, void* stream, bool gu2 = false);
 
 /// The layer's FFN output: entry i's row from its tier (CUDA0's `parts`, the peer's or the CPU pool's mapped rows,
 /// entry i at row i of each), summed with the router weights in native_moe_combine_multi's order, plus `shared`.

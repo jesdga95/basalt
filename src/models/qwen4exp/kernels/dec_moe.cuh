@@ -645,7 +645,7 @@ __device__ void dm_glue_ring_pub(const DmRouteArgs& a, const void* xq, int tid, 
 constexpr int kDmGlueExperts = 1024;   // expert ids the mask table covers
 constexpr int kDmGlueTokens = 16;      // tokens a mask holds
 
-template<int TG>
+template<int TG, int TU = TG>
 __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, NativeExpertLayout L,
                                                             float* __restrict__ gate, float* __restrict__ up,
                                                             block_q8_1* __restrict__ hq) {
@@ -753,20 +753,20 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
         const int bx = it % nx, g = it / nx;
         const int row = bx * GU2_ROWS + 2 * warp;   // rows row, row + 1: both gate or both up
         if (row < 2 * L.n_ff)
-            gu2::pair<TG>((const uint8_t*) s_ptr[g], row, s_start[g], s_start[g + 1], s_tok, xq, L, gate, up, s_grid,
-                          lane);
+            gu2::pair_gu<TG, TU>((const uint8_t*) s_ptr[g], row, s_start[g], s_start[g + 1], s_tok, xq, L, gate, up,
+                                 s_grid, lane);
     }
 }
 
 // co-resident blocks on the current device, an eighth of the SMs left to the side streams (shared expert, ring)
-template<int TG> int dm_glue_blocks() {
+template<int TG, int TU = TG> int dm_glue_blocks() {
     static int b[64] = {};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
     if (b[dev] == 0) {
         int sms = 0, per = 0;
         if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, dm_glue_gu_kernel<TG>, 256, 0) != cudaSuccess) {
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, dm_glue_gu_kernel<TG, TU>, 256, 0) != cudaSuccess) {
             cudaGetLastError();
             return 0;
         }
@@ -830,14 +830,22 @@ __device__ __forceinline__ void dm_gu_row(const uint8_t* wr, int row, int e0, in
     }
 }
 
-template<int TG, bool STAGE_GRID>
+// TU: the up rows' type; a mixed layer's up rows read their grid from the device table (s_grid is the gate's)
+template<int TG, bool STAGE_GRID, int TU = TG>
 __device__ __forceinline__ void dm_gu_item(const uint8_t* blob, int e0, int e1, const int32_t* __restrict__ ent_tok,
                                            const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, int rb,
                                            float* __restrict__ gate, float* __restrict__ up, const uint32_t* s_grid,
                                            int warp, int lane) {
     const int row = rb * GU_ROWS + warp;
     if (row >= 2 * L.n_ff) return;
-    // gate and up rows are contiguous in the blob: row `row` is at row * gu_row
+    if constexpr (TG != TU) {
+        if (row >= L.n_ff) {
+            dm_gu_row<TU, false>(blob + L.up_off + (size_t) (row - L.n_ff) * L.up_row, row, e0, e1, ent_tok, xq, L,
+                                 gate, up, nullptr, lane, (unsigned long long) blob);
+            return;
+        }
+    }
+    // a uniform layer's gate and up rows are contiguous in the blob: row `row` is at row * gu_row
     dm_gu_row<TG, STAGE_GRID>(blob + (size_t) row * L.gu_row, row, e0, e1, ent_tok, xq, L, gate, up, s_grid, lane,
                               (unsigned long long) blob);
 }
@@ -1210,7 +1218,7 @@ __device__ __forceinline__ bool dm_wait_ge(const DmWatch& w, const DmShared* sm,
 // counted in done[g] when finished, then down items (group, kDmSpan rows) the same way, a group's first down item
 // on a block waiting until done[g] holds all of its gate/up items.  A block never waits during its gate/up items, so
 // with a co-resident grid every wait ends.  The rows are native_expert_grouped's, bit for bit.
-template<int TG, int TD, bool Q2 = false>
+template<int TG, int TD, bool Q2 = false, int TU = TG>
 __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, float* gate,
                            float* up, float* out, unsigned int* done, int b, int nb, bool gu2 = false,
                            const DmWatch* watch = nullptr) {
@@ -1233,15 +1241,15 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
             const int row = rb * GU2_ROWS + 2 * warp;
             if (g2) {
                 if (row < 2 * L.n_ff)
-                    gu2::pair<TG>((const uint8_t*) sm.gptr[g], row, sm.start[g], sm.start[g + 1], sm.tok, xq, L, gate,
-                                  up, s_grid, lane);
+                    gu2::pair_gu<TG, TU>((const uint8_t*) sm.gptr[g], row, sm.start[g], sm.start[g + 1], sm.tok, xq, L,
+                                         gate, up, s_grid, lane);
             } else {
-                dm_gu_item<TG, SG>((const uint8_t*) sm.gptr[g], sm.start[g], sm.start[g + 1], sm.tok, xq, L, rb, gate,
-                                   up, s_grid, warp, lane);
+                dm_gu_item<TG, SG, TU>((const uint8_t*) sm.gptr[g], sm.start[g], sm.start[g + 1], sm.tok, xq, L, rb,
+                                       gate, up, s_grid, warp, lane);
             }
         } else {
-            dm_gu_item<TG, SG>((const uint8_t*) sm.gptr[g], sm.start[g], sm.start[g + 1], sm.tok, xq, L, rb, gate, up,
-                               s_grid, warp, lane);
+            dm_gu_item<TG, SG, TU>((const uint8_t*) sm.gptr[g], sm.start[g], sm.start[g + 1], sm.tok, xq, L, rb, gate,
+                                   up, s_grid, warp, lane);
         }
         __threadfence();
         __syncthreads();
@@ -1291,11 +1299,23 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42) \
     X(16, 6) X(17, 6) X(18, 6) X(21, 6) X(22, 6) X(23, 6) X(29, 6) X(42, 6) \
     X(40, 40) X(12, 7) X(12, 8) X(13, 8) X(14, 8) X(8, 8) X(21, 8) X(23, 8)   // IQ3_S / IQ4_XS gate/up, Q8_0 down
+// the mixed gate/up layers (GU_MIX) as (gate, up, down)
+#define DM_MIX(X) X(22, 16, 42)
 
 template<bool Q2 = false>
 __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
                                float* out, unsigned int* done, int b, int nb, bool gu2 = false,
                                const DmWatch* watch = nullptr) {
+    if (L.up_type != L.gu_type) {
+        switch ((L.gu_type * 100 + L.up_type) * 100 + L.d_type) {
+#define DM_MIX_CASE(TG, TU, TD) \
+            case (TG * 100 + TU) * 100 + TD: dm_experts<TG, TD, Q2, TU>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch); break;
+            DM_MIX(DM_MIX_CASE)
+#undef DM_MIX_CASE
+            default: break;
+        }
+        return;
+    }
     switch (L.gu_type * 100 + L.d_type) {
 #define DM_CASE(TG, TD) \
         case TG * 100 + TD: dm_experts<TG, TD, Q2>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch); break;
@@ -2133,7 +2153,7 @@ int dm_vram_blocks() {
 __global__ void __launch_bounds__(kDmThreads) dm_test_kernel(NativeExpertLayout L, const unsigned long long* grp_ptr,
                                                               const int32_t* start, int n_groups, const int32_t* tok,
                                                               const int32_t* dst, const block_q8_1* xq, float* gate,
-                                                              float* up, float* out, unsigned int* sync) {
+                                                              float* up, float* out, unsigned int* sync, bool gu2) {
     __shared__ DmShared sm;
     if (threadIdx.x == 0) sm.ng = n_groups;
     for (int i = threadIdx.x; i <= n_groups; i += kDmThreads) {
@@ -2145,7 +2165,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_test_kernel(NativeExpertLayout 
         sm.dst[i] = dst[i];
     }
     __syncthreads();
-    dm_experts_any(sm, xq, L, gate, up, out, sync + 1, blockIdx.x, gridDim.x);
+    dm_experts_any(sm, xq, L, gate, up, out, sync + 1, blockIdx.x, gridDim.x, gu2);
     if (dm_arrive(sync, gridDim.x, sync + 1, n_groups)) sync[0] = 0u;
 }
 
@@ -2177,8 +2197,17 @@ void dec_moe_stage(const DmRouteArgs& a, uint8_t* staging, int64_t stride, int64
 }
 
 bool dec_moe_glue_ok(const NativeExpertLayout& L) {
-    const bool tg = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
-                    L.gu_type == 23 || L.gu_type == 42;
+    bool tg = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
+              L.gu_type == 23 || L.gu_type == 42;
+    if (L.up_type != L.gu_type) {
+        tg = false;
+        switch (L.gu_type * 100 + L.up_type) {
+#define MIX_OK(TG, TU) case TG * 100 + TU: tg = true; break;
+            GU_MIX(MIX_OK)
+#undef MIX_OK
+            default: break;
+        }
+    }
     bool td = false;
     switch (L.d_type) {
 #define DM_OK(T) case T: td = kSplit<T>; break;
@@ -2211,6 +2240,14 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
         const int nb = std::max(1, std::min(items, resident)) + (a.ring_on ? 1 : 0);
         launch_dependent(kernel, dim3((unsigned) nb), s, a, L, gate, up, hq);
     };
+    if (L.up_type != L.gu_type) {
+        switch (L.gu_type * 100 + L.up_type) {
+#define GLUE_MIX(TG, TU) case TG * 100 + TU: go(dm_glue_gu_kernel<TG, TU>, dm_glue_blocks<TG, TU>()); break;
+            GU_MIX(GLUE_MIX)
+#undef GLUE_MIX
+            default: basalt::log::error("basalt", "dec_moe_glue: gate %d / up %d", L.gu_type, L.up_type); std::exit(1);
+        }
+    } else
     switch (L.gu_type) {
         case 40: go(dm_glue_gu1_kernel<40>, dm_glue1_blocks<40>()); break;
         case 16: go(dm_glue_gu_kernel<16>, dm_glue_blocks<16>()); break;
@@ -2380,7 +2417,17 @@ std::string dec_moe_peer_diag(const uint32_t* d) {
     return b;
 }
 
-bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type) {
+    if (up_type >= 0 && up_type != gu_type) {
+        bool mix = false;
+        switch ((gu_type * 100 + up_type) * 100 + d_type) {
+#define DM_MIX_OK(TG, TU, TD) case (TG * 100 + TU) * 100 + TD: mix = true; break;
+            DM_MIX(DM_MIX_OK)
+#undef DM_MIX_OK
+            default: break;
+        }
+        return mix && n_ff == 640 && n_embd == 2560 && !iq_old_kernels() && !native_grouped_v1();
+    }
     bool gu = false, d = false;
     switch (gu_type) {
 #define DM_OK(T) case T: gu = kSplit<T>; break;
@@ -2511,6 +2558,10 @@ size_t dec_moe_vram_scratch_bytes(int n_ff) {
 
 void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, void* scratch, float* out,
                   unsigned int* sync, void* stream, int kind, int cap) {
+    if (L.up_type != L.gu_type) {   // the A/B kernels below take one gate/up type
+        basalt::log::error("basalt", "dec_moe_vram: gate %d / up %d", L.gu_type, L.up_type);
+        std::exit(1);
+    }
     float* gate = (float*) scratch;
     float* up = gate + (size_t) kDmCap * L.n_ff;
     int blocks = 0;
@@ -2585,7 +2636,7 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
 
 void dec_moe_peer_math_test(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* start,
                             int n_groups, const int32_t* tok, const int32_t* dst, const void* xq, void* scratch,
-                            float* out, void* stream) {
+                            float* out, void* stream, bool gu2) {
     float* gate = (float*) scratch;
     float* up = gate + (size_t) kDmCap * L.n_ff;
     unsigned int* sync = (unsigned int*) (up + (size_t) kDmCap * L.n_ff);   // zeroed by the caller, left zeroed
@@ -2593,7 +2644,8 @@ void dec_moe_peer_math_test(const NativeExpertLayout& L, const unsigned long lon
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
     dm_test_kernel<<<(unsigned) sms, kDmThreads, 0, (cudaStream_t) stream>>>(L, grp_ptr, start, n_groups, tok, dst,
-                                                                              (const block_q8_1*) xq, gate, up, out, sync);
+                                                                              (const block_q8_1*) xq, gate, up, out, sync,
+                                                                              gu2);
     check("dec_moe_peer_math_test");
 }
 

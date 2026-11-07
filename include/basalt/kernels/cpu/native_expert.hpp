@@ -20,12 +20,15 @@ inline constexpr int kNativeMaxFF = 2304;
 /// Bytes of the largest quantized down activation (2304 values as Q8_K: 9 x 292, or Q8_0 72 x 34).
 inline constexpr size_t kNativeHBytes = 3072;
 
-/// One layer's native expert geometry.
+/// One layer's native expert geometry.  Gate and up usually share a type; a layer whose up rows have their own type
+/// (Unsloth's UD-IQ1_S mixes IQ2_S gate with IQ2_XXS up on one layer) keeps it in `up_type` / `up_row`.
 struct NativeFmt {
-    int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
-    int gu_act = -1, d_act = -1;        ///< their vec_dot_type (the activation formats)
+    int gu_type = -1, d_type = -1;      ///< ggml types of gate (and of up unless up_type says otherwise) and of down
+    int up_type = -1;                   ///< the up rows' type (gu_type when they agree)
+    int gu_act = -1, d_act = -1;        ///< their vec_dot_type (the activation formats; gate and up share one)
     int64_t n_embd = 0, n_ff = 0;
-    size_t gu_row = 0, d_row = 0;       ///< bytes per weight row
+    size_t gu_row = 0, d_row = 0;       ///< bytes per gate row and per down row
+    size_t up_row = 0;                  ///< bytes per up row (gu_row when the types agree)
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
     size_t tail = 0;                    ///< NVFP4: the blob's last 16 bytes, FP32 {s_gate, s_up, s_down, 0}
@@ -33,10 +36,10 @@ struct NativeFmt {
     float swiglu_limit = 0.f;           ///< > 0: gate capped at it and up clamped to +-it before the product
 };
 
-/// Fills `f` for a layer (`swiglu_limit`: the model's SwiGLU limit, 0 for none); false (with a reason) when there is no
-/// dot product for a type.
+/// Fills `f` for a layer (`swiglu_limit`: the model's SwiGLU limit, 0 for none; `up_type`: the up rows' type, -1 for
+/// gu_type's); false (with a reason) when there is no dot product for a type or gate and up need different activations.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
-                float swiglu_limit = 0.f);
+                float swiglu_limit = 0.f, int up_type = -1);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);

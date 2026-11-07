@@ -49,7 +49,7 @@ bool Prefill::Run::Chunk::Experts::fused() {
         }
         if (fused_nat) {
             const auto& f = lay.fmt[(size_t) l];
-            const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+            const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off, f.up_type, f.up_row};
             fused::experts_native(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H,
                                   m.Dm, m.cs);
         } else {
