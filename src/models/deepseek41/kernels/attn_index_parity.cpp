@@ -1,6 +1,6 @@
 // Parity test of the DeepSeek-V4.1 attention index side (window ring, compressor, indexer) at the real geometry:
-// random inputs against a double-precision host reference, independence from the call width T and the position, and
-// a microbench.
+// random inputs against a double-precision host reference with the cache roundings, the packed window rows against the
+// CPU packing byte for byte, independence from the call width T and the position, and a microbench.
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "test_util.hpp"
 
@@ -29,7 +29,6 @@ float from_bf16(uint16_t b) {
     std::memcpy(&f, &u, 4);
     return f;
 }
-float from_f16(uint16_t h) { return __half2float(*reinterpret_cast<const __half*>(&h)); }
 
 std::vector<uint16_t> rand_bf16(size_t n, uint32_t seed, float sigma) {
     const auto f = randn(n, seed, sigma);
@@ -61,7 +60,15 @@ void norm_rope(std::vector<double>& v, const float* w, double eps, double pos, c
     }
 }
 
-std::vector<uint16_t> down16(const Dev<uint16_t>& d) { return d.down(); }
+// The decoded values of packed rows `ids` (row r at r * rb).
+std::vector<float> unpack_rows(const std::vector<uint8_t>& b, const std::vector<int>& ids, int d, int rb, Round k) {
+    std::vector<float> v;
+    for (int r : ids) {
+        const auto x = ref_unpack(&b[(size_t) r * rb], d, k);
+        v.insert(v.end(), x.begin(), x.end());
+    }
+    return v;
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -75,7 +82,7 @@ void test_kv_window(Verdict& v) {
         for (int i = 0; i < N; ++i) pos[i] = 1000 + 3 * i;
         Dev<float> draw(raw), dw(w), dfreq(freq), dout((size_t) N * kLatent), dout1((size_t) N * kLatent);
         Dev<int32_t> dpos(pos);
-        Dev<uint16_t> ring((size_t) kWindowSlots * kLatent), ring1((size_t) kWindowSlots * kLatent);
+        Dev<uint8_t> ring((size_t) kWindowSlots * kWinRowBytes), ring1((size_t) kWindowSlots * kWinRowBytes);
         for (int b = 0; b < N; b += 4)
             kv_window(draw.p + (size_t) b * kLatent, dw.p, dpos.p + b, 4, 1e-20f, dfreq.p, dout.p + (size_t) b * kLatent, ring.p, nullptr);
         for (int i = 0; i < N; ++i)
@@ -89,14 +96,28 @@ void test_kv_window(Verdict& v) {
             ref.insert(ref.end(), r.begin(), r.end());
         }
         const Err e = compare(got, ref);
-        std::printf("kv_window comp=%d: rms_rel %.2e max_abs %.2e\n", comp, e.rms_rel, e.max_abs);
         v.expect(e.rms_rel < 1e-5, "kv_window vs reference");
         v.expect(got == got1, "kv_window independent of T");
-        const auto rg = down16(ring), rg1 = down16(ring1);
+        const auto rg = ring.down(), rg1 = ring1.down();
         v.expect(rg == rg1, "kv_window ring independent of T");
-        std::vector<float> rf(kLatent), want(kLatent);
-        for (int c = 0; c < kLatent; ++c) { rf[c] = from_f16(rg[(size_t) (pos[N - 1] % kWindowSlots) * kLatent + c]); want[c] = (float) ref[(size_t) (N - 1) * kLatent + c]; }
-        v.expect(compare(rf, want).rms_rel < 1e-3, "kv_window ring slot");
+        // each ring row is the CPU packing of the token's fp32 row; its values the reference rounding of the double row
+        size_t bad = 0;
+        std::vector<int> slots;
+        for (int i = 0; i < N; ++i) {
+            const int slot = pos[i] % kWindowSlots;
+            slots.push_back(slot);
+            const auto want = ref_pack(&got[(size_t) i * kLatent], kLatent, Round::Fp8Pow2, kWinRowBytes);
+            bad += std::memcmp(want.data(), &rg[(size_t) slot * kWinRowBytes], kWinRowBytes) != 0;
+        }
+        auto rounded = ref;
+        for (int i = 0; i < N; ++i) ref_round(&rounded[(size_t) i * kLatent], kLatent, Round::Fp8Pow2);
+        const auto dec = unpack_rows(rg, slots, kLatent, kWinRowBytes, Round::Fp8Pow2);
+        const Err er = compare(dec, rounded);
+        const double fl = flips(dec, rounded);
+        std::printf("kv_window comp=%d: rms_rel %.2e max_abs %.2e; ring rows differing from the CPU packing %zu, FP8 roundings "
+                    "on the other side of the double reference's %.4f (rms_rel %.2e)\n", comp, e.rms_rel, e.max_abs, bad, fl, er.rms_rel);
+        v.expect(bad == 0, "kv_window ring rows equal the CPU packing");
+        v.expect(er.rms_rel < 1e-2 && fl < 0.01, "kv_window ring vs rounded reference");
     }
 }
 
@@ -104,12 +125,12 @@ void test_kv_window(Verdict& v) {
 
 struct CompState {
     Dev<float> skv, ssc;
-    Dev<uint16_t> ckv, cik;
-    CompState(int ratio, int cap) : skv(ratio * kLatent), ssc(ratio * kLatent), ckv((size_t) cap * kLatent), cik((size_t) cap * kIdxDim) {
+    Dev<uint8_t> ckv, cik;
+    CompState(int ratio, int cap) : skv(ratio * kLatent), ssc(ratio * kLatent), ckv((size_t) cap * kCompRowBytes), cik((size_t) cap * kIdxRowBytes) {
         std::vector<float> z(ratio * kLatent, 0.f);
         skv.up(z);
         ssc.up(z);
-        std::vector<uint16_t> zz(ckv.n, 0), zi(cik.n, 0);
+        std::vector<uint8_t> zz(ckv.n, 0), zi(cik.n, 0);
         ckv.up(zz);
         cik.up(zi);
     }
@@ -132,7 +153,7 @@ void test_compress(Verdict& v) {
     for (int ratio = 1; ratio <= 2; ++ratio) {
         const int cap = 32;
         std::vector<std::vector<int>> parts = {{4, 4, 4}, std::vector<int>(12, 1), {3, 2, 4, 1, 2}};
-        std::vector<std::vector<uint16_t>> outs, outk;
+        std::vector<std::vector<uint8_t>> outs, outk;
         for (const auto& part : parts) {
             CompState st(ratio, cap);
             CompressArgs a;
@@ -200,20 +221,21 @@ void test_compress(Verdict& v) {
             std::vector<double> ik(kIdxDim);
             for (int o = 0; o < kIdxDim; ++o) { double a = 0; for (int c = 0; c < kLatent; ++c) a += (double) from_bf16(wik[(size_t) o * kLatent + c]) * nrm[c]; ik[o] = a; }
             norm_rope(ik, nk.data(), 1e-20, p + 1 - ratio, freq);
+            ref_round(pre.data(), pre.size(), Round::Fp4E4m3);
+            ref_round(ik.data(), ik.size(), Round::Fp4Pow2);
             row_ids.push_back(p / ratio);
             rows.insert(rows.end(), pre.begin(), pre.end());
             iks.insert(iks.end(), ik.begin(), ik.end());
         }
-        std::vector<float> g, gk;
-        for (int r : row_ids) {
-            for (int c = 0; c < kLatent; ++c) g.push_back(from_f16(outs[0][(size_t) r * kLatent + c]));
-            for (int c = 0; c < kIdxDim; ++c) gk.push_back(from_f16(outk[0][(size_t) r * kIdxDim + c]));
-        }
+        const auto g = unpack_rows(outs[0], row_ids, kLatent, kCompRowBytes, Round::Fp4E4m3);
+        const auto gk = unpack_rows(outk[0], row_ids, kIdxDim, kIdxRowBytes, Round::Fp4Pow2);
         // the first group of a call sequence that starts mid-group sees a zero partner row in both
         const Err e = compare(g, rows), ek = compare(gk, iks);
-        std::printf("compress ratio %d: %zu rows, latent rms_rel %.2e, index key rms_rel %.2e\n", ratio, row_ids.size(), e.rms_rel, ek.rms_rel);
-        v.expect(e.rms_rel < 2e-3, "compress latents vs reference");
-        v.expect(ek.rms_rel < 3e-3, "compress index keys vs reference");
+        const double fl = flips(g, rows), flk = flips(gk, iks);
+        std::printf("compress ratio %d: %zu rows, latent rms_rel %.2e (FP4 roundings on the other side %.4f), index key "
+                    "rms_rel %.2e (%.4f)\n", ratio, row_ids.size(), e.rms_rel, fl, ek.rms_rel, flk);
+        v.expect(e.rms_rel < 3e-2 && fl < 0.01, "compress latents vs rounded reference");
+        v.expect(ek.rms_rel < 3e-2 && flk < 0.01, "compress index keys vs rounded reference");
     }
 }
 
@@ -224,11 +246,14 @@ struct Ref {
 };
 
 Ref ref_scores(const std::vector<float>& qr, const std::vector<float>& x, const std::vector<uint16_t>& wq,
-               const std::vector<uint16_t>& wp, const std::vector<uint16_t>& ik, const std::vector<int32_t>& pos,
+               const std::vector<uint16_t>& wp, const std::vector<uint8_t>& ikb, const std::vector<int32_t>& pos,
                int n_comp, int ratio, const std::vector<float>& freq, const std::vector<uint8_t>* ok, int bs, int n_blk) {
     const int T = (int) pos.size();
     Ref r;
     r.scores.assign((size_t) T * n_comp, -INFINITY);
+    std::vector<int> all(n_comp);
+    std::iota(all.begin(), all.end(), 0);
+    const auto ik = unpack_rows(ikb, all, kIdxDim, kIdxRowBytes, Round::Fp4Pow2);
     for (int t = 0; t < T; ++t) {
         std::vector<double> iq((size_t) kIdxHeads * kIdxDim), iw(kIdxHeads);
         for (int o = 0; o < kIdxHeads * kIdxDim; ++o) {
@@ -243,6 +268,7 @@ Ref ref_scores(const std::vector<float>& qr, const std::vector<float>& x, const 
                 const double x0 = b[0], x1 = b[1];
                 b[0] = x0 * c - x1 * s; b[1] = x0 * s + x1 * c;
             }
+            ref_round(&iq[(size_t) h * kIdxDim], kIdxDim, Round::Fp4Pow2);
             double a = 0;
             for (int d = 0; d < D; ++d) a += (double) from_bf16(wp[(size_t) h * D + d]) * x[(size_t) t * D + d];
             iw[h] = a / std::sqrt((double) kIdxHeads * kIdxDim);
@@ -253,7 +279,7 @@ Ref ref_scores(const std::vector<float>& qr, const std::vector<float>& x, const 
             double s = 0;
             for (int h = 0; h < kIdxHeads; ++h) {
                 double a = 0;
-                for (int d = 0; d < kIdxDim; ++d) a += iq[(size_t) h * kIdxDim + d] * from_f16(ik[(size_t) j * kIdxDim + d]);
+                for (int d = 0; d < kIdxDim; ++d) a += iq[(size_t) h * kIdxDim + d] * ik[(size_t) j * kIdxDim + d];
                 s += std::max(a, 0.0) * iw[h];
             }
             r.scores[(size_t) t * n_comp + j] = s;
@@ -291,14 +317,13 @@ void test_indexer(Verdict& v) {
     const auto freq = make_table(true);
     const auto wq = rand_bf16((size_t) kIdxHeads * kIdxDim * 1280, 31, 0.03f), wp = rand_bf16((size_t) kIdxHeads * D, 32, 0.03f);
     const auto wq2 = rand_bf16((size_t) kIdxHeads * kIdxDim * 1280, 33, 0.03f), wp2 = rand_bf16((size_t) kIdxHeads * D, 34, 0.03f);
-    const auto ikf = randn((size_t) n_comp * kIdxDim, 35, 1.f);
-    std::vector<uint16_t> ik(ikf.size());
-    for (size_t i = 0; i < ik.size(); ++i) { const __half h = __float2half(ikf[i]); ik[i] = *reinterpret_cast<const uint16_t*>(&h); }
+    const auto ik = packed_rows(n_comp, kIdxDim, kIdxRowBytes, Round::Fp4Pow2, 35);
     const auto qr = randn((size_t) T * 1280, 36, 1.f), x = randn((size_t) T * D, 37, 1.f);
     // positions: the last token sees n_comp rows; the others fewer (and one far below the top-k count)
     std::vector<int32_t> pos = {300, 4500, n_comp - 2, n_comp - 1};
 
-    Dev<uint16_t> dwq(wq), dwp(wp), dwq2(wq2), dwp2(wp2), dik(ik);
+    Dev<uint16_t> dwq(wq), dwp(wp), dwq2(wq2), dwp2(wp2);
+    Dev<uint8_t> dik(ik);
     Dev<float> dqr(qr), dx(x), dfreq(freq);
     Dev<int32_t> dpos(pos), ids((size_t) T * kTopK), nvld(T), cand((size_t) T * kMaxCandBlocks), cn(T), ids1((size_t) T * kTopK), n1(T), c1((size_t) T * kMaxCandBlocks), cn1(T);
     Dev<char> ws(indexer_workspace_bytes(n_comp));
@@ -427,10 +452,7 @@ void bench() {
     const int n_comp = 16384;
     const auto freq = make_table(true);
     Dev<uint16_t> wq(rand_bf16((size_t) kIdxHeads * kIdxDim * 1280, 41, 0.03f)), wp(rand_bf16((size_t) kIdxHeads * D, 42, 0.03f));
-    const auto ikf = randn((size_t) n_comp * kIdxDim, 43, 1.f);
-    std::vector<uint16_t> ik(ikf.size());
-    for (size_t i = 0; i < ik.size(); ++i) { const __half h = __float2half(ikf[i]); ik[i] = *reinterpret_cast<const uint16_t*>(&h); }
-    Dev<uint16_t> dik(ik);
+    Dev<uint8_t> dik(packed_rows(n_comp, kIdxDim, kIdxRowBytes, Round::Fp4Pow2, 43));
     Dev<float> qr(randn(4 * 1280, 44, 1.f)), x(randn(4 * D, 45, 1.f)), dfreq(freq);
     Dev<int32_t> pos(std::vector<int32_t>{n_comp - 4, n_comp - 3, n_comp - 2, n_comp - 1});
     Dev<int32_t> ids(4 * kTopK), nn(4), cand(4 * kMaxCandBlocks), cn(4);
@@ -440,7 +462,7 @@ void bench() {
         a.mode = IndexMode::Level1; a.ratio = 1; a.n_comp = n_comp; a.w_q = wq.p; a.w_proj = wp.p; a.rope_freq = dfreq.p;
         a.comp_ik = dik.p; a.cand_ids = cand.p; a.cand_n = cn.p; a.out_ids = ids.p; a.out_n = nn.p;
         char name[64];
-        const double ikb = (double) n_comp * kIdxDim * 2 * T;
+        const double ikb = (double) n_comp * kIdxRowBytes * T;
         std::snprintf(name, sizeof name, "indexer Level1 T=%d n=%d", T, n_comp);
         bench_line(name, bench_us([&] { indexer_select(a, qr.p, x.p, pos.p + (4 - T), T, ws.p, nullptr); }, 100), (double) kIdxHeads * kIdxDim * 1280 * 2 + ikb);
         a.mode = IndexMode::Full;
@@ -454,7 +476,7 @@ void bench() {
         a.mode = IndexMode::Full; a.ratio = 1; a.n_comp = 524288; a.w_q = wq.p; a.w_proj = wp.p; a.rope_freq = dfreq.p;
         a.comp_ik = dik.p; a.cand_ids = cand.p; a.cand_n = cn.p; a.out_ids = ids.p; a.out_n = nn.p;
         bench_line("indexer Full T=1 n=16384, buffers for 524288", bench_us([&] { indexer_select(a, qr.p, x.p, pos.p + 3, 1, big.p, nullptr); }, 100),
-                   (double) kIdxHeads * kIdxDim * 1280 * 2 + (double) n_comp * kIdxDim * 2);
+                   (double) kIdxHeads * kIdxDim * 1280 * 2 + (double) n_comp * kIdxRowBytes);
     }
     Dev<uint16_t> wkv(rand_bf16((size_t) kLatent * D, 46, 0.02f)), wg(rand_bf16((size_t) kLatent * D, 47, 0.02f)), wik(rand_bf16((size_t) kIdxDim * kLatent, 48, 0.05f));
     Dev<float> nw(randn(kLatent, 49, 1.f, 1.f)), nk(randn(kIdxDim, 50, 1.f, 1.f));
@@ -467,7 +489,7 @@ void bench() {
     bench_line("compress ratio 2 T=1", bench_us([&] { compress(c, x.p, cpos.p, 1, cws.p, nullptr); }, 200), 2.0 * kLatent * D * 2);
     bench_line("compress ratio 2 T=4", bench_us([&] { compress(c, x.p, cpos.p, 4, cws.p, nullptr); }, 200), 2.0 * kLatent * D * 2);
     Dev<float> raw(randn(4 * kLatent, 51, 1.f)), out(4 * kLatent);
-    Dev<uint16_t> ring((size_t) kWindowSlots * kLatent);
+    Dev<uint8_t> ring((size_t) kWindowSlots * kWinRowBytes);
     bench_line("kv_window T=4", bench_us([&] { kv_window(raw.p, nw.p, cpos.p, 4, 1e-20f, dfreq.p, out.p, ring.p, nullptr); }, 500), 4.0 * kLatent * 12);
 }
 

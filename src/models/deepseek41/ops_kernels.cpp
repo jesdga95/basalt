@@ -108,16 +108,17 @@ public:
         st_sc_.assign((size_t) nl, nullptr);
         cws_l_.assign((size_t) nl, nullptr);
         for (int il = 0; il < nl; ++il) {
-            if (!alloc((void**) &ring_[il], (size_t) kWindowSlots * kLatent * 2)) return oom(err);
+            if (!alloc((void**) &ring_[il], (size_t) kWindowSlots * kWinRowBytes)) return oom(err);
             if (g_.compress_ratio[(size_t) il] && kv_source(il) == il) {
                 const int ratio = g_.compress_ratio[(size_t) il];
                 // the caches reserve the address range of the whole context and are backed as positions arrive
                 const size_t cap = (size_t) ctx_ / ratio + 1;
                 el_kv_[il] = std::make_unique<ElasticBuf>();
                 el_ik_[il] = std::make_unique<ElasticBuf>();
-                if (!el_kv_[il]->open(cap * kLatent * 2, err) || !el_ik_[il]->open(cap * kIdxDim * 2, err)) return false;
-                comp_kv_[il] = (uint16_t*) el_kv_[il]->data();
-                comp_ik_[il] = (uint16_t*) el_ik_[il]->data();
+                if (!el_kv_[il]->open(cap * ctxp::kLatentRowBytes, err) || !el_ik_[il]->open(cap * ctxp::kIndexRowBytes, err))
+                    return false;
+                comp_kv_[il] = el_kv_[il]->data();
+                comp_ik_[il] = el_ik_[il]->data();
                 if (!alloc((void**) &st_kv_[il], (size_t) ratio * kLatent * 4) ||
                     !alloc((void**) &st_sc_[il], (size_t) ratio * kLatent * 4) || !alloc(&cws_l_[il], compress_workspace_bytes()))
                     return oom(err);
@@ -173,7 +174,8 @@ public:
         return total;
     }
 
-    // Each kv-source layer as a K/V entry: its latents and index keys by row, a row being `ratio` cells.
+    // Each kv-source layer as a K/V entry: its latents and index keys by row, a row being `ratio` cells, tagged with
+    // the rows' format.
     bool save_cache(void* stream, int64_t positions, std::vector<core::ConversationKv>& kv, std::string& err) override {
         cudaStreamSynchronize((cudaStream_t) stream);
         kv.clear();
@@ -186,6 +188,7 @@ public:
             }
             const uint64_t rows = ctxp::cache_rows(positions, (int) ratio);
             core::ConversationKv k;
+            k.format = ctxp::kCellFormat;
             k.page_size = ratio;
             k.cells = (int64_t) rows * ratio;
             k.k.resize_for_overwrite(rows * ctxp::kLatentRowBytes);
@@ -209,7 +212,7 @@ public:
         size_t i = 0;
         for (int il = 0; il < g_.n_layers; ++il) {
             if (!el_kv_[(size_t) il]) continue;
-            if (i >= kv.size() || kv[i].page_size != g_.compress_ratio[(size_t) il]) {
+            if (i >= kv.size() || kv[i].page_size != g_.compress_ratio[(size_t) il] || kv[i].format != ctxp::kCellFormat) {
                 err = "deepseek41: a parked conversation has other caches";
                 return false;
             }
@@ -228,7 +231,7 @@ public:
     }
 
     size_t turn_bytes() const override {
-        const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
+        const size_t ring_b = (size_t) kWindowSlots * kWinRowBytes;
         size_t total = 0;
         for (size_t il = 0; il < ring_.size(); ++il) {
             if (ring_[il]) total += ring_b;
@@ -239,7 +242,7 @@ public:
 
     void save_turn(void* stream, uint8_t* host) override {
         cudaStreamSynchronize((cudaStream_t) stream);
-        const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
+        const size_t ring_b = (size_t) kWindowSlots * kWinRowBytes;
         size_t at = 0;
         auto put = [&](const void* dev, size_t bytes) {
             cudaMemcpy(host + at, dev, bytes, cudaMemcpyDeviceToHost);
@@ -258,7 +261,7 @@ public:
     void restore_turn(void* stream, const uint8_t* host) override {
         cudaStreamSynchronize((cudaStream_t) stream);
         win_n_ = 0;
-        const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
+        const size_t ring_b = (size_t) kWindowSlots * kWinRowBytes;
         size_t at = 0;
         auto get = [&](void* dev, size_t bytes) {
             cudaMemcpy(dev, host + at, bytes, cudaMemcpyHostToDevice);
@@ -371,7 +374,8 @@ public:
             for (int il = 0; il < g_.n_layers && ok; ++il) {
                 if (!el_kv_[(size_t) il]) continue;
                 const uint64_t rows = (uint64_t) positions / (uint64_t) g_.compress_ratio[(size_t) il] + 1;
-                ok = el_kv_[(size_t) il]->ensure(rows * kLatent * 2, keep, e) && el_ik_[(size_t) il]->ensure(rows * kIdxDim * 2, keep, e);
+                ok = el_kv_[(size_t) il]->ensure(rows * ctxp::kLatentRowBytes, keep, e) &&
+                     el_ik_[(size_t) il]->ensure(rows * ctxp::kIndexRowBytes, keep, e);
             }
             if (ok) {
                 backed_positions_ = positions;
@@ -398,8 +402,8 @@ public:
         for (int il = 0; il < g_.n_layers; ++il) {
             if (!el_kv_[(size_t) il]) continue;
             const uint64_t rows = (uint64_t) keep / (uint64_t) g_.compress_ratio[(size_t) il] + 1;
-            el_kv_[(size_t) il]->trim(rows * kLatent * 2);
-            el_ik_[(size_t) il]->trim(rows * kIdxDim * 2);
+            el_kv_[(size_t) il]->trim(rows * ctxp::kLatentRowBytes);
+            el_ik_[(size_t) il]->trim(rows * ctxp::kIndexRowBytes);
         }
         backed_positions_ = keep;
     }
@@ -542,14 +546,13 @@ public:
         a.n_tokens = T;
         a.q = q_;
         a.win = ring_[il];
-        a.win_type = LatentType::F16;
+        a.win_type = LatentType::Fp8;
         a.win_cap = kWindowSlots;
         a.win_start = d_start;
         a.win_n = d_n;
         if (ratio) {
             a.comp = comp_kv_[kv_source(il)];
-            a.comp_type = LatentType::F16;
-            a.comp_stride = kLatent;
+            a.comp_type = LatentType::Fp4;
             a.sel = ids_;
             a.n_sel = sel;
             a.comp_limit = d_lim;
@@ -930,7 +933,7 @@ private:
     const Geometry& g_;
     std::unique_ptr<AttnBatch> batch_;
     std::vector<void*> allocs_;
-    std::vector<uint16_t*> ring_, comp_kv_, comp_ik_;
+    std::vector<uint8_t*> ring_, comp_kv_, comp_ik_;
     std::vector<std::unique_ptr<ElasticBuf>> el_kv_, el_ik_;   // backing of comp_kv_ / comp_ik_ per kv-source layer
     int64_t backed_positions_ = 0;
     int ctx_ = 0;

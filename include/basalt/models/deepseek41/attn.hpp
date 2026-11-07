@@ -81,12 +81,15 @@ void q_heads(const QPathWeights& w, int n_tokens, const int32_t* pos, const Rope
 
 // ---- sparse MQA -------------------------------------------------------------------------------------------------
 
-enum class LatentType { F32, F16 };
+/// The rows a latent is read from: plain fp32 or fp16 [512], or the caches' packed rows (attn_index.hpp): Fp8 the
+/// window rows (kWinRowBytes), Fp4 the compressed rows (kCompRowBytes).
+enum class LatentType { F32, F16, Fp8, Fp4 };
 
 /// Keys and values are the same 512-wide latent. Per token the keys are
 ///   window: win_n[t] rows, row j at slot (win_start[t] + j) % win_cap of `win` (ring order is irrelevant to the sum)
 ///   selected: sel[t][0..n_sel) row ids of `comp`; an id < 0 or >= comp_limit[t] is masked out.
-/// score = q . k * scale; the per-head sink joins the softmax denominator and has no value.
+/// score = q . k * scale; the per-head sink joins the softmax denominator and has no value. The type pairs read are
+/// (Fp8, Fp4), the model's caches, and (F16, F32), (F32, F32).
 struct MqaArgs {
     int n_tokens = 1;
     const float* q = nullptr;                          ///< [T][64][512]
@@ -95,9 +98,8 @@ struct MqaArgs {
     int win_cap = kAttnWindow;
     const int32_t* win_start = nullptr;                ///< [T]
     const int32_t* win_n = nullptr;                    ///< [T], at most 128
-    const void* comp = nullptr;                        ///< compressed rows, row r at comp + r * comp_stride (elements)
+    const void* comp = nullptr;                        ///< compressed rows
     LatentType comp_type = LatentType::F32;
-    int64_t comp_stride = kAttnHeadDim;
     const int32_t* sel = nullptr;                      ///< [T][n_sel]; null or n_sel == 0: window only
     int n_sel = 0;                                     ///< at most 512
     const int32_t* comp_limit = nullptr;               ///< [T]: visible rows (ids at or above are masked)

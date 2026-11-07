@@ -1,7 +1,8 @@
 // include/basalt/models/deepseek41/attn_index.hpp - DeepSeek-V4.1 attention, index side: the window ring, the KV
 // compressor and the two-level sparse indexer, for decode calls of T = 1..kMaxT tokens.
 //
-// Activations are fp32, caches are fp16 (stored as uint16_t bits), projection weights are bf16 or fp32 as published.
+// Activations are fp32, the caches hold packed FP8/FP4 rows (layouts below), projection weights are bf16 or fp32 as
+// published.
 // All pointers are device pointers. The result for a token does not depend on T or on its place in the call. `stream`
 // may be null. Exact layouts are in the comments below; the cache rows are what the attend kernel reads.
 #pragma once
@@ -50,10 +51,11 @@ void rope_freq_table(const RopeParams& p, float* out);
 
 // ---- window ring ----------------------------------------------------------------------------------------------
 
-/// kv = rope(rms_norm(kv_raw) * norm_w) per token; kv_out[T][512] (fp32, may be null) and ring[kWindowSlots][512]
-/// (fp16) at slot pos % kWindowSlots receive it. kv_raw is wkv . x, [T][512]. pos[T] int32.
+/// kv = rope(rms_norm(kv_raw) * norm_w) per token, stored as a window row at slot pos % kWindowSlots of
+/// ring[kWindowSlots][kWinRowBytes]; kv_out[T][512] (may be null) receives it in fp32 before the rounding.
+/// kv_raw is wkv . x, [T][512]. pos[T] int32.
 void kv_window(const float* kv_raw, const float* norm_w, const int32_t* pos, int n_tokens, float rms_eps,
-               const float* rope_freq, float* kv_out, uint16_t* ring, void* stream);
+               const float* rope_freq, float* kv_out, uint8_t* ring, void* stream);
 
 // ---- compressor (kv-source layers) ----------------------------------------------------------------------------
 
@@ -72,8 +74,8 @@ struct CompressArgs {
     const float* rope_freq = nullptr;   ///< the layer's table
     float* state_kv = nullptr;          ///< [ratio][512] fp32, partial-group rows by position % ratio; zero at start
     float* state_score = nullptr;       ///< [ratio][512] fp32
-    uint16_t* comp_kv = nullptr;        ///< [cap][512] fp16: compressed latents, row r = group r, rotated at r * ratio
-    uint16_t* comp_ik = nullptr;        ///< [cap][128] fp16: index keys (normed, last 64 dims rotated); may be null
+    uint8_t* comp_kv = nullptr;         ///< [cap][kCompRowBytes]: compressed latents, row r = group r, rotated at r * ratio
+    uint8_t* comp_ik = nullptr;         ///< [cap][kIdxRowBytes]: index keys (normed, last 64 dims rotated); may be null
 };
 
 /// x[T][n_embd] is the attention-normed input, pos[T] the positions (consecutive within a sequence). For each token
@@ -112,7 +114,7 @@ struct IndexerArgs {
     const uint16_t* w_q = nullptr;      ///< bf16 [4096][1280]  (indexer.attn_q_b)
     const uint16_t* w_proj = nullptr;   ///< bf16 [32][n_embd]  (indexer.proj)
     const float* rope_freq = nullptr;   ///< the layer's table
-    const uint16_t* comp_ik = nullptr;  ///< [>=n_comp][128] fp16: the kv-source layer's index keys
+    const uint8_t* comp_ik = nullptr;   ///< [>=n_comp][kIdxRowBytes]: the kv-source layer's index keys
     int32_t* cand_ids = nullptr;        ///< [T][kMaxCandBlocks] int32: written by Level1, read by Level2
     int32_t* cand_n = nullptr;          ///< [T] int32
     int32_t* out_ids = nullptr;         ///< [T][kTopK] int32: row ids ascending, -1 padded
@@ -120,7 +122,8 @@ struct IndexerArgs {
 };
 
 /// qr[T][1280] is the q_a-normed query latent, x[T][n_embd] the attention-normed input.
-/// score(q, j) = sum_h relu(iq[h] . ik[j]) * iw[h] / sqrt(32*128), iw = w_proj . x, iq = rope(w_q . qr).
+/// score(q, j) = sum_h relu(iq[h] . ik[j]) * iw[h] / sqrt(32*128), iw = w_proj . x, iq = rope(w_q . qr) rounded as
+/// an index key.
 /// Query at position p sees rows j < (p+1)/ratio. The top kTopK by score are kept (ties to the lower row id);
 /// fewer than kTopK are kept when fewer rows are visible. Level1/Level2 as in IndexMode.
 /// Reuse layers do nothing: they read the ids of the latest index-source layer.

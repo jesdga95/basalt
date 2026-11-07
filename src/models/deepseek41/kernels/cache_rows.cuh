@@ -136,12 +136,24 @@ __device__ __forceinline__ void fp8_values(uint32_t codes, uint32_t scale, float
     }
 }
 
-// E2M1 codes with an E4M3 scale (compressed rows): n of 2, 4 or 8 values.
+// E2M1 codes with an E4M3 scale (compressed rows): n of 2, 4 or 8 values. The fp16 of a code's value times 2^-14
+// (e2m1_value14) has only a high byte, ((c & 8) << 4) | ((c & 7) << 1): the bytes of all eight are made at once and
+// placed in pairs. Times 2^14, then times the scale, both exact in fp16 (at most 6 significant bits, between 2^-10
+// and 2688).
 template <int n>
 __device__ __forceinline__ void fp4_values(uint32_t codes, uint32_t scale, float* k) {
-    const float s = e4m3_value(scale) * 16384.0f;
+    const __half2 s = __half2half2(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) scale, __NV_E4M3)));
+    const uint32_t lo = codes & 0x0f0f0f0fu, hi = (codes >> 4) & 0x0f0f0f0fu;   // even and odd values
+    const uint32_t l = ((lo & 0x07070707u) << 1) | ((lo & 0x08080808u) << 4);
+    const uint32_t h = ((hi & 0x07070707u) << 1) | ((hi & 0x08080808u) << 4);
+    const uint32_t a = __byte_perm(l, h, 0x5140), b = __byte_perm(l, h, 0x7362);   // values 0..3, 4..7
 #pragma unroll
-    for (int i = 0; i < n; ++i) k[i] = e2m1_value14(codes >> (4 * i)) * s;
+    for (int p = 0; p < n / 2; ++p) {
+        const uint32_t bits = __byte_perm(p < 2 ? a : b, 0u, (p & 1) ? 0x3424 : 0x1404);
+        const float2 f = __half22float2(__hmul2(__hmul2(*reinterpret_cast<const __half2*>(&bits), __float2half2_rn(16384.0f)), s));
+        k[2 * p] = f.x;
+        k[2 * p + 1] = f.y;
+    }
 }
 
 // E2M1 codes with a UE8M0 scale (index keys): n of up to 8 values.
