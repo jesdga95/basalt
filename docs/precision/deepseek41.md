@@ -60,6 +60,16 @@ rounding on either card. The last prompt row's KL, two cards, 400 W + 180 W, RAM
 The halved launches' smaller buffers also moved four experts a layer into the main card's homes. Greedy text parts after 3 to 24
 tokens either way. A fixed prompt on a fixed placement repeats exactly.
 
+Against BF16 (100 chunks, the same placement: homes main card 34, second card 45, RAM 305), the split moves the score within
+noise:
+
+| Prompt experts | PPL | KLD mean | Top-1 |
+|---|---:|---:|---:|
+| Main card only | 3.0337 | 0.27693 | 83.93% |
+| Split across the cards | 3.0378 | 0.27709 | 83.88% |
+
+Paired by chunk, the KLD difference is +0.00016 (95% CI -0.00113 to +0.00145) and top-1 -0.05 points (-0.24 to +0.14).
+
 ### Prompt skip
 
 Past layer 20, a row reads only its own 127-position window and layer 20's compressed rows. A row more than 2,668 positions from the
