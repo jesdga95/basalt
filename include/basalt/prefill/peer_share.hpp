@@ -61,9 +61,12 @@ public:
         float* out = nullptr;                     ///< rows x n_embd results
     };
     /// One layer's formats and steps. The MMQ products read expert q of a launch's group at stage + q gu_stride (gate/up)
-    /// and stage + down_off + q d_stride (down).
+    /// and stage + down_off + q d_stride (down).  A layer whose up rows have their own type (`up_type` >= 0, not
+    /// gu_type) runs a gate product and an up product, the up rows at `up_at` in each gate/up slot.
     struct Layer {
         int gu_type = -1, d_type = -1;
+        int up_type = -1;
+        size_t up_at = 0;
         size_t blob_bytes = 0, stride = 0;        ///< staging by copies: blob i of a group at stage + i stride
         size_t gu_stride = 0, down_off = 0, d_stride = 0;
         /// Main card: the layer's activations x [n_tokens][n_embd] into `dst`; empty: q8_1 for the MMQ products.

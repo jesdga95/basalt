@@ -290,22 +290,28 @@ class Experts:
             if any(t.expected_bytes() is None or len(t.shape) != 3 or int(t.shape[2]) != self.n_expert for t in ts):
                 raise ConvertError("layer %d: an expert tensor is not [*, *, %d] of whole blocks" % (l, self.n_expert))
             per = [t.expected_bytes() // self.n_expert for t in ts]
-            if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
-                raise ConvertError("layer %d: gate and up differ in type" % l)
             blob = sum(per)
-            self.layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, names))
+            self.layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, names, ts[1].type_id))
             offset += blob * self.n_expert
         self.total = offset
 
     def layout_text(self) -> bytes:
-        head = ("# experts v5: layer gu_type d_type offset blob_bytes (n_expert %d, total %d)\n"
+        """v5; v7 (a sixth column, the up rows' type) only when a layer's gate and up differ in type, so every other
+            model stays readable by engines from before v7."""
+        mixed = any(gt != ut for _, gt, _, _, _, _, ut in self.layout)
+        if not mixed:
+            head = ("# experts v5: layer gu_type d_type offset blob_bytes (n_expert %d, total %d)\n"
+                    % (self.n_expert, self.total))
+            return (head + "".join("%d %d %d %d %d\n" % (l, gt, dt, off, blob)
+                                   for l, gt, dt, off, blob, _, _ in self.layout)).encode("utf-8")
+        head = ("# experts v7: layer gu_type d_type offset blob_bytes up_type (n_expert %d, total %d)\n"
                 % (self.n_expert, self.total))
-        return (head + "".join("%d %d %d %d %d\n" % (l, gt, dt, off, blob)
-                               for l, gt, dt, off, blob, _ in self.layout)).encode("utf-8")
+        return (head + "".join("%d %d %d %d %d %d\n" % (l, gt, dt, off, blob, ut)
+                               for l, gt, dt, off, blob, _, ut in self.layout)).encode("utf-8")
 
     def chunks(self, group: int = 32):
         """The blobs layer by layer, `group` experts at a time: each expert is [gate | up | down] of its slices."""
-        for l, gt, dt, off, blob, names in self.layout:
+        for l, gt, dt, off, blob, names, _ in self.layout:
             arrays = [self.model.bytes(n).reshape(self.n_expert, -1) for n in names]
             for s in range(0, self.n_expert, group):
                 yield np.concatenate([a[s:s + group] for a in arrays], axis=1).tobytes()

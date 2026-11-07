@@ -151,6 +151,13 @@ struct PeerShare::Impl {
         p.max_rows = l.max_rows;
         p.dst = gu;
         p.ld_dst = p.w_rows;
+        if (L.up_type >= 0 && L.up_type != L.gu_type) {   // gate rows, then up rows of their own type
+            p.w_rows = d.n_ff;
+            ctx->run(p, ps);
+            p.w = (const uint8_t*) p.w + L.up_at;
+            p.type = L.up_type;
+            p.dst = gu + d.n_ff;
+        }
         ctx->run(p, ps);
         L.act(gu, h, l, ps);
         mmq::quantize(h, nullptr, hq, L.d_type, d.n_ff, d.n_ff, l.rows, ps);
