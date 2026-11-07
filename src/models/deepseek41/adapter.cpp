@@ -112,15 +112,12 @@ public:
         const bool drafter = opened && file.find("dspark/gguf") != nullptr;
         // the pack's drafter runs in windows of 3 unless --spec says otherwise; a token file drafts in its place
         if (!o.spec_given) {
-            o.spec = drafter && o.batch <= 1 ? 3 : 0;
+            o.spec = drafter ? 3 : 0;
             if (opened && !drafter) basalt::log::info("basalt deepseek41", "no dspark/gguf section: plain decode");
         }
-        if (o.spec >= 2 && o.spec_oracle.empty()) {
-            const char* off = o.batch > 1 ? "--parallel slots draft nothing" : !drafter ? "the pack has no dspark/gguf section" : nullptr;
-            if (off != nullptr) {
-                basalt::log::warn("basalt deepseek41", "--spec %d off: %s", o.spec, off);
-                o.spec = 0;
-            }
+        if (o.spec >= 2 && o.spec_oracle.empty() && !drafter) {
+            basalt::log::warn("basalt deepseek41", "--spec %d off: the pack has no dspark/gguf section", o.spec);
+            o.spec = 0;
         }
         if (!opened || !file.load_meta(err)) return std::nullopt;
         const core::Json* kv = file.meta().get("gguf_kv");

@@ -74,8 +74,9 @@ Measured on the UD-IQ1_M pack, 400 W + 180 W, 121 GiB of RAM, `--pool-workers 8`
 
 ## Parallel slots
 
-No throughput gain: at 400 W + 180 W, one stream 60.1 tok/s, two slots 58.4 and four 54.9 in total. Slots share one decode stream
-and draft nothing.
+Slots share one decode stream: a batch window runs each busy slot's window in turn. Each slot drafts as a single stream does, from
+the drafter's window rows of its own conversation. The slots share one drafter, so `--parallel` adds no drafter memory. A request
+alone in its slot gives the same greedy tokens as with `--parallel 1` (tiers pinned).
 
 ## Lossy flags
 
