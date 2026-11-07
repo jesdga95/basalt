@@ -67,17 +67,17 @@ struct QPathWeights {
     float rms_eps = 1e-20f;
 };
 
-/// Bytes of q8_1 scratch the query path needs for n_tokens.
+/// Bytes of qr's q8_1 rows for n_tokens.
 size_t q_path_scratch_bytes(int n_tokens);
 
-/// qr = rms_norm(wq_a . x) * q_norm; q = rope(wq_b . qr). `xq_scratch` holds q_path_scratch_bytes; `pos` is the
+/// qr = rms_norm(wq_a . x) * q_norm; q = rope(wq_b . qr). `qr_q8_1` holds q_path_scratch_bytes; `pos` is the
 /// device array of the T absolute token positions.
 void q_path(const void* x_q8_1, const QPathWeights& w, int n_tokens, const int32_t* pos, const RopeTable& rope,
-            void* xq_scratch, float* qr, float* q, void* stream);
-/// The two halves of q_path: the normed latent qr, then the heads q from it.
-void q_latent(const void* x_q8_1, const QPathWeights& w, int n_tokens, float* qr, void* stream);
-void q_heads(const QPathWeights& w, int n_tokens, const int32_t* pos, const RopeTable& rope, void* xq_scratch,
-             const float* qr, float* q, void* stream);
+            void* qr_q8_1, float* qr, float* q, void* stream);
+/// The two halves of q_path: the normed latent qr and its q8_1 rows, then the heads q from them.
+void q_latent(const void* x_q8_1, const QPathWeights& w, int n_tokens, float* qr, void* qr_q8_1, void* stream);
+void q_heads(const QPathWeights& w, int n_tokens, const int32_t* pos, const RopeTable& rope, const void* qr_q8_1,
+             float* q, void* stream);
 
 // ---- sparse MQA -------------------------------------------------------------------------------------------------
 
