@@ -1,4 +1,4 @@
-"""--model FILE.basalt: the config derived from the file, the tokenizer unpacked once, the peer card, vision."""
+"""--model FILE.basalt: the config derived from the file, the tokenizer read in memory, the peer card, vision."""
 import io
 import json
 import sys
@@ -60,8 +60,8 @@ class Derivation(Tmp):
     def test_cache_key_is_the_meta_hash(self):
         path = self.build()
         key = ModelFile(path).sections["meta"][2].hex()[:16]
-        tok = Path(modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))["tokenizer"])
-        self.assertEqual(tok, self.dir / "cache" / key / "tokenizer")
+        cfg = modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))
+        self.assertEqual(Path(cfg["log"]), self.dir / "cache" / key / "engine.log")
 
     def test_conversation_dir_follows_the_budget(self):
         path = self.build()
@@ -78,15 +78,11 @@ class Derivation(Tmp):
         self.assertEqual(args("--conversation-cache-disk-mib", "5", "--conversation-cache-dir", "/x"),
                          ["--model", path, "--conversation-cache-disk-mib", "5", "--conversation-cache-dir", "/x"])
 
-    def test_tokenizer_extracted_once_and_reused(self):
+    def test_tokenizer_is_read_from_the_sections_and_nothing_is_written(self):
         path = self.build()
-        tok = Path(modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))["tokenizer"])
-        for n, b in TOKENIZER.items():
-            self.assertEqual((tok / n).read_bytes(), b)
-        self.assertEqual([p.name for p in tok.parent.iterdir()], ["tokenizer"])
-        (tok / "vocab.json").write_bytes(b"{}")                # a present directory is not rewritten
-        modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))
-        self.assertEqual((tok / "vocab.json").read_bytes(), b"{}")
+        cfg = modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))
+        self.assertEqual(cfg["tokenizer"], TOKENIZER)
+        self.assertEqual(list(Path(cfg["log"]).parent.iterdir()), [])
 
     def test_missing_tokenizer_and_bad_file(self):
         w = ModelWriter(str(self.dir / "bare.basalt"))
@@ -141,11 +137,10 @@ class Vision(Tmp):
         path = self.build(vision=True)
         side = self.engine_bin.parent / "basalt-vision"
         side.write_text("")
-        cfg = modelfile.model_config(modelfile.ModelSpec(path, vision=True), str(self.engine_bin))
-        v = cfg["vision"]
+        v = modelfile.model_config(modelfile.ModelSpec(path, vision=True), str(self.engine_bin))["vision"]
         self.assertEqual(v["vision_bin"], str(side.resolve()))
         self.assertEqual(v["model"], path)                  # the sidecar reads vision/mmproj in place
-        self.assertFalse((Path(cfg["log"]).parent / "vision").exists())
+        self.assertEqual(list((self.dir / "cache").glob("*/*")), [])
 
     def test_sidecar_takes_the_engine_bins_suffix(self):
         path = self.build(vision=True)
