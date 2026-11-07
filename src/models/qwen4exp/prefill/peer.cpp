@@ -110,7 +110,7 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t tf, std::u
     }
     if (!ok) {
         cudaGetLastError();
-        err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)";
+        err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or use --no-peer-prefill)";
         return false;
     }
     basalt::log::info("basalt prefill", "peer GPU %d computes its experts' rows of each prompt chunk%s, with compact group "

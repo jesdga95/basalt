@@ -92,7 +92,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
     // peer-only experts, staged through the host, so streaming loses until later.
     auto set_stream_all_min = [&]() {
-        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share)
+        if (o.serve && o.peer_device >= 1 && !o.no_peer_prefill && peer_streamed_share)
             basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
     };
     set_stream_all_min();
