@@ -89,6 +89,15 @@ class Http(unittest.TestCase):
         self.assertEqual(set(m["hardware_static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
         self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
 
+    def test_the_context_stays_through_a_restart(self):
+        self.engine.max_context, self.engine.known_ctx = 0, 16384    # a start under way: no READY yet
+        self.assertEqual(self.call("/metrics")[1]["engine"]["max_context"], 16384)
+        self.engine.max_context = 32768                              # the new READY wins
+        self.assertEqual(self.call("/metrics")[1]["engine"]["max_context"], 32768)
+        self.engine.max_context = 0
+        del self.engine.known_ctx                                    # never started: nothing to report
+        self.assertEqual(self.call("/metrics")[1]["engine"]["max_context"], 0)
+
     def test_requests_have_an_id_and_the_path(self):
         paths = ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/chat/completions"]
         for path in paths:
