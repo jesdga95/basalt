@@ -119,6 +119,9 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     core::detail::HostMemory hm;
     auto available = [&] { return core::detail::host_available_memory(hm) ? hm.available : 0; };
     const uint64_t ram_reserve = platform::ram_reserve();
+    // the image encoder's cuBLAS handle takes host memory when created, so it is taken before the reading
+    if (m_.tiers().vision && !m_.vision_blas().open(err))
+        return false;
     if (!host_.open(m_, 0, m_.sessions(), m_.tiers().vision, err))
         return false;
     uint64_t avail = available();
