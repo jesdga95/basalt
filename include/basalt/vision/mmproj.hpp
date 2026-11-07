@@ -56,7 +56,6 @@ private:
     platform::MappedFile mapping_;   ///< the file's view, when `map_` is one
     bool mapped_ = false;   ///< `map_` is a file mapping (else allocated memory the file was read into)
     size_t size_ = 0;
-    size_t view_off_ = 0;   ///< where the projector starts inside the mapping
     Hparams hp_;
     std::map<std::string, TensorRef> tensors_;
 };
