@@ -1,7 +1,7 @@
 // src/prefill/peer_share.cpp - multi-GPU: a second card's share of a prompt chunk's routed experts.
 //
 // Per layer the main card quantizes the activations into mapped host memory. A layer's experts are staged in groups of
-// at most launch_experts, a new one also where the caller starts one (group i in staging buffer i % bufs), each group's
+// at most launch_experts, a new one also where the caller starts one (group i in staging buffer i % stage_bufs), each group's
 // rows run in launches of at most launch_rows rows (launch j in buffer set j % bufs), and four streams carry them:
 //   stage    (second card): a group's blobs into its staging buffer (copies device-to-device or over its own link, or
 //                           the caller's staging); the first groups of a layer whose experts are known early start before
@@ -118,7 +118,7 @@ struct PeerShare::Impl {
 
     // Queues the copies of `blobs` into the staging buffer of group number `gi`, once the last group there is done.
     void stage_group(const Layer& L, const std::vector<std::pair<const uint8_t*, bool>>& blobs, uint64_t gi) {
-        const int b = (int) (gi % (uint64_t) d.bufs);
+        const int b = (int) (gi % (uint64_t) d.stage_bufs);
         const core::OnDevice od(peer);
         cudaStreamWaitEvent(s_stage, ev_free[b], 0);
         if (L.stage) L.stage(blobs, stage[b], s_stage);
@@ -209,8 +209,8 @@ template <class Peer, class Host>
 static void layout(const PeerShare::Dims& d, Peer&& peer, Host&& host) {
     const int64_t R = d.launch_rows, G = max_launches(d);
     host(d.act_bytes);                                               // hxq
+    for (int b = 0; b < d.stage_bufs; ++b) peer(d.group_bytes);     // stage
     for (int b = 0; b < d.bufs; ++b) {
-        peer(d.group_bytes);                                         // stage
         peer(mmq::q8_bytes(R, d.n_embd));                            // xq
         peer((size_t) R * (size_t) d.n_embd * 4);                    // out
         host((size_t) R * (size_t) d.n_embd * 4);                    // hrows
@@ -240,8 +240,8 @@ uint64_t PeerShare::host_bytes(const Dims& d) {
 }
 
 bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::string& err) {
-    if (d.bufs < 2 || d.bufs > kMaxBufs) {
-        err = "peer share: 2 or 3 buffer sets";
+    if (d.bufs < 2 || d.bufs > kMaxBufs || d.stage_bufs < 1 || d.stage_bufs > kMaxBufs) {
+        err = "peer share: 2 or 3 launch buffers, 1 to 3 staging buffers";
         return false;
     }
     auto m = std::make_unique<Impl>();
@@ -265,8 +265,8 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
                 ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
         if (ok) {
             size_t i = 0;
+            for (int b = 0; b < d.stage_bufs; ++b) m->stage[b] = (uint8_t*) pv[i++];
             for (int b = 0; b < d.bufs; ++b) {
-                m->stage[b] = (uint8_t*) pv[i++];
                 m->xq[b] = pv[i++];
                 m->out[b] = (float*) pv[i++];
             }
@@ -325,7 +325,7 @@ void PeerShare::prepare(const Layer& L, const std::vector<Expert>& experts) {
     m.prepared_at = m.group;
     m.prepared_blobs.clear();
     const std::vector<std::pair<size_t, size_t>> cut = cut_groups(experts, m.d.launch_experts);
-    for (size_t k = 0; k < cut.size() && m.prepared < m.d.bufs; ++k, ++m.prepared) {
+    for (size_t k = 0; k < cut.size() && m.prepared < m.d.stage_bufs; ++k, ++m.prepared) {
         const auto [i0, i1] = cut[k];
         std::vector<std::pair<const uint8_t*, bool>> blobs;
         for (size_t i = i0; i < i1; ++i) {
@@ -449,7 +449,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             const Group& g = groups[gi];
             if ((int) gi >= prepared) m.stage_group(L, blobs[gi], nums[gi]);
-            const int sb = (int) (nums[gi] % (uint64_t) d.bufs);
+            const int sb = (int) (nums[gi] % (uint64_t) d.stage_bufs);
             const core::OnDevice od(m.peer);
             if (!g.launches.empty()) cudaStreamWaitEvent(ps, m.ev_staged[sb], 0);
             for (const Cut& l : g.launches) {

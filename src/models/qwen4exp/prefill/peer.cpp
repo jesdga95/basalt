@@ -59,7 +59,9 @@ static PeerShare::Dims share_dims(int64_t Tp, int64_t G, int64_t tf, const MmqPl
     d.n_expert = (int) NE;
     d.launch_experts = MMQ_GROUP;
     d.launch_rows = G;
-    d.bufs = 2;   // the staging gathers out of the peer's own slots: one group ahead is enough
+    // one group buffer, as many as its own gathers had: the group's gather follows the last group's products
+    d.stage_bufs = 1;
+    d.bufs = 2;
     return d;
 }
 template <class Take>
