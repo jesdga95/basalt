@@ -100,7 +100,6 @@ bool Mmproj::open(const core::FileRange& range, std::string& err, const char* pr
     if (!platform::file_size(path, whole)) { err = "cannot open " + path; return false; }
     if (file_bytes < 32 || offset + file_bytes > whole) { err = "cannot read " + path; return false; }
     size_ = (size_t) file_bytes;
-    view_off_ = 0;
     // read whole with block-aligned unbuffered reads, so the file cache neither copies nor keeps it; a file system that
     // refuses them, and a platform with no unbuffered descriptor, is mapped instead
     {
@@ -123,14 +122,16 @@ bool Mmproj::open(const core::FileRange& range, std::string& err, const char* pr
     }
     if (map_ == nullptr) {
         std::string why;
-        auto m = platform::MappedFile::open_ro(path, &why);
+        platform::MapOptions window;   // only the projector's bytes: a section of a pack must not map the whole pack
+        window.offset = offset;
+        window.bytes = file_bytes;
+        auto m = platform::MappedFile::open_ro(path, &why, window);
         if (!m) { err = "cannot map " + path; return false; }
         mapping_ = std::move(*m);
         map_ = const_cast<uint8_t*>(mapping_.data());
         mapped_ = true;
-        view_off_ = (size_t) offset;
     }
-    const uint8_t* base = (const uint8_t*) map_ + view_off_;
+    const uint8_t* base = (const uint8_t*) map_;
     Cursor c{base, base + size_};
     if (c.get<uint32_t>() != 0x46554747u) { err = path + " is not a GGUF file"; return false; }
     if (c.get<uint32_t>() != 3) { err = "unsupported GGUF version"; return false; }
