@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))   # the real tokenizer
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve import service as service_module  # noqa: E402
 from serve.engine.errors import EngineDied, EngineStartError, GpuBusy  # noqa: E402
