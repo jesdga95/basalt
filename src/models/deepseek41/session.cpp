@@ -401,7 +401,12 @@ public:
 
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) override {
         std::string err;
-        vision::Image img;
+        if (!image_) {   // this slot's image buffers, allocated with the tier
+            ExpertTier* tier = ops_ ? ops_->expert_tier(err) : nullptr;
+            image_ = tier ? tier->host().take_image() : nullptr;
+            if (!image_) return {model::Status::Error, err.empty() ? "deepseek41: no image buffers for this slot" : err};
+        }
+        vision::Image& img = image_->picture;
         if (!vision::decode_image(data, bytes, img, err)) return {model::Status::Error, err};
         if (!vis_) {
             release_short_prompt();
@@ -436,7 +441,7 @@ public:
             vis_min_pixels_ = mp.hp().min_pixels;
         }
         const VisionPlan pl = plan_image(img.w, img.h, vis_merge_, vis_min_pixels_);
-        std::vector<float> patches;
+        std::vector<float>& patches = image_->patches;
         image_patches(img, pl, patches);
         if (!vis_->encode(patches, pl, rows, err)) { images_done(); return {model::Status::Error, err}; }
         n_rows = pl.n_tokens();
@@ -534,7 +539,7 @@ private:
         // the tier opens at its normal size before anything else takes the card; the workspaces size to what is left
         ExpertTier* t = ops_->expert_tier(e);
         if (!t || prefill_) return;
-        short_prompt_ = t->has_homes() && n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
+        short_prompt_ = n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
         if (!short_prompt_) t->shrink();
     }
     void settle_tier() {
@@ -1037,6 +1042,7 @@ private:
     void* q8_ = nullptr;
     // the drafter and the main model's side of its feature hand-off
     std::unique_ptr<DsparkDrafter> drafter_;
+    PromptHost::Image* image_ = nullptr;   ///< this slot's image buffers
     float* dfeat_ = nullptr;     // [rows][target layers][n_embd]
     float* h_dfeat_ = nullptr;
     int64_t feat_pos0_ = 0;      // the first position of the rows in dfeat_ that await the drafter, and how many

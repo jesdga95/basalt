@@ -9,6 +9,7 @@
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "models/deepseek41/model.hpp"
+#include "models/deepseek41/prefill_plan.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -24,9 +25,6 @@
 namespace basalt::models::deepseek41 {
 namespace {
 
-// Host memory left to the system beside the RAM tier: what serving takes after the start, and the page cache that
-// file-held experts and the load read through.
-constexpr uint64_t kRamHeadroom = 16ull << 30;
 constexpr size_t kMaxPending = 128;              // promotions in flight
 constexpr uint64_t kPrereadBytes = 12ull << 30;  // file-backed experts read ahead into the page cache
 
@@ -112,21 +110,39 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         }
     }
 
-    core::detail::HostMemory hm;
-    uint64_t avail = 0;
-    if (core::detail::host_available_memory(hm)) avail = hm.available;
-    auto ram_in = [&](uint64_t left_free) {
-        return (int) std::min<uint64_t>(avail > left_free ? (avail - left_free) / one_each_ram : 0, (uint64_t) n_expert_);
+    // The prompt and image buffers first, so the free memory the tier reads already lacks them. The ring holds five layers
+    // of the second card's homes, or its cap when experts may stay in the file.
+    auto available = [] {
+        core::detail::HostMemory hm;
+        return core::detail::host_available_memory(hm) ? hm.available : 0;
     };
-    int ram_slots = ram_in(kRamHeadroom);
-    if (m_.tiers().resident_budget > 0)
-        ram_slots = std::min(ram_slots, (int) std::min<uint64_t>(m_.tiers().resident_budget / one_each_ram, (uint64_t) n_expert_));
-    if (m_.diag_tier_ram() >= 0) ram_slots = std::min(m_.diag_tier_ram(), n_expert_);
+    const uint64_t ram_reserve = platform::ram_reserve();
+    const int peer_homes = std::min(peer_slots, n_expert_);
+    if (!host_.open(m_, std::min(prefillp::kRingPieces, prefillp::kRing * peer_homes), m_.sessions(), m_.tiers().vision, err))
+        return false;
+    uint64_t avail = available();
+    auto ram_in = [&] {   // places per layer above the reserve, less the spare each layer keeps
+        const uint64_t places = core::ram_tier_room(avail, ram_reserve, true) / one_each_ram;
+        int slots = (int) std::min<uint64_t>(places > 0 ? places - 1 : 0, (uint64_t) n_expert_);
+        if (m_.tiers().resident_budget > 0)
+            slots = std::min(slots, (int) std::min<uint64_t>(m_.tiers().resident_budget / one_each_ram, (uint64_t) n_expert_));
+        if (m_.diag_tier_ram() >= 0) slots = std::min(m_.diag_tier_ram(), n_expert_);
+        return slots;
+    };
+    int ram_slots = ram_in();
+    if (ram_slots < n_expert_ - peer_homes) {
+        if (!host_.set_ring(prefillp::kRingPieces, err)) return false;
+        avail = available();
+        ram_slots = ram_in();
+    }
     homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots);
+    const uint64_t ram_floor =
+        ram_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
     if (homes_.peer == 0) peer_.reset();
 
-    reserve_ = homes_.main > 0 ? reserve.beside_homes : reserve.copies;
-    modules_ = homes_.main > 0 ? reserve.modules : 0;
+    // the base arena (homes, or copies a long prompt borrows) leaves its reserve free; grow() fills it beside a short prompt
+    reserve_ = reserve.beside_homes;
+    modules_ = reserve.modules;
     per_layer_ = homes_.main > 0 ? homes_.main : copies;
     if (homes_.main == 0 && per_layer_ < g.n_used) {
         err = "deepseek41: not enough device memory for the expert tier";
@@ -177,21 +193,18 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     pool_ = std::make_unique<kernels::cpu::ExpertPool>(workers, m_.tiers().pool_affinity_given ? m_.tiers().pool_affinity : kernels::cpu::PoolAffinity::All);
 
     if (!load_ram(err)) return false;
-    if (homes_.main > 0) {
-        grow();
-    } else {
-        seed_copies(0, per_layer_);
-        promoted_ = 0;
-    }
+    if (homes_.main == 0) seed_copies(per_layer_);
+    promoted_ = 0;
+    grow();
     // what the start picked by itself, on the server's auto line; the RAM floor the tier left free
     std::printf("auto flags: resident %.1f GB, pool-workers %d\n",
                 (double) one_each_ram * cover_ / 1e9, pool_->workers());   // the server keeps the words after the name
     std::fflush(stdout);
-    basalt::log::info("basalt generate", "RAM floor %.1f GiB of %.1f GiB free", (double) kRamHeadroom / 1073741824.0,
+    basalt::log::info("basalt generate", "RAM floor %.1f GiB of %.1f GiB free", (double) ram_floor / 1073741824.0,
                       (double) avail / 1073741824.0);
     if (peer_) basalt::log::info("basalt deepseek41", "peer GPU %d: %lld experts", peer_->device(), (long long) n_layers_ * homes_.peer);
     basalt::log::info("basalt deepseek41", "expert homes of %d per layer: main card %d, second card %d, RAM %d, file %d; main card copies %lld",
-                 n_expert_, homes_.main, homes_.peer, homes_.ram, homes_.file, (long long) (homes_.main > 0 ? ext_per_layer_ : per_layer_));
+                 n_expert_, homes_.main, homes_.peer, homes_.ram, homes_.file, (long long) (per_layer_ + ext_per_layer_ - homes_.main));
     program::warn_spill(spill(), peer_ ? "" : ", or --gpu 0,1");
     basalt::log::info("basalt deepseek41", "VRAM expert tier %.2f GiB, %lld of %d experts per layer (%.0f%%); CPU pool %d workers",
                  cache_.gib(), (long long) per_layer_, n_expert_, 100.0 * (double) per_layer_ / n_expert_, pool_->workers());
@@ -420,12 +433,12 @@ bool ExpertTier::load_rank(std::string& err) {
     return true;
 }
 
-// Copies the most routed RAM tier experts from rank `first_rank` on into `n` slots of each layer.
-void ExpertTier::seed_copies(int first_rank, int64_t n) {
+// Copies the most routed RAM tier experts the main card does not hold yet into `n` slots of each layer.
+void ExpertTier::seed_copies(int64_t n) {
     for (int l = 0; l < n_layers_; ++l) {
-        for (int64_t r = first_rank, placed = 0; r < n_expert_ && placed < n; ++r) {
+        for (int64_t r = 0, placed = 0; r < n_expert_ && placed < n; ++r) {
             const int e = ranked(l, (int) r);
-            if (!pinned(l, e)) continue;
+            if (!pinned(l, e) || res_[(size_t) l * n_expert_ + e] >= 0) continue;
             ++tick_;
             if (claim(l, e, blob_of(l, e), copy_stream_) < 0) {
                 cudaStreamSynchronize(copy_stream_);
@@ -892,12 +905,10 @@ void ExpertTier::grow() {
     busy_.resize((size_t) slot_total(), 0);
     basalt::log::info("basalt deepseek41", "VRAM expert tier %lld of %d experts per layer (%lld beside the prompt workspaces)",
                  (long long) (per_layer_ + n), n_expert_, (long long) per_layer_);
-    if (homes_.main > 0) {
-        cudaDeviceSynchronize();   // the arena's zeroing is not ordered against the copy stream
-        const int64_t promoted = promoted_;
-        seed_copies(homes_.main + homes_.peer, n);
-        promoted_ = promoted;
-    }
+    cudaDeviceSynchronize();   // the arena's zeroing is not ordered against the copy stream
+    const int64_t promoted = promoted_;
+    seed_copies(n);
+    promoted_ = promoted;
 }
 
 void ExpertTier::set_free_floor(int64_t mib) { free_floor_ = mib < 0 ? start_floor_ : (uint64_t) mib << 20; }

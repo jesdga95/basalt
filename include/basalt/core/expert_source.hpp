@@ -110,14 +110,6 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
 int64_t choose_resident_room(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
                              int64_t lend_from, uint64_t spare_bytes, bool& spares_fit);
 
-/// The RAM a resident copy may take with `physical` bytes available and `headroom` left free.  The arena is ordinary
-/// 4 KiB pages, so their page tables and the driver's per-page records (physical / 256) come on top of its bytes.  The
-/// whole copy's safety check and the keep-what-fits budget are both sized by this one figure.
-inline uint64_t resident_room(uint64_t physical, uint64_t headroom) {
-    const uint64_t reserve = headroom + physical / 256;
-    return physical > reserve ? physical - reserve : 0;
-}
-
 /// The adaptive tier swapped `in` into a GPU slot and `out` out of it: `out` takes `in`'s place in the compact copy
 /// (the caller copies out's bytes there).  False, and nothing changed, unless `in` is in the copy and `out` is not.
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out);
@@ -298,9 +290,9 @@ public:
     /// `budget_bytes` > 0 (`--resident-budget-gib`): only as many of those experts as fit `budget_bytes`, taken in
     /// `rank` order (the expert profile: the hottest after the GPU cache's), are copied; the rest stay on the mapped
     /// files (the SSD tier).  No lend region then (a lent slot's expert is read from the files).
-    /// `budget_bytes` = `kResidentWhatFits` is that path sized by the RAM alone (available minus the headroom and a
-    /// margin) - the soft --resident-experts mode's second try when the whole complement does not fit; false when not
-    /// even one expert fits.
+    /// `budget_bytes` = `kResidentWhatFits` is that path sized by the RAM alone (ram_tier_room of the available RAM and
+    /// the headroom) - the soft --resident-experts mode's second try when the whole complement does not fit; false when
+    /// not even one expert fits.
     static constexpr uint64_t kResidentWhatFits = ~0ull;
     bool pin_cache_complement(
         const ExpertCache& cache, std::string& err, bool pin = true,
@@ -368,11 +360,10 @@ public:
     /// A place `spare_take` gave, unused.
     void spare_return(int64_t layer, uint64_t off);
     /// After loading, before any reader runs: keeps more experts in RAM, in a second region placed after the first
-    /// in the offset space, hottest first (`rank`) as far as available RAM less the RAM margin allows.  `skip(l, e)`
-    /// names experts a GPU holds.  `later` is RAM still to be taken after this, kept free too.  Returns the bytes added
-    /// (0: nothing done); `count` gets the experts.
+    /// in the offset space, hottest first (`rank`) as far as ram_tier_room of the available RAM and the reserve allows.
+    /// `skip(l, e)` names experts a GPU holds.  Returns the bytes added (0: nothing done); `count` gets the experts.
     uint64_t top_up(const std::vector<std::pair<int32_t, int32_t>>& rank,
-                    const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count, uint64_t later = 0);
+                    const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count);
     // ---- RAM homes for the experts a shrinking VRAM cache gives up (--vram-elastic in the resident mode).  The
     // caller asks for homes (`homes_take`: one region, refused with `err` when the RAM budget cannot hold it), copies
     // each expert from its slot into `dst[k]`, waits for the copies, and calls `homes_commit`: the experts are then
@@ -390,7 +381,7 @@ public:
     /// free less than a region or the RAM cannot take the copy).  Only with no exchange in flight.
     uint64_t homes_compact();
     uint64_t homes_bytes() const;
-    /// RAM above the margin that a take leaves free (the server's guard floor and the engine's later allocations).
+    /// RAM above the reserve that a take leaves free (the engine's later allocations).
     void set_homes_reserve(uint64_t bytes) { homes_reserve_ = bytes; }
     /// Debug: whether `bytes` equal the expert's bytes in the model files.
     bool equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const;

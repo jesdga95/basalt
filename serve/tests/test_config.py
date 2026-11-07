@@ -126,10 +126,10 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(flag_value(qfile, "--max-context"), "262144")     # slot-full-context
         self.assertEqual(flag_value(dfile, "--max-context"), "1048576")
 
-    def test_the_ram_guard_switch(self):
-        p = conf({"engine": {"no-ram-guard": True}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
+    def test_the_ram_reserve(self):
+        p = conf({"engine": {"ram-reserve-mib": 4096}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
         for _, _, words, _ in model_settings(build_parser(), ["--config", p]):
-            self.assertIn("--no-ram-guard", words)
+            self.assertEqual(flag_value(words, "--ram-reserve-mib"), "4096")
 
     def test_version(self):
         ap = build_parser()

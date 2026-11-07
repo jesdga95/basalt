@@ -68,6 +68,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `idle-sleep` | entry | seconds | off | Sleep after this long idle: VRAM freed, RAM kept, wake in seconds. Linux only. [running](../running.md#sleep---idle-sleep) |
 | `min-free-vram-mib` | entry | integer | off | Load an unloaded model only when this much VRAM is free; else 503. |
 | `grammar` | entry | switch (`--no-grammar`) | on | Hold tool calls and JSON formats (`json_object`, `json_schema`) to their schema inside the engine. Without it, other JSON formats are refused with 400. |
+| `max-payload-mib` | server | MiB | `256` | Largest request body the server reads; a bigger one gets a 413. |
 | `debug` | server | switch | off | One log line per request, and the raw model text. |
 | `request-lines` | server | switch | off | Echo the per-request summary on stdout. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | entry | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling`, else the engine's | Default for a request that leaves the field out. See [sampling](sampling.md). |
@@ -111,6 +112,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `vram-elastic` | engine | switch | off | Flash-Next only. Hold the expert cache in segments so `POST /v1/vram` can lend VRAM between requests. |
 | `vram-segment-mib` | engine | MiB, at least 64 | 512 | Flash-Next only. Segment size for `vram-elastic`. |
 | `expert-cache` | engine | `auto` or a count | `auto` | Expert blobs kept in VRAM. `auto` takes what fits after weights, session and reserve. |
+| `ram-reserve-mib` | engine | MiB | 2048 | RAM left free for the rest of the system. The expert tiers take what is above it after the engine's own host buffers, and the serving RAM guard holds it. `0` keeps nothing and turns the guard off. [memory floors](../running.md#memory-floors) |
 | `adapt-every` | engine | windows | 1 on a server, 4 with a layer split (`0` = off) | Flash-Next only. An adaptive round every N windows. [adaptive](adaptive.md) |
 | `adapt-swaps` | engine | integer | 96 (`0` = off) | Flash-Next only. Most experts one round swaps into the main GPU. [adaptive](adaptive.md) |
 | `peer-adapt-swaps` | engine | integer | `adapt-swaps` | Flash-Next only. Most experts one round swaps into the peer card. |
@@ -160,7 +162,6 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | `conversation-cache-mib` | engine | MiB | 0 (off) | RAM budget for parked conversations. |
 | `conversation-cache-slots` | engine | integer | 4 | Most parked conversations. |
 | `conversation-cache-min-free-mib` | engine | MiB | 2560 | Physical RAM kept free when parking. |
-| `no-ram-guard` | engine | switch | off | Serving never sheds, delays or stops a request for low RAM ([memory floors](../running.md#memory-floors)). For machines where the guard stops work that would fit; low RAM can then stop the engine or the machine. |
 | `conversation-cache-min-tokens` | engine | tokens | 0 | Park only conversations of at least this many tokens. |
 | `conversation-cache-disk-mib` | engine | MiB | 0 (off) | Disk budget for parked conversations. [running](../running.md#conversations-on-disk---conversation-cache-disk-mib) |
 | `conversation-cache-dir` | engine | directory | model cache folder | Another folder for the disk tier. |

@@ -2,26 +2,9 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
-namespace basalt::models::qwen4exp::serve {
+#include "basalt/core/host_plan.hpp"
 
-uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry& g) {
-    if (!o.serve) return 0;
-    uint64_t bytes = basalt::platform::kRequestHostBytes;
-    basalt::core::ConversationStateSizes z;
-    std::string error;
-    if (o.prompt_cache > 0 && basalt::core::conversation_state_sizes(g, z, error)) {
-        const uint64_t one = z.gdn + z.ple + (uint64_t) g.n_qsa_layers() * (z.tail + z.dead + z.block_pos);
-        bytes += (uint64_t) (o.prompt_cache + 1) * (uint64_t) std::max(o.batch, 1) * one;
-        bytes += (uint64_t) o.conversation_cache_mib << 20;
-    }
-    if (!o.vision_mmproj.empty()) {
-        // the canvas (8-bit RGB), its normalized planar floats and the patches
-        const basalt::vision::Geometry vg;
-        const uint64_t pixels = (uint64_t) vg.max_tokens * (uint64_t) (vg.patch * vg.merge) * (uint64_t) (vg.patch * vg.merge);
-        bytes += pixels * 3 * (1 + 2 * sizeof(float));
-    }
-    return bytes;
-}
+namespace basalt::models::qwen4exp::serve {
 
 // the prompt path's loan with `live` slots: its chunk as large as fits, and the first slot it covers
 int32_t QfnRuntime::loan_plan(int64_t live, int64_t& chunk) {
@@ -239,16 +222,16 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
 }
 
 int QfnRuntime::init_memory() {
-    // the load's own buffers are gone: RAM still free keeps the next-hottest experts the first sizing left out
+    // the load's own buffers and the RAM held for buffers nothing made are gone: RAM still free keeps the next-hottest
+    // experts the copy left out
+    if (const uint64_t held = basalt::core::host_plan_release(); held > 0)
+        basalt::log::info("basalt serve", "RAM: %.2f GiB held for host buffers not made, given back",
+                          (double) held / 1073741824.0);
     if (srcp == &src && src.complement_ready() && o.resident_budget == 0) {
         int64_t n_top = 0;
-        // what the engine still takes once serving (see serve_growth_bytes) and the file cache's floor while
-        // experts are read from the SSD (none when every expert has a tier)
-        const uint64_t later = serve_growth_bytes(o, g) +
-                               (ram_floor_bytes - std::min(ram_floor_bytes, basalt::platform::ram_margin()));
         const uint64_t add = src.top_up(stages.empty() ? profile : profile_all, [&](int32_t l, int32_t e) {
             return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
-        }, o.resident_pin, n_top, later);
+        }, o.resident_pin, n_top);
         if (add > 0) {
             basalt::platform::watch_resident_ram(true, src.resident_bytes() + add);
             basalt::log::info("basalt generate", "RAM top-up: +%.2f GiB, %lld experts (total %.2f GiB)",
@@ -260,14 +243,13 @@ int QfnRuntime::init_memory() {
     // from here the RAM guard watches: below its floor the engine sheds and new requests wait, and a running
     // request stops only once the RAM is critical.  The checkpoints stay through a shed: a live request's rewind and
     // the deferred copy in flight use them.
-    start_guard(tier_spill.bytes, prompt_file_bytes);
+    start_guard();
 
-    // a VRAM shrink's RAM homes leave the guard's floor above the margin and the top-up's own slack free
-    src.set_homes_reserve(guard_floor - std::min(guard_floor, basalt::platform::ram_margin()) + (256ull << 20));
+    // a VRAM shrink's RAM homes stop 256 MiB above the reserve
+    src.set_homes_reserve(256ull << 20);
     if (const uint64_t avail = basalt::platform::available_memory(); avail > 0)
-        basalt::log::info("basalt serve", "RAM %.2f GiB free, guard %.2f GiB, %.2f GiB kept for serving",
-                     (double) avail / 1073741824.0, (double) guard_floor / 1073741824.0,
-                     (double) serve_growth_bytes(o, g) / 1073741824.0);
+        basalt::log::info("basalt serve", "RAM %.2f GiB free, guard %.2f GiB", (double) avail / 1073741824.0,
+                          (double) guard_floor / 1073741824.0);
     return 0;
 }
 

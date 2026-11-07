@@ -16,6 +16,7 @@
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/platform/mapped_file.hpp"
+#include "models/deepseek41/prompt_host.hpp"
 #include "models/deepseek41/tier_policy.hpp"
 
 #include <cuda_runtime.h>
@@ -124,10 +125,10 @@ public:
     };
     Source locate(int layer, int e) const;
     core::PeerExperts* peer() const { return peer_.get(); }
+    /// The prompt path's and the images' host buffers, allocated before the RAM tier is sized.
+    PromptHost& host() { return host_; }
     kernels::cpu::ExpertPool* pool() const { return pool_.get(); }
     const kernels::cpu::NativeFmt& fmt(int layer) const { return fmt_[(size_t) layer]; }
-    /// The main card holds homes: they stay through a prompt, and a short prompt keeps the copies beside them.
-    bool has_homes() const { return homes_.main > 0; }
 
     /// The VRAM slots open now, every layer's.
     int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
@@ -171,7 +172,7 @@ private:
     bool load_ram(std::string& err);
     int ranked(int layer, int r) const;
     bool load_rank(std::string& err);
-    void seed_copies(int first_rank, int64_t n);
+    void seed_copies(int64_t n);
     void preread();
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
     const uint8_t* blob_of(int layer, int e) const;
@@ -241,6 +242,7 @@ private:
     uint64_t token_ = 0;
     int64_t swapped_ = 0;
     platform::MappedFile file_;             ///< the experts section
+    PromptHost host_;
     std::unique_ptr<core::PeerExperts> peer_;
     std::vector<kernels::cpu::NativeFmt> fmt_;   ///< [layer]
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;
