@@ -307,11 +307,13 @@ private:
         sl.d_type = el.d_type;
         sl.blob_bytes = el.blob_bytes;
         sl.stride = staged_stride(el);
+        sl.gu_stride = sl.stride;
         sl.down_off = L.down_off;
+        sl.d_stride = sl.stride;
         const int n_ff = g_.n_ff_exp;
         const float limit = g_.clamp_exp[(size_t) il];
-        sl.act = [n_ff, limit](const float* gu, float* h, int64_t rows, void* stream) {
-            swiglu_split_clamped(gu, h, rows, n_ff, limit, stream);
+        sl.act = [n_ff, limit](const float* gu, float* h, const prefill::PeerShare::Launch& l, void* stream) {
+            swiglu_split_clamped(gu, h, l.rows, n_ff, limit, stream);
         };
         return sl;
     }

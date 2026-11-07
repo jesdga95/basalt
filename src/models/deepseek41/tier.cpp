@@ -10,6 +10,7 @@
 #include "basalt/core/expert_source.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
 
@@ -223,7 +224,10 @@ bool ExpertTier::open_share(std::string& err) {
     prefill::PeerShare::Dims d;
     d.n_embd = g.n_embd;
     d.n_ff = g.n_ff_exp;
-    for (const ExpertLayer& el : m_.pack().experts) d.stride = std::max<size_t>(d.stride, staged_stride(el));
+    size_t stride = 0;
+    for (const ExpertLayer& el : m_.pack().experts) stride = std::max<size_t>(stride, staged_stride(el));
+    d.group_bytes = stride * (size_t) d.launch_experts;
+    d.act_bytes = prefill::mmq::q8_bytes(prefillp::kMaxChunk, g.n_embd);
     d.max_tokens = prefillp::kMaxChunk;
     d.max_rows = (int64_t) prefillp::kMaxChunk * g.n_used;
     d.n_expert = n_expert_;

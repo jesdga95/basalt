@@ -237,8 +237,10 @@ int main() {
             cudaMemcpy(dids, ids.data(), Rg * 4, cudaMemcpyHostToDevice);
             cudaMemset(a, 0, mmq::q8_bytes(Rg, N));
             cudaMemset(b, 0, mmq::q8_bytes(Rg, N));
-            int bad = 0;
-            for (ggml_type t : {kGu, kDown, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q8_0}) {
+            int bad = 0, nt = 0;
+            for (ggml_type t : {kGu, kDown, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4,
+                                GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+                ++nt;
                 mmq::quantize(dx, nullptr, all, t, N, N, T, nullptr);
                 mmq::gather_q8(all, T, dids, a, Rg, N, nullptr);
                 mmq::quantize(dx, dids, b, t, N, N, Rg, nullptr);
@@ -248,7 +250,7 @@ int main() {
                 cudaMemcpy(hb.data(), b, hb.size(), cudaMemcpyDeviceToHost);
                 bad += std::memcmp(ha.data(), hb.data(), ha.size()) != 0;
             }
-            std::printf("gather_q8 vs quantize with ids, 5 formats, %d rows of %d: %s\n", Rg, T, bad ? "DIFFER" : "bitwise identical");
+            std::printf("gather_q8 vs quantize with ids, %d formats, %d rows of %d: %s\n", nt, Rg, T, bad ? "DIFFER" : "bitwise identical");
             if (bad) {
                 std::printf("peer_share_parity: FAIL\n");
                 return 1;
@@ -295,8 +297,12 @@ int main() {
         L.d_type = kDown;
         L.blob_bytes = g.bytes;
         L.stride = g.stride;
+        L.gu_stride = g.stride;
         L.down_off = g.down_off;
-        L.act = swiglu;
+        L.d_stride = g.stride;
+        L.act = [](const float* gu, float* h, const basalt::prefill::PeerShare::Launch& l, void* stream) {
+            swiglu(gu, h, l.rows, stream);
+        };
 
         float* ddst = nullptr;
         ck(cudaMalloc(&ddst, (size_t) T * K * N * 4), "dst");
@@ -310,7 +316,8 @@ int main() {
             basalt::prefill::PeerShare::Dims d;
             d.n_embd = N;
             d.n_ff = FF;
-            d.stride = g.stride;
+            d.group_bytes = g.stride * (size_t) c.experts;
+            d.act_bytes = mmq::q8_bytes(T, N);
             d.max_tokens = T;
             d.max_rows = (int64_t) T * K;
             d.n_expert = E;
