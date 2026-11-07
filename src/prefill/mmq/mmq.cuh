@@ -835,6 +835,13 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config) {
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// Raises the tile's dynamic shared memory limit once per device (the launches and `mul_mat_q_load` share the flags).
+template <ggml_type type, int J, bool fallback>
+static void mul_mat_q_raise_smem(const int nbytes_shared) {
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
+}
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -848,8 +855,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
+    mul_mat_q_raise_smem<type, J, fallback>(nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
@@ -1009,26 +1015,53 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     }
 }
 
-// explicit instantiations live in instances/
-#define DECL_MMQ_CASE(type) \
-    template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream)
+// Readies every tile mul_mat_q_case may launch for weights of `nrows_x` rows on the current device: loads its kernels
+// and raises their shared memory limit. Done at a tile's first launch instead, either waits for the copies queued on
+// the card.
+template <ggml_type type, bool fallback, int J>
+static void mul_mat_q_load_J(const size_t smpbo) {
+    if constexpr (J <= 128) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback);
+        const int nbytes_shared = config.type != GGML_TYPE_COUNT ? (int) mmq_get_nbytes_shared(config) : 0;
+        if (nbytes_shared > 0 && (size_t) nbytes_shared <= smpbo) {
+            ggml_cuda_func_load((const void *) mul_mat_q<type, J, fallback>);
+            mul_mat_q_raise_smem<type, J, fallback>(nbytes_shared);
+            if (ggml_cuda_mmq_get_stream_k(type, J, fallback))
+                ggml_cuda_func_load((const void *) mul_mat_q_stream_k_fixup<type, J, fallback>);
+        }
+        mul_mat_q_load_J<type, fallback, J + 8>(smpbo);
+    }
+}
 
-extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
-extern DECL_MMQ_CASE(GGML_TYPE_Q8_0);
-extern DECL_MMQ_CASE(GGML_TYPE_Q5_0);
-extern DECL_MMQ_CASE(GGML_TYPE_Q5_1);
-extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);
-extern DECL_MMQ_CASE(GGML_TYPE_Q3_K);
-extern DECL_MMQ_CASE(GGML_TYPE_Q4_K);
-extern DECL_MMQ_CASE(GGML_TYPE_Q5_K);
-extern DECL_MMQ_CASE(GGML_TYPE_Q6_K);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ1_M);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XXS);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XS);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ2_S);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ3_XXS);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ3_S);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ4_NL);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
-extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+template <ggml_type type>
+void mul_mat_q_load(int64_t nrows_x) {
+    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    if (nrows_x % 128 == 0) mul_mat_q_load_J<type, false, 8>(smpbo);
+    else mul_mat_q_load_J<type, true, 8>(smpbo);
+}
+
+// explicit instantiations live in instances/
+#define MMQ_INSTANCES(prefix, type) \
+    prefix template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream); \
+    prefix template void mul_mat_q_load<type>(int64_t nrows_x)
+#define DECL_MMQ_CASE(type) MMQ_INSTANCES(, type)
+
+MMQ_INSTANCES(extern, GGML_TYPE_Q2_0);
+MMQ_INSTANCES(extern, GGML_TYPE_Q8_0);
+MMQ_INSTANCES(extern, GGML_TYPE_Q5_0);
+MMQ_INSTANCES(extern, GGML_TYPE_Q5_1);
+MMQ_INSTANCES(extern, GGML_TYPE_Q2_K);
+MMQ_INSTANCES(extern, GGML_TYPE_Q3_K);
+MMQ_INSTANCES(extern, GGML_TYPE_Q4_K);
+MMQ_INSTANCES(extern, GGML_TYPE_Q5_K);
+MMQ_INSTANCES(extern, GGML_TYPE_Q6_K);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ1_S);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ1_M);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ2_XXS);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ2_XS);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ2_S);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ3_XXS);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ3_S);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ4_NL);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ4_XS);
+MMQ_INSTANCES(extern, GGML_TYPE_NVFP4);

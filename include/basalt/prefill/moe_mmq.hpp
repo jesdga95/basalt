@@ -54,6 +54,11 @@ struct Product {
     int64_t opt_rows = 0;
 };
 
+/// Readies on the current device every tile `Context::run` may launch for weights of `ggml_type` with `w_rows` rows (its
+/// kernels loaded, their shared memory limit raised): done at a tile's first launch, that waits for the copies queued on
+/// the card.
+void load(int ggml_type, int64_t w_rows);
+
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
 class Context {
 public:

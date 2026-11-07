@@ -9,6 +9,7 @@
 #include "basalt/log.hpp"
 #include "models/deepseek41/prefill_ffn.hpp"
 
+#include "basalt/core/on_device.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -96,6 +97,28 @@ public:
         mmq::iota(ident_, (int64_t) E, nullptr);
         map_h_.resize(E);
         cudaDeviceSynchronize();
+        // every tile the products may pick, on each card that runs them: a tile's first launch in a long chunk would wait
+        // for the expert copies queued on the card
+        std::vector<std::pair<int, int64_t>> routed, all;
+        auto add = [](std::vector<std::pair<int, int64_t>>& v, int t, int64_t rows) {
+            if (std::find(v.begin(), v.end(), std::make_pair(t, rows)) == v.end()) v.emplace_back(t, rows);
+        };
+        for (const ExpertLayer& e : m_.pack().experts) {
+            add(routed, e.gu_type, 2 * (int64_t) g_.n_ff_exp);
+            add(routed, e.d_type, g_.n_embd);
+        }
+        all = routed;
+        const int64_t nf = (int64_t) g_.n_ff_exp * std::max(g_.n_shared, 1);
+        const std::pair<const char*, int64_t> shexp[] = {{"ffn_gate_shexp.weight", nf}, {"ffn_up_shexp.weight", nf},
+                                                         {"ffn_down_shexp.weight", g_.n_embd}};
+        for (int il = 0; il < g_.n_layers; ++il)
+            for (const auto& [name, rows] : shexp)
+                if (const DevTensor* t = m_.tensor(il, name); t && mmq::fits(t->type, rows)) add(all, t->type, rows);
+        for (const auto& [t, rows] : all) mmq::load(t, rows);
+        if (tier_->peer_share()) {
+            const core::OnDevice od(tier_->peer()->device());
+            for (const auto& [t, rows] : routed) mmq::load(t, rows);
+        }
         return true;
     }
 

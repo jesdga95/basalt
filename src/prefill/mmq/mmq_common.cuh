@@ -50,6 +50,8 @@
     } while (0)
 
 int ggml_cuda_get_device();
+// Loads kernel `symbol` into the current context now (the driver's cuFuncLoad).
+void ggml_cuda_func_load(const void * symbol);
 
 #define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
     do {                                                                                                   \
