@@ -4,6 +4,7 @@
 // is checked, and a file that does not match is refused with the reason.
 #pragma once
 
+#include "basalt/core/model_file.hpp"
 #include "basalt/platform/mapped_file.hpp"
 
 #include <cstdint>
@@ -36,12 +37,10 @@ public:
     Mmproj(const Mmproj&) = delete;
     Mmproj& operator=(const Mmproj&) = delete;
 
-    /// Reads `path` (mapped when the file system refuses unbuffered reads), parses the header and checks it is the `projector` type.  False with `err` otherwise.
-    bool open(const std::string& path, std::string& err, const char* projector = "qwen3vl_merger");
-
-    /// The same for the `bytes` bytes at `offset` of `path` (a projector stored as a section of a larger file).
-    bool open_range(const std::string& path, uint64_t offset, uint64_t bytes, std::string& err,
-                    const char* projector = "qwen3vl_merger");
+    /// Reads the projector GGUF at `range` in place (a whole file, or the `vision/mmproj` section of a .basalt; mapped
+    /// when the file system refuses unbuffered reads), parses the header and checks it is the `projector` type.  False
+    /// with `err` otherwise.
+    bool open(const core::FileRange& range, std::string& err, const char* projector = "qwen3vl_merger");
 
     /// Drops the file's bytes: tensor pointers are invalid afterwards, hp() stays.  For callers that copied the weights.
     void release();

@@ -1168,8 +1168,8 @@ class GpuChoice(unittest.TestCase):
         from serve.engine.vision import Vision
         for gpu, want in ((True, ["--gpu"]), (False, [])):
             with mock.patch.object(Vision, "_start"):
-                v = Vision({"vision_bin": "x", "mmproj": "m", "model": "t", "gpu": gpu})
-            self.assertEqual(v.spawn[0], ["x", "--mmproj", "m", "--model", "t"] + want)
+                v = Vision({"vision_bin": "x", "model": "t", "gpu": gpu})
+            self.assertEqual(v.spawn[0], ["x", "--model", "t"] + want)
             shutil.rmtree(v.dir, ignore_errors=True)
 
     def test_engine_vision_sends_one_enc_for_the_uncached_images(self):

@@ -313,7 +313,7 @@ void test_elementwise() {
 int run_encoder(const char* mmproj, const char* image) {
     std::string err;
     Mmproj mp;
-    if (!mp.open(mmproj, err)) { std::printf("%s\n", err.c_str()); return 2; }
+    if (!mp.open(basalt::core::FileRange(mmproj), err)) { std::printf("%s\n", err.c_str()); return 2; }
     std::ifstream f(image, std::ios::binary);
     const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     Image img;

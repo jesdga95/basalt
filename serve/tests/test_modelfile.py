@@ -137,15 +137,15 @@ class Peer(Tmp):
 
 
 class Vision(Tmp):
-    def test_sidecar_beside_the_engine_bin_and_sections_unpacked(self):
+    def test_sidecar_beside_the_engine_bin_opens_the_model_file(self):
         path = self.build(vision=True)
         side = self.engine_bin.parent / "basalt-vision"
         side.write_text("")
-        v = modelfile.model_config(modelfile.ModelSpec(path, vision=True), str(self.engine_bin))["vision"]
+        cfg = modelfile.model_config(modelfile.ModelSpec(path, vision=True), str(self.engine_bin))
+        v = cfg["vision"]
         self.assertEqual(v["vision_bin"], str(side.resolve()))
-        self.assertEqual(Path(v["mmproj"]).read_bytes(), b"MMPROJ" * 100)
-        self.assertEqual(Path(v["model"]).read_bytes(), b"VOCAB")
-        self.assertEqual([p.name for p in Path(v["mmproj"]).parent.iterdir() if ".gguf." in p.name], [])
+        self.assertEqual(v["model"], path)                  # the sidecar reads vision/mmproj in place
+        self.assertFalse((Path(cfg["log"]).parent / "vision").exists())
 
     def test_sidecar_takes_the_engine_bins_suffix(self):
         path = self.build(vision=True)
@@ -175,13 +175,11 @@ class Vision(Tmp):
         for mode, name in (("1", "1"), ("0", "0"), ("cpu", "cpu"), ("dynamic", "dynamic")):
             self.assertEqual(modelfile.model_config(modelfile.ModelSpec(path, vision=mode), str(self.engine_bin))["vision"]["mode"], name)
 
-    def test_dynamic_gives_the_engine_the_projector_and_needs_no_sidecar(self):
+    def test_dynamic_has_the_engine_open_the_projector_and_needs_no_sidecar(self):
         path = self.build(vision=True)                      # no basalt-vision next to the engine
         cfg = modelfile.model_config(modelfile.ModelSpec(path, vision="dynamic"), str(self.engine_bin))
-        at = cfg["args"].index("--vision-mmproj")
-        self.assertEqual(cfg["args"][at + 1], cfg["vision"]["mmproj"])
-        self.assertIn("--vision", cfg["args"])
-        self.assertNotIn("--vision-mmproj", modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))["args"])
+        self.assertEqual(cfg["args"], ["--model", path, "--vision-dynamic", "--vision"])
+        self.assertNotIn("--vision-dynamic", modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))["args"])
         with self.assertRaisesRegex(ValueError, "basalt-vision"):
             modelfile.model_config(modelfile.ModelSpec(path, vision="1"), str(self.engine_bin))
 

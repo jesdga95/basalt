@@ -41,7 +41,7 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
                   o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx, o.yarn_ext_factor, o.yarn_attn_factor,
                   o.yarn_beta_fast, o.yarn_beta_slow, o.cvec_first, o.cvec_last, o.cvec_mode, o.cvec_single);
     std::string text = std::string("basalt conversation state kv ") + o.kv + " rope " +
-                       o.rope_scaling + num + " mtp " + o.mtp + " mmproj " + o.vision_mmproj;
+                       o.rope_scaling + num + " mtp " + o.mtp + " vision_dynamic " + (o.vision_dynamic ? "1" : "0");
     for (const auto& [path, scale] : o.cvec_files) text += " cvec " + path + " " + std::to_string(scale);
     uint64_t h = conversation_store_hash(text.data(), text.size(), 1);
     const int64_t geo[] = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_v_heads, g.n_head_kv,

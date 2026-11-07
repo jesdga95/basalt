@@ -70,7 +70,7 @@ class Vision:
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
         """`start` false: down until the service restarts it, as an unloaded encoder is."""
-        args = [cfg["vision_bin"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
+        args = [cfg["vision_bin"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start again
         self.stopped = False

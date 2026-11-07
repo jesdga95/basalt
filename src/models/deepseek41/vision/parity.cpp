@@ -18,7 +18,7 @@ int main(int argc, char** argv) {
     }
     std::string err;
     basalt::vision::Mmproj mp;
-    if (!mp.open(argv[1], err, "deepseek41v")) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    if (!mp.open(basalt::core::FileRange(argv[1]), err, "deepseek41v")) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     std::ifstream f(argv[2], std::ios::binary);
     const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     basalt::vision::Image img;
