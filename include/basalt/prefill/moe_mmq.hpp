@@ -22,6 +22,8 @@ bool fits(int ggml_type, int64_t w_rows);
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
 size_t q8_bytes(int64_t rows, int64_t cols);
+/// The quantized blocks of one row of `cols` values; a buffer of R rows holds block k of row r at block k R + r.
+int64_t q8_blocks(int64_t cols);
 
 /// q8_1 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
 /// ids is null); `x` has `ld` floats per row.
