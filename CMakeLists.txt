@@ -1311,7 +1311,7 @@ target_link_libraries(mmq PUBLIC ggml_quants ${_gpu_runtime_target})
 add_library(peer_share STATIC src/prefill/peer_share.cpp)
 target_include_directories(peer_share PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
 target_link_libraries(peer_share PUBLIC mmq kernels ${_gpu_runtime_target})
-target_link_libraries(model_qwen4exp_prefill PUBLIC mmq)
+target_link_libraries(model_qwen4exp_prefill PUBLIC mmq peer_share)
 # the FP4 block-scaled tensor-core experts (need the a-variant of the architecture)
 # the fused prompt experts: on the MMQ device code, with its flags
 add_library(model_qwen4exp_moe_fused STATIC src/models/qwen4exp/prefill/moe_fused.cu src/models/qwen4exp/prefill/moe_fused_iq.cu)
