@@ -252,7 +252,11 @@ private:
         const int yl = skip_layer();
         const int cut = yl > 0 && cut_ > pos0 ? (int) std::min<int64_t>(cut_ - pos0, T) : 0;
         const int n_run = cut == T ? yl + 1 : g_.n_layers;
-        if (ffn_) ffn_->chunk_layers(cut == T ? yl : g_.n_layers);
+        if (ffn_) {
+            std::vector<int> layer_tokens((size_t) (cut == T ? yl : g_.n_layers));
+            for (size_t il = 0; il < layer_tokens.size(); ++il) layer_tokens[il] = T - (yl > 0 && (int) il >= yl ? cut : 0);
+            ffn_->chunk_layers(layer_tokens);
+        }
 
         const float* pre_prev = nullptr;
         int fi = 0;

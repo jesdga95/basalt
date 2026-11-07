@@ -19,15 +19,16 @@ constexpr int64_t kKeepPositions = 32768;          // a new sequence keeps the c
 constexpr uint64_t kTrimBytes = 256ull << 20;      // ... and gives back the rest only when it is at least this much
 constexpr int64_t kStageRows = 16384;              // (token, slot) rows one expert launch handles
 constexpr int kStageExperts = 32;                  // experts staged per launch, two launches in flight
-constexpr int kRing = 5;                           // layers of file and second-card experts read ahead
+constexpr int kRing = 5;                           // layers of file experts read ahead
 constexpr int kRingPieces = kRing * 48;            // most experts the pinned ring of those reads holds
 constexpr int kEmbedRows = 512;                    // token embeddings a chunk stages in host RAM at a time
 constexpr int kEngramRows = 2048;                  // tokens of Engram rows a chunk dequantizes in host RAM at a time
 constexpr int kAheadSlots = 6;                     // staged groups of experts in flight in a long chunk
-constexpr int kShareRows = 2048;                   // rows a layer of a short read may compute on the CPU and the second card
+constexpr int kShareRows = 2048;                   // rows a layer of a short read may compute on the CPU
 constexpr int kStepPrompt = 12;                    // a prompt this short reads one decode step at a time, faster than a chunk's bus copies
 constexpr int kShortPrompt = 2048;                 // a prompt this short takes no staged groups and reads beside a tier's copies
 constexpr int kShortChunk = 1024;                  // ... in chunks of this many tokens
+constexpr double kPreRouteCycles = 4.3e6;           // main card SM-cycles a token takes in a layer before its routing (measured)
 constexpr int64_t kAheadPairs = 50000;              // (token, slot) pairs from which a chunk stages its groups ahead: past a short chunk
 
 /// The first position that stops a read's rows short of the last layers. Each layer past `skip_layer` looks one window further
@@ -49,11 +50,12 @@ struct Dims {
     uint64_t expert_blob_bytes = 0;   // the largest expert
 };
 
-/// Device bytes that grow with the chunk: streams and scratch rows, router outputs, the expert inputs.
+/// Device bytes that grow with the chunk: streams and scratch rows, router outputs, the expert inputs, the experts' rows
+/// with their row map.
 inline uint64_t per_token_bytes(const Dims& d) {
     const uint64_t n = (uint64_t) d.n_embd;
     return 4 * (19 * n + (uint64_t) d.hc_coef * 3 + (uint64_t) d.n_expert + 16 + (uint64_t) d.engram_cols +
-                (uint64_t) d.n_used * n + (uint64_t) d.hc_splits * (uint64_t) (d.hc_coef + 1));
+                (uint64_t) d.n_used * (n + 2) + (uint64_t) d.hc_splits * (uint64_t) (d.hc_coef + 1));
 }
 
 /// (token, slot) rows one expert launch of a chunk handles.
@@ -66,8 +68,7 @@ inline int64_t stage_rows(int64_t n_used, int chunk) {
 inline uint64_t fixed_bytes(const Dims& d, int chunk) {
     const uint64_t R = (uint64_t) stage_rows(d.n_used, chunk);
     const uint64_t q8 = (uint64_t) d.n_embd * R * 36 / 32 + (uint64_t) d.n_ff_exp * R * 36 / 32;
-    return q8 + R * (uint64_t) d.n_ff_exp * 12 + R * 4 + 2 * (d.expert_blob_bytes * kStageExperts + R * 8) +
-           (uint64_t) kShareRows * ((uint64_t) d.n_embd * 4 + 4);
+    return q8 + R * (uint64_t) d.n_ff_exp * 12 + 2 * (d.expert_blob_bytes * kStageExperts + R * 4);
 }
 
 inline uint64_t workspace_bytes(const Dims& d, int chunk) { return fixed_bytes(d, chunk) + per_token_bytes(d) * (uint64_t) chunk; }
