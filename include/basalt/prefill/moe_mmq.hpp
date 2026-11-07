@@ -28,6 +28,10 @@ size_t q8_bytes(int64_t rows, int64_t cols);
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream);
 
+/// Rows ids[0..rows) of `xq` (`src_rows` rows quantized for MMQ, `cols` values each) into `dst` as `rows` rows: the same
+/// bytes `quantize` writes when given those ids.
+void gather_q8(const void* xq, int64_t src_rows, const int32_t* ids, void* dst, int64_t rows, int64_t cols, void* stream);
+
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
 /// dst rows of the same indices (`ld_dst` floats apart, via `ids`: dst row = ids[row], an identity table works).
