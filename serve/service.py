@@ -647,7 +647,9 @@ class Service:
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if busy else None}
         info = dict(getattr(self.engine, "info", {}) or {})
         spill = spill_of(info)
-        engine = {"model": self.model, "max_context": self.engine.max_context, **info, "spill": spill}
+        # a start under way reads 0; the last READY's context stands in until the new one arrives
+        engine = {"model": self.model, "max_context": self.engine.max_context or getattr(self.engine, "known_ctx", 0), **info,
+                  "spill": spill}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
         with self.status_lock:
