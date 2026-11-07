@@ -46,7 +46,7 @@ public:
         conversations.emplace((size_t) o.conversation_cache_mib << 20, (size_t) o.conversation_cache_slots);
         if (o.conversation_cache_disk_mib > 0) {
             const auto t0 = Clock::now();
-            const std::string text = "basalt conversation state " + model_.desc().arch + " mmproj " + o.vision_mmproj;
+            const std::string text = "basalt conversation state " + model_.desc().arch + " vision_dynamic " + (o.vision_dynamic ? "1" : "0");
             const uint64_t identity = basalt::core::conversation_store_hash_file(
                 o.model, basalt::core::conversation_store_hash(text.data(), text.size(), 1));
             std::string de;

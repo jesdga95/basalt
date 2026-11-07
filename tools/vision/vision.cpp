@@ -5,15 +5,15 @@
 // places the rows at the image's pad tokens and gives them their 2-D M-RoPE positions (see --serve GENI in
 // src/program/serve/commands.cpp).
 //
-//   basalt-vision --mmproj <mmproj.gguf> [--model <text vocab .gguf>] [--gpu] [--threads N] [--max-tokens N]
-//                 [--flash-attn on|off|auto]
+//   basalt-vision --model <model.basalt> [--gpu] [--threads N] [--max-tokens N]
+//
+// The projector is read in place from the model file's `vision/mmproj` section; nothing is copied out.
 //
 // Resident: prints "READY <n_embd>", then per stdin line
 //   ENC <image path> <output path>   ->  "OK <n_tokens> <nx> <ny> <ms>"  or  "ERR <message>"
 //   QUIT
 // The output file is  int32 {0x31455653 'SVE1', n_tokens, nx, ny, n_embd}  then float32 [n_tokens][n_embd],
-// row i at grid position (x = i % nx, y = i / nx).  --model and --flash-attn are accepted for the callers that
-// pass them and have no effect.
+// row i at grid position (x = i % nx, y = i / nx).
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -29,6 +29,7 @@
 #ifdef BASALT_VISION_CUDA
 #include "basalt/vision/encoder_cuda.hpp"
 #endif
+#include "basalt/core/model_file.hpp"
 #include "basalt/vision/encoder_cpu.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "basalt/vision/preprocess.hpp"
@@ -50,15 +51,15 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 }
 
 const char* const kUsage =
-    "usage: basalt-vision --mmproj <mmproj.gguf> [--model <model.gguf>] [--gpu] [--threads N] [--max-tokens N] "
-    "[--flash-attn on|off|auto]\n"
+    "usage: basalt-vision --model <model.basalt> [--gpu] [--threads N] [--max-tokens N]\n"
+    "  reads the projector in place from the model file's vision/mmproj section;\n"
     "  reads \"ENC <image> <output>\" lines on stdin and writes each image's embeddings to <output>;\n"
     "  --gpu runs the encoder on the GPU, else on the CPU\n";
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string mmproj;
+    std::string model;
     bool gpu = false;
     int threads = 0, max_tokens = 0;
     for (int i = 1; i < argc; ++i) {
@@ -71,14 +72,13 @@ int main(int argc, char** argv) {
             std::printf("%s", kUsage);
             return 0;
         }
-        if (a == "--mmproj") mmproj = next();
-        else if (a == "--model" || a == "--flash-attn") next();
+        if (a == "--model") model = next();
         else if (a == "--gpu") gpu = true;
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--max-tokens") max_tokens = std::atoi(next().c_str());
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
-    if (mmproj.empty()) {
+    if (model.empty()) {
         std::fprintf(stderr, "%s", kUsage);
         return 2;
     }
@@ -95,7 +95,14 @@ int main(int argc, char** argv) {
     const auto load_t0 = std::chrono::steady_clock::now();
     std::string err;
     Mmproj mp;
-    if (!mp.open(mmproj, err)) { std::printf("ERR cannot load the vision encoder %s: %s\n", mmproj.c_str(), err.c_str()); std::fflush(stdout); return 1; }
+    basalt::core::ModelFile file;
+    if (!file.open(model, err) || file.range("vision/mmproj").empty()) {
+        if (err.empty()) err = model + " has no vision/mmproj section";
+        std::printf("ERR cannot load the vision encoder: %s\n", err.c_str());
+        std::fflush(stdout);
+        return 1;
+    }
+    if (!mp.open(file.range("vision/mmproj"), err)) { std::printf("ERR cannot load the vision encoder %s: %s\n", model.c_str(), err.c_str()); std::fflush(stdout); return 1; }
     Geometry geo;
     if (max_tokens > 0) geo.max_tokens = std::max(max_tokens, geo.min_tokens);
     if (threads <= 0) threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);

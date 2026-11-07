@@ -199,7 +199,7 @@ bool DsModel::open_mmproj(vision::Mmproj& mp, std::string& err) const {
         err = "this pack carries no vision projector (convert with --mmproj)";
         return false;
     }
-    return mp.open_range(pack_.vision.path, pack_.vision.offset, pack_.vision.bytes, err, "deepseek41v");
+    return mp.open(pack_.vision, err, "deepseek41v");
 }
 
 model::Result DsModel::make_session(std::unique_ptr<model::ModelSession>& out) {

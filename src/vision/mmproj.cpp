@@ -93,14 +93,9 @@ void Mmproj::release() {
 
 Mmproj::~Mmproj() { release(); }
 
-bool Mmproj::open(const std::string& path, std::string& err, const char* projector) {
-    uint64_t file_bytes = 0;
-    if (!platform::file_size(path, file_bytes)) { err = "cannot open " + path; return false; }
-    return open_range(path, 0, file_bytes, err, projector);
-}
-
-bool Mmproj::open_range(const std::string& path, uint64_t offset, uint64_t file_bytes, std::string& err,
-                        const char* projector) {
+bool Mmproj::open(const core::FileRange& range, std::string& err, const char* projector) {
+    const std::string& path = range.path;
+    const uint64_t offset = range.offset, file_bytes = range.size();
     uint64_t whole = 0;
     if (!platform::file_size(path, whole)) { err = "cannot open " + path; return false; }
     if (file_bytes < 32 || offset + file_bytes > whole) { err = "cannot read " + path; return false; }

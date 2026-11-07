@@ -28,7 +28,7 @@ from serve.config import (build_parser, check_engine_flags,  # noqa: E402
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.image_source import image_sources_of  # noqa: E402
-from serve.engine.flags import flag_index, flag_value  # noqa: E402
+from serve.engine.flags import flag_value  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
 from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, flag_refused, gpu_card_name,  # noqa: E402
@@ -168,8 +168,6 @@ def drop_sidecar_vision(cfg: dict) -> None:
     if not cfg.get("vision") or cfg["vision"].get("mode") == "dynamic":
         return
     print(tagged("warning", "lazy loading drops a sidecar image encoder, vision off; --vision dynamic stays on"), flush=True)
-    while (at := flag_index(cfg["args"], "--vision-mmproj")) is not None:
-        del cfg["args"][at:at + 2]
     del cfg["vision"]
 
 

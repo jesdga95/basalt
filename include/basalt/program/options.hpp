@@ -101,9 +101,10 @@ struct CommonOptions {
     bool generates = true;             ///< false: this run produces no tokens (a model flag says so)
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
-    /// --vision-mmproj PATH: the image encoder runs in this process on the model's GPU (implies --vision).  Its weights
-    /// stay in pinned host memory; each ENC command borrows expert-cache slots, encodes in them and refills them.
-    std::string vision_mmproj;
+    /// --vision-dynamic: the image encoder runs in this process on the model's GPU (implies --vision).  It reads the
+    /// model file's `vision/mmproj` section in place; its weights stay in pinned host memory; each ENC command borrows
+    /// expert-cache slots, encodes in them and refills them.
+    bool vision_dynamic = false;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole prompt
     /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history (~118 MB of host
     /// RAM); the KV cache itself is positional and stays where it is.
