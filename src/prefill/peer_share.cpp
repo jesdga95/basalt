@@ -1,0 +1,468 @@
+// src/prefill/peer_share.cpp - multi-GPU: a second card's share of a prompt chunk's routed experts.
+//
+// Per layer the main card quantizes the activations into mapped host memory. A layer's experts are staged in groups of
+// launch_experts (group i in staging buffer i % kBufs), each group's rows run in launches of at most launch_rows rows
+// (launch j in buffer set j % kBufs), and four streams carry them:
+//   stage    (second card): copy a group's blobs into its staging buffer (device-to-device or over its own link); the
+//                           first groups of a layer whose experts are known early start before its routing (`prepare`);
+//   products (second card): gather the launch's rows out of mapped host memory, gate/up, the caller's step, down;
+//   out      (second card): copy the result rows into mapped host memory;
+//   rows     (main card):   a kernel on a high-priority stream reads them into the caller's block. Neither the activations
+//                           nor the rows queue behind the expert copies on a copy engine.
+// Events order the reuse of each buffer, so no host thread waits; the host's per-layer tables alternate between two sets,
+// which the caller's next-but-one layer may rewrite only after `join` (each layer starts after the main card's stream
+// reached it).
+#include "basalt/prefill/peer_share.hpp"
+
+#include "basalt/core/on_device.hpp"
+#include "basalt/kernels/elementwise.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
+
+namespace basalt::prefill {
+namespace {
+
+int64_t max_launches(const PeerShare::Dims& d) {
+    // a launch closes at its rows, at its experts, or splits an expert: at most one launch more per expert
+    return (d.max_rows + d.launch_rows - 1) / d.launch_rows + d.n_expert + 1;
+}
+
+}  // namespace
+
+struct PeerShare::Impl {
+    int main = -1, peer = -1;
+    Dims d;
+    std::vector<void*> dev_peer, host;
+    // main card
+    cudaStream_t s_main = nullptr, s_rows = nullptr;
+    cudaEvent_t ev_x = nullptr, ev_xq = nullptr, ev_end = nullptr, ev_rows[kBufs] = {};
+    // second card
+    cudaStream_t s_stage = nullptr, s_prod = nullptr, s_out = nullptr;
+    cudaEvent_t ev_xin = nullptr, ev_staged[kBufs] = {}, ev_free[kBufs] = {}, ev_done[kBufs] = {}, ev_out[kBufs] = {};
+    uint8_t* stage[kBufs] = {};
+    void* xq[kBufs] = {};
+    void* hq = nullptr;
+    float *gu = nullptr, *h = nullptr, *out[kBufs] = {};
+    int32_t *ident = nullptr, *tok_dev = nullptr, *bounds_dev = nullptr;
+    std::unique_ptr<mmq::Context> ctx;
+    // pinned, portable; the activations mapped too
+    void* hxq = nullptr;
+    float* hrows[kBufs] = {};
+    int32_t *tok_h[2] = {}, *bounds_h[2] = {};
+    int set = 0;
+    uint64_t launch = 0, group = 0;
+    cudaError_t err = cudaSuccess;          // the worker's last error, read after `drain`
+    // groups of the next run staged by `prepare`: how many, the first one's number, its blobs
+    int prepared = 0;
+    uint64_t prepared_at = 0;
+    std::vector<const uint8_t*> prepared_blobs;
+
+    // The second card's calls are issued by a thread of its own: when its queues are full a call waits, and the main card's
+    // thread must not.
+    std::thread worker;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> jobs;
+    bool busy = false, quit = false;
+
+    void post(std::function<void()> f) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            jobs.push_back(std::move(f));
+        }
+        cv.notify_all();
+    }
+    void drain() {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return jobs.empty() && !busy; });
+    }
+    void work() {
+        cudaSetDevice(peer);
+        for (;;) {
+            std::function<void()> f;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return quit || !jobs.empty(); });
+                if (jobs.empty()) return;
+                f = std::move(jobs.front());
+                jobs.pop_front();
+                busy = true;
+            }
+            f();
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                busy = false;
+            }
+            cv.notify_all();
+        }
+    }
+
+    // Queues the copies of `blobs` into the staging buffer of group number `gi`, once the last group there is done.
+    void stage_group(const Layer& L, const std::vector<std::pair<const uint8_t*, bool>>& blobs, uint64_t gi) {
+        const int b = (int) (gi % kBufs);
+        const core::OnDevice od(peer);
+        cudaStreamWaitEvent(s_stage, ev_free[b], 0);
+        for (size_t i = 0; i < blobs.size(); ++i)
+            cudaMemcpyAsync(stage[b] + L.stride * i, blobs[i].first, L.blob_bytes,
+                            blobs[i].second ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, s_stage);
+        cudaEventRecord(ev_staged[b], s_stage);
+    }
+
+    ~Impl() {
+        if (worker.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                quit = true;
+            }
+            cv.notify_all();
+            worker.join();
+        }
+        if (peer >= 0) {
+            const core::OnDevice od(peer);
+            for (cudaStream_t s : {s_stage, s_prod, s_out})
+                if (s) {
+                    cudaStreamSynchronize(s);
+                    cudaStreamDestroy(s);
+                }
+            if (ev_xin) cudaEventDestroy(ev_xin);
+            for (int b = 0; b < kBufs; ++b)
+                for (cudaEvent_t e : {ev_staged[b], ev_free[b], ev_done[b], ev_out[b]})
+                    if (e) cudaEventDestroy(e);
+            ctx.reset();
+            for (void* p : dev_peer) cudaFree(p);
+        }
+        if (main >= 0) {
+            const core::OnDevice od(main);
+            for (cudaStream_t s : {s_main, s_rows})
+                if (s) {
+                    cudaStreamSynchronize(s);
+                    cudaStreamDestroy(s);
+                }
+            for (cudaEvent_t e : {ev_x, ev_xq, ev_end})
+                if (e) cudaEventDestroy(e);
+            for (cudaEvent_t e : ev_rows)
+                if (e) cudaEventDestroy(e);
+        }
+        for (void* p : host) cudaFreeHost(p);
+    }
+};
+
+PeerShare::PeerShare() = default;
+PeerShare::~PeerShare() = default;
+
+// The buffers in one place, so that the sizes `open` takes and the ones the plans count are the same.
+template <class Peer, class Host>
+static void layout(const PeerShare::Dims& d, Peer&& peer, Host&& host) {
+    const int64_t R = d.launch_rows, G = max_launches(d);
+    host(mmq::q8_bytes(d.max_tokens, d.n_embd));                     // hxq
+    for (int b = 0; b < PeerShare::kBufs; ++b) {
+        peer(d.stride * (size_t) d.launch_experts);                  // stage
+        peer(mmq::q8_bytes(R, d.n_embd));                            // xq
+        peer((size_t) R * (size_t) d.n_embd * 4);                    // out
+        host((size_t) R * (size_t) d.n_embd * 4);                    // hrows
+    }
+    peer((size_t) R * (size_t) d.n_ff * 2 * 4);                      // gu
+    peer((size_t) R * (size_t) d.n_ff * 4);                          // h
+    peer(mmq::q8_bytes(R, d.n_ff));                                  // hq
+    peer((size_t) R * 4);                                            // ident
+    peer((size_t) d.max_rows * 4);                                   // tok
+    peer((size_t) G * (size_t) (d.launch_experts + 1) * 4);          // bounds
+    for (int s = 0; s < 2; ++s) {
+        host((size_t) d.max_rows * 4);                               // tok
+        host((size_t) G * (size_t) (d.launch_experts + 1) * 4);      // bounds
+    }
+}
+
+uint64_t PeerShare::peer_bytes(const Dims& d) {
+    uint64_t sum = 0;
+    layout(d, [&](size_t b) { sum += (b + 255) / 256 * 256; }, [](size_t) {});
+    return sum;
+}
+
+uint64_t PeerShare::host_bytes(const Dims& d) {
+    uint64_t sum = 0;
+    layout(d, [](size_t) {}, [&](size_t b) { sum += b; });
+    return sum;
+}
+
+bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::string& err) {
+    auto m = std::make_unique<Impl>();
+    m->d = d;
+    bool ok = true;
+    std::vector<void*> pv, hv;
+    {
+        m->peer = peer_device;
+        const core::OnDevice od(peer_device);
+        layout(d, [&](size_t b) {
+            void* p = nullptr;
+            if (ok && cudaMalloc(&p, b) == cudaSuccess) pv.push_back(p), m->dev_peer.push_back(p);
+            else ok = false;
+        }, [](size_t) {});
+        ok = ok && cudaStreamCreateWithFlags(&m->s_stage, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaStreamCreateWithFlags(&m->s_prod, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaStreamCreateWithFlags(&m->s_out, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaEventCreateWithFlags(&m->ev_xin, cudaEventDisableTiming) == cudaSuccess;
+        for (int b = 0; ok && b < kBufs; ++b)
+            for (cudaEvent_t* e : {&m->ev_staged[b], &m->ev_free[b], &m->ev_done[b], &m->ev_out[b]})
+                ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
+        if (ok) {
+            size_t i = 0;
+            for (int b = 0; b < kBufs; ++b) {
+                m->stage[b] = (uint8_t*) pv[i++];
+                m->xq[b] = pv[i++];
+                m->out[b] = (float*) pv[i++];
+            }
+            m->gu = (float*) pv[i++];
+            m->h = (float*) pv[i++];
+            m->hq = pv[i++];
+            m->ident = (int32_t*) pv[i++];
+            m->tok_dev = (int32_t*) pv[i++];
+            m->bounds_dev = (int32_t*) pv[i++];
+            m->ctx = std::make_unique<mmq::Context>();
+            mmq::iota(m->ident, d.launch_rows, m->s_prod);
+            ok = cudaStreamSynchronize(m->s_prod) == cudaSuccess;
+        }
+    }
+    {
+        m->main = main_device;
+        const core::OnDevice od(main_device);
+        int lo = 0, hi = 0;
+        cudaDeviceGetStreamPriorityRange(&lo, &hi);
+        ok = ok && cudaStreamCreateWithFlags(&m->s_main, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaStreamCreateWithPriority(&m->s_rows, cudaStreamNonBlocking, hi) == cudaSuccess &&
+             cudaEventCreateWithFlags(&m->ev_x, cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&m->ev_xq, cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&m->ev_end, cudaEventDisableTiming) == cudaSuccess;
+        for (int b = 0; ok && b < kBufs; ++b) ok = cudaEventCreateWithFlags(&m->ev_rows[b], cudaEventDisableTiming) == cudaSuccess;
+        layout(d, [](size_t) {}, [&](size_t b) {
+            void* p = nullptr;
+            if (ok && cudaHostAlloc(&p, b, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess)
+                hv.push_back(p), m->host.push_back(p);
+            else ok = false;
+        });
+        if (ok) {
+            size_t i = 0;
+            m->hxq = hv[i++];
+            for (int b = 0; b < kBufs; ++b) m->hrows[b] = (float*) hv[i++];
+            for (int s = 0; s < 2; ++s) {
+                m->tok_h[s] = (int32_t*) hv[i++];
+                m->bounds_h[s] = (int32_t*) hv[i++];
+            }
+        }
+    }
+    if (!ok) {
+        (void) cudaGetLastError();
+        err = "out of memory for the second card's prompt share";
+        return false;
+    }
+    Impl* w = m.get();
+    m->worker = std::thread([w] { w->work(); });
+    m_ = std::move(m);
+    return true;
+}
+
+void PeerShare::prepare(const Layer& L, const std::vector<Expert>& experts) {
+    Impl& m = *m_;
+    const size_t E = (size_t) m.d.launch_experts;
+    m.prepared = 0;
+    m.prepared_at = m.group;
+    m.prepared_blobs.clear();
+    for (size_t i0 = 0; i0 < experts.size() && m.prepared < kBufs; i0 += E, ++m.prepared) {
+        const size_t i1 = std::min(experts.size(), i0 + E);
+        std::vector<std::pair<const uint8_t*, bool>> blobs;
+        for (size_t i = i0; i < i1; ++i) {
+            blobs.emplace_back(experts[i].blob, experts[i].on_peer);
+            m.prepared_blobs.push_back(experts[i].blob);
+        }
+        const uint64_t gi = m.group++;
+        Impl* w = &m;
+        m.post([w, L, blobs = std::move(blobs), gi] { w->stage_group(L, blobs, gi); });
+    }
+}
+
+bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vector<Expert>& experts, float* dst,
+                    void* main_stream, std::string& err) {
+    Impl& m = *m_;
+    const Dims& d = m.d;
+    const int prepared = m.prepared;
+    m.prepared = 0;
+    if (L.stride > d.stride || L.blob_bytes > L.stride || n_tokens > d.max_tokens) {
+        err = "peer share: a layer does not fit the share's buffers";
+        return false;
+    }
+    for (size_t i = 0; i < m.prepared_blobs.size() && prepared > 0; ++i)
+        if (i >= experts.size() || experts[i].blob != m.prepared_blobs[i]) {
+            err = "peer share: the experts differ from the prepared ones";
+            return false;
+        }
+    // the groups and their launches: this layer's table set, rows launch by launch in expert order
+    const int s = m.set;
+    m.set ^= 1;
+    int32_t* tok = m.tok_h[s];
+    int32_t* bounds = m.bounds_h[s];
+    struct Launch {
+        int64_t r0 = 0, rows = 0, max_rows = 0;
+        int b0 = 0, q0 = 0, n = 0;                    // its bounds in the table; its first expert in the group and how many
+    };
+    struct Group {
+        size_t i0 = 0, i1 = 0;
+        std::vector<Launch> launches;
+    };
+    std::vector<Group> groups;
+    int64_t r = 0, nb = 0;
+    const int64_t max_b = max_launches(d) * (d.launch_experts + 1);
+    for (size_t i0 = 0; i0 < experts.size(); i0 += (size_t) d.launch_experts) {
+        Group g;
+        g.i0 = i0;
+        g.i1 = std::min(experts.size(), i0 + (size_t) d.launch_experts);
+        // the group's rows, cut into launches of at most launch_rows rows
+        Launch l;
+        int k0 = 0;
+        for (size_t i = g.i0; i < g.i1;) {
+            const Expert& e = experts[i];
+            if (l.n == 0) {
+                if (nb + d.launch_experts + 1 > max_b) {
+                    err = "peer share: too many launches";
+                    return false;
+                }
+                l.r0 = r;
+                l.b0 = (int) nb;
+                l.q0 = (int) (i - g.i0);
+                bounds[nb++] = 0;
+            }
+            const int take = (int) std::min<int64_t>(e.n - k0, d.launch_rows - l.rows);
+            if (r + take > d.max_rows) {
+                err = "peer share: more rows than the chunk has";
+                return false;
+            }
+            std::copy_n(e.tok + k0, take, tok + r);
+            r += take;
+            l.rows += take;
+            l.max_rows = std::max<int64_t>(l.max_rows, take);
+            ++l.n;
+            bounds[nb++] = (int32_t) l.rows;
+            k0 += take;
+            if (k0 == e.n) {
+                ++i;
+                k0 = 0;
+            }
+            if (l.rows == d.launch_rows || i == g.i1) {   // the launch is full, or the group ends
+                if (l.rows > 0) g.launches.push_back(l);
+                else nb = l.b0;
+                l = Launch{};
+            }
+        }
+        groups.push_back(std::move(g));
+    }
+    if (r > 0) {   // the layer's activations into mapped host memory, once the second card has read the last layer's
+        const core::OnDevice od(m.main);
+        cudaEventRecord(m.ev_x, (cudaStream_t) main_stream);
+        cudaStreamWaitEvent(m.s_main, m.ev_x, 0);
+        cudaStreamWaitEvent(m.s_rows, m.ev_x, 0);
+        cudaStreamWaitEvent(m.s_main, m.ev_xin, 0);
+        mmq::quantize(x, nullptr, m.hxq, L.gu_type, d.n_embd, d.n_embd, n_tokens, m.s_main);
+        cudaEventRecord(m.ev_xq, m.s_main);
+    }
+    // the group numbers: the prepared ones, then new ones
+    std::vector<uint64_t> nums;
+    std::vector<std::vector<std::pair<const uint8_t*, bool>>> blobs(groups.size());
+    for (size_t gi = 0; gi < groups.size(); ++gi) {
+        nums.push_back((int) gi < prepared ? m.prepared_at + gi : m.group++);
+        if ((int) gi >= prepared)
+            for (size_t i = groups[gi].i0; i < groups[gi].i1; ++i) blobs[gi].emplace_back(experts[i].blob, experts[i].on_peer);
+    }
+    Impl* w = &m;
+    m.post([w, L, n_tokens, dst, r, nb, tok, bounds, prepared, groups = std::move(groups), nums = std::move(nums),
+            blobs = std::move(blobs)] {
+        Impl& m = *w;
+        const Dims& d = m.d;
+        const cudaStream_t mr = m.s_rows, ps = m.s_prod, so = m.s_out;
+        if (r > 0) {
+            const core::OnDevice od(m.peer);
+            cudaMemcpyAsync(m.tok_dev, tok, (size_t) r * 4, cudaMemcpyHostToDevice, ps);
+            cudaMemcpyAsync(m.bounds_dev, bounds, (size_t) nb * 4, cudaMemcpyHostToDevice, ps);
+            cudaStreamWaitEvent(ps, m.ev_xq, 0);
+        }
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            const Group& g = groups[gi];
+            if ((int) gi >= prepared) m.stage_group(L, blobs[gi], nums[gi]);
+            const int sb = (int) (nums[gi] % kBufs);
+            const core::OnDevice od(m.peer);
+            if (!g.launches.empty()) cudaStreamWaitEvent(ps, m.ev_staged[sb], 0);
+            for (const Launch& l : g.launches) {
+                const int b = (int) (m.launch++ % kBufs);
+                mmq::gather_q8(m.hxq, n_tokens, m.tok_dev + l.r0, m.xq[b], l.rows, d.n_embd, ps);
+                mmq::Product p;
+                p.w = m.stage[sb] + L.stride * (size_t) l.q0;
+                p.type = L.gu_type;
+                p.w_rows = 2 * d.n_ff;
+                p.w_cols = d.n_embd;
+                p.expert_bytes = L.stride;
+                p.n = l.n;
+                p.xq = m.xq[b];
+                p.bounds = m.bounds_dev + l.b0;
+                p.ids = m.ident;
+                p.total_rows = l.rows;
+                p.max_rows = l.max_rows;
+                p.dst = m.gu;
+                p.ld_dst = p.w_rows;
+                m.ctx->run(p, ps);
+                L.act(m.gu, m.h, l.rows, ps);
+                mmq::quantize(m.h, nullptr, m.hq, L.d_type, d.n_ff, d.n_ff, l.rows, ps);
+                mmq::Product q = p;
+                q.w = m.stage[sb] + L.stride * (size_t) l.q0 + L.down_off;
+                q.type = L.d_type;
+                q.w_rows = d.n_embd;
+                q.w_cols = d.n_ff;
+                q.xq = m.hq;
+                q.dst = m.out[b];
+                q.ld_dst = d.n_embd;
+                cudaStreamWaitEvent(ps, m.ev_out[b], 0);   // the last rows out of this buffer have left
+                m.ctx->run(q, ps);
+                cudaEventRecord(m.ev_done[b], ps);
+                // the rows out, once the main card has copied the last ones from there
+                const size_t bytes = (size_t) l.rows * (size_t) d.n_embd * 4;
+                cudaStreamWaitEvent(so, m.ev_done[b], 0);
+                cudaStreamWaitEvent(so, m.ev_rows[b], 0);
+                cudaMemcpyAsync(m.hrows[b], m.out[b], bytes, cudaMemcpyDeviceToHost, so);
+                cudaEventRecord(m.ev_out[b], so);
+                const core::OnDevice om(m.main);
+                cudaStreamWaitEvent(mr, m.ev_out[b], 0);
+                kernels::copy_from_mapped(dst + (size_t) l.r0 * (size_t) d.n_embd, m.hrows[b], (int64_t) (bytes / 4), mr);
+                cudaEventRecord(m.ev_rows[b], mr);
+            }
+            // the staging buffer is free once the group's products are done (or at once, without rows)
+            if (g.launches.empty()) cudaEventRecord(m.ev_free[sb], m.s_stage);
+            else cudaEventRecord(m.ev_free[sb], ps);
+        }
+        {   // the activations' host buffer is free once the layer's gathers are done
+            const core::OnDevice op(m.peer);
+            cudaEventRecord(m.ev_xin, ps);
+        }
+        const core::OnDevice od(m.main);
+        cudaEventRecord(m.ev_end, mr);
+        m.err = cudaGetLastError();
+    });
+    return true;
+}
+
+bool PeerShare::join(void* stream, std::string& err) {
+    m_->drain();
+    if (m_->err != cudaSuccess) {
+        err = std::string("peer share: ") + cudaGetErrorString(m_->err);
+        return false;
+    }
+    const core::OnDevice od(m_->main);
+    cudaStreamWaitEvent((cudaStream_t) stream, m_->ev_end, 0);
+    return true;
+}
+
+}  // namespace basalt::prefill
