@@ -10,6 +10,7 @@
 #include "basalt/program/probe_rates.hpp"
 #include "basalt/protocol.hpp"
 
+#include <iterator>
 #include <sstream>
 
 namespace basalt::program::serve {
@@ -19,6 +20,19 @@ namespace {
 constexpr int32_t kEmbeddingsMagic = 0x31455653;
 
 class SessionRuntime;
+
+/// The rows of a window after the token it feeds: the drafts stay while the drafter's chance that all of them so far
+/// are accepted holds `th`, at most `most` rows in all.
+int chance_window(const float* conf, int n_draft, float th, int most) {
+    int T = 1;
+    float all = 1.0f;
+    while (T < most && T - 1 < n_draft) {
+        all *= conf[T - 1];
+        if (all < th) break;
+        ++T;
+    }
+    return T;
+}
 
 /// A picture's embedding rows, placed at prompt position `at`.
 struct Block {
@@ -115,7 +129,7 @@ public:
     bool next_batch_window() override;
     bool drain_windows() override { return true; }
     void script_command(const std::string&) override {
-        std::printf("ERR BSCRIPT: this model's slots draft nothing\n");
+        std::printf("ERR BSCRIPT: this model's slots take no scripts\n");
         std::fflush(stdout);
     }
     void probe_command(const std::string& line, std::string& e) override {
@@ -314,6 +328,7 @@ private:
     basalt::model::LoadedModel& model_;
     std::vector<std::unique_ptr<basalt::model::ModelSession>> sessions_;
     std::vector<basalt::kernels::SamplerParams> slot_sampling_;
+    std::vector<int32_t> win_, out_;   // a batch window's fed tokens and picks
     int active_ = 0;
 };
 
@@ -348,17 +363,8 @@ public:
         }
     }
     int max_window() const { return rt_.session().max_window(); }
-    // The drafts stay while the drafter's chance that all of them so far are accepted holds.
     int draft_window() {
-        int T = 1;
-        float all = 1.0f;
-        const int most = (int) std::min<int64_t>(max_window(), runtime_.o.max_context - p);
-        while (T < most && T - 1 < n_draft_) {
-            all *= conf_[(size_t) T - 1];
-            if (all < cum_.th()) break;
-            ++T;
-        }
-        return T;
+        return chance_window(conf_.data(), n_draft_, cum_.th(), (int) std::min<int64_t>(max_window(), runtime_.o.max_context - p));
     }
     void lookup_window(int&, bool&, int&) {}
     void fill_drafts(int T, bool) {
@@ -524,55 +530,87 @@ private:
     double live_ms_ = -1e9;
 };
 
-// One token of every active slot, one session at a time.
+// One window of every active slot, one session at a time: the slot's drafts as a solo window takes them, then the
+// drafts of its next window, which run while its tokens go out.
 bool SessionRuntime::next_batch_window() {
     std::vector<int32_t> history;
     std::vector<float> grammar_bias;
+    const auto failed = [&](const std::string& m) {
+        std::printf("ERR %s\n", m.c_str());
+        set_active(0);
+        return false;
+    };
     for (int b = 0; b < (int) bs.size(); ++b) {
         BSlot& sl = bs[(size_t) b];
         if (!sl.active) continue;
         set_active(b);
-        const int32_t fed = sl.x;
-        int32_t y = -1;
+        const int most = (int) std::min<int64_t>({(int64_t) session().max_window(), o.max_context - sl.p, (int64_t) std::size(sl.dr) + 1});
+        const int T = std::max(1, chance_window(sl.dprob, sl.n_dr, sl.cum.th(), most));
+        win_.assign((size_t) T, 0);
+        out_.assign((size_t) T, -1);
+        win_[0] = sl.x;
+        std::copy(sl.dr, sl.dr + (T - 1), win_.begin() + 1);
         basalt::kernels::SamplerParams& sp = slot_sampling_[(size_t) b];
         basalt::model::DecodeRequest d;
-        d.tokens = &fed;
-        d.n_tokens = 1;
+        d.tokens = win_.data();
+        d.n_tokens = T;
         d.pos = sl.p;
-        d.next_token = &y;
+        (T > 1 ? d.row_tokens : d.next_token) = out_.data();
         d.sampling = &sp;
         if (sl.pen_n > 0) {
-            history.resize((size_t) sl.pen_n);
-            basalt::kernels::penalty_rows(sl.ids.data(), (int64_t) sl.ids.size(), &fed, 1, sl.pen_n, history.data());
+            history.resize((size_t) T * sl.pen_n);
+            basalt::kernels::penalty_rows(sl.ids.data(), (int64_t) sl.ids.size(), win_.data(), T, sl.pen_n, history.data());
             d.history = history.data();
             d.history_len = sl.pen_n;
         }
         sp.counter = (uint64_t) sl.produced;
-        if (const basalt::model::Result r = session().decode_window(d); !r.ok()) {
-            std::printf("ERR %s\n", r.message.c_str());
-            set_active(0);
-            return false;
-        }
-        if (sl.guard != nullptr && sl.guard->on() && sl.guard->scan(&y, 1) >= 0) {
-            sl.guard->mask_bias({}, grammar_bias);
-            if (const basalt::model::Result r = session().resample_row(0, grammar_bias.data(), y); !r.ok()) {
-                std::printf("ERR %s\n", r.message.c_str());
-                set_active(0);
-                return false;
+        if (const basalt::model::Result r = session().decode_window(d); !r.ok()) return failed(r.message);
+        int a = 0;
+        while (a < T - 1 && win_[(size_t) a + 1] == out_[(size_t) a]) ++a;
+        if (sl.guard != nullptr && sl.guard->on()) {
+            // the first pick the grammar refuses is drawn again under its mask, and the window ends there
+            const int miss = sl.guard->scan(out_.data(), a + 1);
+            if (miss >= 0) {
+                sl.guard->mask_bias({}, grammar_bias);
+                int32_t y = -1;
+                if (const basalt::model::Result r = session().resample_row(miss, grammar_bias.data(), y); !r.ok()) return failed(r.message);
+                out_[(size_t) miss] = y;
+                a = miss;
+                if (!sl.guard->take(y)) basalt::log::info("basalt grammar", "slot %d: the masked draw was token %d", b, (int) y);
             }
-            if (!sl.guard->take(y)) basalt::log::info("basalt grammar", "slot %d: the masked draw was token %d", b, (int) y);
         }
-        sl.ids.push_back(fed);
-        ++sl.produced;
-        ++sl.p;
-        sl.x = y;
-        basalt::protocol::emit("BT %d %d\n", b, (int) y);
+        sl.cum.observe_chances(sl.dprob, T - 1, a);
+        sl.drafts_offered += T - 1;
+        sl.drafts_accepted += a;
+        std::string line = "BT " + std::to_string(b);
+        const char* fin = nullptr;
+        for (int i = 0; i <= a && fin == nullptr; ++i) {
+            const int32_t y = out_[(size_t) i];
+            sl.ids.push_back(win_[(size_t) i]);
+            ++sl.produced;
+            ++sl.p;
+            sl.x = y;
+            line += " " + std::to_string(y);
+            const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+            fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
+        }
+        sl.n_dr = 0;
+        bool drafting = false;
+        if (fin == nullptr && session().max_window() > 1) {
+            const basalt::model::Result r = session().draft_begin(sl.x, sl.p);
+            if (!r.ok() && r.status != basalt::model::Status::NotImplemented) return failed(r.message);
+            drafting = r.ok();
+        }
+        basalt::protocol::emit_text(line + "\n");
         basalt::core::progress_beat();
-        const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
-        const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
+        if (drafting) {
+            const int max_n = std::min(session().max_window() - 1, (int) std::size(sl.dr));
+            if (const basalt::model::Result r = session().draft_end(sl.dr, sl.dprob, max_n, sl.n_dr); !r.ok()) return failed(r.message);
+        }
         if (fin != nullptr) {
-            std::printf("BDONE %d %lld %s %.1f 0 0\n", b, (long long) sl.produced, fin,
-                        std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count());
+            std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin,
+                        std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
+                        (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
             sl.active = false;
             sl.cached = o.prompt_cache > 0;
             sl.idle_busy = busy_now();
