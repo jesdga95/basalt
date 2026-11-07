@@ -24,7 +24,7 @@ without the official tuned drafter is slower than the official file.
 
 - `dense`: F32 and BF16 tensors. `gguf`: quantized non-expert tensors. `experts`: routed experts per layer.
 - `engram`: the Engram table alone (IQ4_NL rows of 144 bytes), 2 MiB aligned.
-- `vision/mmproj`: present only when built with `--mmproj`.
+- `vision/mmproj`: present only when built with `--mmproj`; the engine and `basalt-vision --model FILE.basalt` read it in place.
 - `dspark/gguf`: DeepSeek's DSpark drafter. Attach it to an existing pack without copying weights:
 
 ```sh
