@@ -32,6 +32,10 @@
 namespace basalt::prefill {
 namespace {
 
+// The main card quantizes a layer's activations this many rows at a time into its own memory and its copy engine moves
+// them to the host: a kernel writing to mapped host memory would hold the main card's SMs for the whole transfer.
+constexpr int64_t kQuantRows = 2048;
+
 int64_t max_launches(const PeerShare::Dims& d) {
     // a launch closes at its rows, at its experts, or splits an expert: at most one launch more per expert
     return (d.max_rows + d.launch_rows - 1) / d.launch_rows + d.n_expert + 1;
@@ -66,6 +70,7 @@ struct PeerShare::Impl {
     std::unique_ptr<mmq::Context> ctx;
     // pinned, portable; the activations mapped too
     void* hxq = nullptr;
+    void* dxq = nullptr;                    // main card: kQuantRows rows of q8_1 on their way to hxq
     float* hrows[kMaxBufs] = {};
     int32_t *tok_h[2] = {}, *bounds_h[2] = {};
     int set = 0;
@@ -196,6 +201,7 @@ struct PeerShare::Impl {
                 if (e) cudaEventDestroy(e);
             for (cudaEvent_t e : ev_rows)
                 if (e) cudaEventDestroy(e);
+            if (dxq) cudaFree(dxq);
         }
         for (void* p : host) cudaFreeHost(p);
     }
@@ -292,6 +298,7 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
              cudaEventCreateWithFlags(&m->ev_xq, cudaEventDisableTiming) == cudaSuccess &&
              cudaEventCreateWithFlags(&m->ev_end, cudaEventDisableTiming) == cudaSuccess;
         for (int b = 0; ok && b < kMaxBufs; ++b) ok = cudaEventCreateWithFlags(&m->ev_rows[b], cudaEventDisableTiming) == cudaSuccess;
+        ok = ok && cudaMalloc(&m->dxq, mmq::q8_bytes(kQuantRows, d.n_embd)) == cudaSuccess;
         layout(d, [](size_t) {}, [&](size_t b) {
             void* p = nullptr;
             if (ok && cudaHostAlloc(&p, b, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess)
@@ -419,8 +426,19 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
         cudaStreamWaitEvent(m.s_main, m.ev_x, 0);
         cudaStreamWaitEvent(m.s_rows, m.ev_x, 0);
         cudaStreamWaitEvent(m.s_main, m.ev_xin, 0);
-        if (L.quantize) L.quantize(x, n_tokens, m.hxq, m.s_main);
-        else mmq::quantize(x, nullptr, m.hxq, L.gu_type, d.n_embd, d.n_embd, n_tokens, m.s_main);
+        if (L.quantize) {
+            L.quantize(x, n_tokens, m.hxq, m.s_main);
+        } else {   // block column kb of row r lies at (kb n_tokens + r) blocks: a piece's rows are a strided copy
+            const size_t kb = (size_t) mmq::q8_blocks(d.n_embd);
+            const size_t bb = (mmq::q8_bytes(1, d.n_embd) - mmq::q8_bytes(0, d.n_embd)) / kb;   // bytes of one block
+            for (int64_t r0 = 0; r0 < n_tokens; r0 += kQuantRows) {
+                const int64_t nr = std::min<int64_t>(kQuantRows, n_tokens - r0);
+                mmq::quantize(x + (size_t) r0 * (size_t) d.n_embd, nullptr, m.dxq, L.gu_type, d.n_embd, d.n_embd, nr,
+                              m.s_main);
+                cudaMemcpy2DAsync((uint8_t*) m.hxq + (size_t) r0 * bb, (size_t) n_tokens * bb, m.dxq, (size_t) nr * bb,
+                                  (size_t) nr * bb, kb, cudaMemcpyDeviceToHost, m.s_main);
+            }
+        }
         cudaEventRecord(m.ev_xq, m.s_main);
     }
     // the group numbers: the prepared ones, then new ones
