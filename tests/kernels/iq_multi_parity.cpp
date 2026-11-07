@@ -72,10 +72,11 @@ const char* name_of(int t) {
         case 13: return "Q5_K";
         case 7: return "Q5_1";
         case 8: return "Q8_0";
+        case 6: return "Q5_0";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 7 || t == 8 || t == 6 ? 32 : t == 42 || t == 40 ? 64 : 256; }
 // A UE4M3 sub-block scale byte.  Profile 0: exponent 1..4 (small blocks).  Profile 1: exponent 6..14, block values in
 // the hundreds as the packs' are (their tails are 1e-5..1e-4).  Profile 2: profile 1 with the odd bytes mixed in: 0x7F
 // (the NaN code, decoded as 0), the sign bit set (ignored), zero and subnormals.
@@ -459,7 +460,8 @@ void bench(cudaStream_t s, std::mt19937& rng) {
     // the verify window's shape: 2560 x 640 experts, 16 groups of m entries each
     // (GB/s: the 16 experts' bytes once per call, at the new kernel's time)
     for (auto [gu, dt] : {std::pair<int, int>{16, 42}, {17, 42}, {18, 42}, {21, 42}, {22, 42}, {29, 42}, {40, 40},
-                          {12, 7}, {12, 8}, {13, 8}, {8, 8}}) {   // NVFP4 with its own down format; the Q4_K_XL and Q8_0 pairs
+                          {12, 7}, {12, 8}, {13, 8}, {8, 8}, {21, 8}, {23, 8}, {18, 6}, {23, 6}}) {   // NVFP4, K-quant
+                                                                               // and Q8_0 / Q5_0 down, i-quant gate/up
         std::printf("%-8s/%-5s grouped, 16 groups of m entries:", name_of(gu), name_of(dt));
         std::string gbs;
         for (int m : {1, 2, 3, 4, 8}) {
@@ -556,7 +558,8 @@ int main(int argc, char** argv) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
     }
-    for (auto [gu, dt] : {std::pair<int, int>{12, 7}, {12, 8}, {13, 8}, {13, 7}, {8, 8}}) {   // the Q4_K_XL and Q8_0 pairs
+    for (auto [gu, dt] : {std::pair<int, int>{12, 7}, {12, 8}, {13, 8}, {13, 7}, {8, 8},
+                          {21, 8}, {23, 8}, {18, 6}, {23, 6}}) {   // the Q4_K_XL / Q8_0 / Q5_0 pairs, i-quant gate/up
         check_grouped(gu, dt, 2560, 640, s, rng);
         check_grouped(gu, dt, 1024, 512, s, rng);
     }
