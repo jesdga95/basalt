@@ -108,6 +108,7 @@ Reference: [quality](quality.md#the-bf16-reference). Two cards, 400 W + 180 W, 2
 | Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
 |---|---:|---:|---:|---:|---:|
 | UD-IQ1_M (the published pack) | 3.0456 | 0.2779 | 0.0566 | 2.86 | 83.88% |
+| UD-IQ2_XXS (published, fp16 caches) | 3.1074 | 0.2408 | 0.0408 | 2.53 | 85.15% |
 | GSQ-RCO IQ2_XXS (tested, not shipped) | 3.6353 | 0.4311 | 0.0894 | 4.39 | 79.97% |
 
 The cache roundings cost nothing measurable: the same run with `--kv fp16` scores PPL 3.0387, KLD 0.2777, top-1 83.97%.
