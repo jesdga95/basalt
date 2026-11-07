@@ -68,10 +68,11 @@ void usage() {
 
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
-                 "  --vision             --serve takes images too (GENI requests; embeddings from basalt-vision --model FILE)\n"
-                 "  --vision-dynamic     --vision, with the image encoder in this process (it reads the model file's\n"
+                 "  --vision             --serve takes images, encoded in this process (it reads the model file's\n"
                  "                       vision/mmproj in place): ENC requests borrow expert-cache slots for the\n"
                  "                       encoder and give them back refilled\n"
+                 "  --vision-external    --serve takes images whose embeddings come from basalt-vision --model FILE\n"
+                 "                       (GENI requests)\n"
                  "  --no-prompt-skip     a model that stops far prompt rows short runs them through every layer: slower\n"
                  "                       reads, the same math from the last prompt token on, another batch shape's rounding\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"

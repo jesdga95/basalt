@@ -122,8 +122,10 @@ def model_config(spec: ModelSpec, engine_bin: str) -> dict:
         v["mode"] = vision
         v["gpu"] = vision != "cpu"
         cfg["vision"] = v
-        if vision == "dynamic":     # the engine encodes: it opens the projector inside the model file itself
-            args.append("--vision-dynamic")
-        if "--vision" not in args:   # image embeddings need --vision
+        # dynamic: the engine encodes, opening the projector inside the model file itself; else the sidecar's
+        # embeddings come in with each image
+        if vision == "dynamic" and "--vision" not in args:
             args.append("--vision")
+        elif vision != "dynamic" and "--vision-external" not in args:
+            args.append("--vision-external")
     return cfg

@@ -151,7 +151,7 @@ Flow Request::parse() {
 
     grammar_resamples = 0;
     runtime_.req_imgs.clear();
-    if (geni && !runtime_.o.vision) { std::printf("ERR this engine was started without --vision\n"); return Flow::next; }
+    if (geni && !runtime_.o.vision) { std::printf("ERR this engine was started without --vision or --vision-external\n"); return Flow::next; }
 
     return Flow::proceed;
 }
