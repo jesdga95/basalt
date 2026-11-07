@@ -219,10 +219,39 @@ class FakeGpu:
                 "pcie_width": 16, "pcie_rx_mb": 1.5, "pcie_tx_mb": 0.5, "unlisted": 1}
 
 
+class SamplerLifetime(unittest.TestCase):
+    def test_closing_the_server_stops_its_sampler(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(Path(__file__).resolve().parents[2] / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        sampler = svc.telemetry
+        self.assertFalse(sampler.stopped())
+        httpd.shutdown()
+        httpd.server_close()
+        self.assertTrue(sampler.stopped())
+
+
 class PerGpu(unittest.TestCase):
+    def sampler(self, **kw):
+        """A Telemetry whose thread ends with the test."""
+        tel = Telemetry(**kw)
+        self.addCleanup(tel.stop)
+        return tel
+
     def telemetry(self, indices, factories=None):
         factories = factories or {}
-        return Telemetry(gpu_indices=indices, gpu_factory=lambda i: factories.get(i) or FakeGpu(i))
+        return self.sampler(gpu_indices=indices, gpu_factory=lambda i: factories.get(i) or FakeGpu(i))
+
+    def test_stop_ends_the_sampling_thread(self):
+        before = set(threading.enumerate())
+        tel = Telemetry(gpu_indices=[0], gpu_factory=FakeGpu)
+        (thread,) = set(threading.enumerate()) - before
+        self.assertTrue(thread.is_alive())
+        tel.stop()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(tel.stopped())
+        self.assertIn("now", tel.snapshot())
 
     def test_one_entry_per_card_with_its_own_figures(self):
         s = self.telemetry([0, 1]).sample()
@@ -249,7 +278,7 @@ class PerGpu(unittest.TestCase):
         self.assertEqual(set(snap["now"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
 
     def test_history_keeps_the_speeds_slots_and_cards(self):
-        tel = Telemetry(extra=lambda: {"tok_s": 12.3456, "prefill_tok_s_mean": None, "tok_s_mean": 9,
+        tel = self.sampler(extra=lambda: {"tok_s": 12.3456, "prefill_tok_s_mean": None, "tok_s_mean": 9,
                                        "slot_tok_s": [1.234, 0.0]},
                         gpu_indices=[0, 1], gpu_factory=FakeGpu)
         for _ in range(70):
@@ -266,7 +295,7 @@ class PerGpu(unittest.TestCase):
         self.assertNotIn("slot_tok_s", snap["now"])
 
     def test_a_slot_series_starts_when_the_slot_appears(self):
-        tel = Telemetry(gpu_indices=[0], gpu_factory=FakeGpu)
+        tel = self.sampler(gpu_indices=[0], gpu_factory=FakeGpu)
         for rates in ([5.0], [5.0], [6.0, 2.0]):
             tel.record({"gpus": [], "slot_tok_s": rates})
         self.assertEqual(tel.snapshot()["history"]["slot_tok_s"], [[5.0, 5.0, 6.0], [None, None, 2.0]])
@@ -276,7 +305,7 @@ class PerGpu(unittest.TestCase):
         s = tel.sample()
         self.assertEqual([g["index"] for g in s["gpus"]], [0, 2])                           # card 1 cannot be read
         self.assertTrue(all(g[k] is None for g in s["gpus"][1:] for k in GPU_KEYS))
-        none = Telemetry(gpu_indices=[0], gpu_factory=lambda i: FakeGpu(i, ok=False))
+        none = self.sampler(gpu_indices=[0], gpu_factory=lambda i: FakeGpu(i, ok=False))
         self.assertEqual(none.sample()["gpus"], [])
         self.assertEqual(none.snapshot()["static"]["gpus"], [])
         self.assertIsNone(none.snapshot()["static"]["driver"])
