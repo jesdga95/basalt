@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/batch_pipeline.cpp - batch pipeline operations.
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/protocol.hpp"
 #include "qfn_request.hpp"
 
 namespace basalt::models::qwen4exp::serve {
@@ -37,7 +38,7 @@ bool QfnRuntime::pump(bool may_start) {
             BSlot& sl = bs[(size_t) (gi * GS + t)];
             if (!sl.active) continue;
             const int32_t y = outb[t];
-            std::printf("BT %d %d\n", gi * GS + t, (int) y);
+            basalt::protocol::emit("BT %d %d\n", gi * GS + t, (int) y);
             ++sl.produced;
             ++bt_rows;
             const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();

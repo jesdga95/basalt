@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/conversation.cpp - conversation operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/protocol.hpp"
 #include "qfn_state.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
 
@@ -567,9 +568,8 @@ int QfnRuntime::init_conversations() {
         if (ms - last_ms < 500.0 && ms >= last_ms) return;
         last_ms = ms;
         const int64_t at = p0 + T * layers_done / n_layers;
-        std::printf("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) pp_total, ms,
-                    ms > 0.0 ? 1000.0 * (double) (at - pp_from) / ms : 0.0);
-        std::fflush(stdout);
+        basalt::protocol::emit("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) pp_total, ms,
+                               ms > 0.0 ? 1000.0 * (double) (at - pp_from) / ms : 0.0);
     };
     sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
         std::vector<int32_t> nxt((size_t) T);

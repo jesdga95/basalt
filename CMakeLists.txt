@@ -634,6 +634,15 @@ if(Python3_Interpreter_FOUND)
                   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/community_row_fix_test.py
                           $<TARGET_FILE:community_row_test> ${CMAKE_CURRENT_SOURCE_DIR})
   set_tests_properties(community_row_fix_test PROPERTIES TIMEOUT 60)
+  # protocol lines written from several threads each arrive whole on stdout
+  add_executable(protocol_test tests/core/protocol_test.cpp)
+  target_include_directories(protocol_test PRIVATE include)
+  target_link_libraries(protocol_test PRIVATE warnings Threads::Threads)
+  basalt_embed_manifest(protocol_test)
+  basalt_cpu_test(NAME protocol_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/protocol_test.py
+                          $<TARGET_FILE:protocol_test>)
+  set_tests_properties(protocol_test PROPERTIES TIMEOUT 60)
 endif()
 
 # the C++ tokenizer's ids against tools/tokenizer.py over a corpus

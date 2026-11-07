@@ -10,6 +10,7 @@
 #include "basalt/model/adapter.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/program/options.hpp"
+#include "basalt/protocol.hpp"
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstdio>
@@ -85,9 +86,8 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
         const double prev = last_ms.load();
         if (ms - prev < 500.0 && ms >= prev) return;
         last_ms.store(ms);
-        std::printf("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) total, ms,
-                    ms > 0.0 ? 1000.0 * (double) (at - (int64_t) reuse) / ms : 0.0);
-        std::fflush(stdout);
+        basalt::protocol::emit("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) total, ms,
+                               ms > 0.0 ? 1000.0 * (double) (at - (int64_t) reuse) / ms : 0.0);
     };
     auto report_at = [&](int64_t at) {
         if (!report) return;
