@@ -198,7 +198,7 @@ bool PeerExperts::open_plain(int device, int64_t n_layers, int64_t n_expert, int
 uint64_t PeerExperts::room() const {
     On on(device_);
     size_t free_b = 0, total_b = 0;
-    return cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? (uint64_t) free_b : 0;
+    return basalt::core::device_mem_info(&free_b, &total_b) == cudaSuccess ? (uint64_t) free_b : 0;
 }
 
 bool PeerExperts::open_slots(const std::vector<int64_t>& slot_bytes, std::string& err) {

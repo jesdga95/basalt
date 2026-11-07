@@ -4,6 +4,7 @@
 #include "decode_loop.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "basalt/core/draft_cum.hpp"
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/conv_cache.hpp"
@@ -300,7 +301,7 @@ public:
 private:
     bool memory_reply(long long reserve, int64_t slots, std::string* reply) {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::device_mem_info(&free_b, &total_b);
         char line[160];
         std::snprintf(line, sizeof line, "VRAM reserve_mib=%lld expert_slots=%lld vram_free_mib=%lld\n", reserve,
                       (long long) slots, (long long) (free_b >> 20));
