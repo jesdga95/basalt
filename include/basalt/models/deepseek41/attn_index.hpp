@@ -21,6 +21,16 @@ constexpr int kIdxDim = 128;            ///< indexer key/query width; the last k
 constexpr int kTopK = 512;              ///< selected compressed rows per query
 constexpr int kMaxCandBlocks = 2048;    ///< capacity of the level-one candidate list
 
+/// The caches' rows round the way the model's reference does and keep its codes and group scales, codes first, each
+/// row padded to 16 bytes. A reader's code times its scale is the rounded value, exactly.
+///   window rows       kLatent E4M3 codes, then kLatent / 32 power-of-two scales (UE8M0: the fp32 exponent byte)
+///   compressed rows   kLatent / 2 bytes of E2M1 codes (value 2i in the low nibble), then kLatent / 16 E4M3 scales
+///   index keys        kIdxDim / 2 bytes of E2M1 codes, then kIdxDim / 32 UE8M0 scales
+/// The indexer's queries take the index keys' rounding and stay fp32.
+constexpr int kWinRowBytes = (kLatent + kLatent / 32 + 15) / 16 * 16;       ///< 528
+constexpr int kCompRowBytes = (kLatent / 2 + kLatent / 16 + 15) / 16 * 16;  ///< 288
+constexpr int kIdxRowBytes = (kIdxDim / 2 + kIdxDim / 32 + 15) / 16 * 16;   ///< 80
+
 /// Rotary parameters of one layer kind (interleaved pairs over the last kRopeDim dims, YaRN when ext_factor != 0).
 /// Layers with compress ratio 0 use {10000, 1, 0, 0, 0, 0}; the others use the compressed base with the YaRN factor
 /// (1/factor), ext_factor 1, beta 32/1 and the original context. The rotation has no magnitude scaling.
