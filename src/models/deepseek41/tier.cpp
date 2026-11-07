@@ -139,7 +139,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         avail = available();
         ram_slots = ram_in();
     }
-    homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots);
+    homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, -1);
     const uint64_t ram_floor =
         ram_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
     if (homes_.peer == 0) {
