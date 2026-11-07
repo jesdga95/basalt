@@ -161,6 +161,78 @@ struct CompState {
     }
 };
 
+// ---------------------------------------------------------------------------------------------------------------
+
+uint64_t fnv(uint64_t h, const void* p, size_t n) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+// The bf16 projections and the compressor's rows, index keys and state at the real geometry hash to the bits of the
+// kernels they replaced (frozen): their sums are bitwise-neutral.
+void test_frozen(Verdict& v) {
+    constexpr uint64_t kGemv = 0xbcf5bf9e8c0478ccull, kComp = 0xf66492ac94ff28d9ull;
+    uint64_t hg = 1469598103934665603ull, hc = hg;
+    const auto x = randn((size_t) kMaxT * D, 61, 1.f);
+    Dev<float> dx(x);
+    const int shapes[][2] = {{D, kLatent}, {D, kIdxHeads}, {1280, kIdxHeads * kIdxDim}};
+    for (const auto& sh : shapes) {
+        Dev<uint16_t> w(rand_bf16((size_t) sh[0] * sh[1], 62, 0.02f));
+        Dev<float> y((size_t) kMaxT * sh[1]);
+        for (int T : {1, 2, 3, 5, 8}) {
+            gemv_bf16(w.p, dx.p, T, sh[0], sh[1], y.p, nullptr);
+            check(cudaDeviceSynchronize(), "gemv_bf16");
+            const auto got = y.down();
+            hg = fnv(hg, got.data(), (size_t) T * sh[1] * sizeof(float));
+        }
+    }
+    const auto freq = make_table(true);
+    Dev<uint16_t> wkv(rand_bf16((size_t) kLatent * D, 63, 0.02f)), wg(rand_bf16((size_t) kLatent * D, 64, 0.02f)),
+        wik(rand_bf16((size_t) kIdxDim * kLatent, 65, 0.05f));
+    Dev<float> nw(randn(kLatent, 66, 1.f, 1.f)), nk(randn(kIdxDim, 67, 1.f, 1.f)), dfreq(freq);
+    Dev<float> dxs(randn((size_t) 24 * D, 68, 1.f));
+    std::vector<int32_t> pos(24);
+    for (int i = 0; i < 24; ++i) pos[i] = 7 + i;
+    Dev<int32_t> dpos(pos);
+    Dev<char> ws(compress_workspace_bytes());
+    for (CacheFormat f : {CacheFormat::Fp8, CacheFormat::Fp16}) {
+        g_fmt = f;
+        for (int ratio = 1; ratio <= 2; ++ratio) {
+            CompState st(ratio, 32);
+            CompressArgs a;
+            a.ratio = ratio; a.w_kv = wkv.p; a.w_gate = ratio > 1 ? wg.p : nullptr; a.norm_w = nw.p;
+            a.w_idx_k = wik.p; a.idx_k_norm_w = nk.p; a.rope_freq = dfreq.p;
+            a.state_kv = st.skv.p; a.state_score = st.ssc.p; a.comp_kv = st.ckv.p; a.comp_ik = st.cik.p; a.format = f;
+            const int width[] = {3, 1, 8, 3, 2, 5}, kept[] = {2, 1, 4, 3, 1, 5};
+            int off = 0;
+            for (int i = 0; off < 24; i = (i + 1) % 6) {
+                const int T = std::min(width[i], 24 - off), q = std::min(kept[i], T);
+                if (T == 1) {
+                    compress(a, dxs.p + (size_t) off * D, dpos.p + off, 1, ws.p, nullptr);
+                    off += 1;
+                } else {
+                    compress_window(a, dxs.p + (size_t) off * D, dpos.p + off, T, ws.p, nullptr);
+                    compress_window_commit(a, dpos.p + off, q, ws.p, nullptr);
+                    off += q;
+                }
+            }
+            check(cudaDeviceSynchronize(), "compress frozen");
+            const auto rk = st.ckv.down(), ri = st.cik.down();
+            const auto sk = st.skv.down(), ss = st.ssc.down();
+            hc = fnv(hc, rk.data(), rk.size());
+            hc = fnv(hc, ri.data(), ri.size());
+            hc = fnv(hc, sk.data(), sk.size() * sizeof(float));
+            hc = fnv(hc, ss.data(), ss.size() * sizeof(float));
+        }
+    }
+    g_fmt = CacheFormat::Fp8;
+    std::printf("frozen: gemv_bf16 %016llx (want %016llx), compressor rows and keys %016llx (want %016llx)\n",
+                (unsigned long long) hg, (unsigned long long) kGemv, (unsigned long long) hc, (unsigned long long) kComp);
+    v.expect(hg == kGemv, "gemv_bf16 bits equal the frozen kernel");
+    v.expect(hc == kComp, "compressor rows and index keys equal the frozen kernels");
+}
+
 void test_compress(Verdict& v) {
     const int N = 12, P0 = 5;
     const auto freq = make_table(true);
@@ -530,6 +602,7 @@ int main(int argc, char** argv) {
         test_compress(v);
         test_indexer(v);
     }
+    test_frozen(v);
     g_fmt = CacheFormat::Fp8;
     test_top_rows(v);
     bench();
