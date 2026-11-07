@@ -222,7 +222,7 @@ class FakeGpu:
 class SamplerLifetime(unittest.TestCase):
     def test_closing_the_server_stops_its_sampler(self):
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(Path(__file__).resolve().parents[2] / "serve/chat_template.jinja"))
+        svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate.from_file(Path(__file__).resolve().parents[2] / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         sampler = svc.telemetry
         self.assertFalse(sampler.stopped())
