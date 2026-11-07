@@ -15,7 +15,7 @@ bit-identical run to run.
 | Setting | Default | Trade-off |
 | --- | --- | --- |
 | `adapt-every` | 1 on a server, 4 with a layer split | Fewer, later rounds cost less link, but a topic change or a fresh engine waits N windows. |
-| `adapt-swaps` | 96 | Bigger rounds catch up faster and move more bytes (about 2.6 MiB per NVFP4 expert each way). The RAM copy keeps four times N free places. |
+| `adapt-swaps` | 12 | Bigger rounds catch up faster and move more bytes (about 2.6 MiB per NVFP4 expert each way). The RAM copy keeps four times N free places. |
 | `peer-adapt-swaps` | `adapt-swaps` | Same, on the peer's link. `0` freezes the peer tier. |
 | `adapt-decay` | 0.85 (0.7 with a layer split) | Lower follows topic changes sooner. Higher keeps a long-run placement. |
 | `expert-profile-save` | off | Saves the placement; a continuing workload starts on it, a different one starts wrong. |
@@ -29,13 +29,13 @@ chat requests. Decode tok/s, one run per arm:
 
 | Arm (two cards: 400 W + 180 W) | Cold | Whole session |
 |---|---:|---:|
-| defaults | 285.5 | 297.8 |
+| defaults (`adapt-swaps 96`) | 285.5 | 297.8 |
 | `adapt-every 64`, `adapt-swaps 256`, `adapt-decay 0.7` | 232.4 | 212.1 |
 | `adapt-every 1`, `adapt-swaps 160` | 287.1 | 295.5 |
 
 | Arm (RTX 5090 alone, 400 W) | Cold | Whole session |
 |---|---:|---:|
-| defaults | 241.8 | 204.8 |
+| defaults (`adapt-swaps 96`) | 241.8 | 204.8 |
 | `adapt-every 64`, `adapt-swaps 256`, `adapt-decay 0.7` | 160.0 | 143.7 |
 | `adapt-every 1`, `adapt-swaps 160` | 230.1 | 206.2 |
 

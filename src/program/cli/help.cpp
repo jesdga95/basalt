@@ -185,7 +185,7 @@ void usage() {
                  "  --prefill-cpu-share F  share of the streamed prompt experts the CPU computes, 0 to 1 (default\n"
                  "                       0.6; 0 = the GPU streams them all).  Fixed, so the output is the same\n"
                  "                       from run to run; a weaker CPU may prefer a lower value\n"
-                 "  --adapt-swaps N      most experts a round swaps into the main GPU (default 96; 0 = off). On a\n"
+                 "  --adapt-swaps N      most experts a round swaps into the main GPU (default 12; 0 = off). On a\n"
                  "                       server without a layer split, a round after one that found twice as many\n"
                  "                       misses swaps four times as many, and the RAM copy keeps 4 N free places\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
