@@ -59,14 +59,20 @@ class LoadBars:
     `copy` targets are counted apart from the total. finish() collapses the bars into one result line. Off a
     terminal the rows print as text once per heartbeat, only while their bytes move.
 
-    A row's MB/s comes from the times its byte counts were read: over the latest >= WINDOW s while it moves,
-    over the engine's last phase for it once it is complete, and none while it stands still unfinished."""
+    A row's MB/s comes from the times its byte counts were read: over the latest window while it moves, over
+    the engine's last phase for it once it is complete, and none while it stands still unfinished. A row stands
+    still only past its own cadence: the engine reads a target out when its bytes advance 1% of its total or
+    after 250 ms of new bytes, so one row's lines cluster (several fills of the first percent at once) and
+    spread (a large slow copy crosses 1% further apart than a second) in the same stretch."""
 
     WIDTH = 24
     TABLE = "ngram"                                    # the n-gram table locked into RAM: its own row, outside the total
     STILL = 1.0                                        # s without new bytes: the stretch of movement ended
-    WINDOW = 1.0                                       # s of the latest bytes a moving row's rate covers
+    WINDOW = 1.0                                       # s floor of the window a moving row's rate covers
     MIN_SPAN = 0.5                                     # s: a shorter span gives no rate
+    STALL = 2.0                                        # x the row's line interval: past it the row stood still
+    CADENCE_KEEP = 0.9                                 # decay of the row's line interval: a maximum that forgets,
+                                                       # so clustered lines never collapse the row's spacing
 
     def __init__(self, out=None, gpus=None):
         self.out = out or sys.stdout
@@ -76,6 +82,7 @@ class LoadBars:
         self.total = 0                                 # announced total bytes (0: none)
         self.targets: dict[tuple[str, bool], dict] = {}   # (target, copy) -> {plan, done, last, seen, start, ...}
         self._beat_seen: dict[tuple[str, bool], int] = {}  # bytes each row showed at the previous busy heartbeat
+        self._beat_t: float | None = None                # when the previous busy heartbeat fired
         self.started = 0                               # targets begun
         self.t0 = None
         self.drawn = 0                                 # lines of bars on screen
@@ -94,40 +101,76 @@ class LoadBars:
         return "ram" if target == "ram" else self.name(target)
 
     def _target(self, target: str, copy: bool) -> dict:
-        # moves: (time, bytes) read while moving, the first one >= WINDOW before the last; phase: the first bytes
-        # of the engine's current phase for the target; moved: when its bytes last changed
+        # moves: (time, bytes) read while moving, the window the rate covers; phase: the first bytes of the
+        # engine's current phase for the target; moved: when its bytes last changed; cadence: the row's line
+        # interval (a maximum that forgets: clustered reads never collapse it), so its own read-out spacing
+        # decides when it stopped
         return self.targets.setdefault((target, copy), {"plan": 0, "done": 0, "last": 0, "seen": 0, "start": None,
-                                                        "moves": [], "phase": None, "moved": None})
+                                                        "moves": [], "phase": None, "moved": None, "cadence": None})
+
+    def _still_for(self, t: dict) -> float:
+        """s of no new line that ends this row's stretch of movement: at least STILL, and for a target the
+        engine reads out less often than that, STALL times its own line interval."""
+        if not t["cadence"]:
+            return self.STILL
+        return max(self.STILL, self.STALL * t["cadence"])
 
     def _sample(self, t: dict, before: int, now: float) -> None:
         """Record the target's bytes as read at `now`; `before` is what it held until this line."""
         have = t["done"] + t["last"]
         if have == before:
             return
-        moves = t["moves"]
-        if t["phase"] is None:                         # the phase's first bytes: its rate counts from here
-            t["phase"] = (now, have)
-            moves.clear()
-        elif now - t["moved"] > self.STILL:            # moving again after standing still: a fresh window
-            moves.clear()
-        moves.append((now, have))
-        while len(moves) > 2 and moves[1][0] <= now - self.WINDOW:
-            moves.pop(0)
+        gap = now - t["moved"] if t["moved"] is not None else 0.0
         t["moved"] = now
+        moves = t["moves"]
+        drought = t["cadence"] is not None and gap > self._still_for(t)   # the row stood still between reads
+        if gap >= self.MIN_SPAN:                   # a real line interval: the row's cadence is a decaying
+            t["cadence"] = max(self.CADENCE_KEEP * t["cadence"], gap) if t["cadence"] else gap
+                                                   # max, so clusters can neither seed nor collapse it; a gap
+                                                   # past the standstill bound raises it too, or a spacing a
+                                                   # little over 2x the cadence stands every later row still
+        if t["phase"] is None:                     # the target's first bytes, or a new phase: its rate counts
+            t["phase"] = (now, have)               # from here, and the window of reads starts fresh
+            moves.clear()
+        elif drought:                              # moving again after standing still: the phase is new, but
+            t["phase"] = (now, have)               # the window keeps its last reads, so no row shows blank
+        moves.append((now, have))
+        win = max(self.WINDOW, t["cadence"] or 0)        # a slow row's window spans at least its last interval
+        while len(moves) > 2 and moves[1][0] <= now - win:
+            moves.pop(0)
 
     def _rate(self, t: dict, have: int, now: float) -> str:
         if t["moved"] is None:
             return ""
         if t["plan"] > 0 and have >= t["plan"] and t["phase"] is not None:   # complete: its last phase's rate
             since, base = t["phase"]
-        elif now - t["moved"] <= self.STILL:           # moving: the latest window
-            since, base = t["moves"][0]
+        elif now - t["moved"] <= self._still_for(t):   # moving: the latest >= WINDOW s, as long as its reads
+            moves = t["moves"]                          # spread over an honest span; else the stretch's mean
+            first = moves[0]
+            if t["moved"] - first[0] >= self.MIN_SPAN and first[1] < have:
+                since, base = first
+            elif t["phase"] is not None and t["moved"] > t["phase"][0]:
+                since, base = t["phase"]
+            else:
+                return ""
         else:
             return ""
         span = t["moved"] - since
         if span < self.MIN_SPAN or have <= base:
             return ""
         return f"  {(have - base) / 1e6 / span:.0f} MB/s"
+
+    def _beat_rate(self, have: int, now: float, beat: tuple[float, int] | None) -> str:
+        """A busy heartbeat's fallback: the mean over the stretch since that beat last read this row
+        out. A phase that just re-planned leaves the row's own window younger than a beat, but the
+        bytes printed between two beats moved inside exactly that stretch -- base and span paired,
+        so this rate needs no MIN_SPAN floor. Never the first beat: there is no earlier read."""
+        if beat is None:
+            return ""
+        since, base = beat
+        if now <= since or have <= base:
+            return ""
+        return f"  {(have - base) / 1e6 / (now - since):.0f} MB/s"
 
     def done(self) -> int:
         return sum(t["done"] + t["last"] for (tg, c), t in self.targets.items() if not c and tg != self.TABLE)
@@ -138,8 +181,10 @@ class LoadBars:
         n = int(f * width)
         return "=" * n + (">" if n < width else "") + " " * (width - n - 1)
 
-    def _rows(self, bar: int = WIDTH) -> list[tuple[tuple[str, bool], str]]:
-        """(key, row) per started target, oldest start first, with bars `bar` wide."""
+    def _rows(self, bar: int = WIDTH, beat: tuple[float, dict] | None = None) -> list[tuple[tuple[str, bool], str]]:
+        """(key, row) per started target, oldest start first, with bars `bar` wide. `beat` (the previous
+        busy heartbeat's time and per-row bytes) rates a row too young for its own window; a tty
+        redraw passes no beat and keeps the row's own rules alone."""
         rows = []
         started = [kv for kv in self.targets.items() if kv[1]["start"] is not None]
         now = time.monotonic()
@@ -148,6 +193,8 @@ class LoadBars:
             if t["plan"] <= 0 and not have:
                 continue                               # planned to hold nothing
             rate = self._rate(t, have, now)
+            if not rate and beat is not None:
+                rate = self._beat_rate(have, now, (beat[0], beat[1].get((target, copy), have)))
             if target == self.TABLE:
                 rows.append(((target, copy), "[server] loading the n-gram table into system ram",
                              have, t["plan"], rate))
@@ -179,11 +226,13 @@ class LoadBars:
 
     def moved_lines(self) -> list[str]:
         """Rows for the heartbeat off a terminal: only the targets whose bytes moved since the
-        previous call; the first call shows every row."""
+        previous call; the first call shows every row. A moved row is never read out blank: one too
+        young for its own window carries the mean over the beat that prints it (see _beat_rate)."""
         with self.lock:
-            rows = self._rows()
+            previous, beat_t = self._beat_seen, self._beat_t
+            self._beat_t = time.monotonic()
+            rows = self._rows(beat=(beat_t, previous) if beat_t is not None else None)
             have = {(tg, c): t["done"] + t["last"] for (tg, c), t in self.targets.items()}
-            previous = self._beat_seen
             self._beat_seen = have
             return [text for key, text in rows if previous.get(key) != have[key]]
 
