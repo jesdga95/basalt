@@ -128,11 +128,10 @@ public:
     /// and the prompt tokens they cover into `tokens`, and stops counting.  False when counting was not started.
     bool route_hist_take(std::vector<uint32_t>& out, int64_t& tokens);
 
-    /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
-    /// rows per layer).  Allocates the peer's buffers for chunks of up to init's `chunk` tokens: the routed-only
+    /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk.  Allocates the peer's buffers for chunks of up to init's `chunk` tokens: the routed-only
     /// chunks, and the streamed ones up to a fixed size on the FP4 experts (the same bits as this GPU's), with the rows
     /// crossing through host memory.
-    bool set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, std::string& err);
+    bool set_peer(core::PeerExperts* peer, bool streamed_share, std::string& err);
     /// The bytes `set_peer` takes on the peer card for chunks of up to `chunk` tokens (0: no peer share); the peer tier
     /// leaves them free when it sizes itself.
     static uint64_t peer_bytes(int64_t chunk, bool streamed_share);

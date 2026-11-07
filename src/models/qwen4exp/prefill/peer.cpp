@@ -77,14 +77,13 @@ static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& 
     }
 }
 
-static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf,
+static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t tf,
                       std::unique_ptr<PeerPrefill>& out, std::string& err) {
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
     pp->T_max = std::min<int64_t>(T_max, stream_all_min() - 1);
     pp->T_fp4 = tf;
     const int64_t Tp = std::max(pp->T_max, tf);   // the longest chunk the peer takes
-    pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, Tp * K));
     const MmqPlan& mp = mmq_plan();
     cudaGetDevice(&pp->prim);
     if (cudaEventCreateWithFlags(&pp->ev_in, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
@@ -162,7 +161,7 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share) {
     return sum;
 }
 
-bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, std::string& err) {
+bool Prefill::set_peer(core::PeerExperts* peer, bool streamed_share, std::string& err) {
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
     // The peer takes the rows of the routed-only chunks (below stream_all_min()): the activations and
@@ -173,11 +172,11 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
                               ? 0 : std::min<int64_t>(m.T_max, kPeerFp4Tokens);
     std::unique_ptr<PeerPrefill> pp;
     const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
-    bool ok = make_peer(peer, t_routed, cap_rows, t_fp4 >= stream_all_min() ? t_fp4 : 0, pp, err);
+    bool ok = make_peer(peer, t_routed, t_fp4 >= stream_all_min() ? t_fp4 : 0, pp, err);
     if (!ok && t_fp4 >= stream_all_min()) {   // the routed-only chunks alone
         pp.reset();
         err.clear();
-        ok = make_peer(peer, t_routed, cap_rows, 0, pp, err);
+        ok = make_peer(peer, t_routed, 0, pp, err);
     }
     if (!ok) return false;
     m.pp = std::move(pp);
