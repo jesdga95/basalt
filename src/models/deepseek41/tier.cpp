@@ -116,30 +116,37 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
 
     // The prompt and image buffers first, so the free memory the tier reads already lacks them. The ring of file reads
     // comes only when experts may stay in the file.
-    auto available = [] {
-        core::detail::HostMemory hm;
-        return core::detail::host_available_memory(hm) ? hm.available : 0;
-    };
+    core::detail::HostMemory hm;
+    auto available = [&] { return core::detail::host_available_memory(hm) ? hm.available : 0; };
     const uint64_t ram_reserve = platform::ram_reserve();
-    const int peer_homes = std::min(peer_slots, n_expert_);
     if (!host_.open(m_, 0, m_.sessions(), m_.tiers().vision, err))
         return false;
     uint64_t avail = available();
-    auto ram_in = [&] {   // places per layer above the reserve, less the spare each layer keeps
-        const uint64_t places = core::ram_tier_room(avail, ram_reserve, true) / one_each_ram;
-        int slots = (int) std::min<uint64_t>(places > 0 ? places - 1 : 0, (uint64_t) n_expert_);
+    // places per layer above the reserve, less the spare each layer keeps, in `bytes` of RAM
+    auto places_in = [&](uint64_t bytes) {
+        const uint64_t places = core::ram_tier_room(bytes, ram_reserve, true) / one_each_ram;
+        return places > 0 ? places - 1 : 0;
+    };
+    const bool ram_given = m_.tiers().resident_budget > 0 || m_.diag_tier_ram() >= 0;
+    auto ram_in = [&] {
+        int slots = (int) std::min<uint64_t>(places_in(avail), (uint64_t) n_expert_);
         if (m_.tiers().resident_budget > 0)
             slots = std::min(slots, (int) std::min<uint64_t>(m_.tiers().resident_budget / one_each_ram, (uint64_t) n_expert_));
         if (m_.diag_tier_ram() >= 0) slots = std::min(m_.diag_tier_ram(), n_expert_);
         return slots;
     };
     int ram_slots = ram_in();
-    if (ram_slots < n_expert_ - peer_homes) {
+    // what the machine can give the tier whatever else runs: its RAM (or the container's) less the engine's own buffers.
+    // The home-versus-copies choice reads this alone, so the cache state at start never moves it.
+    const uint64_t total = std::min(platform::total_physical_memory(), hm.cgroup_limit);
+    const int ram_cap = ram_given ? -1 : (int) std::min<uint64_t>(places_in(total > host_.bytes() ? total - host_.bytes() : 0), 1u << 20);
+    homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
+    if (homes_.file > 0) {   // experts stay in the file: the ring of its reads takes RAM before the tier is sized
         if (!host_.set_ring(prefillp::kRingPieces, err)) return false;
         avail = available();
         ram_slots = ram_in();
+        homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
     }
-    homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, -1);
     const uint64_t ram_floor =
         ram_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
     if (homes_.peer == 0) {
