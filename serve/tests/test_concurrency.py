@@ -52,7 +52,7 @@ class Slots(unittest.TestCase):
         self.engine = self.Engine(tok, ["t</think>\n\n" + scripts[w] for w in words], batch=n or self.N, delay_s=delay,
                                  route=lambda ids: next((i for i, w in enumerate(words)
                                                          if w.encode() in bytes(x & 255 for x in ids)), 0), **kw)
-        self.svc = Service(self.engine, tok, ChatTemplate(TEMPLATE))
+        self.svc = Service(self.engine, tok, ChatTemplate.from_file(TEMPLATE))
         self.httpd = serve(self.svc, port=0)
         self.port = self.httpd.server_address[1]
         self.addCleanup(self.httpd.server_close)

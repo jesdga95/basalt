@@ -31,7 +31,7 @@ class ChunkedBody(unittest.TestCase):
     def setUpClass(cls):
         tok = ByteTokenizer()
         cls.engine = MockEngine(tok, "hello there", max_context=4096)
-        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.svc = Service(cls.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         cls.httpd = serve(cls.svc, port=0)
         cls.port = cls.httpd.server_address[1]
 

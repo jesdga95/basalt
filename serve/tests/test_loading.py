@@ -65,7 +65,7 @@ class Loading(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.engine = GatedEngine(tok)
-        self.svc = Service(self.engine, tok, ChatTemplate(TEMPLATE))
+        self.svc = Service(self.engine, tok, ChatTemplate.from_file(TEMPLATE))
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 

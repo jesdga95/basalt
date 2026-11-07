@@ -25,7 +25,7 @@ class Stopping(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.engine = ResidentEngine(tok)
-        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc = Service(self.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 

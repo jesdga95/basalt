@@ -9,7 +9,7 @@ from serve.api.responses import request_tools
 from serve.frontend import ChatTemplate, OutputParser, anthropic_to_messages, openai_to_messages
 
 ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE = ChatTemplate(ROOT / "serve/chat_template.jinja")
+TEMPLATE = ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")
 NAMES = ["read", "write", "edit", "bash", "grep", "glob", "fetch", "todo", "task", "ctx7"]
 
 

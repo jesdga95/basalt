@@ -51,7 +51,7 @@ class Structured(unittest.TestCase):
     def setUp(self):
         self.tok = ByteTokenizer()
         self.engine = MockEngine(self.tok, json.dumps(STORY), max_context=16384)
-        self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).resolve().parents[1] / "chat_template.jinja"),
+        self.svc = Service(self.engine, self.tok, ChatTemplate.from_file(Path(__file__).resolve().parents[1] / "chat_template.jinja"),
                            grammar=True)
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"

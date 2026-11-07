@@ -244,7 +244,7 @@ class DeepSeek41(Dialect):
     forced_call_ends_reply = True
     nothink_lead = CALLS_GAP
 
-    def template(self, path):
+    def template(self, source):
         return DeepseekTemplate()
 
     def parser(self, thinking, tools, stream_tools=True):

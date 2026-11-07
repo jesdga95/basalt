@@ -48,7 +48,7 @@ class FatalRecovery(unittest.TestCase):
         e=ProcessEngine(str(self.script),['--state',str(self.root/'state'),'--mode',mode])
         self.addCleanup(e.close);return e
     def service(self,e):
-        return Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).resolve().parents[1] / "chat_template.jinja"))
+        return Service(e,ByteTokenizer(),ChatTemplate.from_file(Path(__file__).resolve().parents[1] / "chat_template.jinja"))
     def wait_dead(self,e):
         end=time.monotonic()+2
         while e.alive() and time.monotonic()<end:time.sleep(.01)

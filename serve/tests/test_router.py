@@ -82,7 +82,7 @@ class Base(unittest.TestCase):
         tok = ByteTokenizer()
         self.events = []
         self.engines = {n: SwapEngine(tok, n, self.events) for n in self.NAMES}
-        self.svcs = {n: Service(e, tok, ChatTemplate(TEMPLATE), model_name=n) for n, e in self.engines.items()}
+        self.svcs = {n: Service(e, tok, ChatTemplate.from_file(TEMPLATE), model_name=n) for n, e in self.engines.items()}
         for e in self.engines.values():
             e.model_path = f"/packs/{e.name}.basalt"
         self.router = Router(list(self.svcs.values()))
@@ -577,7 +577,7 @@ class ThirdModel(Base):
 class OneModel(unittest.TestCase):
     def test_a_lone_service_never_queues(self):
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "Hello."), tok, ChatTemplate(TEMPLATE), model_name="M")
+        svc = Service(MockEngine(tok, "Hello."), tok, ChatTemplate.from_file(TEMPLATE), model_name="M")
         router = Router([svc])
         turn = router.join(svc)
         self.assertTrue(router.wait(turn, 0))
@@ -673,7 +673,7 @@ class Names(unittest.TestCase):
     def service(self, tok, name, args=()):
         engine = MockEngine(tok, "x")
         engine.spawn = (None, list(args))
-        return Service(engine, tok, ChatTemplate(TEMPLATE), model_name=name)
+        return Service(engine, tok, ChatTemplate.from_file(TEMPLATE), model_name=name)
 
     def test_two_entries_cannot_share_a_name_or_a_conversation_folder(self):
         import io

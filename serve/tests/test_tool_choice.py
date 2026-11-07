@@ -17,7 +17,7 @@ from serve.service import REASONING_CLOSE, Service  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE = ChatTemplate(ROOT / "serve/chat_template.jinja")
+TEMPLATE = ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")
 ARGS = "<parameter=q>\n2+2\n</parameter>\n</function>\n</tool_call>"
 
 

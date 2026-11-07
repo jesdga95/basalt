@@ -28,7 +28,7 @@ class ModelName(unittest.TestCase):
         tok = ByteTokenizer()
         engine = MockEngine(tok, ["Hello."], max_context=4096)
         engine.model_path = "/packs/" + FILE
-        self.httpd = serve(Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), model_name=ALIAS),
+        self.httpd = serve(Service(engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), model_name=ALIAS),
                            port=0)
         self.port = self.httpd.server_address[1]
 
