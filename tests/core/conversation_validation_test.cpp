@@ -1,8 +1,8 @@
 // Host-only validation fixtures. CUDA is linked but must never be initialized:
 // invalid restores must return before the first CUDA call or destination write.
 #include <algorithm>
-#include "basalt/core/conversation_snapshot.hpp"
-#include "basalt/kernels/kv_q4.hpp"
+#include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -97,9 +97,9 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         c.ids.resize(tokens);
         for (size_t i = 0; i < tokens; ++i) c.ids[i] = (int32_t) i + 1;
         c.imgs = {{1, 44}};
-        c.gdn.resize(z.gdn, 13); c.ple.resize(ple ? z.ple : 0, 13);
-        c.tails.resize(g.n_qsa_layers() * z.tail, 13); c.dead.resize(g.n_qsa_layers() * z.dead, 13);
-        c.block_pos.resize(g.n_qsa_layers() * z.block_pos, 13);
+        c.state_a.resize(z.gdn, 13); c.state_b.resize(ple ? z.ple : 0, 13);
+        c.state_c.resize(g.n_qsa_layers() * z.tail, 13); c.state_d.resize(g.n_qsa_layers() * z.dead, 13);
+        c.state_e.resize(g.n_qsa_layers() * z.block_pos, 13);
         return c;
     };
     image.live = checkpoint(9); image.checkpoints.push_back(checkpoint(5));
@@ -127,18 +127,18 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     reject([](auto& s){s.live.stage_parts.emplace_back();}, "layer-split live state rejected before writes");
     reject([](auto& s){s.checkpoints[0].stage_parts.emplace_back();}, "layer-split checkpoint rejected before writes");
     reject([](auto& s){s.kv.pop_back();}, "missing KV layer rejected");
-    reject([](auto& s){s.live.gdn.pop_back();}, "bad live recurrence rejected");
-    reject([](auto& s){s.checkpoints.back().gdn.pop_back();}, "bad retained checkpoint rejected");
+    reject([](auto& s){s.live.state_a.pop_back();}, "bad live recurrence rejected");
+    reject([](auto& s){s.checkpoints.back().state_a.pop_back();}, "bad retained checkpoint rejected");
     reject([](auto& s){s.checkpoints.back().ids[0] = 99;}, "foreign checkpoint prefix rejected");
     reject([](auto& s){s.checkpoints.back().imgs[0].hash++;}, "foreign checkpoint image rejected");
     reject([](auto& s){s.live.imgs[0].start = -1;}, "negative image position rejected");
     reject([](auto& s){s.live.ids[0] = -1;}, "negative live token rejected");
-    reject([](auto& s){s.live.ple.push_back(0);}, "PLE size/enabled mismatch rejected");
-    reject([](auto& s){s.live.tails.push_back(0);}, "tail size/zero-QSA mismatch rejected");
+    reject([](auto& s){s.live.state_b.push_back(0);}, "PLE size/enabled mismatch rejected");
+    reject([](auto& s){s.live.state_c.push_back(0);}, "tail size/zero-QSA mismatch rejected");
     if (!zero_qsa) {
         reject([](auto& s){s.kv[1].pooled.pop_back();}, "late indexer spare row corruption rejected");
-        reject([](auto& s){s.live.dead.pop_back();}, "missing indexer spare key rejected");
-        reject([](auto& s){s.live.block_pos.pop_back();}, "missing indexer metadata rejected");
+        reject([](auto& s){s.live.state_d.pop_back();}, "missing indexer spare key rejected");
+        reject([](auto& s){s.live.state_e.pop_back();}, "missing indexer metadata rejected");
         ss.qsa_states = nullptr;
         check(!conversation_snapshot_validate(image,ss,g,draft.st,error), "missing QSA targets rejected");
         ss.qsa_states = layers.data();
@@ -151,8 +151,8 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
               "carved session sizes cover the owned rows only");
         check(!conversation_checkpoint_validate(image.live,stage,g,error), "whole-model checkpoint rejected by a carve");
         ConversationCheckpoint part = image.live;
-        part.gdn.resize(zs.gdn); part.tails.resize(zs.tail); part.dead.resize(zs.dead);
-        part.block_pos.resize(zs.block_pos);
+        part.state_a.resize(zs.gdn); part.state_c.resize(zs.tail); part.state_d.resize(zs.dead);
+        part.state_e.resize(zs.block_pos);
         check(conversation_checkpoint_validate(part,stage,g,error), "carve-sized checkpoint validates");
         check(!conversation_snapshot_validate(image,stage,g,draft.st,error), "whole-model snapshot rejected by a carve");
         stage.qsa_alloc = 2;
@@ -193,7 +193,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     check(conversation_snapshot_restore(image,ss,g,draft.st,error)==ConversationRestore::restored,
           "injected host transfer backend completes a valid restore");
     auto same=[](const auto& a,const auto& b){ return std::equal(a.begin(),a.end(),b.begin(),b.end()); };
-    check(same(gdn,image.live.gdn) && same(history,image.live.ple) && ss.ple_prev[0]==8 && ss.ple_prev[1]==9,
+    check(same(gdn,image.live.state_a) && same(history,image.live.state_b) && ss.ple_prev[0]==8 && ss.ple_prev[1]==9,
           "successful restore publishes correct running state and PLE window");
     uint64_t fingerprint = 0;
     check(conversation_kv_verify(image.kv.back(),draft.st,g,9,false,fingerprint,error), "read-back verifies complete draft payload");
@@ -215,7 +215,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     if (!saved_incrementally) std::fprintf(stderr,"capture error: %s\n",error.c_str());
     check(saved_incrementally, "incremental capture through host backend");
     check(reused > 0 && copied_bytes + reused == full_copies, "reused byte count measures transfers actually omitted");
-    check(incremental.bytes() <= peak && incremental.live.gdn == full.live.gdn, "running state refreshed within admitted allocation");
+    check(incremental.bytes() <= peak && incremental.live.state_a == full.live.state_a, "running state refreshed within admitted allocation");
     for (size_t i=0;i<full.kv.size();++i)
         check(incremental.kv[i].k==full.kv[i].k && incremental.kv[i].v==full.kv[i].v &&
               incremental.kv[i].k_scale==full.kv[i].k_scale && incremental.kv[i].v_scale==full.kv[i].v_scale &&

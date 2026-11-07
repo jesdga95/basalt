@@ -93,9 +93,9 @@ cudaError_t device_mem_info(size_t* free_b, size_t* total_b) {
     } else {
         const uint64_t ram = basalt::platform::total_physical_memory();
         const uint64_t avail = basalt::platform::available_memory();
-        const uint64_t margin = basalt::platform::ram_margin();
+        const uint64_t reserve = basalt::platform::ram_reserve();
         if (ram > 0) *total_b = (size_t) std::min<uint64_t>(*total_b, ram);
-        if (avail > 0) *free_b = (size_t) std::min<uint64_t>(*free_b, avail > margin ? avail - margin : 0);
+        if (avail > 0) *free_b = (size_t) std::min<uint64_t>(*free_b, avail > reserve ? avail - reserve : 0);
     }
     *free_b = std::min(*free_b, *total_b);
     return e;

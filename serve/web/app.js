@@ -138,13 +138,20 @@ function drawSide(hw, st, hist, eng, r) {
     + sbRow("Disk read", num(hw.disk_read_mb) ? hw.disk_read_mb.toFixed(1) : "-", "MB/s")
     + (st.driver ? `<div class="sb-foot">Driver ${esc(st.driver)}${st.cuda ? ` · CUDA ${esc(st.cuda)}` : ""}</div>` : ""));
 
-  // the tier split of the last request's routed lookups; the peer tier shows only when the engine reports it
+  // the tier split of the last request's routed lookups; the peer tier shows only when the engine reports it, the SSD
+  // tier and the warning only while experts are read from the SSD
   const peer = r && num(r.pcie_share) ? r.pcie_share : null, hit = r && num(r.hit_rate) ? r.hit_rate : null;
+  const spill = eng.spill, ssd = spill ? (r && num(r.ssd_share) ? r.ssd_share : hit == null ? null : 0) : 0;
   const tiers = [["VRAM", "var(--fg)", hit == null ? null : hit * (1 - (peer || 0))]];
   if (peer != null) tiers.push(["Peer", "var(--fg-3)", peer]);
-  tiers.push(["CPU", "var(--basalt-500)", hit == null ? null : (1 - hit) * (1 - (peer || 0))]);
+  tiers.push(["CPU", "var(--basalt-500)", hit == null ? null : Math.max(0, (1 - hit) * (1 - (peer || 0)) - (ssd || 0))]);
+  if (spill) tiers.push(["SSD", "var(--warn)", ssd]);
+  $(".sb-exp").classList.toggle("spill", !!spill);
+  text($("#exp-note"), spill ? "SSD in use" : "Last request");
+  const gb = spill ? `${(spill.bytes / 1024 ** 3).toFixed(1)} GiB` : "";
   html($("#experts"), `<div class="sb-stack" aria-hidden="true">${tiers.map(t => `<i style="width:${((t[2] || 0) * 100).toFixed(1)}%;background:${t[1]}"></i>`).join("")}</div>`
-    + `<div class="sb-leg">${tiers.map(t => `<div style="--c:${t[1]}"><span>${t[0]}</span><b>${t[2] == null ? "-" : `${(t[2] * 100).toFixed(1)}%`}</b></div>`).join("")}</div>`);
+    + `<div class="sb-leg${spill ? " q" : ""}">${tiers.map(t => `<div style="--c:${t[1]}"><span>${t[0]}</span><b>${t[2] == null ? "-" : `${(t[2] * 100).toFixed(1)}%`}</b></div>`).join("")}</div>`
+    + (spill ? `<div class="sb-note"><span><b>${spill.experts} experts on SSD (${gb})</b> ·</span> <span>free ${gb} RAM</span></div>` : ""));
 }
 
 /* ---- Speed ---- */
@@ -213,7 +220,7 @@ $("#chips").addEventListener("click", e => {
   draw();
 });
 
-/* ---- main card: Slots | Requests | Queue ---- */
+/* ---- main card: Slots (Context for one slot) | Requests | Queue ---- */
 let tab = sessionStorage.getItem("basalt.tab") || "slots";
 $("#tabs").addEventListener("click", e => {
   const b = e.target.closest("button[data-t]"); if (!b) return;
@@ -271,17 +278,112 @@ function queuePane(live) {
     + q.map(r => `<tr><td>${esc(API[r.api] || r.api || "-")}</td><td class="r">${num(r.prompt_tokens) ? fmt(r.prompt_tokens) : "-"}</td><td class="r">${mss(r.waited_s || 0)}</td></tr>`).join("")
     + `</tbody></table>`;
 }
+/* ---- Context: one slot's window, used against free, and the tokens of each recent request ---- */
+const kc = n => n >= 1048576 ? `${n / 1048576 >= 10 ? Math.round(n / 1048576) : +(n / 1048576).toFixed(1)}M` : kt(n).replace("k", "K");
+const pctOf = (a, b) => b ? Math.round(a / b * 100) : 0;
+// stacked columns, one per recent request, oldest first: prompt read (the uncached part) / generated, scaled to the largest
+function ctxHistory(reqs) {
+  const h = reqs.slice(0, 24).reverse().map(r => { return { p: (r.prompt_tokens || 0) - clamp(r.reused || 0, 0, r.prompt_tokens || 0), g: r.output_tokens || 0 }; });
+  if (!h.length) return "";
+  const W = 480, H = 100, step = W / h.length, bw = step * .68;
+  const top = nice(Math.max(1, ...h.map(r => r.p + r.g)) / 1.15);
+  let g = "";
+  h.forEach((r, i) => {
+    let y = H; const x = i * step + (step - bw) / 2;
+    [["p", "rgba(154, 164, 173, .5)"], ["g", "var(--accent)"]].forEach(([k, col]) => {
+      const hh = r[k] / top * H; y -= hh;
+      g += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${hh.toFixed(1)}" fill="${col}"/>`;
+    });
+  });
+  return `<div class="cx-hist"><div class="hh"><b>Tokens per request</b><span>Last ${h.length} requests</span></div><div class="cx-chart">`
+    + `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Tokens per request">`
+    + `<line x1="0" x2="${W}" y1="${H}" y2="${H}" stroke="var(--line)"/><line x1="0" x2="${W}" y1="${H / 2}" y2="${H / 2}" stroke="var(--line-soft)" stroke-dasharray="2 4"/>${g}</svg>`
+    + `<span class="tk" style="top:0">${kc(top)}</span><span class="tk" style="top:50%">${kc(top / 2)}</span><span class="tk" style="top:100%">0</span>`
+    + `<div class="xl"><span>Oldest</span><span>Latest</span></div></div></div>`;
+}
+function contextPane(s, reqs, eng) {
+  const n = s.n_ctx || eng.context || 0, used = s.ctx_used || 0;
+  return `<div class="cx1"><div class="cx-head"><div class="v">${kc(used)}<small>/ ${kc(n)} · ${pctOf(used, n)}%</small></div></div>`
+    + `<div class="cx-bar"><i style="width:${n ? clamp(used / n * 100, 0, 100).toFixed(2) : 0}%"></i></div>`
+    + `<div class="cx-scale"><span>0</span><span>${kc(n / 2)}</span><span>${kc(n)}</span></div>`
+    + ctxHistory(reqs) + `</div>`;
+}
 function drawMain(live, hist, reqs, slots, total) {
   const multi = total > 1, n = live.queued || 0;
-  const T = (multi ? [["slots", "Slots"]] : []).concat([["req", "Requests"], ["queue", `Queue (${n})`]]);
+  const T = (multi ? [["slots", "Slots"]] : reqs.length || (slots[0] && slots[0].ctx_used > 0) ? [["ctx", "Context"]] : []).concat([["req", "Requests"], ["queue", `Queue (${n})`]]);
   const cur = T.some(t => t[0] === tab) ? tab : T[0][0];
   html($("#tabs"), T.map(t => `<button type="button" role="tab" data-t="${t[0]}" aria-selected="${t[0] === cur}">${t[1]}</button>`).join(""));
   let h;
   if (cur === "slots") {
     const series = slots.map((_, k) => tail((hist.slot_tok_s || [])[k]));
     h = slotRows(slots, series);
-  } else h = cur === "req" ? requestsPane(live, reqs, multi) : queuePane(live);
+  } else if (cur === "ctx") h = contextPane(slots[0] || {}, reqs, M.engine || {});
+  else h = cur === "req" ? requestsPane(live, reqs, multi) : queuePane(live);
   html($("#pane"), h);
+}
+
+/* ---- several models: the picker names the model and choosing an unloaded one loads it ---- */
+const WORD = { loaded: "Loaded", unloaded: "Load", loading: "Loading", failed: "Failed" };
+const rowWord = m => m.asleep && m.status.value === "loaded" ? "Asleep" : WORD[m.status.value] || m.status.value;
+function setPicker(open) {
+  const root = $("#models");
+  open ? root.setAttribute("data-open", "") : root.removeAttribute("data-open");
+  root.firstElementChild.setAttribute("aria-expanded", String(open));
+}
+function loadModel(id) {
+  fetch("v1/load", { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+                     body: JSON.stringify({ model: id }) }).catch(() => {});
+}
+function buildPicker(root) {
+  const btn = document.createElement("button"); btn.type = "button"; btn.setAttribute("aria-haspopup", "true"); btn.setAttribute("aria-expanded", "false");
+  btn.append(document.createElement("span"));
+  const pop = document.createElement("div"); pop.className = "pop"; pop.setAttribute("role", "menu");
+  root.append(btn, pop);
+  const live = () => [...pop.children].filter(o => !o.disabled);
+  btn.onclick = () => {
+    const on = !root.hasAttribute("data-open");
+    setPicker(on);
+    if (on) (pop.querySelector('[aria-checked="true"]:not(:disabled)') || live()[0])?.focus();
+  };
+  pop.onclick = e => {
+    const o = e.target.closest(".opt"); if (!o || o.disabled) return;
+    setPicker(false); btn.focus();
+    if (o.classList.contains("go")) loadModel(o.dataset.v);
+  };
+  root.onkeydown = e => {
+    const opts = live(), k = opts.indexOf(document.activeElement);
+    if (e.key === "Escape") { setPicker(false); btn.focus(); }
+    else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!root.hasAttribute("data-open")) { setPicker(true); (pop.querySelector('[aria-checked="true"]:not(:disabled)') || opts[0])?.focus(); return; }
+      opts[(k + (e.key === "ArrowDown" ? 1 : -1) + opts.length) % opts.length]?.focus();
+    }
+  };
+  document.addEventListener("click", e => { if (!e.target.closest("#models")) setPicker(false); });
+}
+function drawModels(models, shown) {
+  const root = $("#models"), many = models.length > 1;
+  root.hidden = !many; $("#crumb-sep").hidden = !many; $("#model").hidden = many;
+  if (!many) return;
+  if (!root.firstElementChild) buildPicker(root);
+  const busy = models.some(m => m.status.value === "loading");
+  const name = (models.find(m => m.status.value === "loading") || {}).id || shown || "";
+  text(root.firstElementChild.firstElementChild, name);
+  const pop = root.querySelector(".pop"), sig = models.map(m => `${m.id}|${rowWord(m)}`).join() + "|" + name;
+  if (pop.dataset.sig === sig) return;
+  pop.dataset.sig = sig;
+  const focused = pop.contains(document.activeElement) ? document.activeElement.dataset.v : null;
+  pop.replaceChildren(...models.map(m => {
+    const b = document.createElement("button"); b.type = "button"; b.setAttribute("role", "menuitemradio");
+    const v = m.status.value, go = v === "unloaded" || v === "failed";
+    b.className = go ? "opt go" : "opt"; b.dataset.v = m.id; b.disabled = busy;
+    b.setAttribute("aria-checked", String(m.id === name));
+    const n = document.createElement("b"), w = document.createElement("span");
+    n.textContent = m.id; w.textContent = rowWord(m);
+    b.append(n, w);
+    return b;
+  }));
+  if (focused) [...pop.children].find(b => b.dataset.v === focused && !b.disabled)?.focus();
 }
 
 /* ---- the whole page ---- */
@@ -290,12 +392,15 @@ function draw() {
   const live = M.live || {}, eng = M.engine || {}, hist = M.history || {}, reqs = M.requests || [];
   const total = (live.slots || {}).total || 1, slots = M.slots || [];
   const name = (live.state || "idle")[0].toUpperCase() + (live.state || "idle").slice(1);
-  const ld = live.state === "loading" ? live.load || {} : null;
-  const gib = ld ? Object.entries(ld.gib || {}).map(([k, v]) => `${k} ${v.toFixed(1)} GiB`).join(" · ") : "";
-  setState(live.state || "idle", ld ? ld.kind === "wake" ? "Waking up" : `Loading weights${num(ld.percent) ? ` · ${ld.percent}%` : ""}`
-    : live.queued > 0 ? `${name} · ${live.queued} queued` : name);
-  text($("#detail"), gib); $("#detail").hidden = !gib;
+  const ld = live.state === "loading" ? live.load || {} : null, weights = ld && ld.kind !== "wake";
+  const models = M.models || [];
+  const none = models.length > 0 && !models.some(m => m.status.value === "loaded" || m.status.value === "loading");
+  setState(live.state || "idle", weights ? "Loading" : ld ? "Waking up" : live.queued > 0 ? `${name} · ${live.queued} queued` : none ? models.some(m => m.status.value === "failed") ? "Load failed" : "No model" : name);
+  const pct = weights && num(ld.percent) ? ld.percent : null;
+  text($("#pct"), pct === null ? "" : `${pct}%`); $("#pct").hidden = pct === null;
+  $("#pbar").hidden = !weights; $("#pbar").firstElementChild.style.width = `${pct || 0}%`;
   text($("#model"), eng.model || "");
+  drawModels(models, eng.model);
   drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);
   drawHero(live, hist, reqs, M.best || {}, slots, total);
   drawMain(live, hist, reqs, slots, total);

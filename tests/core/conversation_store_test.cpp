@@ -5,7 +5,7 @@
 // live end is a reply past it, the directory kept to its budget, and only a chat's root and last three turn-end states
 // written (a cut at a state not written goes back to the nearest one before it, refcounts of a shared root kept).
 #include "basalt/core/conversation_store.hpp"
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/system.hpp"
 
@@ -41,11 +41,11 @@ void fill(ConversationBuffer& b, size_t n) {
 ConversationCheckpoint state(const std::vector<int32_t>& ids, size_t len) {
     ConversationCheckpoint c;
     c.ids.assign(ids.begin(), ids.begin() + (std::ptrdiff_t) len);
-    fill(c.gdn, (3u << 20) + 123);
-    fill(c.ple, 1024);
-    fill(c.tails, 12 * 3 * 512);
-    fill(c.dead, 12 * 512);
-    fill(c.block_pos, 12 * 4);
+    fill(c.state_a, (3u << 20) + 123);
+    fill(c.state_b, 1024);
+    fill(c.state_c, 12 * 3 * 512);
+    fill(c.state_d, 12 * 512);
+    fill(c.state_e, 12 * 4);
     return c;
 }
 
@@ -97,7 +97,7 @@ uint64_t dir_bytes(const std::string& dir, size_t* count = nullptr) {
 }
 
 bool same_state(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
-    return a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails && a.dead == b.dead && a.block_pos == b.block_pos;
+    return a.state_a == b.state_a && a.state_b == b.state_b && a.state_c == b.state_c && a.state_d == b.state_d && a.state_e == b.state_e;
 }
 
 // the checks every cut image passes: live = the state at `at`, K/V the prefix up to it
@@ -140,7 +140,7 @@ SavedConversation chat(const std::vector<int32_t>& ids, const std::vector<std::p
 }
 
 void copy_state_bytes(ConversationCheckpoint& to, const ConversationCheckpoint& from) {
-    to.gdn = from.gdn; to.ple = from.ple; to.tails = from.tails; to.dead = from.dead; to.block_pos = from.block_pos;
+    to.state_a = from.state_a; to.state_b = from.state_b; to.state_c = from.state_c; to.state_d = from.state_d; to.state_e = from.state_e;
 }
 
 // state files in `dir` ("<identity>-s<key>.bcs")
@@ -160,6 +160,75 @@ void remove_dir(const std::string& dir) {
 }
 }  // namespace
 
+// A model with compressed caches: its layers hold rows of `page_size` cells, no scales or pooled rows, and only one
+// part of running state.
+void compressed_rows(const std::string& dir) {
+    constexpr uint64_t kLatentRow = 1024, kKeyRow = 256;
+    std::vector<int32_t> ids(9000);
+    for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t) (i * 11 + 5);
+    const auto running = [&](size_t len) {
+        ConversationCheckpoint c;
+        c.ids.assign(ids.begin(), ids.begin() + (std::ptrdiff_t) len);
+        fill(c.state_a, 1u << 20);
+        return c;
+    };
+    SavedConversation src;
+    src.live = running(ids.size());
+    src.checkpoints.push_back(running(4097));
+    src.checkpoints.back().source = ConversationCheckpoint::kRoot;
+    src.checkpoints.push_back(running(5000));
+    for (int ratio : {1, 2, 2, 1}) {
+        ConversationKv k;
+        const int64_t rows = (int64_t) ids.size() / ratio + 1;
+        k.page_size = ratio;
+        k.cells = rows * ratio;
+        fill(k.k, (size_t) rows * kLatentRow);
+        fill(k.v, (size_t) rows * kKeyRow);
+        src.kv.push_back(std::move(k));
+    }
+    const auto check_at = [&](const SavedConversation& got, int64_t at, const ConversationCheckpoint& c) {
+        CHECK((int64_t) got.live.ids.size() == at);
+        CHECK(got.live.state_a == c.state_a);
+        CHECK(got.kv.size() == src.kv.size());
+        for (size_t i = 0; i < got.kv.size() && i < src.kv.size(); ++i) {
+            const int64_t r = src.kv[i].page_size, rows = (at + r - 1) / r;
+            CHECK(got.kv[i].page_size == r);
+            CHECK(got.kv[i].cells == rows * r);
+            CHECK(got.kv[i].k.size() == (size_t) rows * kLatentRow);
+            CHECK(got.kv[i].v.size() == (size_t) rows * kKeyRow);
+            CHECK(prefix_of(got.kv[i].k, src.kv[i].k));
+            CHECK(prefix_of(got.kv[i].v, src.kv[i].v));
+        }
+    };
+    std::string err;
+    {
+        ConversationStore st;
+        st.set_row_cells(1);
+        CHECK(st.open(dir, 77, 1ull << 30, err));
+        SavedConversation copy = src;
+        CHECK(st.put(std::move(copy), 1ull << 30));
+        st.flush();
+        CHECK(st.stats().written == 1);
+    }
+    ConversationStore st;   // a restart: only the files
+    st.set_row_cells(1);
+    CHECK(st.open(dir, 77, 1ull << 30, err));
+    std::vector<int32_t> p(ids.begin(), ids.begin() + 4200);
+    p.push_back(-5);
+    auto m = st.best(p.data(), p.size(), {}, true);
+    CHECK(m.tokens == 4097);
+    SavedConversation got;
+    CHECK(st.load(m, got, err));   // odd: the last row of a ratio 2 layer is only half under the match
+    check_at(got, 4097, src.checkpoints[0]);
+    p.assign(ids.begin(), ids.begin() + 7000);
+    p.push_back(-5);
+    m = st.best(p.data(), p.size(), {}, true);
+    CHECK(m.tokens == 5000);
+    SavedConversation got2;
+    CHECK(st.load(m, got2, err));
+    check_at(got2, 5000, src.checkpoints[1]);
+}
+
 int main() {
     const std::string dir = basalt::platform::temp_dir() + "/basalt-store-test-" +
                             std::to_string((long long) basalt::platform::process_id());
@@ -173,6 +242,7 @@ int main() {
     const uint64_t id = 42;
     {
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         CHECK(st.open(dir, id, 1ull << 30, err));
         SavedConversation copy = src;
@@ -206,6 +276,7 @@ int main() {
     {
         // a fresh store on the same directory: the index comes from the file (as after a restart)
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         CHECK(st.open(dir, id, 1ull << 30, err));
         CHECK(st.stats().files == 1);
@@ -218,6 +289,7 @@ int main() {
         check_cut(got, src, 10000, src.live);
         // another identity sees nothing
         ConversationStore other;
+        other.set_row_cells(4);
         CHECK(other.open(dir, id + 1, 1ull << 30, err));
         CHECK(other.best(p.data(), p.size(), {}, true).tokens == 0);
     }
@@ -225,6 +297,7 @@ int main() {
         // the same conversation a turn on, with the bytes it had: only its new state and its tail are written; its live
         // end a reply past the turn's checkpoint, it is stored as of that checkpoint
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         CHECK(st.open(dir, id, 1ull << 30, err));
         std::vector<int32_t> ids2 = ids;
@@ -232,11 +305,11 @@ int main() {
         SavedConversation next = src;
         next.live = state(ids2, ids2.size());
         next.checkpoints.push_back(state(ids2, ids.size()));
-        next.checkpoints.back().gdn = src.live.gdn;   // the turn's checkpoint: the state the conversation had
-        next.checkpoints.back().ple = src.live.ple;
-        next.checkpoints.back().tails = src.live.tails;
-        next.checkpoints.back().dead = src.live.dead;
-        next.checkpoints.back().block_pos = src.live.block_pos;
+        next.checkpoints.back().state_a = src.live.state_a;   // the turn's checkpoint: the state the conversation had
+        next.checkpoints.back().state_b = src.live.state_b;
+        next.checkpoints.back().state_c = src.live.state_c;
+        next.checkpoints.back().state_d = src.live.state_d;
+        next.checkpoints.back().state_e = src.live.state_e;
         next.live.ids = ids2;
         SavedConversation longer = image(ids2, {});
         for (size_t i = 0; i < next.kv.size(); ++i) {   // the old cells' bytes, then new ones
@@ -258,7 +331,7 @@ int main() {
         const auto s = st.stats();
         CHECK(s.files == 1 && s.written == 1);
         // the turn's checkpoint and its tail; no live state, no block and no old checkpoint again
-        CHECK(s.written_bytes < (uint64_t) (keep.live.gdn.size() + 3 * (2u << 20)));
+        CHECK(s.written_bytes < (uint64_t) (keep.live.state_a.size() + 3 * (2u << 20)));
         CHECK(dir_bytes(dir) < before + s.written_bytes);   // the old conversation file is gone
         std::vector<int32_t> p = ids2;
         p.push_back(1);
@@ -283,6 +356,7 @@ int main() {
     {
         // a fresh store again: the conversation stored as of its checkpoint reads back from the checkpoint's state file
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         CHECK(st.open(dir, id, 1ull << 30, err));
         std::vector<int32_t> p = ids;
@@ -313,6 +387,7 @@ int main() {
             std::fclose(f);
         }
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         CHECK(st.open(dir, id, 1ull << 30, err));
         CHECK(st.stats().files == 1);
@@ -329,6 +404,7 @@ int main() {
     {
         // the budget: a second conversation pushes the least recently used one out
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         SavedConversation a = src;
         const uint64_t one = a.bytes();
@@ -367,6 +443,7 @@ int main() {
         std::string err;
         {
             ConversationStore st;
+            st.set_row_cells(4);
             CHECK(st.open(d2, id, 1ull << 30, err));
             SavedConversation copy = sa;
             CHECK(st.put(std::move(copy), 1ull << 30));
@@ -401,7 +478,8 @@ int main() {
             CHECK(st.best(p.data(), p.size(), {}, true).tokens == 9000);
         }
         {
-            ConversationStore st;   // after a restart the kinds come from the file
+            ConversationStore st;
+            st.set_row_cells(4);   // after a restart the kinds come from the file
             CHECK(st.open(d2, id, 1ull << 30, err));
             std::vector<int32_t> p(a.begin(), a.begin() + 8200);
             p.push_back(-5);
@@ -428,6 +506,7 @@ int main() {
         }
         const uint64_t one = dir_bytes(d3);
         ConversationStore st;
+        st.set_row_cells(4);
         CHECK(st.open(d3, id, one + one / 4, err));
         CHECK(st.stats().files == 1 && state_files(d3) == 4);
         CHECK(st.put(SavedConversation(sb), 1ull << 30));
@@ -442,6 +521,14 @@ int main() {
         CHECK(st.load(m, got, err));
         CHECK(same_state(got.live, sb.checkpoints[1]) && same_state(got.checkpoints[0], sa.checkpoints[0]));
         remove_dir(d3);
+    }
+    {
+        const std::string dir2 = dir + "-rows";
+        compressed_rows(dir2);
+        std::vector<basalt::platform::DirFile> rows_left;
+        if (basalt::platform::list_files(dir2, rows_left))
+            for (const auto& f : rows_left) basalt::platform::remove_file(dir2 + "/" + f.name);
+        basalt::platform::remove_file(dir2);
     }
     std::vector<basalt::platform::DirFile> left;
     if (basalt::platform::list_files(dir, left))

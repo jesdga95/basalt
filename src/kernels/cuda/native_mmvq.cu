@@ -1506,7 +1506,7 @@ void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
     }
-    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
+    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8 (ncols " + std::to_string(ncols) + ", n_in " + std::to_string(n_in) + ")");
 }
 void validate_pointer(const void* p) {
     if (!p || reinterpret_cast<std::uintptr_t>(p) % 4 != 0) {
@@ -1719,19 +1719,6 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     launch_check();
 }
 
-void native_q3_k_f32(const void* weights, const float* x, void* scratch_q8_1,
-                     float* y, int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x);
-    validate_pointer(scratch_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
-    native_q3_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
 void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     validate_shape(n_in, ncols, 256);
@@ -1765,19 +1752,6 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
     launch_check();
 }
 
-void native_iq4_xs_f32(const void* weights, const float* x, void* scratch_q8_1,
-                      float* y, int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x);
-    validate_pointer(scratch_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
-    native_iq4_xs_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
 void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
     validate_shape(n_in, ncols, 256);
@@ -1802,19 +1776,6 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         native_q4_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
     launch_check();
-}
-
-void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
-                     float* y, int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x);
-    validate_pointer(scratch_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
-    native_q4_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
 void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
@@ -1865,37 +1826,14 @@ void native_q6_k_mmvq_rows(const void* weights, const int32_t* rows, const void*
     launch_check();
 }
 
-void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,
-                     float* y, int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x);
-    validate_pointer(scratch_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
-    native_q6_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
 void native_q4_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     small_mmvq<Q40Block, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
-void native_q4_0_f32(const void* weights, const float* x, void* scratch_q8_1,
-                      float* y, int n_in, int n_out, int ncols, void* stream) {
-    small_f32<Q40Block, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
 void native_q5_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     small_mmvq<Q50Block, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_q5_0_f32(const void* weights, const float* x, void* scratch_q8_1,
-                      float* y, int n_in, int n_out, int ncols, void* stream) {
-    small_f32<Q50Block, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
@@ -1922,19 +1860,9 @@ void native_q8_0_mmvq_stream(const void* weights, const void* x_q8_1, float* y, 
     launch_check();
 }
 
-void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
-                      float* y, int n_in, int n_out, int ncols, void* stream) {
-    small_f32<Q80Block, 8>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
 void native_iq4_nl_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     small_mmvq<IQ4NLBlock, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
-                      float* y, int n_in, int n_out, int ncols, void* stream) {
-    small_f32<IQ4NLBlock, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
 bool native_mmvq_supported(int ggml_type) noexcept {

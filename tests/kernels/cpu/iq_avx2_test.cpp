@@ -11,8 +11,9 @@
 // the kernels differs from it by rounding only). On a CPU without AVX-VNNI the base build is checked against the
 // reference alone. Every build's gate/up and dot rows must also hash to the values frozen from the kernels (the decode
 // may change, the bits may not), on a fixture made from the raw generator output only, so it is the same on every
-// standard library, and a token's rows must not depend on how many tokens share the call. `--print` prints the hashes,
+// standard library. The AVX-512 quantizer must match to the bit and its Q2_0 rows to rounding, where the CPU has them. A token's rows must not depend on how many tokens share the call. `--print` prints the hashes,
 // `--bench` one row range per format on each build.
+#include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -174,6 +175,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     const bool vnni = cpu::cpu_avxvnni_ok();
+    const bool avx512 = cpu::cpu_avx512_ok();
     std::printf("iq_avx2_test: %s, AVX-VNNI %s\n", cpu::cpu_name().c_str(), vnni ? "yes" : "no (base build only)");
     int bad = 0, compared = 0;
     std::mt19937 rng(11);
@@ -436,7 +438,8 @@ int main(int argc, char** argv) {
     {
         constexpr int NB = FF / 64;
         constexpr size_t ROW = (size_t) NB * 18;
-        Stats st;
+        Stats st, st512;
+        int q2_512_diff = 0;
         for (int mode = 0; mode < 3; ++mode) {   // random, all codes 3, random codes with activations at +-127
             std::vector<uint8_t> blob(ROW * (size_t) H);
             std::mt19937_64 wr(2300 + (uint64_t) mode);
@@ -450,6 +453,19 @@ int main(int argc, char** argv) {
             for (int t = 0; t < MAXT; ++t) {
                 for (auto& v : h) v = mode == 2 ? (rng() & 1 ? 1.f : -1.f) : nd(rng);
                 cpu::act_quant_q8_1_avx2(h.data(), FF, a[(size_t) t]);
+                if (avx512) {   // the AVX-512 quantizer is the same rule
+                    cpu::ActQ a512;
+                    cpu::act_quant_q8_1(h.data(), FF, a512);
+                    ++compared;
+                    const cpu::ActQ& a2 = a[(size_t) t];
+                    bool same = a512.nchunks == a2.nchunks && !std::memcmp(a512.q, a2.q, FF);
+                    for (int c = 0; same && c < a2.nchunks; ++c)
+                        same = !std::memcmp(&a512.scale[c], &a2.scale[c], 4) && a512.sum[c] == a2.sum[c];
+                    if (!same) {
+                        std::printf("MISMATCH act_quant avx512 mode %d token %d\n", mode, t);
+                        ++bad;
+                    }
+                }
             }
             const cpu::ActQ* ap[MAXT];
             for (int t = 0; t < MAXT; ++t) ap[t] = &a[(size_t) t];
@@ -458,6 +474,17 @@ int main(int argc, char** argv) {
                 float *pb[MAXT], *pv[MAXT];
                 for (int t = 0; t < nt; ++t) { pb[t] = ob[(size_t) t].data(); pv[t] = ov[(size_t) t].data(); }
                 cpu::q2_0_gguf_rows_multi_avx2_base(blob.data(), ROW, NB, ap, nt, pb, 0, H);
+                if (avx512) {   // the AVX-512 rows give the same bits
+                    std::vector<std::vector<float>> oa(nt, std::vector<float>(H));
+                    float* pa[MAXT];
+                    for (int t = 0; t < nt; ++t) pa[t] = oa[(size_t) t].data();
+                    cpu::q2_0_gguf_rows_multi(blob.data(), ROW, NB, ap, nt, pa, 0, H);
+                    for (int t = 0; t < nt; ++t) {
+                        ++compared;
+                        if (std::memcmp(pa[t], pb[t], H * 4)) ++q2_512_diff;
+                        for (int r = 0; r < H; ++r) st512.add(pa[t][r], pb[t][r]);
+                    }
+                }
                 if (vnni) {
                     cpu::q2_0_gguf_rows_multi_avx2_vnni(blob.data(), ROW, NB, ap, nt, pv, 0, H);
                     for (int t = 0; t < nt; ++t) {
@@ -508,6 +535,10 @@ int main(int argc, char** argv) {
         }
         std::printf("  Q2_0 down rows: vs double reference: max abs %.3g rel %.3g\n", st.max_abs, st.max_rel);
         if (st.max_rel > 1e-3) { std::printf("REFERENCE ERROR too large for Q2_0 down\n"); ++bad; }
+        if (avx512) {
+            std::printf("  Q2_0 down rows: avx512 vs avx2: %d tokens differ, max abs %.3g rel %.3g\n", q2_512_diff, st512.max_abs, st512.max_rel);
+            if (st512.max_rel > 1e-3) { std::printf("AVX-512 Q2_0 down rows too far from AVX2\n"); ++bad; }
+        }
     }
     std::printf("iq_avx2_test: %d base/vnni comparisons, %d failures\n", compared, bad);
 

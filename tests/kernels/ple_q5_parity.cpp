@@ -1,6 +1,6 @@
 // Real-artifact Q5_0 or Q8_0 PLE rows against ggml's reference dequantizer.
 #include "basalt/artifact/gguf_reader.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/ggml/ggml.h"
 
 #include <algorithm>

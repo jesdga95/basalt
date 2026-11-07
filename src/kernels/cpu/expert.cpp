@@ -164,29 +164,6 @@ inline void row_dot_multi(const uint8_t* codes, const uint8_t* scales, const Act
     row_dot_multi_z<NT>(codes, scales, a, nblocks, res);
 }
 
-template<int NT>
-void expert_multi(const uint8_t* blob, const ActQ* const* a1, float* const* out, ExpertScratchMulti& ws) {
-    float g[NT], u[NT];
-    for (int r = 0; r < FF; ++r) {
-        row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, g);
-        row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU, u);
-        for (int t = 0; t < NT; ++t) ws.ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
-    }
-    const ActQ* a2[NT];
-    for (int t = 0; t < NT; ++t) {
-        act_quant_q8_1(ws.ff[t], FF, ws.a2[t]);
-        a2[t] = &ws.a2[t];
-    }
-    float o[NT];
-    for (int r = 0; r < H; ++r) {
-        row_dot_multi<NT>(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2,
-                          SC_D, o);
-        for (int t = 0; t < NT; ++t) out[t][r] = o[t];
-    }
-}
-
 }  // namespace
 
 const char* CpuFeatures::reason() const {
@@ -215,16 +192,6 @@ CpuFeatures cpu_features() {
     f.avx512_vnni = (ecx >> 11) & 1u;
     f.avx512_vbmi = (ecx >> 1) & 1u;
     return f;
-}
-
-void cpu_require_expert_support() {
-    const CpuFeatures f = cpu_features();
-    if (f.usable()) return;
-    basalt::log::error("basalt", "this CPU cannot run the expert kernel: %s.\n"
-                 "        The engine needs AVX512-VNNI and AVX512-VBMI.\n"
-                 "        The scalar fallback exists for tests only and is far too slow to decode with.",
-                 f.reason());
-    std::exit(1);
 }
 
 void act_quant_q8_1(const float* x, int n, ActQ& a) {
@@ -287,92 +254,8 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
     }
 }
 
-void s2_expert_vnni(const uint8_t* blob, const float* x, float* out, ExpertScratch& ws) {
-    act_quant_q8_1(x, H, ws.a1);
-    s2_expert_vnni_q(blob, ws.a1, out, ws);
-}
-
-void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScratch& ws) {
-    for (int r = 0; r < FF; ++r) {
-        const float g = row_dot(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU);
-        const float u = row_dot(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU);
-        // SiLU on the GATE, multiplied by up - the same reading the model definition records for the shared
-        // expert, and the one that is wrong the other way round in a way that still produces a number.
-        ws.ff[r] = (g / (1.f + std::exp(-g))) * u;
-    }
-    act_quant_q8_1(ws.ff, FF, ws.a2);
-    for (int r = 0; r < H; ++r)
-        out[r] = row_dot(blob + O_D_CODES + (size_t) r * ROW_D,
-                         blob + O_D_SCALES + (size_t) r * SC_D * 2, ws.a2, SC_D);
-}
-
-void s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, int r1) {
-    for (int r = r0; r < r1; ++r) {
-        const float g = row_dot(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU);
-        const float u = row_dot(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU);
-        ff[r] = (g / (1.f + std::exp(-g))) * u;
-    }
-}
-
-void s2_expert_down_rows(const uint8_t* blob, const ActQ& a2, float* out, int r0, int r1) {
-    for (int r = r0; r < r1; ++r)
-        out[r] = row_dot(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2, SC_D);
-}
-
 namespace {
-template<int NT>
-void gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, float* const* ff, int r0, int r1) {
-    float g[NT], u[NT];
-    for (int r = r0; r < r1; ++r) {
-        row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, g);
-        row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU, u);
-        for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
-    }
-}
-template<int NT>
-void down_rows_multi(const uint8_t* blob, const ActQ* const* a2, float* const* out, int r0, int r1) {
-    float o[NT];
-    for (int r = r0; r < r1; ++r) {
-        row_dot_multi<NT>(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2,
-                          SC_D, o);
-        for (int t = 0; t < NT; ++t) out[t][r] = o[t];
-    }
-}
 }  // namespace
-
-void s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* ff, int r0,
-                             int r1) {
-    switch (n_tokens) {
-        case 1: gu_rows_multi<1>(blob, a1, ff, r0, r1); break;
-        case 2: gu_rows_multi<2>(blob, a1, ff, r0, r1); break;
-        case 3: gu_rows_multi<3>(blob, a1, ff, r0, r1); break;
-        case 4: gu_rows_multi<4>(blob, a1, ff, r0, r1); break;
-        case 5: gu_rows_multi<5>(blob, a1, ff, r0, r1); break;
-        case 6: gu_rows_multi<6>(blob, a1, ff, r0, r1); break;
-        case 7: gu_rows_multi<7>(blob, a1, ff, r0, r1); break;
-        default: gu_rows_multi<8>(blob, a1, ff, r0, r1); break;
-    }
-}
-
-void s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n_tokens, float* const* out, int r0,
-                               int r1) {
-    switch (n_tokens) {
-        case 1: down_rows_multi<1>(blob, a2, out, r0, r1); break;
-        case 2: down_rows_multi<2>(blob, a2, out, r0, r1); break;
-        case 3: down_rows_multi<3>(blob, a2, out, r0, r1); break;
-        case 4: down_rows_multi<4>(blob, a2, out, r0, r1); break;
-        case 5: down_rows_multi<5>(blob, a2, out, r0, r1); break;
-        case 6: down_rows_multi<6>(blob, a2, out, r0, r1); break;
-        case 7: down_rows_multi<7>(blob, a2, out, r0, r1); break;
-        default: down_rows_multi<8>(blob, a2, out, r0, r1); break;
-    }
-}
 
 // ================================ Q2_0 rows in the GGUF block layout ================================
 //
@@ -432,75 +315,6 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
         case 6: q2g_rows<6>(w, row_bytes, nblocks, a, out, r0, r1); break;
         case 7: q2g_rows<7>(w, row_bytes, nblocks, a, out, r0, r1); break;
         default: q2g_rows<8>(w, row_bytes, nblocks, a, out, r0, r1); break;
-    }
-}
-
-void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* out,
-                          ExpertScratchMulti& ws) {
-    if (n_tokens < 1 || n_tokens > MAXT) {
-        for (int t = 0; t < n_tokens; ++t) s2_expert_vnni_q(blob, *a1[t], out[t], ws.single);
-        return;
-    }
-    switch (n_tokens) {
-        case 1: expert_multi<1>(blob, a1, out, ws); break;
-        case 2: expert_multi<2>(blob, a1, out, ws); break;
-        case 3: expert_multi<3>(blob, a1, out, ws); break;
-        case 4: expert_multi<4>(blob, a1, out, ws); break;
-        case 5: expert_multi<5>(blob, a1, out, ws); break;
-        case 6: expert_multi<6>(blob, a1, out, ws); break;
-        case 7: expert_multi<7>(blob, a1, out, ws); break;
-        default: expert_multi<8>(blob, a1, out, ws); break;
-    }
-}
-
-void s2_expert_scalar(const uint8_t* blob, const float* x_in, float* out, bool quant_acts) {
-    // BOTH STAGES, which is what `quant_acts` promises: the oracle consumes the SAME INT8 activation values
-    // the VNNI path uses, at the gate/up projections and at the intermediate.  Leaving the gate/up projections on
-    // raw f32 `x` coincides when the caller passes an already-quantized input (as the engine does) and hides the
-    // discrepancy; with a raw f32 input the comparison is between two DIFFERENT computations and reads as a
-    // kernel bug.
-    float xq[H];
-    const float* x = x_in;
-    if (quant_acts) {
-        ActQ a1;
-        act_quant_q8_1(x_in, H, a1);
-        for (int i = 0; i < H; ++i) xq[i] = a1.scale[i / QKA] * (float) a1.q[i];
-        x = xq;
-    }
-    float ff[FF];
-    for (int r = 0; r < FF; ++r) {
-        const uint8_t* gc = blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU;
-        const uint8_t* gs = blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2;
-        const uint8_t* uc = blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU;
-        const uint8_t* us = blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2;
-        float sg = 0.f, su = 0.f;
-        for (int b = 0; b < SC_GU; ++b) {
-            const float dg = h2f(gs + 2 * b), du = h2f(us + 2 * b);
-            for (int j = 0; j < QK; ++j) {
-                const int o = b * QK + j;
-                sg += (float) (((gc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * dg * x[o];
-                su += (float) (((uc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * du * x[o];
-            }
-        }
-        ff[r] = (sg / (1.f + std::exp(-sg))) * su;
-    }
-    if (quant_acts) {
-        // Replace the exact intermediate with the INT8 values the VNNI path actually sees, so the two differ
-        // only by FP32 evaluation order.
-        ActQ a2;
-        act_quant_q8_1(ff, FF, a2);
-        for (int i = 0; i < FF; ++i) ff[i] = a2.scale[i / QKA] * (float) a2.q[i];
-    }
-    for (int r = 0; r < H; ++r) {
-        const uint8_t* dc = blob + O_D_CODES + (size_t) r * ROW_D;
-        const uint8_t* ds = blob + O_D_SCALES + (size_t) r * SC_D * 2;
-        float acc = 0.f;
-        for (int b = 0; b < SC_D; ++b) {
-            const float d = h2f(ds + 2 * b);
-            for (int j = 0; j < QK; ++j)
-                acc += (float) (((dc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * d * ff[b * QK + j];
-        }
-        out[r] = acc;
     }
 }
 

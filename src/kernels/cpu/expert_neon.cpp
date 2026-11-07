@@ -1,4 +1,5 @@
-// src/kernels/cpu/expert_neon.cpp - the Q2_0 expert kernels of expert.hpp on Arm64: NEON with the dot product.
+// src/kernels/cpu/expert_neon.cpp - the activation quantizer and the Q2_0 rows of expert.hpp on Arm64: NEON with the
+// dot product.
 //
 // The x86-64 build is expert.cpp, which says why each piece is shaped as it is.  The contract is the same: the
 // activation quantizer does the scalar loop's operations per element, and a row is, per 32-value chunk,
@@ -7,12 +8,8 @@
 // token sees the single-token operations in the same order, so a token's rows do not depend on the batch.
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
-#include "basalt/log.hpp"
 
 #include <arm_neon.h>
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 namespace basalt::kernels::cpu {
@@ -63,14 +60,6 @@ inline int32x4_t block_dot(const int8x16_t c[4], const int8_t* xq) {
     return vdotq_s32(p, c[3], a.val[3]);
 }
 
-/// A row of the expert blob: its codes contiguous, its fp16 scales in their own array.
-struct BlobRow {
-    const uint8_t* codes;
-    const uint8_t* scales;
-    const uint8_t* code(int b) const { return codes + (size_t) b * 16; }
-    float d(int b) const { return h2f(scales + 2 * (size_t) b); }
-};
-
 /// A row of GGUF Q2_0 blocks: the fp16 scale, then 16 code bytes, 18 bytes per 64 weights.
 struct GgufRow {
     const uint8_t* row;
@@ -100,40 +89,6 @@ inline void row_dot_multi(const Row& r, const ActQ* const* a, int nblocks, float
     for (int t = 0; t < NT; ++t) res[t] = vaddvq_f32(acc[t]) - corr[t];
 }
 
-inline float row_dot(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks) {
-    const ActQ* pa = &a;
-    float r;
-    row_dot_multi<1>(BlobRow{codes, scales}, &pa, nblocks, &r);
-    return r;
-}
-
-inline BlobRow gu_row(const uint8_t* blob, int r) {
-    return BlobRow{blob + O_GU_CODES + (size_t) r * ROW_GU, blob + O_GU_SCALES + (size_t) r * SC_GU * 2};
-}
-
-inline BlobRow d_row(const uint8_t* blob, int r) {
-    return BlobRow{blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2};
-}
-
-template <int NT>
-void gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, float* const* ff, int r0, int r1) {
-    float g[NT], u[NT];
-    for (int r = r0; r < r1; ++r) {
-        row_dot_multi<NT>(gu_row(blob, 2 * r), a1, SC_GU, g);
-        row_dot_multi<NT>(gu_row(blob, 2 * r + 1), a1, SC_GU, u);
-        for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
-    }
-}
-
-template <int NT>
-void down_rows_multi(const uint8_t* blob, const ActQ* const* a2, float* const* out, int r0, int r1) {
-    float o[NT];
-    for (int r = r0; r < r1; ++r) {
-        row_dot_multi<NT>(d_row(blob, r), a2, SC_D, o);
-        for (int t = 0; t < NT; ++t) out[t][r] = o[t];
-    }
-}
-
 template <int NT>
 void q2g_rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, float* const* out, int r0, int r1) {
     float res[NT];
@@ -151,13 +106,6 @@ CpuFeatures cpu_features() {
     CpuFeatures f;
     f.arm_dotprod = cpu_neon_dot_ok();
     return f;
-}
-
-void cpu_require_expert_support() {
-    const CpuFeatures f = cpu_features();
-    if (f.usable()) return;
-    basalt::log::error("basalt", "this CPU cannot run the expert kernel: %s.", f.reason());
-    std::exit(1);
 }
 
 void act_quant_q8_1(const float* x, int n, ActQ& a) {
@@ -193,62 +141,6 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
     }
 }
 
-void s2_expert_vnni(const uint8_t* blob, const float* x, float* out, ExpertScratch& ws) {
-    act_quant_q8_1(x, H, ws.a1);
-    s2_expert_vnni_q(blob, ws.a1, out, ws);
-}
-
-void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScratch& ws) {
-    s2_expert_gu_rows(blob, a1, ws.ff, 0, FF);
-    act_quant_q8_1(ws.ff, FF, ws.a2);
-    s2_expert_down_rows(blob, ws.a2, out, 0, H);
-}
-
-void s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, int r1) {
-    for (int r = r0; r < r1; ++r) {
-        const BlobRow gr = gu_row(blob, 2 * r), ur = gu_row(blob, 2 * r + 1);
-        const float g = row_dot(gr.codes, gr.scales, a1, SC_GU);
-        const float u = row_dot(ur.codes, ur.scales, a1, SC_GU);
-        // SiLU on the GATE, multiplied by up.
-        ff[r] = (g / (1.f + std::exp(-g))) * u;
-    }
-}
-
-void s2_expert_down_rows(const uint8_t* blob, const ActQ& a2, float* out, int r0, int r1) {
-    for (int r = r0; r < r1; ++r) {
-        const BlobRow dr = d_row(blob, r);
-        out[r] = row_dot(dr.codes, dr.scales, a2, SC_D);
-    }
-}
-
-void s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* ff, int r0,
-                             int r1) {
-    switch (n_tokens) {
-        case 1: gu_rows_multi<1>(blob, a1, ff, r0, r1); break;
-        case 2: gu_rows_multi<2>(blob, a1, ff, r0, r1); break;
-        case 3: gu_rows_multi<3>(blob, a1, ff, r0, r1); break;
-        case 4: gu_rows_multi<4>(blob, a1, ff, r0, r1); break;
-        case 5: gu_rows_multi<5>(blob, a1, ff, r0, r1); break;
-        case 6: gu_rows_multi<6>(blob, a1, ff, r0, r1); break;
-        case 7: gu_rows_multi<7>(blob, a1, ff, r0, r1); break;
-        default: gu_rows_multi<8>(blob, a1, ff, r0, r1); break;
-    }
-}
-
-void s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n_tokens, float* const* out, int r0,
-                               int r1) {
-    switch (n_tokens) {
-        case 1: down_rows_multi<1>(blob, a2, out, r0, r1); break;
-        case 2: down_rows_multi<2>(blob, a2, out, r0, r1); break;
-        case 3: down_rows_multi<3>(blob, a2, out, r0, r1); break;
-        case 4: down_rows_multi<4>(blob, a2, out, r0, r1); break;
-        case 5: down_rows_multi<5>(blob, a2, out, r0, r1); break;
-        case 6: down_rows_multi<6>(blob, a2, out, r0, r1); break;
-        case 7: down_rows_multi<7>(blob, a2, out, r0, r1); break;
-        default: down_rows_multi<8>(blob, a2, out, r0, r1); break;
-    }
-}
-
 void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                           float* const* out, int r0, int r1) {
     switch (nt) {
@@ -260,68 +152,6 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
         case 6: q2g_rows<6>(w, row_bytes, nblocks, a, out, r0, r1); break;
         case 7: q2g_rows<7>(w, row_bytes, nblocks, a, out, r0, r1); break;
         default: q2g_rows<8>(w, row_bytes, nblocks, a, out, r0, r1); break;
-    }
-}
-
-void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* out,
-                          ExpertScratchMulti& ws) {
-    if (n_tokens < 1 || n_tokens > MAXT) {
-        for (int t = 0; t < n_tokens; ++t) s2_expert_vnni_q(blob, *a1[t], out[t], ws.single);
-        return;
-    }
-    float* ff[MAXT];
-    const ActQ* a2[MAXT];
-    for (int t = 0; t < n_tokens; ++t) ff[t] = ws.ff[t];
-    s2_expert_gu_rows_multi(blob, a1, n_tokens, ff, 0, FF);
-    for (int t = 0; t < n_tokens; ++t) {
-        act_quant_q8_1(ws.ff[t], FF, ws.a2[t]);
-        a2[t] = &ws.a2[t];
-    }
-    s2_expert_down_rows_multi(blob, a2, n_tokens, out, 0, H);
-}
-
-void s2_expert_scalar(const uint8_t* blob, const float* x_in, float* out, bool quant_acts) {
-    // The oracle of expert.cpp, unchanged: both stages consume the kernel's int8 activations when `quant_acts`.
-    float xq[H];
-    const float* x = x_in;
-    if (quant_acts) {
-        ActQ a1;
-        act_quant_q8_1(x_in, H, a1);
-        for (int i = 0; i < H; ++i) xq[i] = a1.scale[i / QKA] * (float) a1.q[i];
-        x = xq;
-    }
-    float ff[FF];
-    for (int r = 0; r < FF; ++r) {
-        const uint8_t* gc = blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU;
-        const uint8_t* gs = blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2;
-        const uint8_t* uc = blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU;
-        const uint8_t* us = blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2;
-        float sg = 0.f, su = 0.f;
-        for (int b = 0; b < SC_GU; ++b) {
-            const float dg = h2f(gs + 2 * b), du = h2f(us + 2 * b);
-            for (int j = 0; j < QK; ++j) {
-                const int o = b * QK + j;
-                sg += (float) (((gc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * dg * x[o];
-                su += (float) (((uc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * du * x[o];
-            }
-        }
-        ff[r] = (sg / (1.f + std::exp(-sg))) * su;
-    }
-    if (quant_acts) {
-        ActQ a2;
-        act_quant_q8_1(ff, FF, a2);
-        for (int i = 0; i < FF; ++i) ff[i] = a2.scale[i / QKA] * (float) a2.q[i];
-    }
-    for (int r = 0; r < H; ++r) {
-        const uint8_t* dc = blob + O_D_CODES + (size_t) r * ROW_D;
-        const uint8_t* ds = blob + O_D_SCALES + (size_t) r * SC_D * 2;
-        float acc = 0.f;
-        for (int b = 0; b < SC_D; ++b) {
-            const float d = h2f(ds + 2 * b);
-            for (int j = 0; j < QK; ++j)
-                acc += (float) (((dc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * d * ff[b * QK + j];
-        }
-        out[r] = acc;
     }
 }
 

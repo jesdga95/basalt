@@ -22,7 +22,7 @@ bool device_memory_is_host_ram();
 
 /// cudaMemGetInfo for the current device, and exactly that on a discrete card.  On an integrated GPU: the dedicated
 /// carve-out's figures where the management library reports them; else `total` at most the machine's RAM and `free`
-/// at most the RAM the OS can hand out without paging, less platform::ram_margin().
+/// at most the RAM the OS can hand out without paging, less platform::ram_reserve().
 cudaError_t device_mem_info(size_t* free_b, size_t* total_b);
 
 }  // namespace basalt::core

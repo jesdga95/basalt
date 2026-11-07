@@ -18,11 +18,21 @@
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg); font: 400 14px/1.5 var(--font-sans); }
 main { max-width: 1180px; margin: 0 auto; padding: 0 16px 48px; }
-header { display: flex; align-items: center; gap: 16px; padding: 40px 0 16px; }
-header img { width: 80px; height: 80px; flex: none; }
-header .names { display: flex; flex-direction: column; gap: 7px; }
-.wordmark { font: 700 30px/1 var(--font-sans); letter-spacing: -.035em; }
-.title { font: 500 15px/1 var(--font-sans); color: var(--fg-2); }
+header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px 24px; padding: 40px 0 20px; }
+.brand { display: flex; align-items: center; gap: 16px; min-width: 0; }
+.brand svg { height: 48px; aspect-ratio: 45.2 / 43.2; flex: none; position: relative; top: 1px; }
+.names { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.wordmark { margin-top: -4px; font: 700 30px/1 var(--font-sans); letter-spacing: -.035em; }
+.counts { margin-bottom: -3px; font: 500 15px/1 var(--font-sans); color: var(--fg-3); white-space: nowrap; }
+.counts b { color: var(--fg); font-weight: 500; }
+.counts i { font-style: normal; margin: 0 6px; }
+.cmd { display: inline-flex; align-items: center; gap: 10px; height: 42px; padding: 0 12px 0 14px; border-radius: 10px; border: 1px solid rgba(255, 122, 61, .45); background: rgba(255, 122, 61, .07); color: var(--accent); font: 400 13px/1 var(--font-mono); white-space: nowrap; cursor: pointer; }
+.cmd:hover { background: rgba(255, 122, 61, .12); }
+.cmd:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.cmd .ic { position: relative; width: 15px; height: 15px; display: block; }
+.cmd .ic svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.cmd .ok, .cmd.done .cp { visibility: hidden; }
+.cmd.done .ok { visibility: visible; }
 
 /* Page background: a faint honeycomb, strongest top right, with a hex cluster in that corner. */
 .bg { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; }
@@ -38,25 +48,32 @@ header .names { display: flex; flex-direction: column; gap: 7px; }
 .bg .ember { fill: #F2662B; opacity: .07; }
 body { background: var(--bg); }
 .wrap { background: var(--bg); }
-p.lede { color: var(--fg-2); max-width: 72ch; margin: 8px 0 20px; }
-p.lede code { font-family: var(--font-mono); color: var(--fg); background: var(--panel); padding: 1px 6px; border-radius: 4px; }
-.controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
-.controls input, .ms > button {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--fg);
-  font: 400 13.5px/1 var(--font-mono); padding: 9px 12px; min-width: 0;
+/* Filters: one pill style for search, every dropdown and sort. Row 1 is search and Model, row 2 the other four and sort; the right-hand column is shared. */
+.fblock { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.frow { display: flex; gap: 8px; }
+.fblock input, .ms > button {
+  height: 42px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; color: var(--fg);
+  font: 400 13px/1 var(--font-mono); padding: 0 12px; min-width: 0;
 }
-.controls input { flex: 1 1 220px; }
-.controls input:focus, .ms > button:focus-visible { outline: none; border-color: var(--accent); }
+.fblock input { flex: 1 1 auto; }
+.fblock input:focus, .ms > button:focus-visible { outline: none; border-color: var(--accent); }
+.end { flex: 0 0 280px; width: 280px; }
+.pset { display: flex; gap: 8px; flex: 1; min-width: 0; }
+.pset .ms { flex: 1 1 0; }
 
 /* Multi-select dropdown: a button and a checkbox list in a popover. */
-.ms { position: relative; flex: 0 1 auto; }
-.ms > button { display: flex; align-items: center; gap: 10px; cursor: pointer; white-space: nowrap; }
+.ms { position: relative; min-width: 0; }
+.ms > button { display: flex; align-items: center; gap: 6px; width: 100%; cursor: pointer; white-space: nowrap; }
+.ms > button .k { color: var(--fg-3); }
+.ms > button .k::after { content: " \00b7"; }
+.ms > button .v { margin-right: auto; overflow: hidden; text-overflow: ellipsis; }
 .ms > button::after { content: ""; width: 6px; height: 6px; border: solid var(--fg-3); border-width: 0 1.5px 1.5px 0; transform: translateY(-2px) rotate(45deg); transition: transform .15s; }
 .ms[data-open] > button { border-color: var(--raised); }
 .ms[data-open] > button::after { transform: translateY(1px) rotate(-135deg); }
-.ms[data-active] > button { color: var(--accent); border-color: rgba(255, 122, 61, .45); }
+.ms[data-active] > button, .ms[data-active] > button .k { color: var(--accent); }
+.ms[data-active] > button { border-color: rgba(255, 122, 61, .45); background: rgba(255, 122, 61, .06); }
 .ms .pop {
-  position: absolute; top: calc(100% + 6px); left: 0; z-index: 10; min-width: 100%; max-height: 300px; overflow-y: auto;
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 10; width: max-content; min-width: 100%; max-width: calc(100vw - 32px); max-height: 300px; overflow-y: auto;
   background: var(--panel); border: 1px solid var(--raised); border-radius: 8px; padding: 6px;
   box-shadow: 0 12px 32px rgba(0, 0, 0, .45);
 }
@@ -64,7 +81,7 @@ p.lede code { font-family: var(--font-mono); color: var(--fg); background: var(-
 .ms .pop.flip { left: auto; right: 0; }
 .ms .opt {
   display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px; border-radius: 5px;
-  font: 400 13.5px/1 var(--font-mono); color: var(--fg-2); white-space: nowrap; cursor: pointer; text-align: left;
+  font: 400 13.5px/1 var(--font-mono); color: var(--fg-2); cursor: pointer; text-align: left;
   background: none; border: 0;
 }
 .ms .opt:hover, .ms .opt:focus-visible { background: var(--raised); color: var(--fg); outline: none; }
@@ -76,14 +93,15 @@ p.lede code { font-family: var(--font-mono); color: var(--fg); background: var(-
 .ms .n { margin-left: auto; padding-left: 16px; color: var(--fg-3); font-size: 12px; }
 .ms .clear { display: block; width: 100%; margin-top: 4px; padding: 8px 10px; border-top: 1px solid var(--line); border-radius: 0; color: var(--fg-3); font: 400 12.5px/1 var(--font-sans); text-align: left; cursor: pointer; background: none; border-left: 0; border-right: 0; border-bottom: 0; }
 .ms .clear:hover { color: var(--accent); }
-.sort { display: flex; margin-left: auto; }
+.sort { display: flex; }
+.sort .ms { flex: 1; }
 .sort .pop { max-height: none; }
 .ms.single .opt .box { border-color: transparent; background: none; }
 .ms.single .opt[aria-checked="true"] .box { background: none; border-color: transparent; }
 .ms.single .box svg path { stroke: var(--accent); }
 .ms.single .opt[aria-checked="true"] { color: var(--accent); }
-.sort .ms > button { border-radius: 6px 0 0 6px; height: 100%; }
-.sort > button { display: grid; place-items: center; width: 42px; padding: 0; background: var(--panel); border: 1px solid var(--line); border-left: 0; border-radius: 0 6px 6px 0; color: var(--accent); font: 400 15px/1 var(--font-mono); cursor: pointer; }
+.sort .ms > button { justify-content: space-between; border-radius: 10px 0 0 10px; }
+.sort > button { display: grid; place-items: center; width: 44px; height: 42px; padding: 0; background: var(--panel); border: 1px solid var(--line); border-left: 0; border-radius: 0 10px 10px 0; color: var(--accent); font: 400 15px/1 var(--font-mono); cursor: pointer; }
 .sort > button:focus-visible { outline: none; border-color: var(--accent); }
 
 /* Runs: one card per run. The header is the whole click target; the open card shows a memory bar and the run's details. */
@@ -160,28 +178,43 @@ p.lede code { font-family: var(--font-mono); color: var(--fg); background: var(-
 @media (max-width: 559px) {
   .labels, .hw { grid-template-columns: 1fr; }
 }
+@media (max-width: 820px) {
+  .frow { flex-wrap: wrap; }
+  .fblock input, .end, .sort, .pset { flex: 1 1 100%; width: 100%; }
+  .pset { flex-wrap: wrap; }
+  .pset .ms { flex: 1 1 calc(50% - 4px); }
+  .cmd { width: 100%; justify-content: space-between; }
+}
 </style>
 </head>
 <body>
 <div class="bg" aria-hidden="true"><svg class="grid"><defs><pattern id="hex" width="24.25" height="42" patternUnits="userSpaceOnUse"><g fill="none" stroke="currentColor" stroke-width="1"><polygon points="12.12,0 24.25,7 24.25,21 12.12,28 0,21 0,7"/><polygon points="0,21 12.12,28 12.12,42 0,49 -12.12,42 -12.12,28"/><polygon points="24.25,21 36.37,28 36.37,42 24.25,49 12.12,42 12.12,28"/></g></pattern></defs><rect width="100%" height="100%" fill="url(#hex)"/><polygon class="ember" points="739.6,43.0 750.9,49.5 750.9,62.5 739.6,69.0 728.4,62.5 728.4,49.5"/><polygon class="ember" points="642.6,127.0 653.9,133.5 653.9,146.5 642.6,153.0 631.4,146.5 631.4,133.5"/><polygon class="ember" points="873.0,190.0 884.3,196.5 884.3,209.5 873.0,216.0 861.7,209.5 861.7,196.5"/><polygon class="ember" points="533.5,64.0 544.8,70.5 544.8,83.5 533.5,90.0 522.2,83.5 522.2,70.5"/><polygon class="ember" points="836.6,295.0 847.9,301.5 847.9,314.5 836.6,321.0 825.4,314.5 825.4,301.5"/><polygon class="ember" points="460.8,232.0 472.0,238.5 472.0,251.5 460.8,258.0 449.5,251.5 449.5,238.5"/><polygon class="ember" points="982.1,85.0 993.4,91.5 993.4,104.5 982.1,111.0 970.9,104.5 970.9,91.5"/><polygon class="ember" points="1079.1,253.0 1090.4,259.5 1090.4,272.5 1079.1,279.0 1067.9,272.5 1067.9,259.5"/></svg><svg class="cluster" viewBox="0 0 760 480" aria-hidden="true"><defs><linearGradient id="ember" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFC566"/><stop offset=".55" stop-color="#F2662B"/><stop offset="1" stop-color="#C9461C"/></linearGradient></defs><polygon class="m" points="400.0,72.0 450.2,101.0 450.2,159.0 400.0,188.0 349.8,159.0 349.8,101.0"/><polygon class="d" points="507.4,72.0 557.6,101.0 557.6,159.0 507.4,188.0 457.2,159.0 457.2,101.0"/><polygon class="d" points="292.6,72.0 342.8,101.0 342.8,159.0 292.6,188.0 242.4,159.0 242.4,101.0"/><polygon class="d" points="453.7,165.0 503.9,194.0 503.9,252.0 453.7,281.0 403.5,252.0 403.5,194.0"/><polygon class="f" points="346.3,165.0 396.5,194.0 396.5,252.0 346.3,281.0 296.1,252.0 296.1,194.0"/><polygon class="m" points="561.1,165.0 611.3,194.0 611.3,252.0 561.1,281.0 510.9,252.0 510.9,194.0"/><polygon class="d" points="453.7,-21.0 503.9,8.0 503.9,66.0 453.7,95.0 403.5,66.0 403.5,8.0"/><polygon class="d" points="561.1,-21.0 611.3,8.0 611.3,66.0 561.1,95.0 510.9,66.0 510.9,8.0"/><polygon class="f" points="346.3,-21.0 396.5,8.0 396.5,66.0 346.3,95.0 296.1,66.0 296.1,8.0"/><polygon class="e" points="614.8,72.0 665.0,101.0 665.0,159.0 614.8,188.0 564.5,159.0 564.5,101.0"/><polygon class="d" points="668.5,165.0 718.7,194.0 718.7,252.0 668.5,281.0 618.2,252.0 618.2,194.0"/><polygon class="d" points="614.8,258.0 665.0,287.0 665.0,345.0 614.8,374.0 564.5,345.0 564.5,287.0"/><polygon class="f" points="507.4,258.0 557.6,287.0 557.6,345.0 507.4,374.0 457.2,345.0 457.2,287.0"/><polygon class="f" points="722.2,258.0 772.4,287.0 772.4,345.0 722.2,374.0 671.9,345.0 671.9,287.0"/><polygon class="d" points="722.2,72.0 772.4,101.0 772.4,159.0 722.2,188.0 671.9,159.0 671.9,101.0"/><polygon class="f" points="238.9,165.0 289.1,194.0 289.1,252.0 238.9,281.0 188.7,252.0 188.7,194.0"/><polygon class="f" points="185.2,72.0 235.5,101.0 235.5,159.0 185.2,188.0 135.0,159.0 135.0,101.0"/><polygon class="f" points="400.0,258.0 450.2,287.0 450.2,345.0 400.0,374.0 349.8,345.0 349.8,287.0"/></svg></div>
 <main>
   <header>
-    <img src="mark.svg" alt="">
-    <div class="names">
-      <span class="wordmark">Basalt</span>
-      <span class="title">Community runs</span>
+    <div class="brand">
+      <svg viewBox="9.4 10.4 45.2 43.2" role="img" aria-label="Basalt"><defs><linearGradient id="markember" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFC566"/><stop offset=".55" stop-color="#F2662B"/><stop offset="1" stop-color="#C9461C"/></linearGradient></defs><polygon points="47.59,23.90 54.60,27.95 54.60,36.05 47.59,40.10 40.57,36.05 40.57,27.95" fill="#2C353E"/><polygon points="39.79,37.40 46.81,41.45 46.81,49.55 39.79,53.60 32.78,49.55 32.78,41.45" fill="#222A31"/><polygon points="24.21,37.40 31.22,41.45 31.22,49.55 24.21,53.60 17.19,49.55 17.19,41.45" fill="#2C353E"/><polygon points="16.41,23.90 23.43,27.95 23.43,36.05 16.41,40.10 9.40,36.05 9.40,27.95" fill="#222A31"/><polygon points="24.21,10.40 31.22,14.45 31.22,22.55 24.21,26.60 17.19,22.55 17.19,14.45" fill="#3A4550"/><polygon points="39.79,10.40 46.81,14.45 46.81,22.55 39.79,26.60 32.78,22.55 32.78,14.45" fill="#2C353E"/><polygon points="32.00,23.90 39.01,27.95 39.01,36.05 32.00,40.10 24.99,36.05 24.99,27.95" fill="url(#markember)"/></svg>
+      <div class="names">
+        <span class="wordmark">Basalt</span>
+        <span class="counts" id="counts"></span>
+      </div>
     </div>
+    <button class="cmd" id="cmd" type="button" aria-label="Copy the benchmark command"><code id="preset">basalt-bench --community</code><span class="ic"><svg class="cp" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/></svg><svg class="ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></span></button>
   </header>
-  <p class="lede">Performance submitted by users, all from the same preset (<code id="preset">basalt-bench --community</code>).</p>
 
-
-  <div class="controls">
-    <input id="q" type="search" placeholder="Search GPU, quant, submitter…" aria-label="Search">
-    <div class="ms" id="f-gpu"></div>
-    <div class="ms" id="f-n"></div>
-    <div class="ms" id="f-quant"></div>
-    <div class="ms" id="f-os"></div>
-    <div class="sort"><div class="ms" id="f-sort"></div><button id="sortdir" type="button"></button></div>
+  <div class="fblock">
+    <div class="frow">
+      <input id="q" type="search" placeholder="Search GPU, quant, submitter…" aria-label="Search">
+      <div class="ms end" id="f-model"></div>
+    </div>
+    <div class="frow">
+      <div class="pset">
+        <div class="ms" id="f-gpu"></div>
+        <div class="ms" id="f-n"></div>
+        <div class="ms" id="f-quant"></div>
+        <div class="ms" id="f-os"></div>
+      </div>
+      <div class="sort end"><div class="ms" id="f-sort"></div><button id="sortdir" type="button"></button></div>
+    </div>
   </div>
 
   <ul class="list" id="rows"></ul>
@@ -229,19 +262,23 @@ const SORTS = [
   { key: "_power", label: "Total power", num: true },
   { key: "ram_gib", label: "RAM", num: true },
   { key: "_rig", label: "GPUs" },
+  { key: "model", label: "Model" },
   { key: "quant", label: "Quant" },
   { key: "os", label: "System" },
   { key: "date", label: "Date" },
   { key: "submitter", label: "Submitter" },
 ];
-const SEARCH = ["_rig", "cpu", "quant", "os", "submitter", "commit", "date", "preset", "notes"];
+const SEARCH = ["_rig", "cpu", "model", "quant", "kv", "os", "submitter", "commit", "date", "preset", "notes"];
 
+const MODEL_NAMES = { "Qwen3.8-Flash-Next": "Qwen 3.8 Flash-Next", "DeepSeek-V4.1-Flash": "DeepSeek V4.1 Flash" };
 const filters = {};
-function multiSelect(id, all, options) {
+function multiSelect(id, key, options) {
   const root = $(id), picked = new Set();
   filters[id] = picked;
   root.replaceChildren();
   const btn = el("button"); btn.type = "button"; btn.setAttribute("aria-haspopup", "true"); btn.setAttribute("aria-expanded", "false");
+  const val = el("span", "v");
+  btn.append(el("span", "k", key), val);
   const pop = el("div", "pop"); pop.setAttribute("role", "menu");
   options.forEach(o => {
     const b = el("button", "opt"); b.type = "button"; b.setAttribute("role", "menuitemcheckbox"); b.setAttribute("aria-checked", "false"); b.dataset.v = o.value;
@@ -253,7 +290,7 @@ function multiSelect(id, all, options) {
   root.append(btn, pop);
   const label = () => {
     const sel = options.filter(o => picked.has(o.value));
-    btn.textContent = !sel.length ? all : sel.length === 1 ? sel[0].label : `${sel.length} selected · ${all.replace(/^All |^Any /, "")}`;
+    val.textContent = !sel.length ? "All" : sel.length === 1 ? sel[0].label : `${sel.length} selected`;
     sel.length ? root.setAttribute("data-active", "") : root.removeAttribute("data-active");
   };
   const setOpen = on => {
@@ -340,6 +377,7 @@ function placePop(root) {
   const pop = root.querySelector(".pop");
   pop.classList.remove("flip");
   if (pop.getBoundingClientRect().right > document.documentElement.clientWidth - 8) pop.classList.add("flip");
+  if (pop.getBoundingClientRect().left < 8) pop.classList.remove("flip");
 }
 function countBy(values) {
   const m = new Map();
@@ -368,6 +406,7 @@ function rig(r, i) {
   return r;
 }
 
+function modelPill(r) { const p = el("span", "pill", r.model); p.title = r.model; return p; }
 function quantPill(r, cls) { const p = el("span", "pill " + (cls || ""), r.quant); p.title = r.quant; return p; }
 
 // Notes: clamped to two lines; the toggle appears only when the text overflows.
@@ -401,7 +440,7 @@ function render(keepPage) {
   const q = $("q").value.trim().toLowerCase();
   const shown = runs.filter(r =>
     any("f-gpu", v => r._names.includes(v)) && any("f-n", v => v === String(Math.min(r._n, 3))) &&
-    any("f-quant", v => r.quant === v) && any("f-os", v => r.os === v) &&
+    any("f-model", v => r.model === v) && any("f-quant", v => r.quant === v) && any("f-os", v => r.os === v) &&
     (!q || SEARCH.some(k => String(r[k] ?? "").toLowerCase().includes(q))));
   shown.sort((a, b) => {
     const x = a[sort.key], y = b[sort.key];
@@ -443,7 +482,7 @@ function drawPager(pages) {
 }
 // After a page change, jump so the toolbar sits just under the top edge; an instant jump cannot be cut short by the new page's height.
 function toToolbar() {
-  const top = document.querySelector(".controls").getBoundingClientRect().top + window.scrollY - 12;
+  const top = document.querySelector(".fblock").getBoundingClientRect().top + window.scrollY - 12;
   window.scrollTo({ top: Math.max(0, top), left: 0, behavior: "instant" });
 }
 // When the range text wraps under the numbers, the divider is dropped.
@@ -474,16 +513,27 @@ $("rows").addEventListener("click", e => {
   if (on) { li.append(buildDetail(runs[id])); wireNotes(li); } else li.querySelector(".detail")?.remove();
 });
 $("q").addEventListener("input", render);
+$("cmd").addEventListener("click", () => {
+  const b = $("cmd");
+  navigator.clipboard?.writeText($("preset").textContent).catch(() => {});
+  b.classList.add("done");
+  clearTimeout(b._t); b._t = setTimeout(() => b.classList.remove("done"), 1200);
+});
 window.addEventListener("resize", () => wireNotes($("rows")));
 
 fetch("benchmarks.json").then(r => r.json()).then(data => {
   runs = (data.runs || []).map((r, i) => rig(r, i));
   if (data.preset) $("preset").textContent = data.preset;
-  multiSelect("f-gpu", "All GPUs", countBy(runs.flatMap(r => [...new Set(r._names)])));
-  multiSelect("f-n", "Any GPU count", countBy(runs.map(r => String(Math.min(r._n, 3))))
+  const gpuOpts = countBy(runs.flatMap(r => [...new Set(r._names)]));
+  const submitters = new Set(runs.map(r => r.submitter)).size;
+  $("counts").replaceChildren(...[[runs.length, "runs"], [gpuOpts.length, "GPUs"], [submitters, "submitters"]].flatMap(([n, w], k) =>
+    [...(k ? [el("i", null, "\u00b7")] : []), el("b", "num", String(n)), document.createTextNode(" " + w)]));
+  multiSelect("f-gpu", "GPU", gpuOpts);
+  multiSelect("f-n", "GPUs", countBy(runs.map(r => String(Math.min(r._n, 3))))
     .map(o => ({ ...o, label: o.value === "1" ? "1 GPU" : o.value === "3" ? "3+ GPUs" : o.value + " GPUs" })));
-  multiSelect("f-quant", "All quants", countBy(runs.map(r => r.quant)));
-  multiSelect("f-os", "All systems", countBy(runs.map(r => r.os)));
+  multiSelect("f-model", "Model", countBy(runs.map(r => r.model)).map(o => ({ ...o, label: MODEL_NAMES[o.value] || o.value })));
+  multiSelect("f-quant", "Quant", countBy(runs.map(r => r.quant)));
+  multiSelect("f-os", "System", countBy(runs.map(r => r.os)));
   setupSort(); render();
 }).catch(() => { $("rows").replaceChildren(el("li", "empty", "Could not load benchmarks.json.")); });
 const SEGCOL = ["var(--seg1)", "var(--seg2)", "var(--seg3)", "var(--seg4)"];
@@ -495,7 +545,7 @@ function buildHead(r) {
   const m = el("div", "m2");
   const sub = el("span", "sub");
   rich(sub, [...(r._n > 1 ? [r._n + " GPUs · "] : []), [f0(r._vram) + " GiB"], " · ", [f0(r._power) + " W"]]);
-  m.append(quantPill(r), sub);
+  m.append(modelPill(r), quantPill(r), sub);
   id.append(gpu, m);
   const stats = el("div", "stats");
   stats.append(st("Prefill 16K", f0(r.prefill_16k_tps)), st("Prefill 64K", f0(r.prefill_64k_tps)), st("Decode tok/s", f1(r.decode_tps), true));
@@ -517,7 +567,7 @@ function buildDetail(r) {
   });
   bars.append(segs, labels);
   d.append(bars);
-  const hw = [];
+  const hw = [["Model", r.model], ["KV cache", r.kv]];
   if (r.cpu) hw.push(["CPU", r.cpu]);
   if (r.ram_gbps != null) hw.push(["RAM read", f1(r.ram_gbps) + " GB/s"]);
   r.gpus.forEach(x => {

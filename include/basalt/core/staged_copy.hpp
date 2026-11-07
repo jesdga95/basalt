@@ -20,6 +20,7 @@ public:
     StagedCopy(const StagedCopy&) = delete;
     StagedCopy& operator=(const StagedCopy&) = delete;
 
+    static constexpr int kBufs = 4;
     /// Copies from card `src_dev` to card `dst_dev` through `kBufs` pinned buffers of `piece_bytes`.
     bool init(int src_dev, int dst_dev, size_t piece_bytes, std::string& err);
     bool ready() const { return dst_stream_ != nullptr; }
@@ -29,7 +30,6 @@ public:
     bool wait(std::string& err);
 
 private:
-    static constexpr int kBufs = 4;
     void release();
     int src_dev_ = -1, dst_dev_ = -1;
     size_t piece_ = 0;

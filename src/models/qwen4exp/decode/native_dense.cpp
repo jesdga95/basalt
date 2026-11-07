@@ -1,0 +1,312 @@
+#include "basalt/models/qwen4exp/decode/native_dense.hpp"
+#include "basalt/model/adapter.hpp"
+#include "basalt/core/direct_upload.hpp"
+#include "basalt/core/load_progress.hpp"
+#include <cstdlib>
+#include "basalt/core/weights.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/platform/memory.hpp"
+
+#include <cuda_runtime.h>
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <set>
+
+namespace basalt::core {
+namespace {
+int g_layer_lb = -1, g_layer_le = -1;   // set_layer_range; -1: every layer
+bool in_range(const std::string& name) {
+    if (g_layer_lb < 0 || name.rfind("blk.", 0) != 0) return true;
+    const int l = std::atoi(name.c_str() + 4);
+    return l >= g_layer_lb && l < g_layer_le;
+}
+bool eligible(const basalt::TensorInfo& tensor, bool include_ple_key) {
+    const auto& name = tensor.name;
+    if (name.rfind("blk.", 0) != 0) return false;
+    // Match the native PLE kernel: Q2_0, IQ3_XXS, IQ4_XS and Q8_0 (UD-Q4_K_XL). Other keys retain the packed BF16
+    // fallback.
+    if (name == "blk.1.ple_key.weight")
+        return include_ple_key && (tensor.type == 42 || tensor.type == 18 || tensor.type == 23 || tensor.type == 8);
+    static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
+        ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
+        ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
+    for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
+    return false;
+}
+struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
+using DevicePtr = std::unique_ptr<void, DeviceFree>;
+struct Pending {
+    WeightRef* ref;
+    int type;
+    uint64_t bytes;
+    void* data;       // inside the slab, or the owned allocation below when the slab ran out
+    DevicePtr owned;
+};
+}
+
+bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
+                               std::set<std::string>& out, std::string& err) {
+    try {
+        for (const auto& path : shards) {
+            basalt::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors())
+                if (eligible(tensor, include_ple_key) && basalt::kernels::native_mmvq_supported(tensor.type) &&
+                    tensor.shape.size() == 2)
+                    out.insert(tensor.name);
+        }
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+
+bool NativeDense::plan_bytes(const std::vector<std::string>& shards, bool include_ple_key, int64_t layer_lo,
+                             int64_t layer_hi, uint64_t& out, std::string& err) {
+    auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
+        if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
+        const long l = std::strtol(name.c_str() + 4, nullptr, 10);
+        return l < layer_lo || l >= layer_hi;
+    };
+    out = 0;
+    try {
+        for (const auto& path : shards) {
+            basalt::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
+                if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
+                if (!basalt::kernels::native_mmvq_supported(tensor.type) || tensor.shape.size() != 2 ||
+                    tensor.shape[0] == 0 || tensor.shape[0] > INT_MAX || tensor.shape[1] == 0 || tensor.shape[1] > INT_MAX)
+                    continue;
+                out += basalt::kernels::native_mmvq_weight_bytes(tensor.type, (int) tensor.shape[0],
+                                                                 (int) tensor.shape[1]);
+            }
+        }
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+
+bool NativeDense::plan_bytes_by_layer(const std::vector<std::string>& shards, bool include_ple_key, int64_t n_layers,
+                                      std::vector<uint64_t>& per_layer, uint64_t& shared, std::string& err) {
+    per_layer.assign((size_t) n_layers, 0);
+    shared = 0;
+    try {
+        for (const auto& path : shards) {
+            basalt::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key) || !basalt::kernels::native_mmvq_supported(tensor.type) ||
+                    tensor.shape.size() != 2 || tensor.shape[0] == 0 || tensor.shape[0] > INT_MAX ||
+                    tensor.shape[1] == 0 || tensor.shape[1] > INT_MAX)
+                    continue;
+                const uint64_t bytes = basalt::kernels::native_mmvq_weight_bytes(tensor.type, (int) tensor.shape[0],
+                                                                                 (int) tensor.shape[1]);
+                const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
+                if (tensor.name.find("ple") == std::string::npos && l >= 0 && l < n_layers) per_layer[(size_t) l] += bytes;
+                else shared += bytes;
+            }
+        }
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+
+void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
+bool NativeDense::keep_unquantized_ple_key(const PackFiles& pack, std::set<std::string>& skip, std::string& err) {
+    const std::string key = "blk.1.ple_key.weight";
+    if (!skip.count(key)) return true;
+    int code_bits = -1;
+    if (!WeightTable::index_code_bits(pack, key, code_bits, err)) return false;
+    if (code_bits == 0) skip.erase(key);
+    return true;
+}
+
+NativeDense::~NativeDense() {
+    if (scratch_) cudaFree(scratch_);
+    for (void* p : allocs_) cudaFree(p);
+}
+
+namespace {
+constexpr uint64_t kSlabAlign = 256;   // matrices start at 256-byte offsets, as separate allocations do
+}
+uint64_t NativeDense::slab_bytes(uint64_t plan_total) { return plan_total + kSlabAlign * 1024; }
+
+bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, void* slab_at, uint64_t slab_cap) {
+    auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
+        if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
+        const long l = std::strtol(name.c_str() + 4, nullptr, 10);
+        return l < layer_lo || l >= layer_hi;
+    };
+    if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
+    if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
+    try {
+        std::vector<Pending> pending;
+        std::set<std::string> seen;
+        // the bytes the uploads below will write (for the progress lines)
+        uint64_t plan_total = 0;
+        if (!plan_bytes(shards, include_ple_key, layer_lo, layer_hi, plan_total, err)) return false;
+        int load_dev = 0;
+        if (cudaGetDevice(&load_dev) != cudaSuccess) load_dev = 0;
+        LoadProgress progress(LoadProgress::cuda(load_dev), plan_total);
+        DirectUploader uploader;   // unbuffered reads, overlapped with the copies
+        // One allocation holds every matrix: separate cudaMalloc calls each round up to the allocator's granularity,
+        // which costs about a MiB per matrix.  Matrices start at 256-byte offsets, as separate allocations do.
+        constexpr uint64_t kAlign = kSlabAlign;
+        const uint64_t slab_bytes = NativeDense::slab_bytes(plan_total);
+        if (slab_at != nullptr && slab_cap < slab_bytes) {
+            err = "native dense: the block given for the matrices is too small";
+            return false;
+        }
+        DevicePtr slab;
+        void* slab_base = slab_at;
+        if (slab_base == nullptr) {
+            void* a = nullptr;
+            if (plan_total > 0 && cudaMalloc(&a, slab_bytes) == cudaSuccess) slab.reset(a);
+            else (void) cudaGetLastError();
+            slab_base = slab.get();
+        }
+        uint64_t slab_used = 0;
+        int max_in = 0;
+        uint64_t total = 0;
+        uint64_t split_count = 0, split_tensors = 0;
+        std::set<uint64_t> split_numbers;
+        bool have_architecture = false;
+        for (const auto& path : shards) {
+            basalt::GgufFile gguf(path);
+            const auto* count = gguf.get("split.count");
+            const auto* number = gguf.get("split.no");
+            const auto* tensors = gguf.get("split.tensors.count");
+            if (gguf.get("general.architecture")) {
+                err = basalt::model::check_architecture(gguf);
+                if (!err.empty()) return false;
+                have_architecture = true;
+                if (count && number && tensors && number->u == 0 && count->u > 1) {
+                    split_count = count->u;
+                    split_tensors = tensors->u;
+                }
+            } else if (!have_architecture || !split_count || !count || !number || !tensors ||
+                       count->u != split_count || number->u == 0 || number->u >= split_count ||
+                       tensors->u != split_tensors) {
+                err = "native dense: additional shard must match the architecture-validated first shard's split metadata";
+                return false;
+            }
+            if (number && !split_numbers.insert(number->u).second) {
+                err = "native dense: duplicate split shard number"; return false;
+            }
+            std::vector<uint64_t> offsets;
+            for (const auto& tensor : gguf.tensors()) offsets.push_back(tensor.offset);
+            std::sort(offsets.begin(), offsets.end());
+            if (std::adjacent_find(offsets.begin(), offsets.end()) != offsets.end()) {
+                err = "native dense: tensor payload offsets overlap"; return false;
+            }
+            // Validate every directory span, including tensors we do not upload:
+            // an ignored tensor must not overlap the native matrix that follows it.
+            const uint64_t payload = gguf.file_size() - gguf.data_start();
+            for (const auto& tensor : gguf.tensors()) {
+                int block_elements = 0, block_bytes = 0;
+                uint64_t elements = 1;
+                if (tensor.shape.empty() || !basalt::block_geometry(tensor.type, block_elements, block_bytes) ||
+                    tensor.shape[0] % (uint64_t) block_elements != 0) {
+                    err = "native dense: invalid block geometry " + tensor.name; return false;
+                }
+                for (uint64_t dimension : tensor.shape) {
+                    if (!dimension || elements > (std::numeric_limits<uint64_t>::max)() / dimension) {
+                        err = "native dense: invalid tensor extent " + tensor.name; return false;
+                    }
+                    elements *= dimension;
+                }
+                const uint64_t blocks = elements / (uint64_t) block_elements;
+                if (blocks > (std::numeric_limits<uint64_t>::max)() / (uint64_t) block_bytes) {
+                    err = "native dense: tensor byte count overflow " + tensor.name; return false;
+                }
+                const uint64_t bytes = blocks * (uint64_t) block_bytes;
+                if (tensor.offset > payload || bytes > payload - tensor.offset) {
+                    err = "native dense: truncated payload " + tensor.name; return false;
+                }
+                const auto next = std::upper_bound(offsets.begin(), offsets.end(), tensor.offset);
+                if (next != offsets.end() && bytes > *next - tensor.offset) {
+                    err = "native dense: overlapping payload " + tensor.name; return false;
+                }
+            }
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
+                if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
+                if (!seen.insert(tensor.name).second) {
+                    err = "native dense: duplicate tensor " + tensor.name; return false;
+                }
+                auto found = table.table_.find(tensor.name);
+                if (found == table.table_.end()) {
+                    err = "native dense: tensor absent from canonical table: " + tensor.name; return false;
+                }
+                auto& ref = found->second;
+                if (ref.native_data) { err = "native dense: override already attached"; return false; }
+                if (!basalt::kernels::native_mmvq_supported(tensor.type)) continue;
+                // the file keeps an unquantized key here, which the PLE reads from the arena
+                if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
+                if (!ref.quantized() || tensor.shape.size() != 2 ||
+                    ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
+                    tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
+                    err = "native dense: incompatible matrix " + tensor.name; return false;
+                }
+                const auto bytes = basalt::kernels::native_mmvq_weight_bytes(
+                    tensor.type, (int) ref.ne0, (int) ref.ne1);
+                void* where = nullptr;
+                DevicePtr own;
+                if (slab_base != nullptr && slab_used + bytes <= slab_bytes) {
+                    where = (char*) slab_base + slab_used;
+                    slab_used += (bytes + kAlign - 1) / kAlign * kAlign;
+                } else if (slab_at != nullptr) {
+                    err = "native dense: the matrices outgrow the block given for them";
+                    return false;
+                } else {
+                    void* allocation = nullptr;
+                    if (cudaMalloc(&allocation, bytes) == cudaSuccess) own.reset(allocation);
+                    where = allocation;
+                }
+                std::string upload_err;
+                if (where == nullptr || !uploader.upload(gguf.path(), gguf.data_start() + tensor.offset, bytes, where, upload_err)) {
+                    err = "native dense upload " + tensor.name + ": " +
+                          (where == nullptr ? std::string("no device memory") : upload_err);
+                    return false;
+                }
+                max_in = (std::max)(max_in, (int) ref.ne0);
+                total += bytes;
+                progress.add(bytes);
+                pending.push_back(Pending{&ref, (int) tensor.type, bytes, where, std::move(own)});
+            }
+        }
+        if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
+        void* allocation = nullptr;
+        const auto status = cudaMalloc(&allocation, basalt::kernels::native_q8_1_bytes(max_in));
+        DevicePtr scratch(allocation);
+        if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }
+        // All checks and allocations finish before publishing any reference.
+        weights_.reserve(pending.size());
+        for (auto& item : pending) {
+            item.ref->native_data = item.data;
+            item.ref->native_type = item.type;
+            item.ref->native_q8_1 = scratch.get();
+            weights_.push_back(item.data);
+            if (item.owned) allocs_.push_back(item.owned.release());
+        }
+        if (slab) allocs_.push_back(slab.release());
+        scratch_ = scratch.release();
+        bytes_ = total;
+        progress.finish();
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+} // namespace basalt::core

@@ -124,7 +124,7 @@ class OpenAI(Base):
     NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
 
     def chat(self, **extra):
-        return self.post("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "2+2?"}],
+        return self.post("/v1/chat/completions", {"model": "basalt", "messages": [{"role": "user", "content": "2+2?"}],
                                                   "max_tokens": 400, "tools": FN, **extra})
 
     def call_of(self, code, b, stream):
@@ -215,7 +215,7 @@ class Anthropic(Base):
     THINKING = {"thinking": {"type": "enabled", "budget_tokens": 1024}}
 
     def msg(self, **extra):
-        return self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 400, "tools": AN,
+        return self.post("/v1/messages", {"model": "basalt", "max_tokens": 400, "tools": AN,
                                           "messages": [{"role": "user", "content": "2+2?"}], **extra})
 
     def blocks(self, code, b, stream):
@@ -276,7 +276,7 @@ class Anthropic(Base):
 
 class Responses(Base):
     def resp(self, **extra):
-        return self.post("/v1/responses", {"model": "qwen3.8-flash-next", "input": "2+2?", "max_output_tokens": 400, "tools": RS,
+        return self.post("/v1/responses", {"model": "basalt", "input": "2+2?", "max_output_tokens": 400, "tools": RS,
                                            **extra})
 
     def calls(self, code, b):

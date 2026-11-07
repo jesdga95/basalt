@@ -20,12 +20,13 @@ namespace basalt::core {
 
 /// Byte storage for a checkpoint's running state.  Large blocks go back to a small shared pool instead of the OS and
 /// are handed out again without being zeroed: a fresh block of this size costs more in page faults and zero-fill
-/// than the device copy into it, and a checkpoint is saved on the request path.
+/// than the device copy into it, and a checkpoint is saved on the request path.  A server reserves the blocks its
+/// checkpoints take at their most before its RAM tier is sized, and the pool keeps that many through a RAM shed.
 template <class T>
 struct PooledAlloc {
     using value_type = T;
     static constexpr size_t kMinBytes = size_t(1) << 20;   // smaller blocks are not worth pooling
-    static constexpr size_t kMaxBlocks = 4;                // blocks kept; the rest are freed
+    static constexpr size_t kMaxBlocks = 4;                // blocks kept beyond the reserved ones; the rest are freed
     PooledAlloc() = default;
     template <class U>
     PooledAlloc(const PooledAlloc<U>&) noexcept {}
@@ -48,7 +49,7 @@ struct PooledAlloc {
         if (bytes >= kMinBytes) {
             Pool& p = pool();
             std::lock_guard<std::mutex> lk(p.mu);
-            if (p.blocks.size() < kMaxBlocks) {
+            if (p.blocks.size() < kMaxBlocks + p.reserved) {
                 p.blocks.emplace_back(ptr, bytes);
                 return;
             }
@@ -59,16 +60,36 @@ struct PooledAlloc {
     void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }   // resize leaves new bytes as they are
     template <class U, class... A>
     void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
-    /// Frees the blocks the pool keeps; returns their bytes.
+    /// Allocates `count` blocks of `bytes` now, their pages written, for checkpoints to take.  False when they cannot
+    /// be allocated (none is kept then).
+    static bool reserve(size_t bytes, size_t count) {
+        if (bytes < kMinBytes || count == 0) return true;
+        std::vector<void*> got;
+        for (size_t i = 0; i < count; ++i) {
+            void* b = ::operator new(bytes, std::nothrow);
+            if (b == nullptr) {
+                for (void* x : got) ::operator delete(x);
+                return false;
+            }
+            std::memset(b, 0, bytes);
+            got.push_back(b);
+        }
+        Pool& p = pool();
+        std::lock_guard<std::mutex> lk(p.mu);
+        for (void* b : got) p.blocks.emplace_back(b, bytes);
+        p.reserved += count;
+        return true;
+    }
+    /// Frees the blocks the pool keeps beyond the reserved ones; returns their bytes.
     static size_t release_pooled() {
         Pool& p = pool();
         std::lock_guard<std::mutex> lk(p.mu);
         size_t n = 0;
-        for (const auto& b : p.blocks) {
-            n += b.second;
-            ::operator delete(b.first);
+        while (p.blocks.size() > p.reserved) {
+            n += p.blocks.back().second;
+            ::operator delete(p.blocks.back().first);
+            p.blocks.pop_back();
         }
-        p.blocks.clear();
         return n;
     }
     template <class U>
@@ -80,6 +101,7 @@ private:
     struct Pool {
         std::mutex mu;
         std::vector<std::pair<void*, size_t>> blocks;
+        size_t reserved = 0;
     };
     static Pool& pool() {
         static Pool* p = new Pool;   // never destroyed: checkpoints may outlive static destruction
@@ -100,7 +122,8 @@ struct ConversationCheckpoint {
     Source source = kTurnEnd;
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
-    CheckpointBytes gdn, ple, tails, dead, block_pos;
+    /// The model's running state, its parts as the model names them.
+    CheckpointBytes state_a, state_b, state_c, state_d, state_e;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
@@ -108,7 +131,7 @@ struct ConversationCheckpoint {
 
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
-               gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
+               state_a.capacity() + state_b.capacity() + state_c.capacity() + state_d.capacity() + state_e.capacity() +
                stage_parts.capacity() * sizeof(ConversationCheckpoint);
         for (const auto& part : stage_parts) n += part.bytes();
         return n;

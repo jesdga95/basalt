@@ -124,21 +124,35 @@ std::string hex_escape(unsigned char c) {
     return std::string("\\x") + h[c >> 4] + h[c & 15];
 }
 
-// Text that never contains the closing tag: a KMP automaton over the tag, one rule per matched length. The tag's last
-// character is the one move the automaton refuses.
+// The UTF-8 characters of `s`: a grammar's literals and classes read characters, not bytes.
+std::vector<std::string> utf8_chars(const std::string& s) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < s.size();) {
+        size_t n = 1;
+        while (i + n < s.size() && ((unsigned char) s[i + n] & 0xC0) == 0x80) ++n;
+        out.push_back(s.substr(i, n));
+        i += n;
+    }
+    return out;
+}
+
+// Text that never contains the closing tag: a KMP automaton over the tag's characters, one rule per matched length.
+// The tag's last character is the one move the automaton refuses.
 std::string add_free_text(SchemaConverter& c, const std::string& tag) {
-    size_t n = tag.size();
-    std::set<unsigned char> alpha(tag.begin(), tag.end());
+    const std::vector<std::string> chars = utf8_chars(tag);
+    size_t n = chars.size();
+    std::set<std::string> alpha(chars.begin(), chars.end());
     std::string excluded;
-    for (unsigned char a : alpha) excluded += hex_escape(a);
+    for (const std::string& a : alpha) excluded += a.size() == 1 ? hex_escape((unsigned char) a[0]) : a;
     for (size_t i = 0; i < n; ++i) {
         std::vector<std::string> alts;
-        for (unsigned char a : alpha) {
-            std::string seen = tag.substr(0, i) + (char) a;
+        for (const std::string& a : alpha) {
+            std::vector<std::string> seen(chars.begin(), chars.begin() + (std::ptrdiff_t) i);
+            seen.push_back(a);
             size_t k = (std::min)(seen.size(), n);
-            while (k > 0 && tag.compare(0, k, seen, seen.size() - k, k) != 0) --k;
+            while (k > 0 && !std::equal(chars.begin(), chars.begin() + (std::ptrdiff_t) k, seen.end() - (std::ptrdiff_t) k)) --k;
             if (k == n) continue;
-            alts.push_back(literal(std::string(1, (char) a)) + " free-text-" + std::to_string(k));
+            alts.push_back(literal(a) + " free-text-" + std::to_string(k));
         }
         alts.push_back("[^" + excluded + "] free-text-0");
         alts.push_back("\"\"");
@@ -250,7 +264,19 @@ bool flatten_union(const JsonValue* params, JsonValue& out) {
 
 }  // namespace
 
+namespace {
+ToolForm g_tool_form;
+}
+
+void set_tool_form(const ToolForm& form) { g_tool_form = form; }
+const ToolForm& tool_form() { return g_tool_form; }
+
 std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptions& opt, std::string& err) {
+    const ToolForm& form = tool_form();
+    if (form.call_open.empty()) {
+        err = "tools: this model has no tool-call grammar";
+        return "";
+    }
     JsonValue tools;
     if (!read_json(tools_json, tools, err)) return "";
     if (!tools.is(Type::Array) || tools.items.empty()) {
@@ -311,7 +337,7 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
                     raw = true;
                 }
                 if (raw && value.empty()) {
-                    if (text_rule.empty()) text_rule = add_free_text(c, "</parameter>");
+                    if (text_rule.empty()) text_rule = add_free_text(c, form.text_end);
                     value = text_rule;
                 }
                 if (!raw) {
@@ -328,7 +354,7 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
                     return "";
                 }
                 (required.count(m.first) ? req_items : opt_items)
-                    .push_back(literal("<parameter=" + m.first + ">\n") + " " + value + " " + literal("\n</parameter>\n"));
+                    .push_back(literal(form.param_open + m.first + (raw ? form.param_mid_text : form.param_mid_value)) + " " + value + " " + literal(form.param_close));
             }
         }
         // As llama.cpp's Qwen3-Coder parser (common/chat-peg-parser.cpp permute, parsers/qwen3-coder.cpp): the required
@@ -352,10 +378,12 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
             body = rule_of(((size_t) 1 << n) - 1) + " ";
         }
         if (!opt_items.empty()) body += "(" + c.add_rule(fn_id + "-opt", join(opt_items, " | ")) + ")* ";
-        fns.push_back(c.add_rule(fn_id, literal("<function=" + nm->s + ">\n") + " " + body + literal("</function>")));
+        fns.push_back(c.add_rule(fn_id, literal(form.fn_open + nm->s + form.fn_mid) + " " + body + literal(form.fn_close)));
     }
-    c.add_rule("call", literal("<tool_call>\n") + " (" + join(fns, " | ") + ") " + literal("\n</tool_call>"));
-    std::string root = opt.multiple_calls ? "call ([ \\t\\n]* call)*" : "call";
+    const std::string one = "(" + join(fns, " | ") + ")";
+    const bool shared_block = form.calls_share_block && opt.multiple_calls;
+    c.add_rule("call", literal(form.call_open) + " " + (shared_block ? one + " (" + literal("\n") + " " + one + ")*" : one) + " " + literal(form.call_close));
+    std::string root = opt.multiple_calls && !form.calls_share_block ? "call ([ \\t\\n]* call)*" : "call";
     if (!opt.answer_schema.empty()) {
         JsonValue answer;
         if (!read_json(opt.answer_schema, answer, err)) return "";
@@ -433,7 +461,7 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
             }
         }
         gbnf = tool_call_gbnf(list.dump(), ToolGrammarOptions{}, err);
-        out.triggers.words = {tool_call_trigger()};
+        out.triggers.words = {tool_form().trigger};
     } else {
         err = "grammar: unknown kind '" + kind->s + "'";
         return out;

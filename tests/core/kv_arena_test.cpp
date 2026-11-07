@@ -2,7 +2,7 @@
 // back and keeps the cells below the cut exactly as they were; the addresses never move.  Needs a CUDA device with
 // virtual memory management (exits 77 without one).
 #include "basalt/core/device_memory.hpp"
-#include "basalt/core/kv_arena.hpp"
+#include "basalt/models/qwen4exp/decode/kv_arena.hpp"
 
 #include <cuda_runtime.h>
 

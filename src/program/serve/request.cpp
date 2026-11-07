@@ -9,7 +9,7 @@ Flow Request::execute() {
         ~Scope() { r.solo_out = nullptr; r.solo_busy = false; r.park_keep = -1; }
     } scope{runtime_};
     if (const Flow flow = parse(); flow != Flow::proceed) return flow;
-    if (const Flow flow = prepare_image(); flow != Flow::proceed) return flow;
+    if (const Flow flow = prepare_prompt(); flow != Flow::proceed) return flow;
     if (const Flow flow = restore(); flow != Flow::proceed) return flow;
     if (const Flow flow = read_prompt(); flow != Flow::proceed) return flow;
     if (const Flow flow = decode(); flow != Flow::proceed) return flow;

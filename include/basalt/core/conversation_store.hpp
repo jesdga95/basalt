@@ -38,6 +38,8 @@ struct ConversationStoreBuffer;
 
 class ConversationStore {
 public:
+    /// Cells behind one pooled row of a K/V layer's index (before open).
+    void set_row_cells(int64_t cells) { row_cells_ = cells; }
     struct Match {
         size_t index = 0;
         int64_t tokens = 0;
@@ -111,9 +113,12 @@ private:
     Stats stats_;
     std::vector<std::unique_ptr<ConversationStoreBuffer>> read_bufs_;   ///< the loads' aligned read buffers, kept
     std::thread thread_;
+    int64_t row_cells_ = 1;
 };
 
 /// The 64-bit hash the store's identity and file checks use (XXH64's rounds).
 uint64_t conversation_store_hash(const void* data, size_t n, uint64_t seed);
+/// `seed` hashed on with a file's size and samples of its bytes: what names the model file in a store's identity.
+uint64_t conversation_store_hash_file(const std::string& path, uint64_t seed);
 
 }  // namespace basalt::core

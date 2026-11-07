@@ -6,6 +6,7 @@
       "date": "2026-10-22",
       "commit": "57909606c2",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5080",
@@ -16,6 +17,7 @@
       "ram_gib": 88,
       "os": "WSL2",
       "quant": "IQ3_S",
+      "kv": "int8",
       "prefill_16k_tps": 3179.8,
       "prefill_64k_tps": 4351.7,
       "decode_tps": 137.9,
@@ -26,6 +28,7 @@
       "date": "2026-10-22",
       "commit": "57909606c2",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5080",
@@ -36,6 +39,7 @@
       "ram_gib": 88,
       "os": "WSL2",
       "quant": "Q4_K_XL",
+      "kv": "int8",
       "prefill_16k_tps": 2834.8,
       "prefill_64k_tps": 3608.2,
       "decode_tps": 77.5,
@@ -46,6 +50,7 @@
       "date": "2026-10-22",
       "commit": "78ca1d6bd6",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5060 Ti",
@@ -61,6 +66,7 @@
       "ram_gib": 60,
       "os": "Linux",
       "quant": "IQ3_S",
+      "kv": "int8",
       "prefill_16k_tps": 2369.8,
       "prefill_64k_tps": 2459.0,
       "decode_tps": 161.3,
@@ -71,6 +77,7 @@
       "date": "2026-10-23",
       "commit": "702c08f783",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 4000 Blackwell",
@@ -81,6 +88,7 @@
       "ram_gib": 123,
       "os": "Linux",
       "quant": "UD-Q6_K_XL",
+      "kv": "int8",
       "prefill_16k_tps": 2674.5,
       "prefill_64k_tps": 2970.3,
       "decode_tps": 65.9
@@ -90,6 +98,7 @@
       "date": "2026-10-23",
       "commit": "9c3692e7f5",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -100,6 +109,7 @@
       "ram_gib": 247,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 9556.4,
       "prefill_64k_tps": 10541.5,
       "decode_tps": 311.8,
@@ -110,6 +120,7 @@
       "date": "2026-10-23",
       "commit": "702c08f783",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 4000 Blackwell",
@@ -120,6 +131,7 @@
       "ram_gib": 123,
       "os": "Linux",
       "quant": "IQ3_S",
+      "kv": "int8",
       "prefill_16k_tps": 3226.5,
       "prefill_64k_tps": 3511.3,
       "decode_tps": 187.3,
@@ -130,6 +142,7 @@
       "date": "2026-10-24",
       "commit": "588a4776ed",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -140,6 +153,7 @@
       "ram_gib": 62,
       "os": "Linux",
       "quant": "IQ3_S",
+      "kv": "int8",
       "prefill_16k_tps": 5677.1,
       "prefill_64k_tps": 5806.4,
       "decode_tps": 376.1,
@@ -150,6 +164,7 @@
       "date": "2026-10-24",
       "commit": "4ac80f68f6",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -171,6 +186,7 @@
       "ram_gbps": 79.5,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 7740.4,
       "prefill_64k_tps": 9607.9,
       "decode_tps": 461.3,
@@ -181,6 +197,7 @@
       "date": "2026-10-23",
       "commit": "702c08f783",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 4000 Blackwell",
@@ -191,6 +208,7 @@
       "ram_gib": 123,
       "os": "Linux",
       "quant": "IQ3_XXS",
+      "kv": "int8",
       "prefill_16k_tps": 3168.7,
       "prefill_64k_tps": 3425.4,
       "decode_tps": 201.8,
@@ -201,6 +219,7 @@
       "date": "2026-10-23",
       "commit": "702c08f783",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 4000 Blackwell",
@@ -211,6 +230,7 @@
       "ram_gib": 123,
       "os": "Linux",
       "quant": "UD-Q4_K_XL",
+      "kv": "int8",
       "prefill_16k_tps": 2865.9,
       "prefill_64k_tps": 3156.2,
       "decode_tps": 104.3,
@@ -221,6 +241,7 @@
       "date": "2026-10-23",
       "commit": "702c08f783",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 4000 Blackwell",
@@ -231,6 +252,7 @@
       "ram_gib": 123,
       "os": "Linux",
       "quant": "UD-Q5_K_XL",
+      "kv": "int8",
       "prefill_16k_tps": 2981.3,
       "prefill_64k_tps": 3174.9,
       "decode_tps": 76.8,
@@ -241,6 +263,7 @@
       "date": "2026-10-24",
       "commit": "588a4776ed",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -252,6 +275,7 @@
       "cpu": "Intel Core Ultra 9 285K, 24 cores",
       "os": "Linux",
       "quant": "IQ3_S",
+      "kv": "int8",
       "prefill_16k_tps": 8858.9,
       "prefill_64k_tps": 9500.8,
       "decode_tps": 374.8,
@@ -262,6 +286,7 @@
       "date": "2026-10-24",
       "commit": "588a4776ed",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -273,6 +298,7 @@
       "cpu": "Intel Core Ultra 9 285K, 24 cores",
       "os": "Linux",
       "quant": "IQ3_XXS",
+      "kv": "int8",
       "prefill_16k_tps": 8784.2,
       "prefill_64k_tps": 9326.3,
       "decode_tps": 564.5,
@@ -283,6 +309,7 @@
       "date": "2026-10-24",
       "commit": "588a4776ed",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -294,6 +321,7 @@
       "cpu": "Intel Core Ultra 9 285K, 24 cores",
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 9288.7,
       "prefill_64k_tps": 10095.3,
       "decode_tps": 305.4,
@@ -304,6 +332,7 @@
       "date": "2026-10-24",
       "commit": "91bc15a580",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090 Laptop GPU",
@@ -314,6 +343,7 @@
       "ram_gib": 47,
       "os": "WSL2",
       "quant": "IQ3_XXS",
+      "kv": "int8",
       "prefill_16k_tps": 3892.1,
       "prefill_64k_tps": 4215.1,
       "decode_tps": 243.0
@@ -323,6 +353,7 @@
       "date": "2026-10-24",
       "commit": "702c08f783",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 4000 Blackwell",
@@ -333,6 +364,7 @@
       "ram_gib": 123,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 4072.5,
       "prefill_64k_tps": 4193.3,
       "decode_tps": 130.6,
@@ -343,6 +375,7 @@
       "date": "2026-10-25",
       "commit": "8d73a39477",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -357,6 +390,7 @@
       "ram_gbps": 57.6,
       "os": "Windows",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 2431.2,
       "prefill_64k_tps": 5600.8,
       "decode_tps": 199.1,
@@ -367,6 +401,7 @@
       "date": "2026-10-24",
       "commit": "91bc15a580",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 4000 Blackwell",
@@ -381,6 +416,7 @@
       "ram_gbps": 29.0,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 3315.6,
       "prefill_64k_tps": 4015.6,
       "decode_tps": 96.1
@@ -390,6 +426,7 @@
       "date": "2026-10-24",
       "commit": "91bc15a580",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 4000 Blackwell",
@@ -404,6 +441,7 @@
       "ram_gbps": 29.0,
       "os": "Linux",
       "quant": "IQ3_XXS",
+      "kv": "int8",
       "prefill_16k_tps": 2893.9,
       "prefill_64k_tps": 3423.3,
       "decode_tps": 188.6
@@ -413,6 +451,7 @@
       "date": "2026-10-25",
       "commit": "91bc15a580",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 4000 Blackwell",
@@ -427,6 +466,7 @@
       "ram_gbps": 29.0,
       "os": "Linux",
       "quant": "IQ3_S",
+      "kv": "int8",
       "prefill_16k_tps": 3236.0,
       "prefill_64k_tps": 3577.8,
       "decode_tps": 158.0
@@ -436,6 +476,7 @@
       "date": "2026-10-25",
       "commit": "91bc15a580",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 4000 Blackwell",
@@ -450,6 +491,7 @@
       "ram_gbps": 29.0,
       "os": "Linux",
       "quant": "Q4_K_XL",
+      "kv": "int8",
       "prefill_16k_tps": 2983.3,
       "prefill_64k_tps": 3246.6,
       "decode_tps": 72.4
@@ -459,6 +501,7 @@
       "date": "2026-10-25",
       "commit": "a57fade43e",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -480,6 +523,7 @@
       "ram_gbps": 58.4,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 7741.2,
       "prefill_64k_tps": 9239.3,
       "decode_tps": 437.5
@@ -489,6 +533,7 @@
       "date": "2026-10-25",
       "commit": "a57fade43e",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -503,6 +548,7 @@
       "ram_gbps": 58.3,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 7732.5,
       "prefill_64k_tps": 9229.4,
       "decode_tps": 317.2
@@ -512,6 +558,7 @@
       "date": "2026-10-25",
       "commit": "a57fade43e",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5060 Ti",
@@ -526,6 +573,7 @@
       "ram_gbps": 58.3,
       "os": "Linux",
       "quant": "IQ3_S",
+      "kv": "int8",
       "prefill_16k_tps": 2427.2,
       "prefill_64k_tps": 2430.0,
       "decode_tps": 137.0
@@ -535,6 +583,7 @@
       "date": "2026-10-25",
       "commit": "a57fade43e",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5060 Ti",
@@ -549,6 +598,7 @@
       "ram_gbps": 58.7,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 2686.6,
       "prefill_64k_tps": 2699.1,
       "decode_tps": 91.9
@@ -558,6 +608,7 @@
       "date": "2026-10-26",
       "commit": "471dc4ca04",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5060 Ti",
@@ -579,6 +630,7 @@
       "ram_gbps": 76.0,
       "os": "Linux",
       "quant": "IQ3_XXS",
+      "kv": "int8",
       "prefill_16k_tps": 2756.0,
       "prefill_64k_tps": 2740.8,
       "decode_tps": 229.6,
@@ -589,6 +641,7 @@
       "date": "2026-10-28",
       "commit": "b9f9b125af",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5060 Ti",
@@ -617,6 +670,7 @@
       "ram_gbps": 70.0,
       "os": "Linux",
       "quant": "IQ3_S",
+      "kv": "int8",
       "prefill_16k_tps": 2479.3,
       "prefill_64k_tps": 2471.2,
       "decode_tps": 195.7,
@@ -627,6 +681,7 @@
       "date": "2026-10-30",
       "commit": "6025cbcf30",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -648,6 +703,7 @@
       "ram_gbps": 67.1,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 8036.6,
       "prefill_64k_tps": 10981.7,
       "decode_tps": 438.7
@@ -657,6 +713,7 @@
       "date": "2026-10-30",
       "commit": "6025cbcf30",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -678,6 +735,7 @@
       "ram_gbps": 63.8,
       "os": "Linux",
       "quant": "Q4_K_XL",
+      "kv": "int8",
       "prefill_16k_tps": 5630.7,
       "prefill_64k_tps": 6416.5,
       "decode_tps": 309.3
@@ -687,6 +745,7 @@
       "date": "2026-10-31",
       "commit": "c15bbd27d5",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5060 Ti",
@@ -708,6 +767,7 @@
       "ram_gbps": 45.0,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 2249.0,
       "prefill_64k_tps": 3566.9,
       "decode_tps": 156.6,
@@ -718,6 +778,7 @@
       "date": "2026-11-01",
       "commit": "9175e7a321",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 6000 Blackwell Workstation Edition",
@@ -732,6 +793,7 @@
       "ram_gbps": 79.2,
       "os": "Windows",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 9522.6,
       "prefill_64k_tps": 11860.5,
       "decode_tps": 498.3,
@@ -742,6 +804,7 @@
       "date": "2026-11-01",
       "commit": "9175e7a321",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX PRO 6000 Blackwell Workstation Edition",
@@ -756,6 +819,7 @@
       "ram_gbps": 81.2,
       "os": "Windows",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 8117.2,
       "prefill_64k_tps": 8488.7,
       "decode_tps": 423.1,
@@ -766,6 +830,7 @@
       "date": "2026-11-01",
       "commit": "9175e7a321",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -787,6 +852,7 @@
       "ram_gbps": 75.7,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 8233.0,
       "prefill_64k_tps": 12741.9,
       "decode_tps": 553.6,
@@ -797,6 +863,7 @@
       "date": "2026-10-31",
       "commit": "9175e7a321",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -818,6 +885,7 @@
       "ram_gbps": 147.8,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 7696.1,
       "prefill_64k_tps": 11629.7,
       "decode_tps": 497.8
@@ -827,6 +895,7 @@
       "date": "2026-10-26",
       "commit": "31aacda2d4",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5080",
@@ -848,6 +917,7 @@
       "ram_gbps": 88.8,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 5031.8,
       "prefill_64k_tps": 5580.6,
       "decode_tps": 286.1
@@ -857,6 +927,7 @@
       "date": "2026-10-26",
       "commit": "31aacda2d4",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5080",
@@ -892,6 +963,7 @@
       "ram_gbps": 86.9,
       "os": "Linux",
       "quant": "NVFP4",
+      "kv": "int8",
       "prefill_16k_tps": 5045.4,
       "prefill_64k_tps": 5581.2,
       "decode_tps": 343.0
@@ -901,6 +973,7 @@
       "date": "2026-10-26",
       "commit": "b2fe96bf30",
       "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5080",
@@ -915,9 +988,232 @@
       "ram_gbps": 71.1,
       "os": "Linux",
       "quant": "IQ3_S",
+      "kv": "int8",
       "prefill_16k_tps": 4876.9,
       "prefill_64k_tps": 4961.0,
       "decode_tps": 186.8
+    },
+    {
+      "submitter": "Redhot-Local",
+      "date": "2026-11-04",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        }
+      ],
+      "ram_gib": 62,
+      "cpu": "AMD Ryzen 9 9900X, 12 cores",
+      "ram_gbps": 75.2,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "kv": "int8",
+      "prefill_16k_tps": 2531.6,
+      "prefill_64k_tps": 2521.6,
+      "decode_tps": 159.0,
+      "notes": "Single RTX 5060 Ti 16GB, 2x32GB DDR5-6000, no desktop environment"
+    },
+    {
+      "submitter": "Serpov",
+      "date": "2026-11-04",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.7
+        },
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        },
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "4.0 x4",
+          "h2d_gbps": 6.5
+        },
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "4.0 x4",
+          "h2d_gbps": 7.0
+        }
+      ],
+      "ram_gib": 92,
+      "cpu": "Intel Core Ultra 7 270K Plus, 24 cores",
+      "ram_gbps": 101.0,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 4841.8,
+      "prefill_64k_tps": 5023.2,
+      "decode_tps": 315.6,
+      "notes": "4x RTX 5070 Ti at a 250 W limit (300 W default); two cards on chipset 4.0 x4 slots; resident experts, 0 SSD spill"
+    },
+    {
+      "submitter": "WenbinHuang",
+      "date": "2026-11-05",
+      "commit": "dc047a77be",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 43.1
+        }
+      ],
+      "ram_gib": 64,
+      "cpu": "13th Gen Intel Core i7-13700K, 16 cores",
+      "ram_gbps": 70.2,
+      "os": "Windows",
+      "quant": "IQ3_S",
+      "kv": "int8",
+      "prefill_16k_tps": 3976.2,
+      "prefill_64k_tps": 4589.6,
+      "decode_tps": 137.5
+    },
+    {
+      "submitter": "wadeubuntu",
+      "date": "2026-11-05",
+      "commit": "dc047a77be",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 26.1
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "13th Gen Intel Core i7-13700K, 16 cores",
+      "ram_gbps": 69.4,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "kv": "int8",
+      "prefill_16k_tps": 4730.4,
+      "prefill_64k_tps": 5045.3,
+      "decode_tps": 192.3
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-05",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.8
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.6,
+      "os": "Windows",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 7922.8,
+      "prefill_64k_tps": 9865.8,
+      "decode_tps": 369.3
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-05",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.7
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.6,
+      "os": "Windows",
+      "quant": "Q4_K_XL",
+      "kv": "int8",
+      "prefill_16k_tps": 7277.6,
+      "prefill_64k_tps": 8410.7,
+      "decode_tps": 219.6
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-05",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16"
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.5,
+      "os": "Windows",
+      "quant": "Q5_K_XL",
+      "kv": "int8",
+      "prefill_16k_tps": 6788.8,
+      "prefill_64k_tps": 8215.2,
+      "decode_tps": 162.4
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-05",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.8
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 63.3,
+      "os": "Windows",
+      "quant": "IQ3_S",
+      "kv": "int8",
+      "prefill_16k_tps": 7910.8,
+      "prefill_64k_tps": 9180.7,
+      "decode_tps": 431.1
     }
   ]
 }
