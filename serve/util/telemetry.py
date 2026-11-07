@@ -208,7 +208,15 @@ class Telemetry:
             "cuda": first.cuda_version() if hasattr(first, "cuda_version") else None,
         }
         self._disk_prev = None
+        self._stopped = threading.Event()
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self) -> None:
+        """End the sampling thread; the readings taken so far stay readable."""
+        self._stopped.set()
+
+    def stopped(self) -> bool:
+        return self._stopped.is_set()
 
     def _disk(self):
         """Disk read MB/s since the last call; None without psutil or on the first call."""
@@ -266,9 +274,9 @@ class Telemetry:
                         h[k].append(_r2(g.get(k)))
 
     def _loop(self):
-        while True:
+        while not self._stopped.is_set():
             self.record(self.sample())
-            time.sleep(1.0)
+            self._stopped.wait(1.0)
 
     def snapshot(self):
         with self.lock:
