@@ -35,6 +35,26 @@ VisionPlan plan_image(int w, int h, int merge, int min_pixels, int max_tokens = 
 /// [-1, 1] and rounded to bf16.
 void image_patches(const basalt::vision::Image& src, const VisionPlan& plan, std::vector<float>& rows);
 
+/// The cuBLAS handle the encoders share. Creating it and running its first products takes host memory for good, so the
+/// model opens it at load, before the expert tier reads the free RAM; an encoder borrows it and never destroys it.
+class VisionBlas {
+public:
+    VisionBlas();
+    ~VisionBlas();
+    VisionBlas(const VisionBlas&) = delete;
+    VisionBlas& operator=(const VisionBlas&) = delete;
+
+    /// Creates the handle on the current device and runs one small product of each kind the encoder uses. Does nothing
+    /// when already open.
+    bool open(std::string& err);
+
+    struct Impl;
+
+private:
+    friend class VisionEncoder;
+    std::unique_ptr<Impl> impl_;
+};
+
 class VisionEncoder {
 public:
     VisionEncoder();
@@ -43,7 +63,8 @@ public:
     VisionEncoder& operator=(const VisionEncoder&) = delete;
 
     /// Uploads the projector `mp` (a deepseek41v file) to the current device; buffers grow on demand up to `max_patches`.
-    bool init(const basalt::vision::Mmproj& mp, int max_patches, std::string& err);
+    /// `blas` is opened here when it is not yet, and must outlive the encoder.
+    bool init(const basalt::vision::Mmproj& mp, int max_patches, VisionBlas& blas, std::string& err);
     /// `out` = [plan.n_tokens()][width] floats, the embedding block.
     bool encode(const std::vector<float>& rows, const VisionPlan& plan, std::vector<float>& out, std::string& err);
     int width() const;

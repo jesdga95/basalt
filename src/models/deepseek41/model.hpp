@@ -5,6 +5,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/ngram/ple_reader.hpp"
+#include "basalt/models/deepseek41/vision.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "models/deepseek41/pack.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
@@ -91,6 +92,8 @@ public:
     /// Opens the image projector: the diagnostic standalone file when set, else the pack's vision section.
     /// False with `err` set when neither exists.
     bool open_mmproj(vision::Mmproj& mp, std::string& err) const;
+    /// The image encoders' cuBLAS handle, opened by the expert tier at load when images are on.
+    VisionBlas& vision_blas() const { return vision_blas_; }
 
 private:
     CacheFormat cache_format_ = CacheFormat::Fp8;
@@ -103,6 +106,7 @@ private:
     int device_ = 0;
     model::LoadRequest tiers_;
     mutable SharedTier shared_tier_;
+    mutable VisionBlas vision_blas_;
     int64_t ctx_ = 0;
     static int64_t ctxp_default();
     int embd_fd_ = -1;
