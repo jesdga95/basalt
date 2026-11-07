@@ -78,7 +78,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
 ## Vision: `--vision`
 
 `--vision off | dynamic | cpu | <GPU number>` (config: `"vision"` in `server`). The encoder is Basalt's own, and all modes give bitwise
-identical embeddings. All of them read the projector in place from the model file's `vision/mmproj` section.
+identical embeddings. All of them read the projector in place from the model file's `vision/mmproj` section. The text can still
+differ between modes: the sidecar's VRAM cost shrinks the expert cache, and which experts run on the GPU or the CPU shifts the
+last bits of the logits, so a greedy answer can fork after some tokens (`dynamic` does the same with a different cache size).
 
 | Mode | Encoder runs | VRAM cost | Fresh-image TTFT (IQ3_S, 400 W): 1k / 3k / 4k image tokens |
 | --- | --- | --- | --- |
