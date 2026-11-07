@@ -2215,7 +2215,7 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L) {
 #undef DM_OK
         default: break;
     }
-    const bool t1 = L.gu_type == 40;   // NVFP4 gate/up: dm_glue_gu1_kernel
+    const bool t1 = L.gu_type == 40 || L.gu_type == 13 || L.gu_type == 14;   // gate/up without gu2 row pairs: dm_glue_gu1_kernel
     return (tg || t1) && td && (t1 || gu2_usable(L)) && L.n_ff == 640 && native_grouped_gu2() >= 2 && !iq_old_kernels() && !native_grouped_v1() &&
            native_expert_phase() == 0;
 }
@@ -2234,7 +2234,7 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
     float* up = (float*) ((uint8_t*) scratch + fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const int gy = g_dec_gy > 0 ? std::min(cap, g_dec_gy) : cap;
-    const int ir = L.gu_type == 40 ? GU_ROWS : GU2_ROWS;   // rows an item: dm_glue_gu1_kernel's, dm_glue_gu_kernel's
+    const int ir = (L.gu_type == 40 || L.gu_type == 13 || L.gu_type == 14) ? GU_ROWS : GU2_ROWS;   // rows an item: dm_glue_gu1_kernel's, dm_glue_gu_kernel's
     const int items = (int) ((2 * L.n_ff + ir - 1) / ir) * cap;
     auto go = [&](auto kernel, int resident) {
         const int nb = std::max(1, std::min(items, resident)) + (a.ring_on ? 1 : 0);
@@ -2250,6 +2250,8 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
     } else
     switch (L.gu_type) {
         case 40: go(dm_glue_gu1_kernel<40>, dm_glue1_blocks<40>()); break;
+        case 13: go(dm_glue_gu1_kernel<13>, dm_glue1_blocks<13>()); break;
+        case 14: go(dm_glue_gu1_kernel<14>, dm_glue1_blocks<14>()); break;
         case 16: go(dm_glue_gu_kernel<16>, dm_glue_blocks<16>()); break;
         case 17: go(dm_glue_gu_kernel<17>, dm_glue_blocks<17>()); break;
         case 18: go(dm_glue_gu_kernel<18>, dm_glue_blocks<18>()); break;
