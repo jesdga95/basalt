@@ -16,9 +16,9 @@ from Unsloth's UD-IQ1_M GGUF. Its layout and the DSpark section: [model file](..
   rest are read from the pack by the CPU. When RAM takes them all, the main card's slots copy the RAM tier's head instead. Either way
   the main card fills the rest of its memory with copies, down to what a short prompt needs. The start line
   `expert homes of 384 per layer: ...` gives the split.
-- **RAM:** the prompt path's and the images' host buffers are allocated at start, before the RAM tier: the pinned ring of
-  second-card and file reads (five layers of the second card's homes, at most 240 experts), the staging of a short read, a chunk's
-  Engram reads, and each slot's largest image. The tier then leaves `--ram-reserve-mib` free beside the driver's tracking of its
+- **RAM:** the prompt path's and the images' host buffers are allocated at start, before the RAM tier: the pinned ring of file
+  reads (only when experts may stay in the file, at most 240 experts), the staging of a short read, the second card's prompt
+  rows, a chunk's Engram reads, and each slot's largest image. The tier then leaves `--ram-reserve-mib` free beside the driver's tracking of its
   pinned pages (`RAM floor X GiB of N GiB free`). N places short puts N experts of every layer in the file, with a warning naming
   the RAM to free.
 - **Slots follow routing:** an expert that keeps missing takes the slot used longest ago, on either card.
@@ -34,6 +34,9 @@ from Unsloth's UD-IQ1_M GGUF. Its layout and the DSpark section: [model file](..
 - Chunks are 16,384 tokens, halved down to 256 to fit memory.
 - A read of more than 2,048 tokens gives back the copies the main card grew into its spare memory; from 4,096 tokens, a main card
   without homes gives back all its slots. Afterwards the grown copies reopen from routing order, the other slots empty.
+- With a second card, each layer of a chunk splits its experts: the second card computes its own and a share of the RAM ones,
+  read over its own PCIe link, while the main card computes the rest; the share is priced from each card's link and SM clock.
+  Its prompt buffers come out of the second card's memory before its slots are sized.
 - `--no-prompt-skip` runs every row through every layer. Without it, rows further than 2,668 positions from the read's end stop
   at layer 20 (the math is the same; rounding differs; [precision](../precision/deepseek41.md#prompt-skip)).
 - A next turn that starts with the held tokens (or the checkpoint) reads only the new tail. `pp=N/Mc` in the `done` line shows how many
