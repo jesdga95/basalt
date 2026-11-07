@@ -615,8 +615,11 @@ public:
         ExpertTier::Reserve r;
         // the caches of a full context grow into the reserve beside the copies; a prompt borrows the copies
         r.copies = m_.context_bytes() * (uint64_t) m_.sessions() + kModuleRoom;
-        r.homes = m_.context_bytes() * (uint64_t) m_.sessions() + prefillp::workspace_bytes(d, prefillp::kHomeChunk) + prefillp::ahead_bytes(d) +
-                  prefillp::kMargin + kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
+        // beside the homes a prompt keeps the full context's caches and a kHomeChunk chunk, and a shorter prompt (whose
+        // caches are small) the largest chunk the context allows
+        const uint64_t prompt_room = std::max(m_.context_bytes() * (uint64_t) m_.sessions() + prefillp::workspace_bytes(d, prefillp::kHomeChunk),
+                                              prefillp::workspace_bytes(d, std::min(prefillp::kMaxChunk, ctx_)));
+        r.homes = prompt_room + prefillp::ahead_bytes(d) + prefillp::kMargin + kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
         r.beside_homes = prefillp::workspace_bytes(d, prefillp::kShortChunk) + prefillp::kShortMargin;
         r.modules = kModuleRoom;
         if (!t->open(r, h_rows_, err)) return false;
