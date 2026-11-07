@@ -116,6 +116,21 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
     if (i < n) dst[i] = (int32_t) i;
 }
 
+// Word `w` (16 bytes) of row `r` of a gathered q8_1 buffer: the activation blocks lie block-column by block-column, each
+// column holding one block of every row, so row r of `dst` takes the blocks of row ids[r] of `src`.
+__device__ __forceinline__ void gather_q8_stage(const uint4* __restrict__ src, int64_t src_rows, const int32_t* __restrict__ ids,
+                                                uint4* __restrict__ dst, int64_t rows, int64_t r, int64_t w) {
+    constexpr int64_t kWords = sizeof(block_q8_1_mmq) / sizeof(uint4);
+    const int64_t kb = w / kWords, j = w - kb * kWords;
+    dst[(kb * rows + r) * kWords + j] = src[(kb * src_rows + ids[r]) * kWords + j];
+}
+
+__global__ void gather_q8_kernel(const uint4* __restrict__ src, int64_t src_rows, const int32_t* __restrict__ ids,
+                                 uint4* __restrict__ dst, int64_t rows, int64_t words) {
+    const int64_t w = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (w < words) gather_q8_stage(src, src_rows, ids, dst, rows, blockIdx.x, w);
+}
+
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 }  // namespace
@@ -284,6 +299,15 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved,
                                                                            (const float4*) tail, bounds, n);
     ck(cudaGetLastError(), "swiglu");
+}
+
+void gather_q8(const void* xq, int64_t src_rows, const int32_t* ids, void* dst, int64_t rows, int64_t cols, void* stream) {
+    if (rows <= 0) return;
+    static_assert(sizeof(block_q8_1_mmq) % sizeof(uint4) == 0, "q8_1 blocks are whole 16-byte words");
+    const int64_t words = pad512(cols) / (4 * QK8_1) * (int64_t) (sizeof(block_q8_1_mmq) / sizeof(uint4));
+    gather_q8_kernel<<<dim3((unsigned) rows, (unsigned) ((words + 127) / 128)), 128, 0, (cudaStream_t) stream>>>(
+        (const uint4*) xq, src_rows, ids, (uint4*) dst, rows, words);
+    ck(cudaGetLastError(), "gather_q8");
 }
 
 void iota(int32_t* dst, int64_t n, void* stream) {
