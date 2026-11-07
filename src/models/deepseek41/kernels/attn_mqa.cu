@@ -449,8 +449,10 @@ void sparse_mqa(const MqaArgs& a, float* workspace, void* stream) {
     float* ml = workspace + (size_t) a.n_tokens * kAttnHeads * n_chunks * kAttnHeadDim;
 
     // window and compressed chunks share one launch
-    const LatentType w = a.win_type, c = sparse ? a.comp_type : (w == LatentType::Fp8 ? LatentType::Fp4 : LatentType::F32);
+    const LatentType w = a.win_type,
+                     c = sparse ? a.comp_type : w == LatentType::Fp8 ? LatentType::Fp4 : w == LatentType::F16 ? LatentType::F16 : LatentType::F32;
     if (w == LatentType::Fp8 && c == LatentType::Fp4) launch_partial<RowFp8, RowFp4>(a, nw, n_chunks, o_part, ml, s);
+    else if (w == LatentType::F16 && c == LatentType::F16) launch_partial<RowF16, RowF16>(a, nw, n_chunks, o_part, ml, s);
     else if (w == LatentType::F16 && c == LatentType::F32) launch_partial<RowF16, RowF32>(a, nw, n_chunks, o_part, ml, s);
     else if (w == LatentType::F32 && c == LatentType::F32) launch_partial<RowF32, RowF32>(a, nw, n_chunks, o_part, ml, s);
     else throw std::invalid_argument("sparse_mqa: latent types");

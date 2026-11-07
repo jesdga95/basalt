@@ -35,7 +35,7 @@ Each entry is checked before anything loads, by the engine's own rules:
 | Value the model refuses (`max-context` past its maximum) | stops the start | stops the start |
 | Unknown name | stops the start | stops the start |
 
-`kv` in a DeepSeek entry stops the start (it has no KV choice). Two aliases that are the same, or two entries sharing a cache
+`kv` takes each model's own values (`fp8` or `fp16` for DeepSeek); another value stops the start. Two aliases that are the same, or two entries sharing a cache
 directory, stop the start too.
 
 ## Requests and turns

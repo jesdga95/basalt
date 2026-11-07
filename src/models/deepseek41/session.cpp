@@ -337,8 +337,8 @@ public:
     std::string info_words() const override {
         std::string e;
         ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
-        return t == nullptr ? std::string("kv=fp8+fp4")
-                            : "expert_slots=" + std::to_string(t->slots()) + " kv=fp8+fp4 " + program::spill_words(t->spill());
+        const std::string kv = m_.cache_format() == CacheFormat::Fp8 ? "kv=fp8+fp4" : "kv=fp16";
+        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill());
     }
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }

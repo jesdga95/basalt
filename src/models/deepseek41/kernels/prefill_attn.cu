@@ -59,7 +59,7 @@ __device__ __forceinline__ void rotate_pair(float& x0, float& x1, float pos, flo
     x1 = b;
 }
 
-template <bool kWindow>
+template <bool kWindow, bool kPacked>
 __global__ void __launch_bounds__(kThreads) mqa_tc_partial(MqaArgs a, int chunk0, int n_total, float* o_part, float* ml) {
     extern __shared__ __align__(128) unsigned char smem[];
     half* qs = reinterpret_cast<half*>(smem);
@@ -114,7 +114,9 @@ __global__ void __launch_bounds__(kThreads) mqa_tc_partial(MqaArgs a, int chunk0
         const int kk = i / (kAttnHeadDim / 8), d = (i % (kAttnHeadDim / 8)) * 8;
         const int row = rowid[kk];
         uint4 v = make_uint4(0, 0, 0, 0);
-        if (row >= 0) {
+        if (row >= 0 && !kPacked) {
+            v = *reinterpret_cast<const uint4*>(base + ((size_t) row * kAttnHeadDim + d) * 2);
+        } else if (row >= 0) {
             float k[8];
             if (kWindow) {
                 const uint8_t* r = base + (size_t) row * kWinRowBytes;
@@ -235,14 +237,14 @@ void check(const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
-template <bool kWindow>
+template <bool kWindow, bool kPacked>
 void launch(const MqaArgs& a, int n_chunks, int chunk0, int n_total, float* o_part, float* ml, cudaStream_t s) {
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(mqa_tc_partial<kWindow>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kSmemBytes);
+        cudaFuncSetAttribute(mqa_tc_partial<kWindow, kPacked>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kSmemBytes);
         attr = true;
     }
-    mqa_tc_partial<kWindow><<<dim3(n_chunks, kAttnHeads / kHeads, a.n_tokens), kThreads, kSmemBytes, s>>>(a, chunk0, n_total,
+    mqa_tc_partial<kWindow, kPacked><<<dim3(n_chunks, kAttnHeads / kHeads, a.n_tokens), kThreads, kSmemBytes, s>>>(a, chunk0, n_total,
                                                                                                           o_part, ml);
     check("mqa_tc_partial");
 }
@@ -250,8 +252,9 @@ void launch(const MqaArgs& a, int n_chunks, int chunk0, int n_total, float* o_pa
 }  // namespace
 
 void sparse_mqa_tc(const MqaArgs& a, float* workspace, void* stream) {
-    if (a.n_tokens < 1 || a.n_sel > 512 || a.n_sel < 0 || a.win_type != LatentType::Fp8 ||
-        (a.sel && a.n_sel > 0 && a.comp_type != LatentType::Fp4))
+    const bool packed = a.win_type == LatentType::Fp8;
+    if (a.n_tokens < 1 || a.n_sel > 512 || a.n_sel < 0 || (a.win_type != LatentType::Fp8 && a.win_type != LatentType::F16) ||
+        (a.sel && a.n_sel > 0 && a.comp_type != (packed ? LatentType::Fp4 : LatentType::F16)))
         throw std::invalid_argument("sparse_mqa_tc: arguments");
     cudaStream_t s = (cudaStream_t) stream;
     const bool sparse = a.sel != nullptr && a.n_sel > 0;
@@ -259,8 +262,13 @@ void sparse_mqa_tc(const MqaArgs& a, float* workspace, void* stream) {
     const int n_chunks = nw + ns;
     float* o_part = workspace;
     float* ml = workspace + (size_t) a.n_tokens * kAttnHeads * n_chunks * kAttnHeadDim;
-    launch<true>(a, nw, 0, n_chunks, o_part, ml, s);
-    if (sparse) launch<false>(a, ns, nw, n_chunks, o_part, ml, s);
+    if (packed) {
+        launch<true, true>(a, nw, 0, n_chunks, o_part, ml, s);
+        if (sparse) launch<false, true>(a, ns, nw, n_chunks, o_part, ml, s);
+    } else {
+        launch<true, false>(a, nw, 0, n_chunks, o_part, ml, s);
+        if (sparse) launch<false, false>(a, ns, nw, n_chunks, o_part, ml, s);
+    }
     mqa_tc_merge<<<dim3(kAttnHeads, a.n_tokens), 256, 0, s>>>(o_part, ml, n_chunks, a.sinks, a.pos, a.rope, a.out);
     check("mqa_tc_merge");
 }

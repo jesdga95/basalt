@@ -17,6 +17,7 @@ struct Case {
     int T, n_sel, win_cap, n_comp;
     bool masked_ids;
     std::vector<int> win_n;
+    bool fp16 = false;   ///< the caches' fp16 rows instead of the packed ones
 };
 
 std::vector<double> reference(const Case& c, const std::vector<float>& q, const std::vector<float>& win,
@@ -62,8 +63,17 @@ std::vector<double> reference(const Case& c, const std::vector<float>& q, const 
     return out;
 }
 
-// The packed rows (window: Fp8, compressed: Fp4) of values v[rows][512]; v becomes the values the rows hold.
-std::vector<uint8_t> packed(std::vector<float>& v, bool window) {
+// The cache rows (window: Fp8, compressed: Fp4; or fp16 both) of values v[rows][512]; v becomes the values the rows hold.
+std::vector<uint8_t> packed(std::vector<float>& v, bool window, bool fp16) {
+    if (fp16) {
+        std::vector<uint8_t> b(v.size() * 2);
+        for (size_t i = 0; i < v.size(); ++i) {
+            const __half h = __float2half(v[i]);
+            v[i] = __half2float(h);
+            std::memcpy(&b[2 * i], &h, 2);
+        }
+        return b;
+    }
     const Round k = window ? Round::Fp8Pow2 : Round::Fp4E4m3;
     const int rb = window ? kWinRowBytes : kCompRowBytes;
     std::vector<uint8_t> b;
@@ -86,7 +96,7 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
     auto win = dstest::randn((size_t) c.win_cap * 512, seed + 1, 1.0f);
     auto comp = dstest::randn((size_t) c.n_comp * 512, seed + 2, 1.0f);
     auto sinks = dstest::randn(64, seed + 3, 1.0f);
-    const auto wrows = packed(win, true), crows = packed(comp, false);
+    const auto wrows = packed(win, true, c.fp16), crows = packed(comp, false, c.fp16);
     std::mt19937 g(seed + 4);
     std::vector<int32_t> sel((size_t) c.T * std::max(c.n_sel, 1)), limit(c.T), wstart(c.T), pos(c.T), wn(c.win_n);
     for (int t = 0; t < c.T; ++t) {
@@ -107,8 +117,8 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
     Dev<int32_t> dsel(sel), dlim(limit), dws0(wstart), dwn(wn), dpos(pos);
 
     MqaArgs a;
-    a.n_tokens = c.T; a.q = dq.p; a.win = wdev.p; a.win_type = LatentType::Fp8; a.win_cap = c.win_cap;
-    a.win_start = dws0.p; a.win_n = dwn.p; a.comp = cdev.p; a.comp_type = LatentType::Fp4;
+    a.n_tokens = c.T; a.q = dq.p; a.win = wdev.p; a.win_type = c.fp16 ? LatentType::F16 : LatentType::Fp8; a.win_cap = c.win_cap;
+    a.win_start = dws0.p; a.win_n = dwn.p; a.comp = cdev.p; a.comp_type = c.fp16 ? LatentType::F16 : LatentType::Fp4;
     a.sel = c.n_sel ? dsel.p : nullptr; a.n_sel = c.n_sel; a.comp_limit = dlim.p; a.sinks = dsink.p;
     a.pos = dpos.p; a.rope = rope; a.out = dout.p;
     cudaStream_t s;
@@ -161,6 +171,8 @@ int main() {
         {"full T1", {1, 512, 130, 3000, true, {128}}},
         {"full T4", {4, 512, 132, 3000, true, {128, 100, 128, 7}}},
         {"full T3 masked", {3, 512, 135, 4096, true, {128, 128, 64}}},
+        {"full fp16 T4", {4, 512, 132, 3000, true, {128, 100, 128, 7}, true}},
+        {"window only fp16 T4", {4, 0, 128, 10, false, {128, 5, 77, 1}, true}},
         {"short sel T2", {2, 200, 128, 300, false, {128, 20}}},
         {"window only T4", {4, 0, 128, 10, false, {128, 5, 77, 1}}},
         {"nothing visible T2", {2, 64, 128, 100, true, {0, 3}}},

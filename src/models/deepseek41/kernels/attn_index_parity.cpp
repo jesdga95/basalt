@@ -60,15 +60,39 @@ void norm_rope(std::vector<double>& v, const float* w, double eps, double pos, c
     }
 }
 
-// The decoded values of packed rows `ids` (row r at r * rb).
+// The cache format the tests run on (both, in turn).
+CacheFormat g_fmt = CacheFormat::Fp8;
+bool packed() { return g_fmt == CacheFormat::Fp8; }
+
+// The values of cache rows `ids` of d values (row r at r * rb): packed as `k`, or fp16.
 std::vector<float> unpack_rows(const std::vector<uint8_t>& b, const std::vector<int>& ids, int d, int rb, Round k) {
     std::vector<float> v;
     for (int r : ids) {
-        const auto x = ref_unpack(&b[(size_t) r * rb], d, k);
-        v.insert(v.end(), x.begin(), x.end());
+        if (packed()) {
+            const auto x = ref_unpack(&b[(size_t) r * rb], d, k);
+            v.insert(v.end(), x.begin(), x.end());
+        } else {
+            for (int c = 0; c < d; ++c) {
+                __half h;
+                std::memcpy(&h, &b[(size_t) r * rb + 2 * (size_t) c], 2);
+                v.push_back(__half2float(h));
+            }
+        }
     }
     return v;
 }
+
+// n index-key rows of random values in the cache format.
+std::vector<uint8_t> key_rows(int n, uint32_t seed) {
+    if (packed()) return packed_rows(n, kIdxDim, kIdxRowBytes, Round::Fp4Pow2, seed);
+    const auto f = randn((size_t) n * kIdxDim, seed, 1.f);
+    std::vector<uint8_t> b(f.size() * 2);
+    for (size_t i = 0; i < f.size(); ++i) { const __half h = __float2half(f[i]); std::memcpy(&b[2 * i], &h, 2); }
+    return b;
+}
+int WRB() { return win_row_bytes(g_fmt); }
+int CRB() { return comp_row_bytes(g_fmt); }
+int IRB() { return idx_row_bytes(g_fmt); }
 
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -82,11 +106,11 @@ void test_kv_window(Verdict& v) {
         for (int i = 0; i < N; ++i) pos[i] = 1000 + 3 * i;
         Dev<float> draw(raw), dw(w), dfreq(freq), dout((size_t) N * kLatent), dout1((size_t) N * kLatent);
         Dev<int32_t> dpos(pos);
-        Dev<uint8_t> ring((size_t) kWindowSlots * kWinRowBytes), ring1((size_t) kWindowSlots * kWinRowBytes);
+        Dev<uint8_t> ring((size_t) kWindowSlots * WRB()), ring1((size_t) kWindowSlots * WRB());
         for (int b = 0; b < N; b += 4)
-            kv_window(draw.p + (size_t) b * kLatent, dw.p, dpos.p + b, 4, 1e-20f, dfreq.p, dout.p + (size_t) b * kLatent, ring.p, nullptr);
+            kv_window(draw.p + (size_t) b * kLatent, dw.p, dpos.p + b, 4, 1e-20f, dfreq.p, dout.p + (size_t) b * kLatent, ring.p, g_fmt, nullptr);
         for (int i = 0; i < N; ++i)
-            kv_window(draw.p + (size_t) i * kLatent, dw.p, dpos.p + i, 1, 1e-20f, dfreq.p, dout1.p + (size_t) i * kLatent, ring1.p, nullptr);
+            kv_window(draw.p + (size_t) i * kLatent, dw.p, dpos.p + i, 1, 1e-20f, dfreq.p, dout1.p + (size_t) i * kLatent, ring1.p, g_fmt, nullptr);
         check(cudaDeviceSynchronize(), "kv_window");
         const auto got = dout.down(), got1 = dout1.down();
         std::vector<double> ref;
@@ -106,18 +130,19 @@ void test_kv_window(Verdict& v) {
         for (int i = 0; i < N; ++i) {
             const int slot = pos[i] % kWindowSlots;
             slots.push_back(slot);
+            if (!packed()) continue;
             const auto want = ref_pack(&got[(size_t) i * kLatent], kLatent, Round::Fp8Pow2, kWinRowBytes);
             bad += std::memcmp(want.data(), &rg[(size_t) slot * kWinRowBytes], kWinRowBytes) != 0;
         }
         auto rounded = ref;
-        for (int i = 0; i < N; ++i) ref_round(&rounded[(size_t) i * kLatent], kLatent, Round::Fp8Pow2);
-        const auto dec = unpack_rows(rg, slots, kLatent, kWinRowBytes, Round::Fp8Pow2);
+        for (int i = 0; i < N && packed(); ++i) ref_round(&rounded[(size_t) i * kLatent], kLatent, Round::Fp8Pow2);
+        const auto dec = unpack_rows(rg, slots, kLatent, WRB(), Round::Fp8Pow2);
         const Err er = compare(dec, rounded);
         const double fl = flips(dec, rounded);
-        std::printf("kv_window comp=%d: rms_rel %.2e max_abs %.2e; ring rows differing from the CPU packing %zu, FP8 roundings "
-                    "on the other side of the double reference's %.4f (rms_rel %.2e)\n", comp, e.rms_rel, e.max_abs, bad, fl, er.rms_rel);
+        std::printf("[%s] kv_window comp=%d: rms_rel %.2e max_abs %.2e; ring rows differing from the CPU packing %zu, FP8 roundings "
+                    "on the other side of the double reference's %.4f (rms_rel %.2e)\n", packed() ? "fp8" : "fp16", comp, e.rms_rel, e.max_abs, bad, fl, er.rms_rel);
         v.expect(bad == 0, "kv_window ring rows equal the CPU packing");
-        v.expect(er.rms_rel < 1e-2 && fl < 0.01, "kv_window ring vs rounded reference");
+        v.expect(packed() ? er.rms_rel < 1e-2 && fl < 0.01 : er.rms_rel < 1e-3, "kv_window ring vs (rounded) reference");
     }
 }
 
@@ -126,7 +151,7 @@ void test_kv_window(Verdict& v) {
 struct CompState {
     Dev<float> skv, ssc;
     Dev<uint8_t> ckv, cik;
-    CompState(int ratio, int cap) : skv(ratio * kLatent), ssc(ratio * kLatent), ckv((size_t) cap * kCompRowBytes), cik((size_t) cap * kIdxRowBytes) {
+    CompState(int ratio, int cap) : skv(ratio * kLatent), ssc(ratio * kLatent), ckv((size_t) cap * CRB()), cik((size_t) cap * IRB()) {
         std::vector<float> z(ratio * kLatent, 0.f);
         skv.up(z);
         ssc.up(z);
@@ -159,7 +184,7 @@ void test_compress(Verdict& v) {
             CompressArgs a;
             a.ratio = ratio; a.w_kv = dwkv.p; a.w_gate = ratio > 1 ? dwg.p : nullptr; a.norm_w = dnw.p;
             a.w_idx_k = dwik.p; a.idx_k_norm_w = dnk.p; a.rope_freq = dfreq.p;
-            a.state_kv = st.skv.p; a.state_score = st.ssc.p; a.comp_kv = st.ckv.p; a.comp_ik = st.cik.p;
+            a.state_kv = st.skv.p; a.state_score = st.ssc.p; a.comp_kv = st.ckv.p; a.comp_ik = st.cik.p; a.format = g_fmt;
             int off = 0;
             for (int n : part) { compress(a, dx.p + (size_t) off * D, dpos.p + off, n, ws.p, nullptr); off += n; }
             check(cudaDeviceSynchronize(), "compress");
@@ -174,7 +199,7 @@ void test_compress(Verdict& v) {
             CompressArgs a;
             a.ratio = ratio; a.w_kv = dwkv.p; a.w_gate = ratio > 1 ? dwg.p : nullptr; a.norm_w = dnw.p;
             a.w_idx_k = dwik.p; a.idx_k_norm_w = dnk.p; a.rope_freq = dfreq.p;
-            a.state_kv = st.skv.p; a.state_score = st.ssc.p; a.comp_kv = st.ckv.p; a.comp_ik = st.cik.p;
+            a.state_kv = st.skv.p; a.state_score = st.ssc.p; a.comp_kv = st.ckv.p; a.comp_ik = st.cik.p; a.format = g_fmt;
             const int width[] = {4, 2, 5, 8, 3, 1}, kept[] = {2, 2, 1, 3, 3, 1};
             int off = 0;
             for (int i = 0; off < N; i = (i + 1) % 6) {
@@ -221,21 +246,23 @@ void test_compress(Verdict& v) {
             std::vector<double> ik(kIdxDim);
             for (int o = 0; o < kIdxDim; ++o) { double a = 0; for (int c = 0; c < kLatent; ++c) a += (double) from_bf16(wik[(size_t) o * kLatent + c]) * nrm[c]; ik[o] = a; }
             norm_rope(ik, nk.data(), 1e-20, p + 1 - ratio, freq);
-            ref_round(pre.data(), pre.size(), Round::Fp4E4m3);
-            ref_round(ik.data(), ik.size(), Round::Fp4Pow2);
+            if (packed()) {
+                ref_round(pre.data(), pre.size(), Round::Fp4E4m3);
+                ref_round(ik.data(), ik.size(), Round::Fp4Pow2);
+            }
             row_ids.push_back(p / ratio);
             rows.insert(rows.end(), pre.begin(), pre.end());
             iks.insert(iks.end(), ik.begin(), ik.end());
         }
-        const auto g = unpack_rows(outs[0], row_ids, kLatent, kCompRowBytes, Round::Fp4E4m3);
-        const auto gk = unpack_rows(outk[0], row_ids, kIdxDim, kIdxRowBytes, Round::Fp4Pow2);
+        const auto g = unpack_rows(outs[0], row_ids, kLatent, CRB(), Round::Fp4E4m3);
+        const auto gk = unpack_rows(outk[0], row_ids, kIdxDim, IRB(), Round::Fp4Pow2);
         // the first group of a call sequence that starts mid-group sees a zero partner row in both
         const Err e = compare(g, rows), ek = compare(gk, iks);
         const double fl = flips(g, rows), flk = flips(gk, iks);
         std::printf("compress ratio %d: %zu rows, latent rms_rel %.2e (FP4 roundings on the other side %.4f), index key "
                     "rms_rel %.2e (%.4f)\n", ratio, row_ids.size(), e.rms_rel, fl, ek.rms_rel, flk);
-        v.expect(e.rms_rel < 3e-2 && fl < 0.01, "compress latents vs rounded reference");
-        v.expect(ek.rms_rel < 3e-2 && flk < 0.01, "compress index keys vs rounded reference");
+        v.expect(packed() ? e.rms_rel < 3e-2 && fl < 0.01 : e.rms_rel < 2e-3, "compress latents vs (rounded) reference");
+        v.expect(packed() ? ek.rms_rel < 3e-2 && flk < 0.01 : ek.rms_rel < 3e-3, "compress index keys vs (rounded) reference");
     }
 }
 
@@ -253,7 +280,7 @@ Ref ref_scores(const std::vector<float>& qr, const std::vector<float>& x, const 
     r.scores.assign((size_t) T * n_comp, -INFINITY);
     std::vector<int> all(n_comp);
     std::iota(all.begin(), all.end(), 0);
-    const auto ik = unpack_rows(ikb, all, kIdxDim, kIdxRowBytes, Round::Fp4Pow2);
+    const auto ik = unpack_rows(ikb, all, kIdxDim, IRB(), Round::Fp4Pow2);
     for (int t = 0; t < T; ++t) {
         std::vector<double> iq((size_t) kIdxHeads * kIdxDim), iw(kIdxHeads);
         for (int o = 0; o < kIdxHeads * kIdxDim; ++o) {
@@ -268,7 +295,7 @@ Ref ref_scores(const std::vector<float>& qr, const std::vector<float>& x, const 
                 const double x0 = b[0], x1 = b[1];
                 b[0] = x0 * c - x1 * s; b[1] = x0 * s + x1 * c;
             }
-            ref_round(&iq[(size_t) h * kIdxDim], kIdxDim, Round::Fp4Pow2);
+            if (packed()) ref_round(&iq[(size_t) h * kIdxDim], kIdxDim, Round::Fp4Pow2);
             double a = 0;
             for (int d = 0; d < D; ++d) a += (double) from_bf16(wp[(size_t) h * D + d]) * x[(size_t) t * D + d];
             iw[h] = a / std::sqrt((double) kIdxHeads * kIdxDim);
@@ -317,7 +344,7 @@ void test_indexer(Verdict& v) {
     const auto freq = make_table(true);
     const auto wq = rand_bf16((size_t) kIdxHeads * kIdxDim * 1280, 31, 0.03f), wp = rand_bf16((size_t) kIdxHeads * D, 32, 0.03f);
     const auto wq2 = rand_bf16((size_t) kIdxHeads * kIdxDim * 1280, 33, 0.03f), wp2 = rand_bf16((size_t) kIdxHeads * D, 34, 0.03f);
-    const auto ik = packed_rows(n_comp, kIdxDim, kIdxRowBytes, Round::Fp4Pow2, 35);
+    const auto ik = key_rows(n_comp, 35);
     const auto qr = randn((size_t) T * 1280, 36, 1.f), x = randn((size_t) T * D, 37, 1.f);
     // positions: the last token sees n_comp rows; the others fewer (and one far below the top-k count)
     std::vector<int32_t> pos = {300, 4500, n_comp - 2, n_comp - 1};
@@ -333,7 +360,7 @@ void test_indexer(Verdict& v) {
         a.mode = mode == 0 ? IndexMode::Full : mode == 1 ? IndexMode::Level1 : IndexMode::Level2;
         a.ratio = ratio; a.n_comp = n_comp; a.block_size = bs; a.cand_blocks = cand_blocks;
         a.w_q = mode == 2 ? dwq2.p : dwq.p; a.w_proj = mode == 2 ? dwp2.p : dwp.p; a.rope_freq = dfreq.p; a.comp_ik = dik.p;
-        a.cand_ids = cand.p; a.cand_n = cn.p; a.out_ids = ids.p; a.out_n = nvld.p;
+        a.cand_ids = cand.p; a.cand_n = cn.p; a.out_ids = ids.p; a.out_n = nvld.p; a.format = g_fmt;
         // Level2 consumes the candidates the Level1 run (mode 1) left in `cand`
         indexer_select(a, dqr.p, dx.p, dpos.p, T, ws.p, nullptr);
         // T = 1 calls, one token each
@@ -347,7 +374,7 @@ void test_indexer(Verdict& v) {
         }
         check(cudaDeviceSynchronize(), "indexer");
         const auto gid = ids.down(), gn = nvld.down(), gid1 = ids1.down(), gn1 = n1.down(), gc = cand.down(), gcn = cn.down(), gc1 = c1.down(), gcn1 = cn1.down();
-        std::printf("indexer mode %s:\n", mode == 0 ? "Full" : mode == 1 ? "Level1" : "Level2");
+        std::printf("[%s] indexer mode %s:\n", packed() ? "fp8" : "fp16", mode == 0 ? "Full" : mode == 1 ? "Level1" : "Level2");
         v.expect(gid == gid1 && gn == gn1, "indexer ids independent of T");
         if (mode == 1) {
             for (int t = 0; t < T; ++t) {
@@ -490,16 +517,20 @@ void bench() {
     bench_line("compress ratio 2 T=4", bench_us([&] { compress(c, x.p, cpos.p, 4, cws.p, nullptr); }, 200), 2.0 * kLatent * D * 2);
     Dev<float> raw(randn(4 * kLatent, 51, 1.f)), out(4 * kLatent);
     Dev<uint8_t> ring((size_t) kWindowSlots * kWinRowBytes);
-    bench_line("kv_window T=4", bench_us([&] { kv_window(raw.p, nw.p, cpos.p, 4, 1e-20f, dfreq.p, out.p, ring.p, nullptr); }, 500), 4.0 * kLatent * 12);
+    bench_line("kv_window T=4", bench_us([&] { kv_window(raw.p, nw.p, cpos.p, 4, 1e-20f, dfreq.p, out.p, ring.p, CacheFormat::Fp8, nullptr); }, 500), 4.0 * kLatent * 12);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     Verdict v;
-    test_kv_window(v);
-    test_compress(v);
-    test_indexer(v);
+    for (CacheFormat f : {CacheFormat::Fp8, CacheFormat::Fp16}) {
+        g_fmt = f;
+        test_kv_window(v);
+        test_compress(v);
+        test_indexer(v);
+    }
+    g_fmt = CacheFormat::Fp8;
     test_top_rows(v);
     bench();
     bench_top_rows();

@@ -89,7 +89,7 @@ enum class LatentType { F32, F16, Fp8, Fp4 };
 ///   window: win_n[t] rows, row j at slot (win_start[t] + j) % win_cap of `win` (ring order is irrelevant to the sum)
 ///   selected: sel[t][0..n_sel) row ids of `comp`; an id < 0 or >= comp_limit[t] is masked out.
 /// score = q . k * scale; the per-head sink joins the softmax denominator and has no value. The type pairs read are
-/// (Fp8, Fp4), the model's caches, and (F16, F32), (F32, F32).
+/// (Fp8, Fp4) and (F16, F16), the model's caches, and (F16, F32), (F32, F32).
 struct MqaArgs {
     int n_tokens = 1;
     const float* q = nullptr;                          ///< [T][64][512]

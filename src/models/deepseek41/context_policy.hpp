@@ -11,9 +11,19 @@
 
 namespace basalt::models::deepseek41::ctxp {
 
-constexpr uint64_t kLatentRowBytes = kCompRowBytes;   // one compressed latent, FP4 packed
-constexpr uint64_t kIndexRowBytes = kIdxRowBytes;     // one index key, FP4 packed
-constexpr int kCellFormat = 1;                        // the format tag of saved caches: these packed rows
+/// --kv's values: fp8 (the default) the packed rows, fp16 plain rows (attn_index.hpp's CacheFormat). An empty or other
+/// name gives false.
+inline bool cache_format(const std::string& name, CacheFormat& f) {
+    if (name == "fp8") f = CacheFormat::Fp8;
+    else if (name == "fp16") f = CacheFormat::Fp16;
+    else return false;
+    return true;
+}
+/// One compressed latent's and one index key's bytes.
+inline uint64_t latent_row_bytes(CacheFormat f) { return (uint64_t) comp_row_bytes(f); }
+inline uint64_t index_row_bytes(CacheFormat f) { return (uint64_t) idx_row_bytes(f); }
+/// The format tag of saved caches: 1 the packed rows, 0 fp16 rows.
+inline int cell_format(CacheFormat f) { return f == CacheFormat::Fp8 ? 1 : 0; }
 constexpr int kDecodeTokens = 8;                // tokens one decode call scores at once (indexer workspace rows)
 constexpr int64_t kLegacyContext = 8192;        // the maximum of a pack that names no context length
 constexpr int64_t kMinContext = 1024;
@@ -25,10 +35,10 @@ inline bool owns_cache(int layer, int ratio) { return ratio != 0 && (layer == 2 
 inline uint64_t cache_rows(int64_t positions, int ratio) { return (uint64_t) positions / (uint64_t) ratio + 1; }
 
 /// Device bytes of the compressed latents and index keys of every kv-source layer at `positions`.
-inline uint64_t cache_bytes(int64_t positions, const std::vector<int>& ratios) {
+inline uint64_t cache_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f) {
     uint64_t b = 0;
     for (int r : ratios)
-        if (r > 0) b += cache_rows(positions, r) * (kLatentRowBytes + kIndexRowBytes);
+        if (r > 0) b += cache_rows(positions, r) * (latent_row_bytes(f) + index_row_bytes(f));
     return b;
 }
 
@@ -36,8 +46,8 @@ inline uint64_t cache_bytes(int64_t positions, const std::vector<int>& ratios) {
 inline uint64_t workspace_bytes(int64_t positions) { return (uint64_t) kDecodeTokens * ((uint64_t) positions + 1) * 9; }
 
 /// Everything that grows with the context.
-inline uint64_t context_bytes(int64_t positions, const std::vector<int>& ratios) {
-    return cache_bytes(positions, ratios) + workspace_bytes(positions);
+inline uint64_t context_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f) {
+    return cache_bytes(positions, ratios, f) + workspace_bytes(positions);
 }
 
 struct Plan {
@@ -50,7 +60,7 @@ struct Plan {
 /// free device memory once the dense weights are resident: below kMinContext or past the native maximum is refused, so
 /// are buffers that need more than half the free memory; a quarter or more gives a warning (the expert tier needs the
 /// rest).
-inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, const std::vector<int>& ratios) {
+inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, const std::vector<int>& ratios, CacheFormat f) {
     Plan p;
     if (native <= 0) native = kLegacyContext;
     const uint64_t quarter = free_bytes / 4, half = free_bytes / 2;
@@ -64,7 +74,7 @@ inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes,
                   std::to_string(native) + " tokens";
         return p;
     }
-    const uint64_t need = context_bytes(requested, ratios);
+    const uint64_t need = context_bytes(requested, ratios, f);
     if (need > half) {
         p.error = "--max-context " + std::to_string(requested) + " needs " + std::to_string(need >> 20) +
                   " MiB of compressed caches, more than half of the " + std::to_string(free_bytes >> 20) +

@@ -75,6 +75,7 @@ std::optional<int> prepare_input_options(Options& o) {
         basalt::log::error("basalt generate", "invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us");
         return 2;
     }
+    if (o.kv.empty()) o.kv = "fp16";
     if (o.kv == "q4") o.kv = "q4_0";
     if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
         basalt::log::error("basalt generate", "--kv must be fp16, int8, q4_0 or k8v4");
