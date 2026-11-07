@@ -15,17 +15,17 @@ def drop(cfg):
 
 class LazyVision(unittest.TestCase):
     def test_dynamic_stays(self):
-        cfg = {"vision": {"mode": "dynamic"}, "args": ["--vision", "--vision-dynamic"]}
+        cfg = {"vision": {"mode": "dynamic"}, "args": ["--vision"]}
         self.assertEqual(drop(cfg), "")
         self.assertEqual(cfg["vision"], {"mode": "dynamic"})
-        self.assertEqual(cfg["args"], ["--vision", "--vision-dynamic"])
+        self.assertEqual(cfg["args"], ["--vision"])
 
     def test_sidecar_goes_with_its_flags(self):
         for mode in ("cpu", "1"):
-            cfg = {"vision": {"mode": mode}, "args": ["--ctx", "4096", "--vision"]}
+            cfg = {"vision": {"mode": mode}, "args": ["--ctx", "4096", "--vision-external"]}
             self.assertIn("vision off", drop(cfg))
             self.assertNotIn("vision", cfg)
-            self.assertEqual(cfg["args"], ["--ctx", "4096", "--vision"])
+            self.assertEqual(cfg["args"], ["--ctx", "4096", "--vision-external"])
 
     def test_no_vision_says_nothing(self):
         cfg = {"args": []}

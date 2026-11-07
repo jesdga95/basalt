@@ -108,7 +108,8 @@ class Peer(Tmp):
         (self.engine_bin.parent / "basalt-vision").write_text("")
         cfg = modelfile.model_config(modelfile.ModelSpec(path, vision=True), str(self.engine_bin))
         self.assertIn("vision", cfg)
-        self.assertIn("--vision", cfg["args"])
+        self.assertIn("--vision-external", cfg["args"])     # the sidecar's embeddings; the engine encodes nothing
+        self.assertNotIn("--vision", cfg["args"])
 
     def test_a_spec_alias_names_the_model(self):
         cfg = modelfile.model_config(modelfile.ModelSpec(self.build(), alias="mine"), str(self.engine_bin))
@@ -157,6 +158,7 @@ class Vision(Tmp):
         cfg = modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))
         self.assertNotIn("vision", cfg)
         self.assertNotIn("--vision", cfg["args"])
+        self.assertNotIn("--vision-external", cfg["args"])
 
     def test_gpu_or_cpu_encoder(self):
         path = self.build(vision=True)
@@ -173,8 +175,8 @@ class Vision(Tmp):
     def test_dynamic_has_the_engine_open_the_projector_and_needs_no_sidecar(self):
         path = self.build(vision=True)                      # no basalt-vision next to the engine
         cfg = modelfile.model_config(modelfile.ModelSpec(path, vision="dynamic"), str(self.engine_bin))
-        self.assertEqual(cfg["args"], ["--model", path, "--vision-dynamic", "--vision"])
-        self.assertNotIn("--vision-dynamic", modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))["args"])
+        self.assertEqual(cfg["args"], ["--model", path, "--vision"])
+        self.assertNotIn("--vision", modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))["args"])
         with self.assertRaisesRegex(ValueError, "basalt-vision"):
             modelfile.model_config(modelfile.ModelSpec(path, vision="1"), str(self.engine_bin))
 

@@ -13,7 +13,7 @@ Protocol (one line each):
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
     that slot's own state, answered like a GEN.
   * `VRAM [mib]` -> `VRAM k=v ...`; `QUIT` ends the engine.
-  * `ENC <image> <out> [<image> <out> ...]` (--vision-dynamic): one `ENC OK <n> <nx> <ny> <ms>` per image, or `ENC ERR`.
+  * `ENC <image> <out> [<image> <out> ...]` (--vision): one `ENC OK <n> <nx> <ny> <ms>` per image, or `ENC ERR`.
   * Requests share one pipe, serialized by the service FIFO (batch: by the `ctl` lock).
 """
 from __future__ import annotations

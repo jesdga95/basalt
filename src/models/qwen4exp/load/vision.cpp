@@ -123,12 +123,12 @@ int vision(Context& context) {
         ss.ple.scratch = ple_scratch;
     }
 
-    // ---- --vision-dynamic: the image encoder's weights staged in pinned host memory, its stream and product handle made,
+    // ---- --vision: the image encoder's weights staged in pinned host memory, its stream and product handle made,
     // and one full-size encode run in a temporary region (the product library loads its kernels on first use), all
     // before the expert cache is sized: afterwards the encoder holds no VRAM until an ENC borrows cache slots
     basalt::vision::CudaEncoder vis_enc;
     const int vis_max_tokens = basalt::vision::Geometry{}.max_tokens;
-    if (o.vision_dynamic && o.serve) {
+    if (o.vision_in_engine && o.serve) {
         const auto t0 = Clock::now();
         std::string verr;
         basalt::vision::Mmproj mp;
