@@ -21,10 +21,18 @@ Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W, 121 GiB of RAM. Geom
 | Engram table | IQ4_NL, 256 values per row | dequantized to fp32 on the host |
 | Compressor and indexer projections | BF16 | fp32 activations and accumulation |
 | Norms, router, hyper-connections | F32 | fp32 |
-| Latents, compressed rows, indexer keys | fp16 | fp32 scores, softmax and accumulation |
+| Window rows (the latest 128 latents) | E4M3, a power-of-two scale per 32 values | decoded exactly; fp32 scores, softmax and accumulation |
+| Compressed rows | E2M1, an E4M3 scale per 16 values | decoded exactly; fp32 scores, softmax and accumulation |
+| Indexer keys and queries | E2M1, a power-of-two scale per 32 values | fp32 scores |
 | Output head | Q6_K | fp32 logits |
 
 All activations between stages are fp32. A decode kernel's output does not depend on how many tokens share its launch (bitwise).
+
+The attention caches round as the model's reference does (`act_quant`, `fp4_act_quant`; the code is Project Maya's, by way
+of Strata) and keep the codes and scales: 920 bytes per position instead of 3,200 in fp16. A code times its scale is the
+rounded value exactly, so the caches hold what fp16 copies of the rounded values would, except values below fp16's range.
+Logits equal a build that keeps those rounded values in fp16 caches, bit for bit (greedy, pinned placement, two cards and one,
+200 tokens of prose and of structured output, a 16,384-token prompt).
 
 ## Experts and placement
 
@@ -43,8 +51,8 @@ Prompt chunks run MMQ products (q8_1, int8 mma, fp32 accumulation). Against deco
 | Routed experts in prompt chunks | a different int8 reduction order |
 | Shared expert | about 1e-3 per layer |
 | Attention projections | about 2e-3 relative RMS per layer |
-| Compressed rows | 1e-5 (fp16 storage included); selected ids identical on random inputs |
-| Sparse attention | fp16 tensor cores, 2e-4 relative RMS against fp32; bitwise independent of token count |
+| Compressed rows | the same packed rows as decode (bitwise on random inputs); selected ids identical |
+| Sparse attention | fp16 tensor cores over the decoded rows (exact in fp16), 2.1e-4 relative RMS against fp32; bitwise independent of token count |
 | Router logits | 3.5e-4 relative RMS against llama.cpp's batched path |
 
 With a second card, each layer's experts split between the cards, both on MMQ. An expert gives the same bits on either card for
@@ -98,8 +106,11 @@ Reference: [quality](quality.md#the-bf16-reference). Two cards, 400 W + 180 W, 2
 
 | Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
 |---|---:|---:|---:|---:|---:|
-| UD-IQ1_M (the published pack) | 3.0334 | 0.2779 | 0.0550 | 2.86 | 83.88% |
+| UD-IQ1_M (the published pack) | 3.0456 | 0.2779 | 0.0566 | 2.86 | 83.88% |
 | GSQ-RCO IQ2_XXS (tested, not shipped) | 3.6353 | 0.4311 | 0.0894 | 4.39 | 79.97% |
+
+The cache roundings cost nothing measurable: the same run with fp16 caches (no rounding) scores PPL 3.0387, KLD 0.2777,
+top-1 83.97%.
 
 Prompt skip cannot be scored this way (512-token chunks). On a 64K prompt, the 200 tokens after it match `--no-prompt-skip` closely
 (KL mean 6.2e-4 between the two runs).
