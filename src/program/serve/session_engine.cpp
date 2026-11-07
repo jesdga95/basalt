@@ -8,6 +8,7 @@
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/probe_rates.hpp"
+#include "basalt/protocol.hpp"
 
 #include <sstream>
 
@@ -504,9 +505,8 @@ private:
 
     void progress_line(const char* tag, int64_t at_pos) {
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
-        std::printf("%s %lld %lld %.0f %.1f\n", tag, (long long) at_pos, (long long) n, ms,
-                    ms > 0.0 ? 1000.0 * (double) (at_pos - resume) / ms : 0.0);
-        std::fflush(stdout);
+        basalt::protocol::emit("%s %lld %lld %.0f %.1f\n", tag, (long long) at_pos, (long long) n, ms,
+                               ms > 0.0 ? 1000.0 * (double) (at_pos - resume) / ms : 0.0);
     }
 
     SessionRuntime& rt_;
@@ -566,7 +566,7 @@ bool SessionRuntime::next_batch_window() {
         ++sl.produced;
         ++sl.p;
         sl.x = y;
-        std::printf("BT %d %d\n", b, (int) y);
+        basalt::protocol::emit("BT %d %d\n", b, (int) y);
         basalt::core::progress_beat();
         const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
         const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
