@@ -452,7 +452,7 @@ void test_top_rows(Verdict& v) {
 void bench_top_rows() {
     std::mt19937 rng(78);
     std::normal_distribution<float> nd(0.f, 1.f);
-    for (int n : {32768, 65536, 131072, 524288, 1048576}) {
+    for (int n : {64, 512, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 524288, 1048576}) {
         std::vector<float> s((size_t) n);
         for (float& x : s) x = nd(rng);
         Dev<float> ds(s);

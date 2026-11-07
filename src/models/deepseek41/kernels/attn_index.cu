@@ -420,23 +420,16 @@ __device__ int block_scan(int flag, int& total, int* wsum) {
     return base + rank;
 }
 
-// One block per token. Keeps the K highest finite scores (ties to the lower index), sorted by index ascending, and
-// pads out[out_ld] with -1. A score of -inf is never kept.
-__global__ void __launch_bounds__(kTopkThreads) topk_kernel(const float* __restrict__ scores, int n, int K,
-                                                            int32_t* __restrict__ out, int out_ld,
-                                                            int32_t* __restrict__ out_n, const int32_t* __restrict__ pos,
-                                                            int ratio, int block_size) {
+// Stage: one token's top-k from one block over its first n scores s[0..n). Keeps the K highest finite scores (ties to
+// the lower index), sorted by index ascending, and pads out[0..out_ld) with -1; *out_n gets the count. A score of
+// -inf is never kept.
+__device__ void topk_block(const float* __restrict__ s, int n, int K, int32_t* __restrict__ out, int out_ld,
+                           int32_t* __restrict__ out_n) {
     __shared__ int ids[kTopkMax];
     __shared__ uint32_t hist[256];
     __shared__ int wsum[32];
     __shared__ uint32_t s_prefix;
     __shared__ int s_need, s_cnt, s_base;
-    const int t = blockIdx.x;
-    const float* s = scores + (size_t) t * n;   // rows are n apart; the call may see fewer
-    if (pos) {
-        n = eff_rows(pos, gridDim.x, ratio, n * (block_size ? block_size : 1));
-        if (block_size) n = (n + block_size - 1) / block_size;
-    }
 
     int nvalid_local = 0;
     for (int i = threadIdx.x; i < n; i += blockDim.x) nvalid_local += s[i] > -INFINITY;
@@ -530,8 +523,22 @@ __global__ void __launch_bounds__(kTopkThreads) topk_kernel(const float* __restr
             __syncthreads();
         }
     }
-    for (int i = threadIdx.x; i < out_ld; i += blockDim.x) out[(size_t) t * out_ld + i] = i < cnt ? ids[i] : -1;
-    if (threadIdx.x == 0) out_n[t] = cnt;
+    for (int i = threadIdx.x; i < out_ld; i += blockDim.x) out[i] = i < cnt ? ids[i] : -1;
+    if (threadIdx.x == 0) *out_n = cnt;
+}
+
+// One block per token: topk_block over the rows the call's last position sees (all of n without `pos`).
+__global__ void __launch_bounds__(kTopkThreads) topk_kernel(const float* __restrict__ scores, int n, int K,
+                                                            int32_t* __restrict__ out, int out_ld,
+                                                            int32_t* __restrict__ out_n, const int32_t* __restrict__ pos,
+                                                            int ratio, int block_size) {
+    const int t = blockIdx.x;
+    const float* s = scores + (size_t) t * n;   // rows are n apart; the call may see fewer
+    if (pos) {
+        n = eff_rows(pos, gridDim.x, ratio, n * (block_size ? block_size : 1));
+        if (block_size) n = (n + block_size - 1) / block_size;
+    }
+    topk_block(s, n, K, out + (size_t) t * out_ld, out_ld, out_n + t);
 }
 
 
@@ -541,9 +548,11 @@ __global__ void __launch_bounds__(kTopkThreads) topk_kernel(const float* __restr
 // order key over all the blocks: a pass reads the previous pass's histogram, so every block picks the same prefix. A mask
 // then marks the rows above the threshold and those equal to it, and one block lists them in row order. The grid's y is
 // the token: each token has its scores, its position, its state and its row bits, and its result does not depend on the
-// others.
+// others. A token that sees few rows takes its list from one block in the first launch, as topk_kernel would, and the
+// launches after it return at once for that token: the passes cost more than the walk there.
 
 constexpr int kSelThreads = 256;     // rows per group
+constexpr int kSelOneBlock = 1024;   // a token with at most this many rows gets its list from one block (topk_block)
 constexpr int kSelBlocks = 128;      // the passes' grid; each block walks the groups beyond the grid
 constexpr int kSelGroups = 2052;     // groups the final block can list: each of them keeps a row
 
@@ -566,9 +575,19 @@ __device__ __forceinline__ SelState* sel_state(SelState* st, size_t stride) {
     return reinterpret_cast<SelState*>(reinterpret_cast<char*>(st) + stride * blockIdx.y);
 }
 
-__global__ void select_begin_kernel(SelState* st, size_t stride) {
+// A token with few rows gets its list here and the passes leave it alone; otherwise its histograms start at zero.
+__global__ void __launch_bounds__(kTopkThreads) select_begin_kernel(const float* __restrict__ s, int n, int K,
+                                                                    int32_t* __restrict__ out, int out_ld,
+                                                                    int32_t* __restrict__ out_n,
+                                                                    const int32_t* __restrict__ pos, int ratio,
+                                                                    int block_size, SelState* st, size_t stride) {
+    const int rows = sel_rows(n, pos + blockIdx.y, ratio, block_size);
+    if (rows <= kSelOneBlock) {
+        topk_block(s + (size_t) n * blockIdx.y, rows, K, out + (size_t) out_ld * blockIdx.y, out_ld, out_n + blockIdx.y);
+        return;
+    }
     st = sel_state(st, stride);
-    for (int p = 0; p < 4; ++p) st->hist[p][threadIdx.x] = 0;
+    for (int i = threadIdx.x; i < 4 * 256; i += blockDim.x) st->hist[i / 256][i % 256] = 0;
 }
 
 // The prefix and the rows still needed after pass `done`, from its histogram; the same in every block.
@@ -599,7 +618,7 @@ __global__ void __launch_bounds__(kSelThreads) select_pass_kernel(const float* _
     pos += blockIdx.y;
     st = sel_state(st, stride);
     n = sel_rows(n, pos, ratio, block_size);
-    if (blockIdx.x * kSelThreads >= n) return;
+    if (n <= kSelOneBlock || blockIdx.x * kSelThreads >= n) return;
     if (threadIdx.x == 0) { s_prefix = 0; s_need = K; }
     if (pass > 0) {
         sel_pick(st, pass - 1, K, lh, s_prefix, s_need);
@@ -637,7 +656,7 @@ __global__ void __launch_bounds__(kSelThreads) select_mask_kernel(const float* _
     uint32_t* eq = gt + groups * 8;
     uint32_t* gc = eq + groups * 8;
     n = sel_rows(n, pos, ratio, block_size);
-    if (blockIdx.x * kSelThreads >= n) return;
+    if (n <= kSelOneBlock || blockIdx.x * kSelThreads >= n) return;
     sel_pick(st, 3, K, lh, s_thr, s_need);
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         st->thr = s_thr;
@@ -696,6 +715,7 @@ __global__ void __launch_bounds__(kTopkThreads) select_final_kernel(int n, int32
     const uint32_t* eq = gt + groups * 8;
     const uint32_t* gc = eq + groups * 8;
     n = sel_rows(n, pos, ratio, block_size);
+    if (n <= kSelOneBlock) return;
     const int ng = (n + kSelThreads - 1) / kSelThreads;
     if (threadIdx.x == 0) { s_cnt = 0; s_total = 0; s_left = st->all ? 0 : st->need_eq; }
     __syncthreads();
@@ -1037,7 +1057,8 @@ void select_top(const float* scores, int n, int K, int32_t* out, int out_ld, int
                 int block_size, SelState* st, int n_tok, cudaStream_t s) {
     const size_t stride = sel_stride(n);
     const int grid = std::min((n + kSelThreads - 1) / kSelThreads, kSelBlocks);
-    select_begin_kernel<<<dim3(1, n_tok), 256, 0, s>>>(st, stride);
+    select_begin_kernel<<<dim3(1, n_tok), kTopkThreads, 0, s>>>(scores, n, K, out, out_ld, out_n, pos, ratio, block_size,
+                                                                 st, stride);
     for (int pass = 0; pass < 4; ++pass)
         select_pass_kernel<<<dim3(grid, n_tok), kSelThreads, 0, s>>>(scores, n, K, pos, ratio, block_size, pass, st, stride);
     select_mask_kernel<<<dim3(grid, n_tok), kSelThreads, 0, s>>>(scores, n, K, pos, ratio, block_size, st, stride);
