@@ -1,11 +1,13 @@
 // src/prefill/peer_share.cpp - multi-GPU: a second card's share of a prompt chunk's routed experts.
 //
 // Per layer the main card quantizes the activations into mapped host memory. A layer's experts are staged in groups of
-// launch_experts (group i in staging buffer i % kBufs), each group's rows run in launches of at most launch_rows rows
-// (launch j in buffer set j % kBufs), and four streams carry them:
-//   stage    (second card): copy a group's blobs into its staging buffer (device-to-device or over its own link); the
-//                           first groups of a layer whose experts are known early start before its routing (`prepare`);
-//   products (second card): gather the launch's rows out of mapped host memory, gate/up, the caller's step, down;
+// at most launch_experts, a new one also where the caller starts one (group i in staging buffer i % bufs), each group's
+// rows run in launches of at most launch_rows rows (launch j in buffer set j % bufs), and four streams carry them:
+//   stage    (second card): a group's blobs into its staging buffer (copies device-to-device or over its own link, or
+//                           the caller's staging); the first groups of a layer whose experts are known early start before
+//                           its routing (`prepare`);
+//   products (second card): gather the launch's rows out of mapped host memory, gate/up, the caller's step, down (or the
+//                           caller's products);
 //   out      (second card): copy the result rows into mapped host memory;
 //   rows     (main card):   a kernel on a high-priority stream reads them into the caller's block. Neither the activations
 //                           nor the rows queue behind the expert copies on a copy engine.
@@ -35,6 +37,15 @@ int64_t max_launches(const PeerShare::Dims& d) {
     return (d.max_rows + d.launch_rows - 1) / d.launch_rows + d.n_expert + 1;
 }
 
+// The groups of `experts`: [first, end) runs of at most `per` experts, a new one also at an expert that starts one.
+std::vector<std::pair<size_t, size_t>> cut_groups(const std::vector<PeerShare::Expert>& experts, int per) {
+    std::vector<std::pair<size_t, size_t>> g;
+    for (size_t i = 0; i < experts.size(); ++i)
+        if (g.empty() || experts[i].group || i - g.back().first == (size_t) per) g.push_back({i, i + 1});
+        else g.back().second = i + 1;
+    return g;
+}
+
 }  // namespace
 
 struct PeerShare::Impl {
@@ -43,19 +54,19 @@ struct PeerShare::Impl {
     std::vector<void*> dev_peer, host;
     // main card
     cudaStream_t s_main = nullptr, s_rows = nullptr;
-    cudaEvent_t ev_x = nullptr, ev_xq = nullptr, ev_end = nullptr, ev_rows[kBufs] = {};
+    cudaEvent_t ev_x = nullptr, ev_xq = nullptr, ev_end = nullptr, ev_rows[kMaxBufs] = {};
     // second card
     cudaStream_t s_stage = nullptr, s_prod = nullptr, s_out = nullptr;
-    cudaEvent_t ev_xin = nullptr, ev_staged[kBufs] = {}, ev_free[kBufs] = {}, ev_done[kBufs] = {}, ev_out[kBufs] = {};
-    uint8_t* stage[kBufs] = {};
-    void* xq[kBufs] = {};
+    cudaEvent_t ev_xin = nullptr, ev_staged[kMaxBufs] = {}, ev_free[kMaxBufs] = {}, ev_done[kMaxBufs] = {}, ev_out[kMaxBufs] = {};
+    uint8_t* stage[kMaxBufs] = {};
+    void* xq[kMaxBufs] = {};
     void* hq = nullptr;
-    float *gu = nullptr, *h = nullptr, *out[kBufs] = {};
+    float *gu = nullptr, *h = nullptr, *out[kMaxBufs] = {};
     int32_t *ident = nullptr, *tok_dev = nullptr, *bounds_dev = nullptr;
     std::unique_ptr<mmq::Context> ctx;
     // pinned, portable; the activations mapped too
     void* hxq = nullptr;
-    float* hrows[kBufs] = {};
+    float* hrows[kMaxBufs] = {};
     int32_t *tok_h[2] = {}, *bounds_h[2] = {};
     int set = 0;
     uint64_t launch = 0, group = 0;
@@ -107,13 +118,48 @@ struct PeerShare::Impl {
 
     // Queues the copies of `blobs` into the staging buffer of group number `gi`, once the last group there is done.
     void stage_group(const Layer& L, const std::vector<std::pair<const uint8_t*, bool>>& blobs, uint64_t gi) {
-        const int b = (int) (gi % kBufs);
+        const int b = (int) (gi % (uint64_t) d.bufs);
         const core::OnDevice od(peer);
         cudaStreamWaitEvent(s_stage, ev_free[b], 0);
-        for (size_t i = 0; i < blobs.size(); ++i)
-            cudaMemcpyAsync(stage[b] + L.stride * i, blobs[i].first, L.blob_bytes,
-                            blobs[i].second ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, s_stage);
+        if (L.stage) L.stage(blobs, stage[b], s_stage);
+        else
+            for (size_t i = 0; i < blobs.size(); ++i)
+                cudaMemcpyAsync(stage[b] + L.stride * i, blobs[i].first, L.blob_bytes,
+                                blobs[i].second ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, s_stage);
         cudaEventRecord(ev_staged[b], s_stage);
+    }
+
+    // The MMQ products of one launch, its rows gathered out of the layer's q8_1 activations.
+    void products(const Layer& L, const Launch& l, int b, cudaStream_t ps) {
+        mmq::gather_q8(l.act, l.n_tokens, l.tok, xq[b], l.rows, d.n_embd, ps);
+        mmq::Product p;
+        p.w = l.stage + L.gu_stride * (size_t) l.q0;
+        p.type = L.gu_type;
+        p.w_rows = 2 * d.n_ff;
+        p.w_cols = d.n_embd;
+        p.expert_bytes = L.gu_stride;
+        p.n = l.n;
+        p.xq = xq[b];
+        p.bounds = l.bounds;
+        p.ids = ident;
+        p.total_rows = l.rows;
+        p.max_rows = l.max_rows;
+        p.dst = gu;
+        p.ld_dst = p.w_rows;
+        ctx->run(p, ps);
+        L.act(gu, h, l, ps);
+        mmq::quantize(h, nullptr, hq, L.d_type, d.n_ff, d.n_ff, l.rows, ps);
+        cudaStreamWaitEvent(ps, ev_out[b], 0);   // the last rows out of this buffer have left
+        mmq::Product q = p;
+        q.w = l.stage + L.down_off + L.d_stride * (size_t) l.q0;
+        q.type = L.d_type;
+        q.w_rows = d.n_embd;
+        q.w_cols = d.n_ff;
+        q.expert_bytes = L.d_stride;
+        q.xq = hq;
+        q.dst = l.out;
+        q.ld_dst = d.n_embd;
+        ctx->run(q, ps);
     }
 
     ~Impl() {
@@ -133,7 +179,7 @@ struct PeerShare::Impl {
                     cudaStreamDestroy(s);
                 }
             if (ev_xin) cudaEventDestroy(ev_xin);
-            for (int b = 0; b < kBufs; ++b)
+            for (int b = 0; b < kMaxBufs; ++b)
                 for (cudaEvent_t e : {ev_staged[b], ev_free[b], ev_done[b], ev_out[b]})
                     if (e) cudaEventDestroy(e);
             ctx.reset();
@@ -162,9 +208,9 @@ PeerShare::~PeerShare() = default;
 template <class Peer, class Host>
 static void layout(const PeerShare::Dims& d, Peer&& peer, Host&& host) {
     const int64_t R = d.launch_rows, G = max_launches(d);
-    host(mmq::q8_bytes(d.max_tokens, d.n_embd));                     // hxq
-    for (int b = 0; b < PeerShare::kBufs; ++b) {
-        peer(d.stride * (size_t) d.launch_experts);                  // stage
+    host(d.act_bytes);                                               // hxq
+    for (int b = 0; b < d.bufs; ++b) {
+        peer(d.group_bytes);                                         // stage
         peer(mmq::q8_bytes(R, d.n_embd));                            // xq
         peer((size_t) R * (size_t) d.n_embd * 4);                    // out
         host((size_t) R * (size_t) d.n_embd * 4);                    // hrows
@@ -194,6 +240,10 @@ uint64_t PeerShare::host_bytes(const Dims& d) {
 }
 
 bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::string& err) {
+    if (d.bufs < 2 || d.bufs > kMaxBufs) {
+        err = "peer share: 2 or 3 buffer sets";
+        return false;
+    }
     auto m = std::make_unique<Impl>();
     m->d = d;
     bool ok = true;
@@ -210,12 +260,12 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
              cudaStreamCreateWithFlags(&m->s_prod, cudaStreamNonBlocking) == cudaSuccess &&
              cudaStreamCreateWithFlags(&m->s_out, cudaStreamNonBlocking) == cudaSuccess &&
              cudaEventCreateWithFlags(&m->ev_xin, cudaEventDisableTiming) == cudaSuccess;
-        for (int b = 0; ok && b < kBufs; ++b)
+        for (int b = 0; ok && b < kMaxBufs; ++b)
             for (cudaEvent_t* e : {&m->ev_staged[b], &m->ev_free[b], &m->ev_done[b], &m->ev_out[b]})
                 ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
         if (ok) {
             size_t i = 0;
-            for (int b = 0; b < kBufs; ++b) {
+            for (int b = 0; b < d.bufs; ++b) {
                 m->stage[b] = (uint8_t*) pv[i++];
                 m->xq[b] = pv[i++];
                 m->out[b] = (float*) pv[i++];
@@ -241,7 +291,7 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
              cudaEventCreateWithFlags(&m->ev_x, cudaEventDisableTiming) == cudaSuccess &&
              cudaEventCreateWithFlags(&m->ev_xq, cudaEventDisableTiming) == cudaSuccess &&
              cudaEventCreateWithFlags(&m->ev_end, cudaEventDisableTiming) == cudaSuccess;
-        for (int b = 0; ok && b < kBufs; ++b) ok = cudaEventCreateWithFlags(&m->ev_rows[b], cudaEventDisableTiming) == cudaSuccess;
+        for (int b = 0; ok && b < kMaxBufs; ++b) ok = cudaEventCreateWithFlags(&m->ev_rows[b], cudaEventDisableTiming) == cudaSuccess;
         layout(d, [](size_t) {}, [&](size_t b) {
             void* p = nullptr;
             if (ok && cudaHostAlloc(&p, b, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess)
@@ -251,7 +301,7 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
         if (ok) {
             size_t i = 0;
             m->hxq = hv[i++];
-            for (int b = 0; b < kBufs; ++b) m->hrows[b] = (float*) hv[i++];
+            for (int b = 0; b < d.bufs; ++b) m->hrows[b] = (float*) hv[i++];
             for (int s = 0; s < 2; ++s) {
                 m->tok_h[s] = (int32_t*) hv[i++];
                 m->bounds_h[s] = (int32_t*) hv[i++];
@@ -271,12 +321,12 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
 
 void PeerShare::prepare(const Layer& L, const std::vector<Expert>& experts) {
     Impl& m = *m_;
-    const size_t E = (size_t) m.d.launch_experts;
     m.prepared = 0;
     m.prepared_at = m.group;
     m.prepared_blobs.clear();
-    for (size_t i0 = 0; i0 < experts.size() && m.prepared < kBufs; i0 += E, ++m.prepared) {
-        const size_t i1 = std::min(experts.size(), i0 + E);
+    const std::vector<std::pair<size_t, size_t>> cut = cut_groups(experts, m.d.launch_experts);
+    for (size_t k = 0; k < cut.size() && m.prepared < m.d.bufs; ++k, ++m.prepared) {
+        const auto [i0, i1] = cut[k];
         std::vector<std::pair<const uint8_t*, bool>> blobs;
         for (size_t i = i0; i < i1; ++i) {
             blobs.emplace_back(experts[i].blob, experts[i].on_peer);
@@ -294,7 +344,8 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
     const Dims& d = m.d;
     const int prepared = m.prepared;
     m.prepared = 0;
-    if (L.stride > d.stride || L.blob_bytes > L.stride || n_tokens > d.max_tokens) {
+    if ((!L.stage && (L.blob_bytes > L.stride || L.stride * (size_t) d.launch_experts > d.group_bytes)) ||
+        n_tokens > d.max_tokens) {
         err = "peer share: a layer does not fit the share's buffers";
         return false;
     }
@@ -308,23 +359,23 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
     m.set ^= 1;
     int32_t* tok = m.tok_h[s];
     int32_t* bounds = m.bounds_h[s];
-    struct Launch {
+    struct Cut {
         int64_t r0 = 0, rows = 0, max_rows = 0;
         int b0 = 0, q0 = 0, n = 0;                    // its bounds in the table; its first expert in the group and how many
     };
     struct Group {
         size_t i0 = 0, i1 = 0;
-        std::vector<Launch> launches;
+        std::vector<Cut> launches;
     };
     std::vector<Group> groups;
     int64_t r = 0, nb = 0;
     const int64_t max_b = max_launches(d) * (d.launch_experts + 1);
-    for (size_t i0 = 0; i0 < experts.size(); i0 += (size_t) d.launch_experts) {
+    for (const auto& [i0, i1] : cut_groups(experts, d.launch_experts)) {
         Group g;
         g.i0 = i0;
-        g.i1 = std::min(experts.size(), i0 + (size_t) d.launch_experts);
+        g.i1 = i1;
         // the group's rows, cut into launches of at most launch_rows rows
-        Launch l;
+        Cut l;
         int k0 = 0;
         for (size_t i = g.i0; i < g.i1;) {
             const Expert& e = experts[i];
@@ -357,7 +408,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
             if (l.rows == d.launch_rows || i == g.i1) {   // the launch is full, or the group ends
                 if (l.rows > 0) g.launches.push_back(l);
                 else nb = l.b0;
-                l = Launch{};
+                l = Cut{};
             }
         }
         groups.push_back(std::move(g));
@@ -368,12 +419,15 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
         cudaStreamWaitEvent(m.s_main, m.ev_x, 0);
         cudaStreamWaitEvent(m.s_rows, m.ev_x, 0);
         cudaStreamWaitEvent(m.s_main, m.ev_xin, 0);
-        mmq::quantize(x, nullptr, m.hxq, L.gu_type, d.n_embd, d.n_embd, n_tokens, m.s_main);
+        if (L.quantize) L.quantize(x, n_tokens, m.hxq, m.s_main);
+        else mmq::quantize(x, nullptr, m.hxq, L.gu_type, d.n_embd, d.n_embd, n_tokens, m.s_main);
         cudaEventRecord(m.ev_xq, m.s_main);
     }
     // the group numbers: the prepared ones, then new ones
     std::vector<uint64_t> nums;
     std::vector<std::vector<std::pair<const uint8_t*, bool>>> blobs(groups.size());
+    std::vector<const uint8_t*> all_blobs;
+    for (const Expert& e : experts) all_blobs.push_back(e.blob);
     for (size_t gi = 0; gi < groups.size(); ++gi) {
         nums.push_back((int) gi < prepared ? m.prepared_at + gi : m.group++);
         if ((int) gi >= prepared)
@@ -381,7 +435,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
     }
     Impl* w = &m;
     m.post([w, L, n_tokens, dst, r, nb, tok, bounds, prepared, groups = std::move(groups), nums = std::move(nums),
-            blobs = std::move(blobs)] {
+            blobs = std::move(blobs), all_blobs = std::move(all_blobs)] {
         Impl& m = *w;
         const Dims& d = m.d;
         const cudaStream_t mr = m.s_rows, ps = m.s_prod, so = m.s_out;
@@ -391,42 +445,36 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
             cudaMemcpyAsync(m.bounds_dev, bounds, (size_t) nb * 4, cudaMemcpyHostToDevice, ps);
             cudaStreamWaitEvent(ps, m.ev_xq, 0);
         }
+        bool first = true;
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             const Group& g = groups[gi];
             if ((int) gi >= prepared) m.stage_group(L, blobs[gi], nums[gi]);
-            const int sb = (int) (nums[gi] % kBufs);
+            const int sb = (int) (nums[gi] % (uint64_t) d.bufs);
             const core::OnDevice od(m.peer);
             if (!g.launches.empty()) cudaStreamWaitEvent(ps, m.ev_staged[sb], 0);
-            for (const Launch& l : g.launches) {
-                const int b = (int) (m.launch++ % kBufs);
-                mmq::gather_q8(m.hxq, n_tokens, m.tok_dev + l.r0, m.xq[b], l.rows, d.n_embd, ps);
-                mmq::Product p;
-                p.w = m.stage[sb] + L.stride * (size_t) l.q0;
-                p.type = L.gu_type;
-                p.w_rows = 2 * d.n_ff;
-                p.w_cols = d.n_embd;
-                p.expert_bytes = L.stride;
-                p.n = l.n;
-                p.xq = m.xq[b];
-                p.bounds = m.bounds_dev + l.b0;
-                p.ids = m.ident;
-                p.total_rows = l.rows;
-                p.max_rows = l.max_rows;
-                p.dst = m.gu;
-                p.ld_dst = p.w_rows;
-                m.ctx->run(p, ps);
-                L.act(m.gu, m.h, l.rows, ps);
-                mmq::quantize(m.h, nullptr, m.hq, L.d_type, d.n_ff, d.n_ff, l.rows, ps);
-                mmq::Product q = p;
-                q.w = m.stage[sb] + L.stride * (size_t) l.q0 + L.down_off;
-                q.type = L.d_type;
-                q.w_rows = d.n_embd;
-                q.w_cols = d.n_ff;
-                q.xq = m.hq;
-                q.dst = m.out[b];
-                q.ld_dst = d.n_embd;
-                cudaStreamWaitEvent(ps, m.ev_out[b], 0);   // the last rows out of this buffer have left
-                m.ctx->run(q, ps);
+            for (const Cut& l : g.launches) {
+                const int b = (int) (m.launch++ % (uint64_t) d.bufs);
+                Launch lv;
+                lv.stage = m.stage[sb];
+                lv.q0 = l.q0;
+                lv.n = l.n;
+                lv.blob = all_blobs.data() + g.i0 + l.q0;
+                lv.tok = m.tok_dev + l.r0;
+                lv.bounds = m.bounds_dev + l.b0;
+                lv.bounds_host = bounds + l.b0;
+                lv.rows = l.rows;
+                lv.max_rows = l.max_rows;
+                lv.act = m.hxq;
+                lv.n_tokens = n_tokens;
+                lv.first = first;
+                lv.out = m.out[b];
+                first = false;
+                if (L.products) {
+                    cudaStreamWaitEvent(ps, m.ev_out[b], 0);   // the last rows out of this buffer have left
+                    L.products(lv, ps);
+                } else {
+                    m.products(L, lv, b, ps);
+                }
                 cudaEventRecord(m.ev_done[b], ps);
                 // the rows out, once the main card has copied the last ones from there
                 const size_t bytes = (size_t) l.rows * (size_t) d.n_embd * 4;

@@ -1,12 +1,12 @@
 // include/basalt/prefill/peer_share.hpp - multi-GPU: a second card's share of a prompt chunk's routed experts.
 //
-// Once a layer the main card quantizes the layer's activations for MMQ into mapped host memory (one small kernel; the
-// rest of its part is copies). The second card copies them in and gathers each launch's rows (the bytes mmq::quantize
-// would write for them), stages each expert's blob (from its own slots, or from pinned host memory over its own link), runs
-// the MMQ products and sends the result rows back, which the main card's copy engine lays into one contiguous block of the
-// caller's rows. Every call is asynchronous: the main card's own experts run while the second card works, and only `join`
-// makes a main stream wait. Model-agnostic: the formats, the blobs and the step between the two products come from the
-// caller.
+// Once a layer the main card writes the layer's activations in the products' format into mapped host memory (one small
+// kernel; the rest of its part is copies). The second card stages each group of experts (copies of their blobs from its
+// own slots or from pinned host memory over its own link, or the caller's own staging), runs each launch's products and
+// sends the result rows back, which the main card lays into one contiguous block of the caller's rows. Every call is
+// asynchronous: the main card's own experts run while the second card works, and only `join` makes a main stream wait.
+// Model-agnostic: the formats, the blobs, the staging, the step between the two products and, for a family MMQ does not
+// run, the products themselves come from the caller.
 #pragma once
 
 #include <cstddef>
@@ -21,16 +21,18 @@ namespace basalt::prefill {
 
 class PeerShare {
 public:
-    static constexpr int kBufs = 3;          ///< groups of experts staged, and launches in flight
+    static constexpr int kMaxBufs = 3;       ///< the most buffer sets
 
     struct Dims {
         int64_t n_embd = 0, n_ff = 0;   ///< a routed expert's [2 n_ff, n_embd] gate/up and [n_embd, n_ff] down
-        size_t stride = 0;             ///< bytes between staged experts: the largest layer's blob in whole blocks
+        size_t group_bytes = 0;        ///< a staged group's buffer
+        size_t act_bytes = 0;          ///< a layer's activations as `Layer::quantize` writes them, for max_tokens tokens
         int max_tokens = 0;            ///< tokens of the longest chunk
         int64_t max_rows = 0;          ///< rows a layer may send: the chunk's tokens times the routed experts per token
         int n_expert = 0;              ///< experts per layer
         int launch_experts = 6;        ///< experts staged together, the most one launch covers
         int64_t launch_rows = 1024;    ///< rows of one launch; a group with more takes several
+        int bufs = kMaxBufs;           ///< groups staged, and launches in flight (2 or 3)
     };
     /// Device bytes on the second card, and pinned host bytes, `open` takes.
     static uint64_t peer_bytes(const Dims& d);
@@ -43,19 +45,43 @@ public:
 
     bool open(int main_device, int peer_device, const Dims& d, std::string& err);
 
-    /// One layer's formats and the step between the products: gu [rows][2 n_ff] -> h [rows][n_ff] on `stream`.
+    /// One launch as the caller's steps see it (second card).
+    struct Launch {
+        const uint8_t* stage = nullptr;           ///< the group's staged buffer
+        int q0 = 0, n = 0;                        ///< the launch's first expert in the group, and how many
+        const uint8_t* const* blob = nullptr;     ///< their blobs, as `run` got them
+        const int32_t* tok = nullptr;             ///< device: the token of each of the launch's rows
+        const int32_t* bounds = nullptr;          ///< device: n + 1 row bounds, relative to the launch's first row
+        const int32_t* bounds_host = nullptr;     ///< the same bounds on the host
+        int64_t rows = 0, max_rows = 0;           ///< its rows, and the most one expert has
+        const void* act = nullptr;                ///< the layer's activations (mapped host memory)
+        int n_tokens = 0;
+        bool first = false;                       ///< the layer's first launch
+        float* out = nullptr;                     ///< rows x n_embd results
+    };
+    /// One layer's formats and steps. The MMQ products read expert q of a launch's group at stage + q gu_stride (gate/up)
+    /// and stage + down_off + q d_stride (down).
     struct Layer {
         int gu_type = -1, d_type = -1;
-        size_t blob_bytes = 0, stride = 0, down_off = 0;
-        std::function<void(const float* gu, float* h, int64_t rows, void* stream)> act;
+        size_t blob_bytes = 0, stride = 0;        ///< staging by copies: blob i of a group at stage + i stride
+        size_t gu_stride = 0, down_off = 0, d_stride = 0;
+        /// Main card: the layer's activations x [n_tokens][n_embd] into `dst`; empty: q8_1 for the MMQ products.
+        std::function<void(const float* x, int n_tokens, void* dst, void* stream)> quantize;
+        /// Second card: a group's blobs into its staged buffer; empty: copies of blob_bytes each.
+        std::function<void(const std::vector<std::pair<const uint8_t*, bool>>& blobs, uint8_t* stage, void* stream)> stage;
+        /// The step between the MMQ products: gu [rows][2 n_ff] -> h [rows][n_ff].
+        std::function<void(const float* gu, float* h, const Launch& l, void* stream)> act;
+        /// Second card: a launch's products into l.out in place of the MMQ products.
+        std::function<void(const Launch& l, void* stream)> products;
     };
-    /// An expert the second card computes: its blob on the second card, or in pinned portable host memory; its row i reads
-    /// row tok[i] of x (it may have none).
+    /// An expert (or a piece of one) the second card computes: its blob on the second card, or in pinned portable host
+    /// memory; its row i reads row tok[i] of x (it may have none). `group`: it starts a new group, and so a new launch.
     struct Expert {
         const uint8_t* blob = nullptr;
         bool on_peer = false;
         const int32_t* tok = nullptr;
         int n = 0;
+        bool group = false;
     };
     /// Starts staging the first groups of the next `run`, whose experts (in that order) are known before its routing:
     /// their copies go on while the main card reads the layer's attention. `run` then takes the same experts, in order.
