@@ -533,13 +533,13 @@ public:
 
         // query path; its latent is also the indexer's input
         QPathWeights qw{qa->ptr, qa->type, (const float*) qan->ptr, qb->ptr, qb->type, g_.rms_eps};
-        q_latent(xq_, qw, T, qr_, stream);
+        q_latent(xq_, qw, T, qr_, xq2_, stream);
         if (indexing) {
             // the selection waits for the latent, the head weights and the layer's index keys
             if (!after(ms, br_[0], br_ev_[2]) || !after(br_[1], br_[0], br_ev_[3])) return failed("attention branch");
             indexer_rank(ia, qr_, d_pos, T, iws_, br_[0]);
         }
-        q_heads(qw, T, d_pos, rope_[kind], xq2_, qr_, q_, stream);
+        q_heads(qw, T, d_pos, rope_[kind], xq2_, q_, stream);
         if (!after(br_[0], ms, br_ev_[4]) || ((compressing || indexing) && !after(br_[1], ms, br_ev_[5])))
             return failed("attention branch");
         const int sel = ratio ? kTopK : 0;
