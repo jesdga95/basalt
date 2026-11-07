@@ -59,6 +59,8 @@ struct KvStreamMap {
 };
 
 inline constexpr int kKvCtlInts = 16;   ///< [0] epoch [1] hand [2] misses [3] overflow; u64 at [4] misses, [6] lookups, [8] calls
+/// The fewest slots a streamed map may have: one step of the resolve's clock sweep (one thread per slot).
+inline constexpr int64_t kKvStreamMinSlots = 1024;
 /// Bytes of the map's arrays besides the page table (which the state already has): 5 per-slot ints + ctl.
 inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots * 4 * 5 + kKvCtlInts * 4; }
 
@@ -79,6 +81,11 @@ void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void*
 /// computed as `b % n_slots`: the ring restore). Not capturable.
 void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
                      int64_t n_slots, const QsaShapes& s, void* stream);
+
+/// The reverse of kv_ring_restore: the ring pages of blocks [b0, b1) (`b % n_slots`, at most n_slots blocks) into
+/// the host copy. Not capturable.
+void kv_ring_save(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1, int64_t n_slots,
+                  const QsaShapes& s, void* stream);
 
 /// Copy the first `n_blocks` blocks of the host copy into a fully resident (identity-layout) pool: the prompt
 /// path's staging of one layer. Not capturable (DMA).
