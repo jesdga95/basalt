@@ -48,7 +48,6 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(DsModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
-        if (drafter_) drafter_->report();
         for (void* p : allocs_) cudaFree(p);
         if (h_next_) cudaFreeHost(h_next_);
         if (h_dfeat_) cudaFreeHost(h_dfeat_);
@@ -146,17 +145,26 @@ public:
         ops_ = make_kernel_ops(m_, err);
         if (!ops_) return false;
         dump_dir_ = m_.diag_dump();
-        if (m_.tiers().draft && !m_.pack().dspark.empty() && m_.sessions() == 1) {
-            // the drafter takes its memory before the tiers size themselves to what is left
-            const int device = m_.tiers().drafter_device >= 0 ? m_.tiers().drafter_device : m_.device();
-            // the ranking that says which experts each stage keeps ships beside the expert profiles
-            const std::string ranking = m_.tiers().profile_dir.empty() ? std::string()
-                : m_.tiers().profile_dir + "/deepseek41-" + std::to_string(g_.n_layers) + "x" + std::to_string(g_.n_expert) + "-dspark.prof";
-            drafter_ = DsparkDrafter::create(m_, device, ranking, m_.tiers().draft_experts, err);
-            if (!drafter_) return false;
-            basalt::log::info("basalt deepseek41", "drafter on GPU %d: %.2f GiB, %s, windows of at most %d tokens (--spec 0: off)", device,
-                              (double) drafter_->device_bytes() / (1ull << 30), drafter_->kept().c_str(),
-                              std::min(max_window(), kDsparkBlock + 1));
+        if (m_.tiers().draft && !m_.pack().dspark.empty()) {
+            // one drafter for every session, made by the first: it takes its memory before the tiers size themselves
+            drafter_ = m_.shared_drafter().lock();
+            if (!drafter_) {
+                const int device = m_.tiers().drafter_device >= 0 ? m_.tiers().drafter_device : m_.device();
+                // the ranking that says which experts each stage keeps ships beside the expert profiles
+                const std::string ranking = m_.tiers().profile_dir.empty() ? std::string()
+                    : m_.tiers().profile_dir + "/deepseek41-" + std::to_string(g_.n_layers) + "x" + std::to_string(g_.n_expert) + "-dspark.prof";
+                drafter_ = DsparkDrafter::create(m_, device, ranking, m_.tiers().draft_experts, m_.sessions(), err);
+                if (!drafter_) return false;
+                m_.shared_drafter() = drafter_;
+                basalt::log::info("basalt deepseek41", "drafter on GPU %d: %.2f GiB, %s, windows of at most %d tokens (--spec 0: off)", device,
+                                  (double) drafter_->device_bytes() / (1ull << 30), drafter_->kept().c_str(),
+                                  std::min(max_window(), kDsparkBlock + 1));
+            }
+            dwin_ = drafter_->open_window();
+            if (dwin_ < 0) {
+                err = "deepseek41: more sessions than the drafter has windows";
+                return false;
+            }
             const size_t ff = (size_t) drafter_->feature_floats();
             if (!buf(dfeat_, ff * kDsparkWindow) ||
                 cudaHostAlloc((void**) &h_dfeat_, ff * kDsparkWindow * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
@@ -167,13 +175,13 @@ public:
         return true;
     }
 
-    int max_window() const override { return m_.sessions() > 1 ? 1 : std::clamp(m_.tiers().spec, 1, kMaxWindow); }
+    int max_window() const override { return std::clamp(m_.tiers().spec, 1, kMaxWindow); }
 
     model::Result draft_begin(int32_t anchor, int64_t pos) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
         std::string err;
         ops_->commit_window(pos, stream_);
-        if (!flush_features(pos, err) || !drafter_->draft_begin(anchor, pos, std::min(max_window() - 1, kDsparkBlock), err))
+        if (!flush_features(pos, err) || !drafter_->draft_begin(dwin_, anchor, pos, std::min(max_window() - 1, kDsparkBlock), err))
             return {model::Status::Error, err};
         ops_->end_window(true);   // the copies queued behind the drafter's inputs run while it drafts
         return {};
@@ -282,7 +290,7 @@ public:
         whole_from_ = 0;
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         feat_n_ = 0;
-        if (drafter_) drafter_->forget_from(pos);
+        if (drafter_) drafter_->forget_from(dwin_, pos);
         return {};
     }
 
@@ -356,7 +364,7 @@ public:
         std::string e;
         if (!ops_->ensure_positions(positions, e) || !ops_->restore_cache(stream_, kv, e)) return {model::Status::Error, e};
         feat_n_ = 0;
-        if (drafter_) drafter_->reset();
+        if (drafter_) drafter_->reset(dwin_);
         return {};
     }
 
@@ -594,7 +602,7 @@ private:
             err = "deepseek41: cannot read the drafter's features";
             return false;
         }
-        return drafter_->inject(feat_pos0_, q, h_dfeat_, err);
+        return drafter_->inject(dwin_, feat_pos0_, q, h_dfeat_, err);
     }
 
     bool device_bias(float*& dev, const float* host, std::string& err) {
@@ -819,7 +827,7 @@ private:
         if (pos == 0) whole_from_ = 0;
         if (ops_) ops_->commit_window(pos, stream_);
         if (ops_ && pos == 0) ops_->trim_positions();
-        if (pos == 0 && drafter_) drafter_->reset();
+        if (pos == 0 && drafter_) drafter_->reset(dwin_);
         if (pos > 0 && (int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
     }
 
@@ -835,7 +843,7 @@ private:
             hist_.clear();
             whole_from_ = 0;
             ops_->reset();
-            if (drafter_) drafter_->reset();
+            if (drafter_) drafter_->reset(dwin_);
         }
         if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
         hist_.resize((size_t) pos);   // a position before the end drops the rejected rows of a window
@@ -1041,7 +1049,8 @@ private:
     bool fused_ = false;
     void* q8_ = nullptr;
     // the drafter and the main model's side of its feature hand-off
-    std::unique_ptr<DsparkDrafter> drafter_;
+    std::shared_ptr<DsparkDrafter> drafter_;
+    int dwin_ = 0;               // this session's window in the drafter
     PromptHost::Image* image_ = nullptr;   ///< this slot's image buffers
     float* dfeat_ = nullptr;     // [rows][target layers][n_embd]
     float* h_dfeat_ = nullptr;

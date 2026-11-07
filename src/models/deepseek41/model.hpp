@@ -32,6 +32,7 @@ inline void dense_f32(const DevTensor& w, const float* x, void* scratch_q8_1, fl
 }
 
 class ExpertTier;
+class DsparkDrafter;
 
 class DsModel final : public model::LoadedModel {
 public:
@@ -73,6 +74,8 @@ public:
         float* h_rows = nullptr;
     };
     SharedTier& shared_tier() const { return shared_tier_; }
+    /// The drafter the sessions share, while one holds it.
+    std::weak_ptr<DsparkDrafter>& shared_drafter() const { return shared_drafter_; }
     /// The sessions that will hold a context each.
     int sessions() const { return tiers_.sessions > 0 ? tiers_.sessions : 1; }
     /// What the flags ask of the expert tiers.
@@ -106,6 +109,7 @@ private:
     int device_ = 0;
     model::LoadRequest tiers_;
     mutable SharedTier shared_tier_;
+    mutable std::weak_ptr<DsparkDrafter> shared_drafter_;
     mutable VisionBlas vision_blas_;
     int64_t ctx_ = 0;
     static int64_t ctxp_default();
