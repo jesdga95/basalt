@@ -22,6 +22,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "basalt/models/deepseek41/attn.hpp"
+#include "basalt/models/deepseek41/attn_index.hpp"
+#include "cache_rows.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -106,93 +108,100 @@ __global__ void rope_rows_kernel(float* rows, int n_rows, int row_stride, int ro
 
 // ---- partial attention: one block per (chunk of 64 keys, group of 16 heads, token) ---------------------------
 
-// Raw row elements as loaded, converted to float at use.
-template <class T> struct Raw4;
-template <> struct Raw4<float> { using type = float4; };
-template <> struct Raw4<__half> { using type = uint2; };
-template <class T> struct Raw2;
-template <> struct Raw2<float> { using type = float2; };
-template <> struct Raw2<__half> { using type = __half2; };
-
-__device__ __forceinline__ void cvt4(const float4& v, float k[4]) { k[0] = v.x; k[1] = v.y; k[2] = v.z; k[3] = v.w; }
-__device__ __forceinline__ void cvt4(const uint2& v, float k[4]) {
-    const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&v.x));
-    const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&v.y));
-    k[0] = a.x; k[1] = a.y; k[2] = b.x; k[3] = b.y;
-}
-__device__ __forceinline__ void cvt2(const float2& v, float k[2]) { k[0] = v.x; k[1] = v.y; }
-__device__ __forceinline__ void cvt2(const __half2& v, float k[2]) {
-    const float2 f = __half22float2(v);
-    k[0] = f.x; k[1] = f.y;
-}
+// How a row type is read: Raw4 values 4i..4i+3 (i < 128) and Raw2 values 2i, 2i+1 (i < 256) as loaded, with their scale
+// where the row has one; converted to float at use.
+struct NoScales {};
+struct RowF32 {
+    using Raw4 = float4;
+    using Raw2 = float2;
+    using Scales = NoScales;
+    static __device__ __forceinline__ Scales scales(const uint8_t*) { return {}; }
+    static __device__ __forceinline__ void cvt4(const Raw4& v, const Scales&, int, float k[4]) { cvt4(v, k); }
+    static constexpr int kRowBytes = kAttnHeadDim * 4;
+    static __device__ __forceinline__ Raw4 load4(const uint8_t* r, int i) { return reinterpret_cast<const float4*>(r)[i]; }
+    static __device__ __forceinline__ Raw2 load2(const uint8_t* r, int i) { return reinterpret_cast<const float2*>(r)[i]; }
+    static __device__ __forceinline__ void cvt4(const Raw4& v, float k[4]) { k[0] = v.x; k[1] = v.y; k[2] = v.z; k[3] = v.w; }
+    static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) { k[0] = v.x; k[1] = v.y; }
+};
+struct RowF16 {
+    using Raw4 = uint2;
+    using Raw2 = uint32_t;
+    using Scales = NoScales;
+    static __device__ __forceinline__ Scales scales(const uint8_t*) { return {}; }
+    static __device__ __forceinline__ void cvt4(const Raw4& v, const Scales&, int, float k[4]) { cvt4(v, k); }
+    static constexpr int kRowBytes = kAttnHeadDim * 2;
+    static __device__ __forceinline__ Raw4 load4(const uint8_t* r, int i) { return reinterpret_cast<const uint2*>(r)[i]; }
+    static __device__ __forceinline__ Raw2 load2(const uint8_t* r, int i) { return reinterpret_cast<const uint32_t*>(r)[i]; }
+    static __device__ __forceinline__ void cvt4(const Raw4& v, float k[4]) {
+        const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&v.x));
+        const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&v.y));
+        k[0] = a.x; k[1] = a.y; k[2] = b.x; k[3] = b.y;
+    }
+    static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) {
+        const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&v));
+        k[0] = f.x; k[1] = f.y;
+    }
+};
+// window rows: the codes, then the group's scale (Raw4's y; above bit 16 of Raw2)
+struct RowFp8 {
+    using Raw4 = uint2;
+    using Raw2 = uint32_t;
+    using Scales = NoScales;
+    static constexpr int kRowBytes = kWinRowBytes;
+    static __device__ __forceinline__ Scales scales(const uint8_t*) { return {}; }
+    static __device__ __forceinline__ Raw4 load4(const uint8_t* r, int i) {
+        return make_uint2(reinterpret_cast<const uint32_t*>(r)[i], r[kLatent + i / 8]);
+    }
+    static __device__ __forceinline__ Raw2 load2(const uint8_t* r, int i) {
+        return (uint32_t) reinterpret_cast<const uint16_t*>(r)[i] | ((uint32_t) r[kLatent + i / 16] << 16);
+    }
+    static __device__ __forceinline__ void cvt4(const Raw4& v, const Scales&, int, float k[4]) { rows::fp8_values<4>(v.x, v.y, k); }
+    static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) { rows::fp8_values<2>(v & 0xffffu, v >> 16, k); }
+};
+// compressed rows: the codes in the low bits, the group's scale above them
+struct RowFp4 {
+    using Raw4 = uint32_t;
+    using Raw2 = uint32_t;
+    using Scales = NoScales;
+    static constexpr int kRowBytes = kCompRowBytes;
+    static __device__ __forceinline__ Scales scales(const uint8_t*) { return {}; }
+    static __device__ __forceinline__ Raw4 load4(const uint8_t* r, int i) {
+        return (uint32_t) reinterpret_cast<const uint16_t*>(r)[i] | ((uint32_t) r[kLatent / 2 + i / 4] << 16);
+    }
+    static __device__ __forceinline__ Raw2 load2(const uint8_t* r, int i) {
+        return (uint32_t) r[i] | ((uint32_t) r[kLatent / 2 + i / 8] << 8);
+    }
+    static __device__ __forceinline__ void cvt4(const Raw4& v, const Scales&, int, float k[4]) { rows::fp4_values<4>(v & 0xffffu, v >> 16, k); }
+    static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) { rows::fp4_values<2>(v & 0xffu, v >> 8, k); }
+};
 
 constexpr int kScoreRows = kAttnChunk / (kBlockThreads / 32);  // rows per warp
 constexpr int kScoreKeys = 4;                                   // keys scored per read of the query
 constexpr int kPvBatch = 32;                                   // rows whose loads are in flight together
 
-// Blocks [0, n_win) are window chunks (they index the ring), the rest compressed chunks (they index the selected
-// ids); `lo` is the launch's first block. Each loop issues all its row loads before using them.
-template <class T>
-__global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, int lo, int n_win, int n_chunks_total,
-                                                                    float* o_part, float* ml) {
-    const int slot = lo + blockIdx.x;
-    const bool kWindow = slot < n_win;
-    const int c = kWindow ? slot : slot - n_win;
-    const int g = blockIdx.y;
-    const int t = blockIdx.z;
+// The chunk's scores, softmax statistics and weighted sum over rows of type R. Each loop issues all its row loads
+// before using them.
+template <class R>
+__device__ __forceinline__ void mqa_chunk(const uint8_t* base, float scale, const float4* qs, float (*sc)[kAttnChunk],
+                                          const int* rowid, float* mlp0, size_t ml_head, float* o_part0, size_t o_head) {
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-
-    __shared__ float4 qs[kHeadsPerBlock * kAttnHeadDim / 4];
-    __shared__ float sc[kHeadsPerBlock][kAttnChunk];
-    __shared__ int rowid[kAttnChunk];
-
-    int r = -1;
-    if (tid < kAttnChunk) {
-        const int j = c * kAttnChunk + tid;
-        if (kWindow) {
-            if (j < a.win_n[t]) {
-                const int cap = a.win_cap;
-                r = (int) (((int64_t) a.win_start[t] + j) % cap);
-                if (r < 0) r += cap;
-            }
-        } else if (j < a.n_sel) {
-            const int id = a.sel[(size_t) t * a.n_sel + j];
-            if (id >= 0 && id < a.comp_limit[t]) r = id;
-        }
-        rowid[tid] = r;
-    }
-    const bool any = __syncthreads_or(tid < kAttnChunk && r >= 0);
-    const int head0 = g * kHeadsPerBlock;
-    if (!any) {
-        if (tid < kHeadsPerBlock) {
-            float* m = ml + (((size_t) t * kAttnHeads + head0 + tid) * n_chunks_total + slot) * 2;
-            m[0] = -INFINITY;
-            m[1] = 0.f;
-        }
-        return;
-    }
-
-    const float4* qg = reinterpret_cast<const float4*>(a.q + ((size_t) t * kAttnHeads + head0) * kAttnHeadDim);
-    for (int i = tid; i < kHeadsPerBlock * kAttnHeadDim / 4; i += kBlockThreads) qs[i] = qg[i];
-    __syncthreads();
-
-    const T* base = reinterpret_cast<const T*>(kWindow ? a.win : a.comp);
-    const int64_t stride = kWindow ? kAttnHeadDim : a.comp_stride;
 
     // scores
     // kScoreKeys keys at a time share each read of the query from shared memory; every key's dot products and
     // reductions keep their own order
 #pragma unroll 1
     for (int i0 = 0; i0 < kScoreRows; i0 += kScoreKeys) {
-        typename Raw4<T>::type raw[kScoreKeys][4];
+        typename R::Raw4 raw[kScoreKeys][4];
+        typename R::Scales scl[kScoreKeys];
 #pragma unroll
         for (int u = 0; u < kScoreKeys; ++u) {
             const int row = rowid[warp + (i0 + u) * (kBlockThreads / 32)];
+            scl[u] = typename R::Scales{};
+            if (row >= 0) scl[u] = R::scales(base + (size_t) row * R::kRowBytes);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                raw[u][j] = typename Raw4<T>::type{};
-                if (row >= 0)
-                    raw[u][j] = reinterpret_cast<const typename Raw4<T>::type*>(base + (size_t) row * stride)[lane + 32 * j];
+                raw[u][j] = typename R::Raw4{};
+                if (row >= 0) raw[u][j] = R::load4(base + (size_t) row * R::kRowBytes, lane + 32 * j);
             }
         }
         float v[kScoreKeys][kHeadsPerBlock];
@@ -204,7 +213,7 @@ __global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, i
         for (int j = 0; j < 4; ++j) {
             float kv[kScoreKeys][4];
 #pragma unroll
-            for (int u = 0; u < kScoreKeys; ++u) cvt4(raw[u][j], kv[u]);
+            for (int u = 0; u < kScoreKeys; ++u) R::cvt4(raw[u][j], scl[u], j, kv[u]);
 #pragma unroll
             for (int h = 0; h < kHeadsPerBlock; ++h) {
                 const float4 q4 = qs[h * (kAttnHeadDim / 4) + lane + 32 * j];
@@ -247,7 +256,7 @@ __global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, i
             v[u][0] += __shfl_xor_sync(0xffffffffu, v[u][0], 1);
             const int head =
                 ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
-            if ((lane & 1) == 0) sc[head][kk] = rowid[kk] >= 0 ? v[u][0] * a.scale : -INFINITY;
+            if ((lane & 1) == 0) sc[head][kk] = rowid[kk] >= 0 ? v[u][0] * scale : -INFINITY;
         }
     }
     __syncthreads();
@@ -266,7 +275,7 @@ __global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, i
 #pragma unroll
         for (int o = 16; o; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
         if (lane == 0) {
-            float* mlp = ml + (((size_t) t * kAttnHeads + head0 + h) * n_chunks_total + slot) * 2;
+            float* mlp = mlp0 + (size_t) h * ml_head;
             mlp[0] = m;
             mlp[1] = l;
         }
@@ -279,19 +288,19 @@ __global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, i
     for (int h = 0; h < kHeadsPerBlock; ++h) acc[h][0] = acc[h][1] = 0.f;
 #pragma unroll 1
     for (int k0 = 0; k0 < kAttnChunk; k0 += kPvBatch) {
-        typename Raw2<T>::type r2[kPvBatch];
+        typename R::Raw2 r2[kPvBatch];
 #pragma unroll
         for (int i = 0; i < kPvBatch; ++i) {
             const int row = rowid[k0 + i];
-            r2[i] = typename Raw2<T>::type{};
-            if (row >= 0) r2[i] = reinterpret_cast<const typename Raw2<T>::type*>(base + (size_t) row * stride)[tid];
+            r2[i] = typename R::Raw2{};
+            if (row >= 0) r2[i] = R::load2(base + (size_t) row * R::kRowBytes, tid);
         }
         // masked rows hold zeros and zero weights, so their terms add exact zeros
 #pragma unroll
         for (int i4 = 0; i4 < kPvBatch; i4 += 4) {
             float k2[4][2];
 #pragma unroll
-            for (int u = 0; u < 4; ++u) cvt2(r2[i4 + u], k2[u]);
+            for (int u = 0; u < 4; ++u) R::cvt2(r2[i4 + u], k2[u]);
 #pragma unroll
             for (int h = 0; h < kHeadsPerBlock; ++h) {
                 const float4 p4 = *reinterpret_cast<const float4*>(&sc[h][k0 + i4]);  // four rows' weights
@@ -306,10 +315,65 @@ __global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, i
     }
 #pragma unroll
     for (int h = 0; h < kHeadsPerBlock; ++h) {
-        float2* o = reinterpret_cast<float2*>(o_part + (((size_t) t * kAttnHeads + head0 + h) * n_chunks_total + slot) *
-                                                           kAttnHeadDim);
+        float2* o = reinterpret_cast<float2*>(o_part0 + (size_t) h * o_head);
         o[tid] = make_float2(acc[h][0], acc[h][1]);
     }
+}
+
+// Blocks [0, n_win) are window chunks (rows of type W, indexing the ring), the rest compressed chunks (rows of type C,
+// indexing the selected ids).
+template <class W, class C>
+__global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, int n_win, int n_chunks_total, float* o_part,
+                                                                    float* ml) {
+    const int slot = blockIdx.x;
+    const bool kWindow = slot < n_win;
+    const int c = kWindow ? slot : slot - n_win;
+    const int g = blockIdx.y;
+    const int t = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    __shared__ float4 qs[kHeadsPerBlock * kAttnHeadDim / 4];
+    __shared__ float sc[kHeadsPerBlock][kAttnChunk];
+    __shared__ int rowid[kAttnChunk];
+
+    int r = -1;
+    if (tid < kAttnChunk) {
+        const int j = c * kAttnChunk + tid;
+        if (kWindow) {
+            if (j < a.win_n[t]) {
+                const int cap = a.win_cap;
+                r = (int) (((int64_t) a.win_start[t] + j) % cap);
+                if (r < 0) r += cap;
+            }
+        } else if (j < a.n_sel) {
+            const int id = a.sel[(size_t) t * a.n_sel + j];
+            if (id >= 0 && id < a.comp_limit[t]) r = id;
+        }
+        rowid[tid] = r;
+    }
+    const bool any = __syncthreads_or(tid < kAttnChunk && r >= 0);
+    const int head0 = g * kHeadsPerBlock;
+    float* mlp0 = ml + (((size_t) t * kAttnHeads + head0) * n_chunks_total + slot) * 2;
+    if (!any) {
+        if (tid < kHeadsPerBlock) {
+            float* m = mlp0 + (size_t) tid * n_chunks_total * 2;
+            m[0] = -INFINITY;
+            m[1] = 0.f;
+        }
+        return;
+    }
+
+    const float4* qg = reinterpret_cast<const float4*>(a.q + ((size_t) t * kAttnHeads + head0) * kAttnHeadDim);
+    for (int i = tid; i < kHeadsPerBlock * kAttnHeadDim / 4; i += kBlockThreads) qs[i] = qg[i];
+    __syncthreads();
+
+    float* o0 = o_part + (((size_t) t * kAttnHeads + head0) * n_chunks_total + slot) * kAttnHeadDim;
+    if (kWindow)
+        mqa_chunk<W>(static_cast<const uint8_t*>(a.win), a.scale, qs, sc, rowid, mlp0, (size_t) n_chunks_total * 2, o0,
+                     (size_t) n_chunks_total * kAttnHeadDim);
+    else
+        mqa_chunk<C>(static_cast<const uint8_t*>(a.comp), a.scale, qs, sc, rowid, mlp0, (size_t) n_chunks_total * 2, o0,
+                     (size_t) n_chunks_total * kAttnHeadDim);
 }
 
 // ---- merge of the chunks with the sink, then the inverse RoPE -------------------------------------------------
@@ -348,11 +412,10 @@ void check_launch(const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
-template <class T>
-void launch_partial(const MqaArgs& a, int lo, int hi, int n_win, int n_total, float* o_part, float* ml,
-                    cudaStream_t s) {
-    mqa_partial_kernel<T><<<dim3(hi - lo, kAttnHeads / kHeadsPerBlock, a.n_tokens), kBlockThreads, 0, s>>>(
-        a, lo, n_win, n_total, o_part, ml);
+template <class W, class C>
+void launch_partial(const MqaArgs& a, int n_win, int n_total, float* o_part, float* ml, cudaStream_t s) {
+    mqa_partial_kernel<W, C><<<dim3(n_total, kAttnHeads / kHeadsPerBlock, a.n_tokens), kBlockThreads, 0, s>>>(
+        a, n_win, n_total, o_part, ml);
     check_launch("mqa_partial");
 }
 
@@ -385,17 +448,12 @@ void sparse_mqa(const MqaArgs& a, float* workspace, void* stream) {
     float* o_part = workspace;
     float* ml = workspace + (size_t) a.n_tokens * kAttnHeads * n_chunks * kAttnHeadDim;
 
-    // window and compressed chunks share one launch when the latents have one type
-    const auto run = [&](int lo, int hi, LatentType type) {
-        if (type == LatentType::F32) launch_partial<float>(a, lo, hi, nw, n_chunks, o_part, ml, s);
-        else launch_partial<__half>(a, lo, hi, nw, n_chunks, o_part, ml, s);
-    };
-    if (!sparse || a.win_type == a.comp_type) {
-        run(0, n_chunks, a.win_type);
-    } else {
-        run(0, nw, a.win_type);
-        run(nw, n_chunks, a.comp_type);
-    }
+    // window and compressed chunks share one launch
+    const LatentType w = a.win_type, c = sparse ? a.comp_type : (w == LatentType::Fp8 ? LatentType::Fp4 : LatentType::F32);
+    if (w == LatentType::Fp8 && c == LatentType::Fp4) launch_partial<RowFp8, RowFp4>(a, nw, n_chunks, o_part, ml, s);
+    else if (w == LatentType::F16 && c == LatentType::F32) launch_partial<RowF16, RowF32>(a, nw, n_chunks, o_part, ml, s);
+    else if (w == LatentType::F32 && c == LatentType::F32) launch_partial<RowF32, RowF32>(a, nw, n_chunks, o_part, ml, s);
+    else throw std::invalid_argument("sparse_mqa: latent types");
     mqa_merge_kernel<<<dim3(kAttnHeads, a.n_tokens), 256, 0, s>>>(o_part, ml, n_chunks, a.sinks, a.pos, a.rope, a.out);
     check_launch("mqa_merge");
 }

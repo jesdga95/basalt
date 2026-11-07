@@ -22,9 +22,10 @@ int main() {
     constexpr int64_t kNative = 1048576;
     constexpr uint64_t GiB = 1ull << 30;
 
-    // cache sizes: 640 B per position at ratio 2, 1280 at ratio 1
-    CHECK(cache_bytes(1000000, ratios) > 3ull * 640 * 1000000 + 1280ull * 1000000 - 16384);
-    CHECK(cache_bytes(1000000, ratios) < 3ull * 640 * 1000000 + 1280ull * 1000000 + 16384);
+    // cache sizes: a packed row of 288 + 80 B, 184 B per position at ratio 2, 368 at ratio 1
+    CHECK(kLatentRowBytes == 288 && kIndexRowBytes == 80);
+    CHECK(cache_bytes(1000000, ratios) > 3ull * 184 * 1000000 + 368ull * 1000000 - 16384);
+    CHECK(cache_bytes(1000000, ratios) < 3ull * 184 * 1000000 + 368ull * 1000000 + 16384);
     CHECK(cache_bytes(0, {}) == 0);
     CHECK(owns_cache(2, 2) && owns_cache(20, 1) && !owns_cache(3, 2) && !owns_cache(2, 0));
 
@@ -43,10 +44,12 @@ int main() {
     p = plan_context(kLegacyContext + 1, 0, 20 * GiB, ratios);
     CHECK(!p.error.empty());
     // more than half of the free memory is refused, a quarter or more warns
-    p = plan_context(kNative, kNative, 6 * GiB, ratios);
+    p = plan_context(kNative, kNative, 3 * GiB / 2, ratios);
     CHECK(!p.error.empty());
-    p = plan_context(kNative, kNative, 12 * GiB, ratios);
+    p = plan_context(kNative, kNative, 3 * GiB, ratios);
     CHECK(p.error.empty() && !p.note.empty());
+    p = plan_context(kNative, kNative, 4 * GiB, ratios);
+    CHECK(p.error.empty() && p.note.empty());
 
     if (g_fail == 0) std::printf("context_policy_test: ok\n");
     return g_fail ? 1 : 0;

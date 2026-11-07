@@ -3,14 +3,17 @@
 // a context the card cannot back.
 #pragma once
 
+#include "basalt/models/deepseek41/attn_index.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace basalt::models::deepseek41::ctxp {
 
-constexpr uint64_t kLatentRowBytes = 512 * 2;   // one compressed latent, fp16
-constexpr uint64_t kIndexRowBytes = 128 * 2;    // one index key, fp16
+constexpr uint64_t kLatentRowBytes = kCompRowBytes;   // one compressed latent, FP4 packed
+constexpr uint64_t kIndexRowBytes = kIdxRowBytes;     // one index key, FP4 packed
+constexpr int kCellFormat = 1;                        // the format tag of saved caches: these packed rows
 constexpr int kDecodeTokens = 8;                // tokens one decode call scores at once (indexer workspace rows)
 constexpr int64_t kLegacyContext = 8192;        // the maximum of a pack that names no context length
 constexpr int64_t kMinContext = 1024;

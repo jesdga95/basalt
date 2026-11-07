@@ -449,7 +449,6 @@ struct DsparkDrafter::Impl {
             a.win_n = dn;
             a.comp = blockkv;
             a.comp_type = LatentType::F32;
-            a.comp_stride = kLatent;
             a.sel = dsel;
             a.n_sel = kT;
             a.comp_limit = dlim;
