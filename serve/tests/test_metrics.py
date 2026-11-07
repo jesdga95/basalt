@@ -47,7 +47,7 @@ class Http(unittest.TestCase):
         tok = ByteTokenizer()
         self.engine = Clocked(tok, "Thought.</think>\n\nHello.", max_context=16384)
         self.engine.info = {"version": "1.2.3", "kv": "fp8", "expert_slots": 100}
-        self.svc = Service(self.engine, tok, ChatTemplate(TEMPLATE))
+        self.svc = Service(self.engine, tok, ChatTemplate.from_file(TEMPLATE))
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 

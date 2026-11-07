@@ -17,7 +17,7 @@ CALL = "</think>\n\n<tool_call>\n<function=put>\n<parameter=items>\n[1, 2, 3, 4,
 def service(script, delay_s=0.0):
     tok = ByteTokenizer()
     engine = MockEngine(tok, script, max_context=4096, delay_s=delay_s)
-    return Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja")), tok
+    return Service(engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")), tok
 
 
 def run(svc, tok, cancel=None, tools=None):

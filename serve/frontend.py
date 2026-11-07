@@ -27,7 +27,11 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
 class ChatTemplate:
     """The model's chat template, rendered with the Jinja settings of transformers' apply_chat_template."""
 
-    def __init__(self, path: str | Path):
+    @classmethod
+    def from_file(cls, path: str | Path) -> "ChatTemplate":
+        return cls(Path(path).read_text(encoding="utf-8"))
+
+    def __init__(self, source: str):
         def raise_exception(message):
             raise TemplateRequestError(message)
 
@@ -37,7 +41,7 @@ class ChatTemplate:
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
-        self.source = Path(path).read_text(encoding="utf-8")
+        self.source = source
         self.template = env.from_string(self.source)
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,

@@ -83,7 +83,7 @@ class QuietPromptCancel(unittest.TestCase):
             with mock.patch.object(process.subprocess, 'Popen', lambda cmd, **kw:
                                    real_popen([sys.executable, str(script), *cmd[1:]], **kw)):
                 engine = ProcessEngine('basalt', ['--batch', str(batch), '--events', str(events)])
-            service = Service(engine, ByteTokenizer(), ChatTemplate(ROOT / 'serve/chat_template.jinja'))
+            service = Service(engine, ByteTokenizer(), ChatTemplate.from_file(ROOT / 'serve/chat_template.jinja'))
             http = serve(service, port=0)
             port = http.server_address[1]
             sock = None
