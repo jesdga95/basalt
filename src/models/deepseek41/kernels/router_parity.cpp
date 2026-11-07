@@ -137,6 +137,32 @@ int main(int argc, char** argv) {
         v.expect(o.ids[0] == 77 && o.ids[1] == 201, "tie did not resolve to the lower index first");
     }
 
+    // ---- frozen: the ids and weights of many tokens hash to the bits of the kernel the selection replaced, here and
+    // with every expert twinned (ties everywhere)
+    {
+        constexpr uint64_t kFrozen = 0x3634b0999cf64e2aull;
+        uint64_t h = 1469598103934665603ull;
+        const auto fnv = [&](const void* p, size_t n) {
+            const uint8_t* b = static_cast<const uint8_t*>(p);
+            for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+        };
+        auto twin_g = gate_h;
+        auto twin_b = bias_h;
+        for (int e = NE / 2; e < NE; ++e) {
+            std::memcpy(&twin_g[(size_t) e * ND], &twin_g[(size_t) (e - NE / 2) * ND], ND * sizeof(float));
+            twin_b[e] = twin_b[e - NE / 2];
+        }
+        Dev<float> tg(twin_g), tb(twin_b);
+        const auto xs = randn((size_t) 64 * ND, 9);
+        for (int twin = 0; twin < 2; ++twin) {
+            Out o = run(twin ? tg : gate, twin ? tb : bias, xs, 64, a);
+            fnv(o.ids.data(), o.ids.size() * 4);
+            fnv(o.w.data(), o.w.size() * 4);
+        }
+        std::printf("frozen: ids and weights %016llx (want %016llx)\n", (unsigned long long) h, (unsigned long long) kFrozen);
+        v.expect(h == kFrozen, "ids and weights equal the frozen kernel");
+    }
+
     // ---- microbench
     for (int T : {1, 4}) {
         Dev<float> dx(std::vector<float>(x_h.begin(), x_h.begin() + (size_t) T * ND)), dl((size_t) T * NE), dw((size_t) T * K);

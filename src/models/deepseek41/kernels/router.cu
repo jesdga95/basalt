@@ -94,46 +94,73 @@ __device__ __forceinline__ float sqrt_softplus(float x) {
     return sqrtf(sp);
 }
 
-// Stage: one token, one thread per expert. A thread ranks its biased score against all others (higher score first,
-// the lower index wins a tie); ranks below k are the selection, in rank order.
+// Shared memory of one token's selection.
+struct SelectScratch {
+    float wmax[kMaxExpert / 32];   // each warp's largest biased score
+    float lb[kMaxExpert];          // the candidates' biased scores and experts, in no particular order
+    int le[kMaxExpert];
+    float thr;
+    int n;
+    float sel[8];
+};
+
+// Stage: one token, one thread per expert. An expert's rank counts the experts ahead of it (higher biased score, or
+// equal and a lower index); ranks below k are the selection, in rank order. The k-th largest warp maximum bounds the
+// k-th score from below (k distinct experts reach it), so only experts at or above it can rank below k, and they are
+// ranked among themselves.
 __device__ void router_select_token(const float* __restrict__ logits, const float* __restrict__ bias, int n_expert,
                                     int k, float scale, int32_t* __restrict__ ids, float* __restrict__ weights,
-                                    float* sb, float* sel) {
-    const int e = threadIdx.x;
+                                    SelectScratch& sh) {
+    const int e = threadIdx.x, lane = e & 31, warp = e >> 5, nw = n_expert >> 5;
     const float s = sqrt_softplus(logits[e]);
     const float b = s + bias[e];
-    sb[e] = b;
+    float m = b;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (lane == 0) sh.wmax[warp] = m;
+    if (e == 0) sh.n = 0;
     __syncthreads();
-    int rank = 0;
-    const int n4 = n_expert >> 2;
-    for (int j4 = 0; j4 < n4; ++j4) {
-        const float4 o = reinterpret_cast<const float4*>(sb)[j4];
-        const int j = j4 * 4;
-        rank += (o.x > b) | ((o.x == b) & (j < e));
-        rank += (o.y > b) | ((o.y == b) & (j + 1 < e));
-        rank += (o.z > b) | ((o.z == b) & (j + 2 < e));
-        rank += (o.w > b) | ((o.w == b) & (j + 3 < e));
+    if (warp == 0) {
+        if (nw < k) {
+            if (lane == 0) sh.thr = -INFINITY;
+        } else if (lane < nw) {
+            const float v = sh.wmax[lane];
+            int r = 0;
+            for (int j = 0; j < nw; ++j) r += (sh.wmax[j] > v) | ((sh.wmax[j] == v) & (j < lane));
+            if (r == k - 1) sh.thr = v;
+        }
     }
-    if (rank < k) {
-        sel[rank] = s;
-        ids[rank] = e;
+    __syncthreads();
+    const bool cand = b >= sh.thr;
+    if (cand) {
+        const int i = atomicAdd(&sh.n, 1);
+        sh.lb[i] = b;
+        sh.le[i] = e;
+    }
+    __syncthreads();
+    if (cand) {
+        int rank = 0;
+        for (int j = 0; j < sh.n; ++j) rank += (sh.lb[j] > b) | ((sh.lb[j] == b) & (sh.le[j] < e));
+        if (rank < k) {
+            sh.sel[rank] = s;
+            ids[rank] = e;
+        }
     }
     __syncthreads();
     if (e == 0) {
         float sum = 0.f;
-        for (int r = 0; r < k; ++r) sum += sel[r];
+        for (int r = 0; r < k; ++r) sum += sh.sel[r];
         const float denom = sum + 1e-20f;
-        for (int r = 0; r < k; ++r) weights[r] = sel[r] / denom * scale;
+        for (int r = 0; r < k; ++r) weights[r] = sh.sel[r] / denom * scale;
     }
 }
 
 __global__ void router_select_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int n_expert,
                                      int k, float scale, int32_t* __restrict__ ids, float* __restrict__ weights) {
-    __shared__ __align__(16) float sb[kMaxExpert];
-    __shared__ float sel[8];
+    __shared__ SelectScratch sh;
     const int t = blockIdx.x;
     router_select_token(logits + (size_t) t * n_expert, bias, n_expert, k, scale, ids + (size_t) t * k,
-                        weights + (size_t) t * k, sb, sel);
+                        weights + (size_t) t * k, sh);
 }
 
 }  // namespace
