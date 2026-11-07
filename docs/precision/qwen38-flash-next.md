@@ -39,7 +39,9 @@ Decode activations are int8 (q8_1) into every quantized matmul. The hc read stay
 
 GPU experts run the same kernels on every tier, so an expert gives the same bits on either card. CPU experts quantize activations with
 ggml's `vec_dot_type` (Q8_K per 256 for i-quant gate/up, Q8_0 for down). They round about 1% of a layer's routed output differently, so
-which experts sit where changes the last bits. Pin `--adapt-swaps 0 --peer-adapt-swaps 0` for identity checks.
+which experts sit where changes the last bits. Pin `--adapt-swaps 0 --peer-adapt-swaps 0` for identity checks. The Arm64 build's CPU
+tier runs NEON dot products (`ggml_cpu_dots_neon.c`, and `nvfp4_neon.cpp` for several tokens at once, bitwise equal per token to that
+dot), which sum in another order than the x86 kernels ([platforms](../platforms.md#windows-on-arm-rtx-spark)).
 
 ### Prefill
 

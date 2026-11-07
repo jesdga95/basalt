@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "basalt/core/device_memory.hpp"
 
 namespace basalt::core {
 
@@ -41,7 +42,7 @@ namespace {
 // What to change when the draft head's token subset does not fit the VRAM left.  Text only, after the failure.
 void draft_head_hint(int64_t n_tokens, uint64_t bytes) {
     size_t free_b = 0, total_b = 0;
-    const bool have_free = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+    const bool have_free = basalt::core::device_mem_info(&free_b, &total_b) == cudaSuccess;
     std::string free_s;
     if (have_free) {
         char b[64];

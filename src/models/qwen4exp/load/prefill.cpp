@@ -24,6 +24,7 @@ int prefill(Context& context) {
     auto& auto_lend_pct = *context.auto_lend_pct;
     auto& auto_ceiling = *context.auto_ceiling;
     auto& pool = *context.pool;
+    const bool own_prompt_buffers = context.own_prompt_buffers != nullptr && *context.own_prompt_buffers;
 
     // ---- the prompt's conditioning positions [0, n_prompt - 1) in batched chunks.  The token loop then starts at the
     // last prompt position, whose prediction is the first generated token.
@@ -54,6 +55,7 @@ int prefill(Context& context) {
             } else if (chunk != o.prefill_chunk) {
                 k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before
             }
+            if (own_prompt_buffers) k = 0;             // the planned chunk in buffers of its own (resident_plan)
             const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
             if (k > 0) {   // the lent slots are refilled after the prompt
                 const int32_t first = (int32_t) (xcache.slots() - k);
@@ -71,7 +73,8 @@ int prefill(Context& context) {
             }
         }
         if (borrow == nullptr)
-            basalt::log::info("basalt generate", "prompt path allocates its own buffers (no cache slots to borrow)");
+            basalt::log::info("basalt generate", "prompt path allocates its own buffers (%s)",
+                              own_prompt_buffers ? "VRAM free beside the expert cache" : "no cache slots to borrow");
         if (!multi_gpu && o.batch <= 0 && !o.no_pool) { prefill.set_cpu_pool(&pool); prefill.set_cpu_share(o.prefill_cpu_share); }
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,

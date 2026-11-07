@@ -1,9 +1,16 @@
 # basalt: a local inference engine for one NVIDIA GPU.
 cmake_minimum_required(VERSION 3.24)
+# Blackwell's compute capability on the target: 12.0 for the discrete cards on x86-64, 12.1 for the integrated GPU
+# on Arm64, settled once the target is known (below).
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
+  set(_basalt_default_arch ON)
 endif()
 project(basalt VERSION 0.3.0 LANGUAGES C CXX CUDA)
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/target_arch.cmake)
+if(_basalt_default_arch AND BASALT_ARM64)
+  set(CMAKE_CUDA_ARCHITECTURES 121 CACHE STRING "CUDA architectures" FORCE)
+endif()
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -37,17 +44,22 @@ endfunction()
 # the CUDA language gives the .cu compile rules but not the imported targets, so `CUDA::cudart` is brought in
 # explicitly for the host-side programs that call the runtime themselves
 find_package(CUDAToolkit REQUIRED)
-# One architecture only: the kernels use its instructions and nothing else is tested.
+# One architecture only: the kernels use its instructions and nothing else is tested. Blackwell 12.0 or 12.1; the
+# engine refuses a card of any other compute capability at start (BASALT_CUDA_CC).
+set(_basalt_cc "")
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
-  if(NOT _base STREQUAL "120")
-    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 only")
+  if(NOT _base MATCHES "^12[01]$" OR (_basalt_cc AND NOT _base STREQUAL _basalt_cc))
+    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for one compute "
+                        "capability, 12.0 or 12.1")
   endif()
+  set(_basalt_cc "${_base}")
 endforeach()
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
   message(FATAL_ERROR "CUDA ${CMAKE_CUDA_COMPILER_VERSION}: basalt needs CUDA 13.0 or newer")
 endif()
 message(STATUS "basalt: CUDA arch ${CMAKE_CUDA_ARCHITECTURES}")
+add_compile_definitions(BASALT_CUDA_CC=${_basalt_cc})
 set(_gpu_runtime_target CUDA::cudart)
 set(_gpu_blas_target CUDA::cublas)
 set(_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -101,7 +113,14 @@ endfunction()
 # ggml dot products pick their VNNI form by __AVX512VNNI__), so they are defined to match what the GNU flags give:
 # without it a file compiles down its no-VNNI path and runs slower than the same build on Linux. __BMI2__ is left
 # alone because -mavx2 and -mavx512* do not enable BMI2 either, so that branch is out on both platforms.
-if(MSVC)
+if(BASALT_ARM64)
+  # The dot product (SDOT) is Armv8.2; MSVC takes the NEON intrinsics without a switch.
+  if(MSVC)
+    set(_isa_neon_dot_flags "")
+  else()
+    set(_isa_neon_dot_flags "-march=armv8.2-a+dotprod")
+  endif()
+elseif(MSVC)
   set(_isa_avx512_flags "/arch:AVX512;-D__F16C__=1;-D__AVX512VNNI__=1;-D__AVX512VBMI__=1")
   set(_isa_avx2_flags "/arch:AVX2;-D__F16C__=1")
   set(_isa_avxvnni_flags "/arch:AVX2;-D__F16C__=1")
@@ -283,7 +302,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 # Defined in cmake/platform.cmake, included above with `warnings`.
 
 # ---- core (GPU runtime) ---------------------------------------------
-add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
+add_library(core STATIC src/core/device.cu src/core/device_memory.cpp src/core/pinned.cu src/core/ram_load.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
                              src/core/model_file.cpp src/core/host_plan.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
@@ -1198,18 +1217,30 @@ if(BUILD_TESTING)
   basalt_cpu_test(NAME bf16_bits_test COMMAND bf16_bits_test)
 endif()
 
-add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp
-            src/kernels/cpu/q2_avx2_vnni.cpp)
+if(BASALT_ARM64)
+  # The Arm64 build: the Q2_0 kernels, the router warm-up dot and the ggml dot products in NEON with the dot product.
+  # The pool and the probes run on any Arm64 CPU; the engine refuses one without the dot product at start
+  # (cpu_neon_dot_ok).
+  add_library(kernels_cpu STATIC src/kernels/cpu/expert_neon.cpp src/kernels/cpu/pool.cpp
+              src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/router_q4_neon.cpp)
+  set_source_files_properties(src/kernels/cpu/expert_neon.cpp src/kernels/cpu/router_q4_neon.cpp
+                              PROPERTIES COMPILE_OPTIONS "${_isa_neon_dot_flags}")
+else()
+  add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
+              src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp
+              src/kernels/cpu/q2_avx2_vnni.cpp src/kernels/cpu/router_q4_avx2.cpp)
+  # only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
+  # and the engine picks the kernels at run time (cpu_avx512_ok).
+  # `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
+  set_source_files_properties(src/kernels/cpu/expert.cpp
+                              PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
+  set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+  # the same Q2_0 rows with the AVX-VNNI instructions, called only behind cpu_avxvnni_ok()
+  set_source_files_properties(src/kernels/cpu/q2_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
+  # the CPU warm-up's router dot (every CPU the engine runs on has AVX2)
+  set_source_files_properties(src/kernels/cpu/router_q4_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+endif()
 target_include_directories(kernels_cpu PUBLIC include)
-# only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
-# and the engine picks the kernels at run time (cpu_avx512_ok).
-# `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
-set_source_files_properties(src/kernels/cpu/expert.cpp
-                            PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
-set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
-# the same Q2_0 rows with the AVX-VNNI instructions, called only behind cpu_avxvnni_ok()
-set_source_files_properties(src/kernels/cpu/q2_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
 find_package(Threads REQUIRED)
 target_link_libraries(kernels_cpu PUBLIC Threads::Threads platform)
 
@@ -1221,60 +1252,74 @@ target_link_libraries(kernels_cpu PUBLIC Threads::Threads platform)
 add_library(ggml_quants STATIC src/kernels/cpu/ggml/ggml_quants.c)
 target_include_directories(ggml_quants PUBLIC include PRIVATE src/kernels/cpu/ggml)
 set_target_properties(ggml_quants PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
-# The CPU dot products are built for AVX2 and for AVX-512, each with its own name for the table lookup;
-# ggml_cpu_dispatch.cpp picks one at run time (cpu_avx512_ok / cpu_avx2_ok).
-set(_ggml_dots_avx2_flags ${_isa_avx2_flags})
-set(_ggml_dots_avx512_flags ${_isa_avx512_flags})
-foreach(_isa avx2 avx512)
-  add_library(ggml_dots_${_isa} OBJECT src/kernels/cpu/ggml/ggml_cpu_dots.c)
-  target_include_directories(ggml_dots_${_isa} PRIVATE include src/kernels/cpu/ggml)
-  target_compile_options(ggml_dots_${_isa} PRIVATE ${_ggml_dots_${_isa}_flags})
-  target_compile_definitions(ggml_dots_${_isa} PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_${_isa})
-  set_target_properties(ggml_dots_${_isa} PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
-endforeach()
-# part of kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
-# one-pass static linking has no cycle to resolve)
-target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                         src/kernels/cpu/nvfp4_avx512.cpp
-                                         src/kernels/cpu/nvfp4_avx2.cpp src/kernels/cpu/nvfp4_avx2_vnni.cpp
-                                         src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/iq_avx2_vnni.cpp
-                                         src/kernels/cpu/kq_avx2.cpp
-                                         src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
-                                         $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
-# the i-quant rows also use BMI2 (pdep/pext for the sign masks; cpu_avx512_ok requires it). MSVC compiles the
-# intrinsics without a switch.
-if(MSVC)
-  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
+if(BASALT_ARM64)
+  # The CPU dot products in NEON with the dot product: one build, which is ggml_get_type_traits_cpu itself.
+  add_library(ggml_dots_neon OBJECT src/kernels/cpu/ggml/ggml_cpu_dots_neon.c)
+  target_include_directories(ggml_dots_neon PRIVATE include src/kernels/cpu/ggml)
+  target_compile_options(ggml_dots_neon PRIVATE ${_isa_neon_dot_flags})
+  set_target_properties(ggml_dots_neon PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
+  target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/nvfp4_neon.cpp
+                                     $<TARGET_OBJECTS:ggml_dots_neon>)
+  # the multi-token NVFP4 rows, bitwise equal per token to the NEON dot above
+  set_source_files_properties(src/kernels/cpu/nvfp4_neon.cpp PROPERTIES COMPILE_OPTIONS "${_isa_neon_dot_flags}")
 else()
-  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags};-mbmi2")
-endif()
-set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                            "${_isa_avx512_flags}")
-set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
-# the same rows with the AVX-VNNI instructions and BMI2 (pdep for the grid indices), called only behind cpu_avxvnni_ok()
-set_source_files_properties(src/kernels/cpu/iq_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
-set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
-# the same rows with AVX-VNNI-INT8 (`vpdpbssd`), called only behind cpu_avxvnni_int8_ok()
-set_source_files_properties(src/kernels/cpu/nvfp4_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnniint8_flags}")
-set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
-# the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
-set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx1_flags}")
-# MSVC gives the scalar F16C conversions no working code: its headers declare them nowhere, and with
-# __F16C__ defined the compiler claims the names as its own, so a definition compiled under that macro does not
-# build as written. The file below supplies the pair from the vector intrinsics, which are the same instruction,
-# and it must be compiled without __F16C__ for its definitions to survive; the callers carry prototypes and
-# #pragma function so the calls reach it. The file is empty for every other compiler, and it is not added to the
-# library at all there.
-if(MSVC)
-  target_sources(kernels_cpu PRIVATE src/kernels/cpu/ggml/f16c_scalar_msvc.c)
-  set_source_files_properties(src/kernels/cpu/ggml/f16c_scalar_msvc.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  # The CPU dot products are built for AVX2 and for AVX-512, each with its own name for the table lookup;
+  # ggml_cpu_dispatch.cpp picks one at run time (cpu_avx512_ok / cpu_avx2_ok).
+  set(_ggml_dots_avx2_flags ${_isa_avx2_flags})
+  set(_ggml_dots_avx512_flags ${_isa_avx512_flags})
+  foreach(_isa avx2 avx512)
+    add_library(ggml_dots_${_isa} OBJECT src/kernels/cpu/ggml/ggml_cpu_dots.c)
+    target_include_directories(ggml_dots_${_isa} PRIVATE include src/kernels/cpu/ggml)
+    target_compile_options(ggml_dots_${_isa} PRIVATE ${_ggml_dots_${_isa}_flags})
+    target_compile_definitions(ggml_dots_${_isa} PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_${_isa})
+    set_target_properties(ggml_dots_${_isa} PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
+  endforeach()
+  # part of kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
+  # one-pass static linking has no cycle to resolve)
+  target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
+                                           src/kernels/cpu/nvfp4_avx512.cpp
+                                           src/kernels/cpu/nvfp4_avx2.cpp src/kernels/cpu/nvfp4_avx2_vnni.cpp
+                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/iq_avx2_vnni.cpp
+                                           src/kernels/cpu/kq_avx2.cpp
+                                           src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
+                                           $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
+  # the i-quant rows also use BMI2 (pdep/pext for the sign masks; cpu_avx512_ok requires it). MSVC compiles the
+  # intrinsics without a switch.
+  if(MSVC)
+    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
+  else()
+    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags};-mbmi2")
+  endif()
+  set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                              "${_isa_avx512_flags}")
+  set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+  # the same rows with the AVX-VNNI instructions and BMI2 (pdep for the grid indices), called only behind cpu_avxvnni_ok()
+  set_source_files_properties(src/kernels/cpu/iq_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
+  set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+  # the same rows with AVX-VNNI-INT8 (`vpdpbssd`), called only behind cpu_avxvnni_int8_ok()
+  set_source_files_properties(src/kernels/cpu/nvfp4_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnniint8_flags}")
+  set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+  # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
+  set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx1_flags}")
+  # MSVC gives the scalar F16C conversions no working code: its headers declare them nowhere, and with
+  # __F16C__ defined the compiler claims the names as its own, so a definition compiled under that macro does not
+  # build as written. The file below supplies the pair from the vector intrinsics, which are the same instruction,
+  # and it must be compiled without __F16C__ for its definitions to survive; the callers carry prototypes and
+  # #pragma function so the calls reach it. The file is empty for every other compiler, and it is not added to the
+  # library at all there.
+  if(MSVC)
+    target_sources(kernels_cpu PRIVATE src/kernels/cpu/ggml/f16c_scalar_msvc.c)
+    set_source_files_properties(src/kernels/cpu/ggml/f16c_scalar_msvc.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  endif()
 endif()
 target_link_libraries(kernels_cpu PUBLIC ggml_quants)
+if(NOT BASALT_ARM64)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
-add_executable(router_dot_parity tests/kernels/cpu/router_dot_parity.cpp)
-target_link_libraries(router_dot_parity PRIVATE kernels_cpu)
-if(BUILD_TESTING)
-  basalt_gpu_test(NAME router_dot_parity COMMAND router_dot_parity)
+  add_executable(router_dot_parity tests/kernels/cpu/router_dot_parity.cpp)
+  target_link_libraries(router_dot_parity PRIVATE kernels_cpu)
+  if(BUILD_TESTING)
+    basalt_gpu_test(NAME router_dot_parity COMMAND router_dot_parity)
+  endif()
 endif()
 # MMQ (ggml-cuda) for the prompt path's experts: the kernel, one instance per format the packs use, and the
 # activation quantizer; mmq_host.cu holds its few host symbols
@@ -1302,7 +1347,7 @@ target_compile_options(model_qwen4exp_moe_fused PRIVATE $<$<COMPILE_LANGUAGE:CUD
 target_link_libraries(model_qwen4exp_moe_fused PUBLIC mmq ${_gpu_runtime_target})
 target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_moe_fused)
 add_library(model_qwen4exp_fp4 STATIC src/models/qwen4exp/prefill/fp4/moe_fp4.cu)
-set_target_properties(model_qwen4exp_fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
+set_target_properties(model_qwen4exp_fp4 PROPERTIES CUDA_ARCHITECTURES ${_basalt_cc}a-real)
 target_include_directories(model_qwen4exp_fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model_qwen4exp_fp4 PUBLIC mmq ${_gpu_runtime_target})
 target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_fp4)
@@ -1447,16 +1492,20 @@ if(BUILD_TESTING)
   add_executable(dequant_bf16_test tests/kernels/dequant_bf16_test.cpp)
   target_link_libraries(dequant_bf16_test PRIVATE kernels artifact ${_gpu_runtime_target})
 
-  # the CPU expert kernels on each instruction set side by side (timing; the parity checks are native_expert_parity)
-  add_executable(avx_bench tests/kernels/cpu/avx_bench.cpp)
-  target_link_libraries(avx_bench PRIVATE kernels_cpu)
+  if(NOT BASALT_ARM64)
+    # the CPU expert kernels on each instruction set side by side (timing; the parity checks are native_expert_parity)
+    add_executable(avx_bench tests/kernels/cpu/avx_bench.cpp)
+    target_link_libraries(avx_bench PRIVATE kernels_cpu)
+  endif()
 
   # needs the AVX-512 VNNI and VBMI instruction sets, which not every host has
 
-  add_executable(nvfp4_cpu_rows_test tests/kernels/cpu/nvfp4_cpu_rows_test.cpp)
-  target_link_libraries(nvfp4_cpu_rows_test PRIVATE kernels_cpu)
-  basalt_cpu_test(NAME nvfp4_cpu_rows_test COMMAND nvfp4_cpu_rows_test)
-  set_tests_properties(nvfp4_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
+  if(NOT BASALT_ARM64)
+    add_executable(nvfp4_cpu_rows_test tests/kernels/cpu/nvfp4_cpu_rows_test.cpp)
+    target_link_libraries(nvfp4_cpu_rows_test PRIVATE kernels_cpu)
+    basalt_cpu_test(NAME nvfp4_cpu_rows_test COMMAND nvfp4_cpu_rows_test)
+    set_tests_properties(nvfp4_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
+  endif()
 
   # Both tests run on a synthetic expert fixture by default; --file experts.bin (the pack's experts section) checks real blobs.
 
@@ -1468,15 +1517,17 @@ if(BUILD_TESTING)
   add_executable(pool_native_test tests/kernels/cpu/pool_native_test.cpp)
   target_link_libraries(pool_native_test PRIVATE kernels_cpu platform)
   basalt_cpu_test(NAME pool_native_test COMMAND pool_native_test)
-  # the AVX2 i-quant rows: the madd build against the AVX-VNNI build (bitwise) and a double reference
-  add_executable(iq_avx2_test tests/kernels/cpu/iq_avx2_test.cpp)
-  target_link_libraries(iq_avx2_test PRIVATE kernels_cpu platform)
-  basalt_cpu_test(NAME iq_avx2_test COMMAND iq_avx2_test)
-  # the AVX-512 i-quant rows: frozen output hashes, token-count independence and a double reference
-  add_executable(iq_avx512_test tests/kernels/cpu/iq_avx512_test.cpp)
-  target_link_libraries(iq_avx512_test PRIVATE kernels_cpu platform)
-  basalt_cpu_test(NAME iq_avx512_test COMMAND iq_avx512_test)
-  set_property(TEST iq_avx512_test APPEND PROPERTY LABELS avx512)
+  if(NOT BASALT_ARM64)
+    # the AVX2 i-quant rows: the madd build against the AVX-VNNI build (bitwise) and a double reference
+    add_executable(iq_avx2_test tests/kernels/cpu/iq_avx2_test.cpp)
+    target_link_libraries(iq_avx2_test PRIVATE kernels_cpu platform)
+    basalt_cpu_test(NAME iq_avx2_test COMMAND iq_avx2_test)
+    # the AVX-512 i-quant rows: frozen output hashes, token-count independence and a double reference
+    add_executable(iq_avx512_test tests/kernels/cpu/iq_avx512_test.cpp)
+    target_link_libraries(iq_avx512_test PRIVATE kernels_cpu platform)
+    basalt_cpu_test(NAME iq_avx512_test COMMAND iq_avx512_test)
+    set_property(TEST iq_avx512_test APPEND PROPERTY LABELS avx512)
+  endif()
 
   # DirectFile has a Linux backend and a Windows backend, and this test covers those two; macOS is not a platform
   # the engine builds for.

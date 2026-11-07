@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/memory.cpp - memory operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
+#include "basalt/core/device_memory.hpp"
 
 #include "basalt/core/host_plan.hpp"
 
@@ -111,7 +112,7 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
     }
     const auto t0 = Clock::now();
     size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
+    basalt::core::device_mem_info(&free_b, &total_b);
     const int64_t want_free = (int64_t) reserve << 20, mapped = xcache.mapped_bytes();
     const int64_t before = xcache.slots();
     // what stays at least: the prompt path's smallest loan (256 tokens) and the 128 slots it must leave
@@ -203,7 +204,7 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
         }
     }
     relend();
-    cudaMemGetInfo(&free_b, &total_b);
+    basalt::core::device_mem_info(&free_b, &total_b);
     basalt::log::info("basalt serve", "VRAM %lld MiB kept free: the expert cache %lld -> %lld of %lld slots "
                          "(%.2f of %.2f GiB), %lld MiB free now, prompt chunk %lld, in %.0f ms%s",
                  reserve, (long long) before, (long long) xcache.slots(), (long long) xcache.full_slots(),

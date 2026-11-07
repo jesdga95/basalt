@@ -8,7 +8,9 @@
 #include "basalt/kernels/cpu/kq_avx2.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
+#include "basalt/kernels/cpu/nvfp4_neon.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/platform/compiler.hpp"
 
 #include "basalt/ggml/ggml.h"
 
@@ -98,14 +100,16 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
-    static const bool avx512 = cpu_avx512_ok();
-    if (f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
-        if (avx512) {
-            quantize_q8_K_avx512(x, dst, f.n_embd);
+    if constexpr (platform::kX86) {
+        static const bool avx512 = cpu_avx512_ok();
+        if (f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
+            if (avx512) {
+                quantize_q8_K_avx512(x, dst, f.n_embd);
+                return;
+            }
+            quantize_q8_K_avx2(x, dst, f.n_embd);   // the engine runs on AVX2 CPUs at least
             return;
         }
-        quantize_q8_K_avx2(x, dst, f.n_embd);   // the engine runs on AVX2 CPUs at least
-        return;
     }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
@@ -120,18 +124,20 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // formats without one.  A token's rows round the same alone as in a group, so greedy output does not depend on
     // the number of drafts in a window.  A format with only an AVX-2 kernel (IQ4_XS) takes it on AVX-2 CPUs
     // only: an AVX-512 CPU keeps the ggml dot for it.
-    static const bool avx512 = cpu_avx512_ok();
-    static const bool avx2 = cpu_avx2_ok();
-    static const bool cpu512 = avx512;
-    // the multi-token kernels have the plain SwiGLU built in: a limited layer takes the ggml dot below
-    if (f.swiglu_limit <= 0.f && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
-        if (avx512 && iq512_supported(f.gu_type)) {
-            iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
-            return;
-        }
-        if (avx2 && iq256_supported(f.gu_type)) {
-            iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
-            return;
+    [[maybe_unused]] static const bool avx512 = cpu_avx512_ok();
+    [[maybe_unused]] static const bool avx2 = cpu_avx2_ok();
+    [[maybe_unused]] static const bool cpu512 = avx512;
+    if constexpr (platform::kX86) {
+        // the multi-token kernels have the plain SwiGLU built in: a limited layer takes the ggml dot below
+        if (f.swiglu_limit <= 0.f && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
+            if (avx512 && iq512_supported(f.gu_type)) {
+                iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+                return;
+            }
+            if (avx2 && iq256_supported(f.gu_type)) {
+                iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+                return;
+            }
         }
     }
     const int n = (int) f.n_embd;
@@ -140,24 +146,33 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         std::memcpy(&sg, blob + f.bytes - f.tail, 4);
         std::memcpy(&su, blob + f.bytes - f.tail + 4, 4);
     }
-    // IQ1_S on AVX-512: bitwise equal per token to the ggml dot, the SwiGLU limit included.
-    if (avx512 && f.gu_type == GGML_TYPE_IQ1_S && iq1s_512_fits(n)) {
-        iq1s_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
-        return;
-    }
-    if (avx512 && f.swiglu_limit > 0.f && iq_exact_512_supported(f.gu_type) && iq1s_512_fits(n)) {
-        iq_exact_512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
-        return;
-    }
-    // NVFP4 on AVX-512: the multi-token kernel, bitwise equal per token to the ggml dot it replaces.
-    if (avx512 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
-        nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
-        return;
-    }
-    // The same on AVX2 CPUs, bitwise equal per token to the AVX2 ggml dot.
-    if (!avx512 && avx2 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {
-        nvfp4_256_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
-        return;
+    if constexpr (platform::kX86) {
+        // IQ1_S on AVX-512: bitwise equal per token to the ggml dot, the SwiGLU limit included.
+        if (avx512 && f.gu_type == GGML_TYPE_IQ1_S && iq1s_512_fits(n)) {
+            iq1s_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
+            return;
+        }
+        if (avx512 && f.swiglu_limit > 0.f && iq_exact_512_supported(f.gu_type) && iq1s_512_fits(n)) {
+            iq_exact_512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
+            return;
+        }
+        // NVFP4 on AVX-512: the multi-token kernel, bitwise equal per token to the ggml dot it replaces.
+        if (avx512 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
+            nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
+            return;
+        }
+        // The same on AVX2 CPUs, bitwise equal per token to the AVX2 ggml dot.
+        if (!avx512 && avx2 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {
+            nvfp4_256_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
+            return;
+        }
+    } else {
+        // NVFP4 on Arm64: the multi-token NEON kernel, bitwise equal per token to the NEON ggml dot.  It has the plain
+        // SwiGLU built in: a limited layer takes the ggml dot below.
+        if (f.swiglu_limit <= 0.f && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_neon_fits((int) f.n_embd, (int) f.n_ff)) {
+            nvfp4_neon_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
+            return;
+        }
     }
     if (f.swiglu_limit > 0.f) gu_rows_ggml<true>(f, blob, act, nt, ff, r0, r1, sg, su);
     else gu_rows_ggml<false>(f, blob, act, nt, ff, r0, r1, sg, su);
@@ -167,30 +182,39 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
                       int r0, int r1) {
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles once per block instead of once per token;
     // the ggml dot is single-token.
-    if (cpu_avx2_ok() && f.d_type == 20 && iq4nl256_fits((int) f.n_ff)) {   // the same rule as the gate/up rows
-        iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
-        return;
+    if constexpr (platform::kX86) {
+        if (cpu_avx2_ok() && f.d_type == 20 && iq4nl256_fits((int) f.n_ff)) {   // the same rule as the gate/up rows
+            iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+            return;
+        }
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
     float sd = 1.f;
     if (f.tail) std::memcpy(&sd, blob + f.bytes - f.tail + 8, 4);
-    static const bool avx512 = cpu_avx512_ok();
-    if (avx512 && f.d_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
-        nvfp4_512_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
-        return;
-    }
-    if (!avx512 && cpu_avx2_ok() && f.d_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {
-        nvfp4_256_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
-        return;
-    }
-    if (avx512 && f.d_type == GGML_TYPE_IQ1_S && !f.tail && iq1s_512_fits(n)) {
-        iq1s_512_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
-        return;
-    }
-    if (avx512 && f.swiglu_limit > 0.f && !f.tail && iq_exact_512_supported(f.d_type) && iq1s_512_fits(n)) {
-        iq_exact_512_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
-        return;
+    if constexpr (platform::kX86) {
+        static const bool avx512 = cpu_avx512_ok();
+        if (avx512 && f.d_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
+            nvfp4_512_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
+            return;
+        }
+        if (!avx512 && cpu_avx2_ok() && f.d_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {
+            nvfp4_256_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
+            return;
+        }
+        if (avx512 && f.d_type == GGML_TYPE_IQ1_S && !f.tail && iq1s_512_fits(n)) {
+            iq1s_512_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+            return;
+        }
+        if (avx512 && f.swiglu_limit > 0.f && !f.tail && iq_exact_512_supported(f.d_type) && iq1s_512_fits(n)) {
+            iq_exact_512_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+            return;
+        }
+    } else {
+        if (f.d_type == GGML_TYPE_NVFP4 && nvfp4_neon_fits((int) f.n_embd, (int) f.n_ff)) {
+            nvfp4_neon_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
+            return;
+        }
     }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;

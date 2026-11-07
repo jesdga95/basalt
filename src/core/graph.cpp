@@ -1,7 +1,6 @@
 // src/core/graph.cpp - the GraphRegistry implementation.
 #include "basalt/core/graph.hpp"
-
-#include <immintrin.h>
+#include "basalt/platform/compiler.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -88,7 +87,7 @@ bool CapturedGraph::wait_ms(int timeout_ms) const {
     // it does not synchronise - so this makes no blocking synchronization call while still giving the driver the call it needs to
     // flush the submission.  See NOTE 1 in the header: without a driver call here the work never starts.
     //
-    // The deadline is a REAL CLOCK, not a count of pause instructions: `_mm_pause` is a few cycles, so
+    // The deadline is a REAL CLOCK, not a count of pause instructions: a spin hint is a few cycles, so
     // counting pauses as microseconds would make the timeout tens of times longer than the caller asked for -
     // a timeout that does not time out is worse than none, because it reports a hang as a pass.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -97,7 +96,7 @@ bool CapturedGraph::wait_ms(int timeout_ms) const {
         if (q == cudaSuccess) return true;
         if (q != cudaErrorNotReady) return false;   // a real error, not "not finished"
         if (std::chrono::steady_clock::now() >= deadline) return false;
-        for (int i = 0; i < 64; ++i) _mm_pause();
+        for (int i = 0; i < 64; ++i) basalt::platform::cpu_relax();
     }
 }
 

@@ -1,5 +1,6 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/device_memory.hpp"
 
 #include <cuda_runtime.h>
 #include "basalt/core/vmm.hpp"
@@ -296,7 +297,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // `device_slot()` walks off the end. So the free-VRAM figure is read and compared BEFORE the allocation,
     // and the two numbers are named in the refusal.
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+    if (basalt::core::device_mem_info(&free_b, &total_b) == cudaSuccess) {
         if ((uint64_t) free_b < want) {
             char buf[320];
             std::snprintf(buf, sizeof buf,

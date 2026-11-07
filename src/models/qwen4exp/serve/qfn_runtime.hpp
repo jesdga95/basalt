@@ -44,6 +44,7 @@ struct Context {
     bool& peer_hot_share;
     std::vector<std::pair<int32_t, int32_t>>& profile_loaded;
     const bool& pf_borrow;
+    const bool& own_prompt_buffers;   // CUDA0's prompt path keeps buffers of its own (load/resident_plan.cpp)
     basalt::core::WeightTable& wt;
     int32_t*& d_mrope;
     std::vector<int32_t>& mrope_host;

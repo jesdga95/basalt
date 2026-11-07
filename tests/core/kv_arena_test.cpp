@@ -1,6 +1,7 @@
 // The elastic KV pools (kv_arena.hpp).  Mapping backs whole pages of every array, zeroed; unmapping gives the VRAM
 // back and keeps the cells below the cut exactly as they were; the addresses never move.  Needs a CUDA device with
 // virtual memory management (exits 77 without one).
+#include "basalt/core/device_memory.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
 
 #include <cuda_runtime.h>
@@ -15,9 +16,10 @@ int fail(const char* what, const std::string& err = "") {
     return 1;
 }
 
+// the free figure the engine sizes from
 size_t free_vram() {
     size_t f = 0, t = 0;
-    cudaMemGetInfo(&f, &t);
+    basalt::core::device_mem_info(&f, &t);
     return f;
 }
 

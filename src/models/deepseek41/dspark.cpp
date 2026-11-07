@@ -6,6 +6,7 @@
 #include "models/deepseek41/dspark.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -167,9 +168,9 @@ struct DsparkDrafter::Impl {
 
     bool load(const core::FileRange& section, const std::string& ranking, int keep, std::string& err) {
         size_t free0 = 0, free1 = 0, total_b = 0;
-        cudaMemGetInfo(&free0, &total_b);
+        core::device_mem_info(&free0, &total_b);
         const bool ok = read(section, ranking, keep, err);
-        cudaMemGetInfo(&free1, &total_b);
+        core::device_mem_info(&free1, &total_b);
         bytes_taken = free0 > free1 ? (uint64_t) (free0 - free1) : 0;
         return ok;
     }

@@ -16,7 +16,6 @@
 #include <cstdio>
 #include <string>
 #include <thread>
-#include <immintrin.h>
 
 namespace basalt::core {
 using namespace verify_detail;
@@ -78,7 +77,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
         dm_->tag_dirty = true;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    _mm_sfence();
+    basalt::platform::store_fence();
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
     for (cudaStream_t s : {cs_}) {

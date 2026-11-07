@@ -21,6 +21,8 @@ struct GpuCard {
     int smi = -1;                   ///< its nvidia-smi number; -1 when unknown
     std::string name;               ///< "RTX 5090"; empty when unknown
     int cc_major = 0, cc_minor = 0; ///< compute capability; 0 when unknown
+    bool compute = true;            ///< false: the management library lists it but gives it no CUDA compute
+                                    ///< capability (an NPU), so CUDA cannot run on it
     double mem_gbps = 0;            ///< peak memory bandwidth; 0 when unknown
     uint64_t vram = 0;              ///< bytes; 0 when unknown
 };
@@ -35,7 +37,8 @@ struct GpuSpec {
 /// Parses "", "auto" or "A,B,..."; false with `err` naming what is wrong.
 bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err);
 
-/// Whether Basalt runs on the card: compute capability 12.0, or unknown (nothing to check against).
+/// Whether Basalt runs on the card: a CUDA device of the compute capability this build is for (12.0 or 12.1), or
+/// unknown (nothing to check against).
 bool gpu_supported(const GpuCard& c);
 
 /// "GPU 1 (RTX 5060 Ti)": the visible number the user types, and the name when known.

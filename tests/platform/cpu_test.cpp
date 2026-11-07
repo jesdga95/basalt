@@ -1,6 +1,7 @@
 // tests/platform/cpu_test.cpp - platform::detect_cpu_topology and the thread placement calls. CPU only. Where the OS
 // refuses a placement (a restricted container) the placement cases are skipped with a line saying so.
 #include "basalt/platform/cpu.hpp"
+#include "basalt/platform/compiler.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -35,6 +36,10 @@ int main() {
         const CpuTopology t = detect_cpu_topology(false, a);
         check(!t.worker_cores.empty(), "a hybrid-aware ordering still finds cores");
     }
+
+    const bool dotprod = cpu_has_arm_dotprod();
+    std::printf("cpu: Arm dot product %s\n", dotprod ? "yes" : "no");
+    if constexpr (kX86) check(!dotprod, "no Arm dot product on x86-64");
 
     return failures ? 1 : 0;
 }

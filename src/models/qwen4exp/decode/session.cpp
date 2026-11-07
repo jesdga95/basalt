@@ -810,6 +810,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
             err = "session_loop: layer " + std::to_string(l) + " ended without ringing";
             return false;
         }
+        std::atomic_thread_fence(std::memory_order_acquire);   // what the device wrote before the ring, read after it
 
         // ---- **THE GPU'S HALF GOES FIRST, SO IT RUNS WHILE THE CPU DOES ITS HALF.**  `Launch` only enqueues:
         // the quantize and the grouped expert kernel land on `main_cs` and the GPU starts on them immediately,
@@ -1048,11 +1049,12 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
                 return false;
             }
         }
+        std::atomic_thread_fence(std::memory_order_acquire);   // what the device wrote before the ring, read after it
         const auto t1 = Clock::now();
         progress_at("token: the CPU experts of layer", l);
         if (pool != nullptr) pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, y_miss_host);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        basalt::platform::store_fence();
         *flag = want;
         const auto t2 = Clock::now();
         tg.ms_wait += std::chrono::duration<double, std::milli>(t1 - t0).count();

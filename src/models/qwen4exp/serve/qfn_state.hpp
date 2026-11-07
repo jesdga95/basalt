@@ -177,6 +177,11 @@ private:
     using Context::n_vocab;
     using Context::grammar_vocab;
     friend class Request;
+    struct CudaFree { void operator()(void* p) const { cudaFree(p); } };
+    // CUDA0's prompt buffers when it keeps them as its own (own_prompt_buffers): one region, laid out per read as a
+    // loan is.  Declared before `sp`, so it is freed after the prompt path laid out in it.
+    std::unique_ptr<void, CudaFree> own_region{};
+    uint64_t own_region_bytes{};
     basalt::prefill::Prefill sp{};
     void* borrow{};
     uint64_t borrow_bytes{};

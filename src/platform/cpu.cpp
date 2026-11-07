@@ -17,6 +17,9 @@
 #include <sched.h>
 #include <unistd.h>
 #include "affinity_linux.hpp"
+#if defined(__aarch64__)
+#include <sys/auxv.h>
+#endif
 #endif
 
 namespace basalt::platform {
@@ -157,6 +160,14 @@ CpuInfo cpu_info() {
         }
     }
     return info;
+}
+
+bool cpu_has_arm_dotprod() {
+#if defined(_M_ARM64)
+    return IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE) != 0;
+#else
+    return false;
+#endif
 }
 
 #else
@@ -314,6 +325,15 @@ CpuInfo cpu_info() {
     info.physical_cores = (int) cores.size();
     if (info.physical_cores == 0) info.physical_cores = (int) detect_cpu_topology(false).worker_cores.size();
     return info;
+}
+
+bool cpu_has_arm_dotprod() {
+#if defined(__aarch64__)
+    constexpr unsigned long kHwcapAsimdDp = 1ul << 20;   // HWCAP_ASIMDDP in <asm/hwcap.h>
+    return (getauxval(AT_HWCAP) & kHwcapAsimdDp) != 0;
+#else
+    return false;
+#endif
 }
 
 #endif

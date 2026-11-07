@@ -5,6 +5,7 @@
 #include "basalt/core/load_progress.hpp"
 #include <optional>
 
+#include "basalt/core/device_memory.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
@@ -78,7 +79,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         one_each_ram += e.blob_bytes;
     }
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+    if (core::device_mem_info(&free_b, &total_b) != cudaSuccess) {
         err = "deepseek41: cannot query the free device memory";
         return false;
     }
@@ -869,7 +870,7 @@ void ExpertTier::lend_all() {
 bool ExpertTier::reclaim(std::string& err) {
     if (lent_per_layer_ == 0) return true;
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+    if (core::device_mem_info(&free_b, &total_b) != cudaSuccess) {
         err = "deepseek41: cannot query the free device memory";
         return false;
     }
@@ -889,7 +890,7 @@ bool ExpertTier::reclaim(std::string& err) {
 void ExpertTier::grow() {
     if (ext_per_layer_ > 0 || per_layer_ >= n_expert_ || !cache_.valid()) return;
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+    if (core::device_mem_info(&free_b, &total_b) != cudaSuccess) return;
     const int64_t n = policy::grow_slots(free_b, reserve_ + (token_ > 0 ? 0 : modules_), free_floor_, one_each_, per_layer_, n_expert_, cap_per_layer_);
     if (n < 1) return;
     std::vector<int64_t> slot_bytes;

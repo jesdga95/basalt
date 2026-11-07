@@ -211,10 +211,11 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // whole point of this check.
     // ... and nothing runs on a CPU without AVX2: every CPU expert kernel is AVX2 at least (the AVX-512 ones are
     // chosen above it), and so is ggml-cpu, which the native pack's layout load initializes next.  Refused here, by name, rather than an illegal instruction in the first expert.
-    if (!basalt::kernels::cpu::cpu_avx2_ok()) {
-        basalt::log::error("basalt generate", "this CPU (%s) does not support AVX2 with FMA and F16C, which this engine's "
-                             "CPU expert kernels need",
-                     basalt::kernels::cpu::cpu_name().c_str());
+    // The Arm64 build's floor is NEON with the dot product.
+    if (!basalt::kernels::cpu::cpu_kernels_ok()) {
+        basalt::log::error("basalt generate", "this CPU (%s) does not support %s, which this engine's CPU expert "
+                             "kernels need",
+                     basalt::kernels::cpu::cpu_name().c_str(), basalt::kernels::cpu::cpu_kernels_floor());
         return 2;
     }
 
@@ -293,7 +294,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
             basalt::log::warn("basalt generate", "PCIe probe failed -> pcie_frac default %.2f", base);
         }
     }
-    if (!basalt::kernels::cpu::cpu_avx512_ok())
+    if (basalt::platform::kX86 && !basalt::kernels::cpu::cpu_avx512_ok())
         basalt::log::warn("basalt generate", "this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)",
                      !basalt::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2)" : "AVX-2");

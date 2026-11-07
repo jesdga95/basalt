@@ -6,6 +6,7 @@
 #include "models/deepseek41/session.hpp"
 #include "basalt/ggml/ggml.h"
 
+#include "basalt/core/device_memory.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
@@ -423,7 +424,7 @@ public:
             vis_ = std::make_unique<VisionEncoder>();
             const auto above_floor = [&] {
                 size_t free_b = 0, total_b = 0;
-                return !t || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
+                return !t || core::device_mem_info(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
             };
             bool opened = vis_->init(mp, std::max(pl.n_patches(), 4096), err) && above_floor();
             if (!opened && t) {
@@ -490,7 +491,7 @@ private:
     bool make_prefill_fit(int tokens, std::string& err) {
         const prefillp::Dims d = m_.prompt_dims();
         size_t free_b = 0, total_b = 0;
-        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        if (core::device_mem_info(&free_b, &total_b) != cudaSuccess) {
             err = "deepseek41: cannot read the free device memory";
             return false;
         }
@@ -509,7 +510,7 @@ private:
             std::string e;
             prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
             const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + margin;
-            if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= after) {
+            if (prefill_ && core::device_mem_info(&free_b, &total_b) == cudaSuccess && free_b >= after) {
                 cudaGetLastError();   // a larger size that did not fit left its error behind
                 return true;
             }

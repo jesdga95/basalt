@@ -7,8 +7,13 @@ cmake_minimum_required(VERSION 3.24)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 120)
+    set(_basalt_default_arch ON)
   endif()
   project(basalt_vision CXX CUDA)
+  include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/target_arch.cmake)
+  if(_basalt_default_arch AND BASALT_ARM64)
+    set(CMAKE_CUDA_ARCHITECTURES 121)
+  endif()
   set(CMAKE_CXX_STANDARD 20)
   set(CMAKE_CUDA_STANDARD 20)
   if(NOT CMAKE_BUILD_TYPE)
@@ -24,14 +29,20 @@ find_package(Threads REQUIRED)
 set(VISION_ROOT ${CMAKE_CURRENT_LIST_DIR}/../..)
 
 # host side: preprocessing, projector file, CPU encoder
+if(BASALT_ARM64)
+  set(_vision_gemm ${VISION_ROOT}/src/vision/gemm_cpu_neon.cpp)
+else()
+  set(_vision_gemm ${VISION_ROOT}/src/vision/gemm_cpu.cpp ${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp)
+endif()
 add_library(vision_core STATIC
   ${VISION_ROOT}/src/vision/preprocess.cpp
   ${VISION_ROOT}/src/vision/mmproj.cpp
   ${VISION_ROOT}/src/vision/encoder_cpu.cpp
-  ${VISION_ROOT}/src/vision/gemm_cpu.cpp
-  ${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp)
+  ${_vision_gemm})
 target_include_directories(vision_core PUBLIC ${VISION_ROOT}/include PRIVATE ${VISION_ROOT}/src/vision)
-if(MSVC)
+if(BASALT_ARM64)
+  # NEON is the Arm64 baseline: no switch
+elseif(MSVC)
   # /arch: selects the baseline; the intrinsics used below are available to a function that uses them either way.
   set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
   # the AVX-512 BF16 file is only called after a run-time CPU check

@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/kv.cpp - kv operations.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
+#include "basalt/core/device_memory.hpp"
 
 namespace basalt::models::qwen4exp::serve {
 
@@ -95,7 +96,7 @@ bool QfnRuntime::kv_drain(std::string& e) {
 bool QfnRuntime::cache_regrow(std::string& e) {
     if (!xcache.segmented() || xcache.mapped_bytes() >= xcache.full_bytes()) return true;
     size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
+    basalt::core::device_mem_info(&free_b, &total_b);
     const int64_t room = (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20);
     if (room <= 0) return true;
     std::string gerr;
@@ -240,7 +241,7 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
     if (shrink && !kv_drain(e)) return false;
     const int64_t before = xcache.slots();
     size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
+    basalt::core::device_mem_info(&free_b, &total_b);
     int64_t room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
     if (!shrink && add > room) { e.clear(); return false; }
     // the KV of idle conversations whose time is up goes before the expert cache's slots, any idle one's before
@@ -250,7 +251,7 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
         const int64_t got = add > room ? park_idle(&s, add - room, any, e) : 0;
         if (got > 0) {
             parked += got;
-            cudaMemGetInfo(&free_b, &total_b);
+            basalt::core::device_mem_info(&free_b, &total_b);
             room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
         }
         return got >= 0;

@@ -1,4 +1,5 @@
 #include "state.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "layout.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
@@ -128,7 +129,7 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
         ok = cudaStreamSynchronize(pp->s) == cudaSuccess;
     }
     size_t fb = 0, tb = 0;
-    cudaMemGetInfo(&fb, &tb);
+    basalt::core::device_mem_info(&fb, &tb);
     cudaSetDevice(pp->prim);
     if (ok && tf > 0) {   // pinned for both cards
         ok = cudaHostAlloc((void**) &pp->hx, (size_t) Tp * N * 4, cudaHostAllocPortable) == cudaSuccess;

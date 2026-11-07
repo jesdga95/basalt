@@ -21,6 +21,7 @@
 #include "basalt/kernels/cpu/kq_avx2.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/platform/compiler.hpp"
 
 #include "basalt/ggml/ggml.h"
 
@@ -99,58 +100,60 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
         // either multi-token kernel: IQ4_XS has an AVX-2 one and no AVX-512 one, so the gate cannot be
         // iq512_supported alone - that would leave the format untested on every CPU.
-        if (cpu::iq512_supported(f.gu_type) || cpu::iq256_supported(f.gu_type)) {
-            // ggml's own vec_dot, same Q8_K activations: the reference for both multi-token kernels
-            // (float-order differences only)
-            const auto* tc = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
-            std::vector<float> gref((size_t) NT * FF);
-            for (int k = 0; k < NT; ++k)
-                for (int64_t r = 0; r < FF; ++r)
-                    tc->vec_dot((int) H, &gref[k * FF + r], 0, blob.data() + r * f.gu_row, 0, a[k], 0, 1);
-            double usg = 0.0;
-            {   // ggml single-token throughput, the weights cache-resident (compute bound)
-                const int it = 50;
-                auto t0 = std::chrono::steady_clock::now();
-                for (int i = 0; i < it; ++i)
-                    for (int64_t r = 0; r < FF; ++r) {
-                        float gg, uu;
-                        tc->vec_dot((int) H, &gg, 0, blob.data() + r * f.gu_row, 0, a[0], 0, 1);
-                        tc->vec_dot((int) H, &uu, 0, blob.data() + f.up_off + r * f.gu_row, 0, a[0], 0, 1);
-                    }
-                auto t1 = std::chrono::steady_clock::now();
-                usg = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
-            }
-            // one multi-token kernel: parity against ggml's vec_dot, then one-token and NT-token throughput
-            auto check = [&](const char* tag, bool is512) {
-                std::vector<float> g((size_t) NT * FF);
-                float* gp[NT];
-                for (int k = 0; k < NT; ++k) gp[k] = g.data() + k * FF;
-                (is512 ? cpu::iq512_rows : cpu::iq256_rows)(f.gu_type, blob.data(), f.gu_row, (int) H, a, NT, gp, 0, (int) FF);
-                const double rg = rel(g, gref);
-                std::printf("          %s %s gate rows vs ggml vec_dot: rel %.2e\n",
-                            ggml_type_name((ggml_type) f.gu_type), tag, rg);
-                if (rg > 1e-5) {   // ggml's own vec_dot is the reference: above 1e-5 it is a real mismatch,
-                    std::printf("          %s %s gate rows MISMATCH (rel %.2e > 1e-5)\n",
-                                ggml_type_name((ggml_type) f.gu_type), tag, rg);   // not rounding
-                    ++failures;
+        if constexpr (basalt::platform::kX86) {
+            if (cpu::iq512_supported(f.gu_type) || cpu::iq256_supported(f.gu_type)) {
+                // ggml's own vec_dot, same Q8_K activations: the reference for both multi-token kernels
+                // (float-order differences only)
+                const auto* tc = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
+                std::vector<float> gref((size_t) NT * FF);
+                for (int k = 0; k < NT; ++k)
+                    for (int64_t r = 0; r < FF; ++r)
+                        tc->vec_dot((int) H, &gref[k * FF + r], 0, blob.data() + r * f.gu_row, 0, a[k], 0, 1);
+                double usg = 0.0;
+                {   // ggml single-token throughput, the weights cache-resident (compute bound)
+                    const int it = 50;
+                    auto t0 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < it; ++i)
+                        for (int64_t r = 0; r < FF; ++r) {
+                            float gg, uu;
+                            tc->vec_dot((int) H, &gg, 0, blob.data() + r * f.gu_row, 0, a[0], 0, 1);
+                            tc->vec_dot((int) H, &uu, 0, blob.data() + f.up_off + r * f.gu_row, 0, a[0], 0, 1);
+                        }
+                    auto t1 = std::chrono::steady_clock::now();
+                    usg = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
                 }
-                float* f1[1] = {ffp[0]};
-                const int it = 50;
-                const auto gu = is512 ? cpu::iq512_gu_rows : cpu::iq256_gu_rows;
-                auto t0 = std::chrono::steady_clock::now();
-                for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, 1, f1, 0, (int) FF);
-                auto t1 = std::chrono::steady_clock::now();
-                for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, NT, ffp, 0, (int) FF);
-                auto t2 = std::chrono::steady_clock::now();
-                const double us1 = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
-                const double usn = std::chrono::duration<double, std::micro>(t2 - t1).count() / it;
-                std::printf("          gate+up one token one thread: %s %.0f us (%.2f GB/s), ggml %.0f us (%.2f GB/s)\n",
-                            tag, us1, 2.0 * f.up_off / us1 / 1e3, usg, 2.0 * f.up_off / usg / 1e3);
-                std::printf("          gate+up %d tokens one thread: %s %.0f us vs ggml %d x %.0f us\n", NT, tag, usn, NT, usg);
-            };
-            // guarded: the binary runs on AVX-2 CPUs too, and IQ4_XS has no AVX-512 kernel (an empty switch)
-            if (cpu::cpu_avx512_ok() && cpu::iq512_supported(f.gu_type)) check("avx512", true);
-            if (cpu::cpu_avx2_ok() && cpu::iq256_supported(f.gu_type)) check("avx2", false);   // no AVX2: ggml-cpu only
+                // one multi-token kernel: parity against ggml's vec_dot, then one-token and NT-token throughput
+                auto check = [&](const char* tag, bool is512) {
+                    std::vector<float> g((size_t) NT * FF);
+                    float* gp[NT];
+                    for (int k = 0; k < NT; ++k) gp[k] = g.data() + k * FF;
+                    (is512 ? cpu::iq512_rows : cpu::iq256_rows)(f.gu_type, blob.data(), f.gu_row, (int) H, a, NT, gp, 0, (int) FF);
+                    const double rg = rel(g, gref);
+                    std::printf("          %s %s gate rows vs ggml vec_dot: rel %.2e\n",
+                                ggml_type_name((ggml_type) f.gu_type), tag, rg);
+                    if (rg > 1e-5) {   // ggml's own vec_dot is the reference: above 1e-5 it is a real mismatch,
+                        std::printf("          %s %s gate rows MISMATCH (rel %.2e > 1e-5)\n",
+                                    ggml_type_name((ggml_type) f.gu_type), tag, rg);   // not rounding
+                        ++failures;
+                    }
+                    float* f1[1] = {ffp[0]};
+                    const int it = 50;
+                    const auto gu = is512 ? cpu::iq512_gu_rows : cpu::iq256_gu_rows;
+                    auto t0 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, 1, f1, 0, (int) FF);
+                    auto t1 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, NT, ffp, 0, (int) FF);
+                    auto t2 = std::chrono::steady_clock::now();
+                    const double us1 = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
+                    const double usn = std::chrono::duration<double, std::micro>(t2 - t1).count() / it;
+                    std::printf("          gate+up one token one thread: %s %.0f us (%.2f GB/s), ggml %.0f us (%.2f GB/s)\n",
+                                tag, us1, 2.0 * f.up_off / us1 / 1e3, usg, 2.0 * f.up_off / usg / 1e3);
+                    std::printf("          gate+up %d tokens one thread: %s %.0f us vs ggml %d x %.0f us\n", NT, tag, usn, NT, usg);
+                };
+                // guarded: the binary runs on AVX-2 CPUs too, and IQ4_XS has no AVX-512 kernel (an empty switch)
+                if (cpu::cpu_avx512_ok() && cpu::iq512_supported(f.gu_type)) check("avx512", true);
+                if (cpu::cpu_avx2_ok() && cpu::iq256_supported(f.gu_type)) check("avx2", false);   // no AVX2: ggml-cpu only
+            }
         }
         for (int k = 0; k < NT; ++k) {
             cpu::native_quant_h(f, ff[k].data(), hq[k].data());
@@ -181,50 +184,52 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         }
         // UD-Q4_K_XL's formats: the multi-token AVX2 kernels (kq_avx2.cpp) against ggml-cpu's vec_dot per token,
         // BIT FOR BIT, for 1..8 tokens; then the time of 4 tokens (a verify window) both ways
-        for (int role = 0; role < 2; ++role) {
-            const int type = role == 0 ? f.gu_type : f.d_type;
-            if (!cpu::cpu_avx2_ok() || !cpu::kq256_supported(type) || (role == 0 && type != 12)) continue;
-            const int n = role == 0 ? (int) H : (int) FF, rows = role == 0 ? (int) FF : (int) H;
-            const size_t rb = role == 0 ? f.gu_row : f.d_row;
-            const uint8_t* w = blob.data() + (role == 0 ? 0 : f.down_off);
-            const auto* tc = ggml_get_type_traits_cpu((ggml_type) type);
-            const ggml_type at = tc->vec_dot_type;
-            std::vector<std::vector<uint8_t>> acts(8, std::vector<uint8_t>(ggml_row_size(at, n)));
-            std::mt19937 arng(77 + seed);
-            std::normal_distribution<float> and_(0.f, 1.f);
-            std::vector<float> xs((size_t) n);
-            const void* ap[8];
-            for (int t = 0; t < 8; ++t) {
-                for (auto& v : xs) v = and_(arng);
-                ggml_get_type_traits_cpu(at)->from_float(xs.data(), acts[t].data(), n);
-                ap[t] = acts[t].data();
+        if constexpr (basalt::platform::kX86) {
+            for (int role = 0; role < 2; ++role) {
+                const int type = role == 0 ? f.gu_type : f.d_type;
+                if (!cpu::cpu_avx2_ok() || !cpu::kq256_supported(type) || (role == 0 && type != 12)) continue;
+                const int n = role == 0 ? (int) H : (int) FF, rows = role == 0 ? (int) FF : (int) H;
+                const size_t rb = role == 0 ? f.gu_row : f.d_row;
+                const uint8_t* w = blob.data() + (role == 0 ? 0 : f.down_off);
+                const auto* tc = ggml_get_type_traits_cpu((ggml_type) type);
+                const ggml_type at = tc->vec_dot_type;
+                std::vector<std::vector<uint8_t>> acts(8, std::vector<uint8_t>(ggml_row_size(at, n)));
+                std::mt19937 arng(77 + seed);
+                std::normal_distribution<float> and_(0.f, 1.f);
+                std::vector<float> xs((size_t) n);
+                const void* ap[8];
+                for (int t = 0; t < 8; ++t) {
+                    for (auto& v : xs) v = and_(arng);
+                    ggml_get_type_traits_cpu(at)->from_float(xs.data(), acts[t].data(), n);
+                    ap[t] = acts[t].data();
+                }
+                std::vector<float> ref((size_t) 8 * rows), got((size_t) 8 * rows);
+                for (int t = 0; t < 8; ++t)
+                    for (int r = 0; r < rows; ++r) tc->vec_dot(n, &ref[(size_t) t * rows + r], 0, w + (size_t) r * rb, 0, ap[t], 0, 1);
+                size_t differ = 0;
+                for (int nt = 1; nt <= 8; ++nt) {
+                    float* op[8];
+                    for (int t = 0; t < nt; ++t) op[t] = got.data() + (size_t) t * rows;
+                    cpu::kq256_rows(type, w, rb, n, ap, nt, op, 0, rows);
+                    for (int t = 0; t < nt; ++t)
+                        differ += std::memcmp(op[t], ref.data() + (size_t) t * rows, (size_t) rows * 4) != 0;
+                }
+                const int it = 30;
+                float* op4[4] = {got.data(), got.data() + rows, got.data() + 2 * rows, got.data() + 3 * rows};
+                auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i) cpu::kq256_rows(type, w, rb, n, ap, 4, op4, 0, rows);
+                auto t1 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i)
+                    for (int r = 0; r < rows; ++r)
+                        for (int t = 0; t < 4; ++t) tc->vec_dot(n, op4[t] + r, 0, w + (size_t) r * rb, 0, ap[t], 0, 1);
+                auto t2 = std::chrono::steady_clock::now();
+                const double us_k = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
+                const double us_g = std::chrono::duration<double, std::micro>(t2 - t1).count() / it;
+                std::printf("          %s %s rows, AVX2 multi-token vs ggml vec_dot: %zu of 36 token-sets differ in any bit; "
+                            "4 tokens one thread %.0f us vs ggml %.0f us (%.2fx)\n", ggml_type_name((ggml_type) type),
+                            role == 0 ? "gate" : "down", differ, us_k, us_g, us_g / us_k);
+                if (differ) ++failures;
             }
-            std::vector<float> ref((size_t) 8 * rows), got((size_t) 8 * rows);
-            for (int t = 0; t < 8; ++t)
-                for (int r = 0; r < rows; ++r) tc->vec_dot(n, &ref[(size_t) t * rows + r], 0, w + (size_t) r * rb, 0, ap[t], 0, 1);
-            size_t differ = 0;
-            for (int nt = 1; nt <= 8; ++nt) {
-                float* op[8];
-                for (int t = 0; t < nt; ++t) op[t] = got.data() + (size_t) t * rows;
-                cpu::kq256_rows(type, w, rb, n, ap, nt, op, 0, rows);
-                for (int t = 0; t < nt; ++t)
-                    differ += std::memcmp(op[t], ref.data() + (size_t) t * rows, (size_t) rows * 4) != 0;
-            }
-            const int it = 30;
-            float* op4[4] = {got.data(), got.data() + rows, got.data() + 2 * rows, got.data() + 3 * rows};
-            auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < it; ++i) cpu::kq256_rows(type, w, rb, n, ap, 4, op4, 0, rows);
-            auto t1 = std::chrono::steady_clock::now();
-            for (int i = 0; i < it; ++i)
-                for (int r = 0; r < rows; ++r)
-                    for (int t = 0; t < 4; ++t) tc->vec_dot(n, op4[t] + r, 0, w + (size_t) r * rb, 0, ap[t], 0, 1);
-            auto t2 = std::chrono::steady_clock::now();
-            const double us_k = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
-            const double us_g = std::chrono::duration<double, std::micro>(t2 - t1).count() / it;
-            std::printf("          %s %s rows, AVX2 multi-token vs ggml vec_dot: %zu of 36 token-sets differ in any bit; "
-                        "4 tokens one thread %.0f us vs ggml %.0f us (%.2fx)\n", ggml_type_name((ggml_type) type),
-                        role == 0 ? "gate" : "down", differ, us_k, us_g, us_g / us_k);
-            if (differ) ++failures;
         }
         if (cpu::q2_native_kernels(f.d_type)) {
             // (b2) the GGUF-layout Q2_0 kernel the pool uses for Q2_0 down projections - the AVX-512 one
@@ -241,42 +246,44 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             }
             cpu::q2_rows_any(blob.data() + f.down_off, f.d_row, (int) (FF / 64), ap, NT, altp, 0, (int) H);
             std::printf("          q2_0 %s down vs ggml down: rel %.2e\n",
-                        cpu::cpu_avx512_ok() ? "AVX-512" : "AVX-2", rel(alt, got_c));
+                        cpu::cpu_avx512_ok() ? "AVX-512" : cpu::cpu_avx2_ok() ? "AVX-2" : "NEON", rel(alt, got_c));
         }
-        if (f.d_type == 20 && cpu::cpu_avx2_ok()) {
-            // (b3) the IQ4_NL multi-token AVX-2 kernel the pool now uses for IQ4_NL down projections,
-            // against ggml-cpu's single-token vec_dot on the SAME Q8_0 activations (h), plus timing.
-            std::vector<float> alt((size_t) NT * H), refd((size_t) NT * H);
-            float* altp[NT];
-            for (int k = 0; k < NT; ++k) altp[k] = alt.data() + k * H;
-            cpu::iq4nl256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, hp, NT, altp, 0, (int) H);
-            const auto* tdc = ggml_get_type_traits_cpu((ggml_type) f.d_type);
-            for (int k = 0; k < NT; ++k)
-                for (int64_t r = 0; r < H; ++r)
-                    tdc->vec_dot((int) FF, refd.data() + k * H + r, 0,
-                                 blob.data() + f.down_off + (size_t) r * f.d_row, 0, hp[k], 0, 1);
-            const double rdn = rel(alt, refd);
-            std::printf("          iq4_nl AVX-2 multi-token down vs ggml down: rel %.2e\n", rdn);
-            if (rdn > 1e-5) {   // same reasoning as the gate/up rows above
-                std::printf("          iq4_nl down MISMATCH (rel %.2e > 1e-5)\n", rdn);
-                ++failures;
-            }
-            const int it = 50;
-            const auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < it; ++i)
+        if constexpr (basalt::platform::kX86) {
+            if (f.d_type == 20 && cpu::cpu_avx2_ok()) {
+                // (b3) the IQ4_NL multi-token AVX-2 kernel the pool now uses for IQ4_NL down projections,
+                // against ggml-cpu's single-token vec_dot on the SAME Q8_0 activations (h), plus timing.
+                std::vector<float> alt((size_t) NT * H), refd((size_t) NT * H);
+                float* altp[NT];
+                for (int k = 0; k < NT; ++k) altp[k] = alt.data() + k * H;
                 cpu::iq4nl256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, hp, NT, altp, 0, (int) H);
-            const auto t1 = std::chrono::steady_clock::now();
-            for (int i = 0; i < it; ++i)
+                const auto* tdc = ggml_get_type_traits_cpu((ggml_type) f.d_type);
                 for (int k = 0; k < NT; ++k)
                     for (int64_t r = 0; r < H; ++r)
                         tdc->vec_dot((int) FF, refd.data() + k * H + r, 0,
-                                    blob.data() + f.down_off + (size_t) r * f.d_row, 0, hp[k], 0, 1);
-            const auto t2 = std::chrono::steady_clock::now();
-            const double usn = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
-            const double usg = std::chrono::duration<double, std::micro>(t2 - t1).count() / it;
-            std::printf("          down %d tokens one thread: avx2 %.0f us (%.2f GB/s) vs ggml %.0f us (%.2f GB/s)\n",
-                        NT, usn, (double) (f.bytes - f.down_off) / usn / 1e3, usg,
-                        (double) (f.bytes - f.down_off) / usg / 1e3);
+                                     blob.data() + f.down_off + (size_t) r * f.d_row, 0, hp[k], 0, 1);
+                const double rdn = rel(alt, refd);
+                std::printf("          iq4_nl AVX-2 multi-token down vs ggml down: rel %.2e\n", rdn);
+                if (rdn > 1e-5) {   // same reasoning as the gate/up rows above
+                    std::printf("          iq4_nl down MISMATCH (rel %.2e > 1e-5)\n", rdn);
+                    ++failures;
+                }
+                const int it = 50;
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i)
+                    cpu::iq4nl256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, hp, NT, altp, 0, (int) H);
+                const auto t1 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i)
+                    for (int k = 0; k < NT; ++k)
+                        for (int64_t r = 0; r < H; ++r)
+                            tdc->vec_dot((int) FF, refd.data() + k * H + r, 0,
+                                        blob.data() + f.down_off + (size_t) r * f.d_row, 0, hp[k], 0, 1);
+                const auto t2 = std::chrono::steady_clock::now();
+                const double usn = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
+                const double usg = std::chrono::duration<double, std::micro>(t2 - t1).count() / it;
+                std::printf("          down %d tokens one thread: avx2 %.0f us (%.2f GB/s) vs ggml %.0f us (%.2f GB/s)\n",
+                            NT, usn, (double) (f.bytes - f.down_off) / usn / 1e3, usg,
+                            (double) (f.bytes - f.down_off) / usg / 1e3);
+            }
         }
     }
     // (c) the GPU: one group holding the NT entries
@@ -439,104 +446,123 @@ int gpu_nvfp4(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, const s
               const std::vector<float>& G, const std::vector<float>& U, const std::vector<float>& D, const float* sc,
               const std::vector<float>& ref, const std::vector<float>& got_c, cudaStream_t s);
 
-// NVFP4 multi-token AVX-512 kernel against the single-token ggml dot this CPU would otherwise run (gate/up with s_gate,
-// s_up and SwiGLU, down with s_down): bitwise equal for every token count 1..9 (9 crosses the 8-token pass) and for
-// a row range that splits a down row pair; then a single-thread microbench, ggml dot vs the kernel, 1/2/4/8 tokens.
+// NVFP4 multi-token kernels (AVX-512 and AVX2 on x86-64, NEON on Arm64) against the single-token ggml dot this CPU
+// would otherwise run (gate/up with s_gate, s_up and SwiGLU, down with s_down): bitwise equal for every token count
+// 1..9 (9 crosses the 8-token pass, and NEON's 4-token passes) and for a row range that splits a down row pair; then a
+// single-thread microbench, ggml dot vs the kernel, 1/2/4/8 tokens.
 int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, bool avx2) {
-    const char* isa = avx2 ? "avx2" : "avx512";
-    if (!avx2 && !cpu::cpu_avx512_ok()) { std::printf("          nvfp4 multi-token avx512: no AVX-512 on this CPU\n"); return 0; }
-    if (avx2 && !cpu::cpu_avx2_ok()) { std::printf("          nvfp4 multi-token avx2: no AVX2 on this CPU\n"); return 0; }
-    constexpr int MT = 9;
-    float sc[4];
-    std::memcpy(sc, blob.data() + f.bytes - f.tail, sizeof sc);
-    const ggml_vec_dot_t dot = (avx2 ? ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4)
-                                      : ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4))->vec_dot;
-    std::mt19937 rng(23 + seed);
-    std::normal_distribution<float> nd(0.f, 1.f);
-    std::vector<std::vector<uint8_t>> act(MT, std::vector<uint8_t>(f.act_bytes)), hq(MT, std::vector<uint8_t>(f.h_bytes));
-    std::vector<float> x(H), h(FF);
-    const void* a[MT];
-    const void* hp[MT];
-    const void* const* a_ = a;
-    const void* const* hp_ = hp;
-    // the kernel under test: the AVX2 one is called directly, so an AVX-512 CPU checks it too
-    auto new_gu = [&](int nt, float* const* ff, int r0, int r1) {
-        if (avx2) cpu::nvfp4_256_gu_rows(blob.data(), f.gu_row, f.up_off, (int) H, sc[0], sc[1], a_, nt, ff, r0, r1);
-        else cpu::native_gu_rows(f, blob.data(), a_, nt, ff, r0, r1);
-    };
-    auto new_down = [&](int nt, float* const* out, int r0, int r1) {
-        if (avx2) cpu::nvfp4_256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, sc[2], hp_, nt, out, r0, r1);
-        else cpu::native_down_rows(f, blob.data(), hp_, nt, out, r0, r1);
-    };
-    for (int t = 0; t < MT; ++t) {
-        for (auto& v : x) v = nd(rng) * (t == 4 ? 30.f : 1.f);
-        for (auto& v : h) v = 0.05f * nd(rng);
-        cpu::native_quant_act(f, x.data(), act[t].data());
-        cpu::native_quant_h(f, h.data(), hq[t].data());
-        a[t] = act[t].data();
-        hp[t] = hq[t].data();
+    const char* isa = basalt::platform::kX86 ? (avx2 ? "avx2" : "avx512") : "neon";
+    ggml_vec_dot_t dot = nullptr;
+    if constexpr (basalt::platform::kX86) {
+        if (!avx2 && !cpu::cpu_avx512_ok()) { std::printf("          nvfp4 multi-token avx512: no AVX-512 on this CPU\n"); return 0; }
+        if (avx2 && !cpu::cpu_avx2_ok()) { std::printf("          nvfp4 multi-token avx2: no AVX2 on this CPU\n"); return 0; }
+        dot = (avx2 ? ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4)
+                    : ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4))->vec_dot;
+    } else {
+        if (avx2) return 0;   // the one Arm64 kernel is checked on the first call
+        dot = ggml_get_type_traits_cpu(GGML_TYPE_NVFP4)->vec_dot;
     }
-    // the old path: one ggml dot per row and token
-    auto old_gu = [&](int nt, float* const* ff, int r0, int r1) {
-        for (int r = r0; r < r1; ++r)
-            for (int t = 0; t < nt; ++t) {
-                float g = 0.f, u = 0.f;
-                dot((int) H, &g, 0, blob.data() + r * f.gu_row, 0, a[t], 0, 1);
-                dot((int) H, &u, 0, blob.data() + f.up_off + r * f.gu_row, 0, a[t], 0, 1);
-                g *= sc[0];
-                u *= sc[1];
-                ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+    {
+        constexpr int MT = 9;
+        float sc[4];
+        std::memcpy(sc, blob.data() + f.bytes - f.tail, sizeof sc);
+        std::mt19937 rng(23 + seed);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<std::vector<uint8_t>> act(MT, std::vector<uint8_t>(f.act_bytes)), hq(MT, std::vector<uint8_t>(f.h_bytes));
+        std::vector<float> x(H), h(FF);
+        const void* a[MT];
+        const void* hp[MT];
+        const void* const* a_ = a;
+        const void* const* hp_ = hp;
+        // the kernel under test: the AVX2 one is called directly, so an AVX-512 CPU checks it too
+        auto new_gu = [&](int nt, float* const* ff, int r0, int r1) {
+            if constexpr (basalt::platform::kX86) {
+                if (avx2) {
+                    cpu::nvfp4_256_gu_rows(blob.data(), f.gu_row, f.up_off, (int) H, sc[0], sc[1], a_, nt, ff, r0, r1);
+                    return;
+                }
             }
-    };
-    auto old_down = [&](int nt, float* const* out, int r0, int r1) {
-        for (int r = r0; r < r1; ++r)
-            for (int t = 0; t < nt; ++t) {
-                float v = 0.f;
-                dot((int) FF, &v, 0, blob.data() + f.down_off + r * f.d_row, 0, hp[t], 0, 1);
-                out[t][r] = v * sc[2];
+            cpu::native_gu_rows(f, blob.data(), a_, nt, ff, r0, r1);
+        };
+        auto new_down = [&](int nt, float* const* out, int r0, int r1) {
+            if constexpr (basalt::platform::kX86) {
+                if (avx2) {
+                    cpu::nvfp4_256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, sc[2], hp_, nt, out, r0, r1);
+                    return;
+                }
             }
-    };
-    std::vector<std::vector<float>> f0(MT, std::vector<float>(FF)), f1(MT, std::vector<float>(FF));
-    std::vector<std::vector<float>> o0(MT, std::vector<float>(H)), o1(MT, std::vector<float>(H));
-    float* pf0[MT]; float* pf1[MT]; float* po0[MT]; float* po1[MT];
-    for (int t = 0; t < MT; ++t) { pf0[t] = f0[t].data(); pf1[t] = f1[t].data(); po0[t] = o0[t].data(); po1[t] = o1[t].data(); }
-    size_t diff = 0, total = 0;
-    old_gu(MT, pf0, 0, (int) FF);
-    old_down(MT, po0, 0, (int) H);
-    for (int nt = 1; nt <= MT; ++nt) {
-        for (int t = 0; t < MT; ++t) { std::fill(f1[t].begin(), f1[t].end(), -1.f); std::fill(o1[t].begin(), o1[t].end(), -1.f); }
-        new_gu(nt, pf1, 0, 7);   // two calls: a split row range
-        new_gu(nt, pf1, 7, (int) FF);
-        new_down(nt, po1, 0, 5);
-        new_down(nt, po1, 5, (int) H);
-        for (int t = 0; t < nt; ++t) {
-            diff += std::memcmp(f0[t].data(), f1[t].data(), FF * 4) != 0;
-            diff += std::memcmp(o0[t].data(), o1[t].data(), H * 4) != 0;
-            total += 2;
+            cpu::native_down_rows(f, blob.data(), hp_, nt, out, r0, r1);
+        };
+        for (int t = 0; t < MT; ++t) {
+            for (auto& v : x) v = nd(rng) * (t == 4 ? 30.f : 1.f);
+            for (auto& v : h) v = 0.05f * nd(rng);
+            cpu::native_quant_act(f, x.data(), act[t].data());
+            cpu::native_quant_h(f, h.data(), hq[t].data());
+            a[t] = act[t].data();
+            hp[t] = hq[t].data();
         }
-    }
-    std::printf("          nvfp4 %s multi-token vs ggml dot: %zu token-rowsets, %zu differ  %s\n", isa, total, diff,
-                diff == 0 ? "bitwise ok" : "FAIL");
-    // microbench: one thread, the blob cache-resident across passes
-    const int it = 30;
-    std::string line = std::string("          bench: nvfp4 ") + isa + " expert 1 thread, us per expert (ggml dot / multi-token):";
-    for (int nt : {1, 2, 4, 8}) {
-        auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < it; ++i) { old_gu(nt, pf0, 0, (int) FF); old_down(nt, po0, 0, (int) H); }
-        const double us0 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
-        t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < it; ++i) {
-            new_gu(nt, pf1, 0, (int) FF);
-            new_down(nt, po1, 0, (int) H);
+        // the old path: one ggml dot per row and token
+        auto old_gu = [&](int nt, float* const* ff, int r0, int r1) {
+            for (int r = r0; r < r1; ++r)
+                for (int t = 0; t < nt; ++t) {
+                    float g = 0.f, u = 0.f;
+                    dot((int) H, &g, 0, blob.data() + r * f.gu_row, 0, a[t], 0, 1);
+                    dot((int) H, &u, 0, blob.data() + f.up_off + r * f.gu_row, 0, a[t], 0, 1);
+                    g *= sc[0];
+                    u *= sc[1];
+                    ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+                }
+        };
+        auto old_down = [&](int nt, float* const* out, int r0, int r1) {
+            for (int r = r0; r < r1; ++r)
+                for (int t = 0; t < nt; ++t) {
+                    float v = 0.f;
+                    dot((int) FF, &v, 0, blob.data() + f.down_off + r * f.d_row, 0, hp[t], 0, 1);
+                    out[t][r] = v * sc[2];
+                }
+        };
+        std::vector<std::vector<float>> f0(MT, std::vector<float>(FF)), f1(MT, std::vector<float>(FF));
+        std::vector<std::vector<float>> o0(MT, std::vector<float>(H)), o1(MT, std::vector<float>(H));
+        float* pf0[MT]; float* pf1[MT]; float* po0[MT]; float* po1[MT];
+        for (int t = 0; t < MT; ++t) { pf0[t] = f0[t].data(); pf1[t] = f1[t].data(); po0[t] = o0[t].data(); po1[t] = o1[t].data(); }
+        size_t diff = 0, total = 0;
+        old_gu(MT, pf0, 0, (int) FF);
+        old_down(MT, po0, 0, (int) H);
+        for (int nt = 1; nt <= MT; ++nt) {
+            for (int t = 0; t < MT; ++t) { std::fill(f1[t].begin(), f1[t].end(), -1.f); std::fill(o1[t].begin(), o1[t].end(), -1.f); }
+            new_gu(nt, pf1, 0, 7);   // two calls: a split row range
+            new_gu(nt, pf1, 7, (int) FF);
+            new_down(nt, po1, 0, 5);
+            new_down(nt, po1, 5, (int) H);
+            for (int t = 0; t < nt; ++t) {
+                diff += std::memcmp(f0[t].data(), f1[t].data(), FF * 4) != 0;
+                diff += std::memcmp(o0[t].data(), o1[t].data(), H * 4) != 0;
+                total += 2;
+            }
         }
-        const double us1 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
-        char b[128];
-        std::snprintf(b, sizeof b, "  %dt %.0f/%.0f (x%.2f, %.1f GB/s)", nt, us0, us1, us0 / us1,
-                      (double) f.bytes / us1 * 1e-3);
-        line += b;
+        std::printf("          nvfp4 %s multi-token vs ggml dot: %zu token-rowsets, %zu differ  %s\n", isa, total, diff,
+                    diff == 0 ? "bitwise ok" : "FAIL");
+        // microbench: one thread, the blob cache-resident across passes
+        const int it = 30;
+        std::string line = std::string("          bench: nvfp4 ") + isa + " expert 1 thread, us per expert (ggml dot / multi-token):";
+        for (int nt : {1, 2, 4, 8}) {
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < it; ++i) { old_gu(nt, pf0, 0, (int) FF); old_down(nt, po0, 0, (int) H); }
+            const double us0 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+            t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < it; ++i) {
+                new_gu(nt, pf1, 0, (int) FF);
+                new_down(nt, po1, 0, (int) H);
+            }
+            const double us1 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+            char b[128];
+            std::snprintf(b, sizeof b, "  %dt %.0f/%.0f (x%.2f, %.1f GB/s)", nt, us0, us1, us0 / us1,
+                          (double) f.bytes / us1 * 1e-3);
+            line += b;
+        }
+        std::printf("%s\n", line.c_str());
+        return diff == 0 ? 0 : 1;
     }
-    std::printf("%s\n", line.c_str());
-    return diff == 0 ? 0 : 1;
 }
 
 int check_nvfp4_cpu(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
@@ -550,16 +576,21 @@ int check_nvfp4_cpu(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, i
     for (auto& v : x) v = nd(rng);
     // (1) the dots
     {
-        const ggml_type_traits_cpu* isa[2] = {ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4),
-                                              cpu::cpu_avx512_ok() ? ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4)
-                                                                   : nullptr};
+        const ggml_type_traits_cpu* isa[2] = {nullptr, nullptr};
         const char* name[2] = {"avx2", "avx512"};
+        if constexpr (basalt::platform::kX86) {
+            isa[0] = ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4);
+            isa[1] = cpu::cpu_avx512_ok() ? ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4) : nullptr;
+        } else {   // the one Arm64 table
+            isa[0] = ggml_get_type_traits_cpu(GGML_TYPE_NVFP4);
+            name[0] = "neon";
+        }
         std::vector<uint8_t> xq(ggml_row_size(GGML_TYPE_Q8_0, H)), hq(ggml_row_size(GGML_TYPE_Q8_0, FF));
         std::vector<float> h(FF);
         for (auto& v : h) v = 0.05f * nd(rng);
         ggml_quantize_chunk(GGML_TYPE_Q8_0, x.data(), xq.data(), 0, 1, H);
         ggml_quantize_chunk(GGML_TYPE_Q8_0, h.data(), hq.data(), 0, 1, FF);
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < (basalt::platform::kX86 ? 2 : 1); ++i) {
             if (isa[i] == nullptr) { std::printf("          nvfp4 %s dot: not on this CPU\n", name[i]); continue; }
             std::vector<float> want, got;
             for (int64_t r = 0; r < FF; ++r) {
@@ -1017,9 +1048,13 @@ int check_cpu_pair(int gu, int dn, int seed) {
         tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
     }
     for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
-    const struct { const char* name; const ggml_type_traits_cpu* (*get)(ggml_type); bool ok; } isas[] = {
-        {"avx2", ggml_get_type_traits_cpu_avx2, cpu::cpu_avx2_ok()},
-        {"avx512", ggml_get_type_traits_cpu_avx512, cpu::cpu_avx512_ok()}};
+    struct Isa { const char* name; const ggml_type_traits_cpu* (*get)(ggml_type); bool ok; };
+    std::vector<Isa> isas;
+    if constexpr (basalt::platform::kX86)
+        isas = {{"avx2", ggml_get_type_traits_cpu_avx2, cpu::cpu_avx2_ok()},
+                {"avx512", ggml_get_type_traits_cpu_avx512, cpu::cpu_avx512_ok()}};
+    else
+        isas = {{"neon", ggml_get_type_traits_cpu, cpu::cpu_neon_dot_ok()}};
     for (const auto& isa : isas) {
         if (!isa.ok) continue;
         const auto* tc = isa.get((ggml_type) gu);
@@ -1290,9 +1325,13 @@ int check_q8k_one(const char* tag, void (*quant)(const float*, void*, int64_t)) 
 
 int check_q8k_quant() {
     int failures = 0;
-    if (cpu::cpu_avx512_ok()) failures += check_q8k_one("AVX-512", cpu::quantize_q8_K_avx512);
-    else std::printf("q8_K quantizer: no AVX-512 on this CPU, skipped\n");
-    if (cpu::cpu_avx2_ok()) failures += check_q8k_one("AVX-2", cpu::quantize_q8_K_avx2);
+    if constexpr (basalt::platform::kX86) {
+        if (cpu::cpu_avx512_ok()) failures += check_q8k_one("AVX-512", cpu::quantize_q8_K_avx512);
+        else std::printf("q8_K quantizer: no AVX-512 on this CPU, skipped\n");
+        if (cpu::cpu_avx2_ok()) failures += check_q8k_one("AVX-2", cpu::quantize_q8_K_avx2);
+    } else {
+        std::printf("q8_K quantizer: Arm64 runs ggml's reference itself, nothing to check\n");
+    }
     return failures;
 }
 

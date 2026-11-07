@@ -1,8 +1,9 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
 Basalt is a local inference engine for mixture-of-experts models: **Qwen3.8-Flash-Next** and **DeepSeek-V4.1-Flash**. It runs on
-an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, with the experts that do not fit in VRAM in system RAM (and optionally
-on more GPUs). The server speaks the OpenAI and Anthropic APIs.
+an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, and on the RTX Spark's integrated Blackwell GPU (sm_121) on Windows on
+Arm64, with the experts that do not fit in VRAM in system RAM (and optionally on more GPUs). The server speaks the OpenAI and
+Anthropic APIs.
 
 <p align="center"><img src="docs/img/frontend.gif" alt="The Basalt web UI while a reply streams" width="720"></p>
 
@@ -10,8 +11,8 @@ on more GPUs). The server speaks the OpenAI and Anthropic APIs.
 
 ## Requirements
 
-- Linux x86-64 with AVX2, or Windows 10 1903+ x64 ([platforms](docs/platforms.md)).
-- An NVIDIA Blackwell GPU (compute capability 12.0) with CUDA 13.
+- Linux x86-64 with AVX2, Windows 10 1903+ x64, or Windows 11 on Arm64 with an RTX Spark ([platforms](docs/platforms.md)).
+- An NVIDIA Blackwell GPU (compute capability 12.0, or 12.1 for the RTX Spark) with CUDA 13.
 - CMake 3.24+, GCC 13+ (Linux), Python 3.10+, and enough system RAM for the experts that do not fit in VRAM.
 
 ## Quick start

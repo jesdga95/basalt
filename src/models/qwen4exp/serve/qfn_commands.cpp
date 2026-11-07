@@ -4,6 +4,7 @@
 #include "qfn_request.hpp"
 #include "../../../program/tokenizer/unicode_flags.hpp"
 #include "../../../program/cli/tokens.hpp"
+#include "basalt/core/device_memory.hpp"
 
 namespace basalt::models::qwen4exp::serve {
 
@@ -119,7 +120,7 @@ void QfnRuntime::print_info() {
     // what the server's Monitor tab shows (the server skips unknown lines until READY)
     {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::device_mem_info(&free_b, &total_b);
         // "Experts in VRAM" is every stage's cache, not one card's.  The caches hold disjoint pairs, so they add.
         const int64_t slots_primary = (int64_t) xcache.slots();
         const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);

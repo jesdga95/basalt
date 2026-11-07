@@ -1,5 +1,6 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
+#include "basalt/core/device_memory.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -25,6 +26,7 @@ int resident_plan(Context& context) {
     auto& xpeers = *context.xpeers;
     auto& drive = *context.drive;
     auto& d_res = *context.d_res;
+    auto& multi_gpu = *context.multi_gpu;
 
     // ================================ THE PERSISTENT ENGINE (--serve) ================================
     //
@@ -108,7 +110,7 @@ int resident_plan(Context& context) {
             size_t fb = 0, tb = 0;
             {
                 const basalt::core::OnDevice on(dev);
-                cudaMemGetInfo(&fb, &tb);
+                basalt::core::device_mem_info(&fb, &tb);
             }
             const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
                                      (dev == o.peer_device ? (uint64_t) peer_split_bytes(d0) + peer_prompt_bytes() : 0);
@@ -172,11 +174,36 @@ int resident_plan(Context& context) {
     // the GPU cache's last slots are lent to the prompt path (and the elastic KV): their experts are kept in RAM too
     int64_t lend_from = -1;
     int64_t lend_chunk = o.prefill_chunk;
+    // One card with the chunk's buffers, the elastic KV's growth and the reserve free beside its cache (the profile
+    // capped the cache, not the VRAM) keeps the buffers as its own, as a split stage with room does: nothing is lent,
+    // streamed during a prompt or refilled after it, and the RAM copy keeps no lent slot's expert.  Not with the
+    // in-engine image encoder, which borrows from the loan's region.
+    bool own_prompt_buffers = false;
     if (o.prefill_chunk > 0 && d_res != nullptr && xcache.slots() > 0) {
         int64_t chunk = o.prefill_chunk;
         const int64_t k = serve_loans::plan_lend(chunk, xcache, g, ss, o.prefill_auto, auto_ceiling,
                                                 (int) auto_lend_pct);
-        if (k > 0) { lend_from = xcache.slots() - k; lend_chunk = chunk; }
+        // the chunk a loan would read: a bare auto stops at kMaxAutoChunk, as resident_load caps a loan's ceiling
+        const int64_t own_ceiling = o.prefill_auto_fit ? std::min(auto_ceiling, kMaxAutoChunk) : auto_ceiling;
+        int64_t own_chunk = o.prefill_chunk;
+        if (k > 0 && !multi_gpu && o.vision_mmproj.empty() &&
+            serve_loans::plan_lend(own_chunk, xcache, g, ss, o.prefill_auto, own_ceiling, (int) auto_lend_pct) > 0) {
+            size_t fb = 0, tb = 0;
+            if (basalt::core::device_mem_info(&fb, &tb) == cudaSuccess) {
+                const uint64_t also = (uint64_t) xcache.elastic_bytes() + ((uint64_t) o.vram_reserve_mib << 20);
+                own_prompt_buffers = serve_loans::own_buffers_fit(fb, g, ss, own_chunk, also);
+                if (own_prompt_buffers) {
+                    auto_ceiling = own_ceiling;
+                    basalt::log::info("basalt generate", "prompt path: buffers of its own (%.2f GiB for %lld tokens, "
+                                         "%.2f GiB free beside the expert cache), no cache slots lent",
+                                      (double) basalt::prefill::Prefill::bytes_needed(g, ss, own_chunk) / 1073741824.0,
+                                      (long long) own_chunk, (double) fb / 1073741824.0);
+                }
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+        if (k > 0 && !own_prompt_buffers) { lend_from = xcache.slots() - k; lend_chunk = chunk; }
     }
     // a layer split: the stages' caches are GPU tiers the RAM copy leaves out, except each one's last slots, which the
     // prompt path lends for the chunk the first card's loan was sized for
@@ -194,8 +221,9 @@ int resident_plan(Context& context) {
         }
     }
     // the elastic KV's tail keeps its experts in RAM too (a slot lent to the KV becomes a CPU miss read from RAM),
-    // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
-    if (kv_tail_slots > 0)
+    // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today.
+    // A card with room for the KV's growth beside its own prompt buffers lends the KV no slot.
+    if (kv_tail_slots > 0 && !own_prompt_buffers)
         lend_from = lend_from >= 0 ? std::max<int64_t>(0, lend_from - kv_tail_slots) : xcache.slots() - kv_tail_slots;
     // ---- the start-up picks for the settings the user left out (peer-exclusive, resident RAM, pool affinity and
     // size): one pure rule over what this machine and pack have, so a given setting is never replaced.  The pool is
@@ -304,6 +332,7 @@ int resident_plan(Context& context) {
     context.open_peer = open_peer;
     context.adapt_fast_on = &adapt_fast_on;
     context.lend_from = &lend_from;
+    context.own_prompt_buffers = &own_prompt_buffers;
     context.stage_held = &stage_held;
     context.pool = &pool;
     context.peer_only = &peer_only;

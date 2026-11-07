@@ -125,6 +125,7 @@ struct Context {
     std::function<bool(bool)> open_peer;
     const bool* adapt_fast_on = nullptr;
     int64_t* lend_from = nullptr;
+    const bool* own_prompt_buffers = nullptr;   // CUDA0's prompt path keeps buffers of its own (no loan)
     std::vector<std::pair<int32_t, int32_t>>* stage_held = nullptr;
     basalt::kernels::cpu::ExpertPool* pool = nullptr;
     std::vector<std::pair<int32_t, int32_t>>* peer_only = nullptr;

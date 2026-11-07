@@ -68,4 +68,9 @@ int64_t plan_lend(int64_t& chunk, const basalt::core::ExpertCache& xc, const bas
     return 0;
 }
 
+bool own_buffers_fit(uint64_t free_bytes, const basalt::core::ModelGeometry& g, const basalt::core::SessionState& ss,
+                     int64_t chunk, uint64_t also) {
+    return chunk > 0 && free_bytes >= basalt::prefill::Prefill::bytes_needed(g, ss, chunk) + also + kOwnBuffersHeadroom;
+}
+
 }  // namespace basalt::models::qwen4exp::serve
