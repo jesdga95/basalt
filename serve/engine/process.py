@@ -86,7 +86,8 @@ def engine_line(line: str) -> str:
 
 
 AUTO_FLAGS = "auto flags: "
-AUTO_NAMES = {"peer-exclusive": "peer-excl", "pool-workers": "pool"}   # the console's short names
+# the console's names: short ones, and `resident` is only the experts held in RAM, not the model
+AUTO_NAMES = {"peer-exclusive": "peer-excl", "pool-workers": "pool", "resident": "ram-experts"}
 
 
 def relay_auto_flags(line: str) -> bool:

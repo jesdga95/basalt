@@ -39,7 +39,7 @@ A config file is one JSON object. `models` lists the models; `engine` applies to
 ## Automatic settings
 
 When left out, the engine picks `peer-exclusive`, `resident` (`resident-budget-gib`), `pool-affinity` and `pool-workers`. A given value
-always wins. It prints one `[server] auto` line:
+always wins. It prints one `[server] auto` line, where `ram-experts` is the `resident` amount (the experts held in RAM, not the whole model):
 
 | Setting | Rule |
 | --- | --- |
