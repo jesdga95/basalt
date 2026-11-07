@@ -25,14 +25,20 @@ struct Homes {
 };
 
 /// `main_slots`: what the main card can hold through a prompt at the full context; `peer_slots`: the room on the second
-/// card (0 without one); `ram_slots`: the room in RAM above the floor. The main card gives up its copies for homes when RAM
-/// cannot take what the second card does not. What RAM cannot take stays in the file, so a shortfall of N places puts N
-/// experts there.
-inline Homes plan_homes(int n_expert, int main_slots, int peer_slots, int ram_slots) {
+/// card (0 without one); `ram_slots`: the room in RAM above the floor right now; `ram_cap`: the places per layer the
+/// machine has for the tier whatever else is running (its total RAM less the engine's own buffers and the floor, not
+/// limited to one layer's experts), or -1 when the tier's size was given and `ram_slots` is all there is.
+/// The main card keeps its homes unless `ram_cap` takes what the second card does not and as many places again as the
+/// main card would have homed: copies-only decodes slower than homes, so it is picked only where RAM leaves no doubt.
+/// The choice reads `ram_cap` alone, so page-cache state and other readings of free memory never move it; `ram_slots`
+/// only sizes the tier. What RAM cannot take stays in the file, so a shortfall of N places puts N experts there.
+inline Homes plan_homes(int n_expert, int main_slots, int peer_slots, int ram_slots, int ram_cap) {
     Homes h;
     h.peer = peer_slots < n_expert ? peer_slots : n_expert;
     const int left = n_expert - h.peer;
-    if (ram_slots < left) h.main = main_slots < left ? main_slots : left;
+    const int homed = main_slots < left ? main_slots : left;
+    const bool roomy = ram_cap < 0 ? ram_slots >= left : ram_cap >= left + homed;
+    if (!roomy) h.main = homed;
     const int rest = left - h.main;
     h.ram = ram_slots < rest ? ram_slots : rest;
     h.file = rest - h.ram;
