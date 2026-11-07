@@ -306,7 +306,7 @@ class EngineStart(unittest.TestCase):
             (tokdir / "vocab.json").write_text("{}")
             (tokdir / "merges.txt").write_text("")
             (tokdir / "token_type.json").write_text("[]")
-            cfg = {"engine_bin": str(eng), "args": ["--serve"], "log": None, "tokenizer": str(tokdir)}
+            cfg = {"engine_bin": str(eng), "args": ["--serve"], "log": None, "tokenizer": {n: (tokdir / n).read_bytes() for n in ("vocab.json", "merges.txt", "token_type.json")}}
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch("serve.engine.modelfile.model_config", return_value=cfg), \
                     mock.patch.dict(sys.modules, {"tokenizer": types.SimpleNamespace(Tokenizer=lambda *a, **k: ByteTokenizer())}), \

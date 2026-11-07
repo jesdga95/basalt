@@ -174,21 +174,23 @@ def drop_sidecar_vision(cfg: dict) -> None:
 def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     """The Service of one checked model, unloaded. With several models a numbered vision sidecar waits for its model's
     turn too."""
-    tokenizer = cfg.get("tokenizer") or a.tokenizer
+    from serve.engine import modelfile
+    files = cfg.get("tokenizer")
+    if files is None:                                   # the mock engine: a directory, or the byte tokenizer without one
+        tdir = Path(a.tokenizer)
+        files = {n: (tdir / n).read_bytes() for n in modelfile.TOKENIZER_SECTIONS if (tdir / n).exists()}
+    if not a.mock_engine and "vocab.json" not in files:
+        fail(f"tokenizer missing: {a.tokenizer}/vocab.json")
     tok = ByteTokenizer()
-    tpath = Path(tokenizer)
-    if not a.mock_engine and not (tpath / "vocab.json").exists():
-        fail(f"tokenizer missing: {tpath / 'vocab.json'}")
-    if (tpath / "vocab.json").exists():
+    if "vocab.json" in files:
         import tokenizer as ST
-        vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
+        vocab = json.loads(files["vocab.json"].decode("utf-8"))
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
             tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
-        types = json.loads((tpath / "token_type.json").read_text())
-        pre = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")).get("pre", "qwen35") \
-            if (tpath / "tokenizer.json").exists() else "qwen35"
+        merges = files["merges.txt"].decode("utf-8").split("\n")
+        types = json.loads(files["token_type.json"])
+        pre = json.loads(files["tokenizer.json"].decode("utf-8")).get("pre", "qwen35") if "tokenizer.json" in files else "qwen35"
         tok = ST.Tokenizer(tokens, merges, types, pre=pre)
     has_grammar = False
     if not a.mock_engine:
@@ -232,8 +234,9 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
             "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, dict(a.sampling_launch)
     # the model's exported template, else the bundled one
     dialect = dialect_for(cfg.get("arch"))
-    tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, dialect.template(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    template = files["chat_template.jinja"].decode("utf-8") if "chat_template.jinja" in files else \
+        (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8")
+    svc = Service(engine, tok, dialect.template(template),
                   model_name=cfg.get("model_name", "basalt"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect)

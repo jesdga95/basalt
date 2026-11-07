@@ -1,13 +1,11 @@
-"""Engine settings, tokenizer and vision inputs for a .basalt model file. The vision programs open the projector
-inside the file; the tokenizer is unpacked once into the cache directory."""
+"""Engine settings, tokenizer and vision inputs for a .basalt model file. Nothing is unpacked: the tokenizer is read from
+its sections into memory, and the vision programs open the projector inside the file themselves."""
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import struct
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,27 +59,14 @@ def sampling_defaults(meta: dict) -> dict:
     return {field: _short(kv[key]) for key, field in GGUF_SAMPLING.items() if kv.get(key) is not None}
 
 
-def extract_tokenizer(mf: ModelFile) -> Path:
-    """The `tokenizer/*` sections as a directory, reused when present."""
-    out = cache_dir(mf) / "tokenizer"
-    if (out / "vocab.json").exists():
-        return out
-    names = [n for n in mf.names() if n.startswith("tokenizer/")]
-    if not any(n == "tokenizer/vocab.json" for n in names):
+TOKENIZER_SECTIONS = ("vocab.json", "merges.txt", "token_type.json", "tokenizer.json", "chat_template.jinja")
+
+
+def tokenizer_files(mf: ModelFile) -> dict[str, bytes]:
+    """The `tokenizer/*` sections the server reads, by file name (those a pack lacks are absent)."""
+    if "tokenizer/vocab.json" not in mf.sections:
         raise ValueError(f"{mf.path}: no tokenizer sections")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(dir=out.parent, prefix="tokenizer."))
-    try:
-        for n in names:
-            (tmp / n.split("/", 1)[1]).write_bytes(mf.read(n))
-        try:
-            os.rename(tmp, out)
-        except OSError:                          # another process finished first
-            if not (out / "vocab.json").exists():
-                raise
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    return out
+    return {n: mf.read("tokenizer/" + n) for n in TOKENIZER_SECTIONS if "tokenizer/" + n in mf.sections}
 
 
 def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
@@ -123,7 +108,7 @@ def model_config(spec: ModelSpec, engine_bin: str) -> dict:
     cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": spec.alias or meta.get("name") or "basalt",
            "sampling": sampling_defaults(meta),
            "arch": (meta.get("gguf_kv") or {}).get("general.architecture"), "log": str(cdir / "engine.log"),
-           "tokenizer": str(extract_tokenizer(mf))}
+           "tokenizer": tokenizer_files(mf)}
     if vision and dialect_for(cfg["arch"]).in_engine_vision:
         if vision != "dynamic":
             raise ValueError(f"this model's images are encoded in the engine: --vision dynamic, not {vision}")
