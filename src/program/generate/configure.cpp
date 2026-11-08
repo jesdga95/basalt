@@ -1,6 +1,8 @@
 #include "context.hpp"
 #include "run.hpp"
 #include "basalt/core/host_pool.hpp"
+#include <filesystem>
+#include <cstdlib>
 
 namespace basalt::program::generate {
 
@@ -14,8 +16,8 @@ int run(int argc, char** argv) {
     std::vector<basalt::program::GpuCard> chosen_cards;
     if (const auto code = cli::select_gpus(o, chosen_cards, basalt::kernels::kDmMaxX + 1)) return *code;
     if (o.host_pool_bytes > 0) {
-        if (!o.serve || o.batch > 0 || chosen_cards.size() != 1 || o.prompt_cache <= 0 || o.conversation_cache_disk_mib <= 0) {
-            return fatal_start_error("--host-pool-gib needs single-GPU solo --serve, checkpoints and a disk conversation cache");
+        if (!o.serve || chosen_cards.size() != 1 || o.prompt_cache <= 0 || o.conversation_cache_disk_mib <= 0) {
+            return fatal_start_error("--host-pool-gib needs single-GPU --serve, checkpoints and a disk conversation cache");
         }
         std::string error;
         basalt::core::detail::HostMemory memory;
@@ -42,10 +44,29 @@ int run(int argc, char** argv) {
         if (!srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty()) o.mtp = o.model;
         // the engine's expert profile for this model, when it has one
         const std::string key = cli::profile_key(model_file.meta());
-        const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
+        std::vector<std::string> prof_candidates;
+#ifdef BASALT_SOURCE_DIR
+        prof_candidates.push_back(std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof");
+#endif
+        if (const char* env_dir = std::getenv("BASALT_PROFILES_DIR")) {
+            prof_candidates.push_back(std::string(env_dir) + "/" + key + ".prof");
+        }
+        prof_candidates.push_back("data/profiles/" + key + ".prof");
+        const std::string mod_path = basalt::platform::module_path();
+        if (!mod_path.empty()) {
+            std::filesystem::path p(mod_path);
+            prof_candidates.push_back((p.parent_path() / "data" / "profiles" / (key + ".prof")).string());
+            prof_candidates.push_back((p.parent_path().parent_path() / "data" / "profiles" / (key + ".prof")).string());
+            prof_candidates.push_back((p.parent_path().parent_path() / "share" / "basalt" / "profiles" / (key + ".prof")).string());
+        }
         uint64_t prof_bytes = 0;
-        if (!key.empty() && basalt::platform::file_size(prof, prof_bytes) && prof_bytes > 0) o.expert_profile = prof;
-        else basalt::log::info("basalt generate", "no expert profile for %s", key.empty() ? "this model" : key.c_str());
+        for (const auto& prof : prof_candidates) {
+            if (!key.empty() && basalt::platform::file_size(prof, prof_bytes) && prof_bytes > 0) {
+                o.expert_profile = prof;
+                break;
+            }
+        }
+        if (o.expert_profile.empty()) basalt::log::info("basalt generate", "no expert profile for %s", key.empty() ? "this model" : key.c_str());
         // the 8-bit hyper-connection copies
         std::map<std::string, basalt::core::Hc8Copy> table;
         if (!basalt::core::hc8_read(srcs.hc8, table, merr)) {
