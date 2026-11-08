@@ -8,6 +8,7 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/program/options.hpp"
 #include "basalt/protocol.hpp"
@@ -337,7 +338,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.expert_profile = o.expert_profile;
         if (lreq.expert_profile.empty()) {   // the engine's own for this model, when it ships one
             const std::string key = profile_key(model_file.meta());
-            const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
+            const std::string prof = basalt::platform::install_root() + "/data/profiles/" + key + ".prof";
             uint64_t bytes = 0;
             if (!key.empty() && basalt::platform::file_size(prof, bytes) && bytes > 0) lreq.expert_profile = prof;
         }
@@ -352,7 +353,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.spec = o.spec;
         lreq.draft = o.spec >= 2 && o.spec_oracle.empty();
         lreq.drafter_device = o.drafter_device;
-        lreq.profile_dir = std::string(BASALT_SOURCE_DIR) + "/data/profiles";
+        lreq.profile_dir = basalt::platform::install_root() + "/data/profiles";
         lreq.draft_experts = o.draft_experts;
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         lreq.kv = o.kv;
