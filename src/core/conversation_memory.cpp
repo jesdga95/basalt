@@ -1,6 +1,7 @@
 #include "basalt/core/conversation_memory.hpp"
 
 #include "basalt/platform/memory.hpp"
+#include "basalt/platform/host_allocator.hpp"
 #include "basalt/platform/system.hpp"
 
 #include <charconv>
@@ -31,6 +32,8 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
 }
 
 std::optional<uint64_t> conversation_available_memory() {
+    const uint64_t reserved = basalt::platform::reserved_host_available();
+    if (reserved != UINT64_MAX) return reserved;
     const std::string path = basalt::platform::meminfo_path();
     if (path.empty()) {
         // No memory accounting file here: take the platform probe's available-RAM reading, in bytes. It reports 0
