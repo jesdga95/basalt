@@ -234,6 +234,23 @@ Flow Request::complete() {
         basalt::log::info("basalt serve", "adaptive swaps: %lld into the VRAM tier this request, %lld deferred "
                           "(no free RAM place)", (long long) (runtime_.xq_swapped - swapped0),
                           (long long) (runtime_.xq_noplace - noplace0));
+    if (runtime_.o.host_pool_bytes > 0) {
+        runtime_.src.trim_file_cache();
+        if (basalt::core::host_pool_stats().used > (50ull << 30))
+            (void) basalt::core::CheckpointBytes::allocator_type::release_pooled();
+        runtime_.relieve_host_pressure();
+        const uint64_t avail = basalt::platform::available_memory();
+        const size_t warm_reserve = (avail > 0 && avail < (10ull << 30)) ||
+                                    basalt::core::host_pool_stats().used > (50ull << 30)
+                                    ? 0 : (3584ull << 20);
+        (void) basalt::core::discard_host_pool_free(warm_reserve);
+        const auto pool = basalt::core::host_pool_stats();
+        basalt::log::info("host pool", "used %llu MiB, peak %llu MiB of %llu MiB; allocation refusals %llu",
+                          (unsigned long long) (pool.used >> 20), (unsigned long long) (pool.peak >> 20),
+                          (unsigned long long) (pool.capacity >> 20), (unsigned long long) pool.failures);
+        basalt::log::info("file cache", "%llu expert-view trims; mapped read window 2048 MiB",
+                          (unsigned long long) runtime_.src.file_cache_trims());
+    }
     // the resident RAM mode, cumulative: experts read from the experts section since the copy was made (what the plain
     // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
     if (runtime_.src.complement_ready())
