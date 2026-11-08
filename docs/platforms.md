@@ -68,25 +68,3 @@ on both, and the pool output matches the serial run bit for bit.
 Greedy tokens differ across the builds: with tiers pinned and adaptive swaps off, `struct` matches over 300 tokens, `conv` diverges at
 token 23 and `prose` at token 44. One build matches itself run to run, so the difference is the host compiler's CPU code (78% of expert
 rows). Quality of the Windows build has not been run ([quality](precision/quality.md)).
-
-## Container image
-
-`Dockerfile` builds the engine, the server and its venv on an NVIDIA CUDA 13 runtime base, and the `docker` workflow publishes the
-result as the `basalt` package in the repository owner's ghcr.io namespace on every push to `main`. The image is Linux; Windows runs
-natively. Building it needs no GPU, and running it reaches the card through the NVIDIA container runtime. It ships no model:
-`basalt_config.json` and the packs come from mounts, and the server unpacks each pack's tokenizer and vision files and keeps its
-conversation disk tier under its cache root (`$HOME/.cache/basalt`), which the image pins to `/data`.
-
-```sh
-docker pull ghcr.io/jesdga95/basalt:latest
-docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all \
-    -v "$PWD/appdata/basalt:/data" -v "$PWD/models:/models" -p 8080:8080 \
-    ghcr.io/jesdga95/basalt:latest
-```
-
-The entrypoint is `basalt serve --config /data/basalt_config.json --host 0.0.0.0`, and arguments on the run command follow it
-(`--api-key KEY`). A pack's path in the config is relative to the config file, so it names the mount: `/models/<pack>.basalt`. The
-served port is `server.port` (8080), and the mapped host port has to match it.
-
-The container path is untested: no `basalt-bench` run and no PPL/KLD quality run has been measured inside the image, so the
-benchmark numbers describe native runs.
