@@ -117,6 +117,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     core::detail::HostMemory hm;
     auto available = [&] { return core::detail::host_available_memory(hm) ? hm.available : 0; };
     const uint64_t ram_reserve = platform::ram_reserve();
+    uint64_t tier_reserve = ram_reserve;   // and the file cache's floor once experts stay in the file
     // the image encoder's cuBLAS handle takes host memory when created, so it is taken before the reading
     if (m_.tiers().vision && !m_.vision_blas().open(err))
         return false;
@@ -125,7 +126,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     uint64_t avail = available();
     // places per layer above the reserve, less the spare each layer keeps, in `bytes` of RAM
     auto places_in = [&](uint64_t bytes) {
-        const uint64_t places = core::ram_tier_room(bytes, ram_reserve, true) / one_each_ram;
+        const uint64_t places = core::ram_tier_room(bytes, tier_reserve, true) / one_each_ram;
         return places > 0 ? places - 1 : 0;
     };
     const bool ram_given = m_.tiers().resident_budget > 0 || m_.diag_tier_ram() >= 0;
@@ -145,11 +146,18 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     if (homes_.file > 0) {   // experts stay in the file: the ring of its reads takes RAM before the tier is sized
         if (!host_.set_ring(prefillp::kRingPieces, err)) return false;
         avail = available();
+        // and they read through the OS file cache, which keeps its floor beside the reserve (the ring holds a prompt's
+        // reads, so only the layers count)
+        core::FileCache cache;
+        for (const auto& e : m_.pack().experts) cache.layer_bytes = std::max<uint64_t>(cache.layer_bytes, (uint64_t) n_expert_ * e.blob_bytes);
+        if (!ram_given)
+            tier_reserve = ram_reserve + core::file_cache_keep(avail, ram_reserve, true,
+                                                               (uint64_t) (homes_.ram + homes_.file + 1) * one_each_ram, cache);
         ram_slots = ram_in();
         homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
     }
     const uint64_t ram_floor =
-        ram_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
+        tier_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
     if (homes_.peer == 0) {
         share_.reset();
         peer_.reset();
