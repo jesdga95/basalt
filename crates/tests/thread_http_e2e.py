@@ -32,7 +32,9 @@ class FakeBasalt(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        body = json.dumps({"choices":[{"message":{"role":"assistant","content":"reply-"+str(len(self.seen))}}]}).encode()
+        body = json.dumps({"choices":[{"message":{"role":"assistant","content":"reply-"+str(len(self.seen))}}],
+                           "usage":{"prompt_tokens":100,"completion_tokens":5,
+                                    "prompt_tokens_details":{"cached_tokens":25 if len(req["messages"])>1 else 0}}}).encode()
         self.send_response(200)
         self.send_header("Content-Type","application/json")
         self.send_header("Content-Length",str(len(body)))
@@ -115,6 +117,11 @@ class ThreadHTTP(unittest.TestCase):
                          ["hello","reply-1","continue","reply-2"])
         self.assertEqual(len(FakeBasalt.seen),2)
         self.assertEqual(len(FakeBasalt.seen[-1]["messages"]),3)
+        code,metrics=self.call("GET",f"/v1/threads/{tid}/metrics")
+        self.assertEqual(code,200,metrics)
+        self.assertEqual(len(metrics["data"]),2)
+        self.assertEqual([v["reported_cached_tokens"] for v in metrics["data"]],[0,25])
+        self.assertTrue(all(v["ttft_ms"] is None for v in metrics["data"]))
         code,_=self.call("POST",f"/v1/threads/{tid}/turns",
                          {**second,"idempotency_key":"stale-key"})
         self.assertEqual(code,409)
