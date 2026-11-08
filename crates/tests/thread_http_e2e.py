@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class FakeBasalt(BaseHTTPRequestHandler):
     seen = []
+    failed_once = False
     def log_message(self, *_args):
         pass
     def do_POST(self):
@@ -22,6 +23,15 @@ class FakeBasalt(BaseHTTPRequestHandler):
         n = int(self.headers["Content-Length"])
         req = json.loads(self.rfile.read(n))
         self.seen.append(req)
+        if req["messages"][-1]["content"] == "fail once" and not FakeBasalt.failed_once:
+            FakeBasalt.failed_once = True
+            body=b'{"error":"transient simulated inference failure"}'
+            self.send_response(503)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         body = json.dumps({"choices":[{"message":{"role":"assistant","content":"reply-"+str(len(self.seen))}}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type","application/json")
@@ -108,6 +118,28 @@ class ThreadHTTP(unittest.TestCase):
         code,_=self.call("POST",f"/v1/threads/{tid}/turns",
                          {**second,"idempotency_key":"stale-key"})
         self.assertEqual(code,409)
+
+    def test_recovery_retry_preserves_single_logical_exchange(self):
+        code,t=self.call("POST","/v1/threads",{"model":"fake-model"})
+        self.assertEqual(code,201,t)
+        tid=t["id"]; branch=t["branch_id"]
+        msg={"branch_id":branch,"expected_version":0,"parent_message_id":None,
+             "idempotency_key":"recover-1","content":"fail once","max_tokens":32}
+        status,failed=self.call("POST",f"/v1/threads/{tid}/turns",msg)
+        self.assertEqual(status,502,failed)
+        status,empty=self.call("GET",f"/v1/threads/{tid}/messages")
+        self.assertEqual((status,len(empty["data"])),(200,0))
+        status,good=self.call("POST",f"/v1/threads/{tid}/turns",msg)
+        self.assertEqual(status,200,good)
+        self.assertEqual(good["status"],"COMMITTED")
+        status,replay=self.call("POST",f"/v1/threads/{tid}/turns",msg)
+        self.assertEqual(status,200,replay)
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["message_id"],good["message_id"])
+        status,items=self.call("GET",f"/v1/threads/{tid}/messages")
+        self.assertEqual(status,200,items)
+        self.assertEqual(len(items["data"]),2)
+        self.assertEqual([x["role"] for x in items["data"]],["user","assistant"])
 
 
 if __name__=="__main__":
