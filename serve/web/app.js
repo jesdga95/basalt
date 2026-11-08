@@ -295,7 +295,7 @@ function ctxHistory(reqs) {
       g += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${hh.toFixed(1)}" fill="${col}"/>`;
     });
   });
-  return `<div class="cx-hist"><div class="hh"><b>Tokens per request</b><span>Last ${h.length} requests</span></div><div class="cx-chart">`
+  return `<div class="cx-hist"><div class="hh"><b>Tokens per request</b><span>${h.length === 1 ? "Last request" : `Last ${h.length} requests`}</span></div><div class="cx-chart">`
     + `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Tokens per request">`
     + `<line x1="0" x2="${W}" y1="${H}" y2="${H}" stroke="var(--line)"/><line x1="0" x2="${W}" y1="${H / 2}" y2="${H / 2}" stroke="var(--line-soft)" stroke-dasharray="2 4"/>${g}</svg>`
     + `<span class="tk" style="top:0">${kc(top)}</span><span class="tk" style="top:50%">${kc(top / 2)}</span><span class="tk" style="top:100%">0</span>`
