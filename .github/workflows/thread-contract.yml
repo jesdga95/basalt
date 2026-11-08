@@ -3,6 +3,8 @@ on:
   pull_request:
     paths:
       - 'crates/**'
+      - 'src/program/serve/**'
+      - 'tests/thread_e2e/**'
       - 'serve/api/thread_proxy.py'
       - 'serve/handler.py'
       - 'serve/tests/test_thread_proxy.py'
@@ -32,6 +34,10 @@ jobs:
         run: cargo fmt --manifest-path crates/Cargo.toml --all -- --check
       - name: Rust contract tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --all-targets
+      - name: Native C++ token tape contract (host-only)
+        run: |
+          g++ -std=c++20 -Wall -Wextra -Werror -I. tests/thread_e2e/native_tape_test.cpp -o /tmp/native_tape_test
+          /tmp/native_tape_test
       - name: Build API binary
         run: cargo build --manifest-path crates/Cargo.toml -p basalt-thread-api
       - name: Python bridge contract tests
