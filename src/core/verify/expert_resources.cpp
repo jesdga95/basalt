@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -74,7 +75,7 @@ bool Verifier::dm_init(std::string& err) {
               cudaMalloc((void**) &d->cseen, 4) == cudaSuccess && cudaMemset(d->cseen, 0, 4) == cudaSuccess &&
               cudaMalloc((void**) &d->landed, (size_t) (d->rings + 1) * 4) == cudaSuccess &&
               cudaMemset(d->landed, 0, (size_t) (d->rings + 1) * 4) == cudaSuccess;
-    if (ok && cudaHostAlloc((void**) &d->landed_pin, DecMoe::kPinSlots * 4, cudaHostAllocPortable) != cudaSuccess) {
+    if (ok && basalt::core::allocate_pinned_host((void**) &d->landed_pin, DecMoe::kPinSlots * 4, cudaHostAllocPortable) != cudaSuccess) {
         cudaGetLastError();
         d->landed_pin = nullptr;
     }
@@ -96,7 +97,7 @@ bool Verifier::dm_init(std::string& err) {
     d->shadow0.assign((size_t) LE, INT32_MIN);
     d->shadow1.assign((size_t) LE, -1);
     d->pin_stride = (size_t) LE * 24;   // [res0 | ptab0 | res1 | ptab1] per slot
-    if (cudaHostAlloc((void**) &d->pin, d->pin_stride * DecMoe::kPinSlots, cudaHostAllocPortable) != cudaSuccess) {
+    if (basalt::core::allocate_pinned_host((void**) &d->pin, d->pin_stride * DecMoe::kPinSlots, cudaHostAllocPortable) != cudaSuccess) {
         cudaGetLastError();
         d->pin = nullptr;
     }
@@ -222,7 +223,7 @@ bool Verifier::dm_init(std::string& err) {
         int st_least = 0, st_greatest = 0;   // the copy's blocks go first as the FFN read's leave the SMs
         bool sok = cudaMalloc((void**) &d->stage_src, (size_t) LE * 8) == cudaSuccess &&
                    cudaMemset(d->stage_src, 0, (size_t) LE * 8) == cudaSuccess &&
-                   cudaMallocHost((void**) &d->stage_host, (size_t) LE * 8) == cudaSuccess &&
+                   basalt::core::allocate_pinned_host((void**) &d->stage_host, (size_t) LE * 8) == cudaSuccess &&
                    cudaMalloc((void**) &d->stage_k, kt.size() * 4) == cudaSuccess &&
                    cudaMemcpy(d->stage_k, kt.data(), kt.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
                    cudaDeviceGetStreamPriorityRange(&st_least, &st_greatest) == cudaSuccess &&
@@ -273,7 +274,7 @@ void Verifier::dm_free() {
         }
         if (x.res) cudaFree(x.res);
         for (void* h : {(void*) x.h_ring, (void*) x.h_w})
-            if (h) cudaFreeHost(h);
+            if (h) basalt::core::release_pinned_host(h);
     }
     if (d->st_s) { cudaStreamSynchronize(d->st_s); cudaStreamDestroy(d->st_s); }
     for (cudaEvent_t e : {d->st_fork, d->st_join})
@@ -283,11 +284,11 @@ void Verifier::dm_free() {
                     (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed,
                     (void*) d->stage_src, (void*) d->stage_k, (void*) d->route_counts})
         if (p) cudaFree(p);
-    if (d->stage_host) cudaFreeHost(d->stage_host);
-    if (d->pin) cudaFreeHost(d->pin);
-    if (d->landed_pin) cudaFreeHost(d->landed_pin);
+    if (d->stage_host) basalt::core::release_pinned_host(d->stage_host);
+    if (d->pin) basalt::core::release_pinned_host(d->pin);
+    if (d->landed_pin) basalt::core::release_pinned_host(d->landed_pin);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
-        if (h) cudaFreeHost(h);
+        if (h) basalt::core::release_pinned_host(h);
     delete d;
     dm_ = nullptr;
 }
