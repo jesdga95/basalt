@@ -99,10 +99,12 @@ public:
     /// rows of `rows`.
     void start_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows);
     void finish_cpu();
-    /// The promotions' copies wait for the bus to idle: mark_gap notes the point of `main` (a layer's sum) they start
-    /// behind, and pump issues up to `pieces` of them there, after the next launches went out (the next layer's head;
-    /// at the window's end, its output). begin_token issues the rest, so every promotion still lands before the next
-    /// lookup, as if it had been copied at once.
+    /// The promotions' copies, and the second card's exchanges, wait for the bus to idle: mark_gap notes the point of
+    /// `main` (a layer's sum) they start behind, and pump issues up to `pieces` promotion pieces there (and at most
+    /// policy::kPeerGapPieces exchange pieces on the second card's bus), after the next launches went out (the next
+    /// layer's head; at the window's end, its output), so they do not take the host memory's bandwidth from the CPU's
+    /// share and the bus copies of a layer's misses. begin_token issues the rest, so every promotion still lands before
+    /// the next lookup, as if it had been copied at once.
     void mark_gap(cudaStream_t main);
     void pump(int pieces);
     static constexpr int kAllPieces = 1 << 20;
@@ -164,11 +166,20 @@ private:
         uint8_t* home_to;
         uint64_t bytes, off = 0, home_off = 0;
     };
-    /// Issues every queued promotion's remaining copies.
+    /// Issues every queued promotion's and exchange's remaining copies.
     void flush_queue();
+    /// Issues up to `pieces` of the queued exchanges' copies on the second card.
+    void pump_peer(int pieces);
     /// `in` on its way into the second card's `slot`; `out`, which held it, on its way to RAM place `place`.
     struct PeerMove {
         int layer, in, out, slot, place;
+    };
+    /// A second card exchange whose copies wait for an idle bus: the slot's bytes out to `to` first, then `from` in.
+    struct PeerQueued {
+        int32_t slot;
+        uint8_t* to;
+        const uint8_t* from;
+        uint64_t bytes, out_off = 0, in_off = 0;
     };
     /// A cold pinned expert (victim) replaced by a hot file-backed one (expert), read into the layer's spare slot.
     struct Swap {
@@ -212,6 +223,7 @@ private:
     std::vector<Pending> pending_;
     std::vector<Queued> queue_;             ///< promotions not yet fully issued, oldest first
     std::vector<PeerMove> peer_moves_;
+    std::vector<PeerQueued> peer_queue_;    ///< exchanges not yet fully issued, oldest first
     std::vector<int32_t> peer_owner_;       ///< [second card slot] expert it holds or is receiving
     std::vector<cudaEvent_t> events_;
     std::vector<int> free_events_;
