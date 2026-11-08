@@ -1,5 +1,6 @@
 #pragma once
 
+#include "basalt/core/host_pool.hpp"
 #include "common.hpp"
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/mtp.hpp"
@@ -65,7 +66,7 @@ struct Stager {
         dma_done.assign((size_t) kRing, nullptr);
         pageable.resize(kRing);
         for (int i = 0; i < kRing; ++i) {
-            pinned[i] = cudaHostAlloc((void**) &buf[i], blob_bytes, cudaHostAllocDefault) == cudaSuccess;
+            pinned[i] = basalt::core::allocate_pinned_host((void**) &buf[i], blob_bytes, cudaHostAllocDefault) == cudaSuccess;
             if (!pinned[i]) {
                 cudaGetLastError();
                 pageable[(size_t) i].resize(blob_bytes);
@@ -84,7 +85,7 @@ struct Stager {
         for (auto& t : threads) t.join();
         for (int i = 0; i < kRing; ++i) {
             if (dma_done[i]) cudaEventDestroy(dma_done[i]);
-            if (buf[i] && pinned[i]) cudaFreeHost(buf[i]);
+            if (buf[i] && pinned[i]) basalt::core::release_pinned_host(buf[i]);
         }
     }
     void work() {
