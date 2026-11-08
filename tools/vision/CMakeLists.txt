@@ -22,6 +22,7 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
 set(VISION_ROOT ${CMAKE_CURRENT_LIST_DIR}/../..)
+include(${VISION_ROOT}/cmake/host_pool.cmake)
 
 # host side: preprocessing, projector file, CPU encoder
 add_library(vision_core STATIC
@@ -49,7 +50,7 @@ add_library(vision_cuda STATIC
   ${VISION_ROOT}/src/vision/encoder_cuda.cu
   ${VISION_ROOT}/src/vision/vision_kernels.cu)
 target_include_directories(vision_cuda PUBLIC ${VISION_ROOT}/include ${VISION_ROOT}/src/vision)
-target_link_libraries(vision_cuda PUBLIC vision_core CUDA::cudart CUDA::cublas)
+target_link_libraries(vision_cuda PUBLIC vision_core host_memory CUDA::cudart CUDA::cublas)
 
 add_executable(basalt-vision vision.cpp)
 target_compile_definitions(basalt-vision PRIVATE BASALT_VISION_CUDA)
