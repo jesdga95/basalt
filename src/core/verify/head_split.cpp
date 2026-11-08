@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/verify.hpp"
@@ -143,8 +144,8 @@ void Verifier::hs_init() {
         const OnDevice on(device_);
         ok = ok && cudaMalloc((void**) &hs_y0_, (size_t) T * rows * 4) == cudaSuccess &&
              cudaEventCreateWithFlags(&hs_in_, cudaEventDisableTiming) == cudaSuccess &&
-             cudaHostAlloc(&hs_hxq_, xb, cudaHostAllocPortable) == cudaSuccess &&
-             cudaHostAlloc((void**) &hs_hy_, (size_t) T * r1 * 4, cudaHostAllocPortable) == cudaSuccess;
+             basalt::core::allocate_pinned_host(&hs_hxq_, xb, cudaHostAllocPortable) == cudaSuccess &&
+             basalt::core::allocate_pinned_host((void**) &hs_hy_, (size_t) T * r1 * 4, cudaHostAllocPortable) == cudaSuccess;
     }
     if (!ok) {
         cudaGetLastError();
@@ -172,7 +173,7 @@ void Verifier::hs_free() {
         if (hs_in_) cudaEventDestroy(hs_in_);
         if (hs_fork_) cudaEventDestroy(hs_fork_);
         if (hs_post_) cudaEventDestroy(hs_post_);
-        for (void* p : {hs_hxq_, (void*) hs_hy_, hs_link_, hs_input_, hs_list_}) if (p) cudaFreeHost(p);
+        for (void* p : {hs_hxq_, (void*) hs_hy_, hs_link_, hs_input_, hs_list_}) if (p) basalt::core::release_pinned_host(p);
     }
     hs_rows_ = 0; hs_dev_ = -1;
     hs_two_ = false;
