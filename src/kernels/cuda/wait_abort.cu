@@ -1,4 +1,5 @@
 // src/kernels/cuda/wait_abort.cu - see include/basalt/kernels/wait_abort.hpp.
+#include "basalt/core/host_pool.hpp"
 #include "basalt/kernels/wait_abort.hpp"
 #include "basalt/log.hpp"
 
@@ -26,7 +27,7 @@ void wait_abort_init() {
     if (g_abort_dev[dev] != nullptr) return;
     if (g_abort_host == nullptr) {
         void* p = nullptr;
-        if (cudaHostAlloc(&p, 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        if (basalt::core::allocate_pinned_host(&p, 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
             basalt::log::error("basalt", "wait abort word: %s", cudaGetErrorString(cudaGetLastError()));
             std::exit(1);
         }
