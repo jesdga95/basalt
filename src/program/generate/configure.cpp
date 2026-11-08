@@ -1,5 +1,6 @@
 #include "context.hpp"
 #include "run.hpp"
+#include "basalt/core/host_pool.hpp"
 
 namespace basalt::program::generate {
 
@@ -12,6 +13,16 @@ int run(int argc, char** argv) {
     // ---- the GPUs: chosen before any CUDA call, which then sees only them, the main card as device 0
     std::vector<basalt::program::GpuCard> chosen_cards;
     if (const auto code = cli::select_gpus(o, chosen_cards, basalt::kernels::kDmMaxX + 1)) return *code;
+    if (o.host_pool_bytes > 0) {
+        if (!o.serve || o.batch > 0 || chosen_cards.size() != 1 || o.prompt_cache <= 0 || o.conversation_cache_disk_mib <= 0) {
+            return fatal_start_error("--host-pool-gib needs single-GPU solo --serve, checkpoints and a disk conversation cache");
+        }
+        std::string error;
+        basalt::core::detail::HostMemory memory;
+        if (!basalt::core::detail::host_available_memory(memory)) return fatal_start_error("host pool cannot read RAM/cgroup availability");
+        const uint64_t permitted = std::min(memory.cgroup_available, basalt::platform::total_physical_memory());
+        if (!basalt::core::open_host_pool(o.host_pool_bytes, permitted, error)) return fatal_start_error(error);
+    }
     // ---- where every loader reads from: the sections of the .basalt file
     if (const auto code = cli::prepare_model_process(o)) return *code;
     basalt::core::ModelSources srcs;
