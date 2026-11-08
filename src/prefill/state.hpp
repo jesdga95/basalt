@@ -1,4 +1,5 @@
 #pragma once
+#include "basalt/platform/host_allocator.hpp"
 
 #include "common.hpp"
 #include "staging.hpp"
@@ -73,7 +74,7 @@ struct Prefill::Impl {
     // running per-expert costs the share is balanced from.
     float *cpu_x = nullptr, *cpu_rows = nullptr;
     size_t cpu_x_n = 0, cpu_rows_n = 0;
-    std::vector<uint8_t> cpu_nact;
+    basalt::platform::HostVector<uint8_t> cpu_nact;
     std::vector<kernels::cpu::ActQ> cpu_actq;
     std::vector<kernels::cpu::ExpertJobMulti> cpu_jobs;
     std::vector<char> cpu_need;
@@ -110,7 +111,7 @@ struct Prefill::Impl {
     cudaEvent_t ahead_ev = nullptr;          // where on the compute stream the copies ahead may start
     // PLE
     float* ple_emb = nullptr;
-    std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
+    basalt::platform::HostVector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
     float* ple_emb_host[2] = {};             // pinned, double-buffered: the next chunk's rows are read while this
     cudaEvent_t ple_copied[2] = {};          // one runs; the event marks that buffer's upload done
     std::vector<uint32_t> ple_rows[2];
