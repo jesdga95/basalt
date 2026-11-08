@@ -1,5 +1,7 @@
 #pragma once
 
+#include "basalt/platform/host_allocator.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -99,6 +101,8 @@ private:
         template <class U> struct rebind { using other = NoInit<U>; };
         NoInit() = default;
         template <class U> NoInit(const NoInit<U>&) noexcept {}
+        T* allocate(size_t n) { return static_cast<T*>(basalt::platform::allocate_host_buffer(n * sizeof(T), alignof(T))); }
+        void deallocate(T* p, size_t) noexcept { basalt::platform::release_host_buffer(p, alignof(T)); }
         template <class U> void construct(U* p) { ::new (static_cast<void*>(p)) U; }
         template <class U, class... A> void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
     };
