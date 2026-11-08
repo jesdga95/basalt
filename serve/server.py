@@ -187,6 +187,7 @@ def main() -> int:
             print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
         # always built unloaded: the load itself (below) is the lazy path's, started here instead of by a request
         engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
+        engine.native_slot_metrics = a.native_slot_metrics
         if isinstance(vision, EngineVision):
             vision.attach(engine)
     else:
