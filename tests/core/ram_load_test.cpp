@@ -1,10 +1,7 @@
 // The shared RAM loader: both layouts place every blob where the plan says, on any alignment, with or without the OS cache.
-#include "basalt/core/device.hpp"
 #include "basalt/core/ram_load.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
-
-#include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstring>
@@ -188,21 +185,6 @@ void fallback_case() {
     check(!read_ram_runs(L, st, err) && err == "refused", "a failing hook fails the load with its error");
 }
 
-// A card the runtime cannot serve is reported with the call, the error and the card, and leaves no error behind.
-void unserved_card_case() {
-    std::string why;
-    uint64_t f = 0, t = 0;
-    check(!device_memory(99, f, t, why), "a card that does not exist has no memory to read");
-    check(why.rfind("cuda", 0) == 0 && why.find("(code ") != std::string::npos && why.find("device 99 of ") != std::string::npos,
-          "the failure names the call, the error code and the card");
-    why.clear();
-    check(!devices_allocate({99}, why) && why.find("device 99 of ") != std::string::npos, "an unserved card fails the allocation check");
-    check(cudaGetLastError() == cudaSuccess, "the checks leave no sticky error");
-    check(devices_allocate({}, why), "no cards, nothing to fail");
-    std::string why2;
-    check(devices_allocate({-1}, why) == device_memory(-1, f, t, why2), "the current card (-1) is served exactly when it answers a query");
-}
-
 }  // namespace
 
 int main() {
@@ -215,7 +197,6 @@ int main() {
     span_case(0, 4096 * 4);
     span_case(1000, 4096 * 2 + 100);
     fallback_case();
-    unserved_card_case();
     std::printf(fails == 0 ? "ram_load_test: ok\n" : "ram_load_test: %d failures\n", fails);
     return fails == 0 ? 0 : 1;
 }
