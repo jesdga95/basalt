@@ -1,5 +1,6 @@
 #pragma once
 
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/verify.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/qsa.hpp"
@@ -25,7 +26,7 @@ struct Bump {
 };
 
 inline bool mapped(size_t bytes, void** h, void** d) {
-    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
+    if (basalt::core::allocate_pinned_host(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
     std::memset(*h, 0, bytes);
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
