@@ -222,6 +222,11 @@ Flow Request::restore() {
         }
     }
     if (from_disk) {
+        if (!runtime_.park_current(0, 0)) {
+            std::printf("ERR %s\n", runtime_.err.c_str());
+            return Flow::error;
+        }
+        runtime_.live_ok = false;
         const uint64_t need = runtime_.disk.load_bytes(on_disk);
         const uint64_t floor = std::max<uint64_t>((uint64_t) runtime_.o.conversation_cache_min_free_mib << 20, runtime_.disk_floor);
         const auto t0 = Clock::now();
@@ -231,9 +236,11 @@ Flow Request::restore() {
             basalt::log::info("basalt serve", "conversation cache: %lld tokens on disk not read (physical RAM "
                               "admission; need %llu MiB)", (long long) on_disk.tokens,
                               (unsigned long long) (need >> 20));
+        } else if (runtime_.o.host_pool_bytes > 0 &&
+                   ((on_disk = runtime_.disk.best(ids32.data(), ids32.size(), runtime_.req_imgs, want_cvec)).tokens == 0)) {
+            from_disk = false;
         } else if (!runtime_.disk.load(on_disk, image, de)) {
-            basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
-                              "dropped", de.c_str());
+            basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s)", de.c_str());
         } else {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
@@ -526,8 +533,13 @@ Flow Request::restore() {
         std::fill(runtime_.part_next.begin(), runtime_.part_next.end(), runtime_.pp_next_check);
     }
     // the cells past this request's room hold nothing it reads (the outgoing conversation is parked by now):
-    // a longer one before it gives them back to the expert cache
-    if (!runtime_.kv_release(*runtime_.rsp, n + runtime_.kKvGrowCells, runtime_.err)) {
+    // a longer one before it gives them back to the expert cache, down to the longest conversation parked in RAM
+    // when evicted experts have RAM homes
+    const int64_t parked_max = runtime_.conversations && runtime_.src.complement_ready() &&
+                                       runtime_.rsp == &runtime_.ss
+                                   ? runtime_.conversations->max_tokens()
+                                   : 0;
+    if (!runtime_.kv_release(*runtime_.rsp, std::max<int64_t>(n, parked_max) + runtime_.kKvGrowCells, runtime_.err)) {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
     }
