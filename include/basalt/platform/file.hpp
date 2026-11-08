@@ -59,6 +59,11 @@ bool path_executable(const std::string& path);
 /// This executable's own path, as the OS knows it; empty when the OS does not say.
 std::string module_path();
 
+/// The directory above the one holding this executable, with no trailing separator: the top of the source tree for a
+/// build (`bin/` is under it) and of an unpacked release, where `serve/`, `tools/`, `data/` and `.venv/` are. Empty when
+/// the OS does not name the executable.
+std::string install_root();
+
 /// The directory for scratch files, with no trailing separator: the system's temp directory on Windows, /tmp on
 /// Linux. Never empty; where the OS cannot name one it says ".".
 std::string temp_dir();

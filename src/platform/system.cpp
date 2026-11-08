@@ -77,8 +77,8 @@ int64_t process_id() { return (int64_t) GetCurrentProcessId(); }
 
 std::string host_os_name() { return "Windows"; }
 
-std::string python_interpreter(const std::string& src_dir) {
-    const std::string venv = src_dir + "/.venv/Scripts/python.exe";
+std::string python_interpreter(const std::string& root) {
+    const std::string venv = root + "/.venv/Scripts/python.exe";
     return path_executable(venv) ? venv : "python";
 }
 
@@ -135,8 +135,8 @@ std::string host_os_name() {
     return rel.find("microsoft") != std::string::npos || rel.find("wsl") != std::string::npos ? "WSL2" : "Linux";
 }
 
-std::string python_interpreter(const std::string& src_dir) {
-    const std::string venv = src_dir + "/.venv/bin/python";
+std::string python_interpreter(const std::string& root) {
+    const std::string venv = root + "/.venv/bin/python";
     return path_executable(venv) ? venv : "python3";
 }
 

@@ -24,6 +24,13 @@ void check(bool ok, const std::string& what) {
 int main() {
     using namespace basalt::platform;
     check(process_id() > 0, "process_id is positive");
+
+    // the root is two path components above the executable: what is left of the path is "/<dir>/<name>"
+    const std::string self = module_path(), root = install_root();
+    const std::string rest = self.compare(0, root.size(), root) == 0 ? self.substr(root.size()) : std::string();
+    int seps = 0;
+    for (char c : rest) seps += c == '/' || c == '\\';
+    check(!root.empty() && seps == 2 && (rest[0] == '/' || rest[0] == '\\'), "install_root is the directory above the executable's own");
     (void) stderr_is_terminal();   // either answer is valid; the call must not fail
 
     const std::string mi = meminfo_path();
