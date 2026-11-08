@@ -21,8 +21,8 @@
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // DeepSeek-V4.1 wo_a for decode: all 8 groups (and every token) of the block-diagonal projection in one launch.
-// Each output row runs the arithmetic of native_q5_k_mmvq / native_q6_k_mmvq with one column (same q8_1
-// activation, same per-block order, same cross-warp and shuffle reduction), so the results are bitwise equal.
+// Each output row runs the arithmetic of native_q5_k_mmvq / native_q6_k_mmvq / native_q8_0_mmvq with one column
+// (same q8_1 activation, same per-block order, same cross-warp and shuffle reduction), so the results are bitwise equal.
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/models/deepseek41/attn.hpp"
 #include "attn_out_grouped.hpp"
@@ -53,6 +53,10 @@ struct Q81Block {
     half2 ds;
     int8_t qs[32];
 };
+struct Q80Block {
+    half d;
+    int8_t qs[32];
+};
 struct Q6KBlock {
     uint8_t ql[128];
     uint8_t qh[64];
@@ -60,7 +64,7 @@ struct Q6KBlock {
     half d;
 };
 
-static_assert(sizeof(Q5KBlock) == 176 && sizeof(Q6KBlock) == 210 && sizeof(Q81Block) == 36);
+static_assert(sizeof(Q5KBlock) == 176 && sizeof(Q6KBlock) == 210 && sizeof(Q81Block) == 36 && sizeof(Q80Block) == 34);
 
 __device__ __forceinline__ int load_int_b2(const void* ptr, int i32) {
     const auto* x = static_cast<const uint16_t*>(ptr);
@@ -173,8 +177,19 @@ __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
 }
 
 
+// Exact pinned native_small_q80_kernel arithmetic: two DP4A in word order, then d0 * d1 * sumi.
+__device__ __forceinline__ float q8_q8_dot(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x, int iqs) {
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) sumi = DP4A(load_int_b2(w->qs, iqs + i), reinterpret_cast<const int*>(x->qs)[iqs + i], sumi);
+    const float d0 = w->d;
+    const float d1 = __low2float(x->ds);
+    return d0 * d1 * float(sumi);
+}
+
 struct Q5Fmt {
     using Block = Q5KBlock;
+    static constexpr int kElems = QK;
     static constexpr int kBlocksPerIter = Q5_VDR * WARPS * WARP / Q5_QI;
     static __device__ __forceinline__ int kqs(int tid) { return Q5_VDR * (tid % (Q5_QI / Q5_VDR)); }
     static __device__ __forceinline__ int kbx0(int tid) { return tid / (Q5_QI / Q5_VDR); }
@@ -182,10 +197,20 @@ struct Q5Fmt {
 };
 struct Q6Fmt {
     using Block = Q6KBlock;
+    static constexpr int kElems = QK;
     static constexpr int kBlocksPerIter = WARPS * WARP / 32;
     static __device__ __forceinline__ int kqs(int tid) { return tid % 32; }
     static __device__ __forceinline__ int kbx0(int tid) { return tid / 32; }
     static __device__ __forceinline__ float dot(const Block* w, const Q81Block* x, int iqs) { return q6_q8_dot(w, x, iqs); }
+};
+// native_small_q80_kernel's mapping (QI 8, two words per thread): its blocks are not 4-byte aligned.
+struct Q8Fmt {
+    using Block = Q80Block;
+    static constexpr int kElems = 32;
+    static constexpr int kBlocksPerIter = 2 * WARPS * WARP / 8;
+    static __device__ __forceinline__ int kqs(int tid) { return 2 * (tid % 4); }
+    static __device__ __forceinline__ int kbx0(int tid) { return tid / 4; }
+    static __device__ __forceinline__ float dot(const Block* w, const Q81Block* x, int iqs) { return q8_q8_dot(w, x, iqs); }
 };
 
 // grid (rows per group, tokens * groups); block (32, 4): one output row per block.
@@ -193,7 +218,7 @@ template <typename F>
 __global__ void __launch_bounds__(WARPS * WARP, 1)
 wo_a_grouped_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y) {
     constexpr int kGroupIn = kAttnGroupIn;
-    constexpr int blocks_per_row = kGroupIn / QK;
+    constexpr int blocks_per_row = kGroupIn / F::kElems;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row = int(blockIdx.x);
     const int tg = int(blockIdx.y);          // token * 8 + group
@@ -202,7 +227,7 @@ wo_a_grouped_kernel(const typename F::Block* __restrict__ w, const Q81Block* __r
     const Q81Block* xc = x + (size_t) tg * (kGroupIn / 32);
     float tmp = 0.0f;
     for (int kbx = F::kbx0(tid); kbx < blocks_per_row; kbx += F::kBlocksPerIter)
-        tmp += F::dot(wg + (size_t) row * blocks_per_row + kbx, xc + kbx * (QK / 32), F::kqs(tid));
+        tmp += F::dot(wg + (size_t) row * blocks_per_row + kbx, xc + kbx * (F::kElems / 32), F::kqs(tid));
     __shared__ float partial[WARPS - 1][WARP];
     if (threadIdx.y > 0) partial[threadIdx.y - 1][threadIdx.x] = tmp;
     __syncthreads();
@@ -219,7 +244,7 @@ template <typename F, int NT>
 __global__ void __launch_bounds__(WARPS * WARP, 1)
 wo_a_grouped_tokens_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y) {
     constexpr int kGroupIn = kAttnGroupIn;
-    constexpr int blocks_per_row = kGroupIn / QK;
+    constexpr int blocks_per_row = kGroupIn / F::kElems;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row = int(blockIdx.x);
     const int g = int(blockIdx.y);
@@ -231,7 +256,7 @@ wo_a_grouped_tokens_kernel(const typename F::Block* __restrict__ w, const Q81Blo
         const typename F::Block* wb = wg + (size_t) row * blocks_per_row + kbx;
 #pragma unroll
         for (int t = 0; t < NT; ++t)
-            tmp[t] += F::dot(wb, x + (size_t) (t * kAttnGroups + g) * (kGroupIn / 32) + kbx * (QK / 32), F::kqs(tid));
+            tmp[t] += F::dot(wb, x + (size_t) (t * kAttnGroups + g) * (kGroupIn / 32) + kbx * (F::kElems / 32), F::kqs(tid));
     }
     __shared__ float partial[WARPS - 1][NT][WARP];
     if (threadIdx.y > 0) {
@@ -250,11 +275,12 @@ wo_a_grouped_tokens_kernel(const typename F::Block* __restrict__ w, const Q81Blo
 }
 
 template <typename F>
-void launch_tokens(const void* wo_a, const void* xq, float* oa, int n_tokens, cudaStream_t s) {
+void launch(const void* wo_a, const void* xq, float* oa, int n_tokens, cudaStream_t s) {
     const dim3 grid(kAttnOutRank, kAttnGroups), block(WARP, WARPS);
     const auto* w = static_cast<const typename F::Block*>(wo_a);
     const auto* x = static_cast<const Q81Block*>(xq);
     switch (n_tokens) {
+        case 1: wo_a_grouped_kernel<F><<<grid, block, 0, s>>>(w, x, oa); break;
         case 2: wo_a_grouped_tokens_kernel<F, 2><<<grid, block, 0, s>>>(w, x, oa); break;
         case 3: wo_a_grouped_tokens_kernel<F, 3><<<grid, block, 0, s>>>(w, x, oa); break;
         case 4: wo_a_grouped_tokens_kernel<F, 4><<<grid, block, 0, s>>>(w, x, oa); break;
@@ -269,19 +295,11 @@ void launch_tokens(const void* wo_a, const void* xq, float* oa, int n_tokens, cu
 
 bool wo_a_grouped(int type, const void* wo_a, const void* xq, float* oa, int n_tokens, void* stream) {
     const auto s = static_cast<cudaStream_t>(stream);
-    if (type != 14 && type != 13) return false;
+    if (type != 14 && type != 13 && type != 8) return false;
     if (n_tokens < 1 || n_tokens > 8) throw std::invalid_argument("wo_a_grouped: tokens");
-    if (n_tokens > 1) {
-        if (type == 14) launch_tokens<Q6Fmt>(wo_a, xq, oa, n_tokens, s);
-        else launch_tokens<Q5Fmt>(wo_a, xq, oa, n_tokens, s);
-    } else {
-        const dim3 grid(kAttnOutRank, kAttnGroups), block(WARP, WARPS);
-        if (type == 14) {
-            wo_a_grouped_kernel<Q6Fmt><<<grid, block, 0, s>>>(static_cast<const Q6KBlock*>(wo_a), static_cast<const Q81Block*>(xq), oa);
-        } else {
-            wo_a_grouped_kernel<Q5Fmt><<<grid, block, 0, s>>>(static_cast<const Q5KBlock*>(wo_a), static_cast<const Q81Block*>(xq), oa);
-        }
-    }
+    if (type == 14) launch<Q6Fmt>(wo_a, xq, oa, n_tokens, s);
+    else if (type == 13) launch<Q5Fmt>(wo_a, xq, oa, n_tokens, s);
+    else launch<Q8Fmt>(wo_a, xq, oa, n_tokens, s);
     if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("wo_a_grouped: launch failed");
     return true;
 }

@@ -15,7 +15,9 @@ namespace K = basalt::kernels;
 
 namespace {
 
-constexpr int kRows = kAttnGroups * kAttnOutRank, kBlocks = kAttnGroupIn / 256;
+constexpr int kRows = kAttnGroups * kAttnOutRank;
+
+const char* type_name(int type) { return type == 14 ? "q6_k" : type == 13 ? "q5_k" : "q8_0"; }
 
 void put_half(uint8_t* p, float v) {
     const __half h = __float2half(v);
@@ -31,14 +33,16 @@ uint64_t fnv(const std::vector<float>& v) {
 cudaStream_t g_stream;
 
 int run(int type, int T, bool bench, dstest::Verdict& v) {
-    const size_t bsz = type == 14 ? 210 : 176;
+    const size_t bsz = type == 14 ? 210 : type == 13 ? 176 : 34;
+    const int elems = type == 8 ? 32 : 256, kBlocks = kAttnGroupIn / elems;
     std::vector<uint8_t> w((size_t) kRows * kBlocks * bsz);
     std::mt19937 g(1234 + type);
     for (auto& b : w) b = (uint8_t) g();
     for (size_t i = 0; i < (size_t) kRows * kBlocks; ++i) {
         uint8_t* b = &w[i * bsz];
         if (type == 14) put_half(b + 208, 0.003f + 0.001f * (float) (g() % 7));
-        else { put_half(b, 0.004f); put_half(b + 2, 0.002f); }
+        else if (type == 13) { put_half(b, 0.004f); put_half(b + 2, 0.002f); }
+        else put_half(b, 0.0002f + 0.0001f * (float) (g() % 7));
     }
     const std::vector<float> attn = dstest::randn((size_t) T * kAttnHeads * kAttnHeadDim, 77 + T);
     Dev<uint8_t> dw(w.size());
@@ -69,8 +73,10 @@ int run(int type, int T, bool bench, dstest::Verdict& v) {
                 double acc = 0;
                 for (int kb = 0; kb < kBlocks; ++kb) {
                     const uint8_t* b = &w[((size_t) (gi * kAttnOutRank + r) * kBlocks + kb) * bsz];
-                    if (type == 14) basalt::dequantize_q6_K(b, wrow.data()); else basalt::dequantize_q5_K(b, wrow.data());
-                    for (int e = 0; e < 256; ++e) acc += (double) wrow[e] * attn[(size_t) (t * kAttnGroups + gi) * kAttnGroupIn + kb * 256 + e];
+                    if (type == 14) basalt::dequantize_q6_K(b, wrow.data());
+                    else if (type == 13) basalt::dequantize_q5_K(b, wrow.data());
+                    else basalt::dequantize_q8_0(b, wrow.data());
+                    for (int e = 0; e < elems; ++e) acc += (double) wrow[e] * attn[(size_t) (t * kAttnGroups + gi) * kAttnGroupIn + kb * elems + e];
                 }
                 const double o = got[(size_t) t * kAttnGroups * kAttnOutRank + (size_t) gi * kAttnOutRank + r];
                 se += (o - acc) * (o - acc);
@@ -82,7 +88,7 @@ int run(int type, int T, bool bench, dstest::Verdict& v) {
     if (bench && T > 1) {
         const double us_t = dstest::bench_stream_us([&](void* s) { wo_a_grouped(type, dw.p, xq.p, oa_new.p, T, s); });
         char name[64];
-        std::snprintf(name, sizeof name, "wo_a grouped %s T=%d", type == 14 ? "q6_k" : "q5_k", T);
+        std::snprintf(name, sizeof name, "wo_a grouped %s T=%d", type_name(type), T);
         dstest::bench_line(name, us_t, (double) w.size());
     }
     if (bench && T == 1) {
@@ -93,8 +99,11 @@ int run(int type, int T, bool bench, dstest::Verdict& v) {
                                oa_ref.p + (size_t) gi * kAttnOutRank, kAttnGroupIn, kAttnOutRank, 1, s);
         });
         const double bytes = (double) w.size();
-        dstest::bench_line(type == 14 ? "wo_a grouped q6_k T=1" : "wo_a grouped q5_k T=1", us_new, bytes);
-        dstest::bench_line(type == 14 ? "wo_a 8x native q6_k T=1" : "wo_a 8x native q5_k T=1", us_old, bytes);
+        char name[64];
+        std::snprintf(name, sizeof name, "wo_a grouped %s T=1", type_name(type));
+        dstest::bench_line(name, us_new, bytes);
+        std::snprintf(name, sizeof name, "wo_a 8x native %s T=1", type_name(type));
+        dstest::bench_line(name, us_old, bytes);
     }
     return 0;
 }
@@ -104,7 +113,7 @@ int run(int type, int T, bool bench, dstest::Verdict& v) {
 int main() {
     dstest::check(cudaStreamCreate(&g_stream), "stream");
     dstest::Verdict v;
-    for (int type : {14, 13})
+    for (int type : {14, 13, 8})
         for (int T : {1, 2, 3, 4, 8}) run(type, T, true, v);
     std::printf(v.failures ? "FAILED\n" : "PASS\n");
     return v.failures ? 1 : 0;
