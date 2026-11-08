@@ -1,11 +1,13 @@
-// tests/kernels/iq1s_parity.cpp - IQ1_S (and the IQ2_XXS / IQ1_S expert pairs of a limited-SwiGLU MoE) on the GPU and
-// CPU expert paths, at the real expert geometry (hidden 5120, FF 2304), against a CPU double reference.
+// tests/kernels/iq1s_parity.cpp - IQ1_S (and the IQ2_XXS / IQ1_S and NVFP4 expert pairs of a limited-SwiGLU MoE) on the GPU
+// and CPU expert paths, at the real expert geometry (hidden 5120, FF 2304), against a CPU double reference.
 //
 //     build/iq1s_parity            the checks (a ctest; needs the GPU)
 //     build/iq1s_parity --cpu      the CPU tier only (no GPU needed)
 //     build/iq1s_parity --bench    the checks, then a microbench line per kernel
 //
-// Random bytes are valid IQ1_S / IQ2_XXS codes (every grid index is in range); only the fp16 block scales are set.
+// Random bytes are valid IQ1_S / IQ2_XXS codes (every grid index is in range); only the fp16 block scales are set.  NVFP4
+// experts are ggml's NVFP4 rounding of normal values with an FP32 scale tail {s_gate, s_up, s_down, 0}, which the
+// reference applies to the dequantized weights.
 // Reference: the weights dequantized with the ggml row dequantizer, the activation as the kernel sees it (q8_1 or
 // Q8_K blocks dequantized), accumulated in double; the SwiGLU limit applied in double.  The GPU / CPU outputs of one
 // entry must not depend on the window: the same entry alone, in a window and at another position is bitwise equal.
@@ -121,15 +123,48 @@ std::vector<double> ref_expert(const std::vector<float>& wg, const std::vector<f
     return out;
 }
 
-const char* nm(int t) { return t == 19 ? "IQ1_S" : t == 16 ? "IQ2_XXS" : t == 17 ? "IQ2_XS" : t == 22 ? "IQ2_S" : t == 29 ? "IQ1_M" : "?"; }
+const char* nm(int t) {
+    return t == 19 ? "IQ1_S" : t == 16 ? "IQ2_XXS" : t == 17 ? "IQ2_XS" : t == 22 ? "IQ2_S" : t == 29 ? "IQ1_M" : t == 40 ? "NVFP4" : "?";
+}
 
 struct Expert {
-    std::vector<uint8_t> blob;          // [gate | up | down]
-    std::vector<float> wg, wu, wd;      // dequantized
+    std::vector<uint8_t> blob;          // [gate | up | down] (NVFP4: and the scale tail)
+    std::vector<float> wg, wu, wd;      // dequantized (NVFP4: times the tail's scales)
+    float tail[3] = {1.f, 1.f, 1.f};
 };
+
+// NVFP4 rows: ggml's rounding of N(0, sd) values
+std::vector<uint8_t> nvfp4_rows(int64_t rows, int64_t n, float sd, std::mt19937& rng) {
+    std::vector<uint8_t> w((size_t) rows * ggml_row_size(GGML_TYPE_NVFP4, n));
+    std::vector<float> x((size_t) n);
+    std::normal_distribution<float> nd(0.f, sd);
+    const size_t rb = ggml_row_size(GGML_TYPE_NVFP4, n);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (auto& v : x) v = nd(rng);
+        ggml_get_type_traits(GGML_TYPE_NVFP4)->from_float_ref(x.data(), w.data() + (size_t) r * rb, n);
+    }
+    return w;
+}
 
 Expert make_expert(int gu, int d, std::mt19937& rng) {
     Expert e;
+    if (gu == GGML_TYPE_NVFP4) {   // gate/up outputs around the limit; s_gate, s_up and s_down in the tail
+        auto g = nvfp4_rows(FF, H, 0.1f, rng), u = nvfp4_rows(FF, H, 0.1f, rng), dn = nvfp4_rows(H, FF, 0.1f, rng);
+        std::uniform_real_distribution<float> ts(0.9f, 1.6f);
+        const float t4[4] = {ts(rng), ts(rng), 0.02f * ts(rng), 0.f};
+        e.wg = dequant(gu, g.data(), FF, H);
+        e.wu = dequant(gu, u.data(), FF, H);
+        e.wd = dequant(d, dn.data(), H, FF);
+        for (auto& v : e.wg) v *= t4[0];
+        for (auto& v : e.wu) v *= t4[1];
+        for (auto& v : e.wd) v *= t4[2];
+        e.blob = g;
+        e.blob.insert(e.blob.end(), u.begin(), u.end());
+        e.blob.insert(e.blob.end(), dn.begin(), dn.end());
+        e.blob.insert(e.blob.end(), (const uint8_t*) t4, (const uint8_t*) t4 + 16);
+        std::copy(t4, t4 + 3, e.tail);
+        return e;
+    }
     const float gs = gu == 19 ? 0.02f : 0.002f;       // block scales: gate/up outputs that reach the SwiGLU limit
     const float ds = d == 19 ? 0.002f : 0.0005f;
     auto g = random_rows(gu, FF, H, gs, rng), u = random_rows(gu, FF, H, gs, rng), dn = random_rows(d, H, FF, ds, rng);
@@ -197,6 +232,10 @@ void cpu_pair(int gu, int d, std::mt19937& rng) {
                 float g = 0, u = 0;
                 dot(H, &g, 0, e.blob.data() + (size_t) r * f.gu_row, 0, act[t].data(), 0, 1);
                 dot(H, &u, 0, e.blob.data() + f.up_off + (size_t) r * f.gu_row, 0, act[t].data(), 0, 1);
+                if (f.tail) {
+                    g *= e.tail[0];
+                    u *= e.tail[1];
+                }
                 g = std::fmin(g, kLimit);
                 u = std::fmax(std::fmin(u, kLimit), -kLimit);
                 const float want = (g / (1.f + std::exp(-g))) * u;
@@ -216,6 +255,7 @@ void cpu_pair(int gu, int d, std::mt19937& rng) {
             for (int r = 0; r < H; r += 11) {
                 float s = 0;
                 dot(FF, &s, 0, e.blob.data() + f.down_off + (size_t) r * f.d_row, 0, hq[t].data(), 0, 1);
+                if (f.tail) s *= e.tail[2];
                 same_ggml = same_ggml && std::memcmp(&s, &out[t][r], 4) == 0;
             }
     }
@@ -521,7 +561,7 @@ void gpu_pair(int gu, int d, bool bench, cudaStream_t s) {
                 differ > 0 ? "yes" : "NO", lay_same ? "yes" : "NO", ok ? "ok" : "FAIL");
     if (!ok) ++g_fail;
 
-    if (bench && (gu == 19 || gu == GGML_TYPE_IQ1_M || d == GGML_TYPE_IQ1_M)) {
+    if (bench && (gu == 19 || gu == GGML_TYPE_IQ1_M || d == GGML_TYPE_IQ1_M || gu == GGML_TYPE_NVFP4)) {
         Call one;   // a decode step: one token, six experts
         for (int k = 0; k < K; ++k) { one.tok.push_back(0); one.exp.push_back(k); }
         const int n = K;
@@ -706,6 +746,7 @@ int main(int argc, char** argv) {
     cpu_pair(17, 29, rng);
     cpu_pair(29, 16, rng);
     cpu_pair(17, 16, rng);
+    cpu_pair(40, 40, rng);   // NVFP4 experts
 #ifdef BASALT_IQ1S_GPU
     if (!cpu_only) {
         cudaStream_t s;
@@ -722,6 +763,7 @@ int main(int argc, char** argv) {
         gpu_pair(17, 29, bench, s);
         gpu_pair(29, 16, bench, s);
         gpu_pair(17, 16, bench, s);
+        gpu_pair(40, 40, bench, s);
     }
 #else
     (void) cpu_only;

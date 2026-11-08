@@ -70,6 +70,19 @@ std::vector<uint8_t> random_rows(int type, int64_t rows, int64_t n, float scale,
     return w;
 }
 
+// NVFP4 rows: ggml's rounding of N(0, sd) values
+std::vector<uint8_t> nvfp4_rows(int64_t rows, int64_t n, float sd, std::mt19937& rng) {
+    const size_t rb = ggml_row_size(GGML_TYPE_NVFP4, n);
+    std::vector<uint8_t> w((size_t) rows * rb);
+    std::vector<float> x((size_t) n);
+    std::normal_distribution<float> nd(0.f, sd);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (auto& v : x) v = nd(rng);
+        ggml_get_type_traits(GGML_TYPE_NVFP4)->from_float_ref(x.data(), w.data() + (size_t) r * rb, n);
+    }
+    return w;
+}
+
 template <class T>
 T* dalloc(size_t n) {
     void* p = nullptr;
@@ -77,16 +90,26 @@ T* dalloc(size_t n) {
     return (T*) p;
 }
 
-const char* nm(int t) { return t == GGML_TYPE_IQ2_XXS ? "IQ2_XXS" : t == GGML_TYPE_IQ2_XS ? "IQ2_XS" : t == GGML_TYPE_IQ1_M ? "IQ1_M" : "?"; }
+const char* nm(int t) {
+    return t == GGML_TYPE_IQ2_XXS ? "IQ2_XXS" : t == GGML_TYPE_IQ2_XS ? "IQ2_XS" : t == GGML_TYPE_IQ1_M ? "IQ1_M"
+         : t == GGML_TYPE_NVFP4 ? "NVFP4" : "?";
+}
 
 void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaStream_t s) {
     std::mt19937 rng(700 + gu * 7 + d);
     const kg::NativeExpertLayout L = kg::native_expert_layout(gu, d, H, FF);
     std::vector<std::vector<uint8_t>> blob;
     for (int b = 0; b < NB; ++b) {
-        auto g = random_rows(gu, FF, H, 0.002f, rng), u = random_rows(gu, FF, H, 0.002f, rng), dn = random_rows(d, H, FF, 0.0005f, rng);
+        const bool fp4 = gu == GGML_TYPE_NVFP4;   // NVFP4: ggml-rounded rows and the scale tail {s_gate, s_up, s_down, 0}
+        auto g = fp4 ? nvfp4_rows(FF, H, 0.1f, rng) : random_rows(gu, FF, H, 0.002f, rng);
+        auto u = fp4 ? nvfp4_rows(FF, H, 0.1f, rng) : random_rows(gu, FF, H, 0.002f, rng);
+        auto dn = fp4 ? nvfp4_rows(H, FF, 0.1f, rng) : random_rows(d, H, FF, 0.0005f, rng);
         g.insert(g.end(), u.begin(), u.end());
         g.insert(g.end(), dn.begin(), dn.end());
+        if (fp4) {
+            const float t4[4] = {1.3f, 1.1f, 0.02f, 0.f};
+            g.insert(g.end(), (const uint8_t*) t4, (const uint8_t*) t4 + 16);
+        }
         check(g.size() == L.bytes, "layout bytes");
         blob.push_back(std::move(g));
     }
@@ -216,10 +239,11 @@ int main(int argc, char** argv) {
     for (int i = 0; i < H; ++i) h_x[i] = nd(rng);
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
-    // the format pairs a GSQ-RCO pack mixes
+    // the format pairs a GSQ-RCO pack mixes, and NVFP4
     const int pairs[][2] = {{GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_M},   {GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS}, {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M},
                             {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS}, {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS}, {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ1_M},
-                            {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS},  {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS}};
+                            {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS},  {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS},
+                            {GGML_TYPE_NVFP4, GGML_TYPE_NVFP4}};
     for (const auto& p : pairs) one_pair(p[0], p[1], bench, h_x, h_rows, s);
     cudaStreamDestroy(s);
     cudaFreeHost(h_x);
