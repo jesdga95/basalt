@@ -89,6 +89,21 @@ class Http(unittest.TestCase):
         self.assertEqual(set(m["hardware_static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
         self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
 
+    def test_the_expert_total_is_reported_with_or_without_spill(self):
+        self.engine.info = {"expert_slots": 24576, "spill_experts": 0, "spill_total": 24576, "spill_bytes": 0}
+        e = self.call("/metrics")[1]["engine"]
+        self.assertEqual((e["expert_slots"], e["expert_total"], e["spill"]), (24576, 24576, None))
+        self.engine.info = {"expert_slots": 9, "spill_experts": 320, "spill_total": 15360, "spill_bytes": 5}
+        e = self.call("/metrics")[1]["engine"]
+        self.assertEqual((e["expert_total"], e["spill"]["experts"]), (15360, 320))
+        self.engine.info = {"expert_slots": 9}                       # an engine that reports no total
+        self.assertIsNone(self.call("/metrics")[1]["engine"]["expert_total"])
+
+    def test_the_experts_card_reads_the_engine_when_there_is_no_ledger(self):
+        js = (TEMPLATE.parent / "web/app.js").read_text(encoding="utf-8")
+        self.assertIn("eng.expert_slots >= eng.expert_total", js)
+        self.assertIn("All in VRAM", js)
+
     def test_the_context_stays_through_a_restart(self):
         self.engine.max_context, self.engine.known_ctx = 0, 16384    # a start under way: no READY yet
         self.assertEqual(self.call("/metrics")[1]["engine"]["max_context"], 16384)

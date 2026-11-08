@@ -646,10 +646,11 @@ class Service:
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if busy else None}
         info = dict(getattr(self.engine, "info", {}) or {})
+        experts_total = info.get("spill_total")          # every routed (layer, expert) pair, on the SSD or not
         spill = spill_of(info)
         # a start under way reads 0; the last READY's context stands in until the new one arrives
         engine = {"model": self.model, "max_context": self.engine.max_context or getattr(self.engine, "known_ctx", 0), **info,
-                  "spill": spill}
+                  "spill": spill, "expert_total": experts_total if isinstance(experts_total, int) else None}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
         with self.status_lock:
