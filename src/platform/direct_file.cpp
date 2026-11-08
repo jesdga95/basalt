@@ -2,6 +2,7 @@
 #include "basalt/platform/direct_file.hpp"
 
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/host_allocator.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -29,6 +30,10 @@ double now_us() {
 }
 
 void* DirectFile::alloc_aligned(size_t bytes) {
+    if (const auto* hooks = host_allocator_hooks.load(std::memory_order_acquire)) {
+        try { return hooks->allocate(bytes, alignment()); }
+        catch (const std::bad_alloc&) { return nullptr; }
+    }
 #if defined(_WIN32)
     // A fresh VirtualAlloc block starts at an allocation granularity boundary, so it satisfies the unbuffered
     // contract without the cache manager ever having held these pages.
@@ -41,6 +46,8 @@ void* DirectFile::alloc_aligned(size_t bytes) {
 
 void DirectFile::free_aligned(void* p) {
     if (p == nullptr) return;
+    if (const auto* hooks = host_allocator_hooks.load(std::memory_order_acquire))
+        if (hooks->release(p)) return;
 #if defined(_WIN32)
     VirtualFree(p, 0, MEM_RELEASE);
 #else
