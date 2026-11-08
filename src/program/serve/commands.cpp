@@ -181,6 +181,80 @@ Flow Runtime::dispatch() {
         std::fflush(stdout);
         return Flow::next;
     }
+    // THREAD_* commands own only a disposable, bounded token tape in this engine epoch.
+    // GPU KV restoration remains subject to the exact token/picture prefix checks in
+    // Request::restore; a caller-supplied head is never an authorization to use KV.
+    if (line.rfind("THREAD_", 0) == 0) {
+        std::istringstream in(line);
+        std::string command, id, head, extra;
+        in >> command >> id;
+        auto parse_ids = [&](const std::string& csv, std::vector<int32_t>& ids) {
+            std::vector<int64_t> parsed;
+            std::string e;
+            if (!cli::parse_i64_list(csv.c_str(), parsed, e)) return false;
+            ids.clear();
+            for (int64_t t : parsed) {
+                if (t < 0 || t >= n_vocab) return false;
+                ids.push_back((int32_t) t);
+            }
+            return !ids.empty();
+        };
+        if (command == "THREAD_ATTACH" || command == "THREAD_APPEND") {
+            std::string csv, new_head;
+            in >> head;
+            if (command == "THREAD_APPEND") in >> new_head;
+            in >> csv;
+            if (in >> extra || !NativeThreadTapes::valid_name(id) ||
+                !NativeThreadTapes::valid_name(head) ||
+                (command == "THREAD_APPEND" && !NativeThreadTapes::valid_name(new_head))) {
+                std::printf("ERR THREAD: bad identity or arguments\\n");
+                std::fflush(stdout);
+                return Flow::next;
+            }
+            std::vector<int32_t> ids;
+            if (!parse_ids(csv, ids)) {
+                std::printf("ERR THREAD: invalid token ids\\n");
+                std::fflush(stdout);
+                return Flow::next;
+            }
+            const auto r = command == "THREAD_ATTACH"
+                ? thread_tapes.attach(id, head, ids, (size_t) o.max_context, n_vocab)
+                : thread_tapes.append(id, head, new_head, ids, (size_t) o.max_context, n_vocab);
+            if (!r.ok) std::printf("ERR THREAD: %s\\n", r.why);
+            else std::printf("THREAD_OK %s %s\\n", command.c_str(), id.c_str());
+            std::fflush(stdout);
+            return Flow::next;
+        }
+        if (command == "THREAD_RELEASE") {
+            if (in >> extra || !NativeThreadTapes::valid_name(id))
+                std::printf("ERR THREAD: bad release identity\\n");
+            else
+                std::printf("THREAD_OK THREAD_RELEASE %s %d\\n", id.c_str(), thread_tapes.release(id) ? 1 : 0);
+            std::fflush(stdout);
+            return Flow::next;
+        }
+        if (command == "THREAD_GENERATE") {
+            long long max_new = 0;
+            in >> head >> max_new;
+            const auto* ids = thread_tapes.get(id, head);
+            if (in >> extra || !NativeThreadTapes::valid_name(id) || !ids ||
+                max_new < 1 || max_new >= o.max_context) {
+                std::printf("ERR THREAD: invalid generate or stale thread head\\n");
+                std::fflush(stdout);
+                return Flow::next;
+            }
+            std::lock_guard<std::mutex> lk(gent_mu);
+            const uint64_t seq = ++gent_seq;
+            gent_ids[seq] = *ids; // only an in-process copy, never a second IPC transfer
+            while (gent_ids.size() > 8) gent_ids.erase(gent_ids.begin());
+            line = "GEN " + std::to_string(max_new) + " @" + std::to_string(seq);
+            // Fall through into existing Request execution and exact prefix/KV verification.
+        } else {
+            std::printf("ERR THREAD: unknown or unsupported native command\\n");
+            std::fflush(stdout);
+            return Flow::next;
+        }
+    }
     if (line.rfind("ERR_GENT ", 0) == 0) {
         std::printf("ERR %s\n", line.c_str() + 9);
         std::fflush(stdout);
