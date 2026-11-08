@@ -29,6 +29,17 @@ int main() {
         // an unplaced expert without a RAM copy does not count either
         CHECK(image_lend_floor({-1, 3}, {0, 1}, 10) == 0);
     }
+    // Temporary copies open exactly the missing tail, then releasing them restores the old floor.
+    {
+        std::vector<int32_t> slots(1000);
+        std::vector<uint8_t> ram(1000, 0);
+        for (int i = 0; i < 1000; ++i) { slots[i] = i; ram[i] = i >= 566; }
+        CHECK(1000 - image_lend_floor(slots, ram, 1000) == 434);
+        for (int i = 534; i < 566; ++i) ram[i] = 1;
+        CHECK(1000 - image_lend_floor(slots, ram, 1000) == 466);
+        for (int i = 534; i < 566; ++i) ram[i] = 0;
+        CHECK(1000 - image_lend_floor(slots, ram, 1000) == 434);
+    }
     // idle sessions first, largest spare first; never below keep or the floor; nothing spare is left out
     {
         std::vector<KvHold> h(4);
