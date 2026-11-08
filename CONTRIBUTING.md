@@ -21,6 +21,7 @@ Basalt is an engine for mixture-of-experts models on NVIDIA Blackwell GPUs. Ever
 - **Logic exists once.** What two models need lives in shared code and takes each model's numbers as parameters. Follow the existing pattern before adding a new one.
 - **One serving loop** runs every request of every model; a model plugs into it and never forks it. See [persistent serving](src/program/serve/README.md).
 - **The engine does the work, the server serves.** Tokenizing and per-request work run in C++. `serve/` parses, routes and streams, names no model, and never repairs model output; constrained decoding (grammar) handles structure.
+- **Build structure: no slow TU.** A clean Release build must finish in under 10 minutes on 32 threads, and nvcc compiles a translation unit on one core, so the build takes as long as its slowest `.cu`. Keep every `.cu` to about a minute or two alone: a kernel that is instantiated in several variants (like `dm_peer_kernel`) gets one `.cu` per variant, behind a getter that returns its address (no relocatable device code), and shared device code goes in a header with no kernel in it. A `.cu` does not include another `.cu` (`tools/check_cu_includes.sh` fails on a new one; `tools/cu_includes.allow` lists the few that must inline). Time a new or changed `.cu` alone (`nvcc --time`) and report it with the change.
 
 ## What every change must include
 
