@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/native_head.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/direct_upload.hpp"
@@ -158,7 +159,7 @@ const NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
     if (hot_) cudaFree(hot_);
-    if (host_) cudaFreeHost(host_);
+    if (host_) basalt::core::release_pinned_host(host_);
     else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
 }
 
@@ -186,7 +187,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             return false;
         }
         basalt::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
-        if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        if (basalt::core::allocate_pinned_host(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
             // themselves (three cards). The table is only gathered from, so keep it in the current device's VRAM
             // instead: it costs its size there and reads faster than over PCIe.
