@@ -16,6 +16,8 @@ on more GPUs). The server speaks the OpenAI and Anthropic APIs. Website: [basalt
 
 ## Quick start
 
+Prebuilt Linux and Windows archives are attached to each [release](https://github.com/jesdga95/basalt/releases) ([what they need](docs/platforms.md#release-archives)); otherwise build from source:
+
 ```sh
 git clone https://github.com/jesdga95/basalt && cd basalt
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
