@@ -1,4 +1,5 @@
 #include "basalt/core/expert_source.hpp"
+#include "basalt/core/host_arena.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
@@ -47,6 +48,23 @@ struct TempDirectory {
         std::error_code ignored;
         fs::remove_all(path, ignored);
     }
+};
+
+struct FixedReadPool {
+    std::vector<uint8_t> backing{std::vector<uint8_t>(16u << 20)};
+    basalt::core::HostArena arena;
+    inline static FixedReadPool* active = nullptr;
+    const basalt::platform::HostAllocatorHooks hooks{
+        [](size_t n, size_t a) -> void* { return active->arena.allocate(n, a); },
+        [](void* p) { return active->arena.owns(p) && active->arena.release(p); },
+        []() -> uint64_t { const auto s = active->arena.stats(); return s.capacity - s.used; }
+    };
+    FixedReadPool() {
+        require(arena.reset(backing.data(), backing.size()), "cannot open fixed read pool");
+        active = this;
+        basalt::platform::host_allocator_hooks.store(&hooks);
+    }
+    ~FixedReadPool() { basalt::platform::host_allocator_hooks.store(nullptr); active = nullptr; }
 };
 
 void create_experts(const fs::path& dir, uint64_t bytes, const std::vector<std::pair<uint64_t, char>>& markers = {}) {
@@ -172,6 +190,43 @@ void test_native_variable_layout() {
     const uint8_t* reopened = source.blob(1, 0);
     require(reopened && source.reads() == 1 && reopened[0] == 'c', "reopened native source kept stale state");
     source.close();
+    {
+        FixedReadPool pool;
+        {
+            FileExpertSource pooled;
+            require(pooled.open(FileRange((dir.path / "experts.bin").string()), layers, experts, err), err);
+            const auto live = pool.arena.stats();
+            require(live.used > 0 && live.peak <= live.capacity, "direct read stage is not pool-owned");
+            const uint8_t* held = pooled.blob(1, 0);
+            require(held && held[0] == 'c', "pooled mapped blob changed bytes");
+            const uint64_t repeat = (3ull << 30) / std::min(first_fmt.bytes, second_fmt.bytes) + 1;
+            for (uint64_t i = 0; i < repeat; ++i) {
+                const uint8_t* other = pooled.blob(i % layers, i % experts);
+                require(other != nullptr, "pooled mapped lookup failed");
+                (void) *static_cast<const volatile uint8_t*>(other);
+            }
+            require(pooled.file_cache_trims() > 0, "mapped read window never returned file pages");
+            pooled.trim_file_cache();
+            require(pooled.file_cache_trims() > 0 && held[0] == 'c',
+                    "trimming file pages invalidated a held blob pointer");
+            require(pool.arena.stats().used == live.used, "mapped reads grew the fixed pool");
+            const std::pair<int32_t, int32_t> advise{1, 0};
+            require(!pooled.advise_pairs(&advise, 1), "fixed pool enabled unbounded expert read-ahead");
+            for (int64_t layer = 0; layer < layers; ++layer) {
+                const size_t n = layer == 0 ? first_fmt.bytes : second_fmt.bytes;
+                basalt::platform::HostVector<uint8_t> out(n);
+                for (int64_t expert = 0; expert < experts; ++expert) {
+                    std::fill(out.begin(), out.end(), 0);
+                    out[0] = layer == 1 && expert == 0 ? 'c' : 0;
+                    require(pooled.equals_file(layer, expert, out.data()),
+                            "pool direct read changed bytes or failed on an unaligned EOF tail");
+                    out.back() ^= 1;
+                    require(!pooled.equals_file(layer, expert, out.data()), "direct read missed a changed byte");
+                }
+            }
+        }
+        require(pool.arena.stats().used == 0, "direct read stage did not return to the fixed pool");
+    }
 }
 
 // Unbuffered bulk reads of blobs whose sizes and offsets are not multiples of the read alignment, with staging
@@ -478,6 +533,11 @@ void test_host_memory() {
     put("fs/box/memory.current", std::to_string(16 * GiB) + "\n");
     put("fs/box/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
     require(probe("0::/box\n") && m.available == 36 * GiB - 48 * GiB / 64 && m.cgroup_limit == 48 * GiB, "v2 limit");
+    require(m.cgroup_available == 32 * GiB, "raw cgroup headroom excludes reclaim estimates and margins");
+    put("meminfo", "MemAvailable: " + std::to_string(8 * GiB / 1024) + " kB\n");
+    require(probe("0::/box\n") && m.available == 8 * GiB && m.cgroup_available == 32 * GiB,
+            "physical reclaim estimate must not replace the allocation budget");
+    put("meminfo", "MemAvailable: " + std::to_string(100 * GiB / 1024) + " kB\n");
     put("fs/box/memory.max", "max\n");
     require(probe("0::/box\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v2 max");
     put("fs/box/memory.max", "48G\n");
