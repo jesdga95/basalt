@@ -5,6 +5,7 @@
 // live end is a reply past it, the directory kept to its budget, and only a chat's root and last three turn-end states
 // written (a cut at a state not written goes back to the nearest one before it, refcounts of a shared root kept).
 #include "basalt/core/conversation_store.hpp"
+#include "basalt/core/host_arena.hpp"
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/system.hpp"
@@ -19,6 +20,11 @@
 using namespace basalt::core;
 
 namespace {
+HostArena* fixed_arena = nullptr;
+void* fixed_allocate(size_t bytes, size_t alignment) { return fixed_arena->allocate(bytes, alignment); }
+bool fixed_release(void* p) { return fixed_arena->owns(p) && fixed_arena->release(p); }
+uint64_t fixed_available() { const auto s = fixed_arena->stats(); return s.capacity - s.used; }
+const basalt::platform::HostAllocatorHooks fixed_hooks{fixed_allocate, fixed_release, fixed_available};
 int failures = 0;
 #define CHECK(c)                                                                 \
     do {                                                                         \
@@ -442,6 +448,66 @@ int main() {
         CHECK(st.load(m, got, err));
         CHECK(same_state(got.live, sb.checkpoints[1]) && same_state(got.checkpoints[0], sa.checkpoints[0]));
         remove_dir(d3);
+    }
+    {   // A fixed pool cannot queue another copy: write one owned image and preserve it if disk admission fails.
+        const std::string sync_dir = dir + "-sync";
+        ConversationStore st;
+        std::string error;
+        CHECK(st.open(sync_dir, id, 1ull << 30, error));
+        SavedConversation copy = src;
+        CHECK(st.put_sync(copy));
+        CHECK(copy.live.ids.empty());
+        CHECK(st.queued_bytes() == 0 && st.holds(src.live.ids, src.live.imgs, src.cvec));
+        auto prompt = src.live.ids; prompt.push_back(-1);
+        const auto match = st.best(prompt.data(), prompt.size(), src.live.imgs, src.cvec);
+        SavedConversation restored;
+        CHECK(match.tokens > 0 && st.load(match, restored, error));
+        CHECK(restored.live.ids == src.live.ids && same_state(restored.live, src.live));
+        remove_dir(sync_dir);
+        const std::string full_dir = dir + "-sync-full";
+        ConversationStore full;
+        CHECK(full.open(full_dir, id, 1, error));
+        SavedConversation retained = src;
+        CHECK(!full.put_sync(retained));
+        CHECK(retained.live.ids == src.live.ids && same_state(retained.live, src.live));
+        CHECK(full.queued_bytes() == 0);
+        remove_dir(full_dir);
+    }
+    {   // Overflow goes to files without a second RAM backing, and a failed read leaves the saved state intact.
+        (void) CheckpointBytes::allocator_type::release_pooled();
+        std::vector<uint8_t> backing(96u << 20);
+        HostArena arena;
+        CHECK(arena.reset(backing.data(), backing.size())); fixed_arena = &arena;
+        basalt::platform::host_allocator_hooks.store(&fixed_hooks);
+        const std::string fixed_dir = dir + "-fixed-pool";
+        {
+            ConversationStore st;
+            std::string error;
+            CHECK(st.open(fixed_dir, id, 1ull << 30, error));
+            SavedConversation copy = src;
+            ConversationCache ram(1, 1);
+            CHECK(!ram.put(std::move(copy)) && !copy.live.ids.empty());
+            CHECK(st.put_sync(copy) && copy.live.ids.empty());
+            (void) CheckpointBytes::allocator_type::release_pooled();
+            auto prompt = src.live.ids; prompt.push_back(-1);
+            const auto match = st.best(prompt.data(), prompt.size(), src.live.imgs, src.cvec);
+            CHECK(match.tokens == (int64_t) src.live.ids.size());
+            std::vector<void*> ballast;
+            while (void* p = arena.allocate(1u << 20)) ballast.push_back(p);
+            SavedConversation restored;
+            CHECK(!st.load(match, restored, error));
+            CHECK(st.holds(src.live.ids, src.live.imgs, src.cvec));
+            CHECK(arena.stats().used <= backing.size() && arena.stats().capacity == backing.size());
+            for (void* p : ballast) CHECK(arena.release(p));
+            (void) CheckpointBytes::allocator_type::release_pooled();
+            CHECK(st.load(match, restored, error));
+            CHECK(restored.live.ids == src.live.ids && same_state(restored.live, src.live));
+            CHECK(arena.stats().peak <= backing.size());
+        }
+        (void) CheckpointBytes::allocator_type::release_pooled();
+        CHECK(arena.stats().used == 0);
+        basalt::platform::host_allocator_hooks.store(nullptr); fixed_arena = nullptr;
+        remove_dir(fixed_dir);
     }
     std::vector<basalt::platform::DirFile> left;
     if (basalt::platform::list_files(dir, left))
