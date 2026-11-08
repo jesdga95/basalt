@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "state.hpp"
 #include "layout.hpp"
 #include "basalt/prefill/prefill.hpp"
@@ -16,12 +17,12 @@ bool Prefill::reserve_hand_off(int64_t rows, std::string& err) {
     Impl& m = *impl_;
     if (m.hand[0] != nullptr && m.hand[1] != nullptr && m.hand_rows >= rows) return true;
     for (int b = 0; b < 2; ++b) {
-        if (m.hand[b] != nullptr) cudaFreeHost(m.hand[b]);
+        if (m.hand[b] != nullptr) basalt::core::release_pinned_host(m.hand[b]);
         m.hand[b] = nullptr;
     }
     m.hand_rows = 0;
     for (int b = 0; b < 2; ++b)
-        if (cudaHostAlloc((void**) &m.hand[b], (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+        if (basalt::core::allocate_pinned_host((void**) &m.hand[b], (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             (void) cudaGetLastError();
             err = "prefill: the layer split's hand-off buffers";
             return false;
