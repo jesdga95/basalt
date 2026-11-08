@@ -33,7 +33,7 @@ pub fn request_hash(canonical_bytes: &[u8]) -> [u8; 32] {
 pub async fn accept_turn(
     db: &PgPool, owner: Uuid, thread: Uuid, branch: Uuid,
     parent: Option<Uuid>, expected_version: i64,
-    key: &str, hash: [u8;32],
+    key: &str, hash: [u8;32], input: &serde_json::Value,
 ) -> Result<AcceptedTurn, LedgerError> {
     if key.is_empty() || key.len() > 256 || expected_version < 0 {
         return Err(LedgerError::Conflict);
@@ -92,6 +92,14 @@ pub async fn accept_turn(
         AcceptedTurn {turn_id:row.try_get("id")?, existing:true,
             status:row.try_get("status")?, committed_message_id:row.try_get("committed_message_id")?}
     };
+    if !result.existing {
+        let encoded = serde_json::to_vec(input).map_err(|_| LedgerError::Conflict)?;
+        let input_digest = request_hash(&encoded);
+        sqlx::query("INSERT INTO turn_inputs(turn_id,role,content,content_hash)
+                     VALUES($1,'user',$2,$3)")
+            .bind(new_id).bind(input).bind(input_digest.as_slice())
+            .execute(&mut *tx).await?;
+    }
     tx.commit().await?;
     Ok(result)
 }
@@ -99,14 +107,15 @@ pub async fn accept_turn(
 /// The database function checks the current lease, fencing token and branch CAS.
 /// A failed function call rolls back both message insertion and HEAD movement.
 pub async fn commit_turn(
-    db: &PgPool, turn: Uuid, run: Uuid, fencing: i64, message: Uuid,
-    role: &str, content: &serde_json::Value, model: Option<&str>,
+    db: &PgPool, turn: Uuid, run: Uuid, fencing: i64,
+    user_message: Uuid, assistant_message: Uuid,
+    content: &serde_json::Value, model: Option<&str>,
 ) -> Result<Uuid, LedgerError> {
     let serialized = serde_json::to_vec(content).map_err(|_| LedgerError::Conflict)?;
-    let digest = Sha256::digest(serialized);
+    let digest = request_hash(&serialized);
     let row = sqlx::query_scalar::<_, Uuid>(
-        "SELECT commit_thread_turn($1,$2,$3,$4,$5,$6,$7,$8)"
-    ).bind(turn).bind(run).bind(fencing).bind(message).bind(role)
+        "SELECT commit_thread_exchange($1,$2,$3,$4,$5,$6,$7,$8)"
+    ).bind(turn).bind(run).bind(fencing).bind(user_message).bind(assistant_message)
         .bind(content).bind(digest.as_slice()).bind(model)
         .fetch_one(db).await?;
     Ok(row)
