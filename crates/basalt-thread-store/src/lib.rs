@@ -10,7 +10,12 @@ pub enum LedgerError {
     Database(sqlx::Error),
 }
 impl From<sqlx::Error> for LedgerError {
-    fn from(value: sqlx::Error) -> Self { Self::Database(value) }
+    fn from(value: sqlx::Error) -> Self {
+        match &value {
+            sqlx::Error::Database(e) if e.code().as_deref()==Some("40001") => Self::Conflict,
+            _ => Self::Database(value),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
