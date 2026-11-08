@@ -1310,7 +1310,8 @@ uint64_t FileExpertSource::top_up(const std::vector<std::pair<int32_t, int32_t>>
                                   const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count) {
     count = 0;
     if (!complement_ready_ || top_arena_ != nullptr || !override_.empty() || !staged_.empty()) return 0;
-    const uint64_t avail = basalt::platform::available_memory();
+    detail::HostMemory hm;
+    const uint64_t avail = detail::host_available_memory(hm) ? hm.available : 0;
     if (avail == 0) return 0;
     const uint64_t room = ram_tier_room(avail, basalt::platform::ram_reserve(), pin);
     // the experts no tier holds, hottest first, as many as fit
