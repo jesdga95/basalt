@@ -254,7 +254,7 @@ int main(int argc, char** argv) {
     const std::string swaps_given = arg_value(args, "--adapt-swaps"), every_given = arg_value(args, "--adapt-every");
     const int base_swaps = swaps_given.empty() ? kDefaultSwaps : std::atoi(swaps_given.c_str());
     bool adapt_on = adapt_flags && base_swaps > 0 && (every_given.empty() || std::atoi(every_given.c_str()) > 0);
-    const AdaptTrial kAdaptTried[] = {{64, 256, 0.70, false, 0}, {1, 160, 0, false, 0}};
+    const AdaptTrial kAdaptTried[] = {{64, 256, 0.70, false, 0}, {1, 160, 0, false, 0}, {0, 12, 0, false, 0}};
     if (adapt_on) {
         int most = base_swaps;
         for (const auto& t : kAdaptTried) most = std::max(most, t.swaps);
