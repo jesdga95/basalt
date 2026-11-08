@@ -26,13 +26,13 @@ const char* mode_name(Mode m) {
 }
 
 void run_mode(Mode m, bool gate, const uint8_t* w, size_t stride, size_t up, int n, const void* const* act, int nt,
-              float* const* out, int r0, int r1) {
+              float* const* out, int r0, int r1, float lim = 0.f) {
     if (gate) {
         switch (m) {
-            case Mode::Avx2Base: cpu::nvfp4_256_gu_rows_base(w, stride, up, n, .1f, .1f, act, nt, out, r0, r1); break;
-            case Mode::Avx2Vnni: cpu::nvfp4_256_gu_rows_vnni(w, stride, up, n, .1f, .1f, act, nt, out, r0, r1); break;
-            case Mode::Avx2Disp: cpu::nvfp4_256_gu_rows(w, stride, up, n, .1f, .1f, act, nt, out, r0, r1); break;
-            case Mode::Avx512: cpu::nvfp4_512_gu_rows(w, stride, up, n, .1f, .1f, act, nt, out, r0, r1); break;
+            case Mode::Avx2Base: cpu::nvfp4_256_gu_rows_base(w, stride, up, n, .1f, .1f, lim, act, nt, out, r0, r1); break;
+            case Mode::Avx2Vnni: cpu::nvfp4_256_gu_rows_vnni(w, stride, up, n, .1f, .1f, lim, act, nt, out, r0, r1); break;
+            case Mode::Avx2Disp: cpu::nvfp4_256_gu_rows(w, stride, up, n, .1f, .1f, lim, act, nt, out, r0, r1); break;
+            case Mode::Avx512: cpu::nvfp4_512_gu_rows(w, stride, up, n, .1f, .1f, lim, act, nt, out, r0, r1); break;
         }
     } else {
         switch (m) {
@@ -44,7 +44,8 @@ void run_mode(Mode m, bool gate, const uint8_t* w, size_t stride, size_t up, int
     }
 }
 
-int check(int n, int rows, bool gate, bool edge_scales, Mode mode) {
+// `limited`: the SwiGLU limit at the median |gate/up| of the reference, so about half the values are capped or clamped
+int check(int n, int rows, bool gate, bool edge_scales, Mode mode, bool limited = false) {
     constexpr int T = 8;
     const bool wide = mode == Mode::Avx512;
     const size_t stride = ggml_row_size(GGML_TYPE_NVFP4, n), up = stride * rows;
@@ -77,6 +78,19 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode) {
     int bad = 0;
     double max_abs = 0, max_rel = 0;
     std::vector<float> w(n), u(n);
+    float lim = 0.f;
+    int capped = 0;
+    if (limited) {
+        std::vector<float> mags;
+        for (int r = 0; r < rows; ++r)
+            for (int t = 0; t < T; ++t) {
+                float a = 0;
+                dot->vec_dot(n, &a, 0, weights.data() + stride * r, 0, act[t], 0, 1);
+                mags.push_back(std::abs(a * .1f));
+            }
+        std::nth_element(mags.begin(), mags.begin() + mags.size() / 2, mags.end());
+        lim = mags[mags.size() / 2];
+    }
     for (int r = 0; r < rows; ++r) {
         dw->to_float(weights.data() + stride * r, w.data(), n);
         if (gate) dw->to_float(weights.data() + up + stride * r, u.data(), n);
@@ -86,6 +100,11 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode) {
             if (gate) dot->vec_dot(n, &b, 0, weights.data() + up + stride * r, 0, act[t], 0, 1);
             a *= .1f;
             b *= .1f;
+            if (lim > 0.f) {
+                capped += a > lim || std::abs(b) > lim;
+                a = std::fmin(a, lim);
+                b = std::fmax(std::fmin(b, lim), -lim);
+            }
             ref[t][r] = gate ? (a / (1.f + std::exp(-a))) * b : a;
             double da = 0, db = 0;
             for (int i = 0; i < n; ++i) {
@@ -94,12 +113,16 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode) {
             }
             da *= (double) .1f;
             db *= (double) .1f;
+            if (lim > 0.f) {
+                da = std::min(da, (double) lim);
+                db = std::max(std::min(db, (double) lim), -(double) lim);
+            }
             expected[t][r] = gate ? da / (1 + std::exp(-da)) * db : da;
         }
     }
     for (int nt = 1; nt <= T; ++nt) for (int offset = 0; offset + nt <= T; ++offset) {
         auto run = [&](int r0, int r1) {
-            run_mode(mode, gate, weights.data(), stride, up, n, act + offset, nt, out, r0, r1);
+            run_mode(mode, gate, weights.data(), stride, up, n, act + offset, nt, out, r0, r1, lim);
         };
         run(0, rows);
         for (int t = 0; t < nt; ++t) {
@@ -109,7 +132,9 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode) {
                 const double err = std::abs(out[t][r] - want);
                 max_abs = std::max(max_abs, err);
                 max_rel = std::max(max_rel, err / std::max(1e-8, std::abs(want)));
-                if (!std::isfinite(out[t][r]) || err > 1e-5 + 5e-5 * std::abs(want)) ++bad;
+                // a value within rounding of the limit may land on either side of it: the double one is not capped
+                const double tol = lim > 0.f ? 1e-4 + 5e-4 * std::abs(want) : 1e-5 + 5e-5 * std::abs(want);
+                if (!std::isfinite(out[t][r]) || err > tol) ++bad;
             }
         }
         for (int t = 0; t < T; ++t) std::fill(got[t].begin(), got[t].end(), -12345.f);
@@ -126,9 +151,10 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode) {
             r0 = r1;
         }
     }
-    std::printf("NVFP4 %s %s n=%d rows=%d: double reference max_abs=%.3g max_rel=%.3g; "
+    if (limited && capped == 0) ++bad;
+    std::printf("NVFP4 %s %s n=%d rows=%d%s: double reference max_abs=%.3g max_rel=%.3g; "
                 "ggml identity, widths, positions and tails: %s\n", mode_name(mode),
-                gate ? "gate/up" : "down", n, rows,
+                gate ? "gate/up" : "down", n, rows, limited ? " limited" : "",
                 max_abs, max_rel, bad ? "FAIL" : "PASS");
     return bad;
 }
@@ -205,6 +231,8 @@ int main() {
         bad += check(64, 65, false, true, m);
         bad += check(2560, 640, true, false, m);
         bad += check(640, 2560, false, false, m);
+        bad += check(5120, 24, true, false, m, true);   // the DeepSeek geometry with its SwiGLU limit
+        bad += check(2304, 40, false, false, m);
         bad += check_extremes(m);
     }
     return bad ? 1 : 0;

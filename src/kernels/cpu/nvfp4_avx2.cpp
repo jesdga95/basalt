@@ -24,11 +24,11 @@ bool nvfp4_256_fits(int n_embd, int n_ff) noexcept {
     return n_embd % QK_NVFP4 == 0 && n_ff % QK_NVFP4 == 0 && n_embd <= kMaxN && n_ff <= kMaxN;
 }
 
-void nvfp4_256_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su,
+void nvfp4_256_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su, float limit,
                        const void* const* act, int nt, float* const* ff, int r0, int r1) {
     static const bool vnni8 = cpu_avxvnni_int8_ok();
-    if (vnni8) nvfp4_256_gu_rows_vnni(blob, gu_row, up_off, n, sg, su, act, nt, ff, r0, r1);
-    else nvfp4_256_gu_rows_base(blob, gu_row, up_off, n, sg, su, act, nt, ff, r0, r1);
+    if (vnni8) nvfp4_256_gu_rows_vnni(blob, gu_row, up_off, n, sg, su, limit, act, nt, ff, r0, r1);
+    else nvfp4_256_gu_rows_base(blob, gu_row, up_off, n, sg, su, limit, act, nt, ff, r0, r1);
 }
 
 void nvfp4_256_down_rows(const uint8_t* w, size_t row_bytes, int n, float sd, const void* const* act, int nt,

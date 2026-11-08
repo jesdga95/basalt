@@ -202,14 +202,15 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         iq_exact_512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
-    // NVFP4 on AVX-512: the multi-token kernel, bitwise equal per token to the ggml dot it replaces.
+    // NVFP4 on AVX-512: the multi-token kernel, bitwise equal per token to the ggml dot it replaces (the SwiGLU limit
+    // included).
     if (avx512 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
-        nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
+        nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
     // The same on AVX2 CPUs, bitwise equal per token to the AVX2 ggml dot.
     if (!avx512 && avx2 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {
-        nvfp4_256_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
+        nvfp4_256_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
     if (f.swiglu_limit > 0.f) gu_rows_ggml<true>(f, blob, act, nt, ff, r0, r1, sg, su);

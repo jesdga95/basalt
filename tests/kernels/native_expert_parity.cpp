@@ -461,7 +461,7 @@ int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob,
     const void* const* hp_ = hp;
     // the kernel under test: the AVX2 one is called directly, so an AVX-512 CPU checks it too
     auto new_gu = [&](int nt, float* const* ff, int r0, int r1) {
-        if (avx2) cpu::nvfp4_256_gu_rows(blob.data(), f.gu_row, f.up_off, (int) H, sc[0], sc[1], a_, nt, ff, r0, r1);
+        if (avx2) cpu::nvfp4_256_gu_rows(blob.data(), f.gu_row, f.up_off, (int) H, sc[0], sc[1], 0.f, a_, nt, ff, r0, r1);
         else cpu::native_gu_rows(f, blob.data(), a_, nt, ff, r0, r1);
     };
     auto new_down = [&](int nt, float* const* out, int r0, int r1) {
