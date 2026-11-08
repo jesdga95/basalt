@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "context.hpp"
 
 namespace basalt::program::generate {
@@ -119,9 +120,9 @@ int cache_size(Context& context) {
             cudaDeviceSynchronize();
             size_t f0 = 0, f1 = 0, t0 = 0;
             cudaMemGetInfo(&f0, &t0);
-            if (cudaHostAlloc(&probe, pb, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
+            if (basalt::core::allocate_pinned_host(&probe, pb, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
                 cudaMemGetInfo(&f1, &t0);
-                cudaFreeHost(probe);
+                basalt::core::release_pinned_host(probe);
                 const double per_gib = f0 > f1 ? (double) (f0 - f1) : 0.0;
                 const double outside = std::max(0.0, (double) expert_total_bytes -
                                                          (double) std::max<int64_t>((int64_t) free_b - base_b, 0));
