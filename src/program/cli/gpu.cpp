@@ -64,23 +64,23 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     // want peer access, which every pair must opt into once per process.  A pair the driver refuses is left alone and
     // the copy goes the long way.
     if (chosen_cards.size() > 1) {
-        int pairs = 0, tried = 0;
+        int pairs = 0, tried = 0, prev = 0;
+        cudaGetDevice(&prev);
         for (int a = 0; a < (int) chosen_cards.size(); ++a)
             for (int b = 0; b < (int) chosen_cards.size(); ++b) {
-                if (a == b) continue;
-                int prev = 0;
-                cudaGetDevice(&prev);
-                if (cudaSetDevice(a) != cudaSuccess) { (void) cudaGetLastError(); continue; }
                 int can = 0;
-                if (cudaDeviceCanAccessPeer(&can, a, b) == cudaSuccess && can) {
-                    ++tried;
-                    const cudaError_t e = cudaDeviceEnablePeerAccess(b, 0);
-                    if (e == cudaSuccess || e == cudaErrorPeerAccessAlreadyEnabled) ++pairs;
+                if (a == b || cudaDeviceCanAccessPeer(&can, a, b) != cudaSuccess || !can) {
                     (void) cudaGetLastError();
-                } else (void) cudaGetLastError();
-                (void) cudaSetDevice(prev);
+                    continue;
+                }
+                ++tried;
+                if (cudaSetDevice(a) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+                const cudaError_t e = cudaDeviceEnablePeerAccess(b, 0);
+                if (e == cudaSuccess || e == cudaErrorPeerAccessAlreadyEnabled) ++pairs;
+                (void) cudaGetLastError();
             }
-        basalt::log::info("basalt", "peer access: %d of %d ordered pairs enabled", pairs, tried);
+        (void) cudaSetDevice(prev);
+        if (tried > 0) basalt::log::info("basalt", "peer access: %d of %d ordered pairs enabled", pairs, tried);
     }
     return std::nullopt;
 }
