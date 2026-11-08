@@ -5,6 +5,7 @@ use axum::{
     Json, Router,
 };
 use basalt_thread_store::{accept_turn, commit_turn, history, request_hash, LedgerError};
+use basalt_thread_runtime::{claim_recovery, heartbeat, reconcile_expired, RecoveryError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -28,6 +29,14 @@ fn error(code: StatusCode, reason: &str) -> (StatusCode, Json<Value>) {
 fn db_error(err: sqlx::Error) -> (StatusCode, Json<Value>) {
     eprintln!("thread database operation failed: {err}");
     error(StatusCode::INTERNAL_SERVER_ERROR, "thread database error")
+}
+fn recovery_error(err: RecoveryError) -> (StatusCode, Json<Value>) {
+    match err {
+        RecoveryError::Conflict => error(StatusCode::CONFLICT, "recovery is not claimable"),
+        RecoveryError::UnsafeToolState => error(StatusCode::CONFLICT,
+            "external tool state uncertain; manual reconciliation required"),
+        RecoveryError::Database(e) => db_error(e),
+    }
 }
 fn ledger_error(err: LedgerError) -> (StatusCode, Json<Value>) {
     match err {
@@ -141,8 +150,10 @@ async fn run_turn(
                 "turn_id":accepted.turn_id,"status":"COMMITTED",
                 "message_id":accepted.committed_message_id,"replayed":true}))));
         }
-        return Ok((StatusCode::ACCEPTED,Json(json!({
-            "turn_id":accepted.turn_id,"status":accepted.status,"replayed":true}))));
+        if accepted.status != "RECOVERABLE" {
+            return Ok((StatusCode::ACCEPTED,Json(json!({
+                "turn_id":accepted.turn_id,"status":accepted.status,"replayed":true}))));
+        }
     }
     let model_row=sqlx::query("SELECT model_id FROM threads WHERE id=$1 AND owner_id=$2")
        .bind(tid).bind(app.owner).fetch_one(&app.pool).await.map_err(db_error)?;
@@ -150,20 +161,25 @@ async fn run_turn(
     // This is a stable run label, NOT a verified model/weights/cache fingerprint.
     // No cache reuse is authorized by this value until the engine publishes its digest.
     let model_label: [u8;32] = Sha256::digest(model.as_bytes()).into();
-    let run_id=Uuid::new_v4();
-    // Queue and claim in one transaction. A future scheduler can replace this
-    // synchronous runner without changing accepted-turn/idempotency semantics.
-    let mut tx=app.pool.begin().await.map_err(db_error)?;
-    let token:i64=sqlx::query_scalar("SELECT nextval('basalt_thread_fencing_seq')")
-        .fetch_one(&mut *tx).await.map_err(db_error)?;
-    sqlx::query("UPDATE turns SET status='RUNNING' WHERE id=$1 AND status='ACCEPTED'")
-        .bind(accepted.turn_id).execute(&mut *tx).await.map_err(db_error)?;
-    sqlx::query(
-        "INSERT INTO runs(id,turn_id,attempt,state,lease_token,model_fingerprint,started_at,lease_expires_at)
-         VALUES($1,$2,1,'RUNNING',$3,$4,clock_timestamp(),clock_timestamp()+interval '1 hour')")
-        .bind(run_id).bind(accepted.turn_id).bind(token).bind(model_label.as_slice())
-        .execute(&mut *tx).await.map_err(db_error)?;
-    tx.commit().await.map_err(db_error)?;
+    let (run_id, token) = if accepted.existing {
+        let lease=claim_recovery(&app.pool,accepted.turn_id,model_label)
+            .await.map_err(recovery_error)?;
+        (lease.run_id,lease.fencing_token)
+    } else {
+        let run_id=Uuid::new_v4();
+        let mut tx=app.pool.begin().await.map_err(db_error)?;
+        let token:i64=sqlx::query_scalar("SELECT nextval('basalt_thread_fencing_seq')")
+            .fetch_one(&mut *tx).await.map_err(db_error)?;
+        sqlx::query("UPDATE turns SET status='RUNNING' WHERE id=$1 AND status='ACCEPTED'")
+            .bind(accepted.turn_id).execute(&mut *tx).await.map_err(db_error)?;
+        sqlx::query(
+            "INSERT INTO runs(id,turn_id,attempt,state,lease_token,model_fingerprint,started_at,lease_expires_at)
+             VALUES($1,$2,1,'RUNNING',$3,$4,clock_timestamp(),clock_timestamp()+interval '1 hour')")
+            .bind(run_id).bind(accepted.turn_id).bind(token).bind(model_label.as_slice())
+            .execute(&mut *tx).await.map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        (run_id,token)
+    };
 
     let mut messages=match req.parent_message_id {
        Some(head)=>history(&app.pool,app.owner,tid,head,100_000).await
@@ -172,10 +188,28 @@ async fn run_turn(
        None=>Vec::new(),
     };
     messages.push(json!({"role":"user","content":req.content}));
+    let (stop_tx,mut stop_rx)=tokio::sync::oneshot::channel::<()>();
+    let heartbeat_pool=app.pool.clone();
+    let turn_id=accepted.turn_id;
+    let heart_task=tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    match heartbeat(&heartbeat_pool,turn_id,run_id,token).await {
+                        Ok(true) => {},
+                        _ => break,
+                    }
+                }
+            }
+        }
+    });
     let upstream=app.client.post(format!("{}/v1/chat/completions",app.upstream))
          .json(&json!({"model":model,"messages":messages,"stream":false,
                       "max_tokens":req.max_tokens.unwrap_or(1024)}))
          .send().await;
+    let _=stop_tx.send(());
+    let _=heart_task.await;
     let result=match upstream {
        Ok(x) if x.status().is_success()=>x.json::<Value>().await.ok(),
        _=>None,
@@ -218,6 +252,15 @@ async fn main() -> std::result::Result<(),Box<dyn std::error::Error>> {
     sqlx::migrate!("../migrations").run(&pool).await?;
     let client=reqwest::Client::builder().timeout(Duration::from_secs(3600)).build()?;
     let app=Arc::new(App{pool,client,secret,owner,workspace,upstream});
+    let recover_pool=app.pool.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(e)=reconcile_expired(&recover_pool,128).await {
+                eprintln!("thread recovery sweep failed: {e:?}");
+            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+    });
     let router=Router::new()
        .route("/v1/threads",post(create_thread))
        .route("/v1/threads/{id}",get(read_thread))
