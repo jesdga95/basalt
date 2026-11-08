@@ -65,6 +65,12 @@ public:
     /// Queues, in this order, a copy of a slot's blob into `out` and of `in` into the slot (both pinned, portable host
     /// memory); `read_wait` waits for those queued.
     void exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes);
+    /// One piece of an exchange, queued on the same stream: bytes [off, off + n) of the slot out to `out + off`, or of
+    /// `in + off` into the slot.
+    void slot_out(int32_t slot, uint8_t* out, uint64_t off, uint64_t n);
+    void slot_in(int32_t slot, const uint8_t* in, uint64_t off, uint64_t n);
+    /// The copies queued from now on start after `ev` (an event of any card).
+    void copies_after(cudaEvent_t ev);
     bool read_wait(std::string& err);
     /// One token's share over the pinned activation `x`, in the layout given; the rows land in open_plain's rows.
     bool launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t k,

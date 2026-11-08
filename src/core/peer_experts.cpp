@@ -215,10 +215,23 @@ bool PeerExperts::fill_slot(int32_t slot, const uint8_t* src, uint64_t bytes) {
 }
 
 void PeerExperts::exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes) {
+    slot_out(slot, out, 0, bytes);
+    slot_in(slot, in, 0, bytes);
+}
+
+void PeerExperts::slot_out(int32_t slot, uint8_t* out, uint64_t off, uint64_t n) {
     On on(device_);
-    uint8_t* blob = const_cast<uint8_t*>(cache_.device_slot(slot));
-    cudaMemcpyAsync(out, blob, bytes, cudaMemcpyDeviceToHost, refill_);
-    cudaMemcpyAsync(blob, in, bytes, cudaMemcpyHostToDevice, refill_);
+    cudaMemcpyAsync(out + off, cache_.device_slot(slot) + off, n, cudaMemcpyDeviceToHost, refill_);
+}
+
+void PeerExperts::slot_in(int32_t slot, const uint8_t* in, uint64_t off, uint64_t n) {
+    On on(device_);
+    cudaMemcpyAsync(const_cast<uint8_t*>(cache_.device_slot(slot)) + off, in + off, n, cudaMemcpyHostToDevice, refill_);
+}
+
+void PeerExperts::copies_after(cudaEvent_t ev) {
+    On on(device_);
+    cudaStreamWaitEvent(refill_, ev, 0);
 }
 
 bool PeerExperts::read_wait(std::string& err) {
