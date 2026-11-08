@@ -3,6 +3,7 @@
 Run after cargo build with DATABASE_URL pointing to a disposable test database.
 """
 import json
+import concurrent.futures
 import os
 import subprocess
 import threading
@@ -52,6 +53,7 @@ class ThreadHTTP(unittest.TestCase):
                  BASALT_THREAD_OWNER_ID="00000000-0000-0000-0000-00000000a001",
                  BASALT_THREAD_WORKSPACE_ID="00000000-0000-0000-0000-00000000a002",
                  BASALT_UPSTREAM_URL="http://127.0.0.1:8080")
+        cls.env=env
         cls.proc=subprocess.Popen(["crates/target/debug/basalt-thread-api"],env=env,
                                   stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         for _ in range(100):
@@ -87,6 +89,7 @@ class ThreadHTTP(unittest.TestCase):
             return e.code,json.loads(e.read() or b'{}')
 
     def test_create_resume_idempotency_and_conflict(self):
+        seen_before=len(FakeBasalt.seen)
         code,t=self.call("POST","/v1/threads",{"model":"fake-model"})
         self.assertEqual(code,201,t)
         tid=t["id"]; branch=t["branch_id"]
@@ -113,9 +116,10 @@ class ThreadHTTP(unittest.TestCase):
         self.assertEqual(code,200,history)
         self.assertEqual([x["role"] for x in history["data"]],
                          ["user","assistant","user","assistant"])
-        self.assertEqual([x["content"] for x in history["data"]],
-                         ["hello","reply-1","continue","reply-2"])
-        self.assertEqual(len(FakeBasalt.seen),2)
+        self.assertEqual([x["content"] for x in history["data"] if x["role"]=="user"],
+                         ["hello","continue"])
+        self.assertTrue(all(x["content"].startswith("reply-") for x in history["data"] if x["role"]=="assistant"))
+        self.assertEqual(len(FakeBasalt.seen),seen_before+2)
         self.assertEqual(len(FakeBasalt.seen[-1]["messages"]),3)
         code,metrics=self.call("GET",f"/v1/threads/{tid}/metrics")
         self.assertEqual(code,200,metrics)
@@ -125,6 +129,51 @@ class ThreadHTTP(unittest.TestCase):
         code,_=self.call("POST",f"/v1/threads/{tid}/turns",
                          {**second,"idempotency_key":"stale-key"})
         self.assertEqual(code,409)
+
+    def test_ten_concurrent_requests_commit_only_one_head(self):
+        status,t=self.call("POST","/v1/threads",{"model":"fake-model"})
+        self.assertEqual(status,201,t)
+        tid=t["id"];branch=t["branch_id"]
+        def request(n):
+            return self.call("POST",f"/v1/threads/{tid}/turns",{
+              "branch_id":branch,"expected_version":0,"parent_message_id":None,
+              "idempotency_key":f"race-{n}","content":f"message {n}","max_tokens":16})
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+            answers=list(pool.map(request,range(10)))
+        codes=[status for status,_ in answers]
+        self.assertEqual(codes.count(200),1,answers)
+        self.assertEqual(codes.count(409),9,answers)
+        status,t=self.call("GET",f"/v1/threads/{tid}")
+        self.assertEqual(status,200)
+        self.assertEqual(t["version"],1)
+        status,history=self.call("GET",f"/v1/threads/{tid}/messages")
+        self.assertEqual((status,len(history["data"])),(200,2))
+
+    def test_restart_reconstructs_from_postgres(self):
+        status,t=self.call("POST","/v1/threads",{"model":"fake-model"})
+        self.assertEqual(status,201,t)
+        tid=t["id"];branch=t["branch_id"]
+        msg={"branch_id":branch,"expected_version":0,"parent_message_id":None,
+             "idempotency_key":"reboot","content":"persist me","max_tokens":16}
+        status,result=self.call("POST",f"/v1/threads/{tid}/turns",msg)
+        self.assertEqual(status,200,result)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        self.__class__.proc=subprocess.Popen(
+             ["crates/target/debug/basalt-thread-api"],env=self.env,
+             stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+        for _ in range(100):
+            if self.proc.poll() is not None:
+                raise AssertionError("sidecar restart failed: "+self.proc.stderr.read().decode())
+            try:
+                status,view=self.call("GET",f"/v1/threads/{tid}")
+                if status==200: break
+            except OSError:
+                time.sleep(0.1)
+        else: self.fail("sidecar restart readiness timeout")
+        self.assertEqual(view["head_message_id"],result["message_id"])
+        status,messages=self.call("GET",f"/v1/threads/{tid}/messages")
+        self.assertEqual([x["content"] for x in messages["data"] if x["role"]=="user"],["persist me"])
 
     def test_recovery_retry_preserves_single_logical_exchange(self):
         code,t=self.call("POST","/v1/threads",{"model":"fake-model"})
