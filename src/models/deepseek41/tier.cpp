@@ -769,7 +769,9 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     }
     uint64_t on_main = ~0ull;
     oldest_slot(layer, /*homes_too=*/true, on_main);
-    if (slot < 0 || oldest >= on_main) return false;
+    // the second card computes an expert ~3.6x slower than the main card: a promotion goes there only when what it
+    // replaces has gone unused well longer than the main card's oldest
+    if (slot < 0 || oldest + policy::kPeerMoveAge >= on_main) return false;
     const int32_t place = spare_[(size_t) layer];
     spare_[(size_t) layer] = -1;
     const uint64_t bytes = m_.pack().experts[(size_t) layer].blob_bytes;

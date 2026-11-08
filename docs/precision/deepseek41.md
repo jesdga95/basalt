@@ -95,6 +95,11 @@ read's end (20 × 127 + 128) therefore stops at layer 20's compressor. `--no-pro
 temperature 1 matches plain decode. With tiers moving, rows round as under any placement: forced through the plain text, 15 to 25 prose
 picks and 1 to 6 code picks differ over 800 tokens.
 
+Where a promotion lands decides which experts the CPU computes later, so it moves the rounding too. Sending one to the second card
+only when what it replaces there has gone unused 1,280 lookups longer than the main card's oldest (instead of any longer) scores
+within noise against BF16 (100 chunks, homes main card 35, second card 45, RAM 304): KLD 0.27971 -> 0.27944, paired by chunk -0.00027
+(95% CI -0.00199 to +0.00144), top-1 83.89% -> 83.77% (-0.12 points, -0.32 to +0.07).
+
 ## Against llama.cpp
 
 Basalt's kernels are its own ports of the same graph. Per-layer tensors on the same weights, relative RMS: router logits 1e-7 (decode),
