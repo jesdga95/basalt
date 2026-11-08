@@ -1,4 +1,5 @@
 // src/core/mtp/lifecycle.cpp - see include/basalt/core/mtp.hpp.
+#include "basalt/core/host_pool.hpp"
 #include "common.hpp"
 
 namespace basalt::core {
@@ -43,7 +44,7 @@ MtpDrafter::~MtpDrafter() {
     if (proxy_scratch_) cudaFree(proxy_scratch_);
     if (gstamp_) cudaFree(gstamp_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
-    for (void* h : hosts) if (h) cudaFreeHost(h);
+    for (void* h : hosts) if (h) basalt::core::release_pinned_host(h);
 }
 
 
