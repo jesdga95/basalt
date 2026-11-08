@@ -77,6 +77,7 @@ bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64
 struct HostMemory {
     uint64_t available = 0;
     uint64_t cgroup_limit = ~uint64_t{0};
+    uint64_t cgroup_available = ~uint64_t{0};
 };
 
 /// This reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; an
@@ -560,6 +561,9 @@ public:
     uint64_t places_generation() const override { return places_gen_; }
     bool pcie_layer(int64_t layer) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
+    /// Drop file pages without invalidating their virtual addresses or resident RAM copies.
+    void trim_file_cache();
+    uint64_t file_cache_trims() const { return pool_map_trims_; }
     /// Overlaps block-aligned unbuffered reads through small pinned stages.  A blob whose read comes back short or
     /// failed, and a file system without unbuffered reads, take the mapped copy instead, whose pages are given back
     /// once the sink has them so a full fill does not leave the pack resident.  A sink that fails stops the read.
@@ -632,10 +636,17 @@ private:
     int64_t exchanges_ = 0;
     uint64_t places_gen_ = 0;   ///< places_generation
     int64_t spares_want_ = 0;
+    uint64_t spare_at_ = 0;
+    std::vector<std::pair<uint64_t, int64_t>> spare_sizes_;
     std::vector<std::pair<uint64_t, uint64_t>> spare_free_;   // (offset, bytes) of free places
     std::atomic<int64_t> file_reads_{0};
     int64_t reads_ = 0;
     int fd_ = -1;
+    int pool_direct_fd_ = -1;
+    void* pool_read_stage_ = nullptr;
+    uint64_t pool_read_bytes_ = 0;
+    uint64_t pool_map_bytes_ = 0, pool_map_trims_ = 0;
+    mutable std::mutex pool_read_mu_;
     std::string path_;   ///< the mapped file, which the bulk reads open unbuffered
 };
 
