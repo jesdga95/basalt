@@ -28,6 +28,27 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 On Windows: `py -3 -m venv .venv` then `.venv\Scripts\pip install -r requirements.txt`. Then follow the README's quick start from the
 model download on: `bin/basalt serve --config basalt_config.json`. Run `basalt-bench` from the top directory (it reads `data/bench`).
 
+## Container image
+
+`Dockerfile` builds the engine, the server and the server's venv into one image on a CUDA 13 base: the release archive's tree,
+with the venv already installed. Building it needs no GPU.
+
+```sh
+docker build -t basalt .
+docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all \
+    -v "$PWD/appdata/basalt:/data" -v "$PWD/models:/models" -p 8080:8080 basalt
+```
+
+`/data` holds `basalt_config.json` — v2, and `tools/migrations/config_v1_to_v2.py` converts an older file — and takes the server's
+folder per model under `~/.cache/basalt`, where `HOME` points: its engine log and, when the conversation disk tier is on, that
+tier. A pack is read where it lies, so the packs go on `/models` and the config names them by their mount path
+(`/models/<pack>.basalt`); paths in the config are relative to the config file. The entrypoint is
+`basalt serve --config /data/basalt_config.json --host 0.0.0.0` and arguments after the image name follow it (`--api-key KEY`).
+The served port is `server.port` (8080) and the mapped host port has to match it; `--gpu` names the cards the container sees.
+
+The container path is untested: no `basalt-bench` run and no PPL/KLD quality run has been measured inside the image, so the
+benchmark numbers describe native runs.
+
 ## Platform code
 
 OS code lives only in `src/platform/` and `include/basalt/platform/`, and CMake `if(WIN32)` blocks. Anywhere else there is no `_WIN32`,
