@@ -78,7 +78,6 @@ RopeTable rope_table_compressed(float freq_base, float factor, float beta_fast, 
 
 namespace {
 
-constexpr int kHeadsPerBlock = 16;
 constexpr int kBlockThreads = 256;
 
 __device__ __forceinline__ void rotate_pair(float& x0, float& x1, float pos, float step, float mscale, bool inverse) {
@@ -106,7 +105,7 @@ __global__ void rope_rows_kernel(float* rows, int n_rows, int row_stride, int ro
     p[1] = x1;
 }
 
-// ---- partial attention: one block per (chunk of 64 keys, group of 16 heads, token) ---------------------------
+// ---- partial attention: one block per (chunk of 64 keys, group of HB heads, token) ---------------------------
 
 // How a row type is read: Raw4 values 4i..4i+3 (i < 128) and Raw2 values 2i, 2i+1 (i < 256) as loaded, with their scale
 // where the row has one; converted to float at use.
@@ -222,7 +221,19 @@ __device__ __forceinline__ void pv_rows(const uint8_t* base, const int* rowid, i
 // The chunk's scores, softmax statistics and weighted sum; its rows are of type W (window) or C (compressed). Only the
 // row loads and their decoding depend on the type: the arithmetic is one body for both, so the kernel's code is
 // not doubled.
-template <class W, class C>
+// One step of the transposed reduction: a lane gives away the half of its N head sums its partner keeps (the upper
+// half where `off` is set in its lane id) and adds the partner's half to its own.
+template <int N>
+__device__ __forceinline__ void halve_heads(float* v, int lane, int off) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        const float send = (lane & off) ? v[i] : v[i + N];
+        const float keep = (lane & off) ? v[i + N] : v[i];
+        v[i] = keep + __shfl_xor_sync(0xffffffffu, send, off);
+    }
+}
+
+template <class W, class C, int HB>
 __device__ __forceinline__ void mqa_chunk(bool window, const uint8_t* base, float scale, const float4* qs,
                                           float (*sc)[kAttnChunk], const int* rowid, float* mlp0, size_t ml_head,
                                           float* o_part0, size_t o_head) {
@@ -236,15 +247,15 @@ __device__ __forceinline__ void mqa_chunk(bool window, const uint8_t* base, floa
         float kv[kScoreKeys][4][4];
         if (window) score_keys<W>(base, rowid, i0, kv);
         else score_keys<C>(base, rowid, i0, kv);
-        float v[kScoreKeys][kHeadsPerBlock];
+        float v[kScoreKeys][HB];
 #pragma unroll
         for (int u = 0; u < kScoreKeys; ++u)
 #pragma unroll
-            for (int h = 0; h < kHeadsPerBlock; ++h) v[u][h] = 0.f;
+            for (int h = 0; h < HB; ++h) v[u][h] = 0.f;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
 #pragma unroll
-            for (int h = 0; h < kHeadsPerBlock; ++h) {
+            for (int h = 0; h < HB; ++h) {
                 const float4 q4 = qs[h * (kAttnHeadDim / 4) + lane + 32 * j];
 #pragma unroll
                 for (int u = 0; u < kScoreKeys; ++u) {
@@ -258,40 +269,25 @@ __device__ __forceinline__ void mqa_chunk(bool window, const uint8_t* base, floa
 #pragma unroll
         for (int u = 0; u < kScoreKeys; ++u) {
             const int kk = warp + (i0 + u) * (kBlockThreads / 32);
-            // transposed reduction: every lane ends with one head's sum
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const float send = (lane & 16) ? v[u][i] : v[u][i + 8];
-                const float keep = (lane & 16) ? v[u][i + 8] : v[u][i];
-                v[u][i] = keep + __shfl_xor_sync(0xffffffffu, send, 16);
-            }
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float send = (lane & 8) ? v[u][i] : v[u][i + 4];
-                const float keep = (lane & 8) ? v[u][i + 4] : v[u][i];
-                v[u][i] = keep + __shfl_xor_sync(0xffffffffu, send, 8);
-            }
-#pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                const float send = (lane & 4) ? v[u][i] : v[u][i + 2];
-                const float keep = (lane & 4) ? v[u][i + 2] : v[u][i];
-                v[u][i] = keep + __shfl_xor_sync(0xffffffffu, send, 4);
-            }
-            {
-                const float send = (lane & 2) ? v[u][0] : v[u][1];
-                const float keep = (lane & 2) ? v[u][1] : v[u][0];
-                v[u][0] = keep + __shfl_xor_sync(0xffffffffu, send, 2);
-            }
+            // transposed reduction: the xor steps from 16 halve the heads a lane holds until one is left, the rest
+            // add whole sums; every head's 32 lane sums meet in the same pairs and order whatever HB is
+            static_assert(HB == 8 || HB == 16, "8 or 16 heads a block");
+            halve_heads<HB / 2>(v[u], lane, 16);
+            halve_heads<HB / 4>(v[u], lane, 8);
+            halve_heads<HB / 8>(v[u], lane, 4);
+            if constexpr (HB == 16) halve_heads<1>(v[u], lane, 2);
+            else v[u][0] += __shfl_xor_sync(0xffffffffu, v[u][0], 2);
             v[u][0] += __shfl_xor_sync(0xffffffffu, v[u][0], 1);
-            const int head =
-                ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
-            if ((lane & 1) == 0) sc[head][kk] = rowid[kk] >= 0 ? v[u][0] * scale : -INFINITY;
+            // lane bits 4, 3, 2 (and 1 at 16 heads) name the head, high to low
+            const int head = HB == 16 ? ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1)
+                                      : ((lane >> 4) & 1) * 4 + ((lane >> 3) & 1) * 2 + ((lane >> 2) & 1);
+            if ((lane & (32 / HB - 1)) == 0) sc[head][kk] = rowid[kk] >= 0 ? v[u][0] * scale : -INFINITY;
         }
     }
     __syncthreads();
 
     // chunk softmax statistics; scores become unnormalised weights
-    for (int h = warp; h < kHeadsPerBlock; h += kBlockThreads / 32) {
+    for (int h = warp; h < HB; h += kBlockThreads / 32) {
         const float s0 = sc[h][lane], s1 = sc[h][lane + 32];
         float m = fmaxf(s0, s1);
 #pragma unroll
@@ -312,9 +308,9 @@ __device__ __forceinline__ void mqa_chunk(bool window, const uint8_t* base, floa
     __syncthreads();
 
     // weighted sum of the chunk's rows
-    float acc[kHeadsPerBlock][2];
+    float acc[HB][2];
 #pragma unroll
-    for (int h = 0; h < kHeadsPerBlock; ++h) acc[h][0] = acc[h][1] = 0.f;
+    for (int h = 0; h < HB; ++h) acc[h][0] = acc[h][1] = 0.f;
 #pragma unroll 1
     for (int k0 = 0; k0 < kAttnChunk; k0 += kPvBatch) {
         float k2[kPvBatch][2];
@@ -324,7 +320,7 @@ __device__ __forceinline__ void mqa_chunk(bool window, const uint8_t* base, floa
 #pragma unroll
         for (int i4 = 0; i4 < kPvBatch; i4 += 4) {
 #pragma unroll
-            for (int h = 0; h < kHeadsPerBlock; ++h) {
+            for (int h = 0; h < HB; ++h) {
                 const float4 p4 = *reinterpret_cast<const float4*>(&sc[h][k0 + i4]);  // four rows' weights
                 const float pu[4] = {p4.x, p4.y, p4.z, p4.w};
 #pragma unroll
@@ -336,7 +332,7 @@ __device__ __forceinline__ void mqa_chunk(bool window, const uint8_t* base, floa
         }
     }
 #pragma unroll
-    for (int h = 0; h < kHeadsPerBlock; ++h) {
+    for (int h = 0; h < HB; ++h) {
         float2* o = reinterpret_cast<float2*>(o_part0 + (size_t) h * o_head);
         o[tid] = make_float2(acc[h][0], acc[h][1]);
     }
@@ -344,7 +340,7 @@ __device__ __forceinline__ void mqa_chunk(bool window, const uint8_t* base, floa
 
 // Blocks [0, n_win) are window chunks (rows of type W, indexing the ring), the rest compressed chunks (rows of type C,
 // indexing the selected ids).
-template <class W, class C>
+template <class W, class C, int HB>
 __global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, int n_win, int n_chunks_total, float* o_part,
                                                                     float* ml) {
     const int slot = blockIdx.x;
@@ -354,8 +350,8 @@ __global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, i
     const int t = blockIdx.z;
     const int tid = threadIdx.x;
 
-    __shared__ float4 qs[kHeadsPerBlock * kAttnHeadDim / 4];
-    __shared__ float sc[kHeadsPerBlock][kAttnChunk];
+    __shared__ float4 qs[HB * kAttnHeadDim / 4];
+    __shared__ float sc[HB][kAttnChunk];
     __shared__ int rowid[kAttnChunk];
 
     int r = -1;
@@ -374,10 +370,10 @@ __global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, i
         rowid[tid] = r;
     }
     const bool any = __syncthreads_or(tid < kAttnChunk && r >= 0);
-    const int head0 = g * kHeadsPerBlock;
+    const int head0 = g * HB;
     float* mlp0 = ml + (((size_t) t * kAttnHeads + head0) * n_chunks_total + slot) * 2;
     if (!any) {
-        if (tid < kHeadsPerBlock) {
+        if (tid < HB) {
             float* m = mlp0 + (size_t) tid * n_chunks_total * 2;
             m[0] = -INFINITY;
             m[1] = 0.f;
@@ -386,11 +382,11 @@ __global__ void __launch_bounds__(kBlockThreads) mqa_partial_kernel(MqaArgs a, i
     }
 
     const float4* qg = reinterpret_cast<const float4*>(a.q + ((size_t) t * kAttnHeads + head0) * kAttnHeadDim);
-    for (int i = tid; i < kHeadsPerBlock * kAttnHeadDim / 4; i += kBlockThreads) qs[i] = qg[i];
+    for (int i = tid; i < HB * kAttnHeadDim / 4; i += kBlockThreads) qs[i] = qg[i];
     __syncthreads();
 
     float* o0 = o_part + (((size_t) t * kAttnHeads + head0) * n_chunks_total + slot) * kAttnHeadDim;
-    mqa_chunk<W, C>(kWindow, static_cast<const uint8_t*>(kWindow ? a.win : a.comp), a.scale, qs, sc, rowid, mlp0,
+    mqa_chunk<W, C, HB>(kWindow, static_cast<const uint8_t*>(kWindow ? a.win : a.comp), a.scale, qs, sc, rowid, mlp0,
                     (size_t) n_chunks_total * 2, o0, (size_t) n_chunks_total * kAttnHeadDim);
 }
 
@@ -430,10 +426,18 @@ void check_launch(const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
+// 8 heads a block where the launch still fits one block per SM (the short windows: twice the blocks, each half the
+// work), else 16; the heads of a block share no sums, so both give the same bits
 template <class W, class C>
 void launch_partial(const MqaArgs& a, int n_win, int n_total, float* o_part, float* ml, cudaStream_t s) {
-    mqa_partial_kernel<W, C><<<dim3(n_total, kAttnHeads / kHeadsPerBlock, a.n_tokens), kBlockThreads, 0, s>>>(
-        a, n_win, n_total, o_part, ml);
+    int dev = 0, sms = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    if (n_total * (kAttnHeads / 8) * a.n_tokens <= sms)
+        mqa_partial_kernel<W, C, 8><<<dim3(n_total, kAttnHeads / 8, a.n_tokens), kBlockThreads, 0, s>>>(a, n_win, n_total, o_part, ml);
+    else
+        mqa_partial_kernel<W, C, 16><<<dim3(n_total, kAttnHeads / 16, a.n_tokens), kBlockThreads, 0, s>>>(a, n_win, n_total, o_part,
+                                                                                                         ml);
     check_launch("mqa_partial");
 }
 
