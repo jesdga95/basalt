@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "state.hpp"
 #include "layout.hpp"
 #include "basalt/prefill/prefill.hpp"
@@ -131,9 +132,9 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     cudaMemGetInfo(&fb, &tb);
     cudaSetDevice(pp->prim);
     if (ok && tf > 0) {   // pinned for both cards
-        ok = cudaHostAlloc((void**) &pp->hx, (size_t) Tp * N * 4, cudaHostAllocPortable) == cudaSuccess;
+        ok = basalt::core::allocate_pinned_host((void**) &pp->hx, (size_t) Tp * N * 4, cudaHostAllocPortable) == cudaSuccess;
         for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
-            ok = cudaHostAlloc((void**) &pp->hres[b], (size_t) pp->G * N * 4, cudaHostAllocPortable) == cudaSuccess;
+            ok = basalt::core::allocate_pinned_host((void**) &pp->hres[b], (size_t) pp->G * N * 4, cudaHostAllocPortable) == cudaSuccess;
     }
     if (!ok) {
         cudaGetLastError();
