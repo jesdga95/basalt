@@ -78,9 +78,10 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         one_each += (e.blob_bytes + 255) / 256 * 256;
         one_each_ram += e.blob_bytes;
     }
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        err = "deepseek41: cannot query the free device memory";
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        err = "deepseek41: cannot query the free device memory: " + why;
         return false;
     }
     one_each_ = one_each;
@@ -943,9 +944,10 @@ void ExpertTier::lend_all() {
 
 bool ExpertTier::reclaim(std::string& err) {
     if (lent_per_layer_ == 0) return true;
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        err = "deepseek41: cannot query the free device memory";
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        err = "deepseek41: cannot query the free device memory: " + why;
         return false;
     }
     const int64_t n = policy::reclaim_slots(free_b, reserve_, free_floor_, one_each_, lent_per_layer_);
@@ -963,8 +965,13 @@ bool ExpertTier::reclaim(std::string& err) {
 
 void ExpertTier::grow() {
     if (ext_per_layer_ > 0 || per_layer_ >= n_expert_ || !cache_.valid()) return;
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        if (!unread_said_) basalt::log::warn("basalt deepseek41", "VRAM expert tier cannot grow: cannot read the free device memory: %s", why.c_str());
+        unread_said_ = true;
+        return;
+    }
     const int64_t n = policy::grow_slots(free_b, reserve_ + (token_ > 0 ? 0 : modules_), free_floor_, one_each_, per_layer_, n_expert_, cap_per_layer_);
     if (n < 1) return;
     std::vector<int64_t> slot_bytes;
