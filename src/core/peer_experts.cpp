@@ -81,6 +81,9 @@ void PeerExperts::close() {
     refill_ev_ = evict_ev_ = nullptr;
     fsrc_ = nullptr;
     rows_map_ = nullptr;
+    meta_map_ = nullptr;
+    x_host_ = nullptr;
+    x_map_ = nullptr;
     evicting_.clear();
     pending_.clear();
     device_ = -1;
@@ -184,9 +187,9 @@ bool PeerExperts::open_plain(int device, int64_t n_layers, int64_t n_expert, int
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "read stream", err) &&
         ck(cudaHostGetDevicePointer((void**) &rows_map_, rows, 0), "mapped rows", err) &&
-        ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable), "plan staging", err) &&
+        ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
+        ck(cudaHostGetDevicePointer(&meta_map_, h_meta_, 0), "mapped plan", err) &&
         ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
-        ck(cudaMalloc((void**) &d_x_, row_bytes * CAP), "activation", err) &&
         ck(cudaMalloc((void**) &d_out_, row_bytes * CAP), "rows", err) &&
         ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (size_t) (n_embd / 32) * 36), "q8_1 rows", err) &&
         ck(cudaMalloc(&d_scratch_, basalt::kernels::native_expert_scratch_bytes((int) CAP, n_ff)), "scratch", err);
@@ -335,15 +338,25 @@ bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout
     m.count[1] = rows;
     entries_ += rows;
     launched_rows_ = rows;
-    // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
-    if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * n_embd_) * sizeof(float));
     On on(device_);
     const cudaStream_t s = stream_;
-    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * n_embd_) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
-        !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
-        return false;
+    if (meta_map_) {
+        // a plain tier: x (pinned, portable, mapped) and the plan are read where they are by the quantize launch, so
+        // the share never waits behind a slot copy on the card's copy engines
+        if (x != x_host_) {
+            if (!ck(cudaHostGetDevicePointer((void**) &x_map_, const_cast<float*>(x), 0), "mapped activations", err)) return false;
+            x_host_ = x;
+        }
+        basalt::kernels::quantize_q8_1_rows_copy(x_map_, n_tok, n_embd_, d_q8_, meta_map_, d_meta_, (int) (sizeof(Meta) / 4), s);
+    } else {
+        // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
+        if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * n_embd_) * sizeof(float));
+        if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * n_embd_) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
+            !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
+            return false;
+        basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
+    }
     Meta* dm = (Meta*) d_meta_;
-    basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
     basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
     basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
                                            d_scratch_, d_out_, s);

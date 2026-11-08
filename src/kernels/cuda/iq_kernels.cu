@@ -2375,6 +2375,20 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
     q8_1_store(x[i], y, i);
 }
 
+// quantize_q8_1_kernel whose blocks past `qblocks` copy `n_words` words from src to dst instead
+__global__ void quantize_q8_1_copy_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n,
+                                          unsigned qblocks, const uint32_t* __restrict__ src, uint32_t* __restrict__ dst,
+                                          int n_words) {
+    if (blockIdx.x >= qblocks) {
+        const int w = (int) (blockIdx.x - qblocks) * blockDim.x + threadIdx.x;
+        if (w < n_words) dst[w] = src[w];
+        return;
+    }
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    q8_1_store(x[i], y, i);
+}
+
 // swiglu_entries_kernel and quantize_q8_1_kernel in one pass, over the call's own entries only:
 // [grp_start[0], grp_start[*n_groups]) (a call's entries are contiguous; the verify window's PCIe call starts after
 // its VRAM call) instead of all cap_entries twice - nothing reads the others: the down kernel reads its groups'.
@@ -2981,6 +2995,16 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
     if (n <= 0) return;
     quantize_q8_1_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y, n);
     check("quantize_q8_1_rows");
+}
+
+void quantize_q8_1_rows_copy(const float* x, int64_t n_rows, int64_t n_cols, void* y, const void* src, void* dst,
+                             int n_words, void* stream) {
+    const long long n = (long long) n_rows * n_cols;
+    const unsigned qblocks = (unsigned) ((n + 255) / 256), cblocks = (unsigned) ((n_words + 255) / 256);
+    if (qblocks + cblocks == 0) return;
+    quantize_q8_1_copy_kernel<<<qblocks + cblocks, 256, 0, (cudaStream_t) stream>>>(
+        x, (block_q8_1*) y, n, qblocks, (const uint32_t*) src, (uint32_t*) dst, n_words);
+    check("quantize_q8_1_rows_copy");
 }
 
 void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {

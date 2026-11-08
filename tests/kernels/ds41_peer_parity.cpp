@@ -2,7 +2,8 @@
 // bit for bit on the real geometry, whatever the share's size and the rows it lands in.
 //
 //     build/ds41_peer_parity            the checks (passes with a note on one card)
-//     build/ds41_peer_parity --bench    the checks, then a microbench line per format and share size
+//     build/ds41_peer_parity --bench    the checks, then a microbench line per format and share size, alone and
+//                                       with a slot's copy in and out queued on the card just before it
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -167,21 +168,29 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
     std::printf("%-7s/%-7s second card vs main card, shares of 1..6: %s\n", nm(gu), nm(d), same ? "bitwise same" : "DIFFER");
 
     if (bench) {
-        for (int n : {1, 2, 3, 4, 6}) {
-            int32_t ids[8] = {}, kind[8] = {};
-            for (int i = 0; i < n; ++i) { ids[i] = i; kind[i] = 2; }
-            std::vector<double> us;
-            for (int it = 0; it < 201; ++it) {
-                const auto t0 = std::chrono::steady_clock::now();
-                peer.launch_plain(0, Lp, h_x, ids, n, kind, err);
-                peer.finish(nullptr, err);
-                if (it > 0) us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        uint8_t* out = nullptr;
+        ck(cudaHostAlloc((void**) &out, L.bytes, cudaHostAllocPortable), "out");
+        for (const bool copying : {false, true})
+            for (int n : {1, 2, 3, 4, 6}) {
+                int32_t ids[8] = {}, kind[8] = {};
+                for (int i = 0; i < n; ++i) { ids[i] = i; kind[i] = 2; }
+                std::vector<double> us;
+                for (int it = 0; it < 201; ++it) {
+                    // the last slot's bytes out and the same bytes back in: a slot swap's copies, the slot unchanged
+                    if (copying) peer.exchange_slot(NB - 1, out, stage, L.bytes);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    peer.launch_plain(0, Lp, h_x, ids, n, kind, err);
+                    peer.finish(nullptr, err);
+                    if (it > 0) us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+                    if (copying) peer.read_wait(err);
+                }
+                std::sort(us.begin(), us.end());
+                const double med = us[us.size() / 2];
+                std::printf("bench second card %s/%s share of %d%s, launch to rows in host memory: %.1f us/call (p90 %.1f), %.1f MB read, %.0f GB/s (weights only)\n",
+                            nm(gu), nm(d), n, copying ? " behind a slot copy" : "", med, us[us.size() * 9 / 10],
+                            (double) n * (double) L.bytes / 1e6, (double) n * (double) L.bytes / (med * 1e3));
             }
-            std::sort(us.begin(), us.end());
-            const double med = us[us.size() / 2];
-            std::printf("bench second card %s/%s share of %d, launch to rows in host memory: %.1f us/call (p90 %.1f), %.1f MB read, %.0f GB/s (weights only)\n",
-                        nm(gu), nm(d), n, med, us[us.size() * 9 / 10], (double) n * (double) L.bytes / 1e6, (double) n * (double) L.bytes / (med * 1e3));
-        }
+        cudaFreeHost(out);
     }
     cudaFreeHost(stage);
     for (void* p : {(void*) blobs, (void*) dx, (void*) xq, (void*) dptr, (void*) dstart, (void*) dng, (void*) ddst, (void*) dtok, (void*) scr, (void*) dout})
@@ -200,7 +209,7 @@ int main(int argc, char** argv) {
     }
     float* h_x = nullptr;
     float* h_rows = nullptr;
-    ck(cudaHostAlloc((void**) &h_x, H * sizeof(float), cudaHostAllocPortable), "x");
+    ck(cudaHostAlloc((void**) &h_x, H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "x");
     ck(cudaHostAlloc((void**) &h_rows, 8 * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "rows");
     std::mt19937 rng(9);
     std::normal_distribution<float> nd(0.f, 1.f);
