@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -280,8 +281,8 @@ void Verifier::gs_init() {
          mapped((size_t) max_t_ * N * 4, (void**) &gs_h_part_, (void**) &gs_m_part_);
     if (ok) {   // gs_move's staging, pinned so the moves run at the bus rate
         const size_t full_f = (size_t) S * HV * S + (size_t) C * HIST, nl = (size_t) gs_ca_.n_layers;
-        ok = cudaHostAlloc((void**) &gs_h_full_, full_f * nl * 4, cudaHostAllocPortable) == cudaSuccess &&
-             cudaHostAlloc((void**) &gs_h_slice_, basalt::core::gdn_slice_state_floats(sl, HIST) * nl * 4,
+        ok = basalt::core::allocate_pinned_host((void**) &gs_h_full_, full_f * nl * 4, cudaHostAllocPortable) == cudaSuccess &&
+             basalt::core::allocate_pinned_host((void**) &gs_h_slice_, basalt::core::gdn_slice_state_floats(sl, HIST) * nl * 4,
                            cudaHostAllocPortable) == cudaSuccess;
     }
     for (const Src& s : src)
@@ -326,7 +327,7 @@ void Verifier::gs_free() {
         if (gs_z0_) cudaFree(gs_z0_);
     }
     for (void* h : {(void*) gs_h_xq_, (void*) gs_h_x_, (void*) gs_h_part_, (void*) gs_h_full_, (void*) gs_h_slice_})
-        if (h) cudaFreeHost(h);
+        if (h) basalt::core::release_pinned_host(h);
     gs_h_full_ = gs_h_slice_ = nullptr;
     gs_h_x_ = gs_m_x_ = gs_h_part_ = gs_m_part_ = nullptr;
     gs_mixl_ = nullptr; gs_pscr_ = nullptr; gs_qkv0_ = gs_z0_ = nullptr;
