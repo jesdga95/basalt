@@ -14,7 +14,6 @@ int resident_load(Context& context) {
     auto& profile_all = *context.profile_all;
     auto& src = *context.src;
     auto& srcp = *context.srcp;
-    auto& ram_available_at_plan = *context.ram_available_at_plan;
     auto& auto_resident_bytes = *context.auto_resident_bytes;
     auto& xcache = *context.xcache;
     auto& kv_tail_slots = *context.kv_tail_slots;
@@ -25,11 +24,7 @@ int resident_load(Context& context) {
     auto& auto_lend_pct = *context.auto_lend_pct;
     auto& kMaxAutoChunk = *context.kMaxAutoChunk;
     auto& auto_ceiling = *context.auto_ceiling;
-    auto& largest_layer_bytes = *context.largest_layer_bytes;
-    auto& prompt_file_bytes = *context.prompt_file_bytes;
     auto& adapt_fast_on = *context.adapt_fast_on;
-    auto& late = *context.late;
-    auto& resident_headroom_base = *context.resident_headroom_base;
     auto& lend_from = *context.lend_from;
     auto& stage_held = *context.stage_held;
     auto& peer_only = *context.peer_only;
@@ -42,7 +37,6 @@ int resident_load(Context& context) {
     // streamed during a prompt and copied back after it, so those are kept in RAM too as far as RAM allows.  The
     // bytes are the file's bytes and the placement is the same, so the answers are the plain mmap mode's; the
     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
-    uint64_t ram_floor_bytes = basalt::platform::ram_margin();   // the RAM the copy leaves free; the serve guard's floor
     if (o.resident_cpu_experts) {
         // the RAM copy is sized from the available RAM: without a reading the experts would silently stay in the file
         if (basalt::core::detail::HostMemory hm; !basalt::core::detail::host_available_memory(hm))
@@ -54,35 +48,41 @@ int resident_load(Context& context) {
         if (adapt_fast_on)
             src.set_spares(o.peer_exclusive ? o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)
                                             : o.adapt_swaps * kSatBoost);
-        uint64_t resident_headroom = resident_headroom_base;
+        // the copy leaves the reserve free (or the legacy headroom, when larger), and the driver's tracking of the
+        // buffers whose RAM is held for them
+        const uint64_t reserve = basalt::platform::ram_reserve();
+        const uint64_t resident_headroom =
+            std::max(o.resident_headroom, reserve) + basalt::core::pin_tracking_bytes(basalt::core::host_plan_bytes());
+        // the adaptive swaps' exchange buffers, before the copy reads the free memory
+        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !adapt_fast_on &&
+            !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
+            basalt::log::error("basalt", "CPU expert residency: %s", err.c_str());
+            return 1;
+        }
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
-        // are read from the file through the OS file cache, so the copy leaves that cache its floor beside the margin.
+        // are read from the file.  Every host buffer the engine takes later is allocated or held by now, so the copy
+        // takes what is above that, less the driver's tracking of its own pages.
         {
             const uint64_t gpu_held = std::min(expert_total_bytes, cache_fill_bytes + peer_only_bytes);
             const uint64_t complement = expert_total_bytes - gpu_held;
-            const uint64_t avail = ram_available_at_plan;
-            const uint64_t margin = basalt::platform::ram_margin();
-            const uint64_t copy = std::min(o.resident_budget > 0 ? o.resident_budget : auto_resident_bytes, complement);
+            basalt::core::detail::HostMemory hm;
+            const uint64_t avail = basalt::core::detail::host_available_memory(hm) ? hm.available : 0;
+            const uint64_t room = basalt::core::ram_tier_room(avail, resident_headroom, o.resident_pin);
+            const uint64_t copy =
+                std::min({o.resident_budget > 0 ? o.resident_budget : auto_resident_bytes, complement, room});
             const uint64_t file_bytes = complement - copy;
-            ram_floor_bytes =
-                basalt::platform::ram_floor(margin, file_bytes, complement, largest_layer_bytes, prompt_file_bytes);
             if (avail > 0 && file_bytes > 0) {
-                const uint64_t safe = basalt::platform::max_safe_copy(avail, late, ram_floor_bytes);
                 constexpr double kGiB = 1073741824.0;
-                if (o.resident_budget > 0 && o.resident_budget > safe) {
+                if (o.resident_budget > 0 && o.resident_budget > room) {
                     return fatal_start_error(
                         "--resident-budget-gib " + gib_text(o.resident_budget) + " too high: " + gib_text(avail) +
-                        " GiB free, " + gib_text(ram_floor_bytes) + " GiB floor" +
-                        (late > 0 ? " + " + gib_text(late) + " GiB for serving" : std::string()) + "; max " +
-                        gib_text(safe));
+                        " GiB free, " + gib_text(resident_headroom) + " GiB reserve and the driver's page tracking; max " +
+                        gib_text(room));
                 }
-                resident_headroom = std::max(resident_headroom, ram_floor_bytes + late);
-                basalt::log::info("basalt generate", "RAM floor %.1f GiB (%.1f margin + %.1f cache), %.1f GiB "
-                                     "experts on SSD, RAM copy <= %.1f of %.1f GiB",
-                             (double) ram_floor_bytes / kGiB, (double) margin / kGiB,
-                             (double) (ram_floor_bytes - margin) / kGiB, (double) file_bytes / kGiB,
-                             (double) (o.resident_budget > 0 ? std::min(o.resident_budget, safe) : safe) / kGiB,
-                             (double) avail / kGiB);
+                basalt::log::info("basalt generate", "RAM floor %.1f GiB of %.1f GiB free, %.1f GiB experts on SSD, RAM "
+                                     "copy <= %.1f GiB", (double) (avail - room) / kGiB, (double) avail / kGiB,
+                                  (double) file_bytes / kGiB,
+                                  (double) (o.resident_budget > 0 ? std::min(o.resident_budget, room) : room) / kGiB);
             }
         }
         std::vector<std::pair<int32_t, int32_t>> gpu_only = peer_only;
@@ -117,11 +117,6 @@ int resident_load(Context& context) {
         }
         if (resident_ok) {
             if (o.serve) basalt::platform::watch_resident_ram(true, src.resident_bytes());
-            if (o.adapt_every > 0 && o.adapt_swaps > 0 && !adapt_fast_on &&
-                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
-                basalt::log::error("basalt", "CPU expert residency: %s", err.c_str());
-                return 1;
-            }
             basalt::log::info("basalt generate", "resident RAM mode: %.2f GiB of experts in RAM (%s), %lld in the GPU "
                                  "cache; adaptive swaps %s",
                          (double) src.resident_bytes() / 1073741824.0,
@@ -154,8 +149,6 @@ int resident_load(Context& context) {
     }
     // the peer's swaps keep their experts in RAM or on a GPU, never only in the file
     if (o.peer_exclusive && peer.valid() && srcp == &src && src.complement_ready()) peer.set_exclusive(&src);
-
-    context.ram_floor_bytes = &ram_floor_bytes;
     return prompt_split(context);
 }
 

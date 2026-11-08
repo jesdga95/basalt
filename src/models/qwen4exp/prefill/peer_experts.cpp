@@ -16,176 +16,110 @@ using namespace detail;
 
 bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
     peer_now = use_mmq && !order_peer.empty();
-    if (peer_now && peer_fp4) {
-        // a streamed chunk: the FP4 kernels in pieces (PeerPrefill::T_fp4)
-        PeerPrefill& P = *ppc;
+    if (!peer_now) return true;
+    PeerPrefill& P = *ppc;
+    const auto& f = lay.fmt[(size_t) l];
+    std::vector<PeerShare::Expert> ex;
+    PeerShare::Layer L;
+    L.gu_type = mmq_gt;
+    L.d_type = mmq_dt;
+    L.up_type = mmq_ut;
+    L.up_at = mmq_gb;
+    const size_t n = order_peer.size();
+    if (peer_fp4) {
+        // a streamed chunk: the FP4 kernels in pieces of at most G rows (PeerPrefill::T_fp4), the blobs read in place
         if (!fp4_l) {
             err = "prefill: the peer's share of a streamed chunk needs the FP4 experts";
             return false;
         }
-        // the peer's experts' rows, relative to its block, in pieces of at most G rows
-        const size_t n = order_peer.size();
-        P.bounds_host.resize(n + 1);
-        for (size_t j = 0; j < n; ++j) P.bounds_host[j] = m.off[(size_t) order_peer[j]] - (int32_t) rows_local;
-        P.bounds_host[n] = (int32_t) rows_peer;
-        fp4::cut_pieces(P.bounds_host.data(), (int) n, P.G, P.pieces);
+        std::vector<int32_t> bounds(n + 1);
+        for (size_t j = 0; j < n; ++j) bounds[j] = m.off[(size_t) order_peer[j]] - (int32_t) rows_local;
+        bounds[n] = (int32_t) rows_peer;
+        fp4::cut_pieces(bounds.data(), (int) n, P.G, P.pieces);
         const fp4::Pieces& pc = P.pieces;
-        const int ngr = (int) pc.group.size() - 1;
-        P.f_rel_host.clear();
-        P.f_rel_at.clear();
-        for (int g2 = 0; g2 < ngr; ++g2) {
-            P.f_rel_at.push_back(P.f_rel_host.size());
-            for (int i = pc.group[(size_t) g2]; i <= pc.group[(size_t) g2 + 1]; ++i)
-                P.f_rel_host.push_back(pc.bounds[(size_t) i] - pc.bounds[(size_t) pc.group[(size_t) g2]]);
-        }
-        if (P.f_rel_host.size() > P.f_rel_cap) {
-            err = "prefill: the peer's piece table is too small";
-            return false;
-        }
-        // the activations to the host once the router has read them (the host buffer is free
-        // once the peer's upload of the last layer's is done)
-        cudaEventRecord(P.ev_in, m.cs);
-        cudaStreamWaitEvent(P.x_out, P.ev_in, 0);
-        if (P.hx_live) cudaStreamWaitEvent(P.x_out, P.ev_hx_free, 0);
-        cudaMemcpyAsync(P.hx, m.mixed, (size_t) T * N * 4, cudaMemcpyDeviceToHost, P.x_out);
-        cudaEventRecord(P.ev_hx, P.x_out);
-        P.hx_live = true;
-        const int prevd = m.device;
-        cudaSetDevice(P.dev);
-        const cudaStream_t ps = P.s;
-        cudaStreamWaitEvent(ps, P.ev_hx, 0);
-        cudaMemcpyAsync(P.mixed, P.hx, (size_t) T * N * 4, cudaMemcpyHostToDevice, ps);
-        cudaEventRecord(P.ev_hx_free, ps);
-        cudaMemcpyAsync(P.src, src_h + rows_local, (size_t) rows_peer * 4, cudaMemcpyHostToDevice, ps);
-        cudaMemcpyAsync(P.f_rel, P.f_rel_host.data(), P.f_rel_host.size() * 4, cudaMemcpyHostToDevice, ps);
-        // the layer's activations as FP4, once per token (the primary's bytes)
-        fp4::quantize_tokens(P.mixed, T, N, N, P.f_a4x, P.f_gsx, ps);
-        const auto& f = lay.fmt[(size_t) l];
-        for (int g2 = 0; g2 < ngr; ++g2) {
-            const int i0 = pc.group[(size_t) g2], ns = pc.group[(size_t) g2 + 1] - i0;
-            const int64_t r0 = pc.bounds[(size_t) i0], nr = pc.bounds[(size_t) (i0 + ns)] - r0;
-            const int32_t* rb = P.f_rel + P.f_rel_at[(size_t) g2];
-            const int b = g2 & 1;
-            if (P.dm_live[b]) cudaStreamWaitEvent(ps, P.ev_dm[b], 0);   // its last rows have left
+        for (size_t g2 = 0; g2 + 1 < pc.group.size(); ++g2)
+            for (int i = pc.group[g2]; i < pc.group[g2 + 1]; ++i) {
+                PeerShare::Expert x;
+                x.blob = P.peer->slot_ptr(l, order_peer[(size_t) pc.expert[(size_t) i]]);
+                x.on_peer = true;
+                x.tok = src_h + rows_local + pc.bounds[(size_t) i];
+                x.n = pc.bounds[(size_t) i + 1] - pc.bounds[(size_t) i];
+                x.group = i == pc.group[g2];
+                ex.push_back(x);
+            }
+        const size_t scales_at = peer_scales_at(std::max(P.T_max, P.T_fp4));
+        // the layer's activations as FP4 once per token (the primary's bytes), on the peer before its first launch
+        L.quantize = [scales_at](const float* x, int tokens, void* dst, void* stream) {
+            fp4::quantize_tokens(x, tokens, N, N, dst, (float*) ((uint8_t*) dst + scales_at), stream);
+        };
+        L.stage = [](const std::vector<std::pair<const uint8_t*, bool>>&, uint8_t*, void*) {};
+        PeerPrefill* pp = &P;
+        const size_t down_off = f.down_off, tail_off = f.bytes - f.tail;
+        L.products = [pp, scales_at, down_off, tail_off](const PeerShare::Launch& lv, void* stream) {
+            const cudaStream_t s = (cudaStream_t) stream;
+            if (lv.first) {
+                cudaMemcpyAsync(pp->f_a4x, lv.act, fp4::token_bytes(lv.n_tokens, N), cudaMemcpyHostToDevice, s);
+                cudaMemcpyAsync(pp->f_gsx, (const uint8_t*) lv.act + scales_at, (size_t) lv.n_tokens * 4,
+                                cudaMemcpyHostToDevice, s);
+            }
             fp4::Group fg;
-            fg.n = ns;
-            for (int i = 0; i < ns; ++i)
-                fg.blob[i] = P.peer->slot_ptr(l, order_peer[(size_t) pc.expert[(size_t) (i0 + i)]]);
-            fg.bounds_host = P.f_rel_host.data() + P.f_rel_at[(size_t) g2];
-            fg.bounds_dev = rb;
-            fg.ids = P.src + r0; fg.a4x = P.f_a4x; fg.gsx = P.f_gsx; fg.tokens = T;
-            fg.down_off = f.down_off;
-            fg.tail_off = f.bytes - f.tail;
-            fg.h = P.H_g; fg.dm = P.Dm_b[b];
-            fg.a4h = P.f_a4h; fg.gsh = P.f_gsh; fg.toh = P.f_toh; fg.rel = P.f_toh + (MMQ_GROUP + 1);
-            fp4::run_group(fg, P.G, ps);
-            // the rows back through a host buffer whose last rows have reached Dm
-            const int hb = g2 % PeerPrefill::kRes;
-            cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
-            cudaStreamWaitEvent(P.s_out, P.ev_grp[g2 % PeerPrefill::kGrpEv], 0);
-            if (P.res_live[hb]) cudaStreamWaitEvent(P.s_out, P.ev_h2d[hb], 0);
-            cudaMemcpyAsync(P.hres[hb], P.Dm_b[b], (size_t) nr * N * 4, cudaMemcpyDeviceToHost, P.s_out);
-            cudaEventRecord(P.ev_dm[b], P.s_out);
-            P.dm_live[b] = true;
-            cudaEventRecord(P.ev_d2h[hb], P.s_out);
-            cudaSetDevice(prevd);
-            cudaStreamWaitEvent(P.res_in, P.ev_d2h[hb], 0);
-            cudaMemcpyAsync(m.Dm + (size_t) (rows_local + r0) * N, P.hres[hb], (size_t) nr * N * 4,
-                            cudaMemcpyHostToDevice, P.res_in);
-            cudaEventRecord(P.ev_h2d[hb], P.res_in);
-            P.res_live[hb] = true;
-            cudaSetDevice(P.dev);
-        }
-        cudaSetDevice(prevd);
-        cudaEventRecord(P.ev_res, P.res_in);
-    } else if (peer_now) {
-        PeerPrefill& P = *ppc;
-        cudaEventRecord(P.ev_in, m.cs);
-        int prevd = 0;
-        cudaGetDevice(&prevd);
-        cudaSetDevice(P.dev);
-        const cudaStream_t ps = P.s;
-        cudaStreamWaitEvent(ps, P.ev_in, 0);
-        if (P.out_pending) { cudaStreamWaitEvent(ps, P.ev_done, 0); P.out_pending = false; }
-        cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
-        cudaMemcpyAsync(P.src, src_h + rows_local, (size_t) rows_peer * 4, cudaMemcpyHostToDevice, ps);
-        const size_t n = order_peer.size();
-        {
-            // groups of up to MMQ_GROUP experts and at most G rows, each computed from its own rows
-            P.groups.clear();
-            {
-                size_t g0 = 0;
-                int64_t gr = 0;
-                for (size_t j = 0; j < n; ++j) {
-                    const int64_t c = m.cnt[(size_t) order_peer[j]];
-                    if (j > g0 && (j - g0 == (size_t) MMQ_GROUP || gr + c > P.G)) { P.groups.push_back({g0, j}); g0 = j; gr = 0; }
-                    gr += c;
-                }
-                if (n > g0) P.groups.push_back({g0, n});
+            fg.n = lv.n;
+            for (int i = 0; i < lv.n; ++i) fg.blob[i] = lv.blob[i];
+            fg.bounds_host = lv.bounds_host;
+            fg.bounds_dev = lv.bounds;
+            fg.ids = lv.tok; fg.a4x = pp->f_a4x; fg.gsx = pp->f_gsx; fg.tokens = lv.n_tokens;
+            fg.down_off = down_off;
+            fg.tail_off = tail_off;
+            fg.h = pp->f_h; fg.dm = lv.out;
+            fg.a4h = pp->f_a4h; fg.gsh = pp->f_gsh; fg.toh = pp->f_toh; fg.rel = pp->f_toh + (MMQ_GROUP + 1);
+            fp4::run_group(fg, pp->G, stream);
+        };
+    } else {
+        // groups of up to MMQ_GROUP experts and at most G rows, each one launch
+        size_t g0 = 0;
+        int64_t gr = 0;
+        for (size_t j = 0; j < n; ++j) {
+            const int32_t e = order_peer[j];
+            const int64_t c = m.cnt[(size_t) e];
+            PeerShare::Expert x;
+            x.blob = P.peer->slot_ptr(l, e);
+            x.on_peer = true;
+            x.tok = src_h + m.off[(size_t) e];
+            x.n = (int) c;
+            x.group = j == 0 || j - g0 == (size_t) MMQ_GROUP || gr + c > P.G;
+            if (x.group) {
+                g0 = j;
+                gr = 0;
             }
-            const size_t ng = P.groups.size();
-            P.bounds_host.resize(n + 1 + ng * (MMQ_GROUP + 1));
-            for (size_t j = 0; j < n; ++j) P.bounds_host[j] = m.off[(size_t) order_peer[j]] - (int32_t) rows_local;
-            P.bounds_host[n] = (int32_t) rows_peer;
-            for (size_t g2 = 0; g2 < ng; ++g2)
-                for (size_t i = 0; i <= MMQ_GROUP; ++i)
-                    P.bounds_host[n + 1 + g2 * (MMQ_GROUP + 1) + i] =
-                        P.bounds_host[std::min(P.groups[g2].second, P.groups[g2].first + i)] -
-                        P.bounds_host[P.groups[g2].first];
-            cudaMemcpyAsync(P.bounds, P.bounds_host.data(), P.bounds_host.size() * 4, cudaMemcpyHostToDevice, ps);
-            const auto& f = lay.fmt[(size_t) l];
-            for (size_t g2 = 0; g2 < ng; ++g2) {
-                const size_t j0 = P.groups[g2].first, j1 = P.groups[g2].second;
-                const int ngx = (int) (j1 - j0);
-                int64_t maxr = 0;
-                for (size_t j = j0; j < j1; ++j) {
-                    const int32_t e = order_peer[j];
-                    maxr = std::max<int64_t>(maxr, m.cnt[(size_t) e]);
-                    const uint8_t* bd = P.peer->slot_ptr(l, e);
-                    const size_t q = j - j0;
-                    if (lay.native)
-                        mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
-                                           P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps,
-                                           f.tail ? bd + f.bytes - f.tail : nullptr,
-                                           grp_scales(P.grp_d) + 4 * q);
-                    else
-                        mmq::gather_q2(bd, P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
-                }
-                const int64_t r0 = P.bounds_host[j0], nr = P.bounds_host[j1] - r0;
-                if (nr <= 0) continue;
-                const int32_t* rel = P.bounds + n + 1 + g2 * (MMQ_GROUP + 1);
-                cudaMemsetAsync(P.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, ps);
-                cudaMemsetAsync(P.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, ps);
-                mmq::quantize(P.mixed, P.src + r0, P.Xq_g, mmq_gt, N, N, nr, ps);
-                mmq::Product gu;
-                gu.w = P.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
-                gu.n = ngx; gu.xq = P.Xq_g; gu.bounds = rel; gu.ids = P.ident;
-                gu.total_rows = nr; gu.max_rows = maxr; gu.dst = P.GU_g; gu.ld_dst = 1280;
-                P.run_ctx->run(gu, ps);
-                mmq::swiglu(P.GU_g, P.H_g, nr, 640, !lay.native, ps,
-                            lay.native && f.tail ? grp_scales(P.grp_d) : nullptr, rel, ngx);
-                mmq::quantize(P.H_g, nullptr, P.Hq_g, mmq_dt, 640, 640, nr, ps);
-                const int b = (int) (g2 & 1);
-                if (P.dm_live[b]) cudaStreamWaitEvent(ps, P.ev_dm[b], 0);   // its last rows have left
-                mmq::Product dn;
-                dn.w = P.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
-                dn.n = ngx; dn.xq = P.Hq_g; dn.bounds = rel;
-                dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm_b[b];
-                dn.ld_dst = N;
-                P.run_ctx->run(dn, ps);
-                cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
-                cudaStreamWaitEvent(P.s_out, P.ev_grp[g2 % PeerPrefill::kGrpEv], 0);
-                cudaMemcpyPeerAsync(m.Dm + (size_t) (rows_local + r0) * N, prevd, P.Dm_b[b], P.dev,
-                                    (size_t) nr * N * 4, P.s_out);
-                cudaEventRecord(P.ev_dm[b], P.s_out);
-                P.dm_live[b] = true;
-            }
+            gr += c;
+            ex.push_back(x);
         }
-        cudaEventRecord(P.ev_done, P.s_out);
-        P.out_pending = true;
-        cudaSetDevice(prevd);
+        // a group's blobs out of the peer's slots into the MMQ layout of a group buffer (peer_down_at)
+        const size_t gub = mmq_gub, gb = mmq_gb, ub = mmq_ub, db = mmq_db, down_at = peer_down_at(mmq_plan());
+        const bool native = lay.native;
+        const size_t up_off = f.up_off, down_off = f.down_off, tail = f.tail, bytes = f.bytes;
+        L.gu_stride = gub;
+        L.down_off = down_at;
+        L.d_stride = db;
+        L.stage = [=](const std::vector<std::pair<const uint8_t*, bool>>& blobs, uint8_t* grp, void* stream) {
+            uint8_t* grp_d = grp + down_at;
+            for (size_t q = 0; q < blobs.size(); ++q) {
+                const uint8_t* bd = blobs[q].first;
+                if (native)
+                    mmq::gather_native(bd, bd + up_off, gb, bd + down_off, db, grp + q * gub, grp_d + q * db, stream,
+                                       tail ? bd + bytes - tail : nullptr, grp_scales(grp_d) + 4 * q, ub);
+                else
+                    mmq::gather_q2(bd, grp + q * gub, grp_d + q * db, stream);
+            }
+            cudaMemsetAsync(grp + blobs.size() * gub, 0, MMQ_TAIL, (cudaStream_t) stream);
+            cudaMemsetAsync(grp_d + blobs.size() * db, 0, MMQ_TAIL, (cudaStream_t) stream);
+        };
+        L.act = [native, tail, down_at](const float* gu, float* h, const PeerShare::Launch& lv, void* stream) {
+            const float* sc = native && tail ? grp_scales((uint8_t*) lv.stage + down_at) + 4 * lv.q0 : nullptr;
+            mmq::swiglu(gu, h, lv.rows, 640, !native, stream, sc, lv.bounds, lv.n);
+        };
     }
-    return true;
+    return P.share->run(L, m.mixed, (int) T, ex, m.Dm + (size_t) rows_local * N, m.cs, err);
 }
 
 }  // namespace basalt::prefill

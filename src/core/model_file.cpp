@@ -432,6 +432,7 @@ void model_sources(const ModelFile& m, ModelSources& s) {
     s.mtp_dense_index = m.range("mtp/dense.index");
     s.mtp_experts = m.range("mtp/experts");
     s.mtp_draft_vocab = m.range("mtp/draft_vocab");
+    s.vision = m.range("vision/mmproj");
     s.model_path = m.path();
 }
 

@@ -8,7 +8,7 @@
 2. `--submitter NAME` is required: the name you want shown (one name with no spaces, up to 40 characters; it is not verified). `notes` (up to 200 characters) is optional and added by hand.
 3. Review the row in `docs/community/benchmarks.json`, commit it and open a pull request. If the bench could not write the file, it prints the row and says where to paste it.
 
-The row records `model` (`Qwen3.8-Flash-Next` or `DeepSeek-V4.1-Flash`, the name the model's adapter reports for the pack's architecture, not its file name) and `kv`, the KV cache format the run used: the preset asks for `--kv int8` and runs the model's own format where the model has no such option. Rows of different models are not comparable.
+The row records `model` (`Qwen3.8-Flash-Next` or `DeepSeek-V4.1-Flash`, the name the model's adapter reports for the pack's architecture, not its file name) and `kv`, the KV cache format the run used: the preset passes `--kv int8` to Flash-Next and `--kv fp8` to DeepSeek, and a model that takes neither runs its own format. Rows of different models are not comparable.
 
 You need enough free RAM that no expert is read from the SSD; the bench checks this and refuses to print a row otherwise.
 

@@ -126,10 +126,10 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(flag_value(qfile, "--max-context"), "262144")     # slot-full-context
         self.assertEqual(flag_value(dfile, "--max-context"), "1048576")
 
-    def test_the_ram_guard_switch(self):
-        p = conf({"engine": {"no-ram-guard": True}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
+    def test_the_ram_reserve(self):
+        p = conf({"engine": {"ram-reserve-mib": 4096}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
         for _, _, words, _ in model_settings(build_parser(), ["--config", p]):
-            self.assertIn("--no-ram-guard", words)
+            self.assertEqual(flag_value(words, "--ram-reserve-mib"), "4096")
 
     def test_version(self):
         ap = build_parser()
@@ -272,6 +272,11 @@ class Precedence(unittest.TestCase):
             self.assertEqual(file_words, words)
         _, _, _, cli_words = parse(["--route-tail-skip", "--resident-experts"])
         self.assertEqual(cli_words, ["--route-tail-skip", "--resident-experts"])
+
+    def test_no_peer_prefill_config_words(self):
+        for value, words in ((True, ["--no-peer-prefill"]), (False, [])):
+            _, _, file_words, _ = parse([], {"engine": {"no-peer-prefill": value}})
+            self.assertEqual(file_words, words)
 
     def test_route_prior_config_words(self):
         _, _, file_words, _ = parse([], {"engine": {"route-prior": 1.5}})

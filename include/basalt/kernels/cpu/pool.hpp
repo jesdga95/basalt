@@ -89,6 +89,11 @@ public:
 
     /// A native pack's layer (ggml-cpu arithmetic, `nact` activations): every expert split by rows across all threads.
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    /// run_split_multi_native in two halves: start publishes the layer's batch, which the workers take while the caller
+    /// does other work; finish joins them and returns once every part is done. A layer of more than kMaxSplitMulti
+    /// experts runs whole in start. `jobs` and their buffers stay untouched until finish returns.
+    void start_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    void finish_split_multi_native();
     static constexpr int kMaxSplitMulti = 96;
     /// Row-range tasks per thread in each phase of the multi-token paths.  The cores differ in speed, so a thread
     /// that finishes early claims another: the more and smaller the tasks, the shorter the wait for the slowest one
@@ -133,6 +138,9 @@ private:
     /// quantization, and the down projection into the job's outputs.
     void native_gu_range(int e, int r0, int r1);
     void native_quantize(int e);
+    /// A down part that finds its expert's intermediate not yet quantized: prefetch its `bytes` of down rows at `p`
+    /// while the gate/up parts finish, stopping early once they have.
+    void prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const;
     void native_down_range(int e, int r0, int r1);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
@@ -198,7 +206,18 @@ private:
         std::atomic<int> ready{0};
     };
     std::unique_ptr<FusedExpert[]> fused_;
-    int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1;
+    int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1, fused_tail_ = 1;
+    /// The first row of `part` of `parts` over `rows` rows (`part == parts` gives `rows`): equal parts, then
+    /// `fused_tail_` quarter-size ones.
+    int part_row(int part, int parts, int rows) const;
+    /// Sets up one batch of at most kMaxSplitMulti experts: its parts per expert; the tasks it makes and the gate/up
+    /// share of its bytes.
+    int split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int n, double& gu_share);
+    // a started batch: its epoch, tasks (0: none), experts, gate/up share and start
+    uint32_t pend_epoch_ = 0;
+    int pend_tasks_ = 0, pend_n_ = 0;
+    double pend_gu_share_ = 0;
+    std::chrono::steady_clock::time_point pend_t0_{};
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;

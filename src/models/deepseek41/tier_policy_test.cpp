@@ -51,29 +51,32 @@ int main() {
             CHECK(p + f - b >= f);   // the CPU always takes every file-backed miss
         }
 
-    // homes: one card keeps its copies and the file the rest; two cards leave nothing in the file when the rest fits
+    // homes: a RAM shortfall puts homes on the main card, with or without a second card; RAM that takes the rest leaves
+    // the main card all copies
     {
-        Homes h = plan_homes(384, 34, 0, 305);
-        CHECK(h.main == 0 && h.peer == 0 && h.ram == 305 && h.file == 79);
-        h = plan_homes(384, 34, 46, 320);
+        Homes h = plan_homes(384, 34, 0, 305, -1);
+        CHECK(h.main == 34 && h.peer == 0 && h.ram == 305 && h.file == 45);
+        h = plan_homes(384, 34, 0, 384, -1);
+        CHECK(h.main == 0 && h.peer == 0 && h.ram == 384 && h.file == 0);
+        h = plan_homes(384, 34, 46, 320, -1);
         CHECK(h.main == 34 && h.peer == 46 && h.ram == 304 && h.file == 0);
-        h = plan_homes(384, 34, 46, 420);
+        h = plan_homes(384, 34, 46, 420, -1);
         CHECK(h.main == 0 && h.peer == 46 && h.ram == 338 && h.file == 0);
-        h = plan_homes(384, 34, 46, 220);
+        h = plan_homes(384, 34, 46, 220, -1);
         CHECK(h.main == 34 && h.peer == 46 && h.ram == 220 && h.file == 84);
-        h = plan_homes(384, 34, 500, 10);
+        h = plan_homes(384, 34, 500, 10, -1);
         CHECK(h.main == 0 && h.peer == 384 && h.ram == 0 && h.file == 0);
         // a shortfall of n places puts n experts in the file, never more
         for (int n : {1, 2, 13}) {
-            h = plan_homes(384, 34, 46, 304 - n);
+            h = plan_homes(384, 34, 46, 304 - n, -1);
             CHECK(h.main == 34 && h.ram == 304 - n && h.file == n);
-            h = plan_homes(384, 34, 0, 384 - n);
-            CHECK(h.file == n);
+            h = plan_homes(384, 34, 0, 350 - n, -1);
+            CHECK(h.main == 34 && h.file == n);
         }
         for (int mp : {0, 10, 80})
             for (int pp : {0, 7, 46})
                 for (int rp : {0, 100, 384}) {
-                    h = plan_homes(384, mp, pp, rp);
+                    h = plan_homes(384, mp, pp, rp, -1);
                     CHECK(h.main + h.peer + h.ram + h.file == 384);
                     CHECK(h.main >= 0 && h.peer >= 0 && h.ram >= 0 && h.file >= 0);
                     // every rank has one place and the places hold what the plan says
@@ -82,13 +85,35 @@ int main() {
                     CHECK(n[(int) Place::Main] == h.main && n[(int) Place::Peer] == h.peer &&
                           n[(int) Place::Ram] == h.ram && n[(int) Place::File] == h.file);
                 }
-        // one card: the RAM tier is the head of the order; two: its copies' head stays in RAM ahead of the second card
-        h = plan_homes(384, 34, 0, 305);
-        CHECK(place_of_rank(h, 59, 0) == Place::Ram && place_of_rank(h, 59, 304) == Place::Ram && place_of_rank(h, 59, 305) == Place::File);
-        h = plan_homes(384, 34, 46, 420);
+        // one card: the main card's homes head the order, then RAM and the file; RAM that takes all is the head when the
+        // main card holds copies; two cards: the copies' head stays in RAM ahead of the second card
+        h = plan_homes(384, 34, 0, 305, -1);
+        CHECK(place_of_rank(h, 59, 33) == Place::Main && place_of_rank(h, 59, 34) == Place::Ram && place_of_rank(h, 59, 338) == Place::Ram &&
+              place_of_rank(h, 59, 339) == Place::File);
+        h = plan_homes(384, 34, 0, 384, -1);
+        CHECK(place_of_rank(h, 59, 0) == Place::Ram && place_of_rank(h, 59, 383) == Place::Ram);
+        h = plan_homes(384, 34, 46, 420, -1);
         CHECK(place_of_rank(h, 59, 58) == Place::Ram && place_of_rank(h, 59, 59) == Place::Peer && place_of_rank(h, 59, 105) == Place::Ram);
-        h = plan_homes(384, 34, 46, 320);
+        h = plan_homes(384, 34, 46, 320, -1);
         CHECK(place_of_rank(h, 59, 33) == Place::Main && place_of_rank(h, 59, 34) == Place::Peer && place_of_rank(h, 59, 80) == Place::Ram);
+    }
+
+    // the machine's capacity decides homes against copies-only: the same live free RAM, different results
+    {
+        Homes h = plan_homes(384, 22, 46, 338, 345);   // fits, but not twice over: homes, the live room fills the rest
+        CHECK(h.main == 22 && h.ram == 316 && h.file == 0);
+        h = plan_homes(384, 22, 46, 330, 345);         // the live room moves RAM and the file, never the placement
+        CHECK(h.main == 22 && h.ram == 316 && h.file == 0);
+        h = plan_homes(384, 22, 46, 310, 345);
+        CHECK(h.main == 22 && h.ram == 310 && h.file == 6);
+        h = plan_homes(384, 22, 46, 338, 360);         // room for the second card's rest and the homes again: copies only
+        CHECK(h.main == 0 && h.ram == 338 && h.file == 0);
+        h = plan_homes(384, 22, 46, 330, 1000);        // other programs hold RAM now: a short tier, not homes
+        CHECK(h.main == 0 && h.ram == 330 && h.file == 8);
+        h = plan_homes(384, 34, 0, 384, 400);          // one card
+        CHECK(h.main == 34 && h.ram == 350 && h.file == 0);
+        h = plan_homes(384, 34, 0, 384, 418);
+        CHECK(h.main == 0 && h.ram == 384);
     }
 
     // promotion budget: copies come in pieces of at most kPieceBytes

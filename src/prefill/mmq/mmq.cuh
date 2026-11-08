@@ -20,10 +20,12 @@ typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const
     float * __restrict__ dst, const int stride, const int i_max, const int j_max);
 
 // Layout of the scales and partial sums in a block_q8_1_mmq; D4 is one 32 bit scale per 32 values, DS4 one 16 bit
-// scale and one 16 bit partial sum per 32 values (the formats with a per-block minimum need the sums).
+// scale and one 16 bit partial sum per 32 values (the formats with a per-block minimum need the sums), D2S6 one 16 bit
+// scale per 64 values and one 16 bit partial sum per 16 of the first 96 values (Q2_K's minimum per 16 values).
 enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D4,
     MMQ_Q8_1_DS_LAYOUT_DS4,
+    MMQ_Q8_1_DS_LAYOUT_D2S6,
 };
 
 static constexpr int QK8_1_MMQ  = 4*QK8_1;
@@ -43,6 +45,8 @@ struct block_q8_1_mmq {
     union {
         float d4[4];    // 1 32 bit scale per 32 values, stored as d0,d1,d2,d3
         half2 ds4[4];   // 1 16 bit scale + 1 16 bit partial sum per 32 values, stored as d0,s0,d1,s1,d2,s2,d3,s3
+        half  d2s6[8];  // 1 16 bit scale per 64 values + 1 16 bit partial sum per 16 values for the first 96 values,
+                        //     stored as d0,d1,s1,s2,s3,s4,s5,s6
     };
     int8_t qs[QK8_1_MMQ];
 };
@@ -56,11 +60,16 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q8_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_Q5_0:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_Q2_K:
+            return MMQ_Q8_1_DS_LAYOUT_D2S6;
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_IQ1_S:
             return MMQ_Q8_1_DS_LAYOUT_DS4;
+        case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ2_XXS:
@@ -100,6 +109,7 @@ struct tile_x_sizes {
 enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1,
+    GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K,
 };
 
@@ -109,6 +119,8 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
             return 2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0 + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1:
             return 2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_1 + 4;
+        case GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K:
+            return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K         + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2       + 4;
         default:
@@ -118,6 +130,7 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
 
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1)  % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K)  % 8 == 4, "Wrong padding.");
 
 // Config options for the MMQ kernel.
@@ -248,10 +261,25 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_load_tiles_q8_0<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_Q5_0:
+            return ggml_cuda_mmq_util_funcs(
+                ggml_cuda_mmq_load_tiles_q5_0<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_Q5_1:
             return ggml_cuda_mmq_util_funcs(
                 ggml_cuda_mmq_load_tiles_q5_1<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma<type, J, fallback>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_Q2_K:
+            return ggml_cuda_mmq_util_funcs(
+                ggml_cuda_mmq_load_tiles_q2_K<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma<type, J, fallback>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_Q3_K:    // one scale per 16 values: the Q3_K-layout dot
+            return ggml_cuda_mmq_util_funcs(
+                ggml_cuda_mmq_load_tiles_q3_K<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_Q4_K:
             return ggml_cuda_mmq_util_funcs(
@@ -807,6 +835,13 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config) {
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// Raises the tile's dynamic shared memory limit once per device (the launches and `mul_mat_q_load` share the flags).
+template <ggml_type type, int J, bool fallback>
+static void mul_mat_q_raise_smem(const int nbytes_shared) {
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
+}
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -820,8 +855,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
+    mul_mat_q_raise_smem<type, J, fallback>(nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
@@ -981,23 +1015,53 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     }
 }
 
-// explicit instantiations live in instances/
-#define DECL_MMQ_CASE(type) \
-    template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream)
+// Readies every tile mul_mat_q_case may launch for weights of `nrows_x` rows on the current device: loads its kernels
+// and raises their shared memory limit. Done at a tile's first launch instead, either waits for the copies queued on
+// the card.
+template <ggml_type type, bool fallback, int J>
+static void mul_mat_q_load_J(const size_t smpbo) {
+    if constexpr (J <= 128) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback);
+        const int nbytes_shared = config.type != GGML_TYPE_COUNT ? (int) mmq_get_nbytes_shared(config) : 0;
+        if (nbytes_shared > 0 && (size_t) nbytes_shared <= smpbo) {
+            ggml_cuda_func_load((const void *) mul_mat_q<type, J, fallback>);
+            mul_mat_q_raise_smem<type, J, fallback>(nbytes_shared);
+            if (ggml_cuda_mmq_get_stream_k(type, J, fallback))
+                ggml_cuda_func_load((const void *) mul_mat_q_stream_k_fixup<type, J, fallback>);
+        }
+        mul_mat_q_load_J<type, fallback, J + 8>(smpbo);
+    }
+}
 
-extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
-extern DECL_MMQ_CASE(GGML_TYPE_Q8_0);
-extern DECL_MMQ_CASE(GGML_TYPE_Q5_1);
-extern DECL_MMQ_CASE(GGML_TYPE_Q4_K);
-extern DECL_MMQ_CASE(GGML_TYPE_Q5_K);
-extern DECL_MMQ_CASE(GGML_TYPE_Q6_K);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ1_M);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XXS);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XS);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ2_S);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ3_XXS);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ3_S);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ4_NL);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
-extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+template <ggml_type type>
+void mul_mat_q_load(int64_t nrows_x) {
+    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    if (nrows_x % 128 == 0) mul_mat_q_load_J<type, false, 8>(smpbo);
+    else mul_mat_q_load_J<type, true, 8>(smpbo);
+}
+
+// explicit instantiations live in instances/
+#define MMQ_INSTANCES(prefix, type) \
+    prefix template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream); \
+    prefix template void mul_mat_q_load<type>(int64_t nrows_x)
+#define DECL_MMQ_CASE(type) MMQ_INSTANCES(, type)
+
+MMQ_INSTANCES(extern, GGML_TYPE_Q2_0);
+MMQ_INSTANCES(extern, GGML_TYPE_Q8_0);
+MMQ_INSTANCES(extern, GGML_TYPE_Q5_0);
+MMQ_INSTANCES(extern, GGML_TYPE_Q5_1);
+MMQ_INSTANCES(extern, GGML_TYPE_Q2_K);
+MMQ_INSTANCES(extern, GGML_TYPE_Q3_K);
+MMQ_INSTANCES(extern, GGML_TYPE_Q4_K);
+MMQ_INSTANCES(extern, GGML_TYPE_Q5_K);
+MMQ_INSTANCES(extern, GGML_TYPE_Q6_K);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ1_S);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ1_M);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ2_XXS);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ2_XS);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ2_S);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ3_XXS);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ3_S);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ4_NL);
+MMQ_INSTANCES(extern, GGML_TYPE_IQ4_XS);
+MMQ_INSTANCES(extern, GGML_TYPE_NVFP4);

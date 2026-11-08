@@ -11,6 +11,7 @@ namespace basalt::models::deepseek41 {
 namespace {
 
 constexpr int kRowsPerBlock = 8;        // one warp per output row
+constexpr int kRowGroups = 4;           // rows per warp in the expert kernels, which share one staged activation row
 constexpr int kLatentW = 512;
 constexpr int kRopeW = 64;
 constexpr int kMarkovRank = 256;
@@ -78,14 +79,15 @@ __device__ __forceinline__ float row_dot(const unsigned char* row, const float* 
     return warp_sum(acc);
 }
 
-// Grid (n_ff / 4, pairs): the block's 8 warps are 4 rows x (gate, up).
+// Grid (n_ff / (4 * kRowGroups), pairs): the block's 8 warps are 4 rows x (gate, up), kRowGroups times over the
+// activation row it staged once.
 template <int ITERS>
 __global__ void __launch_bounds__(256) k_gate_up(const unsigned char* __restrict__ gw,
                                                  const unsigned char* __restrict__ uw, int n_in, int n_ff,
                                                  const float* __restrict__ x, const int32_t* __restrict__ ids, int k,
                                                  float clamp, float* __restrict__ h) {
     extern __shared__ __align__(16) unsigned char smem[];
-    __shared__ float res[8], tab[16];
+    __shared__ float res[kRowGroups][8], tab[16];
     const int nb = n_in / kMxfp4BlockElems;
     const size_t row_bytes = (size_t) nb * kMxfp4BlockBytes;
     float* xs = reinterpret_cast<float*>(smem);
@@ -93,20 +95,25 @@ __global__ void __launch_bounds__(256) k_gate_up(const unsigned char* __restrict
     const int pair = blockIdx.y, t = pair / k, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int e = ids[pair];
     for (int i = threadIdx.x; i < n_in; i += blockDim.x) xs[(i >> 5) * 33 + (i & 31)] = x[(size_t) t * n_in + i];
-    const int r = blockIdx.x * (kRowsPerBlock / 2) + (warp >> 1);
-    const unsigned char* w = ((warp & 1) ? uw : gw) + ((size_t) e * n_ff + r) * row_bytes;
+    const int r0 = blockIdx.x * kRowGroups * (kRowsPerBlock / 2);
     __syncthreads();
-    const float v = row_dot<ITERS>(w, xs, tab, nb, lane);
-    if (lane == 0) res[warp] = v;
+#pragma unroll 1
+    for (int q = 0; q < kRowGroups; ++q) {
+        const int r = r0 + q * (kRowsPerBlock / 2) + (warp >> 1);
+        const unsigned char* w = ((warp & 1) ? uw : gw) + ((size_t) e * n_ff + r) * row_bytes;
+        const float v = row_dot<ITERS>(w, xs, tab, nb, lane);
+        if (lane == 0) res[q][warp] = v;
+    }
     __syncthreads();
-    if (threadIdx.x < kRowsPerBlock / 2) {
-        const float g = fminf(res[2 * threadIdx.x], clamp);
-        const float u = fminf(fmaxf(res[2 * threadIdx.x + 1], -clamp), clamp);
-        h[(size_t) pair * n_ff + blockIdx.x * (kRowsPerBlock / 2) + threadIdx.x] = g / (1.f + __expf(-g)) * u;
+    if (threadIdx.x < kRowGroups * (kRowsPerBlock / 2)) {
+        const int q = threadIdx.x / (kRowsPerBlock / 2), i = threadIdx.x % (kRowsPerBlock / 2);
+        const float g = fminf(res[q][2 * i], clamp);
+        const float u = fminf(fmaxf(res[q][2 * i + 1], -clamp), clamp);
+        h[(size_t) pair * n_ff + r0 + threadIdx.x] = g / (1.f + __expf(-g)) * u;
     }
 }
 
-// Grid (n_out / 8, pairs): one warp per output row.
+// Grid (n_out / (8 * kRowGroups), pairs): one warp per output row, kRowGroups rows per warp.
 template <int ITERS>
 __global__ void __launch_bounds__(256) k_down(const unsigned char* __restrict__ dw, int n_ff, int n_out,
                                               const float* __restrict__ h, const int32_t* __restrict__ ids,
@@ -120,10 +127,13 @@ __global__ void __launch_bounds__(256) k_down(const unsigned char* __restrict__ 
     const int pair = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int e = ids[pair];
     for (int i = threadIdx.x; i < n_ff; i += blockDim.x) xs[(i >> 5) * 33 + (i & 31)] = h[(size_t) pair * n_ff + i];
-    const int r = blockIdx.x * kRowsPerBlock + warp;
     __syncthreads();
-    const float v = row_dot<ITERS>(dw + ((size_t) e * n_out + r) * row_bytes, xs, tab, nb, lane);
-    if (lane == 0) d[(size_t) pair * n_out + r] = v;
+#pragma unroll 1
+    for (int q = 0; q < kRowGroups; ++q) {
+        const int r = (blockIdx.x * kRowGroups + q) * kRowsPerBlock + warp;
+        const float v = row_dot<ITERS>(dw + ((size_t) e * n_out + r) * row_bytes, xs, tab, nb, lane);
+        if (lane == 0) d[(size_t) pair * n_out + r] = v;
+    }
 }
 
 __global__ void k_combine(const float* __restrict__ d, const float* __restrict__ w, const float* __restrict__ shared,
@@ -224,8 +234,8 @@ void check(const char* what) {
 void dspark_moe_gate_up(const void* gate_w, const void* up_w, int n_in, int n_ff, const float* x, const int32_t* ids,
                         int n_tokens, int k, float clamp, float* h, void* stream) {
     const size_t smem = padded_floats(n_in) * 4;
-    if (n_in % kMxfp4BlockElems || n_in > 6144 || n_ff % (kRowsPerBlock / 2)) throw std::invalid_argument("dspark_moe_gate_up: shape");
-    const dim3 grid(n_ff / (kRowsPerBlock / 2), n_tokens * k);
+    if (n_in % kMxfp4BlockElems || n_in > 6144 || n_ff % (kRowGroups * kRowsPerBlock / 2)) throw std::invalid_argument("dspark_moe_gate_up: shape");
+    const dim3 grid(n_ff / (kRowGroups * kRowsPerBlock / 2), n_tokens * k);
     const int iters = (n_in / kMxfp4BlockElems + 31) / 32;
     auto kern = iters <= 3 ? k_gate_up<3> : iters <= 5 ? k_gate_up<5> : k_gate_up<6>;
     kern<<<grid, 256, smem, (cudaStream_t) stream>>>((const unsigned char*) gate_w, (const unsigned char*) up_w, n_in,
@@ -236,8 +246,8 @@ void dspark_moe_gate_up(const void* gate_w, const void* up_w, int n_in, int n_ff
 void dspark_moe_down(const void* down_w, int n_ff, int n_out, const float* h, const int32_t* ids, int n_tokens, int k,
                      float* d, void* stream) {
     const size_t smem = padded_floats(n_ff) * 4;
-    if (n_ff % kMxfp4BlockElems || n_ff > 6144 || n_out % kRowsPerBlock) throw std::invalid_argument("dspark_moe_down: shape");
-    const dim3 grid(n_out / kRowsPerBlock, n_tokens * k);
+    if (n_ff % kMxfp4BlockElems || n_ff > 6144 || n_out % (kRowGroups * kRowsPerBlock)) throw std::invalid_argument("dspark_moe_down: shape");
+    const dim3 grid(n_out / (kRowGroups * kRowsPerBlock), n_tokens * k);
     const int iters = (n_ff / kMxfp4BlockElems + 31) / 32;
     auto kern = iters <= 3 ? k_down<3> : iters <= 5 ? k_down<5> : k_down<6>;
     kern<<<grid, 256, smem, (cudaStream_t) stream>>>((const unsigned char*) down_w, n_ff, n_out, h, ids, d);

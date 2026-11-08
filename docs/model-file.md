@@ -24,7 +24,7 @@ without the official tuned drafter is slower than the official file.
 
 - `dense`: F32 and BF16 tensors. `gguf`: quantized non-expert tensors. `experts`: routed experts per layer.
 - `engram`: the Engram table alone (IQ4_NL rows of 144 bytes), 2 MiB aligned.
-- `vision/mmproj`: present only when built with `--mmproj`.
+- `vision/mmproj`: present only when built with `--mmproj`; the engine and `basalt-vision --model FILE.basalt` read it in place.
 - `dspark/gguf`: DeepSeek's DSpark drafter. Attach it to an existing pack without copying weights:
 
 ```sh
@@ -51,5 +51,5 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
     --out Qwen3.8-FN-NVIDIA-NVFP4-Q8.basalt --name "Qwen3.8-Flash-Next NVIDIA-NVFP4"
 ```
 
-`--mtp-dense FILE` (the `mtp/dense` bytes of an official IQ3_S, IQ3_XXS or Q2_0 pack) swaps in a tuned drafter layer; the converter
+`--mtp-dense FILE` (the `mtp/dense` bytes of an official NVFP4, UD-IQ1_M, UD-IQ2_XS or UD-IQ3_XXS pack) swaps in a tuned drafter layer; the converter
 records it in `meta.mtp.dense`. Output is about 122 GiB (123 GiB for the 8-bit variant). The base's vocabulary must be NVIDIA's.

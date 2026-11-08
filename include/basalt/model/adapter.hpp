@@ -78,6 +78,7 @@ struct LoadRequest {
     std::vector<int> peer_devices;    ///< CUDA devices of the expert tier cards after the main one
     int64_t max_context = 0;          ///< --max-context, or the default every model shares
     int sessions = 1;                 ///< sessions the model will be asked for (--batch)
+    bool vision = false;              ///< --vision: requests may carry images (each slot keeps buffers for one)
     std::string expert_profile;       ///< the routing order of the experts (empty: the file's own order)
     int expert_cache = 0;             ///< VRAM expert slots over all layers (0 or -1: from the free memory)
     uint64_t resident_budget = 0;     ///< bytes the RAM tier may take (0: from the free memory)
@@ -93,6 +94,7 @@ struct LoadRequest {
     std::string profile_dir;          ///< the engine's data/profiles, where a model finds the files its name keys
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
+    std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
 };
 
 struct DecodeRequest {

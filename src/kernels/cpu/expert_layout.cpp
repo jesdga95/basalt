@@ -169,14 +169,15 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
             continue;
         }
         std::istringstream ss(line);
-        long long l = -1, gt = -1, dt = -1;
+        long long l = -1, gt = -1, dt = -1, ut = -1;
         unsigned long long off = 0, blob = 0;
-        if (!(ss >> l >> gt >> dt >> off >> blob) || l < 0 || l >= n_layers) {
+        // v7 adds the up rows' type as a sixth column
+        if (!(ss >> l >> gt >> dt >> off >> blob) || l < 0 || l >= n_layers || (L.version >= 7 && !(ss >> ut))) {
             err = "expert layout: a malformed line: " + line;
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err, swiglu_limit)) return false;
+        if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err, swiglu_limit, (int) ut)) return false;
         if (f.bytes != blob) {
             err = "expert layout: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);

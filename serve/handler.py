@@ -32,8 +32,9 @@ from serve.util.text import stop_strings
 from serve.decision.admission import DecisionError
 
 
-BODY_MAX = 256 << 20                        # the most a JSON request body may hold (read into memory)
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
+DECISION_BODY_MAX = 4 << 20                 # the most a Jev request body may hold, whatever --max-payload-mib says
+DECISION_ROUTES = ("/decision", "/v1/decision", "/v1/systemone")    # the routes svc.jev answers
 TURN_POLL_S = 0.5                           # how soon a request waiting for its turn notices its client left
 
 
@@ -120,8 +121,8 @@ def make_handler(target: Service | Router):
                     raise BadBody(400, "malformed chunked request body")
 
         def _body(self) -> bytes:
-            """The request body, chunked or by Content-Length, at most BODY_MAX bytes."""
-            limit = (4 << 20) if self.path.split("?")[0].rstrip("/") in ("/decision", "/v1/decision", "/v1/systemone") else BODY_MAX
+            """The request body, chunked or by Content-Length, at most svc.max_payload bytes, or DECISION_BODY_MAX on a decision route."""
+            limit = DECISION_BODY_MAX if self.path.split("?")[0].rstrip("/") in DECISION_ROUTES else svc.max_payload
             if self._chunked():
                 return self._read_chunked(limit)
             try:
@@ -252,7 +253,7 @@ def make_handler(target: Service | Router):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
-            if self.path.split("?")[0].rstrip("/") in ("/decision", "/v1/decision", "/v1/systemone"):
+            if self.path.split("?")[0].rstrip("/") in DECISION_ROUTES:
                 self.send_header("Cache-Control", "no-store")
             self._cors()
             self.send_header("Content-Length", str(len(body)))
@@ -396,7 +397,7 @@ def make_handler(target: Service | Router):
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
                 # ---- Jev: preserve auth, body, disconnect and error boundaries ----
-                if path in ("/decision", "/v1/decision", "/v1/systemone"):
+                if path in DECISION_ROUTES:
                     if svc.jev is None:
                         self._json(404, {"error": {"message": "not found"}})
                         return
@@ -848,6 +849,13 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = True
     request_queue_size = 256      # socketserver's backlog of 5 resets some clients of a burst of simultaneous connections
 
+    router: Router | None = None
+
+    def server_close(self):
+        super().server_close()
+        if self.router is not None:
+            self.router.stop_telemetry()           # serve() started the sampler, so closing the server ends it
+
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a hang-up needs no stack trace
             super().handle_error(request, client_address)
@@ -859,5 +867,6 @@ def serve(target: Service | Router, host="127.0.0.1", port=8080) -> ThreadingHTT
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
     router.start_telemetry()
     httpd = Server((host, port), make_handler(router))
+    httpd.router = router
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd

@@ -4,7 +4,7 @@
 
 namespace basalt::models::qwen4exp::serve {
 
-// ---- ENC <image> <out> [<image> <out> ...] (--vision-mmproj), between requests and between batch windows.  The
+// ---- ENC <image> <out> [<image> <out> ...] (--vision), between requests and between batch windows.  The
 // images are decoded on the host first; then the encoder borrows the last expert-cache slots (the prompt path's
 // way: their rows are marked missing for the time), uploads its weights from the pinned copy, encodes each
 // image on its own stream, and the slots get their experts back from RAM before anything else reads the cache.
@@ -15,7 +15,7 @@ void QfnRuntime::enc_command(const std::string& cmd) {
         std::printf("ENC ERR %s\n", m.c_str());
         std::fflush(stdout);
     };
-    if (o.vision_mmproj.empty()) { reply_err("this engine was started without --vision-mmproj"); return; }
+    if (!o.vision_in_engine) { reply_err("this engine was started without --vision"); return; }
     if (pf_parts.size() != 1 || pf_parts[0].first < 0 || !stages.empty()) {
         reply_err("the in-engine image encoder needs one GPU's expert cache with a prompt lend region");
         return;

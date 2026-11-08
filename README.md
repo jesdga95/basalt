@@ -46,7 +46,7 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 
 | | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash |
 |---|---|---|
-| Packs | 9 packs, default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | 1 pack `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) |
+| Packs | 11 packs, default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | 2 packs, `DeepSeek-V4.1-Flash-1017-UD-IQ1_M` and `-UD-IQ2_XXS`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) |
 | Context | default 8,192; `--max-context` sets it | default 8,192; `--max-context` sets it, up to 1,048,576 |
 | Drafting | MTP, on by default | DSpark, on by default |
 | Images | yes | yes |
@@ -71,8 +71,7 @@ All models compared: [models](docs/models/index.md).
 - [Strata](https://github.com/Niko1221/Strata): the project Basalt forks (MIT).
 - [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) and [DeepSeek](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017):
   the models. Their packs carry the models' own licences (see the Hugging Face cards).
-- [unsloth](https://huggingface.co/unsloth) (GGUFs), [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) (NVFP4 experts),
-  IST Austria DAS Lab (GSQ-RCO quants; cite [GSQ](https://arxiv.org/abs/2604.18556) and [RCO](https://arxiv.org/abs/2605.00649)).
+- [unsloth](https://huggingface.co/unsloth) (GGUFs), [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) (NVFP4 experts).
 - [@giveen](https://huggingface.co/giveen): the BF16 reference for the DeepSeek quality numbers.
 - [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp): quantization formats and kernels in `src/` (MIT,
   [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)).

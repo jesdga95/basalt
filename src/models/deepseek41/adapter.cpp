@@ -33,6 +33,9 @@ public:
         auto m = std::make_unique<DsModel>();
         std::string err;
         if (!m->load(req.paths.front(), err)) return {model::Status::Error, "deepseek41: " + err};
+        CacheFormat fmt = CacheFormat::Fp8;
+        if (!req.kv.empty() && !ctxp::cache_format(req.kv, fmt)) return {model::Status::Error, "deepseek41: --kv " + req.kv + ": fp8 or fp16"};
+        m->set_cache_format(fmt);
         if (!m->resolve_context(req.max_context, err)) return {model::Status::Error, err};
         m->set_diag_dump(req.diag_dump);
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
@@ -80,6 +83,7 @@ public:
         if (a == "--no-prompt-skip") o.no_prompt_skip = true;
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
+        else if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--draft-experts") o.draft_experts = std::atoi(args.next("--draft-experts"));
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
@@ -91,6 +95,13 @@ public:
 
     // A context the pack refuses is refused with the flags, before anything loads; the memory check needs the card.
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        CacheFormat fmt = CacheFormat::Fp8;
+        if (o.kv.empty()) o.kv = "fp8";
+        if (!ctxp::cache_format(o.kv, fmt)) {
+            basalt::log::error("basalt deepseek41", "--kv %s: DeepSeek's caches are fp8 (the default: FP8 window rows, FP4 "
+                               "compressed rows and index keys) or fp16", o.kv.c_str());
+            return 2;
+        }
         if (o.draft_experts < 0 || o.draft_experts > 128 || o.draft_experts % 32 != 0) {
             basalt::log::error("basalt deepseek41", "--draft-experts %d: 32, 64, 96 or 128, or 0 for all", o.draft_experts);
             return 2;
@@ -101,20 +112,17 @@ public:
         const bool drafter = opened && file.find("dspark/gguf") != nullptr;
         // the pack's drafter runs in windows of 3 unless --spec says otherwise; a token file drafts in its place
         if (!o.spec_given) {
-            o.spec = drafter && o.batch <= 1 ? 3 : 0;
+            o.spec = drafter ? 3 : 0;
             if (opened && !drafter) basalt::log::info("basalt deepseek41", "no dspark/gguf section: plain decode");
         }
-        if (o.spec >= 2 && o.spec_oracle.empty()) {
-            const char* off = o.batch > 1 ? "--parallel slots draft nothing" : !drafter ? "the pack has no dspark/gguf section" : nullptr;
-            if (off != nullptr) {
-                basalt::log::warn("basalt deepseek41", "--spec %d off: %s", o.spec, off);
-                o.spec = 0;
-            }
+        if (o.spec >= 2 && o.spec_oracle.empty() && !drafter) {
+            basalt::log::warn("basalt deepseek41", "--spec %d off: the pack has no dspark/gguf section", o.spec);
+            o.spec = 0;
         }
         if (!opened || !file.load_meta(err)) return std::nullopt;
         const core::Json* kv = file.meta().get("gguf_kv");
         const core::Json* native = kv ? kv->get("deepseek41.context_length") : nullptr;
-        const ctxp::Plan p = ctxp::plan_context(o.max_context, native ? (int64_t) native->u64() : 0, UINT64_MAX, {});
+        const ctxp::Plan p = ctxp::plan_context(o.max_context, native ? (int64_t) native->u64() : 0, UINT64_MAX, {}, fmt);
         if (p.error.empty()) return std::nullopt;
         basalt::log::error("basalt deepseek41", "%s", p.error.c_str());
         return 2;

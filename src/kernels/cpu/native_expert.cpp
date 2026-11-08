@@ -25,15 +25,15 @@ const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((
 template<bool LIMITED>
 void gu_rows_ggml(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff, int r0,
                   int r1, float sg, float su) {
-    const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
+    const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot, dot_u = traits(f.up_type)->vec_dot;
     const int n = (int) f.n_embd;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
-        const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+        const uint8_t* ur = blob + f.up_off + (size_t) r * f.up_row;
         for (int t = 0; t < nt; ++t) {
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
-            dot(n, &u, 0, ur, 0, act[t], 0, 1);
+            dot_u(n, &u, 0, ur, 0, act[t], 0, 1);
             if (f.tail) {
                 g *= sg;
                 u *= su;
@@ -47,14 +47,50 @@ void gu_rows_ggml(const NativeFmt& f, const uint8_t* blob, const void* const* ac
     }
 }
 
+// A layer whose gate and up types differ: each half through a multi-token row kernel (`rows`: iq512_rows or
+// iq256_rows), then native_gu_rows' SwiGLU expression.  A token's dots are the uniform layers' bits for each type.
+template<typename Rows>
+void gu_rows_mixed(Rows rows, const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
+                   int r0, int r1) {
+    constexpr int kTile = 64, kTok = 8;
+    float ub[kTok][kTile];
+    for (int t0 = 0; t0 < nt; t0 += kTok) {
+        const int m = nt - t0 < kTok ? nt - t0 : kTok;
+        for (int a = r0; a < r1; a += kTile) {
+            const int b = a + kTile < r1 ? a + kTile : r1;
+            float* up[kTok];
+            for (int t = 0; t < m; ++t) up[t] = ub[t];
+            rows(f.gu_type, blob, f.gu_row, (int) f.n_embd, act + t0, m, ff + t0, a, b);
+            rows(f.up_type, blob + f.up_off + (size_t) a * f.up_row, f.up_row, (int) f.n_embd, act + t0, m, up, 0, b - a);
+            for (int t = 0; t < m; ++t)
+                for (int r = a; r < b; ++r) {
+                    const float g = ff[t0 + t][r], u = ub[t][r - a];
+                    ff[t0 + t][r] = (g / (1.f + std::exp(-g))) * u;
+                }
+        }
+    }
+}
+
 }  // namespace
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
-                float swiglu_limit) {
+                float swiglu_limit, int up_type) {
+    if (up_type < 0) up_type = gu_type;
     const ggml_type_traits_cpu* tg = traits(gu_type);
+    const ggml_type_traits_cpu* tu = traits(up_type);
     const ggml_type_traits_cpu* td = traits(d_type);
-    if (tg == nullptr || tg->vec_dot == nullptr || td == nullptr || td->vec_dot == nullptr) {
-        err = "native experts: no CPU dot product for type " + std::to_string(tg && tg->vec_dot ? d_type : gu_type);
+    if (tg == nullptr || tg->vec_dot == nullptr || td == nullptr || td->vec_dot == nullptr || tu == nullptr ||
+        tu->vec_dot == nullptr) {
+        err = "native experts: no CPU dot product for type " +
+              std::to_string(!(tg && tg->vec_dot) ? gu_type : !(tu && tu->vec_dot) ? up_type : d_type);
+        return false;
+    }
+    if (tu->vec_dot_type != tg->vec_dot_type || n_embd % ggml_blck_size((ggml_type) up_type) ||
+        (up_type != gu_type && (gu_type == GGML_TYPE_NVFP4 || up_type == GGML_TYPE_NVFP4 || gu_type == GGML_TYPE_Q2_0 ||
+                               up_type == GGML_TYPE_Q2_0))) {
+        // NVFP4's scale tail and the Q2_0 kernels' own activations are whole-layer
+        err = "native experts: gate type " + std::to_string(gu_type) + " and up type " + std::to_string(up_type) +
+              " cannot share one layer";
         return false;
     }
     const ggml_type_traits_cpu* ag = traits(tg->vec_dot_type);
@@ -75,10 +111,12 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.n_embd = n_embd;
     f.n_ff = n_ff;
     f.swiglu_limit = swiglu_limit;
+    f.up_type = up_type;
     f.gu_row = ggml_row_size((ggml_type) gu_type, n_embd);
+    f.up_row = ggml_row_size((ggml_type) up_type, n_embd);
     f.d_row = ggml_row_size((ggml_type) d_type, n_ff);
     f.up_off = f.gu_row * (size_t) n_ff;
-    f.down_off = 2 * f.up_off;
+    f.down_off = f.up_off + f.up_row * (size_t) n_ff;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
     // NVFP4 keeps its per-expert FP32 scales in a tail after down, so they move with the blob through every tier.
     // The scales cover all three projections: the two kinds cannot mix in one expert.
@@ -123,6 +161,21 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     static const bool avx512 = cpu_avx512_ok();
     static const bool avx2 = cpu_avx2_ok();
     static const bool cpu512 = avx512;
+    if (f.up_type != f.gu_type) {   // gate and up of two types: each half on its type's row kernel
+        if (f.swiglu_limit <= 0.f && f.tail == 0) {
+            if (avx512 && iq512_supported(f.gu_type) && iq512_supported(f.up_type)) {
+                gu_rows_mixed(iq512_rows, f, blob, act, nt, ff, r0, r1);
+                return;
+            }
+            if (!cpu512 && avx2 && iq256_supported(f.gu_type) && iq256_supported(f.up_type)) {
+                gu_rows_mixed(iq256_rows, f, blob, act, nt, ff, r0, r1);
+                return;
+            }
+        }
+        if (f.swiglu_limit > 0.f) gu_rows_ggml<true>(f, blob, act, nt, ff, r0, r1, 1.f, 1.f);
+        else gu_rows_ggml<false>(f, blob, act, nt, ff, r0, r1, 1.f, 1.f);
+        return;
+    }
     // the multi-token kernels have the plain SwiGLU built in: a limited layer takes the ggml dot below
     if (f.swiglu_limit <= 0.f && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {

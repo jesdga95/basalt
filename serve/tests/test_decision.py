@@ -387,7 +387,7 @@ class Integration(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.engine = Scorer(tok)
-        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc = Service(self.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         self.svc.jev = Decisions(self.svc)
 
     def test_zero_output_and_refresh_only_first_row(self):
@@ -636,7 +636,7 @@ class Integration(unittest.TestCase):
                 return self.path, list(counts) * len(images)
 
         eyes = Eyes()
-        svc = Service(Scorer(tok), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+        svc = Service(Scorer(tok), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"),
                       vision=eyes if vision else None)
         svc.jev = Decisions(svc)
         return svc, tok, eyes

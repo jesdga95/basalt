@@ -22,12 +22,15 @@ namespace basalt::prefill::fused {
 /// One layer's native expert geometry (cpu::NativeFmt's fields the kernels read; n_embd 2560, n_ff 640).
 struct NativeGeom {
     int gu_type = -1, d_type = -1;    ///< ggml types
-    size_t gu_row = 0, d_row = 0;     ///< bytes per gate/up row and per down row
+    size_t gu_row = 0, d_row = 0;     ///< bytes per gate row and per down row
     size_t up_off = 0, down_off = 0;  ///< inside the blob
+    int up_type = -1;                 ///< the up rows' type and row bytes (-1: the gate's)
+    size_t up_row = 0;
 };
 
-/// enabled() (int8 MMA), and the kernels cover this gate/up and down pair on this device.
-bool native_supported(int gu_type, int d_type);
+/// enabled() (int8 MMA), and the kernels cover this gate/up and down pair on this device (`up_type`: the up rows'
+/// type, -1 for gu_type's; a mix is covered for the pairs the kernels are built for).
+bool native_supported(int gu_type, int d_type, int up_type = -1);
 
 /// x [rows][cols] FP32 -> `xa` (act_bytes(rows, cols)): int8 per 32 values in natural order, the native kernels' form.
 void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, void* stream);

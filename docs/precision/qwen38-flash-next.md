@@ -22,7 +22,7 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 
 | Stage | Format | Arithmetic |
 |---|---|---|
-| Routed experts (GGUF packs) | GGUF blocks, byte for byte; mixed types across layers | q8_1 activations, dp4a or int8 mma, fp32 scales |
+| Routed experts (GGUF packs) | GGUF blocks, byte for byte; mixed types across layers, and within one (UD-IQ1_S: IQ2_S gate, IQ2_XXS up) | q8_1 activations, dp4a or int8 mma, fp32 scales |
 | Routed experts (NVFP4) | NVIDIA's E2M1 codes and UE4M3 scales, 4.5 bits/weight; FP32 tail `{s_gate, s_up, s_down}` | q8_1 activations, exact int32 per 16-value sub-block, fp32 scales; tails applied in fp32 |
 | Dense projections (attention, GDN qkv/z/out, QSA) | Q8_0 (or Q6_K in the NVFP4 pack; Q4_K/Q5_K/Q6_K in others) | q8_1 activations, int8 tensor-core dot, exact int32 per 32 block |
 | Router, GDN alpha/beta, indexer, PLE key/value | BF16 as stored | fp32 activations and sums |
@@ -93,10 +93,19 @@ means it excludes 0.
 | prompt path against decode | -0.0000 [-0.0010, +0.0009] | +0.13 | lossless |
 | verify window width, T 1 against T 3 | 0 | 0 | lossless, 5,100 of 5,100 rows bitwise equal |
 | fp16 against fp32 indexer keys (below 2,048 tokens) | 0 | 0 | no effect, 25,500 of 25,500 rows equal |
+| Q5_0 down layers on MMQ prefill and the device-planned decode tail, against the dequant GEMM and the host-planned tail: UD-Q3_K_XL (20 such layers) | -0.0005 [-0.0014, +0.0005] | +0.17 | lossless |
+| the same on UD-Q2_K_XL (one such layer) | +0.0004 [-0.0006, +0.0013] | -0.03 | lossless |
 
 All roundings off at once (BF16 dense, fp32 activations everywhere, fp16 KV, exact math): PPL 3.2866 against 3.2975 default,
 KLD 0.05308 against 0.06213, top-1 92.55% against 91.59%. Removing every rounding lowers KLD by about 0.009 (15%). The Q8_0-dense
 pack alone gives -0.0059 of that. The Q8_0-dense pack is about 7% slower on prose and 3% on struct than the default.
+
+UD-IQ1_S, converted as shipped (layer 18: IQ2_S gate, IQ2_XXS up; each half on its own format's kernels, the same bits as
+a uniform layer's rows): PPL 3.4049, KLD 0.2676, top-1 82.76% (100 chunks, T 3, int8 KV, resident experts).
+
+The Q5_0 rows: KLD 0.0943 against 0.0948 on UD-Q3_K_XL, 0.1520 against 0.1517 on UD-Q2_K_XL, tiers auto-sized. The
+device-planned tail runs only when every layer's expert formats are in it, so on these packs the decode rounding moves as well as
+the prompt's.
 
 ## 6-bit dense projections
 

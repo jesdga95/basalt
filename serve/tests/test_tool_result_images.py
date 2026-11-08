@@ -39,7 +39,7 @@ class Qwen:
     pad = "<|image_pad|>"
     quoted = "<|vision_start|><|image_pad|><|vision_end|>"
     result_open, result_close = "<tool_response>", "</tool_response>"
-    template = ChatTemplate(ROOT / "serve/chat_template.jinja")
+    template = ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")
     service_args = {}
 
 

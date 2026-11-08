@@ -21,6 +21,10 @@ size_t iq_row_bytes(int ggml_type, int64_t n) noexcept;
 
 /// q8_1 blocks for `n_rows` rows of `n_cols` floats (n_cols a multiple of 32): y is n_rows * n_cols/32 blocks.
 void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream);
+/// quantize_q8_1_rows that also copies `n_words` 32-bit words from `src` to `dst` in the same launch.  Every pointer
+/// may be mapped host memory: the card's SMs read it, so a copy queued on the card's copy engines does not delay it.
+void quantize_q8_1_rows_copy(const float* x, int64_t n_rows, int64_t n_cols, void* y, const void* src, void* dst,
+                             int n_words, void* stream);
 
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
@@ -37,24 +41,32 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
                    int64_t n_embd, float* out, void* stream, const void* hot = nullptr, int64_t n_hot = 0);
 /// One expert's gate and up matrices (n_ff rows of n_embd each) into the interleaved fp16 layout the prompt path
 /// uses: row 2r = gate row r, row 2r+1 = up row r.  `scale` (device, NVFP4 only): {s_gate, s_up}, as iq_dequant_f16.
+/// `up_type`: the up rows' type (-1: ggml_type).
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
-                       void* stream, const float* scale = nullptr);
+                       void* stream, const float* scale = nullptr, int up_type = -1);
 
-/// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
+/// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.  Up rows usually have the
+/// gate's type; a layer that mixes two (up_type != gu_type) runs the gate rows on gu_type's code and the up rows on
+/// up_type's.
 struct NativeExpertLayout {
     int gu_type = -1, d_type = -1;
+    int up_type = -1;                   // the up rows' type (gu_type when they agree)
     int64_t n_embd = 0, n_ff = 0;
-    size_t gu_row = 0, d_row = 0;       // bytes per row
+    size_t gu_row = 0, d_row = 0;       // bytes per gate row and per down row
+    size_t up_row = 0;                  // bytes per up row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob (NVFP4: with its 16-byte FP32 scale tail)
     float swiglu_limit = 0.0f;          // > 0: native_expert_grouped limits the SwiGLU (gate capped, up clamped to +-limit)
 };
 /// `swiglu_limit` rides in the layout, so every caller of `native_expert_grouped` (the VRAM cache,
 /// the peer card, the remote tier) applies it without a signature change.
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, float swiglu_limit = 0.0f);
+/// `up_type`: the up rows' type (-1: gu_type).
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, float swiglu_limit = 0.0f,
+                                        int up_type = -1);
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
-/// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).
-bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
+/// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).  A layer
+/// whose up type differs (`up_type`, -1: the same) is covered only for the mixes the kernels are built for.
+bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type = -1) noexcept;
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);

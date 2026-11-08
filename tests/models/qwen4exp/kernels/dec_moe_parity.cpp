@@ -2,7 +2,8 @@
 //
 //     build/dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N]
 //     build/dec_moe_parity --nvfp4 [--bench | --stress N]   (synthetic NVFP4 experts with their scale tail, no GGUF)
-//     build/dec_moe_parity --kq [--bench]        (synthetic Q4_K / Q5_K / Q6_K gate/up with Q5_1 / Q8_0 down, no GGUF)
+//     build/dec_moe_parity --kq [--bench]        (synthetic Q4_K / Q5_K / Q6_K gate/up with Q5_1 / Q8_0 down, and
+//                                                 IQ2_XXS / IQ2_S / IQ3_XXS / IQ4_XS gate/up with Q5_0 down, no GGUF)
 //
 // Per layer (default: one of each gate/up + down format pair):
 //   peer math   the persistent kernel's work items (dec_moe_peer_math_test) vs native_expert_grouped, every card
@@ -123,10 +124,12 @@ std::vector<uint8_t> nvfp4_blobs(const K::NativeExpertLayout& L, int nx, std::mt
     return b;
 }
 
-// NX synthetic blobs of the K-quant and Q8_0 formats (Q4_K / Q5_K / Q8_0 gate/up, Q5_1 / Q8_0 down): random bytes, then finite
-// small fp16 block scales (the first two halves of each block; Q8_0 has one)
+// NX synthetic blobs of the K-quant, Q5_0 / Q8_0 and i-quant formats (Q4_K / Q5_K / Q8_0 / IQ gate/up, Q5_1 / Q5_0 / Q8_0
+// down): random bytes, then finite small fp16 block scales (the first two halves of a Q4_K / Q5_K / Q5_1 block, the
+// first half of the others; IQ3_S / IQ4_XS keep d in the block's first two bytes)
 void kq_fix_scales(uint8_t* p, size_t bytes, int type, std::mt19937& rng) {
-    const size_t bs = type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 7 ? 24 : 34;
+    const size_t bs = type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 7 ? 24 : type == 6 ? 22
+                    : type == 16 ? 66 : type == 22 ? 82 : type == 18 ? 98 : type == 21 ? 110 : type == 23 ? 136 : 34;
     std::uniform_int_distribution<int> ex(2, 5), man(0, 1023);
     for (size_t o = 0; o + bs <= bytes; o += bs) {
         if (type == 14) {   // Q6_K: the fp16 scale ends the block
@@ -134,7 +137,7 @@ void kq_fix_scales(uint8_t* p, size_t bytes, int type, std::mt19937& rng) {
             std::memcpy(p + o + 208, &h, 2);
             continue;
         }
-        for (int j = 0; j < (type == 8 ? 1 : 2); ++j) {
+        for (int j = 0; j < (type == 12 || type == 13 || type == 7 ? 2 : 1); ++j) {
             const uint16_t h = (uint16_t) ((ex(rng) << 10) | man(rng));
             std::memcpy(p + o + 2 * j, &h, 2);
         }
@@ -540,7 +543,9 @@ int main(int argc, char** argv) {
     if (nvfp4) { fmt[0] = {40, 40}; auto_layers.push_back(0); layers.clear(); }
     if (kq) {
         fmt[0] = {12, 7}; fmt[1] = {12, 8}; fmt[2] = {13, 8}; fmt[3] = {8, 8}; fmt[4] = {14, 8};
-        auto_layers = {0, 1, 2, 3, 4}; stress_n = 0;
+        fmt[5] = {16, 6}; fmt[6] = {22, 6}; fmt[7] = {18, 6}; fmt[8] = {23, 6};
+        fmt[9] = {21, 8}; fmt[10] = {23, 8};
+        auto_layers = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}; stress_n = 0;
     }
     for (int l = 0; !synth && l < 64; ++l) {
         const basalt::GgufFile& gguf = *gguf_p;

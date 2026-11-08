@@ -1,28 +1,27 @@
-// Tensor-core sparse MQA parity: sparse_mqa_tc against a double-precision CPU reference and against the scalar
-// sparse_mqa at the real geometry (64 heads x 512, up to 128 window rows and 512 selected rows, with the sink and the
-// inverse RoPE), and the token's independence of the call's width. Prints microbench lines.
+// Tensor-core sparse MQA parity: sparse_mqa_tc over the packed cache rows against a double-precision CPU reference of
+// their values and against the scalar sparse_mqa at the real geometry (64 heads x 512, up to 128 window rows and 512
+// selected rows, with the sink and the inverse RoPE), and the token's independence of the call's width. Prints
+// microbench lines.
 #include "basalt/models/deepseek41/attn.hpp"
+#include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/prefill_attn.hpp"
 #include "test_util.hpp"
 
-#include <cuda_fp16.h>
-
 using namespace basalt::models::deepseek41;
 using dstest::Dev;
+using dstest::Round;
 
 namespace {
 
-float half_round(float x) { return __half2float(__float2half(x)); }
-
 struct Case {
     int T, n_sel, win_cap, n_comp;
-    LatentType wt, ct;
     bool masked_ids;
     std::vector<int> win_n;
+    bool fp16 = false;   ///< the caches' fp16 rows instead of the packed ones
 };
 
 std::vector<double> reference(const Case& c, const std::vector<float>& q, const std::vector<float>& win,
-                              const std::vector<float>& comp, int64_t comp_stride, const std::vector<int32_t>& sel,
+                              const std::vector<float>& comp, const std::vector<int32_t>& sel,
                               const std::vector<int32_t>& limit, const std::vector<int32_t>& wstart,
                               const std::vector<float>& sinks, const std::vector<int32_t>& pos, const RopeTable& rope) {
     std::vector<double> out((size_t) c.T * 64 * 512);
@@ -31,7 +30,7 @@ std::vector<double> reference(const Case& c, const std::vector<float>& q, const 
         for (int j = 0; j < c.win_n[t]; ++j) keys.push_back(&win[(size_t) ((wstart[t] + j) % c.win_cap) * 512]);
         for (int i = 0; i < c.n_sel; ++i) {
             const int id = sel[(size_t) t * c.n_sel + i];
-            if (id >= 0 && id < limit[t]) keys.push_back(&comp[(size_t) id * comp_stride]);
+            if (id >= 0 && id < limit[t]) keys.push_back(&comp[(size_t) id * 512]);
         }
         for (int h = 0; h < 64; ++h) {
             const float* qh = &q[((size_t) t * 64 + h) * 512];
@@ -64,17 +63,27 @@ std::vector<double> reference(const Case& c, const std::vector<float>& q, const 
     return out;
 }
 
-template <class T>
-std::vector<T> convert(const std::vector<float>& v) {
-    std::vector<T> r(v.size());
-    for (size_t i = 0; i < v.size(); ++i) r[i] = (T) v[i];
-    return r;
-}
-template <>
-std::vector<__half> convert<__half>(const std::vector<float>& v) {
-    std::vector<__half> r(v.size());
-    for (size_t i = 0; i < v.size(); ++i) r[i] = __float2half(v[i]);
-    return r;
+// The cache rows (window: Fp8, compressed: Fp4; or fp16 both) of values v[rows][512]; v becomes the values the rows hold.
+std::vector<uint8_t> packed(std::vector<float>& v, bool window, bool fp16) {
+    if (fp16) {
+        std::vector<uint8_t> b(v.size() * 2);
+        for (size_t i = 0; i < v.size(); ++i) {
+            const __half h = __float2half(v[i]);
+            v[i] = __half2float(h);
+            std::memcpy(&b[2 * i], &h, 2);
+        }
+        return b;
+    }
+    const Round k = window ? Round::Fp8Pow2 : Round::Fp4E4m3;
+    const int rb = window ? kWinRowBytes : kCompRowBytes;
+    std::vector<uint8_t> b;
+    for (size_t r = 0; r < v.size() / 512; ++r) {
+        const auto row = dstest::ref_pack(&v[r * 512], 512, k, rb);
+        const auto x = dstest::ref_unpack(row.data(), 512, k);
+        std::copy(x.begin(), x.end(), v.begin() + (ptrdiff_t) (r * 512));
+        b.insert(b.end(), row.begin(), row.end());
+    }
+    return b;
 }
 
 struct Result {
@@ -83,13 +92,11 @@ struct Result {
 };
 
 Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
-    const int64_t comp_stride = 640;   // row = 512 latent + 128 indexer key, as the compressed cache stores it
     auto q = dstest::randn((size_t) c.T * 64 * 512, seed, 0.6f);
     auto win = dstest::randn((size_t) c.win_cap * 512, seed + 1, 1.0f);
-    auto comp = dstest::randn((size_t) c.n_comp * comp_stride, seed + 2, 1.0f);
+    auto comp = dstest::randn((size_t) c.n_comp * 512, seed + 2, 1.0f);
     auto sinks = dstest::randn(64, seed + 3, 1.0f);
-    if (c.wt == LatentType::F16) for (auto& x : win) x = half_round(x);
-    if (c.ct == LatentType::F16) for (auto& x : comp) x = half_round(x);
+    const auto wrows = packed(win, true, c.fp16), crows = packed(comp, false, c.fp16);
     std::mt19937 g(seed + 4);
     std::vector<int32_t> sel((size_t) c.T * std::max(c.n_sel, 1)), limit(c.T), wstart(c.T), pos(c.T), wn(c.win_n);
     for (int t = 0; t < c.T; ++t) {
@@ -103,22 +110,15 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
         }
     }
     const RopeTable rope = rope_table_compressed();
-    const auto ref = reference(c, q, win, comp, comp_stride, sel, limit, wstart, sinks, pos, rope);
+    const auto ref = reference(c, q, win, comp, sel, limit, wstart, sinks, pos, rope);
 
-    void* wdev = nullptr; void* cdev = nullptr;
-    size_t wb = win.size() * (c.wt == LatentType::F16 ? 2 : 4), cb = comp.size() * (c.ct == LatentType::F16 ? 2 : 4);
-    dstest::check(cudaMalloc(&wdev, wb), "m");
-    dstest::check(cudaMalloc(&cdev, cb), "m");
-    if (c.wt == LatentType::F16) { auto h = convert<__half>(win); cudaMemcpy(wdev, h.data(), wb, cudaMemcpyHostToDevice); }
-    else cudaMemcpy(wdev, win.data(), wb, cudaMemcpyHostToDevice);
-    if (c.ct == LatentType::F16) { auto h = convert<__half>(comp); cudaMemcpy(cdev, h.data(), cb, cudaMemcpyHostToDevice); }
-    else cudaMemcpy(cdev, comp.data(), cb, cudaMemcpyHostToDevice);
+    Dev<uint8_t> wdev(wrows), cdev(crows);
     Dev<float> dq(q), dsink(sinks), dout((size_t) c.T * 64 * 512), dws(sparse_mqa_workspace_floats(c.T, c.n_sel));
     Dev<int32_t> dsel(sel), dlim(limit), dws0(wstart), dwn(wn), dpos(pos);
 
     MqaArgs a;
-    a.n_tokens = c.T; a.q = dq.p; a.win = wdev; a.win_type = c.wt; a.win_cap = c.win_cap;
-    a.win_start = dws0.p; a.win_n = dwn.p; a.comp = cdev; a.comp_type = c.ct; a.comp_stride = comp_stride;
+    a.n_tokens = c.T; a.q = dq.p; a.win = wdev.p; a.win_type = c.fp16 ? LatentType::F16 : LatentType::Fp8; a.win_cap = c.win_cap;
+    a.win_start = dws0.p; a.win_n = dwn.p; a.comp = cdev.p; a.comp_type = c.fp16 ? LatentType::F16 : LatentType::Fp4;
     a.sel = c.n_sel ? dsel.p : nullptr; a.n_sel = c.n_sel; a.comp_limit = dlim.p; a.sinks = dsink.p;
     a.pos = dpos.p; a.rope = rope; a.out = dout.p;
     cudaStream_t s;
@@ -153,13 +153,12 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
         const double us = dstest::bench_us([&] { sparse_mqa_tc(a, dws.p, nullptr); });
         const double us0 = dstest::bench_us([&] { sparse_mqa(a, dws.p, nullptr); });
         std::printf("scalar sparse_mqa %.1f us, tensor-core %.1f us\n", us0, us);
-        const double elem = (c.wt == LatentType::F16 ? 2.0 : 4.0);
-        const int keys = c.win_n[0] + c.n_sel;
-        dstest::bench_line(name, us, (double) keys * 512 * elem * c.T + (double) c.T * 64 * 512 * 8);
+        dstest::bench_line(name, us, ((double) c.win_n[0] * kWinRowBytes + (double) c.n_sel * kCompRowBytes) * c.T +
+                                         (double) c.T * 64 * 512 * 8);
     }
     std::printf("%-26s T=%d sel=%3d win=%3d  max_abs %.2e  rms_rel %.2e (vs scalar %.2e)  token-independent %s\n", name, c.T,
                 c.n_sel, c.win_n[0], e.max_abs, e.rms_rel, es.rms_rel, same ? "yes" : "NO");
-    cudaFree(wdev); cudaFree(cdev); cudaStreamDestroy(s);
+    cudaStreamDestroy(s);
     return {e.max_abs, e.rms_rel, same};
 }
 
@@ -168,15 +167,15 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
 int main() {
     dstest::Verdict v;
     struct Row { const char* name; Case c; };
-    const LatentType F = LatentType::F16;
     std::vector<Row> rows = {
-        {"full T1", {1, 512, 130, 3000, F, F, true, {128}}},
-        {"full T4", {4, 512, 132, 3000, F, F, true, {128, 100, 128, 7}}},
-        {"full T3 masked", {3, 512, 135, 4096, F, F, true, {128, 128, 64}}},
-        {"short sel T2", {2, 200, 128, 300, F, F, false, {128, 20}}},
-        {"window only T4", {4, 0, 128, 10, F, F, false, {128, 5, 77, 1}}},
-        {"nothing visible T2", {2, 64, 128, 100, F, F, true, {0, 3}}},
-        {"f32 falls back T2", {2, 128, 128, 300, LatentType::F32, LatentType::F32, false, {128, 20}}},
+        {"full T1", {1, 512, 130, 3000, true, {128}}},
+        {"full T4", {4, 512, 132, 3000, true, {128, 100, 128, 7}}},
+        {"full T3 masked", {3, 512, 135, 4096, true, {128, 128, 64}}},
+        {"full fp16 T4", {4, 512, 132, 3000, true, {128, 100, 128, 7}, true}},
+        {"window only fp16 T4", {4, 0, 128, 10, false, {128, 5, 77, 1}, true}},
+        {"short sel T2", {2, 200, 128, 300, false, {128, 20}}},
+        {"window only T4", {4, 0, 128, 10, false, {128, 5, 77, 1}}},
+        {"nothing visible T2", {2, 64, 128, 100, true, {0, 3}}},
     };
     for (auto& r : rows) {
         const auto res = run(r.c, 100 + (uint32_t) (&r - &rows[0]), false, r.name);
