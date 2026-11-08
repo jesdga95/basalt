@@ -6,6 +6,7 @@
 
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/model_file.hpp"
+#include "basalt/core/shipped_profiles.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/platform/file.hpp"
@@ -336,8 +337,16 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.sessions = std::max(o.batch, 1);
         lreq.vision = o.vision;
         lreq.expert_profile = o.expert_profile;
+        const std::string key = profile_key(model_file.meta());
+        {   // what the engine ships for this pack must be there; --expert-profile stands in for the main one
+            std::vector<std::string> need;
+            for (const std::string& name : adapter->shipped_profiles(key)) {
+                if (!(name == key + ".prof" && !o.expert_profile.empty())) need.push_back(name);
+            }
+            const std::string miss = basalt::core::missing_shipped_profile(basalt::platform::install_root() + "/data/profiles", need);
+            if (!miss.empty()) return fatal_start_error(miss);
+        }
         if (lreq.expert_profile.empty()) {   // the engine's own for this model, when it ships one
-            const std::string key = profile_key(model_file.meta());
             const std::string prof = basalt::platform::install_root() + "/data/profiles/" + key + ".prof";
             uint64_t bytes = 0;
             if (!key.empty() && basalt::platform::file_size(prof, bytes) && bytes > 0) lreq.expert_profile = prof;

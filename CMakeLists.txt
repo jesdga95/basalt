@@ -1167,6 +1167,10 @@ endif()
 add_executable(ram_load_test tests/core/ram_load_test.cpp)
 target_link_libraries(ram_load_test PRIVATE core ${_gpu_runtime_target})
 basalt_cpu_test(NAME ram_load_test COMMAND ram_load_test)
+add_executable(shipped_profiles_test tests/core/shipped_profiles_test.cpp)
+target_link_libraries(shipped_profiles_test PRIVATE platform)
+target_include_directories(shipped_profiles_test PRIVATE include)
+basalt_cpu_test(NAME shipped_profiles_test COMMAND shipped_profiles_test)
 
 # the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.
 add_executable(ple_reader_test tests/ngram/ple_reader_test.cpp)

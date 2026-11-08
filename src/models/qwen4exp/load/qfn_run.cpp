@@ -1,4 +1,5 @@
 // The whole start of a Flash-Next engine, in order: its stack frames hold the resources while the server runs.
+#include "basalt/core/shipped_profiles.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "basalt/platform/file.hpp"
 #include "context.hpp"
@@ -35,6 +36,8 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
             }
         } else {
             const std::string key = cli::profile_key(model_file.meta());
+            const std::string miss = basalt::core::missing_shipped_profile(basalt::platform::install_root() + "/data/profiles", cli::shipped_profiles(key));
+            if (!miss.empty()) return fatal_start_error(miss);
             const std::string prof = basalt::platform::install_root() + "/data/profiles/" + key + ".prof";
             if (!key.empty() && basalt::platform::file_size(prof, prof_bytes) && prof_bytes > 0) o.expert_profile = prof;
             else {

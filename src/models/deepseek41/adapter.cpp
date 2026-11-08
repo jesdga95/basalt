@@ -28,6 +28,12 @@ public:
 
     model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
 
+    // the routing order of the experts and the drafter's ranking of each stage's experts
+    std::vector<std::string> shipped_profiles(const std::string& key) const override {
+        if (key != "deepseek41-40x384") return {};
+        return {key + ".prof", key + "-dspark.prof"};
+    }
+
     model::Result load(const model::LoadRequest& req, std::unique_ptr<model::LoadedModel>& out) const override {
         if (req.paths.empty()) return {model::Status::Error, "deepseek41: no model path"};
         auto m = std::make_unique<DsModel>();

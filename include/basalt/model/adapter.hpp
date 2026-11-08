@@ -219,6 +219,9 @@ public:
     /// Geometry from the file's metadata.
     virtual ModelDesc describe(const GgufFile& meta) const = 0;
     virtual Result load(const LoadRequest& req, std::unique_ptr<LoadedModel>& out) const = 0;
+    /// The file names under data/profiles the engine ships for the pack `key` ("<arch>-<layers>x<experts>") names; the
+    /// start refuses when one is missing. Empty for a pack the engine ships no profile for.
+    virtual std::vector<std::string> shipped_profiles(const std::string& /*key*/) const { return {}; }
     virtual std::vector<SideTableSpec> side_tables(const ModelDesc&) const { return {}; }
     virtual TokenizerSpec tokenizer_spec() const = 0;
     /// A model with its own start and serving runs them here to the exit code; nullopt: the shared server runs load()'s sessions.

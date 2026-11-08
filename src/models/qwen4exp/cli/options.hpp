@@ -3,6 +3,7 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace basalt::core { struct Json; }
 namespace basalt::models::qwen4exp { struct Options; }
@@ -13,6 +14,9 @@ namespace basalt::models::qwen4exp::cli {
 // The name of the engine's expert profile for a model (data/profiles/<key>.prof): "<architecture>-<block_count>x
 // <expert_count>" from meta.gguf_kv; empty when the metadata does not say.
 std::string profile_key(const basalt::core::Json& meta);
+
+// The file names under data/profiles the engine ships for the pack `key` names; empty for any other pack.
+std::vector<std::string> shipped_profiles(const std::string& key);
 
 // Resolve defaults after the model's sections and GPU roles are known.
 std::optional<int> resolve_model_options(Options& o, bool multi_gpu);
