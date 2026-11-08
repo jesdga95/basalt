@@ -41,7 +41,7 @@ struct PooledAlloc {
                     return r;
                 }
         }
-        return static_cast<T*>(::operator new(bytes));
+        return static_cast<T*>(basalt::platform::allocate_host_buffer(bytes, alignof(T)));
     }
     void deallocate(T* ptr, size_t n) noexcept {
         const size_t bytes = n * sizeof(T);
@@ -53,7 +53,7 @@ struct PooledAlloc {
                 return;
             }
         }
-        ::operator delete(ptr);
+        basalt::platform::release_host_buffer(ptr, alignof(T));
     }
     template <class U>
     void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }   // resize leaves new bytes as they are
@@ -66,7 +66,7 @@ struct PooledAlloc {
         size_t n = 0;
         for (const auto& b : p.blocks) {
             n += b.second;
-            ::operator delete(b.first);
+            basalt::platform::release_host_buffer(b.first, alignof(T));
         }
         p.blocks.clear();
         return n;
@@ -268,6 +268,14 @@ public:
     size_t slot_size() const { return slot_count_; }
     size_t slot_bytes() const { return slot_bytes_; }
     size_t evictions() const { return evictions_; }
+    int64_t max_tokens() const {
+        int64_t m = 0;
+        for (const auto& e : entries_) {
+            m = std::max<int64_t>(m, (int64_t) e.live.ids.size());
+            for (const auto& c : e.checkpoints) m = std::max<int64_t>(m, (int64_t) c.ids.size());
+        }
+        return m;
+    }
 
     // Retain only the restored K/V buffers, not duplicate running checkpoints.
     // This optimization never evicts a parked conversation to make itself fit.
@@ -329,12 +337,12 @@ public:
     // Reserve before allocating a snapshot. held is an incoming image removed
     // with take() but still alive during the exchange; count it against RAM too.
     // The idle slots' conversations are outside the budget: they stay.
-    bool make_room(size_t incoming, size_t held = 0) {
+    bool make_room(size_t incoming, size_t held = 0, size_t max_victim_tokens = SIZE_MAX) {
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
         if (budgeted_bytes() > budget_ - held - incoming) reuse_ = {};
         while (entries_.size() - slot_count_ >= slots_ || bytes_ - slot_bytes_ > budget_ - held - incoming)
-            if (!evict_oldest(false)) break;
-        return true;
+            if (!evict_oldest(false, max_victim_tokens)) break;
+        return entries_.size() - slot_count_ < slots_ && bytes_ - slot_bytes_ <= budget_ - held - incoming;
     }
 
     /// An idle batch slot's conversation, out of VRAM: kept whatever the byte budget (the caller has admitted its
@@ -423,8 +431,25 @@ private:
         bytes_ -= n;
         if (e.from_slot) { slot_bytes_ -= n; --slot_count_; }
     }
-    // the oldest entry of one kind (an idle slot's or a budgeted one) leaves; false when there is none
-    bool evict_oldest(bool from_slot) {
+    // the oldest entry of one kind (an idle slot's or a budgeted one) leaves; false when there is none.
+    // For budgeted entries, short (< 4096) and medium (< 32768) conversations leave before long multi-turn contexts.
+    bool evict_oldest(bool from_slot, size_t max_victim_tokens = SIZE_MAX) {
+        if (!from_slot) {
+            for (size_t tier_cap : {size_t(4096), size_t(32768), SIZE_MAX}) {
+                const size_t cap = std::min(tier_cap, max_victim_tokens);
+                for (size_t i = 0; i < entries_.size(); ++i) {
+                    if (entries_[i].from_slot || entries_[i].live.ids.size() >= cap) continue;
+                    SavedConversation gone = std::move(entries_[i]);
+                    entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+                    forget(gone);
+                    if (spill_) spilled_.push_back(std::move(gone));
+                    ++evictions_;
+                    return true;
+                }
+                if (tier_cap >= max_victim_tokens) return false;
+            }
+            return false;
+        }
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].from_slot != from_slot) continue;
             SavedConversation gone = std::move(entries_[i]);
