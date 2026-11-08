@@ -9,6 +9,24 @@ the CPU tests on each. The GPU tests and the quality gate need a card.
 | Compiler, build | GCC 13+, CMake 3.24+ | MSVC 19.44 (VS 2022), CMake 3.24+, Ninja |
 | CUDA, Python | 13, 3.10+ | 13, 3.10+ |
 
+## Release archives
+
+Each release carries `basalt-vX.Y.Z-linux-x64.tar.gz` and `basalt-vX.Y.Z-windows-x64.zip`: `bin/` (`basalt`, `basalt-bench`,
+`basalt-probe`, `basalt-vision`), `serve/`, `tools/` (what the server imports), `data/`, `docs/`, `requirements.txt` and the licences.
+They hold no CUDA libraries and no Python environment. Needs:
+
+- An NVIDIA driver for CUDA 13.0: 580.65.06 or newer on Linux, 580.88 or newer on Windows.
+- The CUDA 13 runtime libraries (cudart, cuBLAS) on the library path (`PATH` on Windows).
+- Python 3.10+ with the requirements in a `.venv` at the archive's top directory, which `bin/basalt serve` uses when it is there:
+
+```sh
+cd basalt-vX.Y.Z-linux-x64                   # tar xzf the archive first; on Windows unzip it
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+```
+
+On Windows: `py -3 -m venv .venv` then `.venv\Scripts\pip install -r requirements.txt`. Then follow the README's quick start from the
+model download on: `bin/basalt serve --config basalt_config.json`. Run `basalt-bench` from the top directory (it reads `data/bench`).
+
 ## Platform code
 
 OS code lives only in `src/platform/` and `include/basalt/platform/`, and CMake `if(WIN32)` blocks. Anywhere else there is no `_WIN32`,
