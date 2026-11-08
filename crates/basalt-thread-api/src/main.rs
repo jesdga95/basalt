@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{env, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -114,6 +114,37 @@ async fn read_messages(
     };
     Ok(Json(json!({"object":"list","data":messages})))
 }
+async fn read_metrics(
+    State(app): State<Arc<App>>, headers: HeaderMap, Path(tid): Path<Uuid>,
+) -> Result<Json<Value>> {
+    authorize(&headers,&app)?;
+    let permitted:bool=sqlx::query_scalar(
+       "SELECT EXISTS(SELECT 1 FROM threads WHERE id=$1 AND owner_id=$2 AND status='active')"
+    ).bind(tid).bind(app.owner).fetch_one(&app.pool).await.map_err(db_error)?;
+    if !permitted {return Err(error(StatusCode::NOT_FOUND,"thread not found"));}
+    let rows=sqlx::query(
+       "SELECT r.id AS run_id, tm.prompt_tokens,tm.reported_cached_tokens,
+               tm.completion_tokens,tm.roundtrip_ms,tm.ttft_ms,tm.source
+        FROM runs r JOIN turns t ON t.id=r.turn_id
+        JOIN thread_run_telemetry tm ON tm.run_id=r.id
+        WHERE t.thread_id=$1 ORDER BY tm.captured_at,r.id"
+    ).bind(tid).fetch_all(&app.pool).await.map_err(db_error)?;
+    let mut out=Vec::new();
+    for row in rows {
+        out.push(json!({
+          "run_id":row.try_get::<Uuid,_>("run_id").map_err(db_error)?,
+          "prompt_tokens":row.try_get::<Option<i64>,_>("prompt_tokens").map_err(db_error)?,
+          "reported_cached_tokens":row.try_get::<Option<i64>,_>("reported_cached_tokens").map_err(db_error)?,
+          "completion_tokens":row.try_get::<Option<i64>,_>("completion_tokens").map_err(db_error)?,
+          "roundtrip_ms":row.try_get::<Option<i64>,_>("roundtrip_ms").map_err(db_error)?,
+          "ttft_ms":row.try_get::<Option<i64>,_>("ttft_ms").map_err(db_error)?,
+          "source":row.try_get::<String,_>("source").map_err(db_error)?
+        }));
+    }
+    Ok(Json(json!({"object":"list","data":out,
+       "note":"reported_cached_tokens comes from chat response usage, not independently verified native checkpoint reuse; null means unknown"})))
+}
+
 #[derive(Deserialize)]
 struct NewTurn {
     branch_id: Uuid,
@@ -204,6 +235,7 @@ async fn run_turn(
             }
         }
     });
+    let inference_started=Instant::now();
     let upstream=app.client.post(format!("{}/v1/chat/completions",app.upstream))
          .json(&json!({"model":model,"messages":messages,"stream":false,
                       "max_tokens":req.max_tokens.unwrap_or(1024)}))
@@ -232,8 +264,25 @@ async fn run_turn(
     sqlx::query("UPDATE runs SET state='FINALIZING' WHERE id=$1 AND state='RUNNING'")
        .bind(run_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
+    // Commit telemetry best-effort. A metrics write must never turn a successfully
+    // committed message into a client-visible retry failure.
+    let usage=result.as_ref().and_then(|v|v.get("usage"));
+    let prompt=usage.and_then(|v|v.get("prompt_tokens")).and_then(Value::as_i64);
+    let reported=usage.and_then(|v|v.pointer("/prompt_tokens_details/cached_tokens"))
+        .and_then(Value::as_i64);
+    let completion=usage.and_then(|v|v.get("completion_tokens")).and_then(Value::as_i64);
+    let measured_roundtrip_ms=i64::try_from(inference_started.elapsed().as_millis()).unwrap_or(i64::MAX);
     let message_id=commit_turn(&app.pool,accepted.turn_id,run_id,token,
        Uuid::new_v4(),Uuid::new_v4(),&reply,Some(&model)).await.map_err(ledger_error)?;
+    if let Err(e)=sqlx::query(
+         "INSERT INTO thread_run_telemetry(run_id,prompt_tokens,reported_cached_tokens,
+              completion_tokens,roundtrip_ms,ttft_ms,source)
+          VALUES($1,$2,$3,$4,$5,NULL,'basalt.chat_completion.usage')
+          ON CONFLICT(run_id) DO NOTHING")
+         .bind(run_id).bind(prompt).bind(reported).bind(completion)
+         .bind(measured_roundtrip_ms).execute(&app.pool).await {
+        eprintln!("thread telemetry capture failed: {e}");
+    }
     Ok((StatusCode::OK,Json(json!({"turn_id":accepted.turn_id,"status":"COMMITTED",
        "message_id":message_id,"response":reply}))))
 }
@@ -265,6 +314,7 @@ async fn main() -> std::result::Result<(),Box<dyn std::error::Error>> {
        .route("/v1/threads",post(create_thread))
        .route("/v1/threads/{id}",get(read_thread))
        .route("/v1/threads/{id}/messages",get(read_messages))
+       .route("/v1/threads/{id}/metrics",get(read_metrics))
        .route("/v1/threads/{id}/turns",post(run_turn))
        .with_state(app);
     let addr:SocketAddr="127.0.0.1:8095".parse()?;
