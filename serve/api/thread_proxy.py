@@ -11,7 +11,7 @@ import json
 import os
 import re
 
-_THREAD_PATH = re.compile(r"^/v1/threads(?:/[0-9a-fA-F-]{36}(?:/(?:messages|turns))?)?$")
+_THREAD_PATH = re.compile(r"^/v1/threads(?:/[0-9a-fA-F-]{36}(?:/(?:messages|turns|metrics))?)?$")
 
 
 def is_thread_path(path: str) -> bool:
