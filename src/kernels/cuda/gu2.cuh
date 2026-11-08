@@ -394,8 +394,10 @@ __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e
             rows2<TY, 3, KC>(wr, rb, r, e, 3, ent_tok, xq, dst, n_ff, grid, lane);
             e += 3;
         } else {
-            const int m = min(n, 6);
-            rows2<TY, 6, KC>(wr, rb, r, e, m, ent_tok, xq, dst, n_ff, grid, lane);
+            // 5120-value rows three entries at a time: the decode then fits kGu2MinBlocks' registers
+            constexpr int kNC = KC == 160 ? 3 : 6;
+            const int m = min(n, kNC);
+            rows2<TY, kNC, KC>(wr, rb, r, e, m, ent_tok, xq, dst, n_ff, grid, lane);
             e += m;
         }
     }
@@ -421,15 +423,21 @@ template<int TG> inline constexpr bool kGu2 = TG == 16 || TG == 17 || TG == 18 |
 // the grid formats and Q2_0 (the grouped launch and the peer kernel's Q2_0 build)
 template<int TG> inline constexpr bool kGu2Q2 = kGu2<TG> || TG == 42;
 constexpr int GU2_ROWS = 16;   // rows per block: two a warp
+// three blocks an SM at 5120-value rows, where a format's decode fits the 80 registers that leaves (IQ2_S's and
+// IQ3_S's would spill); the 2560-value rows as they were
+template<int TG, int KC> inline constexpr int kGu2MinBlocks = KC == 160 && TG != 21 && TG != 22 ? 3 : 1;
 
 // native_gu_multi_kernel's rows, GU2_ROWS a block; the same group stride.  TU: the up rows' type; KC: calls a row.
 template<int TG, int TU = TG, int KC = 80>
-__global__ void __launch_bounds__(256) native_gu2_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                         const int32_t* __restrict__ grp_start,
-                                                         const int32_t* __restrict__ n_groups,
-                                                         const int32_t* __restrict__ ent_tok,
-                                                         const block_q8_1* __restrict__ xq, NativeExpertLayout L,
-                                                         float* __restrict__ gate, float* __restrict__ up) {
+__global__ void __launch_bounds__(256, kGu2MinBlocks<TG, KC>)
+native_gu2_kernel(const unsigned long long* __restrict__ grp_ptr,
+                  const int32_t* __restrict__ grp_start,
+                  const int32_t* __restrict__ n_groups,
+                  const int32_t* __restrict__ ent_tok,
+                  const block_q8_1* __restrict__ xq,
+                  NativeExpertLayout L,
+                  float* __restrict__ gate,
+                  float* __restrict__ up) {
     asm volatile("griddepcontrol.launch_dependents;");   // the down kernel may start (it waits for this grid)
     const int ng = *n_groups;
     if ((int) blockIdx.y >= ng) return;
