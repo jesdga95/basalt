@@ -112,6 +112,21 @@ bool Request::refill(std::string& e) {
             if (!p.lent.empty() && !refill_one(p, e)) return false;
     }
     if (n_parts > 0) runtime_.res_upload();
+    if (runtime_.srcp == &runtime_.src && runtime_.src.complement_ready() && runtime_.pf_parts.size() == 1) {
+        if (runtime_.ba_job) { runtime_.ba_thr.join(); runtime_.ba_job = false; }
+        if (!runtime_.ver.wait_commit(e) || !runtime_.xq_drain()) return false;
+        const int64_t loan_from = runtime_.pf_parts[0].first < 0 ? INT64_MAX : runtime_.pf_parts[0].first;
+        size_t released = 0;
+        // A failed request may have left homes behind; only copies now backed by GPU slots below the loan can be released.
+        for (size_t i = 0; i < runtime_.host_res.size(); ++i)
+            if (runtime_.host_res[i] >= 0 && runtime_.host_res[i] < loan_from &&
+                runtime_.src.spare_release(i / runtime_.g.n_expert, i % runtime_.g.n_expert))
+                ++released;
+        const uint64_t freed = runtime_.src.homes_reclaim() + runtime_.src.homes_compact();
+        if (released > 0 || freed > 0)
+            basalt::log::info("basalt serve", "prompt loan: %zu temporary expert copies released (%.0f MiB freed)",
+                             released, (double) freed / 1048576.0);
+    }
     ov_copied = false;
     return true;
 }
@@ -140,11 +155,13 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
     // them stays within kLendCapDecoding slots (they keep their experts in the cache).  A read on an idle
     // engine may refill lent slots from the file, so a larger chunk is worth it.  The chunk shrinks to the
     // loan, but not below the smallest chunk the prompt path runs.
+    const bool ram_loan = runtime_.pf_parts.size() == 1 && runtime_.stages.empty() &&
+                          runtime_.srcp == &runtime_.src && runtime_.src.complement_ready();
     int64_t loan_lim = std::numeric_limits<int64_t>::max();
     if (runtime_.batch_on()) {
         if (beside) loan_lim = runtime_.kLendCapDecoding;
         // the RAM-backed slots are the cache's last ones: those still live after the KV took its share
-        if (runtime_.src.complement_ready())
+        if (runtime_.src.complement_ready() && !ram_loan)
             loan_lim = std::min<int64_t>(loan_lim, std::max<int64_t>(0, runtime_.src.resident_lent_slots() -
                                                                          (runtime_.xcache.full_slots() - runtime_.xcache.slots())));
     }
@@ -193,6 +210,19 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
             if (!refill_one(p, e)) return false;
         }
         const basalt::core::OnDevice on(p.dev);
+        if (ram_loan) {
+            if (runtime_.ba_job) { runtime_.ba_thr.join(); runtime_.ba_job = false; }
+            if (!runtime_.ver.wait_commit(e) || !runtime_.xq_drain()) return false;
+            std::vector<std::pair<int32_t, int32_t>> added;
+            for (size_t i = 0; i < runtime_.host_res.size(); ++i) {
+                const int32_t l = (int32_t) (i / runtime_.g.n_expert), ex = (int32_t) (i % runtime_.g.n_expert);
+                if (runtime_.host_res[i] >= first && !runtime_.src.has_resident(l, ex)) added.emplace_back(l, ex);
+            }
+            if (!runtime_.home_slots_from(first, e)) return false;
+            if (!added.empty())
+                basalt::log::info("basalt serve", "prompt loan: chunk %lld tokens, %zu temporary expert copies",
+                                 (long long) want, added.size());
+        }
         if (beside && &p == &runtime_.pf_parts[0] && p.lent.empty()) {
             if (runtime_.ba_job) { runtime_.ba_thr.join(); runtime_.ba_job = false; }   // no adaptive copy lands in a slot it moves
             if (!runtime_.xq_drain()) { e = "an adaptive refill failed"; return false; }
