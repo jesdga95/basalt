@@ -207,29 +207,29 @@ Flow Runtime::dispatch() {
             if (in >> extra || !NativeThreadTapes::valid_name(id) ||
                 !NativeThreadTapes::valid_name(head) ||
                 (command == "THREAD_APPEND" && !NativeThreadTapes::valid_name(new_head))) {
-                std::printf("ERR THREAD: bad identity or arguments\\n");
+                std::printf("ERR THREAD: bad identity or arguments\n");
                 std::fflush(stdout);
                 return Flow::next;
             }
             std::vector<int32_t> ids;
             if (!parse_ids(csv, ids)) {
-                std::printf("ERR THREAD: invalid token ids\\n");
+                std::printf("ERR THREAD: invalid token ids\n");
                 std::fflush(stdout);
                 return Flow::next;
             }
             const auto r = command == "THREAD_ATTACH"
                 ? thread_tapes.attach(id, head, ids, (size_t) o.max_context, n_vocab)
                 : thread_tapes.append(id, head, new_head, ids, (size_t) o.max_context, n_vocab);
-            if (!r.ok) std::printf("ERR THREAD: %s\\n", r.why);
-            else std::printf("THREAD_OK %s %s\\n", command.c_str(), id.c_str());
+            if (!r.ok) std::printf("ERR THREAD: %s\n", r.why);
+            else std::printf("THREAD_OK %s %s\n", command.c_str(), id.c_str());
             std::fflush(stdout);
             return Flow::next;
         }
         if (command == "THREAD_RELEASE") {
             if (in >> extra || !NativeThreadTapes::valid_name(id))
-                std::printf("ERR THREAD: bad release identity\\n");
+                std::printf("ERR THREAD: bad release identity\n");
             else
-                std::printf("THREAD_OK THREAD_RELEASE %s %d\\n", id.c_str(), thread_tapes.release(id) ? 1 : 0);
+                std::printf("THREAD_OK THREAD_RELEASE %s %d\n", id.c_str(), thread_tapes.release(id) ? 1 : 0);
             std::fflush(stdout);
             return Flow::next;
         }
@@ -239,7 +239,7 @@ Flow Runtime::dispatch() {
             const auto* ids = thread_tapes.get(id, head);
             if (in >> extra || !NativeThreadTapes::valid_name(id) || !ids ||
                 max_new < 1 || max_new >= o.max_context) {
-                std::printf("ERR THREAD: invalid generate or stale thread head\\n");
+                std::printf("ERR THREAD: invalid generate or stale thread head\n");
                 std::fflush(stdout);
                 return Flow::next;
             }
@@ -250,7 +250,7 @@ Flow Runtime::dispatch() {
             line = "GEN " + std::to_string(max_new) + " @" + std::to_string(seq);
             // Fall through into existing Request execution and exact prefix/KV verification.
         } else {
-            std::printf("ERR THREAD: unknown or unsupported native command\\n");
+            std::printf("ERR THREAD: unknown or unsupported native command\n");
             std::fflush(stdout);
             return Flow::next;
         }
