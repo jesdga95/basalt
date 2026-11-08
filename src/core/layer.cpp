@@ -1,5 +1,6 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/layer.hpp"
 #include "basalt/core/native_head.hpp"
 #include "basalt/core/kv_arena.hpp"
@@ -614,9 +615,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.step = c.take<int32_t>((uint64_t) basalt::kernels::kStepCount);
     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
     // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
-    if (cudaHostAlloc((void**) &st.host_step, basalt::kernels::qsa_step_bytes(),
+    if (basalt::core::allocate_pinned_host((void**) &st.host_step, basalt::kernels::qsa_step_bytes(),
                       cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-        cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
+        basalt::core::allocate_pinned_host((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
             cudaSuccess) {
         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
     }
@@ -627,7 +628,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * basalt::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        if (basalt::core::allocate_pinned_host((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             // the driver may pin only a small amount of host memory in all, which is less than a long context of
             // 8-bit KV needs
@@ -1096,8 +1097,8 @@ namespace {}
 uint64_t doorbell_init(const ModelGeometry& g, int64_t k, Doorbell& db) {    db.n_embd = g.n_embd;    db.k = k;    uint64_t bytes = 0;
 // ONE region per field, each MAPPED PINNED, so the device and the host have different pointers to the same
 // bytes and no copy is needed to publish them.
-auto alloc = [&](size_t n, void** h, void** d, const char* what) {        if (cudaHostAlloc(h, n, cudaHostAllocMapped) != cudaSuccess) {            basalt::log::error("basalt", "doorbell_init: cudaHostAlloc(%s) failed", what);            return false;        }        if (cudaHostGetDevicePointer(d, *h, 0) != cudaSuccess) {            basalt::log::error("basalt", "doorbell_init: cudaHostGetDevicePointer(%s) failed", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    };    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(4, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
-void doorbell_free(Doorbell& db) {    if (db.h_x_f) cudaFreeHost(db.h_x_f);    if (db.h_ids) cudaFreeHost(db.h_ids);    if (db.h_weights) cudaFreeHost(db.h_weights);    if (db.h_seq) cudaFreeHost(db.h_seq);    if (db.h_flag) cudaFreeHost(db.h_flag);    db = Doorbell{};}
+auto alloc = [&](size_t n, void** h, void** d, const char* what) {        if (basalt::core::allocate_pinned_host(h, n, cudaHostAllocMapped) != cudaSuccess) {            basalt::log::error("basalt", "doorbell_init: cudaHostAlloc(%s) failed", what);            return false;        }        if (cudaHostGetDevicePointer(d, *h, 0) != cudaSuccess) {            basalt::log::error("basalt", "doorbell_init: cudaHostGetDevicePointer(%s) failed", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    };    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(4, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
+void doorbell_free(Doorbell& db) {    if (db.h_x_f) basalt::core::release_pinned_host(db.h_x_f);    if (db.h_ids) basalt::core::release_pinned_host(db.h_ids);    if (db.h_weights) basalt::core::release_pinned_host(db.h_weights);    if (db.h_seq) basalt::core::release_pinned_host(db.h_seq);    if (db.h_flag) basalt::core::release_pinned_host(db.h_flag);    db = Doorbell{};}
 void doorbell_reset(const Doorbell& db) {
     if (db.h_seq) *db.h_seq = 0;
     if (db.h_flag) *(volatile uint32_t*) db.h_flag = 0;
