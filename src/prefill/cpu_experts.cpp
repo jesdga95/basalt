@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "experts.hpp"
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/mtp.hpp"
@@ -21,10 +22,10 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_download() {
     if (cpu_maybe) {
         const size_t want = (size_t) T * N;
         if (m.cpu_x_n < want) {
-            if (m.cpu_x) cudaFreeHost(m.cpu_x);
+            if (m.cpu_x) basalt::core::release_pinned_host(m.cpu_x);
             m.cpu_x = nullptr;
             m.cpu_x_n = 0;
-            if (cudaHostAlloc((void**) &m.cpu_x, want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+            if (basalt::core::allocate_pinned_host((void**) &m.cpu_x, want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
                 err = "prefill: cannot allocate the CPU experts' activations";
                 return false;
             }
@@ -81,11 +82,11 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_start() {
     if (rows_cpu > 0) {
         const size_t want = (size_t) rows_cpu * N;
         if (m.cpu_rows_n < want) {
-            if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
+            if (m.cpu_rows) basalt::core::release_pinned_host(m.cpu_rows);
             m.cpu_rows = nullptr;
             m.cpu_rows_n = 0;
             const size_t cap = want * 2;   // headroom: few reallocations
-            if (cudaHostAlloc((void**) &m.cpu_rows, cap * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+            if (basalt::core::allocate_pinned_host((void**) &m.cpu_rows, cap * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
                 err = "prefill: cannot allocate the CPU experts' rows";
                 return false;
             }
