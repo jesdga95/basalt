@@ -448,6 +448,16 @@ bool ExpertTier::load_ram(std::string& err) {
         if (unpinned > 0)
             basalt::log::warn("basalt deepseek41", "RAM expert tier: %d of %d layers not pinned, locked: %s", unpinned, n_layers_,
                               ram_pins_[(size_t) n_layers_ - 1].lock_note.c_str());
+        // Pinned past what the driver backs, the runtime stops answering on every card, and returning the pages does not
+        // bring it back: the start ends here rather than at the first request.
+        std::vector<int> cards{-1};   // the main card is the current one
+        if (peer_) cards.push_back(peer_->device());
+        std::string dead;
+        if (!core::devices_allocate(cards, dead)) {
+            err = "deepseek41: the device cannot allocate after pinning the RAM tier (" + dead +
+                  "); pin less with a smaller --resident-budget-gib";
+            return false;
+        }
     }
     if (ram_load) ram_load->finish();
     if (main_load) main_load->finish();
