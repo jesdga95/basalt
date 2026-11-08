@@ -137,6 +137,15 @@ double device_h2d_gbps(int ordinal) {
 
 namespace basalt::core {
 
+std::string memory_failure(const char* what, cudaError_t e) {
+    int dev = -1, count = 0;
+    cudaGetDevice(&dev);
+    cudaGetDeviceCount(&count);
+    (void) cudaGetLastError();   // read here: an error left set would be reported by the next call that checks
+    return std::string(what) + ": " + cudaGetErrorString(e) + " (code " + std::to_string((int) e) + "), device " +
+           std::to_string(dev) + " of " + std::to_string(count);
+}
+
 std::string device_code_error() {
     // every .cu of the engine is compiled for the same CMAKE_CUDA_ARCHITECTURES, so this kernel stands for all
     cudaFuncAttributes a{};

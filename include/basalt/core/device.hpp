@@ -12,11 +12,16 @@
 #pragma once
 
 #include <cstdint>
+#include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace basalt::core {
+
+/// What a failed memory call answered, and where: a bare "cannot read the free device memory" hides whether the
+/// runtime is out of memory on this device, the ordinal is wrong, or the process already cannot allocate at all.
+std::string memory_failure(const char* what, cudaError_t e);
 
 struct DeviceInfo {
     int ordinal = -1;
