@@ -18,6 +18,7 @@
 // prefixed "mtp." and use the drafter's own tensor names.  tools/convert/hc8.py computes them from the file's bf16
 // matrices, bit for bit as the kernels' quantizer (hc8_adopt) does.
 #include "basalt/core/model_format.hpp"
+#include "basalt/platform/host_allocator.hpp"
 
 #include <cstdint>
 #include <map>
@@ -143,7 +144,7 @@ static_assert(sizeof(Hc8Entry) == 160);
 struct Hc8Copy {
     std::string name;
     uint32_t rows = 0, cols = 0, srow = 0;
-    std::vector<uint8_t> data;
+    basalt::platform::HostVector<uint8_t> data;
     const int8_t* q() const { return (const int8_t*) data.data(); }
     const uint16_t* s() const { return (const uint16_t*) (data.data() + (size_t) rows * cols); }
 };
