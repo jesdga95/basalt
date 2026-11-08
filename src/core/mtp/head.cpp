@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "common.hpp"
 
 namespace basalt::core {
@@ -184,7 +185,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     }
     if (diag_ == nullptr && exp_flag("spec_log", 0) != 0) {
         diag_stride_ = dvocab_ != nullptr ? n_dvocab_ : n_vocab_;
-        if (cudaHostAlloc((void**) &diag_, (size_t) max_t_ * (size_t) diag_stride_ * sizeof(float), cudaHostAllocDefault) != cudaSuccess)
+        if (basalt::core::allocate_pinned_host((void**) &diag_, (size_t) max_t_ * (size_t) diag_stride_ * sizeof(float), cudaHostAllocDefault) != cudaSuccess)
             diag_ = nullptr;
     }
     if (top_scratch_ == nullptr) {
