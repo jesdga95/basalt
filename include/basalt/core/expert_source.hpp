@@ -18,6 +18,7 @@
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/hit_hook.hpp"
 #include "basalt/core/model_file.hpp"
+#include "basalt/core/ram_load.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/platform/mapped_file.hpp"
 
@@ -360,7 +361,8 @@ public:
     /// A place `spare_take` gave, unused.
     void spare_return(int64_t layer, uint64_t off);
     /// After loading, before any reader runs: keeps more experts in RAM, in a second region placed after the first
-    /// in the offset space, hottest first (`rank`) as far as ram_tier_room of the available RAM and the reserve allows.
+    /// in the offset space, hottest first (`rank`) as far as ram_tier_room of the available RAM and the reserve allows,
+    /// less the file cache's floor (set_file_cache) while experts stay in the file.
     /// `skip(l, e)` names experts a GPU holds.  Returns the bytes added (0: nothing done); `count` gets the experts.
     uint64_t top_up(const std::vector<std::pair<int32_t, int32_t>>& rank,
                     const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count);
@@ -383,6 +385,8 @@ public:
     uint64_t homes_bytes() const;
     /// RAM above the reserve that a take leaves free (the engine's later allocations).
     void set_homes_reserve(uint64_t bytes) { homes_reserve_ = bytes; }
+    /// The shape of the file cache the experts left in the file read through: the top-up leaves its floor free.
+    void set_file_cache(const FileCache& c) { file_cache_ = c; }
     /// Debug: whether `bytes` equal the expert's bytes in the model files.
     bool equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const;
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
@@ -446,6 +450,7 @@ private:
     bool top_pinned_ = false;
     std::vector<detail::HomeRegion> homes_;
     uint64_t homes_reserve_ = 0;
+    FileCache file_cache_;
     bool exchange_live() const;   // a staged exchange's buffer is still read in place of a slot
     uint64_t homes_next_ = 0;   // the next region's base (0: none yet)
     std::vector<std::pair<size_t, uint64_t>> homes_pending_;   // (expert index, place) of an uncommitted take

@@ -142,6 +142,12 @@ int resident_plan(Context& context) {
                           (long long) xcache.slots(), (long long) held, (long long) (g.n_layers * g.n_expert));
         return true;
     };
+    // what experts left in the file read through the OS file cache: every expert of the largest layer, and one prompt
+    // chunk's reads for the lent slots the copy leaves out (sized below, with the lent slots)
+    basalt::core::FileCache file_cache;
+    for (int64_t l = 0; l < g.n_layers; ++l)
+        file_cache.layer_bytes = std::max<uint64_t>(file_cache.layer_bytes,
+                                                    (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l));
     // --serve: free places in the RAM copy take the evicted experts (no exchange buffers)
     const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
     // ---- the host buffers serving takes at its peak, before the RAM copy reads the free memory: RAM held for the prompt
@@ -220,6 +226,8 @@ int resident_plan(Context& context) {
         const uint64_t lent_bytes =
             (lend_from >= 0 ? (uint64_t) (xcache.slots() - lend_from) * basalt::kernels::cpu::expert_layout().max_blob : 0) +
             stage_lent_bytes;
+        file_cache.prompt_file_bytes = std::min<uint64_t>(lent_bytes, basalt::platform::kPromptFileReadBytes);
+        in.file_cache = file_cache;
         in.complement_full = expert_total_bytes - std::min(expert_total_bytes, cache_fill_bytes);
         in.complement_peer_excl = in.complement_full - std::min(in.complement_full, peer_expert_room());
         // the RAM copy also holds the free places the adaptive swaps use (see set_spares)
@@ -303,6 +311,7 @@ int resident_plan(Context& context) {
     context.auto_ceiling = &auto_ceiling;
     context.open_peer = open_peer;
     context.adapt_fast_on = &adapt_fast_on;
+    context.file_cache = &file_cache;
     context.lend_from = &lend_from;
     context.stage_held = &stage_held;
     context.pool = &pool;

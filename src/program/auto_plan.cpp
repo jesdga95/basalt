@@ -55,7 +55,10 @@ AutoPlan choose_auto(const AutoInputs& in) {
     } else {
         const uint64_t complement = p.peer_exclusive ? in.complement_peer_excl : in.complement_full;
         const uint64_t extra = p.peer_exclusive ? in.extra_peer_excl : in.extra_full;
-        const uint64_t room = in.ram_available > in.floor_bytes ? in.ram_available - in.floor_bytes : 0;
+        // experts left in the file read through the OS file cache, which keeps its floor beside the copy's
+        const uint64_t floor =
+            in.floor_bytes + basalt::core::file_cache_keep(in.ram_available, in.floor_bytes, false, complement, in.file_cache);
+        const uint64_t room = in.ram_available > floor ? in.ram_available - floor : 0;
         p.resident_bytes = (std::min)(room, complement + extra);
         p.resident_gb = (double) p.resident_bytes / kGiB;
     }

@@ -83,6 +83,7 @@ struct Context {
     basalt::core::ExpertSource ** srcp = nullptr;
     std::optional<basalt::kernels::cpu::ExpertPool>* pool_store = nullptr;
     uint64_t* auto_resident_bytes = nullptr;
+    const basalt::core::FileCache* file_cache = nullptr;
     std::function<uint64_t()> peer_prompt_bytes;
     basalt::core::ExpertCache* xcache = nullptr;
     const int64_t* kv_tail_slots = nullptr;
