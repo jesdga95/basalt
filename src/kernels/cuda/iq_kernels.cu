@@ -3005,9 +3005,10 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
         }
     }
     if constexpr (kGu2Q2<TG>) {
-        if (allow_mma && g_gu2 && !g_old_kernels && gu2_usable(L)) {
+        if (allow_mma && g_gu2 && !g_old_kernels && (gu2_usable(L) || gu2_usable(L, 160))) {
             const dim3 g2((unsigned) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS), grid.y);
-            native_gu2_kernel<TG><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            if (gu2_usable(L)) native_gu2_kernel<TG><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else native_gu2_kernel<TG, TG, 160><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
             return;
         }
     }
