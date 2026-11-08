@@ -1431,6 +1431,31 @@
       "prefill_16k_tps": 10520.5,
       "prefill_64k_tps": 11095.8,
       "decode_tps": 391.5
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-07",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.9
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.8,
+      "os": "Windows",
+      "quant": "Q6_K_XL",
+      "kv": "int8",
+      "prefill_16k_tps": 6651.0,
+      "prefill_64k_tps": 8132.4,
+      "decode_tps": 137.0
     }
   ]
 }
