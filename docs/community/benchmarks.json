@@ -1556,6 +1556,58 @@
       "prefill_16k_tps": 3204.9,
       "prefill_64k_tps": 3801.7,
       "decode_tps": 138.0
+    },
+    {
+      "submitter": "beastrobin",
+      "date": "2026-11-09",
+      "commit": "364815560d",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX PRO 6000 Blackwell Workstation Edition",
+          "vram_gib": 96,
+          "power_w": 600,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 48.6
+        }
+      ],
+      "ram_gib": 253,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 59.6,
+      "os": "Windows",
+      "quant": "NVFP4-DQ8",
+      "kv": "int8",
+      "prefill_16k_tps": 10070.0,
+      "prefill_64k_tps": 12033.9,
+      "decode_tps": 538.7,
+      "notes": "NVFP4 experts, dense dequant to 8-bit (DQ8 pack); v0.3.1 tag build self-built; watt-pair rerun of the 498.3@600W/423.1@300W NVFP4 rows (9175e7a3); driver 617.42; each column one cold shot"
+    },
+    {
+      "submitter": "beastrobin",
+      "date": "2026-11-09",
+      "commit": "364815560d",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX PRO 6000 Blackwell Workstation Edition",
+          "vram_gib": 96,
+          "power_w": 300,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 50.2
+        }
+      ],
+      "ram_gib": 253,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 59.7,
+      "os": "Windows",
+      "quant": "NVFP4-DQ8",
+      "kv": "int8",
+      "prefill_16k_tps": 7567.6,
+      "prefill_64k_tps": 8374.7,
+      "decode_tps": 441.4,
+      "notes": "NVFP4 experts, dense dequant to 8-bit (DQ8 pack); v0.3.1 tag build self-built; watt-pair rerun of the 498.3@600W/423.1@300W NVFP4 rows (9175e7a3); driver 617.42; each column one cold shot"
     }
   ]
 }
