@@ -608,7 +608,8 @@ def make_handler(target: Service | Router):
             self.end_headers()
 
         def _unknown_model(self, path, name):
-            """404 for a missing or unserved model, in the shape of the API called."""
+            """404 for a name that serves nothing, or no name where several models are configured, in the shape of the
+            API called. A request naming no model reaches here only through `Router.service_for`."""
             anthropic = path.startswith("/v1/messages")
             if name is None:
                 text = "model: required" if anthropic else "model is required"

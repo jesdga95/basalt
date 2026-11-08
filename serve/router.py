@@ -54,7 +54,10 @@ class Router:
         return len(self.services) > 1
 
     def service_for(self, name) -> object | None:
-        """The service answering to `name`: a listed name or a model file's name."""
+        """The service answering to `name`: a listed name or a model file's name. A request that names no model goes to
+        the only one configured; with several configured it names nothing and the request is the caller's 404."""
+        if name is None:
+            return None if self.multi else self.front
         if isinstance(name, str):
             for svc in self.services:
                 if name in svc.served_names():
