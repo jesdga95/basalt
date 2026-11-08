@@ -175,6 +175,41 @@ class ThreadHTTP(unittest.TestCase):
         status,messages=self.call("GET",f"/v1/threads/{tid}/messages")
         self.assertEqual([x["content"] for x in messages["data"] if x["role"]=="user"],["persist me"])
 
+    def test_explicit_forks_keep_independent_heads_and_history(self):
+        status,t=self.call("POST","/v1/threads",{"model":"fake-model"})
+        self.assertEqual(status,201,t)
+        tid=t["id"]
+        first={"branch_id":t["branch_id"],"expected_version":0,
+               "parent_message_id":None,"idempotency_key":"root","content":"root",
+               "max_tokens":16}
+        status,out=self.call("POST",f"/v1/threads/{tid}/turns",first)
+        self.assertEqual(status,200,out)
+        head=out["message_id"]
+        status,fork=self.call("POST",f"/v1/threads/{tid}/branches",{"from_message_id":head})
+        self.assertEqual(status,201,fork)
+        bid=fork["id"]
+        status,new=self.call("POST",f"/v1/threads/{tid}/turns",{
+           **first,"branch_id":bid,"parent_message_id":head,"expected_version":0,
+           "idempotency_key":"fork-A","content":"alternate direction"})
+        self.assertEqual(status,200,new)
+        status,other=self.call("POST",f"/v1/threads/{tid}/turns",{
+           **first,"parent_message_id":head,"expected_version":1,
+           "idempotency_key":"main-B","content":"original direction"})
+        self.assertEqual(status,200,other)
+        status,original=self.call("GET",f"/v1/threads/{tid}")
+        self.assertEqual(original["head_message_id"],other["message_id"])
+        status,fork_view=self.call("GET",f"/v1/threads/{tid}/branches/{bid}")
+        self.assertEqual(fork_view["head_message_id"],new["message_id"])
+        status,history=self.call("GET",f"/v1/threads/{tid}/branches/{bid}/messages")
+        self.assertEqual([x["content"] for x in history["data"] if x["role"]=="user"],
+                         ["root","alternate direction"])
+        status,main_history=self.call("GET",f"/v1/threads/{tid}/messages")
+        self.assertEqual([x["content"] for x in main_history["data"] if x["role"]=="user"],
+                         ["root","original direction"])
+        status,_=self.call("POST",f"/v1/threads/{tid}/branches",
+                           {"from_message_id":"00000000-0000-0000-0000-000000000000"})
+        self.assertEqual(status,404)
+
     def test_recovery_retry_preserves_single_logical_exchange(self):
         code,t=self.call("POST","/v1/threads",{"model":"fake-model"})
         self.assertEqual(code,201,t)
