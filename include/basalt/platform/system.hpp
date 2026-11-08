@@ -23,9 +23,8 @@ std::string host_os_name();
 /// the platform puts on PATH.
 std::string python_interpreter(const std::string& src_dir);
 
-/// Asks that this process be the one ended first if the machine runs out of memory. No effect where the OS has no
-/// such knob.
-void prefer_oom_victim();
+/// Restores the normal OOM adjustment (zero). Succeeds without changing anything where the OS has no such knob.
+bool use_normal_oom_priority();
 
 /// Asks that this process keep running at full speed while its window is in the background or minimized. Windows
 /// otherwise lowers such a process's quality of service, which on a hybrid CPU keeps its threads on the efficiency
