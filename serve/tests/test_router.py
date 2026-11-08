@@ -600,6 +600,8 @@ class Startup(unittest.TestCase):
             eng.write_bytes(b"\0--kv\0--max-context\0--spec\0--pool-workers\0")
             conf = Path(d) / "c.json"
             conf.write_text(json.dumps(cfg))
+            for entry in cfg.get("models", []):                  # the launch check wants every model file to exist
+                (Path(d) / entry["model"]).write_bytes(b"")
             args = ["server", "--config", str(conf), "--engine-bin", str(eng), *argv]
             with mock.patch.object(sys, "argv", args), mock.patch.object(sys, "stderr", err), mock.patch.object(sys, "stdout", sys.stdout), \
                     mock.patch("serve.engine.modelfile.model_config", return_value={"args": [], "engine_bin": str(eng), "log": None, "tokenizer": "/x", "model_name": "m"}), \
