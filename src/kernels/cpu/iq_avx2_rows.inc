@@ -490,8 +490,9 @@ inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const
     else                                    row_dot<TY, NT>(row, nblocks, y, res);
 }
 
-// Gathered grid rows pay on performance cores and lose on efficient ones (core type 0x20 in CPUID leaf 0x1a): a hybrid
-// part reads the calling thread's core type again every 64 calls, as the OS may move it.  The base build never gathers.
+// Gathered grid rows pay on Intel performance cores and lose on efficient ones (core type 0x20 in CPUID leaf 0x1a) and on
+// other vendors' cores: a hybrid part reads the calling thread's core type again every 64 calls, as the OS may move it.
+// The base build never gathers.
 inline bool core_gathers_fast() {
     unsigned r[4] = {0, 0, 0, 0};
     platform::cpuid(0x1a, 0, r);
@@ -503,6 +504,7 @@ inline bool gather_here() {
     static const int kind = [] {   // 0: every core gathers fast, 1: no core does, 2: hybrid
         unsigned r[4] = {0, 0, 0, 0};
         platform::cpuid(0, 0, r);
+        if (r[1] != 0x756e6547u) return 1;   // not "GenuineIntel": other vendors' gathers lose to the halves
         if (r[0] < 0x1a) return 0;
         platform::cpuid(7, 0, r);
         if (((r[3] >> 15) & 1u) != 0) return 2;
