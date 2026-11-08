@@ -53,7 +53,8 @@ public:
     bool prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, std::string& err);
     bool fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive = false);
     /// A tier whose owner keeps the experts' places and fills the slots itself: no expert source, no adaptation.
-    /// `rows`: the pinned, portable, mapped host rows a share lands in.
+    /// `rows`: the pinned, portable, mapped host rows a share lands in; a share's activations are pinned, portable
+    /// and mapped too.
     bool open_plain(int device, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, float* rows, std::string& err);
     /// The device bytes free for expert slots.
     uint64_t room() const;
@@ -193,6 +194,9 @@ private:
     bool launched_direct_ = false;
     int64_t n_embd_ = 0;                              ///< activation width of the launched shares
     float* rows_map_ = nullptr;                       ///< open_plain's rows as this card addresses them
+    void* meta_map_ = nullptr;                        ///< open_plain: the plan staging as this card addresses it
+    const float* x_host_ = nullptr;                   ///< open_plain: the last activations launched, and as this card
+    const float* x_map_ = nullptr;                    ///< addresses them
     bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
                        int64_t k, const int32_t* kind, std::string& err, float* out);
 };

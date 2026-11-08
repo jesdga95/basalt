@@ -276,7 +276,7 @@ public:
         for (int64_t e = 0; e < env.n_expert && (int) ids_.size() < 8; ++e)
             if (peer_.slot_ptr(0, e) != nullptr) ids_.push_back((int32_t) e);
         if (ids_.empty()) { why = "no_experts_on_peer"; return false; }
-        if (!x_.alloc((size_t) f.n_embd * sizeof(float), cudaHostAllocPortable)) { why = "alloc_failed"; return false; }
+        if (!x_.alloc((size_t) f.n_embd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped)) { why = "alloc_failed"; return false; }
         std::mt19937 rng(5);
         std::normal_distribution<float> nd(0.f, 1.f);
         for (int64_t i = 0; i < f.n_embd; ++i) ((float*) x_.p)[i] = nd(rng);
