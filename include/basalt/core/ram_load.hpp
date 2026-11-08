@@ -106,10 +106,47 @@ inline uint64_t pin_tracking_bytes(uint64_t pinned) { return pinned / 36; }
 
 /// The bytes a RAM tier or copy of experts may take with `avail` bytes available: everything above `reserve`, less the
 /// driver's tracking of its pages when it is `pinned`.  Every model sizes its tier with this, after it has allocated
-/// (or held the RAM of) the host buffers it takes later.
+/// (or held the RAM of) the host buffers it takes later, and with the file cache's keep (file_cache_keep) in `reserve`
+/// when some experts stay in the file.
 inline uint64_t ram_tier_room(uint64_t avail, uint64_t reserve, bool pinned) {
     const uint64_t above = avail > reserve ? avail - reserve : 0;
     return pinned ? above - (above + 36) / 37 : above;
+}
+
+/// What the experts a RAM tier leaves in the file read through the OS file cache, which must keep them for as long as
+/// they are used: every expert of the model's largest layer (`layer_bytes`) and what one prompt chunk reads from the
+/// file beside the layers it computes (`prompt_file_bytes`, 0 when it reads nothing more).
+struct FileCache {
+    uint64_t layer_bytes = 0;
+    uint64_t prompt_file_bytes = 0;
+};
+
+/// The least RAM left to the OS file cache while any expert is read from the file.
+inline constexpr uint64_t kMinFileCacheBytes = 4ull << 30;
+
+/// The file cache's floor while `file_bytes` of `want_bytes` experts are read from the file: one prompt chunk's reads
+/// and the file-held share of two layers (the one computed and the one read ahead), at least kMinFileCacheBytes; 0
+/// when nothing is read from the file.  Pages evicted before their layer is over are read again at drive speed, and
+/// with swap the reclaim moves the rest of the system out instead.
+inline uint64_t file_cache_floor(uint64_t file_bytes, uint64_t want_bytes, const FileCache& c) {
+    if (file_bytes == 0) return 0;
+    const double share = want_bytes > file_bytes ? (double) file_bytes / (double) want_bytes : 1.0;
+    const uint64_t pass = c.prompt_file_bytes + 2 * ((uint64_t) ((double) c.layer_bytes * share) + 1);
+    return pass > kMinFileCacheBytes ? pass : kMinFileCacheBytes;
+}
+
+/// The RAM a tier sized by ram_tier_room(avail, reserve, pinned) also leaves free, toward `want_bytes` of experts: 0
+/// when they all fit, else the file cache's floor for the ones left in the file.  That share depends on the floor, so
+/// the iteration starts from all of them in the file and only goes down: the floor it ends on never undercounts.
+inline uint64_t file_cache_keep(uint64_t avail, uint64_t reserve, bool pinned, uint64_t want_bytes, const FileCache& c) {
+    if (want_bytes <= ram_tier_room(avail, reserve, pinned)) return 0;
+    uint64_t file = want_bytes, keep = 0;
+    for (int i = 0; i < 16; ++i) {
+        keep = file_cache_floor(file, want_bytes, c);
+        const uint64_t room = ram_tier_room(avail, reserve + keep, pinned);
+        file = want_bytes - (room < want_bytes ? room : want_bytes);
+    }
+    return keep;
 }
 
 /// Memory a pin takes whole large pages of: aligned to and padded to 2 MiB.

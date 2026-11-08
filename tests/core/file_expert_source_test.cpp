@@ -287,6 +287,33 @@ void test_resident_lend_region() {
     require(choose_resident_keep_from({}, 0, 0, 0) == 0, "an empty cache");
 }
 
+// A 62 GiB machine with swap, one card, a third of the experts left in the file (issue #285): the tier leaves the OS
+// file cache its floor beside the reserve, so the experts read from the file and the rest of the system keep their RAM.
+void test_file_cache_keep() {
+    using basalt::core::FileCache;
+    using basalt::core::file_cache_floor;
+    using basalt::core::file_cache_keep;
+    using basalt::core::kMinFileCacheBytes;
+    using basalt::core::ram_tier_room;
+    constexpr uint64_t kGiB = 1ull << 30;
+    const FileCache flash{(uint64_t) (1.6 * kGiB), 3584ull << 20};   // a layer's experts, one prompt chunk's reads
+    const uint64_t avail = 55 * kGiB, reserve = 2 * kGiB, want = 67 * kGiB;
+    const uint64_t keep = file_cache_keep(avail, reserve, true, want, flash);
+    const uint64_t room = ram_tier_room(avail, reserve + keep, true);
+    require(room < want, "a third of the experts stay in the file");
+    require(keep >= kMinFileCacheBytes && keep >= flash.prompt_file_bytes, "the file cache keeps a prompt chunk's reads");
+    require(file_cache_floor(want - room, want, flash) <= keep, "the floor for what is left in the file is kept");
+    require(keep < 6 * kGiB, "the floor is a prompt chunk and two layers' file share, not more");
+    // all of it fits: nothing is read from the file, nothing is kept
+    require(file_cache_keep(avail, reserve, true, 40 * kGiB, flash) == 0, "a tier that holds every expert keeps no cache");
+    require(file_cache_floor(0, want, flash) == 0, "no file reads, no floor");
+    // small layers and no prompt reads: the minimum
+    require(file_cache_keep(avail, reserve, false, want, FileCache{kGiB / 4, 0}) == kMinFileCacheBytes,
+            "the file cache keeps at least its minimum");
+    // everything in the file (no RAM above the reserve): the whole largest layer twice and a chunk
+    require(file_cache_floor(want, want, FileCache{4 * kGiB, kGiB}) == 9 * kGiB + 2, "two whole layers and a chunk");
+}
+
 void test_ram_tier_room() {
     using basalt::core::ram_tier_room;
     using basalt::core::pin_tracking_bytes;
@@ -590,6 +617,7 @@ int main() {
         test_resident_lend_region();
         test_resident_exchange();
         test_ram_tier_room();
+        test_file_cache_keep();
         test_cgroup_memory_budget();
         test_cgroup_memory_stat_text();
         test_host_memory();
