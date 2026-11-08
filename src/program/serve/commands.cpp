@@ -21,6 +21,7 @@ struct BusyClock {
 }  // namespace
 
 Flow Runtime::dispatch() {
+    if (o.host_pool_bytes > 0) relieve_host_pressure();
     if (batch_on() || (piped && pipe_inflight())) {
         if (!try_next_line(line)) {
             const BusyClock busy(busy_s, busy_on, busy_from);
@@ -39,11 +40,12 @@ Flow Runtime::dispatch() {
             const int r = next_line_within(line, 1000);
             if (r < 0) return Flow::quit;
             got = r == 1;
+            if (!got) relieve_host_pressure();
             while (!got && !(got = try_next_line(line)) && disk.enabled() && spill_to_disk(false, 1) > 0) {}
             if (got) break;
             parking = parking && park_idle_engine(pe);
             if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
-            if (!parking) break;
+            if (!parking && o.host_pool_bytes == 0) break;
         }
         if (!got && !next_line(line)) return Flow::quit;
     }
