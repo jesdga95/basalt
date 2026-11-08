@@ -357,6 +357,7 @@ def budget_count(text: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)
+    ap.add_argument("--native-slot-metrics", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--mock-engine", action="store_true",
                     help="run a scripted engine instead of the model, for clients and tests (no --model needed)")
     ap.add_argument("--model", help="the .basalt model file: the engine, tokenizer, sampling and vision come from it")
