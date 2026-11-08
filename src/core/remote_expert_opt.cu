@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/remote_experts.hpp"
 #include "basalt/core/on_device.hpp"
@@ -55,7 +56,7 @@ void RemoteExpertOpt::attach(RemoteExperts& remote) {
 
 bool RemoteExpertOpt::init(std::string& err) {
     void* mapped = nullptr;
-    if (!check(cudaHostAlloc((void**) &h_sum_, MAXT * (H + K) * sizeof(float),
+    if (!check(basalt::core::allocate_pinned_host((void**) &h_sum_, MAXT * (H + K) * sizeof(float),
                              cudaHostAllocPortable | cudaHostAllocMapped), err) ||
         !check(cudaHostGetDevicePointer(&mapped, h_sum_, 0), err)) return false;
     m_sum_ = (float*) mapped;
@@ -75,7 +76,7 @@ RemoteExpertOpt::~RemoteExpertOpt() {
         if (p.sum) cudaFree(p.sum);
         p.remote->remote_opt_ = nullptr;
     }
-    if (h_sum_) cudaFreeHost(h_sum_);
+    if (h_sum_) basalt::core::release_pinned_host(h_sum_);
 }
 
 size_t RemoteExpertOpt::metadata_bytes() { return sizeof(ReduceMeta); }
