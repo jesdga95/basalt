@@ -1,4 +1,5 @@
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/session.hpp"
 #include "basalt/kernels/mrope.hpp"
 #include "basalt/core/progress.hpp"
@@ -661,7 +662,7 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
     }
     parts_bytes = parts_bytes_in;
     // MAPPED as well as pinned: the token graph's handoff kernel reads it through its device pointer.
-    if (cudaHostAlloc((void**) &y_miss, parts_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+    if (basalt::core::allocate_pinned_host((void**) &y_miss, parts_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
         err = "SessionLoopScratch: cudaHostAlloc for the pool's staging failed";
         return false;
     }
@@ -676,7 +677,7 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
 
 void SessionLoopScratch::free() {
     if (probe != nullptr) { cudaEventDestroy(probe); probe = nullptr; }
-    if (y_miss != nullptr) { cudaFreeHost(y_miss); y_miss = nullptr; }
+    if (y_miss != nullptr) { basalt::core::release_pinned_host(y_miss); y_miss = nullptr; }
     parts_bytes = 0;
 }
 
