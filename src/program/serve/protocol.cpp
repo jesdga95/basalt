@@ -244,6 +244,8 @@ int Runtime::init_protocol() {
         cudaMemGetInfo(&free_b, &total_b);
         const int64_t free_mib = (int64_t) (free_b >> 20);
         if (free_mib >= vram_floor_mib()) {
+            if (free_mib < o.vram_reserve_mib)
+                o.vram_reserve_mib = (int) std::max<int64_t>(vram_floor_mib(), free_mib - 64);
             basalt::log::info("basalt serve", "%lld MiB of VRAM free with everything loaded", (long long) free_mib);
         } else {
             basalt::log::warn("basalt", "only %lld MiB of VRAM free, requests may stall; close other "
@@ -258,6 +260,9 @@ int Runtime::announce() {
     {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
+        const int64_t free_mib = (int64_t) (free_b >> 20);
+        if (free_mib >= vram_floor_mib() && free_mib < o.vram_reserve_mib)
+            o.vram_reserve_mib = (int) std::max<int64_t>(vram_floor_mib(), free_mib - 32);
         // "Experts in VRAM" is every tier, not one card's.  The tiers are disjoint by construction
         // (remote_experts.cpp skips any pair a stage already claimed), so they add.
         const int64_t slots_primary = (int64_t) xcache.slots();
@@ -312,6 +317,12 @@ int Runtime::announce() {
                     quant_label.c_str(), gpu_ids.c_str());
     }
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
+    if (o.host_pool_bytes > 0) {
+        const auto pool = basalt::core::host_pool_stats();
+        std::printf("INFO host_pool_mib=%llu host_pool_used_mib=%llu host_pool_peak_mib=%llu\n",
+                    (unsigned long long) (pool.capacity >> 20), (unsigned long long) (pool.used >> 20),
+                    (unsigned long long) (pool.peak >> 20));
+    }
     // a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on a flag nobody
     // will raise - end the engine with where it was, so the server starts it again instead of the GPU spinning
     // forever.  Before it does, it reports what every part was doing (stall_report), so one occurrence says where
