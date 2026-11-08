@@ -516,6 +516,13 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
     dir_ = dir;
     identity_ = identity;
     budget_ = budget;
+    if (basalt::platform::reserved_host_available() != UINT64_MAX) {
+        write_buf_ = std::make_unique<Aligned>(kStage);
+        for (int i = 0; i < kReaders; ++i) read_bufs_.push_back(std::make_unique<Aligned>(kPiece));
+        if (!write_buf_->p || std::any_of(read_bufs_.begin(), read_bufs_.end(), [](const auto& b) { return !b->p; })) {
+            error = "the host pool cannot reserve the disk I/O buffers"; return false;
+        }
+    }
     std::vector<basalt::platform::DirFile> files;
     if (!basalt::platform::list_files(dir_, files)) {
         error = "conversation store: cannot list " + dir;
@@ -732,7 +739,7 @@ uint64_t ConversationStore::load_bytes(const Match& m) const {
     return n + state * 3;   // the state at the match, once more as its checkpoint, and the root
 }
 
-bool ConversationStore::load(const Match& m, SavedConversation& out, std::string& error) {
+bool ConversationStore::load(const Match& m, SavedConversation& out, std::string& error) try {
     std::shared_ptr<Job> job;
     std::string name;
     Header head{};
@@ -1042,6 +1049,10 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     ++stats_.restored;
     stats_.read_bytes += read;
     return true;
+} catch (const std::bad_alloc&) {
+    out = {};
+    error = "insufficient buffer space to load the conversation; stored file retained";
+    return false;
 }
 
 // ------------------------------------------------------------------------------------------------ writing
@@ -1066,12 +1077,27 @@ void keep_stored_checkpoints(std::vector<ConversationCheckpoint>& v) {
 }  // namespace
 
 bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
-    if (!open_ || image.live.ids.empty() || !image.stage_images.empty()) return false;
+    return bool(enqueue(std::move(image), queue_cap));
+}
+
+bool ConversationStore::put_sync(SavedConversation& image) {
+    flush();
+    // This one image is already owned; trimming its checkpoint directory can change metadata capacity.
+    auto job = enqueue(std::move(image), UINT64_MAX);
+    if (!job) return false;
+    flush();
+    if (holds(job->image.live.ids, job->image.live.imgs, job->image.cvec)) return true;
+    image = std::move(job->image);
+    return false;
+}
+
+std::shared_ptr<ConversationStore::Job> ConversationStore::enqueue(SavedConversation&& image, uint64_t queue_cap) {
+    if (!open_ || image.live.ids.empty() || !image.stage_images.empty()) return nullptr;
     keep_stored_checkpoints(image.checkpoints);
     for (const auto& c : image.checkpoints)
         if (c.ids.size() > image.live.ids.size() || !std::equal(c.ids.begin(), c.ids.end(), image.live.ids.begin()) ||
             c.imgs != imgs_below(image.live.imgs, (int64_t) c.ids.size()) || !c.stage_parts.empty())
-            return false;
+            return nullptr;
     // The live end a reply past the last checkpoint: stored as of that checkpoint (the next turn goes on from there; a
     // reply sent back as it was is read again), whose state file then stands in for the live state.
     size_t deepest = 0;
@@ -1087,7 +1113,7 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     }
     const uint64_t bytes = image.bytes();
     std::lock_guard<std::mutex> lk(mu_);
-    if (queue_bytes_ + bytes > queue_cap) return false;
+    if (queue_bytes_ + bytes > queue_cap) return nullptr;
     auto job = std::make_shared<Job>();
     job->key = key_of(image.live.ids, image.live.imgs, image.cvec);
     job->name = conversation_name(identity_, job->key);
@@ -1132,7 +1158,7 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     queue_.push_back(job);
     queue_bytes_ += bytes;
     cv_.notify_all();
-    return true;
+    return job;
 }
 
 void ConversationStore::release_locked(const std::vector<std::string>& refs) {
@@ -1207,7 +1233,9 @@ void ConversationStore::writer() {
         uint64_t wrote = 0, whole = 0;
         const uint64_t free_bytes = basalt::platform::disk_free_bytes(dir_);
         const bool room = free_bytes >= job->bytes + kSpaceFloor;
-        const bool ok = room && write_job(*job, wrote, whole, why);
+        bool ok = false;
+        try { ok = room && write_job(*job, wrote, whole, why); }
+        catch (const std::bad_alloc&) { why = "conversation write ran out of buffer space"; }
         if (!room)
             basalt::log::warn("basalt serve", "conversation cache: %s has %.1f GiB free, not written (%.1f GiB "
                               "image, %.0f GiB kept free)", dir_.c_str(), (double) free_bytes / 1073741824.0,
@@ -1287,7 +1315,9 @@ bool ConversationStore::write_job(Job& job, uint64_t& wrote, uint64_t& whole, st
     }
     const int64_t nb = blocky ? n_ids / kBlockCells : 0;
     const int64_t tail_from = nb * kBlockCells;
-    Aligned stage(kStage);
+    std::unique_ptr<Aligned> temporary;
+    if (!write_buf_) temporary = std::make_unique<Aligned>(kStage);
+    Aligned& stage = write_buf_ ? *write_buf_ : *temporary;
     if (!stage.p) { error = "no write buffer"; return false; }
     // A part file (block or state): named by its prefix and bytes; written unless it is there already.
     auto part = [&](char kind, Srcs& srcs, Header h, uint64_t& key) -> bool {
