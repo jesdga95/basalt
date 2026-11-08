@@ -24,8 +24,17 @@ using LockProgress = std::function<void(uint64_t done)>;
 /// locked in chunks (a prefix stays locked when a later chunk is refused) and `progress` hears each one finish.
 LockResult lock_resident(void* p, uint64_t bytes, const LockProgress& progress = nullptr);
 
+/// Whether a visible memory controller prevents this process's anonymous pages from entering swap.
+bool swapping_disabled(const std::string& self_cgroup = "", const std::string& cgroup_root = "");
+
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);
+
+/// Private, ordinary-page backing whose inactive subranges can be discarded and recommitted.
+void* alloc_resident_pool(uint64_t bytes);
+LockResult commit_resident_pool(void* p, uint64_t bytes);
+/// Discards only an unused, page-aligned range; its next committed contents are zero.
+bool discard_resident_pool(void* p, uint64_t bytes);
 
 /// Host memory whose address is a multiple of `alignment`, which has to be a power of two: a range registered with
 /// the driver as a whole, or filled by reads that bypass the OS cache, needs its first byte on a boundary.
