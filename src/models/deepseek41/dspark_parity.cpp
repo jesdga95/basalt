@@ -96,6 +96,17 @@ int main() {
         for (int r = 0; r < kOut; ++r)
             o_ref[(size_t) p * kOut + r] = (float) row_dot(&down[((size_t) ids[p] * kOut + r) * mxfp4_row_bytes(kFF)], &h_got[(size_t) p * kFF], kFF);
     verdict("moe down", dstest::compare(dout.down(), o_ref, 1e-2), 1e-4);
+    {   // frozen: the hidden state and the outputs hash to the bits of the kernels that read one row per warp
+        constexpr uint64_t kFrozen = 0x5970ce9413f8b809ull;
+        uint64_t hh = 1469598103934665603ull;
+        for (const auto& v : {h_got, dout.down()}) {
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(v.data());
+            for (size_t i = 0; i < v.size() * sizeof(float); ++i) hh = (hh ^ b[i]) * 1099511628211ull;
+        }
+        const bool ok = hh == kFrozen;
+        std::printf("moe frozen             %016llx (want %016llx)  %s\n", (unsigned long long) hh, (unsigned long long) kFrozen, ok ? "ok" : "FAIL");
+        if (!ok) ++failures;
+    }
 
     // ---- combine
     std::vector<float> w(kT * kK), sh((size_t) kT * kOut);
