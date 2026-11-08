@@ -19,6 +19,7 @@
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/core/expert_source.hpp"
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/pinned.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
@@ -502,8 +503,14 @@ private:
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
     void ckd_finish();
-    bool disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec);
+    bool disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks,
+                  bool cvec, int64_t stale_tokens = kDiskStaleTokens);
     bool capture_admit(uint64_t need, uint64_t floor);
+    bool store_conversation(basalt::core::SavedConversation& image);
+    bool reclaim_host_pool(uint64_t need, bool spill_all = false);
+    void relieve_host_pressure();
+    Clock::time_point pool_pressure_checked{};
+    std::vector<basalt::core::SavedConversation> pool_spills;
     bool park_current(size_t held, int64_t kept);
     std::vector<ImgKey> imgs_below(const std::vector<ImgKey>& all, int64_t L);
     bool gpu_sync_ok();
@@ -528,6 +535,7 @@ private:
     int32_t loan_plan(int64_t live, int64_t& chunk);
     void relend();
     bool home_given_up(int64_t live, std::string& e);
+    bool home_slots_from(int64_t from, std::string& e);
     bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr);
     int64_t cache_floor_slots();
     bool move_routed_below(int64_t first, const char* why, std::string& e,
