@@ -114,6 +114,59 @@ async fn read_messages(
     };
     Ok(Json(json!({"object":"list","data":messages})))
 }
+#[derive(Deserialize)]
+struct ForkBranch {
+    from_message_id: Uuid,
+}
+#[derive(Serialize)]
+struct BranchView {
+    id: Uuid, thread_id: Uuid, head_message_id: Option<Uuid>, version: i64,
+}
+async fn create_branch(
+    State(app): State<Arc<App>>, headers: HeaderMap, Path(tid): Path<Uuid>,
+    Json(req): Json<ForkBranch>,
+) -> Result<(StatusCode, Json<BranchView>)> {
+    authorize(&headers,&app)?;
+    let mut tx=app.pool.begin().await.map_err(db_error)?;
+    let found:bool=sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM messages m JOIN threads t ON t.id=m.thread_id
+          WHERE m.id=$1 AND m.thread_id=$2 AND t.owner_id=$3 AND t.status='active')"
+    ).bind(req.from_message_id).bind(tid).bind(app.owner)
+      .fetch_one(&mut *tx).await.map_err(db_error)?;
+    if !found {return Err(error(StatusCode::NOT_FOUND,"fork source does not belong to this owner/thread"));}
+    let bid=Uuid::new_v4();
+    sqlx::query("INSERT INTO branches(id,thread_id,head_message_id,version) VALUES($1,$2,$3,0)")
+        .bind(bid).bind(tid).bind(req.from_message_id)
+        .execute(&mut *tx).await.map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok((StatusCode::CREATED,Json(BranchView{id:bid,thread_id:tid,
+        head_message_id:Some(req.from_message_id),version:0})))
+}
+async fn read_branch(
+    State(app): State<Arc<App>>, headers: HeaderMap, Path((tid,bid)): Path<(Uuid,Uuid)>,
+) -> Result<Json<BranchView>> {
+    authorize(&headers,&app)?;
+    let row=sqlx::query(
+      "SELECT b.head_message_id,b.version FROM branches b
+       JOIN threads t ON t.id=b.thread_id
+       WHERE b.thread_id=$1 AND b.id=$2 AND t.owner_id=$3 AND t.status='active'")
+       .bind(tid).bind(bid).bind(app.owner).fetch_optional(&app.pool).await.map_err(db_error)?
+       .ok_or_else(||error(StatusCode::NOT_FOUND,"branch not found"))?;
+    Ok(Json(BranchView{id:bid,thread_id:tid,
+       head_message_id:row.try_get("head_message_id").map_err(db_error)?,
+       version:row.try_get("version").map_err(db_error)?}))
+}
+async fn read_branch_messages(
+    State(app): State<Arc<App>>, headers: HeaderMap, Path((tid,bid)): Path<(Uuid,Uuid)>,
+) -> Result<Json<Value>> {
+    let Json(view)=read_branch(State(app.clone()),headers,Path((tid,bid))).await?;
+    let messages=match view.head_message_id {
+       Some(head)=>history(&app.pool,app.owner,tid,head,100_000).await.map_err(ledger_error)?
+           .into_iter().map(|(id,role,content)|json!({"id":id,"role":role,"content":content})).collect::<Vec<_>>(),
+       None=>Vec::new(),
+    };
+    Ok(Json(json!({"object":"list","data":messages,"branch_id":bid})))
+}
 async fn read_metrics(
     State(app): State<Arc<App>>, headers: HeaderMap, Path(tid): Path<Uuid>,
 ) -> Result<Json<Value>> {
@@ -315,6 +368,9 @@ async fn main() -> std::result::Result<(),Box<dyn std::error::Error>> {
        .route("/v1/threads/{id}",get(read_thread))
        .route("/v1/threads/{id}/messages",get(read_messages))
        .route("/v1/threads/{id}/metrics",get(read_metrics))
+       .route("/v1/threads/{id}/branches",post(create_branch))
+       .route("/v1/threads/{id}/branches/{branch}",get(read_branch))
+       .route("/v1/threads/{id}/branches/{branch}/messages",get(read_branch_messages))
        .route("/v1/threads/{id}/turns",post(run_turn))
        .with_state(app);
     let addr:SocketAddr="127.0.0.1:8095".parse()?;
