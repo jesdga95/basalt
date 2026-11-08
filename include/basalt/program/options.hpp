@@ -7,8 +7,12 @@
 #include <vector>
 
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/platform/memory.hpp"
 
 namespace basalt::program {
+
+/// The context of every model without --max-context.
+inline constexpr int64_t kDefaultContext = 8192;
 
 /// The flags every model takes.
 struct CommonOptions {
@@ -16,7 +20,7 @@ struct CommonOptions {
     std::string model;                ///< --model: the .basalt file every loader reads from
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
-    int64_t max_context = 4096;
+    int64_t max_context = kDefaultContext;
     bool greedy = true;
     uint64_t seed = 0;
     int top_k = 20;
@@ -43,6 +47,7 @@ struct CommonOptions {
     std::vector<double> peer_gbps;
     int peer_reserve_mib = 600;
     bool no_prompt_skip = false;  ///< --no-prompt-skip: every prompt row through every layer
+    std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
     /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.
@@ -63,14 +68,18 @@ struct CommonOptions {
     bool pool_workers_given = false;     // --pool-workers on the command line
     /// Stop when the model emits an end-of-turn token (the pack's own, or --eos-ids).
     bool stop_eos = false;
+    /// --ram-reserve-mib: the RAM left free for the rest of the system (platform::ram_reserve); 0 turns the guard off.
+    int64_t ram_reserve_mib = (int64_t) (basalt::platform::kDefaultRamReserveBytes >> 20);
     std::vector<int64_t> eos_ids;
     /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
     std::string gpu;
     bool gpu_plan = false;
     std::string arch;                  ///< the --model file's architecture
     std::string ppl_base, ppl_out;     ///< --ppl-base, --ppl-out
+    std::string model_name;            ///< the adapter's community-row name, for --gpu-plan
     std::string quality_flags;         ///< the flags the quality gate starts this model with, for --gpu-plan
     int quality_window = 1;            ///< the widest window the gate scores on this model (0: as the request asks)
+    int plan_spec = 0;                 ///< the verify window this start would run, for --gpu-plan (0: plain decode)
     /// Speculative decoding with a verify window of this many tokens (the last accepted token and spec-1 drafts);
     /// 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for the exactness test).
     int spec = 0;
@@ -88,15 +97,16 @@ struct CommonOptions {
     std::vector<int64_t> image_at;
     bool image_pad_given = false;
     int64_t image_pad_id = -1;             ///< --image-pad-id: the prompt token that stands for a picture's rows (--serve)
-    bool max_context_set = false;          ///< --max-context was given (a model with its own default picks one otherwise)
     /// Stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     bool generates = true;             ///< false: this run produces no tokens (a model flag says so)
-    /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
+    /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests (--vision and
+    /// --vision-external).
     bool vision = false;
-    /// --vision-mmproj PATH: the image encoder runs in this process on the model's GPU (implies --vision).  Its weights
-    /// stay in pinned host memory; each ENC command borrows expert-cache slots, encodes in them and refills them.
-    std::string vision_mmproj;
+    /// --vision (not --vision-external): the image encoder runs in this process on the model's GPU.  It reads the
+    /// model file's `vision/mmproj` section in place; its weights stay in pinned host memory; each ENC command borrows
+    /// expert-cache slots, encodes in them and refills them.
+    bool vision_in_engine = false;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole prompt
     /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history (~118 MB of host
     /// RAM); the KV cache itself is positional and stays where it is.

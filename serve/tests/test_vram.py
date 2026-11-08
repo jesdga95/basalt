@@ -76,7 +76,7 @@ class Route(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.engine = VramEngine(tok)
-        self.svc = Service(self.engine, tok, ChatTemplate(Path(__file__).resolve().parents[1] / "chat_template.jinja"))
+        self.svc = Service(self.engine, tok, ChatTemplate.from_file(Path(__file__).resolve().parents[1] / "chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 

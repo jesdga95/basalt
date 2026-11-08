@@ -31,7 +31,6 @@ from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
 
 
-BODY_MAX = 256 << 20                        # the most a JSON request body may hold (read into memory)
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
 TURN_POLL_S = 0.5                           # how soon a request waiting for its turn notices its client left
 
@@ -119,8 +118,8 @@ def make_handler(target: Service | Router):
                     raise BadBody(400, "malformed chunked request body")
 
         def _body(self) -> bytes:
-            """The request body, chunked or by Content-Length, at most BODY_MAX bytes."""
-            limit = BODY_MAX
+            """The request body, chunked or by Content-Length, at most svc.max_payload bytes."""
+            limit = svc.max_payload
             if self._chunked():
                 return self._read_chunked(limit)
             try:
@@ -830,6 +829,13 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = True
     request_queue_size = 256      # socketserver's backlog of 5 resets some clients of a burst of simultaneous connections
 
+    router: Router | None = None
+
+    def server_close(self):
+        super().server_close()
+        if self.router is not None:
+            self.router.stop_telemetry()           # serve() started the sampler, so closing the server ends it
+
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a hang-up needs no stack trace
             super().handle_error(request, client_address)
@@ -841,5 +847,6 @@ def serve(target: Service | Router, host="127.0.0.1", port=8080) -> ThreadingHTT
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
     router.start_telemetry()
     httpd = Server((host, port), make_handler(router))
+    httpd.router = router
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd

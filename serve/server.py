@@ -24,11 +24,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable a
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
                           engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
-                          sampling_items, start_items)
+                          sampling_items, shared_line, slot_share, start_items, with_spec)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.image_source import image_sources_of  # noqa: E402
-from serve.engine.flags import flag_index, flag_value  # noqa: E402
+from serve.engine.flags import flag_value  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
 from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, flag_refused, gpu_card_name,  # noqa: E402
@@ -140,6 +140,13 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
             if plan.get("warning"):
                 lines.append(f"[server] warning: {plan['warning']}")
             cfg["gpu"] = plan["devices"]
+            cfg["spec"] = plan.get("spec")
+            if getattr(a, "split_default", False) and plan.get("max_context"):
+                # the engine's default context, shared by the slots
+                a.shared_context = int(plan["max_context"])
+                part = ["--max-context", str(slot_share(a.shared_context, a.parallel))]
+                cfg["args"] += part
+                cli_engine += part
             cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
             cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
     for flag in a.skipped:
@@ -147,6 +154,7 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
     cfg["items"] = start_items(file_engine, cli_engine,
                                (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
                                grammar_entry(a.grammar, sys.argv[1:], used_argv), a.debug) if pack and not a.mock_engine else []
+    cfg["items"] = with_spec(cfg["items"], cfg.get("spec"))
     if a.alias and not pack:
         cfg["model_name"] = a.alias
     if not cfg.get("model_name") and a.model:
@@ -160,29 +168,29 @@ def drop_sidecar_vision(cfg: dict) -> None:
     if not cfg.get("vision") or cfg["vision"].get("mode") == "dynamic":
         return
     print(tagged("warning", "lazy loading drops a sidecar image encoder, vision off; --vision dynamic stays on"), flush=True)
-    while (at := flag_index(cfg["args"], "--vision-mmproj")) is not None:
-        del cfg["args"][at:at + 2]
     del cfg["vision"]
 
 
 def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     """The Service of one checked model, unloaded. With several models a numbered vision sidecar waits for its model's
     turn too."""
-    tokenizer = cfg.get("tokenizer") or a.tokenizer
+    from serve.engine import modelfile
+    files = cfg.get("tokenizer")
+    if files is None:                                   # the mock engine: a directory, or the byte tokenizer without one
+        tdir = Path(a.tokenizer)
+        files = {n: (tdir / n).read_bytes() for n in modelfile.TOKENIZER_SECTIONS if (tdir / n).exists()}
+    if not a.mock_engine and "vocab.json" not in files:
+        fail(f"tokenizer missing: {a.tokenizer}/vocab.json")
     tok = ByteTokenizer()
-    tpath = Path(tokenizer)
-    if not a.mock_engine and not (tpath / "vocab.json").exists():
-        fail(f"tokenizer missing: {tpath / 'vocab.json'}")
-    if (tpath / "vocab.json").exists():
+    if "vocab.json" in files:
         import tokenizer as ST
-        vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
+        vocab = json.loads(files["vocab.json"].decode("utf-8"))
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
             tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
-        types = json.loads((tpath / "token_type.json").read_text())
-        pre = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")).get("pre", "qwen35") \
-            if (tpath / "tokenizer.json").exists() else "qwen35"
+        merges = files["merges.txt"].decode("utf-8").split("\n")
+        types = json.loads(files["token_type.json"])
+        pre = json.loads(files["tokenizer.json"].decode("utf-8")).get("pre", "qwen35") if "tokenizer.json" in files else "qwen35"
         tok = ST.Tokenizer(tokens, merges, types, pre=pre)
     has_grammar = False
     if not a.mock_engine:
@@ -215,7 +223,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         gwords = grammar_words(known)
         cdir = flag_value(engine_args(cfg), "--conversation-cache-dir")
         cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
-        if cdir and cmib != "0":
+        if cdir and cmib != "0" and a.debug:
             print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
         # always built unloaded: the load itself is the lazy path's, started by the caller instead of by a request
         engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
@@ -226,8 +234,9 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
             "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, dict(a.sampling_launch)
     # the model's exported template, else the bundled one
     dialect = dialect_for(cfg.get("arch"))
-    tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, dialect.template(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    template = files["chat_template.jinja"].decode("utf-8") if "chat_template.jinja" in files else \
+        (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8")
+    svc = Service(engine, tok, dialect.template(template),
                   model_name=cfg.get("model_name", "basalt"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect)
@@ -291,8 +300,9 @@ def main() -> int:
         fail(f"port {a.port} is in use (--port N)")
     width = max(len(c.get("model_name") or "") for c in cfgs) + 1
     shared = [x for x in cfgs[0].get("items", []) if all(x in c.get("items", []) for c in cfgs[1:])] if multi else []
-    if shared:
-        print(tagged("engine", " ".join(shared)), flush=True)
+    line, shared_sleep = shared_line(shared, [m[0].idle_sleep for m in settings])
+    if line:
+        print(tagged("engine", line), flush=True)
     for c in cfgs:
         c["shared_items"], c["name_width"] = shared, width
     services = [build_model(m[0], cfg, logs, multi, known) for m, cfg in zip(settings, cfgs)]
@@ -310,6 +320,9 @@ def main() -> int:
         # an empty key would silently disable authentication
         print("[server] error: --api-key is empty (give a key, or leave it out)", file=sys.stderr)
         return 2
+    if a.max_payload_mib < 1:
+        fail(f"--max-payload-mib {a.max_payload_mib} must be at least 1")
+    svc.max_payload = a.max_payload_mib << 20
     try:
         svc.api_key = api_key_of(a.api_key)
     except ValueError as e:
@@ -349,7 +362,7 @@ def main() -> int:
 
     for s, m in zip(services, (x[0] for x in settings)):
         s.start_idle_unload()
-        s.start_idle_sleep()
+        s.start_idle_sleep(announce=not shared_sleep, name=s.model if multi else None)
         s.on_loaded = announcer(s, m)
 
     # the one place the addresses and the APIs are printed: the server listens before the model loads

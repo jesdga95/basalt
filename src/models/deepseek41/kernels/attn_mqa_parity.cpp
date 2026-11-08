@@ -1,17 +1,17 @@
 // Sparse MQA parity: sparse_mqa against a double-precision CPU reference at the real geometry (64 heads x 512, up to
-// 128 window rows and 512 selected rows, with the sink and the inverse RoPE), and the token's independence of the
-// call's width. Prints a microbench line.
+// 128 window rows and 512 selected rows, with the sink and the inverse RoPE), the packed cache rows bit for bit against
+// fp32 rows of their values, and the token's independence of the call's width. Prints microbench lines.
 #include "basalt/models/deepseek41/attn.hpp"
+#include "basalt/models/deepseek41/attn_index.hpp"
 #include "test_util.hpp"
 
 #include <cuda_fp16.h>
 
 using namespace basalt::models::deepseek41;
 using dstest::Dev;
+using dstest::Round;
 
 namespace {
-
-float half_round(float x) { return __half2float(__float2half(x)); }
 
 struct Case {
     int T, n_sel, win_cap, n_comp;
@@ -21,7 +21,7 @@ struct Case {
 };
 
 std::vector<double> reference(const Case& c, const std::vector<float>& q, const std::vector<float>& win,
-                              const std::vector<float>& comp, int64_t comp_stride, const std::vector<int32_t>& sel,
+                              const std::vector<float>& comp, const std::vector<int32_t>& sel,
                               const std::vector<int32_t>& limit, const std::vector<int32_t>& wstart,
                               const std::vector<float>& sinks, const std::vector<int32_t>& pos, const RopeTable& rope) {
     std::vector<double> out((size_t) c.T * 64 * 512);
@@ -30,7 +30,7 @@ std::vector<double> reference(const Case& c, const std::vector<float>& q, const 
         for (int j = 0; j < c.win_n[t]; ++j) keys.push_back(&win[(size_t) ((wstart[t] + j) % c.win_cap) * 512]);
         for (int i = 0; i < c.n_sel; ++i) {
             const int id = sel[(size_t) t * c.n_sel + i];
-            if (id >= 0 && id < limit[t]) keys.push_back(&comp[(size_t) id * comp_stride]);
+            if (id >= 0 && id < limit[t]) keys.push_back(&comp[(size_t) id * 512]);
         }
         for (int h = 0; h < 64; ++h) {
             const float* qh = &q[((size_t) t * 64 + h) * 512];
@@ -63,17 +63,31 @@ std::vector<double> reference(const Case& c, const std::vector<float>& q, const 
     return out;
 }
 
-template <class T>
-std::vector<T> convert(const std::vector<float>& v) {
-    std::vector<T> r(v.size());
-    for (size_t i = 0; i < v.size(); ++i) r[i] = (T) v[i];
-    return r;
-}
-template <>
-std::vector<__half> convert<__half>(const std::vector<float>& v) {
-    std::vector<__half> r(v.size());
-    for (size_t i = 0; i < v.size(); ++i) r[i] = __float2half(v[i]);
-    return r;
+// The device rows of `type` for values v[rows][512]; v becomes the values the rows hold.
+std::vector<uint8_t> device_rows(std::vector<float>& v, LatentType type) {
+    const size_t n = v.size() / 512;
+    std::vector<uint8_t> b;
+    if (type == LatentType::F32) {
+        b.resize(v.size() * 4);
+        std::memcpy(b.data(), v.data(), b.size());
+    } else if (type == LatentType::F16) {
+        b.resize(v.size() * 2);
+        for (size_t i = 0; i < v.size(); ++i) {
+            const __half h = __float2half(v[i]);
+            v[i] = __half2float(h);
+            std::memcpy(&b[2 * i], &h, 2);
+        }
+    } else {
+        const Round k = type == LatentType::Fp8 ? Round::Fp8Pow2 : Round::Fp4E4m3;
+        const int rb = type == LatentType::Fp8 ? kWinRowBytes : kCompRowBytes;
+        for (size_t r = 0; r < n; ++r) {
+            const auto row = dstest::ref_pack(&v[r * 512], 512, k, rb);
+            const auto x = dstest::ref_unpack(row.data(), 512, k);
+            std::copy(x.begin(), x.end(), v.begin() + (ptrdiff_t) (r * 512));
+            b.insert(b.end(), row.begin(), row.end());
+        }
+    }
+    return b;
 }
 
 struct Result {
@@ -82,13 +96,11 @@ struct Result {
 };
 
 Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
-    const int64_t comp_stride = 640;   // row = 512 latent + 128 indexer key, as the compressed cache stores it
     auto q = dstest::randn((size_t) c.T * 64 * 512, seed, 0.6f);
     auto win = dstest::randn((size_t) c.win_cap * 512, seed + 1, 1.0f);
-    auto comp = dstest::randn((size_t) c.n_comp * comp_stride, seed + 2, 1.0f);
+    auto comp = dstest::randn((size_t) c.n_comp * 512, seed + 2, 1.0f);
     auto sinks = dstest::randn(64, seed + 3, 1.0f);
-    if (c.wt == LatentType::F16) for (auto& x : win) x = half_round(x);
-    if (c.ct == LatentType::F16) for (auto& x : comp) x = half_round(x);
+    const auto wrows = device_rows(win, c.wt), crows = device_rows(comp, c.ct);
     std::mt19937 g(seed + 4);
     std::vector<int32_t> sel((size_t) c.T * std::max(c.n_sel, 1)), limit(c.T), wstart(c.T), pos(c.T), wn(c.win_n);
     for (int t = 0; t < c.T; ++t) {
@@ -102,22 +114,17 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
         }
     }
     const RopeTable rope = rope_table_compressed();
-    const auto ref = reference(c, q, win, comp, comp_stride, sel, limit, wstart, sinks, pos, rope);
+    const auto ref = reference(c, q, win, comp, sel, limit, wstart, sinks, pos, rope);
 
-    void* wdev = nullptr; void* cdev = nullptr;
-    size_t wb = win.size() * (c.wt == LatentType::F16 ? 2 : 4), cb = comp.size() * (c.ct == LatentType::F16 ? 2 : 4);
-    dstest::check(cudaMalloc(&wdev, wb), "m");
-    dstest::check(cudaMalloc(&cdev, cb), "m");
-    if (c.wt == LatentType::F16) { auto h = convert<__half>(win); cudaMemcpy(wdev, h.data(), wb, cudaMemcpyHostToDevice); }
-    else cudaMemcpy(wdev, win.data(), wb, cudaMemcpyHostToDevice);
-    if (c.ct == LatentType::F16) { auto h = convert<__half>(comp); cudaMemcpy(cdev, h.data(), cb, cudaMemcpyHostToDevice); }
-    else cudaMemcpy(cdev, comp.data(), cb, cudaMemcpyHostToDevice);
+    Dev<uint8_t> wdev(wrows), cdev(crows), wf((size_t) win.size() * 4), cf((size_t) comp.size() * 4);
+    dstest::check(cudaMemcpy(wf.p, win.data(), win.size() * 4, cudaMemcpyHostToDevice), "up");
+    dstest::check(cudaMemcpy(cf.p, comp.data(), comp.size() * 4, cudaMemcpyHostToDevice), "up");
     Dev<float> dq(q), dsink(sinks), dout((size_t) c.T * 64 * 512), dws(sparse_mqa_workspace_floats(c.T, c.n_sel));
     Dev<int32_t> dsel(sel), dlim(limit), dws0(wstart), dwn(wn), dpos(pos);
 
     MqaArgs a;
-    a.n_tokens = c.T; a.q = dq.p; a.win = wdev; a.win_type = c.wt; a.win_cap = c.win_cap;
-    a.win_start = dws0.p; a.win_n = dwn.p; a.comp = cdev; a.comp_type = c.ct; a.comp_stride = comp_stride;
+    a.n_tokens = c.T; a.q = dq.p; a.win = wdev.p; a.win_type = c.wt; a.win_cap = c.win_cap;
+    a.win_start = dws0.p; a.win_n = dwn.p; a.comp = cdev.p; a.comp_type = c.ct;
     a.sel = c.n_sel ? dsel.p : nullptr; a.n_sel = c.n_sel; a.comp_limit = dlim.p; a.sinks = dsink.p;
     a.pos = dpos.p; a.rope = rope; a.out = dout.p;
     cudaStream_t s;
@@ -126,6 +133,18 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
     dstest::check(cudaStreamSynchronize(s), "run");
     const auto got = dout.down();
     const auto e = dstest::compare(got, ref, 1e-2);
+    // the same values as fp32 rows give the same bits
+    bool same_f32 = true;
+    if (c.wt != LatentType::F32 || c.ct != LatentType::F32) {
+        MqaArgs b = a;
+        b.win = wf.p; b.win_type = LatentType::F32; b.comp = cf.p; b.comp_type = LatentType::F32;
+        Dev<float> o2((size_t) c.T * 64 * 512);
+        b.out = o2.p;
+        sparse_mqa(b, dws.p, s);
+        dstest::check(cudaStreamSynchronize(s), "f32 rows");
+        const auto v2 = o2.down();
+        same_f32 = std::memcmp(v2.data(), got.data(), got.size() * 4) == 0;
+    }
 
     // token t alone must give the same bits as inside the batch
     bool same = true;
@@ -142,16 +161,19 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
     }
     if (bench) {
         const double us = dstest::bench_us([&] { sparse_mqa(a, dws.p, nullptr); });
-        const double elem = (c.wt == LatentType::F16 ? 2.0 : 4.0);
-        const int keys = c.win_n[0] + c.n_sel;
-        dstest::bench_line(name, us, (double) keys * 512 * elem * c.T + (double) c.T * 64 * 512 * 8);
+        const auto row_bytes = [](LatentType t) {
+            return t == LatentType::F32 ? 2048.0 : t == LatentType::F16 ? 1024.0 : t == LatentType::Fp8 ? kWinRowBytes : kCompRowBytes;
+        };
+        dstest::bench_line(name, us, ((double) c.win_n[0] * row_bytes(c.wt) + (double) c.n_sel * row_bytes(c.ct)) * c.T +
+                                         (double) c.T * 64 * 512 * 8);
     }
     uint64_t hash = 1469598103934665603ull;   // FNV-1a of the output bits: equal across kernel versions = bitwise
     for (float f : got) { uint32_t u; std::memcpy(&u, &f, 4); hash = (hash ^ u) * 1099511628211ull; }
-    std::printf("%-26s T=%d sel=%3d win=%3d  max_abs %.2e  rms_rel %.2e  token-independent %s  bits %016llx\n", name,
-                c.T, c.n_sel, c.win_n[0], e.max_abs, e.rms_rel, same ? "yes" : "NO", (unsigned long long) hash);
-    cudaFree(wdev); cudaFree(cdev); cudaStreamDestroy(s);
-    return {e.max_abs, e.rms_rel, same};
+    std::printf("%-26s T=%d sel=%3d win=%3d  max_abs %.2e  rms_rel %.2e  token-independent %s  = fp32 rows %s  bits %016llx\n",
+                name, c.T, c.n_sel, c.win_n[0], e.max_abs, e.rms_rel, same ? "yes" : "NO", same_f32 ? "yes" : "NO",
+                (unsigned long long) hash);
+    cudaStreamDestroy(s);
+    return {e.max_abs, e.rms_rel, same && same_f32};
 }
 
 }  // namespace
@@ -162,7 +184,12 @@ int main() {
     std::vector<Row> rows = {
         {"full f32 T1", {1, 512, 130, 3000, LatentType::F32, LatentType::F32, true, {128}}},
         {"full f32 T4", {4, 512, 130, 3000, LatentType::F32, LatentType::F32, true, {128, 100, 128, 7}}},
-        {"full f16 T3", {3, 512, 135, 4096, LatentType::F16, LatentType::F16, true, {128, 128, 64}}},
+        {"full fp8/fp4 T3", {3, 512, 136, 4096, LatentType::Fp8, LatentType::Fp4, true, {128, 128, 64}}},
+        {"full fp8/fp4 T8", {8, 512, 136, 4096, LatentType::Fp8, LatentType::Fp4, true, {128, 128, 64, 1, 128, 100, 9, 128}}},
+        {"window only fp8 T2", {2, 0, 136, 10, LatentType::Fp8, LatentType::Fp4, false, {128, 33}}},
+        {"full fp16 T3", {3, 512, 136, 4096, LatentType::F16, LatentType::F16, true, {128, 128, 64}}},
+        {"window only fp16 T2", {2, 0, 136, 10, LatentType::F16, LatentType::F16, false, {128, 33}}},
+        {"drafter f16/f32 T4", {4, 4, 136, 300, LatentType::F16, LatentType::F32, false, {128, 128, 2, 77}}},
         {"short sel f32 T2", {2, 200, 128, 300, LatentType::F32, LatentType::F32, false, {128, 20}}},
         {"window only T4", {4, 0, 128, 10, LatentType::F32, LatentType::F32, false, {128, 5, 77, 1}}},
         {"nothing visible T2", {2, 64, 128, 100, LatentType::F32, LatentType::F32, false, {0, 3}}},
@@ -173,12 +200,14 @@ int main() {
         }
         const auto res = run(r.c, 100 + (uint32_t) (&r - &rows[0]), false, r.name);
         v.expect(res.rms_rel < 2e-6, r.name);
-        v.expect(res.token_independent, "token independence");
+        v.expect(res.token_independent, "token independence, packed rows equal fp32 rows");
     }
     run(rows[0].c, 7, true, "mqa T1 sel512 win128 f32");
     run(rows[1].c, 8, true, "mqa T4 sel512 win128 f32");
     Case h = rows[2].c; h.T = 1; h.win_n = {128};
-    run(h, 9, true, "mqa T1 sel512 win128 f16");
+    run(h, 9, true, "mqa T1 sel512 win128 fp8/fp4");
+    h.T = 4; h.win_n = {128, 128, 128, 128};
+    run(h, 10, true, "mqa T4 sel512 win128 fp8/fp4");
     // RoPE: forward then inverse restores the rows; forward against the CPU rotation
     {
         const RopeTable rope = rope_table_compressed();

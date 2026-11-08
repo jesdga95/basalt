@@ -126,6 +126,11 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(flag_value(qfile, "--max-context"), "262144")     # slot-full-context
         self.assertEqual(flag_value(dfile, "--max-context"), "1048576")
 
+    def test_the_ram_reserve(self):
+        p = conf({"engine": {"ram-reserve-mib": 4096}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
+        for _, _, words, _ in model_settings(build_parser(), ["--config", p]):
+            self.assertEqual(flag_value(words, "--ram-reserve-mib"), "4096")
+
     def test_version(self):
         ap = build_parser()
         entry = [{"model": "m.basalt"}]
@@ -163,8 +168,11 @@ class ConfigFile(unittest.TestCase):
 
     def test_model_and_alias_do_not_go_with_a_config(self):
         p = conf({"models": [{"model": "a.basalt"}]})
-        for extra in (["--model", "b.basalt"], ["--alias", "x"]):
-            with self.assertRaisesRegex(ValueError, "set in a model entry"):
+        for extra, text in ((["--model", "b.basalt"], "^--model is not supported when using a config file$"),
+                            (["--alias", "x"], "^--alias is not supported when using a config file$"),
+                            (["--model", "b.basalt", "--alias", "x"],
+                             "^--model and --alias are not supported when using a config file$")):
+            with self.assertRaisesRegex(ValueError, text):
                 model_settings(build_parser(), ["--config", p, *extra])
 
     def test_the_command_line_applies_to_every_model(self):
@@ -264,6 +272,11 @@ class Precedence(unittest.TestCase):
             self.assertEqual(file_words, words)
         _, _, _, cli_words = parse(["--route-tail-skip", "--resident-experts"])
         self.assertEqual(cli_words, ["--route-tail-skip", "--resident-experts"])
+
+    def test_no_peer_prefill_config_words(self):
+        for value, words in ((True, ["--no-peer-prefill"]), (False, [])):
+            _, _, file_words, _ = parse([], {"engine": {"no-peer-prefill": value}})
+            self.assertEqual(file_words, words)
 
     def test_route_prior_config_words(self):
         _, _, file_words, _ = parse([], {"engine": {"route-prior": 1.5}})
@@ -419,9 +432,16 @@ class SlotContext(unittest.TestCase):
         self.assertEqual(self.context(["--parallel", "2", "--max-context", "262144"]), 131072)
         self.assertEqual(self.context(["--max-context", "262144"]), 262144)                  # solo: whole
         self.assertEqual(self.context(["--parallel", "4"], {"engine": {"max-context": 8192}}), 2048)
-        self.assertEqual(self.context(["--parallel", "4"]), 1024)                            # the default, shared
         self.assertEqual(self.context(["--parallel", "2", "--max-context", "65536"],
                                       {"engine": {"max-context": 8192}}), 32768)
+
+    def test_the_default_is_shared_once_the_engine_names_it(self):
+        from serve.config import slot_share
+        a, _, file_words, cli_words = parse(["--parallel", "4"])
+        self.assertIsNone(flag_value(file_words + cli_words, "--max-context"))      # the engine's plan gives the total
+        self.assertTrue(a.split_default)
+        self.assertEqual(slot_share(8192, 4), 2048)
+        self.assertEqual(slot_share(512, 4), 256)                                     # never under the least slot
 
     def test_parallel_conflicts_with_batch_and_slots(self):
         for flag in ("--batch", "--slots"):

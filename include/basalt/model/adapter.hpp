@@ -76,9 +76,9 @@ struct LoadRequest {
     int diag_tier_ram = -1;           ///< diagnostic: fixed RAM-tier experts per layer (-1 = sized from free memory)
     int diag_tier_vram = -1;          ///< diagnostic: fixed VRAM-tier experts per layer (-1 = sized from free memory)
     std::vector<int> peer_devices;    ///< CUDA devices of the expert tier cards after the main one
-    int64_t max_context = 0;          ///< --max-context (used when max_context_set; else the model picks its own)
-    bool max_context_set = false;
+    int64_t max_context = 0;          ///< --max-context, or the default every model shares
     int sessions = 1;                 ///< sessions the model will be asked for (--batch)
+    bool vision = false;              ///< --vision: requests may carry images (each slot keeps buffers for one)
     std::string expert_profile;       ///< the routing order of the experts (empty: the file's own order)
     int expert_cache = 0;             ///< VRAM expert slots over all layers (0 or -1: from the free memory)
     uint64_t resident_budget = 0;     ///< bytes the RAM tier may take (0: from the free memory)
@@ -94,6 +94,7 @@ struct LoadRequest {
     std::string profile_dir;          ///< the engine's data/profiles, where a model finds the files its name keys
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
+    std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
 };
 
 struct DecodeRequest {
@@ -168,8 +169,9 @@ public:
     /// Conversations shorter than this are cheaper to read again than to keep on disk.
     virtual int64_t disk_min_tokens() const { return 8192; }
     /// The routed experts of decode so far: `lookups` the main card or the CPU served, `hits` the main card's share of
-    /// those, `offloaded` what a bus copy or another card served.
-    struct ExpertCounts { int64_t hits = 0, lookups = 0, offloaded = 0; };
+    /// those, `offloaded` what a bus copy or another card served, `files` those of `lookups`
+    /// read from the file.
+    struct ExpertCounts { int64_t hits = 0, lookups = 0, offloaded = 0, files = 0; };
     virtual ExpertCounts expert_counts() const { return {}; }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
@@ -224,8 +226,12 @@ public:
         (void) o; (void) cards;
         return std::nullopt;
     }
+    /// The verify window a start with these flags runs (0: plain decode), once finish_flags() has run.
+    virtual int planned_spec(const program::CommonOptions& o) const;
     /// The flags the quality gate starts this model with, space separated.
     virtual const char* quality_flags() const { return ""; }
+    /// The model's name as a community benchmark row records it; empty for a model that has none.
+    virtual const char* model_name() const { return ""; }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
     virtual int quality_window() const { return 1; }
     /// The cards that may hold experts beside the main one.

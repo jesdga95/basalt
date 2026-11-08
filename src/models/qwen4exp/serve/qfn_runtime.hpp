@@ -4,6 +4,7 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "../../../program/serve/state.hpp"
 #include "../load/engine_local.hpp"
+#include "basalt/program/expert_spill.hpp"
 #include "basalt/program/grammar/guard.hpp"
 #include "basalt/platform/system.hpp"
 
@@ -80,27 +81,20 @@ struct Context {
     const bool& graph_hits;
     int64_t& auto_lend_pct;
     int64_t& auto_ceiling;
-    uint64_t& prompt_file_bytes;
     basalt::kernels::cpu::ExpertPool& pool;
-    uint64_t& ram_floor_bytes;
     std::vector<std::unique_ptr<engine_local::PromptStage>>& pstages;
     std::function<int64_t()> read_cap;
     const int64_t& kSplitRefCells;
     int64_t& split_hand_rows;
+    int64_t& split_chunk_cap;
     int64_t& split_peer_rows;
     std::function<engine_local::SplitPricing(int64_t, int64_t, int64_t, int)> split_price;
     std::function<std::string(int, const std::vector<int>&)> split_layers_text;
     std::function<std::string(const PsPrice&)> split_stages_text;
     int& split_stages;
-    uint64_t& tier_file_bytes;
+    basalt::program::ExpertSpill& tier_spill;
     std::function<void()> report_expert_tiers;
 };
-
-// Host RAM a server takes while it serves, beyond what it holds once ready: the conversation checkpoints (the solo
-// session's and those a batch slot keeps, each the whole running state), the parked conversations, one image's
-// host buffers at the largest canvas and a running request's own buffers.  The RAM copy of the experts leaves this
-// free beside the margin, so serving stays above the RAM guard.
-uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry& g);
 
 // Serves until QUIT or stdin closes; returns the process exit code.
 int run(Context& context);

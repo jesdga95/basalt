@@ -21,12 +21,12 @@ public:
     virtual bool attention(int layer, int64_t pos, int32_t token, const float* x, float* out, void* stream,
                            std::string& err) = 0;
     /// Routed experts: `ids` [k] and `weights` [k] (device, weights already scaled) over the normed input `x`;
-    /// the weighted sum goes to `out` [n_embd] (device). Follows routed_stage of the same layer on the stream.
+    /// the weighted sum goes to `out` [n_embd] (device). Stages its row and ids itself.
     virtual bool routed_experts(int layer, const float* x, const int32_t* ids, const float* weights, float* out,
                                 void* stream, std::string& err) = 0;
     /// The shared expert over `x`; the result goes to `out` [n_embd] (device).
     virtual bool shared_expert(int layer, const float* x, float* out, void* stream, std::string& err) = 0;
-    /// routed_experts after routed_stage of the same layer ran on the stream (the default stages nothing).
+    /// routed_experts after stage_rows and stage_ids of the same layer ran on the stream (the default runs routed_experts).
     virtual bool routed_experts_staged(int layer, const float* x, const int32_t* ids, const float* weights, float* out,
                                        void* stream, std::string& err) {
         return routed_experts(layer, x, ids, weights, out, stream, err);
@@ -83,21 +83,24 @@ public:
     }
     /// The rows of the last window before `next_pos` join the carried state; the rest leave no trace.
     virtual void commit_window(int64_t next_pos, void* stream) { (void) next_pos; (void) stream; }
+    /// What waits for an idle bus goes now: a few pieces once a token's or window's last launches went out (`all` false),
+    /// the rest once the drafter's inputs went out (`all` true); the next token issues what is left.
+    virtual void end_window(bool all) { (void) all; }
     /// A verify window: attention of the `n_tokens` staged rows; `x`, `out`: [n_tokens][n_embd].
     virtual bool attention_window(int layer, int n_tokens, const float* x, float* out, void* stream, std::string& err) = 0;
-    /// routed_stage for the rows of a window: ids [n_tokens][k], x [n_tokens][n_embd].
-    virtual void routed_stage_window(int n_tokens, const float* x, const int32_t* ids, void* stream) = 0;
+    /// Enqueues what the routed experts read of `n_tokens` normed rows x [n_tokens][n_embd]: their copy in pinned host
+    /// memory and the cards' input. stage_ids of the same rows runs after it on the stream or behind it through an event.
+    virtual void stage_rows(int n_tokens, const float* x, void* stream) = 0;
+    /// Enqueues the copy of the router's expert ids [n_tokens][k] to pinned host memory: once they land, the host reads
+    /// the rows too.
+    virtual void stage_ids(int n_tokens, const int32_t* ids, void* stream) = 0;
     /// The shared expert over the rows of a window.
     virtual bool shared_expert_window(int layer, int n_tokens, const float* x, float* out, void* stream, std::string& err) = 0;
     /// routed_and_shared_staged for the rows of a window: each distinct expert runs once over the rows that routed to it.
     virtual bool routed_shared_window(int layer, int n_tokens, const float* weights, float* out, float* shared_out, void* stream,
                                       std::string& err) = 0;
-    /// True when attention, routed_stage and shared_expert only enqueue work on the stream (graph capturable).
+    /// True when attention, the staging and shared_expert only enqueue work on the stream (graph capturable).
     virtual bool graph_capable() const { return false; }
-    /// Enqueues the copy of the router's expert ids and the activation to pinned host memory, for routed_experts.
-    virtual void routed_stage(int layer, const float* x, const int32_t* ids, void* stream) {
-        (void) layer; (void) x; (void) ids; (void) stream;
-    }
 };
 
 /// Ops built from the kernel groups' entry points (ops_kernels.cpp).

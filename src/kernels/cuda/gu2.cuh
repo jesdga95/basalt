@@ -1,5 +1,5 @@
 // src/kernels/cuda/gu2.cuh - DEC_GU2=1: the grouped gate/up rows of the grid formats (IQ2_XXS, IQ2_XS,
-// IQ2_S, IQ3_XXS, IQ3_S) and Q2_0 with n_embd 2560, two rows a warp.  Included by iq_kernels.cu (its Split / Fmt / grid
+// IQ2_S, IQ3_XXS, IQ3_S), Q2_0 and IQ4_XS with n_embd 2560, two rows a warp.  Included by iq_kernels.cu (its Split / Fmt / grid
 // helpers).
 //
 // Bitwise native_gu_multi_kernel's: each lane sums the calls k = lane, lane + 32, lane + 64 of a row in that order
@@ -220,6 +220,24 @@ template<> struct Fmt2<21> {   // IQ3_S: 110-byte blocks (d, 64 grid bytes, qh[8
     }
 };
 
+template<> struct Fmt2<23> {   // IQ4_XS: 136-byte blocks of 256 values (d, scales_h, scales_l[4], qs[128]).  No grid:
+                               // the 16-entry codebook is Split<23>'s table lookup, the sub-block scale its integer sum
+    static constexpr int kGridWords = 4;   // no grid
+    using W = Split<23>::W;
+    __device__ static W load(const uint8_t* row, int k, const uint32_t*) { return Split<23>::load(row, k >> 3, 4 * (k & 7)); }
+    __device__ static void apply(const W& r, const block_q8_1* __restrict__ x, float& d, float& f) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sumi = ggml_cuda_dp4a(r.v[j].x, get_int_b4(x->qs, j), sumi);
+            sumi = ggml_cuda_dp4a(r.v[j].y, get_int_b4(x->qs, j + 4), sumi);
+        }
+        sumi *= r.ls - 32;
+        d = r.dw * __low2float(x->ds);
+        f = (float) sumi;
+    }
+};
+
 template<> struct Fmt2<42> {   // Q2_0: 18-byte blocks of 64 values, two calls a block; Split<42>'s words
     static constexpr int kGridWords = 4;   // no grid
     using W = Split<42>::W;
@@ -238,7 +256,7 @@ template<> struct Fmt2<42> {   // Q2_0: 18-byte blocks of 64 values, two calls a
 
 template<int TY>
 __device__ __forceinline__ const uint32_t* stage_grid(uint32_t* s, int tid) {
-    if constexpr (TY == 42) {
+    if constexpr (TY == 42 || TY == 23) {   // Q2_0 and IQ4_XS: no grid to stage
         return s;
     } else if constexpr (TY == 21) {
         for (int i = tid; i < 512; i += 256) s[i] = iq3s_grid[i];
@@ -247,6 +265,18 @@ __device__ __forceinline__ const uint32_t* stage_grid(uint32_t* s, int tid) {
     } else {
         return stage_iq_grid<TY, true>(s, tid, 256);
     }
+}
+
+// a format's grid as stage_grid lays it out, read from the device table instead: a mixed layer's up rows, whose grid
+// the block does not stage (the same words, so the same bits)
+template<int TY>
+__device__ __forceinline__ const uint32_t* table_grid() {
+    if constexpr (TY == 16) return (const uint32_t*) iq2xxs_grid;
+    else if constexpr (TY == 17) return (const uint32_t*) iq2xs_grid;
+    else if constexpr (TY == 22) return (const uint32_t*) iq2s_grid;
+    else if constexpr (TY == 18) return (const uint32_t*) iq3xxs_grid;
+    else if constexpr (TY == 21) return (const uint32_t*) iq3s_grid;
+    else return nullptr;
 }
 
 // rows r0, r0 + 1 (gate or up rows r of `dst`; row A at rowA, row B row_bytes after it) for the n <= NC entries
@@ -306,9 +336,9 @@ __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e
                                      float* __restrict__ gate, float* __restrict__ up, const uint32_t* grid, int lane) {
     const bool is_up = row >= L.n_ff;
     const int r = is_up ? row - (int) L.n_ff : row;
-    const uint8_t* wr = blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
+    const int n_ff = (int) L.n_ff, rb = (int) (is_up ? L.up_row : L.gu_row);
+    const uint8_t* wr = blob + (is_up ? L.up_off : 0) + (size_t) r * rb;
     float* dst = is_up ? up : gate;
-    const int n_ff = (int) L.n_ff, rb = (int) L.gu_row;
     for (int e = e0; e < e1;) {
         const int n = e1 - e;
         if (n == 1) {
@@ -328,6 +358,20 @@ __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e
     }
 }
 
+// pair() for a layer with gate rows of TG and up rows of TU: the up rows read TU's grid from the device table
+template<int TG, int TU>
+__device__ __forceinline__ void pair_gu(const uint8_t* blob, int row, int e0, int e1, const int32_t* __restrict__ ent_tok,
+                                        const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
+                                        float* __restrict__ gate, float* __restrict__ up, const uint32_t* grid, int lane) {
+    if constexpr (TG != TU) {
+        if (row >= L.n_ff) {
+            pair<TU>(blob, row, e0, e1, ent_tok, xq, L, gate, up, table_grid<TU>(), lane);
+            return;
+        }
+    }
+    pair<TG>(blob, row, e0, e1, ent_tok, xq, L, gate, up, grid, lane);
+}
+
 }  // namespace gu2
 
 template<int TG> inline constexpr bool kGu2 = TG == 16 || TG == 17 || TG == 18 || TG == 21 || TG == 22;
@@ -335,8 +379,8 @@ template<int TG> inline constexpr bool kGu2 = TG == 16 || TG == 17 || TG == 18 |
 template<int TG> inline constexpr bool kGu2Q2 = kGu2<TG> || TG == 42;
 constexpr int GU2_ROWS = 16;   // rows per block: two a warp
 
-// native_gu_multi_kernel's rows, GU2_ROWS a block; the same group stride
-template<int TG>
+// native_gu_multi_kernel's rows, GU2_ROWS a block; the same group stride.  TU: the up rows' type.
+template<int TG, int TU = TG>
 __global__ void __launch_bounds__(256) native_gu2_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                          const int32_t* __restrict__ grp_start,
                                                          const int32_t* __restrict__ n_groups,
@@ -352,14 +396,18 @@ __global__ void __launch_bounds__(256) native_gu2_kernel(const unsigned long lon
     const int row = blockIdx.x * GU2_ROWS + 2 * warp;          // rows row, row + 1: both gate or both up
     if (row >= 2 * L.n_ff) return;
     for (int g = blockIdx.y; g < ng; g += gridDim.y)
-        gu2::pair<TG>((const uint8_t*) grp_ptr[g], row, grp_start[g], grp_start[g + 1], ent_tok, xq, L, gate, up, s_grid,
-                      lane);
+        gu2::pair_gu<TG, TU>((const uint8_t*) grp_ptr[g], row, grp_start[g], grp_start[g + 1], ent_tok, xq, L, gate, up,
+                             s_grid, lane);
 }
 
 // whether native_gu2_kernel takes L's gate/up rows: 2560 values a row (80 calls), an even n_ff, 4-byte aligned rows
 __host__ __device__ inline bool gu2_usable(const NativeExpertLayout& L) {
-    return L.n_embd == 2560 && L.n_ff % 2 == 0 && L.gu_row % 4 == 0 && L.up_off % 4 == 0;
+    return L.n_embd == 2560 && L.n_ff % 2 == 0 && L.gu_row % 4 == 0 && L.up_row % 4 == 0 && L.up_off % 4 == 0;
 }
+
+// The layers whose gate and up rows differ in type, as (gate, up) pairs: the kernels are built for these mixes only.
+// UD-IQ1_S: IQ2_S gate with IQ2_XXS up.
+#define GU_MIX(X) X(22, 16)
 
 // ---------------------------------------------------------------- DEC_GU2=2: a programmatic chain
 // The SwiGLU pass and the down kernel launched as programmatic dependents (gate/up -> SwiGLU -> down), each grid

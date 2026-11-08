@@ -19,7 +19,7 @@ bool Prefill::Run::Chunk::Experts::Group::compute_fp16(size_t j, const uint8_t* 
         // NVFP4: the tail's FP32 scales {s_gate, s_up, s_down} go into the fp16 weights
         const float* tail = f.tail ? (const float*) (blob_dev + f.bytes - f.tail) : nullptr;
         basalt::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                           m.dq_gu[q], m.cs, tail);
+                                           m.dq_gu[q], m.cs, tail, f.up_type);
         basalt::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs,
                                         tail ? tail + 2 : nullptr);
     } else {

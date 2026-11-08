@@ -95,10 +95,11 @@ struct Prefill::Run::Chunk::Experts {
     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+    const int mmq_ut = lay.native ? lay.fmt[(size_t) l].up_type : 42;   // the up rows' type
     // NVFP4 experts: FP4 block-scaled tensor cores, read in place from the blobs
     const bool fp4_l = use_mmq && lay.native && mmq_gt == GGML_TYPE_NVFP4 && mmq_dt == GGML_TYPE_NVFP4 &&
                        lay.fmt[(size_t) l].tail != 0 && T >= FP4_MIN_TOKENS;
-    const bool fused_nat = use_mmq && stream_all && lay.native && fused::native_supported(mmq_gt, mmq_dt);
+    const bool fused_nat = use_mmq && stream_all && lay.native && fused::native_supported(mmq_gt, mmq_dt, mmq_ut);
     const bool fused_l = (use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat;
     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
     // CPU share: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm) run on a thread that
@@ -190,6 +191,7 @@ struct Prefill::Run::Chunk::Experts::Group {
     decltype(Experts::use_mmq)& use_mmq = experts.use_mmq;
     decltype(Experts::mmq_gt)& mmq_gt = experts.mmq_gt;
     decltype(Experts::mmq_dt)& mmq_dt = experts.mmq_dt;
+    decltype(Experts::mmq_ut)& mmq_ut = experts.mmq_ut;
     decltype(Experts::fp4_l)& fp4_l = experts.fp4_l;
     decltype(Experts::fused_nat)& fused_nat = experts.fused_nat;
     decltype(Experts::fused_l)& fused_l = experts.fused_l;
@@ -211,7 +213,9 @@ struct Prefill::Run::Chunk::Experts::Group {
     std::vector<char> on_peer;
     int64_t rows_local = T * K, rows_peer = 0;
     std::vector<int32_t> order, order_peer;
-    const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
+    // a gate/up slot (gate rows, then up rows) and the gate's bytes in it; mmq_gub - mmq_gb or less are the up's
+    const size_t mmq_gub = use_mmq ? mmq::gu_slot_bytes(mmq_gt, mmq_ut, 640, N) : 0;
+    const size_t mmq_gb = use_mmq ? mmq::matrix_bytes(mmq_gt, 640, N) : 0, mmq_ub = use_mmq ? mmq::matrix_bytes(mmq_ut, 640, N) : 0;
     const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
     int stage_next = 0;
     std::vector<int> stage_of, job_of;

@@ -12,7 +12,7 @@ namespace basalt::prefill::mmq {
 
 /// This build has the MMQ path (the ggml sources were available to the build).
 bool built();
-/// MMQ covers this ggml type (the i-quants, Q2_0, NVFP4 and the K-quants Q4_K, Q5_K, Q6_K and Q5_1 the experts use, and Q8_0).
+/// MMQ covers this ggml type (the i-quants, Q2_0, NVFP4, the K-quants Q2_K to Q6_K, and Q5_0 / Q5_1 / Q8_0).
 bool supported(int ggml_type);
 /// `supported`, and on every visible GPU llama.cpp's MMQ has a tile for this type and a weight matrix of
 /// `w_rows` rows that fits the card's shared memory - the same test its tile choice makes, which aborts the process
@@ -20,13 +20,23 @@ bool supported(int ggml_type);
 bool fits(int ggml_type, int64_t w_rows);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
+/// A group buffer's slot for one expert's gate and up rows ([n_ff, n_embd] of `gate_type`, then of `up_type`):
+/// matrix_bytes of the [2 n_ff, n_embd] matrix when the types agree; otherwise rounded up to whole blocks of both
+/// types and 16 bytes, so the gate product and the up product each step from expert to expert in whole blocks.
+size_t gu_slot_bytes(int gate_type, int up_type, int64_t n_ff, int64_t n_embd);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
 size_t q8_bytes(int64_t rows, int64_t cols);
+/// The quantized blocks of one row of `cols` values; a buffer of R rows holds block k of row r at block k R + r.
+int64_t q8_blocks(int64_t cols);
 
 /// q8_1 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
 /// ids is null); `x` has `ld` floats per row.
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream);
+
+/// Rows ids[0..rows) of `xq` (`src_rows` rows quantized for MMQ, `cols` values each) into `dst` as `rows` rows: the same
+/// bytes `quantize` writes when given those ids.
+void gather_q8(const void* xq, int64_t src_rows, const int32_t* ids, void* dst, int64_t rows, int64_t cols, void* stream);
 
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
@@ -48,6 +58,11 @@ struct Product {
     int64_t opt_rows = 0;
 };
 
+/// Readies on the current device every tile `Context::run` may launch for weights of `ggml_type` with `w_rows` rows (its
+/// kernels loaded, their shared memory limit raised): done at a tile's first launch, that waits for the copies queued on
+/// the card.
+void load(int ggml_type, int64_t w_rows);
+
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
 class Context {
 public:
@@ -63,9 +78,11 @@ private:
 
 /// A GGUF-native expert (gate at `gate`, up at `up`, down at `down`, each its GGUF rows) into a group buffer's
 /// slot: gate rows then up rows at `gu_dst`, down at `d_dst`.  `tail` (NVFP4: the blob's 16-byte FP32 scale tail
-/// {s_gate, s_up, s_down, 0}) is copied to `tail_dst` when both are given.
-void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
-                   void* gu_dst, void* d_dst, void* stream, const void* tail = nullptr, void* tail_dst = nullptr);
+/// {s_gate, s_up, s_down, 0}) is copied to `tail_dst` when both are given.  `gate_bytes` of gate rows; `up_bytes` of
+/// up rows (0: as many as the gate's).
+void gather_native(const void* gate, const void* up, size_t gate_bytes, const void* down, size_t d_bytes,
+                   void* gu_dst, void* d_dst, void* stream, const void* tail = nullptr, void* tail_dst = nullptr,
+                   size_t up_bytes = 0);
 /// gather_native for an MMQ group's experts [first, n) in ONE launch: expert q's blob (`blob[q]`; gate at +0, up at
 /// +up_off, down at +down_off) to gu_dst + q * gu_stride and d_dst + q * d_stride - the same bytes as one gather_native
 /// each.  Every pointer, offset and size 16-byte aligned (false otherwise: nothing launched, gather one at a time).
@@ -75,9 +92,9 @@ struct GatherGroup {
     const uint8_t* blob[kGatherGroupMax] = {};
     int first = 0, n = 0;
 };
-bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
+bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gate_bytes, size_t down_off, size_t d_bytes,
                          void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream,
-                         size_t tail_off = 0, void* tail_dst = nullptr);
+                         size_t tail_off = 0, void* tail_dst = nullptr, size_t up_bytes = 0);
 /// A the engine-pack Q2_0 expert blob (codes and fp16 scales in separate planes, gate/up rows interleaved) into GGUF
 /// Q2_0 blocks: gate/up [1280, 2560] at `gu_dst` (rows stay interleaved), down [2560, 640] at `d_dst`.  Same values.
 void gather_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);

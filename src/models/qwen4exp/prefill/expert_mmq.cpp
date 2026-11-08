@@ -53,13 +53,13 @@ void Prefill::Run::Chunk::Experts::Group::flush() {
         cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
     }
     float* sc = f.tail ? grp_scales(m.grp_d) : nullptr;
-    if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
-                                  m.grp_d, mmq_db, m.cs, sc ? f.bytes - f.tail : 0, sc)) {
+    if (!mmq::gather_native_group(gg, f.up_off, mmq_gb, f.down_off, mmq_db, m.grp_gu, mmq_gub,
+                                  m.grp_d, mmq_db, m.cs, sc ? f.bytes - f.tail : 0, sc, mmq_ub)) {
         for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
             const uint8_t* b = gg.blob[i];
-            mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
+            mmq::gather_native(b, b + f.up_off, mmq_gb, b + f.down_off, mmq_db,
                                m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs,
-                               sc ? b + f.bytes - f.tail : nullptr, sc ? sc + 4 * i : nullptr);
+                               sc ? b + f.bytes - f.tail : nullptr, sc ? sc + 4 * i : nullptr, mmq_ub);
         }
     }
     if (gg_nslots > 0) {
@@ -83,10 +83,10 @@ bool Prefill::Run::Chunk::Experts::Group::compute_mmq(size_t j, const uint8_t* b
         gg = mmq::GatherGroup{};
     } else if (lay.native) {
         const auto& f = lay.fmt[(size_t) l];
-        mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
+        mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gb, blob_dev + f.down_off,
                            mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs,
                            f.tail ? blob_dev + f.bytes - f.tail : nullptr,
-                           grp_scales(m.grp_d) + 4 * q);
+                           grp_scales(m.grp_d) + 4 * q, mmq_ub);
     } else {
         mmq::gather_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
     }
@@ -105,6 +105,11 @@ bool Prefill::Run::Chunk::Experts::Group::compute_mmq(size_t j, const uint8_t* b
     gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
     gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
     gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+    if (mmq_ut != mmq_gt) {   // gate rows and up rows of two types: a product each, into the two halves of GU
+        gu.w_rows = 640;
+        m.mmq_ctx->run(gu, m.cs);
+        gu.w = m.grp_gu + mmq_gb; gu.type = mmq_ut; gu.dst = m.GU + 640;
+    }
     m.mmq_ctx->run(gu, m.cs);
     const bool scaled = lay.native && lay.fmt[(size_t) l].tail != 0;
     mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs,

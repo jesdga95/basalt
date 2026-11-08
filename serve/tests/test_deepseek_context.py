@@ -74,9 +74,7 @@ class EngineSide(unittest.TestCase):
         cls.src = (ROOT / "src/program/generate/adapter.cpp").read_text() + (ROOT / "src/program/cli/arguments.cpp").read_text()
 
     def test_the_flag_is_tracked_and_handed_to_the_model(self):
-        self.assertIn("o.max_context_set = true;", self.src)
         self.assertIn("lreq.max_context = o.max_context;", self.src)
-        self.assertIn("lreq.max_context_set = true;", self.src)
 
     def test_the_ready_line_reports_the_models_resolved_context(self):
         self.assertIn("if (loaded->context() != 0) o.max_context = loaded->context();", self.src)
@@ -109,7 +107,7 @@ class LongRequests(unittest.TestCase):
     def setUpClass(cls):
         tok = ByteTokenizer()
         cls.engine = MockEngine(tok, "ok", max_context=NATIVE)
-        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.svc = Service(cls.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         cls.httpd = serve(cls.svc, port=0)
         cls.port = cls.httpd.server_address[1]
 

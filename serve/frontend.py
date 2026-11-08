@@ -27,7 +27,11 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
 class ChatTemplate:
     """The model's chat template, rendered with the Jinja settings of transformers' apply_chat_template."""
 
-    def __init__(self, path: str | Path):
+    @classmethod
+    def from_file(cls, path: str | Path) -> "ChatTemplate":
+        return cls(Path(path).read_text(encoding="utf-8"))
+
+    def __init__(self, source: str):
         def raise_exception(message):
             raise TemplateRequestError(message)
 
@@ -37,7 +41,7 @@ class ChatTemplate:
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
-        self.source = Path(path).read_text(encoding="utf-8")
+        self.source = source
         self.template = env.from_string(self.source)
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
@@ -160,17 +164,23 @@ def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
     if isinstance(v, str):
         return _mark(v, tags)
     if isinstance(v, dict):
-        return {k: _mark_deep(x, tags) for k, x in v.items()}
+        return {k: x if _is_source(v, k) else _mark_deep(x, tags) for k, x in v.items()}
     if isinstance(v, list):
         return [_mark_deep(x, tags) for x in v]
     return v
+
+
+def _is_source(item: dict, key: str) -> bool:
+    """An image item's source (a path, URL or base64 data URL) never reaches the prompt as text, so it is neither
+    scanned nor marked."""
+    return key == "source" and item.get("type") == "image"
 
 
 def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     if isinstance(v, str):
         return any(tag in v for tag in tags)
     if isinstance(v, dict):
-        return any(_has_tag(x, tags) for x in v.values())
+        return any(_has_tag(x, tags) for k, x in v.items() if not _is_source(v, k))
     if isinstance(v, list):
         return any(_has_tag(x, tags) for x in v)
     return False

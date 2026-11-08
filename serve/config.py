@@ -17,7 +17,6 @@ from serve.util.console import tagged
 
 
 MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
-ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
 CONFIG_VERSION = 2                          # the config file's "version"; a file without one is this format's first
 PARALLEL_MAX = 8                            # the engine's batch slots
 CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the config file
@@ -224,8 +223,10 @@ def model_settings(ap: argparse.ArgumentParser, cli: list[str], refused=None) ->
     a_cli = ap.parse_known_args(cli)[0]
     if not a_cli.config:
         return [parse_settings(ap, cli)]
-    if a_cli.model or a_cli.alias:
-        raise ValueError("--model and --alias are set in a model entry")
+    given = [f for f, v in (("--model", a_cli.model), ("--alias", a_cli.alias)) if v]
+    if given:
+        verb = "is" if len(given) == 1 else "are"
+        raise ValueError(f"{' and '.join(given)} {verb} not supported when using a config file")
     cfg = load_config_file(a_cli.config, ap)
     out = []
     for entry in cfg.models:
@@ -264,18 +265,18 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str], server_argv=(), 
         (cli_words if a_cli.parallel else file_words).extend(["--batch", str(a.parallel)])
         if not a.slot_full_context:
             # --max-context is shared by the slots, as in llama.cpp: each holds an equal part (the solo path, used while
-            # a request is alone, has the same length, so a request never outgrows its slot)
+            # a request is alone, has the same length, so a request never outgrows its slot). Without the flag the
+            # engine's default is shared, once the server has asked the engine for it (split_default).
             src = cli_words if "--max-context" in cli_words or "--max-context" not in file_words else file_words
             at = flag_index(src, "--max-context")
             if at is not None and at + 1 >= len(src):
                 raise ValueError("--max-context needs a value")
-            ctx = int(src[at + 1]) if at is not None else ENGINE_DEFAULT_CONTEXT
-            part = str(max(MIN_SLOT_CONTEXT, ctx // a.parallel))
             if at is None:
-                src += ["--max-context", part]
+                a.split_default = True
             else:
-                src[at + 1] = part
-            a.shared_context = ctx                         # the total, for the startup line
+                ctx = int(src[at + 1])
+                src[at + 1] = str(slot_share(ctx, a.parallel))
+                a.shared_context = ctx                     # the total, for the startup line
     return a, file_argv + cli, file_words, cli_words
 
 
@@ -332,6 +333,24 @@ def start_items(file_words: list[str], cli_words: list[str], shared: tuple[int, 
     if grammar is not None:
         items.append(f"grammar={'on' if grammar[0] else 'off'}")
     return items
+
+
+def slot_share(total: int, parallel: int) -> int:
+    """Each of `parallel` slots' part of a shared --max-context."""
+    return max(MIN_SLOT_CONTEXT, total // parallel)
+
+
+def with_spec(items: list[str], spec) -> list[str]:
+    """A model's items with `spec=N` the window the engine will run (its --gpu-plan answer), not the flag as given."""
+    return items if not isinstance(spec, int) else [x for x in items if not x.startswith("spec=")] + [f"spec={spec}"]
+
+
+def shared_line(shared: list[str], sleeps: list) -> tuple[str, bool]:
+    """The items every model shares, with the idle sleep when all of several models sleep after the same time; and
+    whether it took the sleep (the models then do not say it each)."""
+    s = {x or 0 for x in sleeps}
+    sleep = len(sleeps) > 1 and len(s) == 1 and next(iter(s)) > 0
+    return " ".join(shared + ([f"sleep={next(iter(s)):g}s"] if sleep else [])), sleep
 
 
 def model_line(name: str, width: int, items: list[str]) -> str:
@@ -527,6 +546,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="also answer to this Host name (repeatable; \"*\" turns the check off)")
     ap.add_argument("--cors-origin", action="append", default=[], metavar="ORIGIN",
                     help="let web pages from this origin use /v1/* (repeatable)")
+    ap.add_argument("--max-payload-mib", type=int, default=256, metavar="MIB",
+                    help="the largest request body the server reads, in MiB; a bigger one gets a 413 (default 256)")
     ap.add_argument("--debug", action="store_true",
                     help="log one line per request and the raw model text after each reply")
     ap.add_argument("--request-lines", action="store_true",

@@ -2,13 +2,17 @@
 #include "basalt/log.hpp"
 #include "models/deepseek41/tier.hpp"
 
+#include "basalt/core/device.hpp"
+
 #include "basalt/core/load_progress.hpp"
 #include <optional>
 
 #include "basalt/core/expert_source.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "models/deepseek41/model.hpp"
+#include "models/deepseek41/prefill_plan.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -24,8 +28,6 @@
 namespace basalt::models::deepseek41 {
 namespace {
 
-constexpr uint64_t kRamHeadroom = 20ull << 30;   // host memory left to the system beside the RAM tier
-constexpr uint64_t kRamHeadroomNoFile = 16ull << 30;   // ... when no expert is read through the page cache
 constexpr size_t kMaxPending = 128;              // promotions in flight
 constexpr uint64_t kPrereadBytes = 12ull << 30;  // file-backed experts read ahead into the page cache
 
@@ -51,10 +53,14 @@ ExpertTier::~ExpertTier() {
         std::string e;
         peer_->read_wait(e);
     }
-    if (copy_stream_) cudaStreamSynchronize(copy_stream_);
+    if (copy_stream_) {
+        flush_queue();
+        cudaStreamSynchronize(copy_stream_);
+    }
     if (fetch_stream_) cudaStreamSynchronize(fetch_stream_);
     for (cudaEvent_t e : events_) cudaEventDestroy(e);
     if (fetch_ev_) cudaEventDestroy(fetch_ev_);
+    if (gap_ev_) cudaEventDestroy(gap_ev_);
     if (copy_stream_) cudaStreamDestroy(copy_stream_);
     if (fetch_stream_) cudaStreamDestroy(fetch_stream_);
     for (size_t l = 0; l < ram_.size(); ++l) {
@@ -99,32 +105,61 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     if (m_.peer_device() >= 0) {
         peer_ = std::make_unique<core::PeerExperts>();
         std::string pe;
-        if (peer_->open_plain(m_.peer_device(), n_layers_, n_expert_, g.n_embd, g.n_ff_exp, h_rows, pe)) {
+        if (peer_->open_plain(m_.peer_device(), n_layers_, n_expert_, g.n_embd, g.n_ff_exp, h_rows, pe) && open_share(pe)) {
             peer_slots = slots_in(peer_->room(), (uint64_t) m_.tiers().peer_reserve_mib << 20);
         } else {
+            share_.reset();
             basalt::log::warn("basalt deepseek41", "second card not used: %s", pe.c_str());
             peer_.reset();
         }
     }
 
+    // The prompt and image buffers first, so the free memory the tier reads already lacks them. The ring of file reads
+    // comes only when experts may stay in the file.
     core::detail::HostMemory hm;
-    uint64_t avail = 0;
-    if (core::detail::host_available_memory(hm)) avail = hm.available;
-    auto ram_in = [&](uint64_t left_free) {
-        return (int) std::min<uint64_t>(avail > left_free ? (avail - left_free) / one_each_ram : 0, (uint64_t) n_expert_);
+    auto available = [&] { return core::detail::host_available_memory(hm) ? hm.available : 0; };
+    const uint64_t ram_reserve = platform::ram_reserve();
+    // the image encoder's cuBLAS handle takes host memory when created, so it is taken before the reading
+    if (m_.tiers().vision && !m_.vision_blas().open(err))
+        return false;
+    if (!host_.open(m_, 0, m_.sessions(), m_.tiers().vision, err))
+        return false;
+    uint64_t avail = available();
+    // places per layer above the reserve, less the spare each layer keeps, in `bytes` of RAM
+    auto places_in = [&](uint64_t bytes) {
+        const uint64_t places = core::ram_tier_room(bytes, ram_reserve, true) / one_each_ram;
+        return places > 0 ? places - 1 : 0;
     };
-    int ram_slots = ram_in(kRamHeadroom), ram_no_file = ram_in(kRamHeadroomNoFile);
-    if (m_.tiers().resident_budget > 0) {
-        const int budget = (int) std::min<uint64_t>(m_.tiers().resident_budget / one_each_ram, (uint64_t) n_expert_);
-        ram_slots = std::min(ram_slots, budget);
-        ram_no_file = std::min(ram_no_file, budget);
+    const bool ram_given = m_.tiers().resident_budget > 0 || m_.diag_tier_ram() >= 0;
+    auto ram_in = [&] {
+        int slots = (int) std::min<uint64_t>(places_in(avail), (uint64_t) n_expert_);
+        if (m_.tiers().resident_budget > 0)
+            slots = std::min(slots, (int) std::min<uint64_t>(m_.tiers().resident_budget / one_each_ram, (uint64_t) n_expert_));
+        if (m_.diag_tier_ram() >= 0) slots = std::min(m_.diag_tier_ram(), n_expert_);
+        return slots;
+    };
+    int ram_slots = ram_in();
+    // what the machine can give the tier whatever else runs: its RAM (or the container's) less the engine's own buffers.
+    // The home-versus-copies choice reads this alone, so the cache state at start never moves it.
+    const uint64_t total = std::min(platform::total_physical_memory(), hm.cgroup_limit);
+    const int ram_cap = ram_given ? -1 : (int) std::min<uint64_t>(places_in(total > host_.bytes() ? total - host_.bytes() : 0), 1u << 20);
+    homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
+    if (homes_.file > 0) {   // experts stay in the file: the ring of its reads takes RAM before the tier is sized
+        if (!host_.set_ring(prefillp::kRingPieces, err)) return false;
+        avail = available();
+        ram_slots = ram_in();
+        homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
     }
-    if (m_.diag_tier_ram() >= 0) ram_slots = ram_no_file = std::min(m_.diag_tier_ram(), n_expert_);
-    homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_no_file);
-    if (homes_.peer == 0) peer_.reset();
+    const uint64_t ram_floor =
+        ram_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
+    if (homes_.peer == 0) {
+        share_.reset();
+        peer_.reset();
+    }
 
-    reserve_ = homes_.main > 0 ? reserve.beside_homes : reserve.copies;
-    modules_ = homes_.main > 0 ? reserve.modules : 0;
+    // the base arena (homes, or copies a long prompt borrows) leaves its reserve free; grow() fills it beside a short prompt
+    reserve_ = reserve.beside_homes;
+    modules_ = reserve.modules;
     per_layer_ = homes_.main > 0 ? homes_.main : copies;
     if (homes_.main == 0 && per_layer_ < g.n_used) {
         err = "deepseek41: not enough device memory for the expert tier";
@@ -141,6 +176,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     int lo_prio = 0, hi_prio = 0;
     cudaDeviceGetStreamPriorityRange(&lo_prio, &hi_prio);
     if (cudaEventCreateWithFlags(&fetch_ev_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&gap_ev_, cudaEventDisableTiming) != cudaSuccess ||
         cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithPriority(&fetch_stream_, cudaStreamNonBlocking, hi_prio) != cudaSuccess) {
         err = "deepseek41: cannot create the promotion stream";
@@ -174,23 +210,59 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     pool_ = std::make_unique<kernels::cpu::ExpertPool>(workers, m_.tiers().pool_affinity_given ? m_.tiers().pool_affinity : kernels::cpu::PoolAffinity::All);
 
     if (!load_ram(err)) return false;
-    if (homes_.main > 0) {
-        grow();
-    } else {
-        seed_copies(0, per_layer_);
-        promoted_ = 0;
-    }
+    if (homes_.main == 0) seed_copies(per_layer_);
+    promoted_ = 0;
+    grow();
     // what the start picked by itself, on the server's auto line; the RAM floor the tier left free
     std::printf("auto flags: resident %.1f GB, pool-workers %d\n",
                 (double) one_each_ram * cover_ / 1e9, pool_->workers());   // the server keeps the words after the name
     std::fflush(stdout);
-    basalt::log::info("basalt generate", "RAM floor %.1f GiB", (double) (homes_.file > 0 ? kRamHeadroom : kRamHeadroomNoFile) / 1073741824.0);
+    basalt::log::info("basalt generate", "RAM floor %.1f GiB of %.1f GiB free", (double) ram_floor / 1073741824.0,
+                      (double) avail / 1073741824.0);
     if (peer_) basalt::log::info("basalt deepseek41", "peer GPU %d: %lld experts", peer_->device(), (long long) n_layers_ * homes_.peer);
     basalt::log::info("basalt deepseek41", "expert homes of %d per layer: main card %d, second card %d, RAM %d, file %d; main card copies %lld",
-                 n_expert_, homes_.main, homes_.peer, homes_.ram, homes_.file, (long long) (homes_.main > 0 ? ext_per_layer_ : per_layer_));
+                 n_expert_, homes_.main, homes_.peer, homes_.ram, homes_.file, (long long) (per_layer_ + ext_per_layer_ - homes_.main));
+    program::warn_spill(spill(), peer_ ? "" : ", or --gpu 0,1");
     basalt::log::info("basalt deepseek41", "VRAM expert tier %.2f GiB, %lld of %d experts per layer (%.0f%%); CPU pool %d workers",
                  cache_.gib(), (long long) per_layer_, n_expert_, 100.0 * (double) per_layer_ / n_expert_, pool_->workers());
     return true;
+}
+
+// The second card's prompt share takes its buffers before the card's slots are sized, and each layer's prices.
+bool ExpertTier::open_share(std::string& err) {
+    const Geometry& g = m_.geo();
+    prefill::PeerShare::Dims d;
+    d.n_embd = g.n_embd;
+    d.n_ff = g.n_ff_exp;
+    size_t stride = 0;
+    for (const ExpertLayer& el : m_.pack().experts) stride = std::max<size_t>(stride, staged_stride(el));
+    d.group_bytes = stride * (size_t) d.launch_experts;
+    d.act_bytes = prefill::mmq::q8_bytes(prefillp::kMaxChunk, g.n_embd);
+    d.max_tokens = prefillp::kMaxChunk;
+    d.max_rows = (int64_t) prefillp::kMaxChunk * g.n_used;
+    d.n_expert = n_expert_;
+    int main_dev = 0;
+    cudaGetDevice(&main_dev);
+    share_ = std::make_unique<prefill::PeerShare>();
+    if (!share_->open(main_dev, peer_->device(), d, err)) return false;
+    // a row of a layer's products is three matrices of n_embd x n_ff multiply-adds
+    const core::DeviceRates r0 = core::device_rates(main_dev), r1 = core::device_rates(peer_->device());
+    const double macs = 3.0 * (double) g.n_embd * (double) g.n_ff_exp;
+    rates_.assign((size_t) n_layers_, {});
+    for (prefill::ShareRates& r : rates_) {
+        r.link0 = r0.link_bytes;
+        r.link1 = r1.link_bytes;
+        r.rows0 = r0.sm_hz * prefill::kMmqMacsPerSmCycle / macs;
+        r.rows1 = r1.sm_hz * prefill::kMmqMacsPerSmCycle / macs;
+        r.sm_hz0 = r0.sm_hz;
+    }
+    return true;
+}
+
+program::ExpertSpill ExpertTier::spill() const {
+    uint64_t one_each = 0;
+    for (const ExpertLayer& e : m_.pack().experts) one_each += e.blob_bytes;
+    return {(int64_t) n_layers_ * homes_.file, (int64_t) n_layers_ * n_expert_, one_each * (uint64_t) homes_.file};
 }
 
 namespace {
@@ -263,6 +335,7 @@ bool ExpertTier::load_ram(std::string& err) {
     ram_.assign((size_t) n_layers_, nullptr);
     ram_idx_.assign((size_t) n_layers_ * n_expert_, -1);
     spare_.assign((size_t) n_layers_, -1);
+    swapping_.assign((size_t) n_layers_, 0);
     spare_since_.assign((size_t) n_layers_, 0);
     last_miss_.assign((size_t) n_layers_ * n_expert_, 0);
     const int64_t copies = homes_.main > 0 ? 0 : per_layer_;
@@ -408,12 +481,12 @@ bool ExpertTier::load_rank(std::string& err) {
     return true;
 }
 
-// Copies the most routed RAM tier experts from rank `first_rank` on into `n` slots of each layer.
-void ExpertTier::seed_copies(int first_rank, int64_t n) {
+// Copies the most routed RAM tier experts the main card does not hold yet into `n` slots of each layer.
+void ExpertTier::seed_copies(int64_t n) {
     for (int l = 0; l < n_layers_; ++l) {
-        for (int64_t r = first_rank, placed = 0; r < n_expert_ && placed < n; ++r) {
+        for (int64_t r = 0, placed = 0; r < n_expert_ && placed < n; ++r) {
             const int e = ranked(l, (int) r);
-            if (!pinned(l, e)) continue;
+            if (!pinned(l, e) || res_[(size_t) l * n_expert_ + e] >= 0) continue;
             ++tick_;
             if (claim(l, e, blob_of(l, e), copy_stream_) < 0) {
                 cudaStreamSynchronize(copy_stream_);
@@ -469,6 +542,7 @@ void ExpertTier::drain() {
 }
 
 void ExpertTier::settle() {
+    flush_queue();
     cudaStreamSynchronize(copy_stream_);
     cudaStreamSynchronize(fetch_stream_);
     drain();
@@ -476,6 +550,7 @@ void ExpertTier::settle() {
 
 void ExpertTier::begin_token(int n_tokens) {
     token_ += (uint64_t) n_tokens;
+    flush_queue();
     drain();
     finish_swaps();
     start_swaps();
@@ -490,7 +565,7 @@ void ExpertTier::swap_worker() {
         const Swap sw = jobs_[next];
         lk.unlock();
         const ExpertLayer& el = m_.pack().experts[(size_t) sw.layer];
-        uint8_t* dst = ram_[(size_t) sw.layer] + (size_t) spare_[(size_t) sw.layer] * el.blob_bytes;
+        uint8_t* dst = ram_[(size_t) sw.layer] + (size_t) sw.place * el.blob_bytes;
         const bool ok = platform::pread_all(m_.experts_fd(), dst, el.blob_bytes,
                                             m_.pack().experts_range.offset + el.offset + (uint64_t) sw.expert * el.blob_bytes);
         lk.lock();
@@ -523,10 +598,11 @@ void ExpertTier::finish_swaps() {
         for (size_t i = 0; i < flight_.size(); ++i) flight_[i].expert = jobs_[jobs_.size() - flight_.size() + i].expert;
     }
     for (const Swap& sw : flight_) {
+        swapping_[(size_t) sw.layer] = 0;
         if (sw.expert < 0) continue;
         const size_t base = (size_t) sw.layer * n_expert_;
         const int32_t v = ram_idx_[base + sw.victim];
-        ram_idx_[base + sw.expert] = spare_[(size_t) sw.layer];
+        ram_idx_[base + sw.expert] = sw.place;
         ram_idx_[base + sw.victim] = -1;
         spare_[(size_t) sw.layer] = v;
         spare_since_[(size_t) sw.layer] = token_;
@@ -551,7 +627,7 @@ void ExpertTier::start_swaps() {
         const int v = policy::pick_victim(&ram_idx_[(size_t) l * n_expert_], &stamp_[(size_t) l * n_expert_], n_expert_, nullptr, 0);
         // a victim used in the last 16 tokens stays
         if (v < 0 || stamp_[(size_t) l * n_expert_ + v] + 16ull * (uint64_t) n_layers_ >= tick_) continue;
-        batch.push_back({l, e, v});
+        batch.push_back({l, e, v, spare_[(size_t) l]});
     }
     want_.clear();
     if (batch.empty()) return;
@@ -560,6 +636,7 @@ void ExpertTier::start_swaps() {
         jobs_.insert(jobs_.end(), batch.begin(), batch.end());
     }
     cv_.notify_all();
+    for (const Swap& sw : batch) swapping_[(size_t) sw.layer] = 1;
     flight_ = std::move(batch);
 }
 
@@ -616,54 +693,48 @@ ExpertTier::Source ExpertTier::locate(int layer, int e) const {
     return r;
 }
 
-bool ExpertTier::run_cpu(int layer, const float* x, const Lookup& lk, float* rows, std::string& err) {
+void ExpertTier::start_cpu(int layer, const float* x, const Lookup& lk, float* rows) {
     const kernels::cpu::NativeFmt& f = fmt_[(size_t) layer];
-    kernels::cpu::ExpertJobMulti jobs[kMaxK];
     int n = 0;
-    bool any = false;
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || lk.peer[i]) continue;
-        any = true;
-        jobs[n] = kernels::cpu::ExpertJobMulti{};
-        jobs[n].blob = lk.host[i];
-        jobs[n].nt = 1;
-        jobs[n].nact[0] = act_;
-        jobs[n].out[0] = rows + (size_t) i * (size_t) m_.geo().n_embd;
+        cpu_jobs_[n] = kernels::cpu::ExpertJobMulti{};
+        cpu_jobs_[n].blob = lk.host[i];
+        cpu_jobs_[n].nt = 1;
+        cpu_jobs_[n].nact[0] = act_;
+        cpu_jobs_[n].out[0] = rows + (size_t) i * (size_t) m_.geo().n_embd;
         ++n;
     }
-    if (!any) return true;
+    if (!n) return;
     kernels::cpu::native_quant_act(f, x, act_);
-    pool_->run_split_multi_native(f, jobs, n);
-    (void) err;
-    return true;
+    pool_->start_split_multi_native(f, cpu_jobs_, n);
 }
 
-bool ExpertTier::run_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows, std::string& err) {
+void ExpertTier::start_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows) {
     const kernels::cpu::NativeFmt& f = fmt_[(size_t) layer];
     const size_t n_embd = (size_t) m_.geo().n_embd;
-    kernels::cpu::ExpertJobMulti jobs[kMaxK];
     bool quantized[kMaxWindow] = {};
     int n = 0;
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || lk.peer[i]) continue;
-        jobs[n] = kernels::cpu::ExpertJobMulti{};
-        jobs[n].blob = lk.host[i];
-        jobs[n].nt = use[i].nt;
+        cpu_jobs_[n] = kernels::cpu::ExpertJobMulti{};
+        cpu_jobs_[n].blob = lk.host[i];
+        cpu_jobs_[n].nt = use[i].nt;
         for (int j = 0; j < use[i].nt; ++j) {
             const int t = use[i].tok[j];
             if (!quantized[t]) {
                 kernels::cpu::native_quant_act(f, x + (size_t) t * n_embd, act_ + (size_t) t * kernels::cpu::kNativeActBytes);
                 quantized[t] = true;
             }
-            jobs[n].nact[j] = act_ + (size_t) t * kernels::cpu::kNativeActBytes;
-            jobs[n].out[j] = rows + (size_t) use[i].row[j] * n_embd;
+            cpu_jobs_[n].nact[j] = act_ + (size_t) t * kernels::cpu::kNativeActBytes;
+            cpu_jobs_[n].out[j] = rows + (size_t) use[i].row[j] * n_embd;
         }
         ++n;
     }
-    if (n) pool_->run_split_multi_native(f, jobs, n);
-    (void) err;
-    return true;
+    if (n) pool_->start_split_multi_native(f, cpu_jobs_, n);
 }
+
+void ExpertTier::finish_cpu() { pool_->finish_split_multi_native(); }
 
 int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const {
     int32_t slot = -1;
@@ -679,14 +750,14 @@ int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const
             }
         }
     };
-    if (homes_.main == 0 || (homes_too && homes_.file == 0 && spare_[(size_t) layer] >= 0))
+    if (homes_.main == 0 || (homes_too && spare_[(size_t) layer] >= 0 && !swapping_[(size_t) layer]))
         scan((int64_t) layer * per_layer_, per_layer_);
     if (ext_per_layer_) scan((int64_t) n_layers_ * per_layer_ + (int64_t) layer * ext_per_layer_, ext_per_layer_);
     return slot;
 }
 
 bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
-    if (homes_.peer == 0 || homes_.file > 0 || spare_[(size_t) layer] < 0) return false;
+    if (homes_.peer == 0 || spare_[(size_t) layer] < 0 || swapping_[(size_t) layer]) return false;
     const size_t base = (size_t) layer * n_expert_;
     int32_t slot = -1;
     uint64_t oldest = ~0ull;
@@ -710,8 +781,8 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     return true;
 }
 
-int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too) {
-    if (pending_.size() >= kMaxPending || free_events_.empty()) {
+int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too, bool whole, bool later) {
+    if (pending_.size() + queue_.size() >= kMaxPending || free_events_.empty()) {
         ++dropped_;
         return -1;
     }
@@ -727,23 +798,55 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     uint8_t* dst = const_cast<uint8_t*>(slot_ptr(slot));
     const bool home = homes_.main > 0 && slot < (int64_t) n_layers_ * per_layer_;
     int32_t place = -1;
+    const uint64_t piece = whole ? bytes : policy::kPieceBytes;
     const auto pieces = [&](uint8_t* to, const uint8_t* from, cudaMemcpyKind kind) {
-        for (uint64_t off = 0; off < bytes; off += policy::kPieceBytes)
-            cudaMemcpyAsync(to + off, from + off, std::min(policy::kPieceBytes, bytes - off), kind, stream);
+        for (uint64_t off = 0; off < bytes; off += piece)
+            cudaMemcpyAsync(to + off, from + off, std::min(piece, bytes - off), kind, stream);
     };
     if (home) {   // the home's bytes first: the stream keeps the order
         place = spare_[(size_t) layer];
         spare_[(size_t) layer] = -1;
-        pieces(ram_[(size_t) layer] + (size_t) place * bytes, dst, cudaMemcpyDeviceToHost);
     }
-    pieces(dst, src, cudaMemcpyHostToDevice);
     const int ev = free_events_.back();
     free_events_.pop_back();
+    ++promoted_;
+    if (later) {
+        Queued q{{layer, e, slot, ev, home ? o : -1, place}, dst, src, home ? ram_[(size_t) layer] + (size_t) place * bytes : nullptr, bytes};
+        queue_.push_back(q);
+        return slot;
+    }
+    if (home) pieces(ram_[(size_t) layer] + (size_t) place * bytes, dst, cudaMemcpyDeviceToHost);
+    pieces(dst, src, cudaMemcpyHostToDevice);
     cudaEventRecord(events_[(size_t) ev], stream);
     pending_.push_back({layer, e, slot, ev, home ? o : -1, place});
-    ++promoted_;
     return slot;
 }
+
+void ExpertTier::mark_gap(cudaStream_t main) {
+    gap_marked_ = !queue_.empty() && cudaEventRecord(gap_ev_, main) == cudaSuccess;
+}
+
+void ExpertTier::pump(int pieces) {
+    if (gap_marked_) cudaStreamWaitEvent(copy_stream_, gap_ev_, 0);
+    gap_marked_ = false;
+    if (queue_.empty()) return;
+    size_t done = 0;
+    for (; done < queue_.size() && pieces > 0; ++done) {
+        Queued& q = queue_[done];
+        for (; q.home_to && q.home_off < q.bytes && pieces > 0; q.home_off += policy::kPieceBytes, --pieces)
+            cudaMemcpyAsync(q.home_to + q.home_off, q.dst + q.home_off, std::min(policy::kPieceBytes, q.bytes - q.home_off),
+                            cudaMemcpyDeviceToHost, copy_stream_);
+        for (; (!q.home_to || q.home_off >= q.bytes) && q.off < q.bytes && pieces > 0; q.off += policy::kPieceBytes, --pieces)
+            cudaMemcpyAsync(q.dst + q.off, q.src + q.off, std::min(policy::kPieceBytes, q.bytes - q.off), cudaMemcpyHostToDevice,
+                            copy_stream_);
+        if (q.off < q.bytes) break;
+        cudaEventRecord(events_[(size_t) q.p.event], copy_stream_);
+        pending_.push_back(q.p);
+    }
+    queue_.erase(queue_.begin(), queue_.begin() + (std::ptrdiff_t) done);
+}
+
+void ExpertTier::flush_queue() { pump(kAllPieces); }
 
 int ExpertTier::fetch(int layer, Lookup& lk) {
     if (m_.tiers().diag_tier_frozen) return 0;
@@ -755,7 +858,7 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     for (int i = lk.k - 1; i >= 0 && left > 0; --i) {
         if (lk.dev[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
         --left;
-        const int32_t slot = claim(layer, lk.experts[i], lk.host[i], fetch_stream_);
+        const int32_t slot = claim(layer, lk.experts[i], lk.host[i], fetch_stream_, false, /*whole=*/true);
         if (slot < 0) continue;
         lk.dev[i] = slot_ptr(slot);
         lk.host[i] = nullptr;
@@ -774,12 +877,14 @@ void ExpertTier::promote(int layer, const Lookup& lk) {
     if (m_.tiers().diag_tier_frozen) return;
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || !lk.again[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
-        if (!move_to_peer(layer, lk.experts[i], lk.host[i])) claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true);
+        if (!move_to_peer(layer, lk.experts[i], lk.host[i]))
+            claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true, /*whole=*/false, /*later=*/true);
     }
 }
 
 void ExpertTier::shrink() {
     if (ext_per_layer_ == 0) return;
+    flush_queue();
     cudaStreamSynchronize(copy_stream_);
     cudaStreamSynchronize(fetch_stream_);
     drain();
@@ -797,6 +902,7 @@ void ExpertTier::shrink() {
 void ExpertTier::lend_all() {
     shrink();
     if (lent_per_layer_ > 0 || !cache_.valid() || homes_.main > 0) return;
+    flush_queue();
     cudaStreamSynchronize(copy_stream_);
     cudaStreamSynchronize(fetch_stream_);
     drain();
@@ -847,12 +953,10 @@ void ExpertTier::grow() {
     busy_.resize((size_t) slot_total(), 0);
     basalt::log::info("basalt deepseek41", "VRAM expert tier %lld of %d experts per layer (%lld beside the prompt workspaces)",
                  (long long) (per_layer_ + n), n_expert_, (long long) per_layer_);
-    if (homes_.main > 0) {
-        cudaDeviceSynchronize();   // the arena's zeroing is not ordered against the copy stream
-        const int64_t promoted = promoted_;
-        seed_copies(homes_.main + homes_.peer, n);
-        promoted_ = promoted;
-    }
+    cudaDeviceSynchronize();   // the arena's zeroing is not ordered against the copy stream
+    const int64_t promoted = promoted_;
+    seed_copies(n);
+    promoted_ = promoted;
 }
 
 void ExpertTier::set_free_floor(int64_t mib) { free_floor_ = mib < 0 ? start_floor_ : (uint64_t) mib << 20; }

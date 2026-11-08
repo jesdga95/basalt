@@ -92,11 +92,13 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     CommonOptions& o = *out;
     if (adapter != nullptr) {
         o.arch = adapter->arch();
+        o.model_name = adapter->model_name();
         o.quality_flags = adapter->quality_flags();
         o.quality_window = adapter->quality_window();
     }
     if (const auto code = parse_options(argc, argv, o, adapter)) return *code;
     if (adapter != nullptr) {
+        if (o.gpu_plan) o.plan_spec = adapter->planned_spec(o);
         pack_tokens(*adapter, o);
         // nothing would end a reply
         if (o.eos_ids.empty() && o.generates && !o.gpu_plan && (o.serve || (o.max_new > 0 && o.stop_eos))) {

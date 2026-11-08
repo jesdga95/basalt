@@ -13,7 +13,7 @@ Protocol (one line each):
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
     that slot's own state, answered like a GEN.
   * `VRAM [mib]` -> `VRAM k=v ...`; `QUIT` ends the engine.
-  * `ENC <image> <out> [<image> <out> ...]` (--vision-mmproj): one `ENC OK <n> <nx> <ny> <ms>` per image, or `ENC ERR`.
+  * `ENC <image> <out> [<image> <out> ...]` (--vision): one `ENC OK <n> <nx> <ny> <ms>` per image, or `ENC ERR`.
   * Requests share one pipe, serialized by the service FIFO (batch: by the `ctl` lock).
 """
 from __future__ import annotations
@@ -24,6 +24,7 @@ import math
 import os
 import queue
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -86,7 +87,8 @@ def engine_line(line: str) -> str:
 
 
 AUTO_FLAGS = "auto flags: "
-AUTO_NAMES = {"peer-exclusive": "peer-excl", "pool-workers": "pool"}   # the console's short names
+# the console's names: short ones, and `resident` is only the experts held in RAM, not the model
+AUTO_NAMES = {"peer-exclusive": "peer-excl", "pool-workers": "pool", "resident": "ram-experts"}
 
 
 def relay_auto_flags(line: str) -> bool:
@@ -232,7 +234,7 @@ class ProcessEngine:
             self.loading, self.load_status = False, {}
         self.asleep = False              # its GPU state suspended by the driver (sleep/wake)
         self.restore_s = 0.0             # the driver's part of the last wake
-        self.max_context = int(flag_value(args, "--max-context") or 4096)
+        self.max_context = int(flag_value(args, "--max-context") or 0)   # the engine's own at READY
         self.can_stop = False            # READY <ctx> stop
         self.last = {}
         self.slot_drafts = {}
@@ -414,7 +416,7 @@ class ProcessEngine:
             q.put(None)
 
     def death_note(self) -> str:
-        """Why the engine most likely ended, from the end of its log: its own watchdog, else RAM."""
+        """What is known of why the engine ended: its exit code or signal and its last error line, never a guess."""
         if getattr(self, "silent_note", None):          # the server ended it
             return self.silent_note
         tail = ""
@@ -430,12 +432,23 @@ class ProcessEngine:
                 return "the engine's watchdog stopped it: " + line.strip()
         proc = self.proc                                 # None between restart's close and start
         rc = proc.poll() if proc is not None else None
+        if rc is None:
+            status = "the engine ended (no exit status)"
+        elif rc < 0:
+            try:
+                status = f"the engine was killed by {signal.Signals(-rc).name}"
+            except ValueError:
+                status = f"the engine was killed by signal {-rc}"
+        else:
+            status = f"the engine exited (code {rc})"
         if rc is not None and rc >= 0 and self.last_err:  # its last stdout words
-            return f"the engine exited (code {rc}) after it reported: {self.last_err}"
-        last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("basalt", "ERR"))), "")
-        if rc is not None and rc >= 0 and last:          # it ended by itself
-            return f"the engine exited (code {rc}), last log line: {last}"
-        return "probably out of RAM (sudo dmesg | grep -i 'out of memory')"
+            return f"{status} after it reported: {self.last_err}"
+        lines = [x.strip() for x in tail.splitlines()]
+        err = next((x for x in reversed(lines) if ": error: " in x or x.startswith("ERR")), "")
+        if err:
+            return f"{status}, last error in its log: {err}"
+        last = next((x for x in reversed(lines) if x.startswith("basalt")), "")
+        return f"{status}, last log line: {last}" if last else f"{status}, nothing in its log"
 
     def alive(self) -> bool:
         proc = self.proc                                 # read once: restart()/close() may clear it
@@ -497,6 +510,8 @@ class ProcessEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
+        if len(f) >= 13:                                  # decode lookups read from the expert file
+            self.last.update(file_reads=int(f[12]))
         if len(f) >= 15:                                  # prompt tokens actually read
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # experts read over PCIe

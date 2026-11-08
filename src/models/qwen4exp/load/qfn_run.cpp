@@ -92,7 +92,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
     // peer-only experts, staged through the host, so streaming loses until later.
     auto set_stream_all_min = [&]() {
-        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share)
+        if (o.serve && o.peer_device >= 1 && !o.no_peer_prefill && peer_streamed_share)
             basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
     };
     set_stream_all_min();
@@ -236,19 +236,20 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
         const auto& lay = basalt::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
-            if (!basalt::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
+            if (!basalt::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type)) {
                 char msg[224];
-                std::snprintf(msg, sizeof msg, "layer %lld's experts are %s/%s (ggml types %d/%d), which this "
-                                               "engine has no GPU kernels for: format not supported for decode",
-                              (long long) l,
-                              basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
-                              f.gu_type, f.d_type);
+                std::snprintf(msg, sizeof msg, "layer %lld's experts are %s%s%s/%s (ggml types %d/%d/%d), which "
+                                               "this engine has no GPU kernels for: format not supported for decode",
+                              (long long) l, basalt::ggml_type_name((uint32_t) f.gu_type),
+                              f.up_type != f.gu_type ? "+" : "",
+                              f.up_type != f.gu_type ? basalt::ggml_type_name((uint32_t) f.up_type) : "",
+                              basalt::ggml_type_name((uint32_t) f.d_type), f.gu_type, f.up_type, f.d_type);
                 return fatal_start_error(msg);
             }
             // Q6_K experts run on the fast kernels only (decode-once grouped / device-planned tail, MMQ prefill, CPU
             // dot): a pair or shape outside them is refused rather than routed to a general path.
             if ((f.gu_type == 14 || f.d_type == 14) &&
-                (!basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff) ||
+                (!basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type) ||
                  !basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) || !basalt::prefill::mmq::fits(f.d_type, f.n_embd))) {
                 char msg[224];
                 std::snprintf(msg, sizeof msg, "layer %lld's experts are %s/%s: Q6_K experts have fast kernels only "
@@ -263,14 +264,18 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
             const auto& f = lay.fmt[(size_t) l];
             int64_t e = l;
             while (e + 1 < (int64_t) lay.fmt.size() && lay.fmt[(size_t) e + 1].gu_type == f.gu_type &&
-                   lay.fmt[(size_t) e + 1].d_type == f.d_type)
+                   lay.fmt[(size_t) e + 1].up_type == f.up_type && lay.fmt[(size_t) e + 1].d_type == f.d_type)
                 ++e;
-            basalt::log::info("basalt generate", "experts %s/%s, layers %lld-%lld: decode %s, prefill %s, CPU tier dot",
-                         basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
-                         (long long) l, (long long) e,
-                         basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+            // a layer whose up rows have their own type shows both: gate+up/down
+            const bool mixed = f.up_type != f.gu_type;
+            basalt::log::info("basalt generate", "experts %s%s%s/%s, layers %lld-%lld: decode %s, prefill %s, CPU tier dot",
+                         basalt::ggml_type_name((uint32_t) f.gu_type), mixed ? "+" : "",
+                         mixed ? basalt::ggml_type_name((uint32_t) f.up_type) : "",
+                         basalt::ggml_type_name((uint32_t) f.d_type), (long long) l, (long long) e,
+                         basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type)
                              ? "device-planned tail + grouped kernels" : "grouped kernels",
-                         basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) && basalt::prefill::mmq::fits(f.d_type, f.n_embd)
+                         basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) && basalt::prefill::mmq::fits(f.up_type, 2 * f.n_ff) &&
+                                 basalt::prefill::mmq::fits(f.d_type, f.n_embd)
                              ? "MMQ" : "dequant GEMM");
             l = e + 1;
         }

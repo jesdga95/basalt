@@ -2,51 +2,9 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
+#include "basalt/core/host_plan.hpp"
+
 namespace basalt::models::qwen4exp::serve {
-
-uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry& g) {
-    if (!o.serve) return 0;
-    uint64_t bytes = basalt::platform::kRequestHostBytes;
-    basalt::core::ConversationStateSizes z;
-    std::string error;
-    if (o.prompt_cache > 0 && basalt::core::conversation_state_sizes(g, z, error)) {
-        const uint64_t one = z.gdn + z.ple + (uint64_t) g.n_qsa_layers() * (z.tail + z.dead + z.block_pos);
-        bytes += (uint64_t) (o.prompt_cache + 1) * (uint64_t) std::max(o.batch, 1) * one;
-        bytes += (uint64_t) o.conversation_cache_mib << 20;
-    }
-    if (!o.vision_mmproj.empty()) {
-        // the canvas (8-bit RGB), its normalized planar floats and the patches
-        const basalt::vision::Geometry vg;
-        const uint64_t pixels = (uint64_t) vg.max_tokens * (uint64_t) (vg.patch * vg.merge) * (uint64_t) (vg.patch * vg.merge);
-        bytes += pixels * 3 * (1 + 2 * sizeof(float));
-    }
-    return bytes;
-}
-
-void QfnRuntime::shed_if_low() {
-    if (basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
-    const uint64_t drop = basalt::platform::ram_guard_drops();
-    if (drop == shed_drop) return;
-    shed_drop = drop;
-    const size_t parked = conversations->size();
-    const size_t freed = conversations->clear();
-    size_t to_disk = 0;
-    for (auto& sc : conversations->take_spilled())
-        if (disk.enabled() && !disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec) &&
-            disk.put(std::move(sc), kDiskQueueCap))
-            ++to_disk;
-    if (freed > 0)
-        basalt::log::info("basalt serve", "RAM guard: %zu parked conversations (%zu MiB) leave RAM, %zu of them "
-                          "to disk", parked, freed >> 20, to_disk);
-    if (const size_t pooled = basalt::core::CheckpointBytes::allocator_type::release_pooled(); pooled > 0)
-        basalt::log::info("basalt serve", "RAM guard: freed %zu MiB of checkpoint blocks kept for reuse",
-                          pooled >> 20);
-    const uint64_t before = basalt::platform::available_memory();
-    basalt::platform::release_free_heap();
-    const uint64_t after = basalt::platform::available_memory();
-    basalt::log::info("basalt serve", "RAM guard: free heap returned to the OS, %lld MiB free now (%+lld MiB)",
-                      (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
-}
 
 // the prompt path's loan with `live` slots: its chunk as large as fits, and the first slot it covers
 int32_t QfnRuntime::loan_plan(int64_t live, int64_t& chunk) {
@@ -264,16 +222,16 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
 }
 
 int QfnRuntime::init_memory() {
-    // the load's own buffers are gone: RAM still free keeps the next-hottest experts the first sizing left out
+    // the load's own buffers and the RAM held for buffers nothing made are gone: RAM still free keeps the next-hottest
+    // experts the copy left out
+    if (const uint64_t held = basalt::core::host_plan_release(); held > 0)
+        basalt::log::info("basalt serve", "RAM: %.2f GiB held for host buffers not made, given back",
+                          (double) held / 1073741824.0);
     if (srcp == &src && src.complement_ready() && o.resident_budget == 0) {
         int64_t n_top = 0;
-        // what the engine still takes once serving (see serve_growth_bytes) and the file cache's floor while
-        // experts are read from the SSD (none when every expert has a tier)
-        const uint64_t later = serve_growth_bytes(o, g) +
-                               (ram_floor_bytes - std::min(ram_floor_bytes, basalt::platform::ram_margin()));
         const uint64_t add = src.top_up(stages.empty() ? profile : profile_all, [&](int32_t l, int32_t e) {
             return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
-        }, o.resident_pin, n_top, later);
+        }, o.resident_pin, n_top);
         if (add > 0) {
             basalt::platform::watch_resident_ram(true, src.resident_bytes() + add);
             basalt::log::info("basalt generate", "RAM top-up: +%.2f GiB, %lld experts (total %.2f GiB)",
@@ -282,27 +240,16 @@ int QfnRuntime::init_memory() {
         }
     }
     report_expert_tiers();
-    basalt::platform::stop_memory_watchdog();
     // from here the RAM guard watches: below its floor the engine sheds and new requests wait, and a running
-    // request stops only once the RAM is critical
-    guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes, prompt_file_bytes);
-    basalt::platform::start_ram_guard(guard_floor);
-    disk_floor = guard_floor + (1ull << 30);   // a disk-tier capture or read stays a GiB above the guard
-    // what a stop's error compares against, to tell the engine's own growth from other programs'
-    ready_avail = basalt::platform::available_memory();
-    ready_rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
-    // once per drop below the guard's floor, on the serve thread between steps: the parked conversations leave RAM
-    // (to the disk tier when it is on and holds no copy of them yet: queued for its writer, whose writes free them;
-    // the others are dropped), the checkpoint blocks kept for reuse are freed and the heap's free pages return to
-    // the OS.  The checkpoints stay: a live request's rewind and the deferred copy in flight use them.
-    shed_drop = 0;
+    // request stops only once the RAM is critical.  The checkpoints stay through a shed: a live request's rewind and
+    // the deferred copy in flight use them.
+    start_guard();
 
-    // a VRAM shrink's RAM homes leave the guard's floor above the margin and the top-up's own slack free
-    src.set_homes_reserve(guard_floor - std::min(guard_floor, basalt::platform::ram_margin()) + (256ull << 20));
+    // a VRAM shrink's RAM homes stop 256 MiB above the reserve
+    src.set_homes_reserve(256ull << 20);
     if (const uint64_t avail = basalt::platform::available_memory(); avail > 0)
-        basalt::log::info("basalt serve", "RAM %.2f GiB free, guard %.2f GiB, %.2f GiB kept for serving",
-                     (double) avail / 1073741824.0, (double) guard_floor / 1073741824.0,
-                     (double) serve_growth_bytes(o, g) / 1073741824.0);
+        basalt::log::info("basalt serve", "RAM %.2f GiB free, guard %.2f GiB", (double) avail / 1073741824.0,
+                          (double) guard_floor / 1073741824.0);
     return 0;
 }
 

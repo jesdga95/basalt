@@ -133,11 +133,7 @@ void QfnRuntime::print_info() {
         std::string quant_label, gpu_ids;
         {
             const basalt::core::Json* nm = model_file.meta().get("name");
-            std::string nmv = nm != nullptr && nm->is_string() ? nm->s : std::string();
-            quant_label = nmv.substr(nmv.rfind(' ') == std::string::npos ? 0 : nmv.rfind(' ') + 1);
-            for (const char* pre : {"NVIDIA-", "UD-"})
-                if (quant_label.rfind(pre, 0) == 0) quant_label.erase(0, std::strlen(pre));
-            if (quant_label.empty()) quant_label = "unknown";
+            quant_label = basalt::program::pack_quant_label(nm != nullptr && nm->is_string() ? nm->s : std::string());
             for (int d : basalt::program::engine_gpu_order(o.peer_device, o.peer_devices,
                                                            multi_gpu ? split_devs : std::vector<int>())) {
                 char bus[32] = {};

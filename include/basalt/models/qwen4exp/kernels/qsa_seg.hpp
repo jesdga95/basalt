@@ -12,9 +12,10 @@
 //   query post                   qsa_dec_q_post         (no per-sequence state: one call over all rows)
 //   block scores                 qsa_block_scores_seg
 //   top-k                        qsa_block_topk         (reads scores and steps only: one call over all rows)
+//   residency (streamed slots)   kv_stream_resolve_seg  (each segment resolves into its own slot's map)
 //   chunks and merge             qsa_dec_attn_seg
 //   commit (tail restore + appends)  native_qsa_indexer_commit_seg
-// A streamed layer (kv_mode 1) has no segment form: its resolve walks one sequence's residency map.
+// A streamed slot (kv_mode 1, INT8) carries its residency map; a resident one a null map, which the resolve skips.
 // Rows are `steps`-indexed as in the single-sequence kernels (the row's own position and counts), INT8 or FP16 pools.
 #pragma once
 
@@ -41,6 +42,7 @@ struct QsaSegSlot {
     uint16_t *k_scale = nullptr, *v_scale = nullptr;
     int32_t* page_table = nullptr;
     KvHostPools host;                                 ///< the host copy; all null when resident
+    KvStreamMap map;                                  ///< a streamed slot's residency map; null `ctl` when resident
     float *tail = nullptr, *dead = nullptr, *pooled = nullptr;
     float* tail_snap = nullptr;                       ///< ((idx_block - 1) * idx_dim) floats: the tail before the window
     int32_t* block_pos = nullptr;
@@ -81,6 +83,13 @@ void qsa_dec_kv_post_seg(const QsaDecKvPost& a, const QsaSegTable& t, int n, con
 /// qsa_block_scores over rows of different sequences: row r reads its slot's pooled / dead. nq <= kQsaSegMaxRows.
 void qsa_block_scores_seg(const QsaSegTable& t, const float* q_idx, const int32_t* steps, int64_t nq, int64_t max_blocks,
                           const QsaShapes& s, float* scores, void* stream, bool skip_identity = false);
+
+/// kv_stream_resolve over segments, INT8 pools: segment j's rows (their ids and steps from its first row on) resolve
+/// into its slot's map and the misses are copied from that slot's host copy into its pool, for each slot what
+/// kv_stream_resolve does over that slot's rows alone.  A segment with a negative slot or no rows, and a resident slot
+/// (null map), are skipped.  Capturable.  Every streamed slot holds at least kKvStreamMinSlots pages.
+void kv_stream_resolve_seg(const QsaSegTable& t, const int32_t* ids, const int32_t* steps, int64_t cap,
+                           const QsaShapes& s, void* stream);
 
 /// qsa_dec_attn over rows of different sequences (INT8 pools when `int8`, else FP16). Same outputs and scratch.
 void qsa_dec_attn_seg(const float* q, const QsaSegTable& t, bool int8, const int32_t* ids, const int32_t* steps,

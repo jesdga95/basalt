@@ -58,22 +58,26 @@ const char* name_of(int t) {
         case 16: return "IQ2_XXS";
         case 17: return "IQ2_XS";
         case 18: return "IQ3_XXS";
+        case 19: return "IQ1_S";
         case 20: return "IQ4_NL";
         case 21: return "IQ3_S";
         case 22: return "IQ2_S";
         case 23: return "IQ4_XS";
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
+        case 10: return "Q2_K";
+        case 11: return "Q3_K";
         case 12: return "Q4_K";
         case 13: return "Q5_K";
         case 14: return "Q6_K";
         case 7: return "Q5_1";
+        case 6: return "Q5_0";
         case 8: return "Q8_0";
         case 40: return "NVFP4";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 7 || t == 6 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
 // NVFP4 experts end in {s_gate, s_up, s_down, 0}: FP32 scales in 0.5 .. 2
 void append_nvfp4_tail(std::vector<uint8_t>& b, std::mt19937& rng) {
     std::uniform_real_distribution<float> u(0.5f, 2.0f);
@@ -98,6 +102,13 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
             // exponent's top bits in the last: 0x1 / 0x2 there (0x9 / 0xA negative) keeps it in 2^-11 .. 2^-3
             const uint8_t nib = (uint8_t) ((sgn(rng) ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
             w[o + 55] = (uint8_t) ((w[o + 55] & 0x0F) | (nib << 4));
+        } else if (t == 10 || t == 11) {
+            // Q2_K {d, dmin} at offset 80, Q3_K {d} at 108: the fp16 scales end the block, 2^-14 .. 2^-11
+            const size_t at = t == 10 ? 80 : 108;
+            for (int j = 0; j < (t == 10 ? 2 : 1); ++j) {
+                const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | ((1 + ex(rng) % 4) << 10) | man(rng));
+                std::memcpy(&w[o + at + 2 * j], &h, 2);
+            }
         } else if (t == 14) {
             // Q6_K: the fp16 scale ends the block (offset 208); the codes and the int8 sub-scales stay random
             const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | ((1 + ex(rng) % 4) << 10) | man(rng));
@@ -131,15 +142,20 @@ struct Setup {
     unsigned long long* ptr = nullptr;
     int32_t *start = nullptr, *n = nullptr, *dst = nullptr, *tok = nullptr;
 
+    // `up`: the up rows' format (-1: gu's)
     Setup(int gu, int dt, int64_t H, int64_t FF, int tokens, int k_per_token, int blobs_n, std::mt19937& rng,
-          cudaStream_t s) {
-        L = k::native_expert_layout(gu, dt, H, FF);
+          cudaStream_t s, int up = -1) {
+        L = k::native_expert_layout(gu, dt, H, FF, 0.0f, up);
         T = tokens; K = k_per_token; cap = T * K; n_blobs = blobs_n;
         slot = (L.bytes + 255) & ~(size_t) 255;
         blobs = dalloc<uint8_t>(slot * (size_t) n_blobs);
         for (int b = 0; b < n_blobs; ++b) {
-            // gate rows | up rows (format gu, H values each) | down rows (format dt, FF values each)
-            auto blob = random_rows(gu, 2 * FF, H, rng);
+            // gate rows | up rows (format gu, or up, H values each) | down rows (format dt, FF values each)
+            auto blob = random_rows(gu, up < 0 ? 2 * FF : FF, H, rng);
+            if (up >= 0) {
+                const auto u = random_rows(up, FF, H, rng);
+                blob.insert(blob.end(), u.begin(), u.end());
+            }
             const auto down = random_rows(dt, H, FF, rng);
             blob.insert(blob.end(), down.begin(), down.end());
             if (gu == 40) append_nvfp4_tail(blob, rng);
@@ -396,15 +412,15 @@ void bench(cudaStream_t s, std::mt19937& rng, const BenchOptions& bo) {
 // wrote, then times the 48 calls in a graph.  The launches cover n_ff 640 and the down formats IQ4_NL / Q2_0
 // (dec_moe_formats_ok); any other shape is refused.
 void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T, int pool, int rounds,
-                bool mess = false) {
+                bool mess = false, int up = -1) {
     const int64_t H = 2560;
-    if (!k::dec_moe_formats_ok(gu, dt, H, ff)) {
+    if (!k::dec_moe_formats_ok(gu, dt, H, ff, up)) {
         std::printf("glue %s/%s ff %d: not a shape the glue launches cover  FAIL\n", name_of(gu), name_of(dt), ff);
         ++g_fail;
         return;
     }
     const int KK = 10, NEXP = 256, NL = 48;
-    Setup S(gu, dt, H, ff, T, KK, pool, rng, s);
+    Setup S(gu, dt, H, ff, T, KK, pool, rng, s, up);
     std::vector<int32_t> ids((size_t) T * KK);
     {
         std::vector<int> ord(pool);
@@ -491,8 +507,9 @@ void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T
         for (int e = 0; e < P.counts[1]; ++e)
             for (int64_t c = 0; c < H; ++c) bad += h_out[(size_t) P.dst[e] * H + c] != h_ref[(size_t) P.dst[e] * H + c];
     }
-    std::printf("glue %s/%s T %d pool %d (%d groups): rows vs native_expert_grouped: %s (%zu differ)\n", name_of(gu),
-                name_of(dt), T, pool, ngroups, bad ? "FAIL" : "bitwise equal", bad);
+    std::printf("glue %s%s%s/%s T %d pool %d (%d groups): rows vs native_expert_grouped: %s (%zu differ)\n", name_of(gu),
+                up >= 0 ? "+" : "", up >= 0 ? name_of(up) : "", name_of(dt), T, pool, ngroups, bad ? "FAIL" : "bitwise equal",
+                bad);
     g_fail += bad != 0;
     cudaGraph_t g;
     cudaGraphExec_t ge;
@@ -561,16 +578,21 @@ int main(int argc, char** argv) {
             glue_bench(s, rng, bo.gu, bo.down, bo.ff, glue_t, glue_pool, 60);
         } else {   // every format pair the launches cover, every window width
             for (int gu : {16, 17, 18, 21, 22, 42})
-                for (int dt : {20, 42})
+                for (int dt : {20, 42, 6})
                     for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, gu, dt, 640, T, glue_pool, 20);
             for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, 21, 20, 640, T, glue_pool, 20, true);   // odd ids
+            // a layer of IQ2_S gate with IQ2_XXS up (UD-IQ1_S)
+            for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, 22, 42, 640, T, glue_pool, 20, T == 5, 16);
         }
         std::printf("native_grouped_parity: %d failures\n", g_fail);
         return g_fail ? 1 : 0;
     }
-    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 14, 8})        // GU_FMTS
-        for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; IQ4_XS: n_ff % 256
+    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 10, 11, 12, 13, 14, 8})        // GU_FMTS
+        for (int dt : {20, 23, 42, 7, 6, 8, 10, 11, 18}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; 256-value blocks: n_ff % 256
     check(14, 8, 2560, 640, s, rng);                                    // Q6_K gate/up, a model's shape
+    for (int gu : {22, 18, 23}) check(gu, 6, 2560, 640, s, rng);        // Q5_0 down at a model's shape
+    for (int dt : {10, 11, 18, 22}) check(19, dt, 5120, 2304, s, rng);  // 5120 x 2304 experts: IQ1_S gate/up, K-quant / i-quant down
+    check(16, 10, 5120, 2304, s, rng);
     check(40, 40, 512, 256, s, rng);                                    // NVFP4: its own pair, with the scale tail
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(40, 40, 2560, 640, s, rng);
@@ -580,7 +602,7 @@ int main(int argc, char** argv) {
     {   // --gu2: the new launches take native_gu2_kernel (2560-value rows only), v1 the multi kernel
         if (gu2) {
             for (int gu : {16, 17, 18, 21, 22, 42})
-                for (int dt : {20, 42}) check(gu, dt, 2560, 640, s, rng, gu == 18 ? 8 : 6);
+                for (int dt : {20, 42, 6}) check(gu, dt, 2560, 640, s, rng, gu == 18 ? 8 : 6);
             check(22, 20, 2560, 512, s, rng, 3);
         }
     }

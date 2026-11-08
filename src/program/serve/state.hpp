@@ -109,7 +109,13 @@ public:
     virtual bool park_current(size_t held, int64_t kept) = 0;
     virtual bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) = 0;
     virtual void ckd_finish() {}
-    virtual void shed_if_low() = 0;
+    /// Once per drop below the RAM guard's floor, between steps: the parked conversations leave RAM (to the disk tier
+    /// when it is on and holds no copy of them yet, the others are dropped), the checkpoint blocks kept for reuse are
+    /// freed and the heap's free pages return to the OS. The checkpoints stay: a request may already resume from one.
+    void shed_if_low();
+    /// From READY on the RAM guard watches MemAvailable against the reserve (--ram-reserve-mib); with 0 it never
+    /// starts. The disk tier keeps a GiB above that floor either way.
+    void start_guard();
     virtual bool pipelined() const { return false; }   // batch groups pipelined through layer split stages
     virtual int64_t slot_context(int slot) const = 0;
     virtual bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) = 0;

@@ -148,6 +148,7 @@ class Router:
             self.cv.notify_all()
         for svc in self.services:
             svc.stop()
+        self.stop_telemetry()
 
     def vram(self, reserve_mib):
         """POST /v1/vram: the reserve is the machine's, so a model loaded later applies it too."""
@@ -159,12 +160,18 @@ class Router:
 
     def start_telemetry(self) -> None:
         """One hardware sampler over the cards of every model; the speeds are the shown model's."""
-        if getattr(self.front, "telemetry", None) is None:
+        current = getattr(self.front, "telemetry", None)
+        if current is None or current.stopped():
             from serve.util.telemetry import Telemetry
             cards = list(dict.fromkeys(i for svc in self.services for i in (getattr(svc, "gpu_indices", None) or [0])))
             sampler = Telemetry(extra=lambda: self.shown().telemetry_extra(), gpu_indices=cards)
             for svc in self.services:
                 svc.telemetry = sampler
+
+    def stop_telemetry(self) -> None:
+        sampler = getattr(self.front, "telemetry", None)
+        if sampler is not None:
+            sampler.stop()
 
     def _start_worker(self) -> None:
         if self.worker is None:
@@ -220,7 +227,7 @@ class Router:
         new.load_kind, new.loading = "weights", True    # the status routes show the load from now on
         if hasattr(new.engine, "load_status"):
             new.engine.load_status = {}
-        print(f"[server] swap: {old.model if old else '-'} -> {new.model}, {waiting} waiting", flush=True)
+        print(f"[server] {f'swap {old.model} ->' if old else 'loading'} {new.model} ({waiting} waiting)", flush=True)
         try:
             if old is not None:
                 old.swap_out()                          # at its QUIT the engine spills its conversations to disk
