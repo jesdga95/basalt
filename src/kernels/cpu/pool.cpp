@@ -273,12 +273,26 @@ void ExpertPool::drain(int id, uint32_t epoch) {
                 }
             } else {
                 const int k = (int) i - n * pg, e = k / pd, part = k % pd;
-                // every gate/up task is claimed before any down task, so this waits only for tasks already running
-                if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) wait_ready(e);
-                native_down_range(e, (int) nfmt_->n_embd * part / pd, (int) nfmt_->n_embd * (part + 1) / pd);
+                const int r0 = (int) nfmt_->n_embd * part / pd, r1 = (int) nfmt_->n_embd * (part + 1) / pd;
+                // every gate/up task is claimed before any down task, so this waits only for tasks already running;
+                // the wait would leave the memory bus idle, so it first pulls this part's down rows into the cache
+                if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) {
+                    prefetch_until_ready(e, mjobs_[e].blob + nfmt_->down_off + (size_t) r0 * nfmt_->d_row,
+                                         (size_t) (r1 - r0) * nfmt_->d_row);
+                    if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) wait_ready(e);
+                }
+                native_down_range(e, r0, r1);
             }
         }
         done_.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void ExpertPool::prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const {
+    // into L2 (a part is tens of KB, more than L1 holds), checking every 4 KB whether the wait is already over
+    for (size_t o = 0; o < bytes; o += 64) {
+        _mm_prefetch((const char*) p + o, _MM_HINT_T1);
+        if ((o & 4095) == 4032 && fused_[(size_t) e].ready.load(std::memory_order_relaxed) != 0) return;
     }
 }
 

@@ -138,6 +138,9 @@ private:
     /// quantization, and the down projection into the job's outputs.
     void native_gu_range(int e, int r0, int r1);
     void native_quantize(int e);
+    /// A down part that finds its expert's intermediate not yet quantized: prefetch its `bytes` of down rows at `p`
+    /// while the gate/up parts finish, stopping early once they have.
+    void prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const;
     void native_down_range(int e, int r0, int r1);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
