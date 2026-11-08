@@ -54,5 +54,8 @@ jobs:
             echo "Immutable message trigger did not reject mutation" >&2
             exit 1
           fi
+      - name: Reset disposable schema for sidecar-owned migration test
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
       - name: Thread HTTP E2E (real PostgreSQL, fake Basalt)
         run: python -m unittest discover -s crates/tests -p 'thread_http_e2e.py' -v
