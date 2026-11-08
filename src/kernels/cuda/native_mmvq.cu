@@ -1190,6 +1190,103 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
     }
 }
 
+// ---------------------------------------------------------------- Q6_K columns on short rows (exact layout)
+// With few blocks per row the exact layout's one-row block does little work per launch slot and its threads reload the
+// columns' q8_1 words for every row.  Here a block stages the columns once, per lane as {u0, u1, d8_0, d8_1} (the words
+// and scales Q6KTraits::apply reads), and each warp walks whole rows.  Lane L adds the blocks kbx = w + 4 i of each
+// reference warp w at iqs L in ascending kbx (that warp's sum), then the four sums in warp order (the partial[] fold),
+// then warp_sum: the exact layout's order, so every column is bitwise a single-column call's.
+constexpr int kStagedWarps = 8;
+constexpr int kStagedMaxBlocks = 8;   // blocks of 256 per row that take it
+constexpr int kStagedRowsPerSm = 16;  // and the fewest rows per SM
+constexpr int kStagedRowsPerWarp = 2;
+
+// Stage: block `block` of `n_blocks` stages the columns in `xs` and its warps take rows block * kStagedWarps + warp,
+// then n_blocks * kStagedWarps further on.
+template<int NCOLS>
+__device__ __forceinline__ void q6_k_staged_rows(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
+                                                 float* __restrict__ y, int n_in, int n_out, float4* xs, int block,
+                                                 int n_blocks) {
+    const int lane = int(threadIdx.x), warp = int(threadIdx.y);
+    const int nb = n_in / 256;
+    const int x_stride = n_in / Q8K;
+    for (int i = warp * WARP + lane; i < nb * NCOLS * WARP; i += kStagedWarps * WARP) {
+        const int L = i % WARP, j = (i / WARP) % NCOLS, kbx = i / (WARP * NCOLS);
+        const Q81Block* xb = x + std::size_t(j) * x_stride + kbx * 8 + 4 * (L / 16) + (L % 16) / 8;
+        xs[i] = make_float4(__int_as_float(reinterpret_cast<const int*>(xb[0].qs)[L % 8]),
+                            __int_as_float(reinterpret_cast<const int*>(xb[2].qs)[L % 8]), __low2float(xb[0].ds),
+                            __low2float(xb[2].ds));
+    }
+    __syncthreads();
+    for (int row = block * kStagedWarps + warp; row < n_out; row += n_blocks * kStagedWarps) {
+        const Q6KBlock* wr = w + std::size_t(row) * nb;
+        float acc[NCOLS][4];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int v = 0; v < 4; ++v) acc[j][v] = 0.0f;
+#pragma unroll
+        for (int kbx = 0; kbx < kStagedMaxBlocks; ++kbx) {
+            if (kbx < nb) {
+                const Q6KTraits::W wv = Q6KTraits::load(wr + kbx, lane);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    const float4 xv = xs[(kbx * NCOLS + j) * WARP + lane];
+                    const int u[2] = {__float_as_int(xv.x), __float_as_int(xv.y)};
+                    const float d8[2] = {xv.z, xv.w};
+                    acc[j][kbx % 4] += q6_q8_dot_impl(wv.vl, wv.vh, u, wv.scales, wv.d, d8);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            float t = acc[j][0];
+#pragma unroll
+            for (int v = 1; v < 4; ++v) t += acc[j][v];
+            t = warp_sum(t);
+            if (lane == 0) y[std::size_t(j) * n_out + row] = t;
+        }
+    }
+}
+
+template<int NCOLS>
+__launch_bounds__(kStagedWarps * WARP)
+__global__ void native_q6_k_staged_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
+                                          float* __restrict__ y, int n_in, int n_out) {
+    __shared__ float4 xs[kStagedMaxBlocks * NCOLS * WARP];
+    pdl_wait();
+    q6_k_staged_rows<NCOLS>(w, x, y, n_in, n_out, xs, int(blockIdx.x), int(gridDim.x));
+}
+
+// The device's SM count, per device.
+int device_sms() {
+    static int known[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    if (known[dev] == 0 && cudaDeviceGetAttribute(&known[dev], cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        known[dev] = -1;
+    }
+    return known[dev] > 0 ? known[dev] : 0;
+}
+
+// Rows shorter than kStagedMaxBlocks blocks, at least kStagedRowsPerSm per SM. Each warp takes kStagedRowsPerWarp rows:
+// the staging is shared by enough rows, and the blocks still end often enough for the kernels of the head's other
+// branches (a cluster launch needs several free slots at once) to start beside it.
+template<int NCOLS>
+bool launch_q6_k_staged(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
+    const int sms = device_sms();
+    if (n_in / 256 >= kStagedMaxBlocks || sms == 0 || n_out < kStagedRowsPerSm * sms) return false;
+    constexpr int kRowsPerBlock = kStagedWarps * kStagedRowsPerWarp;
+    launch_pdl(native_q6_k_staged_kernel<NCOLS>, dim3(unsigned((n_out + kRowsPerBlock - 1) / kRowsPerBlock)),
+               dim3(WARP, kStagedWarps), 0, s, static_cast<const Q6KBlock*>(weights),
+               static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out);
+    return true;
+}
+
 template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
@@ -1199,6 +1296,9 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
         launch_pdl(native_mmvq_multi_kernel<F, NCOLS, NW, 2>, dim3(blocks), dim3(WARP, NW), 0, s, w, x, y, n_in, n_out);
         return;
+    }
+    if constexpr (std::is_same_v<F, Q6KTraits>) {
+        if (launch_q6_k_staged<NCOLS>(weights, x_q8_1, y, n_in, n_out, s)) return;
     }
     const dim3 threads(WARP, WARPS);
     if (n_in / F::DIV < F::BPI) {
