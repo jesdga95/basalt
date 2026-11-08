@@ -206,7 +206,8 @@ private:
                   bool later = false);
     /// The least recently used free slot of the layer's main card share, or -1; `best` gets its last use.
     int32_t oldest_slot(int layer, bool homes_too, uint64_t& best) const;
-    /// Moves (layer, e) into the second card when the expert it replaces there was used before any on the main card.
+    /// Moves (layer, e) into the second card when the expert it replaces there was last used policy::kPeerMoveAge
+    /// lookups before the main card's oldest.
     bool move_to_peer(int layer, int e, const uint8_t* src);
 
     const DsModel& m_;

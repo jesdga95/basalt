@@ -11,6 +11,7 @@ constexpr int kAdmitWindow = 256;               // tokens within which a repeat 
 constexpr int kSwapsPerToken = 2;               // pinned-slot swaps started per token
 constexpr uint64_t kPieceBytes = 1ull << 20;    // largest single promotion copy
 constexpr int kPeerGapPieces = 3;               // second card exchange pieces per layer: about what one head leaves its bus
+constexpr uint64_t kPeerMoveAge = 1280;         // lookups (~32 windows) the second card's victim must be older than the main card's
 
 /// `last` is the token + 1 of the previous miss of an expert (0 = never); true when it falls within `window` tokens.
 inline bool repeat_miss(uint64_t last, uint64_t token, int window) {
