@@ -601,6 +601,34 @@ class Startup(unittest.TestCase):
         code, err = self.run_server({"models": [entry], "server": {"port": "abc"}})
         self.assertEqual(code, 2)
 
+    def test_model_files_are_checked_before_anything_loads(self):
+        d = Path(TMP.name)
+        fake_engine = d / "engine"
+        fake_engine.write_text("")
+        gone, gone2, folder = d / "gone.basalt", d / "gone2.basalt", d / "folder.basalt"
+        folder.mkdir(exist_ok=True)
+        eng = ["--engine-bin", str(fake_engine)]
+        code, err = self.run_server({"models": [{"model": str(gone), "alias": "Big One"}]}, *eng)
+        self.assertEqual(code, 2)
+        self.assertIn(f"[server] error: model 'Big One': file not found: {gone} (the \"model\" key in ", err)
+        self.assertNotIn("Errno", err)
+        code, err = self.run_server({"models": [{"model": str(gone)}, {"model": str(folder)}, {"model": str(gone2)}]}, *eng)
+        self.assertEqual(code, 2)
+        lines = [x for x in err.splitlines() if x.startswith("[server] error:")]
+        self.assertEqual(len(lines), 3)
+        self.assertIn(f"models[0]: file not found: {gone} ", lines[0])
+        self.assertIn(f"models[1]: {folder} is a directory", lines[1])
+        self.assertIn(f"models[2]: file not found: {gone2} ", lines[2])
+        self.assertNotIn("Errno", err)
+
+    def test_model_file_of_the_command_line(self):
+        gone = Path(TMP.name) / "gone.basalt"
+        r = subprocess.run([sys.executable, "-m", "serve.server", "--model", str(gone), "--engine-bin", sys.executable,
+                            "--port", str(free_port())], cwd=ROOT, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(f"[server] error: model: file not found: {gone} (--model)", r.stderr)
+        self.assertNotIn("Errno", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
