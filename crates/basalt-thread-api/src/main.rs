@@ -7,6 +7,7 @@ use axum::{
 use basalt_thread_store::{accept_turn, commit_turn, history, request_hash, LedgerError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use uuid::Uuid;
@@ -143,6 +144,12 @@ async fn run_turn(
         return Ok((StatusCode::ACCEPTED,Json(json!({
             "turn_id":accepted.turn_id,"status":accepted.status,"replayed":true}))));
     }
+    let model_row=sqlx::query("SELECT model_id FROM threads WHERE id=$1 AND owner_id=$2")
+       .bind(tid).bind(app.owner).fetch_one(&app.pool).await.map_err(db_error)?;
+    let model:String=model_row.try_get("model_id").map_err(db_error)?;
+    // This is a stable run label, NOT a verified model/weights/cache fingerprint.
+    // No cache reuse is authorized by this value until the engine publishes its digest.
+    let model_label: [u8;32] = Sha256::digest(model.as_bytes()).into();
     let run_id=Uuid::new_v4();
     // Queue and claim in one transaction. A future scheduler can replace this
     // synchronous runner without changing accepted-turn/idempotency semantics.
@@ -154,13 +161,10 @@ async fn run_turn(
     sqlx::query(
         "INSERT INTO runs(id,turn_id,attempt,state,lease_token,model_fingerprint,started_at,lease_expires_at)
          VALUES($1,$2,1,'RUNNING',$3,$4,clock_timestamp(),clock_timestamp()+interval '1 hour')")
-        .bind(run_id).bind(accepted.turn_id).bind(token).bind([0u8;32].as_slice())
+        .bind(run_id).bind(accepted.turn_id).bind(token).bind(model_label.as_slice())
         .execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
 
-    let model_row=sqlx::query("SELECT model_id FROM threads WHERE id=$1 AND owner_id=$2")
-       .bind(tid).bind(app.owner).fetch_one(&app.pool).await.map_err(db_error)?;
-    let model:String=model_row.try_get("model_id").map_err(db_error)?;
     let mut messages=match req.parent_message_id {
        Some(head)=>history(&app.pool,app.owner,tid,head,100_000).await
            .map_err(ledger_error)?.into_iter().map(|(_,role,content)|json!({"role":role,"content":content}))
@@ -176,8 +180,11 @@ async fn run_turn(
        Ok(x) if x.status().is_success()=>x.json::<Value>().await.ok(),
        _=>None,
     };
+    // The first synchronous slice intentionally accepts only plain text output.
+    // Do not silently discard tool calls or reasoning payloads.
     let reply=result.as_ref().and_then(|v|v.pointer("/choices/0/message"))
-      .cloned();
+      .filter(|m|m.get("tool_calls").is_none() && m.get("reasoning_content").is_none())
+      .and_then(|m|m.get("content")).filter(|v|v.is_string()).cloned();
     let Some(reply)=reply else {
         sqlx::query("UPDATE turns SET status='RECOVERABLE' WHERE id=$1 AND status='RUNNING'")
             .bind(accepted.turn_id).execute(&app.pool).await.map_err(db_error)?;
