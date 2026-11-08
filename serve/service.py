@@ -617,6 +617,9 @@ class Service:
                 "elapsed_s": round(time.time() - s["started"], 1) if busy and s.get("started") else None,
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if busy else None}
+        if getattr(self.engine, "native_slot_metrics", False):
+            live["native_slots"] = self.engine.native_slots_view()
+            live["native_slot_source"] = "engine BT/BDONE protocol"
         engine = {"model": self.model, "max_context": self.engine.max_context,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
