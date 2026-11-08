@@ -65,8 +65,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - `--vram-reserve-mib` below 256 is refused on Windows and WSL2 (128 on Linux): less free VRAM makes the driver page GPU memory.
 - `--ram-reserve-mib` (default 2048) is the RAM left free for the rest of the system. The engine allocates its host buffers
   first, or holds their RAM when it page-locks them later; the expert tiers then take the free RAM less the reserve and less
-  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). Programs left idle beside a small reserve
-  may be swapped out.
+  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). When some experts stay in the file, the
+  tiers also leave the OS file cache they are read through a floor: one prompt chunk's file reads and two layers' share of
+  those experts, at least 4 GiB. Programs left idle beside a small reserve may be swapped out.
 - While serving, the RAM guard holds the reserve: below it, it parks conversations to disk or drops them. A request waits up to 30 s
   for RAM to return. A running request stops with an error only when RAM is critical (under 1 GiB free, or below the reserve under
   memory pressure). `--ram-reserve-mib 0` turns the guard off.
