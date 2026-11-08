@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "context.hpp"
 
 namespace basalt::program::generate {
@@ -298,7 +299,7 @@ int prompt_split(Context& context) {
             basalt::core::NativeDense::set_layer_range(-1, -1);
         }
         ok = ok && cudaDeviceSynchronize() == cudaSuccess &&   // (the uploads ran on their own streams)
-             cudaHostAlloc((void**) &st.image, st.image_bytes, cudaHostAllocPortable) == cudaSuccess &&
+             basalt::core::allocate_pinned_host((void**) &st.image, st.image_bytes, cudaHostAllocPortable) == cudaSuccess &&
              cudaMemcpy(st.image, w_at, st.image_bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
         std::string ge;
         if (!(st.tier->give_back(st.lent, ge) && st.tier->give_back_wait(st.lent, ge))) {
@@ -311,7 +312,7 @@ int prompt_split(Context& context) {
                               err.empty() ? "no memory" : err.c_str());
             err.clear();
             for (auto& x : pstages)
-                if (x->image != nullptr) cudaFreeHost(x->image);
+                if (x->image != nullptr) basalt::core::release_pinned_host(x->image);
             pstages.clear();
             split_stages = 0;
         }
