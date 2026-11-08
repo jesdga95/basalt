@@ -1,4 +1,5 @@
 // src/core/peer_experts.cpp - see include/basalt/core/peer_experts.hpp.
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/peer_experts.hpp"
 
@@ -67,9 +68,9 @@ void PeerExperts::close() {
         if (d_meta_) cudaFree(d_meta_);
         if (d_q8_) cudaFree(d_q8_);
         if (d_scratch_) cudaFree(d_scratch_);
-        if (h_x_) cudaFreeHost(h_x_);
-        if (h_out_) cudaFreeHost(h_out_);
-        if (h_meta_) cudaFreeHost(h_meta_);
+        if (h_x_) basalt::core::release_pinned_host(h_x_);
+        if (h_out_) basalt::core::release_pinned_host(h_out_);
+        if (h_meta_) basalt::core::release_pinned_host(h_meta_);
         if (refill_ev_) cudaEventDestroy(refill_ev_);
         if (evict_ev_) cudaEventDestroy(evict_ev_);
         if (stream_) cudaStreamDestroy(stream_);
@@ -156,9 +157,9 @@ bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "refill stream", err) &&
         ck(cudaEventCreateWithFlags(&refill_ev_, cudaEventDisableTiming), "event", err) &&
         ck(cudaEventCreateWithFlags(&evict_ev_, cudaEventDisableTiming), "event", err) &&
-        ck(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
-        ck(cudaHostAlloc((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
-        ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
+        ck(basalt::core::allocate_pinned_host((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
+        ck(basalt::core::allocate_pinned_host((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
+        ck(basalt::core::allocate_pinned_host(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
         ck(cudaMalloc((void**) &d_x_, (size_t) CAP * H * sizeof(float)), "input", err) &&
         ck(cudaMalloc((void**) &d_out_, (size_t) CAP * H * sizeof(float)), "result", err) &&
         ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
