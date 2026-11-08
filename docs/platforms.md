@@ -15,7 +15,8 @@ Each release carries `basalt-vX.Y.Z-linux-x64.tar.gz` and `basalt-vX.Y.Z-windows
 `basalt-probe`, `basalt-vision`), `serve/`, `tools/` (what the server imports), `data/`, `docs/`, `requirements.txt` and the licences.
 They hold no CUDA libraries and no Python environment. Needs:
 
-- An NVIDIA driver for CUDA 13.0: 580.65.06 or newer on Linux, 580.88 or newer on Windows.
+- An NVIDIA driver of the R580 branch or newer. The archives are built with CUDA 13.0.2, whose Linux minimum is 580.95.05; NVIDIA
+  publishes no Windows minimum since 13.0, so use a current driver there.
 - The CUDA 13 runtime libraries (cudart, cuBLAS) on the library path (`PATH` on Windows).
 - Python 3.10+ with the requirements in a `.venv` at the archive's top directory, which `bin/basalt serve` uses when it is there:
 
