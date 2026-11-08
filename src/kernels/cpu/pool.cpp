@@ -265,7 +265,7 @@ void ExpertPool::drain(int id, uint32_t epoch) {
             const int n = fused_n_, pg = fused_gu_parts_, pd = fused_d_parts_;
             if ((int) i < n * pg) {
                 const int e = (int) i / pg, part = (int) i % pg;
-                native_gu_range(e, (int) nfmt_->n_ff * part / pg, (int) nfmt_->n_ff * (part + 1) / pg);
+                native_gu_range(e, part_row(part, pg, (int) nfmt_->n_ff), part_row(part + 1, pg, (int) nfmt_->n_ff));
                 FusedExpert& fe = fused_[(size_t) e];
                 if (fe.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     native_quantize(e);
@@ -273,7 +273,7 @@ void ExpertPool::drain(int id, uint32_t epoch) {
                 }
             } else {
                 const int k = (int) i - n * pg, e = k / pd, part = k % pd;
-                const int r0 = (int) nfmt_->n_embd * part / pd, r1 = (int) nfmt_->n_embd * (part + 1) / pd;
+                const int r0 = part_row(part, pd, (int) nfmt_->n_embd), r1 = part_row(part + 1, pd, (int) nfmt_->n_embd);
                 // every gate/up task is claimed before any down task, so this waits only for tasks already running;
                 // the wait would leave the memory bus idle, so it first pulls this part's down rows into the cache
                 if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) {
@@ -286,6 +286,14 @@ void ExpertPool::drain(int id, uint32_t epoch) {
         }
         done_.fetch_add(1, std::memory_order_release);
     }
+}
+
+int ExpertPool::part_row(int part, int parts, int rows) const {
+    // the last fused_tail_ parts are a quarter of the others: the threads that finish early pick up short tasks, so
+    // the wait for the slowest one before the down rows, and at the end of the layer, is a quarter of a task
+    const int small = (std::min)(fused_tail_, parts / 2), big = parts - small;
+    const int64_t units = 4 * (int64_t) (std::min)(part, big) + (std::max)(0, part - big);
+    return (int) ((int64_t) rows * units / (4 * (int64_t) big + small));
 }
 
 void ExpertPool::prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const {
@@ -400,6 +408,7 @@ int ExpertPool::split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int 
     // The share of tasks follows the share of bytes of the two projections.
     gu_share = (double) f.down_off / (double) (f.down_off + f.d_row * (size_t) f.n_embd);
     fused_n_ = nb;
+    fused_tail_ = threads;
     fused_gu_parts_ = (std::min)((int) f.n_ff, (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb)));
     fused_d_parts_ = (std::min)((int) f.n_embd, (std::max)(1, (int) std::lround(kTasksPerThread * threads * (1.0 - gu_share) / nb)));
     for (int e = 0; e < nb; ++e) {

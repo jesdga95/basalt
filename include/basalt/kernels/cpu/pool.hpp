@@ -206,7 +206,10 @@ private:
         std::atomic<int> ready{0};
     };
     std::unique_ptr<FusedExpert[]> fused_;
-    int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1;
+    int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1, fused_tail_ = 1;
+    /// The first row of `part` of `parts` over `rows` rows (`part == parts` gives `rows`): equal parts, then
+    /// `fused_tail_` quarter-size ones.
+    int part_row(int part, int parts, int rows) const;
     /// Sets up one batch of at most kMaxSplitMulti experts: its parts per expert; the tasks it makes and the gate/up
     /// share of its bytes.
     int split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int n, double& gu_share);
