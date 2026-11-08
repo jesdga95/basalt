@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/remote_experts.hpp"
 #include "basalt/core/remote_expert_opt.hpp"
@@ -97,9 +98,9 @@ void RemoteExperts::close() {
         if (d_scales_) cudaFree(d_scales_);
         if (d_scratch_) cudaFree(d_scratch_);
         if (d_meta_) cudaFree(d_meta_);
-        if (h_x_) cudaFreeHost(h_x_);
-        if (h_out_) cudaFreeHost(h_out_);
-        if (h_meta_) cudaFreeHost(h_meta_);
+        if (h_x_) basalt::core::release_pinned_host(h_x_);
+        if (h_out_) basalt::core::release_pinned_host(h_out_);
+        if (h_meta_) basalt::core::release_pinned_host(h_meta_);
         if (stream_) cudaStreamDestroy(stream_);
     }
     device_ = -1;
@@ -199,9 +200,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     const size_t meta_bytes = sizeof(RemoteMeta) + (remote_opt_ ? remote_opt_->metadata_bytes() : 0);
     const bool allocated =
         check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err, device) &&
-        check(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err, device) &&
-        check(cudaHostAlloc((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err, device) &&
-        check(cudaHostAlloc(&h_meta_, meta_bytes, cudaHostAllocPortable), "metadata staging", err, device) &&
+        check(basalt::core::allocate_pinned_host((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err, device) &&
+        check(basalt::core::allocate_pinned_host((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err, device) &&
+        check(basalt::core::allocate_pinned_host(&h_meta_, meta_bytes, cudaHostAllocPortable), "metadata staging", err, device) &&
         check(cudaMalloc((void**) &d_x_, (size_t) CAP * H * sizeof(float)), "input", err, device) &&
         check(cudaMalloc((void**) &d_out_, (size_t) CAP * H * sizeof(float)), "result", err, device) &&
         check(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activation", err, device) &&
