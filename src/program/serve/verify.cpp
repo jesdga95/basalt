@@ -1,4 +1,5 @@
 // src/program/serve/verify.cpp - verify operations for the persistent engine.
+#include "basalt/core/host_pool.hpp"
 #include "state.hpp"
 
 namespace basalt::program::serve {
@@ -40,7 +41,7 @@ int Runtime::init_verify() {
         std::vector<float*> hand((size_t) n_stages - 1, nullptr);
         for (float*& h : hand) {
             float* hh = nullptr;
-            if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            if (basalt::core::allocate_pinned_host((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
                 cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
                 basalt::log::error("basalt serve", "the layer-split hand-off allocation failed");
                 return 1;
@@ -89,7 +90,7 @@ int Runtime::init_verify() {
             GpuStage& gs = *stages[0];
             float* hb_host = nullptr;
             float* hand_b = nullptr;
-            if (cudaHostAlloc((void**) &hb_host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            if (basalt::core::allocate_pinned_host((void**) &hb_host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
                 cudaHostGetDevicePointer((void**) &hand_b, hb_host, 0) != cudaSuccess ||
                 cudaMalloc(&pair_snap, basalt::core::Verifier::pair_snapshot_bytes(g, ss, 0, split_at[0])) != cudaSuccess) {
                 basalt::log::error("basalt serve", "the pipelined windows' buffers failed");
