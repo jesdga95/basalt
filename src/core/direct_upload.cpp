@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/direct_upload.hpp"
 
 #include "basalt/platform/file.hpp"
@@ -27,7 +28,7 @@ struct DirectUploader::Impl {
     bool init(std::string& err) {
         if (ready) return true;
         for (int i = 0; i < 2; ++i)
-            if (cudaHostAlloc((void**) &buf[i], kChunk + 2 * kAlign, cudaHostAllocPortable) != cudaSuccess ||
+            if (basalt::core::allocate_pinned_host((void**) &buf[i], kChunk + 2 * kAlign, cudaHostAllocPortable) != cudaSuccess ||
                 cudaEventCreateWithFlags(&done[i], cudaEventDisableTiming) != cudaSuccess) {
                 (void) cudaGetLastError();
                 err = "cannot allocate the staging buffers for the file reads";
@@ -88,7 +89,7 @@ DirectUploader::~DirectUploader() {
     Impl& m = *impl_;
     if (m.ready) cudaStreamSynchronize(m.stream);
     for (int i = 0; i < 2; ++i) {
-        if (m.buf[i]) cudaFreeHost(m.buf[i]);
+        if (m.buf[i]) basalt::core::release_pinned_host(m.buf[i]);
         if (m.done[i]) cudaEventDestroy(m.done[i]);
     }
     if (m.stream) cudaStreamDestroy(m.stream);
