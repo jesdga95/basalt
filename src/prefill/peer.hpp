@@ -1,5 +1,6 @@
 #pragma once
 
+#include "basalt/core/host_pool.hpp"
 #include "common.hpp"
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/mtp.hpp"
@@ -101,8 +102,8 @@ struct PeerPrefill {
         for (cudaEvent_t e : {ev_hx, ev_res}) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : ev_h2d) if (e) cudaEventDestroy(e);
         if (ev_in) cudaEventDestroy(ev_in);
-        if (hx) cudaFreeHost(hx);
-        for (float* h : hres) if (h) cudaFreeHost(h);
+        if (hx) basalt::core::release_pinned_host(hx);
+        for (float* h : hres) if (h) basalt::core::release_pinned_host(h);
         cudaSetDevice(prev);
     }
 };
@@ -131,7 +132,7 @@ struct PeerStage {
         dev = peer_dev;
         bytes = blob_bytes;
         for (int i = 0; i < kBufs; ++i)
-            if (cudaHostAlloc((void**) &buf[i], bytes, cudaHostAllocDefault) != cudaSuccess) { cudaGetLastError(); release(); return false; }
+            if (basalt::core::allocate_pinned_host((void**) &buf[i], bytes, cudaHostAllocDefault) != cudaSuccess) { cudaGetLastError(); release(); return false; }
         // h2d is recorded on the primary's copy stream, so it belongs to the current (primary) device; the rest to the peer
         for (int i = 0; i < kBufs; ++i)
             if (cudaEventCreateWithFlags(&h2d[i], cudaEventDisableTiming) != cudaSuccess) { release(); return false; }
@@ -158,7 +159,7 @@ struct PeerStage {
     void release() {
         ok = false;
         for (int i = 0; i < kBufs; ++i) {
-            if (buf[i]) cudaFreeHost(buf[i]);
+            if (buf[i]) basalt::core::release_pinned_host(buf[i]);
             buf[i] = nullptr;
             if (d2h[i]) cudaEventDestroy(d2h[i]);
             if (h2d[i]) cudaEventDestroy(h2d[i]);
