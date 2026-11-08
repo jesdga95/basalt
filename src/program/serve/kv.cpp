@@ -106,6 +106,7 @@ bool Runtime::cache_regrow(std::string& e) {
                !(peer.valid() && peer.has(l, ex));
     };
     std::vector<std::pair<int32_t, int32_t>> keep_out;
+    std::vector<int32_t> picked;
     std::string ferr;
     for (const auto& [i, slot] : vram_evicted) {
         if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
@@ -128,11 +129,29 @@ bool Runtime::cache_regrow(std::string& e) {
             return false;
         }
         host_res[(size_t) pick] = slot;
+        picked.push_back((int32_t) pick);
     }
     vram_evicted.swap(keep_out);
     if (!xcache.sync_queued(ferr)) { e = "elastic KV: " + ferr; return false; }
     res_upload();
     relend();
+    if (srcp == &src && src.complement_ready()) {
+        const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
+        const int64_t keep_ram_from = std::min<int64_t>(loan_from, xcache.full_slots() - src.resident_lent_slots());
+        size_t released = 0;
+        for (int32_t j : picked)
+            if (host_res[(size_t) j] >= 0 && host_res[(size_t) j] < keep_ram_from &&
+                src.spare_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
+                ++released;
+        for (size_t j = 0; j < host_res.size(); ++j)
+            if (host_res[j] >= 0 && host_res[j] < keep_ram_from &&
+                src.spare_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
+                ++released;
+        const uint64_t freed = src.homes_reclaim() + src.homes_compact();
+        if (released > 0 || freed > 0)
+            basalt::log::info("basalt serve", "elastic KV: %zu RAM homes released (%.0f MiB freed, %.0f MiB held)",
+                              released, (double) freed / 1048576.0, (double) src.homes_bytes() / 1048576.0);
+    }
     return true;
 }
 
@@ -205,8 +224,13 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
         // whole tail segments: everything from the first one at or past `keep` goes
         const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
         const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
-        if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
-        if (!xcache.shrink(keep, e)) return false;
+        const int64_t next_slots = xcache.slots_after_shrink(keep);
+        if (kv_keep_routed && !move_routed_below(next_slots, "elastic KV", e)) return false;
+        if (srcp == &src && src.complement_ready() && !home_slots_from(next_slots, e)) {
+            e = "elastic KV: " + e;
+            return false;
+        }
+        const bool shrunk = xcache.shrink(keep, e);
         const int64_t live = xcache.slots();
         for (size_t i = 0; i < host_res.size(); ++i)
             if (host_res[i] >= live) {
@@ -215,6 +239,7 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
             }
         res_upload();
         relend();
+        if (!shrunk) return false;
     }
     if (!basalt::core::session_kv_map(s, cells, e)) { e = "elastic KV: " + e; return false; }
     if (parked > 0 && !cache_regrow(e)) return false;   // the rest of what they held is the cache's again
