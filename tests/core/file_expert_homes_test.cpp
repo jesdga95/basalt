@@ -65,6 +65,7 @@ int run() {
     require(basalt::kernels::cpu::expert_layout_load_text(text.str(), layers, experts, err), err);
 
     FileExpertSource src;
+    src.set_spares(8);
     require(src.open(FileRange((dir.path / "experts.bin").string()), layers, experts, err), err);
     ExpertCache cache;
     require(cache.open_sized(std::vector<int64_t>((size_t) (layers * held), (int64_t) blob), layers, experts, err), err);
@@ -107,9 +108,21 @@ int run() {
         else require(src.home_release(give[k].first, give[k].second), "home_release");
     }
     const uint64_t returned = src.homes_reclaim();
+    require(src.spares_free() >= 8, "homes_reclaim preserved adaptive swap spares while homes are active");
     require(returned > 0 && src.homes_bytes() + returned == homed, "a region with no expert was not returned");
     homed -= returned;
     require(src.homes_bytes() > (96ull << 20), "regions with a survivor were freed");
+
+    // an adaptive swap moves a homed survivor onto the GPU and evicts a GPU expert into a spare place
+    {
+        uint64_t off = 0;
+        uint8_t* sp = src.spare_take(keep[0].first, off);
+        require(sp != nullptr, "spare_take while homes held");
+        std::copy(src.blob(0, 2), src.blob(0, 2) + blob, sp);
+        require(src.spare_land(0, 2, off), "spare_land evicted GPU expert");
+        require(src.spare_release(keep[0].first, keep[0].second), "spare_release homed expert moved to GPU");
+        keep[0] = {0, 2};
+    }
 
     // an exchange in flight: no new take, no compaction
     std::copy(out_blob.begin(), out_blob.end(), src.exchange_buffer(1));
@@ -122,21 +135,32 @@ int run() {
     // the exchange table is allocated and stays so: compaction still runs and frees the sparse regions
     const uint64_t freed = src.homes_compact();
     require(freed == homed && src.homes_bytes() == keep.size() * blob, "compaction after an adaptive swap kept more than the survivors");
+    require(src.spares_free() == 8, "homes_compact preserved all 8 adaptive swap spares");
     for (const auto& [l, e] : keep)
         require(src.has_resident(l, e) && src.equals_file(l, e, src.blob(l, e)), "a survivor lost its bytes");
-    for (size_t k = 0; k < give.size(); ++k)
-        if (k % 20 != 0) require(!src.has_resident(give[k].first, give[k].second), "a released expert still has a place");
+    for (size_t k = 0; k < give.size(); ++k) {
+        const bool kept = (give[k] == keep[0]) || (k > 0 && k % 20 == 0);
+        if (!kept) require(!src.has_resident(give[k].first, give[k].second), "a released expert still has a place");
+    }
 
     // the RAM reserve counts against the budget
     src.set_homes_reserve(~0ull >> 1);
     const uint64_t kept_bytes = src.homes_bytes();
-    require(!src.homes_take({{0, 2}}, err, none) && !err.empty() && src.homes_bytes() == kept_bytes,
+    require(!src.homes_take({{0, 3}}, err, none) && !err.empty() && src.homes_bytes() == kept_bytes,
             "a take that leaves less than the reserve free was accepted");
     src.set_homes_reserve(0);
     const uint64_t before = src.homes_bytes();
-    require(src.homes_take({{0, 2}}, err, none), "take after the reserve is lifted: " + err);
+    require(src.homes_take({{0, 3}}, err, none), "take after the reserve is lifted: " + err);
     src.homes_abort();
-    require(src.homes_bytes() == before && !src.has_resident(0, 2), "an aborted take left a region or a place");
+    require(src.homes_bytes() == before && !src.has_resident(0, 3), "an aborted take left a region or a place");
+
+    // when permanent places free up (refilling a regrown cache after adaptive swaps), homes_reclaim moves survivors back
+    for (size_t k = 0; k < keep.size(); ++k)
+        require(src.spare_release(0, 70 + (int64_t) k), "spare_release for regrow replacement");
+    require(src.homes_reclaim() == before && src.homes_bytes() == 0, "survivors moved into freed permanent places");
+    require(src.spares_free() == 8, "homes_reclaim after regrow preserved all 8 adaptive swap spares");
+    for (const auto& [l, e] : keep)
+        require(src.has_resident(l, e) && src.equals_file(l, e, src.blob(l, e)), "evacuated survivor kept its bytes");
     return 0;
 }
 
