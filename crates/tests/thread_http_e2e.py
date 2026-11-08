@@ -72,7 +72,7 @@ class ThreadHTTP(unittest.TestCase):
             with urllib.request.urlopen(req,timeout=30) as res:
                 return res.status,json.loads(res.read())
         except urllib.error.HTTPError as e:
-            return e.code,json.loads(e.read())
+            return e.code,json.loads(e.read() or b'{}')
 
     def test_create_resume_idempotency_and_conflict(self):
         code,t=self.call("POST","/v1/threads",{"model":"fake-model"})
