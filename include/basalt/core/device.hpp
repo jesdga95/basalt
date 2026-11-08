@@ -50,6 +50,10 @@ struct DeviceRates {
 };
 DeviceRates device_rates(int ordinal);
 
+// The free and total memory of `ordinal`'s card (negative: the current one). On failure `why` names the call, the error
+// and the card: "cudaMemGetInfo: out of memory (code 2), device 0 of 2".
+bool device_memory(int ordinal, uint64_t& free_bytes, uint64_t& total_bytes, std::string& why);
+
 // Pinned host-to-device copy speed of the device in GB/s: the best of several 256 MiB copies. 0 when the copy could not
 // be set up or timed. Uses the device briefly and frees everything before it returns.
 double device_h2d_gbps(int ordinal);

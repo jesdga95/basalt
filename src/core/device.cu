@@ -91,6 +91,40 @@ DeviceRates device_rates(int ordinal) {
     return r;
 }
 
+namespace {
+
+std::string device_fault(const char* call, cudaError_t e, int ordinal) {
+    return std::string(call) + ": " + cudaGetErrorString(e) + " (code " + std::to_string((int) e) + "), device " +
+           std::to_string(ordinal) + " of " + std::to_string(device_count());
+}
+
+}  // namespace
+
+bool device_memory(int ordinal, uint64_t& free_bytes, uint64_t& total_bytes, std::string& why) {
+    int prev = 0;
+    cudaError_t e = cudaGetDevice(&prev);
+    const int at = ordinal < 0 ? prev : ordinal;
+    const char* call = "cudaGetDevice";
+    if (e == cudaSuccess && ordinal >= 0 && ordinal != prev) {
+        call = "cudaSetDevice";
+        e = cudaSetDevice(ordinal);
+    }
+    size_t f = 0, t = 0;
+    if (e == cudaSuccess) {
+        call = "cudaMemGetInfo";
+        e = cudaMemGetInfo(&f, &t);
+        if (ordinal >= 0 && ordinal != prev) cudaSetDevice(prev);
+    }
+    if (e != cudaSuccess) {
+        why = device_fault(call, e, at);
+        cudaGetLastError();
+        return false;
+    }
+    free_bytes = f;
+    total_bytes = t;
+    return true;
+}
+
 double device_h2d_gbps(int ordinal) {
     constexpr size_t kBytes = 256ull << 20;
     constexpr int kCopies = 6;
