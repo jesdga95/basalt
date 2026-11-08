@@ -21,8 +21,10 @@ std::optional<int> start(int argc, char** argv, Options& o, std::string& ppl_bas
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
-    // if memory runs out the kernel ends this process first, not the rest of the machine
-    basalt::platform::prefer_oom_victim();
+    if (!basalt::platform::use_normal_oom_priority()) {
+        basalt::log::error("basalt", "cannot restore normal OOM priority");
+        return 2;
+    }
     // the CPU expert pool keeps its speed while the window is in the background
     if (!basalt::platform::keep_full_speed())
         basalt::log::warn("basalt", "full-speed scheduling refused: decode slows while the window is in the background");
