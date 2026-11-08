@@ -2,6 +2,7 @@
 // The ledger is authoritative: tapes are disposable and must be reattached after restart.
 #pragma once
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <string>
