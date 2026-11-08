@@ -82,6 +82,33 @@ void Runtime::enc_command(const std::string& cmd) {
         return r;
     };
     int64_t room = lendable();
+    std::vector<std::pair<int32_t, int32_t>> image_homes;
+    auto make_image_homes = [&]() -> bool {
+        if (k <= room || k <= 0 || k > p.cache->slots() || (batch_on() && k > kLendCapDecoding) ||
+            srcp != &src || !src.complement_ready())
+            return true;
+        uint64_t bytes = 0;
+        std::vector<std::pair<int32_t, int32_t>> needed;
+        for (size_t i = 0; i < host_res.size(); ++i) {
+            const int32_t l = (int32_t) (i / g.n_expert), ex = (int32_t) (i % g.n_expert);
+            if (host_res[i] >= p.cache->slots() - k && !src.has_resident(l, ex)) {
+                needed.emplace_back(l, ex);
+                bytes += basalt::kernels::cpu::expert_layout().blob_bytes(l);
+            }
+        }
+        if (needed.empty()) return true;
+        const uint64_t held = src.resident_bytes() + src.homes_bytes();
+        if (o.resident_budget > 0 && o.host_pool_bytes == 0 &&
+            (held > o.resident_budget || bytes > o.resident_budget - held)) {
+            reply_err("the image's temporary expert copies exceed the resident RAM budget");
+            return false;
+        }
+        if (!home_slots_from(p.cache->slots() - k, e)) { reply_err(e); return false; }
+        image_homes.insert(image_homes.end(), needed.begin(), needed.end());
+        room = lendable();
+        return true;
+    };
+    if (!make_image_homes()) return;
     // short of room: the elastic KV gives back the cells no session holds (idle slots first), and the cache
     // maps that VRAM again; the sessions take cells back on demand after the encode
     int64_t kv_given = 0;
@@ -90,6 +117,7 @@ void Runtime::enc_command(const std::string& cmd) {
         reply_err(e);
         return;
     }
+    if (!make_image_homes()) return;
     if (k <= 0 || k > room) {
         basalt::log::warn("basalt serve", "image encoder: refused, %lld cache slots needed, %lld lendable "
                              "(cache %lld slots, %lld KV cells given back, the rest held by the sessions)",
@@ -157,6 +185,15 @@ void Runtime::enc_command(const std::string& cmd) {
     p.lent_chunk = 0;
     p.first_now = -1;   // the prompt path lays its buffers out again at its next loan
     res_upload();
+    size_t released = 0;
+    for (const auto& [l, ex] : image_homes) {
+        const int32_t slot = host_res[(size_t) l * g.n_expert + (size_t) ex];
+        if (slot >= 0 && slot < p.first && src.spare_release(l, ex)) ++released;
+    }
+    const uint64_t freed = released == 0 ? 0 : src.homes_reclaim() + src.homes_compact();
+    if (released > 0 || freed > 0)
+        basalt::log::info("basalt serve", "image encoder: %zu temporary expert copies released (%.0f MiB freed)",
+                         released, (double) freed / 1048576.0);
     const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     basalt::log::info("basalt serve", "image encoder: %zu image(s) up to %d tokens in %lld cache slots (%.2f GiB), "
                          "%lld expert rows lent; decode %.0f ms, lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms",
