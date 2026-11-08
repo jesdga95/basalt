@@ -137,6 +137,40 @@ int main() {
         check(cache.evictions() == 1, "eviction counter");
     }
     {
+        ConversationCache cache(1 << 20, 3);
+        SavedConversation long_conv = image({});
+        long_conv.live.ids.assign(4096, 7);
+        check(cache.put(std::move(long_conv)), "park 4096-token conversation");
+        for (int i = 0; i < 6; ++i) {
+            check(cache.put(image({100, i})), "park short one-shot conversation");
+        }
+        std::vector<int32_t> long_query(4097, 7);
+        check(cache.best(long_query, {}, true).tokens == 4096,
+              "short one-shot conversations (< 4096 tokens) do not evict a >= 4096-token conversation");
+        for (int i = 0; i < 3; ++i) {
+            SavedConversation med_conv = image({});
+            med_conv.live.ids.assign(4096, 20 + i);
+            check(cache.put(std::move(med_conv)), "park another >= 4096-token conversation");
+        }
+        check(cache.best(long_query, {}, true).tokens == 0,
+              ">= 4096-token conversations evict older >= 4096-token conversations in FIFO order");
+        SavedConversation deep_conv = image({});
+        deep_conv.live.ids.assign(32768, 11);
+        check(cache.put(std::move(deep_conv)), "park 32768-token multi-turn conversation");
+        for (int i = 0; i < 6; ++i) {
+            SavedConversation med_conv = image({});
+            med_conv.live.ids.assign(8192, 40 + i);
+            check(cache.put(std::move(med_conv)), "park medium < 32768-token conversation");
+        }
+        std::vector<int32_t> deep_query(32769, 11);
+        check(cache.best(deep_query, {}, true).tokens == 32768,
+              "medium conversations (< 32768 tokens) do not evict a >= 32768-token conversation");
+        check(!cache.make_room(image({1, 2, 3}).bytes(), 0, 4096),
+              "max_victim_tokens=4096 refuses to evict >= 4096-token conversations");
+        check(cache.best(deep_query, {}, true).tokens == 32768,
+              "refused short make_room leaves >= 4096-token conversations untouched");
+    }
+    {
         auto s = image({1, 2, 3});
         ConversationCheckpoint cp;
         cp.ids = {1, 2};
