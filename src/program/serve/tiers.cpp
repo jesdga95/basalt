@@ -1,4 +1,5 @@
 // src/program/serve/tiers.cpp - tiers operations for the persistent engine.
+#include "basalt/core/host_pool.hpp"
 #include "state.hpp"
 
 namespace basalt::program::serve {
@@ -607,7 +608,7 @@ int Runtime::init_tiers() {
     xq_words = false;   // the round in flight writes the landed words
     xq_pin = nullptr;
     if (ver.landed_words() != nullptr &&
-        cudaHostAlloc((void**) &xq_pin, (size_t) kXqPinRounds * (size_t) (g.n_layers + 1) * 4, cudaHostAllocPortable) !=
+        basalt::core::allocate_pinned_host((void**) &xq_pin, (size_t) kXqPinRounds * (size_t) (g.n_layers + 1) * 4, cudaHostAllocPortable) !=
             cudaSuccess) {
         cudaGetLastError();
         xq_pin = nullptr;
