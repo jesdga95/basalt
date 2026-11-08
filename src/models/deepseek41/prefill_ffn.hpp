@@ -11,8 +11,21 @@ namespace basalt::models::deepseek41 {
 class DsModel;
 class LayerOps;
 
-/// h[r][k] = silu(min(gate, limit)) * clamp(up, -limit, limit) over gu[r][2 n_ff] (gate rows, then up rows).
-void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, float limit, void* stream);
+/// NVFP4 experts carry their matrices' FP32 scales in a 16-byte tail {s_gate, s_up, s_down, 0}: expert q of a launch at
+/// blobs + q * stride + tail_off (device, 4-byte aligned), its rows [bounds[q], bounds[q + 1]) of the launch (device,
+/// n + 1 entries).
+struct ExpertTails {
+    const uint8_t* blobs = nullptr;
+    size_t stride = 0, tail_off = 0;
+    const int32_t* bounds = nullptr;
+    int n = 0;
+};
+
+/// h[r][k] = silu(min(gate, limit)) * clamp(up, -limit, limit) over gu[r][2 n_ff] (gate rows, then up rows). With
+/// `tails`, gate and up are row r's expert's s_gate and s_up times the products first, and h is times its s_down, so the
+/// down product's output carries s_down.
+void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, float limit, void* stream,
+                          const ExpertTails* tails = nullptr);
 
 /// out[t][i] = sum_k w[t][k] * rows[map[t][k]][i], summed in k order.
 void weighted_sum_tokens(const float* rows, const int32_t* map, const float* w, int n_tokens, int n_rows, int n, float* out,

@@ -41,6 +41,19 @@ using prefillp::kStageExperts;
 constexpr int kReadThreads = 8;     // concurrent blob reads
 constexpr int kSharedRows = 1024;   // tokens per shared-expert sub-chunk
 constexpr int kCpuRows = 8;         // a RAM expert with this few rows in a short chunk may stay on the CPU
+constexpr int kNvfp4 = 40;          // ggml's NVFP4: its blob ends in the FP32 scale tail
+
+// The scale tails of a launch's experts staged `staged_stride` apart from `blobs` (none for a format without them).
+ExpertTails tails_of(const ExpertLayer& el, const uint8_t* blobs, const int32_t* bounds, int n) {
+    ExpertTails t;
+    if (el.gu_type != kNvfp4) return t;
+    t.blobs = blobs;
+    t.stride = staged_stride(el);
+    t.tail_off = el.blob_bytes - kernels::cpu::kNvfp4Tail;
+    t.bounds = bounds;
+    t.n = n;
+    return t;
+}
 
 class Impl final : public PrefillFfn {
 public:
@@ -249,7 +262,8 @@ public:
             p.dst = gu_;
             p.ld_dst = p.w_rows;
             ctx_.run(p, stream);
-            swiglu_split_clamped(gu_, h_, rows, g_.n_ff_exp, g_.clamp_exp[(size_t) il], stream);
+            const ExpertTails tails = tails_of(el, B.blobs, B.bounds, nb);
+            swiglu_split_clamped(gu_, h_, rows, g_.n_ff_exp, g_.clamp_exp[(size_t) il], stream, &tails);
             mmq::quantize(h_, nullptr, xq2_, el.d_type, g_.n_ff_exp, g_.n_ff_exp, rows, stream);
             mmq::Product d;
             d.w = B.blobs + L.down_off;
@@ -335,8 +349,9 @@ private:
         sl.d_stride = sl.stride;
         const int n_ff = g_.n_ff_exp;
         const float limit = g_.clamp_exp[(size_t) il];
-        sl.act = [n_ff, limit](const float* gu, float* h, const prefill::PeerShare::Launch& l, void* stream) {
-            swiglu_split_clamped(gu, h, l.rows, n_ff, limit, stream);
+        sl.act = [n_ff, limit, el](const float* gu, float* h, const prefill::PeerShare::Launch& l, void* stream) {
+            const ExpertTails tails = tails_of(el, l.stage + staged_stride(el) * (size_t) l.q0, l.bounds, l.n);
+            swiglu_split_clamped(gu, h, l.rows, n_ff, limit, stream, &tails);
         };
         return sl;
     }
@@ -765,7 +780,8 @@ private:
                     p.dst = gu_;
                     p.ld_dst = p.w_rows;
                     ctx_.run(p, st);
-                    swiglu_split_clamped(gu_, h_, rows, g_.n_ff_exp, g_.clamp_exp[(size_t) il], st);
+                    const ExpertTails tails = tails_of(el, blobs, bnd_, q1 - q0);
+                    swiglu_split_clamped(gu_, h_, rows, g_.n_ff_exp, g_.clamp_exp[(size_t) il], st, &tails);
                     mmq::quantize(h_, nullptr, xq2_, el.d_type, g_.n_ff_exp, g_.n_ff_exp, rows, st);
                     mmq::Product d;
                     d.w = blobs + L.down_off;
