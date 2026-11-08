@@ -285,8 +285,8 @@ bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, i
 }
 
 static const void* dm_peer_fn(bool q2, bool mix = false) {
-    if (mix) return q2 ? (const void*) dm_peer_kernel<true, true> : (const void*) dm_peer_kernel<false, true>;
-    return q2 ? (const void*) dm_peer_kernel<true, false> : (const void*) dm_peer_kernel<false, false>;
+    if (mix) return q2 ? dm_peer_fn_q1_m1() : dm_peer_fn_q0_m1();
+    return q2 ? dm_peer_fn_q1_m0() : dm_peer_fn_q0_m0();
 }
 
 int dec_moe_peer_blocks(bool q2) {
