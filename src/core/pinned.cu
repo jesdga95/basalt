@@ -1,4 +1,5 @@
 // src/core/pinned.cu - the pinned host arena and the parallel expert load.
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/pinned.hpp"
 #include "basalt/platform/file.hpp"
@@ -64,7 +65,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         const std::string cap_why = "by the engine (remote experts)";
         const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
         const cudaError_t e = capped ? cudaSuccess :
-            cudaHostRegister(base, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
+            basalt::core::register_host_memory(base, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
         if (!capped && e == cudaSuccess) {
             note = "cudaHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
@@ -89,7 +90,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
                 if (limited && (off > limit || n > limit - off)) break;
-                if (cudaHostRegister((uint8_t*) base + off, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+                if (basalt::core::register_host_memory((uint8_t*) base + off, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
                     (void) cudaGetLastError();
                     break;
                 }
@@ -138,9 +139,9 @@ PinnedArena::~PinnedArena() {
     if (base) {
         if (locked_bytes) basalt::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {
-            for (uint64_t off : slice_starts) cudaHostUnregister((uint8_t*) base + off);
+            for (uint64_t off : slice_starts) basalt::core::unregister_host_memory((uint8_t*) base + off);
         } else {
-            cudaHostUnregister(base);
+            basalt::core::unregister_host_memory(base);
         }
         basalt::platform::free_region(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);
         base = nullptr;
