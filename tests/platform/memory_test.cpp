@@ -569,9 +569,38 @@ uint64_t lock_test_bytes(bool& reduced) {
     return half >= 16 * page ? half : 0;
 #endif
 }
+int swapping_disabled_cases() {
+    using basalt::platform::swapping_disabled;
+#if defined(_WIN32)
+    return swapping_disabled("missing", "missing") ? 1 : 0;
+#else
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() /
+        ("basalt_swap_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto root = dir / "root", self = dir / "self";
+    fs::create_directories(root / "box");
+    auto put = [](const fs::path& path, const char* value) { std::ofstream(path) << value; };
+    put(self, "0::/box\n"); put(root / "memory.swap.max", "max\n");
+    put(root / "box/memory.swap.max", "0\n");
+    int fail = !swapping_disabled(self.string(), root.string());
+    put(root / "box/memory.swap.max", "max\n"); put(root / "memory.swap.max", "0\n");
+    fail |= !swapping_disabled(self.string(), root.string());
+    put(root / "memory.swap.max", "max\n");
+    fail |= swapping_disabled(self.string(), root.string());
+    put(root / "box/memory.swap.max", "invalid\n");
+    fail |= swapping_disabled(self.string(), root.string());
+    put(self, "0::/not-visible\n"); put(root / "memory.swap.max", "0\n");
+    fail |= !swapping_disabled(self.string(), root.string());
+    fail |= swapping_disabled((dir / "missing").string(), root.string());
+    fs::remove_all(dir);
+    std::printf("swapping_disabled: %s\n", fail ? "FAILED" : "OK");
+    return fail;
+#endif
+}
 }  // namespace
 
 int main() {
+    if (swapping_disabled_cases()) return 1;
     int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | drop_view_cases() |
                     guard_reclaim_cases() | reclaim_due_cases() | exhausted_message_cases() | ram_level_cases() |
                     admit_wait_cases() | guard_pause_cases() | stall_parse_cases() | stop_message_cases();
