@@ -125,6 +125,29 @@ bool device_memory(int ordinal, uint64_t& free_bytes, uint64_t& total_bytes, std
     return true;
 }
 
+bool devices_allocate(const std::vector<int>& ordinals, std::string& why) {
+    for (int ordinal : ordinals) {
+        uint64_t f = 0, t = 0;
+        if (!device_memory(ordinal, f, t, why)) return false;
+        int prev = 0;
+        cudaGetDevice(&prev);
+        const int d = ordinal < 0 ? prev : ordinal;
+        void* p = nullptr;
+        cudaError_t e = d == prev ? cudaSuccess : cudaSetDevice(d);
+        if (e == cudaSuccess) {
+            e = cudaMalloc(&p, 1ull << 20);
+            if (e == cudaSuccess) cudaFree(p);
+            if (d != prev) cudaSetDevice(prev);
+        }
+        if (e != cudaSuccess) {
+            why = device_fault("cudaMalloc of 1 MiB", e, d);
+            cudaGetLastError();
+            return false;
+        }
+    }
+    return true;
+}
+
 double device_h2d_gbps(int ordinal) {
     constexpr size_t kBytes = 256ull << 20;
     constexpr int kCopies = 6;
