@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from serve.api import responses as responses_api
+from serve.api import thread_proxy
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
@@ -213,6 +214,11 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if thread_proxy.is_thread_path(path):
+                if self._authorized():
+                    status, body = thread_proxy.forward("GET", path)
+                    self._json(status, body)
+                return
             if path.startswith("/fonts/"):
                 name = path[len("/fonts/"):]
                 f = ROOT / "serve" / "web" / "fonts" / name
@@ -332,6 +338,10 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if thread_proxy.is_thread_path(path):
+                    status, body = thread_proxy.forward("POST", path, req)
+                    self._json(status, body)
+                    return
                 if path.startswith("/v1/responses/"):        # nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
