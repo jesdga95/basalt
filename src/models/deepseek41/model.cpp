@@ -1,6 +1,7 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
 #include "basalt/core/load_progress.hpp"
 #include "basalt/log.hpp"
+#include "basalt/core/device.hpp"
 #include "models/deepseek41/model.hpp"
 
 #include "basalt/artifact/dequant.hpp"
@@ -147,8 +148,8 @@ bool DsModel::resolve_context(int64_t requested, std::string& err) {
     const Geometry& g = pack_.geo;
     const std::vector<int> ratios = cache_ratios(g);
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        err = "deepseek41: cannot query the free device memory";
+    if (const cudaError_t e = cudaMemGetInfo(&free_b, &total_b); e != cudaSuccess) {
+        err = "deepseek41: cannot query the free device memory (" + core::memory_failure("cudaMemGetInfo", e) + ")";
         return false;
     }
     const ctxp::Plan p = ctxp::plan_context(requested, g.context_length, free_b, ratios, cache_format_);

@@ -2,6 +2,7 @@
 #include "models/deepseek41/elastic.hpp"
 
 #include "basalt/core/vmm.hpp"
+#include "basalt/core/device.hpp"
 
 #include <cuda_runtime.h>
 
@@ -54,7 +55,12 @@ bool ElasticBuf::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
     const uint64_t n = want - backed_;
     if (keep_free > 0) {
         size_t free_b = 0, total_b = 0;
-        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < n + keep_free) {
+        if (const cudaError_t e = cudaMemGetInfo(&free_b, &total_b); e != cudaSuccess) {
+            // the reserve cannot be checked, so the growth cannot be told to be safe: the caller reads the reason
+            err = "the VRAM reserve cannot be checked (" + core::memory_failure("cudaMemGetInfo", e) + ")";
+            return false;
+        }
+        if (free_b < n + keep_free) {
             err = "the VRAM reserve of " + std::to_string(keep_free >> 20) + " MiB stays free";
             return false;
         }

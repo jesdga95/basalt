@@ -3,6 +3,7 @@
 // Per layer: Engram (on its layers), hyper-connection mixes and collapse, attention, expansion, the FFN's mixes and
 // collapse, router, routed and shared experts, expansion. Prefill runs the same path token by token.
 #include "basalt/log.hpp"
+#include "basalt/core/device.hpp"
 #include "models/deepseek41/session.hpp"
 #include "basalt/ggml/ggml.h"
 
@@ -498,8 +499,8 @@ private:
     bool make_prefill_fit(int tokens, std::string& err) {
         const prefillp::Dims d = m_.prompt_dims();
         size_t free_b = 0, total_b = 0;
-        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-            err = "deepseek41: cannot read the free device memory";
+        if (const cudaError_t e = cudaMemGetInfo(&free_b, &total_b); e != cudaSuccess) {
+            err = "deepseek41: cannot read the free device memory (" + core::memory_failure("cudaMemGetInfo", e) + ")";
             return false;
         }
         // the reserve stays free through the read: the chunk halves to fit above it

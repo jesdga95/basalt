@@ -81,8 +81,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         one_each_ram += e.blob_bytes;
     }
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        err = "deepseek41: cannot query the free device memory";
+    if (const cudaError_t e = cudaMemGetInfo(&free_b, &total_b); e != cudaSuccess) {
+        err = "deepseek41: cannot query the free device memory (" + core::memory_failure("cudaMemGetInfo", e) + ")";
         return false;
     }
     one_each_ = one_each;
@@ -441,6 +441,28 @@ bool ExpertTier::load_ram(std::string& err) {
         if (unpinned > 0)
             basalt::log::warn("basalt deepseek41", "RAM expert tier: %d of %d layers not pinned, locked: %s", unpinned, n_layers_,
                               ram_pins_[(size_t) n_layers_ - 1].lock_note.c_str());
+        // On Windows the driver's page-lock budget is the process's, not the tier's: registered past it, every memory
+        // call of the run answers CUDA_ERROR_OUT_OF_MEMORY - queries included, on either card - and the request fails
+        // somewhere unrelated.  The tier does not need the registration to work from RAM, so it gives it back.
+        size_t free_b = 0, total_b = 0;
+        if (const cudaError_t e = cudaMemGetInfo(&free_b, &total_b); e != cudaSuccess) {
+            int registered = 0;
+            for (size_t l = 0; l < ram_.size() && l < ram_pins_.size(); ++l) {
+                if (ram_[l] == nullptr || ram_pins_[l].registered_bytes == 0) continue;
+                ++registered;
+                core::unpin_ram(ram_[l], ram_pins_[l]);
+                ram_pins_[l] = core::RamPin{};
+            }
+            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+                err = "deepseek41: the device cannot allocate after pinning the RAM tier (" +
+                      core::memory_failure("cudaMemGetInfo", e) + ")";
+                return false;
+            }
+            basalt::log::warn("basalt deepseek41",
+                              "the device cannot allocate while %d RAM tier spans are pinned: they are given back, the tier "
+                              "stays on pageable memory (the experts are copied in rather than read in place)",
+                              registered);
+        }
     }
     if (ram_load) ram_load->finish();
     if (main_load) main_load->finish();
@@ -917,8 +939,8 @@ void ExpertTier::lend_all() {
 bool ExpertTier::reclaim(std::string& err) {
     if (lent_per_layer_ == 0) return true;
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        err = "deepseek41: cannot query the free device memory";
+    if (const cudaError_t e = cudaMemGetInfo(&free_b, &total_b); e != cudaSuccess) {
+        err = "deepseek41: cannot query the free device memory (" + core::memory_failure("cudaMemGetInfo", e) + ")";
         return false;
     }
     const int64_t n = policy::reclaim_slots(free_b, reserve_, free_floor_, one_each_, lent_per_layer_);
@@ -937,7 +959,16 @@ bool ExpertTier::reclaim(std::string& err) {
 void ExpertTier::grow() {
     if (ext_per_layer_ > 0 || per_layer_ >= n_expert_ || !cache_.valid()) return;
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+    if (const cudaError_t e = cudaMemGetInfo(&free_b, &total_b); e != cudaSuccess) {
+        // "nothing fits" and "the runtime cannot answer any more" are not the same: say the second one once
+        static bool said = false;
+        if (!said) {
+            said = true;
+            basalt::log::warn("basalt deepseek41", "VRAM expert tier cannot grow: %s",
+                              core::memory_failure("cudaMemGetInfo", e).c_str());
+        }
+        return;
+    }
     const int64_t n = policy::grow_slots(free_b, reserve_ + (token_ > 0 ? 0 : modules_), free_floor_, one_each_, per_layer_, n_expert_, cap_per_layer_);
     if (n < 1) return;
     std::vector<int64_t> slot_bytes;
