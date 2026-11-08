@@ -82,7 +82,7 @@ std::string python_interpreter(const std::string& src_dir) {
     return path_executable(venv) ? venv : "python";
 }
 
-void prefer_oom_victim() {}
+bool use_normal_oom_priority() { return true; }
 
 bool keep_full_speed() {
     PROCESS_POWER_THROTTLING_STATE s{};
@@ -140,8 +140,17 @@ std::string python_interpreter(const std::string& src_dir) {
     return path_executable(venv) ? venv : "python3";
 }
 
-void prefer_oom_victim() {
-    if (std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w")) { std::fputs("1000", f); std::fclose(f); }
+bool use_normal_oom_priority() {
+    if (std::FILE* in = std::fopen("/proc/self/oom_score_adj", "r")) {
+        int cur = 0;
+        const int read = std::fscanf(in, "%d", &cur);
+        std::fclose(in);
+        if (read == 1 && cur <= 0) return true;
+    }
+    std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w");
+    if (!f) return false;
+    const bool written = std::fputs("0", f) >= 0;
+    return std::fclose(f) == 0 && written;
 }
 
 bool keep_full_speed() { return true; }   // the scheduler does not slow a process for its window's state
