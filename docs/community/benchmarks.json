@@ -1240,6 +1240,38 @@
       "prefill_64k_tps": 3223.4,
       "decode_tps": 87.4,
       "notes": "single RTX 5090 at 475 W, 247 GB RAM; all 384 experts/layer in memory (0 SSD spill); DSpark draft window 3"
+    },
+    {
+      "submitter": "jesdga95",
+      "date": "2026-11-08",
+      "commit": "553e9290da",
+      "preset": "community-1",
+      "model": "DeepSeek-V4.1-Flash",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 400,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.9
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        }
+      ],
+      "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.6,
+      "os": "Linux",
+      "quant": "IQ1_M",
+      "kv": "fp8+fp4",
+      "prefill_16k_tps": 2133.4,
+      "prefill_64k_tps": 2840.9,
+      "decode_tps": 149.1
     }
   ]
 }
