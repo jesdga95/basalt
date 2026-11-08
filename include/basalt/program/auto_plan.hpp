@@ -2,6 +2,8 @@
 // plain values; the engine reads the machine, fills AutoInputs, and applies the AutoPlan.
 #pragma once
 
+#include "basalt/core/ram_load.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -40,6 +42,7 @@ struct AutoInputs {
     uint64_t extra_full = 0;              ///< optional copies beside complement_full (lent slots, adapt spares): kept as far as RAM allows
     uint64_t extra_peer_excl = 0;         ///< the same beside complement_peer_excl
     uint64_t floor_bytes = 0;             ///< RAM that stays free beside the copy: the reserve and the driver's tracking of its pages
+    basalt::core::FileCache file_cache;   ///< what experts left in the file need of the OS file cache, kept free beside the floor
     AutoGiven given;
 };
 
