@@ -28,7 +28,7 @@ Printed only when a value beats the built-in default by more than the measured n
 
 - **`--pool-workers N`**: the fewest workers within 2% of the fastest measured CPU expert time.
 - **`--adapt-every`, `--adapt-swaps`, `--adapt-decay`**: tried from the start placement (`PROBE adapt`) with a prose-then-struct switch.
-  `64 / 256 / 0.7` and `1 / 160` are tested against the engine's own, which runs twice to set the noise band.
+  `64 / 256 / 0.7`, `1 / 160` and a small round (swaps 12, the default cadence) are tested against the engine's own, which runs twice to set the noise band.
 - **`--prefill-cpu-share F`**: 8192-token chunks at share 0, 1 and the balance. Printed only when at least 8% faster.
 - **`--expert-profile-save FILE`**: suggested when a saved profile is faster beyond the band.
 
