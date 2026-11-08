@@ -1,4 +1,5 @@
 // src/core/device.cu - the CUDA side of the runtime core.
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/device.hpp"
 
 #include <cuda_runtime.h>
@@ -73,7 +74,7 @@ double device_h2d_gbps(int ordinal) {
     void* dev = nullptr;
     cudaStream_t st = nullptr;
     cudaEvent_t ev[kCopies + 1] = {};
-    bool ok = cudaHostAlloc(&host, kBytes, cudaHostAllocPortable) == cudaSuccess;
+    bool ok = basalt::core::allocate_pinned_host(&host, kBytes, cudaHostAllocPortable) == cudaSuccess;
     ok = ok && cudaMalloc(&dev, kBytes) == cudaSuccess && cudaStreamCreate(&st) == cudaSuccess;
     for (cudaEvent_t& e : ev) ok = ok && cudaEventCreate(&e) == cudaSuccess;
     double best = 0;
@@ -96,7 +97,7 @@ double device_h2d_gbps(int ordinal) {
         if (e) cudaEventDestroy(e);
     if (st) cudaStreamDestroy(st);
     if (dev) cudaFree(dev);
-    if (host) cudaFreeHost(host);
+    if (host) basalt::core::release_pinned_host(host);
     cudaGetLastError();
     cudaSetDevice(prev);
     return best;
