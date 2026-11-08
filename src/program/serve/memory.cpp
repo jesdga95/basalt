@@ -31,8 +31,8 @@ void Runtime::shed_if_low() {
     const size_t freed = conversations->clear();
     size_t to_disk = 0;
     for (auto& sc : conversations->take_spilled())
-        if (disk.enabled() && !disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec) &&
-            disk.put(std::move(sc), kDiskQueueCap))
+        if (disk.enabled() && !disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec, 0) &&
+            store_conversation(sc))
             ++to_disk;
     if (freed > 0)
         basalt::log::info("basalt serve", "RAM guard: %zu parked conversations (%zu MiB) leave RAM, %zu of them "
@@ -86,16 +86,28 @@ bool Runtime::home_given_up(int64_t live, std::string& e) {
         int64_t c = 0;
         from = std::min<int64_t>(live, loan_plan(live, c));
     }
+    return home_slots_from(from, e);
+}
+
+bool Runtime::home_slots_from(int64_t from, std::string& e) {
+    if (!src.complement_ready()) return true;
     std::vector<std::pair<int32_t, int32_t>> give;
     std::vector<int32_t> slots;
+    uint64_t need = 0;
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     for (size_t i = 0; i < host_res.size(); ++i) {
         const int64_t layer = (int64_t) i / g.n_expert, ex = (int64_t) i % g.n_expert;
         if (host_res[i] >= from && !src.has_resident(layer, ex)) {
             give.emplace_back((int32_t) layer, (int32_t) ex);
             slots.push_back(host_res[i]);
+            need += (uint64_t) lay.blob_bytes(layer);
         }
     }
     if (give.empty()) return true;
+    if (o.host_pool_bytes > 0 && !reclaim_host_pool(need + (512ull << 20))) {
+        e = err;
+        return false;
+    }
     std::vector<uint8_t*> dst;
     if (!src.homes_take(give, e, dst)) return false;
     for (size_t k = 0; k < give.size(); ++k) {
@@ -235,7 +247,7 @@ bool Runtime::vram_command(const std::string& cmd, std::string& e, bool for_slee
             size_t released = 0;
             for (size_t j = 0; j < host_res.size(); ++j)
                 if (host_res[j] >= 0 && host_res[j] < loan_from &&
-                    src.home_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
+                    src.spare_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
                     ++released;
             const uint64_t freed = src.homes_reclaim() + src.homes_compact();
             basalt::log::info("basalt serve", "VRAM: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept for the "
@@ -287,6 +299,10 @@ int Runtime::init_memory() {
     guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes, prompt_file_bytes);
     basalt::platform::start_ram_guard(guard_floor);
     disk_floor = guard_floor + (1ull << 30);   // a disk-tier capture or read stays a GiB above the guard
+    if (o.host_pool_bytes > 0) {
+        src.trim_file_cache();
+        (void) basalt::core::discard_host_pool_free(1024ull << 20);
+    }
     // what a stop's error compares against, to tell the engine's own growth from other programs'
     ready_avail = basalt::platform::available_memory();
     ready_rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
