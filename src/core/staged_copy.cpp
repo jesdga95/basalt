@@ -1,4 +1,5 @@
 // src/core/staged_copy.cpp - see include/basalt/core/staged_copy.hpp.
+#include "basalt/core/host_pool.hpp"
 #include "basalt/core/staged_copy.hpp"
 
 #include "basalt/core/on_device.hpp"
@@ -11,7 +12,7 @@ StagedCopy::~StagedCopy() { release(); }
 
 void StagedCopy::release() {
     for (int b = 0; b < kBufs; ++b) {
-        if (buf_[b] != nullptr) cudaFreeHost(buf_[b]);
+        if (buf_[b] != nullptr) basalt::core::release_pinned_host(buf_[b]);
         buf_[b] = nullptr;
         live_[b] = false;
     }
@@ -35,7 +36,7 @@ bool StagedCopy::init(int src_dev, int dst_dev, size_t piece_bytes, std::string&
     dst_dev_ = dst_dev;
     piece_ = piece_bytes;
     bool ok = piece_ > 0;
-    for (int b = 0; ok && b < kBufs; ++b) ok = cudaHostAlloc((void**) &buf_[b], piece_, cudaHostAllocPortable) == cudaSuccess;
+    for (int b = 0; ok && b < kBufs; ++b) ok = basalt::core::allocate_pinned_host((void**) &buf_[b], piece_, cudaHostAllocPortable) == cudaSuccess;
     {
         const OnDevice on(src_dev_);
         ok = ok && cudaStreamCreateWithFlags(&src_stream_, cudaStreamNonBlocking) == cudaSuccess;
