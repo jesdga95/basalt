@@ -196,6 +196,8 @@ void usage() {
                  "                       When some experts stay in the file, the copy leaves a RAM floor free for\n"
                  "                       the OS file cache (the RAM margin + the larger of 3.5 GiB + two layers'\n"
                  "                       experts and 4 GiB).\n"
+                 "  --host-pool-gib N  prefault and pin one fixed pool for host data buffers; no growth outside it\n"
+                 "                       control objects, server processes and file cache are outside this data pool\n"
                  "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first;\n"
                  "                       auto when not set: what fits);\n"
                  "                       a budget that would leave less than the RAM floor free is refused, naming\n"
