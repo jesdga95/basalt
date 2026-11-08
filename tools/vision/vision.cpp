@@ -160,8 +160,10 @@ int main(int argc, char** argv) {
         const auto t0 = std::chrono::steady_clock::now();
         std::ifstream f(img_path, std::ios::binary);
         const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const bool read_ok = static_cast<bool>(f);
+        f.close();   // the caller removes the input once it has the reply
         Image img;
-        if (!f || bytes.empty() || !decode_image(bytes.data(), bytes.size(), img, err)) {
+        if (!read_ok || bytes.empty() || !decode_image(bytes.data(), bytes.size(), img, err)) {
             std::printf("ERR cannot read the image %s\n", img_path.c_str());
             std::fflush(stdout);
             continue;
