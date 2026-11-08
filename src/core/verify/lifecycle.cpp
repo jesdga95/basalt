@@ -1,3 +1,4 @@
+#include "basalt/core/host_pool.hpp"
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "diagnostics.hpp"
@@ -67,9 +68,9 @@ Verifier::~Verifier() {
     if (arena_b_) cudaFree(arena_b_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (row_bias_device_) cudaFree(row_bias_device_);
-    if (h_commitb_) cudaFreeHost(h_commitb_);
-    if (h_segb_) cudaFreeHost(h_segb_);
-    if (h_qseg_) cudaFreeHost(h_qseg_);
+    if (h_commitb_) basalt::core::release_pinned_host(h_commitb_);
+    if (h_segb_) basalt::core::release_pinned_host(h_segb_);
+    if (h_qseg_) basalt::core::release_pinned_host(h_qseg_);
     if (cs_) cudaStreamDestroy(cs_);
     if (cm_) cudaStreamDestroy(cm_);
     if (ev_commit_go_) cudaEventDestroy(ev_commit_go_);
@@ -98,7 +99,7 @@ Verifier::~Verifier() {
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_, h_pend_,
                      h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_, h_top_};
     for (void* h : hosts)
-        if (h) cudaFreeHost(h);
+        if (h) basalt::core::release_pinned_host(h);
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
