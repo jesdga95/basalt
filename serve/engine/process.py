@@ -233,6 +233,7 @@ class ProcessEngine:
         self.can_stop = False            # READY <ctx> stop
         self.last = {}
         self.slot_drafts = {}
+        self._native_slots = []
         self.info = {}                   # INFO key=value facts
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens, from PP lines
@@ -339,6 +340,7 @@ class ProcessEngine:
         self.slot_order = list(range(self.batch))
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
+        self._native_slots = [None] * self.batch
         # tokens each slot holds (for prefix reuse by a conversation's next turn) and when it was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
@@ -377,6 +379,35 @@ class ProcessEngine:
             if not done:
                 out.put(None)
 
+    native_slot_metrics = False
+
+    def _native_admission(self, slot: int, tokens: int):
+        if self.native_slot_metrics and slot is not None and 0 <= slot < len(self._native_slots):
+            self._native_slots[slot] = {"slot": slot, "state": "reading", "prompt_tokens": tokens,
+                                        "generated": 0}
+
+    def _native_line(self, line: str):
+        if not self.native_slot_metrics or not line.startswith(("BT ", "BDONE ")):
+            return
+        fields = line.split()
+        try:
+            slot = int(fields[1])
+            if not 0 <= slot < len(self._native_slots) or self._native_slots[slot] is None:
+                return
+            before = self._native_slots[slot]
+            if fields[0] == "BT" and len(fields) > 2:
+                for token in fields[2:]:
+                    int(token)
+                self._native_slots[slot] = {**before, "state": "decoding",
+                                            "generated": before["generated"] + len(fields) - 2}
+            elif fields[0] == "BDONE" and len(fields) >= 5:
+                self._native_slots[slot] = {**before, "state": "idle"}
+        except (ValueError, IndexError):
+            return
+
+    def native_slots_view(self) -> list[dict]:
+        return [dict(slot) for slot in self._native_slots if slot is not None]
+
     def _pump(self):
         proc, lines, log = self.proc, self.lines, self.log   # a restart replaces all three
         slot_q = self.slot_q
@@ -395,6 +426,7 @@ class ProcessEngine:
                 except OSError:
                     pass
                 break                                   # publish EOF, never the trailing DONE
+            self._native_line(line)
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
                 try:
                     slot_q[int(line.split()[1])].put(line)
@@ -1074,6 +1106,7 @@ class ProcessEngine:
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
+                    self._native_admission(slot, len(prompt))
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # admission overwrites the slot
                     phase = "admit"
