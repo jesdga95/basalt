@@ -23,6 +23,7 @@ class LogBuffer:
         self.lines: collections.deque = collections.deque(maxlen=capacity)
         self.last = 0
         self.readers: dict[str, LevelReader] = {}      # per source: a traceback spans lines
+        self.on_line = None                            # callable(msg): each line as it arrives, for the service
 
     def add(self, src: str, text: str) -> None:
         """Add each non-empty line of `text` (ANSI codes removed, long lines cut) from source `src`. A line's level is
@@ -37,6 +38,12 @@ class LogBuffer:
                 self.last += 1
                 self.lines.append({"id": self.last, "t": now, "src": src, "lvl": lvl,
                                    "msg": msg.removeprefix(SERVER_PREFIX)})
+            hook = self.on_line                       # read outside the lock: the hook may take the service's
+            if hook is not None:
+                try:
+                    hook(msg)
+                except Exception:                     # a figure the page wanted must never take the server down
+                    pass
 
     def since(self, after_id: int = 0, limit: int = 500) -> tuple[list[dict], int]:
         """Return (the newest `limit` lines above `after_id`, oldest first; the newest id)."""

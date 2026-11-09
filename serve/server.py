@@ -268,6 +268,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect)
     svc.logs = logs
+    logs.on_line = svc.note_engine_line                # the conversation cache logs its own figures
     svc.idle_unload_s = a.idle_unload or 0
     svc.idle_sleep_s = a.idle_sleep or 0
     svc.min_free_vram_mib = a.min_free_vram_mib or 0

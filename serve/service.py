@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import ctypes
+import re
 import subprocess
 import threading
 import time
@@ -22,6 +23,10 @@ from serve.engine.image_source import USAGE as IMAGE_USAGE, ImageRefused, ImageS
 from serve.engine.vision import IMAGE_WAITING_BYTES, Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.config import GRAMMAR_DEFAULT
+
+# The conversation cache's figures, as the engine logs them beside a request (not in the DONE line)
+_CACHE_FIGURES = re.compile(r"parked=(\d+) bytes=(\d+)(?: evictions=(\d+))?")
+_CACHE_RESTORED = re.compile(r"restored (\d+) tokens")
 
 
 def available_ram_mib() -> int | None:
@@ -127,6 +132,10 @@ class Service:
         self._best_gen = getattr(self.engine, "gen", 0)  # the engine process the figures came from
         self.history = collections.deque(maxlen=500)    # finished requests, newest last
         self.requests_done = 0                           # finished requests since start
+        # what has been served since start: the requests card's footer
+        self.totals = {"since": time.time(), "requests": 0, "prompt": 0, "reused": 0, "written": 0,
+                       "prompt_ms": 0.0, "decode_ms": 0.0}
+        self.conversation: dict = {}                     # the conversation cache's own figures, from the engine's log
         self.last_timings = None                         # last request's timings
         self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
@@ -646,20 +655,44 @@ class Service:
                 "generated": s.get("generated") if busy else None,
                 "elapsed_s": round(time.time() - s["started"], 1) if busy and s.get("started") else None,
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
+                "phase": s.get("phase") if busy else None,   # thinking, answering, a tool call being written
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if busy else None}
         info = dict(getattr(self.engine, "info", {}) or {})
         experts_total = info.get("spill_total")          # every routed (layer, expert) pair, on the SSD or not
         spill = spill_of(info)
         # a start under way reads 0; the last READY's context stands in until the new one arrives
-        engine = {"model": self.model, "max_context": self.engine.max_context or getattr(self.engine, "known_ctx", 0), **info,
+        engine = {"model": self.model, "max_context": self.engine.max_context or getattr(self.engine, "known_ctx", 0),
+                  "path": getattr(self.engine, "model_path", None) or None, **info,
                   "spill": spill, "expert_total": experts_total if isinstance(experts_total, int) else None}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
         with self.status_lock:
             self._drop_stale_best()
             best = {k: dict(v) for k, v in self.best.items()}
+            totals = dict(self.totals)
+            conversation = dict(self.conversation)
         return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
+                "totals": totals, "conversation": conversation,
                 "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+
+    def note_engine_line(self, line: str) -> None:
+        """Keep the conversation cache's own figures. The engine logs them beside a request, not inside its DONE
+        line, and a cache that evicts is the reason a prompt reads again instead of being reused."""
+        if "conversation cache" not in line:
+            return
+        park, back = _CACHE_FIGURES.search(line), _CACHE_RESTORED.search(line)
+        if park is None and back is None:
+            return
+        with self.status_lock:
+            c = dict(self.conversation)
+            if park is not None:
+                c.update(parked=int(park[1]), bytes=int(park[2]))
+                if park[3] is not None:
+                    c["evictions"] = int(park[3])
+            if back is not None:
+                c["restored"] = int(back[1])
+            c["at"] = round(time.time(), 1)
+            self.conversation = c
 
     def _drop_stale_best(self) -> None:
         """A best is a fact about the engine that produced it: a restarted engine (another model, other flags, a
@@ -1239,6 +1272,12 @@ class Service:
                             ssd_share = round(last["file_reads"] / routed, 3) if last.get("file_reads") and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # less than len(ids) when cancelled mid-read
                             self.requests_done += 1
+                            self.totals["requests"] += 1
+                            self.totals["prompt"] += seen
+                            self.totals["reused"] += last.get("reused") or 0
+                            self.totals["written"] += n
+                            self.totals["prompt_ms"] += last.get("prompt_ms") or 0.0
+                            self.totals["decode_ms"] += last.get("decode_ms") or 0.0
                             if st.get("slot") is not None:
                                 self.slot_last[st["slot"]] = {"ctx": seen + n, "offered": last.get("drafts_offered"),
                                                               "accepted": last.get("drafts_accepted"), "at": time.time()}
