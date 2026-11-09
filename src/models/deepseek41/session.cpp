@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "basalt/artifact/dequant.hpp"
+#include "models/deepseek41/engram_rows.hpp"
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -899,11 +900,8 @@ private:
         // while its experts run; the Engram layer's head then only adds the result.
         const auto engram_rows = [&](size_t k) {
             if (!m_.engram_reader().collect(tickets[k], err)) return false;
-            const int blocks = 256 / 32;
             for (int r = 0; r < n_cols * T; ++r)
-                for (int b = 0; b < blocks; ++b)
-                    dequantize_iq4_nl(raw[k].data() + (size_t) r * en.row_bytes + (size_t) b * 18,
-                                      erow_h_[k] + (size_t) r * 256 + (size_t) b * 32);
+                engram_row_f32(en.type, en.row_values, raw[k].data() + (size_t) r * en.row_bytes, erow_h_[k] + (size_t) r * 256);
             return true;
         };
         const auto engram_project = [&](size_t k, int il, void* s) {

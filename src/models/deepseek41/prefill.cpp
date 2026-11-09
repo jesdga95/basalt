@@ -7,6 +7,7 @@
 #include "models/deepseek41/prefill.hpp"
 
 #include "basalt/artifact/dequant.hpp"
+#include "models/deepseek41/engram_rows.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
@@ -291,9 +292,7 @@ private:
                     const size_t np = std::min(piece, nr - p0);
                     auto dequant = [&](size_t r0, size_t r1) {
                         for (size_t r = r0; r < r1; ++r)
-                            for (int b = 0; b < 256 / 32; ++b)
-                                dequantize_iq4_nl(raw(cur, k) + (p0 + r) * en.row_bytes + (size_t) b * 18,
-                                                  rows_f + r * 256 + (size_t) b * 32);
+                            engram_row_f32(en.type, en.row_values, raw(cur, k) + (p0 + r) * en.row_bytes, rows_f + r * 256);
                     };
                     {
                         std::vector<std::thread> th;
