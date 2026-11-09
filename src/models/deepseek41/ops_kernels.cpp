@@ -46,6 +46,21 @@ struct CpuJoin {
     }
 };
 
+// The word a layer's weighted sum waits for: armed with the value the sum was queued behind, the host writes it once
+// the CPU's and the second card's rows landed, or on any way out, so the stream never waits for good.
+struct JoinWord {
+    uint32_t* word = nullptr;
+    uint32_t value = 0;
+    bool armed = false;
+    ~JoinWord() { raise(); }
+    void raise() {
+        if (!armed) return;
+        std::atomic_thread_fence(std::memory_order_release);   // the rows before the word
+        *(volatile uint32_t*) word = value;
+        armed = false;
+    }
+};
+
 // A window's plan: the distinct experts of its rows, each with the rows it computes.
 struct WindowPlan {
     unsigned long long ptr[ExpertTier::kMaxK];
@@ -587,12 +602,15 @@ public:
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
         if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
             cudaHostAlloc((void**) &h_ids_, 64 * 4, kMapped) != cudaSuccess ||
+            cudaHostAlloc((void**) &h_join_, 64, kMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_join_, h_join_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_plan_host_, h_plan_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_ids_host_, h_ids_, 0) != cudaSuccess) {
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
         }
         for (int k = 0; k < 64; ++k) h_ids_[k] = -1;
+        *h_join_ = 0;
         DsModel::SharedTier& shared = m_.shared_tier();
         if (shared.tier) {   // another session opened it: the sessions run one at a time over the same rows
             tier_ = shared.tier;
@@ -698,8 +716,12 @@ public:
         if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
         // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
-        bool cpu = false;
-        for (int i = 0; i < nu; ++i) cpu = cpu || (!lk.dev[i] && !lk.peer[i]);
+        bool cpu = false, on_peer = false;
+        for (int i = 0; i < nu; ++i) {
+            cpu = cpu || (!lk.dev[i] && !lk.peer[i]);
+            on_peer = on_peer || lk.peer[i];
+        }
+        JoinWord jw;
         CpuJoin join;
         if (cpu) {
             tier_->start_cpu_window(il, h_x_, lk, use, h_rows_);
@@ -750,16 +772,25 @@ public:
             tier_->await_fetch(st);
             gpu_share(plan, ex_plan2_, ng, entries);
         }
+        // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
+        // launch and the next layer's are off the path from the last rows to the sum
+        WindowRowPtrs rp{};
+        for (int r = 0; r < T * K; ++r)
+            rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
+        if (cpu || on_peer) {
+            jw.word = h_join_;
+            jw.value = ++join_seq_;
+            jw.armed = true;
+            wait_word(d_join_, jw.value, stream);
+        }
+        weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in their rows
         if (cpu) {
             join.now();
             tier_->promote(il, lk);
         }
         if (peer && !peer->finish(nullptr, err)) return false;
-        WindowRowPtrs rp{};
-        for (int r = 0; r < T * K; ++r)
-            rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
-        weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
+        jw.raise();
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
         for (int r = 0; r < T * K; ++r) h_ids_[r] = -1;
         ids_read_ = false;
@@ -807,8 +838,12 @@ public:
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
         // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
-        bool cpu = false;
-        for (int k = 0; k < K; ++k) cpu = cpu || (!lk.dev[k] && !lk.peer[k]);
+        bool cpu = false, on_peer = false;
+        for (int k = 0; k < K; ++k) {
+            cpu = cpu || (!lk.dev[k] && !lk.peer[k]);
+            on_peer = on_peer || lk.peer[k];
+        }
+        JoinWord jw;
         CpuJoin join;
         if (cpu) {
             tier_->start_cpu(il, h_x_, lk, h_rows_);
@@ -881,16 +916,25 @@ public:
             kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, n_fetched,
                                                    n_fetched, ex_xq_, ex_scr_, ex_rows_, stream);
         }
+        // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
+        // launch and the next layer's are off the path from the last rows to the sum
+        RowPtrs rp{};
+        for (int k = 0; k < K; ++k)
+            rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
+        if (cpu || on_peer) {
+            jw.word = h_join_;
+            jw.value = ++join_seq_;
+            jw.armed = true;
+            wait_word(d_join_, jw.value, stream);
+        }
+        weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in the router index's row
         if (cpu) {
             join.now();
             tier_->promote(il, lk);
         }
         if (peer && !peer->finish(nullptr, err)) return false;
-        RowPtrs rp{};
-        for (int k = 0; k < K; ++k)
-            rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
-        weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
+        jw.raise();
         tier_->mark_gap(st);
         for (int k = 0; k < K; ++k) h_ids_[k] = -1;
         ids_read_ = false;
@@ -960,6 +1004,8 @@ private:
     ExpertPlan* h_plan_ = nullptr;
     float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *d_x_host_ = nullptr;
     int32_t *h_ids_ = nullptr, *h_pos_ = nullptr, *d_ids_host_ = nullptr;
+    uint32_t *h_join_ = nullptr, *d_join_ = nullptr;   // the word a layer's weighted sum waits for (mapped)
+    uint32_t join_seq_ = 0;                             // the value it was last armed with
     int64_t staged_pos_ = -1;
     std::shared_ptr<ExpertTier> tier_;
     static constexpr int kMaxK = 8;                 // routed experts of a token
