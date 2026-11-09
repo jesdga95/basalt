@@ -52,6 +52,7 @@ public:
     ~Session() override {
         for (void* p : allocs_) cudaFree(p);
         if (h_next_) cudaFreeHost(h_next_);
+        if (h_emb4_) cudaFreeHost(h_emb4_);
         if (h_dfeat_) cudaFreeHost(h_dfeat_);
         for (cudaGraphExec_t e : head_g_)
             if (e) cudaGraphExecDestroy(e);
@@ -134,7 +135,8 @@ public:
         ok = ok && cudaMalloc(&v, argmax_workspace_bytes()) == cudaSuccess && cudaMemset(v, 0, argmax_workspace_bytes()) == cudaSuccess;
         am_ws_ = v;
         if (v) allocs_.push_back(v);
-        ok = ok && cudaHostAlloc((void**) &h_next_, W * sizeof(int32_t), cudaHostAllocPortable) == cudaSuccess;
+        ok = ok && cudaHostAlloc((void**) &h_next_, W * sizeof(int32_t), cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &h_emb4_, 4 * n * W * sizeof(float), cudaHostAllocPortable) == cudaSuccess;
         v = nullptr;
         const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), W), 1 << 16);
         ok = ok && cudaMalloc(&v, q8) == cudaSuccess;
@@ -851,7 +853,6 @@ private:
         if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
         hist_.resize((size_t) pos);   // a position before the end drops the rejected rows of a window
         hist_.insert(hist_.end(), tokens, tokens + T);
-        ops_->begin_token(pos, T);
         {
             std::string se;
             if (!ops_->stage_token(pos, T, st, se)) return fail(se);
@@ -860,14 +861,13 @@ private:
         fused_ = graphs;
 
         // embeddings, each repeated into the four streams
-        emb4_.resize(n * kHcMult * T);
         for (int t = 0; t < T; ++t) {
-            float* row = emb4_.data() + (size_t) t * kHcMult * n;
+            float* row = h_emb4_ + (size_t) t * kHcMult * n;
             std::string e;
             if (!m_.embedding_row(tokens[t], row, e)) return fail(e);
             for (int s = 1; s < kHcMult; ++s) std::copy(row, row + n, row + (size_t) s * n);
         }
-        DS_CUDA(cudaMemcpyAsync(x_, emb4_.data(), emb4_.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        DS_CUDA(cudaMemcpyAsync(x_, h_emb4_, n * kHcMult * T * sizeof(float), cudaMemcpyHostToDevice, stream_));
         dump("hc_init", -1, pos, x_, 4 * n * sizeof(float));
 
         // Engram rows for every Engram layer, requested now so the SSD reads overlap layer 0
@@ -934,12 +934,15 @@ private:
                 dump("engram_out", il, pos, x_, 4 * n * sizeof(float));
             }
 
+            // the tier's bookkeeping (promotions that land) runs while the first head does
             if (!graphs) {
                 if (!enqueue_head(il, pos, token, st, false)) return false;
+                if (il == 0) ops_->begin_token(pos, T);
                 if (!ops_->routed_experts_staged(il, normed_, ids_, rw_, moe_out_, st, err_)) return false;
                 if (!enqueue_tail(il, pos, st)) return false;
             } else {
                 if (!run_head(il, pos, token, tail_pending, T)) return false;
+                if (il == 0) ops_->begin_token(pos, T);
                 tail_pending = true;
                 for (size_t k = 0; k < en.layers.size(); ++k) {
                     if (en.layers[k] != il + 1 || !engram_ahead(il + 1)) continue;
@@ -1045,7 +1048,7 @@ private:
     int32_t* ids_ = nullptr;
     int32_t *am_dev_ = nullptr, *h_next_ = nullptr;
     void* am_ws_ = nullptr;
-    std::vector<float> emb4_;
+    float* h_emb4_ = nullptr;   // a window's embeddings in the four streams, pinned
     bool fused_ = false;
     void* q8_ = nullptr;
     // the drafter and the main model's side of its feature hand-off
