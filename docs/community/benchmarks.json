@@ -2,6 +2,32 @@
   "preset": "basalt-bench --community",
   "runs": [
     {
+      "submitter": "roger",
+      "date": "2026-11-10",
+      "commit": "4998eb3733",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 300,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 56.3
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "AMD Ryzen 7 7700, 8 cores",
+      "ram_gbps": 63.2,
+      "os": "Linux",
+      "quant": "IQ4_XS",
+      "kv": "int8",
+      "prefill_16k_tps": 2630.4,
+      "prefill_64k_tps": 2666.2,
+      "decode_tps": 122.3,
+      "notes": "NVMe; vm.swappiness=1; community preset unchanged. Startup expert-spill gate passes, but prefill still reads experts from SSD (64K: 18.8 GB); not fully resident during prefill."
+    },
+    {
       "submitter": "lindworm-hermes2026",
       "date": "2026-10-22",
       "commit": "57909606c2",
@@ -1297,7 +1323,7 @@
       "prefill_16k_tps": 4713.1,
       "prefill_64k_tps": 4798.5,
       "decode_tps": 151.5,
-      "notes": "headless desktop, 60 GiB RAM; the larger IQ4_XS pack OOMs at the 64k prefill on this box, so no IQ4_XS row"
+      "notes": "Headless desktop. Correction: the prior IQ4_XS 64K exit was a 60 s stall watchdog during HDD swap pressure, not a confirmed kernel OOM kill; vm.swappiness=1 allows the full IQ4_XS run."
     }
   ]
 }
