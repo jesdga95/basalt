@@ -63,6 +63,11 @@ int engine_plan(const std::string& engine_bin, const std::vector<std::string>& a
 std::string plan_field(const std::string& plan_answer, const std::string& name);
 /// `dir`/<arch> when the model has its own fixtures there, else `dir`.
 std::string fixtures_for(const std::string& dir, const std::string& plan_answer);
+/// The engine a benchmark program starts without --engine: the `basalt` executable beside the program (`self`, its
+/// own path) when there is one, else `built`, where the build wrote it.
+std::string default_engine(const std::string& self, const std::string& built);
+/// The fixtures folder without --fixtures: `root`/data/bench (`root` the install's top) when there is one, else `built`.
+std::string default_fixtures(const std::string& root, const std::string& built);
 /// The line that marks a report as measured with flags that change the model's output (`lossy`, the engine's
 /// INFO lossy= value, comma separated).
 std::string lossy_note(const std::string& lossy);

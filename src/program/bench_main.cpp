@@ -70,6 +70,10 @@ namespace {
 
 // ---------------------------------------------------------------------------------------------- small helpers
 
+// Without --engine / --fixtures: the install's own (an unpacked release has them beside this program), else the build's.
+std::string engine_default() { return default_engine(basalt::platform::module_path(), BASALT_BENCH_ENGINE); }
+std::string fixtures_default() { return default_fixtures(basalt::platform::install_root(), BASALT_BENCH_FIXTURES); }
+
 std::string fmt(const char* f, ...) {
     va_list ap;
     va_start(ap, f);
@@ -291,7 +295,7 @@ void usage(const std::string& engine) {
         "  --gpu A,B,..|auto  the GPUs, as for the server and the engine (default: GPU 0 alone). Every\n"
         "                     other --flag is an engine flag, passed on as given (same names as `basalt`; the engine\n"
         "                     rejects a bad one at startup); --print-command shows the command and exits\n"
-        "  --engine BIN       engine binary (default: the one built with this program)\n"
+        "  --engine BIN       engine binary (default: basalt beside this program, else the build's)\n"
         "  --set \"F V ...\"    FLAG VALUE pairs that replace or add engine arguments (repeatable)\n"
         "  --spec N           speculation window for the engine (--spec N, e.g. 7; also --spec after --); without it\n"
         "                     the engine default (speculation with the pack drafter, window 8); --spec 0 is a\n"
@@ -327,9 +331,9 @@ void usage(const std::string& engine) {
         "      [{'role':'user','content':p}], enable_thinking=False), parse_special=True)\n"
         "      print(','.join(map(str, r(PROMPT))))\"\n"
         "  (for prefill, render with a marker in place of the body and split the ids around it)\n",
-        BASALT_BENCH_FIXTURES);
+        fixtures_default().c_str());
     // the engine's flags are defined once, in the engine: print its own help
-    std::string bin = engine.empty() ? std::string(BASALT_BENCH_ENGINE) : engine;
+    std::string bin = engine.empty() ? engine_default() : engine;
     if (!bin.empty() && fs::exists(bin)) {
         std::printf("\nEngine flags (passed to basalt):\n");
         std::fflush(stdout);
@@ -720,13 +724,11 @@ int main(int argc, char** argv) {
     }
 
     // engine command from the model and the overrides
-    std::string engine_bin = o.engine;
+    const std::string engine_bin = o.engine.empty() ? engine_default() : o.engine;
     std::vector<std::string> args;
     if (!o.model.empty()) {
         args = {"--model", fs::absolute(o.model).string()};
     }
-    if (engine_bin.empty()) engine_bin = BASALT_BENCH_ENGINE;
-    if (o.engine.empty() && std::string(BASALT_BENCH_ENGINE).size() > 0 && fs::exists(BASALT_BENCH_ENGINE)) engine_bin = BASALT_BENCH_ENGINE;
     if (engine_bin.empty() || !fs::exists(engine_bin)) {
         basalt::log::error("basalt-bench", "the engine binary %s does not exist (--engine BIN)", engine_bin.c_str());
         return 2;
@@ -748,7 +750,7 @@ int main(int argc, char** argv) {
         }
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
-        if (o.fixtures.empty()) o.fixtures = fixtures_for(BASALT_BENCH_FIXTURES, answer);
+        if (o.fixtures.empty()) o.fixtures = fixtures_for(fixtures_default(), answer);
     }
     std::vector<std::string> quality_flags;
     if (do_quality && !o.model.empty()) {   // what the gate starts this model with, and the window it scores
