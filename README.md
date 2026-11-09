@@ -58,6 +58,7 @@ profile ships with the engine ([data/profiles](data/profiles)).
 - [basalt-probe](docs/probe.md): measures the machine, the cold decode speed, and suggests values.
 - [The .basalt model file](docs/model-file.md): the layout, and building a pack yourself (including NVFP4).
 - [Platforms](docs/platforms.md): Linux and Windows requirements, the build steps and the Windows limitations.
+- [Agent context sharing design](docs/architecture/agent-context-sharing.md): proposed inferd-inspired fork/resume, shared prefix state, tiered recovery and implementation roadmap (not yet implemented).
 - [Changelog](docs/changelog/index.md): what each release changed.
 - [Building and testing](docs/building.md), [Precision and quality](docs/precision/index.md), [Contributing](CONTRIBUTING.md).
 
