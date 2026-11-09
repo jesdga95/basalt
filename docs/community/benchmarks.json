@@ -1674,6 +1674,49 @@
       "prefill_64k_tps": 4798.5,
       "decode_tps": 151.5,
       "notes": "headless desktop, 60 GiB RAM; the larger IQ4_XS pack OOMs at the 64k prefill on this box, so no IQ4_XS row"
+    },
+    {
+      "submitter": "glfenix",
+      "date": "2026-11-10",
+      "commit": "ffbe33f0cf",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 300,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        },
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 300,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        }
+      ],
+      "ram_gib": 184,
+      "cpu": "AMD EPYC 7443, 24 cores",
+      "ram_gbps": 139.0,
+      "os": "Linux",
+      "quant": "NVFP4-DQ8",
+      "kv": "int8",
+      "prefill_16k_tps": 4825.1,
+      "prefill_64k_tps": 7565.8,
+      "decode_tps": 281.6,
+      "decode_conv_tps": 161.4,
+      "decode_struct_tps": 383.5,
+      "decode_prose_tps": 147.6,
+      "accept_conv_pct": 69.8,
+      "accept_struct_pct": 98.0,
+      "accept_prose_pct": 67.1,
+      "draft_len_conv": 2.0,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
+      "notes": "KVM/QEMU guest: 48 vCPU (24 cores + SMT), 184 GiB, on an EPYC 7443 host; both cards VFIO-passthrough at 4.0 x16, capped to 300 W. NVFP4 experts, Q8_0 dense (the DQ8 pack)."
     }
   ]
 }
