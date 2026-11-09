@@ -57,7 +57,7 @@ REQUESTS_SHOWN = 12        # finished requests /metrics lists
 # the fastest whole request counts only when big enough that fixed costs do not decide it
 BEST_MIN_OUT = 256          # output tokens, for the best decode rate
 BEST_MIN_READ = 4096        # newly read prompt tokens, for the best prefill rate
-BEST_MAX_READ_TOK_S = 20000 # a prompt read faster than this pairs the wrong token count with the wrong time
+BEST_MAX_READ_TOK_S = 200000  # a prompt read faster than this pairs the wrong token count with the wrong time
 RATE_MIN_SPAN_S = 0.25      # below this span there is no rate yet: use the mean with the span floored
 # diagnostics, off unless the server flag sets them
 DEBUG = False            # --debug: one line per request plus the raw model text
