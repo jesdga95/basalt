@@ -42,8 +42,21 @@ read the vision projector inside it.
 
 ## The stats page
 
-The server's address serves a page, updated every second from `/metrics`, `/slots` and `/api/logs`: GPU load, power, VRAM and temperature,
-RAM and disk, decode and prefill rates with 60 s charts, slots, the newest requests, and the console lines.
+The server's address serves a page, updated every second from `/metrics`, `/slots` and `/api/logs`. Its header names the build (the
+version, the pack's quantization and the window) and the model, with a picker that loads another one.
+
+- Model state: Idle, Reading, Generating and Error with the current one lit (Unloaded, Loading and Asleep only while a `--lazy`,
+  `--idle-unload` or `--idle-sleep` server is in one), and what it is doing now — tokens generated against the ask, prompt tokens being
+  read, or the loading percentage — on a bar.
+- Context: a donut of the fullest slot's window, then the side bar's GPUs (per-card VRAM over 60 s against that card's own total),
+  System (CPU, RAM, disk reads) and Experts (where the last request's routed lookups were served).
+- Speed: decode and prefill rates with 60 s charts.
+- Requests: the newest finished requests with prompt and cached tokens, output, time to first token, rate, expert-cache hit, PCIe share
+  and duration, then what has been served since the server started (`totals`). A row opens that request's own timings (click, Enter or
+  Space; Esc closes), whose Copy JSON button copies the record.
+- Conversation cache: the budget and how much of it is parked, the share of the last prompt that came from it, and the mean reuse over
+  the recent requests.
+- Logs: the console lines, filtered by level, with a run of identical lines collapsed into one and counted.
 
 ## Conversations on disk: `--conversation-cache-disk-mib`
 

@@ -79,6 +79,43 @@ const ticks = (max, labels) => [[4, max], [50, max / 2]].filter(t => !labels.som
 /* ---- top bar ---- */
 function setState(s, label) { $("#state").dataset.s = s; text($("#state"), label); }
 
+const STATES = [["idle", "Idle"], ["reading", "Reading"], ["generating", "Generating"], ["error", "Error"]];
+const OCCASIONAL = [["unloaded", "Unloaded"], ["loading", "Loading"], ["asleep", "Asleep"]];
+function drawState(live, slots, eng) {
+  const cur = live.state || "idle";
+  const shown = STATES.concat(OCCASIONAL.filter(([k]) => k === cur));
+  html($("#states"), shown.map(([k, l]) => `<span class="chip" data-on="${k === cur}">${l}</span>`).join(""));
+  const s = slots[0] || {}, gen = num(live.generated) ? live.generated : null;
+  const max = num(s.max_tokens) ? s.max_tokens : null;
+  let line = "Nothing is running", sub = "", frac = 0;
+  if (cur === "generating") {
+    const ph = String(live.phase || "");
+    const lead = ph === "thinking" ? "Thinking" : ph === "answering" ? "Answering"
+      : ph.startsWith("writing a tool call") ? ph[0].toUpperCase() + ph.slice(1) : (gen ? "Thinking" : "Generating");
+    line = `${lead} · ${fmt(gen || 0)} tokens${num(live.tok_s) ? ` · ${fmt(live.tok_s, 1)} tok/s` : ""}`;
+    sub = max ? `of ${fmt(max)} asked` : "";
+    frac = max ? (gen || 0) / max : 0;
+  } else if (cur === "reading") {
+    line = num(live.prompt_tokens) ? `Reading ${fmt(live.prompt_tokens)} prompt tokens` : "Reading the prompt";
+    sub = num(live.elapsed_s) ? `${fmt(live.elapsed_s, 1)} s` : "";
+  } else if (cur === "loading") {
+    const ld = live.load || {};
+    line = ld.kind === "wake" ? "Waking up" : "Loading weights";
+    sub = num(ld.percent) ? `${ld.percent}%` : "";
+    frac = num(ld.percent) ? ld.percent / 100 : 0;
+  } else if (cur === "unloaded") {
+    line = "Unloaded: the next request loads it";
+  } else if (cur === "asleep") {
+    line = "Asleep: the next request wakes it";
+  } else if (cur === "idle") {
+    line = "Idle";
+    sub = num(eng.max_context) ? `${kt(eng.max_context)} token window` : "";
+  }
+  text($("#activity"), line);
+  text($("#activity-sub"), live.queued > 0 ? `${fmt(live.queued)} queued` : sub);
+  html($("#activity-bar"), `<i style="width:${(clamp(frac, 0, 1) * 100).toFixed(1)}%"></i>`);
+}
+
 /* ---- sidebar ---- */
 const sbRow = (k, v, u, st) => `<div class="sb-row"><span class="k">${k}</span>${st ? `<span class="st">${st}</span>` : ""}<span class="num">${v}${u ? `<span class="u">${u}</span>` : ""}</span></div>`;
 const bar = f => `<div class="bar4"><i style="width:${(clamp(f || 0, 0, 1) * 100).toFixed(1)}%"></i></div>`;
@@ -154,6 +191,51 @@ function drawSide(hw, st, hist, eng, r) {
   html($("#experts"), `<div class="sb-stack" aria-hidden="true">${tiers.map(t => `<i style="width:${((t[2] || 0) * 100).toFixed(1)}%;background:${t[1]}"></i>`).join("")}</div>`
     + `<div class="sb-leg${spill ? " q" : ""}">${tiers.map(t => `<div style="--c:${t[1]}"><span>${t[0]}</span><b>${t[2] == null ? "-" : `${(t[2] * 100).toFixed(1)}%`}</b></div>`).join("")}</div>`
     + (spill ? `<div class="sb-note"><span><b>${spill.experts} experts on SSD (${gb})</b> ·</span> <span>free ${gb} RAM</span></div>` : ""));
+}
+
+/* ---- context fill, conversation cache, session totals ---- */
+function donut(frac, label, sub) {
+  const C = 2 * Math.PI * 34, on = clamp(frac, 0, 1) * C;
+  return `<div class="donut"><svg viewBox="0 0 84 84" aria-hidden="true"><circle cx="42" cy="42" r="34" fill="none" stroke="var(--raised)" stroke-width="8"/>`
+    + `<circle cx="42" cy="42" r="34" fill="none" stroke="var(--accent)" stroke-width="8" stroke-linecap="round" `
+    + `stroke-dasharray="${on.toFixed(1)} ${(C - on).toFixed(1)}" transform="rotate(-90 42 42)"/></svg>`
+    + `<div><div class="dv">${label}</div><div class="dk">${sub}</div></div></div>`;
+}
+function drawContext(slots, eng) {
+  const held = slots.filter(s => num(s.ctx_used));
+  const s = held.length ? held.reduce((a, b) => (b.ctx_used > a.ctx_used ? b : a)) : null;
+  const used = s ? s.ctx_used : 0, n = num(eng.max_context) ? eng.max_context : (s ? s.n_ctx : 0);
+  const frac = n ? used / n : 0;
+  text($("#ctx-sub"), s ? `Slot ${s.id + 1}` : "Widest slot");
+  html($("#ctx"), donut(frac, n ? `${Math.round(frac * 100)}%` : "-", `${kt(used)} / ${kt(n)}`));
+}
+function drawConv(eng, conv, reqs) {
+  const slots = num(eng.conversation_cache_slots) ? eng.conversation_cache_slots : null;
+  const mib = num(eng.conversation_cache_mib) ? eng.conversation_cache_mib : null;
+  text($("#conv-sub"), slots ? `${fmt(slots)} slots · ${(mib / 1024).toFixed(0)} GiB` : "");
+  const parked = num(conv.parked) ? conv.parked : null, bytes = num(conv.bytes) ? conv.bytes : null;
+  const evicted = num(conv.evictions) ? conv.evictions : null, restored = num(conv.restored) ? conv.restored : null;
+  const budget = mib ? mib * 2 ** 20 : 0;
+  const rows = reqs.filter(r => num(r.prompt_tokens) && r.prompt_tokens > 0).slice(0, 30);
+  const last = rows[0], share = r => num(r.reused) ? r.reused / r.prompt_tokens : null;
+  const hit = last ? share(last) : null;
+  const seen = rows.map(share).filter(num);
+  const mean = seen.length ? seen.reduce((t, x) => t + x, 0) / seen.length : null;
+  const series = rows.slice().reverse().map(share);
+  html($("#conv"), (parked != null ? `<div class="sb-met">${sbRow("Parked conversations", `${fmt(parked)}${slots ? `<span class="u"> / ${fmt(slots)}</span>` : ""}`)}${bar(slots ? parked / slots : 0)}</div>` : "")
+    + (bytes != null ? `<div class="sb-met">${sbRow("Their memory", budget ? `${gib(bytes)} / ${gib(budget)}` : gib(bytes), "GiB")}${bar(budget ? bytes / budget : 0)}</div>` : "")
+    + (evicted || restored ? `<div class="cv-note">${evicted ? `${fmt(evicted)} evicted` : ""}${evicted && restored ? " · " : ""}${restored ? `${fmt(restored)} tokens restored by the last request` : ""}</div>` : "")
+    + `<div class="sb-met">${sbRow("Reused by the last request", last ? `${fmt(last.reused || 0)} / ${fmt(last.prompt_tokens)}` : "-", hit != null ? `${Math.round(hit * 100)}%` : "")}${bar(hit || 0)}</div>`
+    + (seen.length > 1 ? `<div class="sb-met">${sbRow("Mean reuse", `${Math.round(mean * 100)}`, `% of ${seen.length} requests`)}${bar(mean)}` : "")
+    + spark(series.map(v => v == null ? null : v * 100), 100));
+}
+function drawTotals(t) {
+  if (!t || !num(t.requests)) { html($("#totals"), "No requests finished since the server started."); return; }
+  const pr = t.prompt_ms ? t.prompt / (t.prompt_ms / 1000) : null;
+  const wr = t.decode_ms ? t.written / (t.decode_ms / 1000) : null;
+  html($("#totals"), `Since ${clock(t.since * 1000)} · <b>${fmt(t.requests)}</b> requests · <b>${fmt(t.prompt)}</b> prompt tokens read`
+    + `${pr ? ` at <b>${fmt(pr)}</b> tok/s` : ""} (<b>${fmt(t.reused)}</b> reused) · <b>${fmt(t.written)}</b> written`
+    + `${wr ? ` at <b>${fmt(wr)}</b> tok/s` : ""}`);
 }
 
 /* ---- Speed ---- */
@@ -253,20 +335,70 @@ function slotRows(rows, series) {
   });
   return h + `</div>`;
 }
+// a request row opens its own timings; Enter and Space do it from the keyboard, Esc closes it
+$("#pane").addEventListener("click", e => {
+  const copy = e.target.closest("button.copy");
+  if (copy) {
+    const rec = ((M && M.requests) || []).find(r => r.id === selected.id);
+    if (rec && navigator.clipboard) {
+      navigator.clipboard.writeText(JSON.stringify(rec, null, 2)).then(() => {
+        copy.textContent = "Copied";
+        setTimeout(() => { copy.textContent = "Copy JSON"; }, 1200);
+      }).catch(() => {});
+    }
+    return;
+  }
+  const tr = e.target.closest("tr.req"); if (!tr || !tr.dataset.k) return;
+  selected.id = selected.id === tr.dataset.k ? null : tr.dataset.k;
+  draw();
+});
+$("#pane").addEventListener("keydown", e => {
+  const tr = e.target.closest("tr.req");
+  if (tr && tr.dataset.k && (e.key === "Enter" || e.key === " ")) {
+    e.preventDefault();
+    selected.id = selected.id === tr.dataset.k ? null : tr.dataset.k;
+    draw();
+    return;
+  }
+  if (e.key === "Escape" && selected.id) { selected.id = null; draw(); }
+});
+const selected = { id: null };       // the request whose timings the strip under the table shows
+const detailOf = r => {
+  const x = r.raw || r;
+  const cells = [["Prompt read", num(x.prompt_ms) ? `${x.prompt_ms.toFixed(0)} ms` : "-"],
+    ["Decode", num(x.decode_ms) ? `${x.decode_ms.toFixed(0)} ms` : "-"],
+    ["From cache", num(x.reused) && x.prompt_tokens ? `${Math.round(x.reused / x.prompt_tokens * 100)}% of the prompt` : "-"],
+    ["Drafts", num(x.drafts_accepted) ? `${fmt(x.drafts_accepted)} of ${fmt(x.drafts_offered)} accepted` : "-"],
+    ["Tokens per window", num(x.draft_len) ? x.draft_len.toFixed(1) : "-"],
+    ["Finish", x.finish || "-"]];
+  return `<div class="dl">${cells.map(([k, v]) => `<span>${k}<b>${esc(v)}</b></span>`).join("")}</div>`
+    + `<button type="button" class="copy">Copy JSON</button>`;
+};
 function requestsPane(live, reqs, multi) {
   const rows = [];
   if (!multi && (live.state === "reading" || live.state === "generating"))
-    rows.push({ t: Date.now() / 1000 - (live.elapsed_s || 0), id: "Running", path: "", out: live.generated, tps: live.tok_s, dur: live.elapsed_s, live: true });
-  reqs.forEach(r => rows.push({ t: r.time, id: r.id, slot: r.slot, path: r.path, out: r.output_tokens, tps: r.decode_tok_s, dur: r.duration_s, finish: r.finish }));
+    rows.push({ t: Date.now() / 1000 - (live.elapsed_s || 0), id: "Running", path: "", prompt: live.prompt_tokens,
+      out: live.generated, tps: live.tok_s, dur: live.elapsed_s, live: true });
+  reqs.forEach(r => rows.push({ t: r.time, id: r.id, slot: r.slot, path: r.path, prompt: r.prompt_tokens, cached: r.reused,
+    out: r.output_tokens, ttft: r.ttft_s, tps: r.decode_tok_s, hit: r.hit_rate, pcie: r.pcie_share, dur: r.duration_s, finish: r.finish, raw: r }));
   if (!rows.length) return `<div class="empty">No requests yet.</div>`;
   const ep = p => String(p || "-").replace("/v1/", "").replace("chat/completions", "chat");
-  return `<table><thead><tr><th>Time</th><th>ID</th>${multi ? "<th>Slot</th>" : ""}<th>Endpoint</th><th class="r">Output</th><th class="r">Rate</th><th class="r">Duration</th></tr></thead><tbody>`
+  const pct = v => num(v) ? `${Math.round(v * 100)}%` : "-";
+  const sel = rows.find(r => r.id === selected.id);
+  return (sel ? `<div class="reqdet">${detailOf(sel)}</div>` : "")
+    + `<table><thead><tr><th>Time</th><th>ID</th>${multi ? "<th>Slot</th>" : ""}<th class="col-ep">Endpoint</th>`
+    + `<th class="r">Prompt</th><th class="r col-cache">Cached</th><th class="r">Output</th><th class="r">TTFT</th>`
+    + `<th class="r">Rate</th><th class="r col-hit">Hit</th><th class="r col-pcie">PCIe</th><th class="r">Duration</th></tr></thead><tbody>`
     + rows.map(r => {
       // a request that did not simply stop is marked on its id, with the reason
       const odd = r.finish && r.finish !== "stop" ? (r.finish === "error" ? "err" : "warn") : "";
-      return `<tr${r.live ? ` class="live"` : ""}><td>${clock(r.t * 1000)}</td><td class="${odd}">${esc(r.id)}${odd ? ` · ${esc(r.finish)}` : ""}</td>`
+      const open = selected.id === r.id;
+      return `<tr class="req${r.live ? " live" : ""}${open ? " on" : ""}" data-k="${esc(r.id)}" tabindex="0" aria-expanded="${open}"><td>${clock(r.t * 1000)}</td><td class="${odd}">${esc(r.id)}${odd ? ` · ${esc(r.finish)}` : ""}</td>`
         + (multi ? `<td class="dim">${num(r.slot) ? `s${r.slot + 1}` : "-"}</td>` : "")
-        + `<td>${r.live ? "-" : esc(ep(r.path))}</td><td class="r">${num(r.out) ? fmt(r.out) : "-"}</td><td class="r">${num(r.tps) ? r.tps.toFixed(1) : "-"}</td>`
+        + `<td class="col-ep">${r.live ? "-" : esc(ep(r.path))}</td>`
+        + `<td class="r">${num(r.prompt) ? fmt(r.prompt) : "-"}</td><td class="r col-cache">${num(r.cached) ? fmt(r.cached) : "-"}</td>`
+        + `<td class="r">${num(r.out) ? fmt(r.out) : "-"}</td><td class="r">${num(r.ttft) ? `${r.ttft.toFixed(2)} s` : "-"}</td>`
+        + `<td class="r">${num(r.tps) ? r.tps.toFixed(1) : "-"}</td><td class="r col-hit">${pct(r.hit)}</td><td class="r col-pcie">${pct(r.pcie)}</td>`
         + `<td class="r">${num(r.dur) ? `${r.dur.toFixed(1)} s` : "-"}</td></tr>`;
     }).join("") + `</tbody></table>`;
 }
@@ -404,32 +536,66 @@ function draw() {
   text($("#model"), eng.model || "");
   drawModels(models, eng.model);
   drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);
+  drawState(live, slots, eng);
+  drawContext(slots, eng);
+  drawConv(eng, M.conversation || {}, reqs);
+  drawTotals(M.totals);
+  // what build this is, in the header: the version, the pack's quantization and the window
+  text($("#ident"), [eng.version ? `v${eng.version}` : null, eng.quant, num(eng.max_context) ? kt(eng.max_context) : null]
+    .filter(Boolean).join(" · "));
+  $("#model").title = eng.path || "";
+  const ldG = ld ? Object.entries(ld.gib || {}).map(([k, v]) => `${k} ${v.toFixed(1)} GiB`).join(" · ") : "";
+  text($("#detail"), ldG); $("#detail").hidden = !ldG;
   drawHero(live, hist, reqs, M.best || {}, slots, total);
   drawMain(live, hist, reqs, slots, total);
 }
 
 /* ---- logs ---- */
 const logEl = $("#log"), MAXLOG = 400;
-let logCount = 0, follow = true;
+let logCount = 0, follow = true, logLines = [];
+let logFilter = sessionStorage.getItem("basalt.logf") || "all";
+const keepLine = e => logFilter === "all" || (logFilter === "warn" ? e.lvl !== "info" : e.lvl === "err");
 function lineEl(e) {
   const d = document.createElement("div");
   if (e.lvl !== "info") d.className = e.lvl;
   const t = document.createElement("i"); t.textContent = clock(e.t * 1000);
   d.append(t, `  ${e.src === "srv" ? "[server] " : ""}${e.msg}`);
+  if (e.n > 1) { const b = document.createElement("b"); b.className = "ln"; b.textContent = ` ×${e.n}`; d.append(b); }
   return d;
 }
+// Redraws from the kept lines, so a filter change and a repeat collapse both work without the server's help.
+function renderLog() {
+  const runs = [];
+  for (const e of logLines) {
+    if (!keepLine(e)) continue;
+    const last = runs[runs.length - 1];
+    if (last && last.src === e.src && last.msg === e.msg && last.lvl === e.lvl) { last.n++; continue; }
+    runs.push({ ...e, n: 1 });
+  }
+  if (!runs.length) { clearLog(logLines.length ? "Nothing at this level." : "No log lines yet.", false); return; }
+  const at = logEl.scrollTop;
+  logEl.replaceChildren(...runs.slice(-MAXLOG).map(lineEl));
+  logEl.scrollTop = follow ? logEl.scrollHeight : at;
+}
 function append(lines) {
-  logEl.querySelector(".empty")?.remove();
-  logEl.append(...lines.map(lineEl));
-  while (logEl.childElementCount > MAXLOG) logEl.firstChild.remove();
+  logLines.push(...lines);
+  if (logLines.length > MAXLOG * 2) logLines = logLines.slice(-MAXLOG);
   logCount += lines.length; text($("#log-count"), `${fmt(logCount)} lines`);
-  if (follow) logEl.scrollTop = logEl.scrollHeight;
+  renderLog();
 }
 logEl.addEventListener("scroll", () => { follow = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 12; });
-function clearLog(note) {
-  logCount = 0; text($("#log-count"), "");
+function clearLog(note, reset = true) {
+  if (reset) { logCount = 0; text($("#log-count"), ""); logLines = []; }
   const d = document.createElement("div"); d.className = "empty"; d.textContent = note; logEl.replaceChildren(d);
 }
+const paintFilter = () => { for (const x of $("#log-filter").children) x.setAttribute("aria-pressed", String(x.dataset.f === logFilter)); };
+$("#log-filter").addEventListener("click", e => {
+  const b = e.target.closest("button[data-f]"); if (!b) return;
+  logFilter = b.dataset.f;
+  try { sessionStorage.setItem("basalt.logf", logFilter); } catch { /* private mode */ }
+  paintFilter(); follow = true; renderLog();
+});
+paintFilter();
 
 /* ---- polling ---- */
 let lastLog = 0;

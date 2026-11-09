@@ -12,6 +12,8 @@
 </head>
 <body>
 
+<noscript><p class="noscript">This page reads the server's own metrics, so it needs JavaScript.</p></noscript>
+
 <header class="bar">
   <div class="brand"><img src="web/mark.svg" alt=""><span class="wordmark">Basalt</span></div>
   <div class="crumb">
@@ -19,11 +21,13 @@
     <span class="model" id="model"></span>
     <div class="ms" id="models" hidden></div>
   </div>
+  <span class="ident" id="ident"></span>
   <span class="grow"></span>
   <span class="sp">
     <span class="lab"><span class="state" id="state" data-s="offline">Connecting</span><span class="state" id="pct" data-s="loading" hidden></span></span>
     <span class="pbar" id="pbar" hidden><i></i></span>
   </span>
+  <span class="where detail" id="detail" hidden></span>
   <span class="where" id="host"></span>
   <span class="where" id="keyed" hidden>API key</span>
 </header>
@@ -35,7 +39,19 @@
 </form>
 
 <main class="lay">
+  <section class="a-state card" aria-label="Model state">
+    <div class="st-l"><div class="st-k">Model state</div><div class="st-chips" id="states"></div></div>
+    <div class="st-r">
+      <div class="st-top"><span id="activity">-</span><span id="activity-sub"></span></div>
+      <div class="st-bar" id="activity-bar"><i></i></div>
+    </div>
+  </section>
+
   <aside class="a-side sb" aria-label="Hardware">
+    <div class="sb-ctx">
+      <div class="sb-h">Context<span id="ctx-sub"></span></div>
+      <div class="sb-body" id="ctx"></div>
+    </div>
     <div class="sb-h">GPUs<span>Charts · Last 60 s</span></div>
     <div class="sb-gpus" id="gpus"></div>
     <div class="sb-sys">
@@ -73,10 +89,20 @@
   <section class="a-main card" aria-label="Slots and requests">
     <div class="tabs" role="tablist" id="tabs"></div>
     <div class="pane" id="pane" role="tabpanel"></div>
+    <div class="totals" id="totals"></div>
+  </section>
+
+  <section class="a-conv card" aria-label="Conversation cache">
+    <div class="hd"><b>Conversation cache</b><span id="conv-sub"></span></div>
+    <div class="cv" id="conv"></div>
   </section>
 
   <section class="a-logs card" aria-label="Logs">
-    <div class="hd lh"><b>Logs</b><span id="log-count"></span></div>
+    <div class="hd lh"><b>Logs</b><span class="grow"></span><div class="lf" id="log-filter" role="group" aria-label="Log level">
+      <button type="button" data-f="all" aria-pressed="true">All</button>
+      <button type="button" data-f="warn" aria-pressed="false">Warnings</button>
+      <button type="button" data-f="err" aria-pressed="false">Errors</button>
+    </div><span id="log-count"></span></div>
     <div class="logs" id="log" role="log" aria-live="off" tabindex="0"></div>
   </section>
 </main>

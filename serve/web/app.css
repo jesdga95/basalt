@@ -21,6 +21,9 @@
   --warn: #E9C341;
   --err: #D93A5B;
   color-scheme: dark;
+  /* tints derived from the palette, so a hover or a ring follows the fg and accent instead of restating a hex */
+  --hover: color-mix(in oklab, var(--fg) 7%, transparent);
+  --accent-soft: color-mix(in oklab, var(--accent) 18%, transparent);
 }
 
 * { box-sizing: border-box; }
@@ -85,7 +88,8 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 
 /* Page: the hardware sidebar at full height, Speed across the top, the slots and the logs below */
 .lay { display: grid; gap: 16px; padding: 0 28px 16px; grid-template-columns: 320px minmax(0, 1.3fr) minmax(0, 1fr);
-  grid-template-rows: auto minmax(0, 1fr); grid-template-areas: "side hero hero" "side main logs"; }
+  grid-template-rows: auto auto minmax(0, 1fr) minmax(0, auto);
+  grid-template-areas: "state state state" "side hero hero" "side main logs" "side main conv"; }
 .a-side { grid-area: side; }
 .a-hero { grid-area: hero; }
 .a-main { grid-area: main; display: flex; flex-direction: column; }
@@ -269,7 +273,8 @@ tr.live td { color: var(--accent); }
   .bar { padding: 0 16px; gap: 12px; flex-wrap: wrap; height: auto; min-height: 56px; }
   .where { display: none; }
   .auth { margin: 0 16px 16px; }
-  .lay { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "hero" "main" "logs" "side"; padding: 0 16px 16px; }
+  .lay { grid-template-columns: minmax(0, 1fr); grid-template-rows: none;
+    grid-template-areas: "state" "hero" "main" "logs" "conv" "side"; padding: 0 16px 16px; }
   .trio, .hfoot { grid-template-columns: 1fr; }
   .trio > div + div, .hfoot > div + div { border-left: 0; border-top: 1px solid var(--line); }
   .cw { min-height: 120px; }
@@ -297,3 +302,71 @@ tr.live td { color: var(--accent); }
   .rw { column-gap: 10px; padding: 0 16px; }
   .rw .cx, .rw .spark, .rw .sk { display: none; }
 }
+
+/* ---- the stats page's own sections ---- */
+/* a stale dashboard behind the API key form */
+.lay.frozen { opacity: .5; }
+.noscript { margin: 0; padding: 18px 28px; color: var(--fg-2); font: 400 13px/1.5 var(--font-mono); }
+.ident { font: 400 12.5px/1 var(--font-mono); color: var(--fg-3); opacity: .8; white-space: nowrap; }
+.a-state { grid-area: state; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 28px; padding: 12px 20px; }
+.a-conv { grid-area: conv; display: flex; flex-direction: column; }
+
+/* Model state strip: every state named, the current one lit, and what it is doing now */
+.st-l { display: flex; align-items: center; gap: 16px; white-space: nowrap; }
+.st-k { font: 600 14px/1 var(--font-sans); }
+.st-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { font: 400 12.5px/1 var(--font-mono); color: var(--fg-3); background: var(--surface); border: 1px solid transparent; border-radius: 999px; padding: 6px 10px; white-space: nowrap; }
+.chip:hover { border-color: var(--line); }
+.chip[data-on="true"] { color: var(--basalt-950); background: var(--accent); font-weight: 600; }
+.st-r { display: grid; gap: 8px; min-width: 0; }
+.st-top { display: flex; justify-content: space-between; gap: 16px; font: 400 13px/1 var(--font-mono); color: var(--fg-2); white-space: nowrap; overflow: hidden; text-wrap: balance; }
+.st-top .u { margin-left: 6px; }
+.st-bar { height: 6px; border-radius: 3px; background: var(--raised); overflow: hidden; }
+.st-bar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .3s linear; }
+
+/* Context fill: a donut of the fullest slot, then the bars behind it */
+.sb-ctx { flex: none; }
+.donut { display: flex; align-items: center; gap: 16px; }
+.donut svg { width: 84px; height: 84px; flex: none; }
+.donut .dv { font: 600 24px/1 var(--font-sans); }
+.donut .dv small { font: 400 12.5px/1 var(--font-mono); color: var(--fg-3); margin-left: 4px; }
+.donut .dk { font: 400 12.5px/1 var(--font-mono); color: var(--fg-3); margin-top: 6px; }
+
+/* Requests footer: what has been served since the server started */
+.totals { flex: none; border-top: 1px solid var(--line); padding: 10px 20px; font: 400 12.5px/1.6 var(--font-mono); color: var(--fg-3); overflow: hidden; text-wrap: pretty; }
+.totals b { color: var(--fg-2); font-weight: 500; }
+
+/* Conversation cache: budget, the last request's reuse, and the reuse of recent ones */
+.cv { display: flex; flex-direction: column; gap: 12px; padding: 14px 20px 16px; min-height: 0; overflow: auto; scrollbar-gutter: stable; }
+.cv .spark { height: 44px; flex: none; }
+.cv .sb-row { line-height: 1.2; }
+.cv-note { font: 400 12.5px/1.4 var(--font-mono); color: var(--fg-3); }
+
+/* Logs: a level filter, and the count of a message repeated in a row */
+.lf { display: flex; gap: 4px; flex: none; }
+.lf button { padding: 4px 9px; border-radius: 5px; color: var(--fg-3); font: 500 12px/1.2 var(--font-mono); }
+.lf button:hover { color: var(--fg); }
+.lf button[aria-pressed="true"] { background: var(--surface); color: var(--fg); }
+.logs b.ln { color: var(--fg-3); font-weight: 500; }
+
+/* Requests: a row opens the full timings below the table */
+tbody tr.req { cursor: pointer; }
+tbody tr.req:hover td { background: var(--hover); }
+tbody tr.req.on td { background: var(--surface); }
+tbody tr.req:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.reqdet { border-top: 1px solid var(--line); background: var(--bg); padding: 12px 20px; flex: none; display: flex; align-items: baseline; gap: 18px;
+  transition: opacity .12s ease-out, transform .12s ease-out; }
+.reqdet .dl { flex: 1 1 auto; }
+.reqdet .copy { flex: none; font: 500 12px/1 var(--font-mono); color: var(--fg-3); border: 1px solid var(--line); border-radius: 5px; padding: 5px 9px; }
+.reqdet .copy:hover { color: var(--fg); border-color: var(--fg-3); }
+.dl { display: flex; flex-wrap: wrap; gap: 6px 26px; font: 400 12.5px/1.6 var(--font-mono); color: var(--fg-3); }
+.dl > span { white-space: nowrap; }
+.dl b { color: var(--fg); font-weight: 500; margin-left: 6px; }
+.sb-gt .bus { font: 400 11.5px/1 var(--font-mono); color: var(--fg-3); margin-left: 8px; }
+.sb-bus { font: 400 11.5px/1 var(--font-mono); color: var(--fg-3); margin-top: -6px; }
+.sb-vram { height: 34px; flex: none; position: relative; }
+.sb-vram > .spark, .sb-vram > .sb-ch { height: 100%; }
+.sb-cap { margin-bottom: 12px; }
+.sb-cap2 { font: 400 11.5px/1.4 var(--font-mono); color: var(--fg-3); margin: -4px 0 12px; }
+/* the header of a long request list stays put */
+.pane thead th { position: sticky; top: 0; z-index: 1; background: var(--panel); }
