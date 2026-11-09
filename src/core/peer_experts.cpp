@@ -73,7 +73,10 @@ void PeerExperts::close() {
         if (evict_ev_) cudaEventDestroy(evict_ev_);
         if (stream_) cudaStreamDestroy(stream_);
         if (refill_) cudaStreamDestroy(refill_);
+        for (cudaEvent_t e : marks_) cudaEventDestroy(e);
     }
+    marks_.clear();
+    marks_made_ = 0;
     d_x_ = d_out_ = h_x_ = h_out_ = nullptr;
     d_meta_ = h_meta_ = d_scratch_ = nullptr;
     d_q8_ = nullptr;
@@ -183,7 +186,12 @@ bool PeerExperts::open_plain(int device, int64_t n_layers, int64_t n_expert, int
     On on(device);
     device_ = device;
     const size_t row_bytes = (size_t) n_embd * sizeof(float);
+    constexpr int kMarks = 256;   // marks outstanding at once: a few exchanges per layer of two windows
+    marks_.assign(kMarks, nullptr);
+    bool made = true;
+    for (cudaEvent_t& e : marks_) made = made && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
     const bool ok =
+        ck(made ? cudaSuccess : cudaErrorMemoryAllocation, "exchange marks", err) &&
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "read stream", err) &&
         ck(cudaHostGetDevicePointer((void**) &rows_map_, rows, 0), "mapped rows", err) &&
@@ -229,6 +237,13 @@ void PeerExperts::slot_in(int32_t slot, const uint8_t* in, uint64_t off, uint64_
     cudaMemcpyAsync(const_cast<uint8_t*>(cache_.device_slot(slot)) + off, in + off, n, cudaMemcpyHostToDevice, refill_);
 }
 
+int64_t PeerExperts::mark_in() {
+    if (marks_.empty()) return -1;
+    On on(device_);
+    cudaEventRecord(marks_[(size_t) (marks_made_ % (int64_t) marks_.size())], refill_);
+    return marks_made_++;
+}
+
 void PeerExperts::copies_after(cudaEvent_t ev) {
     On on(device_);
     cudaStreamWaitEvent(refill_, ev, 0);
@@ -237,6 +252,12 @@ void PeerExperts::copies_after(cudaEvent_t ev) {
 bool PeerExperts::read_wait(std::string& err) {
     On on(device_);
     return ck(cudaStreamSynchronize(refill_), "reading experts", err);
+}
+
+bool PeerExperts::read_until(int64_t m, std::string& err) {
+    if (m < 0 || m + (int64_t) marks_.size() <= marks_made_) return read_wait(err);   // no mark, or its event was taken again
+    On on(device_);
+    return ck(cudaEventSynchronize(marks_[(size_t) (m % (int64_t) marks_.size())]), "reading experts", err);
 }
 
 bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive) {
