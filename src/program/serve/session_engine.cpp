@@ -427,7 +427,7 @@ public:
         cum_.observe_chances(conf_.data(), T - 1, a);
         n_draft_ = 0;
         if (!will_draft || max_window() < 2) return true;
-        if (basalt::model::Result r = rt_.session().draft_begin(outv[(size_t) a], p + a + 1); !r.ok()) {
+        if (basalt::model::Result r = rt_.session().draft_begin(outv[(size_t) a], p + a + 1, max_window() - 1); !r.ok()) {
             if (r.status == basalt::model::Status::NotImplemented) return true;
             runtime_.err = r.message;
             return false;
@@ -597,7 +597,7 @@ bool SessionRuntime::next_batch_window() {
         sl.n_dr = 0;
         bool drafting = false;
         if (fin == nullptr && session().max_window() > 1) {
-            const basalt::model::Result r = session().draft_begin(sl.x, sl.p);
+            const basalt::model::Result r = session().draft_begin(sl.x, sl.p, session().max_window() - 1);
             if (!r.ok() && r.status != basalt::model::Status::NotImplemented) return failed(r.message);
             drafting = r.ok();
         }

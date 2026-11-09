@@ -181,10 +181,10 @@ public:
 
     int max_window() const override { return std::clamp(m_.tiers().spec, 1, kMaxWindow); }
 
-    model::Result draft_begin(int32_t anchor, int64_t pos) override {
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
         std::string err;
-        if (!flush_features(pos, err) || !drafter_->draft_begin(dwin_, anchor, pos, std::min(max_window() - 1, kDsparkBlock), err))
+        if (!flush_features(pos, err) || !drafter_->draft_begin(dwin_, anchor, pos, std::clamp(n, 1, std::min(max_window() - 1, kDsparkBlock)), err))
             return {model::Status::Error, err};
         ops_->commit_window(pos, stream_);   // the compressor commits the drafter does not read run beside it
         ops_->end_window(true);   // the copies queued behind the drafter's inputs run while it drafts
