@@ -1634,6 +1634,38 @@
       "prefill_64k_tps": 4798.5,
       "decode_tps": 151.5,
       "notes": "headless desktop, 60 GiB RAM; the larger IQ4_XS pack OOMs at the 64k prefill on this box, so no IQ4_XS row"
+    },
+    {
+      "submitter": "Hotcooler",
+      "date": "2026-11-09",
+      "commit": "7004aa01ee",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        },
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        }
+      ],
+      "ram_gib": 247,
+      "cpu": "AMD EPYC 7F52, 16 cores",
+      "ram_gbps": 139.5,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 5725.3,
+      "prefill_64k_tps": 8763.3,
+      "decode_tps": 355.0
     }
   ]
 }
