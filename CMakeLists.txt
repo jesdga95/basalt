@@ -502,7 +502,7 @@ add_library(serve_shared STATIC src/program/serve/commands.cpp
             src/program/cli/tokens.cpp
             src/program/cli/help.cpp)
 target_include_directories(serve_shared PUBLIC include PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(serve_shared PUBLIC tiers model engine_session grammar tokenizer ${_gpu_runtime_target})
+target_link_libraries(serve_shared PUBLIC tiers model engine_session grammar tokenizer spec ${_gpu_runtime_target})
 
 add_executable(basalt src/program/generate.cpp
                        src/program/generate/adapter.cpp
