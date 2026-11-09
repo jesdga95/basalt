@@ -33,6 +33,14 @@ PILLOW_FORMATS = ("JPEG", "PNG", "BMP", "GIF", "WEBP", "TIFF", "AVIF", "HEIF", "
 _decodes = threading.Semaphore(4)               # reads run outside the request turn: this bounds Pillow's memory
 
 
+def _unlink_quietly(path: Path) -> None:
+    """Drop a scratch file; on Windows the encoder can still hold it open, and a request must not fail for that."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def model_plan(engine_bin: str, path: str, value, words: list[str]) -> dict:
     """The engine's choice for the gpu setting (`basalt --gpu-plan`) for a model with its flags: the cards, main first, as
     "devices" (their CUDA_VISIBLE_DEVICES spelling) and "cards", plus the lines to print once. The engine parses the flags
@@ -254,15 +262,20 @@ class Vision:
             self._pin(key, pins)
             if key in self.cache:
                 return self.cache[key]
-            img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
+            # the image and the encoder's answer are written under names of this attempt: the encoder holds the image
+            # while it reads it, so a second attempt at the same image must not write under that open handle
+            tag = uuid.uuid4().hex[:8]
+            img, part, out = self.dir / f"{key}-{tag}.img", self.dir / f"{key}-{tag}.part", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
-                line = self._enc(img, out)
+                line = self._enc(img, part)
             finally:                                                   # also when the pipe is gone
-                img.unlink(missing_ok=True)
+                _unlink_quietly(img)
             if not line.startswith("OK"):
+                _unlink_quietly(part)
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
+            os.replace(part, out)                                      # published whole: a reader never sees half of it
             return self._remember(key, out, int(line.split()[1]))
 
     def _enc(self, img: Path, out: Path) -> str:
