@@ -6,6 +6,8 @@
     python3 tools/convert/convert.py --dspark FILE --into PACK.basalt --undo-dir DIR
     python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] [--mtp-dense FILE] \\
         [--name NAME] [--workers N] [--force]
+    python3 tools/convert/convert.py --sections-from DEEPSEEK.basalt --checkpoint DIR --out MODEL.basalt [--stream-shards] \\
+        [--name NAME] [--workers N] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
@@ -31,6 +33,13 @@ From an NVFP4 checkpoint (--sections-from with --checkpoint)
                      as Q8_0. The GGUF metadata and the tokenizer come from the checkpoint's files.
   --dense-q8-0       Q8_0 projections instead of Q6_K (the 8-bit dense variant)
   The drafter and vision sections come from BASE byte for byte; BASE's vocabulary must be the checkpoint's.
+
+From NVIDIA's DeepSeek-V4.1 NVFP4 checkpoint (a deepseek41 BASE; tools/convert/checkpoint_deepseek41.py)
+  --checkpoint DIR   config.json, model.safetensors.index.json and the shards. The routed experts are repacked as above
+                     (w1 gate, w3 up, w2 down); the FP8 projections become Q8_0 of their exact values (BF16 where BASE
+                     reads BF16); the MXFP4 Engram rows are kept. Tokenizer, metadata, vision and drafter are BASE's
+  --stream-shards    the shards may arrive while the conversion runs, in file order (another process downloads them), and
+                     each is deleted once its tensors are written: the disk holds the pack and a shard or two
 
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
@@ -524,6 +533,14 @@ def from_checkpoint(a) -> None:
     import multiprocessing
     import checkpoint as C
     out, src = Path(a.out), Path(a.sections_from)
+    if src.is_file() and json.loads(ModelFile(str(src)).read("meta")).get("arch") == "deepseek41":
+        if a.dense_q8_0 or a.mtp_dense:
+            die("a deepseek41 BASE takes no --dense-q8-0 or --mtp-dense")
+        import checkpoint_deepseek41 as D
+        D.build(a, Job, fingerprint, source_record)
+        return
+    if a.stream_shards:
+        die("--stream-shards takes a deepseek41 BASE")
     partial = Path(str(out) + ".partial")
     if out.exists() and not a.force:
         die(f"{out} exists (use --force to overwrite)")
@@ -756,6 +773,8 @@ def main():
                          "with --requant-dense-q6k, the BF16 projections")
     ap.add_argument("--dense-q8-0", action="store_true",
                     help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")
+    ap.add_argument("--stream-shards", action="store_true",
+                    help="with --checkpoint and a deepseek41 --sections-from: shards arrive in file order and are deleted once used")
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     ap.add_argument("--dry-run", action="store_true",
@@ -777,15 +796,16 @@ def main():
         return
     if a.sections_from and a.checkpoint:
         if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab:
-            ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, --workers and --force")
+            ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, "
+                     "--stream-shards, --workers and --force")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
         if a.mtp_dense and not Path(a.mtp_dense).is_file():
             ap.error(f"missing input: {a.mtp_dense}")
         from_checkpoint(a)
         return
-    if a.dense_q8_0:
-        ap.error("--dense-q8-0 needs --checkpoint and --sections-from")
+    if a.dense_q8_0 or a.stream_shards:
+        ap.error("--dense-q8-0 and --stream-shards need --checkpoint and --sections-from")
     if not a.gguf:
         ap.error("--gguf is required")
     if not Path(a.gguf[0]).is_file():
