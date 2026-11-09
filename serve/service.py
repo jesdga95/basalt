@@ -136,6 +136,8 @@ class Service:
         self.totals = {"since": time.time(), "requests": 0, "prompt": 0, "reused": 0, "written": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0}
         self.conversation: dict = {}                     # the conversation cache's own figures, from the engine's log
+        self.conv_lock = threading.Lock()                # its own lock: note_engine_line runs inside LogBuffer.add, where
+                                                         # taking status_lock could meet a print() that holds it
         self.last_timings = None                         # last request's timings
         self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
@@ -683,7 +685,7 @@ class Service:
         park, back = _CACHE_FIGURES.search(line), _CACHE_RESTORED.search(line)
         if park is None and back is None:
             return
-        with self.status_lock:
+        with self.conv_lock:
             c = dict(self.conversation)
             if park is not None:
                 c.update(parked=int(park[1]), bytes=int(park[2]))

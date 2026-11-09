@@ -181,6 +181,35 @@ class Http(unittest.TestCase):
         self.assertEqual(self.call("/metrics")[1]["live"]["queue"], [])
         self.assertEqual(self.svc.waiting, {})
 
+    def test_totals_accumulate_over_finished_requests(self):
+        """The requests card's footer: what has been served since the server started."""
+        before = self.call("/metrics")[1]["totals"]
+        body = {"model": "basalt", "max_tokens": 8, "messages": [{"role": "user", "content": "hi there"}]}
+        code, _ = self.call("/v1/chat/completions", body)
+        self.assertEqual(code, 200)
+        after = self.call("/metrics")[1]["totals"]
+        self.assertEqual(after["requests"], before["requests"] + 1)
+        self.assertGreater(after["prompt"], before["prompt"])
+        self.assertEqual(after["written"], before["written"] + 8)
+
+    def test_the_conversation_cache_line_is_read(self):
+        """The engine logs the cache's figures beside a request, not in its DONE line; the hook keeps them."""
+        self.svc.note_engine_line("[server] conversation cache parked=3 bytes=1048576 evictions=2")
+        c = self.svc.metrics()["conversation"]
+        self.assertEqual((c["parked"], c["bytes"], c["evictions"]), (3, 1048576, 2))
+        self.svc.note_engine_line("[server] conversation cache restored 4096 tokens")
+        c2 = self.svc.metrics()["conversation"]
+        self.assertEqual(c2["restored"], 4096)
+        self.assertEqual(c2["parked"], 3)                      # one line does not clear the other's figures
+        self.svc.note_engine_line("[server] a line with nothing to keep")
+        self.assertEqual(self.svc.metrics()["conversation"], c2)
+
+    def test_a_log_line_that_names_the_cache_reaches_the_figures(self):
+        """LogBuffer.on_line is wired to the service, so a line the engine writes arrives without a second parser."""
+        self.svc.logs.on_line = self.svc.note_engine_line
+        self.svc.logs.add("eng", "[server] conversation cache parked=5 bytes=2048")
+        self.assertEqual(self.svc.metrics()["conversation"]["parked"], 5)
+
     def test_the_removed_endpoints_are_gone(self):
         for path in ("/api/requests", "/api-monitor", "/settings", "/config", "/mcp"):
             self.assertEqual(self.call(path)[0], 404, path)
