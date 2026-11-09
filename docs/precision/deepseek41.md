@@ -26,6 +26,10 @@ Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W, 121 GiB of RAM. Geom
 | Indexer keys and queries | E2M1, a power-of-two scale per 32 values (`--kv fp16`: fp16 keys, fp32 queries) | fp32 scores |
 | Output head | Q6_K | fp32 logits |
 
+The NVFP4 test pack differs in four rows: routed experts NVFP4 (E2M1 codes, an E4M3 scale per 16 values, an FP32 scale per matrix;
+q8_1 activations on the GPU, Q8_0 on the CPU), attention and shared-expert projections Q8_0 of NVIDIA's FP8 values, the Engram
+table MXFP4 (E2M1 codes, a power-of-two scale per 32 values), the output head Q8_0. It is not yet scored against BF16.
+
 All activations between stages are fp32. A decode kernel's output does not depend on how many tokens share its launch (bitwise).
 
 With the default `--kv fp8`, the attention caches round as the model's reference does (`act_quant`, `fp4_act_quant`; the code is Project Maya's, by way
