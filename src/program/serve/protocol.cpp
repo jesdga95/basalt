@@ -124,12 +124,20 @@ int Runtime::init_protocol() {
     in_eof = false;
     // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
     // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
-    std::thread([&] {
+    reader_stop_.store(false);
+    reader_ = std::thread([&] {
         // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
         // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
         // std::exit) would hang in exit(), and the server would wait for it forever
         std::string l, buf;
         char chunk[4096];
+        // the next bytes of stdin, waited for in slices so that the runtime's end stops this thread before its state
+        // goes; -2 when it has
+        auto read_some = [&]() -> std::ptrdiff_t {
+            while (!basalt::platform::pipe_wait_readable(0, 100))
+                if (reader_stop_.load()) return -2;
+            return (std::ptrdiff_t) basalt::platform::pipe_read(0, chunk, sizeof chunk);
+        };
         auto getline_fd = [&](std::string& out) -> bool {
             for (;;) {
                 const size_t nlpos = buf.find('\n');
@@ -138,7 +146,8 @@ int Runtime::init_protocol() {
                     buf.erase(0, nlpos + 1);
                     return true;
                 }
-                const std::ptrdiff_t n = (std::ptrdiff_t) basalt::platform::pipe_read(0, chunk, sizeof chunk);
+                const std::ptrdiff_t n = read_some();
+                if (n == -2) return false;
                 if (n < 0 && errno == EINTR) continue;
                 if (n <= 0) {
                     if (buf.empty()) return false;
@@ -152,7 +161,7 @@ int Runtime::init_protocol() {
         // exactly n raw bytes: what the line reader already holds, then the pipe
         auto read_exact = [&](size_t n, std::string& out) -> bool {
             while (buf.size() < n) {
-                const std::ptrdiff_t got = (std::ptrdiff_t) basalt::platform::pipe_read(0, chunk, sizeof chunk);
+                const std::ptrdiff_t got = read_some();
                 if (got < 0 && errno == EINTR) continue;
                 if (got <= 0) return false;
                 buf.append(chunk, (size_t) got);
@@ -231,7 +240,7 @@ int Runtime::init_protocol() {
         std::lock_guard<std::mutex> lk(in_mu);
         in_eof = true;
         in_cv.notify_one();
-    }).detach();
+    });
 
     // a request also stops when the RAM guard judges the RAM critical; `ram_stop` keeps that it did, so the request
     // ends on an error instead of a cancel
