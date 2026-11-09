@@ -44,6 +44,7 @@ Flow Runtime::dispatch() {
         }
         if (line.rfind("BSTOP ", 0) != 0 && !drain_windows()) return Flow::error;
     } else {
+        kv_ceiling_note();   // between requests too: the free VRAM also moves without the KV
         // idle: once no line has come for a second (a client's next turn usually comes sooner), what a crash would
         // lose goes to disk, then the idle conversations whose time is up leave VRAM, one at a time while no line
         // waits

@@ -72,6 +72,9 @@ public:
     /// The copies queued from now on start after `ev` (an event of any card).
     void copies_after(cudaEvent_t ev);
     bool read_wait(std::string& err);
+    /// A mark behind the pieces queued so far; `read_until` waits until they landed.
+    int64_t mark_in();
+    bool read_until(int64_t mark, std::string& err);
     /// One token's share over the pinned activation `x`, in the layout given; the rows land in open_plain's rows.
     bool launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t k,
                       const int32_t* kind, std::string& err);
@@ -190,6 +193,8 @@ private:
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
     cudaStream_t stream_ = nullptr, refill_ = nullptr;
     cudaEvent_t refill_ev_ = nullptr;
+    std::vector<cudaEvent_t> marks_;                  ///< open_plain: mark_in's marks, reused in turn
+    int64_t marks_made_ = 0;
     float* h_x_ = nullptr;   float* d_x_ = nullptr;   // n_tok x n_embd
     float* h_out_ = nullptr; float* d_out_ = nullptr; // compact rows
     void* h_meta_ = nullptr; void* d_meta_ = nullptr; // groups: ptr | start | dst | tok | count

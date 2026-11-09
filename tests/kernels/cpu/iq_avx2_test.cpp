@@ -7,6 +7,8 @@
 // IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS, the plain dot rows, and the IQ4_NL and Q2_0 down rows, on random
 // weights and activations with the model's row geometry, 1 to 8 tokens, plus weights and activations pinned to their
 // extreme codes.  The down rows must also not depend on the number of tokens in a call or on the row range.
+// IQ3_S, IQ3_XXS and IQ2_S also run with their grid rows gathered (iq256_gu_rows_mode 1), on both builds, bitwise
+// against mode 0.
 // The reference dequantizes the weights and the activation and sums in double; its error is reported (the float order of
 // the kernels differs from it by rounding only). On a CPU without AVX-VNNI the base build is checked against the
 // reference alone. Every build's gate/up and dot rows must also hash to the values frozen from the kernels (the decode
@@ -223,6 +225,31 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+                if (type == 18 || type == 21 || type == 22) {   // the gathering kernels against the half-at-a-time decode
+                    std::vector<std::vector<float>> g0(nt, std::vector<float>(FF)), gm(nt, std::vector<float>(FF)),
+                        o0(nt, std::vector<float>(FF)), om(nt, std::vector<float>(FF));
+                    float *g0p[MAXT], *gmp[MAXT], *o0p[MAXT], *omp[MAXT];
+                    for (int t = 0; t < nt; ++t) {
+                        g0p[t] = g0[(size_t) t].data(); gmp[t] = gm[(size_t) t].data();
+                        o0p[t] = o0[(size_t) t].data(); omp[t] = om[(size_t) t].data();
+                    }
+                    cpu::iq256_gu_rows_mode_base(0, type, blob.data(), f.gu_row, f.up_off, H, ap, nt, g0p, 0, FF);
+                    cpu::iq256_rows_mode_base(0, type, blob.data(), f.gu_row, H, ap, nt, o0p, 0, FF);
+                    for (int v = 0; v < (vnni ? 2 : 1); ++v) {
+                        (v ? cpu::iq256_gu_rows_mode_vnni : cpu::iq256_gu_rows_mode_base)(1, type, blob.data(), f.gu_row,
+                                                                                        f.up_off, H, ap, nt, gmp, 0, FF);
+                        (v ? cpu::iq256_rows_mode_vnni : cpu::iq256_rows_mode_base)(1, type, blob.data(), f.gu_row, H, ap,
+                                                                                  nt, omp, 0, FF);
+                        for (int t = 0; t < nt; ++t) {
+                            ++compared;
+                            if (std::memcmp(g0p[t], gmp[t], FF * 4) || std::memcmp(o0p[t], omp[t], FF * 4)) {
+                                std::printf("MISMATCH type %d nt %d mode %d token %d: gathered rows (%s) against mode 0\n",
+                                            type, nt, mode, t, v ? "vnni" : "base");
+                                ++bad;
+                            }
+                        }
+                    }
+                }
                 // reference on a few rows of the dot output
                 std::vector<float> wrow(H);
                 for (int r : {0, 1, 97, FF - 1}) {
@@ -432,7 +459,7 @@ int main(int argc, char** argv) {
         std::printf("  Q8_0 down activations: %d codes -128, %d of them in a block with a nonzero scale\n", codes128, scaled128);
         if (scaled128 != 0) { std::printf("QUANTIZER wrote -128 in a block with a nonzero scale\n"); ++bad; }
     }
-    std::printf("iq_avx2_test: %d base/vnni comparisons, %d failures\n", compared, bad);
+    std::printf("iq_avx2_test: %d base/vnni and gathered-row comparisons, %d failures\n", compared, bad);
 
     // ---- Q2_0 down rows (the pool's ActQ activations): 64-value blocks of 18 bytes, value i in byte i/4 bits 2*(i%4)
     {
@@ -540,7 +567,7 @@ int main(int argc, char** argv) {
             if (st512.max_rel > 1e-3) { std::printf("AVX-512 Q2_0 down rows too far from AVX2\n"); ++bad; }
         }
     }
-    std::printf("iq_avx2_test: %d base/vnni comparisons, %d failures\n", compared, bad);
+    std::printf("iq_avx2_test: %d base/vnni and gathered-row comparisons, %d failures\n", compared, bad);
 
     if (bench) {   // 200 gate/up rows (the pool's task) per call, the arena far larger than the caches
         for (int type : {22, 18, 21}) {
@@ -559,15 +586,16 @@ int main(int argc, char** argv) {
                 std::vector<std::vector<float>> ff(nt, std::vector<float>(FF));
                 float* fp[MAXT];
                 for (int t = 0; t < nt; ++t) fp[t] = ff[(size_t) t].data();
-                for (int v = 0; v < (vnni ? 2 : 1); ++v) {
-                    auto fn = v ? cpu::iq256_gu_rows_vnni : cpu::iq256_gu_rows_base;
-                    const int reps = 400;
-                    const double t0 = now_ms();
-                    for (int r = 0; r < reps; ++r) fn(type, blob.data(), f.gu_row, f.up_off, H, ap, nt, fp, 0, 200);
-                    const double ms = now_ms() - t0;
-                    std::printf("  type %2d nt %d %s: %.2f GB/s (in cache, one thread)\n", type, nt, v ? "vnni" : "base",
-                                (double) reps * 400.0 * (double) f.gu_row / (ms * 1e6));
-                }
+                for (int v = 0; v < (vnni ? 2 : 1); ++v)
+                    for (int m = 0; m <= 1; ++m) {
+                        auto fn = v ? cpu::iq256_gu_rows_mode_vnni : cpu::iq256_gu_rows_mode_base;
+                        const int reps = 400;
+                        const double t0 = now_ms();
+                        for (int r = 0; r < reps; ++r) fn(m, type, blob.data(), f.gu_row, f.up_off, H, ap, nt, fp, 0, 200);
+                        const double ms = now_ms() - t0;
+                        std::printf("  type %2d nt %d %s mode %d: %.2f GB/s (in cache, one thread)\n", type, nt,
+                                    v ? "vnni" : "base", m, (double) reps * 400.0 * (double) f.gu_row / (ms * 1e6));
+                    }
             }
         }
     }

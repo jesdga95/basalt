@@ -340,7 +340,9 @@ def make_handler(target: Service | Router):
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
-                    self._json(200, {"object": "list", "data": router.models()})
+                    models = router.models()
+                    # "data" is the OpenAI list shape; "models" is what newer Codex builds decode
+                    self._json(200, {"object": "list", "data": models, "models": models})
             elif path == "/props":
                 if self._authorized():
                     self._props()

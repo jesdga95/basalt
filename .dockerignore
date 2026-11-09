@@ -1,0 +1,14 @@
+.git
+.github
+build
+dist
+.venv
+models
+site
+assets
+**/__pycache__
+**/*.pyc
+*.basalt
+**/*.basalt
+**/*.tar.gz
+**/*.zip

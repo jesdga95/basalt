@@ -102,7 +102,7 @@ struct DsparkDrafter::Impl {
           *oa = nullptr, *mws = nullptr, *sh_g = nullptr, *sh_u = nullptr, *sh_h = nullptr, *moe_h = nullptr,
           *moe_d = nullptr, *logits = nullptr, *col = nullptr, *w1p = nullptr, *dconf = nullptr, *hcout = nullptr,
           *feat = nullptr, *mainx = nullptr, *mainxn = nullptr;
-    void *xq = nullptr, *xq2 = nullptr, *sh_q1 = nullptr, *sh_q2 = nullptr, *am_ws = nullptr;
+    void *xq = nullptr, *xq2 = nullptr, *sh_q1 = nullptr, *sh_q2 = nullptr, *moe_hq = nullptr, *am_ws = nullptr;
     int32_t *ids = nullptr, *dmeta = nullptr, *dpos = nullptr, *dstart = nullptr, *dn = nullptr, *dlim = nullptr,
             *dsel = nullptr, *dtok = nullptr, *dpos1 = nullptr;
     float* x_mask = nullptr;   // the mask rows of the block's input, four streams each
@@ -365,6 +365,7 @@ struct DsparkDrafter::Impl {
                                                    kernels::native_q8_1_bytes(kN, 8), attn_out_scratch_bytes(kT), 1 << 16});
         ok = ok && alloc(&xq, xq_bytes) && alloc(&xq2, std::max<size_t>(q_path_scratch_bytes(kT), 1 << 16)) &&
              alloc(&sh_q1, kernels::native_q8_1_bytes(kN, kT)) && alloc(&sh_q2, kernels::native_q8_1_bytes(kFF, kT)) &&
+             alloc(&moe_hq, kernels::native_q8_1_bytes(kT * kUsed * kFF, 1)) &&
              alloc(&am_ws, argmax_workspace_bytes()) && buf(ids, kT * kUsed) && buf(dmeta, kMetaInts) &&
              buf(dpos1, kInjectRows) && buf(x_mask, (size_t) 4 * (kT - 1) * kN);
         if (!ok) {
@@ -483,9 +484,10 @@ struct DsparkDrafter::Impl {
             hc_pre_rms_norm(x2, coef_a, kHcCoef, s.ffn_norm, kT, kN, kEps, cur, normed, st);
             ra.n_expert = s.n_exp;
             router(normed, s.router, s.router_bias, kT, ra, rlogits, ids, rw, st);
-            dspark_moe_gate_up(s.gate_exps.p, s.up_exps.p, kN, kFF, normed, ids, kT, kUsed, 10.f, moe_h, st);
-            dspark_moe_down(s.down_exps.p, kFF, kN, moe_h, ids, kT, kUsed, moe_d, st);
-            kernels::native_quantize_q8_1(normed, sh_q1, kN, kT, st);
+            kernels::native_quantize_q8_1(normed, sh_q1, kN, kT, st);   // the routed and the shared experts' input
+            dspark_moe_gate_up(s.gate_exps.p, s.up_exps.p, kN, kFF, sh_q1, ids, kT, kUsed, 10.f, moe_h, st);
+            kernels::native_quantize_q8_1(moe_h, moe_hq, kT * kUsed * kFF, 1, st);
+            dspark_moe_down(s.down_exps.p, kFF, kN, moe_hq, ids, kT, kUsed, moe_d, st);
             kernels::native_mmvq(s.sh_gate.type, s.sh_gate.p, sh_q1, sh_g, kN, kFF, kT, st);
             kernels::native_mmvq(s.sh_up.type, s.sh_up.p, sh_q1, sh_u, kN, kFF, kT, st);
             swiglu_clamped(sh_g, sh_u, kT * kFF, 10.f, sh_h, st);
@@ -635,8 +637,8 @@ bool DsparkDrafter::draft_begin(int w, int32_t anchor, int64_t pos, int n_out, s
     const std::vector<int64_t>& ring_pos = d.ring_pos[(size_t) w];
     n_out = std::clamp(n_out, 1, kT);
     try {
-        // the block's host inputs: four hyper-connection copies of the anchor's embedding, then the index arrays
-        cudaStreamSynchronize(d.st);   // the staging and the metadata block are reused
+        // the block's host inputs: four hyper-connection copies of the anchor's embedding, then the index arrays (the last
+        // block, which read them, has ended; an inject before this block may still run)
         if (!d.main.embedding_row(anchor, d.h_emb, err)) return false;
         for (int s = 1; s < 4; ++s) std::memcpy(d.h_emb + (size_t) s * kN, d.h_emb, (size_t) kN * 4);
         // the window is the run of positions before `pos` the rings hold

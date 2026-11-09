@@ -453,4 +453,14 @@ bool pread_all(int fd, void* dst, uint64_t n, uint64_t off) {
     return true;
 }
 
+std::string install_root() {
+    std::string dir = module_path();
+    for (int up = 0; up < 2; ++up) {   // the executable's name, then its directory
+        const size_t cut = dir.find_last_of("/\\");
+        if (cut == std::string::npos || cut == 0) return std::string();
+        dir.resize(cut);
+    }
+    return dir;
+}
+
 }  // namespace basalt::platform

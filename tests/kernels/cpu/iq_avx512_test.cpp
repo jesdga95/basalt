@@ -5,10 +5,13 @@
 //
 // Gate/up rows (`iq512_gu_rows`) and plain dot rows (`iq512_rows`) of IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S and IQ2_S at the
 // model's row geometry, 1 to 8 tokens, on random weights, on weights pinned to their extreme codes (every grid index and
-// sign bit set, and every one clear) and with saturating activations.  Checks: (1) every output word hashes to the value
+// sign bit set, and every one clear) and with saturating activations.  Checks: (1) every dot-row word hashes to the value
 // the kernels gave when the hash was frozen (the decode may change, the bits may not); (2) a token's rows do not depend on
-// how many tokens share the call; (3) the dot rows against a double reference (dequantize, then sum in double), whose
-// error is reported.  The fixture uses only the raw generator output, so it is the same on every standard library.
+// how many tokens share the call; (3) the dot rows and the gate/up rows against a double reference (dequantize, then sum in
+// double), whose error is reported.  The dot rows are hashed: their integer decode and float reduction are the same on
+// every compiler.  The gate/up rows carry the silu, whose expf comes from the C library and does not agree between MSVC
+// and glibc, so they are checked against the reference instead of a frozen bit pattern.  The fixture uses only the raw
+// generator output, so it is the same on every standard library.
 // `--print` prints the hashes, `--bench` one in-cache thread's rate per format and token count.
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/ggml/ggml.h"
@@ -37,10 +40,10 @@ struct Frozen {
     int type;
     uint64_t hash;
 };
-// FNV-1a over every output word of every mode, token count and kernel, in the order main() computes them
+// FNV-1a over every dot-row word of every mode and token count, in the order main() computes them
 constexpr Frozen kFrozen[] = {
-    {16, 0x9fdbeb21f694fd2dull}, {17, 0xf352818aa1e11197ull}, {18, 0xd6afdf7513d359a7ull},
-    {21, 0x0b05f3ee4879334bull}, {22, 0x397461e6abe5db6full},
+    {16, 0x5863fdcf90fa4725ull}, {17, 0x3acf759ebce5f2a1ull}, {18, 0x5861282d89bf5a41ull},
+    {21, 0x931a4e9ae9822c6aull}, {22, 0xacaaeba7bf448c1eull},
 };
 
 // mode 0 random bytes, 1 every code bit set, 2 random, 3 every code bit clear; a valid small fp16 scale at the start of
@@ -98,7 +101,7 @@ int main(int argc, char** argv) {
         if (!cpu::native_fmt(type, 20, H, FF, f, err)) { std::printf("native_fmt(%d): %s\n", type, err.c_str()); return 1; }
         const ggml_type_traits* tr = ggml_get_type_traits((ggml_type) type);
         uint64_t h = 1469598103934665603ull;
-        double max_rel = 0;
+        double max_rel = 0, max_gu = 0;
         size_t tok_diff = 0;
         std::mt19937 rng(11 + (unsigned) type);
         for (int mode = 0; mode < MODES; ++mode) {
@@ -133,30 +136,39 @@ int main(int argc, char** argv) {
                 cpu::iq512_gu_rows(type, blob.data(), f.gu_row, f.up_off, H, ap, nt, fp, 0, FF);
                 cpu::iq512_rows(type, blob.data(), f.gu_row, H, ap, nt, dp, 0, FF);
                 for (int t = 0; t < nt; ++t) {
-                    fnv(h, fp[t], FF);
                     fnv(h, dp[t], FF);
                     for (int r = 0; r < FF; ++r)
                         tok_diff += std::memcmp(&fp[t][r], &one_ff[(size_t) t][(size_t) r], 4) != 0 ||
                                     std::memcmp(&dp[t][r], &one_d[(size_t) t][(size_t) r], 4) != 0;
                 }
-                std::vector<float> wrow(H);
+                std::vector<float> wrow(H), wup(H);
                 for (int r : {0, 1, 97, FF - 1}) {
                     tr->to_float(blob.data() + (size_t) r * f.gu_row, wrow.data(), H);
+                    tr->to_float(blob.data() + f.up_off + (size_t) r * f.gu_row, wup.data(), H);
                     for (int t = 0; t < nt; ++t) {
-                        double want = 0;
-                        for (int i = 0; i < H; ++i) want += (double) wrow[(size_t) i] * (double) actf[(size_t) t][(size_t) i];
+                        double want = 0, up = 0;
+                        for (int i = 0; i < H; ++i) {
+                            const double a = (double) actf[(size_t) t][(size_t) i];
+                            want += (double) wrow[(size_t) i] * a;
+                            up += (double) wup[(size_t) i] * a;
+                        }
                         max_rel = std::max(max_rel, std::fabs(dp[t][r] - want) / std::max(1e-3, std::fabs(want)));
+                        const double gu = (want / (1.0 + std::exp(-want))) * up;   // silu(gate_r . a) * (up_r . a)
+                        max_gu = std::max(max_gu, std::fabs(fp[t][r] - gu) / std::max(1e-3, std::fabs(gu)));
                     }
                 }
             }
         }
         const bool hash_ok = h == fz.hash;
-        std::printf("  type %2d: hash %016llx %s, token-count dependence %zu words, dot rows vs double: max rel %.3g\n", type,
-                    (unsigned long long) h, hash_ok ? "(frozen)" : "(DIFFERS from the frozen hash)", tok_diff, max_rel);
+        std::printf("  type %2d: hash %016llx %s, token-count dependence %zu words, dot rows vs double: max rel %.3g, "
+                    "gate/up rows vs double: max rel %.3g\n",
+                    type, (unsigned long long) h, hash_ok ? "(frozen)" : "(DIFFERS from the frozen hash)", tok_diff, max_rel,
+                    max_gu);
         if (print) std::printf("    {%d, 0x%016llxull},\n", type, (unsigned long long) h);
         bad += !hash_ok;
         bad += tok_diff != 0;
-        if (max_rel > 1e-3) { std::printf("REFERENCE ERROR too large for type %d\n", type); ++bad; }
+        if (max_rel > 1e-3) { std::printf("REFERENCE ERROR too large for type %d (dot rows)\n", type); ++bad; }
+        if (max_gu > 1e-4) { std::printf("REFERENCE ERROR too large for type %d (gate/up rows)\n", type); ++bad; }
     }
     std::printf("iq_avx512_test: %s\n", bad ? "FAIL" : "PASS");
 

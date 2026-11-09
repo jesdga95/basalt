@@ -140,14 +140,16 @@ function drawSide(hw, st, hist, eng, r) {
 
   // the tier split of the last request's routed lookups; the peer tier shows only when the engine reports it, the SSD
   // tier and the warning only while experts are read from the SSD
-  const peer = r && num(r.pcie_share) ? r.pcie_share : null, hit = r && num(r.hit_rate) ? r.hit_rate : null;
+  // every expert in VRAM: no lookup ledger exists to read, and the split is all VRAM
+  const resident = !eng.spill && num(eng.expert_slots) && num(eng.expert_total) && eng.expert_total > 0 && eng.expert_slots >= eng.expert_total;
+  const peer = r && num(r.pcie_share) ? r.pcie_share : null, hit = resident ? 1 : r && num(r.hit_rate) ? r.hit_rate : null;
   const spill = eng.spill, ssd = spill ? (r && num(r.ssd_share) ? r.ssd_share : hit == null ? null : 0) : 0;
   const tiers = [["VRAM", "var(--fg)", hit == null ? null : hit * (1 - (peer || 0))]];
   if (peer != null) tiers.push(["Peer", "var(--fg-3)", peer]);
   tiers.push(["CPU", "var(--basalt-500)", hit == null ? null : Math.max(0, (1 - hit) * (1 - (peer || 0)) - (ssd || 0))]);
   if (spill) tiers.push(["SSD", "var(--warn)", ssd]);
   $(".sb-exp").classList.toggle("spill", !!spill);
-  text($("#exp-note"), spill ? "SSD in use" : "Last request");
+  text($("#exp-note"), spill ? "SSD in use" : resident ? "All in VRAM" : "Last request");
   const gb = spill ? `${(spill.bytes / 1024 ** 3).toFixed(1)} GiB` : "";
   html($("#experts"), `<div class="sb-stack" aria-hidden="true">${tiers.map(t => `<i style="width:${((t[2] || 0) * 100).toFixed(1)}%;background:${t[1]}"></i>`).join("")}</div>`
     + `<div class="sb-leg${spill ? " q" : ""}">${tiers.map(t => `<div style="--c:${t[1]}"><span>${t[0]}</span><b>${t[2] == null ? "-" : `${(t[2] * 100).toFixed(1)}%`}</b></div>`).join("")}</div>`
@@ -295,7 +297,7 @@ function ctxHistory(reqs) {
       g += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${hh.toFixed(1)}" fill="${col}"/>`;
     });
   });
-  return `<div class="cx-hist"><div class="hh"><b>Tokens per request</b><span>Last ${h.length} requests</span></div><div class="cx-chart">`
+  return `<div class="cx-hist"><div class="hh"><b>Tokens per request</b><span>${h.length === 1 ? "Last request" : `Last ${h.length} requests`}</span></div><div class="cx-chart">`
     + `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Tokens per request">`
     + `<line x1="0" x2="${W}" y1="${H}" y2="${H}" stroke="var(--line)"/><line x1="0" x2="${W}" y1="${H / 2}" y2="${H / 2}" stroke="var(--line-soft)" stroke-dasharray="2 4"/>${g}</svg>`
     + `<span class="tk" style="top:0">${kc(top)}</span><span class="tk" style="top:50%">${kc(top / 2)}</span><span class="tk" style="top:100%">0</span>`

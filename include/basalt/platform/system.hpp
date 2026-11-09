@@ -19,9 +19,9 @@ int64_t process_id();
 /// Windows subsystem.
 std::string host_os_name();
 
-/// The Python the server runs under: the virtual environment in `src_dir` when it has one, else the interpreter name
+/// The Python the server runs under: the virtual environment in `root` (`install_root()`) when it has one, else the interpreter name
 /// the platform puts on PATH.
-std::string python_interpreter(const std::string& src_dir);
+std::string python_interpreter(const std::string& root);
 
 /// Asks that this process be the one ended first if the machine runs out of memory. No effect where the OS has no
 /// such knob.

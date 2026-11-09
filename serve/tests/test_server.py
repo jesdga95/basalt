@@ -2617,6 +2617,15 @@ class UsageAndStatus(unittest.TestCase):
         self.assertGreaterEqual(s["activity"]["requests"], 1)
         self.assertEqual(s["last_timings"]["cache_n"], ClockedEngine.REUSED)
         self.assertIn("at", s["last_timings"])
+        self.assertIsNone(s["context"]["elastic_kv_ceiling"])             # an engine without an elastic KV
+
+    def test_v1_status_elastic_kv_ceiling(self):
+        """The ceiling is the engine's latest INFO elastic_kv_ceiling, as it moves."""
+        self.assertFalse(hasattr(self.engine, "info"))                    # the mock reports no facts
+        self.addCleanup(delattr, self.engine, "info")
+        for cells in (180224, 179968):
+            self.engine.info = {"elastic_kv_ceiling": cells}
+            self.assertEqual(json.loads(self.request("/v1/status")[1])["context"]["elastic_kv_ceiling"], cells)
 
     def test_no_clock(self):
         """An engine without a clock (MockEngine): no timings, nothing cached."""
