@@ -305,6 +305,25 @@ inline void dequantize_nvfp4(const uint8_t* block, float* out) {
     }
 }
 
+// ---- MXFP4: 32 elements from a 17-byte block { uint8 e (E8M0); uint8 qs[16] }, transcribed from
+// dequantize_row_mxfp4 and ggml_e8m0_to_fp32_half (ggml): d = 2^(e - 128) (half the scale, the e2m1 values being
+// doubled), low nibble element j, high nibble j + 16.
+inline float e8m0_to_fp32_half(uint8_t x) {
+    const uint32_t bits = x < 2 ? 0x00200000u << x : (uint32_t)(x - 1) << 23;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+inline void dequantize_mxfp4(const uint8_t* block, float* out) {
+    const float d = e8m0_to_fp32_half(block[0]);
+    const uint8_t* qs = block + 1;
+    for (int j = 0; j < 16; ++j) {
+        out[j] = (float)kvalues_fp4[qs[j] & 0x0F] * d;
+        out[j + 16] = (float)kvalues_fp4[qs[j] >> 4] * d;
+    }
+}
+
 // ---- element types
 inline void dequantize_f32(const uint8_t* p, float* out, int n) {
     std::memcpy(out, p, (size_t)n * 4);
