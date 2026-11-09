@@ -1634,6 +1634,56 @@
       "prefill_64k_tps": 4798.5,
       "decode_tps": 151.5,
       "notes": "headless desktop, 60 GiB RAM; the larger IQ4_XS pack OOMs at the 64k prefill on this box, so no IQ4_XS row"
+    },
+    {
+      "submitter": "giveen",
+      "date": "2026-11-09",
+      "commit": "89fa1ddd58",
+      "preset": "community-1",
+      "model": "DeepSeek-V4.1-Flash",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 475,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 48.6
+        }
+      ],
+      "ram_gib": 247,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 72.2,
+      "os": "Linux",
+      "quant": "IQ1_M",
+      "kv": "fp8+fp4",
+      "prefill_16k_tps": 2333.3,
+      "prefill_64k_tps": 2992.0,
+      "decode_tps": 102.0
+    },
+    {
+      "submitter": "giveen",
+      "date": "2026-11-09",
+      "commit": "89fa1ddd58",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 475,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 48.9
+        }
+      ],
+      "ram_gib": 247,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 72.7,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 9705.5,
+      "prefill_64k_tps": 10521.2,
+      "decode_tps": 378.2
     }
   ]
 }
