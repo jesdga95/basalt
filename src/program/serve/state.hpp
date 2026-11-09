@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <thread>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -78,7 +79,11 @@ public:
     Runtime(basalt::program::CommonOptions& options, basalt::core::ModelFile& file, std::string& error, const int64_t& vocab,
             std::optional<basalt::program::grammar::PackVocab>& vocab_tables)
         : o(options), model_file(file), err(error), n_vocab(vocab), grammar_vocab(vocab_tables) {}
-    virtual ~Runtime() = default;
+    // the stdin reader thread uses this object's state: it ends before the object does
+    virtual ~Runtime() {
+        reader_stop_.store(true);
+        if (reader_.joinable()) reader_.join();
+    }
     int execute();
     Flow dispatch();
     int run_requests();
@@ -170,6 +175,8 @@ public:
     uint64_t gent_seq{};
     std::atomic<bool> stop_req{};
     std::atomic<bool> stdin_lost{};
+    std::thread reader_{};
+    std::atomic<bool> reader_stop_{};
     std::mutex in_mu{};
     std::condition_variable in_cv{};
     std::deque<std::string> in_lines{};
