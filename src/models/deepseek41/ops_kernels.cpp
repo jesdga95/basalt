@@ -311,7 +311,7 @@ public:
     void end_window(bool all) override {
         // the pieces that land while the window's output and the drafter's inputs are on their way
         constexpr int kEndPieces = 8;
-        if (tier_) tier_->pump(all ? ExpertTier::kAllPieces : kEndPieces);
+        if (tier_) tier_->pump(-1, all ? ExpertTier::kAllPieces : kEndPieces);
     }
 
     bool attention_batch(int il, int64_t pos0, int n_tokens, const int32_t*, const float* x, float* out, int,
@@ -691,7 +691,7 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
-        tier_->pump(2 + T);   // what this layer's head leaves the bus of the promotions queued before it
+        tier_->pump(il, 2 + T);   // what this layer's head leaves the bus of the promotions queued before it
         await_ids(st, T * K);
         int32_t uniq[ExpertTier::kMaxK];
         int nu = 0;
@@ -831,7 +831,7 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
-        tier_->pump(3);
+        tier_->pump(il, 3);
         if (shared_out) await_ids(st, K);
         else cudaStreamSynchronize(st);
         ExpertTier::Lookup lk;

@@ -190,6 +190,28 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
     check(same, "the second card's rows differ from the main card's");
     std::printf("%-7s/%-7s second card vs main card, shares of 1..6: %s\n", nm(gu), nm(d), same ? "bitwise same" : "DIFFER");
 
+    // an exchange in pieces as the tier queues them, landed by its mark: slot 0's bytes out, the next blob's in; then
+    // slot 0 gets its own blob back the same way
+    {
+        uint8_t *out = nullptr, *back = nullptr;
+        ck(cudaHostAlloc((void**) &out, L.bytes, cudaHostAllocPortable), "out");
+        ck(cudaHostAlloc((void**) &back, L.bytes, cudaHostAllocPortable), "back");
+        constexpr uint64_t kPiece = 1ull << 20;
+        const auto exchange = [&](uint8_t* to, const uint8_t* from) {
+            for (uint64_t off = 0; off < L.bytes; off += kPiece) peer.slot_out(0, to, off, std::min<uint64_t>(kPiece, L.bytes - off));
+            for (uint64_t off = 0; off < L.bytes; off += kPiece) peer.slot_in(0, from, off, std::min<uint64_t>(kPiece, L.bytes - off));
+            return peer.read_until(peer.mark_in(), err);
+        };
+        std::memcpy(stage, blob[1].data(), L.bytes);
+        bool ok = exchange(out, stage) && !std::memcmp(out, blob[0].data(), L.bytes);
+        std::memcpy(stage, blob[0].data(), L.bytes);
+        ok = ok && exchange(back, stage) && !std::memcmp(back, blob[1].data(), L.bytes);
+        check(ok, "an exchange's bytes out or in");
+        std::printf("%-7s/%-7s exchange in pieces, landed by its mark: %s\n", nm(gu), nm(d), ok ? "ok" : "WRONG");
+        cudaFreeHost(out);
+        cudaFreeHost(back);
+    }
+
     if (bench) {
         uint8_t* out = nullptr;
         ck(cudaHostAlloc((void**) &out, L.bytes, cudaHostAllocPortable), "out");
