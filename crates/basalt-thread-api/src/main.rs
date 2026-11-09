@@ -377,7 +377,13 @@ async fn main() -> std::result::Result<(),Box<dyn std::error::Error>> {
        .route("/v1/threads/{id}/turns",post(run_turn))
        .merge(contexts::router())
        .with_state(app);
-    let addr:SocketAddr="127.0.0.1:8095".parse()?;
+    // The port is configurable because the loopback range is shared with other local services;
+    // the address itself stays loopback-only: only the Basalt handler talks to this sidecar.
+    let port:u16=match env::var("BASALT_THREAD_API_PORT"){
+        Ok(p)=>p.parse().map_err(|_|format!("BASALT_THREAD_API_PORT is not a port: {p}"))?,
+        Err(_)=>"8095".parse()?,
+    };
+    let addr:SocketAddr=(std::net::Ipv4Addr::LOCALHOST, port).into();
     let listener=tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener,router).await?;
     Ok(())
