@@ -2,6 +2,11 @@
 
 Binding interface between parallel implementation streams. Design: [agent-context-sharing.md](agent-context-sharing.md).
 
+## Stream claims (as of 2026-11-10) — avoid duplicate work
+Another local AI already holds worktrees `ctx-a-registry` (A), `ctx-d-scheduler` (D) and `ctx-engine-bc` (B+C). Those streams stay theirs.
+This base branch (`ctx/00-base`) = design doc + Stateful Threads v1 merge + this contract; **rebase those branches onto it** (`git rebase ctx/00-base`) so the Rust workspace and thread API they extend exist.
+Claude holds E (adapters/Mantle) and the later serial integration (engine `CONTEXT_*` commands, `serve/service.py`, docs). Do not touch those paths.
+
 ## File ownership (no stream edits another's files)
 | Stream | Owns |
 | --- | --- |
