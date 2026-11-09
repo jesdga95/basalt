@@ -34,6 +34,8 @@ function(basalt_gpu_test)
   _basalt_labelled_test(gpu ${ARGN})
 endfunction()
 
+include(cmake/context.cmake)
+
 # the CUDA language gives the .cu compile rules but not the imported targets, so `CUDA::cudart` is brought in
 # explicitly for the host-side programs that call the runtime themselves
 find_package(CUDAToolkit REQUIRED)

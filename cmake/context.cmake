@@ -1,0 +1,18 @@
+# Agent context sharing (docs/architecture/agent-context-sharing.md). Host-only C++: no CUDA, no driver.
+# Workers add files only: src/context/*.cpp join basalt_context, tests/context/*_test.cpp each become a cpu test.
+file(GLOB BASALT_CONTEXT_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/context/*.cpp)
+add_library(basalt_context STATIC ${BASALT_CONTEXT_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/src/context/_anchor.cpp)
+target_include_directories(basalt_context PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(basalt_context PUBLIC cxx_std_20)
+find_package(Threads REQUIRED)
+target_link_libraries(basalt_context PUBLIC Threads::Threads)
+if(BUILD_TESTING)
+  file(GLOB BASALT_CONTEXT_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/context/*_test.cpp)
+  foreach(t ${BASALT_CONTEXT_TESTS})
+    get_filename_component(n ${t} NAME_WE)
+    add_executable(${n} ${t})
+    target_link_libraries(${n} PRIVATE basalt_context)
+    basalt_cpu_test(NAME ${n} COMMAND ${n})
+    set_tests_properties(${n} PROPERTIES TIMEOUT 120)
+  endforeach()
+endif()
