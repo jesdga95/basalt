@@ -5,7 +5,8 @@
 //   2. lookup drafts that are mostly rejected stop being taken (their bucket's rate falls);
 //   3. lookup drafts that are always accepted are taken, and the window grows with them;
 //   4. match-length buckets learn separately (short matches failing does not stop long ones);
-//   5. the policy never proposes a window beyond its cap.
+//   5. the policy never proposes a window beyond its cap;
+//   6. a size measured too dear long ago is measured again.
 #include "basalt/spec/draft_policy.hpp"
 
 #include <cstdio>
@@ -57,6 +58,8 @@ int main() {
         check(k.lookup && k.t == 6, "an unmeasured size is probed for a confident lookup");
         for (int i = 0; i < 3; ++i) p.observe(true, 6, 5, 40, 3.0 * cost(6));   // it turns out very expensive
         check(!p.choose(4, 5, 40).lookup, "after the probes, the measured cost decides");
+        for (int i = 0; i < 300; ++i) p.observe(false, 4, 3, 0, cost(4));
+        check(p.choose(4, 5, 40).lookup, "a size measured long ago is probed again");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

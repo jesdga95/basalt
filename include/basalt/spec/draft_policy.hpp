@@ -11,8 +11,9 @@
 //           match was about as long (4 buckets of match length, decayed counts), at the measured cost of k + 1
 //
 // and takes the lookup window only when its best E/cost beats the MTP's by `margin`. Costs are the measured round
-// times per window size (EMA; sizes not seen yet are scaled from seen ones by a prior shape), so the policy adapts
-// to the machine and the context length. It only chooses which drafts to verify: the output is unchanged.
+// times: a scale that follows every round times a base per window size that follows that size's rounds (sizes not
+// measured lately are inferred from the ones that were, or scaled by a prior shape), so the policy adapts to the
+// machine and the context length, and the costs of sizes not taken lately move with the ones taken. It only chooses which drafts to verify: the output is unchanged.
 #pragma once
 
 #include <array>
@@ -40,11 +41,18 @@ public:
 
 private:
     static int bucket(int match);
+    bool unmeasured(int t) const;          // a size measured too few times, or too long ago, to trust its cost
+    bool recent(int t) const;              // measured within the last rounds
+    double base(int t) const;              // a size's cost relative to the scale, measured or inferred
+    double base_from(int t, bool lately) const;   // t's base from the other (recent) sizes; < 0 without any
     double mtp_tokens(int t) const;
 
     int max_t_;
     double margin_;
-    std::array<double, kMaxT + 1> cost_{}, cost_n_{};      // round ms by window size
+    double scale_ = 0.0;                                   // round ms = scale x base(size)
+    std::array<double, kMaxT + 1> base_{}, base_n_{};      // by window size; rounds behind it
+    std::array<long, kMaxT + 1> seen_{};                   // the round each size was last measured
+    long round_ = 0;
     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
 };
