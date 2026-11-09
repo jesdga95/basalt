@@ -21,30 +21,12 @@ void Runtime::report_cache(int slot, bool cached, const std::vector<int32_t>& he
                            const std::vector<ImgKey>& images, const std::vector<ConvCheckpoint>& saved) {
     cached = cached && o.prompt_cache > 0;
     std::printf("SCACHE %d %zu", slot, cached ? held.size() : size_t(0));
-    // Shared system-prefix checkpoints are reusable, but do not establish conversation affinity.
-    size_t shared = 0;
-    std::string role;
-    if (cached && o.turn_token >= 0 && !held.empty() && held[0] == o.turn_token) {
-        if (text_tokenizer.loaded())
-            for (size_t i = 1; i < held.size() && role.size() < 7; ++i) {
-                const int32_t id = held[i];
-                if (id < 0 || (size_t) id >= text_tokenizer.vocab_size()) break;
-                role += text_tokenizer.token_bytes(id);
-            }
-        // Without role bytes, do not guess whether this is a shared system prefix.
-        if (!text_tokenizer.loaded()) shared = held.size();
-    }
-    if (role.starts_with("system\n")) {
-        shared = held.size();
-        for (size_t i = 1; i < held.size(); ++i)
-            if (held[i] == o.turn_token) { shared = i; break; }
-    }
+    // Report only checkpoints deeper than the shared system-prefix boundary.  The engine marks that root when it reads
+    // the prompt (ConversationCheckpoint::kRoot), so affinity comes from provenance and token/image prefixes alone -
+    // no chat template or role text is decoded here, which would name one model in this shared code.
     if (cached)
-        for (const ConvCheckpoint& c : saved)
-            if (c.ids.size() > shared && c.ids.size() <= held.size() &&
-                basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), held.data()) &&
-                c.imgs == imgs_below(images, (int64_t) c.ids.size()))
-                std::printf(" %zu", c.ids.size());
+        for (const size_t n : basalt::core::conversation_report_checkpoints(held, images, saved))
+            std::printf(" %zu", n);
     std::printf("\n");
 }
 
@@ -131,15 +113,19 @@ Flow Request::complete() {
             sl.imgs = runtime_.live_imgs;
                             sl.guard = std::move(gguard);   // the request's grammar, already past the tokens the request decoded here
             // the slot keeps its conversation's longest checkpoint (its next turn) and its shortest (the
-            // system prompt, which other requests may share)
-            const ConvCheckpoint *best = nullptr, *root = nullptr;
+            // system prompt, which other requests may share); it also keeps the deepest root-marked one so the
+            // routing report can still tell a shared prefix from a real checkpoint after admission thins the chain
+            const ConvCheckpoint *best = nullptr, *root = nullptr, *kroot = nullptr;
             for (const ConvCheckpoint& c : runtime_.checks)
                 if (c.ids.size() < runtime_.live.size() &&
                     basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), runtime_.live.data())) {
                     if (best == nullptr || c.ids.size() > best->ids.size()) best = &c;
                     if (root == nullptr || c.ids.size() < root->ids.size()) root = &c;
+                    if (c.source == ConvCheckpoint::kRoot && (kroot == nullptr || c.ids.size() > kroot->ids.size()))
+                        kroot = &c;
                 }
             if (root != nullptr && root != best) sl.checks.push_back(*root);
+            if (kroot != nullptr && kroot != best && kroot != root) sl.checks.push_back(*kroot);
             if (best != nullptr) sl.checks.push_back(*best);
             basalt::log::info("basalt batch", "slot %d takes %lld tokens (copied in %.1f ms)", runtime_.admit_slot,
                          (long long) runtime_.live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());

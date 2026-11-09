@@ -450,5 +450,81 @@ int main() {
             check(conversation_prefix(c, exact, {}) == 0, "a prompt as long as the key cannot consume its last token");
         }
     }
+    {
+        // The role-free routing boundary: affinity comes from the engine's own provenance marks and token/image
+        // prefixes, never a chat template or role text.  A held conversation of distinct increasing tokens.
+        auto chain = [](size_t n) { std::vector<int32_t> v(n); for (size_t i = 0; i < n; ++i) v[i] = (int32_t)(i + 1); return v; };
+        const std::vector<int32_t> held = chain(100);
+        auto ck = [&](size_t len, ConversationCheckpoint::Source src) {
+            ConversationCheckpoint c; c.ids = chain(len); c.source = src; return c;
+        };
+
+        // images_below: only images that start before L belong to a state at length L.
+        const std::vector<ConversationImageKey> all{{20, 5}, {60, 7}};
+        check(conversation_images_below(all, 15).empty(), "images below 15: none yet");
+        check(conversation_images_below(all, 30) == std::vector<ConversationImageKey>{{20, 5}}, "images below 30: the first only");
+        check(conversation_images_below(all, 70) == all, "images below 70: both");
+
+        // no root marked -> boundary 0, so a lone conversation checkpoint keeps its affinity for its retry
+        std::vector<ConversationCheckpoint> none{ck(40, ConversationCheckpoint::kTurnEnd), ck(80, ConversationCheckpoint::kPeriodic)};
+        check(conversation_shared_boundary(held, {}, none) == 0, "no marked root: no shared boundary");
+        auto rep = conversation_report_checkpoints(held, {}, none);
+        check(rep.size() == 2 && rep[0] == 40 && rep[1] == 80, "without a root every valid checkpoint is reported");
+
+        // the deepest valid root sets the boundary; checkpoints at or below it are shared (not affinity)
+        std::vector<ConversationCheckpoint> rooted{
+            ck(30, ConversationCheckpoint::kRoot), ck(10, ConversationCheckpoint::kRoot),
+            ck(30, ConversationCheckpoint::kPeriodic), ck(60, ConversationCheckpoint::kTurnEnd)};
+        check(conversation_shared_boundary(held, {}, rooted) == 30, "the deepest root is the shared boundary");
+        rep = conversation_report_checkpoints(held, {}, rooted);
+        check(rep.size() == 1 && rep[0] == 60, "checkpoints at or inside the shared prefix are not reported as affinity");
+
+        // a foreign root (another token prefix) never sets the boundary: short prompts keep their own checkpoint usable
+        std::vector<ConversationCheckpoint> foreign{ck(30, ConversationCheckpoint::kRoot), ck(50, ConversationCheckpoint::kTurnEnd)};
+        foreign[0].ids = {999, 998, 997, 996, 995};   // a prefix of nothing here
+        check(conversation_shared_boundary(held, {}, foreign) == 0, "a foreign root checkpoint is ignored");
+        rep = conversation_report_checkpoints(held, {}, foreign);
+        check(rep.size() == 1 && rep[0] == 50, "a stale root does not suppress the real checkpoint");
+
+        // an over-long root (past this conversation) cannot be valid either
+        std::vector<ConversationCheckpoint> toolong{ck(120, ConversationCheckpoint::kRoot), ck(50, ConversationCheckpoint::kTurnEnd)};
+        check(conversation_shared_boundary(held, {}, toolong) == 0, "a root longer than held is not the boundary");
+
+        // images must match below the checkpoint length: a root that predates an image excludes checkpoints straddling it
+        const std::vector<int32_t> himg = chain(100);
+        std::vector<ConversationCheckpoint> imgchecks;
+        {
+            ConversationCheckpoint root30; root30.source = ConversationCheckpoint::kRoot; root30.ids = chain(30); root30.imgs = {};   // before image@20? 20 not <30 -> must hold {{20,5}}
+            imgchecks.push_back(root30);
+        }
+        check(conversation_shared_boundary(himg, all, imgchecks) == 0, "a root missing an image below it is not valid");
+        imgchecks[0].imgs = {{20, 5}};   // now matches images_below(30)
+        check(conversation_shared_boundary(himg, all, imgchecks) == 30, "a root whose images match below it sets the boundary");
+
+        // an equal-length checkpoint (an identical retry: resume at the very end) is still valid and reportable
+        std::vector<ConversationCheckpoint> exact{ck(100, ConversationCheckpoint::kTurnEnd)};
+        rep = conversation_report_checkpoints(held, {}, exact);
+        check(rep.size() == 1 && rep[0] == 100, "a checkpoint spanning the whole held stream is reported");
+
+        // Source survives thinning for routing: split/merge keeps each top-level checkpoint's provenance mark
+        {
+            auto with_parts = [&](std::initializer_list<int32_t> ids, ConversationCheckpoint::Source src, size_t parts) {
+                ConversationCheckpoint c; c.ids = ids; c.source = src; c.state_a.assign(64, 3);
+                for (size_t k = 0; k < parts; ++k) { ConversationCheckpoint p; p.state_a.assign(32, (uint8_t)(9 + k)); c.stage_parts.push_back(std::move(p)); }
+                return c;
+            };
+            std::vector<ConversationCheckpoint> chain_src{
+                with_parts({1, 2}, ConversationCheckpoint::kRoot, 2),
+                with_parts({1, 2, 3}, ConversationCheckpoint::kPeriodic, 1),   // incomplete: kept aside
+                with_parts({1, 2, 3, 4}, ConversationCheckpoint::kTurnEnd, 2)};
+            auto split = conversation_checkpoints_split(std::move(chain_src), 2);
+            std::vector<ConversationCheckpoint> back;
+            check(conversation_checkpoints_merge(std::move(split), back) && back.size() == 3, "split/merge round trip");
+            check(back[0].source == ConversationCheckpoint::kRoot &&
+                  back[1].source == ConversationCheckpoint::kPeriodic &&
+                  back[2].source == ConversationCheckpoint::kTurnEnd,
+                  "a checkpoint's provenance mark survives layer-split parking and restore");
+        }
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
