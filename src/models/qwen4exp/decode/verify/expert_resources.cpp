@@ -228,6 +228,8 @@ bool Verifier::dm_init(std::string& err) {
                    cudaMallocHost((void**) &d->stage_host, (size_t) LE * 8) == cudaSuccess &&
                    cudaMalloc((void**) &d->stage_k, kt.size() * 4) == cudaSuccess &&
                    cudaMemcpy(d->stage_k, kt.data(), kt.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+                   cudaMalloc((void**) &d->stage_link, 8) == cudaSuccess &&
+                   cudaMemset(d->stage_link, 0, 8) == cudaSuccess &&
                    cudaDeviceGetStreamPriorityRange(&st_least, &st_greatest) == cudaSuccess &&
                    cudaStreamCreateWithPriority(&d->st_s, cudaStreamNonBlocking, st_greatest) == cudaSuccess &&
                    cudaEventCreateWithFlags(&d->st_fork, cudaEventDisableTiming) == cudaSuccess &&
@@ -287,7 +289,7 @@ void Verifier::dm_free() {
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
                     (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed,
-                    (void*) d->stage_src, (void*) d->stage_k, (void*) d->route_counts})
+                    (void*) d->stage_src, (void*) d->stage_k, (void*) d->stage_link, (void*) d->route_counts})
         if (p) cudaFree(p);
     if (d->stage_host) cudaFreeHost(d->stage_host);
     if (d->pin) cudaFreeHost(d->pin);

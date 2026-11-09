@@ -148,9 +148,10 @@ __device__ __forceinline__ void dm_group_keys(const int32_t* s_key, int n, int t
 // first such entry), the last stage_k[m] in routing order whose blob has a host-RAM address go to kind 1 with every
 // entry of theirs (m: the layer's distinct CPU misses).  Every thread of the block calls it; q is kDmCap words of
 // block scratch.  The ring's kinds and the staged copy (dm_stage_kernel) make the same split from the same ids and
-// residency.
+// residency.  A window whose stage_off word is set stages nothing; every reader of the window sees the same word.
 __device__ void dm_stage_split(const DmRouteArgs& a, const int32_t* s_ids, int32_t* s_kind, int n, int tid, int32_t* q) {
     if (a.stage_src == nullptr) return;
+    if (a.stage_off != nullptr && __ldcg(a.stage_off) != 0) return;
     const bool in = tid < n;
     const int32_t e = in ? s_ids[tid] : -1;
     const bool miss = in && s_kind[tid] < 0 && e >= 0 && e < a.n_expert;

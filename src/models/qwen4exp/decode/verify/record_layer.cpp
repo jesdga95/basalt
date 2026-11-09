@@ -329,6 +329,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         if (v_.dm_->stage_src != nullptr) {   // the staged share: past the count table's threshold, some CPU misses
             ra.stage_src = v_.dm_->stage_src + l * g.n_expert;
             ra.stage_k = v_.dm_->stage_k;
+            ra.stage_off = v_.dm_->stage_link + 1;
         }
         PdlScope pr(false);   // after the router's kernel: a plain launch
         if (glue_on) {   // the ring's work inside post's gate/up launch, released by the read's counts

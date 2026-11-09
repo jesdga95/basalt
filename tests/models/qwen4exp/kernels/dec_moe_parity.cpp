@@ -1208,7 +1208,9 @@ int main(int argc, char** argv) {
                 K::DmRouteArgs rs = ra;
                 rs.res1 = nullptr;
                 rs.host_seq_m = sw; rs.peer_seq_m = sw + 16;
-                rs.stage_src = d_src; rs.stage_k = d_kt;
+                int32_t* d_off = dmal<int32_t>(1);   // the window's link word: clear here, set in the case below
+                ck(cudaMemset(d_off, 0, 4), "stage off");
+                rs.stage_src = d_src; rs.stage_k = d_kt; rs.stage_off = d_off;
                 ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
                 std::memset((void*) (h_rings + 5), 0, sizeof(K::DmRing));
                 K::dec_moe_route(rs, s0);
@@ -1242,6 +1244,33 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < n; ++i) bst += (rk[i] == 1) != (sseen[i] == 1);
                 std::snprintf(what, sizeof what, "staged split T=%d (%d of %d misses)", T, (int) staged.size(), m);
                 report(what, l, bst, (size_t) n);
+                {   // the link word set: the route's, the ring's and the stage kernel's kinds are the unstaged ones
+                    ck(cudaMemset(d_off, 1, 4), "stage off");
+                    int rnc0 = 0;
+                    for (int i = 0; i < n; ++i) rnc0 += res0[ids[i]] < 0;
+                    ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
+                    std::memset((void*) (h_rings + 5), 0, sizeof(K::DmRing));
+                    K::dec_moe_route(rs, s0);
+                    K::dec_moe_stage(rs, d_stg, stride, (int64_t) L.bytes, 8, s0);
+                    ck(cudaStreamSynchronize(s0), "unstaged route");
+                    K::DmPlan U;
+                    ck(cudaMemcpy(&U, d_plan, sizeof U, cudaMemcpyDeviceToHost), "plan");
+                    size_t bu = 0;
+                    for (int i = 0; i < n; ++i) {
+                        const int32_t k0 = res0[ids[i]] >= 0 ? 0 : -1;
+                        bu += U.kind[i] != k0 || h_rings[5].kind[i] != k0;
+                    }
+                    bu += h_rings[5].n_cpu != rnc0 || U.counts[3] != rnc0 || U.scounts[0] != 0 || U.scounts[1] != 0;
+                    std::snprintf(what, sizeof what, "staged split off T=%d (%d misses)", T, m);
+                    report(what, l, bu, (size_t) n);
+                    ck(cudaMemset(d_off, 0, 4), "stage off");
+                    // the staged plan and staging again, for the tail below
+                    ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
+                    std::memset((void*) (h_rings + 5), 0, sizeof(K::DmRing));
+                    K::dec_moe_route(rs, s0);
+                    K::dec_moe_stage(rs, d_stg, stride, (int64_t) L.bytes, 8, s0);
+                    ck(cudaStreamSynchronize(s0), "staged route");
+                }
                 // the tail: CUDA0's groups and the staged ones into parts, then the combine, against the window with the
                 // staged experts resident at the slots of their blobs
                 std::vector<int32_t> res2 = res0;
