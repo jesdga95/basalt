@@ -134,7 +134,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `spec` | engine | integer | 8 (MTP), 3 (DSpark), else 0 | Verify windows of at most N tokens. `0` or `1` turns it off. |
+| `spec` | engine | integer | 8 (MTP), 6 (DSpark), else 0 | Verify windows of at most N tokens. `0` or `1` turns it off. |
 | `draft-experts` | engine | 32, 64, 96, 128, or 0 | 32 | DeepSeek only. Experts each drafter stage keeps (`0` = all 128). |
 | `suffix-draft` | engine | tokens | 3 (`0` = MTP only) | Flash-Next only. Prompt lookup: fill a window from an earlier repeat of at least N tokens. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Flash-Next only. Caps the MTP's own windows. |

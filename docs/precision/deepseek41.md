@@ -95,7 +95,7 @@ read's end (20 × 127 + 128) therefore stops at layer 20's compressor. `--no-pro
 
 ## Verify windows
 
-`--spec` runs up to 8 rows at once (the default is 3). With placement fixed (`--diag-tier-frozen --diag-tier-ram 304`), every row's logits equal plain decode's, bit for bit, in windows of 2, 3, 5 and 8 rows, for the drafter too. Sampled text at
+`--spec` runs up to 8 rows at once (the default is 6). With placement fixed (`--diag-tier-frozen --diag-tier-ram 304`), every row's logits equal plain decode's, bit for bit, in windows of 2, 3, 5 and 8 rows, for the drafter too. Sampled text at
 temperature 1 matches plain decode. With tiers moving, rows round as under any placement: forced through the plain text, 15 to 25 prose
 picks and 1 to 6 code picks differ over 800 tokens.
 
