@@ -355,17 +355,23 @@ class EngineVision(Vision):
             for k in keys:
                 self._pin(k, pins)
             todo = [k for k in dict.fromkeys(keys) if k not in self.cache]
-            jobs = [(self.dir / f"{k}.img", self.dir / f"{k}.sve") for k in todo]
+            # per attempt, as on the sidecar path: the engine holds an image while it reads it
+            tag = uuid.uuid4().hex[:8]
+            jobs = [(self.dir / f"{k}-{tag}.img", self.dir / f"{k}-{tag}.part") for k in todo]
             try:
                 for (img, _), k in zip(jobs, todo):
                     img.write_bytes(datas[k])
                 if jobs:
                     lines = self.engine.encode_images(jobs)
-                    for k, (_, out), line in zip(todo, jobs, lines):
-                        self._remember(k, out, int(line.split()[1]))
+                    for k, (_, part), line in zip(todo, jobs, lines):
+                        n = int(line.split()[1])              # an ERR line raises here, as it did before
+                        out = self.dir / f"{k}.sve"
+                        os.replace(part, out)                 # published whole: a reader never sees half of it
+                        self._remember(k, out, n)
             finally:
-                for img, _ in jobs:
-                    img.unlink(missing_ok=True)
+                for img, part in jobs:
+                    _unlink_quietly(img)
+                    _unlink_quietly(part)
             return [self.cache[k] for k in keys]
 
 
