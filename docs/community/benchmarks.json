@@ -1323,7 +1323,7 @@
       "prefill_16k_tps": 4713.1,
       "prefill_64k_tps": 4798.5,
       "decode_tps": 151.5,
-      "notes": "Headless desktop. Correction: the prior IQ4_XS 64K exit was a 60 s stall watchdog during HDD swap pressure, not a confirmed kernel OOM kill; vm.swappiness=1 allows the full IQ4_XS run."
+      "notes": "Headless. Prior IQ4_XS OOM claim unconfirmed; reproduction hit a 60 s stall watchdog with HDD swap pressure. Full IQ4_XS community run passes with vm.swappiness=1; prefill still reads SSD experts."
     }
   ]
 }
