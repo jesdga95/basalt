@@ -123,6 +123,10 @@ bool pwrite_all(int fd, const void* src, uint64_t n, uint64_t off);
 /// Waits until what was written through `fd` is on the device. False when the OS reports a failure.
 bool sync_fd(int fd);
 
+/// Waits until the directory entries of `path` are on the device: the step after a published file is renamed to
+/// its final name, so a crash cannot leave a rename unrecorded. False when the directory cannot be opened or synced.
+bool sync_dir(const std::string& path);
+
 /// Creates `path` and its missing parents. True when the directory exists afterwards.
 bool make_dirs(const std::string& path);
 

@@ -372,6 +372,25 @@ bool make_dirs(const std::string& path) {
     return std::filesystem::is_directory(fs_path(path), ec);
 }
 
+bool sync_dir(const std::string& path) {
+#if defined(_WIN32)
+    // A directory handle needs backup semantics; FlushFileBuffers on it records its pending entry changes.
+    const HANDLE h = CreateFileW(fs_path(path).c_str(), FILE_WRITE_ATTRIBUTES,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                 nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    const bool ok = FlushFileBuffers(h) != 0;
+    CloseHandle(h);
+    return ok;
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return false;
+    const bool ok = ::fdatasync(fd) == 0;
+    ::close(fd);
+    return ok;
+#endif
+}
+
 bool list_files(const std::string& dir, std::vector<DirFile>& out) {
     out.clear();
     std::error_code ec;
