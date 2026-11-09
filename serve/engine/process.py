@@ -890,9 +890,12 @@ class ProcessEngine:
         and the prompt-read time of all its runs (a later run only re-reads the token the slot lacks)."""
         self._note_first_reused(first, last0)
         last = self.last
-        if final and first and isinstance(last, dict) and last is not last0:
-            last["reused"] = first[0]
+        if final and isinstance(last, dict) and last is not last0:
+            if first:
+                last["reused"] = first[0]
             if self.read_ms > 0:
+                # the read count of the whole request belongs beside the read time of all its runs, else a later run
+                # that re-reads almost nothing reports a stamp-sized prompt_ms for the whole prompt
                 last["prompt_ms"] = self.read_ms
             first.clear()
         self._carry_drafts(carry, final)
