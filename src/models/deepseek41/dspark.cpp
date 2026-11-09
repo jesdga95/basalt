@@ -635,8 +635,8 @@ bool DsparkDrafter::draft_begin(int w, int32_t anchor, int64_t pos, int n_out, s
     const std::vector<int64_t>& ring_pos = d.ring_pos[(size_t) w];
     n_out = std::clamp(n_out, 1, kT);
     try {
-        // the block's host inputs: four hyper-connection copies of the anchor's embedding, then the index arrays
-        cudaStreamSynchronize(d.st);   // the staging and the metadata block are reused
+        // the block's host inputs: four hyper-connection copies of the anchor's embedding, then the index arrays (the last
+        // block, which read them, has ended; an inject before this block may still run)
         if (!d.main.embedding_row(anchor, d.h_emb, err)) return false;
         for (int s = 1; s < 4; ++s) std::memcpy(d.h_emb + (size_t) s * kN, d.h_emb, (size_t) kN * 4);
         // the window is the run of positions before `pos` the rings hold
