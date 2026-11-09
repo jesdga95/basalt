@@ -1,6 +1,7 @@
 // src/models/deepseek41/dspark_parity.cpp - parity of the DSpark drafter's kernels against plain CPU references, at the
 // drafter's geometry (5120 -> 2304 -> 5120 MXFP4 experts, 512-wide latents, a 129280-row rank-256 Markov table), with
 // a microbench line for the expert kernels; and a drafter that keeps some experts computes what the whole one does on them.
+#include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
 #include "models/deepseek41/dspark.hpp"
 #include "models/deepseek41/dspark_kernels.hpp"
@@ -50,6 +51,33 @@ std::vector<uint8_t> random_mxfp4(std::mt19937& rng, size_t rows, int n_in) {
     return w;
 }
 
+// fp16 bits as a float (normal and zero values).
+float half_bits(uint16_t h) {
+    const uint32_t e = (h >> 10) & 31, m = h & 1023, sign = (uint32_t) (h >> 15) << 31;
+    uint32_t bits = sign;
+    if (e) bits |= ((e + 112) << 23) | (m << 13);
+    else if (m) {   // subnormal
+        int k = 0;
+        uint32_t mm = m;
+        while (!(mm & 1024)) { mm <<= 1; ++k; }
+        bits |= ((uint32_t) (113 - k) << 23) | ((mm & 1023) << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+// The values q8_1 blocks (fp16 scale and sum, 32 int8) stand for.
+std::vector<float> q8_1_values(const std::vector<uint8_t>& q, size_t n) {
+    std::vector<float> v(n);
+    for (size_t b = 0; b < n / 32; ++b) {
+        const uint8_t* blk = &q[b * 36];
+        const float d = half_bits((uint16_t) (blk[0] | blk[1] << 8));
+        for (int i = 0; i < 32; ++i) v[b * 32 + i] = d * (float) (int8_t) blk[4 + i];
+    }
+    return v;
+}
+
 int failures = 0;
 
 void verdict(const char* what, const dstest::Err& e, double tol) {
@@ -78,26 +106,53 @@ int main() {
     Dev<uint8_t> dg(gate), du(up), dd(down);
     Dev<float> dx(x), dh((size_t) kT * kK * kFF), dout((size_t) kT * kK * kOut);
     Dev<int32_t> did(ids);
-    dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dx.p, did.p, kT, kK, 10.f, dh.p, nullptr);
-    dspark_moe_down(dd.p, kFF, kOut, dh.p, did.p, kT, kK, dout.p, nullptr);
+    cudaStream_t qs;
+    check(cudaStreamCreate(&qs), "stream");
+    Dev<uint8_t> dxq(basalt::kernels::native_q8_1_bytes(kIn, kT)), dhq(basalt::kernels::native_q8_1_bytes(kT * kK * kFF, 1));
+    basalt::kernels::native_quantize_q8_1(dx.p, dxq.p, kIn, kT, qs);
+    dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, dh.p, qs);
+    basalt::kernels::native_quantize_q8_1(dh.p, dhq.p, kT * kK * kFF, 1, qs);
+    dspark_moe_down(dd.p, kFF, kOut, dhq.p, did.p, kT, kK, dout.p, qs);
     check(cudaDeviceSynchronize(), "experts");
+    // the references take the values the q8_1 activations stand for
+    const std::vector<float> xv = q8_1_values(dxq.down(), x.size());
     std::vector<float> h_ref((size_t) kT * kK * kFF), o_ref((size_t) kT * kK * kOut);
     for (int p = 0; p < kT * kK; ++p) {
         const int t = p / kK, e = ids[p];
         for (int r = 0; r < kFF; ++r) {
-            const double g = std::fmin(row_dot(&gate[((size_t) e * kFF + r) * mxfp4_row_bytes(kIn)], &x[(size_t) t * kIn], kIn), 10.0);
-            const double u = std::fmin(std::fmax(row_dot(&up[((size_t) e * kFF + r) * mxfp4_row_bytes(kIn)], &x[(size_t) t * kIn], kIn), -10.0), 10.0);
+            const double g = std::fmin(row_dot(&gate[((size_t) e * kFF + r) * mxfp4_row_bytes(kIn)], &xv[(size_t) t * kIn], kIn), 10.0);
+            const double u = std::fmin(std::fmax(row_dot(&up[((size_t) e * kFF + r) * mxfp4_row_bytes(kIn)], &xv[(size_t) t * kIn], kIn), -10.0), 10.0);
             h_ref[(size_t) p * kFF + r] = (float) (g / (1.0 + std::exp(-g)) * u);
         }
     }
     verdict("moe gate_up", dstest::compare(dh.down(), h_ref, 1e-2), 1e-4);
-    const std::vector<float> h_got = dh.down();   // the down check starts from the kernel's own hidden state
+    {   // against fp32 activations, what the kernels before q8_1 computed: the activations' rounding
+        std::vector<float> h32(h_ref.size());
+        for (int p = 0; p < kT * kK; ++p) {
+            const int t = p / kK, e = ids[p];
+            for (int r = 0; r < kFF; ++r) {
+                const double g = std::fmin(row_dot(&gate[((size_t) e * kFF + r) * mxfp4_row_bytes(kIn)], &x[(size_t) t * kIn], kIn), 10.0);
+                const double u = std::fmin(std::fmax(row_dot(&up[((size_t) e * kFF + r) * mxfp4_row_bytes(kIn)], &x[(size_t) t * kIn], kIn), -10.0), 10.0);
+                h32[(size_t) p * kFF + r] = (float) (g / (1.0 + std::exp(-g)) * u);
+            }
+        }
+        verdict("moe gate_up vs fp32 x", dstest::compare(dh.down(), h32, 1e-2), 3e-2);
+    }
+    const std::vector<float> h_got = dh.down();   // the down check starts from the kernel's own hidden state, quantized
+    const std::vector<float> hv = q8_1_values(dhq.down(), h_got.size());
     for (int p = 0; p < kT * kK; ++p)
         for (int r = 0; r < kOut; ++r)
-            o_ref[(size_t) p * kOut + r] = (float) row_dot(&down[((size_t) ids[p] * kOut + r) * mxfp4_row_bytes(kFF)], &h_got[(size_t) p * kFF], kFF);
+            o_ref[(size_t) p * kOut + r] = (float) row_dot(&down[((size_t) ids[p] * kOut + r) * mxfp4_row_bytes(kFF)], &hv[(size_t) p * kFF], kFF);
     verdict("moe down", dstest::compare(dout.down(), o_ref, 1e-2), 1e-4);
-    {   // frozen: the hidden state and the outputs hash to the bits of the kernels that read one row per warp
-        constexpr uint64_t kFrozen = 0x5970ce9413f8b809ull;
+    {   // against the fp32 hidden rows
+        std::vector<float> o32(o_ref.size());
+        for (int p = 0; p < kT * kK; ++p)
+            for (int r = 0; r < kOut; ++r)
+                o32[(size_t) p * kOut + r] = (float) row_dot(&down[((size_t) ids[p] * kOut + r) * mxfp4_row_bytes(kFF)], &h_got[(size_t) p * kFF], kFF);
+        verdict("moe down vs fp32 h", dstest::compare(dout.down(), o32, 1e-2), 3e-2);
+    }
+    {   // frozen: the hidden state and the outputs hash to the bits of the dp4a kernels
+        constexpr uint64_t kFrozen = 0x3be9ade2c87c72d7ull;
         uint64_t hh = 1469598103934665603ull;
         for (const auto& v : {h_got, dout.down()}) {
             const uint8_t* b = reinterpret_cast<const uint8_t*>(v.data());
@@ -250,10 +305,13 @@ int main() {
         Dev<uint8_t> dkg(kg), dku(ku), dkd(kd);
         Dev<int32_t> dcid(cid), dfid(fid);
         Dev<float> h1((size_t) kT * kK * kFF), h2((size_t) kT * kK * kFF), o1((size_t) kT * kK * kOut), o2((size_t) kT * kK * kOut);
-        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dx.p, dfid.p, kT, kK, 10.f, h1.p, nullptr);
-        dspark_moe_down(dd.p, kFF, kOut, h1.p, dfid.p, kT, kK, o1.p, nullptr);
-        dspark_moe_gate_up(dkg.p, dku.p, kIn, kFF, dx.p, dcid.p, kT, kK, 10.f, h2.p, nullptr);
-        dspark_moe_down(dkd.p, kFF, kOut, h2.p, dcid.p, kT, kK, o2.p, nullptr);
+        Dev<uint8_t> hq1(dhq.n), hq2(dhq.n);
+        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, dfid.p, kT, kK, 10.f, h1.p, qs);
+        basalt::kernels::native_quantize_q8_1(h1.p, hq1.p, kT * kK * kFF, 1, qs);
+        dspark_moe_down(dd.p, kFF, kOut, hq1.p, dfid.p, kT, kK, o1.p, qs);
+        dspark_moe_gate_up(dkg.p, dku.p, kIn, kFF, dxq.p, dcid.p, kT, kK, 10.f, h2.p, qs);
+        basalt::kernels::native_quantize_q8_1(h2.p, hq2.p, kT * kK * kFF, 1, qs);
+        dspark_moe_down(dkd.p, kFF, kOut, hq2.p, dcid.p, kT, kK, o2.p, qs);
         check(cudaDeviceSynchronize(), "kept experts");
         const bool same_e = o1.down() == o2.down() && h1.down() == h2.down();
 
@@ -292,13 +350,14 @@ int main() {
 
     // ---- microbench: one layer's expert work for a 5-row block (bytes are what the kernels touch)
     float ms = 0;
-    cudaEventRecord(e0);
+    cudaEventRecord(e0, qs);
     constexpr int kReps = 20;
     for (int i = 0; i < kReps; ++i) {
-        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dx.p, did.p, kT, kK, 10.f, dh.p, nullptr);
-        dspark_moe_down(dd.p, kFF, kOut, dh.p, did.p, kT, kK, dout.p, nullptr);
+        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, dh.p, qs);
+        basalt::kernels::native_quantize_q8_1(dh.p, dhq.p, kT * kK * kFF, 1, qs);
+        dspark_moe_down(dd.p, kFF, kOut, dhq.p, did.p, kT, kK, dout.p, qs);
     }
-    cudaEventRecord(e1);
+    cudaEventRecord(e1, qs);
     cudaEventSynchronize(e1);
     cudaEventElapsedTime(&ms, e0, e1);
     const double bytes = (double) kT * kK * (2.0 * kFF * mxfp4_row_bytes(kIn) + (double) kOut * mxfp4_row_bytes(kFF));
