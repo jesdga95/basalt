@@ -2,7 +2,9 @@
 // CPU test can drive them with synthetic id streams.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <vector>
 
 namespace basalt::models::deepseek41::policy {
 
@@ -68,6 +70,42 @@ inline Place place_of_rank(const Homes& h, int copies, int r) {
     if (r - h.main < lead) return Place::Ram;
     if (r - h.main - lead < h.peer) return Place::Peer;
     return r < h.main + h.peer + h.ram ? Place::Ram : Place::File;
+}
+
+/// Several second cards: card c holds the second-card homes of layers [lo[c], hi[c]) and of no other layer, so each layer
+/// still has exactly one second card. Blocks are contiguous and differ by at most one layer, the larger ones first.
+struct PeerBlocks {
+    std::vector<int> lo, hi;
+};
+inline PeerBlocks split_layers(int n_layers, int n_cards) {
+    PeerBlocks b;
+    const int each = n_layers / n_cards, extra = n_layers % n_cards;
+    for (int c = 0, at = 0; c < n_cards; ++c) {
+        b.lo.push_back(at);
+        at += each + (c < extra ? 1 : 0);
+        b.hi.push_back(at);
+    }
+    return b;
+}
+inline int owner_of(const PeerBlocks& b, int layer) {
+    for (size_t c = 0; c < b.lo.size(); ++c)
+        if (layer >= b.lo[c] && layer < b.hi[c]) return (int) c;
+    return -1;
+}
+/// The second-card homes every layer gets: the fewest any card holds for its own block. `block_bytes[c]`: one slot in
+/// every layer of card c's block (256-rounded blobs, the per-layer term of the tier's `one_each`); `reserve`: what each
+/// card leaves free. One card with every layer is the single second card's count.
+inline int uniform_peer_slots(const std::vector<uint64_t>& room, const std::vector<uint64_t>& block_bytes, uint64_t reserve,
+                              int n_expert) {
+    uint64_t slots = (uint64_t) n_expert;
+    for (size_t c = 0; c < room.size(); ++c)
+        slots = std::min<uint64_t>(slots, room[c] > reserve && block_bytes[c] > 0 ? (room[c] - reserve) / block_bytes[c] : 0);
+    return (int) slots;
+}
+/// A second-card slot in its own card's numbering: the card's first layer starts at 0. The tier's global slot of
+/// (layer, n) is layer * homes_peer + n.
+inline int32_t local_slot(const PeerBlocks& b, int homes_peer, int layer, int n) {
+    return (int32_t) ((layer - b.lo[(size_t) owner_of(b, layer)]) * homes_peer + n);
 }
 
 /// Misses of a layer go half to the CPU (rounded up) and the rest to the bus; the file-backed ones can only go to the

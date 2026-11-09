@@ -1,6 +1,7 @@
 // src/models/deepseek41/tier_policy_test.cpp - the tier admission and placement rules on synthetic id streams.
 #include "models/deepseek41/tier_policy.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -204,6 +205,58 @@ int main() {
         CHECK(halvings == 10);
         CHECK(!use_half_life(0, kUseHalfLife - 1));
         CHECK(use_half_life(kUseHalfLife - 1, 1));
+    }
+
+    // several second cards: each owns a contiguous block of layers, larger blocks first
+    {
+        const PeerBlocks b3 = split_layers(40, 3);
+        CHECK((b3.lo == std::vector<int>{0, 14, 27}) && (b3.hi == std::vector<int>{14, 27, 40}));
+        const PeerBlocks b1 = split_layers(40, 1);
+        CHECK((b1.lo == std::vector<int>{0}) && (b1.hi == std::vector<int>{40}));
+        const PeerBlocks bb = split_layers(3, 3);
+        CHECK((bb.lo == std::vector<int>{0, 1, 2}) && (bb.hi == std::vector<int>{1, 2, 3}));
+        const PeerBlocks b2 = split_layers(40, 2);
+        CHECK((b2.lo == std::vector<int>{0, 20}) && (b2.hi == std::vector<int>{20, 40}));
+        const PeerBlocks b4 = split_layers(40, 4);
+        CHECK((b4.lo == std::vector<int>{0, 10, 20, 30}) && (b4.hi == std::vector<int>{10, 20, 30, 40}));
+
+        const int layers[] = {0, 13, 14, 26, 27, 39}, owners[] = {0, 0, 1, 1, 2, 2};
+        for (int i = 0; i < 6; ++i) CHECK(owner_of(b3, layers[i]) == owners[i]);
+
+        // the uniform per-layer count is the smallest any card holds for ITS block, never card 0's alone
+        const uint64_t blob = (6430000ull + 255) / 256 * 256, reserve = 600ull << 20;
+        const std::vector<uint64_t> rooms{15000000000ull, 15000000000ull, 12000000000ull};   // the last card binds, not card 0
+        const std::vector<uint64_t> blocks{14 * blob, 13 * blob, 13 * blob};
+        uint64_t want = ~0ull;
+        for (size_t c = 0; c < rooms.size(); ++c) want = std::min<uint64_t>(want, (rooms[c] - reserve) / blocks[c]);
+        CHECK(uniform_peer_slots(rooms, blocks, reserve, 384) == (int) std::min<uint64_t>(want, 384));
+        CHECK(want < (rooms[0] - reserve) / blocks[0]);   // so a card-0-only sizing would be caught here
+        CHECK(uniform_peer_slots({15000000000ull, reserve, 14000000000ull}, blocks, reserve, 384) == 0);
+        CHECK(uniform_peer_slots(rooms, {blob, blob, blob}, reserve, 384) == 384);   // capped at the layer's experts
+
+        // one card holding every layer is the single second card's count: min((room - reserve) / one_each, n_expert), 0 at or under the reserve
+        const uint64_t one_each = 40 * blob, R = 15405465600ull;
+        CHECK(uniform_peer_slots({R}, {one_each}, reserve, 384) == (int) std::min<uint64_t>((R - reserve) / one_each, 384));
+        CHECK(uniform_peer_slots({reserve}, {one_each}, reserve, 384) == 0);
+
+        // a card's local slots are dense and distinct; their sum is the global slot count (n_layers * homes_peer)
+        for (const PeerBlocks* b : {&b1, &b2, &b3, &b4}) {
+            const int hp = 7;
+            int total = 0;
+            for (size_t c = 0; c < b->lo.size(); ++c) {
+                const int span = (b->hi[c] - b->lo[c]) * hp;
+                std::vector<int> seen((size_t) span, 0);
+                for (int l = b->lo[c]; l < b->hi[c]; ++l)
+                    for (int n = 0; n < hp; ++n) {
+                        const int32_t s = local_slot(*b, hp, l, n);
+                        CHECK(s >= 0 && s < span);
+                        if (s >= 0 && s < span) ++seen[(size_t) s];
+                    }
+                for (int v : seen) CHECK(v == 1);
+                total += span;
+            }
+            CHECK(total == 40 * hp);
+        }
     }
 
     if (g_fail) return 1;
