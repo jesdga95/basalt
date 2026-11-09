@@ -63,6 +63,9 @@ int engine_plan(const std::string& engine_bin, const std::vector<std::string>& a
 std::string plan_field(const std::string& plan_answer, const std::string& name);
 /// `dir`/<arch> when the model has its own fixtures there, else `dir`.
 std::string fixtures_for(const std::string& dir, const std::string& plan_answer);
+/// The line that marks a report as measured with flags that change the model's output (`lossy`, the engine's
+/// INFO lossy= value, comma separated).
+std::string lossy_note(const std::string& lossy);
 
 std::vector<std::string> split(const std::string& s, char sep);
 bool all_digits(const std::string& s);

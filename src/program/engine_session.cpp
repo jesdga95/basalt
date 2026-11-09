@@ -246,6 +246,14 @@ std::string fixtures_for(const std::string& dir, const std::string& plan_answer)
     return std::filesystem::is_directory(own, ec) ? own.string() : dir;
 }
 
+std::string lossy_note(const std::string& lossy) {
+    const std::vector<std::string> flags = split(lossy, ',');
+    std::string list;
+    for (const auto& f : flags) list += (list.empty() ? "" : ", ") + f;
+    return "LOSSY: " + list + (flags.size() == 1 ? " changes" : " change") + " the model's output; these numbers do not compare "
+           "with a run without " + (flags.size() == 1 ? "it" : "them");
+}
+
 void Engine::reap() {
     // wait for it, up to the time a normal exit needs, then let go whether or not it ended
     (void) basalt::platform::child_wait(child_.child, 10000);
