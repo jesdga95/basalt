@@ -28,6 +28,12 @@ constexpr double kDecay = 0.97;       // lookup counts: older windows fade
 constexpr double kPriorQ[DraftPolicy::kBuckets] = {0.75, 0.88, 0.93, 0.96};
 constexpr double kPriorN = 4.0;
 constexpr int kProbes = 3;       // a lookup window size is tried this often before its guessed cost can veto it
+// Stated chances: the bins' upper edges. A confidence head is best near 1, where long windows are decided, so the bins
+// are finest there. Each bin starts from the stated chance, worth kChancePriorN tested drafts.
+constexpr float kChanceEdge[] = {0.3f, 0.5f, 0.7f, 0.8f, 0.9f, 0.95f, 0.98f, 0.995f};
+constexpr double kChanceDecay = 0.98;
+constexpr double kChancePriorN = 10.0;
+constexpr double kProbeChance = 0.85;   // the joint chance at which a drafter window one row past the best is probed
 
 }  // namespace
 
@@ -40,6 +46,18 @@ int DraftPolicy::bucket(int match) {
 
 // measured fewer than kProbes times since it was new, or not for a long while
 bool DraftPolicy::unmeasured(int t) const { return base_n_[t] < kBasePrior + kProbes || !recent(t); }
+
+int DraftPolicy::chance_bin(float chance) {
+    int b = 0;
+    while (b < kChanceBins - 1 && chance >= kChanceEdge[b]) ++b;
+    return b;
+}
+
+double DraftPolicy::chance_rate(float chance) const {
+    const int b = chance_bin(chance);
+    const double c = std::clamp((double) chance, 0.0, 1.0);
+    return (c_ok_[b] + kChancePriorN * c) / (c_n_[b] + kChancePriorN);
+}
 
 double DraftPolicy::lookup_rate(int match) const {
     const int b = bucket(match);
@@ -114,6 +132,38 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
         p.t = t_full;
     }
     return p;
+}
+
+int DraftPolicy::window(const float* chance, int n) const {
+    const int most = std::clamp(n + 1, 1, max_t_);
+    double e = 1.0, all = 1.0, best = 1.0 / cost_ms(1);
+    int best_t = 1;
+    for (int t = 2; t <= most; ++t) {
+        all *= chance_rate(chance[t - 2]);
+        e += all;
+        const double r = e / cost_ms(t);
+        if (r > best) { best = r; best_t = t; }
+    }
+    // as for lookup windows: a size whose cost is only guessed (or old) is tried a few times when its drafts are
+    // likely accepted, so a guessed or stale cost cannot keep the window from ever growing
+    if (best_t < most && unmeasured(best_t + 1)) {
+        double joint = 1.0;
+        for (int i = 0; i < best_t; ++i) joint *= chance_rate(chance[i]);
+        if (joint >= kProbeChance) ++best_t;
+    }
+    return best_t;
+}
+
+void DraftPolicy::observe_window(const float* chance, int t, int accepted, double round_ms) {
+    // drafts 0..accepted-1 were accepted given their prefix and draft `accepted` (if the window had it) was not; the
+    // drafts after it were never tested
+    const int tested = std::min(t - 1, accepted + 1);
+    for (int i = 0; i < tested; ++i) {
+        const int b = chance_bin(chance[i]);
+        c_ok_[b] = kChanceDecay * c_ok_[b] + (i < accepted ? 1.0 : 0.0);
+        c_n_[b] = kChanceDecay * c_n_[b] + 1.0;
+    }
+    observe(false, t, accepted, 0, round_ms);
 }
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
