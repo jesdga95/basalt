@@ -16,7 +16,7 @@ public:
     LoadSummary(std::string label, bool tty, double now, double period = 10.0, double redraw = 0.5)
         : label_(std::move(label)), tty_(tty), t0_(now), last_out_(now), period_(period), redraw_(redraw) {}
 
-    /// One log line. Lines that are neither load nor error lines are ignored.
+    /// One log line. Error and warning lines are shown at once; other lines that are not load lines are ignored.
     std::string feed(const std::string& line, double now);
     /// Time passing with no new line: the periodic update.
     std::string tick(double now);

@@ -271,6 +271,11 @@ int Runtime::announce() {
         std::printf("INFO eos_ids=%s\n", ends.c_str());
     }
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
+    if (!o.lossy.empty()) {   // the flags that change the output, for a client that labels what it measures
+        std::string flags;
+        for (const auto& f : o.lossy) flags += (flags.empty() ? "" : ",") + f.flag;
+        std::printf("INFO lossy=%s\n", flags.c_str());
+    }
     // a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on a flag nobody
     // will raise - end the engine with where it was, so the server starts it again instead of the GPU spinning
     // forever.  Before it does, it reports what every part was doing (stall_report), so one occurrence says where

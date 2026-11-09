@@ -139,7 +139,12 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
     basalt::platform::set_ram_reserve((uint64_t) o.ram_reserve_mib << 20);
     if (o.serve && o.ram_reserve_mib == 0 && !o.gpu_plan)
         basalt::log::warn("basalt", "RAM guard off (--ram-reserve-mib 0): low RAM can stop the engine or the machine");
-    if (adapter != nullptr) return adapter->finish_flags(o);
+    if (adapter != nullptr)
+        if (const std::optional<int> code = adapter->finish_flags(o)) return code;
+    if (!o.lossy.empty()) {
+        basalt::log::warn("basalt", "lossy flags enabled, these flags will affect the accuracy of the served model");
+        for (const auto& f : o.lossy) basalt::log::warn("basalt", "%s", f.effect.c_str());
+    }
     return std::nullopt;
 }
 

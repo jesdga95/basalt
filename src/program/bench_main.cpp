@@ -303,7 +303,7 @@ void usage(const std::string& engine) {
         "output\n"
         "  -o md|json         a markdown table (default), or the full detail as JSON on stdout: per-repetition\n"
         "                     values, tokens, drafted, accepted, ms/window, verify ms by window width, GPU names,\n"
-        "                     driver, clocks, model, expert tiers, engine arguments\n"
+        "                     driver, clocks, model, expert tiers, engine arguments, lossy flags\n"
         "  --power-label W    the power limit to print, instead of the one read from the GPU\n"
         "  --logs DIR         keep the engine log, the draft log and the quality rows there\n"
         "  --no-windows       do not ask the engine for the per-window log (no window statistics)\n"
@@ -877,6 +877,7 @@ int main(int argc, char** argv) {
     std::map<std::string, std::string> info;
     std::string peer_line;
     std::string engine_args_text;
+    std::string lossy;   // the engine's flags that change the model's output (its INFO lossy=), comma separated
     Quality quality;
 
     // ---- performance session
@@ -913,6 +914,15 @@ int main(int argc, char** argv) {
         if (!eng.start(engine_bin, perf_args, log_path, err)) {
             basalt::log::error("basalt-bench", "%s", err.c_str());
             return 1;
+        }
+        if (eng.info.count("lossy")) {
+            lossy = eng.info["lossy"];
+            if (o.community) {
+                eng.stop();
+                basalt::log::error("basalt-bench", "the engine runs with flags that change the model's output (%s). No row was written.",
+                                   lossy.c_str());
+                return 1;
+            }
         }
         if (o.community) {
             // every expert must sit in VRAM, the peer GPU or RAM: reads from the file would make the row incomparable
@@ -1046,6 +1056,7 @@ int main(int argc, char** argv) {
             if (!eng.start(engine_bin, qa, (fs::path(work) / "engine-quality.log").string(), quality.err)) {
                 basalt::log::error("basalt-bench", "%s", quality.err.c_str());
             } else {
+                if (eng.info.count("lossy")) lossy = eng.info["lossy"];
                 quality.load_s = secs(t0, Clock::now());
                 const auto t1 = Clock::now();
                 const int64_t first = (int64_t) (n_ctx / 2);
@@ -1148,7 +1159,7 @@ int main(int argc, char** argv) {
 
     std::string rep;
     if (o.format == "md" && do_perf) {
-        rep += fmt("basalt-bench  build %s  power limit %s\n\n", BASALT_BENCH_GIT, power.c_str());
+        rep += fmt("basalt-bench  build %s  power limit %s%s\n\n", BASALT_BENCH_GIT, power.c_str(), lossy.empty() ? "" : "  LOSSY");
         std::vector<std::array<std::string, 4>> cells;
         cells.push_back({"test", "t/s", "accept %", "draft len"});
         for (const Row& r : rows) {
@@ -1251,6 +1262,7 @@ int main(int argc, char** argv) {
             rep += fmt("same top-1 %.2f%%   mean |dlogp| of the base top-1 %.5f\n", quality.top1_pct, quality.dlogp);
         }
     }
+    if (o.format == "md" && !lossy.empty()) rep += "\n" + basalt::program::lossy_note(lossy) + "\n";
 
     if (o.format == "json") {
         JW j;
@@ -1282,6 +1294,10 @@ int main(int argc, char** argv) {
         j.end_obj();
         j.key("peer_tier"); j.str(peer_line);
         j.key("engine_args"); j.str(engine_args_text);
+        j.key("lossy");   // the flags that change the model's output; empty for a run of the model as it is
+        j.begin_arr();
+        for (const auto& f : split(lossy, ',')) j.str(f);
+        j.end_arr();
         j.key("summary");
         j.begin_arr();
         for (const Row& r : rows) {
