@@ -1,0 +1,67 @@
+name: Stateful Thread Contract
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'src/program/serve/**'
+      - 'tests/thread_e2e/**'
+      - 'serve/api/thread_proxy.py'
+      - 'serve/handler.py'
+      - 'serve/tests/test_thread_proxy.py'
+      - '.github/workflows/thread-contract.yml'
+  workflow_dispatch:
+jobs:
+  core-and-store:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: thread_test
+          POSTGRES_USER: thread_test
+          POSTGRES_DB: thread_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U thread_test -d thread_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://thread_test:thread_test@localhost:5432/thread_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format report (non-blocking until initial formatter pass)
+        continue-on-error: true
+        run: cargo fmt --manifest-path crates/Cargo.toml --all -- --check
+      - name: Rust contract tests
+        run: cargo test --manifest-path crates/Cargo.toml --workspace --all-targets
+      - name: Native C++ token tape contract (host-only)
+        run: |
+          g++ -std=c++20 -Wall -Wextra -Werror -I. tests/thread_e2e/native_tape_test.cpp -o /tmp/native_tape_test
+          /tmp/native_tape_test
+      - name: Build API binary
+        run: cargo build --manifest-path crates/Cargo.toml -p basalt-thread-api
+      - name: Python bridge contract tests
+        run: python -m unittest serve.tests.test_thread_proxy
+      - name: Apply real PostgreSQL migrations
+        run: |
+          python - <<'PY'
+          import glob,os,subprocess
+          url=os.environ['DATABASE_URL']
+          for path in sorted(glob.glob('crates/migrations/*.sql')):
+              subprocess.run(['psql',url,'-v','ON_ERROR_STOP=1','-f',path],check=True)
+          PY
+      - name: Validate immutable message & relational schema
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+            INSERT INTO thread_owners(id,workspace_id) VALUES('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000002');
+            INSERT INTO threads(id,owner_id,model_id) VALUES('00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000001','test');
+            INSERT INTO messages(id,thread_id,role,content,content_hash) VALUES('00000000-0000-0000-0000-000000000004','00000000-0000-0000-0000-000000000003','user','\"hello\"'::jsonb,decode(repeat('ab',32),'hex'));"
+          if psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "UPDATE messages SET role='assistant' WHERE id='00000000-0000-0000-0000-000000000004';"; then
+            echo "Immutable message trigger did not reject mutation" >&2
+            exit 1
+          fi
+      - name: Reset disposable schema for sidecar-owned migration test
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+      - name: Thread HTTP E2E (real PostgreSQL, fake Basalt)
+        run: python -m unittest discover -s crates/tests -p 'thread_http_e2e.py' -v

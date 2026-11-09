@@ -2,6 +2,7 @@
 #pragma once
 
 #include "runtime.hpp"
+#include "thread_tape.hpp"
 #include "../cli/tokens.hpp"
 #include "loans.hpp"
 #include "loan_moves.hpp"
@@ -314,6 +315,7 @@ private:
     bool xq_unsettled{};
     std::vector<std::pair<int32_t, int32_t>> xq_released{};
     // GENT: the request text arrives as bytes and the reader thread turns it into ids, from the pack's tokenizer tables
+    NativeThreadTapes thread_tapes{};   // disposable per-process token prefix tapes; never the message ledger
     basalt::program::Tokenizer text_tokenizer{};
     std::string text_tokenizer_note{};
     std::mutex gent_mu{};
