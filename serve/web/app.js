@@ -387,8 +387,8 @@ function requestsPane(live, reqs, multi) {
   const sel = rows.find(r => r.id === selected.id);
   return (sel ? `<div class="reqdet">${detailOf(sel)}</div>` : "")
     + `<table><thead><tr><th>Time</th><th>ID</th>${multi ? "<th>Slot</th>" : ""}<th class="col-ep">Endpoint</th>`
-    + `<th class="r">Prompt</th><th class="r col-cache">Cached</th><th class="r">Output</th><th class="r">TTFT</th>`
-    + `<th class="r">Rate</th><th class="r col-hit">Hit</th><th class="r col-pcie">PCIe</th><th class="r">Duration</th></tr></thead><tbody>`
+    + `<th class="r col-prompt">Prompt</th><th class="r col-cache">Cached</th><th class="r">Output</th><th class="r col-ttft">TTFT</th>`
+    + `<th class="r">Rate</th><th class="r col-hit">Hit</th><th class="r col-pcie">PCIe</th><th class="r col-dur">Duration</th></tr></thead><tbody>`
     + rows.map(r => {
       // a request that did not simply stop is marked on its id, with the reason
       const odd = r.finish && r.finish !== "stop" ? (r.finish === "error" ? "err" : "warn") : "";
@@ -396,10 +396,10 @@ function requestsPane(live, reqs, multi) {
       return `<tr class="req${r.live ? " live" : ""}${open ? " on" : ""}" data-k="${esc(r.id)}" tabindex="0" aria-expanded="${open}"><td>${clock(r.t * 1000)}</td><td class="${odd}">${esc(r.id)}${odd ? ` · ${esc(r.finish)}` : ""}</td>`
         + (multi ? `<td class="dim">${num(r.slot) ? `s${r.slot + 1}` : "-"}</td>` : "")
         + `<td class="col-ep">${r.live ? "-" : esc(ep(r.path))}</td>`
-        + `<td class="r">${num(r.prompt) ? fmt(r.prompt) : "-"}</td><td class="r col-cache">${num(r.cached) ? fmt(r.cached) : "-"}</td>`
-        + `<td class="r">${num(r.out) ? fmt(r.out) : "-"}</td><td class="r">${num(r.ttft) ? `${r.ttft.toFixed(2)} s` : "-"}</td>`
+        + `<td class="r col-prompt">${num(r.prompt) ? fmt(r.prompt) : "-"}</td><td class="r col-cache">${num(r.cached) ? fmt(r.cached) : "-"}</td>`
+        + `<td class="r">${num(r.out) ? fmt(r.out) : "-"}</td><td class="r col-ttft">${num(r.ttft) ? `${r.ttft.toFixed(2)} s` : "-"}</td>`
         + `<td class="r">${num(r.tps) ? r.tps.toFixed(1) : "-"}</td><td class="r col-hit">${pct(r.hit)}</td><td class="r col-pcie">${pct(r.pcie)}</td>`
-        + `<td class="r">${num(r.dur) ? `${r.dur.toFixed(1)} s` : "-"}</td></tr>`;
+        + `<td class="r col-dur">${num(r.dur) ? `${r.dur.toFixed(1)} s` : "-"}</td></tr>`;
     }).join("") + `</tbody></table>`;
 }
 const mss = s => `${Math.floor(s / 60)}:${p2(Math.floor(s % 60))}`;

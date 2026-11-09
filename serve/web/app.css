@@ -91,8 +91,8 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
   grid-template-rows: auto auto minmax(0, 1fr) minmax(0, auto);
   grid-template-areas: "state state state" "side hero hero" "side main logs" "side main conv"; }
 .a-side { grid-area: side; }
-.a-hero { grid-area: hero; }
-.a-main { grid-area: main; display: flex; flex-direction: column; }
+.a-hero { grid-area: hero; container-type: inline-size; }
+.a-main { grid-area: main; display: flex; flex-direction: column; container-type: inline-size; }
 .a-logs { grid-area: logs; display: flex; flex-direction: column; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; min-width: 0; min-height: 0; }
 .hd { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 14px 20px; font-size: 13px; color: var(--fg-3); border-bottom: 1px solid var(--line); flex: none; }
@@ -370,3 +370,29 @@ tbody tr.req:focus-visible { outline: 1px solid var(--accent); outline-offset: -
 .sb-cap2 { font: 400 11.5px/1.4 var(--font-mono); color: var(--fg-3); margin: -4px 0 12px; }
 /* the header of a long request list stays put */
 .pane thead th { position: sticky; top: 0; z-index: 1; background: var(--panel); }
+
+/* A card answers to its own width, not the window's: the requests table drops columns as the card narrows instead of
+   scrolling sideways. The thresholds follow the measured widths of the columns: the full table needs about 880 px. */
+@container (max-width: 900px) {
+  .a-main .col-ep { display: none; }
+}
+@container (max-width: 820px) {
+  .a-main .col-cache { display: none; }
+}
+@container (max-width: 760px) {
+  .a-main .col-pcie, .a-main .col-hit { display: none; }
+}
+@container (max-width: 700px) {
+  .a-main .col-ttft { display: none; }
+}
+@container (max-width: 640px) {
+  .a-main .col-dur { display: none; }
+}
+@container (max-width: 560px) {
+  .a-main .col-prompt { display: none; }
+  .a-hero .trio, .a-hero .hfoot { grid-template-columns: 1fr; }
+  .a-hero .trio > div + div, .a-hero .hfoot > div + div { border-left: 0; border-top: 1px solid var(--line); }
+}
+@container (max-width: 480px) {
+  .a-main th, .a-main td { padding-left: 6px; padding-right: 6px; }
+}
