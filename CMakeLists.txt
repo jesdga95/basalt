@@ -298,7 +298,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 # Defined in cmake/platform.cmake, included above with `warnings`.
 
 # ---- core (GPU runtime) ---------------------------------------------
-add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
+add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
                              src/core/host_plan.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
@@ -369,7 +369,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
 # ---- tiers: the storage and transfer tier shared by the models (VRAM slots, RAM and file source, peer card) ----
-add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp src/core/vmm.cpp src/core/peer_experts.cpp src/core/conversation_store.cpp src/core/conversation_memory.cpp)
+add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp src/core/peer_experts.cpp src/core/conversation_store.cpp src/core/conversation_memory.cpp)
 target_include_directories(tiers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(tiers PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 include(src/models/qwen4exp/qwen4exp.cmake)
@@ -379,6 +379,12 @@ if(BUILD_TESTING)
   basalt_embed_manifest(file_expert_source_test)
   basalt_cpu_test(NAME file_expert_source_test COMMAND file_expert_source_test)
   set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
+
+  add_executable(host_registration_test tests/core/host_registration_test.cpp)
+  target_link_libraries(host_registration_test PRIVATE tiers)
+  basalt_embed_manifest(host_registration_test)
+  basalt_gpu_test(NAME host_registration_test COMMAND host_registration_test)
+  set_tests_properties(host_registration_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 # file ranges to the GPU through unbuffered reads
 if(BUILD_TESTING)

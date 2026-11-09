@@ -464,12 +464,14 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
 void FileExpertSource::close() {
     repin_join();
     if (complement_arena_ != nullptr) {
-        if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
+        if (complement_allocation_.allocation_pinned()) complement_allocation_.reset();
+        else if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
         else {
             if (complement_partial_) unregister_complement();
             if (complement_locked_ > 0)
                 basalt::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
-            basalt::platform::free_aligned(complement_arena_);
+            if (complement_allocation_.data()) complement_allocation_.reset();
+            else basalt::platform::free_aligned(complement_arena_);
         }
     }
     if (top_arena_ != nullptr) {
@@ -509,6 +511,8 @@ void FileExpertSource::close() {
     complement_arena_ = nullptr;
     complement_host_ = nullptr;
     complement_device_ = nullptr;
+    complement_slice_at_.clear();
+    complement_slice_dev_.clear();
     complement_bytes_ = 0;
     complement_offsets_.clear();
     ++places_gen_;
@@ -939,12 +943,15 @@ bool FileExpertSource::pin_cache_complement(
         basalt::platform::advise_dontneed(fd_, file_off_, mapped_bytes_);
     }
 
+    RamAllocation allocation;
     void* arena = nullptr;
     const uint8_t* host = nullptr;
     const uint8_t* device = nullptr;
     bool pinned_ok = false;
     uint64_t locked = 0;
     uint64_t partial_pin = 0;   ///< a registered prefix of the arena (all of it once registered after the read)
+    std::vector<uint64_t> slice_at;
+    std::vector<const uint8_t*> slice_dev;
     bool register_after = false;   ///< the arena is registered with the driver after it is filled
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
@@ -952,11 +959,16 @@ bool FileExpertSource::pin_cache_complement(
     constexpr size_t kArenaAlign = 2ull << 20;
     auto release = [&]() {
         if (arena == nullptr) return;
-        if (pinned_ok) (void) cudaFreeHost(arena);
+        if (allocation.allocation_pinned()) allocation.reset();
+        else if (pinned_ok) (void) cudaFreeHost(arena);
         else {
-            if (partial_pin > 0) (void) cudaHostUnregister(arena);
+            if (partial_pin > 0) {
+                if (slice_at.empty()) (void) cudaHostUnregister(arena);
+                else for (uint64_t off : slice_at) (void) cudaHostUnregister((uint8_t*) arena + off);
+            }
             if (locked > 0) basalt::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
-            basalt::platform::free_aligned(arena);
+            if (allocation.data()) allocation.reset();
+            else basalt::platform::free_aligned(arena);
         }
         arena = nullptr;
     };
@@ -964,10 +976,8 @@ bool FileExpertSource::pin_cache_complement(
         basalt::log::info("basalt", "FileExpertSource: allocating %.2f GiB %s cache complement",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         if (pin) {
-            // Ordinary memory, aligned and padded to 2 MiB (whole large pages, so the registered range ends on a page
-            // boundary), registered with the driver once it is filled: the reads fault the pages in while the drive
-            // works, instead of the driver zeroing and locking all of it before the first read.
-            arena = alloc_ram(bytes);
+            // Allocation-backed pins need no portable registration. Ordinary spans are registered after the read.
+            if (allocation.allocate(bytes)) arena = allocation.data();
             if (arena != nullptr) {
                 register_after = true;
             } else {
@@ -1072,8 +1082,30 @@ bool FileExpertSource::pin_cache_complement(
     }
     const double read_done_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
     if (register_after) {
-        const RamPin rp = pin_ram(arena, ram_padded(bytes), bytes, {}, /*mapped=*/true, &device);
-        if (device != nullptr) {
+        std::vector<uint64_t> bounds;
+        if (platform::kBoundHostRegistration && !allocation.allocation_pinned()) {
+            std::vector<uint64_t> starts;
+            for (uint64_t off : offsets) if (off != kNoComplement) starts.push_back(off);
+            uint64_t at = spare_at;
+            for (const auto& [blob, count] : spare_sizes)
+                for (int64_t i = 0; i < count; ++i, at += blob) starts.push_back(at);
+            bounds = ram_pin_slices(std::move(starts), ram_padded(bytes), platform::system_page_size(), 1ull << 30);
+        }
+        const RamPin rp = pin_ram(allocation, bounds, /*mapped=*/true, &device);
+        if (rp.allocation_backed) {
+            partial_pin = bytes;
+            note = "CUDA-pinned through host VMM";
+        } else if constexpr (platform::kBoundHostRegistration) {
+            partial_pin = std::min(bytes, rp.registered_bytes);
+            lock_off = rp.lock_off;
+            locked = rp.locked_bytes;
+            slice_at = rp.slice_starts;
+            slice_dev = rp.slice_devices;
+            note = "registered " + std::to_string(partial_pin >> 20) + " MiB";
+            if (rp.capped) note += "; " + rp.cap_why;
+            if (!rp.refused.empty()) note += "; " + rp.refused;
+            if (!rp.lock_note.empty()) note += "; " + rp.lock_note;
+        } else if (device != nullptr) {
             partial_pin = bytes;   // released through the registered-prefix path
             lock_off = bytes;
             note = "page-locked and mapped";
@@ -1093,8 +1125,11 @@ bool FileExpertSource::pin_cache_complement(
     }
 
     complement_arena_ = arena;
+    complement_allocation_ = std::move(allocation);
     complement_host_ = host;
     complement_device_ = device;
+    complement_slice_at_ = std::move(slice_at);
+    complement_slice_dev_ = std::move(slice_dev);
     complement_bytes_ = bytes;
     complement_offsets_ = std::move(offsets);
     ++places_gen_;
@@ -1648,10 +1683,13 @@ void FileExpertSource::repin_join() {
 
 // Each range registered by itself: the whole arena (as loaded), or the ranges of an earlier WAKE.
 void FileExpertSource::unregister_complement() {
+    if (complement_allocation_.allocation_pinned()) return;
     if (unpinned_ || complement_arena_ == nullptr) return;
     if (pin_units_.size() >= 2 && pin_state_) {
         for (size_t i = 0; i + 1 < pin_units_.size(); ++i)
             if (pin_state_[i].load() == 1) (void) cudaHostUnregister((uint8_t*) complement_arena_ + pin_units_[i]);
+    } else if (!complement_slice_at_.empty()) {
+        for (uint64_t off : complement_slice_at_) (void) cudaHostUnregister((uint8_t*) complement_arena_ + off);
     } else {
         (void) cudaHostUnregister(complement_arena_);
     }
@@ -1659,6 +1697,10 @@ void FileExpertSource::unregister_complement() {
 }
 
 bool FileExpertSource::unpin_complement(std::string& err) {
+    if (complement_allocation_.allocation_pinned()) {
+        err = "host VMM keeps the expert RAM pinned";
+        return false;
+    }
     if (unpinned_) return true;
     if (!complement_ready_ || complement_arena_ == nullptr || !complement_partial_ ||
         complement_pin_limit_ != complement_bytes_ || complement_device_ == nullptr ||
@@ -1666,6 +1708,11 @@ bool FileExpertSource::unpin_complement(std::string& err) {
         err = "the RAM copy is not one registered range read at its host addresses";
         return false;
     }
+    for (size_t i = 0; i < complement_slice_at_.size(); ++i)
+        if (complement_slice_dev_[i] != complement_host_ + complement_slice_at_[i]) {
+            err = "the RAM copy is not registered at its host addresses";
+            return false;
+        }
     repin_join();
     unregister_complement();
     unpinned_ = true;
@@ -1745,7 +1792,9 @@ const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) con
         const int r = detail::home_region_find(homes_, off, layer_blob_bytes_[(size_t) layer]);
         return r >= 0 ? homes_[(size_t) r].device + (size_t) (off - homes_[(size_t) r].base) : nullptr;
     }
-    return off >= complement_bytes_ ? top_device_ + (size_t) (off - complement_bytes_) : complement_device_ + (size_t) off;
+    if (off >= complement_bytes_) return top_device_ + (size_t) (off - complement_bytes_);
+    return complement_slice_at_.empty() ? complement_device_ + (size_t) off :
+        ram_pin_alias(complement_slice_at_, complement_slice_dev_, off);
 }
 
 bool FileExpertSource::pcie_layer(int64_t layer) const {
