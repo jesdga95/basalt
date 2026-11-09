@@ -2,6 +2,32 @@
   "preset": "basalt-bench --community",
   "runs": [
     {
+      "submitter": "roger",
+      "date": "2026-11-09",
+      "commit": "4998eb3733",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 300,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 55.0
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "AMD Ryzen 7 7700, 8 cores",
+      "ram_gbps": 63.2,
+      "os": "Linux",
+      "quant": "i1-IQ3_S",
+      "kv": "int8",
+      "prefill_16k_tps": 4427.2,
+      "prefill_64k_tps": 4503.9,
+      "decode_tps": 142.9,
+      "notes": "mradermacher i1-IQ3_S GGUF converted with --compat-bf16 and --sections-from official UD-IQ3_XXS; weights on NVMe; headless, 0 expert SSD spill."
+    },
+    {
       "submitter": "lindworm-hermes2026",
       "date": "2026-10-22",
       "commit": "57909606c2",
