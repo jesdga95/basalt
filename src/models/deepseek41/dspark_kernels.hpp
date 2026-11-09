@@ -16,12 +16,14 @@ inline size_t mxfp4_row_bytes(int n_in) { return (size_t) (n_in / kMxfp4BlockEle
 
 /// h[p][r] = swiglu(gate_e[r] . x[t], up_e[r] . x[t]) for pair p = t * K + k, e = ids[p]; the weights are MXFP4
 /// matrices [n_expert][n_ff][n_in] (expert e at e * n_ff * row bytes, 4-byte aligned, followed by kMxfp4Pad readable
-/// bytes); x is fp32 [T][n_in]; the clamp is the SwiGLU limit. n_in is a multiple of 128 and at most 6144.
-void dspark_moe_gate_up(const void* gate_w, const void* up_w, int n_in, int n_ff, const float* x, const int32_t* ids,
+/// bytes); x is q8_1 [T][n_in] (kernels::native_quantize_q8_1), the dots int8 (dp4a) per 32 values as llama.cpp's
+/// MXFP4 kernels take them; the clamp is the SwiGLU limit. n_in is a multiple of 128 and at most 6144.
+void dspark_moe_gate_up(const void* gate_w, const void* up_w, int n_in, int n_ff, const void* x_q8_1, const int32_t* ids,
                         int n_tokens, int k, float clamp, float* h, void* stream);
 
-/// d[p][r] = down_e[r] . h[p] with down_e [n_out][n_ff] MXFP4 (expert e at e * n_out * row bytes).
-void dspark_moe_down(const void* down_w, int n_ff, int n_out, const float* h, const int32_t* ids, int n_tokens, int k,
+/// d[p][r] = down_e[r] . h[p] with down_e [n_out][n_ff] MXFP4 (expert e at e * n_out * row bytes) and h q8_1
+/// [pairs][n_ff].
+void dspark_moe_down(const void* down_w, int n_ff, int n_out, const void* h_q8_1, const int32_t* ids, int n_tokens, int k,
                      float* d, void* stream);
 
 /// out[t][i] = sum_k w[t*K + k] * d[(t*K + k)][i] + shared[t][i].

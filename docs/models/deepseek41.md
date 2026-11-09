@@ -64,7 +64,7 @@ basalt deepseek41: drafter on GPU 0: 2.41 GiB, 32 of 128 experts per stage, wind
 Measured on the UD-IQ1_M pack, 400 W + 180 W, 121 GiB of RAM, `--pool-workers 8`:
 
 - The drafter takes 2.41 GiB of the main card with 32 experts per stage, 7.47 GiB with all 128 (which leaves 28 to 29 experts per
-  layer in the file). A block takes 2.0 ms.
+  layer in the file). A block takes 1.4 ms.
 - Greedy, 800 tokens, cold, tok/s (tokens per window):
 
 | | Code | Conversation | Prose |
