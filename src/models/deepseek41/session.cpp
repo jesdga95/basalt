@@ -184,9 +184,9 @@ public:
     model::Result draft_begin(int32_t anchor, int64_t pos) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
         std::string err;
-        ops_->commit_window(pos, stream_);
         if (!flush_features(pos, err) || !drafter_->draft_begin(dwin_, anchor, pos, std::min(max_window() - 1, kDsparkBlock), err))
             return {model::Status::Error, err};
+        ops_->commit_window(pos, stream_);   // the compressor commits the drafter does not read run beside it
         ops_->end_window(true);   // the copies queued behind the drafter's inputs run while it drafts
         return {};
     }
