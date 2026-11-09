@@ -69,7 +69,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `-r N` | 1 | Repetitions; above 1 the table shows mean and deviation. |
 | `--seed N` | | Seed every decode request. |
 | `--set "FLAG VALUE"` | | Replace or add engine arguments (repeatable). |
-| `--engine PATH`, `--fixtures DIR` | built engine, `data/bench` | Binary and fixtures. |
+| `--engine PATH`, `--fixtures DIR` | `basalt` beside the bench, `data/bench` | Binary and fixtures. |
 | `-o md` or `json` | md | Output format. |
 | `--power-label W` | read from the GPU | The power limit to print. |
 | `--logs DIR`, `--no-windows`, `--print-command` | | Logs, window stats, command printing. |

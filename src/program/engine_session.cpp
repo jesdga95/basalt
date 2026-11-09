@@ -246,6 +246,22 @@ std::string fixtures_for(const std::string& dir, const std::string& plan_answer)
     return std::filesystem::is_directory(own, ec) ? own.string() : dir;
 }
 
+std::string default_engine(const std::string& self, const std::string& built) {
+    if (!self.empty()) {
+        const std::filesystem::path p(self);
+        const std::string beside = (p.parent_path() / ("basalt" + p.extension().string())).string();
+        if (basalt::platform::path_executable(beside)) return beside;
+    }
+    return built;
+}
+
+std::string default_fixtures(const std::string& root, const std::string& built) {
+    std::error_code ec;
+    if (!root.empty() && std::filesystem::is_directory(std::filesystem::path(root) / "data" / "bench", ec))
+        return (std::filesystem::path(root) / "data" / "bench").string();
+    return built;
+}
+
 std::string lossy_note(const std::string& lossy) {
     const std::vector<std::string> flags = split(lossy, ',');
     std::string list;

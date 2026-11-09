@@ -1,6 +1,7 @@
 // tests/program/engine_session_test.cpp - Engine::start against a stand-in engine (this binary run with --serve): an
 // error-marked log line during a healthy start does not fail it, an engine that exits before READY does, with its
-// error lines in the reason; an engine with lossy flags reports them. Also the lossy note. CPU only.
+// error lines in the reason; an engine with lossy flags reports them. Also the default engine and fixtures paths and
+// the lossy note. CPU only.
 #include "basalt/program/engine_session.hpp"
 
 #include <cstdio>
@@ -87,6 +88,25 @@ int main(int argc, char** argv) {
         check(e.info["lossy"] == "--route-tail-skip", "the lossy flags are read from INFO", e.info["lossy"]);
         e.stop();
         std::filesystem::remove(log);
+    }
+    {   // the engine and fixtures a program uses without --engine / --fixtures
+        namespace fs = std::filesystem;
+        const fs::path top = fs::path(dir) / "engine_session_test_install";
+        fs::remove_all(top);
+        fs::create_directories(top / "bin");
+        const std::string bench = (top / "bin" / "basalt-bench.exe").string(), built = "/build/bin/basalt";
+        check(basalt::program::default_engine(bench, built) == built, "no engine beside the program: the build's");
+        std::ofstream((top / "bin" / "basalt.exe").string()) << "x";
+        fs::permissions(top / "bin" / "basalt.exe", fs::perms::owner_all);
+        const std::string got = basalt::program::default_engine(bench, built);
+        check(got == (top / "bin" / "basalt.exe").string(), "the engine beside the program, with its suffix", got);
+        check(basalt::program::default_engine("", built) == built, "a program that cannot name itself: the build's");
+        check(basalt::program::default_fixtures(top.string(), "/build/data/bench") == "/build/data/bench",
+              "no data/bench in the install: the build's fixtures");
+        fs::create_directories(top / "data" / "bench");
+        check(basalt::program::default_fixtures(top.string(), "/build/data/bench") == (top / "data" / "bench").string(),
+              "the install's data/bench");
+        fs::remove_all(top);
     }
     {
         const std::string one = basalt::program::lossy_note("--route-tail-skip");
