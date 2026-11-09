@@ -98,7 +98,6 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     layer_card_.assign((size_t) n_layers_, 0);
     if (!m_.peer_devices().empty()) {
         const std::vector<int>& devs = m_.peer_devices();
-        blocks_ = policy::split_layers(n_layers_, (int) devs.size());
         std::string pe;
         bool ok = true;
         for (size_t c = 0; c < devs.size() && ok; ++c) {
@@ -110,17 +109,16 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
             }
         }
         if (ok) {
-            std::vector<uint64_t> rooms, block_bytes;
-            for (size_t c = 0; c < peers_.size(); ++c) {
-                uint64_t b = 0;   // one slot in every layer of the card's block, as one_each counts them
-                for (int l = blocks_.lo[c]; l < blocks_.hi[c]; ++l) {
-                    b += (m_.pack().experts[(size_t) l].blob_bytes + 255) / 256 * 256;
-                    layer_card_[(size_t) l] = (int) c;
-                }
-                rooms.push_back(peers_[c]->room());
-                block_bytes.push_back(b);
-            }
-            peer_slots = policy::uniform_peer_slots(rooms, block_bytes, (uint64_t) m_.tiers().peer_reserve_mib << 20, n_expert_);
+            // every card is open with its share's buffers, so its room is what its slots will get: the blocks are sized
+            // to the rooms (bigger late layers go to more cards), then each block's prompt-share prices are set
+            std::vector<uint64_t> rooms, layer_bytes;   // one slot of each layer, as one_each counts them
+            for (const auto& p : peers_) rooms.push_back(p->room());
+            for (int l = 0; l < n_layers_; ++l) layer_bytes.push_back((m_.pack().experts[(size_t) l].blob_bytes + 255) / 256 * 256);
+            const uint64_t reserve_peer = (uint64_t) m_.tiers().peer_reserve_mib << 20;
+            blocks_ = policy::split_by_bytes(layer_bytes, rooms, reserve_peer, n_expert_, peer_slots);
+            for (size_t c = 0; c < blocks_.lo.size(); ++c)
+                for (int l = blocks_.lo[c]; l < blocks_.hi[c]; ++l) layer_card_[(size_t) l] = (int) c;
+            fill_share_rates();
         } else {
             shares_.clear();
             basalt::log::warn("basalt deepseek41", "second card not used: %s", pe.c_str());
@@ -290,19 +288,29 @@ bool ExpertTier::open_share(size_t card, std::string& err) {
     auto share = std::make_unique<prefill::PeerShare>();
     if (!share->open(main_dev, dev, d, err)) return false;
     shares_.push_back(std::move(share));
-    // a row of a layer's products is three matrices of n_embd x n_ff multiply-adds
-    const core::DeviceRates r0 = core::device_rates(main_dev), r1 = core::device_rates(dev);
-    const double macs = 3.0 * (double) g.n_embd * (double) g.n_ff_exp;
-    if (rates_.size() != (size_t) n_layers_) rates_.assign((size_t) n_layers_, {});
-    for (int l = blocks_.lo[card]; l < blocks_.hi[card]; ++l) {
-        prefill::ShareRates& r = rates_[(size_t) l];
-        r.link0 = r0.link_bytes;
-        r.link1 = r1.link_bytes;
-        r.rows0 = r0.sm_hz * prefill::kMmqMacsPerSmCycle / macs;
-        r.rows1 = r1.sm_hz * prefill::kMmqMacsPerSmCycle / macs;
-        r.sm_hz0 = r0.sm_hz;
-    }
     return true;
+}
+
+// Each layer's prompt-share prices, from the main card and the card that holds the layer (blocks_ is set).
+void ExpertTier::fill_share_rates() {
+    const Geometry& g = m_.geo();
+    int main_dev = 0;
+    cudaGetDevice(&main_dev);
+    const core::DeviceRates r0 = core::device_rates(main_dev);
+    // a row of a layer's products is three matrices of n_embd x n_ff multiply-adds
+    const double macs = 3.0 * (double) g.n_embd * (double) g.n_ff_exp;
+    rates_.assign((size_t) n_layers_, {});
+    for (size_t card = 0; card < blocks_.lo.size() && card < peers_.size(); ++card) {
+        const core::DeviceRates r1 = core::device_rates(peers_[card]->device());
+        for (int l = blocks_.lo[card]; l < blocks_.hi[card]; ++l) {
+            prefill::ShareRates& r = rates_[(size_t) l];
+            r.link0 = r0.link_bytes;
+            r.link1 = r1.link_bytes;
+            r.rows0 = r0.sm_hz * prefill::kMmqMacsPerSmCycle / macs;
+            r.rows1 = r1.sm_hz * prefill::kMmqMacsPerSmCycle / macs;
+            r.sm_hz0 = r0.sm_hz;
+        }
+    }
 }
 
 program::ExpertSpill ExpertTier::spill() const {
