@@ -39,6 +39,16 @@ class Migration(unittest.TestCase):
         self.assertEqual(new["models"], [{"model": "m", "slot-full-context": True, "max-context": 8192}])
         self.assertNotIn("v", new)
 
+    def test_a_single_model_file_marked_version_2(self):
+        # the server refuses it as v1 and names this tool, so the tool takes it
+        marked = {"version": 2, **OLD}
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "marked.json"
+            src.write_text(json.dumps(marked))
+            with self.assertRaisesRegex(ValueError, "Basalt requires v2 config"):
+                load_config_file(str(src), build_parser())
+        self.assertEqual(migrate.migrated(marked), migrate.migrated(OLD))
+
     def test_refused(self):
         for old, why in (({"models": []}, "already has"), ([], "JSON object"), ({"x": 1}, "unexpected key"),
                          ({"engine": {"kv": "int8"}}, "names no model")):

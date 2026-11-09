@@ -31,7 +31,8 @@ def migrated(old) -> dict:
     """The v2 object for a v1 one; ValueError when `old` is not a v1 config that names its model."""
     if not isinstance(old, dict) or "models" in old:
         raise ValueError("not a v1 config: it already has \"models\"" if isinstance(old, dict) else "expected a JSON object")
-    extra = set(old) - {"v", "server", "engine"}
+    # a "version" key on the single-model shape (a v1 file marked 2 by hand) is what the server sends here too
+    extra = set(old) - {"v", "version", "server", "engine"}
     if extra:
         raise ValueError(f"not a v1 config: unexpected key {sorted(extra)[0]!r}")
     server, engine, entry, shared = {}, {}, {}, {}
