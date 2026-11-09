@@ -1,6 +1,7 @@
 // src/models/deepseek41/ops_kernels.cpp - the layer ops built from the kernel groups' entry points: attention
 // (window ring, compressor, indexer, query path, sparse MQA, grouped output) with per-layer state owned here.
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/log.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/platform/file.hpp"
@@ -346,6 +347,15 @@ public:
             return false;
         }
         if (!ensure_positions(pos + T, err)) return false;
+        if (lent_here_) {
+            // the caches took the tier's slots: what is left above the reserve goes back to it now, as no prompt path
+            // closes after a short read
+            lent_here_ = false;
+            std::string e;
+            cudaDeviceSynchronize();
+            if (!tier_->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
+            tier_->grow();
+        }
         if (!ensure_tier(err)) return false;
         commit_window(pos, stream);
         if (T > 1) {
@@ -378,14 +388,15 @@ public:
     bool graph_capable() const override { return true; }
 
     // Backs the compressed caches up to `positions`. When the card is full the expert tier gives back its loan of
-    // spare slots and the mapping is tried again.
+    // spare slots and the mapping is tried again; when that is not enough (a step maps 4 granules on every layer at
+    // once) it lends all its slots, as a long prompt read does, and stage_token takes back what is left.
     bool ensure_positions(int64_t positions, std::string& err) override {
         if (positions <= backed_positions_) return true;
         if (positions > ctx_) {
             err = "deepseek41: the position exceeds the context (" + std::to_string(ctx_) + " tokens)";
             return false;
         }
-        for (int attempt = 0; attempt < 2; ++attempt) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
             std::string e;
             bool ok = true;
             const uint64_t keep = tier_ ? tier_->free_floor() : 0;
@@ -402,6 +413,17 @@ public:
             if (attempt == 0 && tier_) {
                 cudaDeviceSynchronize();
                 tier_->shrink();
+                continue;
+            }
+            if (attempt == 1 && tier_) {
+                const int64_t before = tier_->slots();
+                cudaDeviceSynchronize();
+                tier_->lend_all();
+                if (tier_->slots() < before) {   // a prompt path that lent the tier on purpose keeps it
+                    lent_here_ = true;
+                    basalt::log::warn("basalt deepseek41", "the compressed caches took the VRAM tier's slots at %lld positions",
+                                      (long long) positions);
+                }
                 continue;
             }
             err = "deepseek41: not enough free device memory for a context of " + std::to_string(positions) +
@@ -985,6 +1007,7 @@ private:
     std::vector<uint8_t*> ring_, comp_kv_, comp_ik_;
     std::vector<std::unique_ptr<ElasticBuf>> el_kv_, el_ik_;   // backing of comp_kv_ / comp_ik_ per kv-source layer
     int64_t backed_positions_ = 0;
+    bool lent_here_ = false;   // ensure_positions lent the tier's slots; stage_token takes back what is left
     int ctx_ = 0;
     CacheFormat fmt_ = CacheFormat::Fp8;   // the caches' rows (--kv)
     uint64_t lat_b_ = 0, idx_b_ = 0;       // a compressed row's and an index key's bytes
