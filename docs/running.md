@@ -10,6 +10,8 @@ GiB, and a `--idle-sleep` wake reads `Waking up`. `/metrics` has `live.state` `l
 or `wake`; `/v1/status` and `/health` carry `loading`. Requests wait, then are served; a failed load gives them a 503 in
 the API's own error shape. The start-up load tries once and a failure ends the server; reloads try up to 3 times.
 
+The [agent context sharing proposal](architecture/agent-context-sharing.md) describes a future forkable context registry, shared prefix pages and GPU/RAM/disk recovery. These APIs and scheduler changes are **not implemented**; the behavior below remains the current reference.
+
 ## Concurrent requests: `--parallel N`
 
 `--parallel N` (1..8, also `"parallel"` in the config's `server` section) serves N requests at once in the
