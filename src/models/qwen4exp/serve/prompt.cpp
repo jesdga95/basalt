@@ -136,14 +136,16 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     // `auto:N` and a fixed N keep the operator's number.  (Chunking changes the GEMM tiles and so the rounding of
     // a prompt's K/V; the answers can differ from another chunking by greedy near-ties.)
     int64_t cap = runtime_.read_cap();
-    // Loan limits while slots decode: the loan takes only slots whose expert has a RAM copy (a lent slot
-    // is refilled from RAM, never read from the file, before the slots decode again), and a read beside
-    // them stays within kLendCapDecoding slots (they keep their experts in the cache).  A read on an idle
-    // engine may refill lent slots from the file, so a larger chunk is worth it.  The chunk shrinks to the
-    // loan, but not below the smallest chunk the prompt path runs.
+    // Loan limits beside decoding slots: the loan stays within kLendCapDecoding slots (they keep their experts in
+    // the cache) and takes only slots whose expert has a RAM copy (a lent slot is refilled from RAM, never read
+    // from the file, while the slots decode).  A read that runs alone, on an idle engine or while the slots wait
+    // for it, lends as an idle engine does and may refill lent slots from the file: a chunk cut to the RAM copies
+    // (few when RAM is short or the KV has taken the cache's tail) would stream the experts again every few
+    // hundred tokens, and the waiting slots would wait for all of it.  The chunk shrinks to the loan, but not
+    // below the smallest chunk the prompt path runs.
     int64_t loan_lim = std::numeric_limits<int64_t>::max();
-    if (runtime_.batch_on()) {
-        if (beside) loan_lim = runtime_.kLendCapDecoding;
+    if (beside) {
+        loan_lim = runtime_.kLendCapDecoding;
         // the RAM-backed slots are the cache's last ones: those still live after the KV took its share
         if (runtime_.src.complement_ready())
             loan_lim = std::min<int64_t>(loan_lim, std::max<int64_t>(0, runtime_.src.resident_lent_slots() -
