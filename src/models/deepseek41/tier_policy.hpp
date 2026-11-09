@@ -102,6 +102,60 @@ inline int uniform_peer_slots(const std::vector<uint64_t>& room, const std::vect
         slots = std::min<uint64_t>(slots, room[c] > reserve && block_bytes[c] > 0 ? (room[c] - reserve) / block_bytes[c] : 0);
     return (int) slots;
 }
+/// Blocks sized to each card's room: the contiguous split, in card order and with every card holding at least one layer,
+/// that gives every layer the most second-card homes `homes` such that each card's block fits:
+/// homes * (one slot in every layer of the block) <= room - reserve. `layer_bytes[l]`: one slot of layer l (256-rounded,
+/// as the tier's one_each). `homes` 0 (blocks by count, for the record) when even one home per layer does not fit or there
+/// are more cards than layers. Feasibility only falls as homes rise, so a binary search finds the best count; each count
+/// is checked exactly over every contiguous split (reach[c][i]: the first c cards can hold the first i layers). Filling
+/// each card as far as it goes is NOT enough when the cards' rooms differ: a big early block can starve a small card.
+inline PeerBlocks split_by_bytes(const std::vector<uint64_t>& layer_bytes, const std::vector<uint64_t>& room, uint64_t reserve,
+                                 int n_expert, int& homes) {
+    const int L = (int) layer_bytes.size(), n = (int) room.size();
+    auto fill = [&](uint64_t h, PeerBlocks& b) {
+        // from[c][i]: where card c-1's block starts when the first c cards hold exactly the first i layers, -1: cannot
+        std::vector<std::vector<int>> from((size_t) n + 1, std::vector<int>((size_t) L + 1, -1));
+        from[0][0] = 0;
+        for (int c = 0; c < n; ++c) {
+            const uint64_t cap = room[(size_t) c] > reserve ? room[(size_t) c] - reserve : 0;
+            for (int i = 0; i < L; ++i) {
+                if (from[(size_t) c][(size_t) i] < 0) continue;
+                uint64_t sum = 0;
+                for (int j = i; j < L; ++j) {   // card c takes layers [i, j]
+                    sum += layer_bytes[(size_t) j];
+                    if (h * sum > cap) break;
+                    if (from[(size_t) c + 1][(size_t) j + 1] < 0) from[(size_t) c + 1][(size_t) j + 1] = i;
+                }
+            }
+        }
+        if (from[(size_t) n][(size_t) L] < 0) return false;
+        b.lo.assign((size_t) n, 0);
+        b.hi.assign((size_t) n, 0);
+        for (int c = n, i = L; c > 0; --c) {
+            b.hi[(size_t) c - 1] = i;
+            i = from[(size_t) c][(size_t) i];
+            b.lo[(size_t) c - 1] = i;
+        }
+        return true;
+    };
+    homes = 0;
+    PeerBlocks best = split_layers(L, n > 0 ? n : 1);
+    if (n < 1 || n > L) return best;
+    int lo = 1, hi = n_expert;
+    PeerBlocks b;
+    while (lo <= hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (fill((uint64_t) mid, b)) {
+            homes = mid;
+            best = b;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return best;
+}
+
 /// A second-card slot in its own card's numbering: the card's first layer starts at 0. The tier's global slot of
 /// (layer, n) is layer * homes_peer + n.
 inline int32_t local_slot(const PeerBlocks& b, int homes_peer, int layer, int n) {
