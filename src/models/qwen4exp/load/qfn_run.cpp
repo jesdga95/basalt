@@ -1,5 +1,7 @@
 // The whole start of a Flash-Next engine, in order: its stack frames hold the resources while the server runs.
+#include "basalt/core/shipped_profiles.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/platform/file.hpp"
 #include "context.hpp"
 #include "../../../program/generate/run.hpp"
 #include "models/qwen4exp/adapter.hpp"
@@ -34,7 +36,9 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
             }
         } else {
             const std::string key = cli::profile_key(model_file.meta());
-            const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
+            const std::string miss = basalt::core::missing_shipped_profile(basalt::platform::install_root() + "/data/profiles", cli::shipped_profiles(key));
+            if (!miss.empty()) return fatal_start_error(miss);
+            const std::string prof = basalt::platform::install_root() + "/data/profiles/" + key + ".prof";
             if (!key.empty() && basalt::platform::file_size(prof, prof_bytes) && prof_bytes > 0) o.expert_profile = prof;
             else {
                 basalt::log::info("basalt generate", "no expert profile for %s", key.empty() ? "this model" : key.c_str());
@@ -92,7 +96,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
     // peer-only experts, staged through the host, so streaming loses until later.
     auto set_stream_all_min = [&]() {
-        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share)
+        if (o.serve && o.peer_device >= 1 && !o.no_peer_prefill && peer_streamed_share)
             basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
     };
     set_stream_all_min();
@@ -107,8 +111,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
     // streaming and images (the server's GPU encoder) run across a split, also with parking and --batch.  Across
-    // GPUs, not supported: control vectors and lending cache slots to the
-    // prompt path (each stage's prompt path has its own buffers).
+    // GPUs, not supported: lending cache slots to the prompt path (each stage's prompt path has its own buffers).
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
     bool split_auto = false, split_same = false;
@@ -236,19 +239,20 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
         const auto& lay = basalt::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
-            if (!basalt::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
+            if (!basalt::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type)) {
                 char msg[224];
-                std::snprintf(msg, sizeof msg, "layer %lld's experts are %s/%s (ggml types %d/%d), which this "
-                                               "engine has no GPU kernels for: format not supported for decode",
-                              (long long) l,
-                              basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
-                              f.gu_type, f.d_type);
+                std::snprintf(msg, sizeof msg, "layer %lld's experts are %s%s%s/%s (ggml types %d/%d/%d), which "
+                                               "this engine has no GPU kernels for: format not supported for decode",
+                              (long long) l, basalt::ggml_type_name((uint32_t) f.gu_type),
+                              f.up_type != f.gu_type ? "+" : "",
+                              f.up_type != f.gu_type ? basalt::ggml_type_name((uint32_t) f.up_type) : "",
+                              basalt::ggml_type_name((uint32_t) f.d_type), f.gu_type, f.up_type, f.d_type);
                 return fatal_start_error(msg);
             }
             // Q6_K experts run on the fast kernels only (decode-once grouped / device-planned tail, MMQ prefill, CPU
             // dot): a pair or shape outside them is refused rather than routed to a general path.
             if ((f.gu_type == 14 || f.d_type == 14) &&
-                (!basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff) ||
+                (!basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type) ||
                  !basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) || !basalt::prefill::mmq::fits(f.d_type, f.n_embd))) {
                 char msg[224];
                 std::snprintf(msg, sizeof msg, "layer %lld's experts are %s/%s: Q6_K experts have fast kernels only "
@@ -263,14 +267,18 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
             const auto& f = lay.fmt[(size_t) l];
             int64_t e = l;
             while (e + 1 < (int64_t) lay.fmt.size() && lay.fmt[(size_t) e + 1].gu_type == f.gu_type &&
-                   lay.fmt[(size_t) e + 1].d_type == f.d_type)
+                   lay.fmt[(size_t) e + 1].up_type == f.up_type && lay.fmt[(size_t) e + 1].d_type == f.d_type)
                 ++e;
-            basalt::log::info("basalt generate", "experts %s/%s, layers %lld-%lld: decode %s, prefill %s, CPU tier dot",
-                         basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
-                         (long long) l, (long long) e,
-                         basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+            // a layer whose up rows have their own type shows both: gate+up/down
+            const bool mixed = f.up_type != f.gu_type;
+            basalt::log::info("basalt generate", "experts %s%s%s/%s, layers %lld-%lld: decode %s, prefill %s, CPU tier dot",
+                         basalt::ggml_type_name((uint32_t) f.gu_type), mixed ? "+" : "",
+                         mixed ? basalt::ggml_type_name((uint32_t) f.up_type) : "",
+                         basalt::ggml_type_name((uint32_t) f.d_type), (long long) l, (long long) e,
+                         basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type)
                              ? "device-planned tail + grouped kernels" : "grouped kernels",
-                         basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) && basalt::prefill::mmq::fits(f.d_type, f.n_embd)
+                         basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) && basalt::prefill::mmq::fits(f.up_type, 2 * f.n_ff) &&
+                                 basalt::prefill::mmq::fits(f.d_type, f.n_embd)
                              ? "MMQ" : "dequant GEMM");
             l = e + 1;
         }

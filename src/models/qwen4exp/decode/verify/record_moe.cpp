@@ -45,14 +45,14 @@ bool Verifier::WindowRecorder::post(int64_t l) {
     auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf) {
         // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
         const auto& f = lay.fmt[(size_t) l];
-        const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, 0.0f, f.up_type);
         native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                               v_.nat_xq_, v_.hit_scratch_, dst_buf, cs, gy);
     };
     if (dm) {   // CUDA0's entries straight into their parts rows; the other tiers are read by the combine
         stamp(l, 19);
         const auto& f = lay.fmt[(size_t) l];
-        const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, 0.0f, f.up_type);
         DmPlan* P = v_.dm_->plan;
         // the next GDN layer's commit (and later ones while this layer waits for the CPU), and the next layer's
         // projection weights into L2 while this layer's combine waits

@@ -39,7 +39,7 @@ A config file is one JSON object. `models` lists the models; `engine` applies to
 ## Automatic settings
 
 When left out, the engine picks `peer-exclusive`, `resident` (`resident-budget-gib`), `pool-affinity` and `pool-workers`. A given value
-always wins. It prints one `[server] auto` line:
+always wins. It prints one `[server] auto` line, where `ram-experts` is the `resident` amount (the experts held in RAM, not the whole model):
 
 | Setting | Rule |
 | --- | --- |
@@ -68,6 +68,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `idle-sleep` | entry | seconds | off | Sleep after this long idle: VRAM freed, RAM kept, wake in seconds. Linux only. [running](../running.md#sleep---idle-sleep) |
 | `min-free-vram-mib` | entry | integer | off | Load an unloaded model only when this much VRAM is free; else 503. |
 | `grammar` | entry | switch (`--no-grammar`) | on | Hold tool calls and JSON formats (`json_object`, `json_schema`) to their schema inside the engine. Without it, other JSON formats are refused with 400. |
+| `max-payload-mib` | server | MiB | `256` | Largest request body the server reads; a bigger one gets a 413. |
 | `debug` | server | switch | off | One log line per request, and the raw model text. |
 | `request-lines` | server | switch | off | Echo the per-request summary on stdout. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | entry | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling`, else the engine's | Default for a request that leaves the field out. See [sampling](sampling.md). |
@@ -88,8 +89,8 @@ Command line `--name`; the Where column says which config block takes it.
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
 | `max-context` | engine | tokens | 8192 | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
-| `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | Flash-Next only. KV storage. `int8` halves VRAM. `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056). Not with `kv-resident`. |
-| `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. |
+| `kv` | engine | Flash-Next: `fp16`, `int8`, `q4_0`, `k8v4`; DeepSeek: `fp8`, `fp16` | Flash-Next `fp16`, DeepSeek `fp8` | KV storage. Flash-Next: `int8` halves VRAM; `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056); not with `kv-resident`. DeepSeek: `fp8` rounds as the model's reference (FP8 window rows, FP4 compressed rows and index keys, 920 bytes per position); `fp16` keeps the unrounded values (3,200 bytes per position). A model refuses the other's values. |
+| `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. With `parallel` and `kv` `int8`, every slot streams its own K/V this way. |
 | `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next only. Extend past the trained length. Fixed for the run. |
 | `rope-scale` | engine | number | model's, else 1 | Flash-Next only. Factor for `linear` and `yarn`. |
 | `rope-freq-base`, `rope-freq-scale` | engine | number | 0 (model's own) | Flash-Next only. Raw RoPE values. Leave at 0 unless you know them. |
@@ -111,6 +112,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `vram-elastic` | engine | switch | off | Flash-Next only. Hold the expert cache in segments so `POST /v1/vram` can lend VRAM between requests. |
 | `vram-segment-mib` | engine | MiB, at least 64 | 512 | Flash-Next only. Segment size for `vram-elastic`. |
 | `expert-cache` | engine | `auto` or a count | `auto` | Expert blobs kept in VRAM. `auto` takes what fits after weights, session and reserve. |
+| `ram-reserve-mib` | engine | MiB | 2048 | RAM left free for the rest of the system. The expert tiers take what is above it after the engine's own host buffers, and the serving RAM guard holds it. `0` keeps nothing and turns the guard off. [memory floors](../running.md#memory-floors) |
 | `adapt-every` | engine | windows | 1 on a server, 4 with a layer split (`0` = off) | Flash-Next only. An adaptive round every N windows. [adaptive](adaptive.md) |
 | `adapt-swaps` | engine | integer | 96 (`0` = off) | Flash-Next only. Most experts one round swaps into the main GPU. [adaptive](adaptive.md) |
 | `peer-adapt-swaps` | engine | integer | `adapt-swaps` | Flash-Next only. Most experts one round swaps into the peer card. |
@@ -124,7 +126,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `prefill-cpu-share` | engine | 0 to 1 | 0.6 | Flash-Next only. Share of streamed prompt experts the CPU computes. Fixed, so output is the same run to run. |
 | `short-read` | engine | tokens | 64 (`0` = off) | Flash-Next only. A fresh part of at most N tokens is read through decode windows. |
 | `no-prompt-skip` | engine | switch | off | DeepSeek only. Run every row through every layer. Slower; the same math. [precision](../precision/deepseek41.md#prompt-skip) |
-| `peer-prefill-rows` | engine | rows per layer | half of chunk x top-k | Flash-Next only. Prompt rows per layer the peer card computes. `0` keeps the prompt on the main card. |
+| `no-peer-prefill` | engine | switch | off | Flash-Next only. The peer card computes none of the prompt rows; the prompt stays on the main card. |
 
 ## Drafting
 
@@ -145,7 +147,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `parallel` | entry | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. |
+| `parallel` | entry | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. With `kv-resident`, each slot keeps only those cells in VRAM. |
 | `slot-full-context` | entry | switch | off | Give every slot the whole `max-context`, at N times the KV. |
 
 ## Conversation cache
@@ -160,7 +162,6 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | `conversation-cache-mib` | engine | MiB | 0 (off) | RAM budget for parked conversations. |
 | `conversation-cache-slots` | engine | integer | 4 | Most parked conversations. |
 | `conversation-cache-min-free-mib` | engine | MiB | 2560 | Physical RAM kept free when parking. |
-| `no-ram-guard` | engine | switch | off | Serving never sheds, delays or stops a request for low RAM ([memory floors](../running.md#memory-floors)). For machines where the guard stops work that would fit; low RAM can then stop the engine or the machine. |
 | `conversation-cache-min-tokens` | engine | tokens | 0 | Park only conversations of at least this many tokens. |
 | `conversation-cache-disk-mib` | engine | MiB | 0 (off) | Disk budget for parked conversations. [running](../running.md#conversations-on-disk---conversation-cache-disk-mib) |
 | `conversation-cache-dir` | engine | directory | model cache folder | Another folder for the disk tier. |
@@ -178,7 +179,8 @@ Diagnostic flags: [diagnostics](diagnostics.md).
 
 ## Control vectors
 
-A GGUF control vector added to the residual stream. A request switches it with `experimental_speed_projection`.
+A GGUF control vector added to the residual stream. A request switches it with `experimental_speed_projection`. A layer split
+or a prompt split keeps it on every card: each stage applies the vector to the steered layers it reads.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |

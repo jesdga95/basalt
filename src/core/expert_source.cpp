@@ -780,7 +780,7 @@ bool FileExpertSource::pin_cache_complement(
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
     uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
     err.clear();
-    headroom_bytes = std::max(headroom_bytes, platform::ram_margin());   // never lock into the machine's last RAM
+    headroom_bytes = std::max(headroom_bytes, platform::ram_reserve());   // never lock into the reserve
     const auto pin_t0 = std::chrono::steady_clock::now();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
@@ -831,16 +831,16 @@ bool FileExpertSource::pin_cache_complement(
             return false;
         }
         budget_physical = physical;
-        const uint64_t room = detail::resident_room(physical, headroom_bytes);
+        const uint64_t room = ram_tier_room(physical, headroom_bytes, pin);
         if (budget_bytes > room) {
             if (what_fits)
                 basalt::log::info("basalt", "FileExpertSource: RAM room for the complement: %.2f GiB (%.2f GiB available "
-                                     "minus %.0f GiB headroom and the page overhead)",
+                                     "minus %.0f GiB reserve and the page tracking)",
                              (double) room / 1073741824.0, (double) physical / 1073741824.0,
                              (double) headroom_bytes / 1073741824.0);
             else
                 basalt::log::warn("basalt", "FileExpertSource: --resident-budget-gib %.2f is more than the RAM has room for "
-                                     "(%.2f GiB available minus %.0f GiB headroom and the page overhead): %.2f GiB",
+                                     "(%.2f GiB available minus %.0f GiB reserve and the page tracking): %.2f GiB",
                              (double) budget_bytes / 1073741824.0, (double) physical / 1073741824.0,
                              (double) headroom_bytes / 1073741824.0, (double) room / 1073741824.0);
             budget_bytes = room;
@@ -881,7 +881,7 @@ bool FileExpertSource::pin_cache_complement(
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
             return false;
         }
-        budget = detail::resident_room(physical, headroom_bytes);
+        budget = ram_tier_room(physical, headroom_bytes, pin);
         if (bytes > budget) {
             char message[320];
             std::snprintf(message, sizeof message,
@@ -1160,7 +1160,7 @@ bool FileExpertSource::homes_take(const std::vector<std::pair<int32_t, int32_t>>
         total += layer_blob_bytes_[(size_t) l];
     }
     if (total == 0) return true;
-    // the RAM left over also keeps the server's guard floor above the margin (what the guard stops a request at)
+    // the RAM left over keeps the homes reserve free above the reserve (what the guard stops a request at)
     const uint64_t budget = basalt::platform::ram_budget();
     if (total > budget || homes_reserve_ > budget - total) {
         const uint64_t room = budget > homes_reserve_ ? budget - homes_reserve_ : 0;
@@ -1307,16 +1307,21 @@ uint64_t FileExpertSource::homes_bytes() const {
 }
 
 uint64_t FileExpertSource::top_up(const std::vector<std::pair<int32_t, int32_t>>& rank,
-                                  const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count,
-                                  uint64_t later) {
+                                  const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count) {
     count = 0;
     if (!complement_ready_ || top_arena_ != nullptr || !override_.empty() || !staged_.empty()) return 0;
-    bool known = false;
-    const uint64_t budget = basalt::platform::ram_budget(&known);
-    if (!known) return 0;
-    const uint64_t guard = (256ull << 20) + later;   // the engine's own allocations after this reading
-    const uint64_t room = budget > guard ? budget - guard : 0;
-    // the experts no tier holds, hottest first, as many as fit
+    detail::HostMemory hm;
+    const uint64_t avail = detail::host_available_memory(hm) ? hm.available : 0;
+    if (avail == 0) return 0;
+    // the experts no tier holds; what of them stays in the file keeps the file cache's floor free beside the reserve
+    uint64_t want = 0;
+    for (int32_t l = 0; l < (int32_t) n_layers_; ++l)
+        for (int32_t e = 0; e < (int32_t) n_expert_; ++e)
+            if (complement_offsets_[(size_t) l * (size_t) n_expert_ + (size_t) e] == kNoComplement && !skip(l, e))
+                want += layer_blob_bytes_[(size_t) l];
+    const uint64_t reserve = basalt::platform::ram_reserve();
+    const uint64_t room = ram_tier_room(avail, reserve + file_cache_keep(avail, reserve, pin, want, file_cache_), pin);
+    // hottest first, as many as fit
     std::vector<std::pair<int32_t, int32_t>> pick;
     std::vector<uint64_t> at;
     std::vector<uint8_t> seen(complement_offsets_.size(), 0);
@@ -1854,7 +1859,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
             err = buf;
             return false;
         }
-        // the arena is locked resident: it must leave the margin free, or the machine swaps
+        // the arena is locked resident: it must leave the reserve free, or the machine swaps
         bool known = false;
         const uint64_t budget = platform::ram_budget(&known);
         if ((known && need > budget) || hm.available < need) {

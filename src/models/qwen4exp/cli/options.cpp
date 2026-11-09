@@ -24,6 +24,11 @@ std::string profile_key(const basalt::core::Json& meta) {
     return arch->s + "-" + std::to_string(nl->u64()) + "x" + std::to_string(ne->u64());
 }
 
+std::vector<std::string> shipped_profiles(const std::string& key) {
+    if (key != "qwen4exp-48x512") return {};
+    return {key + ".prof"};
+}
+
 std::optional<int> resolve_model_options(Options& o, bool multi_gpu) {
     // Built-in defaults for what is given nowhere: the fastest settings that need no knowledge of the machine.
     // Speculation needs the pack's drafter; prompt chunks are sized from what the expert cache can lend; the experts
@@ -75,6 +80,7 @@ std::optional<int> prepare_input_options(Options& o) {
         basalt::log::error("basalt generate", "invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us");
         return 2;
     }
+    if (o.kv.empty()) o.kv = "fp16";
     if (o.kv == "q4") o.kv = "q4_0";
     if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
         basalt::log::error("basalt generate", "--kv must be fp16, int8, q4_0 or k8v4");

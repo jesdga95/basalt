@@ -5,12 +5,13 @@ quality: [precision](../precision/qwen38-flash-next.md).
 
 ## Pack
 
-Nine packs on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt), all named `Qwen3.8-FN-` plus:
+Packs on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt), all named `Qwen3.8-FN-` plus:
 
 - `NVFP4-DQ6_K` (default) and `NVFP4-DQ8`: NVIDIA's NVFP4 experts. `D` is the dense projections' format: Q6_K, or Q8_0 for DQ8.
   DQ8 is slower than DQ6_K and has a lower KLD ([precision](../precision/qwen38-flash-next.md#6-bit-dense-projections)).
-- `UD-Q4_K_XL`, `UD-Q5_K_XL`, `UD-Q6_K_XL` and `Q8_0`: Unsloth's GGUF types.
-- `GSQ-RCO-IQ3_S`, `GSQ-RCO-IQ3_XXS` and `GSQ-RCO-Q2_0`: GSQ-RCO quants.
+- `UD-IQ1_S`, `UD-IQ1_M`, `UD-IQ2_XS`, `UD-IQ3_XXS`, `UD-IQ4_XS`, `UD-Q4_K_XL`, `UD-Q5_K_XL`, `UD-Q6_K_XL` and `Q8_0`: Unsloth's GGUF types.
+- Unsloth's `UD-IQ1_S` GGUF converts as shipped (70.4 GB). One of its layers has IQ2_S gate and IQ2_XXS up rows; every layer runs
+  the same fast kernels as the other UD packs.
 
 Sizes are on the card. The layout, and how to build a pack: [model file](../model-file.md).
 
@@ -20,11 +21,18 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
   and `k8v4` trade precision for VRAM ([precision](../precision/qwen38-flash-next.md#measured-costs)).
 - **Experts:** the main card's cache holds the most routed ones, system RAM the rest, and an adaptive tier moves them as the
   conversation changes ([adaptive tier](../configuration/adaptive.md)).
+- **RAM:** before the RAM copy, the checkpoint blocks of every slot are allocated and the RAM of the page-locked prompt buffers
+  is held: the PLE rows at the largest chunk, a layer split's hand-offs, and the prompt split's weights, hand-offs and staging.
+  Each buffer takes its held RAM when it is made; what none takes goes back before the top-up. The copy then leaves
+  `--ram-reserve-mib` free beside the driver's page tracking (`RAM floor X GiB of N GiB free` when experts stay on the SSD).
 - **Cards:** every card after the main one is an expert tier, up to three. Matched cards may split the layers instead
   ([GPUs](../configuration/gpus.md)).
 - **Elastic KV:** with `--max-context` above 32,768 (and not with `--kv-resident`, `--vram-elastic` or a layer split), each session
   backs its first 32,768 cells at start. More cells come from the expert cache when a request needs them, and go back when it does
-  not. An idle conversation's KV moves to RAM after 15 s. The startup line `elastic KV: ...` shows the figures.
+  not. An idle conversation's KV moves to RAM after 15 s. The startup line `elastic KV: ...` shows the figures, and
+  `elastic KV: about N cells fit in the S sessions ...` gives the ceiling: the cells all sessions can hold before the expert
+  cache reaches the slots a prompt chunk needs, past which a request is refused. `/v1/status` gives its current value as
+  `context.elastic_kv_ceiling` (null without elastic KV), so a client can compact a conversation first.
 
 ## Long prompts
 

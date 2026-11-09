@@ -1,6 +1,8 @@
 // src/models/deepseek41/pack.cpp - reads the DeepSeek-V4.1 pack's meta section.
 #include "models/deepseek41/pack.hpp"
 
+#include "models/deepseek41/engram_rows.hpp"
+
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -141,14 +143,19 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         std::istringstream in(std::string(text.begin(), text.end()));
         std::string line;
         p.experts.resize((size_t) g.n_layers);
-        int seen = 0;
+        int seen = 0, version = 0;
         while (std::getline(in, line)) {
+            if (line.rfind("# experts v", 0) == 0) version = std::atoi(line.c_str() + 11);
             if (line.empty() || line[0] == '#') continue;
             std::istringstream ls(line);
-            long long l, gu, d;
+            long long l, gu, d, up = -1;
             unsigned long long off, by;
-            if (!(ls >> l >> gu >> d >> off >> by) || l < 0 || l >= g.n_layers) {
+            if (!(ls >> l >> gu >> d >> off >> by) || l < 0 || l >= g.n_layers || (version >= 7 && !(ls >> up))) {
                 err = "experts.layout: bad line '" + line + "'";
+                return false;
+            }
+            if (version >= 7 && up != gu) {   // v7: the up rows' type; this model's kernels take one gate/up type
+                err = "experts.layout: layer " + std::to_string(l) + "'s gate and up differ in type";
                 return false;
             }
             p.experts[(size_t) l] = {(int) gu, (int) d, off, by};
@@ -173,6 +180,13 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         e.rows = ej->get("rows")->u64();
         e.row_bytes = (uint32_t) ej->get("row_bytes")->u64();
         e.row_values = (int) ej->get("row_values")->u64();
+        e.type = (int) num_or(ej->get("type_id"), 20);
+        const size_t block = engram_block_bytes(e.type);   // bytes per 32 values
+        if (block == 0 || e.row_values % 32 || e.row_bytes != (uint32_t) ((size_t) e.row_values / 32 * block)) {
+            err = path + ": the Engram rows are type " + std::to_string(e.type) + " of " + std::to_string(e.row_bytes) +
+                  " bytes; IQ4_NL and MXFP4 rows are read";
+            return false;
+        }
         for (double d : numbers(ej->get("ple.layers"))) e.layers.push_back((int) d);
         EngramHashParams& h = e.hash;
         h.n_gram = (int) num_or(ej->get("ple.ngram_size"), 4);

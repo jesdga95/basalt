@@ -2,6 +2,7 @@
 #pragma once
 
 #include "basalt/models/deepseek41/attn.hpp"
+#include "basalt/models/deepseek41/attn_index.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -17,9 +18,10 @@ constexpr int kMaxChunk = 16384;
 
 /// The per-layer caches the decode path and the batch path share (owned by the decode ops).
 struct AttnCaches {
-    std::vector<uint16_t*>* ring = nullptr;      ///< fp16 [kWindowSlots][512] per layer
-    std::vector<uint16_t*>* comp_kv = nullptr;   ///< compressed latents of the kv-source layers
-    std::vector<uint16_t*>* comp_ik = nullptr;   ///< their index keys
+    CacheFormat format = CacheFormat::Fp8;       ///< the rows' format (--kv)
+    std::vector<uint8_t*>* ring = nullptr;       ///< window rows [kWindowSlots][win_row_bytes] per layer
+    std::vector<uint8_t*>* comp_kv = nullptr;    ///< compressed rows of the kv-source layers
+    std::vector<uint8_t*>* comp_ik = nullptr;    ///< their index keys
     std::vector<float*>* st_kv = nullptr;        ///< partial-group compressor state
     std::vector<float*>* st_sc = nullptr;
     const float* freq[2] = {nullptr, nullptr};   ///< rotary tables of the two layer kinds

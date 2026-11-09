@@ -12,6 +12,7 @@ context are rejected with a 400, never truncated.
 from __future__ import annotations
 
 import json
+import os
 import signal
 import sys
 import threading
@@ -28,7 +29,7 @@ from serve.config import (build_parser, check_engine_flags,  # noqa: E402
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.image_source import image_sources_of  # noqa: E402
-from serve.engine.flags import flag_index, flag_value  # noqa: E402
+from serve.engine.flags import flag_value  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
 from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, flag_refused, gpu_card_name,  # noqa: E402
@@ -91,6 +92,32 @@ def open_when_ready(svc, url, now=False, opener=None):
             done.append(1)
             opener(url)
     svc.on_loaded = loaded
+
+
+def model_file_problems(settings) -> list[str]:
+    """One plain line for each configured model whose file is missing, a directory or unreadable (the same paths the
+    engine is given: relative ones are already resolved against the config file)."""
+    out = []
+    for i, (m, *_rest) in enumerate(settings):
+        if not m.model or not m.engine_bin or (m.mock_engine and m.config):
+            continue
+        if m.config:
+            who = f"model '{m.alias}'" if m.alias else f"models[{i}]"
+            where = f' (the "model" key in {Path(m.config).name})'
+        else:
+            who, where = "model", " (--model)"
+        if os.path.isdir(m.model):
+            why = f"{m.model} is a directory, not a model file"
+        elif not os.path.exists(m.model):
+            why = f"file not found: {m.model}"
+        else:
+            try:
+                with open(m.model, "rb"):
+                    continue
+            except OSError as e:
+                why = f"can't read {m.model}: {e.strerror or e}"
+        out.append(f"{who}: {why}{where}")
+    return out
 
 
 def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: list[str], known) -> dict:
@@ -168,29 +195,29 @@ def drop_sidecar_vision(cfg: dict) -> None:
     if not cfg.get("vision") or cfg["vision"].get("mode") == "dynamic":
         return
     print(tagged("warning", "lazy loading drops a sidecar image encoder, vision off; --vision dynamic stays on"), flush=True)
-    while (at := flag_index(cfg["args"], "--vision-mmproj")) is not None:
-        del cfg["args"][at:at + 2]
     del cfg["vision"]
 
 
 def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     """The Service of one checked model, unloaded. With several models a numbered vision sidecar waits for its model's
     turn too."""
-    tokenizer = cfg.get("tokenizer") or a.tokenizer
+    from serve.engine import modelfile
+    files = cfg.get("tokenizer")
+    if files is None:                                   # the mock engine: a directory, or the byte tokenizer without one
+        tdir = Path(a.tokenizer)
+        files = {n: (tdir / n).read_bytes() for n in modelfile.TOKENIZER_SECTIONS if (tdir / n).exists()}
+    if not a.mock_engine and "vocab.json" not in files:
+        fail(f"tokenizer missing: {a.tokenizer}/vocab.json")
     tok = ByteTokenizer()
-    tpath = Path(tokenizer)
-    if not a.mock_engine and not (tpath / "vocab.json").exists():
-        fail(f"tokenizer missing: {tpath / 'vocab.json'}")
-    if (tpath / "vocab.json").exists():
+    if "vocab.json" in files:
         import tokenizer as ST
-        vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
+        vocab = json.loads(files["vocab.json"].decode("utf-8"))
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
             tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
-        types = json.loads((tpath / "token_type.json").read_text())
-        pre = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")).get("pre", "qwen35") \
-            if (tpath / "tokenizer.json").exists() else "qwen35"
+        merges = files["merges.txt"].decode("utf-8").split("\n")
+        types = json.loads(files["token_type.json"])
+        pre = json.loads(files["tokenizer.json"].decode("utf-8")).get("pre", "qwen35") if "tokenizer.json" in files else "qwen35"
         tok = ST.Tokenizer(tokens, merges, types, pre=pre)
     has_grammar = False
     if not a.mock_engine:
@@ -234,8 +261,9 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
             "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, dict(a.sampling_launch)
     # the model's exported template, else the bundled one
     dialect = dialect_for(cfg.get("arch"))
-    tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, dialect.template(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    template = files["chat_template.jinja"].decode("utf-8") if "chat_template.jinja" in files else \
+        (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8")
+    svc = Service(engine, tok, dialect.template(template),
                   model_name=cfg.get("model_name", "basalt"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect)
@@ -284,6 +312,11 @@ def main() -> int:
     sys.stdout, sys.stderr = (TeeStream(ColorStream.wrap(sys.stdout), logs, "srv"),
                               TeeStream(ColorStream.wrap(sys.stderr), logs, "srv"))
     print(tagged("legend", LEGEND), flush=True)          # first line, so the key precedes every value
+    problems = model_file_problems(settings)
+    for line in problems:
+        print(f"[server] error: {line}", file=sys.stderr)
+    if problems:
+        return 2
     known = engine_flags_of(a.engine_bin) if a.engine_bin else None
     cfgs = [check_model(m, file_engine, cli_engine, used_argv, known)
             for m, used_argv, file_engine, cli_engine in settings]
@@ -319,6 +352,9 @@ def main() -> int:
         # an empty key would silently disable authentication
         print("[server] error: --api-key is empty (give a key, or leave it out)", file=sys.stderr)
         return 2
+    if a.max_payload_mib < 1:
+        fail(f"--max-payload-mib {a.max_payload_mib} must be at least 1")
+    svc.max_payload = a.max_payload_mib << 20
     try:
         svc.api_key = api_key_of(a.api_key)
     except ValueError as e:

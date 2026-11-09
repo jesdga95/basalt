@@ -270,7 +270,7 @@ void usage(const std::string& engine) {
         "community row\n"
         "  --community        the fixed preset \"community-1\" for the public benchmark table: the three decode\n"
         "                     fixtures, a 16384-token prefill and a 65536-token prefill, once each, with int8 KV cache\n"
-        "                     where the model accepts --kv and its own KV format otherwise (the row records the model and the\n"
+        "                     where the model takes it, else fp8 where it takes that, else its own KV format (the row records the model and the\n"
         "                     KV format used), and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
         "                     default). The decode fixtures and each prefill run in their own fresh engine process, so\n"
         "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it. prefill_16k_tps and\n"
@@ -323,7 +323,7 @@ void usage(const std::string& engine) {
         "  Make the files once, on a machine with the model, with the server's own tokenizer and template:\n"
         "    python3 -c \"import sys; sys.path[:0]=['.','tools']; from tokenizer import Tokenizer;\n"
         "      from serve.frontend import ChatTemplate; t=Tokenizer.from_gguf(GGUF_SHARD_1);\n"
-        "      c=ChatTemplate('serve/chat_template.jinja'); r=lambda p: t.encode(c.render(\n"
+        "      c=ChatTemplate.from_file('serve/chat_template.jinja'); r=lambda p: t.encode(c.render(\n"
         "      [{'role':'user','content':p}], enable_thinking=False), parse_special=True)\n"
         "      print(','.join(map(str, r(PROMPT))))\"\n"
         "  (for prefill, render with a marker in place of the body and split the ids around it)\n",
@@ -732,7 +732,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::string community_model, community_arch;
-    bool community_kv_int8 = false;
+    std::string community_kv;   // the cache format a community run passes; empty when the model takes neither
     if (o.fixtures.empty() || o.community) {   // the model's own fixtures, when it has them; the community row's model name
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
@@ -741,9 +741,10 @@ int main(int argc, char** argv) {
         if (o.community) {
             community_model = asked == 0 ? basalt::program::plan_field(answer, "model") : std::string();
             community_arch = basalt::program::plan_field(answer, "arch");
-            // the cache format users run, when the engine accepts the flag for this model
+            // the cache format users run, when the engine accepts one of the flags for this model
             std::string unused;
-            community_kv_int8 = engine_plan(engine_bin, {"--model", abs_model, "--gpu", "0", "--kv", "int8"}, plan_log, unused) == 0;
+            if (engine_plan(engine_bin, {"--model", abs_model, "--gpu", "0", "--kv", "int8"}, plan_log, unused) == 0) community_kv = "int8";
+            else if (engine_plan(engine_bin, {"--model", abs_model, "--gpu", "0", "--kv", "fp8"}, plan_log, unused) == 0) community_kv = "fp8";
         }
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
@@ -814,7 +815,7 @@ int main(int argc, char** argv) {
             }
         set_arg(args, "--max-context", std::to_string(need));
     }
-    if (community_kv_int8) set_arg(args, "--kv", "int8");
+    if (!community_kv.empty()) set_arg(args, "--kv", community_kv);
     if (o.print_command) {
         std::printf("%s --serve", engine_bin.c_str());
         for (const auto& a : args) std::printf(" %s", a.c_str());

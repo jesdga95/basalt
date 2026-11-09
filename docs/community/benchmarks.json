@@ -1126,7 +1126,7 @@
         {
           "name": "RTX 5090",
           "vram_gib": 32,
-          "power_w": 575,
+          "power_w": 489,
           "pcie": "5.0 x16",
           "h2d_gbps": 57.8
         }
@@ -1139,7 +1139,8 @@
       "kv": "int8",
       "prefill_16k_tps": 7922.8,
       "prefill_64k_tps": 9865.8,
-      "decode_tps": 369.3
+      "decode_tps": 369.3,
+      "notes": "corrected: this run used a 489 W limit (85 % of default); the 575 W in the original submission was a labelling error, the stock 575 W numbers are in the 2026-11-06 rows"
     },
     {
       "submitter": "polygizer",
@@ -1151,7 +1152,7 @@
         {
           "name": "RTX 5090",
           "vram_gib": 32,
-          "power_w": 575,
+          "power_w": 489,
           "pcie": "5.0 x16",
           "h2d_gbps": 57.7
         }
@@ -1164,7 +1165,8 @@
       "kv": "int8",
       "prefill_16k_tps": 7277.6,
       "prefill_64k_tps": 8410.7,
-      "decode_tps": 219.6
+      "decode_tps": 219.6,
+      "notes": "corrected: this run used a 489 W limit (85 % of default); the 575 W in the original submission was a labelling error, the stock 575 W numbers are in the 2026-11-06 rows"
     },
     {
       "submitter": "polygizer",
@@ -1176,7 +1178,7 @@
         {
           "name": "RTX 5090",
           "vram_gib": 32,
-          "power_w": 575,
+          "power_w": 489,
           "pcie": "5.0 x16"
         }
       ],
@@ -1188,7 +1190,8 @@
       "kv": "int8",
       "prefill_16k_tps": 6788.8,
       "prefill_64k_tps": 8215.2,
-      "decode_tps": 162.4
+      "decode_tps": 162.4,
+      "notes": "corrected: this run used a 489 W limit (85 % of default); the 575 W in the original submission was a labelling error, the stock 575 W numbers are in the 2026-11-06 rows"
     },
     {
       "submitter": "polygizer",
@@ -1200,7 +1203,7 @@
         {
           "name": "RTX 5090",
           "vram_gib": 32,
-          "power_w": 575,
+          "power_w": 489,
           "pcie": "5.0 x16",
           "h2d_gbps": 57.8
         }
@@ -1213,7 +1216,424 @@
       "kv": "int8",
       "prefill_16k_tps": 7910.8,
       "prefill_64k_tps": 9180.7,
-      "decode_tps": 431.1
+      "decode_tps": 431.1,
+      "notes": "corrected: this run used a 489 W limit (85 % of default); the 575 W in the original submission was a labelling error, the stock 575 W numbers are in the 2026-11-06 rows"
+    },
+    {
+      "submitter": "giveen",
+      "date": "2026-11-06",
+      "commit": "13a42fd0d1",
+      "preset": "community-1",
+      "model": "DeepSeek-V4.1-Flash",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 475,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 48.5
+        }
+      ],
+      "ram_gib": 247,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 66.7,
+      "os": "Linux",
+      "quant": "IQ1_M",
+      "kv": "fp16",
+      "prefill_16k_tps": 2476.5,
+      "prefill_64k_tps": 3223.4,
+      "decode_tps": 87.4,
+      "notes": "single RTX 5090 at 475 W, 247 GB RAM; all 384 experts/layer in memory (0 SSD spill); DSpark draft window 3"
+    },
+    {
+      "submitter": "jesdga95",
+      "date": "2026-11-08",
+      "commit": "553e9290da",
+      "preset": "community-1",
+      "model": "DeepSeek-V4.1-Flash",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 400,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.9
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        }
+      ],
+      "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.6,
+      "os": "Linux",
+      "quant": "IQ1_M",
+      "kv": "fp8+fp4",
+      "prefill_16k_tps": 2133.4,
+      "prefill_64k_tps": 2840.9,
+      "decode_tps": 149.1
+    },
+    {
+      "submitter": "gpu-node-inferno",
+      "date": "2026-11-06",
+      "commit": "86005088f4",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 600,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.8,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 7248.2,
+      "prefill_64k_tps": 9408.0,
+      "decode_tps": 374.2,
+      "notes": "single RTX 5090 at its 600 W limit, 121 GiB DDR5 dual-channel; resident experts, 0 SSD spill"
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-06",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.9
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.7,
+      "os": "Windows",
+      "quant": "IQ3_S",
+      "kv": "int8",
+      "prefill_16k_tps": 8561.9,
+      "prefill_64k_tps": 9661.4,
+      "decode_tps": 486.7,
+      "notes": "single RTX 5090 at the stock 575 W default limit (no OC), weights SHA256-verified, 0 SSD spill; same build as our 489 W rows: decode 431.1 -> 486.7 (+12.9 %), prefill 16K 7,910.8 -> 8,561.9"
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-06",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.9
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.7,
+      "os": "Windows",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 8678.6,
+      "prefill_64k_tps": 10193.1,
+      "decode_tps": 373.7,
+      "notes": "NVFP4-DQ8 pack (Q8_0 dense + NVFP4 experts), single RTX 5090 at the stock 575 W default limit (no OC), 0 SSD spill; best prefill of our rows (8,678.6 / 10,193.1)"
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-06",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.9
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.8,
+      "os": "Windows",
+      "quant": "Q4_K_XL",
+      "kv": "int8",
+      "prefill_16k_tps": 7077.8,
+      "prefill_64k_tps": 8562.3,
+      "decode_tps": 254.9,
+      "notes": "re-run of our Q4_K_XL row at the stock 575 W default limit (no OC), 0 SSD spill; the 2026-11-05 row was taken at a 489 W limit"
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-06",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.9
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.9,
+      "os": "Windows",
+      "quant": "Huihui-Abliterated-V2",
+      "kv": "int8",
+      "prefill_16k_tps": 7164.5,
+      "prefill_64k_tps": 8555.9,
+      "decode_tps": 269.4,
+      "notes": "Huihui abliterated V2 pack (76.9 GiB file, resident cuda0 28.5 + RAM 48.3 GiB), single RTX 5090 at the stock 575 W default limit (no OC), 0 SSD spill"
+    },
+    {
+      "submitter": "tselle",
+      "date": "2026-11-07",
+      "commit": "6e67f90cd3",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 55.6
+        }
+      ],
+      "ram_gib": 90,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 66.6,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 10520.5,
+      "prefill_64k_tps": 11095.8,
+      "decode_tps": 391.5
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-07",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.9
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.8,
+      "os": "Windows",
+      "quant": "Q6_K_XL",
+      "kv": "int8",
+      "prefill_16k_tps": 6651.0,
+      "prefill_64k_tps": 8132.4,
+      "decode_tps": 137.0
+    },
+    {
+      "submitter": "wasiejen",
+      "date": "2026-11-05",
+      "commit": "bbf2f5bb78",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 200,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 93,
+      "cpu": "AMD Ryzen 7 9800X3D, 8 cores",
+      "ram_gbps": 44.7,
+      "os": "Windows",
+      "quant": "IQ3_S",
+      "kv": "int8",
+      "prefill_16k_tps": 3385.2,
+      "prefill_64k_tps": 3801.7,
+      "decode_tps": 113.1
+    },
+    {
+      "submitter": "wasiejen",
+      "date": "2026-11-05",
+      "commit": "bbf2f5bb78",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 200,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "AMD Ryzen 7 9800X3D, 8 cores",
+      "ram_gbps": 61.1,
+      "os": "Windows",
+      "quant": "IQ3_S",
+      "kv": "int8",
+      "prefill_16k_tps": 3487.3,
+      "prefill_64k_tps": 3950.5,
+      "decode_tps": 117.2
+    },
+    {
+      "submitter": "wasiejen",
+      "date": "2026-11-05",
+      "commit": "bbf2f5bb78",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 200,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "AMD Ryzen 7 9800X3D, 8 cores",
+      "ram_gbps": 59.8,
+      "os": "Windows",
+      "quant": "Swift_CFN_IQ3_S",
+      "kv": "int8",
+      "prefill_16k_tps": 3653.3,
+      "prefill_64k_tps": 4060.5,
+      "decode_tps": 116.9
+    },
+    {
+      "submitter": "wasiejen",
+      "date": "2026-11-05",
+      "commit": "bbf2f5bb78",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 200,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "AMD Ryzen 7 9800X3D, 8 cores",
+      "ram_gbps": 59.5,
+      "os": "Windows",
+      "quant": "QFN-UD-IQ2_XS",
+      "kv": "int8",
+      "prefill_16k_tps": 3204.9,
+      "prefill_64k_tps": 3801.7,
+      "decode_tps": 138.0
+    },
+    {
+      "submitter": "beastrobin",
+      "date": "2026-11-09",
+      "commit": "364815560d",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX PRO 6000 Blackwell Workstation Edition",
+          "vram_gib": 96,
+          "power_w": 600,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 48.6
+        }
+      ],
+      "ram_gib": 253,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 59.6,
+      "os": "Windows",
+      "quant": "NVFP4-DQ8",
+      "kv": "int8",
+      "prefill_16k_tps": 10070.0,
+      "prefill_64k_tps": 12033.9,
+      "decode_tps": 538.7,
+      "notes": "NVFP4 experts, dense dequant to 8-bit (DQ8 pack); v0.3.1 tag build self-built; watt-pair rerun of the 498.3@600W/423.1@300W NVFP4 rows (9175e7a3); driver 617.42; each column one cold shot"
+    },
+    {
+      "submitter": "beastrobin",
+      "date": "2026-11-09",
+      "commit": "364815560d",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX PRO 6000 Blackwell Workstation Edition",
+          "vram_gib": 96,
+          "power_w": 300,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 50.2
+        }
+      ],
+      "ram_gib": 253,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 59.7,
+      "os": "Windows",
+      "quant": "NVFP4-DQ8",
+      "kv": "int8",
+      "prefill_16k_tps": 7567.6,
+      "prefill_64k_tps": 8374.7,
+      "decode_tps": 441.4,
+      "notes": "NVFP4 experts, dense dequant to 8-bit (DQ8 pack); v0.3.1 tag build self-built; watt-pair rerun of the 498.3@600W/423.1@300W NVFP4 rows (9175e7a3); driver 617.42; each column one cold shot"
+    },
+    {
+      "submitter": "roger",
+      "date": "2026-11-09",
+      "commit": "4998eb3733",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 300,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.1
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "AMD Ryzen 7 7700, 8 cores",
+      "ram_gbps": 63.2,
+      "os": "Linux",
+      "quant": "IQ3_XXS",
+      "kv": "int8",
+      "prefill_16k_tps": 4713.1,
+      "prefill_64k_tps": 4798.5,
+      "decode_tps": 151.5,
+      "notes": "headless desktop, 60 GiB RAM; the larger IQ4_XS pack OOMs at the 64k prefill on this box, so no IQ4_XS row"
     }
   ]
 }

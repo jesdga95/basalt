@@ -126,10 +126,10 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(flag_value(qfile, "--max-context"), "262144")     # slot-full-context
         self.assertEqual(flag_value(dfile, "--max-context"), "1048576")
 
-    def test_the_ram_guard_switch(self):
-        p = conf({"engine": {"no-ram-guard": True}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
+    def test_the_ram_reserve(self):
+        p = conf({"engine": {"ram-reserve-mib": 4096}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
         for _, _, words, _ in model_settings(build_parser(), ["--config", p]):
-            self.assertIn("--no-ram-guard", words)
+            self.assertEqual(flag_value(words, "--ram-reserve-mib"), "4096")
 
     def test_version(self):
         ap = build_parser()
@@ -272,6 +272,11 @@ class Precedence(unittest.TestCase):
             self.assertEqual(file_words, words)
         _, _, _, cli_words = parse(["--route-tail-skip", "--resident-experts"])
         self.assertEqual(cli_words, ["--route-tail-skip", "--resident-experts"])
+
+    def test_no_peer_prefill_config_words(self):
+        for value, words in ((True, ["--no-peer-prefill"]), (False, [])):
+            _, _, file_words, _ = parse([], {"engine": {"no-peer-prefill": value}})
+            self.assertEqual(file_words, words)
 
     def test_route_prior_config_words(self):
         _, _, file_words, _ = parse([], {"engine": {"route-prior": 1.5}})
@@ -595,6 +600,34 @@ class Startup(unittest.TestCase):
         self.assertIn("not a server option", err)
         code, err = self.run_server({"models": [entry], "server": {"port": "abc"}})
         self.assertEqual(code, 2)
+
+    def test_model_files_are_checked_before_anything_loads(self):
+        d = Path(TMP.name)
+        fake_engine = d / "engine"
+        fake_engine.write_text("")
+        gone, gone2, folder = d / "gone.basalt", d / "gone2.basalt", d / "folder.basalt"
+        folder.mkdir(exist_ok=True)
+        eng = ["--engine-bin", str(fake_engine)]
+        code, err = self.run_server({"models": [{"model": str(gone), "alias": "Big One"}]}, *eng)
+        self.assertEqual(code, 2)
+        self.assertIn(f"[server] error: model 'Big One': file not found: {gone} (the \"model\" key in ", err)
+        self.assertNotIn("Errno", err)
+        code, err = self.run_server({"models": [{"model": str(gone)}, {"model": str(folder)}, {"model": str(gone2)}]}, *eng)
+        self.assertEqual(code, 2)
+        lines = [x for x in err.splitlines() if x.startswith("[server] error:")]
+        self.assertEqual(len(lines), 3)
+        self.assertIn(f"models[0]: file not found: {gone} ", lines[0])
+        self.assertIn(f"models[1]: {folder} is a directory", lines[1])
+        self.assertIn(f"models[2]: file not found: {gone2} ", lines[2])
+        self.assertNotIn("Errno", err)
+
+    def test_model_file_of_the_command_line(self):
+        gone = Path(TMP.name) / "gone.basalt"
+        r = subprocess.run([sys.executable, "-m", "serve.server", "--model", str(gone), "--engine-bin", sys.executable,
+                            "--port", str(free_port())], cwd=ROOT, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(f"[server] error: model: file not found: {gone} (--model)", r.stderr)
+        self.assertNotIn("Errno", r.stderr)
 
 
 if __name__ == "__main__":

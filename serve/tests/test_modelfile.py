@@ -1,4 +1,4 @@
-"""--model FILE.basalt: the config derived from the file, the tokenizer unpacked once, the peer card, vision."""
+"""--model FILE.basalt: the config derived from the file, the tokenizer read in memory, the peer card, vision."""
 import io
 import json
 import sys
@@ -60,8 +60,8 @@ class Derivation(Tmp):
     def test_cache_key_is_the_meta_hash(self):
         path = self.build()
         key = ModelFile(path).sections["meta"][2].hex()[:16]
-        tok = Path(modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))["tokenizer"])
-        self.assertEqual(tok, self.dir / "cache" / key / "tokenizer")
+        cfg = modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))
+        self.assertEqual(Path(cfg["log"]), self.dir / "cache" / key / "engine.log")
 
     def test_conversation_dir_follows_the_budget(self):
         path = self.build()
@@ -78,15 +78,11 @@ class Derivation(Tmp):
         self.assertEqual(args("--conversation-cache-disk-mib", "5", "--conversation-cache-dir", "/x"),
                          ["--model", path, "--conversation-cache-disk-mib", "5", "--conversation-cache-dir", "/x"])
 
-    def test_tokenizer_extracted_once_and_reused(self):
+    def test_tokenizer_is_read_from_the_sections_and_nothing_is_written(self):
         path = self.build()
-        tok = Path(modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))["tokenizer"])
-        for n, b in TOKENIZER.items():
-            self.assertEqual((tok / n).read_bytes(), b)
-        self.assertEqual([p.name for p in tok.parent.iterdir()], ["tokenizer"])
-        (tok / "vocab.json").write_bytes(b"{}")                # a present directory is not rewritten
-        modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))
-        self.assertEqual((tok / "vocab.json").read_bytes(), b"{}")
+        cfg = modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))
+        self.assertEqual(cfg["tokenizer"], TOKENIZER)
+        self.assertEqual(list(Path(cfg["log"]).parent.iterdir()), [])
 
     def test_missing_tokenizer_and_bad_file(self):
         w = ModelWriter(str(self.dir / "bare.basalt"))
@@ -112,7 +108,8 @@ class Peer(Tmp):
         (self.engine_bin.parent / "basalt-vision").write_text("")
         cfg = modelfile.model_config(modelfile.ModelSpec(path, vision=True), str(self.engine_bin))
         self.assertIn("vision", cfg)
-        self.assertIn("--vision", cfg["args"])
+        self.assertIn("--vision-external", cfg["args"])     # the sidecar's embeddings; the engine encodes nothing
+        self.assertNotIn("--vision", cfg["args"])
 
     def test_a_spec_alias_names_the_model(self):
         cfg = modelfile.model_config(modelfile.ModelSpec(self.build(), alias="mine"), str(self.engine_bin))
@@ -137,15 +134,14 @@ class Peer(Tmp):
 
 
 class Vision(Tmp):
-    def test_sidecar_beside_the_engine_bin_and_sections_unpacked(self):
+    def test_sidecar_beside_the_engine_bin_opens_the_model_file(self):
         path = self.build(vision=True)
         side = self.engine_bin.parent / "basalt-vision"
         side.write_text("")
         v = modelfile.model_config(modelfile.ModelSpec(path, vision=True), str(self.engine_bin))["vision"]
         self.assertEqual(v["vision_bin"], str(side.resolve()))
-        self.assertEqual(Path(v["mmproj"]).read_bytes(), b"MMPROJ" * 100)
-        self.assertEqual(Path(v["model"]).read_bytes(), b"VOCAB")
-        self.assertEqual([p.name for p in Path(v["mmproj"]).parent.iterdir() if ".gguf." in p.name], [])
+        self.assertEqual(v["model"], path)                  # the sidecar reads vision/mmproj in place
+        self.assertEqual(list((self.dir / "cache").glob("*/*")), [])
 
     def test_sidecar_takes_the_engine_bins_suffix(self):
         path = self.build(vision=True)
@@ -162,6 +158,7 @@ class Vision(Tmp):
         cfg = modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))
         self.assertNotIn("vision", cfg)
         self.assertNotIn("--vision", cfg["args"])
+        self.assertNotIn("--vision-external", cfg["args"])
 
     def test_gpu_or_cpu_encoder(self):
         path = self.build(vision=True)
@@ -175,13 +172,11 @@ class Vision(Tmp):
         for mode, name in (("1", "1"), ("0", "0"), ("cpu", "cpu"), ("dynamic", "dynamic")):
             self.assertEqual(modelfile.model_config(modelfile.ModelSpec(path, vision=mode), str(self.engine_bin))["vision"]["mode"], name)
 
-    def test_dynamic_gives_the_engine_the_projector_and_needs_no_sidecar(self):
+    def test_dynamic_has_the_engine_open_the_projector_and_needs_no_sidecar(self):
         path = self.build(vision=True)                      # no basalt-vision next to the engine
         cfg = modelfile.model_config(modelfile.ModelSpec(path, vision="dynamic"), str(self.engine_bin))
-        at = cfg["args"].index("--vision-mmproj")
-        self.assertEqual(cfg["args"][at + 1], cfg["vision"]["mmproj"])
-        self.assertIn("--vision", cfg["args"])
-        self.assertNotIn("--vision-mmproj", modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))["args"])
+        self.assertEqual(cfg["args"], ["--model", path, "--vision"])
+        self.assertNotIn("--vision", modelfile.model_config(modelfile.ModelSpec(path), str(self.engine_bin))["args"])
         with self.assertRaisesRegex(ValueError, "basalt-vision"):
             modelfile.model_config(modelfile.ModelSpec(path, vision="1"), str(self.engine_bin))
 

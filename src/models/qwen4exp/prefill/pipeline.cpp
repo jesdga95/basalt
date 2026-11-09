@@ -2,6 +2,7 @@
 #include "layout.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
+#include "basalt/core/host_plan.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include <string>
 
@@ -21,7 +22,7 @@ bool Prefill::reserve_hand_off(int64_t rows, std::string& err) {
     }
     m.hand_rows = 0;
     for (int b = 0; b < 2; ++b)
-        if (cudaHostAlloc((void**) &m.hand[b], (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+        if (core::host_alloc((void**) &m.hand[b], (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             (void) cudaGetLastError();
             err = "prefill: the layer split's hand-off buffers";
             return false;

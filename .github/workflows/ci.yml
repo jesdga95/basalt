@@ -42,6 +42,8 @@ jobs:
         run: tools/check_platform_boundary.sh
       - name: Engine log lines
         run: tools/check_stderr_logging.sh
+      - name: Build structure
+        run: tools/check_cu_includes.sh
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
@@ -74,37 +76,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: CUDA toolkit (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ninja-build \
-            cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-cccl-13-0 cuda-nvrtc-dev-13-0 libcublas-dev-13-0
-          echo /usr/local/cuda-13.0/bin >> "$GITHUB_PATH"
-          echo CUDA_PATH=/usr/local/cuda-13.0 >> "$GITHUB_ENV"
-
-      - name: CUDA toolkit (Windows)
-        if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+      - uses: ./.github/actions/toolchain
         with:
-          cuda: ${{ env.CUDA_VERSION }}
-          method: network
-          sub-packages: '["nvcc", "cudart", "crt", "nvvm", "cublas_dev", "nvrtc_dev", "visual_studio_integration"]'
-          use-github-cache: true
-
-      - name: MSVC environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-        with:
-          arch: x64
-
-      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
-        with:
-          key: ${{ matrix.os }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: ${{ matrix.os }}-
-          max-size: 1G
+          cuda-version: ${{ env.CUDA_VERSION }}
+          cache-key: ${{ matrix.os }}
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:

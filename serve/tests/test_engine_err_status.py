@@ -46,7 +46,7 @@ class EngineErrStatus(unittest.TestCase):
         tok = ByteTokenizer()
         eng = ErrEngine(tok, "xy", max_context=CTX)
         eng.err = err
-        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(eng, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         out = []

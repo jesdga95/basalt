@@ -81,6 +81,9 @@ void PeerExperts::close() {
     refill_ev_ = evict_ev_ = nullptr;
     fsrc_ = nullptr;
     rows_map_ = nullptr;
+    meta_map_ = nullptr;
+    x_host_ = nullptr;
+    x_map_ = nullptr;
     evicting_.clear();
     pending_.clear();
     device_ = -1;
@@ -184,12 +187,12 @@ bool PeerExperts::open_plain(int device, int64_t n_layers, int64_t n_expert, int
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "read stream", err) &&
         ck(cudaHostGetDevicePointer((void**) &rows_map_, rows, 0), "mapped rows", err) &&
-        ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable), "plan staging", err) &&
+        ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
+        ck(cudaHostGetDevicePointer(&meta_map_, h_meta_, 0), "mapped plan", err) &&
         ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
-        ck(cudaMalloc((void**) &d_x_, row_bytes * kRowBatch), "activation", err) &&
-        ck(cudaMalloc((void**) &d_out_, row_bytes * kRowBatch), "rows", err) &&
-        ck(cudaMalloc((void**) &d_q8_, (size_t) kRowBatch * (size_t) (n_embd / 32) * 36), "q8_1 rows", err) &&
-        ck(cudaMalloc(&d_scratch_, basalt::kernels::native_expert_scratch_bytes((int) kRowBatch, n_ff)), "scratch", err);
+        ck(cudaMalloc((void**) &d_out_, row_bytes * CAP), "rows", err) &&
+        ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (size_t) (n_embd / 32) * 36), "q8_1 rows", err) &&
+        ck(cudaMalloc(&d_scratch_, basalt::kernels::native_expert_scratch_bytes((int) CAP, n_ff)), "scratch", err);
     if (!ok) close();
     return ok;
 }
@@ -211,16 +214,24 @@ bool PeerExperts::fill_slot(int32_t slot, const uint8_t* src, uint64_t bytes) {
     return cudaMemcpy(cache_.device_slot(slot), src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
 }
 
-void PeerExperts::read_slot(const uint8_t* blob, uint8_t* dst, uint64_t bytes) {
-    On on(device_);
-    cudaMemcpyAsync(dst, blob, bytes, cudaMemcpyDeviceToHost, refill_);
+void PeerExperts::exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes) {
+    slot_out(slot, out, 0, bytes);
+    slot_in(slot, in, 0, bytes);
 }
 
-void PeerExperts::exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes) {
+void PeerExperts::slot_out(int32_t slot, uint8_t* out, uint64_t off, uint64_t n) {
     On on(device_);
-    uint8_t* blob = const_cast<uint8_t*>(cache_.device_slot(slot));
-    cudaMemcpyAsync(out, blob, bytes, cudaMemcpyDeviceToHost, refill_);
-    cudaMemcpyAsync(blob, in, bytes, cudaMemcpyHostToDevice, refill_);
+    cudaMemcpyAsync(out + off, cache_.device_slot(slot) + off, n, cudaMemcpyDeviceToHost, refill_);
+}
+
+void PeerExperts::slot_in(int32_t slot, const uint8_t* in, uint64_t off, uint64_t n) {
+    On on(device_);
+    cudaMemcpyAsync(const_cast<uint8_t*>(cache_.device_slot(slot)) + off, in + off, n, cudaMemcpyHostToDevice, refill_);
+}
+
+void PeerExperts::copies_after(cudaEvent_t ev) {
+    On on(device_);
+    cudaStreamWaitEvent(refill_, ev, 0);
 }
 
 bool PeerExperts::read_wait(std::string& err) {
@@ -288,7 +299,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         return false;
     }
     const auto& f = lay.fmt[(size_t) layer];
-    const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit);
+    const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit, f.up_type);
     return launch_layout(layer, L, x, ids, n_tok, k, kind, err, out);
 }
 
@@ -300,21 +311,6 @@ bool PeerExperts::launch_plain(int64_t layer, const kernels::NativeExpertLayout&
 bool PeerExperts::launch_window(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
                                 int64_t n_tok, int64_t k, const int32_t* kind, std::string& err) {
     return launch_layout(layer, L, x, ids, n_tok, k, kind, err, rows_map_);
-}
-
-bool PeerExperts::launch_rows(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n,
-                              float* out, std::string& err) {
-    static_assert(kRowBatch == CAP, "a row batch fills a launch's entries");
-    int32_t kind[CAP];
-    for (int64_t i = 0; i < n; ++i) kind[i] = 2;
-    return launch_layout(layer, L, x, ids, n, 1, kind, err, out);
-}
-
-float* PeerExperts::map_rows(float* host, std::string& err) {
-    On on(device_);
-    void* p = nullptr;
-    if (!ck(cudaHostGetDevicePointer(&p, host, 0), "mapping rows", err)) return nullptr;
-    return (float*) p;
 }
 
 bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
@@ -355,15 +351,25 @@ bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout
     m.count[1] = rows;
     entries_ += rows;
     launched_rows_ = rows;
-    // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
-    if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * n_embd_) * sizeof(float));
     On on(device_);
     const cudaStream_t s = stream_;
-    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * n_embd_) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
-        !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
-        return false;
+    if (meta_map_) {
+        // a plain tier: x (pinned, portable, mapped) and the plan are read where they are by the quantize launch, so
+        // the share never waits behind a slot copy on the card's copy engines
+        if (x != x_host_) {
+            if (!ck(cudaHostGetDevicePointer((void**) &x_map_, const_cast<float*>(x), 0), "mapped activations", err)) return false;
+            x_host_ = x;
+        }
+        basalt::kernels::quantize_q8_1_rows_copy(x_map_, n_tok, n_embd_, d_q8_, meta_map_, d_meta_, (int) (sizeof(Meta) / 4), s);
+    } else {
+        // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
+        if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * n_embd_) * sizeof(float));
+        if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * n_embd_) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
+            !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
+            return false;
+        basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
+    }
     Meta* dm = (Meta*) d_meta_;
-    basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
     basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
     basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
                                            d_scratch_, d_out_, s);

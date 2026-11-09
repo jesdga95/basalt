@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/conversation.cpp - conversation operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/protocol.hpp"
 #include "qfn_state.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
 
@@ -40,7 +41,7 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
                   o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx, o.yarn_ext_factor, o.yarn_attn_factor,
                   o.yarn_beta_fast, o.yarn_beta_slow, o.cvec_first, o.cvec_last, o.cvec_mode, o.cvec_single);
     std::string text = std::string("basalt conversation state kv ") + o.kv + " rope " +
-                       o.rope_scaling + num + " mtp " + o.mtp + " mmproj " + o.vision_mmproj;
+                       o.rope_scaling + num + " mtp " + o.mtp + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
     for (const auto& [path, scale] : o.cvec_files) text += " cvec " + path + " " + std::to_string(scale);
     uint64_t h = conversation_store_hash(text.data(), text.size(), 1);
     const int64_t geo[] = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_v_heads, g.n_head_kv,
@@ -178,6 +179,7 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
         }
         basalt::core::SavedConversation image;
         size_t reused_bytes = 0;
+        if (draft0 != nullptr && !mtp.snapshot_main(err)) return false;   // a streamed draft ring's own window
         if (!basalt::core::conversation_snapshot_save(image, view, *rsp, g, draft0, err,
                 std::move(reuse), &reused_bytes)) return false;
         for (size_t k = 0; k < n_st; ++k) {   // the later stages
@@ -307,7 +309,8 @@ size_t QfnRuntime::spill_to_disk(bool at_exit, size_t limit) {
         try {
             const auto t0 = Clock::now();
             basalt::core::SavedConversation image;
-            if (!basalt::core::conversation_snapshot_save(image, view, s, g, mtp_kv, se)) {
+            if ((mtp_kv != nullptr && !mtp.snapshot_main(se)) ||   // a streamed draft ring's own window
+                !basalt::core::conversation_snapshot_save(image, view, s, g, mtp_kv, se)) {
                 basalt::log::warn("basalt serve", "conversation cache: not written to disk (%s)", se.c_str());
                 return;
             }
@@ -435,10 +438,9 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     }
     size_t moved = 0;   // its checkpoints are in RAM already: they move into the image
     for (const ConvCheckpoint& c : cks) moved += c.bytes();
-    // the RAM a capture leaves free: the conversation cache's, the disk tier's, and the floor the expert copy left
-    // (the file cache when experts are read from the file)
+    // the RAM a capture leaves free: the conversation cache's, the disk tier's, and the reserve
     const uint64_t floor = std::max({(uint64_t) o.conversation_cache_min_free_mib << 20,
-                                     disk.enabled() ? disk_floor : 0, ram_floor_bytes});
+                                     disk.enabled() ? disk_floor : 0, basalt::platform::ram_reserve()});
     // below the token minimum: cells go back, the conversation is kept in neither tier
     const bool keep = o.conversation_cache_min_tokens <= 0 ||
                       (int64_t) ids.size() >= o.conversation_cache_min_tokens;
@@ -509,19 +511,11 @@ int QfnRuntime::init_conversations() {
 
     check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
 
-    {
-        ConvCheckpoint warm;   // one set of pooled blocks, page-faulted now instead of on the first request
-        const ConvStateSizes zw = conv_state_sizes(g, ss);
-        if (o.prompt_cache > 0) {
-            warm.state_a.resize(zw.gdn);
-            std::memset(warm.state_a.data(), 0, warm.state_a.size());
-            if (ss.ple_hist) { warm.state_b.resize(zw.ple); std::memset(warm.state_b.data(), 0, warm.state_b.size()); }
-        }
-        if (o.prompt_cache > 0 && !multi_gpu) {
-            std::string ce;
-            if (!ckd.reserve(zw.gdn, ce))
-                basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", ce.c_str());
-        }
+    // (the checkpoints' pooled blocks were reserved, their pages written, before the RAM copy)
+    if (o.prompt_cache > 0 && !multi_gpu) {
+        std::string ce;
+        if (!ckd.reserve(conv_state_sizes(g, ss).gdn, ce))
+            basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", ce.c_str());
     }
 
     cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
@@ -576,9 +570,8 @@ int QfnRuntime::init_conversations() {
         if (ms - last_ms < 500.0 && ms >= last_ms) return;
         last_ms = ms;
         const int64_t at = p0 + T * layers_done / n_layers;
-        std::printf("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) pp_total, ms,
-                    ms > 0.0 ? 1000.0 * (double) (at - pp_from) / ms : 0.0);
-        std::fflush(stdout);
+        basalt::protocol::emit("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) pp_total, ms,
+                               ms > 0.0 ? 1000.0 * (double) (at - pp_from) / ms : 0.0);
     };
     sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
         std::vector<int32_t> nxt((size_t) T);

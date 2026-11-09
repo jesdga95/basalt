@@ -6,10 +6,13 @@
 
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/model_file.hpp"
+#include "basalt/core/shipped_profiles.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/program/options.hpp"
+#include "basalt/protocol.hpp"
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstdio>
@@ -85,9 +88,8 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
         const double prev = last_ms.load();
         if (ms - prev < 500.0 && ms >= prev) return;
         last_ms.store(ms);
-        std::printf("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) total, ms,
-                    ms > 0.0 ? 1000.0 * (double) (at - (int64_t) reuse) / ms : 0.0);
-        std::fflush(stdout);
+        basalt::protocol::emit("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) total, ms,
+                               ms > 0.0 ? 1000.0 * (double) (at - (int64_t) reuse) / ms : 0.0);
     };
     auto report_at = [&](int64_t at) {
         if (!report) return;
@@ -333,10 +335,19 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.peer_devices = o.peer_devices;
         lreq.max_context = o.max_context;
         lreq.sessions = std::max(o.batch, 1);
+        lreq.vision = o.vision;
         lreq.expert_profile = o.expert_profile;
+        const std::string key = profile_key(model_file.meta());
+        {   // what the engine ships for this pack must be there; --expert-profile stands in for the main one
+            std::vector<std::string> need;
+            for (const std::string& name : adapter->shipped_profiles(key)) {
+                if (!(name == key + ".prof" && !o.expert_profile.empty())) need.push_back(name);
+            }
+            const std::string miss = basalt::core::missing_shipped_profile(basalt::platform::install_root() + "/data/profiles", need);
+            if (!miss.empty()) return fatal_start_error(miss);
+        }
         if (lreq.expert_profile.empty()) {   // the engine's own for this model, when it ships one
-            const std::string key = profile_key(model_file.meta());
-            const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
+            const std::string prof = basalt::platform::install_root() + "/data/profiles/" + key + ".prof";
             uint64_t bytes = 0;
             if (!key.empty() && basalt::platform::file_size(prof, bytes) && bytes > 0) lreq.expert_profile = prof;
         }
@@ -351,9 +362,10 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.spec = o.spec;
         lreq.draft = o.spec >= 2 && o.spec_oracle.empty();
         lreq.drafter_device = o.drafter_device;
-        lreq.profile_dir = std::string(BASALT_SOURCE_DIR) + "/data/profiles";
+        lreq.profile_dir = basalt::platform::install_root() + "/data/profiles";
         lreq.draft_experts = o.draft_experts;
         lreq.diag_tier_frozen = o.diag_tier_frozen;
+        lreq.kv = o.kv;
         const basalt::model::Result r = adapter->load(lreq, loaded);
         if (!r.ok() || !loaded) return fatal_start_error(r.message);
         std::vector<int64_t> stop;

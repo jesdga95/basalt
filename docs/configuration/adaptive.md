@@ -42,4 +42,4 @@ chat requests. Decode tok/s, one run per arm:
 A long cadence is what hurts: the first round of a fresh engine and every topic change wait for it. Single-knob tests on two cards:
 `adapt-swaps 256` alone and `adapt-decay 0.7` alone stay within noise of the defaults.
 
-[basalt-probe](../probe.md) tries these values on your machine.
+Smaller rounds can win where the card is small, since each round moves fewer experts over the link. [basalt-probe](../probe.md) tries these values on your machine, small rounds included.

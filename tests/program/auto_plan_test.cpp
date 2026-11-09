@@ -3,7 +3,6 @@
 
 #include <cstdio>
 
-#include "basalt/platform/memory.hpp"
 #include <string>
 
 using namespace basalt::program;
@@ -37,14 +36,15 @@ static AutoInputs base(uint64_t ram_gib, bool peer) {
 }
 
 int main() {
-    // Empty config: all four keys are auto, per RAM size.
+    // Empty config: all four keys are auto, per RAM size.  A copy that leaves experts in the file also leaves the file
+    // cache's minimum, 4 GiB with these small layers.
     {
-        AutoPlan p = choose_auto(base(16, true));   // 12 avail - 6 floor = 6 GiB
+        AutoPlan p = choose_auto(base(16, true));   // 12 avail - 6 floor - 4 file cache = 2 GiB
         CHECK(!p.peer_exclusive);
-        CHECK_STR(auto_flags_line(p), "auto flags: peer-exclusive off, resident 6.0 GB, pool-affinity auto, pool-workers 15");
-        p = choose_auto(base(32, true));            // 28 - 6 = 22
+        CHECK_STR(auto_flags_line(p), "auto flags: peer-exclusive off, resident 2.0 GB, pool-affinity auto, pool-workers 15");
+        p = choose_auto(base(32, true));            // 28 - 6 - 4 = 18
         CHECK(!p.peer_exclusive);
-        CHECK_STR(auto_flags_line(p), "auto flags: peer-exclusive off, resident 22.0 GB, pool-affinity auto, pool-workers 15");
+        CHECK_STR(auto_flags_line(p), "auto flags: peer-exclusive off, resident 18.0 GB, pool-affinity auto, pool-workers 15");
         p = choose_auto(base(64, true));            // 60 - 6 = 54: below the full 60, above the exclusive 40
         CHECK(p.peer_exclusive);
         CHECK_STR(auto_flags_line(p), "auto flags: peer-exclusive on, resident 40.0 GB, pool-affinity auto, pool-workers 15");
@@ -56,7 +56,7 @@ int main() {
     {
         AutoPlan p = choose_auto(base(64, false));
         CHECK(!p.peer_exclusive);
-        CHECK(p.resident_gb == 54.0);
+        CHECK(p.resident_gb == 50.0);               // 60 - 6 - 4: the rest is read from the file
         AutoInputs in = base(64, true);
         in.serve = false;
         CHECK(!choose_auto(in).peer_exclusive);
@@ -101,8 +101,8 @@ int main() {
         in.given.peer_exclusive = true; in.given.peer_exclusive_value = false;
         AutoPlan p = choose_auto(in);
         CHECK(!p.peer_exclusive && p.peer_exclusive_src == AutoSource::Given);
-        CHECK(p.resident_gb == 54.0);
-        CHECK_STR(auto_flags_line(p), "auto flags: resident 54.0 GB, pool-affinity auto, pool-workers 15");
+        CHECK(p.resident_gb == 50.0);
+        CHECK_STR(auto_flags_line(p), "auto flags: resident 50.0 GB, pool-affinity auto, pool-workers 15");
 
         in = base(64, true);
         in.given.resident = true; in.given.resident_gb = 12.5;
@@ -147,34 +147,35 @@ int main() {
         in.extra_full = 0;
         CHECK(choose_auto(in).resident_bytes == 40 * G);
     }
-    // Experts on the file: the floor follows what is left there, and the copy plus that floor fits the RAM.
+    // Experts on the file: the copy leaves the floor free whatever is left to the file.
     {
         AutoInputs in = base(128, false);
         in.complement_full = 217 * G / 10;          // 21.7 GiB
         in.extra_full = 49 * G / 10;
         in.floor_bytes = 9 * G;
-        in.margin_bytes = 6 * G;
-        in.late_bytes = 3 * G;
-        in.layer_bytes = 5 * G / 4;
-        in.prompt_file_bytes = 7 * G / 2;
         in.ram_available = 334 * G / 10;            // the bare complement fits beside the 9 GiB floor
         AutoPlan p = choose_auto(in);
         CHECK(p.resident_bytes == in.ram_available - 9 * G);
         CHECK(p.resident_bytes > in.complement_full);
-        in.ram_available = 28 * G;                  // it does not: the rest is read from the file
+        in.ram_available = 28 * G;                  // it does not: the rest is read from the file, beside its cache
         p = choose_auto(in);
-        const uint64_t file = in.complement_full - p.resident_bytes;
-        const uint64_t floor = basalt::platform::ram_floor(in.margin_bytes, file, in.complement_full, in.layer_bytes,
-                                                           in.prompt_file_bytes) + in.late_bytes;
-        CHECK(p.resident_bytes < in.complement_full && file > 0);
-        CHECK(p.resident_bytes + floor <= in.ram_available);                  // never past the RAM
-        CHECK(p.resident_bytes + floor + (G >> 20) >= in.ram_available);      // and no more than a MiB short of it
-        // fewer lent slots to read, a smaller floor, a larger copy
-        const uint64_t before = p.resident_bytes;
-        in.prompt_file_bytes = 0;
-        CHECK(choose_auto(in).resident_bytes > before);
-        in.ram_available = 10 * G;                  // little RAM: a sane floor, not a negative copy
+        CHECK(p.resident_bytes == 15 * G && p.resident_bytes < in.complement_full);
+        in.ram_available = 8 * G;                   // little RAM: no negative copy
         CHECK(choose_auto(in).resident_bytes == 0);
+    }
+    // The file cache's floor: a complement that does not fit leaves it free beside the floor for the experts read from
+    // the file (issue #285), and one that fits is not cut.
+    {
+        AutoInputs in = base(64, false);            // 60 available, 6 floor, a 60 GiB complement
+        in.file_cache = basalt::core::FileCache{G, 3 * G};
+        AutoPlan p = choose_auto(in);
+        CHECK(p.resident_bytes == 50 * G);          // 60 - 6 - the 4 GiB minimum (3 + two layers' sixth)
+        in.file_cache = basalt::core::FileCache{8 * G, 3 * G};
+        p = choose_auto(in);                        // 3 + 2 x 8 x (60 - room) / 60: the floor iterates down to about 6.3 GiB
+        CHECK(p.resident_bytes < 50 * G && p.resident_bytes > 47 * G);
+        in = base(128, false);                      // everything fits: the copy is not cut
+        in.file_cache = basalt::core::FileCache{8 * G, 3 * G};
+        CHECK(choose_auto(in).resident_bytes == 60 * G);
     }
     if (g_fail) { std::printf("auto_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("auto_plan_test: ok\n");

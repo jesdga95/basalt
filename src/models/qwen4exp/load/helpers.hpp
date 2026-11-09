@@ -6,7 +6,6 @@
 namespace basalt::models::qwen4exp::generate {
 
 using basalt::models::qwen4exp::serve::vram_floor_mib;
-using basalt::models::qwen4exp::serve::serve_growth_bytes;
 using basalt::models::qwen4exp::engine_local::kSatBoost;
 
 

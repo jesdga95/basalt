@@ -109,6 +109,7 @@ class Service:
         self.logs = LogBuffer()                         # server and engine output
         # origins allowed to call /v1/* (CORS; "*" = any); empty: no CORS headers
         self.cors_origins: list[str] = []
+        self.max_payload = 256 << 20                     # the most a JSON request body may hold, in bytes
         # origins treated as the server's own page for the load/unload/VRAM controls (no wildcard)
         self.trusted_origins: list[str] = []
         # DNS-rebinding guard: extra Host names ("*" = any) and all names answered, set by serve()
@@ -645,8 +646,11 @@ class Service:
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if busy else None}
         info = dict(getattr(self.engine, "info", {}) or {})
+        experts_total = info.get("spill_total")          # every routed (layer, expert) pair, on the SSD or not
         spill = spill_of(info)
-        engine = {"model": self.model, "max_context": self.engine.max_context, **info, "spill": spill}
+        # a start under way reads 0; the last READY's context stands in until the new one arrives
+        engine = {"model": self.model, "max_context": self.engine.max_context or getattr(self.engine, "known_ctx", 0), **info,
+                  "spill": spill, "expert_total": experts_total if isinstance(experts_total, int) else None}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
         with self.status_lock:
@@ -691,7 +695,9 @@ class Service:
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
-            "context": {"native": ctx, "max_positions": ctx},
+            # the cells of K/V all sessions together can hold before a request is refused (None: no elastic KV)
+            "context": {"native": ctx, "max_positions": ctx,
+                        "elastic_kv_ceiling": (getattr(self.engine, "info", {}) or {}).get("elastic_kv_ceiling")},
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],

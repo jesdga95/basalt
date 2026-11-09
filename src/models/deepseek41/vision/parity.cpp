@@ -18,7 +18,7 @@ int main(int argc, char** argv) {
     }
     std::string err;
     basalt::vision::Mmproj mp;
-    if (!mp.open(argv[1], err, "deepseek41v")) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    if (!mp.open(basalt::core::FileRange(argv[1]), err, "deepseek41v")) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     std::ifstream f(argv[2], std::ios::binary);
     const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     basalt::vision::Image img;
@@ -27,8 +27,9 @@ int main(int argc, char** argv) {
     std::vector<float> rows;
     image_patches(img, pl, rows);
     std::printf("image %dx%d -> canvas %dx%d, %d patches, %d block rows\n", img.w, img.h, pl.width, pl.height, pl.n_patches(), pl.n_tokens());
+    VisionBlas blas;
     VisionEncoder enc;
-    if (!enc.init(mp, pl.n_patches(), err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    if (!enc.init(mp, pl.n_patches(), blas, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     std::vector<float> out;
     for (int rep = 0; rep < 2; ++rep) {
         const auto t0 = std::chrono::steady_clock::now();

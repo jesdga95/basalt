@@ -25,7 +25,6 @@
 namespace basalt::models::deepseek41 {
 namespace {
 
-constexpr uint64_t kTierReserve = 6ull << 30;   // device memory left free beside the expert tier: caches and prompt workspaces
 constexpr uint64_t kModuleRoom = 7ull << 27;    // kernel modules still to load when the tier opens
 constexpr uint64_t kVisionRoom = 3ull << 29;    // the image encoder, when the pack carries one
 // One layer's GPU plan for the grouped expert kernel, uploaded with a single copy.
@@ -75,7 +74,9 @@ IndexMode index_mode(int il) { return il == 20 ? IndexMode::Level1 : il > 20 ? I
 
 class KernelOps final : public LayerOps {
 public:
-    explicit KernelOps(const DsModel& m) : m_(m), g_(m.geo()), ctx_((int) m.context()) {}
+    explicit KernelOps(const DsModel& m)
+        : m_(m), g_(m.geo()), ctx_((int) m.context()), fmt_(m.cache_format()), lat_b_(ctxp::latent_row_bytes(fmt_)),
+          idx_b_(ctxp::index_row_bytes(fmt_)) {}
     ~KernelOps() override {
         for (cudaGraphExec_t e : share_g_)
             if (e) cudaGraphExecDestroy(e);
@@ -109,16 +110,17 @@ public:
         st_sc_.assign((size_t) nl, nullptr);
         cws_l_.assign((size_t) nl, nullptr);
         for (int il = 0; il < nl; ++il) {
-            if (!alloc((void**) &ring_[il], (size_t) kWindowSlots * kLatent * 2)) return oom(err);
+            if (!alloc((void**) &ring_[il], (size_t) kWindowSlots * win_row_bytes(fmt_))) return oom(err);
             if (g_.compress_ratio[(size_t) il] && kv_source(il) == il) {
                 const int ratio = g_.compress_ratio[(size_t) il];
                 // the caches reserve the address range of the whole context and are backed as positions arrive
                 const size_t cap = (size_t) ctx_ / ratio + 1;
                 el_kv_[il] = std::make_unique<ElasticBuf>();
                 el_ik_[il] = std::make_unique<ElasticBuf>();
-                if (!el_kv_[il]->open(cap * kLatent * 2, err) || !el_ik_[il]->open(cap * kIdxDim * 2, err)) return false;
-                comp_kv_[il] = (uint16_t*) el_kv_[il]->data();
-                comp_ik_[il] = (uint16_t*) el_ik_[il]->data();
+                if (!el_kv_[il]->open(cap * lat_b_, err) || !el_ik_[il]->open(cap * idx_b_, err))
+                    return false;
+                comp_kv_[il] = el_kv_[il]->data();
+                comp_ik_[il] = el_ik_[il]->data();
                 if (!alloc((void**) &st_kv_[il], (size_t) ratio * kLatent * 4) ||
                     !alloc((void**) &st_sc_[il], (size_t) ratio * kLatent * 4) || !alloc(&cws_l_[il], compress_workspace_bytes()))
                     return oom(err);
@@ -163,8 +165,8 @@ public:
         for (int il = 0; il < g_.n_layers; ++il) {
             if (!el_kv_[(size_t) il]) continue;
             const uint64_t rows = (uint64_t) positions / (uint64_t) g_.compress_ratio[(size_t) il] + 1;
-            fn(el_kv_[(size_t) il]->data(), rows * ctxp::kLatentRowBytes);
-            fn(el_ik_[(size_t) il]->data(), rows * ctxp::kIndexRowBytes);
+            fn(el_kv_[(size_t) il]->data(), rows * lat_b_);
+            fn(el_ik_[(size_t) il]->data(), rows * idx_b_);
         }
     }
 
@@ -174,23 +176,25 @@ public:
         return total;
     }
 
-    // Each kv-source layer as a K/V entry: its latents and index keys by row, a row being `ratio` cells.
+    // Each kv-source layer as a K/V entry: its latents and index keys by row, a row being `ratio` cells, tagged with
+    // the rows' format.
     bool save_cache(void* stream, int64_t positions, std::vector<core::ConversationKv>& kv, std::string& err) override {
         cudaStreamSynchronize((cudaStream_t) stream);
         kv.clear();
         for (int il = 0; il < g_.n_layers; ++il) {
             if (!el_kv_[(size_t) il]) continue;
             const int64_t ratio = g_.compress_ratio[(size_t) il];
-            if (ctxp::kLatentRowBytes % (uint64_t) ratio || ctxp::kIndexRowBytes % (uint64_t) ratio) {
+            if (lat_b_ % (uint64_t) ratio || idx_b_ % (uint64_t) ratio) {
                 err = "deepseek41: compress ratio " + std::to_string(ratio) + " does not divide a cache row";
                 return false;
             }
             const uint64_t rows = ctxp::cache_rows(positions, (int) ratio);
             core::ConversationKv k;
+            k.format = ctxp::cell_format(fmt_);
             k.page_size = ratio;
             k.cells = (int64_t) rows * ratio;
-            k.k.resize_for_overwrite(rows * ctxp::kLatentRowBytes);
-            k.v.resize_for_overwrite(rows * ctxp::kIndexRowBytes);
+            k.k.resize_for_overwrite(rows * lat_b_);
+            k.v.resize_for_overwrite(rows * idx_b_);
             const auto down = [&](const uint8_t* dev, core::ConversationBuffer& to) {
                 return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
                     return cudaMemcpy(p, dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
@@ -210,7 +214,7 @@ public:
         size_t i = 0;
         for (int il = 0; il < g_.n_layers; ++il) {
             if (!el_kv_[(size_t) il]) continue;
-            if (i >= kv.size() || kv[i].page_size != g_.compress_ratio[(size_t) il]) {
+            if (i >= kv.size() || kv[i].page_size != g_.compress_ratio[(size_t) il] || kv[i].format != ctxp::cell_format(fmt_)) {
                 err = "deepseek41: a parked conversation has other caches";
                 return false;
             }
@@ -229,7 +233,7 @@ public:
     }
 
     size_t turn_bytes() const override {
-        const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
+        const size_t ring_b = (size_t) kWindowSlots * win_row_bytes(fmt_);
         size_t total = 0;
         for (size_t il = 0; il < ring_.size(); ++il) {
             if (ring_[il]) total += ring_b;
@@ -240,7 +244,7 @@ public:
 
     void save_turn(void* stream, uint8_t* host) override {
         cudaStreamSynchronize((cudaStream_t) stream);
-        const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
+        const size_t ring_b = (size_t) kWindowSlots * win_row_bytes(fmt_);
         size_t at = 0;
         auto put = [&](const void* dev, size_t bytes) {
             cudaMemcpy(host + at, dev, bytes, cudaMemcpyDeviceToHost);
@@ -259,7 +263,7 @@ public:
     void restore_turn(void* stream, const uint8_t* host) override {
         cudaStreamSynchronize((cudaStream_t) stream);
         win_n_ = 0;
-        const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
+        const size_t ring_b = (size_t) kWindowSlots * win_row_bytes(fmt_);
         size_t at = 0;
         auto get = [&](void* dev, size_t bytes) {
             cudaMemcpy(dev, host + at, bytes, cudaMemcpyHostToDevice);
@@ -309,6 +313,7 @@ public:
         c.comp_ik = &comp_ik_;
         c.st_kv = &st_kv_;
         c.st_sc = &st_sc_;
+        c.format = fmt_;
         c.freq[0] = freq_[0];
         c.freq[1] = freq_[1];
         c.rope = rope_;
@@ -372,7 +377,8 @@ public:
             for (int il = 0; il < g_.n_layers && ok; ++il) {
                 if (!el_kv_[(size_t) il]) continue;
                 const uint64_t rows = (uint64_t) positions / (uint64_t) g_.compress_ratio[(size_t) il] + 1;
-                ok = el_kv_[(size_t) il]->ensure(rows * kLatent * 2, keep, e) && el_ik_[(size_t) il]->ensure(rows * kIdxDim * 2, keep, e);
+                ok = el_kv_[(size_t) il]->ensure(rows * lat_b_, keep, e) &&
+                     el_ik_[(size_t) il]->ensure(rows * idx_b_, keep, e);
             }
             if (ok) {
                 backed_positions_ = positions;
@@ -391,16 +397,13 @@ public:
     }
 
     void trim_positions() override {
-        std::vector<int> ratios;
-        for (int il = 0; il < g_.n_layers; ++il)
-            if (el_kv_[(size_t) il]) ratios.push_back(g_.compress_ratio[(size_t) il]);
-        const int64_t keep = prefillp::keep_positions(backed_positions_, ratios);
+        const int64_t keep = m_.keep_positions(backed_positions_);
         if (keep >= backed_positions_) return;
         for (int il = 0; il < g_.n_layers; ++il) {
             if (!el_kv_[(size_t) il]) continue;
             const uint64_t rows = (uint64_t) keep / (uint64_t) g_.compress_ratio[(size_t) il] + 1;
-            el_kv_[(size_t) il]->trim(rows * kLatent * 2);
-            el_ik_[(size_t) il]->trim(rows * kIdxDim * 2);
+            el_kv_[(size_t) il]->trim(rows * lat_b_);
+            el_ik_[(size_t) il]->trim(rows * idx_b_);
         }
         backed_positions_ = keep;
     }
@@ -446,6 +449,7 @@ public:
         const DevTensor *ik = T("indexer.attn_k.weight"), *ikn = T("indexer.k_norm.weight");
         CompressArgs ca;
         ca.ratio = ratio;
+        ca.format = fmt_;
         ca.rms_eps = g_.rms_eps;
         ca.n_embd = kAttnEmbd;
         ca.w_kv = wc ? (const uint16_t*) wc->ptr : nullptr;
@@ -486,7 +490,7 @@ public:
         kernels::native_quantize_q8_1(x, xq_, kAttnEmbd, T, stream);
         if (!after(ms, br_[0], br_ev_[0])) return failed("attention branch");
         kernels::native_mmvq(wkv->type, wkv->ptr, xq_, kvraw_, kAttnEmbd, kLatent, T, br_[0]);
-        kv_window(kvraw_, (const float*) kvn->ptr, d_pos, T, g_.rms_eps, freq_[kind], nullptr, ring_[il], br_[0]);
+        kv_window(kvraw_, (const float*) kvn->ptr, d_pos, T, g_.rms_eps, freq_[kind], nullptr, ring_[il], fmt_, br_[0]);
 
         // the compressor and the indexer's head weights read only x: beside the query path as well
         const int ks = ratio ? kv_source(il) : -1;
@@ -513,6 +517,7 @@ public:
             }
             ia.mode = index_mode(il);
             ia.ratio = ratio;
+            ia.format = fmt_;
             ia.n_embd = kAttnEmbd;
             ia.n_comp = ctx_ / ratio + 1;   // the buffers' row capacity; only the visible rows are scored
             ia.w_q = (const uint16_t*) iqb->ptr;
@@ -528,13 +533,13 @@ public:
 
         // query path; its latent is also the indexer's input
         QPathWeights qw{qa->ptr, qa->type, (const float*) qan->ptr, qb->ptr, qb->type, g_.rms_eps};
-        q_latent(xq_, qw, T, qr_, stream);
+        q_latent(xq_, qw, T, qr_, xq2_, stream);
         if (indexing) {
             // the selection waits for the latent, the head weights and the layer's index keys
             if (!after(ms, br_[0], br_ev_[2]) || !after(br_[1], br_[0], br_ev_[3])) return failed("attention branch");
             indexer_rank(ia, qr_, d_pos, T, iws_, br_[0]);
         }
-        q_heads(qw, T, d_pos, rope_[kind], xq2_, qr_, q_, stream);
+        q_heads(qw, T, d_pos, rope_[kind], xq2_, q_, stream);
         if (!after(br_[0], ms, br_ev_[4]) || ((compressing || indexing) && !after(br_[1], ms, br_ev_[5])))
             return failed("attention branch");
         const int sel = ratio ? kTopK : 0;
@@ -543,14 +548,13 @@ public:
         a.n_tokens = T;
         a.q = q_;
         a.win = ring_[il];
-        a.win_type = LatentType::F16;
+        a.win_type = fmt_ == CacheFormat::Fp8 ? LatentType::Fp8 : LatentType::F16;
         a.win_cap = kWindowSlots;
         a.win_start = d_start;
         a.win_n = d_n;
         if (ratio) {
             a.comp = comp_kv_[kv_source(il)];
-            a.comp_type = LatentType::F16;
-            a.comp_stride = kLatent;
+            a.comp_type = fmt_ == CacheFormat::Fp8 ? LatentType::Fp4 : LatentType::F16;
             a.sel = ids_;
             a.n_sel = sel;
             a.comp_limit = d_lim;
@@ -611,10 +615,13 @@ public:
         auto t = std::make_shared<ExpertTier>(m_);
         const prefillp::Dims d = m_.prompt_dims();
         ExpertTier::Reserve r;
-        // the caches grow into the reserve beside the tier, then into the spare arena the tier gives back
-        r.copies = kTierReserve;
-        r.homes = m_.context_bytes() * (uint64_t) m_.sessions() + prefillp::workspace_bytes(d, prefillp::kHomeChunk) + prefillp::ahead_bytes(d) +
-                  prefillp::kMargin + kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
+        // the caches of a full context grow into the reserve beside the copies; a prompt borrows the copies
+        r.copies = m_.context_bytes() * (uint64_t) m_.sessions() + kModuleRoom;
+        // beside the homes a prompt keeps the full context's caches and a kHomeChunk chunk, and a shorter prompt (whose
+        // caches are small) the largest chunk the context allows
+        const uint64_t prompt_room = std::max(m_.context_bytes() * (uint64_t) m_.sessions() + prefillp::workspace_bytes(d, prefillp::kHomeChunk),
+                                              prefillp::workspace_bytes(d, std::min(prefillp::kMaxChunk, ctx_)));
+        r.homes = prompt_room + prefillp::ahead_bytes(d) + prefillp::kMargin + kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
         r.beside_homes = prefillp::workspace_bytes(d, prefillp::kShortChunk) + prefillp::kShortMargin;
         r.modules = kModuleRoom;
         if (!t->open(r, h_rows_, err)) return false;
@@ -931,10 +938,12 @@ private:
     const Geometry& g_;
     std::unique_ptr<AttnBatch> batch_;
     std::vector<void*> allocs_;
-    std::vector<uint16_t*> ring_, comp_kv_, comp_ik_;
+    std::vector<uint8_t*> ring_, comp_kv_, comp_ik_;
     std::vector<std::unique_ptr<ElasticBuf>> el_kv_, el_ik_;   // backing of comp_kv_ / comp_ik_ per kv-source layer
     int64_t backed_positions_ = 0;
     int ctx_ = 0;
+    CacheFormat fmt_ = CacheFormat::Fp8;   // the caches' rows (--kv)
+    uint64_t lat_b_ = 0, idx_b_ = 0;       // a compressed row's and an index key's bytes
     std::vector<float*> st_kv_, st_sc_;
     float* freq_[2] = {nullptr, nullptr};
     RopeTable rope_[2];

@@ -2,7 +2,8 @@
 // bit for bit on the real geometry, whatever the share's size and the rows it lands in.
 //
 //     build/ds41_peer_parity            the checks (passes with a note on one card)
-//     build/ds41_peer_parity --bench    the checks, then a microbench line per format and share size
+//     build/ds41_peer_parity --bench    the checks, then a microbench line per format and share size, alone and
+//                                       with a slot's copy in and out queued on the card just before it
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -69,6 +70,19 @@ std::vector<uint8_t> random_rows(int type, int64_t rows, int64_t n, float scale,
     return w;
 }
 
+// NVFP4 rows: ggml's rounding of N(0, sd) values
+std::vector<uint8_t> nvfp4_rows(int64_t rows, int64_t n, float sd, std::mt19937& rng) {
+    const size_t rb = ggml_row_size(GGML_TYPE_NVFP4, n);
+    std::vector<uint8_t> w((size_t) rows * rb);
+    std::vector<float> x((size_t) n);
+    std::normal_distribution<float> nd(0.f, sd);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (auto& v : x) v = nd(rng);
+        ggml_get_type_traits(GGML_TYPE_NVFP4)->from_float_ref(x.data(), w.data() + (size_t) r * rb, n);
+    }
+    return w;
+}
+
 template <class T>
 T* dalloc(size_t n) {
     void* p = nullptr;
@@ -76,16 +90,26 @@ T* dalloc(size_t n) {
     return (T*) p;
 }
 
-const char* nm(int t) { return t == GGML_TYPE_IQ2_XXS ? "IQ2_XXS" : t == GGML_TYPE_IQ2_XS ? "IQ2_XS" : t == GGML_TYPE_IQ1_M ? "IQ1_M" : "?"; }
+const char* nm(int t) {
+    return t == GGML_TYPE_IQ2_XXS ? "IQ2_XXS" : t == GGML_TYPE_IQ2_XS ? "IQ2_XS" : t == GGML_TYPE_IQ1_M ? "IQ1_M"
+         : t == GGML_TYPE_NVFP4 ? "NVFP4" : "?";
+}
 
 void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaStream_t s) {
     std::mt19937 rng(700 + gu * 7 + d);
     const kg::NativeExpertLayout L = kg::native_expert_layout(gu, d, H, FF);
     std::vector<std::vector<uint8_t>> blob;
     for (int b = 0; b < NB; ++b) {
-        auto g = random_rows(gu, FF, H, 0.002f, rng), u = random_rows(gu, FF, H, 0.002f, rng), dn = random_rows(d, H, FF, 0.0005f, rng);
+        const bool fp4 = gu == GGML_TYPE_NVFP4;   // NVFP4: ggml-rounded rows and the scale tail {s_gate, s_up, s_down, 0}
+        auto g = fp4 ? nvfp4_rows(FF, H, 0.1f, rng) : random_rows(gu, FF, H, 0.002f, rng);
+        auto u = fp4 ? nvfp4_rows(FF, H, 0.1f, rng) : random_rows(gu, FF, H, 0.002f, rng);
+        auto dn = fp4 ? nvfp4_rows(H, FF, 0.1f, rng) : random_rows(d, H, FF, 0.0005f, rng);
         g.insert(g.end(), u.begin(), u.end());
         g.insert(g.end(), dn.begin(), dn.end());
+        if (fp4) {
+            const float t4[4] = {1.3f, 1.1f, 0.02f, 0.f};
+            g.insert(g.end(), (const uint8_t*) t4, (const uint8_t*) t4 + 16);
+        }
         check(g.size() == L.bytes, "layout bytes");
         blob.push_back(std::move(g));
     }
@@ -167,21 +191,29 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
     std::printf("%-7s/%-7s second card vs main card, shares of 1..6: %s\n", nm(gu), nm(d), same ? "bitwise same" : "DIFFER");
 
     if (bench) {
-        for (int n : {1, 2, 3, 4, 6}) {
-            int32_t ids[8] = {}, kind[8] = {};
-            for (int i = 0; i < n; ++i) { ids[i] = i; kind[i] = 2; }
-            std::vector<double> us;
-            for (int it = 0; it < 201; ++it) {
-                const auto t0 = std::chrono::steady_clock::now();
-                peer.launch_plain(0, Lp, h_x, ids, n, kind, err);
-                peer.finish(nullptr, err);
-                if (it > 0) us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        uint8_t* out = nullptr;
+        ck(cudaHostAlloc((void**) &out, L.bytes, cudaHostAllocPortable), "out");
+        for (const bool copying : {false, true})
+            for (int n : {1, 2, 3, 4, 6}) {
+                int32_t ids[8] = {}, kind[8] = {};
+                for (int i = 0; i < n; ++i) { ids[i] = i; kind[i] = 2; }
+                std::vector<double> us;
+                for (int it = 0; it < 201; ++it) {
+                    // the last slot's bytes out and the same bytes back in: a slot swap's copies, the slot unchanged
+                    if (copying) peer.exchange_slot(NB - 1, out, stage, L.bytes);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    peer.launch_plain(0, Lp, h_x, ids, n, kind, err);
+                    peer.finish(nullptr, err);
+                    if (it > 0) us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+                    if (copying) peer.read_wait(err);
+                }
+                std::sort(us.begin(), us.end());
+                const double med = us[us.size() / 2];
+                std::printf("bench second card %s/%s share of %d%s, launch to rows in host memory: %.1f us/call (p90 %.1f), %.1f MB read, %.0f GB/s (weights only)\n",
+                            nm(gu), nm(d), n, copying ? " behind a slot copy" : "", med, us[us.size() * 9 / 10],
+                            (double) n * (double) L.bytes / 1e6, (double) n * (double) L.bytes / (med * 1e3));
             }
-            std::sort(us.begin(), us.end());
-            const double med = us[us.size() / 2];
-            std::printf("bench second card %s/%s share of %d, launch to rows in host memory: %.1f us/call (p90 %.1f), %.1f MB read, %.0f GB/s (weights only)\n",
-                        nm(gu), nm(d), n, med, us[us.size() * 9 / 10], (double) n * (double) L.bytes / 1e6, (double) n * (double) L.bytes / (med * 1e3));
-        }
+        cudaFreeHost(out);
     }
     cudaFreeHost(stage);
     for (void* p : {(void*) blobs, (void*) dx, (void*) xq, (void*) dptr, (void*) dstart, (void*) dng, (void*) ddst, (void*) dtok, (void*) scr, (void*) dout})
@@ -200,17 +232,18 @@ int main(int argc, char** argv) {
     }
     float* h_x = nullptr;
     float* h_rows = nullptr;
-    ck(cudaHostAlloc((void**) &h_x, H * sizeof(float), cudaHostAllocPortable), "x");
+    ck(cudaHostAlloc((void**) &h_x, H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "x");
     ck(cudaHostAlloc((void**) &h_rows, 8 * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "rows");
     std::mt19937 rng(9);
     std::normal_distribution<float> nd(0.f, 1.f);
     for (int i = 0; i < H; ++i) h_x[i] = nd(rng);
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
-    // the format pairs a GSQ-RCO pack mixes
+    // the format pairs a GSQ-RCO pack mixes, and NVFP4
     const int pairs[][2] = {{GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_M},   {GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS}, {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M},
                             {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS}, {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS}, {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ1_M},
-                            {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS},  {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS}};
+                            {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS},  {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS},
+                            {GGML_TYPE_NVFP4, GGML_TYPE_NVFP4}};
     for (const auto& p : pairs) one_pair(p[0], p[1], bench, h_x, h_rows, s);
     cudaStreamDestroy(s);
     cudaFreeHost(h_x);

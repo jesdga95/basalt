@@ -1,4 +1,5 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
+#include "basalt/core/device.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/model.hpp"
@@ -123,7 +124,11 @@ static std::vector<int> cache_ratios(const Geometry& g) {
     return ratios;
 }
 
-uint64_t DsModel::context_bytes() const { return ctxp::context_bytes(context(), cache_ratios(pack_.geo)); }
+uint64_t DsModel::context_bytes() const { return ctxp::context_bytes(context(), cache_ratios(pack_.geo), cache_format_); }
+
+int64_t DsModel::keep_positions(int64_t backed) const {
+    return prefillp::keep_positions(backed, cache_ratios(pack_.geo), cache_format_);
+}
 
 prefillp::Dims DsModel::prompt_dims() const {
     const Geometry& g = pack_.geo;
@@ -142,21 +147,23 @@ prefillp::Dims DsModel::prompt_dims() const {
 bool DsModel::resolve_context(int64_t requested, std::string& err) {
     const Geometry& g = pack_.geo;
     const std::vector<int> ratios = cache_ratios(g);
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        err = "deepseek41: cannot query the free device memory";
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        err = "deepseek41: cannot query the free device memory: " + why;
         return false;
     }
-    const ctxp::Plan p = ctxp::plan_context(requested, g.context_length, free_b, ratios);
+    const ctxp::Plan p = ctxp::plan_context(requested, g.context_length, free_b, ratios, cache_format_);
     if (!p.error.empty()) {
         err = "deepseek41: " + p.error;
         return false;
     }
     ctx_ = p.context;
-    core::LoadProgress::kv(core::LoadProgress::cuda(0), ctxp::context_bytes(0, ratios), ctx_, "", ctxp::context_bytes(ctx_, ratios));
-    basalt::log::info("basalt deepseek41", "context %lld tokens (caches of a full context: %.2f GiB)%s%s", (long long) ctx_,
-                 (double) ctxp::context_bytes(ctx_, ratios) / (1024.0 * 1024.0 * 1024.0), p.note.empty() ? "" : "; ",
-                 p.note.c_str());
+    const uint64_t full = ctxp::context_bytes(ctx_, ratios, cache_format_);
+    core::LoadProgress::kv(core::LoadProgress::cuda(0), ctxp::context_bytes(0, ratios, cache_format_), ctx_, "", full);
+    basalt::log::info("basalt deepseek41", "context %lld tokens (caches of a full context: %.2f GiB, --kv %s)%s%s", (long long) ctx_,
+                 (double) full / (1024.0 * 1024.0 * 1024.0), cache_format_ == CacheFormat::Fp8 ? "fp8" : "fp16",
+                 p.note.empty() ? "" : "; ", p.note.c_str());
     return true;
 }
 
@@ -199,7 +206,7 @@ bool DsModel::open_mmproj(vision::Mmproj& mp, std::string& err) const {
         err = "this pack carries no vision projector (convert with --mmproj)";
         return false;
     }
-    return mp.open_range(pack_.vision.path, pack_.vision.offset, pack_.vision.bytes, err, "deepseek41v");
+    return mp.open(pack_.vision, err, "deepseek41v");
 }
 
 model::Result DsModel::make_session(std::unique_ptr<model::ModelSession>& out) {

@@ -59,7 +59,7 @@ class AutoFlagsLine(unittest.TestCase):
     def test_the_line_is_relayed_verbatim_once(self):
         with tempfile.TemporaryDirectory() as d:
             _, out, _ = self.start(d, LINE)
-            self.assertEqual(out.getvalue(), "[server] auto     peer-excl=off resident=51.2GB pool-affinity=all pool=15\n")
+            self.assertEqual(out.getvalue(), "[server] auto     peer-excl=off ram-experts=51.2GB pool-affinity=all pool=15\n")
 
     def test_no_line_prints_nothing(self):
         with tempfile.TemporaryDirectory() as d:

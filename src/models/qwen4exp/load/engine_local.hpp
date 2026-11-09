@@ -25,6 +25,7 @@
 #include "basalt/platform/compiler.hpp"
 #include "basalt/models/qwen4exp/decode/native_dense.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/core/spin_wait.hpp"
 #include "basalt/models/qwen4exp/decode/session.hpp"
 #include "basalt/core/staged_copy.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
@@ -89,10 +90,8 @@ public:
     void join() {
         if (!busy_) return;
         // the caller has nothing else to do: poll rather than sleep, so the job's end is seen at once
-        for (unsigned spins = 0; !done_.load(std::memory_order_acquire); ++spins) {
-            if (spins < 20000) basalt::platform::cpu_relax();
-            else std::this_thread::yield();
-        }
+        basalt::core::SpinWait spin;
+        while (!done_.load(std::memory_order_acquire)) spin();
         busy_ = false;
     }
 private:

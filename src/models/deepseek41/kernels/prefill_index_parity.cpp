@@ -27,7 +27,6 @@ float from_bf16(uint16_t b) {
     std::memcpy(&f, &u, 4);
     return f;
 }
-float from_f16(uint16_t h) { return __half2float(*reinterpret_cast<const __half*>(&h)); }
 
 std::vector<uint16_t> rand_bf16(size_t n, uint32_t seed, float sigma) {
     const auto f = randn(n, seed, sigma);
@@ -43,10 +42,35 @@ std::vector<float> make_table() {
     return t;
 }
 
-std::vector<float> halves(const std::vector<uint16_t>& h) {
-    std::vector<float> f(h.size());
-    for (size_t i = 0; i < h.size(); ++i) f[i] = from_f16(h[i]);
+// The cache format the tests run on (both, in turn).
+CacheFormat g_fmt = CacheFormat::Fp8;
+bool packed() { return g_fmt == CacheFormat::Fp8; }
+
+// The values of a buffer of cache rows of d values: packed as `k`, or fp16.
+std::vector<float> unpacked(const std::vector<uint8_t>& b, int d, int rb, Round k) {
+    std::vector<float> f;
+    for (size_t r = 0; r + (size_t) rb <= b.size(); r += (size_t) rb) {
+        if (packed()) {
+            const auto x = ref_unpack(&b[r], d, k);
+            f.insert(f.end(), x.begin(), x.end());
+        } else {
+            for (int c = 0; c < d; ++c) {
+                __half h;
+                std::memcpy(&h, &b[r + 2 * (size_t) c], 2);
+                f.push_back(__half2float(h));
+            }
+        }
+    }
     return f;
+}
+
+// n index-key rows of random values in the cache format.
+std::vector<uint8_t> key_rows(int n, uint32_t seed) {
+    if (packed()) return packed_rows(n, kIdxDim, kIdxRowBytes, Round::Fp4Pow2, seed);
+    const auto f = randn((size_t) n * kIdxDim, seed, 1.f);
+    std::vector<uint8_t> b(f.size() * 2);
+    for (size_t i = 0; i < f.size(); ++i) { const __half h = __float2half(f[i]); std::memcpy(&b[2 * i], &h, 2); }
+    return b;
 }
 
 void test_gemm(Verdict& v) {
@@ -81,24 +105,24 @@ void test_window(Verdict& v) {
     for (int i = 0; i < N; ++i) pos[i] = P0 + i;
     Dev<float> draw(raw), dnw(nw), dfreq(freq);
     Dev<int32_t> dpos(pos);
-    std::vector<uint16_t> zero((size_t) kWindowSlots * kLatent, 0);
-    Dev<uint16_t> ring_a(zero), ring_b(zero);
+    std::vector<uint8_t> zero((size_t) kWindowSlots * win_row_bytes(g_fmt), 0);
+    Dev<uint8_t> ring_a(zero), ring_b(zero);
     for (int off = 0; off < N; off += 4)
-        kv_window(draw.p + (size_t) off * kLatent, dnw.p, dpos.p + off, std::min(4, N - off), 1e-20f, dfreq.p, nullptr, ring_a.p, nullptr);
+        kv_window(draw.p + (size_t) off * kLatent, dnw.p, dpos.p + off, std::min(4, N - off), 1e-20f, dfreq.p, nullptr, ring_a.p, g_fmt, nullptr);
     const int R = 1152;
-    Dev<uint16_t> stage((size_t) R * kLatent);
-    kv_window_stage(draw.p, dnw.p, dpos.p, N, 1e-20f, dfreq.p, stage.p, R, ring_b.p, std::max(0, N - kWindowSlots), nullptr);
+    Dev<uint8_t> stage((size_t) R * win_row_bytes(g_fmt));
+    kv_window_stage(draw.p, dnw.p, dpos.p, N, 1e-20f, dfreq.p, stage.p, R, ring_b.p, std::max(0, N - kWindowSlots), g_fmt, nullptr);
     check(cudaDeviceSynchronize(), "window");
     v.expect(ring_a.down() == ring_b.down(), "kv_window_stage leaves the decode ring as the token-by-token run does");
     // staged copy of the rows before a later sub-chunk
-    Dev<uint16_t> stage2((size_t) R * kLatent);
+    Dev<uint8_t> stage2((size_t) R * win_row_bytes(g_fmt));
     const int64_t p_lo = P0 + N - 127;
-    window_stage_copy(ring_b.p, stage2.p, R, p_lo, 127, nullptr);
+    window_stage_copy(ring_b.p, stage2.p, R, p_lo, 127, g_fmt, nullptr);
     check(cudaDeviceSynchronize(), "copy");
     const auto sa = stage.down(), sb = stage2.down();
     bool same = true;
     for (int64_t p = p_lo; p < P0 + N; ++p)
-        same = same && std::equal(sa.begin() + (p % R) * kLatent, sa.begin() + (p % R + 1) * kLatent, sb.begin() + (p % R) * kLatent);
+        same = same && std::equal(sa.begin() + (p % R) * win_row_bytes(g_fmt), sa.begin() + (p % R + 1) * win_row_bytes(g_fmt), sb.begin() + (p % R) * win_row_bytes(g_fmt));
     v.expect(same, "window_stage_copy rows equal the staged rows");
 }
 
@@ -116,19 +140,19 @@ void test_compress(Verdict& v) {
         const int cap = 48;
         struct St {
             Dev<float> skv, ssc;
-            Dev<uint16_t> ckv, cik;
-            St(int r, int c) : skv(r * kLatent), ssc(r * kLatent), ckv((size_t) c * kLatent), cik((size_t) c * kIdxDim) {
+            Dev<uint8_t> ckv, cik;
+            St(int r, int c) : skv(r * kLatent), ssc(r * kLatent), ckv((size_t) c * comp_row_bytes(g_fmt)), cik((size_t) c * idx_row_bytes(g_fmt)) {
                 skv.up(randn(r * kLatent, 70, 1.f));
                 ssc.up(randn(r * kLatent, 71, 1.f));
-                ckv.up(std::vector<uint16_t>(ckv.n, 0));
-                cik.up(std::vector<uint16_t>(cik.n, 0));
+                ckv.up(std::vector<uint8_t>(ckv.n, 0));
+                cik.up(std::vector<uint8_t>(cik.n, 0));
             }
         } a(ratio, cap), b(ratio, cap);
         auto args = [&](St& s) {
             CompressArgs c;
             c.ratio = ratio; c.w_kv = dwkv.p; c.w_gate = ratio > 1 ? dwg.p : nullptr; c.norm_w = dnw.p;
             c.w_idx_k = dwik.p; c.idx_k_norm_w = dnk.p; c.rope_freq = dfreq.p;
-            c.state_kv = s.skv.p; c.state_score = s.ssc.p; c.comp_kv = s.ckv.p; c.comp_ik = s.cik.p;
+            c.state_kv = s.skv.p; c.state_score = s.ssc.p; c.comp_kv = s.ckv.p; c.comp_ik = s.cik.p; c.format = g_fmt;
             return c;
         };
         const CompressArgs ca = args(a), cb = args(b);
@@ -137,10 +161,11 @@ void test_compress(Verdict& v) {
         compress_batch(cb, dx.p, dpos.p, split, wsb.p, nullptr);
         compress_batch(cb, dx.p + (size_t) split * D, dpos.p + split, N - split, wsb.p, nullptr);
         check(cudaDeviceSynchronize(), "compress");
-        const Err e1 = compare(halves(b.ckv.down()), halves(a.ckv.down()), 1e-2);
-        const Err e2 = compare(halves(b.cik.down()), halves(a.cik.down()), 1e-2);
+        const int crb = comp_row_bytes(g_fmt), irb = idx_row_bytes(g_fmt);
+        const Err e1 = compare(unpacked(b.ckv.down(), kLatent, crb, Round::Fp4E4m3), unpacked(a.ckv.down(), kLatent, crb, Round::Fp4E4m3), 1e-2);
+        const Err e2 = compare(unpacked(b.cik.down(), kIdxDim, irb, Round::Fp4Pow2), unpacked(a.cik.down(), kIdxDim, irb, Round::Fp4Pow2), 1e-2);
         const Err e3 = compare(b.skv.down(), a.skv.down()), e4 = compare(b.ssc.down(), a.ssc.down());
-        std::printf("compress_batch ratio=%d: comp_kv rms_rel %.2e, comp_ik %.2e, state %.2e / %.2e\n", ratio, e1.rms_rel,
+        std::printf("[%s] compress_batch ratio=%d: comp_kv rms_rel %.2e, comp_ik %.2e, state %.2e / %.2e\n", packed() ? "fp8" : "fp16", ratio, e1.rms_rel,
                     e2.rms_rel, e3.rms_rel, e4.rms_rel);
         v.expect(e1.rms_rel < 1e-3 && e2.rms_rel < 1e-3, "compress_batch rows vs decode-width compress");
         v.expect(e3.rms_rel < 3e-5 && e4.rms_rel < 3e-5, "compress_batch carried state vs decode-width compress");
@@ -151,10 +176,7 @@ void test_indexer(Verdict& v) {
     const int n_comp = 900, N = 48;
     const auto freq = make_table();
     Dev<uint16_t> wq(rand_bf16((size_t) kIdxHeads * kIdxDim * 1280, 41, 0.03f)), wp(rand_bf16((size_t) kIdxHeads * D, 42, 0.03f));
-    const auto ikf = randn((size_t) n_comp * kIdxDim, 43, 1.f);
-    std::vector<uint16_t> ik(ikf.size());
-    for (size_t i = 0; i < ik.size(); ++i) { const __half h = __float2half(ikf[i]); ik[i] = *reinterpret_cast<const uint16_t*>(&h); }
-    Dev<uint16_t> dik(ik);
+    Dev<uint8_t> dik(key_rows(n_comp, 43));
     Dev<float> qr(randn((size_t) N * 1280, 44, 1.f)), x(randn((size_t) N * D, 45, 1.f)), dfreq(freq);
     std::vector<int32_t> pos(N);
     for (int i = 0; i < N; ++i) pos[i] = (n_comp - N + i) * 2 + 1;   // ratio 2: row counts n_comp-N+i+1
@@ -165,6 +187,7 @@ void test_indexer(Verdict& v) {
         if (mode == IndexMode::Level2) {   // candidates from a Level1 pass of the decode-width kernel
             Dev<char> w1(indexer_workspace_bytes(n_comp));
             IndexerArgs a;
+            a.format = g_fmt;
             a.mode = IndexMode::Level1; a.ratio = 2; a.n_comp = n_comp; a.w_q = wq.p; a.w_proj = wp.p; a.rope_freq = dfreq.p;
             a.comp_ik = dik.p; a.cand_ids = ca.p; a.cand_n = cna.p; a.out_ids = ia.p; a.out_n = na.p; a.cand_blocks = 40;
             for (int off = 0; off < N; off += 4) {
@@ -178,6 +201,7 @@ void test_indexer(Verdict& v) {
         Dev<char> wa(indexer_workspace_bytes(n_comp)), wb(indexer_batch_workspace_bytes(N, n_comp));
         IndexerArgs a;
         a.mode = mode; a.ratio = 2; a.n_comp = n_comp; a.w_q = wq.p; a.w_proj = wp.p; a.rope_freq = dfreq.p; a.comp_ik = dik.p;
+        a.format = g_fmt;
         a.cand_blocks = 40;
         IndexerArgs b = a;
         a.cand_ids = ca.p; a.cand_n = cna.p; a.out_ids = ia.p; a.out_n = na.p;
@@ -215,7 +239,8 @@ void bench() {
     bench_line("gemm_bf16 5120->512 T=1024",
                bench_stream_us([&](void* s) { gemm_bf16(wkv.p, x.p, T, D, kLatent, y.p, s); }, 50),
                (double) T * D * 4 + 512.0 * D * 2);
-    Dev<uint16_t> dik(std::vector<uint16_t>((size_t) n_comp * kIdxDim, 0x3c00)), wp(rand_bf16((size_t) kIdxHeads * D, 55, 0.03f));
+    Dev<uint8_t> dik(packed_rows(n_comp, kIdxDim, kIdxRowBytes, Round::Fp4Pow2, 56));
+    Dev<uint16_t> wp(rand_bf16((size_t) kIdxHeads * D, 55, 0.03f));
     std::vector<int32_t> pos(T);
     for (int i = 0; i < T; ++i) pos[i] = 2 * n_comp - T + i;
     Dev<int32_t> dpos(pos), ids((size_t) T * kTopK), nn(T), cand((size_t) T * kMaxCandBlocks), cn(T);
@@ -226,7 +251,7 @@ void bench() {
     a.comp_ik = dik.p; a.cand_ids = cand.p; a.cand_n = cn.p; a.out_ids = ids.p; a.out_n = nn.p;
     bench_line("indexer_select_batch Level1 T=1024",
                bench_stream_us([&](void* s) { indexer_select_batch(a, qr.p, x.p, dpos.p, T, ws.p, s); }, 10),
-               (double) n_comp * kIdxDim * 2);
+               (double) n_comp * kIdxRowBytes);
 }
 
 }  // namespace
@@ -234,9 +259,13 @@ void bench() {
 int main() {
     Verdict v;
     test_gemm(v);
-    test_window(v);
-    test_compress(v);
-    test_indexer(v);
+    for (CacheFormat f : {CacheFormat::Fp8, CacheFormat::Fp16}) {
+        g_fmt = f;
+        test_window(v);
+        test_compress(v);
+        test_indexer(v);
+    }
+    g_fmt = CacheFormat::Fp8;
     bench();
     std::printf(v.failures ? "FAILED\n" : "PASS\n");
     return v.failures ? 1 : 0;

@@ -2,6 +2,7 @@
 //
 // Per layer: Engram (on its layers), hyper-connection mixes and collapse, attention, expansion, the FFN's mixes and
 // collapse, router, routed and shared experts, expansion. Prefill runs the same path token by token.
+#include "basalt/core/device.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/session.hpp"
 #include "basalt/ggml/ggml.h"
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "basalt/artifact/dequant.hpp"
+#include "models/deepseek41/engram_rows.hpp"
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -48,7 +50,6 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(DsModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
-        if (drafter_) drafter_->report();
         for (void* p : allocs_) cudaFree(p);
         if (h_next_) cudaFreeHost(h_next_);
         if (h_dfeat_) cudaFreeHost(h_dfeat_);
@@ -146,17 +147,26 @@ public:
         ops_ = make_kernel_ops(m_, err);
         if (!ops_) return false;
         dump_dir_ = m_.diag_dump();
-        if (m_.tiers().draft && !m_.pack().dspark.empty() && m_.sessions() == 1) {
-            // the drafter takes its memory before the tiers size themselves to what is left
-            const int device = m_.tiers().drafter_device >= 0 ? m_.tiers().drafter_device : m_.device();
-            // the ranking that says which experts each stage keeps ships beside the expert profiles
-            const std::string ranking = m_.tiers().profile_dir.empty() ? std::string()
-                : m_.tiers().profile_dir + "/deepseek41-" + std::to_string(g_.n_layers) + "x" + std::to_string(g_.n_expert) + "-dspark.prof";
-            drafter_ = DsparkDrafter::create(m_, device, ranking, m_.tiers().draft_experts, err);
-            if (!drafter_) return false;
-            basalt::log::info("basalt deepseek41", "drafter on GPU %d: %.2f GiB, %s, windows of at most %d tokens (--spec 0: off)", device,
-                              (double) drafter_->device_bytes() / (1ull << 30), drafter_->kept().c_str(),
-                              std::min(max_window(), kDsparkBlock + 1));
+        if (m_.tiers().draft && !m_.pack().dspark.empty()) {
+            // one drafter for every session, made by the first: it takes its memory before the tiers size themselves
+            drafter_ = m_.shared_drafter().lock();
+            if (!drafter_) {
+                const int device = m_.tiers().drafter_device >= 0 ? m_.tiers().drafter_device : m_.device();
+                // the ranking that says which experts each stage keeps ships beside the expert profiles
+                const std::string ranking = m_.tiers().profile_dir.empty() ? std::string()
+                    : m_.tiers().profile_dir + "/deepseek41-" + std::to_string(g_.n_layers) + "x" + std::to_string(g_.n_expert) + "-dspark.prof";
+                drafter_ = DsparkDrafter::create(m_, device, ranking, m_.tiers().draft_experts, m_.sessions(), err);
+                if (!drafter_) return false;
+                m_.shared_drafter() = drafter_;
+                basalt::log::info("basalt deepseek41", "drafter on GPU %d: %.2f GiB, %s, windows of at most %d tokens (--spec 0: off)", device,
+                                  (double) drafter_->device_bytes() / (1ull << 30), drafter_->kept().c_str(),
+                                  std::min(max_window(), kDsparkBlock + 1));
+            }
+            dwin_ = drafter_->open_window();
+            if (dwin_ < 0) {
+                err = "deepseek41: more sessions than the drafter has windows";
+                return false;
+            }
             const size_t ff = (size_t) drafter_->feature_floats();
             if (!buf(dfeat_, ff * kDsparkWindow) ||
                 cudaHostAlloc((void**) &h_dfeat_, ff * kDsparkWindow * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
@@ -167,13 +177,13 @@ public:
         return true;
     }
 
-    int max_window() const override { return m_.sessions() > 1 ? 1 : std::clamp(m_.tiers().spec, 1, kMaxWindow); }
+    int max_window() const override { return std::clamp(m_.tiers().spec, 1, kMaxWindow); }
 
     model::Result draft_begin(int32_t anchor, int64_t pos) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
         std::string err;
         ops_->commit_window(pos, stream_);
-        if (!flush_features(pos, err) || !drafter_->draft_begin(anchor, pos, std::min(max_window() - 1, kDsparkBlock), err))
+        if (!flush_features(pos, err) || !drafter_->draft_begin(dwin_, anchor, pos, std::min(max_window() - 1, kDsparkBlock), err))
             return {model::Status::Error, err};
         ops_->end_window(true);   // the copies queued behind the drafter's inputs run while it drafts
         return {};
@@ -282,7 +292,7 @@ public:
         whole_from_ = 0;
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         feat_n_ = 0;
-        if (drafter_) drafter_->forget_from(pos);
+        if (drafter_) drafter_->forget_from(dwin_, pos);
         return {};
     }
 
@@ -337,8 +347,8 @@ public:
     std::string info_words() const override {
         std::string e;
         ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
-        return t == nullptr ? std::string("kv=fp16")
-                            : "expert_slots=" + std::to_string(t->slots()) + " kv=fp16 " + program::spill_words(t->spill());
+        const std::string kv = m_.cache_format() == CacheFormat::Fp8 ? "kv=fp8+fp4" : "kv=fp16";
+        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill());
     }
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }
@@ -356,7 +366,7 @@ public:
         std::string e;
         if (!ops_->ensure_positions(positions, e) || !ops_->restore_cache(stream_, kv, e)) return {model::Status::Error, e};
         feat_n_ = 0;
-        if (drafter_) drafter_->reset();
+        if (drafter_) drafter_->reset(dwin_);
         return {};
     }
 
@@ -401,7 +411,12 @@ public:
 
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) override {
         std::string err;
-        vision::Image img;
+        if (!image_) {   // this slot's image buffers, allocated with the tier
+            ExpertTier* tier = ops_ ? ops_->expert_tier(err) : nullptr;
+            image_ = tier ? tier->host().take_image() : nullptr;
+            if (!image_) return {model::Status::Error, err.empty() ? "deepseek41: no image buffers for this slot" : err};
+        }
+        vision::Image& img = image_->picture;
         if (!vision::decode_image(data, bytes, img, err)) return {model::Status::Error, err};
         if (!vis_) {
             release_short_prompt();
@@ -420,12 +435,12 @@ public:
                 size_t free_b = 0, total_b = 0;
                 return !t || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
             };
-            bool opened = vis_->init(mp, std::max(pl.n_patches(), 4096), err) && above_floor();
+            bool opened = vis_->init(mp, std::max(pl.n_patches(), 4096), m_.vision_blas(), err) && above_floor();
             if (!opened && t) {
                 vis_ = std::make_unique<VisionEncoder>();
                 t->lend_all();
                 err.clear();
-                opened = vis_->init(mp, std::max(pl.n_patches(), 4096), err);
+                opened = vis_->init(mp, std::max(pl.n_patches(), 4096), m_.vision_blas(), err);
                 if (opened && !above_floor()) {
                     opened = false;
                     err = "not enough free device memory for the image encoder above the VRAM reserve";
@@ -436,7 +451,7 @@ public:
             vis_min_pixels_ = mp.hp().min_pixels;
         }
         const VisionPlan pl = plan_image(img.w, img.h, vis_merge_, vis_min_pixels_);
-        std::vector<float> patches;
+        std::vector<float>& patches = image_->patches;
         image_patches(img, pl, patches);
         if (!vis_->encode(patches, pl, rows, err)) { images_done(); return {model::Status::Error, err}; }
         n_rows = pl.n_tokens();
@@ -484,9 +499,10 @@ private:
     // the card). The estimate picks the first size to try, and the free memory left after the allocation confirms it.
     bool make_prefill_fit(int tokens, std::string& err) {
         const prefillp::Dims d = m_.prompt_dims();
-        size_t free_b = 0, total_b = 0;
-        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-            err = "deepseek41: cannot read the free device memory";
+        uint64_t free_b = 0, total_b = 0;
+        std::string why;
+        if (!core::device_memory(-1, free_b, total_b, why)) {
+            err = "deepseek41: cannot read the free device memory: " + why;
             return false;
         }
         // the reserve stays free through the read: the chunk halves to fit above it
@@ -534,7 +550,7 @@ private:
         // the tier opens at its normal size before anything else takes the card; the workspaces size to what is left
         ExpertTier* t = ops_->expert_tier(e);
         if (!t || prefill_) return;
-        short_prompt_ = t->has_homes() && n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
+        short_prompt_ = n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
         if (!short_prompt_) t->shrink();
     }
     void settle_tier() {
@@ -589,7 +605,7 @@ private:
             err = "deepseek41: cannot read the drafter's features";
             return false;
         }
-        return drafter_->inject(feat_pos0_, q, h_dfeat_, err);
+        return drafter_->inject(dwin_, feat_pos0_, q, h_dfeat_, err);
     }
 
     bool device_bias(float*& dev, const float* host, std::string& err) {
@@ -814,7 +830,7 @@ private:
         if (pos == 0) whole_from_ = 0;
         if (ops_) ops_->commit_window(pos, stream_);
         if (ops_ && pos == 0) ops_->trim_positions();
-        if (pos == 0 && drafter_) drafter_->reset();
+        if (pos == 0 && drafter_) drafter_->reset(dwin_);
         if (pos > 0 && (int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
     }
 
@@ -830,7 +846,7 @@ private:
             hist_.clear();
             whole_from_ = 0;
             ops_->reset();
-            if (drafter_) drafter_->reset();
+            if (drafter_) drafter_->reset(dwin_);
         }
         if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
         hist_.resize((size_t) pos);   // a position before the end drops the rejected rows of a window
@@ -884,11 +900,8 @@ private:
         // while its experts run; the Engram layer's head then only adds the result.
         const auto engram_rows = [&](size_t k) {
             if (!m_.engram_reader().collect(tickets[k], err)) return false;
-            const int blocks = 256 / 32;
             for (int r = 0; r < n_cols * T; ++r)
-                for (int b = 0; b < blocks; ++b)
-                    dequantize_iq4_nl(raw[k].data() + (size_t) r * en.row_bytes + (size_t) b * 18,
-                                      erow_h_[k] + (size_t) r * 256 + (size_t) b * 32);
+                engram_row_f32(en.type, en.row_values, raw[k].data() + (size_t) r * en.row_bytes, erow_h_[k] + (size_t) r * 256);
             return true;
         };
         const auto engram_project = [&](size_t k, int il, void* s) {
@@ -1036,7 +1049,9 @@ private:
     bool fused_ = false;
     void* q8_ = nullptr;
     // the drafter and the main model's side of its feature hand-off
-    std::unique_ptr<DsparkDrafter> drafter_;
+    std::shared_ptr<DsparkDrafter> drafter_;
+    int dwin_ = 0;               // this session's window in the drafter
+    PromptHost::Image* image_ = nullptr;   ///< this slot's image buffers
     float* dfeat_ = nullptr;     // [rows][target layers][n_embd]
     float* h_dfeat_ = nullptr;
     int64_t feat_pos0_ = 0;      // the first position of the rows in dfeat_ that await the drafter, and how many

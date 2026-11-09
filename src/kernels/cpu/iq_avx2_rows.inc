@@ -254,6 +254,146 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
 }
 
+// ---- IQ3_S (21), IQ3_XXS (18) and IQ2_S (22) a 64-value group at a time: both halves' grid indices in one
+// vector, their grid rows gathered, sign bytes broadcast from the block, the block's scales decoded once, the halves
+// into two accumulators.  The int32 lane sums are row_dot's, added in another order, so every float operation and its
+// operands are unchanged and the output is bitwise row_dot's.
+
+// 32 sign bits at p -> 32 bytes of -1 (bit set) / +1, as sgn_vec
+inline __m256i sgn_at(const uint8_t* p, __m256i spread, __m256i bsel, __m256i one8) {
+    const __m256i b = _mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(p)), spread);
+    return _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(b, bsel), bsel), one8);
+}
+
+struct SgnConsts {
+    __m256i spread = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                                      2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    __m256i bsel = _mm256_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char) 0x80, 1, 2, 4, 8, 16, 32, 64, (char) 0x80,
+                                    1, 2, 4, 8, 16, 32, 64, (char) 0x80, 1, 2, 4, 8, 16, 32, 64, (char) 0x80);
+    __m256i one8 = _mm256_set1_epi8(1);
+};
+
+// one 64-value group's two halves for every token: g the grid magnitudes, s the signs, c the int16 scales
+template <int NT>
+inline void group_tokens(__m256i (&acc)[NT][2], const block_q8_K* const* y, int i, int off, __m256i g0, __m256i s0,
+                         __m256i c0, __m256i g1, __m256i s1, __m256i c1) {
+    for (int t = 0; t < NT; ++t) {
+        const int8_t* yq = y[t][i].qs + off;
+        acc[t][0] = iq_acc(acc[t][0], _mm256_maddubs_epi16(g0, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) yq), s0)), c0);
+        acc[t][1] = iq_acc(acc[t][1], _mm256_maddubs_epi16(g1, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) (yq + 32)), s1)), c1);
+    }
+}
+
+template <int NT>
+inline void block_finish(__m256 (&accf)[NT], const __m256i (&acc)[NT][2], const block_q8_K* const* y, int i, float dx) {
+    for (int t = 0; t < NT; ++t)
+        accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(_mm256_add_epi32(acc[t][0], acc[t][1])),
+                                  accf[t]);
+}
+
+template <int NT>
+inline void row_dot_iq3s(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    const SgnConsts k;
+    const __m256i shl = _mm256_setr_epi32(8, 7, 6, 5, 4, 3, 2, 1), shr = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    const __m256i bit8 = _mm256_set1_epi32(0x100);
+    const __m128i m4 = _mm_set1_epi8(0xf), m1 = _mm_set1_epi8(1);
+    __m256 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * Fmt32<21>::bytes;
+        rows_ahead(blk + prefetch_ahead);
+        // half 2j + h takes nibble h of scales[j], as 2 * nibble + 1
+        alignas(16) int16_t scl[8];
+        const __m128i s = _mm_cvtsi32_si128((int) u32(blk + 106));
+        const __m128i nib = _mm_unpacklo_epi8(_mm_and_si128(s, m4), _mm_and_si128(_mm_srli_epi16(s, 4), m4));
+        _mm_store_si128((__m128i*) scl, _mm_cvtepu8_epi16(_mm_add_epi8(_mm_add_epi8(nib, nib), m1)));
+        __m256i acc[NT][2];
+        for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = _mm256_setzero_si256();
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t* q = blk + 2 + 16 * j;
+            // bit k of qh[2j] (qh[2j + 1]) is bit 8 of index k of the first (second) half
+            const __m256i hw = _mm256_set1_epi32((int) u16(blk + 66 + 2 * j));
+            const __m256i i0 = _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) q)),
+                                               _mm256_and_si256(_mm256_sllv_epi32(hw, shl), bit8));
+            const __m256i i1 = _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) (q + 8))),
+                                               _mm256_and_si256(_mm256_srlv_epi32(hw, shr), bit8));
+            const __m256i g0 = _mm256_i32gather_epi32((const int*) iq3s_grid, i0, 4);
+            const __m256i g1 = _mm256_i32gather_epi32((const int*) iq3s_grid, i1, 4);
+            group_tokens<NT>(acc, y, i, 64 * j, g0, sgn_at(blk + 74 + 8 * j, k.spread, k.bsel, k.one8),
+                             _mm256_set1_epi16(scl[2 * j]), g1, sgn_at(blk + 78 + 8 * j, k.spread, k.bsel, k.one8),
+                             _mm256_set1_epi16(scl[2 * j + 1]));
+        }
+        block_finish<NT>(accf, acc, y, i, h2f(u16(blk)) * Fmt32<21>::K);
+    }
+    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+}
+
+template <int NT>
+inline void row_dot_iq3xxs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    __m256 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * Fmt32<18>::bytes;
+        rows_ahead(blk + prefetch_ahead);
+        __m256i acc[NT][2];
+        for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = _mm256_setzero_si256();
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t* q = blk + 2 + 16 * j;
+            const uint32_t w0 = u32(blk + 66 + 8 * j), w1 = u32(blk + 70 + 8 * j);   // the halves' sign/scale words
+            const __m256i g0 = _mm256_i32gather_epi32((const int*) iq3xxs_grid,
+                                                      _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) q)), 4);
+            const __m256i g1 = _mm256_i32gather_epi32((const int*) iq3xxs_grid,
+                                                      _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) (q + 8))), 4);
+            const __m256i s0 = _mm256_set_epi64x((long long) even_signs.v[(w0 >> 21) & 127], (long long) even_signs.v[(w0 >> 14) & 127],
+                                                 (long long) even_signs.v[(w0 >> 7) & 127], (long long) even_signs.v[w0 & 127]);
+            const __m256i s1 = _mm256_set_epi64x((long long) even_signs.v[(w1 >> 21) & 127], (long long) even_signs.v[(w1 >> 14) & 127],
+                                                 (long long) even_signs.v[(w1 >> 7) & 127], (long long) even_signs.v[w1 & 127]);
+            group_tokens<NT>(acc, y, i, 64 * j, g0, s0, sc32(2 * (int) (w0 >> 28) + 1), g1, s1, sc32(2 * (int) (w1 >> 28) + 1));
+        }
+        block_finish<NT>(accf, acc, y, i, h2f(u16(blk)) * Fmt32<18>::K);
+    }
+    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+}
+
+template <int NT>
+inline void row_dot_iq2s(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    static const uint8_t k_sc[128] = {   // half H -> scale bytes 2H (lanes 0-7), 2H+1 (lanes 8-15)
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+        4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
+        8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+        12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15 };
+    const SgnConsts k;
+    // lanes 0-3 take the first half's qh byte, 4-7 the second's; index k's bits 8-9 are bits 2k, 2k+1 of it
+    const __m256i hsel = _mm256_setr_epi32(0, 0, 0, 0, 8, 8, 8, 8), hsh = _mm256_setr_epi32(8, 6, 4, 2, 8, 6, 4, 2);
+    const __m256i m300 = _mm256_set1_epi32(0x300);
+    const __m128i m4 = _mm_set1_epi8(0xf), m1 = _mm_set1_epi8(1);
+    __m256 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * Fmt32<22>::bytes;
+        rows_ahead(blk + prefetch_ahead);
+        __m128i st = _mm_set1_epi64x((long long) u64(blk + 74));
+        st = _mm_unpacklo_epi8(_mm_and_si128(st, m4), _mm_and_si128(_mm_srli_epi16(st, 4), m4));
+        const __m128i scales = _mm_add_epi8(_mm_slli_epi16(st, 1), m1);
+        __m256i acc[NT][2];
+        for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = _mm256_setzero_si256();
+        for (int j = 0; j < 4; ++j) {
+            const __m256i hw = _mm256_srlv_epi32(_mm256_set1_epi32((int) u16(blk + 66 + 2 * j)), hsel);
+            const __m256i idx = _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) (blk + 2 + 8 * j))),
+                                                _mm256_and_si256(_mm256_sllv_epi32(hw, hsh), m300));
+            const __m256i g0 = _mm256_i32gather_epi64((const long long*) iq2s_grid, _mm256_castsi256_si128(idx), 8);
+            const __m256i g1 = _mm256_i32gather_epi64((const long long*) iq2s_grid, _mm256_extracti128_si256(idx, 1), 8);
+            group_tokens<NT>(acc, y, i, 64 * j,
+                             g0, sgn_at(blk + 34 + 8 * j, k.spread, k.bsel, k.one8),
+                             _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, _mm_loadu_si128((const __m128i*) k_sc + 2 * j))),
+                             g1, sgn_at(blk + 38 + 8 * j, k.spread, k.bsel, k.one8),
+                             _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, _mm_loadu_si128((const __m128i*) k_sc + 2 * j + 1))));
+        }
+        block_finish<NT>(accf, acc, y, i, h2f(u16(blk)) * Fmt32<22>::K);
+    }
+    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+}
+
 // ---- IQ2_XS (17) with ggml's vectorized sign decode (arch/x86/quants.c, ggml_vec_dot_iq2_xs_q8_K):
 // the 7-bit sign indices never touch ksigns_iq2xs - the 8th sign bit is reconstructed by parity (two
 // shifts, a xor and ggml's bit_helper pshufb) and the per-half sign vectors come out of shuffles of one
@@ -341,13 +481,51 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
 }
 
-template <int TY, int NT>
+template <int TY, int NT, int M>
 inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
-    if constexpr (TY == 17) row_dot_iq2xs<NT>(row, nblocks, y, res);
-    else                    row_dot<TY, NT>(row, nblocks, y, res);
+    if constexpr (TY == 17)                 row_dot_iq2xs<NT>(row, nblocks, y, res);
+    else if constexpr (TY == 21 && M == 1) row_dot_iq3s<NT>(row, nblocks, y, res);
+    else if constexpr (TY == 18 && M == 1) row_dot_iq3xxs<NT>(row, nblocks, y, res);
+    else if constexpr (TY == 22 && M == 1) row_dot_iq2s<NT>(row, nblocks, y, res);
+    else                                    row_dot<TY, NT>(row, nblocks, y, res);
 }
 
-template <int TY, int NT>
+// Gathered grid rows pay on Intel performance cores and lose on efficient ones (core type 0x20 in CPUID leaf 0x1a) and on
+// other vendors' cores: a hybrid part reads the calling thread's core type again every 64 calls, as the OS may move it.
+// The base build never gathers.
+inline bool core_gathers_fast() {
+    unsigned r[4] = {0, 0, 0, 0};
+    platform::cpuid(0x1a, 0, r);
+    return (r[0] >> 24) != 0x20;
+}
+
+inline bool gather_here() {
+#if BASALT_IQ_VNNI
+    static const int kind = [] {   // 0: every core gathers fast, 1: no core does, 2: hybrid
+        unsigned r[4] = {0, 0, 0, 0};
+        platform::cpuid(0, 0, r);
+        if (r[1] != 0x756e6547u) return 1;   // not "GenuineIntel": other vendors' gathers lose to the halves
+        if (r[0] < 0x1a) return 0;
+        platform::cpuid(7, 0, r);
+        if (((r[3] >> 15) & 1u) != 0) return 2;
+        return core_gathers_fast() ? 0 : 1;
+    }();
+    if (kind != 2) return kind == 0;
+    thread_local int left = 0;
+    thread_local bool fast = true;
+    if (--left < 0) {
+        fast = core_gathers_fast();
+        left = 63;
+    }
+    return fast;
+#else
+    return false;
+#endif
+}
+
+inline int rows_mode() { return gather_here() ? 1 : 0; }
+
+template <int TY, int NT, int M>
 void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, float* const* ff,
              int r0, int r1) {
     const block_q8_K* y[NT];
@@ -355,49 +533,49 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     const int nb = n / QK_K;
     float g[NT], u[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot_any<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
-        row_dot_any<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
+        row_dot_any<TY, NT, M>(blob + (size_t) r * gu_row, nb, y, g);
+        row_dot_any<TY, NT, M>(blob + up_off + (size_t) r * gu_row, nb, y, u);
         for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
     }
 }
 
-template <int TY, int NT>
+template <int TY, int NT, int M>
 void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     float res[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot_any<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        row_dot_any<TY, NT, M>(w + (size_t) r * row_bytes, n / QK_K, y, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
 
-template <int TY>
+template <int TY, int M>
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                 float* const* ff, int r0, int r1) {
     switch (nt) {
-        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 1: gu_rows<TY, 1, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 2: gu_rows<TY, 2, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 3: gu_rows<TY, 3, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 4: gu_rows<TY, 4, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 5: gu_rows<TY, 5, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 6: gu_rows<TY, 6, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 7: gu_rows<TY, 7, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        default: gu_rows<TY, 8, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
     }
 }
 
-template <int TY>
+template <int TY, int M>
 void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
                  int r1) {
     switch (nt) {
-        case 1: dot_rows<TY, 1>(w, row_bytes, n, act, out, r0, r1); break;
-        case 2: dot_rows<TY, 2>(w, row_bytes, n, act, out, r0, r1); break;
-        case 3: dot_rows<TY, 3>(w, row_bytes, n, act, out, r0, r1); break;
-        case 4: dot_rows<TY, 4>(w, row_bytes, n, act, out, r0, r1); break;
+        case 1: dot_rows<TY, 1, M>(w, row_bytes, n, act, out, r0, r1); break;
+        case 2: dot_rows<TY, 2, M>(w, row_bytes, n, act, out, r0, r1); break;
+        case 3: dot_rows<TY, 3, M>(w, row_bytes, n, act, out, r0, r1); break;
+        case 4: dot_rows<TY, 4, M>(w, row_bytes, n, act, out, r0, r1); break;
         default: for (int t0 = 0; t0 < nt; t0 += 4) {
             const int k = nt - t0 < 4 ? nt - t0 : 4;
-            dot_rows_nt<TY>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
+            dot_rows_nt<TY, M>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
         }
     }
 }
@@ -498,26 +676,44 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
 
 void BASALT_IQ_EXPORT(iq256_gu_rows)(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
-    switch (type) {
-        case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 23: gu_rows_nt<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+    BASALT_IQ_EXPORT(iq256_gu_rows_mode)(rows_mode(), type, blob, gu_row, up_off, n, act, nt, ff, r0, r1);
+}
+
+void BASALT_IQ_EXPORT(iq256_gu_rows_mode)(int mode, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+                                          const void* const* act, int nt, float* const* ff, int r0, int r1) {
+    const int m = (type == 18 || type == 21 || type == 22) ? mode : 0;
+    switch (type * 4 + m) {
+        case 16 * 4: gu_rows_nt<16, 0>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 17 * 4: gu_rows_nt<17, 0>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 18 * 4: gu_rows_nt<18, 0>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 18 * 4 + 1: gu_rows_nt<18, 1>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 21 * 4: gu_rows_nt<21, 0>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 21 * 4 + 1: gu_rows_nt<21, 1>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 22 * 4: gu_rows_nt<22, 0>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 22 * 4 + 1: gu_rows_nt<22, 1>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 23 * 4: gu_rows_nt<23, 0>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         default: break;
     }
 }
 
 void BASALT_IQ_EXPORT(iq256_rows)(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                 int r0, int r1) {
-    switch (type) {
-        case 16: dot_rows_nt<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 17: dot_rows_nt<17>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 18: dot_rows_nt<18>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 21: dot_rows_nt<21>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 22: dot_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 23: dot_rows_nt<23>(nt, w, row_bytes, n, act, out, r0, r1); break;
+    BASALT_IQ_EXPORT(iq256_rows_mode)(rows_mode(), type, w, row_bytes, n, act, nt, out, r0, r1);
+}
+
+void BASALT_IQ_EXPORT(iq256_rows_mode)(int mode, int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act,
+                                       int nt, float* const* out, int r0, int r1) {
+    const int m = (type == 18 || type == 21 || type == 22) ? mode : 0;
+    switch (type * 4 + m) {
+        case 16 * 4: dot_rows_nt<16, 0>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 17 * 4: dot_rows_nt<17, 0>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 18 * 4: dot_rows_nt<18, 0>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 18 * 4 + 1: dot_rows_nt<18, 1>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 21 * 4: dot_rows_nt<21, 0>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 21 * 4 + 1: dot_rows_nt<21, 1>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 22 * 4: dot_rows_nt<22, 0>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 22 * 4 + 1: dot_rows_nt<22, 1>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 23 * 4: dot_rows_nt<23, 0>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
 }

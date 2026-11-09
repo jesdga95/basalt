@@ -36,7 +36,9 @@ Each request ends with one `done` line:
 - `hit`: expert cache hit rate. `pcie`: share of routed experts read over PCIe.
 
 The engine's own `basalt ...` lines go to `~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits
-taken from the file); `[server] engine log: PATH` names it when the engine fails to start.
+taken from the file); `[server] engine log: PATH` names it when the engine fails to start. The folder also holds the conversation
+cache. Nothing is unpacked from the model file: the server reads the tokenizer from its sections, and the engine and `basalt-vision`
+read the vision projector inside it.
 
 ## The stats page
 
@@ -61,19 +63,25 @@ free RAM with 8 GiB to spare. `--idle-unload` ends the process instead.
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
 
 - `--vram-reserve-mib` below 256 is refused on Windows and WSL2 (128 on Linux): less free VRAM makes the driver page GPU memory.
-- With experts on the SSD, the RAM copy keeps a floor free for the OS file cache (`RAM floor ...` in the start log).
-- While serving, the RAM guard parks conversations to disk or drops them when free RAM falls. A request waits up to 30 s for RAM to
-  return. A running request stops with an error only when RAM is critical (under 1 GiB free, or below the guard under memory pressure).
+- `--ram-reserve-mib` (default 2048) is the RAM left free for the rest of the system. The engine allocates its host buffers
+  first, or holds their RAM when it page-locks them later; the expert tiers then take the free RAM less the reserve and less
+  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). When some experts stay in the file, the
+  tiers also leave the OS file cache they are read through a floor: one prompt chunk's file reads and two layers' share of
+  those experts, at least 4 GiB. Programs left idle beside a small reserve may be swapped out.
+- While serving, the RAM guard holds the reserve: below it, it parks conversations to disk or drops them. A request waits up to 30 s
+  for RAM to return. A running request stops with an error only when RAM is critical (under 1 GiB free, or below the reserve under
+  memory pressure). `--ram-reserve-mib 0` turns the guard off.
 - Experts on the SSD give one warning, the same for every model: `N experts on SSD (X GiB) · free X GiB RAM`. The console
   repeats it and the stats page turns its Experts block amber.
-- `--no-ram-guard` turns the guard off: nothing is shed, delayed or stopped for low RAM. The disk tier keeps its floor a GiB
-  above where the guard would sit.
+- The disk tier keeps its floor a GiB above the reserve.
 - `--resident-budget-gib` that would leave less than the floor is refused with the largest safe value.
 
 ## Vision: `--vision`
 
 `--vision off | dynamic | cpu | <GPU number>` (config: `"vision"` in `server`). The encoder is Basalt's own, and all modes give bitwise
-identical embeddings.
+identical embeddings. All of them read the projector in place from the model file's `vision/mmproj` section. The text can still
+differ between modes: the sidecar's VRAM cost shrinks the expert cache, and which experts run on the GPU or the CPU shifts the
+last bits of the logits, so a greedy answer can fork after some tokens (`dynamic` does the same with a different cache size).
 
 | Mode | Encoder runs | VRAM cost | Fresh-image TTFT (IQ3_S, 400 W): 1k / 3k / 4k image tokens |
 | --- | --- | --- | --- |

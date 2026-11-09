@@ -53,7 +53,8 @@ public:
     bool prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, std::string& err);
     bool fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive = false);
     /// A tier whose owner keeps the experts' places and fills the slots itself: no expert source, no adaptation.
-    /// `rows`: the pinned, portable, mapped host rows a share lands in.
+    /// `rows`: the pinned, portable, mapped host rows a share lands in; a share's activations are pinned, portable
+    /// and mapped too.
     bool open_plain(int device, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, float* rows, std::string& err);
     /// The device bytes free for expert slots.
     uint64_t room() const;
@@ -61,11 +62,15 @@ public:
     bool open_slots(const std::vector<int64_t>& slot_bytes, std::string& err);
     void admit(int64_t layer, int64_t expert, int32_t slot) { res_[(size_t) (layer * n_expert_ + expert)] = slot; }
     bool fill_slot(int32_t slot, const uint8_t* src, uint64_t bytes);
-    /// Queues a copy of a blob of this card into pinned, portable host memory; `read_wait` waits for those queued.
-    void read_slot(const uint8_t* blob, uint8_t* dst, uint64_t bytes);
     /// Queues, in this order, a copy of a slot's blob into `out` and of `in` into the slot (both pinned, portable host
-    /// memory); `read_wait` waits for those queued too.
+    /// memory); `read_wait` waits for those queued.
     void exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes);
+    /// One piece of an exchange, queued on the same stream: bytes [off, off + n) of the slot out to `out + off`, or of
+    /// `in + off` into the slot.
+    void slot_out(int32_t slot, uint8_t* out, uint64_t off, uint64_t n);
+    void slot_in(int32_t slot, const uint8_t* in, uint64_t off, uint64_t n);
+    /// The copies queued from now on start after `ev` (an event of any card).
+    void copies_after(cudaEvent_t ev);
     bool read_wait(std::string& err);
     /// One token's share over the pinned activation `x`, in the layout given; the rows land in open_plain's rows.
     bool launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t k,
@@ -74,12 +79,6 @@ public:
     /// ids[t * k + j] over row t where kind says so; the rows land at that entry of open_plain's rows.
     bool launch_window(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
                        int64_t k, const int32_t* kind, std::string& err);
-    /// `n` rows, each with its own activation in `x` (pinned, portable): entry i computes expert ids[i] over x[i] and its row
-    /// lands at out[i], `out` as this card addresses mapped host memory (`map_rows`). At most kRowBatch entries; `finish` waits.
-    static constexpr int64_t kRowBatch = 80;
-    bool launch_rows(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n, float* out,
-                     std::string& err);
-    float* map_rows(float* host, std::string& err);
     /// A slot's bytes for an expert of `layer`.
     static uint64_t slot_bytes(int64_t layer);
     void close();
@@ -201,6 +200,9 @@ private:
     bool launched_direct_ = false;
     int64_t n_embd_ = 0;                              ///< activation width of the launched shares
     float* rows_map_ = nullptr;                       ///< open_plain's rows as this card addresses them
+    void* meta_map_ = nullptr;                        ///< open_plain: the plan staging as this card addresses it
+    const float* x_host_ = nullptr;                   ///< open_plain: the last activations launched, and as this card
+    const float* x_map_ = nullptr;                    ///< addresses them
     bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
                        int64_t k, const int32_t* kind, std::string& err, float* out);
 };
