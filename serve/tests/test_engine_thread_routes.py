@@ -64,6 +64,14 @@ class Routes(unittest.TestCase):
         self.assertEqual((s, b), (200, {"shared_prefix_tokens": 2}))
         self.assertEqual(self.engine.tapes["c"], ("v0", [1, 2]))
 
+    def test_bad_names_are_refused_without_taking_the_engine(self):
+        self.svc.fifo.acquire()                      # a busy engine: a valid request would answer 503, a bad one 409
+        try:
+            s, _ = self.post("/v1/engine/threads/fork", {"parent": "p", "parent_head": "v1", "child": "c c", "child_head": "v0"})
+        finally:
+            self.svc.fifo.release()
+        self.assertEqual(s, 409)
+
     def test_errors(self):
         self.assertEqual(self.post("/v1/engine/threads/fork", {"parent": "x"})[0], 422)
         self.assertEqual(self.post("/v1/engine/threads/fork", {"parent": "nope", "parent_head": "v1", "child": "c2", "child_head": "v0"})[0], 409)

@@ -682,6 +682,9 @@ class Service:
         fork = getattr(self.engine, "thread_fork", None)
         if fork is None:
             raise ValueError("this engine has no native thread tapes")
+        name = getattr(self.engine, "_THREAD_NAME", None)       # a bad request is refused before it waits for the engine
+        if name is not None and not all(isinstance(n, str) and name.fullmatch(n) for n in (parent, parent_head, child, child_head)):
+            raise ValueError("thread and head names are 1..128 characters of A-Z a-z 0-9 - _")
         return self._thread_engine_call(lambda: fork(parent, parent_head, child, child_head, keep))
 
     def _note_best(self, r: dict) -> None:
