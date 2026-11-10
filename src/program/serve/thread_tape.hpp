@@ -57,6 +57,37 @@ public:
         e.head=next;
         return {true,"appended"};
     }
+    // Fork: the child starts as a copy of the parent's tape at `keep` tokens (0 = whole tape).
+    // The child shares the token prefix, so the exact-prefix KV check reuses the parent's cache.
+    // Same child id + same result is idempotent; a different result is a conflict.
+    Result fork(const std::string& parent, const std::string& parent_head,
+                const std::string& child, const std::string& child_head, size_t keep) {
+        if (!valid_name(parent) || !valid_name(child) || !valid_name(parent_head) ||
+            !valid_name(child_head) || parent == child)
+            return {false, "invalid fork identity"};
+        auto p = tapes_.find(parent);
+        if (p == tapes_.end()) return {false, "unknown thread tape"};
+        if (p->second.head != parent_head) return {false, "stale thread tape head"};
+        if (keep == 0) keep = p->second.ids.size();
+        if (keep > p->second.ids.size()) return {false, "fork point beyond tape"};
+        std::vector<int32_t> ids(p->second.ids.begin(), p->second.ids.begin() + (std::ptrdiff_t) keep);
+        auto c = tapes_.find(child);
+        if (c != tapes_.end())
+            return c->second.head == child_head && c->second.ids == ids
+                ? Result{true, "already forked"} : Result{false, "fork conflict; release before replacing"};
+        if (tapes_.size() >= max_threads_) return {false, "thread tape capacity reached"};
+        tapes_.emplace(child, Entry{child_head, std::move(ids)});
+        return {true, "forked"};
+    }
+    // Length of the common token prefix of two tapes (what a fork pair can share in KV).
+    size_t shared_prefix(const std::string& a, const std::string& b) const {
+        auto x = tapes_.find(a), y = tapes_.find(b);
+        if (x == tapes_.end() || y == tapes_.end()) return 0;
+        const auto& u = x->second.ids; const auto& v = y->second.ids;
+        size_t n = 0;
+        while (n < u.size() && n < v.size() && u[n] == v[n]) ++n;
+        return n;
+    }
     const std::vector<int32_t>* get(const std::string& id, const std::string& head) const {
         auto it=tapes_.find(id);
         if (it==tapes_.end() || it->second.head!=head) return nullptr;

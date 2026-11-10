@@ -225,6 +225,23 @@ Flow Runtime::dispatch() {
             std::fflush(stdout);
             return Flow::next;
         }
+        if (command == "THREAD_FORK") {
+            // THREAD_FORK <parent> <parent_head> <child> <child_head> [keep_tokens]
+            std::string child, child_head;
+            long long keep = 0;
+            in >> head >> child >> child_head;
+            if (in >> keep && keep < 0) keep = -1;
+            if (in >> extra || keep < 0) {
+                std::printf("ERR THREAD: bad fork arguments\n");
+            } else {
+                const auto r = thread_tapes.fork(id, head, child, child_head, (size_t) keep);
+                if (!r.ok) std::printf("ERR THREAD: %s\n", r.why);
+                else std::printf("THREAD_OK THREAD_FORK %s %s %zu\n", id.c_str(), child.c_str(),
+                                 thread_tapes.shared_prefix(id, child));
+            }
+            std::fflush(stdout);
+            return Flow::next;
+        }
         if (command == "THREAD_RELEASE") {
             if (in >> extra || !NativeThreadTapes::valid_name(id))
                 std::printf("ERR THREAD: bad release identity\n");
