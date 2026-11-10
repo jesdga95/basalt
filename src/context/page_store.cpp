@@ -1,214 +1,272 @@
-// src/context/page_store.cpp - see include/basalt/context/page_store.hpp.
 #include "basalt/context/page_store.hpp"
+#include "basalt/context/fingerprint.hpp"
 
-#include "basalt/context/hash.hpp"
-#include "basalt/platform/host_allocator.hpp"
-
+#include <algorithm>
 #include <cstring>
+#include <shared_mutex>
 
 namespace basalt::context {
+namespace {
 
-struct PageStore::Page {
-    uint8_t* data = nullptr;
-    Digest digest{};
-    bool sealed = false;
-    uint32_t refs = 0;   // segment slots holding this page
-};
+std::string page_name(const ContextId& id, size_t page) { return "page " + std::to_string(page) + " of " + id; }
 
-struct PageStore::Segment {
-    ContextId owner;
-    StateKind kind = StateKind::kv;
-    uint32_t part = 0;
-    std::vector<uint64_t> pages;
-};
+}  // namespace
 
-PageStore::PageStore(uint64_t page_bytes, uint64_t budget_bytes)
-    : page_bytes_(page_bytes), budget_bytes_(budget_bytes) {}
-
-PageStore::~PageStore() {
-    for (auto& [id, page] : pages_) basalt::platform::release_host_buffer(page.data, kPageAlign);
-}
-
-uint64_t PageStore::take_page_locked() {
-    const uint64_t cap = budget_bytes_ / page_bytes_;
-    if (used_pages_ >= cap) return 0;
-    void* p = basalt::platform::allocate_host_buffer(page_bytes_, kPageAlign);
-    if (p == nullptr) return 0;
-    std::memset(p, 0, page_bytes_);
-    const uint64_t id = next_page_++;
-    pages_[id] = Page{static_cast<uint8_t*>(p), {}, false, 1};
-    ++used_pages_;
-    return id;
-}
-
-void PageStore::drop_slot_locked(uint64_t page_id) {
-    auto it = pages_.find(page_id);
-    if (it == pages_.end()) return;
-    if (--it->second.refs > 0) return;
-    if (it->second.sealed) {
-        const auto sit = sealed_.find(it->second.digest);
-        if (sit != sealed_.end() && sit->second == page_id) sealed_.erase(sit);
+const char* page_status_name(PageStatus s) {
+    switch (s) {
+        case PageStatus::ok: return "ok";
+        case PageStatus::not_open: return "not_open";
+        case PageStatus::invalid_argument: return "invalid_argument";
+        case PageStatus::unknown_context: return "unknown_context";
+        case PageStatus::context_exists: return "context_exists";
+        case PageStatus::out_of_range: return "out_of_range";
+        case PageStatus::read_only: return "read_only";
+        case PageStatus::budget: return "budget";
+        case PageStatus::digest_mismatch: return "digest_mismatch";
     }
-    basalt::platform::release_host_buffer(it->second.data, kPageAlign);
+    return "unknown";
+}
+
+Digest page_digest(const void* data, size_t bytes) {
+    return DomainHash("basalt/context/page/v1").u64(bytes).bytes(data, bytes).finish();
+}
+
+// `mu` excludes the context's writers from its readers, forks and seals; the table itself changes under the store's.
+struct PageStore::Ctx {
+    mutable std::shared_mutex mu;
+    std::vector<PageId> table;
+    bool frozen = false;
+    bool dead = false;
+};
+
+PageResult PageStore::fail(PageStatus s, std::string reason) const { return PageResult{s, std::move(reason)}; }
+
+std::shared_ptr<PageStore::Ctx> PageStore::find(const ContextId& id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto it = contexts_.find(id);
+    return it == contexts_.end() ? nullptr : it->second;
+}
+
+PageResult PageStore::open(void* base, size_t bytes, size_t page_bytes) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!pages_.empty() || !contexts_.empty()) return fail(PageStatus::invalid_argument, "pages or contexts are live");
+    // Whole slots on the arena's alignment: freed slots tile, so a free slot always has a page-sized range.
+    const size_t slot = page_bytes > SIZE_MAX - 255 ? 0 : (page_bytes + 255) & ~size_t(255);
+    const size_t skip = base ? (256 - reinterpret_cast<uintptr_t>(base) % 256) % 256 : 0;
+    const size_t usable = !slot || bytes < skip ? 0 : (bytes - skip) / slot * slot;
+    if (!base || usable == 0)
+        return fail(PageStatus::invalid_argument, "range of " + std::to_string(bytes) + " B cannot hold a page of " +
+                                                      std::to_string(page_bytes) + " B");
+    if (!arena_.reset(static_cast<uint8_t*>(base) + skip, usable))
+        return fail(PageStatus::invalid_argument, "range still holds pages");
+    page_bytes_ = page_bytes;
+    slot_bytes_ = slot;
+    open_ = true;
+    stats_ = {};
+    return {};
+}
+
+PageResult PageStore::create(const ContextId& id, size_t pages) {
+    if (!valid_context_id(id)) return fail(PageStatus::invalid_argument, "invalid context id");
+    if (pages == 0) return fail(PageStatus::invalid_argument, "a context needs at least one page slot");
+    auto ctx = std::make_shared<Ctx>();
+    ctx->table.assign(pages, 0);
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!open_) return fail(PageStatus::not_open, "page store is not open");
+    if (!contexts_.emplace(id, std::move(ctx)).second) return fail(PageStatus::context_exists, id + " exists");
+    return {};
+}
+
+PageResult PageStore::add(const ContextId& source, const ContextId& child, bool frozen) {
+    if (!valid_context_id(child)) return fail(PageStatus::invalid_argument, "invalid context id");
+    const auto src = find(source);
+    if (!src) return fail(PageStatus::unknown_context, "no context " + source);
+    std::shared_lock<std::shared_mutex> sl(src->mu);  // no write of the source lands mid-fork
+    std::lock_guard<std::mutex> lk(mu_);
+    if (src->dead) return fail(PageStatus::unknown_context, "no context " + source);
+    if (contexts_.count(child)) return fail(PageStatus::context_exists, child + " exists");
+    auto ctx = std::make_shared<Ctx>();
+    ctx->table = src->table;
+    ctx->frozen = frozen;
+    contexts_.emplace(child, std::move(ctx));
+    for (PageId p : src->table)
+        if (p) ++pages_.at(p).refs;
+    return {};
+}
+
+PageResult PageStore::fork(const ContextId& parent, const ContextId& child) { return add(parent, child, false); }
+PageResult PageStore::lease(const ContextId& source, const ContextId& lease) { return add(source, lease, true); }
+
+void PageStore::unref_locked(PageId id) {
+    const auto it = pages_.find(id);
+    if (--it->second.refs) return;
+    if (it->second.sealed) sealed_.erase(it->second.digest);  // a sealed page is the one its digest keys
+    arena_.release(it->second.data);
     pages_.erase(it);
-    --used_pages_;
 }
 
-uint32_t PageStore::create_segment(const ContextId& owner, StateKind kind, uint32_t part) {
-    std::lock_guard<std::mutex> lock(mu_);
-    const uint32_t id = next_segment_++;
-    segments_[id] = Segment{owner, kind, part, {}};
-    return id;
+PageResult PageStore::remove(const ContextId& id) {
+    const auto ctx = find(id);
+    if (!ctx) return fail(PageStatus::unknown_context, "no context " + id);
+    std::unique_lock<std::shared_mutex> xl(ctx->mu);  // waits out the context's reads and writes
+    std::lock_guard<std::mutex> lk(mu_);
+    if (ctx->dead) return fail(PageStatus::unknown_context, "no context " + id);
+    ctx->dead = true;
+    contexts_.erase(id);
+    for (PageId p : ctx->table)
+        if (p) unref_locked(p);
+    ctx->table.clear();
+    return {};
 }
 
-bool PageStore::has_segment(uint32_t segment) const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return segments_.count(segment) > 0;
+uint8_t* PageStore::allocate_locked(PageResult& why) {
+    if (void* p = arena_.allocate(slot_bytes_)) return static_cast<uint8_t*>(p);
+    ++stats_.rejections;
+    const auto s = arena_.stats();
+    why = fail(PageStatus::budget, "page store budget exhausted: need " + std::to_string(slot_bytes_) + " B, " +
+                                       std::to_string(s.used) + " of " + std::to_string(s.capacity) + " B in use");
+    return nullptr;
 }
 
-bool PageStore::segment_info(uint32_t segment, ContextId& owner, StateKind& kind, uint32_t& part) const {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto it = segments_.find(segment);
-    if (it == segments_.end()) return false;
-    owner = it->second.owner;
-    kind = it->second.kind;
-    part = it->second.part;
-    return true;
-}
-
-bool PageStore::append_page(uint32_t segment) {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto sit = segments_.find(segment);
-    if (sit == segments_.end()) return false;
-    const uint64_t id = take_page_locked();
-    if (id == 0) return false;
-    sit->second.pages.push_back(id);
-    return true;
-}
-
-bool PageStore::share_prefix(uint32_t child, uint32_t parent, uint64_t n) {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto cit = segments_.find(child);
-    const auto pit = segments_.find(parent);
-    if (cit == segments_.end() || pit == segments_.end()) return false;
-    if (cit->second.kind != pit->second.kind || cit->second.part != pit->second.part) return false;
-    if (n > pit->second.pages.size()) return false;
-    Segment& c = cit->second;
-    const Segment& p = pit->second;
-    if (n < c.pages.size()) return false;                  // a shared head never shrinks
-    // The child's existing pages must be the first pages of the parent, alias for alias: sharing only grows.
-    for (size_t i = 0; i < c.pages.size(); ++i) {
-        if (i >= p.pages.size() || c.pages[i] != p.pages[i]) return false;
+PageResult PageStore::write(const ContextId& id, size_t page, size_t offset, const void* src, size_t n) {
+    const auto ctx = find(id);
+    if (!ctx) return fail(PageStatus::unknown_context, "no context " + id);
+    std::unique_lock<std::shared_mutex> xl(ctx->mu);
+    uint8_t* dst = nullptr;
+    const uint8_t* shared_bytes = nullptr;
+    PageId shared = 0;  // the page copied from, still referenced until the copy is done
+    bool fresh = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (ctx->dead) return fail(PageStatus::unknown_context, "no context " + id);
+        if (ctx->frozen) return fail(PageStatus::read_only, id + " is a read-only lease");
+        if (page >= ctx->table.size() || offset > page_bytes_ || n > page_bytes_ - offset)
+            return fail(PageStatus::out_of_range, page_name(id, page) + ": write past the page or table");
+        if (n == 0) return {};
+        if (!src) return fail(PageStatus::invalid_argument, "no source bytes");
+        PageId& slot = ctx->table[page];
+        if (slot && pages_.at(slot).refs == 1) {
+            Page& own = pages_.at(slot);
+            if (own.sealed) { sealed_.erase(own.digest); own.sealed = false; }  // nobody else can see it
+            dst = own.data;
+        } else {
+            PageResult why;
+            dst = allocate_locked(why);
+            if (!dst) return why;
+            if (slot) {
+                shared = slot;
+                shared_bytes = pages_.at(slot).data;
+                ++stats_.cow_copies;
+            } else {
+                fresh = true;
+            }
+            slot = next_++;
+            pages_.emplace(slot, Page{dst, 1, false, {}});
+        }
     }
-    for (uint64_t i = c.pages.size(); i < n; ++i) {
-        c.pages.push_back(p.pages[i]);
-        ++pages_[p.pages[i]].refs;
+    // Only this context references `dst`, and its lock keeps forks and readers out until the bytes are in place.
+    const bool whole = offset == 0 && n == page_bytes_;
+    if (shared && !whole) std::memcpy(dst, shared_bytes, page_bytes_);
+    else if (fresh && !whole) std::memset(dst, 0, page_bytes_);
+    std::memcpy(dst + offset, src, n);
+    if (shared) {
+        std::lock_guard<std::mutex> lk(mu_);
+        unref_locked(shared);
     }
-    return true;
+    return {};
 }
 
-uint64_t PageStore::segment_pages(uint32_t segment) const {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto it = segments_.find(segment);
-    return it == segments_.end() ? 0 : it->second.pages.size();
-}
-
-bool PageStore::page_shared(uint32_t segment, uint64_t index) const {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto sit = segments_.find(segment);
-    if (sit == segments_.end() || index >= sit->second.pages.size()) return false;
-    return pages_.at(sit->second.pages[index]).refs > 1;
-}
-
-bool PageStore::page_sealed(uint32_t segment, uint64_t index) const {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto sit = segments_.find(segment);
-    if (sit == segments_.end() || index >= sit->second.pages.size()) return false;
-    return pages_.at(sit->second.pages[index]).sealed;
-}
-
-bool PageStore::page_digest(uint32_t segment, uint64_t index, Digest& out) const {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto sit = segments_.find(segment);
-    if (sit == segments_.end() || index >= sit->second.pages.size()) return false;
-    const Page& page = pages_.at(sit->second.pages[index]);
-    if (!page.sealed) return false;
-    out = page.digest;
-    return true;
-}
-
-const uint8_t* PageStore::read_page(uint32_t segment, uint64_t index) const {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto sit = segments_.find(segment);
-    if (sit == segments_.end() || index >= sit->second.pages.size()) return nullptr;
-    return pages_.at(sit->second.pages[index]).data;
-}
-
-uint8_t* PageStore::write_page(uint32_t segment, uint64_t index) {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto sit = segments_.find(segment);
-    if (sit == segments_.end() || index >= sit->second.pages.size()) return nullptr;
-    uint64_t& slot = sit->second.pages[index];
-    Page& page = pages_.at(slot);
-    if (page.sealed) return nullptr;                       // a frozen prefix page never changes
-    if (page.refs > 1) {                                   // shared and writable: copy first, then write
-        uint8_t* const old_data = page.data;               // take_page_locked may rehash pages_ and drop `page`
-        const uint64_t fresh = take_page_locked();
-        if (fresh == 0) return nullptr;                    // no room to copy: the caller sheds state
-        std::memcpy(pages_[fresh].data, old_data, page_bytes_);
-        drop_slot_locked(slot);
-        slot = fresh;
-        return pages_[fresh].data;
+PageResult PageStore::read(const ContextId& id, size_t page, size_t offset, void* dst, size_t n) const {
+    const auto ctx = find(id);
+    if (!ctx) return fail(PageStatus::unknown_context, "no context " + id);
+    std::shared_lock<std::shared_mutex> sl(ctx->mu);
+    const uint8_t* from = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (ctx->dead) return fail(PageStatus::unknown_context, "no context " + id);
+        if (page >= ctx->table.size() || offset > page_bytes_ || n > page_bytes_ - offset)
+            return fail(PageStatus::out_of_range, page_name(id, page) + ": read past the page or table");
+        if (n && !dst) return fail(PageStatus::invalid_argument, "no destination");
+        if (const PageId p = ctx->table[page]) from = pages_.at(p).data;
     }
-    return page.data;
+    if (!n) return {};
+    if (from) std::memcpy(dst, from + offset, n);
+    else std::memset(dst, 0, n);
+    return {};
 }
 
-bool PageStore::seal_page(uint32_t segment, uint64_t index, Digest& out_digest) {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto sit = segments_.find(segment);
-    if (sit == segments_.end() || index >= sit->second.pages.size()) return false;
-    uint64_t& slot = sit->second.pages[index];
-    Page& page = pages_.at(slot);
-    if (page.sealed) { out_digest = page.digest; return true; }
-    const Digest digest = sha256(page.data, page_bytes_);
-    const auto existing = sealed_.find(digest);
-    if (existing != sealed_.end()) {                       // the bytes are already held once: alias them
-        ++pages_[existing->second].refs;
-        drop_slot_locked(slot);
-        slot = existing->second;
-    } else {
-        page.sealed = true;
-        page.digest = digest;
-        sealed_[digest] = slot;
+PageResult PageStore::seal(const ContextId& id, std::vector<Digest>* digests) {
+    const auto ctx = find(id);
+    if (!ctx) return fail(PageStatus::unknown_context, "no context " + id);
+    std::unique_lock<std::shared_mutex> xl(ctx->mu);
+    struct Item { size_t slot; PageId page; const uint8_t* data; Digest digest; };
+    std::vector<Item> todo;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (ctx->dead) return fail(PageStatus::unknown_context, "no context " + id);
+        for (size_t i = 0; i < ctx->table.size(); ++i)
+            if (const PageId p = ctx->table[i]; p && !pages_.at(p).sealed) todo.push_back({i, p, pages_.at(p).data, {}});
     }
-    out_digest = digest;
-    return true;
+    for (auto& t : todo) t.digest = page_digest(t.data, page_bytes_);  // stable: private under our lock, or shared
+    PageResult out;
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& t : todo) {
+        Page& pg = pages_.at(t.page);
+        if (pg.sealed) continue;  // a co-owner sealed this shared page meanwhile
+        const auto hit = sealed_.find(t.digest);
+        if (hit == sealed_.end()) {
+            pg.sealed = true;
+            pg.digest = t.digest;
+            sealed_.emplace(t.digest, t.page);
+            continue;
+        }
+        Page& same = pages_.at(hit->second);
+        if (std::memcmp(same.data, pg.data, page_bytes_) != 0) {  // corruption: share nothing
+            if (out) out = fail(PageStatus::digest_mismatch, page_name(id, t.slot) + " collides with a sealed page");
+            continue;
+        }
+        ++same.refs;
+        ctx->table[t.slot] = hit->second;
+        ++stats_.dedup_hits;
+        unref_locked(t.page);
+    }
+    if (digests) {
+        digests->assign(ctx->table.size(), Digest{});
+        for (size_t i = 0; i < ctx->table.size(); ++i)
+            if (const PageId p = ctx->table[i]) (*digests)[i] = pages_.at(p).digest;
+    }
+    return out;
 }
 
-void PageStore::release_segment(uint32_t segment) {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto it = segments_.find(segment);
-    if (it == segments_.end()) return;
-    for (const uint64_t id : it->second.pages) drop_slot_locked(id);
-    segments_.erase(it);
+PageResult PageStore::verify(const ContextId& id) const {
+    const auto ctx = find(id);
+    if (!ctx) return fail(PageStatus::unknown_context, "no context " + id);
+    std::shared_lock<std::shared_mutex> sl(ctx->mu);
+    struct Item { size_t slot; const uint8_t* data; Digest digest; };
+    std::vector<Item> items;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (ctx->dead) return fail(PageStatus::unknown_context, "no context " + id);
+        for (size_t i = 0; i < ctx->table.size(); ++i)
+            if (const PageId p = ctx->table[i]; p && pages_.at(p).sealed)
+                items.push_back({i, pages_.at(p).data, pages_.at(p).digest});
+    }
+    for (const auto& it : items)
+        if (page_digest(it.data, page_bytes_) != it.digest)
+            return fail(PageStatus::digest_mismatch, page_name(id, it.slot) + " no longer matches its content key");
+    return {};
 }
 
-uint64_t PageStore::used_pages() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return used_pages_;
-}
-
-uint64_t PageStore::used_bytes() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return used_pages_ * page_bytes_;
-}
-
-uint64_t PageStore::shared_pages() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    uint64_t n = 0;
-    for (const auto& [id, page] : pages_)
-        if (page.refs > 1) ++n;
-    return n;
+PageStore::Stats PageStore::stats() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    Stats s = stats_;
+    const auto a = arena_.stats();
+    s.capacity = a.capacity;
+    s.used = a.used;
+    s.pages = pages_.size();
+    s.sealed = sealed_.size();
+    s.contexts = contexts_.size();
+    return s;
 }
 
 }  // namespace basalt::context
