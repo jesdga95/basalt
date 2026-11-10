@@ -724,6 +724,67 @@ class ParallelService(unittest.TestCase):
             self.assertEqual(t["draft_n_accepted"], t["predicted_n"] - batch_admissions, t)
             self.assertEqual(t["draft_n"], 2 * t["draft_n_accepted"], t)
 
+    # ---- session affinity: the header picks the slot -----------------------------------------------------------------
+    def chat_session(self, text, headers=None, max_tokens=64):
+        """A chat completion carrying a session header (the flow id a client or its load balancer already sends)."""
+        body = {"model": "basalt", "messages": [{"role": "user", "content": text}], "max_tokens": max_tokens,
+                "reasoning_effort": "none"}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+
+    def together(self, jobs):
+        """Run every job at the same instant: a request alone on an idle engine runs solo without choosing a slot, so
+        a slot is only picked (and a session only claimed) when requests overlap."""
+        barrier, out, errors = threading.Barrier(len(jobs)), [], []
+
+        def go(job):
+            try:
+                barrier.wait(10)
+                out.append(job())
+            except Exception as e:   # noqa: BLE001 - reported below
+                errors.append(e)
+        threads = [threading.Thread(target=go, args=(j,)) for j in jobs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        self.assertEqual(errors, [])
+        return out
+
+    def test_the_same_session_lands_in_the_same_slot(self):
+        self.start(3)
+        self.together([lambda: self.chat_session("alpha " * 10, {"x-session-id": "s1"}),
+                       lambda: self.chat_session("beta " * 14, {"x-session-id": "s2"})])
+        first = dict(self.engine.session_slot)
+        self.assertEqual(set(first), {"s1", "s2"})                  # the headers reached the engine
+        self.assertNotEqual(first["s1"], first["s2"])               # two conversations, two slots
+        # the next turn of each session, with a prompt of its own: both land in the slot their K/V sits in, although
+        # the engine has a third, unowned slot free (which is what admission would otherwise prefer)
+        self.together([lambda: self.chat_session("gamma " * 9, {"x-session-id": "s1"}),
+                       lambda: self.chat_session("delta " * 12, {"x-session-id": "s2"})])
+        self.assertEqual(self.engine.session_slot, first)
+        self.assertEqual(sorted(self.engine.slot_owner.items(), key=lambda kv: kv[0]),
+                         sorted(((s, k) for k, s in first.items())))
+        self.assertFalse(any(self.engine.slot_busy))
+
+    def test_a_per_request_id_is_not_a_session(self):
+        """x-client-request-id names one request, so pinning a slot with it would give every turn a slot of its own."""
+        self.start(3)
+        self.together([lambda: self.chat_session("epsilon " * 10, {"x-client-request-id": "req-1"}),
+                       lambda: self.chat_session("zeta " * 11, {"x-client-request-id": "req-2"})])
+        self.assertEqual(self.engine.session_slot, {})
+        self.assertEqual(self.engine.slot_owner, {})
+
+    def test_the_session_headers_a_load_balancer_sends_all_count(self):
+        self.start(4)
+        self.together([(lambda h=h, n=n: self.chat_session("turn " * n, {h: "s-" + h}))
+                       for n, h in enumerate(("x-llm-flow-id", "x-claude-code-session-id", "x-session-id",
+                                              "x-session-affinity"))])
+        for h in ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity"):
+            self.assertIn("s-" + h, self.engine.session_slot, h)
+
     def test_timings_of_a_solo_request_carry_its_draft_counts(self):
         self.start(2, counts=True)
         self.check_counts(self.timed_chats(["alone LONGREPLY"]), 0)
