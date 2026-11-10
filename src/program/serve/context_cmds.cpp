@@ -22,6 +22,7 @@
 #include "basalt/context/snapshot_io.hpp"
 #include "basalt/core/conversation_snapshot.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -174,6 +175,10 @@ void plan_from_image(SavedConversation& image, const SnapshotMeta& meta, Invento
     // parts are numbered per kind, without gaps
     uint32_t next[6] = {0, 0, 0, 0, 0, 0};
     for (auto& item : plan.items) item.part = next[(int) item.kind]++;
+    // the manifest demands the inventory sorted by kind, then by part
+    std::sort(plan.items.begin(), plan.items.end(), [](const InventoryPlan::Item& a, const InventoryPlan::Item& b) {
+        return a.kind != b.kind ? a.kind < b.kind : a.part < b.part;
+    });
 }
 
 class ImageSource final : public ctx::StateSource {
@@ -437,10 +442,13 @@ Flow Runtime::context_dispatch() {
         draft.prefix_hash = prefix_hash;
         draft.prefix_tokens = live.size();
         draft.generation = generation;
-        for (const auto& item : plan.items)
-            draft.inventory.push_back({item.kind, ctx::EntryMode::stored, item.part, item.bytes, {}});
-        if (!meta.has_draft)
-            draft.inventory.push_back({ctx::StateKind::mtp_draft, ctx::EntryMode::recompute, 0, 0, {}});
+        for (const ctx::StateKind kind : ctx::kStateKinds) {
+            if (kind == ctx::StateKind::mtp_draft && !meta.has_draft)
+                draft.inventory.push_back({kind, ctx::EntryMode::recompute, 0, 0, {}});
+            for (const auto& item : plan.items)
+                if (item.kind == kind)
+                    draft.inventory.push_back({item.kind, ctx::EntryMode::stored, item.part, item.bytes, {}});
+        }
         ctx::SnapshotStore store(o.context_store_dir + "/" + id, files);
         ImageSource source(plan);
         const auto result = store.publish(draft, source);
