@@ -35,6 +35,12 @@ void dspark_moe_combine(const float* d, const float* w, const float* shared, int
 void dspark_kv_rope(const float* raw, const float* norm_w, const int32_t* pos, int n_tokens, float eps,
                     const float* rope_freq, float* kv_out, uint16_t* ring, int ring_slots, void* stream);
 
+/// A block's inputs, x as `rows` rows of four streams of n floats: row 0 is `emb` (n floats) in each stream, row r > 0
+/// is mask row r - 1 (four streams); cur [rows][n] gets stream 0 of each row and dmeta[0, n_meta) `meta`. `meta` and
+/// `emb` may be mapped host memory.
+void dspark_block_inputs(const int32_t* meta, int n_meta, const float* emb, const float* mask, int n, int rows,
+                         int32_t* dmeta, float* x, float* cur, void* stream);
+
 /// pos[j] = pos0 + j for j < n (n at most 1024).
 void dspark_fill_positions(int32_t* pos, int64_t pos0, int n, void* stream);
 
