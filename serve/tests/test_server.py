@@ -100,21 +100,6 @@ class MaxTokens(unittest.TestCase):
         self.assertEqual(s2, 200)
         self.assertEqual(b["input_tokens"], n_in)
 
-    def test_request_line_parses_the_engine_summary(self):
-        line = ("basalt serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
-                "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
-        from serve.engine.process import ENGINE_REQUEST
-        m = ENGINE_REQUEST.search(line)
-        self.assertIsNotNone(m)
-        self.assertEqual((m["prompt"], m["reused"], m["gen"], m["tg"]), ("1200", "1000", "30", "100.0"))
-        # a request cancelled while its prompt was read says how far it got
-        m = ENGINE_REQUEST.search("basalt serve: prompt 98179 tokens = 0 reused + 12288 of 98179 read in 17565 ms "
-                                  "(699.6 tok/s), 0 generated in 0 ms (0.0 tok/s), drafts accepted 0 of 0, "
-                                  "0 checkpoints (cancelled)")
-        self.assertIsNotNone(m)
-        self.assertEqual((m["prompt"], m["reused"], m["read"], m["pp"], m["gen"]),
-                         ("98179", "0", "17565", "699.6", "0"))
-
     def test_unset_budget_is_the_rest_of_the_context(self):
         cases = {"openai": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
                             {"max_completion_tokens": -1}, {"max_completion_tokens": None, "max_tokens": None}],

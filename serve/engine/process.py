@@ -3,7 +3,10 @@
 Protocol (one line each):
   * start: stdout `INFO k=v ...` lines, then `READY <ctx> [stop]` (stop: STOP is honoured mid-request).
   * solo: `GEN <max_new> [k=v ...] <ids>` (GENI with embeddings) -> `T <id>`, `PP <read> <total> ...`,
-    `RESUME <n>`, then `DONE ...`; `STOP` ends it early. `ERR ...` is a failure.
+    `RESUME <n>`, then `DONE ...`; `STOP` ends it early. `ERR ...` is a failure; a prompt that does not fit the
+    context is `ERR <context_overflow|context_no_room> prompt=N [max_new=N] context=N [slot=N]: <message>`.
+  * any time after READY: `CONV parked=N bytes=N evictions=N [restored=N restored_ms=X]`, the conversation cache's
+    figures after a park or a restore (never a reply line, like INFO).
   * solo, text (INFO text_prompt=1): `GENT <max_new> [k=v ...] <nbytes> [plain=a:b,...]`, a newline, then nbytes of
     raw UTF-8: the engine tokenizes (control literals on; `plain` byte spans are text) and answers like a GEN, with
     `PT <n> <max_new>` before the first PP line. `clip=1` cuts max_new to the room the context leaves after the prompt.
@@ -34,7 +37,7 @@ from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.engine import lifeline, suspend
 from serve.engine.flags import flag_value
-from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck
+from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, split_err
 from serve.engine.slots import AdmissionQueue
 from serve.prompt import PromptText
 from serve.util.console import tagged
@@ -56,68 +59,19 @@ PP_SLACK = 3.0
 ENGINE_READY_S = 900.0
 QUIT_S = 20.0            # an engine's time to end after QUIT
 QUIT_DISK_S = 300.0      # ... with a disk tier: it writes the conversations it holds first
-ENGINE_REQUEST = re.compile(
-    # "+ 12288 of 98179 read": a request cancelled during its prompt read
-    r"prompt (?P<prompt>\d+) tokens = (?P<reused>\d+) reused \+ \d+(?: of \d+)? read in (?P<read>[\d.]+) ms "
-    r"\((?P<pp>[\d.]+) tok/s\), "
-    r"(?P<gen>\d+) generated in (?P<gen_ms>[\d.]+) ms \((?P<tg>[\d.]+) tok/s\)")
-_echoing: set[str] = set()      # logs already followed (restart() re-runs __init__)
-
-
-def echo_requests(log_path: str, offset: int) -> None:
-    """--request-lines: print one stdout line per finished request, parsed from the engine's log summary."""
-    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-        f.seek(offset)
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(0.2)
-                continue
-            m = ENGINE_REQUEST.search(line)
-            if m:
-                read_ms, gen_ms = float(m["read"]), float(m["gen_ms"])
-                print("[server] request prompt %s cached %s output %s prompt_read %.0f ms total %.0f ms prefill %s "
-                      "tok/s decode %s tok/s" % (m["prompt"], m["reused"], m["gen"], read_ms, read_ms + gen_ms, m["pp"],
-                                                 m["tg"]), flush=True)
-
-
-# The conversation cache's lines (src/models/qwen4exp/serve/conversation.cpp, src/program/serve/request_restore.cpp).
-CONV_PARKED = re.compile(r"conversation cache: (?:parked|skipped) \d+ tokens in [\d.]+ ms; parked=(?P<parked>\d+) "
-                         r"bytes=(?P<bytes>\d+) evictions=(?P<evictions>\d+)")
-CONV_RESTORED = re.compile(r"conversation cache: restored (?P<tokens>\d+) tokens \(\w+\) in (?P<ms>[\d.]+) ms; "
-                           r"parked=(?P<parked>\d+) bytes=(?P<bytes>\d+)")
 
 
 def conversation_facts(line: str) -> dict:
-    """What an engine log line says about the conversation cache: parked, bytes, evictions (a park line only) and
-    restored, restored_ms (a restore line only); empty for any other line."""
-    if "conversation cache: " not in line:
-        return {}
-    if m := CONV_PARKED.search(line):
-        return {"parked": int(m["parked"]), "bytes": int(m["bytes"]), "evictions": int(m["evictions"])}
-    if m := CONV_RESTORED.search(line):
-        return {"parked": int(m["parked"]), "bytes": int(m["bytes"]), "restored": int(m["tokens"]),
-                "restored_ms": float(m["ms"])}
-    return {}
-
-
-def follow_log(path: str, offset: int, on_line, done) -> None:
-    """Pass each line a log file gains after `offset` to `on_line` until `done()`, then the lines it still holds."""
-    try:
-        f = open(path, "r", encoding="utf-8", errors="replace")
-    except OSError:
-        return
-    with f:
-        f.seek(offset)
-        while True:
-            ended = done()
-            line = f.readline()
-            if line:
-                on_line(line)
-            elif ended:
-                return
-            else:
-                time.sleep(0.2)
+    """The facts of a `CONV` line (`CONV parked=N bytes=N evictions=N[ restored=N restored_ms=X]`): the cache's figures
+    after a park or, with restored and restored_ms, after a restore."""
+    facts = {}
+    for kv in line.split()[1:]:
+        k, _, v = kv.partition("=")
+        try:
+            facts[k] = float(v) if k.endswith("_ms") else int(v)
+        except ValueError:
+            pass
+    return facts
 
 
 def engine_line(line: str) -> str:
@@ -153,7 +107,7 @@ def relay_auto_flags(line: str) -> bool:
 
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
-PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "READY", "T ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR", "BADM ",
+PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR", "BADM ",
                   "BT ", "BDONE ", "YIELDED ", "VRAM ", "ENC ")
 
 
@@ -189,7 +143,7 @@ def pump_lines(stream, sink) -> None:
         pass
 
 
-REQUEST_LINES = False    # --request-lines: echo the engine's per-request summary on stdout
+REQUEST_LINES = False    # --request-lines: echo each request's DONE figures on stdout
 PENALTY_LAST_N_DEFAULT = 64  # the penalty window of a request that sets a penalty but no penalty_last_n
 
 
@@ -207,7 +161,8 @@ REQUEST_ERRS = ("prompt (", "bad request:", "sampling ", "logit_bias:", "grammar
 def request_err(err: str, shown: str | None = None) -> ValueError:
     """The exception for a request's ERR text, raised with `shown` when given: ValueError when the request caused it,
     else EngineError."""
-    return (ValueError if err.startswith(REQUEST_ERRS) else EngineError)(err if shown is None else shown)
+    message = split_err(err)[2]
+    return (ValueError if message.startswith(REQUEST_ERRS) else EngineError)(message if shown is None else shown)
 
 
 class ProcessEngine:
@@ -287,7 +242,7 @@ class ProcessEngine:
         self.last = {}
         self.slot_drafts = {}
         self.info = {}                   # INFO key=value facts
-        self.conversation = {}           # the cache's figures from the engine's log lines; this process's only
+        self.conversation = {}           # the cache's figures from the engine's CONV lines; this process's only
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens, from PP lines
         self.silent_note = None
@@ -309,10 +264,6 @@ class ProcessEngine:
             narrator = threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), loading),
                                         kwargs={"gpus": gpus, "on_progress": self._note_load}, daemon=True)
             narrator.start()
-            # one follower per log, across restarts
-            if REQUEST_LINES and os.path.abspath(log) not in _echoing:
-                _echoing.add(os.path.abspath(log))
-                threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
         sink = None if log else ProcessEngine.stderr_sink
         self.max_context = 0                            # before the new process is visible: never its predecessor's
         try:
@@ -327,11 +278,7 @@ class ProcessEngine:
         frame_pipes(self.proc, sink is not None)
         proc = self.proc
         if sink:
-            threading.Thread(target=pump_lines, args=(proc.stderr, lambda x: (self._note_conversation(proc, x), sink(x))),
-                             daemon=True).start()
-        elif log:
-            threading.Thread(target=follow_log, args=(log, log_start, lambda x: self._note_conversation(proc, x),
-                                                      lambda: proc.poll() is not None), daemon=True).start()
+            threading.Thread(target=pump_lines, args=(proc.stderr, sink), daemon=True).start()
         # the lines come from a thread up to READY, so the read can time out and the rest of the stream stays for _pump
         ready_q: queue.Queue = queue.Queue()
         threading.Thread(target=self._ready_pump, args=(self.proc, ready_q, self.log), daemon=True).start()
@@ -413,12 +360,6 @@ class ProcessEngine:
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
-    def _note_conversation(self, proc, line: str) -> None:
-        """Keep the cache's figures from an engine log line; a line of an engine that is gone changes nothing."""
-        facts = conversation_facts(line)
-        if facts and self.proc is proc:
-            self.conversation = {**self.conversation, **facts}
-
     def _note_load(self, status: dict) -> None:
         self.load_status = status
 
@@ -452,6 +393,10 @@ class ProcessEngine:
             if line.startswith("INFO "):                # a fact the engine updates as it runs; never a reply line
                 if self.proc is proc:
                     self.info.update(info_facts(line))
+                continue
+            if line.startswith("CONV "):                # the conversation cache's figures; never a reply line
+                if self.proc is proc:
+                    self.conversation = {**self.conversation, **conversation_facts(line)}
                 continue
             if line.startswith(FATAL_PREFIXES):         # before batch routing
                 if self.proc is proc:
@@ -578,6 +523,18 @@ class ProcessEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+        if REQUEST_LINES:
+            self._echo_request()
+
+    def _echo_request(self) -> None:
+        """--request-lines: one stdout line for the request the last DONE ended."""
+        d = self.last
+        read, gen = d.get("prompt_read", 0), d["generated"]
+        print("[server] request prompt %d cached %d output %d prompt_read %.0f ms total %.0f ms prefill %.1f tok/s "
+              "decode %.1f tok/s" % (d["prompt_tokens"], d.get("reused", 0), gen, d["prompt_ms"],
+                                     d["prompt_ms"] + d["decode_ms"],
+                                     1000.0 * read / d["prompt_ms"] if d["prompt_ms"] > 0 else 0.0,
+                                     1000.0 * gen / d["decode_ms"] if d["decode_ms"] > 0 else 0.0), flush=True)
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """Resize the expert cache to leave `reserve_mib` free (None: the starting reserve); returns the engine's
