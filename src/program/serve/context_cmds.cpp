@@ -90,7 +90,12 @@ struct SnapshotMeta {
     }
     static bool decode(const std::string& text, SnapshotMeta& out, std::string& error) {
         out = {};
-        std::istringstream in(text);
+        // encode() separates every number with a comma and every group with a semicolon; the numbers land on the
+        // same whitespace-token path here, so the meta a SNAP published is exactly the meta a RESTORE decodes.
+        std::string flat;
+        flat.reserve(text.size());
+        for (const char c : text) flat += (c == ',') ? ' ' : c;
+        std::istringstream in(flat);
         std::string head;
         if (!std::getline(in, head, ';')) { error = "meta: empty"; return false; }
         std::istringstream h(head);
@@ -123,8 +128,7 @@ struct SnapshotMeta {
             long long s[kKvBuffers];
             if (!(g >> f[0] >> f[1] >> f[2] >> f[3] >> f[4] >> f[5] >> f[6])) { error = "meta: group"; return false; }
             for (int b = 0; b < kKvBuffers; ++b) {
-                char comma;
-                if (!(g >> comma >> s[b])) { error = "meta: buffer sizes"; return false; }
+                if (!(g >> s[b])) { error = "meta: buffer sizes"; return false; }
             }
             q.format = f[0]; q.cells = f[1]; q.heads = f[2]; q.head_dim = f[3];
             q.page_size = f[4]; q.pooled_rows = f[5]; q.idx_dim = f[6];
