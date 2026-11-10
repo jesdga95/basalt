@@ -150,7 +150,8 @@ class Service:
         # agent contexts ride the registry sidecar; off unless BASALT_THREAD_API_KEY is configured
         self.context = None
         ctx_adapter = ContextAdapter.from_env()
-        if ctx_adapter is not None:
+        # ... and only for an engine that speaks CONTEXT_* (a mock or older engine would fail after the reply is made)
+        if ctx_adapter is not None and callable(getattr(self.engine, "context_command", None)):
             self.context = ContextLifecycle(self, ctx_adapter)
 
     def loaded(self) -> bool:
