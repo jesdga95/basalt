@@ -75,6 +75,28 @@ class Levels(unittest.TestCase):
 
 
 class Buffer(unittest.TestCase):
+    def test_stream_pages_without_skipping_and_reports_overflow(self):
+        b = LogBuffer(capacity=4)
+        for i in range(6):
+            b.add("srv", str(i))
+        first = b.snapshot(0, 2)
+        self.assertTrue(first["dropped"])
+        self.assertEqual([x["id"] for x in first["lines"]], [3, 4])
+        self.assertEqual((first["next"], first["last"]), (4, 6))
+        second = b.snapshot(first["next"], 2, first["instance_id"])
+        self.assertFalse(second["dropped"])
+        self.assertEqual([x["id"] for x in second["lines"]], [5, 6])
+        self.assertEqual([x["id"] for x in b.snapshot(None, 2)["lines"]], [5, 6])
+
+    def test_stream_restart_detected_even_after_ids_catch_up(self):
+        b = LogBuffer()
+        for i in range(10):
+            b.add("srv", str(i))
+        data = b.snapshot(2, 3, "previous-server")
+        self.assertTrue(data["reset"])
+        self.assertEqual([x["id"] for x in data["lines"]], [8, 9, 10])
+        self.assertTrue(b.snapshot(99, 3)["reset"])
+
     def test_ids_lines_and_fields(self):
         b = LogBuffer()
         b.add("srv", "one\ntwo\n\n   \nthree")
