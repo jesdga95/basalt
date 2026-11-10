@@ -52,6 +52,13 @@ int main() {
     TierMove cancel_down{"c2", Tier::host, Tier::disk, 1, 2 * PB, false, {}};
     CHECK(mover.copy(cancel_down, yes, d2, e) == TierMover::Outcome::canceled);
     CHECK(access(mover.path_of("c2", 1).c_str(), F_OK) != 0 && access((mover.path_of("c2", 1) + ".tmp").c_str(), F_OK) != 0);
+    // an id that is a path is refused before any file is touched; generation 0 is not a snapshot
+    TierMove evil{"../escape", Tier::host, Tier::disk, 1, PB, false, {}};
+    CHECK(mover.copy(evil, no, d2, e) == TierMover::Outcome::failed);
+    CHECK(access((dir + "/../escape.1.pages").c_str(), F_OK) != 0);
+    mover.release("../escape", Tier::disk);
+    TierMove zero_gen{"ctx", Tier::host, Tier::disk, 0, PB, false, {}};
+    CHECK(mover.copy(zero_gen, no, d2, e) == TierMover::Outcome::failed);
     // unsupported pair
     TierMove gpu{"c2", Tier::gpu, Tier::host, 1, PB, false, {}};
     CHECK(mover.copy(gpu, no, d2, e) == TierMover::Outcome::failed);

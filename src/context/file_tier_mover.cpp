@@ -57,6 +57,7 @@ std::string FileTierMover::path_of(const ContextId& context, Generation g) const
 }
 
 void FileTierMover::release(const ContextId& context, Tier tier) {
+    if (!valid_context_id(context)) return;   // the id becomes a file name: never a path
     if (tier == Tier::host) { store_.remove(context); return; }
     if (tier != Tier::disk) return;
     DIR* d = ::opendir(dir_.c_str());
@@ -76,6 +77,7 @@ TierMover::Outcome FileTierMover::copy(const TierMove& move, const std::atomic<b
                                        std::string& error) {
     const size_t pb = store_.page_bytes();
     if (pb == 0) { error = "page store is not open"; return Outcome::failed; }
+    if (!valid_context_id(move.context) || move.generation == 0) { error = "invalid context id or generation"; return Outcome::failed; }
     if (move.from == Tier::host && move.to == Tier::disk) {
         const size_t pages = (size_t) ((move.bytes + pb - 1) / pb);
         const std::string final_path = path_of(move.context, move.generation);
