@@ -35,6 +35,14 @@ void dspark_moe_combine(const float* d, const float* w, const float* shared, int
 void dspark_kv_rope(const float* raw, const float* norm_w, const int32_t* pos, int n_tokens, float eps,
                     const float* rope_freq, float* kv_out, uint16_t* ring, int ring_slots, void* stream);
 
+/// pos[j] = pos0 + j for j < n (n at most 1024).
+void dspark_fill_positions(int32_t* pos, int64_t pos0, int n, void* stream);
+
+/// Rows of a staged latent set into the stages' rings: for p in pos0..pos0 + n - 1, ring_l[p % ring_slots] =
+/// staged[l][p % stage_slots] (512 fp16 values each) for each of the three stages.
+void dspark_commit_rows(const uint16_t* staged, int stage_slots, uint16_t* ring0, uint16_t* ring1, uint16_t* ring2,
+                        int ring_slots, int64_t pos0, int n, void* stream);
+
 /// out[r * out_stride + i] = mean over the four hyper-connection streams of x[r][s][i], for `n_rows` rows.
 void dspark_hc_mean(const float* x, int n_rows, int n, float* out, int out_stride, void* stream);
 
