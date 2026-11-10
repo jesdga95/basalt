@@ -130,6 +130,10 @@ struct Options : CommonOptions {
     /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
     /// from each GPU's free VRAM); empty = one GPU
     std::string layer_split;
+    /// --layer-split-forced: take the layer split even when the price model picks the expert tier.  The split keeps
+    /// every expert where it is computed (pipeline parallel), which is what the prompt path needs; the price model
+    /// weighs a decode window and picks the tier.  An explicit --layer-split implies this.
+    bool split_forced = false;
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
