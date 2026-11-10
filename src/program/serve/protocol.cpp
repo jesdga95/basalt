@@ -1,4 +1,5 @@
 // src/program/serve/protocol.cpp - protocol operations for the persistent engine.
+#include "basalt/protocol.hpp"
 #include "state.hpp"
 
 namespace basalt::program::serve {
@@ -59,6 +60,12 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
         );
         std::fflush(f);
     }
+}
+
+void Runtime::report_conversations(long long restored, double restored_ms) {
+    if (!conversations) return;
+    basalt::protocol::emit_text(basalt::protocol::conversation_line(conversations->size(), conversations->bytes(),
+                                                                    conversations->evictions(), restored, restored_ms));
 }
 
 bool Runtime::next_line(std::string& out) {
