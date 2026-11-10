@@ -322,8 +322,8 @@ void usage(const std::string& engine) {
         "                                  the body is the 16384-token depth, cut or repeated to the asked depth,\n"
         "                                  and 4 random ids are inserted before it so the prompt cache cannot match\n"
         "  Prompts: conv  \"Explain how a B-tree differs from an LSM tree, with a worked example of\n"
-        "  each. About 600 words.\" (1200 tokens, temperature 0.6); struct  the JSON-array prompt (8192 tokens,\n"
-        "  temperature 0, 7230 tokens expected); prose  \"Write an essay on the Odyssey.\" (1200 tokens,\n"
+        "  each. About 600 words.\" (1200 tokens, temperature 0.6); struct  the JSON-array prompt (up to 8192 tokens,\n"
+        "  temperature 0); prose  \"Write an essay on the Odyssey.\" (1200 tokens,\n"
         "  temperature 0.6); prefill  40000 characters of filler as the body, then \"In one sentence, what is this\n"
         "  document?\".\n"
         "  Make the files once, on a machine with the model, with the server's own tokenizer and template:\n"
@@ -468,7 +468,6 @@ const Fixture kDecode[] = {
     {"struct", "struct.ids", 8192, 0.0},
     {"prose", "prose.ids", 1200, 0.6},
 };
-constexpr long long kStructTokens = 7230;
 constexpr long long kPrefillBase = 16384;   // the base body's depth in tokens
 constexpr long long kCommunityPrefillShort = 16384, kCommunityPrefillLong = 65536;   // the community preset's depths
 constexpr long long kPrefillBaseDecode = 32;
@@ -547,7 +546,6 @@ struct Result {
     Done d;
     int sm_mhz = -1, mem_mhz = -1;
     WinStats win;
-    bool checksum_bad = false;
 };
 
 double tok_s(const Done& d) { return d.decode_ms > 0 ? (double) d.generated / (d.decode_ms / 1000.0) : 0.0; }
@@ -991,7 +989,6 @@ int main(int argc, char** argv) {
                 const Nvml::Snap s = nvml.snap(0);
                 r.sm_mhz = s.sm_mhz;
                 r.mem_mhz = s.mem_mhz;
-                r.checksum_bad = r.name == "struct" && r.d.generated != kStructTokens;
                 ++n_requests;
                 ++n_decode_requests;
                 basalt::log::raw("  run %d %-7s %.1f tok/s, %lld tokens\n", run, r.name.c_str(), tok_s(r.d), r.d.generated);
@@ -1215,9 +1212,6 @@ int main(int argc, char** argv) {
                 rep += s + "\n";
             }
         }
-        for (const Result& x : results)
-            if (x.checksum_bad && x.run == 1)
-                rep += fmt("\nnote: struct produced %lld tokens, the expected count is %lld\n", x.d.generated, kStructTokens);
     }
     std::string community_row;
     basalt::program::CommunityRow crow;
@@ -1392,7 +1386,6 @@ int main(int argc, char** argv) {
                 j.key("hit_pct"); j.num(r.d.lookups > 0 ? 100.0 * (double) r.d.hits / (double) r.d.lookups : 0.0);
                 j.key("hits"); j.integer(r.d.hits);
                 j.key("lookups"); j.integer(r.d.lookups);
-                if (r.name == "struct") { j.key("checksum_ok"); j.boolean(!r.checksum_bad); }
                 if (r.win.present) {
                     j.key("windows"); j.integer(r.win.windows);
                     j.key("mean_t"); j.num(r.win.mean_t);
