@@ -82,8 +82,9 @@ std::optional<int> prepare_input_options(Options& o) {
     }
     if (o.kv.empty()) o.kv = "fp16";
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        basalt::log::error("basalt generate", "--kv must be fp16, int8, q4_0 or k8v4");
+    if (o.kv == "fp4" || o.kv == "nv-fp4") o.kv = "nvfp4";
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "nvfp4" && o.kv != "k8v4") {
+        basalt::log::error("basalt generate", "--kv must be fp16, int8, q4_0, nvfp4 or k8v4");
         return 2;
     }
     return std::nullopt;

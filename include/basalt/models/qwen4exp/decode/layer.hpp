@@ -206,6 +206,9 @@ struct QsaState {
     uint16_t* v_scale = nullptr;
     /// Q4_0 KV with Walsh-Hadamard rotation (qsa_set_kv_q4, kv_q4.hpp): 144 B per cell and head
     bool kv_q4 = false;
+    /// Sub-format of the kv_q4 pools: NVFP4 (qsa_set_kv_nvfp4, kv_q4.hpp): E2M1 codes with an E4M3 scale per 16,
+    /// the same 144 B rows, pools and movers - only the bytes' meaning differs. Implies kv_q4.
+    bool kv_nvfp4 = false;
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
     /// Hybrid K8V4: K in INT8 (unrotated - the scores stay exact), V in rotated Q4_0 (kv_q4.hpp): 816 B per cell.
@@ -290,7 +293,11 @@ void qsa_set_kv_q4(bool enabled);
 /// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell. Not with --kv-resident.
 void qsa_set_kv_hybrid(bool enabled);
 bool qsa_kv_hybrid();
-/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4).
+/// Store K/V as NVFP4 after the same Hadamard rotation (`--kv nvfp4`): E2M1 codes + an E4M3 scale per 16 values,
+/// the pack's own 4-bit rounding. 576 B per cell like Q4_0, at the quality of a finer, unsigned, floating scale.
+void qsa_set_kv_nvfp4(bool enabled);
+bool qsa_kv_nvfp4();
+/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvFp4).
 inline int qsa_kv_format(const QsaState& st) {
     // A hybrid K8V4 state is mode 0 only and never reaches the block movers; refuse rather than let it
     // fall through to kKvF16 - a wrong layout silently applied is worse than a hard stop (PR review).
@@ -298,7 +305,9 @@ inline int qsa_kv_format(const QsaState& st) {
         basalt::log::error("basalt", "qsa_kv_format: a hybrid K8V4 state must never reach the block movers");
         std::exit(1);   // the kernels' own "unsupported geometry" convention (kv_q8.cu, qsa_decode_attn.cu)
     }
-    return st.kv_q4 ? basalt::kernels::kKvQ4 : st.kv_int8 ? basalt::kernels::kKvInt8 : basalt::kernels::kKvF16;
+    return st.kv_nvfp4 ? basalt::kernels::kKvFp4
+         : st.kv_q4 ? basalt::kernels::kKvQ4
+         : st.kv_int8 ? basalt::kernels::kKvInt8 : basalt::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
