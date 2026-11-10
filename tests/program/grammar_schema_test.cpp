@@ -367,6 +367,80 @@ static void test_multibyte_text_end() {
     CHECK(call_ok(g, head + "a " + bar + " </ </\xef\xbd\x9d" + end));   // a near match and a neighbour character stay text
 }
 
+// Boolean schemas: `true` is the empty schema (any value), `false` has no valid value.
+static void test_boolean_schemas() {
+    std::string err;
+    // the nested `true`, as a client writes it for an any-typed value
+    const char* kFilters = R"([{"type":"function","function":{"name":"search_metadata","parameters":{"type":"object","properties":{
+        "filters":{"type":"array","items":{"type":"object","properties":{"field":{"type":"string"},"value":true},"required":["field","value"]}}},
+        "required":["filters"]}}}])";
+    std::string gbnf = tool_call_gbnf(kFilters, ToolGrammarOptions{}, err);
+    CHECK(!gbnf.empty());
+    auto g = Grammar::parse(gbnf, err);
+    CHECK(g);
+    const std::string head = "<tool_call>\n<function=search_metadata>\n<parameter=filters>\n";
+    const std::string tail = "\n</parameter>\n</function>\n</tool_call>";
+    for (const char* v : {"\"text\"", "12", "-1.5e3", "{\"a\":[1,{\"b\":null}]}", "[1,\"x\",false]", "null", "true", "false"}) {
+        CHECK(g && call_ok(g, head + "[{\"field\":\"f\",\"value\":" + v + "}]" + tail));
+    }
+    CHECK(g && !pre(g, head + "[{\"field\":1"));
+
+    // the same through response_format's grammar request, and with `true` through a $ref
+    auto req = grammar_from_request(R"({"kind":"json_schema","schema":{"type":"object","properties":{"v":{"type":"array","items":{"type":"object","properties":{"value":true},"required":["value"]}}},"required":["v"]}})", err);
+    CHECK(req.grammar && ok(req.grammar, R"({"v":[{"value":{"x":[null]}},{"value":"s"},{"value":3}]})") && !pre(req.grammar, R"({"v":[{"x")"));
+    auto ref = build(R"({"type":"object","properties":{"a":{"$ref":"#/$defs/any"}},"required":["a"],"$defs":{"any":true}})");
+    CHECK(ref && ok(ref, R"({"a":[1,"x"]})") && ok(ref, R"({"a":null})"));
+
+    // true at every position, equal to {}
+    auto top = build("true");
+    CHECK(top && ok(top, "1") && ok(top, "{\"a\":[]}") && ok(top, "\"s\"") && ok(top, "null"));
+    auto items = build(R"({"type":"array","items":true})");
+    CHECK(items && ok(items, "[1,\"a\",null,{}]") && ok(items, "[]"));
+    auto tuple = build(R"({"type":"array","prefixItems":[true,{"type":"integer"}]})");
+    CHECK(tuple && ok(tuple, "[\"x\",1]") && !pre(tuple, "[\"x\",\"y"));
+    auto addl = build(R"({"type":"object","properties":{"a":{"type":"integer"}},"additionalProperties":true})");
+    CHECK(addl && ok(addl, R"({"a":1,"z":[1,2]})"));
+    auto addl_schema = build(R"({"type":"object","additionalProperties":{"type":"integer"}})");
+    CHECK(addl_schema && ok(addl_schema, R"({"z":1})") && !pre(addl_schema, R"({"z":"s)"));
+    auto alt = build(R"({"anyOf":[true,{"type":"integer"}]})");
+    CHECK(alt && ok(alt, "\"x\"") && ok(alt, "3"));
+    auto all = build(R"({"allOf":[true,{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]}]})");
+    CHECK(all && ok(all, R"({"a":1})"));
+
+    // false: an optional property is never written, additionalProperties false is unchanged, items false is the empty array
+    auto opt = build(R"({"type":"object","properties":{"a":{"type":"integer"},"b":false},"required":["a"]})");
+    CHECK(opt && ok(opt, R"({"a":1})") && !pre(opt, R"({"a":1,"b")"));
+    auto none = build(R"({"type":"object","properties":{"a":{"type":"integer"}},"additionalProperties":false})");
+    CHECK(none && ok(none, R"({"a":1})") && !pre(none, R"({"a":1,"z")"));
+    auto empty = build(R"({"type":"array","items":false})");
+    CHECK(empty && ok(empty, "[]") && !pre(empty, "[1"));
+    auto closed = build(R"({"type":"array","prefixItems":[{"type":"integer"}],"items":false})");
+    CHECK(closed && ok(closed, "[1]") && !pre(closed, "[1,2"));
+    auto alt_false = build(R"({"anyOf":[false,{"type":"integer"}]})");
+    CHECK(alt_false && ok(alt_false, "3") && !pre(alt_false, "\"x"));
+    auto ref_false = build(R"({"type":"object","properties":{"a":{"type":"integer"},"b":{"$ref":"#/$defs/no"}},"required":["a"],"$defs":{"no":false}})");
+    CHECK(ref_false && ok(ref_false, R"({"a":1})") && !pre(ref_false, R"({"a":1,"b")"));
+
+    // a false that nothing can satisfy is a clear error
+    for (const char* bad : {"false",
+                            R"({"type":"object","properties":{"a":false},"required":["a"]})",
+                            R"({"type":"object","properties":{"a":{"$ref":"#/$defs/no"}},"required":["a"],"$defs":{"no":false}})",
+                            R"({"type":"array","items":false,"minItems":1})",
+                            R"({"type":"array","prefixItems":[false]})",
+                            R"({"anyOf":[false,false]})",
+                            R"({"allOf":[{"type":"integer"},false]})"}) {
+        std::string e;
+        CHECK(json_schema_to_gbnf(bad, e).empty() && e.find("false") != std::string::npos);
+    }
+    // as a tool parameter: an optional `false` is dropped, a required one is refused
+    auto param = Grammar::parse(tool_call_gbnf(R"([{"name":"w","parameters":{"type":"object","properties":{"a":{"type":"integer"},"b":false},"required":["a"]}}])",
+                                               ToolGrammarOptions{}, err), err);
+    CHECK(param && call_ok(param, "<tool_call>\n<function=w>\n<parameter=a>\n1\n</parameter>\n</function>\n</tool_call>") &&
+          !pre(param, "<tool_call>\n<function=w>\n<parameter=a>\n1\n</parameter>\n<parameter=b>"));
+    CHECK(tool_call_gbnf(R"([{"name":"w","parameters":{"type":"object","properties":{"b":false},"required":["b"]}}])", ToolGrammarOptions{}, err).empty() &&
+          err.find("false") != std::string::npos);
+}
+
 int main() {
     set_test_tool_form();
     test_request();
@@ -380,6 +454,7 @@ int main() {
     test_union_parameters();
     test_control_escapes();
     test_multibyte_text_end();
+    test_boolean_schemas();
     if (g_fail) { std::printf("grammar_schema_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_schema_test: ok\n");
     return 0;

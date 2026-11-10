@@ -309,6 +309,13 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
             for (const auto& m : props->members) {
                 const JsonValue* ps = deref(params, &m.second);
                 JsonValue any_schema;   // `true` and a missing target are the empty schema
+                if (ps && ps->is(Type::Bool) && !ps->b) {   // `false`: no value is valid
+                    if (required.count(m.first)) {
+                        err = "tools: " + nm->s + "." + m.first + ": required parameter has the schema false, no value is valid";
+                        return "";
+                    }
+                    continue;
+                }
                 if (!ps || ps->is(Type::Bool)) {
                     any_schema.type = Type::Object;
                     ps = &any_schema;
