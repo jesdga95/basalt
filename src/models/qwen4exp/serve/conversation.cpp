@@ -205,6 +205,7 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                      conversations->size(), conversations->bytes(), conversations->evictions(), snapshot_bytes, reused_bytes,
                      to_disk ? " (to disk)" : "");
+        report_conversations();
         // what the RAM tier evicted to make room goes to the disk tier
         for (auto& s : conversations->take_spilled())
             if (!disk_has(s.live.ids, s.live.imgs, s.checkpoints, s.cvec)) disk.put(std::move(s), kDiskQueueCap);
