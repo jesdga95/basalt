@@ -349,6 +349,7 @@ class ContextLifecycle:
         except Exception:
             return False
         if position > len(token_ids):
+            print(f"[server] context: {h.cid[:8]} the transcript holds {len(token_ids)} tokens, fewer than the published {position}", flush=True)
             return False                    # the client's prompt is not an extension of the published prefix
         fd, path = tempfile.mkstemp(prefix="basalt-ctx-", suffix=".ids")
         try:
@@ -356,7 +357,8 @@ class ContextLifecycle:
                 f.write(",".join(str(t) for t in token_ids[:position]) + "\n")
             self.svc.engine.context_command(f"CONTEXT_RESTORE {h.cid} {h.gen} {path} {meta}")
             return True
-        except (ValueError, EngineDied, OSError):
+        except (ValueError, EngineDied, OSError) as e:
+            print(f"[server] context: {h.cid[:8]} the engine refused the restore ({e})", flush=True)
             return False
         finally:
             try:
