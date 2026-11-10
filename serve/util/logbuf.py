@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+import uuid
 
 from serve.util.loglevel import ERR, WARN, LevelReader
 
@@ -22,6 +23,8 @@ class LogBuffer:
         self.lock = threading.Lock()
         self.lines: collections.deque = collections.deque(maxlen=capacity)
         self.last = 0
+        self.instance_id = uuid.uuid4().hex
+        self.clients = threading.BoundedSemaphore(8)
         self.readers: dict[str, LevelReader] = {}      # per source: a traceback spans lines
 
     def add(self, src: str, text: str) -> None:
@@ -44,6 +47,20 @@ class LogBuffer:
             fresh = [dict(x) for x in self.lines if x["id"] > after_id]
             last = self.last
         return (fresh[-limit:] if limit > 0 else []), last
+
+    def snapshot(self, after: int | None, limit: int, instance: str | None = None) -> dict:
+        """Stream cursor: page forward without skipping lines; detect restarts and ring overflow."""
+        with self.lock:
+            reset = (instance is not None and instance != self.instance_id) or \
+                (after is not None and after > self.last)
+            if reset:
+                after = None
+            dropped = after is not None and bool(self.lines) and after < self.lines[0]["id"] - 1
+            lines = list(self.lines)
+            lines = lines[-limit:] if after is None else [x for x in lines if x["id"] > after][:limit]
+            return {"lines": [dict(x) for x in lines], "last": self.last,
+                    "next": lines[-1]["id"] if lines else self.last,
+                    "instance_id": self.instance_id, "reset": reset, "dropped": dropped}
 
 
 class TeeStream:
