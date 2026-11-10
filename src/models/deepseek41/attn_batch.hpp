@@ -13,9 +13,6 @@ namespace basalt::models::deepseek41 {
 
 class DsModel;
 
-/// The most prompt tokens one batch call takes.
-constexpr int kMaxChunk = 16384;
-
 /// The per-layer caches the decode path and the batch path share (owned by the decode ops).
 struct AttnCaches {
     CacheFormat format = CacheFormat::Fp8;       ///< the rows' format (--kv)
@@ -38,7 +35,11 @@ public:
     virtual bool compress_only(int layer, int64_t pos0, int n_tokens, const float* x, void* stream, std::string& err) = 0;
 };
 
+/// The workspaces of a batch of up to `max_tokens` tokens per call. They are a prompt's workspaces: opened and
+/// released with the others, and counted with them (attn_batch_fixed_bytes + attn_batch_token_bytes per token).
 std::unique_ptr<AttnBatch> make_attn_batch(const DsModel& model, const AttnCaches& caches, int max_tokens, int max_positions,
                                            std::string& err);
+uint64_t attn_batch_fixed_bytes(CacheFormat format);
+uint64_t attn_batch_token_bytes();
 
 }  // namespace basalt::models::deepseek41

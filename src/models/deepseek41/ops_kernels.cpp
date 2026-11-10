@@ -317,12 +317,12 @@ public:
 
     bool attention_batch(int il, int64_t pos0, int n_tokens, const int32_t*, const float* x, float* out, int,
                          void* stream, std::string& err) override {
-        if (!ensure_positions(pos0 + n_tokens, err) || !ensure_batch(err)) return false;
+        if (!ensure_positions(pos0 + n_tokens, err) || !batch_open(err)) return false;
         return batch_->run(il, pos0, n_tokens, x, out, stream, err);
     }
 
-    bool ensure_batch(std::string& err) {
-        if (batch_) return true;
+    bool open_batch(int max_tokens, std::string& err) override {
+        batch_.reset();
         AttnCaches c;
         c.ring = &ring_;
         c.comp_kv = &comp_kv_;
@@ -333,12 +333,17 @@ public:
         c.freq[0] = freq_[0];
         c.freq[1] = freq_[1];
         c.rope = rope_;
-        batch_ = make_attn_batch(m_, c, kMaxChunk, ctx_, err);
+        batch_ = make_attn_batch(m_, c, max_tokens, ctx_, err);
+        return batch_ != nullptr;
+    }
+    void close_batch() override { batch_.reset(); }
+    bool batch_open(std::string& err) const {
+        if (!batch_) err = "deepseek41: the batched attention runs only inside a prompt read";
         return batch_ != nullptr;
     }
 
     bool compress_batch(int il, int64_t pos0, int n_tokens, const float* x, void* stream, std::string& err) override {
-        return ensure_positions(pos0 + n_tokens, err) && ensure_batch(err) && batch_->compress_only(il, pos0, n_tokens, x, stream, err);
+        return ensure_positions(pos0 + n_tokens, err) && batch_open(err) && batch_->compress_only(il, pos0, n_tokens, x, stream, err);
     }
 
     bool stage_token(int64_t pos, int T, void* stream, std::string& err) override {

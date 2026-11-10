@@ -51,6 +51,10 @@ public:
         err = "deepseek41: this layer ops implementation has no batched compressor";
         return false;
     }
+    /// The workspaces of attention_batch and compress_batch for chunks of up to `max_tokens`: a prompt's, opened and
+    /// released with its other workspaces so the expert tier plans for them.
+    virtual bool open_batch(int max_tokens, std::string& err) { (void) max_tokens; (void) err; return true; }
+    virtual void close_batch() {}
     /// The expert tier (VRAM slots and the pinned RAM copy), opened on first use; null when this implementation has none.
     virtual ExpertTier* expert_tier(std::string& err) { (void) err; return nullptr; }
     /// Backs the per-position state (the compressed caches) for positions below `positions`; the layer calls need it

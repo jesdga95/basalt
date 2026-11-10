@@ -7,6 +7,7 @@
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/platform/file.hpp"
+#include "models/deepseek41/attn_batch.hpp"
 #include "models/deepseek41/context_policy.hpp"
 #include "models/deepseek41/session.hpp"
 
@@ -141,6 +142,8 @@ prefillp::Dims DsModel::prompt_dims() const {
     for (const ExpertLayer& e : pack_.experts) {
         d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
     }
+    d.attn_fixed_bytes = attn_batch_fixed_bytes(cache_format_);
+    d.attn_token_bytes = attn_batch_token_bytes();
     return d;
 }
 
