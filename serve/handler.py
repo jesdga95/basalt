@@ -347,6 +347,22 @@ def make_handler(svc: Service):
                     status, body = thread_proxy.forward("POST", path, req)
                     self._json(status, body)
                     return
+                if path == "/v1/engine/threads/fork":         # native thread tape fork (shared token prefix)
+                    names = [req.get(k) for k in ("parent", "parent_head", "child", "child_head")]
+                    keep = req.get("keep_tokens", 0)
+                    if not all(isinstance(n, str) for n in names) or not isinstance(keep, int) or isinstance(keep, bool):
+                        self._json(422, {"error": {"type": "invalid_request_error", "message": "parent, parent_head, child, child_head (strings) and optional keep_tokens (int)"}})
+                        return
+                    try:
+                        shared = svc.thread_fork(*names, keep)
+                    except ValueError as e:
+                        self._json(409, {"error": {"type": "conflict", "message": str(e)}})
+                        return
+                    except (GpuBusy, EngineDied) as e:
+                        self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                        return
+                    self._json(200, {"shared_prefix_tokens": shared})
+                    return
                 if context_proxy.is_context_path(path):
                     status, body = context_proxy.forward("POST", path, req, self.headers.get("Idempotency-Key"))
                     self._json(status, body)

@@ -20,6 +20,7 @@ from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, 
 from serve.engine.vision import Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.config import GRAMMAR_DEFAULT
+from serve.scheduler import adapter as scheduler_adapter
 
 
 def available_ram_mib() -> int | None:
@@ -88,6 +89,7 @@ class Service:
         self.grammar_engine = grammar_engine          # the engine understands the request key
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
+        self.scheduler = None                           # serve.scheduler AgentScheduler; None keeps the request path as is
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
         self.embeddings = threading.local()           # this request's image embeddings file
         self.api_key = ""                              # when set, /v1/* requires it
@@ -626,8 +628,17 @@ class Service:
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
         with self.status_lock:
             best = {k: dict(v) for k, v in self.best.items()}
-        return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
-                "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+        out = {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
+               "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+        return scheduler_adapter.add_metrics(out, self.scheduler)
+
+    def thread_fork(self, parent: str, parent_head: str, child: str, child_head: str, keep: int = 0) -> int:
+        """Fork a native thread tape (engine THREAD_FORK) on the request fifo; returns the shared token prefix length."""
+        fork = getattr(self.engine, "thread_fork", None)
+        if fork is None:
+            raise ValueError("this engine has no native thread tapes")
+        with self.fifo:
+            return fork(parent, parent_head, child, child_head, keep)
 
     def _note_best(self, r: dict) -> None:
         """Keep finished request `r` as the best decode or prefill when it is the fastest big enough one.
