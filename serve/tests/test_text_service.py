@@ -20,7 +20,7 @@ class TextEngine(MockEngine):
     """Counts the text like an engine would (one token per byte here) and answers with the script."""
     takes_text = True
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         if isinstance(ids, PromptText):
             self.seen_text = ids.text
             n = len(ByteTokenizer().encode(ids.text, parse_special=True))   # what an engine would count

@@ -11,7 +11,8 @@ from serve.util.text import IM_END
 
 class Engine(Protocol):
     max_context: int
-    def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event) -> Iterator[int]: ...
+    def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event, embeddings=None,
+                 session: str | None = None) -> Iterator[int]: ...
 
 
 class MockEngine:
@@ -36,7 +37,7 @@ class MockEngine:
         with self.cv:
             return len(self.admission)
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):   # one script: a session picks no slot
         if not self.batch:
             yield from self._run(ids, max_new, sampling, cancel, embeddings)
             return

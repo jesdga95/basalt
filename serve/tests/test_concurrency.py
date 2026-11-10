@@ -169,7 +169,7 @@ class Concurrent(Slots):
 class Drafting(MockEngine):
     """The mock engine with a DONE line's draft counts, as ProcessEngine keeps them."""
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         try:
             yield from super().generate(ids, max_new, sampling, cancel, embeddings)
         finally:

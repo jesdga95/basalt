@@ -9,7 +9,7 @@ from serve.frontend import Event
 from serve.service import Service
 
 
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, session=None):
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     model = svc.model
 
@@ -21,7 +21,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, session=session):
         if kind == "ping":
             yield None
         elif kind == "event":
