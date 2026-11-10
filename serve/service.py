@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import ctypes
+import os
 import subprocess
 import threading
 import time
@@ -20,6 +21,10 @@ from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, 
 from serve.engine.vision import Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.config import GRAMMAR_DEFAULT
+from serve.api.context_adapter import ContextAdapter
+from serve.api.context_lifecycle import ContextLifecycle
+from serve.scheduler import adapter as sched
+from serve.scheduler.core import AdmissionExpired, AdmissionRejected, PREFILL
 
 
 def available_ram_mib() -> int | None:
@@ -129,6 +134,17 @@ class Service:
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # the agent scheduler orders who gets the solo turn next; off unless configured, the fifo still locks it
+        self.scheduler = None
+        if os.environ.get("BASALT_AGENT_SCHEDULER", "").lower() in ("1", "on", "true"):
+            self.scheduler = sched.scheduler_for_service(
+                self, enabled=True, max_inflight=1,
+                min_free_vram_mib=int(os.environ.get("BASALT_SCHEDULER_MIN_FREE_VRAM_MIB", "0") or 0))
+        # agent contexts ride the registry sidecar; off unless BASALT_THREAD_API_KEY is configured
+        self.context = None
+        ctx_adapter = ContextAdapter.from_env()
+        if ctx_adapter is not None:
+            self.context = ContextLifecycle(self, ctx_adapter)
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -626,8 +642,9 @@ class Service:
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
         with self.status_lock:
             best = {k: dict(v) for k, v in self.best.items()}
-        return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
-                "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+        return sched.add_metrics({"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN],
+                                  "best": best, "hardware": tel["now"], "hardware_static": tel["static"],
+                                  "history": tel["history"]}, self.scheduler)
 
     def _note_best(self, r: dict) -> None:
         """Keep finished request `r` as the best decode or prefill when it is the fastest big enough one.
@@ -942,12 +959,40 @@ class Service:
         try:
             # batch slots run requests concurrently, so no fifo
             turn = contextlib.ExitStack()
+            grant = None
+            if self.scheduler is not None and not par:
+                # the scheduler decides who gets the solo turn; a full queue soft-degrades to plain FIFO
+                try:
+                    grant = sched.submit(self.scheduler, getattr(self.request_ctx, "tenant", "default"),
+                                         getattr(self.request_ctx, "agent", "default"),
+                                         len(ids) if isinstance(ids, (list, tuple)) else 0, PREFILL)
+                except AdmissionRejected:
+                    grant = None
             if not getattr(self.engine, "batch", 0):
                 # A request waiting for the single turn sends a keep-alive now and then, so a client with a stream idle
                 # timeout does not abort a healthy queued request; one that left while queued gives its place up.
                 got = False
                 try:
                     while not got:
+                        if grant is not None:
+                            try:
+                                outcome = sched.step(grant, cancel, QUEUE_BEAT_S)
+                            except AdmissionExpired:
+                                break
+                            if outcome == "waiting":
+                                yield "ping", None
+                                continue
+                            if outcome == "cancelled":
+                                break
+                            got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
+                            if got:
+                                turn.callback(sched.release, grant)
+                                turn.callback(self.fifo.release)
+                            elif cancel.is_set():
+                                break
+                            else:
+                                yield "ping", None
+                            continue
                         got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
                         if got:
                             turn.callback(self.fifo.release)
@@ -975,6 +1020,10 @@ class Service:
                     # restart a dead or unloaded engine; parallel requests serialize this start on the fifo
                     with (self.fifo if par else contextlib.nullcontext()):
                         self.ensure_loaded()
+                    ctx_h = None
+                    if self.context is not None and not par:
+                        # lease this request's bound context and load its snapshot when the registry has one
+                        ctx_h = self.context.attach(getattr(self.request_ctx, "request", None), ids)
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
@@ -1142,6 +1191,9 @@ class Service:
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
+                    if self.context is not None and not par:
+                        # publish what the engine now holds and release the lease, under the turn still
+                        self.context.settle(ctx_h, finish in ("stop", "length"))
                 except GeneratorExit:                  # client disconnected
                     finish = "disconnect"
                     raise

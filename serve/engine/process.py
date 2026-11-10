@@ -601,6 +601,35 @@ class ProcessEngine:
             if time.time() > deadline:
                 raise EngineDied(f"the engine did not answer the {what} command")
 
+    def context_command(self, command: str, timeout: float = 900.0) -> str:
+        """Send one CONTEXT_* command and return its `CONTEXT_OK ...` line as words.
+
+        The commands run between requests on the solo session (context_cmds.cpp); a capture or a publish of a long
+        conversation takes time, so the timeout is generous. ValueError carries the engine's `ERR CONTEXT:` refusal,
+        which means the caller rebuilds the context from its transcript instead.
+        """
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        if not command.startswith("CONTEXT_"):
+            raise ValueError("not a context command")
+        self.proc.stdin.write(command + "\n")
+        self.proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the context command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the context command")
+            if line.startswith("CONTEXT_OK "):
+                return line
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the context command")
+
     ENC_TIMEOUT_S = 300.0
 
     def encode_images(self, jobs: list, timeout: float | None = None) -> list[str]:

@@ -12,6 +12,7 @@ context are rejected with a 400, never truncated.
 from __future__ import annotations
 
 import json
+import os
 import signal
 import sys
 import threading
@@ -185,6 +186,9 @@ def main() -> int:
         cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
         if cdir and cmib != "0":
             print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
+        if os.environ.get("BASALT_CONTEXT_STORE_DIR") and flag_value(cfg["args"], "--context-store-dir") is None:
+            # the agent-context snapshot store, when the operator sets it in the environment instead of the config
+            cfg["args"] += ["--context-store-dir", os.environ["BASALT_CONTEXT_STORE_DIR"]]
         # always built unloaded: the load itself (below) is the lazy path's, started here instead of by a request
         engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
         engine.native_slot_metrics = a.native_slot_metrics
