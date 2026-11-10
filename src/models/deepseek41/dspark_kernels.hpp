@@ -18,13 +18,14 @@ inline size_t mxfp4_row_bytes(int n_in) { return (size_t) (n_in / kMxfp4BlockEle
 /// matrices [n_expert][n_ff][n_in] (expert e at e * n_ff * row bytes, 4-byte aligned, followed by kMxfp4Pad readable
 /// bytes); x is q8_1 [T][n_in] (kernels::native_quantize_q8_1), the dots int8 (dp4a) per 32 values as llama.cpp's
 /// MXFP4 kernels take them; the clamp is the SwiGLU limit. n_in is a multiple of 128 and at most 6144.
+/// With `live_rows` (device, may be null) the pairs of tokens from *live_rows on are skipped: their h is left as it is.
 void dspark_moe_gate_up(const void* gate_w, const void* up_w, int n_in, int n_ff, const void* x_q8_1, const int32_t* ids,
-                        int n_tokens, int k, float clamp, float* h, void* stream);
+                        int n_tokens, int k, float clamp, const int32_t* live_rows, float* h, void* stream);
 
 /// d[p][r] = down_e[r] . h[p] with down_e [n_out][n_ff] MXFP4 (expert e at e * n_out * row bytes) and h q8_1
-/// [pairs][n_ff].
+/// [pairs][n_ff]. With `live_rows` (device, may be null) the pairs of tokens from *live_rows on get zeros.
 void dspark_moe_down(const void* down_w, int n_ff, int n_out, const void* h_q8_1, const int32_t* ids, int n_tokens, int k,
-                     float* d, void* stream);
+                     const int32_t* live_rows, float* d, void* stream);
 
 /// out[t][i] = sum_k w[t*K + k] * d[(t*K + k)][i] + shared[t][i].
 void dspark_moe_combine(const float* d, const float* w, const float* shared, int n_tokens, int k, int n, float* out,
