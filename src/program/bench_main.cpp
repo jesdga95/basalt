@@ -411,9 +411,9 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     }
     if (o.community) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
-                        : !o.spec.empty() ? "--spec" : !o.sets.empty() ? "--set" : !o.engine.empty() ? "--engine"
+                        : !o.spec.empty() ? "--spec" : !o.engine.empty() ? "--engine"
                         : !o.gpu.empty() ? "--gpu" : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
-                        : o.format != "md" ? "-o" : !o.passthrough.empty() ? o.passthrough[0].c_str() : nullptr;
+                        : o.format != "md" ? "-o" : nullptr;   // engine flags (--set, others) are refused in main, which can ask the engine
         if (bad != nullptr) {
             err = std::string("--community runs the fixed preset: ") + bad + " would make the row incomparable";
             return false;
@@ -731,6 +731,23 @@ int main(int argc, char** argv) {
     }
     if (engine_bin.empty() || !fs::exists(engine_bin)) {
         basalt::log::error("basalt-bench", "the engine binary %s does not exist (--engine BIN)", engine_bin.c_str());
+        return 2;
+    }
+    if (o.community && (!o.passthrough.empty() || !o.sets.empty())) {
+        // any engine flag is refused; the engine's plan for them says which are lossy, so the refusal can name those
+        std::vector<std::string> extra = o.passthrough;
+        for (const auto& kv : o.sets) {
+            extra.push_back(kv.first);
+            extra.push_back(kv.second);
+        }
+        std::vector<std::string> plan_args = {"--model", fs::absolute(o.model).string(), "--gpu", "0"};
+        merge_args(plan_args, extra);
+        std::string answer;
+        const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
+        (void) engine_plan(engine_bin, plan_args, plan_log, answer);
+        std::error_code rm_ec;
+        fs::remove(plan_log, rm_ec);
+        basalt::log::error("basalt-bench", "%s", basalt::program::community_refusal(extra, answer).c_str());
         return 2;
     }
     std::string community_model, community_arch;
@@ -1264,7 +1281,7 @@ int main(int argc, char** argv) {
             rep += fmt("same top-1 %.2f%%   mean |dlogp| of the base top-1 %.5f\n", quality.top1_pct, quality.dlogp);
         }
     }
-    if (o.format == "md" && !lossy.empty()) rep += "\n" + basalt::program::lossy_note(lossy) + "\n";
+    if (o.format == "md" && !lossy.empty()) rep += "\nLOSSY: lossy flags were on, so these numbers don't compare with a run without them\n";
 
     if (o.format == "json") {
         JW j;
