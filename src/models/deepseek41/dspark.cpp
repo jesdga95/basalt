@@ -123,8 +123,10 @@ struct DsparkDrafter::Impl {
     // pinned host staging
     float* h_feat = nullptr;     // [kInjectRows][feature floats]
     int32_t* h_pos = nullptr;    // [kInjectRows]
-    float* h_emb = nullptr;      // the anchor's row, four streams
-    int32_t* h_meta = nullptr;   // pos[5], start[5], n[5], lim[5], sel[25], tok0
+    float* h_emb = nullptr;      // the anchor's row (mapped: the block's first kernel reads it)
+    int32_t* h_meta = nullptr;   // pos[5], start[5], n[5], lim[5], sel[25], tok0 (mapped)
+    const float* h_emb_dev = nullptr;
+    const int32_t* h_meta_dev = nullptr;
     int32_t* h_out = nullptr;    // tok[5]
     float* h_conf = nullptr;
 
@@ -401,8 +403,10 @@ struct DsparkDrafter::Impl {
         }
         if (cudaHostAlloc((void**) &h_feat, (size_t) kInjectRows * ff * 4, cudaHostAllocPortable) != cudaSuccess ||
             cudaHostAlloc((void**) &h_pos, kInjectRows * 4, cudaHostAllocPortable) != cudaSuccess ||
-            cudaHostAlloc((void**) &h_emb, (size_t) 4 * kN * 4, cudaHostAllocPortable) != cudaSuccess ||
-            cudaHostAlloc((void**) &h_meta, 64 * 4, cudaHostAllocPortable) != cudaSuccess ||
+            cudaHostAlloc((void**) &h_emb, (size_t) kN * 4, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostAlloc((void**) &h_meta, 64 * 4, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &h_emb_dev, h_emb, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &h_meta_dev, h_meta, 0) != cudaSuccess ||
             cudaHostAlloc((void**) &h_out, 8 * 4, cudaHostAllocPortable) != cudaSuccess ||
             cudaHostAlloc((void**) &h_conf, 8 * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "dspark: cannot allocate pinned staging";
@@ -455,11 +459,10 @@ struct DsparkDrafter::Impl {
         project(feat, dpos1, n, rings, kWindowSlots, st);
     }
 
-    // The block's stages: its inputs (the metadata, the anchor's row, the mask rows), then every stage over all rows.
+    // The block's stages: its inputs (the metadata and the anchor's row, read from the mapped staging by a kernel: copy
+    // nodes start a graph late; the mask rows), then every stage over all rows.
     void run_body() {
-        cudaMemcpyAsync(dmeta, h_meta, (size_t) kMetaUpload * 4, cudaMemcpyHostToDevice, st);
-        cudaMemcpyAsync(x, h_emb, (size_t) 4 * kN * 4, cudaMemcpyHostToDevice, st);
-        cudaMemcpyAsync(x + (size_t) 4 * kN, x_mask, (size_t) 4 * (kT - 1) * kN * 4, cudaMemcpyDeviceToDevice, st);
+        dspark_block_inputs(h_meta_dev, kMetaUpload, h_emb_dev, x_mask, kN, kT, dmeta, x, cur, st);
         HcArgs hca;
         hca.n_embd = kN;
         hca.rms_eps = kEps;
@@ -474,8 +477,7 @@ struct DsparkDrafter::Impl {
             const Stage& s = stage[l];
             hc_mixes(x, s.hc_attn_fn, s.hc_attn_scale, s.hc_attn_base, kT, hca, hc_ws, coef_a, st);
             if (l == 0) {
-                cudaMemcpy2DAsync(cur, kN * 4, x, 4 * kN * 4, kN * 4, kT, cudaMemcpyDeviceToDevice, st);
-                rms_norm_rows(cur, s.attn_norm, kT, kN, kEps, normed, st);
+                rms_norm_rows(cur, s.attn_norm, kT, kN, kEps, normed, st);   // cur holds stream 0 of each input row
             } else {
                 hc_pre_rms_norm(x, coef_f[(l - 1) & 1], kHcCoef, s.attn_norm, kT, kN, kEps, cur, normed, st);
             }
@@ -715,10 +717,9 @@ bool DsparkDrafter::draft_begin(int w, int32_t anchor, int64_t pos, int n_out, s
     const std::vector<int64_t>& ring_pos = d.ring_pos[(size_t) w];
     n_out = std::clamp(n_out, 1, kT);
     try {
-        // the block's host inputs: four hyper-connection copies of the anchor's embedding, then the index arrays (the last
-        // block, which read them, has ended; an inject before this block may still run)
+        // the block's host inputs: the anchor's embedding (the block copies it into the four hyper-connection streams),
+        // then the index arrays (the last block, which read them, has ended; an inject before this block may still run)
         if (!d.main.embedding_row(anchor, d.h_emb, err)) return false;
-        for (int s = 1; s < 4; ++s) std::memcpy(d.h_emb + (size_t) s * kN, d.h_emb, (size_t) kN * 4);
         // the window is the run of positions before `pos` the rings hold
         int64_t start = pos;
         while (start > 0 && pos - start < kDsparkWindow && ring_pos[(size_t) ((start - 1) % kWindowSlots)] == start - 1) --start;

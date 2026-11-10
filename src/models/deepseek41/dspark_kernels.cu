@@ -305,6 +305,22 @@ void dspark_kv_rope(const float* raw, const float* norm_w, const int32_t* pos, i
 }
 
 namespace {
+// Block (column group, row): x's row as four streams, cur's row as stream 0; the first block copies the metadata.
+__global__ void k_block_inputs(const int32_t* __restrict__ meta, int n_meta, const float4* __restrict__ emb,
+                               const float4* __restrict__ mask, int n4, int32_t* __restrict__ dmeta, float4* __restrict__ x,
+                               float4* __restrict__ cur) {
+    const int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r == 0 && blockIdx.x == 0)
+        for (int j = threadIdx.x; j < n_meta; j += blockDim.x) dmeta[j] = meta[j];
+    if (i >= n4) return;
+    const float4* src = r == 0 ? emb : mask + (size_t) (r - 1) * 4 * n4;
+    float4* xr = x + (size_t) r * 4 * n4;
+    const float4 v0 = src[i];
+    xr[i] = v0;
+    for (int s = 1; s < 4; ++s) xr[(size_t) s * n4 + i] = r == 0 ? v0 : src[(size_t) s * n4 + i];
+    cur[(size_t) r * n4 + i] = v0;
+}
+
 __global__ void k_fill_positions(int32_t* pos, int64_t pos0, int n) {
     if ((int) threadIdx.x < n) pos[threadIdx.x] = (int32_t) (pos0 + threadIdx.x);
 }
@@ -320,6 +336,15 @@ __global__ void k_commit_rows(const uint4* __restrict__ staged, int stage_slots,
     ring[(size_t) (p % ring_slots) * kWords + threadIdx.x] = src[threadIdx.x];
 }
 }  // namespace
+
+void dspark_block_inputs(const int32_t* meta, int n_meta, const float* emb, const float* mask, int n, int rows,
+                         int32_t* dmeta, float* x, float* cur, void* stream) {
+    const int n4 = n / 4;
+    k_block_inputs<<<dim3((unsigned) ((n4 + 255) / 256), (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(
+        meta, n_meta, reinterpret_cast<const float4*>(emb), reinterpret_cast<const float4*>(mask), n4, dmeta,
+        reinterpret_cast<float4*>(x), reinterpret_cast<float4*>(cur));
+    check("dspark_block_inputs");
+}
 
 void dspark_fill_positions(int32_t* pos, int64_t pos0, int n, void* stream) {
     if (n <= 0) return;
