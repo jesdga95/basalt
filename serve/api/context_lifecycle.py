@@ -209,6 +209,11 @@ class ContextLifecycle:
                 try:
                     words = self.svc.engine.context_command(f"CONTEXT_DROP {cid}", timeout=120.0).split()
                     print(f"[server] context: {cid[:8]} engine freed {words[3] if len(words) > 3 else '?'} files", flush=True)
+                    if self.store_dir:
+                        try:
+                            os.rmdir(os.path.join(self.store_dir, cid))   # the engine freed the files; the empty folder goes with them
+                        except OSError:
+                            pass
                 except (ValueError, EngineDied) as e:
                     print(f"[server] context: engine drop of {cid[:8]} refused ({e})", flush=True)
                 try:
