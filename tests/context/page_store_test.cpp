@@ -1,4 +1,5 @@
 #include "basalt/context/page_store.hpp"
+#include "basalt/context/hash.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -18,12 +19,6 @@ void check(bool condition, const char* message) {
 }
 void ok(const PageResult& r, const char* message) {
     if (!r) { std::fprintf(stderr, "FAIL: %s: %s %s\n", message, page_status_name(r.status), r.reason.c_str()); std::abort(); }
-}
-std::string hex(const Digest& d) {
-    static const char* k = "0123456789abcdef";
-    std::string s;
-    for (uint8_t b : d) { s += k[b >> 4]; s += k[b & 15]; }
-    return s;
 }
 // A caller's range as its pool hands it out: page-aligned.
 struct Region {
@@ -52,12 +47,12 @@ std::vector<uint8_t> page_of(const PageStore& s, const ContextId& id, size_t pag
 }
 
 void digests() {
-    check(hex(page_digest("abc", 3)) == "bf1dd8a4b79ddcaf8a5b14296180b2d4f04299012c1dd5ad5479d023b8b6b13a", "short digest");
+    check(to_hex(page_digest("abc", 3)) == "ea29555ec7d8ffd05e99a85faeb8f4dd0739f204b718d94c4f743eb07f1b29c1", "short digest");
     std::vector<uint8_t> data(1000);
     for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<uint8_t>((i * 7 + 3) % 256);
-    check(hex(page_digest(data.data(), data.size())) ==
-              "a80716e605c451714de31bd4bf3b25f9997cbcde4aab8aefcc2fceacca3b0e18", "multi-block digest");
-    check(hex(page_digest(nullptr, 0)) == "731daf19436c33c0353198230d15c7afc9baf8dcdce46c86bd2905b0bfc2ffaf", "empty digest");
+    check(to_hex(page_digest(data.data(), data.size())) ==
+              "2857fbfab5ee6da605fbfeca2bbf9c9e91c1c96138b6b62c5d570121847f9e58", "multi-block digest");
+    check(to_hex(page_digest(nullptr, 0)) == "70f00a9d6a9482286335a9a567cac49722d4bf81a16934469051dd5cfe73e30a", "empty digest");
 }
 
 void lazy_admission() {
