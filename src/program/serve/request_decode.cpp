@@ -407,6 +407,11 @@ Flow Request::decode() {
                           std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
             }
             const bool will_draft = !eos_pre && produced_n + n_emit < max_new;
+            // Nothing past the stop token or the answer's cap joins the conversation: the emit above is the
+            // boundary of what the client's transcript can ever send back, and a context snapshot's prefix
+            // must be reproducible from that transcript (serve re-renders it on restore). Verified drafts the
+            // window accepted beyond that boundary are dropped, the same as they are never emitted.
+            if (n_emit < a - e0 + 1) a = e0 + n_emit - 1;
             float wprob[16];
             const int wprob_n = std::min(runtime_.S_mtp, 16);
             if (draft_log != nullptr)
@@ -554,6 +559,17 @@ Flow Request::decode() {
             continue;
         }
         spawn_adapt(false);
+        // the same boundary as the chain's: verified tokens past the stop or the cap are dropped, not committed
+        {
+            int n_emit = 0;
+            bool eos_pre = false;
+            for (int i = e0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
+                ++n_emit;
+                eos_pre = ppl == nullptr &&
+                          std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
+            }
+            if (n_emit < a - e0 + 1) a = e0 + n_emit - 1;
+        }
         if (!runtime_.ver.commit(a + 1, runtime_.err)) {
             if (adapt_thr.joinable()) adapt_thr.join();
             std::printf("ERR %s\n", runtime_.err.c_str());
