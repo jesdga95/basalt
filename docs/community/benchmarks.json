@@ -94,28 +94,6 @@
       "decode_tps": 65.9
     },
     {
-      "submitter": "giveen",
-      "date": "2026-10-23",
-      "commit": "9c3692e7f5",
-      "preset": "community-1",
-      "model": "Qwen3.8-Flash-Next",
-      "gpus": [
-        {
-          "name": "RTX 5090",
-          "vram_gib": 32,
-          "power_w": 475
-        }
-      ],
-      "ram_gib": 247,
-      "os": "Linux",
-      "quant": "NVFP4",
-      "kv": "int8",
-      "prefill_16k_tps": 9556.4,
-      "prefill_64k_tps": 10541.5,
-      "decode_tps": 311.8,
-      "notes": "single RTX 5090 at a 475 W limit (below the card's 575 W default), 247 GB DDR5; 0 SSD spill"
-    },
-    {
       "submitter": "foolio",
       "date": "2026-10-23",
       "commit": "702c08f783",
@@ -1250,32 +1228,6 @@
       "notes": "corrected: this run used a 489 W limit (85 % of default); the 575 W in the original submission was a labelling error, the stock 575 W numbers are in the 2026-11-06 rows"
     },
     {
-      "submitter": "giveen",
-      "date": "2026-11-06",
-      "commit": "13a42fd0d1",
-      "preset": "community-1",
-      "model": "DeepSeek-V4.1-Flash",
-      "gpus": [
-        {
-          "name": "RTX 5090",
-          "vram_gib": 32,
-          "power_w": 475,
-          "pcie": "5.0 x16",
-          "h2d_gbps": 48.5
-        }
-      ],
-      "ram_gib": 247,
-      "cpu": "Intel Core Ultra 9 285K, 24 cores",
-      "ram_gbps": 66.7,
-      "os": "Linux",
-      "quant": "IQ1_M",
-      "kv": "fp16",
-      "prefill_16k_tps": 2476.5,
-      "prefill_64k_tps": 3223.4,
-      "decode_tps": 87.4,
-      "notes": "single RTX 5090 at 475 W, 247 GB RAM; all 384 experts/layer in memory (0 SSD spill); DSpark draft window 3"
-    },
-    {
       "submitter": "jesdga95",
       "date": "2026-11-10",
       "commit": "37c2c1a8ad",
@@ -1677,35 +1629,10 @@
     },
     {
       "submitter": "giveen",
-      "date": "2026-11-09",
-      "commit": "89fa1ddd58",
+      "date": "2026-11-10",
+      "commit": "ffbe33f0cf",
       "preset": "community-1",
       "model": "DeepSeek-V4.1-Flash",
-      "gpus": [
-        {
-          "name": "RTX 5090",
-          "vram_gib": 32,
-          "power_w": 475,
-          "pcie": "5.0 x16",
-          "h2d_gbps": 48.6
-        }
-      ],
-      "ram_gib": 247,
-      "cpu": "Intel Core Ultra 9 285K, 24 cores",
-      "ram_gbps": 72.2,
-      "os": "Linux",
-      "quant": "IQ1_M",
-      "kv": "fp8+fp4",
-      "prefill_16k_tps": 2333.3,
-      "prefill_64k_tps": 2992.0,
-      "decode_tps": 102.0
-    },
-    {
-      "submitter": "giveen",
-      "date": "2026-11-09",
-      "commit": "89fa1ddd58",
-      "preset": "community-1",
-      "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
@@ -1717,13 +1644,58 @@
       ],
       "ram_gib": 247,
       "cpu": "Intel Core Ultra 9 285K, 24 cores",
-      "ram_gbps": 72.7,
+      "ram_gbps": 73.5,
+      "os": "Linux",
+      "quant": "IQ1_M",
+      "kv": "fp8+fp4",
+      "prefill_16k_tps": 2417.9,
+      "prefill_64k_tps": 3056.0,
+      "decode_tps": 113.4,
+      "decode_conv_tps": 69.9,
+      "decode_struct_tps": 136.2,
+      "decode_prose_tps": 74.1,
+      "accept_conv_pct": 73.5,
+      "accept_struct_pct": 98.5,
+      "accept_prose_pct": 64.6,
+      "draft_len_conv": 1.0,
+      "draft_len_struct": 4.8,
+      "draft_len_prose": 1.0,
+      "engine_args": "--gpu 0 --max-context 61709 --kv fp8"
+    },
+    {
+      "submitter": "giveen",
+      "date": "2026-11-10",
+      "commit": "ffbe33f0cf",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 475,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 48.6
+        }
+      ],
+      "ram_gib": 247,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 76.7,
       "os": "Linux",
       "quant": "NVFP4",
       "kv": "int8",
-      "prefill_16k_tps": 9705.5,
-      "prefill_64k_tps": 10521.2,
-      "decode_tps": 378.2
+      "prefill_16k_tps": 9328.7,
+      "prefill_64k_tps": 10585.9,
+      "decode_tps": 362.7,
+      "decode_conv_tps": 216.4,
+      "decode_struct_tps": 449.7,
+      "decode_prose_tps": 236.2,
+      "accept_conv_pct": 73.9,
+      "accept_struct_pct": 97.9,
+      "accept_prose_pct": 64.9,
+      "draft_len_conv": 2.4,
+      "draft_len_struct": 7.0,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     }
   ]
 }
