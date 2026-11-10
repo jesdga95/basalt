@@ -98,8 +98,9 @@ class ContextAdapter:
         secret = os.environ.get("BASALT_THREAD_API_KEY")
         if not secret or len(secret) < 24:
             return None
+        host = os.environ.get("BASALT_THREAD_API_HOST") or "127.0.0.1"
         port = int(os.environ.get("BASALT_THREAD_API_PORT", "8095"))
-        return cls(f"http://127.0.0.1:{port}", {"Authorization": f"Bearer {secret}"}, **kw)
+        return cls(f"http://{host}:{port}", {"Authorization": f"Bearer {secret}"}, **kw)
 
     # -- binding ---------------------------------------------------------------
     def extract_binding(self, request: Mapping[str, Any]) -> Optional[Binding]:
@@ -146,8 +147,13 @@ class ContextAdapter:
                              f"{key}:resume", (200,))
             lease = res.get("lease")
             token = lease.get("token") if isinstance(lease, dict) else None
-            if not isinstance(token, str) or not token:
+            # The registry issues the lease token as a 64-bit number; transitions and releases send it back as one.
+            if isinstance(token, bool) or not isinstance(token, (int, str)):
                 raise RegistryError("invalid_response")
+            if isinstance(token, str):
+                if not token.isdigit():
+                    raise RegistryError("invalid_response")
+                token = int(token)
         except RegistryError as err:
             return self._replay(binding, err)
         source = res.get("source")

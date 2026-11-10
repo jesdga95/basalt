@@ -18,6 +18,7 @@ _ROUTES = (
     (re.compile(rf"^/v1/contexts/{_ID}$"), frozenset({"GET", "DELETE"})),
     (re.compile(rf"^/v1/contexts/{_ID}/(?:fork|resume|transition)$"), frozenset({"POST"})),
     (re.compile(rf"^/v1/contexts/{_ID}/lease/release$"), frozenset({"POST"})),
+    (re.compile(rf"^/v1/contexts/{_ID}/payload/released$"), frozenset({"POST"})),
 )
 _MAX_RESPONSE = 8 * 1024 * 1024
 _IDEMPOTENCY_KEY = re.compile(r"^[\x20-\x7e]{1,256}$")
@@ -60,7 +61,8 @@ def forward(method: str, path: str, payload=None, idempotency_key: str | None = 
     if idempotency_key is not None:
         headers["Idempotency-Key"] = idempotency_key
     body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    conn = http.client.HTTPConnection("127.0.0.1", portnum, timeout=60)
+    host = os.environ.get("BASALT_THREAD_API_HOST") or "127.0.0.1"
+    conn = http.client.HTTPConnection(host, portnum, timeout=60)
     try:
         conn.request(method, path, body=body, headers=headers)
         response = conn.getresponse()

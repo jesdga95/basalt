@@ -79,6 +79,7 @@ TierMover::Outcome FileTierMover::copy(const TierMove& move, const std::atomic<b
     if (pb == 0) { error = "page store is not open"; return Outcome::failed; }
     if (!valid_context_id(move.context) || move.generation == 0) { error = "invalid context id or generation"; return Outcome::failed; }
     if (move.from == Tier::host && move.to == Tier::disk) {
+        if (move.bytes == 0 || move.bytes > (uint64_t) 1 << 48) { error = "bytes out of range"; return Outcome::failed; }
         const size_t pages = (size_t) ((move.bytes + pb - 1) / pb);
         const std::string final_path = path_of(move.context, move.generation);
         const std::string tmp = final_path + ".tmp";
@@ -120,10 +121,13 @@ TierMover::Outcome FileTierMover::copy(const TierMove& move, const std::atomic<b
         if (!read_all(fd, head, sizeof head) || std::memcmp(head, kMagic, 8) != 0) { error = "bad snapshot header: " + path; return Outcome::corrupt; }
         if (get_be64(head + 8) != pb) { error = "page size differs from the pool"; return Outcome::corrupt; }
         if (get_be64(head + 24) != move.generation) { error = "snapshot is another generation"; return Outcome::corrupt; }
-        const size_t pages = (size_t) get_be64(head + 16);
-        if ((uint64_t) pages * pb < move.bytes) { error = "snapshot is shorter than the context"; return Outcome::corrupt; }
         struct stat st;
-        if (::fstat(fd, &st) != 0 || (uint64_t) st.st_size != kHeader + (uint64_t) pages * pb + 32) { error = "snapshot size mismatch: " + path; return Outcome::corrupt; }
+        if (::fstat(fd, &st) != 0 || (uint64_t) st.st_size < kHeader + 32) { error = "snapshot size mismatch: " + path; return Outcome::corrupt; }
+        const uint64_t body = (uint64_t) st.st_size - kHeader - 32;   // the header's count is checked against the real size
+        const uint64_t declared = get_be64(head + 16);
+        if (declared > body / pb || declared * pb != body) { error = "snapshot size mismatch: " + path; return Outcome::corrupt; }
+        const size_t pages = (size_t) declared;
+        if (declared * pb < move.bytes) { error = "snapshot is shorter than the context"; return Outcome::corrupt; }
         PageResult c = store_.create(move.context, pages);
         if (!c) { error = "host create: " + c.reason; return Outcome::failed; }
         auto drop = [&](Outcome o, std::string msg) { store_.remove(move.context); error = std::move(msg); return o; };

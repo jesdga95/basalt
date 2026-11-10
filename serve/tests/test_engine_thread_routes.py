@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from serve.engine.mock import MockEngine
+from serve.engine.process import ProcessEngine
 from serve.frontend import ChatTemplate
 from serve.handler import serve
 from serve.service import Service
@@ -14,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class TapeEngine(MockEngine):
+    _THREAD_NAME = ProcessEngine._THREAD_NAME
+
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.tapes = {}

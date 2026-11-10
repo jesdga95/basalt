@@ -341,6 +341,20 @@ pub async fn create_context(db: &PgPool, owner: Uuid, thread: Uuid, branch: Opti
         }
     };
     let roles: Vec<(String, Digest32)> = chain.into_iter().map(|(_, r, h)| (r, h)).collect();
+    // One context per transcript head: a repeated attach reuses the branch's live context at this position
+    // instead of fragmenting the lineage with a fresh row per request. The branch's own (unforked) context
+    // wins over forked children that share the head; children keep their private leases through /fork.
+    let existing = sqlx::query(&format!(
+        "SELECT {COLS} FROM contexts WHERE owner_id=$1 AND thread_id=$2 AND branch_id=$3 \
+         AND head_message_id IS NOT DISTINCT FROM $4 AND deleted_at IS NULL \
+         ORDER BY (parent_id IS NULL) DESC, updated_at DESC LIMIT 1"))
+        .bind(owner).bind(thread).bind(branch_id).bind(head)
+        .fetch_optional(&mut *tx).await?;
+    if let Some(r) = existing {
+        let out = context_from(&r)?;
+        tx.commit().await?;
+        return Ok(out);
+    }
     let id = Uuid::new_v4();
     let sql = format!(
         "INSERT INTO contexts(id,owner_id,thread_id,branch_id,head_message_id,model_fingerprint,prefix_hash)
@@ -537,6 +551,29 @@ pub async fn tombstone(db: &PgPool, owner: Uuid, id: Uuid) -> Res<Context> {
     }
     let sql = format!("UPDATE contexts SET deleted_at=clock_timestamp(),version=version+1,
                          updated_at=clock_timestamp() WHERE id=$1 RETURNING {COLS}");
+    let row = sqlx::query(&sql).bind(id).fetch_one(&mut *tx).await?;
+    let out = context_from(&row)?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Engine confirmation that a tombstoned context's snapshot payload is gone: the locator,
+/// tier, validated flag and epoch are cleared so the sweeper's GC can purge the row. Only a
+/// tombstoned context can be released this way; a live context keeps its recoverable snapshot.
+/// Idempotent: an already-released row is returned unchanged.
+pub async fn release_payload(db: &PgPool, owner: Uuid, id: Uuid) -> Res<Context> {
+    let mut tx = db.begin().await?;
+    let c = lock_owned(&mut tx, owner, id, true).await?;
+    if !c.tombstoned {
+        return Err(RegistryError::Invalid("payload release requires a tombstoned context".into()));
+    }
+    if c.locator.is_none() && c.tier == Tier::None && !c.validated && c.engine_epoch.is_none() {
+        tx.commit().await?;
+        return Ok(c);
+    }
+    let sql = format!("UPDATE contexts SET state='RECORDED',tier='none',validated=false,locator=NULL,\
+                         engine_epoch=NULL,version=version+1,updated_at=clock_timestamp() \
+                         WHERE id=$1 RETURNING {COLS}");
     let row = sqlx::query(&sql).bind(id).fetch_one(&mut *tx).await?;
     let out = context_from(&row)?;
     tx.commit().await?;

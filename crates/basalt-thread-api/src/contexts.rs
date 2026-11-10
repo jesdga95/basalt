@@ -52,6 +52,9 @@ struct ForkReq { expected_version: i64 }
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct ResumeReq { lease_ttl_ms: Option<i64> }
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct EmptyReq {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReleaseReq { token: i64 }
@@ -168,6 +171,7 @@ async fn read(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Path<St
         "version": c.version, "validated": c.validated,
         "model_fingerprint": reg::hex(&c.model_fingerprint), "prefix_hash": reg::hex(&c.prefix_hash),
         "position": {"prefix_tokens": c.prefix_tokens, "head_message_id": c.head_message_id},
+        "locator": c.locator,
         "lineage": v.lineage.iter().map(|l| json!({
             "context_id": l.id, "state": l.state.as_str(), "version": l.version,
             "tombstoned": l.tombstoned})).collect::<Vec<_>>(),
@@ -184,6 +188,16 @@ async fn delete(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Path<
     Ok((StatusCode::ACCEPTED, Json(json!({"context_id": id, "deleted": true}))))
 }
 
+async fn payload_released(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Path<String>, body: Bytes)
+    -> ApiResult<Json<Value>> {
+    authorize(&headers, &app)?;
+    let id = context_id(&id)?;
+    parse_optional_body::<EmptyReq>(&body)?;
+    let c = reg::release_payload(&app.pool, app.owner, id).await.map_err(registry_error)?;
+    Ok(Json(json!({"context_id": id, "state": c.state.as_str(), "tier": c.tier.as_str(),
+                   "locator": c.locator, "version": c.version})))
+}
+
 pub fn router() -> Router<Arc<App>> {
     Router::new()
         .route("/v1/contexts", post(create))
@@ -192,6 +206,7 @@ pub fn router() -> Router<Arc<App>> {
         .route("/v1/contexts/{id}/resume", post(resume))
         .route("/v1/contexts/{id}/lease/release", post(release))
         .route("/v1/contexts/{id}/transition", post(transition))
+        .route("/v1/contexts/{id}/payload/released", post(payload_released))
 }
 
 /// Restart-safe sweeper: expire leases, rebuild orphans and collect tombstones that own

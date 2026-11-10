@@ -8,6 +8,8 @@ TierMover::Outcome DeviceTierMover::copy(const TierMove& move, const std::atomic
                                          std::string& error) {
     const size_t pb = store_.page_bytes();
     if (pb == 0) { error = "page store is not open"; return Outcome::failed; }
+    if (move.bytes == 0 || move.bytes > (uint64_t) 1 << 48) { error = "bytes out of range"; return Outcome::failed; }
+        if (move.bytes == 0 || move.bytes > ((uint64_t) 1 << 48)) { error = "bytes out of range"; return Outcome::failed; }
     const size_t pages = (size_t) ((move.bytes + pb - 1) / pb);
     std::vector<uint8_t> buf(pb);
     std::vector<Digest> digests;

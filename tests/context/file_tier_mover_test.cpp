@@ -46,6 +46,13 @@ int main() {
     // a flipped byte on disk is detected
     { std::fstream f(mover.path_of("ctx", 5), std::ios::in | std::ios::out | std::ios::binary); f.seekp(100); f.put('Z'); }
     CHECK(mover.copy(up, no, d2, e) == TierMover::Outcome::corrupt);
+    // a crafted header page count that would wrap the size arithmetic is corrupt, never an allocation
+    { std::fstream f(mover.path_of("ctx", 5), std::ios::in | std::ios::out | std::ios::binary);
+      f.seekp(16); const unsigned char huge[8] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}; f.write((const char*) huge, 8); }
+    CHECK(mover.copy(up, no, d2, e) == TierMover::Outcome::corrupt);
+    // an absurd byte count is refused before any allocation
+    TierMove huge_move{"c9", Tier::host, Tier::disk, 1, ~uint64_t(0), false, {}};
+    CHECK(mover.copy(huge_move, no, d2, e) == TierMover::Outcome::failed);
     // cancel mid-move leaves nothing
     std::atomic<bool> yes{true};
     CHECK(store.create("c2", 2));

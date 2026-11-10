@@ -78,6 +78,8 @@ void usage() {
                  "                       when a prompt starts with one, also after a restart (default 0 = off)\n"
                  "  --conversation-cache-dir DIR  --serve: the disk tier's folder (required with a budget unless the\n"
                  "                       server starts the engine, which uses the model cache folder)\n"
+                 "  --context-store-dir DIR  --serve: the agent-context snapshot folder; non-empty turns the\n"
+                 "                       CONTEXT_* commands on (docs/architecture/agent-context-contract.md)\n"
                  "  --vram-elastic       --serve (opt-in): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"

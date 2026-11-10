@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import ctypes
+import os
 import subprocess
 import threading
 import time
@@ -20,8 +21,10 @@ from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, 
 from serve.engine.vision import Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.config import GRAMMAR_DEFAULT
-from serve.scheduler import adapter as scheduler_adapter
-from serve.scheduler.core import AdmissionExpired, AdmissionRejected
+from serve.api.context_adapter import ContextAdapter
+from serve.api.context_lifecycle import ContextLifecycle
+from serve.scheduler import adapter as sched
+from serve.scheduler.core import AdmissionExpired, AdmissionRejected, PREFILL
 
 
 def available_ram_mib() -> int | None:
@@ -90,7 +93,6 @@ class Service:
         self.grammar_engine = grammar_engine          # the engine understands the request key
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
-        self.scheduler = None                           # serve.scheduler AgentScheduler; None keeps the request path as is
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
         self.embeddings = threading.local()           # this request's image embeddings file
         self.api_key = ""                              # when set, /v1/* requires it
@@ -132,6 +134,17 @@ class Service:
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # the agent scheduler orders who gets the solo turn next; off unless configured, the fifo still locks it
+        self.scheduler = None
+        if os.environ.get("BASALT_AGENT_SCHEDULER", "").lower() in ("1", "on", "true"):
+            self.scheduler = sched.scheduler_for_service(
+                self, enabled=True, max_inflight=1,
+                min_free_vram_mib=int(os.environ.get("BASALT_SCHEDULER_MIN_FREE_VRAM_MIB", "0") or 0))
+        # agent contexts ride the registry sidecar; off unless BASALT_THREAD_API_KEY is configured
+        self.context = None
+        ctx_adapter = ContextAdapter.from_env()
+        if ctx_adapter is not None:
+            self.context = ContextLifecycle(self, ctx_adapter)
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -629,27 +642,39 @@ class Service:
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
         with self.status_lock:
             best = {k: dict(v) for k, v in self.best.items()}
-        out = {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
-               "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
-        return scheduler_adapter.add_metrics(out, self.scheduler)
+        return sched.add_metrics({"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN],
+                                  "best": best, "hardware": tel["now"], "hardware_static": tel["static"],
+                                  "history": tel["history"]}, self.scheduler)
+
+    THREAD_FIFO_WAIT_S = 2.0
+
+    def _thread_engine_call(self, fn):
+        """Run a native thread-tape command on the request fifo, but never wait behind a long generation."""
+        if not self.fifo.acquire(timeout=self.THREAD_FIFO_WAIT_S):
+            raise GpuBusy("the engine is busy with a request; retry the thread command")
+        try:
+            return fn()
+        finally:
+            self.fifo.release()
 
     def thread_attach(self, thread: str, head: str, ids: list) -> None:
-        """Attach a native thread tape (engine THREAD_ATTACH) on the request fifo."""
+        """Attach a native thread tape (engine THREAD_ATTACH)."""
         command = getattr(self.engine, "thread_command", None)
         if command is None:
             raise ValueError("this engine has no native thread tapes")
+        name = self.engine._THREAD_NAME if hasattr(self.engine, "_THREAD_NAME") else None
+        if name is not None and not (name.fullmatch(thread or "") and name.fullmatch(head or "")):
+            raise ValueError("thread and head names are 1..128 characters of A-Z a-z 0-9 - _")
         if not ids or not all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in ids):
             raise ValueError("ids must be a non-empty list of token ids")
-        with self.fifo:
-            command(f"THREAD_ATTACH {thread} {head} " + ",".join(map(str, ids)))
+        self._thread_engine_call(lambda: command(f"THREAD_ATTACH {thread} {head} " + ",".join(map(str, ids))))
 
     def thread_fork(self, parent: str, parent_head: str, child: str, child_head: str, keep: int = 0) -> int:
-        """Fork a native thread tape (engine THREAD_FORK) on the request fifo; returns the shared token prefix length."""
+        """Fork a native thread tape (engine THREAD_FORK); returns the shared token prefix length."""
         fork = getattr(self.engine, "thread_fork", None)
         if fork is None:
             raise ValueError("this engine has no native thread tapes")
-        with self.fifo:
-            return fork(parent, parent_head, child, child_head, keep)
+        return self._thread_engine_call(lambda: fork(parent, parent_head, child, child_head, keep))
 
     def _note_best(self, r: dict) -> None:
         """Keep finished request `r` as the best decode or prefill when it is the fastest big enough one.
@@ -962,47 +987,42 @@ class Service:
                                               "model": getattr(self.request_ctx, "model", None) or self.model,
                                               "prompt_tokens": len(ids), "started": time.time()}
         try:
-            # fair admission (serve.scheduler); None or disabled: the request goes straight on as before
-            turn = contextlib.ExitStack()
-            sched = self.scheduler
-            if sched is not None and sched.enabled:
-                grant = None
-                try:
-                    grant = scheduler_adapter.submit(
-                        sched, getattr(self.request_ctx, "tenant", None) or "default",
-                        getattr(self.request_ctx, "agent", None) or "default", len(ids))
-                    turn.callback(scheduler_adapter.release, grant)
-                    state = scheduler_adapter.step(grant, cancel)
-                    while state == "waiting":
-                        yield "ping", None
-                        state = scheduler_adapter.step(grant, cancel)
-                except (AdmissionRejected, AdmissionExpired) as e:
-                    turn.close()
-                    with self.status_lock:
-                        self.status["queued"] -= 1
-                        self.waiting.pop(id(wait_key), None)
-                    raise GpuBusy(f"the scheduler did not admit this request ({type(e).__name__})") from None
-                except BaseException:                    # the consumer closed us at a ping
-                    turn.close()
-                    with self.status_lock:
-                        self.status["queued"] -= 1
-                        self.waiting.pop(id(wait_key), None)
-                    raise
-                if state == "cancelled":
-                    turn.close()
-                    with self.status_lock:
-                        self.status["queued"] -= 1
-                        self.waiting.pop(id(wait_key), None)
-                    yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
-                                   "reasoning_tokens": 0}
-                    return
             # batch slots run requests concurrently, so no fifo
+            turn = contextlib.ExitStack()
+            grant = None
+            if self.scheduler is not None and not par:
+                # the scheduler decides who gets the solo turn; a full queue soft-degrades to plain FIFO
+                try:
+                    grant = sched.submit(self.scheduler, getattr(self.request_ctx, "tenant", "default"),
+                                         getattr(self.request_ctx, "agent", "default"),
+                                         len(ids) if isinstance(ids, (list, tuple)) else 0, PREFILL)
+                except AdmissionRejected:
+                    grant = None
             if not getattr(self.engine, "batch", 0):
                 # A request waiting for the single turn sends a keep-alive now and then, so a client with a stream idle
                 # timeout does not abort a healthy queued request; one that left while queued gives its place up.
                 got = False
                 try:
                     while not got:
+                        if grant is not None:
+                            try:
+                                outcome = sched.step(grant, cancel, QUEUE_BEAT_S)
+                            except AdmissionExpired:
+                                break
+                            if outcome == "waiting":
+                                yield "ping", None
+                                continue
+                            if outcome == "cancelled":
+                                break
+                            got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
+                            if got:
+                                turn.callback(sched.release, grant)
+                                turn.callback(self.fifo.release)
+                            elif cancel.is_set():
+                                break
+                            else:
+                                yield "ping", None
+                            continue
                         got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
                         if got:
                             turn.callback(self.fifo.release)
@@ -1011,13 +1031,11 @@ class Service:
                         else:
                             yield "ping", None
                 except BaseException:                    # the consumer closed us at a ping: no longer queued
-                    turn.close()
                     with self.status_lock:
                         self.status["queued"] -= 1
                         self.waiting.pop(id(wait_key), None)
                     raise
                 if not got:                              # cancelled while queued
-                    turn.close()
                     with self.status_lock:
                         self.status["queued"] -= 1
                         self.waiting.pop(id(wait_key), None)
@@ -1032,6 +1050,10 @@ class Service:
                     # restart a dead or unloaded engine; parallel requests serialize this start on the fifo
                     with (self.fifo if par else contextlib.nullcontext()):
                         self.ensure_loaded()
+                    ctx_h = None
+                    if self.context is not None and not par:
+                        # lease this request's bound context and load its snapshot when the registry has one
+                        ctx_h = self.context.attach(getattr(self.request_ctx, "request", None), ids)
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
@@ -1199,6 +1221,9 @@ class Service:
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
+                    if self.context is not None and not par:
+                        # publish what the engine now holds and release the lease, under the turn still
+                        self.context.settle(ctx_h, finish in ("stop", "length"))
                 except GeneratorExit:                  # client disconnected
                     finish = "disconnect"
                     raise

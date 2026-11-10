@@ -1,5 +1,7 @@
 // src/program/serve/commands.cpp - scheduling and protocol command dispatch.
 #include "request.hpp"
+#include <cerrno>
+#include <cstdlib>
 
 namespace basalt::program::serve {
 
@@ -184,6 +186,7 @@ Flow Runtime::dispatch() {
     // THREAD_* commands own only a disposable, bounded token tape in this engine epoch.
     // GPU KV restoration remains subject to the exact token/picture prefix checks in
     // Request::restore; a caller-supplied head is never an authorization to use KV.
+    if (line.rfind("CONTEXT_", 0) == 0) return context_dispatch();
     if (line.rfind("THREAD_", 0) == 0) {
         std::istringstream in(line);
         std::string command, id, head, extra;
@@ -229,8 +232,14 @@ Flow Runtime::dispatch() {
             // THREAD_FORK <parent> <parent_head> <child> <child_head> [keep_tokens]
             std::string child, child_head;
             long long keep = 0;
+            std::string keep_text;
             in >> head >> child >> child_head;
-            if (in >> keep && keep < 0) keep = -1;
+            if (in >> keep_text) {
+                char* end = nullptr;
+                errno = 0;
+                keep = std::strtoll(keep_text.c_str(), &end, 10);
+                if (errno != 0 || end == keep_text.c_str() || *end != '\0') keep = -1;   // not a plain integer
+            }
             if (in >> extra || keep < 0) {
                 std::printf("ERR THREAD: bad fork arguments\n");
             } else {

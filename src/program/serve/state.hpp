@@ -54,6 +54,7 @@
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/native_dense.hpp"
 #include "basalt/program/conv_cache.hpp"
+#include "basalt/context/ids.hpp"
 #include "basalt/program/ppl_gate.hpp"
 #include "basalt/program/probe_rates.hpp"
 #include "basalt/spec/draft_policy.hpp"
@@ -567,6 +568,12 @@ private:
     bool pump(bool may_start);
     bool pipe_drain();
     size_t spill_to_disk(bool at_exit, size_t limit);
+    /// The serve protocol's CONTEXT_* commands (context_cmds.cpp): the agent-context snapshot lifecycle over the
+    /// conversation snapshot machinery, one solo conversation at a time, gated on --context-store-dir.
+    Flow context_dispatch();
+    /// The model fingerprint and this engine epoch, computed on the first CONTEXT_FINGERPRINT.
+    std::optional<basalt::context::Digest> ctx_fingerprint{};
+    std::string ctx_epoch{};
     bool probe_adapt(const std::string& cmd, std::string& e);
     int init_prompt();
     int init_verify();
