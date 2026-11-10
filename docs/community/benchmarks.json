@@ -94,28 +94,6 @@
       "decode_tps": 65.9
     },
     {
-      "submitter": "giveen",
-      "date": "2026-10-23",
-      "commit": "9c3692e7f5",
-      "preset": "community-1",
-      "model": "Qwen3.8-Flash-Next",
-      "gpus": [
-        {
-          "name": "RTX 5090",
-          "vram_gib": 32,
-          "power_w": 475
-        }
-      ],
-      "ram_gib": 247,
-      "os": "Linux",
-      "quant": "NVFP4",
-      "kv": "int8",
-      "prefill_16k_tps": 9556.4,
-      "prefill_64k_tps": 10541.5,
-      "decode_tps": 311.8,
-      "notes": "single RTX 5090 at a 475 W limit (below the card's 575 W default), 247 GB DDR5; 0 SSD spill"
-    },
-    {
       "submitter": "foolio",
       "date": "2026-10-23",
       "commit": "702c08f783",
@@ -498,8 +476,8 @@
     },
     {
       "submitter": "jesdga95",
-      "date": "2026-10-25",
-      "commit": "a57fade43e",
+      "date": "2026-11-10",
+      "commit": "37c2c1a8ad",
       "preset": "community-1",
       "model": "Qwen3.8-Flash-Next",
       "gpus": [
@@ -520,18 +498,28 @@
       ],
       "ram_gib": 121,
       "cpu": "AMD Ryzen 9 9950X, 16 cores",
-      "ram_gbps": 58.4,
+      "ram_gbps": 58.2,
       "os": "Linux",
       "quant": "NVFP4",
       "kv": "int8",
-      "prefill_16k_tps": 7741.2,
-      "prefill_64k_tps": 9239.3,
-      "decode_tps": 437.5
+      "prefill_16k_tps": 7808.2,
+      "prefill_64k_tps": 10303.3,
+      "decode_tps": 503.8,
+      "decode_conv_tps": 361.2,
+      "decode_struct_tps": 613.5,
+      "decode_prose_tps": 293.0,
+      "accept_conv_pct": 70.2,
+      "accept_struct_pct": 98.7,
+      "accept_prose_pct": 64.7,
+      "draft_len_conv": 3.2,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 2.0,
+      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8"
     },
     {
       "submitter": "jesdga95",
-      "date": "2026-10-25",
-      "commit": "a57fade43e",
+      "date": "2026-11-10",
+      "commit": "37c2c1a8ad",
       "preset": "community-1",
       "model": "Qwen3.8-Flash-Next",
       "gpus": [
@@ -545,13 +533,23 @@
       ],
       "ram_gib": 121,
       "cpu": "AMD Ryzen 9 9950X, 16 cores",
-      "ram_gbps": 58.3,
+      "ram_gbps": 58.4,
       "os": "Linux",
       "quant": "NVFP4",
       "kv": "int8",
-      "prefill_16k_tps": 7732.5,
-      "prefill_64k_tps": 9229.4,
-      "decode_tps": 317.2
+      "prefill_16k_tps": 7794.3,
+      "prefill_64k_tps": 9250.0,
+      "decode_tps": 386.2,
+      "decode_conv_tps": 241.8,
+      "decode_struct_tps": 478.9,
+      "decode_prose_tps": 236.0,
+      "accept_conv_pct": 76.9,
+      "accept_struct_pct": 98.2,
+      "accept_prose_pct": 66.7,
+      "draft_len_conv": 2.6,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.9,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     },
     {
       "submitter": "jesdga95",
@@ -580,8 +578,8 @@
     },
     {
       "submitter": "jesdga95",
-      "date": "2026-10-25",
-      "commit": "a57fade43e",
+      "date": "2026-11-10",
+      "commit": "37c2c1a8ad",
       "preset": "community-1",
       "model": "Qwen3.8-Flash-Next",
       "gpus": [
@@ -595,13 +593,23 @@
       ],
       "ram_gib": 121,
       "cpu": "AMD Ryzen 9 9950X, 16 cores",
-      "ram_gbps": 58.7,
+      "ram_gbps": 58.6,
       "os": "Linux",
       "quant": "NVFP4",
       "kv": "int8",
-      "prefill_16k_tps": 2686.6,
-      "prefill_64k_tps": 2699.1,
-      "decode_tps": 91.9
+      "prefill_16k_tps": 2695.3,
+      "prefill_64k_tps": 2704.2,
+      "decode_tps": 107.5,
+      "decode_conv_tps": 78.6,
+      "decode_struct_tps": 120.8,
+      "decode_prose_tps": 80.2,
+      "accept_conv_pct": 77.2,
+      "accept_struct_pct": 98.7,
+      "accept_prose_pct": 70.5,
+      "draft_len_conv": 2.3,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.9,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     },
     {
       "submitter": "SanGawku",
@@ -1220,35 +1228,9 @@
       "notes": "corrected: this run used a 489 W limit (85 % of default); the 575 W in the original submission was a labelling error, the stock 575 W numbers are in the 2026-11-06 rows"
     },
     {
-      "submitter": "giveen",
-      "date": "2026-11-06",
-      "commit": "13a42fd0d1",
-      "preset": "community-1",
-      "model": "DeepSeek-V4.1-Flash",
-      "gpus": [
-        {
-          "name": "RTX 5090",
-          "vram_gib": 32,
-          "power_w": 475,
-          "pcie": "5.0 x16",
-          "h2d_gbps": 48.5
-        }
-      ],
-      "ram_gib": 247,
-      "cpu": "Intel Core Ultra 9 285K, 24 cores",
-      "ram_gbps": 66.7,
-      "os": "Linux",
-      "quant": "IQ1_M",
-      "kv": "fp16",
-      "prefill_16k_tps": 2476.5,
-      "prefill_64k_tps": 3223.4,
-      "decode_tps": 87.4,
-      "notes": "single RTX 5090 at 475 W, 247 GB RAM; all 384 experts/layer in memory (0 SSD spill); DSpark draft window 3"
-    },
-    {
       "submitter": "jesdga95",
-      "date": "2026-11-08",
-      "commit": "553e9290da",
+      "date": "2026-11-10",
+      "commit": "37c2c1a8ad",
       "preset": "community-1",
       "model": "DeepSeek-V4.1-Flash",
       "gpus": [
@@ -1269,13 +1251,23 @@
       ],
       "ram_gib": 121,
       "cpu": "AMD Ryzen 9 9950X, 16 cores",
-      "ram_gbps": 58.6,
+      "ram_gbps": 58.4,
       "os": "Linux",
       "quant": "IQ1_M",
       "kv": "fp8+fp4",
-      "prefill_16k_tps": 2133.4,
-      "prefill_64k_tps": 2840.9,
-      "decode_tps": 149.1
+      "prefill_16k_tps": 2116.9,
+      "prefill_64k_tps": 2852.9,
+      "decode_tps": 182.4,
+      "decode_conv_tps": 92.7,
+      "decode_struct_tps": 253.0,
+      "decode_prose_tps": 99.8,
+      "accept_conv_pct": 73.8,
+      "accept_struct_pct": 98.4,
+      "accept_prose_pct": 63.3,
+      "draft_len_conv": 1.2,
+      "draft_len_struct": 4.8,
+      "draft_len_prose": 1.0,
+      "engine_args": "--gpu 0,1 --max-context 61709 --kv fp8"
     },
     {
       "submitter": "gpu-node-inferno",
@@ -1636,28 +1628,117 @@
       "notes": "headless desktop, 60 GiB RAM; the larger IQ4_XS pack OOMs at the 64k prefill on this box, so no IQ4_XS row"
     },
     {
-      "submitter": "eadra",
-      "date": "2026-11-09",
-      "commit": "ffc68faa71",
+      "submitter": "giveen",
+      "date": "2026-11-10",
+      "commit": "ffbe33f0cf",
+      "preset": "community-1",
+      "model": "DeepSeek-V4.1-Flash",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 475,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 48.9
+        }
+      ],
+      "ram_gib": 247,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 73.5,
+      "os": "Linux",
+      "quant": "IQ1_M",
+      "kv": "fp8+fp4",
+      "prefill_16k_tps": 2417.9,
+      "prefill_64k_tps": 3056.0,
+      "decode_tps": 113.4,
+      "decode_conv_tps": 69.9,
+      "decode_struct_tps": 136.2,
+      "decode_prose_tps": 74.1,
+      "accept_conv_pct": 73.5,
+      "accept_struct_pct": 98.5,
+      "accept_prose_pct": 64.6,
+      "draft_len_conv": 1.0,
+      "draft_len_struct": 4.8,
+      "draft_len_prose": 1.0,
+      "engine_args": "--gpu 0 --max-context 61709 --kv fp8"
+    },
+    {
+      "submitter": "giveen",
+      "date": "2026-11-10",
+      "commit": "ffbe33f0cf",
       "preset": "community-1",
       "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
           "name": "RTX 5090",
           "vram_gib": 32,
-          "power_w": 600,
-          "pcie": "5.0 x16"
+          "power_w": 475,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 48.6
         }
       ],
-      "ram_gib": 127,
-      "cpu": "AMD Ryzen 9 9950X3D, 16 cores",
-      "ram_gbps": 63.9,
-      "os": "Windows",
+      "ram_gib": 247,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 76.7,
+      "os": "Linux",
       "quant": "NVFP4",
       "kv": "int8",
-      "prefill_16k_tps": 8757.0,
-      "prefill_64k_tps": 10342.5,
-      "decode_tps": 374.5
+      "prefill_16k_tps": 9328.7,
+      "prefill_64k_tps": 10585.9,
+      "decode_tps": 362.7,
+      "decode_conv_tps": 216.4,
+      "decode_struct_tps": 449.7,
+      "decode_prose_tps": 236.2,
+      "accept_conv_pct": 73.9,
+      "accept_struct_pct": 97.9,
+      "accept_prose_pct": 64.9,
+      "draft_len_conv": 2.4,
+      "draft_len_struct": 7.0,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+    },
+    {
+      "submitter": "glfenix",
+      "date": "2026-11-10",
+      "commit": "ffbe33f0cf",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 300,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        },
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 300,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        }
+      ],
+      "ram_gib": 184,
+      "cpu": "AMD EPYC 7443, 24 cores",
+      "ram_gbps": 139.0,
+      "os": "Linux",
+      "quant": "NVFP4-DQ8",
+      "kv": "int8",
+      "prefill_16k_tps": 4825.1,
+      "prefill_64k_tps": 7565.8,
+      "decode_tps": 281.6,
+      "decode_conv_tps": 161.4,
+      "decode_struct_tps": 383.5,
+      "decode_prose_tps": 147.6,
+      "accept_conv_pct": 69.8,
+      "accept_struct_pct": 98.0,
+      "accept_prose_pct": 67.1,
+      "draft_len_conv": 2.0,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
+      "notes": "KVM/QEMU guest: 48 vCPU (24 cores + SMT), 184 GiB, on an EPYC 7443 host; both cards VFIO-passthrough at 4.0 x16, capped to 300 W. NVFP4 experts, Q8_0 dense (the DQ8 pack)."
     }
   ]
 }

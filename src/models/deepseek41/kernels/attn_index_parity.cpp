@@ -487,7 +487,7 @@ void test_top_rows(Verdict& v) {
     std::mt19937 rng(77);
     std::normal_distribution<float> nd(0.f, 1.f);
     int cases = 0;
-    for (int n : {1, 3, 255, 256, 257, 1000, 4096, 32768, 65536, 200000, 600000, 1048576}) {
+    for (int n : {1, 3, 255, 256, 257, 1000, 4096, 8192, 12288, 12289, 16384, 32768, 65536, 200000, 600000, 1048576}) {
         for (int K : {1, 16, kTopK, 2048}) {
             for (int kind = 0; kind < 5; ++kind) {
                 std::vector<float> s((size_t) n);
@@ -524,7 +524,7 @@ void test_top_rows(Verdict& v) {
 void bench_top_rows() {
     std::mt19937 rng(78);
     std::normal_distribution<float> nd(0.f, 1.f);
-    for (int n : {64, 512, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 524288, 1048576}) {
+    for (int n : {64, 512, 2048, 4096, 8192, 12288, 16384, 32768, 65536, 131072, 524288, 1048576}) {
         std::vector<float> s((size_t) n);
         for (float& x : s) x = nd(rng);
         Dev<float> ds(s);

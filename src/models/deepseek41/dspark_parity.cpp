@@ -110,9 +110,9 @@ int main() {
     check(cudaStreamCreate(&qs), "stream");
     Dev<uint8_t> dxq(basalt::kernels::native_q8_1_bytes(kIn, kT)), dhq(basalt::kernels::native_q8_1_bytes(kT * kK * kFF, 1));
     basalt::kernels::native_quantize_q8_1(dx.p, dxq.p, kIn, kT, qs);
-    dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, dh.p, qs);
+    dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, nullptr, dh.p, qs);
     basalt::kernels::native_quantize_q8_1(dh.p, dhq.p, kT * kK * kFF, 1, qs);
-    dspark_moe_down(dd.p, kFF, kOut, dhq.p, did.p, kT, kK, dout.p, qs);
+    dspark_moe_down(dd.p, kFF, kOut, dhq.p, did.p, kT, kK, nullptr, dout.p, qs);
     check(cudaDeviceSynchronize(), "experts");
     // the references take the values the q8_1 activations stand for
     const std::vector<float> xv = q8_1_values(dxq.down(), x.size());
@@ -161,6 +161,21 @@ int main() {
         const bool ok = hh == kFrozen;
         std::printf("moe frozen             %016llx (want %016llx)  %s\n", (unsigned long long) hh, (unsigned long long) kFrozen, ok ? "ok" : "FAIL");
         if (!ok) ++failures;
+    }
+    {   // a head that reads two rows: the other rows are skipped (zeros out of down), the two keep their bits
+        Dev<int32_t> dlive(std::vector<int32_t>{2});
+        Dev<float> dh2((size_t) kT * kK * kFF), dout2((size_t) kT * kK * kOut);
+        Dev<uint8_t> dhq2(basalt::kernels::native_q8_1_bytes(kT * kK * kFF, 1));
+        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, dlive.p, dh2.p, qs);
+        basalt::kernels::native_quantize_q8_1(dh2.p, dhq2.p, kT * kK * kFF, 1, qs);
+        dspark_moe_down(dd.p, kFF, kOut, dhq2.p, did.p, kT, kK, dlive.p, dout2.p, qs);
+        check(cudaDeviceSynchronize(), "live rows");
+        const std::vector<float> a = dout.down(), b = dout2.down(), hb = dh2.down();
+        const size_t live_h = (size_t) 2 * kK * kFF, live_o = (size_t) 2 * kK * kOut;
+        bool same = std::memcmp(a.data(), b.data(), live_o * 4) == 0 && std::memcmp(h_got.data(), hb.data(), live_h * 4) == 0;
+        for (size_t i = live_o; i < b.size(); ++i) same = same && b[i] == 0.f;
+        std::printf("%-22s %s\n", "moe live rows", same ? "bitwise" : "FAIL");
+        if (!same) ++failures;
     }
 
     // ---- combine
@@ -306,12 +321,12 @@ int main() {
         Dev<int32_t> dcid(cid), dfid(fid);
         Dev<float> h1((size_t) kT * kK * kFF), h2((size_t) kT * kK * kFF), o1((size_t) kT * kK * kOut), o2((size_t) kT * kK * kOut);
         Dev<uint8_t> hq1(dhq.n), hq2(dhq.n);
-        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, dfid.p, kT, kK, 10.f, h1.p, qs);
+        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, dfid.p, kT, kK, 10.f, nullptr, h1.p, qs);
         basalt::kernels::native_quantize_q8_1(h1.p, hq1.p, kT * kK * kFF, 1, qs);
-        dspark_moe_down(dd.p, kFF, kOut, hq1.p, dfid.p, kT, kK, o1.p, qs);
-        dspark_moe_gate_up(dkg.p, dku.p, kIn, kFF, dxq.p, dcid.p, kT, kK, 10.f, h2.p, qs);
+        dspark_moe_down(dd.p, kFF, kOut, hq1.p, dfid.p, kT, kK, nullptr, o1.p, qs);
+        dspark_moe_gate_up(dkg.p, dku.p, kIn, kFF, dxq.p, dcid.p, kT, kK, 10.f, nullptr, h2.p, qs);
         basalt::kernels::native_quantize_q8_1(h2.p, hq2.p, kT * kK * kFF, 1, qs);
-        dspark_moe_down(dkd.p, kFF, kOut, hq2.p, dcid.p, kT, kK, o2.p, qs);
+        dspark_moe_down(dkd.p, kFF, kOut, hq2.p, dcid.p, kT, kK, nullptr, o2.p, qs);
         check(cudaDeviceSynchronize(), "kept experts");
         const bool same_e = o1.down() == o2.down() && h1.down() == h2.down();
 
@@ -353,9 +368,9 @@ int main() {
     cudaEventRecord(e0, qs);
     constexpr int kReps = 20;
     for (int i = 0; i < kReps; ++i) {
-        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, dh.p, qs);
+        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, nullptr, dh.p, qs);
         basalt::kernels::native_quantize_q8_1(dh.p, dhq.p, kT * kK * kFF, 1, qs);
-        dspark_moe_down(dd.p, kFF, kOut, dhq.p, did.p, kT, kK, dout.p, qs);
+        dspark_moe_down(dd.p, kFF, kOut, dhq.p, did.p, kT, kK, nullptr, dout.p, qs);
     }
     cudaEventRecord(e1, qs);
     cudaEventSynchronize(e1);
@@ -363,6 +378,62 @@ int main() {
     const double bytes = (double) kT * kK * (2.0 * kFF * mxfp4_row_bytes(kIn) + (double) kOut * mxfp4_row_bytes(kFF));
     std::printf("bench: 5 rows x top-3 expert layer %.1f us (%.0f GB/s of pair-reads)\n", 1000.0 * ms / kReps,
                 bytes / (ms / kReps * 1e-3) / 1e9);
+
+    // ---- staged latents: a verify window's rows projected together (8 slots, as DsparkDrafter::stage) and the accepted
+    // ones committed into a ring hold the bits a projection of only those rows would write (as DsparkDrafter::inject)
+    {
+        constexpr int kFf = 3 * 5120, kLat = 512, kRing = 128, kStage = 8, kRows = 6;
+        auto q80 = [&](size_t rows, int n_in) {   // Q8_0: an fp16 scale then 32 int8 per 32 values
+            std::vector<uint8_t> w(rows * (size_t) (n_in / 32) * 34);
+            for (size_t b = 0; b < w.size() / 34; ++b) {
+                const uint16_t sc = (uint16_t) (0x2000 + rng() % 0x0400);   // about 2^-7 .. 2^-6
+                std::memcpy(&w[b * 34], &sc, 2);
+                for (int j = 0; j < 32; ++j) w[b * 34 + 2 + j] = (uint8_t) (rng() & 0xff);
+            }
+            return w;
+        };
+        const auto fc = q80(5120, kFf), wkv = q80(kLat, 5120);
+        std::vector<float> feats((size_t) kRows * kFf), enc((size_t) 5120), kvn(kLat), freq(32);
+        for (float& v : feats) v = nd(rng);
+        for (float& v : enc) v = 1.0f + 0.1f * nd(rng);
+        for (float& v : kvn) v = 1.0f + 0.1f * nd(rng);
+        for (int i = 0; i < 32; ++i) freq[i] = std::pow(10000.0f, -2.0f * (float) i / 64.0f);
+        Dev<uint8_t> dfc(fc), dwkv(wkv);
+        Dev<float> dfeat(feats), denc(enc), dkvn(kvn), dfreq(freq), mx((size_t) kRows * 5120), mxn((size_t) kRows * 5120),
+            kvraw((size_t) kRows * kLat);
+        Dev<uint8_t> xq(basalt::kernels::native_q8_1_bytes(kFf, kRows));
+        Dev<uint16_t> staged((size_t) 3 * kStage * kLat), ring0((size_t) kRing * kLat), ring1((size_t) kRing * kLat),
+            ring2((size_t) kRing * kLat), ref((size_t) kRing * kLat);
+        const int64_t pos0 = 1000;   // slots past the ring's end wrap
+        std::vector<int32_t> pos(kRows);
+        for (int j = 0; j < kRows; ++j) pos[j] = (int32_t) (pos0 + j);
+        Dev<int32_t> dpos(pos);
+        const auto project = [&](const float* f, int n, uint16_t* rows, int slots) {
+            basalt::kernels::native_quantize_q8_1(f, xq.p, kFf, n, qs);
+            basalt::kernels::native_mmvq(8, dfc.p, xq.p, mx.p, kFf, 5120, n, qs);
+            rms_norm_rows(mx.p, denc.p, n, 5120, 1e-20f, mxn.p, nullptr);
+            basalt::kernels::native_quantize_q8_1(mxn.p, xq.p, 5120, n, qs);
+            basalt::kernels::native_mmvq(8, dwkv.p, xq.p, kvraw.p, 5120, kLat, n, qs);
+            dspark_kv_rope(kvraw.p, dkvn.p, dpos.p, n, 1e-20f, dfreq.p, nullptr, rows, slots, qs);
+        };
+        project(dfeat.p, kRows, staged.p, kStage);   // stage 0's rows; the other two stages hold copies of them
+        check(cudaMemcpy(staged.p + (size_t) kStage * kLat, staged.p, (size_t) kStage * kLat * 2, cudaMemcpyDeviceToDevice), "copy");
+        check(cudaMemcpy(staged.p + (size_t) 2 * kStage * kLat, staged.p, (size_t) kStage * kLat * 2, cudaMemcpyDeviceToDevice), "copy");
+        bool same = true;
+        for (int q = 1; q <= kRows; ++q) {
+            check(cudaMemset(ref.p, 0, ref.n * 2), "memset");
+            check(cudaMemset(ring0.p, 0, ring0.n * 2), "memset");
+            check(cudaMemset(ring1.p, 0, ring1.n * 2), "memset");
+            check(cudaMemset(ring2.p, 0, ring2.n * 2), "memset");
+            project(dfeat.p, q, ref.p, kRing);   // only the accepted rows
+            dspark_commit_rows(staged.p, kStage, ring0.p, ring1.p, ring2.p, kRing, pos0, q, qs);
+            check(cudaDeviceSynchronize(), "staged latents");
+            const auto r = ref.down();
+            same = same && r == ring0.down() && r == ring1.down() && r == ring2.down();
+        }
+        std::printf("%-22s %s\n", "staged latents", same ? "bitwise" : "FAIL");
+        if (!same) ++failures;
+    }
 
     std::printf(failures ? "FAILED\n" : "PASSED\n");
     return failures ? 1 : 0;

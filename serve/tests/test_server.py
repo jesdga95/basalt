@@ -37,7 +37,7 @@ ANSWER = "xy" * 1000
 
 
 class RecordingEngine(MockEngine):
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.last_max_new = max_new
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
@@ -99,21 +99,6 @@ class MaxTokens(unittest.TestCase):
         s2, _, n_in, _ = self.call("anthropic", "how many tokens is this?", max_tokens=8)
         self.assertEqual(s2, 200)
         self.assertEqual(b["input_tokens"], n_in)
-
-    def test_request_line_parses_the_engine_summary(self):
-        line = ("basalt serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
-                "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
-        from serve.engine.process import ENGINE_REQUEST
-        m = ENGINE_REQUEST.search(line)
-        self.assertIsNotNone(m)
-        self.assertEqual((m["prompt"], m["reused"], m["gen"], m["tg"]), ("1200", "1000", "30", "100.0"))
-        # a request cancelled while its prompt was read says how far it got
-        m = ENGINE_REQUEST.search("basalt serve: prompt 98179 tokens = 0 reused + 12288 of 98179 read in 17565 ms "
-                                  "(699.6 tok/s), 0 generated in 0 ms (0.0 tok/s), drafts accepted 0 of 0, "
-                                  "0 checkpoints (cancelled)")
-        self.assertIsNotNone(m)
-        self.assertEqual((m["prompt"], m["reused"], m["read"], m["pp"], m["gen"]),
-                         ("98179", "0", "17565", "699.6", "0"))
 
     def test_unset_budget_is_the_rest_of_the_context(self):
         cases = {"openai": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
@@ -511,7 +496,7 @@ class LiteralControlTokens(unittest.TestCase):
 
 class CountingEngine(MockEngine):
     """Counts the tokens the engine was asked for, so a test can see it stopped early."""
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.yielded = 0
         for t in super().generate(ids, max_new, sampling, cancel, embeddings):
             self.yielded += 1
@@ -1272,7 +1257,7 @@ class GpuChoice(unittest.TestCase):
 
 
 class RecordingPrompt(MockEngine):
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.last_ids = list(ids)
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
@@ -1291,7 +1276,7 @@ class DyingEngine(MockEngine):
         self.dead, self.die_after = False, None
         self.restarts += 1
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
             if self.die_after is not None and i == self.die_after:
                 self.dead = True
@@ -1302,7 +1287,7 @@ class DyingEngine(MockEngine):
 class SlowPromptEngine(MockEngine):
     """Reads a "long prompt" for up to 20 s without a token (the engine sends nothing then), stopping on cancel."""
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.cancelled_after = None
         t0 = time.monotonic()
         while time.monotonic() - t0 < 20:
@@ -1311,6 +1296,40 @@ class SlowPromptEngine(MockEngine):
                 return
             time.sleep(0.05)
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class SessionOnTheMockEngine(unittest.TestCase):
+    """A session header, or the body's session_id, reaches the engine; the mock engine takes it and answers."""
+
+    def test_the_session_is_accepted(self):
+        tok = ByteTokenizer()
+        sessions = []
+
+        class Recording(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+                sessions.append(session)
+                return super().generate(ids, max_new, sampling, cancel, embeddings, session)
+        svc = Service(Recording(tok, "ok", max_context=CTX), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions"
+        try:
+            for headers, extra in (({"x-session-id": "s1"}, {}), ({}, {"session_id": "s2"}), ({}, {})):
+                body = {"model": "basalt", "max_tokens": 20, "reasoning_effort": "none",
+                        "messages": [{"role": "user", "content": "hi"}], **extra}
+                req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json", **headers})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    self.assertEqual(r.status, 200)
+                    self.assertEqual(json.loads(r.read())["choices"][0]["message"]["content"], "ok")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual(sessions, ["s1", "s2", None])
+
+    def test_the_bare_mock_engine_takes_a_session(self):
+        tok = ByteTokenizer()
+        out = list(MockEngine(tok, "ok").generate(tok.encode("hi"), 8, {}, threading.Event(), session="s1"))
+        self.assertTrue(out)
 
 
 class ClientHangUp(unittest.TestCase):
@@ -1388,7 +1407,7 @@ class EngineDeath(unittest.TestCase):
     def test_engine_err_mid_stream(self):
         """The engine's ERR after the stream started reaches the client as an error event, not a 400."""
         class ErrEngine(MockEngine):
-            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
                 yield None                                  # a prompt-progress heartbeat: the stream has started
                 raise ValueError("verify: layer 31 never rang (an illegal memory access was encountered)")
 
@@ -1420,7 +1439,7 @@ class DoneLineEngine(MockEngine):
         super().__init__(*a, **kw)
         self.done_lines = list(done_lines)
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         try:
             yield from super().generate(ids, max_new, sampling, cancel, embeddings)
         finally:
@@ -2246,7 +2265,7 @@ class LiveRate(unittest.TestCase):
         class HalfDead(MockEngine):
             last = {"generated": 99, "prompt_tokens": 9, "prompt_ms": 10.0, "decode_ms": 100.0, "finish": "stop"}
 
-            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
                 for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
                     if i == 3:
                         raise EngineDied("the engine stopped unexpectedly (exit code -9)")
@@ -2489,7 +2508,7 @@ class ClockedEngine(MockEngine):
     """The mock engine with ProcessEngine's clock and a conversation cache holding the first REUSED tokens."""
     REUSED = 5
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         n = 0
         try:
             for t in super().generate(ids, max_new, sampling, cancel, embeddings):
@@ -2806,7 +2825,7 @@ class ThinkingEngine(MockEngine):
         super().__init__(tok, "x", max_context=CTX)
         self.prompts = []
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.prompts.append(list(ids))
         done = self.tok.decode(ids).endswith("</think>\n\n")
         text = self.ANSWER if done else self.THOUGHT + ("" if self.end_in_thought else "</think>\n\n" + self.ANSWER)
@@ -2821,7 +2840,7 @@ class CachingThinkingEngine(ThinkingEngine):
     the previous pass's stream (a continued request finds its own prompt and tokens there)."""
     FIRST = 3
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         reused = self.FIRST if not self.prompts else len(self.prompts[-1])
         n = 0
         try:
@@ -3020,7 +3039,7 @@ class ThinkingBudget(unittest.TestCase):
 
         effective_cap = 1024
 
-        def clipped(ids, max_new, sampling, cancel, embeddings=None):
+        def clipped(ids, max_new, sampling, cancel, embeddings=None, session=None):
             if isinstance(ids, PromptText):
                 yield None                              # waiting for the engine's prompt count
                 ids.set_counted(len(ids.ids()), effective_cap)
@@ -3190,7 +3209,7 @@ class StatusHandover(unittest.TestCase):
         class Engine(MockEngine):
             calls = 0
 
-            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
                 Engine.calls += 1
                 me = Engine.calls
                 for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):

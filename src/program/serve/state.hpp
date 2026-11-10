@@ -114,6 +114,9 @@ public:
     virtual bool park_current(size_t held, int64_t kept) = 0;
     virtual bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) = 0;
     virtual void ckd_finish() {}
+    /// Writes the `CONV` line with the RAM tier's figures (a restore adds the tokens it returned and its ms), for
+    /// every model after it parks or restores a conversation.
+    void report_conversations(long long restored = -1, double restored_ms = 0);
     /// Once per drop below the RAM guard's floor, between steps: the parked conversations leave RAM (to the disk tier
     /// when it is on and holds no copy of them yet, the others are dropped), the checkpoint blocks kept for reuse are
     /// freed and the heap's free pages return to the OS. The checkpoints stay: a request may already resume from one.

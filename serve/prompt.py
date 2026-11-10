@@ -6,7 +6,8 @@ reply segment, engines that take ids, batch slots), and `+` gives the id list th
 """
 from __future__ import annotations
 
-import re
+from serve.engine.errors import split_err
+
 
 CTX_SLACK = 8               # the engine rejects prompt + max_new + 8 > context
 
@@ -25,10 +26,6 @@ def overflow_error(n: int, max_new: int, ctx: int) -> ValueError:
                       f"max_tokens (at most {max(0, room)} here), or start the server with "
                       "--fit-max-tokens (or set \"fit-max-tokens\": true in the \"server\" section of "
                       "the --config file) to shorten it to the room left")
-
-
-_OVERFLOW = re.compile(r"prompt \((\d+) tokens\) \+ max_new \((\d+)\) exceeds the context \((\d+)\)")
-_NO_ROOM = re.compile(r"prompt \((\d+) tokens\) leaves no room to answer in the context \((\d+)\)")
 
 
 class PromptText:
@@ -82,16 +79,16 @@ class PromptText:
         return ids, max_new
 
     def explain(self, err: str) -> str:
-        """The engine's ERR text in the server's words, as the id path would have raised it."""
-        m = _OVERFLOW.search(err)
-        if m:
-            self.n = int(m.group(1))
-            return str(overflow_error(int(m.group(1)), int(m.group(2)), int(m.group(3))))
-        m = _NO_ROOM.search(err)
-        if m:
-            self.n = int(m.group(1))
-            return str(room_error(int(m.group(1)), int(m.group(2))))
-        return err
+        """The engine's ERR text in the server's words, as the id path would have raised it: a coded context error
+        (the engine's own fields) becomes the API's message, any other error is shown as the engine worded it."""
+        code, f, message = split_err(err)
+        if code == "context_overflow" and "slot" not in f and {"prompt", "max_new", "context"} <= f.keys():
+            self.n = f["prompt"]
+            return str(overflow_error(f["prompt"], f["max_new"], f["context"]))
+        if code == "context_no_room" and {"prompt", "context"} <= f.keys():
+            self.n = f["prompt"]
+            return str(room_error(f["prompt"], f["context"]))
+        return message
 
 
 def tokens_known(prompt) -> bool:

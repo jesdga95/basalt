@@ -54,6 +54,7 @@ public:
         if (h_next_) cudaFreeHost(h_next_);
         if (h_emb4_) cudaFreeHost(h_emb4_);
         if (h_dfeat_) cudaFreeHost(h_dfeat_);
+        if (feat_ev_) cudaEventDestroy(feat_ev_);
         for (cudaGraphExec_t e : head_g_)
             if (e) cudaGraphExecDestroy(e);
         for (cudaGraphExec_t e : tail_g_)
@@ -171,10 +172,16 @@ public:
             }
             const size_t ff = (size_t) drafter_->feature_floats();
             if (!buf(dfeat_, ff * kDsparkWindow) ||
-                cudaHostAlloc((void**) &h_dfeat_, ff * kDsparkWindow * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
+                cudaHostAlloc((void**) &h_dfeat_, ff * kDsparkWindow * sizeof(float), cudaHostAllocPortable) != cudaSuccess ||
+                cudaEventCreateWithFlags(&feat_ev_, cudaEventDisableTiming) != cudaSuccess) {
                 err = "out of memory for the drafter's feature rows";
                 return false;
             }
+            for (int il = 0; il < g_.n_layers; ++il)
+                if (drafter_->feature_slot(il) >= 0) {
+                    if (feat_first_ < 0) feat_first_ = il;
+                    feat_last_ = il;
+                }
         }
         return true;
     }
@@ -294,6 +301,7 @@ public:
         whole_from_ = 0;
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         feat_n_ = 0;
+        staged_ = false;
         if (drafter_) drafter_->forget_from(dwin_, pos);
         return {};
     }
@@ -368,6 +376,7 @@ public:
         std::string e;
         if (!ops_->ensure_positions(positions, e) || !ops_->restore_cache(stream_, kv, e)) return {model::Status::Error, e};
         feat_n_ = 0;
+        staged_ = false;
         if (drafter_) drafter_->reset(dwin_);
         return {};
     }
@@ -588,6 +597,7 @@ private:
             dspark_hc_mean(x + (size_t) (T - tap_rows_) * kHcMult * n, tap_rows_, (int) n, dfeat_ + (size_t) slot * n, drafter_->feature_floats(), st);
         };
         prefill_->chunk_done = [this](int T, int64_t pos0, std::string& err) {
+            staged_ = false;
             feat_pos0_ = pos0 + T - tap_rows_;
             feat_n_ = tap_rows_;
             tap_rows_ = 0;
@@ -600,6 +610,11 @@ private:
         if (!drafter_ || !feat_n_) return true;
         const int q = (int) std::clamp<int64_t>(upto - feat_pos0_, 0, feat_n_);
         feat_n_ = 0;
+        if (staged_) {   // the window's rows were made beside it: the accepted ones move into the rings
+            staged_ = false;
+            if (drafter_->commit(dwin_, feat_pos0_, q, err)) return true;
+            if (!err.empty()) return false;
+        }
         if (!q) return true;
         const size_t ff = (size_t) drafter_->feature_floats();
         if (cudaMemcpyAsync(h_dfeat_, dfeat_, ff * q * sizeof(float), cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
@@ -719,21 +734,20 @@ private:
         ra.k = g_.n_used;
         ra.weight_scale = g_.weight_scale;
 
-        // each sublayer's mixes run beside its collapse: only its expansion reads them
+        // each sublayer's mixes run beside its collapse: only its expansion reads them (captured after the collapse, so a
+        // graph launch starts the collapse's branch first)
         DS_CUDA(cudaEventRecord(mix_ev_[0], stream_));
+        if (pre_prev) {
+            hc_pre_rms_norm(x_, pre_prev, kHcCoef, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
+        } else {
+            // the collapse of layer 0 is stream 0 of each row (kernels: a graph's copy nodes start late)
+            for (int t = 0; t < T; ++t) copy_rows(x_ + (size_t) t * kHcMult * n, cur_ + (size_t) t * n, (int) n, st);
+            rms_norm(cur_, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, normed_, st);
+        }
         DS_CUDA(cudaStreamWaitEvent(mix_st_, mix_ev_[0], 0));
         hc_mixes(x_, wf(il, "hc_attn_fn.weight"), wf(il, "hc_attn_scale.weight"), wf(il, "hc_attn_base.weight"), T, hca,
                  hc_ws_, coef_a_, mix_st_);
         DS_CUDA(cudaEventRecord(mix_ev_[1], mix_st_));
-        if (pre_prev) {
-            hc_pre_rms_norm(x_, pre_prev, kHcCoef, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
-        } else {
-            // the collapse of layer 0 is stream 0 of each row
-            for (int t = 0; t < T; ++t)
-                DS_CUDA(cudaMemcpyAsync(cur_ + (size_t) t * n, x_ + (size_t) t * kHcMult * n, n * sizeof(float),
-                                        cudaMemcpyDeviceToDevice, stream_));
-            rms_norm(cur_, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, normed_, st);
-        }
         dump("hc_attn_pre", il, pos, cur_, n * sizeof(float));
         if (T == 1 ? !ops_->attention(il, pos, token, normed_, attn_out_, st, err_)
                    : !ops_->attention_window(il, T, normed_, attn_out_, st, err_))
@@ -941,9 +955,16 @@ private:
                 if (!ops_->routed_experts_staged(il, normed_, ids_, rw_, moe_out_, st, err_)) return false;
                 if (!enqueue_tail(il, pos, st)) return false;
             } else {
+                if (il == feat_first_) drafter_->after_staging(stream_);   // the last staging has read its rows
                 if (!run_head(il, pos, token, tail_pending, T)) return false;
                 if (il == 0) ops_->begin_token(pos, T);
                 tail_pending = true;
+                if (il == feat_last_) {   // every target row of the window is in dfeat_: their latents are made beside it
+                    std::string se;
+                    DS_CUDA(cudaEventRecord(feat_ev_, stream_));
+                    staged_ = drafter_->stage(dwin_, pos, T, dfeat_, feat_ev_, se);
+                    if (!se.empty()) return fail(se);
+                }
                 for (size_t k = 0; k < en.layers.size(); ++k) {
                     if (en.layers[k] != il + 1 || !engram_ahead(il + 1)) continue;
                     if (!engram_rows(k)) return fail(err);
@@ -1059,6 +1080,9 @@ private:
     float* h_dfeat_ = nullptr;
     int64_t feat_pos0_ = 0;      // the first position of the rows in dfeat_ that await the drafter, and how many
     int feat_n_ = 0;
+    bool staged_ = false;        // those rows' latents were made beside their window (DsparkDrafter::stage)
+    int feat_first_ = -1, feat_last_ = -1;   // the drafter's first and last target layer
+    cudaEvent_t feat_ev_ = nullptr;          // the last target layer's rows are in dfeat_
     int tap_rows_ = 0;           // the rows the running prompt chunk leaves in dfeat_
 };
 

@@ -26,7 +26,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 On Windows: `py -3 -m venv .venv` then `.venv\Scripts\pip install -r requirements.txt`. Then follow the README's quick start from the
-model download on: `bin/basalt serve --config basalt_config.json`. Run `basalt-bench` from the top directory (it reads `data/bench`).
+model download on: `bin/basalt serve --config basalt_config.json`. `bin/basalt-bench` starts the `basalt` beside it and
+reads the archive's `data/bench`.
 
 ## Container image
 

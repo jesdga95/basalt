@@ -252,6 +252,7 @@ public:
         basalt::core::SavedConversation image;
         if (!capture(image, live, live_imgs, checks, cvec_cached, err)) return false;
         (void) (to_disk ? disk.put(std::move(image), kDiskQueueCap) : conversations->put(std::move(image), held));
+        report_conversations();
         for (auto& s : conversations->take_spilled())
             if (!disk_has(s.live.ids, s.live.imgs, s.checkpoints, s.cvec)) disk.put(std::move(s), kDiskQueueCap);
         return true;
