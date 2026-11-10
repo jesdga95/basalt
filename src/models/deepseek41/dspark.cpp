@@ -37,7 +37,7 @@ constexpr int kMarkovR = 256;
 constexpr int kInjectRows = 8;       // rows of one inject launch, and of a staged verify window
 constexpr float kEps = 1e-20f;
 constexpr int kMxfp4 = 39;
-constexpr int kMetaUpload = 4 * kT + kT * kT + 1;   // pos, start, n, lim, sel, the anchor
+constexpr int kMetaUpload = 4 * kT + kT * kT + 2;   // pos, start, n, lim, sel, the rows the head reads, the anchor
 constexpr int kMetaInts = kMetaUpload + kT;          // and the argmax of each row
 
 // What a DSpark GGUF must be for this build, whatever else the file holds.
@@ -113,7 +113,7 @@ struct DsparkDrafter::Impl {
           *feat = nullptr, *mainx = nullptr, *mainxn = nullptr;
     void *xq = nullptr, *xq2 = nullptr, *sh_q1 = nullptr, *sh_q2 = nullptr, *moe_hq = nullptr, *am_ws = nullptr;
     int32_t *ids = nullptr, *dmeta = nullptr, *dpos = nullptr, *dstart = nullptr, *dn = nullptr, *dlim = nullptr,
-            *dsel = nullptr, *dtok = nullptr, *dpos1 = nullptr;
+            *dsel = nullptr, *dlive = nullptr, *dtok = nullptr, *dpos1 = nullptr;
     float* x_mask = nullptr;   // the mask rows of the block's input, four streams each
 
     // the block as two graphs: the stages, then the head for the rows a window can use
@@ -124,7 +124,7 @@ struct DsparkDrafter::Impl {
     float* h_feat = nullptr;     // [kInjectRows][feature floats]
     int32_t* h_pos = nullptr;    // [kInjectRows]
     float* h_emb = nullptr;      // the anchor's row (mapped: the block's first kernel reads it)
-    int32_t* h_meta = nullptr;   // pos[5], start[5], n[5], lim[5], sel[25], tok0 (mapped)
+    int32_t* h_meta = nullptr;   // pos[5], start[5], n[5], lim[5], sel[25], live rows, tok0 (mapped)
     const float* h_emb_dev = nullptr;
     const int32_t* h_meta_dev = nullptr;
     int32_t* h_out = nullptr;    // tok[5]
@@ -392,7 +392,8 @@ struct DsparkDrafter::Impl {
         dn = dmeta + 2 * kT;
         dlim = dmeta + 3 * kT;
         dsel = dmeta + 4 * kT;
-        dtok = dmeta + 4 * kT + kT * kT;
+        dlive = dmeta + 4 * kT + kT * kT;
+        dtok = dlive + 1;
         {
             std::vector<float> rows((size_t) 4 * (kT - 1) * kN);
             for (size_t r = 0; r < (size_t) 4 * (kT - 1); ++r) std::memcpy(rows.data() + r * kN, mask_emb.data(), (size_t) kN * 4);
@@ -513,9 +514,11 @@ struct DsparkDrafter::Impl {
             ra.n_expert = s.n_exp;
             router(normed, s.router, s.router_bias, kT, ra, rlogits, ids, rw, st);
             kernels::native_quantize_q8_1(normed, sh_q1, kN, kT, st);   // the routed and the shared experts' input
-            dspark_moe_gate_up(s.gate_exps.p, s.up_exps.p, kN, kFF, sh_q1, ids, kT, kUsed, 10.f, moe_h, st);
+            // the last stage's routed experts run for the rows the head reads only: its other rows feed nothing
+            const int32_t* live = l == kStages - 1 ? dlive : nullptr;
+            dspark_moe_gate_up(s.gate_exps.p, s.up_exps.p, kN, kFF, sh_q1, ids, kT, kUsed, 10.f, live, moe_h, st);
             kernels::native_quantize_q8_1(moe_h, moe_hq, kT * kUsed * kFF, 1, st);
-            dspark_moe_down(s.down_exps.p, kFF, kN, moe_hq, ids, kT, kUsed, moe_d, st);
+            dspark_moe_down(s.down_exps.p, kFF, kN, moe_hq, ids, kT, kUsed, live, moe_d, st);
             kernels::native_mmvq(s.sh_gate.type, s.sh_gate.p, sh_q1, sh_g, kN, kFF, kT, st);
             kernels::native_mmvq(s.sh_up.type, s.sh_up.p, sh_q1, sh_u, kN, kFF, kT, st);
             swiglu_clamped(sh_g, sh_u, kT * kFF, 10.f, sh_h, st);
@@ -731,7 +734,8 @@ bool DsparkDrafter::draft_begin(int w, int32_t anchor, int64_t pos, int n_out, s
             m[3 * kT + t] = kT;
             for (int j = 0; j < kT; ++j) m[4 * kT + t * kT + j] = j;
         }
-        m[4 * kT + kT * kT] = anchor;
+        m[4 * kT + kT * kT] = n_out;
+        m[4 * kT + kT * kT + 1] = anchor;
         d.bind(w);
         cudaEventRecord(d.ev0, d.st);
         if (!d.launch(d.g_body, [&] { d.run_body(); }, err)) return false;

@@ -110,9 +110,9 @@ int main() {
     check(cudaStreamCreate(&qs), "stream");
     Dev<uint8_t> dxq(basalt::kernels::native_q8_1_bytes(kIn, kT)), dhq(basalt::kernels::native_q8_1_bytes(kT * kK * kFF, 1));
     basalt::kernels::native_quantize_q8_1(dx.p, dxq.p, kIn, kT, qs);
-    dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, dh.p, qs);
+    dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, nullptr, dh.p, qs);
     basalt::kernels::native_quantize_q8_1(dh.p, dhq.p, kT * kK * kFF, 1, qs);
-    dspark_moe_down(dd.p, kFF, kOut, dhq.p, did.p, kT, kK, dout.p, qs);
+    dspark_moe_down(dd.p, kFF, kOut, dhq.p, did.p, kT, kK, nullptr, dout.p, qs);
     check(cudaDeviceSynchronize(), "experts");
     // the references take the values the q8_1 activations stand for
     const std::vector<float> xv = q8_1_values(dxq.down(), x.size());
@@ -161,6 +161,21 @@ int main() {
         const bool ok = hh == kFrozen;
         std::printf("moe frozen             %016llx (want %016llx)  %s\n", (unsigned long long) hh, (unsigned long long) kFrozen, ok ? "ok" : "FAIL");
         if (!ok) ++failures;
+    }
+    {   // a head that reads two rows: the other rows are skipped (zeros out of down), the two keep their bits
+        Dev<int32_t> dlive(std::vector<int32_t>{2});
+        Dev<float> dh2((size_t) kT * kK * kFF), dout2((size_t) kT * kK * kOut);
+        Dev<uint8_t> dhq2(basalt::kernels::native_q8_1_bytes(kT * kK * kFF, 1));
+        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, dlive.p, dh2.p, qs);
+        basalt::kernels::native_quantize_q8_1(dh2.p, dhq2.p, kT * kK * kFF, 1, qs);
+        dspark_moe_down(dd.p, kFF, kOut, dhq2.p, did.p, kT, kK, dlive.p, dout2.p, qs);
+        check(cudaDeviceSynchronize(), "live rows");
+        const std::vector<float> a = dout.down(), b = dout2.down(), hb = dh2.down();
+        const size_t live_h = (size_t) 2 * kK * kFF, live_o = (size_t) 2 * kK * kOut;
+        bool same = std::memcmp(a.data(), b.data(), live_o * 4) == 0 && std::memcmp(h_got.data(), hb.data(), live_h * 4) == 0;
+        for (size_t i = live_o; i < b.size(); ++i) same = same && b[i] == 0.f;
+        std::printf("%-22s %s\n", "moe live rows", same ? "bitwise" : "FAIL");
+        if (!same) ++failures;
     }
 
     // ---- combine
@@ -306,12 +321,12 @@ int main() {
         Dev<int32_t> dcid(cid), dfid(fid);
         Dev<float> h1((size_t) kT * kK * kFF), h2((size_t) kT * kK * kFF), o1((size_t) kT * kK * kOut), o2((size_t) kT * kK * kOut);
         Dev<uint8_t> hq1(dhq.n), hq2(dhq.n);
-        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, dfid.p, kT, kK, 10.f, h1.p, qs);
+        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, dfid.p, kT, kK, 10.f, nullptr, h1.p, qs);
         basalt::kernels::native_quantize_q8_1(h1.p, hq1.p, kT * kK * kFF, 1, qs);
-        dspark_moe_down(dd.p, kFF, kOut, hq1.p, dfid.p, kT, kK, o1.p, qs);
-        dspark_moe_gate_up(dkg.p, dku.p, kIn, kFF, dxq.p, dcid.p, kT, kK, 10.f, h2.p, qs);
+        dspark_moe_down(dd.p, kFF, kOut, hq1.p, dfid.p, kT, kK, nullptr, o1.p, qs);
+        dspark_moe_gate_up(dkg.p, dku.p, kIn, kFF, dxq.p, dcid.p, kT, kK, 10.f, nullptr, h2.p, qs);
         basalt::kernels::native_quantize_q8_1(h2.p, hq2.p, kT * kK * kFF, 1, qs);
-        dspark_moe_down(dkd.p, kFF, kOut, hq2.p, dcid.p, kT, kK, o2.p, qs);
+        dspark_moe_down(dkd.p, kFF, kOut, hq2.p, dcid.p, kT, kK, nullptr, o2.p, qs);
         check(cudaDeviceSynchronize(), "kept experts");
         const bool same_e = o1.down() == o2.down() && h1.down() == h2.down();
 
@@ -353,9 +368,9 @@ int main() {
     cudaEventRecord(e0, qs);
     constexpr int kReps = 20;
     for (int i = 0; i < kReps; ++i) {
-        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, dh.p, qs);
+        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dxq.p, did.p, kT, kK, 10.f, nullptr, dh.p, qs);
         basalt::kernels::native_quantize_q8_1(dh.p, dhq.p, kT * kK * kFF, 1, qs);
-        dspark_moe_down(dd.p, kFF, kOut, dhq.p, did.p, kT, kK, dout.p, qs);
+        dspark_moe_down(dd.p, kFF, kOut, dhq.p, did.p, kT, kK, nullptr, dout.p, qs);
     }
     cudaEventRecord(e1, qs);
     cudaEventSynchronize(e1);

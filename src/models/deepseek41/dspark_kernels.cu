@@ -116,13 +116,14 @@ template <int ITERS>
 __global__ void __launch_bounds__(256) k_gate_up(const unsigned char* __restrict__ gw,
                                                  const unsigned char* __restrict__ uw, int n_in, int n_ff,
                                                  const Q81* __restrict__ x, const int32_t* __restrict__ ids, int k,
-                                                 float clamp, float* __restrict__ h) {
+                                                 float clamp, const int32_t* __restrict__ live, float* __restrict__ h) {
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ float res[kRowGroups][8];
     const int nb = n_in / kMxfp4BlockElems;
     const size_t row_bytes = (size_t) nb * kMxfp4BlockBytes;
     XBlock* xs = reinterpret_cast<XBlock*>(smem);
     const int pair = blockIdx.y, t = pair / k, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (live && t >= *live) return;   // a row nothing reads
     const int e = ids[pair];
     const int r0 = blockIdx.x * kRowGroups * (kRowsPerBlock / 2);
     const unsigned char* w0 = ((warp & 1) ? uw : gw) + ((size_t) e * n_ff + r0 + (warp >> 1)) * row_bytes;
@@ -149,15 +150,20 @@ __global__ void __launch_bounds__(256) k_gate_up(const unsigned char* __restrict
 // Grid (n_out / (8 * kRowGroups), pairs): one warp per output row, kRowGroups rows per warp.
 template <int ITERS>
 __global__ void __launch_bounds__(256) k_down(const unsigned char* __restrict__ dw, int n_ff, int n_out,
-                                              const Q81* __restrict__ h, const int32_t* __restrict__ ids,
-                                              float* __restrict__ d) {
+                                              const Q81* __restrict__ h, const int32_t* __restrict__ ids, int k,
+                                              const int32_t* __restrict__ live, float* __restrict__ d) {
     extern __shared__ __align__(16) unsigned char smem[];
     const int nb = n_ff / kMxfp4BlockElems;
     const size_t row_bytes = (size_t) nb * kMxfp4BlockBytes;
     XBlock* xs = reinterpret_cast<XBlock*>(smem);
     const int pair = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int e = ids[pair];
     const int r0 = blockIdx.x * kRowGroups * kRowsPerBlock + warp;
+    if (live && pair / k >= *live) {   // a row nothing reads: zeros, so the sums after it stay finite
+        if (lane == 0)
+            for (int q = 0; q < kRowGroups; ++q) d[(size_t) pair * n_out + r0 + q * kRowsPerBlock] = 0.f;
+        return;
+    }
+    const int e = ids[pair];
     const unsigned char* w0 = dw + ((size_t) e * n_out + r0) * row_bytes;
     const size_t step = (size_t) kRowsPerBlock * row_bytes;   // the warp's row of the next group
     uint32_t w[2][ITERS][5];
@@ -268,25 +274,26 @@ void check(const char* what) {
 }  // namespace
 
 void dspark_moe_gate_up(const void* gate_w, const void* up_w, int n_in, int n_ff, const void* x_q8_1, const int32_t* ids,
-                        int n_tokens, int k, float clamp, float* h, void* stream) {
+                        int n_tokens, int k, float clamp, const int32_t* live_rows, float* h, void* stream) {
     const size_t smem = (size_t) (n_in / kMxfp4BlockElems) * sizeof(XBlock);
     if (n_in % kMxfp4BlockElems || n_in > 6144 || n_ff % (kRowGroups * kRowsPerBlock / 2)) throw std::invalid_argument("dspark_moe_gate_up: shape");
     const dim3 grid(n_ff / (kRowGroups * kRowsPerBlock / 2), n_tokens * k);
     const int iters = (n_in / kMxfp4BlockElems + 31) / 32;
     auto kern = iters <= 3 ? k_gate_up<3> : iters <= 5 ? k_gate_up<5> : k_gate_up<6>;
     kern<<<grid, 256, smem, (cudaStream_t) stream>>>((const unsigned char*) gate_w, (const unsigned char*) up_w, n_in,
-                                                    n_ff, (const Q81*) x_q8_1, ids, k, clamp, h);
+                                                    n_ff, (const Q81*) x_q8_1, ids, k, clamp, live_rows, h);
     check("dspark_moe_gate_up");
 }
 
 void dspark_moe_down(const void* down_w, int n_ff, int n_out, const void* h_q8_1, const int32_t* ids, int n_tokens, int k,
-                     float* d, void* stream) {
+                     const int32_t* live_rows, float* d, void* stream) {
     const size_t smem = (size_t) (n_ff / kMxfp4BlockElems) * sizeof(XBlock);
     if (n_ff % kMxfp4BlockElems || n_ff > 6144 || n_out % (kRowGroups * kRowsPerBlock)) throw std::invalid_argument("dspark_moe_down: shape");
     const dim3 grid(n_out / (kRowGroups * kRowsPerBlock), n_tokens * k);
     const int iters = (n_ff / kMxfp4BlockElems + 31) / 32;
     auto kern = iters <= 3 ? k_down<3> : iters <= 5 ? k_down<5> : k_down<6>;
-    kern<<<grid, 256, smem, (cudaStream_t) stream>>>((const unsigned char*) down_w, n_ff, n_out, (const Q81*) h_q8_1, ids, d);
+    kern<<<grid, 256, smem, (cudaStream_t) stream>>>((const unsigned char*) down_w, n_ff, n_out, (const Q81*) h_q8_1, ids, k,
+                                                    live_rows, d);
     check("dspark_moe_down");
 }
 
