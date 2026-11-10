@@ -277,10 +277,12 @@ void usage(const std::string& engine) {
         "                     where the model takes it, else fp8 where it takes that, else its own KV format (the row records the model and the\n"
         "                     KV format used), and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
         "                     default). The decode fixtures and each prefill run in their own fresh engine process, so\n"
-        "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it. prefill_16k_tps and\n"
+        "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it; a row of the same\n"
+        "                     setup (submitter, model, quant, GPUs, CPU, RAM, system) is replaced in place and keeps its notes. prefill_16k_tps and\n"
         "                     prefill_64k_tps = engine tokens/s of those requests; the row also records the CPU, the RAM read speed and, per GPU, the\n"
         "                     PCIe link (maximum generation and width) and the pinned host-to-device copy speed, measured before the engine starts; decode_tps = tokens / decode time\n"
-        "                     summed over conv, struct and prose (token-weighted). Needs NVML for the GPU names, VRAM and enforced power limits. Only\n"
+        "                     summed over conv, struct and prose (token-weighted); the per-fixture decode speeds, acceptance and draft length and the engine\n"
+        "                     arguments are recorded too. Needs NVML for the GPU names, VRAM and enforced power limits. Only\n"
         "                     --model, --submitter, --community-file, --fixtures, --logs and --print-command may be given with it:\n"
         "                     any other option or engine flag would make rows incomparable and is refused\n"
         "  --submitter NAME   the name shown in the table, written into the row (required with --community)\n"
@@ -1222,6 +1224,7 @@ int main(int argc, char** argv) {
     if (o.community) {
         // one aggregate per direction over the single cold pass: tokens over time summed across requests
         double pre_tps[2] = {0, 0}, pre_s[2] = {0, 0}, dec_tok = 0, dec_ms = 0;
+        double t_tok[3] = {}, t_ms[3] = {}, t_acc[3] = {}, t_off[3] = {}, t_win[3] = {};   // per decode fixture
         for (const Result& x : results) {
             if (x.name == "prefill") {
                 const int k = x.depth == kCommunityPrefillLong ? 1 : 0;
@@ -1230,6 +1233,14 @@ int main(int argc, char** argv) {
             } else {
                 dec_tok += (double) x.d.generated;
                 dec_ms += x.d.decode_ms;
+                for (int k = 0; k < 3; ++k)
+                    if (x.name == basalt::program::kCommunityTestNames[k]) {
+                        t_tok[k] += (double) x.d.generated;
+                        t_ms[k] += x.d.decode_ms;
+                        t_acc[k] += (double) x.d.accepted;
+                        t_off[k] += (double) x.d.offered;
+                        t_win[k] += window_count(x);   // the table's draft length counts windows the same way
+                    }
             }
         }
         std::string gpu_err;
@@ -1274,6 +1285,18 @@ int main(int argc, char** argv) {
         crow.prefill_16k_tps = pre_tps[0];
         crow.prefill_64k_tps = pre_tps[1];
         crow.decode_tps = dec_tok / (dec_ms / 1000.0);
+        for (int k = 0; k < 3; ++k) {
+            crow.tests[k].decode_tps = t_ms[k] > 0 ? t_tok[k] / (t_ms[k] / 1000.0) : 0.0;
+            if (t_off[k] > 0) {
+                crow.tests[k].accept_pct = 100.0 * t_acc[k] / t_off[k];
+                crow.tests[k].draft_len = t_off[k] / t_win[k];
+            }
+        }
+        // the arguments the preset passed, without the model's path (the row names the model and quant)
+        for (size_t k = 0; k < perf_args.size(); ++k) {
+            if (perf_args[k] == "--model") { ++k; continue; }
+            crow.engine_args += (crow.engine_args.empty() ? "" : " ") + perf_args[k];
+        }
         community_row = basalt::program::community_row_text(crow);
         rep += "\n" + hardware_text(hw, cards);
         rep += fmt("\ncommunity-1: prefill 16K %.1f t/s (%.1f s), prefill 64K %.1f t/s (%.1f s), decode %.1f t/s (%.0f tokens in %.1f s), "
@@ -1423,15 +1446,24 @@ int main(int argc, char** argv) {
         const std::string path = o.community_file.empty() ? std::string(BASALT_BENCH_SOURCE_DIR) + "/docs/community/benchmarks.json"
                                                           : o.community_file;
         std::string why;
-        std::printf("\nCOMMUNITY ROW:\n%s\n", community_row.c_str());
+        basalt::program::CommunityEdit edit;
+        const bool added = basalt::program::community_add_row_file(path, crow, why, &edit);
+        std::printf("\nCOMMUNITY ROW:\n%s\n", (added ? edit.row_text : community_row).c_str());
         std::fflush(stdout);
-        if (basalt::program::community_add_row_file(path, crow, why))
+        if (added && edit.replaced) {
+            basalt::log::info("basalt-bench", "runs[%zu] of %s has this run's setup (submitter, model, quant, GPUs, CPU, RAM, system): it was updated in "
+                              "place, not added", edit.index, path.c_str());
+            if (!edit.notes.empty())
+                basalt::log::info("basalt-bench", "its notes were kept: \"%s\". Check they still apply to this run", edit.notes.c_str());
+            basalt::log::info("basalt-bench", "review the row, commit it and open a pull request (docs/community.md)");
+        } else if (added) {
             basalt::log::info("basalt-bench", "the row was added to %s; review it, commit it and open a pull request (docs/community.md)",
                               path.c_str());
-        else
+        } else {
             basalt::log::warn("basalt-bench", "the row was not added to %s (%s); paste it at the end of the runs list of docs/community/benchmarks.json, "
                               "run python3 tools/check_benchmarks.py --fix on it and open a pull request (docs/community.md)",
                               path.c_str(), why.c_str());
+        }
     }
     return do_quality && !quality.ran ? 1 : 0;
 }
