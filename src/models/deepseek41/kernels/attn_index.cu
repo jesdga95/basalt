@@ -617,13 +617,45 @@ __device__ __forceinline__ int one_scan(int v, int& total, int* ws) {
     return (warp ? ws[warp - 1] : 0) + x - v;
 }
 
+// A pass's bin from its 256 counts, a thread a bin (c: bin threadIdx.x's count, 0 past bin 255): the highest bin whose
+// count from the top reaches `need` (the bins up to it all reach it); its thread adds it to the prefix at `shift` and
+// leaves the rows still needed within it. With none, the walk from the top ends at bin 0 having counted every bin.
+// Returns the sum of the counts in every thread. ws: 8 ints.
+__device__ __forceinline__ int pick_bin(int c, int need, uint32_t prefix, int shift, uint32_t& s_prefix, int& s_need,
+                                        int* ws) {
+    const int b = threadIdx.x, lane = b & 31, warp = b >> 5;
+    int above = c;
+    if (b < 256) {
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_down_sync(0xffffffffu, above, o);
+            if (lane + o < 32) above += y;
+        }
+        if (lane == 0) ws[warp] = above;
+    }
+    __syncthreads();
+    int total = 0;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        if (b < 256 && w > warp) above += ws[w];
+        total += ws[w];
+    }
+    const int n_hit = __syncthreads_count(b < 256 && above >= need);
+    if (b < 256 && (n_hit == 0 ? b == 0 : b == n_hit - 1)) {
+        s_prefix = prefix | ((uint32_t) (n_hit == 0 ? 0 : b) << shift);
+        s_need = need - (n_hit == 0 ? above : above - c);
+    }
+    __syncthreads();
+    return total;
+}
+
 __device__ void topk_one(const float* __restrict__ s, int n, int K, int32_t* __restrict__ out, int out_ld,
                          int32_t* __restrict__ out_n) {
     __shared__ uint32_t wh[kOneWarps][256];
     __shared__ int ws[kOneWarps];
     __shared__ uint32_t s_prefix;
     __shared__ int s_need, s_all, s_cnt;
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int warp = threadIdx.x >> 5;
     if (threadIdx.x == 0) {
         s_prefix = 0;
         s_need = K;
@@ -643,37 +675,13 @@ __device__ void topk_one(const float* __restrict__ s, int n, int K, int32_t* __r
             if (pass == 0 || (key >> (shift + 8)) == (prefix >> (shift + 8))) atomicAdd(&wh[warp][(key >> shift) & 255], 1u);
         }
         __syncthreads();
-        // bin b's count, then the counts from bin b up: 8 warps of 32 bins, the higher warps' sums added
-        int c = 0, above = 0;
-        if (threadIdx.x < 256) {
-            for (int w = 0; w < kOneWarps; ++w) c += (int) wh[w][threadIdx.x];
-            int x = c;
-#pragma unroll
-            for (int o = 1; o < 32; o <<= 1) {
-                const int y = __shfl_down_sync(0xffffffffu, x, o);
-                if (lane + o < 32) x += y;
-            }
-            if (lane == 0) ws[warp] = x;
-            above = x;
-        }
-        __syncthreads();
+        // bin b's count: the warps' histograms summed
+        int c = 0;
         if (threadIdx.x < 256)
-            for (int w = warp + 1; w < 8; ++w) above += ws[w];
-        const int need = s_need;
-        const int n_hit = __syncthreads_count(threadIdx.x < 256 && above >= need);
+            for (int w = 0; w < kOneWarps; ++w) c += (int) wh[w][threadIdx.x];
+        const int rows = pick_bin(c, s_need, prefix, shift, s_prefix, s_need, ws);
         // pass 0 counted every valid row: all of them are kept when they are at most K
-        if (pass == 0 && threadIdx.x == 0) {
-            int all_rows = 0;
-            for (int w = 0; w < 8; ++w) all_rows += ws[w];
-            if (all_rows <= K) s_all = 1;
-        }
-        // the highest bin whose count from the top reaches `need` (the bins up to it all reach it); with none, the
-        // walk ends at bin 0 having counted every bin
-        if (threadIdx.x < 256 && (n_hit == 0 ? threadIdx.x == 0 : (int) threadIdx.x == n_hit - 1)) {
-            s_prefix = prefix | ((uint32_t) (n_hit == 0 ? 0 : threadIdx.x) << shift);
-            s_need = need - (n_hit == 0 ? above : above - c);
-        }
-        __syncthreads();
+        if (pass == 0 && threadIdx.x == 0 && rows <= K) s_all = 1;
     }
     const bool all = s_all != 0;
     const uint32_t thr = s_prefix;
@@ -758,28 +766,20 @@ __global__ void __launch_bounds__(kTopkThreads) select_begin_kernel(const float*
     for (int i = threadIdx.x; i < 4 * 256; i += blockDim.x) st->hist[i / 256][i % 256] = 0;
 }
 
-// The prefix and the rows still needed after pass `done`, from its histogram; the same in every block.
-__device__ __forceinline__ void sel_pick(SelState* st, int done, int K, uint32_t* lh, uint32_t& s_prefix, int& s_need) {
-    lh[threadIdx.x] = st->hist[done][threadIdx.x];
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        const uint32_t prefix = done ? st->prefix[done] : 0u;
-        const int need = done ? st->need[done] : K;
-        int cum = 0, sel = 0;
-        for (int b = 255; b >= 0; --b) {
-            if (cum + (int) lh[b] >= need) { sel = b; break; }
-            cum += (int) lh[b];
-        }
-        s_prefix = prefix | ((uint32_t) sel << (24 - 8 * done));
-        s_need = need - cum;
-    }
-    __syncthreads();
+// The prefix and the rows still needed after pass `done`, from its histogram: the same in every block. Returns the
+// histogram's total.
+static_assert(kSelThreads == 256, "sel_pick takes a thread a bin");
+__device__ __forceinline__ int sel_pick(SelState* st, int done, int K, uint32_t& s_prefix, int& s_need) {
+    __shared__ int ws[8];
+    return pick_bin((int) st->hist[done][threadIdx.x], done ? st->need[done] : K, done ? st->prefix[done] : 0u,
+                    24 - 8 * done, s_prefix, s_need, ws);
 }
 
 __global__ void __launch_bounds__(kSelThreads) select_pass_kernel(const float* __restrict__ s, int n, int K,
                                                                   const int32_t* __restrict__ pos, int ratio, int block_size,
                                                                   int pass, SelState* st, size_t stride) {
-    __shared__ uint32_t h[256], lh[256];
+    // a histogram per warp: no warp waits on another's atomics
+    __shared__ uint32_t wh[kSelThreads / 32][256];
     __shared__ uint32_t s_prefix;
     __shared__ int s_need;
     s += (size_t) n * blockIdx.y;
@@ -789,13 +789,17 @@ __global__ void __launch_bounds__(kSelThreads) select_pass_kernel(const float* _
     if (n <= kSelOneBlock || blockIdx.x * kSelThreads >= n) return;
     if (threadIdx.x == 0) { s_prefix = 0; s_need = K; }
     if (pass > 0) {
-        sel_pick(st, pass - 1, K, lh, s_prefix, s_need);
+        const int rows = sel_pick(st, pass - 1, K, s_prefix, s_need);
         if (blockIdx.x == 0 && threadIdx.x == 0) {
             st->prefix[pass] = s_prefix;
             st->need[pass] = s_need;
+            // pass 0 counted every valid row: all of them are kept when they are at most K
+            if (pass == 1) st->all = rows <= K;
         }
     }
-    h[threadIdx.x] = 0;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int w = 0; w < kSelThreads / 32; ++w) wh[w][threadIdx.x] = 0;
     __syncthreads();
     const uint32_t prefix = s_prefix;
     const int shift = 24 - 8 * pass;
@@ -803,17 +807,20 @@ __global__ void __launch_bounds__(kSelThreads) select_pass_kernel(const float* _
         const int j = base + threadIdx.x;
         if (j >= n || !(s[j] > -INFINITY)) continue;
         const uint32_t key = order_key(s[j]);
-        if (pass == 0 || (key >> (shift + 8)) == (prefix >> (shift + 8))) atomicAdd(&h[(key >> shift) & 255], 1u);
+        if (pass == 0 || (key >> (shift + 8)) == (prefix >> (shift + 8))) atomicAdd(&wh[warp][(key >> shift) & 255], 1u);
     }
     __syncthreads();
-    if (h[threadIdx.x]) atomicAdd(&st->hist[pass][threadIdx.x], h[threadIdx.x]);
+    uint32_t h = 0;
+#pragma unroll
+    for (int w = 0; w < kSelThreads / 32; ++w) h += wh[w][threadIdx.x];
+    if (h) atomicAdd(&st->hist[pass][threadIdx.x], h);
 }
 
 // Row bits per group: above the threshold in `gt`, equal to it in `eq`; `gc` counts both.
 __global__ void __launch_bounds__(kSelThreads) select_mask_kernel(const float* __restrict__ s, int n, int K,
                                                                   const int32_t* __restrict__ pos, int ratio, int block_size,
                                                                   SelState* st, size_t stride) {
-    __shared__ uint32_t lh[256], w_gt[8], w_eq[8];
+    __shared__ uint32_t w_gt[8], w_eq[8];
     __shared__ uint32_t s_thr;
     __shared__ int s_need;
     const size_t groups = (size_t) (n + kSelThreads - 1) / kSelThreads + 1;
@@ -825,24 +832,13 @@ __global__ void __launch_bounds__(kSelThreads) select_mask_kernel(const float* _
     uint32_t* gc = eq + groups * 8;
     n = sel_rows(n, pos, ratio, block_size);
     if (n <= kSelOneBlock || blockIdx.x * kSelThreads >= n) return;
-    sel_pick(st, 3, K, lh, s_thr, s_need);
+    sel_pick(st, 3, K, s_thr, s_need);
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         st->thr = s_thr;
         st->need_eq = s_need;
     }
     const uint32_t thr = s_thr;
-    // every valid row is kept when they are at most K
-    __shared__ int s_all;
-    lh[threadIdx.x] = st->hist[0][threadIdx.x];
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        int total = 0;
-        for (int b = 0; b < 256; ++b) total += (int) lh[b];
-        s_all = total <= K;
-        if (blockIdx.x == 0) st->all = s_all;
-    }
-    __syncthreads();
-    const bool all = s_all != 0;
+    const bool all = st->all != 0;   // set by pass 1
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int base = blockIdx.x * kSelThreads; base < n; base += gridDim.x * kSelThreads) {
         const int j = base + threadIdx.x;
@@ -908,17 +904,27 @@ __global__ void __launch_bounds__(kTopkThreads) select_final_kernel(int n, int32
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0) {
-        // the equals kept are the lowest rows
-        int need = st->all ? 0 : st->need_eq, total = 0;
-        for (int i = 0; i < s_cnt; ++i) {
-            const int take = min(ceq[i], need);
-            need -= take;
-            ceq[i] = take;
-            at[i] = total;
-            total += cgt[i] + take;
+    // the equals kept are the lowest rows: before group i, the equals counted so far (E) keep min(E, need) of them; each
+    // thread walks its own run of groups, placed by scans of the runs' counts
+    {
+        const int need0 = st->all ? 0 : st->need_eq, cnt = s_cnt;
+        const int run = (cnt + kTopkThreads - 1) / kTopkThreads;
+        const int i0 = min(cnt, (int) threadIdx.x * run), i1 = min(cnt, i0 + run);
+        int g = 0, e = 0;
+        for (int i = i0; i < i1; ++i) {
+            g += cgt[i];
+            e += ceq[i];
         }
-        s_total = total;
+        int g_tot, e_tot;
+        int G = one_scan(g, g_tot, wsum), E = one_scan(e, e_tot, wsum);
+        for (int i = i0; i < i1; ++i) {
+            const int take = min(ceq[i], max(0, need0 - E));
+            at[i] = G + min(E, need0);
+            G += cgt[i];
+            E += ceq[i];
+            ceq[i] = take;
+        }
+        if (threadIdx.x == 0) s_total = g_tot + min(e_tot, need0);
     }
     __syncthreads();
     for (int i = threadIdx.x; i < s_cnt; i += blockDim.x) {
