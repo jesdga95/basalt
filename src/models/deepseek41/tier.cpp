@@ -15,14 +15,11 @@
 #include "models/deepseek41/prefill_plan.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <random>
-#include <thread>
 #include <vector>
 
 namespace basalt::models::deepseek41 {
@@ -30,7 +27,6 @@ namespace {
 
 constexpr size_t kMaxPending = 128;              // copies claimed a window
 constexpr size_t kEvents = 2 * kMaxPending;      // a window's and the last one's copies
-constexpr uint64_t kPrereadBytes = 12ull << 30;  // file-backed experts read ahead into the page cache
 
 // The usual routing order of this model's experts: the RAM and VRAM tiers start from the head of it.
 constexpr int kRankLayers = 40, kRankExperts = 384;
@@ -41,16 +37,6 @@ ExpertTier::ExpertTier(const DsModel& model) : m_(model) {}
 ExpertTier::~ExpertTier() {
     std::string read_err;
     await_reads(read_err);   // the reads write into the RAM tier freed below
-    preread_quit_ = true;
-    if (preread_.joinable()) preread_.join();
-    if (worker_.joinable()) {
-        {
-            std::lock_guard<std::mutex> g(mu_);
-            quit_ = true;
-        }
-        cv_.notify_all();
-        worker_.join();
-    }
     report("final");
     if (copy_stream_) issue(-1, kAllPieces);
     if (peer_ && !peer_moves_.empty()) {
@@ -349,8 +335,6 @@ bool ExpertTier::load_ram(std::string& err) {
     ram_.assign((size_t) n_layers_, nullptr);
     ram_idx_.assign((size_t) n_layers_ * n_expert_, -1);
     spare_.assign((size_t) n_layers_, -1);
-    swapping_.assign((size_t) n_layers_, 0);
-    spare_since_.assign((size_t) n_layers_, 0);
     last_miss_.assign((size_t) n_layers_ * n_expert_, 0);
     const int64_t copies = homes_.main > 0 ? 0 : per_layer_;
     std::vector<int32_t> device_home;   // [layer * n_expert + e] the slot of a home on either card, or -1
@@ -613,95 +597,6 @@ void ExpertTier::begin_token(int n_tokens) {
         for (uint16_t& u : uses_) u >>= 1;
     token_ += (uint64_t) n_tokens;
     claims_ = 0;
-    finish_swaps();
-    // the swaps read their candidates' RAM places, which the copies of those layers move
-    if (homes_.file > 0 && !m_.tiers().diag_tier_frozen)
-        for (const auto& w : want_) land(w.first);
-    start_swaps();
-}
-
-void ExpertTier::swap_worker() {
-    std::unique_lock<std::mutex> lk(mu_);
-    size_t next = 0;
-    for (;;) {
-        cv_.wait(lk, [&] { return quit_ || next < jobs_.size(); });
-        if (quit_) return;
-        const Swap sw = jobs_[next];
-        lk.unlock();
-        const ExpertLayer& el = m_.pack().experts[(size_t) sw.layer];
-        uint8_t* dst = ram_[(size_t) sw.layer] + (size_t) sw.place * el.blob_bytes;
-        const bool ok = platform::pread_all(m_.experts_fd(), dst, el.blob_bytes,
-                                            m_.pack().experts_range.offset + el.offset + (uint64_t) sw.expert * el.blob_bytes);
-        lk.lock();
-        if (!ok) jobs_[next].expert = -1;
-        ++next;
-        ++jobs_done_;
-        cv_.notify_all();
-    }
-}
-
-void ExpertTier::preread() {
-    uint64_t left = kPrereadBytes;
-    for (int r = n_expert_ - homes_.file; r < n_expert_; ++r) {
-        for (int l = 0; l < n_layers_; ++l) {
-            if (preread_quit_.load(std::memory_order_relaxed)) return;
-            const ExpertLayer& el = m_.pack().experts[(size_t) l];
-            if (left < el.blob_bytes) return;
-            left -= el.blob_bytes;
-            platform::advise_willneed(m_.experts_fd(), m_.pack().experts_range.offset + el.offset + (uint64_t) ranked(l, r) * el.blob_bytes,
-                                      el.blob_bytes);
-        }
-    }
-}
-
-void ExpertTier::finish_swaps() {
-    if (flight_.empty()) return;
-    {
-        std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [&] { return jobs_done_ == jobs_.size(); });
-        for (size_t i = 0; i < flight_.size(); ++i) flight_[i].expert = jobs_[jobs_.size() - flight_.size() + i].expert;
-    }
-    for (const Swap& sw : flight_) {
-        swapping_[(size_t) sw.layer] = 0;
-        if (sw.expert < 0) continue;
-        const size_t base = (size_t) sw.layer * n_expert_;
-        const int32_t v = ram_idx_[base + sw.victim];
-        ram_idx_[base + sw.expert] = sw.place;
-        ram_idx_[base + sw.victim] = -1;
-        spare_[(size_t) sw.layer] = v;
-        spare_since_[(size_t) sw.layer] = token_;
-        ++swapped_;
-    }
-    flight_.clear();
-}
-
-void ExpertTier::start_swaps() {
-    if (homes_.file == 0 || want_.empty() || m_.tiers().diag_tier_frozen) {
-        want_.clear();
-        return;
-    }
-    std::vector<Swap> batch;
-    for (const auto& w : want_) {
-        if ((int) batch.size() >= policy::kSwapsPerToken) break;
-        const int l = w.first, e = w.second;
-        if (spare_[(size_t) l] < 0 || token_ <= spare_since_[(size_t) l] || pinned(l, e)) continue;
-        bool dup = false;
-        for (const Swap& b : batch) dup = dup || b.layer == l;
-        if (dup) continue;
-        const int v = policy::pick_victim(&ram_idx_[(size_t) l * n_expert_], &stamp_[(size_t) l * n_expert_], n_expert_, nullptr, 0);
-        // a victim used in the last 16 tokens stays
-        if (v < 0 || stamp_[(size_t) l * n_expert_ + v] + 16ull * (uint64_t) n_layers_ >= tick_) continue;
-        batch.push_back({l, e, v, spare_[(size_t) l]});
-    }
-    want_.clear();
-    if (batch.empty()) return;
-    {
-        std::lock_guard<std::mutex> g(mu_);
-        jobs_.insert(jobs_.end(), batch.begin(), batch.end());
-    }
-    cv_.notify_all();
-    for (const Swap& sw : batch) swapping_[(size_t) sw.layer] = 1;
-    flight_ = std::move(batch);
 }
 
 bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err) {
@@ -811,14 +706,14 @@ int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const
             }
         }
     };
-    if (homes_.main == 0 || (homes_too && spare_[(size_t) layer] >= 0 && !swapping_[(size_t) layer]))
+    if (homes_.main == 0 || (homes_too && spare_[(size_t) layer] >= 0))
         scan((int64_t) layer * per_layer_, per_layer_);
     if (ext_per_layer_) scan((int64_t) n_layers_ * per_layer_ + (int64_t) layer * ext_per_layer_, ext_per_layer_);
     return slot;
 }
 
 bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
-    if (homes_.peer == 0 || spare_[(size_t) layer] < 0 || swapping_[(size_t) layer]) return false;
+    if (homes_.peer == 0 || spare_[(size_t) layer] < 0) return false;
     const size_t base = (size_t) layer * n_expert_;
     int32_t slot = -1;
     uint64_t oldest = ~0ull;
@@ -1097,9 +992,9 @@ void ExpertTier::set_free_floor(int64_t mib) { free_floor_ = mib < 0 ? start_flo
 void ExpertTier::report(const char* tag) const {
     const int64_t n = hits_ + cpu_ + fetched_ + peer_hits_;
     if (n == 0) return;
-    basalt::log::info("basalt deepseek41", "TIER %s: %lld lookups: %.1f%% VRAM, %.1f%% second card, %.1f%% bus copy, %.1f%% CPU (file %.1f%%); promoted %lld, dropped %lld, swapped %lld", tag,
+    basalt::log::info("basalt deepseek41", "TIER %s: %lld lookups: %.1f%% VRAM, %.1f%% second card, %.1f%% bus copy, %.1f%% CPU (file %.1f%%); promoted %lld, dropped %lld", tag,
                  (long long) n, 100.0 * (double) hits_ / (double) n, 100.0 * (double) peer_hits_ / (double) n, 100.0 * (double) fetched_ / (double) n,
-                 100.0 * (double) cpu_ / (double) n, 100.0 * (double) file_hits_ / (double) n, (long long) promoted_, (long long) dropped_, (long long) swapped_);
+                 100.0 * (double) cpu_ / (double) n, 100.0 * (double) file_hits_ / (double) n, (long long) promoted_, (long long) dropped_);
     if (reads_.is_open())
         basalt::log::info("basalt deepseek41", "TIER %s: %lld experts read into the RAM tier (%s)", tag, (long long) read_,
                           reads_.unbuffered() ? "unbuffered" : "through the file cache");

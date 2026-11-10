@@ -25,13 +25,9 @@
 
 #include <cuda_runtime.h>
 
-#include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace basalt::models::deepseek41 {
@@ -193,16 +189,11 @@ private:
     void land_all();
     void apply(const Pending& p);
     void apply(const PeerMove& m);
-    /// A cold pinned expert (victim) replaced by a hot file-backed one (expert), read into the layer's spare slot.
-    struct Swap {
-        int layer, expert, victim, place;
-    };
     bool load_ram(std::string& err);
     bool open_share(std::string& err);
     int ranked(int layer, int r) const;
     bool load_rank(std::string& err);
     void seed_copies(int64_t n);
-    void preread();
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
     /// Gives the file experts of `ids` the RAM places of the layer's least recently used pinned experts outside `ids`
     /// and starts reading them there; `reading[i]` marks those of `ids`.
@@ -210,9 +201,6 @@ private:
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;
     uint64_t slot_total() const { return (uint64_t) n_layers_ * (uint64_t) (per_layer_ + ext_per_layer_); }
-    void finish_swaps();
-    void start_swaps();
-    void swap_worker();
     /// Copies (layer, e) from `src` into the least recently used free slot of the layer; the slot, or -1. With `homes_too`
     /// that slot may be a home's, when the layer has a free RAM place for it. `whole`: one copy, for a layer that waits
     /// on it; else pieces, which let a waited copy pass. With `later` the pieces wait in the queue for pump.
@@ -259,22 +247,9 @@ private:
     std::vector<int32_t> rank_;             ///< [layer * n_expert + rank] expert; empty: the file's order
     int cover_ = 0;                         ///< experts per layer in the RAM tier
     std::vector<int32_t> ram_idx_;          ///< [layer * n_expert + e] pinned slot or -1
-    std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a swap, or -1
-    std::vector<uint8_t> swapping_;         ///< [layer] a file expert is being read into its spare
-    std::vector<uint64_t> spare_since_;     ///< [layer] token at which the spare became free
+    std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a home leaving the main card, or -1
     std::vector<uint64_t> last_miss_;       ///< [layer * n_expert + e] token + 1 of the last miss
-    std::vector<std::pair<int, int>> want_; ///< file-backed experts that missed twice, in lookup order
-    std::vector<Swap> flight_;              ///< swaps started at the previous begin_token
-    std::thread worker_;
-    std::thread preread_;
-    std::atomic<bool> preread_quit_{false};
-    std::mutex mu_;
-    std::condition_variable cv_;
-    std::vector<Swap> jobs_;
-    size_t jobs_done_ = 0;
-    bool quit_ = false;
     uint64_t token_ = 0;
-    int64_t swapped_ = 0;
     platform::MappedFile file_;             ///< the experts section
     FileReads reads_;                       ///< open when the file holds experts and the RAM tier caches them
     std::vector<FileReads::Blob> blobs_;    ///< the reads of the last lookup

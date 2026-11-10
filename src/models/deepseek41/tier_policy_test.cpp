@@ -21,8 +21,6 @@ int main() {
     CHECK(!repeat_miss(0, 100, kPromoteWindow));
     CHECK(repeat_miss(10 + 1, 10 + kPromoteWindow, kPromoteWindow));
     CHECK(!repeat_miss(10 + 1, 10 + kPromoteWindow + 1, kPromoteWindow));
-    CHECK(repeat_miss(5 + 1, 5 + kAdmitWindow, kAdmitWindow));
-    CHECK(!repeat_miss(5 + 1, 5 + kAdmitWindow + 1, kAdmitWindow));
 
     // ghost reset: a stream where one expert misses every 40 tokens is admitted on its second miss, one every 100 never
     for (int period : {40, 100}) {

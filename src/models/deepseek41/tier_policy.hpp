@@ -7,8 +7,6 @@
 namespace basalt::models::deepseek41::policy {
 
 constexpr int kPromoteWindow = 64;              // tokens within which a repeat miss earns a VRAM slot
-constexpr int kAdmitWindow = 256;               // tokens within which a repeat file miss earns a pinned slot
-constexpr int kSwapsPerToken = 2;               // pinned-slot swaps started per token
 constexpr uint64_t kPieceBytes = 1ull << 20;    // largest single promotion copy
 constexpr int kPeerGapPieces = 3;               // second card exchange pieces per layer: about what one head leaves its bus
 constexpr uint64_t kPeerMoveAge = 1280;         // lookups (~32 windows) the second card's victim must be older than the main card's
