@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from serve.api import responses as responses_api
-from serve.api import thread_proxy
+from serve.api import context_proxy, thread_proxy
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
@@ -219,6 +219,11 @@ def make_handler(svc: Service):
                     status, body = thread_proxy.forward("GET", path)
                     self._json(status, body)
                 return
+            if context_proxy.is_context_path(path):
+                if self._authorized():
+                    status, body = context_proxy.forward("GET", path)
+                    self._json(status, body)
+                return
             if path.startswith("/fonts/"):
                 name = path[len("/fonts/"):]
                 f = ROOT / "serve" / "web" / "fonts" / name
@@ -340,6 +345,10 @@ def make_handler(svc: Service):
                     raise ValueError("send a JSON object")
                 if thread_proxy.is_thread_path(path):
                     status, body = thread_proxy.forward("POST", path, req)
+                    self._json(status, body)
+                    return
+                if context_proxy.is_context_path(path):
+                    status, body = context_proxy.forward("POST", path, req, self.headers.get("Idempotency-Key"))
                     self._json(status, body)
                     return
                 if path.startswith("/v1/responses/"):        # nothing is stored
