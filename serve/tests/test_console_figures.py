@@ -1,4 +1,4 @@
-"""The console's figures: the conversation cache from the engine's log lines, the session totals and the phase."""
+"""The console's figures: the conversation cache from the engine's CONV lines, the session totals and the phase."""
 import contextlib
 import io
 import json
@@ -22,44 +22,21 @@ from serve.util.text import ByteTokenizer
 ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "serve" / "chat_template.jinja"
 
-# the lines as the engine prints them (basalt::log::info adds the "basalt serve: " head)
-PARK = "basalt serve: conversation cache: parked 91233 tokens in 188.2 ms; parked=6 bytes=13314398618 evictions=3 " \
-       "snapshot_bytes=2010000000 reused_kv_bytes=0"
-PARK_DISK = "basalt serve: conversation cache: skipped 500 tokens in 3.0 ms; parked=2 bytes=100 evictions=0 " \
-            "snapshot_bytes=7 reused_kv_bytes=0 (to disk)"
-RESTORE = "basalt serve: conversation cache: restored 187342 tokens (checkpoint) in 912.3 ms; parked=5 bytes=12000000000"
+# the protocol lines as the engine prints them (src/program/serve, tests/program/protocol_lines_test.cpp)
+PARK = "CONV parked=6 bytes=13314398618 evictions=3"
+RESTORE = "CONV parked=5 bytes=12000000000 evictions=1 restored=187342 restored_ms=912.3"
 
 
-class EngineFormats(unittest.TestCase):
-    """The parsed text is the engine's: the format strings are read from its source."""
-
-    def source(self, rel):
-        return (ROOT / rel).read_text(encoding="utf-8")
-
-    def test_the_park_line(self):
-        self.assertIn('"conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu '
-                      'reused_kv_bytes=%zu%s"', " ".join(self.source("src/models/qwen4exp/serve/conversation.cpp").split()).replace('" "', ""))
+class ConvLine(unittest.TestCase):
+    def test_a_park_line(self):
         self.assertEqual(conversation_facts(PARK), {"parked": 6, "bytes": 13314398618, "evictions": 3})
-        self.assertEqual(conversation_facts(PARK_DISK), {"parked": 2, "bytes": 100, "evictions": 0})
 
-    def test_the_restore_line_both_models_share(self):
-        self.assertIn('"conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu"',
-                      self.source("src/program/serve/request_restore.cpp"))
-        self.assertEqual(conversation_facts(RESTORE), {"parked": 5, "bytes": 12000000000, "restored": 187342,
-                                                       "restored_ms": 912.3})
-        live = RESTORE.replace("(checkpoint)", "(live)")
-        self.assertEqual(conversation_facts(live)["restored"], 187342)
+    def test_a_restore_line(self):
+        self.assertEqual(conversation_facts(RESTORE), {"parked": 5, "bytes": 12000000000, "evictions": 1,
+                                                       "restored": 187342, "restored_ms": 912.3})
 
-    def test_deepseek_parks_without_a_line(self):
-        """DeepSeek's parking (the shared session_engine.cpp) prints no park line: its figures come from restore lines."""
-        self.assertNotIn("parked=", self.source("src/program/serve/session_engine.cpp").split("park_current")[1].split("copy_from_slot")[0])
-        self.assertEqual(conversation_facts("basalt serve: conversation cache: 4000 tokens not parked (physical RAM admission)"), {})
-
-    def test_other_lines_say_nothing(self):
-        for line in ("basalt serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)",
-                     "basalt serve: conversation cache: 12 tokens below the minimum 256, not parked",
-                     "basalt serve: conversation cache on disk: /x, 3 conversations of this model", "ready", ""):
-            self.assertEqual(conversation_facts(line), {}, line)
+    def test_a_word_that_is_not_a_number_is_skipped(self):
+        self.assertEqual(conversation_facts("CONV parked=2 bytes=x"), {"parked": 2})
 
 
 FAKE = r'''
@@ -67,8 +44,10 @@ import sys, time
 print("INFO engine=fake context=4096", flush=True)
 print("READY 4096 stop", flush=True)
 for raw in sys.stdin:
-    if raw.startswith("PARK"):
-        print(sys.argv[-1], file=sys.stderr, flush=True)
+    if raw.startswith("PARK2"):
+        print("CONV parked=5 bytes=12000000000 evictions=1 restored=187342 restored_ms=912.3", flush=True)
+    elif raw.startswith("PARK"):
+        print(sys.argv[-1], flush=True)
     elif raw.startswith("QUIT"):
         break
 '''
@@ -98,7 +77,7 @@ class Lifetime(unittest.TestCase):
         engine.proc.stdin.write("PARK\n")
         engine.proc.stdin.flush()
 
-    def test_a_log_file_feeds_the_figures_and_unloading_clears_them(self):
+    def test_a_conv_line_feeds_the_figures_and_unloading_clears_them(self):
         engine = self.start(log=True)
         self.assertEqual(engine.conversation, {})
         self.park(engine)
@@ -106,22 +85,25 @@ class Lifetime(unittest.TestCase):
         engine.unload()
         self.assertEqual(engine.conversation, {})
 
-    def test_the_stderr_sink_feeds_the_figures_too(self):
-        seen = []
-        with mock.patch.object(ProcessEngine, "stderr_sink", seen.append):
-            engine = self.start(log=False)
-            self.park(engine)
-            self.wait(engine, {"parked": 6, "bytes": 13314398618, "evictions": 3})
-        self.assertTrue(any("conversation cache" in x for x in seen))     # the log panel still gets the raw line
-        engine.unload()
-        self.assertEqual(engine.conversation, {})
+    def test_the_figures_come_the_same_without_a_log_file(self):
+        engine = self.start(log=False)
+        self.park(engine)
+        self.wait(engine, {"parked": 6, "bytes": 13314398618, "evictions": 3})
 
-    def test_a_line_of_an_ended_engine_changes_nothing(self):
+    def test_a_restore_line_adds_to_the_park_figures(self):
         engine = self.start(log=True)
-        old = engine.proc
-        engine.unload()
-        engine._note_conversation(old, PARK)
-        self.assertEqual(engine.conversation, {})
+        self.park(engine)
+        self.wait(engine, {"parked": 6, "bytes": 13314398618, "evictions": 3})
+        engine.proc.stdin.write("PARK2\n")
+        engine.proc.stdin.flush()
+        self.wait(engine, {"parked": 5, "bytes": 12000000000, "evictions": 1, "restored": 187342, "restored_ms": 912.3})
+
+    def test_a_conv_line_is_not_a_reply_line_and_stays_out_of_the_log(self):
+        engine = self.start(log=True)
+        self.park(engine)
+        self.wait(engine, {"parked": 6, "bytes": 13314398618, "evictions": 3})
+        self.assertTrue(engine.lines.empty())
+        self.assertNotIn("CONV", Path(engine.log.name).read_text(encoding="utf-8"))
 
     def test_metrics_carries_them_and_a_mock_engine_has_none(self):
         engine = MockEngine(ByteTokenizer(), "Hi.")

@@ -38,7 +38,7 @@ while True:
         clip = "clip=1" in f
         room = 4096 - 8 - n
         if n > 4000:
-            say("ERR prompt (%d tokens) + max_new (%s) exceeds the context (4096)" % (n, f[1]))
+            say("ERR context_overflow prompt=%d max_new=%s context=4096: prompt (%d tokens) + max_new (%s) exceeds the context (4096)" % (n, f[1], n, f[1]))
             continue
         say("PT %d %d" % (n, min(int(f[1]), room) if clip else int(f[1])))
         say("PP %d %d 0 100" % (n, n))

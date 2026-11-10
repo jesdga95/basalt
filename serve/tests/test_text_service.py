@@ -27,10 +27,10 @@ class TextEngine(MockEngine):
             room = CTX - CTX_SLACK - n
             if ids.clip:
                 if room < 1:
-                    raise ValueError(ids.explain(f"prompt ({n} tokens) leaves no room to answer in the context ({CTX})"))
+                    raise ValueError(ids.explain(f"context_no_room prompt={n} context={CTX}: prompt ({n} tokens) leaves no room to answer in the context ({CTX})"))
                 max_new = min(max_new, room)
             elif max_new > room:
-                raise ValueError(ids.explain(f"prompt ({n} tokens) + max_new ({max_new}) exceeds the context ({CTX})"))
+                raise ValueError(ids.explain(f"context_overflow prompt={n} max_new={max_new} context={CTX}: prompt ({n} tokens) + max_new ({max_new}) exceeds the context ({CTX})"))
             ids.set_counted(n, max_new)
             yield None
             ids = ids.ids()
