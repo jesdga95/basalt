@@ -543,6 +543,29 @@ pub async fn tombstone(db: &PgPool, owner: Uuid, id: Uuid) -> Res<Context> {
     Ok(out)
 }
 
+/// Engine confirmation that a tombstoned context's snapshot payload is gone: the locator,
+/// tier, validated flag and epoch are cleared so the sweeper's GC can purge the row. Only a
+/// tombstoned context can be released this way; a live context keeps its recoverable snapshot.
+/// Idempotent: an already-released row is returned unchanged.
+pub async fn release_payload(db: &PgPool, owner: Uuid, id: Uuid) -> Res<Context> {
+    let mut tx = db.begin().await?;
+    let c = lock_owned(&mut tx, owner, id, true).await?;
+    if !c.tombstoned {
+        return Err(RegistryError::Invalid("payload release requires a tombstoned context".into()));
+    }
+    if c.locator.is_none() && c.tier == Tier::None && !c.validated && c.engine_epoch.is_none() {
+        tx.commit().await?;
+        return Ok(c);
+    }
+    let sql = format!("UPDATE contexts SET state='RECORDED',tier='none',validated=false,locator=NULL,\
+                         engine_epoch=NULL,version=version+1,updated_at=clock_timestamp() \
+                         WHERE id=$1 RETURNING {COLS}");
+    let row = sqlx::query(&sql).bind(id).fetch_one(&mut *tx).await?;
+    let out = context_from(&row)?;
+    tx.commit().await?;
+    Ok(out)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcCandidate { pub id: Uuid, pub owner_id: Uuid, pub tier: Tier, pub locator: Option<String> }
 
