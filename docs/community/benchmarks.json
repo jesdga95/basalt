@@ -1774,6 +1774,48 @@
       "draft_len_struct": 6.9,
       "draft_len_prose": 1.9,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+    },
+    {
+      "submitter": "Hotcooler",
+      "date": "2026-11-10",
+      "commit": "317f5a69f6",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        },
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        }
+      ],
+      "ram_gib": 247,
+      "cpu": "AMD EPYC 7F52, 16 cores",
+      "ram_gbps": 139.3,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 5730.2,
+      "prefill_64k_tps": 8764.8,
+      "decode_tps": 358.3,
+      "decode_conv_tps": 230.7,
+      "decode_struct_tps": 445.2,
+      "decode_prose_tps": 209.7,
+      "accept_conv_pct": 74.7,
+      "accept_struct_pct": 98.6,
+      "accept_prose_pct": 66.8,
+      "draft_len_conv": 2.3,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.7,
+      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8"
     }
   ]
 }
