@@ -224,6 +224,10 @@ struct Options {
     /// that leaves the session or the RAM cache, and every one the process holds when it ends, is written there and
     /// read back when a prompt starts with it, after a restart too (conversation_store.hpp)
     std::string conversation_cache_dir;
+    /// --serve: the folder of the agent-context snapshots (one subfolder per context_id, generation files written
+    /// atomically with a manifest): non-empty turns the CONTEXT_* commands on (serve/context_cmds.cpp,
+    /// docs/architecture/agent-context-contract.md)
+    std::string context_store_dir;
     int64_t conversation_cache_disk_mib = 0;   ///< byte budget of the disk tier, least recently used first; above 0 turns it on
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;

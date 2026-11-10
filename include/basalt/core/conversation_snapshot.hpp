@@ -4,10 +4,15 @@
 #include "basalt/core/layer.hpp"
 #include "basalt/core/session.hpp"
 
+#include <array>
 #include <string>
 #include <thread>
 
 namespace basalt::core {
+
+/// The 18-value geometry key a snapshot stamps and later validates against (`SavedConversation::geometry`):
+/// the same key every save writes, exposed so a snapshot rebuilt from another store stamps it identically.
+std::array<int64_t, 18> conversation_geometry_key(const ModelGeometry& g);
 
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).

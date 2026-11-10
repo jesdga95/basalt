@@ -507,6 +507,7 @@ add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/
                        src/program/serve/batch_pipeline.cpp
                        src/program/serve/commands.cpp
                        src/program/serve/conversation.cpp
+                       src/program/serve/context_cmds.cpp
                        src/program/serve/kv.cpp
                        src/program/serve/loans.cpp
                        src/program/serve/loan_moves.cpp
@@ -536,7 +537,7 @@ add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/
                        src/program/cli/report.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec ${_gpu_runtime_target})
+target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec basalt_context ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
 # `basalt serve` runs the Python server from the source tree; the engine reads its expert profiles from data/profiles
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

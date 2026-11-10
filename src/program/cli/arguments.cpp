@@ -163,6 +163,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--vision-mmproj") { o.vision_mmproj = next("--vision-mmproj"); o.vision = true; }
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
+        else if (a == "--context-store-dir") o.context_store_dir = next("--context-store-dir");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-disk-mib" ||
                  a == "--conversation-cache-min-tokens") {

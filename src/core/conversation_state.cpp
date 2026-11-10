@@ -421,4 +421,6 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
                                                    const ModelGeometry& g, const QsaState& draft, std::string& error) {
     return conversation_snapshot_restore(image, ss, g, &draft, error);
 }
+
+std::array<int64_t, 18> conversation_geometry_key(const ModelGeometry& g) { return geometry_key(g); }
 } // namespace basalt::core

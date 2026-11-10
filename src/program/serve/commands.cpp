@@ -184,6 +184,7 @@ Flow Runtime::dispatch() {
     // THREAD_* commands own only a disposable, bounded token tape in this engine epoch.
     // GPU KV restoration remains subject to the exact token/picture prefix checks in
     // Request::restore; a caller-supplied head is never an authorization to use KV.
+    if (line.rfind("CONTEXT_", 0) == 0) return context_dispatch();
     if (line.rfind("THREAD_", 0) == 0) {
         std::istringstream in(line);
         std::string command, id, head, extra;
