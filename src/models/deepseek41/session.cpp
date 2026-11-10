@@ -734,21 +734,20 @@ private:
         ra.k = g_.n_used;
         ra.weight_scale = g_.weight_scale;
 
-        // each sublayer's mixes run beside its collapse: only its expansion reads them
+        // each sublayer's mixes run beside its collapse: only its expansion reads them (captured after the collapse, so a
+        // graph launch starts the collapse's branch first)
         DS_CUDA(cudaEventRecord(mix_ev_[0], stream_));
+        if (pre_prev) {
+            hc_pre_rms_norm(x_, pre_prev, kHcCoef, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
+        } else {
+            // the collapse of layer 0 is stream 0 of each row (kernels: a graph's copy nodes start late)
+            for (int t = 0; t < T; ++t) copy_rows(x_ + (size_t) t * kHcMult * n, cur_ + (size_t) t * n, (int) n, st);
+            rms_norm(cur_, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, normed_, st);
+        }
         DS_CUDA(cudaStreamWaitEvent(mix_st_, mix_ev_[0], 0));
         hc_mixes(x_, wf(il, "hc_attn_fn.weight"), wf(il, "hc_attn_scale.weight"), wf(il, "hc_attn_base.weight"), T, hca,
                  hc_ws_, coef_a_, mix_st_);
         DS_CUDA(cudaEventRecord(mix_ev_[1], mix_st_));
-        if (pre_prev) {
-            hc_pre_rms_norm(x_, pre_prev, kHcCoef, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
-        } else {
-            // the collapse of layer 0 is stream 0 of each row
-            for (int t = 0; t < T; ++t)
-                DS_CUDA(cudaMemcpyAsync(cur_ + (size_t) t * n, x_ + (size_t) t * kHcMult * n, n * sizeof(float),
-                                        cudaMemcpyDeviceToDevice, stream_));
-            rms_norm(cur_, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, normed_, st);
-        }
         dump("hc_attn_pre", il, pos, cur_, n * sizeof(float));
         if (T == 1 ? !ops_->attention(il, pos, token, normed_, attn_out_, st, err_)
                    : !ops_->attention_window(il, T, normed_, attn_out_, st, err_))
