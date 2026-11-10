@@ -341,6 +341,19 @@ void usage(const std::string& engine) {
     }
 }
 
+// The --submitter a community row needs, as the table checker accepts it; empty when fine, else the message (also in err).
+std::string community_submitter_error(const Options& o, std::string& err) {
+    std::string who = o.submitter;
+    for (char& c : who) c = (char) std::toupper((unsigned char) c);
+    if (who.find_first_not_of(" \t") == std::string::npos || who == "YOUR_NAME")
+        err = "--community needs --submitter NAME, the name shown in the table";
+    else if (o.submitter.size() > 40) err = "--submitter must be at most 40 characters";
+    else
+        for (unsigned char c : o.submitter)
+            if (c < 0x20 || c == 0x7f || std::isspace(c)) err = "--submitter must be one name with no spaces or control characters";
+    return err;
+}
+
 bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -419,18 +432,8 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             return false;
         }
         if (o.model.empty()) { err = "--community needs --model FILE"; return false; }
-        std::string who = o.submitter;
-        for (char& c : who) c = (char) std::toupper((unsigned char) c);
-        if (who.find_first_not_of(" \t") == std::string::npos || who == "YOUR_NAME") {
-            err = "--community needs --submitter NAME, the name shown in the table";
-            return false;
-        }
-        if (o.submitter.size() > 40) { err = "--submitter must be at most 40 characters"; return false; }
-        for (unsigned char c : o.submitter)
-            if (c < 0x20 || c == 0x7f || std::isspace(c)) {
-                err = "--submitter must be one name with no spaces or control characters";
-                return false;
-            }
+        // an engine flag is refused first (in main, which asks the engine whether it is lossy): a run with one needs no submitter
+        if (o.passthrough.empty() && o.sets.empty() && !community_submitter_error(o, err).empty()) return false;
     }
     if (!o.community_file.empty() && !o.community) { err = "--community-file needs --community"; return false; }
     if (o.reps < 1) { err = "-r needs N >= 1"; return false; }
@@ -749,6 +752,13 @@ int main(int argc, char** argv) {
         fs::remove(plan_log, rm_ec);
         basalt::log::error("basalt-bench", "%s", basalt::program::community_refusal(extra, answer).c_str());
         return 2;
+    }
+    if (o.community) {
+        std::string serr;
+        if (!community_submitter_error(o, serr).empty()) {
+            basalt::log::error("basalt-bench", "%s", serr.c_str());
+            return 2;
+        }
     }
     std::string community_model, community_arch;
     std::string community_kv;   // the cache format a community run passes; empty when the model takes neither
