@@ -1,6 +1,6 @@
 # Community runs
 
-[jesdga95.github.io/basalt](https://jesdga95.github.io/basalt/) lists benchmark runs submitted by users, all taken with the same preset so the rows compare. The data is `docs/community/benchmarks.json`.
+[basalt.jgulfo.com/community](https://basalt.jgulfo.com/community/) lists benchmark runs submitted by users, all taken with the same preset so the rows compare. The data is `docs/community/benchmarks.json`; the page reads it from `main`, so a merged row shows up within minutes.
 
 ## Add your run
 

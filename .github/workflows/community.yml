@@ -1,0 +1,34 @@
+name: community
+
+# Validates the community benchmark file on pull requests and on main.
+on:
+  pull_request:
+    paths:
+      - "docs/community/**"
+      - "tools/check_benchmarks.py"
+      - ".github/workflows/community.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docs/community/**"
+      - "tools/check_benchmarks.py"
+      - ".github/workflows/community.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: community-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Validate benchmarks.json
+        run: python3 tools/check_benchmarks.py docs/community/benchmarks.json

@@ -59,8 +59,8 @@ Basalt is an engine for mixture-of-experts models on NVIDIA Blackwell GPUs. Ever
   1. Run `basalt-bench --community --model PACK --submitter YourName`. It adds the row to `docs/community/benchmarks.json` ([building](docs/building.md)).
   2. Review the row. After a hand edit, format and check it with `python3 tools/check_benchmarks.py --fix docs/community/benchmarks.json`.
   3. Commit it.
-  4. Open a pull request; the `pages` workflow runs the same check.
-  5. Once merged, the row appears on the runs page.
+  4. Open a pull request; the `community` workflow runs the same check.
+  5. Once merged, the row appears on the [runs page](https://basalt.jgulfo.com/community/).
 - Any Blackwell (sm_120) machine with spare hours helps; bigger setups help most: 96 GB+ VRAM (single large cards or multi-GPU), quad- or octa-channel DDR5.
 - A few hours of remote access to a machine speeds up development.
 - Or sponsor the project through GitHub Sponsors (the repository's Sponsor button): it pays for tokens for agentic development and for time on different hardware to test on.
