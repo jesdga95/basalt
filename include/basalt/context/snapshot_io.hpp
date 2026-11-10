@@ -50,8 +50,6 @@ struct SnapshotDirEntry {
     int64_t mtime = 0;   ///< seconds on the file system's clock, the one `SnapshotFiles::now` reads
 };
 
-enum class DirSync : uint8_t { synced, unsupported, failed };
-
 /// The file calls a snapshot store makes, in the shape of basalt::platform's: descriptors are ints, reads and writes
 /// are positional and whole (a short transfer is a failure).
 class SnapshotFiles {
@@ -68,8 +66,7 @@ public:
     virtual bool remove(const std::string& path) = 0;    ///< true when the file is gone afterwards
     virtual bool list(const std::string& dir, std::vector<SnapshotDirEntry>& out) = 0;   ///< regular files only
     virtual bool make_dirs(const std::string& dir) = 0;
-    /// Makes the directory's entries durable; `unsupported` where the platform gives no handle on a directory.
-    virtual DirSync sync_dir(const std::string& dir) = 0;
+    virtual bool sync_dir(const std::string& dir) = 0;   ///< true once its entries (a rename into it) are durable
     virtual int64_t now() = 0;
 };
 
@@ -102,9 +99,8 @@ enum class PublishStatus : uint8_t {
 
 struct PublishResult {
     PublishStatus status = PublishStatus::invalid;
-    Manifest manifest;        ///< as published, digests filled in
+    Manifest manifest;   ///< as published, digests filled in
     std::string path;
-    bool dir_synced = false;  ///< false: the rename's durability rests on the file system alone
     std::string error;
     bool ok() const { return status == PublishStatus::published; }
 };
@@ -177,7 +173,11 @@ private:
 
 /// SnapshotFiles over basalt::platform: unbuffered reads and writes where the file system gives them, otherwise the
 /// OS cache is asked to drop a file's pages when it is closed, so snapshots do not grow the file cache.
-class PlatformSnapshotFiles final : public SnapshotFiles {
+/// A template so that only code constructing one instantiates it: the program that does links basalt::platform, and
+/// the context library's own objects never reference it (an optimizer that sees a lone implementation of an
+/// interface may inline calls against it).
+template <class = void>
+class BasicPlatformSnapshotFiles final : public SnapshotFiles {
 public:
     int create(const std::string& path) override {
         const int fd = basalt::platform::open_write_unbuffered(path);
@@ -211,14 +211,9 @@ public:
         return true;
     }
     bool make_dirs(const std::string& dir) override { return basalt::platform::make_dirs(dir); }
-    DirSync sync_dir(const std::string& dir) override {
-        const int fd = basalt::platform::open_fd_utf8(dir);
-        if (fd < 0) return DirSync::unsupported;
-        const bool ok = basalt::platform::sync_fd(fd);
-        basalt::platform::close_fd(fd);
-        return ok ? DirSync::synced : DirSync::failed;
-    }
+    bool sync_dir(const std::string& dir) override { return basalt::platform::sync_dir(dir); }
     int64_t now() override { return basalt::platform::file_time_now(); }
 };
+using PlatformSnapshotFiles = BasicPlatformSnapshotFiles<>;
 
 }  // namespace basalt::context
