@@ -428,6 +428,9 @@ def build_parser() -> argparse.ArgumentParser:
             ("seed", "fix the random draw, an integer")):
         ap.add_argument(f"--{key}", type=sampling_option(key.replace("-", "_")), metavar="N", default=None,
                         help=f"default {key.replace('-', '_')} for requests that leave it out, over the model file's: {text}")
+    ap.add_argument("--scheduler", action="store_true",
+                    help="admit requests through the agent scheduler (fair share per tenant/agent, prefill/decode "
+                         "budgets); off by default")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
                     help="load an unloaded model only when this much VRAM is free, else answer 503")
     ap.add_argument("--reasoning-budget-tokens", type=budget_count, default=None, metavar="N",

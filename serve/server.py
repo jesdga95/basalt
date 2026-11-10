@@ -200,6 +200,9 @@ def main() -> int:
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar))
     svc.logs = logs
+    if getattr(a, "scheduler", False):
+        from serve.scheduler.adapter import scheduler_for_service
+        svc.scheduler = scheduler_for_service(svc, min_free_vram_mib=a.min_free_vram_mib or 0)
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(used_argv)):
         # an empty key would silently disable authentication

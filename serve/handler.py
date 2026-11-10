@@ -415,6 +415,10 @@ def make_handler(svc: Service):
                     return
                 svc.request_ctx.path = path
                 svc.request_ctx.model = svc.model            # always the served name, never the requested one
+                # scheduler identity: header values are bounded and restricted to a safe charset
+                for attr, header in (("tenant", "X-Basalt-Tenant"), ("agent", "X-Basalt-Agent")):
+                    v = (self.headers.get(header) or "").strip()
+                    setattr(svc.request_ctx, attr, v if 0 < len(v) <= 64 and all(c.isalnum() or c in "-_." for c in v) else None)
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path == "/v1/chat/completions":

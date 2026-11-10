@@ -21,6 +21,7 @@ from serve.engine.vision import Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.config import GRAMMAR_DEFAULT
 from serve.scheduler import adapter as scheduler_adapter
+from serve.scheduler.core import AdmissionExpired, AdmissionRejected
 
 
 def available_ram_mib() -> int | None:
@@ -951,8 +952,41 @@ class Service:
                                               "model": getattr(self.request_ctx, "model", None) or self.model,
                                               "prompt_tokens": len(ids), "started": time.time()}
         try:
-            # batch slots run requests concurrently, so no fifo
+            # fair admission (serve.scheduler); None or disabled: the request goes straight on as before
             turn = contextlib.ExitStack()
+            sched = self.scheduler
+            if sched is not None and sched.enabled:
+                grant = None
+                try:
+                    grant = scheduler_adapter.submit(
+                        sched, getattr(self.request_ctx, "tenant", None) or "default",
+                        getattr(self.request_ctx, "agent", None) or "default", len(ids))
+                    turn.callback(scheduler_adapter.release, grant)
+                    state = scheduler_adapter.step(grant, cancel)
+                    while state == "waiting":
+                        yield "ping", None
+                        state = scheduler_adapter.step(grant, cancel)
+                except (AdmissionRejected, AdmissionExpired) as e:
+                    turn.close()
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                        self.waiting.pop(id(wait_key), None)
+                    raise GpuBusy(f"the scheduler did not admit this request ({type(e).__name__})") from None
+                except BaseException:                    # the consumer closed us at a ping
+                    turn.close()
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                        self.waiting.pop(id(wait_key), None)
+                    raise
+                if state == "cancelled":
+                    turn.close()
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                        self.waiting.pop(id(wait_key), None)
+                    yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
+                                   "reasoning_tokens": 0}
+                    return
+            # batch slots run requests concurrently, so no fifo
             if not getattr(self.engine, "batch", 0):
                 # A request waiting for the single turn sends a keep-alive now and then, so a client with a stream idle
                 # timeout does not abort a healthy queued request; one that left while queued gives its place up.
@@ -967,11 +1001,13 @@ class Service:
                         else:
                             yield "ping", None
                 except BaseException:                    # the consumer closed us at a ping: no longer queued
+                    turn.close()
                     with self.status_lock:
                         self.status["queued"] -= 1
                         self.waiting.pop(id(wait_key), None)
                     raise
                 if not got:                              # cancelled while queued
+                    turn.close()
                     with self.status_lock:
                         self.status["queued"] -= 1
                         self.waiting.pop(id(wait_key), None)
