@@ -15,6 +15,18 @@ class Dialect:
     image_start = "<|vision_start|>"        # the token an image's pad run follows ("" : every pad is an image row)
     in_engine_vision = False                # the image encoder always lives in the engine (only --vision dynamic)
     effort_turn = ""                        # a trailing turn that states the reasoning effort ("{}" for its text)
+    # what the model's template does with a conversation, as llama.cpp's /props `chat_template_caps` names it
+    caps = {"supports_tool_calls": False, "supports_parallel_tool_calls": False, "supports_reasoning_effort": False,
+            "supports_system_role": False, "supports_preserve_reasoning": False}
+
+    def template_kwargs(self, kwargs: dict) -> dict:
+        """The frontend's template kwargs as this model's template names them: `preserve_reasoning` (keep earlier
+        turns' thinking in the prompt) becomes the template's own switch."""
+        if "preserve_reasoning" not in kwargs:
+            return kwargs
+        out = dict(kwargs)
+        out["preserve_thinking"] = out.pop("preserve_reasoning")
+        return out
 
     def effort_level(self, level):
         """The frontend's reasoning level (low, medium, high, max or a number) as this model's template takes it."""

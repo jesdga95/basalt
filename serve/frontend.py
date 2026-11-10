@@ -83,12 +83,37 @@ def effort_kwargs(value) -> dict:
 
 
 def budget_effort(tokens) -> dict:
-    """Anthropic's thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high."""
+    """A thinking budget in tokens (Anthropic's budget_tokens, llama.cpp's reasoning_budget) -> a level: up to 2048
+    low, up to 8192 medium, else high."""
     try:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "high"}
+    return {"reasoning_effort": "low" if n <= 2048 else "medium" if n <= 8192 else "high"}
+
+
+def llama_budget(value) -> dict:
+    """llama.cpp's reasoning_budget as template kwargs: 0 is thinking off, -1 (any negative) is unbounded, which
+    asks for the model's highest effort, N > 0 is a token budget, and names a level as Anthropic's budget does.
+    The token cap itself is the service's (Service.reasoning_budget)."""
+    if value is None:
+        return {}
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"reasoning_budget: expected a whole number (0 = off, -1 = unbounded), not {value!r}")
+    if value == 0:
+        return {"enable_thinking": False}
+    return {"reasoning_effort": "max"} if value < 0 else budget_effort(value)
+
+
+def preserve_kwargs(value) -> dict:
+    """llama.cpp's chat_template_kwargs.preserve_reasoning: keep earlier turns' thinking in the prompt."""
+    if value is None:
+        return {}
+    if not isinstance(value, bool):
+        raise ValueError(f"preserve_reasoning: expected true or false, not {value!r}")
+    return {"preserve_reasoning": value}
 
 
 def _has_image(content) -> bool:
@@ -401,16 +426,20 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     _order_chat_tool_results(messages)
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
-    kwargs = {}
-    # "reasoning_effort", or Responses-style "reasoning": {"effort": ...}
+    # Thinking, strongest first: off from any field (enable_thinking false, an effort of none, reasoning_budget 0),
+    # then chat_template_kwargs.reasoning_effort, "reasoning_effort" or Responses-style "reasoning": {"effort": ...},
+    # and last the level a reasoning_budget implies (-1: the highest, N: as Anthropic's budget_tokens)
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
-    kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
-    # chat_template_kwargs: enable_thinking / reasoning_effort
-    for k, v in (req.get("chat_template_kwargs") or {}).items():
-        if k == "enable_thinking" and not v:
-            kwargs = {"enable_thinking": False}
-        elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
-            kwargs.update(effort_kwargs(v))
+    template_kw = req.get("chat_template_kwargs") or {}
+    kwargs = {**llama_budget(req.get("reasoning_budget")),
+              **effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort"))}
+    if "reasoning_effort" in template_kw:
+        kwargs.update(effort_kwargs(template_kw["reasoning_effort"]))
+    if "enable_thinking" in template_kw and not template_kw["enable_thinking"]:
+        kwargs["enable_thinking"] = False
+    if kwargs.get("enable_thinking") is False:
+        kwargs = {"enable_thinking": False}
+    kwargs.update(preserve_kwargs(template_kw.get("preserve_reasoning")))
     return _late_system_to_user(messages), tools, kwargs
 
 

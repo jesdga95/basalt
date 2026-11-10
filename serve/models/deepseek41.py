@@ -28,7 +28,7 @@ INVOKE_HEAD = re.compile(r'^' + re.escape(INVOKE_START) + r' name="([^"]*)">')
 PARAM_HEAD = re.compile(r'^' + re.escape(PARAM_START) + r' name="([^"]*)" string="(true|false)">')
 DSML_MARK = "\U000F2000"                # stands for the DSML marker while a message is rendered
 
-# the frontend's levels -> the encoder's scale (low, high, max or 1-100); medium is its default
+# the frontend's levels -> the encoder's scale (low 50, high 75, max 100, or 1-100); medium is the model's default (high)
 EFFORTS = {"low": "low", "medium": None, "high": "high", "max": "max"}
 
 
@@ -38,7 +38,7 @@ class DeepseekTemplate:
     source = "deepseek41 encoder (serve/models/deepseek41_encoding.py)"
 
     def render(self, messages, tools=None, add_generation_prompt=True, enable_thinking=True, reasoning_effort=None,
-               **_):
+               drop_thinking=True, **_):
         msgs = [dict(m) for m in messages]
         if tools:
             wrapped = [{"type": "function", "function": t} for t in tools]
@@ -48,7 +48,7 @@ class DeepseekTemplate:
                 msgs.insert(0, {"role": "system", "content": "", "tools": wrapped})
         mode = "thinking" if enable_thinking is not False else "chat"
         effort = EFFORTS.get(reasoning_effort, reasoning_effort)
-        text = enc.encode_messages(msgs, thinking_mode=mode, reasoning_effort=effort)
+        text = enc.encode_messages(msgs, thinking_mode=mode, reasoning_effort=effort, drop_thinking=drop_thinking)
         if not add_generation_prompt and msgs and msgs[-1].get("role") in ("user", "tool", "system"):
             head = enc.ASSISTANT_SP_TOKEN
             cut = text.rfind(head)
@@ -232,10 +232,21 @@ class DeepseekParser:
 
 
 class DeepSeek41(Dialect):
+    name = "deepseek41"
+    # the encoder: DSML tools with several invokes per block, effort 1-100 or low/high/max, a system message,
+    # and `drop_thinking` (off keeps earlier turns' thinking)
+    caps = {"supports_tool_calls": True, "supports_parallel_tool_calls": True, "supports_reasoning_effort": True,
+            "supports_system_role": True, "supports_preserve_reasoning": True}
+
     def effort_level(self, level):
         return level
 
-    name = "deepseek41"
+    def template_kwargs(self, kwargs):
+        if "preserve_reasoning" not in kwargs:
+            return kwargs
+        out = dict(kwargs)
+        out["drop_thinking"] = not out.pop("preserve_reasoning")
+        return out
     in_engine_vision = True
     image_pad = enc.IMAGE_PLACEHOLDER
     image_start = ""
