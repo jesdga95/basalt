@@ -1,9 +1,10 @@
 """ContextClient for the Mantle orchestrator, backed by the context registry through ContextAdapter, and the
 previous_response_id -> thread map that ContextAdapter's resolver hook needs.
 
-prefill() binds the handoff's transcript (``transcript_ref`` = thread id) to a new context and asks the registry to
-materialize it; the engine's own materialization (re-prefill from the transcript, never raw KV) completes the
-transition to HOT. start() takes the fenced writer lease. discard() tombstones the context."""
+prefill() binds the handoff's transcript (``transcript_ref`` = thread id) to the head's context, takes the fenced
+writer lease and starts materializing; the engine's own re-prefill from the transcript (never raw KV) completes the
+transition to HOT under that lease. start() checks the context is building or ready. discard() releases the lease and
+tombstones the context."""
 from __future__ import annotations
 
 import collections
@@ -19,27 +20,45 @@ class RegistryContextClient:
         self.adapter = adapter
         self._leases: dict = {}   # context id -> numeric lease token
 
-    def prefill(self, model: str, handoff: Handoff) -> str:
-        ctx = self.adapter._call("POST", "/v1/contexts", {"thread_id": handoff.transcript_ref},
-                                 f"mantle:{model}:{handoff.transcript_ref}:create", (200, 201))
-        cid = self.adapter._id(ctx.get("context_id"))
-        version = ctx.get("version")
-        if not isinstance(version, int):
-            raise RegistryError("invalid_response")
-        self.adapter._call("POST", f"/v1/contexts/{cid}/transition",
-                           {"event": "materialize", "expected_version": version},
-                           f"mantle:{model}:{handoff.transcript_ref}:materialize", (200,))
-        return cid
-
-    def start(self, context_id: str) -> None:
-        res = self.adapter._call("POST", f"/v1/contexts/{self.adapter._id(context_id)}/resume", {},
-                                 f"mantle:{context_id}:resume", (200,))
+    @staticmethod
+    def _lease_token(res: dict) -> int:
         lease = res.get("lease")
         token = lease.get("token") if isinstance(lease, dict) else None
         # the registry issues the token as a 64-bit number (a digit string is accepted); release sends it back as one
         if isinstance(token, bool) or not isinstance(token, (int, str)) or (isinstance(token, str) and not token.isdigit()):
             raise RegistryError("invalid_response")
-        self._leases[context_id] = int(token)
+        return int(token)
+
+    def prefill(self, model: str, handoff: Handoff) -> str:
+        """Create (or reuse) the transcript head's context, take its writer lease and start materializing it. The
+        engine's re-prefill from the transcript completes the transition to HOT under the same lease."""
+        key = f"mantle:{model}:{handoff.transcript_ref}"
+        ctx = self.adapter._call("POST", "/v1/contexts", {"thread_id": handoff.transcript_ref}, f"{key}:create", (200, 201))
+        cid = self.adapter._id(ctx.get("context_id"))
+        res = self.adapter._call("POST", f"/v1/contexts/{cid}/resume", {}, f"{key}:resume", (200,))
+        token = self._lease_token(res)
+        self._leases[cid] = token
+        try:
+            cur = self.adapter._call("GET", f"/v1/contexts/{cid}", None, None, (200,))
+            version = cur.get("version")
+            if not isinstance(version, int) or isinstance(version, bool):
+                raise RegistryError("invalid_response")
+            if cur.get("state") == "RECORDED":
+                self.adapter._call("POST", f"/v1/contexts/{cid}/transition",
+                                   {"event": "materialize", "expected_version": version, "lease_token": token},
+                                   f"{key}:materialize", (200,))
+        except RegistryError:
+            self.discard(cid)
+            raise
+        return cid
+
+    def start(self, context_id: str) -> None:
+        """The context must be building or ready under this client's lease; anything else means the prefill was lost."""
+        if context_id not in self._leases:
+            raise RegistryError("lease_missing")
+        cur = self.adapter._call("GET", f"/v1/contexts/{self.adapter._id(context_id)}", None, None, (200,))
+        if cur.get("state") not in ("MATERIALIZING", "HOT"):
+            raise RegistryError("not_materialized")
 
     def discard(self, context_id: str) -> None:
         token = self._leases.pop(context_id, None)

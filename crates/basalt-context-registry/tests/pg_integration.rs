@@ -63,7 +63,7 @@ async fn s_create_and_isolation(db: &PgPool) {
     assert_eq!(cut.model_fingerprint, full.model_fingerprint);
     let again = create_context(db, a.owner, a.thread, None, Some(a.messages[1])).await.unwrap();
     assert_eq!(again.prefix_hash, cut.prefix_hash, "same prefix -> same identity");
-    assert_ne!(again.id, cut.id);
+    assert_eq!(again.id, cut.id, "one context per transcript head: a repeated create returns the live one");
     // cross-tenant and foreign message ids look like missing resources
     not_found(create_context(db, b.owner, a.thread, None, None).await);
     not_found(create_context(db, a.owner, a.thread, None, Some(b.messages[0])).await);
@@ -219,59 +219,63 @@ async fn s_expiry_and_reconcile(db: &PgPool) {
     assert_eq!(reconcile(db, None, 100).await.unwrap(), ReconcileReport::default());
 
     // expired lease cleaned lazily by the next resume (no sweeper needed)
-    let c2 = create_context(db, s.owner, s.thread, None, None).await.unwrap();
-    let (_, l2, _) = acquire_lease(db, s.owner, c2.id, Some(1_000)).await.unwrap();
-    transition(db, s.owner, c2.id, req(Event::Materialize, 0, Some(l2.token))).await.unwrap();
+    let s2 = seed(db, 2).await;
+    let c2 = create_context(db, s2.owner, s2.thread, None, None).await.unwrap();
+    let (_, l2, _) = acquire_lease(db, s2.owner, c2.id, Some(1_000)).await.unwrap();
+    transition(db, s2.owner, c2.id, req(Event::Materialize, 0, Some(l2.token))).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1_300)).await;
-    let (cur, l3, src) = acquire_lease(db, s.owner, c2.id, None).await.unwrap();
+    let (cur, l3, src) = acquire_lease(db, s2.owner, c2.id, None).await.unwrap();
     assert_eq!((cur.state, src), (State::Recorded, "replay"));
     assert!(l3.token > l2.token);
 
     // abandoning a build releases it back to RECORDED; abandoning a restore leaves FAILED
-    release_lease(db, s.owner, c2.id, l3.token).await.unwrap();
-    let c3 = create_context(db, s.owner, s.thread, None, None).await.unwrap();
-    let (_, l4, _) = acquire_lease(db, s.owner, c3.id, None).await.unwrap();
-    transition(db, s.owner, c3.id, req(Event::Materialize, 0, Some(l4.token))).await.unwrap();
-    release_lease(db, s.owner, c3.id, l4.token).await.unwrap();
-    assert_eq!(get_context(db, s.owner, c3.id).await.unwrap().context.state, State::Recorded);
-    let (_, l5, _) = acquire_lease(db, s.owner, c3.id, None).await.unwrap();
-    let cur = get_context(db, s.owner, c3.id).await.unwrap().context;
-    transition(db, s.owner, c3.id, req(Event::Materialize, cur.version, Some(l5.token))).await.unwrap();
+    release_lease(db, s2.owner, c2.id, l3.token).await.unwrap();
+    let s3 = seed(db, 2).await;
+    let c3 = create_context(db, s3.owner, s3.thread, None, None).await.unwrap();
+    let (_, l4, _) = acquire_lease(db, s3.owner, c3.id, None).await.unwrap();
+    transition(db, s3.owner, c3.id, req(Event::Materialize, 0, Some(l4.token))).await.unwrap();
+    release_lease(db, s3.owner, c3.id, l4.token).await.unwrap();
+    assert_eq!(get_context(db, s3.owner, c3.id).await.unwrap().context.state, State::Recorded);
+    let (_, l5, _) = acquire_lease(db, s3.owner, c3.id, None).await.unwrap();
+    let cur = get_context(db, s3.owner, c3.id).await.unwrap().context;
+    transition(db, s3.owner, c3.id, req(Event::Materialize, cur.version, Some(l5.token))).await.unwrap();
     let mut rdy = req(Event::Ready, cur.version + 1, Some(l5.token));
     rdy.patch.engine_epoch = Some(Uuid::new_v4());
-    transition(db, s.owner, c3.id, rdy).await.unwrap();
-    release_lease(db, s.owner, c3.id, l5.token).await.unwrap();
-    let ver = get_context(db, s.owner, c3.id).await.unwrap().context.version;
-    transition(db, s.owner, c3.id, req(Event::Cool, ver, None)).await.unwrap();
-    transition(db, s.owner, c3.id, req(Event::Warm, ver + 1, None)).await.unwrap();
+    transition(db, s3.owner, c3.id, rdy).await.unwrap();
+    release_lease(db, s3.owner, c3.id, l5.token).await.unwrap();
+    let ver = get_context(db, s3.owner, c3.id).await.unwrap().context.version;
+    transition(db, s3.owner, c3.id, req(Event::Cool, ver, None)).await.unwrap();
+    transition(db, s3.owner, c3.id, req(Event::Warm, ver + 1, None)).await.unwrap();
     let mut chill = req(Event::Chill, ver + 2, None);
     chill.patch = Patch { locator: Some("/snap/c3".into()), validated: Some(true), ..Default::default() };
-    transition(db, s.owner, c3.id, chill).await.unwrap();
-    let (_, l6, _) = acquire_lease(db, s.owner, c3.id, None).await.unwrap();
-    transition(db, s.owner, c3.id, req(Event::Restore, ver + 3, Some(l6.token))).await.unwrap();
-    release_lease(db, s.owner, c3.id, l6.token).await.unwrap();
-    let after = get_context(db, s.owner, c3.id).await.unwrap().context;
+    transition(db, s3.owner, c3.id, chill).await.unwrap();
+    let (_, l6, _) = acquire_lease(db, s3.owner, c3.id, None).await.unwrap();
+    transition(db, s3.owner, c3.id, req(Event::Restore, ver + 3, Some(l6.token))).await.unwrap();
+    release_lease(db, s3.owner, c3.id, l6.token).await.unwrap();
+    let after = get_context(db, s3.owner, c3.id).await.unwrap().context;
     assert_eq!((after.state, after.tier), (State::Failed, Tier::None));
     assert_eq!(after.locator.as_deref(), Some("/snap/c3"), "durable snapshot locator survives a failed restore");
 
     // engine restart: HOT context of a dead epoch is replayed, COLD one survives
-    let hot = create_context(db, s.owner, s.thread, None, None).await.unwrap();
-    let (_, lh, _) = acquire_lease(db, s.owner, hot.id, None).await.unwrap();
-    transition(db, s.owner, hot.id, req(Event::Materialize, 0, Some(lh.token))).await.unwrap();
+    // one context per transcript head: each scenario below needs its own thread
+    let s4 = seed(db, 2).await;
+    let hot = create_context(db, s4.owner, s4.thread, None, None).await.unwrap();
+    let (_, lh, _) = acquire_lease(db, s4.owner, hot.id, None).await.unwrap();
+    transition(db, s4.owner, hot.id, req(Event::Materialize, 0, Some(lh.token))).await.unwrap();
     let old_epoch = Uuid::new_v4();
     let mut r = req(Event::Ready, 1, Some(lh.token));
     r.patch = Patch { engine_epoch: Some(old_epoch), locator: Some("gpu".into()), validated: Some(true), ..Default::default() };
-    transition(db, s.owner, hot.id, r).await.unwrap();
-    release_lease(db, s.owner, hot.id, lh.token).await.unwrap();
+    transition(db, s4.owner, hot.id, r).await.unwrap();
+    release_lease(db, s4.owner, hot.id, lh.token).await.unwrap();
     reconcile(db, Some(old_epoch), 100).await.unwrap();
-    assert_eq!(get_context(db, s.owner, hot.id).await.unwrap().context.state, State::Hot,
+    assert_eq!(get_context(db, s4.owner, hot.id).await.unwrap().context.state, State::Hot,
         "context of the live epoch is left alone");
     let rep = reconcile(db, Some(Uuid::new_v4()), 100).await.unwrap();
     assert!(rep.contexts_recovered >= 1);
-    let lost = get_context(db, s.owner, hot.id).await.unwrap().context;
+    let lost = get_context(db, s4.owner, hot.id).await.unwrap().context;
     assert_eq!((lost.state, lost.tier, lost.validated, lost.locator.clone(), lost.engine_epoch),
         (State::Recorded, Tier::None, false, None, None));
-    assert_eq!(get_context(db, s.owner, c3.id).await.unwrap().context.state, State::Failed);
+    assert_eq!(get_context(db, s3.owner, c3.id).await.unwrap().context.state, State::Failed);
 }
 
 async fn s_tombstone_and_gc(db: &PgPool) {

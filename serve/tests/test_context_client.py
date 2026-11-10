@@ -11,6 +11,7 @@ CID = "11111111-2222-3333-4444-555555555555"
 class Recorder:
     def __init__(self):
         self.calls = []
+        self.materialized = False
 
     def __call__(self, method, url, headers, body, timeout):
         path = url[url.index("/v1"):]
@@ -19,6 +20,11 @@ class Recorder:
             return 201, json.dumps({"context_id": CID, "version": 3}).encode()
         if path.endswith("/resume"):
             return 200, json.dumps({"lease": {"token": 4242}, "source": "cold"}).encode()
+        if method == "GET":
+            return 200, json.dumps({"context_id": CID, "state": "RECORDED" if not self.materialized else "MATERIALIZING",
+                                    "version": 5}).encode()
+        if path.endswith("/transition"):
+            self.materialized = True
         return 200, b"{}"
 
 
@@ -28,7 +34,8 @@ class ContextClientTest(unittest.TestCase):
         c = RegistryContextClient(ContextAdapter("http://x", transport=rec))
         h = Handoff(plan={}, transcript_ref="thread-1")
         self.assertEqual(c.prefill("little", h), CID)
-        self.assertEqual(rec.calls[1][2], {"event": "materialize", "expected_version": 3})
+        transition = [call for call in rec.calls if call[1].endswith("/transition")][0]
+        self.assertEqual(transition[2], {"event": "materialize", "expected_version": 5, "lease_token": 4242})
         c.start(CID)
         c.discard(CID)
         self.assertEqual(c._leases, {})
@@ -38,7 +45,7 @@ class ContextClientTest(unittest.TestCase):
         self.assertIn(("POST", "release"), paths)
         self.assertEqual(rec.calls[-1][0], "DELETE")
         self.assertEqual(rec.calls[0][3], "mantle:little:thread-1:create")
-        self.assertEqual(rec.calls[1][3], "mantle:little:thread-1:materialize")
+        self.assertEqual(transition[3], "mantle:little:thread-1:materialize")
 
     def test_response_map_bounded_and_resolves(self):
         m = ResponseThreadMap(capacity=2)

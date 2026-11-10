@@ -63,7 +63,7 @@ class AttachResult:
     """mode: 'none' (no binding), 'context' (leased context), 'replay' (use fallback)."""
     mode: str
     context_id: Optional[str] = None
-    lease_token: Optional[str] = None
+    lease_token: Optional[int] = None  # the registry issues a 64-bit number
     source: Optional[str] = None  # hot|warm|cold|replay as reported by the registry
     replay_required: bool = False  # True when mode=='replay' or registry source=='replay'
     fallback: Optional[ReplayFallback] = None
@@ -168,7 +168,7 @@ class ContextAdapter:
         return self._call("POST", f"/v1/contexts/{cid}/fork",
                           {"expected_version": expected_version}, idempotency_key, (200, 201))
 
-    def release(self, context_id: str, lease_token: str) -> bool:
+    def release(self, context_id: str, lease_token: int) -> bool:
         try:
             self._call("POST", f"/v1/contexts/{self._id(context_id)}/lease/release",
                        {"token": lease_token}, None, (200, 202, 204))
