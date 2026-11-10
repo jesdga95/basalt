@@ -45,6 +45,19 @@ read the vision projector inside it.
 The server's address serves a page, updated every second from `/metrics`, `/slots` and `/api/logs`: GPU load, power, VRAM and temperature,
 RAM and disk, decode and prefill rates with 60 s charts, slots, the newest requests, and the console lines.
 
+Three quiet figures sit in it, each from `/metrics`:
+
+- `N chats cached · X GiB` at the right of the Speed footer: the conversations parked in RAM (`conversation`: `parked`,
+  `bytes`, `evictions`, and the last restore's `restored` tokens and `restored_ms`, in the tooltip). The server reads them
+  from the engine's `conversation cache:` lines and clears them when the engine unloads, sleeps or restarts. A model that
+  prints no line when it parks (DeepSeek) shows them after its first restore, without evictions.
+- `N requests served · M tokens written` under the Slots table (`totals`: requests, prompt, reused and written tokens, prompt
+  and decode time since the server started; the rest in the tooltip).
+- The header word reads `Thinking`, `Answering` or `Tool call` (`live.phase`) while exactly one request runs.
+
+The log panel shows the engine's long cache lines short (`cache: restored 187k tokens in 912 ms`); the log and `/api/logs`
+keep the raw line.
+
 ## Conversations on disk: `--conversation-cache-disk-mib`
 
 Off at 0. With a budget, conversations of at least 8,192 tokens are written to `conversations` in the model's cache folder when they leave
