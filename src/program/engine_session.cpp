@@ -262,12 +262,15 @@ std::string default_fixtures(const std::string& root, const std::string& built) 
     return built;
 }
 
-std::string lossy_note(const std::string& lossy) {
-    const std::vector<std::string> flags = split(lossy, ',');
-    std::string list;
-    for (const auto& f : flags) list += (list.empty() ? "" : ", ") + f;
-    return "LOSSY: " + list + (flags.size() == 1 ? " changes" : " change") + " the model's output; these numbers do not compare "
-           "with a run without " + (flags.size() == 1 ? "it" : "them");
+std::string community_refusal(const std::vector<std::string>& extra, const std::string& plan_answer) {
+    const std::vector<std::string> lossy = split(plan_field(plan_answer, "lossy"), ',');
+    if (!lossy.empty()) {
+        std::string list;
+        for (const auto& f : lossy) list += (list.empty() ? "" : ", ") + f;
+        return "--community runs the model as it is: " + list + (lossy.size() == 1 ? " is a lossy flag" : " are lossy flags");
+    }
+    return "--community runs the fixed preset: " + (extra.empty() ? std::string("an engine flag") : extra[0]) +
+           " would make the row incomparable";
 }
 
 void Engine::reap() {

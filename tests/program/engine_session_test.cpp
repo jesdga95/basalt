@@ -1,7 +1,7 @@
 // tests/program/engine_session_test.cpp - Engine::start against a stand-in engine (this binary run with --serve): an
 // error-marked log line during a healthy start does not fail it, an engine that exits before READY does, with its
 // error lines in the reason; an engine with lossy flags reports them. Also the default engine and fixtures paths and
-// the lossy note. CPU only.
+// the community refusal of engine flags. CPU only.
 #include "basalt/program/engine_session.hpp"
 
 #include <cstdio>
@@ -108,13 +108,18 @@ int main(int argc, char** argv) {
               "the install's data/bench");
         fs::remove_all(top);
     }
-    {
-        const std::string one = basalt::program::lossy_note("--route-tail-skip");
-        check(one == "LOSSY: --route-tail-skip changes the model's output; these numbers do not compare with a run without it",
-              "the lossy note names the flag", one);
-        const std::string two = basalt::program::lossy_note("--route-prior,--route-tail-skip");
-        check(two == "LOSSY: --route-prior, --route-tail-skip change the model's output; these numbers do not compare with a "
-                     "run without them", "and every flag", two);
+    {   // --community and engine flags: the engine's plan names the lossy ones
+        using basalt::program::community_refusal;
+        const std::string plan = "{\"arch\":\"qwen4exp\",\"lossy\":\"--route-tail-skip\",\"spec\":8}";
+        std::string got = community_refusal({"--route-tail-skip", "7"}, plan);
+        check(got == "--community runs the model as it is: --route-tail-skip is a lossy flag", "a lossy flag is named as one", got);
+        got = community_refusal({"--route-prior", "--route-tail-skip"}, "{\"lossy\":\"--route-prior,--route-tail-skip\"}");
+        check(got == "--community runs the model as it is: --route-prior, --route-tail-skip are lossy flags", "and every one", got);
+        got = community_refusal({"--kv", "fp16"}, "{\"arch\":\"qwen4exp\",\"lossy\":\"\",\"spec\":8}");
+        check(got == "--community runs the fixed preset: --kv would make the row incomparable", "another flag is still refused", got);
+        got = community_refusal({"--route-tail-skip", "7"}, "");
+        check(got == "--community runs the fixed preset: --route-tail-skip would make the row incomparable",
+              "an engine that cannot plan (a model without the flag) still refuses it", got);
     }
     return failures ? 1 : 0;
 }
