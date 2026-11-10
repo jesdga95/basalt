@@ -21,6 +21,8 @@ public:
     /// Frees the host copy (PageStore::remove) or deletes the context's files.
     void release(const ContextId& context, Tier tier) override;
 
+    /// Removes temporary files an earlier process left behind (call once at startup, before any copy). Returns the count.
+    static size_t sweep(const std::string& dir);
     std::string path_of(const ContextId& context, Generation g) const;
     /// Digest of the pages as the file format defines it.
     static Digest combine(const std::vector<Digest>& pages);

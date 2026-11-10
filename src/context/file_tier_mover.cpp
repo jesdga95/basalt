@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <vector>
@@ -52,6 +53,18 @@ Digest FileTierMover::combine(const std::vector<Digest>& pages) {
     return h.finish();
 }
 
+size_t FileTierMover::sweep(const std::string& dir) {
+    DIR* d = ::opendir(dir.c_str());
+    if (!d) return 0;
+    size_t removed = 0;
+    while (dirent* e = ::readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.find(".pages.tmp.") != std::string::npos && ::unlink((dir + "/" + n).c_str()) == 0) ++removed;
+    }
+    ::closedir(d);
+    return removed;
+}
+
 std::string FileTierMover::path_of(const ContextId& context, Generation g) const {
     return dir_ + "/" + context + "." + std::to_string(g) + ".pages";
 }
@@ -67,7 +80,7 @@ void FileTierMover::release(const ContextId& context, Tier tier) {
         std::string n = e->d_name;
         if (n.compare(0, prefix.size(), prefix) == 0 && n.size() > 6 && n.compare(n.size() - 6, 6, ".pages") == 0)
             ::unlink((dir_ + "/" + n).c_str());
-        else if (n.compare(0, prefix.size(), prefix) == 0 && n.find(".tmp") != std::string::npos)
+        else if (n.compare(0, prefix.size(), prefix) == 0 && n.find(".pages.tmp.") != std::string::npos)
             ::unlink((dir_ + "/" + n).c_str());
     }
     ::closedir(d);
@@ -82,7 +95,9 @@ TierMover::Outcome FileTierMover::copy(const TierMove& move, const std::atomic<b
         if (move.bytes == 0 || move.bytes > (uint64_t) 1 << 48) { error = "bytes out of range"; return Outcome::failed; }
         const size_t pages = (size_t) ((move.bytes + pb - 1) / pb);
         const std::string final_path = path_of(move.context, move.generation);
-        const std::string tmp = final_path + ".tmp";
+        // unique per call: two copies of one generation never share a temporary file
+        static std::atomic<uint64_t> serial{0};
+        const std::string tmp = final_path + ".tmp." + std::to_string((long long) ::getpid()) + "." + std::to_string(serial.fetch_add(1));
         int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
         if (fd < 0) { error = err("open", tmp); return Outcome::failed; }
         auto fail = [&](Outcome o, std::string msg) { ::close(fd); ::unlink(tmp.c_str()); error = std::move(msg); return o; };
@@ -107,7 +122,12 @@ TierMover::Outcome FileTierMover::copy(const TierMove& move, const std::atomic<b
         ::close(fd);
         if (::rename(tmp.c_str(), final_path.c_str()) != 0) { error = err("rename", final_path); ::unlink(tmp.c_str()); return Outcome::failed; }
         int dfd = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (dfd < 0 || ::fsync(dfd) != 0) { error = err("fsync dir", dir_); if (dfd >= 0) ::close(dfd); return Outcome::failed; }
+        if (dfd < 0 || ::fsync(dfd) != 0) {   // not durable: take the file back so a retry starts clean
+            error = err("fsync dir", dir_);
+            if (dfd >= 0) ::close(dfd);
+            ::unlink(final_path.c_str());
+            return Outcome::failed;
+        }
         ::close(dfd);
         digest = total;
         return Outcome::done;
