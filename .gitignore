@@ -1,5 +1,6 @@
 build*/
 /bin/
+crates/target/
 pack/
 logs/
 *.log

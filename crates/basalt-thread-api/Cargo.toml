@@ -7,6 +7,7 @@ license = "MIT"
 [dependencies]
 basalt-thread-store = { path = "../basalt-thread-store" }
 basalt-thread-runtime = { path = "../basalt-thread-runtime" }
+basalt-context-registry = { path = "../basalt-context-registry" }
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

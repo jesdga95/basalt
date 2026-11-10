@@ -1,5 +1,6 @@
 //! Loopback-only API sidecar. Basalt's existing HTTP handler authenticates and forwards
 //! thread calls; this process has a separate mandatory shared secret.
+mod contexts;
 use axum::{
     extract::{Path, State}, http::{HeaderMap, StatusCode}, routing::{get, post},
     Json, Router,
@@ -363,6 +364,8 @@ async fn main() -> std::result::Result<(),Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });
+    let engine_epoch=env::var("BASALT_ENGINE_EPOCH").ok().map(|v|v.parse::<Uuid>()).transpose()?;
+    contexts::spawn_sweeper(app.pool.clone(),engine_epoch);
     let router=Router::new()
        .route("/v1/threads",post(create_thread))
        .route("/v1/threads/{id}",get(read_thread))
@@ -372,8 +375,15 @@ async fn main() -> std::result::Result<(),Box<dyn std::error::Error>> {
        .route("/v1/threads/{id}/branches/{branch}",get(read_branch))
        .route("/v1/threads/{id}/branches/{branch}/messages",get(read_branch_messages))
        .route("/v1/threads/{id}/turns",post(run_turn))
+       .merge(contexts::router())
        .with_state(app);
-    let addr:SocketAddr="127.0.0.1:8095".parse()?;
+    // The port is configurable because the loopback range is shared with other local services;
+    // the address itself stays loopback-only: only the Basalt handler talks to this sidecar.
+    let port:u16=match env::var("BASALT_THREAD_API_PORT"){
+        Ok(p)=>p.parse().map_err(|_|format!("BASALT_THREAD_API_PORT is not a port: {p}"))?,
+        Err(_)=>"8095".parse()?,
+    };
+    let addr:SocketAddr=(std::net::Ipv4Addr::LOCALHOST, port).into();
     let listener=tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener,router).await?;
     Ok(())
