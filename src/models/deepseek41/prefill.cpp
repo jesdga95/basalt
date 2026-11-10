@@ -41,6 +41,7 @@ public:
     ~PrefillImpl() override {
         finish_reads(ahead_);
         for (void* p : allocs_) cudaFree(p);
+        if (batch_open_) ops_.close_batch();
     }
 
     bool init(std::string& err) {
@@ -59,6 +60,8 @@ public:
         ExpertTier* tier = ops_.expert_tier(err);   // the FFN has it open by now
         if (!tier) return false;
         host_ = &tier->host();
+        batch_open_ = ops_.open_batch(cap_, err);
+        if (!batch_open_) return false;
         const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), 8), 1 << 16);
         bool ok = buf(x_, C * 4 * n) && buf(x2_, C * 4 * n) && buf(cur_, C * n) && buf(normed_, C * n) &&
                   buf(attn_, C * n) && buf(moe_, C * n) && buf(sh_, C * n) && buf(sum_, C * n) &&
@@ -425,6 +428,7 @@ private:
     LayerOps& ops_;
     cudaStream_t stream_;
     int cap_;
+    bool batch_open_ = false;   // the ops hold this read's batched attention
     std::vector<void*> allocs_;
     std::string err_;
     float *x_ = nullptr, *x2_ = nullptr, *cur_ = nullptr, *normed_ = nullptr, *attn_ = nullptr, *moe_ = nullptr,

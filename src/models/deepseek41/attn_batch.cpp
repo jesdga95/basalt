@@ -42,6 +42,32 @@ constexpr int kStageSlots = kSub + kWindow;   // staged window ring: a sub-chunk
 constexpr int kMqaChunks = (kWindow + kAttnChunk - 1) / kAttnChunk + (kTopK + kAttnChunk - 1) / kAttnChunk;
 constexpr size_t kIndexBudget = 160u << 20;   // bytes of indexer workspace
 
+// Device bytes of the buffers that do not grow with the chunk, in the order init allocates them.
+struct Sizes {
+    size_t xq, kvraw, qr, q, attn, oa, ident, stage, mws, cws, iws, fixed;
+};
+Sizes sizes(CacheFormat f) {
+    namespace mmq = basalt::prefill::mmq;
+    const size_t S = kSub;
+    Sizes z;
+    z.xq = std::max({mmq::q8_bytes((int64_t) S, kAttnEmbd), mmq::q8_bytes((int64_t) S, kAttnQRank),
+                     mmq::q8_bytes((int64_t) S * kAttnGroups, kAttnGroupIn),
+                     mmq::q8_bytes((int64_t) S, kAttnGroups * kAttnOutRank), (size_t) 1 << 16});
+    z.kvraw = S * kLatent * 4;
+    z.qr = S * kAttnQRank * 4;
+    z.q = z.attn = S * kAttnHeads * kAttnHeadDim * 4;
+    z.oa = S * kAttnGroups * kAttnOutRank * 4;
+    z.ident = S * 4;
+    z.stage = (size_t) kStageSlots * win_row_bytes(f);
+    z.mws = ((size_t) kMqaT * kAttnHeads * kMqaChunks * (kAttnHeadDim + 2) + 64) * 4;
+    z.cws = compress_batch_workspace_bytes(kSub);
+    z.iws = kIndexBudget;
+    z.fixed = (size_t) (kAttnGroups * S + 16) * 4;   // each of the two sub-chunk sizes' index arrays
+    return z;
+}
+// per token of the chunk: positions, window bounds, both visible-row limits, top-k ids and count, candidates and count
+constexpr size_t kTokenBytes = 4 * (5 + kTopK + 1 + kMaxCandBlocks + 1);
+
 class Impl final : public AttnBatch {
 public:
     Impl(const DsModel& m, const AttnCaches& c, int cap, int max_pos) : m_(m), g_(m.geo()), c_(c), cap_(cap), max_pos_(max_pos) {}
@@ -54,23 +80,17 @@ public:
     bool init(std::string& err) {
         namespace mmq = basalt::prefill::mmq;
         const size_t C = (size_t) cap_, S = kSub;
-        const size_t xq = std::max({mmq::q8_bytes((int64_t) S, kAttnEmbd), mmq::q8_bytes((int64_t) S, kAttnQRank),
-                                    mmq::q8_bytes((int64_t) S * kAttnGroups, kAttnGroupIn),
-                                    mmq::q8_bytes((int64_t) S, kAttnGroups * kAttnOutRank), (size_t) 1 << 16});
-        bool ok = alloc(&xq_, xq) && alloc(&kvraw_, S * kLatent * 4) && alloc(&qr_, S * kAttnQRank * 4) &&
-                  alloc(&q_, S * kAttnHeads * kAttnHeadDim * 4) && alloc(&attn_, S * kAttnHeads * kAttnHeadDim * 4) &&
-                  alloc(&oa_, S * kAttnGroups * kAttnOutRank * 4) && alloc(&ident_, S * 4) &&
-                  alloc(&stage_, (size_t) kStageSlots * win_row_bytes(c_.format)) &&
-                  alloc(&mws_, ((size_t) kMqaT * kAttnHeads * kMqaChunks * (kAttnHeadDim + 2) + 64) * 4) &&
-                  alloc(&cws_, compress_batch_workspace_bytes(kSub)) && alloc(&iws_, kIndexBudget) &&
+        const Sizes z = sizes(c_.format);
+        bool ok = alloc(&xq_, z.xq) && alloc(&kvraw_, z.kvraw) && alloc(&qr_, z.qr) && alloc(&q_, z.q) &&
+                  alloc(&attn_, z.attn) && alloc(&oa_, z.oa) && alloc(&ident_, z.ident) && alloc(&stage_, z.stage) &&
+                  alloc(&mws_, z.mws) && alloc(&cws_, z.cws) && alloc(&iws_, z.iws) &&
                   alloc(&d_pos_, C * 4) && alloc(&d_start_, C * 4) && alloc(&d_n_, C * 4) && alloc(&d_lim_[0], C * 4) &&
                   alloc(&d_lim_[1], C * 4) && alloc(&ids_, C * kTopK * 4) && alloc(&idn_, C * 4) &&
                   alloc(&cand_, C * kMaxCandBlocks * 4) && alloc(&cand_n_, C * 4);
         // layer-independent index arrays of the full and the tail sub-chunk, uploaded once from pinned memory
         for (Fixed& f : fixed_) {
             f.dev = nullptr;
-            ok = ok && alloc(&f.dev, (size_t) (kAttnGroups * S + 16) * 4) &&
-                 cudaMallocHost((void**) &f.host, (size_t) (kAttnGroups * S + 16) * 4) == cudaSuccess;
+            ok = ok && alloc(&f.dev, z.fixed) && cudaMallocHost((void**) &f.host, z.fixed) == cudaSuccess;
         }
         if (ok) {
             mmq::iota(ident_, (int64_t) S, nullptr);
@@ -365,6 +385,13 @@ private:
 };
 
 }  // namespace
+
+uint64_t attn_batch_fixed_bytes(CacheFormat format) {
+    const Sizes z = sizes(format);
+    return z.xq + z.kvraw + z.qr + z.q + z.attn + z.oa + z.ident + z.stage + z.mws + z.cws + z.iws + 2 * z.fixed;
+}
+
+uint64_t attn_batch_token_bytes() { return kTokenBytes; }
 
 std::unique_ptr<AttnBatch> make_attn_batch(const DsModel& model, const AttnCaches& caches, int max_tokens, int max_positions,
                                            std::string& err) {

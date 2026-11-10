@@ -76,6 +76,18 @@ int main() {
     const int64_t pairs_chunk = (kAheadPairs + d.n_used - 1) / d.n_used;
     CHECK(chunk_bytes(d, (int) pairs_chunk, kLong) == workspace_bytes(d, (int) pairs_chunk) + ahead_bytes(d));
     CHECK(plan_chunk(d, workspace_bytes(d, 16384) + kMargin, kMargin, kLong).chunk < 16384);
+    // the batched attention is a prompt workspace: it counts in every chunk, so the room a tier leaves beside a short
+    // read (the short chunk's workspaces and kShortMargin) holds it, and a chunk is never planned without it
+    {
+        Dims a = d;
+        a.attn_fixed_bytes = 600ull << 20;
+        a.attn_token_bytes = 10272;
+        CHECK(workspace_bytes(a, kShortChunk) ==
+              workspace_bytes(d, kShortChunk) + a.attn_fixed_bytes + a.attn_token_bytes * kShortChunk);
+        CHECK(workspace_bytes(a, 8192) - workspace_bytes(a, 4096) == per_token_bytes(a) * 4096);
+        CHECK(plan_chunk(a, workspace_bytes(a, kShortChunk) + kShortMargin, kShortMargin, kShortChunk).chunk == kShortChunk);
+        CHECK(plan_chunk(a, workspace_bytes(d, kShortChunk) + kShortMargin, kShortMargin, kShortChunk).chunk < kShortChunk);
+    }
 
     // give-back: a short context keeps what it has; a long one drops to the kept positions
     const std::vector<int> ratios = {2, 2, 2, 1};
