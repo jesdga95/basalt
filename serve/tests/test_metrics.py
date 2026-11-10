@@ -30,7 +30,7 @@ TEMPLATE = Path(__file__).resolve().parents[1] / "chat_template.jinja"
 class Clocked(MockEngine):
     """The mock engine with a DONE line's figures, as ProcessEngine keeps them."""
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         n = 0
         try:
             for t in super().generate(ids, max_new, sampling, cancel, embeddings):

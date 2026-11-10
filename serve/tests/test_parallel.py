@@ -785,6 +785,23 @@ class ParallelService(unittest.TestCase):
         for h in ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity"):
             self.assertIn("s-" + h, self.engine.session_slot, h)
 
+    def test_overlapping_requests_of_one_session_spread_over_slots(self):
+        """A session's slot is busy with its first request: the second takes the normal pick and owns the slot after."""
+        self.start(3)
+        out = self.together([lambda: self.chat_session("alpha " * 10, {"x-claude-code-session-id": "s1"}),
+                             lambda: self.chat_session("beta " * 14, {"x-claude-code-session-id": "s1"})])
+        self.assertEqual(len(out), 2)                                # neither waits on the other: both complete
+        for r in out:
+            self.assertEqual(r["choices"][0]["message"]["content"], "ok, done.")
+        slots = [int(x.split()[1]) for x in self.log.read_text().splitlines() if x.startswith(("BGEN", "SGEN"))]
+        self.assertEqual(len(set(slots)), 2, slots)                  # two slots, not one request queued behind the other
+        self.assertEqual(list(self.engine.session_slot), ["s1"])     # one slot owned by the session, the later claim
+        self.assertEqual(self.engine.slot_owner, {self.engine.session_slot["s1"]: "s1"})
+        self.assertFalse(any(self.engine.slot_busy))                 # nothing is left held
+        # the next turn goes back to the slot it owns
+        self.chat_session("gamma " * 9, {"x-claude-code-session-id": "s1"})
+        self.assertEqual(len(self.engine.session_slot), 1)
+
     def test_timings_of_a_solo_request_carry_its_draft_counts(self):
         self.start(2, counts=True)
         self.check_counts(self.timed_chats(["alone LONGREPLY"]), 0)

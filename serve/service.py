@@ -1078,10 +1078,9 @@ class Service:
                     while True:
                         if isinstance(ids, PromptText) and ids.max_new:
                             max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
-                        skw = {"session": session} if session is not None else {}
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb,
-                                                   **skw) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel, **skw)
+                                                   session=session) if emb \
+                            else self.engine.generate(prompt, max_new - n, sampling, cancel, session=session)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
                         looped = False                  # the wrap is for a repeated token, not the budget
                         ended_thinking = False          # the turn ended inside the thinking
