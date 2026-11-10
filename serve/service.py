@@ -965,7 +965,7 @@ class Service:
                 print(line, flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, session=None) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare)."""
         budget = self.reasoning_budget(sampling) if thinking else None
@@ -1078,8 +1078,9 @@ class Service:
                     while True:
                         if isinstance(ids, PromptText) and ids.max_new:
                             max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb,
+                                                   session=session) if emb \
+                            else self.engine.generate(prompt, max_new - n, sampling, cancel, session=session)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
                         looped = False                  # the wrap is for a repeated token, not the budget
                         ended_thinking = False          # the turn ended inside the thinking

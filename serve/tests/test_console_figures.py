@@ -116,7 +116,7 @@ class Lifetime(unittest.TestCase):
 class Done(MockEngine):
     """The mock engine with a DONE line's figures per request, as ProcessEngine keeps them."""
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         try:
             yield from super().generate(ids, max_new, sampling, cancel, embeddings)
         finally:
