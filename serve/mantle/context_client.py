@@ -17,7 +17,7 @@ from .handoff import Handoff
 class RegistryContextClient:
     def __init__(self, adapter: ContextAdapter):
         self.adapter = adapter
-        self._leases: dict = {}
+        self._leases: dict = {}   # context id -> numeric lease token
 
     def prefill(self, model: str, handoff: Handoff) -> str:
         ctx = self.adapter._call("POST", "/v1/contexts", {"thread_id": handoff.transcript_ref},
@@ -36,9 +36,10 @@ class RegistryContextClient:
                                  f"mantle:{context_id}:resume", (200,))
         lease = res.get("lease")
         token = lease.get("token") if isinstance(lease, dict) else None
-        if not isinstance(token, str) or not token:
+        # the registry issues the token as a 64-bit number (a digit string is accepted); release sends it back as one
+        if isinstance(token, bool) or not isinstance(token, (int, str)) or (isinstance(token, str) and not token.isdigit()):
             raise RegistryError("invalid_response")
-        self._leases[context_id] = token
+        self._leases[context_id] = int(token)
 
     def discard(self, context_id: str) -> None:
         token = self._leases.pop(context_id, None)

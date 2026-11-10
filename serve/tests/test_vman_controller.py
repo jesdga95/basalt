@@ -47,6 +47,17 @@ class VmanControllerTest(unittest.TestCase):
         self.assertEqual(f.mode, "image")
         self.assertEqual(len(f.calls), 1)
 
+    def test_failed_switch_records_nothing_and_odd_mode_is_refused(self):
+        f = Fake("strata", fail=True)
+        c = self.ctl(f)
+        with self.assertRaises(VmanError):
+            c.load("little")
+        f.fail = False
+        c.release("little")                      # nothing was recorded: no restore switch
+        self.assertEqual(f.calls[-1][-1], "llm")
+        with self.assertRaises(VmanError):
+            self.ctl(Fake("--force")).load("little")
+
     def test_failure_and_unknown(self):
         with self.assertRaises(VmanError):
             self.ctl(Fake(fail=True)).load("little")

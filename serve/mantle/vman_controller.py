@@ -5,6 +5,7 @@ controller is testable without a GPU; the real runner is used only when a deploy
 from __future__ import annotations
 
 import subprocess
+import threading
 from typing import Callable, Mapping, Optional, Sequence
 
 VMAN = "/data/tools/bin/vman"
@@ -18,7 +19,10 @@ class VmanError(RuntimeError):
 
 
 def subprocess_runner(argv: Sequence[str], timeout: float) -> "tuple[int, str]":
-    p = subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout, check=False)
+    try:
+        p = subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        raise VmanError(f"{argv[1:]} did not finish in {timeout:.0f}s; check `vman status` before retrying") from None
     return p.returncode, (p.stdout + p.stderr)[-2000:]
 
 
@@ -35,6 +39,7 @@ class VmanModelController:
         self.timeout_s, self.caller = timeout_s, caller
         self._previous: Optional[str] = None
         self._active: Optional[str] = None
+        self._lock = threading.Lock()
 
     def _switch(self, profile: str) -> None:
         code, out = self.runner([VMAN, "mode", "--caller", self.caller, profile], self.timeout_s)
@@ -45,18 +50,22 @@ class VmanModelController:
         profile = self.profiles.get(model)
         if profile is None:
             raise VmanError(f"no vman profile for model {model!r}")
-        now = self.current_mode()
-        if now == profile:
+        with self._lock:
+            now = self.current_mode()
+            if now == profile:
+                self._active = profile
+                return
+            if now is not None and now not in PROFILES:
+                raise VmanError(f"unexpected current vman mode {now!r}")
+            self._switch(profile)                 # a failed switch leaves nothing recorded to restore
+            if self._previous is None:
+                self._previous = now
             self._active = profile
-            return
-        if self._previous is None:
-            self._previous = now
-        self._switch(profile)
-        self._active = profile
 
     def release(self, model: str) -> None:
-        if self._active is None:
-            return
-        if self._previous is not None and self.current_mode() == self._active:
-            self._switch(self._previous)
-        self._active, self._previous = None, None
+        with self._lock:
+            if self._active is None:
+                return
+            if self._previous is not None and self.current_mode() == self._active:
+                self._switch(self._previous)
+            self._active, self._previous = None, None

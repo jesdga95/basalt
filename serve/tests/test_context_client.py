@@ -18,7 +18,7 @@ class Recorder:
         if path == "/v1/contexts":
             return 201, json.dumps({"context_id": CID, "version": 3}).encode()
         if path.endswith("/resume"):
-            return 200, json.dumps({"lease": {"token": "tok"}, "source": "cold"}).encode()
+            return 200, json.dumps({"lease": {"token": 4242}, "source": "cold"}).encode()
         return 200, b"{}"
 
 
@@ -31,6 +31,9 @@ class ContextClientTest(unittest.TestCase):
         self.assertEqual(rec.calls[1][2], {"event": "materialize", "expected_version": 3})
         c.start(CID)
         c.discard(CID)
+        self.assertEqual(c._leases, {})
+        release = [call for call in rec.calls if call[1].endswith("/lease/release")][0]
+        self.assertEqual(release[2], {"token": 4242})        # a number, as the registry's i64 field needs
         paths = [(m, p.rsplit("/", 2)[-1]) for m, p, *_ in rec.calls]
         self.assertIn(("POST", "release"), paths)
         self.assertEqual(rec.calls[-1][0], "DELETE")
