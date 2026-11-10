@@ -23,7 +23,9 @@ New C++ files need no CMake edit (`cmake/context.cmake` globs). Common types: `i
 - `POST /v1/contexts` `{thread_id, branch_id?, upto_message_id?}` → `201 {context_id, state, version, model_fingerprint(hex), prefix_hash(hex), prefix_tokens, tier}`
 - `POST /v1/contexts/{id}/fork` headers `Idempotency-Key`; body `{expected_version}` → `201|200 {context_id(child), parent_id, state, version}`; same key+payload → same child (200); different payload → `409`.
 - `POST /v1/contexts/{id}/resume` body `{lease_ttl_ms?}` → `200 {context_id, lease:{token,expires_at}, source:"hot|warm|cold|replay"}`; one fenced writer lease per context.
-- `POST /v1/contexts/{id}/lease/release` `{token}`; `POST /v1/contexts/{id}/transition` `{event, expected_version, lease_token?, tier?, locator?, validated?}` (engine/scheduler only).
+- `POST /v1/contexts/{id}/lease/release` `{token}`; `POST /v1/contexts/{id}/transition` `{event, expected_version, lease_token?, tier?, locator?, validated?}` (engine/scheduler only); `ready` also accepts `model_fingerprint?`, `prefix_hash?`, `prefix_tokens?`, `engine_epoch?`.
+- Engine fork (Python server, same auth as the API): `POST /v1/engine/threads/fork` `{parent, parent_head, child, child_head, keep_tokens?}` → `{shared_prefix_tokens}`; `409` stale head/conflict, `422` bad body, `503` engine unavailable. Engine line: `THREAD_FORK <parent> <parent_head> <child> <child_head> [keep]` → `THREAD_OK THREAD_FORK <parent> <child> <shared>`. The child shares the token prefix; KV reuse stays under the exact-prefix check.
+- Scheduler: `basalt serve --scheduler` (off by default); identity from `X-Basalt-Tenant` / `X-Basalt-Agent` (<=64 chars of `[A-Za-z0-9_.-]`); a queue-full or expired admission is a 503-class `GpuBusy`.
 - `GET /v1/contexts/{id}` → state, tier, position, `lineage[]`, `validated`, `children`, `refs`; cross-tenant → `404`.
 - `DELETE /v1/contexts/{id}` → tombstone `202`; GC deferred while children/leases hold refs. Never deletes the thread.
 - Errors: `{error:{code,message}}`; 404 unknown/foreign, 409 conflict/stale version/lease, 422 invalid.
