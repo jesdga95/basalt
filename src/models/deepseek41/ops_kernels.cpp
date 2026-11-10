@@ -742,10 +742,12 @@ public:
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
-        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
-        bool cpu = false, on_peer = false;
+        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch;
+        // the experts still being read from the file follow it
+        bool cpu = false, reading = false, on_peer = false;
         for (int i = 0; i < nu; ++i) {
-            cpu = cpu || (!lk.dev[i] && !lk.peer[i]);
+            cpu = cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i]);
+            reading = reading || lk.reading[i];
             on_peer = on_peer || lk.peer[i];
         }
         JoinWord jw;
@@ -804,7 +806,7 @@ public:
         WindowRowPtrs rp{};
         for (int r = 0; r < T * K; ++r)
             rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
-        if (cpu || on_peer) {
+        if (cpu || reading || on_peer) {
             jw.word = h_join_;
             jw.value = ++join_seq_;
             jw.armed = true;
@@ -812,10 +814,14 @@ public:
         }
         weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in their rows
-        if (cpu) {
+        if (cpu) join.now();
+        if (reading) {
+            if (!tier_->await_reads(err)) return false;
+            tier_->start_cpu_window(il, h_x_, lk, use, h_rows_, /*reading=*/true);
+            join.tier = tier_.get();
             join.now();
-            tier_->promote(il, lk);
         }
+        if (cpu || reading) tier_->promote(il, lk);
         if (peer && !peer->finish(nullptr, err)) return false;
         jw.raise();
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
@@ -864,10 +870,12 @@ public:
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
-        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
-        bool cpu = false, on_peer = false;
+        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch;
+        // the experts still being read from the file follow it
+        bool cpu = false, reading = false, on_peer = false;
         for (int k = 0; k < K; ++k) {
-            cpu = cpu || (!lk.dev[k] && !lk.peer[k]);
+            cpu = cpu || (!lk.dev[k] && !lk.peer[k] && !lk.reading[k]);
+            reading = reading || lk.reading[k];
             on_peer = on_peer || lk.peer[k];
         }
         JoinWord jw;
@@ -948,7 +956,7 @@ public:
         RowPtrs rp{};
         for (int k = 0; k < K; ++k)
             rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
-        if (cpu || on_peer) {
+        if (cpu || reading || on_peer) {
             jw.word = h_join_;
             jw.value = ++join_seq_;
             jw.armed = true;
@@ -956,10 +964,14 @@ public:
         }
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in the router index's row
-        if (cpu) {
+        if (cpu) join.now();
+        if (reading) {
+            if (!tier_->await_reads(err)) return false;
+            tier_->start_cpu(il, h_x_, lk, h_rows_, /*reading=*/true);
+            join.tier = tier_.get();
             join.now();
-            tier_->promote(il, lk);
         }
+        if (cpu || reading) tier_->promote(il, lk);
         if (peer && !peer->finish(nullptr, err)) return false;
         jw.raise();
         tier_->mark_gap(st);

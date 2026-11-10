@@ -12,6 +12,20 @@ constexpr int kSwapsPerToken = 2;               // pinned-slot swaps started per
 constexpr uint64_t kPieceBytes = 1ull << 20;    // largest single promotion copy
 constexpr int kPeerGapPieces = 3;               // second card exchange pieces per layer: about what one head leaves its bus
 constexpr uint64_t kPeerMoveAge = 1280;         // lookups (~32 windows) the second card's victim must be older than the main card's
+constexpr int kPromoteUses = 12;                // CPU uses that earn a VRAM slot when the RAM tier caches the file
+constexpr int kUseHalfLife = 128;               // tokens after which those counts halve
+
+/// One more CPU use of an expert: true, and the count starts over, when it reaches kPromoteUses.
+inline bool count_use(uint16_t& uses) {
+    if (++uses < kPromoteUses) return false;
+    uses = 0;
+    return true;
+}
+
+/// Whether the tokens from `token` to `token + n` cross a kUseHalfLife boundary.
+inline bool use_half_life(uint64_t token, uint64_t n) {
+    return token / kUseHalfLife != (token + n) / kUseHalfLife;
+}
 
 /// `last` is the token + 1 of the previous miss of an expert (0 = never); true when it falls within `window` tokens.
 inline bool repeat_miss(uint64_t last, uint64_t token, int window) {

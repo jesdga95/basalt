@@ -177,6 +177,21 @@ int main() {
         CHECK(reclaim_slots(3000, room, 2500, one, 30) == 0);
     }
 
+    // promotion by CPU uses: the kPromoteUses-th use earns it and the count starts over; the counts halve once per
+    // kUseHalfLife tokens, however the tokens come in windows
+    {
+        uint16_t uses = 0;
+        for (int i = 1; i < kPromoteUses; ++i) CHECK(!count_use(uses));
+        CHECK(count_use(uses));
+        CHECK(uses == 0);
+        CHECK(!count_use(uses));
+        int halvings = 0;
+        for (uint64_t t = 0; t < 10 * kUseHalfLife; t += 3) halvings += use_half_life(t, 3);
+        CHECK(halvings == 10);
+        CHECK(!use_half_life(0, kUseHalfLife - 1));
+        CHECK(use_half_life(kUseHalfLife - 1, 1));
+    }
+
     if (g_fail) return 1;
     std::printf("tier_policy_test: ok\n");
     return 0;
