@@ -1739,6 +1739,41 @@
       "draft_len_prose": 1.8,
       "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
       "notes": "KVM/QEMU guest: 48 vCPU (24 cores + SMT), 184 GiB, on an EPYC 7443 host; both cards VFIO-passthrough at 4.0 x16, capped to 300 W. NVFP4 experts, Q8_0 dense (the DQ8 pack)."
+    },
+    {
+      "submitter": "eadra",
+      "date": "2026-11-10",
+      "commit": "ef3591f8b0",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 600,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.8
+        }
+      ],
+      "ram_gib": 127,
+      "cpu": "AMD Ryzen 9 9950X3D, 16 cores",
+      "ram_gbps": 63.4,
+      "os": "Windows",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 8855.6,
+      "prefill_64k_tps": 10266.8,
+      "decode_tps": 395.4,
+      "decode_conv_tps": 242.5,
+      "decode_struct_tps": 494.7,
+      "decode_prose_tps": 248.9,
+      "accept_conv_pct": 71.1,
+      "accept_struct_pct": 98.7,
+      "accept_prose_pct": 67.4,
+      "draft_len_conv": 2.4,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.9,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     }
   ]
 }
