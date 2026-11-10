@@ -12,6 +12,7 @@ caller was already prepared to send. All of it is off unless the registry adapte
 from __future__ import annotations
 
 import hashlib
+import shutil
 import os
 import tempfile
 import threading
@@ -37,6 +38,9 @@ class ContextLifecycle:
         self.svc = service
         self.ad = adapter
         self.cool_idle_s = float(os.environ.get("BASALT_CONTEXT_COOL_IDLE_S", "600") or 0)
+        # publishing a snapshot onto a nearly full disk is how a host dies: refuse it fail-closed
+        self.min_free_disk_bytes = int(float(os.environ.get("BASALT_CONTEXT_MIN_FREE_DISK_GIB", "16") or 0)) * (1 << 30)
+        self.store_dir = os.environ.get("BASALT_CONTEXT_STORE_DIR") or ""
         self.lock = threading.Lock()
         self.fp: str | None = None
         self.epoch: str | None = None
@@ -59,6 +63,14 @@ class ContextLifecycle:
             with self.lock:                 # a new engine process holds no conversation
                 self.live_id = None
         return self.fp, self.epoch
+
+    def _disk_ok(self) -> bool:
+        if not (self.store_dir and self.min_free_disk_bytes):
+            return True
+        try:
+            return shutil.disk_usage(self.store_dir).free >= self.min_free_disk_bytes
+        except OSError:
+            return False
 
     # -- one request -----------------------------------------------------------
     def attach(self, req, ids) -> "_Handle | None":
@@ -149,6 +161,9 @@ class ContextLifecycle:
         elif h.mode == "replay":
             fp, epoch = self._identity()
             gen = h.gen + 1
+            if not self._disk_ok():
+                print("[server] context: disk budget full, publishing skipped (replay stays correct)", flush=True)
+                return
             words = self.svc.engine.context_command(f"CONTEXT_SNAP {h.cid} {gen}").split()
             if len(words) != _SNAP_WORDS:
                 raise ValueError("the engine's SNAP answer is malformed")
@@ -234,19 +249,21 @@ class ContextLifecycle:
             live = self.live_id == cid
         if state == "HOT" and live:
             try:                            # the session still holds it: publish the freshest generation first
-                gen = h.gen + 1
-                words = self.svc.engine.context_command(f"CONTEXT_SNAP {cid} {gen}").split()
-                if len(words) != _SNAP_WORDS:
-                    raise ValueError("the engine's SNAP answer is malformed")
-                self._transition(h, "cool", lease=False)
-                self._transition(h, "chill", patch={"locator": f"g{gen},{words[7]}"}, lease=False)
-                with self.lock:
-                    self.hot.pop(cid, None)
-                    if self.live_id == cid:
-                        self.live_id = None
-                return
-            except (ValueError, EngineDied):
-                pass                        # fall through: cool at the generation the registry already has
+                if self._disk_ok():
+                    gen = h.gen + 1
+                    words = self.svc.engine.context_command(f"CONTEXT_SNAP {cid} {gen}").split()
+                    if len(words) != _SNAP_WORDS:
+                        raise ValueError("the engine's SNAP answer is malformed")
+                    self._transition(h, "cool", lease=False)
+                    self._transition(h, "chill", patch={"locator": f"g{gen},{words[7]}"}, lease=False)
+                    with self.lock:
+                        self.hot.pop(cid, None)
+                        if self.live_id == cid:
+                            self.live_id = None
+                    return
+            except (ValueError, EngineDied) as e:
+                print(f"[server] context: refresh before cooling {cid[:8]} failed ({e})", flush=True)
+                                        # fall through: cool at the generation the registry already has
         if state == "HOT":
             self._transition(h, "cool", lease=False)
         self._transition(h, "chill", lease=False)   # COOLING -> COLD keeps the published locator
