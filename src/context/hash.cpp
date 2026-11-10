@@ -22,9 +22,13 @@ inline void be32_put(uint8_t* p, uint32_t v) {
 }
 }  // namespace
 
-Sha256::Sha256() {
+Sha256::Sha256() { reset(); }
+
+void Sha256::reset() {
     h_[0] = 0x6a09e667u; h_[1] = 0xbb67ae85u; h_[2] = 0x3c6ef372u; h_[3] = 0xa54ff53au;
     h_[4] = 0x510e527fu; h_[5] = 0x9b05688cu; h_[6] = 0x1f83d9abu; h_[7] = 0x5be0cd19u;
+    len_bits_ = 0;
+    buf_len_ = 0;
 }
 
 void Sha256::update_be32(uint32_t v) {
@@ -69,6 +73,7 @@ Digest Sha256::finish() {
     update(lenb, 8);           // fills the block and compresses
     Digest d{};
     for (int i = 0; i < 8; ++i) be32_put(&d[i * 4], h_[i]);
+    reset();                   // the hasher starts over, so one object serves many digests
     return d;
 }
 
@@ -115,11 +120,13 @@ bool from_hex(const std::string& hex, Digest& out) {
         if (c >= 'A' && c <= 'F') return c - 'A' + 10;
         return -1;
     };
+    Digest d{};
     for (size_t i = 0; i < 32; ++i) {
         const int hi = nib(hex[2 * i]), lo = nib(hex[2 * i + 1]);
         if (hi < 0 || lo < 0) return false;
-        out[i] = (uint8_t) (hi << 4 | lo);
+        d[i] = (uint8_t) (hi << 4 | lo);
     }
+    out = d;
     return true;
 }
 }  // namespace basalt::context
