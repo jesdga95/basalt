@@ -98,8 +98,9 @@ class ContextAdapter:
         secret = os.environ.get("BASALT_THREAD_API_KEY")
         if not secret or len(secret) < 24:
             return None
+        host = os.environ.get("BASALT_THREAD_API_HOST") or "127.0.0.1"
         port = int(os.environ.get("BASALT_THREAD_API_PORT", "8095"))
-        return cls(f"http://127.0.0.1:{port}", {"Authorization": f"Bearer {secret}"}, **kw)
+        return cls(f"http://{host}:{port}", {"Authorization": f"Bearer {secret}"}, **kw)
 
     # -- binding ---------------------------------------------------------------
     def extract_binding(self, request: Mapping[str, Any]) -> Optional[Binding]:

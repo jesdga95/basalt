@@ -32,7 +32,8 @@ def forward(method: str, path: str, payload=None) -> tuple[int, dict]:
     except ValueError:
         return 503, {"error": {"message": "invalid thread service port"}}
     body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    conn = http.client.HTTPConnection("127.0.0.1", portnum, timeout=3600)
+    host = os.environ.get("BASALT_THREAD_API_HOST") or "127.0.0.1"
+    conn = http.client.HTTPConnection(host, portnum, timeout=3600)
     try:
         conn.request(method, path, body=body, headers={
             "Authorization": f"Bearer {secret}",

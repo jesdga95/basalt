@@ -61,7 +61,8 @@ def forward(method: str, path: str, payload=None, idempotency_key: str | None = 
     if idempotency_key is not None:
         headers["Idempotency-Key"] = idempotency_key
     body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    conn = http.client.HTTPConnection("127.0.0.1", portnum, timeout=60)
+    host = os.environ.get("BASALT_THREAD_API_HOST") or "127.0.0.1"
+    conn = http.client.HTTPConnection(host, portnum, timeout=60)
     try:
         conn.request(method, path, body=body, headers=headers)
         response = conn.getresponse()
