@@ -22,7 +22,7 @@ class Fake:
 OK = {
     ("POST", "/v1/contexts"): (201, {"context_id": "c-1", "version": 1}),
     ("POST", "/v1/contexts/c-1/resume"): (200, {"context_id": "c-1", "source": "warm",
-                                                "lease": {"token": "tok", "expires_at": "x"}}),
+                                                "lease": {"token": 71, "expires_at": "x"}}),
     ("POST", "/v1/contexts/c-1/lease/release"): (200, {}),
     ("POST", "/v1/contexts/c-1/fork"): (201, {"context_id": "c-2", "parent_id": "c-1"}),
 }
@@ -43,11 +43,11 @@ class AdapterTests(unittest.TestCase):
         a, f = adapter(OK)
         r = a.attach({"thread_id": "t-1", "branch_id": "b-1"}, idempotency_key="K")
         self.assertEqual((r.mode, r.context_id, r.lease_token, r.source, r.replay_required),
-                         ("context", "c-1", "tok", "warm", False))
+                         ("context", "c-1", 71, "warm", False))
         self.assertEqual(f.calls[0][3], {"thread_id": "t-1", "branch_id": "b-1"})
         self.assertEqual(f.calls[0][2]["Idempotency-Key"], "K:create")
         self.assertEqual(f.calls[0][2]["Authorization"], "Bearer t")
-        self.assertTrue(a.release("c-1", "tok"))
+        self.assertTrue(a.release("c-1", 71))
 
     def test_previous_response_resolved(self):
         a, f = adapter(OK, resolver=lambda rid: ("t-9", None, "m-3") if rid == "resp_1" else None)
@@ -82,7 +82,7 @@ class AdapterTests(unittest.TestCase):
         routes[("POST", "/v1/contexts/c-1/resume")] = (409, {})
         r = adapter(routes)[0].attach({"thread_id": "t-1"})
         self.assertEqual((r.mode, r.fallback.reason), ("replay", "conflict"))
-        routes[("POST", "/v1/contexts/c-1/resume")] = (200, {"source": "replay", "lease": {"token": "z"}})
+        routes[("POST", "/v1/contexts/c-1/resume")] = (200, {"source": "replay", "lease": {"token": 7}})
         r = adapter(routes)[0].attach({"thread_id": "t-1"})
         self.assertEqual((r.mode, r.replay_required), ("context", True))
 

@@ -18,6 +18,7 @@ _ROUTES = (
     (re.compile(rf"^/v1/contexts/{_ID}$"), frozenset({"GET", "DELETE"})),
     (re.compile(rf"^/v1/contexts/{_ID}/(?:fork|resume|transition)$"), frozenset({"POST"})),
     (re.compile(rf"^/v1/contexts/{_ID}/lease/release$"), frozenset({"POST"})),
+    (re.compile(rf"^/v1/contexts/{_ID}/payload/released$"), frozenset({"POST"})),
 )
 _MAX_RESPONSE = 8 * 1024 * 1024
 _IDEMPOTENCY_KEY = re.compile(r"^[\x20-\x7e]{1,256}$")
