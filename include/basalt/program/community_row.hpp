@@ -1,4 +1,4 @@
-// include/basalt/program/community_row.hpp - one row of docs/community/benchmarks.json and the edit that appends it.
+// include/basalt/program/community_row.hpp - one row of docs/community/benchmarks.json and the edit that adds or updates it.
 // Host only. The text it produces is the canonical file form tools/check_benchmarks.py enforces.
 #pragma once
 
@@ -14,14 +14,26 @@ struct CommunityGpu {
     double h2d_gbps = 0;       ///< pinned host-to-device copy speed; omitted when 0
 };
 
+/// One decode fixture of the preset. Each figure is omitted from the row when 0.
+struct CommunityTest {
+    double decode_tps = 0;   ///< that fixture's tokens over its decode time
+    double accept_pct = 0;   ///< accepted over offered draft tokens, in percent; 0 with draft_len 0 is "no drafting"
+    double draft_len = 0;    ///< mean draft tokens offered per window; omitted (with accept_pct) when the model did not draft
+};
+
 struct CommunityRow {
     std::string submitter, date, commit, preset, model, os, quant, kv, notes;   // notes is omitted when empty
     // model: the adapter's model_name; kv: the KV cache format the engine reported ("int8", "fp16")
     std::vector<CommunityGpu> gpus;
     std::string cpu;           ///< "AMD Ryzen 9 9950X, 16 cores"; omitted when empty
     double ram_gib = 0, ram_gbps = 0;   ///< ram_gbps (host read speed) is omitted when 0
-    double prefill_16k_tps = 0, prefill_64k_tps = 0, decode_tps = 0;
+    double prefill_16k_tps = 0, prefill_64k_tps = 0, decode_tps = 0;   ///< decode_tps: tokens over decode time, summed over the three fixtures
+    CommunityTest tests[3];    ///< conv, struct, prose (kCommunityTestNames)
+    std::string engine_args;   ///< the arguments the preset passed the engine, without the model path; omitted when empty
 };
+
+/// The decode fixtures' names in the order of CommunityRow::tests; they spell the new fields' keys.
+inline constexpr const char* kCommunityTestNames[3] = {"conv", "struct", "prose"};
 
 /// The cpu field from the OS's processor string and physical core count: trademark marks, the clock, "N-Core
 /// Processor" and the like are dropped, then ", N cores" is added. Empty when the name is empty.
@@ -40,15 +52,34 @@ std::vector<int> engine_gpu_order(int peer_device, const std::vector<int>& peer_
 /// The comma-separated PCI bus ids of the INFO line's gpus= field as a list; empty items are dropped.
 std::vector<std::string> split_gpu_ids(const std::string& csv);
 
+/// True when the two rows are one setup: submitter (ASCII letters compared without case), model, quant, every GPU
+/// (name, vram_gib, power_w, in order), cpu, ram_gib and os all match. A field empty or 0 in either row matches; kv is
+/// not compared. tools/check_benchmarks.py (same_setup) applies the same rule and refuses a file holding two such rows.
+bool community_same_setup(const CommunityRow& a, const CommunityRow& b);
+
+/// The rows of a file in the canonical form, with the fields the rule above and the notes use (the others are left
+/// default). False with `err` set when the runs list is not laid out as the canonical form lays it out.
+bool community_parse_rows(const std::string& file, std::vector<CommunityRow>& rows, std::string& err);
+
+/// What an edit of the file did: whether it replaced a row of the same setup (at `index` in "runs") instead of appending.
+struct CommunityEdit {
+    bool replaced = false;
+    size_t index = 0;
+    std::string notes;       ///< the replaced row's notes, carried over to the new row; empty when it had none
+    std::string row_text;    ///< the row as it stands in the file now
+};
+
 /// The row as the file spells it: 4-space indent, fixed key order, gpus expanded, no trailing newline.
 std::string community_row_text(const CommunityRow& row);
 
-/// `file` with the row added as the last element of "runs". False with `err` set when the file does not end in
-/// the canonical tail.
-bool community_add_row(const std::string& file, const CommunityRow& row, std::string& out, std::string& err);
+/// `file` with the row added as the last element of "runs", or, when a row of the same setup is already there,
+/// replacing it in its place with that row's notes kept. False with `err` set when the file does not end in the
+/// canonical tail.
+bool community_add_row(const std::string& file, const CommunityRow& row, std::string& out, std::string& err,
+                       CommunityEdit* edit = nullptr);
 
 /// Reads `path`, adds the row and writes it back. False with `err` set on any failure; the file is then unchanged
 /// unless the write itself failed part way.
-bool community_add_row_file(const std::string& path, const CommunityRow& row, std::string& err);
+bool community_add_row_file(const std::string& path, const CommunityRow& row, std::string& err, CommunityEdit* edit = nullptr);
 
 }  // namespace basalt::program
