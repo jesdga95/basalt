@@ -299,7 +299,8 @@ def make_handler(svc: Service):
                     elif not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # listed, loads on use
                         loaded = True
-                    self._json(200, {"object": "list", "data": [model] if loaded else []})
+                    data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)] if loaded else []
+                    self._json(200, {"object": "list", "data": data})
             elif path == "/props":
                 if self._authorized():
                     self._props()

@@ -363,6 +363,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--model", help="the .basalt model file: the engine, tokenizer, sampling and vision come from it")
     ap.add_argument("--engine-bin", help=argparse.SUPPRESS)      # set by `basalt serve`
     ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
+    ap.add_argument("--aliases", action="append", default=[], metavar="NAME",
+                    help="extra names the API answers to and lists in /v1/models as alias_of the model "
+                         "(repeatable; a comma-separated list works too)")
     ap.add_argument("--parallel", type=parallel_count, metavar="N",
                     help=f"requests served at once, 1..{PARALLEL_MAX} (default 1: one at a time); more requests wait "
                          "their turn. --max-context is shared: each slot holds that divided by N (so 4 slots of 262144 "

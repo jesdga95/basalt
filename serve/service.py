@@ -77,7 +77,7 @@ class Service:
 
     def served_names(self) -> list[str]:
         """The model names a request may use: the one /v1/models lists, and the model file's own name."""
-        names = [self.model]
+        names = [self.model] + list(self.aliases)
         path = getattr(self.engine, "model_path", None)
         if isinstance(path, str) and path:
             names.append(path.replace("\\", "/").rsplit("/", 1)[-1])
@@ -85,8 +85,15 @@ class Service:
 
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True):
+                 fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
+                 aliases: list | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.aliases = []                           # other names of this model: /v1/models lists them, requests may use them
+        for x in aliases or []:
+            for y in str(x).split(","):
+                y = y.strip()
+                if y and y != self.model and y not in self.aliases:
+                    self.aliases.append(y)
         self.literals = literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # clamp the output cap instead of a 400
         self.grammar = grammar                        # the `grammar` option: every tool or JSON request gets one
