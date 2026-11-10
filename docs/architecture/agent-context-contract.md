@@ -20,7 +20,7 @@ Claude holds E (adapters/Mantle) and the later serial integration (engine `CONTE
 New C++ files need no CMake edit (`cmake/context.cmake` globs). Common types: `include/basalt/context/ids.hpp`.
 
 ## HTTP contract (Rust API, authoritative; owner scope from the existing auth header, tenant = thread owner)
-- `POST /v1/contexts` `{thread_id, branch_id?, upto_message_id?}` → `201 {context_id, state, version, model_fingerprint(hex), prefix_hash(hex), prefix_tokens, tier}`
+- `POST /v1/contexts` `{thread_id, branch_id?, upto_message_id?}` → `201 {context_id, state, version, model_fingerprint(hex), prefix_hash(hex), prefix_tokens, tier}`. One context per transcript head: a repeated create at the branch's live head returns that context (the branch's own before forked children) instead of provisioning a second row.
 - `POST /v1/contexts/{id}/fork` headers `Idempotency-Key`; body `{expected_version}` → `201|200 {context_id(child), parent_id, state, version}`; same key+payload → same child (200); different payload → `409`.
 - `POST /v1/contexts/{id}/resume` body `{lease_ttl_ms?}` → `200 {context_id, lease:{token,expires_at}, source:"hot|warm|cold|replay"}`; one fenced writer lease per context. `lease.token` is a 64-bit integer.
 - `POST /v1/contexts/{id}/lease/release` `{token}`; `POST /v1/contexts/{id}/transition` `{event, expected_version, lease_token?, tier?, locator?, validated?, model_fingerprint?, prefix_hash?, prefix_tokens?, engine_epoch?}` (engine/scheduler only). `tier` must equal the FSM's tier for the transition; `locator`/`validated` are accepted only with `ready|warm|chill`; the three manifest fields only with `ready` (a `ready` out of RESTORING must reproduce the stored identity, so omitting them is the norm); `engine_epoch` (UUID) with `materialize|restore|ready`.
@@ -46,6 +46,9 @@ CONTEXT_DROP <context_id>                         -> CONTEXT_OK DROP <id> <remov
 ```
 
 Every refusal is `ERR CONTEXT: <reason>`: the caller rebuilds the conversation from its transcript instead.
+The snapshot's prefix runs to the request's last emitted token (its stop token included): the engine commits
+nothing past the stop or the answer's cap, so the transcript the client holds re-renders to exactly the stored
+prefix and `CONTEXT_RESTORE`'s `prefix_hash` check can pass from the transcript alone.
 `<meta>` is the restore metadata text (running-state sizes, then per-KV-group geometry and buffer sizes; runs of
 identical groups collapse to `<count>x<group>`); `<ids_file>` line 1 = comma-separated prefix token IDs, line 2 =
 `<start>:<hash>` image keys. `epoch_hex32` is a fresh engine epoch in UUID simple form, patched into the registry
