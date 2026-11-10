@@ -186,6 +186,137 @@ class Http(unittest.TestCase):
             self.assertEqual(self.call(path)[0], 404, path)
 
     # --- /api/logs
+    def state_event(self, response):
+        self.assertEqual(response.readline(), b"event: state\n")
+        data = json.loads(response.readline().removeprefix(b"data: "))
+        self.assertEqual(response.readline(), b"\n")
+        return data
+
+    def test_ui_stream_combines_metrics_and_slots(self):
+        with urllib.request.urlopen(self.base + "/api/state/stream", timeout=3) as r:
+            self.assertEqual(r.headers["Content-Type"], "text/event-stream")
+            first = self.state_event(r)
+            self.assertEqual(first["slots"], self.call("/slots")[1])
+            self.assertEqual(first["engine"], self.call("/metrics")[1]["engine"])
+            self.assertIn("models", first)
+            self.assertIn("history", first)
+            self.state_event(r)  # periodic snapshot on the same connection
+            self.httpd.ui_state.close()
+            self.assertEqual(r.read(), b"")
+
+    def test_ui_stream_publishes_request_changes_before_periodic_tick(self):
+        state = self.httpd.ui_state
+        with urllib.request.urlopen(self.base + "/api/state/stream", timeout=3) as r:
+            self.state_event(r)
+            with self.svc.status_lock:
+                self.svc.status["queued"] = 1
+            started = time.monotonic()
+            data = self.state_event(r)
+            self.assertEqual(data["live"]["queued"], 1)
+            self.assertLess(time.monotonic() - started, .8)
+            with state.cv:
+                version = state.version
+            with urllib.request.urlopen(self.base + "/api/state/stream", timeout=3) as other:
+                self.assertEqual(self.state_event(other)["live"]["queued"], 1)
+                with state.cv:
+                    self.assertEqual(state.version, version)  # clients share the published frame
+
+    def test_ui_stream_auth_and_client_limit(self):
+        self.svc.api_key = "secret"
+        self.assertEqual(self.call("/api/state/stream")[0], 401)
+        state = self.httpd.ui_state
+        self.assertIsNone(state.worker)
+        for _ in range(8):
+            self.assertTrue(state.clients.acquire(blocking=False))
+        try:
+            self.assertEqual(self.call("/api/state/stream", headers={"Authorization": "Bearer secret"})[0], 503)
+        finally:
+            for _ in range(8):
+                state.clients.release()
+        req = urllib.request.Request(self.base + "/api/state/stream", headers={"Authorization": "Bearer secret"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            self.state_event(r)
+
+    def test_ui_stream_reconnect_gets_latest_snapshot(self):
+        with urllib.request.urlopen(self.base + "/api/state/stream", timeout=3) as r:
+            self.state_event(r)
+        with self.svc.status_lock:
+            self.svc.status["queued"] = 2
+        state = self.httpd.ui_state
+        deadline = time.monotonic() + 3
+        with state.cv:
+            while json.loads(state.frame.split(b"data: ", 1)[1])["live"]["queued"] != 2:
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0)
+                state.cv.wait(remaining)
+        with urllib.request.urlopen(self.base + "/api/state/stream", timeout=3) as r:
+            self.assertEqual(self.state_event(r)["live"]["queued"], 2)
+
+    def test_ui_state_key_tracks_model_and_request_transitions(self):
+        state = self.httpd.ui_state
+        before = state._key()
+        self.svc.loading = True
+        self.assertNotEqual(state._key(), before)
+        self.svc.loading = False
+        self.assertEqual(state._key(), before)
+        with self.svc.status_lock:
+            self.svc.status.update(busy=True, started=time.time(), first_token=None)
+        reading = state._key()
+        self.assertNotEqual(reading, before)
+        with self.svc.status_lock:
+            self.svc.status["first_token"] = time.time()
+        self.assertNotEqual(state._key(), reading)
+
+    def log_event(self, response):
+        self.assertEqual(response.readline(), b"event: logs\n")
+        data = json.loads(response.readline().removeprefix(b"data: "))
+        self.assertEqual(response.readline(), b"\n")
+        return data
+
+    def test_log_stream_backlog_live_and_resume(self):
+        self.svc.logs.add("srv", "first")
+        with urllib.request.urlopen(self.base + "/api/logs/stream", timeout=3) as r:
+            self.assertEqual(r.headers["Content-Type"], "text/event-stream")
+            self.assertEqual(r.headers["X-Accel-Buffering"], "no")
+            first = self.log_event(r)
+            self.assertEqual([x["msg"] for x in first["lines"]], ["first"])
+            self.svc.logs.add("eng", "basalt: warning: live")
+            self.assertEqual([x["id"] for x in self.log_event(r)["lines"]], [2])
+        with urllib.request.urlopen(self.base + "/api/logs/stream?after=1", timeout=3) as r:
+            self.assertEqual([x["id"] for x in self.log_event(r)["lines"]], [2])
+
+    def test_log_stream_empty_and_restart(self):
+        with urllib.request.urlopen(self.base + "/api/logs/stream?after=5&instance=old", timeout=3) as r:
+            data = self.log_event(r)
+            self.assertTrue(data["reset"])
+            self.assertEqual((data["lines"], data["next"]), ([], 0))
+
+    def test_log_stream_shutdown_releases_client(self):
+        with urllib.request.urlopen(self.base + "/api/logs/stream", timeout=3) as r:
+            self.log_event(r)
+            self.httpd.log_stop.set()
+            self.assertEqual(r.read(), b"")
+        for _ in range(8):
+            self.assertTrue(self.svc.logs.clients.acquire(blocking=False))
+        for _ in range(8):
+            self.svc.logs.clients.release()
+
+    def test_log_stream_validation_auth_and_limit(self):
+        for query in ("after=-1", "after=x", "limit=0", "limit=501", "limit="):
+            self.assertEqual(self.call("/api/logs/stream?" + query)[0], 400)
+        self.svc.api_key = "secret"
+        self.assertEqual(self.call("/api/logs/stream")[0], 401)
+        for _ in range(8):
+            self.assertTrue(self.svc.logs.clients.acquire(blocking=False))
+        try:
+            self.assertEqual(self.call("/api/logs/stream", headers={"Authorization": "Bearer secret"})[0], 503)
+        finally:
+            for _ in range(8):
+                self.svc.logs.clients.release()
+        req = urllib.request.Request(self.base + "/api/logs/stream", headers={"Authorization": "Bearer secret"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            self.assertEqual(self.log_event(r)["next"], 0)
+
     def test_logs(self):
         self.assertEqual(self.call("/api/logs")[1], {"lines": [], "last": 0})
         for i in range(5):

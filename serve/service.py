@@ -623,7 +623,7 @@ class Service:
             rows.append(row)
         return rows, queue
 
-    def metrics(self) -> dict:
+    def metrics(self, include_slots: bool = False) -> dict:
         """GET /metrics: engine facts, live state, recent requests, hardware and speed history."""
         with self.status_lock:
             s = dict(self.status)
@@ -647,7 +647,8 @@ class Service:
         else:
             state = "idle"
         slots = self.slot_stats()
-        live = {"state": state, "load": self.load_progress(), "queued": slots["queue_depth"], "slots": slots, "queue": self.slot_table()[1],
+        rows, queue = self.slot_table()
+        live = {"state": state, "load": self.load_progress(), "queued": slots["queue_depth"], "slots": slots, "queue": queue,
                 "prompt_tokens": s.get("prompt_tokens") if busy else None,
                 "generated": s.get("generated") if busy else None,
                 "elapsed_s": round(time.time() - s["started"], 1) if busy and s.get("started") else None,
@@ -665,7 +666,8 @@ class Service:
         with self.status_lock:
             self._drop_stale_best()
             best = {k: dict(v) for k, v in self.best.items()}
-        return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
+        return {**({"slots": rows if self.loaded() else []} if include_slots else {}),
+                "engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
                 "totals": totals, "conversation": dict(getattr(self.engine, "conversation", None) or {}),
                 "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
 

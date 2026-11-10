@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from serve.api import responses as responses_api
+from serve.api.logs import stream_logs
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
@@ -29,6 +30,7 @@ from serve.router import Router
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, QUEUE_BEAT_S, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
+from serve.util.ui_state import UIState, stream_state
 
 
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
@@ -323,6 +325,12 @@ def make_handler(target: Service | Router):
             elif path == "/api/logs":
                 if self._authorized():
                     self._logs()
+            elif path == "/api/logs/stream":
+                if self._authorized():
+                    stream_logs(self, svc.logs)
+            elif path == "/api/state/stream":
+                if self._authorized():
+                    stream_state(self, self.server.ui_state)
             elif path == "":
                 body = (ROOT / "serve" / "web" / "index.html").read_bytes()
                 self.send_response(200)
@@ -850,7 +858,20 @@ class Server(ThreadingHTTPServer):
 
     router: Router | None = None
 
+    def __init__(self, *args, **kwargs):
+        self.log_stop = threading.Event()
+        super().__init__(*args, **kwargs)
+
+    def shutdown(self):
+        self.log_stop.set()
+        if getattr(self, "ui_state", None) is not None:
+            self.ui_state.close()
+        super().shutdown()
+
     def server_close(self):
+        self.log_stop.set()
+        if getattr(self, "ui_state", None) is not None:
+            self.ui_state.close()
         super().server_close()
         if self.router is not None:
             self.router.stop_telemetry()           # serve() started the sampler, so closing the server ends it
@@ -867,5 +888,6 @@ def serve(target: Service | Router, host="127.0.0.1", port=8080) -> ThreadingHTT
     router.start_telemetry()
     httpd = Server((host, port), make_handler(router))
     httpd.router = router
+    httpd.ui_state = UIState(router)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd

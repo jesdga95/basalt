@@ -8,6 +8,7 @@
 <link rel="preload" href="fonts/geist-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="fonts/geist-mono-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="web/app.css">
+<script defer src="web/logs.js"></script>
 <script defer src="web/app.js"></script>
 </head>
 <body>
@@ -70,16 +71,16 @@
     <div class="hfoot"><div id="foot-dec"></div><div id="foot-pre"></div></div>
   </section>
 
-  <section class="a-main card" aria-label="Slots and requests">
+  <section class="a-main card" aria-label="Slots, requests and logs">
     <div class="tabs" role="tablist" id="tabs"></div>
     <div class="pane" id="pane" role="tabpanel"></div>
+    <div class="pane" id="logs-pane" role="tabpanel" aria-label="Logs" hidden>
+      <div class="hd lh"><span id="log-status">Connecting</span><span id="log-count"></span></div>
+      <div class="logs" id="log" role="log" aria-live="off" tabindex="0"></div>
+    </div>
     <div class="tot" id="totals"></div>
   </section>
 
-  <section class="a-logs card" aria-label="Logs">
-    <div class="hd lh"><b>Logs</b><span id="log-count"></span></div>
-    <div class="logs" id="log" role="log" aria-live="off" tabindex="0"></div>
-  </section>
 </main>
 
 </body>

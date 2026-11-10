@@ -83,13 +83,12 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .auth input:focus { border-color: var(--fg-3); outline: 0; }
 .auth button { padding: 9px 16px; border-radius: 6px; background: var(--raised); }
 
-/* Page: the hardware sidebar at full height, Speed across the top, the slots and the logs below */
+/* Page: hardware sidebar, Speed above the tabbed main card */
 .lay { display: grid; gap: 16px; padding: 0 28px 16px; grid-template-columns: 320px minmax(0, 1.3fr) minmax(0, 1fr);
-  grid-template-rows: auto minmax(0, 1fr); grid-template-areas: "side hero hero" "side main logs"; }
+  grid-template-rows: auto minmax(0, 1fr); grid-template-areas: "side hero hero" "side main main"; }
 .a-side { grid-area: side; }
 .a-hero { grid-area: hero; }
 .a-main { grid-area: main; display: flex; flex-direction: column; }
-.a-logs { grid-area: logs; display: flex; flex-direction: column; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; min-width: 0; min-height: 0; }
 .hd { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 14px 20px; font-size: 13px; color: var(--fg-3); border-bottom: 1px solid var(--line); flex: none; }
 .hd b { color: var(--fg); font-weight: 600; font-size: 14px; }
@@ -183,7 +182,7 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .hfoot b { color: var(--fg-2); font-weight: 500; }
 
 /* Main card: tabs, then one pane */
-.tabs { display: flex; gap: 4px; padding: 10px 12px; border-bottom: 1px solid var(--line); flex: none; }
+.tabs { display: flex; gap: 4px; padding: 10px 12px; border-bottom: 1px solid var(--line); flex: none; overflow-x: auto; }
 .tabs button { padding: 6px 14px; border-radius: 6px; color: var(--fg-3); font-weight: 500; line-height: 1.5; }
 .tabs button:hover { color: var(--fg); }
 .tabs button[aria-selected="true"] { background: var(--surface); color: var(--fg); }
@@ -263,13 +262,13 @@ tr.live td { color: var(--accent); }
   .sb-tbl .c { padding: 7px 0 9px; }
   .sb-agg .sb-met + .sb-met { display: none; }
 }
-/* Phone and narrow windows: one column (header, Speed, slots, logs, hardware) */
+/* Phone and narrow windows: one column (header, Speed, tabs, hardware) */
 @media (max-width: 900px) {
   body { overflow-x: hidden; }
   .bar { padding: 0 16px; gap: 12px; flex-wrap: wrap; height: auto; min-height: 56px; }
   .where { display: none; }
   .auth { margin: 0 16px 16px; }
-  .lay { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "hero" "main" "logs" "side"; padding: 0 16px 16px; }
+  .lay { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "hero" "main" "side"; padding: 0 16px 16px; }
   .trio, .hfoot { grid-template-columns: 1fr; }
   .trio > div + div, .hfoot > div + div { border-left: 0; border-top: 1px solid var(--line); }
   .cw { min-height: 120px; }

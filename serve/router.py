@@ -87,9 +87,9 @@ class Router:
             return {"from": s["from"], "to": s["svc"].model, "phase": s["phase"],
                     "elapsed_s": round(time.time() - s["since"], 1), "waiting": len(self.queue)}
 
-    def metrics(self, svc) -> dict:
+    def metrics(self, svc, include_slots: bool = False) -> dict:
         """GET /metrics for `svc`, with the requests waiting for any model's turn and every model's row."""
-        m = svc.metrics()
+        m = svc.metrics(include_slots=True) if include_slots else svc.metrics()
         now = time.time()
         with self.cv:
             waiting = [{"api": None, "model": t.svc.model, "prompt_tokens": None, "waited_s": round(now - t.at, 1)}
