@@ -51,12 +51,16 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
 
 ## Drafting
 
-On when the pack has the DSpark drafter. `--spec N` sets the window (default 3: the last accepted token plus up to 2 drafts; at most
-8). `--spec 0` turns it off. Each drafter stage keeps its 32 most routed experts (`--draft-experts`, default 32; 64, 96, 128 or 0 for
-all), ranked by `data/profiles/deepseek41-40x384-dspark.prof`. The start line:
+On when the pack has the DSpark drafter. One block pass drafts up to 5 tokens and states each one's chance of acceptance. Each
+window takes the drafts that pay: of the windows of 1 to 6 rows, the one with the most expected tokens per millisecond, from those
+chances (calibrated by how often drafts of that chance were accepted) and the round times this machine measured for each window
+size (`include/basalt/spec/draft_policy.hpp`). The block drafts at most one token more than the last window used, and at least 2.
+`--spec N` caps the window (default 6: the last accepted token plus the whole block; at most 8). `--spec 0` turns it off. Each
+drafter stage keeps its 32 most routed experts (`--draft-experts`, default 32; 64, 96, 128 or 0 for all), ranked by
+`data/profiles/deepseek41-40x384-dspark.prof`. The start line:
 
 ```
-basalt deepseek41: drafter on GPU 0: 2.41 GiB, 32 of 128 experts per stage, windows of at most 3 tokens (--spec 0: off)
+basalt deepseek41: drafter on GPU 0: 2.41 GiB, 32 of 128 experts per stage, windows of at most 6 tokens (--spec 0: off)
 ```
 
 ### What it costs
@@ -64,7 +68,7 @@ basalt deepseek41: drafter on GPU 0: 2.41 GiB, 32 of 128 experts per stage, wind
 Measured on the UD-IQ1_M pack, 400 W + 180 W, 121 GiB of RAM, `--pool-workers 8`:
 
 - The drafter takes 2.41 GiB of the main card with 32 experts per stage, 7.47 GiB with all 128 (which leaves 28 to 29 experts per
-  layer in the file). A block takes 2.0 ms.
+  layer in the file). A block takes 1.4 ms.
 - Greedy, 800 tokens, cold, tok/s (tokens per window):
 
 | | Code | Conversation | Prose |

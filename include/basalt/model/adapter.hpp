@@ -141,8 +141,9 @@ public:
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
-    /// Starts the drafts after `anchor`, the token at position `pos`. The rows of the last window before `pos` were accepted.
-    virtual Result draft_begin(int32_t anchor, int64_t pos) { (void) anchor; (void) pos; return {Status::NotImplemented, "this model has no drafter"}; }
+    /// Starts `n` drafts (at most max_window() - 1) after `anchor`, the token at position `pos`. The rows of the last window
+    /// before `pos` were accepted.
+    virtual Result draft_begin(int32_t anchor, int64_t pos, int n) { (void) anchor; (void) pos; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
     /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`.
     virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n) { (void) ids; (void) conf; (void) max_n; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
     /// The last decoded row's logits (n_vocab floats).

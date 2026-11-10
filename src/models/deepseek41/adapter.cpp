@@ -11,6 +11,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "models/deepseek41/context_policy.hpp"
+#include "models/deepseek41/dspark.hpp"
 #include "models/deepseek41/meta.hpp"
 #include "models/deepseek41/model.hpp"
 
@@ -116,9 +117,10 @@ public:
         std::string err;
         const bool opened = !o.model.empty() && file.open(o.model, err);
         const bool drafter = opened && file.find("dspark/gguf") != nullptr;
-        // the pack's drafter runs in windows of 3 unless --spec says otherwise; a token file drafts in its place
+        // the pack's drafter offers a whole block (the window policy takes the rows that pay) unless --spec caps it;
+        // a token file drafts in its place
         if (!o.spec_given) {
-            o.spec = drafter ? 3 : 0;
+            o.spec = drafter ? kDsparkBlock + 1 : 0;
             if (opened && !drafter) basalt::log::info("basalt deepseek41", "no dspark/gguf section: plain decode");
         }
         if (o.spec >= 2 && o.spec_oracle.empty() && !drafter) {

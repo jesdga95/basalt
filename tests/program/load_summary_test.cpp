@@ -1,6 +1,6 @@
 // tests/program/load_summary_test.cpp - the load summary basalt-bench prints from the engine's `basalt load:` lines:
-// every line kind, a skipped() re-print, a copy phase, an error line, the throttling and the terminal mode. CPU only;
-// the clock is passed in.
+// every line kind, a skipped() re-print, a copy phase, an error and a warning line, the throttling and the terminal
+// mode. CPU only; the clock is passed in.
 #include "basalt/program/load_summary.hpp"
 
 #include <cstdio>
@@ -56,7 +56,11 @@ int main() {
            "an error line is shown at once without its prefix");
         is(s.feed("basalt generate: error: the weight arena failed", 34.5), "basalt-bench: engine: the weight arena failed\n",
            "a line of any area marked error is shown the same way");
-        is(s.feed("basalt generate: warning: the cache is short", 34.6), "", "a warning is not an error");
+        is(s.feed("basalt generate: warning: the cache is short", 34.6), "basalt-bench: engine: warning: the cache is short\n",
+           "a warning line is shown at once with its marker");
+        is(s.feed("basalt: warning: --route-tail-skip 7 drops low-ranked missed experts", 34.65),
+           "basalt-bench: engine: warning: --route-tail-skip 7 drops low-ranked missed experts\n",
+           "a lossy-flag warning is shown the same way");
         is(s.feed("basalt generate: no error here", 34.7), "", "the word error in a message is not a marker");
         is(s.finish(80.0, true), "basalt-bench: engine ready in 80 s\n", "READY prints the ready line");
     }
@@ -96,6 +100,8 @@ int main() {
         is(s.tick(1.2), "\r\x1b[2Kbasalt-bench: loading cuda0 14.0/14.0 GiB \xC2\xB7 ram 0.0/38.0 GiB \xC2\xB7 26% \xC2\xB7 1 s",
            "the clock redraws with time passing");
         is(s.feed("basalt error: bad", 1.3), "\r\x1b[2Kbasalt-bench: engine: bad\n", "an error clears the line and prints its own");
+        s.feed(ld("ram", 10.0, 38.0), 1.4);
+        is(s.feed("basalt: warning: slow", 1.5), "\r\x1b[2Kbasalt-bench: engine: warning: slow\n", "so does a warning");
         s.feed(ld("ram", 21.0, 38.0), 2.0);
         is(s.finish(41.0, true),
            "\r\x1b[2Kbasalt-bench: loading cuda0 14.0/14.0 GiB \xC2\xB7 ram 21.0/21.0 GiB \xC2\xB7 100% \xC2\xB7 41 s\n"

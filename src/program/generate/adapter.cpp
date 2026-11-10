@@ -246,7 +246,7 @@ int adapter_generate(basalt::model::LoadedModel& loaded, const std::vector<int64
                 ++n_draft;
             }
         } else if (cap > 1) {
-            basalt::model::Result dres = sess->draft_begin(next, pos);
+            basalt::model::Result dres = sess->draft_begin(next, pos, cap - 1);
             if (dres.ok()) dres = sess->draft_end(drafts.data(), conf.data(), cap - 1, n_draft);
             if (!dres.ok() && dres.status != basalt::model::Status::NotImplemented) {
                 basalt::log::error("basalt generate", "%s", dres.message.c_str());

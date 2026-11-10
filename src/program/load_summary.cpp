@@ -76,11 +76,11 @@ std::string LoadSummary::redraw(double now) {
 std::string LoadSummary::feed(const std::string& raw, double now) {
     static const std::string tag = "basalt load: ";
     basalt::log::Parsed p;
-    if (basalt::log::parse(raw, p) && p.level == basalt::log::Level::error) {
+    if (basalt::log::parse(raw, p) && p.level != basalt::log::Level::info) {   // shown at once; a warning keeps its marker
         const std::string pre = drawn_ ? kClear : "";
         drawn_ = false;
         last_out_ = now;
-        return pre + line("engine: " + p.text);
+        return pre + line(std::string(p.level == basalt::log::Level::warning ? "engine: warning: " : "engine: ") + p.text);
     }
     if (raw.rfind(tag, 0) != 0) return "";
     std::istringstream is(raw.substr(tag.size()));

@@ -48,14 +48,16 @@ struct Dims {
     int64_t n_embd = 0, n_used = 0, n_expert = 0, n_ff_exp = 0;
     int64_t hc_coef = 24, hc_splits = 8, engram_cols = 0;
     uint64_t expert_blob_bytes = 0;   // the largest expert
+    uint64_t attn_fixed_bytes = 0, attn_token_bytes = 0;   // the batched attention's workspaces
 };
 
 /// Device bytes that grow with the chunk: streams and scratch rows, router outputs, the expert inputs, the experts' rows
-/// with their row map.
+/// with their row map, the attention's positions and selected rows.
 inline uint64_t per_token_bytes(const Dims& d) {
     const uint64_t n = (uint64_t) d.n_embd;
     return 4 * (19 * n + (uint64_t) d.hc_coef * 3 + (uint64_t) d.n_expert + 16 + (uint64_t) d.engram_cols +
-                (uint64_t) d.n_used * (n + 2) + (uint64_t) d.hc_splits * (uint64_t) (d.hc_coef + 1));
+                (uint64_t) d.n_used * (n + 2) + (uint64_t) d.hc_splits * (uint64_t) (d.hc_coef + 1)) +
+           d.attn_token_bytes;
 }
 
 /// (token, slot) rows one expert launch of a chunk handles.
@@ -64,11 +66,11 @@ inline int64_t stage_rows(int64_t n_used, int chunk) {
     return rows < least ? least : rows > kStageRows ? kStageRows : rows;
 }
 
-/// Device bytes that do not: the expert launch buffers and the staged blobs.
+/// Device bytes that do not: the expert launch buffers and the staged blobs, the attention's sub-chunk buffers.
 inline uint64_t fixed_bytes(const Dims& d, int chunk) {
     const uint64_t R = (uint64_t) stage_rows(d.n_used, chunk);
     const uint64_t q8 = (uint64_t) d.n_embd * R * 36 / 32 + (uint64_t) d.n_ff_exp * R * 36 / 32;
-    return q8 + R * (uint64_t) d.n_ff_exp * 12 + 2 * (d.expert_blob_bytes * kStageExperts + R * 4);
+    return q8 + R * (uint64_t) d.n_ff_exp * 12 + 2 * (d.expert_blob_bytes * kStageExperts + R * 4) + d.attn_fixed_bytes;
 }
 
 inline uint64_t workspace_bytes(const Dims& d, int chunk) { return fixed_bytes(d, chunk) + per_token_bytes(d) * (uint64_t) chunk; }

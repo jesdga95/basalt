@@ -59,6 +59,20 @@ def make_handler(target: Service | Router):
         turn = None                                         # this request's router turn
         sse_open = False                                    # the stream's headers went out
 
+        # a request's session identity, the headers a load balancer names its flows by (tinyllb's order), then the
+        # request body's own field; the slot the engine runs a conversation in follows it.  Deliberately not here:
+        # x-client-request-id, which identifies one request and would give every turn a session of its own.
+        SESSION_HEADERS = ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity")
+
+        def _session_id(self, req) -> str | None:
+            """The conversation this request belongs to, or None when it names no session (admission is prompt-only)."""
+            for h in self.SESSION_HEADERS:
+                v = (self.headers.get(h) or "").strip()
+                if v:
+                    return v
+            v = req.get("session_id") if isinstance(req, dict) else None
+            return v if isinstance(v, str) and v else None
+
         def log_message(self, fmt, *args):
             pass
 
@@ -514,7 +528,7 @@ def make_handler(target: Service | Router):
             props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
                      "total_slots": svc.slot_stats()["total"], "model_alias": svc.model, "chat_template": svc.template.source,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
-                     "is_sleeping": not svc.loaded()}
+                     "is_sleeping": not svc.loaded(), "chat_template_caps": dict(svc.dialect.caps)}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
@@ -623,7 +637,8 @@ def make_handler(target: Service | Router):
                                                  image_access=self._image_access())
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
-            chunks = primed(openai_chunks(self.svc, req, ids, thinking, tools, max_new, cancel, force=force), ids)
+            chunks = primed(openai_chunks(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
+                                          session=self._session_id(req)), ids)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
@@ -660,7 +675,8 @@ def make_handler(target: Service | Router):
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+                for kind, x in self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                            session=self._session_id(req)):
                     if kind == "ping":
                         yield None
                     elif kind == "event":
@@ -801,7 +817,8 @@ def make_handler(target: Service | Router):
                                                  image_access=self._image_access())
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
-            events = primed(anthropic_events(self.svc, req, ids, thinking, tools, max_new, cancel, force=force), ids)
+            events = primed(anthropic_events(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
+                                              session=self._session_id(req)), ids)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()

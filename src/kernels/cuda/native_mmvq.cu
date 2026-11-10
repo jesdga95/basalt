@@ -617,19 +617,25 @@ __global__ void native_q4_k_mmvq_kernel(const Q4KBlock* __restrict__ w,
 
 // Exact pinned vec_dot_q6_K_q8_1: keep signed per-16-element scales,
 // signed-byte subtraction, DP4A order, and the float accumulation sequence.
-__device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __restrict__ u,
-                                              const int8_t* __restrict__ scales,
-                                              float d, const float* __restrict__ d8) {
+// sc[i] is the block's scales[4 * i] at the lane's scale offset.
+__device__ __forceinline__ float q6_q8_dot_sc(int vl, int vh, const int* __restrict__ u, const int (&sc)[2], float d,
+                                              const float* __restrict__ d8) {
     float sumf = 0.0f;
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-        const int sc = scales[4 * i];
         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
         const int vi = __vsubss4(vil | vih, 0x20202020);
-        sumf += d8[i] * (DP4A(vi, u[i], 0) * sc);
+        sumf += d8[i] * (DP4A(vi, u[i], 0) * sc[i]);
     }
     return d * sumf;
+}
+
+__device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __restrict__ u,
+                                              const int8_t* __restrict__ scales,
+                                              float d, const float* __restrict__ d8) {
+    const int sc[2] = {scales[0], scales[4]};
+    return q6_q8_dot_sc(vl, vh, u, sc, d, d8);
 }
 
 __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
@@ -1201,16 +1207,26 @@ constexpr int kStagedMaxBlocks = 8;   // blocks of 256 per row that take it
 constexpr int kStagedRowsPerSm = 16;  // and the fewest rows per SM
 constexpr int kStagedRowsPerWarp = 2;
 
+// A lane's words of one Q6_K block (Q6KTraits::load's, scales read too), so a warp's rows can be read before their dots.
+struct Q6Words {
+    int vl, vh, sc[2];
+    float d;
+};
+__device__ __forceinline__ Q6Words q6_words(const Q6KBlock* __restrict__ b, int lane) {
+    const Q6KTraits::W r = Q6KTraits::load(b, lane);
+    return {r.vl, r.vh, {r.scales[0], r.scales[4]}, r.d};
+}
+
 // Stage: block `block` of `n_blocks` stages the columns in `xs` and its warps take rows block * kStagedWarps + warp,
-// then n_blocks * kStagedWarps further on.
-template<int NCOLS>
+// then n_blocks * kStagedWarps further on, kStagedRowsPerWarp of them at a time: all their NB blocks' words are read
+// before the first dot, and each row's sums are the ones above in the same order.
+template<int NCOLS, int NB>
 __device__ __forceinline__ void q6_k_staged_rows(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
-                                                 float* __restrict__ y, int n_in, int n_out, float4* xs, int block,
+                                                 float* __restrict__ y, int n_out, float4* xs, int block,
                                                  int n_blocks) {
     const int lane = int(threadIdx.x), warp = int(threadIdx.y);
-    const int nb = n_in / 256;
-    const int x_stride = n_in / Q8K;
-    for (int i = warp * WARP + lane; i < nb * NCOLS * WARP; i += kStagedWarps * WARP) {
+    const int x_stride = NB * 256 / Q8K;
+    for (int i = warp * WARP + lane; i < NB * NCOLS * WARP; i += kStagedWarps * WARP) {
         const int L = i % WARP, j = (i / WARP) % NCOLS, kbx = i / (WARP * NCOLS);
         const Q81Block* xb = x + std::size_t(j) * x_stride + kbx * 8 + 4 * (L / 16) + (L % 16) / 8;
         xs[i] = make_float4(__int_as_float(reinterpret_cast<const int*>(xb[0].qs)[L % 8]),
@@ -1218,44 +1234,53 @@ __device__ __forceinline__ void q6_k_staged_rows(const Q6KBlock* __restrict__ w,
                             __low2float(xb[2].ds));
     }
     __syncthreads();
-    for (int row = block * kStagedWarps + warp; row < n_out; row += n_blocks * kStagedWarps) {
-        const Q6KBlock* wr = w + std::size_t(row) * nb;
-        float acc[NCOLS][4];
+    const int step = n_blocks * kStagedWarps;
+    for (int row0 = block * kStagedWarps + warp; row0 < n_out; row0 += kStagedRowsPerWarp * step) {
+        Q6Words wv[kStagedRowsPerWarp][NB];
 #pragma unroll
-        for (int j = 0; j < NCOLS; ++j)
+        for (int r = 0; r < kStagedRowsPerWarp; ++r) {
+            const Q6KBlock* wr = w + std::size_t(min(row0 + r * step, n_out - 1)) * NB;
 #pragma unroll
-            for (int v = 0; v < 4; ++v) acc[j][v] = 0.0f;
+            for (int kbx = 0; kbx < NB; ++kbx) wv[r][kbx] = q6_words(wr + kbx, lane);
+        }
 #pragma unroll
-        for (int kbx = 0; kbx < kStagedMaxBlocks; ++kbx) {
-            if (kbx < nb) {
-                const Q6KTraits::W wv = Q6KTraits::load(wr + kbx, lane);
+        for (int r = 0; r < kStagedRowsPerWarp; ++r) {
+            const int row = row0 + r * step;
+            if (row >= n_out) break;
+            float acc[NCOLS][4];
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+                for (int v = 0; v < 4; ++v) acc[j][v] = 0.0f;
+#pragma unroll
+            for (int kbx = 0; kbx < NB; ++kbx) {
 #pragma unroll
                 for (int j = 0; j < NCOLS; ++j) {
                     const float4 xv = xs[(kbx * NCOLS + j) * WARP + lane];
                     const int u[2] = {__float_as_int(xv.x), __float_as_int(xv.y)};
                     const float d8[2] = {xv.z, xv.w};
-                    acc[j][kbx % 4] += q6_q8_dot_impl(wv.vl, wv.vh, u, wv.scales, wv.d, d8);
+                    acc[j][kbx % 4] += q6_q8_dot_sc(wv[r][kbx].vl, wv[r][kbx].vh, u, wv[r][kbx].sc, wv[r][kbx].d, d8);
                 }
             }
-        }
 #pragma unroll
-        for (int j = 0; j < NCOLS; ++j) {
-            float t = acc[j][0];
+            for (int j = 0; j < NCOLS; ++j) {
+                float t = acc[j][0];
 #pragma unroll
-            for (int v = 1; v < 4; ++v) t += acc[j][v];
-            t = warp_sum(t);
-            if (lane == 0) y[std::size_t(j) * n_out + row] = t;
+                for (int v = 1; v < 4; ++v) t += acc[j][v];
+                t = warp_sum(t);
+                if (lane == 0) y[std::size_t(j) * n_out + row] = t;
+            }
         }
     }
 }
 
-template<int NCOLS>
+template<int NCOLS, int NB>
 __launch_bounds__(kStagedWarps * WARP)
 __global__ void native_q6_k_staged_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
-                                          float* __restrict__ y, int n_in, int n_out) {
-    __shared__ float4 xs[kStagedMaxBlocks * NCOLS * WARP];
+                                          float* __restrict__ y, int n_out) {
+    __shared__ float4 xs[NB * NCOLS * WARP];
     pdl_wait();
-    q6_k_staged_rows<NCOLS>(w, x, y, n_in, n_out, xs, int(blockIdx.x), int(gridDim.x));
+    q6_k_staged_rows<NCOLS, NB>(w, x, y, n_out, xs, int(blockIdx.x), int(gridDim.x));
 }
 
 // The device's SM count, per device.
@@ -1281,10 +1306,19 @@ bool launch_q6_k_staged(const void* weights, const void* x_q8_1, float* y, int n
     const int sms = device_sms();
     if (n_in / 256 >= kStagedMaxBlocks || sms == 0 || n_out < kStagedRowsPerSm * sms) return false;
     constexpr int kRowsPerBlock = kStagedWarps * kStagedRowsPerWarp;
-    launch_pdl(native_q6_k_staged_kernel<NCOLS>, dim3(unsigned((n_out + kRowsPerBlock - 1) / kRowsPerBlock)),
-               dim3(WARP, kStagedWarps), 0, s, static_cast<const Q6KBlock*>(weights),
-               static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out);
-    return true;
+    const dim3 grid(unsigned((n_out + kRowsPerBlock - 1) / kRowsPerBlock)), threads(WARP, kStagedWarps);
+    const auto* w = static_cast<const Q6KBlock*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    switch (n_in / 256) {
+    case 1: launch_pdl(native_q6_k_staged_kernel<NCOLS, 1>, grid, threads, 0, s, w, x, y, n_out); return true;
+    case 2: launch_pdl(native_q6_k_staged_kernel<NCOLS, 2>, grid, threads, 0, s, w, x, y, n_out); return true;
+    case 3: launch_pdl(native_q6_k_staged_kernel<NCOLS, 3>, grid, threads, 0, s, w, x, y, n_out); return true;
+    case 4: launch_pdl(native_q6_k_staged_kernel<NCOLS, 4>, grid, threads, 0, s, w, x, y, n_out); return true;
+    case 5: launch_pdl(native_q6_k_staged_kernel<NCOLS, 5>, grid, threads, 0, s, w, x, y, n_out); return true;
+    case 6: launch_pdl(native_q6_k_staged_kernel<NCOLS, 6>, grid, threads, 0, s, w, x, y, n_out); return true;
+    case 7: launch_pdl(native_q6_k_staged_kernel<NCOLS, 7>, grid, threads, 0, s, w, x, y, n_out); return true;
+    default: return false;
+    }
 }
 
 template<typename F, int NCOLS>

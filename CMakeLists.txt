@@ -502,7 +502,7 @@ add_library(serve_shared STATIC src/program/serve/commands.cpp
             src/program/cli/tokens.cpp
             src/program/cli/help.cpp)
 target_include_directories(serve_shared PUBLIC include PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(serve_shared PUBLIC tiers model engine_session grammar tokenizer ${_gpu_runtime_target})
+target_link_libraries(serve_shared PUBLIC tiers model engine_session grammar tokenizer spec ${_gpu_runtime_target})
 
 add_executable(basalt src/program/generate.cpp
                        src/program/generate/adapter.cpp
@@ -1136,6 +1136,13 @@ target_link_libraries(reply_rows_test PRIVATE warnings)
 basalt_embed_manifest(reply_rows_test)
 basalt_cpu_test(NAME reply_rows_test COMMAND reply_rows_test)
 set_tests_properties(reply_rows_test PROPERTIES TIMEOUT 60)
+# the lines the server reads from the engine: the conversation cache's figures and the context-overflow ERR
+add_executable(protocol_lines_test tests/program/protocol_lines_test.cpp)
+target_include_directories(protocol_lines_test PRIVATE include)
+target_link_libraries(protocol_lines_test PRIVATE warnings)
+basalt_embed_manifest(protocol_lines_test)
+basalt_cpu_test(NAME protocol_lines_test COMMAND protocol_lines_test)
+set_tests_properties(protocol_lines_test PROPERTIES TIMEOUT 60)
 add_executable(auto_plan_test tests/program/auto_plan_test.cpp)
 target_link_libraries(auto_plan_test PRIVATE engine_session warnings)
 basalt_embed_manifest(auto_plan_test)

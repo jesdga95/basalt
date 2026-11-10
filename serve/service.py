@@ -57,6 +57,7 @@ REQUESTS_SHOWN = 12        # finished requests /metrics lists
 # the fastest whole request counts only when big enough that fixed costs do not decide it
 BEST_MIN_OUT = 256          # output tokens, for the best decode rate
 BEST_MIN_READ = 4096        # newly read prompt tokens, for the best prefill rate
+BEST_MAX_READ_TOK_S = 200000  # a prompt read faster than this pairs the wrong token count with the wrong time
 RATE_MIN_SPAN_S = 0.25      # below this span there is no rate yet: use the mean with the span floored
 # diagnostics, off unless the server flag sets them
 DEBUG = False            # --debug: one line per request plus the raw model text
@@ -122,9 +123,11 @@ class Service:
         self.request_ctx = threading.local()            # .path, .model: the API path and model name of this request
         self.slot_last: dict[int, dict] = {}            # per slot: context held and draft counts of its last request
         self.waiting: dict[int, dict] = {}              # single stream: requests waiting for the turn
-        self.best: dict[str, dict] = {}                 # fastest whole request since start: "decode", "prefill"
+        self.best: dict[str, dict] = {}                 # fastest whole request of this engine: "decode", "prefill"
+        self._best_gen = getattr(self.engine, "gen", 0)  # the engine process the figures came from
         self.history = collections.deque(maxlen=500)    # finished requests, newest last
         self.requests_done = 0                           # finished requests since start
+        self.totals = {"prompt": 0, "reused": 0, "written": 0, "prompt_ms": 0.0, "decode_ms": 0.0}   # their sums
         self.last_timings = None                         # last request's timings
         self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
@@ -147,11 +150,15 @@ class Service:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
     def reasoning_budget(self, req, *, use_default: bool = True) -> int | None:
-        """The request's thinking budget in tokens, or None (0 or less: none); ValueError for a non-integer."""
+        """The request's thinking budget in tokens, or None (0 or less: none); ValueError for a non-integer.
+        Several fields: reasoning_budget_tokens, thinking_budget_tokens, llama.cpp's reasoning_budget (-1: no cap;
+        0 also turns thinking off, see frontend.llama_budget), then Anthropic's thinking.budget_tokens."""
         req = req if isinstance(req, dict) else {}
         value = req.get("reasoning_budget_tokens")
         if value is None:                               # llama.cpp's name for the same budget
             value = req.get("thinking_budget_tokens")
+        if value is None:
+            value = req.get("reasoning_budget")
         if value is None:                               # Anthropic's, which also names a level by its size
             thinking = req.get("thinking")
             value = thinking.get("budget_tokens") if isinstance(thinking, dict) else None
@@ -173,7 +180,7 @@ class Service:
         # None also means an absent field: distinguish it from an explicit opt-out.
         req = req if isinstance(req, dict) else {}
         thinking = req.get("thinking")
-        explicit = any(req.get(k) is not None for k in ("reasoning_budget_tokens", "thinking_budget_tokens")) \
+        explicit = any(req.get(k) is not None for k in ("reasoning_budget_tokens", "thinking_budget_tokens", "reasoning_budget")) \
             or isinstance(thinking, dict) and thinking.get("budget_tokens") is not None
         if explicit and request_budget is None:
             return budget
@@ -625,6 +632,7 @@ class Service:
             # parallel: generating while any slot decodes, though the newest request may still wait or read
             decoding = any(st.get("first_token") is not None for st, _ in self.live_reqs.values())
             hist = list(self.history)
+            totals = {"since": int(self.started_at), "requests": self.requests_done, **self.totals}
         busy = bool(s.get("busy"))
         if self.loading:
             state = "loading"
@@ -644,6 +652,7 @@ class Service:
                 "generated": s.get("generated") if busy else None,
                 "elapsed_s": round(time.time() - s["started"], 1) if busy and s.get("started") else None,
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
+                "phase": s.get("phase") if busy else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if busy else None}
         info = dict(getattr(self.engine, "info", {}) or {})
         experts_total = info.get("spill_total")          # every routed (layer, expert) pair, on the SSD or not
@@ -654,13 +663,23 @@ class Service:
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
         with self.status_lock:
+            self._drop_stale_best()
             best = {k: dict(v) for k, v in self.best.items()}
         return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
+                "totals": totals, "conversation": dict(getattr(self.engine, "conversation", None) or {}),
                 "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+
+    def _drop_stale_best(self) -> None:
+        """A best is a fact about the engine that produced it: a restarted engine (another model, other flags, a
+        crash) starts its own.  Call with status_lock held."""
+        gen = getattr(self.engine, "gen", self._best_gen)
+        if gen != self._best_gen:
+            self._best_gen, self.best = gen, {}
 
     def _note_best(self, r: dict) -> None:
         """Keep finished request `r` as the best decode or prefill when it is the fastest big enough one.
         Call with status_lock held."""
+        self._drop_stale_best()
         if (r["output_tokens"] or 0) >= BEST_MIN_OUT and r["decode_tok_s"] and \
                 r["decode_tok_s"] > self.best.get("decode", {}).get("tok_s", 0):
             self.best["decode"] = {"tok_s": r["decode_tok_s"], "id": r["id"], "time": r["time"],
@@ -668,7 +687,9 @@ class Service:
         read = (r["prompt_tokens"] or 0) - (r["reused"] or 0)
         if read >= BEST_MIN_READ and r["prompt_ms"]:
             rate = round(read / (r["prompt_ms"] / 1000), 1)
-            if rate > self.best.get("prefill", {}).get("tok_s", 0):
+            # a multi-run request can carry the whole prompt's read count beside one run's read time; no card reads
+            # this fast, so the pair is not a record
+            if rate <= BEST_MAX_READ_TOK_S and rate > self.best.get("prefill", {}).get("tok_s", 0):
                 self.best["prefill"] = {"tok_s": rate, "id": r["id"], "time": r["time"], "read_tokens": read}
 
     def v1_status(self) -> dict:
@@ -720,6 +741,7 @@ class Service:
         (same prefix, cache kept) and follows as a short system turn right before it."""
         if kwargs.get("reasoning_effort") not in (None, ""):
             kwargs = dict(kwargs, reasoning_effort=self.dialect.effort_level(kwargs["reasoning_effort"]))
+        kwargs = self.dialect.template_kwargs(kwargs)
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or not self.dialect.effort_turn or (not off and effort in (None, "", "xhigh", "high")):
@@ -943,7 +965,7 @@ class Service:
                 print(line, flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, session=None) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare)."""
         budget = self.reasoning_budget(sampling) if thinking else None
@@ -1056,8 +1078,9 @@ class Service:
                     while True:
                         if isinstance(ids, PromptText) and ids.max_new:
                             max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb,
+                                                   session=session) if emb \
+                            else self.engine.generate(prompt, max_new - n, sampling, cancel, session=session)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
                         looped = False                  # the wrap is for a repeated token, not the budget
                         ended_thinking = False          # the turn ended inside the thinking
@@ -1226,6 +1249,10 @@ class Service:
                             ssd_share = round(last["file_reads"] / routed, 3) if last.get("file_reads") and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # less than len(ids) when cancelled mid-read
                             self.requests_done += 1
+                            for key, add in (("prompt", seen), ("reused", last.get("reused") or 0), ("written", n),
+                                             ("prompt_ms", last.get("prompt_ms") or 0.0),
+                                             ("decode_ms", last.get("decode_ms") or 0.0)):
+                                self.totals[key] += add
                             if st.get("slot") is not None:
                                 self.slot_last[st["slot"]] = {"ctx": seen + n, "offered": last.get("drafts_offered"),
                                                               "accepted": last.get("drafts_accepted"), "at": time.time()}

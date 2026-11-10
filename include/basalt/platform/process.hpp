@@ -53,6 +53,10 @@ bool pipe_write_all(int fd, const void* data, size_t n);
 /// stream; -1 on failure.
 int64_t pipe_read(int fd, void* dst, size_t n);
 
+/// Whether `pipe_read` on the descriptor would return at once (bytes, the end of the stream or an error), waiting at
+/// most `timeout_ms`. A descriptor that cannot be waited on counts as ready.
+bool pipe_wait_readable(int fd, int timeout_ms);
+
 /// Waits for the child to end. `timeout_ms` of 0 only asks whether it already has, -1 waits as long as it takes.
 /// Returns the child's exit code, or -1 when it is still running at the timeout. A child stopped by a signal
 /// reports 128 + the signal number, which is how a shell spells it. Linux has reaped the child when this returns a

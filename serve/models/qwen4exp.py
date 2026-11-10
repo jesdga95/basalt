@@ -11,6 +11,10 @@ class Qwen4Exp(Dialect):
     stop_texts = (IM_END, "<|endoftext|>")
     reasoning_close = "\n</think>\n\n"
     effort_turn = "<|im_start|>system\n{}<|im_end|>\n"
+    # chat_template.jinja: tools and several calls per turn, the efforts xhigh/medium/low, a leading system turn,
+    # and `preserve_thinking`
+    caps = {"supports_tool_calls": True, "supports_parallel_tool_calls": True, "supports_reasoning_effort": True,
+            "supports_system_role": True, "supports_preserve_reasoning": True}
 
     def template(self, source):
         return frontend.ChatTemplate(source)

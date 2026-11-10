@@ -297,3 +297,11 @@ tr.live td { color: var(--accent); }
   .rw { column-gap: 10px; padding: 0 16px; }
   .rw .cx, .rw .spark, .rw .sk { display: none; }
 }
+
+/* a chip in the prefill footer, one muted line under the main card */
+#foot-dec { display: flex; justify-content: space-between; gap: 12px; }
+#foot-dec > span { flex: none; }
+.cc { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--fg-3); cursor: default; }
+.tot { flex: none; padding: 9px 20px; border-top: 1px solid var(--line); font: 400 11.5px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: default; }
+@media (max-width: 560px) { .tot { white-space: normal; line-height: 1.4; padding: 9px 16px; } }
+@media (max-width: 560px) { #foot-dec { flex-wrap: wrap; row-gap: 10px; } }

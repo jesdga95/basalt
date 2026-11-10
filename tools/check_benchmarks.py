@@ -9,7 +9,11 @@ import sys
 
 REQUIRED = {"submitter", "date", "commit", "preset", "model", "gpus", "ram_gib", "os",
             "quant", "kv", "prefill_16k_tps", "prefill_64k_tps", "decode_tps"}
-OPTIONAL = {"notes", "cpu", "ram_gbps"}
+TESTS = ("conv", "struct", "prose")   # the decode fixtures of the preset
+TEST_TPS = tuple(f"decode_{t}_tps" for t in TESTS)
+TEST_ACCEPT = tuple(f"accept_{t}_pct" for t in TESTS)
+TEST_DRAFT = tuple(f"draft_len_{t}" for t in TESTS)
+OPTIONAL = {"notes", "cpu", "ram_gbps", "engine_args", *TEST_TPS, *TEST_ACCEPT, *TEST_DRAFT}
 GPU_KEYS = {"name", "vram_gib", "power_w", "pcie", "h2d_gbps"}
 PCIE = re.compile(r"[1-9](\.0)? x(1|2|4|8|16|32)")
 PLACEHOLDER = "YOUR_NAME"
@@ -91,9 +95,14 @@ def check_row(r, err):
         else:
             for k, x in enumerate(g):
                 check_gpu(x, k, err)
-    for key in ("ram_gib", "prefill_16k_tps", "prefill_64k_tps", "decode_tps"):
+    for key in ("ram_gib", "prefill_16k_tps", "prefill_64k_tps", "decode_tps", *TEST_TPS, *TEST_DRAFT):
         if key in r and not is_pos(r[key]):
             err(f"{key} must be a number > 0")
+    for key in TEST_ACCEPT:
+        if key in r and not (is_num(r[key]) and 0 <= r[key] <= 100):
+            err(f"{key} must be a number from 0 to 100")
+    if "engine_args" in r and not (is_text(r["engine_args"]) and len(r["engine_args"]) <= 300 and not CONTROL.search(r["engine_args"])):
+        err("engine_args must be a non-empty string of at most 300 characters, without control characters")
     if "ram_gbps" in r and not is_pos(r["ram_gbps"]):
         err("ram_gbps must be a number > 0")
     if "cpu" in r and not (is_text(r["cpu"]) and len(r["cpu"]) <= 80 and not CONTROL.search(r["cpu"])):
@@ -111,7 +120,8 @@ def check_row(r, err):
 
 
 ROW_ORDER = ("submitter", "date", "commit", "preset", "model", "gpus", "ram_gib", "cpu", "ram_gbps", "os",
-             "quant", "kv", "prefill_16k_tps", "prefill_64k_tps", "decode_tps", "notes")
+             "quant", "kv", "prefill_16k_tps", "prefill_64k_tps", "decode_tps", *TEST_TPS, *TEST_ACCEPT, *TEST_DRAFT,
+             "engine_args", "notes")
 GPU_ORDER = ("name", "vram_gib", "power_w", "pcie", "h2d_gbps")
 TOP_ORDER = ("preset", "runs")
 FIX_HINT = "python3 tools/check_benchmarks.py --fix docs/community/benchmarks.json"
@@ -138,6 +148,36 @@ def canonical(data):
     return json.dumps(data, indent=2, ensure_ascii=False)
 
 
+def lower_ascii(s):
+    """Case folding that C++ (community_row.cpp) reproduces exactly: ASCII letters only."""
+    return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in s)
+
+
+def same_setup(a, b):
+    """True when two rows are one setup: submitter (ASCII case-insensitive), model, quant, every GPU (name, vram_gib,
+    power_w, in order), cpu, ram_gib and os all match. A field missing from either row matches; kv is not compared (the
+    preset fixes it and only the engine version changes it)."""
+    def eq(x, y):
+        if x is None or y is None:
+            return True
+        if isinstance(x, str) and isinstance(y, str):
+            return x == y
+        return is_num(x) and is_num(y) and x == y
+    sa, sb = a.get("submitter"), b.get("submitter")
+    if isinstance(sa, str) and isinstance(sb, str):
+        sa, sb = lower_ascii(sa), lower_ascii(sb)
+    if not all(eq(x, y) for x, y in ((sa, sb), *((a.get(k), b.get(k)) for k in ("model", "quant", "cpu", "ram_gib", "os")))):
+        return False
+    ga, gb = a.get("gpus"), b.get("gpus")
+    if isinstance(ga, list) and isinstance(gb, list):
+        if len(ga) != len(gb):
+            return False
+        for x, y in zip(ga, gb):
+            if not (isinstance(x, dict) and isinstance(y, dict)) or not all(eq(x.get(k), y.get(k)) for k in ("name", "vram_gib", "power_w")):
+                return False
+    return True
+
+
 def validate(data):
     problems = []
     if not isinstance(data, dict):
@@ -149,10 +189,14 @@ def validate(data):
             problems.append("top-level 'runs' must be a list")
         for key in sorted(set(data) - {"preset", "runs"}):
             problems.append(f"unknown top-level key '{key}'")
-        for i, r in enumerate(data["runs"] if isinstance(data.get("runs"), list) else []):
+        rows = data["runs"] if isinstance(data.get("runs"), list) else []
+        for i, r in enumerate(rows):
             who = r.get("submitter") if isinstance(r, dict) else None
             label = f"runs[{i}]" + (f" ({who})" if isinstance(who, str) and who else "")
             check_row(r, lambda m, label=label: problems.append(f"{label}: {m}"))
+            first = next((j for j in range(i) if isinstance(r, dict) and isinstance(rows[j], dict) and same_setup(rows[j], r)), None)
+            if first is not None:
+                problems.append(f"{label}: same submitter, model, quant and hardware as runs[{first}]: update your run instead")
     return problems
 
 
