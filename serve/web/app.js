@@ -79,6 +79,32 @@ const ticks = (max, labels) => [[4, max], [50, max / 2]].filter(t => !labels.som
 /* ---- top bar ---- */
 function setState(s, label) { $("#state").dataset.s = s; text($("#state"), label); }
 
+/* ---- session figures ---- */
+const big = n => !num(n) ? "-" : n >= 1e6 ? `${+(n / 1e6).toFixed(1)}M` : kt(n);
+const dur = ms => !num(ms) || ms <= 0 ? "-" : ms < 60000 ? `${Math.round(ms / 1000)} s` : ms < 3600000 ? `${Math.round(ms / 60000)} min` : `${(ms / 3600000).toFixed(1)} h`;
+// the state word, annotated by the phase: exactly one running request (with several, one request's phase would stand for all)
+function stateWord(live, name) {
+  const p = live.phase;
+  if (live.state !== "generating" || (live.slots || {}).active !== 1 || !p) return [name, ""];
+  if (p === "thinking") return ["Thinking", ""];
+  if (p === "answering") return ["Answering", ""];
+  if (p.startsWith("writing a tool call") || p === "tool call complete") return ["Tool call", p.replace(/^writing a tool call: /, "Tool call: ")];
+  return [name, ""];
+}
+// one chip in the Speed footer, only when something is cached; the rest is its tooltip
+function cacheChip(conv, live) {
+  if (["unloaded", "asleep", "loading"].includes(live.state) || !conv || !num(conv.parked) || conv.parked < 1) return "";
+  const tip = [`${conv.parked} conversations cached, ${gib(conv.bytes)} GiB`, num(conv.evictions) ? `${conv.evictions} evicted to make room` : "",
+    num(conv.restored) ? `last restore: ${fmt(conv.restored)} tokens${num(conv.restored_ms) ? ` in ${Math.round(conv.restored_ms)} ms` : ""}` : ""].filter(Boolean).join("\n");
+  return `<span class="cc" title="${esc(tip)}">${conv.parked} chat${conv.parked === 1 ? "" : "s"} cached · ${gib(conv.bytes)} GiB</span>`;
+}
+function drawTotals(t) {
+  const n = t && num(t.requests) && t.requests > 0 ? t : null;
+  text($("#totals"), n ? `${fmt(n.requests)} requests served · ${fmt(n.written)} tokens written` : "");
+  $("#totals").hidden = !n;
+  $("#totals").title = n ? `Since the server started: ${fmt(n.prompt)} prompt tokens (${fmt(n.reused)} reused), ${dur(n.prompt_ms)} reading, ${dur(n.decode_ms)} generating` : "";
+}
+
 /* ---- sidebar ---- */
 const sbRow = (k, v, u, st) => `<div class="sb-row"><span class="k">${k}</span>${st ? `<span class="st">${st}</span>` : ""}<span class="num">${v}${u ? `<span class="u">${u}</span>` : ""}</span></div>`;
 const bar = f => `<div class="bar4"><i style="width:${(clamp(f || 0, 0, 1) * 100).toFixed(1)}%"></i></div>`;
@@ -160,6 +186,7 @@ function drawSide(hw, st, hist, eng, r) {
 const SC = ["#FF7A3D", "#FFB547", "#F3D3B5", "#D9582A", "#FFD08A", "#C98A6B", "#FF9A66", "#B8401A"], SD = ["", "7 3", "1.5 3", "8 3 1.5 3"];
 const off = new Set();       // decode lines switched off: "t" (total) and slot numbers
 let offFor = 0;              // the slot count `off` was set up for
+let chip = "";
 function drawHero(live, hist, reqs, best, slots, total) {
   const multi = total > 1, generating = live.state === "generating", reading = live.state === "reading";
   // the live rate while generating, else the newest finished request's that has one
@@ -210,8 +237,8 @@ function drawHero(live, hist, reqs, best, slots, total) {
   html($("#pre-last"), r && num(r.prompt_tokens) ? `<b>${fmt(r.prompt_tokens)}</b> tok${num(r.prompt_ms) ? ` in <b>${(r.prompt_ms / 1000).toFixed(2)}</b> s` : ""}` : "-");
   text($("#pre-hit"), r && r.prompt_tokens > 0 && num(r.reused) ? `${Math.round(r.reused / r.prompt_tokens * 100)}%` : "-");
 
-  const bd = best.decode, bp = best.prefill, busy = slots.filter(s => s.is_processing).length;
-  html($("#foot-dec"), `${multi ? `${busy} of ${total} slots busy` : "Single slot"} · Best <b>${bd ? fmt(bd.tok_s, 1) : "-"}</b> tok/s`);
+  const bd = best.decode, bp = best.prefill;
+  html($("#foot-dec"), `<span>Best <b>${bd ? fmt(bd.tok_s, 1) : "-"}</b> tok/s</span>${chip}`);
   html($("#foot-pre"), `Best <b>${bp ? fmt(bp.tok_s) : "-"}</b> tok/s`);
   $("#foot-dec").title = bd ? `Fastest whole request since the server started: ${bd.id}, ${fmt(bd.output_tokens)} tokens, ${clock(bd.time * 1000)}` : "";
   $("#foot-pre").title = bp ? `Fastest prompt read since the server started: ${bp.id}, ${fmt(bp.read_tokens)} tokens read, ${clock(bp.time * 1000)}` : "";
@@ -397,25 +424,39 @@ function draw() {
   const ld = live.state === "loading" ? live.load || {} : null, weights = ld && ld.kind !== "wake";
   const models = M.models || [];
   const none = models.length > 0 && !models.some(m => m.status.value === "loaded" || m.status.value === "loading");
-  setState(live.state || "idle", weights ? "Loading" : ld ? "Waking up" : live.queued > 0 ? `${name} · ${live.queued} queued` : none ? models.some(m => m.status.value === "failed") ? "Load failed" : "No model" : name);
+  const [sw, swTip] = stateWord(live, name);
+  $("#state").title = swTip;
+  setState(live.state || "idle", weights ? "Loading" : ld ? "Waking up" : live.queued > 0 ? `${name} · ${live.queued} queued` : none ? models.some(m => m.status.value === "failed") ? "Load failed" : "No model" : sw);
   const pct = weights && num(ld.percent) ? ld.percent : null;
   text($("#pct"), pct === null ? "" : `${pct}%`); $("#pct").hidden = pct === null;
   $("#pbar").hidden = !weights; $("#pbar").firstElementChild.style.width = `${pct || 0}%`;
   text($("#model"), eng.model || "");
   drawModels(models, eng.model);
+  chip = cacheChip(M.conversation, live);
+  drawTotals(M.totals);
   drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);
   drawHero(live, hist, reqs, M.best || {}, slots, total);
   drawMain(live, hist, reqs, slots, total);
 }
 
 /* ---- logs ---- */
+// the engine's long conversation cache lines, shortened for the panel (the log and the API keep the raw line)
+function shortLog(msg) {
+  const k = n => n >= 1000 ? `${Math.round(n / 1000)}k` : String(n), g = b => `${(b / 1024 ** 3).toFixed(1)} GiB`;
+  let m = /conversation cache: parked (\d+) tokens in [\d.]+ ms; parked=(\d+) bytes=(\d+)/.exec(msg);
+  if (m) return `cache: parked ${k(+m[1])} tokens · ${m[2]} cached · ${g(+m[3])}`;
+  m = /conversation cache: restored (\d+) tokens \(\w+\) in ([\d.]+) ms/.exec(msg);
+  return m ? `cache: restored ${k(+m[1])} tokens in ${Math.round(+m[2])} ms` : msg;
+}
 const logEl = $("#log"), MAXLOG = 400;
 let logCount = 0, follow = true;
 function lineEl(e) {
   const d = document.createElement("div");
   if (e.lvl !== "info") d.className = e.lvl;
   const t = document.createElement("i"); t.textContent = clock(e.t * 1000);
-  d.append(t, `  ${e.src === "srv" ? "[server] " : ""}${e.msg}`);
+  const shown = shortLog(e.msg);
+  d.append(t, `  ${e.src === "srv" ? "[server] " : ""}${shortLog(e.msg)}`);
+  if (e.src !== "srv" || true) d.title = e.msg;
   return d;
 }
 function append(lines) {

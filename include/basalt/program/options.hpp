@@ -132,6 +132,12 @@ struct CommonOptions {
     /// the checkpoint goes in front of that turn instead, so it holds the conversation and not the effort text.
     /// -1 = off (the checkpoint at the last <|im_start|>).
     int64_t tail_role_token = -1;
+    /// A flag on in this start that changes the model's output: the flag as typed and the warning line that says how.
+    struct LossyFlag {
+        std::string flag, effect;
+    };
+    /// Filled by the model's finish_flags; the start warns about each and --serve reports them (INFO lossy=).
+    std::vector<LossyFlag> lossy;
 };
 
 }  // namespace basalt::program

@@ -116,13 +116,14 @@ template <int ITERS>
 __global__ void __launch_bounds__(256) k_gate_up(const unsigned char* __restrict__ gw,
                                                  const unsigned char* __restrict__ uw, int n_in, int n_ff,
                                                  const Q81* __restrict__ x, const int32_t* __restrict__ ids, int k,
-                                                 float clamp, float* __restrict__ h) {
+                                                 float clamp, const int32_t* __restrict__ live, float* __restrict__ h) {
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ float res[kRowGroups][8];
     const int nb = n_in / kMxfp4BlockElems;
     const size_t row_bytes = (size_t) nb * kMxfp4BlockBytes;
     XBlock* xs = reinterpret_cast<XBlock*>(smem);
     const int pair = blockIdx.y, t = pair / k, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (live && t >= *live) return;   // a row nothing reads
     const int e = ids[pair];
     const int r0 = blockIdx.x * kRowGroups * (kRowsPerBlock / 2);
     const unsigned char* w0 = ((warp & 1) ? uw : gw) + ((size_t) e * n_ff + r0 + (warp >> 1)) * row_bytes;
@@ -149,15 +150,20 @@ __global__ void __launch_bounds__(256) k_gate_up(const unsigned char* __restrict
 // Grid (n_out / (8 * kRowGroups), pairs): one warp per output row, kRowGroups rows per warp.
 template <int ITERS>
 __global__ void __launch_bounds__(256) k_down(const unsigned char* __restrict__ dw, int n_ff, int n_out,
-                                              const Q81* __restrict__ h, const int32_t* __restrict__ ids,
-                                              float* __restrict__ d) {
+                                              const Q81* __restrict__ h, const int32_t* __restrict__ ids, int k,
+                                              const int32_t* __restrict__ live, float* __restrict__ d) {
     extern __shared__ __align__(16) unsigned char smem[];
     const int nb = n_ff / kMxfp4BlockElems;
     const size_t row_bytes = (size_t) nb * kMxfp4BlockBytes;
     XBlock* xs = reinterpret_cast<XBlock*>(smem);
     const int pair = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int e = ids[pair];
     const int r0 = blockIdx.x * kRowGroups * kRowsPerBlock + warp;
+    if (live && pair / k >= *live) {   // a row nothing reads: zeros, so the sums after it stay finite
+        if (lane == 0)
+            for (int q = 0; q < kRowGroups; ++q) d[(size_t) pair * n_out + r0 + q * kRowsPerBlock] = 0.f;
+        return;
+    }
+    const int e = ids[pair];
     const unsigned char* w0 = dw + ((size_t) e * n_out + r0) * row_bytes;
     const size_t step = (size_t) kRowsPerBlock * row_bytes;   // the warp's row of the next group
     uint32_t w[2][ITERS][5];
@@ -268,25 +274,26 @@ void check(const char* what) {
 }  // namespace
 
 void dspark_moe_gate_up(const void* gate_w, const void* up_w, int n_in, int n_ff, const void* x_q8_1, const int32_t* ids,
-                        int n_tokens, int k, float clamp, float* h, void* stream) {
+                        int n_tokens, int k, float clamp, const int32_t* live_rows, float* h, void* stream) {
     const size_t smem = (size_t) (n_in / kMxfp4BlockElems) * sizeof(XBlock);
     if (n_in % kMxfp4BlockElems || n_in > 6144 || n_ff % (kRowGroups * kRowsPerBlock / 2)) throw std::invalid_argument("dspark_moe_gate_up: shape");
     const dim3 grid(n_ff / (kRowGroups * kRowsPerBlock / 2), n_tokens * k);
     const int iters = (n_in / kMxfp4BlockElems + 31) / 32;
     auto kern = iters <= 3 ? k_gate_up<3> : iters <= 5 ? k_gate_up<5> : k_gate_up<6>;
     kern<<<grid, 256, smem, (cudaStream_t) stream>>>((const unsigned char*) gate_w, (const unsigned char*) up_w, n_in,
-                                                    n_ff, (const Q81*) x_q8_1, ids, k, clamp, h);
+                                                    n_ff, (const Q81*) x_q8_1, ids, k, clamp, live_rows, h);
     check("dspark_moe_gate_up");
 }
 
 void dspark_moe_down(const void* down_w, int n_ff, int n_out, const void* h_q8_1, const int32_t* ids, int n_tokens, int k,
-                     float* d, void* stream) {
+                     const int32_t* live_rows, float* d, void* stream) {
     const size_t smem = (size_t) (n_ff / kMxfp4BlockElems) * sizeof(XBlock);
     if (n_ff % kMxfp4BlockElems || n_ff > 6144 || n_out % (kRowGroups * kRowsPerBlock)) throw std::invalid_argument("dspark_moe_down: shape");
     const dim3 grid(n_out / (kRowGroups * kRowsPerBlock), n_tokens * k);
     const int iters = (n_ff / kMxfp4BlockElems + 31) / 32;
     auto kern = iters <= 3 ? k_down<3> : iters <= 5 ? k_down<5> : k_down<6>;
-    kern<<<grid, 256, smem, (cudaStream_t) stream>>>((const unsigned char*) down_w, n_ff, n_out, (const Q81*) h_q8_1, ids, d);
+    kern<<<grid, 256, smem, (cudaStream_t) stream>>>((const unsigned char*) down_w, n_ff, n_out, (const Q81*) h_q8_1, ids, k,
+                                                    live_rows, d);
     check("dspark_moe_down");
 }
 
@@ -302,6 +309,63 @@ void dspark_kv_rope(const float* raw, const float* norm_w, const int32_t* pos, i
     k_kv_rope<<<n_tokens, kLatentW, 0, (cudaStream_t) stream>>>(raw, norm_w, pos, eps, rope_freq, kv_out,
                                                                  reinterpret_cast<__half*>(ring), ring_slots);
     check("dspark_kv_rope");
+}
+
+namespace {
+// Block (column group, row): x's row as four streams, cur's row as stream 0; the first block copies the metadata.
+__global__ void k_block_inputs(const int32_t* __restrict__ meta, int n_meta, const float4* __restrict__ emb,
+                               const float4* __restrict__ mask, int n4, int32_t* __restrict__ dmeta, float4* __restrict__ x,
+                               float4* __restrict__ cur) {
+    const int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r == 0 && blockIdx.x == 0)
+        for (int j = threadIdx.x; j < n_meta; j += blockDim.x) dmeta[j] = meta[j];
+    if (i >= n4) return;
+    const float4* src = r == 0 ? emb : mask + (size_t) (r - 1) * 4 * n4;
+    float4* xr = x + (size_t) r * 4 * n4;
+    const float4 v0 = src[i];
+    xr[i] = v0;
+    for (int s = 1; s < 4; ++s) xr[(size_t) s * n4 + i] = r == 0 ? v0 : src[(size_t) s * n4 + i];
+    cur[(size_t) r * n4 + i] = v0;
+}
+
+__global__ void k_fill_positions(int32_t* pos, int64_t pos0, int n) {
+    if ((int) threadIdx.x < n) pos[threadIdx.x] = (int32_t) (pos0 + threadIdx.x);
+}
+
+// Block (row, stage): one row of 512 fp16 values, 8 a thread.
+__global__ void k_commit_rows(const uint4* __restrict__ staged, int stage_slots, uint4* ring0, uint4* ring1, uint4* ring2,
+                              int ring_slots, int64_t pos0) {
+    const int64_t p = pos0 + blockIdx.x;
+    const int l = blockIdx.y;
+    uint4* ring = l == 0 ? ring0 : l == 1 ? ring1 : ring2;
+    constexpr int kWords = kLatentW * 2 / 16;
+    const uint4* src = staged + ((size_t) l * stage_slots + (size_t) (p % stage_slots)) * kWords;
+    ring[(size_t) (p % ring_slots) * kWords + threadIdx.x] = src[threadIdx.x];
+}
+}  // namespace
+
+void dspark_block_inputs(const int32_t* meta, int n_meta, const float* emb, const float* mask, int n, int rows,
+                         int32_t* dmeta, float* x, float* cur, void* stream) {
+    const int n4 = n / 4;
+    k_block_inputs<<<dim3((unsigned) ((n4 + 255) / 256), (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(
+        meta, n_meta, reinterpret_cast<const float4*>(emb), reinterpret_cast<const float4*>(mask), n4, dmeta,
+        reinterpret_cast<float4*>(x), reinterpret_cast<float4*>(cur));
+    check("dspark_block_inputs");
+}
+
+void dspark_fill_positions(int32_t* pos, int64_t pos0, int n, void* stream) {
+    if (n <= 0) return;
+    k_fill_positions<<<1, 1024, 0, (cudaStream_t) stream>>>(pos, pos0, n);
+    check("dspark_fill_positions");
+}
+
+void dspark_commit_rows(const uint16_t* staged, int stage_slots, uint16_t* ring0, uint16_t* ring1, uint16_t* ring2,
+                        int ring_slots, int64_t pos0, int n, void* stream) {
+    if (n <= 0) return;
+    k_commit_rows<<<dim3((unsigned) n, 3), kLatentW * 2 / 16, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const uint4*>(staged), stage_slots, reinterpret_cast<uint4*>(ring0), reinterpret_cast<uint4*>(ring1),
+        reinterpret_cast<uint4*>(ring2), ring_slots, pos0);
+    check("dspark_commit_rows");
 }
 
 void dspark_hc_mean(const float* x, int n_rows, int n, float* out, int out_stride, void* stream) {

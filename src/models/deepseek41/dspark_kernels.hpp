@@ -18,13 +18,14 @@ inline size_t mxfp4_row_bytes(int n_in) { return (size_t) (n_in / kMxfp4BlockEle
 /// matrices [n_expert][n_ff][n_in] (expert e at e * n_ff * row bytes, 4-byte aligned, followed by kMxfp4Pad readable
 /// bytes); x is q8_1 [T][n_in] (kernels::native_quantize_q8_1), the dots int8 (dp4a) per 32 values as llama.cpp's
 /// MXFP4 kernels take them; the clamp is the SwiGLU limit. n_in is a multiple of 128 and at most 6144.
+/// With `live_rows` (device, may be null) the pairs of tokens from *live_rows on are skipped: their h is left as it is.
 void dspark_moe_gate_up(const void* gate_w, const void* up_w, int n_in, int n_ff, const void* x_q8_1, const int32_t* ids,
-                        int n_tokens, int k, float clamp, float* h, void* stream);
+                        int n_tokens, int k, float clamp, const int32_t* live_rows, float* h, void* stream);
 
 /// d[p][r] = down_e[r] . h[p] with down_e [n_out][n_ff] MXFP4 (expert e at e * n_out * row bytes) and h q8_1
-/// [pairs][n_ff].
+/// [pairs][n_ff]. With `live_rows` (device, may be null) the pairs of tokens from *live_rows on get zeros.
 void dspark_moe_down(const void* down_w, int n_ff, int n_out, const void* h_q8_1, const int32_t* ids, int n_tokens, int k,
-                     float* d, void* stream);
+                     const int32_t* live_rows, float* d, void* stream);
 
 /// out[t][i] = sum_k w[t*K + k] * d[(t*K + k)][i] + shared[t][i].
 void dspark_moe_combine(const float* d, const float* w, const float* shared, int n_tokens, int k, int n, float* out,
@@ -34,6 +35,20 @@ void dspark_moe_combine(const float* d, const float* w, const float* shared, int
 /// [T][512] (fp32, may be null) and, when `ring` is not null, as fp16 to slot pos % ring_slots of ring.
 void dspark_kv_rope(const float* raw, const float* norm_w, const int32_t* pos, int n_tokens, float eps,
                     const float* rope_freq, float* kv_out, uint16_t* ring, int ring_slots, void* stream);
+
+/// A block's inputs, x as `rows` rows of four streams of n floats: row 0 is `emb` (n floats) in each stream, row r > 0
+/// is mask row r - 1 (four streams); cur [rows][n] gets stream 0 of each row and dmeta[0, n_meta) `meta`. `meta` and
+/// `emb` may be mapped host memory.
+void dspark_block_inputs(const int32_t* meta, int n_meta, const float* emb, const float* mask, int n, int rows,
+                         int32_t* dmeta, float* x, float* cur, void* stream);
+
+/// pos[j] = pos0 + j for j < n (n at most 1024).
+void dspark_fill_positions(int32_t* pos, int64_t pos0, int n, void* stream);
+
+/// Rows of a staged latent set into the stages' rings: for p in pos0..pos0 + n - 1, ring_l[p % ring_slots] =
+/// staged[l][p % stage_slots] (512 fp16 values each) for each of the three stages.
+void dspark_commit_rows(const uint16_t* staged, int stage_slots, uint16_t* ring0, uint16_t* ring1, uint16_t* ring2,
+                        int ring_slots, int64_t pos0, int n, void* stream);
 
 /// out[r * out_stride + i] = mean over the four hyper-connection streams of x[r][s][i], for `n_rows` rows.
 void dspark_hc_mean(const float* x, int n_rows, int n, float* out, int out_stride, void* stream);
