@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from serve.api import responses as responses_api
-from serve.api import context_proxy, thread_proxy
+from serve.api import context_engine_link, context_proxy, thread_proxy
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
@@ -347,6 +347,21 @@ def make_handler(svc: Service):
                     status, body = thread_proxy.forward("POST", path, req)
                     self._json(status, body)
                     return
+                if path == "/v1/engine/threads/attach":       # native thread tape from a token-id prefix
+                    name, head, ids = req.get("thread"), req.get("head"), req.get("ids")
+                    if not (isinstance(name, str) and isinstance(head, str) and isinstance(ids, list)):
+                        self._json(422, {"error": {"type": "invalid_request_error", "message": "thread, head (strings) and ids (list of token ids)"}})
+                        return
+                    try:
+                        svc.thread_attach(name, head, ids)
+                    except ValueError as e:
+                        self._json(409, {"error": {"type": "conflict", "message": str(e)}})
+                        return
+                    except (GpuBusy, EngineDied) as e:
+                        self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                        return
+                    self._json(200, {"status": "attached"})
+                    return
                 if path == "/v1/engine/threads/fork":         # native thread tape fork (shared token prefix)
                     names = [req.get(k) for k in ("parent", "parent_head", "child", "child_head")]
                     keep = req.get("keep_tokens", 0)
@@ -365,6 +380,9 @@ def make_handler(svc: Service):
                     return
                 if context_proxy.is_context_path(path):
                     status, body = context_proxy.forward("POST", path, req, self.headers.get("Idempotency-Key"))
+                    link = context_engine_link.after_registry_fork(path, req, status, body, svc.thread_fork)
+                    if link is not None:
+                        body = {**body, "engine_fork": link}
                     self._json(status, body)
                     return
                 if path.startswith("/v1/responses/"):        # nothing is stored

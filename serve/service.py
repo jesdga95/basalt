@@ -633,6 +633,16 @@ class Service:
                "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
         return scheduler_adapter.add_metrics(out, self.scheduler)
 
+    def thread_attach(self, thread: str, head: str, ids: list) -> None:
+        """Attach a native thread tape (engine THREAD_ATTACH) on the request fifo."""
+        command = getattr(self.engine, "thread_command", None)
+        if command is None:
+            raise ValueError("this engine has no native thread tapes")
+        if not ids or not all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in ids):
+            raise ValueError("ids must be a non-empty list of token ids")
+        with self.fifo:
+            command(f"THREAD_ATTACH {thread} {head} " + ",".join(map(str, ids)))
+
     def thread_fork(self, parent: str, parent_head: str, child: str, child_head: str, keep: int = 0) -> int:
         """Fork a native thread tape (engine THREAD_FORK) on the request fifo; returns the shared token prefix length."""
         fork = getattr(self.engine, "thread_fork", None)
