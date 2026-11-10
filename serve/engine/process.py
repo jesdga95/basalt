@@ -601,6 +601,37 @@ class ProcessEngine:
             if time.time() > deadline:
                 raise EngineDied(f"the engine did not answer the {what} command")
 
+    THREAD_TIMEOUT_S = 10.0
+
+    def thread_command(self, command: str, timeout: float | None = None) -> list[str]:
+        """Send one THREAD_ATTACH/APPEND/FORK/RELEASE line and return the fields after `THREAD_OK`. ValueError carries
+        the engine's refusal. Caller holds the service FIFO (the reply is one line, read from the shared queue)."""
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        if "\n" in command or not command.startswith("THREAD_"):
+            raise ValueError("not a THREAD command")
+        self._send(command)
+        deadline = time.time() + (self.THREAD_TIMEOUT_S if timeout is None else timeout)
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the THREAD command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the THREAD command")
+            if line.startswith("THREAD_OK "):
+                return line.split()[1:]
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the THREAD command")
+
+    def thread_fork(self, parent: str, parent_head: str, child: str, child_head: str, keep: int = 0) -> int:
+        """Fork a thread tape; returns the token prefix length parent and child share (what KV reuse can cover)."""
+        fields = self.thread_command(f"THREAD_FORK {parent} {parent_head} {child} {child_head} {int(keep)}")
+        return int(fields[-1])
+
     ENC_TIMEOUT_S = 300.0
 
     def encode_images(self, jobs: list, timeout: float | None = None) -> list[str]:
