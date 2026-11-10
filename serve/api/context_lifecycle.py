@@ -186,24 +186,43 @@ class ContextLifecycle:
                 self.live_id = None
         self.drain_drops()
 
-    def drain_drops(self) -> None:
-        """Free tombstoned payloads while the engine sits idle, then confirm to the registry so GC can purge."""
+    REAPER_FIFO_WAIT_S = 25.0               # a reaper round's patience for the solo turn
+
+    def drain_drops(self, fifo_wait_s: float = 0.0) -> None:
+        """Free tombstoned payloads while the engine sits idle, then confirm to the registry so GC can purge.
+
+        The reaper passes a bounded wait: under sustained agent load the turn lock passes straight from one
+        request to the next and a non-blocking probe loses every race, so tombstones would never drain.
+        """
         with self.lock:
             pending = list(self.drops)
         if not pending or not self.svc.loaded():
             return
-        if not self.svc.fifo.acquire(blocking=False):
-            return                          # a request holds the turn: the reaper retries
+        if fifo_wait_s > 0:
+            got = self.svc.fifo.acquire(timeout=fifo_wait_s)
+        else:
+            got = self.svc.fifo.acquire(blocking=False)
+        if not got:
+            return                          # a request holds the turn: the caller retries
         try:
             for cid in pending:
                 try:
-                    self.svc.engine.context_command(f"CONTEXT_DROP {cid}", timeout=120.0)
-                except (ValueError, EngineDied):
-                    pass                    # nothing published, or the engine is gone: the row stays tombstoned
+                    words = self.svc.engine.context_command(f"CONTEXT_DROP {cid}", timeout=120.0).split()
+                    print(f"[server] context: {cid[:8]} engine freed {words[3] if len(words) > 3 else '?'} files", flush=True)
+                except (ValueError, EngineDied) as e:
+                    print(f"[server] context: engine drop of {cid[:8]} refused ({e})", flush=True)
                 try:
                     self.ad._call("POST", f"/v1/contexts/{cid}/payload/released", None, None, (200,))
-                except (RegistryError, OSError):
+                except RegistryError as e:
+                    if e.status == 404:
+                        with self.lock:
+                            self.drops.discard(cid)   # the row is already purged: nothing left to confirm
+                        continue
+                    print(f"[server] context: release of {cid[:8]} did not land ({e.reason}); retrying", flush=True)
                     continue                # registry unreachable: retry on the next round
+                except OSError as e:
+                    print(f"[server] context: release of {cid[:8]} did not land ({e}); retrying", flush=True)
+                    continue
                 with self.lock:
                     self.drops.discard(cid)
         finally:
@@ -213,7 +232,7 @@ class ContextLifecycle:
     def _reap_loop(self) -> None:
         while not self._stop.wait(30.0):
             try:
-                self.drain_drops()
+                self.drain_drops(self.REAPER_FIFO_WAIT_S)
                 self._cool_idle()
             except Exception as e:          # a daemon thread must outlive any one round
                 print(f"[server] context: reaper round failed ({type(e).__name__}: {e})", flush=True)
@@ -224,7 +243,7 @@ class ContextLifecycle:
             stale = [cid for cid, i in self.hot.items() if now - i["used"] > self.cool_idle_s]
         if not stale or not self.svc.loaded():
             return
-        if not self.svc.fifo.acquire(blocking=False):
+        if not self.svc.fifo.acquire(timeout=self.REAPER_FIFO_WAIT_S):
             return
         try:
             for cid in stale:
