@@ -1234,7 +1234,9 @@ int2* split_scratch(void* stream, size_t entries, unsigned** done) {
 // per entry.  The same chain at every launch, so a seed replays its draws; sampler_parity's mirror runs the same order.
 constexpr int kWideBlockSpan = 4096;   // logits per block of the key pass (its penalty bitmap: 512 bytes)
 constexpr int kWideKeyThreads = 256;
-constexpr int kWideChunks = 1024;      // chunks of a list's sums: 32 blocks of 32 threads, one chunk each
+constexpr int kWideChunks = 1024;      // chunks of a list's sums, each summed in order by one thread
+constexpr int kWideTermChunks = 8;     // chunks one block of the terms pass takes: all its threads compute their terms
+constexpr int kWideTermThreads = 256;
 constexpr int kWideRows = 8;           // rows of one pass (their buffers); more rows take several passes
 
 // a row's scan state between the wide path's launches
@@ -1303,29 +1305,33 @@ __device__ __forceinline__ int wide_kept(const WideRow& r, int k, int min_keep) 
     return cut < r.below ? cut : r.below;
 }
 
-/// One pass's terms and chunk sums: grid (32, rows) x 32 threads, thread c the chunk c of the pass's length (pass 1:
-/// the list, k; pass 2: the kept prefix).  Pass 1 holds exp(x - x0), pass 2 exp(x / T - x0 / T); pass 2's block 0
-/// records the kept prefix.
-__global__ void __launch_bounds__(32)
+/// One pass's terms and chunk sums: grid (kWideChunks / kWideTermChunks, rows) x kWideTermThreads, block b the chunks
+/// b * kWideTermChunks.. of the pass's length (pass 1: the list, k; pass 2: the kept prefix).  The block's threads compute
+/// the terms of those chunks' entries together; then one thread per chunk sums its terms in order.  Pass 1 holds
+/// exp(x - x0), pass 2 exp(x / T - x0 / T); pass 2's block 0 records the kept prefix.
+__global__ void __launch_bounds__(kWideTermThreads)
 sampler_wide_terms_kernel(const unsigned* __restrict__ keys, int n_vocab, int k, const SamplerParams p, int pass,
                           double* __restrict__ e, double* __restrict__ part, WideRow* __restrict__ st) {
-    const int t = blockIdx.y, c = (int) (blockIdx.x * 32 + threadIdx.x);
+    const int t = blockIdx.y, c0 = (int) blockIdx.x * kWideTermChunks;
     const unsigned* kr = keys + (size_t) t * n_vocab;
     double* er = e + (size_t) t * n_vocab;
     const float x0 = wide_value(kr[0]);
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
     const float smx = x0 * inv_t;            // the list is sorted: its first product is the largest
     const int n = pass == 1 ? k : wide_kept(st[t], k, p.min_keep);
-    if (pass == 2 && c == 0) st[t].n_keep = n;
+    if (pass == 2 && c0 == 0 && threadIdx.x == 0) st[t].n_keep = n;
     const int C = (n + kWideChunks - 1) / kWideChunks;
-    const int lo = min(n, c * C), hi = min(n, lo + C);
-    double s = 0.0;
-    for (int i = lo; i < hi; ++i) {
+    const int lo = min(n, c0 * C), hi = min(n, (c0 + kWideTermChunks) * C);
+    for (int i = lo + (int) threadIdx.x; i < hi; i += kWideTermThreads) {
         const float x = wide_value(kr[i]);
-        const double v = pass == 1 ? exp((double) x - (double) x0) : exp((double) (x * inv_t) - (double) smx);
-        er[i] = v;
-        s += v;
+        er[i] = pass == 1 ? exp((double) x - (double) x0) : exp((double) (x * inv_t) - (double) smx);
     }
+    __syncthreads();
+    if (threadIdx.x >= kWideTermChunks) return;
+    const int c = c0 + (int) threadIdx.x;
+    const int clo = min(n, c * C), chi = min(n, clo + C);
+    double s = 0.0;
+    for (int i = clo; i < chi; ++i) s += er[i];
     part[(size_t) t * kWideChunks + c] = s;
 }
 
@@ -1527,15 +1533,15 @@ void sample_wide(const float* logits, int n_tokens, int n_vocab, const int* hist
                 std::exit(1);
             }
         }
-        const dim3 grid(kWideChunks / 32, (unsigned) R);
+        const dim3 grid(kWideChunks / 32, (unsigned) R), tgrid(kWideChunks / kWideTermChunks, (unsigned) R);
         if (p.top_p < 1.0f) {
-            sampler_wide_terms_kernel<<<grid, 32, 0, cs>>>(w.keys, n_vocab, k, pr, 1, w.terms, w.part, w.rows);
+            sampler_wide_terms_kernel<<<tgrid, kWideTermThreads, 0, cs>>>(w.keys, n_vocab, k, pr, 1, w.terms, w.part, w.rows);
             sampler_wide_scan_kernel<<<(unsigned) R, kWideChunks, 0, cs>>>(w.part, w.pre, 1, w.rows);
         }
         if (p.top_p < 1.0f || p.min_p > 0.0f)
             sampler_wide_search_kernel<<<grid, 32, 0, cs>>>(w.keys, w.ids, n_vocab, k, pr, 1, w.terms, w.pre, nullptr, 0,
                                                             w.rows);
-        sampler_wide_terms_kernel<<<grid, 32, 0, cs>>>(w.keys, n_vocab, k, pr, 2, w.terms, w.part, w.rows);
+        sampler_wide_terms_kernel<<<tgrid, kWideTermThreads, 0, cs>>>(w.keys, n_vocab, k, pr, 2, w.terms, w.part, w.rows);
         sampler_wide_scan_kernel<<<(unsigned) R, kWideChunks, 0, cs>>>(w.part, w.pre, 2, w.rows);
         // the query rows of this pass (row t0 + t asks for query[t0 + t])
         const int nq = n_query - t0 > 0 ? n_query - t0 : 0;
