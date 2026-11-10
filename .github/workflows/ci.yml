@@ -6,16 +6,14 @@ on:
   pull_request:
     paths-ignore:
       - "docs/community/**"
-      - "site/**"
       - "tools/check_benchmarks.py"
-      - ".github/workflows/pages.yml"
+      - ".github/workflows/community.yml"
   push:
     branches: [main]
     paths-ignore:
       - "docs/community/**"
-      - "site/**"
       - "tools/check_benchmarks.py"
-      - ".github/workflows/pages.yml"
+      - ".github/workflows/community.yml"
   workflow_dispatch:
   schedule:
     - cron: "17 5 * * *"   # keeps the compiler caches from expiring
