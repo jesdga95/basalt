@@ -441,8 +441,7 @@ PublishResult SnapshotStore::publish(const Manifest& draft, StateSource& source,
         files_.remove(tmp);
         return publish_refused(status, why);
     }
-    const DirSync synced = files_.sync_dir(dir_);
-    if (synced == DirSync::failed) {
+    if (!files_.sync_dir(dir_)) {
         // the rename may or may not survive a crash: take it back so no caller records it
         files_.remove(path);
         return publish_refused(PublishStatus::io_failed, fail_text("cannot sync directory " + dir_));
@@ -451,7 +450,6 @@ PublishResult SnapshotStore::publish(const Manifest& draft, StateSource& source,
     r.status = PublishStatus::published;
     r.manifest = std::move(m);
     r.path = path;
-    r.dir_synced = synced == DirSync::synced;
     return r;
 }
 

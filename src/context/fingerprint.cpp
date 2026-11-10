@@ -2,6 +2,7 @@
 #include "basalt/context/fingerprint.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <cmath>
 
