@@ -304,6 +304,38 @@ void dspark_kv_rope(const float* raw, const float* norm_w, const int32_t* pos, i
     check("dspark_kv_rope");
 }
 
+namespace {
+__global__ void k_fill_positions(int32_t* pos, int64_t pos0, int n) {
+    if ((int) threadIdx.x < n) pos[threadIdx.x] = (int32_t) (pos0 + threadIdx.x);
+}
+
+// Block (row, stage): one row of 512 fp16 values, 8 a thread.
+__global__ void k_commit_rows(const uint4* __restrict__ staged, int stage_slots, uint4* ring0, uint4* ring1, uint4* ring2,
+                              int ring_slots, int64_t pos0) {
+    const int64_t p = pos0 + blockIdx.x;
+    const int l = blockIdx.y;
+    uint4* ring = l == 0 ? ring0 : l == 1 ? ring1 : ring2;
+    constexpr int kWords = kLatentW * 2 / 16;
+    const uint4* src = staged + ((size_t) l * stage_slots + (size_t) (p % stage_slots)) * kWords;
+    ring[(size_t) (p % ring_slots) * kWords + threadIdx.x] = src[threadIdx.x];
+}
+}  // namespace
+
+void dspark_fill_positions(int32_t* pos, int64_t pos0, int n, void* stream) {
+    if (n <= 0) return;
+    k_fill_positions<<<1, 1024, 0, (cudaStream_t) stream>>>(pos, pos0, n);
+    check("dspark_fill_positions");
+}
+
+void dspark_commit_rows(const uint16_t* staged, int stage_slots, uint16_t* ring0, uint16_t* ring1, uint16_t* ring2,
+                        int ring_slots, int64_t pos0, int n, void* stream) {
+    if (n <= 0) return;
+    k_commit_rows<<<dim3((unsigned) n, 3), kLatentW * 2 / 16, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const uint4*>(staged), stage_slots, reinterpret_cast<uint4*>(ring0), reinterpret_cast<uint4*>(ring1),
+        reinterpret_cast<uint4*>(ring2), ring_slots, pos0);
+    check("dspark_commit_rows");
+}
+
 void dspark_hc_mean(const float* x, int n_rows, int n, float* out, int out_stride, void* stream) {
     k_hc_mean<<<dim3((n + 255) / 256, n_rows), 256, 0, (cudaStream_t) stream>>>(x, n, out, out_stride);
     check("dspark_hc_mean");

@@ -59,6 +59,16 @@ public:
 
     /// Window `w`'s latents of positions pos0.. from `n_rows` rows of target features (host, feature_floats() each).
     bool inject(int w, int64_t pos0, int n_rows, const float* features, std::string& err);
+    /// The latents of a verify window's `n_rows` rows (at most 8, positions pos0..) made from their target features
+    /// `features` (device, on the drafter's card, feature_floats() a row) once `ready` (an event of the stream that
+    /// writes them) has passed, at low priority beside the window; `commit` then moves the accepted ones into window
+    /// `w`. False when they cannot be staged here (another card), with nothing started.
+    bool stage(int w, int64_t pos0, int n_rows, const float* features, void* ready, std::string& err);
+    /// The first `n_rows` staged rows of window `w` from position pos0 into its rings, as `inject` of their features
+    /// would leave them. False (nothing done) when those rows were not staged.
+    bool commit(int w, int64_t pos0, int n_rows, std::string& err);
+    /// Makes `stream` wait until the staged rows' features were read.
+    void after_staging(void* stream);
     /// Starts the block over window `w` for the anchor token `anchor` at position `pos`; its first `n_out` rows become drafts.
     bool draft_begin(int w, int32_t anchor, int64_t pos, int n_out, std::string& err);
     /// Waits for the block.
