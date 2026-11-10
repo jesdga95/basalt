@@ -81,6 +81,45 @@ def echo_requests(log_path: str, offset: int) -> None:
                                                  m["tg"]), flush=True)
 
 
+# The conversation cache's lines (src/models/qwen4exp/serve/conversation.cpp, src/program/serve/request_restore.cpp).
+CONV_PARKED = re.compile(r"conversation cache: (?:parked|skipped) \d+ tokens in [\d.]+ ms; parked=(?P<parked>\d+) "
+                         r"bytes=(?P<bytes>\d+) evictions=(?P<evictions>\d+)")
+CONV_RESTORED = re.compile(r"conversation cache: restored (?P<tokens>\d+) tokens \(\w+\) in (?P<ms>[\d.]+) ms; "
+                           r"parked=(?P<parked>\d+) bytes=(?P<bytes>\d+)")
+
+
+def conversation_facts(line: str) -> dict:
+    """What an engine log line says about the conversation cache: parked, bytes, evictions (a park line only) and
+    restored, restored_ms (a restore line only); empty for any other line."""
+    if "conversation cache: " not in line:
+        return {}
+    if m := CONV_PARKED.search(line):
+        return {"parked": int(m["parked"]), "bytes": int(m["bytes"]), "evictions": int(m["evictions"])}
+    if m := CONV_RESTORED.search(line):
+        return {"parked": int(m["parked"]), "bytes": int(m["bytes"]), "restored": int(m["tokens"]),
+                "restored_ms": float(m["ms"])}
+    return {}
+
+
+def follow_log(path: str, offset: int, on_line, done) -> None:
+    """Pass each line a log file gains after `offset` to `on_line` until `done()`, then the lines it still holds."""
+    try:
+        f = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with f:
+        f.seek(offset)
+        while True:
+            ended = done()
+            line = f.readline()
+            if line:
+                on_line(line)
+            elif ended:
+                return
+            else:
+                time.sleep(0.2)
+
+
 def engine_line(line: str) -> str:
     """Drop the `\r` a text-mode stream puts before a line's final `\n`; the line keeps its `\n`."""
     return line[:-2] + "\n" if line.endswith("\r\n") else line
@@ -248,6 +287,7 @@ class ProcessEngine:
         self.last = {}
         self.slot_drafts = {}
         self.info = {}                   # INFO key=value facts
+        self.conversation = {}           # the cache's figures from the engine's log lines; this process's only
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens, from PP lines
         self.silent_note = None
@@ -285,8 +325,13 @@ class ProcessEngine:
                 self.log.close()
             raise EngineStartError(f"the engine could not be started: {e}", log) from e
         frame_pipes(self.proc, sink is not None)
+        proc = self.proc
         if sink:
-            threading.Thread(target=pump_lines, args=(self.proc.stderr, sink), daemon=True).start()
+            threading.Thread(target=pump_lines, args=(proc.stderr, lambda x: (self._note_conversation(proc, x), sink(x))),
+                             daemon=True).start()
+        elif log:
+            threading.Thread(target=follow_log, args=(log, log_start, lambda x: self._note_conversation(proc, x),
+                                                      lambda: proc.poll() is not None), daemon=True).start()
         # the lines come from a thread up to READY, so the read can time out and the rest of the stream stays for _pump
         ready_q: queue.Queue = queue.Queue()
         threading.Thread(target=self._ready_pump, args=(self.proc, ready_q, self.log), daemon=True).start()
@@ -367,6 +412,12 @@ class ProcessEngine:
         self.wlock = threading.Lock()                   # serializes stdin writes
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+
+    def _note_conversation(self, proc, line: str) -> None:
+        """Keep the cache's figures from an engine log line; a line of an engine that is gone changes nothing."""
+        facts = conversation_facts(line)
+        if facts and self.proc is proc:
+            self.conversation = {**self.conversation, **facts}
 
     def _note_load(self, status: dict) -> None:
         self.load_status = status
@@ -1452,4 +1503,4 @@ class ProcessEngine:
                     self.log.close()
                 self.proc = None
                 self.ended = True
-                self.progress, self.last = None, {}
+                self.progress, self.last, self.conversation = None, {}, {}
