@@ -284,7 +284,8 @@ program::ExpertSpill ExpertTier::spill() const {
 
 namespace {
 
-// The second card's real path: launches over the homes of the layer it holds most of, one token at a time.
+// The second card's real path over the homes of the layer it holds most of, one token at a time: each share is armed
+// as a layer arms it with its head, the card waits at its word, and the round trip runs from the plan to the rows.
 class PeerPath final : public program::ProbePeerPath {
 public:
     PeerPath(core::PeerExperts& peer, int top_k) : peer_(peer), k_(top_k) {}
@@ -312,14 +313,19 @@ public:
         bool ok = true;
         for (int r = 0; r < rings() && ok; ++r) {
             before(r);
+            ok = peer_.arm(L_, (const float*) x_.p, 1, k, policy::peer_groups(1), err);
+            const auto ta = program::ProbeClock::now();
+            while (ok && program::us_since(ta) < kHeadUs) {
+            }
             const auto t0 = program::ProbeClock::now();
-            ok = peer_.launch_plain(0, L_, (const float*) x_.p, ids, k, kind, err) && peer_.finish(nullptr, err);
+            ok = ok && peer_.raise(0, ids, kind, err) && peer_.finish(nullptr, err);
             rt.push_back(program::us_since(t0));
         }
         return ok;
     }
 
 private:
+    static constexpr double kHeadUs = 100;   // about a head's time: the arm's launches are on the card by then
     core::PeerExperts& peer_;
     program::HostBuf x_;
     int k_, n_ = 1;

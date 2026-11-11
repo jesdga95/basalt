@@ -2,8 +2,9 @@
 // bit for bit on the real geometry, whatever the share's size and the rows it lands in.
 //
 //     build/ds41_peer_parity            the checks (passes with a note on one card)
-//     build/ds41_peer_parity --bench    the checks, then a microbench line per format and share size, alone and
-//                                       with a slot's copy in and out queued on the card just before it
+//     build/ds41_peer_parity --bench    the checks, then a microbench line per format and share size, from the plan's
+//                                       word to the rows, alone and with a slot's copy in and out queued on the card
+//                                       just before it
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -171,24 +172,53 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
     }
     kg::NativeExpertLayout Lp = L;
     Lp.swiglu_limit = kLimit;
+    // a share armed before its plan: the card waits until the plan is raised, as a layer's share waits while the head runs
+    const auto share = [&](int64_t n_tok, int64_t k, int64_t gy, const int32_t* ids, const int32_t* kind) {
+        if (!peer.arm(Lp, h_x, n_tok, k, gy, err)) return false;
+        const auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - t0 < std::chrono::microseconds(100)) {
+        }
+        return peer.raise(0, ids, kind, err) && peer.finish(nullptr, err);
+    };
     bool same = true;
-    for (int n = 1; n <= 6; ++n) {
-        int32_t ids[8] = {}, kind[8] = {};
-        for (int i = 0; i < n; ++i) {
-            ids[n - 1 - i] = (i * 3) % NB;   // landing in rows other than their order
-            kind[n - 1 - i] = 2;
+    for (int n = 1; n <= 6; ++n)
+        for (int64_t gy : {(int64_t) 1, (int64_t) 3, (int64_t) n}) {   // the groups side by side do not change a row
+            int32_t ids[8] = {}, kind[8] = {};
+            for (int i = 0; i < n; ++i) {
+                ids[n - 1 - i] = (i * 3) % NB;   // landing in rows other than their order
+                kind[n - 1 - i] = 2;
+            }
+            std::memset(h_rows, 0, (size_t) n * H * sizeof(float));
+            if (!share(1, n, gy, ids, kind)) {
+                std::printf("FAIL: share: %s\n", err.c_str());
+                ++g_fail;
+                return;
+            }
+            for (int i = 0; i < n; ++i)
+                same = same && !std::memcmp(h_rows + (size_t) (n - 1 - i) * H, main_rows.data() + (size_t) ((i * 3) % NB) * H, (size_t) H * sizeof(float));
         }
-        std::memset(h_rows, 0, (size_t) n * H * sizeof(float));
-        if (!peer.launch_plain(0, Lp, h_x, ids, n, kind, err) || !peer.finish(nullptr, err)) {
-            std::printf("FAIL: share: %s\n", err.c_str());
-            ++g_fail;
-            return;
-        }
-        for (int i = 0; i < n; ++i)
-            same = same && !std::memcmp(h_rows + (size_t) (n - 1 - i) * H, main_rows.data() + (size_t) ((i * 3) % NB) * H, (size_t) H * sizeof(float));
-    }
     check(same, "the second card's rows differ from the main card's");
-    std::printf("%-7s/%-7s second card vs main card, shares of 1..6: %s\n", nm(gu), nm(d), same ? "bitwise same" : "DIFFER");
+    std::printf("%-7s/%-7s second card vs main card, shares of 1..6, 1 / 3 / all groups side by side: %s\n", nm(gu), nm(d),
+                same ? "bitwise same" : "DIFFER");
+
+    // a window of three rows whose last row is the main card's activation: its entries give the main card's rows, in
+    // whatever entries of the window they sit; an entry of another row, or a share raised with nothing to do, writes
+    // no row
+    {
+        constexpr int kTok = 3, kK = 2;
+        const int32_t ids[kTok * kK] = {5, 1, 0, 7, 6, 2};
+        const int32_t kind[kTok * kK] = {0, 0, 0, 0, 2, 2};
+        for (int i = 0; i < kTok * kK * H; ++i) h_rows[i] = -1.0f;
+        bool ok = share(kTok, kK, 2, ids, kind);
+        ok = ok && !std::memcmp(h_rows + (size_t) 4 * H, main_rows.data() + (size_t) 6 * H, (size_t) H * sizeof(float)) &&
+             !std::memcmp(h_rows + (size_t) 5 * H, main_rows.data() + (size_t) 2 * H, (size_t) H * sizeof(float));
+        for (int i = 0; i < 4 * H; ++i) ok = ok && h_rows[i] == -1.0f;
+        for (int i = 0; i < kTok * kK * H; ++i) h_rows[i] = -1.0f;
+        ok = ok && share(kTok, kK, 2, ids, nullptr);
+        for (int i = 0; i < kTok * kK * H; ++i) ok = ok && h_rows[i] == -1.0f;
+        check(ok, "a window's entries, or a share with nothing to do");
+        std::printf("%-7s/%-7s a window's last row against the main card, an empty share: %s\n", nm(gu), nm(d), ok ? "bitwise same" : "WRONG");
+    }
 
     // an exchange in pieces as the tier queues them, landed by its mark: slot 0's bytes out, the next blob's in; then
     // slot 0 gets its own blob back the same way
@@ -216,25 +246,31 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
         uint8_t* out = nullptr;
         ck(cudaHostAlloc((void**) &out, L.bytes, cudaHostAllocPortable), "out");
         for (const bool copying : {false, true})
-            for (int n : {1, 2, 3, 4, 6}) {
-                int32_t ids[8] = {}, kind[8] = {};
-                for (int i = 0; i < n; ++i) { ids[i] = i; kind[i] = 2; }
-                std::vector<double> us;
-                for (int it = 0; it < 201; ++it) {
-                    // the last slot's bytes out and the same bytes back in: a slot swap's copies, the slot unchanged
-                    if (copying) peer.exchange_slot(NB - 1, out, stage, L.bytes);
-                    const auto t0 = std::chrono::steady_clock::now();
-                    peer.launch_plain(0, Lp, h_x, ids, n, kind, err);
-                    peer.finish(nullptr, err);
-                    if (it > 0) us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
-                    if (copying) peer.read_wait(err);
+            for (int n : {1, 2, 3, 4, 6})
+                for (int64_t gy : {(int64_t) n, (int64_t) 3}) {
+                    if (copying && gy != n) continue;
+                    int32_t ids[8] = {}, kind[8] = {};
+                    for (int i = 0; i < n; ++i) { ids[i] = i; kind[i] = 2; }
+                    std::vector<double> us;
+                    for (int it = 0; it < 201; ++it) {
+                        // the last slot's bytes out and the same bytes back in: a slot swap's copies, the slot unchanged
+                        if (copying) peer.exchange_slot(NB - 1, out, stage, L.bytes);
+                        peer.arm(Lp, h_x, 1, n, gy, err);
+                        const auto tw = std::chrono::steady_clock::now();
+                        while (std::chrono::steady_clock::now() - tw < std::chrono::microseconds(100)) {
+                        }
+                        const auto t0 = std::chrono::steady_clock::now();
+                        peer.raise(0, ids, kind, err);
+                        peer.finish(nullptr, err);
+                        if (it > 0) us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+                        if (copying) peer.read_wait(err);
+                    }
+                    std::sort(us.begin(), us.end());
+                    const double med = us[us.size() / 2];
+                    std::printf("bench second card %s/%s share of %d (%lld side by side)%s, plan to rows in host memory: %.1f us/call (p90 %.1f), %.1f MB read, %.0f GB/s (weights only)\n",
+                                nm(gu), nm(d), n, (long long) gy, copying ? " behind a slot copy" : "", med, us[us.size() * 9 / 10],
+                                (double) n * (double) L.bytes / 1e6, (double) n * (double) L.bytes / (med * 1e3));
                 }
-                std::sort(us.begin(), us.end());
-                const double med = us[us.size() / 2];
-                std::printf("bench second card %s/%s share of %d%s, launch to rows in host memory: %.1f us/call (p90 %.1f), %.1f MB read, %.0f GB/s (weights only)\n",
-                            nm(gu), nm(d), n, copying ? " behind a slot copy" : "", med, us[us.size() * 9 / 10],
-                            (double) n * (double) L.bytes / 1e6, (double) n * (double) L.bytes / (med * 1e3));
-            }
         cudaFreeHost(out);
     }
     cudaFreeHost(stage);
@@ -254,11 +290,13 @@ int main(int argc, char** argv) {
     }
     float* h_x = nullptr;
     float* h_rows = nullptr;
-    ck(cudaHostAlloc((void**) &h_x, H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "x");
+    // three rows: the main card's activation, another, and the first again (a window's rows)
+    ck(cudaHostAlloc((void**) &h_x, 3 * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "x");
     ck(cudaHostAlloc((void**) &h_rows, 8 * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "rows");
     std::mt19937 rng(9);
     std::normal_distribution<float> nd(0.f, 1.f);
-    for (int i = 0; i < H; ++i) h_x[i] = nd(rng);
+    for (int i = 0; i < 2 * H; ++i) h_x[i] = nd(rng);
+    std::memcpy(h_x + 2 * H, h_x, H * sizeof(float));
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     // the format pairs a GSQ-RCO pack mixes, and NVFP4

@@ -1,5 +1,6 @@
 // src/models/deepseek41/ops_kernels.cpp - the layer ops built from the kernel groups' entry points: attention
 // (window ring, compressor, indexer, query path, sparse MQA, grouped output) with per-layer state owned here.
+#include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/log.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -59,6 +60,16 @@ struct JoinWord {
         std::atomic_thread_fence(std::memory_order_release);   // the rows before the word
         *(volatile uint32_t*) word = value;
         armed = false;
+    }
+};
+
+// Raises an armed second-card share on every way out before its plan, so the card never waits for good (the share
+// then has nothing to do).
+struct PeerArm {
+    core::PeerExperts* peer = nullptr;
+    ~PeerArm() {
+        std::string e;
+        if (peer) peer->raise(0, nullptr, nullptr, e);
     }
 };
 
@@ -716,6 +727,15 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
+        // the second card's share goes out while the head runs: its kernels wait on the card for the plan
+        core::PeerExperts* peer = tier_->peer();
+        PeerArm armed;
+        if (peer) {
+            kernels::NativeExpertLayout limited = L;
+            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
+            if (!peer->arm(limited, h_x_, T, K, policy::peer_groups(T), err)) return false;
+            armed.peer = peer;
+        }
         tier_->pump(il, 2 + T);   // what this layer's head leaves the bus of the promotions queued before it
         await_ids(st, T * K);
         int32_t uniq[ExpertTier::kMaxK];
@@ -740,7 +760,13 @@ public:
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
-        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
+        // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land
+        if (peer) {
+            int32_t kind[ExpertTier::kMaxK] = {};
+            for (int r = 0; r < T * K; ++r) kind[r] = lk.peer[uidx[r]] ? 2 : 0;
+            if (!peer->raise(il, h_ids_, kind, err)) return false;
+        }
+        // then the CPU's share: it takes longest, and the pool's workers run it while the main card's share launches
         bool cpu = false, on_peer = false;
         for (int i = 0; i < nu; ++i) {
             cpu = cpu || (!lk.dev[i] && !lk.peer[i]);
@@ -751,16 +777,6 @@ public:
         if (cpu) {
             tier_->start_cpu_window(il, h_x_, lk, use, h_rows_);
             join.tier = tier_.get();
-        }
-
-        // the second card's share first: its rows are the last of the two cards' to land
-        core::PeerExperts* peer = tier_->peer();
-        if (peer) {
-            int32_t kind[ExpertTier::kMaxK] = {};
-            for (int r = 0; r < T * K; ++r) kind[r] = lk.peer[uidx[r]] ? 2 : 0;
-            kernels::NativeExpertLayout limited = L;
-            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
-            if (!peer->launch_window(il, limited, h_x_, h_ids_, T, K, kind, err)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds; the fetched ones in a second plan, once their copies landed
@@ -806,7 +822,7 @@ public:
             jw.word = h_join_;
             jw.value = ++join_seq_;
             jw.armed = true;
-            wait_word(d_join_, jw.value, stream);
+            kernels::wait_word(d_join_, jw.value, stream);
         }
         weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in their rows
@@ -856,13 +872,28 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
+        // the second card's share goes out while the head runs: its kernels wait on the card for the plan
+        core::PeerExperts* peer = tier_->peer();
+        PeerArm armed;
+        if (peer) {
+            kernels::NativeExpertLayout limited = L;
+            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
+            if (!peer->arm(limited, h_x_, 1, K, policy::peer_groups(1), err)) return false;
+            armed.peer = peer;
+        }
         tier_->pump(il, 3);
         if (shared_out) await_ids(st, K);
         else cudaStreamSynchronize(st);
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
-        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
+        // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land
+        if (peer) {
+            int32_t kind[ExpertTier::kMaxK] = {};
+            for (int k = 0; k < K; ++k) kind[k] = lk.peer[k] ? 2 : 0;
+            if (!peer->raise(il, lk.experts, kind, err)) return false;
+        }
+        // then the CPU's share: it takes longest, and the pool's workers run it while the main card's share launches
         bool cpu = false, on_peer = false;
         for (int k = 0; k < K; ++k) {
             cpu = cpu || (!lk.dev[k] && !lk.peer[k]);
@@ -873,16 +904,6 @@ public:
         if (cpu) {
             tier_->start_cpu(il, h_x_, lk, h_rows_);
             join.tier = tier_.get();
-        }
-
-        // the second card's share first: its rows are the last of the two cards' to land
-        core::PeerExperts* peer = tier_->peer();
-        if (peer) {
-            int32_t kind[ExpertTier::kMaxK] = {};
-            for (int k = 0; k < K; ++k) kind[k] = lk.peer[k] ? 2 : 0;
-            kernels::NativeExpertLayout limited = L;
-            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
-            if (!peer->launch_plain(il, limited, h_x_, lk.experts, K, kind, err)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index; the
@@ -950,7 +971,7 @@ public:
             jw.word = h_join_;
             jw.value = ++join_seq_;
             jw.armed = true;
-            wait_word(d_join_, jw.value, stream);
+            kernels::wait_word(d_join_, jw.value, stream);
         }
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in the router index's row
