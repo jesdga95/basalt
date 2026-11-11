@@ -309,10 +309,8 @@ public:
     void begin_token(int64_t, int n_tokens) override {
         if (tier_) tier_->begin_token(n_tokens);
     }
-    void end_window(bool all) override {
-        // the pieces that land while the window's output and the drafter's inputs are on their way
-        constexpr int kEndPieces = 8;
-        if (tier_) tier_->pump(-1, all ? ExpertTier::kAllPieces : kEndPieces);
+    void end_window() override {
+        if (tier_) tier_->pump(-1, ExpertTier::kAllPieces);
     }
 
     bool attention_batch(int il, int64_t pos0, int n_tokens, const int32_t*, const float* x, float* out, int,
