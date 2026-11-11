@@ -56,11 +56,14 @@ ExpertTier::~ExpertTier() {
         peer_->read_wait(e);
     }
     if (copy_stream_) cudaStreamSynchronize(copy_stream_);
+    if (out_stream_) cudaStreamSynchronize(out_stream_);
     if (fetch_stream_) cudaStreamSynchronize(fetch_stream_);
     for (cudaEvent_t e : events_) cudaEventDestroy(e);
+    for (cudaEvent_t e : out_events_) cudaEventDestroy(e);
     if (fetch_ev_) cudaEventDestroy(fetch_ev_);
     if (gap_ev_) cudaEventDestroy(gap_ev_);
     if (copy_stream_) cudaStreamDestroy(copy_stream_);
+    if (out_stream_) cudaStreamDestroy(out_stream_);
     if (fetch_stream_) cudaStreamDestroy(fetch_stream_);
     for (size_t l = 0; l < ram_.size(); ++l) {
         if (ram_[l] == nullptr) continue;
@@ -186,17 +189,23 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     if (cudaEventCreateWithFlags(&fetch_ev_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&gap_ev_, cudaEventDisableTiming) != cudaSuccess ||
         cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&out_stream_, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithPriority(&fetch_stream_, cudaStreamNonBlocking, hi_prio) != cudaSuccess) {
         err = "deepseek41: cannot create the promotion stream";
         return false;
     }
     for (size_t i = 0; i < kEvents; ++i) {
-        cudaEvent_t e;
+        cudaEvent_t e, o;
         if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
             err = "deepseek41: cannot create a promotion event";
             return false;
         }
         events_.push_back(e);
+        if (cudaEventCreateWithFlags(&o, cudaEventDisableTiming) != cudaSuccess) {
+            err = "deepseek41: cannot create a promotion event";
+            return false;
+        }
+        out_events_.push_back(o);
         free_events_.push_back((int) i);
     }
 
@@ -600,6 +609,7 @@ void ExpertTier::land_all() {
 void ExpertTier::settle() {
     land_all();
     cudaStreamSynchronize(copy_stream_);
+    cudaStreamSynchronize(out_stream_);
     cudaStreamSynchronize(fetch_stream_);
 }
 
@@ -911,6 +921,7 @@ void ExpertTier::issue_peer(int layer, int pieces) {
 void ExpertTier::issue(int layer, int pieces) {
     if (gap_marked_) {
         cudaStreamWaitEvent(copy_stream_, gap_ev_, 0);
+        cudaStreamWaitEvent(out_stream_, gap_ev_, 0);
         if (!peer_moves_.empty()) peer_->copies_after(gap_ev_);
     }
     gap_marked_ = false;
@@ -918,14 +929,25 @@ void ExpertTier::issue(int layer, int pieces) {
     if (!peer_moves_.empty()) issue_peer(layer, pieces == kAllPieces ? pieces : std::min(pieces, policy::kPeerGapPieces));
     if (queue_.empty()) return;
     const uint64_t P = policy::kPieceBytes;
-    // the home's bytes out first, then the promotion's in: the stream keeps the order
-    const auto piece = [&](Queued& q) {
-        if (q.home_to && q.home_off < q.bytes) {
+    // A copy engine takes copies in the order they were queued, whatever their stream: a copy queued later (a layer's
+    // bus fetch, a window's rows, the drafter's result) would wait for every piece queued before it. A small operation
+    // between two pieces lets it go first, after one piece at most. The home's bytes go out on a stream of their own, so
+    // the pieces in do not wait for them, nor they for the copies in.
+    const auto out = [&](Queued& q) {   // every piece out of the home q replaces, and the event behind them
+        if (!q.home_to || q.home_off >= q.bytes) return;
+        for (; q.home_off < q.bytes; q.home_off += P) {
             cudaMemcpyAsync(q.home_to + q.home_off, q.dst + q.home_off, std::min(P, q.bytes - q.home_off), cudaMemcpyDeviceToHost,
-                            copy_stream_);
-            q.home_off += P;
-            return;
+                            out_stream_);
+            cudaMemsetAsync(q.dst + q.home_off, 0, 4, out_stream_);   // out already; the pieces in overwrite it
         }
+        cudaEventRecord(out_events_[(size_t) q.p.event], out_stream_);
+    };
+    const auto piece = [&](Queued& q) {   // one piece in, the first once the home's bytes are out
+        if (q.home_to && q.off == 0) {
+            out(q);
+            cudaStreamWaitEvent(copy_stream_, out_events_[(size_t) q.p.event], 0);
+        }
+        cudaMemsetAsync(q.dst + q.off, 0, 4, copy_stream_);   // the piece overwrites it
         cudaMemcpyAsync(q.dst + q.off, q.src + q.off, std::min(P, q.bytes - q.off), cudaMemcpyHostToDevice, copy_stream_);
         q.off += P;
         if (q.off >= q.bytes) {
@@ -937,8 +959,15 @@ void ExpertTier::issue(int layer, int pieces) {
     for (Queued& q : queue_)
         if (q.p.layer == layer)
             while (q.off < q.bytes) piece(q);
-    for (size_t i = 0; i < queue_.size() && pieces > 0; ++i)
+    for (size_t i = 0; i < queue_.size() && pieces > 0; ++i) {
+        if (queue_[i].off < queue_[i].bytes)   // the next home goes out while this promotion comes in
+            for (size_t j = i + 1; j < queue_.size(); ++j)
+                if (queue_[j].home_to && queue_[j].off == 0) {
+                    out(queue_[j]);
+                    break;
+                }
         for (Queued& q = queue_[i]; q.off < q.bytes && pieces > 0; --pieces) piece(q);
+    }
     queue_.erase(std::remove_if(queue_.begin(), queue_.end(), [](const Queued& q) { return q.off >= q.bytes; }), queue_.end());
 }
 

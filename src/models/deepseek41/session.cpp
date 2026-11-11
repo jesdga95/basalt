@@ -203,7 +203,7 @@ public:
         if (!flush_features(pos, err) || !drafter_->draft_begin(dwin_, anchor, pos, std::clamp(n, 1, std::min(max_window() - 1, kDsparkBlock)), err))
             return {model::Status::Error, err};
         ops_->commit_window(pos, stream_);   // the compressor commits the drafter does not read run beside it
-        ops_->end_window(true);   // the copies queued behind the drafter's inputs run while it drafts
+        ops_->end_window();   // what is still queued runs while it drafts
         prepare_row0(anchor, pos);
         return {};
     }
@@ -1056,7 +1056,7 @@ private:
         }
         if (tail_pending && !run_tail(g_.n_layers - 1, pos, T)) return false;
         if (!want_out && !next && !logits_out) {
-            ops_->end_window(false);
+            ops_->end_window();
             DS_CUDA(cudaStreamSynchronize(stream_));
             return true;
         }
@@ -1068,7 +1068,7 @@ private:
         dump("result_norm", -1, pos, normed_, n * sizeof(float));
         const DevTensor* head = m_.tensor("output.weight");
         dense_f32(*head, normed_, q8_, logits_, (int) n, g_.n_vocab, T, st);
-        ops_->end_window(false);
+        ops_->end_window();
         if (T > 1) {
             if (draw_kernel_) kernels::sample_tokens(logits_, T, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, am_dev_, st);
             else argmax_rows(logits_, T, g_.n_vocab, am_dev_, am_ws_, st);
