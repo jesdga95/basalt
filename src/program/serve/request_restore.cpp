@@ -171,6 +171,10 @@ Flow Request::restore() {
     on_disk = runtime_.disk.enabled() ? runtime_.disk.best(ids32.data(), ids32.size(), runtime_.req_imgs, want_cvec)
                        : basalt::core::ConversationStore::Match{};
     from_disk = on_disk.tokens > std::max({resume, slot_tokens, parked.tokens});
+    basalt::log::info("basalt serve", "restore lookup: prompt %lld tokens, live %lld, RAM match %lld of %zu parked, disk match %lld, "
+                      "slot %lld -> %s", (long long) n, (long long) resume, (long long) parked.tokens,
+                      runtime_.conversations->size(), (long long) on_disk.tokens, (long long) slot_tokens,
+                      from_disk ? "disk" : parked.tokens > std::max(resume, slot_tokens) ? "ram" : slot_tokens > resume ? "slot" : "live/none");
     if (!from_disk && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(runtime_.conversations->take(parked.index));
     // RAM below the guard's floor (another program's peak): shed (after the conversation this request
     // continues is taken out of the cache), then let it come back before the request starts; a STOP ends the

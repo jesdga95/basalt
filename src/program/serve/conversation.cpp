@@ -96,7 +96,12 @@ bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey
 bool Runtime::store_conversation(basalt::core::SavedConversation& image) {
     if (o.host_pool_bytes == 0) return disk.put(std::move(image), kDiskQueueCap);
     if (!disk.enabled()) { err = "the host pool needs its disk conversation cache"; return false; }
+    const size_t tokens = image.live.ids.size(), bytes = image.bytes();
+    const auto w0 = Clock::now();
     if (!disk.put_sync(image)) { err = "a host-pool conversation could not be written to disk"; return false; }
+    // a synchronous write on the request's path: its size and time, to tell a slow first token from a miss
+    basalt::log::info("basalt serve", "conversation cache: %zu tokens (%zu MiB) written to disk in %.0f ms", tokens,
+                      bytes >> 20, std::chrono::duration<double, std::milli>(Clock::now() - w0).count());
     return true;
 }
 
