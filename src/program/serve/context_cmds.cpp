@@ -487,6 +487,14 @@ Flow Runtime::context_dispatch() {
         for (const auto& img : imgs) inputs.push_back({ctx::InputKind::image, img.start, image_input_digest(img.hash)});
         ctx::Digest prefix_hash{};
         if (!ctx::prefix_hash(ids, inputs, meta.cvec == 1, prefix_hash, error)) { reply_err(error); return Flow::next; }
+        // The session may still hold a live conversation, and this restore overwrites its cells: park it first
+        // (unparked it would be lost) and with it the K/V retained for it, which the restored conversation
+        // replaces below. A park that cannot run leaves the session untouched and the caller replays.
+        if (!park_current(0, 0)) {
+            reply_err("restore: parking the outgoing conversation failed: " + err);
+            err.clear();
+            return Flow::next;
+        }
         ctx::SnapshotStore store(o.context_store_dir + "/" + id, files);
         SavedConversation image;
         image.kv.resize(meta.groups.size());
@@ -519,6 +527,10 @@ Flow Runtime::context_dispatch() {
         checks.clear();
         cvec_cached = meta.cvec == 1;
         live_ok = true;
+        // The image's buffers are this conversation's authoritative K/V: retain them for its next park, exactly
+        // as the conversation cache's restore does. retain() replaces whatever was held for the conversation
+        // that gave way, so no stale prefix can ride into this conversation's image.
+        conversations->retain(std::move(image.kv), int64_t(live.size()), {}, rsp);
         std::printf("CONTEXT_OK RESTORE %s %llu %zu\n", id.c_str(), generation, live.size());
         std::fflush(stdout);
         return Flow::next;
