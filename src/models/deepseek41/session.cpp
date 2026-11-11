@@ -108,6 +108,7 @@ public:
         erows_.resize(eids_.size());
         eraw_.assign(en.layers.size(), std::vector<uint8_t>(eids_.size() * en.row_bytes));
         eread_.resize(en.layers.size());
+        efirst_ = (size_t) (std::min_element(en.layers.begin(), en.layers.end()) - en.layers.begin());
         bool ok = buf(x_, 4 * n * W) && buf(x2_, 4 * n * W) && buf(cur_, n * W) && buf(normed_, n * W) &&
                   buf(attn_out_, n * W) && buf(moe_out_, n * W) && buf(sh_out_, n * W) && buf(ffn_sum_, n * W) &&
                   buf(coef_a_, kHcCoef * W) && buf(coef_f_[0], kHcCoef * W) && buf(coef_f_[1], kHcCoef * W) &&
@@ -719,14 +720,16 @@ private:
         }
     }
 
-    // Asks for every Engram layer's rows of the `n` tokens at window rows from.. (positions pos..) with read `slot`
-    // (0: row 0, from prepare_row0; 1: the window's others).
-    void engram_issue(const int32_t* tokens, int n, int64_t pos, int from, int slot) {
+    // Asks for the rows of the `n` tokens at window rows from.. (positions pos..) with read `slot` (0: row 0, from
+    // prepare_row0; 1: the window's others) on the first Engram layer (`first`), whose rows are read soonest, or on the
+    // others.
+    void engram_issue(const int32_t* tokens, int n, int64_t pos, int from, int slot, bool first) {
         const EngramInfo& en = m_.pack().engram;
         const size_t cols = (size_t) en.hash.n_cols();
         int32_t prev[8] = {0};
         engram_prev(pos, prev);
         for (size_t k = 0; k < en.layers.size(); ++k) {
+            if ((k == efirst_) != first) continue;
             ngram::PleReader::Ticket& t = eread_[k][(size_t) slot];
             finish_read(t);   // a failed window's read lands before its rows are asked for again
             engram_hash(en.hash, (int) k, tokens, n, pos, pos == 0 ? nullptr : prev, eids_.data());
@@ -752,7 +755,10 @@ private:
         std::string e;
         if (!m_.embedding_row(token, h_emb4_, e)) return;   // the window reads it again and reports why
         for (int s = 1; s < kHcMult; ++s) std::copy(h_emb4_, h_emb4_ + n, h_emb4_ + (size_t) s * n);
-        if (!m_.pack().engram.layers.empty()) engram_issue(&token, 1, pos, 0, 0);
+        if (!m_.pack().engram.layers.empty()) {
+            engram_issue(&token, 1, pos, 0, 0, true);
+            engram_issue(&token, 1, pos, 0, 0, false);
+        }
         engram_prev(pos, row0_prev_);
         row0_token_ = token;
         row0_pos_ = pos;
@@ -960,11 +966,15 @@ private:
         DS_CUDA(cudaMemcpyAsync(x_, h_emb4_, n * kHcMult * T * sizeof(float), cudaMemcpyHostToDevice, stream_));
         dump("hc_init", -1, pos, x_, 4 * n * sizeof(float));
 
-        // Engram rows for every Engram layer of the rows not asked for with the drafts, requested now so the SSD reads
-        // overlap layer 0
+        // Engram rows of the window's rows not asked for with the drafts, requested now so the SSD reads overlap layer 0:
+        // the first Engram layer's before layer 0's head; the others' once it is launched, since a request right after
+        // another waits while the reader hands out that one's reads.
         const EngramInfo& en = m_.pack().engram;
         const int n_cols = en.hash.n_cols();
-        if (!en.layers.empty() && from < T) engram_issue(tokens + from, T - from, pos + from, from, 1);
+        const auto engram_ask = [&](bool first) {
+            if (!en.layers.empty() && from < T) engram_issue(tokens + from, T - from, pos + from, from, 1, first);
+        };
+        engram_ask(true);
 
         const int32_t token = tokens[0];
         bool tail_pending = false;
@@ -1012,15 +1022,17 @@ private:
                 dump("engram_out", il, pos, x_, 4 * n * sizeof(float));
             }
 
-            // the tier's bookkeeping (promotions that land) runs while the first head does
+            // the later Engram layers' reads and the tier's bookkeeping (promotions that land) run while the first head does
             if (!graphs) {
                 if (!enqueue_head(il, pos, token, st, false)) return false;
+                if (il == 0) engram_ask(false);
                 if (il == 0) ops_->begin_token(pos, T);
                 if (!ops_->routed_experts_staged(il, normed_, ids_, rw_, moe_out_, st, err_)) return false;
                 if (!enqueue_tail(il, pos, st)) return false;
             } else {
                 if (il == feat_first_) drafter_->after_staging(stream_);   // the last staging has read its rows
                 if (!run_head(il, pos, token, tail_pending, T)) return false;
+                if (il == 0) engram_ask(false);
                 if (il == 0) ops_->begin_token(pos, T);
                 tail_pending = true;
                 if (il == feat_last_) {   // every target row of the window is in dfeat_: their latents are made beside it
@@ -1131,11 +1143,12 @@ private:
     cudaEvent_t eng_go_ = nullptr;
     std::vector<cudaEvent_t> eng_ev_;
     // per Engram layer: a window's rows as read from the table ([row][column]) and the two reads that fill them
-    // (engram_issue); one read's table rows
+    // (engram_issue); one read's table rows; the slot of the first Engram layer
     std::vector<std::vector<uint8_t>> eraw_;
     std::vector<std::array<ngram::PleReader::Ticket, 2>> eread_;
     std::vector<int32_t> eids_;
     std::vector<uint32_t> erows_;
+    size_t efirst_ = 0;
     // row 0 of the next window, made while the drafter runs (prepare_row0): its token, position and n-gram tokens
     bool row0_ = false;
     int32_t row0_token_ = 0;
