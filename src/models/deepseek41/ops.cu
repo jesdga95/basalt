@@ -1,7 +1,6 @@
 // src/models/deepseek41/ops.cu - small device helpers for the DeepSeek layer loop.
 #include "models/deepseek41/ops.hpp"
 
-#include "basalt/kernels/dp4a.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -10,11 +9,6 @@
 
 namespace basalt::models::deepseek41 {
 namespace {
-
-__global__ void k_wait_word(const volatile uint32_t* word, uint32_t value) {
-    while (*word != value) spin_pause();
-    __threadfence_system();
-}
 
 __global__ void k_add(const float* a, const float* b, float* out, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -156,10 +150,6 @@ void weighted_sum_window(const WindowRowPtrs& rows, const float* w, int n_tokens
 
 void argmax_rows(const float* x, int n_rows, int n, int32_t* out, void* ws, void* stream) {
     for (int r = 0; r < n_rows; ++r) argmax_index(x + (size_t) r * n, n, out + r, ws, stream);
-}
-
-void wait_word(const uint32_t* word, uint32_t value, void* stream) {
-    k_wait_word<<<1, 1, 0, (cudaStream_t) stream>>>(word, value);
 }
 
 void copy_words(const void* src, void* dst, int n_words, void* stream) {

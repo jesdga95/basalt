@@ -67,6 +67,10 @@ inline int bus_count(int pinned, int file) {
     return n < 0 ? 0 : n > pinned ? pinned : n;
 }
 
+/// The second card's share is queued before its plan, so its grouped kernels run this many groups side by side and stride
+/// over the rest: about the experts a window of `n_tok` rows sends it.
+inline int64_t peer_groups(int n_tok) { return 2 * (int64_t) n_tok + 1; }
+
 /// Copies of at most kPieceBytes needed for `bytes`.
 inline int pieces(uint64_t bytes) { return (int) ((bytes + kPieceBytes - 1) / kPieceBytes); }
 

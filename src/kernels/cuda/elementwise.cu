@@ -196,6 +196,16 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) 
     check_launch("doorbell_wait");
 }
 
+__global__ void wait_word_kernel(const volatile uint32_t* word, uint32_t value) {
+    while (*word != value) spin_pause();
+    __threadfence_system();
+}
+
+void wait_word(const uint32_t* word, uint32_t value, void* stream) {
+    wait_word_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(word, value);
+    check_launch("wait_word");
+}
+
 __global__ void copy_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t n4) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
         const float4 v = const_cast<const float4*>(src)[i];
@@ -226,20 +236,23 @@ __global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const vol
 }
 namespace {
 __global__ void scatter_rows_kernel(const float4* __restrict__ src, float4* dst, const int32_t* __restrict__ rows,
-                                    int64_t w4) {
+                                    int64_t w4, const int32_t* __restrict__ count) {
     const int64_t r = blockIdx.x;
+    if (count && r >= *count) return;
     const float4* s = src + r * w4;
     float4* d = dst + (int64_t) rows[r] * w4;
     for (int64_t i = threadIdx.x; i < w4; i += blockDim.x) d[i] = s[i];
 }
 }  // namespace
-void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream) {
+void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream,
+                      const int32_t* count) {
     if (n <= 0) return;
     if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
         basalt::log::error("basalt", "scatter_rows_f32: width must be a multiple of 4 and both pointers 16-byte aligned");
         std::exit(1);
     }
-    scatter_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4);
+    scatter_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4,
+                                                                         count);
 }
 void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
                            const int32_t* count, void* stream) {

@@ -15,9 +15,6 @@ void add_inplace(float* out, const float* a, int n, void* stream);
 /// out[i] = a[i] + b[i].
 void add(const float* a, const float* b, float* out, int n, void* stream);
 
-/// Holds the stream until *word (mapped host memory the host writes) equals `value`.
-void wait_word(const uint32_t* word, uint32_t value, void* stream);
-
 /// out[i] = silu(min(gate[i], limit)) * clamp(up[i], -limit, limit).
 void swiglu_clamped(const float* gate, const float* up, int n, float limit, float* out, void* stream);
 

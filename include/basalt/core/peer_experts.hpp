@@ -75,13 +75,16 @@ public:
     /// A mark behind the pieces queued so far; `read_until` waits until they landed.
     int64_t mark_in();
     bool read_until(int64_t mark, std::string& err);
-    /// One token's share over the pinned activation `x`, in the layout given; the rows land in open_plain's rows.
-    bool launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t k,
-                      const int32_t* kind, std::string& err);
-    /// The share of a window of `n_tok` rows over the pinned activations `x` [n_tok][n_embd]: entry t * k + j computes
-    /// ids[t * k + j] over row t where kind says so; the rows land at that entry of open_plain's rows.
-    bool launch_window(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
-                       int64_t k, const int32_t* kind, std::string& err);
+    /// open_plain: a share queued on the card before its plan is known, so it starts when the plan does, not a launch
+    /// later.  `arm` queues a wait for a word in mapped memory and behind it the quantize of the pinned activations `x`
+    /// [n_tok][n_embd] with the plan's copy to the card, the grouped kernels (`L`) over at most n_tok * k entries,
+    /// `grid_groups` of them side by side, and the scatter of the rows into open_plain's rows, each reading the plan's
+    /// counts on the card.  `raise` writes the plan, entry t * k + j computing ids[t * k + j] of `layer` over row t
+    /// where kind says so (kind null: nothing to do), then the word.  An armed share is raised before the card is
+    /// waited for (finish, close).
+    bool arm(const kernels::NativeExpertLayout& L, const float* x, int64_t n_tok, int64_t k, int64_t grid_groups,
+             std::string& err);
+    bool raise(int64_t layer, const int32_t* ids, const int32_t* kind, std::string& err);
     /// A slot's bytes for an expert of `layer`.
     static uint64_t slot_bytes(int64_t layer);
     void close();
@@ -206,8 +209,21 @@ private:
     int64_t n_embd_ = 0;                              ///< activation width of the launched shares
     float* rows_map_ = nullptr;                       ///< open_plain's rows as this card addresses them
     void* meta_map_ = nullptr;                        ///< open_plain: the plan staging as this card addresses it
-    const float* x_host_ = nullptr;                   ///< open_plain: the last activations launched, and as this card
+    const float* x_host_ = nullptr;                   ///< open_plain: the last activations armed, and as this card
     const float* x_map_ = nullptr;                    ///< addresses them
+    uint32_t* go_ = nullptr;                          ///< open_plain: the word an armed share waits for (mapped)
+    uint32_t* go_map_ = nullptr;                      ///< ... as this card addresses it
+    uint32_t go_seq_ = 0;                             ///< the value the last share was armed with
+    bool armed_ = false;                              ///< a share waits for its plan
+    bool queued_ = false;                             ///< a share was armed since the stream was last seen idle
+    int64_t armed_tok_ = 0, armed_k_ = 0;
+    /// The layouts whose kernels have run on this card: the first share of a layout runs them with an empty plan first
+    std::vector<kernels::NativeExpertLayout> loaded_;
+    /// Spins until the stream has run what was queued.
+    bool idle(std::string& err);
+    /// The plan of a share in h_meta_ (and row_of_): its groups and entries, or false when an entry is not resident.
+    bool plan(int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind, int& groups, int& rows,
+              std::string& err);
     bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
                        int64_t k, const int32_t* kind, std::string& err, float* out);
 };
