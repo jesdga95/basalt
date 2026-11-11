@@ -1816,6 +1816,114 @@
       "draft_len_struct": 6.9,
       "draft_len_prose": 1.7,
       "engine_args": "--gpu 0,1 --max-context 66661 --kv int8"
+    },
+    {
+      "submitter": "murez",
+      "date": "2026-11-11",
+      "commit": "cbb8ab435b",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 14.5
+        }
+      ],
+      "ram_gib": 504,
+      "cpu": "AMD EPYC 7K62, 48 cores",
+      "ram_gbps": 115.2,
+      "os": "Linux",
+      "quant": "IQ4_XS",
+      "kv": "int8",
+      "prefill_16k_tps": 1933.1,
+      "prefill_64k_tps": 2176.0,
+      "decode_tps": 128.1,
+      "decode_conv_tps": 77.3,
+      "decode_struct_tps": 153.6,
+      "decode_prose_tps": 82.0,
+      "accept_conv_pct": 68.5,
+      "accept_struct_pct": 94.7,
+      "accept_prose_pct": 65.6,
+      "draft_len_conv": 1.6,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+      "notes": "Proxmox unprivileged LXC; 384 GiB container RAM limit (ram_gib is host-visible); 48 CPUs; swap disabled; no expert SSD spill."
+    },
+    {
+      "submitter": "murez",
+      "date": "2026-11-11",
+      "commit": "cbb8ab435b",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 14.5
+        }
+      ],
+      "ram_gib": 504,
+      "cpu": "AMD EPYC 7K62, 48 cores",
+      "ram_gbps": 123.4,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 2598.4,
+      "prefill_64k_tps": 2686.0,
+      "decode_tps": 107.4,
+      "decode_conv_tps": 67.0,
+      "decode_struct_tps": 128.5,
+      "decode_prose_tps": 72.3,
+      "accept_conv_pct": 70.3,
+      "accept_struct_pct": 98.6,
+      "accept_prose_pct": 69.5,
+      "draft_len_conv": 2.2,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+      "notes": "Proxmox unprivileged LXC; 384 GiB container RAM limit (ram_gib is host-visible); 48 CPUs; swap disabled; no expert SSD spill. NVFP4-DQ6_K pack."
+    },
+    {
+      "submitter": "murez",
+      "date": "2026-11-11",
+      "commit": "cbb8ab435b",
+      "preset": "community-1",
+      "model": "DeepSeek-V4.1-Flash",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 14.5
+        }
+      ],
+      "ram_gib": 504,
+      "cpu": "AMD EPYC 7K62, 48 cores",
+      "ram_gbps": 114.8,
+      "os": "Linux",
+      "quant": "IQ1_M",
+      "kv": "fp8+fp4",
+      "prefill_16k_tps": 558.3,
+      "prefill_64k_tps": 673.2,
+      "decode_tps": 26.5,
+      "decode_conv_tps": 21.9,
+      "decode_struct_tps": 29.8,
+      "decode_prose_tps": 18.5,
+      "accept_conv_pct": 65.8,
+      "accept_struct_pct": 98.8,
+      "accept_prose_pct": 61.9,
+      "draft_len_conv": 2.0,
+      "draft_len_struct": 4.5,
+      "draft_len_prose": 1.0,
+      "engine_args": "--gpu 0 --max-context 61709 --kv fp8",
+      "notes": "Proxmox unprivileged LXC; 384 GiB container RAM limit (ram_gib is host-visible); 48 CPUs; swap disabled; no expert SSD spill."
     }
   ]
 }
