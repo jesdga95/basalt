@@ -7,6 +7,7 @@
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/memory.hpp"
 #include "models/deepseek41/attn_batch.hpp"
 #include "models/deepseek41/context_policy.hpp"
 #include "models/deepseek41/session.hpp"
@@ -202,6 +203,10 @@ bool DsModel::embedding_row(int32_t token, float* out, std::string& err) const {
         for (uint64_t b = 0; b < n_embd / 256; ++b) dequantize_q6_K(row.data() + b * 210, out + b * 256);
     }
     return true;
+}
+
+void DsModel::warm_token_table() const {
+    if (const TensorRef* t = pack_.find("token_embd.weight")) platform::advise_willneed(embd_fd_, t->offset, t->bytes);
 }
 
 bool DsModel::open_mmproj(vision::Mmproj& mp, std::string& err) const {

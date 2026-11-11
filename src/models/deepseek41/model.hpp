@@ -57,6 +57,9 @@ public:
     const DevTensor* tensor(int layer, const char* suffix) const { return tensor("blk." + std::to_string(layer) + "." + suffix); }
     /// One token-embedding row, dequantised into `out` (n_embd floats).
     bool embedding_row(int32_t token, float* out, std::string& err) const;
+    /// Asks the OS file cache for the whole token embedding: a window reads a row per token, the drafter's anchor
+    /// first, and a row the cache lacks waits for the disk.
+    void warm_token_table() const;
     ngram::PleReader& engram_reader() const { return *engram_; }
     int experts_fd() const { return experts_fd_; }
     const std::string& path() const { return path_; }
