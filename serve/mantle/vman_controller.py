@@ -4,11 +4,13 @@ Nothing here touches containers directly and `--force` is never passed. The subp
 controller is testable without a GPU; the real runner is used only when a deployment constructs it on purpose."""
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 from typing import Callable, Mapping, Optional, Sequence
 
 VMAN = "/data/tools/bin/vman"
+STATE_FILE = "/data/tools/sre/vram_current_mode.json"   # what `vman mode` writes atomically after a verified switch
 PROFILES = frozenset({"strata", "llm", "image", "video", "voice", "quant", "off"})
 
 Runner = Callable[[Sequence[str], float], "tuple[int, str]"]
@@ -16,6 +18,17 @@ Runner = Callable[[Sequence[str], float], "tuple[int, str]"]
 
 class VmanError(RuntimeError):
     pass
+
+
+def vman_state_mode(path: str = STATE_FILE) -> Optional[str]:
+    """The mode vman last switched to, or None when the state file is missing or unreadable. vman itself assumes
+    `llm` then; a controller must not switch (or restore) on a guess, so it gets None and refuses."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            mode = json.load(f).get("mode")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return mode if isinstance(mode, str) and mode in PROFILES else None
 
 
 def subprocess_runner(argv: Sequence[str], timeout: float) -> "tuple[int, str]":
@@ -55,8 +68,8 @@ class VmanModelController:
             if now == profile:
                 self._active = profile
                 return
-            if now is not None and now not in PROFILES:
-                raise VmanError(f"unexpected current vman mode {now!r}")
+            if now is None or now not in PROFILES:
+                raise VmanError(f"current vman mode is unknown ({now!r}); not switching on a guess")
             self._switch(profile)                 # a failed switch leaves nothing recorded to restore
             if self._previous is None:
                 self._previous = now
@@ -69,3 +82,8 @@ class VmanModelController:
             if self._previous is not None and self.current_mode() == self._active:
                 self._switch(self._previous)
             self._active, self._previous = None, None
+
+
+def default_controller(profiles: Mapping[str, str], **kw) -> VmanModelController:
+    """The controller wired to the real `vman` and its state file."""
+    return VmanModelController(profiles, vman_state_mode, **kw)

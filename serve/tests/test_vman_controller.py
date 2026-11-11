@@ -1,6 +1,10 @@
 import unittest
 
-from serve.mantle.vman_controller import VmanError, VmanModelController
+import json
+import os
+import tempfile
+
+from serve.mantle.vman_controller import STATE_FILE, VmanError, VmanModelController, default_controller, vman_state_mode
 
 
 class Fake:
@@ -57,6 +61,10 @@ class VmanControllerTest(unittest.TestCase):
         self.assertEqual(f.calls[-1][-1], "llm")
         with self.assertRaises(VmanError):
             self.ctl(Fake("--force")).load("little")
+        f = Fake(None)                                # unknown current mode: refuse, never switch on a guess
+        with self.assertRaisesRegex(VmanError, "unknown"):
+            self.ctl(f).load("little")
+        self.assertEqual(f.calls, [])
 
     def test_failure_and_unknown(self):
         with self.assertRaises(VmanError):
@@ -65,6 +73,30 @@ class VmanControllerTest(unittest.TestCase):
             self.ctl(Fake()).load("nope")
         with self.assertRaises(ValueError):
             VmanModelController({"x": "rm -rf"}, lambda: None)
+
+
+class StateFileTest(unittest.TestCase):
+    def read(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "mode.json")
+            if text is not None:
+                open(p, "w").write(text)
+            return vman_state_mode(p)
+
+    def test_reads_known_mode_and_refuses_the_rest(self):
+        self.assertEqual(self.read(json.dumps({"mode": "strata", "switched_at": "x"})), "strata")
+        for bad in (None, "{", json.dumps({}), json.dumps({"mode": "rm -rf"}), json.dumps({"mode": 3}), json.dumps([1])):
+            self.assertIsNone(self.read(bad), bad)
+
+    def test_the_real_state_file_is_readable_and_a_noop_load_does_not_run_vman(self):
+        mode = vman_state_mode()
+        if mode is None:
+            self.skipTest("no vman state file on this machine")
+        calls = []
+        c = default_controller({"current": mode}, runner=lambda argv, t: calls.append(argv) or (0, ""))
+        c.load("current")                             # already active: nothing is switched
+        c.release("current")
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
