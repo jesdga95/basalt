@@ -97,6 +97,16 @@ Flow Request::read_prompt() {
                 if (i >= runtime_.o.prompt_cache_root) root_at = i;
                 break;
             }
+    // (opt-in) The last user turn's start is where a sibling that branches off the same history diverges from this
+    // prompt; a checkpoint there lets it reuse the whole history.  The turn end above sits after the last user
+    // message, so it only serves a request that continues this very conversation.
+    fork_at = -1;
+    if (runtime_.o.prompt_cache_fork > 0 && turn_at > 0)
+        for (int64_t i = turn_at - 1; i > resume; --i)
+            if (ids[(size_t) i] == runtime_.o.turn_token) { fork_at = i; break; }
+    if (fork_at > 0 && (fork_at <= root_at ||
+                        fork_at - std::max<int64_t>(read_from, std::max<int64_t>(root_at, 0)) < runtime_.o.prompt_cache_fork))
+        fork_at = -1;
     // A short read into a slot beside decoding slots is not split: each part pays the lend, refill and
     // side-thread costs again, and a checkpoint stalls the windows.  One that runs alone stops at its root,
     // and at its turn boundary only past --prompt-cache-root tokens since the root: a short history is
@@ -105,15 +115,17 @@ Flow Request::read_prompt() {
         if (n - 1 - read_from > runtime_.kReadAlone) {
             turn_at = -1;
             root_at = -1;
+            fork_at = -1;
         } else if (turn_at - std::max(read_from, root_at) < runtime_.o.prompt_cache_root) {
             turn_at = -1;
+            fork_at = -1;
         }
     }
     // the parts after the first read their n-gram rows from memory: once the first part has its own, the rest
     // are read into the row cache beside it
     {
         int64_t first_to = 0;
-        for (const int64_t to : {root_at, turn_at, n - 1})
+        for (const int64_t to : {root_at, fork_at, turn_at, n - 1})
             if (to > read_from) { first_to = to; break; }
         runtime_.sp.set_ple_warm(ids.data(), read_from, first_to, n - 1);
     }
@@ -124,7 +136,7 @@ Flow Request::read_prompt() {
     const auto source_at = [&](int64_t to) {
         return to == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd;
     };
-    for (const int64_t to : {root_at, turn_at, n - 1}) {
+    for (const int64_t to : {root_at, fork_at, turn_at, n - 1}) {
         if (to <= at) continue;
         runtime_.err.clear();
         const bool win = windows_ok(at, to);
@@ -153,7 +165,7 @@ Flow Request::read_prompt() {
         if (win && !ov_window()) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
         runtime_.ov_post_done = false;
         runtime_.ov_post = [&, to]() -> bool {
-            if ((to == turn_at || to == root_at) && !runtime_.checkpoint_at(to, nullptr, false, source_at(to))) return false;
+            if ((to == turn_at || to == root_at || to == fork_at) && !runtime_.checkpoint_at(to, nullptr, false, source_at(to))) return false;
             // the lent slots get their experts back here, beside the windows; the table follows on the main thread
             for (PfPart& p : runtime_.pf_parts) {
                 if (p.lent.empty()) continue;
@@ -164,7 +176,7 @@ Flow Request::read_prompt() {
             ov_copied = true;
             return true;
         };
-        runtime_.pp_part_ckpt = (to == turn_at || to == root_at) ? to : -1;
+        runtime_.pp_part_ckpt = (to == turn_at || to == root_at || to == fork_at) ? to : -1;
         bool split_ran = true;
         bool sp_ok = win ? (rto <= at || read_windows(at, rto, runtime_.err))
                    : split_c > 0 ? read_split(at, to, split, split_ran, runtime_.err)
@@ -194,7 +206,7 @@ Flow Request::read_prompt() {
         at = to;
         resumed_chunk = 0;   // the later parts are planned as the read they continue planned them
         runtime_.ov_post = nullptr;
-        if ((to == turn_at || to == root_at) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on(), source_at(to))) {
+        if ((to == turn_at || to == root_at || to == fork_at) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on(), source_at(to))) {
             std::printf("ERR saving a conversation checkpoint failed%s\n", runtime_.ckpt_why.c_str());
             return Flow::error;
         }

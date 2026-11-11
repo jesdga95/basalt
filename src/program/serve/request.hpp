@@ -116,6 +116,7 @@ private:
     bool cancelled{};
     int64_t turn_at{};
     int64_t root_at{};
+    int64_t fork_at{};
     int64_t at{};
     int64_t fold_p0{};
     double prompt_ms{};
