@@ -512,7 +512,6 @@ private:
     bool store_conversation(basalt::core::SavedConversation& image);
     bool reclaim_host_pool(uint64_t need, bool spill_all = false);
     void relieve_host_pressure();
-    bool spill_oldest_conversation();   ///< the RAM tier's oldest parked conversation goes to the disk tier; false when it cannot
     Clock::time_point pool_pressure_checked{};
     std::vector<basalt::core::SavedConversation> pool_spills;
     bool park_current(size_t held, int64_t kept);

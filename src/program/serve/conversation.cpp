@@ -158,59 +158,19 @@ bool Runtime::reclaim_host_pool(uint64_t need, bool spill_all) {
     return true;
 }
 
-bool Runtime::spill_oldest_conversation() {
-    if (!conversations || conversations->size() == 0) return false;
-    auto image = conversations->take(0);   // the RAM tier is kept least recently active first
-    if (!disk_has(image.live.ids, image.live.imgs, image.checkpoints, image.cvec, 0) && !store_conversation(image)) {
-        pool_spills.push_back(std::move(image));
-        return false;
-    }
-    return true;
-}
-
 void Runtime::relieve_host_pressure() {
     if (o.host_pool_bytes == 0 || !conversations) return;
     const uint64_t avail = basalt::platform::available_memory();
     const bool host_low = (avail > 0 && avail < (10ull << 30)) ||
                           basalt::core::host_pool_stats().used > (50ull << 30);
-    const bool guard_low = basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok;
-    if (pool_spills.empty() && !host_low && !guard_low) return;
+    if (pool_spills.empty() && !host_low && basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
     const auto now = Clock::now();
     if (now - pool_pressure_checked < std::chrono::seconds(1)) return;
     pool_pressure_checked = now;
     const auto before = basalt::core::host_pool_stats().used;
-    if (guard_low || !pool_spills.empty()) {
-        // the RAM guard or a failed earlier spill: everything inactive goes, as it always has
-        if (!reclaim_host_pool(0, true)) {
-            basalt::log::warn("host pool", "inactive cache retained after disk spill failed: %s", err.c_str());
-            return;
-        }
-    } else {
-        // Only the host's free RAM (or the pool's size) is low: free the oldest parked conversations one at a time
-        // until it is back a margin above the trigger, instead of emptying the whole RAM tier at every small dip.
-        // The host's free RAM sits close to the trigger, so emptying it made most following requests miss.
-        auto still_low = [] {
-            const uint64_t a = basalt::platform::available_memory();
-            return (a > 0 && a < (11ull << 30)) || basalt::core::host_pool_stats().used > (49ull << 30);
-        };
-        if (!reclaim_host_pool(0, false)) {   // conversations the RAM tier already evicted are written first
-            basalt::log::warn("host pool", "inactive cache retained after disk spill failed: %s", err.c_str());
-            return;
-        }
-        size_t spilled = 0;
-        while (still_low() && conversations->size() > 0) {
-            ckd_finish();
-            if (!spill_oldest_conversation()) {
-                basalt::log::warn("host pool", "inactive cache retained after disk spill failed: %s", err.c_str());
-                break;
-            }
-            ++spilled;
-            (void) basalt::core::CheckpointBytes::allocator_type::release_pooled();
-            (void) basalt::core::discard_host_pool_free(0);
-        }
-        if (spilled > 0)
-            basalt::log::info("host pool", "memory pressure: %zu oldest conversation%s spilled, %zu stay in RAM", spilled,
-                              spilled == 1 ? "" : "s", conversations->size());
+    if (!reclaim_host_pool(0, true)) {
+        basalt::log::warn("host pool", "inactive cache retained after disk spill failed: %s", err.c_str());
+        return;
     }
     if (!basalt::core::discard_host_pool_free(0))
         basalt::log::warn("host pool", "unused backing discard failed");
