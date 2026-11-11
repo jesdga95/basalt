@@ -67,6 +67,18 @@ inline int bus_count(int pinned, int file) {
     return n < 0 ? 0 : n > pinned ? pinned : n;
 }
 
+/// Scratch slots on a second card for the misses its own link fetches: the most a layer sends it.
+constexpr int kPeerFetchSlots = 4;
+
+/// Of the bus's misses (bus_count), how many a second card fetches over its own link and computes, the main card's link
+/// taking the rest. A copy takes longer than a CPU expert, so one link carrying as many misses as the CPU ends well after
+/// it: half of them, rounded down, go over the second card's link instead. When the CPU has one more, it ends last
+/// anyway, and a second link would only slow it.
+inline int peer_bus_count(int pinned, int file) {
+    const int bus = bus_count(pinned, file);
+    return 2 * bus >= pinned + file ? bus / 2 : 0;
+}
+
 /// The second card's share is queued before its plan, so its grouped kernels run this many groups side by side and stride
 /// over the rest: about the experts a window of `n_tok` rows sends it.
 inline int64_t peer_groups(int n_tok) { return 2 * (int64_t) n_tok + 1; }

@@ -44,11 +44,11 @@ public:
     struct Lookup {
         int k = 0;
         const uint8_t* dev[kMaxK] = {};    ///< device blob of an expert the VRAM tier holds, else null
-        const uint8_t* peer[kMaxK] = {};   ///< device blob of an expert the second card holds, else null
-        const uint8_t* host[kMaxK] = {};   ///< host blob of the others
+        const uint8_t* peer[kMaxK] = {};   ///< device blob of an expert the second card holds or fetched, else null
+        const uint8_t* host[kMaxK] = {};   ///< host blob of the others (and of those the second card fetched)
         int experts[kMaxK] = {};
         bool again[kMaxK] = {};            ///< a miss that repeats one from the last kPromoteWindow tokens
-        bool fetched[kMaxK] = {};          ///< `dev` is being copied in by `fetch`
+        bool fetched[kMaxK] = {};          ///< `dev` or `peer` is being copied in by `fetch`
     };
 
     /// The window rows that use one looked-up expert: row i of token tok[i] is `row[i]` of the output rows.
@@ -111,8 +111,10 @@ public:
     void pump(int layer, int pieces);
     static constexpr int kAllPieces = 1 << 20;
     /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (policy::bus_count) into the VRAM tier; those
-    /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. How many
-    /// started; `await_fetch` makes `main` wait for them.
+    /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. With a
+    /// second card, policy::peer_bus_count of them cross its own link into its scratch slots instead (`peer`, marked
+    /// `fetched`); their VRAM tier copies follow off the token path. How many the main card's link started; `await_fetch`
+    /// makes `main` wait for them.
     int fetch(int layer, Lookup& lk);
     void await_fetch(cudaStream_t main);
     /// Queues the pinned misses the CPU computed that missed before within kPromoteWindow tokens for a copy into the

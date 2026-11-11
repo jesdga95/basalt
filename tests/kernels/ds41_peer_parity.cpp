@@ -1,10 +1,11 @@
 // tests/kernels/ds41_peer_parity.cpp - a second card's share of a layer's experts against the main card's grouped kernels,
-// bit for bit on the real geometry, whatever the share's size and the rows it lands in.
+// bit for bit on the real geometry, whatever the share's size and the rows it lands in, and with experts the card fetched
+// into its scratch slots for the share.
 //
 //     build/ds41_peer_parity            the checks (passes with a note on one card)
 //     build/ds41_peer_parity --bench    the checks, then a microbench line per format and share size, from the plan's
 //                                       word to the rows, alone and with a slot's copy in and out queued on the card
-//                                       just before it
+//                                       just before it, and for experts fetched over the card's link, from the fetch
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -158,13 +159,16 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
         ++g_fail;
         return;
     }
-    if (!peer.open_slots(std::vector<int64_t>(NB, (int64_t) L.bytes), err)) {
+    if (!peer.open_slots(std::vector<int64_t>(NB, (int64_t) L.bytes), err) || !peer.open_scratch(4, L.bytes, err)) {
         std::printf("FAIL: slots: %s\n", err.c_str());
         ++g_fail;
         return;
     }
     uint8_t* stage = nullptr;
     ck(cudaHostAlloc((void**) &stage, L.bytes, cudaHostAllocPortable), "stage");
+    uint8_t* pinned = nullptr;   // every blob in pinned memory, as the RAM tier holds them: the fetches' sources
+    ck(cudaHostAlloc((void**) &pinned, slot * NB, cudaHostAllocPortable), "pinned blobs");
+    for (int b = 0; b < NB; ++b) std::memcpy(pinned + slot * b, blob[(size_t) b].data(), L.bytes);
     for (int b = 0; b < NB; ++b) {
         peer.admit(0, b, b);
         std::memcpy(stage, blob[(size_t) b].data(), L.bytes);
@@ -220,6 +224,32 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
         std::printf("%-7s/%-7s a window's last row against the main card, an empty share: %s\n", nm(gu), nm(d), ok ? "bitwise same" : "WRONG");
     }
 
+    // experts fetched into scratch slots for one share (kind 3) beside the ones the card holds (kind 2): the main card's
+    // rows in the entries that name them, whatever slot each landed in, one fetched expert serving two rows; the slots
+    // are free again for the next share
+    {
+        constexpr int kTok = 3, kK = 2;
+        struct Round {
+            int32_t ids[kTok * kK], kind[kTok * kK];
+            std::vector<int> fetch;
+        };
+        const Round rounds[] = {{{5, 1, 0, 7, 5, 2}, {3, 2, 0, 0, 3, 2}, {5}},
+                                {{6, 3, 0, 7, 4, 2}, {3, 2, 0, 0, 3, 3}, {2, 6, 4}}};
+        bool ok = true;
+        for (const Round& rd : rounds) {
+            for (int i = 0; i < kTok * kK * H; ++i) h_rows[i] = -1.0f;
+            ok = ok && peer.arm(Lp, h_x, kTok, kK, 2, err);
+            for (int e : rd.fetch) ok = ok && peer.fetch(e, pinned + slot * (size_t) e, L.bytes) != nullptr;
+            ok = ok && peer.raise(0, rd.ids, rd.kind, err) && peer.run_fetched(err) && peer.finish(nullptr, err);
+            for (int r : {0, 1, 4, 5})   // rows 0 and 2 of the window are the main card's activation
+                ok = ok && !std::memcmp(h_rows + (size_t) r * H, main_rows.data() + (size_t) rd.ids[r] * H, (size_t) H * sizeof(float));
+            for (int i = 2 * H; i < 4 * H; ++i) ok = ok && h_rows[i] == -1.0f;
+        }
+        check(ok, "experts fetched into scratch slots");
+        std::printf("%-7s/%-7s experts fetched into scratch slots beside held ones, against the main card: %s\n", nm(gu), nm(d),
+                    ok ? "bitwise same" : (err.empty() ? "WRONG" : err.c_str()));
+    }
+
     // an exchange in pieces as the tier queues them, landed by its mark: slot 0's bytes out, the next blob's in; then
     // slot 0 gets its own blob back the same way
     {
@@ -271,9 +301,33 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
                                 nm(gu), nm(d), n, (long long) gy, copying ? " behind a slot copy" : "", med, us[us.size() * 9 / 10],
                                 (double) n * (double) L.bytes / 1e6, (double) n * (double) L.bytes / (med * 1e3));
                 }
+        // experts fetched over the card's own link for a share, from the fetch to their rows in host memory
+        for (int nf : {1, 2}) {
+            int32_t ids[8] = {}, kind[8] = {};
+            for (int i = 0; i < nf; ++i) { ids[i] = i; kind[i] = 3; }
+            std::vector<double> us;
+            for (int it = 0; it < 201; ++it) {
+                peer.arm(Lp, h_x, 1, nf, nf, err);
+                const auto tw = std::chrono::steady_clock::now();
+                while (std::chrono::steady_clock::now() - tw < std::chrono::microseconds(100)) {
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < nf; ++i) peer.fetch(i, pinned + slot * (size_t) i, L.bytes);
+                peer.raise(0, ids, kind, err);
+                peer.run_fetched(err);
+                peer.finish(nullptr, err);
+                if (it > 0) us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+            }
+            std::sort(us.begin(), us.end());
+            const double med = us[us.size() / 2];
+            std::printf("bench second card %s/%s %d fetched over its link, fetch to rows in host memory: %.1f us/call (p90 %.1f), %.1f MB copied, %.1f GB/s\n",
+                        nm(gu), nm(d), nf, med, us[us.size() * 9 / 10], (double) nf * (double) L.bytes / 1e6,
+                        (double) nf * (double) L.bytes / (med * 1e3));
+        }
         cudaFreeHost(out);
     }
     cudaFreeHost(stage);
+    cudaFreeHost(pinned);
     for (void* p : {(void*) blobs, (void*) dx, (void*) xq, (void*) dptr, (void*) dstart, (void*) dng, (void*) ddst, (void*) dtok, (void*) scr, (void*) dout})
         cudaFree(p);
 }
