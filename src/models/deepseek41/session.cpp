@@ -36,7 +36,7 @@
 namespace basalt::models::deepseek41 {
 namespace {
 constexpr int kLendTierTokens = 4096;   // a prompt this long reads without the VRAM tier, in larger chunks
-constexpr int kStepTailTokens = 256;     // a tail this short may read one decode step at a time when no workspaces fit
+constexpr int kStepTailTokens = 16;     // a tail shorter than this reads one decode step at a time when no workspaces fit
 
 #define DS_CUDA(call)                                                                                   \
     do {                                                                                                \
@@ -249,8 +249,8 @@ public:
                 // the caches take their memory before the prompt workspaces do
                 if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
                 if (!prefill_ && !make_prefill_fit(plan_tokens, err)) {
-                    // a long context's caches left no room: a short tail takes the decode path, a longer read the tier's memory
-                    if (r.n_tokens <= kStepTailTokens) {
+                    // a long context's caches left no room: a short tail (< 16 tokens) takes the decode path, a longer read the tier's memory
+                    if (r.n_tokens < kStepTailTokens) {
                         close_prompt_path();
                         for (int i = 0; i < r.n_tokens; ++i)
                             if (!step(r.tokens + i, 1, r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
