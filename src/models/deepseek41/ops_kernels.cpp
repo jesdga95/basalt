@@ -760,10 +760,11 @@ public:
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
-        // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land
+        // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land; the
+        // experts it fetched over its own link are planned beside the ones it holds
         if (peer) {
             int32_t kind[ExpertTier::kMaxK] = {};
-            for (int r = 0; r < T * K; ++r) kind[r] = lk.peer[uidx[r]] ? 2 : 0;
+            for (int r = 0; r < T * K; ++r) kind[r] = !lk.peer[uidx[r]] ? 0 : lk.fetched[uidx[r]] ? 3 : 2;
             if (!peer->raise(il, h_ids_, kind, err)) return false;
         }
         // then the CPU's share: it takes longest, and the pool's workers run it while the main card's share launches
@@ -813,6 +814,8 @@ public:
             tier_->await_fetch(st);
             gpu_share(plan, ex_plan2_, ng, entries);
         }
+        // the second card's fetched experts run once their copies land, long after these launches
+        if (peer && !peer->run_fetched(err)) return false;
         // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
         // launch and the next layer's are off the path from the last rows to the sum
         WindowRowPtrs rp{};
@@ -887,10 +890,11 @@ public:
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
-        // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land
+        // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land; the
+        // experts it fetched over its own link are planned beside the ones it holds
         if (peer) {
             int32_t kind[ExpertTier::kMaxK] = {};
-            for (int k = 0; k < K; ++k) kind[k] = lk.peer[k] ? 2 : 0;
+            for (int k = 0; k < K; ++k) kind[k] = !lk.peer[k] ? 0 : lk.fetched[k] ? 3 : 2;
             if (!peer->raise(il, lk.experts, kind, err)) return false;
         }
         // then the CPU's share: it takes longest, and the pool's workers run it while the main card's share launches
@@ -962,6 +966,8 @@ public:
             kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, n_fetched,
                                                    n_fetched, ex_xq_, ex_scr_, ex_rows_, stream);
         }
+        // the second card's fetched experts run once their copies land, long after these launches
+        if (peer && !peer->run_fetched(err)) return false;
         // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
         // launch and the next layer's are off the path from the last rows to the sum
         RowPtrs rp{};

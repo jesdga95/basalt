@@ -372,6 +372,13 @@ bool ExpertTier::load_ram(std::string& err) {
         for (int l = 0; l < n_layers_; ++l)
             for (int s = 0; s < homes_.peer; ++s) sizes.push_back((int64_t) m_.pack().experts[(size_t) l].blob_bytes);
         if (!peer_->open_slots(sizes, err)) return false;
+        // scratch slots for the misses the card fetches over its own link, in what its homes leave above its reserve
+        const uint64_t keep = (uint64_t) m_.tiers().peer_reserve_mib << 20, room = peer_->room();
+        const uint64_t slot = (max_blob + 255) / 256 * 256;
+        const int n = room > keep ? (int) std::min<uint64_t>(policy::kPeerFetchSlots, (room - keep) / slot) : 0;
+        std::string se;
+        if (n > 0 && !peer_->open_scratch(n, max_blob, se))
+            basalt::log::warn("basalt deepseek41", "the second card fetches no misses over its link: %s", se.c_str());
     }
     for (int l = 0; l < n_layers_; ++l) {
         std::vector<int> held;
@@ -990,18 +997,29 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     for (int i = 0; i < lk.k; ++i)
         if (!lk.dev[i] && !lk.peer[i]) ++(pinned(layer, lk.experts[i]) ? np : nf);
     int left = policy::bus_count(np, nf);
+    // A second card fetches some over its own link into a scratch slot and computes them there. Their main card slots are
+    // claimed all the same, filled behind the window's work as a promotion is, so every expert's place is the one the
+    // main card's link alone would have given it.
+    int far = peer_ ? std::min(policy::peer_bus_count(np, nf), peer_->scratch_free()) : 0;
+    const uint64_t bytes = m_.pack().experts[(size_t) layer].blob_bytes;
     int started = 0;
     for (int i = lk.k - 1; i >= 0 && left > 0; --i) {
         if (lk.dev[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
         --left;
-        const int32_t slot = claim(layer, lk.experts[i], lk.host[i], fetch_stream_, false, /*whole=*/true);
+        const int32_t slot = far > 0 ? claim(layer, lk.experts[i], lk.host[i], copy_stream_, false, false, /*later=*/true)
+                                     : claim(layer, lk.experts[i], lk.host[i], fetch_stream_, false, /*whole=*/true);
         if (slot < 0) continue;
-        lk.dev[i] = slot_ptr(slot);
-        lk.host[i] = nullptr;
+        if (far > 0) {
+            lk.peer[i] = peer_->fetch(lk.experts[i], lk.host[i], bytes);
+            --far;
+        } else {
+            lk.dev[i] = slot_ptr(slot);
+            lk.host[i] = nullptr;
+            ++started;
+        }
         lk.fetched[i] = true;
         --cpu_;
         ++fetched_;
-        ++started;
     }
     if (started) cudaEventRecord(fetch_ev_, fetch_stream_);
     return started;
@@ -1012,7 +1030,7 @@ void ExpertTier::await_fetch(cudaStream_t main) { cudaStreamWaitEvent(main, fetc
 void ExpertTier::promote(int layer, const Lookup& lk) {
     if (m_.tiers().diag_tier_frozen) return;
     for (int i = 0; i < lk.k; ++i) {
-        if (lk.dev[i] || !lk.again[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
+        if (lk.dev[i] || lk.fetched[i] || !lk.again[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
         if (!move_to_peer(layer, lk.experts[i], lk.host[i]))
             claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true, /*whole=*/false, /*later=*/true);
     }

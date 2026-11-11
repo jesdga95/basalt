@@ -78,7 +78,20 @@ void PeerExperts::close() {
         if (stream_) cudaStreamDestroy(stream_);
         if (refill_) cudaStreamDestroy(refill_);
         for (cudaEvent_t e : marks_) cudaEventDestroy(e);
+        if (fetch_) cudaStreamSynchronize(fetch_);
+        if (scratch_base_) cudaFree(scratch_base_);
+        if (d_fplan_) cudaFree(d_fplan_);
+        if (h_fplan_) cudaFreeHost(h_fplan_);
+        if (fetch_ev_) cudaEventDestroy(fetch_ev_);
+        if (fetch_) cudaStreamDestroy(fetch_);
     }
+    scratch_base_ = nullptr;
+    scratch_.clear();
+    scratch_used_ = 0;
+    fetch_ = nullptr;
+    fetch_ev_ = nullptr;
+    h_fplan_ = fplan_map_ = d_fplan_ = nullptr;
+    fetched_groups_ = fetched_rows_ = 0;
     marks_.clear();
     marks_made_ = 0;
     d_x_ = d_out_ = h_x_ = h_out_ = nullptr;
@@ -394,7 +407,9 @@ bool same_kernels(const basalt::kernels::NativeExpertLayout& a, const basalt::ke
 bool PeerExperts::arm(const kernels::NativeExpertLayout& L, const float* x, int64_t n_tok, int64_t k, int64_t grid_groups,
                       std::string& err) {
     if (armed_ && !raise(0, nullptr, nullptr, err)) return false;
-    if (queued_ && !idle(err)) return false;   // the last share has read its plan
+    if (queued_ && !idle(err)) return false;   // the last share has read its plan and its scratch slots
+    scratch_used_ = 0;
+    fetched_groups_ = fetched_rows_ = 0;
     const int64_t cap = n_tok * k;
     if (cap <= 0 || cap > CAP) { err = "peer experts: window too large"; return false; }
     On on(device_);
@@ -423,19 +438,99 @@ bool PeerExperts::arm(const kernels::NativeExpertLayout& L, const float* x, int6
     armed_ = queued_ = true;
     armed_tok_ = n_tok;
     armed_k_ = k;
+    armed_L_ = L;
     return true;
 }
 
 bool PeerExperts::raise(int64_t layer, const int32_t* ids, const int32_t* kind, std::string& err) {
     if (!armed_) return true;
     int groups = 0, rows = 0;
-    const bool ok = plan(layer, ids, armed_tok_, armed_k_, kind, groups, rows, err);
+    bool ok = plan(layer, ids, armed_tok_, armed_k_, kind, groups, rows, err);
+    if (ok && scratch_used_ > 0) ok = plan_fetched(ids, armed_tok_ * armed_k_, kind, err);
     std::atomic_thread_fence(std::memory_order_release);   // the plan before the word
     *(volatile uint32_t*) go_ = go_seq_;
     armed_ = false;
     launched_rows_ = rows;
     launched_direct_ = true;
     return ok;
+}
+
+bool PeerExperts::open_scratch(int n, uint64_t bytes, std::string& err) {
+    On on(device_);
+    const uint64_t stride = (bytes + 255) / 256 * 256;
+    const bool ok = ck(cudaMalloc((void**) &scratch_base_, stride * (uint64_t) n), "scratch slots", err) &&
+                    ck(cudaStreamCreateWithFlags(&fetch_, cudaStreamNonBlocking), "fetch stream", err) &&
+                    ck(cudaEventCreateWithFlags(&fetch_ev_, cudaEventDisableTiming), "fetch event", err) &&
+                    ck(cudaHostAlloc(&h_fplan_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "fetched plan staging", err) &&
+                    ck(cudaHostGetDevicePointer(&fplan_map_, h_fplan_, 0), "mapped fetched plan", err) &&
+                    ck(cudaMalloc(&d_fplan_, sizeof(Meta)), "fetched plan", err);
+    if (!ok) return false;   // no slot to fetch into; close() frees what was taken
+    scratch_bytes_ = stride;
+    scratch_.assign((size_t) n, -1);
+    return true;
+}
+
+const uint8_t* PeerExperts::fetch(int64_t expert, const uint8_t* src, uint64_t bytes) {
+    if (scratch_used_ >= (int) scratch_.size() || bytes > scratch_bytes_) return nullptr;
+    const int s = scratch_used_++;
+    scratch_[(size_t) s] = expert;
+    uint8_t* dst = scratch_base_ + (uint64_t) s * scratch_bytes_;
+    On on(device_);
+    cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, fetch_);
+    cudaEventRecord(fetch_ev_, fetch_);
+    return dst;
+}
+
+bool PeerExperts::plan_fetched(const int32_t* ids, int64_t n, const int32_t* kind, std::string& err) {
+    Meta& m = *(Meta*) h_fplan_;
+    int groups = 0, rows = 0;
+    for (int64_t i = 0; kind && i < n; ++i) {
+        if (kind[i] != 3) continue;
+        bool seen = false;
+        for (int64_t j = 0; j < i && !seen; ++j) seen = kind[j] == 3 && ids[j] == ids[i];
+        if (seen) continue;
+        int s = 0;
+        while (s < scratch_used_ && scratch_[(size_t) s] != ids[i]) ++s;
+        if (s == scratch_used_) {
+            err = "peer experts: an entry was planned in a scratch slot that holds no such expert";
+            return false;
+        }
+        m.ptr[groups] = (unsigned long long) (scratch_base_ + (uint64_t) s * scratch_bytes_);
+        m.start[groups] = rows;
+        for (int64_t j = i; j < n; ++j)
+            if (kind[j] == 3 && ids[j] == ids[i]) {
+                m.dst[rows] = rows;
+                m.tok[rows] = (int32_t) (j / armed_k_);
+                m.out_row[rows] = (int32_t) j;
+                ++rows;
+            }
+        ++groups;
+    }
+    m.start[groups] = rows;
+    m.count[0] = groups;
+    m.count[1] = rows;
+    experts_ += groups;
+    entries_ += rows;
+    fetched_groups_ = groups;
+    fetched_rows_ = rows;
+    return true;
+}
+
+bool PeerExperts::run_fetched(std::string& err) {
+    if (fetched_rows_ == 0) return true;
+    On on(device_);
+    const cudaStream_t s = stream_;
+    Meta* dm = (Meta*) d_fplan_;
+    if (!ck(cudaStreamWaitEvent(s, fetch_ev_, 0), "fetched experts", err)) return false;
+    // the plan alone (no rows to quantize: the share left its activations on the card), read where it is
+    basalt::kernels::quantize_q8_1_rows_copy(nullptr, 0, n_embd_, nullptr, fplan_map_, d_fplan_, (int) (sizeof(Meta) / 4), s);
+    basalt::kernels::native_expert_grouped(armed_L_, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, fetched_groups_, fetched_rows_,
+                                           d_q8_, d_scratch_, d_out_, s, fetched_groups_);
+    basalt::kernels::scatter_rows_f32(d_out_, rows_map_, dm->out_row, fetched_rows_, n_embd_, s, dm->count + 1);
+    launched_rows_ += fetched_rows_;
+    queued_ = true;
+    fetched_groups_ = fetched_rows_ = 0;
+    return true;
 }
 
 bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
