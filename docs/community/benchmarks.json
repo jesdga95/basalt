@@ -1816,6 +1816,41 @@
       "draft_len_struct": 6.9,
       "draft_len_prose": 1.7,
       "engine_args": "--gpu 0,1 --max-context 66661 --kv int8"
+    },
+    {
+      "submitter": "changlv",
+      "date": "2026-11-11",
+      "commit": "101401ac49",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 160,
+          "pcie": "3.0 x8",
+          "h2d_gbps": 7.0
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "Intel Xeon CPU E5-2686 v4, 18 cores",
+      "ram_gbps": 49.7,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 1592.7,
+      "prefill_64k_tps": 1991.8,
+      "decode_tps": 91.6,
+      "decode_conv_tps": 60.9,
+      "decode_struct_tps": 106.5,
+      "decode_prose_tps": 66.0,
+      "accept_conv_pct": 74.1,
+      "accept_struct_pct": 98.8,
+      "accept_prose_pct": 70.9,
+      "draft_len_conv": 2.3,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.6,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     }
   ]
 }
