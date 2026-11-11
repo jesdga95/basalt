@@ -192,11 +192,17 @@ bool Runtime::capture_admit(uint64_t need, uint64_t floor) {
 // own chain), 0 when another conversation takes the session
 bool Runtime::park_current(size_t held, int64_t kept) {
     ckd_finish();
-    if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
+    // Nothing to park, but the request that brought us here overwrites the session's cells with another
+    // conversation: K/V retained for the one being dropped must not survive to be captured as its prefix.
+    if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) {
+        conversations->drop_reuse();
+        return true;
+    }
     // below the token minimum: store nothing, evict nothing
     if (o.conversation_cache_min_tokens > 0 && (int64_t) live.size() < o.conversation_cache_min_tokens) {
         basalt::log::info("basalt serve", "conversation cache: %zu tokens below the minimum %d, not parked",
                           live.size(), o.conversation_cache_min_tokens);
+        conversations->drop_reuse();   // a CONTEXT_RESTORE may have retained buffers for this short conversation
         return true;
     }
     // the disk tier takes the image when there is no RAM tier or it cannot make room, unless the conversation is

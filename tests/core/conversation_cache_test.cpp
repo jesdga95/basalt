@@ -82,6 +82,20 @@ int main() {
         check(cache.retained_bytes() == 0 && cache.size() == 1 && cache.evictions() == 0,
               "pressure drops retained storage before evicting parked conversations");
     }
+    {   // retained buffers are bound to the conversation the session's cells hold, not just to the session
+        auto one_layer = [] { ConversationKv layer; layer.k.resize(64); std::vector<ConversationKv> v; v.push_back(std::move(layer)); return v; };
+        ConversationCache cache(1 << 20, 4);
+        int session_a = 0, session_b = 0;
+        cache.retain(one_layer(), 16, {}, &session_a);
+        check(cache.take_reuse(&session_b).kv.empty(), "another session cannot take the retained buffers");
+        check(cache.retained_bytes() == 0, "a foreign take discards them rather than handing them over");
+        cache.drop_reuse();
+        check(cache.retained_bytes() == 0 && cache.take_reuse(&session_a).kv.empty(),
+              "a skipped park drops the retained buffers with the conversation they hold");
+        cache.retain(one_layer(), 16, {}, &session_a);
+        cache.drop_reuse_unless(&session_a);
+        check(cache.retained_bytes() > 0, "their own session's continuation keeps them");
+    }
     {   // clear gives back everything the cache holds
         auto one_layer = [] { ConversationKv layer; layer.k.resize(64); std::vector<ConversationKv> v; v.push_back(std::move(layer)); return v; };
         ConversationCache cache(1 << 20, 4);

@@ -281,6 +281,9 @@ public:
     // This optimization never evicts a parked conversation to make itself fit.
     // `stage_kv`: with a layer split, the later stages' restored K/V (one per stage), retained with the first's.
     // `owner`: the session the buffers were restored into; only that session's own state may be captured with them.
+    // Identity is only as good as the session's cells: the buffers hold the conversation they were restored for,
+    // so every path that replaces the session's conversation must consume them (a park) or drop them - a capture
+    // on cells that now hold another conversation would publish that conversation's K/V as this one's prefix.
     void retain(std::vector<ConversationKv>&& kv, int64_t tokens,
                 std::vector<std::vector<ConversationKv>>&& stage_kv = {}, const void* owner = nullptr) {
         reuse_ = {};
@@ -299,6 +302,10 @@ public:
     void drop_reuse_unless(const void* owner) {
         if (owner != reuse_owner_) reuse_ = {};
     }
+    // The session's cells are about to hold another conversation without a park consuming the retained buffers
+    // (a park was skipped, or a CONTEXT_RESTORE overwrote them): whatever they hold belongs to the conversation
+    // that gave way, so they go before the next capture could graft it onto a different one.
+    void drop_reuse() { reuse_ = {}; reuse_owner_ = nullptr; }
     ConversationKvReuse take_reuse(const void* owner = nullptr) {
         drop_reuse_unless(owner);
         return std::exchange(reuse_, {});
