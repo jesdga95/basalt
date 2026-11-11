@@ -128,26 +128,31 @@ void ExpertPool::worker(int id) {
     parked_.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
         // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the sibling
-        // hyperthread; `epoch_` is bumped once per LAYER, not once per expert, so most of these iterations are spent
-        // here with nothing to do.
+        // hyperthread and draws little power, which leaves the package's budget to the cores still working;
+        // `epoch_` is bumped once per LAYER, not once per expert, so most of these iterations are spent here with
+        // nothing to do.
         //
         // **AND NOTHING ELSE HAPPENS IN HERE**: no counter is bumped per iteration (a locked read-modify-write, five
         // workers against one cache line, would make the workers invalidate each other's caches and the very line the
         // host writes to publish work).  See the note on the atomics in pool.hpp.
         //
-        // After `kSpinBeforeYield` the worker yields its core on every check, and after `kSpinBeforeSleep` with no
-        // work it sleeps.  The clock is read once every 64 checks.
+        // Once every `kYieldEvery` the worker yields its core, and after `kSpinBeforeSleep` with no work it sleeps.
+        // The clock is read once every 64 checks.
         const auto parked_at = std::chrono::steady_clock::now();
+        auto yield_at = parked_at + kYieldEvery;
         uint32_t spins = 0;
-        bool yielding = false;
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            if (yielding) std::this_thread::yield();
-            else _mm_pause();
+            _mm_pause();
             if ((++spins & 63u) != 0) continue;
-            const auto waited = std::chrono::steady_clock::now() - parked_at;
-            yielding = waited >= kSpinBeforeYield;
-            if (waited < spin_before_sleep_) continue;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - parked_at < spin_before_sleep_) {
+                if (now >= yield_at) {
+                    std::this_thread::yield();
+                    yield_at = now + kYieldEvery;
+                }
+                continue;
+            }
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
