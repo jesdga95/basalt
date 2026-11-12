@@ -40,6 +40,9 @@ bool bind(const DynLib& u, const DynLib& f, const DynLib& c, const DynLib& s, Ff
     get(u, "av_frame_clone", out.av_frame_clone);
     get(u, "av_hwdevice_ctx_create", out.av_hwdevice_ctx_create);
     get(u, "av_buffer_ref", out.av_buffer_ref);
+    get(u, "av_buffer_unref", out.av_buffer_unref);
+    get(u, "av_hwdevice_ctx_alloc", out.av_hwdevice_ctx_alloc);
+    get(u, "av_hwdevice_ctx_init", out.av_hwdevice_ctx_init);
     get(u, "av_hwframe_transfer_data", out.av_hwframe_transfer_data);
     get(f, "avformat_version", out.avformat_version);
     get(f, "avformat_open_input", out.avformat_open_input);

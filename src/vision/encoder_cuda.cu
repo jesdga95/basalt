@@ -41,6 +41,19 @@ bool probe_device(std::string& err) {
     return true;
 }
 
+void* current_context() {
+    // the runtime makes its context current on first use; the driver's own call through the runtime's entry
+    // points, so nothing links the driver library
+    if (cudaFree(nullptr) != cudaSuccess) return nullptr;
+    void* fn = nullptr;
+    cudaDriverEntryPointQueryResult q{};
+    if (cudaGetDriverEntryPointByVersion("cuCtxGetCurrent", &fn, 12000, cudaEnableDefault, &q) != cudaSuccess || fn == nullptr ||
+        q != cudaDriverEntryPointSuccess)
+        return nullptr;
+    void* ctx = nullptr;
+    return reinterpret_cast<int (*)(void**)>(fn)(&ctx) == 0 ? ctx : nullptr;
+}
+
 namespace {
 constexpr int E = 1152, F = 4304, H = 16, D = 72, DP = 80;
 

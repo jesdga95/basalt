@@ -27,6 +27,8 @@ struct VideoOptions {
     int64_t max_frame_pixels = 64ll << 20;
     int64_t max_held_pixels = 256ll << 20;
     int gpu = -1;                      ///< the CUDA device NVDEC decodes on; -1: decode on the CPU
+    void* cuda_context = nullptr;      ///< the caller's CUDA context on `gpu` (a CUcontext) for FFmpeg to share
+    int64_t gpu_spare = -1;            ///< device bytes NVDEC may take (-1: no limit); a larger stream decodes on the CPU
 };
 
 /// The source indices to sample from a video of `total` frames at `src_fps` (no fps: 24).
@@ -52,7 +54,7 @@ struct Video {
     double fps = 0;                    ///< the source's frame rate
     std::vector<int64_t> indices;      ///< the sampled source frames
     std::vector<uint8_t> frames;       ///< indices.size() frames of the canvas, RGB
-    std::string decoder;               ///< "nvdec" or "cpu": where the frames were decoded
+    std::string decoder;               ///< "nvdec" or "cpu" (with why NVDEC did not, when it was asked)
     double ms_total = 0, ms_copy = 0, ms_convert = 0;   ///< all of read_video; GPU-to-host copies; the busiest converter
     int groups() const { return ((int) indices.size() + 1) / 2; }
 };

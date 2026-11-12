@@ -45,6 +45,8 @@ int main() {
     eq(offsetof(AVCodecContext, hw_device_ctx), row->cc_hw_device_ctx, "AVCodecContext.hw_device_ctx");
     eq(AV_PIX_FMT_CUDA, row->pix_fmt_cuda, "AV_PIX_FMT_CUDA");
     eq(AV_PIX_FMT_P010LE, row->pix_fmt_p010, "AV_PIX_FMT_P010LE");
+    eq(offsetof(AVHWDeviceContext, hwctx), row->hwdev_hwctx, "AVHWDeviceContext.hwctx");
+    eq(offsetof(AVBufferRef, data), ff::kBufferData, "AVBufferRef.data");
     eq(AV_PIX_FMT_YUV420P, ff::kPixFmtYuv420p, "AV_PIX_FMT_YUV420P");
     eq(AV_PIX_FMT_NV12, ff::kPixFmtNv12, "AV_PIX_FMT_NV12");
     eq(AV_PIX_FMT_YUV420P10LE, ff::kPixFmtYuv420p10, "AV_PIX_FMT_YUV420P10LE");

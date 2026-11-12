@@ -31,6 +31,9 @@ struct Ffmpeg {
     ff::av_frame_clone_fn av_frame_clone = nullptr;
     ff::av_hwdevice_ctx_create_fn av_hwdevice_ctx_create = nullptr;
     ff::av_buffer_ref_fn av_buffer_ref = nullptr;
+    ff::av_buffer_unref_fn av_buffer_unref = nullptr;
+    ff::av_hwdevice_ctx_alloc_fn av_hwdevice_ctx_alloc = nullptr;
+    ff::av_hwdevice_ctx_init_fn av_hwdevice_ctx_init = nullptr;
     ff::av_hwframe_transfer_data_fn av_hwframe_transfer_data = nullptr;
 
     ff::avformat_version_fn avformat_version = nullptr;

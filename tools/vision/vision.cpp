@@ -167,7 +167,10 @@ int main(int argc, char** argv) {
             std::string vid_path, out_path;
             VideoOptions vo;
             vo.group_tokens = geo.max_tokens;
-            vo.gpu = gpu ? 0 : -1;   // NVDEC on the encoder's own card
+            vo.gpu = gpu ? 0 : -1;   // NVDEC on the encoder's own card, in its context
+#ifdef BASALT_VISION_CUDA
+            if (gpu) vo.cuda_context = current_context();
+#endif
             Video v;
             if (!parse_encv(line, vid_path, out_path, vo, err) || !read_video(vid_path, vo, v, err)) {
                 std::printf("ERR %s\n", err.c_str());
