@@ -36,7 +36,7 @@ from serve.util.text import stop_strings
 
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
 # What this server offers beyond the OpenAI, Anthropic and llama.cpp APIs, listed under /props "basalt"
-CAPABILITIES = ["answer_now"]
+CAPABILITIES = ["answer_now", "logprobs"]
 TURN_POLL_S = 0.5                           # how soon a request waiting for its turn notices its client left
 
 

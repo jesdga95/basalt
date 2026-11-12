@@ -258,7 +258,7 @@ class AnswerNowServer(unittest.TestCase):
         """/props names Basalt and what it offers in one added key; llama.cpp's own fields stay as they were."""
         code, _, props = self.request("/props")
         self.assertEqual(code, 200)
-        self.assertEqual(props["basalt"], {"version": None, "capabilities": ["answer_now"]})
+        self.assertEqual(props["basalt"], {"version": None, "capabilities": ["answer_now", "logprobs"]})
         self.assertEqual(set(props), {"default_generation_settings", "total_slots", "model_alias", "chat_template",
                                       "modalities", "models_autoload", "is_sleeping", "chat_template_caps", "basalt"})
         self.engine.info = {"version": "0.4.0"}
