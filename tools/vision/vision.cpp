@@ -15,6 +15,7 @@
 // The output file is  int32 {0x31455653 'SVE1', n_tokens, nx, ny, n_embd}  then float32 [n_tokens][n_embd],
 // row i at grid position (x = i % nx, y = i / nx).
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -175,7 +176,7 @@ int main(int argc, char** argv) {
         if (!encode(patches, sz, out)) { std::printf("ERR the vision encoder failed\n"); std::fflush(stdout); continue; }
         const int nx = sz.w / 32, ny = sz.h / 32, n = nx * ny;
         FILE* o = std::fopen(out_path.c_str(), "wb");
-        if (!o) { std::printf("ERR cannot write %s\n", out_path.c_str()); std::fflush(stdout); continue; }
+        if (!o) { std::printf("ERR cannot write %s (errno %d)\n", out_path.c_str(), errno); std::fflush(stdout); continue; }
         const int32_t hdr[5] = {0x31455653, n, nx, ny, n_embd};
         const bool ok = std::fwrite(hdr, sizeof hdr, 1, o) == 1 &&
                         std::fwrite(out.data(), sizeof(float) * (size_t) n_embd, (size_t) n, o) == (size_t) n;

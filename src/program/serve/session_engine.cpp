@@ -10,6 +10,7 @@
 #include "basalt/protocol.hpp"
 #include "basalt/spec/draft_policy.hpp"
 
+#include <cerrno>
 #include <iterator>
 #include <sstream>
 
@@ -739,7 +740,7 @@ void SessionRuntime::enc_command(const std::string& cmd) {
         const bool ok = fo && std::fwrite(hdr, sizeof hdr, 1, fo) == 1 &&
                         std::fwrite(rows.data(), sizeof(float), rows.size(), fo) == rows.size();
         if (fo) std::fclose(fo);
-        if (!ok) { fail = "cannot write " + words[i + 1]; break; }
+        if (!ok) { fail = "cannot write " + words[i + 1] + (fo ? "" : " (errno " + std::to_string(errno) + ")"); break; }
         replies.push_back("ENC OK " + std::to_string(rows_n) + " " + std::to_string(nx) + " " + std::to_string(ny) + " " +
                           std::to_string((int) std::chrono::duration<double, std::milli>(Clock::now() - te).count()));
     }

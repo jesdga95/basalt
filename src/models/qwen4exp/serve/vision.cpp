@@ -2,6 +2,8 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
+#include <cerrno>
+
 namespace basalt::models::qwen4exp::serve {
 
 // ---- ENC <image> <out> [<image> <out> ...] (--vision), between requests and between batch windows.  The
@@ -128,7 +130,7 @@ void QfnRuntime::enc_command(const std::string& cmd) {
         if (!vis_enc.encode(j.patches, j.sz, out)) { ok = false; eerr = "the vision encoder failed: " + vis_enc.last_error(); break; }
         const int nx = j.sz.w / 32, ny = j.sz.h / 32, n = nx * ny, n_embd = (int) g.n_embd;
         std::FILE* fo = std::fopen(j.out.c_str(), "wb");
-        if (!fo) { ok = false; eerr = "cannot write " + j.out; break; }
+        if (!fo) { ok = false; eerr = "cannot write " + j.out + " (errno " + std::to_string(errno) + ")"; break; }
         const int32_t hdr[5] = {0x31455653, n, nx, ny, n_embd};
         const bool wrote = (int) (out.size() / (size_t) n_embd) == n && std::fwrite(hdr, sizeof hdr, 1, fo) == 1 &&
                            std::fwrite(out.data(), sizeof(float) * (size_t) n_embd, (size_t) n, fo) == (size_t) n;
