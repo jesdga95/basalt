@@ -22,7 +22,7 @@ class Eng:
 def sidecar():
     v = Vision.__new__(Vision)
     v.dir = EngineVision({}).dir
-    v.lock, v.cache, v.cache_bytes, v.pinned = threading.Lock(), {}, 0, {}
+    v.lock, v.cache, v.cache_bytes, v.pinned, v.videos = threading.Lock(), {}, 0, {}, {}
 
     def enc(img, out):
         out.write_bytes(SVE)

@@ -18,7 +18,9 @@ Protocol (one line each):
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
     that slot's own state, answered like a GEN.
   * `VRAM [mib]` -> `VRAM k=v ...`; `QUIT` ends the engine.
-  * `ENC <image> <out> [<image> <out> ...]` (--vision): one `ENC OK <n> <nx> <ny> <ms>` per image, or `ENC ERR`.
+  * `ENC <image> <out> [<image> <out> ...]` (--vision): one `ENC OK <n> <nx> <ny> <ms>` per image, or `ENC ERR`;
+    `ENCV <video> <out> [k=v ...]`: one `ENC OK <groups> <nx> <ny> <ms> <time,...>`, or `ENC ERR`. At start a
+    `VIDEO on|off ...` line says whether the encoder reads video.
   * Requests share one pipe, serialized by the service FIFO (batch: by the `ctl` lock).
 """
 from __future__ import annotations
@@ -112,7 +114,7 @@ def relay_auto_flags(line: str) -> bool:
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
 PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
-                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ")
+                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ")
 
 
 def log_unparsed(line: str, log) -> None:
@@ -246,6 +248,7 @@ class ProcessEngine:
         self.last = {}
         self.slot_drafts = {}
         self.info = {}                   # INFO key=value facts
+        self.video = None                # the in-engine encoder's VIDEO line: "on ..." or "off <reason>"
         self.conversation = {}           # the cache's figures from the engine's CONV lines; this process's only
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens, from PP lines
@@ -303,6 +306,8 @@ class ProcessEngine:
                 continue
             if line.startswith("INFO "):
                 self.info.update(info_facts(line))
+            if line.startswith("VIDEO "):                # whether the in-engine encoder reads video
+                self.video = line[6:].strip()
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -624,6 +629,14 @@ class ProcessEngine:
         """ENC: the engine's in-process image encoder reads each (image file, output file) of `jobs` and answers one
         `OK <n> <nx> <ny> <ms>` line per image. Caller holds the service FIFO; with batch slots the control lines are
         taken here too (a decoding slot pauses for the encode). ValueError carries the engine's refusal."""
+        return self._encode("ENC " + " ".join(f"{img} {out}" for img, out in jobs), len(jobs), "image", timeout)
+
+    def encode_video(self, video, out, words: str = "", timeout: float | None = None) -> str:
+        """ENCV: the engine's in-process encoder reads the video file and writes one record per group to `out`; its
+        `OK <groups> <nx> <ny> <ms> <time,...>` line. As encode_images otherwise."""
+        return self._encode(f"ENCV {video} {out} {words}".rstrip(), 1, "video", timeout)[0]
+
+    def _encode(self, command: str, replies: int, what: str, timeout: float | None) -> list[str]:
         if not self.alive():
             raise EngineDied("the engine is not running")
         timeout = self.ENC_TIMEOUT_S if timeout is None else timeout
@@ -636,23 +649,23 @@ class ProcessEngine:
             except StopIteration:
                 have_ctl = True
         try:
-            self._send("ENC " + " ".join(f"{img} {out}" for img, out in jobs))
+            self._send(command)
             deadline = time.time() + timeout
             got: list[str] = []
-            while len(got) < len(jobs):
+            while len(got) < replies:
                 try:
                     line = self.lines.get(timeout=max(0.1, deadline - time.time()))
                 except queue.Empty:
-                    raise EngineDied("the engine did not answer the image command") from None
+                    raise EngineDied(f"the engine did not answer the {what} command") from None
                 if line is None:
                     raise EngineDied("the engine ended")
                 line = line.strip()
                 if line.startswith("ENC ERR"):
-                    raise ValueError("the image could not be read: " + (line[8:].strip() or "the engine refused it"))
+                    raise ValueError(f"the {what} could not be read: " + (line[8:].strip() or "the engine refused it"))
                 if line.startswith("ENC OK "):
                     got.append(line[4:])
                 elif time.time() > deadline:
-                    raise EngineDied("the engine did not answer the image command")
+                    raise EngineDied(f"the engine did not answer the {what} command")
             return got
         finally:
             if have_ctl:

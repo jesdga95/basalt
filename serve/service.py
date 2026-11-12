@@ -13,14 +13,14 @@ from typing import Iterator
 
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.engine.mock import Engine
-from serve.frontend import ChatTemplate, Event, images_of, mark_think_literals, unmark_think_literals
+from serve.frontend import ChatTemplate, Event, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
 from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_strings
-from serve.engine.image_source import USAGE as IMAGE_USAGE, ImageRefused, ImageSources
-from serve.engine.vision import IMAGE_WAITING_BYTES, Vision
+from serve.engine.image_source import USAGE as IMAGE_USAGE, VIDEO as VIDEO_KIND, ImageRefused, ImageSources
+from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_MAX_TOKENS, VIDEO_REQUEST_BYTES, Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, Channels as LogprobChannels, entry as logprob_entry
 from serve.config import GRAMMAR_DEFAULT
@@ -79,7 +79,8 @@ class Service:
         return {"id": self.model, "object": "model", "status": {"value": value},
                 "asleep": getattr(self.engine, "asleep", False) is True,
                 "meta": {"n_ctx": self.engine.max_context},
-                "architecture": {"input_modalities": ["text", "image"] if self.vision is not None else ["text"],
+                "architecture": {"input_modalities": ["text", "image"] + (["video"] if self.video_on() else [])
+                                 if self.vision is not None else ["text"],
                                  "output_modalities": ["text"]}}
 
     def served_names(self) -> list[str]:
@@ -93,11 +94,12 @@ class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "basalt",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
-                 dialect: Dialect | None = None):
+                 dialect: Dialect | None = None, video_max_tokens: int = VIDEO_MAX_TOKENS):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.dialect = dialect or dialect_for(None)      # how this model's prompts and replies are written
         self.literals = self.dialect.literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # clamp the output cap instead of a 400
+        self.video_max_tokens = video_max_tokens      # one video's merged tokens over all its groups
         self.grammar = grammar                        # the `grammar` option: every tool or JSON request gets one
         self.grammar_engine = grammar_engine          # the engine understands the request key
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
@@ -773,12 +775,69 @@ class Service:
             return prompt, []
         return unmark_think_literals(prompt, self.literals)
 
-    def encode_prompt(self, messages, tools, kwargs) -> list[int]:
-        """The rendered, tokenized prompt (see render_text)."""
+    def encode_prompt(self, messages, tools, kwargs, videos=None) -> list[int]:
+        """The rendered, tokenized prompt (see render_text). `videos`: the text standing for each video in prompt order,
+        put in place of the template's marker before the prompt is tokenized, so its timestamps are tokenized with the
+        text around them as the reference processor's are."""
         prompt, plain = self.render_text(messages, tools, kwargs)
+        if videos is not None:
+            prompt, plain = self._splice_videos(prompt, plain, videos)
         if not plain:
             return self.tok.encode(prompt, parse_special=True)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
+
+    def _splice_videos(self, prompt: str, plain: list, videos: list[str]) -> tuple[str, list]:
+        """Each of the template's video markers replaced by its video's text, in order; the plain spans after each
+        move with it. A marker inside message text is plain text, not a video's (render_text marked it)."""
+        marker = self.dialect.video_marker
+        found, at = [], 0
+        while (j := prompt.find(marker, at)) >= 0:
+            if not any(a < j + len(marker) and j < b for a, b in plain):
+                found.append(j)
+            at = j + 1
+        if len(found) != len(videos):
+            _refuse_images("the prompt and its videos do not match")
+        out, at = [], 0
+        for j, text in zip(found, videos):
+            out += [prompt[at:j], text]
+            at = j + len(marker)
+        out.append(prompt[at:])
+        growth = [(j, len(text) - len(marker)) for j, text in zip(found, videos)]
+        spans = [(a + sum(d for j, d in growth if j < a), b + sum(d for j, d in growth if j < a)) for a, b in plain]
+        return "".join(out), spans
+
+    def video_on(self) -> bool:
+        """Video input works: image input is on, the model reads video and its encoder found FFmpeg."""
+        if self.vision is None or not self.dialect.video_pad:
+            return False
+        state = getattr(self.vision, "video_state", lambda: None)()
+        return bool(state) and state.startswith("on")
+
+    def _check_videos(self, items) -> None:
+        """Refuse, before anything is read, a request whose videos cannot reach the prompt; the sampling a part asks
+        for must be in range."""
+        if self.vision is None:
+            _refuse_images("this server was started without image input (--vision), so it cannot read videos")
+        if not self.dialect.video_pad:
+            _refuse_images("this model reads no video")
+        for item in items:
+            if item["role"] == "system":
+                _refuse_images("a system prompt cannot hold a video")
+            if item["role"] == "tool":
+                _refuse_images("a tool result cannot hold a video")
+            if not item.get("source"):
+                _refuse_images(VIDEO_KIND.usage)
+            fps, frames = item.get("fps"), item.get("max_frames")
+            if fps is not None and (isinstance(fps, bool) or not isinstance(fps, (int, float)) or not 0 < fps <= 60):
+                _refuse_images(f"a video's fps must be a number above 0 and at most 60, not {fps!r}")
+            if frames is not None and (isinstance(frames, bool) or not isinstance(frames, int) or not 4 <= frames <= 768):
+                _refuse_images(f"a video's max_frames must be a whole number from 4 to 768, not {frames!r}")
+
+    def _video_state_check(self) -> None:
+        """Refuse the video when the encoder process reads none (no FFmpeg found); the reason is its own."""
+        state = getattr(self.vision, "video_state", lambda: None)() or "off its encoder has not said whether it reads video"
+        if not state.startswith("on"):
+            _refuse_images("this server cannot read video: " + state[4:].strip())
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, image_access=None):
         """Return (ids, thinking, max_new); an unset or non-positive max_new means the rest of the context.
@@ -823,60 +882,96 @@ class Service:
             _refuse_images(IMAGE_USAGE)
 
     def _prepare(self, messages, tools, kwargs, max_new, force, image_access):
-        images = images_of(messages)
+        media = media_of(messages)
+        images = [item["source"] for item in media if item["type"] == "image"]
+        videos = [item for item in media if item["type"] == "video"]
         if images:
             self._check_images(messages, images)
-        elif getattr(self.engine, "takes_text", False) and not getattr(self.engine, "batch", 0):
+        if videos:
+            self._check_videos(videos)
+        if not media and getattr(self.engine, "takes_text", False) and not getattr(self.engine, "batch", 0):
             return self._prepare_text(messages, tools, kwargs, max_new, force)
-        ids = self.encode_prompt(messages, tools, kwargs)
+        results, spliced = [], None
+        if media:
+            results = self._encode_media(media, images, videos, image_access)
+            # each video's marker becomes its groups' text before the prompt is tokenized
+            spliced = [self.dialect.video_text(r.times, r.rows) for r in results if not isinstance(r, int)] if videos else None
+        ids = self.encode_prompt(messages, tools, kwargs, spliced)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(self.dialect.nothink_lead + force, parse_special=True)
         if images:
-            pad = self.tok.encode(self.dialect.image_pad, parse_special=True)[0]
-            start = self.tok.encode(self.dialect.image_start, parse_special=True)[0] if self.dialect.image_start else None
-            try:                                        # before the fifo: a slow source must not hold the turn
-                images = self.vision.read(images, image_access)
-            except ImageRefused as e:
-                print(f"[server] error: {e.log_line}", flush=True)
-                raise
-            except ValueError as e:
-                print(f"[server] error: {e}", flush=True)
-                raise
-            held = sum(len(i) for i in {id(i): i for i in images}.values())
+            ids = self._expand_images(ids, [r for r in results if isinstance(r, int)])
+        return self._fit(ids, kwargs, max_new)
+
+    def _encode_media(self, media, images, videos, image_access) -> list:
+        """The request's images and videos read and encoded into one embeddings file in prompt order
+        (self.embeddings.path); per item its result: an image's token count, a video's VideoRows."""
+        if videos and getattr(self.vision, "in_engine", False):   # the engine's encoder says whether it reads video
+            with self.fifo:
+                self.ensure_loaded()
+        if videos:
+            self._video_state_check()
+        try:                                            # before the fifo: a slow source must not hold the turn
+            read = iter(self.vision.read(images, image_access)) if images else iter(())
+            datas = [next(read) if item["type"] == "image" else self.vision.read_video(item["source"], image_access)
+                     for item in media]
+        except ImageRefused as e:
+            print(f"[server] error: {e.log_line}", flush=True)
+            raise
+        except ValueError as e:
+            print(f"[server] error: {e}", flush=True)
+            raise
+        video_bytes = sum(len(d) for item, d in zip(media, datas) if item["type"] == "video")
+        if video_bytes > VIDEO_REQUEST_BYTES:
+            _refuse_images(f"the request's videos are larger than {VIDEO_REQUEST_BYTES >> 20} MiB")
+        held = sum(len(d) for d in {id(d): d for d in datas}.values())
+        with self.images_lock:
+            if self.images_waiting + held > IMAGE_WAITING_BYTES:
+                raise ModelBusy("too many images are waiting to be encoded; try again shortly")
+            self.images_waiting += held
+        try:
+            # encode under the fifo: the encoder and a running engine must not use the GPU together
+            with self.fifo:
+                if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
+                    self.ensure_loaded()
+                try:
+                    if not videos:
+                        self.embeddings.path, counts = self.vision.encode(datas)
+                        return counts
+                    jobs = [(item["type"], data, None if item["type"] == "image" else
+                             {"max_tokens": self.video_max_tokens, **{k: item[k] for k in ("fps", "max_frames") if k in item}})
+                            for item, data in zip(media, datas)]
+                    self.embeddings.path, results = self.vision.encode_media(jobs)
+                    return results
+                except ValueError as e:                 # a refused image or video: the client gets the 400, the log says why
+                    print(f"[server] error: {e}", flush=True)
+                    raise
+        finally:
             with self.images_lock:
-                if self.images_waiting + held > IMAGE_WAITING_BYTES:
-                    raise ModelBusy("too many images are waiting to be encoded; try again shortly")
-                self.images_waiting += held
-            try:
-                # encode under the fifo: the encoder and a running engine must not use the GPU together
-                with self.fifo:
-                    if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
-                        self.ensure_loaded()
-                    try:
-                        self.embeddings.path, counts = self.vision.encode(images)
-                    except ValueError as e:             # a refused image: the client gets the 400, the log says why
-                        print(f"[server] error: {e}", flush=True)
-                        raise
-            finally:
-                with self.images_lock:
-                    self.images_waiting -= held
-            # expand each image's pad to one per image token; a pad not after <|vision_start|> is message text
-            literal = self.tok.encode(self.dialect.image_pad, parse_special=False)
-            out, k = [], 0
-            for j, t in enumerate(ids):
-                if t == pad and (start is None or (j > 0 and ids[j - 1] == start)):
-                    # more markers than images
-                    if k == len(counts):
-                        _refuse_images("the prompt and its images do not match")
-                    out += [pad] * counts[k]
-                    k += 1
-                elif t == pad:
-                    out += literal
-                else:
-                    out.append(t)
-            if k != len(counts):
-                _refuse_images("the prompt and its images do not match")
-            ids = out
+                self.images_waiting -= held
+
+    def _expand_images(self, ids: list[int], counts: list[int]) -> list[int]:
+        """Each image's pad expanded to one per image token; a pad not after <|vision_start|> is message text."""
+        pad = self.tok.encode(self.dialect.image_pad, parse_special=True)[0]
+        start = self.tok.encode(self.dialect.image_start, parse_special=True)[0] if self.dialect.image_start else None
+        literal = self.tok.encode(self.dialect.image_pad, parse_special=False)
+        out, k = [], 0
+        for j, t in enumerate(ids):
+            if t == pad and (start is None or (j > 0 and ids[j - 1] == start)):
+                if k == len(counts):                    # more markers than images
+                    _refuse_images("the prompt and its images do not match")
+                out += [pad] * counts[k]
+                k += 1
+            elif t == pad:
+                out += literal
+            else:
+                out.append(t)
+        if k != len(counts):
+            _refuse_images("the prompt and its images do not match")
+        return out
+
+    def _fit(self, ids, kwargs, max_new):
+        """(ids, thinking, max_new) with the answer cap settled against the context."""
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # starting, not an oversized prompt

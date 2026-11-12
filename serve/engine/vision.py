@@ -1,4 +1,4 @@
-"""The image encoder process, and the GPU helpers the engine and encoder environments are built from."""
+"""The image and video encoder process, and the GPU helpers the engine and encoder environments are built from."""
 from __future__ import annotations
 
 import hashlib
@@ -11,9 +11,10 @@ import time
 import uuid
 import queue
 from pathlib import Path
+from typing import NamedTuple
 
 from serve.engine import lifeline
-from serve.engine.image_source import ImageSources, load_image
+from serve.engine.image_source import VIDEO, ImageSources, load_image
 from serve.engine.process import frame_pipes
 from serve.util.console import tagged
 
@@ -26,6 +27,8 @@ VISION_CACHE_BYTES = 1 << 30                    # room for about 64 images
 IMAGE_MAX_PIXELS = 64 << 20                     # matches the decoder's kMaxImagePixels
 IMAGE_REQUEST_BYTES = 1 << 30                   # one request's images, as the encoder will get them
 IMAGE_WAITING_BYTES = 2 << 30                   # all requests' read images waiting for their turn to encode
+VIDEO_REQUEST_BYTES = 256 << 20                 # one request's videos, as read
+VIDEO_MAX_TOKENS = 8192                         # one video's merged tokens over all its groups (--video-max-tokens)
 # what Pillow decodes for a client: formats whose header gives the size that decoding will produce, and whose cost is
 # in proportion. Out: EPS (runs Ghostscript), ICO (the size checked is not the size decoded), JPEG 2000 (seconds of
 # work that stall the server).
@@ -65,8 +68,22 @@ def flag_refused(engine_bin: str, path: str, group: list[str]) -> bool:
     return f"unknown argument: {group[0]}" in run.stderr
 
 
+class VideoRows(NamedTuple):
+    """An encoded video: `groups` records of `rows` rows each, and each group's time in seconds."""
+    groups: int
+    rows: int
+    times: list
+
+
+def video_rows(line: str) -> VideoRows:
+    """A video reply's `OK <groups> <nx> <ny> <ms> <time,...>` as VideoRows."""
+    w = line.split()
+    return VideoRows(int(w[1]), int(w[2]) * int(w[3]), [float(t) for t in w[5].split(",")])
+
+
 class Vision:
-    """The resident `basalt-vision` encoder: `ENC <image> <out>` lines in, embeddings out, cached by image hash."""
+    """The resident `basalt-vision` encoder: `ENC <image> <out>` and `ENCV <video> <out>` lines in, embeddings out,
+    cached by content hash."""
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
         """`start` false: down until the service restarts it, as an unloaded encoder is."""
@@ -84,6 +101,7 @@ class Vision:
         self.cache: dict[str, tuple[Path, int, int]] = {}  # LRU cache: file, image tokens, bytes
         self.cache_bytes = 0
         self.pinned: dict[str, int] = {}                # image -> requests using it
+        self.videos: dict[str, VideoRows] = {}          # a cached video's groups, beside its cache entry
 
     def _start(self):
         args, log, env = self.spawn
@@ -96,6 +114,9 @@ class Vision:
         except RuntimeError:                            # silent: it was ended, and is not left half-started
             self.stopped = True
             raise
+        if line.startswith("VIDEO "):                    # whether it reads video, before READY
+            self.video = line[6:].strip()
+            line = self._readline(VISION_READY_S, "the vision encoder did not start")
         if not line.startswith("READY"):
             raise RuntimeError("the vision encoder did not start: " + line.strip())
         self.ready_s = time.time() - t0
@@ -123,8 +144,18 @@ class Vision:
                 pass
             raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
 
+    video = None                                        # "on <release> ..." or "off <reason>", from the encoder
+
     def alive(self) -> bool:
         return not self.stopped and self.proc.poll() is None
+
+    def video_state(self):
+        """Whether the encoder reads video ("on ..." / "off <reason>"); None before it has said."""
+        return self.video
+
+    def read_video(self, source, allowed: ImageSources | None = None) -> bytes:
+        """A video's bytes, read under the request's policy (64 MiB at most). Decoding is the encoder's."""
+        return load_image(source, allowed, VIDEO)
 
     def unload(self):
         """Stop the encoder; encoded images stay cached on disk."""
@@ -239,6 +270,67 @@ class Vision:
                         del self.pinned[k]
                 self._evict()
 
+    def encode_media(self, jobs: list) -> tuple[Path, list]:
+        """Encode a request's images and videos, (kind, bytes, video options) in prompt order, into one embeddings
+        file; return it and per item an image's token count or a video's VideoRows."""
+        pins = []
+        try:
+            images = self._encode_pinned([data for kind, data, _ in jobs if kind == "image"], pins)
+            parts, k = [], 0
+            for kind, data, opts in jobs:
+                if kind == "image":
+                    parts.append((images[k][0], images[k][1]))
+                    k += 1
+                else:
+                    parts.append(self._encode_video(data, opts or {}, pins))
+            combined = self.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
+            try:
+                with open(combined, "wb") as f:
+                    for path, _ in parts:
+                        f.write(path.read_bytes())
+            except BaseException:
+                combined.unlink(missing_ok=True)
+                raise
+            return combined, [r for _, r in parts]
+        finally:
+            with self.lock:
+                for k in pins:
+                    self.pinned[k] -= 1
+                    if not self.pinned[k]:
+                        del self.pinned[k]
+                self._evict()
+
+    def _encode_video(self, data: bytes, opts: dict, pins: list[str]) -> tuple[Path, VideoRows]:
+        """One video through ENCV, cached by its bytes and the sampling asked for."""
+        words = " ".join(f"{k}={opts[k]!r}" if isinstance(opts[k], float) else f"{k}={opts[k]}" for k in sorted(opts))
+        key = hashlib.sha256(data + b"\0" + words.encode()).hexdigest()[:32]
+        with self.lock:
+            self._pin(key, pins)
+            if key in self.cache and key in self.videos:
+                return self.cache[key][0], self.videos[key]
+            vid, out = self.dir / f"{key}.vid", self.dir / f"{key}.sve"
+            vid.write_bytes(data)
+            try:
+                line = self._encv(vid, out, words)
+            finally:
+                vid.unlink(missing_ok=True)
+            if not line.startswith("OK"):
+                raise ValueError("the video could not be read: " + (line[4:] if line.startswith("ERR") else
+                                                                     "the vision encoder stopped"))
+            rows = video_rows(line)
+            self.videos[key] = rows
+            return self._remember(key, out, rows.groups * rows.rows)[0], rows
+
+    def _encv(self, video: Path, out: Path, words: str) -> str:
+        """One ENCV round trip with the sidecar: its `OK <groups> ...` or `ERR ...` line."""
+        self.proc.stdin.write(f"ENCV {video} {out} {words}\n".rstrip() + "\n")
+        self.proc.stdin.flush()
+        try:
+            return self._readline(VISION_ENCODE_S, "the video could not be read").strip()
+        except RuntimeError as e:
+            self.stopped = True
+            raise ValueError(str(e)) from None
+
     def _pin(self, key: str, pins: list[str]) -> None:
         self.pinned[key] = self.pinned.get(key, 0) + 1
         pins.append(key)
@@ -289,6 +381,7 @@ class Vision:
             path, _, size = self.cache.pop(k)
             path.unlink(missing_ok=True)
             self.cache_bytes -= size
+            self.videos.pop(k, None)
 
     def close(self):
         if self.proc is None:
@@ -315,9 +408,18 @@ class EngineVision(Vision):
         self.cache: dict[str, tuple[Path, int, int]] = {}
         self.cache_bytes = 0
         self.pinned: dict[str, int] = {}
+        self.videos: dict[str, VideoRows] = {}
 
     def attach(self, engine) -> None:
         self.engine = engine
+
+    def video_state(self):
+        """Whether the engine's encoder reads video, from its start lines; None before the engine has run."""
+        return getattr(self.engine, "video", None)
+
+    def _encv(self, video: Path, out: Path, words: str) -> str:
+        """ENCV over the engine's own pipe: the engine borrows its slots once for the video's groups."""
+        return self.engine.encode_video(video, out, words)
 
     def alive(self) -> bool:                            # the engine's life is the engine's business
         return True
