@@ -1,6 +1,6 @@
 """Documents in message content: Anthropic `document` blocks, Chat Completions `file` parts and Responses `input_file`
 parts become the text and image items every API's content is made of. A PDF gives its text layer page by page; a page
-without text whose content is an embedded image (a scan) gives that image to the vision encoder. Plain-text documents
+with little or no text gives its main embedded image (a scan, a slide's picture) to the vision encoder too. Plain-text documents
 give their text. Reading the same bytes again is a cache hit, so a document resent on every turn of a conversation
 renders the same prompt and costs no second parse."""
 from __future__ import annotations
@@ -23,6 +23,8 @@ DOCUMENT_PARTS = ("document", "file", "input_file")
 MAX_DOCUMENT_BYTES = 64 << 20       # one document's bytes after base64
 MAX_PAGES = 600                     # pages read from one PDF
 MIN_SCAN_PIXELS = 64 * 64           # a smaller image on a page without text is decoration, not the page
+SPARSE_TEXT = 200                   # a page with less text is read with its main image too (a stamped scan, a slide)
+MIN_PICTURE_PIXELS = 512 * 512      # the main image of a page that has some text must be this large
 _CACHE_ENTRIES = 32
 
 _cache: OrderedDict[str, tuple] = OrderedDict()
@@ -230,28 +232,25 @@ def _read_pdf(data: bytes, name: str) -> tuple[int, tuple]:
             body = _clean(page.extract_text() or "")
         except Exception as e:  # noqa: BLE001
             raise ValueError(f"document {name!r}: page {k + 1} could not be read: {e}") from None
-        if body:
-            chars += len(body)
-            text.append(f"[page {k + 1}]\n{body}\n")
-            continue
-        image = _scan_of(page)
+        chars += len(body)
+        image = None if len(body) >= SPARSE_TEXT else _scan_of(page, MIN_PICTURE_PIXELS if body else MIN_SCAN_PIXELS)
         if image is None:
-            text.append(f"[page {k + 1}: no text]\n")
+            text.append(f"[page {k + 1}]\n{body}\n" if body else f"[page {k + 1}: no text]\n")
             continue
         scans += 1
-        text.append(f"[page {k + 1}: scanned, as an image]\n")
+        text.append(f"[page {k + 1}, with its image]\n{body}\n" if body else f"[page {k + 1}: scanned, as an image]\n")
         items.append(_text_item("\n".join(text)))
         items.append({"type": "image_url", "image_url": image})
         text = []
     if text:
         items.append(_text_item("\n".join(text)))
-    print(f"[server] document: {_quoted(name)} {n} pages, {scans} scanned, {chars} chars of text, "
+    print(f"[server] document: {_quoted(name)} {n} pages, {scans} as images, {chars} chars of text, "
           f"{time.monotonic() - t0:.2f}s", flush=True)
     return n, tuple(items)
 
 
-def _scan_of(page) -> str | None:
-    """The largest embedded image of a page as a data: URL, or None when the page has none worth reading."""
+def _scan_of(page, min_pixels: int) -> str | None:
+    """The largest embedded image of a page as a data: URL, or None when it has fewer than `min_pixels`."""
     try:
         images = list(page.images)
     except Exception:  # noqa: BLE001  an image filter pypdf cannot decode
@@ -267,7 +266,7 @@ def _scan_of(page) -> str | None:
         pixels = pil.width * pil.height
         if pixels > size:
             best, size = (img, pil), pixels
-    if best is None or size < MIN_SCAN_PIXELS:
+    if best is None or size < min_pixels:
         return None
     img, pil = best
     if (pil.format or "").upper() == "JPEG" and img.data[:2] == b"\xff\xd8":

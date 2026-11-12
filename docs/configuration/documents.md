@@ -19,7 +19,9 @@ harness on the same machine can name the file instead of sending its bytes on ev
 - A PDF's text layer, page by page, inside `<document name="..." pages="N">` with a `[page K]` line before each page, so the model can
   name pages. A `context` (Anthropic) comes first, in `<context>`.
 - A page with no text whose content is an image (a scan) is that image, read by the vision encoder like any image in a message
-  (`[page K: scanned, as an image]`). It needs `--vision`; a system prompt cannot hold one. A page with neither says `[page K: no text]`.
+  (`[page K: scanned, as an image]`). A page with under 200 characters of text (a slide, a stamped scan) gives its text and then its
+  largest image, when that has at least 512 x 512 pixels (`[page K, with its image]`). Images need `--vision`; a system prompt cannot
+  hold one. A page with neither text nor image says `[page K: no text]`.
 - A text document (`text/*`, JSON, YAML, XML) is its text. A `content` document (Anthropic) is its own text and image blocks.
 
 The same bytes give the same text every time, and a parsed PDF is kept, so a conversation that resends its document on every turn keeps
