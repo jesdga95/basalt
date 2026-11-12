@@ -20,7 +20,6 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     lps: list[dict] = []
     lps_reasoning: list[dict] = []
     lps_tools: dict[int, list[dict]] = {}
-    closed = 0                                     # tool calls finished: a call token belongs to call `closed`
 
     def chunk(delta, finish=None):
         choice = {"index": 0, "delta": delta, "finish_reason": finish}
@@ -40,16 +39,15 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         if kind == "ping":
             yield None
         elif kind == "logprobs":
-            channel, entry = x
+            channel, entry, index = x
             if channel == "content":
                 lps.append(entry)
             elif channel == "reasoning":
                 lps_reasoning.append(entry)
             else:
-                lps_tools.setdefault(closed, []).append(entry)
+                lps_tools.setdefault(index, []).append(entry)
         elif kind == "event":
             ev: Event = x
-            closed += ev.kind == "tool_call"
             if ev.kind == "reasoning" and ev.text:
                 yield chunk({"reasoning_content": ev.text})
             elif ev.kind == "content" and ev.text:

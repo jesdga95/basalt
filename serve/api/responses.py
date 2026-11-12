@@ -423,7 +423,7 @@ class Assembler:
         out.append(self.event("response.output_item.done", output_index=at, item=copy.deepcopy(item)))
         return out
 
-    def logprob(self, channel: str, entry: dict) -> None:
+    def logprob(self, channel: str, entry: dict, index: int | None = None) -> None:
         """A generated token's logprobs (Service.run's "logprobs" event): the answer's ride its next text delta."""
         if channel == "content":
             self.lps.append(entry)

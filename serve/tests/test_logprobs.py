@@ -51,14 +51,14 @@ class FakeService:
 
     def run(self, *a, **kw):
         a, b = ToolCall("read", {"path": "x"}), ToolCall("bash", {"cmd": "ls"})
-        yield "logprobs", ("reasoning", lp("hm"))
+        yield "logprobs", ("reasoning", lp("hm"), None)
         yield "event", Event("reasoning", "hm")
-        yield "logprobs", ("content", lp("Hi"))
+        yield "logprobs", ("content", lp("Hi"), None)
         yield "event", Event("content", "Hi")
-        yield "logprobs", ("tool", lp("<call"))
-        yield "logprobs", ("tool", lp(">", -2.0))
+        yield "logprobs", ("tool", lp("<call"), 0)
+        yield "logprobs", ("tool", lp(">", -2.0), 0)
         yield "event", Event("tool_call", call=a)
-        yield "logprobs", ("tool", lp("<call"))
+        yield "logprobs", ("tool", lp("<call"), 1)
         yield "event", Event("tool_call", call=b)
         yield "done", {"finish": "stop", "completion_tokens": 6}
 
@@ -76,6 +76,47 @@ class Channels(unittest.TestCase):
     def test_off(self):
         r = openai_collect(openai_chunks(FakeService(), {}, [1, 2], True, [], 64, None))
         self.assertNotIn("logprobs", r["choices"][0])
+
+
+class ChannelRules(unittest.TestCase):
+    """Channels over a parser's states and events, token by token, as Service.run feeds it."""
+
+    def test_thinking_answer_and_held_tokens(self):
+        c, out = logprobs.Channels(thinking=True), []
+        out += c.token(lp("Let"), "reasoning", "reasoning", [Event("reasoning", "Let")])
+        out += c.token(lp("</th"), "reasoning", "reasoning", [])             # a held piece of the close
+        out += c.token(lp("ink>"), "reasoning", "content", [])               # the close: in neither text
+        out += c.token(lp("\n\n"), "content", "content", [])                # the blank after it: held
+        out += c.token(lp("Hi"), "content", "content", [Event("content", "Hi")])
+        self.assertEqual([(ch, e["token"]) for ch, e, _ in out], [("reasoning", "Let"), ("content", "Hi")])
+
+    def test_held_reasoning_text_goes_with_the_close(self):
+        c = logprobs.Channels(thinking=True)
+        self.assertEqual(c.token(lp("\n"), "reasoning", "reasoning", []), [])
+        out = c.token(lp("</think>"), "reasoning", "content", [Event("reasoning", "\n")])
+        self.assertEqual([(ch, e["token"]) for ch, e, _ in out], [("reasoning", "\n")])
+
+    def test_calls_and_their_markup(self):
+        a, b = ToolCall("read", {}), ToolCall("bash", {})
+        c, out = logprobs.Channels(thinking=False), []
+        out += c.token(lp("\n\n"), "content", "content", [])
+        out += c.token(lp("<calls>"), "content", "call", [])
+        out += c.token(lp("<invoke read>"), "call", "call", [Event("tool_start", call=a)])
+        out += c.token(lp("</invoke>"), "call", "call", [Event("tool_call", call=a)])
+        out += c.token(lp("<invoke bash>"), "call", "call", [])
+        out += c.token(lp("</invoke>"), "call", "call", [Event("tool_call", call=b)])
+        out += c.token(lp("</calls>"), "call", "content", [])
+        out += c.finish([])
+        self.assertEqual([(ch, i, e["token"]) for ch, e, i in out],
+                         [("tool", 0, "\n\n"), ("tool", 0, "<calls>"), ("tool", 0, "<invoke read>"),
+                          ("tool", 0, "</invoke>"), ("tool", 1, "<invoke bash>"), ("tool", 1, "</invoke>"),
+                          ("tool", 1, "</calls>")])
+
+    def test_written_by_the_server(self):
+        c = logprobs.Channels(thinking=True)
+        out = c.token(lp("hm"), "reasoning", "reasoning", [])
+        out += c.token(None, "reasoning", "content", [Event("reasoning", "hm")])   # the budget's close
+        self.assertEqual([(ch, e["token"]) for ch, e, _ in out], [("reasoning", "hm")])
 
 
 class Responses(unittest.TestCase):

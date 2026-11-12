@@ -61,3 +61,50 @@ def entry(tok, t: Token) -> dict:
         return {"token": raw.decode("utf-8", errors="replace"), "logprob": lp, "bytes": list(raw)}
     lp, alts = t.lp
     return {**one(int(t), lp), "top_logprobs": [one(i, v) for i, v in alts]}
+
+
+class Channels:
+    """Which text each generated token's entry belongs to: the thinking ("reasoning"), the answer ("content") or tool
+    call i ("tool", i). A token the parser holds (part of a tag, a blank) waits for the next event that shows text; the
+    thinking's close and the blank after it are in neither text and are left out, so each channel's entries join to
+    its text (a call's entries are its tokens as the model wrote them, markup included)."""
+
+    def __init__(self, thinking: bool):
+        self.thinking, self.pending, self.calls, self.answered, self.last = thinking, [], 0, False, None
+
+    def token(self, entry: dict | None, state0: str, state1: str, evs) -> list[tuple]:
+        """A token fed to the parser (`entry` None: one the server wrote itself), the parser's state before and after
+        it and its events: the entries whose channel is now known, as (channel, entry, call index or None)."""
+        shows = [ev for ev in evs if ev.text or ev.kind in ("tool_start", "tool_call")]
+        if state0 == "reasoning" and state1 != "reasoning":
+            entry = None                                 # the thinking's close: in neither text
+            if not any(ev.kind == "reasoning" and ev.text for ev in evs):
+                self.pending.clear()                     # (held pieces of the tag)
+        if entry is not None:
+            self.pending.append(entry)
+        if not shows:
+            return []
+        out = self._flush(shows[0].kind)
+        self.calls += sum(ev.kind == "tool_call" for ev in evs)
+        return out
+
+    def finish(self, evs) -> list[tuple]:
+        """The parser's last events: the entries still waiting go with them, else with the last call or the answer."""
+        shows = [ev for ev in evs if ev.text or ev.kind in ("tool_start", "tool_call")]
+        if shows:
+            return self._flush(shows[0].kind)
+        if self.pending and self.last is not None and self.last[0] == "tool":
+            return self._flush("tool_call", self.calls - 1)  # a call's closing markup after its event
+        return self._flush("content") if self.pending else []
+
+    def _flush(self, kind: str, index: int | None = None) -> list[tuple]:
+        channel = "reasoning" if kind == "reasoning" else "content" if kind == "content" else "tool"
+        if channel == "tool" and index is None:
+            index = self.calls
+        out, self.pending = self.pending, []
+        if channel == "content" and self.thinking and not self.answered:
+            while out and not out[0]["token"].strip():   # the blank between the thinking and the answer
+                out.pop(0)
+        self.answered = self.answered or channel == "content"
+        self.last = (channel, index if channel == "tool" else None)
+        return [(channel, e, self.last[1]) for e in out]
