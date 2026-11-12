@@ -56,9 +56,6 @@ std::wstring to_wide_path(const std::string& utf8) {
     return L"\\\\?\\" + full;
 }
 
-namespace {
-/// The way back, for a path the OS names (its own module path, a resolved path, the temp directory). An empty
-/// result means the name could not be read or is not representable.
 std::string to_utf8(const wchar_t* w) {
     const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
     if (n <= 0) return std::string();
@@ -67,6 +64,8 @@ std::string to_utf8(const wchar_t* w) {
     s.pop_back();
     return s;
 }
+
+namespace {
 
 /// This thread's handle for reading `fd`, valid until the read that asked for it is done. A handle opened without
 /// FILE_FLAG_OVERLAPPED serializes the I/O issued through it, so threads reading through one shared descriptor would

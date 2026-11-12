@@ -31,6 +31,9 @@ std::wstring to_wide(const std::string& utf8);
 /// accept is made absolute and given the `\\?\` prefix, so it opens whether or not the system's long-path policy is
 /// on (the manifest's `longPathAware` only takes effect where it is). Shorter paths convert as `to_wide` does.
 std::wstring to_wide_path(const std::string& utf8);
+
+/// UTF-16 back to UTF-8, for a name the OS hands out. Empty when the name cannot be read or is not representable.
+std::string to_utf8(const wchar_t* w);
 #endif
 
 /// Opens `path` as `mode` spells it ("rb", "wb", "ab"). nullptr on failure. `mode` is passed through as given: text
