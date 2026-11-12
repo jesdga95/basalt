@@ -20,7 +20,7 @@ import json
 import time
 import uuid
 
-from serve.api.logprobs import MAX_TOP as MAX_TOP_LOGPROBS
+from serve.api.logprobs import MAX_TOP as MAX_TOP_LOGPROBS, REQUEST_KEY as LOGPROBS_KEY
 from serve.frontend import IMAGE_PARTS, Event, _late_system_to_user, _parts_of, effort_kwargs, stable_tool_order
 
 ENCRYPTED_PREFIX = "basalt.r1:"                   # our own reasoning replay strings; others' are ignored
@@ -349,6 +349,11 @@ class Assembler:
         self.seq = 0
         self.item = None                             # the open output item
         self.lps: list[dict] = []                    # the answer tokens' logprobs not yet in a delta
+        # Basalt's: a reasoning item's and each call item's tokens, on the item as `logprobs`
+        self.want_lp = req.get(LOGPROBS_KEY) is not None
+        self.lps_reasoning: list[dict] = []
+        self.lps_tools: dict[int, list[dict]] = {}
+        self.calls: list[dict] = []                  # the call items, in order: tool call i is calls[i]
         reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
         self.response = {
             "id": rid or new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
@@ -383,6 +388,10 @@ class Assembler:
     def _open(self, item) -> list[dict]:
         self.response["output"].append(item)
         self.item = item
+        if self.want_lp and item["type"] in ("reasoning", "function_call", "custom_tool_call"):
+            item["logprobs"] = []
+            if item["type"] != "reasoning":
+                self.calls.append(item)
         out = [self.event("response.output_item.added", output_index=self.index, item=copy.deepcopy(item))]
         if item["type"] == "message":
             part = {"type": "output_text", "text": "", "annotations": [], "logprobs": []}
@@ -401,6 +410,8 @@ class Assembler:
             return []
         at, out = self.response["output"].index(item), []
         item["status"] = status
+        if self.want_lp and item in self.calls:
+            item["logprobs"] += self.lps_tools.pop(self.calls.index(item), [])
         if item["type"] == "message":
             part = item["content"][0]
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,
@@ -424,9 +435,14 @@ class Assembler:
         return out
 
     def logprob(self, channel: str, entry: dict, index: int | None = None) -> None:
-        """A generated token's logprobs (Service.run's "logprobs" event): the answer's ride its next text delta."""
+        """A generated token's logprobs (Service.run's "logprobs" event): the answer's and the thinking's ride their next
+        text delta, a call's go on its item when it closes."""
         if channel == "content":
             self.lps.append(entry)
+        elif channel == "reasoning":
+            self.lps_reasoning.append(entry)
+        else:
+            self.lps_tools.setdefault(index, []).append(entry)
 
     def feed(self, ev: Event) -> list[dict]:
         out = []
@@ -439,8 +455,12 @@ class Assembler:
                 out += self._open({"id": new_id("rs"), "type": "reasoning", "status": "in_progress", "summary": [],
                                    "content": [{"type": "reasoning_text", "text": ""}]})
             self.item["content"][0]["text"] += ev.text
+            extra = {}
+            if self.want_lp:
+                self.item["logprobs"] += self.lps_reasoning
+                extra, self.lps_reasoning = {"logprobs": self.lps_reasoning}, []
             out.append(self.event("response.reasoning_text.delta", item_id=self.item["id"], output_index=self.index,
-                                  content_index=0, delta=ev.text))
+                                  content_index=0, delta=ev.text, **extra))
         elif kind == "content":
             if not ev.text:
                 return out
@@ -500,6 +520,10 @@ class Assembler:
         # an open call was cut off: incomplete whatever the finish
         unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
         out = self.close("incomplete" if length or unfinished else "completed")
+        for k, entries in sorted(self.lps_tools.items()):    # a call's closing markup, after its item closed
+            if k < len(self.calls):
+                self.calls[k]["logprobs"] += entries
+        self.lps_tools.clear()
         n = done.get("completion_tokens", 0)
         prompt = done.get("prompt_tokens", self.prompt_tokens)
         self.response["usage"] = {

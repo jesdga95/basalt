@@ -39,7 +39,7 @@ them, and decode speed stays within a few percent.
   (`[{index, content}]`, each call's tokens as the model wrote them, markup included): the least likely token of a call is where
   the model guessed.
 - **Responses:** `include: ["message.output_text.logprobs"]` with `top_logprobs` fills `output_text.logprobs` and each
-  `response.output_text.delta`.
+  `response.output_text.delta`; Basalt adds `logprobs` to reasoning and call items (and to `response.reasoning_text.delta`).
 - **Anthropic Messages** (a Basalt extension; the API has no such field): the same `logprobs` and `top_logprobs`. Each
   `content_block_delta` carries `logprobs`, the entries of its tokens; the message, or else `message_delta`, carries the
   `logprobs` object above.
