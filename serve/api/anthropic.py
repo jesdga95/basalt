@@ -9,8 +9,9 @@ from serve.prompt import tokens_known
 from serve.service import Service
 
 
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, session=None):
-    mid = "msg_" + uuid.uuid4().hex[:24]
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, session=None,
+                     live=None):
+    mid = live.id if live else "msg_" + uuid.uuid4().hex[:24]
 
     def start():
         return "message_start", {"type": "message_start", "message": {
@@ -27,7 +28,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, session=session):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, session=session, live=live):
         if not started and (kind != "ping" or tokens_known(ids)):
             started = True
             yield start()

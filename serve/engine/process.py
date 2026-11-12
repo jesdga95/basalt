@@ -714,13 +714,17 @@ class ProcessEngine:
         except (OSError, AttributeError):                # the pipe is gone
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
-    def _control(self, cancel, on_token, stop_when=None, idle=None):
+    def _control(self, cancel, on_token, stop_when=None, idle=None, stop_soon=None):
         """Read the control lines of a GEN/BGEN, yielding None as heartbeat and False per token (on_token gets the id).
-        Ends at DONE (solo) or BADM; `stop_when()` true sends STOP once. `idle()` runs whenever no line came for
-        0.5 s: a prompt read beside the slots' windows sends no progress line."""
+        Ends at DONE (solo) or BADM; `stop_when()` true sends STOP once, and so does `stop_soon` once set (checked
+        as well whenever the consumer comes back). `idle()` runs whenever no line came for 0.5 s: a prompt read
+        beside the slots' windows sends no progress line."""
         stopped = False
         beat = time.monotonic()
         while True:
+            if not stopped and stop_soon is not None and stop_soon.is_set() and self._ctl_mode == "solo":
+                self._send("STOP")
+                stopped = True
             try:
                 # polls the cancel event every 0.5 s; the HTTP heartbeat stays at 10 s
                 line = self.lines.get(timeout=0.5)
@@ -973,7 +977,7 @@ class ProcessEngine:
             return (sum(1 for b in self.slot_busy if not b) >= free and
                     any(e[0] * 2 <= plen for e in self.wait_lens))
 
-    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None, session=None, stop_soon=None):
         """--batch: run solo (GEN) while alone, move to a batch slot (BGEN) when others arrive, and return to solo
         when left alone. Prompt reads and admissions take the control lines one at a time; a long read may give way
         to a much shorter waiting one (BYIELD). An early-leaving consumer is STOPped/BSTOPped and drained."""
@@ -1039,7 +1043,7 @@ class ProcessEngine:
                     def others():       # a request waiting moves this one into a slot, if one can ever hold it
                         with self.slot_cv:
                             return self.waiting > 0
-                    for x in self._control(cancel, pending.append, stop_when=others):
+                    for x in self._control(cancel, pending.append, stop_when=others, stop_soon=stop_soon):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
@@ -1074,7 +1078,8 @@ class ProcessEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in self.eos_ids()):
+                        soft = stop_soon is not None and stop_soon.is_set()
+                        if cancel.is_set() or soft or left <= 0 or finish in ("stop", "length") or (out and out[-1] in self.eos_ids()):
                             self._carry_run(carry, first, last0, True)
                             return
                         self._carry_run(carry, first, last0, False)
@@ -1164,6 +1169,9 @@ class ProcessEngine:
                 gen0 = len(out) if notok else len(out) - 1  # the admission's token, if any; the slot feeds it first
                 going_solo = False
                 while True:
+                    if not stop_sent and not going_solo and stop_soon is not None and stop_soon.is_set():
+                        self._send(f"BSTOP {slot}")             # the windows under way still come, then BDONE
+                        stop_sent = True
                     try:
                         line = self.slot_q[slot].get(timeout=10.0)
                     except queue.Empty:
@@ -1197,7 +1205,8 @@ class ProcessEngine:
                         # the slot holds the prompt and every token fed (all but the last)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         again = (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
-                                 and not (out and out[-1] in self.eos_ids()))
+                                 and not (out and out[-1] in self.eos_ids())
+                                 and not (stop_soon is not None and stop_soon.is_set()))
                         self._carry_run(carry, first, last0, not again)
                         if again:
                             # continue on the solo path
@@ -1308,9 +1317,11 @@ class ProcessEngine:
         self.slot_owner[slot] = session
         self.session_slot[session] = slot
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None, stop_soon=None):
         """Yield token ids, and None as a 10 s heartbeat while the engine is quiet. An early-leaving consumer or
-        `cancel` makes the engine STOP."""
+        `cancel` makes the engine STOP. `stop_soon` (an Event), once set, makes it STOP too, but the tokens of the
+        windows already under way still come and the generator ends at the DONE: the engine holds exactly the prompt
+        and every token yielded but the last, so a next request that extends them reads only its new tokens."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         text = ids if isinstance(ids, PromptText) else None
@@ -1318,7 +1329,7 @@ class ProcessEngine:
             ids, max_new = text.resolve(int(max_new), self.max_context)    # this engine takes ids
             text = None
         if getattr(self, "batch", 0):
-            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, session)
+            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, session, stop_soon)
             return
         self.progress = None
         self.prefill_tok_s_mean = None
@@ -1343,8 +1354,18 @@ class ProcessEngine:
         allow = silence + min(len(ids), PP_CHUNK_MAX) / PP_FLOOR_TOK_S if silence > 0 else 0.0
         heard, read_to = time.monotonic(), 0
         beat = heard
+        soft_sent = False
         try:
             while True:
+                if not soft_sent and stop_soon is not None and stop_soon.is_set():
+                    if not self.can_stop:
+                        return                            # an engine that cannot stop early: STOP and drain below
+                    try:
+                        self.proc.stdin.write("STOP\n")
+                        self.proc.stdin.flush()
+                    except OSError:
+                        pass
+                    soft_sent = True
                 wait = 10.0
                 if allow > 0:
                     wait = min(wait, allow - (time.monotonic() - heard))
