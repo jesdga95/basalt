@@ -778,11 +778,12 @@ class ParallelService(unittest.TestCase):
         self.assertEqual(self.engine.slot_owner, {})
 
     def test_the_session_headers_a_load_balancer_sends_all_count(self):
-        self.start(4)
+        self.start(6)
         self.together([(lambda h=h, n=n: self.chat_session("turn " * n, {h: "s-" + h}))
                        for n, h in enumerate(("x-llm-flow-id", "x-claude-code-session-id", "x-session-id",
-                                              "x-session-affinity"))])
-        for h in ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity"):
+                                              "x-session-affinity", "x-grok-conv-id", "x-grok-session-id"))])
+        for h in ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity",
+                  "x-grok-conv-id", "x-grok-session-id"):
             self.assertIn("s-" + h, self.engine.session_slot, h)
 
     def test_overlapping_requests_of_one_session_spread_over_slots(self):

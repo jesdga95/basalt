@@ -60,9 +60,11 @@ def make_handler(target: Service | Router):
         sse_open = False                                    # the stream's headers went out
 
         # a request's session identity, the headers a load balancer names its flows by (tinyllb's order), then the
-        # request body's own field; the slot the engine runs a conversation in follows it.  Deliberately not here:
-        # x-client-request-id, which identifies one request and would give every turn a session of its own.
-        SESSION_HEADERS = ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity")
+        # request body's own field; the slot the engine runs a conversation in follows it.  The grok build CLI names
+        # its conversations with x-grok-conv-id / x-grok-session-id on every request, to any base URL.  Deliberately
+        # not here: x-client-request-id, which identifies one request and would give every turn a session of its own.
+        SESSION_HEADERS = ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity",
+                           "x-grok-conv-id", "x-grok-session-id")
 
         def _session_id(self, req) -> str | None:
             """The conversation this request belongs to, or None when it names no session (admission is prompt-only)."""
