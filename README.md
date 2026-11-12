@@ -53,6 +53,7 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 | Drafting | MTP, on by default | DSpark, on by default |
 | Images | yes | yes |
 | Documents (PDF, text) | yes | yes |
+| Video | yes, with FFmpeg ([video](docs/running.md#video)) | no |
 | Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) |
 | Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) |
 
