@@ -566,7 +566,9 @@ def make_handler(target: Service | Router):
             version = getattr(svc.engine, "info", {}).get("version")
             if version:
                 props["build_info"] = "basalt " + str(version)
-            props["basalt"] = {"version": str(version) if version else None, "capabilities": list(CAPABILITIES)}
+            # "video" only where a video can be read: image input on, a model that reads video, FFmpeg found
+            props["basalt"] = {"version": str(version) if version else None,
+                               "capabilities": list(CAPABILITIES) + (["video"] if svc.video_on() else [])}
             self._json(200, props)
 
         def _control_body(self) -> bool:

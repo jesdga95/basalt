@@ -264,6 +264,14 @@ class AnswerNowServer(unittest.TestCase):
         self.engine.info = {"version": "0.4.0"}
         _, _, props = self.request("/props")
         self.assertEqual((props["build_info"], props["basalt"]["version"]), ("basalt 0.4.0", "0.4.0"))
+        # "video" while the encoder reads video, and not when it found no FFmpeg
+        base = ["answer_now", "logprobs", "documents"]
+        for state, caps in (("on FFmpeg 8 (test)", base + ["video"]), ("off no FFmpeg libraries found", base)):
+            self.svc.vision = type("V", (), {"video_state": lambda _self, s=state: s})()
+            _, _, props = self.request("/props")
+            self.assertEqual(props["basalt"]["capabilities"], caps, state)
+            self.assertEqual(props["modalities"]["video"], len(caps) == len(base) + 1)
+        self.svc.vision = None
 
 
 class AnswerNowBatchSlots(AnswerNowServer):
