@@ -1362,6 +1362,8 @@ class Service:
                 Path(emb).unlink(missing_ok=True)
         last_evs = cut(parser.finish())
         if lp_channels is not None:
+            if stops is not None and stops.hit is not None:
+                lp_channels.pending.clear()             # the stop string's tokens: not in the answer
             for item in lp_channels.finish(last_evs):
                 yield "logprobs", item
         for ev in last_evs:

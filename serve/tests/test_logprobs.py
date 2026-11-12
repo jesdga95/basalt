@@ -31,6 +31,14 @@ class Check(unittest.TestCase):
         self.assertEqual(logprobs.engine_key(0), " logprobs=0")
         self.assertEqual(logprobs.engine_key(5), " logprobs=5")
 
+    def test_gen_line(self):
+        from serve.engine.process import ProcessEngine
+        base = {"temperature": 0.7, "top_p": 0.9, "seed": 3}
+        self.assertNotIn("logprobs", ProcessEngine.sampling_keys(base))                       # unasked: the line as before
+        self.assertNotIn("logprobs", ProcessEngine.sampling_keys({**base, logprobs.REQUEST_KEY: None}))
+        self.assertEqual(ProcessEngine.sampling_keys({**base, logprobs.REQUEST_KEY: 4}),
+                         ProcessEngine.sampling_keys(base) + " logprobs=4")
+
     def test_line_and_token(self):
         parsed = logprobs.parse_line("7 -0.5 7:-0.5 9:-1.25".split())
         self.assertEqual(parsed, (7, -0.5, [(7, -0.5), (9, -1.25)]))
@@ -227,6 +235,13 @@ class Api(unittest.TestCase):
         part = [o for o in out["output"] if o["type"] == "message"][0]["content"][0]
         self.assertEqual(part["text"], "ok, done.")
         self.check_entries("ok, done.", part["logprobs"], 2)
+
+    def test_stop_string(self):
+        self.start(0)
+        r = self.post({"logprobs": True, "stop": [" done"]})
+        choice = r["choices"][0]
+        self.assertEqual(choice["message"]["content"], "ok,")
+        self.check_entries("ok,", choice["logprobs"]["content"], 0)
 
     def test_bad_request(self):
         self.start(0)
