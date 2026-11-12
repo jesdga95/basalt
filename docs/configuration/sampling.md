@@ -27,9 +27,16 @@ cap, `reasoning_budget_tokens` wins over `thinking_budget_tokens`, then `reasoni
 
 ## Thinking
 
-- **Budget:** with `answer-room` on and a cap of at least 1,024 tokens, thinking is limited to the cap minus `min(max(512, cap // 4), cap // 2)`.
-  An 8,192-token cap allows 6,144 thinking tokens, and 2,048 remain for the close and the answer. Reserved space does not guarantee a
-  complete answer.
+- **Budget:** `answer-room` keeps output tokens for the close and the answer by limiting the thinking to the cap minus the reserve. A smaller
+  budget (the request's, else the entry's `reasoning-budget-tokens`) still wins. Reserved space does not guarantee a complete answer.
+  - `auto` (the default): the reserve is `min(max(512, cap // 4), cap // 2)`. An 8,192-token cap allows 6,144 thinking tokens and keeps
+    2,048; a 700-token cap allows 350 and keeps 350. A cap under 32 tokens is left as it is.
+  - A whole number `N`: a fixed reserve at any cap, larger or smaller than `auto`'s, so thinking is limited to `cap - N` (`1024` with a
+    4,096-token cap leaves 3,072). `0` reserves nothing. An `N` of the cap or more leaves thinking one token.
+  - In a config file the value is `"auto"` or a whole number, written `100` or `"100"`; on the command line, `--answer-room auto` or
+    `--answer-room 100`. A negative number, `true`, `false` or any other text is refused at start.
+  Examples: `"answer-room": "auto"`, `"answer-room": 2048` (think longer at large caps), `"answer-room": 0` (no reserve).
+  - A request's explicit budget of 0 or less opts out in every mode.
 
 ## Answer now
 

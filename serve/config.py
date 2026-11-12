@@ -109,6 +109,13 @@ def option_words(where: str, key, value, act, here: Path) -> list[str]:
             return ["--vision", vision_mode(value)]
         except ValueError as e:
             raise ValueError(f"{where}.{key}: {e}") from None
+    if name == "answer-room":                          # auto, or a whole number of tokens as a number or a string
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError(f'{where}.{key}: "auto" or a whole number of tokens (0 = none), not {value!r}')
+        try:
+            return [flag, str(answer_room(str(value)))]
+        except argparse.ArgumentTypeError as e:
+            raise ValueError(f"{where}.{key}: {e}") from None
     if act.nargs == 0:                                 # a switch
         if not isinstance(value, bool):
             raise ValueError(f"{where}.{key}: true or false")
@@ -485,6 +492,19 @@ def budget_count(text: str) -> int:
     return n
 
 
+def answer_room(text: str) -> str | int:
+    """argparse type: auto, or a whole number of tokens >= 0 (0: none)."""
+    if text == "auto":
+        return text
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected auto or a whole number of tokens >= 0, not {text!r}") from None
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"expected auto or a whole number of tokens >= 0, not {n}")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)
@@ -580,7 +600,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--thinking-loop-tokens", type=budget_count, default=256, metavar="N",
                     help="end the thinking and let the model answer when it repeats one token this many times in a "
                          "row inside the thinking (0 = never)")
-    ap.add_argument("--answer-room", action=argparse.BooleanOptionalAction, default=True,
-                    help="reserve space for closing the thinking and the answer when the output cap is at least 1024 tokens; "
-                         "an explicit request budget of 0 opts out")
+    ap.add_argument("--answer-room", type=answer_room, default="auto", metavar="auto|N",
+                    help="output tokens kept for closing the thinking and the answer: auto (a quarter of the cap, at "
+                         "least 512, at most half) or a whole number of tokens (0 = none); an explicit request budget "
+                         "of 0 opts out")
     return ap

@@ -44,8 +44,9 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                          "elaboration."}
 # the Qwen dialect's closer of thinking; other dialects carry their own
 REASONING_CLOSE = "\n</think>\n\n"
-# Reserve output tokens for closing the thinking and the answer above this cap.
-ANSWER_ROOM_MIN_CAP = 1024
+# Automatic answer room: thinking leaves the answer max(512, cap // 4) tokens, at most half the cap; a cap below
+# ANSWER_ROOM_MIN_CAP is too small to split and is left as it is.
+ANSWER_ROOM_MIN_CAP = 32
 ANSWER_RESERVE_MIN = 512
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
@@ -142,7 +143,7 @@ class Service:
         self.before_load = None
         self.vram_reserve = None                         # last POST /v1/vram reserve (None: the start's)
         self.reasoning_budget_tokens = 0                 # default thinking budget (0: none)
-        self.answer_room = True                          # reserve output space when thinking
+        self.answer_room: str | int = "auto"             # answer reserve when thinking: "auto" or a fixed token count (0: none)
         self.thinking_loop_tokens = 256                  # one token repeated this often in the thinking ends it (0: off)
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = {t for s in self.dialect.stop_texts for t in tokenizer.encode(s, parse_special=True)}
@@ -175,7 +176,13 @@ class Service:
 
     def answer_budget(self, req, max_new: int, budget: int | None) -> int | None:
         """Limit thinking to leave answer space; an explicit non-positive request budget opts out."""
-        if not self.answer_room or max_new < ANSWER_ROOM_MIN_CAP:
+        if self.answer_room == "auto":
+            if max_new < ANSWER_ROOM_MIN_CAP:
+                return budget
+            reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+        elif self.answer_room > 0:
+            reserve = min(self.answer_room, max_new - 1)       # thinking keeps at least one token
+        else:
             return budget
         request_budget = self.reasoning_budget(req, use_default=False)
         # None also means an absent field: distinguish it from an explicit opt-out.
@@ -185,9 +192,9 @@ class Service:
             or isinstance(thinking, dict) and thinking.get("budget_tokens") is not None
         if explicit and request_budget is None:
             return budget
-        room = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+        room = max_new - reserve
         if budget is None or budget > room:
-            print(f"[server] thinking budget {room} tokens, output cap {max_new} (--no-answer-room disables)",
+            print(f"[server] thinking budget {room} tokens, output cap {max_new} (answer-room {self.answer_room})",
                   flush=True)
             return room
         return budget
