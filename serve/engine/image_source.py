@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from serve.security import is_ip
 
 IMAGE_MAX_BYTES = 32 << 20                      # one image's bytes, from any source
-VIDEO_MAX_BYTES = 64 << 20                      # one video's bytes, from any source
+VIDEO_MAX_BYTES = 1 << 30                       # one video's bytes, from any source (a minute of 4K is 300-400 MB)
 IMAGE_READ_S = 60.0                             # one source's whole read, name lookup and connect included
 USER_AGENT = "local-server"
 USAGE = "an image must be a data: URL, an http(s) URL or a local file path"

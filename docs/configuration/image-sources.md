@@ -10,7 +10,7 @@ from this machine. A [document](documents.md) named by URL or path follows the s
 | path or `file:` URL | yes, any file the server's user can read | only under a directory named with `--image-dir` |
 
 Limits for every source: 32 MiB and 64 megapixels per image, 60 s per read, regular files only, 1 GiB of files per request.
-Videos follow the same rules, with 64 MiB per video and 256 MiB per request.
+Videos follow the same rules, with 1 GiB per video and per request.
 
 **This machine** means a loopback peer with no forwarding header, no non-local `Host`, and no `Origin` or `Sec-Fetch-Site` other than
 `none` (any web page counts as remote, including the server's own page). `--image-remote-only` makes every request remote.
