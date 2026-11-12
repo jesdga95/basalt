@@ -11,16 +11,16 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
-constexpr int kPart = 4 + 2 * kLogprobMaxTop;
-constexpr int kMaxVocab = 1 << 20;              // the widest head the merge's shared memory holds   // a chunk's scratch: max, (pad), exp sum (double), top ids, top values
+constexpr int kPart = 4 + 2 * kLogprobMaxTop;   // a chunk's scratch: max, (pad), exp sum (double), top ids, top values
+constexpr int kMaxVocab = 1 << 20;              // the widest head the merge's shared memory holds
 
 // the better of two (value, id) entries: the larger value, ties to the lower id
 __device__ __forceinline__ bool better(float v, int i, float bv, int bi) { return v > bv || (v == bv && i < bi); }
 // ranked after (pv, pi): what the next argmax round may take
 __device__ __forceinline__ bool after(float v, int i, float pv, int pi) { return v < pv || (v == pv && i > pi); }
 
-// The block's best (value, id) among the entries ranked after (pv, pi): each thread's own `v`/`i`, then the warps, then
-// thread 0 of each warp through shared memory. Every thread gets the result.
+// The block's best (value, id) of every thread's own `bv`/`bi`: within each warp, then across the warps through shared
+// memory. Every thread gets the result.
 __device__ void block_best(float& bv, int& bi, float* s_v, int* s_i, int tid) {
     for (int o = 16; o > 0; o >>= 1) {
         const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
