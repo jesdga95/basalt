@@ -78,13 +78,6 @@ __device__ __forceinline__ void spin_ge(const unsigned* c, unsigned target) {
             if (mkb_now() - t0_ > basalt::kernels::kWaitPollNs && mkb_give_up(t0_, 2, __LINE__)) return;
     }
 }
-__device__ __forceinline__ void hop_copy(const unsigned* ctr, unsigned target, void* dst, const void* src, unsigned bytes, uint64_t* bar) {
-    spin_ge(ctr, target);
-    asm volatile("fence.proxy.async.global;" ::: "memory");
-    pfence();
-    mbar_expect_tx(bar, bytes);
-    bulk_g2s(dst, src, bytes, bar);
-}
 __device__ __forceinline__ void pf_l2(const void* p, size_t n) {   // n multiple of 16
     const char* c = (const char*) p;
 #pragma unroll 1
@@ -94,7 +87,7 @@ __device__ __forceinline__ void pf_l2(const void* p, size_t n) {   // n multiple
     }
 }
 
-enum { PB_WD = 0, PB_WU = 1, PB_A = 2, PB_SLOT = 3, PB_REC = 7, PB_OX = 8, PB_OW = 9 };   // bits of the parity register
+enum { PB_WD = 0, PB_WU = 1, PB_A = 2, PB_SLOT = 3, PB_REC = 7, PB_OW = 9 };   // bits of the parity register
 #define MW(bar, bit) do { mwait(bar, (PH >> (bit)) & 1u); PH ^= 1u << (bit); } while (0)
 enum { C_H1DN, C_H1UP, C_PAIR, C_REC, C_OUT, C_H2DN, C_H2UP, C_RT, C_END, C_REL, C_PZ, NCTR = 16 };
 struct RecS {   // rec_rank's RecSmem with q/k/v for RXT tokens at a time, the alpha/beta rows shared by the 4 ranks
