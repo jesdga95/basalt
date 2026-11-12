@@ -75,6 +75,31 @@ class VmanControllerTest(unittest.TestCase):
             VmanModelController({"x": "rm -rf"}, lambda: None)
 
 
+class ReadyTest(unittest.TestCase):
+    def test_waits_for_the_model_after_a_switch_and_after_the_restore(self):
+        f = Fake("strata")
+        polls = []
+        def ready(profile):
+            polls.append(profile)
+            return len([p for p in polls if p == profile]) >= 3       # the third probe of each profile answers
+        c = VmanModelController({"big": "strata", "little": "llm"}, f.current, f.run, ready=ready, poll_s=0)
+        c.load("little")
+        self.assertEqual(polls, ["llm"] * 3)
+        c.release("little")
+        self.assertEqual(polls, ["llm"] * 3 + ["strata"] * 3)
+        self.assertEqual(f.mode, "strata")
+
+    def test_a_model_that_never_loads_is_an_error(self):
+        f = Fake("strata")
+        c = VmanModelController({"little": "llm"}, f.current, f.run, ready=lambda p: False, ready_timeout_s=0.05, poll_s=0.01)
+        with self.assertRaisesRegex(VmanError, "not ready"):
+            c.load("little")
+
+    def test_default_controller_probes_over_http(self):
+        from serve.mantle.vman_controller import http_ready
+        self.assertFalse(http_ready("strata", base="http://127.0.0.1:9", timeout_s=0.5))   # nothing listens: not ready
+
+
 class StateFileTest(unittest.TestCase):
     def read(self, text):
         with tempfile.TemporaryDirectory() as d:
