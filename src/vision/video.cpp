@@ -5,7 +5,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <thread>
 
 #include "basalt/vision/ffmpeg_api.hpp"
@@ -140,6 +145,26 @@ std::string times_text(const std::vector<double>& times) {
 
 namespace {
 
+// The CUDA device context NVDEC decodes on, one per GPU for the life of the process, on the GPU's primary context
+// (the one the CUDA runtime uses, so the engine's and the encoder's work and FFmpeg's share it). Null with `why` when
+// FFmpeg cannot open one (no driver, no CUDA support in this FFmpeg build).
+ff::AVBufferRef* nvdec_device(const Ffmpeg& F, int gpu, std::string& why) {
+    static std::mutex m;
+    static std::map<int, ff::AVBufferRef*> devices;
+    static std::map<int, std::string> failed;
+    std::lock_guard<std::mutex> l(m);
+    if (auto it = devices.find(gpu); it != devices.end()) return it->second;
+    if (auto it = failed.find(gpu); it != failed.end()) { why = it->second; return nullptr; }
+    ff::AVBufferRef* d = nullptr;
+    const int r = F.av_hwdevice_ctx_create(&d, ff::kHwDeviceCuda, std::to_string(gpu).c_str(), nullptr, ff::kCudaUsePrimaryContext);
+    if (r < 0 || d == nullptr) {
+        failed[gpu] = why = "FFmpeg cannot open GPU " + std::to_string(gpu) + " for NVDEC: " + F.error_text(r);
+        return nullptr;
+    }
+    devices[gpu] = d;
+    return d;
+}
+
 // One open video stream and its decoder; closes both when it goes.
 struct Reader {
     const Ffmpeg& F;
@@ -161,7 +186,7 @@ struct Reader {
         if (fmt != nullptr) F.avformat_close_input(&fmt);
     }
 
-    bool open(const std::string& path, std::string& err) {
+    bool open(const std::string& path, std::string& err, int gpu = -1) {
         int r = F.avformat_open_input(&fmt, path.c_str(), nullptr, nullptr);
         if (r < 0) { fmt = nullptr; err = "FFmpeg cannot open the video: " + F.error_text(r); return false; }
         if ((r = F.avformat_find_stream_info(fmt, nullptr)) < 0) { err = "FFmpeg cannot read the video: " + F.error_text(r); return false; }
@@ -183,6 +208,15 @@ struct Reader {
         if ((r = F.avcodec_parameters_to_context(ctx, ff::field<ff::AVCodecParameters*>(st, F.abi.st_codecpar))) < 0) {
             err = "FFmpeg cannot set up the decoder: " + F.error_text(r);
             return false;
+        }
+        // NVDEC where the GPU and FFmpeg's build allow: FFmpeg's default format choice takes the device's frames
+        // when a device is set, and decodes in software itself when NVDEC refuses the stream
+        if (gpu >= 0) {
+            std::string why;
+            if (ff::AVBufferRef* dev = nvdec_device(F, gpu, why)) {
+                ff::AVBufferRef* ref = F.av_buffer_ref(dev);
+                std::memcpy((unsigned char*) ctx + F.abi.cc_hw_device_ctx, &ref, sizeof ref);
+            }
         }
         ff::AVDictionary* opts = nullptr;
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
@@ -214,15 +248,184 @@ struct Reader {
     }
 };
 
+// The sampled frames' conversion: worker threads, each with its own swscale context, take (frame, slot) jobs from a
+// short queue (a few frames in flight bound the memory), convert to RGB with the frame's colour matrix and range as
+// PyAV does, resize to the canvas and write the slot. The first error stops the rest.
+class Converters {
+public:
+    Converters(const Ffmpeg& f, const ff::AbiRow& a, Video& v, int n) : F(f), A(a), V(v), n_(n) {}
+    Converters(const Converters&) = delete;
+    Converters& operator=(const Converters&) = delete;
+    ~Converters() { finish(); }
+
+    void start() {
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        const int workers = (int) std::clamp(hw / 4, 1u, 8u);
+        cap_ = (size_t) workers * 2;
+        for (int t = 0; t < std::min(workers, n_); ++t) threads_.emplace_back([this] { run(); });
+    }
+
+    void push(ff::AVFrame* f, size_t slot, int cs, int range) {
+        std::unique_lock<std::mutex> l(m_);
+        room_.wait(l, [&] { return q_.size() < cap_ || !error_.empty(); });
+        if (!error_.empty()) { F.av_frame_free(&f); return; }
+        q_.push_back({f, slot, cs, range});
+        ready_.notify_one();
+    }
+
+    /// Waits for the queued frames; returns the first error, or "".
+    std::string finish() {
+        {
+            std::lock_guard<std::mutex> l(m_);
+            done_ = true;
+        }
+        ready_.notify_all();
+        for (auto& t : threads_) t.join();
+        threads_.clear();
+        std::lock_guard<std::mutex> l(m_);
+        for (Job& j : q_) F.av_frame_free(&j.f);
+        q_.clear();
+        V.ms_convert = convert_ms_;
+        return error_;
+    }
+
+private:
+    struct Job { ff::AVFrame* f; size_t slot; int cs, range; };
+
+    void run() {
+        ff::SwsContext* sws = nullptr;
+        int sw = 0, sh = 0, sf = -1, scs = -1, sr = -1;
+        double ms = 0;
+        for (;;) {
+            Job j;
+            {
+                std::unique_lock<std::mutex> l(m_);
+                ready_.wait(l, [&] { return !q_.empty() || done_; });
+                if (q_.empty()) break;
+                j = q_.front();
+                q_.pop_front();
+                room_.notify_one();
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            const std::string e = convert(j, sws, sw, sh, sf, scs, sr);
+            ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            F.av_frame_free(&j.f);
+            if (!e.empty()) {
+                std::lock_guard<std::mutex> l(m_);
+                if (error_.empty()) error_ = e;
+                room_.notify_all();
+            }
+        }
+        if (sws != nullptr) F.sws_freeContext(sws);
+        std::lock_guard<std::mutex> l(m_);
+        convert_ms_ = std::max(convert_ms_, ms);
+    }
+
+    std::string convert(const Job& j, ff::SwsContext*& sws, int& sw, int& sh, int& sf, int& scs, int& sr) {
+        const int w = ff::field<int>(j.f, ff::kFrameWidth), h = ff::field<int>(j.f, ff::kFrameHeight);
+        int pf = ff::field<int>(j.f, ff::kFrameFormat);
+        uint8_t* data[ff::kNumDataPointers];
+        int linesize[ff::kNumDataPointers];
+        std::memcpy(data, (const unsigned char*) j.f + ff::kFrameData, sizeof data);
+        std::memcpy(linesize, (const unsigned char*) j.f + ff::kFrameLinesize, sizeof linesize);
+        // NVDEC's frames come back with their chroma interleaved (NV12, P010); a software decoder's are planar, and
+        // swscale converts the two through different routines. The chroma is split into planes first (no value
+        // changes), so a frame converts the same whichever decoder made it.
+        std::vector<uint8_t> planes;
+        if (pf == ff::kPixFmtNv12 || pf == A.pix_fmt_p010) {
+            const bool ten = pf != ff::kPixFmtNv12;
+            const int cw = (w + 1) / 2, ch = (h + 1) / 2, bytes = ten ? 2 : 1;
+            planes.resize((size_t) w * h * bytes + (size_t) 2 * cw * ch * bytes);
+            uint8_t* y = planes.data();
+            uint8_t* u = y + (size_t) w * h * bytes;
+            uint8_t* v = u + (size_t) cw * ch * bytes;
+            for (int r = 0; r < h; ++r) {
+                const uint8_t* s = data[0] + (size_t) r * linesize[0];
+                if (!ten) {
+                    std::memcpy(y + (size_t) r * w, s, (size_t) w);
+                } else {
+                    for (int x = 0; x < w; ++x) {   // P010 keeps the 10 bits at the top of each 16-bit word
+                        uint16_t q;
+                        std::memcpy(&q, s + 2 * x, 2);
+                        q = (uint16_t) (q >> 6);
+                        std::memcpy(y + ((size_t) r * w + x) * 2, &q, 2);
+                    }
+                }
+            }
+            for (int r = 0; r < ch; ++r) {
+                const uint8_t* s = data[1] + (size_t) r * linesize[1];
+                for (int x = 0; x < cw; ++x) {
+                    if (!ten) {
+                        u[(size_t) r * cw + x] = s[2 * x];
+                        v[(size_t) r * cw + x] = s[2 * x + 1];
+                    } else {
+                        uint16_t a, b;
+                        std::memcpy(&a, s + 4 * x, 2);
+                        std::memcpy(&b, s + 4 * x + 2, 2);
+                        a = (uint16_t) (a >> 6);
+                        b = (uint16_t) (b >> 6);
+                        std::memcpy(u + ((size_t) r * cw + x) * 2, &a, 2);
+                        std::memcpy(v + ((size_t) r * cw + x) * 2, &b, 2);
+                    }
+                }
+            }
+            data[0] = y; data[1] = u; data[2] = v; data[3] = nullptr;
+            linesize[0] = w * bytes; linesize[1] = linesize[2] = cw * bytes; linesize[3] = 0;
+            pf = ten ? ff::kPixFmtYuv420p10 : ff::kPixFmtYuv420p;
+        }
+        if (sws == nullptr || w != sw || h != sh || pf != sf) {
+            if (sws != nullptr) F.sws_freeContext(sws);
+            sws = F.sws_getContext(w, h, pf, w, h, ff::kPixFmtRgb24, ff::kSwsBilinear, nullptr, nullptr, nullptr);
+            sw = w; sh = h; sf = pf; scs = -1; sr = -1;
+            if (sws == nullptr) return "FFmpeg cannot convert the video's pixel format";
+        }
+        // an unspecified matrix is BT.601, an unspecified range the format's own
+        if (j.cs != scs || j.range != sr) {
+            int *inv = nullptr, *tbl = nullptr, src_range = 0, dst_range = 0, bri = 0, con = 0, sat = 0;
+            if (F.sws_getColorspaceDetails(sws, &inv, &src_range, &tbl, &dst_range, &bri, &con, &sat) >= 0) {
+                if (j.range == ff::kRangeMpeg) src_range = 0;
+                else if (j.range == ff::kRangeJpeg) src_range = 1;
+                F.sws_setColorspaceDetails(sws, F.sws_getCoefficients(j.cs), src_range, tbl, dst_range, bri, con, sat);
+            }
+            scs = j.cs;
+            sr = j.range;
+        }
+        Image img;
+        img.w = w;
+        img.h = h;
+        img.rgb.resize((size_t) w * h * 3);
+        uint8_t* dst[4] = {img.rgb.data(), nullptr, nullptr, nullptr};
+        const int dst_stride[4] = {w * 3, 0, 0, 0};
+        F.sws_scale(sws, data, linesize, 0, h, dst, dst_stride);
+        const Image c = video_frame_to_canvas(img, V.canvas);
+        std::memcpy(&V.frames[j.slot * c.rgb.size()], c.rgb.data(), c.rgb.size());
+        return "";
+    }
+
+    const Ffmpeg& F;
+    const ff::AbiRow& A;
+    Video& V;
+    int n_;
+    size_t cap_ = 2;
+    std::mutex m_;
+    std::condition_variable ready_, room_;
+    std::deque<Job> q_;
+    std::vector<std::thread> threads_;
+    std::string error_;
+    bool done_ = false;
+    double convert_ms_ = 0;
+};
+
 }  // namespace
 
 bool read_video(const std::string& path, const VideoOptions& o, Video& out, std::string& err) {
+    const auto t_start = std::chrono::steady_clock::now();
     std::string why;
     const Ffmpeg* F = ffmpeg(why);
     if (F == nullptr) { err = "this process cannot read video: " + why; return false; }
     const ff::AbiRow& a = F->abi;
     Reader rd(*F);
-    if (!rd.open(path, err)) return false;
+    if (!rd.open(path, err, o.gpu)) return false;
     const ff::AVRational tb = ff::field<ff::AVRational>(rd.st, a.st_time_base);
     const ff::AVCodecParameters* par = ff::field<ff::AVCodecParameters*>(rd.st, a.st_codecpar);
     const int pw = ff::field<int>(par, a.par_width), ph = ff::field<int>(par, a.par_height);
@@ -258,13 +461,16 @@ bool read_video(const std::string& path, const VideoOptions& o, Video& out, std:
     out.fps = fps;
     out.indices = sample_indices(total, fps, o);
     const int64_t n = (int64_t) out.indices.size();
-    if (pw > 0 && ph > 0 && n * pw * (int64_t) ph > o.max_sampled_pixels) {
-        err = "the video's sampled frames are " + std::to_string((long long) (n * pw * (int64_t) ph >> 20)) +
-              " megapixels; the limit is " + std::to_string((long long) (o.max_sampled_pixels >> 20));
+    // what is held is each sampled frame at its canvas (a frame is resized as it is decoded); a source frame is
+    // only decoded one at a time, and FFmpeg allocates it before anything is checked: its own size is capped
+    if ((int64_t) pw * ph > o.max_frame_pixels) {
+        err = "the video's frames are " + std::to_string(pw) + "x" + std::to_string(ph) + "; the limit is " +
+              std::to_string((long long) (o.max_frame_pixels >> 20)) + " megapixels a frame";
         return false;
     }
-    ff::SwsContext* sws = nullptr;
-    int sws_w = 0, sws_h = 0, sws_fmt = -1, sws_cs = -1, sws_range = -1;
+    // Sampled frames go to converters on worker threads (to RGB with the frame's own colour matrix, then resized
+    // to the canvas); a frame NVDEC decoded is copied to the host first, the others never leave the device.
+    Converters conv(*F, a, out, (int) n);
     size_t k = 0;
     int64_t i = 0;
     int r;
@@ -274,53 +480,44 @@ bool read_video(const std::string& path, const VideoOptions& o, Video& out, std:
         if (k == 0 && pw > 0 && (fw != pw || fh != ph)) { err = F->version + ": layout check failed"; break; }
         F->av_frame_apply_cropping(rd.frm, 0);
         const int w = ff::field<int>(rd.frm, ff::kFrameWidth), h = ff::field<int>(rd.frm, ff::kFrameHeight);
-        const int pf = ff::field<int>(rd.frm, ff::kFrameFormat);
-        if (w <= 0 || h <= 0 || pf < 0) { err = "FFmpeg returned an empty frame"; break; }
+        if (w <= 0 || h <= 0 || ff::field<int>(rd.frm, ff::kFrameFormat) < 0) { err = "FFmpeg returned an empty frame"; break; }
         if (k == 0) {
             out.src_w = w;
             out.src_h = h;
+            out.decoder = ff::field<int>(rd.frm, ff::kFrameFormat) == a.pix_fmt_cuda ? "nvdec" : "cpu";
             out.canvas = fit_video((int) n, w, h, o);
             if (out.canvas.w == 0) { err = "the video's frames are " + std::to_string(w) + "x" + std::to_string(h) + ", too narrow"; break; }
-            out.frames.reserve((size_t) n * out.canvas.w * out.canvas.h * 3);
-        }
-        if (sws == nullptr || w != sws_w || h != sws_h || pf != sws_fmt) {
-            if (sws != nullptr) F->sws_freeContext(sws);
-            sws = F->sws_getContext(w, h, pf, w, h, ff::kPixFmtRgb24, ff::kSwsBilinear, nullptr, nullptr, nullptr);
-            sws_w = w; sws_h = h; sws_fmt = pf; sws_cs = -1; sws_range = -1;
-            if (sws == nullptr) { err = "FFmpeg cannot convert the video's pixel format"; break; }
-        }
-        // the frame's own colour matrix and range, as the reference's decoder converts (an unspecified matrix is
-        // BT.601, an unspecified range the format's own)
-        const int cs = ff::field<int>(rd.frm, a.fr_colorspace), range = ff::field<int>(rd.frm, a.fr_color_range);
-        if (cs != sws_cs || range != sws_range) {
-            int *inv = nullptr, *tbl = nullptr, src_range = 0, dst_range = 0, bri = 0, con = 0, sat = 0;
-            if (F->sws_getColorspaceDetails(sws, &inv, &src_range, &tbl, &dst_range, &bri, &con, &sat) >= 0) {
-                if (range == ff::kRangeMpeg) src_range = 0;
-                else if (range == ff::kRangeJpeg) src_range = 1;
-                F->sws_setColorspaceDetails(sws, F->sws_getCoefficients(cs), src_range, tbl, dst_range, bri, con, sat);
+            if (n * out.canvas.w * (int64_t) out.canvas.h > o.max_held_pixels) {
+                err = "the video's sampled frames would hold " + std::to_string((long long) (n * out.canvas.w * (int64_t) out.canvas.h >> 20)) +
+                      " megapixels; the limit is " + std::to_string((long long) (o.max_held_pixels >> 20));
+                break;
             }
-            sws_cs = cs;
-            sws_range = range;
+            out.frames.assign((size_t) n * out.canvas.w * out.canvas.h * 3, 0);
+            conv.start();
         }
-        Image img;
-        img.w = w;
-        img.h = h;
-        img.rgb.resize((size_t) w * h * 3);
-        uint8_t* dst[4] = {img.rgb.data(), nullptr, nullptr, nullptr};
-        const int dst_stride[4] = {w * 3, 0, 0, 0};
-        uint8_t* data[ff::kNumDataPointers];
-        int linesize[ff::kNumDataPointers];
-        std::memcpy(data, (const unsigned char*) rd.frm + ff::kFrameData, sizeof data);
-        std::memcpy(linesize, (const unsigned char*) rd.frm + ff::kFrameLinesize, sizeof linesize);
-        F->sws_scale(sws, data, linesize, 0, h, dst, dst_stride);
-        const Image c = video_frame_to_canvas(img, out.canvas);
-        out.frames.insert(out.frames.end(), c.rgb.begin(), c.rgb.end());
+        // the colour fields stay the decoded frame's: a copy to the host does not carry them
+        const int cs = ff::field<int>(rd.frm, a.fr_colorspace), range = ff::field<int>(rd.frm, a.fr_color_range);
+        ff::AVFrame* job = nullptr;
+        if (ff::field<int>(rd.frm, ff::kFrameFormat) == a.pix_fmt_cuda) {
+            const auto t0 = std::chrono::steady_clock::now();
+            job = F->av_frame_alloc();
+            const int tr = job != nullptr ? F->av_hwframe_transfer_data(job, rd.frm, 0) : -1;
+            out.ms_copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (tr < 0) { if (job) F->av_frame_free(&job); err = "copying a decoded frame from the GPU failed: " + F->error_text(tr); break; }
+        } else {
+            job = F->av_frame_clone(rd.frm);
+            if (job == nullptr) { err = "FFmpeg is out of memory"; break; }
+        }
+        conv.push(job, k, cs, range);
         ++k;
     }
-    if (sws != nullptr) F->sws_freeContext(sws);
+    const std::string cerr = conv.finish();
+    if (err.empty()) err = cerr;
     if (!err.empty()) return false;
     if (k == 0) { err = "no frame of the video could be decoded"; return false; }
     out.indices.resize(k);   // a container that claims more frames than it holds: the tail is gone
+    out.frames.resize(k * (size_t) out.canvas.w * out.canvas.h * 3);
+    out.ms_total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     return true;
 }
 

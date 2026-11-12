@@ -22,9 +22,11 @@ struct VideoOptions {
     int max_tokens = 8192;             ///< merged tokens over all groups (a volume of max_tokens * 2048 pixels)
     int min_volume = 4096;             ///< the smallest frames x height x width volume
     int group_tokens = 4096;           ///< the most merged tokens one group may have (the encoder's sized picture)
-    double max_seconds = 600;          ///< decode guards: the source's length, frames and sampled source pixels
-    int64_t max_source_frames = 100000;
-    int64_t max_sampled_pixels = 128ll << 20;
+    double max_seconds = 600;          ///< decode guards: the source's length and frames, one decoded frame's
+    int64_t max_source_frames = 100000;   ///< pixels, and the pixels of the sampled frames held at their canvas
+    int64_t max_frame_pixels = 64ll << 20;
+    int64_t max_held_pixels = 256ll << 20;
+    int gpu = -1;                      ///< the CUDA device NVDEC decodes on; -1: decode on the CPU
 };
 
 /// The source indices to sample from a video of `total` frames at `src_fps` (no fps: 24).
@@ -50,6 +52,8 @@ struct Video {
     double fps = 0;                    ///< the source's frame rate
     std::vector<int64_t> indices;      ///< the sampled source frames
     std::vector<uint8_t> frames;       ///< indices.size() frames of the canvas, RGB
+    std::string decoder;               ///< "nvdec" or "cpu": where the frames were decoded
+    double ms_total = 0, ms_copy = 0, ms_convert = 0;   ///< all of read_video; GPU-to-host copies; the busiest converter
     int groups() const { return ((int) indices.size() + 1) / 2; }
 };
 

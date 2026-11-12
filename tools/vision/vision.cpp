@@ -167,6 +167,7 @@ int main(int argc, char** argv) {
             std::string vid_path, out_path;
             VideoOptions vo;
             vo.group_tokens = geo.max_tokens;
+            vo.gpu = gpu ? 0 : -1;   // NVDEC on the encoder's own card
             Video v;
             if (!parse_encv(line, vid_path, out_path, vo, err) || !read_video(vid_path, vo, v, err)) {
                 std::printf("ERR %s\n", err.c_str());

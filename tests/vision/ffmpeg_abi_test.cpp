@@ -5,6 +5,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 }
 
@@ -41,6 +42,13 @@ int main() {
     eq(offsetof(AVCodecParameters, height), row->par_height, "AVCodecParameters.height");
     eq(offsetof(AVFrame, color_range), row->fr_color_range, "AVFrame.color_range");
     eq(offsetof(AVFrame, colorspace), row->fr_colorspace, "AVFrame.colorspace");
+    eq(offsetof(AVCodecContext, hw_device_ctx), row->cc_hw_device_ctx, "AVCodecContext.hw_device_ctx");
+    eq(AV_PIX_FMT_CUDA, row->pix_fmt_cuda, "AV_PIX_FMT_CUDA");
+    eq(AV_PIX_FMT_P010LE, row->pix_fmt_p010, "AV_PIX_FMT_P010LE");
+    eq(AV_PIX_FMT_YUV420P, ff::kPixFmtYuv420p, "AV_PIX_FMT_YUV420P");
+    eq(AV_PIX_FMT_NV12, ff::kPixFmtNv12, "AV_PIX_FMT_NV12");
+    eq(AV_PIX_FMT_YUV420P10LE, ff::kPixFmtYuv420p10, "AV_PIX_FMT_YUV420P10LE");
+    eq(AV_HWDEVICE_TYPE_CUDA, ff::kHwDeviceCuda, "AV_HWDEVICE_TYPE_CUDA");
     eq(AVCOL_RANGE_MPEG, ff::kRangeMpeg, "AVCOL_RANGE_MPEG");
     eq(AVCOL_RANGE_JPEG, ff::kRangeJpeg, "AVCOL_RANGE_JPEG");
     eq(offsetof(AVFormatContext, nb_streams), ff::kFmtNbStreams, "AVFormatContext.nb_streams");
