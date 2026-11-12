@@ -28,6 +28,10 @@ struct Ffmpeg {
     ff::av_dict_set_fn av_dict_set = nullptr;
     ff::av_dict_free_fn av_dict_free = nullptr;
     ff::av_log_set_level_fn av_log_set_level = nullptr;
+    ff::av_frame_clone_fn av_frame_clone = nullptr;
+    ff::av_hwdevice_ctx_create_fn av_hwdevice_ctx_create = nullptr;
+    ff::av_buffer_ref_fn av_buffer_ref = nullptr;
+    ff::av_hwframe_transfer_data_fn av_hwframe_transfer_data = nullptr;
 
     ff::avformat_version_fn avformat_version = nullptr;
     ff::avformat_open_input_fn avformat_open_input = nullptr;

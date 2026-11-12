@@ -24,6 +24,7 @@ struct AVPacket;
 struct AVDictionary;
 struct AVInputFormat;
 struct SwsContext;
+struct AVBufferRef;
 struct SwsFilter;
 
 struct AVRational {
@@ -34,10 +35,15 @@ inline double q2d(AVRational r) { return r.den != 0 ? (double) r.num / (double) 
 
 constexpr int kMediaTypeVideo = 0;          // AVMEDIA_TYPE_VIDEO
 constexpr int kPixFmtRgb24 = 2;             // AV_PIX_FMT_RGB24
+constexpr int kPixFmtYuv420p = 0;           // AV_PIX_FMT_YUV420P
+constexpr int kPixFmtNv12 = 23;             // AV_PIX_FMT_NV12
+constexpr int kPixFmtYuv420p10 = 62;        // AV_PIX_FMT_YUV420P10LE
 constexpr int kSwsBilinear = 2;             // SWS_BILINEAR
 constexpr int kSwsFullChrHInt = 0x2000;     // SWS_FULL_CHR_H_INT
 constexpr int kSwsAccurateRnd = 0x40000;    // SWS_ACCURATE_RND
 constexpr int kLogQuiet = -8;               // AV_LOG_QUIET
+constexpr int kHwDeviceCuda = 2;            // AV_HWDEVICE_TYPE_CUDA
+constexpr int kCudaUsePrimaryContext = 1;   // AV_CUDA_USE_PRIMARY_CONTEXT
 constexpr int kRangeMpeg = 1;               // AVCOL_RANGE_MPEG (limited)
 constexpr int kRangeJpeg = 2;               // AVCOL_RANGE_JPEG (full)
 constexpr int kNumDataPointers = 8;         // AV_NUM_DATA_POINTERS
@@ -56,6 +62,10 @@ using av_strerror_fn = int (*)(int errnum, char* buf, size_t size);
 using av_dict_set_fn = int (*)(AVDictionary** pm, const char* key, const char* value, int flags);
 using av_dict_free_fn = void (*)(AVDictionary** m);
 using av_log_set_level_fn = void (*)(int level);
+using av_frame_clone_fn = AVFrame* (*)(const AVFrame* src);
+using av_hwdevice_ctx_create_fn = int (*)(AVBufferRef** device_ctx, int type, const char* device, AVDictionary* opts, int flags);
+using av_buffer_ref_fn = AVBufferRef* (*)(const AVBufferRef* buf);
+using av_hwframe_transfer_data_fn = int (*)(AVFrame* dst, const AVFrame* src, int flags);
 
 using avformat_version_fn = unsigned (*)();
 using avformat_open_input_fn = int (*)(AVFormatContext** ps, const char* url, const AVInputFormat* fmt, AVDictionary** options);
@@ -95,13 +105,16 @@ struct AbiRow {
     size_t st_codecpar, st_time_base, st_duration, st_nb_frames, st_avg_frame_rate, st_r_frame_rate;   // AVStream
     size_t par_width, par_height;            // AVCodecParameters.width / height (int)
     size_t fr_color_range, fr_colorspace;    // AVFrame.color_range / colorspace (enums, int)
+    size_t cc_hw_device_ctx;                 // AVCodecContext.hw_device_ctx (AVBufferRef*)
+    int pix_fmt_cuda;                        // AV_PIX_FMT_CUDA
+    int pix_fmt_p010;                        // AV_PIX_FMT_P010LE
 };
 
 /// Newest first: the loader takes the first release whose libraries are all present.
 inline constexpr AbiRow kAbiRows[] = {
-    {"8", 62, 62, 60, 9, 104, 16, 32, 48, 56, 88, 204, 72, 76, 280, 292},
-    {"7", 61, 61, 59, 8, 104, 16, 32, 48, 56, 88, 216, 72, 76, 296, 308},
-    {"6", 60, 60, 58, 7, 72, 16, 32, 48, 56, 88, 216, 56, 60, 320, 332},
+    {"8", 62, 62, 60, 9, 104, 16, 32, 48, 56, 88, 204, 72, 76, 280, 292, 560, 117, 158},
+    {"7", 61, 61, 59, 8, 104, 16, 32, 48, 56, 88, 216, 72, 76, 296, 308, 560, 117, 158},
+    {"6", 60, 60, 58, 7, 72, 16, 32, 48, 56, 88, 216, 56, 60, 320, 332, 864, 117, 159},
 };
 
 // Fields at the same place in every row.

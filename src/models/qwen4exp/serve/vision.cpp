@@ -43,15 +43,18 @@ void QfnRuntime::enc_command(const std::string& cmd) {
     std::vector<Job> jobs;
     const basalt::vision::Geometry geo;
     int max_patches = 0;
+    std::string decoder;   // where a video's frames were decoded
     if (video) {
         std::string vpath, opath, verr;
         basalt::vision::VideoOptions vo;
         vo.group_tokens = geo.max_tokens;
+        cudaGetDevice(&vo.gpu);   // NVDEC on the encoder's card: the frames it copies out stay off the other links
         basalt::vision::Video v;
         if (!basalt::vision::parse_encv(cmd, vpath, opath, vo, verr) || !basalt::vision::read_video(vpath, vo, v, verr)) {
             reply_err(verr);
             return;
         }
+        decoder = v.decoder;
         Job j;
         j.out = opath;
         j.sz = v.canvas;
@@ -195,9 +198,9 @@ void QfnRuntime::enc_command(const std::string& cmd) {
     const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     if (video)
         basalt::log::info("basalt serve", "video encoder: %d groups of %d tokens in %lld cache slots (%.2f GiB), "
-                             "%lld expert rows lent; decode %.0f ms, lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms",
+                             "%lld expert rows lent; decode %.0f ms (%s), lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms",
                      groups, tokens, (long long) k, (double) vis_enc.arena_bytes(tokens) / 1073741824.0, (long long) n_lent,
-                     ms(t0, t_dec), ms(t_dec, t_lent), ms(t_lent, t_up), ms(t_up, t_enc), ms(t_enc, Clock::now()));
+                     ms(t0, t_dec), decoder.c_str(), ms(t_dec, t_lent), ms(t_lent, t_up), ms(t_up, t_enc), ms(t_enc, Clock::now()));
     else
         basalt::log::info("basalt serve", "image encoder: %zu image(s) up to %d tokens in %lld cache slots (%.2f GiB), "
                              "%lld expert rows lent; decode %.0f ms, lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms",
