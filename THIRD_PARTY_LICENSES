@@ -357,6 +357,16 @@ Licensed under the Apache License, Version 2.0, reproduced below.
    limitations under the License.
 
 ================================================================================
+ninfer (https://github.com/Neroued/ninfer), Apache License 2.0
+By Neroued and the ninfer contributors.
+================================================================================
+
+The video input adapts ideas from ninfer, not its code: the decode guards (encoded bytes, source
+length, source frames, sampled source pixels) and their limits, the frame count from the container,
+then the length, then a counting pass, and per-group timestamps with image positions per group
+(src/vision/video.cpp, serve/). Licensed under the Apache License, Version 2.0, reproduced above.
+
+================================================================================
 DeepSeek-V4.1 chat encoding (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), in
 serve/models/deepseek41_encoding.py
 ================================================================================

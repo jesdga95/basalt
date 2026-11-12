@@ -51,6 +51,9 @@ struct Ffmpeg {
     ff::sws_getContext_fn sws_getContext = nullptr;
     ff::sws_scale_fn sws_scale = nullptr;
     ff::sws_freeContext_fn sws_freeContext = nullptr;
+    ff::sws_getCoefficients_fn sws_getCoefficients = nullptr;
+    ff::sws_getColorspaceDetails_fn sws_getColorspaceDetails = nullptr;
+    ff::sws_setColorspaceDetails_fn sws_setColorspaceDetails = nullptr;
 
     /// FFmpeg's text for an error code.
     std::string error_text(int code) const;

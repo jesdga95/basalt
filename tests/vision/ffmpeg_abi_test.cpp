@@ -39,6 +39,10 @@ int main() {
     eq(offsetof(AVStream, r_frame_rate), row->st_r_frame_rate, "AVStream.r_frame_rate");
     eq(offsetof(AVCodecParameters, width), row->par_width, "AVCodecParameters.width");
     eq(offsetof(AVCodecParameters, height), row->par_height, "AVCodecParameters.height");
+    eq(offsetof(AVFrame, color_range), row->fr_color_range, "AVFrame.color_range");
+    eq(offsetof(AVFrame, colorspace), row->fr_colorspace, "AVFrame.colorspace");
+    eq(AVCOL_RANGE_MPEG, ff::kRangeMpeg, "AVCOL_RANGE_MPEG");
+    eq(AVCOL_RANGE_JPEG, ff::kRangeJpeg, "AVCOL_RANGE_JPEG");
     eq(offsetof(AVFormatContext, nb_streams), ff::kFmtNbStreams, "AVFormatContext.nb_streams");
     eq(offsetof(AVFormatContext, streams), ff::kFmtStreams, "AVFormatContext.streams");
     eq(offsetof(AVFrame, data), ff::kFrameData, "AVFrame.data");

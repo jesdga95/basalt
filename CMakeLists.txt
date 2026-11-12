@@ -577,6 +577,12 @@ if(BUILD_TESTING)
   target_link_libraries(ffmpeg_load_test PRIVATE vision_core warnings)
   basalt_embed_manifest(ffmpeg_load_test)
   basalt_cpu_test(NAME ffmpeg_load_test COMMAND ffmpeg_load_test)
+  # video sampling, canvas, timestamps and patches against the reference processor; the committed clip is decoded
+  # where this machine has FFmpeg
+  add_executable(video_test tests/vision/video_test.cpp)
+  target_link_libraries(video_test PRIVATE vision_core warnings)
+  basalt_embed_manifest(video_test)
+  basalt_cpu_test(NAME video_test COMMAND video_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/video/synth.mp4)
   # the hand-declared FFmpeg ABI against FFmpeg's own headers, where this machine has them (nothing is linked)
   find_path(BASALT_FFMPEG_HEADERS libavformat/avformat.h)
   if(BASALT_FFMPEG_HEADERS)
