@@ -68,6 +68,13 @@ def _content(content, param):
             parts.append({"type": "text", "text": part.get("text") or ""})
         elif kind == "refusal":
             parts.append({"type": "text", "text": part.get("refusal") or ""})
+        elif kind == "input_file":
+            if not part.get("file_data"):
+                field = "file_id" if part.get("file_id") else "file_url" if part.get("file_url") else "file_data"
+                raise ResponsesError("only files given as file_data (a data: URL with the file's bytes) are read; "
+                                     "this server keeps no files and fetches none", f"{param}[{j}].{field}",
+                                     "unsupported_parameter")
+            parts.append(part)
         elif kind in IMAGE_PARTS:
             if not part.get("image_url"):
                 print("[server] error: an image part has no image_url", flush=True)
@@ -75,7 +82,7 @@ def _content(content, param):
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
             parts.append({"type": "input_image", "image_url": part["image_url"]})
         else:
-            raise ResponsesError(f"content parts of type {kind!r} are not supported (text and images are)",
+            raise ResponsesError(f"content parts of type {kind!r} are not supported (text, images and files are)",
                                  f"{param}[{j}].type", "unsupported_parameter")
     return _parts_of(parts)
 
@@ -114,7 +121,7 @@ def _arguments(raw, param) -> dict:
 def _tool_output(item, param):
     out = item.get("output")
     if isinstance(out, dict):
-        if out.get("type") in IMAGE_PARTS:
+        if out.get("type") in IMAGE_PARTS or out.get("type") == "input_file":
             return _content([out], param + ".output")
         return json.dumps(out, ensure_ascii=False)   # some clients send a JSON result as an object
     return out if isinstance(out, str) else _content(out, param + ".output")

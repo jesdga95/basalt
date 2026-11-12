@@ -18,6 +18,8 @@ from pathlib import Path
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+from serve.api.documents import expand_documents, has_document
+
 
 # ------------------------------------------------------------------------------------------------ template
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
@@ -135,9 +137,11 @@ def _image_source(part: dict) -> str:
 
 def _parts_of(content):
     """The one form of message and tool result content in every API: a string without images, else its list of text
-    and image items."""
+    and image items. Documents become their text and page images first."""
     if isinstance(content, dict):
         content = [content]
+    if has_document(content):
+        content = expand_documents(content)
     if not _has_image(content):
         return _text_of(content)
     items = []
@@ -486,7 +490,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         parts, reasoning, calls = [], [], []
         for block in content or []:
             kind = block.get("type")
-            if kind in ("text", "input_text", None) or kind in IMAGE_PARTS:
+            if kind in ("text", "input_text", None) or kind in IMAGE_PARTS or kind == "document":
                 parts.append(block)
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
