@@ -14,6 +14,12 @@ A `url` source or a `file_url` is an `http(s)` URL, a `file:` URL or a path, rea
 ([image sources](image-sources.md)): from this machine any of them, from elsewhere only hosts and directories the server allows. A
 harness on the same machine can name the file instead of sending its bytes on every turn.
 
+## Pages
+
+Basalt adds `"pages"` beside a document's other fields (`file.pages` in Chat Completions): pages and ranges such as `"1-5,8"`. Only
+those pages are read, under their own numbers, and the frame says which (`read="1-5,8"`). With a path, a harness can hand the model
+pages 40-55 of a long manual without parsing it.
+
 ## What the model sees
 
 - A PDF's text layer, page by page, inside `<document name="..." pages="N">` with a `[page K]` line before each page, so the model can
@@ -29,7 +35,8 @@ its cached prefix and parses it once.
 
 ## Refusals
 
-Each is a 400 that names the document: a password-protected or unreadable PDF, more than 600 pages, more than 64 MiB, a media type
+Each is a 400 that names the document: a password-protected or unreadable PDF, more than 600 pages read, a page past the end, `pages`
+on a text document, more than 64 MiB, a media type
 other than PDF or text, text that is not UTF-8, a URL or path the image rules refuse. The server keeps no files: a `file_id` or a
 `file` source is refused with the field to send instead. Citations are not produced.
 

@@ -147,6 +147,50 @@ class PdfText(unittest.TestCase):
         self.assertEqual(first[0]["text"].replace('"paper.pdf"', '"other.pdf"'), again[0]["text"])
 
 
+class Pages(unittest.TestCase):
+    """A Basalt extension: "pages" on a document names the PDF pages to read."""
+    BOOK = make_pdf(["Preface", "Chapter one\nThe router.", "Chapter two\nThe experts.", "Index"])
+
+    def setUp(self):
+        documents._cache.clear()
+
+    def read(self, pages) -> str:
+        return documents.expand_documents([{**anthropic_doc(self.BOOK, "book.pdf"), "pages": pages}])[0]["text"]
+
+    def test_named_pages_only_with_their_numbers(self):
+        self.assertEqual(self.read("2-3"), '<document name="book.pdf" pages="4" read="2-3">\n[page 2]\nChapter one\n'
+                                           'The router.\n\n[page 3]\nChapter two\nThe experts.\n</document>')
+        self.assertIn('read="1,3-4"', self.read(" 4, 1 ,3 "))
+        self.assertIn('read="3"', self.read(3))
+        self.assertNotIn("Preface", self.read("2"))
+
+    def test_every_api_takes_pages(self):
+        data_url = "data:application/pdf;base64," + b64(self.BOOK)
+        chat, _, _ = openai_to_messages({"messages": [{"role": "user", "content": [
+            {"type": "file", "file": {"filename": "book.pdf", "file_data": data_url, "pages": "2"}}]}]})
+        responses = input_messages({"input": [{"role": "user", "content": [
+            {"type": "input_file", "filename": "book.pdf", "file_data": data_url, "pages": "2"}]}]})
+        self.assertEqual(chat[0]["content"], self.read("2"))
+        self.assertEqual(responses[0]["content"], self.read("2"))
+
+    def test_pages_lift_the_page_cap(self):
+        with mock.patch.object(documents, "MAX_PAGES", 2):
+            self.assertIn('read="1-2"', self.read("1-2"))
+            with self.assertRaises(ValueError) as e:
+                self.read(None)
+            self.assertIn("name the ones to read", str(e.exception))
+
+    def test_bad_pages(self):
+        for pages, words in (("5", "page 5 is past its end (4 pages)"), ("0", "such as"), ("3-2", "such as"),
+                             ("a", "such as"), ("", "such as"), (True, "such as"), ([1], "such as")):
+            with self.assertRaises(ValueError) as e:
+                self.read(pages)
+            self.assertIn(words, str(e.exception))
+        with self.assertRaises(ValueError) as e:
+            documents.expand_documents([{**anthropic_doc(b"plain", "a.txt", "text/plain"), "pages": "1"}])
+        self.assertIn("pages are named in PDF documents only", str(e.exception))
+
+
 class Scans(unittest.TestCase):
     def setUp(self):
         documents._cache.clear()
@@ -243,7 +287,7 @@ class Refusals(unittest.TestCase):
     def test_too_many_pages(self):
         with mock.patch.object(documents, "MAX_PAGES", 1):
             documents._cache.clear()
-            self.refused(anthropic_doc(PAPER), "has 2 pages; at most 1")
+            self.refused(anthropic_doc(PAPER), "2 pages; at most 1 are read")
 
 
 class ByUrlOrPath(unittest.TestCase):

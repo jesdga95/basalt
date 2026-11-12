@@ -99,13 +99,13 @@ def _document_items(part: dict) -> tuple:
     name = spec.get("filename") or "document"
     if spec.get("file_data"):
         media, data = _data_url(spec["file_data"], kind)
-        return _read(data, media, name, None)
+        return _read(data, media, name, None, spec.get("pages"))
     if spec.get("file_id"):
         raise ValueError(f"{kind}: this server keeps no files, so a file_id cannot be read; send the file's bytes "
                          "as file_data (a data: URL)")
     if isinstance(spec.get("file_url"), str) and spec["file_url"]:
         name = spec.get("filename") or _url_name(spec["file_url"])
-        return _read(_fetch(spec["file_url"], name), "", name, None)
+        return _read(_fetch(spec["file_url"], name), "", name, None, spec.get("pages"))
     raise ValueError(f"a {kind} part needs file_data (a data: URL with the file's bytes) or file_url")
 
 
@@ -117,7 +117,8 @@ def _anthropic(part: dict) -> tuple:
     context = part.get("context") if isinstance(part.get("context"), str) else None
     kind = src.get("type")
     if kind == "base64":
-        return _read(_b64(src.get("data"), "document source.data"), src.get("media_type") or "", name, context)
+        return _read(_b64(src.get("data"), "document source.data"), src.get("media_type") or "", name, context,
+                     part.get("pages"))
     if kind == "text":
         if not isinstance(src.get("data"), str):
             raise ValueError("a text document's source.data must be a string")
@@ -146,7 +147,7 @@ def _anthropic(part: dict) -> tuple:
         if not isinstance(src.get("url"), str) or not src["url"]:
             raise ValueError("a url document needs source.url")
         name = part.get("title") or _url_name(src["url"])
-        return _read(_fetch(src["url"], name), "", name, context)
+        return _read(_fetch(src["url"], name), "", name, context, part.get("pages"))
     raise ValueError(f"document source type {kind!r} is not supported (base64, text and content are)")
 
 
@@ -176,25 +177,28 @@ def _b64(value, what: str) -> bytes:
 
 
 # ------------------------------------------------------------------------------------------------ reading
-def _read(data: bytes, media: str, name: str, context: str | None) -> tuple:
+def _read(data: bytes, media: str, name: str, context: str | None, want=None) -> tuple:
+    """A document's items; `want` (a Basalt extension: "1-5,8") names the PDF pages to read, None all of them."""
     media = media.split(";")[0].strip().lower()
     pdf = data[:1024].lstrip().startswith(b"%PDF-")
     if media == "application/pdf" or (pdf and media in ("", "application/octet-stream")):
         if not pdf:
             raise ValueError(f"document {name!r} is not a PDF (it does not start with %PDF-)")
-        key = "pdf:" + hashlib.sha256(data).hexdigest()
+        key = f"pdf:{hashlib.sha256(data).hexdigest()}:{want!r}"
         with _cache_lock:
             hit = _cache.get(key)
             if hit is not None:
                 _cache.move_to_end(key)
         if hit is None:
-            hit = _read_pdf(data, name)
+            hit = _read_pdf(data, name, want)
             with _cache_lock:
                 _cache[key] = hit
                 while len(_cache) > _CACHE_ENTRIES:
                     _cache.popitem(last=False)
-        pages, items = hit
-        return _framed(name, pages, context, items)
+        pages, read, items = hit
+        return _framed(name, pages, read, context, items)
+    if want is not None:
+        raise ValueError(f"document {name!r}: pages are named in PDF documents only")
     if media.startswith("text/") or media in _TEXT_TYPES or (media in ("", "application/octet-stream") and not pdf):
         try:
             text = data.decode("utf-8-sig")
@@ -204,9 +208,9 @@ def _read(data: bytes, media: str, name: str, context: str | None) -> tuple:
     raise ValueError(f"document {name!r}: media type {media!r} is not read (PDF and text documents are)")
 
 
-def _read_pdf(data: bytes, name: str) -> tuple[int, tuple]:
-    """(pages, items) for a PDF: a text item per run of text pages and an image item per scanned page. Items carry
-    page text only; _framed adds the name and the page count."""
+def _read_pdf(data: bytes, name: str, want) -> tuple[int, str | None, tuple]:
+    """(pages, the pages read as named or None for all, items) for a PDF: a text item per run of text pages and an
+    image item per page read as its image. Items carry page text only; _framed adds the frame."""
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -223,10 +227,12 @@ def _read_pdf(data: bytes, name: str) -> tuple[int, tuple]:
         raise
     except Exception as e:  # noqa: BLE001  pypdf raises many kinds on a damaged file
         raise ValueError(f"document {name!r} could not be read as a PDF: {e}") from None
-    if n > MAX_PAGES:
-        raise ValueError(f"document {name!r} has {n} pages; at most {MAX_PAGES} are read per document")
+    chosen, read = _page_list(want, n, name)
+    if len(chosen) > MAX_PAGES:
+        raise ValueError(f"document {name!r}: {len(chosen)} pages; at most {MAX_PAGES} are read per document "
+                         "(name the ones to read with \"pages\")")
     items, text, scans, chars = [], [], 0, 0
-    for k in range(n):
+    for k in chosen:
         try:
             page = reader.pages[k]
             body = _clean(page.extract_text() or "")
@@ -244,9 +250,39 @@ def _read_pdf(data: bytes, name: str) -> tuple[int, tuple]:
         text = []
     if text:
         items.append(_text_item("\n".join(text)))
-    print(f"[server] document: {_quoted(name)} {n} pages, {scans} as images, {chars} chars of text, "
-          f"{time.monotonic() - t0:.2f}s", flush=True)
-    return n, tuple(items)
+    print(f"[server] document: {_quoted(name)} {n} pages" + (f", read {read}" if read else "") +
+          f", {scans} as images, {chars} chars of text, {time.monotonic() - t0:.2f}s", flush=True)
+    return n, read, tuple(items)
+
+
+def _page_list(want, n: int, name: str) -> tuple[list[int], str | None]:
+    """The 0-based pages `want` names ("3", "1-5", "1-5,8", or a number), in order without repeats, and the 1-based
+    ranges as text; None names every page."""
+    if want is None:
+        return list(range(n)), None
+    if isinstance(want, int) and not isinstance(want, bool):
+        want = str(want)
+    usage = f"document {name!r}: pages must name pages and ranges such as \"1-5,8\", not {want!r}"
+    if not isinstance(want, str) or not want.strip():
+        raise ValueError(usage)
+    chosen = set()
+    for piece in want.split(","):
+        m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?", piece)
+        if not m:
+            raise ValueError(usage)
+        first, last = int(m.group(1)), int(m.group(2) or m.group(1))
+        if first < 1 or last < first:
+            raise ValueError(usage)
+        if last > n:
+            raise ValueError(f"document {name!r}: page {last} is past its end ({n} pages)")
+        chosen.update(range(first - 1, last))
+    pages = sorted(chosen)
+    runs, start = [], pages[0]
+    for a, b in zip(pages, pages[1:] + [None]):
+        if b != a + 1:
+            runs.append(f"{start + 1}" if start == a else f"{start + 1}-{a + 1}")
+            start = b
+    return pages, ",".join(runs)
 
 
 def _scan_of(page, min_pixels: int) -> str | None:
@@ -291,8 +327,9 @@ def _quoted(name: str) -> str:
     return '"' + name.replace('"', "'") + '"'
 
 
-def _header(name: str, pages: int | None, context: str | None) -> str:
-    head = f"<document name={_quoted(name)}" + (f" pages=\"{pages}\"" if pages is not None else "") + ">\n"
+def _header(name: str, pages: int | None, context: str | None, read: str | None = None) -> str:
+    head = (f"<document name={_quoted(name)}" + (f" pages=\"{pages}\"" if pages is not None else "") +
+            (f" read=\"{read}\"" if read else "") + ">\n")
     return head + (f"<context>{context}</context>\n" if context else "")
 
 
@@ -300,10 +337,10 @@ def _wrap(name: str, pages: int | None, context: str | None, body: str) -> str:
     return f"{_header(name, pages, context)}{body}\n</document>"
 
 
-def _framed(name: str, pages: int, context: str | None, items: tuple) -> tuple:
+def _framed(name: str, pages: int, read: str | None, context: str | None, items: tuple) -> tuple:
     """A PDF's cached page items inside its document frame."""
     items = [dict(i) for i in items]
-    head = _header(name, pages, context)
+    head = _header(name, pages, context, read)
     if items and items[0]["type"] == "text":
         items[0]["text"] = head + items[0]["text"]
     else:
