@@ -222,6 +222,7 @@ public:
         // the request's grammar (the batch windows' form of the solo loop's `gguard`): the window's kept picks are
         // scanned, the first refused one is resampled under the mask, and the segment ends there
         std::unique_ptr<basalt::program::grammar::Guard> guard;
+        int lp_top = -1;   ///< the request's logprobs=K: a BP line ahead of the BT line for every kept pick (-1: off)
         // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
         // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
         // history and last proposal

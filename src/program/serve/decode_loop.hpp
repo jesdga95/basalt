@@ -5,6 +5,7 @@
 #pragma once
 
 #include "request.hpp"
+#include "logprobs.hpp"
 #include "reply_rows.hpp"
 
 namespace basalt::program::serve {
@@ -31,6 +32,8 @@ Flow Request::decode_loop(B& b) {
     if (cancelled) finish = "cancel";
 
     const std::vector<int64_t>& eos_ids = runtime_.o.eos_ids;
+    std::vector<float> lp_row;              // logprobs=K: one pick's row of logits
+    std::vector<std::string> lp_fields;     // and each pick's P line fields, sent ahead of its T line
     while (!cancelled && produced_n < max_new && (!in_slot || solo_req)) {   // (a batch slot's first token comes from the batch window)
         int T = 1;
         if constexpr (kSpec) T = b.draft_window();
@@ -101,6 +104,17 @@ Flow Request::decode_loop(B& b) {
                 ++grammar_resamples;
             }
         }
+        if (req_logprobs >= 0 && ppl == nullptr) {   // the picks are final: read their rows before the commit
+            lp_row.resize((size_t) runtime_.n_vocab);
+            lp_fields.assign((size_t) a + 1, std::string());
+            for (int i = e0; i <= a; ++i) {
+                if (!b.copy_logits(i, lp_row.data())) {
+                    std::printf("ERR logprobs: the head logits copy failed\n");
+                    return Flow::error;
+                }
+                lp_fields[(size_t) i] = logprob_fields(lp_row.data(), (int) runtime_.n_vocab, outv[(size_t) i], req_logprobs);
+            }
+        }
         if (ppl != nullptr) {   // every row scored and committed
             a = T - 1;
             for (int t = 0; t < T; ++t) {
@@ -143,6 +157,7 @@ Flow Request::decode_loop(B& b) {
             commit_ok = hold ? true : b.commit(keep, cerr, 1);
             if (!hold) tier.after_commit();
             for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
+                if (req_logprobs >= 0 && ppl == nullptr) std::printf("P%s\n", lp_fields[(size_t) i].c_str());
                 std::printf("T %d\n", (int) outv[(size_t) i]);
                 basalt::core::progress_beat();
                 ++produced_n;

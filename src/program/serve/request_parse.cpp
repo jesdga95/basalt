@@ -1,6 +1,7 @@
 // src/program/serve/request_parse.cpp - request parse operations.
 #include "request.hpp"
 #include "../cli/tokens.hpp"
+#include "logprobs.hpp"
 
 namespace basalt::program::serve {
 
@@ -37,6 +38,7 @@ Flow Request::parse() {
     // the chunk teacher-forced through verify windows of T tokens, every token committed
     req_ppl = -1;
     req_ppl_t = 3;
+    req_logprobs = -1;   // logprobs=K (0..20): each sent pick's log probability and the row's K likeliest tokens
     req_clip = 0;   // clip=1 (GENT): max_new is a cap, cut to the room the context leaves after the prompt
     if (endp != nullptr) {   // GENI takes the same keys (image requests were always greedy); its
                              // embedding file path is the first token without an =
@@ -64,6 +66,7 @@ Flow Request::parse() {
             else if (key == "penalty_present") req_penalty_present = fv;
             else if (key == "seed") { req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10); req_seed_given = true; }
             else if (key == "relax") req_relax = fv;
+            else if (key == "logprobs") req_logprobs = std::atoi(tok.c_str() + eq + 1);
             else if (key == "clip") req_clip = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
@@ -83,6 +86,8 @@ Flow Request::parse() {
     else if (!std::isfinite(req_penalty_freq) || !std::isfinite(req_penalty_present))
         bad = "penalty_freq, penalty_present: numbers";
     else if (!(req_relax >= 0.0f && req_relax <= 1.0f)) bad = "relax: 0..1";
+    else if (req_logprobs < -1 || req_logprobs > kMaxTopLogprobs) bad = "logprobs: 0 to 20 alternatives";
+    else if (req_logprobs >= 0 && runtime_.o.batch > 0 && runtime_.pipelined()) bad = "logprobs: pipelined batch groups are not supported";
     if (bad == nullptr && runtime_.o.batch > 0 && runtime_.pipelined() && req_penalty_last_n > 0 &&
         (req_penalty_repeat != 1.0f || req_penalty_freq != 0.0f || req_penalty_present != 0.0f))
         bad = "penalties: pipelined batch groups are not supported";

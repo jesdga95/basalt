@@ -37,6 +37,7 @@ protected:
     int req_ppl{};
     int req_ppl_t{};
     int req_clip{};
+    int req_logprobs{};   // logprobs=K: a P line ahead of every sent pick, with the K likeliest tokens (-1: off)
     std::vector<float> req_bias{};
     std::string emb_path{};
     std::vector<int64_t> ids{};
