@@ -326,6 +326,14 @@ class Api(unittest.TestCase):
         self.assertEqual(e.exception.code, 400)
         self.assertIn("top_logprobs", json.loads(e.exception.read().decode())["error"]["message"])
 
+    def test_engine_refusal_is_a_400(self):
+        self.start(0)
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            self.post({"logprobs": True, "messages": [{"role": "user", "content": "PIPELINED"}]})
+        self.assertEqual(e.exception.code, 400)
+        self.assertIn("pipelined", json.loads(e.exception.read().decode())["error"]["message"])
+        self.assertEqual(self.post({})["choices"][0]["message"]["content"], "ok, done.")   # the engine serves on
+
 
 if __name__ == "__main__":
     unittest.main()
