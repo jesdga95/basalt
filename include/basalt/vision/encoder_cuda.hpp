@@ -53,4 +53,8 @@ private:
 /// the card it runs on: the way a build made for another compute capability reports itself at startup.
 bool probe_device(std::string& err);
 
+/// The CUDA driver context current on this thread (a CUcontext: the device's primary one, made current here if it is
+/// not yet), for a library that works on the same device in this process (FFmpeg's NVDEC); null when there is none.
+void* current_context();
+
 }  // namespace basalt::vision

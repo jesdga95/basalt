@@ -43,7 +43,6 @@ constexpr int kSwsFullChrHInt = 0x2000;     // SWS_FULL_CHR_H_INT
 constexpr int kSwsAccurateRnd = 0x40000;    // SWS_ACCURATE_RND
 constexpr int kLogQuiet = -8;               // AV_LOG_QUIET
 constexpr int kHwDeviceCuda = 2;            // AV_HWDEVICE_TYPE_CUDA
-constexpr int kCudaUsePrimaryContext = 1;   // AV_CUDA_USE_PRIMARY_CONTEXT
 constexpr int kRangeMpeg = 1;               // AVCOL_RANGE_MPEG (limited)
 constexpr int kRangeJpeg = 2;               // AVCOL_RANGE_JPEG (full)
 constexpr int kNumDataPointers = 8;         // AV_NUM_DATA_POINTERS
@@ -65,6 +64,9 @@ using av_log_set_level_fn = void (*)(int level);
 using av_frame_clone_fn = AVFrame* (*)(const AVFrame* src);
 using av_hwdevice_ctx_create_fn = int (*)(AVBufferRef** device_ctx, int type, const char* device, AVDictionary* opts, int flags);
 using av_buffer_ref_fn = AVBufferRef* (*)(const AVBufferRef* buf);
+using av_hwdevice_ctx_alloc_fn = AVBufferRef* (*)(int type);
+using av_hwdevice_ctx_init_fn = int (*)(AVBufferRef* ref);
+using av_buffer_unref_fn = void (*)(AVBufferRef** buf);
 using av_hwframe_transfer_data_fn = int (*)(AVFrame* dst, const AVFrame* src, int flags);
 
 using avformat_version_fn = unsigned (*)();
@@ -108,13 +110,14 @@ struct AbiRow {
     size_t cc_hw_device_ctx;                 // AVCodecContext.hw_device_ctx (AVBufferRef*)
     int pix_fmt_cuda;                        // AV_PIX_FMT_CUDA
     int pix_fmt_p010;                        // AV_PIX_FMT_P010LE
+    size_t hwdev_hwctx;                      // AVHWDeviceContext.hwctx (AVCUDADeviceContext*, cuda_ctx first)
 };
 
 /// Newest first: the loader takes the first release whose libraries are all present.
 inline constexpr AbiRow kAbiRows[] = {
-    {"8", 62, 62, 60, 9, 104, 16, 32, 48, 56, 88, 204, 72, 76, 280, 292, 560, 117, 158},
-    {"7", 61, 61, 59, 8, 104, 16, 32, 48, 56, 88, 216, 72, 76, 296, 308, 560, 117, 158},
-    {"6", 60, 60, 58, 7, 72, 16, 32, 48, 56, 88, 216, 56, 60, 320, 332, 864, 117, 159},
+    {"8", 62, 62, 60, 9, 104, 16, 32, 48, 56, 88, 204, 72, 76, 280, 292, 560, 117, 158, 16},
+    {"7", 61, 61, 59, 8, 104, 16, 32, 48, 56, 88, 216, 72, 76, 296, 308, 560, 117, 158, 16},
+    {"6", 60, 60, 58, 7, 72, 16, 32, 48, 56, 88, 216, 56, 60, 320, 332, 864, 117, 159, 24},
 };
 
 // Fields at the same place in every row.
@@ -126,6 +129,7 @@ constexpr size_t kFrameWidth = 104;          // AVFrame.width
 constexpr size_t kFrameHeight = 108;         // AVFrame.height
 constexpr size_t kFrameFormat = 116;         // AVFrame.format
 constexpr size_t kPacketStreamIndex = 36;    // AVPacket.stream_index
+constexpr size_t kBufferData = 8;            // AVBufferRef.data
 
 /// A field of type T at byte `off` of the structure at `p`.
 template <class T>

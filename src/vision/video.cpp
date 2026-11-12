@@ -145,10 +145,12 @@ std::string times_text(const std::vector<double>& times) {
 
 namespace {
 
-// The CUDA device context NVDEC decodes on, one per GPU for the life of the process, on the GPU's primary context
-// (the one the CUDA runtime uses, so the engine's and the encoder's work and FFmpeg's share it). Null with `why` when
-// FFmpeg cannot open one (no driver, no CUDA support in this FFmpeg build).
-ff::AVBufferRef* nvdec_device(const Ffmpeg& F, int gpu, std::string& why) {
+// The CUDA device NVDEC decodes on, one per GPU for the life of the process. On the caller's own CUDA context when
+// it gives one: a context of FFmpeg's own costs a few hundred MiB the engine has handed to its expert cache, and
+// FFmpeg will not take the primary context with scheduling flags other than its own. Without one (a program with no
+// CUDA of its own), FFmpeg opens a context. Null with `why` when neither works (no driver, no CUDA support in this
+// FFmpeg build, no memory left).
+ff::AVBufferRef* nvdec_device(const Ffmpeg& F, int gpu, void* cuda_context, std::string& why) {
     static std::mutex m;
     static std::map<int, ff::AVBufferRef*> devices;
     static std::map<int, std::string> failed;
@@ -156,7 +158,20 @@ ff::AVBufferRef* nvdec_device(const Ffmpeg& F, int gpu, std::string& why) {
     if (auto it = devices.find(gpu); it != devices.end()) return it->second;
     if (auto it = failed.find(gpu); it != failed.end()) { why = it->second; return nullptr; }
     ff::AVBufferRef* d = nullptr;
-    const int r = F.av_hwdevice_ctx_create(&d, ff::kHwDeviceCuda, std::to_string(gpu).c_str(), nullptr, ff::kCudaUsePrimaryContext);
+    int r = 0;
+    if (cuda_context != nullptr) {
+        d = F.av_hwdevice_ctx_alloc(ff::kHwDeviceCuda);
+        if (d == nullptr) {
+            r = -12;   // AVERROR(ENOMEM)
+        } else {
+            unsigned char* dev = ff::field<unsigned char*>(d, ff::kBufferData);
+            unsigned char* cuda = ff::field<unsigned char*>(dev, F.abi.hwdev_hwctx);
+            std::memcpy(cuda, &cuda_context, sizeof cuda_context);   // AVCUDADeviceContext.cuda_ctx
+            if ((r = F.av_hwdevice_ctx_init(d)) < 0) F.av_buffer_unref(&d);
+        }
+    } else {
+        r = F.av_hwdevice_ctx_create(&d, ff::kHwDeviceCuda, std::to_string(gpu).c_str(), nullptr, 0);
+    }
     if (r < 0 || d == nullptr) {
         failed[gpu] = why = "FFmpeg cannot open GPU " + std::to_string(gpu) + " for NVDEC: " + F.error_text(r);
         return nullptr;
@@ -186,7 +201,9 @@ struct Reader {
         if (fmt != nullptr) F.avformat_close_input(&fmt);
     }
 
-    bool open(const std::string& path, std::string& err, int gpu = -1) {
+    std::string nvdec_why;   // why NVDEC was not asked, when it was wanted
+
+    bool open(const std::string& path, std::string& err, int gpu = -1, void* cuda_context = nullptr, int64_t spare = -1) {
         int r = F.avformat_open_input(&fmt, path.c_str(), nullptr, nullptr);
         if (r < 0) { fmt = nullptr; err = "FFmpeg cannot open the video: " + F.error_text(r); return false; }
         if ((r = F.avformat_find_stream_info(fmt, nullptr)) < 0) { err = "FFmpeg cannot read the video: " + F.error_text(r); return false; }
@@ -211,9 +228,17 @@ struct Reader {
         }
         // NVDEC where the GPU and FFmpeg's build allow: FFmpeg's default format choice takes the device's frames
         // when a device is set, and decodes in software itself when NVDEC refuses the stream
-        if (gpu >= 0) {
-            std::string why;
-            if (ff::AVBufferRef* dev = nvdec_device(F, gpu, why)) {
+        // what NVDEC takes: its surfaces (the reference frames and the output pool, about 40 frames of 1.5 bytes a
+        // pixel, counted at 16 bits a sample, as a 10-bit stream's) and its own state; a stream that does not fit in
+        // what the card can spare is decoded on the CPU rather than take memory the model needs
+        const ff::AVCodecParameters* par = ff::field<ff::AVCodecParameters*>(st, F.abi.st_codecpar);
+        const int64_t px = (int64_t) ff::field<int>(par, F.abi.par_width) * ff::field<int>(par, F.abi.par_height);
+        const int64_t need = px * 3 / 2 * 40 * 2 + (64ll << 20);
+        if (gpu >= 0 && spare >= 0 && need > spare) {
+            nvdec_why = "NVDEC needs about " + std::to_string((long long) (need >> 20)) + " MiB, GPU " + std::to_string(gpu) +
+                        " can spare " + std::to_string((long long) (spare >> 20));
+        } else if (gpu >= 0) {
+            if (ff::AVBufferRef* dev = nvdec_device(F, gpu, cuda_context, nvdec_why)) {
                 ff::AVBufferRef* ref = F.av_buffer_ref(dev);
                 std::memcpy((unsigned char*) ctx + F.abi.cc_hw_device_ctx, &ref, sizeof ref);
             }
@@ -418,14 +443,36 @@ private:
 
 }  // namespace
 
+namespace {
+bool read_video_once(const std::string& path, const VideoOptions& o, Video& out, std::string& err);
+}
+
 bool read_video(const std::string& path, const VideoOptions& o, Video& out, std::string& err) {
+    if (read_video_once(path, o, out, err)) return true;
+    // only a failure of the decode itself is tried again: a guard or an unreadable file fails the same way twice
+    const bool decoding = err.rfind("FFmpeg cannot decode", 0) == 0 || err.rfind("copying a decoded frame", 0) == 0;
+    if (o.gpu < 0 || !decoding) return false;
+    // NVDEC can run out of device memory after it started (the card's memory is the model's): the file is decoded
+    // again on the CPU, and the decoder note says why
+    const std::string why = err;
+    VideoOptions cpu = o;
+    cpu.gpu = -1;
+    cpu.cuda_context = nullptr;
+    err.clear();
+    if (!read_video_once(path, cpu, out, err)) return false;
+    out.decoder = "cpu, NVDEC failed: " + why;
+    return true;
+}
+
+namespace {
+bool read_video_once(const std::string& path, const VideoOptions& o, Video& out, std::string& err) {
     const auto t_start = std::chrono::steady_clock::now();
     std::string why;
     const Ffmpeg* F = ffmpeg(why);
     if (F == nullptr) { err = "this process cannot read video: " + why; return false; }
     const ff::AbiRow& a = F->abi;
     Reader rd(*F);
-    if (!rd.open(path, err, o.gpu)) return false;
+    if (!rd.open(path, err, o.gpu, o.cuda_context, o.gpu_spare)) return false;
     const ff::AVRational tb = ff::field<ff::AVRational>(rd.st, a.st_time_base);
     const ff::AVCodecParameters* par = ff::field<ff::AVCodecParameters*>(rd.st, a.st_codecpar);
     const int pw = ff::field<int>(par, a.par_width), ph = ff::field<int>(par, a.par_height);
@@ -484,7 +531,9 @@ bool read_video(const std::string& path, const VideoOptions& o, Video& out, std:
         if (k == 0) {
             out.src_w = w;
             out.src_h = h;
-            out.decoder = ff::field<int>(rd.frm, ff::kFrameFormat) == a.pix_fmt_cuda ? "nvdec" : "cpu";
+            out.decoder = ff::field<int>(rd.frm, ff::kFrameFormat) == a.pix_fmt_cuda ? "nvdec"
+                        : o.gpu < 0 ? "cpu"
+                        : "cpu, " + (rd.nvdec_why.empty() ? std::string("NVDEC refused the stream") : rd.nvdec_why);
             out.canvas = fit_video((int) n, w, h, o);
             if (out.canvas.w == 0) { err = "the video's frames are " + std::to_string(w) + "x" + std::to_string(h) + ", too narrow"; break; }
             if (n * out.canvas.w * (int64_t) out.canvas.h > o.max_held_pixels) {
@@ -520,5 +569,7 @@ bool read_video(const std::string& path, const VideoOptions& o, Video& out, std:
     out.ms_total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     return true;
 }
+
+}  // namespace
 
 }  // namespace basalt::vision

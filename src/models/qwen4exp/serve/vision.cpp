@@ -3,6 +3,8 @@
 #include "qfn_state.hpp"
 #include "basalt/vision/video.hpp"
 
+#include <future>
+
 namespace basalt::models::qwen4exp::serve {
 
 // ---- ENC <image> <out> [<image> <out> ...] and ENCV <video> <out> [k=v ...] (--vision), between requests and
@@ -48,12 +50,26 @@ void QfnRuntime::enc_command(const std::string& cmd) {
         std::string vpath, opath, verr;
         basalt::vision::VideoOptions vo;
         vo.group_tokens = geo.max_tokens;
-        cudaGetDevice(&vo.gpu);   // NVDEC on the encoder's card: the frames it copies out stay off the other links
-        basalt::vision::Video v;
-        if (!basalt::vision::parse_encv(cmd, vpath, opath, vo, verr) || !basalt::vision::read_video(vpath, vo, v, verr)) {
-            reply_err(verr);
-            return;
+        cudaGetDevice(&vo.gpu);   // NVDEC on the encoder's card, in the engine's context: no context of FFmpeg's own
+        vo.cuda_context = basalt::vision::current_context();
+        {   // NVDEC takes no more than the card has free above the floor of what the engine allocates after loading:
+            // for the seconds of a decode it may use the reserve kept for other programs, never the model's memory
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            vo.gpu_spare = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) basalt::program::serve::vram_floor_mib() << 20));
         }
+        basalt::vision::Video v;
+        if (!basalt::vision::parse_encv(cmd, vpath, opath, vo, verr)) { reply_err(verr); return; }
+        // the decode runs on its own thread while the decoding slots keep their windows (a minute of 4K takes
+        // seconds; the slots stop only for the encode below, as for an image)
+        std::future<bool> dec = std::async(std::launch::async, [&] { return basalt::vision::read_video(vpath, vo, v, verr); });
+        bool windows_ok = true;
+        while (dec.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            if (batch_on() && windows_ok) windows_ok = next_batch_window();
+            else dec.wait();
+        }
+        if (!dec.get()) { reply_err(verr); return; }
+        if (!windows_ok) { reply_err("a batch window failed while the video was decoded"); return; }
         decoder = v.decoder;
         Job j;
         j.out = opath;

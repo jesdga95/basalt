@@ -20,7 +20,7 @@ void check(bool ok, const std::string& what) {
 }  // namespace
 
 int main() {
-    const ff::AbiRow none{"99", 99, 99, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const ff::AbiRow none{"99", 99, 99, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     Ffmpeg f;
     std::string why;
     check(!load_ffmpeg({none}, f, why), "a release nobody ships does not load");
