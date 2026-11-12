@@ -64,6 +64,8 @@ Video input loads FFmpeg's shared libraries at run time (libavformat, libavcodec
 is linked or shipped). Linux: the distribution's runtime packages (`libavformat62` and its siblings on Ubuntu 26.04, `libavformat60`
 on 24.04), found by the system loader. Windows: a shared FFmpeg build (`avformat-62.dll` and the rest, from gyan.dev or BtbN) beside
 `basalt.exe` or in a `PATH` directory; the current directory is never searched. Without them video is off and the server says why.
+GPU decoding needs an FFmpeg build with NVDEC (the distribution packages and the gyan.dev and BtbN builds have it); without it
+frames decode on the CPU.
 
 ## Windows limitations
 
