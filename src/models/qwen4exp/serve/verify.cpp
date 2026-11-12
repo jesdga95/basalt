@@ -218,10 +218,11 @@ int QfnRuntime::capture_windows() {
     rounds = 0;
     sfx.emplace(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
     policy.emplace(S);   // MTP or lookup window, learned over the whole process
-    // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
-    // or more basalt-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
-    // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
-    // h = p + y, w = p + x, and the text after the image continues at p + max(nx, ny).
+    // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images and videos.  The
+    // file is one or more basalt-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt
+    // order, one per picture and one per two-frame video group; each record's rows go to its run of <|image_pad|> or
+    // <|video_pad|> tokens, whose M-RoPE positions are Qwen3-VL's (mrope_positions.hpp): t = p, h = p + y,
+    // w = p + x, and the text after the run continues at p + max(nx, ny).
     mrope_identity = true;
 
     // ---- VRAM <reserve_mib>, between requests, only with --vram-elastic.  It shrinks the expert cache until that

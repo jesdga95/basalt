@@ -48,7 +48,7 @@ public:
     PreTokenizer pretokenizer() const override { return {"qwen35", tokenizer::pretok_qwen35}; }
 
     model::TokenNames token_names() const override {
-        return {{"<|endoftext|>", "<|im_end|>"}, "<|im_start|>", "<|image_pad|>"};
+        return {{"<|endoftext|>", "<|im_end|>"}, "<|im_start|>", "<|image_pad|>", "<|video_pad|>"};
     }
 
     program::grammar::ToolForm tool_form() const override {

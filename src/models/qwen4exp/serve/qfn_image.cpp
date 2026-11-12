@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/qfn_image.cpp - a request's image positions and the quality gate's chunk.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
+#include "basalt/vision/mrope_positions.hpp"
 
 namespace basalt::models::qwen4exp::serve {
 
@@ -47,33 +48,24 @@ Flow QfnRequest::prepare_image() {
             if (ve.empty() && (n > cells || n > runtime_.o.max_context))
                 ve = "prompt (" + std::to_string((long long) n) + " tokens) exceeds the context (" +
                      std::to_string((long long) runtime_.o.max_context) + ")";
-            int64_t p = 0, i = 0;
-            size_t k = 0;
-            while (ve.empty() && i < n) {
-                if (ids[(size_t) i] != runtime_.o.image_pad_id) { put(i, p, p, p); ++p; ++i; continue; }
-                if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }
-                const Img& im = imgs[k++];
-                {   // what the conversation cache compares: a picture is its grid and its embeddings
-                    const int64_t grid[3] = {im.n, im.nx, im.ny};
+            // each run of a picture's pad or a video group's takes the next record, in order
+            std::vector<int64_t> pads = {runtime_.o.image_pad_id}, runs;
+            if (runtime_.o.video_pad_id >= 0) pads.push_back(runtime_.o.video_pad_id);
+            std::vector<basalt::vision::MediaGrid> grids;
+            for (const Img& im : imgs) grids.push_back({im.n, im.nx, im.ny});
+            if (ve.empty()) ve = basalt::vision::mrope_positions(ids.data(), n, pads, grids, cells, runtime_.mrope_host.data(), runs);
+            for (size_t k = 0; ve.empty() && k < runs.size(); ++k) {
+                const Img& im = imgs[k];
+                const int64_t i = runs[k];
+                {   // what the conversation cache compares: a picture is its pad, its grid and its embeddings
+                    const int64_t grid[4] = {ids[(size_t) i], im.n, im.nx, im.ny};
                     uint64_t h = fnv1a(grid, sizeof grid);
                     h = fnv1a(runtime_.img_rows.data() + im.off, (size_t) im.n * (size_t) runtime_.g.n_embd * sizeof(float), h);
                     runtime_.req_imgs.push_back({i, h});
                 }
-                for (int64_t j = 0; j < im.n && ve.empty(); ++j)
-                    if (i + j >= n || ids[(size_t) (i + j)] != runtime_.o.image_pad_id)
-                        ve = "image " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
-                             " rows but fewer <|image_pad|> tokens";
-                for (int64_t j = 0; j < im.n && ve.empty(); ++j) {
-                    const int64_t y = j / im.nx, x = j % im.nx;
-                    put(i + j, p, p + y, p + x);
+                for (int64_t j = 0; j < im.n; ++j)
                     runtime_.row_ptr[(size_t) (i + j)] = runtime_.img_rows.data() + im.off + (size_t) j * (size_t) runtime_.g.n_embd;
-                }
-                i += im.n;
-                p += std::max(im.nx, im.ny);
             }
-            if (ve.empty() && k != imgs.size()) ve = "the embeddings file has more images than the prompt";
-            if (ve.empty() && n > 0 && ids[(size_t) (n - 1)] == runtime_.o.image_pad_id) ve = "the prompt cannot end in an image";
-            for (int64_t c = n; ve.empty() && c < cells; ++c) put(c, p + (c - n), p + (c - n), p + (c - n));
         }
         cudaDeviceSynchronize();
         // CUDA0's table and, with a layer split, every later stage's (each device reads its own)

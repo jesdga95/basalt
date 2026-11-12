@@ -204,11 +204,13 @@ public:
     virtual Result make_session(std::unique_ptr<ModelSession>& out) = 0;
 };
 
-/// The texts of the model's own tokens in the pack's vocabulary: the defaults of --eos-ids, --turn-token, --image-pad-id.
+/// The texts of the model's own tokens in the pack's vocabulary: the defaults of --eos-ids, --turn-token, --image-pad-id,
+/// and a video group's pad ("" for a model that reads no video).
 struct TokenNames {
     std::vector<std::string> eos;
     std::string turn;
     std::string image_pad;
+    std::string video_pad;
 };
 
 class FlagArgs;
