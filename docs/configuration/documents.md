@@ -1,6 +1,6 @@
 # Documents
 
-A message can carry a document, as on the hosted APIs: a PDF or a text file, in a user turn or in a tool result. The model reads it on
+A message can carry a document, as on the hosted APIs: a PDF, an Office file or a text file, in a user turn or in a tool result. The model reads it on
 every model and every API. Claude Code's Read tool sends a PDF this way, so asking Claude Code to read a paper, a datasheet or a spec
 works against Basalt.
 
@@ -28,6 +28,8 @@ pages 40-55 of a long manual without parsing it.
   (`[page K: scanned, as an image]`). A page with under 200 characters of text (a slide, a stamped scan) gives its text and then its
   largest image, when that has at least 512 x 512 pixels (`[page K, with its image]`). Images need `--vision`; a system prompt cannot
   hold one. A page with neither text nor image says `[page K: no text]`.
+- A Word (`.docx`) file is its paragraphs and tables (cells split by ` | `), a PowerPoint (`.pptx`) file its slides' text in
+  presentation order (`[slide K]`, `slides="N"`), an Excel (`.xlsx`) file each sheet's rows (`[sheet NAME]`, `sheets="N"`).
 - A text document (`text/*`, JSON, YAML, XML) is its text. A `content` document (Anthropic) is its own text and image blocks.
 
 The same bytes give the same text every time, and a parsed PDF is kept, so a conversation that resends its document on every turn keeps

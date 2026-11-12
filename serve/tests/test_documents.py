@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -257,6 +258,80 @@ class TextDocuments(unittest.TestCase):
             {"type": "text", "text": "slide one"},
             {"type": "image", "source": "data:image/png;base64,AA=="},
             {"type": "text", "text": "\n</document>"}])
+
+
+W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+A = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+R = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+PR = 'xmlns="http://schemas.openxmlformats.org/package/2006/relationships"'
+S = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+
+
+def office(parts: dict) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for path, text in parts.items():
+            z.writestr(path, text)
+    return out.getvalue()
+
+
+DOCX = office({"word/document.xml": f'<w:document {W}><w:body>'
+               '<w:p><w:r><w:t>Spec</w:t></w:r></w:p>'
+               '<w:p><w:r><w:t xml:space="preserve">Port </w:t></w:r><w:r><w:t>9473</w:t><w:tab/><w:t>fixed</w:t></w:r></w:p>'
+               '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>key</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>value</w:t></w:r></w:p>'
+               '</w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>workers</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>6</w:t>'
+               '</w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>'})
+PPTX = office({"ppt/presentation.xml": f'<p:presentation xmlns:p="x" {R}><p:sldIdLst><p:sldId r:id="rId3"/>'
+               '<p:sldId r:id="rId2"/></p:sldIdLst></p:presentation>',
+               "ppt/_rels/presentation.xml.rels": f'<Relationships {PR}><Relationship Id="rId2" Target="slides/slide1.xml"/>'
+               '<Relationship Id="rId3" Target="slides/slide2.xml"/></Relationships>',
+               "ppt/slides/slide1.xml": f'<p:sld xmlns:p="x" {A}><a:p><a:r><a:t>Second in order</a:t></a:r></a:p></p:sld>',
+               "ppt/slides/slide2.xml": f'<p:sld xmlns:p="x" {A}><a:p><a:r><a:t>Roadmap</a:t></a:r></a:p>'
+               '<a:p><a:r><a:t>Ship </a:t></a:r><a:r><a:t>documents</a:t></a:r></a:p></p:sld>'})
+XLSX = office({"xl/workbook.xml": f'<workbook {S} {R}><sheets><sheet name="Sales" r:id="rId1"/></sheets></workbook>',
+               "xl/_rels/workbook.xml.rels": f'<Relationships {PR}><Relationship Id="rId1" '
+               'Target="worksheets/sheet1.xml"/></Relationships>',
+               "xl/sharedStrings.xml": f'<sst {S}><si><t>Region</t></si><si><t>Units</t></si><si><t>South</t></si></sst>',
+               "xl/worksheets/sheet1.xml": f'<worksheet {S}><sheetData><row><c t="s"><v>0</v></c><c t="s"><v>1</v></c></row>'
+               '<row><c t="s"><v>2</v></c><c><v>52</v></c><c t="b"><v>1</v></c><c t="inlineStr"><is><t>top</t></is></c>'
+               '</row></sheetData></worksheet>'})
+
+
+class OfficeFiles(unittest.TestCase):
+    def read(self, data: bytes, media: str = "", name: str = "f") -> str:
+        return documents.expand_documents([anthropic_doc(data, name, media)])[0]["text"]
+
+    def test_word(self):
+        self.assertEqual(self.read(DOCX, name="spec.docx"),
+                         '<document name="spec.docx">\nSpec\nPort 9473\tfixed\nkey | value\nworkers | 6\n</document>')
+
+    def test_powerpoint_in_presentation_order(self):
+        self.assertEqual(self.read(PPTX, name="deck.pptx"), '<document name="deck.pptx" slides="2">\n[slide 1]\n'
+                         'Roadmap\nShip documents\n\n[slide 2]\nSecond in order\n</document>')
+
+    def test_excel(self):
+        media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        self.assertEqual(self.read(XLSX, media, "q3.xlsx"), '<document name="q3.xlsx" sheets="1">\n[sheet Sales]\n'
+                         'Region | Units\nSouth | 52 | TRUE | top\n</document>')
+
+    def test_every_api_reads_them(self):
+        data_url = "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64," + b64(DOCX)
+        responses = input_messages({"input": [{"role": "user", "content": [
+            {"type": "input_file", "filename": "spec.docx", "file_data": data_url}]}]})
+        self.assertEqual(responses[0]["content"], self.read(DOCX, name="spec.docx"))
+
+    def test_refusals(self):
+        word = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        for data, media, words in ((b"PK\x03\x04 not a zip", word, "is not a Word (.docx) file"),
+                                   (office({"other.xml": "<x/>"}), word, "is not a Word (.docx) file"),
+                                   (office({"word/document.xml": "<broken"}), "", "could not be read as a docx file")):
+            with self.assertRaises(ValueError) as e:
+                self.read(data, media)
+            self.assertIn(words, str(e.exception))
+        with mock.patch.object(documents, "MAX_PART_BYTES", 100):
+            with self.assertRaises(ValueError) as e:
+                self.read(office({"word/document.xml": f"<w:document {W}>" + " " * 200 + "</w:document>"}))
+            self.assertIn("larger than", str(e.exception))
 
 
 class Refusals(unittest.TestCase):
