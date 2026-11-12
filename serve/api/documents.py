@@ -81,12 +81,19 @@ def _fetch(source: str, name: str) -> bytes:
         raise ValueError(f"document {name!r}: {e}") from None
 
 
+def _given(value) -> str:
+    return value if isinstance(value, str) else ""
+
+
 def _url_name(source: str) -> str:
-    try:
-        tail = urllib.parse.urlsplit(source).path.rstrip("/").rsplit("/", 1)[-1]
-    except ValueError:
-        tail = ""
-    return urllib.parse.unquote(tail) or "document"
+    """The file name a URL or a path ends in (either separator)."""
+    path = source
+    if re.match(r"[a-zA-Z][a-zA-Z0-9+.-]+://", source):
+        try:
+            path = urllib.parse.unquote(urllib.parse.urlsplit(source).path)
+        except ValueError:
+            path = ""
+    return re.split(r"[\\/]", path.rstrip("\\/"))[-1] or "document"
 
 
 # ------------------------------------------------------------------------------------------------ the part shapes
@@ -97,7 +104,7 @@ def _document_items(part: dict) -> tuple:
     spec = part.get("file") if kind == "file" else part      # Chat Completions nests the fields under "file"
     if not isinstance(spec, dict):
         raise ValueError(f"a {kind} part needs a \"file\" object with file_data")
-    name = spec.get("filename") or "document"
+    name = _given(spec.get("filename")) or "document"
     if spec.get("file_data"):
         media, data = _data_url(spec["file_data"], kind)
         return _read(data, media, name, None, spec.get("pages"))
@@ -105,7 +112,7 @@ def _document_items(part: dict) -> tuple:
         raise ValueError(f"{kind}: this server keeps no files, so a file_id cannot be read; send the file's bytes "
                          "as file_data (a data: URL)")
     if isinstance(spec.get("file_url"), str) and spec["file_url"]:
-        name = spec.get("filename") or _url_name(spec["file_url"])
+        name = _given(spec.get("filename")) or _url_name(spec["file_url"])
         return _read(_fetch(spec["file_url"], name), "", name, None, spec.get("pages"))
     raise ValueError(f"a {kind} part needs file_data (a data: URL with the file's bytes) or file_url")
 
@@ -114,7 +121,7 @@ def _anthropic(part: dict) -> tuple:
     src = part.get("source")
     if not isinstance(src, dict):
         raise ValueError("a document block needs a source object")
-    name = part.get("title") or "document"
+    name = _given(part.get("title")) or "document"
     context = part.get("context") if isinstance(part.get("context"), str) else None
     kind = src.get("type")
     if kind == "base64":
@@ -147,7 +154,7 @@ def _anthropic(part: dict) -> tuple:
     if kind == "url":
         if not isinstance(src.get("url"), str) or not src["url"]:
             raise ValueError("a url document needs source.url")
-        name = part.get("title") or _url_name(src["url"])
+        name = _given(part.get("title")) or _url_name(src["url"])
         return _read(_fetch(src["url"], name), "", name, context, part.get("pages"))
     raise ValueError(f"document source type {kind!r} is not supported (base64, text and content are)")
 
@@ -326,7 +333,8 @@ def _clean(text: str) -> str:
 
 
 def _quoted(name: str) -> str:
-    return '"' + name.replace('"', "'") + '"'
+    """A client-given name as one quoted line."""
+    return '"' + re.sub(r"[\x00-\x1f\x7f]+", " ", name).replace('"', "'") + '"'
 
 
 def _header(name: str, pages: int | None, context: str | None, read: str | None = None) -> str:

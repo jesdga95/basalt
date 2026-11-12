@@ -191,6 +191,20 @@ class Pages(unittest.TestCase):
         self.assertIn("pages are named in PDF documents only", str(e.exception))
 
 
+class Names(unittest.TestCase):
+    def test_names_from_urls_and_paths(self):
+        for source, name in (("C:\\docs\\a.pdf", "a.pdf"), ("https://x/y/b%20c.pdf?q=1", "b c.pdf"), ("/tmp/z.pdf", "z.pdf"),
+                             ("file:///tmp/d.pdf", "d.pdf"), ("https://x/", "document")):
+            self.assertEqual(documents._url_name(source), name)
+
+    def test_a_name_stays_on_its_line(self):
+        text = documents.expand_documents([{"type": "document", "title": 'a\n"b"', "source": {
+            "type": "text", "data": "x"}}])[0]["text"]
+        self.assertEqual(text, "<document name=\"a 'b'\">\nx\n</document>")
+        text = documents.expand_documents([{"type": "document", "title": 7, "source": {"type": "text", "data": "x"}}])[0]
+        self.assertTrue(text["text"].startswith('<document name="document">'))
+
+
 class Scans(unittest.TestCase):
     def setUp(self):
         documents._cache.clear()
