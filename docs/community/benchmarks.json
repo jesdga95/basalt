@@ -1959,6 +1959,41 @@
       "draft_len_prose": 1.0,
       "engine_args": "--gpu 0 --max-context 61709 --kv fp8",
       "notes": "Proxmox unprivileged LXC; 384 GiB container RAM limit (ram_gib is host-visible); 48 CPUs; swap disabled; no expert SSD spill."
+    },
+    {
+      "submitter": "changlv",
+      "date": "2026-11-12",
+      "commit": "17579fbc6a",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 160,
+          "pcie": "3.0 x8",
+          "h2d_gbps": 6.9
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "Intel Xeon CPU E5-2686 v4, 18 cores",
+      "ram_gbps": 51.2,
+      "os": "Linux",
+      "quant": "IQ4_XS",
+      "kv": "int8",
+      "prefill_16k_tps": 1662.5,
+      "prefill_64k_tps": 1770.6,
+      "decode_tps": 86.1,
+      "decode_conv_tps": 61.3,
+      "decode_struct_tps": 97.8,
+      "decode_prose_tps": 61.3,
+      "accept_conv_pct": 73.5,
+      "accept_struct_pct": 96.3,
+      "accept_prose_pct": 65.6,
+      "draft_len_conv": 2.4,
+      "draft_len_struct": 6.7,
+      "draft_len_prose": 1.7,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     }
   ]
 }
