@@ -65,7 +65,8 @@ Flow Request::read_prompt() {
         int64_t end = runtime_.req_imgs.back().start;
         while (end < n && is_pad(ids[(size_t) end])) ++end;
         const int64_t last = turn_at > 0 ? turn_at : n - 1;
-        end = end / 64 * 64;   // on the 64-token grid the prompt is read in, so the parts change no position's math
+        // exactly where the picture's rows end: a model that reads a picture as one block of rows can stop a read only
+        // at a picture's edge
         if (end > std::max(resume, root_at) && end < last) media_at = end;
     }
     limit_parts();
