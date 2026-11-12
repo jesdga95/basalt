@@ -76,5 +76,16 @@ int main() {
     }
     DynLib moved = DynLib();
     check(!moved, "an empty DynLib is false");
+
+    // application libraries: a name nobody ships loads nothing; the C runtime's own does load, and names its file
+    check(!DynLib::open_app(DynLib::versioned_name("basalt_no_such_library", 99)), "open_app: a missing library is empty");
+#if defined(_WIN32)
+    check(DynLib::versioned_name("avformat", 62) == "avformat-62.dll", "versioned_name follows the platform's spelling");
+    const DynLib crt = DynLib::open_app("ucrtbase.dll");
+#else
+    check(DynLib::versioned_name("avformat", 62) == "libavformat.so.62", "versioned_name follows the platform's spelling");
+    const DynLib crt = DynLib::open_app("libc.so.6");
+#endif
+    check((bool) crt && !crt.path().empty(), "open_app: the C runtime loads and path() names its file");
     return failures ? 1 : 0;
 }

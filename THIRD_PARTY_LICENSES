@@ -382,3 +382,16 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+================================================================================
+FFmpeg (https://ffmpeg.org), declarations in include/basalt/vision/ffmpeg_abi.hpp
+================================================================================
+
+Basalt neither ships nor links FFmpeg. When video input is used, it loads the
+FFmpeg shared libraries installed on the machine at run time. The declarations
+in include/basalt/vision/ffmpeg_abi.hpp (function signatures, constants and
+structure field offsets) are derived from FFmpeg's public headers, releases 6.0
+to 8.0. FFmpeg is Copyright (c) the FFmpeg developers and is licensed under the
+GNU Lesser General Public License version 2.1 or later
+(https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html); some optional parts
+of an FFmpeg build are under the GPL.
