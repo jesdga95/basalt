@@ -38,6 +38,8 @@ constexpr int kSwsBilinear = 2;             // SWS_BILINEAR
 constexpr int kSwsFullChrHInt = 0x2000;     // SWS_FULL_CHR_H_INT
 constexpr int kSwsAccurateRnd = 0x40000;    // SWS_ACCURATE_RND
 constexpr int kLogQuiet = -8;               // AV_LOG_QUIET
+constexpr int kRangeMpeg = 1;               // AVCOL_RANGE_MPEG (limited)
+constexpr int kRangeJpeg = 2;               // AVCOL_RANGE_JPEG (full)
 constexpr int kNumDataPointers = 8;         // AV_NUM_DATA_POINTERS
 constexpr int kErrorEagain = -11;           // AVERROR(EAGAIN) on Linux and Windows alike
 constexpr int kErrorEof = -541478725;       // AVERROR_EOF: FFERRTAG('E','O','F',' ')
@@ -79,6 +81,11 @@ using sws_getContext_fn = SwsContext* (*)(int srcW, int srcH, int srcFormat, int
 using sws_scale_fn = int (*)(SwsContext* c, const uint8_t* const srcSlice[], const int srcStride[], int srcSliceY,
                              int srcSliceH, uint8_t* const dst[], const int dstStride[]);
 using sws_freeContext_fn = void (*)(SwsContext* swsContext);
+using sws_getCoefficients_fn = const int* (*)(int colorspace);
+using sws_getColorspaceDetails_fn = int (*)(SwsContext* c, int** inv_table, int* srcRange, int** table, int* dstRange,
+                                            int* brightness, int* contrast, int* saturation);
+using sws_setColorspaceDetails_fn = int (*)(SwsContext* c, const int inv_table[4], int srcRange, const int table[4],
+                                            int dstRange, int brightness, int contrast, int saturation);
 
 /// One FFmpeg release's library majors and the offsets of the fields that move between them.
 struct AbiRow {
@@ -87,13 +94,14 @@ struct AbiRow {
     size_t fmt_duration;                     // AVFormatContext.duration (int64_t, AV_TIME_BASE units)
     size_t st_codecpar, st_time_base, st_duration, st_nb_frames, st_avg_frame_rate, st_r_frame_rate;   // AVStream
     size_t par_width, par_height;            // AVCodecParameters.width / height (int)
+    size_t fr_color_range, fr_colorspace;    // AVFrame.color_range / colorspace (enums, int)
 };
 
 /// Newest first: the loader takes the first release whose libraries are all present.
 inline constexpr AbiRow kAbiRows[] = {
-    {"8", 62, 62, 60, 9, 104, 16, 32, 48, 56, 88, 204, 72, 76},
-    {"7", 61, 61, 59, 8, 104, 16, 32, 48, 56, 88, 216, 72, 76},
-    {"6", 60, 60, 58, 7, 72, 16, 32, 48, 56, 88, 216, 56, 60},
+    {"8", 62, 62, 60, 9, 104, 16, 32, 48, 56, 88, 204, 72, 76, 280, 292},
+    {"7", 61, 61, 59, 8, 104, 16, 32, 48, 56, 88, 216, 72, 76, 296, 308},
+    {"6", 60, 60, 58, 7, 72, 16, 32, 48, 56, 88, 216, 56, 60, 320, 332},
 };
 
 // Fields at the same place in every row.

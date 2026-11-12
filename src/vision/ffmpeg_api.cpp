@@ -57,6 +57,9 @@ bool bind(const DynLib& u, const DynLib& f, const DynLib& c, const DynLib& s, Ff
     get(s, "sws_getContext", out.sws_getContext);
     get(s, "sws_scale", out.sws_scale);
     get(s, "sws_freeContext", out.sws_freeContext);
+    get(s, "sws_getCoefficients", out.sws_getCoefficients);
+    get(s, "sws_getColorspaceDetails", out.sws_getColorspaceDetails);
+    get(s, "sws_setColorspaceDetails", out.sws_setColorspaceDetails);
     return ok;
 }
 
