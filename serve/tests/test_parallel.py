@@ -124,6 +124,9 @@ while True:
         lp_top[None] = lp
         if bslot is not None:
             lp_top[bslot] = lp
+        if lp is not None and bytes(int(x) & 255 for x in ids).find(b"PIPELINED") >= 0:   # as a layer-split engine
+            print("ERR sampling logprobs: pipelined batch groups are not supported", flush=True)
+            continue
         if bytes(int(x) & 255 for x in ids).find(b"REFUSEME") >= 0:   # refused up front, then idle (no DONE)
             print("ERR refused: images are not enabled", flush=True)
             continue
