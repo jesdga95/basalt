@@ -125,6 +125,38 @@ class Budget(unittest.TestCase):
                          {"reasoning_effort": "medium"})
         self.assertEqual(self.kw(reasoning_budget=-1, reasoning={"effort": "medium"}), {"reasoning_effort": "medium"})
 
+    def test_answer_room_auto_table(self):
+        svc = qwen_service()
+        self.assertEqual(svc.answer_room, "auto")
+        # (cap, configured budget, thinking limit): the formula from 1,024 up as ever, half the cap below it
+        for cap, budget, want in ((700, 8192, 350), (700, None, 350), (400, None, 200), (200, None, 100),
+                                  (1023, None, 512), (1024, None, 512), (1024, 8192, 512), (4096, None, 3072),
+                                  (16384, None, 12288), (131072, None, 98304), (700, 100, 100), (32, None, 16),
+                                  (31, None, None), (31, 8192, 8192), (1, None, None)):
+            with self.subTest(cap=cap, budget=budget):
+                self.assertEqual(svc.answer_budget({}, cap, budget), want)
+
+    def test_answer_room_fixed_reserve(self):
+        svc = qwen_service()
+        # (setting, cap, thinking limit): not clamped to auto's value; 0 reserves nothing; N of the cap or more leaves one token
+        for room, cap, want in ((1024, 4096, 3072), (4096, 131072, 126976), (100, 131072, 130972), (8192, 16384, 8192),
+                                (1024, 700, 1), (700, 700, 1), (0, 4096, None), (0, 700, None), (1, 2, 1)):
+            with self.subTest(room=room, cap=cap):
+                svc.answer_room = room
+                self.assertEqual(svc.answer_budget({}, cap, None), want)
+        svc.answer_room = 1024
+        self.assertEqual(svc.answer_budget({}, 4096, 500), 500)         # a smaller budget stays
+        self.assertEqual(svc.answer_budget({}, 4096, 9000), 3072)
+
+    def test_answer_room_explicit_request_opt_out(self):
+        svc = qwen_service()
+        for room in ("auto", 1024):
+            svc.answer_room = room
+            for req in ({"reasoning_budget_tokens": 0}, {"reasoning_budget": -1}, {"thinking": {"budget_tokens": 0}}):
+                for cap in (200, 700, 8192):
+                    with self.subTest(room=room, req=req, cap=cap):
+                        self.assertIsNone(svc.answer_budget(req, cap, None))
+
     def test_token_budget_fields(self):
         svc = qwen_service()
         for req, want in (({"reasoning_budget": 500}, 500), ({"reasoning_budget": -1}, None), ({"reasoning_budget": 0}, None),
