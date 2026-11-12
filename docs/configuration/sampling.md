@@ -43,6 +43,9 @@ them, and decode speed stays within a few percent.
 - **Anthropic Messages** (a Basalt extension; the API has no such field): the same `logprobs` and `top_logprobs`. Each
   `content_block_delta` carries `logprobs`, the entries of its tokens; the message, or else `message_delta`, carries the
   `logprobs` object above.
+- **Uses:** with `response_format` set to a schema whose field is an `enum`, the `top_logprobs` at the value's first
+  token give each label's probability (a classifier); in an agent, a tool call whose least likely token sits far below
+  its alternative is one the model was unsure of.
 - Tokens the server writes itself (the close of a thinking budget) have none. Refused with parallel slots split over GPUs by
   layer (pipelined batch groups).
 
