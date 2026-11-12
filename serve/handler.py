@@ -17,6 +17,7 @@ from serve.api import responses as responses_api
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
+from serve.api.documents import sources as document_sources
 from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
@@ -487,16 +488,17 @@ def make_handler(target: Service | Router):
                     return
                 self.svc.request_ctx.path = path
                 self.svc.request_ctx.model = self.svc.model  # always the served name, never the requested one
-                if path == "/v1/responses":
-                    self._responses(req)
-                elif path == "/v1/chat/completions":
-                    self._openai(req)
-                elif path == "/v1/messages":
-                    self._anthropic(req)
-                elif path == "/v1/messages/count_tokens":
-                    self._count_tokens(req)
-                else:
-                    self._json(404, {"error": {"message": "not found"}})
+                with document_sources(self._image_access()):   # a document by URL or path follows the image rules
+                    if path == "/v1/responses":
+                        self._responses(req)
+                    elif path == "/v1/chat/completions":
+                        self._openai(req)
+                    elif path == "/v1/messages":
+                        self._anthropic(req)
+                    elif path == "/v1/messages/count_tokens":
+                        self._count_tokens(req)
+                    else:
+                        self._json(404, {"error": {"message": "not found"}})
             except EngineError as e:                         # the engine failed: not the request's fault
                 if path == "/v1/responses":
                     self._json(500, responses_error_body(str(e), "server_error", code="server_error"))

@@ -7,13 +7,17 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import hashlib
 import io
 import logging
 import re
 import threading
 import time
+import urllib.parse
 from collections import OrderedDict
+
+from serve.engine.image_source import ImageRefused, ImageSources, load_image
 
 DOCUMENT_PARTS = ("document", "file", "input_file")
 MAX_DOCUMENT_BYTES = 64 << 20       # one document's bytes after base64
@@ -23,6 +27,7 @@ _CACHE_ENTRIES = 32
 
 _cache: OrderedDict[str, tuple] = OrderedDict()
 _cache_lock = threading.Lock()
+_request = threading.local()                # the image-source policy of the request this thread serves
 _TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/yaml", "application/csv",
                "application/javascript", "application/x-sh")
 
@@ -52,6 +57,35 @@ def expand_documents(content: list) -> list:
     return out
 
 
+@contextlib.contextmanager
+def sources(allowed: ImageSources):
+    """While a request is turned into messages: a document named by URL or path is read under `allowed`, the policy
+    its images get. Outside one, every such document is refused."""
+    _request.allowed = allowed
+    try:
+        yield
+    finally:
+        _request.allowed = None
+
+
+def _fetch(source: str, name: str) -> bytes:
+    try:
+        return load_image(source, getattr(_request, "allowed", None) or ImageSources())
+    except ImageRefused as e:
+        print(f"[server] error: document {_quoted(name)}: {e.log_line}", flush=True)
+        raise ValueError(f"document {name!r}: {e}") from None
+    except ValueError as e:
+        raise ValueError(f"document {name!r}: {e}") from None
+
+
+def _url_name(source: str) -> str:
+    try:
+        tail = urllib.parse.urlsplit(source).path.rstrip("/").rsplit("/", 1)[-1]
+    except ValueError:
+        tail = ""
+    return urllib.parse.unquote(tail) or "document"
+
+
 # ------------------------------------------------------------------------------------------------ the part shapes
 def _document_items(part: dict) -> tuple:
     kind = part["type"]
@@ -67,9 +101,10 @@ def _document_items(part: dict) -> tuple:
     if spec.get("file_id"):
         raise ValueError(f"{kind}: this server keeps no files, so a file_id cannot be read; send the file's bytes "
                          "as file_data (a data: URL)")
-    if spec.get("file_url"):
-        raise ValueError(f"{kind}: a document by URL is not fetched; send the file's bytes as file_data (a data: URL)")
-    raise ValueError(f"a {kind} part needs file_data (a data: URL with the file's bytes)")
+    if isinstance(spec.get("file_url"), str) and spec["file_url"]:
+        name = spec.get("filename") or _url_name(spec["file_url"])
+        return _read(_fetch(spec["file_url"], name), "", name, None)
+    raise ValueError(f"a {kind} part needs file_data (a data: URL with the file's bytes) or file_url")
 
 
 def _anthropic(part: dict) -> tuple:
@@ -106,7 +141,10 @@ def _anthropic(part: dict) -> tuple:
         raise ValueError("document: this server keeps no files, so a file_id cannot be read; send the file's bytes "
                          "as a base64 source")
     if kind == "url":
-        raise ValueError("document: a document by URL is not fetched; send the file's bytes as a base64 source")
+        if not isinstance(src.get("url"), str) or not src["url"]:
+            raise ValueError("a url document needs source.url")
+        name = part.get("title") or _url_name(src["url"])
+        return _read(_fetch(src["url"], name), "", name, context)
     raise ValueError(f"document source type {kind!r} is not supported (base64, text and content are)")
 
 
