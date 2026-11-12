@@ -332,14 +332,14 @@ def template_kwargs(req: dict) -> dict:
 class Assembler:
     """Builds one response's output items and typed events from Service.run's events."""
 
-    def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool):
+    def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool, rid: str | None = None):
         self.names, self.encrypted = names, encrypted
         self.prompt_tokens = prompt_tokens
         self.seq = 0
         self.item = None                             # the open output item
         reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
         self.response = {
-            "id": new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
+            "id": rid or new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
             "background": False, "error": None, "incomplete_details": None,
             "instructions": req.get("instructions"), "max_output_tokens": req.get("max_output_tokens"),
             "model": model, "output": [], "parallel_tool_calls": req.get("parallel_tool_calls", True),

@@ -15,6 +15,7 @@ import threading
 import time
 
 from serve.engine.errors import EngineDied, EngineStartError, EngineStuck, GpuBusy
+from serve.live import LiveRequests
 
 WAITING, GRANTED, FAILED, LEFT = "waiting", "granted", "failed", "left"
 
@@ -48,6 +49,7 @@ class Router:
         self.errors: dict[int, str] = {}                # id(service) -> its last load's failure, until one succeeds
         self.stopping = False
         self.worker = None
+        self.live = LiveRequests()                      # the running requests, for answer now
 
     @property
     def multi(self) -> bool:

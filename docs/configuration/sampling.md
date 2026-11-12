@@ -31,6 +31,29 @@ cap, `reasoning_budget_tokens` wins over `thinking_budget_tokens`, then `reasoni
   An 8,192-token cap allows 6,144 thinking tokens, and 2,048 remain for the close and the answer. Reserved space does not guarantee a
   complete answer.
 
+## Answer now
+
+A client can end a reply's thinking while it runs: `POST /v1/answer_now` closes the thinking and the reply goes on to its answer
+in the same response. The engine finishes the decode window under way, so a few more thinking tokens may arrive first; the close
+then follows them, the way the budget closes, and the engine reads only the close, however long the thinking was. It works on
+`/v1/chat/completions`, `/v1/messages` and `/v1/responses`, streaming or not, and with `--parallel` slots. A request nobody asks
+runs exactly as before.
+
+- **Naming the request:** every chat response carries `X-Request-Id`, the response's own id (`chatcmpl-...`, `msg_...`, `resp_...`,
+  also the `id` of a stream's chunks). Send `{"request_id": "<id>"}`. A client that sends `x-client-request-id` with its request can
+  use that value instead, before any reply arrives. Or name the session: `{"session_id": "<id>"}` or the request's
+  [session header](../running.md#session-affinity) on the call, which picks the session's newest running request.
+- **Reply:** `200 {"object": "answer_now", "request_id": "...", "state": "thinking"}`. A request still `queued` or reading its
+  `prompt` takes it too, and closes its thinking at its first token.
+- **Refusals:** `409` with `error.code` `not_thinking` and `error.state` `answering` or `finished`, or a message naming thinking off;
+  `404` with `unknown_request` or `unknown_session`; `400` `no_target` without a request id or session.
+
+```sh
+curl -s localhost:8080/v1/answer_now -H 'Content-Type: application/json' -d '{"request_id": "chatcmpl-..."}'
+```
+
+The call takes the API key like every `/v1` route. A page on another origin reads `X-Request-Id` through `--cors-origin`.
+
 ## Thinking loops
 
 - **Loops:** when one token repeats 256 times inside the thinking, the server closes the thinking and the model answers

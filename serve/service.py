@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import ctypes
+import inspect
 import subprocess
 import threading
 import time
@@ -965,9 +966,13 @@ class Service:
                 print(line, flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, session=None) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, session=None,
+            live=None) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
-        `force`: the opening of the call the reply must make (see prepare)."""
+        `force`: the opening of the call the reply must make (see prepare). `live` (serve.live.LiveRequest): the state
+        this updates, and the answer-now signal that closes the thinking at its next clean point."""
+        if live is not None:
+            live.thinking = bool(thinking)
         budget = self.reasoning_budget(sampling) if thinking else None
         budget_req = sampling
         budget_ready = False
@@ -1070,7 +1075,11 @@ class Service:
                         rate.clear()                    # drop the previous request's samples
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
+                    if live is not None:
+                        live.state = "prompt"
                     prompt, thought = ids, 0            # reasoning tokens so far
+                    # answer now stops an engine that takes `stop_soon` at its own pace (see the pass below)
+                    soft_stops = live is not None and "stop_soon" in inspect.signature(self.engine.generate).parameters
                     closed_early = False                # the thinking was already closed once
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
                     for ev in opening:
@@ -1078,11 +1087,18 @@ class Service:
                     while True:
                         if isinstance(ids, PromptText) and ids.max_new:
                             max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
+                        # answer now stops the engine at its own pace: the tokens it still writes are kept, so the
+                        # next pass extends exactly what it holds and reads only the close
+                        soft = threading.Event() if soft_stops else None
+                        more = {"stop_soon": soft} if soft is not None else {}
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb,
-                                                   session=session) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel, session=session)
+                                                   session=session, **more) if emb \
+                            else self.engine.generate(prompt, max_new - n, sampling, cancel, session=session, **more)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
                         looped = False                  # the wrap is for a repeated token, not the budget
+                        asked = False                   # the wrap is the client's answer now
+                        drained = False                 # the pass ran to the engine's DONE
+                        resumed = False                 # stopped for answer now, but not at a point to close: go on
                         ended_thinking = False          # the turn ended inside the thinking
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -1155,12 +1171,22 @@ class Service:
                                     if thought >= budget and not parser.buf and not detok.pending():
                                         wrap = True
                                         break
+                                if live is not None:
+                                    live.state = "thinking" if parser.state == "reasoning" else "answering"
+                                    if live.answer_now.is_set() and parser.state == "reasoning":
+                                        if soft is not None:
+                                            soft.set()      # the close follows the engine's last token
+                                        elif not parser.buf and not detok.pending():
+                                            wrap = asked = True
+                                            break
                                 if force:
                                     if any(ev.kind in ("tool_start", "tool_call") for ev in evs):
                                         force = None    # the model is writing a call of its own
                                     elif parser.state == "content" and not parser.buf and not detok.pending():
                                         opens = True    # at a clean point right after the thinking
                                         break
+                            else:
+                                drained = True
                         except EngineDied as e:
                             finish = "error"
                             self._say_died(e)
@@ -1184,7 +1210,12 @@ class Service:
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
-                        if not (wrap or opens or ended_thinking) or cancel.is_set():
+                        if drained and soft is not None and soft.is_set() and n < max_new and not cancel.is_set():
+                            if parser.state == "reasoning" and not parser.buf and not detok.pending():
+                                wrap = asked = True
+                            else:                       # a split tag or character, or the thinking ended meanwhile
+                                resumed = True
+                        if not (wrap or opens or ended_thinking or resumed) or cancel.is_set():
                             break
                         # budget reached or turn ended in thinking: close it and continue; the next prompt extends this
                         # one, so the engine keeps its prefix
@@ -1202,10 +1233,14 @@ class Service:
                             force = None
                             if max_new - n - len(extra) < 1:
                                 break                   # no room to answer: "length"
-                            if looped:
+                            if asked:
+                                print(f"[server] answer now: closing the thinking after {thinking_n} tokens", flush=True)
+                            elif looped:
                                 print(f"[server] thinking repeated one token {run_n} times, ending it", flush=True)
                             else:
                                 print(f"[server] thinking budget reached ({thought} tokens), wrapping up", flush=True)
+                        elif resumed:
+                            extra = []
                         else:
                             # the thinking closed itself: the call opens after the blank line the template puts
                             # before a call
@@ -1222,6 +1257,8 @@ class Service:
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev
+                        if live is not None:
+                            live.state = "thinking" if parser.state == "reasoning" else "answering"
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
