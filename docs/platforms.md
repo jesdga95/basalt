@@ -58,6 +58,13 @@ fork/exec/pipe, dlopen, /proc or /sys reads). `tools/check_platform_boundary.sh`
 the Linux body being the code you would have written anyway, and a test in `tests/platform/` that runs on both. Paths are UTF-8 and go
 through the platform file calls.
 
+## FFmpeg for video
+
+Video input loads FFmpeg's shared libraries at run time (libavformat, libavcodec, libavutil and libswscale of release 6, 7 or 8; nothing
+is linked or shipped). Linux: the distribution's runtime packages (`libavformat62` and its siblings on Ubuntu 26.04, `libavformat60`
+on 24.04), found by the system loader. Windows: a shared FFmpeg build (`avformat-62.dll` and the rest, from gyan.dev or BtbN) beside
+`basalt.exe` or in a `PATH` directory; the current directory is never searched. Without them video is off and the server says why.
+
 ## Windows limitations
 
 - Pinned memory is capped under WDDM: the pinned slices are limited to `RAM/2 - 8 GiB` when the whole arena cannot be registered.

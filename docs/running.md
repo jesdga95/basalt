@@ -114,3 +114,25 @@ last bits of the logits, so a greedy answer can fork after some tokens (`dynamic
 
 `dynamic` borrows the cache's last slots per image and refills them afterwards (about 70 ms), so the cache is identical after. Which
 images a request may name: [image sources](configuration/image-sources.md). An image may not sit in a system prompt.
+
+## Video
+
+With image input on, Qwen3.8-Flash-Next also reads video (DeepSeek does not). A user message names a video as it names an image, from
+the same [sources](configuration/image-sources.md):
+
+| API | Part |
+| --- | --- |
+| OpenAI chat | `{"type": "video_url", "video_url": {"url": "..."}}`; llama.cpp's `{"type": "input_video", "input_video": {"url": "..."}}` |
+| Responses | `{"type": "input_video", "video_url": "..."}` |
+| Anthropic | `{"type": "video", "source": {"type": "base64", "media_type": "video/mp4", "data": "..."}}`, or a `url` source |
+
+Frames are sampled as the model's own processor samples them: 2 a second, 4 to 768, evenly spaced. A part may set `fps` (up to 60)
+and `max_frames` (4 to 768). All frames are scaled to one size so the whole video fits `video-max-tokens` (default 8192 image
+tokens), and each pair of frames is read as one picture with its time in the prompt. Audio and rotation metadata are not read: a
+phone's portrait clip arrives sideways.
+
+Decoding uses FFmpeg 6, 7 or 8 from the machine ([platforms](platforms.md#ffmpeg-for-video)). At start the server prints
+`video  on, FFmpeg 8 (...)`, or `video  off` with the reason, and then a video is refused with that reason.
+
+A 30 s 1280x720 clip (60 frames, 30 groups of 264 tokens, 8,202 prompt tokens), NVFP4 pack, `dynamic`, 400 W + 180 W, cold: 3.2 s to
+the end of a 67-token answer. Decode 0.49 s, encode 0.29 s, prompt read 1.9 s.

@@ -174,6 +174,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | `image-url-host` | server | `HOST` or `HOST:PORT`, repeatable | none | Allow `http(s)` image URLs on this host from other machines. [image sources](image-sources.md) |
 | `image-dir` | server | directory, repeatable | none | Allow image files under this directory from other machines. [image sources](image-sources.md) |
 | `image-remote-only` | server | switch | off | Treat this machine's requests as remote too. [image sources](image-sources.md) |
+| `video-max-tokens` | entry | 64 to 65536 | 8192 | The most image tokens one video takes over all its frames. Video needs `vision` and FFmpeg 6, 7 or 8 on the machine. [running](../running.md#video) |
 
 Diagnostic flags: [diagnostics](diagnostics.md).
 
