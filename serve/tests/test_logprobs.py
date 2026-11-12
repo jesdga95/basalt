@@ -304,6 +304,21 @@ class Api(unittest.TestCase):
         self.assertEqual(choice["message"]["content"], "ok,")
         self.check_entries("ok,", choice["logprobs"]["content"], 0)
 
+    def test_responses_streaming(self):
+        self.start(0)
+        body = {"model": "basalt", "input": "hi", "max_output_tokens": 64, "reasoning": {"effort": "none"}, "stream": True,
+                "include": ["message.output_text.logprobs"], "top_logprobs": 1}
+        req = urllib.request.Request(self.base + "/v1/responses", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            events = [json.loads(l[6:]) for l in r.read().decode().splitlines() if l.startswith("data: {")]
+        deltas = [e for e in events if e["type"] == "response.output_text.delta"]
+        text = "".join(e["delta"] for e in deltas)
+        self.assertEqual(text, "ok, done.")
+        self.check_entries(text, [x for e in deltas for x in e["logprobs"]], 1)
+        done = [e for e in events if e["type"] == "response.output_text.done"][0]
+        self.check_entries(text, done["logprobs"], 1)
+
     def test_bad_request(self):
         self.start(0)
         with self.assertRaises(urllib.error.HTTPError) as e:
