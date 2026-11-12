@@ -51,8 +51,17 @@ read the vision projector inside it.
 
 ## The stats page
 
-The server's address serves a page, updated every second from `/metrics`, `/slots` and `/api/logs`: GPU load, power, VRAM and temperature,
-RAM and disk, decode and prefill rates with 60 s charts, slots, the newest requests, and the console lines.
+The server's address serves a page with GPU load, power, VRAM and temperature, RAM and disk,
+decode and prefill rates with 60 s charts, slots, the newest requests, and console lines.
+The page receives combined metrics and slot snapshots through `/api/state/stream`, once per second
+and on observed request, queue or model state changes (checked every 100 ms). A shared publisher
+serves all clients without per-client snapshot queues; reconnecting clients receive its latest snapshot.
+This is a combined view, not a transaction across all engine and router state. `/metrics` and `/slots`
+remain JSON endpoints for external clients. Each SSE endpoint permits up to eight concurrent clients.
+The Logs tab, beside Requests and Queue, receives live SSE
+events from `/api/logs/stream`, reconnects from its last cursor, and reports server restarts or lines
+lost from the bounded buffer. Both log endpoints require the API key when one is configured; the
+page sends it in the Authorization header. `/api/logs` remains a JSON snapshot endpoint.
 
 Three quiet figures sit in it, each from `/metrics`:
 

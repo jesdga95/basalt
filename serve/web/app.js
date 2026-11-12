@@ -21,14 +21,7 @@ const shortCpu = s => String(s || "").replace(/\((R|TM)\)/gi, "").replace(/\s+\d
   .replace(/\s+CPU\s+@.*$/i, "").replace(/\s+Processor$/i, "").replace(/\s+/g, " ").trim();
 
 let apiKey = sessionStorage.getItem("basalt.key") || "";
-let M = null;          // the last /metrics reading, with .slots from /slots
-
-async function get(path) {
-  const r = await fetch(path, { cache: "no-store", headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} });
-  if (r.status === 401) throw Object.assign(new Error("locked"), { locked: true });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
-}
+let M = null;          // the last combined state snapshot
 
 /* ---- series and charts ---- */
 // the last HIST samples, padded at the start with null (no line) so the newest sample sits at the right edge
@@ -249,11 +242,12 @@ $("#chips").addEventListener("click", e => {
   draw();
 });
 
-/* ---- main card: Slots (Context for one slot) | Requests | Queue ---- */
+/* ---- main card: Slots (Context for one slot) | Requests | Queue | Logs ---- */
 let tab = sessionStorage.getItem("basalt.tab") || "slots";
 $("#tabs").addEventListener("click", e => {
   const b = e.target.closest("button[data-t]"); if (!b) return;
   tab = b.dataset.t; try { sessionStorage.setItem("basalt.tab", tab); } catch (err) { /* private mode */ }
+  showMainTab(tab);
   draw();
 });
 const accept = s => s.drafts_offered > 20 ? Math.round(s.drafts_accepted / s.drafts_offered * 100) : null;
@@ -339,9 +333,11 @@ function contextPane(s, reqs, eng) {
 }
 function drawMain(live, hist, reqs, slots, total) {
   const multi = total > 1, n = live.queued || 0;
-  const T = (multi ? [["slots", "Slots"]] : reqs.length || (slots[0] && slots[0].ctx_used > 0) ? [["ctx", "Context"]] : []).concat([["req", "Requests"], ["queue", `Queue (${n})`]]);
+  const T = (multi ? [["slots", "Slots"]] : reqs.length || (slots[0] && slots[0].ctx_used > 0) ? [["ctx", "Context"]] : []).concat([["req", "Requests"], ["queue", `Queue (${n})`], ["logs", "Logs"]]);
   const cur = T.some(t => t[0] === tab) ? tab : T[0][0];
-  html($("#tabs"), T.map(t => `<button type="button" role="tab" data-t="${t[0]}" aria-selected="${t[0] === cur}">${t[1]}</button>`).join(""));
+  html($("#tabs"), T.map(t => `<button type="button" role="tab" data-t="${t[0]}" aria-controls="${t[0] === "logs" ? "logs-pane" : "pane"}" aria-selected="${t[0] === cur}">${t[1]}</button>`).join(""));
+  showMainTab(cur);
+  if (cur === "logs") return;
   let h;
   if (cur === "slots") {
     const series = slots.map((_, k) => tail((hist.slot_tok_s || [])[k]));
@@ -349,6 +345,12 @@ function drawMain(live, hist, reqs, slots, total) {
   } else if (cur === "ctx") h = contextPane(slots[0] || {}, reqs, M.engine || {});
   else h = cur === "req" ? requestsPane(live, reqs, multi) : queuePane(live);
   html($("#pane"), h);
+}
+function showMainTab(cur) {
+  $("#pane").hidden = cur === "logs";
+  $("#logs-pane").hidden = cur !== "logs";
+  $("#tabs").querySelectorAll("button[data-t]").forEach(b => b.setAttribute("aria-selected", String(b.dataset.t === cur)));
+  if (cur === "logs" && follow) logEl.scrollTop = logEl.scrollHeight;
 }
 
 /* ---- several models: the picker names the model and choosing an unloaded one loads it ---- */
@@ -472,32 +474,70 @@ function clearLog(note) {
   const d = document.createElement("div"); d.className = "empty"; d.textContent = note; logEl.replaceChildren(d);
 }
 
-/* ---- polling ---- */
-let lastLog = 0;
-async function pollMetrics() {
-  try {
-    const m = await get("metrics");
-    m.slots = await get("slots").catch(() => []);
-    M = m; $("#auth").hidden = true; draw();
-  } catch (e) {
-    $("#auth").hidden = !e.locked; M = null;
-    setState("offline", e.locked ? "Locked" : "Offline");
+/* ---- streamed state and logs ---- */
+function stream(path, receive, status) {
+  let controller = null, retry = null, stopped = false;
+  function cancel() {
+    clearTimeout(retry); retry = null;
+    controller?.abort(); controller = null;
   }
-  setTimeout(pollMetrics, 1000);
+  async function connect() {
+    cancel();
+    if (stopped) return;
+    const own = controller = new AbortController();
+    let reader;
+    try {
+      status("connecting");
+      const r = await fetch(path(), { signal: own.signal, cache: "no-store",
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} });
+      if (own.signal.aborted) return;
+      if (r.status === 401) { status("locked"); return; }
+      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+      reader = r.body.getReader();
+      const decoder = new TextDecoder(), parse = createLogParser(data => { receive(data); status("live"); });
+      while (!own.signal.aborted) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error("Connection closed");
+        if (!own.signal.aborted) parse(decoder.decode(value, { stream: true }));
+      }
+    } catch (e) {
+      if (own.signal.aborted) return;
+      status("offline"); retry = setTimeout(connect, 2000);
+    } finally {
+      if (reader) { try { await reader.cancel(); } catch (_) {} reader.releaseLock(); }
+    }
+  }
+  window.addEventListener("pagehide", () => { stopped = true; cancel(); });
+  window.addEventListener("pageshow", () => { if (stopped) { stopped = false; connect(); } });
+  return connect;
 }
-async function pollLog() {
-  try {
-    const r = await get(`api/logs?after=${lastLog}`);
-    if (r.last < lastLog) { lastLog = 0; clearLog("The server restarted."); }
-    else if (r.lines.length) { lastLog = r.last; append(r.lines); }
-    else if (!logCount && !logEl.firstChild) clearLog("No log lines yet.");
-  } catch (e) { /* the metrics poll reports the connection */ }
-  setTimeout(pollLog, 1000);
-}
+const connectState = stream(() => "api/state/stream", data => {
+  M = data; $("#auth").hidden = true; draw();
+}, state => {
+  if (state === "locked" || state === "offline") {
+    $("#auth").hidden = state !== "locked"; M = null;
+    setState("offline", state === "locked" ? "Locked" : "Offline");
+  }
+});
+let lastLog = null, logInstance = null;
+const connectLogs = stream(() => "api/logs/stream" + (lastLog === null ? "" :
+  `?after=${lastLog}&instance=${encodeURIComponent(logInstance)}`), data => {
+  if (data.reset || (logInstance !== null && logInstance !== data.instance_id)) {
+    clearLog("The server restarted."); lastLog = null;
+  }
+  logInstance = data.instance_id;
+  if (data.dropped) append([{ t: Date.now() / 1000, src: "srv", lvl: "warn", msg: "Some log lines were dropped from the server buffer." }]);
+  append(data.lines.filter(line => lastLog === null || line.id > lastLog));
+  lastLog = data.next;
+  if (!logCount) clearLog("No log lines yet.");
+}, state => text($("#log-status"), { connecting: "Connecting", locked: "API key required",
+  live: "Live", offline: "Disconnected; retrying" }[state]));
 $("#auth").onsubmit = e => {
   e.preventDefault(); apiKey = $("#key").value.trim(); sessionStorage.setItem("basalt.key", apiKey);
+  connectState(); connectLogs();
 };
 
 $("#host").textContent = location.host;
 fetch("health").then(r => r.json()).then(h => { $("#keyed").hidden = !h.api_key; }).catch(() => {});
-pollMetrics(); pollLog();
+drawMain({}, {}, [], [], 1);
+connectState(); connectLogs();
