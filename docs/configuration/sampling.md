@@ -54,6 +54,12 @@ curl -s localhost:8080/v1/answer_now -H 'Content-Type: application/json' -d '{"r
 
 The call takes the API key like every `/v1` route. A page on another origin reads `X-Request-Id` through `--cors-origin`.
 
+### Detecting Basalt
+
+`/props` (llama.cpp's route, unchanged for its clients) carries one extra key, `basalt`: `{"version": "...", "capabilities":
+["answer_now"]}`. A client that finds `basalt` there talks to Basalt; `"answer_now" in basalt.capabilities` says the endpoint above is
+served. Later features add their names to the same list.
+
 ## Thinking loops
 
 - **Loops:** when one token repeats 256 times inside the thinking, the server closes the thinking and the model answers
