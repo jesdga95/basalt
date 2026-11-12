@@ -828,15 +828,15 @@ target_include_directories(mid_chain_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(mid_chain_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME mid_chain_parity COMMAND mid_chain_parity 20)
 set_tests_properties(mid_chain_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
-# mid_chain with one SM held (mid_chain_parity --hold), built with a short wait bound: below it the launch waits for the
-# release and is bitwise, past it the waits give up through the abort word instead of trapping
+# A cooperative mid-chain launch waits for a held SM without starting a partial grid,
+# including when the resource wait exceeds the kernel's bounded device waits.
 add_executable(mid_chain_hold tests/models/qwen4exp/kernels/mid_chain_parity.cpp src/models/qwen4exp/kernels/mid_chain.cu)
 target_include_directories(mid_chain_hold PRIVATE ${_gpu_include_directories})
 target_compile_definitions(mid_chain_hold PRIVATE MKB_NS=200000000ull)
 target_link_libraries(mid_chain_hold PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME mid_chain_hold COMMAND mid_chain_hold 1 --hold 50)
-basalt_gpu_test(NAME mid_chain_hold_abort COMMAND mid_chain_hold 1 --hold 600)
-set_tests_properties(mid_chain_hold mid_chain_hold_abort PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+basalt_gpu_test(NAME mid_chain_hold_long COMMAND mid_chain_hold 1 --hold 600)
+set_tests_properties(mid_chain_hold mid_chain_hold_long PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 add_executable(qsa_mid_parity tests/models/qwen4exp/kernels/qsa_mid_parity.cpp)
 target_include_directories(qsa_mid_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(qsa_mid_parity PRIVATE model_qwen4exp_kernels ggml_quants ${_gpu_runtime_target})

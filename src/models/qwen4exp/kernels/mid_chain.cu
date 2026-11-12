@@ -572,12 +572,13 @@ void mid_chain_init() {
     MidDev& d = mid_dev();
     if (d.checked) return;
     d.checked = true;
-    int dev = 0, optin = 0, sms = 0;
+    int dev = 0, optin = 0, sms = 0, cooperative = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-    if (!hc_fused_supported() || sms < kMidMinCtas || optin < SMEM_MAX) {
-        basalt::log::warn("basalt", "mid_chain: device not covered (%d SMs, %d B optin smem; need %d, %d): the unfused kernels run", sms, optin, kMidMinCtas, SMEM_MAX);
+    cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, dev);
+    if (!hc_fused_supported() || sms < kMidMinCtas || optin < SMEM_MAX || !cooperative) {
+        basalt::log::warn("basalt", "mid_chain: device not covered (%d SMs, %d B optin smem, cooperative %d; need %d, %d, 1): the unfused kernels run", sms, optin, cooperative, kMidMinCtas, SMEM_MAX);
         return;
     }
     d.ctas = sms < kMidCtas ? sms : kMidCtas;
@@ -647,8 +648,24 @@ void mid_chain(const MidChainArgs& a, void* stream) {
     // set the next one uses once their predecessor has completed (see the kernel)
     p.par = (unsigned) (a.ord & 1);
     if (a.ord == 0) cudaMemsetAsync(d.cnt, 0, (2 * NCTR + 1) * 4, (cudaStream_t) stream);
-    launch_pdl(mid_pick(a.T, a.type_q, a.type_z, a.type_o, a.stamps != nullptr), dim3(a.ctas > 0 ? a.ctas : d.ctas), dim3(CT), (size_t) SMEM_MAX, (cudaStream_t) stream, p);
-    const cudaError_t e = cudaGetLastError();
+    // Cross-block hand-offs require the whole grid resident. Ordinary launches can
+    // leave a producer unscheduled while resident consumers wait for its counter.
+    cudaLaunchAttribute attrs[2]{};
+    attrs[0].id = cudaLaunchAttributeCooperative;
+    attrs[0].val.cooperative = 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(a.ctas > 0 ? a.ctas : d.ctas);
+    cfg.blockDim = dim3(CT);
+    cfg.dynamicSmemBytes = SMEM_MAX;
+    cfg.stream = (cudaStream_t) stream;
+    cfg.attrs = attrs;
+    cfg.numAttrs = 1;
+    if (pdl_launch_wanted()) {
+        attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[1].val.programmaticStreamSerializationAllowed = 1;
+        cfg.numAttrs = 2;
+    }
+    const cudaError_t e = cudaLaunchKernelEx(&cfg, mid_pick(a.T, a.type_q, a.type_z, a.type_o, a.stamps != nullptr), p);
     if (e != cudaSuccess) {
         basalt::log::error("basalt", "mid_chain: %s", cudaGetErrorString(e));
         std::exit(1);

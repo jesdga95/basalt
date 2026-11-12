@@ -9,11 +9,8 @@
 //
 //     build/mid_chain_parity [iters] [--hold <ms>]
 //
-// --hold: one launch with one SM held by another stream's kernel for <ms> (as a host-gated spin kernel beside it would
-// hold it; the decode graph keeps every side branch away from the mid chain).  The kernel needs every CTA resident, so
-// it ends only after the release.  Held for less than the wait bound (MKB_NS) it has the bits of a free launch; held
-// longer, its waits give up at the bound and set the abort word (wait_abort.hpp) instead of trapping, the resident CTAs
-// leave, the last one runs on an SM they free, the launch ends cleanly, and the next launch is bitwise again.  The mid_chain_hold build has a short bound for this.
+// --hold: one SM held by another stream's kernel for <ms>. The cooperative mid-chain launch waits for enough resources,
+// even beyond its device-wait bound, then has the bits of a free launch and leaves the abort word clear.
 #include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
@@ -293,20 +290,15 @@ int main(int argc, char** argv) {
         const double ended = ms_since();
         CK(cudaStreamSynchronize(sb));
         const unsigned long long code = K::wait_abort_code();
-        const bool expect_abort = (unsigned long long) hold_ms * 1000000ull > (unsigned long long) MKB_NS;
         std::printf("hold 1 of %d SMs for %d ms (wait bound %.0f ms): k_mid %s, ended %.1f ms after its launch (%s), abort word %s\n",
                     sms, hold_ms, MKB_NS / 1e6, early ? "ended with the SM held" : "stuck until the release", ended,
                     cudaGetErrorString(e), code != 0 ? K::wait_abort_text(code).c_str() : "clear");
-        // past the bound the resident CTAs give up and leave, and the last one runs on an SM they free
-        bad += early && (!expect_abort || ended * 1e6 < (double) MKB_NS) ? 1 : 0;
+        bad += early ? 1 : 0;
         bad += e != cudaSuccess ? 1 : 0;
-        if (!expect_abort) {
-            const size_t d = e == cudaSuccess ? differing(ref, snap(T, true)) : 0;
-            std::printf("  held below the bound: %zu bytes differ from the free launch\n", d);
-            bad += (int) d + (code != 0 ? 1 : 0);
-        } else {
-            bad += (code >> 56 & 0x7fu) == K::kWaitMidChain ? 0 : 1;
-            K::wait_abort_clear();
+        const size_t held_diff = e == cudaSuccess ? differing(ref, snap(T, true)) : 0;
+        std::printf("  held launch: %zu bytes differ from the free launch\n", held_diff);
+        bad += (int) held_diff + (code != 0 ? 1 : 0);
+        {
             reset(); run(w, T, true, true, s);
             const cudaError_t e2 = cudaStreamSynchronize(s);
             const size_t d = e2 == cudaSuccess ? differing(ref, snap(T, true)) : 0;
