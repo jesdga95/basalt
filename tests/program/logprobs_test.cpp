@@ -1,19 +1,16 @@
-// tests/program/logprobs_test.cpp - a pick's P line fields (logprobs.hpp) against a plain double-precision reference.
-// Random rows at the real vocabulary size: the pick's log probability, the K likeliest ids in order (ties to the lower
-// id), the clamp to 20 alternatives, and a masked (-inf) logit.
+// tests/program/logprobs_test.cpp - the P line fields (logprobs.hpp) from a row of kernels::row_logprobs: the pick's
+// value, the alternatives in order, the clamp to 20, a masked value's floor and a row shorter than asked.
 #include "logprobs.hpp"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <numeric>
-#include <sstream>
+#include <cstring>
 #include <string>
 #include <vector>
 
 using namespace basalt::program::serve;
+using basalt::kernels::kLogprobStride;
 
 static int g_fail = 0;
 #define CHECK(c)                                                                         \
@@ -22,75 +19,32 @@ static int g_fail = 0;
     } while (0)
 
 namespace {
-
-uint64_t g_rng = 7;
-uint64_t next_u64() {   // splitmix64: the same sequence on every compiler
-    uint64_t z = (g_rng += 0x9e3779b97f4a7c15ull);
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-    return z ^ (z >> 31);
-}
-float uniform(float lo, float hi) { return lo + (hi - lo) * (float) ((next_u64() >> 11) * (1.0 / 9007199254740992.0)); }
-
-struct Parsed { int tok = -1; double lp = 0; std::vector<int> ids; std::vector<double> lps; };
-
-Parsed parse(const std::string& s) {
-    Parsed p;
-    std::istringstream in(s);
-    in >> p.tok >> p.lp;
-    std::string alt;
-    while (in >> alt) {
-        const size_t c = alt.find(':');
-        p.ids.push_back(std::atoi(alt.substr(0, c).c_str()));
-        p.lps.push_back(std::atof(alt.substr(c + 1).c_str()));
+std::vector<float> row(float pick, const std::vector<std::pair<int32_t, float>>& alts) {
+    std::vector<float> r((size_t) kLogprobStride, 0.0f);
+    r[0] = pick;
+    for (size_t k = 0; k < (size_t) basalt::kernels::kLogprobMaxTop; ++k) {
+        const int32_t id = k < alts.size() ? alts[k].first : -1;
+        std::memcpy(&r[2 + 2 * k], &id, sizeof id);
+        r[3 + 2 * k] = k < alts.size() ? alts[k].second : -INFINITY;
     }
-    return p;
+    return r;
 }
-
-void check_row(const std::vector<float>& lg, int tok, int top) {
-    const int n = (int) lg.size();
-    double mx = -INFINITY, sum = 0;
-    for (float v : lg) mx = std::max(mx, (double) v);
-    for (float v : lg) sum += std::exp((double) v - mx);
-    const double lse = mx + std::log(sum);
-    std::vector<int> ord((size_t) n);
-    std::iota(ord.begin(), ord.end(), 0);
-    std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return lg[(size_t) a] > lg[(size_t) b]; });
-    const Parsed p = parse(logprob_fields(lg.data(), n, tok, top));
-    const int want = std::min(std::max(top, 0), kMaxTopLogprobs);
-    CHECK(p.tok == tok);
-    const double ref = std::isfinite((double) lg[(size_t) tok]) ? (double) lg[(size_t) tok] - lse : -9999.0;
-    CHECK(std::fabs(p.lp - ref) < 2e-6);
-    CHECK((int) p.ids.size() == want);
-    for (int k = 0; k < (int) p.ids.size() && k < want; ++k) {
-        CHECK(p.ids[(size_t) k] == ord[(size_t) k]);
-        CHECK(std::fabs(p.lps[(size_t) k] - ((double) lg[(size_t) ord[(size_t) k]] - lse)) < 2e-6);
-    }
-}
-
 }  // namespace
 
 int main() {
-    const int kVocab = 151936;   // the real head width
-    std::vector<float> lg((size_t) kVocab);
-    for (int trial = 0; trial < 40; ++trial) {
-        for (float& v : lg) v = uniform(-20.0f, 20.0f);
-        if (trial % 4 == 1)   // a peaked row: one token far above the rest
-            lg[(size_t) (next_u64() % (uint64_t) kVocab)] = 60.0f;
-        if (trial % 4 == 2)   // ties: the lower id comes first
-            for (int i = 0; i < 30; ++i) lg[(size_t) (next_u64() % (uint64_t) kVocab)] = 25.0f;
-        const int tok = (int) (next_u64() % (uint64_t) kVocab);
-        check_row(lg, tok, (int) (next_u64() % 25));
-    }
-    // a masked pick reports the floor, and the alternatives skip nothing finite
-    for (float& v : lg) v = uniform(-5.0f, 5.0f);
-    lg[3] = -INFINITY;
-    check_row(lg, 3, 5);
-    // a small vocabulary with fewer ids than asked
-    std::vector<float> small = {1.0f, 3.0f, 2.0f};
-    const Parsed p = parse(logprob_fields(small.data(), 3, 1, 20));
-    CHECK(p.ids.size() == 3 && p.ids[0] == 1 && p.ids[1] == 2 && p.ids[2] == 0);
-    CHECK(parse(logprob_fields(small.data(), 3, 1, 0)).ids.empty());
+    const auto r = row(-0.25f, {{7, -0.25f}, {9, -1.5f}, {3, -2.0f}});
+    CHECK(logprob_fields(r.data(), 7, 0) == " 7 -0.250000");
+    CHECK(logprob_fields(r.data(), 7, 2) == " 7 -0.250000 7:-0.250000 9:-1.500000");
+    CHECK(logprob_fields(r.data(), 7, 5) == " 7 -0.250000 7:-0.250000 9:-1.500000 3:-2.000000");   // fewer than asked
+    std::vector<std::pair<int32_t, float>> many;
+    for (int i = 0; i < 25; ++i) many.push_back({i, -0.1f * (float) i});
+    const auto m = row(-1.0f, many);
+    const std::string all = logprob_fields(m.data(), 4, 99);
+    int n = 0;
+    for (char c : all) n += c == ':';
+    CHECK(n == kMaxTopLogprobs);   // clamped to 20
+    const auto masked = row(-INFINITY, {{1, -INFINITY}});
+    CHECK(logprob_fields(masked.data(), 5, 1) == " 5 -9999.000000 1:-9999.000000");
     if (g_fail) { std::printf("%d failures\n", g_fail); return 1; }
     std::printf("logprobs_test: ok\n");
     return 0;

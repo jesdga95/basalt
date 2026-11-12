@@ -318,6 +318,7 @@ target_link_libraries(basalt-load PRIVATE core kernels)
 # reference is the whole point - a kernel checked against another copy of itself proves nothing.
 add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/sampler.cu
+                        src/kernels/cuda/logprobs.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/bf16_gemv.cu
                         src/kernels/cuda/native_mmvq.cu
@@ -862,6 +863,11 @@ target_include_directories(sampler_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(sampler_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME sampler_parity COMMAND sampler_parity --selftest)
 basalt_gpu_test(NAME sampler_split_parity COMMAND sampler_parity --split)
+# a pick's log probability and the row's likeliest tokens (row_logprobs) against a double CPU reference
+add_executable(logprobs_parity tests/kernels/logprobs_parity.cpp)
+target_include_directories(logprobs_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(logprobs_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME logprobs_parity COMMAND logprobs_parity)
 # the decode QSA top-k and the greedy argmax on thread-block clusters vs the one-CTA kernels, bitwise,
 # captured in a graph too (GPU, synthetic, no model; skips without cluster support); --bench: per-call times
 add_executable(decode_cluster_parity tests/models/qwen4exp/kernels/decode_cluster_parity.cpp)
@@ -1138,7 +1144,7 @@ basalt_cpu_test(NAME reply_rows_test COMMAND reply_rows_test)
 set_tests_properties(reply_rows_test PROPERTIES TIMEOUT 60)
 # a sent pick's log probability and the row's likeliest tokens (CPU only)
 add_executable(logprobs_test tests/program/logprobs_test.cpp)
-target_include_directories(logprobs_test PRIVATE src/program/serve)
+target_include_directories(logprobs_test PRIVATE src/program/serve include)
 target_link_libraries(logprobs_test PRIVATE warnings)
 basalt_embed_manifest(logprobs_test)
 basalt_cpu_test(NAME logprobs_test COMMAND logprobs_test)

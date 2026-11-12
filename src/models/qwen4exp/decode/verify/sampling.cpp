@@ -9,6 +9,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/qwen4exp/kernels/q6k_head.hpp"
 #include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
+#include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include <exception>
 #include <string>
@@ -133,6 +134,29 @@ bool Verifier::resample_row(int t, int64_t pos0, const std::vector<float>& bias,
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "resample_row: the sampling failed"; return false; }
     token = ((volatile int32_t*) h_out_)[0];
     return true;
+}
+
+bool Verifier::row_logprobs(int t0, int n, const int32_t* picks, int top, float* host) {
+    using basalt::kernels::kLogprobStride;
+    if (next_ != nullptr) return next_->row_logprobs(t0, n, picks, top, host);   // a layer split: the head is on the last stage
+    if (head_logits_ == nullptr || host == nullptr || picks == nullptr || t0 < 0 || n <= 0 || n_vocab_ <= 0) return false;
+    const OnDevice on_device(device_);
+    if (head_screened_ && !head_exact_again()) return false;
+    if (lp_cap_ < (size_t) n) {
+        if (lp_buf_ != nullptr) cudaFree(lp_buf_);
+        lp_buf_ = nullptr;
+        lp_cap_ = 0;
+        const size_t floats = basalt::kernels::row_logprobs_scratch_floats(n, (int) n_vocab_) + (size_t) n * (kLogprobStride + 1);
+        if (cudaMalloc((void**) &lp_buf_, floats * sizeof(float)) != cudaSuccess) return false;
+        lp_cap_ = (size_t) n;
+    }
+    float* d_out = lp_buf_ + basalt::kernels::row_logprobs_scratch_floats((int) lp_cap_, (int) n_vocab_);
+    int32_t* d_picks = reinterpret_cast<int32_t*>(d_out + lp_cap_ * kLogprobStride);
+    if (cudaMemcpyAsync(d_picks, picks, (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess) return false;
+    basalt::kernels::row_logprobs(head_logits_ + (size_t) t0 * (size_t) n_vocab_, n, (int) n_vocab_, d_picks, top, d_out,
+                                  lp_buf_, cs_);
+    return cudaMemcpyAsync(host, d_out, (size_t) n * kLogprobStride * sizeof(float), cudaMemcpyDeviceToHost, cs_) ==
+               cudaSuccess && cudaStreamSynchronize(cs_) == cudaSuccess;
 }
 
 bool Verifier::copy_logits(int t, float* host) const {

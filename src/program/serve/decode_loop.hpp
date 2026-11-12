@@ -32,7 +32,7 @@ Flow Request::decode_loop(B& b) {
     if (cancelled) finish = "cancel";
 
     const std::vector<int64_t>& eos_ids = runtime_.o.eos_ids;
-    std::vector<float> lp_row;              // logprobs=K: one pick's row of logits
+    std::vector<float> lp_rows;             // logprobs=K: the picks' rows (row_logprobs)
     std::vector<std::string> lp_fields;     // and each pick's P line fields, sent ahead of its T line
     while (!cancelled && produced_n < max_new && (!in_slot || solo_req)) {   // (a batch slot's first token comes from the batch window)
         int T = 1;
@@ -105,15 +105,15 @@ Flow Request::decode_loop(B& b) {
             }
         }
         if (req_logprobs >= 0 && ppl == nullptr) {   // the picks are final: read their rows before the commit
-            lp_row.resize((size_t) runtime_.n_vocab);
+            constexpr int S = basalt::kernels::kLogprobStride;
+            lp_rows.resize((size_t) (a + 1 - e0) * S);
             lp_fields.assign((size_t) a + 1, std::string());
-            for (int i = e0; i <= a; ++i) {
-                if (!b.copy_logits(i, lp_row.data())) {
-                    std::printf("ERR logprobs: the head logits copy failed\n");
-                    return Flow::error;
-                }
-                lp_fields[(size_t) i] = logprob_fields(lp_row.data(), (int) runtime_.n_vocab, outv[(size_t) i], req_logprobs);
+            if (!b.row_logprobs(e0, a + 1 - e0, outv.data() + e0, req_logprobs, lp_rows.data())) {
+                std::printf("ERR logprobs: the head logits read failed\n");
+                return Flow::error;
             }
+            for (int i = e0; i <= a; ++i)
+                lp_fields[(size_t) i] = logprob_fields(lp_rows.data() + (size_t) (i - e0) * S, outv[(size_t) i], req_logprobs);
         }
         if (ppl != nullptr) {   // every row scored and committed
             a = T - 1;
