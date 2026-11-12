@@ -191,6 +191,8 @@ class Responses(unittest.TestCase):
         self.assertEqual([x["token"] for x in out[1]["logprobs"]], ["<call", "args", "</calls>"])
         rdelta = [e for e in events if e["type"] == "response.reasoning_text.delta"][0]
         self.assertEqual([x["token"] for x in rdelta["logprobs"]], ["hm"])
+        adelta = [e for e in events if e["type"] == "response.function_call_arguments.delta"][0]
+        self.assertEqual([x["token"] for x in adelta["logprobs"]], ["<call", "args"])
 
 
 class Api(unittest.TestCase):
