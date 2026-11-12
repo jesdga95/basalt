@@ -59,7 +59,7 @@ enum { ST_ENTRY, ST_WAIT, ST_TILE0, ST_PAIR_REL = ST_TILE0 + 7, ST_PZ_REL = ST_P
 static_assert(ST_N == kMidStampPts, "stamp points");
 // the CTA's shared-memory tail: barriers, the IQ3_S grid, the layer's pointers and arguments
 struct MPerm {
-    uint64_t slot[P_SLOTS], ofull, oxbar, rbar;
+    uint64_t slot[P_SLOTS], ofull, rbar;
     uint32_t grid[512];
     const uint8_t *lwq, *lwz, *lwo, *lyq;
     float* lbo;
@@ -103,7 +103,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
     if (tid == 0) tk = atomicInc(&p.cnt[2 * NCTR], (unsigned) (G - 1));   // arrival ticket; wraps, never cleared
     if (tid == 0) {
         for (int s = 0; s < P_SLOTS; ++s) mbar_init(&P.slot[s], 1);
-        mbar_init(&P.ofull, 1); mbar_init(&P.oxbar, 1); mbar_init(&P.rbar, 1);
+        mbar_init(&P.ofull, 1); mbar_init(&P.rbar, 1);
     }
     {   // the layer's arguments: one batch of independent loads, issued before any bulk copy
         constexpr int NR = (int) (sizeof(DecRecArgs) / 4);
@@ -358,11 +358,15 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         const bool oxs = FO != 0 && TM <= RXT ? oxs_fixed : P.geo.ox + T * nb32 * kQ81 <= OFF_PERM;   // x staged in smem (else read from L2 through L1)
         const uint8_t* xsm = oxs ? reinterpret_cast<const uint8_t*>(sm + P.geo.ox) : P.lyq;
         float* red = reinterpret_cast<float*>(sm + P.geo.ored);
+        if (tid == 0) spin_ge(&c[C_REC], R_HV);
+        cbar();
         if (oxs) {
-            if (tid == 0) hop_copy(&c[C_REC], R_HV, sm + P.geo.ox, P.lyq, (unsigned) (T * nb32 * kQ81), &P.oxbar);
-            MW(&P.oxbar, PB_OX);
-        } else {
-            if (tid == 0) spin_ge(&c[C_REC], R_HV);
+            // Read the produced rows through L2, then publish the staged rows with
+            // a block barrier; this hand-off needs no asynchronous-copy barrier.
+            constexpr int row_vectors = O_NIN / 32 * kQ81 / sizeof(uint4);
+            auto* dst = reinterpret_cast<uint4*>(sm + P.geo.ox);
+            const auto* src = reinterpret_cast<const uint4*>(P.lyq);
+            for (int j = tid; j < T * row_vectors; j += CT) dst[j] = __ldcg(src + j);
             cbar();
         }
         STP(tid == 0, ST_O_REC);
@@ -612,7 +616,7 @@ bool mid_chain_supported(const MidChainArgs& a) {
     return d.ok && a.ctas >= 0 && a.ctas <= d.ctas && (a.ctas == 0 || a.ctas >= kMidMinCtas) && a.T >= 1 && a.T <= kMidChainMaxT && types_ok(a) &&
            a.xq != nullptr && a.bo != nullptr && a.rec.yq != nullptr && a.rec.qkv != nullptr && a.rec.z != nullptr &&
            ((uintptr_t) a.wq & 15) == 0 && ((uintptr_t) a.wz & 15) == 0 && ((uintptr_t) a.wo & 15) == 0 &&
-           ((uintptr_t) a.rec.state & 15) == 0 && ((uintptr_t) a.xq & 3) == 0 && a.rec.n_embd == 2560 && a.rec.h_v == R_HV &&
+           ((uintptr_t) a.rec.state & 15) == 0 && ((uintptr_t) a.rec.yq & 15) == 0 && ((uintptr_t) a.xq & 3) == 0 && a.rec.n_embd == 2560 && a.rec.h_v == R_HV &&
            a.rec.h_k == R_HK && a.rec.C == R_C && a.rec.nk == 0;
 }
 
