@@ -15,7 +15,9 @@ import re
 import threading
 import time
 import urllib.parse
+import zipfile
 from collections import OrderedDict
+from xml.etree import ElementTree
 
 from serve.engine.image_source import ImageRefused, ImageSources, load_image
 
@@ -31,6 +33,10 @@ _cache: OrderedDict[str, tuple] = OrderedDict()
 _cache_lock = threading.Lock()
 _request = threading.local()                # the image-source policy of the request this thread serves
 _parses = threading.Semaphore(2)            # PDFs are parsed outside the request turn: this bounds the CPU and memory
+_OFFICE_TYPES = {"application/vnd.openxmlformats-officedocument.wordprocessingml.document": "Word (.docx)",
+                 "application/vnd.openxmlformats-officedocument.presentationml.presentation": "PowerPoint (.pptx)",
+                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "Excel (.xlsx)"}
+MAX_PART_BYTES = 64 << 20           # one XML part of an Office file, unpacked
 _TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/yaml", "application/csv",
                "application/javascript", "application/x-sh")
 
@@ -208,13 +214,20 @@ def _read(data: bytes, media: str, name: str, context: str | None, want=None) ->
         return _framed(name, pages, read, context, items)
     if want is not None:
         raise ValueError(f"document {name!r}: pages are named in PDF documents only")
+    office = _office_kind(data) if media in _OFFICE_TYPES or media in ("", "application/octet-stream") else None
+    if office:
+        body, count = _read_office(data, name, office)
+        return (_text_item(_wrap(name, None, context, body, count)),)
+    if media in _OFFICE_TYPES:
+        raise ValueError(f"document {name!r} is not a {_OFFICE_TYPES[media]} file")
     if media.startswith("text/") or media in _TEXT_TYPES or (media in ("", "application/octet-stream") and not pdf):
         try:
             text = data.decode("utf-8-sig")
         except UnicodeDecodeError:
             raise ValueError(f"document {name!r} is not UTF-8 text") from None
         return (_text_item(_wrap(name, None, context, _clean(text))),)
-    raise ValueError(f"document {name!r}: media type {media!r} is not read (PDF and text documents are)")
+    raise ValueError(f"document {name!r}: media type {media!r} is not read (PDF, Word, PowerPoint, Excel and text "
+                     "documents are)")
 
 
 def _read_pdf(data: bytes, name: str, want) -> tuple[int, str | None, tuple]:
@@ -325,6 +338,126 @@ def _scan_of(page, min_pixels: int) -> str | None:
     return f"data:{media};base64,{base64.b64encode(raw).decode()}"
 
 
+# ------------------------------------------------------------------------------------------------ Office files
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PR = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def _office_kind(data: bytes) -> str | None:
+    if not data.startswith(b"PK\x03\x04"):
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = set(z.namelist())
+    except (zipfile.BadZipFile, ValueError):
+        return None
+    for part, kind in (("word/document.xml", "docx"), ("ppt/presentation.xml", "pptx"), ("xl/workbook.xml", "xlsx")):
+        if part in names:
+            return kind
+    return None
+
+
+def _read_office(data: bytes, name: str, kind: str) -> tuple[str, str]:
+    """(text, the frame's count attribute) of a Word, PowerPoint or Excel file."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            part = lambda path: _xml(z, path)   # noqa: E731
+            if kind == "docx":
+                return _docx(part("word/document.xml")), ""
+            if kind == "pptx":
+                slides = _targets(part, "ppt/presentation.xml", "ppt/_rels/presentation.xml.rels", "ppt/",
+                                  f"{_PR}Relationship", "sldIdLst")
+                body = "\n\n".join(f"[slide {k}]\n" + _paragraphs(part(path), f"{_A}p", f"{_A}t")
+                                    for k, (_, path) in enumerate(slides, 1))
+                return body, f'slides="{len(slides)}"'
+            sheets = _targets(part, "xl/workbook.xml", "xl/_rels/workbook.xml.rels", "xl/", f"{_PR}Relationship",
+                              "sheets")
+            shared = [_text_of_node(si, f"{_S}t") for si in part("xl/sharedStrings.xml").iter(f"{_S}si")] \
+                if "xl/sharedStrings.xml" in z.namelist() else []
+            body = "\n\n".join(f"[sheet {title}]\n" + _sheet(part(path), shared) for title, path in sheets)
+            return body, f'sheets="{len(sheets)}"'
+    except ValueError:
+        raise
+    except Exception as e:  # noqa: BLE001  a damaged archive or XML part
+        raise ValueError(f"document {name!r} could not be read as a {kind} file: {e}") from None
+
+
+def _xml(z: zipfile.ZipFile, path: str):
+    info = z.getinfo(path)
+    if info.file_size > MAX_PART_BYTES:
+        raise ValueError(f"an Office part is larger than {MAX_PART_BYTES >> 20} MiB unpacked")
+    with z.open(info) as f:
+        raw = f.read(MAX_PART_BYTES + 1)
+    if len(raw) > MAX_PART_BYTES:
+        raise ValueError(f"an Office part is larger than {MAX_PART_BYTES >> 20} MiB unpacked")
+    return ElementTree.fromstring(raw)
+
+
+def _targets(part, main: str, rels: str, base: str, rel_tag: str, list_tag: str) -> list[tuple[str, str]]:
+    """(name, part path) of the slides or sheets `main` lists, in its order, through its relationships."""
+    links = {r.get("Id"): r.get("Target", "") for r in part(rels).iter(rel_tag)}
+    out = []
+    for node in next((n for n in part(main).iter() if n.tag.endswith("}" + list_tag)), ElementTree.Element("x")):
+        target = links.get(node.get(f"{_R}id"), "")
+        if target:
+            out.append((node.get("name") or "", target.lstrip("/") if target.startswith("/") else base + target))
+    return out
+
+
+def _text_of_node(node, tag: str) -> str:
+    return "".join(t.text or "" for t in node.iter(tag))
+
+
+def _paragraphs(root, p_tag: str, t_tag: str) -> str:
+    return "\n".join(line for line in (_text_of_node(p, t_tag) for p in root.iter(p_tag)) if line.strip())
+
+
+def _docx(root) -> str:
+    def para(p) -> str:
+        out = []
+        for node in p.iter():
+            if node.tag == f"{_W}t":
+                out.append(node.text or "")
+            elif node.tag == f"{_W}tab":
+                out.append("\t")
+            elif node.tag in (f"{_W}br", f"{_W}cr"):
+                out.append("\n")
+        return "".join(out)
+
+    body = root.find(f"{_W}body")
+    lines = []
+    for block in (body if body is not None else []):
+        if block.tag == f"{_W}p":
+            lines.append(para(block))
+        elif block.tag == f"{_W}tbl":
+            for row in block.iter(f"{_W}tr"):
+                lines.append(" | ".join(" ".join(para(p) for p in cell.iter(f"{_W}p")).strip()
+                                        for cell in row.iter(f"{_W}tc")))
+    return _clean("\n".join(lines))
+
+
+def _sheet(root, shared: list[str]) -> str:
+    rows = []
+    for row in root.iter(f"{_S}row"):
+        cells = []
+        for c in row.iter(f"{_S}c"):
+            kind, v = c.get("t"), c.find(f"{_S}v")
+            if kind == "s" and v is not None and (v.text or "").isdigit() and int(v.text) < len(shared):
+                cells.append(shared[int(v.text)])
+            elif kind == "inlineStr":
+                cells.append(_text_of_node(c, f"{_S}t"))
+            elif kind == "b" and v is not None:
+                cells.append("TRUE" if v.text == "1" else "FALSE")
+            else:
+                cells.append((v.text or "") if v is not None else "")
+        if any(cells):
+            rows.append(" | ".join(cells))
+    return "\n".join(rows)
+
+
 # ------------------------------------------------------------------------------------------------ text
 def _clean(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\0", "")
@@ -343,8 +476,11 @@ def _header(name: str, pages: int | None, context: str | None, read: str | None 
     return head + (f"<context>{context}</context>\n" if context else "")
 
 
-def _wrap(name: str, pages: int | None, context: str | None, body: str) -> str:
-    return f"{_header(name, pages, context)}{body}\n</document>"
+def _wrap(name: str, pages: int | None, context: str | None, body: str, count: str = "") -> str:
+    head = _header(name, pages, context)
+    if count:
+        head = head.replace(">\n", f" {count}>\n", 1)
+    return f"{head}{body}\n</document>"
 
 
 def _framed(name: str, pages: int, read: str | None, context: str | None, items: tuple) -> tuple:
