@@ -153,6 +153,9 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
     for (int64_t q = a0; q < b0;) {
         const int64_t r = std::min(b0, q + (runtime_.batch_on() ? std::min(C, live_chunk) : C));
         const auto tq = Clock::now();
+        // each chunk runs as a prefill of its own here, so the next chunk's n-gram rows would wait for it: once
+        // this chunk has its rows, the rows that follow it are read into the row cache beside it
+        runtime_.sp.set_ple_warm(ids.data(), q, r, n - 1);
         if (!runtime_.sp.run(ids.data() + q, r - q, q, e)) return false;
         q = r;
         if (q >= b0) continue;
