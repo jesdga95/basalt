@@ -1,14 +1,17 @@
 // src/models/qwen4exp/serve/vision.cpp - vision operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
+#include "basalt/vision/video.hpp"
 
 namespace basalt::models::qwen4exp::serve {
 
-// ---- ENC <image> <out> [<image> <out> ...] (--vision), between requests and between batch windows.  The
-// images are decoded on the host first; then the encoder borrows the last expert-cache slots (the prompt path's
-// way: their rows are marked missing for the time), uploads its weights from the pinned copy, encodes each
-// image on its own stream, and the slots get their experts back from RAM before anything else reads the cache.
-// One reply line per image: `ENC OK <n> <nx> <ny> <ms>`, or a single `ENC ERR <message>`.
+// ---- ENC <image> <out> [<image> <out> ...] and ENCV <video> <out> [k=v ...] (--vision), between requests and
+// between batch windows.  The images (or the video's sampled frames) are decoded on the host first; then the
+// encoder borrows the last expert-cache slots (the prompt path's way: their rows are marked missing for the time),
+// uploads its weights from the pinned copy, encodes each picture (or each two-frame group) on its own stream, and
+// the slots get their experts back from RAM before anything else reads the cache.  One reply line per image,
+// `ENC OK <n> <nx> <ny> <ms>`; for a video one line, `ENC OK <groups> <nx> <ny> <ms> <time,time,...>`, and its file
+// holds one record per group; or a single `ENC ERR <message>`.
 void QfnRuntime::enc_command(const std::string& cmd) {
     auto reply_err = [&](const std::string& m, bool logged = false) {
         if (!logged) basalt::log::warn("basalt serve", "image encoder: refused: %s", m.c_str());
@@ -16,12 +19,13 @@ void QfnRuntime::enc_command(const std::string& cmd) {
         std::fflush(stdout);
     };
     if (!o.vision_in_engine) { reply_err("this engine was started without --vision"); return; }
+    const bool video = cmd.rfind("ENCV ", 0) == 0;
     if (pf_parts.size() != 1 || pf_parts[0].first < 0 || !stages.empty()) {
         reply_err("the in-engine image encoder needs one GPU's expert cache with a prompt lend region");
         return;
     }
     std::vector<std::string> words;
-    {
+    if (!video) {
         size_t pos = 3;
         for (;;) {
             pos = cmd.find_first_not_of(' ', pos);
@@ -32,12 +36,31 @@ void QfnRuntime::enc_command(const std::string& cmd) {
             pos = end;
         }
     }
-    if (words.empty() || words.size() % 2 != 0) { reply_err("expected: ENC <image> <output> [<image> <output> ...]"); return; }
+    if (!video && (words.empty() || words.size() % 2 != 0)) { reply_err("expected: ENC <image> <output> [<image> <output> ...]"); return; }
     const auto t0 = Clock::now();
-    struct Job { std::string out; basalt::vision::Size sz; std::vector<float> patches; };
+    // a picture is one group of 768-wide rows; a video is `groups` groups of 1536-wide rows, `times` their times
+    struct Job { std::string out; basalt::vision::Size sz; std::vector<float> patches; int groups = 1; std::string times; };
     std::vector<Job> jobs;
     const basalt::vision::Geometry geo;
     int max_patches = 0;
+    if (video) {
+        std::string vpath, opath, verr;
+        basalt::vision::VideoOptions vo;
+        vo.group_tokens = geo.max_tokens;
+        basalt::vision::Video v;
+        if (!basalt::vision::parse_encv(cmd, vpath, opath, vo, verr) || !basalt::vision::read_video(vpath, vo, v, verr)) {
+            reply_err(verr);
+            return;
+        }
+        Job j;
+        j.out = opath;
+        j.sz = v.canvas;
+        j.groups = v.groups();
+        j.times = basalt::vision::times_text(basalt::vision::group_times(v.indices, v.fps));
+        basalt::vision::patchify_video(v.frames, (int) v.indices.size(), v.canvas, geo, j.patches);
+        max_patches = j.sz.w / 16 * (j.sz.h / 16);
+        jobs.push_back(std::move(j));
+    }
     for (size_t i = 0; i < words.size(); i += 2) {
         std::ifstream f(words[i], std::ios::binary);
         const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -116,7 +139,8 @@ void QfnRuntime::enc_command(const std::string& cmd) {
         }
     res_upload();
     const auto t_lent = Clock::now();
-    std::vector<std::array<double, 4>> done;   // n, nx, ny, ms
+    std::vector<std::string> done;   // the reply lines
+    int groups = 0;
     std::string eerr;
     bool ok = vis_enc.attach(p.cache->device_slot(first), part_bytes(p, first), tokens, eerr);
     if (!ok && eerr.empty()) eerr = "the encoder could not be placed";
@@ -124,18 +148,26 @@ void QfnRuntime::enc_command(const std::string& cmd) {
     for (size_t i = 0; ok && i < jobs.size(); ++i) {
         const Job& j = jobs[i];
         const auto ti = Clock::now();
-        std::vector<float> out;
-        if (!vis_enc.encode(j.patches, j.sz, out)) { ok = false; eerr = "the vision encoder failed: " + vis_enc.last_error(); break; }
         const int nx = j.sz.w / 32, ny = j.sz.h / 32, n = nx * ny, n_embd = (int) g.n_embd;
         std::FILE* fo = std::fopen(j.out.c_str(), "wb");
         if (!fo) { ok = false; eerr = "cannot write " + j.out; break; }
-        const int32_t hdr[5] = {0x31455653, n, nx, ny, n_embd};
-        const bool wrote = (int) (out.size() / (size_t) n_embd) == n && std::fwrite(hdr, sizeof hdr, 1, fo) == 1 &&
-                           std::fwrite(out.data(), sizeof(float) * (size_t) n_embd, (size_t) n, fo) == (size_t) n;
+        const size_t per = j.patches.size() / (size_t) j.groups;
+        for (int gi = 0; ok && gi < j.groups; ++gi) {
+            std::vector<float> out, part;
+            if (j.groups > 1) part.assign(j.patches.begin() + (ptrdiff_t) (gi * per), j.patches.begin() + (ptrdiff_t) ((gi + 1) * per));
+            if (!vis_enc.encode(j.groups > 1 ? part : j.patches, j.sz, out)) { ok = false; eerr = "the vision encoder failed: " + vis_enc.last_error(); break; }
+            const int32_t hdr[5] = {0x31455653, n, nx, ny, n_embd};
+            const bool wrote = (int) (out.size() / (size_t) n_embd) == n && std::fwrite(hdr, sizeof hdr, 1, fo) == 1 &&
+                               std::fwrite(out.data(), sizeof(float) * (size_t) n_embd, (size_t) n, fo) == (size_t) n;
+            if (!wrote) { ok = false; eerr = "short write to " + j.out; }
+        }
         std::fclose(fo);
-        if (!wrote) { ok = false; eerr = "short write to " + j.out; break; }
-        done.push_back({(double) n, (double) nx, (double) ny,
-                        std::chrono::duration<double, std::milli>(Clock::now() - ti).count()});
+        if (!ok) break;
+        groups += j.groups;
+        char line[96];
+        std::snprintf(line, sizeof line, "ENC OK %d %d %d %.0f", video ? j.groups : n, nx, ny,
+                      std::chrono::duration<double, std::milli>(Clock::now() - ti).count());
+        done.push_back(std::string(line) + (video ? " " + j.times : ""));
     }
     vis_enc.detach();
     const auto t_enc = Clock::now();
@@ -161,12 +193,18 @@ void QfnRuntime::enc_command(const std::string& cmd) {
     p.first_now = -1;   // the prompt path lays its buffers out again at its next loan
     res_upload();
     const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    basalt::log::info("basalt serve", "image encoder: %zu image(s) up to %d tokens in %lld cache slots (%.2f GiB), "
-                         "%lld expert rows lent; decode %.0f ms, lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms",
-                 jobs.size(), tokens, (long long) k, (double) vis_enc.arena_bytes(tokens) / 1073741824.0, (long long) n_lent,
-                 ms(t0, t_dec), ms(t_dec, t_lent), ms(t_lent, t_up), ms(t_up, t_enc), ms(t_enc, Clock::now()));
+    if (video)
+        basalt::log::info("basalt serve", "video encoder: %d groups of %d tokens in %lld cache slots (%.2f GiB), "
+                             "%lld expert rows lent; decode %.0f ms, lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms",
+                     groups, tokens, (long long) k, (double) vis_enc.arena_bytes(tokens) / 1073741824.0, (long long) n_lent,
+                     ms(t0, t_dec), ms(t_dec, t_lent), ms(t_lent, t_up), ms(t_up, t_enc), ms(t_enc, Clock::now()));
+    else
+        basalt::log::info("basalt serve", "image encoder: %zu image(s) up to %d tokens in %lld cache slots (%.2f GiB), "
+                             "%lld expert rows lent; decode %.0f ms, lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms",
+                     jobs.size(), tokens, (long long) k, (double) vis_enc.arena_bytes(tokens) / 1073741824.0, (long long) n_lent,
+                     ms(t0, t_dec), ms(t_dec, t_lent), ms(t_lent, t_up), ms(t_up, t_enc), ms(t_enc, Clock::now()));
     if (!ok) { reply_err(eerr); return; }
-    for (const auto& d : done) std::printf("ENC OK %d %d %d %.0f\n", (int) d[0], (int) d[1], (int) d[2], d[3]);
+    for (const std::string& d : done) std::printf("%s\n", d.c_str());
     std::fflush(stdout);
 }
 
