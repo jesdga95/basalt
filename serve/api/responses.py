@@ -20,6 +20,7 @@ import json
 import time
 import uuid
 
+from serve.api.logprobs import MAX_TOP as MAX_TOP_LOGPROBS
 from serve.frontend import IMAGE_PARTS, Event, _late_system_to_user, _parts_of, effort_kwargs, stable_tool_order
 
 ENCRYPTED_PREFIX = "basalt.r1:"                   # our own reasoning replay strings; others' are ignored
@@ -320,6 +321,16 @@ def check_request(req: dict) -> None:
         raise ResponsesError("reasoning must be an object", "reasoning")
 
 
+def requested_logprobs(req: dict) -> int | None:
+    """The alternatives a response's output text carries (`top_logprobs`, 0..20) when `include` names
+    message.output_text.logprobs, else None; a bad top_logprobs is refused."""
+    top = req.get("top_logprobs")
+    if top is not None and (isinstance(top, bool) or not isinstance(top, int) or not 0 <= top <= MAX_TOP_LOGPROBS):
+        raise ResponsesError(f"top_logprobs must be a whole number from 0 to {MAX_TOP_LOGPROBS}", "top_logprobs")
+    include = req.get("include") if isinstance(req.get("include"), list) else []
+    return (top or 0) if "message.output_text.logprobs" in include else None
+
+
 def template_kwargs(req: dict) -> dict:
     effort = (req.get("reasoning") or {}).get("effort")
     try:
@@ -337,6 +348,7 @@ class Assembler:
         self.prompt_tokens = prompt_tokens
         self.seq = 0
         self.item = None                             # the open output item
+        self.lps: list[dict] = []                    # the answer tokens' logprobs not yet in a delta
         reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
         self.response = {
             "id": rid or new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
@@ -348,7 +360,7 @@ class Assembler:
             "store": False, "temperature": req.get("temperature"),
             "text": req.get("text") if isinstance(req.get("text"), dict) else {"format": {"type": "text"}},
             "tool_choice": req.get("tool_choice", "auto"), "tools": req.get("tools") or [],
-            "top_p": req.get("top_p"), "truncation": "disabled", "usage": None, "user": None,
+            "top_p": req.get("top_p"), "top_logprobs": req.get("top_logprobs"), "truncation": "disabled", "usage": None, "user": None,
             "metadata": req.get("metadata") or {}}
 
     # --- events
@@ -392,7 +404,7 @@ class Assembler:
         if item["type"] == "message":
             part = item["content"][0]
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,
-                               text=part["text"], logprobs=[]),
+                               text=part["text"], logprobs=copy.deepcopy(part["logprobs"])),
                     self.event("response.content_part.done", item_id=item["id"], output_index=at, content_index=0,
                                part=copy.deepcopy(part))]
         elif item["type"] == "reasoning":
@@ -410,6 +422,11 @@ class Assembler:
                                   input=item["input"]))
         out.append(self.event("response.output_item.done", output_index=at, item=copy.deepcopy(item)))
         return out
+
+    def logprob(self, channel: str, entry: dict) -> None:
+        """A generated token's logprobs (Service.run's "logprobs" event): the answer's ride its next text delta."""
+        if channel == "content":
+            self.lps.append(entry)
 
     def feed(self, ev: Event) -> list[dict]:
         out = []
@@ -432,8 +449,10 @@ class Assembler:
                 out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress",
                                    "role": "assistant", "content": []})
             self.item["content"][0]["text"] += ev.text
+            self.item["content"][0]["logprobs"] += self.lps
             out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
-                                  content_index=0, delta=ev.text, logprobs=[]))
+                                  content_index=0, delta=ev.text, logprobs=self.lps))
+            self.lps = []
         elif kind == "tool_start":
             out += self.close()
             out += self._open(self._call_item(ev))

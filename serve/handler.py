@@ -20,6 +20,7 @@ from serve.api.anthropic import anthropic_collect, anthropic_events
 from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
+from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, checked as checked_logprobs
 from serve.config import checked_sampling
 from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect
@@ -655,6 +656,7 @@ def make_handler(target: Service | Router):
             self.svc.require_grammar(req.get("response_format"))
             checked_sampling(req)                             # a sampling value out of range is a 400 likewise
             self._open_live("chatcmpl-" + uuid.uuid4().hex[:24], req)
+            req[LOGPROBS_KEY] = checked_logprobs(req)         # and a bad logprobs / top_logprobs
             self._take_turn(bool(req.get("stream")))
             self.svc.load()
             req[BIAS_KEY] = checked_bias(req, self.svc.engine)     # a bad logit_bias is a 400 before streaming
@@ -711,6 +713,8 @@ def make_handler(target: Service | Router):
                         yield None
                     elif kind == "event":
                         yield from asm.feed(x)
+                    elif kind == "logprobs":
+                        asm.logprob(*x)
                     elif kind == "done":
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
@@ -801,6 +805,7 @@ def make_handler(target: Service | Router):
                 checked_sampling(req)
             except ValueError as e:
                 raise ResponsesError(str(e), str(e).split(":")[0]) from None
+            req[LOGPROBS_KEY] = responses_api.requested_logprobs(req)
             try:
                 stop_strings(req)
             except ValueError as e:
