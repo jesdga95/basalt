@@ -558,7 +558,8 @@ def make_handler(target: Service | Router):
             params["n_predict"] = -1
             props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
                      "total_slots": svc.slot_stats()["total"], "model_alias": svc.model, "chat_template": svc.template.source,
-                     "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
+                     "modalities": {"vision": svc.vision is not None, "video": svc.video_on()},
+                     "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded(), "chat_template_caps": dict(svc.dialect.caps)}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path

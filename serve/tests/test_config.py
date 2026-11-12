@@ -35,6 +35,7 @@ from serve.config import (  # noqa: E402
     server_options,
     split_engine_extras,
     vision_setting,
+    video_tokens,
 )
 from serve.engine.flags import flag_value  # noqa: E402
 from serve.security import exposed_without_key  # noqa: E402
@@ -500,6 +501,8 @@ class EveryOption(unittest.TestCase):
             return 7
         if act.type is vision_setting:                      # --vision: a GPU number is a valid sample
             return "1"
+        if act.type is video_tokens:
+            return 1024
         if act.type is float:
             return 0.25
         if act.dest in SAMPLING_KEYS:                      # the model file's checks apply

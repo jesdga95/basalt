@@ -13,6 +13,8 @@ class Dialect:
     nothink_lead = ""                       # text between a no-thinking prompt and a forced call's opening
     image_pad = "<|image_pad|>"             # the prompt token that stands for one row of an image's embeddings
     image_start = "<|vision_start|>"        # the token an image's pad run follows ("" : every pad is an image row)
+    video_pad = ""                          # the prompt token for one row of a video group ("": the model reads no video)
+    video_marker = ""                       # what the template writes for a video, replaced by video_text
     in_engine_vision = False                # the image encoder always lives in the engine (only --vision dynamic)
     effort_turn = ""                        # a trailing turn that states the reasoning effort ("{}" for its text)
     # what the model's template does with a conversation, as llama.cpp's /props `chat_template_caps` names it
@@ -47,6 +49,11 @@ class Dialect:
     def literal_tags(self, controls) -> dict[str, str]:
         """Texts that stay plain text inside a message, with the private-use mark standing for each while the
         prompt is rendered."""
+        raise NotImplementedError
+
+    def video_text(self, times: list[float], rows: int) -> str:
+        """The prompt text for a video in place of video_marker: per two-frame group its time (seconds) and its run of
+        `rows` video pads."""
         raise NotImplementedError
 
     def forced_opening(self, name: str | None) -> str:
