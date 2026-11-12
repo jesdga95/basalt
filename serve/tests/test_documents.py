@@ -1,0 +1,267 @@
+"""Documents in message content: PDFs and text through Anthropic document blocks, Chat Completions file parts and
+Responses input_file parts, as their text and their scanned pages' images."""
+from __future__ import annotations
+
+import base64
+import http.client
+import io
+import json
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from serve.api import documents
+from serve.api.responses import input_messages
+from serve.engine.mock import MockEngine
+from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages
+from serve.handler import serve
+from serve.service import Service
+from serve.util.text import ByteTokenizer
+
+TEMPLATE = ChatTemplate.from_file(Path(__file__).resolve().parents[1] / "chat_template.jinja")
+
+
+def _escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def make_pdf(pages: list) -> bytes:
+    """A PDF with one page per item: a str is lines of Helvetica text, bytes is a JPEG drawn over the page."""
+    objects = {1: b"<< /Type /Catalog /Pages 2 0 R >>", 3: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"}
+    kids, n = [], 4
+    for page in pages:
+        page_id, content_id, image_id = n, n + 1, n + 2
+        n += 3
+        kids.append(page_id)
+        if isinstance(page, str):
+            ops = ["BT /F1 12 Tf 72 720 Td"]
+            for k, line in enumerate(page.split("\n")):
+                ops.append(("0 -14 Td " if k else "") + f"({_escape(line)}) Tj")
+            stream = (" ".join(ops) + " ET").encode("latin-1")
+            resources = b"<< /Font << /F1 3 0 R >> >>"
+            objects[image_id] = b"<< >>"
+        else:
+            from PIL import Image
+            w, h = Image.open(io.BytesIO(page)).size
+            stream = b"q 468 0 0 600 72 100 cm /Im1 Do Q"
+            resources = f"<< /XObject << /Im1 {image_id} 0 R >> >>".encode()
+            objects[image_id] = (f"<< /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceRGB "
+                                 f"/BitsPerComponent 8 /Filter /DCTDecode /Length {len(page)} >>\nstream\n").encode() \
+                + page + b"\nendstream"
+        objects[content_id] = f"<< /Length {len(stream)} >>\nstream\n".encode() + stream + b"\nendstream"
+        objects[page_id] = (f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {content_id} 0 R "
+                            "/Resources ").encode() + resources + b" >>"
+    objects[2] = f"<< /Type /Pages /Kids [{' '.join(f'{k} 0 R' for k in kids)}] /Count {len(kids)} >>".encode()
+    out, offsets = io.BytesIO(), {}
+    out.write(b"%PDF-1.4\n")
+    for k in sorted(objects):
+        offsets[k] = out.tell()
+        out.write(f"{k} 0 obj\n".encode() + objects[k] + b"\nendobj\n")
+    xref = out.tell()
+    out.write(f"xref\n0 {n}\n0000000000 65535 f \n".encode())
+    for k in range(1, n):
+        out.write(f"{offsets[k]:010d} 00000 n \n".encode())
+    out.write(f"trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return out.getvalue()
+
+
+def jpeg(w: int = 160, h: int = 120) -> bytes:
+    from PIL import Image
+    out = io.BytesIO()
+    Image.new("RGB", (w, h), (200, 30, 30)).save(out, format="JPEG")
+    return out.getvalue()
+
+
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
+
+PAPER = make_pdf(["Mixture of experts\nRouting picks 8 of 256 experts.", "Results\nDecode reached 120 tokens/s."])
+
+
+def anthropic_doc(data: bytes, title: str | None = "paper.pdf", media: str = "application/pdf") -> dict:
+    block = {"type": "document", "source": {"type": "base64", "media_type": media, "data": b64(data)}}
+    if title:
+        block["title"] = title
+    return block
+
+
+class PdfText(unittest.TestCase):
+    def setUp(self):
+        documents._cache.clear()
+
+    def test_pages_in_order_inside_one_frame(self):
+        messages, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [
+            anthropic_doc(PAPER), {"type": "text", "text": "What does page 2 say?"}]}]})
+        text = messages[0]["content"]
+        self.assertIsInstance(text, str)
+        self.assertTrue(text.startswith('<document name="paper.pdf" pages="2">\n[page 1]\nMixture of experts'), text)
+        self.assertIn("[page 2]\nResults\nDecode reached 120 tokens/s.\n</document>\n\nWhat does page 2 say?", text)
+        self.assertLess(text.index("Routing picks"), text.index("[page 2]"))
+
+    def test_claude_code_read_tool_result(self):
+        """Claude Code's Read of a .pdf: a caption line, then the PDF as a document block in the tool result."""
+        messages, _, _ = anthropic_to_messages({"messages": [
+            {"role": "user", "content": "Summarize paper.pdf"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read",
+                                               "input": {"file_path": "/w/paper.pdf"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "text", "text": "PDF file read: /w/paper.pdf (1.2KB)"},
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                                "data": b64(PAPER)}}]}]}]})
+        tool = [m for m in messages if m["role"] == "tool"][0]["content"]
+        self.assertTrue(tool.startswith("PDF file read: /w/paper.pdf (1.2KB)\n\n<document name=\"document\" "
+                                        "pages=\"2\">"), tool)
+        self.assertIn("Routing picks 8 of 256 experts.", tool)
+
+    def test_every_api_renders_the_same_prompt(self):
+        data_url = "data:application/pdf;base64," + b64(PAPER)
+        anthropic, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [anthropic_doc(PAPER)]}]})
+        chat, _, _ = openai_to_messages({"messages": [{"role": "user", "content": [
+            {"type": "file", "file": {"filename": "paper.pdf", "file_data": data_url}}]}]})
+        responses = input_messages({"input": [{"role": "user", "content": [
+            {"type": "input_file", "filename": "paper.pdf", "file_data": data_url}]}]})
+        self.assertEqual(anthropic[0]["content"], chat[0]["content"])
+        self.assertEqual(anthropic[0]["content"], responses[0]["content"])
+
+    def test_context_and_untitled(self):
+        messages, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [
+            {**anthropic_doc(PAPER, title=None), "context": "from the design review"}]}]})
+        self.assertTrue(messages[0]["content"].startswith(
+            '<document name="document" pages="2">\n<context>from the design review</context>\n[page 1]'))
+
+    def test_a_resent_document_is_parsed_once(self):
+        import pypdf
+        with mock.patch.object(pypdf, "PdfReader", wraps=pypdf.PdfReader) as reader:
+            first = documents.expand_documents([anthropic_doc(PAPER)])
+            again = documents.expand_documents([anthropic_doc(PAPER, title="other.pdf")])
+        self.assertEqual(reader.call_count, 1)
+        self.assertEqual(first[0]["text"].replace('"paper.pdf"', '"other.pdf"'), again[0]["text"])
+
+
+class Scans(unittest.TestCase):
+    def setUp(self):
+        documents._cache.clear()
+
+    def test_a_scanned_page_is_its_own_image(self):
+        scan = jpeg()
+        pdf = make_pdf(["Cover text", scan, "Last page"])
+        messages, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [
+            anthropic_doc(pdf, "scan.pdf"), {"type": "text", "text": "Read it."}]}]})
+        items = messages[0]["content"]
+        self.assertEqual([i["type"] for i in items], ["text", "image", "text", "text"])
+        self.assertTrue(items[0]["text"].endswith("[page 2: scanned, as an image]\n"), items[0]["text"])
+        self.assertEqual(items[1]["source"], "data:image/jpeg;base64," + b64(scan))   # the scan's own bytes
+        self.assertEqual(items[2]["text"], "[page 3]\nLast page\n</document>\n\n")
+        self.assertEqual(items[3]["text"], "Read it.")
+
+    def test_a_tiny_image_is_not_a_scan(self):
+        messages, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [
+            anthropic_doc(make_pdf([jpeg(16, 16)]))]}]})
+        self.assertEqual(messages[0]["content"], '<document name="paper.pdf" pages="1">\n[page 1: no text]\n</document>')
+
+
+class TextDocuments(unittest.TestCase):
+    def test_text_source_and_base64_text(self):
+        plain, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [
+            {"type": "document", "title": "notes.md", "source": {"type": "text", "media_type": "text/plain",
+                                                                "data": "line one\r\nline two\n\n\n\nend"}}]}]})
+        self.assertEqual(plain[0]["content"], '<document name="notes.md">\nline one\nline two\n\nend\n</document>')
+        coded, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [
+            anthropic_doc(b"line one\r\nline two\n\n\n\nend", "notes.md", "text/plain")]}]})
+        self.assertEqual(coded, plain)
+
+    def test_content_source_keeps_its_blocks(self):
+        messages, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [
+            {"type": "document", "title": "deck", "source": {"type": "content", "content": [
+                {"type": "text", "text": "slide one"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}]}}]}]})
+        self.assertEqual(messages[0]["content"], [
+            {"type": "text", "text": '<document name="deck">\n'},
+            {"type": "text", "text": "slide one"},
+            {"type": "image", "source": "data:image/png;base64,AA=="},
+            {"type": "text", "text": "\n</document>"}])
+
+
+class Refusals(unittest.TestCase):
+    def refused(self, block: dict, words: str):
+        with self.assertRaises(ValueError) as e:
+            anthropic_to_messages({"messages": [{"role": "user", "content": [block]}]})
+        self.assertIn(words, str(e.exception))
+
+    def test_password_protected(self):
+        from pypdf import PdfReader, PdfWriter
+        writer = PdfWriter(clone_from=PdfReader(io.BytesIO(PAPER)))
+        writer.encrypt(user_password="secret", owner_password="owner", algorithm="RC4-128")
+        out = io.BytesIO()
+        writer.write(out)
+        self.refused(anthropic_doc(out.getvalue()), "password-protected")
+
+    def test_owner_only_encryption_is_read(self):
+        from pypdf import PdfReader, PdfWriter
+        writer = PdfWriter(clone_from=PdfReader(io.BytesIO(PAPER)))
+        writer.encrypt(user_password="", owner_password="owner", algorithm="RC4-128")
+        out = io.BytesIO()
+        writer.write(out)
+        documents._cache.clear()
+        messages, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [
+            anthropic_doc(out.getvalue())]}]})
+        self.assertIn("Routing picks 8 of 256 experts.", messages[0]["content"])
+
+    def test_damaged_and_mislabelled(self):
+        self.refused(anthropic_doc(b"%PDF-1.4\n garbage"), "could not be read as a PDF")
+        self.refused(anthropic_doc(b"plain words"), "is not a PDF")
+        self.refused(anthropic_doc(b"\x89PNG....", media="image/png"), "media type 'image/png' is not read")
+        self.refused({"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                                     "data": "@@@"}}, "not valid base64")
+
+    def test_files_and_urls_are_named(self):
+        self.refused({"type": "document", "source": {"type": "file", "file_id": "file_1"}}, "keeps no files")
+        self.refused({"type": "document", "source": {"type": "url", "url": "https://x/a.pdf"}}, "not fetched")
+        with self.assertRaises(ValueError) as e:
+            openai_to_messages({"messages": [{"role": "user", "content": [
+                {"type": "file", "file": {"file_id": "file-1"}}]}]})
+        self.assertIn("keeps no files", str(e.exception))
+
+    def test_too_many_pages(self):
+        with mock.patch.object(documents, "MAX_PAGES", 1):
+            documents._cache.clear()
+            self.refused(anthropic_doc(PAPER), "has 2 pages; at most 1")
+
+
+class OverHttp(unittest.TestCase):
+    def post(self, path: str, body: dict):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "ok", max_context=16384)
+        service = Service(engine, tok, TEMPLATE)
+        httpd = serve(service, port=0)
+        connection = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=10)
+        try:
+            connection.request("POST", path, json.dumps({"model": service.model, **body}),
+                               {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read()), tok.decode(engine.last_prompt)
+        finally:
+            connection.close()
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_messages_and_count_tokens(self):
+        body = {"max_tokens": 16, "thinking": {"type": "disabled"}, "messages": [{"role": "user", "content": [
+            anthropic_doc(PAPER), {"type": "text", "text": "Summarize."}]}]}
+        status, reply, prompt = self.post("/v1/messages", body)
+        self.assertEqual(status, 200, reply)
+        self.assertIn("Decode reached 120 tokens/s.", prompt)
+        status, counted, _ = self.post("/v1/messages/count_tokens", body)
+        self.assertEqual(status, 200, counted)
+        self.assertGreater(counted["input_tokens"], len("Decode reached 120 tokens/s."))
+
+    def test_a_bad_document_is_a_400(self):
+        status, reply, _ = self.post("/v1/chat/completions", {"max_tokens": 16, "messages": [{"role": "user", "content": [
+            {"type": "file", "file": {"filename": "x.pdf", "file_data": "data:application/pdf;base64," + b64(b"%PDF-1.4 x")}}]}]})
+        self.assertEqual(status, 400, reply)
+        self.assertIn("could not be read as a PDF", reply["error"]["message"])
+
+
+if __name__ == "__main__":
+    unittest.main()
