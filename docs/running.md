@@ -132,7 +132,14 @@ tokens), and each pair of frames is read as one picture with its time in the pro
 phone's portrait clip arrives sideways.
 
 Decoding uses FFmpeg 6, 7 or 8 from the machine ([platforms](platforms.md#ffmpeg-for-video)). At start the server prints
-`video  on, FFmpeg 8 (...)`, or `video  off` with the reason, and then a video is refused with that reason.
+`video  on, FFmpeg 8 (...)`, or `video  off` with the reason, and then a video is refused with that reason. A video may be 1 GiB.
 
-A 30 s 1280x720 clip (60 frames, 30 groups of 264 tokens, 8,202 prompt tokens), NVFP4 pack, `dynamic`, 400 W + 180 W, cold: 3.2 s to
-the end of a 67-token answer. Decode 0.49 s, encode 0.29 s, prompt read 1.9 s.
+Frames decode on the encoder's GPU with NVDEC (H.264, HEVC, AV1, VP9 and the older codecs FFmpeg's NVDEC takes); a stream NVDEC
+refuses decodes on the CPU, with the same pixels. With `dynamic` the expert cache lends NVDEC the memory for the decode when no
+reply is running (tens of ms to lend and refill); beside a running reply the video decodes on the CPU, and the reply keeps going
+until the frames are encoded. Another question about the same video, in the same chat or a new one, starts from the video
+already read.
+
+NVFP4 pack, `dynamic`, 400 W + 180 W, cold, time to the first token: a 30 s 1280x720 clip (8,202 prompt tokens) 2.7 s; a minute of
+3840x2160 HEVC 5.2 s (decode 2.6 s, encode 0.3 s, prompt read 1.9 s); of 1920x1080 H.264 4.3 s. A new question on the same 30 s
+clip: 0.4 s.
