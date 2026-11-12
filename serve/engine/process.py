@@ -3,7 +3,8 @@
 Protocol (one line each):
   * start: stdout `INFO k=v ...` lines, then `READY <ctx> [stop]` (stop: STOP is honoured mid-request).
   * solo: `GEN <max_new> [k=v ...] <ids>` (GENI with embeddings) -> `T <id>`, `PP <read> <total> ...`,
-    `RESUME <n>`, then `DONE ...`; `STOP` ends it early. `ERR ...` is a failure; a prompt that does not fit the
+    `RESUME <n>`, then `DONE ...`; `STOP` ends it early. With `logprobs=K` each `T` line follows its
+    `P <id> <lp> [<id>:<lp> ...]` line (the pick's log probability and the K likeliest tokens). `ERR ...` is a failure; a prompt that does not fit the
     context is `ERR <context_overflow|context_no_room> prompt=N [max_new=N] context=N [slot=N]: <message>`.
   * any time after READY: `CONV parked=N bytes=N evictions=N [restored=N restored_ms=X]`, the conversation cache's
     figures after a park or a restore (never a reply line, like INFO).
@@ -11,7 +12,8 @@ Protocol (one line each):
     raw UTF-8: the engine tokenizes (control literals on; `plain` byte spans are text) and answers like a GEN, with
     `PT <n> <max_new>` before the first PP line. `clip=1` cuts max_new to the room the context leaves after the prompt.
     The slot and batch forms are SGENT and BGENT; the server uses only GENT.
-  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> ...`;
+  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> ...`; with
+    `logprobs=K`, one `BP <slot> <id> <lp> [...]` line per kept pick ahead of its `BT` line;
     `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`).
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
     that slot's own state, answered like a GEN.
@@ -35,6 +37,8 @@ from pathlib import Path
 
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
+from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, engine_key as logprobs_key, parse_line as logprob_line, \
+    token as logprob_token
 from serve.engine import lifeline, suspend
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, split_err
@@ -107,8 +111,8 @@ def relay_auto_flags(line: str) -> bool:
 
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
-PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR", "BADM ",
-                  "BT ", "BDONE ", "YIELDED ", "VRAM ", "ENC ")
+PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
+                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ")
 
 
 def log_unparsed(line: str, log) -> None:
@@ -411,7 +415,7 @@ class ProcessEngine:
                 except OSError:
                     pass
                 break                                   # publish EOF, never the trailing DONE
-            if line.startswith(("BT ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
+            if line.startswith(("BT ", "BP ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
                 try:
                     slot_q[int(line.split()[1])].put(line)
                     continue
@@ -698,7 +702,7 @@ class ProcessEngine:
         elif _number(rd):
             keys += f" relax={float(rd)!r}"
         return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
-            + grammar_key(sampling.get(GRAMMAR_KEY))
+            + grammar_key(sampling.get(GRAMMAR_KEY)) + logprobs_key(sampling.get(LOGPROBS_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -721,6 +725,7 @@ class ProcessEngine:
         beside the slots' windows sends no progress line."""
         stopped = False
         beat = time.monotonic()
+        lp = None                                        # the P line of the next T line (logprobs)
         while True:
             if not stopped and stop_soon is not None and stop_soon.is_set() and self._ctl_mode == "solo":
                 self._send("STOP")
@@ -741,8 +746,12 @@ class ProcessEngine:
             beat = time.monotonic()
             if line is None:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+            if line.startswith("P "):
+                lp = logprob_line(line.split()[1:])
+                continue
             if line.startswith("T "):
-                on_token(int(line[2:]))
+                on_token(logprob_token(int(line[2:]), lp))
+                lp = None
                 if not stopped and (cancel.is_set() or (stop_when is not None and stop_when())):
                     self._send("STOP")
                     stopped = True
@@ -1168,6 +1177,7 @@ class ProcessEngine:
                 notok = bool(self._ctl_result and len(self._ctl_result) > 2 and self._ctl_result[2])
                 gen0 = len(out) if notok else len(out) - 1  # the admission's token, if any; the slot feeds it first
                 going_solo = False
+                slot_lp: list = []                       # BP lines waiting for their BT line
                 while True:
                     if not stop_sent and not going_solo and stop_soon is not None and stop_soon.is_set():
                         self._send(f"BSTOP {slot}")             # the windows under way still come, then BDONE
@@ -1183,9 +1193,14 @@ class ProcessEngine:
                     if line is None:
                         phase = "none"
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                    if line.startswith("BP "):                  # a kept pick's logprobs, ahead of its BT line
+                        slot_lp.append(logprob_line(line.split()[2:]))
+                        continue
                     if line.startswith("BT "):
                         self._count_window(len(line.split()) - 2)
-                        for t in (int(x) for x in line.split()[2:]):    # a window's tokens for this slot, in order
+                        lps, slot_lp[:] = list(slot_lp), []
+                        for k, t in enumerate(int(x) for x in line.split()[2:]):   # a window's tokens for this slot, in order
+                            t = logprob_token(t, lps[k] if k < len(lps) else None)
                             out.append(t)
                             if cancel.is_set():
                                 if not stop_sent:
@@ -1355,6 +1370,7 @@ class ProcessEngine:
         heard, read_to = time.monotonic(), 0
         beat = heard
         soft_sent = False
+        lp = None                                         # the P line of the next T line (logprobs)
         try:
             while True:
                 if not soft_sent and stop_soon is not None and stop_soon.is_set():
@@ -1389,11 +1405,15 @@ class ProcessEngine:
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                 heard = time.monotonic()                  # any line counts as output
                 beat = heard
+                if line.startswith("P "):
+                    lp = logprob_line(line.split()[1:])
+                    continue
                 if line.startswith("T "):
                     allow = silence
                     if cancel.is_set():
                         return
-                    yield int(line[2:])
+                    yield logprob_token(int(line[2:]), lp)
+                    lp = None
                 elif line.startswith("PT ") and text is not None:   # the engine tokenized the text
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].lstrip("-").isdigit():

@@ -25,6 +25,23 @@ budget at the level it names (up to 2048 low, up to 8192 medium, else high; Deep
 `chat_template_kwargs.reasoning_effort`, then `reasoning_effort`, and last the level a `reasoning_budget` implies. For the token
 cap, `reasoning_budget_tokens` wins over `thinking_budget_tokens`, then `reasoning_budget`, then `thinking.budget_tokens`.
 
+## Logprobs
+
+A request can ask for each generated token's log probability and the likeliest tokens at its place. The engine computes them
+from the row's full head logits: the natural log of the token's probability under the model's own distribution, before
+temperature, penalties, `logit_bias`, top-k/top-p and any grammar mask. The reply's tokens are the same with or without them.
+
+- **Chat Completions:** `logprobs: true` and `top_logprobs` (0 to 20). `choices[0].logprobs.content` has one entry per answer
+  token, `{token, logprob, bytes, top_logprobs: [{token, logprob, bytes}]}`, likeliest first. Streaming: each chunk carries the
+  entries of its tokens.
+- **Thinking and tool calls:** Basalt adds `logprobs.reasoning_content` (the thinking's tokens) and `logprobs.tool_calls`
+  (`[{index, content}]`, each call's tokens as the model wrote them, markup included): the least likely token of a call is where
+  the model guessed.
+- **Responses:** `include: ["message.output_text.logprobs"]` with `top_logprobs` fills `output_text.logprobs` and each
+  `response.output_text.delta`.
+- Tokens the server writes itself (the close of a thinking budget) have none. Refused with parallel slots split over GPUs by
+  layer (pipelined batch groups). The Anthropic API has no logprobs field.
+
 ## Thinking
 
 - **Budget:** `answer-room` keeps output tokens for the close and the answer by limiting the thinking to the cap minus the reserve. A smaller

@@ -22,6 +22,7 @@ from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_str
 from serve.engine.image_source import USAGE as IMAGE_USAGE, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, Vision
 from serve.api.grammar import grammar_spec, unenforced
+from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, entry as logprob_entry
 from serve.config import GRAMMAR_DEFAULT
 
 
@@ -977,7 +978,9 @@ class Service:
             live=None) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare). `live` (serve.live.LiveRequest): the state
-        this updates, and the answer-now signal that closes the thinking at its next clean point."""
+        this updates, and the answer-now signal that closes the thinking at its next clean point. A request with
+        logprobs also gets ("logprobs", (channel, entry)) for each generated token ahead of its events: channel
+        "reasoning", "content" or "tool" (a tool call's tokens), entry in OpenAI's shape."""
         if live is not None:
             live.thinking = bool(thinking)
         budget = self.reasoning_budget(sampling) if thinking else None
@@ -988,6 +991,8 @@ class Service:
             sampling = {**self.sampling_defaults, **req_values}
         parser = self.dialect.parser(thinking, tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        want_lp = (sampling or {}).get(LOGPROBS_KEY) is not None
+        answered = False                               # answer text was written (logprobs: the blank after thinking)
         thinking_n = 0                                 # tokens written while thinking
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -1146,7 +1151,17 @@ class Service:
                                 thinking_n += parser.state == "reasoning"
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
+                                state0 = parser.state
                                 evs = cut(parser.feed(piece))
+                                if want_lp and getattr(t, "lp", None) is not None:
+                                    channel = "reasoning" if state0 == "reasoning" else \
+                                        "tool" if "call" in (state0, parser.state) or \
+                                        any(ev.kind.startswith("tool") for ev in evs) else "content"
+                                    shown = any(ev.kind == "content" and ev.text for ev in evs)
+                                    # the blank between the thinking and the answer is in neither text
+                                    if channel != "content" or answered or shown or not thinking or piece.strip():
+                                        yield "logprobs", (channel, logprob_entry(self.tok, t))
+                                    answered = answered or shown
                                 self._note(n, evs, st, rate)
                                 if st.get("reused") is None:    # the prefix reuse, once the engine reports it
                                     run_last = getattr(self.engine, "last", None)
