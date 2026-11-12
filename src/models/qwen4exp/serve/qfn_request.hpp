@@ -60,6 +60,9 @@ public:
         return cv->resample_row(row, pos, bias, tok, e);
     }
     bool copy_logits(int row, float* out) { return cv->copy_logits(row, out); }
+    bool row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) {
+        return cv->row_logprobs(row0, n, picks, top, out);
+    }
     bool after_accept(int T, int& a, int e0, bool from_sfx, bool held_run, bool paired, bool& hold);
     void note_draft_probs(bool from_sfx);
     void stamp_before_commit() { basalt::core::decode_events().stamp(9); }

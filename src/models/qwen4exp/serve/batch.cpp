@@ -281,15 +281,15 @@ bool QfnRuntime::batch_step() {
     for (int sg = 0; sg < S; ++sg) {
         const int top = bs[(size_t) rows[sg]].lp_top;
         if (top < 0) continue;
-        lh_buf.resize((size_t) n_vocab);
-        for (int e = 0; e < n_keep[sg]; ++e) {
-            if (!ver.copy_logits(r0s[sg] + e, lh_buf.data())) {
-                std::printf("ERR logprobs: the head logits copy failed\n");
-                return false;
-            }
-            lp_lines[sg] += "BP " + std::to_string(rows[sg]) +
-                            basalt::program::serve::logprob_fields(lh_buf.data(), (int) n_vocab, outb[r0s[sg] + e], top) + "\n";
+        constexpr int LS = basalt::kernels::kLogprobStride;
+        lh_buf.resize((size_t) n_keep[sg] * LS);
+        if (!ver.row_logprobs(r0s[sg], n_keep[sg], outb + r0s[sg], top, lh_buf.data())) {
+            std::printf("ERR logprobs: the head logits read failed\n");
+            return false;
         }
+        for (int e = 0; e < n_keep[sg]; ++e)
+            lp_lines[sg] += "BP " + std::to_string(rows[sg]) +
+                            basalt::program::serve::logprob_fields(lh_buf.data() + (size_t) e * LS, outb[r0s[sg] + e], top) + "\n";
     }
     if (logit_hash)
         for (int sg = 0; sg < S; ++sg)

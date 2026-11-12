@@ -28,8 +28,9 @@ cap, `reasoning_budget_tokens` wins over `thinking_budget_tokens`, then `reasoni
 ## Logprobs
 
 A request can ask for each generated token's log probability and the likeliest tokens at its place. The engine computes them
-from the row's full head logits: the natural log of the token's probability under the model's own distribution, before
-temperature, penalties, `logit_bias`, top-k/top-p and any grammar mask. The reply's tokens are the same with or without them.
+on the GPU from the row's full head logits: the natural log of the token's probability under the model's own distribution,
+before temperature, penalties, `logit_bias`, top-k/top-p and any grammar mask. The reply's tokens are the same with or without
+them, and decode speed stays within a few percent.
 
 - **Chat Completions:** `logprobs: true` and `top_logprobs` (0 to 20). `choices[0].logprobs.content` has one entry per answer
   token, `{token, logprob, bytes, top_logprobs: [{token, logprob, bytes}]}`, likeliest first. Streaming: each chunk carries the
