@@ -729,6 +729,11 @@ Flow SessionRequest::read_to(int64_t to) {
 
 // ENC <image> <out> [<image> <out> ...]: one `ENC OK <n> <nx> <ny> <ms>` per image, or one `ENC ERR <message>`.
 void SessionRuntime::enc_command(const std::string& cmd) {
+    if (cmd.rfind("ENCV ", 0) == 0) {
+        std::printf("ENC ERR this model reads no video\n");
+        std::fflush(stdout);
+        return;
+    }
     std::istringstream in(cmd);
     std::string word;
     in >> word;

@@ -61,4 +61,12 @@ bool read_video(const std::string& path, const VideoOptions& o, Video& out, std:
 /// decoded elsewhere.
 Image video_frame_to_canvas(const Image& frame, Size canvas);
 
+/// An encoder process's video request, `ENCV <video> <output> [fps=F] [max_frames=N] [max_tokens=N]` (paths without
+/// spaces): the paths, and the options over `o`'s. False with `err` for a malformed line or a value out of range.
+bool parse_encv(const std::string& line, std::string& video, std::string& output, VideoOptions& o, std::string& err);
+
+/// The groups' times for a reply line: each in 17 significant digits (it reads back as the same double), comma
+/// separated.
+std::string times_text(const std::vector<double>& times);
+
 }  // namespace basalt::vision

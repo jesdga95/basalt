@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -99,6 +101,42 @@ void patchify_video(const std::vector<uint8_t>& frames, int n, Size canvas, cons
 }
 
 Image video_frame_to_canvas(const Image& frame, Size canvas) { return resize_bicubic_to(frame, canvas.w, canvas.h); }
+
+bool parse_encv(const std::string& line, std::string& video, std::string& output, VideoOptions& o, std::string& err) {
+    std::vector<std::string> words;
+    size_t at = 0;
+    while ((at = line.find_first_not_of(' ', at)) != std::string::npos) {
+        const size_t end = std::min(line.find(' ', at), line.size());
+        words.push_back(line.substr(at, end - at));
+        at = end;
+    }
+    if (words.size() < 3 || words[0] != "ENCV") { err = "expected: ENCV <video> <output> [fps=F] [max_frames=N] [max_tokens=N]"; return false; }
+    video = words[1];
+    output = words[2];
+    for (size_t i = 3; i < words.size(); ++i) {
+        const size_t eq = words[i].find('=');
+        const std::string k = words[i].substr(0, eq), v = eq == std::string::npos ? "" : words[i].substr(eq + 1);
+        char* end = nullptr;
+        const double x = std::strtod(v.c_str(), &end);
+        if (v.empty() || end == nullptr || *end != 0 || !(x > 0)) { err = "ENCV: " + words[i] + " is not a positive number"; return false; }
+        if (k == "fps" && x <= 60) o.fps = x;
+        else if (k == "max_frames" && x == std::floor(x) && x >= o.min_frames && x <= 768) o.max_frames = (int) x;
+        else if (k == "max_tokens" && x == std::floor(x) && x >= 16 && x <= 1 << 20) o.max_tokens = (int) x;
+        else { err = "ENCV: " + words[i] + " is not a known option in range"; return false; }
+    }
+    return true;
+}
+
+std::string times_text(const std::vector<double>& times) {
+    std::string s;
+    char buf[32];
+    for (size_t i = 0; i < times.size(); ++i) {
+        // %.17g reads back as the same double, so the server formats exactly the reference's number
+        std::snprintf(buf, sizeof buf, "%.17g", times[i]);
+        s += (i ? "," : "") + std::string(buf);
+    }
+    return s;
+}
 
 namespace {
 
