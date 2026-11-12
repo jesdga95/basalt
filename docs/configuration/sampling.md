@@ -40,8 +40,11 @@ them, and decode speed stays within a few percent.
   the model guessed.
 - **Responses:** `include: ["message.output_text.logprobs"]` with `top_logprobs` fills `output_text.logprobs` and each
   `response.output_text.delta`.
+- **Anthropic Messages** (a Basalt extension; the API has no such field): the same `logprobs` and `top_logprobs`. Each
+  `content_block_delta` carries `logprobs`, the entries of its tokens; the message, or else `message_delta`, carries the
+  `logprobs` object above.
 - Tokens the server writes itself (the close of a thinking budget) have none. Refused with parallel slots split over GPUs by
-  layer (pipelined batch groups). The Anthropic API has no logprobs field.
+  layer (pipelined batch groups).
 
 ## Thinking
 

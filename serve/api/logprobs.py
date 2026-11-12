@@ -63,6 +63,16 @@ def entry(tok, t: Token) -> dict:
     return {**one(int(t), lp), "top_logprobs": [one(i, v) for i, v in alts]}
 
 
+def logprobs_part(content: list, reasoning: list, tools: dict) -> dict:
+    """The `logprobs` object: the answer's tokens (OpenAI's `content`), then the thinking's and each tool call's tokens when there are any."""
+    part = {"content": content[:]}
+    if reasoning:
+        part["reasoning_content"] = reasoning[:]
+    if tools:
+        part["tool_calls"] = [{"index": i, "content": tools[i][:]} for i in sorted(tools)]
+    return part
+
+
 class Channels:
     """Which text each generated token's entry belongs to: the thinking ("reasoning"), the answer ("content") or tool
     call i ("tool", i). A token the parser holds (part of a tag, a blank) waits for the next event that shows text; the
