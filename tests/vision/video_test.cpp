@@ -9,8 +9,10 @@
 #include "basalt/vision/ffmpeg_api.hpp"
 #include "basalt/vision/video.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
