@@ -32,6 +32,9 @@ The official Flash-Next packs are scored against the first base on their
 [Hugging Face card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt#quality). That gate is 100 chunks, T 3, int8 KV, resident
 experts and tiers pinned, on an RTX 5090 at 400 W with an RTX 5060 Ti at 180 W.
 
+Both bases are published as the [basalt-kld-bases](https://huggingface.co/datasets/jesdga/basalt-kld-bases) dataset on Hugging Face,
+with checksums: pass one to `basalt-bench --quality --kld-base FILE` to score a build or a self-converted pack.
+
 A quantized base is not a reference. llama.cpp's Q8_0 GGUF adds its own rounding, so every pack reads 0.003 to 0.010 KLD higher against a
 Q8_0 base than against BF16 (see [Flash-Next](qwen38-flash-next.md#summary)).
 
