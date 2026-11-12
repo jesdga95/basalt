@@ -17,6 +17,13 @@
 
 namespace basalt::vision {
 
+namespace {
+// What NVDEC takes for frames of `px` pixels: its surfaces (the reference frames and the output pool, about 40 frames
+// of 1.5 bytes a pixel, counted at 16 bits a sample, as a 10-bit stream's) and its own state.
+int64_t nvdec_need(int64_t px) { return px * 3 / 2 * 40 * 2 + (64ll << 20); }
+
+}  // namespace
+
 std::vector<int64_t> sample_indices(int64_t total, double src_fps, const VideoOptions& o) {
     if (total <= 0) return {};
     if (!(src_fps > 0)) src_fps = 24.0;
@@ -106,6 +113,27 @@ void patchify_video(const std::vector<uint8_t>& frames, int n, Size canvas, cons
 }
 
 Image video_frame_to_canvas(const Image& frame, Size canvas) { return resize_bicubic_to(frame, canvas.w, canvas.h); }
+
+int64_t video_nvdec_bytes(const std::string& path) {
+    std::string why;
+    const Ffmpeg* F = ffmpeg(why);
+    if (F == nullptr) return -1;
+    ff::AVFormatContext* fmt = nullptr;
+    if (F->avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return -1;
+    int64_t need = -1;
+    const ff::AVCodec* dec = nullptr;
+    if (F->avformat_find_stream_info(fmt, nullptr) >= 0) {
+        const int index = F->av_find_best_stream(fmt, ff::kMediaTypeVideo, -1, -1, &dec, 0);
+        ff::AVStream* const* streams = ff::field<ff::AVStream**>(fmt, ff::kFmtStreams);
+        if (index >= 0 && (unsigned) index < ff::field<unsigned>(fmt, ff::kFmtNbStreams) && streams != nullptr) {
+            const ff::AVCodecParameters* par = ff::field<ff::AVCodecParameters*>(streams[index], F->abi.st_codecpar);
+            const int64_t px = (int64_t) ff::field<int>(par, F->abi.par_width) * ff::field<int>(par, F->abi.par_height);
+            if (px > 0) need = nvdec_need(px);
+        }
+    }
+    F->avformat_close_input(&fmt);
+    return need;
+}
 
 bool parse_encv(const std::string& line, std::string& video, std::string& output, VideoOptions& o, std::string& err) {
     std::vector<std::string> words;
@@ -228,12 +256,10 @@ struct Reader {
         }
         // NVDEC where the GPU and FFmpeg's build allow: FFmpeg's default format choice takes the device's frames
         // when a device is set, and decodes in software itself when NVDEC refuses the stream
-        // what NVDEC takes: its surfaces (the reference frames and the output pool, about 40 frames of 1.5 bytes a
-        // pixel, counted at 16 bits a sample, as a 10-bit stream's) and its own state; a stream that does not fit in
-        // what the card can spare is decoded on the CPU rather than take memory the model needs
+        // a stream whose NVDEC surfaces do not fit in what the card can spare is decoded on the CPU rather than take
+        // memory the model needs
         const ff::AVCodecParameters* par = ff::field<ff::AVCodecParameters*>(st, F.abi.st_codecpar);
-        const int64_t px = (int64_t) ff::field<int>(par, F.abi.par_width) * ff::field<int>(par, F.abi.par_height);
-        const int64_t need = px * 3 / 2 * 40 * 2 + (64ll << 20);
+        const int64_t need = nvdec_need((int64_t) ff::field<int>(par, F.abi.par_width) * ff::field<int>(par, F.abi.par_height));
         if (gpu >= 0 && spare >= 0 && need > spare) {
             nvdec_why = "NVDEC needs about " + std::to_string((long long) (need >> 20)) + " MiB, GPU " + std::to_string(gpu) +
                         " can spare " + std::to_string((long long) (spare >> 20));
