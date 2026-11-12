@@ -254,6 +254,18 @@ class AnswerNowServer(unittest.TestCase):
         self.assertIn("thinking off", b["error"]["message"])
         th.join(30)
 
+    def test_capabilities_in_props(self):
+        """/props names Basalt and what it offers in one added key; llama.cpp's own fields stay as they were."""
+        code, _, props = self.request("/props")
+        self.assertEqual(code, 200)
+        self.assertEqual(props["basalt"], {"version": None, "capabilities": ["answer_now"]})
+        self.assertEqual(set(props), {"default_generation_settings", "total_slots", "model_alias", "chat_template",
+                                      "modalities", "models_autoload", "is_sleeping", "chat_template_caps", "basalt"})
+        self.engine.info = {"version": "0.4.0"}
+        _, _, props = self.request("/props")
+        self.assertEqual((props["build_info"], props["basalt"]["version"]), ("basalt 0.4.0", "0.4.0"))
+
+
 class AnswerNowBatchSlots(AnswerNowServer):
     """The same over concurrent slots: one reply closes its thinking, the other runs on untouched."""
     batch = 2

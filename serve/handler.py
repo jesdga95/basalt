@@ -34,6 +34,8 @@ from serve.util.text import stop_strings
 
 
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
+# What this server offers beyond the OpenAI, Anthropic and llama.cpp APIs, listed under /props "basalt"
+CAPABILITIES = ["answer_now"]
 TURN_POLL_S = 0.5                           # how soon a request waiting for its turn notices its client left
 
 
@@ -560,6 +562,7 @@ def make_handler(target: Service | Router):
             version = getattr(svc.engine, "info", {}).get("version")
             if version:
                 props["build_info"] = "basalt " + str(version)
+            props["basalt"] = {"version": str(version) if version else None, "capabilities": list(CAPABILITIES)}
             self._json(200, props)
 
         def _control_body(self) -> bool:
