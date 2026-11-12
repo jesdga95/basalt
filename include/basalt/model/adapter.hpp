@@ -146,8 +146,8 @@ public:
     virtual Result draft_begin(int32_t anchor, int64_t pos, int n) { (void) anchor; (void) pos; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
     /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`.
     virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n) { (void) ids; (void) conf; (void) max_n; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
-    /// The last decoded row's logits (n_vocab floats).
-    virtual Result copy_logits(float* out) { (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
+    /// The logits of row `row` of the last decoded window (n_vocab floats).
+    virtual Result copy_logits(int row, float* out) { (void) row; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
     /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now.
     virtual Result set_low_memory(bool low, int64_t& expert_slots) { (void) low; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
     /// What the session leaves free on the main card from now on (`mib` < 0: the start's reserve), through prompts and

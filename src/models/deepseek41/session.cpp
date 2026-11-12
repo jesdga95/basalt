@@ -423,9 +423,9 @@ public:
         return {};
     }
 
-    model::Result copy_logits(float* out) override {
+    model::Result copy_logits(int row, float* out) override {
         cudaStreamSynchronize(stream_);
-        if (cudaMemcpy(out, logits_, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        if (cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
             return {model::Status::Error, "the head logits copy failed"};
         return {};
     }

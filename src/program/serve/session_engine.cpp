@@ -403,7 +403,7 @@ public:
         if (!r.ok()) e = r.message;
         return r.ok();
     }
-    bool copy_logits(int, float* out) { return rt_.session().copy_logits(out).ok(); }
+    bool copy_logits(int row, float* out) { return rt_.session().copy_logits(row, out).ok(); }
     bool after_accept(int, int&, int, bool, bool, bool, bool& hold) {
         hold = false;
         return true;
@@ -535,6 +535,7 @@ private:
 bool SessionRuntime::next_batch_window() {
     std::vector<int32_t> history;
     std::vector<float> grammar_bias;
+    std::vector<float> lp_row;   // a logprobs slot's row of logits
     const auto failed = [&](const std::string& m) {
         std::printf("ERR %s\n", m.c_str());
         set_active(0);
@@ -588,6 +589,12 @@ bool SessionRuntime::next_batch_window() {
         const char* fin = nullptr;
         for (int i = 0; i <= a && fin == nullptr; ++i) {
             const int32_t y = out_[(size_t) i];
+            if (sl.lp_top >= 0) {   // ahead of the BT line, read before the drafts touch the head
+                lp_row.resize((size_t) n_vocab);
+                if (const basalt::model::Result r = session().copy_logits(i, lp_row.data()); !r.ok()) return failed(r.message);
+                basalt::protocol::emit_text("BP " + std::to_string(b) +
+                                            logprob_fields(lp_row.data(), (int) n_vocab, y, sl.lp_top) + "\n");
+            }
             sl.ids.push_back(win_[(size_t) i]);
             ++sl.produced;
             ++sl.p;
