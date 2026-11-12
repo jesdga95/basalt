@@ -3,11 +3,15 @@
 //
 //   vision_cuda_parity kernels
 //   vision_cuda_parity encoder <mmproj.gguf> <image>
+//   vision_cuda_parity video <model.basalt | mmproj.gguf> <clip>
 //
 // kernels: random inputs at the real geometry (1152 columns, 16 heads of 72); each result against a double
 // precision host computation of the same operation, bitwise repeatability, and a row's independence of the rows
 // around it; then a timing line per kernel.  encoder: per tap relative L2 against the CPU encoder run with the same
-// bf16 input rounding, and the end-to-end time.  Exit status 1 when a gate fails.
+// bf16 input rounding, and the end-to-end time.  video: a clip's groups through the two-tap patch embedding (the CPU
+// encoder against a double precision W0.a + W1.b, a pair of equal frames against the still-picture path, the CUDA
+// encoder against the CPU one per group) and a microbench line for the K = 1536 patch product.  Exit status 1 when a
+// gate fails.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -20,8 +24,12 @@
 #include <string>
 #include <vector>
 
+#include <cublas_v2.h>
+
+#include "basalt/core/model_file.hpp"
 #include "basalt/vision/encoder_cpu.hpp"
 #include "basalt/vision/encoder_cuda.hpp"
+#include "basalt/vision/video.hpp"
 #include "vision_kernels.cuh"
 
 using namespace basalt::vision;
@@ -368,6 +376,110 @@ int run_encoder(const char* mmproj, const char* image) {
     return 0;
 }
 
+// One embedding tap ("embed") of an encode.
+std::vector<float> embed_of(CpuEncoder& enc, const std::vector<float>& patches, Size sz) {
+    std::vector<float> e, out;
+    enc.encode(patches, sz, out, [&](const std::string& n, const float* d, size_t c) { if (n == "embed") e.assign(d, d + c); });
+    return e;
+}
+
+int run_video(const char* model, const char* clip) {
+    std::string err;
+    basalt::core::ModelFile file;
+    basalt::core::FileRange range(model);
+    const std::string m = model;
+    if (m.size() > 7 && m.compare(m.size() - 7, 7, ".basalt") == 0) {
+        if (!file.open(m, err) || file.range("vision/mmproj").empty()) { std::printf("no vision/mmproj in %s %s\n", model, err.c_str()); return 2; }
+        range = file.range("vision/mmproj");
+    }
+    Mmproj mp;
+    if (!mp.open(range, err)) { std::printf("%s\n", err.c_str()); return 2; }
+    Video v;
+    if (!read_video(clip, VideoOptions{}, v, err)) { std::printf("%s\n", err.c_str()); return 2; }
+    const Size sz = v.canvas;
+    const int n = sz.w / 16 * (sz.h / 16), tokens = n / 4, E1 = mp.hp().embd;
+    std::vector<float> all;
+    patchify_video(v.frames, (int) v.indices.size(), sz, Geometry{}, all);
+    std::printf("video: %s, %d groups of %dx%d (%d tokens each)\n", clip, v.groups(), sz.w, sz.h, tokens);
+    CpuEncoder cpu;
+    if (!cpu.init(mp, 8, true, false, err)) { std::printf("%s\n", err.c_str()); return 2; }
+    // 1. the two-tap embedding against double precision: embed(a, b) - embed(0) = W0.a + W1.b
+    std::printf("two-tap patch embedding (CPU, group 0)\n");
+    const std::vector<float> g0(all.begin(), all.begin() + (size_t) n * 1536);
+    const std::vector<float> e2 = embed_of(cpu, g0, sz), e0 = embed_of(cpu, std::vector<float>((size_t) n * 768, 0.f), sz);
+    const auto* w0 = mp.find("v.patch_embd.weight");
+    const auto* w1 = mp.find("v.patch_embd.weight.1");
+    std::vector<double> got, ref;
+    for (int t = 0; t < n; ++t)
+        for (int e = 0; e < E1; ++e) {
+            double acc = 0;
+            for (int c = 0; c < 3; ++c)
+                for (int k = 0; k < 256; ++k) {
+                    acc += (double) ((const float*) w0->data)[(size_t) e * 768 + c * 256 + k] * g0[(size_t) t * 1536 + c * 512 + k];
+                    acc += (double) ((const float*) w1->data)[(size_t) e * 768 + c * 256 + k] * g0[(size_t) t * 1536 + c * 512 + 256 + k];
+                }
+            ref.push_back(acc);
+            got.push_back((double) e2[(size_t) t * E1 + e] - e0[(size_t) t * E1 + e]);
+        }
+    verdict("W0.a + W1.b vs double", rel_l2(got, ref), 1e-6);
+    // 2. a pair of equal frames is a still picture: the 768-wide path with the taps summed
+    std::vector<float> same((size_t) n * 1536), still((size_t) n * 768);
+    for (int t = 0; t < n; ++t)
+        for (int c = 0; c < 3; ++c)
+            for (int k = 0; k < 256; ++k) {
+                const float x = g0[(size_t) t * 1536 + c * 512 + k];
+                same[(size_t) t * 1536 + c * 512 + k] = same[(size_t) t * 1536 + c * 512 + 256 + k] = x;
+                still[(size_t) t * 768 + c * 256 + k] = x;
+            }
+    {
+        const std::vector<float> a = embed_of(cpu, same, sz), b = embed_of(cpu, still, sz);
+        verdict("equal frames vs the still path", rel_l2(std::vector<double>(a.begin(), a.end()), std::vector<double>(b.begin(), b.end())), 1e-6);
+    }
+    // 3. the CUDA encoder against the CPU encoder, every group
+    CudaEncoder gpu;
+    if (!gpu.init(mp, std::max(tokens, 8), err)) { std::printf("cuda init: %s\n", err.c_str()); return 2; }
+    std::printf("CUDA encoder vs CPU encoder, per group\n");
+    double worst = 0, worst_embed = 0;
+    for (int gi = 0; gi < v.groups(); ++gi) {
+        const std::vector<float> p(all.begin() + (size_t) gi * n * 1536, all.begin() + (size_t) (gi + 1) * n * 1536);
+        std::vector<float> rc, rg, ec, eg;
+        cpu.encode(p, sz, rc, [&](const std::string& nm, const float* d, size_t c) { if (nm == "embed") ec.assign(d, d + c); });
+        if (!gpu.encode(p, sz, rg, [&](const std::string& nm, const float* d, size_t c) { if (nm == "embed") eg.assign(d, d + c); })) {
+            std::printf("encode: %s\n", gpu.last_error().c_str());
+            return 2;
+        }
+        worst_embed = std::max(worst_embed, rel_l2(std::vector<double>(eg.begin(), eg.end()), std::vector<double>(ec.begin(), ec.end())));
+        worst = std::max(worst, rel_l2(std::vector<double>(rg.begin(), rg.end()), std::vector<double>(rc.begin(), rc.end())));
+    }
+    verdict("embed, worst group", worst_embed, 1e-6);
+    verdict("final embeddings, worst group", worst, 1e-1);
+    std::vector<float> out;
+    const std::vector<float> p0(all.begin(), all.begin() + (size_t) n * 1536);
+    const auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 5; ++i) gpu.encode(p0, sz, out);
+    std::printf("  encode one group (warm) %.2f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() / 5);
+    // 4. the patch product alone, at the encoder's largest picture: K = 1536 (a video group) against K = 768
+    cublasHandle_t blas;
+    cublasCreate(&blas);
+    for (int K : {768, 1536}) {
+        const int M = 16384, N = E1;
+        float* X = dev(randn((size_t) M * K, 0.5f));
+        float* W = dev(randn((size_t) N * K, 0.02f));
+        float* Y = dev_empty<float>((size_t) M * N);
+        const float one = 1.f, zero = 0.f;
+        const double ms = time_ms([&] {
+            cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &one, W, CUDA_R_32F, K, X, CUDA_R_32F, K, &zero, Y, CUDA_R_32F, N,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        });
+        const double flop = 2.0 * M * N * K, bytes = 4.0 * ((double) M * K + (double) N * K + (double) M * N);
+        std::printf("  bench patch product M=%d N=%d K=%d %9.1f us/call  %6.1f TFLOP/s  %6.0f GB/s\n", M, N, K, ms * 1e3,
+                    flop / 1e12 / (ms * 1e-3), bytes / 1e9 / (ms * 1e-3));
+        cudaFree(X); cudaFree(W); cudaFree(Y);
+    }
+    cublasDestroy(blas);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -378,8 +490,10 @@ int main(int argc, char** argv) {
         test_attention();
     } else if (argc >= 4 && !std::strcmp(argv[1], "encoder")) {
         run_encoder(argv[2], argv[3]);
+    } else if (argc >= 4 && !std::strcmp(argv[1], "video")) {
+        if (run_video(argv[2], argv[3]) != 0) return 2;
     } else {
-        std::fprintf(stderr, "usage: vision_cuda_parity kernels | encoder <mmproj.gguf> <image>\n");
+        std::fprintf(stderr, "usage: vision_cuda_parity kernels | encoder <mmproj.gguf> <image> | video <model.basalt | mmproj.gguf> <clip>\n");
         return 2;
     }
     std::printf(g_fail ? "FAILED (%d)\n" : "all passed\n", g_fail);
