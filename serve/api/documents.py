@@ -30,6 +30,7 @@ _CACHE_ENTRIES = 32
 _cache: OrderedDict[str, tuple] = OrderedDict()
 _cache_lock = threading.Lock()
 _request = threading.local()                # the image-source policy of the request this thread serves
+_parses = threading.Semaphore(2)            # PDFs are parsed outside the request turn: this bounds the CPU and memory
 _TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/yaml", "application/csv",
                "application/javascript", "application/x-sh")
 
@@ -190,7 +191,8 @@ def _read(data: bytes, media: str, name: str, context: str | None, want=None) ->
             if hit is not None:
                 _cache.move_to_end(key)
         if hit is None:
-            hit = _read_pdf(data, name, want)
+            with _parses:
+                hit = _read_pdf(data, name, want)
             with _cache_lock:
                 _cache[key] = hit
                 while len(_cache) > _CACHE_ENTRIES:
