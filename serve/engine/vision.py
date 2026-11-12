@@ -65,13 +65,56 @@ def flag_refused(engine_bin: str, path: str, group: list[str]) -> bool:
     return f"unknown argument: {group[0]}" in run.stderr
 
 
+def _labeled_dir() -> Path | None:
+    """A temp directory a Low-integrity process may write, or None if the call is refused: a process started from
+    an image labeled Low runs at Low and cannot write the Medium dir this server creates (No-Write-Up), failing
+    every embedding write. The DACL is tempfile's own private one (owner, SYSTEM, administrators), inherited here."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SecurityAttributes(ctypes.Structure):
+            _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p),
+                        ("bInheritHandle", wintypes.BOOL)]
+
+        advapi32, kernel32 = ctypes.windll.advapi32, ctypes.windll.kernel32
+        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = \
+            [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
+        kernel32.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(SecurityAttributes)]
+        psd = ctypes.c_void_p()
+        sddl = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)S:(ML;OICI;NW;;;LW)"
+        if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(psd), None):
+            return None
+        try:
+            for _ in range(10):
+                directory = Path(tempfile.gettempdir()) / f"basalt-vision-{uuid.uuid4().hex[:8]}"
+                if kernel32.CreateDirectoryW(str(directory),
+                                             ctypes.byref(SecurityAttributes(ctypes.sizeof(SecurityAttributes), psd,
+                                                                            False))):
+                    return directory
+        finally:
+            kernel32.LocalFree(psd)
+    except Exception:
+        pass
+    return None
+
+
+def _vision_dir() -> Path:
+    """The encoder's scratch directory: images in, embeddings out, shared with the encoder process by path."""
+    if os.name == "nt":
+        directory = _labeled_dir()
+        if directory is not None:
+            return directory
+    return Path(tempfile.mkdtemp(prefix="basalt-vision-"))
+
+
 class Vision:
     """The resident `basalt-vision` encoder: `ENC <image> <out>` lines in, embeddings out, cached by image hash."""
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
         """`start` false: down until the service restarts it, as an unloaded encoder is."""
         args = [cfg["vision_bin"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
-        self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
+        self.dir = _vision_dir()
         self.spawn = (args, log, env)                   # to start again
         self.stopped = False
         self.ready_s = 0.0                              # last start's time to READY
@@ -307,7 +350,7 @@ class EngineVision(Vision):
     in_engine = True
 
     def __init__(self, cfg: dict):
-        self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
+        self.dir = _vision_dir()
         self.engine = None                              # set by attach() once the engine exists
         self.stopped = False
         self.ready_s = 0.0
