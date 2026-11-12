@@ -27,7 +27,7 @@ VISION_CACHE_BYTES = 1 << 30                    # room for about 64 images
 IMAGE_MAX_PIXELS = 64 << 20                     # matches the decoder's kMaxImagePixels
 IMAGE_REQUEST_BYTES = 1 << 30                   # one request's images, as the encoder will get them
 IMAGE_WAITING_BYTES = 2 << 30                   # all requests' read images waiting for their turn to encode
-VIDEO_REQUEST_BYTES = 256 << 20                 # one request's videos, as read
+VIDEO_REQUEST_BYTES = 1 << 30                   # one request's videos, as read
 VIDEO_MAX_TOKENS = 8192                         # one video's merged tokens over all its groups (--video-max-tokens)
 # what Pillow decodes for a client: formats whose header gives the size that decoding will produce, and whose cost is
 # in proportion. Out: EPS (runs Ghostscript), ICO (the size checked is not the size decoded), JPEG 2000 (seconds of
@@ -154,7 +154,7 @@ class Vision:
         return self.video
 
     def read_video(self, source, allowed: ImageSources | None = None) -> bytes:
-        """A video's bytes, read under the request's policy (64 MiB at most). Decoding is the encoder's."""
+        """A video's bytes, read under the request's policy (VIDEO_MAX_BYTES at most). Decoding is the encoder's."""
         return load_image(source, allowed, VIDEO)
 
     def unload(self):
