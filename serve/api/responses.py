@@ -482,8 +482,13 @@ class Assembler:
                 return out
             if item["type"] == "function_call":         # a custom tool's input is sent whole, at its end
                 item["arguments"] += ev.text
+                extra = {}
+                if self.want_lp and item in self.calls:   # the call's tokens so far ride its delta
+                    got = self.lps_tools.pop(self.calls.index(item), [])
+                    item["logprobs"] += got
+                    extra = {"logprobs": got}
                 out.append(self.event("response.function_call_arguments.delta", item_id=item["id"],
-                                      output_index=self.index, delta=ev.text))
+                                      output_index=self.index, delta=ev.text, **extra))
         elif kind == "tool_call":
             item = self.item
             if item is None or item.get("call_id") != ev.call.id:     # a call that was not announced while written
