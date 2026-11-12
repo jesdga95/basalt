@@ -1,7 +1,7 @@
 # Image sources
 
 A request names an image as a `data:` URL, `http(s)` URL, `file:` URL or path. What the server reads depends on whether the request is
-from this machine.
+from this machine. A [document](documents.md) named by URL or path follows the same rules.
 
 | Source | From this machine | From anywhere else |
 |---|---|---|

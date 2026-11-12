@@ -6,9 +6,13 @@ works against Basalt.
 
 | API | Part | Bytes |
 |---|---|---|
-| Anthropic Messages | `{"type": "document", "source": {...}, "title": "...", "context": "..."}` | `source` of type `base64` (PDF or text), `text` or `content` |
+| Anthropic Messages | `{"type": "document", "source": {...}, "title": "...", "context": "..."}` | `source` of type `base64` (PDF or text), `text`, `content` or `url` |
 | Chat Completions | `{"type": "file", "file": {"filename": "...", "file_data": "data:application/pdf;base64,..."}}` | `file_data` |
-| Responses | `{"type": "input_file", "filename": "...", "file_data": "data:application/pdf;base64,..."}` | `file_data` |
+| Responses | `{"type": "input_file", "filename": "...", "file_data": "data:application/pdf;base64,..."}` | `file_data` or `file_url` |
+
+A `url` source or a `file_url` is an `http(s)` URL, a `file:` URL or a path, read under the same rules as an image named that way
+([image sources](image-sources.md)): from this machine any of them, from elsewhere only hosts and directories the server allows. A
+harness on the same machine can name the file instead of sending its bytes on every turn.
 
 ## What the model sees
 
@@ -24,8 +28,8 @@ its cached prefix and parses it once.
 ## Refusals
 
 Each is a 400 that names the document: a password-protected or unreadable PDF, more than 600 pages, more than 64 MiB, a media type
-other than PDF or text, text that is not UTF-8. The server keeps no files and fetches none: a `file_id`, a `file_url` or a `url`
-source is refused with the field to send instead. Citations are not produced.
+other than PDF or text, text that is not UTF-8, a URL or path the image rules refuse. The server keeps no files: a `file_id` or a
+`file` source is refused with the field to send instead. Citations are not produced.
 
 ## Example
 

@@ -6,12 +6,15 @@ import base64
 import http.client
 import io
 import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from serve.api import documents
 from serve.api.responses import input_messages
+from serve.engine.image_source import ImageSources
 from serve.engine.mock import MockEngine
 from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages
 from serve.handler import serve
@@ -215,9 +218,8 @@ class Refusals(unittest.TestCase):
         self.refused({"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
                                                      "data": "@@@"}}, "not valid base64")
 
-    def test_files_and_urls_are_named(self):
+    def test_files_are_named(self):
         self.refused({"type": "document", "source": {"type": "file", "file_id": "file_1"}}, "keeps no files")
-        self.refused({"type": "document", "source": {"type": "url", "url": "https://x/a.pdf"}}, "not fetched")
         with self.assertRaises(ValueError) as e:
             openai_to_messages({"messages": [{"role": "user", "content": [
                 {"type": "file", "file": {"file_id": "file-1"}}]}]})
@@ -227,6 +229,57 @@ class Refusals(unittest.TestCase):
         with mock.patch.object(documents, "MAX_PAGES", 1):
             documents._cache.clear()
             self.refused(anthropic_doc(PAPER), "has 2 pages; at most 1")
+
+
+class ByUrlOrPath(unittest.TestCase):
+    """A document named by URL or path is read under the request's image-source policy."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "paper.pdf")
+        with open(self.path, "wb") as f:
+            f.write(PAPER)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def convert(self, block: dict, allowed=None):
+        if allowed is None:
+            return anthropic_to_messages({"messages": [{"role": "user", "content": [block]}]})[0]
+        with documents.sources(allowed):
+            return anthropic_to_messages({"messages": [{"role": "user", "content": [block]}]})[0]
+
+    def test_a_local_client_names_a_file(self):
+        local = ImageSources(local=True, why="")
+        for url in (self.path, "file://" + self.path):
+            text = self.convert({"type": "document", "source": {"type": "url", "url": url}}, local)[0]["content"]
+            self.assertTrue(text.startswith('<document name="paper.pdf" pages="2">'), text)
+        responses = None
+        with documents.sources(local):
+            responses = input_messages({"input": [{"role": "user", "content": [
+                {"type": "input_file", "file_url": "file://" + self.path}]}]})
+        self.assertEqual(responses[0]["content"], text)
+
+    def test_a_remote_client_needs_the_image_dir(self):
+        block = {"type": "document", "title": "p.pdf", "source": {"type": "url", "url": self.path}}
+        with self.assertRaises(ValueError) as e:
+            self.convert(block, ImageSources(why="peer"))
+        self.assertIn("document 'p.pdf': image source refused by server policy", str(e.exception))
+        allowed = ImageSources(dirs=(os.path.realpath(self.dir.name),), why="peer")
+        self.assertIn("Routing picks", self.convert(block, allowed)[0]["content"])
+
+    def test_no_policy_reads_nothing(self):
+        with self.assertRaises(ValueError) as e:
+            self.convert({"type": "document", "source": {"type": "url", "url": self.path}})
+        self.assertIn("refused by server policy", str(e.exception))
+
+    def test_a_text_file_by_path(self):
+        notes = os.path.join(self.dir.name, "notes.txt")
+        with open(notes, "w") as f:
+            f.write("port 9473")
+        text = self.convert({"type": "document", "source": {"type": "url", "url": notes}},
+                            ImageSources(local=True, why=""))[0]["content"]
+        self.assertEqual(text, '<document name="notes.txt">\nport 9473\n</document>')
 
 
 class OverHttp(unittest.TestCase):
@@ -255,6 +308,16 @@ class OverHttp(unittest.TestCase):
         status, counted, _ = self.post("/v1/messages/count_tokens", body)
         self.assertEqual(status, 200, counted)
         self.assertGreater(counted["input_tokens"], len("Decode reached 120 tokens/s."))
+
+    def test_this_machine_names_a_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "paper.pdf")
+            with open(path, "wb") as f:
+                f.write(PAPER)
+            status, reply, prompt = self.post("/v1/messages", {"max_tokens": 16, "messages": [{"role": "user", "content": [
+                {"type": "document", "source": {"type": "url", "url": path}}]}]})
+        self.assertEqual(status, 200, reply)
+        self.assertIn("Routing picks 8 of 256 experts.", prompt)
 
     def test_a_bad_document_is_a_400(self):
         status, reply, _ = self.post("/v1/chat/completions", {"max_tokens": 16, "messages": [{"role": "user", "content": [

@@ -69,10 +69,10 @@ def _content(content, param):
         elif kind == "refusal":
             parts.append({"type": "text", "text": part.get("refusal") or ""})
         elif kind == "input_file":
-            if not part.get("file_data"):
-                field = "file_id" if part.get("file_id") else "file_url" if part.get("file_url") else "file_data"
-                raise ResponsesError("only files given as file_data (a data: URL with the file's bytes) are read; "
-                                     "this server keeps no files and fetches none", f"{param}[{j}].{field}",
+            if not (part.get("file_data") or part.get("file_url")):
+                field = "file_id" if part.get("file_id") else "file_data"
+                raise ResponsesError("only files given as file_data (a data: URL with the file's bytes) or file_url "
+                                     "are read; this server keeps no files", f"{param}[{j}].{field}",
                                      "unsupported_parameter")
             parts.append(part)
         elif kind in IMAGE_PARTS:
