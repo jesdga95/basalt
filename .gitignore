@@ -1,20 +1,6 @@
-build*/
-/bin/
-pack/
-logs/
-*.log
-*.nsys-rep
-*.ncu-rep
-__pycache__/
-.pytest_cache/
-*.pyc
-/.venv/
-/models/
-/packs/
-/mtp/
-/.ccache/
-.DS_Store
-
-# Local working notes for the Windows port: scratch planning, not project docs.
-docs/WINDOWS-ROADMAP.md
-docs/REBASE-PLAN.md
+build-fork/
+build/
+*.obj
+*.lib
+*.pdb
+*.exe
