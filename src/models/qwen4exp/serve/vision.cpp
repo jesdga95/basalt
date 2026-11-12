@@ -46,29 +46,63 @@ void QfnRuntime::enc_command(const std::string& cmd) {
     const basalt::vision::Geometry geo;
     int max_patches = 0;
     std::string decoder;   // where a video's frames were decoded
+    std::string borrow_note;   // the expert-cache memory lent to NVDEC for the decode, when it was
+    double borrow_ms = 0, refill_ms = 0;
     if (video) {
         std::string vpath, opath, verr;
         basalt::vision::VideoOptions vo;
         vo.group_tokens = geo.max_tokens;
         cudaGetDevice(&vo.gpu);   // NVDEC on the encoder's card, in the engine's context: no context of FFmpeg's own
         vo.cuda_context = basalt::vision::current_context();
-        {   // NVDEC takes no more than the card has free above the floor of what the engine allocates after loading:
-            // for the seconds of a decode it may use the reserve kept for other programs, never the model's memory
-            size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
-            vo.gpu_spare = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) basalt::program::serve::vram_floor_mib() << 20));
-        }
         basalt::vision::Video v;
         if (!basalt::vision::parse_encv(cmd, vpath, opath, vo, verr)) { reply_err(verr); return; }
-        // the decode runs on its own thread while the decoding slots keep their windows (a minute of 4K takes
-        // seconds; the slots stop only for the encode below, as for an image)
-        std::future<bool> dec = std::async(std::launch::async, [&] { return basalt::vision::read_video(vpath, vo, v, verr); });
-        bool windows_ok = true;
-        while (dec.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-            if (batch_on() && windows_ok) windows_ok = next_batch_window();
-            else dec.wait();
+        // NVDEC takes no more than the card has free above the floor of what the engine allocates after loading
+        // (for the seconds of a decode it may use the reserve kept for other programs). When the stream needs more,
+        // the expert cache lends it the memory, as SLEEP takes it: the tail segments' experts go to RAM homes, the
+        // segments are unmapped, and after the decode they are mapped again and refilled in place, so the placement
+        // comes back the same
+        const int64_t floor_b = (int64_t) basalt::program::serve::vram_floor_mib() << 20;
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const int64_t need = basalt::vision::video_nvdec_bytes(vpath);
+        bool borrowed = false;
+        // (only between replies: the cache's segments are shared with the elastic KV, and the engine changes its
+        // size only with no slot decoding, as for VRAM and SLEEP; beside a decoding reply the video decodes on the CPU)
+        if (need > 0 && need > (int64_t) free_b - floor_b && !batch_on() && xcache.segmented() && pf_parts.size() == 1 &&
+            pf_parts[0].lent.empty()) {
+            const auto tb = Clock::now();
+            std::string be, quiet;
+            borrowed = vram_command("VRAM " + std::to_string((long long) ((need + floor_b) >> 20) + 1), be, true, &quiet);
+            borrow_ms = std::chrono::duration<double, std::milli>(Clock::now() - tb).count();
+            if (!borrowed) borrow_note = ", no NVDEC room: " + be;
+            cudaMemGetInfo(&free_b, &total_b);
+        } else if (need > 0 && need > (int64_t) free_b - floor_b) {
+            borrow_note = batch_on() ? ", a reply is decoding" : !xcache.segmented() ? ", the expert cache cannot lend memory (not segmented)"
+                                                                         : ", a prompt's loan is out";
         }
-        if (!dec.get()) { reply_err(verr); return; }
+        vo.gpu_spare = std::max<int64_t>(0, (int64_t) free_b - floor_b);
+        bool windows_ok = true;
+        if (borrowed) {
+            // the cache is short of its slots: the decode runs alone, then the cache takes its memory back
+            const bool ok = basalt::vision::read_video(vpath, vo, v, verr);
+            const auto tr = Clock::now();
+            std::string re, quiet;
+            const bool back = vram_command("VRAM", re, true, &quiet);
+            refill_ms = std::chrono::duration<double, std::milli>(Clock::now() - tr).count();
+            borrow_note = ", " + std::to_string((long long) (need >> 20)) + " MiB lent to NVDEC (shrink " +
+                          std::to_string((long long) borrow_ms) + " ms, refill " + std::to_string((long long) refill_ms) + " ms)";
+            if (!back) { reply_err("giving the expert cache its memory back failed: " + re); return; }
+            if (!ok) { reply_err(verr); return; }
+        } else {
+            // the decode runs on its own thread while the decoding slots keep their windows (a minute of 4K takes
+            // seconds on the CPU; the slots stop only for the encode below, as for an image)
+            std::future<bool> dec = std::async(std::launch::async, [&] { return basalt::vision::read_video(vpath, vo, v, verr); });
+            while (dec.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                if (batch_on() && windows_ok) windows_ok = next_batch_window();
+                else dec.wait();
+            }
+            if (!dec.get()) { reply_err(verr); return; }
+        }
         if (!windows_ok) { reply_err("a batch window failed while the video was decoded"); return; }
         decoder = v.decoder;
         Job j;
@@ -216,7 +250,7 @@ void QfnRuntime::enc_command(const std::string& cmd) {
         basalt::log::info("basalt serve", "video encoder: %d groups of %d tokens in %lld cache slots (%.2f GiB), "
                              "%lld expert rows lent; decode %.0f ms (%s), lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms",
                      groups, tokens, (long long) k, (double) vis_enc.arena_bytes(tokens) / 1073741824.0, (long long) n_lent,
-                     ms(t0, t_dec), decoder.c_str(), ms(t_dec, t_lent), ms(t_lent, t_up), ms(t_up, t_enc), ms(t_enc, Clock::now()));
+                     ms(t0, t_dec), (decoder + borrow_note).c_str(), ms(t_dec, t_lent), ms(t_lent, t_up), ms(t_up, t_enc), ms(t_enc, Clock::now()));
     else
         basalt::log::info("basalt serve", "image encoder: %zu image(s) up to %d tokens in %lld cache slots (%.2f GiB), "
                              "%lld expert rows lent; decode %.0f ms, lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms",

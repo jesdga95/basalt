@@ -67,6 +67,10 @@ bool read_video(const std::string& path, const VideoOptions& o, Video& out, std:
 /// decoded elsewhere.
 Image video_frame_to_canvas(const Image& frame, Size canvas);
 
+/// The device bytes NVDEC is expected to take for the video file at `path` (from its frame size; see read_video), or
+/// -1 when this process has no FFmpeg or the file has no video stream it can read. For a caller that makes room first.
+int64_t video_nvdec_bytes(const std::string& path);
+
 /// An encoder process's video request, `ENCV <video> <output> [fps=F] [max_frames=N] [max_tokens=N]` (paths without
 /// spaces): the paths, and the options over `o`'s. False with `err` for a malformed line or a value out of range.
 bool parse_encv(const std::string& line, std::string& video, std::string& output, VideoOptions& o, std::string& err);
