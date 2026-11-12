@@ -71,9 +71,9 @@ void usage() {
 
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
-                 "  --vision             --serve takes images, encoded in this process (it reads the model file's\n"
-                 "                       vision/mmproj in place): ENC requests borrow expert-cache slots for the\n"
-                 "                       encoder and give them back refilled\n"
+                 "  --vision             --serve takes images and videos, encoded in this process (it reads the model\n"
+                 "                       file's vision/mmproj in place): ENC and ENCV requests borrow expert-cache slots\n"
+                 "                       for the encoder and give them back refilled\n"
                  "  --vision-external    --serve takes images whose embeddings come from basalt-vision --model FILE\n"
                  "                       (GENI requests)\n"
                  "  --no-prompt-skip     a model that stops far prompt rows short runs them through every layer: slower\n"

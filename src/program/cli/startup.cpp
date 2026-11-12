@@ -67,6 +67,7 @@ void pack_tokens(const model::ModelAdapter& adapter, CommonOptions& o) {
             if (const int64_t id = id_of(name); id >= 0) o.eos_ids.push_back(id);
     if (!o.turn_token_given) o.turn_token = id_of(names.turn);
     if (!o.image_pad_given) o.image_pad_id = id_of(names.image_pad);
+    if (!names.video_pad.empty()) o.video_pad_id = id_of(names.video_pad);
 }
 
 }  // namespace
