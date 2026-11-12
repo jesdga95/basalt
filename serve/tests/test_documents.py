@@ -29,28 +29,33 @@ def _escape(text: str) -> str:
 
 
 def make_pdf(pages: list) -> bytes:
-    """A PDF with one page per item: a str is lines of Helvetica text, bytes is a JPEG drawn over the page."""
+    """A PDF with one page per item: a str is lines of Helvetica text, bytes is a JPEG drawn over the page, a
+    (str, bytes) pair is both."""
     objects = {1: b"<< /Type /Catalog /Pages 2 0 R >>", 3: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"}
     kids, n = [], 4
     for page in pages:
         page_id, content_id, image_id = n, n + 1, n + 2
         n += 3
         kids.append(page_id)
-        if isinstance(page, str):
-            ops = ["BT /F1 12 Tf 72 720 Td"]
-            for k, line in enumerate(page.split("\n")):
-                ops.append(("0 -14 Td " if k else "") + f"({_escape(line)}) Tj")
-            stream = (" ".join(ops) + " ET").encode("latin-1")
-            resources = b"<< /Font << /F1 3 0 R >> >>"
-            objects[image_id] = b"<< >>"
-        else:
+        words, picture = (page, None) if isinstance(page, str) else (None, page) if isinstance(page, bytes) else page
+        stream, resources = b"", []
+        if picture is not None:
             from PIL import Image
-            w, h = Image.open(io.BytesIO(page)).size
-            stream = b"q 468 0 0 600 72 100 cm /Im1 Do Q"
-            resources = f"<< /XObject << /Im1 {image_id} 0 R >> >>".encode()
+            w, h = Image.open(io.BytesIO(picture)).size
+            stream += b"q 468 0 0 600 72 100 cm /Im1 Do Q "
+            resources.append(f"/XObject << /Im1 {image_id} 0 R >>")
             objects[image_id] = (f"<< /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceRGB "
-                                 f"/BitsPerComponent 8 /Filter /DCTDecode /Length {len(page)} >>\nstream\n").encode() \
-                + page + b"\nendstream"
+                                 f"/BitsPerComponent 8 /Filter /DCTDecode /Length {len(picture)} >>\nstream\n").encode() \
+                + picture + b"\nendstream"
+        else:
+            objects[image_id] = b"<< >>"
+        if words is not None:
+            ops = ["BT /F1 12 Tf 72 720 Td"]
+            for k, line in enumerate(words.split("\n")):
+                ops.append(("0 -14 Td " if k else "") + f"({_escape(line)}) Tj")
+            stream += (" ".join(ops) + " ET").encode("latin-1")
+            resources.append("/Font << /F1 3 0 R >>")
+        resources = f"<< {' '.join(resources)} >>".encode()
         objects[content_id] = f"<< /Length {len(stream)} >>\nstream\n".encode() + stream + b"\nendstream"
         objects[page_id] = (f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {content_id} 0 R "
                             "/Resources ").encode() + resources + b" >>"
@@ -157,6 +162,16 @@ class Scans(unittest.TestCase):
         self.assertEqual(items[1]["source"], "data:image/jpeg;base64," + b64(scan))   # the scan's own bytes
         self.assertEqual(items[2]["text"], "[page 3]\nLast page\n</document>\n\n")
         self.assertEqual(items[3]["text"], "Read it.")
+
+    def test_a_page_with_little_text_keeps_its_picture(self):
+        """A slide or a stamped scan: its few words, then its main image; a small picture stays out."""
+        picture = jpeg(640, 480)
+        pdf = make_pdf([("Quarterly results", picture), ("Logo page", jpeg(200, 100)), ("words " * 60, picture)])
+        items = documents.expand_documents([anthropic_doc(pdf, "deck.pdf")])
+        self.assertEqual([i["type"] for i in items], ["text", "image_url", "text"])
+        self.assertTrue(items[0]["text"].endswith("[page 1, with its image]\nQuarterly results\n"), items[0]["text"])
+        self.assertEqual(items[1]["image_url"], "data:image/jpeg;base64," + b64(picture))
+        self.assertTrue(items[2]["text"].startswith("[page 2]\nLogo page\n\n[page 3]\nwords words"), items[2]["text"])
 
     def test_a_tiny_image_is_not_a_scan(self):
         messages, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [
