@@ -719,7 +719,7 @@ Flow SessionRequest::read_to(int64_t to) {
         if (runtime_.halted()) { cancelled = true; return Flow::quit; }
         progress_line("PP", at);
     }
-    if ((to == turn_at || to == root_at) &&
+    if (part_checkpoint(to) &&
         !rt_.checkpoint_at(to, to == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd, ids)) {
         std::printf("ERR saving a conversation checkpoint failed: %s\n", runtime_.err.c_str());
         return Flow::error;

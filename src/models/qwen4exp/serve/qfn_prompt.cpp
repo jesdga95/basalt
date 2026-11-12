@@ -64,15 +64,17 @@ void QfnRequest::limit_parts() {
         if (n - 1 - read_from > runtime_.kReadAlone) {
             turn_at = -1;
             root_at = -1;
-        } else if (turn_at - std::max(read_from, root_at) < runtime_.o.prompt_cache_root) {
-            turn_at = -1;
+            media_at = -1;
+        } else {
+            if (turn_at - std::max(read_from, root_at) < runtime_.o.prompt_cache_root) turn_at = -1;
+            if (media_at - std::max(read_from, root_at) < runtime_.o.prompt_cache_root) media_at = -1;
         }
     }
     // the parts after the first read their n-gram rows from memory: once the first part has its own, the rest
     // are read into the row cache beside it
     {
         int64_t first_to = 0;
-        for (const int64_t to : {root_at, turn_at, n - 1})
+        for (const int64_t to : {root_at, media_at, turn_at, n - 1})
             if (to > read_from) { first_to = to; break; }
         runtime_.sp.set_ple_warm(ids.data(), read_from, first_to, n - 1);
     }
@@ -85,7 +87,7 @@ Flow QfnRequest::read_to(int64_t to) {
     runtime_.err.clear();
     const bool win = windows_ok(at, to);
     int64_t rto = to;
-    if (win && to == n - 1 && to != turn_at && to != root_at && ppl == nullptr && gguard == nullptr) {
+    if (win && to == n - 1 && !part_checkpoint(to) && ppl == nullptr && gguard == nullptr) {
         const int64_t p0 = at + (int64_t) runtime_.S * ((to - at) / runtime_.S);
         if (!runtime_.mtp_on || n - p0 <= runtime_.S_mtp) { rto = p0; fold_p0 = p0; }
     }
@@ -109,7 +111,7 @@ Flow QfnRequest::read_to(int64_t to) {
     if (win && !ov_window()) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
     runtime_.ov_post_done = false;
     runtime_.ov_post = [&, to]() -> bool {
-        if ((to == turn_at || to == root_at) && !runtime_.checkpoint_at(to, nullptr, false, source_at(to))) return false;
+        if (part_checkpoint(to) && !runtime_.checkpoint_at(to, nullptr, false, source_at(to))) return false;
         // the lent slots get their experts back here, beside the windows; the table follows on the main thread
         for (PfPart& p : runtime_.pf_parts) {
             if (p.lent.empty()) continue;
@@ -120,7 +122,7 @@ Flow QfnRequest::read_to(int64_t to) {
         ov_copied = true;
         return true;
     };
-    runtime_.pp_part_ckpt = (to == turn_at || to == root_at) ? to : -1;
+    runtime_.pp_part_ckpt = part_checkpoint(to) ? to : -1;
     bool split_ran = true;
     bool sp_ok = win ? (rto <= at || read_windows(at, rto, runtime_.err))
                : split_c > 0 ? read_split(at, to, split, split_ran, runtime_.err)
@@ -150,7 +152,7 @@ Flow QfnRequest::read_to(int64_t to) {
     at = to;
     resumed_chunk = 0;   // the later parts are planned as the read they continue planned them
     runtime_.ov_post = nullptr;
-    if ((to == turn_at || to == root_at) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on(), source_at(to))) {
+    if (part_checkpoint(to) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on(), source_at(to))) {
         std::printf("ERR saving a conversation checkpoint failed%s\n", runtime_.ckpt_why.c_str());
         return Flow::error;
     }
