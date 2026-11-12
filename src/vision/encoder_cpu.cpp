@@ -81,6 +81,12 @@ bool CpuEncoder::init(const Mmproj& mp, int threads, bool round_bf16, bool f16_q
     if (!w0 || !w1 || !bpatch_ || !pos_ || !postw_ || !postb_ || !bm0_ || !bm2_ || !wm0_ || !wm2_) return false;
     wpatch_.resize((size_t) E * 768);
     for (size_t i = 0; i < wpatch_.size(); ++i) wpatch_[i] = w0[i] + w1[i];
+    wpatch2_.resize((size_t) E * 1536);
+    for (int64_t e = 0; e < E; ++e)
+        for (int c = 0; c < 3; ++c) {
+            std::memcpy(&wpatch2_[(size_t) e * 1536 + c * 512], w0 + e * 768 + c * 256, 256 * sizeof(float));
+            std::memcpy(&wpatch2_[(size_t) e * 1536 + c * 512 + 256], w1 + e * 768 + c * 256, 256 * sizeof(float));
+        }
     layers_.resize(h.layers);
     for (int l = 0; l < h.layers; ++l) {
         const std::string p = "v.blk." + std::to_string(l) + ".";
@@ -108,7 +114,8 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
     const Hparams& hp = mp_->hp();
     const int E = hp.embd, F = hp.ffn, H = hp.heads, D = E / H, gx = canvas.w / 16, gy = canvas.h / 16;
     const int n = gx * gy;
-    if (n % 4 != 0 || (int) patches.size() != n * 768) return false;
+    const bool pair = (int64_t) patches.size() == (int64_t) n * 1536;   // a video group: the two taps apart
+    if (n % 4 != 0 || (!pair && (int) patches.size() != n * 768)) return false;
     std::vector<float> x((size_t) n * E), h((size_t) n * E), qkv((size_t) n * 3 * E), att((size_t) n * E),
         tmp((size_t) n * E), ffn((size_t) n * F), attk((size_t) H * n * D), attv((size_t) H * D * n);
     const int T = threads_;
@@ -116,7 +123,8 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
     // patch embedding + bilinear position embedding, rows in merge order
     std::vector<float> p16(patches);
     if (f16_) for (float& v : p16) v = f16_round(v);
-    gemm_f32w(p16.data(), wpatch_.data(), x.data(), n, E, 768, T);
+    if (pair) gemm_f32w(p16.data(), wpatch2_.data(), x.data(), n, E, 1536, T);
+    else gemm_f32w(p16.data(), wpatch_.data(), x.data(), n, E, 768, T);
     {
         const int S = 48;
         auto src = [&](int axis_out, int axis_in, int i, int& i0, int& i1, float& d) {

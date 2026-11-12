@@ -35,7 +35,8 @@ public:
     bool attach(void* arena, size_t bytes, int max_tokens, std::string& err);
     void detach();
 
-    /// As CpuEncoder::encode; the taps copy to the host and are for parity runs only.
+    /// As CpuEncoder::encode (a picture's 768-wide rows or a video group's 1536-wide ones); the taps copy to the host
+    /// and are for parity runs only.
     bool encode(const std::vector<float>& patches, Size canvas, std::vector<float>& out, const TapFn& tap = {});
 
     /// Device bytes held by the weights and the work buffers.
