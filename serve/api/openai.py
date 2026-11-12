@@ -5,7 +5,7 @@ import json
 import time
 import uuid
 
-from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY
+from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, logprobs_part
 from serve.frontend import Event
 from serve.service import Service
 
@@ -80,16 +80,6 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
             yield last
-
-
-def logprobs_part(content: list, reasoning: list, tools: dict) -> dict:
-    """A choice's `logprobs`: OpenAI's `content`, then the thinking's and each tool call's tokens when there are any."""
-    part = {"content": content[:]}
-    if reasoning:
-        part["reasoning_content"] = reasoning[:]
-    if tools:
-        part["tool_calls"] = [{"index": i, "content": tools[i][:]} for i in sorted(tools)]
-    return part
 
 
 def _is_json(text: str) -> bool:

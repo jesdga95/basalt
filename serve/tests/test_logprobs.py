@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 
 from serve.api import logprobs
+from serve.api.anthropic import anthropic_collect, anthropic_events
 from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import Assembler, ResponsesError, requested_logprobs
 from serve.frontend import Event, ToolCall
@@ -84,6 +85,21 @@ class Channels(unittest.TestCase):
     def test_off(self):
         r = openai_collect(openai_chunks(FakeService(), {}, [1, 2], True, [], 64, None))
         self.assertNotIn("logprobs", r["choices"][0])
+        m = anthropic_collect(anthropic_events(FakeService(), {}, [1, 2], True, [], 64, None))
+        self.assertNotIn("logprobs", m)
+        self.assertTrue(all("logprobs" not in e for _, e in anthropic_events(FakeService(), {}, [1, 2], True, [], 64, None)))
+
+    def test_anthropic(self):
+        events = list(anthropic_events(FakeService(), {logprobs.REQUEST_KEY: 0}, [1, 2], True, [], 64, None))
+        deltas = [e for name, e in events if name == "content_block_delta"]
+        self.assertEqual([[x["token"] for x in e["logprobs"]] for e in deltas], [["hm"], ["Hi"], ["<call", ">"], ["<call"]])
+        m = anthropic_collect(iter(events))
+        self.assertEqual([b["type"] for b in m["content"]], ["thinking", "text", "tool_use", "tool_use"])
+        part = m["logprobs"]
+        self.assertEqual([e["token"] for e in part["content"]], ["Hi"])
+        self.assertEqual([e["token"] for e in part["reasoning_content"]], ["hm"])
+        self.assertEqual([(t["index"], [e["token"] for e in t["content"]]) for t in part["tool_calls"]],
+                         [(0, ["<call", ">"]), (1, ["<call"])])
 
 
 class ChannelRules(unittest.TestCase):
@@ -235,6 +251,31 @@ class Api(unittest.TestCase):
         part = [o for o in out["output"] if o["type"] == "message"][0]["content"][0]
         self.assertEqual(part["text"], "ok, done.")
         self.check_entries("ok, done.", part["logprobs"], 2)
+
+    def messages(self, body, stream=False):
+        body = {"model": "basalt", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}], "stream": stream, **body}
+        req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read().decode()
+        return [json.loads(l[6:]) for l in raw.splitlines() if l.startswith("data: {")] if stream else json.loads(raw)
+
+    def test_anthropic_messages(self):
+        self.start(0)
+        m = self.messages({"logprobs": True, "top_logprobs": 2})
+        text = "".join(b.get("text", "") for b in m["content"])
+        self.assertEqual(text, "ok, done.")
+        self.check_entries(text, m["logprobs"]["content"], 2)
+        events = self.messages({"logprobs": True}, stream=True)
+        deltas = [e for e in events if e["type"] == "content_block_delta"]
+        self.check_entries(text, [x for e in deltas if e["delta"]["type"] == "text_delta" for x in e["logprobs"]], 0)
+        # the fake ends inside the thinking: the server closes it, and its own newline has no entry
+        thought = "".join(e["delta"]["thinking"] for e in deltas if e["delta"]["type"] == "thinking_delta").rstrip("\n")
+        self.check_entries(thought, [x for e in deltas if e["delta"]["type"] == "thinking_delta" for x in e["logprobs"]], 0)
+        self.assertNotIn("logprobs", self.messages({}))
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            self.messages({"top_logprobs": 2})
+        self.assertEqual(e.exception.code, 400)
 
     def test_stop_string(self):
         self.start(0)

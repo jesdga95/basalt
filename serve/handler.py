@@ -846,6 +846,7 @@ def make_handler(target: Service | Router):
             req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
             self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             checked_sampling(req)                             # likewise a sampling value out of range
+            req[LOGPROBS_KEY] = checked_logprobs(req)         # Basalt's logprobs, as Chat Completions takes them
             stop_strings(req)                                 # likewise a bad stop
             self._open_live("msg_" + uuid.uuid4().hex[:24], req)
             self._take_turn(bool(req.get("stream")))
