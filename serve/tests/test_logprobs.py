@@ -171,6 +171,26 @@ class Responses(unittest.TestCase):
         self.assertEqual(final["top_logprobs"], 2)
         msg = [o for o in final["output"] if o["type"] == "message"][0]
         self.assertEqual([x["token"] for x in msg["content"][0]["logprobs"]], ["He", "llo", "!"])
+        self.assertNotIn("logprobs", [o for o in final["output"] if o["type"] == "reasoning"][0])   # not asked
+
+    def test_reasoning_and_call_items(self):
+        asm = Assembler({logprobs.REQUEST_KEY: 0}, "m", 3, {}, False)
+        events = asm.start()
+        asm.logprob("reasoning", lp("hm"))
+        events += asm.feed(Event("reasoning", "hm"))
+        call = ToolCall("read", {"path": "x"})
+        asm.logprob("tool", lp("<call"), 0)
+        events += asm.feed(Event("tool_start", call=call))
+        asm.logprob("tool", lp("args"), 0)
+        events += asm.feed(Event("tool_args", "{}", call=call))
+        events += asm.feed(Event("tool_call", call=call))
+        asm.logprob("tool", lp("</calls>"), 0)                  # markup after the call's event
+        events += asm.finish({"finish": "stop", "completion_tokens": 4})
+        out = events[-1]["response"]["output"]
+        self.assertEqual([x["token"] for x in out[0]["logprobs"]], ["hm"])
+        self.assertEqual([x["token"] for x in out[1]["logprobs"]], ["<call", "args", "</calls>"])
+        rdelta = [e for e in events if e["type"] == "response.reasoning_text.delta"][0]
+        self.assertEqual([x["token"] for x in rdelta["logprobs"]], ["hm"])
 
 
 class Api(unittest.TestCase):
