@@ -353,26 +353,30 @@ __global__ void dyn_conv2_kernel(const float* __restrict__ x, const float* __res
     out[i] = acc;
 }
 
-// One block of `rank` threads walks the positions; per candidate a block sum over the rank.
+// One block of `rank` threads walks the positions: the predecessor's row times h into shared memory, then each warp
+// scores its candidates (a warp sum over the rank), then one thread picks.  Two barriers a position.
 __global__ void candidate_path_kernel(const float* __restrict__ lp_rows, int stride, int top, const float* __restrict__ h,
                                       const uint16_t* __restrict__ pred, const uint16_t* __restrict__ succ, int rank,
                                       const int32_t* __restrict__ anchor, int n, int32_t* __restrict__ ids,
                                       float* __restrict__ conf) {
-    __shared__ float red[32];
+    extern __shared__ float ph[];   // [rank]
     __shared__ float score[64];
     __shared__ int32_t prev_s;
-    const int r = threadIdx.x;
+    const int r = threadIdx.x, lane = r & 31, warp = r >> 5, warps = blockDim.x >> 5;
     if (r == 0) prev_s = *anchor;
     __syncthreads();
     for (int p = 0; p < n; ++p) {
         const float* row = lp_rows + (size_t) p * stride;
-        const int32_t prev = prev_s;
-        const float ph = __uint_as_float((uint32_t) pred[(size_t) prev * rank + r] << 16) * h[(size_t) p * rank + r];
-        for (int k = 0; k < top; ++k) {
+        ph[r] = __uint_as_float((uint32_t) pred[(size_t) prev_s * rank + r] << 16) * h[(size_t) p * rank + r];
+        __syncthreads();
+        for (int k = warp; k < top; k += warps) {
             const int32_t cand = __float_as_int(row[2 + 2 * k]);
-            const float v = cand >= 0 ? ph * __uint_as_float((uint32_t) succ[(size_t) cand * rank + r] << 16) : 0.0f;
-            const float sum = block_sum(v, red);
-            if (r == 0) score[k] = cand >= 0 ? row[3 + 2 * k] + sum : -1e30f;
+            float v = 0.0f;
+            if (cand >= 0)
+                for (int i = lane; i < rank; i += 32) v += ph[i] * __uint_as_float((uint32_t) succ[(size_t) cand * rank + i] << 16);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0) score[k] = cand >= 0 ? row[3 + 2 * k] + v : -1e30f;
         }
         __syncthreads();
         if (r == 0) {
@@ -619,7 +623,7 @@ void candidate_path(const float* lp_rows, int stride, int top, const float* h, c
         basalt::log::error("basalt", "candidate_path: %d candidates of rank %d", top, rank);
         std::exit(1);
     }
-    candidate_path_kernel<<<1, rank, 0, (cudaStream_t) stream>>>(lp_rows, stride, top, h, pred, succ, rank, anchor, n, ids, conf);
+    candidate_path_kernel<<<1, rank, (size_t) rank * sizeof(float), (cudaStream_t) stream>>>(lp_rows, stride, top, h, pred, succ, rank, anchor, n, ids, conf);
     check("candidate_path");
 }
 

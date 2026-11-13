@@ -54,7 +54,8 @@ struct BatchTable {
 
 /// The decode window's scratch (kBatch rows).
 struct WindowScratch {
-    float *x = nullptr, *xn = nullptr, *tmp = nullptr;
+    uint16_t* x = nullptr;                       // the residual rows, BF16 (every add in fp32, rounded once)
+    float *xn = nullptr, *tmp = nullptr;
     void* xq = nullptr;                          // the window gemm's activations (bf16 rows)
     void* hq = nullptr;                          // the down product's (SwiGLU's bf16 rows)
     void* x8 = nullptr;                          // MMQ's (q8_1 rows)
@@ -139,6 +140,8 @@ public:
 /// One conversation's device state.
 struct SessionState {
     cudaStream_t stream = nullptr;
+    cudaStream_t side = nullptr;                  // the GDN commit, beside the block drafter
+    cudaEvent_t fork = nullptr, join = nullptr;   // the commit's start (after the window) and end
     Arena arena;
     float* gdn = nullptr;                        // per GDN layer: state [S][h_v][S], then conv history [C][3]
     size_t gdn_floats = 0;                       // per layer
@@ -184,7 +187,7 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
                    const int32_t* pos3, std::string& err);
 /// The commit of the last window's first n rows into the recurrent state.
-void commit_window(Model& m, SessionState& st, int n);
+void commit_window(Model& m, SessionState& st, int n, cudaStream_t s);
 
 /// The block drafter's context from the last window's first n rows (st.dacc) at positions pos.. .
 bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err);

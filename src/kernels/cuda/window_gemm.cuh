@@ -31,6 +31,7 @@ struct Args {
     int64_t rows[kMaxMatrices];
     const float* scale[kMaxMatrices];
     float* y[kMaxMatrices];
+    uint16_t* y16[kMaxMatrices];
     int64_t ld_y[kMaxMatrices];
     int64_t row_off[kMaxMatrices];   // the matrix's first row in the workspace's rows
     int tile0[kMaxMatrices + 1];     // the matrix's first tile (tile0[n]: all tiles)
@@ -348,19 +349,27 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
             if (final_block) {
                 __threadfence();
                 const float* base = a.partial + a.row_off[mat];
+                // slice by slice, every element's load of a slice issued together (each element still sums its
+                // slices in order from 0)
 #pragma unroll
                 for (int mt = 0; mt < MW; ++mt)
 #pragma unroll
                     for (int t = 0; t < NT; ++t)
 #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            const int col = t * 8 + 2 * c + (j & 1);
-                            const int64_t r = row0 + (rw * MW + mt) * 16 + g + 8 * (j >> 1);
-                            if (col >= a.T || r >= rows) continue;
-                            float s = 0.0f;
-                            for (int k = 0; k < ks; ++k) s += __ldcg(base + ((int64_t) k * kRows + col) * a.part_rows + r);
-                            acc[mt][t][j] = s;
-                        }
+                        for (int j = 0; j < 4; ++j) acc[mt][t][j] = 0.0f;
+                for (int k = 0; k < ks; ++k) {
+                    const float* bk = base + (int64_t) k * kRows * a.part_rows;
+#pragma unroll
+                    for (int mt = 0; mt < MW; ++mt)
+#pragma unroll
+                        for (int t = 0; t < NT; ++t)
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                const int col = t * 8 + 2 * c + (j & 1);
+                                const int64_t r = row0 + (rw * MW + mt) * 16 + g + 8 * (j >> 1);
+                                if (col < a.T && r < rows) acc[mt][t][j] += __ldcg(bk + (int64_t) col * a.part_rows + r);
+                            }
+                }
                 if (threadIdx.x == 0) a.tickets[tile] = 0;
             }
         }
@@ -410,6 +419,13 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                         const int64_t r = row0 + (rw * MW + mt) * 16 + g + 8 * (j >> 1);
                         if (col >= a.T || r >= rows) continue;
                         const float v = acc[mt][t][j] * sc;
+                        if (a.epi == (int) Epilogue::AddBf16) {
+                            uint16_t* d16 = a.y16[mat] + col * ld + r;
+                            // the product rounded as Store leaves it (no fma into the add), then one add, one rounding
+                            *d16 = __bfloat16_as_ushort(__float2bfloat16_rn(
+                                __fadd_rn(__bfloat162float(__ushort_as_bfloat16(*d16)), __fmul_rn(acc[mt][t][j], sc))));
+                            continue;
+                        }
                         float* dst = y + col * ld + r;
                         if (a.epi == (int) Epilogue::Add) *dst += v;
                         else *dst = v;

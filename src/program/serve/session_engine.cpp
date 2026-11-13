@@ -469,7 +469,8 @@ public:
             return false;
         }
         after_launch();
-        if (basalt::model::Result r = rt_.session().draft_end(drafts_.data(), conf_.data(), n, n_draft_); !r.ok()) {
+        // room for every draft the session makes (a block drafter may make more than asked, the policy picks)
+        if (basalt::model::Result r = rt_.session().draft_end(drafts_.data(), conf_.data(), max_window() - 1, n_draft_); !r.ok()) {
             runtime_.err = r.message;
             return false;
         }

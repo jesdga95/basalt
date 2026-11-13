@@ -34,8 +34,9 @@ std::size_t act_bytes(int64_t K);
 /// Rows 0..T-1 of x (row t at x + t * ld_x, K values) as bf16 rows in `act`.
 void pack(const float* x, int64_t ld_x, int64_t K, int T, void* act, void* stream);
 /// The RMS norm of rows 0..T-1 of x ([T][K], weights w, any offset folded) packed into `act`; with `xn` the normed fp32
-/// rows too (bitwise rms_norm_rows).
+/// rows too (bitwise rms_norm_rows; the BF16 overload reads BF16 rows, a BF16 residual, widened).
 void norm_pack(const float* x, const float* w, float eps, int64_t K, int T, void* act, float* xn, void* stream);
+void norm_pack(const uint16_t* x, const float* w, float eps, int64_t K, int T, void* act, float* xn, void* stream);
 /// The device scratch for split-K sums, sized with workspace_need over every call a model makes.
 struct Workspace {
     float* partial = nullptr;    // [slices][16][rows] of the product in flight
@@ -52,11 +53,13 @@ struct Matrix {
     int64_t ld_y = 0;
     const uint8_t* scales = nullptr;   // NVFP4, Q8: the scale plane when `rows` are the first rows of a larger matrix (null: after
                                        // the codes of these rows)
+    uint16_t* y16 = nullptr;           // AddBf16: the BF16 rows added into (y unused)
 };
 
 enum class Epilogue {
     Store,    // y = scale * W x
     Add,      // y += scale * W x
+    AddBf16,  // y16 = bf16(float(y16) + scale * W x): a BF16 residual, the add in fp32, rounded once
     SwiGLU,   // two matrices of the same rows (gate, up): m[0].y = silu(s_g gate x) * (s_u up x)
 };
 

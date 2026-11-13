@@ -1,6 +1,6 @@
 // tests/kernels/window_gemm_parity.cpp - a decode window's products (window_gemm.hpp) at Qwen3.8-27B widths, FP8 E4M3 and
 // NVFP4 planes: against a double-precision reference on the fp16-packed activations, each row of a window bitwise the
-// same whatever the window's rows (1..16) and whatever the other rows hold, the Add and SwiGLU epilogues, a call of
+// same whatever the window's rows (1..16) and whatever the other rows hold, the Add, AddBf16 and SwiGLU epilogues, a call of
 // several matrices, and the fused packs against rms_norm_rows / attn_gate followed by pack.
 // --bench: us per call and GB/s of weights, the weights rotated through copies larger than L2.  Exit 77 without a GPU.
 #include "basalt/kernels/dense_ops.hpp"
@@ -211,6 +211,21 @@ void parity(const Shape& sh) {
     for (size_t i = 0; i < ya.size(); ++i) bad += std::fabs(ya[i] - (0.5 + (double) y16[i])) > 1e-6 * (1.0 + std::fabs((double) y16[i]));
     std::printf("%-24s Add epilogue: %s\n", sh.name, bad ? "WRONG  FAIL" : "ok");
     if (bad) ++fails;
+    {   // AddBf16: BF16 rows plus the product, the add in fp32, rounded once
+        std::vector<uint16_t> b16((size_t) R * sh.rows);
+        for (size_t i = 0; i < b16.size(); ++i) b16[i] = bf16_of(0.25f * nd(rng));
+        uint16_t* d_b16 = up(b16);
+        c.epi = wg::Epilogue::AddBf16;
+        c.m[0].y = nullptr;
+        c.m[0].y16 = d_b16;
+        wg::gemm(c, act, R, ws, nullptr);
+        const auto yb = down(d_b16, b16.size());
+        int bad16 = 0;
+        for (size_t i = 0; i < yb.size(); ++i) bad16 += yb[i] != bf16_of(bf16f(b16[i]) + y16[i]);
+        std::printf("%-24s AddBf16 epilogue == bf16(x + W y): %s\n", sh.name, bad16 ? "NO  FAIL" : "yes");
+        if (bad16) ++fails;
+        cudaFree(d_b16);
+    }
     cudaFree(d_w); cudaFree(d_x); cudaFree(act); cudaFree(d_y); cudaFree(d_y2); cudaFree(d_sc);
 }
 
@@ -396,6 +411,20 @@ void parity_packs() {
     const bool ok = b1 == b2 && std::memcmp(n1.data(), n2.data(), n1.size() * 4) == 0;
     std::printf("%-24s norm_pack == rms_norm_rows + pack: %s\n", "packs", ok ? "yes" : "NO  FAIL");
     if (!ok) ++fails;
+    {   // the same from BF16 rows (the residual)
+        std::vector<uint16_t> x16(x.size());
+        for (size_t i = 0; i < x.size(); ++i) x16[i] = bf16_of(x[i]);
+        uint16_t* d_x16 = up(x16);
+        basalt::kernels::rms_norm_rows(d_x16, d_w, d_xn, R, K, 1e-6f, nullptr);
+        wg::pack(d_xn, K, K, R, a1, nullptr);
+        wg::norm_pack(d_x16, d_w, 1e-6f, K, R, a2, d_xn2, nullptr);
+        const auto c1 = down((const uint8_t*) a1, wg::act_bytes(K)), c2 = down((const uint8_t*) a2, wg::act_bytes(K));
+        const auto m1 = down(d_xn, (size_t) R * K), m2 = down(d_xn2, (size_t) R * K);
+        const bool ok16 = c1 == c2 && std::memcmp(m1.data(), m2.data(), m1.size() * 4) == 0;
+        std::printf("%-24s norm_pack (BF16 rows) == rms_norm_rows + pack: %s\n", "packs", ok16 ? "yes" : "NO  FAIL");
+        if (!ok16) ++fails;
+        cudaFree(d_x16);
+    }
     cudaFree(d_x); cudaFree(d_w); cudaFree(d_xn); cudaFree(d_xn2); cudaFree(a1); cudaFree(a2);
 }
 
