@@ -172,28 +172,43 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
     const float ws = sg.scale ? *sg.scale : 1.0f;
     const bool add = p.epi == (int) Epilogue::Add;
 #pragma unroll
-    for (int mt = 0; mt < MT; ++mt)
+    for (int mt = 0; mt < MT; ++mt) {
+        // an m-tile's two token rows: with Add, every residual pair is loaded before any is written back, so the loads
+        // overlap instead of each waiting behind the last store
+        int tk[2];
+        float as_[2];
+        float2 res[2][MR];
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int t = tok0 + wtk * WTOK + mt * 16 + (lane >> 2) + h * 8;
-            if (t >= p.ntok) continue;
-            const float as_ = __ldg(p.a_scale + t);
-            float* orow = sg.dst + (int64_t) t * sg.ld;
+            tk[h] = tok0 + wtk * WTOK + mt * 16 + (lane >> 2) + h * 8;
+            as_[h] = tk[h] < p.ntok ? __ldg(p.a_scale + tk[h]) : 0.0f;
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) {
+                const int r = row0 + wrw * WROW + mr * 8 + 2 * (lane & 3);
+                res[h][mr] = make_float2(0.0f, 0.0f);
+                if (add && tk[h] < p.ntok && r < sg.rows)
+                    res[h][mr] = __ldcg(reinterpret_cast<const float2*>(sg.dst + (int64_t) tk[h] * sg.ld + r));
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            if (tk[h] >= p.ntok) continue;
+            float* orow = sg.dst + (int64_t) tk[h] * sg.ld;
 #pragma unroll
             for (int mr = 0; mr < MR; ++mr) {
                 const int r = row0 + wrw * WROW + mr * 8 + 2 * (lane & 3);
                 if (r >= sg.rows) continue;
                 // rounded products, then the add: no contraction into an fma, so the bits do not depend on the instance
-                float2 v = make_float2(__fmul_rn(__fmul_rn(acc[mt][mr][2 * h], as_), ws),
-                                       __fmul_rn(__fmul_rn(acc[mt][mr][2 * h + 1], as_), ws));
+                float2 v = make_float2(__fmul_rn(__fmul_rn(acc[mt][mr][2 * h], as_[h]), ws),
+                                       __fmul_rn(__fmul_rn(acc[mt][mr][2 * h + 1], as_[h]), ws));
                 if (add) {
-                    const float2 o = *reinterpret_cast<const float2*>(orow + r);
-                    v.x = __fadd_rn(o.x, v.x);
-                    v.y = __fadd_rn(o.y, v.y);
+                    v.x = __fadd_rn(res[h][mr].x, v.x);
+                    v.y = __fadd_rn(res[h][mr].y, v.y);
                 }
                 *reinterpret_cast<float2*>(orow + r) = v;
             }
         }
+    }
 }
 
 size_t scale_off(int64_t rows, int64_t cols) { return ((size_t) rows * (size_t) cols + 15) & ~(size_t) 15; }
