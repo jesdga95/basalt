@@ -15,6 +15,26 @@ The build fetches nothing. The ggml and llama.cpp parts Basalt uses (quantizatio
 
 `-DWERROR=ON` makes project warnings errors (CI sets it on Linux).
 
+## Building only some models
+
+`-DBASALT_MODELS=<ids>` is a semicolon list of architecture ids; the default builds every model. A model left out is not compiled at
+all: its C++ and CUDA sources, its kernels and its tests are skipped, which is most of the build time for DeepSeek.
+
+| Model | Id |
+| --- | --- |
+| Qwen3.8-Flash-Next | `qwen4exp` |
+| DeepSeek-V4.1-Flash | `deepseek41` |
+
+```sh
+cmake -S . -B build -DBASALT_MODELS=qwen4exp                  # Flash-Next only
+cmake -S . -B build -DBASALT_MODELS=deepseek41                # DeepSeek only
+cmake -S . -B build "-DBASALT_MODELS=qwen4exp;deepseek41"     # both (the default); quote the semicolon
+```
+
+An unknown id or an empty list stops the configure and names the valid ids. A pack of a model the build left out fails at load with
+`architecture is 'deepseek41', a Basalt model this build left out (built with BASALT_MODELS=qwen4exp); rebuild with cmake
+-DBASALT_MODELS="qwen4exp;deepseek41" to load it`. The value is kept in the build folder's cache: to change it, pass the option again.
+
 ## Tests
 
 Configure with `-DBUILD_TESTING=ON`, build, and run `ctest --test-dir build`.

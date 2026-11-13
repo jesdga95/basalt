@@ -91,6 +91,8 @@ cmake --build build -j
 ctest --test-dir build -L cpu -j 8 --output-on-failure
 ```
 
+`-DBASALT_MODELS=qwen4exp` or `deepseek41` builds one model ([building](building.md#building-only-some-models)); the option works the same here.
+
 If tests fail to create fixtures, point `TEMP` and `TMP` into the build tree. CUDA 13.2+ headers need `/Zc:preprocessor`; the CMakeLists
 passes it to nvcc's host compiler.
 
