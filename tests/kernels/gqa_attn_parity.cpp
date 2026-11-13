@@ -157,10 +157,11 @@ int main(int argc, char** argv) {
     std::vector<std::vector<double>> want(rows.size(), std::vector<double>((size_t) NH * HD));
     for (size_t i = 0; i < rows.size(); ++i) ref_attn(&q[(size_t) rows[i] * NH * HD], kc, vc, p0 + rows[i] + 1, want[i].data());
     // decode: the last 8 rows as windows of 1..8 rows; each row bitwise equal across widths
-    std::vector<float> single((size_t) 8 * NH * HD), got((size_t) 8 * NH * HD);
+    constexpr int TW = basalt::kernels::kGqaMaxWindow;
+    std::vector<float> single((size_t) TW * NH * HD), got((size_t) TW * NH * HD);
     Err ed;
     bool bitwise = true;
-    for (int T = 1; T <= 8; ++T) {
+    for (int T = 1; T <= TW; ++T) {
         const int r0 = TP - T;
         basalt::kernels::gqa_decode_attn(d_q + (size_t) r0 * NH * HD, d_kc, d_vc, NH, NKV, p0 + r0, T, d_scr, max_cells, d_out, nullptr);
         ck(cudaMemcpy(got.data(), d_out, (size_t) T * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
@@ -175,8 +176,8 @@ int main(int argc, char** argv) {
                     for (int j = 0; j < NH * HD; ++j) ed.add(got[(size_t) t * NH * HD + j], want[i][(size_t) j]);
         }
     }
-    std::printf("gqa_decode_attn: max abs %.3g rel %.3g vs double; the last row bitwise equal across widths 1-8: %s\n", ed.abs,
-                ed.rel, bitwise ? "yes" : "NO");
+    std::printf("gqa_decode_attn: max abs %.3g rel %.3g vs double; the last row bitwise equal across widths 1-%d: %s\n", ed.abs,
+                ed.rel, TW, bitwise ? "yes" : "NO");
     if (ed.abs > 2e-4 || !bitwise) ++fails;
     {
         // a captured window reads its first cell on the device and loops its blocks over the chunks in use: bitwise the

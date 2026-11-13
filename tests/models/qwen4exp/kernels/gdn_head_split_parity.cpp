@@ -192,14 +192,14 @@ Card make_card(int dev, const HostLayer& L, int hk, const std::vector<float>& x)
     k.state = upload(L.state); k.state_n = L.state.size();
     k.wa = upload(L.wa); k.wb = upload(L.wb);
     k.x = upload(x);
-    CK(cudaMalloc(&k.qkv, sizeof(float) * kDecMaxT * k.c));
-    CK(cudaMalloc(&k.z, sizeof(float) * kDecMaxT * k.zv));
-    CK(cudaMalloc(&k.h, sizeof(float) * kDecMaxT * k.c));
-    CK(cudaMalloc(&k.gate, sizeof(float) * kDecMaxT * k.hv));
-    CK(cudaMalloc(&k.beta, sizeof(float) * kDecMaxT * k.hv));
-    CK(cudaMalloc(&k.out, sizeof(float) * kDecMaxT * N));
-    CK(cudaMalloc(&k.xq, native_q8_1_bytes(N, kDecMaxT)));
-    CK(cudaMalloc(&k.yq, native_q8_1_bytes(k.zv, kDecMaxT)));
+    CK(cudaMalloc(&k.qkv, sizeof(float) * kVerifyMaxT * k.c));
+    CK(cudaMalloc(&k.z, sizeof(float) * kVerifyMaxT * k.zv));
+    CK(cudaMalloc(&k.h, sizeof(float) * kVerifyMaxT * k.c));
+    CK(cudaMalloc(&k.gate, sizeof(float) * kVerifyMaxT * k.hv));
+    CK(cudaMalloc(&k.beta, sizeof(float) * kVerifyMaxT * k.hv));
+    CK(cudaMalloc(&k.out, sizeof(float) * kVerifyMaxT * N));
+    CK(cudaMalloc(&k.xq, native_q8_1_bytes(N, kVerifyMaxT)));
+    CK(cudaMalloc(&k.yq, native_q8_1_bytes(k.zv, kVerifyMaxT)));
     CK(cudaDeviceSynchronize());
     return k;
 }
@@ -225,13 +225,13 @@ void run_card(const Card& k, int T, cudaStream_t s) {
     native_mmvq(k.to, k.wo, k.yq, k.out, k.zv, N, T, s);
 }
 void clear_card(const Card& k, cudaStream_t s) {
-    CK(cudaMemsetAsync(k.qkv, 0xff, sizeof(float) * kDecMaxT * k.c, s));
-    CK(cudaMemsetAsync(k.z, 0xff, sizeof(float) * kDecMaxT * k.zv, s));
-    CK(cudaMemsetAsync(k.h, 0xff, sizeof(float) * kDecMaxT * k.c, s));
-    CK(cudaMemsetAsync(k.gate, 0xff, sizeof(float) * kDecMaxT * k.hv, s));
-    CK(cudaMemsetAsync(k.beta, 0xff, sizeof(float) * kDecMaxT * k.hv, s));
-    CK(cudaMemsetAsync(k.out, 0xff, sizeof(float) * kDecMaxT * N, s));
-    CK(cudaMemsetAsync(k.yq, 0xff, native_q8_1_bytes(k.zv, kDecMaxT), s));
+    CK(cudaMemsetAsync(k.qkv, 0xff, sizeof(float) * kVerifyMaxT * k.c, s));
+    CK(cudaMemsetAsync(k.z, 0xff, sizeof(float) * kVerifyMaxT * k.zv, s));
+    CK(cudaMemsetAsync(k.h, 0xff, sizeof(float) * kVerifyMaxT * k.c, s));
+    CK(cudaMemsetAsync(k.gate, 0xff, sizeof(float) * kVerifyMaxT * k.hv, s));
+    CK(cudaMemsetAsync(k.beta, 0xff, sizeof(float) * kVerifyMaxT * k.hv, s));
+    CK(cudaMemsetAsync(k.out, 0xff, sizeof(float) * kVerifyMaxT * N, s));
+    CK(cudaMemsetAsync(k.yq, 0xff, native_q8_1_bytes(k.zv, kVerifyMaxT), s));
 }
 
 // bytes that differ between this slice's rows of a whole-layer output and the slice's own output, T tokens
@@ -369,11 +369,11 @@ std::vector<float> run_peer_item(const Card& k, int T, cudaStream_t s, bool& ok,
     float *qkv, *z, *h, *ga, *be, *o, *x;
     void *yq, *mxq, *scr;
     unsigned int* arr;
-    CK(cudaMalloc(&qkv, sizeof(float) * kDecMaxT * k.c)); CK(cudaMalloc(&h, sizeof(float) * kDecMaxT * k.c));
-    CK(cudaMalloc(&z, sizeof(float) * kDecMaxT * k.zv)); CK(cudaMalloc(&o, sizeof(float) * kDecMaxT * k.zv));
-    CK(cudaMalloc(&ga, sizeof(float) * kDecMaxT * k.hv)); CK(cudaMalloc(&be, sizeof(float) * kDecMaxT * k.hv));
-    CK(cudaMalloc(&x, sizeof(float) * kDecMaxT * N));
-    CK(cudaMalloc(&yq, native_q8_1_bytes(k.zv, kDecMaxT))); CK(cudaMalloc(&mxq, xq_stride));
+    CK(cudaMalloc(&qkv, sizeof(float) * kVerifyMaxT * k.c)); CK(cudaMalloc(&h, sizeof(float) * kVerifyMaxT * k.c));
+    CK(cudaMalloc(&z, sizeof(float) * kVerifyMaxT * k.zv)); CK(cudaMalloc(&o, sizeof(float) * kVerifyMaxT * k.zv));
+    CK(cudaMalloc(&ga, sizeof(float) * kVerifyMaxT * k.hv)); CK(cudaMalloc(&be, sizeof(float) * kVerifyMaxT * k.hv));
+    CK(cudaMalloc(&x, sizeof(float) * kVerifyMaxT * N));
+    CK(cudaMalloc(&yq, native_q8_1_bytes(k.zv, kVerifyMaxT))); CK(cudaMalloc(&mxq, xq_stride));
     constexpr int kFf = 1024;
     CK(cudaMalloc(&scr, dec_moe_peer_scratch_bytes(N, kFf)));
     CK(cudaMalloc(&arr, 64));
@@ -457,7 +457,7 @@ bool parity() {
     const int combos[3][3] = {{14, 14, 14}, {12, 23, 13}, {13, 12, 23}};
     for (const auto& cb : combos) {
         const HostLayer L = make_layer(cb[0], cb[1], cb[2], rng);
-        const std::vector<float> x = randn((size_t) kDecMaxT * N, 1.f, rng);
+        const std::vector<float> x = randn((size_t) kVerifyMaxT * N, 1.f, rng);
         Card whole = make_card(0, L, HK, x);
         cudaStream_t s0;
         CK(cudaStreamCreateWithFlags(&s0, cudaStreamNonBlocking));
@@ -606,7 +606,7 @@ void bench(int ndev) {
     constexpr int NL = 8;
     std::vector<HostLayer> Ls;
     for (int i = 0; i < NL; ++i) Ls.push_back(make_layer(14, 14, 14, rng));
-    const std::vector<float> x = randn((size_t) kDecMaxT * N, 1.f, rng);
+    const std::vector<float> x = randn((size_t) kVerifyMaxT * N, 1.f, rng);
     for (int dev = 0; dev < ndev; ++dev) {
         cudaDeviceProp p{};
         CK(cudaGetDeviceProperties(&p, dev));

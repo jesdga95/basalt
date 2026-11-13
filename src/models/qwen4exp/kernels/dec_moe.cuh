@@ -1306,14 +1306,14 @@ template<int TY>
 __device__ __forceinline__ void dm_mix_rows_t(const uint8_t* w, size_t rb, int rows, int n_in, const block_q8_1* x, int xs,
                                               int nt, float* out, int ld, int gw, int nw, int lane) {
     const int nbk = n_in / Fmt<TY>::qk;
-    int off[kDecMaxT];
+    int off[kVerifyMaxT];
 #pragma unroll
-    for (int c = 0; c < kDecMaxT; ++c) off[c] = min(c, nt - 1) * xs;
+    for (int c = 0; c < kVerifyMaxT; ++c) off[c] = min(c, nt - 1) * xs;
     for (int r = gw; r < rows; r += nw) {
-        float s[kDecMaxT];
-        row_dot_multi<TY, kDecMaxT>(w + (size_t) r * rb, x, off, nt, nbk, lane, s);
+        float s[kVerifyMaxT];
+        row_dot_multi<TY, kVerifyMaxT>(w + (size_t) r * rb, x, off, nt, nbk, lane, s);
 #pragma unroll
-        for (int c = 0; c < kDecMaxT; ++c)
+        for (int c = 0; c < kVerifyMaxT; ++c)
             if (c < nt && lane == c) out[(size_t) c * ld + r] = s[c];
     }
 }
@@ -1337,16 +1337,16 @@ __device__ __forceinline__ void dm_mix_rows_m_t(const uint8_t* w, size_t rb, int
                                                 int xs, int nt, float* out, int ld, float (*sp)[kDmThreads / 32]) {
     constexpr int WB = kDmThreads / 32;
     const int nbk = n_in / Fmt<TY>::qk, lane = threadIdx.x & 31, wi = threadIdx.x / 32;
-    int off[kDecMaxT];
+    int off[kVerifyMaxT];
 #pragma unroll
-    for (int c = 0; c < kDecMaxT; ++c) off[c] = min(c, nt - 1) * xs;
+    for (int c = 0; c < kVerifyMaxT; ++c) off[c] = min(c, nt - 1) * xs;
     for (int r0 = blockIdx.x * WB; r0 < rows; r0 += gridDim.x * WB) {
         const int r = r0 + wi;
         if (r < rows) {
-            float s[kDecMaxT];
-            row_dot_multi<TY, kDecMaxT>(w + (size_t) r * rb, x, off, nt, nbk, lane, s);
+            float s[kVerifyMaxT];
+            row_dot_multi<TY, kVerifyMaxT>(w + (size_t) r * rb, x, off, nt, nbk, lane, s);
 #pragma unroll
-            for (int c = 0; c < kDecMaxT; ++c)
+            for (int c = 0; c < kVerifyMaxT; ++c)
                 if (c < nt && lane == c) sp[c][wi] = s[c];
         }
         __syncthreads();

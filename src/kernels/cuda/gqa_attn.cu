@@ -1,5 +1,6 @@
 // src/kernels/cuda/gqa_attn.cu - see include/basalt/kernels/gqa_attn.hpp.
 #include "basalt/kernels/gqa_attn.hpp"
+#include "basalt/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -53,9 +54,12 @@ __device__ __forceinline__ int64_t row_lo(const Range& r, int t) {
 // thread (quad, group) over dims 4 quad .. 4 quad + 3 and cells i = group mod PG, the groups added in order; the chunk is
 // folded into the block's running {max, sum, acc[HD]} per head.  Writes that partial (empty when the block had no cells).
 template <int HD>
-__global__ void __launch_bounds__(kDecThreads) decode_chunk_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
-                                                                   const __half* __restrict__ vc, int n_head, int n_kv, Range r,
-                                                                   int n_chunks, float scale, float* __restrict__ part, KvInt8 q8) {
+// (launched through launch_pdl: q and the cache come from the kernels before, read after pdl_wait, so not __restrict__)
+__global__ void __launch_bounds__(kDecThreads) decode_chunk_kernel(const float* q, const __half* kc, const __half* vc, int n_head,
+                                                                   int n_kv, Range r, int n_chunks, float scale, float* part,
+                                                                   KvInt8 q8) {
+    pdl_launch_dependents();
+    pdl_wait();
     constexpr int NQ = HD / 4, PG = kDecThreads / NQ;   // dim quads, cell groups
     static_assert(PG >= 1 && kDecThreads % NQ == 0, "decode attention: thread split");
     __shared__ float s[CHUNK][GMAX + 1];
@@ -222,8 +226,9 @@ __global__ void __launch_bounds__(kDecThreads) decode_chunk_kernel(const float* 
 
 // Block (query head, row t), one thread per dim: the row's splits merged in order.
 template <int HD>
-__global__ void __launch_bounds__(HD) decode_merge_kernel(const float* __restrict__ part, int n_head, int gx,
-                                                          float* __restrict__ out) {
+__global__ void __launch_bounds__(HD) decode_merge_kernel(const float* part, int n_head, int gx, float* out) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const float* p = part + ((int64_t) t * n_head + h) * gx * (HD + 2);
     float m = kNeg;
@@ -246,10 +251,11 @@ void launch_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n
                    float* scratch, int n_chunks, float* out, cudaStream_t s, KvInt8 q8 = {}) {
     const float scale = 1.4426950408889634f / sqrtf((float) HD);
     const int gx = decode_splits(n_chunks);
-    decode_chunk_kernel<HD><<<dim3((unsigned) gx, (unsigned) n_kv, (unsigned) T), kDecThreads, 0, s>>>(
-        q, (const __half*) kc, (const __half*) vc, n_head, n_kv, r, n_chunks, scale, scratch, q8);
+    launch_pdl(decode_chunk_kernel<HD>, dim3((unsigned) gx, (unsigned) n_kv, (unsigned) T), dim3(kDecThreads), 0, s, q,
+               (const __half*) kc, (const __half*) vc, n_head, n_kv, r, n_chunks, scale, scratch, q8);
     check("gqa decode attention");
-    decode_merge_kernel<HD><<<dim3((unsigned) n_head, (unsigned) T), HD, 0, s>>>(scratch, n_head, gx, out);
+    launch_pdl(decode_merge_kernel<HD>, dim3((unsigned) n_head, (unsigned) T), dim3(HD), 0, s, (const float*) scratch, n_head, gx,
+               out);
     check("gqa decode attention/merge");
 }
 

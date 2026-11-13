@@ -300,7 +300,7 @@ __device__ __forceinline__ void commit_drain(const GdnCommitLayers& a, int n, in
     __syncthreads();
     int i = (int) s_c[0], in = (int) s_c[1];
     __syncthreads();
-    CommitPre cur, nxt;
+    CommitPre<kVerifyMaxT> cur, nxt;
     bool cur_state = i < total && i % per_layer < per_state;
     if (cur_state) commit_pre_load(a, per_layer, n, i, cur);
     int unpub = 0;
@@ -417,7 +417,7 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_lazy_kernel(GdnCommitLayer
         if (i >= total) break;
         const int l = i / per_layer, j = i - l * per_layer;
         if (j < per_state) {
-            CommitPre p;
+            CommitPre<kVerifyMaxT> p;
             commit_pre_load(a, per_layer, n, i, p);
             commit_pre_run(a, per_layer, n, i, p);
         } else {
@@ -484,7 +484,7 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_layers_seg_kernel(GdnCommi
     a.gate = s.gate + (size_t) r.row0 * s.h_v; a.beta = s.beta + (size_t) r.row0 * s.h_v;
     a.state_stride = s.state_stride; a.h_stride = s.h_stride; a.gb_stride = s.gb_stride;
     a.C = s.C; a.h_k = s.h_k; a.h_v = s.h_v; a.n_layers = s.n_layers;
-    commit_layers_body(a, n, conv_blocks);
+    commit_layers_body<kVerifyMaxT>(a, n, conv_blocks);
 }
 
 // n tokens from `state` (written back when `write`)

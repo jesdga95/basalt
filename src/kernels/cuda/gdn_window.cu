@@ -72,16 +72,19 @@ __device__ __forceinline__ void stamp(const DecRecArgs& a, int i) {
     a.stamps[blockIdx.x * 10 + i] = t;
 }
 
-// NJ: uint4 of bf16 per lane in an alpha/beta row (its width / 256)
-template<int NJ>
+// the rows a kernel of MAXT rows keeps in shared memory: 8 up to 8 rows (one layout for every narrow window), else MAXT
+__host__ __device__ constexpr int rec_rows(int maxt) { return maxt <= 8 ? 8 : maxt; }
+
+// NJ: uint4 of bf16 per lane in an alpha/beta row (its width / 256); M: rows (rec_rows)
+template<int NJ, int M = 8>
 struct RecSmem {
-    float qn[kDecMaxT][S], kn[kDecMaxT][S];
-    float v[kDecMaxT][32];
-    float oc[kDecMaxT][32];
+    float qn[M][S], kn[M][S];
+    float v[M][32];
+    float oc[M][32];
     float red_kv[RG][32], red_o[RG][32];
-    float part[2][kDecMaxT][RG];   // the q/k L2 partials
-    float g[kDecMaxT], b[kDecMaxT];
-    float wsum[kDecMaxT][4];       // every rank's sum of squares per token, pushed by the ranks
+    float part[2][M][RG];   // the q/k L2 partials
+    float g[M], b[M];
+    float wsum[M][4];       // every rank's sum of squares per token, pushed by the ranks
     uint4 wab[2][32 * NJ];         // the head's alpha and beta rows
 };
 
@@ -169,7 +172,7 @@ __device__ __forceinline__ void rec_sync() {
 // One block of a head's cluster.  `head` = the launch's value head (head_map), `rank` = its column group.  SPLIT: no cluster and no z; the
 // head's raw output goes to a.o for dec_gdn_rec_norm.
 template<int MAXT, int NJ, bool SPLIT, bool SUB = false>
-__device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem<NJ>& sm,
+__device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem<NJ, rec_rows(MAXT)>& sm,
                                           cg::cluster_group* cluster) {
     const int rg = threadIdx.x / 32, lane = threadIdx.x % 32, tid = threadIdx.x;
     stamp(a, 0);
@@ -318,9 +321,12 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     // cluster barrier
     asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
     if (rg == 0) {
-        const int t = lane / 4, r = lane % 4;
-        const float v = __shfl_sync(0xffffffffu, wsum_t, t);
-        if (t < T) *cluster->map_shared_rank(&sm.wsum[t][rank], r) = v;
+#pragma unroll
+        for (int t0 = 0; t0 < MAXT; t0 += 8) {   // eight tokens a pass: lane 4 i + r sends token t0 + i to rank r
+            const int t = t0 + lane / 4, r = lane % 4;
+            const float v = __shfl_sync(0xffffffffu, wsum_t, t & 31);
+            if (t < T) *cluster->map_shared_rank(&sm.wsum[t][rank], r) = v;
+        }
     }
     cluster->sync();
     stamp(a, 7);
@@ -340,14 +346,14 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
 
 template<int MAXT, int NJ>
 __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_kernel(const DecRecArgs a, int T) {
-    __shared__ RecSmem<NJ> sm;
+    __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
     cg::cluster_group cl = cg::this_cluster();
     rec_block<MAXT, NJ, false>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
 }
 
 template<int MAXT, int NJ>
 __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T) {
-    __shared__ RecSmem<NJ> sm;
+    __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
     rec_block<MAXT, NJ, true>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, nullptr);
 }
 
@@ -358,7 +364,7 @@ __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(co
                                                                               size_t state_off) {
     const SegRow r = rows[blockIdx.y];
     if (r.j != 0) return;
-    __shared__ RecSmem<NJ> sm;
+    __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
     cg::cluster_group cl = cg::this_cluster();
     DecRecArgs a = a0;
     const size_t vd = (size_t) S * a.h_v, r0 = (size_t) r.row0;
@@ -406,9 +412,11 @@ bool dec_gdn_rec_supported(int n_embd) { return n_embd == 2560 || n_embd == 5120
 template<template<int, int> class K, class L>
 static void by_width(int n_embd, int max_t, L launch) {
     if (n_embd == 5120) {
-        if (max_t <= 2) launch(K<2, 20>::f); else if (max_t <= 4) launch(K<4, 20>::f); else launch(K<kDecMaxT, 20>::f);
+        if (max_t <= 2) launch(K<2, 20>::f); else if (max_t <= 4) launch(K<4, 20>::f); else if (max_t <= 8) launch(K<8, 20>::f);
+        else launch(K<16, 20>::f);
     } else {
-        if (max_t <= 2) launch(K<2, 10>::f); else if (max_t <= 4) launch(K<4, 10>::f); else launch(K<kDecMaxT, 10>::f);
+        if (max_t <= 2) launch(K<2, 10>::f); else if (max_t <= 4) launch(K<4, 10>::f); else if (max_t <= 8) launch(K<8, 10>::f);
+        else launch(K<16, 10>::f);
     }
 }
 template<int MAXT, int NJ> struct RecK { static constexpr auto f = rec_kernel<MAXT, NJ>; };
