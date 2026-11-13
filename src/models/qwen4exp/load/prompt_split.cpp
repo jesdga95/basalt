@@ -21,6 +21,12 @@ int split_plan(Context& context) {
     // the probes' buffers come and go while the RAM is still free.
     std::vector<std::unique_ptr<PromptStage>> pstages;
     double split_host_gbps = 0;   // the host's bandwidth to the main card and every tier card at once
+    // before any probe or host_plan: those buffers are held while the RAM copy is sized, so a split that
+    // later prices out still costs the experts their place in RAM
+    if (o.no_prompt_split) {
+        basalt::log::info("basalt generate", "prompt split: off (--no-prompt-split)");
+        split_want = false;
+    }
     if (split_want) {
         const char* off = o.peer_exclusive ? "the tier's experts have no RAM copy (--peer-exclusive)"
                         : !o.resident_cpu_experts ? "no RAM copy of the experts" : nullptr;

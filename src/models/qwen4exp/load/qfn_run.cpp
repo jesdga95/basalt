@@ -84,7 +84,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // the prompt-time layer split over the expert tier cards (PromptStage), and the most stages it may use, the main
     // card's included: every card on two cards or on three or more alike ones, none on three or more unlike cards
     // until measured on such a set.  With --batch a read splits only while no slot decodes.
-    bool split_want = o.serve && o.peer_device >= 1;
+    bool split_want = o.serve && o.peer_device >= 1 && !o.no_prompt_split;
     bool split_alike = true;
     for (size_t i = 1; i < chosen_cards.size(); ++i)
         split_alike = split_alike && basalt::program::cards_alike(chosen_cards[0], chosen_cards[i]);
