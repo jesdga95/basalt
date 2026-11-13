@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <map>
 #include <mutex>
 
@@ -146,7 +145,10 @@ Plan plan_for(const Call& c) {
         const int cps = (p.nchunks + ks - 1) / ks, kse = (p.nchunks + cps - 1) / cps;
         if (kse != ks) continue;
         const int64_t items = (int64_t) p.tiles * kse;
-        const double cost = (double) ((items + R - 1) / R) * (cps + (kse > 1 ? sums : 0.0));
+        // plus the tile's last block's walk over the slices' sums, about a quarter chunk a slice at 16 rows (40 slices
+        // of a 256-row matrix cost 15.7 us at T = 16 against 7.7 at 10)
+        const double tail = kse > 1 ? 0.25 * kse : 0.0;
+        const double cost = (double) ((items + R - 1) / R) * (cps + (kse > 1 ? sums : 0.0)) + tail;
         if (cost < best - 1e-9) {
             best = cost;
             p.ks = kse;
