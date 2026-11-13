@@ -294,6 +294,14 @@ void launch_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n
     check("gqa decode attention/merge");
 }
 
+__device__ __forceinline__ void mma16832_u8s8(int (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                              unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+// exact for |v| < 2^22: the integer lands in the mantissa of 1.5 * 2^23
+__device__ __forceinline__ float small_int_to_float(int v) { return __int_as_float(v + 0x4B400000) - 12582912.0f; }
 __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
     const __half2 h = __floats2half2_rn(lo, hi);
     return *reinterpret_cast<const unsigned*>(&h);
@@ -480,34 +488,18 @@ __global__ void __launch_bounds__(PNW * 32) prompt_f16_kernel(const float* __res
 // for the whole sweep, so scores, probabilities and the 256-wide output stay in registers and the only block barrier
 // publishes a key tile.  Keys stream in tiles of 64 cells, K and V double-buffered as raw int8 codes with their scales
 // (16-byte pieces XOR-swizzled by the row).  QK^T: int8 tensor cores, each 64-dim group's integer sum times the query's
-// and the cell's scales in fp32.  P V: V decoded in registers (ldmatrix.trans on byte pairs gives a lane two adjacent
-// cells of two adjacent dims, one fp16 B fragment each for an even-dim and an odd-dim n8 tile; codes widen exactly to
-// fp16 and take their fp16 group scale), fp16 tensor cores summing the 64-cell tile in fp16, added to the fp32 output
-// once per tile.  A partial is at most 64 * 127 * the tile's largest V scale; a tile whose scale passes 8 decodes V
-// with the scales divided by a power of two and multiplies the partial back.  Online softmax in fp32.
+// and the cell's scales in fp32.  P V in 8 bits (Infernix's prompt-pv8): per 64-dim V group, each probability times
+// its cell's group scale, rounded to u8 against its row's largest product over the tile (255 = that maximum); u8 x s8
+// tensor cores sum the stored V codes exactly in int32, and the partial times the row's step joins the fp32 output.
+// Online softmax in fp32.
 //
 // A split launch (gridDim.z > 1) gives each block a contiguous run of its key tiles; the block writes its rows
 // normalized by its own sum with their (max, sum) and prompt_i8_merge_kernel combines the splits.
 constexpr int I8BC = 64;                                   // cells per key tile
 constexpr int I8_TILE = I8BC * HD;                         // bytes of one tile's K (or V) codes
 constexpr int I8_STAGE = 2 * I8_TILE + 2 * I8BC * 4 * 2;   // K, V codes and their fp16 scales
-constexpr float kI8PartialScaleLimit = 8.0f;
 
 template <int W> constexpr int i8_smem() { return W * 16 * HD + 2 * I8_STAGE; }
-
-// One ldmatrix.trans lane of an int8 [cell][dim] tile holds the codes {V[k][d], V[k][d+1], V[k+1][d], V[k+1][d+1]}:
-// returns the fp16 B halves {V[k][d], V[k+1][d]} and {V[k][d+1], V[k+1][d+1]}, each code widened exactly (code ^ 0x80 is
-// code + 128, fp16 0x6400 | byte is 1024 + byte) and multiplied once by its cell's fp16 scale.
-__device__ __forceinline__ void decode_v_pair(unsigned codes, unsigned scales, unsigned& even, unsigned& odd) {
-    const unsigned biased = codes ^ 0x80808080u;
-    const unsigned e = __byte_perm(biased, 0x64646464u, 0x4240), o = __byte_perm(biased, 0x64646464u, 0x4341);
-    const __half2 off = __float2half2_rn(1152.0f);
-    const __half2 s2 = *reinterpret_cast<const __half2*>(&scales);
-    const __half2 ve = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&e), off), s2);
-    const __half2 vo = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&o), off), s2);
-    even = *reinterpret_cast<const unsigned*>(&ve);
-    odd = *reinterpret_cast<const unsigned*>(&vo);
-}
 
 template <int W, bool Split>
 __global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const float* __restrict__ q, int n_head, int n_kv, int pos0,
@@ -689,75 +681,81 @@ __global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const float* __res
         l0 = fmaf(l0, al0, bl0);   // lane-partial; the quad is summed after the sweep
         l1 = fmaf(l1, al1, bl1);
 
-        // the tile's largest V scale bounds its fp16 partials
-        int shift = 0;
-        {
-            const uint4 v8 = *reinterpret_cast<const uint4*>(vs_s + 8 * lane);
-            const __half2 mx2 = __hmax2(__hmax2(__habs2(*reinterpret_cast<const __half2*>(&v8.x)),
-                                                __habs2(*reinterpret_cast<const __half2*>(&v8.y))),
-                                        __hmax2(__habs2(*reinterpret_cast<const __half2*>(&v8.z)),
-                                                __habs2(*reinterpret_cast<const __half2*>(&v8.w))));
-            const float vmax = warp_max(fmaxf(__low2float(mx2), __high2float(mx2)));
-            if (vmax > kI8PartialScaleLimit) {
-                const float bounded = fminf(vmax, 65504.0f);
-                while (ldexpf(bounded, -shift) > kI8PartialScaleLimit) ++shift;
-            }
-        }
-        const __half2 down = __float2half2_rn(ldexpf(1.0f, -shift));
-        const float up = ldexpf(1.0f, shift);
-
-        // O = O * alpha + P V
+        // 8-bit P V (Infernix's prompt-pv8, fast_tiled_mma.cuh): per 64-dim V group, each probability times its
+        // cell's group scale, rounded to u8 against its row's largest product over the tile (255 = that maximum);
+        // u8 x s8 tensor cores sum the stored V codes exactly in int32, and the partial times the row's step joins the
+        // fp32 output.  A k32 step takes the lane's own cells {2t, 2t+1, 8+2t, 9+2t} (+16), as pa holds them.
+        const __half2 origin = __float2half2_rn(1024.0f);
 #pragma unroll
         for (int grp = 0; grp < G4; ++grp) {
-            unsigned vsc[KS][2];   // the group scales of the cells this lane supplies: 16 j + 2 tq (+1), and + 8
+            __half2 prod[KS][4];
+            __half2 mx0 = __float2half2_rn(0.0f), mx1 = mx0;
 #pragma unroll
             for (int j = 0; j < KS; ++j) {
                 const int key = j * 16 + 2 * tq;
-                __half2 lo = __halves2half2(__ushort_as_half(vs_s[key * G4 + grp]), __ushort_as_half(vs_s[(key + 1) * G4 + grp]));
-                __half2 hi = __halves2half2(__ushort_as_half(vs_s[(key + 8) * G4 + grp]),
-                                            __ushort_as_half(vs_s[(key + 9) * G4 + grp]));
-                if (shift) {
-                    lo = __hmul2(lo, down);
-                    hi = __hmul2(hi, down);
+                const __half2 lo = __halves2half2(__ushort_as_half(vs_s[key * G4 + grp]), __ushort_as_half(vs_s[(key + 1) * G4 + grp]));
+                const __half2 hi = __halves2half2(__ushort_as_half(vs_s[(key + 8) * G4 + grp]),
+                                                  __ushort_as_half(vs_s[(key + 9) * G4 + grp]));
+                prod[j][0] = __hmul2(*reinterpret_cast<const __half2*>(&pa[j][0]), lo);
+                prod[j][1] = __hmul2(*reinterpret_cast<const __half2*>(&pa[j][1]), lo);
+                prod[j][2] = __hmul2(*reinterpret_cast<const __half2*>(&pa[j][2]), hi);
+                prod[j][3] = __hmul2(*reinterpret_cast<const __half2*>(&pa[j][3]), hi);
+                mx0 = __hmax2(mx0, __hmax2(prod[j][0], prod[j][2]));
+                mx1 = __hmax2(mx1, __hmax2(prod[j][1], prod[j][3]));
+            }
+            const float rm0 = quad_max(fmaxf(__low2float(mx0), __high2float(mx0)));
+            const float rm1 = quad_max(fmaxf(__low2float(mx1), __high2float(mx1)));
+            // codes rint(product * inverse), the fp16 inverse rounded down so none passes 255; the step is its reciprocal
+            const __half inv0 = __float2half_rd(rm0 > 0.0f ? 255.0f / rm0 : 0.0f);
+            const __half inv1 = __float2half_rd(rm1 > 0.0f ? 255.0f / rm1 : 0.0f);
+            const float step0 = __hgt(inv0, __float2half(0.0f)) ? 1.0f / __half2float(inv0) : 0.0f;
+            const float step1 = __hgt(inv1, __float2half(0.0f)) ? 1.0f / __half2float(inv1) : 0.0f;
+            const __half2 i02 = __half2half2(inv0), i12 = __half2half2(inv1);
+            unsigned a8[2][4];   // fp16 1024 + n holds n in its low byte
+#pragma unroll
+            for (int st = 0; st < 2; ++st) {
+                unsigned qv[2][4];
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int j = 2 * st + h;
+                    const __half2 c0 = __hfma2(prod[j][0], i02, origin), c1 = __hfma2(prod[j][1], i12, origin);
+                    const __half2 c2 = __hfma2(prod[j][2], i02, origin), c3 = __hfma2(prod[j][3], i12, origin);
+                    qv[h][0] = *reinterpret_cast<const unsigned*>(&c0);
+                    qv[h][1] = *reinterpret_cast<const unsigned*>(&c1);
+                    qv[h][2] = *reinterpret_cast<const unsigned*>(&c2);
+                    qv[h][3] = *reinterpret_cast<const unsigned*>(&c3);
                 }
-                vsc[j][0] = *reinterpret_cast<const unsigned*>(&lo);
-                vsc[j][1] = *reinterpret_cast<const unsigned*>(&hi);
+                a8[st][0] = __byte_perm(qv[0][0], qv[0][2], 0x6420);
+                a8[st][1] = __byte_perm(qv[0][1], qv[0][3], 0x6420);
+                a8[st][2] = __byte_perm(qv[1][0], qv[1][2], 0x6420);
+                a8[st][3] = __byte_perm(qv[1][1], qv[1][3], 0x6420);
             }
 #pragma unroll
-            for (int pass = 0; pass < 2; ++pass) {
-                const int db0 = grp * 4 + pass * 2;
-                unsigned h[2][2][2] = {};   // [d block][even, odd dims][C regs]
+            for (int b = 0; b < 4; ++b) {
+                const int db = grp * 4 + b;
+                int ev[4] = {0, 0, 0, 0}, od[4] = {0, 0, 0, 0};
 #pragma unroll
-                for (int j = 0; j < KS; ++j) {
-                    // matrices: cells 16 j + 0..7 and 8..15 of d block db0, then of db0 + 1
-                    const int key = j * 16 + ((a_mat & 1) << 3) + a_rin;
-                    const int ch = db0 + (a_mat >> 1);
+                for (int st = 0; st < 2; ++st) {
+                    // matrices: cells 32 st + 0..7, 8..15, 16..23, 24..31 of d block db; lane (g, t) gets cells
+                    // {2t, 2t+1} at dims {2g, 2g+1}
+                    const int key = st * 32 + (a_mat << 3) + a_rin;
                     unsigned r[4];
-                    ldsm_x4_t(r[0], r[1], r[2], r[3], v_s + key * HD + ((ch ^ (key & 7)) << 4));
-#pragma unroll
-                    for (int b = 0; b < 2; ++b) {
-                        unsigned e_lo, o_lo, e_hi, o_hi;
-                        decode_v_pair(r[2 * b], vsc[j][0], e_lo, o_lo);
-                        decode_v_pair(r[2 * b + 1], vsc[j][1], e_hi, o_hi);
-                        mma16816_h(h[b][0], pa[j][0], pa[j][1], pa[j][2], pa[j][3], e_lo, e_hi);
-                        mma16816_h(h[b][1], pa[j][0], pa[j][1], pa[j][2], pa[j][3], o_lo, o_hi);
-                    }
+                    ldsm_x4_t(r[0], r[1], r[2], r[3], v_s + key * HD + ((db ^ (key & 7)) << 4));
+                    mma16832_u8s8(ev, a8[st][0], a8[st][1], a8[st][2], a8[st][3], __byte_perm(r[0], r[1], 0x6420),
+                                  __byte_perm(r[2], r[3], 0x6420));
+                    mma16832_u8s8(od, a8[st][0], a8[st][1], a8[st][2], a8[st][3], __byte_perm(r[0], r[1], 0x7531),
+                                  __byte_perm(r[2], r[3], 0x7531));
                 }
-#pragma unroll
-                for (int b = 0; b < 2; ++b)
-#pragma unroll
-                    for (int p = 0; p < 2; ++p) {
-                        float (&a)[4] = acc[db0 + b][p];
-                        float2 r0 = __half22float2(*reinterpret_cast<const __half2*>(&h[b][p][0]));
-                        float2 r1 = __half22float2(*reinterpret_cast<const __half2*>(&h[b][p][1]));
-                        if (shift) {
-                            r0.x *= up; r0.y *= up; r1.x *= up; r1.y *= up;
-                        }
-                        a[0] = fmaf(a[0], al0, r0.x);
-                        a[1] = fmaf(a[1], al0, r0.y);
-                        a[2] = fmaf(a[2], al1, r1.x);
-                        a[3] = fmaf(a[3], al1, r1.y);
-                    }
+                float (&e)[4] = acc[db][0];
+                float (&o)[4] = acc[db][1];
+                e[0] = fmaf(e[0], al0, step0 * small_int_to_float(ev[0]));
+                e[1] = fmaf(e[1], al0, step0 * small_int_to_float(ev[1]));
+                e[2] = fmaf(e[2], al1, step1 * small_int_to_float(ev[2]));
+                e[3] = fmaf(e[3], al1, step1 * small_int_to_float(ev[3]));
+                o[0] = fmaf(o[0], al0, step0 * small_int_to_float(od[0]));
+                o[1] = fmaf(o[1], al0, step0 * small_int_to_float(od[1]));
+                o[2] = fmaf(o[2], al1, step1 * small_int_to_float(od[2]));
+                o[3] = fmaf(o[3], al1, step1 * small_int_to_float(od[3]));
             }
         }
     }

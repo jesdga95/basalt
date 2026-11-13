@@ -38,8 +38,13 @@ What the dense stack computes in, where it rounds, and what that costs against t
   order.
   Prompt chunks, fp16 cache: QK^T with fp16 q and k on tensor cores, fp32 accumulation; P V with fp16 p and v, each tile of
   32 cells summed in fp16 and added to the fp32 output. int8 cache: q rounded to int8 per 64 values (amax / 127), each
-  64-value group's integer sum times both scales in fp32; P V with fp16 p and fp16 code x scale, each tile of 64 cells
-  summed in fp16 into the fp32 output; long prompts split the cells and merge the splits in fp32. Softmax in fp32.
+  64-value group's integer sum times both scales in fp32; P V in 8 bits (Infernix's prompt-pv8): per 64-value V group
+  each probability times its cell's fp16 scale, rounded to u8 against the row's largest product in the 64-cell tile
+  (255 = that maximum), times the stored V codes on the int8 tensor cores with exact int32 sums, scaled back into the
+  fp32 output; long prompts split the cells and merge the splits in fp32. Softmax in fp32. Measured against serial
+  decode (the prompt path vs the same prompt one token at a time, int8 KV, natural text): KL 0.019 at 16,023 tokens and
+  0.006 at 64,023 (FP16 P V: 0.027 and 0.013), the same next token. The quality gate below runs fp16 KV, so it does
+  not reach this path.
 - **Residual and norms:** fp32.
 
 ## Quality against BF16
