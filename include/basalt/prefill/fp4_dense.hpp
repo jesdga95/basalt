@@ -11,8 +11,8 @@
 // Each token has its own FP32 scale gs[t] = amax / (6 * 448), applied in the product's epilogue.
 //
 // Every output keeps one K order whatever the number of tokens, so a token's row is the same bits at any chunk length.
-// Shapes: weight rows a multiple of 128, K a multiple of 256, tokens >= 1.  Output is token-major FP32, dst[t * ld + r];
-// dst and ld must be even (float2 stores).
+// Shapes: weight rows a multiple of 128, K a multiple of 256, tokens >= 1.  Output is token-major, dst[t * ld + r] (FP32,
+// SwiGLU's BF16); ld must be even (pair stores).
 #pragma once
 
 #include <cstddef>
@@ -28,9 +28,9 @@ size_t act_bytes(int64_t rows, int64_t cols);
 /// gs[rows].
 void quantize(const float* x, int64_t rows, int64_t cols, int64_t ld, void* act, float* gs, void* stream);
 /// As quantize, of the RMSNorm'd rows x * rsqrt(mean(x^2) + eps) * w (rows `cols` apart); xn (optional) gets the normed rows.
-/// As quantize, with each row's largest |value| given (rowmax[rows], e.g. from swiglu's amax), so the rows are read once:
-/// the same codes and scales.
-void quantize_amax(const float* x, const float* rowmax, int64_t rows, int64_t cols, int64_t ld, void* act, float* gs,
+/// As quantize, of BF16 rows (swiglu's output), with each row's largest |value| given (rowmax[rows], swiglu's amax), so the
+/// rows are read once: quantize's codes and scales of the same values.
+void quantize_amax(const uint16_t* x, const float* rowmax, int64_t rows, int64_t cols, int64_t ld, void* act, float* gs,
                    void* stream);
 void rms_norm_quantize(const float* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* gs, float* xn,
                        void* stream);
@@ -40,11 +40,11 @@ void rms_norm_quantize(const float* x, const float* w, float eps, int64_t rows, 
 void product(const void* w, const float* w_scale, int64_t rows, int64_t K, const void* act, const float* gs,
              int64_t tokens, float* dst, int64_t ld, bool add, void* stream);
 
-/// dst[t * ld + r] = silu(s_gate * g) * (s_up * u), g and u the products of gate / up (two plane matrices of rows x K,
-/// the gate and up scales on the device) with the token's scale applied to both; r < rows.
-/// amax (optional, `tokens` floats): each token's largest |output|, for quantize_amax.
+/// dst[t * ld + r] = silu(s_gate * g) * (s_up * u) rounded to BF16 (dst holds the BF16 bits), g and u the products of
+/// gate / up (two plane matrices of rows x K, the gate and up scales on the device) with the token's scale applied to both;
+/// r < rows.  amax (optional, `tokens` floats): each token's largest |output| as stored, for quantize_amax.
 void swiglu(const void* w_gate, const void* w_up, const float* s_gate, const float* s_up, int64_t rows, int64_t K,
-            const void* act, const float* gs, int64_t tokens, float* dst, int64_t ld, void* stream,
+            const void* act, const float* gs, int64_t tokens, uint16_t* dst, int64_t ld, void* stream,
             float* amax = nullptr);
 
 }  // namespace basalt::prefill::fp4_dense
