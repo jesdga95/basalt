@@ -44,5 +44,5 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 
 ## Limits
 
-- Slots decode one after another: `--parallel` adds throughput only through drafting and overlap, not batched products.
+- Slots whose windows fit the 8-row tile together (up to 8 slots plain, fewer with drafts) share one pass through the weights each round; a window that does not fit takes a pass of its own. Drafting passes and prompt reads run per slot.
 - No layer split and no second-card drafting.
