@@ -15,14 +15,15 @@ What the dense stack computes in, where it rounds, and what that costs against t
 
 ## Where each stage rounds
 
-- **Products:** NVFP4 matrices (MLP, head): activations rounded to q8_1 (32 values, fp16 scale) and multiplied on int8 tensor
-  cores (llama.cpp's MMQ) in decode windows and prompt chunks below 1,024 rows; from 1,024 rows the MLP runs W4A4 (below).
-  An NVFP4 matrix's FP32 scale is applied to its fp32 output. F8_E4M3 projections: in prompt chunks the activations are
+- **Products:** NVFP4 matrices (MLP, head): in decode windows each E2M1 code times its UE4M3 group scale is converted to fp16
+  exactly and multiplied by fp16 activations (each row scaled by a power of two) with fp32 accumulation; prompt chunks run
+  the MLP W4A4 (below). An NVFP4 matrix's FP32 scale is applied to its fp32 output. F8_E4M3 projections: in prompt chunks the activations are
   rounded to E4M3 once per row (scale amax / 448) and multiplied on FP8 tensor cores (W8A8, as NVIDIA's checkpoint
   specifies; its static input_scale is not used); in decode windows the codes are converted to fp16 exactly and multiplied by
   fp16 activations (each row scaled by a power of two) with fp32 accumulation. Both apply the matrix's FP32 scale at the end.
-- **Decode windows** run with one 8-row tile whatever their rows, so a token's arithmetic is the same in a drafted window and in
-  plain decoding: greedy output with drafting is bitwise plain greedy, alone or beside other slots. Tokens read through the
+- **Decode windows:** a row's products are summed in K slices fixed by the matrix's shape and added in order, and the
+  attention splits a row's cells by position alone, so a token's arithmetic is the same in a drafted window and in plain
+  decoding: greedy output with drafting is bitwise plain greedy, alone or beside other slots. Tokens read through the
   prompt path round differently from decoded ones, so this holds where every request reads the same prompt the same way. A
   thinking budget stops the engine on its last token and the answer continues the engine's own state, so it holds there too.
   When the server cuts off a thinking loop, the tokens the engine wrote past the cut are read again through the prompt path,
@@ -31,7 +32,8 @@ What the dense stack computes in, where it rounds, and what that costs against t
   rule with q/k in BF16 and the state in fp32 (shared with Flash-Next). The prompt's a/b projections (BF16 weights) take the
   normed rows as two tf32 terms on tensor cores (about fp32's precision).
 - **Attention:** K and V stored fp16, or with `--kv int8` as int8 codes and an fp16 scale per 64 values (amax / 127, codes rounded
-  to nearest against the stored scale). Decode reads them with fp32 dot products and softmax (int8: code x scale in fp32).
+  to nearest against the stored scale). Decode reads them with fp32 dot products and softmax (int8: code x scale in fp32), in chunks of 64 cells folded in a fixed
+  order.
   Prompt chunks: QK^T with fp16 q and k on tensor cores, fp32 accumulation (int8: q rounded to int8 per 64 values, amax / 127,
   and each 64-value group's integer sum times both scales in fp32); softmax in fp32; P V with fp16 p and v on tensor cores,
   each tile of 32 cells summed in fp16 and added to the fp32 output (int8: code x scale rounded to fp16).

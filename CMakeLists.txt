@@ -193,7 +193,7 @@ target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deeps
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it
 add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp)
 target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
-target_link_libraries(dense PUBLIC model kernels mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
+target_link_libraries(dense PUBLIC model kernels window_gemm mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
 add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
 target_include_directories(model_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
 target_link_libraries(model_qwen35 PUBLIC model tokenizer dense core ${_gpu_runtime_target})
@@ -345,7 +345,6 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/gdn_prompt.cu
                         src/kernels/cuda/dense_ops.cu
                         src/kernels/cuda/gqa_attn.cu
-                        src/kernels/cuda/fp8_window.cu
                         src/kernels/cuda/nvfp4_planes.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
@@ -688,10 +687,10 @@ add_executable(nvfp4_planes_test tests/kernels/nvfp4_planes_test.cpp)
 target_link_libraries(nvfp4_planes_test PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME nvfp4_planes_test COMMAND nvfp4_planes_test)
 set_tests_properties(nvfp4_planes_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
-add_executable(fp8_window_parity tests/kernels/fp8_window_parity.cpp)
-target_link_libraries(fp8_window_parity PRIVATE kernels ${_gpu_runtime_target})
-basalt_gpu_test(NAME fp8_window_parity COMMAND fp8_window_parity)
-set_tests_properties(fp8_window_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+add_executable(window_gemm_parity tests/kernels/window_gemm_parity.cpp)
+target_link_libraries(window_gemm_parity PRIVATE window_gemm kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME window_gemm_parity COMMAND window_gemm_parity)
+set_tests_properties(window_gemm_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 add_executable(gqa_attn_parity tests/kernels/gqa_attn_parity.cpp)
 target_link_libraries(gqa_attn_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gqa_attn_parity COMMAND gqa_attn_parity)
@@ -1449,6 +1448,12 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME fp8_gemm_test COMMAND fp8_gemm_test)
   set_tests_properties(fp8_gemm_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
+# a decode window's products against FP8 and NVFP4 matrices (the NVFP4 codes convert with sm_120a instructions)
+add_library(window_gemm STATIC src/kernels/cuda/window_gemm.cu src/kernels/cuda/window_gemm_f8.cu
+                               src/kernels/cuda/window_gemm_nvfp4.cu)
+set_target_properties(window_gemm PROPERTIES CUDA_ARCHITECTURES 120a-real)
+target_include_directories(window_gemm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(window_gemm PUBLIC core ${_gpu_runtime_target})
 add_library(prefill_fp4 STATIC src/prefill/moe_fp4.cu src/prefill/fp4_dense.cu)
 set_target_properties(prefill_fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
 target_include_directories(prefill_fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

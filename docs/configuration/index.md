@@ -136,7 +136,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | --- | --- | --- | --- | --- |
 | `spec` | engine | integer | 8 (MTP), 6 (DSpark), else 0 | Verify windows of at most N tokens. `0` or `1` turns it off. |
 | `draft-experts` | engine | 32, 64, 96, 128, or 0 | 32 | DeepSeek only. Experts each drafter stage keeps (`0` = all 128). |
-| `suffix-draft` | engine | tokens | 3 (`0` = MTP only) | Flash-Next only. Prompt lookup: fill a window from an earlier repeat of at least N tokens. |
+| `suffix-draft` | engine | tokens | 3 (`0` = the drafter only) | Flash-Next and Qwen3.8-27B. Prompt lookup: fill a window from an earlier repeat of at least N tokens. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Flash-Next only. Caps the MTP's own windows. |
 | `mtp-window` | engine | cells | 32768 (`0` = all) | Flash-Next only. The drafter attends to the last N cells. |
 | `relaxed-drafting` | engine (`[P]`) | `true` or 0 to 1 | off | Flash-Next only. **Changes output.** Under sampling, keeps a draft the model gives probability P or more. Greedy, `logit_bias`, JSON and tool calls stay exact. [precision](../precision/qwen38-flash-next.md#relaxed-drafting) |

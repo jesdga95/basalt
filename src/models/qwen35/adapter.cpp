@@ -345,20 +345,6 @@ private:
         l.cols = cols;
         l.w = upload(gg, *t, err);
         if (!l.w) return false;
-        if (type == kTypeNvfp4Planes) {
-            // The products still read ggml blocks: the planes become blocks in place (same bytes) until they read planes.
-            const size_t n = kernels::nvfp4p::bytes(rows, cols);
-            void* tmp = nullptr;
-            if (cudaMalloc(&tmp, n) != cudaSuccess || cudaMemcpy(tmp, l.w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) {
-                if (tmp) cudaFree(tmp);
-                err = "qwen35: no device memory to lay out " + base + ".weight";
-                return false;
-            }
-            kernels::nvfp4p::to_blocks(tmp, rows, cols, const_cast<void*>(l.w), nullptr);
-            cudaDeviceSynchronize();
-            cudaFree(tmp);
-            l.type = kTypeNvfp4;
-        }
         if (type == kTypeNvfp4Planes || type == kTypeF8) {
             l.scale = floats(gg, base + ".scale", 1, err);
             if (!l.scale) return false;
@@ -406,6 +392,7 @@ public:
         else if (a == "--diag-drafter") { drafter_choice() = args.next("--diag-drafter"); }
         else if (a == "--diag-fp4-rows") fp4_rows() = std::max(1, std::atoi(args.next("--diag-fp4-rows")));
         else if (a == "--kv") o.kv = args.next("--kv");
+        else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
         return true;

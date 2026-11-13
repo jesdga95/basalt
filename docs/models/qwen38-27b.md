@@ -34,8 +34,9 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
 ## Drafting
 
 On by default with the pack's drafter; `--spec N` caps the window (default 8), `--spec 0` turns it off. With the block drafter
-one pass proposes up to 7 tokens; without it the MTP layer drafts one token per step. Output is exactly plain decoding's: every
-window, drafted or not, runs its products with one 8-row tile, so a row's arithmetic does not depend on the window.
+one pass proposes up to 7 tokens; without it the MTP layer drafts one token per step. `--suffix-draft N` (default 3, `0` = off)
+also fills a window from an earlier repeat of at least N tokens in the context, where the draft policy expects it to pay.
+Output is exactly plain decoding's: a row's arithmetic does not depend on the window's rows, drafted or not, alone or batched.
 
 ## Images and video
 
@@ -44,5 +45,5 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 
 ## Limits
 
-- Slots whose windows fit the 8-row tile together (up to 8 slots plain, fewer with drafts) share one pass through the weights each round; a window that does not fit takes a pass of its own. Drafting passes and prompt reads run per slot.
+- Slots whose windows fit 16 rows together (up to 16 slots plain, two slots of 8-row drafted windows) share one pass through the weights each round, and their block drafters run two blocks a pass; a window that does not fit takes a pass of its own. Prompt reads run per slot.
 - No layer split and no second-card drafting.
