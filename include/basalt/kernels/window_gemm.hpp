@@ -1,13 +1,11 @@
 // include/basalt/kernels/window_gemm.hpp - the weight products of a decode window: up to 16 activation rows against an
-// FP8 E4M3 matrix or an NVFP4 matrix in planes (nvfp4_planes.hpp), the matrix read once at memory speed.
+// FP8 E4M3 matrix, an NVFP4 matrix in planes (nvfp4_planes.hpp) or a BF16 matrix, the matrix read once at memory speed.
 //
-// Activations: fp16, each row scaled by a power of two so its largest value sits in [2^14, 2^15) (pack); the power comes
-// back out after the product, exactly.  Weights: E4M3 codes, or E2M1 codes times their UE4M3 group scale, converted to
-// fp16 in registers (both exact).  Products: mma m16n8k16 (fp16 in, fp32 accumulate) with the window's rows as the
-// columns, 8 per mma.  A column's sums never meet another column's, and the order of a row's sums (fixed chunks of K in
-// order within a K slice, the slices added in slice order) depends only on the shapes of the call's matrices: a row's
-// bits do not depend on T or on what the other rows hold, so a drafted or batched window gives the same rows as plain
-// decoding.
+// Activations: bf16 rows.  Weights: E4M3 codes, or E2M1 codes times their UE4M3 group scale, converted to bf16 in registers
+// (both exact).  Products: mma m16n8k16 (bf16 in, fp32 accumulate) with the window's rows as the columns, 8 per mma.  A
+// column's sums never meet another column's, and the order of a row's sums (fixed chunks of K in order within a K slice,
+// the slices added in slice order) depends only on the shapes of the call's matrices: a row's bits do not depend on T or
+// on what the other rows hold, so a drafted or batched window gives the same rows as plain decoding.
 //
 // Products start as programmatic dependents inside a PdlScope (pdl.hpp): each stages its first weights before it waits
 // for the kernel before it.
@@ -19,20 +17,16 @@ namespace basalt::kernels::wgemm {
 
 constexpr int kRows = 16;   // rows a window holds
 
-enum class Format { F8, Nvfp4 };
+enum class Format { F8, Nvfp4, Bf16 };
 
-/// Bytes of a window's packed activations for K values per row: [16][K] fp16, then 16 fp32 output factors (2^-e).
+/// Bytes of a window's activations for K values per row: [16][K] bf16.
 std::size_t act_bytes(int64_t K);
 
-/// Rows 0..T-1 of x (row t at x + t * ld_x, K values, K a multiple of 128) packed into `act`.
+/// Rows 0..T-1 of x (row t at x + t * ld_x, K values) as bf16 rows in `act`.
 void pack(const float* x, int64_t ld_x, int64_t K, int T, void* act, void* stream);
 /// The RMS norm of rows 0..T-1 of x ([T][K], weights w, any offset folded) packed into `act`; with `xn` the normed fp32
-/// rows too.  Bitwise rms_norm_rows followed by pack.
+/// rows too (bitwise rms_norm_rows).
 void norm_pack(const float* x, const float* w, float eps, int64_t K, int T, void* act, float* xn, void* stream);
-/// A gated attention layer's output rows: attn [T][n_head][256] times sigmoid of each head's gate (q_full [T][n_head][512],
-/// the second half), packed into `act`.  Bitwise attn_gate followed by pack.
-void gate_pack(const float* attn, const float* q_full, int T, int n_head, void* act, void* stream);
-
 /// The device scratch for split-K sums, sized with workspace_need over every call a model makes.
 struct Workspace {
     float* partial = nullptr;    // [slices][16][rows] of the product in flight
@@ -47,6 +41,8 @@ struct Matrix {
     const float* scale = nullptr;
     float* y = nullptr;
     int64_t ld_y = 0;
+    const uint8_t* scales = nullptr;   // NVFP4: the scale plane when `rows` are the first rows of a larger matrix (null: after
+                                       // the codes of these rows)
 };
 
 enum class Epilogue {
@@ -64,6 +60,7 @@ struct Call {
     Matrix m[kMaxMatrices];
     int n = 1;
     Epilogue epi = Epilogue::Store;
+    void* act_out = nullptr;   // SwiGLU: h also as bf16 rows for the next product ([16][rows], act_bytes(rows)); m[0].y may be null
 };
 
 /// The workspace a call needs (its shape only).

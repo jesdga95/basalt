@@ -16,6 +16,7 @@
 
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -143,6 +144,7 @@ __device__ __forceinline__ void norm_q8(const DecRecArgs& a, int t, int head, in
     const float act = a.gate_act == GdnGate::Silu ? z / (1.0f + __expf(-z)) : 1.0f / (1.0f + __expf(-z));
     const float yv = oc * scale * gam * act;
     if (a.y) a.y[(size_t) t * value_dim + head * S + col] = yv;
+    if (a.y16) a.y16[(size_t) t * value_dim + head * S + col] = __bfloat16_as_ushort(__float2bfloat16_rn(yv));
     float amax = fabsf(yv), sum = yv;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -372,6 +374,7 @@ __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(co
     a.qkv += r0 * a.C; a.x += r0 * a.n_embd; a.z += r0 * vd; a.h += r0 * a.C;
     a.gate += r0 * a.h_v; a.beta += r0 * a.h_v;
     if (a.y) a.y += r0 * vd;
+    if (a.y16) a.y16 += r0 * vd;
     a.yq = static_cast<char*>(a.yq) + r0 * (vd / 32) * sizeof(Q81);
     rec_block<MAXT, NJ, false>(a, r.n, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
 }
