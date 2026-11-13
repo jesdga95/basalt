@@ -21,6 +21,15 @@ void scale_values(float* y, const float* scale, int64_t n, void* stream);
 /// h[i] = silu(g[i] * sg) * (u[i] * su)  (n values; g, u and h may each have their own row stride: rows x width).
 void swiglu_scaled(const float* g, const float* u, const float* sg, const float* su, float* h, int64_t rows,
                    int64_t width, int64_t ld_gu, void* stream);
+/// Where one decode-window row of a gated delta-net layer goes in its session: the row of layer 0 in the session's store of
+/// the window's rows (qkv, conv output, gate, beta), each a [kWindow rows][C or h_v] block per layer.
+struct GdnRowDst {
+    float *qkv, *h, *gate, *beta;
+};
+/// A batched window's rows of layer `layer` (computed packed, row r at qkv + r * C, h + r * C, gate / beta + r * h_v) copied
+/// to each row's own session: dst[r] + layer * window_rows * (C or h_v).  Bitwise copies.
+void gdn_rows_scatter(const GdnRowDst* dst, int n_rows, const float* qkv, const float* h, const float* gate, const float* beta,
+                      int C, int h_v, int64_t layer, int window_rows, void* stream);
 /// y[t][n] = x[t] . w[n]  for BF16 rows w [N][K]: the small BF16 projections of a prompt chunk.
 void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64_t N, int64_t K, void* stream);
 

@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace basalt::vision {
@@ -35,6 +36,14 @@ private:
     size_t size_ = 0, used_ = 0;
 };
 
+/// A batch window's device table: per window row its GDN segment, where its GDN rows go in its session, per segment its
+/// first cell.
+struct BatchTable {
+    kernels::SegRow seg[kWindow];
+    kernels::GdnRowDst dst[kWindow];
+    int32_t pos0[kWindow];
+};
+
 /// The decode window's scratch (kWindow rows).
 struct WindowScratch {
     float *x = nullptr, *xn = nullptr, *tmp = nullptr;
@@ -49,6 +58,9 @@ struct WindowScratch {
     float *y = nullptr, *hl = nullptr;           // the GDN output rows; the drafter's head rows
     int32_t *iota = nullptr, *bounds = nullptr;  // the products' row map and the window's rows
     int32_t* pos0 = nullptr;                     // the window's first cell (device), read by its attention
+    // a batch window's: the packed GDN rows of the layer in hand (before they go to each session), its table
+    float *rq = nullptr, *rh = nullptr, *rgate = nullptr, *rbeta = nullptr;
+    BatchTable* btab = nullptr;
     // the block drafter's: its rows' q, k, v, attention and convolution coefficients, the selector's projection
     float *bq = nullptr, *bk = nullptr, *bv = nullptr, *bqo = nullptr, *bao = nullptr, *dyn = nullptr, *bh = nullptr;
     float *battn = nullptr, *blp = nullptr, *bsel = nullptr;
@@ -72,6 +84,8 @@ struct ChunkScratch {
     int32_t *tok = nullptr, *pos = nullptr, *iota = nullptr, *bounds = nullptr;
 };
 
+struct SessionState;
+
 class Model {
 public:
     Geometry g;
@@ -83,6 +97,16 @@ public:
     bool chunk_ready = false;
     std::unique_ptr<prefill::mmq::Context> mmq;
     std::vector<int> gdn_index, attn_index;      // per layer: its index among the GDN or attention layers (-1)
+    // the batch windows' graphs, one per composition (the sessions in the window and their rows), the least recently used out
+    using BatchKey = std::vector<std::pair<const SessionState*, int>>;
+    struct BatchGraph {
+        BatchKey key;
+        cudaGraphExec_t exec = nullptr;
+        uint64_t used = 0;
+    };
+    static constexpr size_t kBatchGraphs = 64;
+    std::vector<BatchGraph> batch_graphs;
+    uint64_t batch_clock = 0;
     std::unique_ptr<vision::Mmproj> mmproj;
     std::unique_ptr<vision::CudaEncoder> encoder;
     void* enc_arena = nullptr;
@@ -132,6 +156,15 @@ struct SessionState {
 /// st.logits and the GDN rows for the commit.
 bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3,
                     std::string& err);
+/// One window of S sessions as one batch: segment k is segs[k].T rows (tokens and pos3 [row][3] packed in segment order, at
+/// most kWindow rows in all) at cells segs[k].pos.. of its session.  Each session is left as after its own forward_window
+/// (logits, the GDN rows for its commit, the drafter's rows); runs on the first session's stream.
+struct BatchSeg {
+    SessionState* st = nullptr;
+    int T = 0;
+    int64_t pos = 0;
+};
+bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err);
 /// Runs a prompt chunk; rows are token embeddings, or `rows` (fp32 [T][n_embd]) when given.  `pos3` [T][3].
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
                    const int32_t* pos3, std::string& err);
