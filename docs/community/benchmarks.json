@@ -1101,8 +1101,8 @@
     },
     {
       "submitter": "wadeubuntu",
-      "date": "2026-11-05",
-      "commit": "dc047a77be",
+      "date": "2026-11-12",
+      "commit": "17579fbc6a",
       "preset": "community-1",
       "model": "Qwen3.8-Flash-Next",
       "gpus": [
@@ -1111,18 +1111,28 @@
           "vram_gib": 16,
           "power_w": 360,
           "pcie": "5.0 x16",
-          "h2d_gbps": 26.1
+          "h2d_gbps": 29.2
         }
       ],
       "ram_gib": 61,
       "cpu": "13th Gen Intel Core i7-13700K, 16 cores",
-      "ram_gbps": 69.4,
+      "ram_gbps": 90.7,
       "os": "Linux",
       "quant": "IQ3_S",
       "kv": "int8",
-      "prefill_16k_tps": 4730.4,
-      "prefill_64k_tps": 5045.3,
-      "decode_tps": 192.3
+      "prefill_16k_tps": 4826.8,
+      "prefill_64k_tps": 5102.7,
+      "decode_tps": 218.6,
+      "decode_conv_tps": 157.4,
+      "decode_struct_tps": 248.7,
+      "decode_prose_tps": 158.2,
+      "accept_conv_pct": 72.9,
+      "accept_struct_pct": 95.9,
+      "accept_prose_pct": 66.9,
+      "draft_len_conv": 2.7,
+      "draft_len_struct": 6.7,
+      "draft_len_prose": 1.9,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     },
     {
       "submitter": "polygizer",
