@@ -82,6 +82,7 @@ WIDTH_OK = {
     "src/program/cli/help.cpp": "2560 MiB, a RAM floor",
     "src/kernels/cuda/gu2.cuh": "a shared kernel's instance for this width; other widths take the other path",
     "src/kernels/cuda/gdn_window.cu": "the block widths the GDN window kernel is instantiated for; others are refused",
+    "src/prefill/moe_fp4.cu": "the row widths the FP4 quantizer is instantiated for; others are refused",
     "src/prefill/moe_mmq.cu": "the Q2_0 blob layout of that format's instance",
     "include/basalt/prefill/moe_mmq.hpp": "the Q2_0 blob layout of that format's instance",
     "include/basalt/kernels/cpu/expert.hpp": "the capacity of the Q8_1 activation block, not a model width",

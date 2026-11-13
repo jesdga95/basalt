@@ -11,7 +11,7 @@
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
-#include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/prefill/peer_share.hpp"
 #include "basalt/log.hpp"
