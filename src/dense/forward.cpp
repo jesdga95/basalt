@@ -197,12 +197,12 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim;
-    kernels::rms_norm_rows(b.x, L.attn_norm, b.xn, T, H, g.eps, s);
-    if (all_f8({&L.q, &L.k, &L.v})) {   // one FP8 product for q, k and v
-        prefill::fp8::quantize(b.xn, T, H, H, b.xq, s);
+    if (all_f8({&L.q, &L.k, &L.v})) {   // the norm in the quantizer, one FP8 product for q, k and v
+        prefill::fp8::rms_norm_quantize(b.x, L.attn_norm, g.eps, T, H, b.xq, nullptr, s);
         const prefill::fp8::Segment seg[3] = {f8_seg(L.q, b.qfull), f8_seg(L.k, b.k), f8_seg(L.v, b.v)};
         prefill::fp8::gemm_segmented(seg, 3, H, b.xq, T, prefill::fp8::Epilogue::Store, s);
     } else {
+        kernels::rms_norm_rows(b.x, L.attn_norm, b.xn, T, H, g.eps, s);
         quantize_mmq(b.xn, b.xq, L.q.type, H, T, s);
         gemm(m, L.q, b.xq, b.qfull, T, s);
         if (L.k.type != L.q.type) quantize_mmq(b.xn, b.xq, L.k.type, H, T, s);
@@ -223,12 +223,12 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
     const int H = g.n_embd, VD = g.value_width(), HV = g.gdn_v_heads;
     float* state = st.gdn + (size_t) gi * st.gdn_floats;
     float* hist = state + (size_t) g.gdn_state * HV * g.gdn_state;
-    kernels::rms_norm_rows(b.x, L.attn_norm, b.xn, T, H, g.eps, s);
-    if (all_f8({&L.qkv, &L.z})) {   // one FP8 product for qkv and z
-        prefill::fp8::quantize(b.xn, T, H, H, b.xq, s);
+    if (all_f8({&L.qkv, &L.z})) {   // the norm in the quantizer (the normed rows kept for a/b), one product for qkv and z
+        prefill::fp8::rms_norm_quantize(b.x, L.attn_norm, g.eps, T, H, b.xq, b.xn, s);
         const prefill::fp8::Segment seg[2] = {f8_seg(L.qkv, b.qkv), f8_seg(L.z, b.z)};
         prefill::fp8::gemm_segmented(seg, 2, H, b.xq, T, prefill::fp8::Epilogue::Store, s);
     } else {
+        kernels::rms_norm_rows(b.x, L.attn_norm, b.xn, T, H, g.eps, s);
         quantize_mmq(b.xn, b.xq, L.qkv.type, H, T, s);
         gemm(m, L.qkv, b.xq, b.qkv, T, s);
         if (L.z.type != L.qkv.type) quantize_mmq(b.xn, b.xq, L.z.type, H, T, s);
@@ -284,15 +284,16 @@ void chunk_ffn(Model& m, const Layer& L, int il, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd;
-    kernels::rms_norm_rows(b.x, L.ffn_norm, b.xn, T, H, g.eps, s);
     if (L.gate.type == kTypeNvfp4Planes && L.up.type == kTypeNvfp4Planes && L.down.type == kTypeNvfp4Planes) {
-        // NVFP4 planes: W4A4 on the TMA products, gate and up as one SwiGLU product, the residual added by down's
-        prefill::fp4_dense::quantize(b.xn, T, H, H, b.a4, b.gs, s);
+        // NVFP4 planes: the norm in the quantizer, W4A4 on the TMA products, gate and up as one SwiGLU product, the residual
+        // added by down's
+        prefill::fp4_dense::rms_norm_quantize(b.x, L.ffn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
         prefill::fp4_dense::swiglu(L.gate.w, L.up.w, L.gate.scale, L.up.scale, L.gate.rows, H, b.a4, b.gs, T, b.h, g.n_ff, s);
         prefill::fp4_dense::quantize(b.h, T, g.n_ff, g.n_ff, b.a4, b.gs, s);
         prefill::fp4_dense::product(L.down.w, L.down.scale, L.down.rows, g.n_ff, b.a4, b.gs, T, b.x, H, true, s);
         return;
     }
+    kernels::rms_norm_rows(b.x, L.ffn_norm, b.xn, T, H, g.eps, s);
     if (T >= m.o.fp4_rows && L.gate.type == 40 && L.up.type == 40 && L.down.type == 40) {   // a long chunk: W4A4
         fp4_quant(m, b.xn, H, T, s);
         gemm_fp4_swiglu(m, L, il, b.h, T, s);

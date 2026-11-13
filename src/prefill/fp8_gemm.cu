@@ -199,14 +199,46 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
 size_t scale_off(int64_t rows, int64_t cols) { return ((size_t) rows * (size_t) cols + 15) & ~(size_t) 15; }
 
 // One block per row: amax over the row, then E4M3 codes of x * 448 / amax (saturating, round to nearest even).
+// NORM: the row is RMSNorm'd first (x * rsqrt(mean(x^2) + eps) * nw), the normed row optionally written to xn.
+template <bool NORM>
 __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__ x, int64_t cols, int64_t ld,
-                                                      uint8_t* __restrict__ codes, float* __restrict__ scale) {
+                                                      uint8_t* __restrict__ codes, float* __restrict__ scale,
+                                                      const float* __restrict__ nw = nullptr, float eps = 0.0f,
+                                                      float* __restrict__ xn = nullptr) {
     __shared__ float red[8];
-    __shared__ float inv_s;
+    __shared__ float inv_s, inv_rms_s;
     const float* xr = x + (int64_t) blockIdx.x * ld;
+    float inv_rms = 1.0f;
+    if (NORM) {
+        float ss = 0.0f;
+        for (int64_t i = threadIdx.x * 4; i < cols; i += 1024) {
+            const float4 v = *reinterpret_cast<const float4*>(xr + i);
+            ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.0f;
+            for (int i = 0; i < 8; ++i) t += red[i];
+            inv_rms_s = rsqrtf(t / (float) cols + eps);
+        }
+        __syncthreads();
+        inv_rms = inv_rms_s;
+    }
+    auto val4 = [&](int64_t i) -> float4 {
+        float4 v = *reinterpret_cast<const float4*>(xr + i);
+        if (NORM) {
+            const float4 w = *reinterpret_cast<const float4*>(nw + i);
+            v = make_float4(v.x * inv_rms * w.x, v.y * inv_rms * w.y, v.z * inv_rms * w.z, v.w * inv_rms * w.w);
+        }
+        return v;
+    };
     float m = 0.0f;
     for (int64_t i = threadIdx.x * 4; i < cols; i += 1024) {
-        const float4 v = *reinterpret_cast<const float4*>(xr + i);
+        const float4 v = val4(i);
+        if (NORM && xn) *reinterpret_cast<float4*>(xn + (int64_t) blockIdx.x * cols + i) = v;
         m = fmaxf(m, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
     }
 #pragma unroll
@@ -223,7 +255,7 @@ __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__
     const float inv = inv_s;
     uint8_t* cr = codes + (int64_t) blockIdx.x * cols;
     for (int64_t i = threadIdx.x * 4; i < cols; i += 1024) {
-        const float4 v = *reinterpret_cast<const float4*>(xr + i);
+        const float4 v = val4(i);
         const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(v.x * inv, v.y * inv), __NV_SATFINITE, __NV_E4M3);
         const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(v.z * inv, v.w * inv), __NV_SATFINITE, __NV_E4M3);
         *reinterpret_cast<uint32_t*>(cr + i) = (uint32_t) lo | ((uint32_t) hi << 16);
@@ -242,7 +274,19 @@ void quantize(const float* x, int64_t rows, int64_t cols, int64_t ld, void* act,
     }
     uint8_t* codes = (uint8_t*) act;
     float* scale = (float*) (codes + scale_off(rows, cols));
-    quantize_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, cols, ld, codes, scale);
+    quantize_kernel<false><<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, cols, ld, codes, scale);
+    ck("quantize");
+}
+
+void rms_norm_quantize(const float* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* xn, void* stream) {
+    if (rows <= 0) return;
+    if (cols % 64 != 0 || cols % 4 != 0) {
+        basalt::log::error("basalt", "prefill fp8: rows of %lld values (norm)", (long long) cols);
+        std::exit(1);
+    }
+    uint8_t* codes = (uint8_t*) act;
+    float* scale = (float*) (codes + scale_off(rows, cols));
+    quantize_kernel<true><<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, cols, cols, codes, scale, w, eps, xn);
     ck("quantize");
 }
 

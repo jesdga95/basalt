@@ -27,6 +27,9 @@ size_t act_bytes(int64_t rows, int64_t cols);
 /// Rounds `rows` rows of x (`ld` floats apart) into the activation planes `act` (act_bytes) and the token scales
 /// gs[rows].
 void quantize(const float* x, int64_t rows, int64_t cols, int64_t ld, void* act, float* gs, void* stream);
+/// As quantize, of the RMSNorm'd rows x * rsqrt(mean(x^2) + eps) * w (rows `cols` apart); xn (optional) gets the normed rows.
+void rms_norm_quantize(const float* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* gs, float* xn,
+                       void* stream);
 
 /// dst[t * ld + r] (+)= gs[t] * (*w_scale) * sum_k w[r][k] x[t][k], r < rows, t < tokens.  w: planes of rows x K
 /// (nvfp4p::bytes); w_scale: the matrix's device FP32 scale.  add: dst += (the residual epilogue), else dst = .

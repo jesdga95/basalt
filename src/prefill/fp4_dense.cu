@@ -311,8 +311,11 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
 
 // One warp per token row (and per padding row of the last scale tile).  Token scale g = amax / (6 * 448); per 16 values
 // a UE4M3 scale of block amax / (6 g); codes round to nearest even on x / (scale * g), value 2b in byte b's low nibble.
+// NORM: the row is RMSNorm'd first (x * rsqrt(mean(x^2) + eps) * nw), the normed row optionally written to xn.
+template <bool NORM>
 __global__ void quantize_kernel(const float* __restrict__ x, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales,
-                                float* __restrict__ gs, int cols, int64_t ld, int64_t rows) {
+                                float* __restrict__ gs, int cols, int64_t ld, int64_t rows, const float* __restrict__ nw = nullptr,
+                                float eps = 0.0f, float* __restrict__ xn = nullptr) {
     const int lane = threadIdx.x & 31;
     const int64_t r = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     const int nb = cols / 16, ktiles = cols / 256;
@@ -323,12 +326,36 @@ __global__ void quantize_kernel(const float* __restrict__ x, uint8_t* __restrict
         return;
     }
     const float* xr = x + r * ld;
+    float inv_rms = 1.0f;
+    if (NORM) {
+        float ss = 0.0f;
+        for (int b = lane; b < nb; b += 32) {
+            const float4* q = (const float4*) (xr + 16 * b);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float4 v = q[i];
+                ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        inv_rms = rsqrtf(ss / (float) cols + eps);
+    }
+    // value c of the row as the quantizer sees it
+    auto val4 = [&](int c) -> float4 {
+        float4 v = *(const float4*) (xr + c);
+        if (NORM) {
+            const float4 w = *(const float4*) (nw + c);
+            v = make_float4(v.x * inv_rms * w.x, v.y * inv_rms * w.y, v.z * inv_rms * w.z, v.w * inv_rms * w.w);
+        }
+        return v;
+    };
     float amax = 0.0f;
     for (int b = lane; b < nb; b += 32) {
-        const float4* q = (const float4*) (xr + 16 * b);
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const float4 v = q[i];
+            const float4 v = val4(16 * b + 4 * i);
+            if (NORM && xn) *(float4*) (xn + r * cols + 16 * b + 4 * i) = v;
             amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
         }
     }
@@ -338,12 +365,11 @@ __global__ void quantize_kernel(const float* __restrict__ x, uint8_t* __restrict
     if (lane == 0) gs[r] = g;
     const float inv_g = amax > 0.0f ? 1.0f / g : 0.0f;
     for (int b = lane; b < nb; b += 32) {
-        const float4* q = (const float4*) (xr + 16 * b);
         float v[16];
         float m = 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const float4 t = q[i];
+            const float4 t = val4(16 * b + 4 * i);
             v[4 * i] = t.x; v[4 * i + 1] = t.y; v[4 * i + 2] = t.z; v[4 * i + 3] = t.w;
             m = fmaxf(m, fmaxf(fmaxf(fabsf(t.x), fabsf(t.y)), fmaxf(fabsf(t.z), fabsf(t.w))));
         }
@@ -462,8 +488,22 @@ void quantize(const float* x, int64_t rows, int64_t cols, int64_t ld, void* act,
     uint8_t* codes = (uint8_t*) act;
     uint8_t* scales = codes + (size_t) rows * (size_t) (cols / 2);
     const unsigned grid = (unsigned) ((padded(rows) + 7) / 8);
-    quantize_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(x, codes, scales, gs, (int) cols, ld, rows);
+    quantize_kernel<false><<<grid, 256, 0, (cudaStream_t) stream>>>(x, codes, scales, gs, (int) cols, ld, rows);
     ck(cudaGetLastError(), "quantize");
+}
+
+void rms_norm_quantize(const float* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* gs, float* xn,
+                       void* stream) {
+    if (rows <= 0) return;
+    if (cols % 256 || (reinterpret_cast<uintptr_t>(x) & 15) || (reinterpret_cast<uintptr_t>(act) & 15)) {
+        basalt::log::error("basalt", "fp4 dense: rms_norm_quantize %lld columns", (long long) cols);
+        std::exit(1);
+    }
+    uint8_t* codes = (uint8_t*) act;
+    uint8_t* scales = codes + (size_t) rows * (size_t) (cols / 2);
+    const unsigned grid = (unsigned) ((padded(rows) + 7) / 8);
+    quantize_kernel<true><<<grid, 256, 0, (cudaStream_t) stream>>>(x, codes, scales, gs, (int) cols, cols, rows, w, eps, xn);
+    ck(cudaGetLastError(), "rms_norm_quantize");
 }
 
 void product(const void* w, const float* w_scale, int64_t rows, int64_t K, const void* act, const float* gs, int64_t tokens,

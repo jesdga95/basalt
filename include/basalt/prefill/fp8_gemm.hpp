@@ -15,6 +15,8 @@ size_t act_bytes(int64_t rows, int64_t cols);
 
 /// Rounds rows of x (`ld` floats apart) to E4M3 with scale amax / 448 per row (round to nearest even, saturating).
 void quantize(const float* x, int64_t rows, int64_t cols, int64_t ld, void* act, void* stream);
+/// As quantize, of the RMSNorm'd rows x * rsqrt(mean(x^2) + eps) * w (rows `cols` apart); xn (optional) gets the normed rows.
+void rms_norm_quantize(const float* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* xn, void* stream);
 
 enum class Epilogue { Store, Add };
 /// dst[t * ld_dst + r] (=, or += with Add) = w_scale * a_scale[t] * sum_k W[r][k] A[t][k] for t < rows, r < w_rows:
