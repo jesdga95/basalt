@@ -1,0 +1,130 @@
+// src/dense/internal.hpp - the dense stack's model, session state and forward passes (see basalt/dense/model.hpp).
+#pragma once
+
+#include "basalt/dense/model.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
+
+#include <cuda_runtime.h>
+
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace basalt::vision {
+class Mmproj;
+class CudaEncoder;
+}
+
+namespace basalt::dense {
+
+constexpr int kWindow = 8;        // rows a decode window holds
+constexpr int kChunk = 2048;      // tokens a prompt chunk reads at once
+
+/// Device buffers carved from one allocation.
+class Arena {
+public:
+    ~Arena();
+    bool reserve(size_t bytes);
+    template <class T> T* take(size_t n) { return static_cast<T*>(take_bytes(n * sizeof(T))); }
+    void* take_bytes(size_t n);
+    void rewind(size_t mark) { used_ = mark; }
+    size_t mark() const { return used_; }
+    size_t size() const { return size_; }
+private:
+    uint8_t* base_ = nullptr;
+    size_t size_ = 0, used_ = 0;
+};
+
+/// The decode window's scratch (kWindow rows).
+struct WindowScratch {
+    float *x = nullptr, *xn = nullptr, *tmp = nullptr;
+    void *xq = nullptr, *yq = nullptr;           // q8_1 activations
+    float *z = nullptr;
+    float *qfull = nullptr, *k = nullptr, *v = nullptr, *qo = nullptr, *ao = nullptr, *ag = nullptr;
+    float *g = nullptr, *u = nullptr, *h = nullptr;
+    float* attn = nullptr;                       // gqa_decode_attn's partial sums
+    int32_t *tok = nullptr, *pos = nullptr;      // the window's tokens and [row][3] positions (device)
+    float* cat = nullptr;                        // the drafter's [embedding | hidden] rows
+    float *lp = nullptr, *lp_scratch = nullptr;  // the drafter's picks (row_logprobs rows) and their scratch
+};
+
+/// The prompt chunk's scratch (kChunk rows), its mixer and FFN buffers sharing memory.
+struct ChunkScratch {
+    float *x = nullptr, *xn = nullptr, *tmp = nullptr;
+    void* xq = nullptr;                           // MMQ activations
+    float *qkv = nullptr, *z = nullptr, *hc = nullptr, *gate = nullptr, *beta = nullptr, *ab = nullptr;
+    float *y = nullptr, *yn = nullptr;
+    void* work = nullptr;
+    float *qfull = nullptr, *k = nullptr, *v = nullptr, *qo = nullptr, *ao = nullptr, *ag = nullptr;
+    float *g = nullptr, *u = nullptr, *h = nullptr;
+    float *hn = nullptr, *cat = nullptr;          // the drafter's history: main's normed rows, its input rows
+    int32_t *tok = nullptr, *pos = nullptr, *iota = nullptr, *bounds = nullptr;
+};
+
+class Model {
+public:
+    Geometry g;
+    Weights w;
+    Options o;
+    Arena dec_arena, pre_arena;
+    WindowScratch ws;
+    ChunkScratch cs;
+    bool chunk_ready = false;
+    std::unique_ptr<prefill::mmq::Context> mmq;
+    std::vector<int> gdn_index, attn_index;      // per layer: its index among the GDN or attention layers (-1)
+    std::unique_ptr<vision::Mmproj> mmproj;
+    std::unique_ptr<vision::CudaEncoder> encoder;
+    void* enc_arena = nullptr;
+    size_t enc_bytes = 0;
+    ~Model();
+    bool ensure_chunk(std::string& err);
+    /// The image encoder placed in device memory for pictures of up to `tokens` merged tokens.
+    bool vision_attach(int tokens, std::string& err);
+    /// Its memory goes back.
+    void vision_detach();
+};
+
+/// One conversation's device state.
+struct SessionState {
+    cudaStream_t stream = nullptr;
+    Arena arena;
+    float* gdn = nullptr;                        // per GDN layer: state [S][h_v][S], then conv history [C][3]
+    size_t gdn_floats = 0;                       // per layer
+    std::vector<uint16_t*> kc, vc;               // per attention layer: [cell][n_kv][head_dim] fp16
+    // the last window's rows per GDN layer, until its commit
+    float *rec_qkv = nullptr, *rec_h = nullptr, *rec_gate = nullptr, *rec_beta = nullptr;
+    int32_t* n_keep = nullptr;                   // device
+    float* logits = nullptr;                     // [kWindow][n_vocab]
+    int32_t* picks = nullptr;                    // device [kWindow]
+    int64_t rope_delta = 0;                      // rope position - cell index for the next text token
+    // the drafter (null without one): its KV, the last window's normed hidden rows, and the row waiting for the
+    // token after it (cell tail_cell, -1 none)
+    uint16_t *mtp_kc = nullptr, *mtp_vc = nullptr;
+    float *hid = nullptr, *tail = nullptr, *chain = nullptr;   // chain: [2][n_embd]
+    float *dlogits = nullptr, *lp = nullptr;     // the drafter's head row and its picks [kWindow][kLogprobStride]
+    int32_t* win_tok = nullptr;                  // the last window's tokens (device)
+    int64_t tail_cell = -1;
+};
+
+/// Runs a decode window of T rows at cells pos..pos+T-1 (`pos3` [T][3] their rope positions); leaves the logits in
+/// st.logits and the GDN rows for the commit.
+bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3,
+                    std::string& err);
+/// Runs a prompt chunk; rows are token embeddings, or `rows` (fp32 [T][n_embd]) when given.  `pos3` [T][3].
+bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
+                   const int32_t* pos3, std::string& err);
+/// The commit of the last window's first n rows into the recurrent state.
+void commit_window(Model& m, SessionState& st, int n);
+
+/// The drafter over n rows of (hidden, next token) pairs at cells c0..c0+n-1: `hid` device rows [n][n_embd] (main's
+/// normed hidden, or the drafter's own output), `tok` device ids of the tokens after them.  Writes its KV; with
+/// `out` (device [n][n_embd]) also its normed output rows and, for the last row, the head's pick and probability
+/// into lp_row (row_logprobs layout, device).  n <= kWindow.
+bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok, int n, int64_t c0, float* out,
+                float* lp_row, std::string& err);
+/// The drafter's history over a prompt chunk's pairs (n <= kChunk), KV only: hidden rows `hid`, next tokens `tok`
+/// (device ids) or next rows `emb` (device [n][n_embd]).
+bool mtp_chunk(Model& m, SessionState& st, const float* hid, const int32_t* tok, const float* emb, int n, int64_t c0,
+               std::string& err);
+
+}  // namespace basalt::dense
