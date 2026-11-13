@@ -196,6 +196,17 @@ bool Model::ensure_chunk(std::string& err) {
     b.a4 = pre_arena.take_bytes(prefill::fp4::a4_bytes((int64_t) T, (int64_t) std::max<size_t>(H, gg.n_ff), 1));
     b.gs = pre_arena.take<float>(prefill::fp4::scale_count((int64_t) T, 1));
     b.tile_off = pre_arena.take<int32_t>(prefill::fp4::kMaxExperts + 1);
+    b.ffn_tail = pre_arena.take<float>(4 * (size_t) gg.n_layers);
+    for (int il = 0; il < gg.n_layers && b.ffn_tail; ++il) {   // the scales a long chunk's SwiGLU product reads
+        const Layer& L = w.layers[(size_t) il];
+        const float one[2] = {1.0f, 0.0f};
+        float* t = b.ffn_tail + 4 * il;
+        cudaMemcpy(t + 2, one, sizeof one, cudaMemcpyHostToDevice);
+        if (L.gate.scale) cudaMemcpy(t, L.gate.scale, 4, cudaMemcpyDeviceToDevice);
+        else cudaMemcpy(t, one, 4, cudaMemcpyHostToDevice);
+        if (L.up.scale) cudaMemcpy(t + 1, L.up.scale, 4, cudaMemcpyDeviceToDevice);
+        else cudaMemcpy(t + 1, one, 4, cudaMemcpyHostToDevice);
+    }
     const size_t phase = pre_arena.mark();
     if (gg.gdn_layers()) {
         b.qkv = pre_arena.take<float>(T * C);

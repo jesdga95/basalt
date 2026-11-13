@@ -211,22 +211,39 @@ void gemm_fp4(Model& m, const Linear& l, float* y, int T, cudaStream_t s) {
     p.max_rows = T;
     prefill::fp4::run(p, s);
 }
+// h [T][n_ff] = silu(s_gate gate . x) (s_up up . x) for the layer's NVFP4 gate and up on the FP4 tensor cores, one product
+void gemm_fp4_swiglu(Model& m, const Layer& L, int il, float* h, int T, cudaStream_t s) {
+    prefill::fp4::Product p;
+    p.blob[0] = (const uint8_t*) L.gate.w;
+    p.up = (const uint8_t*) L.up.w;
+    p.tail = m.cs.ffn_tail + 4 * il;
+    p.swiglu = true;
+    p.w_rows = 2 * L.gate.rows;
+    p.w_cols = L.gate.cols;
+    p.n = 1;
+    p.a4 = m.cs.a4;
+    p.gs = m.cs.gs;
+    p.bounds = m.cs.bounds;
+    p.tile_off = m.cs.tile_off;
+    p.dst = h;
+    p.ld_dst = L.gate.rows;
+    p.max_rows = T;
+    prefill::fp4::run(p, s);
+}
 void fp4_quant(Model& m, const float* x, int64_t cols, int T, cudaStream_t s) {
     prefill::fp4::plan(m.cs.bounds, 1, m.cs.tile_off, s);
     prefill::fp4::quantize(x, nullptr, m.cs.bounds, m.cs.tile_off, 1, m.cs.a4, m.cs.gs, cols, cols, T, s);
 }
 
-void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
+void chunk_ffn(Model& m, const Layer& L, int il, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd;
     kernels::rms_norm_rows(b.x, L.ffn_norm, b.xn, T, H, g.eps, s);
     if (T >= m.o.fp4_rows && L.gate.type == 40 && L.up.type == 40 && L.down.type == 40) {   // a long chunk: W4A4
         fp4_quant(m, b.xn, H, T, s);
-        gemm_fp4(m, L.gate, b.g, T, s);
-        gemm_fp4(m, L.up, b.u, T, s);
-        prefill::fp4::quantize_swiglu(b.g, b.u, L.gate.scale, L.up.scale, m.cs.bounds, m.cs.tile_off, 1, m.cs.a4, m.cs.gs,
-                                      g.n_ff, g.n_ff, T, s);   // the tile plan is the gate/up input's
+        gemm_fp4_swiglu(m, L, il, b.h, T, s);
+        fp4_quant(m, b.h, g.n_ff, T, s);
         gemm_fp4(m, L.down, b.tmp, T, s);
         kernels::add_scaled(b.x, b.tmp, L.down.scale, (int64_t) T * H, s);
         return;
@@ -559,7 +576,7 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
             const int ai = m.attn_index[(size_t) il];
             chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai]);
         }
-        chunk_ffn(m, L, T, s);
+        chunk_ffn(m, L, il, T, s);
         if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) {
             const Linear& fc = bd.fc[next_target];
             quantize_mmq(b.x, b.xq, fc.type, H, T, s);
