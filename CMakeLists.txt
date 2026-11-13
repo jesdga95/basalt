@@ -190,6 +190,11 @@ add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision tiers mmq peer_share kernels core ${_gpu_runtime_target})
 
+# The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it
+add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp)
+target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
+target_link_libraries(dense PUBLIC model kernels mmq core warnings ${_gpu_runtime_target})
+
 add_library(models STATIC src/models/builtin.cpp)
 target_link_libraries(models PUBLIC model_qwen4exp model_deepseek41)
 
@@ -581,6 +586,7 @@ set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_S
 add_subdirectory(tools/vision)
 target_link_libraries(model_qwen4exp PUBLIC vision_cuda)
 target_link_libraries(serve_shared PUBLIC vision_core)
+target_link_libraries(dense PUBLIC vision_cuda)
 if(BUILD_TESTING)
   # the host half of the vision library needs no GPU: the decode guard is checked here
   add_executable(vision_preprocess_test tests/vision/preprocess_limit_test.cpp)
