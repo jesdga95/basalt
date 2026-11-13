@@ -1,8 +1,9 @@
 // src/prefill/fp8_gemm.cu - see include/basalt/prefill/fp8_gemm.hpp.
 //
 // A block is 128 weight rows x 128 tokens, eight warps as 2 (rows) x 4 (tokens), each warp 64 rows x 32 tokens (4 x 4
-// mma tiles); K streams in 64-value steps through a four-stage cp.async pipeline, both operands' 16-byte chunks
-// XOR-swizzled per row so the ldmatrix reads are conflict-free.  The weight rows are the mma's A (m16), the tokens its
+// mma tiles), two blocks per SM, the token tiles fastest in the grid (a weight tile serves them back to back); K streams
+// in 64-value steps through a three-stage cp.async pipeline, both operands' 16-byte chunks XOR-swizzled per row so the
+// ldmatrix reads are conflict-free.  The weight rows are the mma's A (m16), the tokens its
 // B (n8); fp32 accumulation over K in order, the two scales applied once in the epilogue.
 #include "basalt/prefill/fp8_gemm.hpp"
 
@@ -16,7 +17,7 @@
 namespace basalt::prefill::fp8 {
 namespace {
 
-constexpr int BM = 128, BN = 128, BK = 64, ST = 4, NT = 256;
+constexpr int BM = 128, BN = 128, BK = 64, ST = 3, NT = 256;   // three stages: two blocks per SM
 
 void ck(const char* what) {
     const cudaError_t e = cudaGetLastError();
@@ -54,11 +55,11 @@ struct Args {
     int M, K, N, epi;
 };
 
-__global__ void __launch_bounds__(NT, 1) gemm_kernel(const Args p) {
+__global__ void __launch_bounds__(NT, 2) gemm_kernel(const Args p) {
     extern __shared__ __align__(16) unsigned char raw[];
     Smem& s = *reinterpret_cast<Smem*>(raw);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp & 1, wn = warp >> 1;
-    const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;   // token tiles fastest: a weight tile serves them back to back
     const int nk = p.K / BK;
     auto issue = [&](int kt) {
         const int st = kt % ST, k0 = kt * BK;
@@ -203,7 +204,7 @@ void gemm(const uint8_t* w, int64_t w_rows, int64_t w_cols, const float* w_scale
     p.K = (int) w_cols;
     p.N = (int) rows;
     p.epi = (int) epi;
-    const dim3 grid((unsigned) ((w_rows + BM - 1) / BM), (unsigned) ((rows + BN - 1) / BN));
+    const dim3 grid((unsigned) ((rows + BN - 1) / BN), (unsigned) ((w_rows + BM - 1) / BM));
     gemm_kernel<<<grid, NT, sizeof(Smem), (cudaStream_t) stream>>>(p);
     ck("gemm");
 }
