@@ -2,6 +2,7 @@
 #pragma once
 
 #include "basalt/dense/model.hpp"
+#include "basalt/kernels/fp8_window.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
 #include <cuda_runtime.h>
@@ -20,6 +21,7 @@ namespace basalt::dense {
 
 constexpr int kWindow = 8;        // rows a decode window holds
 constexpr int kChunk = 2048;      // tokens a prompt chunk reads at once
+constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
 
 /// Device buffers carved from one allocation.
 class Arena {
@@ -47,7 +49,8 @@ struct BatchTable {
 /// The decode window's scratch (kWindow rows).
 struct WindowScratch {
     float *x = nullptr, *xn = nullptr, *tmp = nullptr;
-    void *xq = nullptr, *yq = nullptr;           // q8_1 activations
+    void *xq = nullptr, *yq = nullptr;           // activations: q8_1 (MMQ) or fp16 rows (the F8 products)
+    kernels::fp8w::Workspace w8;                 // the F8 products' split-K sums
     float *z = nullptr;
     float *qfull = nullptr, *k = nullptr, *v = nullptr, *qo = nullptr, *ao = nullptr, *ag = nullptr;
     float *g = nullptr, *u = nullptr, *h = nullptr;

@@ -4,6 +4,7 @@
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/logprobs.hpp"
+#include "basalt/prefill/fp8_gemm.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/log.hpp"
@@ -68,6 +69,29 @@ size_t block_scratch_floats(const Geometry& g, const BlockDrafter& bd) {
            kernels::gqa_decode_scratch_floats(bd.window + 256, kWindow, bd.n_head, bd.head_dim) + 64 * 64;
 }
 
+// a window's activation buffer: MMQ's q8_1 rows or the F8 products' fp16 rows, for the widest input
+size_t act_slot(const Geometry& g) {
+    const size_t AQ = (size_t) g.n_head * g.head_dim;
+    const int64_t widest = (int64_t) std::max<size_t>({(size_t) g.n_embd, (size_t) g.n_ff, (size_t) g.value_width(), AQ,
+                                                       2 * (size_t) g.n_embd});
+    return (std::max(prefill::mmq::q8_bytes(kWindow, widest), kernels::fp8w::act_bytes(widest)) + 255) / 256 * 256;
+}
+
+// the F8 products' split-K workspace for every projection shape the geometry has
+void fp8w_need(const Geometry& g, size_t& partial, size_t& tickets) {
+    const int64_t H = g.n_embd, AQ = (int64_t) g.n_head * g.head_dim, KV = (int64_t) g.n_kv * g.head_dim;
+    const int64_t shapes[][2] = {{2 * AQ, H}, {KV, H}, {H, AQ}, {g.conv_channels(), H}, {g.value_width(), H},
+                                 {H, g.value_width()}};
+    partial = tickets = 0;
+    for (const auto& sh : shapes) {
+        if (sh[0] <= 0 || sh[1] <= 0 || sh[1] % 256 != 0) continue;
+        size_t p, t;
+        kernels::fp8w::workspace_need(sh[0], sh[1], p, t);
+        partial = std::max(partial, p);
+        tickets = std::max(tickets, t);
+    }
+}
+
 size_t window_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_context) {
     const size_t W = kWindow, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim;
     const size_t widest = std::max<size_t>({H, (size_t) g.n_ff, (size_t) g.value_width(), AQ});
@@ -76,14 +100,18 @@ size_t window_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_conte
     f += W * (2 * (size_t) g.conv_channels() + 2 * (size_t) g.gdn_v_heads) + (sizeof(BatchTable) + 3) / 4;
     f += W * 2 * H + kernels::row_logprobs_scratch_floats(kWindow, g.n_vocab) + W * g.value_width() + W * (size_t) g.n_vocab;
     f += block_scratch_floats(g, bd);
-    return f * 4 + 2 * prefill::mmq::q8_bytes(kWindow, (int64_t) std::max<size_t>(widest, 2 * H)) + W * 4 * 6 + 72 * 256;
+    (void) widest;
+    size_t wp, wt;
+    fp8w_need(g, wp, wt);
+    return f * 4 + 2 * act_slot(g) + (wp + wt + 1) * 4 + W * 4 * 6 + 76 * 256;
 }
 
 size_t chunk_bytes(const Geometry& g) {
     const size_t T = kChunk, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim, C = (size_t) g.conv_channels();
     const size_t VD = (size_t) g.value_width(), HV = (size_t) g.gdn_v_heads;
     const size_t widest = std::max<size_t>({H, (size_t) g.n_ff, VD, AQ});
-    const size_t keep = 6 * T * H * 4 + H * 4 + prefill::mmq::q8_bytes(T, (int64_t) widest) +
+    const size_t keep = 6 * T * H * 4 + H * 4 +
+                        std::max(prefill::mmq::q8_bytes(T, (int64_t) widest), prefill::fp8::act_bytes(T, (int64_t) widest)) +
                         prefill::fp4::a4_bytes((int64_t) T, (int64_t) std::max<size_t>(H, g.n_ff), 1) +
                         prefill::fp4::scale_count((int64_t) T, 1) * 4 + 4 * 256;
     const size_t gdn = g.gdn_layers() ? (2 * T * C + 3 * T * VD + 4 * T * HV) * 4 + kernels::gdn_work_bytes(T) : 0;
@@ -160,6 +188,7 @@ bool Model::ready_products(std::string& err) {
         for (const Linear* l : {&Lp->qkv, &Lp->z, &Lp->out, &Lp->q, &Lp->k, &Lp->v, &Lp->o, &Lp->gate, &Lp->up, &Lp->down})
             if (l->w) ls.push_back(l);
     for (const Linear* l : ls) {
+        if (l->type == kTypeF8) continue;   // the F8 products are not MMQ's
         if (!prefill::mmq::fits(l->type, l->rows)) {
             err = o.arch + ": the products have no tile for a " + std::to_string(l->rows) + "-row matrix";
             return false;
@@ -183,7 +212,7 @@ bool Model::ensure_chunk(std::string& err) {
     b.x = pre_arena.take<float>(T * H);
     b.xn = pre_arena.take<float>(T * H);
     b.tmp = pre_arena.take<float>(T * H);
-    b.xq = pre_arena.take_bytes(prefill::mmq::q8_bytes(T, (int64_t) widest));
+    b.xq = pre_arena.take_bytes(std::max(prefill::mmq::q8_bytes(T, (int64_t) widest), prefill::fp8::act_bytes(T, (int64_t) widest)));
     b.tok = pre_arena.take<int32_t>(T);
     b.pos = pre_arena.take<int32_t>(3 * T);
     b.iota = pre_arena.take<int32_t>(T);
@@ -283,14 +312,16 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         return nullptr;
     }
     const size_t W = kWindow, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim, KV = (size_t) g.n_kv * g.head_dim;
-    const size_t widest = std::max<size_t>({H, (size_t) g.n_ff, (size_t) g.value_width(), AQ});
     WindowScratch& b = m->ws;
     Arena& a = m->dec_arena;
     b.x = a.take<float>(W * H);
     b.xn = a.take<float>(W * H);
     b.tmp = a.take<float>(W * H);
-    b.xq = a.take_bytes(prefill::mmq::q8_bytes(kWindow, (int64_t) std::max<size_t>(widest, 2 * H)));
-    b.yq = a.take_bytes(prefill::mmq::q8_bytes(kWindow, (int64_t) std::max<size_t>(widest, 2 * H)));
+    b.xq = a.take_bytes(act_slot(g));
+    b.yq = a.take_bytes(act_slot(g));
+    fp8w_need(g, b.w8.partial_floats, b.w8.tickets_n);
+    b.w8.partial = a.take<float>(std::max<size_t>(b.w8.partial_floats, 1));
+    b.w8.tickets = a.take<int32_t>(std::max<size_t>(b.w8.tickets_n, 1));   // zero: the arena is cleared below
     b.z = a.take<float>(W * g.value_width());
     b.qfull = a.take<float>(W * 2 * AQ);
     b.k = a.take<float>(W * KV);
