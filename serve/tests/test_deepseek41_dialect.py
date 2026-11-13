@@ -8,7 +8,7 @@ from serve.frontend import openai_to_messages
 from serve.models import dialect_for
 from serve.models import deepseek41_encoding as enc
 from serve.models.deepseek41 import DeepSeek41, DeepseekParser, DeepseekTemplate
-from serve.models.qwen4exp import Qwen4Exp
+from serve.models.qwen import Qwen
 
 BOS, EOS, A, U = enc.bos_token, enc.eos_token, enc.ASSISTANT_SP_TOKEN, enc.USER_SP_TOKEN
 CALLS = "<｜DSML｜ calls>\n"
@@ -252,8 +252,9 @@ class Parse(unittest.TestCase):
 class Seam(unittest.TestCase):
     def test_dialect_choice(self):
         self.assertIsInstance(dialect_for("deepseek41"), DeepSeek41)
-        self.assertIsInstance(dialect_for("qwen4exp"), Qwen4Exp)
-        self.assertIsInstance(dialect_for(None), Qwen4Exp)
+        self.assertIsInstance(dialect_for("qwen4exp"), Qwen)
+        self.assertIsInstance(dialect_for("qwen35"), Qwen)
+        self.assertIsInstance(dialect_for(None), Qwen)
 
     def test_forced_openings_parse_back(self):
         d = DeepSeek41()

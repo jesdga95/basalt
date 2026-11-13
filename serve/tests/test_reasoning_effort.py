@@ -11,7 +11,7 @@ from serve.engine.mock import MockEngine
 from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages
 from serve.handler import serve
 from serve.models.deepseek41 import DeepSeek41, DeepseekTemplate
-from serve.models.qwen4exp import Qwen4Exp
+from serve.models.qwen import Qwen
 from serve.router import Router
 from serve.service import Service
 from serve.util.text import ByteTokenizer
@@ -29,7 +29,7 @@ HISTORY = [{"role": "user", "content": "first"},
 def qwen_service():
     tok = ByteTokenizer()
     return Service(MockEngine(tok, "</think>ok", max_context=4096), tok, ChatTemplate.from_file(TEMPLATE),
-                   model_name="qwen", dialect=Qwen4Exp())
+                   model_name="qwen", dialect=Qwen())
 
 
 def deepseek_service():
@@ -60,7 +60,7 @@ def harness_body(effort, caps=None, preserve=False):
 
 class Caps(unittest.TestCase):
     def test_each_dialect_names_every_capability(self):
-        for dialect in (Qwen4Exp(), DeepSeek41()):
+        for dialect in (Qwen(), DeepSeek41()):
             self.assertEqual(set(dialect.caps), set(CAP_NAMES), dialect.name)
             self.assertTrue(all(isinstance(v, bool) for v in dialect.caps.values()))
 
@@ -68,7 +68,7 @@ class Caps(unittest.TestCase):
         source = TEMPLATE.read_text()
         for needle in ("<tool_call>", "reasoning_effort", "preserve_thinking", "message.role == \"system\""):
             self.assertIn(needle, source)
-        self.assertTrue(all(Qwen4Exp.caps.values()))
+        self.assertTrue(all(Qwen.caps.values()))
 
     def test_deepseek_caps_are_what_its_encoder_has(self):
         from serve.models import deepseek41_encoding as enc
@@ -89,9 +89,9 @@ class Caps(unittest.TestCase):
                     return r.status, json.loads(r.read())
                 finally:
                     c.close()
-            self.assertEqual(props("/props?model=qwen")[1]["chat_template_caps"], Qwen4Exp.caps)
+            self.assertEqual(props("/props?model=qwen")[1]["chat_template_caps"], Qwen.caps)
             self.assertEqual(props("/props?model=ds")[1]["chat_template_caps"], DeepSeek41.caps)
-            self.assertEqual(props("/props")[1]["chat_template_caps"], Qwen4Exp.caps)
+            self.assertEqual(props("/props")[1]["chat_template_caps"], Qwen.caps)
             self.assertEqual(props("/props?model=nope")[0], 404)
         finally:
             router.stop()
