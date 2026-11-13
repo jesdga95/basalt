@@ -23,7 +23,7 @@ constexpr int kWindow = 16;       // rows one session's decode window holds
 constexpr int kBatch = 16;        // rows a batch window (several sessions' windows) holds
 constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
-constexpr int kChunk = 2048;      // tokens a prompt chunk reads at once
+constexpr int kChunk = 4096;      // tokens a prompt chunk reads at once
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
 constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
 constexpr int kTypeQ8P = 108;     // Q8_0 in planes (window_gemm Format::Q8), made at load for the decode window
@@ -91,10 +91,9 @@ struct ChunkScratch {
     float *g = nullptr, *u = nullptr, *h = nullptr;
     float *hn = nullptr, *cat = nullptr;          // the drafter's history: main's normed rows, its input rows
     float* dacc = nullptr;                        // the block drafter's projected features of the chunk's rows
-    void* a4 = nullptr;                           // FP4 activations of a long chunk's NVFP4 products, their token scales
+    void* a4 = nullptr;                           // the MLP's FP4 activations (fp4_dense), their token scales
     float* gs = nullptr;
-    int32_t* tile_off = nullptr;
-    float* ffn_tail = nullptr;                    // per layer {s_gate, s_up, 1, 0}: the FP4 SwiGLU product's scales
+    float* hmax = nullptr;                        // each row's largest |H| (the SwiGLU product's), for its FP4 rounding
     int32_t *tok = nullptr, *pos = nullptr, *iota = nullptr, *bounds = nullptr;
 };
 

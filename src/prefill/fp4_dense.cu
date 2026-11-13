@@ -7,6 +7,7 @@
 #include "basalt/prefill/fp4_dense.hpp"
 
 #include <cuda.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -106,9 +107,11 @@ struct Params {
     TmaDesc a_codes, a_scales, b_codes[2], b_scales[2];
     const float* gs;
     const float* ws[2];   // the matrix scales (SwiGLU: gate, up)
-    float* dst;
+    float* dst;           // the plain product's output (FP32)
+    __nv_bfloat16* hdst;  // SwiGLU's output (BF16)
     int64_t ld;
     int tokens, K, tok_tiles;
+    float* amax;          // SwiGLU (optional): each token's largest |output|, raised with atomicMax (zeroed by the caller)
 };
 static_assert(offsetof(Params, a_codes) % 64 == 0 && sizeof(TmaDesc) % 64 == 0, "descriptors sit on the map boundary");
 
@@ -130,7 +133,8 @@ template <int N, class F> __device__ __forceinline__ void with_live(int live, F&
 
 // SWIGLU: a block's 128 rows are 64 gate rows and the same 64 up rows (two descriptor sets, each warp holds the gate and
 // the up product of the same outputs), and the output is silu(s_gate g) (s_up u).  ADD: dst += the product.
-template <bool SWIGLU, bool ADD>
+// BF: the plain product's dst is BF16 (Add widens it, adds in fp32 and rounds once).
+template <bool SWIGLU, bool ADD, bool BF = false>
 __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Params p) {
     constexpr int branches = SWIGLU ? 2 : 1;
     constexpr int loaded_rows = kBR / branches;
@@ -277,10 +281,11 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
             const int t = token_begin + warp_m * kWarpTokens + mm * 16 + (lane >> 2) + 8 * h;
             if (t >= p.tokens) continue;
             const float g = p.gs[t];
-            float* out = p.dst + (int64_t) t * p.ld;
             if constexpr (SWIGLU) {
+                __nv_bfloat16* hout = p.hdst + (int64_t) t * p.ld;
                 const float ag = __fmul_rn(g, s0), au = __fmul_rn(g, s1);
                 const int r0 = row_begin + warp_n * 32 + 2 * (lane & 3);
+                float m = 0.0f;
 #pragma unroll
                 for (int f = 0; f < 4; ++f) {
                     float v[2];
@@ -290,20 +295,41 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
                         const float uu = __fmul_rn(acc[mm][f + 4][2 * h + e], au);
                         v[e] = gg / (1.0f + __expf(-gg)) * uu;
                     }
-                    *reinterpret_cast<float2*>(out + r0 + 8 * f) = make_float2(v[0], v[1]);
+                    const __nv_bfloat162 hv = __floats2bfloat162_rn(v[0], v[1]);   // the amax is of the stored values
+                    m = fmaxf(m, fmaxf(fabsf(__low2float(hv)), fabsf(__high2float(hv))));
+                    *reinterpret_cast<__nv_bfloat162*>(hout + r0 + 8 * f) = hv;
+                }
+                if (p.amax) {   // the token's largest |value|: the four lanes of the token, then one atomic (max is exact)
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+                    if ((lane & 3) == 0) atomicMax(reinterpret_cast<int*>(p.amax + t), __float_as_int(m));
                 }
             } else {
+                float* out = p.dst + (int64_t) t * p.ld;
+                __nv_bfloat16* hout = reinterpret_cast<__nv_bfloat16*>(p.dst) + (int64_t) t * p.ld;
                 const float alpha = __fmul_rn(g, s0);
                 const int r0 = row_begin + warp_n * kWarpRows + 2 * (lane & 3);
+                float2 res[kMmaRows];   // ADD: every residual pair loaded before any is written back
+                if constexpr (ADD) {
+#pragma unroll
+                    for (int f = 0; f < kMmaRows; ++f) {
+                        if constexpr (BF) {
+                            const unsigned u = __ldcg(reinterpret_cast<const unsigned*>(hout + r0 + 8 * f));
+                            res[f] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u));
+                        } else {
+                            res[f] = __ldcg(reinterpret_cast<const float2*>(out + r0 + 8 * f));
+                        }
+                    }
+                }
 #pragma unroll
                 for (int f = 0; f < kMmaRows; ++f) {
                     float2 v = make_float2(__fmul_rn(acc[mm][f][2 * h], alpha), __fmul_rn(acc[mm][f][2 * h + 1], alpha));
-                    float2* d = reinterpret_cast<float2*>(out + r0 + 8 * f);
-                    if constexpr (ADD) {
-                        const float2 o = *d;
-                        v = make_float2(__fadd_rn(o.x, v.x), __fadd_rn(o.y, v.y));
+                    if constexpr (ADD) v = make_float2(__fadd_rn(res[f].x, v.x), __fadd_rn(res[f].y, v.y));
+                    if constexpr (BF) {
+                        *reinterpret_cast<__nv_bfloat162*>(hout + r0 + 8 * f) = __floats2bfloat162_rn(v.x, v.y);
+                    } else {
+                        *reinterpret_cast<float2*>(out + r0 + 8 * f) = v;
                     }
-                    *d = v;
                 }
             }
         }
@@ -312,10 +338,11 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
 // One warp per token row (and per padding row of the last scale tile).  Token scale g = amax / (6 * 448); per 16 values
 // a UE4M3 scale of block amax / (6 g); codes round to nearest even on x / (scale * g), value 2b in byte b's low nibble.
 // NORM: the row is RMSNorm'd first (x * rsqrt(mean(x^2) + eps) * nw), the normed row optionally written to xn.
-template <bool NORM>
-__global__ void quantize_kernel(const float* __restrict__ x, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales,
+// AMAX: each row's largest |value| is given (rowmax), so the row is read once.  In: float or __nv_bfloat16 rows.
+template <bool NORM, bool AMAX = false, class In = float>
+__global__ void quantize_kernel(const In* __restrict__ x, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales,
                                 float* __restrict__ gs, int cols, int64_t ld, int64_t rows, const float* __restrict__ nw = nullptr,
-                                float eps = 0.0f, float* __restrict__ xn = nullptr) {
+                                float eps = 0.0f, float* __restrict__ xn = nullptr, const float* __restrict__ rowmax = nullptr) {
     const int lane = threadIdx.x & 31;
     const int64_t r = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     const int nb = cols / 16, ktiles = cols / 256;
@@ -325,15 +352,22 @@ __global__ void quantize_kernel(const float* __restrict__ x, uint8_t* __restrict
         for (int kt = lane; kt < ktiles; kt += 32) *reinterpret_cast<uint4*>(srow + (tile_base + kt) * kScaleTileBytes) = make_uint4(0, 0, 0, 0);
         return;
     }
-    const float* xr = x + r * ld;
+    const In* xr = x + r * ld;
     float inv_rms = 1.0f;
     if (NORM) {
         float ss = 0.0f;
         for (int b = lane; b < nb; b += 32) {
-            const float4* q = (const float4*) (xr + 16 * b);
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                const float4 v = q[i];
+                float4 v;
+                if constexpr (std::is_same_v<In, float>) {
+                    v = *(const float4*) (xr + 16 * b + 4 * i);
+                } else {
+                    const uint2 u = *(const uint2*) (xr + 16 * b + 4 * i);
+                    const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+                    const float2 c = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+                    v = make_float4(a.x, a.y, c.x, c.y);
+                }
                 ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
             }
         }
@@ -343,7 +377,15 @@ __global__ void quantize_kernel(const float* __restrict__ x, uint8_t* __restrict
     }
     // value c of the row as the quantizer sees it
     auto val4 = [&](int c) -> float4 {
-        float4 v = *(const float4*) (xr + c);
+        float4 v;
+        if constexpr (std::is_same_v<In, float>) {
+            v = *(const float4*) (xr + c);
+        } else {
+            const uint2 u = *(const uint2*) (xr + c);
+            const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+            const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+            v = make_float4(a.x, a.y, b.x, b.y);
+        }
         if (NORM) {
             const float4 w = *(const float4*) (nw + c);
             v = make_float4(v.x * inv_rms * w.x, v.y * inv_rms * w.y, v.z * inv_rms * w.z, v.w * inv_rms * w.w);
@@ -351,16 +393,20 @@ __global__ void quantize_kernel(const float* __restrict__ x, uint8_t* __restrict
         return v;
     };
     float amax = 0.0f;
-    for (int b = lane; b < nb; b += 32) {
+    if (AMAX) {
+        amax = rowmax[r];
+    } else {
+        for (int b = lane; b < nb; b += 32) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float4 v = val4(16 * b + 4 * i);
-            if (NORM && xn) *(float4*) (xn + r * cols + 16 * b + 4 * i) = v;
-            amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+            for (int i = 0; i < 4; ++i) {
+                const float4 v = val4(16 * b + 4 * i);
+                if (NORM && xn) *(float4*) (xn + r * cols + 16 * b + 4 * i) = v;
+                amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+            }
         }
-    }
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    }
     const float g = amax * (1.0f / (6.0f * 448.0f));
     if (lane == 0) gs[r] = g;
     const float inv_g = amax > 0.0f ? 1.0f / g : 0.0f;
@@ -431,7 +477,7 @@ TmaDesc map_2d(const void* base, uint64_t cols, uint64_t rows, uint64_t stride, 
 
 int64_t padded(int64_t tokens) { return (tokens + kBT - 1) / kBT * kBT; }
 
-template <bool SWIGLU, bool ADD> void launch(Params p, const void* w0, const void* w1, int64_t rows, int64_t K,
+template <bool SWIGLU, bool ADD, bool BF = false> void launch(Params p, const void* w0, const void* w1, int64_t rows, int64_t K,
                                              const void* act, int64_t tokens, cudaStream_t s) {
     constexpr int loaded_rows = kBR / (SWIGLU ? 2 : 1);
     static std::atomic<bool> configured[64];   // the shared-memory opt-in is per device and per kernel
@@ -439,7 +485,7 @@ template <bool SWIGLU, bool ADD> void launch(Params p, const void* w0, const voi
     ck(cudaGetDevice(&dev), "device");
     if (dev < 0 || dev >= 64) ck(cudaErrorInvalidDevice, "device range");
     if (!configured[dev].load(std::memory_order_acquire)) {
-        ck(cudaFuncSetAttribute(kernel<SWIGLU, ADD>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem), "smem");
+        ck(cudaFuncSetAttribute(kernel<SWIGLU, ADD, BF>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem), "smem");
         configured[dev].store(true, std::memory_order_release);
     }
     const uint8_t* a = (const uint8_t*) act;
@@ -458,11 +504,11 @@ template <bool SWIGLU, bool ADD> void launch(Params p, const void* w0, const voi
     p.tokens = (int) tokens;
     p.tok_tiles = (int) ((tokens + kBT - 1) / kBT);
     const int64_t row_tiles = rows / loaded_rows;
-    kernel<SWIGLU, ADD><<<(unsigned) (row_tiles * p.tok_tiles), kThreads, kSmem, s>>>(p);
+    kernel<SWIGLU, ADD, BF><<<(unsigned) (row_tiles * p.tok_tiles), kThreads, kSmem, s>>>(p);
     ck(cudaGetLastError(), "product");
 }
 
-void check(const void* a, const void* b, int64_t rows, int64_t K, int64_t tokens, const void* act, const float* dst, int64_t ld,
+void check(const void* a, const void* b, int64_t rows, int64_t K, int64_t tokens, const void* act, const void* dst, int64_t ld,
            const char* what) {
     const auto al = [](const void* v, size_t n) { return (reinterpret_cast<uintptr_t>(v) & (n - 1)) == 0; };
     if (rows <= 0 || rows % 128 || K <= 0 || K % 256 || tokens <= 0 || ld < rows || (ld & 1) || !al(a, 16) || !al(b, 16) ||
@@ -492,6 +538,21 @@ void quantize(const float* x, int64_t rows, int64_t cols, int64_t ld, void* act,
     ck(cudaGetLastError(), "quantize");
 }
 
+void quantize_amax(const uint16_t* x, const float* rowmax, int64_t rows, int64_t cols, int64_t ld, void* act, float* gs,
+                   void* stream) {
+    if (rows <= 0) return;
+    if (cols % 256 || (ld & 3) || (reinterpret_cast<uintptr_t>(x) & 15) || (reinterpret_cast<uintptr_t>(act) & 15)) {
+        basalt::log::error("basalt", "fp4 dense: quantize %lld columns, ld %lld", (long long) cols, (long long) ld);
+        std::exit(1);
+    }
+    uint8_t* codes = (uint8_t*) act;
+    uint8_t* scales = codes + (size_t) rows * (size_t) (cols / 2);
+    const unsigned grid = (unsigned) ((padded(rows) + 7) / 8);
+    quantize_kernel<false, true, __nv_bfloat16><<<grid, 256, 0, (cudaStream_t) stream>>>(reinterpret_cast<const __nv_bfloat16*>(x), codes, scales, gs, (int) cols, ld, rows, nullptr, 0.0f,
+                                                                          nullptr, rowmax);
+    ck(cudaGetLastError(), "quantize_amax");
+}
+
 void rms_norm_quantize(const float* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* gs, float* xn,
                        void* stream) {
     if (rows <= 0) return;
@@ -518,14 +579,43 @@ void product(const void* w, const float* w_scale, int64_t rows, int64_t K, const
     else launch<false, false>(p, w, nullptr, rows, K, act, tokens, (cudaStream_t) stream);
 }
 
+void product_add_bf16(const void* w, const float* w_scale, int64_t rows, int64_t K, const void* act, const float* gs,
+                      int64_t tokens, uint16_t* dst, int64_t ld, void* stream) {
+    check(w, w, rows, K, tokens, act, dst, ld, "product_add_bf16");
+    Params p{};
+    p.gs = gs;
+    p.ws[0] = w_scale;
+    p.dst = reinterpret_cast<float*>(dst);
+    p.ld = ld;
+    launch<false, true, true>(p, w, nullptr, rows, K, act, tokens, (cudaStream_t) stream);
+}
+
+void rms_norm_quantize(const uint16_t* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* gs,
+                       void* stream) {
+    if (rows <= 0) return;
+    if (cols % 256 || (reinterpret_cast<uintptr_t>(x) & 15) || (reinterpret_cast<uintptr_t>(act) & 15)) {
+        basalt::log::error("basalt", "fp4 dense: rms_norm_quantize %lld columns", (long long) cols);
+        std::exit(1);
+    }
+    uint8_t* codes = (uint8_t*) act;
+    uint8_t* scales = codes + (size_t) rows * (size_t) (cols / 2);
+    const unsigned grid = (unsigned) ((padded(rows) + 7) / 8);
+    quantize_kernel<true, false, __nv_bfloat16><<<grid, 256, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), codes, scales, gs, (int) cols, cols, rows, w, eps, nullptr);
+    ck(cudaGetLastError(), "rms_norm_quantize");
+}
+
 void swiglu(const void* w_gate, const void* w_up, const float* s_gate, const float* s_up, int64_t rows, int64_t K,
-            const void* act, const float* gs, int64_t tokens, float* dst, int64_t ld, void* stream) {
+            const void* act, const float* gs, int64_t tokens, uint16_t* dst, int64_t ld, void* stream, float* amax) {
     check(w_gate, w_up, rows, K, tokens, act, dst, ld, "swiglu");
     Params p{};
+    p.amax = amax;
+    if (amax && cudaMemsetAsync(amax, 0, (size_t) tokens * sizeof(float), (cudaStream_t) stream) != cudaSuccess)
+        ck(cudaGetLastError(), "swiglu amax");
     p.gs = gs;
     p.ws[0] = s_gate;
     p.ws[1] = s_up;
-    p.dst = dst;
+    p.hdst = reinterpret_cast<__nv_bfloat16*>(dst);
     p.ld = ld;
     launch<true, false>(p, w_gate, w_up, rows, K, act, tokens, (cudaStream_t) stream);
 }

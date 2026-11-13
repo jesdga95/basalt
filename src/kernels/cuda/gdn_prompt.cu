@@ -9,6 +9,7 @@
 #include "basalt/kernels/gdn_prompt.hpp"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -85,6 +86,23 @@ __device__ __forceinline__ void mma_tf32(float (&c)[4], unsigned a0, unsigned a1
 __device__ __forceinline__ void cp16(void* dst, const void* src, int bytes) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr(dst)), "l"(src), "r"(bytes));
 }
+__device__ __forceinline__ void cp8(void* dst, const void* src, int bytes) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(smem_addr(dst)), "l"(src), "r"(bytes));
+}
+// FP32 or BF16 activations (the prompt chunk's are BF16, Flash-Next's FP32)
+__device__ __forceinline__ float ld1(const float* p) { return *p; }
+__device__ __forceinline__ float ld1(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+__device__ __forceinline__ void st1(float* p, float v) { *p = v; }
+__device__ __forceinline__ void st1(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+__device__ __forceinline__ float4 ld4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+__device__ __forceinline__ float4 ld4(const __nv_bfloat16* p) {
+    const uint2 u = *reinterpret_cast<const uint2*>(p);
+    const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+    const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+__device__ __forceinline__ float2 ld2(const float* p) { return *reinterpret_cast<const float2*>(p); }
+__device__ __forceinline__ float2 ld2(const __nv_bfloat16* p) { return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p)); }
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
 template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
 __device__ __forceinline__ float sum16(float v) {
@@ -102,7 +120,8 @@ struct PrepareShared {
 };
 
 // Block (chunk, value head): row = token in the chunk, 16 threads per row with 8 coordinates each.
-__device__ __forceinline__ void gdn_prepare(int bid, const float* __restrict__ h, const float* __restrict__ gate,
+template <class In>
+__device__ __forceinline__ void gdn_prepare(int bid, const In* __restrict__ h, const float* __restrict__ gate,
                                             const float* __restrict__ beta, float eps, int T, QkChunk* __restrict__ qk_out,
                                             Control* __restrict__ ctl_out) {
     __shared__ PrepareShared sm;
@@ -112,9 +131,9 @@ __device__ __forceinline__ void gdn_prepare(int bid, const float* __restrict__ h
     const int row = tid / 16, col = (tid & 15) * 8;
     float q[8] = {}, k[8] = {};
     if (row < length) {
-        const float* hq = h + (int64_t) (start + row) * C + qh * S + col;
-        const float4 q0 = *reinterpret_cast<const float4*>(hq), q1 = *reinterpret_cast<const float4*>(hq + 4);
-        const float4 k0 = *reinterpret_cast<const float4*>(hq + HK * S), k1 = *reinterpret_cast<const float4*>(hq + HK * S + 4);
+        const In* hq = h + (int64_t) (start + row) * C + qh * S + col;
+        const float4 q0 = ld4(hq), q1 = ld4(hq + 4);
+        const float4 k0 = ld4(hq + HK * S), k1 = ld4(hq + HK * S + 4);
         q[0] = q0.x; q[1] = q0.y; q[2] = q0.z; q[3] = q0.w; q[4] = q1.x; q[5] = q1.y; q[6] = q1.z; q[7] = q1.w;
         k[0] = k0.x; k[1] = k0.y; k[2] = k0.z; k[3] = k0.w; k[4] = k1.x; k[5] = k1.y; k[6] = k1.z; k[7] = k1.w;
     }
@@ -198,24 +217,26 @@ __device__ __forceinline__ void gdn_prepare(int bid, const float* __restrict__ h
         for (int i = tid; i < (int) (sizeof(QkChunk) / 16); i += NTH) qd[i] = qs4[i];
     }
 }
-__global__ void __launch_bounds__(NTH, 2) gdn_prepare_kernel(const float* __restrict__ h, const float* __restrict__ gate,
+template <class In>
+__global__ void __launch_bounds__(NTH, 2) gdn_prepare_kernel(const In* __restrict__ h, const float* __restrict__ gate,
                                                              const float* __restrict__ beta, float eps, int T,
                                                              QkChunk* __restrict__ qk_out, Control* __restrict__ ctl_out) {
     gdn_prepare(blockIdx.x, h, gate, beta, eps, T, qk_out, ctl_out);
 }
 
-struct alignas(256) Stage {
+template <class In> struct alignas(256) Stage {
     QkChunk qk;
     Control control;
-    float value[CK * DV];
+    In value[CK * DV];
 };
-struct ChunkShared {
-    Stage stage[2];
+template <class In> struct ChunkShared {
+    Stage<In> stage[2];
     float snapshot[S * DV];   // the state at the chunk's start, [key][value]
     float delta[CK * DV];
 };
 
-__device__ __forceinline__ void load_stage(Stage& st, const float* __restrict__ h, const QkChunk* __restrict__ qk,
+template <class In>
+__device__ __forceinline__ void load_stage(Stage<In>& st, const In* __restrict__ h, const QkChunk* __restrict__ qk,
                                            const Control* __restrict__ ctl, int head, int vstart, int chunk, int chunks,
                                            int T, int tid) {
     const uint4* qs = reinterpret_cast<const uint4*>(qk + (int64_t) (head % HK) * chunks + chunk);
@@ -228,8 +249,10 @@ __device__ __forceinline__ void load_stage(Stage& st, const float* __restrict__ 
     // CK x DV values, four per thread
     const int row = tid / (DV / 4), col = (tid % (DV / 4)) * 4;
     const int t = chunk * CK + row;
-    cp16(st.value + row * DV + col, h + (int64_t) (t < T ? t : 0) * C + 2 * HK * S + head * S + vstart + col,
-         t < T ? 16 : 0);
+    if constexpr (sizeof(In) == 4)
+        cp16(st.value + row * DV + col, h + (int64_t) (t < T ? t : 0) * C + 2 * HK * S + head * S + vstart + col, t < T ? 16 : 0);
+    else
+        cp8(st.value + row * DV + col, h + (int64_t) (t < T ? t : 0) * C + 2 * HK * S + head * S + vstart + col, t < T ? 8 : 0);
     cp_commit();
 }
 
@@ -259,9 +282,10 @@ __device__ __forceinline__ void matrix_delta(float (&acc)[4], const float* m, co
 }
 
 // Block (value head, DV-column stripe); warp w owns value columns 8 w .. 8 w + 7 of the stripe, all 128 key rows.
-__device__ __forceinline__ void gdn_chunk(int bid, float* __restrict__ state, const float* __restrict__ h,
+template <class In>
+__device__ __forceinline__ void gdn_chunk(int bid, float* __restrict__ state, const In* __restrict__ h,
                                           const QkChunk* __restrict__ qk, const Control* __restrict__ ctl,
-                                          float* __restrict__ y, int T, ChunkShared& sm) {
+                                          float* __restrict__ y, int T, ChunkShared<In>& sm) {
     constexpr int MT = S / 16;   // key tiles
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const int g = lane / 4, t = lane & 3;
@@ -290,7 +314,7 @@ __device__ __forceinline__ void gdn_chunk(int bid, float* __restrict__ state, co
             *reinterpret_cast<float2*>(sm.snapshot + value_index(key + 8, col)) = make_float2(st[m][2], st[m][3]);
         }
         __syncthreads();
-        const Stage& sg = sm.stage[chunk & 1];
+        const Stage<In>& sg = sm.stage[chunk & 1];
         const Control& p = sg.control;
         float hist[4] = {}, pred[4] = {};
         // pred = K S (TF32), hist = Q S (BF16)
@@ -311,8 +335,8 @@ __device__ __forceinline__ void gdn_chunk(int bid, float* __restrict__ state, co
         }
         {   // residual R = V - diag(prefix) K S
             const int r = lane / 4, c = warp * 8 + (lane & 3) * 2;
-            const float2 v0 = *reinterpret_cast<const float2*>(sg.value + r * DV + c);
-            const float2 v1 = *reinterpret_cast<const float2*>(sg.value + (r + 8) * DV + c);
+            const float2 v0 = ld2(sg.value + r * DV + c);
+            const float2 v1 = ld2(sg.value + (r + 8) * DV + c);
             *reinterpret_cast<float2*>(sm.delta + value_index(r, c)) =
                 make_float2(v0.x - p.prefix[r] * pred[0], v0.y - p.prefix[r] * pred[1]);
             *reinterpret_cast<float2*>(sm.delta + value_index(r + 8, c)) =
@@ -364,11 +388,12 @@ __device__ __forceinline__ void gdn_chunk(int bid, float* __restrict__ state, co
         *reinterpret_cast<float2*>(state + (key + 8) * rs + v) = make_float2(st[m][2], st[m][3]);
     }
 }
-__global__ void __launch_bounds__(NTH, 2) gdn_chunk_kernel(float* __restrict__ state, const float* __restrict__ h,
+template <class In>
+__global__ void __launch_bounds__(NTH, 2) gdn_chunk_kernel(float* __restrict__ state, const In* __restrict__ h,
                                                            const QkChunk* __restrict__ qk, const Control* __restrict__ ctl,
                                                            float* __restrict__ y, int T) {
     extern __shared__ __align__(256) unsigned char backing[];
-    gdn_chunk(blockIdx.x, state, h, qk, ctl, y, T, *reinterpret_cast<ChunkShared*>(backing));
+    gdn_chunk(blockIdx.x, state, h, qk, ctl, y, T, *reinterpret_cast<ChunkShared<In>*>(backing));
 }
 
 // the output norm over a head's 128 columns, into the FP16 copy the out projection reads
@@ -394,6 +419,66 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
     if (yn) yn[at] = v;
 }
 
+// The same norm, a block per token over all its heads, rounded straight to E4M3 for the out projection: scale
+// amax / 448 per token, codes v * (448 / amax) rounded to nearest even and saturated (prefill::fp8::quantize's rows,
+// bitwise: each head's sum of squares adds in gdn_out_norm_kernel's order, so v is its value).  A warp takes a head at a
+// time, lane l holding columns l, l + 32, l + 64 and l + 96.
+constexpr int kNormWarps = 16, kNormHeads = (HV + kNormWarps - 1) / kNormWarps;
+template <class In>
+__global__ void __launch_bounds__(kNormWarps * 32) gdn_out_norm_e4m3_kernel(const In* __restrict__ z,
+                                                                           const float* __restrict__ gamma, float eps,
+                                                                           const float* __restrict__ y,
+                                                                           uint8_t* __restrict__ codes,
+                                                                           float* __restrict__ scales, GdnGate act) {
+    __shared__ float red[kNormWarps];
+    const int64_t t = blockIdx.x;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    float v[kNormHeads][4];
+    float m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kNormHeads; ++i) {
+        const int head = warp + i * kNormWarps;
+        if (head >= HV) break;
+        const size_t base = (size_t) t * HV * S + (size_t) head * S;
+        float oc[4], w[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            oc[k] = y[base + lane + 32 * k];
+            float sp = oc[k] * oc[k];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) sp += __shfl_xor_sync(0xffffffffu, sp, o);
+            w[k] = sp;
+        }
+        const float ss = w[0] + w[1] + w[2] + w[3];
+        const float inv = rsqrtf(ss / (float) S + eps);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int col = lane + 32 * k;
+            const float zv = ld1(z + base + col);
+            v[i][k] = oc[k] * inv * gamma[col] * (act == GdnGate::Silu ? zv * sigm(zv) : sigm(zv));
+            m = fmaxf(m, fabsf(v[i][k]));
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kNormWarps; ++i) amax = fmaxf(amax, red[i]);
+    if (threadIdx.x == 0) scales[t] = amax / 448.0f;
+    const float q = amax > 0.0f ? 448.0f / amax : 0.0f;
+#pragma unroll
+    for (int i = 0; i < kNormHeads; ++i) {
+        const int head = warp + i * kNormWarps;
+        if (head >= HV) break;
+        uint8_t* row = codes + (size_t) t * HV * S + (size_t) head * S;
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            row[lane + 32 * k] = (uint8_t) __nv_cvt_float_to_fp8(v[i][k] * q, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
 // ---------------------------------------------------------------- gates and conv
 __global__ void gdn_gates_kernel(const float* __restrict__ ab, const float* __restrict__ dt,
                                  const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta,
@@ -406,16 +491,17 @@ __global__ void gdn_gates_kernel(const float* __restrict__ ab, const float* __re
     beta[i] = 1.0f / (1.0f + __expf(-ab[t * 2 * HV + HV + h]));
 }
 // one thread per channel, walks the chunk; then a second kernel normalises
-__global__ void gdn_conv_kernel(float* __restrict__ hist, const float* __restrict__ qkv, const float* __restrict__ w,
-                                float* __restrict__ h, int64_t T) {
+template <class In>
+__global__ void gdn_conv_kernel(float* __restrict__ hist, const In* __restrict__ qkv, const float* __restrict__ w,
+                                In* __restrict__ h, int64_t T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float v0 = hist[c * 3], v1 = hist[c * 3 + 1], v2 = hist[c * 3 + 2];
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
     for (int64_t t = 0; t < T; ++t) {
-        const float x = qkv[t * C + c];
+        const float x = ld1(qkv + t * C + c);
         const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
-        h[t * C + c] = s / (1.0f + __expf(-s));
+        st1(h + t * C + c, s / (1.0f + __expf(-s)));
         v0 = v1; v1 = v2; v2 = x;
     }
     hist[c * 3] = v0; hist[c * 3 + 1] = v1; hist[c * 3 + 2] = v2;
@@ -424,31 +510,33 @@ __global__ void gdn_conv_kernel(float* __restrict__ hist, const float* __restric
 // the history before it) instead of carrying them - the conv reads inputs, not its own outputs, so the tiles are
 // independent. The same expression per element (so the same bits); the history is written afterwards.
 constexpr int CONV_TILE = 64;
-__global__ void gdn_conv_tiled_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
-                                      const float* __restrict__ w, float* __restrict__ h, int64_t T) {
+template <class In>
+__global__ void gdn_conv_tiled_kernel(const float* __restrict__ hist, const In* __restrict__ qkv,
+                                      const float* __restrict__ w, In* __restrict__ h, int64_t T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     const int64_t t0 = (int64_t) blockIdx.y * CONV_TILE;
     if (t0 >= T) return;
     const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
-    auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
+    auto input = [&](int64_t t) -> float { return t >= 0 ? ld1(qkv + t * C + c) : hist[c * 3 + (int) (t + 3)]; };
     float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
     for (int64_t t = t0; t < t1; ++t) {
-        const float x = qkv[t * C + c];
+        const float x = ld1(qkv + t * C + c);
         const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
-        h[t * C + c] = s / (1.0f + __expf(-s));
+        st1(h + t * C + c, s / (1.0f + __expf(-s)));
         v0 = v1; v1 = v2; v2 = x;
     }
 }
 // the history after the chunk: its last three inputs (the older history where the chunk is shorter than 3)
-__global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T) {
+template <class In>
+__global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const In* __restrict__ qkv, int64_t T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float v[3];
     for (int k = 0; k < 3; ++k) {
         const int64_t t = T - 3 + k;
-        v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)];
+        v[k] = t >= 0 ? ld1(qkv + t * C + c) : hist[c * 3 + (int) (t + 3)];
     }
     hist[c * 3] = v[0]; hist[c * 3 + 1] = v[1]; hist[c * 3 + 2] = v[2];
 }
@@ -472,13 +560,13 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
     check("gdn_gates");
 }
 
-void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, void* stream) {
+template <class In> void conv_impl(float* history, const In* qkv, const float* conv_w, In* h, int64_t T, void* stream) {
     if (T <= CONV_TILE) {
-        gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
+        gdn_conv_kernel<In><<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
     } else {
-        gdn_conv_tiled_kernel<<<dim3(C / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
-                                (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
-        gdn_conv_hist_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, T);
+        gdn_conv_tiled_kernel<In><<<dim3(C / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
+                                    (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
+        gdn_conv_hist_kernel<In><<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, T);
     }
     check("gdn_conv");
 }
@@ -488,32 +576,57 @@ uint64_t gdn_work_bytes(int64_t T) {
     return (uint64_t) chunks * (HK * sizeof(QkChunk) + HV * sizeof(Control));
 }
 
-void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
+namespace {
+template <class In>
+void recurrence_impl(float* state, const In* h, const float* gate, const float* beta, const In* z,
                     const float* gamma, float eps, void* work, float* y, uint16_t* y16, int64_t T, void* stream,
-                    GdnGate act, float* yn) {
+                    GdnGate act, float* yn, uint8_t* y8, float* y8_scale) {
     if (T > 0) {
         const cudaStream_t s = (cudaStream_t) stream;
         const int chunks = (int) ((T + CK - 1) / CK);
         QkChunk* qk = static_cast<QkChunk*>(work);
         Control* ctl = reinterpret_cast<Control*>(qk + (int64_t) HK * chunks);
-        gdn_prepare_kernel<<<(unsigned) (HV * chunks), NTH, 0, s>>>(h, gate, beta, eps, (int) T, qk, ctl);
+        gdn_prepare_kernel<In><<<(unsigned) (HV * chunks), NTH, 0, s>>>(h, gate, beta, eps, (int) T, qk, ctl);
         // the shared-memory opt-in is per device (a layer split runs this on several, from different threads)
-        static std::atomic<bool> attr[64];
+        static std::atomic<bool> attr[64];   // per In instance
         int dev = 0;
         cudaGetDevice(&dev);
         if (dev < 0 || dev >= 64) { basalt::log::error("basalt", "gdn_recurrence: device %d out of range", dev); std::abort(); }
         if (!attr[dev].load(std::memory_order_acquire)) {
-            if (cudaFuncSetAttribute(gdn_chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     (int) sizeof(ChunkShared)) != cudaSuccess) {
+            if (cudaFuncSetAttribute(gdn_chunk_kernel<In>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int) sizeof(ChunkShared<In>)) != cudaSuccess) {
                 basalt::log::error("basalt", "gdn_recurrence: shared-memory opt-in failed");
                 std::abort();
             }
             attr[dev].store(true, std::memory_order_release);
         }
-        gdn_chunk_kernel<<<HV * (S / DV), NTH, sizeof(ChunkShared), s>>>(state, h, qk, ctl, y, (int) T);
-        gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, s>>>(z, gamma, eps, y, y16, yn, act);
+        gdn_chunk_kernel<In><<<HV * (S / DV), NTH, sizeof(ChunkShared<In>), s>>>(state, h, qk, ctl, y, (int) T);
+        if constexpr (sizeof(In) == 4)
+            if (y16 || yn) gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, s>>>(z, gamma, eps, y, y16, yn, act);
+        if (y8) gdn_out_norm_e4m3_kernel<In><<<(unsigned) T, kNormWarps * 32, 0, s>>>(z, gamma, eps, y, y8, y8_scale, act);
     }
     check("gdn_recurrence");
+}
+
+}  // namespace
+
+void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, void* stream) {
+    conv_impl(history, qkv, conv_w, h, T, stream);
+}
+void gdn_conv(float* history, const uint16_t* qkv, const float* conv_w, uint16_t* h, int64_t T, void* stream) {
+    conv_impl(history, reinterpret_cast<const __nv_bfloat16*>(qkv), conv_w, reinterpret_cast<__nv_bfloat16*>(h), T, stream);
+}
+
+void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                    const float* gamma, float eps, void* work, float* y, uint16_t* y16, int64_t T, void* stream,
+                    GdnGate act, float* yn, uint8_t* y8, float* y8_scale) {
+    recurrence_impl(state, h, gate, beta, z, gamma, eps, work, y, y16, T, stream, act, yn, y8, y8_scale);
+}
+void gdn_recurrence_bf16(float* state, const uint16_t* h, const float* gate, const float* beta, const uint16_t* z,
+                         const float* gamma, float eps, void* work, float* y, int64_t T, void* stream, GdnGate act,
+                         uint8_t* y8, float* y8_scale) {
+    recurrence_impl(state, reinterpret_cast<const __nv_bfloat16*>(h), gate, beta, reinterpret_cast<const __nv_bfloat16*>(z), gamma,
+                    eps, work, y, nullptr, T, stream, act, nullptr, y8, y8_scale);
 }
 
 }  // namespace basalt::kernels

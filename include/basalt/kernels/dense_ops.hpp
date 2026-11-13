@@ -16,6 +16,12 @@ void rms_norm_rows(const float* x, const float* w, float* out, int64_t rows, int
                    int64_t ld_out = 0);
 /// x[i] += y[i] * scale  (n values).
 void add_scaled(float* x, const float* y, const float* scale, int64_t n, void* stream);
+/// The BF16 residual stream: x += y * (*scale) (scale null: 1) in fp32, rounded once; and conversions to and from FP32.
+void add_scaled(uint16_t* x, const float* y, const float* scale, int64_t n, void* stream);
+void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream);
+void to_f32(const uint16_t* x, float* y, int64_t n, void* stream);
+/// rms_norm_rows of BF16 rows (FP32 math and output).
+void rms_norm_rows(const uint16_t* x, const float* w, float* out, int64_t rows, int64_t cols, float eps, void* stream);
 /// y[i] *= scale  (n values).
 void scale_values(float* y, const float* scale, int64_t n, void* stream);
 /// h[i] = silu(g[i] * sg) * (u[i] * su)  (n values; g, u and h may each have their own row stride: rows x width).
@@ -35,6 +41,9 @@ void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64
 /// The GDN a/b projections of a prompt chunk with the gates fused: w_ab BF16 [2 HV][K] (the a rows, then the b rows),
 /// gate[t][h] = softplus(a + dt[h]) * ssm_a[h], beta[t][h] = sigmoid(b).  Replaces bf16_rows_dot + gdn_gates (HV = 48, K % 512 == 0).
 void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
+                     int64_t T, int64_t HV, int64_t K, void* stream);
+/// As gdn_gating_proj, of BF16 rows (exact: one BF16 term).
+void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
                      int64_t T, int64_t HV, int64_t K, void* stream);
 
 /// The rotary part of a gated GQA attention layer: `rot` leading dims of each head rotate NeoX-style (pairs i and
@@ -56,8 +65,16 @@ void attn_qk_prepare(const float* q_full, const float* k, const float* v, const 
                      float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv,
                      float* q_out, uint16_t* k_cache, uint16_t* v_cache, int64_t cell0, void* stream, int hd = 256,
                      bool gated = true, int64_t cap = 0, const int32_t* cell0_dev = nullptr, KvInt8 q8 = {});
+/// The prompt chunk's form: BF16 q_full (gated, hd 256), k and v; FP32 q_out; the cache at cells cell0 + t.
+void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint16_t* v, const float* q_norm, const float* k_norm,
+                          float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv, float* q_out,
+                          int64_t cell0, void* stream, KvInt8 q8, uint16_t* k_cache, uint16_t* v_cache);
 /// out[t][h][d] = attn[t][h][d] * sigmoid(q_full[t][h][hd + d])  (hd = 256).
 void attn_gate(const float* attn, const float* q_full, float* out, int64_t T, int n_head, void* stream);
+/// attn_gate's rows rounded to E4M3 for the out projection: codes [T][n_head * 256], scales[T] = amax / 448 per token
+/// (prefill::fp8::quantize of attn_gate's output, bitwise).
+void attn_gate_e4m3(const float* attn, const float* q_full, int64_t T, int n_head, uint8_t* codes, float* scales, void* stream);
+void attn_gate_e4m3(const float* attn, const uint16_t* q_full, int64_t T, int n_head, uint8_t* codes, float* scales, void* stream);
 
 /// A block drafter's two-tap grouped dynamic convolution along a block's rows (DFlash 2):
 /// out[t][c] = sum over o in {0, 1} of (base[o][c] + dyn[t][o * groups + c / group]) * x[t - o][c], x[-1] = 0.
