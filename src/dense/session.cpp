@@ -136,9 +136,9 @@ public:
 
     bool copy_drafts() const override { return max_window() > 1; }
 
-    // The block drafter's width for n drafts: its own block, or wider (up to the window) when more drafts are asked for:
-    // the policy asks for more only after windows whose drafts were all taken, and reads each draft's confidence.
-    int block_width(int n) const { return std::clamp(n + 1, m_.w.dflash.block, kWindow); }
+    // The block drafter's width for n drafts: its own block, or wider (up to the window) right after a window whose rows
+    // were all kept, so a run of accepted drafts can grow past the block; the policy reads each draft's confidence.
+    int block_width(int n) const { return last_full_ ? std::clamp(n + 1, m_.w.dflash.block, kWindow) : m_.w.dflash.block; }
 
     // The drafter's chain after `anchor` (the token at `pos`): step 0 pairs main's last normed row (cell pos - 1) with
     // the anchor, each later step its own output with the draft before it; all on the stream, read by draft_end.
@@ -184,8 +184,6 @@ public:
         for (int i = 0; i < count; ++i) {
             ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
             if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return fail(m_.o.arch + ": a draft batch of sessions of another model");
-            if (pos[i] + block_width(std::clamp(n[i], 1, max_window() - 1)) > m_.o.max_context)
-                return fail(m_.o.arch + ": no room for a draft block");
             if (Result r = ss[(size_t) i]->settle(pos[i]); !r.ok()) return r;
             if (cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
         }
@@ -197,7 +195,8 @@ public:
         std::vector<int> nn((size_t) count), width((size_t) count);
         for (int i = 0; i < count; ++i) {
             nn[(size_t) i] = std::clamp(n[i], 1, max_window() - 1);
-            width[(size_t) i] = block_width(nn[(size_t) i]);
+            width[(size_t) i] = ss[(size_t) i]->block_width(nn[(size_t) i]);
+            if (pos[i] + width[(size_t) i] > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
         }
         const cudaStream_t s0 = sts[0]->stream;
         for (int i = 0; i < count;) {
@@ -593,6 +592,7 @@ private:
             st_.rope_delta = 0;
             st_.tail_cell = -1;
             st_.dctx_from = 0;
+            last_full_ = false;
             if (g_.gdn_layers() &&
                 cudaMemsetAsync(st_.gdn, 0, (size_t) g_.gdn_layers() * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
                 return fail("clearing the recurrent state failed");
@@ -604,6 +604,7 @@ private:
         const int T = pend_T_;
         pend_T_ = 0;
         if (n < 0 || n > T) return fail(m_.o.arch + ": position " + std::to_string((long long) pos) + " is not reachable from the last window");
+        last_full_ = n == T;
         commit_window(m_, st_, (int) n);
         if (block_ && n > 0) {   // the kept rows become the block drafter's context
             std::string err;
@@ -692,6 +693,7 @@ private:
     bool drafter_ = false, block_ = false;
     int n_draft_ = 0;
     cudaEvent_t done_ = nullptr;   // a batched drafter pass, for the other sessions' streams
+    bool last_full_ = false;       // the last settled window kept all its rows
     int64_t pend_pos_ = 0;
     int pend_T_ = 0;
     kernels::SamplerParams sampling_{};
