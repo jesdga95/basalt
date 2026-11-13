@@ -232,6 +232,36 @@ int main(int argc, char** argv) {
         std::printf("fp8 gemm segmented (3 matrices, Store and Add) bitwise against separate products: %s\n", segbad ? "NO" : "yes");
         fails += segbad;
     }
+    {   // the norm in the quantizer: its normed rows against a host RMSNorm, and its codes those of quantize(normed rows)
+        std::vector<float> nw(K);
+        for (auto& v : nw) v = 1.0f + 0.1f * nd(rng);
+        float *d_nw, *d_xn;
+        void* act2;
+        cudaMalloc(&d_nw, K * 4);
+        cudaMalloc(&d_xn, (size_t) T * K * 4);
+        cudaMalloc(&act2, fp8::act_bytes(T, K));
+        cudaMemcpy(d_nw, nw.data(), K * 4, cudaMemcpyHostToDevice);
+        fp8::rms_norm_quantize(dx, d_nw, 1e-6f, T, K, act, d_xn, nullptr);
+        fp8::quantize(d_xn, T, K, K, act2, nullptr);
+        std::vector<uint8_t> a1(fp8::act_bytes(T, K)), a2(a1.size());
+        std::vector<float> xn((size_t) T * K);
+        cudaMemcpy(a1.data(), act, a1.size(), cudaMemcpyDeviceToHost);
+        cudaMemcpy(a2.data(), act2, a2.size(), cudaMemcpyDeviceToHost);
+        cudaMemcpy(xn.data(), d_xn, xn.size() * 4, cudaMemcpyDeviceToHost);
+        double nerr = 0;
+        for (int64_t t = 0; t < T; ++t) {
+            double ss = 0;
+            for (int64_t k = 0; k < K; ++k) ss += (double) x[(size_t) t * K + k] * x[(size_t) t * K + k];
+            const double inv = 1.0 / std::sqrt(ss / K + 1e-6);
+            for (int64_t k = 0; k < K; ++k) {
+                const double want = x[(size_t) t * K + k] * inv * nw[k];
+                nerr = std::max(nerr, std::fabs(xn[(size_t) t * K + k] - want) / (std::fabs(want) + 1e-3));
+            }
+        }
+        const bool same = a1 == a2;
+        std::printf("fp8 rms_norm_quantize: normed rows rel %.3g, codes and scales %s\n", nerr, same ? "bitwise quantize's" : "DIFFER");
+        if (nerr > 1e-5 || !same) ++fails;
+    }
     if (cudaGetLastError() != cudaSuccess) ++fails;
     std::printf("%s\n", fails ? "FAILED" : "PASS");
     return fails ? 1 : 0;

@@ -180,9 +180,27 @@ int main(int argc, char** argv) {
         worst_q = std::max(worst_q, std::fabs(gsh[t] - amax / (6.0 * 448.0)) / (amax / (6.0 * 448.0)));
         worst_q = std::max(worst_q, err / amax / 0.25);   // half a step of 2 .. 3 spacing near the top, with the scale's rounding
     }
+    // the norm in the quantizer: its codes and token scales are quantize()'s of its own normed rows
+    bool norm_same = false;
+    {
+        std::vector<float> nw(K);
+        for (auto& v : nw) v = 1.0f + 0.1f * nd(rng);
+        float* dnw = dev_copy(nw);
+        float *dxn, *gs2;
+        void* act2;
+        cudaMalloc(&dxn, (size_t) T * K * 4);
+        cudaMalloc(&gs2, T * 4);
+        cudaMalloc(&act2, fd::act_bytes(T, K));
+        fd::rms_norm_quantize(dx, dnw, 1e-6f, T, K, act, gs, dxn, nullptr);
+        fd::quantize(dxn, T, K, K, act2, gs2, nullptr);
+        cudaDeviceSynchronize();
+        norm_same = host_copy((const uint8_t*) act, fd::act_bytes(T, K)) == host_copy((const uint8_t*) act2, fd::act_bytes(T, K)) &&
+                    host_copy(gs, T) == host_copy(gs2, T);
+        std::printf("fp4 dense rms_norm_quantize: codes and scales %s\n", norm_same ? "bitwise quantize's of its normed rows" : "DIFFER");
+    }
     const bool same = std::memcmp(hy.data(), hy2.data(), (size_t) T2 * R * 4) == 0;
     const bool same1 = std::memcmp(hy.data(), hy1.data(), (size_t) R * 4) == 0;
-    const bool ok = !launch_err && worst_plain < 1e-5 && worst_add < 1e-5 && worst_sw < 1e-5 && worst_q < 1.0 && same && same1;
+    const bool ok = !launch_err && worst_plain < 1e-5 && worst_add < 1e-5 && worst_sw < 1e-5 && worst_q < 1.0 && same && same1 && norm_same;
     std::printf("fp4 dense tma [%lld x %lld] x %lld tokens: plain max err %.3g, add %.3g, swiglu %.3g (x sum|wx|), quantizer %.3g; "
                 "rows bitwise at 1, 1000, 1100 tokens: %s%s\n",
                 (long long) R, (long long) K, (long long) T, worst_plain, worst_add, worst_sw, worst_q,
