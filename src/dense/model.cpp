@@ -4,6 +4,7 @@
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/logprobs.hpp"
+#include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/prefill/fp8_gemm.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -139,7 +140,8 @@ size_t chunk_bytes(const Geometry& g) {
     const size_t widest = std::max<size_t>({H, (size_t) g.n_ff, VD, AQ});
     const size_t keep = 6 * T * H * 4 + H * 4 +
                         std::max(prefill::mmq::q8_bytes(T, (int64_t) widest), prefill::fp8::act_bytes(T, (int64_t) widest)) +
-                        prefill::fp4::a4_bytes((int64_t) T, (int64_t) std::max<size_t>(H, g.n_ff), 1) +
+                        std::max(prefill::fp4::a4_bytes((int64_t) T, (int64_t) std::max<size_t>(H, g.n_ff), 1),
+                                 prefill::fp4_dense::act_bytes((int64_t) T, (int64_t) std::max<size_t>(H, g.n_ff))) +
                         prefill::fp4::scale_count((int64_t) T, 1) * 4 + 4 * 256;
     const size_t gdn = g.gdn_layers() ? (2 * T * C + 3 * T * VD + 4 * T * HV) * 4 + kernels::gdn_work_bytes(T) : 0;
     const size_t attn = g.attn_layers() ? T * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) * 4 +
@@ -217,7 +219,7 @@ bool Model::ready_products(std::string& err) {
         for (const Linear* l : {&Lp->qkv, &Lp->z, &Lp->out, &Lp->q, &Lp->k, &Lp->v, &Lp->o, &Lp->gate, &Lp->up, &Lp->down})
             if (l->w) ls.push_back(l);
     for (const Linear* l : ls) {
-        if (l->type == kTypeF8 || l->type == kTypeNvfp4P) continue;   // the window gemm's, not MMQ's
+        if (l->type == kTypeF8 || l->type == kTypeNvfp4Planes) continue;   // the window gemm's, not MMQ's
         if (!prefill::mmq::fits(l->type, l->rows)) {
             err = o.arch + ": the products have no tile for a " + std::to_string(l->rows) + "-row matrix";
             return false;
@@ -251,8 +253,10 @@ bool Model::ensure_chunk(std::string& err) {
         b.hn = pre_arena.take<float>((T + 1) * H);
     }
     if (o.drafter == Drafter::Block) b.dacc = pre_arena.take<float>(T * H);
-    b.a4 = pre_arena.take_bytes(prefill::fp4::a4_bytes((int64_t) T, (int64_t) std::max<size_t>(H, gg.n_ff), 1));
-    b.gs = pre_arena.take<float>(prefill::fp4::scale_count((int64_t) T, 1));
+    // the FP4 activations: the expert-tiled planes (ggml-block weights) or fp4_dense's (NVFP4_PLANES weights)
+    const int64_t a4w = (int64_t) std::max<size_t>(H, gg.n_ff);
+    b.a4 = pre_arena.take_bytes(std::max(prefill::fp4::a4_bytes((int64_t) T, a4w, 1), prefill::fp4_dense::act_bytes((int64_t) T, a4w)));
+    b.gs = pre_arena.take<float>(std::max<size_t>(prefill::fp4::scale_count((int64_t) T, 1), T));
     b.tile_off = pre_arena.take<int32_t>(prefill::fp4::kMaxExperts + 1);
     b.ffn_tail = pre_arena.take<float>(4 * (size_t) gg.n_layers);
     for (int il = 0; il < gg.n_layers && b.ffn_tail; ++il) {   // the scales a long chunk's SwiGLU product reads

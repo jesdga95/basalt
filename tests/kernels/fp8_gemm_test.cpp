@@ -1,7 +1,7 @@
 // tests/kernels/fp8_gemm_test.cpp - prefill::fp8 (fp8_gemm.hpp): the row quantizer against a CPU E4M3 rounding, the
 // product against a double reference on the same codes (a chunk whose rows are not a tile multiple), the Add epilogue,
-// and each row the same whatever the chunk's length.  --bench: TFLOP/s at the Qwen3.8-27B projection shapes, 2048
-// rows.  Exit 77 without a GPU.
+// each row the same whatever the chunk's length, and a segmented product against separate products.  --bench: TFLOP/s (random data) at the Qwen3.8-27B projection shapes,
+// 2048 rows, and the segmented products.  Exit 77 without a GPU.
 #include "basalt/prefill/fp8_gemm.hpp"
 
 #include <cuda_fp8.h>
@@ -21,6 +21,27 @@ float e4m3(uint8_t b) {
     std::memcpy(&v, &b, 1);
     return (float) v;
 }
+// Random E4M3 weight codes (no NaN) and random activations: constant data draws less power and flatters the clocks.
+void fill_w(uint8_t* d, size_t n, uint64_t seed) {
+    std::vector<uint8_t> h(n);
+    uint64_t x = seed * 0x9E3779B97F4A7C15ull + 1;
+    for (size_t i = 0; i < n; ++i) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        uint8_t b = (uint8_t) (x >> 24);
+        if ((b & 0x7f) == 0x7f) b = 0x31;
+        h[i] = b;
+    }
+    cudaMemcpy(d, h.data(), n, cudaMemcpyHostToDevice);
+}
+void fill_x(float* d, size_t n, uint64_t seed) {
+    std::vector<float> h(n);
+    uint64_t x = seed * 0x9E3779B97F4A7C15ull + 7;
+    for (size_t i = 0; i < n; ++i) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        h[i] = (float) (int32_t) (x >> 32) * (1.0f / 2147483648.0f);
+    }
+    cudaMemcpy(d, h.data(), n * 4, cudaMemcpyHostToDevice);
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -37,9 +58,9 @@ int main(int argc, char** argv) {
             float *x, *y;
             void* act;
             cudaMalloc(&w, (size_t) M * K);
-            cudaMemset(w, 0x38, (size_t) M * K);
+            fill_w(w, (size_t) M * K, 1);
             cudaMalloc(&x, (size_t) T * K * 4);
-            cudaMemset(x, 0x3c, (size_t) T * K * 4);
+            fill_x(x, (size_t) T * K, 2);
             cudaMalloc(&y, (size_t) T * M * 4);
             cudaMalloc(&act, fp8::act_bytes(T, K));
             fp8::quantize(x, T, K, K, act, nullptr);
@@ -62,6 +83,45 @@ int main(int argc, char** argv) {
             cudaEventElapsedTime(&mq, a, b);
             std::printf("fp8 gemm [%lld x %lld] x %lld rows: %.3f ms (%.0f TFLOP/s); quantize %.3f ms\n", (long long) M,
                         (long long) K, (long long) T, ms, 2.0 * M * K * T / ms / 1e9, mq / 10);
+            cudaFree(w); cudaFree(x); cudaFree(y); cudaFree(act);
+        }
+        // the segmented products at 2048 rows: GDN qkv + z, attention q + k + v (one launch each), and the Add form
+        const int64_t K = 5120, T2 = 2048;
+        const int64_t segs[][3] = {{10240, 6144, 0}, {12288, 1024, 1024}};
+        for (const auto& sg : segs) {
+            const int ns = sg[2] ? 3 : 2;
+            uint8_t* w;
+            float *x, *y;
+            void* act;
+            int64_t tot = 0;
+            for (int i = 0; i < ns; ++i) tot += sg[i];
+            cudaMalloc(&w, (size_t) tot * K);
+            fill_w(w, (size_t) tot * K, 3);
+            cudaMalloc(&x, (size_t) T2 * K * 4);
+            fill_x(x, (size_t) T2 * K, 4);
+            cudaMalloc(&y, (size_t) T2 * tot * 4);
+            cudaMalloc(&act, fp8::act_bytes(T2, K));
+            fp8::quantize(x, T2, K, K, act, nullptr);
+            fp8::Segment sv[3];
+            int64_t wo = 0;
+            for (int i = 0; i < ns; ++i) {
+                sv[i] = {w + wo * K, sg[i], nullptr, y + wo * T2, sg[i]};
+                wo += sg[i];
+            }
+            fp8::gemm_segmented(sv, ns, K, act, T2, fp8::Epilogue::Store, nullptr);
+            cudaEvent_t a, b;
+            cudaEventCreate(&a);
+            cudaEventCreate(&b);
+            cudaEventRecord(a);
+            for (int i = 0; i < 10; ++i) fp8::gemm_segmented(sv, ns, K, act, T2, fp8::Epilogue::Store, nullptr);
+            cudaEventRecord(b);
+            cudaEventSynchronize(b);
+            float ms;
+            cudaEventElapsedTime(&ms, a, b);
+            ms /= 10;
+            std::printf("fp8 gemm segmented [%lld + %lld%s x %lld] x %lld rows: %.3f ms (%.0f TFLOP/s)\n", (long long) sg[0],
+                        (long long) sg[1], ns == 3 ? " + 1024" : "", (long long) K, (long long) T2, ms,
+                        2.0 * tot * K * T2 / ms / 1e9);
             cudaFree(w); cudaFree(x); cudaFree(y); cudaFree(act);
         }
         return 0;
@@ -138,6 +198,40 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < y2.size(); ++i) bad += std::fabs(y2[i] - 2.0 * y[i]) > 1e-6 * (std::fabs(y[i]) + 1e-6);
     std::printf("fp8 gemm: rows bitwise at 130 and 300 rows: %s; Add epilogue: %s\n", same ? "yes" : "NO", bad ? "WRONG" : "ok");
     if (!same || bad) ++fails;
+    // a segmented product (three matrices of 128, 384 and 256 rows over the first 1024 weight rows' codes, own scales,
+    // outputs and strides) against the same matrices as separate products, bitwise, in Store and Add
+    {
+        fp8::quantize(dx, T, K, K, act, nullptr);
+        const int64_t R[3] = {128, 384, 256}, LD[3] = {R[0] + 6, R[1], R[2] + 2};
+        const float sv_[3] = {0.5f, 0.03f, 0.007f};
+        uint8_t* wp[3] = {dw, dw + 128 * K, dw};
+        float *sc3, *o1[3], *o2[3];
+        cudaMalloc(&sc3, 12);
+        cudaMemcpy(sc3, sv_, 12, cudaMemcpyHostToDevice);
+        fp8::Segment sg1[3], sg2[3];
+        for (int i = 0; i < 3; ++i) {
+            cudaMalloc(&o1[i], (size_t) T * LD[i] * 4);
+            cudaMalloc(&o2[i], (size_t) T * LD[i] * 4);
+            cudaMemset(o1[i], 0x3f, (size_t) T * LD[i] * 4);
+            cudaMemset(o2[i], 0x3f, (size_t) T * LD[i] * 4);
+            sg1[i] = {wp[i], R[i], sc3 + i, o1[i], LD[i]};
+            sg2[i] = {wp[i], R[i], sc3 + i, o2[i], LD[i]};
+        }
+        int segbad = 0;
+        for (int pass = 0; pass < 2; ++pass) {
+            const fp8::Epilogue e = pass ? fp8::Epilogue::Add : fp8::Epilogue::Store;
+            fp8::gemm_segmented(sg1, 3, K, act, T, e, nullptr);
+            for (int i = 0; i < 3; ++i) fp8::gemm(sg2[i].w, R[i], K, sc3 + i, act, T, o2[i], LD[i], e, nullptr);
+            for (int i = 0; i < 3; ++i) {
+                std::vector<float> a((size_t) T * LD[i]), b((size_t) T * LD[i]);
+                cudaMemcpy(a.data(), o1[i], a.size() * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(b.data(), o2[i], b.size() * 4, cudaMemcpyDeviceToHost);
+                segbad += std::memcmp(a.data(), b.data(), a.size() * 4) != 0;
+            }
+        }
+        std::printf("fp8 gemm segmented (3 matrices, Store and Add) bitwise against separate products: %s\n", segbad ? "NO" : "yes");
+        fails += segbad;
+    }
     if (cudaGetLastError() != cudaSuccess) ++fails;
     std::printf("%s\n", fails ? "FAILED" : "PASS");
     return fails ? 1 : 0;
