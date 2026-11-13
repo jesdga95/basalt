@@ -15,6 +15,8 @@
 #include "models/deepseek41/meta.hpp"
 #include "models/deepseek41/model.hpp"
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <cstdlib>
 
@@ -47,7 +49,18 @@ public:
         m->set_diag_dump(req.diag_dump);
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
         m->set_tiers(req);
-        if (!req.peer_devices.empty()) m->set_peer_device(req.peer_devices.front());
+        if (!req.peer_devices.empty()) {
+            // The peer-tier kernels of this architecture are built for sm_120 only: refuse an older
+            // peer card here rather than failing at its first launch with 'no kernel image'.
+            cudaDeviceProp prop{};
+            const int dev = req.peer_devices.front();
+            if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.major != 0 &&
+                !(prop.major == 12 && prop.minor == 0))
+                return {model::Status::Error,
+                        "deepseek41: GPU " + std::to_string(dev) + " (" + prop.name +
+                        ") is not sm_120: the DeepSeek peer-tier kernels are built for Blackwell only"};
+            m->set_peer_device(dev);
+        }
         if (req.peer_devices.size() > 1) basalt::log::warn("basalt deepseek41", "one second card holds experts; later cards idle");
         out = std::move(m);
         return {};

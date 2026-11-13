@@ -314,6 +314,41 @@ target_link_libraries(basalt-device PRIVATE core)
 add_executable(basalt-load src/models/qwen4exp/plan/load_main.cpp)
 target_link_libraries(basalt-load PRIVATE core kernels)
 
+# Peer-tier compilation: the expert-window decode kernels, the peer prefill mmq/iota kernels and the
+# small utility kernels that run on the peer card additionally compile for sm_89 (Ada), so a non-Blackwell
+# card can serve as the expert tier. Must be set BEFORE the targets that compile these files are defined.
+set_source_files_properties(
+  src/models/qwen4exp/kernels/dec_moe.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q0_m0.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q0_m1.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q1_m0.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q1_m1.cu
+  src/prefill/moe_mmq.cu
+  src/prefill/mmq/mmq_host.cu
+  src/prefill/mmq/quantize.cu
+  src/prefill/mmq/instances/mmq_q2_0.cu
+  src/prefill/mmq/instances/mmq_iq1_s.cu
+  src/prefill/mmq/instances/mmq_iq1_m.cu
+  src/prefill/mmq/instances/mmq_iq2_xxs.cu
+  src/prefill/mmq/instances/mmq_iq2_xs.cu
+  src/prefill/mmq/instances/mmq_iq2_s.cu
+  src/prefill/mmq/instances/mmq_iq3_xxs.cu
+  src/prefill/mmq/instances/mmq_iq3_s.cu
+  src/prefill/mmq/instances/mmq_iq4_nl.cu
+  src/prefill/mmq/instances/mmq_iq4_xs.cu
+  src/prefill/mmq/instances/mmq_q8_0.cu
+  src/prefill/mmq/instances/mmq_q5_0.cu
+  src/prefill/mmq/instances/mmq_q5_1.cu
+  src/prefill/mmq/instances/mmq_q2_k.cu
+  src/prefill/mmq/instances/mmq_q3_k.cu
+  src/prefill/mmq/instances/mmq_q4_k.cu
+  src/prefill/mmq/instances/mmq_q5_k.cu
+  src/prefill/mmq/instances/mmq_q6_k.cu
+  src/kernels/cuda/quantize_act.cu
+  src/kernels/cuda/wait_abort.cu
+  src/kernels/cuda/elementwise.cu
+  PROPERTIES COMPILE_OPTIONS "--generate-code=arch=compute_89,code=sm_89")
+
 # ---- kernels ----
 # Naive first, each with a parity test against a reference that was itself validated against ggml.  The
 # kernels link `artifact` for the scalar dequantizers, because using the VALIDATED scalar path as the

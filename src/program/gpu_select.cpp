@@ -137,7 +137,12 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err) {
 // A peer GPU runs only the expert tier's standard CUDA kernels (Q8_1/Q2_0 rows, shared-memory rings,
 // doorbells) — any modern CUDA architecture works (sm_70+, tested on sm_89/Ada).
 bool gpu_main_supported(const GpuCard& c) { return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0); }
-bool gpu_peer_supported(const GpuCard& c) { return c.cc_major == 0 || c.cc_major >= 7; }
+// sm_89 (Ada) is the one older architecture the peer kernels are compiled for; a peer card of any
+// other pre-Blackwell arch (e.g. sm_80/Ampere) is rejected here rather than failing later with
+// 'no kernel image' at the first peer launch.
+bool gpu_peer_supported(const GpuCard& c) {
+    return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0) || (c.cc_major == 8 && c.cc_minor == 9);
+}
 
 std::string gpu_label(const std::vector<GpuCard>& visible, int index) {
     std::string s = "GPU " + std::to_string(index);

@@ -164,11 +164,21 @@ __device__ __forceinline__ void rec_sync() {
     else __syncthreads();
 }
 
+// Below sm_90 (a peer-tier build for an older card) the cluster machinery does not exist: only the SPLIT
+// instantiation is compiled there, where `cluster` is always null, so its type degenerates to void*.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define DM_REC_NO_CLUSTERS 1
+using DmRecClusterPtr = void*;
+#else
+#define DM_REC_NO_CLUSTERS 0
+using DmRecClusterPtr = cg::cluster_group*;
+#endif
+
 // One block of a head's cluster.  `head` = the launch's value head (head_map), `rank` = its column group.  SPLIT: no cluster and no z; the
 // head's raw output goes to a.o for dec_gdn_rec_norm.
 template<int MAXT, bool SPLIT, bool SUB = false>
 __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem& sm,
-                                          cg::cluster_group* cluster) {
+                                          DmRecClusterPtr cluster) {
     const int rg = threadIdx.x / 32, lane = threadIdx.x % 32, tid = threadIdx.x;
     stamp(a, 0);
     const int col = rank * 32 + lane;
@@ -200,9 +210,11 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     asm volatile("cp.async.commit_group;" ::: "memory");
     const float dt = a.dt[gh], sa = a.ssm_a[gh], gam = a.gamma[col];
     stamp(a, 1);
-    if (a.early_trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the out projection may stage its weights
+    if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights (a no-op below sm_90)
     // this block has started: the barrier the ranks wait on before writing into each other's shared memory
+#if !DM_REC_NO_CLUSTERS
     if (!SPLIT) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+#endif
     // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
     // predecessor passed its own wait on the hc read), so they are computed while the projections still run
     asm volatile("cp.async.wait_all;" ::: "memory");
@@ -312,6 +324,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     }
     stamp(a, 6);
     if (SPLIT) return;
+#if !DM_REC_NO_CLUSTERS
     // every rank's sums of squares, pushed into every rank's shared memory (once every rank has started) before one
     // cluster barrier
     asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
@@ -334,14 +347,17 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     }
     stamp(a, 8);
     stamp(a, 9);
+#endif  // !DM_REC_NO_CLUSTERS
 }
 
+#if !DM_REC_NO_CLUSTERS
 template<int MAXT>
 __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_kernel(const DecRecArgs a, int T) {
     __shared__ RecSmem sm;
     cg::cluster_group cl = cg::this_cluster();
     rec_block<MAXT, false>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
 }
+#endif  // !DM_REC_NO_CLUSTERS
 
 template<int MAXT>
 __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T) {
@@ -351,6 +367,7 @@ __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T)
 
 // rec_kernel over a segmented window: cluster row y is a window row, of which only a segment's first works, on the
 // segment's rows and state
+#if !DM_REC_NO_CLUSTERS
 template<int MAXT>
 __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
                                                                               size_t state_off) {
@@ -367,6 +384,7 @@ __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(co
     a.yq = static_cast<char*>(a.yq) + r0 * (vd / 32) * sizeof(Q81);
     rec_block<MAXT, false>(a, r.n, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
 }
+#endif  // !DM_REC_NO_CLUSTERS
 
 // one warp per (token, value head): the head's four 32-value sums of squares in rank order, then norm_q8 per rank
 __global__ void __launch_bounds__(128) rec_norm_kernel(const DecRecArgs a, int T) {

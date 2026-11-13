@@ -52,16 +52,6 @@ add_library(model_qwen4exp_kernels STATIC
   src/models/qwen4exp/kernels/hc8_gr.cu)
 target_link_libraries(model_qwen4exp_kernels PUBLIC kernels)
 
-# The peer window kernels use standard CUDA only (Q8_1/Q2_0 rows, shared-memory rings, doorbells):
-# they additionally compile for sm_89 (Ada) so a non-Blackwell card can serve as the expert tier.
-# The rest of the kernels (NVFP4 tensor cores, TMA, Blackwell instructions) stay sm_120-only.
-set_source_files_properties(
-  src/models/qwen4exp/kernels/dec_moe_peer_q0_m0.cu
-  src/models/qwen4exp/kernels/dec_moe_peer_q0_m1.cu
-  src/models/qwen4exp/kernels/dec_moe_peer_q1_m0.cu
-  src/models/qwen4exp/kernels/dec_moe_peer_q1_m1.cu
-  PROPERTIES CUDA_ARCHITECTURES "89;120")
-
 # The composed layer: layer and session, the verify windows, the MTP drafter, the conversation state.
 add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp src/models/qwen4exp/decode/expert_dispatch.cpp
   src/models/qwen4exp/decode/session.cpp
