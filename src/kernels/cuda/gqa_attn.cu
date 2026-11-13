@@ -4,15 +4,17 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
 
-constexpr int HD = 256;
 constexpr int GMAX = 8;               // query heads per KV head
 constexpr int CHUNK = 256;            // cells per decode block
+constexpr int HD = 256;              // the prompt kernel's head width
 constexpr float kScaleLog2 = 0.0625f * 1.4426950408889634f;   // 1/sqrt(256) * log2(e)
 constexpr float kNeg = -1e30f;
 
@@ -28,106 +30,153 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 
 // ---------------------------------------------------------------- decode
-// Block (chunk, KV head, row t): the scores of the chunk's visible cells for the G query heads (warp per cell, lanes
-// over the dims), the chunk's max and sum per head (one thread per head, cells in order), then p . V with one
-// thread per dim (cells in order).  Writes the chunk's partial {max, sum, acc[256]} per query head.
-__global__ void __launch_bounds__(HD) decode_chunk_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
-                                                          const __half* __restrict__ vc, int n_head, int n_kv,
-                                                          int64_t pos0, int n_chunks, float* __restrict__ part) {
-    __shared__ float s[CHUNK][GMAX];
+// Row t of a window sees positions [lo_t, hi_t): hi_t = pos0 + t + 1 (causal) or `hi`, lo_t = pos0 + t - window + 1 (a
+// sliding window, else 0); position p sits in cache cell p % cap.  Cells are split in CHUNK-position chunks from chunk
+// `base`, so a row's chunks and sums depend on its own range only.
+struct Range {
+    int64_t pos0 = 0, hi = 0, window = 0, cap = 0;
+    int causal = 1, base = 0;
+    const int32_t* pos_dev = nullptr;   // pos0 read from the device (a captured window): the grid covers the capacity
+};
+__device__ __forceinline__ int64_t row_pos0(const Range& r) { return r.pos_dev ? (int64_t) *r.pos_dev : r.pos0; }
+__device__ __forceinline__ int64_t row_hi(const Range& r, int t) { return r.causal ? row_pos0(r) + t + 1 : r.hi; }
+__device__ __forceinline__ int64_t row_lo(const Range& r, int t) {
+    return r.window > 0 ? max((int64_t) 0, row_pos0(r) + t - r.window + 1) : 0;
+}
+
+// Block (chunk, KV head, row t), one thread per cell for the scores: its key row against the G query heads (held in
+// shared memory, read by every thread at once); one warp per head for the chunk's max and sum (a fixed butterfly);
+// then p . V with one thread per dim, cells in order.  Writes the chunk's partial {max, sum, acc[HD]} per query head.
+template <int HD>
+__global__ void __launch_bounds__(CHUNK) decode_chunk_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
+                                                             const __half* __restrict__ vc, int n_head, int n_kv, Range r,
+                                                             int n_chunks, float scale, float* __restrict__ part, KvInt8 q8) {
+    __shared__ float s[CHUNK][GMAX + 1];
+    __shared__ __align__(16) float qs[GMAX][HD];
     __shared__ float mx[GMAX], sm[GMAX];
     const int chunk = blockIdx.x, kvh = blockIdx.y, t = blockIdx.z;
     const int G = n_head / n_kv;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int64_t visible = pos0 + t + 1;
-    const int64_t c0 = (int64_t) chunk * CHUNK;
-    const int n = (int) min((int64_t) CHUNK, visible - c0);   // may be <= 0
+    const int64_t lo = row_lo(r, t), hi = row_hi(r, t);
+    const int64_t c0 = (int64_t) (r.base + chunk) * CHUNK;
+    if (c0 >= hi) return;   // past the row's cells: the merge does not read it
+    const int64_t first = max(c0, lo), end = min(c0 + CHUNK, hi);
+    const int n = (int) (end - first);   // may be <= 0
     float* out = part + (((int64_t) t * n_head + (int64_t) kvh * G) * n_chunks + chunk) * (HD + 2);
     if (n <= 0) {
         for (int h = 0; h < G; ++h) {
             float* o = out + (int64_t) h * n_chunks * (HD + 2);
             if (threadIdx.x == 0) { o[0] = kNeg; o[1] = 0.0f; }
-            o[2 + threadIdx.x] = 0.0f;
+            for (int d = threadIdx.x; d < HD; d += CHUNK) o[2 + d] = 0.0f;
         }
         return;
     }
-    float qf[GMAX][8];
+    for (int h = 0; h < G; ++h)
+        for (int d = threadIdx.x; d < HD; d += CHUNK) qs[h][d] = q[((int64_t) t * n_head + kvh * G + h) * HD + d] * scale;
+    __syncthreads();
+    // the chunk's cells are consecutive positions: one modulo for the block, a wrap at most once
+    const int64_t cell0 = first % r.cap;
+    auto cell_of = [&](int i) -> int64_t { const int64_t c = cell0 + i; return c >= r.cap ? c - r.cap : c; };
+    // a warp per cell, lanes over the dims (HD / 32 each): the key row read in one coalesced pass
+    constexpr int PER = HD / 32;
+    float qf[GMAX][PER];
 #pragma unroll
     for (int h = 0; h < GMAX; ++h)
-        if (h < G) {
-            const float4* qp = reinterpret_cast<const float4*>(q + ((int64_t) t * n_head + kvh * G + h) * HD + lane * 8);
-            const float4 a = qp[0], b = qp[1];
-            qf[h][0] = a.x; qf[h][1] = a.y; qf[h][2] = a.z; qf[h][3] = a.w;
-            qf[h][4] = b.x; qf[h][5] = b.y; qf[h][6] = b.z; qf[h][7] = b.w;
-        }
-    for (int c = warp; c < n; c += HD / 32) {
-        const uint4 kv = *reinterpret_cast<const uint4*>(kc + ((c0 + c) * n_kv + kvh) * HD + lane * 8);
-        const __half2* k2 = reinterpret_cast<const __half2*>(&kv);
-        float kf[8];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float2 f = __half22float2(k2[i]);
-            kf[2 * i] = f.x;
-            kf[2 * i + 1] = f.y;
+        for (int i = 0; i < PER; ++i) qf[h][i] = h < G ? qs[h][lane * PER + i] : 0.0f;
+    for (int c = warp; c < n; c += CHUNK / 32) {
+        const int64_t row = cell_of(c) * n_kv + kvh;
+        float kf[PER];
+        if (q8.k) {
+            const int8_t* cb = q8.k + row * HD + lane * PER;
+            const float sc = __half2float(__ushort_as_half(q8.ks[row * (HD / 64) + lane * PER / 64]));
+#pragma unroll
+            for (int i = 0; i < PER; ++i) kf[i] = (float) cb[i] * sc;
+        } else {
+            const __half2* k2 = reinterpret_cast<const __half2*>(kc + row * HD + lane * PER);
+#pragma unroll
+            for (int i = 0; i < PER / 2; ++i) {
+                const float2 f = __half22float2(k2[i]);
+                kf[2 * i] = f.x;
+                kf[2 * i + 1] = f.y;
+            }
         }
 #pragma unroll
         for (int h = 0; h < GMAX; ++h)
             if (h < G) {
                 float d = 0.0f;
 #pragma unroll
-                for (int i = 0; i < 8; ++i) d = fmaf(qf[h][i], kf[i], d);
+                for (int i = 0; i < PER; ++i) d = fmaf(qf[h][i], kf[i], d);
                 d = warp_sum(d);
-                if (lane == 0) s[c][h] = d * kScaleLog2;
+                if (lane == 0) s[c][h] = d;
             }
     }
     __syncthreads();
-    if (threadIdx.x < G) {
-        const int h = threadIdx.x;
+    if (warp < G) {
+        const int h = warp;
         float m = kNeg;
-        for (int c = 0; c < n; ++c) m = fmaxf(m, s[c][h]);
+        for (int i = lane; i < n; i += 32) m = fmaxf(m, s[i][h]);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
         float l = 0.0f;
-        for (int c = 0; c < n; ++c) {
-            const float p = exp2f(s[c][h] - m);
-            s[c][h] = p;
+        for (int i = lane; i < n; i += 32) {
+            const float p = exp2f(s[i][h] - m);
+            s[i][h] = p;
             l += p;
         }
-        mx[h] = m;
-        sm[h] = l;
+        l = warp_sum(l);
+        if (lane == 0) { mx[h] = m; sm[h] = l; }
     }
     __syncthreads();
-    float acc[GMAX] = {};
-    const int d = threadIdx.x;
-    for (int c = 0; c < n; ++c) {
-        const float v = __half2float(vc[((c0 + c) * n_kv + kvh) * HD + d]);
+    for (int d = threadIdx.x; d < HD; d += CHUNK) {
+        float acc[GMAX] = {};
+        for (int i = 0; i < n; ++i) {
+            const int64_t row = cell_of(i) * n_kv + kvh;
+            const float v = q8.v ? (float) q8.v[row * HD + d] * __half2float(__ushort_as_half(q8.vs[row * (HD / 64) + d / 64]))
+                                 : __half2float(vc[row * HD + d]);
+#pragma unroll
+            for (int h = 0; h < GMAX; ++h)
+                if (h < G) acc[h] = fmaf(s[i][h], v, acc[h]);
+        }
 #pragma unroll
         for (int h = 0; h < GMAX; ++h)
-            if (h < G) acc[h] = fmaf(s[c][h], v, acc[h]);
+            if (h < G) {
+                float* o = out + (int64_t) h * n_chunks * (HD + 2);
+                if (d == 0) { o[0] = mx[h]; o[1] = sm[h]; }
+                o[2 + d] = acc[h];
+            }
     }
-#pragma unroll
-    for (int h = 0; h < GMAX; ++h)
-        if (h < G) {
-            float* o = out + (int64_t) h * n_chunks * (HD + 2);
-            if (d == 0) { o[0] = mx[h]; o[1] = sm[h]; }
-            o[2 + d] = acc[h];
-        }
 }
 
-// Block (query head, row t), one thread per dim: the chunks merged in order.
-__global__ void __launch_bounds__(HD) decode_merge_kernel(const float* __restrict__ part, int n_head, int64_t pos0,
+// Block (query head, row t), one thread per dim: the row's chunks merged in order.
+template <int HD>
+__global__ void __launch_bounds__(HD) decode_merge_kernel(const float* __restrict__ part, int n_head, Range r,
                                                           int n_chunks, float* __restrict__ out) {
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-    const int used = (int) ((pos0 + t + 1 + CHUNK - 1) / CHUNK);
+    const int used = (int) ((row_hi(r, t) + CHUNK - 1) / CHUNK) - r.base;
+    const int skip = (int) (row_lo(r, t) / CHUNK) - r.base;
     const float* p = part + ((int64_t) t * n_head + h) * n_chunks * (HD + 2);
     float m = kNeg;
-    for (int c = 0; c < used; ++c) m = fmaxf(m, p[(int64_t) c * (HD + 2)]);
+    for (int c = skip; c < used; ++c) m = fmaxf(m, p[(int64_t) c * (HD + 2)]);
     float l = 0.0f, a = 0.0f;
-    for (int c = 0; c < used; ++c) {
+    for (int c = skip; c < used; ++c) {
         const float* pc = p + (int64_t) c * (HD + 2);
         const float w = exp2f(pc[0] - m);
         l = fmaf(pc[1], w, l);
         a = fmaf(pc[2 + d], w, a);
     }
     out[((int64_t) t * n_head + h) * HD + d] = a / l;
+}
+
+template <int HD>
+void launch_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_kv, const Range& r, int T,
+                   float* scratch, int n_chunks, int used, float* out, cudaStream_t s, KvInt8 q8 = {}) {
+    const float scale = 1.4426950408889634f / sqrtf((float) HD);
+    decode_chunk_kernel<HD><<<dim3((unsigned) used, (unsigned) n_kv, (unsigned) T), CHUNK, 0, s>>>(
+        q, (const __half*) kc, (const __half*) vc, n_head, n_kv, r, n_chunks, scale, scratch, q8);
+    check("gqa decode attention");
+    decode_merge_kernel<HD><<<dim3((unsigned) n_head, (unsigned) T), HD, 0, s>>>(scratch, n_head, r, n_chunks, out);
+    check("gqa decode attention/merge");
 }
 
 // ---------------------------------------------------------------- prompt
@@ -166,7 +215,7 @@ struct PromptSmem {
 // Block (query tile, query head): warp w owns query rows 16 w .. 16 w + 15 of the tile.
 __global__ void __launch_bounds__(NW * 32) prompt_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
                                                          const __half* __restrict__ vc, int n_head, int n_kv,
-                                                         int64_t pos0, int64_t T, float* __restrict__ out) {
+                                                         int64_t pos0, int64_t T, float* __restrict__ out, KvInt8 q8) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     PromptSmem& sm = *reinterpret_cast<PromptSmem*>(smem_raw);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -193,9 +242,23 @@ __global__ void __launch_bounds__(NW * 32) prompt_kernel(const float* __restrict
         for (int i = tid; i < BN * HD / 8; i += NW * 32) {
             const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
             const bool ok = c0 + r < cells;
-            const int64_t at = ((ok ? c0 + r : 0) * n_kv + kvh) * HD + c;
-            cp16(&sm.k[r][c], kc + at, ok);
-            cp16(&sm.v[r][c], vc + at, ok);
+            const int64_t row = (ok ? c0 + r : 0) * n_kv + kvh;
+            if (q8.k) {   // eight codes times their group's scale, rounded to the fp16 tile
+                const uint2 kw = *reinterpret_cast<const uint2*>(q8.k + row * HD + c);
+                const uint2 vw = *reinterpret_cast<const uint2*>(q8.v + row * HD + c);
+                const float ks = __half2float(__ushort_as_half(q8.ks[row * (HD / 64) + c / 64]));
+                const float vs = __half2float(__ushort_as_half(q8.vs[row * (HD / 64) + c / 64]));
+                const int8_t* kb = reinterpret_cast<const int8_t*>(&kw);
+                const int8_t* vb = reinterpret_cast<const int8_t*>(&vw);
+#pragma unroll
+                for (int j = 0; j < 8; j += 2) {
+                    *reinterpret_cast<__half2*>(&sm.k[r][c + j]) = ok ? __floats2half2_rn(kb[j] * ks, kb[j + 1] * ks) : __floats2half2_rn(0.f, 0.f);
+                    *reinterpret_cast<__half2*>(&sm.v[r][c + j]) = ok ? __floats2half2_rn(vb[j] * vs, vb[j + 1] * vs) : __floats2half2_rn(0.f, 0.f);
+                }
+            } else {
+                cp16(&sm.k[r][c], kc + row * HD + c, ok);
+                cp16(&sm.v[r][c], vc + row * HD + c, ok);
+            }
         }
         asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
         __syncthreads();
@@ -285,29 +348,55 @@ __global__ void __launch_bounds__(NW * 32) prompt_kernel(const float* __restrict
 
 }  // namespace
 
-size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head) {
-    const int64_t chunks = (max_cells + CHUNK - 1) / CHUNK;
-    return (size_t) T * n_head * chunks * (HD + 2);
+size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_dim) {
+    const int64_t chunks = (max_cells + CHUNK - 1) / CHUNK + 1;
+    return (size_t) T * n_head * chunks * (head_dim + 2);
 }
 
 void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
-                     int64_t pos0, int T, float* scratch, int64_t max_cells, float* out, void* stream) {
+                     int64_t pos0, int T, float* scratch, int64_t max_cells, float* out, void* stream,
+                     const int32_t* pos_dev, KvInt8 q8) {
     if (T < 1 || T > kGqaMaxWindow || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX || pos0 + T > max_cells) {
         basalt::log::error("basalt", "gqa_decode_attn: invalid arguments");
         std::exit(1);
     }
+    Range r;
+    r.pos0 = pos0;
+    r.cap = max_cells;
+    r.pos_dev = pos_dev;
     const int n_chunks = (int) ((max_cells + CHUNK - 1) / CHUNK);
-    const int used = (int) ((pos0 + T + CHUNK - 1) / CHUNK);
-    const cudaStream_t s = (cudaStream_t) stream;
-    decode_chunk_kernel<<<dim3((unsigned) used, (unsigned) n_kv, (unsigned) T), HD, 0, s>>>(
-        q, (const __half*) k_cache, (const __half*) v_cache, n_head, n_kv, pos0, n_chunks, scratch);
-    check("gqa_decode_attn");
-    decode_merge_kernel<<<dim3((unsigned) n_head, (unsigned) T), HD, 0, s>>>(scratch, n_head, pos0, n_chunks, out);
-    check("gqa_decode_attn/merge");
+    const int used = pos_dev ? n_chunks : (int) ((pos0 + T + CHUNK - 1) / CHUNK);
+    launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, used, out, (cudaStream_t) stream, q8);
+}
+
+void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
+                     int64_t pos0, int T, int64_t hi, int64_t window, int64_t cap, float* scratch, int64_t scratch_cells,
+                     float* out, void* stream) {
+    if (T < 1 || T > kGqaMaxWindow || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX || window <= 0 ||
+        (head_dim != 128 && head_dim != 256) || hi < pos0 + T) {
+        basalt::log::error("basalt", "gqa_window_attn: invalid arguments");
+        std::exit(1);
+    }
+    Range r;
+    r.pos0 = pos0;
+    r.hi = hi;
+    r.window = window;
+    r.cap = cap;
+    r.causal = 0;
+    const int64_t lo = std::max<int64_t>(0, pos0 - window + 1);
+    r.base = (int) (lo / CHUNK);
+    const int used = (int) ((hi + CHUNK - 1) / CHUNK) - r.base;
+    const int n_chunks = (int) ((scratch_cells + CHUNK - 1) / CHUNK) + 1;
+    if (used > n_chunks) {
+        basalt::log::error("basalt", "gqa_window_attn: the window passes its scratch");
+        std::exit(1);
+    }
+    if (head_dim == 128) launch_window<128>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, used, out, (cudaStream_t) stream);
+    else launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, used, out, (cudaStream_t) stream);
 }
 
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
-                     int64_t pos0, int64_t T, float* out, void* stream) {
+                     int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8) {
     if (T <= 0) return;
     if (n_kv < 1 || n_head % n_kv) {
         basalt::log::error("basalt", "gqa_prompt_attn: invalid arguments");
@@ -323,7 +412,7 @@ void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
         attr = true;
     }
     prompt_kernel<<<dim3((unsigned) ((T + BM - 1) / BM), (unsigned) n_head), NW * 32, sizeof(PromptSmem),
-                    (cudaStream_t) stream>>>(q, (const __half*) k_cache, (const __half*) v_cache, n_head, n_kv, pos0, T, out);
+                    (cudaStream_t) stream>>>(q, (const __half*) k_cache, (const __half*) v_cache, n_head, n_kv, pos0, T, out, q8);
     check("gqa_prompt_attn");
 }
 

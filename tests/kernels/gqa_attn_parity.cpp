@@ -187,6 +187,54 @@ int main() {
     std::printf("gqa_prompt_attn: max abs %.3g rel %.3g vs double (fp16 q and p)\n", ep.abs, ep.rel);
     if (ep.abs > 5e-3) ++fails;
 
+    // ---- int8 cache: the same cells as codes and per-64 scales (the write kernel's rule), against the reference on the
+    // dequantized values
+    {
+        const size_t rows = (size_t) max_cells * NKV;
+        std::vector<int8_t> k8(rows * HD), v8(rows * HD);
+        std::vector<uint16_t> ks(rows * HD / 64), vs(rows * HD / 64), kd(kc.size()), vd(vc.size());
+        auto quant = [&](const std::vector<uint16_t>& src, std::vector<int8_t>& q, std::vector<uint16_t>& sc, std::vector<uint16_t>& deq) {
+            for (size_t g = 0; g < rows * HD / 64; ++g) {
+                float amax = 0;
+                for (int i = 0; i < 64; ++i) amax = std::max(amax, std::fabs(h2f(src[g * 64 + i])));
+                const uint16_t h = basalt::kernels::f16_from_f32(amax / 127.0f);
+                const float s16 = h2f(h);
+                sc[g] = h;
+                for (int i = 0; i < 64; ++i) {
+                    const float c = s16 > 0 ? std::rint(h2f(src[g * 64 + i]) / s16) : 0.0f;
+                    q[g * 64 + i] = (int8_t) std::max(-127.0f, std::min(127.0f, c));
+                    deq[g * 64 + i] = basalt::kernels::f16_from_f32(q[g * 64 + i] * s16);
+                }
+            }
+        };
+        quant(kc, k8, ks, kd);
+        quant(vc, v8, vs, vd);
+        basalt::kernels::KvInt8 q8;
+        ck(cudaMalloc(&q8.k, k8.size()), "malloc");
+        ck(cudaMalloc(&q8.v, v8.size()), "malloc");
+        ck(cudaMalloc(&q8.ks, ks.size() * 2), "malloc");
+        ck(cudaMalloc(&q8.vs, vs.size() * 2), "malloc");
+        cudaMemcpy(q8.k, k8.data(), k8.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(q8.v, v8.data(), v8.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(q8.ks, ks.data(), ks.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(q8.vs, vs.data(), vs.size() * 2, cudaMemcpyHostToDevice);
+        std::vector<double> w8((size_t) NH * HD);
+        ref_attn(&q[(size_t) (TP - 1) * NH * HD], kd, vd, p0 + TP, w8.data());
+        basalt::kernels::gqa_decode_attn(d_q + (size_t) (TP - 1) * NH * HD, nullptr, nullptr, NH, NKV, p0 + TP - 1, 1, d_scr,
+                                         max_cells, d_out, nullptr, nullptr, q8);
+        std::vector<float> g8((size_t) NH * HD);
+        ck(cudaMemcpy(g8.data(), d_out, g8.size() * 4, cudaMemcpyDeviceToHost), "copy");
+        Err e8;
+        for (int j = 0; j < NH * HD; ++j) e8.add(g8[(size_t) j], w8[(size_t) j]);
+        basalt::kernels::gqa_prompt_attn(d_q, nullptr, nullptr, NH, NKV, p0, TP, d_out, nullptr, q8);
+        ck(cudaMemcpy(pr.data(), d_out, pr.size() * 4, cudaMemcpyDeviceToHost), "copy");
+        Err p8;
+        for (int j = 0; j < NH * HD; ++j) p8.add(pr[(size_t) (TP - 1) * NH * HD + j], w8[(size_t) j]);
+        std::printf("int8 cache: decode max abs %.3g rel %.3g, prompt max abs %.3g, vs double on the dequantized cells\n",
+                    e8.abs, e8.rel, p8.abs);
+        if (e8.abs > 1e-3 || p8.abs > 5e-3) ++fails;   // decode reads code x scale in fp32, the reference its fp16 rounding
+    }
+
     // ---- microbench: one decode row at 3000 cells, and the 300-row chunk
     cudaEvent_t a, b;
     cudaEventCreate(&a);

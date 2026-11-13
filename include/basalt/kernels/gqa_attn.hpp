@@ -16,11 +16,28 @@ namespace basalt::kernels {
 
 constexpr int kGqaMaxWindow = 8;
 
-/// Scratch floats gqa_decode_attn needs for up to `max_cells` cells and `T` rows.
-size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head);
+/// An int8 K/V cache in place of the fp16 one: codes [cell][n_kv][256], fp16 scales [cell][n_kv][4] (one per 64 values,
+/// amax / 127, codes rounded to nearest).  `k` null: the fp16 cache.
+struct KvInt8 {
+    int8_t* k = nullptr;
+    int8_t* v = nullptr;
+    uint16_t* ks = nullptr;
+    uint16_t* vs = nullptr;
+};
+
+/// Scratch floats gqa_decode_attn needs for up to `max_cells` cells and `T` rows (gqa_window_attn: cells its window
+/// spans plus the window's rows).
+size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_dim = 256);
+/// `pos_dev` (optional): pos0 read from the device instead, the grid sized for `max_cells` (a captured window).
 void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
-                     int64_t pos0, int T, float* scratch, int64_t max_cells, float* out, void* stream);
+                     int64_t pos0, int T, float* scratch, int64_t max_cells, float* out, void* stream,
+                     const int32_t* pos_dev = nullptr, KvInt8 q8 = {});
+/// gqa_decode_attn for a block drafter's rows: head width 128 or 256, row t at position pos0 + t sees positions
+/// [pos0 + t - window + 1, hi) (not causal), position p in cache cell p % cap.
+void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
+                     int64_t pos0, int T, int64_t hi, int64_t window, int64_t cap, float* scratch, int64_t scratch_cells,
+                     float* out, void* stream);
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
-                     int64_t pos0, int64_t T, float* out, void* stream);
+                     int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8 = {});
 
 }  // namespace basalt::kernels
