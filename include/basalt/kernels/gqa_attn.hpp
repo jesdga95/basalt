@@ -20,7 +20,7 @@
 
 namespace basalt::kernels {
 
-constexpr int kGqaMaxWindow = 8;
+constexpr int kGqaMaxWindow = 16;
 
 /// An int8 K/V cache in place of the fp16 one: codes [cell][n_kv][256], fp16 scales [cell][n_kv][4] (one per 64 values,
 /// amax / 127, codes rounded to nearest).  `k` null: the fp16 cache.

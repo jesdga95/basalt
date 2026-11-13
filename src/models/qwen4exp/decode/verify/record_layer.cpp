@@ -167,10 +167,10 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             if (read_q8) h.xq = v_.xq_;
             // the GDN qkv+z pair kernel follows (dense_tc_pair_mask & 16): its blocks start on the SMs the read leaves
             h.next_early = mid_ok || (read_q8 && (kernels::dense_tc_pair_mask() & 16) &&
-                           !is_qsa_layer(g, l) && N == 2560 && n <= kDecMaxT &&
+                           !is_qsa_layer(g, l) && N == 2560 && n <= kVerifyMaxT &&
                            dec_gdnf_mode() != 0);
             // a QSA layer's query projection follows (qsaf_wide path): its blocks start with the read
-            if (read_q8 && is_qsa_layer(g, l) && N == 2560 && n <= kDecMaxT) {
+            if (read_q8 && is_qsa_layer(g, l) && N == 2560 && n <= kVerifyMaxT) {
                 const QsaState& st0 = ss.qsa_states[qsa_idx[(size_t) l]];
                 h.next_early = st0.kv_int8 && !st0.kv_rot && !st0.kv_hybrid && !st0.kv_q4 &&
                                qsa_dec_fused_supported(s) &&

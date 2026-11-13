@@ -21,19 +21,21 @@ __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __
     gdn_conv_commit_n(hist, qkv, C, *n_keep, blockIdx.x * blockDim.x + threadIdx.x);
 }
 
+template <int MAXT>
 __global__ void __launch_bounds__(32 * RG) gdn_commit_layers_pipe_kernel(GdnCommitLayers a, int conv_blocks) {
-    const int n = min(*a.n_keep, kDecMaxT);
+    const int n = min(*a.n_keep, MAXT);
     if (n <= 0) return;
-    commit_layers_body(a, n, conv_blocks);
+    commit_layers_body<MAXT>(a, n, conv_blocks);
 }
 
 }  // namespace
 
-void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks) {
+void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks, int max_n) {
     if (a.n_layers <= 0) return;
     const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
-    gdn_commit_layers_pipe_kernel<<<(unsigned) (blocks > 0 ? blocks : 1), dim3(32, RG), 0, (cudaStream_t) stream>>>(
-        a, conv_blocks);
+    const dim3 grid((unsigned) (blocks > 0 ? blocks : 1)), block(32, RG);
+    if (max_n <= 8) gdn_commit_layers_pipe_kernel<8><<<grid, block, 0, (cudaStream_t) stream>>>(a, conv_blocks);
+    else gdn_commit_layers_pipe_kernel<kDecMaxT><<<grid, block, 0, (cudaStream_t) stream>>>(a, conv_blocks);
     check("gdn_commit_layers");
 }
 

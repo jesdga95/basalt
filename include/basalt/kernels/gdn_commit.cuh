@@ -33,12 +33,14 @@ __device__ __forceinline__ void gdn_conv_commit_n(float* __restrict__ hist, cons
 
 
 // One state item's inputs, held in registers so the next item's loads are in flight while this one computes.
+template <int MAXT>
 struct CommitPre {
     float s[RPG];
-    float k[kDecMaxT], v[kDecMaxT], g[kDecMaxT], b[kDecMaxT];
+    float k[MAXT], v[MAXT], g[MAXT], b[MAXT];
 };
 
-__device__ __forceinline__ void commit_pre_load(const GdnCommitLayers& a, int per_layer, int n, int i, CommitPre& p) {
+template <int MAXT>
+__device__ __forceinline__ void commit_pre_load(const GdnCommitLayers& a, int per_layer, int n, int i, CommitPre<MAXT>& p) {
     const int l = i / per_layer, j = i - l * per_layer;
     const int head = j >> 2, cblk = j & 3;
     const float* hbuf = a.h + (size_t) l * a.h_stride;
@@ -49,7 +51,7 @@ __device__ __forceinline__ void commit_pre_load(const GdnCommitLayers& a, int pe
     const int qk = S * a.h_k;
     const int qh = head % a.h_k;
 #pragma unroll
-    for (int t = 0; t < kDecMaxT; ++t) {
+    for (int t = 0; t < MAXT; ++t) {
         if (t >= n) break;
         const float* ht = hbuf + (size_t) t * a.C;
         p.k[t] = ht[qk + qh * S + tid];
@@ -64,8 +66,9 @@ __device__ __forceinline__ void commit_pre_load(const GdnCommitLayers& a, int pe
 }
 
 // The step-commit math (gdn_step_commit_block) on registers loaded earlier, every token's inputs up front.
-__device__ __forceinline__ void commit_pre_run(const GdnCommitLayers& a, int per_layer, int n, int i, CommitPre& p) {
-    __shared__ float sk[kDecMaxT][S];
+template <int MAXT>
+__device__ __forceinline__ void commit_pre_run(const GdnCommitLayers& a, int per_layer, int n, int i, CommitPre<MAXT>& p) {
+    __shared__ float sk[MAXT][S];
     __shared__ float red[2][RG][32];
     const int l = i / per_layer, j = i - l * per_layer;
     const int head = j >> 2, cblk = j & 3;
@@ -74,13 +77,13 @@ __device__ __forceinline__ void commit_pre_run(const GdnCommitLayers& a, int per
     const int tid = rg * 32 + col_local;
     __syncthreads();                    // the previous item is done with sk/red
 #pragma unroll
-    for (int t = 0; t < kDecMaxT; ++t) {
+    for (int t = 0; t < MAXT; ++t) {
         if (t >= n) break;
         sk[t][tid] = p.k[t];
     }
     __syncthreads();
 #pragma unroll
-    for (int t = 0; t < kDecMaxT; ++t) {
+    for (int t = 0; t < MAXT; ++t) {
         if (t >= n) break;
         const float gt = __expf(p.g[t]);
         float kv = 0.0f;
@@ -100,11 +103,12 @@ __device__ __forceinline__ void commit_pre_run(const GdnCommitLayers& a, int per
     for (int r = 0; r < RPG; ++r) base[r * row_stride] = p.s[r];
 }
 
-// The grid-stride items with the next state item's loads issued before the current item runs.
+// The grid-stride items with the next state item's loads issued before the current item runs (n <= MAXT rows).
+template <int MAXT>
 __device__ __forceinline__ void commit_layers_body(const GdnCommitLayers& a, int n, int conv_blocks) {
     const int per_state = a.h_v * (S / 32), per_layer = per_state + conv_blocks, total = per_layer * a.n_layers;
     const int step = gridDim.x;
-    CommitPre cur, nxt;
+    CommitPre<MAXT> cur, nxt;
     bool cur_state = (int) blockIdx.x < total && (int) blockIdx.x % per_layer < per_state;
     if (cur_state) commit_pre_load(a, per_layer, n, blockIdx.x, cur);
     for (int i = blockIdx.x; i < total; i += step) {

@@ -131,11 +131,14 @@ public:
     }
 
     int max_window() const override {
-        if (block_) return std::clamp(std::min(m_.o.spec, m_.w.dflash.block), 1, kWindow);
-        return drafter_ ? std::clamp(m_.o.spec, 1, kWindow) : 1;
+        return block_ || drafter_ ? std::clamp(m_.o.spec, 1, kWindow) : 1;
     }
 
     bool copy_drafts() const override { return max_window() > 1; }
+
+    // The block drafter's width for n drafts: its own block, or wider (up to the window) when more drafts are asked for:
+    // the policy asks for more only after windows whose drafts were all taken, and reads each draft's confidence.
+    int block_width(int n) const { return std::clamp(n + 1, m_.w.dflash.block, kWindow); }
 
     // The drafter's chain after `anchor` (the token at `pos`): step 0 pairs main's last normed row (cell pos - 1) with
     // the anchor, each later step its own output with the draft before it; all on the stream, read by draft_end.
@@ -143,9 +146,11 @@ public:
         if (block_) {
             if (Result s = settle(pos); !s.ok()) return s;
             std::string err;
-            if (pos + m_.w.dflash.block > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
-            if (!block_draft(m_, st_, anchor, pos, err)) return fail(err);
-            n_draft_ = std::clamp(n, 1, std::min(max_window() - 1, m_.w.dflash.block - 1));
+            n = std::clamp(n, 1, max_window() - 1);
+            const int width = block_width(n);
+            if (pos + width > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
+            if (!block_draft(m_, st_, anchor, pos, width, err)) return fail(err);
+            n_draft_ = std::min(n, width - 1);
             return {};
         }
         if (!drafter_) return {Status::NotImplemented, m_.o.arch + ": no drafter is loaded"};
@@ -174,13 +179,13 @@ public:
     // the others' streams wait for them before their draft_end reads.
     Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
                        int count) override {
-        const int per = block_ ? kBatch / m_.w.dflash.block : 0;
-        if (count <= 1 || per < 2) return ModelSession::draft_batch(peers, anchors, pos, n, count);
+        if (count <= 1 || !block_ || 2 * m_.w.dflash.block > kBatch) return ModelSession::draft_batch(peers, anchors, pos, n, count);
         std::vector<Session*> ss((size_t) count);
         for (int i = 0; i < count; ++i) {
             ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
             if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return fail(m_.o.arch + ": a draft batch of sessions of another model");
-            if (pos[i] + m_.w.dflash.block > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
+            if (pos[i] + block_width(std::clamp(n[i], 1, max_window() - 1)) > m_.o.max_context)
+                return fail(m_.o.arch + ": no room for a draft block");
             if (Result r = ss[(size_t) i]->settle(pos[i]); !r.ok()) return r;
             if (cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
         }
@@ -188,13 +193,22 @@ public:
         std::vector<SessionState*> sts((size_t) count);
         for (int i = 0; i < count; ++i) sts[(size_t) i] = &ss[(size_t) i]->st_;
         std::string err;
+        // the blocks in passes of at most a batch window's rows, in order
+        std::vector<int> nn((size_t) count), width((size_t) count);
+        for (int i = 0; i < count; ++i) {
+            nn[(size_t) i] = std::clamp(n[i], 1, max_window() - 1);
+            width[(size_t) i] = block_width(nn[(size_t) i]);
+        }
         const cudaStream_t s0 = sts[0]->stream;
-        for (int i = 0; i < count; i += per)
-            if (!block_draft_batch(m_, sts.data() + i, anchors + i, pos + i, std::min(per, count - i), err, s0)) return fail(err);
+        for (int i = 0; i < count;) {
+            int k = 0, rows = 0;
+            while (i + k < count && rows + width[(size_t) (i + k)] <= kBatch) rows += width[(size_t) (i + k++)];
+            if (!block_draft_batch(m_, sts.data() + i, anchors + i, pos + i, width.data() + i, k, err, s0)) return fail(err);
+            i += k;
+        }
         cudaEventRecord(done_, s0);
         for (int i = 1; i < count; ++i) cudaStreamWaitEvent(sts[(size_t) i]->stream, done_, 0);
-        for (int i = 0; i < count; ++i)
-            ss[(size_t) i]->n_draft_ = std::clamp(n[i], 1, std::min(ss[(size_t) i]->max_window() - 1, m_.w.dflash.block - 1));
+        for (int i = 0; i < count; ++i) ss[(size_t) i]->n_draft_ = std::min(nn[(size_t) i], width[(size_t) i] - 1);
         return {};
     }
 
