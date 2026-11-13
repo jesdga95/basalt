@@ -87,7 +87,7 @@ __global__ void rebase_kernel(const int32_t* __restrict__ bounds, int n, int32_t
 
 // ---------------------------------------------------------------------------------------- quantizer
 
-// The widths built: rows of 2560 / 640 values (Flash-Next's experts), 5120 / 17408 (a dense 27B's MLP); NBL = the
+// The widths built: rows of 2560 / 640 values (an MoE's expert input and output), 5120 / 17408 (a dense MLP's); NBL = the
 // 16-value blocks per lane.
 // One warp per row: token scale g = amax / (6 * 448); per 16 values a UE4M3 scale of block amax / (6 g); codes
 // round to nearest even on x / (scale * g).  A sub-block's 8 bytes hold value j in the low nibble of byte j and value
