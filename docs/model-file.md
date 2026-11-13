@@ -82,8 +82,11 @@ python3 tools/convert/convert.py --checkpoint nvidia --drafter dflash2 --out Qwe
 ```
 
 - `gguf`: every tensor in llama.cpp's `qwen35` names. NVFP4 MLP and head move bit for bit into Basalt's 64-value blocks (type
-  40) with each matrix's FP32 scale as `<name>.scale`; the FP8 projections become Q8_0 of `code x scale`; the MTP layer's and
-  the drafter's BF16 projections Q8_0; norms F32 with the offset folded in (exact); GDN value heads in the GGUF order.
+  40) with each matrix's FP32 scale as `<name>.scale`; the FP8 projections keep their E4M3 codes (type 44, `F8_E4M3`: one
+  byte per value, Basalt's own type id) with each matrix's FP32 `weight_scale` as `<name>.scale`; the MTP layer's and the
+  drafter's BF16 projections Q8_0; norms F32 with the offset folded in (exact); GDN value heads in the GGUF order (rows of
+  qkv and z, columns of the out projection, moved whole).
 - `vision/mmproj`: the BF16 tower written as llama.cpp's clip GGUF (`qwen3vl_merger`); `vision/text_vocab` beside it.
 - The drafter's feature projection is stored as one block per target layer (`dflash.fc.N`), so the engine projects each
-  layer's rows as the layer ends. About 20.5 GiB, 22.6 GiB with the drafter; two minutes on 8 converter processes.
+  layer's rows as the layer ends. About 20 GiB, 22 GiB with the drafter; two minutes on 8 converter processes. A pack from
+  before F8_E4M3 (its projections Q8_0) still loads and runs them on the Q8_0 path.

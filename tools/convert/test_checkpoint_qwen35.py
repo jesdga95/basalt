@@ -242,14 +242,15 @@ class Qwen35Test(unittest.TestCase):
     def test_tensor_names_order_types(self):
         P = "model.language_model."
         want = ["token_embd.weight", "output_norm.weight", "output.weight", "output.scale",
-                "blk.0.attn_norm.weight", "blk.0.post_attention_norm.weight", "blk.0.attn_qkv.weight",
-                "blk.0.attn_gate.weight", "blk.0.ssm_out.weight", "blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight",
+                "blk.0.attn_norm.weight", "blk.0.post_attention_norm.weight", "blk.0.attn_qkv.weight", "blk.0.attn_qkv.scale",
+                "blk.0.attn_gate.weight", "blk.0.attn_gate.scale", "blk.0.ssm_out.weight", "blk.0.ssm_out.scale",
+                "blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight",
                 "blk.0.ssm_a", "blk.0.ssm_dt.bias", "blk.0.ssm_conv1d.weight", "blk.0.ssm_norm.weight"]
         for n in ("gate", "up", "down"):
             want += [f"blk.0.ffn_{n}.weight", f"blk.0.ffn_{n}.scale"]
-        want += ["blk.1.attn_norm.weight", "blk.1.post_attention_norm.weight", "blk.1.attn_q.weight",
-                 "blk.1.attn_k.weight", "blk.1.attn_v.weight", "blk.1.attn_output.weight", "blk.1.attn_q_norm.weight",
-                 "blk.1.attn_k_norm.weight"]
+        want += ["blk.1.attn_norm.weight", "blk.1.post_attention_norm.weight", "blk.1.attn_q.weight", "blk.1.attn_q.scale",
+                 "blk.1.attn_k.weight", "blk.1.attn_k.scale", "blk.1.attn_v.weight", "blk.1.attn_v.scale",
+                 "blk.1.attn_output.weight", "blk.1.attn_output.scale", "blk.1.attn_q_norm.weight", "blk.1.attn_k_norm.weight"]
         for n in ("gate", "up", "down"):
             want += [f"blk.1.ffn_{n}.weight", f"blk.1.ffn_{n}.scale"]
         want += ["mtp.fc.weight", "mtp.norm.weight", "mtp.pre_fc_norm_embedding.weight", "mtp.pre_fc_norm_hidden.weight",
@@ -262,7 +263,8 @@ class Qwen35Test(unittest.TestCase):
         self.assertEqual((T["token_embd.weight"]["type"], T["token_embd.weight"]["shape"]), ("BF16", [H, VOCAB]))
         self.assertEqual((T["output.weight"]["type"], T["output.weight"]["shape"]), ("NVFP4", [H, VOCAB]))
         self.assertEqual((T["output.scale"]["type"], T["output.scale"]["shape"], T["output.scale"]["bytes"]), ("F32", [1], 4))
-        self.assertEqual((T["blk.0.attn_qkv.weight"]["type"], T["blk.0.attn_qkv.weight"]["shape"]), ("Q8_0", [H, QKV]))
+        self.assertEqual((T["blk.0.attn_qkv.weight"]["type"], T["blk.0.attn_qkv.weight"]["shape"]), ("F8_E4M3", [H, QKV]))
+        self.assertEqual((T["blk.0.attn_qkv.scale"]["type"], T["blk.0.attn_qkv.scale"]["bytes"]), ("F32", 4))
         self.assertEqual(T["blk.0.ssm_out.weight"]["shape"], [VALUE, H])
         self.assertEqual(T["blk.0.ssm_conv1d.weight"]["shape"], [4, QKV])
         self.assertEqual((T["blk.0.ssm_a"]["type"], T["blk.0.ssm_a"]["shape"]), ("F32", [48]))
@@ -292,7 +294,18 @@ class Qwen35Test(unittest.TestCase):
             scale = self.p.f32(name[:-len(".weight")] + ".scale")
             self.assertEqual(scale.tolist(), [float(g)], name)
 
-    # ---- FP8 / BF16 to Q8_0
+    # ---- FP8 kept, BF16 to Q8_0
+    def check_f8(self, name, src, rows=None, cols=None):
+        # the codes as stored (rows or columns in the GGUF head order) and the tensor scale beside them
+        codes, scale = self.fx.fp8[src]
+        if rows is not None:
+            codes = codes[rows]
+        if cols is not None:
+            codes = codes[:, cols]
+        self.assertEqual(self.p.meta["tensors"][name]["shape"], [codes.shape[1], codes.shape[0]])
+        self.assertEqual(self.p.raw(name), np.ascontiguousarray(codes).tobytes(), name)
+        self.assertEqual(self.p.f32(name[:-len(".weight")] + ".scale").tolist(), [float(np.float32(scale))], name)
+
     def check_q8(self, name, want, tol=1.0):
         rows, cols = want.shape
         self.assertEqual(self.p.meta["tensors"][name]["shape"], [cols, rows])
@@ -304,17 +317,10 @@ class Qwen35Test(unittest.TestCase):
         codes, scale = self.fx.fp8[src]
         return E4M3[codes] * np.float64(scale)
 
-    def test_fp8_to_q8_0_plain(self):
+    def test_fp8_kept(self):
         P = "model.language_model.layers.1."
         for hf, g in (("q_proj", "attn_q"), ("k_proj", "attn_k"), ("v_proj", "attn_v"), ("o_proj", "attn_output")):
-            self.check_q8(f"blk.1.{g}.weight", self.fp8_values(P + f"self_attn.{hf}.weight"))
-
-    def test_fp8_to_q8_0_is_one_rounding(self):
-        # the Q8_0 blocks are exactly what ggml's reference rounding gives for code x scale in f32
-        src = "model.language_model.layers.1.self_attn.k_proj.weight"
-        codes, scale = self.fx.fp8[src]
-        x = (E4M3.astype(np.float32)[codes] * np.float32(scale)).reshape(-1)
-        self.assertEqual(self.p.raw("blk.1.attn_k.weight"), S.q8_0(x))
+            self.check_f8(f"blk.1.{g}.weight", P + f"self_attn.{hf}.weight")
 
     def test_bf16_drafter_to_q8_0(self):
         v = self.fx.v
@@ -336,12 +342,11 @@ class Qwen35Test(unittest.TestCase):
         L = "model.language_model.layers.0.linear_attn."
         v = self.fx.v
         qkv = self.fp8_values(L + "in_proj_qkv.weight")[S.gdn_index(QKV, S.GDN_QK_ROWS)]
-        self.check_q8("blk.0.attn_qkv.weight", qkv)
+        self.check_f8("blk.0.attn_qkv.weight", L + "in_proj_qkv.weight", rows=S.gdn_index(QKV, S.GDN_QK_ROWS))
         np.testing.assert_array_equal(qkv[:4096], self.fp8_values(L + "in_proj_qkv.weight")[:4096])     # q and k stay
         z = self.fp8_values(L + "in_proj_z.weight")[S.gdn_index(VALUE, 0)]
-        self.check_q8("blk.0.attn_gate.weight", z)
-        out = self.fp8_values(L + "out_proj.weight")[:, S.gdn_index(VALUE, 0)]
-        self.check_q8("blk.0.ssm_out.weight", out)
+        self.check_f8("blk.0.attn_gate.weight", L + "in_proj_z.weight", rows=S.gdn_index(VALUE, 0))
+        self.check_f8("blk.0.ssm_out.weight", L + "out_proj.weight", cols=S.gdn_index(VALUE, 0))
         # GGUF value head 17 (r = 1, k = 1) is checkpoint head 4, in z rows and out_proj columns alike
         zraw = self.fp8_values(L + "in_proj_z.weight")
         np.testing.assert_array_equal(z[17 * 128:18 * 128], zraw[4 * 128:5 * 128])

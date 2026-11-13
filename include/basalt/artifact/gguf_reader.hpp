@@ -100,6 +100,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 44:
+        return "F8_E4M3";
     default:
         return "?";
     }
@@ -204,6 +206,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 42:
         elems = 64;
         bytes = 18;
+        return true;
+    case 44:   // F8_E4M3: one E4M3 code per value, its FP32 tensor scale a separate `<name>.scale`
+        elems = 1;
+        bytes = 1;
         return true;
     default:
         return false;
