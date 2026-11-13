@@ -133,7 +133,8 @@ template <int N, class F> __device__ __forceinline__ void with_live(int live, F&
 
 // SWIGLU: a block's 128 rows are 64 gate rows and the same 64 up rows (two descriptor sets, each warp holds the gate and
 // the up product of the same outputs), and the output is silu(s_gate g) (s_up u).  ADD: dst += the product.
-template <bool SWIGLU, bool ADD>
+// BF: the plain product's dst is BF16 (Add widens it, adds in fp32 and rounds once).
+template <bool SWIGLU, bool ADD, bool BF = false>
 __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Params p) {
     constexpr int branches = SWIGLU ? 2 : 1;
     constexpr int loaded_rows = kBR / branches;
@@ -305,17 +306,30 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
                 }
             } else {
                 float* out = p.dst + (int64_t) t * p.ld;
+                __nv_bfloat16* hout = reinterpret_cast<__nv_bfloat16*>(p.dst) + (int64_t) t * p.ld;
                 const float alpha = __fmul_rn(g, s0);
                 const int r0 = row_begin + warp_n * kWarpRows + 2 * (lane & 3);
                 float2 res[kMmaRows];   // ADD: every residual pair loaded before any is written back
-                if constexpr (ADD)
+                if constexpr (ADD) {
 #pragma unroll
-                    for (int f = 0; f < kMmaRows; ++f) res[f] = __ldcg(reinterpret_cast<const float2*>(out + r0 + 8 * f));
+                    for (int f = 0; f < kMmaRows; ++f) {
+                        if constexpr (BF) {
+                            const unsigned u = __ldcg(reinterpret_cast<const unsigned*>(hout + r0 + 8 * f));
+                            res[f] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u));
+                        } else {
+                            res[f] = __ldcg(reinterpret_cast<const float2*>(out + r0 + 8 * f));
+                        }
+                    }
+                }
 #pragma unroll
                 for (int f = 0; f < kMmaRows; ++f) {
                     float2 v = make_float2(__fmul_rn(acc[mm][f][2 * h], alpha), __fmul_rn(acc[mm][f][2 * h + 1], alpha));
                     if constexpr (ADD) v = make_float2(__fadd_rn(res[f].x, v.x), __fadd_rn(res[f].y, v.y));
-                    *reinterpret_cast<float2*>(out + r0 + 8 * f) = v;
+                    if constexpr (BF) {
+                        *reinterpret_cast<__nv_bfloat162*>(hout + r0 + 8 * f) = __floats2bfloat162_rn(v.x, v.y);
+                    } else {
+                        *reinterpret_cast<float2*>(out + r0 + 8 * f) = v;
+                    }
                 }
             }
         }
@@ -343,10 +357,17 @@ __global__ void quantize_kernel(const In* __restrict__ x, uint8_t* __restrict__ 
     if (NORM) {
         float ss = 0.0f;
         for (int b = lane; b < nb; b += 32) {
-            const float4* q = (const float4*) (xr + 16 * b);
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                const float4 v = q[i];
+                float4 v;
+                if constexpr (std::is_same_v<In, float>) {
+                    v = *(const float4*) (xr + 16 * b + 4 * i);
+                } else {
+                    const uint2 u = *(const uint2*) (xr + 16 * b + 4 * i);
+                    const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+                    const float2 c = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+                    v = make_float4(a.x, a.y, c.x, c.y);
+                }
                 ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
             }
         }
@@ -456,7 +477,7 @@ TmaDesc map_2d(const void* base, uint64_t cols, uint64_t rows, uint64_t stride, 
 
 int64_t padded(int64_t tokens) { return (tokens + kBT - 1) / kBT * kBT; }
 
-template <bool SWIGLU, bool ADD> void launch(Params p, const void* w0, const void* w1, int64_t rows, int64_t K,
+template <bool SWIGLU, bool ADD, bool BF = false> void launch(Params p, const void* w0, const void* w1, int64_t rows, int64_t K,
                                              const void* act, int64_t tokens, cudaStream_t s) {
     constexpr int loaded_rows = kBR / (SWIGLU ? 2 : 1);
     static std::atomic<bool> configured[64];   // the shared-memory opt-in is per device and per kernel
@@ -464,7 +485,7 @@ template <bool SWIGLU, bool ADD> void launch(Params p, const void* w0, const voi
     ck(cudaGetDevice(&dev), "device");
     if (dev < 0 || dev >= 64) ck(cudaErrorInvalidDevice, "device range");
     if (!configured[dev].load(std::memory_order_acquire)) {
-        ck(cudaFuncSetAttribute(kernel<SWIGLU, ADD>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem), "smem");
+        ck(cudaFuncSetAttribute(kernel<SWIGLU, ADD, BF>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem), "smem");
         configured[dev].store(true, std::memory_order_release);
     }
     const uint8_t* a = (const uint8_t*) act;
@@ -483,7 +504,7 @@ template <bool SWIGLU, bool ADD> void launch(Params p, const void* w0, const voi
     p.tokens = (int) tokens;
     p.tok_tiles = (int) ((tokens + kBT - 1) / kBT);
     const int64_t row_tiles = rows / loaded_rows;
-    kernel<SWIGLU, ADD><<<(unsigned) (row_tiles * p.tok_tiles), kThreads, kSmem, s>>>(p);
+    kernel<SWIGLU, ADD, BF><<<(unsigned) (row_tiles * p.tok_tiles), kThreads, kSmem, s>>>(p);
     ck(cudaGetLastError(), "product");
 }
 
@@ -556,6 +577,32 @@ void product(const void* w, const float* w_scale, int64_t rows, int64_t K, const
     p.ld = ld;
     if (add) launch<false, true>(p, w, nullptr, rows, K, act, tokens, (cudaStream_t) stream);
     else launch<false, false>(p, w, nullptr, rows, K, act, tokens, (cudaStream_t) stream);
+}
+
+void product_add_bf16(const void* w, const float* w_scale, int64_t rows, int64_t K, const void* act, const float* gs,
+                      int64_t tokens, uint16_t* dst, int64_t ld, void* stream) {
+    check(w, w, rows, K, tokens, act, dst, ld, "product_add_bf16");
+    Params p{};
+    p.gs = gs;
+    p.ws[0] = w_scale;
+    p.dst = reinterpret_cast<float*>(dst);
+    p.ld = ld;
+    launch<false, true, true>(p, w, nullptr, rows, K, act, tokens, (cudaStream_t) stream);
+}
+
+void rms_norm_quantize(const uint16_t* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* gs,
+                       void* stream) {
+    if (rows <= 0) return;
+    if (cols % 256 || (reinterpret_cast<uintptr_t>(x) & 15) || (reinterpret_cast<uintptr_t>(act) & 15)) {
+        basalt::log::error("basalt", "fp4 dense: rms_norm_quantize %lld columns", (long long) cols);
+        std::exit(1);
+    }
+    uint8_t* codes = (uint8_t*) act;
+    uint8_t* scales = codes + (size_t) rows * (size_t) (cols / 2);
+    const unsigned grid = (unsigned) ((padded(rows) + 7) / 8);
+    quantize_kernel<true, false, __nv_bfloat16><<<grid, 256, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), codes, scales, gs, (int) cols, cols, rows, w, eps, nullptr);
+    ck(cudaGetLastError(), "rms_norm_quantize");
 }
 
 void swiglu(const void* w_gate, const void* w_up, const float* s_gate, const float* s_up, int64_t rows, int64_t K,

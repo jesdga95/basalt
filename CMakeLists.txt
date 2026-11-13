@@ -1452,6 +1452,11 @@ if(BUILD_TESTING)
   target_link_libraries(e4m3_producers_test PRIVATE prefill_fp8 kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME e4m3_producers_test COMMAND e4m3_producers_test)
   set_tests_properties(e4m3_producers_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # the prompt chunk's BF16 entry points against the FP32 kernels on the widened values
+  add_executable(bf16_chunk_test tests/kernels/bf16_chunk_test.cpp)
+  target_link_libraries(bf16_chunk_test PRIVATE prefill_fp8 prefill_fp4 kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME bf16_chunk_test COMMAND bf16_chunk_test)
+  set_tests_properties(bf16_chunk_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
 # a decode window's products against FP8 and NVFP4 matrices (the NVFP4 codes convert with sm_120a instructions)
 add_library(window_gemm STATIC src/kernels/cuda/window_gemm.cu src/kernels/cuda/window_gemm_f8.cu

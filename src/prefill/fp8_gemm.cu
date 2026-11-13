@@ -13,6 +13,7 @@
 #include "basalt/prefill/fp8_gemm.hpp"
 
 #include <cuda.h>
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
@@ -52,7 +53,7 @@ static_assert(alignof(CUtensorMap) >= 64, "CUtensorMap lost its alignas: the bui
 
 struct Seg {
     const float* scale;
-    float* dst;
+    void* dst;
     int64_t ld;
     int rows;
     int tile0;   // first row tile of this segment in the grid
@@ -101,6 +102,8 @@ __device__ __forceinline__ void tma2d(void* dst, const TmaDesc* map, int k, int 
 // byte offset of (row, logical byte) in a 128-byte-row tile the TMA wrote with the 128-byte swizzle
 __device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^ ((row & 7) << 4)); }
 
+// BF16: the outputs are BF16 (Store rounds the product, Add widens the BF16 residual, adds in fp32 and rounds once)
+template <bool BF16>
 __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Args p) {
     extern __shared__ __align__(1024) unsigned char raw[];
     unsigned char* act = raw;
@@ -172,7 +175,7 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
         if (lane == 0) mb_arrive(empty + st);
     }
     const float ws = sg.scale ? *sg.scale : 1.0f;
-    const bool add = p.epi == (int) Epilogue::Add;
+    const bool add = p.epi == (int) Epilogue::Add || p.epi == (int) Epilogue::AddBf16;
     // a token row at a time: with Add, its residual pairs are all loaded before any is written back (the loads overlap),
     // and only one row's worth is live beside the accumulators (no spills at 168 registers)
 #pragma unroll
@@ -182,12 +185,21 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
             const int tk = tok0 + wtk * WTOK + mt * 16 + (lane >> 2) + h * 8;
             if (tk >= p.ntok) continue;
             const float as = __ldg(p.a_scale + tk);
-            float* orow = sg.dst + (int64_t) tk * sg.ld;
+            float* orow = static_cast<float*>(sg.dst) + (int64_t) tk * sg.ld;
+            __nv_bfloat16* hrow = static_cast<__nv_bfloat16*>(sg.dst) + (int64_t) tk * sg.ld;
             float2 res[MR];
 #pragma unroll
             for (int mr = 0; mr < MR; ++mr) {
                 const int r = row0 + wrw * WROW + mr * 8 + 2 * (lane & 3);
-                res[mr] = add && r < sg.rows ? __ldcg(reinterpret_cast<const float2*>(orow + r)) : make_float2(0.0f, 0.0f);
+                res[mr] = make_float2(0.0f, 0.0f);
+                if (add && r < sg.rows) {
+                    if constexpr (BF16) {
+                        const unsigned u = __ldcg(reinterpret_cast<const unsigned*>(hrow + r));
+                        res[mr] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u));
+                    } else {
+                        res[mr] = __ldcg(reinterpret_cast<const float2*>(orow + r));
+                    }
+                }
             }
 #pragma unroll
             for (int mr = 0; mr < MR; ++mr) {
@@ -197,7 +209,8 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
                 float2 v = make_float2(__fmul_rn(__fmul_rn(acc[mt][mr][2 * h], as), ws),
                                        __fmul_rn(__fmul_rn(acc[mt][mr][2 * h + 1], as), ws));
                 if (add) v = make_float2(__fadd_rn(res[mr].x, v.x), __fadd_rn(res[mr].y, v.y));
-                *reinterpret_cast<float2*>(orow + r) = v;
+                if constexpr (BF16) *reinterpret_cast<__nv_bfloat162*>(hrow + r) = __floats2bfloat162_rn(v.x, v.y);
+                else *reinterpret_cast<float2*>(orow + r) = v;
             }
         }
 }
@@ -206,19 +219,32 @@ size_t scale_off(int64_t rows, int64_t cols) { return ((size_t) rows * (size_t) 
 
 // One block per row: amax over the row, then E4M3 codes of x * 448 / amax (saturating, round to nearest even).
 // NORM: the row is RMSNorm'd first (x * rsqrt(mean(x^2) + eps) * nw), the normed row optionally written to xn.
-template <bool NORM>
-__global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__ x, int64_t cols, int64_t ld,
+// In: float or __nv_bfloat16 rows (xn, when written, in the same type).
+__device__ __forceinline__ float4 load4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+__device__ __forceinline__ float4 load4(const __nv_bfloat16* p) {
+    const uint2 u = *reinterpret_cast<const uint2*>(p);
+    const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+    const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+__device__ __forceinline__ void store4(float* p, float4 v) { *reinterpret_cast<float4*>(p) = v; }
+__device__ __forceinline__ void store4(__nv_bfloat16* p, float4 v) {
+    const __nv_bfloat162 a = __floats2bfloat162_rn(v.x, v.y), b = __floats2bfloat162_rn(v.z, v.w);
+    *reinterpret_cast<uint2*>(p) = make_uint2(*reinterpret_cast<const unsigned*>(&a), *reinterpret_cast<const unsigned*>(&b));
+}
+template <bool NORM, class In = float>
+__global__ void __launch_bounds__(256) quantize_kernel(const In* __restrict__ x, int64_t cols, int64_t ld,
                                                       uint8_t* __restrict__ codes, float* __restrict__ scale,
                                                       const float* __restrict__ nw = nullptr, float eps = 0.0f,
-                                                      float* __restrict__ xn = nullptr) {
+                                                      In* __restrict__ xn = nullptr) {
     __shared__ float red[8];
     __shared__ float inv_s, inv_rms_s;
-    const float* xr = x + (int64_t) blockIdx.x * ld;
+    const In* xr = x + (int64_t) blockIdx.x * ld;
     float inv_rms = 1.0f;
     if (NORM) {
         float ss = 0.0f;
         for (int64_t i = threadIdx.x * 4; i < cols; i += 1024) {
-            const float4 v = *reinterpret_cast<const float4*>(xr + i);
+            const float4 v = load4(xr + i);
             ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
         }
 #pragma unroll
@@ -234,7 +260,7 @@ __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__
         inv_rms = inv_rms_s;
     }
     auto val4 = [&](int64_t i) -> float4 {
-        float4 v = *reinterpret_cast<const float4*>(xr + i);
+        float4 v = load4(xr + i);
         if (NORM) {
             const float4 w = *reinterpret_cast<const float4*>(nw + i);
             v = make_float4(v.x * inv_rms * w.x, v.y * inv_rms * w.y, v.z * inv_rms * w.z, v.w * inv_rms * w.w);
@@ -244,7 +270,7 @@ __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__
     float m = 0.0f;
     for (int64_t i = threadIdx.x * 4; i < cols; i += 1024) {
         const float4 v = val4(i);
-        if (NORM && xn) *reinterpret_cast<float4*>(xn + (int64_t) blockIdx.x * cols + i) = v;
+        if (NORM && xn) store4(xn + (int64_t) blockIdx.x * cols + i, v);
         m = fmaxf(m, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
     }
 #pragma unroll
@@ -297,6 +323,20 @@ void rms_norm_quantize(const float* x, const float* w, float eps, int64_t rows, 
     ck("quantize");
 }
 
+void rms_norm_quantize(const uint16_t* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, uint16_t* xn,
+                       void* stream) {
+    if (rows <= 0) return;
+    if (cols % 64 != 0 || cols % 4 != 0) {
+        basalt::log::error("basalt", "prefill fp8: rows of %lld values (norm)", (long long) cols);
+        std::exit(1);
+    }
+    uint8_t* codes = (uint8_t*) act;
+    float* scale = (float*) (codes + scale_off(rows, cols));
+    quantize_kernel<true, __nv_bfloat16><<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x), cols, cols, codes, scale, w, eps, reinterpret_cast<__nv_bfloat16*>(xn));
+    ck("quantize");
+}
+
 namespace {
 using EncodeFn = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
                               const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle,
@@ -338,18 +378,20 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
     }
     static bool raised = false;
     if (!raised) {
-        if (cudaFuncSetAttribute(gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess) {
+        if (cudaFuncSetAttribute(gemm_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess ||
+            cudaFuncSetAttribute(gemm_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess) {
             basalt::log::error("basalt", "prefill fp8: shared-memory opt-in failed");
             std::exit(1);
         }
         raised = true;
     }
+    const bool bf16 = epi == Epilogue::StoreBf16 || epi == Epilogue::AddBf16;
     Args p{};
     tmap(&p.tm[0], act, rows, w_cols, BT);
     int tiles = 0;
     for (int i = 0; i < nseg; ++i) {
         const Segment& s = seg[i];
-        if (s.rows <= 0 || s.rows % 128 != 0 || ((uintptr_t) s.w & 15) != 0 || ((uintptr_t) s.dst & 7) != 0 || s.ld_dst % 2 != 0) {
+        if (s.rows <= 0 || s.rows % 128 != 0 || ((uintptr_t) s.w & 15) != 0 || ((uintptr_t) s.dst & (bf16 ? 3 : 7)) != 0 || s.ld_dst % 2 != 0) {
             basalt::log::error("basalt", "prefill fp8: segment %d: [%lld x %lld] matrix, ld %lld", i, (long long) s.rows,
                                (long long) w_cols, (long long) s.ld_dst);
             std::exit(1);
@@ -364,11 +406,14 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
     p.tok_tiles = (int) ((rows + BT - 1) / BT);
     p.k_tiles = (int) ((w_cols + BK - 1) / BK);   // a K tail past the tensor reads as zeros
     p.epi = (int) epi;
-    gemm_kernel<<<(unsigned) (tiles * p.tok_tiles), NT, SMEM, (cudaStream_t) stream>>>(p);
+    if (bf16)
+        gemm_kernel<true><<<(unsigned) (tiles * p.tok_tiles), NT, SMEM, (cudaStream_t) stream>>>(p);
+    else
+        gemm_kernel<false><<<(unsigned) (tiles * p.tok_tiles), NT, SMEM, (cudaStream_t) stream>>>(p);
     ck("gemm");
 }
 
-void gemm(const uint8_t* w, int64_t w_rows, int64_t w_cols, const float* w_scale, const void* act, int64_t rows, float* dst,
+void gemm(const uint8_t* w, int64_t w_rows, int64_t w_cols, const float* w_scale, const void* act, int64_t rows, void* dst,
           int64_t ld_dst, Epilogue epi, void* stream) {
     const Segment s{w, w_rows, w_scale, dst, ld_dst};
     gemm_segmented(&s, 1, w_cols, act, rows, epi, stream);
