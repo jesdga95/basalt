@@ -19,6 +19,7 @@ namespace basalt::dense {
 
 constexpr int kWindow = 8;        // rows a decode window holds
 constexpr int kChunk = 2048;      // tokens a prompt chunk reads at once
+constexpr int kFp4Rows = 1024;    // from this many rows a chunk's NVFP4 products run W4A4 on the FP4 tensor cores
 
 /// Device buffers carved from one allocation.
 class Arena {
@@ -66,6 +67,9 @@ struct ChunkScratch {
     float *g = nullptr, *u = nullptr, *h = nullptr;
     float *hn = nullptr, *cat = nullptr;          // the drafter's history: main's normed rows, its input rows
     float* dacc = nullptr;                        // the block drafter's projected features of the chunk's rows
+    void* a4 = nullptr;                           // FP4 activations of a long chunk's NVFP4 products, their token scales
+    float* gs = nullptr;
+    int32_t* tile_off = nullptr;
     int32_t *tok = nullptr, *pos = nullptr, *iota = nullptr, *bounds = nullptr;
 };
 

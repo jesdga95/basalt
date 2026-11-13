@@ -193,7 +193,7 @@ target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deeps
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it
 add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp)
 target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
-target_link_libraries(dense PUBLIC model kernels mmq core warnings ${_gpu_runtime_target})
+target_link_libraries(dense PUBLIC model kernels mmq prefill_fp4 core warnings ${_gpu_runtime_target})
 add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
 target_include_directories(model_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
 target_link_libraries(model_qwen35 PUBLIC model tokenizer dense core ${_gpu_runtime_target})

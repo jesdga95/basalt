@@ -6,6 +6,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
 
 #include <algorithm>
 #include <vector>
@@ -193,11 +194,42 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
     kernels::add_scaled(b.x, b.tmp, L.out.scale, (int64_t) T * H, s);
 }
 
+// y [T][rows] = W . x for an NVFP4 matrix on the FP4 tensor cores, x already rounded to FP4 (fp4_quant)
+void gemm_fp4(Model& m, const Linear& l, float* y, int T, cudaStream_t s) {
+    prefill::fp4::Product p;
+    p.blob[0] = (const uint8_t*) l.w;
+    p.w_rows = l.rows;
+    p.w_cols = l.cols;
+    p.n = 1;
+    p.a4 = m.cs.a4;
+    p.gs = m.cs.gs;
+    p.bounds = m.cs.bounds;
+    p.tile_off = m.cs.tile_off;
+    p.dst = y;
+    p.ld_dst = l.rows;
+    p.max_rows = T;
+    prefill::fp4::run(p, s);
+}
+void fp4_quant(Model& m, const float* x, int64_t cols, int T, cudaStream_t s) {
+    prefill::fp4::plan(m.cs.bounds, 1, m.cs.tile_off, s);
+    prefill::fp4::quantize(x, nullptr, m.cs.bounds, m.cs.tile_off, 1, m.cs.a4, m.cs.gs, cols, cols, T, s);
+}
+
 void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd;
     kernels::rms_norm_rows(b.x, L.ffn_norm, b.xn, T, H, g.eps, s);
+    if (T >= kFp4Rows && L.gate.type == 40 && L.up.type == 40 && L.down.type == 40) {   // a long chunk: W4A4
+        fp4_quant(m, b.xn, H, T, s);
+        gemm_fp4(m, L.gate, b.g, T, s);
+        gemm_fp4(m, L.up, b.u, T, s);
+        kernels::swiglu_scaled(b.g, b.u, L.gate.scale, L.up.scale, b.h, T, g.n_ff, g.n_ff, s);
+        fp4_quant(m, b.h, g.n_ff, T, s);
+        gemm_fp4(m, L.down, b.tmp, T, s);
+        kernels::add_scaled(b.x, b.tmp, L.down.scale, (int64_t) T * H, s);
+        return;
+    }
     quantize_mmq(b.xn, b.xq, L.gate.type, H, T, s);
     gemm(m, L.gate, b.xq, b.g, T, s);
     if (L.up.type != L.gate.type) quantize_mmq(b.xn, b.xq, L.up.type, H, T, s);

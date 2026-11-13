@@ -4,6 +4,7 @@
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/logprobs.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/log.hpp"
 #include "basalt/vision/encoder_cuda.hpp"
@@ -81,7 +82,9 @@ size_t chunk_bytes(const Geometry& g) {
     const size_t T = kChunk, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim, C = (size_t) g.conv_channels();
     const size_t VD = (size_t) g.value_width(), HV = (size_t) g.gdn_v_heads;
     const size_t widest = std::max<size_t>({H, (size_t) g.n_ff, VD, AQ});
-    const size_t keep = 6 * T * H * 4 + H * 4 + prefill::mmq::q8_bytes(T, (int64_t) widest);
+    const size_t keep = 6 * T * H * 4 + H * 4 + prefill::mmq::q8_bytes(T, (int64_t) widest) +
+                        prefill::fp4::a4_bytes((int64_t) T, (int64_t) std::max<size_t>(H, g.n_ff), 1) +
+                        prefill::fp4::scale_count((int64_t) T, 1) * 4 + 4 * 256;
     const size_t gdn = g.gdn_layers() ? (2 * T * C + 3 * T * VD + 4 * T * HV) * 4 + kernels::gdn_work_bytes(T) : 0;
     const size_t attn = g.attn_layers() ? T * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) * 4 : 0;
     const size_t ffn = 3 * T * g.n_ff * 4;
@@ -188,6 +191,9 @@ bool Model::ensure_chunk(std::string& err) {
         b.hn = pre_arena.take<float>((T + 1) * H);
     }
     if (o.drafter == Drafter::Block) b.dacc = pre_arena.take<float>(T * H);
+    b.a4 = pre_arena.take_bytes(prefill::fp4::a4_bytes((int64_t) T, (int64_t) std::max<size_t>(H, gg.n_ff), 1));
+    b.gs = pre_arena.take<float>(prefill::fp4::scale_count((int64_t) T, 1));
+    b.tile_off = pre_arena.take<int32_t>(prefill::fp4::kMaxExperts + 1);
     const size_t phase = pre_arena.mark();
     if (gg.gdn_layers()) {
         b.qkv = pre_arena.take<float>(T * C);
