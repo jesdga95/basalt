@@ -4,6 +4,8 @@
 
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/model_file.hpp"
+#include "basalt/model/flags.hpp"
+#include "basalt/program/options.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/program/qwen_forms.hpp"
@@ -11,7 +13,9 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <map>
+#include <optional>
 
 namespace basalt::models::qwen35 {
 namespace {
@@ -106,6 +110,25 @@ public:
                 return false;
             w.layers.push_back(L);
         }
+        if (req.draft && tensors_.count("mtp.fc.weight")) {   // the pack's drafter layer, for --spec
+            dense::Mtp& d = w.mtp;
+            dense::Layer& L = d.layer;
+            L.kind = dense::Mixer::Attention;
+            d.norm_e = floats(gg, "mtp.pre_fc_norm_embedding.weight", H, err);
+            d.norm_h = floats(gg, "mtp.pre_fc_norm_hidden.weight", H, err);
+            d.norm = floats(gg, "mtp.norm.weight", H, err);
+            L.attn_norm = floats(gg, "mtp.attn_norm.weight", H, err);
+            L.ffn_norm = floats(gg, "mtp.post_attention_norm.weight", H, err);
+            L.q_norm = floats(gg, "mtp.attn_q_norm.weight", g.head_dim, err);
+            L.k_norm = floats(gg, "mtp.attn_k_norm.weight", g.head_dim, err);
+            if (!d.norm_e || !d.norm_h || !d.norm || !L.attn_norm || !L.ffn_norm || !L.q_norm || !L.k_norm ||
+                !linear(gg, "mtp.fc", H, 2 * H, d.fc, err) || !linear(gg, "mtp.attn_q", 2 * AQ, H, L.q, err) ||
+                !linear(gg, "mtp.attn_k", KV, H, L.k, err) || !linear(gg, "mtp.attn_v", KV, H, L.v, err) ||
+                !linear(gg, "mtp.attn_output", H, AQ, L.o, err) || !linear(gg, "mtp.ffn_gate", g.n_ff, H, L.gate, err) ||
+                !linear(gg, "mtp.ffn_up", g.n_ff, H, L.up, err) || !linear(gg, "mtp.ffn_down", H, g.n_ff, L.down, err))
+                return false;
+            d.present = true;
+        }
         progress.finish();
         progress_ = nullptr;
         size_t free_b = 0, total_b = 0;
@@ -132,7 +155,8 @@ public:
                   std::to_string((long long) g.context_length);
             return false;
         }
-        const uint64_t need_b = dense::shared_bytes(g, o.max_context) + (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, false);
+        const uint64_t need_b = dense::shared_bytes(g, o.max_context) +
+                                (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, w.mtp.present && o.draft);
         const uint64_t reserve = (uint64_t) std::max(req.vram_reserve_mib, 0) << 20;
         if (need_b + reserve + (512ull << 20) > free_b) {
             err = "qwen35: " + std::to_string((long long) o.sessions) + " session(s) of " + std::to_string((long long) o.max_context) +
@@ -273,6 +297,42 @@ public:
     model::TokenNames token_names() const override { return program::qwen_token_names(); }
     program::grammar::ToolForm tool_form() const override { return program::qwen_tool_form(); }
     int max_expert_cards() const override { return 0; }
+
+    bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
+        (void) code;
+        if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
+        else return false;
+        return true;
+    }
+
+    // the pack's drafter runs in windows of 8 unless --spec says otherwise (0 or 1: plain decode)
+    int planned_spec(const program::CommonOptions& o) const override {
+        if (o.spec_given) return o.spec >= 2 ? o.spec : 0;
+        return has_drafter(o.model) ? kDefaultSpec : 0;
+    }
+
+    std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        if (o.spec_given && (o.spec < 0 || o.spec > 8)) {
+            basalt::log::error("basalt qwen35", "--spec %d: 0 (off) to 8", o.spec);
+            return 2;
+        }
+        if (!o.spec_given) o.spec = has_drafter(o.model) ? kDefaultSpec : 0;
+        if (o.spec >= 2 && !has_drafter(o.model)) {
+            basalt::log::warn("basalt qwen35", "--spec %d off: the pack has no drafter layer", o.spec);
+            o.spec = 0;
+        }
+        return std::nullopt;
+    }
+
+private:
+    static constexpr int kDefaultSpec = 8;
+    static bool has_drafter(const std::string& path) {
+        core::ModelFile file;
+        std::string err;
+        if (path.empty() || !file.open(path, err) || !file.load_meta(err)) return false;
+        const core::Json* t = file.meta().get("tensors");
+        return t != nullptr && t->get("mtp.fc.weight") != nullptr;
+    }
     const char* model_name() const override { return "Qwen3.8-27B"; }
 };
 
