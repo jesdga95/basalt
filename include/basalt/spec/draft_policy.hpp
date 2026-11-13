@@ -32,7 +32,7 @@ namespace basalt::spec {
 
 class DraftPolicy {
 public:
-    static constexpr int kMaxT = 8;
+    static constexpr int kMaxT = 16;
     static constexpr int kBuckets = 4;
 
     explicit DraftPolicy(int max_t, double margin = 0.03);
@@ -48,6 +48,9 @@ public:
 
     /// A drafter with stated chances: the window (1 + up to `n` drafts) with the most expected tokens per ms.
     int window(const float* chance, int n) const;
+    /// The same drafter's window against a lookup proposal of `lookup_k` tokens behind a match of `match`: the lookup
+    /// window when its expected tokens per ms beat the drafter's best by the margin.
+    Pick choose_window(const float* chance, int n, int lookup_k, int match) const;
     /// After such a window: the chances of its t - 1 drafts, the drafts accepted, and the round's time.
     void observe_window(const float* chance, int t, int accepted, double round_ms);
 
@@ -64,6 +67,8 @@ private:
     double base(int t) const;              // a size's cost relative to the scale, measured or inferred
     double base_from(int t, bool lately) const;   // t's base from the other (recent) sizes; < 0 without any
     double mtp_tokens(int t) const;
+    Pick lookup_over(int t, double rate, int lookup_k, int match) const;   // the lookup window, if it beats `rate` at t
+    double drafter_tokens(const float* chance, int t) const;               // expected tokens of a drafter window of t
 
     int max_t_;
     double margin_;

@@ -178,6 +178,47 @@ int main(int argc, char** argv) {
     std::printf("gqa_decode_attn: max abs %.3g rel %.3g vs double; the last row bitwise equal across widths 1-8: %s\n", ed.abs,
                 ed.rel, bitwise ? "yes" : "NO");
     if (ed.abs > 2e-4 || !bitwise) ++fails;
+    {
+        // a captured window reads its first cell on the device and loops its blocks over the chunks in use: bitwise the
+        // host-position launch, past the grid's first round of chunks
+        const int64_t L2 = 12000, cap2 = 65536, at = L2 - 8;
+        std::vector<uint16_t> k2((size_t) L2 * NKV * HD), v2(k2.size());
+        for (auto& x : k2) x = basalt::kernels::f16_from_f32(nd(rng));
+        for (auto& x : v2) x = basalt::kernels::f16_from_f32(nd(rng));
+        uint16_t *d_k2 = dev<uint16_t>((size_t) cap2 * NKV * HD), *d_v2 = dev<uint16_t>((size_t) cap2 * NKV * HD);
+        float* d_s2 = dev<float>(basalt::kernels::gqa_decode_scratch_floats(cap2, 8, NH));
+        int32_t* d_at = dev<int32_t>(2);
+        const int32_t at2[2] = {(int32_t) at, 0};
+        ck(cudaMemcpy(d_k2, k2.data(), k2.size() * 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(d_v2, v2.data(), v2.size() * 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(d_at, at2, sizeof at2, cudaMemcpyHostToDevice), "copy");
+        std::vector<float> h1((size_t) 8 * NH * HD), h2(h1.size());
+        basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, at, 8, d_s2, cap2, d_out, nullptr);
+        ck(cudaMemcpy(h1.data(), d_out, h1.size() * 4, cudaMemcpyDeviceToHost), "copy");
+        basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, at, 8, d_s2, cap2, d_out, nullptr, d_at);
+        ck(cudaMemcpy(h2.data(), d_out, h2.size() * 4, cudaMemcpyDeviceToHost), "copy");
+        const bool same = std::memcmp(h1.data(), h2.data(), h1.size() * 4) == 0;
+        std::printf("gqa_decode_attn: device first cell at %lld of %lld cells bitwise the host launch: %s\n", (long long) at,
+                    (long long) cap2, same ? "yes" : "NO");
+        if (!same) ++fails;
+        // its cost at a short context in a large capacity, against the host launch's grid of the chunks in use
+        const int32_t near[2] = {2999, 0};
+        ck(cudaMemcpy(d_at, near, sizeof near, cudaMemcpyHostToDevice), "copy");
+        double us[2];
+        for (int dv = 0; dv < 2; ++dv) {
+            for (int i = 0; i < 5; ++i)
+                basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, 2999, 1, d_s2, cap2, d_out, nullptr, dv ? d_at : nullptr);
+            cudaDeviceSynchronize();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 200; ++i)
+                basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, 2999, 1, d_s2, cap2, d_out, nullptr, dv ? d_at : nullptr);
+            cudaDeviceSynchronize();
+            us[dv] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 200;
+        }
+        std::printf("bench: decode 1 row x 3000 cells in %lld: %.1f us host first cell, %.1f us device first cell\n",
+                    (long long) cap2, us[0], us[1]);
+        cudaFree(d_k2); cudaFree(d_v2); cudaFree(d_s2); cudaFree(d_at);
+    }
     // prompt chunk
     basalt::kernels::gqa_prompt_attn(d_q, d_kc, d_vc, NH, NKV, p0, TP, d_out, nullptr);
     std::vector<float> pr(q.size());

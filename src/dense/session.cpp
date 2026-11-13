@@ -27,6 +27,7 @@ public:
         for (cudaGraphExec_t& e : st_.wg)
             if (e) cudaGraphExecDestroy(e);
         if (st_.stream) cudaStreamDestroy(st_.stream);
+        if (done_) cudaEventDestroy(done_);
         if (h_picks_) cudaFreeHost(h_picks_);
     }
 
@@ -134,6 +135,8 @@ public:
         return drafter_ ? std::clamp(m_.o.spec, 1, kWindow) : 1;
     }
 
+    bool copy_drafts() const override { return max_window() > 1; }
+
     // The drafter's chain after `anchor` (the token at `pos`): step 0 pairs main's last normed row (cell pos - 1) with
     // the anchor, each later step its own output with the draft before it; all on the stream, read by draft_end.
     Result draft_begin(int32_t anchor, int64_t pos, int n) override {
@@ -163,6 +166,35 @@ public:
         }
         st_.tail_cell = -1;   // cell pos - 1 holds the right pair now
         n_draft_ = n;
+        return {};
+    }
+
+    // The block drafter for several sessions in passes of as many blocks as a batch window holds: each session is settled
+    // on its own stream (one after another: they share the window scratch), the passes run on the first one's stream, and
+    // the others' streams wait for them before their draft_end reads.
+    Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
+                       int count) override {
+        const int per = block_ ? kBatch / m_.w.dflash.block : 0;
+        if (count <= 1 || per < 2) return ModelSession::draft_batch(peers, anchors, pos, n, count);
+        std::vector<Session*> ss((size_t) count);
+        for (int i = 0; i < count; ++i) {
+            ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
+            if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return fail(m_.o.arch + ": a draft batch of sessions of another model");
+            if (pos[i] + m_.w.dflash.block > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
+            if (Result r = ss[(size_t) i]->settle(pos[i]); !r.ok()) return r;
+            if (cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        }
+        if (!done_ && cudaEventCreateWithFlags(&done_, cudaEventDisableTiming) != cudaSuccess) return fail(m_.o.arch + ": no event");
+        std::vector<SessionState*> sts((size_t) count);
+        for (int i = 0; i < count; ++i) sts[(size_t) i] = &ss[(size_t) i]->st_;
+        std::string err;
+        const cudaStream_t s0 = sts[0]->stream;
+        for (int i = 0; i < count; i += per)
+            if (!block_draft_batch(m_, sts.data() + i, anchors + i, pos + i, std::min(per, count - i), err, s0)) return fail(err);
+        cudaEventRecord(done_, s0);
+        for (int i = 1; i < count; ++i) cudaStreamWaitEvent(sts[(size_t) i]->stream, done_, 0);
+        for (int i = 0; i < count; ++i)
+            ss[(size_t) i]->n_draft_ = std::clamp(n[i], 1, std::min(ss[(size_t) i]->max_window() - 1, m_.w.dflash.block - 1));
         return {};
     }
 
@@ -214,7 +246,7 @@ public:
         return {};
     }
 
-    int batch_rows() const override { return kWindow; }
+    int batch_rows() const override { return kBatch; }
 
     // Several sessions' windows as one batch: each is settled and its draw prepared as decode_window does, the rows run
     // together on the first session's stream (every session's own stream is idle by then), each session draws from its own
@@ -233,7 +265,7 @@ public:
             if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the window passes the context");
             rows += r.n_tokens;
         }
-        if (rows > kWindow) return fail(m_.o.arch + ": a batch of " + std::to_string(rows) + " rows");
+        if (rows > kBatch) return fail(m_.o.arch + ": a batch of " + std::to_string(rows) + " rows");
         for (int i = 0; i < n; ++i)
             if (Result s = ss[(size_t) i]->settle(reqs[i].pos); !s.ok()) return s;
         for (int i = 0; i < n; ++i)
@@ -348,7 +380,7 @@ public:
     }
 
     size_t running_bytes() const override {
-        return (size_t) g_.gdn_layers() * st_.gdn_floats * 4 + 24 + (drafter_ ? (size_t) g_.n_embd * 4 : 0);
+        return (size_t) g_.gdn_layers() * st_.gdn_floats * 4 + 24 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) + block_ctx_bytes();
     }
 
     Result save_running(uint8_t* host, int64_t pos) override {
@@ -360,12 +392,13 @@ public:
         if (drafter_ && cudaMemcpy(host + n + sizeof tail, st_.tail, (size_t) g_.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
             return fail("saving the state failed");
         std::memcpy(host + n, tail, sizeof tail);
+        if (block_ && !block_ctx_copy(host + n + sizeof tail, pos, false)) return fail("saving the state failed");
         return {};
     }
 
     Result restore_running(const uint8_t* host, int64_t pos) override {
         pend_T_ = 0;
-        st_.dctx_from = pos;   // the block drafter's context below `pos` is not this conversation's
+        st_.dctx_from = pos;   // until its saved context is back, the block drafter's cells are another conversation's
         const size_t n = (size_t) g_.gdn_layers() * st_.gdn_floats * 4;
         if (n && cudaMemcpyAsync(st_.gdn, host, n, cudaMemcpyHostToDevice, st_.stream) != cudaSuccess) return fail("restoring the state failed");
         if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail("restoring the state failed");
@@ -375,7 +408,46 @@ public:
         st_.tail_cell = tail[2];
         if (drafter_ && cudaMemcpy(st_.tail, host + n + sizeof tail, (size_t) g_.n_embd * 4, cudaMemcpyHostToDevice) != cudaSuccess)
             return fail("restoring the state failed");
+        if (block_ && !block_ctx_copy(const_cast<uint8_t*>(host) + n + sizeof tail, pos, true)) return fail("restoring the state failed");
         return {};
+    }
+
+    // The block drafter's context in a running state: how many cells below the position hold it, then per layer its K and
+    // V for the window's cells below the position, oldest first (the cells under the count are not written).
+    size_t block_ctx_cells() const { return block_ ? (size_t) std::min<int64_t>(m_.w.dflash.window, st_.dctx_cap) : 0; }
+    size_t block_ctx_row() const { return (size_t) m_.w.dflash.n_kv * m_.w.dflash.head_dim * sizeof(uint16_t); }
+    size_t block_ctx_bytes() const {
+        return block_ ? sizeof(int64_t) + m_.w.dflash.layers.size() * 2 * block_ctx_cells() * block_ctx_row() : 0;
+    }
+    bool block_ctx_copy(uint8_t* host, int64_t pos, bool restore) {
+        const int64_t W = (int64_t) block_ctx_cells(), cap = st_.dctx_cap;
+        const size_t row = block_ctx_row();
+        int64_t valid = 0;
+        if (restore) {
+            std::memcpy(&valid, host, sizeof valid);
+            if (valid < 0 || valid > W || valid > pos) return false;
+            st_.dctx_from = pos - valid;
+        } else {
+            valid = std::clamp<int64_t>(pos - st_.dctx_from, 0, std::min<int64_t>(W, pos));
+            std::memcpy(host, &valid, sizeof valid);
+        }
+        uint8_t* at = host + sizeof(int64_t);
+        for (size_t l = 0; l < st_.dk.size(); ++l)
+            for (int kv = 0; kv < 2; ++kv) {
+                uint8_t* dev = (uint8_t*) (kv == 0 ? st_.dk[l] : st_.dv[l]);
+                uint8_t* layer = at + (size_t) (2 * l + kv) * W * row;
+                // cells pos - valid .. pos - 1 at their offset from the window's start, in up to two runs of the ring
+                for (int64_t c = pos - valid; c < pos;) {
+                    const int64_t slot = c % cap, run = std::min(pos - c, cap - slot);
+                    uint8_t* h = layer + (size_t) (c - (pos - W)) * row;
+                    uint8_t* d = dev + (size_t) slot * row;
+                    const cudaError_t e = restore ? cudaMemcpyAsync(d, h, (size_t) run * row, cudaMemcpyHostToDevice, st_.stream)
+                                                  : cudaMemcpyAsync(h, d, (size_t) run * row, cudaMemcpyDeviceToHost, st_.stream);
+                    if (e != cudaSuccess) return false;
+                    c += run;
+                }
+            }
+        return cudaStreamSynchronize(st_.stream) == cudaSuccess;
     }
 
     // a layer's cells: fp16 K and V (format 1), or int8 codes with fp16 scales per 64 values (format 2); the MTP
@@ -605,6 +677,7 @@ private:
     int32_t* h_picks_ = nullptr;
     bool drafter_ = false, block_ = false;
     int n_draft_ = 0;
+    cudaEvent_t done_ = nullptr;   // a batched drafter pass, for the other sessions' streams
     int64_t pend_pos_ = 0;
     int pend_T_ = 0;
     kernels::SamplerParams sampling_{};
