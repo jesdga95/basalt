@@ -2073,7 +2073,8 @@
       "draft_len_conv": 2.5,
       "draft_len_struct": 6.9,
       "draft_len_prose": 1.9,
-      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+      "notes": "single RTX 5090 D at its 600 W default limit (no OC), Ubuntu 24.04, weights on SATA SSD, 0 SSD spill"
     }
   ]
 }
