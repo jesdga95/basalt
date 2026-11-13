@@ -234,8 +234,7 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
         if (L.z.type != L.qkv.type) quantize_mmq(b.xn, b.xq, L.z.type, H, T, s);
         gemm(m, L.z, b.xq, b.z, T, s);
     }
-    kernels::bf16_rows_dot(b.xn, L.w_ab, b.ab, T, 2 * HV, H, s);
-    kernels::gdn_gates(b.ab, L.dt, L.ssm_a, b.gate, b.beta, T, s);
+    kernels::gdn_gating_proj(b.xn, L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
     kernels::gdn_conv(hist, b.qkv, L.conv, b.hc, T, s);
     kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn);
     chunk_residual(m, L.out, b.yn, VD, T, s);

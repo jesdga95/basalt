@@ -2,6 +2,8 @@
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 
+#include <cooperative_groups.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -114,6 +116,105 @@ __global__ void __launch_bounds__(32) bf16_rows_dot_kernel(const float* __restri
             const int64_t t = t0 + g + (i >> 1) * 8, n = n0 + 8 * j + 2 * c + (i & 1);
             if (t < T && n < N) y[t * N + n] = acc[j][i];
         }
+}
+
+// The GDN a/b projections of a prompt chunk with the gates fused: a and b are the first and last HV (= 48) rows of w
+// [2 HV][K] (BF16), gate[t][h] = softplus(a + dt[h]) * ssm_a[h], beta[t][h] = sigmoid(b) - the expressions of gdn_gates.
+// The product runs on BF16 tensor cores (m16n8k16): x is split into two BF16 terms (hi + lo, about 17 bits of x; the BF16
+// weights are exact), fp32 accumulation.  A 2,048-row chunk is only 128 token tiles of 16, so K is split over a cluster
+// of GP_S blocks (each a 64-token tile over all 96 rows and a K / GP_S slice); the partial sums meet through distributed
+// shared memory, summed in rank order (deterministic), and each block applies the gates to its 8 tokens.  The four warps
+// of a block read the same weights, so those come from L1.
+// Adapted from Infernix (Ian Ranson and contributors), Apache-2.0: see THIRD_PARTY_LICENSES - its
+// bf16_gdn_gating_proj_gemm_mma fuses the same gating into the a/b projection's epilogue over a split K.
+constexpr int GP_AHEAD = 1;   // K / GP_S must be a multiple of 32 GP_AHEAD
+constexpr int GP_HV = 48, GP_S = 8, GP_TT = 64, GP_LD = 2 * GP_HV + 8, GP_NF = 2 * GP_HV / 8;
+__global__ void __cluster_dims__(1, 1, GP_S) __launch_bounds__(128)
+    gdn_gating_proj_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w, const float* __restrict__ dt,
+                           const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta, int64_t T,
+                           int64_t K) {
+    namespace cg = cooperative_groups;
+    __shared__ __align__(16) float part[GP_TT * GP_LD];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    const int rank = blockIdx.z;
+    const int64_t tile0 = (int64_t) blockIdx.x * GP_TT, t0 = tile0 + warp * 16;
+    const int64_t kslice = K / GP_S, kbeg = rank * kslice;
+    const int64_t ta = min(t0 + g, T - 1), tb = min(t0 + g + 8, T - 1);
+    // thread c reads 8 consecutive k per 32 (an mma step takes them as the pairs 0,1 and 2,3: the k order inside a step is
+    // free), so the four lanes of a row read 128 contiguous bytes of x and 64 of w, one wide load each
+    const float* xa = x + ta * K + kbeg + 8 * c;
+    const float* xb = x + tb * K + kbeg + 8 * c;
+    const uint16_t* wp = w + (int64_t) g * K + kbeg + 8 * c;   // row 8 j + g of the 96
+    float acc[GP_NF][4] = {};
+    float4 qx[GP_AHEAD][4];   // the loads run GP_AHEAD steps of 32 k ahead of the products (a register queue)
+    uint4 qw[GP_AHEAD][GP_NF];
+    auto fetch = [&](int d, int64_t k) {
+        qx[d][0] = *reinterpret_cast<const float4*>(xa + k);
+        qx[d][1] = *reinterpret_cast<const float4*>(xa + k + 4);
+        qx[d][2] = *reinterpret_cast<const float4*>(xb + k);
+        qx[d][3] = *reinterpret_cast<const float4*>(xb + k + 4);
+#pragma unroll
+        for (int j = 0; j < GP_NF; ++j) qw[d][j] = *reinterpret_cast<const uint4*>(wp + (int64_t) 8 * j * K + k);
+    };
+    auto bf2 = [](float lo, float hi) { return __floats2bfloat162_rn(lo, hi); };
+    auto bits = [](__nv_bfloat162 v) { return *reinterpret_cast<unsigned*>(&v); };
+#pragma unroll
+    for (int d = 0; d < GP_AHEAD; ++d) fetch(d, 32 * d);
+    for (int64_t k = 0; k < kslice; k += 32 * GP_AHEAD) {
+#pragma unroll
+        for (int d = 0; d < GP_AHEAD; ++d) {
+            float4 fx[4];
+            uint4 wv[GP_NF];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) fx[i] = qx[d][i];
+#pragma unroll
+            for (int j = 0; j < GP_NF; ++j) wv[j] = qw[d][j];
+            if (k + 32 * (GP_AHEAD + d) < kslice) fetch(d, k + 32 * (GP_AHEAD + d));
+#pragma unroll
+            for (int step = 0; step < 2; ++step) {   // x = hi + lo, both BF16 (about 17 bits of x), one m16n8k16 each
+                const float4 xa4 = fx[step], xb4 = fx[2 + step];
+                const __nv_bfloat162 ha0 = bf2(xa4.x, xa4.y), ha1 = bf2(xa4.z, xa4.w);
+                const __nv_bfloat162 hb0 = bf2(xb4.x, xb4.y), hb1 = bf2(xb4.z, xb4.w);
+                const unsigned hi0 = bits(ha0), hi1 = bits(hb0), hi2 = bits(ha1), hi3 = bits(hb1);
+                const unsigned lo0 = bits(bf2(xa4.x - __low2float(ha0), xa4.y - __high2float(ha0)));
+                const unsigned lo1 = bits(bf2(xb4.x - __low2float(hb0), xb4.y - __high2float(hb0)));
+                const unsigned lo2 = bits(bf2(xa4.z - __low2float(ha1), xa4.w - __high2float(ha1)));
+                const unsigned lo3 = bits(bf2(xb4.z - __low2float(hb1), xb4.w - __high2float(hb1)));
+#pragma unroll
+                for (int j = 0; j < GP_NF; ++j) {
+                    const unsigned b0 = step ? wv[j].z : wv[j].x, b1 = step ? wv[j].w : wv[j].y;
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                 : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
+                                 : "r"(lo0), "r"(lo1), "r"(lo2), "r"(lo3), "r"(b0), "r"(b1));
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                 : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
+                                 : "r"(hi0), "r"(hi1), "r"(hi2), "r"(hi3), "r"(b0), "r"(b1));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < GP_NF; ++j) {
+        *reinterpret_cast<float2*>(part + (warp * 16 + g) * GP_LD + 8 * j + 2 * c) = make_float2(acc[j][0], acc[j][1]);
+        *reinterpret_cast<float2*>(part + (warp * 16 + g + 8) * GP_LD + 8 * j + 2 * c) = make_float2(acc[j][2], acc[j][3]);
+    }
+    cg::cluster_group cluster = cg::this_cluster();
+    cluster.sync();
+    const float* remote[GP_S];
+#pragma unroll
+    for (int q = 0; q < GP_S; ++q) remote[q] = cluster.map_shared_rank(part, q);
+    for (int idx = tid; idx < (GP_TT / GP_S) * GP_HV; idx += 128) {
+        const int tl = rank * (GP_TT / GP_S) + idx / GP_HV, h = idx % GP_HV;
+        float a = 0.f, b = 0.f;
+#pragma unroll
+        for (int q = 0; q < GP_S; ++q) { a += remote[q][tl * GP_LD + h]; b += remote[q][tl * GP_LD + GP_HV + h]; }
+        const int64_t t = tile0 + tl;
+        if (t >= T) continue;
+        const float v = a + dt[h];
+        gate[t * GP_HV + h] = (v > 20.0f ? v : log1pf(__expf(v))) * ssm_a[h];
+        beta[t * GP_HV + h] = 1.0f / (1.0f + __expf(-b));
+    }
+    cluster.sync();   // no block leaves while another still reads its partial sums
 }
 
 // Block (row t, head j): j < n_head a query head, else a key/value head; one thread per head dim.
@@ -297,6 +398,18 @@ void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64
     bf16_rows_dot_kernel<<<dim3((unsigned) ((T + RD_T - 1) / RD_T), (unsigned) ((N + RD_N - 1) / RD_N)), 32, 0,
                            (cudaStream_t) stream>>>(x, w, y, T, N, K);
     check("bf16_rows_dot");
+}
+
+void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
+                     int64_t T, int64_t HV, int64_t K, void* stream) {
+    if (T <= 0) return;
+    if (HV != GP_HV || K % (32 * GP_AHEAD * GP_S) != 0) {
+        basalt::log::error("basalt", "gdn_gating_proj: HV %lld K %lld", (long long) HV, (long long) K);
+        std::exit(1);
+    }
+    gdn_gating_proj_kernel<<<dim3((unsigned) ((T + GP_TT - 1) / GP_TT), 1, GP_S), 128, 0, (cudaStream_t) stream>>>(
+        x, w_ab, dt, ssm_a, gate, beta, T, K);
+    check("gdn_gating_proj");
 }
 
 void attn_qk_prepare(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
