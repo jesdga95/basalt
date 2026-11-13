@@ -19,7 +19,6 @@ namespace basalt::dense {
 
 constexpr int kWindow = 8;        // rows a decode window holds
 constexpr int kChunk = 2048;      // tokens a prompt chunk reads at once
-constexpr int kFp4Rows = 1024;    // from this many rows a chunk's NVFP4 products run W4A4 on the FP4 tensor cores
 
 /// Device buffers carved from one allocation.
 class Arena {

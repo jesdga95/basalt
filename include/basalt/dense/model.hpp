@@ -113,6 +113,7 @@ struct Options {
     Drafter drafter = Drafter::None;    ///< which one
     bool vision = false;                ///< requests may carry images
     bool kv_int8 = false;               ///< the attention layers' K/V as int8 codes with a scale per 64 values
+    int fp4_rows = 1024;                ///< from this many rows a prompt chunk's NVFP4 MLP runs W4A4 (diagnostic: lower to gate it)
     core::FileRange mmproj;             ///< the vision projector (vision/mmproj)
     std::string arch;                   ///< the architecture name, for messages
 };
