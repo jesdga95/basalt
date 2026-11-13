@@ -2,6 +2,7 @@
 // pack into the shared dense stack and hands out its sessions.
 #include "models/qwen35/adapter.hpp"
 
+#include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/model_file.hpp"
@@ -21,7 +22,7 @@
 namespace basalt::models::qwen35 {
 namespace {
 
-constexpr int kTypeF32 = 0, kTypeQ8_0 = 8, kTypeBf16 = 30, kTypeNvfp4 = 40, kTypeF8 = 44;
+constexpr int kTypeF32 = 0, kTypeQ8_0 = 8, kTypeBf16 = 30, kTypeNvfp4 = 40, kTypeF8 = 44, kTypeNvfp4Planes = 45;
 
 class Loaded final : public model::LoadedModel {
 public:
@@ -308,7 +309,7 @@ private:
         return (const uint16_t*) d;
     }
 
-    // `<base>.weight` (Q8_0, NVFP4 or F8_E4M3, rows x cols) and, for NVFP4 and F8_E4M3, its tensor scale `<base>.scale`
+    // `<base>.weight` (Q8_0, NVFP4_PLANES or F8_E4M3, rows x cols) and, for the last two, its tensor scale `<base>.scale`
     bool linear(const GgufFile& gg, const std::string& base, int64_t rows, int64_t cols, dense::Linear& l, std::string& err) {
         auto it = tensors_.find(base + ".weight");
         if (it == tensors_.end()) {
@@ -316,8 +317,18 @@ private:
             return false;
         }
         const int type = (int) it->second.type;
-        if (type != kTypeQ8_0 && type != kTypeNvfp4 && type != kTypeF8) {
-            err = "qwen35: " + base + ".weight is " + it->second.type_name() + "; the dense kernels read Q8_0, NVFP4 and F8_E4M3";
+        if (type == kTypeNvfp4) {
+            err = "qwen35: " + base + ".weight is NVFP4 in ggml blocks, from a pack older than NVFP4_PLANES: re-convert the "
+                  "pack (tools/convert/convert.py --checkpoint, docs/model-file.md)";
+            return false;
+        }
+        if (type != kTypeQ8_0 && type != kTypeNvfp4Planes && type != kTypeF8) {
+            err = "qwen35: " + base + ".weight is " + it->second.type_name() + "; the dense kernels read Q8_0, NVFP4_PLANES and F8_E4M3";
+            return false;
+        }
+        if (type == kTypeNvfp4Planes && !kernels::nvfp4p::fits(rows, cols)) {
+            err = "qwen35: " + base + ".weight: NVFP4_PLANES of " + std::to_string(rows) + " x " + std::to_string(cols) +
+                  " (planes need rows in 128s and 64-value groups)";
             return false;
         }
         if (type == kTypeF8 && cols % 256 != 0) {
@@ -334,7 +345,21 @@ private:
         l.cols = cols;
         l.w = upload(gg, *t, err);
         if (!l.w) return false;
-        if (type == kTypeNvfp4 || type == kTypeF8) {
+        if (type == kTypeNvfp4Planes) {
+            // The products still read ggml blocks: the planes become blocks in place (same bytes) until they read planes.
+            const size_t n = kernels::nvfp4p::bytes(rows, cols);
+            void* tmp = nullptr;
+            if (cudaMalloc(&tmp, n) != cudaSuccess || cudaMemcpy(tmp, l.w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) {
+                if (tmp) cudaFree(tmp);
+                err = "qwen35: no device memory to lay out " + base + ".weight";
+                return false;
+            }
+            kernels::nvfp4p::to_blocks(tmp, rows, cols, const_cast<void*>(l.w), nullptr);
+            cudaDeviceSynchronize();
+            cudaFree(tmp);
+            l.type = kTypeNvfp4;
+        }
+        if (type == kTypeNvfp4Planes || type == kTypeF8) {
             l.scale = floats(gg, base + ".scale", 1, err);
             if (!l.scale) return false;
         }

@@ -151,6 +151,10 @@ The grouped NVFP4 expert GEMM in src/prefill/fp4/moe_fp4.cu adapts code from Inf
 The int8 prompt-attention kernel adapts ideas and code from Infernix (src/ops/qsa/qsa_prompt.cu): the
 per-warp 16-cell tiles with one merge, the k-step query ordering, and the exact int8 widening to FP16.
 The chunked gated delta rule in src/kernels/cuda/gdn_prompt.cu adapts the Infernix chunked formulation.
+The int8-cache prompt attention in src/kernels/cuda/gqa_attn.cu adapts Infernix's fast int8 prompt kernel
+(src/ops/softmax_attention/dense/causal_cache/int8/fast_tiled_mma.cuh, fast_tiled_plan.h, ../fast_prompt_common.cuh):
+warps owning 16 query rows of one head for the whole sweep, raw int8 K/V tiles with V decoded in registers, the FP16
+partial guard, longest-first issue, and the block-shape and key-split plan with its merge.
 
 Licensed under the Apache License, Version 2.0, reproduced below.
 

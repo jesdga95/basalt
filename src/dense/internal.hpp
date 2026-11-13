@@ -21,6 +21,7 @@ namespace basalt::dense {
 
 constexpr int kWindow = 8;        // rows a decode window holds
 constexpr int kChunk = 2048;      // tokens a prompt chunk reads at once
+constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
 constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
 
 /// Device buffers carved from one allocation.
@@ -78,6 +79,7 @@ struct ChunkScratch {
     float *y = nullptr, *yn = nullptr;
     void* work = nullptr;
     float *qfull = nullptr, *k = nullptr, *v = nullptr, *qo = nullptr, *ao = nullptr, *ag = nullptr;
+    float* attn_split = nullptr;                  // gqa_prompt_attn's key-split scratch (kAttnSplits splits)
     float *g = nullptr, *u = nullptr, *h = nullptr;
     float *hn = nullptr, *cat = nullptr;          // the drafter's history: main's normed rows, its input rows
     float* dacc = nullptr;                        // the block drafter's projected features of the chunk's rows

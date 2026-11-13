@@ -115,7 +115,9 @@ size_t chunk_bytes(const Geometry& g) {
                         prefill::fp4::a4_bytes((int64_t) T, (int64_t) std::max<size_t>(H, g.n_ff), 1) +
                         prefill::fp4::scale_count((int64_t) T, 1) * 4 + 4 * 256;
     const size_t gdn = g.gdn_layers() ? (2 * T * C + 3 * T * VD + 4 * T * HV) * 4 + kernels::gdn_work_bytes(T) : 0;
-    const size_t attn = g.attn_layers() ? T * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) * 4 : 0;
+    const size_t attn = g.attn_layers() ? T * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) * 4 +
+                                              kernels::gqa_prompt_split_floats((int64_t) T, g.n_head, kAttnSplits) * 4
+                                        : 0;
     const size_t ffn = 3 * T * g.n_ff * 4;
     return keep + std::max({gdn, attn, ffn}) + T * 4 * 6 + 32 * 256;
 }
@@ -256,6 +258,7 @@ bool Model::ensure_chunk(std::string& err) {
         b.qo = pre_arena.take<float>(T * AQ);
         b.ao = pre_arena.take<float>(T * AQ);
         b.ag = pre_arena.take<float>(T * AQ);
+        b.attn_split = pre_arena.take<float>(kernels::gqa_prompt_split_floats((int64_t) T, gg.n_head, kAttnSplits));
         pre_arena.rewind(phase);
     }
     b.g = pre_arena.take<float>(T * gg.n_ff);
