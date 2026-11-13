@@ -73,13 +73,13 @@ __device__ __forceinline__ void ldsm2(unsigned& r0, unsigned& r1, unsigned a) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(a));
 }
 // m16n8k32 e4m3 x e4m3 -> f32, block-scaled with both scales 0x7f (2^0): the raw dot product at full accumulate rate
-__device__ __forceinline__ void mma_e4m3(float* c, const unsigned* a, unsigned b0, unsigned b1) {
-    const unsigned sf = 0x7Fu;
-    const unsigned short z = 0;
+__device__ __forceinline__ void mma_e4m3(float& c0, float& c1, float& c2, float& c3, unsigned a0, unsigned a1, unsigned a2,
+                                         unsigned a3, unsigned b0, unsigned b1) {
+    constexpr unsigned short z = 0;
     asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sf), "h"(z), "h"(z), "r"(sf), "h"(z), "h"(z));
+                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0x7Fu), "h"(z), "h"(z), "r"(0x7Fu), "h"(z), "h"(z));
 }
 __device__ __forceinline__ void mb_init(unsigned long long* b, unsigned n) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(su(b)), "r"(n) : "memory");
@@ -162,7 +162,9 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
-                for (int mr = 0; mr < MR; ++mr) mma_e4m3(acc[mt][mr], af[slot][mt], bf[slot][mr][0], bf[slot][mr][1]);
+                for (int mr = 0; mr < MR; ++mr)
+                    mma_e4m3(acc[mt][mr][0], acc[mt][mr][1], acc[mt][mr][2], acc[mt][mr][3], af[slot][mt][0], af[slot][mt][1],
+                             af[slot][mt][2], af[slot][mt][3], bf[slot][mr][0], bf[slot][mr][1]);
         }
         // the stage's reads (generic proxy) are ordered before the producer's async-proxy refill
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -171,44 +173,33 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
     }
     const float ws = sg.scale ? *sg.scale : 1.0f;
     const bool add = p.epi == (int) Epilogue::Add;
+    // a token row at a time: with Add, its residual pairs are all loaded before any is written back (the loads overlap),
+    // and only one row's worth is live beside the accumulators (no spills at 168 registers)
 #pragma unroll
-    for (int mt = 0; mt < MT; ++mt) {
-        // an m-tile's two token rows: with Add, every residual pair is loaded before any is written back, so the loads
-        // overlap instead of each waiting behind the last store
-        int tk[2];
-        float as_[2];
-        float2 res[2][MR];
+    for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            tk[h] = tok0 + wtk * WTOK + mt * 16 + (lane >> 2) + h * 8;
-            as_[h] = tk[h] < p.ntok ? __ldg(p.a_scale + tk[h]) : 0.0f;
+            const int tk = tok0 + wtk * WTOK + mt * 16 + (lane >> 2) + h * 8;
+            if (tk >= p.ntok) continue;
+            const float as = __ldg(p.a_scale + tk);
+            float* orow = sg.dst + (int64_t) tk * sg.ld;
+            float2 res[MR];
 #pragma unroll
             for (int mr = 0; mr < MR; ++mr) {
                 const int r = row0 + wrw * WROW + mr * 8 + 2 * (lane & 3);
-                res[h][mr] = make_float2(0.0f, 0.0f);
-                if (add && tk[h] < p.ntok && r < sg.rows)
-                    res[h][mr] = __ldcg(reinterpret_cast<const float2*>(sg.dst + (int64_t) tk[h] * sg.ld + r));
+                res[mr] = add && r < sg.rows ? __ldcg(reinterpret_cast<const float2*>(orow + r)) : make_float2(0.0f, 0.0f);
             }
-        }
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            if (tk[h] >= p.ntok) continue;
-            float* orow = sg.dst + (int64_t) tk[h] * sg.ld;
 #pragma unroll
             for (int mr = 0; mr < MR; ++mr) {
                 const int r = row0 + wrw * WROW + mr * 8 + 2 * (lane & 3);
                 if (r >= sg.rows) continue;
                 // rounded products, then the add: no contraction into an fma, so the bits do not depend on the instance
-                float2 v = make_float2(__fmul_rn(__fmul_rn(acc[mt][mr][2 * h], as_[h]), ws),
-                                       __fmul_rn(__fmul_rn(acc[mt][mr][2 * h + 1], as_[h]), ws));
-                if (add) {
-                    v.x = __fadd_rn(res[h][mr].x, v.x);
-                    v.y = __fadd_rn(res[h][mr].y, v.y);
-                }
+                float2 v = make_float2(__fmul_rn(__fmul_rn(acc[mt][mr][2 * h], as), ws),
+                                       __fmul_rn(__fmul_rn(acc[mt][mr][2 * h + 1], as), ws));
+                if (add) v = make_float2(__fadd_rn(res[mr].x, v.x), __fadd_rn(res[mr].y, v.y));
                 *reinterpret_cast<float2*>(orow + r) = v;
             }
         }
-    }
 }
 
 size_t scale_off(int64_t rows, int64_t cols) { return ((size_t) rows * (size_t) cols + 15) & ~(size_t) 15; }
