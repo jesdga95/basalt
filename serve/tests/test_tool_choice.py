@@ -39,8 +39,10 @@ class CallingEngine(MockEngine):
             text = ARGS
         elif prompt.endswith("</think>\n\n"):
             text = self.ANSWER
-        else:
-            text = self.THOUGHT + "</think>\n\n" + self.ANSWER
+        else:   # a pass that continues an earlier one (a thinking budget stops the first) picks up where it ends
+            full = self.THOUGHT + "</think>\n\n" + self.ANSWER
+            said = prompt.split("<think>\n")[-1] if "<think>\n" in prompt else ""
+            text = full[len(said):] if said and full.startswith(said) else full
         for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
             if cancel.is_set():
                 return
@@ -187,7 +189,11 @@ class OpenAI(Base):
                 code, b = self.chat(**extra)
                 self.assertEqual(code, 200, b)
                 self.assertEqual(b["choices"][0]["message"]["content"], CallingEngine.ANSWER)
-                self.assertEqual(len(self.engine.prompts), 1)
+                # one reply: a later pass (the thinking budget stops the first) only extends what the model wrote
+                first = self.engine.prompts[0]
+                for later in self.engine.prompts[1:]:
+                    self.assertEqual(later[:len(first)], first)
+                    self.assertNotIn("<tool_call>", self.tok.decode(later[len(first):]))
                 self.assertEqual(self.offered(), extra.get("tool_choice") != "none")
 
     def test_flat_shape_names_a_function(self):
