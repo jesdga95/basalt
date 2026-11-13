@@ -4,7 +4,8 @@ NVIDIA Model Optimizer checkpoint (as nvidia/Qwen3.8-27B-NVFP4), for tools/conve
   gguf                every language-model and drafter tensor in GGUF names:
                         NVFP4 MLP and head: E2M1 codes and UE4M3 scales moved into Basalt's 64-value blocks
                           (type 40, unchanged values), the FP32 tensor scale as `<name>.scale` (F32 [1])
-                        FP8 projections: code x per-tensor scale in f32, then Q8_0 (one rounding)
+                        FP8 projections: the E4M3 codes as stored (type 44, F8_E4M3; rows / columns in the GGUF
+                          head order), the FP32 per-tensor weight_scale as `<name>.scale` (F32 [1])
                         BF16 projections (the drafter's): Q8_0
                         norms F32 with the offset "+1" folded in (exact), the GDN gated norm as stored
                         GDN value heads in the GGUF order (value head h meets key head h % 16)
@@ -37,12 +38,12 @@ from gguf_writer import GGUFWriter  # noqa: E402
 from model_file import TENSOR_ALIGN, ModelWriter, Stream  # noqa: E402
 
 ARCH = "qwen35"
-TYPE_ID = {"F32": 0, "F16": 1, "Q8_0": 8, "BF16": 30, "NVFP4": 40}
+TYPE_ID = {"F32": 0, "F16": 1, "Q8_0": 8, "BF16": 30, "NVFP4": 40, "F8_E4M3": 44}
 ROWS_PER_JOB = 1 << 22
 E4M3 = S.fp8_e4m3_table()
 
 # checkpoint tensor (after `model.language_model.layers.N.` or `mtp.layers.0.`) -> (GGUF name, form, transform)
-#   forms: Q8 (Q8_0 from FP8 or BF16), FP4 (NVFP4 kept), BF16, F32
+#   forms: Q8 (Q8_0 from BF16; the main model's FP8 projections become F8, their codes kept), FP4 (NVFP4 kept), BF16, F32
 #   transforms as checkpoint.py names them: id, norm, heads, negexp, gconv, vrows, zrows, vcols
 LAYER = {
     "input_layernorm.weight": ("attn_norm.weight", "F32", "norm"),
@@ -82,12 +83,12 @@ METHODS = dict(C.METHODS, id="as stored")
 class Tensor:
     def __init__(self, name, form, src, how, ne):
         self.name, self.form, self.src, self.how, self.ne = name, form, src, how, ne
-        self.type_name = {"Q8": "Q8_0", "FP4": "NVFP4"}.get(form, form)
+        self.type_name = {"Q8": "Q8_0", "FP4": "NVFP4", "F8": "F8_E4M3"}.get(form, form)
         self.type_id = TYPE_ID[self.type_name]
 
     def expected_bytes(self) -> int:
         n = int(np.prod(self.ne))
-        return {"F32": 4 * n, "BF16": 2 * n, "Q8_0": n // 32 * 34, "NVFP4": n // 64 * 36}[self.type_name]
+        return {"F32": 4 * n, "BF16": 2 * n, "Q8_0": n // 32 * 34, "NVFP4": n // 64 * 36, "F8_E4M3": n}[self.type_name]
 
 
 class Plan:
@@ -105,7 +106,7 @@ class Plan:
                 or int(tc["linear_key_head_dim"]) != S.GDN_HEAD or int(tc["linear_value_head_dim"]) != S.GDN_HEAD:
             raise S.ConvertError("the GDN head geometry differs from the GGUF head order this converter knows")
         self.tensors: dict[str, Tensor] = {}
-        self.scales: dict[str, str] = {}      # NVFP4 tensor -> its weight_scale_2 source
+        self.scales: dict[str, str] = {}      # NVFP4 tensor -> its weight_scale_2 source, F8 tensor -> its weight_scale
         unknown = []
         for k in ck.order:
             if k.startswith("model.visual.") or QUANT_SIDE.search(k):
@@ -126,6 +127,8 @@ class Plan:
             _, _, dt, shape, _ = ck.t[k]
             if mm and form == "FP4":
                 form = "Q8"           # the drafter's MLP is BF16 in the checkpoint
+            if form == "Q8" and dt == "F8_E4M3":
+                form = "F8"           # FP8 projections keep their codes and scale
             if form == "FP4" and dt != "U8":
                 raise S.ConvertError(f"{k} is {dt}; NVFP4 codes are U8")
             if how == "gconv":
@@ -138,7 +141,7 @@ class Plan:
                 ne = list(reversed(shape))
             if form == "Q8" and (len(ne) != 2 or ne[0] % 32):
                 raise S.ConvertError(f"{k}: rows of {ne[0]} values cannot be Q8_0")
-            if form == "Q8" and dt not in ("F8_E4M3", "BF16"):
+            if form == "Q8" and dt != "BF16":
                 raise S.ConvertError(f"{k} is {dt}; projections are read from FP8 or BF16")
             if form in ("F32", "BF16") and dt != "BF16":
                 raise S.ConvertError(f"{k} is {dt}, expected BF16")
@@ -152,6 +155,7 @@ class Plan:
                 self.scales[gname] = base + ".weight_scale_2"
             if dt == "F8_E4M3":
                 ck.need(k[:-len(".weight")] + ".weight_scale", "F32", ())
+                self.scales[gname] = k[:-len(".weight")] + ".weight_scale"
         if unknown:
             raise S.ConvertError("checkpoint tensors with no GGUF counterpart: " + ", ".join(unknown[:8]))
         self._check_complete(tc)
@@ -222,7 +226,7 @@ class Plan:
         first = S.GDN_QK_ROWS if t.how == "vrows" else 0
         step = max(1, ROWS_PER_JOB // ne0)
         for r in range(0, ne1, step):
-            yield ("q8", str(p), off, dt, scale, ne0, ne1, r, min(step, ne1 - r), kind, first)
+            yield ("f8" if t.form == "F8" else "q8", str(p), off, dt, scale, ne0, ne1, r, min(step, ne1 - r), kind, first)
 
     def chunks(self, name, pool, depth: int = 64):
         for b in S.bounded_imap(pool, _job, self.jobs(name), depth):
@@ -244,7 +248,7 @@ def _job(args):
         if (sc & 0x80).any() or (sc == 0x7F).any():
             return "a UE4M3 scale with the sign bit set or NaN"
         return C.nvfp4_rows(codes, sc).tobytes()
-    _, path, off, dt, scale, ne0, ne1, row0, rows, kind, first = args
+    op, path, off, dt, scale, ne0, ne1, row0, rows, kind, first = args
     if dt == "F8_E4M3":
         mm = np.memmap(path, dtype=np.uint8, mode="r", offset=off, shape=(ne1, ne0))
     else:
@@ -256,6 +260,10 @@ def _job(args):
     else:
         u = mm[row0:row0 + rows]
     u = np.ascontiguousarray(u)
+    if op == "f8":   # the codes as stored, in the GGUF head order
+        if ((u & 0x7F) == 0x7F).any():
+            return "an E4M3 NaN code"
+        return u.tobytes()
     x = E4M3[u.reshape(-1)] * np.float32(scale) if dt == "F8_E4M3" else S._bf16_to_f32(u).reshape(-1)
     if not np.isfinite(x).all():
         return "a non-finite value"
@@ -549,12 +557,12 @@ def build(a, Job, fingerprint, die) -> None:
             t = time.time()
             parts, names = [], []
             for n, info in plan.tensors.items():
-                if info.type_name in ("Q8_0", "NVFP4"):
+                if info.type_name in ("Q8_0", "NVFP4", "F8_E4M3"):
                     parts.append(Stream(info.expected_bytes(), plan.chunks(n, pool)))
                 else:
                     parts.append(plan.float_bytes(n))
                 names.append(n)
-                if info.type_name == "NVFP4":
+                if info.type_name in ("NVFP4", "F8_E4M3"):
                     parts.append(plan.scale_value(n).tobytes())
                     names.append(n[:-len(".weight")] + ".scale")
             for n, info in (drafter.tensors.items() if drafter else []):
@@ -597,7 +605,8 @@ def build(a, Job, fingerprint, die) -> None:
                     "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
                     "nvfp4": "weight (E2M1 pairs) and weight_scale (UE4M3 per 16) moved into 64-value blocks unchanged; "
                              "weight_scale_2 as <name>.scale; input_scale unused",
-                    "fp8": "code x weight_scale in f32, Q8_0 blocks of 32 (ggml reference rounding); input_scale unused",
+                    "fp8": "weight (E4M3 codes) kept as stored, rows / columns in the GGUF head order; weight_scale as "
+                           "<name>.scale; input_scale unused (activations get a scale per row at run time)",
                     "bf16_projections": "Q8_0 (ggml reference rounding)",
                     "transforms": {k: METHODS[k] for k in used}},
             }
