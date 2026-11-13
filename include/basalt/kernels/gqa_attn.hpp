@@ -52,5 +52,8 @@ size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits);
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8 = {}, float* split_scratch = nullptr,
                      size_t split_floats = 0);
+/// The prompt chunk's form on an int8 cache: BF16 queries and BF16 output rows (the same arithmetic; the output rounded once).
+void gqa_prompt_attn_bf16(const uint16_t* q, int n_head, int n_kv, int64_t pos0, int64_t T, uint16_t* out, void* stream,
+                          KvInt8 q8, float* split_scratch = nullptr, size_t split_floats = 0);
 
 }  // namespace basalt::kernels

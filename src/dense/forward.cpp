@@ -320,11 +320,17 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         const prefill::fp8::Segment seg[3] = {f8_seg(L.q, b.qfull), f8_seg(L.k, b.k), f8_seg(L.v, b.v)};
         prefill::fp8::gemm_segmented(seg, 3, H, b.xq, T, prefill::fp8::Epilogue::StoreBf16, s);
         kernels::attn_qk_prepare_bf16(bf(b.qfull), bf(b.k), bf(b.v), L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv,
-                                      b.qo, pos, s, q8, kc, vc);
-        kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split,
-                                 kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits));
+                                      bf(b.qo), pos, s, q8, kc, vc);
+        const size_t split = kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits);
         // the gate rounds its rows to E4M3 for o itself
-        kernels::attn_gate_e4m3(b.ao, bf(b.qfull), T, g.n_head, (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, AQ), s);
+        if (q8.k) {   // BF16 queries and output rows
+            kernels::gqa_prompt_attn_bf16(bf(b.qo), g.n_head, g.n_kv, pos, T, bf(b.ao), s, q8, b.attn_split, split);
+            kernels::attn_gate_e4m3(bf(b.ao), bf(b.qfull), T, g.n_head, (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, AQ), s);
+        } else {      // an fp16 cache's prompt kernel reads FP32 queries
+            kernels::to_f32(bf(b.qo), b.ag, (int64_t) T * AQ, s);
+            kernels::gqa_prompt_attn(b.ag, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split, split);
+            kernels::attn_gate_e4m3(b.ao, bf(b.qfull), T, g.n_head, (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, AQ), s);
+        }
         chunk_residual_f8(m, L.o, T, s);
         return;
     }

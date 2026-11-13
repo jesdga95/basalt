@@ -269,12 +269,14 @@ __global__ void __cluster_dims__(1, 1, GP_S) __launch_bounds__(128)
 // Block (row t, head j): j < n_head a query head, else a key/value head; one thread per head dim.
 __device__ __forceinline__ float ldf(const float* p) { return *p; }
 __device__ __forceinline__ float ldf(const __nv_bfloat16* p) { return __bfloat162float(*p); }
-template <int HDW, class In = float>
+__device__ __forceinline__ void stf(float* p, float v) { *p = v; }
+__device__ __forceinline__ void stf(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+template <int HDW, class In = float, class QO = float>
 // (launched through launch_pdl: the earlier kernels' outputs are read after pdl_wait, so they are not __restrict__)
 __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, const In* k, const In* v,
                                                             const float* __restrict__ q_norm,
                                                             const float* __restrict__ k_norm, float eps, RopeSpec rope,
-                                                            const int32_t* pos, int n_head, int n_kv, float* q_out,
+                                                            const int32_t* pos, int n_head, int n_kv, QO* q_out,
                                                             __half* k_cache, __half* v_cache, int64_t cell0, int q_stride,
                                                             int64_t cap, const int32_t* cell0_dev, KvInt8 q8) {
     pdl_launch_dependents();
@@ -300,7 +302,7 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         y = d < half ? y * cs - xs[d + half] * sn : y * cs + xs[d - half] * sn;
     }
     if (is_q) {
-        q_out[(t * n_head + head) * HDW + d] = y;
+        stf(q_out + (t * n_head + head) * HDW + d, y);
         return;
     }
     const int64_t c0 = cell0_dev ? (int64_t) *cell0_dev : cell0;
@@ -399,8 +401,8 @@ __global__ void attn_gate_kernel(const float* __restrict__ attn, const float* __
 
 // attn_gate_kernel's values of one token's row (block per token), rounded to E4M3 with scale amax / 448 as
 // prefill::fp8::quantize rounds them (bitwise)
-template <class Q>
-__global__ void __launch_bounds__(256) attn_gate_e4m3_kernel(const float* __restrict__ attn, const Q* __restrict__ q_full,
+template <class Q, class A = float>
+__global__ void __launch_bounds__(256) attn_gate_e4m3_kernel(const A* __restrict__ attn, const Q* __restrict__ q_full,
                                                              int n_head, uint8_t* __restrict__ codes, float* __restrict__ scales) {
     constexpr int kPer = 8;   // values a thread keeps: n_head * HD <= 256 * 4 * kPer
     __shared__ float red[8];
@@ -413,7 +415,15 @@ __global__ void __launch_bounds__(256) attn_gate_e4m3_kernel(const float* __rest
         const int i = (j * 256 + (int) threadIdx.x) * 4;
         if (i >= cols) break;
         const int h = i / HD, d = i % HD;
-        const float4 a = *reinterpret_cast<const float4*>(attn + t * cols + i);
+        float4 a;
+        if constexpr (sizeof(A) == 4) {
+            a = *reinterpret_cast<const float4*>(attn + t * cols + i);
+        } else {
+            const uint2 u = *reinterpret_cast<const uint2*>(attn + t * cols + i);
+            const float2 x0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+            const float2 x1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+            a = make_float4(x0.x, x0.y, x1.x, x1.y);
+        }
         float4 g;
         if constexpr (sizeof(Q) == 4) {
             g = *reinterpret_cast<const float4*>(q_full + (t * n_head + h) * 2 * HD + HD + d);
@@ -576,7 +586,7 @@ void attn_qk_prepare(const float* q_full, const float* k, const float* v, const 
 }
 
 void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint16_t* v, const float* q_norm, const float* k_norm,
-                          float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv, float* q_out,
+                          float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv, uint16_t* q_out,
                           int64_t cell0, void* stream, KvInt8 q8, uint16_t* k_cache, uint16_t* v_cache) {
     if (T <= 0) return;
     if (rope.rot <= 0 || rope.rot > 256 || rope.rot % 2) {
@@ -589,8 +599,8 @@ void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint1
     const __nv_bfloat16* qf = reinterpret_cast<const __nv_bfloat16*>(q_full);
     const __nv_bfloat16* kk = reinterpret_cast<const __nv_bfloat16*>(k);
     const __nv_bfloat16* vv = reinterpret_cast<const __nv_bfloat16*>(v);
-    launch_pdl(attn_qk_prepare_kernel<256, __nv_bfloat16>, grid, dim3(256), 0, (cudaStream_t) stream, qf, kk, vv, q_norm, k_norm,
-               eps, r, pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, 512, (int64_t) 0,
+    launch_pdl(attn_qk_prepare_kernel<256, __nv_bfloat16, __nv_bfloat16>, grid, dim3(256), 0, (cudaStream_t) stream, qf, kk, vv,
+               q_norm, k_norm, eps, r, pos, n_head, n_kv, reinterpret_cast<__nv_bfloat16*>(q_out), (__half*) k_cache, (__half*) v_cache, cell0, 512, (int64_t) 0,
                (const int32_t*) nullptr, q8);
     check("attn_qk_prepare_bf16");
 }
@@ -627,6 +637,17 @@ void attn_gate_e4m3(const float* attn, const float* q_full, int64_t T, int n_hea
         std::abort();
     }
     attn_gate_e4m3_kernel<float><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(attn, q_full, n_head, codes, scales);
+    check("attn_gate_e4m3");
+}
+void attn_gate_e4m3(const uint16_t* attn, const uint16_t* q_full, int64_t T, int n_head, uint8_t* codes, float* scales,
+                    void* stream) {
+    if (T <= 0) return;
+    if (n_head * HD > 256 * 4 * 8) {
+        basalt::log::error("basalt", "attn_gate_e4m3: %d heads", n_head);
+        std::abort();
+    }
+    attn_gate_e4m3_kernel<__nv_bfloat16, __nv_bfloat16><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(attn), reinterpret_cast<const __nv_bfloat16*>(q_full), n_head, codes, scales);
     check("attn_gate_e4m3");
 }
 void attn_gate_e4m3(const float* attn, const uint16_t* q_full, int64_t T, int n_head, uint8_t* codes, float* scales, void* stream) {

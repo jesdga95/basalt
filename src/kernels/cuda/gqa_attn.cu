@@ -501,9 +501,20 @@ constexpr int I8_STAGE = 2 * I8_TILE + 2 * I8BC * 4 * 2;   // K, V codes and the
 
 template <int W> constexpr int i8_smem() { return W * 16 * HD + 2 * I8_STAGE; }
 
-template <int W, bool Split>
-__global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const float* __restrict__ q, int n_head, int n_kv, int pos0,
-                                                              int T, float* __restrict__ out, KvInt8 q8,
+// IO: the queries and the output rows in FP32 or BF16 (the prompt chunk's)
+__device__ __forceinline__ float io_ld(const float* p) { return *p; }
+__device__ __forceinline__ float io_ld(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+__device__ __forceinline__ void io_st4(float* p, float4 v) { *reinterpret_cast<float4*>(p) = v; }
+__device__ __forceinline__ void io_st4(__nv_bfloat16* p, float4 v) {
+    const __nv_bfloat162 a = __floats2bfloat162_rn(v.x, v.y), b = __floats2bfloat162_rn(v.z, v.w);
+    *reinterpret_cast<uint2*>(p) = make_uint2(*reinterpret_cast<const unsigned*>(&a), *reinterpret_cast<const unsigned*>(&b));
+}
+__device__ __forceinline__ void io_st1(float* p, float v) { *p = v; }
+__device__ __forceinline__ void io_st1(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+
+template <int W, bool Split, class IO = float>
+__global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const IO* __restrict__ q, int n_head, int n_kv, int pos0,
+                                                              int T, IO* __restrict__ out, KvInt8 q8,
                                                               float* __restrict__ part_rows, float2* __restrict__ part_stats) {
     constexpr int Threads = W * 32, Br = W * 16;
     constexpr int G4 = HD / 64;           // scale groups per row
@@ -533,10 +544,10 @@ __global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const float* __res
     for (int r = 0; r < 16; ++r) {
         const int row = warp * 16 + r;
         const bool valid = row < rows;
-        const float* src = q + ((int64_t) (q0 + row) * n_head + head) * HD;
+        const IO* src = q + ((int64_t) (q0 + row) * n_head + head) * HD;
         float x[8];
 #pragma unroll
-        for (int k = 0; k < 8; ++k) x[k] = valid ? src[lane + 32 * k] : 0.0f;
+        for (int k = 0; k < 8; ++k) x[k] = valid ? io_ld(src + lane + 32 * k) : 0.0f;
 #pragma unroll
         for (int grp = 0; grp < G4; ++grp) {
             const float amax = warp_max(fmaxf(fabsf(x[2 * grp]), fabsf(x[2 * grp + 1])));
@@ -767,21 +778,23 @@ __global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const float* __res
     const auto store = [&](int row, int e, float m, float l, float inv) {
         if (row >= rows) return;
         const int64_t idx = Split ? ((int64_t) split * T + q0 + row) * n_head + head : (int64_t) (q0 + row) * n_head + head;
-        float* dst = (Split ? part_rows : out) + idx * HD;
         if (Split && tq == 0) part_stats[idx] = make_float2(m, l);
 #pragma unroll
-        for (int b = 0; b < DB; ++b)
-            *reinterpret_cast<float4*>(dst + b * 16 + 4 * tq) =
-                make_float4(acc[b][0][e] * inv, acc[b][1][e] * inv, acc[b][0][e + 1] * inv, acc[b][1][e + 1] * inv);
+        for (int b = 0; b < DB; ++b) {
+            const float4 v = make_float4(acc[b][0][e] * inv, acc[b][1][e] * inv, acc[b][0][e + 1] * inv, acc[b][1][e + 1] * inv);
+            if (Split) io_st4(part_rows + idx * HD + b * 16 + 4 * tq, v);   // the splits' rows stay FP32
+            else io_st4(out + idx * HD + b * 16 + 4 * tq, v);
+        }
     };
     store(row0, 0, m0, l0, i0);
     store(row1, 2, m1, l1, i1);
 }
 
 // Block (row, query head), one thread per dim: the splits' rows weighted by sum_s 2^((m_s - M) scale).
+template <class IO>
 __global__ void __launch_bounds__(HD) prompt_i8_merge_kernel(const float* __restrict__ part_rows,
                                                              const float2* __restrict__ part_stats, int n_head, int T,
-                                                             int splits, float* __restrict__ out) {
+                                                             int splits, IO* __restrict__ out) {
     const int t = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
     float mx = -INFINITY;
     for (int s = 0; s < splits; ++s) {
@@ -798,15 +811,15 @@ __global__ void __launch_bounds__(HD) prompt_i8_merge_kernel(const float* __rest
             den += w;
         }
     }
-    out[((int64_t) t * n_head + head) * HD + d] = den > 0.0f ? num / den : 0.0f;
+    io_st1(out + ((int64_t) t * n_head + head) * HD + d, den > 0.0f ? num / den : 0.0f);
 }
 
-template <int W, bool Split>
-void launch_prompt_i8(const float* q, int n_head, int n_kv, int pos0, int T, float* out, KvInt8 q8, int splits,
+template <int W, bool Split, class IO = float>
+void launch_prompt_i8(const IO* q, int n_head, int n_kv, int pos0, int T, IO* out, KvInt8 q8, int splits,
                       float* scratch, cudaStream_t st) {
     static bool raised = false;
     if (!raised) {
-        if (cudaFuncSetAttribute(prompt_i8_kernel<W, Split>, cudaFuncAttributeMaxDynamicSharedMemorySize, i8_smem<W>()) !=
+        if (cudaFuncSetAttribute(prompt_i8_kernel<W, Split, IO>, cudaFuncAttributeMaxDynamicSharedMemorySize, i8_smem<W>()) !=
             cudaSuccess) {
             basalt::log::error("basalt", "gqa_prompt_attn: shared-memory opt-in failed");
             std::exit(1);
@@ -816,10 +829,10 @@ void launch_prompt_i8(const float* q, int n_head, int n_kv, int pos0, int T, flo
     float* rows = scratch;
     float2* stats = reinterpret_cast<float2*>(scratch + (size_t) splits * T * n_head * HD);
     const dim3 grid((unsigned) ((T + W * 16 - 1) / (W * 16)), (unsigned) n_head, (unsigned) splits);
-    prompt_i8_kernel<W, Split><<<grid, W * 32, i8_smem<W>(), st>>>(q, n_head, n_kv, pos0, T, out, q8, rows, stats);
+    prompt_i8_kernel<W, Split, IO><<<grid, W * 32, i8_smem<W>(), st>>>(q, n_head, n_kv, pos0, T, out, q8, rows, stats);
     if (Split) {
         check("gqa_prompt_attn");
-        prompt_i8_merge_kernel<<<dim3((unsigned) T, (unsigned) n_head), HD, 0, st>>>(rows, stats, n_head, T, splits, out);
+        prompt_i8_merge_kernel<IO><<<dim3((unsigned) T, (unsigned) n_head), HD, 0, st>>>(rows, stats, n_head, T, splits, out);
     }
 }
 
@@ -903,6 +916,23 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
 
 size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits) {
     return (size_t) splits * T * n_head * (HD + 2);   // the splits' rows, then their (max, sum) pairs
+}
+
+void gqa_prompt_attn_bf16(const uint16_t* q, int n_head, int n_kv, int64_t pos0, int64_t T, uint16_t* out, void* stream,
+                          KvInt8 q8, float* split_scratch, size_t split_floats) {
+    if (T <= 0) return;
+    if (!q8.k || n_kv < 1 || n_head % n_kv || pos0 + T > INT32_MAX) {
+        basalt::log::error("basalt", "gqa_prompt_attn_bf16: an int8 cache and a supported head layout");
+        std::exit(1);
+    }
+    const cudaStream_t st = (cudaStream_t) stream;
+    const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(q);
+    __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(out);
+    const I8Plan p = plan_prompt_i8(n_head, T, pos0 + T, split_scratch ? split_floats : 0);
+    if (p.warps == 4) launch_prompt_i8<4, false>(qb, n_head, n_kv, (int) pos0, (int) T, ob, q8, 1, nullptr, st);
+    else if (p.splits == 1) launch_prompt_i8<8, false>(qb, n_head, n_kv, (int) pos0, (int) T, ob, q8, 1, nullptr, st);
+    else launch_prompt_i8<8, true>(qb, n_head, n_kv, (int) pos0, (int) T, ob, q8, p.splits, split_scratch, st);
+    check("gqa_prompt_attn_bf16");
 }
 
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
