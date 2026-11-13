@@ -339,8 +339,9 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
         // NVFP4 planes: the norm in the quantizer, W4A4 on the TMA products, gate and up as one SwiGLU product, the residual
         // added by down's
         prefill::fp4_dense::rms_norm_quantize(b.x, L.ffn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
-        prefill::fp4_dense::swiglu(L.gate.w, L.up.w, L.gate.scale, L.up.scale, L.gate.rows, H, b.a4, b.gs, T, b.h, g.n_ff, s);
-        prefill::fp4_dense::quantize(b.h, T, g.n_ff, g.n_ff, b.a4, b.gs, s);
+        prefill::fp4_dense::swiglu(L.gate.w, L.up.w, L.gate.scale, L.up.scale, L.gate.rows, H, b.a4, b.gs, T, b.h, g.n_ff, s,
+                                   b.hmax);
+        prefill::fp4_dense::quantize_amax(b.h, b.hmax, T, g.n_ff, g.n_ff, b.a4, b.gs, s);   // H read once
         prefill::fp4_dense::product(L.down.w, L.down.scale, L.down.rows, g.n_ff, b.a4, b.gs, T, b.x, H, true, s);
         return;
     }
