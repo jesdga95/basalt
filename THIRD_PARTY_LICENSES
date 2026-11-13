@@ -366,6 +366,13 @@ length, source frames, decoded pixels) and their limits, the frame count from th
 then the length, then a counting pass, and per-group timestamps with image positions per group
 (src/vision/video.cpp, serve/). Licensed under the Apache License, Version 2.0, reproduced above.
 
+The dense stack and the Qwen3.8-27B model (src/dense/, src/models/qwen35/, src/kernels/cuda/dense_ops.cu,
+src/kernels/cuda/gqa_attn.cu) follow ninfer's Qwen3.5 dense execution (commit 13ebb92f6f) as the reference
+design, not its code: the DFlash 2 block drafter's flow (target-layer feature taps, the projected context K/V
+window, the non-causal draft block, top-k candidates and the candidate-path selection that picks the
+proposed tokens), the gated attention and the GDN output gate. Licensed under the Apache License, Version 2.0,
+reproduced above.
+
 ================================================================================
 DeepSeek-V4.1 chat encoding (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), in
 serve/models/deepseek41_encoding.py
