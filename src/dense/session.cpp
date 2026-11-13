@@ -194,7 +194,8 @@ public:
         // the blocks in passes of at most a batch window's rows, in order
         std::vector<int> nn((size_t) count), width((size_t) count);
         for (int i = 0; i < count; ++i) {
-            nn[(size_t) i] = std::clamp(n[i], 1, max_window() - 1);
+            // a slot's next window shares the batch's rows: no more drafts than its share takes
+            nn[(size_t) i] = std::clamp(n[i], 1, std::max(1, std::min(max_window(), kBatch / count) - 1));
             width[(size_t) i] = ss[(size_t) i]->block_width(nn[(size_t) i]);
             if (pos[i] + width[(size_t) i] > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
         }
