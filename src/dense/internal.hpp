@@ -19,8 +19,9 @@ class CudaEncoder;
 
 namespace basalt::dense {
 
-constexpr int kWindow = 8;        // rows one session's decode window holds
+constexpr int kWindow = 16;       // rows one session's decode window holds
 constexpr int kBatch = 16;        // rows a batch window (several sessions' windows) holds
+constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
 constexpr int kChunk = 2048;      // tokens a prompt chunk reads at once
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
 constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
@@ -183,10 +184,12 @@ void commit_window(Model& m, SessionState& st, int n);
 /// The block drafter's context from the last window's first n rows (st.dacc) at positions pos.. .
 bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err);
 /// The block drafter's pass after `anchor` at `pos`: its picks for slots 1 .. block-1 into st.dids / st.dconf.
-bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, std::string& err);
-/// The same pass for S sessions at once (S blocks of rows, at most kBatch rows), on `stream` (null: the first session's).
-bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchors, const int64_t* pos, int S, std::string& err,
-                       cudaStream_t stream = nullptr);
+/// The block is `width` rows (the drafter's block or wider, up to kWindow: one anchor, then mask tokens).
+bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, int width, std::string& err);
+/// The same pass for S sessions at once (session k's block of widths[k] rows, at least the drafter's block, at most kBatch rows
+/// in all), on `stream` (null: the first session's).
+bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchors, const int64_t* pos, const int* widths, int S,
+                       std::string& err, cudaStream_t stream = nullptr);
 
 /// The drafter over n rows of (hidden, next token) pairs at cells c0..c0+n-1: `hid` device rows [n][n_embd] (main's
 /// normed hidden, or the drafter's own output), `tok` device ids of the tokens after them.  Writes its KV; with

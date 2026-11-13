@@ -17,7 +17,7 @@
 
 namespace basalt::kernels {
 
-constexpr int kDecMaxT = 8;
+constexpr int kDecMaxT = 16;   // rows a GDN window kernel takes (a dense decode window's)
 
 /// The activation on z in the closing gated RMS norm: y = rms_norm(o) * gamma * act(z).
 enum class GdnGate : int32_t { Sigmoid = 0, Silu = 1 };
@@ -90,7 +90,8 @@ inline constexpr int dec_gdnf_mode() { return 3; }
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
 /// n_layers consecutive GDN layers' commits in one launch (layer l's state at state + l * state_stride, its conv
 /// history right after the S x h_v x S state; h / qkv at l * h_stride, gate / beta at l * gb_stride): the conv
-/// history and the state replayed over the first *n_keep rows (at most kDecMaxT), from the rows dec_gdn_rec stored.
+/// history and the state replayed over the first *n_keep rows (at most max_n: 8, or else kDecMaxT), from the rows
+/// dec_gdn_rec stored.
 struct GdnCommitLayers {
     float* state = nullptr;
     const float *h = nullptr, *qkv = nullptr, *gate = nullptr, *beta = nullptr;
@@ -99,6 +100,6 @@ struct GdnCommitLayers {
     const int32_t* n_keep = nullptr;
 };
 /// From `blocks` persistent blocks (grid-stride); each loads its next item while the current one runs.
-void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks = 32);
+void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks = 32, int max_n = 8);
 
 }  // namespace basalt::kernels

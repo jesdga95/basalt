@@ -21,7 +21,8 @@
 
 namespace basalt::kernels {
 
-inline constexpr int kVerifyMaxT = kDecMaxT;
+inline constexpr int kVerifyMaxT = 8;   // Flash-Next's verify window (at most kDecMaxT)
+static_assert(kVerifyMaxT <= kDecMaxT, "the verify window fits the GDN window kernels");
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written.  Bitwise `fused_gdn_conv_l2` per token.

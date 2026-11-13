@@ -23,7 +23,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     DmShared& sm = su.d;
     __shared__ uint32_t s_seq;
     __shared__ int32_t s_ok;
-    __shared__ float s_part[MIX ? kDecMaxT : 1][kDmThreads / 32];
+    __shared__ float s_part[MIX ? kVerifyMaxT : 1][kDmThreads / 32];
     const int tid = threadIdx.x;
     const int nb = gridDim.x;
     float* gate = (float*) a.scratch;
@@ -106,7 +106,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                 if (tid < 128)   // one 128-thread item per (value head, rank), grid-strided
                     for (int it = blockIdx.x; it < 4 * R.h_v; it += nb) {
                         if (it != (int) blockIdx.x) rec_sync<true>();
-                        rec_block<kDecMaxT, 10, true, true>(R, mt, it >> 2, it & 3, su.r, nullptr);
+                        rec_block<kVerifyMaxT, 10, true, true>(R, mt, it >> 2, it & 3, su.r, nullptr);
                     }
                 if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
                 stamp(a.steps + s, 2);
