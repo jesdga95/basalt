@@ -381,6 +381,7 @@ public:
         else if (a == "--diag-drafter") { drafter_choice() = args.next("--diag-drafter"); }
         else if (a == "--diag-fp4-rows") fp4_rows() = std::max(1, std::atoi(args.next("--diag-fp4-rows")));
         else if (a == "--kv") o.kv = args.next("--kv");
+        else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
         return true;

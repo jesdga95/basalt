@@ -34,8 +34,10 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
 ## Drafting
 
 On by default with the pack's drafter; `--spec N` caps the window (default 8), `--spec 0` turns it off. With the block drafter
-one pass proposes up to 7 tokens; without it the MTP layer drafts one token per step. Output is exactly plain decoding's: every
-window, drafted or not, runs its products with one 8-row tile, so a row's arithmetic does not depend on the window.
+one pass proposes up to 7 tokens; without it the MTP layer drafts one token per step. `--suffix-draft N` (default 3, `0` = off)
+also fills a window from an earlier repeat of at least N tokens in the context, where the draft policy expects it to pay.
+Output is exactly plain decoding's: every window, drafted or not, runs its products with one 8-row tile, so a row's arithmetic
+does not depend on the window.
 
 ## Images and video
 

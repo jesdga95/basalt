@@ -84,6 +84,11 @@ struct CommonOptions {
     /// 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for the exactness test).
     int spec = 0;
     bool spec_given = false;           ///< --spec on the command line
+    /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
+    /// edits, quoted input, tool-call JSON) by at least this many tokens, a window may hold what followed it there instead
+    /// of the drafter's drafts, where the draft policy expects it to pay (basalt/spec/draft_policy.hpp).  Read by the models
+    /// that take --suffix-draft; 0 = the drafter only.
+    int suffix_draft = 3;
     std::string spec_oracle;
     int draft_experts = 32;            ///< --draft-experts N: the drafter's routed experts each stage keeps (0: all)
     int drafter_device = -1;           ///< --diag-drafter-gpu N: the CUDA device it runs on (-1: the main card)

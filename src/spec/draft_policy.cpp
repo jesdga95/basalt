@@ -9,7 +9,8 @@ namespace {
 // The shape of a round's cost by window size, relative to one token, used only below the smallest measured size or
 // while a single size is measured (two measured sizes give the cost of a row; measured round times replace both). It
 // sits between the measured curves: steeper with every missed expert on the CPU, flatter with the default CPU/DMA split.
-constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6};
+constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6,
+                                                    3.95, 4.3, 4.65, 5.0, 5.35, 5.7, 6.05, 6.4};
 // A round's cost is scale x base(size): the scale follows every round fast (the context grows, the tiers move, a
 // request's first windows run cold), each size's base follows its own rounds slowly, so the costs of sizes not taken
 // lately move with the ones taken
@@ -105,10 +106,35 @@ double DraftPolicy::mtp_tokens(int t) const {
 }
 
 DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const {
+    const int t = std::clamp(t_mtp, 1, max_t_);
+    if (lookup_k <= 0) {
+        Pick p;
+        p.t = t;
+        return p;
+    }
+    return lookup_over(t, mtp_tokens(t) / cost_ms(t), lookup_k, match);
+}
+
+DraftPolicy::Pick DraftPolicy::choose_window(const float* chance, int n, int lookup_k, int match) const {
     Pick p;
-    p.t = std::clamp(t_mtp, 1, max_t_);
+    p.t = window(chance, n);
     if (lookup_k <= 0) return p;
-    const double base = mtp_tokens(p.t) / cost_ms(p.t);
+    return lookup_over(p.t, drafter_tokens(chance, p.t) / cost_ms(p.t), lookup_k, match);
+}
+
+double DraftPolicy::drafter_tokens(const float* chance, int t) const {
+    double e = 1.0, all = 1.0;
+    for (int i = 0; i + 1 < t; ++i) {
+        all *= chance_rate(chance[i]);
+        e += all;
+    }
+    return e;
+}
+
+// `base`: the expected tokens per ms of the window of t the drafter would run
+DraftPolicy::Pick DraftPolicy::lookup_over(int t, double base, int lookup_k, int match) const {
+    Pick p;
+    p.t = t;
     const double q = lookup_rate(match);
     double e = 1.0, qi = 1.0, best = 0.0;
     int best_t = 0;

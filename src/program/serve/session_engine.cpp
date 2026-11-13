@@ -51,6 +51,7 @@ public:
         // one policy for the solo windows and one for the batch windows, whose rounds cost differently
         policy.emplace(session().max_window());
         bpolicy.emplace(session().max_window());
+        if (lookup_on()) sfx.emplace(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         if (o.batch > 0) {
             bs.resize((size_t) o.batch);
             slot_sampling_.resize((size_t) o.batch);
@@ -312,6 +313,9 @@ public:
     /// The draft windows' policy (basalt/spec/draft_policy.hpp): learns this machine's round times and the drafter's
     /// acceptance across requests.
     std::optional<basalt::spec::DraftPolicy> policy, bpolicy;
+    /// Prompt lookup (--suffix-draft) for a model whose sessions take copied drafts: the solo request's history.
+    bool lookup_on() const { return o.suffix_draft > 0 && sessions_[0]->copy_drafts(); }
+    std::optional<basalt::spec::SuffixDrafter> sfx;
     /// --draft-log FILE, opened once.
     FILE* draft_log() {
         static FILE* const f = std::fopen(basalt::core::diagnostics().draft_log.c_str(), "a");
@@ -357,6 +361,11 @@ public:
         n_draft_ = 0;
         drafts_.assign((size_t) max_window(), 0);
         conf_.assign((size_t) max_window(), 0.0f);
+        sbuf_.assign((size_t) max_window(), 0);
+        if (rt_.sfx) {
+            rt_.sfx->reset();
+            for (int64_t t : ids) rt_.sfx->append((int32_t) t);
+        }
     }
     void decode_stats_begin() {
         counts0_ = rt_.session().expert_counts();
@@ -371,9 +380,23 @@ public:
         const int T = rt_.policy->window(conf_.data(), n_draft_);
         return (int) std::max<int64_t>(1, std::min<int64_t>(T, runtime_.o.max_context - p));
     }
-    void lookup_window(int&, bool&, int&) {}
-    void fill_drafts(int T, bool) {
-        for (int i = 1; i < T; ++i) window[(size_t) i] = drafts_[(size_t) i - 1];
+    // a lookup proposal takes the window when its first token is the drafter's (or the drafter has none) and the policy
+    // expects more tokens per ms from it
+    void lookup_window(int& T, bool& from_sfx, int& sfx_match) {
+        if (!rt_.sfx || first_window || ppl != nullptr) return;
+        const int most = (int) std::min<int64_t>(max_window(), runtime_.o.max_context - p);
+        if (most < 2) return;
+        const int k = rt_.sfx->propose(most - 1, sbuf_.data());
+        sfx_match = rt_.sfx->last_match();
+        if (k <= 0 || (n_draft_ > 0 && sbuf_[0] != drafts_[0])) return;
+        const basalt::spec::DraftPolicy::Pick pk = rt_.policy->choose_window(conf_.data(), n_draft_, k, sfx_match);
+        if (pk.lookup) {
+            T = std::min(pk.t, most);
+            from_sfx = true;
+        }
+    }
+    void fill_drafts(int T, bool from_sfx) {
+        for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf_[(size_t) i - 1] : drafts_[(size_t) i - 1];
     }
     int before_window(int, int64_t) { return 0; }
     int32_t* history_stage() {
@@ -418,8 +441,9 @@ public:
         hold = false;
         return true;
     }
-    void note_draft_probs(bool) {
-        window_conf_.assign(conf_.begin(), conf_.begin() + n_draft_);
+    void note_draft_probs(bool from_sfx) {
+        if (from_sfx) window_conf_.clear();
+        else window_conf_.assign(conf_.begin(), conf_.begin() + n_draft_);
     }
     void stamp_before_commit() {}
     // each row's pick is the draw of its own index, whatever the width of the window
@@ -427,7 +451,9 @@ public:
         if (phase == 2) draws_ += (uint64_t) keep;
         return true;
     }
-    void on_token(int32_t) {}
+    void on_token(int32_t tok) {
+        if (rt_.sfx) rt_.sfx->append(tok);
+    }
     void count_round() {}
     // The next window's drafts start before this window's tokens go out, which run in their shadow.
     template <class After>
@@ -448,16 +474,18 @@ public:
         return true;
     }
     bool draft_fatal() const { return false; }
-    void window_timing(int T, int a, bool, Clock::time_point round0, Clock::time_point tw0, Clock::time_point tw1, Clock::time_point) {
+    void window_timing(int T, int a, bool from_sfx, Clock::time_point round0, Clock::time_point tw0, Clock::time_point tw1, Clock::time_point) {
         if (draft_log_ == nullptr) return;
         const auto msd = [](Clock::time_point x, Clock::time_point y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
-        std::fprintf(draft_log_, "W %d %d 0 %.3f %.3f %.3f", T, a, msd(round0, tw0), msd(tw0, tw1), msd(tw1, Clock::now()));
+        std::fprintf(draft_log_, "W %d %d %d %.3f %.3f %.3f", T, a, from_sfx ? 1 : 0, msd(round0, tw0), msd(tw0, tw1), msd(tw1, Clock::now()));
         for (float c : window_conf_) std::fprintf(draft_log_, " %.4f", (double) c);
         std::fputc('\n', draft_log_);
     }
-    void observe_policy(bool, int T, int a, int, Clock::time_point round0) {
+    void observe_policy(bool from_sfx, int T, int a, int sfx_match, Clock::time_point round0) {
         if (ppl != nullptr) return;   // a quality gate's windows are forced, not drafted
-        rt_.policy->observe_window(window_conf_.data(), T, a, std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+        if (from_sfx) rt_.policy->observe(true, T, a, sfx_match, ms);
+        else rt_.policy->observe_window(window_conf_.data(), T, a, ms);
     }
     void mark_after_window() {}
     void mark_loop_end() {}
@@ -485,6 +513,14 @@ private:
     }
     Flow read_to(int64_t to) override;
     Flow slot_bind() override { rt_.set_active(slot_b); return Flow::proceed; }
+    // a slot's prompt lookup history: the conversation, then the token its first window feeds
+    void slot_init(BSlot& sl) override {
+        if (!rt_.lookup_on()) return;
+        sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
+                                                               (size_t) runtime_.o.max_context + 4096);
+        for (int32_t t : runtime_.live) sl.sfx->append(t);
+        sl.sfx->append(x);
+    }
     Flow restore_image() override {
         const int64_t positions = (int64_t) incoming->live.ids.size();
         // a conversation stored by a build whose running state had another layout is read again, not mounted
@@ -534,7 +570,7 @@ private:
     std::vector<Block> blocks_;
     std::vector<int32_t> history_;
     uint64_t draws_ = 0;
-    std::vector<int32_t> drafts_;
+    std::vector<int32_t> drafts_, sbuf_;
     std::vector<float> conf_, window_conf_;
     int n_draft_ = 0;
     FILE* draft_log_ = nullptr;
@@ -547,6 +583,8 @@ private:
 // A slot's window of one round: what it feeds, what it drew, and the penalty history rows of its draws.
 struct SlotWin {
     int T = 1;
+    bool from_sfx = false;   // the drafts are a lookup proposal behind a match of `match` tokens
+    int match = 0;
     std::vector<int32_t> win, out, history;
     float chance[16] = {};
     Clock::time_point round0;
@@ -557,12 +595,26 @@ struct SlotWin {
 void SessionRuntime::slot_window_begin(int b, SlotWin& w, int limit) {
     BSlot& sl = bs[(size_t) b];
     const int most = (int) std::min<int64_t>({(int64_t) sessions_[(size_t) b]->max_window(), o.max_context - sl.p, (int64_t) std::size(sl.dr) + 1, (int64_t) limit});
-    const int T = w.T = std::max(1, std::min(bpolicy->window(sl.dprob, sl.n_dr), most));
+    w.T = std::max(1, std::min(bpolicy->window(sl.dprob, sl.n_dr), most));
+    w.from_sfx = false;
+    w.match = 0;
+    if (sl.sfx && most >= 2) {   // a lookup proposal, as in the solo loop
+        const int k = sl.sfx->propose(most - 1, sl.sbuf);
+        w.match = sl.sfx->last_match();
+        if (k > 0 && (sl.n_dr == 0 || sl.sbuf[0] == sl.dr[0])) {
+            const basalt::spec::DraftPolicy::Pick pk = bpolicy->choose_window(sl.dprob, std::min(sl.n_dr, most - 1), k, w.match);
+            if (pk.lookup) {
+                w.T = std::min(pk.t, most);
+                w.from_sfx = true;
+            }
+        }
+    }
+    const int T = w.T;
     std::copy(sl.dprob, sl.dprob + (T - 1), w.chance);
     w.win.assign((size_t) T, 0);
     w.out.assign((size_t) T, -1);
     w.win[0] = sl.x;
-    std::copy(sl.dr, sl.dr + (T - 1), w.win.begin() + 1);
+    std::copy(w.from_sfx ? sl.sbuf : sl.dr, (w.from_sfx ? sl.sbuf : sl.dr) + (T - 1), w.win.begin() + 1);
     basalt::kernels::SamplerParams& sp = slot_sampling_[(size_t) b];
     w.d = {};
     w.d.tokens = w.win.data();
@@ -626,6 +678,7 @@ bool SessionRuntime::slot_window_finish(int b, SlotWin& w) {
         ++sl.produced;
         ++sl.p;
         sl.x = y;
+        if (sl.sfx) sl.sfx->append(y);
         line += " " + std::to_string(y);
         const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
         fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
@@ -642,7 +695,9 @@ bool SessionRuntime::slot_window_finish(int b, SlotWin& w) {
     if (drafting) {
         const int max_n = std::min(drafts_ahead(T, session().max_window()), (int) std::size(sl.dr));
         if (const basalt::model::Result r = session().draft_end(sl.dr, sl.dprob, max_n, sl.n_dr); !r.ok()) return failed(r.message);
-        bpolicy->observe_window(w.chance, T, a, std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count());
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
+        if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
+        else bpolicy->observe_window(w.chance, T, a, ms);
     }
     if (fin != nullptr) {
         std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin,
