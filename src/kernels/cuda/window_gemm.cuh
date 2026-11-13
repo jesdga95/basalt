@@ -113,7 +113,7 @@ __device__ __forceinline__ uint4 ld_nc16(const void* p) {
 }
 
 template <int F, int RS, int NM, int CH, int ST, int NT, int MW>
-__global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW) wgemm_kernel(const Args a) {
+__global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgemm_kernel(const Args a) {
     using C = Cfg<F, RS, NM, CH, ST>;
     constexpr bool kF8 = F == (int) Format::F8, kBf16 = F == (int) Format::Bf16;
     constexpr int KB = CH / 64;                       // 64-value blocks per chunk
