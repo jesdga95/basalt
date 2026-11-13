@@ -346,6 +346,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/dense_ops.cu
                         src/kernels/cuda/gqa_attn.cu
                         src/kernels/cuda/fp8_window.cu
+                        src/kernels/cuda/nvfp4_planes.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
@@ -683,6 +684,10 @@ add_executable(dense_ops_parity tests/kernels/dense_ops_parity.cpp)
 target_link_libraries(dense_ops_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dense_ops_parity COMMAND dense_ops_parity)
 set_tests_properties(dense_ops_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+add_executable(nvfp4_planes_test tests/kernels/nvfp4_planes_test.cpp)
+target_link_libraries(nvfp4_planes_test PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME nvfp4_planes_test COMMAND nvfp4_planes_test)
+set_tests_properties(nvfp4_planes_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 add_executable(fp8_window_parity tests/kernels/fp8_window_parity.cpp)
 target_link_libraries(fp8_window_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME fp8_window_parity COMMAND fp8_window_parity)
