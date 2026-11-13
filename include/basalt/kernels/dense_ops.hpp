@@ -40,6 +40,7 @@ struct RopeSpec {
     int rot = 0;
     float theta = 0.0f;
     int8_t axis[64] = {};   // per rotated pair
+    float inv_freq[64] = {};   // filled by attn_qk_prepare from theta and rot (the kernels read the table)
 };
 
 /// One window's or chunk's query and key heads: q_full [T][n_head][2 hd] (query | gate per head; `gated` false:

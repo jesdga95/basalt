@@ -139,7 +139,7 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const float* __res
     __syncthreads();
     if (d < rope.rot) {
         const int i = d < half ? d : d - half;
-        const float inv_freq = (float) pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+        const float inv_freq = rope.inv_freq[i];
         const float ang = (float) pos[t * 3 + rope.axis[i]] * inv_freq;
         float sn, cs;
         sincosf(ang, &sn, &cs);
@@ -310,11 +310,14 @@ void attn_qk_prepare(const float* q_full, const float* k, const float* v, const 
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head + n_kv));
     const int qs = gated ? 2 * hd : hd;
+    // each pair's inverse frequency, once on the host in double (the kernel used to take a double pow per thread)
+    RopeSpec r = rope;
+    for (int i = 0; i < rope.rot / 2; ++i) r.inv_freq[i] = (float) std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
     if (hd == 256)
-        attn_qk_prepare_kernel<256><<<grid, 256, 0, (cudaStream_t) stream>>>(q_full, k, v, q_norm, k_norm, eps, rope, pos, n_head,
+        attn_qk_prepare_kernel<256><<<grid, 256, 0, (cudaStream_t) stream>>>(q_full, k, v, q_norm, k_norm, eps, r, pos, n_head,
             n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8);
     else
-        attn_qk_prepare_kernel<128><<<grid, 128, 0, (cudaStream_t) stream>>>(q_full, k, v, q_norm, k_norm, eps, rope, pos, n_head,
+        attn_qk_prepare_kernel<128><<<grid, 128, 0, (cudaStream_t) stream>>>(q_full, k, v, q_norm, k_norm, eps, r, pos, n_head,
             n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8);
     check("attn_qk_prepare");
 }
