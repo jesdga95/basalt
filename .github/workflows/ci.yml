@@ -59,7 +59,6 @@ jobs:
         run: python -m unittest discover -s tools/migrations -p "test_*.py"
 
   build-test:
-    needs: lint
     strategy:
       fail-fast: false
       matrix:
@@ -140,7 +139,6 @@ jobs:
 
   # A build of one model compiles and tests none of the others (-DBASALT_MODELS).
   build-single-model:
-    needs: lint
     strategy:
       fail-fast: false
       matrix:
