@@ -140,11 +140,6 @@ struct Options : CommonOptions {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
-    /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
-    /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
-    /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
-    /// pay (basalt/spec/draft_policy.hpp).  On by default; 0 = MTP only.
-    int suffix_draft = 3;
     /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
     /// A control vector on the residual stream (basalt/kernels/cvec.hpp), with llama.cpp's flags: the

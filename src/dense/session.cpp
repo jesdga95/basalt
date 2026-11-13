@@ -134,6 +134,8 @@ public:
         return drafter_ ? std::clamp(m_.o.spec, 1, kWindow) : 1;
     }
 
+    bool copy_drafts() const override { return max_window() > 1; }
+
     // The drafter's chain after `anchor` (the token at `pos`): step 0 pairs main's last normed row (cell pos - 1) with
     // the anchor, each later step its own output with the draft before it; all on the stream, read by draft_end.
     Result draft_begin(int32_t anchor, int64_t pos, int n) override {

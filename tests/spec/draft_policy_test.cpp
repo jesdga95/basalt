@@ -14,6 +14,9 @@
 //   9. a head that overstates its chances is calibrated down, and the window shrinks with it;
 //  10. rows that cost little take more drafts at the same chances;
 //  11. never more rows than the drafts, nor beyond the cap.
+// A drafter with stated chances against a lookup proposal (choose_window):
+//  12. no proposal keeps the drafter's window; a long, reliable copy takes a wider window than confident drafts would;
+//  13. a short copy that keeps failing loses to confident drafts; windows past 8 rows stay within the cap.
 #include "basalt/spec/draft_policy.hpp"
 
 #include <cstdio>
@@ -131,6 +134,22 @@ int main() {
         check(p.window(ch, 2) <= 3, "drafter: never more rows than drafts + 1");
         check(p.window(ch, 5) <= 4, "drafter: never beyond the cap");
         check(p.window(ch, 0) == 1, "drafter: no drafts, one row");
+    }
+    {
+        DraftPolicy p(16);
+        const float ch[15] = {0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f};
+        for (int i = 0; i < 200; ++i) {
+            const int t = 1 + i % 16;
+            p.observe(true, t, t - 1, 40, 20.0 + 1.5 * (t - 1));   // copies behind long matches: all accepted, rows cheap
+        }
+        const DraftPolicy::Pick none = p.choose_window(ch, 7, 0, 0);
+        check(!none.lookup && none.t == p.window(ch, 7), "drafter vs lookup: no proposal, the drafter's window");
+        const DraftPolicy::Pick k = p.choose_window(ch, 7, 15, 40);
+        check(k.lookup && k.t > 8, "drafter vs lookup: a long reliable copy takes a wide window");
+        check(p.choose_window(ch, 7, 40, 40).t <= 16, "drafter vs lookup: never beyond the cap");
+        for (int i = 0; i < 200; ++i) p.observe(true, 6, 0, 4, 20.0 + 1.5 * 5);   // short matches: the first draft fails
+        const float sure[7] = {0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f};
+        check(!p.choose_window(sure, 7, 5, 4).lookup, "drafter vs lookup: a failing short copy loses to sure drafts");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
