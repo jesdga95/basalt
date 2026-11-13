@@ -194,9 +194,12 @@ target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deeps
 add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp)
 target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
 target_link_libraries(dense PUBLIC model kernels mmq core warnings ${_gpu_runtime_target})
+add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
+target_include_directories(model_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
+target_link_libraries(model_qwen35 PUBLIC model tokenizer dense core ${_gpu_runtime_target})
 
 add_library(models STATIC src/models/builtin.cpp)
-target_link_libraries(models PUBLIC model_qwen4exp model_deepseek41)
+target_link_libraries(models PUBLIC model_qwen4exp model_deepseek41 model_qwen35)
 
 # DeepSeek-V4.1 kernels and their tests (own file)
 include(src/models/deepseek41/kernels/kernels.cmake)
