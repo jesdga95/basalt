@@ -272,6 +272,9 @@ const ModelAdapter* find_adapter(const std::string& arch);
 std::vector<std::string> adapter_names();
 /// The most expert cards any registered model takes: a card plan before a model is known.
 int max_expert_cards();
+/// Why no adapter serves `arch`: a Basalt model this build left out (what the build holds and the option that adds
+/// it), or an architecture Basalt does not have.
+std::string unavailable_architecture(const std::string& arch);
 /// The adapter for a file's `general.architecture`, or null with `err` set.
 const ModelAdapter* adapter_for(const GgufFile& meta, std::string& err);
 /// Replaces the old architecture guard: empty when the file belongs to a registered model and validates.
