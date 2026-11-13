@@ -189,6 +189,10 @@ int64_t choose_resident_room(const std::vector<uint64_t>& slot_bytes, uint64_t b
     return choose_resident_keep_from(slot_bytes, base_bytes, spares_fit ? budget - spare_bytes : budget, lend_from);
 }
 
+uint64_t budget_lend_room(uint64_t budget_bytes, uint64_t complement_bytes) {
+    return budget_bytes > 0 && budget_bytes >= complement_bytes ? budget_bytes : 0;
+}
+
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out) {
     if (in == out || in >= offsets.size() || out >= offsets.size() || offsets[in] == kNoCacheComplement ||
         offsets[out] != kNoCacheComplement) return false;
@@ -845,6 +849,17 @@ bool FileExpertSource::pin_cache_complement(
                              (double) headroom_bytes / 1073741824.0, (double) room / 1073741824.0);
             budget_bytes = room;
         }
+    }
+    uint64_t lend_cap = std::numeric_limits<uint64_t>::max();   // the RAM the lend region and the spares may fill up to
+    const uint64_t lend_room = what_fits ? 0 : detail::budget_lend_room(budget_bytes, bytes);
+    if (lend_room > 0) {
+        // the budget holds every expert of the complement: none is left to the files, and the prompt path's lend
+        // region is kept in what the budget has left
+        basalt::log::info("basalt", "FileExpertSource: RAM budget %.2f GiB holds the %.2f GiB of experts the GPU cache does "
+                             "not hold; the prompt path's lend region takes the rest of it",
+                     (double) budget_bytes / 1073741824.0, (double) bytes / 1073741824.0);
+        lend_cap = lend_room;
+    } else if (budget_bytes > 0) {
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
         int64_t held = 0;
@@ -875,13 +890,14 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t budget = std::numeric_limits<uint64_t>::max();
     if (bytes > 0 || lend) {
         // with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own allocations,
-        // the file cache) could fail a budget the first one had clamped.  (A budget turns `lend` off.)
+        // the file cache) could fail a budget the first one had clamped.  (A budget that leaves experts to the files turns
+        // `lend` off.)
         uint64_t physical = budget_physical;
         if (physical == 0 && !available_memory_bytes(physical)) {
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
             return false;
         }
-        budget = ram_tier_room(physical, headroom_bytes, pin);
+        budget = std::min(ram_tier_room(physical, headroom_bytes, pin), lend_cap);
         if (bytes > budget) {
             char message[320];
             std::snprintf(message, sizeof message,
