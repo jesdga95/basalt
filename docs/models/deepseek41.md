@@ -21,7 +21,9 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   rest are read from the pack by the CPU. When RAM takes them all, the main card's slots copy the RAM tier's head instead. Either way
   the main card fills the rest of its memory with copies, down to what a short prompt needs. The start line
   `expert homes of 384 per layer: ...` gives the split.
-- **RAM:** the prompt path's and the images' host buffers are allocated at start, before the RAM tier: the pinned ring of file
+- **RAM:** the checkpoint blocks (`--prompt-cache` + 1 per slot, about 3 MB each) are allocated page-locked at start, with a
+  spare VRAM buffer of the same size, before the RAM tier is sized. The prompt path's and the images' host buffers are allocated at
+  start, before the RAM tier: the pinned ring of file
   reads (only when experts may stay in the file, at most 240 experts), the staging of a short read, the second card's prompt
   rows, a chunk's Engram reads, and each slot's largest image. The tier then leaves `--ram-reserve-mib` free beside the driver's tracking of its
   pinned pages (`RAM floor X GiB of N GiB free`). N places short puts N experts of every layer in the file, with a warning naming
