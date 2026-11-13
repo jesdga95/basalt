@@ -27,6 +27,7 @@ Every score is against the original model in BF16:
 | --- | --- | --- |
 | Qwen3.8-Flash-Next | unsloth's BF16 GGUF through `llama-perplexity` (llama.cpp commit 436f6f89e), 100 chunks of 512, `-b 8192 -ub 8192` | 3.2749 (3.2733 on the scored rows) |
 | DeepSeek-V4.1-Flash | a BF16 GGUF by @giveen, made with `convert_hf_to_gguf --outtype bf16` (llama.cpp 330f0189), wikitext-2, 100 chunks of 512 | 2.7394 (2.7314 from the stored rows) |
+| Qwen3.8-27B | unsloth's BF16 GGUF through `llama-perplexity` (llama.cpp 5676dfbe), wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192` | 6.7437 (6.7411 on the scored rows) |
 
 The official Flash-Next packs are scored against the first base on their
 [Hugging Face card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt#quality). That gate is 100 chunks, T 3, int8 KV, resident

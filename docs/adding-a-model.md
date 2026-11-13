@@ -19,4 +19,9 @@ The router then needs one config entry. Nothing in the server names a model.
 - Report loads through `core::LoadProgress`. Use `core/ram_load` for the RAM tier.
 - Conversations: `save_cells` and `restore_cells` give the RAM and disk tiers what they need.
 - A model with its own fast path derives from `serve::Runtime` and `serve::Request`; see `src/models/qwen4exp/`.
+- A dense model of GDN and gated attention layers (the Qwen3.5 family) needs only its pack read into `dense::Geometry` and
+  `dense::Weights` (`include/basalt/dense/model.hpp`): the shared dense stack runs the layers, the drafters (MTP layer or DFlash
+  2 block drafter), images and video, and gives the session engine its sessions. See `src/models/qwen35/`.
+- A Qwen chat model takes the shared pre-tokenizer, tool form and token names (`basalt/program/qwen_forms.hpp`) and the
+  shared Qwen dialect (`serve/models/qwen.py`).
 - Kernels: shared kernels stay in `src/kernels/`. Every new kernel gets a parity test and a microbench line.

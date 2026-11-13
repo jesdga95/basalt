@@ -68,3 +68,22 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
 
 `--mtp-dense FILE` (the `mtp/dense` bytes of an official NVFP4, UD-IQ1_M, UD-IQ2_XS or UD-IQ3_XXS pack) swaps in a tuned drafter layer; the converter
 records it in `meta.mtp.dense`. Output is about 122 GiB (123 GiB for the 8-bit variant). The base's vocabulary must be NVIDIA's.
+
+## Qwen3.8-27B pack
+
+From NVIDIA's checkpoint ([nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4), revision `482ca0f3`)
+alone, no base pack: tokenizer, metadata, MTP layer and vision tower come from the checkpoint's own files. `--drafter` adds the
+DFlash 2 block drafter ([z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)).
+
+```sh
+hf download nvidia/Qwen3.8-27B-NVFP4 --revision 482ca0f3 --local-dir nvidia
+hf download z-lab/Qwen3.8-27B-DFlash2 --local-dir dflash2
+python3 tools/convert/convert.py --checkpoint nvidia --drafter dflash2 --out Qwen3.8-27B-NVFP4.basalt --name "Qwen3.8-27B NVFP4"
+```
+
+- `gguf`: every tensor in llama.cpp's `qwen35` names. NVFP4 MLP and head move bit for bit into Basalt's 64-value blocks (type
+  40) with each matrix's FP32 scale as `<name>.scale`; the FP8 projections become Q8_0 of `code x scale`; the MTP layer's and
+  the drafter's BF16 projections Q8_0; norms F32 with the offset folded in (exact); GDN value heads in the GGUF order.
+- `vision/mmproj`: the BF16 tower written as llama.cpp's clip GGUF (`qwen3vl_merger`); `vision/text_vocab` beside it.
+- The drafter's feature projection is stored as one block per target layer (`dflash.fc.N`), so the engine projects each
+  layer's rows as the layer ends. About 20.5 GiB, 22.6 GiB with the drafter; two minutes on 8 converter processes.

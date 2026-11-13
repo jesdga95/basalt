@@ -1,8 +1,8 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
-Basalt is a local inference engine for mixture-of-experts models: **Qwen3.8-Flash-Next** and **DeepSeek-V4.1-Flash**. It runs on
-an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, with the experts that do not fit in VRAM in system RAM (and optionally
-on more GPUs). The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
+Basalt is a local inference engine for mixture-of-experts models, **Qwen3.8-Flash-Next** and **DeepSeek-V4.1-Flash**, and the dense
+**Qwen3.8-27B**. It runs on an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, with the experts that do not fit in VRAM in
+system RAM (and optionally on more GPUs). The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
 
 <p align="center"><img src="docs/img/frontend.gif" alt="The Basalt web UI while a reply streams" width="720"></p>
 
@@ -46,16 +46,16 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 
 ## Models
 
-| | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash |
-|---|---|---|
-| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) |
-| Context | default 8,192; `--max-context` sets it | default 8,192; `--max-context` sets it, up to 1,048,576 |
-| Drafting | MTP, on by default | DSpark, on by default |
-| Images | yes | yes |
-| Documents (PDF, text) | yes | yes |
-| Video | yes, with FFmpeg ([video](docs/running.md#video)) | no |
-| Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) |
-| Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) |
+| | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | Qwen3.8-27B |
+|---|---|---|---|
+| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-NVFP4`, built from NVIDIA's checkpoint ([how](docs/model-file.md#qwen38-27b-pack)) |
+| Context | default 8,192; `--max-context` sets it | default 8,192; `--max-context` sets it, up to 1,048,576 | default 8,192; up to 262,144 |
+| Drafting | MTP, on by default | DSpark, on by default | DFlash 2 (or MTP), on by default |
+| Images | yes | yes | yes |
+| Documents (PDF, text) | yes | yes | yes |
+| Video | yes, with FFmpeg ([video](docs/running.md#video)) | no | yes, with FFmpeg |
+| Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) | [guide](docs/models/qwen38-27b.md) |
+| Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) | [precision](docs/precision/qwen38-27b.md) |
 
 All models compared: [models](docs/models/index.md).
 
@@ -66,6 +66,7 @@ All models compared: [models](docs/models/index.md).
   [documents](docs/configuration/documents.md),
   [diagnostics](docs/configuration/diagnostics.md), [basalt-probe](docs/probe.md), [platforms](docs/platforms.md).
 - **Models:** [models](docs/models/index.md), [Flash-Next](docs/models/qwen38-flash-next.md), [DeepSeek](docs/models/deepseek41.md),
+  [Qwen3.8-27B](docs/models/qwen38-27b.md),
   [the `.basalt` file](docs/model-file.md), [file format changes](docs/basalt-file-changelog.md).
 - **Quality:** [precision](docs/precision/index.md), [method](docs/precision/quality.md).
 - **Build and develop:** [building](docs/building.md), [adding a model](docs/adding-a-model.md), [community runs](docs/community.md),
@@ -74,9 +75,11 @@ All models compared: [models](docs/models/index.md).
 ## Credits
 
 - [Strata](https://github.com/Niko1221/Strata): the project Basalt forks (MIT).
-- [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) and [DeepSeek](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017):
+- [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (and [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)) and [DeepSeek](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017):
   the models. Their packs carry the models' own licences (see the Hugging Face cards).
-- [unsloth](https://huggingface.co/unsloth) (GGUFs), [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) (NVFP4 experts).
+- [unsloth](https://huggingface.co/unsloth) (GGUFs), [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) (NVFP4 experts and the
+  [NVFP4 27B](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)), [z-lab](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) (the
+  27B's DFlash 2 drafter), [NInfer](https://github.com/Neroued/ninfer) (the reference for the 27B).
 - [@giveen](https://huggingface.co/giveen): the BF16 reference for the DeepSeek quality numbers.
 - [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp): quantization formats and kernels in `src/` (MIT,
   [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)).
