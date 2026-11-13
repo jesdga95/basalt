@@ -22,9 +22,10 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 uint64_t gdn_work_bytes(int64_t T);
 /// The recurrence over the chunk: q/k L2-normalized (eps) and rounded to BF16, the state [key][value head][value]
 /// kept in FP32; then the closing norm rmsnorm(o) * gamma * act(z) into y16 (FP16, may be null) and yn (FP32, may be
-/// null).  y is FP32 scratch, work gdn_work_bytes(T) bytes.
+/// null), and (y8, may be null) rounded to E4M3 per token for the out projection: codes [T][48 * 128] and y8_scale[T] =
+/// amax / 448 (prefill::fp8::quantize of the yn rows, bitwise).  y is FP32 scratch, work gdn_work_bytes(T) bytes.
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, void* work, float* y, uint16_t* y16, int64_t T, void* stream,
-                    GdnGate act = GdnGate::Sigmoid, float* yn = nullptr);
+                    GdnGate act = GdnGate::Sigmoid, float* yn = nullptr, uint8_t* y8 = nullptr, float* y8_scale = nullptr);
 
 }  // namespace basalt::kernels

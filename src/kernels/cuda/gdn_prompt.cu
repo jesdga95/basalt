@@ -9,6 +9,7 @@
 #include "basalt/kernels/gdn_prompt.hpp"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -394,6 +395,65 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
     if (yn) yn[at] = v;
 }
 
+// The same norm, a block per token over all its heads, rounded straight to E4M3 for the out projection: scale
+// amax / 448 per token, codes v * (448 / amax) rounded to nearest even and saturated (prefill::fp8::quantize's rows,
+// bitwise: each head's sum of squares adds in gdn_out_norm_kernel's order, so v is its value).  A warp takes a head at a
+// time, lane l holding columns l, l + 32, l + 64 and l + 96.
+constexpr int kNormWarps = 16, kNormHeads = (HV + kNormWarps - 1) / kNormWarps;
+__global__ void __launch_bounds__(kNormWarps * 32) gdn_out_norm_e4m3_kernel(const float* __restrict__ z,
+                                                                           const float* __restrict__ gamma, float eps,
+                                                                           const float* __restrict__ y,
+                                                                           uint8_t* __restrict__ codes,
+                                                                           float* __restrict__ scales, GdnGate act) {
+    __shared__ float red[kNormWarps];
+    const int64_t t = blockIdx.x;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    float v[kNormHeads][4];
+    float m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kNormHeads; ++i) {
+        const int head = warp + i * kNormWarps;
+        if (head >= HV) break;
+        const size_t base = (size_t) t * HV * S + (size_t) head * S;
+        float oc[4], w[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            oc[k] = y[base + lane + 32 * k];
+            float sp = oc[k] * oc[k];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) sp += __shfl_xor_sync(0xffffffffu, sp, o);
+            w[k] = sp;
+        }
+        const float ss = w[0] + w[1] + w[2] + w[3];
+        const float inv = rsqrtf(ss / (float) S + eps);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int col = lane + 32 * k;
+            const float zv = z[base + col];
+            v[i][k] = oc[k] * inv * gamma[col] * (act == GdnGate::Silu ? zv * sigm(zv) : sigm(zv));
+            m = fmaxf(m, fabsf(v[i][k]));
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kNormWarps; ++i) amax = fmaxf(amax, red[i]);
+    if (threadIdx.x == 0) scales[t] = amax / 448.0f;
+    const float q = amax > 0.0f ? 448.0f / amax : 0.0f;
+#pragma unroll
+    for (int i = 0; i < kNormHeads; ++i) {
+        const int head = warp + i * kNormWarps;
+        if (head >= HV) break;
+        uint8_t* row = codes + (size_t) t * HV * S + (size_t) head * S;
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            row[lane + 32 * k] = (uint8_t) __nv_cvt_float_to_fp8(v[i][k] * q, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
 // ---------------------------------------------------------------- gates and conv
 __global__ void gdn_gates_kernel(const float* __restrict__ ab, const float* __restrict__ dt,
                                  const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta,
@@ -490,7 +550,7 @@ uint64_t gdn_work_bytes(int64_t T) {
 
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, void* work, float* y, uint16_t* y16, int64_t T, void* stream,
-                    GdnGate act, float* yn) {
+                    GdnGate act, float* yn, uint8_t* y8, float* y8_scale) {
     if (T > 0) {
         const cudaStream_t s = (cudaStream_t) stream;
         const int chunks = (int) ((T + CK - 1) / CK);
@@ -511,7 +571,8 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
             attr[dev].store(true, std::memory_order_release);
         }
         gdn_chunk_kernel<<<HV * (S / DV), NTH, sizeof(ChunkShared), s>>>(state, h, qk, ctl, y, (int) T);
-        gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, s>>>(z, gamma, eps, y, y16, yn, act);
+        if (y16 || yn) gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, s>>>(z, gamma, eps, y, y16, yn, act);
+        if (y8) gdn_out_norm_e4m3_kernel<<<(unsigned) T, kNormWarps * 32, 0, s>>>(z, gamma, eps, y, y8, y8_scale, act);
     }
     check("gdn_recurrence");
 }

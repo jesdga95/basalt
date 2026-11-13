@@ -281,6 +281,10 @@ void chunk_residual(Model& m, const Linear& l, const float* a, int64_t cols, int
     gemm(m, l, b.xq, b.tmp, T, s);
     kernels::add_scaled(b.x, b.tmp, post_scale(l), (int64_t) T * l.rows, s);
 }
+// x += W . a for an F8 output projection whose input rows its producer already rounded into b.xq
+void chunk_residual_f8(Model& m, const Linear& l, int T, cudaStream_t s) {
+    prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, m.cs.x, l.rows, prefill::fp8::Epilogue::Add, s);
+}
 
 void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
                 kernels::KvInt8 q8 = {}) {
@@ -303,6 +307,11 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
                              pos, s, 256, true, 0, nullptr, q8);
     kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split,
                              kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits));
+    if (L.o.type == kTypeF8) {   // the gate rounds its rows to E4M3 for o itself
+        kernels::attn_gate_e4m3(b.ao, b.qfull, T, g.n_head, (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, AQ), s);
+        chunk_residual_f8(m, L.o, T, s);
+        return;
+    }
     kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
     chunk_residual(m, L.o, b.ag, AQ, T, s);
 }
@@ -326,6 +335,12 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
     }
     kernels::gdn_gating_proj(b.xn, L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
     kernels::gdn_conv(hist, b.qkv, L.conv, b.hc, T, s);
+    if (L.out.type == kTypeF8) {   // the closing norm rounds its rows to E4M3 for out itself
+        kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, nullptr,
+                                (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD));
+        chunk_residual_f8(m, L.out, T, s);
+        return;
+    }
     kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn);
     chunk_residual(m, L.out, b.yn, VD, T, s);
 }
