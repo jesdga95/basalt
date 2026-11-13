@@ -159,6 +159,9 @@ block-scaled mma used as the full-rate e4m3 product, and the segmented outputs.
 The int8 prompt-attention kernel adapts ideas and code from Infernix (src/ops/qsa/qsa_prompt.cu): the
 per-warp 16-cell tiles with one merge, the k-step query ordering, and the exact int8 widening to FP16.
 The chunked gated delta rule in src/kernels/cuda/gdn_prompt.cu adapts the Infernix chunked formulation.
+The GDN a/b projection with fused gating in src/kernels/cuda/dense_ops.cu (gdn_gating_proj) adapts Infernix's
+bf16_gdn_gating_proj_gemm_mma (src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh, bf16_gdn_gating_proj_kernels.cu):
+the a and b rows of one head held together so the gates apply in the epilogue, BF16 mma with a split K reduced before the gates.
 The int8-cache prompt attention in src/kernels/cuda/gqa_attn.cu adapts Infernix's fast int8 prompt kernel
 (src/ops/softmax_attention/dense/causal_cache/int8/fast_tiled_mma.cuh, fast_tiled_plan.h, ../fast_prompt_common.cuh):
 warps owning 16 query rows of one head for the whole sweep, raw int8 K/V tiles with V decoded in registers, the FP16

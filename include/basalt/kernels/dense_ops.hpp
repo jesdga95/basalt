@@ -32,6 +32,10 @@ void gdn_rows_scatter(const GdnRowDst* dst, int n_rows, const float* qkv, const 
                       int C, int h_v, int64_t layer, int window_rows, void* stream);
 /// y[t][n] = x[t] . w[n]  for BF16 rows w [N][K]: the small BF16 projections of a prompt chunk.
 void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64_t N, int64_t K, void* stream);
+/// The GDN a/b projections of a prompt chunk with the gates fused: w_ab BF16 [2 HV][K] (the a rows, then the b rows),
+/// gate[t][h] = softplus(a + dt[h]) * ssm_a[h], beta[t][h] = sigmoid(b).  Replaces bf16_rows_dot + gdn_gates (HV = 48, K % 512 == 0).
+void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
+                     int64_t T, int64_t HV, int64_t K, void* stream);
 
 /// The rotary part of a gated GQA attention layer: `rot` leading dims of each head rotate NeoX-style (pairs i and
 /// i + rot/2) with inverse frequency theta^(-2i/rot); pair i takes its position from axis `axis[i]` (0 t, 1 h, 2 w:

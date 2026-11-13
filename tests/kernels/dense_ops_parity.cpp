@@ -4,6 +4,7 @@
 // 16 channels, 16 candidates of rank 256).  Prints max abs / rel error per kernel.  Exit 77 without a GPU.
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/f16_bits.hpp"
+#include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/logprobs.hpp"
 
@@ -122,6 +123,85 @@ int main() {
                 want[(size_t) t * N + n] = a;
             }
         report("bf16_rows_dot", y, want, 3e-4);   // tf32 tensor cores: two-term x, but the mma accumulates below fp32
+    }
+    {   // gdn_gating_proj against bf16_rows_dot + gdn_gates and a double reference, a 2,048-row chunk and a ragged one
+        const int HV = 48, N = 2 * HV;
+        std::vector<uint16_t> w((size_t) N * H);
+        for (auto& v : w) v = bf(0.02f * nd(rng));
+        auto dt = randn(HV, 0.5f), sa = randn(HV, 0.3f);
+        for (auto& v : sa) v = -std::exp(v);
+        uint16_t* dw = up(w);
+        float *ddt = up(dt), *dsa = up(sa);
+        for (const int Tc : {2048, 37}) {
+            auto x = randn((size_t) Tc * H);
+            for (size_t i = 0; i < x.size(); i += 97) x[i] *= 8.f;   // a few large activations
+            float *dx = up(x), *dg = nullptr, *db = nullptr, *dab = nullptr, *dg0 = nullptr, *db0 = nullptr;
+            cudaMalloc(&dg, (size_t) Tc * HV * 4);
+            cudaMalloc(&db, (size_t) Tc * HV * 4);
+            cudaMalloc(&dg0, (size_t) Tc * HV * 4);
+            cudaMalloc(&db0, (size_t) Tc * HV * 4);
+            cudaMalloc(&dab, (size_t) Tc * N * 4);
+            basalt::kernels::gdn_gating_proj(dx, dw, ddt, dsa, dg, db, Tc, HV, H, S);
+            basalt::kernels::bf16_rows_dot(dx, dw, dab, Tc, N, H, S);
+            basalt::kernels::gdn_gates(dab, ddt, dsa, dg0, db0, Tc, S);
+            auto g = down(dg, (size_t) Tc * HV), b = down(db, (size_t) Tc * HV), g0 = down(dg0, (size_t) Tc * HV),
+                 b0 = down(db0, (size_t) Tc * HV);
+            std::vector<float> gg, bb, gg0, bb0;
+            std::vector<double> wg, wb;
+            for (int t = 0; t < Tc; t += (Tc > 100 ? 7 : 1))
+                for (int h = 0; h < HV; ++h) {
+                    double a = 0, bs = 0;
+                    for (int k = 0; k < H; ++k) {
+                        a += (double) x[(size_t) t * H + k] * fb(w[(size_t) h * H + k]);
+                        bs += (double) x[(size_t) t * H + k] * fb(w[(size_t) (HV + h) * H + k]);
+                    }
+                    const double v = a + dt[h];
+                    wg.push_back((v > 20 ? v : std::log1p(std::exp(v))) * sa[h]);
+                    wb.push_back(1.0 / (1.0 + std::exp(-bs)));
+                    gg.push_back(g[(size_t) t * HV + h]); bb.push_back(b[(size_t) t * HV + h]);
+                    gg0.push_back(g0[(size_t) t * HV + h]); bb0.push_back(b0[(size_t) t * HV + h]);
+                }
+            std::printf("T = %d  new kernel:\n", Tc);
+            report("  gdn_gating_proj g", gg, wg, 3e-4);
+            report("  gdn_gating_proj beta", bb, wb, 3e-5);
+            std::printf("T = %d  old bf16_rows_dot + gdn_gates:\n", Tc);
+            report("  old g", gg0, wg, 3e-4);
+            report("  old beta", bb0, wb, 3e-5);
+            if (Tc == 2048) {   // microbench
+                cudaEvent_t e0, e1;
+                cudaEventCreate(&e0); cudaEventCreate(&e1);
+                const int R = 200;
+                for (int pass = 0; pass < 2; ++pass) {
+                    cudaEventRecord(e0, S);
+                    for (int r = 0; r < R; ++r) {
+                        if (pass == 0) {
+                            basalt::kernels::bf16_rows_dot(dx, dw, dab, Tc, N, H, S);
+                            basalt::kernels::gdn_gates(dab, ddt, dsa, dg0, db0, Tc, S);
+                        } else basalt::kernels::gdn_gating_proj(dx, dw, ddt, dsa, dg, db, Tc, HV, H, S);
+                    }
+                    cudaEventRecord(e1, S);
+                    cudaEventSynchronize(e1);
+                    float ms = 0;
+                    cudaEventElapsedTime(&ms, e0, e1);
+                    std::printf("  bench T=2048 %s: %.1f us per call\n", pass ? "gdn_gating_proj" : "bf16_rows_dot + gdn_gates", 1e3 * ms / R);
+                }
+            }
+        }
+    }
+    {   // gdn_conv at a 2,048-row chunk: timing and its bandwidth (the fp32 traffic bound: a float4 variant gained 8% and was dropped)
+        const int C = 10240, Tc = 2048;
+        auto q = randn((size_t) Tc * C), cw = randn((size_t) C * 4, 0.5f), hh = randn((size_t) C * 3);
+        float *dq = up(q), *dcw = up(cw), *dh = up(hh), *dout = nullptr;
+        cudaMalloc(&dout, (size_t) Tc * C * 4);
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0); cudaEventCreate(&e1);
+        cudaEventRecord(e0, S);
+        for (int r = 0; r < 100; ++r) basalt::kernels::gdn_conv(dh, dq, dcw, dout, Tc, S);
+        cudaEventRecord(e1, S);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        std::printf("  bench gdn_conv T=2048: %.1f us per call, %.0f GB/s\n", 1e3 * ms / 100, 2.0 * Tc * C * 4 / (ms / 100 * 1e-3) / 1e9);
     }
     {   // dyn_conv2: base + dynamic two-tap convolution along the block, 16-channel groups
         const int G = 16, groups = H / G, LD = 4 * groups;
