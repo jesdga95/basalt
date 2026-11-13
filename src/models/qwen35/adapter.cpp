@@ -394,7 +394,7 @@ public:
         return true;
     }
 
-    // the pack's drafter runs in windows of up to 8 unless --spec says otherwise (up to 16; 0 or 1: plain decode)
+    // the pack's drafter runs in windows of up to 16 unless --spec says otherwise (0 or 1: plain decode)
     int planned_spec(const program::CommonOptions& o) const override {
         if (o.spec_given) return o.spec >= 2 ? o.spec : 0;
         return has_drafter(o.model) ? kDefaultSpec : 0;
@@ -423,7 +423,7 @@ private:
         static std::string c;
         return c;
     }
-    static constexpr int kDefaultSpec = 8;
+    static constexpr int kDefaultSpec = 16;
     static bool has_drafter(const std::string& path) {
         core::ModelFile file;
         std::string err;

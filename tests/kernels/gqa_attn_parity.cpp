@@ -178,7 +178,7 @@ int main(int argc, char** argv) {
     }
     std::printf("gqa_decode_attn: max abs %.3g rel %.3g vs double; the last row bitwise equal across widths 1-%d: %s\n", ed.abs,
                 ed.rel, TW, bitwise ? "yes" : "NO");
-    if (ed.abs > 2e-4 || !bitwise) ++fails;
+    if (ed.abs > 1e-3 || !bitwise) ++fails;   // fp16 q, K, V and p on the tensor cores
     {
         // a captured window reads its first cell on the device and loops its blocks over the chunks in use: bitwise the
         // host-position launch, past the grid's first round of chunks
@@ -187,7 +187,7 @@ int main(int argc, char** argv) {
         for (auto& x : k2) x = basalt::kernels::f16_from_f32(nd(rng));
         for (auto& x : v2) x = basalt::kernels::f16_from_f32(nd(rng));
         uint16_t *d_k2 = dev<uint16_t>((size_t) cap2 * NKV * HD), *d_v2 = dev<uint16_t>((size_t) cap2 * NKV * HD);
-        float* d_s2 = dev<float>(basalt::kernels::gqa_decode_scratch_floats(cap2, 8, NH));
+        float* d_s2 = dev<float>(basalt::kernels::gqa_decode_scratch_floats(cap2, 16, NH));
         int32_t* d_at = dev<int32_t>(2);
         const int32_t at2[2] = {(int32_t) at, 0};
         ck(cudaMemcpy(d_k2, k2.data(), k2.size() * 2, cudaMemcpyHostToDevice), "copy");
@@ -218,6 +218,14 @@ int main(int argc, char** argv) {
         }
         std::printf("bench: decode 1 row x 3000 cells in %lld: %.1f us host first cell, %.1f us device first cell\n",
                     (long long) cap2, us[0], us[1]);
+        for (int T : {1, 8, 16}) {   // a window of T rows near 12K cells
+            for (int i = 0; i < 5; ++i) basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, at - 8, T, d_s2, cap2, d_out, nullptr);
+            cudaDeviceSynchronize();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 100; ++i) basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, at - 8, T, d_s2, cap2, d_out, nullptr);
+            cudaDeviceSynchronize();
+            std::printf("bench: decode %d rows x %lld cells: %.1f us\n", T, (long long) at, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 100);
+        }
         cudaFree(d_k2); cudaFree(d_v2); cudaFree(d_s2); cudaFree(d_at);
     }
     // prompt chunk

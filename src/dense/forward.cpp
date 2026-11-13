@@ -6,6 +6,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/prefill/fp4_dense.hpp"
@@ -33,10 +34,15 @@ namespace wg = kernels::wgemm;
 // window's rows (up to kBatch) and which applies the tensor scale; others (the drafters' Q8_0) on MMQ with the tile of
 // kNarrow or kBatch rows whatever the window's rows (activations quantized for the whole tile, the bounds {0, T} saying
 // which rows are written), the scale applied after.  The window gemm's activations go to m.ws.xq, MMQ's to m.ws.x8.
-bool on_wg(int type) { return type == kTypeF8 || type == kTypeNvfp4Planes; }
+bool on_wg(int type) { return type == kTypeF8 || type == kTypeNvfp4Planes || type == kTypeQ8P; }
 // the scale the step after a prompt chunk product applies: an NVFP4 matrix's (its product leaves it out), none after F8
 const float* post_scale(const Linear& l) { return l.type == kTypeF8 ? nullptr : l.scale; }
 int mmq_tile(int T) { return T <= kNarrow ? kNarrow : kBatch; }
+// the vocabulary rows the block drafter's head scores: the first kDraftVocab when the head is in planes, else all
+int64_t draft_vocab(const Model& m) {
+    const Linear& hd = m.w.head;
+    return hd.type == kTypeNvfp4Planes && hd.rows > kDraftVocab ? kDraftVocab : m.g.n_vocab;
+}
 
 // rows 0..T-1 of x readied for products of `type`
 const void* wact(Model& m, const float* x, int type, int64_t cols, int T, cudaStream_t s) {
@@ -77,7 +83,7 @@ void mmq_run(Model& m, const Linear& l, const void* xq, float* y, int T, cudaStr
 }
 wg::Call wcall(const Linear& l, wg::Epilogue epi = wg::Epilogue::Store) {
     wg::Call c;
-    c.fmt = l.type == kTypeF8 ? wg::Format::F8 : wg::Format::Nvfp4;
+    c.fmt = l.type == kTypeF8 ? wg::Format::F8 : l.type == kTypeQ8P ? wg::Format::Q8 : wg::Format::Nvfp4;
     c.K = l.cols;
     c.epi = epi;
     return c;
@@ -126,22 +132,30 @@ void prod_add(Model& m, const Linear& l, const void* yq, float* x, int T, cudaSt
     mmq_run(m, l, yq, m.ws.tmp, T, s);
     kernels::add_scaled(x, m.ws.tmp, l.scale, (int64_t) T * l.rows, s);
 }
-// h [T][rows] = silu(s_g gate x) (s_u up x): one window gemm call with the SwiGLU epilogue
+// h [T][rows] = silu(s_g gate x) (s_u up x): one window gemm call with the SwiGLU epilogue, which can also leave h as the
+// next product's bf16 rows (`h16`; h may then be null)
 void prod_swiglu(Model& m, const Linear& gate, const Linear& up, const float* x, const void* xq, float* h, int T,
-                 cudaStream_t s) {
-    if (on_wg(gate.type) && up.type == gate.type) {
+                 cudaStream_t s, void* h16 = nullptr) {
+    if (gate.type == kTypeNvfp4Planes && up.type == gate.type) {
         wg::Call c = wcall(gate, wg::Epilogue::SwiGLU);
         c.n = 2;
         c.m[0] = wmat(gate, h);
         c.m[1] = wmat(up, nullptr);
+        c.act_out = h16;
         wg::gemm(c, xq, T, m.ws.w8, s);
         return;
     }
     WindowScratch& b = m.ws;
-    mmq_run(m, gate, xq, b.g, T, s);
-    if (up.type != gate.type) xq = wact(m, x, up.type, up.cols, T, s);
-    mmq_run(m, up, xq, b.u, T, s);
-    kernels::swiglu_scaled(b.g, b.u, gate.scale, up.scale, h, T, gate.rows, gate.rows, s);
+    if (on_wg(gate.type)) {   // two products (their scales applied), then SwiGLU
+        prod_group(m, x, xq, gate.type, {{&gate, b.g}, {&up, b.u}}, T, s);
+        kernels::swiglu_scaled(b.g, b.u, nullptr, nullptr, h, T, gate.rows, gate.rows, s);
+    } else {
+        mmq_run(m, gate, xq, b.g, T, s);
+        if (up.type != gate.type) xq = wact(m, x, up.type, up.cols, T, s);
+        mmq_run(m, up, xq, b.u, T, s);
+        kernels::swiglu_scaled(b.g, b.u, gate.scale, up.scale, h, T, gate.rows, gate.rows, s);
+    }
+    if (h16) wg::pack(h, gate.rows, gate.rows, T, h16, s);
 }
 
 // y [T][rows] = W . x on MMQ (xq quantized for l.type), or for F8 on the FP8 tensor cores with the tensor scale applied
@@ -180,13 +194,13 @@ void text_positions(std::vector<int32_t>& p3, int T, int64_t pos, int64_t delta)
 
 // ---- decode window layers: the residual rows are m.ws.x
 
-// the gated attention output's product: gate, ready and add into the residual rows
+// the gated attention output's product: gate, ready and add into the residual rows (on the window gemm the attention
+// merge left the gated bf16 rows in m.ws.xq)
 void win_attn_out(Model& m, const Layer& L, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const void* yq;
     if (on_wg(L.o.type)) {
-        wg::gate_pack(b.ao, b.qfull, T, g.n_head, b.xq, s);
         yq = b.xq;
     } else {
         kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
@@ -230,7 +244,9 @@ void win_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64
     prod_group(m, b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
                              pos, s, 256, true, 0, b.pos0, q8);
-    kernels::gqa_decode_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.attn, m.o.max_context, b.ao, s, b.pos0, q8);
+    const bool gated = on_wg(L.o.type);   // the merge gates and readies the rows for o
+    kernels::gqa_decode_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.attn, m.o.max_context, gated ? nullptr : b.ao, s, b.pos0, q8,
+                             gated ? b.qfull : nullptr, gated ? (uint16_t*) b.xq : nullptr);
     win_attn_out(m, L, T, s);
 }
 
@@ -247,8 +263,9 @@ void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStre
     a.h = st.rec_h + (size_t) gi * kWindow * C;
     a.gate = st.rec_gate + (size_t) gi * kWindow * g.gdn_v_heads;
     a.beta = st.rec_beta + (size_t) gi * kWindow * g.gdn_v_heads;
+    if (on_wg(L.out.type)) a.y16 = (uint16_t*) b.xq;   // the out product's rows
     kernels::dec_gdn_rec(a, T, s);
-    prod_add(m, L.out, wact(m, b.y, L.out.type, g.value_width(), T, s), b.x, T, s);
+    prod_add(m, L.out, on_wg(L.out.type) ? b.xq : wact(m, b.y, L.out.type, g.value_width(), T, s), b.x, T, s);
 }
 
 void win_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
@@ -256,6 +273,11 @@ void win_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
     const void* xq = wnorm(m, b.x, L.ffn_norm, b.xn, L.gate.type, H, T, g.eps, s);
+    if (on_wg(L.down.type)) {   // h straight into the down product's bf16 rows
+        prod_swiglu(m, L.gate, L.up, b.xn, xq, nullptr, T, s, b.hq);
+        prod_add(m, L.down, b.hq, b.x, T, s);
+        return;
+    }
     prod_swiglu(m, L.gate, L.up, b.xn, xq, b.h, T, s);
     prod_add(m, L.down, wact(m, b.h, L.down.type, g.n_ff, T, s), b.x, T, s);
 }
@@ -425,7 +447,7 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
     const int H = g.n_embd;
     kernels::PdlScope pdl(true);   // the window gemm and its packs start early: their weights are read meanwhile
     kernels::iq_embed_rows(30, w.embd, (size_t) H * 2, b.tok, T, H, b.x, s);
-    const BlockDrafter& bd = w.dflash;
+    const BlockDrafter& bd = m.bd_dec;
     const bool block = m.o.drafter == Drafter::Block;
     size_t next_target = 0;
     for (int il = 0; il < g.n_layers; ++il) {
@@ -500,8 +522,11 @@ void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, i
                                  L.k_norm, g.eps, g.rope, b.pos + (size_t) row * 3, T, g.n_head, g.n_kv,
                                  b.qo + (size_t) row * AQ, st.kc[(size_t) ai], st.vc[(size_t) ai], segs[k].pos, s, 256, true, 0, p0,
                                  st.kq[(size_t) ai]);
+        const bool gated = on_wg(L.o.type);
         kernels::gqa_decode_attn(b.qo + (size_t) row * AQ, st.kc[(size_t) ai], st.vc[(size_t) ai], g.n_head, g.n_kv, segs[k].pos, T,
-                                 b.attn, m.o.max_context, b.ao + (size_t) row * AQ, s, p0, st.kq[(size_t) ai]);
+                                 b.attn, m.o.max_context, gated ? nullptr : b.ao + (size_t) row * AQ, s, p0, st.kq[(size_t) ai],
+                                 gated ? b.qfull + (size_t) row * 2 * AQ : nullptr,
+                                 gated ? (uint16_t*) b.xq + (size_t) row * AQ : nullptr);
         row += T;
     }
     win_attn_out(m, L, rows, s);
@@ -518,9 +543,10 @@ void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int rows,
     a.h = b.rh;
     a.gate = b.rgate;
     a.beta = b.rbeta;
+    if (on_wg(L.out.type)) a.y16 = (uint16_t*) b.xq;
     kernels::dec_gdn_rec_seg(a, b.btab->seg, (size_t) gi * segs[0].st->gdn_floats, rows, max_n, s);
     kernels::gdn_rows_scatter(b.btab->dst, rows, b.rq, b.rh, b.rgate, b.rbeta, C, g.gdn_v_heads, gi, kWindow, s);
-    prod_add(m, L.out, wact(m, b.y, L.out.type, g.value_width(), rows, s), b.x, rows, s);
+    prod_add(m, L.out, on_wg(L.out.type) ? b.xq : wact(m, b.y, L.out.type, g.value_width(), rows, s), b.x, rows, s);
 }
 
 }  // namespace
@@ -538,7 +564,7 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
     {
         kernels::PdlScope pdl(true);
         kernels::iq_embed_rows(30, w.embd, (size_t) H * 2, b.tok, rows, H, b.x, s);
-        const BlockDrafter& bd = w.dflash;
+        const BlockDrafter& bd = m.bd_dec;
         const bool block = m.o.drafter == Drafter::Block;
         size_t next_target = 0;
         for (int il = 0; il < g.n_layers; ++il) {
@@ -694,7 +720,7 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
 }
 
 bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err) {
-    const BlockDrafter& bd = m.w.dflash;
+    const BlockDrafter& bd = m.bd_dec;
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
     const int H = m.g.n_embd;
@@ -721,7 +747,7 @@ bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, int wi
 
 bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchors, const int64_t* pos, const int* widths, int S,
                        std::string& err, cudaStream_t stream) {
-    const BlockDrafter& bd = m.w.dflash;
+    const BlockDrafter& bd = m.bd_dec;
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const cudaStream_t s = stream ? stream : sts[0]->stream;
@@ -794,12 +820,29 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
         kernels::add_scaled(b.x, b.bh, nullptr, (int64_t) R * H, s);
     }
     // slots 1 .. B-1 of each block: the head's candidates, then one path through them
-    prod(m, m.w.head, wnorm(m, b.x, bd.norm, b.xn, m.w.head.type, H, R, bd.eps, s), b.hl, R, s);
-    kernels::bf16_rows_dot(b.xn, bd.sel_h, b.bsel, R, bd.rank, H, s);
+    // the head over the vocabulary's first rows only (a BPE vocabulary's ids run roughly by frequency): its picks there
+    const int64_t nv = draft_vocab(m);
+    const void* hq = wnorm(m, b.x, bd.norm, b.xn, m.w.head.type, H, R, bd.eps, s);
+    if (nv < g.n_vocab) {
+        const Linear& hd = m.w.head;
+        wg::Call c = wcall(hd);
+        c.m[0] = {(const uint8_t*) hd.w, nv, hd.scale, b.hl, nv, (const uint8_t*) hd.w + kernels::nvfp4p::scale_offset(hd.rows, hd.cols)};
+        wg::gemm(c, hq, R, m.ws.w8, s);
+    } else {
+        prod(m, m.w.head, hq, b.hl, R, s);
+    }
+    {   // the selector's projection of every row (BF16 weights) on the window gemm
+        wg::Call c;
+        c.fmt = wg::Format::Bf16;
+        c.K = H;
+        c.m[0] = {(const uint8_t*) bd.sel_h, bd.rank, nullptr, b.bsel, bd.rank};
+        wg::pack(b.xn, H, H, R, b.xq, s);
+        wg::gemm(c, b.xq, R, m.ws.w8, s);
+    }
     for (int k = 0; k < S; ++k) {
         const size_t q0 = (size_t) r0[k];
         const int B = widths[k];
-        kernels::row_logprobs(b.hl + (q0 + 1) * g.n_vocab, B - 1, g.n_vocab, b.tok + q0 + 1, bd.top_k, b.blp, b.lp_scratch, s);
+        kernels::row_logprobs(b.hl + (q0 + 1) * nv, B - 1, nv, b.tok + q0 + 1, bd.top_k, b.blp, b.lp_scratch, s);
         kernels::candidate_path(b.blp, kernels::kLogprobStride, bd.top_k, b.bsel + (q0 + 1) * bd.rank, bd.pred, bd.succ, bd.rank,
                                 sts[k]->win_tok, B - 1, sts[k]->dids, sts[k]->dconf, s);
     }

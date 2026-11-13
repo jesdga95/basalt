@@ -19,6 +19,7 @@
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -26,6 +27,7 @@ namespace basalt::kernels::wgemm::detail {
 
 struct Args {
     const uint8_t* w[kMaxMatrices];
+    const uint8_t* sp[kMaxMatrices];   // NVFP4 scale planes
     int64_t rows[kMaxMatrices];
     const float* scale[kMaxMatrices];
     float* y[kMaxMatrices];
@@ -35,8 +37,8 @@ struct Args {
     int n;
     int64_t K, part_rows;
     int T, tiles, ks, cps, nchunks, epi;
-    const __half* act;
-    const float* fac;
+    const uint16_t* act;   // bf16 rows
+    uint16_t* act_out;     // SwiGLU: h as the next product's bf16 rows ([16][rows]), or null
     float* partial;
     int32_t* tickets;
 };
@@ -44,20 +46,21 @@ struct Args {
 template <int F, int RS, int NM, int CH, int ST>
 struct Cfg {
     static constexpr int kThreads = 32 * NM * RS / 16;   // with one 16-row tile per warp
-    static constexpr int CB = F == (int) Format::F8 ? CH : CH / 2;          // code bytes per row per chunk
+    static constexpr int CB = F == (int) Format::F8 || F == (int) Format::Q8 ? CH : F == (int) Format::Bf16 ? 2 * CH : CH / 2;   // weight bytes per row per chunk
     static constexpr int P = CB / 16;                                        // 16-byte pieces per row per chunk
-    static constexpr int SB = F == (int) Format::F8 ? 0 : (CH / 64) * RS * 4;   // scale bytes per matrix per chunk
+    static constexpr int SB = F == (int) Format::Nvfp4 ? (CH / 64) * RS * 4 : F == (int) Format::Q8 ? RS * (CH / 16) : 0;   // scale bytes per matrix per chunk
     static constexpr int MB = RS * CB + SB;                                  // bytes per matrix per stage
     static constexpr int kStage = NM * MB;
     static constexpr int kSmem = ST * kStage;
     static constexpr int kScalePiece = RS / 8;                               // a scale tile line's bytes for RS rows
     static_assert(RS % 16 == 0 && CH % 64 == 0, "window gemm: tile shape");
-    static_assert(F == (int) Format::F8 || (RS == 32 || RS == 64 || RS == 128), "window gemm: NVFP4 rows per block");
+    static_assert(F != (int) Format::Nvfp4 || (RS == 32 || RS == 64 || RS == 128), "window gemm: NVFP4 rows per block");
 };
 
 // the piece a row's 16-byte piece q lands on in shared memory (bank spread for the reads below)
 template <int F, int P> __device__ __forceinline__ int swz(int r) {
-    if constexpr (F == (int) Format::F8) return P >= 8 ? (r & 1) << 2 : 0;
+    if constexpr (F == (int) Format::F8 || F == (int) Format::Q8) return P >= 8 ? (r & 1) << 2 : 0;
+    else if constexpr (F == (int) Format::Bf16) return P >= 16 ? (r & 1) << 3 : 0;
     else if constexpr (P >= 8) return (r & 3) << 1;
     else if constexpr (P == 4) return ((r >> 1) & 1) << 1;
     else return 0;
@@ -73,35 +76,49 @@ template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.as
 
 __device__ __forceinline__ void mma(float (&d)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                     unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
                  "{%0, %1, %2, %3};"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-// two E4M3 bytes (the low 16 bits of x, the low byte the lower half) as fp16x2
+// two E4M3 bytes (the low 16 bits of x, the low byte the lower half) as bf16x2 (exact)
 __device__ __forceinline__ unsigned e4m3x2_f16(unsigned x) {
     unsigned h;
     const unsigned short v = (unsigned short) x;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"(v));
+    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"(v));
     return h;
 }
-// the four bytes of w, each two E2M1 codes (the low nibble the lower half), as fp16x2 times the fp16x2 scale sc
+// the four bytes of w, each two E2M1 codes (the low nibble the lower half), as bf16x2 times the bf16x2 scale sc (exact:
+// a code times a UE4M3 scale has at most five significant bits)
 __device__ __forceinline__ void e2m1x8_f16(unsigned w, unsigned sc, unsigned (&h)[4]) {
     asm("{\n"
         ".reg .b8 b0, b1, b2, b3;\n"
         ".reg .b32 t0, t1, t2, t3;\n"
         "mov.b32 {b0, b1, b2, b3}, %4;\n"
-        "cvt.rn.f16x2.e2m1x2 t0, b0;\n"
-        "cvt.rn.f16x2.e2m1x2 t1, b1;\n"
-        "cvt.rn.f16x2.e2m1x2 t2, b2;\n"
-        "cvt.rn.f16x2.e2m1x2 t3, b3;\n"
-        "mul.rn.f16x2 %0, t0, %5;\n"
-        "mul.rn.f16x2 %1, t1, %5;\n"
-        "mul.rn.f16x2 %2, t2, %5;\n"
-        "mul.rn.f16x2 %3, t3, %5;\n"
+        "cvt.rn.bf16x2.e2m1x2 t0, b0;\n"
+        "cvt.rn.bf16x2.e2m1x2 t1, b1;\n"
+        "cvt.rn.bf16x2.e2m1x2 t2, b2;\n"
+        "cvt.rn.bf16x2.e2m1x2 t3, b3;\n"
+        "mul.rn.bf16x2 %0, t0, %5;\n"
+        "mul.rn.bf16x2 %1, t1, %5;\n"
+        "mul.rn.bf16x2 %2, t2, %5;\n"
+        "mul.rn.bf16x2 %3, t3, %5;\n"
         "}\n"
         : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
         : "r"(w), "r"(sc));
+}
+// two int8 (the low 16 bits of x, the low byte the lower half) as bf16x2, exact
+__device__ __forceinline__ unsigned s8x2_bf16(unsigned x) {
+    const float f0 = __int_as_float(0x4B000000 | ((x ^ 0x80u) & 0xffu)) - 8388736.0f;
+    const float f1 = __int_as_float(0x4B000000 | (((x >> 8) ^ 0x80u) & 0xffu)) - 8388736.0f;
+    unsigned h;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(h) : "f"(f1), "f"(f0));
+    return h;
+}
+__device__ __forceinline__ unsigned bf16x2_mul(unsigned a, unsigned b) {
+    unsigned d;
+    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+    return d;
 }
 __device__ __forceinline__ uint4 ld_nc16(const void* p) {
     uint4 v;
@@ -110,9 +127,9 @@ __device__ __forceinline__ uint4 ld_nc16(const void* p) {
 }
 
 template <int F, int RS, int NM, int CH, int ST, int NT, int MW>
-__global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW) wgemm_kernel(const Args a) {
+__global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgemm_kernel(const Args a) {
     using C = Cfg<F, RS, NM, CH, ST>;
-    constexpr bool kF8 = F == (int) Format::F8;
+    constexpr bool kF8 = F == (int) Format::F8, kBf16 = F == (int) Format::Bf16, kQ8 = F == (int) Format::Q8;
     constexpr int KB = CH / 64;                       // 64-value blocks per chunk
     constexpr int kWarpsPerM = RS / (16 * MW);        // warps per matrix
     constexpr int kThreads = 32 * NM * kWarpsPerM;
@@ -121,7 +138,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW) wgemm_k
     __shared__ float xchg[NM == 2 ? RS * kRows : 1];   // SwiGLU: the up rows for the gate warps
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
     const int ks = a.ks, items = a.tiles * ks, G = gridDim.x;
-    const int64_t row_bytes = kF8 ? a.K : a.K / 2;
+    const int64_t row_bytes = kF8 || kQ8 ? a.K : kBf16 ? 2 * a.K : a.K / 2;
 
     // a work item is (row tile, K slice); a block takes items blockIdx.x, + G, ... and streams their chunks as one
     // sequence through the stages
@@ -148,8 +165,15 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW) wgemm_k
                 const int64_t row = min(row0 + r, rows - 1);   // rows past the last read the last (not written)
                 cp_async<16>(sm + r * C::CB + ((q ^ swz<F, C::P>(r)) << 4), W + row * row_bytes + kc * C::CB + q * 16);
             }
-            if constexpr (!kF8) {
-                const uint8_t* S = W + rows * (a.K / 2);
+            if constexpr (kQ8) {   // each row's CH / 32 fp16 scales of the chunk
+                const uint8_t* S = a.sp[mat];
+                for (int r = threadIdx.x; r < RS; r += kThreads) {
+                    const int64_t row = min(row0 + r, rows - 1);
+                    cp_async<CH / 16>(sm + RS * C::CB + r * (CH / 16), S + row * (a.K / 16) + kc * (CH / 16));
+                }
+            }
+            if constexpr (F == (int) Format::Nvfp4) {
+                const uint8_t* S = a.sp[mat];
                 const int64_t tbase = (row0 >> 7) * (a.K / 64);
                 const int quart = (int) ((row0 & 127) >> 5) * 4;
                 for (int p = threadIdx.x; p < KB * 32; p += kThreads) {
@@ -182,7 +206,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW) wgemm_k
     const int wm = NM == 1 ? 0 : warp / kWarpsPerM;   // this warp's matrix slot in the stage
     const int rw = warp % kWarpsPerM;
     bool live[NT];
-    const __half* xcol[NT];
+    const uint16_t* xcol[NT];
 #pragma unroll
     for (int t = 0; t < NT; ++t) {
         live[t] = t * 8 + g < a.T;
@@ -207,7 +231,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW) wgemm_k
             for (int b = 0; b < KB; ++b)
 #pragma unroll
                 for (int t = 0; t < NT; ++t) {
-                    const __half* xp = xcol[t] + k0 + i * CH + b * 64;
+                    const uint16_t* xp = xcol[t] + k0 + i * CH + b * 64;
                     xa[b][t] = live[t] ? ld_nc16(xp) : make_uint4(0, 0, 0, 0);
                     xb[b][t] = live[t] ? ld_nc16(xp + 8) : make_uint4(0, 0, 0, 0);
                 }
@@ -222,7 +246,39 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW) wgemm_k
 #pragma unroll
                 for (int b = 0; b < KB; ++b) {
                     unsigned a0[4], a1[4], a2[4], a3[4];   // step s: rows g, g + 8 at k-slots 2c.., then 2c + 8..
-                    if constexpr (kF8) {
+                    if constexpr (kBf16) {   // values 16c .. 16c + 15 as eight bf16 pairs, two 16-byte pieces
+                        const int pc = 8 * b + 2 * c;
+                        const uint4 p0 = *(const uint4*) (q0 + ((pc ^ swz<F, C::P>(r0l)) << 4));
+                        const uint4 p1 = *(const uint4*) (q0 + (((pc + 1) ^ swz<F, C::P>(r0l)) << 4));
+                        const uint4 p2 = *(const uint4*) (q1 + ((pc ^ swz<F, C::P>(r1l)) << 4));
+                        const uint4 p3 = *(const uint4*) (q1 + (((pc + 1) ^ swz<F, C::P>(r1l)) << 4));
+                        const unsigned w0[8] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
+                        const unsigned w1[8] = {p2.x, p2.y, p2.z, p2.w, p3.x, p3.y, p3.z, p3.w};
+#pragma unroll
+                        for (int s = 0; s < 4; ++s) {
+                            a0[s] = w0[2 * s];
+                            a1[s] = w1[2 * s];
+                            a2[s] = w0[2 * s + 1];
+                            a3[s] = w1[2 * s + 1];
+                        }
+                    } else if constexpr (kQ8) {   // values 16c .. 16c + 15: half of 32-value block 2b + c / 2
+                        const int pc = 4 * b + c;
+                        const uint4 w0 = *(const uint4*) (q0 + ((pc ^ swz<F, C::P>(r0l)) << 4));
+                        const uint4 w1 = *(const uint4*) (q1 + ((pc ^ swz<F, C::P>(r1l)) << 4));
+                        const __half* ss = (const __half*) (sm + RS * C::CB);
+                        const int jb = 2 * b + (c >> 1);
+                        const unsigned short s0 = __bfloat16_as_ushort(__float2bfloat16_rn(__half2float(ss[r0l * (CH / 32) + jb])));
+                        const unsigned short s1 = __bfloat16_as_ushort(__float2bfloat16_rn(__half2float(ss[r1l * (CH / 32) + jb])));
+                        const unsigned sc0 = s0 | ((unsigned) s0 << 16), sc1 = s1 | ((unsigned) s1 << 16);
+                        const unsigned u0[4] = {w0.x, w0.y, w0.z, w0.w}, u1[4] = {w1.x, w1.y, w1.z, w1.w};
+#pragma unroll
+                        for (int s = 0; s < 4; ++s) {
+                            a0[s] = bf16x2_mul(s8x2_bf16(u0[s]), sc0);
+                            a1[s] = bf16x2_mul(s8x2_bf16(u1[s]), sc1);
+                            a2[s] = bf16x2_mul(s8x2_bf16(u0[s] >> 16), sc0);
+                            a3[s] = bf16x2_mul(s8x2_bf16(u1[s] >> 16), sc1);
+                        }
+                    } else if constexpr (kF8) {
                         const int pc = 4 * b + c;
                         const uint4 w0 = *(const uint4*) (q0 + ((pc ^ swz<F, C::P>(r0l)) << 4));
                         const uint4 w1 = *(const uint4*) (q1 + ((pc ^ swz<F, C::P>(r1l)) << 4));
@@ -321,7 +377,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW) wgemm_k
                         for (int j = 0; j < 4; ++j) {
                             const int col = t * 8 + 2 * c + (j & 1);
                             const int rl = (rw * MW + mt) * 16 + g + 8 * (j >> 1);
-                            if (col < a.T) xchg[rl * kRows + col] = acc[mt][t][j] * a.fac[col] * su;
+                            if (col < a.T) xchg[rl * kRows + col] = acc[mt][t][j] * su;
                         }
             __syncthreads();
             if (wm == 0)
@@ -334,8 +390,10 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW) wgemm_k
                             const int col = t * 8 + 2 * c + (j & 1);
                             const int rl = (rw * MW + mt) * 16 + g + 8 * (j >> 1);
                             if (col >= a.T || row0 + rl >= rows) continue;
-                            const float gv = acc[mt][t][j] * a.fac[col] * sg, uv = xchg[rl * kRows + col];
-                            a.y[0][col * a.ld_y[0] + row0 + rl] = gv / (1.0f + expf(-gv)) * uv;
+                            const float gv = acc[mt][t][j] * sg, uv = xchg[rl * kRows + col];
+                            const float hv = gv / (1.0f + expf(-gv)) * uv;
+                            if (a.y[0]) a.y[0][col * a.ld_y[0] + row0 + rl] = hv;
+                            if (a.act_out) a.act_out[col * rows + row0 + rl] = __bfloat16_as_ushort(__float2bfloat16_rn(hv));
                         }
             __syncthreads();   // xchg is free for the next item
         } else {
@@ -351,7 +409,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW) wgemm_k
                         const int col = t * 8 + 2 * c + (j & 1);
                         const int64_t r = row0 + (rw * MW + mt) * 16 + g + 8 * (j >> 1);
                         if (col >= a.T || r >= rows) continue;
-                        const float v = acc[mt][t][j] * a.fac[col] * sc;
+                        const float v = acc[mt][t][j] * sc;
                         float* dst = y + col * ld + r;
                         if (a.epi == (int) Epilogue::Add) *dst += v;
                         else *dst = v;
