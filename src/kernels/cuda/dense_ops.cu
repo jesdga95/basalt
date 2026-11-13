@@ -71,19 +71,49 @@ __global__ void swiglu_scaled_kernel(const float* __restrict__ g, const float* _
     h[i] = gv / (1.0f + expf(-gv)) * uv;
 }
 
-// one warp per output (t, n): K values in fp32 against a BF16 row
-__global__ void bf16_rows_dot_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w, float* __restrict__ y,
-                                     int64_t T, int64_t N, int64_t K) {
-    const int64_t o = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    const int lane = threadIdx.x & 31;
-    if (o >= T * N) return;
-    const int64_t t = o / N, n = o % N;
-    const float* xr = x + t * K;
-    const uint16_t* wr = w + n * K;
-    float s = 0.0f;
-    for (int64_t k = lane; k < K; k += 32) s = fmaf(__uint_as_float((uint32_t) wr[k] << 16), xr[k], s);
-    s = warp_sum(s);
-    if (lane == 0) y[o] = s;
+// y[t][n] = sum_k x[t][k] w[n][k], x fp32, w BF16, on tf32 tensor cores (mma m16n8k8): a warp per 16 rows x 48 outputs.
+// x is split into two tf32 terms (hi + lo: about fp32's precision; BF16 weights are exact in tf32), fp32 accumulation.  In each 8-value step thread c's k-slots c and
+// c + 4 take values 2c and 2c + 1, so its loads are contiguous pairs (the sum is the same dot product).
+constexpr int RD_T = 16, RD_N = 48;
+__device__ __forceinline__ unsigned tf32_of(float f) {
+    unsigned r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(f));
+    return r;
+}
+__global__ void __launch_bounds__(32) bf16_rows_dot_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+                                                           float* __restrict__ y, int64_t T, int64_t N, int64_t K) {
+    const int lane = threadIdx.x, g = lane >> 2, c = lane & 3;
+    const int64_t t0 = (int64_t) blockIdx.x * RD_T, n0 = (int64_t) blockIdx.y * RD_N;
+    const int64_t ta = min(t0 + g, T - 1), tb = min(t0 + g + 8, T - 1);
+    const float* xa = x + ta * K + 2 * c;
+    const float* xb = x + tb * K + 2 * c;
+    const uint16_t* wr[RD_N / 8];
+#pragma unroll
+    for (int j = 0; j < RD_N / 8; ++j) wr[j] = w + min(n0 + 8 * j + g, N - 1) * K + 2 * c;
+    float acc[RD_N / 8][4] = {};
+    for (int64_t k = 0; k < K; k += 8) {
+        const float2 fa = *reinterpret_cast<const float2*>(xa + k), fb = *reinterpret_cast<const float2*>(xb + k);
+        const unsigned a0 = tf32_of(fa.x), a1 = tf32_of(fb.x), a2 = tf32_of(fa.y), a3 = tf32_of(fb.y);
+        const unsigned l0 = tf32_of(fa.x - __uint_as_float(a0)), l1 = tf32_of(fb.x - __uint_as_float(a1));
+        const unsigned l2 = tf32_of(fa.y - __uint_as_float(a2)), l3 = tf32_of(fb.y - __uint_as_float(a3));
+#pragma unroll
+        for (int j = 0; j < RD_N / 8; ++j) {
+            const unsigned wv = *reinterpret_cast<const unsigned*>(wr[j] + k);
+            asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                         : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
+                         : "r"(l0), "r"(l1), "r"(l2), "r"(l3), "r"(wv << 16), "r"(wv & 0xFFFF0000u));
+            asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                         : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(wv << 16), "r"(wv & 0xFFFF0000u));
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < RD_N / 8; ++j)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int64_t t = t0 + g + (i >> 1) * 8, n = n0 + 8 * j + 2 * c + (i & 1);
+            if (t < T && n < N) y[t * N + n] = acc[j][i];
+        }
 }
 
 // Block (row t, head j): j < n_head a query head, else a key/value head; one thread per head dim.
@@ -263,7 +293,9 @@ void swiglu_scaled(const float* g, const float* u, const float* sg, const float*
 
 void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64_t N, int64_t K, void* stream) {
     if (T <= 0) return;
-    bf16_rows_dot_kernel<<<blocks_for(T * N * 32), 256, 0, (cudaStream_t) stream>>>(x, w, y, T, N, K);
+    if (K % 8 != 0) { basalt::log::error("basalt", "bf16_rows_dot: K %lld", (long long) K); std::exit(1); }
+    bf16_rows_dot_kernel<<<dim3((unsigned) ((T + RD_T - 1) / RD_T), (unsigned) ((N + RD_N - 1) / RD_N)), 32, 0,
+                           (cudaStream_t) stream>>>(x, w, y, T, N, K);
     check("bf16_rows_dot");
 }
 

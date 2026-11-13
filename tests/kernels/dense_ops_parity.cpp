@@ -121,7 +121,7 @@ int main() {
                 for (int k = 0; k < H; ++k) a += (double) x[(size_t) t * H + k] * fb(w[(size_t) n * H + k]);
                 want[(size_t) t * N + n] = a;
             }
-        report("bf16_rows_dot", y, want, 1e-4);
+        report("bf16_rows_dot", y, want, 3e-4);   // tf32 tensor cores: two-term x, but the mma accumulates below fp32
     }
     {   // dyn_conv2: base + dynamic two-tap convolution along the block, 16-channel groups
         const int G = 16, groups = H / G, LD = 4 * groups;
