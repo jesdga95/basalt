@@ -183,7 +183,8 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     gemm(m, L.v, b.xq, b.v, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
                              pos, s, 256, true, 0, nullptr, q8);
-    kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8);
+    kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split,
+                             kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits));
     kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
     quantize_mmq(b.ag, b.xq, L.o.type, AQ, T, s);
     gemm(m, L.o, b.xq, b.tmp, T, s);
