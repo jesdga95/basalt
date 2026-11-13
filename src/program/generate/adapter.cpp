@@ -62,6 +62,7 @@ struct AdapterImage {
     int64_t at = 0;
     std::vector<float> rows;
     int n_rows = 0;
+    basalt::model::ImageGrid grid;
 };
 
 struct AdapterTimes {
@@ -143,7 +144,7 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
         }
         if (r.ok() && i < images.size()) {
             const auto tp = Clock::now();
-            r = sess.prefill_embeddings(images[i].rows.data(), images[i].n_rows, pos);
+            r = sess.prefill_embeddings(images[i].rows.data(), images[i].n_rows, pos, images[i].grid);
             basalt::log::info("basalt generate", "image prefill %d rows in %.0f ms", images[i].n_rows,
                          std::chrono::duration<double, std::milli>(Clock::now() - tp).count());
             pos += images[i].n_rows;
@@ -202,7 +203,7 @@ int adapter_generate(basalt::model::LoadedModel& loaded, const std::vector<int64
         std::ifstream f(images[i], std::ios::binary);
         const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         const auto te = Clock::now();
-        const basalt::model::Result er = sess->encode_image(bytes.data(), bytes.size(), blocks[i].rows, blocks[i].n_rows);
+        const basalt::model::Result er = sess->encode_image(bytes.data(), bytes.size(), blocks[i].rows, blocks[i].n_rows, blocks[i].grid);
         if (!er.ok()) {
             basalt::log::error("basalt generate", "%s: %s", images[i].c_str(), er.message.c_str());
             return 1;

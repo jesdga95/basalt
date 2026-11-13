@@ -445,7 +445,7 @@ public:
         return {};
     }
 
-    model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) override {
+    model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid&) override {
         std::string err;
         if (!image_) {   // this slot's image buffers, allocated with the tier
             ExpertTier* tier = ops_ ? ops_->expert_tier(err) : nullptr;
@@ -506,7 +506,7 @@ public:
         }
     }
 
-    model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) override {
+    model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
         if (!prefillp::may_resume(pos, (int64_t) hist_.size(), whole_from_)) return {model::Status::Error, kSkippedRows};
         sync_rewind(pos);
         settle_tier();

@@ -578,6 +578,7 @@ set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_S
 # the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
 add_subdirectory(tools/vision)
 target_link_libraries(model_qwen4exp PUBLIC vision_cuda)
+target_link_libraries(serve_shared PUBLIC vision_core)
 if(BUILD_TESTING)
   # the host half of the vision library needs no GPU: the decode guard is checked here
   add_executable(vision_preprocess_test tests/vision/preprocess_limit_test.cpp)
