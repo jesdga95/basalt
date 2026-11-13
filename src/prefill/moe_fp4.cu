@@ -20,17 +20,14 @@ namespace {
 
 constexpr int kRowsPerBlock = 128;
 constexpr int kKTile = 128;                         // values per pipeline stage
+constexpr int kStages = 4;
 constexpr int kACodeBytes = kTileTokens * kKTile / 2;   // 4096
 constexpr int kAScaleBytes = kTileTokens * kKTile / 16; // 512
 constexpr int kAStage = kACodeBytes + kAScaleBytes;     // 4608
 constexpr int kBRowBytes = kKTile / 64 * 36;            // 72
 constexpr int kBStage = kRowsPerBlock * kBRowBytes;     // 9216
-// 64-token tiles per GEMM block: 2 for experts' runs (four stages), 4 for a dense layer's chunk (three stages, each warp
-// two tiles, so a weight fragment feeds eight token groups)
-template <int BT> struct Blk {
-    static constexpr int kStages = BT == 2 ? 4 : 3;
-    static constexpr int kSmem = kStages * (BT * kAStage + kBStage);
-};
+constexpr int kBlockTiles = 2;                          // 64-token tiles per GEMM block
+constexpr int kSmem = kStages * (kBlockTiles * kAStage + kBStage);
 constexpr int kThreads = 256;
 
 void ck(cudaError_t e, const char* what) {
@@ -189,8 +186,6 @@ struct GemmArgs {
     float* dst;
     int64_t ld_dst;
     size_t tail_off;          // SWIGLU: the blob's {s_gate, s_up, s_down, -}
-    const uint8_t* up;        // SWIGLU over a dense layer: the up matrix (gate rows from the blob), its scales at tail
-    const float* tail;
 };
 
 // The weight row behind B tile row sr of block rb: 128 consecutive rows, or (SWIGLU) the block's 64 gate rows and the
@@ -223,16 +218,16 @@ __device__ __forceinline__ float swiglu_tail(float g, float u, float4 s) {
 
 // One pipeline stage: the block's activation tiles (runs of the tiled planes, or GATHER: each row's token codes, their
 // 16-byte chunks swizzled as quantize() places them, and its scales) and the block's weight rows
-template <int BT, bool GATHER, bool SWIGLU>
+template <bool GATHER, bool SWIGLU>
 __device__ __forceinline__ void load_stage(int stage, int kt, uint8_t* smem, const uint8_t* a_src, size_t tile_stride,
                                            int ntiles, const uint8_t* const* a_code, const int* a_dst,
                                            const uint8_t* a_scale, int s_dst, const uint8_t* w_src, size_t row_bytes,
-                                           int rb, int half, const uint8_t* w_up) {
-    uint8_t* as = smem + stage * BT * kAStage;
-    uint8_t* bs = smem + Blk<BT>::kStages * BT * kAStage + stage * kBStage;
+                                           int rb, int half) {
+    uint8_t* as = smem + stage * kBlockTiles * kAStage;
+    uint8_t* bs = smem + kStages * kBlockTiles * kAStage + stage * kBStage;
     if (GATHER) {   // chunk i of a thread lies in tile i, its scale row in tile threadIdx.x / 64
 #pragma unroll
-        for (int i = 0; i < BT * kTileTokens * 4 / kThreads; ++i)
+        for (int i = 0; i < kBlockTiles * kTileTokens * 4 / kThreads; ++i)
             if (i < ntiles) cp_async16(as + a_dst[i], a_code[i] + (size_t) kt * 64);
         if ((int) threadIdx.x < ntiles * kTileTokens) cp_async8(as + s_dst, a_scale + (size_t) kt * 8);
     } else {
@@ -243,9 +238,8 @@ __device__ __forceinline__ void load_stage(int stage, int kt, uint8_t* smem, con
     }
     for (int i = threadIdx.x; i < kRowsPerBlock * (kBRowBytes / 8); i += kThreads) {
         const int row = i / (kBRowBytes / 8), c = i % (kBRowBytes / 8);
-        const uint8_t* src = SWIGLU && w_up && row >= 64 ? w_up + (size_t) (rb * 64 + row - 64) * row_bytes
-                                                        : w_src + (size_t) b_row<SWIGLU>(rb, row, half) * row_bytes;
-        cp_async8(bs + row * kBRowBytes + 8 * c, src + (size_t) kt * kBRowBytes + 8 * c);
+        cp_async8(bs + row * kBRowBytes + 8 * c,
+                  w_src + (size_t) b_row<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes + 8 * c);
     }
 }
 
@@ -253,16 +247,15 @@ __device__ __forceinline__ void load_stage(int stage, int kt, uint8_t* smem, con
 // and 32 rows, so a weight fragment feeds four token groups.  GATHER: a row's activations are its token's (token planes,
 // row -> token from ids); SWIGLU: the gate/up product's outputs leave as the tail-scaled SwiGLU of each gate/up pair.
 // Every output keeps the same MMA chain over K as the plain product of one tile, so the products are the same bits.
-template <int BT, bool GATHER, bool SWIGLU>
+template <bool GATHER, bool SWIGLU>
 __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
-    constexpr int kBlockTiles = BT, kStages = Blk<BT>::kStages, TPW = BT / 2;   // tiles per warp
     extern __shared__ __align__(1024) uint8_t smem[];
     __shared__ int32_t tok_s[kBlockTiles * kTileTokens];
     const int j = blockIdx.z, tp = blockIdx.y, rb = blockIdx.x;
     const int cnt = a.bounds[j + 1] - a.bounds[j];
     const int first = tp * kBlockTiles * kTileTokens;   // the block's first row inside the expert
     if (first >= cnt) return;
-    const int ntiles = min(kBlockTiles, (cnt - first + kTileTokens - 1) / kTileTokens);
+    const int ntiles = first + kTileTokens < cnt ? 2 : 1;
     const int nkt = a.w_cols / kKTile;
     const size_t row_bytes = (size_t) (a.w_cols / 64) * 36;
     const size_t tile_stride = (size_t) nkt * kAStage;
@@ -293,42 +286,41 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
     }
 
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int warp_m = warp >> 2, warp_n = warp & 3;   // tiles TPW warp_m .. x 4 row quarters
-    const bool live = TPW * warp_m < ntiles;
+    const int warp_m = warp >> 2, warp_n = warp & 3;   // tile x 4 row quarters
+    const bool live = warp_m < ntiles;
     const int group = lane >> 2, tig = lane & 3;
     const int a_row = (lane & 7) + (((lane >> 3) & 1) << 3);
     const int a_col = (lane >> 4) * 16;
     const int sfa_row = ((lane & 1) << 3) | (lane >> 2);
 
-    float acc[4 * TPW][4][4] = {};
+    float acc[4][4][4] = {};
 #pragma unroll
     for (int s = 0; s < kStages - 1; ++s) {
         if (s < nkt)
-            load_stage<BT, GATHER, SWIGLU>(s, s, smem, a_src, tile_stride, ntiles, a_code, a_dst, a_scale, s_dst, w_src,
-                                       row_bytes, rb, a.half, a.up);
+            load_stage<GATHER, SWIGLU>(s, s, smem, a_src, tile_stride, ntiles, a_code, a_dst, a_scale, s_dst, w_src,
+                                       row_bytes, rb, a.half);
         cp_commit();
     }
     for (int kt = 0; kt < nkt; ++kt) {
         cp_wait<kStages - 2>();
         __syncthreads();
         if (kt + kStages - 1 < nkt)
-            load_stage<BT, GATHER, SWIGLU>((kt + kStages - 1) % kStages, kt + kStages - 1, smem, a_src, tile_stride, ntiles,
-                                       a_code, a_dst, a_scale, s_dst, w_src, row_bytes, rb, a.half, a.up);
+            load_stage<GATHER, SWIGLU>((kt + kStages - 1) % kStages, kt + kStages - 1, smem, a_src, tile_stride, ntiles,
+                                       a_code, a_dst, a_scale, s_dst, w_src, row_bytes, rb, a.half);
         cp_commit();
         if (!live) continue;
         const int stage = kt % kStages;
-        const uint8_t* as = smem + stage * kBlockTiles * kAStage + TPW * warp_m * kAStage;
+        const uint8_t* as = smem + stage * kBlockTiles * kAStage + warp_m * kAStage;
         const uint8_t* bs = smem + kStages * kBlockTiles * kAStage + stage * kBStage;
 #pragma unroll
         for (int s = 0; s < 2; ++s) {
-            unsigned af[4 * TPW][4], asc[4 * TPW];
+            unsigned af[4][4], asc[4];
 #pragma unroll
-            for (int mt = 0; mt < 4 * TPW; ++mt) {
-                const uint8_t* at = as + (mt / 4) * kAStage;
-                const int row = (mt % 4) * 16 + a_row;
+            for (int mt = 0; mt < 4; ++mt) {
+                const int row = mt * 16 + a_row;
                 ldmatrix_x4(af[mt][0], af[mt][1], af[mt][2], af[mt][3],
-                            smem_addr(at + row * 64 + swz(row, s * 32 + a_col)));
-                asc[mt] = *(const uint32_t*) (at + kACodeBytes + ((mt % 4) * 16 + sfa_row) * 8 + 4 * s);
+                            smem_addr(as + row * 64 + swz(row, s * 32 + a_col)));
+                asc[mt] = *(const uint32_t*) (as + kACodeBytes + (mt * 16 + sfa_row) * 8 + 4 * s);
             }
             unsigned b0[4], b1[4], sb[4];
 #pragma unroll
@@ -341,7 +333,7 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
                 sb[r] = v & ~__vcmpeq4(v, 0x7f7f7f7fu);
             }
 #pragma unroll
-            for (int mt = 0; mt < 4 * TPW; ++mt)
+            for (int mt = 0; mt < 4; ++mt)
 #pragma unroll
                 for (int r = 0; r < 4; ++r) mma_fp4(acc[mt][r], af[mt], b0[r], b1[r], asc[mt], sb[r]);
         }
@@ -349,19 +341,18 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
     cp_wait<0>();
     if (!live) return;
 
+    const int tl = kBlockTiles * tp + warp_m;   // this warp's tile inside the expert
+    const int64_t tile = tile0 + warp_m;
+    const int64_t row0 = a.bounds[j] + (int64_t) tl * kTileTokens;
     float4 tail = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    if (SWIGLU) tail = a.tail ? *(const float4*) a.tail : *(const float4*) (a.blob[j] + a.tail_off);
+    if (SWIGLU) tail = *(const float4*) (a.blob[j] + a.tail_off);
 #pragma unroll
-    for (int mq = 0; mq < 4 * TPW; ++mq)
+    for (int mt = 0; mt < 4; ++mt)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int wt = TPW * warp_m + mq / 4, mt = mq;   // the block's tile, the accumulator row group
-            const int tl = kBlockTiles * tp + wt;           // this tile inside the expert
-            const int64_t tile = tile0 + wt;
-            const int64_t row0 = a.bounds[j] + (int64_t) tl * kTileTokens;
-            const int t = (mq % 4) * 16 + group + 8 * h;
+            const int t = mt * 16 + group + 8 * h;
             if (tl * kTileTokens + t >= cnt) continue;
-            const float g = GATHER ? a.gs[tok_s[wt * kTileTokens + t]] : a.gs[tile * kTileTokens + t];
+            const float g = GATHER ? a.gs[tok_s[warp_m * kTileTokens + t]] : a.gs[tile * kTileTokens + t];
             if (SWIGLU) {
                 // the gate/up product's values as the plain product stores them, then mmq::swiglu's arithmetic
                 float* out = a.dst + (row0 + t) * a.ld_dst + rb * 64 + warp_n * 16 + 2 * tig;
@@ -435,28 +426,23 @@ void gather_tails(const Product& p, size_t tail_off, float* dst, void* stream) {
 }
 
 // the shared-memory opt-in is per device and per kernel (a layer split runs these on several, from different threads)
-template <int BT, bool GATHER, bool SWIGLU> void launch(const GemmArgs& a, dim3 grid, cudaStream_t s) {
+template <bool GATHER, bool SWIGLU> void launch(const GemmArgs& a, dim3 grid, cudaStream_t s) {
     static std::atomic<bool> configured[64];
     int dev = 0;
     ck(cudaGetDevice(&dev), "device");
     if (dev < 0 || dev >= 64) ck(cudaErrorInvalidDevice, "device range");
     if (!configured[dev].load(std::memory_order_acquire)) {
-        ck(cudaFuncSetAttribute(gemm_kernel<BT, GATHER, SWIGLU>, cudaFuncAttributeMaxDynamicSharedMemorySize, Blk<BT>::kSmem),
-           "smem");
+        ck(cudaFuncSetAttribute(gemm_kernel<GATHER, SWIGLU>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem), "smem");
         configured[dev].store(true, std::memory_order_release);
     }
-    gemm_kernel<BT, GATHER, SWIGLU><<<grid, kThreads, Blk<BT>::kSmem, s>>>(a);
+    gemm_kernel<GATHER, SWIGLU><<<grid, kThreads, kSmem, s>>>(a);
     ck(cudaGetLastError(), "gemm");
 }
 
 void run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
-    if (p.ids != nullptr && !p.swiglu) {
+    if ((p.ids != nullptr) != p.swiglu) {
         basalt::log::error("basalt", "prefill fp4: token rows go with the SwiGLU output only");
-        std::exit(1);
-    }
-    if (p.swiglu && (p.ids == nullptr) != (p.up != nullptr)) {
-        basalt::log::error("basalt", "prefill fp4: a SwiGLU product reads token rows (experts) or a dense up matrix");
         std::exit(1);
     }
     GemmArgs a{};
@@ -464,18 +450,12 @@ void run(const Product& p, void* stream) {
     a.w_off = p.w_off; a.w_cols = (int) p.w_cols; a.half = (int) (p.w_rows / 2); a.a4 = (const uint8_t*) p.a4;
     a.gs = p.gs; a.bounds = p.bounds; a.tile_off = p.tile_off; a.ids = p.ids; a.dst = p.dst; a.ld_dst = p.ld_dst;
     a.tail_off = p.tail_off;
-    a.up = p.up;
-    a.tail = p.tail;
     a.a4s = p.ids ? (const uint8_t*) p.a4 + (size_t) p.tokens * (size_t) (p.w_cols / 2) : nullptr;
-    // one dense matrix over a long chunk: four tiles per block; experts' runs: two
-    const int bt = p.n == 1 && !p.ids && p.max_rows >= 1024 ? 4 : 2;
-    const int block_rows = bt * kTileTokens;
+    const int block_rows = kBlockTiles * kTileTokens;
     const dim3 grid((unsigned) (p.w_rows / kRowsPerBlock), (unsigned) ((p.max_rows + block_rows - 1) / block_rows),
                     (unsigned) p.n);
-    if (p.swiglu && p.ids) launch<2, true, true>(a, grid, (cudaStream_t) stream);
-    else if (p.swiglu) launch<4, false, true>(a, grid, (cudaStream_t) stream);
-    else if (bt == 4) launch<4, false, false>(a, grid, (cudaStream_t) stream);
-    else launch<2, false, false>(a, grid, (cudaStream_t) stream);
+    if (p.swiglu) launch<true, true>(a, grid, (cudaStream_t) stream);
+    else launch<false, false>(a, grid, (cudaStream_t) stream);
 }
 
 int run_length(const Group& g, int i0, int64_t row_cap) {

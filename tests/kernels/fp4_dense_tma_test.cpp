@@ -72,6 +72,16 @@ template <class T> T* dev_copy(const std::vector<T>& v) {
     cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice);
     return d;
 }
+// BF16 bits to float (exact)
+std::vector<float> from_bf16(const std::vector<uint16_t>& h) {
+    std::vector<float> f(h.size());
+    for (size_t i = 0; i < h.size(); ++i) {
+        const uint32_t u = (uint32_t) h[i] << 16;
+        std::memcpy(&f[i], &u, 4);
+    }
+    return f;
+}
+
 template <class T> std::vector<T> host_copy(const T* d, size_t n) {
     std::vector<T> v(n);
     cudaMemcpy(v.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
@@ -110,7 +120,7 @@ int main(int argc, char** argv) {
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) return 77;
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) return bench();
 
-    const int64_t R = 384, K = 1280, T = 1100, T2 = 1000;
+    const int64_t R = 512, K = 1280, T = 1100, T2 = 1000;   // R a multiple of 256: the SwiGLU output is quantized again
     std::mt19937 rng(11);
     const Planes wg = make_planes(R, K, rng), wu = make_planes(R, K, rng);
     std::normal_distribution<float> nd;
@@ -124,13 +134,14 @@ int main(int argc, char** argv) {
     float* dx = dev_copy(x);
     float* dsc = dev_copy(std::vector<float>(scales, scales + 2));
     void* act;
-    float *gs, *y, *y2, *y1, *yh;
+    float *gs, *y, *y2, *y1;
+    uint16_t* yh;
     cudaMalloc(&act, fd::act_bytes(T, K));
     cudaMalloc(&gs, T * 4);
     cudaMalloc(&y, (size_t) T * R * 4);
     cudaMalloc(&y2, (size_t) T * R * 4);
     cudaMalloc(&y1, (size_t) R * 4);
-    cudaMalloc(&yh, (size_t) T * R * 4);
+    cudaMalloc(&yh, (size_t) T * R * 2);
 
     fd::quantize(dx, T, K, K, act, gs, nullptr);
     fd::product(dwg, dsc, R, K, act, gs, T, y, R, false, nullptr);
@@ -154,7 +165,8 @@ int main(int argc, char** argv) {
     const auto xd = decode_act(actb, T, K);
     const Ref rg = reference(wg.dec, xd, R, K, T), ru = reference(wu.dec, xd, R, K, T);
     const auto hy = host_copy(y, (size_t) T * R), hy2 = host_copy(y2, (size_t) T2 * R), hy1 = host_copy(y1, R);
-    const auto hh = host_copy(yh, (size_t) T * R), hres = host_copy(dres, (size_t) T * R);
+    const auto hh = from_bf16(host_copy(yh, (size_t) T * R));
+    const auto hres = host_copy(dres, (size_t) T * R);
 
     double worst_plain = 0, worst_add = 0, worst_sw = 0, worst_q = 0;
     for (int64_t t = 0; t < T; ++t)
@@ -167,7 +179,8 @@ int main(int argc, char** argv) {
             const double gv = g * rg.sum[o], uv = u * ru.sum[o];
             const double ref = gv / (1.0 + std::exp(-gv)) * uv;
             const double gb = g * rg.abs[o], ub = u * ru.abs[o];
-            const double tol = 1.1 * gb * std::fabs(uv) + std::fabs(gv / (1.0 + std::exp(-gv))) * ub + 1e-30;
+            // the bounds of the products' rounding, plus BF16's half step of the output
+            const double tol = 1.1 * gb * std::fabs(uv) + std::fabs(gv / (1.0 + std::exp(-gv))) * ub + std::fabs(ref) / 256.0 + 1e-30;
             worst_sw = std::max(worst_sw, std::fabs(hh[o] - ref) / tol);
         }
     // the quantizer: each token's scale is amax / (6 * 448) and the decoded row is within the FP4 grid's reach of x
@@ -198,9 +211,30 @@ int main(int argc, char** argv) {
                     host_copy(gs, T) == host_copy(gs2, T);
         std::printf("fp4 dense rms_norm_quantize: codes and scales %s\n", norm_same ? "bitwise quantize's of its normed rows" : "DIFFER");
     }
+    // SwiGLU's per-token amax: quantize_amax of its output gives quantize's codes and scales, reading the rows once
+    bool amax_same = false;
+    {
+        float *hmax, *gs3, *gs4;
+        void *a3, *a4;
+        cudaMalloc(&hmax, T * 4);
+        cudaMalloc(&gs3, T * 4);
+        cudaMalloc(&gs4, T * 4);
+        cudaMalloc(&a3, fd::act_bytes(T, R));
+        cudaMalloc(&a4, fd::act_bytes(T, R));
+        fd::quantize(dx, T, K, K, act, gs, nullptr);
+        fd::swiglu(dwg, dwu, dsc, dsc + 1, R, K, act, gs, T, yh, R, nullptr, hmax);
+        cudaDeviceSynchronize();
+        float* yf = dev_copy(from_bf16(host_copy(yh, (size_t) T * R)));   // the same values as FP32 rows
+        fd::quantize(yf, T, R, R, a3, gs3, nullptr);
+        fd::quantize_amax(yh, hmax, T, R, R, a4, gs4, nullptr);
+        cudaDeviceSynchronize();
+        amax_same = host_copy((const uint8_t*) a3, fd::act_bytes(T, R)) == host_copy((const uint8_t*) a4, fd::act_bytes(T, R)) &&
+                    host_copy(gs3, T) == host_copy(gs4, T);
+        std::printf("fp4 dense swiglu amax + quantize_amax: %s\n", amax_same ? "bitwise quantize's" : "DIFFER");
+    }
     const bool same = std::memcmp(hy.data(), hy2.data(), (size_t) T2 * R * 4) == 0;
     const bool same1 = std::memcmp(hy.data(), hy1.data(), (size_t) R * 4) == 0;
-    const bool ok = !launch_err && worst_plain < 1e-5 && worst_add < 1e-5 && worst_sw < 1e-5 && worst_q < 1.0 && same && same1 && norm_same;
+    const bool ok = !launch_err && worst_plain < 1e-5 && worst_add < 1e-5 && worst_sw < 1.0 && worst_q < 1.0 && same && same1 && norm_same && amax_same;
     std::printf("fp4 dense tma [%lld x %lld] x %lld tokens: plain max err %.3g, add %.3g, swiglu %.3g (x sum|wx|), quantizer %.3g; "
                 "rows bitwise at 1, 1000, 1100 tokens: %s%s\n",
                 (long long) R, (long long) K, (long long) T, worst_plain, worst_add, worst_sw, worst_q,
@@ -276,30 +310,29 @@ int bench() {
         fp4::plan(bounds, 1, toff, nullptr);
 
         const double flop_gu = 2.0 * T * (2 * gate_rows) * K1, flop_d = 2.0 * T * down_rows * K2;
+        // the expert path's plain products (gate and up as two of them)
         auto old_product = [&](const uint8_t* w, const uint8_t* up, int64_t rows, int64_t K, void* a4, float* dst) {
-            fp4::Product p;
-            p.blob[0] = w;
-            p.w_rows = up ? 2 * rows : rows;
-            p.w_cols = K;
-            p.n = 1;
-            p.a4 = a4;
-            p.gs = gs;
-            p.bounds = bounds;
-            p.tile_off = toff;
-            p.dst = dst;
-            p.ld_dst = rows;
-            p.max_rows = T;
-            if (up) {
-                p.swiglu = true;
-                p.up = up;
-                p.tail = dsc;
+            for (const uint8_t* m : {w, up}) {
+                if (!m) continue;
+                fp4::Product p;
+                p.blob[0] = m;
+                p.w_rows = rows;
+                p.w_cols = K;
+                p.n = 1;
+                p.a4 = a4;
+                p.gs = gs;
+                p.bounds = bounds;
+                p.tile_off = toff;
+                p.dst = dst;
+                p.ld_dst = rows;
+                p.max_rows = T;
+                fp4::run(p, nullptr);
             }
-            fp4::run(p, nullptr);
         };
         const float q1 = time_ms([&] { fd::quantize(dx1, T, K1, K1, act1, gs, nullptr); });
         const float q2 = time_ms([&] { fd::quantize(dx2, T, K2, K2, act2, gs, nullptr); });
         fd::quantize(dx1, T, K1, K1, act1, gs, nullptr);
-        const float n_gu = time_ms([&] { fd::swiglu(wg, wu, dsc, dsc + 1, gate_rows, K1, act1, gs, T, out, gate_rows, nullptr); });
+        const float n_gu = time_ms([&] { fd::swiglu(wg, wu, dsc, dsc + 1, gate_rows, K1, act1, gs, T, (uint16_t*) out, gate_rows, nullptr); });
         fd::quantize(dx2, T, K2, K2, act2, gs, nullptr);
         const float n_d = time_ms([&] { fd::product(wd, dsc + 2, down_rows, K2, act2, gs, T, out2, down_rows, false, nullptr); });
         const float n_da = time_ms([&] { fd::product(wd, dsc + 2, down_rows, K2, act2, gs, T, out2, down_rows, true, nullptr); });

@@ -1447,6 +1447,16 @@ if(BUILD_TESTING)
   target_link_libraries(fp8_gemm_test PRIVATE prefill_fp8 ${_gpu_runtime_target})
   basalt_gpu_test(NAME fp8_gemm_test COMMAND fp8_gemm_test)
   set_tests_properties(fp8_gemm_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # the producers that round their rows to E4M3 for an F8 output projection: bitwise quantize's
+  add_executable(e4m3_producers_test tests/kernels/e4m3_producers_test.cpp)
+  target_link_libraries(e4m3_producers_test PRIVATE prefill_fp8 kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME e4m3_producers_test COMMAND e4m3_producers_test)
+  set_tests_properties(e4m3_producers_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # the prompt chunk's BF16 entry points against the FP32 kernels on the widened values
+  add_executable(bf16_chunk_test tests/kernels/bf16_chunk_test.cpp)
+  target_link_libraries(bf16_chunk_test PRIVATE prefill_fp8 prefill_fp4 kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME bf16_chunk_test COMMAND bf16_chunk_test)
+  set_tests_properties(bf16_chunk_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
 # a decode window's products against FP8 and NVFP4 matrices (the NVFP4 codes convert with sm_120a instructions)
 add_library(window_gemm STATIC src/kernels/cuda/window_gemm.cu src/kernels/cuda/window_gemm_f8.cu
@@ -1524,11 +1534,6 @@ if(BUILD_TESTING)
   target_link_libraries(prefill_hc_up_mix_test PRIVATE model_qwen4exp_prefill model_qwen4exp_kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_hc_up_mix_test COMMAND prefill_hc_up_mix_test --no-bench)
   set_tests_properties(prefill_hc_up_mix_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
-  # a dense layer's FP4 products: long and short chunks give the same rows, the SwiGLU product against the plain ones
-  add_executable(fp4_dense_test tests/kernels/fp4_dense_test.cpp)
-  target_link_libraries(fp4_dense_test PRIVATE prefill_fp4 ${_gpu_runtime_target})
-  basalt_gpu_test(NAME fp4_dense_test COMMAND fp4_dense_test)
-  set_tests_properties(fp4_dense_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the TMA dense W4A4 product against a double reference, rows bitwise at any chunk length; --bench for TFLOP/s
   add_executable(fp4_dense_tma_test tests/kernels/fp4_dense_tma_test.cpp)
   target_link_libraries(fp4_dense_tma_test PRIVATE prefill_fp4 kernels ${_gpu_runtime_target})

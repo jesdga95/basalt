@@ -324,8 +324,9 @@ int main(int argc, char** argv) {
             static const char* what[3] = {"300 rows", "300 rows split", "2048 rows"};
             std::printf("int8 cache: prompt %s max abs %.3g (%.3g against int8-rounded queries) vs double on the dequantized "
                         "cells\n", what[cfg], p8.abs, p8q.abs);
-            // the prompt's QK reads int8 queries, its P V fp16 probabilities summed in fp16 per 64-cell tile
-            if (p8q.abs > 5e-3 || p8.abs > 3e-2) ++fails;
+            // the prompt's QK reads int8 queries; its P V rounds each probability times its cell's scale to u8 per row per
+            // 64-cell tile (half a step of 1/255 of the tile's largest product each), summed exactly in int32
+            if (p8q.abs > 2e-2 || p8.abs > 3e-2) ++fails;
         }
         cudaFree(d_qb);
         cudaFree(d_ob);
