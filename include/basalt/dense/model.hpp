@@ -125,7 +125,8 @@ struct ModelDeleter {
 using ModelPtr = std::unique_ptr<Model, ModelDeleter>;
 
 /// The model's shared state: geometry, weights, and what its sessions use one at a time (scratch, the image encoder).
-/// Sessions run one after another on the serving thread; each call leaves its stream idle.
+/// Sessions run one after another on the serving thread; each call leaves its stream idle. The decode windows of several
+/// sessions (at most kWindow rows in all) run as one batch through `ModelSession::decode_batch`.
 ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::string& err);
 std::unique_ptr<model::ModelSession> make_session(Model& m, std::string& err);
 /// Device bytes one session takes (its KV cells, recurrent states and window rows).
