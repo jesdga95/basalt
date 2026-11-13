@@ -1,9 +1,9 @@
-// src/models/qwen4exp/prefill/fp4/moe_fp4.cu - see include/basalt/models/qwen4exp/prefill/moe_fp4.hpp.
+// src/prefill/moe_fp4.cu - see include/basalt/prefill/moe_fp4.hpp.
 // The block-scaled MMA wrapper and the tile structure (64-token tiles x 128 weight rows, eight warps, activation
 // fragments through ldmatrix, scale registers per 64-wide K step) follow Infernix's grouped NVFP4 GEMM
 // (src/ops/offloaded_sparse_moe/cuda/wide_expert.cuh, src/ops/common/mma.cuh).
 // Adapted from Infernix (Ian Ranson and contributors), Apache-2.0: see THIRD_PARTY_LICENSES.
-#include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -87,6 +87,8 @@ __global__ void rebase_kernel(const int32_t* __restrict__ bounds, int n, int32_t
 
 // ---------------------------------------------------------------------------------------- quantizer
 
+// The widths built: rows of 2560 / 640 values (Flash-Next's experts), 5120 / 17408 (a dense 27B's MLP); NBL = the
+// 16-value blocks per lane.
 // One warp per row: token scale g = amax / (6 * 448); per 16 values a UE4M3 scale of block amax / (6 g); codes
 // round to nearest even on x / (scale * g).  A sub-block's 8 bytes hold value j in the low nibble of byte j and value
 // j + 8 in the high one (the layout of an NVFP4 weight sub-block).  TOKENS: row r goes to the token planes (codes
@@ -398,6 +400,8 @@ void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const i
     const cudaStream_t s = (cudaStream_t) stream;
     if (cols == 2560) quantize_kernel<5, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else if (cols == 640) quantize_kernel<2, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
+    else if (cols == 5120) quantize_kernel<10, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
+    else if (cols == 17408) quantize_kernel<34, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else { basalt::log::error("basalt", "prefill fp4: %lld columns", (long long) cols); std::exit(1); }
     ck(cudaGetLastError(), "quantize");
 }
