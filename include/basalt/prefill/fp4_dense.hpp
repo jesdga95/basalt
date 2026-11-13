@@ -12,7 +12,8 @@
 //
 // Every output keeps one K order whatever the number of tokens, so a token's row is the same bits at any chunk length.
 // Shapes: weight rows a multiple of 128, K a multiple of 256, tokens >= 1.  Output is token-major, dst[t * ld + r] (FP32,
-// SwiGLU's BF16); ld must be even (pair stores).
+// SwiGLU's BF16); ld must be even (pair stores).  The BF16 outputs (swiglu's, product_add_bf16's) go out by tensor
+// stores: dst and gs 16-byte aligned, ld a multiple of 8.
 #pragma once
 
 #include <cstddef>

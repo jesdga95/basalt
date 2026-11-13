@@ -5,11 +5,18 @@
 // activations, 256 weight rows x 128 K) through a two-stage mbarrier ring, eight consumer warps as 2 (tokens) x 4
 // (rows), each 64 tokens x 64 rows, ldmatrix fragments ping-ponged over the four k32 steps, one CTA per SM, the token
 // tiles fastest in the grid.  The activations are the mma's A (m16) and the weight rows its B (n8), so a thread's
-// accumulator pair is two adjacent weight rows of one token: the epilogue stores float2 straight to the token-major
-// output.  The mma is the block-scaled form with both scales 2^0 (the plain e4m3 form accumulates at half rate on the
-// RTX 5090); fp32 accumulation over K in order, the two scales applied with rounded multiplies once at the end, so a
-// row's bits do not depend on the chunk length or the tile it falls in.  One product may span up to three weight
-// matrices that share the activations (each with its own scale, output and stride): their row tiles run in one grid.
+// accumulator pair is two adjacent weight rows of one token.  The mma is the block-scaled form with both scales 2^0 (the
+// plain e4m3 form accumulates at half rate on the RTX 5090); fp32 accumulation over K in order, the two scales applied
+// with rounded multiplies once at the end, so a row's bits do not depend on the chunk length or the tile it falls in.
+// One product may span up to three weight matrices that share the activations (each with its own scale, output and
+// stride): their row tiles run in one grid.
+//
+// BF16 outputs leave through shared memory: once the K loop is over, the weight stages' memory is the block's output
+// tile, four slabs of 64 rows x 128 tokens in the 128-byte swizzle (the eight tokens a warp instruction touches fall in
+// different banks).  An Add's residual slabs come in by TMA (their lines asked for a few stages before the K loop
+// ends), the consumers write their rounded values into the tile and TMA stores write it out, so no thread waits on a
+// load or a store of its own; the tile's token scales are copied into shared memory at the block's start for the same
+// reason.  FP32 outputs go straight from the accumulators.
 #include "basalt/prefill/fp8_gemm.hpp"
 
 #include <cuda.h>
@@ -31,7 +38,13 @@ constexpr int NCONS = WT * WR * 32, NT = NCONS + 32;    // consumer threads; plu
 constexpr int WTOK = BT / WT, WROW = BR / WR;           // a warp's 64 tokens x 64 rows
 constexpr int MT = WTOK / 16, MR = WROW / 8;            // its mma tiles: 4 x 8
 constexpr int ACT_BYTES = ST * BT * BK, W_BYTES = ST * BR * BK;
-constexpr int SMEM = ACT_BYTES + W_BYTES + ST * 2 * 8;
+// A block's BF16 output tile takes the weight stages' memory: slabs of SLAB_ROWS rows (128 bytes a token)
+constexpr int SLAB_ROWS = 64, SLABS = BR / SLAB_ROWS, SLAB_BYTES = BT * SLAB_ROWS * 2;
+constexpr int OUT_BYTES = SLABS * SLAB_BYTES;
+constexpr int FETCH_STAGES = 6;                         // stages before the K loop's end an Add asks for its residual lines
+static_assert(OUT_BYTES <= W_BYTES && WROW == SLAB_ROWS && MR == 8, "a warp's rows are one slab, its fragments the slab's 16-byte pieces");
+// the stages, the barriers (full and empty per stage, the output tile's two), the tile's token scales
+constexpr int SMEM = ACT_BYTES + W_BYTES + (2 * ST + 2) * 8 + BT * 4;
 constexpr int MAX_SEG = 3;
 
 void ck(const char* what) {
@@ -61,6 +74,7 @@ struct Seg {
 
 struct Args {
     TmaDesc tm[1 + MAX_SEG];   // activations, then each segment's weights
+    TmaDesc tm_out[MAX_SEG];   // each segment's BF16 output rows
     Seg seg[MAX_SEG];
     const float* a_scale;
     int nseg, ntok, tok_tiles, k_tiles, epi;
@@ -99,6 +113,20 @@ __device__ __forceinline__ void tma2d(void* dst, const TmaDesc* map, int k, int 
     asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
                  ::"r"(su(dst)), "l"(map), "r"(k), "r"(row), "r"(su(bar)) : "memory");
 }
+// The tile at `src` out to the map at (c0, c1); stores_read waits until every store issued has read its tile (the block
+// may then end, or reuse the memory).
+__device__ __forceinline__ void tma_store2d(const TmaDesc* map, int c0, int c1, const void* src) {
+    asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];" ::"l"(map), "r"(c0), "r"(c1), "r"(su(src))
+                 : "memory");
+}
+__device__ __forceinline__ void stores_read() {
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+}
+// 16 bytes to shared memory, the first `n` of them from src and zeros after
+__device__ __forceinline__ void cp16z(void* dst, const void* src, int n) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(su(dst)), "l"(src), "r"(n) : "memory");
+}
 // byte offset of (row, logical byte) in a 128-byte-row tile the TMA wrote with the 128-byte swizzle
 __device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^ ((row & 7) << 4)); }
 
@@ -110,6 +138,9 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
     unsigned char* wt = raw + ACT_BYTES;
     unsigned long long* full = reinterpret_cast<unsigned long long*>(raw + ACT_BYTES + W_BYTES);
     unsigned long long* empty = full + ST;
+    unsigned long long* tile_in = empty + ST;     // BF16: the output tile is the consumers' (an Add's residual is in it)
+    unsigned long long* tile_out = tile_in + 1;   // BF16: every consumer warp has written its part of the tile
+    float* scale_s = reinterpret_cast<float*>(tile_out + 1);   // BF16: the tile's token scales (zero past the call's tokens)
     // the grid: weight row tiles of every segment, the token tiles fastest (a weight tile serves them back to back)
     // (worked out where used, so the consumers carry nothing extra through the K loop: 9 warps leave 168 registers)
     const auto tile = [&](int& si, int& row0, int& tok0) {
@@ -126,20 +157,70 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
             mb_init(full + s, 1);
             mb_init(empty + s, WT * WR);
         }
+        mb_init(tile_in, 1);
+        mb_init(tile_out, WT * WR);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
     if (threadIdx.x < 32) {
-        if (threadIdx.x == 0) {
-            int si, row0, tok0;
-            tile(si, row0, tok0);
-            const TmaDesc* tw = &p.tm[1 + si];
-            for (int kt = 0; kt < p.k_tiles; ++kt) {
-                const int st = kt % ST;
-                mb_wait(empty + st, 1u ^ ((kt / ST) & 1u));
+        // the producer warp: every lane keeps the ring's pace (so the lanes can each do a share of the copies and
+        // prefetches below), the first lane issues the tensor copies
+        const bool lead = threadIdx.x == 0;
+        int si, row0, tok0;
+        tile(si, row0, tok0);
+        const TmaDesc* tw = &p.tm[1 + si];
+        const auto issue = [&](int kt) {
+            const int st = kt % ST;
+            mb_wait(empty + st, 1u ^ ((kt / ST) & 1u));
+            if (lead) {
                 mb_expect(full + st, (BT + BR) * BK);   // a box past the tensor still counts whole (zero filled)
                 tma2d(act + st * BT * BK, &p.tm[0], kt * BK, tok0, full + st);
                 tma2d(wt + st * BR * BK, tw, kt * BK, row0, full + st);
+            }
+        };
+        const int first = min(ST, p.k_tiles);   // the ring's first fill waits for no stage
+        for (int kt = 0; kt < first; ++kt) issue(kt);
+        if constexpr (BF16) {   // the tile's token scales, a 16-byte piece a lane, while the first stages come in
+            const int t = tok0 + (int) threadIdx.x * 4;
+            cp16z(scale_s + threadIdx.x * 4, p.a_scale + t, min(max(p.ntok - t, 0), 4) * 4);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+        }
+        const bool add = BF16 && p.epi == (int) Epilogue::AddBf16;
+        const int fetch_at = max(first, p.k_tiles - FETCH_STAGES);
+        for (int kt = first; kt < p.k_tiles; ++kt) {
+            issue(kt);
+            if constexpr (BF16) {
+                if (add && kt == fetch_at) {   // the residual tile's lines (4 tokens x 4 lines a lane) toward the last level cache
+                    const Seg sg = p.seg[si];
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        const int tk = tok0 + (int) threadIdx.x * 4 + (i >> 2), r = row0 + (i & 3) * 64;
+                        if (tk < p.ntok && r < sg.rows)
+                            asm volatile("prefetch.global.L2 [%0];" ::"l"(static_cast<const __nv_bfloat16*>(sg.dst) + (int64_t) tk * sg.ld + r) : "memory");
+                    }
+                }
+            }
+        }
+        if constexpr (BF16) {
+            // the stages are the consumers' until every warp has left the last one; then the weight stages' memory is the
+            // output tile: an Add's residual comes in first, the consumers write it, and it goes out
+            for (int kt = p.k_tiles; kt < p.k_tiles + ST; ++kt) mb_wait(empty + kt % ST, 1u ^ ((kt / ST) & 1u));
+            if (lead) {
+                if (add) {
+                    mb_expect(tile_in, OUT_BYTES);
+#pragma unroll
+                    for (int s = 0; s < SLABS; ++s) tma2d(wt + s * SLAB_BYTES, &p.tm_out[si], row0 + s * SLAB_ROWS, tok0, tile_in);
+                } else {
+                    mb_arrive(tile_in);
+                }
+            }
+            mb_wait(tile_out, 0);
+            if (lead) {
+#pragma unroll
+                for (int s = 0; s < SLABS; ++s)
+                    if (row0 + s * SLAB_ROWS < p.seg[si].rows) tma_store2d(&p.tm_out[si], row0 + s * SLAB_ROWS, tok0, wt + s * SLAB_BYTES);
+                stores_read();
             }
         }
         return;
@@ -190,43 +271,67 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
     const Seg sg = p.seg[si];
     const float ws = sg.scale ? *sg.scale : 1.0f;
     const bool add = p.epi == (int) Epilogue::Add || p.epi == (int) Epilogue::AddBf16;
-    // a token row at a time: with Add, its residual pairs are all loaded before any is written back (the loads overlap),
-    // and only one row's worth is live beside the accumulators (no spills at 168 registers)
+    if constexpr (BF16) {
+        // Into the block's tile: a token row at a time, its pairs read (Add) before any is written.  Rows and tokens past
+        // the output are written too: the store leaves them out, and the residual load gave them zeros.
+        mb_wait(tile_in, 0);
 #pragma unroll
-    for (int mt = 0; mt < MT; ++mt)
+        for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int tk = tok0 + wtk * WTOK + mt * 16 + (lane >> 2) + h * 8;
-            if (tk >= p.ntok) continue;
-            const float as = __ldg(p.a_scale + tk);
-            float* orow = static_cast<float*>(sg.dst) + (int64_t) tk * sg.ld;
-            __nv_bfloat16* hrow = static_cast<__nv_bfloat16*>(sg.dst) + (int64_t) tk * sg.ld;
-            float2 res[MR];
+            for (int h = 0; h < 2; ++h) {
+                const int tl = wtk * WTOK + mt * 16 + (lane >> 2) + h * 8;
+                const float as = scale_s[tl];
+                // the thread's pair of fragment mr: the slab's token row tl, 16-byte piece mr (swizzled by the token)
+                unsigned char* pr = wt + wrw * SLAB_BYTES + tl * 128 + (lane & 3) * 4;
+                float2 res[MR];
 #pragma unroll
-            for (int mr = 0; mr < MR; ++mr) {
-                const int r = row0 + wrw * WROW + mr * 8 + 2 * (lane & 3);
-                res[mr] = make_float2(0.0f, 0.0f);
-                if (add && r < sg.rows) {
-                    if constexpr (BF16) {
-                        const unsigned u = __ldcg(reinterpret_cast<const unsigned*>(hrow + r));
-                        res[mr] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u));
-                    } else {
-                        res[mr] = __ldcg(reinterpret_cast<const float2*>(orow + r));
-                    }
+                for (int mr = 0; mr < MR; ++mr) {
+                    res[mr] = make_float2(0.0f, 0.0f);
+                    if (add) res[mr] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pr + ((mr ^ (tl & 7)) << 4)));
+                }
+#pragma unroll
+                for (int mr = 0; mr < MR; ++mr) {
+                    // rounded products, then the add: no contraction into an fma, so the bits do not depend on the instance
+                    float2 v = make_float2(__fmul_rn(__fmul_rn(acc[mt][mr][2 * h], as), ws),
+                                           __fmul_rn(__fmul_rn(acc[mt][mr][2 * h + 1], as), ws));
+                    if (add) v = make_float2(__fadd_rn(res[mr].x, v.x), __fadd_rn(res[mr].y, v.y));
+                    *reinterpret_cast<__nv_bfloat162*>(pr + ((mr ^ (tl & 7)) << 4)) = __floats2bfloat162_rn(v.x, v.y);
                 }
             }
+        // the tile's writes (generic proxy) are ordered before the store's async-proxy read
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        __syncwarp();
+        if (lane == 0) mb_arrive(tile_out);
+    } else {
+        // a token row at a time: with Add, its residual pairs are all loaded before any is written back (the loads overlap),
+        // and only one row's worth is live beside the accumulators (no spills at 168 registers)
 #pragma unroll
-            for (int mr = 0; mr < MR; ++mr) {
-                const int r = row0 + wrw * WROW + mr * 8 + 2 * (lane & 3);
-                if (r >= sg.rows) continue;
-                // rounded products, then the add: no contraction into an fma, so the bits do not depend on the instance
-                float2 v = make_float2(__fmul_rn(__fmul_rn(acc[mt][mr][2 * h], as), ws),
-                                       __fmul_rn(__fmul_rn(acc[mt][mr][2 * h + 1], as), ws));
-                if (add) v = make_float2(__fadd_rn(res[mr].x, v.x), __fadd_rn(res[mr].y, v.y));
-                if constexpr (BF16) *reinterpret_cast<__nv_bfloat162*>(hrow + r) = __floats2bfloat162_rn(v.x, v.y);
-                else *reinterpret_cast<float2*>(orow + r) = v;
+        for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int tk = tok0 + wtk * WTOK + mt * 16 + (lane >> 2) + h * 8;
+                if (tk >= p.ntok) continue;
+                const float as = __ldg(p.a_scale + tk);
+                float* orow = static_cast<float*>(sg.dst) + (int64_t) tk * sg.ld;
+                float2 res[MR];
+#pragma unroll
+                for (int mr = 0; mr < MR; ++mr) {
+                    const int r = row0 + wrw * WROW + mr * 8 + 2 * (lane & 3);
+                    res[mr] = make_float2(0.0f, 0.0f);
+                    if (add && r < sg.rows) res[mr] = __ldcg(reinterpret_cast<const float2*>(orow + r));
+                }
+#pragma unroll
+                for (int mr = 0; mr < MR; ++mr) {
+                    const int r = row0 + wrw * WROW + mr * 8 + 2 * (lane & 3);
+                    if (r >= sg.rows) continue;
+                    // rounded products, then the add: no contraction into an fma, so the bits do not depend on the instance
+                    float2 v = make_float2(__fmul_rn(__fmul_rn(acc[mt][mr][2 * h], as), ws),
+                                           __fmul_rn(__fmul_rn(acc[mt][mr][2 * h + 1], as), ws));
+                    if (add) v = make_float2(__fadd_rn(res[mr].x, v.x), __fadd_rn(res[mr].y, v.y));
+                    *reinterpret_cast<float2*>(orow + r) = v;
+                }
             }
-        }
+    }
 }
 
 size_t scale_off(int64_t rows, int64_t cols) { return ((size_t) rows * (size_t) cols + 15) & ~(size_t) 15; }
@@ -382,6 +487,20 @@ void tmap(TmaDesc* out, const void* base, int64_t rows, int64_t cols, int box_ro
     }
     std::memcpy(out, &m, sizeof m);
 }
+
+// BF16 output rows [tokens][ld] of `rows` values as a 128-byte-swizzled map with boxes of one slab of a block's tile.
+void tmap_out(TmaDesc* out, void* dst, int64_t rows, int64_t tokens, int64_t ld) {
+    const EncodeFn f = encode_fn();
+    CUtensorMap m{};
+    const cuuint64_t dim[2] = {(cuuint64_t) rows, (cuuint64_t) tokens}, str[1] = {(cuuint64_t) ld * 2};
+    const cuuint32_t box[2] = {(cuuint32_t) SLAB_ROWS, (cuuint32_t) BT}, es[2] = {1, 1};
+    if (f == nullptr || f(&m, CU_TENSOR_MAP_DATA_TYPE_UINT16, 2, dst, dim, str, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                          CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS) {
+        basalt::log::error("basalt", "prefill fp8: tensor map for [%lld x %lld] output rows", (long long) tokens, (long long) rows);
+        std::exit(1);
+    }
+    std::memcpy(out, &m, sizeof m);
+}
 }  // namespace
 
 void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* act, int64_t rows, Epilogue epi, void* stream) {
@@ -405,12 +524,15 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
     int tiles = 0;
     for (int i = 0; i < nseg; ++i) {
         const Segment& s = seg[i];
-        if (s.rows <= 0 || s.rows % 128 != 0 || ((uintptr_t) s.w & 15) != 0 || ((uintptr_t) s.dst & (bf16 ? 3 : 7)) != 0 || s.ld_dst % 2 != 0) {
+        // BF16 rows are written by tensor stores: 16-byte aligned, a multiple of 16 bytes apart
+        if (s.rows <= 0 || s.rows % 128 != 0 || ((uintptr_t) s.w & 15) != 0 || ((uintptr_t) s.dst & (bf16 ? 15 : 7)) != 0 ||
+            s.ld_dst % (bf16 ? 8 : 2) != 0 || s.ld_dst < s.rows) {
             basalt::log::error("basalt", "prefill fp8: segment %d: [%lld x %lld] matrix, ld %lld", i, (long long) s.rows,
                                (long long) w_cols, (long long) s.ld_dst);
             std::exit(1);
         }
         tmap(&p.tm[1 + i], s.w, s.rows, w_cols, BR);
+        if (bf16) tmap_out(&p.tm_out[i], s.dst, s.rows, rows, s.ld_dst);
         p.seg[i] = {s.w_scale, s.dst, s.ld_dst, (int) s.rows, tiles};
         tiles += (int) ((s.rows + BR - 1) / BR);
     }

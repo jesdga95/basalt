@@ -28,7 +28,8 @@ enum class Epilogue { Store, Add, StoreBf16, AddBf16 };
 /// dst[t * ld_dst + r] (=, or += with Add) = w_scale * a_scale[t] * sum_k W[r][k] A[t][k] for t < rows, r < w_rows:
 /// W [w_rows][w_cols] E4M3 codes (row-major, 16-byte aligned rows: w_cols a multiple of 64), `act` from quantize with
 /// the same cols, `w_scale` a device fp32 scalar (or null for 1).  Row tiles past w_rows and token tiles past rows are
-/// masked; w_rows a multiple of 128; dst 4-byte aligned and ld_dst even.  A row's bits do not depend on `rows`.
+/// masked; w_rows a multiple of 128 and ld_dst >= w_rows.  An FP32 dst is 8-byte aligned with ld_dst even; a BF16 dst is
+/// 16-byte aligned with ld_dst a multiple of 8 (its rows go out by tensor stores).  A row's bits do not depend on `rows`.
 void gemm(const uint8_t* w, int64_t w_rows, int64_t w_cols, const float* w_scale, const void* act, int64_t rows, void* dst,
           int64_t ld_dst, Epilogue epi, void* stream);
 

@@ -4,7 +4,16 @@
 // eight consumer warps (setmaxnreg), the block-scaled m16n8k64 MMA, 128 weight rows x 256 tokens x K 128 per stage,
 // token tiles walking fastest so the CTAs that run together share a weight tile.
 // Adapted from Infernix (Ian Ranson and contributors), Apache-2.0: see THIRD_PARTY_LICENSES.
+//
+// BF16 outputs (SwiGLU's H, the down product's residual add) leave through shared memory: once the K loop is over, the
+// code stages' memory is the block's output tile, slabs of 64 rows x 256 tokens in the 128-byte swizzle (the eight
+// tokens a warp instruction touches fall in different banks).  An Add's residual slabs come in by TMA (their lines
+// asked for a few stages before the K loop ends), the consumers write their rounded values into the tile and TMA
+// stores write it out, so no thread waits on a load or a store of its own; the tile's token scales are copied into
+// shared memory at the block's start for the same reason.  FP32 outputs go straight from the accumulators.
 #include "basalt/prefill/fp4_dense.hpp"
+
+#include "basalt/kernels/silu.cuh"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -74,6 +83,24 @@ __device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap* map, i
                  : "memory");
 }
 
+// The tile at `src` out to the map at (c0, c1); stores_read waits until every store issued has read its tile (the block
+// may then end).
+__device__ __forceinline__ void tma_store_2d(const CUtensorMap* map, int c0, int c1, const void* src) {
+    asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                 :
+                 : "l"(map), "r"(c0), "r"(c1), "r"(smem_addr(src))
+                 : "memory");
+}
+__device__ __forceinline__ void stores_read() {
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+}
+
+// 16 bytes to shared memory, the first `n` of them from src and zeros after
+__device__ __forceinline__ void cp16z(void* dst, const void* src, int n) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(smem_addr(dst)), "l"(src), "r"(n) : "memory");
+}
+
 __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
@@ -105,6 +132,7 @@ static_assert(alignof(CUtensorMap) >= 64, "CUtensorMap lost its alignas: the bui
 
 struct Params {
     TmaDesc a_codes, a_scales, b_codes[2], b_scales[2];
+    TmaDesc out;          // the BF16 output rows (SwiGLU's H, the BF16 add's residual)
     const float* gs;
     const float* ws[2];   // the matrix scales (SwiGLU: gate, up)
     float* dst;           // the plain product's output (FP32)
@@ -122,9 +150,19 @@ struct alignas(128) Shared {
     alignas(16) uint8_t b_scales[kStages][2][kBR * kK64 * 4];
     alignas(8) uint64_t full[kStages];
     alignas(8) uint64_t empty[kStages];
+    alignas(8) uint64_t tile_in;    // a BF16 output: the tile is the consumers' (an Add's residual is in it)
+    alignas(8) uint64_t tile_out;   // a BF16 output: every consumer warp has written its part of the tile
+    alignas(16) float gs[kBT];      // a BF16 output: the tile's token scales (zero past the call's tokens)
 };
 constexpr int kSmem = (int) sizeof(Shared);
 static_assert(kSmem <= 99 * 1024, "one block's shared memory");
+// A block's BF16 output tile takes the code stages' memory once the K loop is over: slabs of kSlabRows rows (128 bytes
+// a token).
+constexpr int kSlabRows = 64, kSlabBytes = kBT * kSlabRows * 2;
+constexpr int kFetchStages = 12;   // stages before the K loop's end an Add asks for its residual lines
+static_assert(offsetof(Shared, a_codes) == 0 && offsetof(Shared, b_codes) == sizeof(Shared::a_codes), "the code stages are one run");
+static_assert(kBT * kBR * 2 <= (int) (sizeof(Shared::a_codes) + sizeof(Shared::b_codes)), "the output tile fits the code stages");
+static_assert(kWarpRows == kSlabRows && kMmaRows == 8, "a warp's rows are one slab, its fragments the slab's 16-byte pieces");
 
 template <int N, class F> __device__ __forceinline__ void with_live(int live, F&& f) {
     if (live >= N) f(std::integral_constant<int, N>{});
@@ -146,6 +184,12 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
                                          reinterpret_cast<const CUtensorMap*>(&p.b_codes[1])};
     const CUtensorMap* b_scales_map[2] = {reinterpret_cast<const CUtensorMap*>(&p.b_scales[0]),
                                           reinterpret_cast<const CUtensorMap*>(&p.b_scales[1])};
+    // BF16 outputs go through the block's tile: `rows_out` rows of 256 tokens, in slabs
+    constexpr bool staged = SWIGLU || (ADD && BF);
+    constexpr int rows_out = SWIGLU ? kBR / 2 : kBR;
+    constexpr int slabs = rows_out / kSlabRows;
+    const CUtensorMap* out_map = reinterpret_cast<const CUtensorMap*>(&p.out);
+    unsigned char* tile = shared_bytes;
 
     // token tiles fastest: the CTAs that run together share one weight tile, so the matrix is read about once
     const int tok_tile = (int) blockIdx.x % p.tok_tiles;
@@ -160,17 +204,22 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
             mbar_init(&sh.full[s], 1);
             mbar_init(&sh.empty[s], kConsumerWarps);
         }
+        mbar_init(&sh.tile_in, 1);
+        mbar_init(&sh.tile_out, kConsumerWarps);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
 
     if (threadIdx.x < kProducerThreads) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" ::: "memory");
-        if (threadIdx.x == 0) {
-#pragma unroll 1
-            for (int kt = 0; kt < ktiles; ++kt) {
-                const int stage = kt % kStages;
-                mbar_wait(&sh.empty[stage], 1u ^ ((kt / kStages) & 1u));
+        if (threadIdx.x >= 32) return;
+        // the producer warp: every lane keeps the ring's pace (so the lanes can each do a share of the copies and
+        // prefetches below), the first lane issues the tensor copies
+        const bool lead = threadIdx.x == 0;
+        const auto issue = [&](int kt) {
+            const int stage = kt % kStages;
+            mbar_wait(&sh.empty[stage], 1u ^ ((kt / kStages) & 1u));
+            if (lead) {
                 constexpr uint32_t kScaleBytes = kScaleTileBytes;
                 constexpr uint32_t kTx = kBT * 64 + kBR * 64 + kScaleBytes + branches * kBR * kK64 * 4;
                 // a scale tile covers two K stages: fetched on the even one, the odd one expects that many bytes fewer
@@ -190,6 +239,55 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
                     const int scale_row = ((row_begin / 128) * (K / 64) + kt * kK64) * 32;
                     tma_load_2d(sh.b_scales[stage][b], b_scales_map[b], 0, scale_row, &sh.full[stage]);
                 }
+            }
+        };
+        const int first = min(kStages, ktiles);   // the ring's first fill waits for no stage
+#pragma unroll 1
+        for (int kt = 0; kt < first; ++kt) issue(kt);
+        if constexpr (staged) {   // the tile's token scales, two 16-byte pieces a lane, while the first stages come in
+#pragma unroll
+            for (int i = 0; i < kBT / 4 / 32; ++i) {
+                const int c = (int) threadIdx.x + i * 32;
+                const int t = token_begin + c * 4;
+                cp16z(sh.gs + c * 4, p.gs + t, min(max(p.tokens - t, 0), 4) * 4);
+            }
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+        }
+        const int fetch_at = max(first, ktiles - kFetchStages);
+#pragma unroll 1
+        for (int kt = first; kt < ktiles; ++kt) {
+            issue(kt);
+            if constexpr (ADD && BF) {
+                if (kt == fetch_at) {   // the residual tile's lines (8 tokens x 2 lines a lane) toward the last level cache
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        const int t = token_begin + (int) threadIdx.x * 8 + (i >> 1);
+                        if (t < p.tokens)
+                            asm volatile("prefetch.global.L2 [%0];" ::"l"(reinterpret_cast<const __nv_bfloat16*>(p.dst) + (int64_t) t * p.ld + row_begin + (i & 1) * 64) : "memory");
+                    }
+                }
+            }
+        }
+        if constexpr (staged) {
+            // the stages are the consumers' until every warp has left the last one; then the code stages' memory is the
+            // output tile: an Add's residual comes in first, the consumers write it, and it goes out
+            for (int kt = ktiles; kt < ktiles + kStages; ++kt) mbar_wait(&sh.empty[kt % kStages], 1u ^ ((kt / kStages) & 1u));
+            if (lead) {
+                if constexpr (ADD) {
+                    mbar_expect_tx(&sh.tile_in, slabs * kSlabBytes);
+#pragma unroll
+                    for (int s = 0; s < slabs; ++s)
+                        tma_load_2d(tile + s * kSlabBytes, out_map, row_begin + s * kSlabRows, token_begin, &sh.tile_in);
+                } else {
+                    mbar_arrive(&sh.tile_in);
+                }
+            }
+            mbar_wait(&sh.tile_out, 0);
+            if (lead) {
+#pragma unroll
+                for (int s = 0; s < slabs; ++s) tma_store_2d(out_map, row_begin + s * kSlabRows, token_begin, tile + s * kSlabBytes);
+                stores_read();
             }
         }
         return;
@@ -266,6 +364,8 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
             __syncwarp();
             if (lane == 0) mbar_arrive(&sh.empty[stage]);
         }
+        if constexpr (staged)
+            if (lane == 0) mbar_arrive(&sh.tile_out);   // it writes nothing into the tile
         return;
     }
 
@@ -274,65 +374,94 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
     // add after it a separate rounded add, so a column's bits do not depend on whether its tile is full.
     const float s0 = *p.ws[0];
     const float s1 = SWIGLU ? *p.ws[1] : 0.0f;
+    if constexpr (staged) {
+        // Into the block's tile, a token row at a time.  A token past the call has a zero scale: its rows are written
+        // too (the store leaves them out), so the loops have no branch and the rows' arithmetic runs side by side.
+        mbar_wait(&sh.tile_in, 0);
+        [[maybe_unused]] float amax[kMmaTokens][2];   // SwiGLU: each of the thread's tokens' largest |value|
 #pragma unroll
-    for (int mm = 0; mm < kMmaTokens; ++mm)
+        for (int mm = 0; mm < kMmaTokens; ++mm)
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int t = token_begin + warp_m * kWarpTokens + mm * 16 + (lane >> 2) + 8 * h;
-            if (t >= p.tokens) continue;
-            const float g = p.gs[t];
-            if constexpr (SWIGLU) {
-                __nv_bfloat16* hout = p.hdst + (int64_t) t * p.ld;
-                const float ag = __fmul_rn(g, s0), au = __fmul_rn(g, s1);
-                const int r0 = row_begin + warp_n * 32 + 2 * (lane & 3);
-                float m = 0.0f;
+            for (int h = 0; h < 2; ++h) {
+                const int tl = warp_m * kWarpTokens + mm * 16 + (lane >> 2) + 8 * h;
+                const float g = sh.gs[tl];
+                if constexpr (SWIGLU) {
+                    // the thread's pair of output fragment f: token row tl, 16-byte piece 4 warp_n + f (swizzled by the token)
+                    unsigned char* pr = tile + tl * 128 + (lane & 3) * 4;
+                    const float ag = __fmul_rn(g, s0), au = __fmul_rn(g, s1);
+                    float m = 0.0f;
 #pragma unroll
-                for (int f = 0; f < 4; ++f) {
-                    float v[2];
+                    for (int f = 0; f < 4; ++f) {
+                        float v[2];
 #pragma unroll
-                    for (int e = 0; e < 2; ++e) {
-                        const float gg = __fmul_rn(acc[mm][f][2 * h + e], ag);
-                        const float uu = __fmul_rn(acc[mm][f + 4][2 * h + e], au);
-                        v[e] = gg / (1.0f + __expf(-gg)) * uu;
+                        for (int e = 0; e < 2; ++e) {
+                            const float gg = __fmul_rn(acc[mm][f][2 * h + e], ag);
+                            const float uu = __fmul_rn(acc[mm][f + 4][2 * h + e], au);
+                            v[e] = __fmul_rn(kernels::silu_quotient(gg), uu);
+                        }
+                        const __nv_bfloat162 hv = __floats2bfloat162_rn(v[0], v[1]);   // the amax is of the stored values
+                        m = fmaxf(m, fmaxf(fabsf(__low2float(hv)), fabsf(__high2float(hv))));
+                        *reinterpret_cast<__nv_bfloat162*>(pr + (((warp_n * 4 + f) ^ (tl & 7)) << 4)) = hv;
                     }
-                    const __nv_bfloat162 hv = __floats2bfloat162_rn(v[0], v[1]);   // the amax is of the stored values
-                    m = fmaxf(m, fmaxf(fabsf(__low2float(hv)), fabsf(__high2float(hv))));
-                    *reinterpret_cast<__nv_bfloat162*>(hout + r0 + 8 * f) = hv;
+                    amax[mm][h] = m;
+                } else {
+                    // the thread's pair of fragment f: the warp's slab, token row tl, 16-byte piece f (swizzled by the token)
+                    unsigned char* pr = tile + warp_n * kSlabBytes + tl * 128 + (lane & 3) * 4;
+                    const float alpha = __fmul_rn(g, s0);
+                    float2 res[kMmaRows];   // every residual pair read before any is written back
+#pragma unroll
+                    for (int f = 0; f < kMmaRows; ++f)
+                        res[f] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pr + ((f ^ (tl & 7)) << 4)));
+#pragma unroll
+                    for (int f = 0; f < kMmaRows; ++f) {
+                        float2 v = make_float2(__fmul_rn(acc[mm][f][2 * h], alpha), __fmul_rn(acc[mm][f][2 * h + 1], alpha));
+                        v = make_float2(__fadd_rn(res[f].x, v.x), __fadd_rn(res[f].y, v.y));
+                        *reinterpret_cast<__nv_bfloat162*>(pr + ((f ^ (tl & 7)) << 4)) = __floats2bfloat162_rn(v.x, v.y);
+                    }
                 }
-                if (p.amax) {   // the token's largest |value|: the four lanes of the token, then one atomic (max is exact)
-                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
-                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
-                    if ((lane & 3) == 0) atomicMax(reinterpret_cast<int*>(p.amax + t), __float_as_int(m));
-                }
-            } else {
+            }
+        // the tile's writes (generic proxy) are ordered before the store's async-proxy read
+        fence_reads_before_refill();
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&sh.tile_out);
+        if constexpr (SWIGLU) {
+            if (p.amax) {   // each token's largest |value|: the four lanes of the token, then one atomic (max is exact)
+#pragma unroll
+                for (int mm = 0; mm < kMmaTokens; ++mm)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int t = token_begin + warp_m * kWarpTokens + mm * 16 + (lane >> 2) + 8 * h;
+                        float m = amax[mm][h];
+                        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+                        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+                        if ((lane & 3) == 0 && t < p.tokens) atomicMax(reinterpret_cast<int*>(p.amax + t), __float_as_int(m));
+                    }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int mm = 0; mm < kMmaTokens; ++mm)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int t = token_begin + warp_m * kWarpTokens + mm * 16 + (lane >> 2) + 8 * h;
+                if (t >= p.tokens) continue;
+                const float g = p.gs[t];
                 float* out = p.dst + (int64_t) t * p.ld;
-                __nv_bfloat16* hout = reinterpret_cast<__nv_bfloat16*>(p.dst) + (int64_t) t * p.ld;
                 const float alpha = __fmul_rn(g, s0);
                 const int r0 = row_begin + warp_n * kWarpRows + 2 * (lane & 3);
                 float2 res[kMmaRows];   // ADD: every residual pair loaded before any is written back
                 if constexpr (ADD) {
 #pragma unroll
-                    for (int f = 0; f < kMmaRows; ++f) {
-                        if constexpr (BF) {
-                            const unsigned u = __ldcg(reinterpret_cast<const unsigned*>(hout + r0 + 8 * f));
-                            res[f] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u));
-                        } else {
-                            res[f] = __ldcg(reinterpret_cast<const float2*>(out + r0 + 8 * f));
-                        }
-                    }
+                    for (int f = 0; f < kMmaRows; ++f) res[f] = __ldcg(reinterpret_cast<const float2*>(out + r0 + 8 * f));
                 }
 #pragma unroll
                 for (int f = 0; f < kMmaRows; ++f) {
                     float2 v = make_float2(__fmul_rn(acc[mm][f][2 * h], alpha), __fmul_rn(acc[mm][f][2 * h + 1], alpha));
                     if constexpr (ADD) v = make_float2(__fadd_rn(res[f].x, v.x), __fadd_rn(res[f].y, v.y));
-                    if constexpr (BF) {
-                        *reinterpret_cast<__nv_bfloat162*>(hout + r0 + 8 * f) = __floats2bfloat162_rn(v.x, v.y);
-                    } else {
-                        *reinterpret_cast<float2*>(out + r0 + 8 * f) = v;
-                    }
+                    *reinterpret_cast<float2*>(out + r0 + 8 * f) = v;
                 }
             }
-        }
+    }
 }
 
 // One warp per token row (and per padding row of the last scale tile).  Token scale g = amax / (6 * 448); per 16 values
@@ -456,7 +585,8 @@ EncodeFn encode_fn() {
 
 // A byte matrix [rows][cols] (row stride `stride` bytes), box [box_r][box_c], into a kernel argument.
 TmaDesc map_2d(const void* base, uint64_t cols, uint64_t rows, uint64_t stride, uint32_t box_c, uint32_t box_r,
-               CUtensorMapSwizzle swizzle, CUtensorMapL2promotion promo, const char* what) {
+               CUtensorMapSwizzle swizzle, CUtensorMapL2promotion promo, const char* what,
+               CUtensorMapDataType type = CU_TENSOR_MAP_DATA_TYPE_UINT8) {
     const EncodeFn f = encode_fn();
     if (f == nullptr) {
         basalt::log::error("basalt", "fp4 dense: cuTensorMapEncodeTiled is unavailable");
@@ -465,7 +595,7 @@ TmaDesc map_2d(const void* base, uint64_t cols, uint64_t rows, uint64_t stride, 
     CUtensorMap m;
     const cuuint64_t dim[2] = {cols, rows}, str[1] = {stride};
     const cuuint32_t box[2] = {box_c, box_r}, es[2] = {1, 1};
-    if (f(&m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(base), dim, str, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
+    if (f(&m, type, 2, const_cast<void*>(base), dim, str, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
           swizzle, promo, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS) {
         basalt::log::error("basalt", "fp4 dense: tensor map of %s failed", what);
         std::exit(1);
@@ -500,6 +630,11 @@ template <bool SWIGLU, bool ADD, bool BF = false> void launch(Params p, const vo
         p.b_scales[b] = map_2d(wb + rows * K / 2, 16, (uint64_t) rows * K / 256, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE,
                                CU_TENSOR_MAP_L2_PROMOTION_NONE, "weight scales");
     }
+    if constexpr (SWIGLU || (ADD && BF)) {   // the BF16 rows a block's tile is stored to (and, for the add, loaded from)
+        const void* out = SWIGLU ? (const void*) p.hdst : (const void*) p.dst;
+        p.out = map_2d(out, (uint64_t) rows, (uint64_t) tokens, (uint64_t) p.ld * 2, kSlabRows, kBT, CU_TENSOR_MAP_SWIZZLE_128B,
+                       CU_TENSOR_MAP_L2_PROMOTION_NONE, "output rows", CU_TENSOR_MAP_DATA_TYPE_UINT16);
+    }
     p.K = (int) K;
     p.tokens = (int) tokens;
     p.tok_tiles = (int) ((tokens + kBT - 1) / kBT);
@@ -508,11 +643,12 @@ template <bool SWIGLU, bool ADD, bool BF = false> void launch(Params p, const vo
     ck(cudaGetLastError(), "product");
 }
 
+// `bf16`: the output rows are BF16, written by tensor stores (16-byte aligned, a multiple of 16 bytes apart).
 void check(const void* a, const void* b, int64_t rows, int64_t K, int64_t tokens, const void* act, const void* dst, int64_t ld,
-           const char* what) {
+           const char* what, bool bf16 = false, const float* gs = nullptr) {
     const auto al = [](const void* v, size_t n) { return (reinterpret_cast<uintptr_t>(v) & (n - 1)) == 0; };
-    if (rows <= 0 || rows % 128 || K <= 0 || K % 256 || tokens <= 0 || ld < rows || (ld & 1) || !al(a, 16) || !al(b, 16) ||
-        !al(act, 16) || !al(dst, 8)) {
+    if (rows <= 0 || rows % 128 || K <= 0 || K % 256 || tokens <= 0 || ld < rows || (ld & (bf16 ? 7 : 1)) || !al(a, 16) || !al(b, 16) ||
+        !al(act, 16) || !al(dst, bf16 ? 16 : 8) || (bf16 && !al(gs, 16))) {
         basalt::log::error("basalt", "fp4 dense: %s: rows %lld K %lld tokens %lld ld %lld", what, (long long) rows, (long long) K,
                            (long long) tokens, (long long) ld);
         std::exit(1);
@@ -581,7 +717,7 @@ void product(const void* w, const float* w_scale, int64_t rows, int64_t K, const
 
 void product_add_bf16(const void* w, const float* w_scale, int64_t rows, int64_t K, const void* act, const float* gs,
                       int64_t tokens, uint16_t* dst, int64_t ld, void* stream) {
-    check(w, w, rows, K, tokens, act, dst, ld, "product_add_bf16");
+    check(w, w, rows, K, tokens, act, dst, ld, "product_add_bf16", true, gs);
     Params p{};
     p.gs = gs;
     p.ws[0] = w_scale;
@@ -607,7 +743,7 @@ void rms_norm_quantize(const uint16_t* x, const float* w, float eps, int64_t row
 
 void swiglu(const void* w_gate, const void* w_up, const float* s_gate, const float* s_up, int64_t rows, int64_t K,
             const void* act, const float* gs, int64_t tokens, uint16_t* dst, int64_t ld, void* stream, float* amax) {
-    check(w_gate, w_up, rows, K, tokens, act, dst, ld, "swiglu");
+    check(w_gate, w_up, rows, K, tokens, act, dst, ld, "swiglu", true, gs);
     Params p{};
     p.amax = amax;
     if (amax && cudaMemsetAsync(amax, 0, (size_t) tokens * sizeof(float), (cudaStream_t) stream) != cudaSuccess)
