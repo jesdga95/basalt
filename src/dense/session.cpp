@@ -348,7 +348,7 @@ public:
     }
 
     size_t running_bytes() const override {
-        return (size_t) g_.gdn_layers() * st_.gdn_floats * 4 + 24 + (drafter_ ? (size_t) g_.n_embd * 4 : 0);
+        return (size_t) g_.gdn_layers() * st_.gdn_floats * 4 + 24 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) + block_ctx_bytes();
     }
 
     Result save_running(uint8_t* host, int64_t pos) override {
@@ -360,12 +360,13 @@ public:
         if (drafter_ && cudaMemcpy(host + n + sizeof tail, st_.tail, (size_t) g_.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
             return fail("saving the state failed");
         std::memcpy(host + n, tail, sizeof tail);
+        if (block_ && !block_ctx_copy(host + n + sizeof tail, pos, false)) return fail("saving the state failed");
         return {};
     }
 
     Result restore_running(const uint8_t* host, int64_t pos) override {
         pend_T_ = 0;
-        st_.dctx_from = pos;   // the block drafter's context below `pos` is not this conversation's
+        st_.dctx_from = pos;   // until its saved context is back, the block drafter's cells are another conversation's
         const size_t n = (size_t) g_.gdn_layers() * st_.gdn_floats * 4;
         if (n && cudaMemcpyAsync(st_.gdn, host, n, cudaMemcpyHostToDevice, st_.stream) != cudaSuccess) return fail("restoring the state failed");
         if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail("restoring the state failed");
@@ -375,7 +376,46 @@ public:
         st_.tail_cell = tail[2];
         if (drafter_ && cudaMemcpy(st_.tail, host + n + sizeof tail, (size_t) g_.n_embd * 4, cudaMemcpyHostToDevice) != cudaSuccess)
             return fail("restoring the state failed");
+        if (block_ && !block_ctx_copy(const_cast<uint8_t*>(host) + n + sizeof tail, pos, true)) return fail("restoring the state failed");
         return {};
+    }
+
+    // The block drafter's context in a running state: how many cells below the position hold it, then per layer its K and
+    // V for the window's cells below the position, oldest first (the cells under the count are not written).
+    size_t block_ctx_cells() const { return block_ ? (size_t) std::min<int64_t>(m_.w.dflash.window, st_.dctx_cap) : 0; }
+    size_t block_ctx_row() const { return (size_t) m_.w.dflash.n_kv * m_.w.dflash.head_dim * sizeof(uint16_t); }
+    size_t block_ctx_bytes() const {
+        return block_ ? sizeof(int64_t) + m_.w.dflash.layers.size() * 2 * block_ctx_cells() * block_ctx_row() : 0;
+    }
+    bool block_ctx_copy(uint8_t* host, int64_t pos, bool restore) {
+        const int64_t W = (int64_t) block_ctx_cells(), cap = st_.dctx_cap;
+        const size_t row = block_ctx_row();
+        int64_t valid = 0;
+        if (restore) {
+            std::memcpy(&valid, host, sizeof valid);
+            if (valid < 0 || valid > W || valid > pos) return false;
+            st_.dctx_from = pos - valid;
+        } else {
+            valid = std::clamp<int64_t>(pos - st_.dctx_from, 0, std::min<int64_t>(W, pos));
+            std::memcpy(host, &valid, sizeof valid);
+        }
+        uint8_t* at = host + sizeof(int64_t);
+        for (size_t l = 0; l < st_.dk.size(); ++l)
+            for (int kv = 0; kv < 2; ++kv) {
+                uint8_t* dev = (uint8_t*) (kv == 0 ? st_.dk[l] : st_.dv[l]);
+                uint8_t* layer = at + (size_t) (2 * l + kv) * W * row;
+                // cells pos - valid .. pos - 1 at their offset from the window's start, in up to two runs of the ring
+                for (int64_t c = pos - valid; c < pos;) {
+                    const int64_t slot = c % cap, run = std::min(pos - c, cap - slot);
+                    uint8_t* h = layer + (size_t) (c - (pos - W)) * row;
+                    uint8_t* d = dev + (size_t) slot * row;
+                    const cudaError_t e = restore ? cudaMemcpyAsync(d, h, (size_t) run * row, cudaMemcpyHostToDevice, st_.stream)
+                                                  : cudaMemcpyAsync(h, d, (size_t) run * row, cudaMemcpyDeviceToHost, st_.stream);
+                    if (e != cudaSuccess) return false;
+                    c += run;
+                }
+            }
+        return cudaStreamSynchronize(st_.stream) == cudaSuccess;
     }
 
     // a layer's cells: fp16 K and V (format 1), or int8 codes with fp16 scales per 64 values (format 2); the MTP

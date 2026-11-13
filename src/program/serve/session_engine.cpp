@@ -487,7 +487,11 @@ private:
     Flow slot_bind() override { rt_.set_active(slot_b); return Flow::proceed; }
     Flow restore_image() override {
         const int64_t positions = (int64_t) incoming->live.ids.size();
-        basalt::model::Result r = rt_.session().restore_cells(incoming->kv, positions);
+        // a conversation stored by a build whose running state had another layout is read again, not mounted
+        bool sized = incoming->live.state_a.size() == rt_.session().running_bytes();
+        for (const ConvCheckpoint& c : incoming->checkpoints) sized = sized && c.state_a.size() == rt_.session().running_bytes();
+        basalt::model::Result r = sized ? rt_.session().restore_cells(incoming->kv, positions)
+                                        : basalt::model::Result{basalt::model::Status::Error, "its running state has another size"};
         if (r.ok()) r = rt_.session().restore_running(incoming->live.state_a.data(), positions);
         if (r.ok()) r = rt_.session().set_history(incoming->live.ids.data(), positions);
         if (!r.ok()) {
