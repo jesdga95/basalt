@@ -19,13 +19,17 @@ float* act_scales(void* act, int64_t rows, int64_t cols);
 void quantize(const float* x, int64_t rows, int64_t cols, int64_t ld, void* act, void* stream);
 /// As quantize, of the RMSNorm'd rows x * rsqrt(mean(x^2) + eps) * w (rows `cols` apart); xn (optional) gets the normed rows.
 void rms_norm_quantize(const float* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* xn, void* stream);
+/// As rms_norm_quantize, of BF16 rows (the residual stream); xn (optional) gets the normed rows in BF16.
+void rms_norm_quantize(const uint16_t* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, uint16_t* xn,
+                       void* stream);
 
-enum class Epilogue { Store, Add };
+/// Store / Add: FP32 dst; StoreBf16 / AddBf16: BF16 dst (Add widens it, adds in fp32 and rounds once).
+enum class Epilogue { Store, Add, StoreBf16, AddBf16 };
 /// dst[t * ld_dst + r] (=, or += with Add) = w_scale * a_scale[t] * sum_k W[r][k] A[t][k] for t < rows, r < w_rows:
 /// W [w_rows][w_cols] E4M3 codes (row-major, 16-byte aligned rows: w_cols a multiple of 64), `act` from quantize with
 /// the same cols, `w_scale` a device fp32 scalar (or null for 1).  Row tiles past w_rows and token tiles past rows are
-/// masked; w_rows a multiple of 128; dst 8-byte aligned and ld_dst even.  A row's bits do not depend on `rows`.
-void gemm(const uint8_t* w, int64_t w_rows, int64_t w_cols, const float* w_scale, const void* act, int64_t rows, float* dst,
+/// masked; w_rows a multiple of 128; dst 4-byte aligned and ld_dst even.  A row's bits do not depend on `rows`.
+void gemm(const uint8_t* w, int64_t w_rows, int64_t w_cols, const float* w_scale, const void* act, int64_t rows, void* dst,
           int64_t ld_dst, Epilogue epi, void* stream);
 
 /// One weight matrix of a segmented product: the same contract as gemm's w, w_rows, w_scale, dst, ld_dst.
@@ -33,7 +37,7 @@ struct Segment {
     const uint8_t* w;
     int64_t rows;
     const float* w_scale;
-    float* dst;
+    void* dst;   // FP32 or BF16, as the epilogue says
     int64_t ld_dst;
 };
 /// One product over up to three weight matrices that share the activations (GDN qkv + z, attention q + k + v): every

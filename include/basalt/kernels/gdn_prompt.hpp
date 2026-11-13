@@ -18,6 +18,8 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
 /// The 4-tap causal conv + SiLU over the chunk (history [C][3] in, updated to the chunk's last three inputs).
 /// h: [T, C].
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, void* stream);
+/// As gdn_conv, of BF16 qkv rows into BF16 h (the history stays FP32).
+void gdn_conv(float* history, const uint16_t* qkv, const float* conv_w, uint16_t* h, int64_t T, void* stream);
 /// The bytes of scratch gdn_recurrence needs for T tokens.
 uint64_t gdn_work_bytes(int64_t T);
 /// The recurrence over the chunk: q/k L2-normalized (eps) and rounded to BF16, the state [key][value head][value]
@@ -27,5 +29,9 @@ uint64_t gdn_work_bytes(int64_t T);
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, void* work, float* y, uint16_t* y16, int64_t T, void* stream,
                     GdnGate act = GdnGate::Sigmoid, float* yn = nullptr, uint8_t* y8 = nullptr, float* y8_scale = nullptr);
+/// As gdn_recurrence, of BF16 h and z (the prompt chunk's activations), the closing norm straight to E4M3 (y8, y8_scale).
+void gdn_recurrence_bf16(float* state, const uint16_t* h, const float* gate, const float* beta, const uint16_t* z,
+                         const float* gamma, float eps, void* work, float* y, int64_t T, void* stream, GdnGate act,
+                         uint8_t* y8, float* y8_scale);
 
 }  // namespace basalt::kernels

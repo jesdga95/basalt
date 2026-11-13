@@ -45,7 +45,9 @@ What the dense stack computes in, where it rounds, and what that costs against t
   decode (the prompt path vs the same prompt one token at a time, int8 KV, natural text): KL 0.019 at 16,023 tokens and
   0.006 at 64,023 (FP16 P V: 0.027 and 0.013), the same next token. The quality gate below runs fp16 KV, so it does
   not reach this path.
-- **Residual and norms:** fp32.
+- **Residual and norms:** prompt chunks keep the residual stream in BF16 (each add in fp32, rounded once) and pass BF16
+  activations between kernels (qkv, z, the conv output, q/k/v, the normed rows for GDN's a/b); norms and softmax in fp32.
+  Decode windows: fp32 for now (moving to the same rule).
 
 ## Quality against BF16
 
