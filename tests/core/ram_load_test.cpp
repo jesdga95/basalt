@@ -9,6 +9,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <utility>
 
 using namespace basalt::core;
 
@@ -188,6 +189,21 @@ void fallback_case() {
 }  // namespace
 
 int main() {
+    {
+        // Reader threads may move layer owners while their destination pointers stay live, without a CUDA context.
+        RamAllocation span;
+        check(span.allocate(4097, false), "ordinary RAM span");
+        if (span.data()) {
+            std::memset(span.data(), 0x5b, 4097);
+            const auto* at = span.data();
+            std::vector<RamAllocation> owners;
+            owners.push_back(std::move(span));
+            owners.emplace_back();
+            check(!span.data() && owners[0].data() == at && owners[0].data()[4096] == 0x5b,
+                  "moving a layer owner changed its address or bytes");
+            check(!owners[1].allocate(~uint64_t(0), false) && !owners[1].data(), "RAM extent overflow");
+        }
+    }
     for (bool unbuffered : {true, false})
         for (int threads : {1, 4}) {
             arena_case(0, 4096 * 8, unbuffered, threads);      // block aligned: straight into RAM

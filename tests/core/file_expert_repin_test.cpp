@@ -7,6 +7,7 @@
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
+#include "basalt/kernels/elementwise.hpp"
 
 #include <cuda_runtime.h>
 
@@ -101,13 +102,35 @@ int run() {
     std::vector<const void*> alias;
     bool host_alias = true;   // the driver maps the registered copy at its host address: the sleep needs that
     for (const auto& [l, e] : probe) {
-        require(src.has_resident(l, e) && registered(src.blob(l, e)), "a resident expert is registered after the load");
+        require(src.has_resident(l, e) && src.pinned(l, e), "a resident expert is pinned after the load");
+        require(src.complement_allocation_pinned() || registered(src.blob(l, e)), "ordinary expert registration after load");
         require_alias_maps(src.device_alias(l, e), src.blob(l, e), (size_t) blob, "the device alias after the load");
         bytes.emplace_back(src.blob(l, e), src.blob(l, e) + blob);
         alias.push_back(src.device_alias(l, e));
         host_alias = host_alias && src.device_alias(l, e) == src.blob(l, e);
     }
-    if (!host_alias) {
+    const bool allocation_pinned = src.complement_allocation_pinned();
+    if (allocation_pinned) {
+        for (int cycle = 0; cycle < 2; ++cycle) {
+            require(!src.unpin_complement(err) && err.find("host VMM") != std::string::npos,
+                    "allocation-backed pins must not be passed to cudaHostUnregister");
+            require(!src.complement_unpinned(), "allocation-backed sleep lost pin state");
+            src.repin_start(2);
+            require(src.repin_finish(err), "allocation-backed wake");
+            int32_t* gpu = nullptr;
+            require(cudaMalloc(&gpu, 128) == cudaSuccess, "mapped-read buffer");
+            for (size_t k = 0; k < probe.size(); ++k) {
+                const auto& [l, e] = probe[k];
+                require(src.device_alias(l, e) == alias[k] && src.pinned(l, e), "allocation-backed wake changed aliases");
+                require(std::memcmp(src.blob(l, e), bytes[k].data(), (size_t) blob) == 0, "wake changed expert weights");
+                basalt::kernels::copy_i32_from_mapped(gpu, (const int32_t*) src.device_alias(l, e), 32, nullptr);
+                int32_t back[32]{};
+                require(cudaMemcpy(back, gpu, sizeof back, cudaMemcpyDeviceToHost) == cudaSuccess, "mapped kernel read");
+                require(std::memcmp(back, bytes[k].data(), sizeof back) == 0, "mapped kernel changed expert bytes");
+            }
+            require(cudaFree(gpu) == cudaSuccess, "mapped-read cleanup");
+        }
+    } else if (!host_alias) {
         // the sleep is refused where the device alias is not the host address (one registered range read at its host
         // addresses); the copy stays registered and the read path below still runs
         const bool refused = src.unpin_complement(err);
@@ -116,7 +139,7 @@ int run() {
                     "refused: %s; the repin cycles are skipped\n",
                     err.c_str());
     }
-    for (int cycle = 0; host_alias && cycle < 2; ++cycle) {
+    for (int cycle = 0; !allocation_pinned && host_alias && cycle < 2; ++cycle) {
         const bool unpinned = src.unpin_complement(err);
         require(unpinned, "unpin: " + err);
         require(src.complement_unpinned(), "unpinned");
@@ -142,12 +165,12 @@ int run() {
             "copy back");
     require(back == bytes[0], "the slot holds the expert's bytes");
     // a sleep left in place at the end: closing frees an unregistered copy
-    if (host_alias) {
+    if (!allocation_pinned && host_alias) {
         const bool unpinned = src.unpin_complement(err);
         require(unpinned, "unpin at the end: " + err);
     }
     src.close();
-    if (!host_alias) {
+    if (!allocation_pinned && !host_alias) {
         std::puts("file_expert_repin_test: skipped: this driver cannot sleep the resident copy, there is no repin to test");
         return 77;
     }

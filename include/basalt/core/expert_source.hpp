@@ -312,11 +312,12 @@ public:
     uint64_t pinned_bytes() const { return complement_pinned_ ? complement_pin_limit_ : 0; }
     uint64_t resident_bytes() const { return complement_bytes_; }
     bool complement_pinned() const { return complement_pinned_; }
+    bool complement_allocation_pinned() const { return complement_allocation_.allocation_pinned(); }
     bool complement_ready() const { return complement_ready_; }
     uint64_t locked_bytes() const { return complement_locked_; }
     /// SLEEP and WAKE: the RAM copy's registration with the driver.  `unpin_complement` drops it, so a process
     /// checkpoint does not map the whole copy into every context again on restore; false (nothing changed) when the
-    /// copy is not one registered range read at its host addresses.  `repin_start` registers it again at the same
+    /// copy is allocation-pinned or not one registered range read at its host addresses. `repin_start` registers it again at the same
     /// addresses, about 1 GiB at a time on `threads` threads in address order; `repin_wait(p, n)` waits until
     /// [p, p + n) is registered (false once a registration was refused); `repin_finish` waits for all of it.
     bool unpin_complement(std::string& err);
@@ -446,7 +447,10 @@ private:
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
     void* complement_arena_ = nullptr;
     const uint8_t* complement_host_ = nullptr;
+    RamAllocation complement_allocation_;
     const uint8_t* complement_device_ = nullptr;
+    std::vector<uint64_t> complement_slice_at_;
+    std::vector<const uint8_t*> complement_slice_dev_;
     uint64_t complement_bytes_ = 0;
     // the top-up region: offsets from complement_bytes_ on lie in it
     void* top_arena_ = nullptr;
