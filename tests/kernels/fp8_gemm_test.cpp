@@ -76,14 +76,54 @@ int main(int argc, char** argv) {
             cudaEventElapsedTime(&ms, a, b);
             ms /= 10;
             cudaEventRecord(a);
+            for (int i = 0; i < 10; ++i) fp8::gemm(w, M, K, nullptr, act, T, y, M, fp8::Epilogue::Add, nullptr);
+            cudaEventRecord(b);
+            cudaEventSynchronize(b);
+            float ma;
+            cudaEventElapsedTime(&ma, a, b);
+            ma /= 10;
+            cudaEventRecord(a);
             for (int i = 0; i < 10; ++i) fp8::quantize(x, T, K, K, act, nullptr);
             cudaEventRecord(b);
             cudaEventSynchronize(b);
             float mq;
             cudaEventElapsedTime(&mq, a, b);
-            std::printf("fp8 gemm [%lld x %lld] x %lld rows: %.3f ms (%.0f TFLOP/s); quantize %.3f ms\n", (long long) M,
-                        (long long) K, (long long) T, ms, 2.0 * M * K * T / ms / 1e9, mq / 10);
+            std::printf("fp8 gemm [%lld x %lld] x %lld rows: %.3f ms (%.0f TFLOP/s), Add %.3f ms (%.0f); quantize %.3f ms\n",
+                        (long long) M, (long long) K, (long long) T, ms, 2.0 * M * K * T / ms / 1e9, ma,
+                        2.0 * M * K * T / ma / 1e9, mq / 10);
             cudaFree(w); cudaFree(x); cudaFree(y); cudaFree(act);
+        }
+        {   // the output projection with cold weights and a cold residual: 8 copies of each, rotated
+            const int64_t M = 5120, K = 6144, C = 8;
+            std::vector<uint8_t*> ws(C);
+            std::vector<float*> ys(C);
+            float* x;
+            void* act;
+            for (int i = 0; i < C; ++i) {
+                cudaMalloc(&ws[i], (size_t) M * K);
+                fill_w(ws[i], (size_t) M * K, 10 + i);
+                cudaMalloc(&ys[i], (size_t) T * M * 4);
+                cudaMemset(ys[i], 0, (size_t) T * M * 4);
+            }
+            cudaMalloc(&x, (size_t) T * K * 4);
+            fill_x(x, (size_t) T * K, 2);
+            cudaMalloc(&act, fp8::act_bytes(T, K));
+            fp8::quantize(x, T, K, K, act, nullptr);
+            cudaEvent_t a, b;
+            cudaEventCreate(&a);
+            cudaEventCreate(&b);
+            for (int e = 0; e < 2; ++e) {
+                cudaEventRecord(a);
+                for (int i = 0; i < 4 * C; ++i)
+                    fp8::gemm(ws[i % C], M, K, nullptr, act, T, ys[i % C], M, e ? fp8::Epilogue::Add : fp8::Epilogue::Store, nullptr);
+                cudaEventRecord(b);
+                cudaEventSynchronize(b);
+                float ms;
+                cudaEventElapsedTime(&ms, a, b);
+                ms /= 4 * C;
+                std::printf("fp8 gemm [%lld x %lld] cold weights and outputs, %s: %.3f ms (%.0f TFLOP/s)\n", (long long) M, (long long) K,
+                            e ? "Add" : "Store", ms, 2.0 * M * K * T / ms / 1e9);
+            }
         }
         // the segmented products at 2048 rows: GDN qkv + z, attention q + k + v (one launch each), and the Add form
         const int64_t K = 5120, T2 = 2048;
