@@ -31,6 +31,7 @@ struct Args {
     int64_t rows[kMaxMatrices];
     const float* scale[kMaxMatrices];
     float* y[kMaxMatrices];
+    uint16_t* y16[kMaxMatrices];
     int64_t ld_y[kMaxMatrices];
     int64_t row_off[kMaxMatrices];   // the matrix's first row in the workspace's rows
     int tile0[kMaxMatrices + 1];     // the matrix's first tile (tile0[n]: all tiles)
@@ -410,6 +411,13 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                         const int64_t r = row0 + (rw * MW + mt) * 16 + g + 8 * (j >> 1);
                         if (col >= a.T || r >= rows) continue;
                         const float v = acc[mt][t][j] * sc;
+                        if (a.epi == (int) Epilogue::AddBf16) {
+                            uint16_t* d16 = a.y16[mat] + col * ld + r;
+                            // the product rounded as Store leaves it (no fma into the add), then one add, one rounding
+                            *d16 = __bfloat16_as_ushort(__float2bfloat16_rn(
+                                __fadd_rn(__bfloat162float(__ushort_as_bfloat16(*d16)), __fmul_rn(acc[mt][t][j], sc))));
+                            continue;
+                        }
                         float* dst = y + col * ld + r;
                         if (a.epi == (int) Epilogue::Add) *dst += v;
                         else *dst = v;

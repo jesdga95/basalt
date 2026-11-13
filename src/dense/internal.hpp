@@ -54,7 +54,8 @@ struct BatchTable {
 
 /// The decode window's scratch (kBatch rows).
 struct WindowScratch {
-    float *x = nullptr, *xn = nullptr, *tmp = nullptr;
+    uint16_t* x = nullptr;                       // the residual rows, BF16 (every add in fp32, rounded once)
+    float *xn = nullptr, *tmp = nullptr;
     void* xq = nullptr;                          // the window gemm's activations (bf16 rows)
     void* hq = nullptr;                          // the down product's (SwiGLU's bf16 rows)
     void* x8 = nullptr;                          // MMQ's (q8_1 rows)
