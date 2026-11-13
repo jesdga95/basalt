@@ -1,14 +1,14 @@
-// src/models/qwen4exp/tokenizer/pretok_qwen35.cpp - the qwen35 pre-tokenizer: the text split into the pieces BPE merges.
+// src/program/tokenizer/pretok_qwen35.cpp - the qwen35 pre-tokenizer: the text split into the pieces BPE merges.
 //
 // The splitting rules are those of llama.cpp's unicode_regex_split_custom_qwen35 (src/unicode.cpp at commit f5027fb21,
 // MIT licence, written by Kabir Potdar for llama.cpp pull request 22110; see THIRD_PARTY_LICENSES). They implement
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 // by hand, without backtracking. Here the code points are decoded once, with their flags, and the pieces come back as
 // byte offsets into the UTF-8 text.
-#include "basalt/models/qwen4exp/shared_names.hpp"
-#include "../../../program/tokenizer/unicode_flags.hpp"
+#include "basalt/program/qwen_forms.hpp"
+#include "unicode_flags.hpp"
 
-namespace basalt::models::qwen4exp::tokenizer {
+namespace basalt::program::tokenizer {
 
 namespace {
 
@@ -131,4 +131,4 @@ void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends) {
     }
 }
 
-}  // namespace basalt::models::qwen4exp::tokenizer
+}  // namespace basalt::program::tokenizer

@@ -132,7 +132,6 @@ target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model PUBLIC artifact warnings)
 
 add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp
-  src/models/qwen4exp/tokenizer/pretok_qwen35.cpp
   src/models/qwen4exp/load/engine_local.cpp
   src/models/qwen4exp/serve/probe_peer.cpp
   src/models/qwen4exp/load/helpers.cpp
@@ -558,18 +557,18 @@ target_link_libraries(grammar PRIVATE warnings)
 
 # the C++ byte-level BPE tokenizer the engine runs on request text (CPU only)
 add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp
-            src/program/tokenizer/unicode_flags.cpp)
+            src/program/tokenizer/unicode_flags.cpp src/program/tokenizer/pretok_qwen35.cpp)
 target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenizer)
 target_link_libraries(tokenizer PRIVATE warnings)
 # built from the tokenizer sources with the standard library range checks on, so an out-of-range index aborts the test
 add_executable(tokenizer_test tests/program/tokenizer_test.cpp src/program/tokenizer/bpe.cpp
-               src/models/qwen4exp/tokenizer/pretok_qwen35.cpp src/program/tokenizer/unicode_flags.cpp
+               src/program/tokenizer/pretok_qwen35.cpp src/program/tokenizer/unicode_flags.cpp
                src/models/deepseek41/tokenizer/pretok_joyai.cpp)
 target_include_directories(tokenizer_test PRIVATE include src src/program/tokenizer)
 target_compile_definitions(tokenizer_test PRIVATE _GLIBCXX_ASSERTIONS)
 target_link_libraries(tokenizer_test PRIVATE warnings)
 basalt_embed_manifest(tokenizer_test)
-add_executable(tokenizer_bench tests/program/tokenizer_bench.cpp src/models/qwen4exp/tokenizer/pretok_qwen35.cpp)
+add_executable(tokenizer_bench tests/program/tokenizer_bench.cpp)
 target_link_libraries(tokenizer_bench PRIVATE tokenizer warnings)
 basalt_embed_manifest(tokenizer_bench)
 basalt_cpu_test(NAME tokenizer_test COMMAND tokenizer_test)
