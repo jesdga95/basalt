@@ -332,12 +332,22 @@ void chunk_residual_f8(Model& m, const Linear& l, int T, cudaStream_t s) {
                        prefill::fp8::Epilogue::AddBf16, s);
 }
 
+// `cells_only`: nothing reads the layer's rows (a chunk's last layer), so only its K and V cells are made: the same k
+// and v products and the same cache write, without the queries, the attention and the output projection.
 void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
-                kernels::KvInt8 q8 = {}) {
+                kernels::KvInt8 q8 = {}, bool cells_only = false) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim;
     const bool f8 = all_f8({&L.q, &L.k, &L.v, &L.o});
+    if (f8 && cells_only) {
+        prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, nullptr, s);
+        const prefill::fp8::Segment seg[2] = {f8_seg(L.k, b.k), f8_seg(L.v, b.v)};
+        prefill::fp8::gemm_segmented(seg, 2, H, b.xq, T, prefill::fp8::Epilogue::StoreBf16, s);
+        kernels::attn_qk_prepare_bf16(nullptr, bf(b.k), bf(b.v), nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr,
+                                      pos, s, q8, kc, vc);
+        return;
+    }
     if (f8) {   // the norm in the quantizer, one FP8 product for q, k and v (BF16 out)
         prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, nullptr, s);
         const prefill::fp8::Segment seg[3] = {f8_seg(L.q, b.qfull), f8_seg(L.k, b.k), f8_seg(L.v, b.v)};
@@ -357,14 +367,20 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         chunk_residual_f8(m, L.o, T, s);
         return;
     }
-    {
-        kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
-        quantize_mmq(b.xn, b.xq, L.q.type, H, T, s);
-        gemm(m, L.q, b.xq, b.qfull, T, s);
-        if (L.k.type != L.q.type) quantize_mmq(b.xn, b.xq, L.k.type, H, T, s);
+    kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
+    if (cells_only) {
+        quantize_mmq(b.xn, b.xq, L.k.type, H, T, s);
         gemm(m, L.k, b.xq, b.k, T, s);
         gemm(m, L.v, b.xq, b.v, T, s);
+        kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr, kc, vc, pos, s,
+                                 256, true, 0, nullptr, q8);
+        return;
     }
+    quantize_mmq(b.xn, b.xq, L.q.type, H, T, s);
+    gemm(m, L.q, b.xq, b.qfull, T, s);
+    if (L.k.type != L.q.type) quantize_mmq(b.xn, b.xq, L.k.type, H, T, s);
+    gemm(m, L.k, b.xq, b.k, T, s);
+    gemm(m, L.v, b.xq, b.v, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
                              pos, s, 256, true, 0, nullptr, q8);
     kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split,
@@ -712,15 +728,23 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
     if (drafter) cudaMemcpyAsync(b.cat, b.tmp, (size_t) T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
     const BlockDrafter& bd = w.dflash;
     const bool block = m.o.drafter == Drafter::Block;
+    // A chunk gives no logits (a prompt's last token runs as a decode window), so the last layer's rows are read only by
+    // a drafter: the MTP history takes every row's final hidden state, a block drafter the rows of its target layers.
+    // When neither reads them, the last layer leaves only what the session keeps: an attention layer its cells; its FFN
+    // is not run.
+    const bool last_read = drafter || (block && std::find(bd.target_layers.begin(), bd.target_layers.end(), g.n_layers - 1) !=
+                                                    bd.target_layers.end());
     size_t next_target = 0;
     for (int il = 0; il < g.n_layers; ++il) {
         const Layer& L = w.layers[(size_t) il];
+        const bool unread = il == g.n_layers - 1 && !last_read;
         if (L.kind == Mixer::Gdn) {
             chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
         } else {
             const int ai = m.attn_index[(size_t) il];
-            chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai]);
+            chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread);
         }
+        if (unread) break;
         chunk_ffn(m, L, T, s);
         if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) {
             const Linear& fc = bd.fc[next_target];
