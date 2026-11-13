@@ -73,9 +73,10 @@ size_t window_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_conte
     const size_t widest = std::max<size_t>({H, (size_t) g.n_ff, (size_t) g.value_width(), AQ});
     size_t f = 3 * W * H + W * g.value_width() + W * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) + 3 * W * g.n_ff;
     if (g.attn_layers() > 0) f += kernels::gqa_decode_scratch_floats(max_context, kWindow, g.n_head);
+    f += W * (2 * (size_t) g.conv_channels() + 2 * (size_t) g.gdn_v_heads) + (sizeof(BatchTable) + 3) / 4;
     f += W * 2 * H + kernels::row_logprobs_scratch_floats(kWindow, g.n_vocab) + W * g.value_width() + W * (size_t) g.n_vocab;
     f += block_scratch_floats(g, bd);
-    return f * 4 + 2 * prefill::mmq::q8_bytes(kWindow, (int64_t) std::max<size_t>(widest, 2 * H)) + W * 4 * 6 + 64 * 256;
+    return f * 4 + 2 * prefill::mmq::q8_bytes(kWindow, (int64_t) std::max<size_t>(widest, 2 * H)) + W * 4 * 6 + 72 * 256;
 }
 
 size_t chunk_bytes(const Geometry& g) {
@@ -109,6 +110,7 @@ uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv
 }
 
 Model::~Model() {
+    for (BatchGraph& g : batch_graphs) cudaGraphExecDestroy(g.exec);
     vision_detach();
 }
 
@@ -313,6 +315,13 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     b.iota = a.take<int32_t>(W);
     b.bounds = a.take<int32_t>(2);
     b.pos0 = a.take<int32_t>(2);
+    if (g.gdn_layers() > 0) {
+        b.rq = a.take<float>(W * (size_t) g.conv_channels());
+        b.rh = a.take<float>(W * (size_t) g.conv_channels());
+        b.rgate = a.take<float>(W * (size_t) g.gdn_v_heads);
+        b.rbeta = a.take<float>(W * (size_t) g.gdn_v_heads);
+    }
+    b.btab = a.take<BatchTable>(1);
     if (!b.bounds) {
         err = o.arch + ": the decode scratch does not fit its arena";
         return nullptr;

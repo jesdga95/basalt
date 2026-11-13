@@ -9,6 +9,7 @@
 #include "basalt/prefill/moe_fp4.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <vector>
 
 namespace basalt::dense {
@@ -349,6 +350,183 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
     return true;
 }
 
+
+namespace {
+
+// ---- a batch window: the rows of several sessions packed (m.ws.x), the sequence-bound steps per segment
+
+int32_t* batch_pos0(Model& m) { return reinterpret_cast<int32_t*>(reinterpret_cast<char*>(m.ws.btab) + offsetof(BatchTable, pos0)); }
+
+void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, int rows, cudaStream_t s) {
+    const Geometry& g = m.g;
+    WindowScratch& b = m.ws;
+    const int H = g.n_embd, AQ = g.n_head * g.head_dim, KV = g.n_kv * g.head_dim;
+    kernels::rms_norm_rows(b.x, L.attn_norm, b.xn, rows, H, g.eps, s);
+    wquant(b.xn, b.xq, L.q.type, H, s);
+    gemv(m, L.q, b.xq, b.qfull, s);
+    if (L.k.type != L.q.type) wquant(b.xn, b.xq, L.k.type, H, s);
+    gemv(m, L.k, b.xq, b.k, s);
+    gemv(m, L.v, b.xq, b.v, s);
+    int row = 0;
+    for (int k = 0; k < S; ++k) {
+        SessionState& st = *segs[k].st;
+        const int T = segs[k].T;
+        const int32_t* p0 = batch_pos0(m) + k;
+        kernels::attn_qk_prepare(b.qfull + (size_t) row * 2 * AQ, b.k + (size_t) row * KV, b.v + (size_t) row * KV, L.q_norm,
+                                 L.k_norm, g.eps, g.rope, b.pos + (size_t) row * 3, T, g.n_head, g.n_kv,
+                                 b.qo + (size_t) row * AQ, st.kc[(size_t) ai], st.vc[(size_t) ai], segs[k].pos, s, 256, true, 0, p0,
+                                 st.kq[(size_t) ai]);
+        kernels::gqa_decode_attn(b.qo + (size_t) row * AQ, st.kc[(size_t) ai], st.vc[(size_t) ai], g.n_head, g.n_kv, segs[k].pos, T,
+                                 b.attn, m.o.max_context, b.ao + (size_t) row * AQ, s, p0, st.kq[(size_t) ai]);
+        row += T;
+    }
+    kernels::attn_gate(b.ao, b.qfull, b.ag, rows, g.n_head, s);
+    wquant(b.ag, b.yq, L.o.type, AQ, s);
+    gemv(m, L.o, b.yq, b.tmp, s);
+    kernels::add_scaled(b.x, b.tmp, L.o.scale, (int64_t) rows * H, s);
+}
+
+void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int rows, int max_n, cudaStream_t s) {
+    const Geometry& g = m.g;
+    WindowScratch& b = m.ws;
+    const int H = g.n_embd, C = g.conv_channels();
+    kernels::rms_norm_rows(b.x, L.attn_norm, b.xn, rows, H, g.eps, s);
+    wquant(b.xn, b.xq, L.qkv.type, H, s);
+    gemv(m, L.qkv, b.xq, b.rq, s);
+    if (L.z.type != L.qkv.type) wquant(b.xn, b.xq, L.z.type, H, s);
+    gemv(m, L.z, b.xq, b.z, s);
+    kernels::DecRecArgs a;
+    a.qkv = b.rq;
+    a.conv_w = L.conv;
+    a.x = b.xn;
+    a.w_alpha = L.w_ab;
+    a.w_beta = L.w_ab + (size_t) g.gdn_v_heads * H;
+    a.dt = L.dt;
+    a.ssm_a = L.ssm_a;
+    a.z = b.z;
+    a.gamma = L.gamma;
+    a.h = b.rh;
+    a.gate = b.rgate;
+    a.beta = b.rbeta;
+    a.yq = b.yq;
+    a.y = b.y;
+    a.C = C;
+    a.n_embd = H;
+    a.h_k = g.gdn_k_heads;
+    a.h_v = g.gdn_v_heads;
+    a.eps = g.eps;
+    a.early_trigger = false;
+    a.gate_act = g.gdn_gate;
+    kernels::dec_gdn_rec_seg(a, b.btab->seg, (size_t) gi * segs[0].st->gdn_floats, rows, max_n, s);
+    kernels::gdn_rows_scatter(b.btab->dst, rows, b.rq, b.rh, b.rgate, b.rbeta, C, g.gdn_v_heads, gi, kWindow, s);
+    wquant(b.y, b.yq, L.out.type, g.value_width(), s);
+    gemv(m, L.out, b.yq, b.tmp, s);
+    kernels::add_scaled(b.x, b.tmp, L.out.scale, (int64_t) rows * H, s);
+}
+
+}  // namespace
+
+namespace {
+
+// The batch window's work on the device, all of it from device inputs (tokens, positions, the segment table), so it can be
+// captured once per composition (the sessions and their row counts) and replayed at any positions.
+void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
+    const Geometry& g = m.g;
+    const Weights& w = m.w;
+    WindowScratch& b = m.ws;
+    const cudaStream_t s = segs[0].st->stream;
+    const int H = g.n_embd;
+    kernels::iq_embed_rows(30, w.embd, (size_t) H * 2, b.tok, rows, H, b.x, s);
+    const BlockDrafter& bd = w.dflash;
+    const bool block = m.o.drafter == Drafter::Block;
+    size_t next_target = 0;
+    for (int il = 0; il < g.n_layers; ++il) {
+        const Layer& L = w.layers[(size_t) il];
+        if (L.kind == Mixer::Gdn) batch_gdn(m, L, m.gdn_index[(size_t) il], segs, rows, max_n, s);
+        else batch_attn(m, L, m.attn_index[(size_t) il], segs, S, rows, s);
+        win_ffn(m, L, rows, s);
+        if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) {
+            // the block drafter's features, packed in the head's rows until every session has its own
+            const Linear& fc = bd.fc[next_target];
+            wquant(b.x, b.xq, fc.type, H, s);
+            gemv(m, fc, b.xq, next_target == 0 ? b.hl : b.tmp, s);
+            if (next_target > 0) kernels::add_scaled(b.hl, b.tmp, nullptr, (int64_t) rows * H, s);
+            ++next_target;
+        }
+    }
+    int row = 0;
+    if (block)
+        for (int k = 0; k < S; row += segs[k++].T)
+            cudaMemcpyAsync(segs[k].st->dacc, b.hl + (size_t) row * H, (size_t) segs[k].T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    kernels::rms_norm_rows(b.x, w.out_norm, b.xn, rows, H, g.eps, s);
+    row = 0;
+    for (int k = 0; k < S; row += segs[k++].T)
+        if (segs[k].st->hid)   // the drafter's
+            cudaMemcpyAsync(segs[k].st->hid, b.xn + (size_t) row * H, (size_t) segs[k].T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    wquant(b.xn, b.xq, w.head.type, H, s);
+    gemv(m, w.head, b.xq, b.hl, s);
+    kernels::scale_values(b.hl, w.head.scale, (int64_t) rows * g.n_vocab, s);
+    row = 0;
+    for (int k = 0; k < S; row += segs[k++].T)
+        cudaMemcpyAsync(segs[k].st->logits, b.hl + (size_t) row * g.n_vocab, (size_t) segs[k].T * g.n_vocab * sizeof(float),
+                        cudaMemcpyDeviceToDevice, s);
+}
+
+}  // namespace
+
+bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
+    const Geometry& g = m.g;
+    WindowScratch& b = m.ws;
+    const cudaStream_t s = segs[0].st->stream;
+    const int C = g.conv_channels(), HV = g.gdn_v_heads;
+    int rows = 0, max_n = 1;
+    BatchTable tab{};
+    Model::BatchKey key;
+    for (int k = 0; k < S; ++k) {
+        SessionState& st = *segs[k].st;
+        const int T = segs[k].T;
+        key.emplace_back(&st, T);
+        tab.pos0[k] = (int32_t) segs[k].pos;
+        for (int j = 0; j < T; ++j) {
+            tab.seg[rows + j] = {st.gdn, rows, j, T, T, k, (int32_t) (segs[k].pos + j)};
+            if (st.rec_qkv)
+                tab.dst[rows + j] = {st.rec_qkv + (size_t) j * C, st.rec_h + (size_t) j * C, st.rec_gate + (size_t) j * HV,
+                                     st.rec_beta + (size_t) j * HV};
+        }
+        rows += T;
+        max_n = std::max(max_n, T);
+    }
+    const int32_t bounds[2] = {0, rows};
+    cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(b.btab, &tab, sizeof tab, cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(b.tok, tokens, (size_t) rows * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(b.pos, pos3, (size_t) rows * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    for (Model::BatchGraph& bg : m.batch_graphs)
+        if (bg.key == key) {
+            bg.used = ++m.batch_clock;
+            if (cudaGraphLaunch(bg.exec, s) != cudaSuccess) return cuda_ok("dense batch graph", err) && false;
+            return cuda_ok("dense batch window", err);
+        }
+    batch_body(m, segs, S, rows, max_n);   // a composition's first window runs as launched, then is captured for the next ones
+    if (!cuda_ok("dense batch window", err)) return false;
+    cudaGraph_t graph = nullptr;
+    if (cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed) != cudaSuccess) return cuda_ok("dense batch capture", err);
+    batch_body(m, segs, S, rows, max_n);
+    cudaGraphExec_t exec = nullptr;
+    if (cudaStreamEndCapture(s, &graph) != cudaSuccess || cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
+        if (graph) cudaGraphDestroy(graph);
+        return cuda_ok("dense batch capture", err);
+    }
+    cudaGraphDestroy(graph);
+    if (m.batch_graphs.size() >= Model::kBatchGraphs) {   // the least recently used composition goes
+        auto old = std::min_element(m.batch_graphs.begin(), m.batch_graphs.end(),
+                                    [](const Model::BatchGraph& x, const Model::BatchGraph& y) { return x.used < y.used; });
+        cudaGraphExecDestroy(old->exec);
+        m.batch_graphs.erase(old);
+    }
+    m.batch_graphs.push_back({std::move(key), exec, ++m.batch_clock});
+    return true;
+}
 
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
                    const int32_t* pos3, std::string& err) {
