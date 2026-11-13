@@ -128,22 +128,53 @@ __global__ void __launch_bounds__(CHUNK) decode_chunk_kernel(const float* __rest
         if (lane == 0) { mx[h] = m; sm[h] = l; }
     }
     __syncthreads();
-    for (int d = threadIdx.x; d < HD; d += CHUNK) {
-        float acc[GMAX] = {};
-        for (int i = 0; i < n; ++i) {
-            const int64_t row = cell_of(i) * n_kv + kvh;
-            const float v = q8.v ? (float) q8.v[row * HD + d] * __half2float(__ushort_as_half(q8.vs[row * (HD / 64) + d / 64]))
-                                 : __half2float(vc[row * HD + d]);
-#pragma unroll
-            for (int h = 0; h < GMAX; ++h)
-                if (h < G) acc[h] = fmaf(s[i][h], v, acc[h]);
+    // p . V: thread (quad, grp) sums dims 4 quad .. 4 quad + 3 over the cells i = grp mod PG, then the PG partial sums
+    // are added in group order through shared memory
+    constexpr int NQ = HD / 4, PG = CHUNK / NQ;   // dim quads, cell groups
+    static_assert(PG >= 1 && CHUNK % NQ == 0, "decode attention: thread split");
+    const int quad = threadIdx.x % NQ, grp = threadIdx.x / NQ;
+    float acc[GMAX][4] = {};
+    for (int i = grp; i < n; i += PG) {
+        const int64_t row = cell_of(i) * n_kv + kvh;
+        float v[4];
+        if (q8.v) {
+            const char4 c = *reinterpret_cast<const char4*>(q8.v + row * HD + 4 * quad);
+            const float sc = __half2float(__ushort_as_half(q8.vs[row * (HD / 64) + (4 * quad) / 64]));
+            v[0] = (float) c.x * sc; v[1] = (float) c.y * sc; v[2] = (float) c.z * sc; v[3] = (float) c.w * sc;
+        } else {
+            const uint2 u = *reinterpret_cast<const uint2*>(vc + row * HD + 4 * quad);
+            const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+            const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+            v[0] = a.x; v[1] = a.y; v[2] = b.x; v[3] = b.y;
         }
 #pragma unroll
         for (int h = 0; h < GMAX; ++h)
             if (h < G) {
+                const float p = s[i][h];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[h][e] = fmaf(p, v[e], acc[h][e]);
+            }
+    }
+    __shared__ float red[PG > 1 ? (PG - 1) * GMAX * HD : 1];   // the groups' partial sums [PG - 1][GMAX][HD]
+    if (grp > 0)
+#pragma unroll
+        for (int h = 0; h < GMAX; ++h)
+            if (h < G)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) red[((grp - 1) * GMAX + h) * HD + 4 * quad + e] = acc[h][e];
+    __syncthreads();
+    if (grp == 0) {
+#pragma unroll
+        for (int h = 0; h < GMAX; ++h)
+            if (h < G) {
+#pragma unroll
+                for (int gq = 1; gq < PG; ++gq)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) acc[h][e] += red[((gq - 1) * GMAX + h) * HD + 4 * quad + e];
                 float* o = out + (int64_t) h * n_chunks * (HD + 2);
-                if (d == 0) { o[0] = mx[h]; o[1] = sm[h]; }
-                o[2 + d] = acc[h];
+                if (quad == 0) { o[0] = mx[h]; o[1] = sm[h]; }
+#pragma unroll
+                for (int e = 0; e < 4; ++e) o[2 + 4 * quad + e] = acc[h][e];
             }
     }
 }
