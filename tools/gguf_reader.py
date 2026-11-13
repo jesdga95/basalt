@@ -13,7 +13,8 @@ from typing import Any
 GGUF_MAGIC = 0x46554747  # "GGUF" little-endian
 
 # ggml_type values; 42 = Q2_0, the routed-expert encoding, absent from gguf-py; 44 = F8_E4M3 (one E4M3 code per value,
-# the tensor's FP32 scale a separate `<name>.scale`), Basalt's own
+# the tensor's FP32 scale a separate `<name>.scale`) and 45 = NVFP4_PLANES (NVFP4 as a code plane and a tiled scale plane,
+# include/basalt/kernels/nvfp4_planes.hpp), Basalt's own
 GGML_TYPES: dict[int, str] = {
     0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 4: "Q4_2", 5: "Q4_3", 6: "Q5_0", 7: "Q5_1",
     8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K",
@@ -21,7 +22,7 @@ GGML_TYPES: dict[int, str] = {
     21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 24: "I8", 25: "I16", 26: "I32", 27: "I64",
     28: "F64", 29: "IQ1_M", 30: "BF16", 31: "Q4_0_4_4", 32: "Q4_0_4_8", 33: "Q4_0_8_8",
     34: "TQ1_0", 35: "TQ2_0", 36: "IQ4_NL_4_4", 37: "IQ4_NL_4_8", 38: "IQ4_NL_8_8",
-    39: "MXFP4", 40: "NVFP4", 41: "Q4_0_8_8", 42: "Q2_0", 44: "F8_E4M3",
+    39: "MXFP4", 40: "NVFP4", 41: "Q4_0_8_8", 42: "Q2_0", 44: "F8_E4M3", 45: "NVFP4_PLANES",
 }
 
 # GGUF metadata value type ids
@@ -41,6 +42,7 @@ BLOCK_GEOMETRY: dict[str, tuple[int, int]] = {
     "IQ2_XXS": (256, 66), "IQ2_XS": (256, 74), "IQ3_XXS": (256, 98), "IQ1_S": (256, 50),
     "IQ4_NL": (32, 18), "IQ3_S": (256, 110), "IQ2_S": (256, 82), "IQ4_XS": (256, 136),
     "IQ1_M": (256, 56), "Q2_0": (64, 18), "MXFP4": (32, 17), "NVFP4": (64, 36), "F8_E4M3": (1, 1),
+    "NVFP4_PLANES": (64, 36),
 }
 
 

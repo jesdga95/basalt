@@ -7,7 +7,7 @@ What the dense stack computes in, where it rounds, and what that costs against t
 
 | Tensors | Stored as | From NVIDIA's checkpoint |
 | --- | --- | --- |
-| MLP gate, up, down; output head | NVFP4 (E2M1, UE4M3 per 16, FP32 per matrix) | bit for bit |
+| MLP gate, up, down; output head | NVFP4_PLANES (E2M1, UE4M3 per 16, FP32 per matrix) | bit for bit |
 | GDN qkv, z, out; attention q, k, v, o | F8_E4M3 (E4M3 codes, FP32 per matrix) | bit for bit |
 | GDN a, b; conv; norms | BF16, F32 | as stored (norms with the offset folded in, exact) |
 | Token embedding | BF16, in page-locked RAM | as stored |

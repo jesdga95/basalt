@@ -25,7 +25,7 @@ from test_checkpoint import basalt_values, bf16, modelopt_values, ue4m3, write_s
 
 H = 256                    # hidden size (Q8_0 rows and 64-value NVFP4 blocks need multiples of 32 and 64)
 FF = 128                   # dense intermediate size
-VOCAB = 16
+VOCAB = 128                # NVFP4 planes tile rows in 128s (the head)
 NHEAD, NKV, HD = 2, 1, 64  # the attention layer
 QKV = 2 * S.GDN_K_HEADS * S.GDN_HEAD + S.GDN_V_HEADS * S.GDN_HEAD      # 10240 GDN qkv channels
 VALUE = S.GDN_V_HEADS * S.GDN_HEAD                                      # 6144
@@ -52,6 +52,7 @@ VISION_CONFIG = {"model_type": "qwen3_5_vision", "depth": VDEPTH, "hidden_size":
                  "intermediate_size": VFF, "out_hidden_size": VOUT, "patch_size": 16, "temporal_patch_size": 2,
                  "spatial_merge_size": 2, "hidden_act": "gelu_pytorch_tanh", "deepstack_visual_indexes": []}
 TOKENS = list("abcdefghijkl") + ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|vision_start|>"]
+PADDED = TOKENS + [f"[PAD{i}]" for i in range(len(TOKENS), VOCAB)]   # the vocabulary padded to the head's rows
 
 
 def q8_values(blob: bytes, rows: int, cols: int):
@@ -261,7 +262,7 @@ class Qwen35Test(unittest.TestCase):
         self.assertEqual(list(self.p.meta["tensors"]), want)
         T = self.p.meta["tensors"]
         self.assertEqual((T["token_embd.weight"]["type"], T["token_embd.weight"]["shape"]), ("BF16", [H, VOCAB]))
-        self.assertEqual((T["output.weight"]["type"], T["output.weight"]["shape"]), ("NVFP4", [H, VOCAB]))
+        self.assertEqual((T["output.weight"]["type"], T["output.weight"]["shape"]), ("NVFP4_PLANES", [H, VOCAB]))
         self.assertEqual((T["output.scale"]["type"], T["output.scale"]["shape"], T["output.scale"]["bytes"]), ("F32", [1], 4))
         self.assertEqual((T["blk.0.attn_qkv.weight"]["type"], T["blk.0.attn_qkv.weight"]["shape"]), ("F8_E4M3", [H, QKV]))
         self.assertEqual((T["blk.0.attn_qkv.scale"]["type"], T["blk.0.attn_qkv.scale"]["bytes"]), ("F32", 4))
@@ -270,7 +271,7 @@ class Qwen35Test(unittest.TestCase):
         self.assertEqual((T["blk.0.ssm_a"]["type"], T["blk.0.ssm_a"]["shape"]), ("F32", [48]))
         self.assertEqual(T["blk.0.ssm_alpha.weight"]["type"], "BF16")
         self.assertEqual(T["blk.1.attn_q.weight"]["shape"], [H, 2 * NHEAD * HD])
-        self.assertEqual((T["blk.0.ffn_down.weight"]["type"], T["blk.0.ffn_down.weight"]["shape"]), ("NVFP4", [FF, H]))
+        self.assertEqual((T["blk.0.ffn_down.weight"]["type"], T["blk.0.ffn_down.weight"]["shape"]), ("NVFP4_PLANES", [FF, H]))
         self.assertEqual(T["mtp.ffn_gate.weight"]["type"], "Q8_0")        # the drafter's MLP is BF16 in the checkpoint
         self.assertEqual(T["mtp.fc.weight"]["shape"], [2 * H, H])
         for n, t in T.items():
@@ -286,11 +287,14 @@ class Qwen35Test(unittest.TestCase):
                           (P + "layers.1.mlp.up_proj.weight", "blk.1.ffn_up.weight")):
             codes, sc, g = self.fx.fp4[src]
             got = self.p.raw(name)
-            self.assertEqual(got, C.nvfp4_rows(codes, sc).tobytes(), name)
             rows, cols = codes.shape[0], codes.shape[1] * 2
             self.assertEqual(len(got), rows * S.nvfp4_row_bytes(cols))
-            blocks = np.frombuffer(got, np.uint8)
-            np.testing.assert_array_equal(basalt_values(blocks, cols), modelopt_values(codes, sc), name)
+            # the code plane as stored, then each scale at its tile slot (nvfp4_planes.hpp)
+            self.assertEqual(got[:rows * cols // 2], codes.tobytes(), name)
+            tiles = np.frombuffer(got[rows * cols // 2:], np.uint8)
+            r, q = np.meshgrid(np.arange(rows), np.arange(cols // 16), indexing="ij")
+            idx = ((r // 128) * (cols // 64) + q // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + q % 4
+            np.testing.assert_array_equal(tiles[idx], sc, name)
             scale = self.p.f32(name[:-len(".weight")] + ".scale")
             self.assertEqual(scale.tolist(), [float(g)], name)
 
@@ -400,10 +404,10 @@ class Qwen35Test(unittest.TestCase):
         for k, x in want.items():
             self.assertEqual(kv[k], x, k)
         self.assertAlmostEqual(kv[A + "attention.layer_norm_rms_epsilon"], 1e-6, 12)
-        self.assertEqual(kv["tokenizer.ggml.tokens"], TOKENS)
+        self.assertEqual(kv["tokenizer.ggml.tokens"], PADDED)
         self.assertEqual(kv["tokenizer.ggml.merges"], ["a b", "c d"])
         self.assertEqual(kv["tokenizer.ggml.token_type"][:12], [1] * 12)
-        self.assertEqual(kv["tokenizer.ggml.token_type"][12:], [3] * 4)
+        self.assertEqual(kv["tokenizer.ggml.token_type"][12:16], [3] * 4)
         self.assertEqual(kv["tokenizer.chat_template"], "{{ messages }}")
         self.assertEqual(self.p.meta["arch"], "qwen35")
         self.assertEqual(self.p.meta["mtp"]["layers"], 1)
@@ -414,7 +418,7 @@ class Qwen35Test(unittest.TestCase):
     def test_text_vocab_and_sections(self):
         md = self.p.tv.metadata
         self.assertEqual(md["general.architecture"], "qwen35")
-        self.assertEqual(md["tokenizer.ggml.tokens"], TOKENS)
+        self.assertEqual(md["tokenizer.ggml.tokens"], PADDED)
         self.assertEqual(md["qwen35.block_count"], 2)
         self.assertEqual(self.p.tv.tensors, [])
         names = self.p.mf.names()
@@ -513,15 +517,13 @@ class Qwen35RefusalTest(unittest.TestCase):
             codes, sc, g = fx.fp4["lm_head.weight"]
             sc = sc.copy()
             sc[0, 0] |= 0x80
-            data = Q._job(("fp4", str(d / "model-00001-of-00001.safetensors"),
-                           C.Checkpoint(d).t["lm_head.weight"][1], str(d / "model-00001-of-00001.safetensors"),
-                           C.Checkpoint(d).t["lm_head.weight_scale"][1], H, 0, 2))
+            data = Q._job(("fp4s", str(d / "model-00001-of-00001.safetensors"),
+                           C.Checkpoint(d).t["lm_head.weight_scale"][1], H, 0, VOCAB))
             self.assertIsInstance(data, bytes)      # the intact scales convert
             fx.tens["lm_head.weight_scale"] = ("F8_E4M3", sc.shape, sc.tobytes())
             write_safetensors(d / "model-00001-of-00001.safetensors", fx.tens)
             ck = C.Checkpoint(d)
-            bad = Q._job(("fp4", str(d / "model-00001-of-00001.safetensors"), ck.t["lm_head.weight"][1],
-                          str(d / "model-00001-of-00001.safetensors"), ck.t["lm_head.weight_scale"][1], H, 0, 2))
+            bad = Q._job(("fp4s", str(d / "model-00001-of-00001.safetensors"), ck.t["lm_head.weight_scale"][1], H, 0, VOCAB))
             self.assertIsInstance(bad, str)
 
 

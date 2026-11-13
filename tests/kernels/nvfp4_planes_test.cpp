@@ -43,7 +43,15 @@ int main() {
                 bad += got != ref[(size_t) v] && !(got == 0.0f && ref[(size_t) v] == 0.0f);
             }
         }
-    const bool ok = bad == 0 && cudaGetLastError() == cudaSuccess;
-    std::printf("nvfp4 planes from ggml blocks: %s (%d values differ)\n", ok ? "same values" : "WRONG  FAIL", bad);
+    // and back: the blocks bit for bit
+    void* d_b2;
+    cudaMalloc(&d_b2, blk.size());
+    p::to_blocks(d_p, rows, K, d_b2, nullptr);
+    std::vector<uint8_t> back(blk.size());
+    cudaMemcpy(back.data(), d_b2, back.size(), cudaMemcpyDeviceToHost);
+    const bool round = back == blk;
+    const bool ok = bad == 0 && round && cudaGetLastError() == cudaSuccess;
+    std::printf("nvfp4 planes from ggml blocks: %s (%d values differ); back to blocks: %s\n",
+                bad == 0 ? "same values" : "WRONG  FAIL", bad, round ? "bitwise" : "DIFFER  FAIL");
     return ok ? 0 : 1;
 }
