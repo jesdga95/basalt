@@ -2,6 +2,7 @@
 // pack into the shared dense stack and hands out its sessions.
 #include "models/qwen35/adapter.hpp"
 
+#include "basalt/core/diag.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/model/flags.hpp"
@@ -372,6 +373,7 @@ public:
         if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--diag-drafter") { drafter_choice() = args.next("--diag-drafter"); }
         else if (a == "--kv") o.kv = args.next("--kv");
+        else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
         return true;
     }
