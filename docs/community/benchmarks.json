@@ -2040,6 +2040,42 @@
       "draft_len_prose": 1.5,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8",
       "notes": "Q4_K/Q5_1 and Q4_K/Q8_0 expert layers take the engine's 'glue off' fallback, so decode trails the NVFP4 and IQ4_XS packs on this card"
+    },
+    {
+      "submitter": "zzl",
+      "date": "2026-11-13",
+      "commit": "101401ac49",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090 Laptop GPU",
+          "vram_gib": 24,
+          "power_w": 98,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 55.4
+        }
+      ],
+      "ram_gib": 51,
+      "cpu": "Intel Core Ultra 9 275HX, 24 cores",
+      "ram_gbps": 83.4,
+      "os": "WSL2",
+      "quant": "IQ3_XXS",
+      "kv": "int8",
+      "prefill_16k_tps": 2639.3,
+      "prefill_64k_tps": 3222.9,
+      "decode_tps": 197.3,
+      "decode_conv_tps": 134.6,
+      "decode_struct_tps": 233.1,
+      "decode_prose_tps": 117.3,
+      "accept_conv_pct": 72.3,
+      "accept_struct_pct": 95.2,
+      "accept_prose_pct": 63.7,
+      "draft_len_conv": 2.4,
+      "draft_len_struct": 6.8,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+      "notes": "Dynamic GPU limit 80-110W under load (mostly 80W); power_w=98 is final snapshot. All 3 engines: runtime expert file blob reads 0; 4387/4387 lendable slots RAM-backed."
     }
   ]
 }
