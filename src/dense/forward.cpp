@@ -220,7 +220,7 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
     ChunkScratch& b = m.cs;
     const int H = g.n_embd;
     kernels::rms_norm_rows(b.x, L.ffn_norm, b.xn, T, H, g.eps, s);
-    if (T >= kFp4Rows && L.gate.type == 40 && L.up.type == 40 && L.down.type == 40) {   // a long chunk: W4A4
+    if (T >= m.o.fp4_rows && L.gate.type == 40 && L.up.type == 40 && L.down.type == 40) {   // a long chunk: W4A4
         fp4_quant(m, b.xn, H, T, s);
         gemm_fp4(m, L.gate, b.g, T, s);
         gemm_fp4(m, L.up, b.u, T, s);
