@@ -6,6 +6,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/prefill/fp8_gemm.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 
 #include <algorithm>
@@ -25,11 +26,20 @@ bool cuda_ok(const char* what, std::string& err) {
 
 // A decode window's products run on MMQ with the tile of a full window whatever the window's rows, so a row's output
 // does not depend on how many rows the window has: the activations are always quantized for kWindow rows (the rows past
-// T hold finite stale values) and the bounds {0, T} say which rows are written.
+// T hold finite stale values) and the bounds {0, T} say which rows are written.  F8 projections run on fp8_window over
+// all kWindow rows (fp16 activations; a row's output depends on its own row only), the tensor scale applied in the product.
 void wquant(const float* x, void* xq, int type, int64_t cols, cudaStream_t s) {
-    prefill::mmq::quantize(x, nullptr, xq, type, cols, cols, kWindow, s);
+    if (type == kTypeF8) kernels::fp8w::pack(x, cols, cols, kWindow, xq, s);
+    else prefill::mmq::quantize(x, nullptr, xq, type, cols, cols, kWindow, s);
 }
+// the scale the step after a product applies: an NVFP4 matrix's (its product leaves it out), none after an F8 product
+const float* post_scale(const Linear& l) { return l.type == kTypeF8 ? nullptr : l.scale; }
 void gemv(Model& m, const Linear& l, const void* xq, float* y, cudaStream_t s) {
+    if (l.type == kTypeF8) {
+        kernels::fp8w::gemm((const uint8_t*) l.w, l.rows, l.cols, xq, l.scale, y, l.rows, kernels::fp8w::Epilogue::Store,
+                            kWindow, m.ws.w8, s);
+        return;
+    }
     prefill::mmq::Product p;
     p.w = l.w;
     p.type = l.type;
@@ -48,8 +58,12 @@ void gemv(Model& m, const Linear& l, const void* xq, float* y, cudaStream_t s) {
     m.mmq->run(p, s);
 }
 
-// y [T][rows] = W . x on MMQ (xq quantized for l.type)
+// y [T][rows] = W . x on MMQ (xq quantized for l.type), or for F8 on the FP8 tensor cores with the tensor scale applied
 void gemm(Model& m, const Linear& l, const void* xq, float* y, int T, cudaStream_t s) {
+    if (l.type == kTypeF8) {
+        prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, xq, T, y, l.rows, prefill::fp8::Epilogue::Store, s);
+        return;
+    }
     prefill::mmq::Product p;
     p.w = l.w;
     p.type = l.type;
@@ -68,7 +82,8 @@ void gemm(Model& m, const Linear& l, const void* xq, float* y, int T, cudaStream
 }
 
 void quantize_mmq(const float* x, void* xq, int type, int64_t cols, int T, cudaStream_t s) {
-    prefill::mmq::quantize(x, nullptr, xq, type, cols, cols, T, s);
+    if (type == kTypeF8) prefill::fp8::quantize(x, T, cols, cols, xq, s);
+    else prefill::mmq::quantize(x, nullptr, xq, type, cols, cols, T, s);
 }
 
 // rope positions [T][3] of cells pos.. for text rows
@@ -96,7 +111,7 @@ void win_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64
     kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
     wquant(b.ag, b.yq, L.o.type, AQ, s);
     gemv(m, L.o, b.yq, b.tmp, s);
-    kernels::add_scaled(b.x, b.tmp, L.o.scale, (int64_t) T * H, s);
+    kernels::add_scaled(b.x, b.tmp, post_scale(L.o), (int64_t) T * H, s);
 }
 
 void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s) {
@@ -135,7 +150,7 @@ void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStre
     kernels::dec_gdn_rec(a, T, s);
     wquant(b.y, b.yq, L.out.type, g.value_width(), s);
     gemv(m, L.out, b.yq, b.tmp, s);
-    kernels::add_scaled(b.x, b.tmp, L.out.scale, (int64_t) T * H, s);
+    kernels::add_scaled(b.x, b.tmp, post_scale(L.out), (int64_t) T * H, s);
 }
 
 void win_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
@@ -172,7 +187,7 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
     quantize_mmq(b.ag, b.xq, L.o.type, AQ, T, s);
     gemm(m, L.o, b.xq, b.tmp, T, s);
-    kernels::add_scaled(b.x, b.tmp, L.o.scale, (int64_t) T * H, s);
+    kernels::add_scaled(b.x, b.tmp, post_scale(L.o), (int64_t) T * H, s);
 }
 
 void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s) {
@@ -192,7 +207,7 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
     kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn);
     quantize_mmq(b.yn, b.xq, L.out.type, VD, T, s);
     gemm(m, L.out, b.xq, b.tmp, T, s);
-    kernels::add_scaled(b.x, b.tmp, L.out.scale, (int64_t) T * H, s);
+    kernels::add_scaled(b.x, b.tmp, post_scale(L.out), (int64_t) T * H, s);
 }
 
 // y [T][rows] = W . x for an NVFP4 matrix on the FP4 tensor cores, x already rounded to FP4 (fp4_quant)
@@ -400,7 +415,7 @@ void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, i
     kernels::attn_gate(b.ao, b.qfull, b.ag, rows, g.n_head, s);
     wquant(b.ag, b.yq, L.o.type, AQ, s);
     gemv(m, L.o, b.yq, b.tmp, s);
-    kernels::add_scaled(b.x, b.tmp, L.o.scale, (int64_t) rows * H, s);
+    kernels::add_scaled(b.x, b.tmp, post_scale(L.o), (int64_t) rows * H, s);
 }
 
 void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int rows, int max_n, cudaStream_t s) {
@@ -438,7 +453,7 @@ void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int rows,
     kernels::gdn_rows_scatter(b.btab->dst, rows, b.rq, b.rh, b.rgate, b.rbeta, C, g.gdn_v_heads, gi, kWindow, s);
     wquant(b.y, b.yq, L.out.type, g.value_width(), s);
     gemv(m, L.out, b.yq, b.tmp, s);
-    kernels::add_scaled(b.x, b.tmp, L.out.scale, (int64_t) rows * H, s);
+    kernels::add_scaled(b.x, b.tmp, post_scale(L.out), (int64_t) rows * H, s);
 }
 
 }  // namespace

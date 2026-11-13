@@ -23,8 +23,9 @@ namespace basalt::dense {
 
 enum class Mixer { Gdn, Attention };
 
-/// One projection: `rows` outputs of `cols` inputs, ggml blocks of `type` (Q8_0 8, NVFP4 40) on the device; `scale`
-/// an NVFP4 matrix's fp32 tensor scale (device), null for 1.
+/// One projection: `rows` outputs of `cols` inputs, ggml blocks of `type` (Q8_0 8, NVFP4 40, F8_E4M3 44: one E4M3 code
+/// per value, rows of `cols` bytes) on the device; `scale` an NVFP4 or F8 matrix's fp32 tensor scale (device), null for 1.
+/// An NVFP4 product leaves the scale to the step after it; an F8 product applies it itself.
 struct Linear {
     int type = -1;
     const void* w = nullptr;

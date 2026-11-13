@@ -21,7 +21,7 @@
 namespace basalt::models::qwen35 {
 namespace {
 
-constexpr int kTypeF32 = 0, kTypeQ8_0 = 8, kTypeBf16 = 30, kTypeNvfp4 = 40;
+constexpr int kTypeF32 = 0, kTypeQ8_0 = 8, kTypeBf16 = 30, kTypeNvfp4 = 40, kTypeF8 = 44;
 
 class Loaded final : public model::LoadedModel {
 public:
@@ -308,7 +308,7 @@ private:
         return (const uint16_t*) d;
     }
 
-    // `<base>.weight` (Q8_0 or NVFP4, rows x cols) and, for NVFP4, its tensor scale `<base>.scale`
+    // `<base>.weight` (Q8_0, NVFP4 or F8_E4M3, rows x cols) and, for NVFP4 and F8_E4M3, its tensor scale `<base>.scale`
     bool linear(const GgufFile& gg, const std::string& base, int64_t rows, int64_t cols, dense::Linear& l, std::string& err) {
         auto it = tensors_.find(base + ".weight");
         if (it == tensors_.end()) {
@@ -316,8 +316,12 @@ private:
             return false;
         }
         const int type = (int) it->second.type;
-        if (type != kTypeQ8_0 && type != kTypeNvfp4) {
-            err = "qwen35: " + base + ".weight is " + it->second.type_name() + "; the dense kernels read Q8_0 and NVFP4";
+        if (type != kTypeQ8_0 && type != kTypeNvfp4 && type != kTypeF8) {
+            err = "qwen35: " + base + ".weight is " + it->second.type_name() + "; the dense kernels read Q8_0, NVFP4 and F8_E4M3";
+            return false;
+        }
+        if (type == kTypeF8 && cols % 256 != 0) {
+            err = "qwen35: " + base + ".weight: F8_E4M3 rows of " + std::to_string(cols) + " values (the kernels read multiples of 256)";
             return false;
         }
         const TensorInfo* t = need(gg, base + ".weight", type, rows * cols, err);
@@ -330,7 +334,7 @@ private:
         l.cols = cols;
         l.w = upload(gg, *t, err);
         if (!l.w) return false;
-        if (type == kTypeNvfp4) {
+        if (type == kTypeNvfp4 || type == kTypeF8) {
             l.scale = floats(gg, base + ".scale", 1, err);
             if (!l.scale) return false;
         }
