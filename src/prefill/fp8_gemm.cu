@@ -111,12 +111,15 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
     unsigned long long* full = reinterpret_cast<unsigned long long*>(raw + ACT_BYTES + W_BYTES);
     unsigned long long* empty = full + ST;
     // the grid: weight row tiles of every segment, the token tiles fastest (a weight tile serves them back to back)
-    const int row_tile = blockIdx.x / p.tok_tiles, tok_tile = blockIdx.x - row_tile * p.tok_tiles;
-    int si = 0;
-    for (int i = 1; i < p.nseg; ++i)
-        if (row_tile >= p.seg[i].tile0) si = i;
-    const Seg sg = p.seg[si];
-    const int row0 = (row_tile - sg.tile0) * BR, tok0 = tok_tile * BT;
+    // (worked out where used, so the consumers carry nothing extra through the K loop: 9 warps leave 168 registers)
+    const auto tile = [&](int& si, int& row0, int& tok0) {
+        const int row_tile = blockIdx.x / p.tok_tiles, tok_tile = blockIdx.x - row_tile * p.tok_tiles;
+        si = 0;
+        for (int i = 1; i < p.nseg; ++i)
+            if (row_tile >= p.seg[i].tile0) si = i;
+        row0 = (row_tile - p.seg[si].tile0) * BR;
+        tok0 = tok_tile * BT;
+    };
     if (threadIdx.x == 0) {
 #pragma unroll
         for (int s = 0; s < ST; ++s) {
@@ -128,6 +131,8 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
     __syncthreads();
     if (threadIdx.x < 32) {
         if (threadIdx.x == 0) {
+            int si, row0, tok0;
+            tile(si, row0, tok0);
             const TmaDesc* tw = &p.tm[1 + si];
             for (int kt = 0; kt < p.k_tiles; ++kt) {
                 const int st = kt % ST;
@@ -143,9 +148,9 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
     float acc[MT][MR][4] = {};
     const int am = lane >> 3, a_row = (lane & 7) + ((am & 1) << 3), a_col = (am >> 1) * 16;
     const int b_row = lane & 7, b_col = ((lane >> 3) & 1) * 16;
-    for (int kt = 0; kt < p.k_tiles; ++kt) {
-        const int st = kt % ST;
-        mb_wait(full + st, (kt / ST) & 1u);
+    // the K loop a stage pair at a time, so each tile's stage (its shared-memory offsets and barriers) is a constant
+    const auto stage = [&](const int st, const unsigned phase) {
+        mb_wait(full + st, phase);
         const unsigned char* as = act + st * BT * BK;
         const unsigned char* ws = wt + st * BR * BK;
         unsigned af[2][MT][4], bf[2][MR][2];
@@ -173,7 +178,16 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         __syncwarp();
         if (lane == 0) mb_arrive(empty + st);
+    };
+    static_assert(ST == 2, "the K loop pairs the two stages");
+    for (int kt = 0; kt < p.k_tiles; kt += 2) {
+        const unsigned phase = (kt / 2) & 1u;
+        stage(0, phase);
+        if (kt + 1 < p.k_tiles) stage(1, phase);
     }
+    int si, row0, tok0;
+    tile(si, row0, tok0);
+    const Seg sg = p.seg[si];
     const float ws = sg.scale ? *sg.scale : 1.0f;
     const bool add = p.epi == (int) Epilogue::Add || p.epi == (int) Epilogue::AddBf16;
     // a token row at a time: with Add, its residual pairs are all loaded before any is written back (the loads overlap),
