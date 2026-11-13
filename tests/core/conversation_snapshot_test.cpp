@@ -140,11 +140,11 @@ void full_session(int fmt, int mode, int experts) {
     checkpoint.ids.assign(ids.begin(),ids.begin()+3);
     check(conversation_checkpoint_save(checkpoint,ss,g,err),"save complete running checkpoint");
     {   // a deferred save equals the plain one, though the device state changes right after it is issued
-        ConversationCheckpointDeferral deferral;
-        check(deferral.reserve(sizes.gdn,err),"reserve the deferred checkpoint buffer");
+        CheckpointDeferral deferral;
+        check(deferral.reserve(conversation_checkpoint_bytes(ss,g),err),"reserve the deferred checkpoint buffer");
         ConversationCheckpoint deferred;
         deferred.ids=checkpoint.ids;
-        check(deferral.save(deferred,ss,g,err) && deferral.pending()==deferred.state_a.data(),"issue deferred checkpoint save");
+        check(conversation_checkpoint_save_deferred(deferral,deferred,ss,g,err) && deferral.pending()==deferred.state_a.data(),"issue deferred checkpoint save");
         cuda_check(cudaMemset(ss.gdn_state,0x5a,sizes.gdn));
         cuda_check(cudaDeviceSynchronize());
         check(deferral.finish(err) && deferral.pending()==nullptr,"finish deferred checkpoint save");

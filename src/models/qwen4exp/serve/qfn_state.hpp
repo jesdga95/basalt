@@ -235,9 +235,6 @@ private:
     bool pipe_on{};
     basalt::core::PoolMultiFn win_pool_fn{};
     void* win_pool_user{};
-    // A turn-boundary checkpoint's GDN bytes reach the host after the first token (see the deferral class); this
-    // is declared after `checks` so it is destroyed, and its copy finished, before the checkpoints are.
-    basalt::core::ConversationCheckpointDeferral ckd{};
     std::vector<basalt::core::SessionState> rviews{};
     basalt::core::SessionState* rsp{};
     // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
@@ -385,7 +382,6 @@ private:
     basalt::core::Verifier& stage_ver(int st);
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
-    void ckd_finish() override;
     bool capture_admit(uint64_t need, uint64_t floor) override;
     bool park_current(size_t held, int64_t kept) override;
     bool gpu_sync_ok();

@@ -50,18 +50,6 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
     return basalt::core::conversation_store_hash_file(o.model, h);
 }
 
-// finishes the in-flight host copy; a failed one drops its checkpoint
-void QfnRuntime::ckd_finish() {
-    const void* dst = ckd.pending();
-    if (dst == nullptr) return;
-    std::string ce;
-    if (ckd.finish(ce)) return;
-    basalt::log::error("basalt serve", "%s", ce.c_str());
-    checks.erase(std::remove_if(checks.begin(), checks.end(),
-                                [&](const ConvCheckpoint& k) { return k.state_a.data() == dst; }), checks.end());
-}
-
-
 // A capture of a conversation's state, or a read of one from disk, takes `need` bytes of RAM: only while the RAM
 // guard reads its level as ok, and with `floor` left free after it (the disk tier's floor sits above the guard's).
 bool QfnRuntime::capture_admit(uint64_t need, uint64_t floor) {
@@ -231,12 +219,7 @@ bool QfnRuntime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bo
     ckpt_why.clear();
     ckd_finish();
     if (o.prompt_cache <= 0 || L < 1) return true;
-    for (ConvCheckpoint& c : checks)
-        if ((int64_t) c.ids.size() == L) {   // a turn end or the root outranks a stride that landed on it
-            c.used = ++check_clock;
-            if (source > c.source) c.source = source;
-            return true;
-        }
+    if (touch_check(L, source)) return true;
     ConvCheckpoint c;
     c.source = source;
     c.ids.assign(cur.begin(), cur.begin() + L);
@@ -253,7 +236,10 @@ bool QfnRuntime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bo
         if (!gpu_sync_ok()) return false;
         std::string ce;
         if (defer && stages.empty()) {
-            if (!ckd.save(c, *rsp, g, ce)) { basalt::log::error("basalt serve", "checkpoint save: %s", ce.c_str()); return false; }
+            if (!basalt::core::conversation_checkpoint_save_deferred(ckd, c, *rsp, g, ce)) {
+                basalt::log::error("basalt serve", "checkpoint save: %s", ce.c_str());
+                return false;
+            }
         } else if (!checkpoint_save(c, *rsp, g)) return false;
         for (auto& st : stages) {   // a layer split's later stages: their sessions' part
             const basalt::core::OnDevice on(st->dev);
@@ -263,17 +249,7 @@ bool QfnRuntime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bo
             c.stage_parts.push_back(std::move(part));
         }
     }
-    c.used = ++check_clock;
-    checks.push_back(std::move(c));
-    while ((int) checks.size() > o.prompt_cache) {
-        std::vector<uint64_t> stamps;
-        stamps.reserve(checks.size());
-        for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
-        const size_t victim = basalt::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
-                                                                           o.prompt_cache);
-        if (checks[victim].state_a.data() == ckd.pending()) ckd_finish();
-        checks.erase(checks.begin() + (std::ptrdiff_t) victim);
-    }
+    keep_check(std::move(c));
     return true;
 }
 
@@ -515,7 +491,7 @@ int QfnRuntime::init_conversations() {
     // (the checkpoints' pooled blocks were reserved, their pages written, before the RAM copy)
     if (o.prompt_cache > 0 && !multi_gpu) {
         std::string ce;
-        if (!ckd.reserve(conv_state_sizes(g, ss).gdn, ce))
+        if (!ckd.reserve(basalt::core::conversation_checkpoint_bytes(ss, g), ce))
             basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", ce.c_str());
     }
 
