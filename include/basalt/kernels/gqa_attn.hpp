@@ -6,7 +6,10 @@
 //
 //   gqa_decode_attn   a decode window (T <= 8): cells split in chunks over the grid, fp32 dot products, the chunks'
 //                     partial softmax sums merged by a second kernel.  A row's output does not depend on T.
-//   gqa_prompt_attn   a prompt chunk: 64-query tiles per head on fp16 tensor cores (fp32 accumulation, online softmax).
+//   gqa_prompt_attn   a prompt chunk: blocks of 96 rows (positions x the KV group's query heads, so a K/V tile is read
+//                     once per group); QK^T on int8 tensor cores for an int8 cache (q rounded to int8 per 64 values), fp16
+//                     ones with fp32 accumulation for fp16; P V on fp16 tensor cores summed in fp16 per 32-cell tile,
+//                     online softmax and the output in fp32.
 #pragma once
 
 #include <cstddef>

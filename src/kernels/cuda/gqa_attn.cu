@@ -180,7 +180,31 @@ void launch_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n
 }
 
 // ---------------------------------------------------------------- prompt
-constexpr int BM = 64, BN = 32, NW = 4, LDS = HD + 8;   // query tile, cell tile, warps, padded smem row (halves)
+// Block (query tile, KV head): its 96 rows are the tile's positions times the KV group's query heads (head fastest), so
+// a K/V tile is read once for every head of the group.  Warp w owns rows 16 w .. 16 w + 15.  Cells stream in tiles of
+// 32.  QK^T: an int8 cache on int8 tensor cores (queries rounded to int8 per 64 dims, each 64-dim group's integer sum
+// times the query's and the cell's scales, in fp32), an fp16 cache on fp16 tensor cores with fp32 accumulation.  P V:
+// fp16 tensor cores accumulating each 32-cell tile in fp16, added to the fp32 output.  Online softmax in fp32.
+constexpr int PNW = 6, PROWS = 16 * PNW, PBN = 32;
+constexpr int LDH = HD + 8;    // padded fp16 row (halves)
+constexpr int LD8 = HD + 16;   // padded int8 row (bytes)
+
+struct PromptSmem8 {
+    int8_t q[PROWS][LD8];
+    float qs[PROWS][HD / 64];
+    struct Stage {
+        int8_t k[PBN][LD8];
+        int8_t v[PBN][LD8];
+        uint16_t ks[PBN][HD / 64];
+        uint16_t vs[PBN][HD / 64];
+    } st[2];
+    __half vh[PBN][LDH];
+};
+struct PromptSmem16 {
+    __half q[PROWS][LDH];
+    __half k[PBN][LDH];
+    __half v[PBN][LDH];
+};
 
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void ldsm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const void* p) {
@@ -198,6 +222,19 @@ __device__ __forceinline__ void mma16816(float (&c)[4], unsigned a0, unsigned a1
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
+__device__ __forceinline__ void mma16816_h(unsigned (&c)[2], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                           unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void mma16832_s8(int (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                            unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
 __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
     const __half2 h = __floats2half2_rn(lo, hi);
     return *reinterpret_cast<const unsigned*>(&h);
@@ -205,89 +242,194 @@ __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
 __device__ __forceinline__ void cp16(void* dst, const void* src, bool ok) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(dst)), "l"(src), "r"(ok ? 16 : 0));
 }
+__device__ __forceinline__ void cp8(void* dst, const void* src, bool ok) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(smem_u32(dst)), "l"(src), "r"(ok ? 8 : 0));
+}
+__device__ __forceinline__ float h2f(uint16_t u) { return __half2float(__ushort_as_half(u)); }
 
-struct PromptSmem {
-    __half q[BM][LDS];
-    __half k[BN][LDS];
-    __half v[BN][LDS];
-};
-
-// Block (query tile, query head): warp w owns query rows 16 w .. 16 w + 15 of the tile.
-__global__ void __launch_bounds__(NW * 32) prompt_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
-                                                         const __half* __restrict__ vc, int n_head, int n_kv,
-                                                         int64_t pos0, int64_t T, float* __restrict__ out, KvInt8 q8) {
+template <bool I8>
+__global__ void __launch_bounds__(PNW * 32) prompt_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
+                                                          const __half* __restrict__ vc, int n_head, int n_kv,
+                                                          int64_t pos0, int64_t T, float* __restrict__ out, KvInt8 q8) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    PromptSmem& sm = *reinterpret_cast<PromptSmem*>(smem_raw);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int head = blockIdx.y, kvh = head / (n_head / n_kv);
-    const int64_t q0 = (int64_t) blockIdx.x * BM;
-    // the query tile, fp16
-    for (int i = tid; i < BM * HD / 4; i += NW * 32) {
-        const int r = i / (HD / 4), c = (i % (HD / 4)) * 4;
-        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (q0 + r < T) v = *reinterpret_cast<const float4*>(q + ((q0 + r) * n_head + head) * HD + c);
-        *reinterpret_cast<__half2*>(&sm.q[r][c]) = __floats2half2_rn(v.x, v.y);
-        *reinterpret_cast<__half2*>(&sm.q[r][c + 2]) = __floats2half2_rn(v.z, v.w);
-    }
+    const int G = n_head / n_kv, PB = PROWS / G;   // query heads per KV head, positions per tile
+    const int kvh = blockIdx.y;
+    const int64_t q0 = (int64_t) (gridDim.x - 1 - blockIdx.x) * PB;   // the longest tiles first
+    const int64_t last_pos = min(T, q0 + PB) - 1;
+    const int64_t cells = pos0 + last_pos + 1;
     const int g = lane >> 2, tq = lane & 3;
-    const int64_t row_a = q0 + warp * 16 + g, row_b = row_a + 8;   // this thread's two query rows (chunk index)
+    const int ra = warp * 16 + g, rb = ra + 8;                         // this thread's two rows
+    const int64_t pos_a = q0 + ra / G, pos_b = q0 + rb / G;
+    const int head_a = kvh * G + ra % G, head_b = kvh * G + rb % G;
+
+    // the query tile
+    if constexpr (I8) {
+        PromptSmem8& sm = *reinterpret_cast<PromptSmem8*>(smem_raw);
+        for (int it = tid; it < PROWS * (HD / 64); it += PNW * 32) {
+            const int r = it / (HD / 64), grp = it % (HD / 64);
+            const int64_t pos = q0 + r / G;
+            const int head = kvh * G + r % G;
+            float v[64];
+            float amax = 0.0f;
+            if (pos < T) {
+                const float4* src = reinterpret_cast<const float4*>(q + (pos * n_head + head) * HD + grp * 64);
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const float4 f = src[j];
+                    v[4 * j] = f.x; v[4 * j + 1] = f.y; v[4 * j + 2] = f.z; v[4 * j + 3] = f.w;
+                }
+#pragma unroll
+                for (int j = 0; j < 64; ++j) amax = fmaxf(amax, fabsf(v[j]));
+            } else {
+#pragma unroll
+                for (int j = 0; j < 64; ++j) v[j] = 0.0f;
+            }
+            const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+            unsigned* dst = reinterpret_cast<unsigned*>(&sm.q[r][grp * 64]);
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                unsigned w = 0;
+#pragma unroll
+                for (int b = 0; b < 4; ++b) w |= ((unsigned) (__float2int_rn(v[4 * j + b] * inv) & 0xFF)) << (8 * b);
+                dst[j] = w;
+            }
+            sm.qs[r][grp] = amax / 127.0f;
+        }
+    } else {
+        PromptSmem16& sm = *reinterpret_cast<PromptSmem16*>(smem_raw);
+        for (int i = tid; i < PROWS * HD / 4; i += PNW * 32) {
+            const int r = i / (HD / 4), c = (i % (HD / 4)) * 4;
+            const int64_t pos = q0 + r / G;
+            const int head = kvh * G + r % G;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (pos < T) v = *reinterpret_cast<const float4*>(q + (pos * n_head + head) * HD + c);
+            *reinterpret_cast<__half2*>(&sm.q[r][c]) = __floats2half2_rn(v.x, v.y);
+            *reinterpret_cast<__half2*>(&sm.q[r][c + 2]) = __floats2half2_rn(v.z, v.w);
+        }
+    }
+
     float o[HD / 8][4];
 #pragma unroll
     for (int n = 0; n < HD / 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
     float m_a = kNeg, m_b = kNeg, l_a = 0.0f, l_b = 0.0f;
-    const int64_t last_row = min(T, q0 + BM) - 1;
-    const int64_t cells = pos0 + last_row + 1;
-    for (int64_t c0 = 0; c0 < cells; c0 += BN) {
-        __syncthreads();   // the previous tile is consumed (and the query tile is written)
-        for (int i = tid; i < BN * HD / 8; i += NW * 32) {
-            const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
+    const int n_tiles = (int) ((cells + PBN - 1) / PBN);
+
+    auto issue8 = [&](int ti, int stg) {   // an int8 tile's codes and scales, asynchronously
+        PromptSmem8& sm = *reinterpret_cast<PromptSmem8*>(smem_raw);
+        const int64_t c0 = (int64_t) ti * PBN;
+        for (int i = tid; i < PBN * (HD / 16); i += PNW * 32) {
+            const int r = i / (HD / 16), c = (i % (HD / 16)) * 16;
             const bool ok = c0 + r < cells;
             const int64_t row = (ok ? c0 + r : 0) * n_kv + kvh;
-            if (q8.k) {   // eight codes times their group's scale, rounded to the fp16 tile
-                const uint2 kw = *reinterpret_cast<const uint2*>(q8.k + row * HD + c);
-                const uint2 vw = *reinterpret_cast<const uint2*>(q8.v + row * HD + c);
-                const float ks = __half2float(__ushort_as_half(q8.ks[row * (HD / 64) + c / 64]));
-                const float vs = __half2float(__ushort_as_half(q8.vs[row * (HD / 64) + c / 64]));
-                const int8_t* kb = reinterpret_cast<const int8_t*>(&kw);
+            cp16(&sm.st[stg].k[r][c], q8.k + row * HD + c, ok);
+            cp16(&sm.st[stg].v[r][c], q8.v + row * HD + c, ok);
+        }
+        if (tid < 2 * PBN) {
+            const int r = tid % PBN;
+            const bool ok = c0 + r < cells;
+            const int64_t row = (ok ? c0 + r : 0) * n_kv + kvh;
+            if (tid < PBN) cp8(&sm.st[stg].ks[r][0], q8.ks + row * (HD / 64), ok);
+            else cp8(&sm.st[stg].vs[r][0], q8.vs + row * (HD / 64), ok);
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    };
+    if constexpr (I8) issue8(0, 0);
+
+    for (int ti = 0; ti < n_tiles; ++ti) {
+        const int64_t c0 = (int64_t) ti * PBN;
+        const int stg = ti & 1;
+        __syncthreads();   // the previous tile is consumed (and the query tile is written)
+        if constexpr (I8) {
+            if (ti + 1 < n_tiles) issue8(ti + 1, stg ^ 1);
+            else asm volatile("cp.async.commit_group;\n" ::: "memory");
+            asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+            __syncthreads();
+            // V codes times their group's scale, rounded to the fp16 tile
+            PromptSmem8& sm = *reinterpret_cast<PromptSmem8*>(smem_raw);
+            for (int i = tid; i < PBN * (HD / 8); i += PNW * 32) {
+                const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
+                const uint2 vw = *reinterpret_cast<const uint2*>(&sm.st[stg].v[r][c]);
+                const float vsc = h2f(sm.st[stg].vs[r][c / 64]);
                 const int8_t* vb = reinterpret_cast<const int8_t*>(&vw);
-#pragma unroll
-                for (int j = 0; j < 8; j += 2) {
-                    *reinterpret_cast<__half2*>(&sm.k[r][c + j]) = ok ? __floats2half2_rn(kb[j] * ks, kb[j + 1] * ks) : __floats2half2_rn(0.f, 0.f);
-                    *reinterpret_cast<__half2*>(&sm.v[r][c + j]) = ok ? __floats2half2_rn(vb[j] * vs, vb[j + 1] * vs) : __floats2half2_rn(0.f, 0.f);
-                }
-            } else {
+                uint4 h;
+                h.x = pack_h2(vb[0] * vsc, vb[1] * vsc);
+                h.y = pack_h2(vb[2] * vsc, vb[3] * vsc);
+                h.z = pack_h2(vb[4] * vsc, vb[5] * vsc);
+                h.w = pack_h2(vb[6] * vsc, vb[7] * vsc);
+                *reinterpret_cast<uint4*>(&sm.vh[r][c]) = h;
+            }
+        } else {
+            PromptSmem16& sm = *reinterpret_cast<PromptSmem16*>(smem_raw);
+            for (int i = tid; i < PBN * HD / 8; i += PNW * 32) {
+                const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
+                const bool ok = c0 + r < cells;
+                const int64_t row = (ok ? c0 + r : 0) * n_kv + kvh;
                 cp16(&sm.k[r][c], kc + row * HD + c, ok);
                 cp16(&sm.v[r][c], vc + row * HD + c, ok);
             }
+            asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
         }
-        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
         __syncthreads();
+
         // S = Q K^T for the warp's 16 rows and the tile's 32 cells (four 8-cell tiles)
-        float s[BN / 8][4];
+        float s[PBN / 8][4];
 #pragma unroll
-        for (int n = 0; n < BN / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+        for (int n = 0; n < PBN / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+        if constexpr (I8) {
+            PromptSmem8& sm = *reinterpret_cast<PromptSmem8*>(smem_raw);
 #pragma unroll
-        for (int k = 0; k < HD; k += 16) {
-            unsigned a0, a1, a2, a3;
-            ldsm_x4(a0, a1, a2, a3, &sm.q[warp * 16 + (lane & 15)][k + (lane >> 4) * 8]);
+            for (int grp = 0; grp < HD / 64; ++grp) {
+                int acc[PBN / 8][4];
 #pragma unroll
-            for (int n = 0; n < BN / 8; n += 2) {
-                unsigned b0, b1, b2, b3;
-                // rows: cells n*8 .. n*8+15; the x4's matrices are (cells 0-7, dims k..k+7), (0-7, k+8..), (8-15, k..), (8-15, k+8..)
-                ldsm_x4(b0, b1, b2, b3, &sm.k[n * 8 + (lane & 7) + ((lane >> 4) << 3)][k + ((lane >> 3) & 1) * 8]);
-                mma16816(s[n], a0, a1, a2, a3, b0, b1);
-                mma16816(s[n + 1], a0, a1, a2, a3, b2, b3);
+                for (int n = 0; n < PBN / 8; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0;
+#pragma unroll
+                for (int kk = 0; kk < 64; kk += 32) {
+                    const int k0 = grp * 64 + kk;
+                    unsigned a0, a1, a2, a3;
+                    ldsm_x4(a0, a1, a2, a3, &sm.q[warp * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)][k0 + (lane >> 4) * 16]);
+#pragma unroll
+                    for (int n = 0; n < PBN / 8; n += 2) {
+                        unsigned b0, b1, b2, b3;
+                        ldsm_x4(b0, b1, b2, b3, &sm.st[stg].k[n * 8 + (lane >> 4) * 8 + (lane & 7)][k0 + ((lane >> 3) & 1) * 16]);
+                        mma16832_s8(acc[n], a0, a1, a2, a3, b0, b1);
+                        mma16832_s8(acc[n + 1], a0, a1, a2, a3, b2, b3);
+                    }
+                }
+                const float qa = sm.qs[ra][grp], qb = sm.qs[rb][grp];
+#pragma unroll
+                for (int n = 0; n < PBN / 8; ++n) {
+                    const float k0s = h2f(sm.st[stg].ks[n * 8 + tq * 2][grp]), k1s = h2f(sm.st[stg].ks[n * 8 + tq * 2 + 1][grp]);
+                    s[n][0] = fmaf((float) acc[n][0], qa * k0s, s[n][0]);
+                    s[n][1] = fmaf((float) acc[n][1], qa * k1s, s[n][1]);
+                    s[n][2] = fmaf((float) acc[n][2], qb * k0s, s[n][2]);
+                    s[n][3] = fmaf((float) acc[n][3], qb * k1s, s[n][3]);
+                }
+            }
+        } else {
+            PromptSmem16& sm = *reinterpret_cast<PromptSmem16*>(smem_raw);
+#pragma unroll
+            for (int k = 0; k < HD; k += 16) {
+                unsigned a0, a1, a2, a3;
+                ldsm_x4(a0, a1, a2, a3, &sm.q[warp * 16 + (lane & 15)][k + (lane >> 4) * 8]);
+#pragma unroll
+                for (int n = 0; n < PBN / 8; n += 2) {
+                    unsigned b0, b1, b2, b3;
+                    ldsm_x4(b0, b1, b2, b3, &sm.k[n * 8 + (lane & 7) + ((lane >> 4) << 3)][k + ((lane >> 3) & 1) * 8]);
+                    mma16816(s[n], a0, a1, a2, a3, b0, b1);
+                    mma16816(s[n + 1], a0, a1, a2, a3, b2, b3);
+                }
             }
         }
-        // mask and online softmax: thread holds rows row_a (s[n][0..1]) and row_b (s[n][2..3])
+        // mask and online softmax: thread holds rows ra (s[n][0..1]) and rb (s[n][2..3])
         float mx_a = m_a, mx_b = m_b;
 #pragma unroll
-        for (int n = 0; n < BN / 8; ++n)
+        for (int n = 0; n < PBN / 8; ++n)
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int64_t cell = c0 + n * 8 + tq * 2 + (i & 1);
-                const int64_t row = i < 2 ? row_a : row_b;
-                const bool vis = cell <= pos0 + row && cell < cells;
+                const int64_t pos = i < 2 ? pos_a : pos_b;
+                const bool vis = cell <= pos0 + pos && cell < cells;
                 s[n][i] = vis ? s[n][i] * kScaleLog2 : kNeg;
                 if (i < 2) mx_a = fmaxf(mx_a, s[n][i]);
                 else mx_b = fmaxf(mx_b, s[n][i]);
@@ -301,7 +443,7 @@ __global__ void __launch_bounds__(NW * 32) prompt_kernel(const float* __restrict
         m_b = mx_b;
         float ps_a = 0.0f, ps_b = 0.0f;
 #pragma unroll
-        for (int n = 0; n < BN / 8; ++n) {
+        for (int n = 0; n < PBN / 8; ++n) {
             s[n][0] = s[n][0] <= kNeg ? 0.0f : exp2f(s[n][0] - m_a);
             s[n][1] = s[n][1] <= kNeg ? 0.0f : exp2f(s[n][1] - m_a);
             s[n][2] = s[n][2] <= kNeg ? 0.0f : exp2f(s[n][2] - m_b);
@@ -311,28 +453,46 @@ __global__ void __launch_bounds__(NW * 32) prompt_kernel(const float* __restrict
         }
         l_a = l_a * sc_a + ps_a;
         l_b = l_b * sc_b + ps_b;
+        // O = O * scale + P V, the tile's P V summed in fp16 on the tensor cores
+        unsigned pa[PBN / 16][4];
 #pragma unroll
-        for (int n = 0; n < HD / 8; ++n) {
-            o[n][0] *= sc_a; o[n][1] *= sc_a;
-            o[n][2] *= sc_b; o[n][3] *= sc_b;
+        for (int j = 0; j < PBN / 16; ++j) {
+            pa[j][0] = pack_h2(s[2 * j][0], s[2 * j][1]);
+            pa[j][1] = pack_h2(s[2 * j][2], s[2 * j][3]);
+            pa[j][2] = pack_h2(s[2 * j + 1][0], s[2 * j + 1][1]);
+            pa[j][3] = pack_h2(s[2 * j + 1][2], s[2 * j + 1][3]);
         }
-        // O += P V: P's C fragments of cell tiles 2j and 2j+1 are the A fragment of k-step j
+        const __half* vt;
+        int ldv;
+        if constexpr (I8) {
+            vt = &reinterpret_cast<PromptSmem8*>(smem_raw)->vh[0][0];
+            ldv = LDH;
+        } else {
+            vt = &reinterpret_cast<PromptSmem16*>(smem_raw)->v[0][0];
+            ldv = LDH;
+        }
 #pragma unroll
-        for (int j = 0; j < BN / 16; ++j) {
-            const unsigned a0 = pack_h2(s[2 * j][0], s[2 * j][1]);
-            const unsigned a1 = pack_h2(s[2 * j][2], s[2 * j][3]);
-            const unsigned a2 = pack_h2(s[2 * j + 1][0], s[2 * j + 1][1]);
-            const unsigned a3 = pack_h2(s[2 * j + 1][2], s[2 * j + 1][3]);
+        for (int n = 0; n < HD / 8; n += 2) {
+            unsigned d0[2] = {0u, 0u}, d1[2] = {0u, 0u};
 #pragma unroll
-            for (int n = 0; n < HD / 8; n += 2) {
+            for (int j = 0; j < PBN / 16; ++j) {
                 unsigned b0, b1, b2, b3;
                 // V rows are cells (k), columns dims (n): transposed loads give the col-major B of dims n*8.., n*8+8..
-                ldsm_x4_t(b0, b1, b2, b3, &sm.v[j * 16 + (lane & 15)][n * 8 + (lane >> 4) * 8]);
-                mma16816(o[n], a0, a1, a2, a3, b0, b1);
-                mma16816(o[n + 1], a0, a1, a2, a3, b2, b3);
+                ldsm_x4_t(b0, b1, b2, b3, vt + (j * 16 + (lane & 15)) * ldv + n * 8 + (lane >> 4) * 8);
+                mma16816_h(d0, pa[j][0], pa[j][1], pa[j][2], pa[j][3], b0, b1);
+                mma16816_h(d1, pa[j][0], pa[j][1], pa[j][2], pa[j][3], b2, b3);
             }
+            const float2 e0 = __half22float2(*reinterpret_cast<const __half2*>(&d0[0]));
+            const float2 e1 = __half22float2(*reinterpret_cast<const __half2*>(&d0[1]));
+            const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&d1[0]));
+            const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&d1[1]));
+            o[n][0] = fmaf(o[n][0], sc_a, e0.x); o[n][1] = fmaf(o[n][1], sc_a, e0.y);
+            o[n][2] = fmaf(o[n][2], sc_b, e1.x); o[n][3] = fmaf(o[n][3], sc_b, e1.y);
+            o[n + 1][0] = fmaf(o[n + 1][0], sc_a, f0.x); o[n + 1][1] = fmaf(o[n + 1][1], sc_a, f0.y);
+            o[n + 1][2] = fmaf(o[n + 1][2], sc_b, f1.x); o[n + 1][3] = fmaf(o[n + 1][3], sc_b, f1.y);
         }
     }
+    if constexpr (I8) asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     l_a += __shfl_xor_sync(0xffffffffu, l_a, 1);
     l_a += __shfl_xor_sync(0xffffffffu, l_a, 2);
     l_b += __shfl_xor_sync(0xffffffffu, l_b, 1);
@@ -341,8 +501,8 @@ __global__ void __launch_bounds__(NW * 32) prompt_kernel(const float* __restrict
 #pragma unroll
     for (int n = 0; n < HD / 8; ++n) {
         const int col = n * 8 + tq * 2;
-        if (row_a < T) *reinterpret_cast<float2*>(out + (row_a * n_head + head) * HD + col) = make_float2(o[n][0] * ia, o[n][1] * ia);
-        if (row_b < T) *reinterpret_cast<float2*>(out + (row_b * n_head + head) * HD + col) = make_float2(o[n][2] * ib, o[n][3] * ib);
+        if (pos_a < T) *reinterpret_cast<float2*>(out + (pos_a * n_head + head_a) * HD + col) = make_float2(o[n][0] * ia, o[n][1] * ia);
+        if (pos_b < T) *reinterpret_cast<float2*>(out + (pos_b * n_head + head_b) * HD + col) = make_float2(o[n][2] * ib, o[n][3] * ib);
     }
 }
 
@@ -398,21 +558,37 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8) {
     if (T <= 0) return;
-    if (n_kv < 1 || n_head % n_kv) {
-        basalt::log::error("basalt", "gqa_prompt_attn: invalid arguments");
+    if (n_kv < 1 || n_head % n_kv || PROWS % (n_head / n_kv)) {
+        basalt::log::error("basalt", "gqa_prompt_attn: unsupported head layout");
         std::exit(1);
     }
-    static bool attr = false;
-    if (!attr) {
-        if (cudaFuncSetAttribute(prompt_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(PromptSmem)) !=
-            cudaSuccess) {
-            basalt::log::error("basalt", "gqa_prompt_attn: shared-memory opt-in failed");
-            std::exit(1);
+    const int pb = PROWS / (n_head / n_kv);
+    const dim3 grid((unsigned) ((T + pb - 1) / pb), (unsigned) n_kv);
+    if (q8.k) {
+        static bool raised = false;
+        if (!raised) {
+            if (cudaFuncSetAttribute(prompt_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(PromptSmem8)) !=
+                cudaSuccess) {
+                basalt::log::error("basalt", "gqa_prompt_attn: shared-memory opt-in failed");
+                std::exit(1);
+            }
+            raised = true;
         }
-        attr = true;
+        prompt_kernel<true><<<grid, PNW * 32, sizeof(PromptSmem8), (cudaStream_t) stream>>>(q, nullptr, nullptr, n_head, n_kv, pos0,
+                                                                                             T, out, q8);
+    } else {
+        static bool raised = false;
+        if (!raised) {
+            if (cudaFuncSetAttribute(prompt_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(PromptSmem16)) !=
+                cudaSuccess) {
+                basalt::log::error("basalt", "gqa_prompt_attn: shared-memory opt-in failed");
+                std::exit(1);
+            }
+            raised = true;
+        }
+        prompt_kernel<false><<<grid, PNW * 32, sizeof(PromptSmem16), (cudaStream_t) stream>>>(
+            q, (const __half*) k_cache, (const __half*) v_cache, n_head, n_kv, pos0, T, out, q8);
     }
-    prompt_kernel<<<dim3((unsigned) ((T + BM - 1) / BM), (unsigned) n_head), NW * 32, sizeof(PromptSmem),
-                    (cudaStream_t) stream>>>(q, (const __half*) k_cache, (const __half*) v_cache, n_head, n_kv, pos0, T, out, q8);
     check("gqa_prompt_attn");
 }
 

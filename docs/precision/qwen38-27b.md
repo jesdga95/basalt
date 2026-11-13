@@ -24,10 +24,13 @@ What the dense stack computes in, where it rounds, and what that costs against t
   When the server cuts off a thinking loop, the tokens the engine wrote past the cut are read again through the prompt path,
   and that reply can differ in the last bits between runs.
 - **GDN:** fp32 state and conv history. Decode windows replay accepted rows into the state; prompt chunks run the chunked delta
-  rule with q/k in BF16 and the state in fp32 (shared with Flash-Next).
+  rule with q/k in BF16 and the state in fp32 (shared with Flash-Next). The prompt's a/b projections (BF16 weights) take the
+  normed rows as two tf32 terms on tensor cores (about fp32's precision).
 - **Attention:** K and V stored fp16, or with `--kv int8` as int8 codes and an fp16 scale per 64 values (amax / 127, codes rounded
-  to nearest against the stored scale). Decode reads them with fp32 dot products and softmax (int8: code x scale in fp32);
-  prompt chunks multiply fp16 q and p on tensor cores with fp32 accumulation (int8: code x scale rounded to fp16 first).
+  to nearest against the stored scale). Decode reads them with fp32 dot products and softmax (int8: code x scale in fp32).
+  Prompt chunks: QK^T with fp16 q and k on tensor cores, fp32 accumulation (int8: q rounded to int8 per 64 values, amax / 127,
+  and each 64-value group's integer sum times both scales in fp32); softmax in fp32; P V with fp16 p and v on tensor cores,
+  each tile of 32 cells summed in fp16 and added to the fp32 output (int8: code x scale rounded to fp16).
 - **Residual and norms:** fp32.
 
 ## Quality against BF16
