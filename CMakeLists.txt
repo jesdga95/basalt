@@ -344,6 +344,7 @@ set_source_files_properties(
   src/prefill/mmq/instances/mmq_q4_k.cu
   src/prefill/mmq/instances/mmq_q5_k.cu
   src/prefill/mmq/instances/mmq_q6_k.cu
+  src/kernels/cuda/iq_kernels.cu
   src/kernels/cuda/quantize_act.cu
   src/kernels/cuda/wait_abort.cu
   src/kernels/cuda/elementwise.cu
