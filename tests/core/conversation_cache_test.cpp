@@ -1,5 +1,7 @@
 #include "basalt/core/conversation_cache.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -416,6 +418,39 @@ int main() {
         CheckpointBytes again;
         again.resize(big);
         check(again.size() == big, "a reserved block is taken again");
+    }
+    {
+        // reserved blocks are page-locked through the HostPin given; one it refuses is used as ordinary memory; a locked
+        // block is handed out before an ordinary one of its size, and every lock is released when its block is freed
+        static std::vector<void*> locked;
+        static int pins = 0, unpins = 0;
+        const HostPin pin{[](void* p, size_t) { ++pins; if (pins % 2 == 0) return false; locked.push_back(p); return true; },
+                          [](void* p) { ++unpins; locked.erase(std::find(locked.begin(), locked.end(), p)); }};
+        const size_t big = (size_t(3) << 20) + 11;
+        (void) CheckpointBytes::allocator_type::release_pooled();
+        const size_t before = CheckpointBytes::allocator_type::locked_bytes();
+        check(CheckpointBytes::allocator_type::reserve(big, 4, &pin), "four pinned blocks reserved");
+        check(pins == 4 && locked.size() == 2, "the driver took two of the four");
+        check(CheckpointBytes::allocator_type::locked_bytes() == before + 2 * big, "the locked bytes are counted");
+        CheckpointBytes a, b;
+        a.resize(big);
+        b.resize(big);
+        check(std::find(locked.begin(), locked.end(), (void*) a.data()) != locked.end() &&
+              std::find(locked.begin(), locked.end(), (void*) b.data()) != locked.end(), "locked blocks are handed out first");
+        check((reinterpret_cast<uintptr_t>(a.data()) & 4095) == 0, "a large block starts on a page");
+        CheckpointBytes none;
+        none.resize(big);
+        a[0] = 5;
+        std::vector<CheckpointBytes> extra(8);
+        for (auto& e : extra) e.resize(big);   // past the reserved ones: ordinary blocks, never locked
+        check(pins == 4, "blocks beyond the reserved ones are not locked");
+        extra.clear();
+        none = CheckpointBytes();
+        a = CheckpointBytes();
+        b = CheckpointBytes();
+        (void) CheckpointBytes::allocator_type::release_pooled();
+        check(unpins == 0, "reserved locked blocks stay locked through a release");
+        check(CheckpointBytes::allocator_type::locked_bytes() == before + 2 * big, "and stay counted");
     }
     {
         // The bulk (memcmp) key compare against the element-wise reference: every divergence index, a full match, and
