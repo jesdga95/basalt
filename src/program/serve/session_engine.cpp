@@ -127,7 +127,7 @@ public:
     }
     bool windows_in_flight() override { return false; }
     bool next_batch_window() override;
-    void slot_window_begin(int b, SlotWin& w);
+    void slot_window_begin(int b, SlotWin& w, int limit);
     bool slot_window_finish(int b, SlotWin& w);
     bool drain_windows() override { return true; }
     void script_command(const std::string&) override {
@@ -550,9 +550,9 @@ struct SlotWin {
 };
 
 // The slot's next window: its anchor and the drafts its drafter left (as many as the draft policy takes).
-void SessionRuntime::slot_window_begin(int b, SlotWin& w) {
+void SessionRuntime::slot_window_begin(int b, SlotWin& w, int limit) {
     BSlot& sl = bs[(size_t) b];
-    const int most = (int) std::min<int64_t>({(int64_t) sessions_[(size_t) b]->max_window(), o.max_context - sl.p, (int64_t) std::size(sl.dr) + 1});
+    const int most = (int) std::min<int64_t>({(int64_t) sessions_[(size_t) b]->max_window(), o.max_context - sl.p, (int64_t) std::size(sl.dr) + 1, (int64_t) limit});
     const int T = w.T = std::max(1, std::min(bpolicy->window(sl.dprob, sl.n_dr), most));
     std::copy(sl.dprob, sl.dprob + (T - 1), w.chance);
     w.win.assign((size_t) T, 0);
@@ -673,15 +673,17 @@ bool SessionRuntime::next_batch_window() {
         for (const int b : act) {
             set_active(b);
             w.round0 = Clock::now();
-            slot_window_begin(b, w);
+            slot_window_begin(b, w, 1 << 20);
             if (const basalt::model::Result r = session().decode_window(w.d); !r.ok()) return failed(r.message);
             if (!slot_window_finish(b, w)) return false;
         }
         set_active(0);
         return true;
     }
+    // the windows of a round share the batch's rows: with no more slots than rows each takes its share, so one pass serves all
+    const int n_act = (int) act.size();
     std::vector<SlotWin> wins(act.size());
-    for (size_t i = 0; i < act.size(); ++i) slot_window_begin(act[i], wins[i]);
+    for (int i = 0; i < n_act; ++i) slot_window_begin(act[(size_t) i], wins[(size_t) i], n_act <= cap ? cap / n_act + (i < cap % n_act ? 1 : 0) : cap);
     std::vector<bool> taken(act.size(), false);
     for (size_t first = 0; first < act.size(); ++first) {
         if (taken[first]) continue;
