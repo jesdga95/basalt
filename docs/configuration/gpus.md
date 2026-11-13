@@ -85,7 +85,7 @@ last chunk's later layers itself.
   card's chunk (the prompt buffers of the GGUF expert formats are larger than NVFP4's) reads shorter chunks, and the start prints
   `prompt split: chunks of at most N tokens fit the tier cards' slots`.
 - **Control vector:** a loaded one is copied to every stage card, which applies it to the steered layers it reads.
-- **Off with** `--peer-exclusive`, without the RAM copy of the experts, when RAM or a tier's slots are short,
+- **Off with** `--no-prompt-split` (config `no-prompt-split: true`; the host buffers are not reserved, so the RAM copy is sized without them), `--peer-exclusive`, without the RAM copy of the experts, when RAM or a tier's slots are short,
   when the context is too short for a split to pay (the start line says so), or when a tier card keeps under 256 MiB free beside
   its stage (`peer-reserve-mib` sets the room).
 - **A shorter request** that arrives during a read gets its turn at the end of the main card's current chunk.

@@ -127,6 +127,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `short-read` | engine | tokens | 64 (`0` = off) | Flash-Next only. A fresh part of at most N tokens is read through decode windows. |
 | `no-prompt-skip` | engine | switch | off | DeepSeek only. Run every row through every layer. Slower; the same math. [precision](../precision/deepseek41.md#prompt-skip) |
 | `no-peer-prefill` | engine | switch | off | Flash-Next only. The peer card computes none of the prompt rows; the prompt stays on the main card. |
+| `no-prompt-split` | engine | switch | off | Flash-Next only. Do not pipeline a long prompt across the tier cards, and do not reserve that path's host buffers before the RAM copy of the experts. |
 
 ## Drafting
 

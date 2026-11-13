@@ -61,6 +61,9 @@ struct Options : CommonOptions {
     bool peer_exclusive = false;
     /// --no-peer-prefill: the prompt path stays on the primary, the peer computes none of its rows
     bool no_peer_prefill = false;
+    /// --no-prompt-split: do not pipeline a long prompt across the tier cards, and do not reserve that
+    /// path's host buffers before the RAM copy of the experts is sized.
+    bool no_prompt_split = false;
     /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,
     /// then the routing counted since the start; the format of data/profiles); on QUIT and every
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.

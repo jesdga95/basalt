@@ -190,6 +190,8 @@ void usage() {
                  "                       misses swaps four times as many, and the RAM copy keeps 4 N free places\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --no-peer-prefill    the peer computes none of the prompt rows: the prompt stays on the primary\n"
+                 "  --no-prompt-split    do not pipeline a long prompt across the tier cards, and do not\n"
+                 "                       reserve that path's host buffers before the RAM copy of the experts\n"
                  "  --pool-workers N     CPU expert pool worker count.  Auto when not set: every physical core\n"
                  "                       except the one the host loop spins on (on a hybrid CPU, with --pool-affinity\n"
                  "                       auto: P-cores minus 1 plus half the E-cores; p-cores: P-cores minus 1),\n"
