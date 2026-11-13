@@ -163,6 +163,10 @@ The int8-cache prompt attention in src/kernels/cuda/gqa_attn.cu adapts Infernix'
 (src/ops/softmax_attention/dense/causal_cache/int8/fast_tiled_mma.cuh, fast_tiled_plan.h, ../fast_prompt_common.cuh):
 warps owning 16 query rows of one head for the whole sweep, raw int8 K/V tiles with V decoded in registers, the FP16
 partial guard, longest-first issue, and the block-shape and key-split plan with its merge.
+The decode-window products in src/kernels/cuda/window_gemm*.cu adapt the launch protocol of Infernix's decode products
+(src/core/pdl.cuh, src/ops/linear/nvfp4/nvfp4_a16_gemv.cuh): weights staged before the programmatic-launch wait,
+dependents started once the weights are read, and the slice-ordered split-K reduction; Basalt fixes the split by the
+matrix shape so a row's bits do not depend on the window.
 
 Licensed under the Apache License, Version 2.0, reproduced below.
 

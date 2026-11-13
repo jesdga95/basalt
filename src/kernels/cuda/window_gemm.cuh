@@ -11,6 +11,9 @@
 // dot products.  With several slices each block writes its sums to the workspace, and the last block of a row tile to
 // finish (a ticket) adds them in slice order and applies the epilogue.  The slice count depends on the call's shapes and
 // the device only, never on T: a column's bits are the same at any T and any NT.
+//
+// Adapts the launch protocol of Infernix's decode products (Apache-2.0, by Ian Ranson and the Infernix contributors;
+// see THIRD_PARTY_LICENSES): weights staged before the PDL wait, dependents started once the weights are read.
 #pragma once
 
 #include "basalt/kernels/pdl.hpp"
