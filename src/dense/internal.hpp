@@ -24,7 +24,7 @@ constexpr int kBatch = 16;        // rows a batch window (several sessions' wind
 constexpr int kChunk = 2048;      // tokens a prompt chunk reads at once
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
 constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
-constexpr int kTypeNvfp4P = 45;   // NVFP4 in planes (nvfp4_planes.hpp)
+constexpr int kTypeNvfp4Planes = 45;   // NVFP4_PLANES matrices (Linear::type, nvfp4_planes.hpp)
 
 /// Device buffers carved from one allocation.
 class Arena {
