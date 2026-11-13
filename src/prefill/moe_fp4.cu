@@ -93,10 +93,25 @@ __global__ void rebase_kernel(const int32_t* __restrict__ bounds, int n, int32_t
 // round to nearest even on x / (scale * g).  A sub-block's 8 bytes hold value j in the low nibble of byte j and value
 // j + 8 in the high one (the layout of an NVFP4 weight sub-block).  TOKENS: row r goes to the token planes (codes
 // [rows][cols / 2], then scales [rows][cols / 16], gs[r]), else to its expert's tile.  The arithmetic is the same.
-template <int NBL, bool TOKENS>
+// SWIGLU: the row is silu(g * sg) * (u * su) of x (g) and u, made as it is read (a dense MLP's down input).
+struct SwiGlu {
+    const float* u = nullptr;
+    const float* sg = nullptr;
+    const float* su = nullptr;
+};
+template <bool SWIGLU>
+__device__ __forceinline__ float4 row4(const float* xr, const float* ur, int64_t off, float a, float b) {
+    const float4 v = *(const float4*) (xr + off);
+    if (!SWIGLU) return v;
+    const float4 w = *(const float4*) (ur + off);
+    auto h = [&](float gv, float uv) { gv *= a; return gv / (1.0f + expf(-gv)) * (uv * b); };   // as swiglu_scaled
+    return make_float4(h(v.x, w.x), h(v.y, w.y), h(v.z, w.z), h(v.w, w.w));
+}
+template <int NBL, bool TOKENS, bool SWIGLU = false>
 __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                 const int32_t* __restrict__ bounds, const int32_t* __restrict__ tile_off, int n,
-                                uint8_t* __restrict__ a4, float* __restrict__ gs, int cols, int64_t ld, int64_t rows) {
+                                uint8_t* __restrict__ a4, float* __restrict__ gs, int cols, int64_t ld, int64_t rows,
+                                SwiGlu sw = {}) {
     const int lane = threadIdx.x & 31;
     const int64_t r = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (r >= rows) return;
@@ -114,6 +129,8 @@ __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __re
     }
     const int nkt = cols / kKTile, nb = cols / 16;
     const float* xr = x + (ids ? ids[r] : r) * ld;
+    const float* ur = SWIGLU ? sw.u + (ids ? ids[r] : r) * ld : nullptr;
+    const float sa = SWIGLU && sw.sg ? *sw.sg : 1.0f, sb_ = SWIGLU && sw.su ? *sw.su : 1.0f;
     float bm[NBL];
     float amax = 0.0f;
 #pragma unroll
@@ -121,10 +138,9 @@ __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __re
         const int b = lane + 32 * i;
         float m = 0.0f;
         if (b < nb) {
-            const float4* p = (const float4*) (xr + 16 * b);
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
-                const float4 v = p[q];
+                const float4 v = row4<SWIGLU>(xr, ur, 16 * b + 4 * q, sa, sb_);
                 m = fmaxf(m, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
             }
         }
@@ -144,11 +160,10 @@ __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __re
         const __nv_fp8_storage_t sb = __nv_cvt_float_to_fp8(bm[i] * inv_g * (1.0f / 6.0f), __NV_SATFINITE, __NV_E4M3);
         const float sd = __half2float(__half(__nv_cvt_fp8_to_halfraw(sb, __NV_E4M3)));
         const float inv = sd > 0.0f ? 1.0f / (sd * g) : 0.0f;
-        const float4* p = (const float4*) (xr + 16 * b);
         float v[16];
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
-            const float4 t = p[q];
+            const float4 t = row4<SWIGLU>(xr, ur, 16 * b + 4 * q, sa, sb_);
             v[4 * q] = t.x * inv; v[4 * q + 1] = t.y * inv; v[4 * q + 2] = t.z * inv; v[4 * q + 3] = t.w * inv;
         }
         uint32_t w[2] = {0, 0};
@@ -404,6 +419,18 @@ void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const i
     else if (cols == 17408) quantize_kernel<34, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else { basalt::log::error("basalt", "prefill fp4: %lld columns", (long long) cols); std::exit(1); }
     ck(cudaGetLastError(), "quantize");
+}
+
+void quantize_swiglu(const float* g, const float* u, const float* sg, const float* su, const int32_t* bounds,
+                     const int32_t* tile_off, int n, void* a4, float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+    if (rows <= 0) return;
+    const unsigned grid = (unsigned) ((rows + 7) / 8);
+    const SwiGlu sw{u, sg, su};
+    if (cols == 17408)
+        quantize_kernel<34, false, true><<<grid, 256, 0, (cudaStream_t) stream>>>(g, nullptr, bounds, tile_off, n, (uint8_t*) a4, gs,
+                                                                                   (int) cols, ld, rows, sw);
+    else { basalt::log::error("basalt", "prefill fp4: SwiGLU rows of %lld columns", (long long) cols); std::exit(1); }
+    ck(cudaGetLastError(), "quantize swiglu");
 }
 
 size_t token_bytes(int64_t tokens, int64_t cols) { return (size_t) tokens * (size_t) (cols / 2 + cols / 16); }

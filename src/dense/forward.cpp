@@ -225,8 +225,8 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
         fp4_quant(m, b.xn, H, T, s);
         gemm_fp4(m, L.gate, b.g, T, s);
         gemm_fp4(m, L.up, b.u, T, s);
-        kernels::swiglu_scaled(b.g, b.u, L.gate.scale, L.up.scale, b.h, T, g.n_ff, g.n_ff, s);
-        fp4_quant(m, b.h, g.n_ff, T, s);
+        prefill::fp4::quantize_swiglu(b.g, b.u, L.gate.scale, L.up.scale, m.cs.bounds, m.cs.tile_off, 1, m.cs.a4, m.cs.gs,
+                                      g.n_ff, g.n_ff, T, s);   // the tile plan is the gate/up input's
         gemm_fp4(m, L.down, b.tmp, T, s);
         kernels::add_scaled(b.x, b.tmp, L.down.scale, (int64_t) T * H, s);
         return;

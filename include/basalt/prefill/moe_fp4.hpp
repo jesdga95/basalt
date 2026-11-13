@@ -34,6 +34,10 @@ void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const i
 
 /// Bytes of the token planes of `tokens` rows of `cols` values: the codes [tokens][cols / 2] (each 16 values' 8 bytes
 /// in order), then the UE4M3 scales [tokens][cols / 16].
+/// As quantize, rows h = silu(g * sg) * (u * su) made from g and u as they are read (sg, su device scalars or null).
+void quantize_swiglu(const float* g, const float* u, const float* sg, const float* su, const int32_t* bounds,
+                     const int32_t* tile_off, int n, void* a4, float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream);
+
 size_t token_bytes(int64_t tokens, int64_t cols);
 /// Rounds each of `tokens` rows of x (`ld` floats apart) to FP4 once, into the token planes `a4` and the token scales
 /// gs[tokens]: the same codes and scales quantize() gives every row that reads that token.
