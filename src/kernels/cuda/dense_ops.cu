@@ -312,16 +312,22 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         v_cache[at] = __float2half_rn(vv);
         return;
     }
-    // int8: per 64 values, scale = amax / 127 (stored fp16), codes rounded to nearest against the stored scale
-    ks8[d] = y;
-    vs8[d] = vv;
-    __syncthreads();
-    const int g0 = d & ~63;
-    float ak = 0.0f, av = 0.0f;
-    for (int i = 0; i < 64; ++i) {
-        ak = fmaxf(ak, fabsf(ks8[g0 + i]));
-        av = fmaxf(av, fabsf(vs8[g0 + i]));
+    // int8: per 64 values, scale = amax / 127 (stored fp16), codes rounded to nearest against the stored scale; a group
+    // is two warps: each warp's max by shuffles, then the pair's (a max is exact in any order)
+    float ak = fabsf(y), av = fabsf(vv);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        ak = fmaxf(ak, __shfl_xor_sync(0xffffffffu, ak, o));
+        av = fmaxf(av, __shfl_xor_sync(0xffffffffu, av, o));
     }
+    if ((d & 31) == 0) {
+        ks8[d >> 5] = ak;
+        vs8[d >> 5] = av;
+    }
+    __syncthreads();
+    const int w0 = (d >> 5) & ~1;
+    ak = fmaxf(ks8[w0], ks8[w0 + 1]);
+    av = fmaxf(vs8[w0], vs8[w0 + 1]);
     const __half hk = __float2half_rn(ak / 127.0f), hv = __float2half_rn(av / 127.0f);
     const float sk = __half2float(hk), sv = __half2float(hv);
     const float qk = sk > 0.0f ? rintf(y / sk) : 0.0f, qv = sv > 0.0f ? rintf(vv / sv) : 0.0f;
