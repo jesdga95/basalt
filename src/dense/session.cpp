@@ -24,6 +24,8 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(Model& m) : m_(m), g_(m.g) {}
     ~Session() override {
+        for (cudaGraphExec_t& e : st_.wg)
+            if (e) cudaGraphExecDestroy(e);
         if (st_.stream) cudaStreamDestroy(st_.stream);
         if (h_picks_) cudaFreeHost(h_picks_);
     }
@@ -34,10 +36,17 @@ public:
             err = "cannot create a CUDA stream";
             return false;
         }
-        drafter_ = m_.w.mtp.present && m_.o.draft;
-        if (!st_.arena.reserve(session_bytes(g, m_.o.max_context, drafter_))) {
+        drafter_ = m_.o.drafter == Drafter::Mtp;
+        block_ = m_.o.drafter == Drafter::Block;
+        size_t block_bytes = 0;
+        if (block_) {
+            const BlockDrafter& bd = m_.w.dflash;
+            block_bytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
+                          (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
+        }
+        if (!st_.arena.reserve(session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8) + block_bytes)) {
             err = m_.o.arch + ": out of device memory for a session of " + std::to_string((long long) m_.o.max_context) +
-                  " cells (" + std::to_string((unsigned long long) (session_bytes(g, m_.o.max_context, drafter_) >> 20)) +
+                  " cells (" + std::to_string((unsigned long long) (session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8) >> 20)) +
                   " MiB); lower --max-context or --parallel";
             return false;
         }
@@ -53,8 +62,23 @@ public:
         }
         const size_t cells = (size_t) m_.o.max_context * g.n_kv * g.head_dim;
         for (int i = 0; i < g.attn_layers(); ++i) {
-            st_.kc.push_back(st_.arena.take<uint16_t>(cells));
-            st_.vc.push_back(st_.arena.take<uint16_t>(cells));
+            kernels::KvInt8 q8;
+            if (m_.o.kv_int8) {
+                q8.k = st_.arena.take<int8_t>(cells);
+                q8.v = st_.arena.take<int8_t>(cells);
+                q8.ks = st_.arena.take<uint16_t>(cells / 64);
+                q8.vs = st_.arena.take<uint16_t>(cells / 64);
+                st_.kc.push_back(nullptr);
+                st_.vc.push_back(nullptr);
+                if (!q8.vs) {
+                    err = m_.o.arch + ": the KV cache does not fit the session's arena";
+                    return false;
+                }
+            } else {
+                st_.kc.push_back(st_.arena.take<uint16_t>(cells));
+                st_.vc.push_back(st_.arena.take<uint16_t>(cells));
+            }
+            st_.kq.push_back(q8);
         }
         if (drafter_) {
             st_.mtp_kc = st_.arena.take<uint16_t>(cells);
@@ -70,10 +94,26 @@ public:
                 return false;
             }
         }
+        if (block_) {
+            const BlockDrafter& bd = m_.w.dflash;
+            st_.dctx_cap = bd.window + 256;
+            for (size_t l = 0; l < bd.layers.size(); ++l) {
+                st_.dk.push_back(st_.arena.take<uint16_t>((size_t) st_.dctx_cap * bd.n_kv * bd.head_dim));
+                st_.dv.push_back(st_.arena.take<uint16_t>((size_t) st_.dctx_cap * bd.n_kv * bd.head_dim));
+            }
+            st_.dacc = st_.arena.take<float>((size_t) kWindow * g.n_embd);
+            st_.dids = st_.arena.take<int32_t>(kWindow);
+            st_.dconf = st_.arena.take<float>(kWindow);
+            st_.win_tok = st_.arena.take<int32_t>(kWindow);
+            if (!st_.win_tok) {
+                err = m_.o.arch + ": the block drafter's buffers do not fit the session's arena";
+                return false;
+            }
+        }
         st_.logits = st_.arena.take<float>((size_t) kWindow * g.n_vocab);
         st_.picks = st_.arena.take<int32_t>(kWindow);
         st_.n_keep = st_.arena.take<int32_t>(4);
-        if (!st_.n_keep || (ng && !st_.gdn) || (!st_.kc.empty() && !st_.vc.back())) {
+        if (!st_.n_keep || (ng && !st_.gdn) || (!st_.kc.empty() && !m_.o.kv_int8 && !st_.vc.back())) {
             err = m_.o.arch + ": a session's buffers do not fit its arena";
             return false;
         }
@@ -89,11 +129,22 @@ public:
         return cudaStreamSynchronize(st_.stream) == cudaSuccess;
     }
 
-    int max_window() const override { return drafter_ ? std::clamp(m_.o.spec, 1, kWindow) : 1; }
+    int max_window() const override {
+        if (block_) return std::clamp(std::min(m_.o.spec, m_.w.dflash.block), 1, kWindow);
+        return drafter_ ? std::clamp(m_.o.spec, 1, kWindow) : 1;
+    }
 
     // The drafter's chain after `anchor` (the token at `pos`): step 0 pairs main's last normed row (cell pos - 1) with
     // the anchor, each later step its own output with the draft before it; all on the stream, read by draft_end.
     Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        if (block_) {
+            if (Result s = settle(pos); !s.ok()) return s;
+            std::string err;
+            if (pos + m_.w.dflash.block > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
+            if (!block_draft(m_, st_, anchor, pos, err)) return fail(err);
+            n_draft_ = std::clamp(n, 1, std::min(max_window() - 1, m_.w.dflash.block - 1));
+            return {};
+        }
         if (!drafter_) return {Status::NotImplemented, m_.o.arch + ": no drafter is loaded"};
         if (Result s = settle(pos); !s.ok()) return s;
         if (st_.tail_cell != pos - 1) return fail(m_.o.arch + ": the drafter has no row before position " + std::to_string((long long) pos));
@@ -116,6 +167,14 @@ public:
     }
 
     Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
+        if (block_) {
+            n = std::min(n_draft_, max_n);
+            if (cudaMemcpyAsync(ids, st_.dids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
+                cudaMemcpyAsync(conf, st_.dconf, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
+                cudaStreamSynchronize(st_.stream) != cudaSuccess)
+                return fail(m_.o.arch + ": the block drafter failed");
+            return {};
+        }
         if (!drafter_) return {Status::NotImplemented, m_.o.arch + ": no drafter is loaded"};
         float h[kWindow * kernels::kLogprobStride];
         n = std::min(n_draft_, max_n);
@@ -245,8 +304,8 @@ public:
     }
 
     Result restore_running(const uint8_t* host, int64_t pos) override {
-        (void) pos;
         pend_T_ = 0;
+        st_.dctx_from = pos;   // the block drafter's context below `pos` is not this conversation's
         const size_t n = (size_t) g_.gdn_layers() * st_.gdn_floats * 4;
         if (n && cudaMemcpyAsync(st_.gdn, host, n, cudaMemcpyHostToDevice, st_.stream) != cudaSuccess) return fail("restoring the state failed");
         if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail("restoring the state failed");
@@ -259,31 +318,41 @@ public:
         return {};
     }
 
+    // a layer's cells: fp16 K and V (format 1), or int8 codes with fp16 scales per 64 values (format 2); the MTP
+    // drafter's own layer is fp16 and comes last
+    size_t row_bytes(bool int8) const { return (size_t) g_.n_kv * g_.head_dim * (int8 ? 1 : 2); }
     size_t cells_bytes(int64_t positions) const override {
-        return (size_t) (g_.attn_layers() + (drafter_ ? 1 : 0)) * (size_t) positions * g_.n_kv * g_.head_dim * 2 * 2;
+        const size_t main = m_.o.kv_int8 ? 2 * (row_bytes(true) + row_bytes(true) / 32) : 2 * row_bytes(false);
+        return (size_t) positions * ((size_t) g_.attn_layers() * main + (drafter_ ? 2 * row_bytes(false) : 0));
     }
 
     Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         cudaStreamSynchronize(st_.stream);
         kv.clear();
-        const size_t row = (size_t) g_.n_kv * g_.head_dim * 2;
+        const auto down = [&](const void* dev, core::ConversationBuffer& to, size_t bytes) {
+            to.resize_for_overwrite(bytes);
+            return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
+                return cudaMemcpy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+            });
+        };
         for (size_t i = 0; i < st_.kc.size() + (drafter_ ? 1 : 0); ++i) {
-            uint16_t* kc = i < st_.kc.size() ? st_.kc[i] : st_.mtp_kc;
-            uint16_t* vc = i < st_.kc.size() ? st_.vc[i] : st_.mtp_vc;
+            const bool mtp = i == st_.kc.size();
+            const bool int8 = !mtp && m_.o.kv_int8;
             core::ConversationKv k;
-            k.format = 1;
+            k.format = int8 ? 2 : 1;
             k.cells = positions;
             k.heads = g_.n_kv;
             k.head_dim = g_.head_dim;
             k.page_size = 1;
-            k.k.resize_for_overwrite((size_t) positions * row);
-            k.v.resize_for_overwrite((size_t) positions * row);
-            const auto down = [&](const uint16_t* dev, core::ConversationBuffer& to) {
-                return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
-                    return cudaMemcpy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
-                });
-            };
-            if (!down(kc, k.k) || !down(vc, k.v)) return fail("reading the KV cells back failed");
+            const size_t rows = (size_t) positions * row_bytes(int8);
+            bool ok;
+            if (int8) {
+                const kernels::KvInt8& q = st_.kq[i];
+                ok = down(q.k, k.k, rows) && down(q.v, k.v, rows) && down(q.ks, k.k_scale, rows / 32) && down(q.vs, k.v_scale, rows / 32);
+            } else {
+                ok = down(mtp ? st_.mtp_kc : st_.kc[i], k.k, rows) && down(mtp ? st_.mtp_vc : st_.vc[i], k.v, rows);
+            }
+            if (!ok) return fail("reading the KV cells back failed");
             kv.push_back(std::move(k));
         }
         return {};
@@ -293,19 +362,26 @@ public:
         cudaStreamSynchronize(st_.stream);
         if (kv.size() != st_.kc.size() + (drafter_ ? 1 : 0)) return fail(m_.o.arch + ": a parked conversation has other caches");
         if (positions > m_.o.max_context) return fail(m_.o.arch + ": a parked conversation is longer than the context");
-        const size_t row = (size_t) g_.n_kv * g_.head_dim * 2;
+        const auto up = [&](void* dev, const core::ConversationBuffer& from, size_t bytes) {
+            return from.size() >= bytes && from.visit(0, bytes, [&](const uint8_t* p, size_t n, size_t at) {
+                return cudaMemcpy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
+            });
+        };
         for (size_t i = 0; i < kv.size(); ++i) {
+            const bool mtp = i == st_.kc.size();
+            const bool int8 = !mtp && m_.o.kv_int8;
             const core::ConversationKv& k = kv[i];
-            if (k.format != 1 || k.heads != g_.n_kv || k.head_dim != g_.head_dim || k.k.size() < (size_t) positions * row)
+            if (k.format != (int8 ? 2 : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
                 return fail(m_.o.arch + ": a parked conversation has other caches");
-            const auto up = [&](uint16_t* dev, const core::ConversationBuffer& from) {
-                return from.visit(0, (size_t) positions * row, [&](const uint8_t* p, size_t n, size_t at) {
-                    return cudaMemcpy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
-                });
-            };
-            uint16_t* kc = i < st_.kc.size() ? st_.kc[i] : st_.mtp_kc;
-            uint16_t* vc = i < st_.kc.size() ? st_.vc[i] : st_.mtp_vc;
-            if (!up(kc, k.k) || !up(vc, k.v)) return fail("uploading the KV cells failed");
+            const size_t rows = (size_t) positions * row_bytes(int8);
+            bool ok;
+            if (int8) {
+                const kernels::KvInt8& q = st_.kq[i];
+                ok = up(q.k, k.k, rows) && up(q.v, k.v, rows) && up(q.ks, k.k_scale, rows / 32) && up(q.vs, k.v_scale, rows / 32);
+            } else {
+                ok = up(mtp ? st_.mtp_kc : st_.kc[i], k.k, rows) && up(mtp ? st_.mtp_vc : st_.vc[i], k.v, rows);
+            }
+            if (!ok) return fail(m_.o.arch + ": a parked conversation has other caches");
         }
         pend_T_ = 0;
         return {};
@@ -357,7 +433,10 @@ public:
         return {};
     }
 
-    std::string info_words() const override { return drafter_ ? "kv=fp16 drafter=mtp" : "kv=fp16"; }
+    std::string info_words() const override {
+        const std::string kv = m_.o.kv_int8 ? "kv=int8" : "kv=fp16";
+        return kv + (block_ ? " drafter=block" : drafter_ ? " drafter=mtp" : "");
+    }
     int64_t disk_min_tokens() const override { return 4096; }
 
 private:
@@ -367,6 +446,7 @@ private:
             pend_T_ = 0;
             st_.rope_delta = 0;
             st_.tail_cell = -1;
+            st_.dctx_from = 0;
             if (g_.gdn_layers() &&
                 cudaMemsetAsync(st_.gdn, 0, (size_t) g_.gdn_layers() * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
                 return fail("clearing the recurrent state failed");
@@ -379,6 +459,10 @@ private:
         pend_T_ = 0;
         if (n < 0 || n > T) return fail(m_.o.arch + ": position " + std::to_string((long long) pos) + " is not reachable from the last window");
         commit_window(m_, st_, (int) n);
+        if (block_ && n > 0) {   // the kept rows become the block drafter's context
+            std::string err;
+            if (!block_ctx_window(m_, st_, (int) n, pend_pos_, err)) return fail(err);
+        }
         if (drafter_ && n > 0) {
             // the drafter's history: the waiting row with the window's first token, then each kept row with the next
             std::string err;
@@ -458,7 +542,7 @@ private:
     const Geometry& g_;
     SessionState st_;
     int32_t* h_picks_ = nullptr;
-    bool drafter_ = false;
+    bool drafter_ = false, block_ = false;
     int n_draft_ = 0;
     int64_t pend_pos_ = 0;
     int pend_T_ = 0;

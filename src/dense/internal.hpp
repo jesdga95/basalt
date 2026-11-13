@@ -46,6 +46,13 @@ struct WindowScratch {
     int32_t *tok = nullptr, *pos = nullptr;      // the window's tokens and [row][3] positions (device)
     float* cat = nullptr;                        // the drafter's [embedding | hidden] rows
     float *lp = nullptr, *lp_scratch = nullptr;  // the drafter's picks (row_logprobs rows) and their scratch
+    float *y = nullptr, *hl = nullptr;           // the GDN output rows; the drafter's head rows
+    int32_t *iota = nullptr, *bounds = nullptr;  // the products' row map and the window's rows
+    int32_t* pos0 = nullptr;                     // the window's first cell (device), read by its attention
+    // the block drafter's: its rows' q, k, v, attention and convolution coefficients, the selector's projection
+    float *bq = nullptr, *bk = nullptr, *bv = nullptr, *bqo = nullptr, *bao = nullptr, *dyn = nullptr, *bh = nullptr;
+    float *battn = nullptr, *blp = nullptr, *bsel = nullptr;
+    int32_t* bpos = nullptr;
 };
 
 /// The prompt chunk's scratch (kChunk rows), its mixer and FFN buffers sharing memory.
@@ -58,6 +65,7 @@ struct ChunkScratch {
     float *qfull = nullptr, *k = nullptr, *v = nullptr, *qo = nullptr, *ao = nullptr, *ag = nullptr;
     float *g = nullptr, *u = nullptr, *h = nullptr;
     float *hn = nullptr, *cat = nullptr;          // the drafter's history: main's normed rows, its input rows
+    float* dacc = nullptr;                        // the block drafter's projected features of the chunk's rows
     int32_t *tok = nullptr, *pos = nullptr, *iota = nullptr, *bounds = nullptr;
 };
 
@@ -78,6 +86,8 @@ public:
     size_t enc_bytes = 0;
     ~Model();
     bool ensure_chunk(std::string& err);
+    /// llama.cpp's MMQ readied for every product of the model (its kernels loaded for each format and height).
+    bool ready_products(std::string& err);
     /// The image encoder placed in device memory for pictures of up to `tokens` merged tokens.
     bool vision_attach(int tokens, std::string& err);
     /// Its memory goes back.
@@ -90,13 +100,15 @@ struct SessionState {
     Arena arena;
     float* gdn = nullptr;                        // per GDN layer: state [S][h_v][S], then conv history [C][3]
     size_t gdn_floats = 0;                       // per layer
-    std::vector<uint16_t*> kc, vc;               // per attention layer: [cell][n_kv][head_dim] fp16
+    std::vector<uint16_t*> kc, vc;               // per attention layer: [cell][n_kv][head_dim] fp16 (null with int8)
+    std::vector<kernels::KvInt8> kq;             // per attention layer: the int8 cache ({} with fp16)
     // the last window's rows per GDN layer, until its commit
     float *rec_qkv = nullptr, *rec_h = nullptr, *rec_gate = nullptr, *rec_beta = nullptr;
     int32_t* n_keep = nullptr;                   // device
     float* logits = nullptr;                     // [kWindow][n_vocab]
     int32_t* picks = nullptr;                    // device [kWindow]
     int64_t rope_delta = 0;                      // rope position - cell index for the next text token
+    cudaGraphExec_t wg[kWindow + 1] = {};        // the decode window of T rows, captured once per T
     // the drafter (null without one): its KV, the last window's normed hidden rows, and the row waiting for the
     // token after it (cell tail_cell, -1 none)
     uint16_t *mtp_kc = nullptr, *mtp_vc = nullptr;
@@ -104,6 +116,13 @@ struct SessionState {
     float *dlogits = nullptr, *lp = nullptr;     // the drafter's head row and its picks [kWindow][kLogprobStride]
     int32_t* win_tok = nullptr;                  // the last window's tokens (device)
     int64_t tail_cell = -1;
+    // the block drafter: its context K/V per layer (cyclic, dctx_cap cells), the last window's projected features,
+    // its picks and their confidence
+    std::vector<uint16_t*> dk, dv;
+    int64_t dctx_cap = 0, dctx_from = 0;         // cells; the first position its context holds
+    float* dacc = nullptr;
+    int32_t* dids = nullptr;
+    float* dconf = nullptr;
 };
 
 /// Runs a decode window of T rows at cells pos..pos+T-1 (`pos3` [T][3] their rope positions); leaves the logits in
@@ -115,6 +134,11 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
                    const int32_t* pos3, std::string& err);
 /// The commit of the last window's first n rows into the recurrent state.
 void commit_window(Model& m, SessionState& st, int n);
+
+/// The block drafter's context from the last window's first n rows (st.dacc) at positions pos.. .
+bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err);
+/// The block drafter's pass after `anchor` at `pos`: its picks for slots 1 .. block-1 into st.dids / st.dconf.
+bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, std::string& err);
 
 /// The drafter over n rows of (hidden, next token) pairs at cells c0..c0+n-1: `hid` device rows [n][n_embd] (main's
 /// normed hidden, or the drafter's own output), `tok` device ids of the tokens after them.  Writes its KV; with

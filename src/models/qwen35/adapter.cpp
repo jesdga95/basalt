@@ -110,7 +110,9 @@ public:
                 return false;
             w.layers.push_back(L);
         }
-        if (req.draft && tensors_.count("mtp.fc.weight")) {   // the pack's drafter layer, for --spec
+        const bool want_block = req.draft && tensors_.count("dflash.fc.0.weight") && drafter_choice_ != "mtp";
+        if (want_block && !block_drafter(gg, w.dflash, H, err)) return false;
+        if (req.draft && !want_block && tensors_.count("mtp.fc.weight")) {   // the pack's drafter layer, for --spec
             dense::Mtp& d = w.mtp;
             dense::Layer& L = d.layer;
             L.kind = dense::Mixer::Attention;
@@ -141,7 +143,9 @@ public:
         o.sessions = req.sessions;
         o.spec = req.spec;
         o.draft = req.draft;
+        o.drafter = w.dflash.present ? dense::Drafter::Block : w.mtp.present ? dense::Drafter::Mtp : dense::Drafter::None;
         o.vision = req.vision;
+        o.kv_int8 = req.kv == "int8";
         o.arch = "qwen35";
         if (o.vision) {
             core::ModelFile file;
@@ -156,7 +160,7 @@ public:
             return false;
         }
         const uint64_t need_b = dense::shared_bytes(g, o.max_context) +
-                                (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, w.mtp.present && o.draft);
+                                (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_int8);
         const uint64_t reserve = (uint64_t) std::max(req.vram_reserve_mib, 0) << 20;
         if (need_b + reserve + (512ull << 20) > free_b) {
             err = "qwen35: " + std::to_string((long long) o.sessions) + " session(s) of " + std::to_string((long long) o.max_context) +
@@ -168,7 +172,71 @@ public:
         return model_ != nullptr;
     }
 
+    std::string drafter_choice_;   // --diag-drafter: mtp or block (empty: the pack's block drafter when it has one)
+
 private:
+    // the pack's DFlash 2 block drafter (dflash.* tensors, qwen35.dflash.* metadata)
+    bool block_drafter(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& err) {
+        const auto u = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (int) v->u : 0; };
+        const auto f = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (float) v->num() : 0.0f; };
+        d.block = u("block_size");
+        d.mask_id = u("mask_token_id");
+        d.conv_group = u("conv_group");
+        d.rank = u("selector_rank");
+        d.top_k = u("selector_top_k");
+        d.window = u("sliding_window");
+        d.n_head = u("attention.head_count");
+        d.n_kv = u("attention.head_count_kv");
+        d.head_dim = u("attention.key_length");
+        d.theta = f("rope.freq_base");
+        d.eps = f("attention.layer_norm_rms_epsilon");
+        if (const MetaValue* t = gg.get("qwen35.dflash.target_layers"))
+            for (const MetaValue& x : t->items) d.target_layers.push_back((int) x.u);
+        const int layers = u("block_count"), ff = u("feed_forward_length");
+        if (d.block < 2 || d.block > 8 || d.target_layers.empty() || u("conv_kernel") != 2 || d.n_kv <= 0 ||
+            (d.head_dim != 128 && d.head_dim != 256) || d.top_k > 20 || H % d.conv_group) {
+            err = "qwen35: the pack's block drafter has a shape the engine does not run";
+            return false;
+        }
+        const int AQ = d.n_head * d.head_dim, KV = d.n_kv * d.head_dim, conv = 2 * 2 * (H / d.conv_group);
+        for (size_t j = 0; j < d.target_layers.size(); ++j) {
+            d.fc.emplace_back();
+            if (!linear(gg, "dflash.fc." + std::to_string(j), H, H, d.fc.back(), err)) return false;
+        }
+        d.hidden_norm = floats(gg, "dflash.hidden_norm.weight", H, err);
+        d.norm = floats(gg, "dflash.norm.weight", H, err);
+        if (!d.hidden_norm || !d.norm) return false;
+        for (int l = 0; l < layers; ++l) {
+            const std::string p = "dflash.blk." + std::to_string(l) + ".";
+            dense::BlockDrafter::Layer L;
+            L.attn_norm = floats(gg, p + "attn_norm.weight", H, err);
+            L.ffn_norm = floats(gg, p + "post_attention_norm.weight", H, err);
+            L.q_norm = floats(gg, p + "attn_q_norm.weight", d.head_dim, err);
+            L.k_norm = floats(gg, p + "attn_k_norm.weight", d.head_dim, err);
+            L.base_a = floats(gg, p + "attn_conv.base", 4 * (int64_t) H, err);
+            L.base_f = floats(gg, p + "ffn_conv.base", 4 * (int64_t) H, err);
+            if (!L.attn_norm || !L.ffn_norm || !L.q_norm || !L.k_norm || !L.base_a || !L.base_f ||
+                !linear(gg, p + "attn_q", AQ, H, L.q, err) || !linear(gg, p + "attn_k", KV, H, L.k, err) ||
+                !linear(gg, p + "attn_v", KV, H, L.v, err) || !linear(gg, p + "attn_output", H, AQ, L.o, err) ||
+                !linear(gg, p + "ffn_gate", ff, H, L.gate, err) || !linear(gg, p + "ffn_up", ff, H, L.up, err) ||
+                !linear(gg, p + "ffn_down", H, ff, L.down, err) || !linear(gg, p + "attn_conv", conv, H, L.conv_a, err) ||
+                !linear(gg, p + "ffn_conv", conv, H, L.conv_f, err))
+                return false;
+            d.layers.push_back(L);
+        }
+        d.sel_h = bf16(gg, "dflash.selector.hidden.weight", (int64_t) d.rank * H, err);
+        d.pred = bf16(gg, "dflash.selector.pred", (int64_t) d.rank * desc_.n_vocab, err);
+        d.succ = bf16(gg, "dflash.selector.succ", (int64_t) d.rank * desc_.n_vocab, err);
+        if (!d.sel_h || !d.pred || !d.succ) return false;
+        d.present = true;
+        return true;
+    }
+
+    const uint16_t* bf16(const GgufFile& gg, const std::string& name, int64_t elems, std::string& err) {
+        const TensorInfo* t = need(gg, name, kTypeBf16, elems, err);
+        return t ? (const uint16_t*) upload(gg, *t, err) : nullptr;
+    }
+
     const TensorInfo* need(const GgufFile& gg, const std::string& name, int type, int64_t elems, std::string& err) {
         (void) gg;
         auto it = tensors_.find(name);
@@ -286,6 +354,7 @@ public:
     model::Result load(const model::LoadRequest& req, std::unique_ptr<model::LoadedModel>& out) const override {
         if (req.paths.empty()) return {model::Status::Error, "qwen35: no model path"};
         auto m = std::make_unique<Loaded>();
+        m->drafter_choice_ = drafter_choice();
         std::string err;
         if (!m->load(req, err)) return {model::Status::Error, err};
         out = std::move(m);
@@ -301,6 +370,8 @@ public:
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         (void) code;
         if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
+        else if (a == "--diag-drafter") { drafter_choice() = args.next("--diag-drafter"); }
+        else if (a == "--kv") o.kv = args.next("--kv");
         else return false;
         return true;
     }
@@ -312,6 +383,10 @@ public:
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "int8") {
+            basalt::log::error("basalt qwen35", "--kv %s: fp16 (the default) or int8", o.kv.c_str());
+            return 2;
+        }
         if (o.spec_given && (o.spec < 0 || o.spec > 8)) {
             basalt::log::error("basalt qwen35", "--spec %d: 0 (off) to 8", o.spec);
             return 2;
@@ -325,13 +400,18 @@ public:
     }
 
 private:
+    // diagnostic: --diag-drafter mtp runs the MTP layer where the pack also has a block drafter (A/B only)
+    static std::string& drafter_choice() {
+        static std::string c;
+        return c;
+    }
     static constexpr int kDefaultSpec = 8;
     static bool has_drafter(const std::string& path) {
         core::ModelFile file;
         std::string err;
         if (path.empty() || !file.open(path, err) || !file.load_meta(err)) return false;
         const core::Json* t = file.meta().get("tensors");
-        return t != nullptr && t->get("mtp.fc.weight") != nullptr;
+        return t != nullptr && (t->get("mtp.fc.weight") != nullptr || t->get("dflash.fc.0.weight") != nullptr);
     }
     const char* model_name() const override { return "Qwen3.8-27B"; }
 };

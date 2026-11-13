@@ -59,20 +59,29 @@ std::string Geometry::check() const {
 namespace {
 
 // bytes of the decode window's scratch
-size_t window_bytes(const Geometry& g, int64_t max_context) {
+// the block drafter's rows in the window scratch
+size_t block_scratch_floats(const Geometry& g, const BlockDrafter& bd) {
+    if (!bd.present) return 0;
+    const size_t W = kWindow, AQ = (size_t) bd.n_head * bd.head_dim, KV = (size_t) bd.n_kv * bd.head_dim;
+    return W * (3 * AQ + 2 * KV + bd.layers[0].conv_a.rows + g.n_embd + kernels::kLogprobStride + bd.rank + 3) +
+           kernels::gqa_decode_scratch_floats(bd.window + 256, kWindow, bd.n_head, bd.head_dim) + 64 * 64;
+}
+
+size_t window_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_context) {
     const size_t W = kWindow, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim;
     const size_t widest = std::max<size_t>({H, (size_t) g.n_ff, (size_t) g.value_width(), AQ});
     size_t f = 3 * W * H + W * g.value_width() + W * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) + 3 * W * g.n_ff;
     if (g.attn_layers() > 0) f += kernels::gqa_decode_scratch_floats(max_context, kWindow, g.n_head);
-    f += W * 2 * H + kernels::row_logprobs_scratch_floats(1, g.n_vocab);
-    return f * 4 + 2 * kernels::native_q8_1_bytes((int) widest, kWindow) + W * 4 * 4 + 64 * 256;
+    f += W * 2 * H + kernels::row_logprobs_scratch_floats(kWindow, g.n_vocab) + W * g.value_width() + W * (size_t) g.n_vocab;
+    f += block_scratch_floats(g, bd);
+    return f * 4 + 2 * prefill::mmq::q8_bytes(kWindow, (int64_t) std::max<size_t>(widest, 2 * H)) + W * 4 * 6 + 64 * 256;
 }
 
 size_t chunk_bytes(const Geometry& g) {
     const size_t T = kChunk, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim, C = (size_t) g.conv_channels();
     const size_t VD = (size_t) g.value_width(), HV = (size_t) g.gdn_v_heads;
     const size_t widest = std::max<size_t>({H, (size_t) g.n_ff, VD, AQ});
-    const size_t keep = 5 * T * H * 4 + H * 4 + prefill::mmq::q8_bytes(T, (int64_t) widest);
+    const size_t keep = 6 * T * H * 4 + H * 4 + prefill::mmq::q8_bytes(T, (int64_t) widest);
     const size_t gdn = g.gdn_layers() ? (2 * T * C + 3 * T * VD + 4 * T * HV) * 4 + kernels::gdn_work_bytes(T) : 0;
     const size_t attn = g.attn_layers() ? T * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) * 4 : 0;
     const size_t ffn = 3 * T * g.n_ff * 4;
@@ -81,14 +90,17 @@ size_t chunk_bytes(const Geometry& g) {
 
 }  // namespace
 
-uint64_t shared_bytes(const Geometry& g, int64_t max_context) { return window_bytes(g, max_context) + chunk_bytes(g); }
+uint64_t shared_bytes(const Geometry& g, int64_t max_context) { return window_bytes(g, BlockDrafter{}, max_context) + chunk_bytes(g) + (512ull << 20); }
 
-uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp) {
+uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8) {
     const uint64_t C = (uint64_t) g.conv_channels();
     const uint64_t gdn = (uint64_t) g.gdn_layers() *
                          ((uint64_t) g.gdn_state * g.gdn_v_heads * g.gdn_state + C * 3 +
                           kWindow * (2 * C + 2 * (uint64_t) g.gdn_v_heads)) * 4;
-    const uint64_t kv = (uint64_t) (g.attn_layers() + (mtp ? 1 : 0)) * (uint64_t) max_context * g.n_kv * g.head_dim * 2 * 2;
+    const uint64_t cell16 = (uint64_t) g.n_kv * g.head_dim * 2 * 2;   // a cell of one layer, K and V, fp16
+    const uint64_t cell8 = (uint64_t) g.n_kv * (g.head_dim + g.head_dim / 64 * 2) * 2;
+    const uint64_t kv = (uint64_t) max_context * ((uint64_t) g.attn_layers() * (kv_int8 ? cell8 : cell16) + (mtp ? cell16 : 0)) +
+                        (uint64_t) g.attn_layers() * 4 * 256;
     const uint64_t drafter = mtp ? ((uint64_t) (kWindow + 3) * g.n_embd + g.n_vocab + (uint64_t) kWindow * 64) * 4 : 0;
     return gdn + kv + drafter + (uint64_t) kWindow * g.n_vocab * 4 + 64 * 256;
 }
@@ -127,6 +139,31 @@ void Model::vision_detach() {
     enc_bytes = 0;
 }
 
+bool Model::ready_products(std::string& err) {
+    mmq = std::make_unique<prefill::mmq::Context>();
+    std::vector<const Layer*> all;
+    for (const Layer& L : w.layers) all.push_back(&L);
+    if (o.drafter == Drafter::Mtp) all.push_back(&w.mtp.layer);
+    std::vector<const Linear*> ls = {&w.head};
+    if (o.drafter == Drafter::Mtp) ls.push_back(&w.mtp.fc);
+    if (o.drafter == Drafter::Block) {
+        for (const Linear& l : w.dflash.fc) ls.push_back(&l);
+        for (const BlockDrafter::Layer& D : w.dflash.layers)
+            for (const Linear* l : {&D.q, &D.k, &D.v, &D.o, &D.gate, &D.up, &D.down, &D.conv_a, &D.conv_f}) ls.push_back(l);
+    }
+    for (const Layer* Lp : all)
+        for (const Linear* l : {&Lp->qkv, &Lp->z, &Lp->out, &Lp->q, &Lp->k, &Lp->v, &Lp->o, &Lp->gate, &Lp->up, &Lp->down})
+            if (l->w) ls.push_back(l);
+    for (const Linear* l : ls) {
+        if (!prefill::mmq::fits(l->type, l->rows)) {
+            err = o.arch + ": the products have no tile for a " + std::to_string(l->rows) + "-row matrix";
+            return false;
+        }
+        prefill::mmq::load(l->type, l->rows);
+    }
+    return true;
+}
+
 bool Model::ensure_chunk(std::string& err) {
     if (chunk_ready) return true;
     const Geometry& gg = g;
@@ -146,10 +183,11 @@ bool Model::ensure_chunk(std::string& err) {
     b.pos = pre_arena.take<int32_t>(3 * T);
     b.iota = pre_arena.take<int32_t>(T);
     b.bounds = pre_arena.take<int32_t>(2);
-    if (w.mtp.present && o.draft) {
+    if (o.drafter == Drafter::Mtp) {
         b.cat = pre_arena.take<float>(T * H);
         b.hn = pre_arena.take<float>((T + 1) * H);
     }
+    if (o.drafter == Drafter::Block) b.dacc = pre_arena.take<float>(T * H);
     const size_t phase = pre_arena.mark();
     if (gg.gdn_layers()) {
         b.qkv = pre_arena.take<float>(T * C);
@@ -180,24 +218,6 @@ bool Model::ensure_chunk(std::string& err) {
         return false;
     }
     prefill::mmq::iota(b.iota, (int64_t) T, nullptr);
-    mmq = std::make_unique<prefill::mmq::Context>();
-    std::vector<const Layer*> all;
-    for (const Layer& L : w.layers) all.push_back(&L);
-    if (w.mtp.present && o.draft) all.push_back(&w.mtp.layer);
-    if (w.mtp.present && o.draft && !prefill::mmq::fits(w.mtp.fc.type, w.mtp.fc.rows)) {
-        err = o.arch + ": the prompt kernels have no tile for the drafter's input projection";
-        return false;
-    }
-    if (w.mtp.present && o.draft) prefill::mmq::load(w.mtp.fc.type, w.mtp.fc.rows);
-    for (const Layer* Lp : all)
-        for (const Linear* l : {&Lp->qkv, &Lp->z, &Lp->out, &Lp->q, &Lp->k, &Lp->v, &Lp->o, &Lp->gate, &Lp->up, &Lp->down})
-            if (l->w) {
-                if (!prefill::mmq::fits(l->type, l->rows)) {
-                    err = o.arch + ": the prompt kernels have no tile for a " + std::to_string(l->rows) + "-row matrix";
-                    return false;
-                }
-                prefill::mmq::load(l->type, l->rows);
-            }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         err = o.arch + ": preparing the prompt kernels failed";
         return false;
@@ -239,7 +259,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         basalt::log::info("basalt dense", "image encoder: %.2f GiB staged in page-locked RAM, on the card per request",
                           (double) m->encoder->weights_bytes() / 1073741824.0);
     }
-    if (!m->dec_arena.reserve(window_bytes(g, o.max_context))) {
+    if (!m->dec_arena.reserve(window_bytes(g, o.drafter == Drafter::Block ? w.dflash : BlockDrafter{}, o.max_context))) {
         err = o.arch + ": out of device memory for the decode scratch";
         return nullptr;
     }
@@ -250,8 +270,8 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     b.x = a.take<float>(W * H);
     b.xn = a.take<float>(W * H);
     b.tmp = a.take<float>(W * H);
-    b.xq = a.take_bytes(kernels::native_q8_1_bytes((int) widest, kWindow));
-    b.yq = a.take_bytes(kernels::native_q8_1_bytes((int) widest, kWindow));
+    b.xq = a.take_bytes(prefill::mmq::q8_bytes(kWindow, (int64_t) std::max<size_t>(widest, 2 * H)));
+    b.yq = a.take_bytes(prefill::mmq::q8_bytes(kWindow, (int64_t) std::max<size_t>(widest, 2 * H)));
     b.z = a.take<float>(W * g.value_width());
     b.qfull = a.take<float>(W * 2 * AQ);
     b.k = a.take<float>(W * KV);
@@ -266,9 +286,39 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     b.tok = a.take<int32_t>(W);
     b.pos = a.take<int32_t>(W * 3);
     b.cat = a.take<float>(W * 2 * H);
-    b.lp_scratch = a.take<float>(kernels::row_logprobs_scratch_floats(1, g.n_vocab));
-    if (!b.lp_scratch) {
+    b.lp_scratch = a.take<float>(kernels::row_logprobs_scratch_floats(kWindow, g.n_vocab));
+    if (o.drafter == Drafter::Block) {
+        const BlockDrafter& bd = w.dflash;
+        const size_t AQd = (size_t) bd.n_head * bd.head_dim, KVd = (size_t) bd.n_kv * bd.head_dim;
+        b.bq = a.take<float>(W * AQd);
+        b.bk = a.take<float>(W * KVd);
+        b.bv = a.take<float>(W * KVd);
+        b.bqo = a.take<float>(W * AQd);
+        b.bao = a.take<float>(W * AQd);
+        b.dyn = a.take<float>(W * bd.layers[0].conv_a.rows);
+        b.bh = a.take<float>(W * H);
+        b.blp = a.take<float>(W * kernels::kLogprobStride);
+        b.bsel = a.take<float>(W * bd.rank);
+        b.bpos = a.take<int32_t>(W * 3);
+        b.battn = a.take<float>(kernels::gqa_decode_scratch_floats(bd.window + 256, kWindow, bd.n_head, bd.head_dim));
+    }
+    b.y = a.take<float>(W * g.value_width());
+    b.hl = a.take<float>(W * (size_t) g.n_vocab);
+    b.iota = a.take<int32_t>(W);
+    b.bounds = a.take<int32_t>(2);
+    b.pos0 = a.take<int32_t>(2);
+    if (!b.bounds) {
         err = o.arch + ": the decode scratch does not fit its arena";
+        return nullptr;
+    }
+    // rows past a window's last stay finite: they are quantized with it
+    if (cudaMemset(b.x, 0, a.mark()) != cudaSuccess) {   // b.x is the arena's first buffer
+        err = o.arch + ": clearing the decode scratch failed";
+        return nullptr;
+    }
+    prefill::mmq::iota(b.iota, kWindow, nullptr);
+    if (!m->ready_products(err) || cudaDeviceSynchronize() != cudaSuccess) {
+        if (err.empty()) err = o.arch + ": readying the products failed";
         return nullptr;
     }
     return m;
