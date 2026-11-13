@@ -22,9 +22,11 @@ namespace basalt::dense {
 constexpr int kWindow = 16;       // rows one session's decode window holds
 constexpr int kBatch = 16;        // rows a batch window (several sessions' windows) holds
 constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
+constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
 constexpr int kChunk = 4096;      // tokens a prompt chunk reads at once
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
 constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
+constexpr int kTypeQ8P = 108;     // Q8_0 in planes (window_gemm Format::Q8), made at load for the decode window
 constexpr int kTypeNvfp4Planes = 45;   // NVFP4_PLANES matrices (Linear::type, nvfp4_planes.hpp)
 
 /// Device buffers carved from one allocation.
@@ -53,7 +55,8 @@ struct BatchTable {
 /// The decode window's scratch (kBatch rows).
 struct WindowScratch {
     float *x = nullptr, *xn = nullptr, *tmp = nullptr;
-    void* xq = nullptr;                          // the window gemm's activations (fp16 rows)
+    void* xq = nullptr;                          // the window gemm's activations (bf16 rows)
+    void* hq = nullptr;                          // the down product's (SwiGLU's bf16 rows)
     void* x8 = nullptr;                          // MMQ's (q8_1 rows)
     kernels::wgemm::Workspace w8;                // the window gemm's split-K sums
     float* dacc = nullptr;                       // a batch window's block drafter features, packed
@@ -119,6 +122,8 @@ public:
     uint64_t batch_clock = 0;
     std::unique_ptr<vision::Mmproj> mmproj;
     std::unique_ptr<vision::CudaEncoder> encoder;
+    BlockDrafter bd_dec;                         // the block drafter as decode windows run it (its products in Q8 planes)
+    std::vector<void*> owned;                    // device buffers the model allocated (Q8 plane copies, a wider workspace)
     void* enc_arena = nullptr;
     size_t enc_bytes = 0;
     ~Model();

@@ -2,7 +2,7 @@
 // dispatch to the kernel instantiations (window_gemm_f8.cu, window_gemm_nvfp4.cu).
 #include "window_gemm_kernels.hpp"
 
-#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -51,49 +51,20 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
     for (int i = 0; i < nw; ++i) t += red[i];
     return t;
 }
-// the power of two 2^e that puts the row's amax m in [2^14, 2^15); fac = 2^-e
-__device__ __forceinline__ float row_power(float m, float* red, float* fac_out) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-    __syncthreads();
-    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
-    __syncthreads();
-    __shared__ float pw;
-    if (threadIdx.x == 0) {
-        float t = 0.0f;
-        for (int i = 0; i < (int) (blockDim.x >> 5); ++i) t = fmaxf(t, red[i]);
-        int e = 0;
-        if (t > 0.0f && isfinite(t)) {
-            int ex;
-            frexpf(t, &ex);   // t = m 2^ex, m in [0.5, 1)
-            e = 15 - ex;
-        }
-        *fac_out = ldexpf(1.0f, -e);
-        pw = ldexpf(1.0f, e);
-    }
-    __syncthreads();
-    return pw;
-}
+__device__ __forceinline__ uint16_t bf16_bits(float v) { return __bfloat16_as_ushort(__float2bfloat16_rn(v)); }
 
 // The pack kernels start their dependents at once (the products stage weights meanwhile) and wait for their inputs.
-template <class Value>
-__device__ __forceinline__ void pack_row(const Value& value, int64_t K, __half* out, float* fac, float* red) {
-    float m = 0.0f;
-    for (int64_t c = threadIdx.x; c < K; c += blockDim.x) m = fmaxf(m, fabsf(value(c)));
-    const float pw = row_power(m, red, fac);
-    for (int64_t c = threadIdx.x; c < K; c += blockDim.x) out[c] = __float2half_rn(value(c) * pw);
-}
-
-__global__ void __launch_bounds__(kPackThreads) pack_kernel(const float* x, int64_t ld_x, int64_t K, __half* out, float* fac) {
-    __shared__ float red[32];
+__global__ void __launch_bounds__(256) pack_kernel(const float* x, int64_t ld_x, int64_t K, int64_t n, uint16_t* out) {
     pdl_launch_dependents();
     pdl_wait();
-    const float* xr = x + (int64_t) blockIdx.x * ld_x;
-    pack_row([&](int64_t c) { return xr[c]; }, K, out + (int64_t) blockIdx.x * K, fac + blockIdx.x, red);
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int64_t t = i / K, c = i - t * K;
+    out[i] = bf16_bits(x[t * ld_x + c]);
 }
 
 __global__ void __launch_bounds__(kPackThreads) norm_pack_kernel(const float* x, const float* __restrict__ w, float eps,
-                                                                 int64_t K, __half* out, float* fac, float* xn) {
+                                                                 int64_t K, uint16_t* out, float* xn) {
     __shared__ float red[32];
     pdl_launch_dependents();
     pdl_wait();
@@ -101,28 +72,14 @@ __global__ void __launch_bounds__(kPackThreads) norm_pack_kernel(const float* x,
     float ss = 0.0f;
     for (int64_t c = threadIdx.x; c < K; c += blockDim.x) ss = fmaf(xr[c], xr[c], ss);
     const float inv = rsqrtf(block_sum(ss, red) / (float) K + eps);
-    if (xn) {
-        float* yr = xn + (int64_t) blockIdx.x * K;
-        for (int64_t c = threadIdx.x; c < K; c += blockDim.x) yr[c] = xr[c] * inv * w[c];
+    float* yr = xn ? xn + (int64_t) blockIdx.x * K : nullptr;
+    uint16_t* o = out + (int64_t) blockIdx.x * K;
+    for (int64_t c = threadIdx.x; c < K; c += blockDim.x) {
+        const float v = xr[c] * inv * w[c];
+        if (yr) yr[c] = v;
+        o[c] = bf16_bits(v);
     }
-    pack_row([&](int64_t c) { return xr[c] * inv * w[c]; }, K, out + (int64_t) blockIdx.x * K, fac + blockIdx.x, red);
 }
-
-__global__ void __launch_bounds__(kPackThreads) gate_pack_kernel(const float* attn, const float* q_full, int n_head,
-                                                                 __half* out, float* fac) {
-    __shared__ float red[32];
-    constexpr int HD = 256;
-    pdl_launch_dependents();
-    pdl_wait();
-    const int64_t K = (int64_t) n_head * HD;
-    const float* ar = attn + (int64_t) blockIdx.x * K;
-    const float* qr = q_full + (int64_t) blockIdx.x * 2 * K;
-    pack_row([&](int64_t i) { return ar[i] / (1.0f + expf(-qr[(i / HD) * 2 * HD + HD + i % HD])); }, K,
-             out + (int64_t) blockIdx.x * K, fac + blockIdx.x, red);
-}
-
-__half* act_rows(void* act) { return (__half*) act; }
-float* act_fac(void* act, int64_t K) { return (float*) ((uint8_t*) act + (size_t) kRows * K * sizeof(__half)); }
 
 // ---- the plan
 
@@ -159,10 +116,10 @@ int resident(const Kernel& k) {
 
 const Kernel& kernel_for(const Call& c, int nt) {
     const bool swiglu = c.epi == Epilogue::SwiGLU;
-    if (c.fmt == Format::F8) {
-        if (swiglu) refuse("an FP8 SwiGLU pair", c);
-        return detail::f8(nt);
-    }
+    if (c.fmt != Format::Nvfp4 && swiglu) refuse("an FP8 or BF16 SwiGLU pair", c);
+    if (c.fmt == Format::F8) return detail::f8(nt);
+    if (c.fmt == Format::Bf16) return detail::bf16(nt);
+    if (c.fmt == Format::Q8) return detail::q8(nt);
     return swiglu ? detail::nvfp4_swiglu(nt) : detail::nvfp4(nt);
 }
 
@@ -178,7 +135,7 @@ Plan plan_for(const Call& c) {
         for (int i = 0; i < c.n; ++i) p.tiles += (int) ((c.m[i].rows + rs - 1) / rs);
     p.nchunks = (int) (c.K / p.k->ch);
     const int64_t R = resident(*p.k);
-    const int cb = c.fmt == Format::F8 ? p.k->ch : p.k->ch / 2;   // weight bytes per row per chunk
+    const int cb = c.fmt == Format::F8 || c.fmt == Format::Q8 ? p.k->ch : c.fmt == Format::Bf16 ? 2 * p.k->ch : p.k->ch / 2;   // weight bytes per row per chunk
     const double sums = 1.0 + 64.0 / cb;   // an item's fixed cost in chunks: its pipeline turn and its slice's sums
     double best = 1e30;
     for (int ks = 1; ks <= std::min(p.nchunks, 64); ++ks) {
@@ -203,29 +160,41 @@ int64_t part_rows(const Call& c) {
     return r;
 }
 
+// one thread per (row, 32-value block): the fp16 scale to the scale plane, the 32 codes to the code plane
+__global__ void q8_planes_kernel(const uint8_t* __restrict__ src, int64_t rows, int64_t K, uint8_t* __restrict__ dst) {
+    const int64_t nb = K / 32, i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * nb) return;
+    const int64_t r = i / nb, b = i - r * nb;
+    const uint8_t* blk = src + i * 34;
+    uint8_t* codes = dst + r * K + b * 32;
+    for (int k = 0; k < 32; ++k) codes[k] = blk[2 + k];
+    uint8_t* sc = dst + rows * K + (r * nb + b) * 2;
+    sc[0] = blk[0];
+    sc[1] = blk[1];
+}
+
 }  // namespace
 
-std::size_t act_bytes(int64_t K) { return (size_t) kRows * K * sizeof(__half) + kRows * sizeof(float); }
+void q8_planes(const void* blocks, int64_t rows, int64_t K, void* planes, void* stream) {
+    if (K % 32 != 0) refuse("Q8 planes of K not a multiple of 32", Call{});
+    const int64_t n = rows * (K / 32);
+    q8_planes_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>((const uint8_t*) blocks, rows, K, (uint8_t*) planes);
+    check("window gemm: q8 planes");
+}
+
+std::size_t act_bytes(int64_t K) { return (size_t) kRows * K * sizeof(uint16_t); }
 
 void pack(const float* x, int64_t ld_x, int64_t K, int T, void* act, void* stream) {
     if (T <= 0) return;
-    launch_pdl(pack_kernel, dim3(T), dim3(kPackThreads), 0, (cudaStream_t) stream, x, ld_x, K, act_rows(act), act_fac(act, K));
+    const int64_t n = (int64_t) T * K;
+    launch_pdl(pack_kernel, dim3((unsigned) ((n + 255) / 256)), dim3(256), 0, (cudaStream_t) stream, x, ld_x, K, n, (uint16_t*) act);
     check("window gemm: pack");
 }
 
 void norm_pack(const float* x, const float* w, float eps, int64_t K, int T, void* act, float* xn, void* stream) {
     if (T <= 0) return;
-    launch_pdl(norm_pack_kernel, dim3(T), dim3(kPackThreads), 0, (cudaStream_t) stream, x, w, eps, K, act_rows(act),
-               act_fac(act, K), xn);
+    launch_pdl(norm_pack_kernel, dim3(T), dim3(kPackThreads), 0, (cudaStream_t) stream, x, w, eps, K, (uint16_t*) act, xn);
     check("window gemm: norm_pack");
-}
-
-void gate_pack(const float* attn, const float* q_full, int T, int n_head, void* act, void* stream) {
-    if (T <= 0) return;
-    const int64_t K = (int64_t) n_head * 256;
-    launch_pdl(gate_pack_kernel, dim3(T), dim3(kPackThreads), 0, (cudaStream_t) stream, attn, q_full, n_head, act_rows(act),
-               act_fac(act, K));
-    check("window gemm: gate_pack");
 }
 
 void workspace_need(const Call& c, std::size_t& partial_floats, std::size_t& tickets) {
@@ -239,6 +208,7 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
     if (T > kRows) refuse("more rows than a window holds", c);
     if (c.n < 1 || c.n > kMaxMatrices || (c.epi == Epilogue::SwiGLU && (c.n != 2 || c.m[1].rows != c.m[0].rows)))
         refuse("matrices", c);
+    if (c.act_out && c.epi != Epilogue::SwiGLU) refuse("bf16 rows out of a product other than SwiGLU", c);
     const Plan p = plan_for(c);
     if (c.K % p.k->ch != 0) refuse("K is not a multiple of the chunk", c);
     for (int i = 0; i < c.n; ++i) {
@@ -255,6 +225,7 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
     int64_t off = 0;
     for (int i = 0; i < c.n; ++i) {
         a.w[i] = c.m[i].w;
+        a.sp[i] = c.m[i].scales ? c.m[i].scales : c.m[i].w + c.m[i].rows * (c.fmt == Format::Q8 ? c.K : c.K / 2);
         a.rows[i] = c.m[i].rows;
         a.scale[i] = c.m[i].scale;
         a.y[i] = c.m[i].y;
@@ -274,8 +245,8 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
     a.cps = p.cps;
     a.nchunks = p.nchunks;
     a.epi = (int) c.epi;
-    a.act = (const __half*) act;
-    a.fac = (const float*) ((const uint8_t*) act + (size_t) kRows * c.K * sizeof(__half));
+    a.act = (const uint16_t*) act;
+    a.act_out = (uint16_t*) c.act_out;
     a.partial = ws.partial;
     a.tickets = ws.tickets;
     launch_pdl(k.fn, dim3((unsigned) p.grid), dim3((unsigned) k.threads), (size_t) k.smem,
