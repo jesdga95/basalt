@@ -52,6 +52,8 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 | Context | default 8,192; `--max-context` sets it | default 8,192; `--max-context` sets it, up to 1,048,576 |
 | Drafting | MTP, on by default | DSpark, on by default |
 | Images | yes | yes |
+| Documents (PDF, text) | yes | yes |
+| Video | yes, with FFmpeg ([video](docs/running.md#video)) | no |
 | Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) |
 | Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) |
 
@@ -61,6 +63,7 @@ All models compared: [models](docs/models/index.md).
 
 - **Run:** [running](docs/running.md), [configuration](docs/configuration/index.md), [models and the router](docs/configuration/models.md),
   [sampling](docs/configuration/sampling.md), [image sources](docs/configuration/image-sources.md),
+  [documents](docs/configuration/documents.md),
   [diagnostics](docs/configuration/diagnostics.md), [basalt-probe](docs/probe.md), [platforms](docs/platforms.md).
 - **Models:** [models](docs/models/index.md), [Flash-Next](docs/models/qwen38-flash-next.md), [DeepSeek](docs/models/deepseek41.md),
   [the `.basalt` file](docs/model-file.md), [file format changes](docs/basalt-file-changelog.md).

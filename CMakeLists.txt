@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
 endif()
-project(basalt VERSION 0.3.2 LANGUAGES C CXX CUDA)
+project(basalt VERSION 0.3.3 LANGUAGES C CXX CUDA)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -185,7 +185,7 @@ target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_q
 
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
-  src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/prompt_host.cpp src/models/deepseek41/ops.cu
+  src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/file_reads.cpp src/models/deepseek41/prompt_host.cpp src/models/deepseek41/ops.cu
   src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu
   src/models/deepseek41/dspark.cpp src/models/deepseek41/dspark_kernels.cu)
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
@@ -253,6 +253,13 @@ if(BUILD_TESTING)
   target_include_directories(tier_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   basalt_embed_manifest(tier_policy_test)
   basalt_cpu_test(NAME tier_policy_test COMMAND tier_policy_test)
+  # the RAM tier's file reads land every blob byte for byte (no GPU)
+  add_executable(file_reads_test src/models/deepseek41/file_reads_test.cpp src/models/deepseek41/file_reads.cpp)
+  target_include_directories(file_reads_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(file_reads_test PRIVATE BASALT_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}")
+  target_link_libraries(file_reads_test PRIVATE platform Threads::Threads)
+  basalt_embed_manifest(file_reads_test)
+  basalt_cpu_test(NAME file_reads_test COMMAND file_reads_test)
   # the DeepSeek context: the refusals, the warning and the cache sizes (no GPU)
   add_executable(context_policy_test src/models/deepseek41/context_policy_test.cpp)
   target_include_directories(context_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -298,7 +305,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 # Defined in cmake/platform.cmake, included above with `warnings`.
 
 # ---- core (GPU runtime) ---------------------------------------------
-add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
+add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
                              src/core/host_plan.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
@@ -318,6 +325,7 @@ target_link_libraries(basalt-load PRIVATE core kernels)
 # reference is the whole point - a kernel checked against another copy of itself proves nothing.
 add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/sampler.cu
+                        src/kernels/cuda/logprobs.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/bf16_gemv.cu
                         src/kernels/cuda/native_mmvq.cu
@@ -369,7 +377,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
 # ---- tiers: the storage and transfer tier shared by the models (VRAM slots, RAM and file source, peer card) ----
-add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp src/core/vmm.cpp src/core/peer_experts.cpp src/core/conversation_store.cpp src/core/conversation_memory.cpp)
+add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp src/core/peer_experts.cpp src/core/conversation_store.cpp src/core/conversation_memory.cpp)
 target_include_directories(tiers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(tiers PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 include(src/models/qwen4exp/qwen4exp.cmake)
@@ -379,6 +387,12 @@ if(BUILD_TESTING)
   basalt_embed_manifest(file_expert_source_test)
   basalt_cpu_test(NAME file_expert_source_test COMMAND file_expert_source_test)
   set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
+
+  add_executable(host_registration_test tests/core/host_registration_test.cpp)
+  target_link_libraries(host_registration_test PRIVATE tiers)
+  basalt_embed_manifest(host_registration_test)
+  basalt_gpu_test(NAME host_registration_test COMMAND host_registration_test)
+  set_tests_properties(host_registration_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 # file ranges to the GPU through unbuffered reads
 if(BUILD_TESTING)
@@ -502,7 +516,7 @@ add_library(serve_shared STATIC src/program/serve/commands.cpp
             src/program/cli/tokens.cpp
             src/program/cli/help.cpp)
 target_include_directories(serve_shared PUBLIC include PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(serve_shared PUBLIC tiers model engine_session grammar tokenizer ${_gpu_runtime_target})
+target_link_libraries(serve_shared PUBLIC tiers model engine_session grammar tokenizer spec ${_gpu_runtime_target})
 
 add_executable(basalt src/program/generate.cpp
                        src/program/generate/adapter.cpp
@@ -571,6 +585,29 @@ if(BUILD_TESTING)
   add_executable(vision_resize_test tests/vision/preprocess_test.cpp)
   target_link_libraries(vision_resize_test PRIVATE vision_core warnings)
   basalt_cpu_test(NAME vision_resize_test COMMAND vision_resize_test)
+  # FFmpeg found at run time, or the reason it is not (any machine: CI has no FFmpeg)
+  add_executable(ffmpeg_load_test tests/vision/ffmpeg_load_test.cpp)
+  target_link_libraries(ffmpeg_load_test PRIVATE vision_core warnings)
+  basalt_embed_manifest(ffmpeg_load_test)
+  basalt_cpu_test(NAME ffmpeg_load_test COMMAND ffmpeg_load_test)
+  # video sampling, canvas, timestamps and patches against the reference processor; the committed clip is decoded
+  # where this machine has FFmpeg
+  add_executable(video_test tests/vision/video_test.cpp)
+  target_link_libraries(video_test PRIVATE vision_core warnings)
+  basalt_embed_manifest(video_test)
+  basalt_cpu_test(NAME video_test COMMAND video_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/video/synth.mp4)
+  # a prompt's rotary positions with pictures and video groups against the reference's get_rope_index
+  add_executable(mrope_positions_test tests/vision/mrope_positions_test.cpp)
+  target_link_libraries(mrope_positions_test PRIVATE vision_core warnings)
+  basalt_cpu_test(NAME mrope_positions_test COMMAND mrope_positions_test)
+  # the hand-declared FFmpeg ABI against FFmpeg's own headers, where this machine has them (nothing is linked)
+  find_path(BASALT_FFMPEG_HEADERS libavformat/avformat.h)
+  if(BASALT_FFMPEG_HEADERS)
+    add_executable(ffmpeg_abi_test tests/vision/ffmpeg_abi_test.cpp)
+    target_include_directories(ffmpeg_abi_test PRIVATE include ${BASALT_FFMPEG_HEADERS})
+    basalt_cpu_test(NAME ffmpeg_abi_test COMMAND ffmpeg_abi_test)
+    set_tests_properties(ffmpeg_abi_test PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
 endif()
 add_dependencies(basalt-bench basalt basalt-device git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
@@ -862,6 +899,11 @@ target_include_directories(sampler_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(sampler_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME sampler_parity COMMAND sampler_parity --selftest)
 basalt_gpu_test(NAME sampler_split_parity COMMAND sampler_parity --split)
+# a pick's log probability and the row's likeliest tokens (row_logprobs) against a double CPU reference
+add_executable(logprobs_parity tests/kernels/logprobs_parity.cpp)
+target_include_directories(logprobs_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(logprobs_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME logprobs_parity COMMAND logprobs_parity)
 # the decode QSA top-k and the greedy argmax on thread-block clusters vs the one-CTA kernels, bitwise,
 # captured in a graph too (GPU, synthetic, no model; skips without cluster support); --bench: per-call times
 add_executable(decode_cluster_parity tests/models/qwen4exp/kernels/decode_cluster_parity.cpp)
@@ -1136,6 +1178,20 @@ target_link_libraries(reply_rows_test PRIVATE warnings)
 basalt_embed_manifest(reply_rows_test)
 basalt_cpu_test(NAME reply_rows_test COMMAND reply_rows_test)
 set_tests_properties(reply_rows_test PROPERTIES TIMEOUT 60)
+# a sent pick's log probability and the row's likeliest tokens (CPU only)
+add_executable(logprobs_test tests/program/logprobs_test.cpp)
+target_include_directories(logprobs_test PRIVATE src/program/serve include)
+target_link_libraries(logprobs_test PRIVATE warnings)
+basalt_embed_manifest(logprobs_test)
+basalt_cpu_test(NAME logprobs_test COMMAND logprobs_test)
+set_tests_properties(logprobs_test PROPERTIES TIMEOUT 60)
+# the lines the server reads from the engine: the conversation cache's figures and the context-overflow ERR
+add_executable(protocol_lines_test tests/program/protocol_lines_test.cpp)
+target_include_directories(protocol_lines_test PRIVATE include)
+target_link_libraries(protocol_lines_test PRIVATE warnings)
+basalt_embed_manifest(protocol_lines_test)
+basalt_cpu_test(NAME protocol_lines_test COMMAND protocol_lines_test)
+set_tests_properties(protocol_lines_test PROPERTIES TIMEOUT 60)
 add_executable(auto_plan_test tests/program/auto_plan_test.cpp)
 target_link_libraries(auto_plan_test PRIVATE engine_session warnings)
 basalt_embed_manifest(auto_plan_test)

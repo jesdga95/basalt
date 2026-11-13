@@ -30,7 +30,7 @@ class CallingEngine(MockEngine):
         super().__init__(tok, "x", max_context=32768)
         self.prompts = []
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.prompts.append(list(ids))
         prompt = self.tok.decode(ids)
         if prompt.endswith("<function="):

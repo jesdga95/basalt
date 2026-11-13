@@ -26,7 +26,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 On Windows: `py -3 -m venv .venv` then `.venv\Scripts\pip install -r requirements.txt`. Then follow the README's quick start from the
-model download on: `bin/basalt serve --config basalt_config.json`. Run `basalt-bench` from the top directory (it reads `data/bench`).
+model download on: `bin/basalt serve --config basalt_config.json`. `bin/basalt-bench` starts the `basalt` beside it and
+reads the archive's `data/bench`.
 
 ## Container image
 
@@ -57,9 +58,21 @@ fork/exec/pipe, dlopen, /proc or /sys reads). `tools/check_platform_boundary.sh`
 the Linux body being the code you would have written anyway, and a test in `tests/platform/` that runs on both. Paths are UTF-8 and go
 through the platform file calls.
 
+## FFmpeg for video
+
+Video input loads FFmpeg's shared libraries at run time (libavformat, libavcodec, libavutil and libswscale of release 6, 7 or 8; nothing
+is linked or shipped). Linux: the distribution's runtime packages (`libavformat62` and its siblings on Ubuntu 26.04, `libavformat60`
+on 24.04), found by the system loader. Windows: a shared FFmpeg build (`avformat-62.dll` and the rest, from gyan.dev or BtbN) beside
+`basalt.exe` or in a `PATH` directory; the current directory is never searched. Without them video is off and the server says why.
+GPU decoding needs an FFmpeg build with NVDEC (the distribution packages and the gyan.dev and BtbN builds have it); without it
+frames decode on the CPU.
+
 ## Windows limitations
 
-- Pinned memory is capped under WDDM: the pinned slices are limited to `RAM/2 - 8 GiB` when the whole arena cannot be registered.
+- Portable host registrations stay within the visible adapters' DXGI non-local allowances, leaving driver headroom.
+  Whole-expert slices retain their own device aliases; the unregistered tail is locked in the working set.
+  Qwen and DeepSeek's resident RAM tiers share CUDA host VMM when supported, with ordinary registration as the fallback.
+  Allocation-backed pins stay in RAM across SLEEP/WAKE; the expert caches can still return their VRAM.
 - Large pages need "Lock pages in memory" (Administrators). Without it the engine uses 4 KiB pages and says so at start.
 - No shared arena files and no cgroup limits. `--ple-io direct` reads through the file cache.
 - `basalt serve` runs the Python server as a child.

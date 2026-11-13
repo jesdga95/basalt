@@ -56,13 +56,26 @@ Flow Request::read_prompt() {
                 if (i >= runtime_.o.prompt_cache_root) root_at = i;
                 break;
             }
+    // A prompt with pictures also stops right after the last picture's rows before the new turn: another question
+    // about the same pictures (a new chat, or the turn asked again) then finds them read, in a checkpoint that
+    // ends where the question begins.
+    media_at = -1;
+    if (runtime_.o.prompt_cache > 0 && !runtime_.req_imgs.empty()) {
+        auto is_pad = [&](int64_t id) { return id == runtime_.o.image_pad_id || (runtime_.o.video_pad_id >= 0 && id == runtime_.o.video_pad_id); };
+        int64_t end = runtime_.req_imgs.back().start;
+        while (end < n && is_pad(ids[(size_t) end])) ++end;
+        const int64_t last = turn_at > 0 ? turn_at : n - 1;
+        // exactly where the picture's rows end: a model that reads a picture as one block of rows can stop a read only
+        // at a picture's edge
+        if (end > std::max(resume, root_at) && end < last) media_at = end;
+    }
     limit_parts();
     at = read_from;
     // the last window of the last windowed part carries the last prompt token too: the first generated
     // token is sampled from it, and the draft layer takes its rows like any accepted window
     fold_p0 = n - 1;
     prompt_parts_begin();
-    for (const int64_t to : {root_at, turn_at, n - 1}) {
+    for (const int64_t to : {root_at, media_at, turn_at, n - 1}) {
         if (to <= at) continue;
         const Flow flow = read_to(to);
         if (flow == Flow::quit) break;   // stopped while reading: the rest of the request runs, and ends as cancelled

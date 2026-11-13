@@ -21,8 +21,6 @@ int main() {
     CHECK(!repeat_miss(0, 100, kPromoteWindow));
     CHECK(repeat_miss(10 + 1, 10 + kPromoteWindow, kPromoteWindow));
     CHECK(!repeat_miss(10 + 1, 10 + kPromoteWindow + 1, kPromoteWindow));
-    CHECK(repeat_miss(5 + 1, 5 + kAdmitWindow, kAdmitWindow));
-    CHECK(!repeat_miss(5 + 1, 5 + kAdmitWindow + 1, kAdmitWindow));
 
     // ghost reset: a stream where one expert misses every 40 tokens is admitted on its second miss, one every 100 never
     for (int period : {40, 100}) {
@@ -49,6 +47,22 @@ int main() {
             const int b = bus_count(p, f);
             CHECK(b >= 0 && b <= p);
             CHECK(p + f - b >= f);   // the CPU always takes every file-backed miss
+        }
+
+    // the second card's link: half the bus's misses, rounded down, when the bus has as many as the CPU
+    CHECK(peer_bus_count(1, 0) == 0);
+    CHECK(peer_bus_count(2, 0) == 0);
+    CHECK(peer_bus_count(3, 0) == 0);
+    CHECK(peer_bus_count(4, 0) == 1);
+    CHECK(peer_bus_count(5, 0) == 0);
+    CHECK(peer_bus_count(6, 0) == 1);
+    CHECK(peer_bus_count(8, 0) == 2);
+    CHECK(peer_bus_count(3, 1) == 1);   // the file-backed miss and a pinned one on the CPU, two pinned on the bus
+    CHECK(peer_bus_count(1, 3) == 0);
+    for (int p = 0; p <= 16; ++p)
+        for (int f = 0; f <= 16 - p; ++f) {
+            const int n = peer_bus_count(p, f);
+            CHECK(n >= 0 && n <= bus_count(p, f) - n);   // the main card's link keeps at least as many
         }
 
     // homes: a RAM shortfall puts homes on the main card, with or without a second card; RAM that takes the rest leaves
@@ -175,6 +189,21 @@ int main() {
         CHECK(reclaim_slots(3000, room, 2200, one, 8) == 8);
         CHECK(reclaim_slots(3000, room, 1500, one, 30) == 5);
         CHECK(reclaim_slots(3000, room, 2500, one, 30) == 0);
+    }
+
+    // promotion by CPU uses: the kPromoteUses-th use earns it and the count starts over; the counts halve once per
+    // kUseHalfLife tokens, however the tokens come in windows
+    {
+        uint16_t uses = 0;
+        for (int i = 1; i < kPromoteUses; ++i) CHECK(!count_use(uses));
+        CHECK(count_use(uses));
+        CHECK(uses == 0);
+        CHECK(!count_use(uses));
+        int halvings = 0;
+        for (uint64_t t = 0; t < 10 * kUseHalfLife; t += 3) halvings += use_half_life(t, 3);
+        CHECK(halvings == 10);
+        CHECK(!use_half_life(0, kUseHalfLife - 1));
+        CHECK(use_half_life(kUseHalfLife - 1, 1));
     }
 
     if (g_fail) return 1;

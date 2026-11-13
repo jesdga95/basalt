@@ -357,6 +357,16 @@ Licensed under the Apache License, Version 2.0, reproduced below.
    limitations under the License.
 
 ================================================================================
+ninfer (https://github.com/Neroued/ninfer), Apache License 2.0
+By Neroued and the ninfer contributors.
+================================================================================
+
+The video input adapts ideas from ninfer, not its code: the decode guards (encoded bytes, source
+length, source frames, decoded pixels) and their limits, the frame count from the container,
+then the length, then a counting pass, and per-group timestamps with image positions per group
+(src/vision/video.cpp, serve/). Licensed under the Apache License, Version 2.0, reproduced above.
+
+================================================================================
 DeepSeek-V4.1 chat encoding (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), in
 serve/models/deepseek41_encoding.py
 ================================================================================
@@ -382,3 +392,16 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+================================================================================
+FFmpeg (https://ffmpeg.org), declarations in include/basalt/vision/ffmpeg_abi.hpp
+================================================================================
+
+Basalt neither ships nor links FFmpeg. When video input is used, it loads the
+FFmpeg shared libraries installed on the machine at run time. The declarations
+in include/basalt/vision/ffmpeg_abi.hpp (function signatures, constants and
+structure field offsets) are derived from FFmpeg's public headers, releases 6.0
+to 8.0. FFmpeg is Copyright (c) the FFmpeg developers and is licensed under the
+GNU Lesser General Public License version 2.1 or later
+(https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html); some optional parts
+of an FFmpeg build are under the GPL.

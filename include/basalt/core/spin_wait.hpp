@@ -2,7 +2,7 @@
 //
 // A thread that spins without ever yielding keeps its core: a thread woken onto that core (the job the spinner waits
 // for, or the spinner's own waker) may wait for the scheduler's next tick.  A wait pauses for its first kYieldAfter,
-// as the pool's parked workers do, then yields the core on every check.
+// then yields the core on every check.
 #pragma once
 
 #include <chrono>

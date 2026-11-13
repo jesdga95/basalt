@@ -16,18 +16,47 @@ constexpr int kLatentW = 512;
 constexpr int kRopeW = 64;
 constexpr int kMarkovRank = 256;
 
-// The E2M1 values doubled; the block scale supplies the other factor of two. Kept in shared memory: lanes index it
-// with different values, which a constant-memory read would serialise.
-__device__ __forceinline__ void load_values(float* tab) {
-    if (threadIdx.x < 16) {
-        const float v[16] = {0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f, -0.f, -1.f, -2.f, -3.f, -4.f, -6.f, -8.f, -12.f};
-        tab[threadIdx.x] = v[threadIdx.x];
+// q8_1 activations as the native quantizer writes them: per 32 values an fp16 scale (and sum), then 32 int8.
+struct Q81 {
+    __half2 ds;
+    int8_t qs[32];
+};
+
+// One q8_1 block in shared memory with its bytes in the order an MXFP4 block's nibbles come (x[0], x[16], x[1],
+// x[17], ...) and its scale; 48 bytes, so the lanes' 16-byte reads (one block each) do not share a bank.
+struct XBlock {
+    int4 lo, hi;
+    float d;
+    float pad[3];
+};
+
+// Stages `nb` q8_1 blocks into `xs` in nibble order.
+__device__ __forceinline__ void stage_q8(const Q81* __restrict__ x, int nb, XBlock* xs) {
+    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+        const int* q = reinterpret_cast<const int*>(x[b].qs);
+        int w[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int a = q[i], c = q[i + 4];   // x[4i..4i+3], x[4i+16..4i+19]
+            w[2 * i] = (int) __byte_perm(a, c, 0x5140);
+            w[2 * i + 1] = (int) __byte_perm(a, c, 0x7362);
+        }
+        xs[b].lo = make_int4(w[0], w[1], w[2], w[3]);
+        xs[b].hi = make_int4(w[4], w[5], w[6], w[7]);
+        xs[b].d = __low2float(x[b].ds);
     }
 }
 
-// The activation row sits in shared memory with one pad float per 32-element block, so the lanes (one block each)
-// do not share a bank.
-__host__ __device__ constexpr size_t padded_floats(int n) { return (size_t) (n / kMxfp4BlockElems) * (kMxfp4BlockElems + 1); }
+// The E2M1 values doubled as int8 (the block scale supplies the other factor of two), by magnitude code.
+constexpr uint32_t kPos0 = 0x03020100u, kPos1 = 0x0c080604u;   //  0  1  2  3 |  4  6  8  12
+constexpr uint32_t kNeg0 = 0xfdfeff00u, kNeg1 = 0xf4f8fafcu;   //  0 -1 -2 -3 | -4 -6 -8 -12
+
+// The four nibbles in the low 16 bits of `q` as int8 values, in nibble order (the sign select is ggml's
+// get_int_from_table_16; MIT, Copyright (c) 2023-2026 The ggml authors).
+__device__ __forceinline__ int e2m1x4(uint32_t q) {
+    const uint32_t pos = __byte_perm(kPos0, kPos1, q), neg = __byte_perm(kNeg0, kNeg1, q);
+    return (int) __byte_perm(pos, neg, 0x3210 | ((q & 0x8888u) >> 1));
+}
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -40,13 +69,11 @@ __device__ __forceinline__ float e8m0_half(uint32_t e) {
     return __uint_as_float(e < 2 ? (0x00200000u << e) : ((e - 1) << 23));
 }
 
-// Dot of one MXFP4 row in global memory (4-byte aligned, `nb` blocks of 17 bytes) with x in shared memory; every lane
-// gets the sum. A lane takes blocks lane, lane + 32, ...; all their words are loaded before any is used. A block
-// starts at byte 17 * b, so its misalignment is b & 3 and a funnel shift lines its bytes up. The caller pads the
-// matrix by 16 bytes: the last block reads up to three bytes past its end.
+// The words of one MXFP4 row in global memory (4-byte aligned, `nb` blocks of 17 bytes) a lane needs: blocks lane,
+// lane + 32, ... A block starts at byte 17 * b, so its misalignment is b & 3. The caller pads the matrix by 16 bytes:
+// the last block reads up to three bytes past its end.
 template <int ITERS>
-__device__ __forceinline__ float row_dot(const unsigned char* row, const float* xs, const float* tab, int nb, int lane) {
-    uint32_t w[ITERS][5];
+__device__ __forceinline__ void row_load(const unsigned char* row, int nb, int lane, uint32_t (&w)[ITERS][5]) {
 #pragma unroll
     for (int it = 0; it < ITERS; ++it) {
         const int b = lane + 32 * it;
@@ -56,52 +83,59 @@ __device__ __forceinline__ float row_dot(const unsigned char* row, const float* 
             for (int k = 0; k < 5; ++k) w[it][k] = __ldg(p + k);
         }
     }
+}
+
+// Dot of a row row_load fetched with staged q8_1 activations; every lane gets the sum. A funnel shift lines each
+// block's 16 nibble bytes up; their int8 values meet the activations in dp4a, the block's sum takes both scales.
+template <int ITERS>
+__device__ __forceinline__ float row_dot(const uint32_t (&w)[ITERS][5], const XBlock* xs, int nb, int lane) {
     float acc = 0.f;
 #pragma unroll
     for (int it = 0; it < ITERS; ++it) {
         const int b = lane + 32 * it;
         if (b >= nb) continue;
         const int sh = (b & 3) * 8;
-        uint32_t v[5];
+        const float scale = e8m0_half((w[it][0] >> sh) & 0xff);
+        const int4 lo = xs[b].lo, hi = xs[b].hi;
+        const int xw[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+        int s = 0;
 #pragma unroll
-        for (int k = 0; k < 4; ++k) v[k] = __funnelshift_r(w[it][k], w[it][k + 1], sh);
-        v[4] = w[it][4] >> sh;
-        const float scale = e8m0_half(v[0] & 0xff);
-        const float* xv = xs + b * (kMxfp4BlockElems + 1);
-        float s = 0.f;
-#pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            const uint32_t q = (v[(j + 1) >> 2] >> (((j + 1) & 3) * 8)) & 0xff;
-            s += tab[q & 15] * xv[j] + tab[q >> 4] * xv[j + 16];
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t n = __funnelshift_rc(w[it][k], w[it][k + 1], sh + 8);   // nibble bytes 4k..4k+3
+            s = __dp4a(e2m1x4(n), xw[2 * k], s);
+            s = __dp4a(e2m1x4(n >> 16), xw[2 * k + 1], s);
         }
-        acc += s * scale;
+        acc += scale * (xs[b].d * (float) s);
     }
     return warp_sum(acc);
 }
 
 // Grid (n_ff / (4 * kRowGroups), pairs): the block's 8 warps are 4 rows x (gate, up), kRowGroups times over the
-// activation row it staged once.
+// activation row it staged once; the next group's weights load while this one's dots run.
 template <int ITERS>
 __global__ void __launch_bounds__(256) k_gate_up(const unsigned char* __restrict__ gw,
                                                  const unsigned char* __restrict__ uw, int n_in, int n_ff,
-                                                 const float* __restrict__ x, const int32_t* __restrict__ ids, int k,
-                                                 float clamp, float* __restrict__ h) {
+                                                 const Q81* __restrict__ x, const int32_t* __restrict__ ids, int k,
+                                                 float clamp, const int32_t* __restrict__ live, float* __restrict__ h) {
     extern __shared__ __align__(16) unsigned char smem[];
-    __shared__ float res[kRowGroups][8], tab[16];
+    __shared__ float res[kRowGroups][8];
     const int nb = n_in / kMxfp4BlockElems;
     const size_t row_bytes = (size_t) nb * kMxfp4BlockBytes;
-    float* xs = reinterpret_cast<float*>(smem);
-    load_values(tab);
+    XBlock* xs = reinterpret_cast<XBlock*>(smem);
     const int pair = blockIdx.y, t = pair / k, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (live && t >= *live) return;   // a row nothing reads
     const int e = ids[pair];
-    for (int i = threadIdx.x; i < n_in; i += blockDim.x) xs[(i >> 5) * 33 + (i & 31)] = x[(size_t) t * n_in + i];
     const int r0 = blockIdx.x * kRowGroups * (kRowsPerBlock / 2);
+    const unsigned char* w0 = ((warp & 1) ? uw : gw) + ((size_t) e * n_ff + r0 + (warp >> 1)) * row_bytes;
+    const size_t step = (size_t) (kRowsPerBlock / 2) * row_bytes;   // the warp's row of the next group
+    uint32_t w[2][ITERS][5];
+    row_load<ITERS>(w0, nb, lane, w[0]);
+    stage_q8(x + (size_t) t * nb, nb, xs);
     __syncthreads();
-#pragma unroll 1
+#pragma unroll
     for (int q = 0; q < kRowGroups; ++q) {
-        const int r = r0 + q * (kRowsPerBlock / 2) + (warp >> 1);
-        const unsigned char* w = ((warp & 1) ? uw : gw) + ((size_t) e * n_ff + r) * row_bytes;
-        const float v = row_dot<ITERS>(w, xs, tab, nb, lane);
+        if (q + 1 < kRowGroups) row_load<ITERS>(w0 + (q + 1) * step, nb, lane, w[(q + 1) & 1]);
+        const float v = row_dot<ITERS>(w[q & 1], xs, nb, lane);
         if (lane == 0) res[q][warp] = v;
     }
     __syncthreads();
@@ -116,23 +150,31 @@ __global__ void __launch_bounds__(256) k_gate_up(const unsigned char* __restrict
 // Grid (n_out / (8 * kRowGroups), pairs): one warp per output row, kRowGroups rows per warp.
 template <int ITERS>
 __global__ void __launch_bounds__(256) k_down(const unsigned char* __restrict__ dw, int n_ff, int n_out,
-                                              const float* __restrict__ h, const int32_t* __restrict__ ids,
-                                              float* __restrict__ d) {
+                                              const Q81* __restrict__ h, const int32_t* __restrict__ ids, int k,
+                                              const int32_t* __restrict__ live, float* __restrict__ d) {
     extern __shared__ __align__(16) unsigned char smem[];
-    __shared__ float tab[16];
     const int nb = n_ff / kMxfp4BlockElems;
     const size_t row_bytes = (size_t) nb * kMxfp4BlockBytes;
-    float* xs = reinterpret_cast<float*>(smem);
-    load_values(tab);
+    XBlock* xs = reinterpret_cast<XBlock*>(smem);
     const int pair = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = blockIdx.x * kRowGroups * kRowsPerBlock + warp;
+    if (live && pair / k >= *live) {   // a row nothing reads: zeros, so the sums after it stay finite
+        if (lane == 0)
+            for (int q = 0; q < kRowGroups; ++q) d[(size_t) pair * n_out + r0 + q * kRowsPerBlock] = 0.f;
+        return;
+    }
     const int e = ids[pair];
-    for (int i = threadIdx.x; i < n_ff; i += blockDim.x) xs[(i >> 5) * 33 + (i & 31)] = h[(size_t) pair * n_ff + i];
+    const unsigned char* w0 = dw + ((size_t) e * n_out + r0) * row_bytes;
+    const size_t step = (size_t) kRowsPerBlock * row_bytes;   // the warp's row of the next group
+    uint32_t w[2][ITERS][5];
+    row_load<ITERS>(w0, nb, lane, w[0]);
+    stage_q8(h + (size_t) pair * nb, nb, xs);
     __syncthreads();
-#pragma unroll 1
+#pragma unroll
     for (int q = 0; q < kRowGroups; ++q) {
-        const int r = (blockIdx.x * kRowGroups + q) * kRowsPerBlock + warp;
-        const float v = row_dot<ITERS>(dw + ((size_t) e * n_out + r) * row_bytes, xs, tab, nb, lane);
-        if (lane == 0) d[(size_t) pair * n_out + r] = v;
+        if (q + 1 < kRowGroups) row_load<ITERS>(w0 + (q + 1) * step, nb, lane, w[(q + 1) & 1]);
+        const float v = row_dot<ITERS>(w[q & 1], xs, nb, lane);
+        if (lane == 0) d[(size_t) pair * n_out + r0 + q * kRowsPerBlock] = v;
     }
 }
 
@@ -231,26 +273,27 @@ void check(const char* what) {
 
 }  // namespace
 
-void dspark_moe_gate_up(const void* gate_w, const void* up_w, int n_in, int n_ff, const float* x, const int32_t* ids,
-                        int n_tokens, int k, float clamp, float* h, void* stream) {
-    const size_t smem = padded_floats(n_in) * 4;
+void dspark_moe_gate_up(const void* gate_w, const void* up_w, int n_in, int n_ff, const void* x_q8_1, const int32_t* ids,
+                        int n_tokens, int k, float clamp, const int32_t* live_rows, float* h, void* stream) {
+    const size_t smem = (size_t) (n_in / kMxfp4BlockElems) * sizeof(XBlock);
     if (n_in % kMxfp4BlockElems || n_in > 6144 || n_ff % (kRowGroups * kRowsPerBlock / 2)) throw std::invalid_argument("dspark_moe_gate_up: shape");
     const dim3 grid(n_ff / (kRowGroups * kRowsPerBlock / 2), n_tokens * k);
     const int iters = (n_in / kMxfp4BlockElems + 31) / 32;
     auto kern = iters <= 3 ? k_gate_up<3> : iters <= 5 ? k_gate_up<5> : k_gate_up<6>;
     kern<<<grid, 256, smem, (cudaStream_t) stream>>>((const unsigned char*) gate_w, (const unsigned char*) up_w, n_in,
-                                                    n_ff, x, ids, k, clamp, h);
+                                                    n_ff, (const Q81*) x_q8_1, ids, k, clamp, live_rows, h);
     check("dspark_moe_gate_up");
 }
 
-void dspark_moe_down(const void* down_w, int n_ff, int n_out, const float* h, const int32_t* ids, int n_tokens, int k,
-                     float* d, void* stream) {
-    const size_t smem = padded_floats(n_ff) * 4;
+void dspark_moe_down(const void* down_w, int n_ff, int n_out, const void* h_q8_1, const int32_t* ids, int n_tokens, int k,
+                     const int32_t* live_rows, float* d, void* stream) {
+    const size_t smem = (size_t) (n_ff / kMxfp4BlockElems) * sizeof(XBlock);
     if (n_ff % kMxfp4BlockElems || n_ff > 6144 || n_out % (kRowGroups * kRowsPerBlock)) throw std::invalid_argument("dspark_moe_down: shape");
     const dim3 grid(n_out / (kRowGroups * kRowsPerBlock), n_tokens * k);
     const int iters = (n_ff / kMxfp4BlockElems + 31) / 32;
     auto kern = iters <= 3 ? k_down<3> : iters <= 5 ? k_down<5> : k_down<6>;
-    kern<<<grid, 256, smem, (cudaStream_t) stream>>>((const unsigned char*) down_w, n_ff, n_out, h, ids, d);
+    kern<<<grid, 256, smem, (cudaStream_t) stream>>>((const unsigned char*) down_w, n_ff, n_out, (const Q81*) h_q8_1, ids, k,
+                                                    live_rows, d);
     check("dspark_moe_down");
 }
 
@@ -266,6 +309,63 @@ void dspark_kv_rope(const float* raw, const float* norm_w, const int32_t* pos, i
     k_kv_rope<<<n_tokens, kLatentW, 0, (cudaStream_t) stream>>>(raw, norm_w, pos, eps, rope_freq, kv_out,
                                                                  reinterpret_cast<__half*>(ring), ring_slots);
     check("dspark_kv_rope");
+}
+
+namespace {
+// Block (column group, row): x's row as four streams, cur's row as stream 0; the first block copies the metadata.
+__global__ void k_block_inputs(const int32_t* __restrict__ meta, int n_meta, const float4* __restrict__ emb,
+                               const float4* __restrict__ mask, int n4, int32_t* __restrict__ dmeta, float4* __restrict__ x,
+                               float4* __restrict__ cur) {
+    const int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r == 0 && blockIdx.x == 0)
+        for (int j = threadIdx.x; j < n_meta; j += blockDim.x) dmeta[j] = meta[j];
+    if (i >= n4) return;
+    const float4* src = r == 0 ? emb : mask + (size_t) (r - 1) * 4 * n4;
+    float4* xr = x + (size_t) r * 4 * n4;
+    const float4 v0 = src[i];
+    xr[i] = v0;
+    for (int s = 1; s < 4; ++s) xr[(size_t) s * n4 + i] = r == 0 ? v0 : src[(size_t) s * n4 + i];
+    cur[(size_t) r * n4 + i] = v0;
+}
+
+__global__ void k_fill_positions(int32_t* pos, int64_t pos0, int n) {
+    if ((int) threadIdx.x < n) pos[threadIdx.x] = (int32_t) (pos0 + threadIdx.x);
+}
+
+// Block (row, stage): one row of 512 fp16 values, 8 a thread.
+__global__ void k_commit_rows(const uint4* __restrict__ staged, int stage_slots, uint4* ring0, uint4* ring1, uint4* ring2,
+                              int ring_slots, int64_t pos0) {
+    const int64_t p = pos0 + blockIdx.x;
+    const int l = blockIdx.y;
+    uint4* ring = l == 0 ? ring0 : l == 1 ? ring1 : ring2;
+    constexpr int kWords = kLatentW * 2 / 16;
+    const uint4* src = staged + ((size_t) l * stage_slots + (size_t) (p % stage_slots)) * kWords;
+    ring[(size_t) (p % ring_slots) * kWords + threadIdx.x] = src[threadIdx.x];
+}
+}  // namespace
+
+void dspark_block_inputs(const int32_t* meta, int n_meta, const float* emb, const float* mask, int n, int rows,
+                         int32_t* dmeta, float* x, float* cur, void* stream) {
+    const int n4 = n / 4;
+    k_block_inputs<<<dim3((unsigned) ((n4 + 255) / 256), (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(
+        meta, n_meta, reinterpret_cast<const float4*>(emb), reinterpret_cast<const float4*>(mask), n4, dmeta,
+        reinterpret_cast<float4*>(x), reinterpret_cast<float4*>(cur));
+    check("dspark_block_inputs");
+}
+
+void dspark_fill_positions(int32_t* pos, int64_t pos0, int n, void* stream) {
+    if (n <= 0) return;
+    k_fill_positions<<<1, 1024, 0, (cudaStream_t) stream>>>(pos, pos0, n);
+    check("dspark_fill_positions");
+}
+
+void dspark_commit_rows(const uint16_t* staged, int stage_slots, uint16_t* ring0, uint16_t* ring1, uint16_t* ring2,
+                        int ring_slots, int64_t pos0, int n, void* stream) {
+    if (n <= 0) return;
+    k_commit_rows<<<dim3((unsigned) n, 3), kLatentW * 2 / 16, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const uint4*>(staged), stage_slots, reinterpret_cast<uint4*>(ring0), reinterpret_cast<uint4*>(ring1),
+        reinterpret_cast<uint4*>(ring2), ring_slots, pos0);
+    check("dspark_commit_rows");
 }
 
 void dspark_hc_mean(const float* x, int n_rows, int n, float* out, int out_stride, void* stream) {

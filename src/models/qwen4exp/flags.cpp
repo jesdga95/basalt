@@ -7,6 +7,7 @@
 #include "basalt/models/qwen4exp/options.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -177,14 +178,18 @@ std::optional<int> finish_flags(Options& o) {
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
         o.resident_headroom = 0;
     }
-    if (o.route_tail_skip > 0 || o.route_prior > 0.0f || o.relaxed_drafting > 0.0f) {
-        basalt::log::warn("basalt", "lossy flags enabled, these flags will affect the accuracy of the served model");
-        if (o.relaxed_drafting > 0.0f)
-            basalt::log::warn("basalt", "--relaxed-drafting %g accepts draft tokens the model would not pick", (double) o.relaxed_drafting);
-        if (o.route_prior > 0.0f)
-            basalt::log::warn("basalt", "--route-prior %g changes expert routing", (double) o.route_prior);
-        if (o.route_tail_skip > 0)
-            basalt::log::warn("basalt", "--route-tail-skip %d drops low-ranked missed experts", o.route_tail_skip);
+    char effect[128];
+    if (o.relaxed_drafting > 0.0f) {
+        std::snprintf(effect, sizeof effect, "--relaxed-drafting %g accepts draft tokens the model would not pick", (double) o.relaxed_drafting);
+        o.lossy.push_back({"--relaxed-drafting", effect});
+    }
+    if (o.route_prior > 0.0f) {
+        std::snprintf(effect, sizeof effect, "--route-prior %g changes expert routing", (double) o.route_prior);
+        o.lossy.push_back({"--route-prior", effect});
+    }
+    if (o.route_tail_skip > 0) {
+        std::snprintf(effect, sizeof effect, "--route-tail-skip %d drops low-ranked missed experts", o.route_tail_skip);
+        o.lossy.push_back({"--route-tail-skip", effect});
     }
     return std::nullopt;
 }

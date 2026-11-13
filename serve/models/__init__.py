@@ -13,8 +13,22 @@ class Dialect:
     nothink_lead = ""                       # text between a no-thinking prompt and a forced call's opening
     image_pad = "<|image_pad|>"             # the prompt token that stands for one row of an image's embeddings
     image_start = "<|vision_start|>"        # the token an image's pad run follows ("" : every pad is an image row)
+    video_pad = ""                          # the prompt token for one row of a video group ("": the model reads no video)
+    video_marker = ""                       # what the template writes for a video, replaced by video_text
     in_engine_vision = False                # the image encoder always lives in the engine (only --vision dynamic)
     effort_turn = ""                        # a trailing turn that states the reasoning effort ("{}" for its text)
+    # what the model's template does with a conversation, as llama.cpp's /props `chat_template_caps` names it
+    caps = {"supports_tool_calls": False, "supports_parallel_tool_calls": False, "supports_reasoning_effort": False,
+            "supports_system_role": False, "supports_preserve_reasoning": False}
+
+    def template_kwargs(self, kwargs: dict) -> dict:
+        """The frontend's template kwargs as this model's template names them: `preserve_reasoning` (keep earlier
+        turns' thinking in the prompt) becomes the template's own switch."""
+        if "preserve_reasoning" not in kwargs:
+            return kwargs
+        out = dict(kwargs)
+        out["preserve_thinking"] = out.pop("preserve_reasoning")
+        return out
 
     def effort_level(self, level):
         """The frontend's reasoning level (low, medium, high, max or a number) as this model's template takes it."""
@@ -35,6 +49,11 @@ class Dialect:
     def literal_tags(self, controls) -> dict[str, str]:
         """Texts that stay plain text inside a message, with the private-use mark standing for each while the
         prompt is rendered."""
+        raise NotImplementedError
+
+    def video_text(self, times: list[float], rows: int) -> str:
+        """The prompt text for a video in place of video_marker: per two-frame group its time (seconds) and its run of
+        `rows` video pads."""
         raise NotImplementedError
 
     def forced_opening(self, name: str | None) -> str:

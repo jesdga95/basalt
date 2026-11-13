@@ -92,6 +92,18 @@ class Builder {
         return *target;
     }
 
+    // the schema `false` (also through $ref links): no value satisfies it
+    bool is_never(const JsonValue& schema) {
+        const JsonValue* cur = &schema;
+        for (int guard = 0; guard < 32; ++guard) {
+            if (cur->type == Type::Bool) return !cur->b;
+            const JsonValue* ref = cur->type == Type::Object ? cur->get("$ref") : nullptr;
+            if (!ref || ref->type != Type::String || ref->s.compare(0, 2, "#/") != 0) return false;
+            cur = &resolve_ref(ref->s, "#");
+        }
+        return false;
+    }
+
     SchemaPtr build_ref(const JsonValue& value, const std::string& path) {
         if (value.type != Type::String) fail(path, "$ref must be a string");
         const std::string& ref = value.s;
@@ -117,8 +129,12 @@ class Builder {
         node->kind = kind;
         size_t i = 0;
         for (const auto& alt : alts.items) {
-            node->children.push_back(build_node(alt, path + "/" + std::to_string(i++)));
+            const std::string alt_path = path + "/" + std::to_string(i++);
+            // an alternative that is `false` never matches; for allOf it makes the whole schema unsatisfiable
+            if (kind == SchemaNode::AnyOf && is_never(alt)) continue;
+            node->children.push_back(build_node(alt, alt_path));
         }
+        if (node->children.empty()) fail(path, "every alternative is the schema false, no value is valid");
         return node;
     }
 
@@ -138,10 +154,17 @@ class Builder {
         if (const JsonValue* properties = schema.get("properties")) {
             if (properties->type != Type::Object) fail(path, "properties must be an object");
             for (const auto& kv : properties->members) {
+                const std::string prop_path = path + "/properties/" + kv.first;
+                const bool is_required = required.count(kv.first) > 0;
+                if (is_never(kv.second)) {
+                    // an optional property that no value satisfies is never written
+                    if (is_required) fail(prop_path, "required property " + kv.first + " has the schema false, no value is valid");
+                    continue;
+                }
                 SchemaProperty prop;
                 prop.name = kv.first;
-                prop.schema = build_node(kv.second, path + "/properties/" + kv.first);
-                prop.required = required.count(kv.first) > 0;
+                prop.schema = build_node(kv.second, prop_path);
+                prop.required = is_required;
                 node->properties.push_back(std::move(prop));
             }
         }
@@ -166,16 +189,28 @@ class Builder {
         node->kind = SchemaNode::Array;
         if (schema.contains("items") || schema.contains("prefixItems")) {
             // "items" wins when both are present; as in the converter, a schema instead of an array is the item schema
-            const std::string key = schema.contains("items") ? "items" : "prefixItems";
+            // "items": false after "prefixItems" only closes the tuple, which is already exact
+            const JsonValue* pre = schema.get("prefixItems");
+            const bool closed_tuple = pre && pre->type == Type::Array && schema.contains("items") && is_never(*schema.get("items"));
+            const std::string key = schema.contains("items") && !closed_tuple ? "items" : "prefixItems";
             const JsonValue& items = *schema.get(key);
             if (items.type == Type::Array) {
                 auto tuple = std::make_unique<SchemaNode>();
                 tuple->kind = SchemaNode::Tuple;
                 size_t i = 0;
                 for (const auto& item : items.items) {
+                    if (is_never(item)) fail(path + "/" + key + "/" + std::to_string(i), "tuple item has the schema false, no value is valid");
                     tuple->children.push_back(build_node(item, path + "/" + key + "/" + std::to_string(i++)));
                 }
                 return tuple;
+            }
+            if (is_never(items)) {
+                // "items": false leaves only the empty array
+                node->items = std::make_unique<SchemaNode>();
+                node->min_items = get_count(schema, "minItems", path, 0);
+                if (node->min_items > 0) fail(path, "items is the schema false but minItems asks for items");
+                node->max_items = 0;
+                return node;
             }
             node->items = build_node(items, path + "/" + key);
         } else {
@@ -222,7 +257,12 @@ class Builder {
     }
 
     SchemaPtr build_node(const JsonValue& schema, const std::string& path) {
-        if (schema.type != Type::Object) fail(path, "schema must be an object");
+        // a boolean schema: `true` is the empty schema, `false` has no valid value
+        if (schema.type == Type::Bool) {
+            if (!schema.b) fail(path, "the schema false has no valid value");
+            return simple(SchemaNode::Any);
+        }
+        if (schema.type != Type::Object) fail(path, "schema must be an object or a boolean");
         if (const JsonValue* ref = schema.get("$ref")) return build_ref(*ref, path);
         if (schema.contains("oneOf") || schema.contains("anyOf")) {
             const std::string key = schema.contains("oneOf") ? "oneOf" : "anyOf";

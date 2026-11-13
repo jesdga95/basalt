@@ -27,6 +27,10 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   pinned pages (`RAM floor X GiB of N GiB free`). N places short puts N experts of every layer in the file, with a warning naming
   the RAM to free.
 - **Slots follow routing:** an expert that keeps missing takes the slot used longest ago, on either card.
+- **Experts in the file:** with experts left in the file, the RAM tier is also a cache of it. A decode step that routes to a file
+  expert reads it whole into the place of the layer's pinned expert used longest ago, around the OS file cache, while the CPU
+  computes the experts already in RAM; the CPU then computes the ones read. A pinned expert the CPU keeps computing takes a VRAM
+  slot. `TIER final: N experts read into the RAM tier` counts the reads at exit.
 - **Context:** `--max-context` from 1,024 up to the pack's 1,048,576, default 8,192. Caches grow with position (a short chat maps
   a few MiB, a 1M context about 0.97 GiB) into the memory the tier leaves free. A value past the maximum, or whose caches need more
   than half the free memory, is refused; a quarter or more gives a warning.
@@ -51,12 +55,16 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
 
 ## Drafting
 
-On when the pack has the DSpark drafter. `--spec N` sets the window (default 3: the last accepted token plus up to 2 drafts; at most
-8). `--spec 0` turns it off. Each drafter stage keeps its 32 most routed experts (`--draft-experts`, default 32; 64, 96, 128 or 0 for
-all), ranked by `data/profiles/deepseek41-40x384-dspark.prof`. The start line:
+On when the pack has the DSpark drafter. One block pass drafts up to 5 tokens and states each one's chance of acceptance. Each
+window takes the drafts that pay: of the windows of 1 to 6 rows, the one with the most expected tokens per millisecond, from those
+chances (calibrated by how often drafts of that chance were accepted) and the round times this machine measured for each window
+size (`include/basalt/spec/draft_policy.hpp`). The block drafts at most one token more than the last window used, and at least 2.
+`--spec N` caps the window (default 6: the last accepted token plus the whole block; at most 8). `--spec 0` turns it off. Each
+drafter stage keeps its 32 most routed experts (`--draft-experts`, default 32; 64, 96, 128 or 0 for all), ranked by
+`data/profiles/deepseek41-40x384-dspark.prof`. The start line:
 
 ```
-basalt deepseek41: drafter on GPU 0: 2.41 GiB, 32 of 128 experts per stage, windows of at most 3 tokens (--spec 0: off)
+basalt deepseek41: drafter on GPU 0: 2.41 GiB, 32 of 128 experts per stage, windows of at most 6 tokens (--spec 0: off)
 ```
 
 ### What it costs
@@ -64,7 +72,7 @@ basalt deepseek41: drafter on GPU 0: 2.41 GiB, 32 of 128 experts per stage, wind
 Measured on the UD-IQ1_M pack, 400 W + 180 W, 121 GiB of RAM, `--pool-workers 8`:
 
 - The drafter takes 2.41 GiB of the main card with 32 experts per stage, 7.47 GiB with all 128 (which leaves 28 to 29 experts per
-  layer in the file). A block takes 2.0 ms.
+  layer in the file). A block takes 1.4 ms.
 - Greedy, 800 tokens, cold, tok/s (tokens per window):
 
 | | Code | Conversation | Prose |

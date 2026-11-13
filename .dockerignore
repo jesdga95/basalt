@@ -4,7 +4,6 @@ build
 dist
 .venv
 models
-site
 assets
 **/__pycache__
 **/*.pyc

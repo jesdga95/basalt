@@ -72,13 +72,30 @@ public:
     /// The copies queued from now on start after `ev` (an event of any card).
     void copies_after(cudaEvent_t ev);
     bool read_wait(std::string& err);
-    /// One token's share over the pinned activation `x`, in the layout given; the rows land in open_plain's rows.
-    bool launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t k,
-                      const int32_t* kind, std::string& err);
-    /// The share of a window of `n_tok` rows over the pinned activations `x` [n_tok][n_embd]: entry t * k + j computes
-    /// ids[t * k + j] over row t where kind says so; the rows land at that entry of open_plain's rows.
-    bool launch_window(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
-                       int64_t k, const int32_t* kind, std::string& err);
+    /// A mark behind the pieces queued so far; `read_until` waits until they landed.
+    int64_t mark_in();
+    bool read_until(int64_t mark, std::string& err);
+    /// open_plain: a share queued on the card before its plan is known, so it starts when the plan does, not a launch
+    /// later.  `arm` queues a wait for a word in mapped memory and behind it the quantize of the pinned activations `x`
+    /// [n_tok][n_embd] with the plan's copy to the card, the grouped kernels (`L`) over at most n_tok * k entries,
+    /// `grid_groups` of them side by side, and the scatter of the rows into open_plain's rows, each reading the plan's
+    /// counts on the card.  `raise` writes the plan, entry t * k + j computing ids[t * k + j] of `layer` over row t
+    /// where kind says so (kind null: nothing to do), then the word.  An armed share is raised before the card is
+    /// waited for (finish, close).
+    bool arm(const kernels::NativeExpertLayout& L, const float* x, int64_t n_tok, int64_t k, int64_t grid_groups,
+             std::string& err);
+    bool raise(int64_t layer, const int32_t* ids, const int32_t* kind, std::string& err);
+    /// open_plain: `n` scratch slots of `bytes` each, for experts the card computes for one share without holding them.
+    bool open_scratch(int n, uint64_t bytes, std::string& err);
+    /// Scratch slots still free for the armed share (all of them again once the next one is armed).
+    int scratch_free() const { return (int) scratch_.size() - scratch_used_; }
+    /// Copies `bytes` at `src` (pinned host memory) into a free scratch slot for `expert`, over this card's own link on a
+    /// stream of its own; the slot, or null when none is free.  The armed share's next `raise` plans the expert's entries
+    /// where kind is 3, and `run_fetched` queues them behind the copies.
+    const uint8_t* fetch(int64_t expert, const uint8_t* src, uint64_t bytes);
+    /// Queues the entries the last `raise` planned in scratch slots behind their copies and the share: the grouped kernels
+    /// over the share's activations, the scatter into open_plain's rows.  `finish` waits for them too.
+    bool run_fetched(std::string& err);
     /// A slot's bytes for an expert of `layer`.
     static uint64_t slot_bytes(int64_t layer);
     void close();
@@ -190,6 +207,8 @@ private:
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
     cudaStream_t stream_ = nullptr, refill_ = nullptr;
     cudaEvent_t refill_ev_ = nullptr;
+    std::vector<cudaEvent_t> marks_;                  ///< open_plain: mark_in's marks, reused in turn
+    int64_t marks_made_ = 0;
     float* h_x_ = nullptr;   float* d_x_ = nullptr;   // n_tok x n_embd
     float* h_out_ = nullptr; float* d_out_ = nullptr; // compact rows
     void* h_meta_ = nullptr; void* d_meta_ = nullptr; // groups: ptr | start | dst | tok | count
@@ -201,8 +220,34 @@ private:
     int64_t n_embd_ = 0;                              ///< activation width of the launched shares
     float* rows_map_ = nullptr;                       ///< open_plain's rows as this card addresses them
     void* meta_map_ = nullptr;                        ///< open_plain: the plan staging as this card addresses it
-    const float* x_host_ = nullptr;                   ///< open_plain: the last activations launched, and as this card
+    const float* x_host_ = nullptr;                   ///< open_plain: the last activations armed, and as this card
     const float* x_map_ = nullptr;                    ///< addresses them
+    uint32_t* go_ = nullptr;                          ///< open_plain: the word an armed share waits for (mapped)
+    uint32_t* go_map_ = nullptr;                      ///< ... as this card addresses it
+    uint32_t go_seq_ = 0;                             ///< the value the last share was armed with
+    bool armed_ = false;                              ///< a share waits for its plan
+    bool queued_ = false;                             ///< a share was armed since the stream was last seen idle
+    int64_t armed_tok_ = 0, armed_k_ = 0;
+    kernels::NativeExpertLayout armed_L_{};           ///< the armed share's kernels, which its fetched entries run too
+    uint8_t* scratch_base_ = nullptr;                 ///< open_scratch: the scratch slots, `scratch_bytes_` apart
+    uint64_t scratch_bytes_ = 0;
+    std::vector<int64_t> scratch_;                    ///< [scratch slot] the expert fetched into it, or -1
+    int scratch_used_ = 0;
+    cudaStream_t fetch_ = nullptr;                    ///< the scratch slots' copies
+    cudaEvent_t fetch_ev_ = nullptr;                  ///< behind the last of them
+    void* h_fplan_ = nullptr;                         ///< the fetched entries' plan: staging (mapped), as this card
+    void* fplan_map_ = nullptr;                       ///< addresses it, and on the card
+    void* d_fplan_ = nullptr;
+    int fetched_groups_ = 0, fetched_rows_ = 0;       ///< what the last raise planned in scratch slots, not yet queued
+    /// The entries of `kind` 3 into h_fplan_: each fetched expert's slot and the entries that use it.
+    bool plan_fetched(const int32_t* ids, int64_t n, const int32_t* kind, std::string& err);
+    /// The layouts whose kernels have run on this card: the first share of a layout runs them with an empty plan first
+    std::vector<kernels::NativeExpertLayout> loaded_;
+    /// Spins until the stream has run what was queued.
+    bool idle(std::string& err);
+    /// The plan of a share in h_meta_ (and row_of_): its groups and entries, or false when an entry is not resident.
+    bool plan(int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind, int& groups, int& rows,
+              std::string& err);
     bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
                        int64_t k, const int32_t* kind, std::string& err, float* out);
 };

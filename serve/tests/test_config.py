@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -33,6 +35,7 @@ from serve.config import (  # noqa: E402
     server_options,
     split_engine_extras,
     vision_setting,
+    video_tokens,
 )
 from serve.engine.flags import flag_value  # noqa: E402
 from serve.security import exposed_without_key  # noqa: E402
@@ -465,12 +468,25 @@ class SlotContext(unittest.TestCase):
         self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144"],
                                       {"server": {"slot-full-context": True}}), 262144)
 
-    def test_answer_room_switch(self):
-        """On by default; off by --no-answer-room or the config's "answer-room": false (a switch on by default)."""
-        self.assertTrue(parse([])[0].answer_room)
-        self.assertFalse(parse(["--no-answer-room"])[0].answer_room)
-        self.assertFalse(parse([], {"server": {"answer-room": False}})[0].answer_room)
-        self.assertTrue(parse([], {"server": {"answer-room": True}})[0].answer_room)
+    def test_answer_room_setting(self):
+        """auto by default; auto or a whole number of tokens by the command line or the config; anything else is refused."""
+        self.assertEqual(parse([])[0].answer_room, "auto")
+        self.assertEqual(parse(["--answer-room", "auto"])[0].answer_room, "auto")
+        self.assertEqual(parse(["--answer-room", "1024"])[0].answer_room, 1024)
+        self.assertEqual(parse(["--answer-room", "0"])[0].answer_room, 0)
+        self.assertEqual(parse([], {"server": {"answer-room": 4096}})[0].answer_room, 4096)
+        self.assertEqual(parse([], {"server": {"answer-room": "auto"}})[0].answer_room, "auto")
+        self.assertEqual(parse([], {"server": {}, "engine": {"answer-room": 0}})[0].answer_room, 0)
+        self.assertEqual(parse([], {"server": {"answer-room": "100"}})[0].answer_room, 100)
+        for bad in (False, True, -1, "-1", "off", "1.5", 1.5, None, [1], ""):
+            with self.subTest(config=bad), self.assertRaisesRegex(ValueError, "answer-room.*auto"):
+                parse([], {"engine": {"answer-room": bad}})
+        for bad in ("-1", "x", "1.5", "false"):
+            with self.subTest(cli=bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse(["--answer-room", bad])
+        a, _, _, cli_words = parse(["--no-answer-room"])      # no longer a server flag: it goes to the engine, which refuses it
+        self.assertEqual(a.answer_room, "auto")
+        self.assertIn("--no-answer-room", cli_words)
 
 
 class EveryOption(unittest.TestCase):
@@ -481,8 +497,12 @@ class EveryOption(unittest.TestCase):
             return [c for c in act.choices][-1]
         if act.type is int or act.type is parallel_count or act.type is budget_count:
             return 7
+        if act.dest == "answer_room":
+            return 7
         if act.type is vision_setting:                      # --vision: a GPU number is a valid sample
             return "1"
+        if act.type is video_tokens:
+            return 1024
         if act.type is float:
             return 0.25
         if act.dest in SAMPLING_KEYS:                      # the model file's checks apply
@@ -494,8 +514,8 @@ class EveryOption(unittest.TestCase):
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
         for name, act in server_options(ap).items():
-            # grammar and answer-room are on by default: their no- forms differ (test_grammar, test_answer_room_switch)
-            if name in ("api-key", "engine-bin", "grammar", "answer-room"):
+            # grammar is on by default: its no- form differs (test_grammar)
+            if name in ("api-key", "engine-bin", "grammar"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):

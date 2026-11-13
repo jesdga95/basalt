@@ -141,12 +141,16 @@ public:
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
-    /// Starts the drafts after `anchor`, the token at position `pos`. The rows of the last window before `pos` were accepted.
-    virtual Result draft_begin(int32_t anchor, int64_t pos) { (void) anchor; (void) pos; return {Status::NotImplemented, "this model has no drafter"}; }
+    /// Starts `n` drafts (at most max_window() - 1) after `anchor`, the token at position `pos`. The rows of the last window
+    /// before `pos` were accepted.
+    virtual Result draft_begin(int32_t anchor, int64_t pos, int n) { (void) anchor; (void) pos; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
     /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`.
     virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n) { (void) ids; (void) conf; (void) max_n; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
-    /// The last decoded row's logits (n_vocab floats).
-    virtual Result copy_logits(float* out) { (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
+    /// Rows row0..row0+n of the last decoded window: picks[t]'s log probability and the row's `top` likeliest tokens,
+    /// kernels::kLogprobStride floats a row to the host `out` (basalt/kernels/logprobs.hpp).
+    virtual Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) { (void) row0; (void) n; (void) picks; (void) top; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
+    /// The logits of row `row` of the last decoded window (n_vocab floats).
+    virtual Result copy_logits(int row, float* out) { (void) row; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
     /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now.
     virtual Result set_low_memory(bool low, int64_t& expert_slots) { (void) low; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
     /// What the session leaves free on the main card from now on (`mib` < 0: the start's reserve), through prompts and
@@ -200,11 +204,13 @@ public:
     virtual Result make_session(std::unique_ptr<ModelSession>& out) = 0;
 };
 
-/// The texts of the model's own tokens in the pack's vocabulary: the defaults of --eos-ids, --turn-token, --image-pad-id.
+/// The texts of the model's own tokens in the pack's vocabulary: the defaults of --eos-ids, --turn-token, --image-pad-id,
+/// and a video group's pad ("" for a model that reads no video).
 struct TokenNames {
     std::vector<std::string> eos;
     std::string turn;
     std::string image_pad;
+    std::string video_pad;
 };
 
 class FlagArgs;

@@ -266,7 +266,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     svc = Service(engine, tok, dialect.template(template),
                   model_name=cfg.get("model_name", "basalt"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
-                  grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect)
+                  grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect, video_max_tokens=a.video_max_tokens)
     svc.logs = logs
     svc.idle_unload_s = a.idle_unload or 0
     svc.idle_sleep_s = a.idle_sleep or 0
@@ -376,7 +376,7 @@ def main() -> int:
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
 
     def announcer(s: Service, m):
-        first_load = [True]
+        first_load, said_video = [True], [False]
 
         def announce():
             """After every weights load: the slot table once, then the weights line (no URL)."""
@@ -390,6 +390,13 @@ def main() -> int:
                                  + (" (slot-full-context)" if m.slot_full_context else "") + ", others queue"), flush=True)
             print(tagged("weights", f"loaded{f' {s.model}' if multi else ''}, ctx={engine.max_context} "
                                     f"images={'on' if s.vision else 'off'}"), flush=True)
+            # with image input on, whether video works too: the encoder's own word (FFmpeg found or not), once
+            video = s.vision.video_state() if s.vision is not None and hasattr(s.vision, "video_state") else None
+            if video and not said_video[0]:
+                said_video[0] = True
+                state, _, why = video.partition(" ")
+                print(tagged("video", f"{state}, {why}" if s.dialect.video_pad else "off, this model reads no video"),
+                      flush=True)
         return announce
 
     for s, m in zip(services, (x[0] for x in settings)):
