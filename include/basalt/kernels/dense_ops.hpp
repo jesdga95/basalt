@@ -65,9 +65,9 @@ void attn_qk_prepare(const float* q_full, const float* k, const float* v, const 
                      float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv,
                      float* q_out, uint16_t* k_cache, uint16_t* v_cache, int64_t cell0, void* stream, int hd = 256,
                      bool gated = true, int64_t cap = 0, const int32_t* cell0_dev = nullptr, KvInt8 q8 = {});
-/// The prompt chunk's form: BF16 q_full (gated, hd 256), k and v; FP32 q_out; the cache at cells cell0 + t.
+/// The prompt chunk's form: BF16 q_full (gated, hd 256), k and v; BF16 q_out; the cache at cells cell0 + t.
 void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint16_t* v, const float* q_norm, const float* k_norm,
-                          float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv, float* q_out,
+                          float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv, uint16_t* q_out,
                           int64_t cell0, void* stream, KvInt8 q8, uint16_t* k_cache, uint16_t* v_cache);
 /// out[t][h][d] = attn[t][h][d] * sigmoid(q_full[t][h][hd + d])  (hd = 256).
 void attn_gate(const float* attn, const float* q_full, float* out, int64_t T, int n_head, void* stream);
@@ -75,6 +75,8 @@ void attn_gate(const float* attn, const float* q_full, float* out, int64_t T, in
 /// (prefill::fp8::quantize of attn_gate's output, bitwise).
 void attn_gate_e4m3(const float* attn, const float* q_full, int64_t T, int n_head, uint8_t* codes, float* scales, void* stream);
 void attn_gate_e4m3(const float* attn, const uint16_t* q_full, int64_t T, int n_head, uint8_t* codes, float* scales, void* stream);
+void attn_gate_e4m3(const uint16_t* attn, const uint16_t* q_full, int64_t T, int n_head, uint8_t* codes, float* scales,
+                    void* stream);
 
 /// A block drafter's two-tap grouped dynamic convolution along a block's rows (DFlash 2):
 /// out[t][c] = sum over o in {0, 1} of (base[o][c] + dyn[t][o * groups + c / group]) * x[t - o][c], x[-1] = 0.

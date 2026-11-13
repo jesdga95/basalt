@@ -220,24 +220,41 @@ int main() {
             c->ks = dev_n<uint16_t>((size_t) cells * NKV * HD / 64);
             c->vs = dev_n<uint16_t>((size_t) cells * NKV * HD / 64);
         }
-        float *q1 = dev_n<float>((size_t) T * NH * HD), *q2 = dev_n<float>((size_t) T * NH * HD);
+        float* q1 = dev_n<float>((size_t) T * NH * HD);
+        uint16_t* q2 = dev_n<uint16_t>((size_t) T * NH * HD);
         k::attn_qk_prepare(dev(qf), dev(kf), dev(vf), dqn, dkn, 1e-6f, rope, dpos, T, NH, NKV, q1, nullptr, nullptr, 100, nullptr,
                            256, true, 0, nullptr, c1);
         k::attn_qk_prepare_bf16(dev(qb), dev(kb), dev(vb), dqn, dkn, 1e-6f, rope, dpos, T, NH, NKV, q2, 100, nullptr, c2, nullptr,
                                 nullptr);
         const size_t cb = (size_t) cells * NKV * HD;
-        ok &= report("attn_qk_prepare_bf16 (q, int8 K/V and scales)",
-                     host(q1, (size_t) T * NH * HD * 4) == host(q2, (size_t) T * NH * HD * 4) && host(c1.k, cb) == host(c2.k, cb) &&
+        ok &= report("attn_qk_prepare_bf16 (q rounded once, int8 K/V and scales)",
+                     round_rows(host(q1, (size_t) T * NH * HD * 4)) == host(q2, (size_t) T * NH * HD * 2) && host(c1.k, cb) == host(c2.k, cb) &&
                          host(c1.v, cb) == host(c2.v, cb) && host(c1.ks, cb / 32) == host(c2.ks, cb / 32) &&
                          host(c1.vs, cb / 32) == host(c2.vs, cb / 32));
-        std::vector<float> at((size_t) T * NH * HD);
-        std::normal_distribution<float> nd(0.0f, 1.0f);
-        for (auto& v : at) v = nd(rng);
+        // the prompt attention over the cache just written, from the BF16 queries widened and as BF16
+        {
+            const auto qh = host(q2, (size_t) T * NH * HD * 2);
+            std::vector<float> qw((size_t) T * NH * HD);
+            for (size_t i = 0; i < qw.size(); ++i) { uint16_t b; std::memcpy(&b, &qh[2 * i], 2); qw[i] = from_bf(b); }
+            const size_t sf = k::gqa_prompt_split_floats(T, NH, 3);
+            float* scr = dev_n<float>(sf);
+            float* o1 = dev_n<float>((size_t) T * NH * HD);
+            uint16_t* o2 = dev_n<uint16_t>((size_t) T * NH * HD);
+            k::gqa_prompt_attn(dev(qw), nullptr, nullptr, NH, NKV, 100, T, o1, nullptr, c2, scr, sf);
+            k::gqa_prompt_attn_bf16(q2, NH, NKV, 100, T, o2, nullptr, c2, scr, sf);
+            ok &= report("gqa_prompt_attn_bf16", round_rows(host(o1, (size_t) T * NH * HD * 4)) == host(o2, (size_t) T * NH * HD * 2));
+        }
+        std::vector<uint16_t> ab;
+        std::vector<float> at;
+        pair((size_t) T * NH * HD, 1.0f, ab, at);
         float* dat = dev(at);
         void *e1 = dev_n<uint8_t>(fp8::act_bytes(T, NH * HD)), *e2 = dev_n<uint8_t>(fp8::act_bytes(T, NH * HD));
+        void* e3 = dev_n<uint8_t>(fp8::act_bytes(T, NH * HD));
         k::attn_gate_e4m3(dat, dev(qf), T, NH, (uint8_t*) e1, fp8::act_scales(e1, T, NH * HD), nullptr);
         k::attn_gate_e4m3(dat, dev(qb), T, NH, (uint8_t*) e2, fp8::act_scales(e2, T, NH * HD), nullptr);
-        ok &= report("attn_gate_e4m3 of BF16 q_full", host(e1, fp8::act_bytes(T, NH * HD)) == host(e2, fp8::act_bytes(T, NH * HD)));
+        k::attn_gate_e4m3(dev(ab), dev(qb), T, NH, (uint8_t*) e3, fp8::act_scales(e3, T, NH * HD), nullptr);
+        ok &= report("attn_gate_e4m3 of BF16 q_full and BF16 rows", host(e1, fp8::act_bytes(T, NH * HD)) == host(e2, fp8::act_bytes(T, NH * HD)) &&
+                                                                     host(e1, fp8::act_bytes(T, NH * HD)) == host(e3, fp8::act_bytes(T, NH * HD)));
     }
     std::printf("%s\n", ok ? "bf16 chunk entry points ok" : "FAIL");
     return ok ? 0 : 1;
