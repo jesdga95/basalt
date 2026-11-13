@@ -2,7 +2,8 @@
 // attn_qk_prepare (dense_ops.hpp) against a CPU reference in double precision, at the Qwen3.5-27B attention geometry
 // (24 query heads, 4 KV heads, 256 wide, 64 rotated dims, interleaved M-RoPE sections 11/11/10).
 //
-// Checks: each kernel's max absolute and relative error to the reference; a decode row's output is bitwise the same
+// Checks: each kernel's max absolute and relative error to the reference (the int8 prompt kernel's narrow, split and
+// 8-warp launches); a decode row's output is bitwise the same
 // whatever the window width or the row's place in it; the prompt kernel's rows agree with decode's within fp16 rounding.
 // Exit 77 without a GPU.  Prints one line per check and a microbench line for the decode and prompt kernels.
 #include "basalt/kernels/dense_ops.hpp"
@@ -218,32 +219,67 @@ int main(int argc, char** argv) {
         cudaMemcpy(q8.v, v8.data(), v8.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(q8.ks, ks.data(), ks.size() * 2, cudaMemcpyHostToDevice);
         cudaMemcpy(q8.vs, vs.data(), vs.size() * 2, cudaMemcpyHostToDevice);
+        // the prompt kernel rounds the queries to int8 per 64 dims (amax / 127) for its int8 QK: references on the
+        // queries as given and on those
+        auto ref8 = [&](const float* qrow, int64_t visible, double* w, double* wq) {
+            ref_attn(qrow, kd, vd, visible, w);
+            std::vector<float> qq(qrow, qrow + (size_t) NH * HD);
+            for (size_t g0 = 0; g0 < qq.size(); g0 += 64) {
+                float amax = 0;
+                for (int i = 0; i < 64; ++i) amax = std::max(amax, std::fabs(qq[g0 + i]));
+                for (int i = 0; i < 64; ++i)
+                    qq[g0 + i] = amax > 0 ? (float) std::nearbyint(qq[g0 + i] * (127.0f / amax)) * (amax / 127.0f) : 0.0f;
+            }
+            ref_attn(qq.data(), kd, vd, visible, wq);
+        };
         std::vector<double> w8((size_t) NH * HD), w8q((size_t) NH * HD);
-        ref_attn(&q[(size_t) (TP - 1) * NH * HD], kd, vd, p0 + TP, w8.data());
-        // the prompt kernel rounds the queries to int8 per 64 dims (amax / 127) for its int8 QK: the same reference on those
-        std::vector<float> qq(&q[(size_t) (TP - 1) * NH * HD], &q[(size_t) TP * NH * HD]);
-        for (size_t g0 = 0; g0 < qq.size(); g0 += 64) {
-            float amax = 0;
-            for (int i = 0; i < 64; ++i) amax = std::max(amax, std::fabs(qq[g0 + i]));
-            for (int i = 0; i < 64; ++i)
-                qq[g0 + i] = amax > 0 ? (float) std::nearbyint(qq[g0 + i] * (127.0f / amax)) * (amax / 127.0f) : 0.0f;
-        }
-        ref_attn(qq.data(), kd, vd, p0 + TP, w8q.data());
+        ref8(&q[(size_t) (TP - 1) * NH * HD], p0 + TP, w8.data(), w8q.data());
         basalt::kernels::gqa_decode_attn(d_q + (size_t) (TP - 1) * NH * HD, nullptr, nullptr, NH, NKV, p0 + TP - 1, 1, d_scr,
                                          max_cells, d_out, nullptr, nullptr, q8);
         std::vector<float> g8((size_t) NH * HD);
         ck(cudaMemcpy(g8.data(), d_out, g8.size() * 4, cudaMemcpyDeviceToHost), "copy");
         Err e8;
         for (int j = 0; j < NH * HD; ++j) e8.add(g8[(size_t) j], w8[(size_t) j]);
-        basalt::kernels::gqa_prompt_attn(d_q, nullptr, nullptr, NH, NKV, p0, TP, d_out, nullptr, q8);
-        ck(cudaMemcpy(pr.data(), d_out, pr.size() * 4, cudaMemcpyDeviceToHost), "copy");
-        Err p8, p8q;
-        for (int j = 0; j < NH * HD; ++j) p8.add(pr[(size_t) (TP - 1) * NH * HD + j], w8[(size_t) j]);
-        for (int j = 0; j < NH * HD; ++j) p8q.add(pr[(size_t) (TP - 1) * NH * HD + j], w8q[(size_t) j]);
-        std::printf("int8 cache: decode max abs %.3g rel %.3g, prompt max abs %.3g (%.3g against int8-rounded queries), vs "
-                    "double on the dequantized cells\n", e8.abs, e8.rel, p8.abs, p8q.abs);
-        // decode reads code x scale in fp32, the reference its fp16 rounding; the prompt's QK reads int8 queries
-        if (e8.abs > 1e-3 || p8q.abs > 5e-3 || p8.abs > 3e-2) ++fails;
+        std::printf("int8 cache: decode max abs %.3g rel %.3g vs double on the dequantized cells\n", e8.abs, e8.rel);
+        // decode reads code x scale in fp32, the reference its fp16 rounding
+        if (e8.abs > 1e-3) ++fails;
+
+        // prompt chunks at the end of the L cells: 300 rows (narrow: 4-warp blocks), the same with split scratch (the
+        // cells split over more blocks and merged), and 2048 rows (8-warp blocks), each at rows on and around the block
+        // and key-tile edges
+        const int TB = 2048;
+        std::vector<float> qb((size_t) TB * NH * HD);
+        for (auto& x : qb) x = 2.0f * nd(rng);
+        float *d_qb = dev<float>(qb.size()), *d_ob = dev<float>(qb.size());
+        ck(cudaMemcpy(d_qb, qb.data(), qb.size() * 4, cudaMemcpyHostToDevice), "copy");
+        const size_t split_floats = basalt::kernels::gqa_prompt_split_floats(TP, NH, 8);
+        float* d_split = dev<float>(split_floats);
+        for (int cfg = 0; cfg < 3; ++cfg) {
+            const int T = cfg < 2 ? TP : TB;
+            const int64_t pp = L - T;
+            const float* qh = cfg < 2 ? q.data() : qb.data();
+            basalt::kernels::gqa_prompt_attn(cfg < 2 ? d_q : d_qb, nullptr, nullptr, NH, NKV, pp, T, d_ob, nullptr, q8,
+                                             cfg == 1 ? d_split : nullptr, cfg == 1 ? split_floats : 0);
+            std::vector<float> po((size_t) T * NH * HD);
+            ck(cudaMemcpy(po.data(), d_ob, po.size() * 4, cudaMemcpyDeviceToHost), "copy");
+            Err p8, p8q;
+            for (const int r : {0, 1, 57, 63, 64, 65, 127, 128, 255, T - 2, T - 1, 1000, 2047}) {
+                if (r >= T) continue;
+                ref8(&qh[(size_t) r * NH * HD], pp + r + 1, w8.data(), w8q.data());
+                for (int j = 0; j < NH * HD; ++j) {
+                    p8.add(po[(size_t) r * NH * HD + j], w8[(size_t) j]);
+                    p8q.add(po[(size_t) r * NH * HD + j], w8q[(size_t) j]);
+                }
+            }
+            static const char* what[3] = {"300 rows", "300 rows split", "2048 rows"};
+            std::printf("int8 cache: prompt %s max abs %.3g (%.3g against int8-rounded queries) vs double on the dequantized "
+                        "cells\n", what[cfg], p8.abs, p8q.abs);
+            // the prompt's QK reads int8 queries, its P V fp16 probabilities summed in fp16 per 64-cell tile
+            if (p8q.abs > 5e-3 || p8.abs > 3e-2) ++fails;
+        }
+        cudaFree(d_qb);
+        cudaFree(d_ob);
+        cudaFree(d_split);
     }
 
     // ---- microbench: one decode row at 3000 cells, and the 300-row chunk
@@ -290,17 +326,22 @@ int main(int argc, char** argv) {
             cudaMemset(b8.vs, 0x20, (size_t) cells * NKV * HD / 64 * 2);
             double fl = 0;
             for (int64_t t = 0; t < T2; ++t) fl += 4.0 * NH * HD * (double) (pp + t + 1);
-            for (int i8 = 0; i8 < 2; ++i8) {
-                basalt::kernels::gqa_prompt_attn(bq, bk, bv, NH, NKV, pp, T2, bo, nullptr, i8 ? b8 : basalt::kernels::KvInt8{});
+            // fp16, int8, int8 with scratch for three key splits
+            const size_t sf = basalt::kernels::gqa_prompt_split_floats(T2, NH, 3);
+            float* bs = dev<float>(sf);
+            for (int run = 0; run < 3; ++run) {
+                const basalt::kernels::KvInt8 kv = run ? b8 : basalt::kernels::KvInt8{};
+                float* scr = run == 2 ? bs : nullptr;
+                basalt::kernels::gqa_prompt_attn(bq, bk, bv, NH, NKV, pp, T2, bo, nullptr, kv, scr, sf);
                 cudaEventRecord(a);
-                for (int i = 0; i < 5; ++i)
-                    basalt::kernels::gqa_prompt_attn(bq, bk, bv, NH, NKV, pp, T2, bo, nullptr, i8 ? b8 : basalt::kernels::KvInt8{});
+                for (int i = 0; i < 5; ++i) basalt::kernels::gqa_prompt_attn(bq, bk, bv, NH, NKV, pp, T2, bo, nullptr, kv, scr, sf);
                 cudaEventRecord(b);
                 cudaEventSynchronize(b);
                 cudaEventElapsedTime(&ms, a, b);
                 std::printf("bench: prompt chunk 2048 rows at %lld cells, %s cache: %.2f ms (%.1f TFLOP/s)\n", (long long) cells,
-                            i8 ? "int8" : "fp16", ms / 5, fl / (ms / 5) / 1e9);
+                            run == 0 ? "fp16" : run == 1 ? "int8" : "int8 split scratch", ms / 5, fl / (ms / 5) / 1e9);
             }
+            cudaFree(bs);
             cudaFree(bk); cudaFree(bv); cudaFree(bq); cudaFree(bo); cudaFree(b8.k); cudaFree(b8.v); cudaFree(b8.ks); cudaFree(b8.vs);
         }
     }
