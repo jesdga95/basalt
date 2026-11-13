@@ -27,6 +27,10 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   pinned pages (`RAM floor X GiB of N GiB free`). N places short puts N experts of every layer in the file, with a warning naming
   the RAM to free.
 - **Slots follow routing:** an expert that keeps missing takes the slot used longest ago, on either card.
+- **Experts in the file:** with experts left in the file, the RAM tier is also a cache of it. A decode step that routes to a file
+  expert reads it whole into the place of the layer's pinned expert used longest ago, around the OS file cache, while the CPU
+  computes the experts already in RAM; the CPU then computes the ones read. A pinned expert the CPU keeps computing takes a VRAM
+  slot. `TIER final: N experts read into the RAM tier` counts the reads at exit.
 - **Context:** `--max-context` from 1,024 up to the pack's 1,048,576, default 8,192. Caches grow with position (a short chat maps
   a few MiB, a 1M context about 0.97 GiB) into the memory the tier leaves free. A value past the maximum, or whose caches need more
   than half the free memory, is refused; a quarter or more gives a warning.
