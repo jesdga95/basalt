@@ -193,7 +193,7 @@ target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deeps
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it
 add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp)
 target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
-target_link_libraries(dense PUBLIC model kernels mmq prefill_fp4 core warnings ${_gpu_runtime_target})
+target_link_libraries(dense PUBLIC model kernels mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
 add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
 target_include_directories(model_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
 target_link_libraries(model_qwen35 PUBLIC model tokenizer dense core ${_gpu_runtime_target})
@@ -345,6 +345,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/gdn_prompt.cu
                         src/kernels/cuda/dense_ops.cu
                         src/kernels/cuda/gqa_attn.cu
+                        src/kernels/cuda/fp8_window.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
@@ -682,6 +683,10 @@ add_executable(dense_ops_parity tests/kernels/dense_ops_parity.cpp)
 target_link_libraries(dense_ops_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dense_ops_parity COMMAND dense_ops_parity)
 set_tests_properties(dense_ops_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+add_executable(fp8_window_parity tests/kernels/fp8_window_parity.cpp)
+target_link_libraries(fp8_window_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME fp8_window_parity COMMAND fp8_window_parity)
+set_tests_properties(fp8_window_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 add_executable(gqa_attn_parity tests/kernels/gqa_attn_parity.cpp)
 target_link_libraries(gqa_attn_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gqa_attn_parity COMMAND gqa_attn_parity)
@@ -1427,6 +1432,17 @@ target_include_directories(model_qwen4exp_moe_fused PUBLIC ${CMAKE_CURRENT_SOURC
 target_compile_options(model_qwen4exp_moe_fused PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
 target_link_libraries(model_qwen4exp_moe_fused PUBLIC mmq ${_gpu_runtime_target})
 target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_moe_fused)
+# a prompt chunk's products against FP8 E4M3 weights on the FP8 tensor cores (W8A8)
+add_library(prefill_fp8 STATIC src/prefill/fp8_gemm.cu)
+target_include_directories(prefill_fp8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(prefill_fp8 PUBLIC core ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  # the quantizer and product against CPU references, rows bitwise at any chunk length; --bench for TFLOP/s
+  add_executable(fp8_gemm_test tests/kernels/fp8_gemm_test.cpp)
+  target_link_libraries(fp8_gemm_test PRIVATE prefill_fp8 ${_gpu_runtime_target})
+  basalt_gpu_test(NAME fp8_gemm_test COMMAND fp8_gemm_test)
+  set_tests_properties(fp8_gemm_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()
 add_library(prefill_fp4 STATIC src/prefill/moe_fp4.cu)
 set_target_properties(prefill_fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
 target_include_directories(prefill_fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
