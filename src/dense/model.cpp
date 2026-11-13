@@ -427,7 +427,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     const size_t W = kBatch, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim, KV = (size_t) g.n_kv * g.head_dim;
     WindowScratch& b = m->ws;
     Arena& a = m->dec_arena;
-    b.x = a.take<float>(W * H);
+    b.x = a.take<uint16_t>(W * H);
     b.xn = a.take<float>(W * H);
     b.tmp = a.take<float>(W * H);
     b.dacc = a.take<float>(W * H);
