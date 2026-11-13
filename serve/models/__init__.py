@@ -66,7 +66,7 @@ def dialect_for(arch: str | None) -> Dialect:
     if arch == "deepseek41":
         from serve.models.deepseek41 import DeepSeek41
         return DeepSeek41()
-    if arch in ("qwen4exp", None):
-        from serve.models.qwen4exp import Qwen4Exp
-        return Qwen4Exp()
+    if arch in ("qwen4exp", "qwen35", None):
+        from serve.models.qwen import Qwen
+        return Qwen()
     raise ValueError(f"no dialect for architecture {arch!r}")
