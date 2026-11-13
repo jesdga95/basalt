@@ -33,9 +33,11 @@ Reference: [quality](quality.md#the-bf16-reference). 100 chunks, 25,500 rows, on
 | Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
 |---|---:|---:|---:|---:|---:|
 | NVFP4 (NVIDIA's checkpoint) | 6.7887 | 0.0213 | 0.0117 | 0.177 | 92.86% |
+| The same, prompt MLP W4A4 on every chunk (`--diag-fp4-rows 1`) | 6.7903 | 0.0238 | 0.0128 | 0.204 | 92.45% |
 
-The base scores 6.7411 on the same rows. The gate's 256-row prompt halves run the MMQ path; the FP4 prompt path (from 1,024
-rows) is checked against serial decoding below.
+The base scores 6.7411 on the same rows. Each chunk's first half is read as one 257-row prompt (the MMQ path) and the scored
+rows are then decoded against it. The second row forces the FP4 prompt path (W4A4, normally from 1,024 rows) onto that read,
+so every scored row sees a cache and recurrent state written by it: KLD +0.0025, top-1 -0.4 points. Decode never uses it.
 
 ## Agreement with Hugging Face
 
