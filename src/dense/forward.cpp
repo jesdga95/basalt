@@ -445,11 +445,11 @@ void mtp_input(Model& m, const float* emb, const float* hid, float* cat, int n, 
 
 }  // namespace
 
-void commit_window(Model& m, SessionState& st, int n) {
+void commit_window(Model& m, SessionState& st, int n, cudaStream_t s) {
     const Geometry& g = m.g;
     const int C = g.conv_channels();
     if (g.gdn_layers() == 0 || n <= 0) return;
-    cudaMemcpyAsync(st.n_keep, &n, sizeof(int32_t), cudaMemcpyHostToDevice, st.stream);
+    cudaMemcpyAsync(st.n_keep, &n, sizeof(int32_t), cudaMemcpyHostToDevice, s);
     kernels::GdnCommitLayers a;
     a.state = st.gdn;
     a.h = st.rec_h;
@@ -464,7 +464,7 @@ void commit_window(Model& m, SessionState& st, int n) {
     a.h_v = g.gdn_v_heads;
     a.n_layers = g.gdn_layers();
     a.n_keep = st.n_keep;
-    kernels::gdn_commit_layers(a, st.stream, 64, n);
+    kernels::gdn_commit_layers(a, s, 64, n);
 }
 
 namespace {
