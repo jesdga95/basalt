@@ -148,7 +148,6 @@ public:
         o.drafter = w.dflash.present ? dense::Drafter::Block : w.mtp.present ? dense::Drafter::Mtp : dense::Drafter::None;
         o.vision = req.vision;
         o.kv_int8 = req.kv == "int8";
-        if (fp4_rows_ > 0) o.fp4_rows = fp4_rows_;
         o.arch = "qwen35";
         if (o.vision) {
             core::ModelFile file;
@@ -176,7 +175,6 @@ public:
     }
 
     std::string drafter_choice_;   // --diag-drafter: mtp or block (empty: the pack's block drafter when it has one)
-    int fp4_rows_ = 0;             // --diag-fp4-rows: the W4A4 prompt MLP from this many rows (0: the stack's 1,024)
 
 private:
     // the pack's DFlash 2 block drafter (dflash.* tensors, qwen35.dflash.* metadata)
@@ -373,7 +371,6 @@ public:
         if (req.paths.empty()) return {model::Status::Error, "qwen35: no model path"};
         auto m = std::make_unique<Loaded>();
         m->drafter_choice_ = drafter_choice();
-        m->fp4_rows_ = fp4_rows();
         std::string err;
         if (!m->load(req, err)) return {model::Status::Error, err};
         out = std::move(m);
@@ -390,7 +387,6 @@ public:
         (void) code;
         if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--diag-drafter") { drafter_choice() = args.next("--diag-drafter"); }
-        else if (a == "--diag-fp4-rows") fp4_rows() = std::max(1, std::atoi(args.next("--diag-fp4-rows")));
         else if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
@@ -426,11 +422,6 @@ private:
     static std::string& drafter_choice() {
         static std::string c;
         return c;
-    }
-    // diagnostic: --diag-fp4-rows N runs the W4A4 prompt MLP from N rows, so the 256-row quality gate reaches it
-    static int& fp4_rows() {
-        static int n = 0;
-        return n;
     }
     static constexpr int kDefaultSpec = 8;
     static bool has_drafter(const std::string& path) {

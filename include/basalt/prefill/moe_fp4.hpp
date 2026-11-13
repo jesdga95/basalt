@@ -61,11 +61,6 @@ struct Product {
     const int32_t* ids = nullptr;
     int64_t tokens = 0;
     size_t tail_off = 0;
-    /// A dense layer's SwiGLU product (with swiglu, no ids): blob[0] the gate matrix, `up` the up matrix of the same
-    /// shape; w_rows counts both (2 x the outputs); `tail` the device {s_gate, s_up, s_down, -} in place of the blob's.
-    /// Rows come from tiled planes as in the plain product; long chunks only (at least 1,024 rows).
-    const uint8_t* up = nullptr;
-    const float* tail = nullptr;
 };
 void run(const Product& p, void* stream);
 /// The 16-byte scale tail at `tail_off` of each of p's n blobs to dst[4 j .. 4 j + 3] (the tail swiglu reads).
