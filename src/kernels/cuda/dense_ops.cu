@@ -1,6 +1,7 @@
 // src/kernels/cuda/dense_ops.cu - see include/basalt/kernels/dense_ops.hpp.
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
+#include "basalt/kernels/pdl.hpp"
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -219,13 +220,15 @@ __global__ void __cluster_dims__(1, 1, GP_S) __launch_bounds__(128)
 
 // Block (row t, head j): j < n_head a query head, else a key/value head; one thread per head dim.
 template <int HDW>
-__global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const float* __restrict__ q_full, const float* __restrict__ k,
-                                                            const float* __restrict__ v, const float* __restrict__ q_norm,
+// (launched through launch_pdl: the earlier kernels' outputs are read after pdl_wait, so they are not __restrict__)
+__global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const float* q_full, const float* k, const float* v,
+                                                            const float* __restrict__ q_norm,
                                                             const float* __restrict__ k_norm, float eps, RopeSpec rope,
-                                                            const int32_t* __restrict__ pos, int n_head, int n_kv,
-                                                            float* __restrict__ q_out, __half* __restrict__ k_cache,
-                                                            __half* __restrict__ v_cache, int64_t cell0, int q_stride,
-                                                            int64_t cap, const int32_t* __restrict__ cell0_dev, KvInt8 q8) {
+                                                            const int32_t* pos, int n_head, int n_kv, float* q_out,
+                                                            __half* k_cache, __half* v_cache, int64_t cell0, int q_stride,
+                                                            int64_t cap, const int32_t* cell0_dev, KvInt8 q8) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ float red[HDW / 32];
     __shared__ float xs[HDW], ks8[HDW], vs8[HDW];
     const int64_t t = blockIdx.x;
@@ -427,11 +430,11 @@ void attn_qk_prepare(const float* q_full, const float* k, const float* v, const 
     RopeSpec r = rope;
     for (int i = 0; i < rope.rot / 2; ++i) r.inv_freq[i] = (float) std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
     if (hd == 256)
-        attn_qk_prepare_kernel<256><<<grid, 256, 0, (cudaStream_t) stream>>>(q_full, k, v, q_norm, k_norm, eps, r, pos, n_head,
-            n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8);
+        launch_pdl(attn_qk_prepare_kernel<256>, grid, dim3(256), 0, (cudaStream_t) stream, q_full, k, v, q_norm, k_norm, eps, r,
+                   pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8);
     else
-        attn_qk_prepare_kernel<128><<<grid, 128, 0, (cudaStream_t) stream>>>(q_full, k, v, q_norm, k_norm, eps, r, pos, n_head,
-            n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8);
+        launch_pdl(attn_qk_prepare_kernel<128>, grid, dim3(128), 0, (cudaStream_t) stream, q_full, k, v, q_norm, k_norm, eps, r,
+                   pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8);
     check("attn_qk_prepare");
 }
 
