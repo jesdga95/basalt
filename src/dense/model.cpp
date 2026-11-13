@@ -64,46 +64,73 @@ namespace {
 // the block drafter's rows in the window scratch
 size_t block_scratch_floats(const Geometry& g, const BlockDrafter& bd) {
     if (!bd.present) return 0;
-    const size_t W = kWindow, AQ = (size_t) bd.n_head * bd.head_dim, KV = (size_t) bd.n_kv * bd.head_dim;
+    const size_t W = kBatch, AQ = (size_t) bd.n_head * bd.head_dim, KV = (size_t) bd.n_kv * bd.head_dim;
     return W * (3 * AQ + 2 * KV + bd.layers[0].conv_a.rows + g.n_embd + kernels::kLogprobStride + bd.rank + 3) +
            kernels::gqa_decode_scratch_floats(bd.window + 256, kWindow, bd.n_head, bd.head_dim) + 64 * 64;
 }
 
-// a window's activation buffer: MMQ's q8_1 rows or the F8 products' fp16 rows, for the widest input
-size_t act_slot(const Geometry& g) {
+int64_t widest_input(const Geometry& g) {
     const size_t AQ = (size_t) g.n_head * g.head_dim;
-    const int64_t widest = (int64_t) std::max<size_t>({(size_t) g.n_embd, (size_t) g.n_ff, (size_t) g.value_width(), AQ,
-                                                       2 * (size_t) g.n_embd});
-    return (std::max(prefill::mmq::q8_bytes(kWindow, widest), kernels::fp8w::act_bytes(widest)) + 255) / 256 * 256;
+    return (int64_t) std::max<size_t>({(size_t) g.n_embd, (size_t) g.n_ff, (size_t) g.value_width(), AQ, 2 * (size_t) g.n_embd});
 }
+// a window's activation buffers for the widest input: the window gemm's fp16 rows, MMQ's q8_1 rows
+size_t act_slot(const Geometry& g) { return (kernels::wgemm::act_bytes(widest_input(g)) + 255) / 256 * 256; }
+size_t q8_slot(const Geometry& g) { return (prefill::mmq::q8_bytes(kBatch, widest_input(g)) + 255) / 256 * 256; }
 
-// the F8 products' split-K workspace for every projection shape the geometry has
-void fp8w_need(const Geometry& g, size_t& partial, size_t& tickets) {
+// The window gemm's split-K workspace for every call a window makes (forward.cpp): the groups and each matrix alone, in
+// either format (a superset is harmless).
+void wgemm_need(const Geometry& g, size_t& partial, size_t& tickets) {
+    namespace wg = kernels::wgemm;
     const int64_t H = g.n_embd, AQ = (int64_t) g.n_head * g.head_dim, KV = (int64_t) g.n_kv * g.head_dim;
-    const int64_t shapes[][2] = {{2 * AQ, H}, {KV, H}, {H, AQ}, {g.conv_channels(), H}, {g.value_width(), H},
-                                 {H, g.value_width()}};
-    partial = tickets = 0;
-    for (const auto& sh : shapes) {
-        if (sh[0] <= 0 || sh[1] <= 0 || sh[1] % 256 != 0) continue;
-        size_t p, t;
-        kernels::fp8w::workspace_need(sh[0], sh[1], p, t);
-        partial = std::max(partial, p);
-        tickets = std::max(tickets, t);
+    const int64_t C = g.conv_channels(), VD = g.value_width(), F = g.n_ff;
+    struct Shape {
+        int64_t rows[3];
+        int n;
+        int64_t K;
+        wg::Epilogue epi;
+    };
+    std::vector<Shape> shapes = {{{2 * AQ, KV, KV}, 3, H, wg::Epilogue::Store}, {{2 * AQ}, 1, H, wg::Epilogue::Store},
+                                 {{KV}, 1, H, wg::Epilogue::Store},          {{H}, 1, AQ, wg::Epilogue::Add},
+                                 {{F, F}, 2, H, wg::Epilogue::SwiGLU},       {{F}, 1, H, wg::Epilogue::Store},
+                                 {{H}, 1, F, wg::Epilogue::Add},             {{g.n_vocab}, 1, H, wg::Epilogue::Store}};
+    if (g.gdn_layers() > 0) {
+        shapes.push_back({{C, VD}, 2, H, wg::Epilogue::Store});
+        shapes.push_back({{C}, 1, H, wg::Epilogue::Store});
+        shapes.push_back({{VD}, 1, H, wg::Epilogue::Store});
+        shapes.push_back({{H}, 1, VD, wg::Epilogue::Add});
     }
+    partial = tickets = 0;
+    for (const Shape& sh : shapes)
+        for (const wg::Format f : {wg::Format::F8, wg::Format::Nvfp4}) {
+            if (sh.K <= 0 || sh.K % 256 != 0) continue;
+            wg::Call c;
+            c.fmt = f;
+            c.K = sh.K;
+            c.n = sh.n;
+            c.epi = sh.epi;
+            bool ok = true;
+            for (int i = 0; i < sh.n; ++i) {
+                c.m[i].rows = sh.rows[i];
+                ok = ok && sh.rows[i] > 0 && (f == wg::Format::F8 || sh.rows[i] % 128 == 0);
+            }
+            if (!ok || (f == wg::Format::F8 && sh.epi == wg::Epilogue::SwiGLU)) continue;
+            size_t p, t;
+            wg::workspace_need(c, p, t);
+            partial = std::max(partial, p);
+            tickets = std::max(tickets, t);
+        }
 }
 
 size_t window_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_context) {
-    const size_t W = kWindow, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim;
-    const size_t widest = std::max<size_t>({H, (size_t) g.n_ff, (size_t) g.value_width(), AQ});
-    size_t f = 3 * W * H + W * g.value_width() + W * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) + 3 * W * g.n_ff;
+    const size_t W = kBatch, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim;
+    size_t f = 4 * W * H + W * g.value_width() + W * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) + 3 * W * g.n_ff;
     if (g.attn_layers() > 0) f += kernels::gqa_decode_scratch_floats(max_context, kWindow, g.n_head);
     f += W * (2 * (size_t) g.conv_channels() + 2 * (size_t) g.gdn_v_heads) + (sizeof(BatchTable) + 3) / 4;
     f += W * 2 * H + kernels::row_logprobs_scratch_floats(kWindow, g.n_vocab) + W * g.value_width() + W * (size_t) g.n_vocab;
     f += block_scratch_floats(g, bd);
-    (void) widest;
     size_t wp, wt;
-    fp8w_need(g, wp, wt);
-    return f * 4 + 2 * act_slot(g) + (wp + wt + 1) * 4 + W * 4 * 6 + 76 * 256;
+    wgemm_need(g, wp, wt);
+    return f * 4 + act_slot(g) + q8_slot(g) + (wp + wt + 1) * 4 + W * 4 * 6 + 76 * 256;
 }
 
 size_t chunk_bytes(const Geometry& g) {
@@ -190,7 +217,7 @@ bool Model::ready_products(std::string& err) {
         for (const Linear* l : {&Lp->qkv, &Lp->z, &Lp->out, &Lp->q, &Lp->k, &Lp->v, &Lp->o, &Lp->gate, &Lp->up, &Lp->down})
             if (l->w) ls.push_back(l);
     for (const Linear* l : ls) {
-        if (l->type == kTypeF8) continue;   // the F8 products are not MMQ's
+        if (l->type == kTypeF8 || l->type == kTypeNvfp4P) continue;   // the window gemm's, not MMQ's
         if (!prefill::mmq::fits(l->type, l->rows)) {
             err = o.arch + ": the products have no tile for a " + std::to_string(l->rows) + "-row matrix";
             return false;
@@ -314,15 +341,16 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         err = o.arch + ": out of device memory for the decode scratch";
         return nullptr;
     }
-    const size_t W = kWindow, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim, KV = (size_t) g.n_kv * g.head_dim;
+    const size_t W = kBatch, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim, KV = (size_t) g.n_kv * g.head_dim;
     WindowScratch& b = m->ws;
     Arena& a = m->dec_arena;
     b.x = a.take<float>(W * H);
     b.xn = a.take<float>(W * H);
     b.tmp = a.take<float>(W * H);
+    b.dacc = a.take<float>(W * H);
     b.xq = a.take_bytes(act_slot(g));
-    b.yq = a.take_bytes(act_slot(g));
-    fp8w_need(g, b.w8.partial_floats, b.w8.tickets_n);
+    b.x8 = a.take_bytes(q8_slot(g));
+    wgemm_need(g, b.w8.partial_floats, b.w8.tickets_n);
     b.w8.partial = a.take<float>(std::max<size_t>(b.w8.partial_floats, 1));
     b.w8.tickets = a.take<int32_t>(std::max<size_t>(b.w8.tickets_n, 1));   // zero: the arena is cleared below
     b.z = a.take<float>(W * g.value_width());
@@ -376,7 +404,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         err = o.arch + ": clearing the decode scratch failed";
         return nullptr;
     }
-    prefill::mmq::iota(b.iota, kWindow, nullptr);
+    prefill::mmq::iota(b.iota, kBatch, nullptr);
     if (!m->ready_products(err) || cudaDeviceSynchronize() != cudaSuccess) {
         if (err.empty()) err = o.arch + ": readying the products failed";
         return nullptr;

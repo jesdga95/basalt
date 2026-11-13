@@ -345,7 +345,6 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/gdn_prompt.cu
                         src/kernels/cuda/dense_ops.cu
                         src/kernels/cuda/gqa_attn.cu
-                        src/kernels/cuda/fp8_window.cu
                         src/kernels/cuda/nvfp4_planes.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
@@ -692,10 +691,6 @@ add_executable(window_gemm_parity tests/kernels/window_gemm_parity.cpp)
 target_link_libraries(window_gemm_parity PRIVATE window_gemm kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME window_gemm_parity COMMAND window_gemm_parity)
 set_tests_properties(window_gemm_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
-add_executable(fp8_window_parity tests/kernels/fp8_window_parity.cpp)
-target_link_libraries(fp8_window_parity PRIVATE kernels ${_gpu_runtime_target})
-basalt_gpu_test(NAME fp8_window_parity COMMAND fp8_window_parity)
-set_tests_properties(fp8_window_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 add_executable(gqa_attn_parity tests/kernels/gqa_attn_parity.cpp)
 target_link_libraries(gqa_attn_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gqa_attn_parity COMMAND gqa_attn_parity)

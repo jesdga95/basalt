@@ -216,7 +216,7 @@ public:
         return {};
     }
 
-    int batch_rows() const override { return kWindow; }
+    int batch_rows() const override { return kBatch; }
 
     // Several sessions' windows as one batch: each is settled and its draw prepared as decode_window does, the rows run
     // together on the first session's stream (every session's own stream is idle by then), each session draws from its own
@@ -235,7 +235,7 @@ public:
             if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the window passes the context");
             rows += r.n_tokens;
         }
-        if (rows > kWindow) return fail(m_.o.arch + ": a batch of " + std::to_string(rows) + " rows");
+        if (rows > kBatch) return fail(m_.o.arch + ": a batch of " + std::to_string(rows) + " rows");
         for (int i = 0; i < n; ++i)
             if (Result s = ss[(size_t) i]->settle(reqs[i].pos); !s.ok()) return s;
         for (int i = 0; i < n; ++i)
