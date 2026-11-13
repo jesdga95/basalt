@@ -9,6 +9,7 @@
 #include "basalt/program/probe_rates.hpp"
 #include "basalt/protocol.hpp"
 #include "basalt/spec/draft_policy.hpp"
+#include "basalt/vision/ffmpeg_api.hpp"
 #include "basalt/vision/video.hpp"
 
 #include <iterator>
@@ -109,6 +110,8 @@ public:
                 return 1;
             }
         start_guard();
+        // whether the in-engine encoder reads video: FFmpeg found, for a model that reads the shared patches
+        if (o.vision_in_engine && sessions_[0]->reads_patches()) std::printf("%s\n", basalt::vision::video_line().c_str());
         std::printf("INFO %s\n", (identity_words() + sessions_[0]->info_words()).c_str());
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);
