@@ -74,7 +74,7 @@ int64_t widest_input(const Geometry& g) {
     const size_t AQ = (size_t) g.n_head * g.head_dim;
     return (int64_t) std::max<size_t>({(size_t) g.n_embd, (size_t) g.n_ff, (size_t) g.value_width(), AQ, 2 * (size_t) g.n_embd});
 }
-// a window's activation buffers for the widest input: the window gemm's fp16 rows, MMQ's q8_1 rows
+// a window's activation buffers for the widest input: the window gemm's bf16 rows, MMQ's q8_1 rows
 size_t act_slot(const Geometry& g) { return (kernels::wgemm::act_bytes(widest_input(g)) + 255) / 256 * 256; }
 size_t q8_slot(const Geometry& g) { return (prefill::mmq::q8_bytes(kBatch, widest_input(g)) + 255) / 256 * 256; }
 
@@ -93,7 +93,9 @@ void wgemm_need(const Geometry& g, size_t& partial, size_t& tickets) {
     std::vector<Shape> shapes = {{{2 * AQ, KV, KV}, 3, H, wg::Epilogue::Store}, {{2 * AQ}, 1, H, wg::Epilogue::Store},
                                  {{KV}, 1, H, wg::Epilogue::Store},          {{H}, 1, AQ, wg::Epilogue::Add},
                                  {{F, F}, 2, H, wg::Epilogue::SwiGLU},       {{F}, 1, H, wg::Epilogue::Store},
-                                 {{H}, 1, F, wg::Epilogue::Add},             {{g.n_vocab}, 1, H, wg::Epilogue::Store}};
+                                 {{H}, 1, F, wg::Epilogue::Add},             {{g.n_vocab}, 1, H, wg::Epilogue::Store},
+                                 {{256}, 1, H, wg::Epilogue::Store},   // the block drafter's selector (its rank)
+                                 {{kDraftVocab}, 1, H, wg::Epilogue::Store}};   // and its head's rows
     if (g.gdn_layers() > 0) {
         shapes.push_back({{C, VD}, 2, H, wg::Epilogue::Store});
         shapes.push_back({{C}, 1, H, wg::Epilogue::Store});
@@ -102,7 +104,7 @@ void wgemm_need(const Geometry& g, size_t& partial, size_t& tickets) {
     }
     partial = tickets = 0;
     for (const Shape& sh : shapes)
-        for (const wg::Format f : {wg::Format::F8, wg::Format::Nvfp4}) {
+        for (const wg::Format f : {wg::Format::F8, wg::Format::Nvfp4, wg::Format::Bf16}) {
             if (sh.K <= 0 || sh.K % 256 != 0) continue;
             wg::Call c;
             c.fmt = f;
@@ -114,7 +116,7 @@ void wgemm_need(const Geometry& g, size_t& partial, size_t& tickets) {
                 c.m[i].rows = sh.rows[i];
                 ok = ok && sh.rows[i] > 0 && (f == wg::Format::F8 || sh.rows[i] % 128 == 0);
             }
-            if (!ok || (f == wg::Format::F8 && sh.epi == wg::Epilogue::SwiGLU)) continue;
+            if (!ok || (f != wg::Format::Nvfp4 && sh.epi == wg::Epilogue::SwiGLU)) continue;
             size_t p, t;
             wg::workspace_need(c, p, t);
             partial = std::max(partial, p);
@@ -131,7 +133,7 @@ size_t window_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_conte
     f += block_scratch_floats(g, bd);
     size_t wp, wt;
     wgemm_need(g, wp, wt);
-    return f * 4 + act_slot(g) + q8_slot(g) + (wp + wt + 1) * 4 + W * 4 * 6 + 76 * 256;
+    return f * 4 + 2 * act_slot(g) + q8_slot(g) + (wp + wt + 1) * 4 + W * 4 * 6 + 76 * 256;
 }
 
 size_t chunk_bytes(const Geometry& g) {
@@ -353,6 +355,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     b.tmp = a.take<float>(W * H);
     b.dacc = a.take<float>(W * H);
     b.xq = a.take_bytes(act_slot(g));
+    b.hq = a.take_bytes(act_slot(g));
     b.x8 = a.take_bytes(q8_slot(g));
     wgemm_need(g, b.w8.partial_floats, b.w8.tickets_n);
     b.w8.partial = a.take<float>(std::max<size_t>(b.w8.partial_floats, 1));

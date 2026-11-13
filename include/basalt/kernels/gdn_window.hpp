@@ -37,6 +37,7 @@ struct DecRecArgs {
     float* gate = nullptr;           // token t at gate + t * h_v
     float* beta = nullptr;
     float* y = nullptr;              // optional fp32 output, token t at y + t * h_v * S
+    uint16_t* y16 = nullptr;         // optional bf16 output, laid out as y
     float* o = nullptr;              // dec_gdn_rec_split: the raw (pre-norm) output, laid out as y
     void* yq = nullptr;              // q8_1 of the output, token t at block t * h_v * S / 32
     int C = 0, n_embd = 0, h_k = 0, h_v = 0;

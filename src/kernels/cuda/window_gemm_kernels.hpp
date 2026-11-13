@@ -7,6 +7,7 @@ namespace basalt::kernels::wgemm::detail {
 
 /// The kernel for windows of up to 8 (nt 1) or 16 (nt 2) rows.  Both nt of a kind have the same block shape.
 const Kernel& f8(int nt);
+const Kernel& bf16(int nt);
 const Kernel& nvfp4(int nt);
 const Kernel& nvfp4_swiglu(int nt);
 

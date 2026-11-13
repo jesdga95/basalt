@@ -2,6 +2,7 @@
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/pdl.hpp"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -226,7 +227,8 @@ __global__ void __launch_bounds__(kDecThreads) decode_chunk_kernel(const float* 
 
 // Block (query head, row t), one thread per dim: the row's splits merged in order.
 template <int HD>
-__global__ void __launch_bounds__(HD) decode_merge_kernel(const float* part, int n_head, int gx, float* out) {
+__global__ void __launch_bounds__(HD) decode_merge_kernel(const float* part, int n_head, int gx, float* out, const float* gate_q,
+                                                          uint16_t* gated16) {
     pdl_launch_dependents();
     pdl_wait();
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
@@ -240,7 +242,13 @@ __global__ void __launch_bounds__(HD) decode_merge_kernel(const float* part, int
         l = fmaf(pb[1], w, l);
         a = fmaf(pb[2 + d], w, a);
     }
-    out[((int64_t) t * n_head + h) * HD + d] = a / l;
+    const float o = a / l;
+    const int64_t i = ((int64_t) t * n_head + h) * HD + d;
+    if (out) out[i] = o;
+    if (gated16) {
+        const float g = gate_q[((int64_t) t * n_head + h) * 2 * HD + HD + d];
+        gated16[i] = __bfloat16_as_ushort(__float2bfloat16_rn(o / (1.0f + expf(-g))));
+    }
 }
 
 // the splits a row's chunks go to: from the capacity's chunks alone
@@ -248,14 +256,15 @@ int decode_splits(int64_t n_chunks) { return (int) std::max<int64_t>(1, std::min
 
 template <int HD>
 void launch_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_kv, const Range& r, int T,
-                   float* scratch, int n_chunks, float* out, cudaStream_t s, KvInt8 q8 = {}) {
+                   float* scratch, int n_chunks, float* out, cudaStream_t s, KvInt8 q8 = {}, const float* gate_q = nullptr,
+                   uint16_t* gated16 = nullptr) {
     const float scale = 1.4426950408889634f / sqrtf((float) HD);
     const int gx = decode_splits(n_chunks);
     launch_pdl(decode_chunk_kernel<HD>, dim3((unsigned) gx, (unsigned) n_kv, (unsigned) T), dim3(kDecThreads), 0, s, q,
                (const __half*) kc, (const __half*) vc, n_head, n_kv, r, n_chunks, scale, scratch, q8);
     check("gqa decode attention");
     launch_pdl(decode_merge_kernel<HD>, dim3((unsigned) n_head, (unsigned) T), dim3(HD), 0, s, (const float*) scratch, n_head, gx,
-               out);
+               out, gate_q, gated16);
     check("gqa decode attention/merge");
 }
 
@@ -862,7 +871,7 @@ size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_
 
 void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int T, float* scratch, int64_t max_cells, float* out, void* stream,
-                     const int32_t* pos_dev, KvInt8 q8) {
+                     const int32_t* pos_dev, KvInt8 q8, const float* gate_q, uint16_t* gated16) {
     if (T < 1 || T > kGqaMaxWindow || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX || pos0 + T > max_cells) {
         basalt::log::error("basalt", "gqa_decode_attn: invalid arguments");
         std::exit(1);
@@ -872,7 +881,7 @@ void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
     r.cap = max_cells;
     r.pos_dev = pos_dev;
     const int n_chunks = (int) ((max_cells + CHUNK - 1) / CHUNK);
-    launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream, q8);
+    launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream, q8, gate_q, gated16);
 }
 
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
