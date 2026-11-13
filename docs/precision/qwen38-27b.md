@@ -18,7 +18,11 @@ What the dense stack computes in, where it rounds, and what that costs against t
 - **Products:** activations are rounded to q8_1 (32 values, fp16 scale) and multiplied on int8 tensor cores (llama.cpp's MMQ),
   in prompt chunks and decode windows alike; an NVFP4 matrix's FP32 scale is applied to its fp32 output.
 - **Decode windows** run with one 8-row tile whatever their rows, so a token's arithmetic is the same in a drafted window and in
-  plain decoding: greedy output with drafting is bitwise plain greedy.
+  plain decoding: greedy output with drafting is bitwise plain greedy, alone or beside other slots. Tokens read through the
+  prompt path round differently from decoded ones, so this holds where every request reads the same prompt the same way. A
+  thinking budget stops the engine on its last token and the answer continues the engine's own state, so it holds there too.
+  When the server cuts off a thinking loop, the tokens the engine wrote past the cut are read again through the prompt path,
+  and that reply can differ in the last bits between runs.
 - **GDN:** fp32 state and conv history. Decode windows replay accepted rows into the state; prompt chunks run the chunked delta
   rule with q/k in BF16 and the state in fp32 (shared with Flash-Next).
 - **Attention:** K and V stored fp16, or with `--kv int8` as int8 codes and an fp16 scale per 64 values (amax / 127, codes rounded
