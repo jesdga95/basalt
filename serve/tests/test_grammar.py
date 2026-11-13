@@ -300,6 +300,7 @@ class EngineStart(unittest.TestCase):
             eng.write_bytes(flags)
             conf = Path(d) / "c.json"
             conf.write_text(json.dumps({"models": [{"model": "m.basalt", **server_block}]}))
+            (Path(d) / "m.basalt").write_bytes(b"")              # the launch check wants the file to exist
             argv = ["x", "--config", str(conf), "--engine-bin", str(eng), "--port", str(free_port()), *cli]
             tokdir = Path(d) / "tok"
             tokdir.mkdir()

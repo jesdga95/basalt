@@ -5,7 +5,7 @@ quality: [precision](../precision/qwen38-flash-next.md).
 
 ## Pack
 
-Nine packs on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt), all named `Qwen3.8-FN-` plus:
+Packs on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt), all named `Qwen3.8-FN-` plus:
 
 - `NVFP4-DQ6_K` (default) and `NVFP4-DQ8`: NVIDIA's NVFP4 experts. `D` is the dense projections' format: Q6_K, or Q8_0 for DQ8.
   DQ8 is slower than DQ6_K and has a lower KLD ([precision](../precision/qwen38-flash-next.md#6-bit-dense-projections)).
@@ -29,7 +29,10 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
   ([GPUs](../configuration/gpus.md)).
 - **Elastic KV:** with `--max-context` above 32,768 (and not with `--kv-resident`, `--vram-elastic` or a layer split), each session
   backs its first 32,768 cells at start. More cells come from the expert cache when a request needs them, and go back when it does
-  not. An idle conversation's KV moves to RAM after 15 s. The startup line `elastic KV: ...` shows the figures.
+  not. An idle conversation's KV moves to RAM after 15 s. The startup line `elastic KV: ...` shows the figures, and
+  `elastic KV: about N cells fit in the S sessions ...` gives the ceiling: the cells all sessions can hold before the expert
+  cache reaches the slots a prompt chunk needs, past which a request is refused. `/v1/status` gives its current value as
+  `context.elastic_kv_ceiling` (null without elastic KV), so a client can compact a conversation first.
 
 ## Long prompts
 

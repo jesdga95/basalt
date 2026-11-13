@@ -7,6 +7,7 @@
 #include "models/deepseek41/prefill.hpp"
 
 #include "basalt/artifact/dequant.hpp"
+#include "models/deepseek41/engram_rows.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
@@ -40,6 +41,7 @@ public:
     ~PrefillImpl() override {
         finish_reads(ahead_);
         for (void* p : allocs_) cudaFree(p);
+        if (batch_open_) ops_.close_batch();
     }
 
     bool init(std::string& err) {
@@ -58,6 +60,8 @@ public:
         ExpertTier* tier = ops_.expert_tier(err);   // the FFN has it open by now
         if (!tier) return false;
         host_ = &tier->host();
+        batch_open_ = ops_.open_batch(cap_, err);
+        if (!batch_open_) return false;
         const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), 8), 1 << 16);
         bool ok = buf(x_, C * 4 * n) && buf(x2_, C * 4 * n) && buf(cur_, C * n) && buf(normed_, C * n) &&
                   buf(attn_, C * n) && buf(moe_, C * n) && buf(sh_, C * n) && buf(sum_, C * n) &&
@@ -291,9 +295,7 @@ private:
                     const size_t np = std::min(piece, nr - p0);
                     auto dequant = [&](size_t r0, size_t r1) {
                         for (size_t r = r0; r < r1; ++r)
-                            for (int b = 0; b < 256 / 32; ++b)
-                                dequantize_iq4_nl(raw(cur, k) + (p0 + r) * en.row_bytes + (size_t) b * 18,
-                                                  rows_f + r * 256 + (size_t) b * 32);
+                            engram_row_f32(en.type, en.row_values, raw(cur, k) + (p0 + r) * en.row_bytes, rows_f + r * 256);
                     };
                     {
                         std::vector<std::thread> th;
@@ -426,6 +428,7 @@ private:
     LayerOps& ops_;
     cudaStream_t stream_;
     int cap_;
+    bool batch_open_ = false;   // the ops hold this read's batched attention
     std::vector<void*> allocs_;
     std::string err_;
     float *x_ = nullptr, *x2_ = nullptr, *cur_ = nullptr, *normed_ = nullptr, *attn_ = nullptr, *moe_ = nullptr,

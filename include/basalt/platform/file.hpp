@@ -31,6 +31,9 @@ std::wstring to_wide(const std::string& utf8);
 /// accept is made absolute and given the `\\?\` prefix, so it opens whether or not the system's long-path policy is
 /// on (the manifest's `longPathAware` only takes effect where it is). Shorter paths convert as `to_wide` does.
 std::wstring to_wide_path(const std::string& utf8);
+
+/// UTF-16 back to UTF-8, for a name the OS hands out. Empty when the name cannot be read or is not representable.
+std::string to_utf8(const wchar_t* w);
 #endif
 
 /// Opens `path` as `mode` spells it ("rb", "wb", "ab"). nullptr on failure. `mode` is passed through as given: text
@@ -59,6 +62,11 @@ bool path_executable(const std::string& path);
 /// This executable's own path, as the OS knows it; empty when the OS does not say.
 std::string module_path();
 
+/// The directory above the one holding this executable, with no trailing separator: the top of the source tree for a
+/// build (`bin/` is under it) and of an unpacked release, where `serve/`, `tools/`, `data/` and `.venv/` are. Empty when
+/// the OS does not name the executable.
+std::string install_root();
+
 /// The directory for scratch files, with no trailing separator: the system's temp directory on Windows, /tmp on
 /// Linux. Never empty; where the OS cannot name one it says ".".
 std::string temp_dir();
@@ -71,7 +79,7 @@ std::string temp_dir();
 /// duration of it: a handle opened without overlapped I/O serializes the reads issued through it, so threads sharing
 /// one descriptor would take turns, and a handle the call kept would keep the file open after its descriptor was
 /// closed. When the file cannot be reopened the shared descriptor is used, which still reads correctly, only in
-/// turn.
+/// turn. Unbuffered descriptors instead share an overlapped handle, with an event and absolute offset per read.
 /// A descriptor this process has already closed is not a value to hand here: finding a descriptor's handle is what
 /// Windows does first, and the CRT stops the process for a number it knows is closed. `fd` < 0 says -1 instead.
 /// `dst` has to hold everything `n` asks for: on Windows that is up to the 1 GiB the cap gives, so a caller asking

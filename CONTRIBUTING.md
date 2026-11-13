@@ -21,6 +21,7 @@ Basalt is an engine for mixture-of-experts models on NVIDIA Blackwell GPUs. Ever
 - **Logic exists once.** What two models need lives in shared code and takes each model's numbers as parameters. Follow the existing pattern before adding a new one.
 - **One serving loop** runs every request of every model; a model plugs into it and never forks it. See [persistent serving](src/program/serve/README.md).
 - **The engine does the work, the server serves.** Tokenizing and per-request work run in C++. `serve/` parses, routes and streams, names no model, and never repairs model output; constrained decoding (grammar) handles structure.
+- **Build structure: no slow TU.** A clean Release build must finish in under 10 minutes on 32 threads, and nvcc compiles a translation unit on one core, so the build takes as long as its slowest `.cu`. Keep every `.cu` to about a minute or two alone: a kernel that is instantiated in several variants (like `dm_peer_kernel`) gets one `.cu` per variant, behind a getter that returns its address (no relocatable device code), and shared device code goes in a header with no kernel in it. A `.cu` does not include another `.cu` (`tools/check_cu_includes.sh` fails on a new one; `tools/cu_includes.allow` lists the few that must inline). Time a new or changed `.cu` alone (`nvcc --time`) and report it with the change.
 
 ## What every change must include
 
@@ -58,8 +59,8 @@ Basalt is an engine for mixture-of-experts models on NVIDIA Blackwell GPUs. Ever
   1. Run `basalt-bench --community --model PACK --submitter YourName`. It adds the row to `docs/community/benchmarks.json` ([building](docs/building.md)).
   2. Review the row. After a hand edit, format and check it with `python3 tools/check_benchmarks.py --fix docs/community/benchmarks.json`.
   3. Commit it.
-  4. Open a pull request; the `pages` workflow runs the same check.
-  5. Once merged, the row appears on the runs page.
+  4. Open a pull request; the `community` workflow runs the same check.
+  5. Once merged, the row appears on the [runs page](https://basalt.jgulfo.com/community/).
 - Any Blackwell (sm_120) machine with spare hours helps; bigger setups help most: 96 GB+ VRAM (single large cards or multi-GPU), quad- or octa-channel DDR5.
 - A few hours of remote access to a machine speeds up development.
 - Or sponsor the project through GitHub Sponsors (the repository's Sponsor button): it pays for tokens for agentic development and for time on different hardware to test on.

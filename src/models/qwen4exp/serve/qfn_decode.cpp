@@ -69,7 +69,7 @@ void QfnRequest::decode_state_begin() {
     n_chain = 0;                       // drafts the last chain produced
     full_ema = 0.5;                 // how often windows are accepted whole
     pair_hint = false;                // windows are accepted whole often enough to run the chain on for a guess
-    pair_req = runtime_.pipe_on && ppl == nullptr && !relax_on && gguard == nullptr && hist_n == 0 && !in_slot &&
+    pair_req = runtime_.pipe_on && ppl == nullptr && !relax_on && gguard == nullptr && hist_n == 0 && !in_slot && req_logprobs < 0 &&
                           runtime_.kv_floor == 0;
     if (runtime_.pipe_on) runtime_.mtp.set_max_drafts((pair_req ? basalt::core::kMtpChainMax : runtime_.S_mtp) - 1);
     pair_runs = 0;
@@ -188,10 +188,8 @@ inline void QfnRequest::spawn_adapt(bool early) {
                     const bool pre = early && runtime_.xq_stage == 0;
                     if (pre) runtime_.rank_swaps(ranked, runtime_.xq_across);
                     const double ms_pre = ms(ta);
-                    for (unsigned spins = 0; early && adapt_go.load(std::memory_order_acquire) == 0; ++spins) {
-                        if (spins < 20000) basalt::platform::cpu_relax();
-                        else std::this_thread::yield();
-                    }
+                    basalt::core::SpinWait spin;
+                    while (early && adapt_go.load(std::memory_order_acquire) == 0) spin();
                     if (early && adapt_go.load(std::memory_order_acquire) != 1) return;
                     const auto tb = Clock::now();
                     adapt_ok = runtime_.xq_stage != 0 ? runtime_.xq_advance(false) : runtime_.xq_round(pre ? &ranked : nullptr);

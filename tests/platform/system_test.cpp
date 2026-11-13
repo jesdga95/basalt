@@ -24,6 +24,13 @@ void check(bool ok, const std::string& what) {
 int main() {
     using namespace basalt::platform;
     check(process_id() > 0, "process_id is positive");
+
+    // the root is two path components above the executable: what is left of the path is "/<dir>/<name>"
+    const std::string self = module_path(), root = install_root();
+    const std::string rest = self.compare(0, root.size(), root) == 0 ? self.substr(root.size()) : std::string();
+    int seps = 0;
+    for (char c : rest) seps += c == '/' || c == '\\';
+    check(!root.empty() && seps == 2 && (rest[0] == '/' || rest[0] == '\\'), "install_root is the directory above the executable's own");
     (void) stderr_is_terminal();   // either answer is valid; the call must not fail
 
     const std::string mi = meminfo_path();
@@ -69,5 +76,16 @@ int main() {
     }
     DynLib moved = DynLib();
     check(!moved, "an empty DynLib is false");
+
+    // application libraries: a name nobody ships loads nothing; the C runtime's own does load, and names its file
+    check(!DynLib::open_app(DynLib::versioned_name("basalt_no_such_library", 99)), "open_app: a missing library is empty");
+#if defined(_WIN32)
+    check(DynLib::versioned_name("avformat", 62) == "avformat-62.dll", "versioned_name follows the platform's spelling");
+    const DynLib crt = DynLib::open_app("ucrtbase.dll");
+#else
+    check(DynLib::versioned_name("avformat", 62) == "libavformat.so.62", "versioned_name follows the platform's spelling");
+    const DynLib crt = DynLib::open_app("libc.so.6");
+#endif
+    check((bool) crt && !crt.path().empty(), "open_app: the C runtime loads and path() names its file");
     return failures ? 1 : 0;
 }

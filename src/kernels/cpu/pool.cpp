@@ -128,26 +128,31 @@ void ExpertPool::worker(int id) {
     parked_.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
         // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the sibling
-        // hyperthread; `epoch_` is bumped once per LAYER, not once per expert, so most of these iterations are spent
-        // here with nothing to do.
+        // hyperthread and draws little power, which leaves the package's budget to the cores still working;
+        // `epoch_` is bumped once per LAYER, not once per expert, so most of these iterations are spent here with
+        // nothing to do.
         //
         // **AND NOTHING ELSE HAPPENS IN HERE**: no counter is bumped per iteration (a locked read-modify-write, five
         // workers against one cache line, would make the workers invalidate each other's caches and the very line the
         // host writes to publish work).  See the note on the atomics in pool.hpp.
         //
-        // After `kSpinBeforeYield` the worker yields its core on every check, and after `kSpinBeforeSleep` with no
-        // work it sleeps.  The clock is read once every 64 checks.
+        // Once every `kYieldEvery` the worker yields its core, and after `kSpinBeforeSleep` with no work it sleeps.
+        // The clock is read once every 64 checks.
         const auto parked_at = std::chrono::steady_clock::now();
+        auto yield_at = parked_at + kYieldEvery;
         uint32_t spins = 0;
-        bool yielding = false;
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            if (yielding) std::this_thread::yield();
-            else _mm_pause();
+            _mm_pause();
             if ((++spins & 63u) != 0) continue;
-            const auto waited = std::chrono::steady_clock::now() - parked_at;
-            yielding = waited >= kSpinBeforeYield;
-            if (waited < spin_before_sleep_) continue;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - parked_at < spin_before_sleep_) {
+                if (now >= yield_at) {
+                    std::this_thread::yield();
+                    yield_at = now + kYieldEvery;
+                }
+                continue;
+            }
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
@@ -265,7 +270,7 @@ void ExpertPool::drain(int id, uint32_t epoch) {
             const int n = fused_n_, pg = fused_gu_parts_, pd = fused_d_parts_;
             if ((int) i < n * pg) {
                 const int e = (int) i / pg, part = (int) i % pg;
-                native_gu_range(e, (int) nfmt_->n_ff * part / pg, (int) nfmt_->n_ff * (part + 1) / pg);
+                native_gu_range(e, part_row(part, pg, (int) nfmt_->n_ff), part_row(part + 1, pg, (int) nfmt_->n_ff));
                 FusedExpert& fe = fused_[(size_t) e];
                 if (fe.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     native_quantize(e);
@@ -273,12 +278,34 @@ void ExpertPool::drain(int id, uint32_t epoch) {
                 }
             } else {
                 const int k = (int) i - n * pg, e = k / pd, part = k % pd;
-                // every gate/up task is claimed before any down task, so this waits only for tasks already running
-                if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) wait_ready(e);
-                native_down_range(e, (int) nfmt_->n_embd * part / pd, (int) nfmt_->n_embd * (part + 1) / pd);
+                const int r0 = part_row(part, pd, (int) nfmt_->n_embd), r1 = part_row(part + 1, pd, (int) nfmt_->n_embd);
+                // every gate/up task is claimed before any down task, so this waits only for tasks already running;
+                // the wait would leave the memory bus idle, so it first pulls this part's down rows into the cache
+                if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) {
+                    prefetch_until_ready(e, mjobs_[e].blob + nfmt_->down_off + (size_t) r0 * nfmt_->d_row,
+                                         (size_t) (r1 - r0) * nfmt_->d_row);
+                    if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) wait_ready(e);
+                }
+                native_down_range(e, r0, r1);
             }
         }
         done_.fetch_add(1, std::memory_order_release);
+    }
+}
+
+int ExpertPool::part_row(int part, int parts, int rows) const {
+    // the last fused_tail_ parts are a quarter of the others: the threads that finish early pick up short tasks, so
+    // the wait for the slowest one before the down rows, and at the end of the layer, is a quarter of a task
+    const int small = (std::min)(fused_tail_, parts / 2), big = parts - small;
+    const int64_t units = 4 * (int64_t) (std::min)(part, big) + (std::max)(0, part - big);
+    return (int) ((int64_t) rows * units / (4 * (int64_t) big + small));
+}
+
+void ExpertPool::prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const {
+    // into L2 (a part is tens of KB, more than L1 holds), checking every 4 KB whether the wait is already over
+    for (size_t o = 0; o < bytes; o += 64) {
+        _mm_prefetch((const char*) p + o, _MM_HINT_T1);
+        if ((o & 4095) == 4032 && fused_[(size_t) e].ready.load(std::memory_order_relaxed) != 0) return;
     }
 }
 
@@ -381,13 +408,15 @@ int ExpertPool::split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int 
     mjobs_ = jobs;
     nfmt_ = &f;
     const int threads = active_.load(std::memory_order_relaxed) + 1;
+    const int tpt = cpu_avx512_ok() ? kTasksPerThread : kTasksPerThreadAvx2;
     // One batch for the whole layer: an expert's down rows start once its own gate/up rows are done and quantized,
     // so there is no barrier between the three steps and the cores' speed differences cost one tail, not two.
     // The share of tasks follows the share of bytes of the two projections.
     gu_share = (double) f.down_off / (double) (f.down_off + f.d_row * (size_t) f.n_embd);
     fused_n_ = nb;
-    fused_gu_parts_ = (std::min)((int) f.n_ff, (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb)));
-    fused_d_parts_ = (std::min)((int) f.n_embd, (std::max)(1, (int) std::lround(kTasksPerThread * threads * (1.0 - gu_share) / nb)));
+    fused_tail_ = threads;
+    fused_gu_parts_ = (std::min)((int) f.n_ff, (std::max)(1, (int) std::lround(tpt * threads * gu_share / nb)));
+    fused_d_parts_ = (std::min)((int) f.n_embd, (std::max)(1, (int) std::lround(tpt * threads * (1.0 - gu_share) / nb)));
     for (int e = 0; e < nb; ++e) {
         fused_[(size_t) e].gu_left.store(fused_gu_parts_, std::memory_order_relaxed);
         fused_[(size_t) e].ready.store(0, std::memory_order_relaxed);

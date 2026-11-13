@@ -16,7 +16,7 @@ Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W, 121 GiB of RAM. Geom
 
 | Stage | Format | Arithmetic |
 |---|---|---|
-| Routed experts (UD-IQ1_M) | IQ1_S/IQ1_M gate/up, IQ1_S/IQ1_M/IQ2_S down | q8_1 activations (GPU), Q8_K (CPU); fp32 scales |
+| Routed experts (UD-IQ1_M) | IQ1_S, IQ2_XXS or IQ2_XS gate/up; IQ1_S, IQ2_XXS, IQ2_S or IQ2_XS down | q8_1 activations (GPU), Q8_K (CPU); fp32 scales |
 | Attention and shared-expert projections | Q6_K, Q5_K or Q8_0 | q8_1 (decode); fp16 block-scaled int8 mma (prompt) |
 | Engram table | IQ4_NL, 256 values per row | dequantized to fp32 on the host |
 | Compressor and indexer projections | BF16 | fp32 activations and accumulation |
@@ -25,6 +25,10 @@ Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W, 121 GiB of RAM. Geom
 | Compressed rows | E2M1, an E4M3 scale per 16 values (`--kv fp16`: fp16) | decoded exactly; fp32 scores, softmax and accumulation |
 | Indexer keys and queries | E2M1, a power-of-two scale per 32 values (`--kv fp16`: fp16 keys, fp32 queries) | fp32 scores |
 | Output head | Q6_K | fp32 logits |
+
+The NVFP4 test pack differs in four rows: routed experts NVFP4 (E2M1 codes, an E4M3 scale per 16 values, an FP32 scale per matrix;
+q8_1 activations on the GPU, Q8_0 on the CPU), attention and shared-expert projections Q8_0 of NVIDIA's FP8 values, the Engram
+table MXFP4 (E2M1 codes, a power-of-two scale per 32 values), the output head Q8_0. It is not yet scored against BF16.
 
 All activations between stages are fp32. A decode kernel's output does not depend on how many tokens share its launch (bitwise).
 
@@ -91,9 +95,14 @@ read's end (20 × 127 + 128) therefore stops at layer 20's compressor. `--no-pro
 
 ## Verify windows
 
-`--spec` runs up to 8 rows at once (the default is 3). With placement fixed (`--diag-tier-frozen --diag-tier-ram 304`), every row's logits equal plain decode's, bit for bit, in windows of 2, 3, 5 and 8 rows, for the drafter too. Sampled text at
+`--spec` runs up to 8 rows at once (the default is 6). With placement fixed (`--diag-tier-frozen --diag-tier-ram 304`), every row's logits equal plain decode's, bit for bit, in windows of 2, 3, 5 and 8 rows, for the drafter too. Sampled text at
 temperature 1 matches plain decode. With tiers moving, rows round as under any placement: forced through the plain text, 15 to 25 prose
 picks and 1 to 6 code picks differ over 800 tokens.
+
+Where a promotion lands decides which experts the CPU computes later, so it moves the rounding too. Sending one to the second card
+only when what it replaces there has gone unused 1,280 lookups longer than the main card's oldest (instead of any longer) scores
+within noise against BF16 (100 chunks, homes main card 35, second card 45, RAM 304): KLD 0.27971 -> 0.27944, paired by chunk -0.00027
+(95% CI -0.00199 to +0.00144), top-1 83.89% -> 83.77% (-0.12 points, -0.32 to +0.07).
 
 ## Against llama.cpp
 

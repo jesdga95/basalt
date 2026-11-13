@@ -16,6 +16,7 @@
 #include <io.h>      // _open_osfhandle, _read, _write, _close
 #else
 #include <fcntl.h>
+#include <poll.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -192,6 +193,23 @@ int64_t pipe_read(int fd, void* dst, size_t n) {
         if (r < 0 && errno == EINTR) continue;
         return (int64_t) r;
     }
+}
+
+bool pipe_wait_readable(int fd, int timeout_ms) {
+#if defined(_WIN32)
+    const HANDLE h = (HANDLE) _get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE || GetFileType(h) != FILE_TYPE_PIPE) return true;
+    for (int waited = 0;; waited += 10) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr) || avail > 0) return true;   // data, or the writer is gone
+        if (waited >= timeout_ms) return false;
+        Sleep(10);
+    }
+#else
+    pollfd p{fd, POLLIN, 0};
+    const int r = ::poll(&p, 1, timeout_ms);
+    return r != 0;   // an interrupted or failed poll lets the read report it
+#endif
 }
 
 int child_wait(Child& c, int timeout_ms) {

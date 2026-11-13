@@ -202,6 +202,15 @@ int QfnRuntime::capture_windows() {
     res_at_start = host_res;
     peer_at_start = peer.valid() ? peer.residency() : std::vector<int32_t>();
     prof_rank_start = prof_rank;
+    // the elastic KV's ceiling with everything loaded; the server's copy follows it from here
+    kv_ceiling_note();
+    if (kv_ceiling_sent >= 0) {
+        const int n = std::max(o.batch, 1);
+        basalt::log::info("basalt serve", "elastic KV: about %lld cells fit in the %d session%s (%lld at full "
+                          "context) before the expert cache reaches the %lld slots a prompt chunk needs",
+                          (long long) kv_ceiling_sent, n, n == 1 ? "" : "s", (long long) n * o.max_context,
+                          (long long) cache_floor_slots());
+    }
     std::printf("INFO %s\n", basalt::program::spill_words(tier_spill).c_str());   // experts only the file holds
     std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
     std::fflush(stdout);
@@ -209,10 +218,11 @@ int QfnRuntime::capture_windows() {
     rounds = 0;
     sfx.emplace(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
     policy.emplace(S);   // MTP or lookup window, learned over the whole process
-    // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
-    // or more basalt-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
-    // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
-    // h = p + y, w = p + x, and the text after the image continues at p + max(nx, ny).
+    // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images and videos.  The
+    // file is one or more basalt-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt
+    // order, one per picture and one per two-frame video group; each record's rows go to its run of <|image_pad|> or
+    // <|video_pad|> tokens, whose M-RoPE positions are Qwen3-VL's (mrope_positions.hpp): t = p, h = p + y,
+    // w = p + x, and the text after the run continues at p + max(nx, ny).
     mrope_identity = true;
 
     // ---- VRAM <reserve_mib>, between requests, only with --vram-elastic.  It shrinks the expert cache until that

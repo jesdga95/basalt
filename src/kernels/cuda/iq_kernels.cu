@@ -2353,6 +2353,97 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
     }
 }
 
+// 8-lane sub-warp row dot for any K = nb * ipb calls: lane t of the eight stands for the warp lanes t, t + 8, t + 16
+// and t + 24 of row_dot_multi, each one's calls lane-strided by 32 and summed in the same order, then warp_sum's tree:
+// the xor-16 and xor-8 steps inside the lane, the last three across the eight.  The same bits as row_dot_multi with
+// every lane busy (a K of 72, n_ff 2304, leaves 24 of 32 lanes idle in row_dot_multi's third pass).
+template<int TY, int NC, bool EXACT_N = false>
+__device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
+                                             int K, int t, float (&s)[NC]) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+    float a[4][NC];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c) a[i][c] = 0.0f;
+        for (int k = t + 8 * i; k < K; k += 32) {
+            const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+            const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (EXACT_N || c < n) a[i][c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (EXACT_N || c < n) {
+            s[c] = __fadd_rn(__fadd_rn(a[0][c], a[2][c]), __fadd_rn(a[1][c], a[3][c]));
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+        }
+    }
+}
+
+// native_down_multi_kernel's generic path with four rows a warp (32 a block) through row_dot_sub8, for a down row of
+// kDownSub8Calls calls (n_ff 2304 of 256-value blocks): the same bits.  DEP: launched as a programmatic dependent, the
+// block's first group's rows are prefetched into L2 before the wait.
+constexpr int kDownSub8Calls = 72;
+constexpr int kDownSub8Rows = 32;
+template<int TD, bool DEP = false>
+__global__ void __launch_bounds__(256) native_down_sub8_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                               const int32_t* __restrict__ grp_start,
+                                                               const int32_t* __restrict__ n_groups,
+                                                               const int32_t* __restrict__ ent_dst,
+                                                               const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                               float* __restrict__ out) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    if constexpr (DEP) {
+        const int r0 = blockIdx.x * kDownSub8Rows, nr = min(kDownSub8Rows, (int) L.n_embd - r0);
+        const uint8_t* p = (const uint8_t*) grp_ptr[blockIdx.y] + L.down_off + (size_t) r0 * L.d_row;
+        for (int o = threadIdx.x * 128; o < nr * (int) L.d_row; o += 256 * 128)
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(p + o));
+        pdl_wait();
+        pdl_launch_dependents();
+    }
+    const int r = blockIdx.x * kDownSub8Rows + (threadIdx.x >> 3), t = threadIdx.x & 7;
+    if (r >= L.n_embd) return;   // whole 8-lane groups leave together: the shuffles stay within the group
+    const int K = (int) (L.n_ff / Fmt<TD>::qk) * Fmt<TD>::ipb, hb = (int) (L.n_ff / 32);
+    const size_t w_off = L.down_off + (size_t) r * L.d_row;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        [[maybe_unused]] const float sc = expert_out_scale<TD>(grp_ptr[g], L, 2);
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            if (n == 1) {
+                const int off1[1] = { e * hb };
+                float s1[1];
+                row_dot_sub8<TD, 1, true>(wr, hq, off1, 1, K, t, s1);
+                tail_scale<TD>(s1, sc);
+                if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0];
+            } else if (n == 2) {
+                const int off2[2] = { e * hb, (e + 1) * hb };
+                float s2[2];
+                row_dot_sub8<TD, 2, true>(wr, hq, off2, 2, K, t, s2);
+                tail_scale<TD>(s2, sc);
+                if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = t == 0 ? s2[0] : s2[1];
+            } else {
+                int off[GRP_NC];
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c) off[c] = (e + min(c, n - 1)) * hb;
+                float s[GRP_NC];
+                row_dot_sub8<TD, GRP_NC>(wr, hq, off, n, K, t, s);
+                tail_scale<TD>(s, sc);
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c)
+                    if (c < n && t == c) out[(size_t) ent_dst[e + c] * L.n_embd + r] = s[c];
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
 // value i of a q8_1 row set (the warp holds block i / 32, lane = i % 32)
 __device__ __forceinline__ void q8_1_store(const float xi, block_q8_1* __restrict__ y, const long long i) {
@@ -2370,6 +2461,20 @@ __device__ __forceinline__ void q8_1_store(const float xi, block_q8_1* __restric
 }
 
 __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    q8_1_store(x[i], y, i);
+}
+
+// quantize_q8_1_kernel whose blocks past `qblocks` copy `n_words` words from src to dst instead
+__global__ void quantize_q8_1_copy_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n,
+                                          unsigned qblocks, const uint32_t* __restrict__ src, uint32_t* __restrict__ dst,
+                                          int n_words) {
+    if (blockIdx.x >= qblocks) {
+        const int w = (int) (blockIdx.x - qblocks) * blockDim.x + threadIdx.x;
+        if (w < n_words) dst[w] = src[w];
+        return;
+    }
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     q8_1_store(x[i], y, i);
@@ -2775,6 +2880,9 @@ int d_qk(int t) {
 
 // The per-column kernels instead of the ones that decode a weight part once for every column (the same bits; tests)
 bool g_old_kernels = false;
+// native_expert_grouped's launches before the group stride and the fused SwiGLU (native_grouped_set_v1; tests): also
+// the warp-a-row down kernel instead of native_down_sub8_kernel (the same bits)
+bool g_grouped_v1 = false;
 // 64-bit i-quant codebook tables staged into shared memory
 constexpr bool g_stage_grid = true;
 // five or six columns in one pass of six rather than of eight (the same bits)
@@ -2897,9 +3005,10 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
         }
     }
     if constexpr (kGu2Q2<TG>) {
-        if (allow_mma && g_gu2 && !g_old_kernels && gu2_usable(L)) {
+        if (allow_mma && g_gu2 && !g_old_kernels && (gu2_usable(L) || gu2_usable(L, 160))) {
             const dim3 g2((unsigned) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS), grid.y);
-            native_gu2_kernel<TG><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            if (gu2_usable(L)) native_gu2_kernel<TG><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else native_gu2_kernel<TG, TG, 160><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
             return;
         }
     }
@@ -2924,12 +3033,25 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
     } else native_gu_multi_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
 }
 
+// The rows native_down_sub8_kernel takes: kDownSub8Calls calls of a split format that native_down_multi_kernel runs
+// through its generic path (not the n_ff 640 paths).
+template<int TD>
+bool down_sub8(const NativeExpertLayout& L) {
+    if constexpr (kDown40<TD> || TD == 42) return false;
+    else return L.n_ff % Fmt<TD>::qk == 0 && (L.n_ff / Fmt<TD>::qk) * Fmt<TD>::ipb == kDownSub8Calls;
+}
+
 template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
                  float* out, bool dep = false) {
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else if (!g_grouped_v1 && down_sub8<TD>(L)) {
+        const dim3 g8((unsigned) ((L.n_embd + kDownSub8Rows - 1) / kDownSub8Rows), grid.y);
+        if (dep) launch_dependent(native_down_sub8_kernel<TD, true>, g8, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else native_down_sub8_kernel<TD><<<g8, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    }
     else if (dep) launch_dependent(native_down_multi_kernel<TD, true>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else native_down_multi_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
@@ -2981,6 +3103,16 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
     if (n <= 0) return;
     quantize_q8_1_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y, n);
     check("quantize_q8_1_rows");
+}
+
+void quantize_q8_1_rows_copy(const float* x, int64_t n_rows, int64_t n_cols, void* y, const void* src, void* dst,
+                             int n_words, void* stream) {
+    const long long n = (long long) n_rows * n_cols;
+    const unsigned qblocks = (unsigned) ((n + 255) / 256), cblocks = (unsigned) ((n_words + 255) / 256);
+    if (qblocks + cblocks == 0) return;
+    quantize_q8_1_copy_kernel<<<qblocks + cblocks, 256, 0, (cudaStream_t) stream>>>(
+        x, (block_q8_1*) y, n, qblocks, (const uint32_t*) src, (uint32_t*) dst, n_words);
+    check("quantize_q8_1_rows_copy");
 }
 
 void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
@@ -3085,10 +3217,6 @@ void native_expert_set_mode(int mode, int phase) {
     (void) mode;
     g_exp_phase = phase;
 }
-
-namespace {
-bool g_grouped_v1 = false;
-}  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
 bool native_grouped_v1() { return g_grouped_v1; }

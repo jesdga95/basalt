@@ -2,7 +2,7 @@
 
 Basalt is a local inference engine for mixture-of-experts models: **Qwen3.8-Flash-Next** and **DeepSeek-V4.1-Flash**. It runs on
 an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, with the experts that do not fit in VRAM in system RAM (and optionally
-on more GPUs). The server speaks the OpenAI and Anthropic APIs.
+on more GPUs). The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
 
 <p align="center"><img src="docs/img/frontend.gif" alt="The Basalt web UI while a reply streams" width="720"></p>
 
@@ -15,6 +15,8 @@ on more GPUs). The server speaks the OpenAI and Anthropic APIs.
 - CMake 3.24+, GCC 13+ (Linux), Python 3.10+, and enough system RAM for the experts that do not fit in VRAM.
 
 ## Quick start
+
+Prebuilt Linux and Windows archives are attached to each [release](https://github.com/jesdga95/basalt/releases) ([what they need](docs/platforms.md#release-archives)); otherwise build from source:
 
 ```sh
 git clone https://github.com/jesdga95/basalt && cd basalt
@@ -46,10 +48,12 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 
 | | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash |
 |---|---|---|
-| Packs | 11 packs, default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | 2 packs, `DeepSeek-V4.1-Flash-1017-UD-IQ1_M` and `-UD-IQ2_XXS`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) |
+| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) |
 | Context | default 8,192; `--max-context` sets it | default 8,192; `--max-context` sets it, up to 1,048,576 |
 | Drafting | MTP, on by default | DSpark, on by default |
 | Images | yes | yes |
+| Documents (PDF, text) | yes | yes |
+| Video | yes, with FFmpeg ([video](docs/running.md#video)) | no |
 | Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) |
 | Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) |
 
@@ -59,6 +63,7 @@ All models compared: [models](docs/models/index.md).
 
 - **Run:** [running](docs/running.md), [configuration](docs/configuration/index.md), [models and the router](docs/configuration/models.md),
   [sampling](docs/configuration/sampling.md), [image sources](docs/configuration/image-sources.md),
+  [documents](docs/configuration/documents.md),
   [diagnostics](docs/configuration/diagnostics.md), [basalt-probe](docs/probe.md), [platforms](docs/platforms.md).
 - **Models:** [models](docs/models/index.md), [Flash-Next](docs/models/qwen38-flash-next.md), [DeepSeek](docs/models/deepseek41.md),
   [the `.basalt` file](docs/model-file.md), [file format changes](docs/basalt-file-changelog.md).

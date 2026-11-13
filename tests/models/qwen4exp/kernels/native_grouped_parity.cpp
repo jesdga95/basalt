@@ -591,8 +591,8 @@ int main(int argc, char** argv) {
         for (int dt : {20, 23, 42, 7, 6, 8, 10, 11, 18}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; 256-value blocks: n_ff % 256
     check(14, 8, 2560, 640, s, rng);                                    // Q6_K gate/up, a model's shape
     for (int gu : {22, 18, 23}) check(gu, 6, 2560, 640, s, rng);        // Q5_0 down at a model's shape
-    for (int dt : {10, 11, 18, 22}) check(19, dt, 5120, 2304, s, rng);  // 5120 x 2304 experts: IQ1_S gate/up, K-quant / i-quant down
-    check(16, 10, 5120, 2304, s, rng);
+    for (int dt : {10, 11, 18, 22, 16, 17, 19}) check(19, dt, 5120, 2304, s, rng);   // 5120 x 2304 experts: IQ1_S gate/up, K-quant / i-quant down
+    for (int gu : {16, 17, 18, 21, 22, 42}) check(gu, 10, 5120, 2304, s, rng);   // the gate/up pair kernel at 5120-value rows
     check(40, 40, 512, 256, s, rng);                                    // NVFP4: its own pair, with the scale tail
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(40, 40, 2560, 640, s, rng);

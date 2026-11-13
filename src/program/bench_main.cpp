@@ -70,6 +70,10 @@ namespace {
 
 // ---------------------------------------------------------------------------------------------- small helpers
 
+// Without --engine / --fixtures: the install's own (an unpacked release has them beside this program), else the build's.
+std::string engine_default() { return default_engine(basalt::platform::module_path(), BASALT_BENCH_ENGINE); }
+std::string fixtures_default() { return default_fixtures(basalt::platform::install_root(), BASALT_BENCH_FIXTURES); }
+
 std::string fmt(const char* f, ...) {
     va_list ap;
     va_start(ap, f);
@@ -273,10 +277,12 @@ void usage(const std::string& engine) {
         "                     where the model takes it, else fp8 where it takes that, else its own KV format (the row records the model and the\n"
         "                     KV format used), and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
         "                     default). The decode fixtures and each prefill run in their own fresh engine process, so\n"
-        "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it. prefill_16k_tps and\n"
+        "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it; a row of the same\n"
+        "                     setup (submitter, model, quant, GPUs, CPU, RAM, system) is replaced in place and keeps its notes. prefill_16k_tps and\n"
         "                     prefill_64k_tps = engine tokens/s of those requests; the row also records the CPU, the RAM read speed and, per GPU, the\n"
         "                     PCIe link (maximum generation and width) and the pinned host-to-device copy speed, measured before the engine starts; decode_tps = tokens / decode time\n"
-        "                     summed over conv, struct and prose (token-weighted). Needs NVML for the GPU names, VRAM and enforced power limits. Only\n"
+        "                     summed over conv, struct and prose (token-weighted); the per-fixture decode speeds, acceptance and draft length and the engine\n"
+        "                     arguments are recorded too. Needs NVML for the GPU names, VRAM and enforced power limits. Only\n"
         "                     --model, --submitter, --community-file, --fixtures, --logs and --print-command may be given with it:\n"
         "                     any other option or engine flag would make rows incomparable and is refused\n"
         "  --submitter NAME   the name shown in the table, written into the row (required with --community)\n"
@@ -291,7 +297,7 @@ void usage(const std::string& engine) {
         "  --gpu A,B,..|auto  the GPUs, as for the server and the engine (default: GPU 0 alone). Every\n"
         "                     other --flag is an engine flag, passed on as given (same names as `basalt`; the engine\n"
         "                     rejects a bad one at startup); --print-command shows the command and exits\n"
-        "  --engine BIN       engine binary (default: the one built with this program)\n"
+        "  --engine BIN       engine binary (default: basalt beside this program, else the build's)\n"
         "  --set \"F V ...\"    FLAG VALUE pairs that replace or add engine arguments (repeatable)\n"
         "  --spec N           speculation window for the engine (--spec N, e.g. 7; also --spec after --); without it\n"
         "                     the engine default (speculation with the pack drafter, window 8); --spec 0 is a\n"
@@ -303,7 +309,7 @@ void usage(const std::string& engine) {
         "output\n"
         "  -o md|json         a markdown table (default), or the full detail as JSON on stdout: per-repetition\n"
         "                     values, tokens, drafted, accepted, ms/window, verify ms by window width, GPU names,\n"
-        "                     driver, clocks, model, expert tiers, engine arguments\n"
+        "                     driver, clocks, model, expert tiers, engine arguments, lossy flags\n"
         "  --power-label W    the power limit to print, instead of the one read from the GPU\n"
         "  --logs DIR         keep the engine log, the draft log and the quality rows there\n"
         "  --no-windows       do not ask the engine for the per-window log (no window statistics)\n"
@@ -316,8 +322,8 @@ void usage(const std::string& engine) {
         "                                  the body is the 16384-token depth, cut or repeated to the asked depth,\n"
         "                                  and 4 random ids are inserted before it so the prompt cache cannot match\n"
         "  Prompts: conv  \"Explain how a B-tree differs from an LSM tree, with a worked example of\n"
-        "  each. About 600 words.\" (1200 tokens, temperature 0.6); struct  the JSON-array prompt (8192 tokens,\n"
-        "  temperature 0, 7230 tokens expected); prose  \"Write an essay on the Odyssey.\" (1200 tokens,\n"
+        "  each. About 600 words.\" (1200 tokens, temperature 0.6); struct  the JSON-array prompt (up to 8192 tokens,\n"
+        "  temperature 0); prose  \"Write an essay on the Odyssey.\" (1200 tokens,\n"
         "  temperature 0.6); prefill  40000 characters of filler as the body, then \"In one sentence, what is this\n"
         "  document?\".\n"
         "  Make the files once, on a machine with the model, with the server's own tokenizer and template:\n"
@@ -327,14 +333,27 @@ void usage(const std::string& engine) {
         "      [{'role':'user','content':p}], enable_thinking=False), parse_special=True)\n"
         "      print(','.join(map(str, r(PROMPT))))\"\n"
         "  (for prefill, render with a marker in place of the body and split the ids around it)\n",
-        BASALT_BENCH_FIXTURES);
+        fixtures_default().c_str());
     // the engine's flags are defined once, in the engine: print its own help
-    std::string bin = engine.empty() ? std::string(BASALT_BENCH_ENGINE) : engine;
+    std::string bin = engine.empty() ? engine_default() : engine;
     if (!bin.empty() && fs::exists(bin)) {
         std::printf("\nEngine flags (passed to basalt):\n");
         std::fflush(stdout);
         if (const auto help = basalt::platform::capture_output({bin, "--help"}, true)) std::fputs(help->c_str(), stdout);
     }
+}
+
+// The --submitter a community row needs, as the table checker accepts it; empty when fine, else the message (also in err).
+std::string community_submitter_error(const Options& o, std::string& err) {
+    std::string who = o.submitter;
+    for (char& c : who) c = (char) std::toupper((unsigned char) c);
+    if (who.find_first_not_of(" \t") == std::string::npos || who == "YOUR_NAME")
+        err = "--community needs --submitter NAME, the name shown in the table";
+    else if (o.submitter.size() > 40) err = "--submitter must be at most 40 characters";
+    else
+        for (unsigned char c : o.submitter)
+            if (c < 0x20 || c == 0x7f || std::isspace(c)) err = "--submitter must be one name with no spaces or control characters";
+    return err;
 }
 
 bool parse_args(int argc, char** argv, Options& o, std::string& err) {
@@ -407,26 +426,16 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     }
     if (o.community) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
-                        : !o.spec.empty() ? "--spec" : !o.sets.empty() ? "--set" : !o.engine.empty() ? "--engine"
+                        : !o.spec.empty() ? "--spec" : !o.engine.empty() ? "--engine"
                         : !o.gpu.empty() ? "--gpu" : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
-                        : o.format != "md" ? "-o" : !o.passthrough.empty() ? o.passthrough[0].c_str() : nullptr;
+                        : o.format != "md" ? "-o" : nullptr;   // engine flags (--set, others) are refused in main, which can ask the engine
         if (bad != nullptr) {
             err = std::string("--community runs the fixed preset: ") + bad + " would make the row incomparable";
             return false;
         }
         if (o.model.empty()) { err = "--community needs --model FILE"; return false; }
-        std::string who = o.submitter;
-        for (char& c : who) c = (char) std::toupper((unsigned char) c);
-        if (who.find_first_not_of(" \t") == std::string::npos || who == "YOUR_NAME") {
-            err = "--community needs --submitter NAME, the name shown in the table";
-            return false;
-        }
-        if (o.submitter.size() > 40) { err = "--submitter must be at most 40 characters"; return false; }
-        for (unsigned char c : o.submitter)
-            if (c < 0x20 || c == 0x7f || std::isspace(c)) {
-                err = "--submitter must be one name with no spaces or control characters";
-                return false;
-            }
+        // an engine flag is refused first (in main, which asks the engine whether it is lossy): a run with one needs no submitter
+        if (o.passthrough.empty() && o.sets.empty() && !community_submitter_error(o, err).empty()) return false;
     }
     if (!o.community_file.empty() && !o.community) { err = "--community-file needs --community"; return false; }
     if (o.reps < 1) { err = "-r needs N >= 1"; return false; }
@@ -459,7 +468,6 @@ const Fixture kDecode[] = {
     {"struct", "struct.ids", 8192, 0.0},
     {"prose", "prose.ids", 1200, 0.6},
 };
-constexpr long long kStructTokens = 7230;
 constexpr long long kPrefillBase = 16384;   // the base body's depth in tokens
 constexpr long long kCommunityPrefillShort = 16384, kCommunityPrefillLong = 65536;   // the community preset's depths
 constexpr long long kPrefillBaseDecode = 32;
@@ -538,7 +546,6 @@ struct Result {
     Done d;
     int sm_mhz = -1, mem_mhz = -1;
     WinStats win;
-    bool checksum_bad = false;
 };
 
 double tok_s(const Done& d) { return d.decode_ms > 0 ? (double) d.generated / (d.decode_ms / 1000.0) : 0.0; }
@@ -720,16 +727,38 @@ int main(int argc, char** argv) {
     }
 
     // engine command from the model and the overrides
-    std::string engine_bin = o.engine;
+    const std::string engine_bin = o.engine.empty() ? engine_default() : o.engine;
     std::vector<std::string> args;
     if (!o.model.empty()) {
         args = {"--model", fs::absolute(o.model).string()};
     }
-    if (engine_bin.empty()) engine_bin = BASALT_BENCH_ENGINE;
-    if (o.engine.empty() && std::string(BASALT_BENCH_ENGINE).size() > 0 && fs::exists(BASALT_BENCH_ENGINE)) engine_bin = BASALT_BENCH_ENGINE;
     if (engine_bin.empty() || !fs::exists(engine_bin)) {
         basalt::log::error("basalt-bench", "the engine binary %s does not exist (--engine BIN)", engine_bin.c_str());
         return 2;
+    }
+    if (o.community && (!o.passthrough.empty() || !o.sets.empty())) {
+        // any engine flag is refused; the engine's plan for them says which are lossy, so the refusal can name those
+        std::vector<std::string> extra = o.passthrough;
+        for (const auto& kv : o.sets) {
+            extra.push_back(kv.first);
+            extra.push_back(kv.second);
+        }
+        std::vector<std::string> plan_args = {"--model", fs::absolute(o.model).string(), "--gpu", "0"};
+        merge_args(plan_args, extra);
+        std::string answer;
+        const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
+        (void) engine_plan(engine_bin, plan_args, plan_log, answer);
+        std::error_code rm_ec;
+        fs::remove(plan_log, rm_ec);
+        basalt::log::error("basalt-bench", "%s", basalt::program::community_refusal(extra, answer).c_str());
+        return 2;
+    }
+    if (o.community) {
+        std::string serr;
+        if (!community_submitter_error(o, serr).empty()) {
+            basalt::log::error("basalt-bench", "%s", serr.c_str());
+            return 2;
+        }
     }
     std::string community_model, community_arch;
     std::string community_kv;   // the cache format a community run passes; empty when the model takes neither
@@ -748,7 +777,7 @@ int main(int argc, char** argv) {
         }
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
-        if (o.fixtures.empty()) o.fixtures = fixtures_for(BASALT_BENCH_FIXTURES, answer);
+        if (o.fixtures.empty()) o.fixtures = fixtures_for(fixtures_default(), answer);
     }
     std::vector<std::string> quality_flags;
     if (do_quality && !o.model.empty()) {   // what the gate starts this model with, and the window it scores
@@ -877,6 +906,7 @@ int main(int argc, char** argv) {
     std::map<std::string, std::string> info;
     std::string peer_line;
     std::string engine_args_text;
+    std::string lossy;   // the engine's flags that change the model's output (its INFO lossy=), comma separated
     Quality quality;
 
     // ---- performance session
@@ -914,6 +944,15 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt-bench", "%s", err.c_str());
             return 1;
         }
+        if (eng.info.count("lossy")) {
+            lossy = eng.info["lossy"];
+            if (o.community) {
+                eng.stop();
+                basalt::log::error("basalt-bench", "the engine runs with flags that change the model's output (%s). No row was written.",
+                                   lossy.c_str());
+                return 1;
+            }
+        }
         if (o.community) {
             // every expert must sit in VRAM, the peer GPU or RAM: reads from the file would make the row incomparable
             const char* k = "spill_bytes";
@@ -950,7 +989,6 @@ int main(int argc, char** argv) {
                 const Nvml::Snap s = nvml.snap(0);
                 r.sm_mhz = s.sm_mhz;
                 r.mem_mhz = s.mem_mhz;
-                r.checksum_bad = r.name == "struct" && r.d.generated != kStructTokens;
                 ++n_requests;
                 ++n_decode_requests;
                 basalt::log::raw("  run %d %-7s %.1f tok/s, %lld tokens\n", run, r.name.c_str(), tok_s(r.d), r.d.generated);
@@ -1046,6 +1084,7 @@ int main(int argc, char** argv) {
             if (!eng.start(engine_bin, qa, (fs::path(work) / "engine-quality.log").string(), quality.err)) {
                 basalt::log::error("basalt-bench", "%s", quality.err.c_str());
             } else {
+                if (eng.info.count("lossy")) lossy = eng.info["lossy"];
                 quality.load_s = secs(t0, Clock::now());
                 const auto t1 = Clock::now();
                 const int64_t first = (int64_t) (n_ctx / 2);
@@ -1148,7 +1187,7 @@ int main(int argc, char** argv) {
 
     std::string rep;
     if (o.format == "md" && do_perf) {
-        rep += fmt("basalt-bench  build %s  power limit %s\n\n", BASALT_BENCH_GIT, power.c_str());
+        rep += fmt("basalt-bench  build %s  power limit %s%s\n\n", BASALT_BENCH_GIT, power.c_str(), lossy.empty() ? "" : "  LOSSY");
         std::vector<std::array<std::string, 4>> cells;
         cells.push_back({"test", "t/s", "accept %", "draft len"});
         for (const Row& r : rows) {
@@ -1173,15 +1212,13 @@ int main(int argc, char** argv) {
                 rep += s + "\n";
             }
         }
-        for (const Result& x : results)
-            if (x.checksum_bad && x.run == 1)
-                rep += fmt("\nnote: struct produced %lld tokens, the expected count is %lld\n", x.d.generated, kStructTokens);
     }
     std::string community_row;
     basalt::program::CommunityRow crow;
     if (o.community) {
         // one aggregate per direction over the single cold pass: tokens over time summed across requests
         double pre_tps[2] = {0, 0}, pre_s[2] = {0, 0}, dec_tok = 0, dec_ms = 0;
+        double t_tok[3] = {}, t_ms[3] = {}, t_acc[3] = {}, t_off[3] = {}, t_win[3] = {};   // per decode fixture
         for (const Result& x : results) {
             if (x.name == "prefill") {
                 const int k = x.depth == kCommunityPrefillLong ? 1 : 0;
@@ -1190,6 +1227,14 @@ int main(int argc, char** argv) {
             } else {
                 dec_tok += (double) x.d.generated;
                 dec_ms += x.d.decode_ms;
+                for (int k = 0; k < 3; ++k)
+                    if (x.name == basalt::program::kCommunityTestNames[k]) {
+                        t_tok[k] += (double) x.d.generated;
+                        t_ms[k] += x.d.decode_ms;
+                        t_acc[k] += (double) x.d.accepted;
+                        t_off[k] += (double) x.d.offered;
+                        t_win[k] += window_count(x);   // the table's draft length counts windows the same way
+                    }
             }
         }
         std::string gpu_err;
@@ -1234,6 +1279,18 @@ int main(int argc, char** argv) {
         crow.prefill_16k_tps = pre_tps[0];
         crow.prefill_64k_tps = pre_tps[1];
         crow.decode_tps = dec_tok / (dec_ms / 1000.0);
+        for (int k = 0; k < 3; ++k) {
+            crow.tests[k].decode_tps = t_ms[k] > 0 ? t_tok[k] / (t_ms[k] / 1000.0) : 0.0;
+            if (t_off[k] > 0) {
+                crow.tests[k].accept_pct = 100.0 * t_acc[k] / t_off[k];
+                crow.tests[k].draft_len = t_off[k] / t_win[k];
+            }
+        }
+        // the arguments the preset passed, without the model's path (the row names the model and quant)
+        for (size_t k = 0; k < perf_args.size(); ++k) {
+            if (perf_args[k] == "--model") { ++k; continue; }
+            crow.engine_args += (crow.engine_args.empty() ? "" : " ") + perf_args[k];
+        }
         community_row = basalt::program::community_row_text(crow);
         rep += "\n" + hardware_text(hw, cards);
         rep += fmt("\ncommunity-1: prefill 16K %.1f t/s (%.1f s), prefill 64K %.1f t/s (%.1f s), decode %.1f t/s (%.0f tokens in %.1f s), "
@@ -1251,6 +1308,7 @@ int main(int argc, char** argv) {
             rep += fmt("same top-1 %.2f%%   mean |dlogp| of the base top-1 %.5f\n", quality.top1_pct, quality.dlogp);
         }
     }
+    if (o.format == "md" && !lossy.empty()) rep += "\nLOSSY: lossy flags were on, so these numbers don't compare with a run without them\n";
 
     if (o.format == "json") {
         JW j;
@@ -1282,6 +1340,10 @@ int main(int argc, char** argv) {
         j.end_obj();
         j.key("peer_tier"); j.str(peer_line);
         j.key("engine_args"); j.str(engine_args_text);
+        j.key("lossy");   // the flags that change the model's output; empty for a run of the model as it is
+        j.begin_arr();
+        for (const auto& f : split(lossy, ',')) j.str(f);
+        j.end_arr();
         j.key("summary");
         j.begin_arr();
         for (const Row& r : rows) {
@@ -1324,7 +1386,6 @@ int main(int argc, char** argv) {
                 j.key("hit_pct"); j.num(r.d.lookups > 0 ? 100.0 * (double) r.d.hits / (double) r.d.lookups : 0.0);
                 j.key("hits"); j.integer(r.d.hits);
                 j.key("lookups"); j.integer(r.d.lookups);
-                if (r.name == "struct") { j.key("checksum_ok"); j.boolean(!r.checksum_bad); }
                 if (r.win.present) {
                     j.key("windows"); j.integer(r.win.windows);
                     j.key("mean_t"); j.num(r.win.mean_t);
@@ -1378,15 +1439,24 @@ int main(int argc, char** argv) {
         const std::string path = o.community_file.empty() ? std::string(BASALT_BENCH_SOURCE_DIR) + "/docs/community/benchmarks.json"
                                                           : o.community_file;
         std::string why;
-        std::printf("\nCOMMUNITY ROW:\n%s\n", community_row.c_str());
+        basalt::program::CommunityEdit edit;
+        const bool added = basalt::program::community_add_row_file(path, crow, why, &edit);
+        std::printf("\nCOMMUNITY ROW:\n%s\n", (added ? edit.row_text : community_row).c_str());
         std::fflush(stdout);
-        if (basalt::program::community_add_row_file(path, crow, why))
+        if (added && edit.replaced) {
+            basalt::log::info("basalt-bench", "runs[%zu] of %s has this run's setup (submitter, model, quant, GPUs, CPU, RAM, system): it was updated in "
+                              "place, not added", edit.index, path.c_str());
+            if (!edit.notes.empty())
+                basalt::log::info("basalt-bench", "its notes were kept: \"%s\". Check they still apply to this run", edit.notes.c_str());
+            basalt::log::info("basalt-bench", "review the row, commit it and open a pull request (docs/community.md)");
+        } else if (added) {
             basalt::log::info("basalt-bench", "the row was added to %s; review it, commit it and open a pull request (docs/community.md)",
                               path.c_str());
-        else
+        } else {
             basalt::log::warn("basalt-bench", "the row was not added to %s (%s); paste it at the end of the runs list of docs/community/benchmarks.json, "
                               "run python3 tools/check_benchmarks.py --fix on it and open a pull request (docs/community.md)",
                               path.c_str(), why.c_str());
+        }
     }
     return do_quality && !quality.ran ? 1 : 0;
 }

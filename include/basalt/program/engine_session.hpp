@@ -63,6 +63,15 @@ int engine_plan(const std::string& engine_bin, const std::vector<std::string>& a
 std::string plan_field(const std::string& plan_answer, const std::string& name);
 /// `dir`/<arch> when the model has its own fixtures there, else `dir`.
 std::string fixtures_for(const std::string& dir, const std::string& plan_answer);
+/// The engine a benchmark program starts without --engine: the `basalt` executable beside the program (`self`, its
+/// own path) when there is one, else `built`, where the build wrote it.
+std::string default_engine(const std::string& self, const std::string& built);
+/// The fixtures folder without --fixtures: `root`/data/bench (`root` the install's top) when there is one, else `built`.
+std::string default_fixtures(const std::string& root, const std::string& built);
+/// Why --community refuses the engine flags `extra` (FLAG [VALUE] words from the command line): the lossy ones by
+/// name when the engine's --gpu-plan answer for them (`plan_answer`) lists any, else the first word as a change to
+/// the preset.
+std::string community_refusal(const std::vector<std::string>& extra, const std::string& plan_answer);
 
 std::vector<std::string> split(const std::string& s, char sep);
 bool all_digits(const std::string& s);

@@ -30,7 +30,7 @@ TEMPLATE = Path(__file__).resolve().parents[1] / "chat_template.jinja"
 class Clocked(MockEngine):
     """The mock engine with a DONE line's figures, as ProcessEngine keeps them."""
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         n = 0
         try:
             for t in super().generate(ids, max_new, sampling, cancel, embeddings):
@@ -75,12 +75,13 @@ class Http(unittest.TestCase):
     def test_the_contract(self):
         code, m = self.call("/metrics")
         self.assertEqual(code, 200)
-        self.assertEqual(set(m), {"engine", "live", "requests", "best", "hardware", "hardware_static", "history", "models", "swap"})
+        self.assertEqual(set(m), {"engine", "live", "requests", "best", "totals", "conversation", "hardware", "hardware_static",
+                                 "history", "models", "swap"})
         self.assertEqual(m["best"], {})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
         self.assertEqual(set(m["live"]), {"state", "load", "queued", "slots", "queue", "prompt_tokens", "generated", "elapsed_s",
-                                          "tok_s", "prefill_tok_s_mean"})
+                                          "tok_s", "phase", "prefill_tok_s_mean"})
         self.assertEqual(m["live"]["queue"], [])
         self.assertEqual((m["live"]["state"], m["live"]["queued"]), ("idle", 0))
         self.assertEqual(m["requests"], [])
@@ -88,6 +89,21 @@ class Http(unittest.TestCase):
         self.assertIsInstance(m["hardware"]["gpus"], list)
         self.assertEqual(set(m["hardware_static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
         self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
+
+    def test_the_expert_total_is_reported_with_or_without_spill(self):
+        self.engine.info = {"expert_slots": 24576, "spill_experts": 0, "spill_total": 24576, "spill_bytes": 0}
+        e = self.call("/metrics")[1]["engine"]
+        self.assertEqual((e["expert_slots"], e["expert_total"], e["spill"]), (24576, 24576, None))
+        self.engine.info = {"expert_slots": 9, "spill_experts": 320, "spill_total": 15360, "spill_bytes": 5}
+        e = self.call("/metrics")[1]["engine"]
+        self.assertEqual((e["expert_total"], e["spill"]["experts"]), (15360, 320))
+        self.engine.info = {"expert_slots": 9}                       # an engine that reports no total
+        self.assertIsNone(self.call("/metrics")[1]["engine"]["expert_total"])
+
+    def test_the_experts_card_reads_the_engine_when_there_is_no_ledger(self):
+        js = (TEMPLATE.parent / "web/app.js").read_text(encoding="utf-8")
+        self.assertIn("eng.expert_slots >= eng.expert_total", js)
+        self.assertIn("All in VRAM", js)
 
     def test_the_context_stays_through_a_restart(self):
         self.engine.max_context, self.engine.known_ctx = 0, 16384    # a start under way: no READY yet
@@ -127,12 +143,21 @@ class Http(unittest.TestCase):
                 {"id": "r_0002", "time": 2.0, "output_tokens": 100, "decode_tok_s": 500.0, "prompt_tokens": 5000,
                  "reused": 2000, "prompt_ms": 100.0},                      # too short for either
                 {"id": "r_0003", "time": 3.0, "output_tokens": 256, "decode_tok_s": 120.0, "prompt_tokens": 100,
-                 "reused": None, "prompt_ms": 10.0}]
+                 "reused": None, "prompt_ms": 10.0},
+                {"id": "r_0004", "time": 4.0, "output_tokens": 0, "decode_tok_s": None, "prompt_tokens": 197798,
+                 "reused": 0, "prompt_ms": 9.1}]          # a whole prompt beside one run's read time: no record
         for r in rows:
             self.svc._note_best(r)
         best = self.call("/metrics")[1]["best"]
         self.assertEqual(best["decode"], {"tok_s": 120.0, "id": "r_0003", "time": 3.0, "output_tokens": 256})
         self.assertEqual(best["prefill"], {"tok_s": 4000.0, "id": "r_0001", "time": 1.0, "read_tokens": 8000})
+
+    def test_best_belongs_to_the_engine_that_made_it(self):
+        self.svc._note_best({"id": "r_0001", "time": 1.0, "output_tokens": 300, "decode_tok_s": 400.0,
+                             "prompt_tokens": 9000, "reused": 0, "prompt_ms": 1000.0})
+        self.assertEqual(set(self.call("/metrics")[1]["best"]), {"decode", "prefill"})
+        self.engine.gen = 2                       # a restarted engine: another model, other flags, a crash
+        self.assertEqual(self.call("/metrics")[1]["best"], {})
 
     def test_a_request_waiting_for_the_single_stream_is_queued(self):
         self.engine.delay = 0.05

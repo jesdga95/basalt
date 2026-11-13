@@ -86,6 +86,9 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
 /// nodes that follow.  Captured once per layer between `pre[l]` and the parts copy; it is what lets one graph
 /// hold the whole token (a handoff needs no driver call).
 void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream);
+/// Holds the stream until *word (mapped host memory the host writes) equals `value`, then fences so what the host wrote
+/// before the word is visible to the work queued after it.
+void wait_word(const uint32_t* word, uint32_t value, void* stream);
 
 /// Token graph: copy `n` floats from MAPPED pinned host memory (`src` is its device pointer) into
 /// device memory with a kernel, so the handoff stays on the compute queue (a memcpy node is a copy-engine
@@ -93,8 +96,10 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream);
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 /// `rows` rows of `width` floats from mapped memory, except the rows listed in hit_rows[0, *count) (device),
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
-/// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).
-void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream);
+/// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).  With
+/// `count` (device), only r < *count: n is then the most there can be.
+void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream,
+                      const int32_t* count = nullptr);
 void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
                            const int32_t* count, void* stream);
 

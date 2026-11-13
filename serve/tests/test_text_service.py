@@ -20,17 +20,17 @@ class TextEngine(MockEngine):
     """Counts the text like an engine would (one token per byte here) and answers with the script."""
     takes_text = True
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         if isinstance(ids, PromptText):
             self.seen_text = ids.text
             n = len(ByteTokenizer().encode(ids.text, parse_special=True))   # what an engine would count
             room = CTX - CTX_SLACK - n
             if ids.clip:
                 if room < 1:
-                    raise ValueError(ids.explain(f"prompt ({n} tokens) leaves no room to answer in the context ({CTX})"))
+                    raise ValueError(ids.explain(f"context_no_room prompt={n} context={CTX}: prompt ({n} tokens) leaves no room to answer in the context ({CTX})"))
                 max_new = min(max_new, room)
             elif max_new > room:
-                raise ValueError(ids.explain(f"prompt ({n} tokens) + max_new ({max_new}) exceeds the context ({CTX})"))
+                raise ValueError(ids.explain(f"context_overflow prompt={n} max_new={max_new} context={CTX}: prompt ({n} tokens) + max_new ({max_new}) exceeds the context ({CTX})"))
             ids.set_counted(n, max_new)
             yield None
             ids = ids.ids()

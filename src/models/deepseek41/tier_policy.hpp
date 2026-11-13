@@ -10,6 +10,8 @@ constexpr int kPromoteWindow = 64;              // tokens within which a repeat 
 constexpr int kAdmitWindow = 256;               // tokens within which a repeat file miss earns a pinned slot
 constexpr int kSwapsPerToken = 2;               // pinned-slot swaps started per token
 constexpr uint64_t kPieceBytes = 1ull << 20;    // largest single promotion copy
+constexpr int kPeerGapPieces = 3;               // second card exchange pieces per layer: about what one head leaves its bus
+constexpr uint64_t kPeerMoveAge = 1280;         // lookups (~32 windows) the second card's victim must be older than the main card's
 
 /// `last` is the token + 1 of the previous miss of an expert (0 = never); true when it falls within `window` tokens.
 inline bool repeat_miss(uint64_t last, uint64_t token, int window) {
@@ -64,6 +66,22 @@ inline int bus_count(int pinned, int file) {
     const int n = m - cpu;
     return n < 0 ? 0 : n > pinned ? pinned : n;
 }
+
+/// Scratch slots on a second card for the misses its own link fetches: the most a layer sends it.
+constexpr int kPeerFetchSlots = 4;
+
+/// Of the bus's misses (bus_count), how many a second card fetches over its own link and computes, the main card's link
+/// taking the rest. A copy takes longer than a CPU expert, so one link carrying as many misses as the CPU ends well after
+/// it: half of them, rounded down, go over the second card's link instead. When the CPU has one more, it ends last
+/// anyway, and a second link would only slow it.
+inline int peer_bus_count(int pinned, int file) {
+    const int bus = bus_count(pinned, file);
+    return 2 * bus >= pinned + file ? bus / 2 : 0;
+}
+
+/// The second card's share is queued before its plan, so its grouped kernels run this many groups side by side and stride
+/// over the rest: about the experts a window of `n_tok` rows sends it.
+inline int64_t peer_groups(int n_tok) { return 2 * (int64_t) n_tok + 1; }
 
 /// Copies of at most kPieceBytes needed for `bytes`.
 inline int pieces(uint64_t bytes) { return (int) ((bytes + kPieceBytes - 1) / kPieceBytes); }

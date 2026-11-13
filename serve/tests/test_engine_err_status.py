@@ -29,7 +29,7 @@ BODIES = [("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi
 class ErrEngine(MockEngine):
     err = None
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         yield None
         raise request_err(self.err)
 

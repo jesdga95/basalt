@@ -99,6 +99,7 @@ public:
     /// that finishes early claims another: the more and smaller the tasks, the shorter the wait for the slowest one
     /// at the end of a phase, until the claim traffic and the short streams cost more than the tail they remove.
     static constexpr int kTasksPerThread = 12;
+    static constexpr int kTasksPerThreadAvx2 = 8;   // the native multi-token path on AVX2
     /// Work for the parked workers between batches (not the host thread): `fn(ctx, worker, workers, stop)` runs once
     /// per worker index and must return soon after `stop` reads true.  Returns at once.  The next batch, `idle_stop`
     /// or the destructor raises `stop`, ends the claims and waits for every claimed job to return, so the work never
@@ -115,17 +116,18 @@ public:
     /// contention being measured.
     long long pauses() const { return 0; }
 
-    /// **A PARKED WORKER WAITS THIS LONG, THEN SLEEPS.**  The park spins (then yields, see `kSpinBeforeYield`)
-    /// because a layer's batches are microseconds apart and a wake-up from the OS costs more than that.  But a wait
-    /// that never ends keeps every worker's core at 100% while the engine waits for a request.  Between requests the
-    /// workers block on `sleep_cv_`.
+    /// **A PARKED WORKER WAITS THIS LONG, THEN SLEEPS.**  The park spins (see `kYieldEvery`) because a layer's
+    /// batches are microseconds apart and a wake-up from the OS costs more than that.  But a wait that never ends
+    /// keeps every worker's core at 100% while the engine waits for a request.  Between requests the workers block on
+    /// `sleep_cv_`.
     /// NOT only between requests: with most experts in VRAM many layers have no CPU work, so the workers also sleep
     /// mid-request - which the claim protocol above must survive.
     static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
-    /// A parked worker spins this long, then yields its core on every check until the next batch or the sleep: a
-    /// short wait keeps the core, a long gap between batches gives it to any runnable thread, such as a worker the OS
-    /// put on this core in the middle of its task.  With nothing else runnable the yield returns at once.
-    static constexpr std::chrono::microseconds kSpinBeforeYield{50};
+    /// A parked worker pauses, and yields its core once every this long until the next batch or the sleep: a thread
+    /// the OS queued behind it (a worker taken off this core in the middle of its task when the threads outnumber the
+    /// cores, or another program's) waits at most this long.  With nothing else runnable the yield returns at once.
+    /// Between the yields the spin makes no system call: one per check would draw power the cores still working lack.
+    static constexpr std::chrono::microseconds kYieldEvery{50};
     /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
     /// spinning forever, and the server starts it again.
     static constexpr std::chrono::seconds kStall{60};
@@ -138,6 +140,9 @@ private:
     /// quantization, and the down projection into the job's outputs.
     void native_gu_range(int e, int r0, int r1);
     void native_quantize(int e);
+    /// A down part that finds its expert's intermediate not yet quantized: prefetch its `bytes` of down rows at `p`
+    /// while the gate/up parts finish, stopping early once they have.
+    void prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const;
     void native_down_range(int e, int r0, int r1);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
@@ -203,7 +208,10 @@ private:
         std::atomic<int> ready{0};
     };
     std::unique_ptr<FusedExpert[]> fused_;
-    int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1;
+    int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1, fused_tail_ = 1;
+    /// The first row of `part` of `parts` over `rows` rows (`part == parts` gives `rows`): equal parts, then
+    /// `fused_tail_` quarter-size ones.
+    int part_row(int part, int parts, int rows) const;
     /// Sets up one batch of at most kMaxSplitMulti experts: its parts per expert; the tasks it makes and the gate/up
     /// share of its bytes.
     int split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int n, double& gu_share);

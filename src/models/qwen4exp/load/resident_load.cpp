@@ -51,7 +51,7 @@ int resident_load(Context& context) {
         // the copy leaves the reserve free (or the legacy headroom, when larger), and the driver's tracking of the
         // buffers whose RAM is held for them
         const uint64_t reserve = basalt::platform::ram_reserve();
-        const uint64_t resident_headroom =
+        uint64_t resident_headroom =
             std::max(o.resident_headroom, reserve) + basalt::core::pin_tracking_bytes(basalt::core::host_plan_bytes());
         // the adaptive swaps' exchange buffers, before the copy reads the free memory
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !adapt_fast_on &&
@@ -60,13 +60,18 @@ int resident_load(Context& context) {
             return 1;
         }
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
-        // are read from the file.  Every host buffer the engine takes later is allocated or held by now, so the copy
-        // takes what is above that, less the driver's tracking of its own pages.
+        // are read from the file through the OS file cache, which keeps its floor free beside the reserve.  Every
+        // host buffer the engine takes later is allocated or held by now, so the copy takes what is above that, less
+        // the driver's tracking of its own pages.
+        src.set_file_cache(*context.file_cache);
         {
             const uint64_t gpu_held = std::min(expert_total_bytes, cache_fill_bytes + peer_only_bytes);
             const uint64_t complement = expert_total_bytes - gpu_held;
             basalt::core::detail::HostMemory hm;
             const uint64_t avail = basalt::core::detail::host_available_memory(hm) ? hm.available : 0;
+            const uint64_t cache_keep =
+                basalt::core::file_cache_keep(avail, resident_headroom, o.resident_pin, complement, *context.file_cache);
+            resident_headroom += cache_keep;
             const uint64_t room = basalt::core::ram_tier_room(avail, resident_headroom, o.resident_pin);
             const uint64_t copy =
                 std::min({o.resident_budget > 0 ? o.resident_budget : auto_resident_bytes, complement, room});
@@ -76,12 +81,13 @@ int resident_load(Context& context) {
                 if (o.resident_budget > 0 && o.resident_budget > room) {
                     return fatal_start_error(
                         "--resident-budget-gib " + gib_text(o.resident_budget) + " too high: " + gib_text(avail) +
-                        " GiB free, " + gib_text(resident_headroom) + " GiB reserve and the driver's page tracking; max " +
+                        " GiB free, " + gib_text(resident_headroom) + " GiB reserve, file cache and the driver's page "
+                        "tracking; max " +
                         gib_text(room));
                 }
-                basalt::log::info("basalt generate", "RAM floor %.1f GiB of %.1f GiB free, %.1f GiB experts on SSD, RAM "
-                                     "copy <= %.1f GiB", (double) (avail - room) / kGiB, (double) avail / kGiB,
-                                  (double) file_bytes / kGiB,
+                basalt::log::info("basalt generate", "RAM floor %.1f GiB (%.1f file cache) of %.1f GiB free, %.1f GiB "
+                                     "experts on SSD, RAM copy <= %.1f GiB", (double) (avail - room) / kGiB,
+                                  (double) cache_keep / kGiB, (double) avail / kGiB, (double) file_bytes / kGiB,
                                   (double) (o.resident_budget > 0 ? std::min(o.resident_budget, room) : room) / kGiB);
             }
         }

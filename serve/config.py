@@ -12,7 +12,7 @@ from pathlib import Path
 from serve import ROOT
 from serve.engine.flags import flag_index
 from serve.engine.image_source import parse_url_host
-from serve.engine.vision import VISION_MODES, VISION_USAGE, vision_mode
+from serve.engine.vision import VIDEO_MAX_TOKENS, VISION_MODES, VISION_USAGE, vision_mode
 from serve.util.console import tagged
 
 
@@ -25,7 +25,7 @@ ENTRY_OPTIONS = frozenset({"model", "alias"})
 MODEL_OPTIONS = frozenset({
     "gpu", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
     "grammar", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
-    "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed"})
+    "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
 
 
@@ -108,6 +108,13 @@ def option_words(where: str, key, value, act, here: Path) -> list[str]:
         try:
             return ["--vision", vision_mode(value)]
         except ValueError as e:
+            raise ValueError(f"{where}.{key}: {e}") from None
+    if name == "answer-room":                          # auto, or a whole number of tokens as a number or a string
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError(f'{where}.{key}: "auto" or a whole number of tokens (0 = none), not {value!r}')
+        try:
+            return [flag, str(answer_room(str(value)))]
+        except argparse.ArgumentTypeError as e:
             raise ValueError(f"{where}.{key}: {e}") from None
     if act.nargs == 0:                                 # a switch
         if not isinstance(value, bool):
@@ -485,6 +492,30 @@ def budget_count(text: str) -> int:
     return n
 
 
+def answer_room(text: str) -> str | int:
+    """argparse type: auto, or a whole number of tokens >= 0 (0: none)."""
+    if text == "auto":
+        return text
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected auto or a whole number of tokens >= 0, not {text!r}") from None
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"expected auto or a whole number of tokens >= 0, not {n}")
+    return n
+
+
+def video_tokens(text: str) -> int:
+    """argparse type: a video's token budget, a whole number from 64 to 65536."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number from 64 to 65536, not {text!r}") from None
+    if not 64 <= n <= 65536:
+        raise argparse.ArgumentTypeError(f"expected a whole number from 64 to 65536, not {n}")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)
@@ -580,7 +611,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--thinking-loop-tokens", type=budget_count, default=256, metavar="N",
                     help="end the thinking and let the model answer when it repeats one token this many times in a "
                          "row inside the thinking (0 = never)")
-    ap.add_argument("--answer-room", action=argparse.BooleanOptionalAction, default=True,
-                    help="reserve space for closing the thinking and the answer when the output cap is at least 1024 tokens; "
-                         "an explicit request budget of 0 opts out")
+    ap.add_argument("--video-max-tokens", type=video_tokens, default=VIDEO_MAX_TOKENS, metavar="N",
+                    help=f"the most image tokens one video may take over all its frames (default {VIDEO_MAX_TOKENS}): "
+                         "frames are sampled at 2 a second (4 to 768; a request's video part may ask fps and "
+                         "max_frames) and scaled down together to fit")
+    ap.add_argument("--answer-room", type=answer_room, default="auto", metavar="auto|N",
+                    help="output tokens kept for closing the thinking and the answer: auto (a quarter of the cap, at "
+                         "least 512, at most half) or a whole number of tokens (0 = none); an explicit request budget "
+                         "of 0 opts out")
     return ap

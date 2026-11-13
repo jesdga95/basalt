@@ -1,14 +1,15 @@
-// src/kernels/cuda/gu2.cuh - DEC_GU2=1: the grouped gate/up rows of the grid formats (IQ2_XXS, IQ2_XS,
-// IQ2_S, IQ3_XXS, IQ3_S), Q2_0 and IQ4_XS with n_embd 2560, two rows a warp.  Included by iq_kernels.cu (its Split / Fmt / grid
-// helpers).
+// src/kernels/cuda/gu2.cuh - DEC_GU2=1: the grouped gate/up rows of the grid formats (IQ1_S, IQ2_XXS, IQ2_XS,
+// IQ2_S, IQ3_XXS, IQ3_S), Q2_0 and IQ4_XS with n_embd 2560 or 5120, two rows a warp.  Included by iq_kernels.cu (its
+// Split / Fmt / grid helpers).
 //
-// Bitwise native_gu_multi_kernel's: each lane sums the calls k = lane, lane + 32, lane + 64 of a row in that order
-// (fused multiply-adds of the block scale product and the integer sum, as the contracted `s += apply`), then the
-// same warp_sum.  The 80 calls of a row leave the third pass half idle, so a warp takes two rows: the third pass
-// runs row A's call on lanes 0..15 and row B's on lanes 16..31, and row B's scale and sum go to lane - 16 by shuffle
-// before its add.  The weight side differs only in how the same integers are made: the part's words are aligned
-// 32-bit loads funnel-shifted to the 2-byte block layout, the grid table is in shared memory for every format, and
-// a sign byte's masks come from prmt's sign-replicating mode instead of the SIMD compare and subtract.
+// Bitwise native_gu_multi_kernel's: each lane sums the calls k = lane, lane + 32, ... of a row in that order (fused
+// multiply-adds of the block scale product and the integer sum, as the contracted `s += apply`), then the same
+// warp_sum.  A warp takes two rows, so each activation load serves both.  At n_embd 2560 the 80 calls of a row
+// leave the third pass half idle: it runs row A's call on lanes 0..15 and row B's on lanes 16..31, and row B's
+// scale and sum go to lane - 16 by shuffle before its add.  At 5120 a row is five whole passes.  The weight side
+// differs only in how the same integers are made: the part's words are aligned 32-bit loads funnel-shifted to the
+// 2-byte block layout, the grid table is in shared memory for every format, and a sign byte's masks come from
+// prmt's sign-replicating mode instead of the SIMD compare and subtract.
 #pragma once
 
 namespace gu2 {
@@ -65,6 +66,40 @@ __device__ __forceinline__ int dp8_ls2(const int (&g)[8], const block_q8_1* __re
 // load(row, k, grid): call k (block k / 8, part k % 8) of a row as Split<TY>::load makes it; apply(w, x, d, f): the
 // scale product d and the integer sum f of Split<TY>::apply (which returns d * f) against x, the call's q8_1 block.
 template<int TY> struct Fmt2;
+
+template<> struct Fmt2<19> {   // IQ1_S: 50-byte blocks (d, qs[32], qh[8] as 16-bit words)
+    static constexpr int kGridWords = 2048;
+    using W = Split<19>::W;
+    __device__ static W load(const uint8_t* row, int k, const uint32_t* grid) {
+        const uint8_t* b = row + (k >> 3) * 50;
+        const int j = k & 7;
+        const uint32_t qs = int_at(b + 2 + 4 * j);
+        const uint32_t qh = __ldg((const unsigned short*) (b + 34 + 2 * j));
+        W r;
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const uint32_t g = grid[((qs >> 8 * p) & 0xffu) | (((qh >> 3 * p) & 0x07u) << 8)];
+            r.g[2 * p + 0] = (int) (g & 0x0F0F0F0Fu);
+            r.g[2 * p + 1] = (int) ((g >> 4) & 0x0F0F0F0Fu);
+        }
+        r.ls = (int) ((qh >> 11) & 0x0Eu) + 1;
+        r.delta = -1.0f + IQ1S_DELTA - (int) (qh & 0x8000u) * (2.0f * IQ1S_DELTA / 0x8000);
+        r.dw = __half2float(*(const __half*) b);
+        return r;
+    }
+    // Split<19>::apply's d1q * ds * (sumi + delta * sumy): the two products, then the sum as one fused add
+    __device__ static void apply(const W& r, const block_q8_1* __restrict__ x, float& d, float& f) {
+        int sumi = 0, sumy = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int u = get_int_b4(x->qs, j);
+            sumi = ggml_cuda_dp4a(r.g[j], u, sumi);
+            sumy = ggml_cuda_dp4a(u, 0x01010101, sumy);
+        }
+        d = __fmul_rn(r.dw * r.ls, __low2float(x->ds));
+        f = __fmaf_rn(r.delta, (float) sumy, (float) sumi);
+    }
+};
 
 template<> struct Fmt2<16> {   // IQ2_XXS: 66-byte blocks
     static constexpr int kGridWords = 512;
@@ -280,8 +315,8 @@ __device__ __forceinline__ const uint32_t* table_grid() {
 }
 
 // rows r0, r0 + 1 (gate or up rows r of `dst`; row A at rowA, row B row_bytes after it) for the n <= NC entries
-// from e: entry e + c's activation is xq + ent_tok[e + c] * 80 (2560 values)
-template<int TY, int NC>
+// from e: entry e + c's activation is xq + ent_tok[e + c] * KC (KC calls a row, one q8_1 block each: 80 or 160)
+template<int TY, int NC, int KC>
 __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r, int e, int n,
                                       const int32_t* __restrict__ ent_tok, const block_q8_1* __restrict__ xq,
                                       float* __restrict__ dst, int n_ff, const uint32_t* grid, int lane) {
@@ -289,12 +324,13 @@ __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r,
     const uint8_t* rowB = rowA + row_bytes;
     const block_q8_1* xc[NC];
 #pragma unroll
-    for (int c = 0; c < NC; ++c) xc[c] = xq + (size_t) ent_tok[e + min(c, n - 1)] * 80;
+    for (int c = 0; c < NC; ++c) xc[c] = xq + (size_t) ent_tok[e + min(c, n - 1)] * KC;
     float sA[NC], sB[NC];
 #pragma unroll
     for (int c = 0; c < NC; ++c) sA[c] = sB[c] = 0.0f;
+    static_assert(KC == 80 || KC == 160, "a row is 2560 or 5120 values");
 #pragma unroll
-    for (int it = 0; it < 2; ++it) {
+    for (int it = 0; it < KC / 32; ++it) {
         const int k = lane + 32 * it;
         const typename F::W wa = F::load(rowA, k, grid);
         const typename F::W wb = F::load(rowB, k, grid);
@@ -309,18 +345,25 @@ __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r,
             }
         }
     }
-    const int k2 = 64 + (lane & 15);
-    const typename F::W w2 = F::load(lane < 16 ? rowA : rowB, k2, grid);
+    if constexpr (KC % 32 != 0) {
+        const int k2 = KC - 16 + (lane & 15);
+        const typename F::W w2 = F::load(lane < 16 ? rowA : rowB, k2, grid);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (c < n) {
+                float d, f;
+                F::apply(w2, xc[c] + k2, d, f);
+                const float dB = __shfl_down_sync(0xffffffffu, d, 16), fB = __shfl_down_sync(0xffffffffu, f, 16);
+                if (lane < 16) {
+                    sA[c] = __fmaf_rn(d, f, sA[c]);
+                    sB[c] = __fmaf_rn(dB, fB, sB[c]);
+                }
+            }
+        }
+    }
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
         if (c < n) {
-            float d, f;
-            F::apply(w2, xc[c] + k2, d, f);
-            const float dB = __shfl_down_sync(0xffffffffu, d, 16), fB = __shfl_down_sync(0xffffffffu, f, 16);
-            if (lane < 16) {
-                sA[c] = __fmaf_rn(d, f, sA[c]);
-                sB[c] = __fmaf_rn(dB, fB, sB[c]);
-            }
             sA[c] = warp_sum(sA[c]);
             sB[c] = warp_sum(sB[c]);
             if (lane == 2 * c) dst[(size_t) (e + c) * n_ff + r] = sA[c];
@@ -330,7 +373,7 @@ __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r,
 }
 
 // gate/up rows row, row + 1 (0 .. 2 n_ff: both gate or both up rows) of the expert at `blob`, entries [e0, e1)
-template<int TY>
+template<int TY, int KC = 80>
 __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e1, const int32_t* __restrict__ ent_tok,
                                      const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
                                      float* __restrict__ gate, float* __restrict__ up, const uint32_t* grid, int lane) {
@@ -342,51 +385,59 @@ __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e
     for (int e = e0; e < e1;) {
         const int n = e1 - e;
         if (n == 1) {
-            rows2<TY, 1>(wr, rb, r, e, 1, ent_tok, xq, dst, n_ff, grid, lane);
+            rows2<TY, 1, KC>(wr, rb, r, e, 1, ent_tok, xq, dst, n_ff, grid, lane);
             e += 1;
         } else if (n == 2) {
-            rows2<TY, 2>(wr, rb, r, e, 2, ent_tok, xq, dst, n_ff, grid, lane);
+            rows2<TY, 2, KC>(wr, rb, r, e, 2, ent_tok, xq, dst, n_ff, grid, lane);
             e += 2;
         } else if (n == 3) {
-            rows2<TY, 3>(wr, rb, r, e, 3, ent_tok, xq, dst, n_ff, grid, lane);
+            rows2<TY, 3, KC>(wr, rb, r, e, 3, ent_tok, xq, dst, n_ff, grid, lane);
             e += 3;
         } else {
-            const int m = min(n, 6);
-            rows2<TY, 6>(wr, rb, r, e, m, ent_tok, xq, dst, n_ff, grid, lane);
+            // 5120-value rows three entries at a time: the decode then fits kGu2MinBlocks' registers
+            constexpr int kNC = KC == 160 ? 3 : 6;
+            const int m = min(n, kNC);
+            rows2<TY, kNC, KC>(wr, rb, r, e, m, ent_tok, xq, dst, n_ff, grid, lane);
             e += m;
         }
     }
 }
 
 // pair() for a layer with gate rows of TG and up rows of TU: the up rows read TU's grid from the device table
-template<int TG, int TU>
+template<int TG, int TU, int KC = 80>
 __device__ __forceinline__ void pair_gu(const uint8_t* blob, int row, int e0, int e1, const int32_t* __restrict__ ent_tok,
                                         const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
                                         float* __restrict__ gate, float* __restrict__ up, const uint32_t* grid, int lane) {
     if constexpr (TG != TU) {
         if (row >= L.n_ff) {
-            pair<TU>(blob, row, e0, e1, ent_tok, xq, L, gate, up, table_grid<TU>(), lane);
+            pair<TU, KC>(blob, row, e0, e1, ent_tok, xq, L, gate, up, table_grid<TU>(), lane);
             return;
         }
     }
-    pair<TG>(blob, row, e0, e1, ent_tok, xq, L, gate, up, grid, lane);
+    pair<TG, KC>(blob, row, e0, e1, ent_tok, xq, L, gate, up, grid, lane);
 }
 
 }  // namespace gu2
 
-template<int TG> inline constexpr bool kGu2 = TG == 16 || TG == 17 || TG == 18 || TG == 21 || TG == 22;
+template<int TG> inline constexpr bool kGu2 = TG == 16 || TG == 17 || TG == 18 || TG == 19 || TG == 21 || TG == 22;
 // the grid formats and Q2_0 (the grouped launch and the peer kernel's Q2_0 build)
 template<int TG> inline constexpr bool kGu2Q2 = kGu2<TG> || TG == 42;
 constexpr int GU2_ROWS = 16;   // rows per block: two a warp
+// three blocks an SM at 5120-value rows, where a format's decode fits the 80 registers that leaves (IQ2_S's and
+// IQ3_S's would spill); the 2560-value rows as they were
+template<int TG, int KC> inline constexpr int kGu2MinBlocks = KC == 160 && TG != 21 && TG != 22 ? 3 : 1;
 
-// native_gu_multi_kernel's rows, GU2_ROWS a block; the same group stride.  TU: the up rows' type.
-template<int TG, int TU = TG>
-__global__ void __launch_bounds__(256) native_gu2_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                         const int32_t* __restrict__ grp_start,
-                                                         const int32_t* __restrict__ n_groups,
-                                                         const int32_t* __restrict__ ent_tok,
-                                                         const block_q8_1* __restrict__ xq, NativeExpertLayout L,
-                                                         float* __restrict__ gate, float* __restrict__ up) {
+// native_gu_multi_kernel's rows, GU2_ROWS a block; the same group stride.  TU: the up rows' type; KC: calls a row.
+template<int TG, int TU = TG, int KC = 80>
+__global__ void __launch_bounds__(256, kGu2MinBlocks<TG, KC>)
+native_gu2_kernel(const unsigned long long* __restrict__ grp_ptr,
+                  const int32_t* __restrict__ grp_start,
+                  const int32_t* __restrict__ n_groups,
+                  const int32_t* __restrict__ ent_tok,
+                  const block_q8_1* __restrict__ xq,
+                  NativeExpertLayout L,
+                  float* __restrict__ gate,
+                  float* __restrict__ up) {
     asm volatile("griddepcontrol.launch_dependents;");   // the down kernel may start (it waits for this grid)
     const int ng = *n_groups;
     if ((int) blockIdx.y >= ng) return;
@@ -396,13 +447,14 @@ __global__ void __launch_bounds__(256) native_gu2_kernel(const unsigned long lon
     const int row = blockIdx.x * GU2_ROWS + 2 * warp;          // rows row, row + 1: both gate or both up
     if (row >= 2 * L.n_ff) return;
     for (int g = blockIdx.y; g < ng; g += gridDim.y)
-        gu2::pair_gu<TG, TU>((const uint8_t*) grp_ptr[g], row, grp_start[g], grp_start[g + 1], ent_tok, xq, L, gate, up,
-                             s_grid, lane);
+        gu2::pair_gu<TG, TU, KC>((const uint8_t*) grp_ptr[g], row, grp_start[g], grp_start[g + 1], ent_tok, xq, L, gate,
+                                 up, s_grid, lane);
 }
 
-// whether native_gu2_kernel takes L's gate/up rows: 2560 values a row (80 calls), an even n_ff, 4-byte aligned rows
-__host__ __device__ inline bool gu2_usable(const NativeExpertLayout& L) {
-    return L.n_embd == 2560 && L.n_ff % 2 == 0 && L.gu_row % 4 == 0 && L.up_row % 4 == 0 && L.up_off % 4 == 0;
+// whether native_gu2_kernel<.., KC> takes L's gate/up rows: KC calls a row (32 KC values), an even n_ff, 4-byte
+// aligned rows
+__host__ __device__ inline bool gu2_usable(const NativeExpertLayout& L, int kc = 80) {
+    return L.n_embd == 32 * kc && L.n_ff % 2 == 0 && L.gu_row % 4 == 0 && L.up_row % 4 == 0 && L.up_off % 4 == 0;
 }
 
 // The layers whose gate and up rows differ in type, as (gate, up) pairs: the kernels are built for these mixes only.

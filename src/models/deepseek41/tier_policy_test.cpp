@@ -51,6 +51,22 @@ int main() {
             CHECK(p + f - b >= f);   // the CPU always takes every file-backed miss
         }
 
+    // the second card's link: half the bus's misses, rounded down, when the bus has as many as the CPU
+    CHECK(peer_bus_count(1, 0) == 0);
+    CHECK(peer_bus_count(2, 0) == 0);
+    CHECK(peer_bus_count(3, 0) == 0);
+    CHECK(peer_bus_count(4, 0) == 1);
+    CHECK(peer_bus_count(5, 0) == 0);
+    CHECK(peer_bus_count(6, 0) == 1);
+    CHECK(peer_bus_count(8, 0) == 2);
+    CHECK(peer_bus_count(3, 1) == 1);   // the file-backed miss and a pinned one on the CPU, two pinned on the bus
+    CHECK(peer_bus_count(1, 3) == 0);
+    for (int p = 0; p <= 16; ++p)
+        for (int f = 0; f <= 16 - p; ++f) {
+            const int n = peer_bus_count(p, f);
+            CHECK(n >= 0 && n <= bus_count(p, f) - n);   // the main card's link keeps at least as many
+        }
+
     // homes: a RAM shortfall puts homes on the main card, with or without a second card; RAM that takes the rest leaves
     // the main card all copies
     {

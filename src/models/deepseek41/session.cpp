@@ -2,11 +2,13 @@
 //
 // Per layer: Engram (on its layers), hyper-connection mixes and collapse, attention, expansion, the FFN's mixes and
 // collapse, router, routed and shared experts, expansion. Prefill runs the same path token by token.
+#include "basalt/core/device.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/session.hpp"
 #include "basalt/ggml/ggml.h"
 
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
@@ -24,12 +26,14 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
 
 #include "basalt/artifact/dequant.hpp"
+#include "models/deepseek41/engram_rows.hpp"
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -48,9 +52,13 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(DsModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
+        for (auto& reads : eread_)   // reads still out land in eraw_ before it goes
+            for (ngram::PleReader::Ticket& t : reads) finish_read(t);
         for (void* p : allocs_) cudaFree(p);
         if (h_next_) cudaFreeHost(h_next_);
+        if (h_emb4_) cudaFreeHost(h_emb4_);
         if (h_dfeat_) cudaFreeHost(h_dfeat_);
+        if (feat_ev_) cudaEventDestroy(feat_ev_);
         for (cudaGraphExec_t e : head_g_)
             if (e) cudaGraphExecDestroy(e);
         for (cudaGraphExec_t e : tail_g_)
@@ -95,13 +103,20 @@ public:
             p = (float*) v;
             return true;
         };
-        const size_t cols = (size_t) m_.pack().engram.hash.n_cols() * 256;
+        const EngramInfo& en = m_.pack().engram;
+        const size_t cols = (size_t) en.hash.n_cols() * 256;
+        eids_.resize((size_t) en.hash.n_cols() * W);
+        erows_.resize(eids_.size());
+        eraw_.assign(en.layers.size(), std::vector<uint8_t>(eids_.size() * en.row_bytes));
+        eread_.resize(en.layers.size());
+        efirst_ = (size_t) (std::min_element(en.layers.begin(), en.layers.end()) - en.layers.begin());
         bool ok = buf(x_, 4 * n * W) && buf(x2_, 4 * n * W) && buf(cur_, n * W) && buf(normed_, n * W) &&
                   buf(attn_out_, n * W) && buf(moe_out_, n * W) && buf(sh_out_, n * W) && buf(ffn_sum_, n * W) &&
                   buf(coef_a_, kHcCoef * W) && buf(coef_f_[0], kHcCoef * W) && buf(coef_f_[1], kHcCoef * W) &&
                   buf(hc_ws_, hc_mixes_workspace_floats(W)) && buf(rlogits_, (size_t) g_.n_expert * W) &&
-                  buf(rw_, 64) && buf(logits_, (size_t) g_.n_vocab * W);
-        for (size_t k = 0; ok && k < m_.pack().engram.layers.size(); ++k) {
+                  buf(rw_, 64) && buf(logits_, (size_t) g_.n_vocab * W) &&
+                  buf(lp_buf_, kernels::row_logprobs_scratch_floats(W, (int) g_.n_vocab) + (size_t) W * (kernels::kLogprobStride + 1));
+        for (size_t k = 0; ok && k < en.layers.size(); ++k) {
             float *h = nullptr, *d = nullptr, *kv = nullptr;
             void* q = nullptr;
             ok = cudaHostAlloc((void**) &h, cols * W * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess;
@@ -132,7 +147,8 @@ public:
         ok = ok && cudaMalloc(&v, argmax_workspace_bytes()) == cudaSuccess && cudaMemset(v, 0, argmax_workspace_bytes()) == cudaSuccess;
         am_ws_ = v;
         if (v) allocs_.push_back(v);
-        ok = ok && cudaHostAlloc((void**) &h_next_, W * sizeof(int32_t), cudaHostAllocPortable) == cudaSuccess;
+        ok = ok && cudaHostAlloc((void**) &h_next_, W * sizeof(int32_t), cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &h_emb4_, 4 * n * W * sizeof(float), cudaHostAllocPortable) == cudaSuccess;
         v = nullptr;
         const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), W), 1 << 16);
         ok = ok && cudaMalloc(&v, q8) == cudaSuccess;
@@ -167,23 +183,30 @@ public:
             }
             const size_t ff = (size_t) drafter_->feature_floats();
             if (!buf(dfeat_, ff * kDsparkWindow) ||
-                cudaHostAlloc((void**) &h_dfeat_, ff * kDsparkWindow * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
+                cudaHostAlloc((void**) &h_dfeat_, ff * kDsparkWindow * sizeof(float), cudaHostAllocPortable) != cudaSuccess ||
+                cudaEventCreateWithFlags(&feat_ev_, cudaEventDisableTiming) != cudaSuccess) {
                 err = "out of memory for the drafter's feature rows";
                 return false;
             }
+            for (int il = 0; il < g_.n_layers; ++il)
+                if (drafter_->feature_slot(il) >= 0) {
+                    if (feat_first_ < 0) feat_first_ = il;
+                    feat_last_ = il;
+                }
         }
         return true;
     }
 
     int max_window() const override { return std::clamp(m_.tiers().spec, 1, kMaxWindow); }
 
-    model::Result draft_begin(int32_t anchor, int64_t pos) override {
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
         std::string err;
-        ops_->commit_window(pos, stream_);
-        if (!flush_features(pos, err) || !drafter_->draft_begin(dwin_, anchor, pos, std::min(max_window() - 1, kDsparkBlock), err))
+        if (!flush_features(pos, err) || !drafter_->draft_begin(dwin_, anchor, pos, std::clamp(n, 1, std::min(max_window() - 1, kDsparkBlock)), err))
             return {model::Status::Error, err};
-        ops_->end_window(true);   // the copies queued behind the drafter's inputs run while it drafts
+        ops_->commit_window(pos, stream_);   // the compressor commits the drafter does not read run beside it
+        ops_->end_window();   // what is still queued runs while it drafts
+        prepare_row0(anchor, pos);
         return {};
     }
 
@@ -290,6 +313,7 @@ public:
         whole_from_ = 0;
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         feat_n_ = 0;
+        staged_ = false;
         if (drafter_) drafter_->forget_from(dwin_, pos);
         return {};
     }
@@ -364,6 +388,7 @@ public:
         std::string e;
         if (!ops_->ensure_positions(positions, e) || !ops_->restore_cache(stream_, kv, e)) return {model::Status::Error, e};
         feat_n_ = 0;
+        staged_ = false;
         if (drafter_) drafter_->reset(dwin_);
         return {};
     }
@@ -400,9 +425,22 @@ public:
         return {};
     }
 
-    model::Result copy_logits(float* out) override {
+    model::Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) override {
+        if (n <= 0 || row0 < 0 || row0 + n > kMaxWindow) return {model::Status::Error, "row_logprobs: rows out of range"};
+        float* d_out = lp_buf_ + kernels::row_logprobs_scratch_floats(kMaxWindow, (int) g_.n_vocab);
+        int32_t* d_picks = reinterpret_cast<int32_t*>(d_out + (size_t) kMaxWindow * kernels::kLogprobStride);
+        if (cudaMemcpyAsync(d_picks, picks, (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+            return {model::Status::Error, "row_logprobs: the picks copy failed"};
+        kernels::row_logprobs(logits_ + (size_t) row0 * g_.n_vocab, n, (int) g_.n_vocab, d_picks, top, d_out, lp_buf_, stream_);
+        if (cudaMemcpyAsync(out, d_out, (size_t) n * kernels::kLogprobStride * sizeof(float), cudaMemcpyDeviceToHost,
+                            stream_) != cudaSuccess || cudaStreamSynchronize(stream_) != cudaSuccess)
+            return {model::Status::Error, "row_logprobs: the kernel failed"};
+        return {};
+    }
+
+    model::Result copy_logits(int row, float* out) override {
         cudaStreamSynchronize(stream_);
-        if (cudaMemcpy(out, logits_, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        if (cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
             return {model::Status::Error, "the head logits copy failed"};
         return {};
     }
@@ -497,9 +535,10 @@ private:
     // the card). The estimate picks the first size to try, and the free memory left after the allocation confirms it.
     bool make_prefill_fit(int tokens, std::string& err) {
         const prefillp::Dims d = m_.prompt_dims();
-        size_t free_b = 0, total_b = 0;
-        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-            err = "deepseek41: cannot read the free device memory";
+        uint64_t free_b = 0, total_b = 0;
+        std::string why;
+        if (!core::device_memory(-1, free_b, total_b, why)) {
+            err = "deepseek41: cannot read the free device memory: " + why;
             return false;
         }
         // the reserve stays free through the read: the chunk halves to fit above it
@@ -583,6 +622,7 @@ private:
             dspark_hc_mean(x + (size_t) (T - tap_rows_) * kHcMult * n, tap_rows_, (int) n, dfeat_ + (size_t) slot * n, drafter_->feature_floats(), st);
         };
         prefill_->chunk_done = [this](int T, int64_t pos0, std::string& err) {
+            staged_ = false;
             feat_pos0_ = pos0 + T - tap_rows_;
             feat_n_ = tap_rows_;
             tap_rows_ = 0;
@@ -595,6 +635,11 @@ private:
         if (!drafter_ || !feat_n_) return true;
         const int q = (int) std::clamp<int64_t>(upto - feat_pos0_, 0, feat_n_);
         feat_n_ = 0;
+        if (staged_) {   // the window's rows were made beside it: the accepted ones move into the rings
+            staged_ = false;
+            if (drafter_->commit(dwin_, feat_pos0_, q, err)) return true;
+            if (!err.empty()) return false;
+        }
         if (!q) return true;
         const size_t ff = (size_t) drafter_->feature_floats();
         if (cudaMemcpyAsync(h_dfeat_, dfeat_, ff * q * sizeof(float), cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
@@ -681,6 +726,77 @@ private:
     // which starts right after the rows were asked for.
     bool engram_ahead(int il) const { return fused_ && il > 1 && engram_at(il); }
 
+    // The n_gram - 1 tokens before position `pos`, oldest first; hist_ holds every position below it.
+    void engram_prev(int64_t pos, int32_t* prev) const {
+        const int np = m_.pack().engram.hash.n_gram - 1;
+        for (int j = 0; j < np; ++j) {
+            const int64_t q = pos - np + j;
+            prev[j] = q >= 0 ? hist_[(size_t) q] : 0;
+        }
+    }
+
+    // Asks for the rows of the `n` tokens at window rows from.. (positions pos..) with read `slot` (0: row 0, from
+    // prepare_row0; 1: the window's others) on the first Engram layer (`first`), whose rows are read soonest, or on the
+    // others.
+    void engram_issue(const int32_t* tokens, int n, int64_t pos, int from, int slot, bool first) {
+        const EngramInfo& en = m_.pack().engram;
+        const size_t cols = (size_t) en.hash.n_cols();
+        int32_t prev[8] = {0};
+        engram_prev(pos, prev);
+        for (size_t k = 0; k < en.layers.size(); ++k) {
+            if ((k == efirst_) != first) continue;
+            ngram::PleReader::Ticket& t = eread_[k][(size_t) slot];
+            finish_read(t);   // a failed window's read lands before its rows are asked for again
+            engram_hash(en.hash, (int) k, tokens, n, pos, pos == 0 ? nullptr : prev, eids_.data());
+            std::copy(eids_.begin(), eids_.begin() + (ptrdiff_t) (cols * n), erows_.begin());
+            t = m_.engram_reader().issue(erows_.data(), cols * n, eraw_[k].data() + (size_t) from * cols * en.row_bytes);
+        }
+    }
+
+    // A read whose rows no window takes ends before eraw_ is filled again.
+    void finish_read(ngram::PleReader::Ticket& t) {
+        if (!t.id) return;
+        std::string e;
+        m_.engram_reader().collect(t, e);
+        t = {};
+    }
+
+    // Row 0 of the window after the drafts is `token` at `pos`: its embedding and its Engram reads are made while the
+    // drafter runs, for the window that starts there (take_row0).
+    void prepare_row0(int32_t token, int64_t pos) {
+        drop_row0();
+        if ((int64_t) hist_.size() < pos) return;
+        const size_t n = (size_t) g_.n_embd;
+        std::string e;
+        if (!m_.embedding_row(token, h_emb4_, e)) return;   // the window reads it again and reports why
+        for (int s = 1; s < kHcMult; ++s) std::copy(h_emb4_, h_emb4_ + n, h_emb4_ + (size_t) s * n);
+        if (!m_.pack().engram.layers.empty()) {
+            engram_issue(&token, 1, pos, 0, 0, true);
+            engram_issue(&token, 1, pos, 0, 0, false);
+        }
+        engram_prev(pos, row0_prev_);
+        row0_token_ = token;
+        row0_pos_ = pos;
+        row0_ = true;
+    }
+
+    // Whether prepare_row0 made row 0 of a window of `token` at `pos`: the same token after the same n-gram tokens.
+    bool take_row0(int32_t token, int64_t pos) {
+        const int np = m_.pack().engram.hash.n_gram - 1;
+        int32_t prev[8] = {0};
+        engram_prev(pos, prev);
+        if (row0_ && token == row0_token_ && pos == row0_pos_ && std::equal(prev, prev + np, row0_prev_)) {
+            row0_ = false;
+            return true;
+        }
+        drop_row0();
+        return false;
+    }
+    void drop_row0() {
+        row0_ = false;
+        for (auto& reads : eread_) finish_read(reads[0]);
+    }
+
     // The layer's work up to the router and the expert inputs' copy to the host, optionally behind the previous
     // layer's tail. Everything here is capturable: positions are read from device memory.
     bool enqueue_head(int il, int64_t pos, int32_t token, void* st, bool with_prev_tail, int T = 1) {
@@ -714,21 +830,20 @@ private:
         ra.k = g_.n_used;
         ra.weight_scale = g_.weight_scale;
 
-        // each sublayer's mixes run beside its collapse: only its expansion reads them
+        // each sublayer's mixes run beside its collapse: only its expansion reads them (captured after the collapse, so a
+        // graph launch starts the collapse's branch first)
         DS_CUDA(cudaEventRecord(mix_ev_[0], stream_));
+        if (pre_prev) {
+            hc_pre_rms_norm(x_, pre_prev, kHcCoef, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
+        } else {
+            // the collapse of layer 0 is stream 0 of each row (kernels: a graph's copy nodes start late)
+            for (int t = 0; t < T; ++t) copy_rows(x_ + (size_t) t * kHcMult * n, cur_ + (size_t) t * n, (int) n, st);
+            rms_norm(cur_, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, normed_, st);
+        }
         DS_CUDA(cudaStreamWaitEvent(mix_st_, mix_ev_[0], 0));
         hc_mixes(x_, wf(il, "hc_attn_fn.weight"), wf(il, "hc_attn_scale.weight"), wf(il, "hc_attn_base.weight"), T, hca,
                  hc_ws_, coef_a_, mix_st_);
         DS_CUDA(cudaEventRecord(mix_ev_[1], mix_st_));
-        if (pre_prev) {
-            hc_pre_rms_norm(x_, pre_prev, kHcCoef, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
-        } else {
-            // the collapse of layer 0 is stream 0 of each row
-            for (int t = 0; t < T; ++t)
-                DS_CUDA(cudaMemcpyAsync(cur_ + (size_t) t * n, x_ + (size_t) t * kHcMult * n, n * sizeof(float),
-                                        cudaMemcpyDeviceToDevice, stream_));
-            rms_norm(cur_, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, normed_, st);
-        }
         dump("hc_attn_pre", il, pos, cur_, n * sizeof(float));
         if (T == 1 ? !ops_->attention(il, pos, token, normed_, attn_out_, st, err_)
                    : !ops_->attention_window(il, T, normed_, attn_out_, st, err_))
@@ -848,7 +963,6 @@ private:
         if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
         hist_.resize((size_t) pos);   // a position before the end drops the rejected rows of a window
         hist_.insert(hist_.end(), tokens, tokens + T);
-        ops_->begin_token(pos, T);
         {
             std::string se;
             if (!ops_->stage_token(pos, T, st, se)) return fail(se);
@@ -856,37 +970,26 @@ private:
         const bool graphs = dump_dir_.empty() && ops_->graph_capable();
         fused_ = graphs;
 
-        // embeddings, each repeated into the four streams
-        emb4_.resize(n * kHcMult * T);
-        for (int t = 0; t < T; ++t) {
-            float* row = emb4_.data() + (size_t) t * kHcMult * n;
+        // embeddings, each repeated into the four streams; row 0's may have been made while the drafter ran
+        const int from = take_row0(tokens[0], pos) ? 1 : 0;
+        for (int t = from; t < T; ++t) {
+            float* row = h_emb4_ + (size_t) t * kHcMult * n;
             std::string e;
             if (!m_.embedding_row(tokens[t], row, e)) return fail(e);
             for (int s = 1; s < kHcMult; ++s) std::copy(row, row + n, row + (size_t) s * n);
         }
-        DS_CUDA(cudaMemcpyAsync(x_, emb4_.data(), emb4_.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        DS_CUDA(cudaMemcpyAsync(x_, h_emb4_, n * kHcMult * T * sizeof(float), cudaMemcpyHostToDevice, stream_));
         dump("hc_init", -1, pos, x_, 4 * n * sizeof(float));
 
-        // Engram rows for every Engram layer, requested now so the SSD reads overlap layer 0
+        // Engram rows of the window's rows not asked for with the drafts, requested now so the SSD reads overlap layer 0:
+        // the first Engram layer's before layer 0's head; the others' once it is launched, since a request right after
+        // another waits while the reader hands out that one's reads.
         const EngramInfo& en = m_.pack().engram;
         const int n_cols = en.hash.n_cols();
-        std::vector<std::vector<uint8_t>> raw(en.layers.size());
-        std::vector<ngram::PleReader::Ticket> tickets(en.layers.size());
-        if (!en.layers.empty()) {
-            int32_t prev[8] = {0};
-            const int np = en.hash.n_gram - 1;
-            for (int j = 0; j < np; ++j) {
-                const int64_t q = pos - np + j;   // oldest first
-                prev[j] = q >= 0 ? hist_[(size_t) q] : 0;
-            }
-            for (size_t k = 0; k < en.layers.size(); ++k) {
-                std::vector<int32_t> ids((size_t) n_cols * T);
-                engram_hash(en.hash, (int) k, tokens, T, pos, pos == 0 ? nullptr : prev, ids.data());
-                std::vector<uint32_t> rows(ids.begin(), ids.end());
-                raw[k].assign((size_t) n_cols * T * en.row_bytes, 0);
-                tickets[k] = m_.engram_reader().issue(rows.data(), rows.size(), raw[k].data());
-            }
-        }
+        const auto engram_ask = [&](bool first) {
+            if (!en.layers.empty() && from < T) engram_issue(tokens + from, T - from, pos + from, from, 1, first);
+        };
+        engram_ask(true);
 
         const int32_t token = tokens[0];
         bool tail_pending = false;
@@ -896,12 +999,12 @@ private:
         // expert copies. The projection of an Engram layer past layer 1 runs one layer ahead, behind that layer's head,
         // while its experts run; the Engram layer's head then only adds the result.
         const auto engram_rows = [&](size_t k) {
-            if (!m_.engram_reader().collect(tickets[k], err)) return false;
-            const int blocks = 256 / 32;
+            for (ngram::PleReader::Ticket& t : eread_[k]) {
+                if (t.id && !m_.engram_reader().collect(t, err)) return false;
+                t = {};
+            }
             for (int r = 0; r < n_cols * T; ++r)
-                for (int b = 0; b < blocks; ++b)
-                    dequantize_iq4_nl(raw[k].data() + (size_t) r * en.row_bytes + (size_t) b * 18,
-                                      erow_h_[k] + (size_t) r * 256 + (size_t) b * 32);
+                engram_row_f32(en.type, en.row_values, eraw_[k].data() + (size_t) r * en.row_bytes, erow_h_[k] + (size_t) r * 256);
             return true;
         };
         const auto engram_project = [&](size_t k, int il, void* s) {
@@ -934,13 +1037,25 @@ private:
                 dump("engram_out", il, pos, x_, 4 * n * sizeof(float));
             }
 
+            // the later Engram layers' reads and the tier's bookkeeping (promotions that land) run while the first head does
             if (!graphs) {
                 if (!enqueue_head(il, pos, token, st, false)) return false;
+                if (il == 0) engram_ask(false);
+                if (il == 0) ops_->begin_token(pos, T);
                 if (!ops_->routed_experts_staged(il, normed_, ids_, rw_, moe_out_, st, err_)) return false;
                 if (!enqueue_tail(il, pos, st)) return false;
             } else {
+                if (il == feat_first_) drafter_->after_staging(stream_);   // the last staging has read its rows
                 if (!run_head(il, pos, token, tail_pending, T)) return false;
+                if (il == 0) engram_ask(false);
+                if (il == 0) ops_->begin_token(pos, T);
                 tail_pending = true;
+                if (il == feat_last_) {   // every target row of the window is in dfeat_: their latents are made beside it
+                    std::string se;
+                    DS_CUDA(cudaEventRecord(feat_ev_, stream_));
+                    staged_ = drafter_->stage(dwin_, pos, T, dfeat_, feat_ev_, se);
+                    if (!se.empty()) return fail(se);
+                }
                 for (size_t k = 0; k < en.layers.size(); ++k) {
                     if (en.layers[k] != il + 1 || !engram_ahead(il + 1)) continue;
                     if (!engram_rows(k)) return fail(err);
@@ -956,7 +1071,7 @@ private:
         }
         if (tail_pending && !run_tail(g_.n_layers - 1, pos, T)) return false;
         if (!want_out && !next && !logits_out) {
-            ops_->end_window(false);
+            ops_->end_window();
             DS_CUDA(cudaStreamSynchronize(stream_));
             return true;
         }
@@ -968,7 +1083,7 @@ private:
         dump("result_norm", -1, pos, normed_, n * sizeof(float));
         const DevTensor* head = m_.tensor("output.weight");
         dense_f32(*head, normed_, q8_, logits_, (int) n, g_.n_vocab, T, st);
-        ops_->end_window(false);
+        ops_->end_window();
         if (T > 1) {
             if (draw_kernel_) kernels::sample_tokens(logits_, T, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, am_dev_, st);
             else argmax_rows(logits_, T, g_.n_vocab, am_dev_, am_ws_, st);
@@ -1035,6 +1150,7 @@ private:
     float *x_ = nullptr, *x2_ = nullptr, *cur_ = nullptr, *normed_ = nullptr, *attn_out_ = nullptr, *moe_out_ = nullptr,
           *sh_out_ = nullptr, *ffn_sum_ = nullptr, *coef_a_ = nullptr, *coef_f_[2] = {nullptr, nullptr},
           *hc_ws_ = nullptr, *rlogits_ = nullptr, *rw_ = nullptr, *logits_ = nullptr;
+    float* lp_buf_ = nullptr;   // row_logprobs: its scratch, kLogprobStride floats a row, then the picks
     // per Engram layer: its dequantized rows (mapped host memory) as the host and the kernels see them, the projection's
     // q8_1 scratch and result; the stream a projection one layer ahead runs on, its start and its end per layer
     std::vector<float*> erow_h_, erow_d_, ekv_;
@@ -1042,10 +1158,22 @@ private:
     cudaStream_t eng_st_ = nullptr;
     cudaEvent_t eng_go_ = nullptr;
     std::vector<cudaEvent_t> eng_ev_;
+    // per Engram layer: a window's rows as read from the table ([row][column]) and the two reads that fill them
+    // (engram_issue); one read's table rows; the slot of the first Engram layer
+    std::vector<std::vector<uint8_t>> eraw_;
+    std::vector<std::array<ngram::PleReader::Ticket, 2>> eread_;
+    std::vector<int32_t> eids_;
+    std::vector<uint32_t> erows_;
+    size_t efirst_ = 0;
+    // row 0 of the next window, made while the drafter runs (prepare_row0): its token, position and n-gram tokens
+    bool row0_ = false;
+    int32_t row0_token_ = 0;
+    int64_t row0_pos_ = 0;
+    int32_t row0_prev_[8] = {};
     int32_t* ids_ = nullptr;
     int32_t *am_dev_ = nullptr, *h_next_ = nullptr;
     void* am_ws_ = nullptr;
-    std::vector<float> emb4_;
+    float* h_emb4_ = nullptr;   // a window's embeddings in the four streams, pinned
     bool fused_ = false;
     void* q8_ = nullptr;
     // the drafter and the main model's side of its feature hand-off
@@ -1056,6 +1184,9 @@ private:
     float* h_dfeat_ = nullptr;
     int64_t feat_pos0_ = 0;      // the first position of the rows in dfeat_ that await the drafter, and how many
     int feat_n_ = 0;
+    bool staged_ = false;        // those rows' latents were made beside their window (DsparkDrafter::stage)
+    int feat_first_ = -1, feat_last_ = -1;   // the drafter's first and last target layer
+    cudaEvent_t feat_ev_ = nullptr;          // the last target layer's rows are in dfeat_
     int tap_rows_ = 0;           // the rows the running prompt chunk leaves in dfeat_
 };
 

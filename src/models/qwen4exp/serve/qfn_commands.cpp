@@ -2,6 +2,7 @@
 #include "models/qwen4exp/adapter.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
+#include "basalt/vision/ffmpeg_api.hpp"
 #include "../../../program/tokenizer/unicode_flags.hpp"
 #include "../../../program/cli/tokens.hpp"
 
@@ -162,6 +163,8 @@ void QfnRuntime::print_info() {
                                    " slot0_solo=" + std::to_string(slot0_is_solo ? 1 : 0) +
                                    " solo_any_slot=" + std::to_string(slot0_is_solo ? 1 : 0)).c_str() : "",
                     quant_label.c_str(), gpu_ids.c_str());
+        // whether the in-engine encoder reads video (FFmpeg found at run time), for the server's start line
+        if (o.vision_in_engine) std::printf("%s\n", basalt::vision::video_line().c_str());
     }
 }
 

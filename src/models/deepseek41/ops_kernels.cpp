@@ -1,6 +1,8 @@
 // src/models/deepseek41/ops_kernels.cpp - the layer ops built from the kernel groups' entry points: attention
 // (window ring, compressor, indexer, query path, sparse MQA, grouped output) with per-layer state owned here.
+#include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/log.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/platform/file.hpp"
@@ -43,6 +45,31 @@ struct CpuJoin {
     void now() {
         if (tier) tier->finish_cpu();
         tier = nullptr;
+    }
+};
+
+// The word a layer's weighted sum waits for: armed with the value the sum was queued behind, the host writes it once
+// the CPU's and the second card's rows landed, or on any way out, so the stream never waits for good.
+struct JoinWord {
+    uint32_t* word = nullptr;
+    uint32_t value = 0;
+    bool armed = false;
+    ~JoinWord() { raise(); }
+    void raise() {
+        if (!armed) return;
+        std::atomic_thread_fence(std::memory_order_release);   // the rows before the word
+        *(volatile uint32_t*) word = value;
+        armed = false;
+    }
+};
+
+// Raises an armed second-card share on every way out before its plan, so the card never waits for good (the share
+// then has nothing to do).
+struct PeerArm {
+    core::PeerExperts* peer = nullptr;
+    ~PeerArm() {
+        std::string e;
+        if (peer) peer->raise(0, nullptr, nullptr, e);
     }
 };
 
@@ -293,20 +320,18 @@ public:
     void begin_token(int64_t, int n_tokens) override {
         if (tier_) tier_->begin_token(n_tokens);
     }
-    void end_window(bool all) override {
-        // the pieces that land while the window's output and the drafter's inputs are on their way
-        constexpr int kEndPieces = 8;
-        if (tier_) tier_->pump(all ? ExpertTier::kAllPieces : kEndPieces);
+    void end_window() override {
+        if (tier_) tier_->pump(-1, ExpertTier::kAllPieces);
     }
 
     bool attention_batch(int il, int64_t pos0, int n_tokens, const int32_t*, const float* x, float* out, int,
                          void* stream, std::string& err) override {
-        if (!ensure_positions(pos0 + n_tokens, err) || !ensure_batch(err)) return false;
+        if (!ensure_positions(pos0 + n_tokens, err) || !batch_open(err)) return false;
         return batch_->run(il, pos0, n_tokens, x, out, stream, err);
     }
 
-    bool ensure_batch(std::string& err) {
-        if (batch_) return true;
+    bool open_batch(int max_tokens, std::string& err) override {
+        batch_.reset();
         AttnCaches c;
         c.ring = &ring_;
         c.comp_kv = &comp_kv_;
@@ -317,12 +342,17 @@ public:
         c.freq[0] = freq_[0];
         c.freq[1] = freq_[1];
         c.rope = rope_;
-        batch_ = make_attn_batch(m_, c, kMaxChunk, ctx_, err);
+        batch_ = make_attn_batch(m_, c, max_tokens, ctx_, err);
+        return batch_ != nullptr;
+    }
+    void close_batch() override { batch_.reset(); }
+    bool batch_open(std::string& err) const {
+        if (!batch_) err = "deepseek41: the batched attention runs only inside a prompt read";
         return batch_ != nullptr;
     }
 
     bool compress_batch(int il, int64_t pos0, int n_tokens, const float* x, void* stream, std::string& err) override {
-        return ensure_positions(pos0 + n_tokens, err) && ensure_batch(err) && batch_->compress_only(il, pos0, n_tokens, x, stream, err);
+        return ensure_positions(pos0 + n_tokens, err) && batch_open(err) && batch_->compress_only(il, pos0, n_tokens, x, stream, err);
     }
 
     bool stage_token(int64_t pos, int T, void* stream, std::string& err) override {
@@ -331,6 +361,15 @@ public:
             return false;
         }
         if (!ensure_positions(pos + T, err)) return false;
+        if (lent_here_) {
+            // the caches took the tier's slots: what is left above the reserve goes back to it now, as no prompt path
+            // closes after a short read
+            lent_here_ = false;
+            std::string e;
+            cudaDeviceSynchronize();
+            if (!tier_->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
+            tier_->grow();
+        }
         if (!ensure_tier(err)) return false;
         commit_window(pos, stream);
         if (T > 1) {
@@ -363,14 +402,15 @@ public:
     bool graph_capable() const override { return true; }
 
     // Backs the compressed caches up to `positions`. When the card is full the expert tier gives back its loan of
-    // spare slots and the mapping is tried again.
+    // spare slots and the mapping is tried again; when that is not enough (a step maps 4 granules on every layer at
+    // once) it lends all its slots, as a long prompt read does, and stage_token takes back what is left.
     bool ensure_positions(int64_t positions, std::string& err) override {
         if (positions <= backed_positions_) return true;
         if (positions > ctx_) {
             err = "deepseek41: the position exceeds the context (" + std::to_string(ctx_) + " tokens)";
             return false;
         }
-        for (int attempt = 0; attempt < 2; ++attempt) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
             std::string e;
             bool ok = true;
             const uint64_t keep = tier_ ? tier_->free_floor() : 0;
@@ -387,6 +427,17 @@ public:
             if (attempt == 0 && tier_) {
                 cudaDeviceSynchronize();
                 tier_->shrink();
+                continue;
+            }
+            if (attempt == 1 && tier_) {
+                const int64_t before = tier_->slots();
+                cudaDeviceSynchronize();
+                tier_->lend_all();
+                if (tier_->slots() < before) {   // a prompt path that lent the tier on purpose keeps it
+                    lent_here_ = true;
+                    basalt::log::warn("basalt deepseek41", "the compressed caches took the VRAM tier's slots at %lld positions",
+                                      (long long) positions);
+                }
                 continue;
             }
             err = "deepseek41: not enough free device memory for a context of " + std::to_string(positions) +
@@ -533,13 +584,13 @@ public:
 
         // query path; its latent is also the indexer's input
         QPathWeights qw{qa->ptr, qa->type, (const float*) qan->ptr, qb->ptr, qb->type, g_.rms_eps};
-        q_latent(xq_, qw, T, qr_, stream);
+        q_latent(xq_, qw, T, qr_, xq2_, stream);
         if (indexing) {
             // the selection waits for the latent, the head weights and the layer's index keys
             if (!after(ms, br_[0], br_ev_[2]) || !after(br_[1], br_[0], br_ev_[3])) return failed("attention branch");
             indexer_rank(ia, qr_, d_pos, T, iws_, br_[0]);
         }
-        q_heads(qw, T, d_pos, rope_[kind], xq2_, qr_, q_, stream);
+        q_heads(qw, T, d_pos, rope_[kind], xq2_, q_, stream);
         if (!after(br_[0], ms, br_ev_[4]) || ((compressing || indexing) && !after(br_[1], ms, br_ev_[5])))
             return failed("attention branch");
         const int sel = ratio ? kTopK : 0;
@@ -587,12 +638,15 @@ public:
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
         if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
             cudaHostAlloc((void**) &h_ids_, 64 * 4, kMapped) != cudaSuccess ||
+            cudaHostAlloc((void**) &h_join_, 64, kMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_join_, h_join_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_plan_host_, h_plan_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_ids_host_, h_ids_, 0) != cudaSuccess) {
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
         }
         for (int k = 0; k < 64; ++k) h_ids_[k] = -1;
+        *h_join_ = 0;
         DsModel::SharedTier& shared = m_.shared_tier();
         if (shared.tier) {   // another session opened it: the sessions run one at a time over the same rows
             tier_ = shared.tier;
@@ -673,7 +727,16 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
-        tier_->pump(2 + T);   // what this layer's head leaves the bus of the promotions queued before it
+        // the second card's share goes out while the head runs: its kernels wait on the card for the plan
+        core::PeerExperts* peer = tier_->peer();
+        PeerArm armed;
+        if (peer) {
+            kernels::NativeExpertLayout limited = L;
+            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
+            if (!peer->arm(limited, h_x_, T, K, policy::peer_groups(T), err)) return false;
+            armed.peer = peer;
+        }
+        tier_->pump(il, 2 + T);   // what this layer's head leaves the bus of the promotions queued before it
         await_ids(st, T * K);
         int32_t uniq[ExpertTier::kMaxK];
         int nu = 0;
@@ -697,23 +760,24 @@ public:
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
-        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
-        bool cpu = false;
-        for (int i = 0; i < nu; ++i) cpu = cpu || (!lk.dev[i] && !lk.peer[i]);
+        // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land; the
+        // experts it fetched over its own link are planned beside the ones it holds
+        if (peer) {
+            int32_t kind[ExpertTier::kMaxK] = {};
+            for (int r = 0; r < T * K; ++r) kind[r] = !lk.peer[uidx[r]] ? 0 : lk.fetched[uidx[r]] ? 3 : 2;
+            if (!peer->raise(il, h_ids_, kind, err)) return false;
+        }
+        // then the CPU's share: it takes longest, and the pool's workers run it while the main card's share launches
+        bool cpu = false, on_peer = false;
+        for (int i = 0; i < nu; ++i) {
+            cpu = cpu || (!lk.dev[i] && !lk.peer[i]);
+            on_peer = on_peer || lk.peer[i];
+        }
+        JoinWord jw;
         CpuJoin join;
         if (cpu) {
             tier_->start_cpu_window(il, h_x_, lk, use, h_rows_);
             join.tier = tier_.get();
-        }
-
-        // the second card's share first: its rows are the last of the two cards' to land
-        core::PeerExperts* peer = tier_->peer();
-        if (peer) {
-            int32_t kind[ExpertTier::kMaxK] = {};
-            for (int r = 0; r < T * K; ++r) kind[r] = lk.peer[uidx[r]] ? 2 : 0;
-            kernels::NativeExpertLayout limited = L;
-            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
-            if (!peer->launch_window(il, limited, h_x_, h_ids_, T, K, kind, err)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds; the fetched ones in a second plan, once their copies landed
@@ -750,16 +814,27 @@ public:
             tier_->await_fetch(st);
             gpu_share(plan, ex_plan2_, ng, entries);
         }
+        // the second card's fetched experts run once their copies land, long after these launches
+        if (peer && !peer->run_fetched(err)) return false;
+        // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
+        // launch and the next layer's are off the path from the last rows to the sum
+        WindowRowPtrs rp{};
+        for (int r = 0; r < T * K; ++r)
+            rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
+        if (cpu || on_peer) {
+            jw.word = h_join_;
+            jw.value = ++join_seq_;
+            jw.armed = true;
+            kernels::wait_word(d_join_, jw.value, stream);
+        }
+        weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in their rows
         if (cpu) {
             join.now();
             tier_->promote(il, lk);
         }
         if (peer && !peer->finish(nullptr, err)) return false;
-        WindowRowPtrs rp{};
-        for (int r = 0; r < T * K; ++r)
-            rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
-        weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
+        jw.raise();
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
         for (int r = 0; r < T * K; ++r) h_ids_[r] = -1;
         ids_read_ = false;
@@ -800,29 +875,39 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
-        tier_->pump(3);
+        // the second card's share goes out while the head runs: its kernels wait on the card for the plan
+        core::PeerExperts* peer = tier_->peer();
+        PeerArm armed;
+        if (peer) {
+            kernels::NativeExpertLayout limited = L;
+            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
+            if (!peer->arm(limited, h_x_, 1, K, policy::peer_groups(1), err)) return false;
+            armed.peer = peer;
+        }
+        tier_->pump(il, 3);
         if (shared_out) await_ids(st, K);
         else cudaStreamSynchronize(st);
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
-        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
-        bool cpu = false;
-        for (int k = 0; k < K; ++k) cpu = cpu || (!lk.dev[k] && !lk.peer[k]);
+        // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land; the
+        // experts it fetched over its own link are planned beside the ones it holds
+        if (peer) {
+            int32_t kind[ExpertTier::kMaxK] = {};
+            for (int k = 0; k < K; ++k) kind[k] = !lk.peer[k] ? 0 : lk.fetched[k] ? 3 : 2;
+            if (!peer->raise(il, lk.experts, kind, err)) return false;
+        }
+        // then the CPU's share: it takes longest, and the pool's workers run it while the main card's share launches
+        bool cpu = false, on_peer = false;
+        for (int k = 0; k < K; ++k) {
+            cpu = cpu || (!lk.dev[k] && !lk.peer[k]);
+            on_peer = on_peer || lk.peer[k];
+        }
+        JoinWord jw;
         CpuJoin join;
         if (cpu) {
             tier_->start_cpu(il, h_x_, lk, h_rows_);
             join.tier = tier_.get();
-        }
-
-        // the second card's share first: its rows are the last of the two cards' to land
-        core::PeerExperts* peer = tier_->peer();
-        if (peer) {
-            int32_t kind[ExpertTier::kMaxK] = {};
-            for (int k = 0; k < K; ++k) kind[k] = lk.peer[k] ? 2 : 0;
-            kernels::NativeExpertLayout limited = L;
-            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
-            if (!peer->launch_plain(il, limited, h_x_, lk.experts, K, kind, err)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index; the
@@ -881,16 +966,27 @@ public:
             kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, n_fetched,
                                                    n_fetched, ex_xq_, ex_scr_, ex_rows_, stream);
         }
+        // the second card's fetched experts run once their copies land, long after these launches
+        if (peer && !peer->run_fetched(err)) return false;
+        // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
+        // launch and the next layer's are off the path from the last rows to the sum
+        RowPtrs rp{};
+        for (int k = 0; k < K; ++k)
+            rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
+        if (cpu || on_peer) {
+            jw.word = h_join_;
+            jw.value = ++join_seq_;
+            jw.armed = true;
+            kernels::wait_word(d_join_, jw.value, stream);
+        }
+        weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in the router index's row
         if (cpu) {
             join.now();
             tier_->promote(il, lk);
         }
         if (peer && !peer->finish(nullptr, err)) return false;
-        RowPtrs rp{};
-        for (int k = 0; k < K; ++k)
-            rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
-        weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
+        jw.raise();
         tier_->mark_gap(st);
         for (int k = 0; k < K; ++k) h_ids_[k] = -1;
         ids_read_ = false;
@@ -941,6 +1037,7 @@ private:
     std::vector<uint8_t*> ring_, comp_kv_, comp_ik_;
     std::vector<std::unique_ptr<ElasticBuf>> el_kv_, el_ik_;   // backing of comp_kv_ / comp_ik_ per kv-source layer
     int64_t backed_positions_ = 0;
+    bool lent_here_ = false;   // ensure_positions lent the tier's slots; stage_token takes back what is left
     int ctx_ = 0;
     CacheFormat fmt_ = CacheFormat::Fp8;   // the caches' rows (--kv)
     uint64_t lat_b_ = 0, idx_b_ = 0;       // a compressed row's and an index key's bytes
@@ -960,6 +1057,8 @@ private:
     ExpertPlan* h_plan_ = nullptr;
     float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *d_x_host_ = nullptr;
     int32_t *h_ids_ = nullptr, *h_pos_ = nullptr, *d_ids_host_ = nullptr;
+    uint32_t *h_join_ = nullptr, *d_join_ = nullptr;   // the word a layer's weighted sum waits for (mapped)
+    uint32_t join_seq_ = 0;                             // the value it was last armed with
     int64_t staged_pos_ = -1;
     std::shared_ptr<ExpertTier> tier_;
     static constexpr int kMaxK = 8;                 // routed experts of a token

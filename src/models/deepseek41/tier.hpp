@@ -44,11 +44,11 @@ public:
     struct Lookup {
         int k = 0;
         const uint8_t* dev[kMaxK] = {};    ///< device blob of an expert the VRAM tier holds, else null
-        const uint8_t* peer[kMaxK] = {};   ///< device blob of an expert the second card holds, else null
-        const uint8_t* host[kMaxK] = {};   ///< host blob of the others
+        const uint8_t* peer[kMaxK] = {};   ///< device blob of an expert the second card holds or fetched, else null
+        const uint8_t* host[kMaxK] = {};   ///< host blob of the others (and of those the second card fetched)
         int experts[kMaxK] = {};
         bool again[kMaxK] = {};            ///< a miss that repeats one from the last kPromoteWindow tokens
-        bool fetched[kMaxK] = {};          ///< `dev` is being copied in by `fetch`
+        bool fetched[kMaxK] = {};          ///< `dev` or `peer` is being copied in by `fetch`
     };
 
     /// The window rows that use one looked-up expert: row i of token tok[i] is `row[i]` of the output rows.
@@ -86,10 +86,11 @@ public:
     void set_free_floor(int64_t mib);
     uint64_t free_floor() const { return free_floor_; }
 
-    /// Called before each token or window: the promotions queued during the previous one finish and become resident, so
-    /// what a lookup finds depends only on the routing history.
+    /// Called before each token or window. The copies queued during the previous one (promotions, second card exchanges)
+    /// land layer by layer: each before its layer's next lookup (`pump`), so what a lookup finds depends only on the
+    /// routing history, as if every copy had landed at the window's start.
     void begin_token(int n_tokens = 1);
-    /// Looks up `ids[0..k)` of `layer` and stamps them as used.
+    /// Looks up `ids[0..k)` of `layer` and stamps them as used; `layer`'s queued copies land first.
     bool lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err);
     /// The CPU's share: the experts of `lk` without a device blob, over the activation `x` (n_embd floats, host).
     /// Row i of `rows` (n_embd floats each) gets expert i's output. Started here, it runs on the pool's workers while
@@ -99,16 +100,21 @@ public:
     /// rows of `rows`.
     void start_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows);
     void finish_cpu();
-    /// The promotions' copies wait for the bus to idle: mark_gap notes the point of `main` (a layer's sum) they start
-    /// behind, and pump issues up to `pieces` of them there, after the next launches went out (the next layer's head;
-    /// at the window's end, its output). begin_token issues the rest, so every promotion still lands before the next
-    /// lookup, as if it had been copied at once.
+    /// The promotions' copies, and the second card's exchanges, wait for the bus to idle: mark_gap notes the point of
+    /// `main` (a layer's sum) they start behind, and pump issues up to `pieces` promotion pieces there (and at most
+    /// policy::kPeerGapPieces exchange pieces on the second card's bus), after the next launches went out (the next
+    /// layer's head; at the window's end, its output), so they do not take the host memory's bandwidth from the CPU's
+    /// share and the bus copies of a layer's misses. A copy queued after them on another stream (a layer's bus fetch)
+    /// waits for one piece at most. With `layer` >= 0 (called before the layer's lookup) that layer's queued copies first
+    /// go out whole and land.
     void mark_gap(cudaStream_t main);
-    void pump(int pieces);
+    void pump(int layer, int pieces);
     static constexpr int kAllPieces = 1 << 20;
     /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (policy::bus_count) into the VRAM tier; those
-    /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. How many
-    /// started; `await_fetch` makes `main` wait for them.
+    /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. With a
+    /// second card, policy::peer_bus_count of them cross its own link into its scratch slots instead (`peer`, marked
+    /// `fetched`); their VRAM tier copies follow off the token path. How many the main card's link started; `await_fetch`
+    /// makes `main` wait for them.
     int fetch(int layer, Lookup& lk);
     void await_fetch(cudaStream_t main);
     /// Queues the pinned misses the CPU computed that missed before within kPromoteWindow tokens for a copy into the
@@ -156,7 +162,8 @@ private:
         int layer, expert, slot, event;
         int out = -1, place = -1;
     };
-    /// A promotion whose copies wait for an idle bus: the home's bytes out to `home_to` first, then `src` into `dst`.
+    /// A promotion whose copies wait for an idle bus: the home's bytes out to `home_to` (on the out stream), then `src`
+    /// into `dst` once they are out.
     struct Queued {
         Pending p;
         uint8_t* dst;
@@ -164,12 +171,24 @@ private:
         uint8_t* home_to;
         uint64_t bytes, off = 0, home_off = 0;
     };
-    /// Issues every queued promotion's remaining copies.
-    void flush_queue();
-    /// `in` on its way into the second card's `slot`; `out`, which held it, on its way to RAM place `place`.
+    /// `in` on its way into the second card's `slot`, its pieces waiting for an idle bus; `out`, which held it, on its
+    /// way to RAM place `place`: the slot's bytes out to `to` first, then `from` in.
     struct PeerMove {
         int layer, in, out, slot, place;
+        uint8_t* to;
+        const uint8_t* from;
+        uint64_t bytes, out_off = 0, in_off = 0;
+        int64_t in_mark = -1;   ///< the second card's mark behind its last piece
     };
+    /// Issues what is left of `layer`'s queued copies (>= 0), then up to `pieces` pieces of the others, oldest first:
+    /// the main card's and the second card's.
+    void issue(int layer, int pieces);
+    void issue_peer(int layer, int pieces);
+    /// The copies queued for `layer` (or every layer) land: the experts take their places.
+    void land(int layer);
+    void land_all();
+    void apply(const Pending& p);
+    void apply(const PeerMove& m);
     /// A cold pinned expert (victim) replaced by a hot file-backed one (expert), read into the layer's spare slot.
     struct Swap {
         int layer, expert, victim, place;
@@ -184,7 +203,6 @@ private:
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;
     uint64_t slot_total() const { return (uint64_t) n_layers_ * (uint64_t) (per_layer_ + ext_per_layer_); }
-    void drain();
     void finish_swaps();
     void start_swaps();
     void swap_worker();
@@ -195,7 +213,8 @@ private:
                   bool later = false);
     /// The least recently used free slot of the layer's main card share, or -1; `best` gets its last use.
     int32_t oldest_slot(int layer, bool homes_too, uint64_t& best) const;
-    /// Moves (layer, e) into the second card when the expert it replaces there was used before any on the main card.
+    /// Moves (layer, e) into the second card when the expert it replaces there was last used policy::kPeerMoveAge
+    /// lookups before the main card's oldest.
     bool move_to_peer(int layer, int e, const uint8_t* src);
 
     const DsModel& m_;
@@ -204,18 +223,22 @@ private:
     int64_t per_layer_ = 0;                 ///< VRAM slots each layer owns in the base arena
     core::ExpertCache ext_;                 ///< slots beside the base arena, open only while no prompt workspace is
     int64_t ext_per_layer_ = 0;             ///< slots each layer owns in `ext_`
+    bool unread_said_ = false;              ///< `grow` has said that the runtime could not answer
     int64_t lent_per_layer_ = 0;            ///< base slots given up by lend_all(), 0 when none
     std::vector<int32_t> res_;              ///< [layer * n_expert + e] VRAM slot or -1
     std::vector<uint64_t> stamp_;           ///< [layer * n_expert + e] last use
     std::vector<int32_t> owner_;            ///< [slot] expert it holds or is receiving, or -1
     std::vector<uint8_t> busy_;             ///< [slot] a promotion is copying into it
-    std::vector<Pending> pending_;
+    std::vector<Pending> pending_;          ///< issued copies not landed yet
     std::vector<Queued> queue_;             ///< promotions not yet fully issued, oldest first
-    std::vector<PeerMove> peer_moves_;
+    std::vector<PeerMove> peer_moves_;      ///< second card exchanges not landed yet, oldest first
     std::vector<int32_t> peer_owner_;       ///< [second card slot] expert it holds or is receiving
-    std::vector<cudaEvent_t> events_;
+    std::vector<cudaEvent_t> events_;       ///< [event] behind a copy's last piece in
+    std::vector<cudaEvent_t> out_events_;   ///< [event] behind the last piece out of the home a promotion replaces
     std::vector<int> free_events_;
+    int claims_ = 0;                        ///< copies claimed since the last begin_token (at most kMaxPending)
     cudaStream_t copy_stream_ = nullptr;    ///< promotions, off the token path
+    cudaStream_t out_stream_ = nullptr;     ///< the homes they replace, out to RAM beside them
     cudaStream_t fetch_stream_ = nullptr;   ///< copies a layer waits for (high priority)
     cudaEvent_t fetch_ev_ = nullptr;
     cudaEvent_t gap_ev_ = nullptr;          ///< the main stream's point the pumped pieces start behind

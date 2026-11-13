@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <thread>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -78,7 +79,11 @@ public:
     Runtime(basalt::program::CommonOptions& options, basalt::core::ModelFile& file, std::string& error, const int64_t& vocab,
             std::optional<basalt::program::grammar::PackVocab>& vocab_tables)
         : o(options), model_file(file), err(error), n_vocab(vocab), grammar_vocab(vocab_tables) {}
-    virtual ~Runtime() = default;
+    // the stdin reader thread uses this object's state: it ends before the object does
+    virtual ~Runtime() {
+        reader_stop_.store(true);
+        if (reader_.joinable()) reader_.join();
+    }
     int execute();
     Flow dispatch();
     int run_requests();
@@ -109,6 +114,9 @@ public:
     virtual bool park_current(size_t held, int64_t kept) = 0;
     virtual bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) = 0;
     virtual void ckd_finish() {}
+    /// Writes the `CONV` line with the RAM tier's figures (a restore adds the tokens it returned and its ms), for
+    /// every model after it parks or restores a conversation.
+    void report_conversations(long long restored = -1, double restored_ms = 0);
     /// Once per drop below the RAM guard's floor, between steps: the parked conversations leave RAM (to the disk tier
     /// when it is on and holds no copy of them yet, the others are dropped), the checkpoint blocks kept for reuse are
     /// freed and the heap's free pages return to the OS. The checkpoints stay: a request may already resume from one.
@@ -124,6 +132,7 @@ public:
     virtual void enc_command(const std::string& cmd) = 0;
     virtual size_t spill_to_disk(bool at_exit, size_t limit) = 0;
     virtual bool park_idle_engine(std::string& e) = 0;
+    virtual void kv_ceiling_note() {}   // a model with an elastic KV sends its ceiling again when it moves
     basalt::program::CommonOptions& o;
     basalt::core::ModelFile& model_file;
     std::string& err;
@@ -169,6 +178,8 @@ public:
     uint64_t gent_seq{};
     std::atomic<bool> stop_req{};
     std::atomic<bool> stdin_lost{};
+    std::thread reader_{};
+    std::atomic<bool> reader_stop_{};
     std::mutex in_mu{};
     std::condition_variable in_cv{};
     std::deque<std::string> in_lines{};
@@ -211,6 +222,7 @@ public:
         // the request's grammar (the batch windows' form of the solo loop's `gguard`): the window's kept picks are
         // scanned, the first refused one is resampled under the mask, and the segment ends there
         std::unique_ptr<basalt::program::grammar::Guard> guard;
+        int lp_top = -1;   ///< the request's logprobs=K: a BP line ahead of the BT line for every kept pick (-1: off)
         // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
         // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
         // history and last proposal

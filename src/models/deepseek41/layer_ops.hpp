@@ -51,6 +51,10 @@ public:
         err = "deepseek41: this layer ops implementation has no batched compressor";
         return false;
     }
+    /// The workspaces of attention_batch and compress_batch for chunks of up to `max_tokens`: a prompt's, opened and
+    /// released with its other workspaces so the expert tier plans for them.
+    virtual bool open_batch(int max_tokens, std::string& err) { (void) max_tokens; (void) err; return true; }
+    virtual void close_batch() {}
     /// The expert tier (VRAM slots and the pinned RAM copy), opened on first use; null when this implementation has none.
     virtual ExpertTier* expert_tier(std::string& err) { (void) err; return nullptr; }
     /// Backs the per-position state (the compressed caches) for positions below `positions`; the layer calls need it
@@ -83,9 +87,9 @@ public:
     }
     /// The rows of the last window before `next_pos` join the carried state; the rest leave no trace.
     virtual void commit_window(int64_t next_pos, void* stream) { (void) next_pos; (void) stream; }
-    /// What waits for an idle bus goes now: a few pieces once a token's or window's last launches went out (`all` false),
-    /// the rest once the drafter's inputs went out (`all` true); the next token issues what is left.
-    virtual void end_window(bool all) { (void) all; }
+    /// What waits for an idle bus goes now, once a token's or window's last launches went out: its copies yield to the
+    /// output's and the next window's, and land while the drafter runs.
+    virtual void end_window() {}
     /// A verify window: attention of the `n_tokens` staged rows; `x`, `out`: [n_tokens][n_embd].
     virtual bool attention_window(int layer, int n_tokens, const float* x, float* out, void* stream, std::string& err) = 0;
     /// Enqueues what the routed experts read of `n_tokens` normed rows x [n_tokens][n_embd]: their copy in pinned host

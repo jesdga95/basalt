@@ -10,7 +10,8 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 
 - **Drafting does not change output** unless `--relaxed-drafting` is set. With the tiers pinned, 275 of 275 greedy prompts gave
   identical tokens on both packs tested (IQ3_XXS and IQ3_S), and every full-vocabulary logit row matched bit for bit.
-- **Lossy flags are opt-in:** `--relaxed-drafting`, `--route-prior`, `--route-tail-skip`. Each is named in one start warning.
+- **Lossy flags are opt-in:** `--relaxed-drafting`, `--route-prior`, `--route-tail-skip`. Each is named in one start warning,
+  which `basalt-bench` shows too; it marks such a run LOSSY, and a community run refuses them.
 - **Closer to BF16 than llama.cpp.** Same Q8_0 weights, against the BF16 reference: llama.cpp scores KLD 0.0325, top-1 93.98%;
   the Basalt Q8_0 pack scores KLD 0.0200, top-1 95.34%.
 - **Quantized once.** GGUF packs keep their blocks. The NVIDIA NVFP4 pack keeps NVIDIA's expert codes and scales bit for bit and
@@ -190,6 +191,17 @@ With a peer card faster than the main card, each GDN mixer may be split by key h
 changes in the last bits. Quality against the BF16 reference, swapped card order (peer at 400 W), NVFP4, 20 chunks, whole mixer against
 split: PPL 2.3129 / 2.2999, KLD 0.07294 / 0.07262, top-1 92.94% / 92.96%. The paired KLD difference is -0.00032 ± 0.0014. With a
 slower peer the split is not taken and output is bitwise the same as without it.
+
+## Video input
+
+A video reaches the encoder as transformers' Qwen3VLVideoProcessor prepares it. On four clips the sampled frames, canvas, groups and
+timestamps are identical. The pixel values after normalisation are within one uint8 step: 0.016% and 0.007% of values are one step
+off on 320x240 and 640x360 sources, 0.1% on a 720x358 one (40 of 14.9 M two steps). Frames convert to RGB with their own colour matrix, as PyAV's do.
+What differs is the resize: the image path's Pillow-style bicubic against torchvision's float antialiased bicubic.
+
+A group's two frames go through the patch embedding's two temporal taps apart (W0 a + W1 b, rel L2 6e-7 to 9e-7 against double
+precision). A picture keeps the summed taps, so image output is bitwise as before. In the prompt, the template's whole video marker
+becomes per-group `<t seconds>` text and pads, as the processor at the model's release (transformers 4.57.1) writes it.
 
 ## Lossy routing flags
 

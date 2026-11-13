@@ -1,4 +1,5 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
+#include "basalt/core/device.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/model.hpp"
@@ -6,6 +7,8 @@
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/memory.hpp"
+#include "models/deepseek41/attn_batch.hpp"
 #include "models/deepseek41/context_policy.hpp"
 #include "models/deepseek41/session.hpp"
 
@@ -140,15 +143,18 @@ prefillp::Dims DsModel::prompt_dims() const {
     for (const ExpertLayer& e : pack_.experts) {
         d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
     }
+    d.attn_fixed_bytes = attn_batch_fixed_bytes(cache_format_);
+    d.attn_token_bytes = attn_batch_token_bytes();
     return d;
 }
 
 bool DsModel::resolve_context(int64_t requested, std::string& err) {
     const Geometry& g = pack_.geo;
     const std::vector<int> ratios = cache_ratios(g);
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        err = "deepseek41: cannot query the free device memory";
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        err = "deepseek41: cannot query the free device memory: " + why;
         return false;
     }
     const ctxp::Plan p = ctxp::plan_context(requested, g.context_length, free_b, ratios, cache_format_);
@@ -197,6 +203,10 @@ bool DsModel::embedding_row(int32_t token, float* out, std::string& err) const {
         for (uint64_t b = 0; b < n_embd / 256; ++b) dequantize_q6_K(row.data() + b * 210, out + b * 256);
     }
     return true;
+}
+
+void DsModel::warm_token_table() const {
+    if (const TensorRef* t = pack_.find("token_embd.weight")) platform::advise_willneed(embd_fd_, t->offset, t->bytes);
 }
 
 bool DsModel::open_mmproj(vision::Mmproj& mp, std::string& err) const {

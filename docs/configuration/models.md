@@ -21,7 +21,8 @@ and starts the next.
 - `server`: shared by the whole server: `host`, `port`, `allowed-host`, `cors-origin`, `image-url-host`, `image-dir`,
   `image-remote-only`, `lazy`, `open`, `debug`, `request-lines`.
 - An entry takes engine flags and these server options: `gpu`, `vision`, `parallel`, `slot-full-context`, `idle-sleep`,
-  `idle-unload`, `min-free-vram-mib`, `fit-max-tokens`, `grammar`, the reasoning settings and the sampling defaults.
+  `idle-unload`, `min-free-vram-mib`, `fit-max-tokens`, `grammar`, `video-max-tokens`, the reasoning settings and the sampling
+  defaults.
 - `version` is `2`. A file in the old shape (no `models`) is refused.
 - The command line wins for every model.
 

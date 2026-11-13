@@ -1310,10 +1310,18 @@ uint64_t FileExpertSource::top_up(const std::vector<std::pair<int32_t, int32_t>>
                                   const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count) {
     count = 0;
     if (!complement_ready_ || top_arena_ != nullptr || !override_.empty() || !staged_.empty()) return 0;
-    const uint64_t avail = basalt::platform::available_memory();
+    detail::HostMemory hm;
+    const uint64_t avail = detail::host_available_memory(hm) ? hm.available : 0;
     if (avail == 0) return 0;
-    const uint64_t room = ram_tier_room(avail, basalt::platform::ram_reserve(), pin);
-    // the experts no tier holds, hottest first, as many as fit
+    // the experts no tier holds; what of them stays in the file keeps the file cache's floor free beside the reserve
+    uint64_t want = 0;
+    for (int32_t l = 0; l < (int32_t) n_layers_; ++l)
+        for (int32_t e = 0; e < (int32_t) n_expert_; ++e)
+            if (complement_offsets_[(size_t) l * (size_t) n_expert_ + (size_t) e] == kNoComplement && !skip(l, e))
+                want += layer_blob_bytes_[(size_t) l];
+    const uint64_t reserve = basalt::platform::ram_reserve();
+    const uint64_t room = ram_tier_room(avail, reserve + file_cache_keep(avail, reserve, pin, want, file_cache_), pin);
+    // hottest first, as many as fit
     std::vector<std::pair<int32_t, int32_t>> pick;
     std::vector<uint64_t> at;
     std::vector<uint8_t> seen(complement_offsets_.size(), 0);
