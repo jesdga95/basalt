@@ -1198,9 +1198,20 @@ class Service:
                         # next pass extends exactly what it holds and reads only the close
                         soft = threading.Event() if soft_stops else None
                         more = {"stop_soon": soft} if soft is not None else {}
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb,
+                        # A thinking budget caps the pass itself, so the engine stops on the budget's token and holds
+                        # exactly what was kept: the next pass extends its live state instead of reading the overshoot
+                        # again through the prompt path (which rounds differently from decoding).
+                        if thinking and not budget_ready and not isinstance(ids, PromptText):
+                            budget = self.answer_budget(budget_req, max_new, budget)
+                            budget_ready = True
+                        cap = max_new - n
+                        capped = bool(budget) and parser.state == "reasoning" and budget - thought < cap
+                        if capped:
+                            cap = max(1, budget - thought)
+                        gen = self.engine.generate(prompt, cap, sampling, cancel, embeddings=emb,
                                                    session=session, **more) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel, session=session, **more)
+                            else self.engine.generate(prompt, cap, sampling, cancel, session=session, **more)
+                        n_pass0 = n
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
                         looped = False                  # the wrap is for a repeated token, not the budget
                         asked = False                   # the wrap is the client's answer now
@@ -1322,6 +1333,11 @@ class Service:
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
+                        if drained and capped and not wrap and n - n_pass0 >= cap and n < max_new and not cancel.is_set():
+                            if parser.state == "reasoning" and thought >= budget and not parser.buf and not detok.pending():
+                                wrap = True             # the budget's last token: close the thinking
+                            else:                       # a split tag or character, or the thinking ended on it
+                                resumed = True
                         if drained and soft is not None and soft.is_set() and n < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and not parser.buf and not detok.pending():
                                 wrap = asked = True
