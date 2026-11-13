@@ -139,7 +139,7 @@ size_t chunk_bytes(const Geometry& g) {
     const size_t widest = std::max<size_t>({H, (size_t) g.n_ff, VD, AQ});
     const size_t keep = 6 * T * H * 4 + H * 4 +
                         std::max(prefill::mmq::q8_bytes(T, (int64_t) widest), prefill::fp8::act_bytes(T, (int64_t) widest)) +
-                        prefill::fp4_dense::act_bytes((int64_t) T, (int64_t) std::max<size_t>(H, g.n_ff)) + T * 4 + 4 * 256;
+                        prefill::fp4_dense::act_bytes((int64_t) T, (int64_t) std::max<size_t>(H, g.n_ff)) + 2 * T * 4 + 5 * 256;
     const size_t gdn = g.gdn_layers() ? (2 * T * C + 3 * T * VD + 4 * T * HV) * 4 + kernels::gdn_work_bytes(T) : 0;
     const size_t attn = g.attn_layers() ? T * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) * 4 +
                                               kernels::gqa_prompt_split_floats((int64_t) T, g.n_head, kAttnSplits) * 4
@@ -253,6 +253,7 @@ bool Model::ensure_chunk(std::string& err) {
     // the MLP's FP4 activations (fp4_dense) and their token scales
     b.a4 = pre_arena.take_bytes(prefill::fp4_dense::act_bytes((int64_t) T, (int64_t) std::max<size_t>(H, gg.n_ff)));
     b.gs = pre_arena.take<float>(T);
+    b.hmax = pre_arena.take<float>(T);
     const size_t phase = pre_arena.mark();
     if (gg.gdn_layers()) {
         b.qkv = pre_arena.take<float>(T * C);

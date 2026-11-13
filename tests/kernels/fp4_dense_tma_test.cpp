@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) return 77;
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) return bench();
 
-    const int64_t R = 384, K = 1280, T = 1100, T2 = 1000;
+    const int64_t R = 512, K = 1280, T = 1100, T2 = 1000;   // R a multiple of 256: the SwiGLU output is quantized again
     std::mt19937 rng(11);
     const Planes wg = make_planes(R, K, rng), wu = make_planes(R, K, rng);
     std::normal_distribution<float> nd;
@@ -198,9 +198,28 @@ int main(int argc, char** argv) {
                     host_copy(gs, T) == host_copy(gs2, T);
         std::printf("fp4 dense rms_norm_quantize: codes and scales %s\n", norm_same ? "bitwise quantize's of its normed rows" : "DIFFER");
     }
+    // SwiGLU's per-token amax: quantize_amax of its output gives quantize's codes and scales, reading the rows once
+    bool amax_same = false;
+    {
+        float *hmax, *gs3, *gs4;
+        void *a3, *a4;
+        cudaMalloc(&hmax, T * 4);
+        cudaMalloc(&gs3, T * 4);
+        cudaMalloc(&gs4, T * 4);
+        cudaMalloc(&a3, fd::act_bytes(T, R));
+        cudaMalloc(&a4, fd::act_bytes(T, R));
+        fd::quantize(dx, T, K, K, act, gs, nullptr);
+        fd::swiglu(dwg, dwu, dsc, dsc + 1, R, K, act, gs, T, yh, R, nullptr, hmax);
+        fd::quantize(yh, T, R, R, a3, gs3, nullptr);
+        fd::quantize_amax(yh, hmax, T, R, R, a4, gs4, nullptr);
+        cudaDeviceSynchronize();
+        amax_same = host_copy((const uint8_t*) a3, fd::act_bytes(T, R)) == host_copy((const uint8_t*) a4, fd::act_bytes(T, R)) &&
+                    host_copy(gs3, T) == host_copy(gs4, T);
+        std::printf("fp4 dense swiglu amax + quantize_amax: %s\n", amax_same ? "bitwise quantize's" : "DIFFER");
+    }
     const bool same = std::memcmp(hy.data(), hy2.data(), (size_t) T2 * R * 4) == 0;
     const bool same1 = std::memcmp(hy.data(), hy1.data(), (size_t) R * 4) == 0;
-    const bool ok = !launch_err && worst_plain < 1e-5 && worst_add < 1e-5 && worst_sw < 1e-5 && worst_q < 1.0 && same && same1 && norm_same;
+    const bool ok = !launch_err && worst_plain < 1e-5 && worst_add < 1e-5 && worst_sw < 1e-5 && worst_q < 1.0 && same && same1 && norm_same && amax_same;
     std::printf("fp4 dense tma [%lld x %lld] x %lld tokens: plain max err %.3g, add %.3g, swiglu %.3g (x sum|wx|), quantizer %.3g; "
                 "rows bitwise at 1, 1000, 1100 tokens: %s%s\n",
                 (long long) R, (long long) K, (long long) T, worst_plain, worst_add, worst_sw, worst_q,

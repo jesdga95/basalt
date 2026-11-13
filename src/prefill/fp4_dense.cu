@@ -109,6 +109,7 @@ struct Params {
     float* dst;
     int64_t ld;
     int tokens, K, tok_tiles;
+    float* amax;          // SwiGLU (optional): each token's largest |output|, raised with atomicMax (zeroed by the caller)
 };
 static_assert(offsetof(Params, a_codes) % 64 == 0 && sizeof(TmaDesc) % 64 == 0, "descriptors sit on the map boundary");
 
@@ -281,6 +282,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
             if constexpr (SWIGLU) {
                 const float ag = __fmul_rn(g, s0), au = __fmul_rn(g, s1);
                 const int r0 = row_begin + warp_n * 32 + 2 * (lane & 3);
+                float m = 0.0f;
 #pragma unroll
                 for (int f = 0; f < 4; ++f) {
                     float v[2];
@@ -289,21 +291,27 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
                         const float gg = __fmul_rn(acc[mm][f][2 * h + e], ag);
                         const float uu = __fmul_rn(acc[mm][f + 4][2 * h + e], au);
                         v[e] = gg / (1.0f + __expf(-gg)) * uu;
+                        m = fmaxf(m, fabsf(v[e]));
                     }
                     *reinterpret_cast<float2*>(out + r0 + 8 * f) = make_float2(v[0], v[1]);
+                }
+                if (p.amax) {   // the token's largest |value|: the four lanes of the token, then one atomic (max is exact)
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+                    if ((lane & 3) == 0) atomicMax(reinterpret_cast<int*>(p.amax + t), __float_as_int(m));
                 }
             } else {
                 const float alpha = __fmul_rn(g, s0);
                 const int r0 = row_begin + warp_n * kWarpRows + 2 * (lane & 3);
+                float2 res[kMmaRows];   // ADD: every residual pair loaded before any is written back
+                if constexpr (ADD)
+#pragma unroll
+                    for (int f = 0; f < kMmaRows; ++f) res[f] = __ldcg(reinterpret_cast<const float2*>(out + r0 + 8 * f));
 #pragma unroll
                 for (int f = 0; f < kMmaRows; ++f) {
                     float2 v = make_float2(__fmul_rn(acc[mm][f][2 * h], alpha), __fmul_rn(acc[mm][f][2 * h + 1], alpha));
-                    float2* d = reinterpret_cast<float2*>(out + r0 + 8 * f);
-                    if constexpr (ADD) {
-                        const float2 o = *d;
-                        v = make_float2(__fadd_rn(o.x, v.x), __fadd_rn(o.y, v.y));
-                    }
-                    *d = v;
+                    if constexpr (ADD) v = make_float2(__fadd_rn(res[f].x, v.x), __fadd_rn(res[f].y, v.y));
+                    *reinterpret_cast<float2*>(out + r0 + 8 * f) = v;
                 }
             }
         }
@@ -312,10 +320,11 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
 // One warp per token row (and per padding row of the last scale tile).  Token scale g = amax / (6 * 448); per 16 values
 // a UE4M3 scale of block amax / (6 g); codes round to nearest even on x / (scale * g), value 2b in byte b's low nibble.
 // NORM: the row is RMSNorm'd first (x * rsqrt(mean(x^2) + eps) * nw), the normed row optionally written to xn.
-template <bool NORM>
+// AMAX: each row's largest |value| is given (rowmax), so the row is read once.
+template <bool NORM, bool AMAX = false>
 __global__ void quantize_kernel(const float* __restrict__ x, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales,
                                 float* __restrict__ gs, int cols, int64_t ld, int64_t rows, const float* __restrict__ nw = nullptr,
-                                float eps = 0.0f, float* __restrict__ xn = nullptr) {
+                                float eps = 0.0f, float* __restrict__ xn = nullptr, const float* __restrict__ rowmax = nullptr) {
     const int lane = threadIdx.x & 31;
     const int64_t r = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     const int nb = cols / 16, ktiles = cols / 256;
@@ -351,16 +360,20 @@ __global__ void quantize_kernel(const float* __restrict__ x, uint8_t* __restrict
         return v;
     };
     float amax = 0.0f;
-    for (int b = lane; b < nb; b += 32) {
+    if (AMAX) {
+        amax = rowmax[r];
+    } else {
+        for (int b = lane; b < nb; b += 32) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float4 v = val4(16 * b + 4 * i);
-            if (NORM && xn) *(float4*) (xn + r * cols + 16 * b + 4 * i) = v;
-            amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+            for (int i = 0; i < 4; ++i) {
+                const float4 v = val4(16 * b + 4 * i);
+                if (NORM && xn) *(float4*) (xn + r * cols + 16 * b + 4 * i) = v;
+                amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+            }
         }
-    }
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    }
     const float g = amax * (1.0f / (6.0f * 448.0f));
     if (lane == 0) gs[r] = g;
     const float inv_g = amax > 0.0f ? 1.0f / g : 0.0f;
@@ -492,6 +505,21 @@ void quantize(const float* x, int64_t rows, int64_t cols, int64_t ld, void* act,
     ck(cudaGetLastError(), "quantize");
 }
 
+void quantize_amax(const float* x, const float* rowmax, int64_t rows, int64_t cols, int64_t ld, void* act, float* gs,
+                   void* stream) {
+    if (rows <= 0) return;
+    if (cols % 256 || (ld & 3) || (reinterpret_cast<uintptr_t>(x) & 15) || (reinterpret_cast<uintptr_t>(act) & 15)) {
+        basalt::log::error("basalt", "fp4 dense: quantize %lld columns, ld %lld", (long long) cols, (long long) ld);
+        std::exit(1);
+    }
+    uint8_t* codes = (uint8_t*) act;
+    uint8_t* scales = codes + (size_t) rows * (size_t) (cols / 2);
+    const unsigned grid = (unsigned) ((padded(rows) + 7) / 8);
+    quantize_kernel<false, true><<<grid, 256, 0, (cudaStream_t) stream>>>(x, codes, scales, gs, (int) cols, ld, rows, nullptr, 0.0f,
+                                                                          nullptr, rowmax);
+    ck(cudaGetLastError(), "quantize_amax");
+}
+
 void rms_norm_quantize(const float* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* gs, float* xn,
                        void* stream) {
     if (rows <= 0) return;
@@ -519,9 +547,12 @@ void product(const void* w, const float* w_scale, int64_t rows, int64_t K, const
 }
 
 void swiglu(const void* w_gate, const void* w_up, const float* s_gate, const float* s_up, int64_t rows, int64_t K,
-            const void* act, const float* gs, int64_t tokens, float* dst, int64_t ld, void* stream) {
+            const void* act, const float* gs, int64_t tokens, float* dst, int64_t ld, void* stream, float* amax) {
     check(w_gate, w_up, rows, K, tokens, act, dst, ld, "swiglu");
     Params p{};
+    p.amax = amax;
+    if (amax && cudaMemsetAsync(amax, 0, (size_t) tokens * sizeof(float), (cudaStream_t) stream) != cudaSuccess)
+        ck(cudaGetLastError(), "swiglu amax");
     p.gs = gs;
     p.ws[0] = s_gate;
     p.ws[1] = s_up;
