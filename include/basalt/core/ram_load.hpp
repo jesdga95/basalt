@@ -83,8 +83,10 @@ bool read_ram_runs(const RamLoad& load, RamLoadStats& stats, std::string& err);
 /// budget; what stays unpinned is locked in the working set.
 struct RamPin {
     uint64_t registered_bytes = 0;
+    bool allocation_backed = false;   ///< pinned by the allocation; unpin_ram must not unregister it
     bool sliced = false;
     std::vector<uint64_t> slice_starts;
+    std::vector<const uint8_t*> slice_devices;   ///< independent mapped aliases, when requested
     int slices = 0;
     uint64_t locked_bytes = 0;
     uint64_t lock_off = 0;
@@ -99,6 +101,39 @@ struct RamPin {
 RamPin pin_ram(void* base, uint64_t register_bytes, uint64_t lock_bytes, const std::vector<uint64_t>& bounds, bool mapped,
                const uint8_t** device = nullptr);
 void unpin_ram(void* base, const RamPin& pin);
+
+/// Owns an expert RAM span. Pinning may come from host VMM, otherwise pin_ram registers it after the read.
+/// Ordinary registrations must be removed before reset; allocation-backed pins live until reset.
+class RamAllocation {
+public:
+    RamAllocation() = default;
+    ~RamAllocation();
+    RamAllocation(RamAllocation&& other) noexcept;
+    RamAllocation& operator=(RamAllocation&& other) noexcept;
+    RamAllocation(const RamAllocation&) = delete;
+    RamAllocation& operator=(const RamAllocation&) = delete;
+    /// `pin` permits allocation-backed pinning; ordinary memory is registered separately after the read.
+    bool allocate(uint64_t bytes, bool pin = true);
+    void reset();
+    uint8_t* data() const { return data_; }
+    uint64_t bytes() const { return bytes_; }
+    uint64_t capacity() const { return capacity_; }
+    bool allocation_pinned() const { return allocation_pinned_; }
+private:
+    uint8_t* data_ = nullptr;
+    uint64_t bytes_ = 0, capacity_ = 0;
+    bool allocation_pinned_ = false;
+};
+
+RamPin pin_ram(const RamAllocation& allocation, const std::vector<uint64_t>& bounds, bool mapped,
+               const uint8_t** device = nullptr);
+std::vector<RamPin> pin_ram_spans(const std::vector<RamAllocation>& allocations, bool mapped);
+
+/// Remaining portable-registration allowance across the visible adapters. A known exhausted budget is true/0.
+bool host_pin_budget(uint64_t& limit, std::string& why);
+/// Page-aligned cuts at whole-object boundaries; no object may span two registrations.
+std::vector<uint64_t> ram_pin_slices(std::vector<uint64_t> starts, uint64_t end, uint64_t page, uint64_t target);
+const uint8_t* ram_pin_alias(const std::vector<uint64_t>& starts, const std::vector<const uint8_t*>& devices, uint64_t off);
 
 /// Kernel memory the GPU driver keeps beside `pinned` bytes of page-locked host memory (its per-page tracking): a plan
 /// that pins counts it with them.

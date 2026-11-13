@@ -69,7 +69,10 @@ frames decode on the CPU.
 
 ## Windows limitations
 
-- Pinned memory is capped under WDDM: the pinned slices are limited to `RAM/2 - 8 GiB` when the whole arena cannot be registered.
+- Portable host registrations stay within the visible adapters' DXGI non-local allowances, leaving driver headroom.
+  Whole-expert slices retain their own device aliases; the unregistered tail is locked in the working set.
+  Qwen and DeepSeek's resident RAM tiers share CUDA host VMM when supported, with ordinary registration as the fallback.
+  Allocation-backed pins stay in RAM across SLEEP/WAKE; the expert caches can still return their VRAM.
 - Large pages need "Lock pages in memory" (Administrators). Without it the engine uses 4 KiB pages and says so at start.
 - No shared arena files and no cgroup limits. `--ple-io direct` reads through the file cache.
 - `basalt serve` runs the Python server as a child.

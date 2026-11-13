@@ -68,8 +68,8 @@ ExpertTier::~ExpertTier() {
     for (size_t l = 0; l < ram_.size(); ++l) {
         if (ram_[l] == nullptr) continue;
         if (l < ram_pins_.size()) core::unpin_ram(ram_[l], ram_pins_[l]);
-        platform::free_aligned(ram_[l]);
     }
+    ram_allocations_.clear();
     platform::free_aligned(act_);
 }
 
@@ -427,6 +427,7 @@ bool ExpertTier::load_ram(std::string& err) {
     }
     // the layout: one span per layer, each with its swap spare
     std::vector<uint64_t> span_bytes((size_t) n_layers_, 0);
+    ram_allocations_.resize((size_t) n_layers_);
     core::RamGrid grid;
     grid.n_layers = n_layers_;
     grid.n_expert = n_expert_;
@@ -437,11 +438,11 @@ bool ExpertTier::load_ram(std::string& err) {
         grid.blob_bytes.push_back(el.blob_bytes);
         if (cover_ <= 0) continue;
         span_bytes[(size_t) l] = el.blob_bytes * (uint64_t) (cover_ + 1);
-        ram_[(size_t) l] = core::alloc_ram(span_bytes[(size_t) l]);
-        if (ram_[(size_t) l] == nullptr) {
+        if (!ram_allocations_[(size_t) l].allocate(span_bytes[(size_t) l])) {
             err = "deepseek41: cannot allocate the RAM expert tier";
             return false;
         }
+        ram_[(size_t) l] = ram_allocations_[(size_t) l].data();
     }
     core::RamLoad load;
     load.fd = m_.experts_fd();
@@ -467,7 +468,12 @@ bool ExpertTier::load_ram(std::string& err) {
         return false;
     }
     if (cover_ > 0) {
-        ram_pins_ = core::pin_ram_spans(ram_, span_bytes, /*mapped=*/false);
+        uint64_t host_pinned = 0;
+        for (const auto& a : ram_allocations_)
+            if (a.allocation_pinned()) host_pinned += a.capacity();
+        ram_pins_ = core::pin_ram_spans(ram_allocations_, /*mapped=*/false);
+        if (host_pinned)
+            basalt::log::info("basalt deepseek41", "RAM expert tier: %.2f GiB CUDA-pinned through host VMM", host_pinned / 1073741824.0);
         int unpinned = 0;
         for (const core::RamPin& p : ram_pins_) unpinned += p.registered_bytes == 0;
         if (unpinned > 0)

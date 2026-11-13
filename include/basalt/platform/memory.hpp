@@ -59,7 +59,20 @@ void free_region(void* mapping_base, uint64_t mapping_bytes);
 /// The most host memory the GPU may map page-locked before its shared-memory segment is full, when the OS limits it
 /// beneath the driver's own refusal (`why` names where the figure comes from); false when it does not, and the driver's
 /// refusal is the limit.
-bool pin_budget(uint64_t& limit, std::string& why);
+bool pin_budget(uint64_t& limit, std::string& why, const char* luid = nullptr,
+                uint32_t node_mask = 0, bool shared_mapping = false);
+
+// Portable registrations consume each WDDM adapter's non-local budget. Host VMM instead backs the CPU tier
+// without registering the same pages on every adapter; other platforms keep their existing allocation path.
+#if defined(_WIN32)
+inline constexpr bool kBoundHostRegistration = true;
+inline constexpr bool kPreferHostVmm = true;
+#else
+inline constexpr bool kBoundHostRegistration = false;
+inline constexpr bool kPreferHostVmm = false;
+#endif
+uint64_t system_page_size();
+inline uint64_t pin_reserve(uint64_t budget) { return budget / 20 > (1ull << 30) ? budget / 20 : (1ull << 30); }
 
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
