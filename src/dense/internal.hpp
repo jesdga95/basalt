@@ -23,6 +23,7 @@ constexpr int kWindow = 8;        // rows a decode window holds
 constexpr int kChunk = 2048;      // tokens a prompt chunk reads at once
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
 constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
+constexpr int kTypeNvfp4Planes = 45;   // NVFP4_PLANES matrices (Linear::type; the loader turns them into ggml blocks for now)
 
 /// Device buffers carved from one allocation.
 class Arena {
