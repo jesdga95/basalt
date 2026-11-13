@@ -119,6 +119,7 @@ const Kernel& kernel_for(const Call& c, int nt) {
     if (c.fmt != Format::Nvfp4 && swiglu) refuse("an FP8 or BF16 SwiGLU pair", c);
     if (c.fmt == Format::F8) return detail::f8(nt);
     if (c.fmt == Format::Bf16) return detail::bf16(nt);
+    if (c.fmt == Format::Q8) return detail::q8(nt);
     return swiglu ? detail::nvfp4_swiglu(nt) : detail::nvfp4(nt);
 }
 
@@ -134,7 +135,7 @@ Plan plan_for(const Call& c) {
         for (int i = 0; i < c.n; ++i) p.tiles += (int) ((c.m[i].rows + rs - 1) / rs);
     p.nchunks = (int) (c.K / p.k->ch);
     const int64_t R = resident(*p.k);
-    const int cb = c.fmt == Format::F8 ? p.k->ch : c.fmt == Format::Bf16 ? 2 * p.k->ch : p.k->ch / 2;   // weight bytes per row per chunk
+    const int cb = c.fmt == Format::F8 || c.fmt == Format::Q8 ? p.k->ch : c.fmt == Format::Bf16 ? 2 * p.k->ch : p.k->ch / 2;   // weight bytes per row per chunk
     const double sums = 1.0 + 64.0 / cb;   // an item's fixed cost in chunks: its pipeline turn and its slice's sums
     double best = 1e30;
     for (int ks = 1; ks <= std::min(p.nchunks, 64); ++ks) {
@@ -159,7 +160,27 @@ int64_t part_rows(const Call& c) {
     return r;
 }
 
+// one thread per (row, 32-value block): the fp16 scale to the scale plane, the 32 codes to the code plane
+__global__ void q8_planes_kernel(const uint8_t* __restrict__ src, int64_t rows, int64_t K, uint8_t* __restrict__ dst) {
+    const int64_t nb = K / 32, i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * nb) return;
+    const int64_t r = i / nb, b = i - r * nb;
+    const uint8_t* blk = src + i * 34;
+    uint8_t* codes = dst + r * K + b * 32;
+    for (int k = 0; k < 32; ++k) codes[k] = blk[2 + k];
+    uint8_t* sc = dst + rows * K + (r * nb + b) * 2;
+    sc[0] = blk[0];
+    sc[1] = blk[1];
+}
+
 }  // namespace
+
+void q8_planes(const void* blocks, int64_t rows, int64_t K, void* planes, void* stream) {
+    if (K % 32 != 0) refuse("Q8 planes of K not a multiple of 32", Call{});
+    const int64_t n = rows * (K / 32);
+    q8_planes_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>((const uint8_t*) blocks, rows, K, (uint8_t*) planes);
+    check("window gemm: q8 planes");
+}
 
 std::size_t act_bytes(int64_t K) { return (size_t) kRows * K * sizeof(uint16_t); }
 
@@ -204,7 +225,7 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
     int64_t off = 0;
     for (int i = 0; i < c.n; ++i) {
         a.w[i] = c.m[i].w;
-        a.sp[i] = c.m[i].scales ? c.m[i].scales : c.m[i].w + c.m[i].rows * (c.K / 2);
+        a.sp[i] = c.m[i].scales ? c.m[i].scales : c.m[i].w + c.m[i].rows * (c.fmt == Format::Q8 ? c.K : c.K / 2);
         a.rows[i] = c.m[i].rows;
         a.scale[i] = c.m[i].scale;
         a.y[i] = c.m[i].y;

@@ -17,7 +17,16 @@ namespace basalt::kernels::wgemm {
 
 constexpr int kRows = 16;   // rows a window holds
 
-enum class Format { F8, Nvfp4, Bf16 };
+enum class Format {
+    F8,      // E4M3 codes [rows][K]
+    Nvfp4,   // planes (nvfp4_planes.hpp)
+    Bf16,    // [rows][K]
+    Q8,      // Q8_0 in planes: int8 codes [rows][K], then fp16 scales [rows][K / 32] (q8_planes); a code times its scale
+             // rounds to bf16
+};
+
+/// Q8_0 blocks (rows x K, ggml's 34-byte blocks) into Q8 planes, the same bytes, `planes` distinct from `blocks`.
+void q8_planes(const void* blocks, int64_t rows, int64_t K, void* planes, void* stream);
 
 /// Bytes of a window's activations for K values per row: [16][K] bf16.
 std::size_t act_bytes(int64_t K);
@@ -41,7 +50,7 @@ struct Matrix {
     const float* scale = nullptr;
     float* y = nullptr;
     int64_t ld_y = 0;
-    const uint8_t* scales = nullptr;   // NVFP4: the scale plane when `rows` are the first rows of a larger matrix (null: after
+    const uint8_t* scales = nullptr;   // NVFP4, Q8: the scale plane when `rows` are the first rows of a larger matrix (null: after
                                        // the codes of these rows)
 };
 

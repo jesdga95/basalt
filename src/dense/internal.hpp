@@ -26,6 +26,7 @@ constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's
 constexpr int kChunk = 2048;      // tokens a prompt chunk reads at once
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
 constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
+constexpr int kTypeQ8P = 108;     // Q8_0 in planes (window_gemm Format::Q8), made at load for the decode window
 constexpr int kTypeNvfp4Planes = 45;   // NVFP4_PLANES matrices (Linear::type, nvfp4_planes.hpp)
 
 /// Device buffers carved from one allocation.
@@ -122,6 +123,8 @@ public:
     uint64_t batch_clock = 0;
     std::unique_ptr<vision::Mmproj> mmproj;
     std::unique_ptr<vision::CudaEncoder> encoder;
+    BlockDrafter bd_dec;                         // the block drafter as decode windows run it (its products in Q8 planes)
+    std::vector<void*> owned;                    // device buffers the model allocated (Q8 plane copies, a wider workspace)
     void* enc_arena = nullptr;
     size_t enc_bytes = 0;
     ~Model();
