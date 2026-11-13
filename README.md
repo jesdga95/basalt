@@ -22,6 +22,7 @@ Prebuilt Linux and Windows archives are attached to each [release](https://githu
 git clone https://github.com/jesdga95/basalt && cd basalt
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
+                                        # one model only: -DBASALT_MODELS=qwen4exp or deepseek41 ([building](docs/building.md#building-only-some-models))
 pip install -r requirements.txt
 hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-NVFP4-DQ6_K.basalt --local-dir models
 ```
