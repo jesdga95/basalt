@@ -326,7 +326,7 @@ endif()
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
-                             src/core/host_plan.cpp)
+                             src/core/host_plan.cpp src/core/checkpoint_transfer.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -463,6 +463,10 @@ if(BUILD_TESTING)
   target_include_directories(conversation_memory_test PRIVATE include)
   target_link_libraries(conversation_memory_test PRIVATE platform)
   basalt_cpu_test(NAME conversation_memory_test COMMAND conversation_memory_test)
+  add_executable(checkpoint_transfer_test tests/core/checkpoint_transfer_test.cpp)
+  target_link_libraries(checkpoint_transfer_test PRIVATE core)
+  basalt_gpu_test(NAME checkpoint_transfer_test COMMAND checkpoint_transfer_test)
+  set_tests_properties(checkpoint_transfer_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   if(BASALT_MODEL_QWEN4EXP)
   add_executable(conversation_validation_test tests/core/conversation_validation_test.cpp)
   target_link_libraries(conversation_validation_test PRIVATE model_qwen4exp_engine)
@@ -473,14 +477,15 @@ if(BUILD_TESTING)
   target_link_libraries(conversation_store_test PRIVATE model_qwen4exp_engine)
   basalt_cpu_test(NAME conversation_store_test COMMAND conversation_store_test)
   set_tests_properties(conversation_store_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
-  # The transfer-failure paths are reached by GNU ld's --wrap, which symbolizes the three runtime calls. The Windows
+  # The transfer-failure paths are reached by GNU ld's --wrap, which symbolizes the runtime calls. The Windows
   # linker has no equivalent, so that one program is not built here; the same source builds the ordinary snapshot
   # test above, which does port.
   if(NOT WIN32)
     add_executable(conversation_transfer_test tests/core/conversation_validation_test.cpp)
     target_compile_definitions(conversation_transfer_test PRIVATE CONVERSATION_TEST_TRANSFERS)
     target_link_options(conversation_transfer_test PRIVATE
-      -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError)
+      -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaStreamSynchronize
+      -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError)
     target_link_libraries(conversation_transfer_test PRIVATE model_qwen4exp_engine)
     basalt_cpu_test(NAME conversation_transfer_test COMMAND conversation_transfer_test)
     set_tests_properties(conversation_transfer_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)

@@ -299,17 +299,20 @@ public:
 
     size_t running_bytes() const override { return ops_ ? ops_->turn_bytes() : 0; }
 
-    model::Result save_running(uint8_t* host, int64_t pos) override {
-        if (!prefillp::may_save(pos, whole_from_)) return {model::Status::Error, kSkippedRows};
-        sync_rewind(pos);
+    model::Result running_state(int64_t pos, bool save, core::RunningState& s) override {
         if (!ops_) return {model::Status::NotImplemented, "no state yet"};
-        ops_->save_turn(stream_, host);
+        if (save) {
+            if (!prefillp::may_save(pos, whole_from_)) return {model::Status::Error, kSkippedRows};
+            sync_rewind(pos);
+        }
+        ops_->turn_regions(s.regions);
+        s.stream = stream_;
         return {};
     }
 
-    model::Result restore_running(const uint8_t* host, int64_t pos) override {
+    model::Result running_restored(int64_t pos, const uint8_t*) override {
         if (!ops_) return {model::Status::Error, "no state yet"};
-        ops_->restore_turn(stream_, host);
+        ops_->turn_restored();
         whole_from_ = 0;
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         feat_n_ = 0;

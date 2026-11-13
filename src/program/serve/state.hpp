@@ -2,6 +2,7 @@
 #pragma once
 
 #include "../cli/tokens.hpp"
+#include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/conversation_store.hpp"
@@ -113,7 +114,9 @@ public:
     virtual bool capture_admit(uint64_t need, uint64_t floor) = 0;
     virtual bool park_current(size_t held, int64_t kept) = 0;
     virtual bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) = 0;
-    virtual void ckd_finish() {}
+    /// Waits for the checkpoint save still on its way to the host, if any; a save that failed drops its checkpoint.  Every
+    /// reader of a checkpoint's bytes (a restore, a copy, a park) calls it first.
+    void ckd_finish();
     /// Writes the `CONV` line with the RAM tier's figures (a restore adds the tokens it returned and its ms), for
     /// every model after it parks or restores a conversation.
     void report_conversations(long long restored = -1, double restored_ms = 0);
@@ -150,6 +153,12 @@ public:
     std::vector<ImgKey> req_imgs{};
     bool live_ok{};
     std::vector<ConvCheckpoint> checks{};
+    /// The checkpoint save in flight (see ckd_finish).  Declared after `checks`: its wait runs before their bytes are freed.
+    basalt::core::CheckpointDeferral ckd{};
+    /// A checkpoint of `to` tokens already in the chain is used again (and keeps the higher `source`): true.
+    bool touch_check(int64_t to, ConvCheckpoint::Source source);
+    /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache.
+    void keep_check(ConvCheckpoint&& c);
     uint64_t check_clock{};
     bool cvec_cached{};
     std::optional<basalt::core::ConversationCache> conversations;
