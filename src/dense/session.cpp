@@ -363,6 +363,15 @@ public:
 private:
     // The last window's accepted rows go into the recurrent state once the next call says where it starts.
     Result settle(int64_t pos) {
+        if (pos == 0) {   // a new conversation: the running state starts empty
+            pend_T_ = 0;
+            st_.rope_delta = 0;
+            st_.tail_cell = -1;
+            if (g_.gdn_layers() &&
+                cudaMemsetAsync(st_.gdn, 0, (size_t) g_.gdn_layers() * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
+                return fail("clearing the recurrent state failed");
+            return {};
+        }
         if (pend_T_ == 0) return {};
         const int64_t n = pos - pend_pos_;
         pend_T_ = std::max(pend_T_, 0);
