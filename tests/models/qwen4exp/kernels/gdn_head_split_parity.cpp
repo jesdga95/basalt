@@ -19,7 +19,7 @@
 // microseconds per layer.
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/models/qwen4exp/decode/gdn_head_split.hpp"
-#include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
+#include "basalt/kernels/gdn_window.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"

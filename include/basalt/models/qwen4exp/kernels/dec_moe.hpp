@@ -11,7 +11,7 @@
 // tier gives the same bits as before; only the PCIe share is gone (those entries go to the CPU pool).
 #pragma once
 
-#include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
+#include "basalt/kernels/gdn_window.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 
 #include <cstddef>

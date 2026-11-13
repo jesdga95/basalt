@@ -7,7 +7,7 @@
 #include "basalt/models/qwen4exp/decode/gdn_head_split.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/peer_experts.hpp"
-#include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
+#include "basalt/kernels/gdn_window.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/progress.hpp"

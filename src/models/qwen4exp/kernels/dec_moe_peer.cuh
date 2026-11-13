@@ -7,7 +7,7 @@ namespace {
 // The peer's shared memory: the expert rings' or the mixer recurrence's (never both at once in a block).
 union DmPeerShared {
     DmShared d;
-    RecSmem r;
+    RecSmem<10> r;
 };
 
 // The peer window.  Per ring: block 0 waits for CUDA0's doorbell and copies the ring's header and q8_1 rows to the
@@ -106,7 +106,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                 if (tid < 128)   // one 128-thread item per (value head, rank), grid-strided
                     for (int it = blockIdx.x; it < 4 * R.h_v; it += nb) {
                         if (it != (int) blockIdx.x) rec_sync<true>();
-                        rec_block<kDecMaxT, true, true>(R, mt, it >> 2, it & 3, su.r, nullptr);
+                        rec_block<kDecMaxT, 10, true, true>(R, mt, it >> 2, it & 3, su.r, nullptr);
                     }
                 if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
                 stamp(a.steps + s, 2);

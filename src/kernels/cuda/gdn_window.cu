@@ -1,4 +1,4 @@
-// src/models/qwen4exp/kernels/dec_gdn_rec.cu - see include/basalt/models/qwen4exp/kernels/dec_gdn.hpp: the recurrence stage.
+// src/kernels/cuda/gdn_window.cu - see include/basalt/kernels/gdn_window.hpp: the recurrence stage.
 //
 // Built with the flags of verify_kernels.cu, whose kernels it fuses: gdn_conv_l2_multi (conv1d + SiLU + q/k L2
 // norm), gdn_ab_multi (alpha/beta gates), gdn_step_norm_multi (the recurrence and the gated RMS norm).  The q8_1 of
@@ -10,9 +10,8 @@
 // adds the four warps' butterflies in rank order through distributed shared memory; rank 0 computes alpha, rank 1
 // beta, and the others read them the same way.  The state and every constant are loaded before the grid
 // dependency wait (the window never writes the state).
-#include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
+#include "basalt/kernels/gdn_window.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 
 #include <cooperative_groups.h>
@@ -31,7 +30,6 @@ namespace {
 constexpr int S = 128;   // state size
 constexpr int RG = 4;    // row groups
 constexpr int RPG = S / RG;
-constexpr int NJ = 10;   // uint4 of bf16 per lane in a 2560-wide alpha/beta row
 
 struct Q81 {
     half2 ds;
@@ -74,6 +72,8 @@ __device__ __forceinline__ void stamp(const DecRecArgs& a, int i) {
     a.stamps[blockIdx.x * 10 + i] = t;
 }
 
+// NJ: uint4 of bf16 per lane in an alpha/beta row (its width / 256)
+template<int NJ>
 struct RecSmem {
     float qn[kDecMaxT][S], kn[kDecMaxT][S];
     float v[kDecMaxT][32];
@@ -87,6 +87,7 @@ struct RecSmem {
 
 // alpha (is_beta false) or beta of `head` for token t: gdn_ab_multi_unrolled_kernel's sum, one warp.  The row's
 // weights are in shared memory; the token's 80 activations per lane are loaded at once.
+template<int NJ>
 __device__ __forceinline__ float ab_one(const DecRecArgs& a, const uint4* __restrict__ w_sm, bool is_beta, int t, int lane,
                                         float dt, float sa) {
     const float4* xt = reinterpret_cast<const float4*>(a.x + (size_t) t * a.n_embd);
@@ -113,7 +114,7 @@ __device__ __forceinline__ float ab_one(const DecRecArgs& a, const uint4* __rest
     return sp * sa;
 }
 
-// The launch's value head `head` under the head map (dec_gdn.hpp): gh the layer's value head, qh its key head, lq
+// The launch's value head `head` under the head map (gdn_window.hpp): gh the layer's value head, qh its key head, lq
 // the card's key head, nkl / nvl the card's key and value heads, cl the card's qkv channels.
 struct HeadMap {
     int gh, qh, lq, nkl, nvl, cl;
@@ -136,7 +137,8 @@ __device__ __forceinline__ void norm_q8(const DecRecArgs& a, int t, int head, in
                                         float ss, float gam, float z) {
     const int value_dim = S * nvl, col = rank * 32 + lane;
     const float scale = rsqrtf(ss / (float) S + a.eps);
-    const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-z)));
+    const float act = a.gate_act == GdnGate::Silu ? z / (1.0f + __expf(-z)) : 1.0f / (1.0f + __expf(-z));
+    const float yv = oc * scale * gam * act;
     if (a.y) a.y[(size_t) t * value_dim + head * S + col] = yv;
     float amax = fabsf(yv), sum = yv;
 #pragma unroll
@@ -166,8 +168,8 @@ __device__ __forceinline__ void rec_sync() {
 
 // One block of a head's cluster.  `head` = the launch's value head (head_map), `rank` = its column group.  SPLIT: no cluster and no z; the
 // head's raw output goes to a.o for dec_gdn_rec_norm.
-template<int MAXT, bool SPLIT, bool SUB = false>
-__device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem& sm,
+template<int MAXT, int NJ, bool SPLIT, bool SUB = false>
+__device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem<NJ>& sm,
                                           cg::cluster_group* cluster) {
     const int rg = threadIdx.x / 32, lane = threadIdx.x % 32, tid = threadIdx.x;
     stamp(a, 0);
@@ -210,7 +212,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     for (int job = rg; job < 2 * T; job += RG) {   // (gate, token) jobs over the four warps
         const int t = job >> 1;
         const bool is_beta = job & 1;
-        const float v = ab_one(a, sm.wab[is_beta], is_beta, t, lane, dt, sa);
+        const float v = ab_one<NJ>(a, sm.wab[is_beta], is_beta, t, lane, dt, sa);
         if (lane == 0) (is_beta ? sm.b : sm.g)[t] = v;
     }
     pdl_wait();
@@ -336,27 +338,27 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     stamp(a, 9);
 }
 
-template<int MAXT>
+template<int MAXT, int NJ>
 __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_kernel(const DecRecArgs a, int T) {
-    __shared__ RecSmem sm;
+    __shared__ RecSmem<NJ> sm;
     cg::cluster_group cl = cg::this_cluster();
-    rec_block<MAXT, false>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
+    rec_block<MAXT, NJ, false>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
 }
 
-template<int MAXT>
+template<int MAXT, int NJ>
 __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T) {
-    __shared__ RecSmem sm;
-    rec_block<MAXT, true>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, nullptr);
+    __shared__ RecSmem<NJ> sm;
+    rec_block<MAXT, NJ, true>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, nullptr);
 }
 
 // rec_kernel over a segmented window: cluster row y is a window row, of which only a segment's first works, on the
 // segment's rows and state
-template<int MAXT>
+template<int MAXT, int NJ>
 __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
                                                                               size_t state_off) {
     const SegRow r = rows[blockIdx.y];
     if (r.j != 0) return;
-    __shared__ RecSmem sm;
+    __shared__ RecSmem<NJ> sm;
     cg::cluster_group cl = cg::this_cluster();
     DecRecArgs a = a0;
     const size_t vd = (size_t) S * a.h_v, r0 = (size_t) r.row0;
@@ -365,7 +367,7 @@ __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(co
     a.gate += r0 * a.h_v; a.beta += r0 * a.h_v;
     if (a.y) a.y += r0 * vd;
     a.yq = static_cast<char*>(a.yq) + r0 * (vd / 32) * sizeof(Q81);
-    rec_block<MAXT, false>(a, r.n, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
+    rec_block<MAXT, NJ, false>(a, r.n, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
 }
 
 // one warp per (token, value head): the head's four 32-value sums of squares in rank order, then norm_q8 per rank
@@ -398,47 +400,56 @@ static int mapped_heads(const DecRecArgs& a) {
     return a.nk * (a.h_v / a.h_k);
 }
 
+bool dec_gdn_rec_supported(int n_embd) { return n_embd == 2560 || n_embd == 5120; }
+
+// the kernel for a block width: NJ = n_embd / 256
+template<template<int, int> class K, class L>
+static void by_width(int n_embd, int max_t, L launch) {
+    if (n_embd == 5120) {
+        if (max_t <= 2) launch(K<2, 20>::f); else if (max_t <= 4) launch(K<4, 20>::f); else launch(K<kDecMaxT, 20>::f);
+    } else {
+        if (max_t <= 2) launch(K<2, 10>::f); else if (max_t <= 4) launch(K<4, 10>::f); else launch(K<kDecMaxT, 10>::f);
+    }
+}
+template<int MAXT, int NJ> struct RecK { static constexpr auto f = rec_kernel<MAXT, NJ>; };
+template<int MAXT, int NJ> struct SplitK { static constexpr auto f = rec_split_kernel<MAXT, NJ>; };
+template<int MAXT, int NJ> struct SegK { static constexpr auto f = rec_seg_kernel<MAXT, NJ>; };
+
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
-    if (n_tok < 1 || n_tok > kDecMaxT || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 || a.h_v % a.h_k != 0 ||
+    if (n_tok < 1 || n_tok > kDecMaxT || !dec_gdn_rec_supported(a.n_embd) || a.h_k <= 0 || a.h_v % a.h_k != 0 ||
         mapped_heads(a) < 1) {
         basalt::log::error("basalt", "dec_gdn_rec: invalid arguments");
         std::exit(1);
     }
     const dim3 grid((unsigned) (mapped_heads(a) * 4)), block(S);
     const cudaStream_t s = (cudaStream_t) stream;
-    if (n_tok <= 2) launch_pdl(rec_kernel<2>, grid, block, 0, s, a, n_tok);
-    else if (n_tok <= 4) launch_pdl(rec_kernel<4>, grid, block, 0, s, a, n_tok);
-    else launch_pdl(rec_kernel<kDecMaxT>, grid, block, 0, s, a, n_tok);
+    by_width<RecK>(a.n_embd, n_tok, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, n_tok); });
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, void* stream) {
-    if (n_rows < 1 || max_n < 1 || max_n > kDecMaxT || !rows || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 ||
+    if (n_rows < 1 || max_n < 1 || max_n > kDecMaxT || !rows || !dec_gdn_rec_supported(a.n_embd) || a.h_k <= 0 ||
         a.h_v % a.h_k != 0 || a.nk != 0) {
         basalt::log::error("basalt", "dec_gdn_rec_seg: invalid arguments");
         std::exit(1);
     }
     const dim3 grid((unsigned) (a.h_v * 4), (unsigned) n_rows), block(S);
     const cudaStream_t s = (cudaStream_t) stream;
-    if (max_n <= 2) launch_pdl(rec_seg_kernel<2>, grid, block, 0, s, a, rows, state_off);
-    else if (max_n <= 4) launch_pdl(rec_seg_kernel<4>, grid, block, 0, s, a, rows, state_off);
-    else launch_pdl(rec_seg_kernel<kDecMaxT>, grid, block, 0, s, a, rows, state_off);
+    by_width<SegK>(a.n_embd, max_n, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, rows, state_off); });
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec_seg: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 void dec_gdn_rec_split(const DecRecArgs& a, int n_tok, void* stream) {
-    if (n_tok < 1 || n_tok > kDecMaxT || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 || a.h_v % a.h_k != 0 || !a.o ||
+    if (n_tok < 1 || n_tok > kDecMaxT || !dec_gdn_rec_supported(a.n_embd) || a.h_k <= 0 || a.h_v % a.h_k != 0 || !a.o ||
         mapped_heads(a) < 1) {
         basalt::log::error("basalt", "dec_gdn_rec_split: invalid arguments");
         std::exit(1);
     }
     const dim3 grid((unsigned) (mapped_heads(a) * 4)), block(S);
     const cudaStream_t s = (cudaStream_t) stream;
-    if (n_tok <= 2) launch_pdl(rec_split_kernel<2>, grid, block, 0, s, a, n_tok);
-    else if (n_tok <= 4) launch_pdl(rec_split_kernel<4>, grid, block, 0, s, a, n_tok);
-    else launch_pdl(rec_split_kernel<kDecMaxT>, grid, block, 0, s, a, n_tok);
+    by_width<SplitK>(a.n_embd, n_tok, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, n_tok); });
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec_split: %s", cudaGetErrorString(e)); std::exit(1); }
 }

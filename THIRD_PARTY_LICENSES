@@ -150,7 +150,7 @@ The grouped NVFP4 expert GEMM in src/prefill/fp4/moe_fp4.cu adapts code from Inf
 
 The int8 prompt-attention kernel adapts ideas and code from Infernix (src/ops/qsa/qsa_prompt.cu): the
 per-warp 16-cell tiles with one merge, the k-step query ordering, and the exact int8 widening to FP16.
-The chunked gated delta rule in src/prefill/gdn_chunked.cu adapts the Infernix chunked formulation.
+The chunked gated delta rule in src/kernels/cuda/gdn_prompt.cu adapts the Infernix chunked formulation.
 
 Licensed under the Apache License, Version 2.0, reproduced below.
 

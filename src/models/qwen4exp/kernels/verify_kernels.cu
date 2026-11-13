@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
+#include "basalt/kernels/gdn_commit.cuh"
 #include "basalt/kernels/wait_abort.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -17,6 +18,11 @@
 #include "basalt/log.hpp"
 
 namespace basalt::kernels {
+using gdn_dev::CommitPre;
+using gdn_dev::commit_pre_load;
+using gdn_dev::commit_pre_run;
+using gdn_dev::commit_layers_body;
+using gdn_dev::gdn_conv_commit_n;
 namespace {
 
 constexpr int S = 128;          // GDN state size
@@ -87,30 +93,7 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_seg_kernel(const SegRow* __rest
     h[(size_t) t * C + c] = y;
 }
 
-__device__ __forceinline__ void gdn_conv_commit_n(float* __restrict__ hist, const float* __restrict__ qkv, int C, int n,
-                                                  int c) {
-    if (c >= C) return;
-    if (n <= 0) return;
-    float seq[3];
-#pragma unroll
-    for (int j = 0; j < 3; ++j) {
-        const int src = n + j;          // the last three of [hist(3) | x_0..x_{n-1}]
-        seq[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
-    }
-    hist[c * 3] = seq[0];
-    hist[c * 3 + 1] = seq[1];
-    hist[c * 3 + 2] = seq[2];
-}
 
-__device__ __forceinline__ void gdn_conv_commit_one(float* __restrict__ hist, const float* __restrict__ qkv, int C,
-                                                    const int32_t* __restrict__ n_keep, int c) {
-    gdn_conv_commit_n(hist, qkv, C, *n_keep, c);
-}
-
-__global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
-                                       const int32_t* __restrict__ n_keep) {
-    gdn_conv_commit_one(hist, qkv, C, n_keep, blockIdx.x * blockDim.x + threadIdx.x);
-}
 
 template <int MAX_T = kVerifyMaxT>
 __global__ void __launch_bounds__(64) gdn_ab_multi_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
@@ -264,97 +247,6 @@ __global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restr
     gdn_step_commit_block(state, hbuf, C, gate, beta, h_k, h_v, n_keep, blockIdx.x, blockIdx.y);
 }
 
-// One state item's inputs, held in registers so the next item's loads are in flight while this one computes.
-struct CommitPre {
-    float s[RPG];
-    float k[kVerifyMaxT], v[kVerifyMaxT], g[kVerifyMaxT], b[kVerifyMaxT];
-};
-
-__device__ __forceinline__ void commit_pre_load(const GdnCommitLayers& a, int per_layer, int n, int i, CommitPre& p) {
-    const int l = i / per_layer, j = i - l * per_layer;
-    const int head = j >> 2, cblk = j & 3;
-    const float* hbuf = a.h + (size_t) l * a.h_stride;
-    const float* gate = a.gate + (size_t) l * a.gb_stride;
-    const float* beta = a.beta + (size_t) l * a.gb_stride;
-    const int col = cblk * 32 + threadIdx.x;
-    const int tid = threadIdx.y * 32 + threadIdx.x;
-    const int qk = S * a.h_k;
-    const int qh = head % a.h_k;
-#pragma unroll
-    for (int t = 0; t < kVerifyMaxT; ++t) {
-        if (t >= n) break;
-        const float* ht = hbuf + (size_t) t * a.C;
-        p.k[t] = ht[qk + qh * S + tid];
-        p.v[t] = ht[2 * qk + head * S + col];
-        p.g[t] = gate[(size_t) t * a.h_v + head];
-        p.b[t] = beta[(size_t) t * a.h_v + head];
-    }
-    const float* base = a.state + (size_t) l * a.state_stride + ((size_t) (threadIdx.y * RPG) * a.h_v + head) * S + col;
-    const size_t row_stride = (size_t) a.h_v * S;
-#pragma unroll
-    for (int r = 0; r < RPG; ++r) p.s[r] = base[r * row_stride];
-}
-
-// The step-commit math (gdn_step_commit_block) on registers loaded earlier, every token's inputs up front.
-__device__ __forceinline__ void commit_pre_run(const GdnCommitLayers& a, int per_layer, int n, int i, CommitPre& p) {
-    __shared__ float sk[kVerifyMaxT][S];
-    __shared__ float red[2][RG][32];
-    const int l = i / per_layer, j = i - l * per_layer;
-    const int head = j >> 2, cblk = j & 3;
-    const int col_local = threadIdx.x, rg = threadIdx.y;
-    const int col = cblk * 32 + col_local;
-    const int tid = rg * 32 + col_local;
-    __syncthreads();                    // the previous item is done with sk/red
-#pragma unroll
-    for (int t = 0; t < kVerifyMaxT; ++t) {
-        if (t >= n) break;
-        sk[t][tid] = p.k[t];
-    }
-    __syncthreads();
-#pragma unroll
-    for (int t = 0; t < kVerifyMaxT; ++t) {
-        if (t >= n) break;
-        const float gt = __expf(p.g[t]);
-        float kv = 0.0f;
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) kv = fmaf(p.s[r], sk[t][rg * RPG + r], kv);
-        red[t & 1][rg][col_local] = kv;
-        __syncthreads();
-        const float kv_col = red[t & 1][0][col_local] + red[t & 1][1][col_local] + red[t & 1][2][col_local] +
-                             red[t & 1][3][col_local];
-        const float delta = (p.v[t] - gt * kv_col) * p.b[t];
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) p.s[r] = fmaf(gt, p.s[r], sk[t][rg * RPG + r] * delta);
-    }
-    float* base = a.state + (size_t) l * a.state_stride + ((size_t) (rg * RPG) * a.h_v + head) * S + col;
-    const size_t row_stride = (size_t) a.h_v * S;
-#pragma unroll
-    for (int r = 0; r < RPG; ++r) base[r * row_stride] = p.s[r];
-}
-
-// The grid-stride items with the next state item's loads issued before the current item runs.
-__device__ __forceinline__ void commit_layers_body(const GdnCommitLayers& a, int n, int conv_blocks) {
-    const int per_state = a.h_v * (S / 32), per_layer = per_state + conv_blocks, total = per_layer * a.n_layers;
-    const int step = gridDim.x;
-    CommitPre cur, nxt;
-    bool cur_state = (int) blockIdx.x < total && (int) blockIdx.x % per_layer < per_state;
-    if (cur_state) commit_pre_load(a, per_layer, n, blockIdx.x, cur);
-    for (int i = blockIdx.x; i < total; i += step) {
-        const int in = i + step;
-        const bool next_state = in < total && in % per_layer < per_state;
-        if (next_state) commit_pre_load(a, per_layer, n, in, nxt);
-        if (cur_state) {
-            commit_pre_run(a, per_layer, n, i, cur);
-        } else {
-            const int l = i / per_layer, j = i - l * per_layer;
-            gdn_conv_commit_n(a.state + (size_t) l * a.state_stride + (size_t) S * a.h_v * S,
-                              a.qkv + (size_t) l * a.h_stride, a.C, n,
-                              (j - per_state) * 32 * RG + threadIdx.y * 32 + threadIdx.x);
-        }
-        cur_state = next_state;
-        if (next_state) cur = nxt;
-    }
-}
 
 // ---- the commit's items claimed from a device counter: the commit kernel and the finisher share them.
 // A counter set is four words on four lines: claim, done, started (the epoch whose begin kernel ran), pre (the epoch
@@ -498,11 +390,6 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_finish_kernel(GdnCommitLay
     }
 }
 
-__global__ void __launch_bounds__(32 * RG) gdn_commit_layers_pipe_kernel(GdnCommitLayers a, int conv_blocks) {
-    const int n = min(*a.n_keep, kVerifyMaxT);
-    if (n <= 0) return;
-    commit_layers_body(a, n, conv_blocks);
-}
 
 // The lazy layers' items (layer-major), claimed from the epoch's lazy counter (line 10, reset by the begin kernel): every
 // item of the first `must_layers`, then more while *stop != stop_value.  A block claims only after that check, and
@@ -1099,13 +986,6 @@ void gdn_commit_finish(const GdnCommitLayers& a, CommitCtl* ctl, void* stream, i
     check("gdn_commit_finish");
 }
 
-void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks) {
-    if (a.n_layers <= 0) return;
-    const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
-    gdn_commit_layers_pipe_kernel<<<(unsigned) (blocks > 0 ? blocks : 1), dim3(32, RG), 0, (cudaStream_t) stream>>>(
-        a, conv_blocks);
-    check("gdn_commit_layers");
-}
 
 void gdn_commit_lazy(const GdnCommitLayers& a, CommitCtl* ctl, int must_layers, const uint32_t* stop,
                      uint32_t stop_value, void* stream, int blocks, const GdnLazyPf* pf) {
@@ -1121,11 +1001,6 @@ bool gdn_commit_lazy_none(CommitCtl* ctl) {
     return cudaMemcpy(ctl->w + (size_t) kCtlWords * 10, &none, 4, cudaMemcpyHostToDevice) == cudaSuccess;
 }
 
-void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream) {
-    gdn_conv_commit_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (cudaStream_t) stream>>>(history, qkv,
-                                                                                                 channels, n_keep);
-    check("gdn_conv_commit");
-}
 
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {

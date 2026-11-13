@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-MODELS = ("qwen4exp", "deepseek41")
+MODELS = ("qwen4exp", "deepseek41", "qwen35")
 NAMES = re.compile(r"qwen4exp|deepseek41|Flash-Next|DeepSeek|Qwen3\.8|\b(248044|248045|248046|248056|248058|248059|248320)\b")
 status = 0
 
@@ -81,6 +81,7 @@ WIDTH_OK = {
     "include/basalt/program/options.hpp": "2560 MiB, a RAM floor",
     "src/program/cli/help.cpp": "2560 MiB, a RAM floor",
     "src/kernels/cuda/gu2.cuh": "a shared kernel's instance for this width; other widths take the other path",
+    "src/kernels/cuda/gdn_window.cu": "the block widths the GDN window kernel is instantiated for; others are refused",
     "src/prefill/moe_mmq.cu": "the Q2_0 blob layout of that format's instance",
     "include/basalt/prefill/moe_mmq.hpp": "the Q2_0 blob layout of that format's instance",
     "include/basalt/kernels/cpu/expert.hpp": "the capacity of the Q8_1 activation block, not a model width",
