@@ -162,6 +162,13 @@ public:
     /// Starts `n` drafts (at most max_window() - 1) after `anchor`, the token at position `pos`. The rows of the last window
     /// before `pos` were accepted.
     virtual Result draft_begin(int32_t anchor, int64_t pos, int n) { (void) anchor; (void) pos; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
+    /// draft_begin for `count` sessions of this model (peers[i] after anchors[i] at pos[i], n[i] drafts), in one pass where
+    /// the model can; each session's draft_end then reads its own.  The default starts each in turn.
+    virtual Result draft_batch(ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n, int count) {
+        for (int i = 0; i < count; ++i)
+            if (Result r = peers[i]->draft_begin(anchors[i], pos[i], n[i]); !r.ok()) return r;
+        return {};
+    }
     /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`.
     virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n) { (void) ids; (void) conf; (void) max_n; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
     /// Rows row0..row0+n of the last decoded window: picks[t]'s log probability and the row's `top` likeliest tokens,

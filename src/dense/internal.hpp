@@ -185,8 +185,9 @@ void commit_window(Model& m, SessionState& st, int n);
 bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err);
 /// The block drafter's pass after `anchor` at `pos`: its picks for slots 1 .. block-1 into st.dids / st.dconf.
 bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, std::string& err);
-/// The same pass for S sessions at once (S blocks of rows, at most kBatch rows), on the first session's stream.
-bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchors, const int64_t* pos, int S, std::string& err);
+/// The same pass for S sessions at once (S blocks of rows, at most kBatch rows), on `stream` (null: the first session's).
+bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchors, const int64_t* pos, int S, std::string& err,
+                       cudaStream_t stream = nullptr);
 
 /// The drafter over n rows of (hidden, next token) pairs at cells c0..c0+n-1: `hid` device rows [n][n_embd] (main's
 /// normed hidden, or the drafter's own output), `tok` device ids of the tokens after them.  Writes its KV; with

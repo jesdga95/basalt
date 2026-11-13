@@ -130,6 +130,8 @@ public:
     bool next_batch_window() override;
     void slot_window_begin(int b, SlotWin& w, int limit);
     bool slot_window_finish(int b, SlotWin& w);
+    bool slot_window_accept(int b, SlotWin& w);
+    bool slot_window_end(int b, SlotWin& w);
     bool drain_windows() override { return true; }
     void script_command(const std::string&) override {
         std::printf("ERR BSCRIPT: this model's slots take no scripts\n");
@@ -589,6 +591,12 @@ struct SlotWin {
     float chance[16] = {};
     Clock::time_point round0;
     basalt::model::DecodeRequest d;
+    // set by slot_window_accept: the accepted drafts, the tokens' line, the finish reason, the drafts to start next
+    int a = 0;
+    std::string line;
+    const char* fin = nullptr;
+    int want = 0;
+    bool drafting = false;
 };
 
 // The slot's next window: its anchor and the drafts its drafter left (as many as the draft policy takes).
@@ -634,6 +642,21 @@ void SessionRuntime::slot_window_begin(int b, SlotWin& w, int limit) {
 // The slot's window is drawn: the accepted drafts, the grammar's mask, the logprobs, the tokens out, the slot's next drafts
 // (made while the tokens go out), and its end.
 bool SessionRuntime::slot_window_finish(int b, SlotWin& w) {
+    if (!slot_window_accept(b, w)) return false;
+    if (w.want > 0) {
+        const basalt::model::Result r = session().draft_begin(bs[(size_t) b].x, bs[(size_t) b].p, w.want);
+        if (!r.ok() && r.status != basalt::model::Status::NotImplemented) {
+            std::printf("ERR %s\n", r.message.c_str());
+            set_active(0);
+            return false;
+        }
+        w.drafting = r.ok();
+    }
+    return slot_window_end(b, w);
+}
+
+// The window's accepted drafts, grammar, logprobs and tokens; whether drafts follow (w.want).
+bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
     std::vector<float> grammar_bias;
     std::vector<float> lp_rows;   // a logprobs slot's kept rows (row_logprobs)
     const auto failed = [&](const std::string& m) {
@@ -684,15 +707,28 @@ bool SessionRuntime::slot_window_finish(int b, SlotWin& w) {
         fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
     }
     sl.n_dr = 0;
-    bool drafting = false;
-    if (fin == nullptr && session().max_window() > 1) {
-        const basalt::model::Result r = session().draft_begin(sl.x, sl.p, drafts_ahead(T, session().max_window()));
-        if (!r.ok() && r.status != basalt::model::Status::NotImplemented) return failed(r.message);
-        drafting = r.ok();
-    }
-    basalt::protocol::emit_text(line + "\n");
+    w.a = a;
+    w.line = line;
+    w.fin = fin;
+    w.want = fin == nullptr && session().max_window() > 1 ? drafts_ahead(T, session().max_window()) : 0;
+    w.drafting = false;
+    return true;
+}
+
+// The tokens go out while the drafts run; then the drafts are read, and the slot ends or goes on.
+bool SessionRuntime::slot_window_end(int b, SlotWin& w) {
+    const auto failed = [&](const std::string& m) {
+        std::printf("ERR %s\n", m.c_str());
+        set_active(0);
+        return false;
+    };
+    BSlot& sl = bs[(size_t) b];
+    set_active(b);
+    const int T = w.T, a = w.a;
+    const char* fin = w.fin;
+    basalt::protocol::emit_text(w.line + "\n");
     basalt::core::progress_beat();
-    if (drafting) {
+    if (w.drafting) {
         const int max_n = std::min(drafts_ahead(T, session().max_window()), (int) std::size(sl.dr));
         if (const basalt::model::Result r = session().draft_end(sl.dr, sl.dprob, max_n, sl.n_dr); !r.ok()) return failed(r.message);
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
@@ -766,10 +802,29 @@ bool SessionRuntime::next_batch_window() {
             }
             if (const basalt::model::Result r = ss[0]->decode_batch(ss.data(), rq.data(), (int) group.size()); !r.ok()) return failed(r.message);
         }
+        // every slot's tokens, then the group's drafts as one pass, then each slot's tokens out and drafts read
+        std::vector<basalt::model::ModelSession*> ds;
+        std::vector<int32_t> anchors;
+        std::vector<int64_t> dpos;
+        std::vector<int> dn;
         for (const size_t i : group) {
             wins[i].round0 = t0;
-            if (!slot_window_finish(act[i], wins[i])) return false;
+            if (!slot_window_accept(act[i], wins[i])) return false;
+            if (wins[i].want > 0) {
+                const BSlot& sl = bs[(size_t) act[i]];
+                ds.push_back(sessions_[(size_t) act[i]].get());
+                anchors.push_back(sl.x);
+                dpos.push_back(sl.p);
+                dn.push_back(wins[i].want);
+            }
         }
+        if (!ds.empty()) {
+            const basalt::model::Result r = ds[0]->draft_batch(ds.data(), anchors.data(), dpos.data(), dn.data(), (int) ds.size());
+            if (!r.ok() && r.status != basalt::model::Status::NotImplemented) return failed(r.message);
+            for (const size_t i : group) wins[i].drafting = r.ok() && wins[i].want > 0;
+        }
+        for (const size_t i : group)
+            if (!slot_window_end(act[i], wins[i])) return false;
     }
     set_active(0);
     return true;
