@@ -9,6 +9,7 @@
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "unicode_flags.hpp"
 #include "basalt/models/qwen4exp/options.hpp"
+#include "basalt/program/qwen_forms.hpp"
 
 namespace basalt::models::qwen4exp {
 namespace {
@@ -45,26 +46,11 @@ public:
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "qwen"}; }
 
-    PreTokenizer pretokenizer() const override { return {"qwen35", tokenizer::pretok_qwen35}; }
+    PreTokenizer pretokenizer() const override { return {"qwen35", program::tokenizer::pretok_qwen35}; }
 
-    model::TokenNames token_names() const override {
-        return {{"<|endoftext|>", "<|im_end|>"}, "<|im_start|>", "<|image_pad|>", "<|video_pad|>"};
-    }
+    model::TokenNames token_names() const override { return program::qwen_token_names(); }
 
-    program::grammar::ToolForm tool_form() const override {
-        program::grammar::ToolForm f;
-        f.call_open = "<tool_call>\n";
-        f.call_close = "\n</tool_call>";
-        f.fn_open = "<function=";
-        f.fn_mid = ">\n";
-        f.fn_close = "</function>";
-        f.param_open = "<parameter=";
-        f.param_mid_text = f.param_mid_value = ">\n";
-        f.param_close = "\n</parameter>\n";
-        f.text_end = "</parameter>";
-        f.trigger = "<tool_call>";
-        return f;
-    }
+    program::grammar::ToolForm tool_form() const override { return program::qwen_tool_form(); }
 
     std::unique_ptr<program::CommonOptions> make_options() const override { return std::make_unique<Options>(); }
     bool parse_flag(const std::string& name, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {

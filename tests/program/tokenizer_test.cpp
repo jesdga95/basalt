@@ -13,7 +13,7 @@
 #include "models/deepseek41/adapter.hpp"
 #include "unicode_flags.hpp"
 
-namespace basalt::models::qwen4exp::tokenizer { void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends); }
+namespace basalt::program::tokenizer { void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends); }
 
 using basalt::program::Tokenizer;
 
@@ -65,7 +65,7 @@ void synthetic() {
     merges = "b c\na b\nab c\na a\naa a";   // ranks: bc 0, ab 1, abc 2, aa 3, aaa 4
     Tokenizer t;
     std::string err;
-    t.set_pretokenize(basalt::models::qwen4exp::tokenizer::pretok_qwen35);
+    t.set_pretokenize(basalt::program::tokenizer::pretok_qwen35);
     CHECK(t.load(vocab, merges, types, err));
     std::vector<int32_t> ids;
     CHECK(t.encode("abc", false, {}, ids, err));
@@ -110,7 +110,7 @@ int parity(const std::string& dir, const std::string& golden) {
     const auto t0 = std::chrono::steady_clock::now();
     // the rule the pack names
     t.set_pretokenize(read_all(dir + "/tokenizer.json").find("\"pre\": \"joyai-llm\"") != std::string::npos
-                          ? basalt::models::deepseek41::pretok_joyai : basalt::models::qwen4exp::tokenizer::pretok_qwen35);
+                          ? basalt::models::deepseek41::pretok_joyai : basalt::program::tokenizer::pretok_qwen35);
     if (!t.load(read_all(dir + "/vocab.json"), read_all(dir + "/merges.txt"), read_all(dir + "/token_type.json"), err)) {
         std::fprintf(stderr, "load: %s\n", err.c_str());
         return 1;
