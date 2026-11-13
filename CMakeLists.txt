@@ -1447,6 +1447,11 @@ if(BUILD_TESTING)
   target_link_libraries(fp8_gemm_test PRIVATE prefill_fp8 ${_gpu_runtime_target})
   basalt_gpu_test(NAME fp8_gemm_test COMMAND fp8_gemm_test)
   set_tests_properties(fp8_gemm_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # the producers that round their rows to E4M3 for an F8 output projection: bitwise quantize's
+  add_executable(e4m3_producers_test tests/kernels/e4m3_producers_test.cpp)
+  target_link_libraries(e4m3_producers_test PRIVATE prefill_fp8 kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME e4m3_producers_test COMMAND e4m3_producers_test)
+  set_tests_properties(e4m3_producers_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
 # a decode window's products against FP8 and NVFP4 matrices (the NVFP4 codes convert with sm_120a instructions)
 add_library(window_gemm STATIC src/kernels/cuda/window_gemm.cu src/kernels/cuda/window_gemm_f8.cu

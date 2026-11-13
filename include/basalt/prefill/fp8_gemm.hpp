@@ -12,6 +12,8 @@ namespace basalt::prefill::fp8 {
 /// Bytes of `rows` activation rows of `cols` values (cols a multiple of 64): the codes [rows][cols], then the row
 /// scales [rows] as fp32 (padded to 16 bytes).
 size_t act_bytes(int64_t rows, int64_t cols);
+/// The row scales inside `act` (rows of `cols` values), for a producer that writes the activations itself.
+float* act_scales(void* act, int64_t rows, int64_t cols);
 
 /// Rounds rows of x (`ld` floats apart) to E4M3 with scale amax / 448 per row (round to nearest even, saturating).
 void quantize(const float* x, int64_t rows, int64_t cols, int64_t ld, void* act, void* stream);

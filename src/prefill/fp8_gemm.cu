@@ -280,6 +280,7 @@ __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__
 }  // namespace
 
 size_t act_bytes(int64_t rows, int64_t cols) { return scale_off(rows, cols) + (size_t) rows * sizeof(float) + 16; }
+float* act_scales(void* act, int64_t rows, int64_t cols) { return (float*) ((uint8_t*) act + scale_off(rows, cols)); }
 
 void quantize(const float* x, int64_t rows, int64_t cols, int64_t ld, void* act, void* stream) {
     if (rows <= 0) return;

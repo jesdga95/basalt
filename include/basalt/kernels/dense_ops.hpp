@@ -58,6 +58,9 @@ void attn_qk_prepare(const float* q_full, const float* k, const float* v, const 
                      bool gated = true, int64_t cap = 0, const int32_t* cell0_dev = nullptr, KvInt8 q8 = {});
 /// out[t][h][d] = attn[t][h][d] * sigmoid(q_full[t][h][hd + d])  (hd = 256).
 void attn_gate(const float* attn, const float* q_full, float* out, int64_t T, int n_head, void* stream);
+/// attn_gate's rows rounded to E4M3 for the out projection: codes [T][n_head * 256], scales[T] = amax / 448 per token
+/// (prefill::fp8::quantize of attn_gate's output, bitwise).
+void attn_gate_e4m3(const float* attn, const float* q_full, int64_t T, int n_head, uint8_t* codes, float* scales, void* stream);
 
 /// A block drafter's two-tap grouped dynamic convolution along a block's rows (DFlash 2):
 /// out[t][c] = sum over o in {0, 1} of (base[o][c] + dyn[t][o * groups + c / group]) * x[t - o][c], x[-1] = 0.

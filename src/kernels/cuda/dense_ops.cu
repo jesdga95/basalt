@@ -6,6 +6,7 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -341,6 +342,45 @@ __global__ void attn_gate_kernel(const float* __restrict__ attn, const float* __
     out[i] = attn[i] / (1.0f + expf(-g));
 }
 
+// attn_gate_kernel's values of one token's row (block per token), rounded to E4M3 with scale amax / 448 as
+// prefill::fp8::quantize rounds them (bitwise)
+__global__ void __launch_bounds__(256) attn_gate_e4m3_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
+                                                             int n_head, uint8_t* __restrict__ codes, float* __restrict__ scales) {
+    constexpr int kPer = 8;   // values a thread keeps: n_head * HD <= 256 * 4 * kPer
+    __shared__ float red[8];
+    const int64_t t = blockIdx.x;
+    const int cols = n_head * HD;
+    float4 v[kPer];
+    float m = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        const int i = (j * 256 + (int) threadIdx.x) * 4;
+        if (i >= cols) break;
+        const int h = i / HD, d = i % HD;
+        const float4 a = *reinterpret_cast<const float4*>(attn + t * cols + i);
+        const float4 g = *reinterpret_cast<const float4*>(q_full + (t * n_head + h) * 2 * HD + HD + d);
+        v[j] = make_float4(a.x / (1.0f + expf(-g.x)), a.y / (1.0f + expf(-g.y)), a.z / (1.0f + expf(-g.z)), a.w / (1.0f + expf(-g.w)));
+        m = fmaxf(m, fmaxf(fmaxf(fabsf(v[j].x), fabsf(v[j].y)), fmaxf(fabsf(v[j].z), fabsf(v[j].w))));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) amax = fmaxf(amax, red[i]);
+    if (threadIdx.x == 0) scales[t] = amax / 448.0f;
+    const float q = amax > 0.0f ? 448.0f / amax : 0.0f;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        const int i = (j * 256 + (int) threadIdx.x) * 4;
+        if (i >= cols) break;
+        const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(v[j].x * q, v[j].y * q), __NV_SATFINITE, __NV_E4M3);
+        const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(v[j].z * q, v[j].w * q), __NV_SATFINITE, __NV_E4M3);
+        *reinterpret_cast<uint32_t*>(codes + t * cols + i) = (uint32_t) lo | ((uint32_t) hi << 16);
+    }
+}
+
 __global__ void gdn_rows_scatter_kernel(const GdnRowDst* __restrict__ dst, const float* __restrict__ qkv, const float* __restrict__ h,
                                         const float* __restrict__ gate, const float* __restrict__ beta, int C, int h_v,
                                         int64_t layer, int window_rows) {
@@ -461,6 +501,16 @@ void attn_gate(const float* attn, const float* q_full, float* out, int64_t T, in
     if (n <= 0) return;
     attn_gate_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out, n, n_head);
     check("attn_gate");
+}
+
+void attn_gate_e4m3(const float* attn, const float* q_full, int64_t T, int n_head, uint8_t* codes, float* scales, void* stream) {
+    if (T <= 0) return;
+    if (n_head * HD > 256 * 4 * 8) {
+        basalt::log::error("basalt", "attn_gate_e4m3: %d heads", n_head);
+        std::abort();
+    }
+    attn_gate_e4m3_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(attn, q_full, n_head, codes, scales);
+    check("attn_gate_e4m3");
 }
 
 }  // namespace basalt::kernels
