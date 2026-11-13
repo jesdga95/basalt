@@ -228,6 +228,50 @@ int main() {
             }
         report("gqa_window_attn", out, want, 2e-4);
     }
+    {   // gdn_rows_scatter: a batched window's packed GDN rows to three sessions' stores, bitwise
+        const int C = 10240, HV = 48, W = 8, NL = 3, layer = 2, rows = 7;
+        auto qkv = randn((size_t) rows * C), h = randn((size_t) rows * C), gate = randn((size_t) rows * HV), beta = randn((size_t) rows * HV);
+        float *dq = up(qkv), *dh = up(h), *dg = up(gate), *db = up(beta);
+        const int seg_of[7] = {0, 0, 0, 1, 1, 2, 2}, j_of[7] = {0, 1, 2, 0, 1, 0, 1};
+        float *sq[3], *sh[3], *sg[3], *sb[3];
+        for (int k = 0; k < 3; ++k) {
+            cudaMalloc(&sq[k], (size_t) NL * W * C * 4); cudaMalloc(&sh[k], (size_t) NL * W * C * 4);
+            cudaMalloc(&sg[k], (size_t) NL * W * HV * 4); cudaMalloc(&sb[k], (size_t) NL * W * HV * 4);
+            cudaMemset(sq[k], 0, (size_t) NL * W * C * 4); cudaMemset(sh[k], 0, (size_t) NL * W * C * 4);
+            cudaMemset(sg[k], 0, (size_t) NL * W * HV * 4); cudaMemset(sb[k], 0, (size_t) NL * W * HV * 4);
+        }
+        std::vector<basalt::kernels::GdnRowDst> tab(rows);
+        for (int r = 0; r < rows; ++r) {
+            const int k = seg_of[r], j = j_of[r];
+            tab[r] = {sq[k] + (size_t) j * C, sh[k] + (size_t) j * C, sg[k] + (size_t) j * HV, sb[k] + (size_t) j * HV};
+        }
+        auto* dt = up(tab);
+        basalt::kernels::gdn_rows_scatter(dt, rows, dq, dh, dg, db, C, HV, layer, W, S);
+        bool same = true;
+        for (int r = 0; r < rows; ++r) {
+            const int k = seg_of[r], j = j_of[r];
+            auto gq = down(sq[k] + ((size_t) layer * W + j) * C, C), gh = down(sh[k] + ((size_t) layer * W + j) * C, C);
+            auto gg = down(sg[k] + ((size_t) layer * W + j) * HV, HV), gb = down(sb[k] + ((size_t) layer * W + j) * HV, HV);
+            same = same && !std::memcmp(gq.data(), &qkv[(size_t) r * C], C * 4) && !std::memcmp(gh.data(), &h[(size_t) r * C], C * 4) &&
+                   !std::memcmp(gg.data(), &gate[(size_t) r * HV], HV * 4) && !std::memcmp(gb.data(), &beta[(size_t) r * HV], HV * 4);
+        }
+        // layers other than the one named are untouched
+        auto other = down(sq[0], (size_t) layer * W * C);
+        for (float v : other) same = same && v == 0.0f;
+        std::printf("%-22s %s\n", "gdn_rows_scatter", same ? "bitwise" : "MISMATCH  FAIL");
+        if (!same) ++fails;
+        cudaEvent_t e0, e1;   // profile: one layer's scatter of a full window
+        cudaEventCreate(&e0); cudaEventCreate(&e1);
+        const int reps = 200;
+        cudaEventRecord(e0, S);
+        for (int i = 0; i < reps; ++i) basalt::kernels::gdn_rows_scatter(dt, rows, dq, dh, dg, db, C, HV, layer, W, S);
+        cudaEventRecord(e1, S);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        const double bytes = 2.0 * rows * (2.0 * C + 2.0 * HV) * 4;
+        std::printf("%-22s %.1f us per call, %.0f GB/s of %.2f MB moved\n", "gdn_rows_scatter", 1e3 * ms / reps, bytes / (1e-3 * ms / reps) / 1e9, bytes / 1e6);
+    }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

@@ -136,6 +136,16 @@ public:
     virtual ~ModelSession() = default;
     virtual Result decode_window(const DecodeRequest& r) = 0;
     virtual Result prefill_chunk(const PrefillRequest& r) = 0;
+    /// The rows a decode_batch call holds in all; 0: this model's sessions do not batch their windows.
+    virtual int batch_rows() const { return 0; }
+    /// The windows reqs[0..n) of the distinct sessions[0..n) (sessions of one model, this one among them) as one batch, the
+    /// model's weights read once: each session ends as after its own decode_window(reqs[i]). The windows' rows total at most
+    /// batch_rows().
+    virtual Result decode_batch(ModelSession* const* sessions, const DecodeRequest* reqs, int n) {
+        for (int i = 0; i < n; ++i)
+            if (Result r = sessions[i]->decode_window(reqs[i]); !r.ok()) return r;
+        return {};
+    }
     /// Takes the memory the session will hold (expert tiers), so the first request does not wait for it.
     virtual Result prepare() { return {}; }
     /// The prompt is read: workspaces a part kept with `more` go back.

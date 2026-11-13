@@ -214,6 +214,66 @@ public:
         return {};
     }
 
+    int batch_rows() const override { return kWindow; }
+
+    // Several sessions' windows as one batch: each is settled and its draw prepared as decode_window does, the rows run
+    // together on the first session's stream (every session's own stream is idle by then), each session draws from its own
+    // logits.
+    Result decode_batch(model::ModelSession* const* peers, const model::DecodeRequest* reqs, int n) override {
+        if (n == 1) return peers[0]->decode_window(reqs[0]);
+        std::vector<Session*> ss((size_t) n);
+        std::vector<int32_t> tokens, pos3;
+        std::vector<BatchSeg> segs((size_t) n);
+        int rows = 0;
+        for (int i = 0; i < n; ++i) {
+            ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
+            const model::DecodeRequest& r = reqs[i];
+            if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return fail(m_.o.arch + ": a batch of sessions of another model");
+            if (r.n_tokens < 1 || r.n_tokens > kWindow) return fail(m_.o.arch + ": a decode window of " + std::to_string(r.n_tokens) + " rows");
+            if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the window passes the context");
+            rows += r.n_tokens;
+        }
+        if (rows > kWindow) return fail(m_.o.arch + ": a batch of " + std::to_string(rows) + " rows");
+        for (int i = 0; i < n; ++i)
+            if (Result s = ss[(size_t) i]->settle(reqs[i].pos); !s.ok()) return s;
+        for (int i = 0; i < n; ++i)
+            if (cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        std::string err;
+        const cudaStream_t s = ss[0]->st_.stream;
+        for (int i = 0; i < n; ++i) {
+            Session& se = *ss[(size_t) i];
+            const model::DecodeRequest& r = reqs[i];
+            const int T = r.n_tokens;
+            if (!se.prepare_draw(r, err)) return fail(err);
+            tokens.insert(tokens.end(), r.tokens, r.tokens + T);
+            for (int t = 0; t < T; ++t) {
+                const int32_t p = (int32_t) (r.pos + t + se.st_.rope_delta);
+                pos3.insert(pos3.end(), {p, p, p});
+            }
+            if (se.drafter_) cudaMemcpyAsync(se.st_.win_tok, r.tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+            segs[(size_t) i] = {&se.st_, T, r.pos};
+        }
+        if (!forward_batch(m_, segs.data(), n, tokens.data(), pos3.data(), err)) return fail(err);
+        for (int i = 0; i < n; ++i) {
+            Session& se = *ss[(size_t) i];
+            const model::DecodeRequest& r = reqs[i];
+            const int T = r.n_tokens;
+            se.draw(T, s);
+            se.pend_pos_ = r.pos;
+            se.pend_T_ = T;
+            if (r.logits) cudaMemcpyAsync(r.logits, se.st_.logits + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, s);
+            cudaMemcpyAsync(se.h_picks_, se.st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, s);
+        }
+        if (cudaStreamSynchronize(s) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        for (int i = 0; i < n; ++i) {
+            Session& se = *ss[(size_t) i];
+            const model::DecodeRequest& r = reqs[i];
+            if (r.row_tokens) std::copy(se.h_picks_, se.h_picks_ + r.n_tokens, r.row_tokens);
+            if (r.next_token) *r.next_token = se.h_picks_[r.n_tokens - 1];
+        }
+        return {};
+    }
+
     Result prefill_chunk(const model::PrefillRequest& r) override {
         if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the prompt passes the context");
         if (Result s = settle(r.pos); !s.ok()) return s;
@@ -528,9 +588,10 @@ private:
         return true;
     }
 
-    void draw(int T) {
+    void draw(int T) { draw(T, st_.stream); }
+    void draw(int T, cudaStream_t stream) {
         kernels::sample_tokens(st_.logits, T, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_,
-                               st_.picks, st_.stream);
+                               st_.picks, stream);
     }
 
     struct DevFree {
