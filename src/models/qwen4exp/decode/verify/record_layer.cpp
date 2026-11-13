@@ -14,7 +14,7 @@
 #include "basalt/models/qwen4exp/kernels/mid_chain.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/models/qwen4exp/kernels/cvec.hpp"
-#include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
+#include "basalt/kernels/gdn_window.hpp"
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/models/qwen4exp/kernels/gr.hpp"
 #include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"

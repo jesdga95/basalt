@@ -1,6 +1,6 @@
 // src/models/qwen4exp/kernels/mid_chain.cu - see include/basalt/models/qwen4exp/kernels/mid_chain.hpp.
 //
-// Its own translation unit: the device code of dense_tc.cu / dec_gdn_rec.cu / hc_fused.cu (and the helpers of
+// Its own translation unit: the device code of dense_tc.cu / gdn_window.cu / hc_fused.cu (and the helpers of
 // attn_chain_kernel.cuh's phase code) without their host sides.  Built WITHOUT fast math, like them.
 #define FZ_DEV_ONLY
 #include "hc_fused.cu"
@@ -8,7 +8,7 @@
 #include "dense_tc.cu"
 #undef smem
 #define div_approx_ftz div_approx_ftz_rec
-#include "dec_gdn_rec.cu"
+#include "../../../kernels/cuda/gdn_window.cu"
 #undef div_approx_ftz
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/models/qwen4exp/kernels/mid_chain.hpp"

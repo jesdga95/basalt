@@ -1,12 +1,12 @@
-// src/models/qwen4exp/prefill/gdn_chunked.cu - the prompt path's gated delta rule (gdn_recurrence in
-// include/basalt/models/qwen4exp/prefill/kernels.hpp), in chunks of 16 tokens on the tensor cores.
+// src/kernels/cuda/gdn_prompt.cu - the prompt path's GDN (include/basalt/kernels/gdn_prompt.hpp): gates, conv, and the
+// gated delta rule in chunks of 16 tokens on the tensor cores.
 // Per chunk and value head, gdn_prepare_kernel builds the L2-normalized BF16 q/k packet, the within-chunk solve
 // (I + L)^-1 diag(beta), the decayed q.k products and the cumulative decays; gdn_chunk_kernel then carries the FP32
 // state across the chunks: prediction K S and history Q S (TF32 / BF16 MMA), the residual through the solve, the
 // output, and S = decay S + K^T diag(suffix) Delta.
 // Adapted from Infernix (Ian Ranson and contributors), src/ops/linear_attention/gated_delta_net/chunked/,
 // Apache-2.0: see THIRD_PARTY_LICENSES.
-#include "basalt/models/qwen4exp/prefill/kernels.hpp"
+#include "basalt/kernels/gdn_prompt.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -17,10 +17,10 @@
 #include <cstdlib>
 #include "basalt/log.hpp"
 
-namespace basalt::prefill {
+namespace basalt::kernels {
 namespace {
 
-constexpr int S = 128, HK = 16, HV = 48, C = 10240;
+constexpr int S = 128, HK = 16, HV = 48, C = 2 * HK * S + HV * S;
 constexpr int CK = 16;     // tokens per chunk
 constexpr int DV = 64;     // value columns per recurrence block
 constexpr int NTH = 256;   // threads of both kernels
@@ -375,7 +375,8 @@ __global__ void __launch_bounds__(NTH, 2) gdn_chunk_kernel(float* __restrict__ s
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + __expf(-x)); }
 __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
                                                          float eps, const float* __restrict__ y,
-                                                         uint16_t* __restrict__ y16) {
+                                                         uint16_t* __restrict__ y16, float* __restrict__ yn,
+                                                         GdnGate act) {
     __shared__ float wsum[4];
     const int64_t t = blockIdx.x;
     const int head = blockIdx.y, col = threadIdx.x;
@@ -387,8 +388,69 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
     if ((col & 31) == 0) wsum[col >> 5] = sp;
     __syncthreads();
     const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-    const float v = oc * rsqrtf(ss / (float) S + eps) * gamma[col] * sigm(z[t * HV * S + head * S + col]);
-    y16[at] = __half_as_ushort(__float2half_rn(v));
+    const float zv = z[t * HV * S + head * S + col];
+    const float v = oc * rsqrtf(ss / (float) S + eps) * gamma[col] * (act == GdnGate::Silu ? zv * sigm(zv) : sigm(zv));
+    if (y16) y16[at] = __half_as_ushort(__float2half_rn(v));
+    if (yn) yn[at] = v;
+}
+
+// ---------------------------------------------------------------- gates and conv
+__global__ void gdn_gates_kernel(const float* __restrict__ ab, const float* __restrict__ dt,
+                                 const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta,
+                                 int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * HV) return;
+    const int64_t t = i / HV, h = i % HV;
+    const float v = ab[t * 2 * HV + h] + dt[h];
+    gate[i] = (v > 20.0f ? v : log1pf(__expf(v))) * ssm_a[h];
+    beta[i] = 1.0f / (1.0f + __expf(-ab[t * 2 * HV + HV + h]));
+}
+// one thread per channel, walks the chunk; then a second kernel normalises
+__global__ void gdn_conv_kernel(float* __restrict__ hist, const float* __restrict__ qkv, const float* __restrict__ w,
+                                float* __restrict__ h, int64_t T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float v0 = hist[c * 3], v1 = hist[c * 3 + 1], v2 = hist[c * 3 + 2];
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    for (int64_t t = 0; t < T; ++t) {
+        const float x = qkv[t * C + c];
+        const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+        h[t * C + c] = s / (1.0f + __expf(-s));
+        v0 = v1; v1 = v2; v2 = x;
+    }
+    hist[c * 3] = v0; hist[c * 3 + 1] = v1; hist[c * 3 + 2] = v2;
+}
+// the same 4-tap causal conv, tiled over tokens: thread (c, tile) reads its tile's 3 predecessors from the chunk (or
+// the history before it) instead of carrying them - the conv reads inputs, not its own outputs, so the tiles are
+// independent. The same expression per element (so the same bits); the history is written afterwards.
+constexpr int CONV_TILE = 64;
+__global__ void gdn_conv_tiled_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
+                                      const float* __restrict__ w, float* __restrict__ h, int64_t T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int64_t t0 = (int64_t) blockIdx.y * CONV_TILE;
+    if (t0 >= T) return;
+    const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
+    auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
+    float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    for (int64_t t = t0; t < t1; ++t) {
+        const float x = qkv[t * C + c];
+        const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+        h[t * C + c] = s / (1.0f + __expf(-s));
+        v0 = v1; v1 = v2; v2 = x;
+    }
+}
+// the history after the chunk: its last three inputs (the older history where the chunk is shorter than 3)
+__global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float v[3];
+    for (int k = 0; k < 3; ++k) {
+        const int64_t t = T - 3 + k;
+        v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)];
+    }
+    hist[c * 3] = v[0]; hist[c * 3 + 1] = v[1]; hist[c * 3 + 2] = v[2];
 }
 
 void check(const char* what) {
@@ -401,13 +463,34 @@ void check(const char* what) {
 
 }  // namespace
 
+bool gdn_prompt_supported(int state, int k_heads, int v_heads, int conv_taps) {
+    return state == S && k_heads == HK && v_heads == HV && conv_taps == 4;
+}
+
+void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream) {
+    if (T > 0) gdn_gates_kernel<<<(unsigned) ((T * HV + 255) / 256), 256, 0, (cudaStream_t) stream>>>(ab, dt, ssm_a, gate, beta, T);
+    check("gdn_gates");
+}
+
+void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, void* stream) {
+    if (T <= CONV_TILE) {
+        gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
+    } else {
+        gdn_conv_tiled_kernel<<<dim3(C / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
+                                (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
+        gdn_conv_hist_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, T);
+    }
+    check("gdn_conv");
+}
+
 uint64_t gdn_work_bytes(int64_t T) {
     const int64_t chunks = (T + CK - 1) / CK;
     return (uint64_t) chunks * (HK * sizeof(QkChunk) + HV * sizeof(Control));
 }
 
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                    const float* gamma, float eps, void* work, float* y, uint16_t* y16, int64_t T, void* stream) {
+                    const float* gamma, float eps, void* work, float* y, uint16_t* y16, int64_t T, void* stream,
+                    GdnGate act, float* yn) {
     if (T > 0) {
         const cudaStream_t s = (cudaStream_t) stream;
         const int chunks = (int) ((T + CK - 1) / CK);
@@ -428,9 +511,9 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
             attr[dev].store(true, std::memory_order_release);
         }
         gdn_chunk_kernel<<<HV * (S / DV), NTH, sizeof(ChunkShared), s>>>(state, h, qk, ctl, y, (int) T);
-        gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, s>>>(z, gamma, eps, y, y16);
+        gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, s>>>(z, gamma, eps, y, y16, yn, act);
     }
     check("gdn_recurrence");
 }
 
-}  // namespace basalt::prefill
+}  // namespace basalt::kernels

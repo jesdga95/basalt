@@ -1,4 +1,6 @@
 namespace mkc {
+
+constexpr int NJ = 10;   // uint4 of bf16 per lane in a 2560-wide alpha/beta row
 // XT: a window's rows; RXT: the recurrence's q/k/v rows staged at a time (a wider window stages its second half after
 // the first half's tokens)
 constexpr int CT = 512, XT = kMidChainMaxT, RXT = 4, SMEM_MAX = 101376;

@@ -2,7 +2,7 @@
 #include "record.hpp"
 #include "expert_plan.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
-#include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
+#include "basalt/kernels/gdn_window.hpp"
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -49,7 +49,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         goto gdn_done;
     }
     // conv, gates, recurrence, gated norm and the output's q8_1 in dec_gdn_rec's one or two launches; at
-    // 2/3 the z projection runs on the side stream beside the recurrence (dec_gdn.hpp)
+    // 2/3 the z projection runs on the side stream beside the recurrence (gdn_window.hpp)
     {
     // a batch window may take the fused recurrence where the qkv and z projections are one pair launch
     const bool pair_ok = kernels::dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&

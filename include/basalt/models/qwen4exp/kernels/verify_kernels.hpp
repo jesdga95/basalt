@@ -16,30 +16,17 @@
 
 #include <cstdint>
 
+#include "basalt/kernels/gdn_window.hpp"
 #include "basalt/models/qwen4exp/kernels/resident_tabs.hpp"
 
 namespace basalt::kernels {
 
-inline constexpr int kVerifyMaxT = 8;
+inline constexpr int kVerifyMaxT = kDecMaxT;
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written.  Bitwise `fused_gdn_conv_l2` per token.
 void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin = 0);
-/// history <- the last 3 entries of [history | qkv_0 .. qkv_{n-1}], n = *n_keep (0 leaves it as it was).
-void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
-/// DEC_COMMIT: n_layers consecutive GDN layers' commits in one launch (layer l's state at state + l *
-/// state_stride, its conv history right after the S x h_v x S state; h / qkv at l * h_stride, gate / beta at
-/// l * gb_stride): gdn_conv_commit and gdn_step_norm_multi's state-only commit, bitwise.
-struct GdnCommitLayers {
-    float* state = nullptr;
-    const float *h = nullptr, *qkv = nullptr, *gate = nullptr, *beta = nullptr;
-    size_t state_stride = 0, h_stride = 0, gb_stride = 0;
-    int C = 0, h_k = 0, h_v = 0, n_layers = 0;
-    const int32_t* n_keep = nullptr;
-};
-/// From `blocks` persistent blocks (grid-stride); each loads its next item while the current one runs.
-void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks = 32);
 /// Counters of the commit's dynamic items, two sets used by epoch parity (claim, done, started, pre; one line each),
 /// then the newest epoch, the last epoch a finisher finished and the lazy layers' claims.  Zeroed once (then
 /// gdn_commit_lazy_none); a set and the lazy claims are reset by the begin kernel of the epoch that uses them.
@@ -76,19 +63,6 @@ void gdn_commit_lazy(const GdnCommitLayers& a, CommitCtl* ctl, int must_layers, 
                      uint32_t stop_value, void* stream, int blocks, const GdnLazyPf* pf = nullptr);
 /// The lazy counter of a new CommitCtl: nothing owed until the first begin kernel.
 bool gdn_commit_lazy_none(CommitCtl* ctl);
-/// A window of several sequences ("segments"): each segment is n consecutive rows with its own GDN state.  The table
-/// has one entry per window row (a segment's rows all carry the segment's fields), uploaded to the device per window.
-/// A kernel launched over the entries lets only the segment's first row (j == 0) do the segment's work.
-struct SegRow {
-    float* gdn;        // the segment's GDN state of layer 0 (layer l's state at gdn + l * state floats)
-    int32_t row0;      // the segment's first window row
-    int32_t j;         // this row's index in its segment
-    int32_t n;         // the segment's rows
-    int32_t n_keep;    // rows of the segment to commit
-    int32_t slot;      // the sequence's slot
-    int32_t pos;       // this row's position
-};
-static_assert(sizeof(SegRow) == 32, "SegRow is copied as eight words");
 /// gdn_conv_l2_multi over a segmented window: every row's conv from its own segment's history (hist_off floats past
 /// `gdn`: the layer's conv history), all n_rows rows in one launch; bitwise the per-segment calls.
 void gdn_conv_l2_seg(const SegRow* rows, size_t hist_off, const float* qkv, const float* conv_w, float* h, int channels,

@@ -9,7 +9,7 @@
 // falls through (wait_abort.hpp).
 #pragma once
 
-#include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
+#include "basalt/kernels/gdn_window.hpp"
 
 namespace basalt::kernels {
 
