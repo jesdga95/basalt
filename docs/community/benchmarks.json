@@ -2040,6 +2040,40 @@
       "draft_len_prose": 1.5,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8",
       "notes": "Q4_K/Q5_1 and Q4_K/Q8_0 expert layers take the engine's 'glue off' fallback, so decode trails the NVFP4 and IQ4_XS packs on this card"
+    },
+    {
+      "submitter": "wolfpan16",
+      "date": "2026-11-13",
+      "commit": "2729e2288f",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090 D",
+          "vram_gib": 32,
+          "power_w": 600,
+          "pcie": "5.0 x16"
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 9 9950X3D2, 16 cores",
+      "ram_gbps": 51.6,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 8189.4,
+      "prefill_64k_tps": 10391.0,
+      "decode_tps": 358.2,
+      "decode_conv_tps": 225.0,
+      "decode_struct_tps": 442.7,
+      "decode_prose_tps": 229.6,
+      "accept_conv_pct": 72.8,
+      "accept_struct_pct": 98.3,
+      "accept_prose_pct": 67.8,
+      "draft_len_conv": 2.5,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.9,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     }
   ]
 }
