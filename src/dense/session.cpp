@@ -27,13 +27,19 @@ public:
         for (cudaGraphExec_t& e : st_.wg)
             if (e) cudaGraphExecDestroy(e);
         if (st_.stream) cudaStreamDestroy(st_.stream);
+        if (st_.side) cudaStreamDestroy(st_.side);
+        if (st_.fork) cudaEventDestroy(st_.fork);
+        if (st_.join) cudaEventDestroy(st_.join);
         if (done_) cudaEventDestroy(done_);
         if (h_picks_) cudaFreeHost(h_picks_);
     }
 
     bool init(std::string& err) {
         const Geometry& g = g_;
-        if (cudaStreamCreateWithFlags(&st_.stream, cudaStreamNonBlocking) != cudaSuccess) {
+        if (cudaStreamCreateWithFlags(&st_.stream, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&st_.side, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&st_.fork, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&st_.join, cudaEventDisableTiming) != cudaSuccess) {
             err = "cannot create a CUDA stream";
             return false;
         }
@@ -136,17 +142,25 @@ public:
 
     bool copy_drafts() const override { return max_window() > 1; }
 
-    // The block drafter's width for n drafts: its own block, or wider (up to the window) right after a window whose rows
-    // were all kept, so a run of accepted drafts can grow past the block; the policy reads each draft's confidence.
-    int block_width(int n) const { return last_full_ ? std::clamp(n + 1, m_.w.dflash.block, kWindow) : m_.w.dflash.block; }
+    // The block drafter's width for n drafts: its own block, or wider (up to the window) right after a window that kept
+    // most of a block, so a run of accepted drafts can grow past the block; the policy reads each draft's confidence.
+    int block_width(int n) const { return wide_ ? std::clamp(n + 1, m_.w.dflash.block, kWindow) : m_.w.dflash.block; }
 
     // The drafter's chain after `anchor` (the token at `pos`): step 0 pairs main's last normed row (cell pos - 1) with
     // the anchor, each later step its own output with the draft before it; all on the stream, read by draft_end.
     Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         if (block_) {
-            if (Result s = settle(pos); !s.ok()) return s;
+            // the GDN commit runs beside the drafter (which reads none of its rows); the stream waits for it after
+            // the drafter's work, so whatever comes next sees the committed state
+            struct Join {
+                Session& s;
+                ~Join() { s.join_commit(); }
+            } join{*this};
+            if (Result s = settle(pos, true); !s.ok()) return s;
             std::string err;
-            n = std::clamp(n, 1, max_window() - 1);
+            // a wide block drafts the whole window whatever was asked: its drafts cost about one pass at any count, and
+            // the policy picks the window from their chances
+            n = wide_ ? max_window() - 1 : std::clamp(n, 1, max_window() - 1);
             const int width = block_width(n);
             if (pos + width > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
             if (!block_draft(m_, st_, anchor, pos, width, err)) return fail(err);
@@ -194,7 +208,8 @@ public:
         // the blocks in passes of at most a batch window's rows, in order
         std::vector<int> nn((size_t) count), width((size_t) count);
         for (int i = 0; i < count; ++i) {
-            nn[(size_t) i] = std::clamp(n[i], 1, max_window() - 1);
+            // a slot's next window shares the batch's rows: no more drafts than its share takes
+            nn[(size_t) i] = std::clamp(n[i], 1, std::max(1, std::min(max_window(), kBatch / count) - 1));
             width[(size_t) i] = ss[(size_t) i]->block_width(nn[(size_t) i]);
             if (pos[i] + width[(size_t) i] > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
         }
@@ -586,13 +601,19 @@ public:
 
 private:
     // The last window's accepted rows go into the recurrent state once the next call says where it starts.
-    Result settle(int64_t pos) {
+    void join_commit() {
+        if (!commit_pending_) return;
+        cudaStreamWaitEvent(st_.stream, st_.join, 0);
+        commit_pending_ = false;
+    }
+    // `defer`: the commit's join is left to the caller (join_commit), which queues work beside it first
+    Result settle(int64_t pos, bool defer = false) {
         if (pos == 0) {   // a new conversation: the running state starts empty
             pend_T_ = 0;
             st_.rope_delta = 0;
             st_.tail_cell = -1;
             st_.dctx_from = 0;
-            last_full_ = false;
+            wide_ = false;
             if (g_.gdn_layers() &&
                 cudaMemsetAsync(st_.gdn, 0, (size_t) g_.gdn_layers() * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
                 return fail("clearing the recurrent state failed");
@@ -604,8 +625,15 @@ private:
         const int T = pend_T_;
         pend_T_ = 0;
         if (n < 0 || n > T) return fail(m_.o.arch + ": position " + std::to_string((long long) pos) + " is not reachable from the last window");
-        last_full_ = n == T;
-        commit_window(m_, st_, (int) n);
+        wide_ = n >= std::max(2, m_.w.dflash.block - 2);
+        if (g_.gdn_layers() && n > 0) {
+            cudaEventRecord(st_.fork, st_.stream);
+            cudaStreamWaitEvent(st_.side, st_.fork, 0);
+            commit_window(m_, st_, (int) n, st_.side);
+            cudaEventRecord(st_.join, st_.side);
+            commit_pending_ = true;
+            if (!defer) join_commit();
+        }
         if (block_ && n > 0) {   // the kept rows become the block drafter's context
             std::string err;
             if (!block_ctx_window(m_, st_, (int) n, pend_pos_, err)) return fail(err);
@@ -693,7 +721,8 @@ private:
     bool drafter_ = false, block_ = false;
     int n_draft_ = 0;
     cudaEvent_t done_ = nullptr;   // a batched drafter pass, for the other sessions' streams
-    bool last_full_ = false;       // the last settled window kept all its rows
+    bool commit_pending_ = false;  // the GDN commit runs on st_.side, not yet joined to st_.stream
+    bool wide_ = false;            // the last settled window kept most of a block (block - 2 rows or more)
     int64_t pend_pos_ = 0;
     int pend_T_ = 0;
     kernels::SamplerParams sampling_{};

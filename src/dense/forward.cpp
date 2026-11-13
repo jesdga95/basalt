@@ -63,6 +63,28 @@ const void* wnorm(Model& m, const float* x, const float* w, float* xn, int type,
     kernels::rms_norm_rows(x, w, xn, T, cols, eps, s);
     return wact(m, xn, type, cols, T, s);
 }
+// the same for BF16 rows (the residual)
+const void* wnorm(Model& m, const uint16_t* x, const float* w, float* xn, int type, int64_t cols, int T, float eps,
+                  cudaStream_t s) {
+    if (on_wg(type)) {
+        wg::norm_pack(x, w, eps, cols, T, m.ws.xq, xn, s);
+        return m.ws.xq;
+    }
+    kernels::rms_norm_rows(x, w, xn, T, cols, eps, s);
+    return wact(m, xn, type, cols, T, s);
+}
+// the BF16 residual rows readied for a product: as they are on the window gemm, else widened and quantized
+const void* resid_act(Model& m, const Linear& l, int T, cudaStream_t s) {
+    if (on_wg(l.type)) return m.ws.x;
+    kernels::to_f32(m.ws.x, m.ws.tmp, (int64_t) T * l.cols, s);
+    return wact(m, m.ws.tmp, l.type, l.cols, T, s);
+}
+// the window's first rows: the embedding (BF16 in the pack) into the BF16 residual, exactly
+void embed_rows(Model& m, const int32_t* tok, int T, cudaStream_t s) {
+    const int H = m.g.n_embd;
+    kernels::iq_embed_rows(30, m.w.embd, (size_t) H * 2, tok, T, H, m.ws.tmp, s);
+    kernels::to_bf16(m.ws.tmp, m.ws.x, (int64_t) T * H, s);
+}
 void mmq_run(Model& m, const Linear& l, const void* xq, float* y, int T, cudaStream_t s) {
     prefill::mmq::Product p;
     p.w = l.w;
@@ -121,11 +143,12 @@ void prod_group(Model& m, const float* x, const void* xq, int type, std::initial
         prod(m, *o.l, xq, o.y, T, s);
     }
 }
-// x [T][rows] += scale W y (the residual add in the window gemm's epilogue)
-void prod_add(Model& m, const Linear& l, const void* yq, float* x, int T, cudaStream_t s) {
+// x [T][rows] += scale W y into the BF16 residual (the add in fp32, rounded once; in the window gemm's epilogue)
+void prod_add(Model& m, const Linear& l, const void* yq, uint16_t* x, int T, cudaStream_t s) {
     if (on_wg(l.type)) {
-        wg::Call c = wcall(l, wg::Epilogue::Add);
-        c.m[0] = wmat(l, x);
+        wg::Call c = wcall(l, wg::Epilogue::AddBf16);
+        c.m[0] = wmat(l, nullptr);
+        c.m[0].y16 = x;
         wg::gemm(c, yq, T, m.ws.w8, s);
         return;
     }
@@ -428,11 +451,11 @@ void mtp_input(Model& m, const float* emb, const float* hid, float* cat, int n, 
 
 }  // namespace
 
-void commit_window(Model& m, SessionState& st, int n) {
+void commit_window(Model& m, SessionState& st, int n, cudaStream_t s) {
     const Geometry& g = m.g;
     const int C = g.conv_channels();
     if (g.gdn_layers() == 0 || n <= 0) return;
-    cudaMemcpyAsync(st.n_keep, &n, sizeof(int32_t), cudaMemcpyHostToDevice, st.stream);
+    cudaMemcpyAsync(st.n_keep, &n, sizeof(int32_t), cudaMemcpyHostToDevice, s);
     kernels::GdnCommitLayers a;
     a.state = st.gdn;
     a.h = st.rec_h;
@@ -447,7 +470,7 @@ void commit_window(Model& m, SessionState& st, int n) {
     a.h_v = g.gdn_v_heads;
     a.n_layers = g.gdn_layers();
     a.n_keep = st.n_keep;
-    kernels::gdn_commit_layers(a, st.stream, 64, n);
+    kernels::gdn_commit_layers(a, s, 64, n);
 }
 
 namespace {
@@ -461,7 +484,7 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
     const cudaStream_t s = st.stream;
     const int H = g.n_embd;
     kernels::PdlScope pdl(true);   // the window gemm and its packs start early: their weights are read meanwhile
-    kernels::iq_embed_rows(30, w.embd, (size_t) H * 2, b.tok, T, H, b.x, s);
+    embed_rows(m, b.tok, T, s);
     const BlockDrafter& bd = m.bd_dec;
     const bool block = m.o.drafter == Drafter::Block;
     size_t next_target = 0;
@@ -477,7 +500,7 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
         if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) {
             // the block drafter's features: this layer's rows through its block of the projection, summed
             const Linear& fc = bd.fc[next_target];
-            prod(m, fc, wact(m, b.x, fc.type, H, T, s), next_target == 0 ? st.dacc : b.tmp, T, s);
+            prod(m, fc, resid_act(m, fc, T, s), next_target == 0 ? st.dacc : b.tmp, T, s);
             if (next_target > 0) kernels::add_scaled(st.dacc, b.tmp, nullptr, (int64_t) T * H, s);
             ++next_target;
         }
@@ -578,7 +601,7 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
     const int H = g.n_embd;
     {
         kernels::PdlScope pdl(true);
-        kernels::iq_embed_rows(30, w.embd, (size_t) H * 2, b.tok, rows, H, b.x, s);
+        embed_rows(m, b.tok, rows, s);
         const BlockDrafter& bd = m.bd_dec;
         const bool block = m.o.drafter == Drafter::Block;
         size_t next_target = 0;
@@ -590,7 +613,7 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
             if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) {
                 // the block drafter's features, packed in b.dacc until every session has its own
                 const Linear& fc = bd.fc[next_target];
-                prod(m, fc, wact(m, b.x, fc.type, H, rows, s), next_target == 0 ? b.dacc : b.tmp, rows, s);
+                prod(m, fc, resid_act(m, fc, rows, s), next_target == 0 ? b.dacc : b.tmp, rows, s);
                 if (next_target > 0) kernels::add_scaled(b.dacc, b.tmp, nullptr, (int64_t) rows * H, s);
                 ++next_target;
             }
@@ -801,7 +824,7 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.tok, tok, (size_t) R * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.bpos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-    kernels::iq_embed_rows(30, m.w.embd, (size_t) H * 2, b.tok, R, H, b.x, s);
+    embed_rows(m, b.tok, R, s);
     const kernels::RopeSpec rope = block_rope(bd);
     // the dynamic convolution runs along each block's own rows into b.bh
     const auto conv = [&](const float* x, const float* dyn, int64_t ld_dyn, const float* base) {
@@ -905,7 +928,8 @@ bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok
     cudaMemcpyAsync(b.pos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     kernels::iq_embed_rows(30, m.w.embd, (size_t) H * 2, tok, n, H, b.tmp, s);
     mtp_input(m, b.tmp, hid, b.cat, n, s);
-    prod(m, d.fc, wact(m, b.cat, d.fc.type, 2 * H, n, s), b.x, n, s);
+    prod(m, d.fc, wact(m, b.cat, d.fc.type, 2 * H, n, s), b.tmp, n, s);
+    kernels::to_bf16(b.tmp, b.x, (int64_t) n * H, s);
     win_attn(m, d.layer, st.mtp_kc, st.mtp_vc, n, c0, s);
     if (out) {
         win_ffn(m, d.layer, n, s);

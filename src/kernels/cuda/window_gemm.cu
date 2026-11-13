@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <map>
 #include <mutex>
 
@@ -63,19 +62,23 @@ __global__ void __launch_bounds__(256) pack_kernel(const float* x, int64_t ld_x,
     out[i] = bf16_bits(x[t * ld_x + c]);
 }
 
-__global__ void __launch_bounds__(kPackThreads) norm_pack_kernel(const float* x, const float* __restrict__ w, float eps,
+__device__ __forceinline__ float widen(float v) { return v; }
+__device__ __forceinline__ float widen(uint16_t v) { return __bfloat162float(__ushort_as_bfloat16(v)); }
+
+template <class X>
+__global__ void __launch_bounds__(kPackThreads) norm_pack_kernel(const X* x, const float* __restrict__ w, float eps,
                                                                  int64_t K, uint16_t* out, float* xn) {
     __shared__ float red[32];
     pdl_launch_dependents();
     pdl_wait();
-    const float* xr = x + (int64_t) blockIdx.x * K;
+    const X* xr = x + (int64_t) blockIdx.x * K;
     float ss = 0.0f;
-    for (int64_t c = threadIdx.x; c < K; c += blockDim.x) ss = fmaf(xr[c], xr[c], ss);
+    for (int64_t c = threadIdx.x; c < K; c += blockDim.x) ss = fmaf(widen(xr[c]), widen(xr[c]), ss);
     const float inv = rsqrtf(block_sum(ss, red) / (float) K + eps);
     float* yr = xn ? xn + (int64_t) blockIdx.x * K : nullptr;
     uint16_t* o = out + (int64_t) blockIdx.x * K;
     for (int64_t c = threadIdx.x; c < K; c += blockDim.x) {
-        const float v = xr[c] * inv * w[c];
+        const float v = widen(xr[c]) * inv * w[c];
         if (yr) yr[c] = v;
         o[c] = bf16_bits(v);
     }
@@ -142,7 +145,10 @@ Plan plan_for(const Call& c) {
         const int cps = (p.nchunks + ks - 1) / ks, kse = (p.nchunks + cps - 1) / cps;
         if (kse != ks) continue;
         const int64_t items = (int64_t) p.tiles * kse;
-        const double cost = (double) ((items + R - 1) / R) * (cps + (kse > 1 ? sums : 0.0));
+        // plus the tile's last block's walk over the slices' sums, about a quarter chunk a slice at 16 rows (40 slices
+        // of a 256-row matrix cost 15.7 us at T = 16 against 7.7 at 10)
+        const double tail = kse > 1 ? 0.25 * kse : 0.0;
+        const double cost = (double) ((items + R - 1) / R) * (cps + (kse > 1 ? sums : 0.0)) + tail;
         if (cost < best - 1e-9) {
             best = cost;
             p.ks = kse;
@@ -193,7 +199,13 @@ void pack(const float* x, int64_t ld_x, int64_t K, int T, void* act, void* strea
 
 void norm_pack(const float* x, const float* w, float eps, int64_t K, int T, void* act, float* xn, void* stream) {
     if (T <= 0) return;
-    launch_pdl(norm_pack_kernel, dim3(T), dim3(kPackThreads), 0, (cudaStream_t) stream, x, w, eps, K, (uint16_t*) act, xn);
+    launch_pdl(norm_pack_kernel<float>, dim3(T), dim3(kPackThreads), 0, (cudaStream_t) stream, x, w, eps, K, (uint16_t*) act, xn);
+    check("window gemm: norm_pack");
+}
+
+void norm_pack(const uint16_t* x, const float* w, float eps, int64_t K, int T, void* act, float* xn, void* stream) {
+    if (T <= 0) return;
+    launch_pdl(norm_pack_kernel<uint16_t>, dim3(T), dim3(kPackThreads), 0, (cudaStream_t) stream, x, w, eps, K, (uint16_t*) act, xn);
     check("window gemm: norm_pack");
 }
 
@@ -229,6 +241,7 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
         a.rows[i] = c.m[i].rows;
         a.scale[i] = c.m[i].scale;
         a.y[i] = c.m[i].y;
+        a.y16[i] = c.m[i].y16;
         a.ld_y[i] = c.m[i].ld_y;
         a.row_off[i] = off;
         a.tile0[i] = t0;
