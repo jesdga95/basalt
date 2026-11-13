@@ -260,6 +260,17 @@ int main() {
         for (float v : other) same = same && v == 0.0f;
         std::printf("%-22s %s\n", "gdn_rows_scatter", same ? "bitwise" : "MISMATCH  FAIL");
         if (!same) ++fails;
+        cudaEvent_t e0, e1;   // profile: one layer's scatter of a full window
+        cudaEventCreate(&e0); cudaEventCreate(&e1);
+        const int reps = 200;
+        cudaEventRecord(e0, S);
+        for (int i = 0; i < reps; ++i) basalt::kernels::gdn_rows_scatter(dt, rows, dq, dh, dg, db, C, HV, layer, W, S);
+        cudaEventRecord(e1, S);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        const double bytes = 2.0 * rows * (2.0 * C + 2.0 * HV) * 4;
+        std::printf("%-22s %.1f us per call, %.0f GB/s of %.2f MB moved\n", "gdn_rows_scatter", 1e3 * ms / reps, bytes / (1e-3 * ms / reps) / 1e9, bytes / 1e6);
     }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
