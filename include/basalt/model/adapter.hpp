@@ -125,6 +125,11 @@ struct PrefillRequest {
     bool more = false;                   ///< another part follows: the workspaces stay until end_prompt()
 };
 
+/// The merged tokens of an encoded picture or video group: `nx` across, `ny` down (0: placed as a sequence).
+struct ImageGrid {
+    int nx = 0, ny = 0;
+};
+
 /// Model-owned per-conversation state (recurrent state, KV, windows).
 class ModelSession {
 public:
@@ -179,17 +184,26 @@ public:
     virtual ExpertCounts expert_counts() const { return {}; }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
-    /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block). Rows with no
-    /// vision support leave the default.
-    virtual Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) {
-        (void) data; (void) bytes; (void) rows; (void) n_rows;
+    /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block), and its grid of
+    /// merged tokens when the model places rows by it (else {0, 0}). Rows with no vision support leave the default.
+    virtual Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, ImageGrid& grid) {
+        (void) data; (void) bytes; (void) rows; (void) n_rows; (void) grid;
         return {Status::NotImplemented, "this model takes no images"};
     }
+    /// For a model whose encoder reads the shared preprocessor's patches (basalt/vision/preprocess.hpp and video.hpp):
+    /// one picture's [n][768] or one two-frame video group's [n][1536] patch rows, in merge order, of a w x h canvas,
+    /// to n / 4 embedding rows.  What lets the server send it video.
+    virtual Result encode_patches(const std::vector<float>& patches, int w, int h, std::vector<float>& rows) {
+        (void) patches; (void) w; (void) h; (void) rows;
+        return {Status::NotImplemented, "this model reads no video"};
+    }
+    virtual bool reads_patches() const { return false; }
     /// A request's pictures are encoded: the encoder gives its memory back.
     virtual void images_done() {}
-    /// Feeds `n_rows` embedding rows (from encode_image) at positions pos.. instead of token embeddings.
-    virtual Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) {
-        (void) rows; (void) n_rows; (void) pos;
+    /// Feeds `n_rows` embedding rows (from encode_image) at positions pos.. instead of token embeddings; `grid` as
+    /// encode_image gave it.
+    virtual Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, ImageGrid grid) {
+        (void) rows; (void) n_rows; (void) pos; (void) grid;
         return {Status::NotImplemented, "this model takes no images"};
     }
 };
