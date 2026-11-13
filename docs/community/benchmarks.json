@@ -2040,6 +2040,41 @@
       "draft_len_prose": 1.5,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8",
       "notes": "Q4_K/Q5_1 and Q4_K/Q8_0 expert layers take the engine's 'glue off' fallback, so decode trails the NVFP4 and IQ4_XS packs on this card"
+    },
+    {
+      "submitter": "changlv",
+      "date": "2026-11-13",
+      "commit": "3075cd6176",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 160,
+          "pcie": "3.0 x8",
+          "h2d_gbps": 6.9
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "Intel Xeon CPU E5-2686 v4, 18 cores",
+      "ram_gbps": 50.0,
+      "os": "Linux",
+      "quant": "IQ3_XXS",
+      "kv": "int8",
+      "prefill_16k_tps": 1795.9,
+      "prefill_64k_tps": 1982.0,
+      "decode_tps": 102.8,
+      "decode_conv_tps": 74.0,
+      "decode_struct_tps": 116.9,
+      "decode_prose_tps": 73.7,
+      "accept_conv_pct": 76.4,
+      "accept_struct_pct": 96.4,
+      "accept_prose_pct": 67.6,
+      "draft_len_conv": 2.4,
+      "draft_len_struct": 6.4,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     }
   ]
 }
