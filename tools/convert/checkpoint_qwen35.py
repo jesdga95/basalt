@@ -2,8 +2,9 @@
 NVIDIA Model Optimizer checkpoint (as nvidia/Qwen3.8-27B-NVFP4), for tools/convert/convert.py.
 
   gguf                every language-model and drafter tensor in GGUF names:
-                        NVFP4 MLP and head: E2M1 codes and UE4M3 scales moved into Basalt's 64-value blocks
-                          (type 40, unchanged values), the FP32 tensor scale as `<name>.scale` (F32 [1])
+                        NVFP4 MLP and head: NVFP4_PLANES (type 45): the E2M1 code plane as stored, then the UE4M3
+                          scales in 128-row x 4-group tiles (unchanged values); the FP32 tensor scale as
+                          `<name>.scale` (F32 [1])
                         FP8 projections: the E4M3 codes as stored (type 44, F8_E4M3; rows / columns in the GGUF
                           head order), the FP32 per-tensor weight_scale as `<name>.scale` (F32 [1])
                         BF16 projections (the drafter's): Q8_0
@@ -38,12 +39,13 @@ from gguf_writer import GGUFWriter  # noqa: E402
 from model_file import TENSOR_ALIGN, ModelWriter, Stream  # noqa: E402
 
 ARCH = "qwen35"
-TYPE_ID = {"F32": 0, "F16": 1, "Q8_0": 8, "BF16": 30, "NVFP4": 40, "F8_E4M3": 44}
+TYPE_ID = {"F32": 0, "F16": 1, "Q8_0": 8, "BF16": 30, "NVFP4": 40, "F8_E4M3": 44, "NVFP4_PLANES": 45}
 ROWS_PER_JOB = 1 << 22
 E4M3 = S.fp8_e4m3_table()
 
 # checkpoint tensor (after `model.language_model.layers.N.` or `mtp.layers.0.`) -> (GGUF name, form, transform)
-#   forms: Q8 (Q8_0 from BF16; the main model's FP8 projections become F8, their codes kept), FP4 (NVFP4 kept), BF16, F32
+#   forms: Q8 (Q8_0 from BF16; the main model's FP8 projections become F8, their codes kept), FP4 (NVFP4 kept, as planes),
+#   BF16, F32
 #   transforms as checkpoint.py names them: id, norm, heads, negexp, gconv, vrows, zrows, vcols
 LAYER = {
     "input_layernorm.weight": ("attn_norm.weight", "F32", "norm"),
@@ -83,12 +85,12 @@ METHODS = dict(C.METHODS, id="as stored")
 class Tensor:
     def __init__(self, name, form, src, how, ne):
         self.name, self.form, self.src, self.how, self.ne = name, form, src, how, ne
-        self.type_name = {"Q8": "Q8_0", "FP4": "NVFP4", "F8": "F8_E4M3"}.get(form, form)
+        self.type_name = {"Q8": "Q8_0", "FP4": "NVFP4_PLANES", "F8": "F8_E4M3"}.get(form, form)
         self.type_id = TYPE_ID[self.type_name]
 
     def expected_bytes(self) -> int:
         n = int(np.prod(self.ne))
-        return {"F32": 4 * n, "BF16": 2 * n, "Q8_0": n // 32 * 34, "NVFP4": n // 64 * 36, "F8_E4M3": n}[self.type_name]
+        return {"F32": 4 * n, "BF16": 2 * n, "Q8_0": n // 32 * 34, "NVFP4_PLANES": n // 64 * 36, "F8_E4M3": n}[self.type_name]
 
 
 class Plan:
@@ -131,6 +133,8 @@ class Plan:
                 form = "F8"           # FP8 projections keep their codes and scale
             if form == "FP4" and dt != "U8":
                 raise S.ConvertError(f"{k} is {dt}; NVFP4 codes are U8")
+            if form == "FP4" and (shape[0] % 128 or (shape[1] * 2) % 64):
+                raise S.ConvertError(f"{k}: NVFP4 planes need rows in 128s and 64-value groups, not {shape}")
             if how == "gconv":
                 if len(shape) != 3 or shape[1] != 1:
                     raise S.ConvertError(f"{k}: a conv weight of shape {shape}")
@@ -215,11 +219,13 @@ class Plan:
         t = self.tensors[name]
         p, off, dt, shape, _ = self.ck.t[t.src]
         ne0, ne1 = t.ne
-        if t.form == "FP4":
+        if t.form == "FP4":   # the code plane, then the scale plane in 128-row tiles
             sp, soff = self.ck.t[t.src[:-len(".weight")] + ".weight_scale"][:2]
-            step = max(1, ROWS_PER_JOB // ne0)
+            step = max(128, ROWS_PER_JOB // ne0 // 128 * 128)
             for r in range(0, ne1, step):
-                yield ("fp4", str(p), off, str(sp), soff, ne0, r, min(step, ne1 - r))
+                yield ("fp4c", str(p), off, ne0, r, min(step, ne1 - r))
+            for r in range(0, ne1, step):
+                yield ("fp4s", str(sp), soff, ne0, r, min(step, ne1 - r))
             return
         scale = float(self.ck.values(t.src[:-len(".weight")] + ".weight_scale")) if dt == "F8_E4M3" else None
         kind = {"vrows": "rows", "zrows": "rows", "vcols": "cols"}.get(t.how)
@@ -241,13 +247,15 @@ def _job(args):
         mm = np.memmap(path, dtype="<u2", mode="r", offset=off + row0 * width * 2, shape=(rows, width))
         x = S._bf16_to_f32(np.ascontiguousarray(mm[:, c0:c0 + ne0])).reshape(-1)
         return S.q8_0(x) if np.isfinite(x).all() else "a non-finite value"
-    if args[0] == "fp4":
-        _, path, off, spath, soff, ne0, row0, rows = args
-        codes = np.fromfile(path, dtype=np.uint8, count=rows * ne0 // 2, offset=off + row0 * ne0 // 2).reshape(rows, ne0 // 2)
+    if args[0] == "fp4c":   # code rows as stored (value 2i in the low nibble of byte i)
+        _, path, off, ne0, row0, rows = args
+        return np.fromfile(path, dtype=np.uint8, count=rows * ne0 // 2, offset=off + row0 * ne0 // 2).tobytes()
+    if args[0] == "fp4s":   # scale rows [row0, row0 + rows), rows in 128s, into their tiles
+        _, spath, soff, ne0, row0, rows = args
         sc = np.fromfile(spath, dtype=np.uint8, count=rows * ne0 // 16, offset=soff + row0 * ne0 // 16).reshape(rows, ne0 // 16)
         if (sc & 0x80).any() or (sc == 0x7F).any():
             return "a UE4M3 scale with the sign bit set or NaN"
-        return C.nvfp4_rows(codes, sc).tobytes()
+        return nvfp4_scale_tiles(sc).tobytes()
     op, path, off, dt, scale, ne0, ne1, row0, rows, kind, first = args
     if dt == "F8_E4M3":
         mm = np.memmap(path, dtype=np.uint8, mode="r", offset=off, shape=(ne1, ne0))
@@ -268,6 +276,13 @@ def _job(args):
     if not np.isfinite(x).all():
         return "a non-finite value"
     return S.q8_0(x)
+
+
+def nvfp4_scale_tiles(sc: np.ndarray) -> np.ndarray:
+    """UE4M3 scales [rows, K/16] (rows in 128s) -> the NVFP4_PLANES scale tiles: per 128 rows and 4 groups a 512-byte tile
+    (tiles row-block major), byte (r % 32) * 16 + ((r % 128) // 32) * 4 + g % 4 (include/basalt/kernels/nvfp4_planes.hpp)."""
+    rows, groups = sc.shape
+    return np.ascontiguousarray(sc.reshape(rows // 128, 4, 32, groups // 4, 4).transpose(0, 3, 2, 1, 4)).reshape(-1)
 
 
 # ------------------------------------------------------------------ metadata
@@ -557,12 +572,12 @@ def build(a, Job, fingerprint, die) -> None:
             t = time.time()
             parts, names = [], []
             for n, info in plan.tensors.items():
-                if info.type_name in ("Q8_0", "NVFP4", "F8_E4M3"):
+                if info.type_name in ("Q8_0", "NVFP4_PLANES", "F8_E4M3"):
                     parts.append(Stream(info.expected_bytes(), plan.chunks(n, pool)))
                 else:
                     parts.append(plan.float_bytes(n))
                 names.append(n)
-                if info.type_name in ("NVFP4", "F8_E4M3"):
+                if info.type_name in ("NVFP4_PLANES", "F8_E4M3"):
                     parts.append(plan.scale_value(n).tobytes())
                     names.append(n[:-len(".weight")] + ".scale")
             for n, info in (drafter.tensors.items() if drafter else []):
@@ -603,8 +618,8 @@ def build(a, Job, fingerprint, die) -> None:
                 "checkpoint": {
                     "dir": pathlib.Path(a.checkpoint).name,
                     "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
-                    "nvfp4": "weight (E2M1 pairs) and weight_scale (UE4M3 per 16) moved into 64-value blocks unchanged; "
-                             "weight_scale_2 as <name>.scale; input_scale unused",
+                    "nvfp4": "NVFP4_PLANES: weight (E2M1 pairs) as stored, then weight_scale (UE4M3 per 16) in "
+                             "128-row x 4-group tiles, unchanged; weight_scale_2 as <name>.scale; input_scale unused",
                     "fp8": "weight (E4M3 codes) kept as stored, rows / columns in the GGUF head order; weight_scale as "
                            "<name>.scale; input_scale unused (activations get a scale per row at run time)",
                     "bf16_projections": "Q8_0 (ggml reference rounding)",

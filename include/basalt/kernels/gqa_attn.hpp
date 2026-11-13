@@ -6,10 +6,13 @@
 //
 //   gqa_decode_attn   a decode window (T <= 8): cells split in chunks over the grid, fp32 dot products, the chunks'
 //                     partial softmax sums merged by a second kernel.  A row's output does not depend on T.
-//   gqa_prompt_attn   a prompt chunk: blocks of 96 rows (positions x the KV group's query heads, so a K/V tile is read
-//                     once per group); QK^T on int8 tensor cores for an int8 cache (q rounded to int8 per 64 values), fp16
-//                     ones with fp32 accumulation for fp16; P V on fp16 tensor cores summed in fp16 per 32-cell tile,
-//                     online softmax and the output in fp32.
+//   gqa_prompt_attn   a prompt chunk.  An int8 cache: blocks of 128 positions (64 for narrow launches) of one query
+//                     head, a warp per 16 positions for the whole sweep; 64-cell K/V tiles as raw codes, QK^T on int8
+//                     tensor cores (q rounded to int8 per 64 values), V decoded to fp16 in registers, P V on fp16
+//                     tensor cores summed in fp16 per tile; with split scratch, the cells of a launch whose blocks
+//                     would leave SMs idle split over more blocks and merged.  An fp16 cache: blocks of 96 rows
+//                     (positions x the KV group's query heads), QK^T on fp16 tensor cores with fp32 accumulation, P V
+//                     summed in fp16 per 32-cell tile.  Online softmax and the output in fp32.
 #pragma once
 
 #include <cstddef>
@@ -40,7 +43,11 @@ void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
                      int64_t pos0, int T, int64_t hi, int64_t window, int64_t cap, float* scratch, int64_t scratch_cells,
                      float* out, void* stream);
+/// Scratch floats gqa_prompt_attn needs to split a T-row chunk's cells `splits` ways (an int8 cache).
+size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits);
+/// `split_scratch` (optional, `split_floats` floats): lets an int8-cache launch split its cells over more blocks.
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
-                     int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8 = {});
+                     int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8 = {}, float* split_scratch = nullptr,
+                     size_t split_floats = 0);
 
 }  // namespace basalt::kernels
