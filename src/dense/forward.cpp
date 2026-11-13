@@ -35,7 +35,7 @@ namespace wg = kernels::wgemm;
 // window's rows (up to kBatch) and which applies the tensor scale; others (the drafters' Q8_0) on MMQ with the tile of
 // kNarrow or kBatch rows whatever the window's rows (activations quantized for the whole tile, the bounds {0, T} saying
 // which rows are written), the scale applied after.  The window gemm's activations go to m.ws.xq, MMQ's to m.ws.x8.
-bool on_wg(int type) { return type == kTypeF8 || type == kTypeNvfp4Planes; }
+bool on_wg(int type) { return type == kTypeF8 || type == kTypeNvfp4Planes || type == kTypeQ8P; }
 // the scale the step after a prompt chunk product applies: an NVFP4 matrix's (its product leaves it out), none after F8
 const float* post_scale(const Linear& l) { return l.type == kTypeF8 ? nullptr : l.scale; }
 int mmq_tile(int T) { return T <= kNarrow ? kNarrow : kBatch; }
@@ -84,7 +84,7 @@ void mmq_run(Model& m, const Linear& l, const void* xq, float* y, int T, cudaStr
 }
 wg::Call wcall(const Linear& l, wg::Epilogue epi = wg::Epilogue::Store) {
     wg::Call c;
-    c.fmt = l.type == kTypeF8 ? wg::Format::F8 : wg::Format::Nvfp4;
+    c.fmt = l.type == kTypeF8 ? wg::Format::F8 : l.type == kTypeQ8P ? wg::Format::Q8 : wg::Format::Nvfp4;
     c.K = l.cols;
     c.epi = epi;
     return c;
@@ -137,7 +137,7 @@ void prod_add(Model& m, const Linear& l, const void* yq, float* x, int T, cudaSt
 // next product's bf16 rows (`h16`; h may then be null)
 void prod_swiglu(Model& m, const Linear& gate, const Linear& up, const float* x, const void* xq, float* h, int T,
                  cudaStream_t s, void* h16 = nullptr) {
-    if (on_wg(gate.type) && up.type == gate.type) {
+    if (gate.type == kTypeNvfp4Planes && up.type == gate.type) {
         wg::Call c = wcall(gate, wg::Epilogue::SwiGLU);
         c.n = 2;
         c.m[0] = wmat(gate, h);
@@ -147,10 +147,16 @@ void prod_swiglu(Model& m, const Linear& gate, const Linear& up, const float* x,
         return;
     }
     WindowScratch& b = m.ws;
-    mmq_run(m, gate, xq, b.g, T, s);
-    if (up.type != gate.type) xq = wact(m, x, up.type, up.cols, T, s);
-    mmq_run(m, up, xq, b.u, T, s);
-    kernels::swiglu_scaled(b.g, b.u, gate.scale, up.scale, h, T, gate.rows, gate.rows, s);
+    if (on_wg(gate.type)) {   // two products (their scales applied), then SwiGLU
+        prod_group(m, x, xq, gate.type, {{&gate, b.g}, {&up, b.u}}, T, s);
+        kernels::swiglu_scaled(b.g, b.u, nullptr, nullptr, h, T, gate.rows, gate.rows, s);
+    } else {
+        mmq_run(m, gate, xq, b.g, T, s);
+        if (up.type != gate.type) xq = wact(m, x, up.type, up.cols, T, s);
+        mmq_run(m, up, xq, b.u, T, s);
+        kernels::swiglu_scaled(b.g, b.u, gate.scale, up.scale, h, T, gate.rows, gate.rows, s);
+    }
+    if (h16) wg::pack(h, gate.rows, gate.rows, T, h16, s);
 }
 
 // y [T][rows] = W . x on MMQ (xq quantized for l.type), or for F8 on the FP8 tensor cores with the tensor scale applied
@@ -472,7 +478,7 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
     const int H = g.n_embd;
     kernels::PdlScope pdl(true);   // the window gemm and its packs start early: their weights are read meanwhile
     kernels::iq_embed_rows(30, w.embd, (size_t) H * 2, b.tok, T, H, b.x, s);
-    const BlockDrafter& bd = w.dflash;
+    const BlockDrafter& bd = m.bd_dec;
     const bool block = m.o.drafter == Drafter::Block;
     size_t next_target = 0;
     for (int il = 0; il < g.n_layers; ++il) {
@@ -589,7 +595,7 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
     {
         kernels::PdlScope pdl(true);
         kernels::iq_embed_rows(30, w.embd, (size_t) H * 2, b.tok, rows, H, b.x, s);
-        const BlockDrafter& bd = w.dflash;
+        const BlockDrafter& bd = m.bd_dec;
         const bool block = m.o.drafter == Drafter::Block;
         size_t next_target = 0;
         for (int il = 0; il < g.n_layers; ++il) {
@@ -745,7 +751,7 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
 }
 
 bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err) {
-    const BlockDrafter& bd = m.w.dflash;
+    const BlockDrafter& bd = m.bd_dec;
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
     const int H = m.g.n_embd;
@@ -772,7 +778,7 @@ bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, int wi
 
 bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchors, const int64_t* pos, const int* widths, int S,
                        std::string& err, cudaStream_t stream) {
-    const BlockDrafter& bd = m.w.dflash;
+    const BlockDrafter& bd = m.bd_dec;
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const cudaStream_t s = stream ? stream : sts[0]->stream;

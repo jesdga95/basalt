@@ -155,6 +155,97 @@ size_t chunk_bytes(const Geometry& g) {
 
 }  // namespace
 
+namespace {
+// The block drafter as decode windows run it: its Q8_0 products in Q8 planes for the window gemm.  q, o, gate, up, down and
+// the convolutions are repacked in place (prompt chunks never read them); k, v and the feature projection, which prompt
+// chunks read as blocks, get plane copies.  Then the window gemm's workspace grows to its calls if they need more.
+bool decode_drafter(Model& m, std::string& err) {
+    m.bd_dec = m.w.dflash;
+    BlockDrafter& bd = m.bd_dec;
+    if (!bd.present || m.o.drafter != Drafter::Block) return true;
+    void* tmp = nullptr;
+    size_t tmp_bytes = 0;
+    auto q8 = [](const Linear& l) { return l.type == 8 && l.cols % 256 == 0 && l.rows > 0; };
+    auto bytes = [](const Linear& l) { return (size_t) l.rows * (size_t) l.cols / 32 * 34; };
+    auto in_place = [&](Linear& l) -> bool {
+        if (!q8(l)) return true;
+        const size_t n = bytes(l);
+        if (n > tmp_bytes) {
+            if (tmp) cudaFree(tmp);
+            tmp = nullptr;
+            if (cudaMalloc(&tmp, n) != cudaSuccess) return false;
+            tmp_bytes = n;
+        }
+        if (cudaMemcpy(tmp, l.w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
+        kernels::wgemm::q8_planes(tmp, l.rows, l.cols, const_cast<void*>(l.w), nullptr);
+        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+        l.type = kTypeQ8P;
+        return true;
+    };
+    auto copy = [&](Linear& l) -> bool {
+        if (!q8(l)) return true;
+        void* p = nullptr;
+        if (cudaMalloc(&p, bytes(l)) != cudaSuccess) return false;
+        m.owned.push_back(p);
+        kernels::wgemm::q8_planes(l.w, l.rows, l.cols, p, nullptr);
+        l.w = p;
+        l.type = kTypeQ8P;
+        return true;
+    };
+    bool ok = true;
+    for (BlockDrafter::Layer& D : bd.layers) {
+        for (Linear* l : {&D.q, &D.o, &D.gate, &D.up, &D.down, &D.conv_a, &D.conv_f}) ok = ok && in_place(*l);
+        ok = ok && copy(D.k) && copy(D.v);
+    }
+    for (Linear& l : bd.fc) ok = ok && copy(l);
+    if (tmp) cudaFree(tmp);
+    if (!ok || cudaDeviceSynchronize() != cudaSuccess) {
+        err = m.o.arch + ": laying out the block drafter for decode windows failed";
+        return false;
+    }
+    // the workspace for the drafter's calls (each matrix, q + k + v, k + v)
+    namespace wg = kernels::wgemm;
+    size_t need_p = m.ws.w8.partial_floats, need_t = m.ws.w8.tickets_n;
+    auto need = [&](std::initializer_list<const Linear*> ls) {
+        wg::Call c;
+        c.fmt = wg::Format::Q8;
+        c.n = 0;
+        for (const Linear* l : ls) {
+            if (l->type != kTypeQ8P) return;
+            c.K = l->cols;
+            c.m[c.n++].rows = l->rows;
+        }
+        size_t p, t;
+        wg::workspace_need(c, p, t);
+        need_p = std::max(need_p, p);
+        need_t = std::max(need_t, t);
+    };
+    for (const BlockDrafter::Layer& D : bd.layers) {
+        for (const Linear* l : {&D.q, &D.k, &D.v, &D.o, &D.gate, &D.up, &D.down, &D.conv_a, &D.conv_f}) need({l});
+        need({&D.q, &D.k, &D.v});
+        need({&D.k, &D.v});
+        need({&D.gate, &D.up});
+    }
+    for (const Linear& l : bd.fc) need({&l});
+    if (need_p > m.ws.w8.partial_floats || need_t > m.ws.w8.tickets_n) {
+        void *p = nullptr, *t = nullptr;
+        if (cudaMalloc(&p, std::max<size_t>(need_p, 1) * 4) != cudaSuccess || cudaMalloc(&t, need_t * 4) != cudaSuccess ||
+            cudaMemset(t, 0, need_t * 4) != cudaSuccess) {
+            err = m.o.arch + ": out of device memory for the drafter's workspace";
+            return false;
+        }
+        m.owned.push_back(p);
+        m.owned.push_back(t);
+        m.ws.w8.partial = (float*) p;
+        m.ws.w8.tickets = (int32_t*) t;
+        m.ws.w8.partial_floats = need_p;
+        m.ws.w8.tickets_n = need_t;
+    }
+    return true;
+}
+
+}  // namespace
+
 uint64_t shared_bytes(const Geometry& g, int64_t max_context) { return window_bytes(g, BlockDrafter{}, max_context) + chunk_bytes(g) + (512ull << 20); }
 
 uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8) {
@@ -172,6 +263,7 @@ uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv
 
 Model::~Model() {
     for (BatchGraph& g : batch_graphs) cudaGraphExecDestroy(g.exec);
+    for (void* p : owned) cudaFree(p);
     vision_detach();
 }
 
@@ -412,6 +504,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         return nullptr;
     }
     prefill::mmq::iota(b.iota, kBatch, nullptr);
+    if (!decode_drafter(*m, err)) return nullptr;
     if (!m->ready_products(err) || cudaDeviceSynchronize() != cudaSuccess) {
         if (err.empty()) err = o.arch + ": readying the products failed";
         return nullptr;

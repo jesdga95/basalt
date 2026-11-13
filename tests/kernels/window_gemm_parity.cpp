@@ -283,6 +283,64 @@ void parity_swiglu(int64_t rows, int64_t K) {
     cudaFree(d_sg); cudaFree(d_su); cudaFree(d_h16);
 }
 
+// Q8_0 blocks laid out as Q8 planes (q8_planes) against a double reference on code x scale (each rounded to bf16 in the
+// kernel: within bf16 rounding); rows bitwise at any T
+void parity_q8(int64_t rows, int64_t K) {
+    std::vector<uint8_t> blk((size_t) rows * K / 32 * 34);
+    std::normal_distribution<float> nd;
+    for (size_t b = 0; b < blk.size() / 34; ++b) {
+        const __half d = __float2half(0.01f * (1.0f + 0.5f * nd(rng)));
+        std::memcpy(&blk[b * 34], &d, 2);
+        for (int k = 0; k < 32; ++k) blk[b * 34 + 2 + k] = (uint8_t) (int8_t) (rng() % 255 - 127);
+    }
+    uint8_t* d_blk = up(blk);
+    uint8_t* d_pl;
+    cudaMalloc(&d_pl, blk.size());
+    wg::q8_planes(d_blk, rows, K, d_pl, nullptr);
+    const auto x = make_x(K);
+    float* d_x = up(x);
+    void* act;
+    cudaMalloc(&act, wg::act_bytes(K));
+    float *d_y, *d_y2;
+    cudaMalloc(&d_y, (size_t) R * rows * 4);
+    cudaMalloc(&d_y2, (size_t) R * rows * 4);
+    wg::pack(d_x, K, K, R, act, nullptr);
+    wg::Call c;
+    c.fmt = wg::Format::Q8;
+    c.K = K;
+    c.m[0] = {d_pl, rows, nullptr, d_y, rows};
+    need(c);
+    wg::gemm(c, act, R, ws, nullptr);
+    const auto y = down(d_y, (size_t) R * rows);
+    const auto hx = bf16_rows(act, (size_t) R * K);
+    double worst = 0;
+    for (int t = 0; t < R; ++t)
+        for (int64_t r = 0; r < rows; r += 7) {
+            double sum = 0, sa = 0;
+            for (int64_t k = 0; k < K; ++k) {
+                const size_t b = ((size_t) r * K + k) / 32;
+                __half d;
+                std::memcpy(&d, &blk[b * 34], 2);
+                const double w = (double) (int8_t) blk[b * 34 + 2 + k % 32] * (double) __half2float(d);
+                sum += w * hx[(size_t) t * K + k];
+                sa += std::fabs(w * hx[(size_t) t * K + k]);
+            }
+            worst = std::max(worst, std::fabs(y[(size_t) t * rows + r] - sum) / std::max(sa, 1e-30));
+        }
+    int diff = 0;
+    for (int T : {1, 5, 8, 9, 16}) {
+        cudaMemset(d_y2, 0, (size_t) R * rows * 4);
+        c.m[0].y = d_y2;
+        wg::gemm(c, act, T, ws, nullptr);
+        diff += std::memcmp(down(d_y2, (size_t) T * rows).data(), y.data(), (size_t) T * rows * 4) != 0;
+    }
+    const bool ok = worst < 1e-2 && diff == 0;   // each weight rounds to bf16 (code x bf16 scale)
+    std::printf("%-24s vs double (bf16 weights): %.3g; rows bitwise across T: %s%s\n", "Q8 5120x5120", worst, diff ? "NO" : "yes",
+                ok ? "" : "  FAIL");
+    if (!ok) ++fails;
+    cudaFree(d_blk); cudaFree(d_pl); cudaFree(d_x); cudaFree(act); cudaFree(d_y); cudaFree(d_y2);
+}
+
 // q, k, v as one call: each matrix against the reference
 void parity_multi() {
     const int64_t K = 5120;
@@ -342,7 +400,8 @@ void parity_packs() {
 }
 
 void bench_call(const char* name, wg::Format fmt, int64_t rows, int64_t K, bool swiglu) {
-    const size_t wb = fmt == wg::Format::F8 ? (size_t) rows * K : fmt == wg::Format::Bf16 ? (size_t) rows * K * 2 : np::bytes(rows, K);
+    const size_t wb = fmt == wg::Format::F8 ? (size_t) rows * K : fmt == wg::Format::Bf16 ? (size_t) rows * K * 2
+                      : fmt == wg::Format::Q8 ? (size_t) rows * K / 32 * 34 : np::bytes(rows, K);
     const size_t per = swiglu ? 2 * wb : wb;
     const int copies = (int) std::max<size_t>(2, (512u << 20) / per + 1);
     std::vector<uint8_t*> d_w((size_t) copies * (swiglu ? 2 : 1));
@@ -415,11 +474,13 @@ int main(int argc, char** argv) {
         for (const Shape& sh : kShapes) bench_call(sh.name, sh.fmt, sh.rows, sh.K, false);
         bench_call("FP4 gate+up SwiGLU", wg::Format::Nvfp4, 17408, 5120, true);
         bench_call("FP4 head 248320x5120", wg::Format::Nvfp4, 248320, 5120, false);
+        bench_call("Q8 gate 17408x5120", wg::Format::Q8, 17408, 5120, false);
         return 0;
     }
     for (const Shape& sh : kShapes) parity(sh);
     parity_swiglu(17408, 5120);
     parity_multi();
+    parity_q8(5120, 5120);
     parity_packs();
     std::printf("%s\n", fails ? "FAILED" : "all passed");
     return fails ? 1 : 0;

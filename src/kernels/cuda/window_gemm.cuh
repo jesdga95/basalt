@@ -20,6 +20,7 @@
 #include "basalt/kernels/window_gemm.hpp"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace basalt::kernels::wgemm::detail {
@@ -45,9 +46,9 @@ struct Args {
 template <int F, int RS, int NM, int CH, int ST>
 struct Cfg {
     static constexpr int kThreads = 32 * NM * RS / 16;   // with one 16-row tile per warp
-    static constexpr int CB = F == (int) Format::F8 ? CH : F == (int) Format::Bf16 ? 2 * CH : CH / 2;   // weight bytes per row per chunk
+    static constexpr int CB = F == (int) Format::F8 || F == (int) Format::Q8 ? CH : F == (int) Format::Bf16 ? 2 * CH : CH / 2;   // weight bytes per row per chunk
     static constexpr int P = CB / 16;                                        // 16-byte pieces per row per chunk
-    static constexpr int SB = F == (int) Format::Nvfp4 ? (CH / 64) * RS * 4 : 0;   // scale bytes per matrix per chunk
+    static constexpr int SB = F == (int) Format::Nvfp4 ? (CH / 64) * RS * 4 : F == (int) Format::Q8 ? RS * (CH / 16) : 0;   // scale bytes per matrix per chunk
     static constexpr int MB = RS * CB + SB;                                  // bytes per matrix per stage
     static constexpr int kStage = NM * MB;
     static constexpr int kSmem = ST * kStage;
@@ -58,7 +59,7 @@ struct Cfg {
 
 // the piece a row's 16-byte piece q lands on in shared memory (bank spread for the reads below)
 template <int F, int P> __device__ __forceinline__ int swz(int r) {
-    if constexpr (F == (int) Format::F8) return P >= 8 ? (r & 1) << 2 : 0;
+    if constexpr (F == (int) Format::F8 || F == (int) Format::Q8) return P >= 8 ? (r & 1) << 2 : 0;
     else if constexpr (F == (int) Format::Bf16) return P >= 16 ? (r & 1) << 3 : 0;
     else if constexpr (P >= 8) return (r & 3) << 1;
     else if constexpr (P == 4) return ((r >> 1) & 1) << 1;
@@ -106,6 +107,19 @@ __device__ __forceinline__ void e2m1x8_f16(unsigned w, unsigned sc, unsigned (&h
         : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
         : "r"(w), "r"(sc));
 }
+// two int8 (the low 16 bits of x, the low byte the lower half) as bf16x2, exact
+__device__ __forceinline__ unsigned s8x2_bf16(unsigned x) {
+    const float f0 = __int_as_float(0x4B000000 | ((x ^ 0x80u) & 0xffu)) - 8388736.0f;
+    const float f1 = __int_as_float(0x4B000000 | (((x >> 8) ^ 0x80u) & 0xffu)) - 8388736.0f;
+    unsigned h;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(h) : "f"(f1), "f"(f0));
+    return h;
+}
+__device__ __forceinline__ unsigned bf16x2_mul(unsigned a, unsigned b) {
+    unsigned d;
+    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+    return d;
+}
 __device__ __forceinline__ uint4 ld_nc16(const void* p) {
     uint4 v;
     asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
@@ -115,7 +129,7 @@ __device__ __forceinline__ uint4 ld_nc16(const void* p) {
 template <int F, int RS, int NM, int CH, int ST, int NT, int MW>
 __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgemm_kernel(const Args a) {
     using C = Cfg<F, RS, NM, CH, ST>;
-    constexpr bool kF8 = F == (int) Format::F8, kBf16 = F == (int) Format::Bf16;
+    constexpr bool kF8 = F == (int) Format::F8, kBf16 = F == (int) Format::Bf16, kQ8 = F == (int) Format::Q8;
     constexpr int KB = CH / 64;                       // 64-value blocks per chunk
     constexpr int kWarpsPerM = RS / (16 * MW);        // warps per matrix
     constexpr int kThreads = 32 * NM * kWarpsPerM;
@@ -124,7 +138,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
     __shared__ float xchg[NM == 2 ? RS * kRows : 1];   // SwiGLU: the up rows for the gate warps
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
     const int ks = a.ks, items = a.tiles * ks, G = gridDim.x;
-    const int64_t row_bytes = kF8 ? a.K : kBf16 ? 2 * a.K : a.K / 2;
+    const int64_t row_bytes = kF8 || kQ8 ? a.K : kBf16 ? 2 * a.K : a.K / 2;
 
     // a work item is (row tile, K slice); a block takes items blockIdx.x, + G, ... and streams their chunks as one
     // sequence through the stages
@@ -150,6 +164,13 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                 const int r = p / C::P, q = p - r * C::P;
                 const int64_t row = min(row0 + r, rows - 1);   // rows past the last read the last (not written)
                 cp_async<16>(sm + r * C::CB + ((q ^ swz<F, C::P>(r)) << 4), W + row * row_bytes + kc * C::CB + q * 16);
+            }
+            if constexpr (kQ8) {   // each row's CH / 32 fp16 scales of the chunk
+                const uint8_t* S = a.sp[mat];
+                for (int r = threadIdx.x; r < RS; r += kThreads) {
+                    const int64_t row = min(row0 + r, rows - 1);
+                    cp_async<CH / 16>(sm + RS * C::CB + r * (CH / 16), S + row * (a.K / 16) + kc * (CH / 16));
+                }
             }
             if constexpr (F == (int) Format::Nvfp4) {
                 const uint8_t* S = a.sp[mat];
@@ -239,6 +260,23 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                             a1[s] = w1[2 * s];
                             a2[s] = w0[2 * s + 1];
                             a3[s] = w1[2 * s + 1];
+                        }
+                    } else if constexpr (kQ8) {   // values 16c .. 16c + 15: half of 32-value block 2b + c / 2
+                        const int pc = 4 * b + c;
+                        const uint4 w0 = *(const uint4*) (q0 + ((pc ^ swz<F, C::P>(r0l)) << 4));
+                        const uint4 w1 = *(const uint4*) (q1 + ((pc ^ swz<F, C::P>(r1l)) << 4));
+                        const __half* ss = (const __half*) (sm + RS * C::CB);
+                        const int jb = 2 * b + (c >> 1);
+                        const unsigned short s0 = __bfloat16_as_ushort(__float2bfloat16_rn(__half2float(ss[r0l * (CH / 32) + jb])));
+                        const unsigned short s1 = __bfloat16_as_ushort(__float2bfloat16_rn(__half2float(ss[r1l * (CH / 32) + jb])));
+                        const unsigned sc0 = s0 | ((unsigned) s0 << 16), sc1 = s1 | ((unsigned) s1 << 16);
+                        const unsigned u0[4] = {w0.x, w0.y, w0.z, w0.w}, u1[4] = {w1.x, w1.y, w1.z, w1.w};
+#pragma unroll
+                        for (int s = 0; s < 4; ++s) {
+                            a0[s] = bf16x2_mul(s8x2_bf16(u0[s]), sc0);
+                            a1[s] = bf16x2_mul(s8x2_bf16(u1[s]), sc1);
+                            a2[s] = bf16x2_mul(s8x2_bf16(u0[s] >> 16), sc0);
+                            a3[s] = bf16x2_mul(s8x2_bf16(u1[s] >> 16), sc1);
                         }
                     } else if constexpr (kF8) {
                         const int pc = 4 * b + c;
