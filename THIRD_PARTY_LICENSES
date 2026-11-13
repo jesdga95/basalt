@@ -148,6 +148,11 @@ By Ian Ranson and the Infernix contributors.
 
 The grouped NVFP4 expert GEMM in src/prefill/fp4/moe_fp4.cu adapts code from Infernix.
 
+The FP8 E4M3 prompt-chunk product in src/prefill/fp8_gemm.cu adapts Infernix's fp8_a8_tma_mma_kernel
+(src/ops/linear/fp8/fp8_a8_tma_mma.cuh, fp8_a8_mma_common.cuh, src/ops/common/mbarrier.cuh, mma.cuh): the TMA and
+mbarrier producer/consumer pipeline, the 128x256x128 tile with its warp layout and ping-ponged fragments, the
+block-scaled mma used as the full-rate e4m3 product, and the segmented outputs.
+
 The int8 prompt-attention kernel adapts ideas and code from Infernix (src/ops/qsa/qsa_prompt.cu): the
 per-warp 16-cell tiles with one merge, the k-step query ordering, and the exact int8 widening to FP16.
 The chunked gated delta rule in src/kernels/cuda/gdn_prompt.cu adapts the Infernix chunked formulation.

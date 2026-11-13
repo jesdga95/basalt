@@ -1439,6 +1439,7 @@ target_link_libraries(model_qwen4exp_moe_fused PUBLIC mmq ${_gpu_runtime_target}
 target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_moe_fused)
 # a prompt chunk's products against FP8 E4M3 weights on the FP8 tensor cores (W8A8)
 add_library(prefill_fp8 STATIC src/prefill/fp8_gemm.cu)
+set_target_properties(prefill_fp8 PROPERTIES CUDA_ARCHITECTURES 120a-real)   # the block-scaled mma
 target_include_directories(prefill_fp8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(prefill_fp8 PUBLIC core ${_gpu_runtime_target})
 if(BUILD_TESTING)
