@@ -56,6 +56,26 @@ struct Mtp {
     Layer layer;
 };
 
+/// A block drafter (DFlash 2): the target's rows at a few layers, projected and normed, are the context (K/V in a
+/// sliding window) of a few non-causal attention layers that read a block [anchor, mask, ...] and give every slot's
+/// candidates at once; a selector walks one path through them.  The head is the target's.
+struct BlockDrafter {
+    struct Layer {
+        const float *attn_norm = nullptr, *ffn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr;
+        const float *base_a = nullptr, *base_f = nullptr;   // the two convolutions' base kernels [2][2][n_embd]
+        Linear q, k, v, o, gate, up, down, conv_a, conv_f;
+    };
+    bool present = false;
+    int block = 0, mask_id = 0, conv_group = 0, rank = 0, top_k = 0, window = 0;
+    int n_head = 0, n_kv = 0, head_dim = 0;
+    float theta = 0.0f, eps = 1e-6f;
+    std::vector<int> target_layers;          ///< the target layers whose outputs it reads, in order
+    std::vector<Linear> fc;                  ///< per target layer, its block of the feature projection
+    const float *hidden_norm = nullptr, *norm = nullptr;
+    std::vector<Layer> layers;
+    const uint16_t *sel_h = nullptr, *pred = nullptr, *succ = nullptr;   // bf16 [rank][n_embd], [vocab][rank] x 2
+};
+
 struct Geometry {
     int n_layers = 0, n_embd = 0, n_ff = 0, n_vocab = 0;
     int n_head = 0, n_kv = 0, head_dim = 0;
@@ -79,14 +99,20 @@ struct Weights {
     const float* out_norm = nullptr;
     Linear head;
     Mtp mtp;
+    BlockDrafter dflash;
 };
+
+/// Which drafter a model's sessions run.
+enum class Drafter { None, Mtp, Block };
 
 struct Options {
     int64_t max_context = 0;            ///< cells each session holds
     int sessions = 1;
     int spec = 0;                       ///< rows a decode window may hold (0 or 1: one)
     bool draft = false;                 ///< run the pack's drafter
+    Drafter drafter = Drafter::None;    ///< which one
     bool vision = false;                ///< requests may carry images
+    bool kv_int8 = false;               ///< the attention layers' K/V as int8 codes with a scale per 64 values
     core::FileRange mmproj;             ///< the vision projector (vision/mmproj)
     std::string arch;                   ///< the architecture name, for messages
 };
@@ -103,7 +129,7 @@ using ModelPtr = std::unique_ptr<Model, ModelDeleter>;
 ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::string& err);
 std::unique_ptr<model::ModelSession> make_session(Model& m, std::string& err);
 /// Device bytes one session takes (its KV cells, recurrent states and window rows).
-uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp);
+uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8 = false);
 /// Device bytes the model's shared scratch takes.
 uint64_t shared_bytes(const Geometry& g, int64_t max_context);
 
