@@ -34,10 +34,6 @@ void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const i
 
 /// Bytes of the token planes of `tokens` rows of `cols` values: the codes [tokens][cols / 2] (each 16 values' 8 bytes
 /// in order), then the UE4M3 scales [tokens][cols / 16].
-/// As quantize, rows h = silu(g * sg) * (u * su) made from g and u as they are read (sg, su device scalars or null).
-void quantize_swiglu(const float* g, const float* u, const float* sg, const float* su, const int32_t* bounds,
-                     const int32_t* tile_off, int n, void* a4, float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream);
-
 size_t token_bytes(int64_t tokens, int64_t cols);
 /// Rounds each of `tokens` rows of x (`ld` floats apart) to FP4 once, into the token planes `a4` and the token scales
 /// gs[tokens]: the same codes and scales quantize() gives every row that reads that token.
@@ -65,6 +61,11 @@ struct Product {
     const int32_t* ids = nullptr;
     int64_t tokens = 0;
     size_t tail_off = 0;
+    /// A dense layer's SwiGLU product (with swiglu, no ids): blob[0] the gate matrix, `up` the up matrix of the same
+    /// shape; w_rows counts both (2 x the outputs); `tail` the device {s_gate, s_up, s_down, -} in place of the blob's.
+    /// Rows come from tiled planes as in the plain product; long chunks only (at least 1,024 rows).
+    const uint8_t* up = nullptr;
+    const float* tail = nullptr;
 };
 void run(const Product& p, void* stream);
 /// The 16-byte scale tail at `tail_off` of each of p's n blobs to dst[4 j .. 4 j + 3] (the tail swiglu reads).

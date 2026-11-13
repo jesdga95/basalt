@@ -81,6 +81,7 @@ struct ChunkScratch {
     void* a4 = nullptr;                           // FP4 activations of a long chunk's NVFP4 products, their token scales
     float* gs = nullptr;
     int32_t* tile_off = nullptr;
+    float* ffn_tail = nullptr;                    // per layer {s_gate, s_up, 1, 0}: the FP4 SwiGLU product's scales
     int32_t *tok = nullptr, *pos = nullptr, *iota = nullptr, *bounds = nullptr;
 };
 
