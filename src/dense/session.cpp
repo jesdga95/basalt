@@ -27,6 +27,7 @@ public:
         for (cudaGraphExec_t& e : st_.wg)
             if (e) cudaGraphExecDestroy(e);
         if (st_.stream) cudaStreamDestroy(st_.stream);
+        if (done_) cudaEventDestroy(done_);
         if (h_picks_) cudaFreeHost(h_picks_);
     }
 
@@ -165,6 +166,35 @@ public:
         }
         st_.tail_cell = -1;   // cell pos - 1 holds the right pair now
         n_draft_ = n;
+        return {};
+    }
+
+    // The block drafter for several sessions in passes of as many blocks as a batch window holds: each session is settled
+    // on its own stream (one after another: they share the window scratch), the passes run on the first one's stream, and
+    // the others' streams wait for them before their draft_end reads.
+    Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
+                       int count) override {
+        const int per = block_ ? kBatch / m_.w.dflash.block : 0;
+        if (count <= 1 || per < 2) return ModelSession::draft_batch(peers, anchors, pos, n, count);
+        std::vector<Session*> ss((size_t) count);
+        for (int i = 0; i < count; ++i) {
+            ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
+            if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return fail(m_.o.arch + ": a draft batch of sessions of another model");
+            if (pos[i] + m_.w.dflash.block > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
+            if (Result r = ss[(size_t) i]->settle(pos[i]); !r.ok()) return r;
+            if (cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        }
+        if (!done_ && cudaEventCreateWithFlags(&done_, cudaEventDisableTiming) != cudaSuccess) return fail(m_.o.arch + ": no event");
+        std::vector<SessionState*> sts((size_t) count);
+        for (int i = 0; i < count; ++i) sts[(size_t) i] = &ss[(size_t) i]->st_;
+        std::string err;
+        const cudaStream_t s0 = sts[0]->stream;
+        for (int i = 0; i < count; i += per)
+            if (!block_draft_batch(m_, sts.data() + i, anchors + i, pos + i, std::min(per, count - i), err, s0)) return fail(err);
+        cudaEventRecord(done_, s0);
+        for (int i = 1; i < count; ++i) cudaStreamWaitEvent(sts[(size_t) i]->stream, done_, 0);
+        for (int i = 0; i < count; ++i)
+            ss[(size_t) i]->n_draft_ = std::clamp(n[i], 1, std::min(ss[(size_t) i]->max_window() - 1, m_.w.dflash.block - 1));
         return {};
     }
 
@@ -647,6 +677,7 @@ private:
     int32_t* h_picks_ = nullptr;
     bool drafter_ = false, block_ = false;
     int n_draft_ = 0;
+    cudaEvent_t done_ = nullptr;   // a batched drafter pass, for the other sessions' streams
     int64_t pend_pos_ = 0;
     int pend_T_ = 0;
     kernels::SamplerParams sampling_{};

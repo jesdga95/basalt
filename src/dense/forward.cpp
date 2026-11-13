@@ -713,11 +713,11 @@ bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, std::s
 }
 
 bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchors, const int64_t* pos, int S,
-                       std::string& err) {
+                       std::string& err, cudaStream_t stream) {
     const BlockDrafter& bd = m.w.dflash;
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
-    const cudaStream_t s = sts[0]->stream;
+    const cudaStream_t s = stream ? stream : sts[0]->stream;
     const int H = g.n_embd, B = bd.block, AQ = bd.n_head * bd.head_dim, KV = bd.n_kv * bd.head_dim, R = S * B;
     const int groups = H / bd.conv_group;
     if (S < 1 || R > kBatch) {
