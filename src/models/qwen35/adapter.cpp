@@ -398,7 +398,7 @@ public:
         return true;
     }
 
-    // the pack's drafter runs in windows of 8 unless --spec says otherwise (0 or 1: plain decode)
+    // the pack's drafter runs in windows of up to 16 unless --spec says otherwise (0 or 1: plain decode)
     int planned_spec(const program::CommonOptions& o) const override {
         if (o.spec_given) return o.spec >= 2 ? o.spec : 0;
         return has_drafter(o.model) ? kDefaultSpec : 0;
@@ -409,8 +409,8 @@ public:
             basalt::log::error("basalt qwen35", "--kv %s: fp16 (the default) or int8", o.kv.c_str());
             return 2;
         }
-        if (o.spec_given && (o.spec < 0 || o.spec > 8)) {
-            basalt::log::error("basalt qwen35", "--spec %d: 0 (off) to 8", o.spec);
+        if (o.spec_given && (o.spec < 0 || o.spec > 16)) {
+            basalt::log::error("basalt qwen35", "--spec %d: 0 (off) to 16", o.spec);
             return 2;
         }
         if (!o.spec_given) o.spec = has_drafter(o.model) ? kDefaultSpec : 0;
@@ -432,7 +432,7 @@ private:
         static int n = 0;
         return n;
     }
-    static constexpr int kDefaultSpec = 8;
+    static constexpr int kDefaultSpec = 16;
     static bool has_drafter(const std::string& path) {
         core::ModelFile file;
         std::string err;
