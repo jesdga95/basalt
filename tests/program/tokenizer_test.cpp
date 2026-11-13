@@ -34,6 +34,12 @@ constexpr PreTok kQwen35 = basalt::models::qwen4exp::tokenizer::pretok_qwen35;
 #else
 constexpr PreTok kQwen35 = nullptr;
 #endif
+// the synthetic vocab below runs under whichever pre-tokenizer this build has, Qwen first
+#ifdef BASALT_MODEL_QWEN4EXP
+constexpr PreTok kAny = kQwen35;
+#else
+constexpr PreTok kAny = kJoyai;
+#endif
 }  // namespace
 
 namespace {
@@ -84,7 +90,7 @@ void synthetic() {
     merges = "b c\na b\nab c\na a\naa a";   // ranks: bc 0, ab 1, abc 2, aa 3, aaa 4
     Tokenizer t;
     std::string err;
-    t.set_pretokenize(kQwen35 != nullptr ? kQwen35 : kJoyai);
+    t.set_pretokenize(kAny);
     CHECK(t.load(vocab, merges, types, err));
     std::vector<int32_t> ids;
     CHECK(t.encode("abc", false, {}, ids, err));
