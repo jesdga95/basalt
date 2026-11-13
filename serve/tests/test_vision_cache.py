@@ -3,6 +3,7 @@ import hashlib
 import shutil
 import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from serve.engine import vision
@@ -17,6 +18,17 @@ class Eng:
         for _, out in jobs:
             out.write_bytes(SVE)
         return ["OK 7 2 2 5"] * len(jobs)
+
+
+class RecordingEng(Eng):
+    """The engine path's fake, keeping the names of the scratch files it is handed."""
+
+    def __init__(self, seen: list):
+        self.seen = seen
+
+    def encode_images(self, jobs):
+        self.seen.extend(img.name for img, _ in jobs)
+        return super().encode_images(jobs)
 
 
 def sidecar():
@@ -66,6 +78,76 @@ class VisionCache(unittest.TestCase):
     def readable(self, v, names):
         combined, counts = v.encode(blobs(names))
         return combined.read_bytes() == SVE * len(names) and counts == [7] * len(names)
+
+    def test_a_scratch_file_the_encoder_still_holds_does_not_fail_the_request(self):
+        # Windows refuses the unlink while the encoder has the image open (WinError 32): the file is scratch, so the
+        # request carries on instead of dying as a dropped connection
+        real_unlink = Path.unlink
+
+        def held(self, missing_ok=False):
+            if self.suffix == ".img":
+                raise PermissionError(13, "the file is in use", str(self))
+            return real_unlink(self, missing_ok=missing_ok)
+
+        for name, make in PATHS.items():
+            with self.subTest(path=name):
+                v = make()
+                try:
+                    with mock.patch.object(Path, "unlink", held):
+                        self.assertTrue(self.readable(v, ["a"]))
+                finally:
+                    shutil.rmtree(v.dir, ignore_errors=True)
+
+    def test_each_attempt_writes_scratch_files_of_its_own(self):
+        for name, make in PATHS.items():
+            with self.subTest(path=name):
+                v = make()
+                seen = []
+                if isinstance(v, EngineVision):
+                    v.engine = RecordingEng(seen)
+                else:
+                    def enc(img, out, seen=seen):
+                        seen.append(img.name)
+                        out.write_bytes(SVE)
+                        return "OK 7 2 2 5"
+                    v._enc = enc
+                try:
+                    self.assertTrue(self.readable(v, ["a"]))
+                    v.cache.clear()
+                    v.cache_bytes = 0                    # the same image encoded again: a second attempt
+                    self.assertTrue(self.readable(v, ["a"]))
+                    self.assertEqual(len(set(seen)), 2, seen)
+                finally:
+                    shutil.rmtree(v.dir, ignore_errors=True)
+
+    def test_a_video_scratch_file_the_encoder_still_holds_does_not_fail_the_request(self):
+        # the same on the video path, which also encodes into a name of its own and publishes the result whole
+        seen = []
+
+        def encv(video, out, words):
+            seen.append((video.name, out.name))
+            out.write_bytes(SVE)
+            return "OK 3 3 2 12 0.3,1.5,2.4"
+
+        real_unlink = Path.unlink
+
+        def held(self, missing_ok=False):
+            if self.suffix == ".vid":
+                raise PermissionError(13, "the file is in use", str(self))
+            return real_unlink(self, missing_ok=missing_ok)
+
+        for name, make in PATHS.items():
+            with self.subTest(path=name):
+                v = make()
+                v._encv = encv
+                try:
+                    with mock.patch.object(Path, "unlink", held):
+                        combined, rows = v.encode_media([("video", b"clip", {})])
+                    self.assertEqual(combined.read_bytes(), SVE)
+                    self.assertTrue(seen[-1][0].endswith(".vid") and seen[-1][1].endswith(".part"), seen)
+                    self.assertFalse(list(v.dir.glob("*.part")))
+                finally:
+                    shutil.rmtree(v.dir, ignore_errors=True)
 
     def test_a_request_with_more_images_than_fit(self):
         for v in self.each_path():
