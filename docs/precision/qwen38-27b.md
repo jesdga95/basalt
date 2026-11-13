@@ -17,7 +17,9 @@ What the dense stack computes in, where it rounds, and what that costs against t
 
 - **Products:** NVFP4 matrices (MLP, head): in decode windows each E2M1 code times its UE4M3 group scale is converted to fp16
   exactly and multiplied by fp16 activations (each row scaled by a power of two) with fp32 accumulation; prompt chunks run
-  the MLP W4A4 (below). An NVFP4 matrix's FP32 scale is applied to its fp32 output. F8_E4M3 projections: in prompt chunks the activations are
+  the MLP W4A4 on every chunk: each row rounded to FP4 (E2M1 with a UE4M3 scale per 16 values against a per-row FP32 scale,
+  amax / (6 x 448)) and multiplied on the FP4 tensor cores, fp32 accumulation. An NVFP4 matrix's FP32 scale is applied to
+  its fp32 output. F8_E4M3 projections: in prompt chunks the activations are
   rounded to E4M3 once per row (scale amax / 448) and multiplied on FP8 tensor cores (W8A8, as NVIDIA's checkpoint
   specifies; its static input_scale is not used); in decode windows the codes are converted to fp16 exactly and multiplied by
   fp16 activations (each row scaled by a power of two) with fp32 accumulation. Both apply the matrix's FP32 scale at the end.
@@ -30,13 +32,14 @@ What the dense stack computes in, where it rounds, and what that costs against t
   and that reply can differ in the last bits between runs.
 - **GDN:** fp32 state and conv history. Decode windows replay accepted rows into the state; prompt chunks run the chunked delta
   rule with q/k in BF16 and the state in fp32 (shared with Flash-Next). The prompt's a/b projections (BF16 weights) take the
-  normed rows as two tf32 terms on tensor cores (about fp32's precision).
+  normed rows as two bf16 terms on tensor cores (about fp32's precision), the gates applied in the same kernel.
 - **Attention:** K and V stored fp16, or with `--kv int8` as int8 codes and an fp16 scale per 64 values (amax / 127, codes rounded
   to nearest against the stored scale). Decode reads them with fp32 dot products and softmax (int8: code x scale in fp32), in chunks of 64 cells folded in a fixed
   order.
-  Prompt chunks: QK^T with fp16 q and k on tensor cores, fp32 accumulation (int8: q rounded to int8 per 64 values, amax / 127,
-  and each 64-value group's integer sum times both scales in fp32); softmax in fp32; P V with fp16 p and v on tensor cores,
-  each tile of 32 cells summed in fp16 and added to the fp32 output (int8: code x scale rounded to fp16).
+  Prompt chunks, fp16 cache: QK^T with fp16 q and k on tensor cores, fp32 accumulation; P V with fp16 p and v, each tile of
+  32 cells summed in fp16 and added to the fp32 output. int8 cache: q rounded to int8 per 64 values (amax / 127), each
+  64-value group's integer sum times both scales in fp32; P V with fp16 p and fp16 code x scale, each tile of 64 cells
+  summed in fp16 into the fp32 output; long prompts split the cells and merge the splits in fp32. Softmax in fp32.
 - **Residual and norms:** fp32.
 
 ## Quality against BF16
@@ -45,16 +48,19 @@ Reference: [quality](quality.md#the-bf16-reference). 100 chunks, 25,500 rows, on
 
 | Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
 |---|---:|---:|---:|---:|---:|
-| NVFP4 + F8_E4M3 projections (NVIDIA's checkpoint, bit for bit) | 6.7850 | 0.0214 | 0.0118 | 0.179 | 92.87% |
-| The same, prompt MLP W4A4 on every chunk (`--diag-fp4-rows 1`) | 6.7815 | 0.0239 | 0.0128 | 0.204 | 92.55% |
-| Earlier pack: projections Q8_0 of the FP8 values | 6.7889 | 0.0213 | 0.0118 | 0.178 | 92.93% |
+| NVFP4 + F8_E4M3 projections, the prompt MLP W4A4 on every chunk (the default) | 6.7815 | 0.0239 | 0.0128 | 0.204 | 92.55% |
+| The same with the prompt MLP on int8 below 1,024 rows (before NVFP4_PLANES) | 6.7850 | 0.0214 | 0.0118 | 0.179 | 92.87% |
+| Earlier pack: projections Q8_0 of the FP8 values, MLP int8 below 1,024 rows | 6.7889 | 0.0213 | 0.0118 | 0.178 | 92.93% |
 
 The F8 projections hold NVIDIA's values exactly but read prompt rows in E4M3 (one scale per row) where the Q8_0 pack read
 them in q8_1 (one scale per 32): perplexity 6.7889 -> 6.7850, KLD 0.0213 -> 0.0214, top-1 92.93 -> 92.87%.
 
-The base scores 6.7411 on the same rows. Each chunk's first half is read as one 257-row prompt (the MMQ path) and the scored
-rows are then decoded against it. The second row forces the FP4 prompt path (W4A4, normally from 1,024 rows) onto that read,
-so every scored row sees a cache and recurrent state written by it: KLD +0.0025, top-1 -0.4 points. Decode never uses it.
+The base scores 6.7411 on the same rows. Each chunk's first half is read as one 257-row prompt and the scored rows are then
+decoded against it, so every scored row sees a cache and recurrent state the prompt path wrote. With the MLP in NVFP4 planes
+the prompt path runs it W4A4 at any chunk length (as NVIDIA's checkpoint and Infernix do); before, chunks under 1,024 rows
+took int8 activations, and the gate's 257-row reads never reached W4A4. That costs this gate KLD +0.0025 and top-1 -0.3
+points; long prompts were W4A4 already. Decode never uses it. (The first row was measured with W4A4 forced on the earlier
+F8 pack: the same arithmetic.)
 
 ## Agreement with Hugging Face
 

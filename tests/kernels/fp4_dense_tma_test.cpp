@@ -276,25 +276,24 @@ int bench() {
         fp4::plan(bounds, 1, toff, nullptr);
 
         const double flop_gu = 2.0 * T * (2 * gate_rows) * K1, flop_d = 2.0 * T * down_rows * K2;
+        // the expert path's plain products (gate and up as two of them)
         auto old_product = [&](const uint8_t* w, const uint8_t* up, int64_t rows, int64_t K, void* a4, float* dst) {
-            fp4::Product p;
-            p.blob[0] = w;
-            p.w_rows = up ? 2 * rows : rows;
-            p.w_cols = K;
-            p.n = 1;
-            p.a4 = a4;
-            p.gs = gs;
-            p.bounds = bounds;
-            p.tile_off = toff;
-            p.dst = dst;
-            p.ld_dst = rows;
-            p.max_rows = T;
-            if (up) {
-                p.swiglu = true;
-                p.up = up;
-                p.tail = dsc;
+            for (const uint8_t* m : {w, up}) {
+                if (!m) continue;
+                fp4::Product p;
+                p.blob[0] = m;
+                p.w_rows = rows;
+                p.w_cols = K;
+                p.n = 1;
+                p.a4 = a4;
+                p.gs = gs;
+                p.bounds = bounds;
+                p.tile_off = toff;
+                p.dst = dst;
+                p.ld_dst = rows;
+                p.max_rows = T;
+                fp4::run(p, nullptr);
             }
-            fp4::run(p, nullptr);
         };
         const float q1 = time_ms([&] { fd::quantize(dx1, T, K1, K1, act1, gs, nullptr); });
         const float q2 = time_ms([&] { fd::quantize(dx2, T, K2, K2, act2, gs, nullptr); });

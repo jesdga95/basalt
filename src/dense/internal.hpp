@@ -87,10 +87,8 @@ struct ChunkScratch {
     float *g = nullptr, *u = nullptr, *h = nullptr;
     float *hn = nullptr, *cat = nullptr;          // the drafter's history: main's normed rows, its input rows
     float* dacc = nullptr;                        // the block drafter's projected features of the chunk's rows
-    void* a4 = nullptr;                           // FP4 activations of a long chunk's NVFP4 products, their token scales
+    void* a4 = nullptr;                           // the MLP's FP4 activations (fp4_dense), their token scales
     float* gs = nullptr;
-    int32_t* tile_off = nullptr;
-    float* ffn_tail = nullptr;                    // per layer {s_gate, s_up, 1, 0}: the FP4 SwiGLU product's scales
     int32_t *tok = nullptr, *pos = nullptr, *iota = nullptr, *bounds = nullptr;
 };
 
