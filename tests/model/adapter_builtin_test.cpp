@@ -20,8 +20,9 @@ int main() {
     };
     models::register_builtin_models();
     models::register_builtin_models();
-    check(model::find_adapter("qwen4exp") && model::find_adapter("deepseek41"), "both adapters registered");
-    check(model::adapter_names().size() == 2, "registering twice keeps one adapter per name");
+    check(model::find_adapter("qwen4exp") && model::find_adapter("deepseek41") && model::find_adapter("qwen35"),
+          "every built-in adapter registered");
+    check(model::adapter_names().size() == 3, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
         std::unique_ptr<model::LoadedModel> loaded;
         check(ds->load({}, loaded).status == model::Status::Error, "deepseek41 load without a path is an error");
