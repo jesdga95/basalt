@@ -202,8 +202,10 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
 
 #pragma unroll
     for (int i = 0; i < ST - 1; ++i) issue_next();
-    pdl_launch_dependents();   // the next kernel may take SM room as blocks finish and stage its weights meanwhile
     pdl_wait();   // the activations and the workspace come from the kernels before this one
+    // the next kernel may take SM room as blocks finish and stage its weights meanwhile; only after the wait, since a
+    // dependent may read what the kernel before this one wrote before its own wait
+    pdl_launch_dependents();
 
     const int wm = NM == 1 ? 0 : warp / kWarpsPerM;   // this warp's matrix slot in the stage
     const int rw = warp % kWarpsPerM;
