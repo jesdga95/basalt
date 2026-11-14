@@ -180,6 +180,8 @@ private:
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
+    std::mutex done_mu_;
+    std::condition_variable done_cv_;
     // The sleep after `kSpinBeforeSleep`.  `sleepers_` is how `publish` knows whether anyone needs waking, so the
     // token path pays one uncontended load per publish and never takes the mutex while the workers spin.
     alignas(64) std::atomic<uint32_t> sleepers_{0};

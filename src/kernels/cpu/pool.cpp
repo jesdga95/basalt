@@ -115,6 +115,7 @@ void ExpertPool::publish() {
     // the host sees the sleeper and notifies under the mutex the worker holds until it is inside `wait`.
     // On x86 the fetch_add is a locked xadd either way, so this costs the token path nothing.
     epoch_.fetch_add(1, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     if (sleepers_.load(std::memory_order_seq_cst) != 0) {
         std::lock_guard<std::mutex> lk(sleep_mu_);
         sleep_cv_.notify_all();
@@ -156,7 +157,7 @@ void ExpertPool::worker(int id) {
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
-            sleep_cv_.wait(lk, [&] {
+            sleep_cv_.wait_for(lk, std::chrono::milliseconds(10), [&] {
                 return epoch_.load(std::memory_order_seq_cst) != seen || stop_.load(std::memory_order_relaxed);
             });
             sleepers_.fetch_sub(1, std::memory_order_relaxed);
@@ -197,9 +198,11 @@ uint32_t ExpertPool::begin_batch(int n) {
     }
     // Every job of the previous batch has completed (`wait_done`), and a claim of it can no longer succeed, so
     // nothing adds to `done` until this batch's first claim - which the release below orders after the reset.
-    done_.store(0, std::memory_order_relaxed);
-    const uint32_t e = epoch_.load(std::memory_order_relaxed) + 1;   // only the host bumps the epoch
-    head_.store(pack_head(e, (uint32_t) n, 0), std::memory_order_release);
+    done_.store(0, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const uint32_t e = epoch_.load(std::memory_order_seq_cst) + 1;   // only the host bumps the epoch
+    head_.store(pack_head(e, (uint32_t) n, 0), std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     publish();
     return e;
 }
@@ -227,12 +230,27 @@ void ExpertPool::wait_parked(const char* what) {
 void ExpertPool::wait_done(int n) {
     hstate_.store(kWaitDone, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
-    StallClock clock;
-    for (;;) {
-        const uint32_t d = done_.load(std::memory_order_acquire);
+    for (int spin = 0; spin < 2000; ++spin) {
+        const uint32_t d = done_.load(std::memory_order_seq_cst);
         if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
         _mm_pause();
-        if (clock.expired(d)) {                                       // progress restarts the clock
+    }
+    uint32_t last_d = done_.load(std::memory_order_seq_cst);
+    auto last_progress = std::chrono::steady_clock::now();
+    while (last_d < (uint32_t) n) {
+        {
+            std::unique_lock<std::mutex> lk(done_mu_);
+            done_cv_.wait_for(lk, std::chrono::milliseconds(10), [&] {
+                return done_.load(std::memory_order_seq_cst) >= (uint32_t) n;
+            });
+        }
+        const uint32_t d = done_.load(std::memory_order_seq_cst);
+        if (d >= (uint32_t) n) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (d != last_d) {
+            last_d = d;
+            last_progress = now;
+        } else if (now - last_progress > kStall) {
             basalt::log::error("basalt", "the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
                                  "stopping the engine so the server can start it again",
                          d, n, parked_.load(), n_);
@@ -289,7 +307,12 @@ void ExpertPool::drain(int id, uint32_t epoch) {
                 native_down_range(e, r0, r1);
             }
         }
-        done_.fetch_add(1, std::memory_order_release);
+        const uint32_t prev_done = done_.fetch_add(1, std::memory_order_seq_cst);
+        if (prev_done + 1 >= (uint32_t) njobs_) {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            std::lock_guard<std::mutex> lk(done_mu_);
+            done_cv_.notify_all();
+        }
     }
 }
 
@@ -388,6 +411,7 @@ void ExpertPool::idle_stop() {
                                                   std::memory_order_acquire))
             break;
     }
+    njobs_ = (int) claimed;
     wait_done((int) claimed);
     idle_live_ = false;
     mode_ = 0;
