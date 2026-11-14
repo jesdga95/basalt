@@ -41,6 +41,12 @@ BASALT_NVFP4P_HD inline int64_t scale_index(int64_t row, int64_t group, int64_t 
 
 /// The planes of a matrix of ggml NVFP4 blocks (`blocks`, rows x K) into `planes` (distinct buffers, `bytes` each).
 void from_blocks(const void* blocks, int64_t rows, int64_t K, void* planes, void* stream);
+/// A Q8_0 matrix (ggml's 34-byte blocks, rows x K) rounded to NVFP4 planes in `planes` (distinct, `bytes` long): a global
+/// scale gs = the matrix's largest |value| / (6 * 448) written to *scale (device FP32, the product's multiplier), per 16
+/// values the UE4M3 scale of their largest |value| / (6 gs), codes value / (scale gs) rounded to E2M1.  For a block
+/// drafter, whose products only shape drafts (every draft is verified exactly).
+void from_q8(const void* q8_blocks, int64_t rows, int64_t K, void* planes, float* scale, void* stream);
+
 /// The ggml NVFP4 blocks of a plane matrix, for products that read blocks (distinct buffers, `bytes` each).
 void to_blocks(const void* planes, int64_t rows, int64_t K, void* blocks, void* stream);
 
