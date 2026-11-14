@@ -23,6 +23,7 @@
 #include "basalt/program/options.hpp"
 #include "basalt/program/ppl_gate.hpp"
 #include "basalt/program/tokenizer.hpp"
+#include "basalt/spec/draft_policy.hpp"
 #include "basalt/spec/suffix_drafter.hpp"
 
 #include <cuda_runtime.h>
@@ -235,12 +236,12 @@ public:
         // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
         // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
         // history and last proposal
-        int32_t dr[16] = {};
-        float dprob[16] = {};
+        int32_t dr[basalt::spec::DraftPolicy::kMaxT] = {};
+        float dprob[basalt::spec::DraftPolicy::kMaxT] = {};
         int n_dr = 0;
         basalt::core::DraftCumAdapt cum;
         std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
-        int32_t sbuf[16] = {};
+        int32_t sbuf[basalt::spec::DraftPolicy::kMaxT] = {};
         int sk = 0, smatch = 0;
         int pen_n = 0;                 ///< the request's penalty window (penalty_last_n; 0: no penalties)
         bool from_sfx = false;
