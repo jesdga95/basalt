@@ -15,14 +15,14 @@ What the dense stack computes in, where it rounds, and what that costs against t
 
 ## Where each stage rounds
 
-- **Products:** NVFP4 matrices (MLP, head): in decode windows each E2M1 code times its UE4M3 group scale is converted to fp16
-  exactly and multiplied by fp16 activations (each row scaled by a power of two) with fp32 accumulation; prompt chunks run
+- **Products:** NVFP4 matrices (MLP, head): in decode windows each E2M1 code times its UE4M3 group scale is converted to bf16
+  exactly and multiplied by the window's bf16 rows on the bf16 tensor cores with fp32 accumulation; prompt chunks run
   the MLP W4A4 on every chunk: each row rounded to FP4 (E2M1 with a UE4M3 scale per 16 values against a per-row FP32 scale,
   amax / (6 x 448)) and multiplied on the FP4 tensor cores, fp32 accumulation. An NVFP4 matrix's FP32 scale is applied to
   its fp32 output. F8_E4M3 projections: in prompt chunks the activations are
   rounded to E4M3 once per row (scale amax / 448) and multiplied on FP8 tensor cores (W8A8, as NVIDIA's checkpoint
-  specifies; its static input_scale is not used); in decode windows the codes are converted to fp16 exactly and multiplied by
-  fp16 activations (each row scaled by a power of two) with fp32 accumulation. Both apply the matrix's FP32 scale at the end.
+  specifies; its static input_scale is not used); in decode windows the codes are converted to bf16 exactly and multiplied by
+  the window's bf16 rows with fp32 accumulation. Both apply the matrix's FP32 scale at the end.
 - **Decode windows:** a row's products are summed in K slices fixed by the matrix's shape and added in order, and the
   attention splits a row's cells by position alone, so a token's arithmetic is the same in a drafted window and in plain
   decoding: greedy output with drafting is bitwise plain greedy, alone or beside other slots. Tokens read through the
@@ -47,11 +47,16 @@ What the dense stack computes in, where it rounds, and what that costs against t
   not reach this path.
 - **Residual and norms:** prompt chunks keep the residual stream in BF16 (each add in fp32, rounded once) and pass BF16
   activations between kernels (qkv, z, the conv output, q/k/v, the normed rows for GDN's a/b); norms and softmax in fp32.
-  Decode windows: fp32 for now (moving to the same rule).
+  Decode windows keep the residual in BF16 by the same rule (every add in fp32, rounded once, in the window gemm's epilogue),
+  and the products read BF16 rows that the producing kernels write.
 
 ## Quality against BF16
 
-Reference: [quality](quality.md#the-bf16-reference). 100 chunks, 25,500 rows, one RTX 5090 at 400 W, `--kv fp16`:
+Reference: [quality](quality.md#the-bf16-reference). 100 chunks, 25,500 rows, one RTX 5090 at 400 W, `--kv fp16`.
+
+**The rows below were measured before the BF16 residual and activations (prompt chunks and decode windows) and before the
+8-bit P V on an int8 cache; the gate's fp16-KV run does not reach P V, but the BF16 rounding is in it. They are remeasured
+at landing: TBD-quality-ppl, TBD-quality-kld-mean, TBD-quality-kld-p99, TBD-quality-top1 for the current build.**
 
 | Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
 |---|---:|---:|---:|---:|---:|
@@ -70,6 +75,8 @@ points; long prompts were W4A4 already. Decode never uses it. (The first row was
 F8 pack: the same arithmetic.)
 
 ## Agreement with Hugging Face
+
+Measured before the BF16 residual and activations; remeasured at landing (TBD-hf-agreement).
 
 Four short prompts (5, 15, 21 and 60 tokens; the last a chat-templated question), every position's logits through the decode
 path against Hugging Face transformers' own Qwen3.5 modules run in fp32 on the CPU, with the same NVFP4 and FP8 weights
