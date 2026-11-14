@@ -36,14 +36,16 @@ struct KvHostPools {
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;  ///< int8 mode: fp16 scale per 64 values
     uint16_t* v_scale = nullptr;
-    uint8_t* k_q4 = nullptr;      ///< q4_0 mode (kv_q4.hpp): block_q4_0 codes, 144 B per cell and head
+    uint8_t* k_q4 = nullptr;      ///< q4_0 / NVFP4 mode (kv_q4.hpp): 4-bit codes, 144 B per cell and head
     uint8_t* v_q4 = nullptr;
     bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
 };
 
-/// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0.
+/// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0,
+/// NVFP4. The two 4-bit formats have the same row size and share these pointers and these movers (kv_q4.hpp);
+/// which one a block's bytes are is a state property, invisible to a byte copy.
 /// (A bool `int8` argument still reads as kKvF16 / kKvInt8.)
-enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2 };
+enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvFp4 = 3 };
 
 /// The residency map of a streamed layer, all device memory at fixed addresses (the graphs bake them in).
 struct KvStreamMap {

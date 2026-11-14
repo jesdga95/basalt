@@ -180,7 +180,10 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
                                   v_.kcur_ + t * NKV * HD, v_.kcur_ + t * NKV * HD, s, cs, nullptr);
                 kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, v_.vcur_ + t * NKV * HD,
                                   v_.vcur_ + t * NKV * HD, s, cs, nullptr);
-            } else if (st.kv_q4)
+            } else if (st.kv_nvfp4)
+                kv_append_fp4_step(st.k_q4, st.v_q4, st.page_table, step_t, v_.kcur_ + t * NKV * HD,
+                                   v_.vcur_ + t * NKV * HD, s, cs, &st.host);
+            else if (st.kv_q4)
                 kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, v_.kcur_ + t * NKV * HD,
                                   v_.vcur_ + t * NKV * HD, s, cs, &st.host);
             else if (st.kv_int8)

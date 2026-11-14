@@ -4,6 +4,7 @@
 #include "basalt/models/qwen4exp/kernels/qsa_prompt_attn.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
+#include "basalt/models/qwen4exp/kernels/fp4_bits.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -57,11 +58,14 @@ __device__ __forceinline__ uint32_t pack_h2(float lo_k, float hi_k) {   // eleme
 // KV_MODE 4 (Q4_0 K and V, `--kv q4_0`): mode 1 with a scale per 32 values - each q4_0 block's codes enter as exact
 // int8 (code - 8) and its fp16 scale is applied in FP32, as mode 1's are; the caller rotates q and un-rotates the
 // output (kv_q4.hpp).
+// KV_MODE 5 (NVFP4 K and V, `--kv nvfp4`): the E2M1 x E4M3 rows decode straight into the FP16 stage (the product is
+// exact in FP32), so everything downstream of the load is the mode-0 path with scales 1; the caller rotates q and
+// un-rotates the output, as for mode 4.
 template <int KV_MODE>
 struct Smem {
-    using KElem = typename std::conditional<KV_MODE == 0, __half, int8_t>::type;
+    using KElem = typename std::conditional<KV_MODE == 0 || KV_MODE == 5, __half, int8_t>::type;
     using VElem = typename std::conditional<KV_MODE == 1 || KV_MODE == 4, int8_t, __half>::type;
-    static constexpr int KROW = KV_MODE == 0 ? HD + 8 : HD + 16;   // elements; 16-byte aligned rows, banks spread
+    static constexpr int KROW = (KV_MODE == 0 || KV_MODE == 5) ? HD + 8 : HD + 16;   // elements; 16-byte aligned rows, banks spread
     static constexpr int VROW = (KV_MODE == 1 || KV_MODE == 4) ? HD + 16 : HD + 8;
     static constexpr int NG = KV_MODE == 4 ? HD / QK4_0 : 4;      // scale groups per row (q4_0: 8 of 32, else 4 of 64)
     __half qh[16][QS];
@@ -134,7 +138,48 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
         __syncthreads();   // rows ready; the previous chunk's p.v is done with k, v, s
         // gather the chunk's K and V rows (16-byte pieces; K8V4's V as q4_0 blocks dequantized to fp16)
         // and their scales
-        if constexpr (KV_MODE == 4) {
+        if constexpr (KV_MODE == 5) {
+            // NVFP4 K and V: one (K or V, cell, block of 32) per item - the block's 16 code bytes (element 2j in
+            // the low nibble of byte j, 2j + 1 in the high one) and its two E4M3 scales decode into the FP16
+            // stage; the product E2M1 x E4M3 is exact in FP32, so the downstream path is mode 0 with scales 1
+            constexpr int BLKS = HD / 32;
+            constexpr int ROWB = HD / 2 + HD / 16;   // the q4_0-sized row: 128 code + 16 scale bytes
+            for (int i = t; i < 2 * CH * BLKS; i += THREADS) {
+                const int kv = i / (CH * BLKS), rem = i % (CH * BLKS), c = rem / BLKS, b = rem % BLKS;
+                const long long r = S.row[c];
+                __half2 out[16];
+                if (r >= 0) {
+                    const uint8_t* base = (kv == 0 ? p.k_q4 : p.v_q4) + (size_t) r * ROWB + b * 16;
+                    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(base);   // byte-aligned: b * 16 is even
+                    uint32_t w[4];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        w[j] = (uint32_t) __ldg(q16 + 2 * j) | ((uint32_t) __ldg(q16 + 2 * j + 1) << 16);
+                    const uint8_t* sc = (kv == 0 ? p.k_q4 : p.v_q4) + (size_t) r * ROWB + HD / 2 + 2 * b;
+                    const float s0 = 16384.0f * fp4_e4m3_value(__ldg(sc)), s1 = 16384.0f * fp4_e4m3_value(__ldg(sc + 1));
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        const uint32_t byte = (w[j >> 2] >> (8 * (j & 3))) & 0xffu;
+                        const float sg = j < 8 ? s0 : s1;
+                        out[j] = __halves2half2(__float2half_rn(fp4_e2m1_value14(byte & 0x0Fu) * sg),
+                                                __float2half_rn(fp4_e2m1_value14(byte >> 4) * sg));
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) out[j] = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
+                }
+                __half2* dst = kv == 0 ? reinterpret_cast<__half2*>(&S.k[c][0]) : reinterpret_cast<__half2*>(&S.v[c][0]);
+                const uint4* src4 = reinterpret_cast<const uint4*>(&out[0]);
+                uint4* dst4 = reinterpret_cast<uint4*>(dst + b * 16);   // 16 half2 = 4 uint4 = 64 B
+#pragma unroll
+                for (int j = 0; j < 4; ++j) dst4[j] = src4[j];
+            }
+            for (int i = t; i < CH * 4; i += THREADS) {   // the FP16 stage carries no scales
+                const int c = i / 4, g = i % 4;
+                S.ks[c][g] = 1.0f;
+                S.vs[c][g] = 1.0f;
+            }
+        } else if constexpr (KV_MODE == 4) {
             // q4_0 K and V: one (K or V, cell, block) per item - the block's 16 code bytes (2-byte aligned: eight
             // 16-bit loads) become 32 exact int8 codes (element j in the low nibble of byte j, j + 16 in the high
             // one), its fp16 scale goes to ks/vs
@@ -199,7 +244,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                         }
                     }
                 }
-            } else {
+            } else if constexpr (KV_MODE != 5) {
                 constexpr int VPIECES = HD * (int) sizeof(typename Smem<KV_MODE>::VElem) / 16;   // per V row
                 for (int i = t; i < CH * VPIECES; i += THREADS) {
                     const int c = i / VPIECES, pc = i % VPIECES;
@@ -255,7 +300,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                     al[1] = *reinterpret_cast<const uint32_t*>(&S.ql[gid + 8][k0 + 2 * tig]);
                     al[2] = *reinterpret_cast<const uint32_t*>(&S.ql[gid][k0 + 2 * tig + 8]);
                     al[3] = *reinterpret_cast<const uint32_t*>(&S.ql[gid + 8][k0 + 2 * tig + 8]);
-                    if constexpr (KV_MODE != 0) {   // modes 1 and 3: the K side is INT8 codes
+                    if constexpr (KV_MODE == 1 || KV_MODE == 3 || KV_MODE == 4) {   // the K side is INT8 codes
                         b[0] = i8x2_to_h2(*reinterpret_cast<const uint16_t*>(&S.k[cb + gid][k0 + 2 * tig]));
                         b[1] = i8x2_to_h2(*reinterpret_cast<const uint16_t*>(&S.k[cb + gid][k0 + 2 * tig + 8]));
                     } else {
@@ -837,6 +882,10 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
     cudaStream_t st = (cudaStream_t) stream;
+    if (pools.k_q4 != nullptr && pools.q4_fmt) {   // NVFP4 K and V (--kv nvfp4): mode 5
+        if (pools.v_q4 == nullptr) return false;
+        return launch<5>(q, pools, ids, steps, cap, s, attn, n_q, st);
+    }
     if (pools.k_q4 != nullptr) {   // Q4_0 K and V (--kv q4_0): mode 4
         if (pools.v_q4 == nullptr) return false;
         return launch<4>(q, pools, ids, steps, cap, s, attn, n_q, st);
