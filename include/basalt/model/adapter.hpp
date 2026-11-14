@@ -5,6 +5,7 @@
 // never includes a model's headers, and models never include each other (tools/check_model_layering.sh).
 #pragma once
 
+#include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/program/grammar/tool_form.hpp"
@@ -181,10 +182,16 @@ public:
     /// What the session leaves free on the main card from now on (`mib` < 0: the start's reserve), through prompts and
     /// images too; its VRAM use is resized to that now. The slots it holds now.
     virtual Result set_vram_reserve(int64_t mib, int64_t& expert_slots) { (void) mib; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
-    /// The running state at position `pos`: what cannot be rewound. Positional state stays valid below it.
+    /// The running state at position `pos`: what cannot be rewound. Positional state stays valid below it.  Its size, which
+    /// a checkpoint's host buffer takes, and the device regions it lives in (packed in this order into the checkpoint's
+    /// bytes, the same list whatever the position) with the stream the session works on: the shared engine copies them
+    /// (basalt/core/checkpoint_transfer.hpp).  `save`: a checkpoint is about to be taken at `pos`; the session brings its
+    /// state to `pos` first, or refuses.
     virtual size_t running_bytes() const { return 0; }
-    virtual Result save_running(uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
-    virtual Result restore_running(const uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
+    virtual Result running_state(int64_t pos, bool save, core::RunningState& s) { (void) pos; (void) save; (void) s; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
+    /// The regions of running_state() hold a checkpoint's bytes again, `head` (its size as running_state gave it) the host
+    /// part saved with them: the session's own record of them follows.
+    virtual Result running_restored(int64_t pos, const uint8_t* head) { (void) pos; (void) head; return {}; }
     /// The positional state below `positions`, one entry per layer that holds any, in the store's K/V form: a layer's
     /// `page_size` is the positions behind one of its rows, `cells` its rows times that.  What a conversation parked
     /// out of VRAM takes along; a store cuts it at any position, so restore takes what a cut left.
@@ -306,6 +313,9 @@ const ModelAdapter* find_adapter(const std::string& arch);
 std::vector<std::string> adapter_names();
 /// The most expert cards any registered model takes: a card plan before a model is known.
 int max_expert_cards();
+/// Why no adapter serves `arch`: a Basalt model this build left out (what the build holds and the option that adds
+/// it), or an architecture Basalt does not have.
+std::string unavailable_architecture(const std::string& arch);
 /// The adapter for a file's `general.architecture`, or null with `err` set.
 const ModelAdapter* adapter_for(const GgufFile& meta, std::string& err);
 /// Replaces the old architecture guard: empty when the file belongs to a registered model and validates.
