@@ -136,17 +136,17 @@ int main() {
         check(p.window(ch, 0) == 1, "drafter: no drafts, one row");
     }
     {
-        DraftPolicy p(16);
-        const float ch[15] = {0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f};
+        DraftPolicy p(DraftPolicy::kMaxT);
+        const float ch[DraftPolicy::kMaxT - 1] = {0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f};
         for (int i = 0; i < 200; ++i) {
-            const int t = 1 + i % 16;
+            const int t = 1 + i % DraftPolicy::kMaxT;
             p.observe(true, t, t - 1, 40, 20.0 + 1.5 * (t - 1));   // copies behind long matches: all accepted, rows cheap
         }
         const DraftPolicy::Pick none = p.choose_window(ch, 7, 0, 0);
         check(!none.lookup && none.t == p.window(ch, 7), "drafter vs lookup: no proposal, the drafter's window");
         const DraftPolicy::Pick k = p.choose_window(ch, 7, 15, 40);
         check(k.lookup && k.t > 8, "drafter vs lookup: a long reliable copy takes a wide window");
-        check(p.choose_window(ch, 7, 40, 40).t <= 16, "drafter vs lookup: never beyond the cap");
+        check(p.choose_window(ch, 7, 40, 40).t <= DraftPolicy::kMaxT, "drafter vs lookup: never beyond the cap");
         for (int i = 0; i < 200; ++i) p.observe(true, 6, 0, 4, 20.0 + 1.5 * 5);   // short matches: the first draft fails
         const float sure[7] = {0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f};
         check(!p.choose_window(sure, 7, 5, 4).lookup, "drafter vs lookup: a failing short copy loses to sure drafts");

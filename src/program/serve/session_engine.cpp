@@ -619,7 +619,7 @@ struct SlotWin {
     bool from_sfx = false;   // the drafts are a lookup proposal behind a match of `match` tokens
     int match = 0;
     std::vector<int32_t> win, out, history;
-    float chance[16] = {};
+    float chance[basalt::spec::DraftPolicy::kMaxT] = {};
     Clock::time_point round0;
     basalt::model::DecodeRequest d;
     // set by slot_window_accept: the accepted drafts, the tokens' line, the finish reason, the drafts to start next
