@@ -1,7 +1,8 @@
 """Tests for checkpoint_qwen35.py (convert.py --checkpoint DIR, no --sections-from) on a tiny synthetic Model Optimizer
 checkpoint: two layers (GDN, then gated attention) at the real GDN head geometry with narrow matrices, FP8 projections,
 NVFP4 MLPs and head, a BF16 drafter, a two-block vision tower and tokenizer files; and on its compressed-tensors
-variant: every projection NVFP4 (weight_packed, weight_global_scale), the a / b projections too, the head BF16.
+variant: every projection NVFP4 (weight_packed, weight_global_scale), the a / b projections too, the head BF16 (FP8 rows
+by default, NVFP4 with --head nvfp4).
 
     python3 tools/convert/test_checkpoint_qwen35.py
     python3 -m unittest discover -s tools/convert -p 'test_checkpoint_qwen35.py'"""
@@ -516,7 +517,7 @@ def nvfp4_dequant(codes: np.ndarray, sc: np.ndarray) -> np.ndarray:
 
 class Qwen35CompressedTensorsTest(unittest.TestCase):
     """The compressed-tensors checkpoint: GDN, attention and MLP projections move as planes with 1 / weight_global_scale,
-    the a / b projections become BF16 of their values, the BF16 head is rounded to NVFP4."""
+    the a / b projections become BF16 of their values, the BF16 head is rounded to NVFP4 (--head nvfp4)."""
 
     @classmethod
     def setUpClass(cls):
@@ -526,7 +527,7 @@ class Qwen35CompressedTensorsTest(unittest.TestCase):
         cls.fx = Fixture(t / "ck", ct=True)
         out = t / "x.basalt"
         r = subprocess.run([sys.executable, str(HERE / "convert.py"), "--checkpoint", str(t / "ck"), "--out", str(out),
-                            "--workers", "2"], capture_output=True, text=True)
+                            "--head", "nvfp4", "--workers", "2"], capture_output=True, text=True)
         if r.returncode:
             raise RuntimeError(r.stdout + r.stderr)
         cls.p = Pack(out, t)
@@ -605,7 +606,7 @@ class Qwen35CompressedTensorsTest(unittest.TestCase):
 
 
 class Qwen35Fp8HeadTest(unittest.TestCase):
-    """--head fp8 on the compressed-tensors checkpoint: the BF16 head becomes E4M3 rows, each with its FP32 scale."""
+    """The compressed-tensors checkpoint by default: the BF16 head becomes E4M3 rows, each with its FP32 scale."""
 
     @classmethod
     def setUpClass(cls):
@@ -615,7 +616,7 @@ class Qwen35Fp8HeadTest(unittest.TestCase):
         cls.fx = Fixture(t / "ck", ct=True)
         out = t / "x.basalt"
         r = subprocess.run([sys.executable, str(HERE / "convert.py"), "--checkpoint", str(t / "ck"), "--out", str(out),
-                            "--head", "fp8", "--workers", "2"], capture_output=True, text=True)
+                            "--workers", "2"], capture_output=True, text=True)
         if r.returncode:
             raise RuntimeError(r.stdout + r.stderr)
         cls.p = Pack(out, t)
@@ -664,7 +665,9 @@ class Qwen35RefusalTest(unittest.TestCase):
             return Q.Plan(C.Checkpoint(d))
 
     def test_the_fixture_plans(self):
-        self.assertIn("blk.1.attn_q.weight", self.plan().tensors)
+        t = self.plan().tensors
+        self.assertIn("blk.1.attn_q.weight", t)
+        self.assertEqual(t["output.weight"].form, "FP4")   # an NVFP4 head is kept whatever the --head default
 
     def test_unknown_tensor(self):
         with self.assertRaisesRegex(S.ConvertError, "no GGUF counterpart.*linear_attn.new_thing"):
