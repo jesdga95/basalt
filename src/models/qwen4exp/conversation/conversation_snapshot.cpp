@@ -240,6 +240,24 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     return settle_resident(st, g, upto, error);
 }
 
+bool conversation_kv_regions(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                             std::vector<std::pair<void*, size_t>>& out, bool check, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || (check && (!valid(st, l, upto, error) || !backed(st, l, error))))
+        return false;
+    const auto p = pools(st);
+    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (check && sizes[i] && !p[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+        out.emplace_back(p[i], sizes[i]);
+    }
+    return true;
+}
+
+bool conversation_kv_settle(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    return settle_resident(st, g, upto, error);
+}
+
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto, bool index,
                           std::string& error) {
     Layout a{}, b{};

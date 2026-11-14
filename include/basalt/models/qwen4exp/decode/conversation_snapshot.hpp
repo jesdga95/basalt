@@ -29,6 +29,12 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state,
 // restore of it into `to` leave there.
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto,
                           bool include_index, std::string& error);
+// The pools a K/V image of cells [0, upto) is copied from, as (pointer, bytes) in image order.  `check` false: the
+// sizes only, without the buffer and backing checks a copy needs.
+bool conversation_kv_regions(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                             std::vector<std::pair<void*, size_t>>& out, bool check, std::string& error);
+// After the pools were written in place: the resident copies refill from them.
+bool conversation_kv_settle(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
@@ -128,5 +134,36 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
+
+/// A parked conversation kept in VRAM (--kv-pool): its running state and the K/V of its cells, every owned layer's
+/// and the draft layer's, copied device to device into one allocation.  Its checkpoints stay in RAM.  Restored only
+/// into a session with the layout it was saved from.
+struct DeviceConversation {
+    ConversationCheckpoint live;   ///< ids and images; the running state is in `mem`
+    std::vector<ConversationCheckpoint> checkpoints;
+    bool cvec = true;
+    bool from_slot = false;   ///< always false: the cache's slot entries are RAM images
+    void* mem = nullptr;
+    std::vector<size_t> sizes;   ///< the regions in `mem`, in save order
+    size_t mem_bytes = 0;
+    int64_t layer_lo = 0, layer_hi = 0;
+    /// the VRAM it holds (the pool's budget counts VRAM only)
+    size_t bytes() const { return mem_bytes; }
+    DeviceConversation() = default;
+    DeviceConversation(DeviceConversation&& o) noexcept { *this = std::move(o); }
+    DeviceConversation& operator=(DeviceConversation&& o) noexcept;
+    DeviceConversation(const DeviceConversation&) = delete;
+    DeviceConversation& operator=(const DeviceConversation&) = delete;
+    ~DeviceConversation();
+};
+/// The VRAM a DeviceConversation of `tokens` cells takes.  0 on an invalid session.
+size_t conversation_device_bytes(const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                 int64_t tokens);
+/// Allocates `image` and copies the session's state for the view's tokens into it (the view's checkpoints are
+/// checked, not copied: the caller moves them in).  The session is not changed.
+bool conversation_device_save(DeviceConversation& image, const ConversationView& view, const SessionState& session,
+                              const ModelGeometry& g, const QsaState* draft, std::string& error);
+ConversationRestore conversation_device_restore(const DeviceConversation& image, SessionState& session,
+                                                const ModelGeometry& g, const QsaState* draft, std::string& error);
 
 } // namespace basalt::core
