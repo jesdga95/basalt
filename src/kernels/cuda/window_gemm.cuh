@@ -228,17 +228,32 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
 #pragma unroll
             for (int t = 0; t < NT; ++t) acc[mt][t][0] = acc[mt][t][1] = acc[mt][t][2] = acc[mt][t][3] = 0.0f;
 
-        for (int i = 0; i < n; ++i, ++q) {
-            issue_next();
-            uint4 xa[KB][NT], xb[KB][NT];
+        // the activations of chunk i + 1 load while chunk i computes (not at NT 4: no registers to spare)
+        constexpr bool kAhead = NT <= 2;
+        uint4 na[KB][NT], nb[KB][NT];
+        auto load_x = [&](int i) {
 #pragma unroll
             for (int b = 0; b < KB; ++b)
 #pragma unroll
                 for (int t = 0; t < NT; ++t) {
                     const uint16_t* xp = xcol[t] + k0 + i * CH + b * 64;
-                    xa[b][t] = live[t] ? ld_nc16(xp) : make_uint4(0, 0, 0, 0);
-                    xb[b][t] = live[t] ? ld_nc16(xp + 8) : make_uint4(0, 0, 0, 0);
+                    na[b][t] = live[t] ? ld_nc16(xp) : make_uint4(0, 0, 0, 0);
+                    nb[b][t] = live[t] ? ld_nc16(xp + 8) : make_uint4(0, 0, 0, 0);
                 }
+        };
+        if constexpr (kAhead) load_x(0);
+        for (int i = 0; i < n; ++i, ++q) {
+            issue_next();
+            if constexpr (!kAhead) load_x(i);
+            uint4 xa[KB][NT], xb[KB][NT];
+#pragma unroll
+            for (int b = 0; b < KB; ++b)
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    xa[b][t] = na[b][t];
+                    xb[b][t] = nb[b][t];
+                }
+            if (kAhead && i + 1 < n) load_x(i + 1);
             cp_wait<ST - 1>();
             __syncthreads();
             const uint8_t* sm = smem + (q % ST) * C::kStage + wm * C::MB;
