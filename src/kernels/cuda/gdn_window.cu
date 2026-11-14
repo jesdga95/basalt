@@ -89,33 +89,35 @@ struct RecSmem {
     uint4 wab[2][32 * NJ];         // the head's alpha and beta rows
 };
 
-// alpha (is_beta false) or beta of `head` for token t: gdn_ab_multi_unrolled_kernel's sum, one warp.  The row's
-// weights are in shared memory; the token's 80 activations per lane are loaded at once.
+// alpha and beta of `head` for token t: gdn_ab_multi_unrolled_kernel's two sums, one warp, side by side over one read
+// of the token's activations (80 per lane).  The rows' weights are in shared memory.
 template<int NJ>
-__device__ __forceinline__ float ab_one(const DecRecArgs& a, const uint4* __restrict__ w_sm, bool is_beta, int t, int lane,
-                                        float dt, float sa) {
+__device__ __forceinline__ void ab_pair(const DecRecArgs& a, const uint4 (&w_sm)[2][32 * NJ], int t, int lane, float dt,
+                                        float sa, float& alpha, float& beta) {
     const float4* xt = reinterpret_cast<const float4*>(a.x + (size_t) t * a.n_embd);
-    float4 xa[NJ], xb[NJ];
+    float u = 0.0f, v = 0.0f;
 #pragma unroll
     for (int q = 0; q < NJ; ++q) {
         const int j = lane + 32 * q;
-        xa[q] = xt[2 * j];
-        xb[q] = xt[2 * j + 1];
+        const float4 xa = xt[2 * j], xb = xt[2 * j + 1];
+        const uint4 w = w_sm[0][j], z = w_sm[1][j];
+        u = fmaf(__uint_as_float(w.x << 16), xa.x, u); u = fmaf(__uint_as_float(w.x & 0xffff0000u), xa.y, u);
+        u = fmaf(__uint_as_float(w.y << 16), xa.z, u); u = fmaf(__uint_as_float(w.y & 0xffff0000u), xa.w, u);
+        u = fmaf(__uint_as_float(w.z << 16), xb.x, u); u = fmaf(__uint_as_float(w.z & 0xffff0000u), xb.y, u);
+        u = fmaf(__uint_as_float(w.w << 16), xb.z, u); u = fmaf(__uint_as_float(w.w & 0xffff0000u), xb.w, u);
+        v = fmaf(__uint_as_float(z.x << 16), xa.x, v); v = fmaf(__uint_as_float(z.x & 0xffff0000u), xa.y, v);
+        v = fmaf(__uint_as_float(z.y << 16), xa.z, v); v = fmaf(__uint_as_float(z.y & 0xffff0000u), xa.w, v);
+        v = fmaf(__uint_as_float(z.z << 16), xb.x, v); v = fmaf(__uint_as_float(z.z & 0xffff0000u), xb.y, v);
+        v = fmaf(__uint_as_float(z.w << 16), xb.z, v); v = fmaf(__uint_as_float(z.w & 0xffff0000u), xb.w, v);
     }
-    float v = 0.0f;
-#pragma unroll
-    for (int q = 0; q < NJ; ++q) {
-        const uint4 w = w_sm[lane + 32 * q];
-        v = fmaf(__uint_as_float(w.x << 16), xa[q].x, v); v = fmaf(__uint_as_float(w.x & 0xffff0000u), xa[q].y, v);
-        v = fmaf(__uint_as_float(w.y << 16), xa[q].z, v); v = fmaf(__uint_as_float(w.y & 0xffff0000u), xa[q].w, v);
-        v = fmaf(__uint_as_float(w.z << 16), xb[q].x, v); v = fmaf(__uint_as_float(w.z & 0xffff0000u), xb[q].y, v);
-        v = fmaf(__uint_as_float(w.w << 16), xb[q].z, v); v = fmaf(__uint_as_float(w.w & 0xffff0000u), xb[q].w, v);
+    for (int o = 16; o > 0; o >>= 1) {
+        u += __shfl_xor_sync(0xffffffffu, u, o);
+        v += __shfl_xor_sync(0xffffffffu, v, o);
     }
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    if (is_beta) return 1.0f / (1.0f + __expf(-v));
-    const float u = v + dt;
-    const float sp = u > 20.0f ? u : log1pf(__expf(u));
-    return sp * sa;
+    beta = 1.0f / (1.0f + __expf(-v));
+    const float g = u + dt;
+    const float sp = g > 20.0f ? g : log1pf(__expf(g));
+    alpha = sp * sa;
 }
 
 // The launch's value head `head` under the head map (gdn_window.hpp): gh the layer's value head, qh its key head, lq
@@ -208,19 +210,31 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     const float dt = a.dt[gh], sa = a.ssm_a[gh], gam = a.gamma[col];
     stamp(a, 1);
     if (a.early_trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the out projection may stage its weights
-    // this block has started: the barrier the ranks wait on before writing into each other's shared memory
-    if (!SPLIT) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
     // predecessor passed its own wait on the hc read), so they are computed while the projections still run
     asm volatile("cp.async.wait_all;" ::: "memory");
     rec_sync<SUB>();
-    for (int job = rg; job < 2 * T; job += RG) {   // (gate, token) jobs over the four warps
-        const int t = job >> 1;
-        const bool is_beta = job & 1;
-        const float v = ab_one<NJ>(a, sm.wab[is_beta], is_beta, t, lane, dt, sa);
-        if (lane == 0) (is_beta ? sm.b : sm.g)[t] = v;
+    if constexpr (SPLIT) {   // a token per warp
+        for (int t = rg; t < T; t += RG) {
+            float al, be;
+            ab_pair<NJ>(a, sm.wab, t, lane, dt, sa, al, be);
+            if (lane == 0) { sm.g[t] = al; sm.b[t] = be; }
+        }
+    } else {   // a token per warp of the cluster, written into every rank's shared memory once all four have started
+        asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+        for (int t = rank * RG + rg; t < T; t += 4 * RG) {
+            float al, be;
+            ab_pair<NJ>(a, sm.wab, t, lane, dt, sa, al, be);
+            if (lane < 4) {
+                *cluster->map_shared_rank(&sm.g[t], lane) = al;
+                *cluster->map_shared_rank(&sm.b[t], lane) = be;
+            }
+        }
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");   // waited on before the gates are read
     }
     pdl_wait();
+    if constexpr (!SPLIT) asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     stamp(a, 2);
 
     // ---- every load of the previous kernels' outputs, issued together
@@ -341,9 +355,8 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         }
     }
     if (SPLIT) return;
-    // every rank's sums of squares, pushed into every rank's shared memory (once every rank has started) before one
-    // cluster barrier
-    asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+    // every rank's sums of squares, pushed into every rank's shared memory (every rank has started: the gates' barrier)
+    // before one cluster barrier
     if (rg == 0) {
 #pragma unroll
         for (int t0 = 0; t0 < MAXT; t0 += 8) {   // eight tokens a pass: lane 4 i + r sends token t0 + i to rank r
