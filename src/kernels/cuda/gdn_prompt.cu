@@ -89,7 +89,7 @@ __device__ __forceinline__ void cp16(void* dst, const void* src, int bytes) {
 __device__ __forceinline__ void cp8(void* dst, const void* src, int bytes) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(smem_addr(dst)), "l"(src), "r"(bytes));
 }
-// FP32 or BF16 activations (the prompt chunk's are BF16, Flash-Next's FP32)
+// FP32 or BF16 activations (a dense prompt chunk passes BF16 rows, a caller on the FP32 path FP32)
 __device__ __forceinline__ float ld1(const float* p) { return *p; }
 __device__ __forceinline__ float ld1(const __nv_bfloat16* p) { return __bfloat162float(*p); }
 __device__ __forceinline__ void st1(float* p, float v) { *p = v; }
