@@ -571,7 +571,9 @@ void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, i
     const int H = g.n_embd, AQ = g.n_head * g.head_dim, KV = g.n_kv * g.head_dim;
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.q.type, H, rows, g.eps, s);
     prod_group(m, b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, rows, s);
+    // each segment's queries and cache cells, then every segment's attention in one launch
     int row = 0;
+    kernels::GqaSeg as[kBatch];
     for (int k = 0; k < S; ++k) {
         SessionState& st = *segs[k].st;
         const int T = segs[k].T;
@@ -580,13 +582,17 @@ void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, i
                                  L.k_norm, g.eps, g.rope, b.pos + (size_t) row * 3, T, g.n_head, g.n_kv,
                                  b.qo + (size_t) row * AQ, st.kc[(size_t) ai], st.vc[(size_t) ai], segs[k].pos, s, 256, true, 0, p0,
                                  st.kq[(size_t) ai]);
-        const bool gated = on_wg(L.o.type);
-        kernels::gqa_decode_attn(b.qo + (size_t) row * AQ, st.kc[(size_t) ai], st.vc[(size_t) ai], g.n_head, g.n_kv, segs[k].pos, T,
-                                 b.attn, m.o.max_context, gated ? nullptr : b.ao + (size_t) row * AQ, s, p0, st.kq[(size_t) ai],
-                                 gated ? b.qfull + (size_t) row * 2 * AQ : nullptr,
-                                 gated ? (uint16_t*) b.xq + (size_t) row * AQ : nullptr);
+        as[k].T = T;
+        as[k].k_cache = st.kc[(size_t) ai];
+        as[k].v_cache = st.vc[(size_t) ai];
+        as[k].pos0 = segs[k].pos;
+        as[k].pos_dev = p0;
+        as[k].q8 = st.kq[(size_t) ai];
         row += T;
     }
+    const bool gated = on_wg(L.o.type);
+    kernels::gqa_decode_attn_segs(b.qo, g.n_head, g.n_kv, as, S, b.attn, m.o.max_context, gated ? nullptr : b.ao, s,
+                                  gated ? b.qfull : nullptr, gated ? (uint16_t*) b.xq : nullptr);
     win_attn_out(m, L, rows, s);
 }
 

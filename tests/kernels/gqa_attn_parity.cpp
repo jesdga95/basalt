@@ -202,6 +202,26 @@ int main(int argc, char** argv) {
         std::printf("gqa_decode_attn: device first cell at %lld of %lld cells bitwise the host launch: %s\n", (long long) at,
                     (long long) cap2, same ? "yes" : "NO");
         if (!same) ++fails;
+        {   // two sequences' windows in one launch (a batch window's segments), each bitwise its own launch
+            const int TA = 5, TB = 7;
+            std::vector<float> solo((size_t) (TA + TB) * NH * HD), seg(solo.size());
+            basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, 3000, TA, d_s2, cap2, d_out, nullptr);
+            ck(cudaMemcpy(solo.data(), d_out, (size_t) TA * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
+            basalt::kernels::gqa_decode_attn(d_q + (size_t) TA * NH * HD, d_k2, d_v2, NH, NKV, at - TB, TB, d_s2, cap2, d_out, nullptr);
+            ck(cudaMemcpy(solo.data() + (size_t) TA * NH * HD, d_out, (size_t) TB * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
+            const int32_t atb[2] = {(int32_t) (at - TB), 0};
+            ck(cudaMemcpy(d_at, atb, sizeof atb, cudaMemcpyHostToDevice), "copy");
+            basalt::kernels::GqaSeg sg[2];
+            sg[0].T = TA; sg[0].k_cache = d_k2; sg[0].v_cache = d_v2; sg[0].pos0 = 3000;
+            sg[1].T = TB; sg[1].k_cache = d_k2; sg[1].v_cache = d_v2; sg[1].pos0 = at - TB; sg[1].pos_dev = d_at;
+            basalt::kernels::gqa_decode_attn_segs(d_q, NH, NKV, sg, 2, d_s2, cap2, d_out, nullptr);
+            ck(cudaMemcpy(seg.data(), d_out, seg.size() * 4, cudaMemcpyDeviceToHost), "copy");
+            const bool same_seg = std::memcmp(solo.data(), seg.data(), seg.size() * 4) == 0;
+            std::printf("gqa_decode_attn_segs: windows of %d and %d rows in one launch bitwise their own launches: %s\n", TA, TB,
+                        same_seg ? "yes" : "NO");
+            if (!same_seg) ++fails;
+            ck(cudaMemcpy(d_at, at2, sizeof at2, cudaMemcpyHostToDevice), "copy");
+        }
         // its cost at a short context in a large capacity, against the host launch's grid of the chunks in use
         const int32_t near[2] = {2999, 0};
         ck(cudaMemcpy(d_at, near, sizeof near, cudaMemcpyHostToDevice), "copy");
