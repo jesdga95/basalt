@@ -15,7 +15,8 @@ DFlash 2 block drafter ([z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab
 - The BF16 token embedding stays in page-locked RAM (2.4 GiB); everything else sits on the main card (18.4 GiB with
   the block drafter, 16.4 GiB without a drafter).
 
-How to build it: [model file](../model-file.md#qwen38-27b-pack).
+Download it from [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) (`hf download jesdga/Qwen3.8-27B-Basalt Qwen3.8-27B-NVFP4.basalt --local-dir models`),
+or build the same file yourself: [model file](../model-file.md#qwen38-27b-pack).
 
 ## Architecture
 
