@@ -19,7 +19,7 @@ PCIE = re.compile(r"[1-9](\.0)? x(1|2|4|8|16|32)")
 PLACEHOLDER = "YOUR_NAME"
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 SYSTEMS = ("Linux", "Windows", "WSL2")
-MODELS = ("Qwen3.8-Flash-Next", "DeepSeek-V4.1-Flash")   # the engine's model names (model_name of each adapter)
+MODELS = ("Qwen3.8-Flash-Next", "Qwen3.8-27B", "DeepSeek-V4.1-Flash")   # the engine's model names (model_name of each adapter)
 KV_FORMATS = ("fp16", "int8", "q4_0", "k8v4", "fp8+fp4")  # the cache formats the engine reports (DeepSeek --kv fp8 is fp8+fp4)
 
 
