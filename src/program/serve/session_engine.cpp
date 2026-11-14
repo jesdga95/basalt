@@ -25,8 +25,9 @@ constexpr int32_t kEmbeddingsMagic = 0x31455653;
 class SessionRuntime;
 struct SlotWin;
 
-/// The drafts to make for the next window: up to one more than the window just verified used (at least 2), so a long
-/// window grows a row at a time where its drafts pay and the drafter's head runs only the rows a window can take.
+/// The drafts to ask for the next window: up to one more than the window just verified used (at least 2), so a chained
+/// drafter's long window grows a row at a time where its drafts pay.  A block drafter makes its whole block in one pass and
+/// offers every draft of it; the drafts read back are as many as the session made.
 int drafts_ahead(int T, int most) { return std::clamp(std::max(T, 2), 1, most - 1); }
 
 /// A picture's (or a video group's) embedding rows, placed at prompt position `at`, and its grid.
@@ -765,7 +766,7 @@ bool SessionRuntime::slot_window_end(int b, SlotWin& w) {
     basalt::protocol::emit_text(w.line + "\n");
     basalt::core::progress_beat();
     if (w.drafting) {
-        const int max_n = std::min(drafts_ahead(T, session().max_window()), (int) std::size(sl.dr));
+        const int max_n = std::min(session().max_window() - 1, (int) std::size(sl.dr));
         if (const basalt::model::Result r = session().draft_end(sl.dr, sl.dprob, max_n, sl.n_dr); !r.ok()) return failed(r.message);
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
         if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);

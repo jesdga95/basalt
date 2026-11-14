@@ -163,13 +163,13 @@ public:
             } join{*this};
             if (Result s = settle(pos, true); !s.ok()) return s;
             std::string err;
-            // a wide block drafts the whole window whatever was asked: its drafts cost about one pass at any count, and
-            // the policy picks the window from their chances
+            // a block's drafts cost about one pass at any count, so it offers all of them whatever was asked (a wide
+            // block the whole window) and the policy picks the window from their chances
             n = wide_ ? max_window() - 1 : std::clamp(n, 1, max_window() - 1);
             const int width = block_width(n);
             if (pos + width > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
             if (!block_draft(m_, st_, anchor, pos, width, err)) return fail(err);
-            n_draft_ = std::min(n, width - 1);
+            n_draft_ = std::min(width - 1, max_window() - 1);
             return {};
         }
         if (!drafter_) return {Status::NotImplemented, m_.o.arch + ": no drafter is loaded"};
@@ -212,9 +212,10 @@ public:
         std::string err;
         // the blocks in passes of at most a batch window's rows, in order
         std::vector<int> nn((size_t) count), width((size_t) count);
+        // a slot's next window shares the batch's rows: no more drafts than its share takes
+        const int share = std::max(1, std::min(max_window(), kBatch / count) - 1);
         for (int i = 0; i < count; ++i) {
-            // a slot's next window shares the batch's rows: no more drafts than its share takes
-            nn[(size_t) i] = std::clamp(n[i], 1, std::max(1, std::min(max_window(), kBatch / count) - 1));
+            nn[(size_t) i] = std::clamp(n[i], 1, share);
             width[(size_t) i] = ss[(size_t) i]->block_width(nn[(size_t) i]);
             if (pos[i] + width[(size_t) i] > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
         }
@@ -228,7 +229,7 @@ public:
         cudaEventRecord(done_, s0);
         for (int i = 1; i < count; ++i) cudaStreamWaitEvent(sts[(size_t) i]->stream, done_, 0);
         for (int i = 0; i < count; ++i) ss[(size_t) i]->join_commit();   // the sessions' commits ran side by side
-        for (int i = 0; i < count; ++i) ss[(size_t) i]->n_draft_ = std::min(nn[(size_t) i], width[(size_t) i] - 1);
+        for (int i = 0; i < count; ++i) ss[(size_t) i]->n_draft_ = std::min(share, width[(size_t) i] - 1);   // all the block's, as solo
         return {};
     }
 
