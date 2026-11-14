@@ -104,10 +104,10 @@ __device__ __forceinline__ void sliced_stage(const Args& a, int tile, uint8_t* s
             unsigned a0[4], a1[4], a2[4], a3[4];
 #pragma unroll
             for (int s = 0; s < 4; ++s) {
-                a0[s] = e4m3x2_f16(u0[s]);
-                a1[s] = e4m3x2_f16(u1[s]);
-                a2[s] = e4m3x2_f16(u0[s] >> 16);
-                a3[s] = e4m3x2_f16(u1[s] >> 16);
+                a0[s] = e4m3x2_bf16x2(u0[s]);
+                a1[s] = e4m3x2_bf16x2(u1[s]);
+                a2[s] = e4m3x2_bf16x2(u0[s] >> 16);
+                a3[s] = e4m3x2_bf16x2(u1[s] >> 16);
             }
 #pragma unroll
             for (int t = 0; t < NT; ++t) {
