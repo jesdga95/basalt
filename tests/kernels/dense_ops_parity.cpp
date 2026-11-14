@@ -239,7 +239,7 @@ int main() {
         int32_t *da = up(std::vector<int32_t>{anchor}), *dids = nullptr;
         cudaMalloc(&dids, P * 4);
         cudaMalloc(&dconf, P * 4);
-        basalt::kernels::candidate_path(dlp, basalt::kernels::kLogprobStride, K, dh, dp, ds, R, da, P, dids, dconf, S);
+        basalt::kernels::candidate_path(dlp, basalt::kernels::kLogprobStride, K, dh, dp, ds, R, da, P, dids, dconf, {}, S);
         auto ids = down(dids, P);
         auto conf = down(dconf, P);
         int32_t prev = anchor;
