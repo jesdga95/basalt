@@ -2040,6 +2040,42 @@
       "draft_len_prose": 1.5,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8",
       "notes": "Q4_K/Q5_1 and Q4_K/Q8_0 expert layers take the engine's 'glue off' fallback, so decode trails the NVFP4 and IQ4_XS packs on this card"
+    },
+    {
+      "submitter": "shining",
+      "date": "2026-11-14",
+      "commit": "8471072850",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+          "vram_gib": 96,
+          "power_w": 300,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 9 7950X, 16 cores",
+      "ram_gbps": 41.5,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 7859.4,
+      "prefill_64k_tps": 10058.0,
+      "decode_tps": 489.2,
+      "decode_conv_tps": 358.6,
+      "decode_struct_tps": 579.6,
+      "decode_prose_tps": 307.8,
+      "accept_conv_pct": 72.1,
+      "accept_struct_pct": 98.6,
+      "accept_prose_pct": 65.2,
+      "draft_len_conv": 2.7,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 2.0,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+      "notes": "Proxmox LXC; 52 GiB container RAM limit (ram_gib is host-visible); quant pack is NVFP4-DQ6_K; 300 W is the Max-Q hardware cap."
     }
   ]
 }
