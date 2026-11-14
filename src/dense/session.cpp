@@ -26,6 +26,7 @@ public:
     ~Session() override {
         for (cudaGraphExec_t& e : st_.wg)
             if (e) cudaGraphExecDestroy(e);
+        if (st_.wg1_alt) cudaGraphExecDestroy(st_.wg1_alt);
         if (st_.stream) cudaStreamDestroy(st_.stream);
         if (st_.side) cudaStreamDestroy(st_.side);
         if (st_.fork) cudaEventDestroy(st_.fork);
@@ -61,7 +62,8 @@ public:
         st_.gdn_floats = (size_t) g.gdn_state * HV * g.gdn_state + C * 3;
         const size_t ng = (size_t) g.gdn_layers();
         if (ng) {
-            st_.gdn = st_.arena.take<float>(ng * st_.gdn_floats);
+            st_.gdn = st_.gdn_first = st_.arena.take<float>(ng * st_.gdn_floats);
+            st_.gdn_alt = st_.arena.take<float>(ng * st_.gdn_floats);
             st_.rec_qkv = st_.arena.take<float>(ng * kWindow * C);
             st_.rec_h = st_.arena.take<float>(ng * kWindow * C);
             st_.rec_gate = st_.arena.take<float>(ng * kWindow * HV);
@@ -592,19 +594,26 @@ private:
             st_.tail_cell = -1;
             st_.dctx_from = 0;
             wide_ = false;
+            st_.alt_ready = false;
             if (g_.gdn_layers() &&
                 cudaMemsetAsync(st_.gdn, 0, (size_t) g_.gdn_layers() * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
                 return fail("clearing the recurrent state failed");
             return {};
         }
-        if (pend_T_ == 0) return {};
+        if (pend_T_ == 0) {
+            st_.alt_ready = false;
+            return {};
+        }
         const int64_t n = pos - pend_pos_;
         pend_T_ = std::max(pend_T_, 0);
         const int T = pend_T_;
         pend_T_ = 0;
         if (n < 0 || n > T) return fail(m_.o.arch + ": position " + std::to_string((long long) pos) + " is not reachable from the last window");
         wide_ = n >= std::max(2, m_.w.dflash.block - 2);
-        if (g_.gdn_layers() && n > 0) {
+        const bool swap = st_.alt_ready && T == 1 && n == 1;
+        st_.alt_ready = false;
+        if (swap) std::swap(st_.gdn, st_.gdn_alt);   // the window left its state after the row: nothing to commit
+        if (g_.gdn_layers() && n > 0 && !swap) {
             cudaEventRecord(st_.fork, st_.stream);
             cudaStreamWaitEvent(st_.side, st_.fork, 0);
             commit_window(m_, st_, (int) n, st_.side);

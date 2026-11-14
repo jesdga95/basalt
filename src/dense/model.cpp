@@ -248,7 +248,7 @@ uint64_t shared_bytes(const Geometry& g, int64_t max_context) { return window_by
 uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8) {
     const uint64_t C = (uint64_t) g.conv_channels();
     const uint64_t gdn = (uint64_t) g.gdn_layers() *
-                         ((uint64_t) g.gdn_state * g.gdn_v_heads * g.gdn_state + C * 3 +
+                         (2 * ((uint64_t) g.gdn_state * g.gdn_v_heads * g.gdn_state + C * 3) +
                           kWindow * (2 * C + 2 * (uint64_t) g.gdn_v_heads)) * 4;
     const uint64_t cell16 = (uint64_t) g.n_kv * g.head_dim * 2 * 2;   // a cell of one layer, K and V, fp16
     const uint64_t cell8 = (uint64_t) g.n_kv * (g.head_dim + g.head_dim / 64 * 2) * 2;

@@ -144,6 +144,12 @@ struct SessionState {
     cudaEvent_t fork = nullptr, join = nullptr;   // the commit's start (after the window) and end
     Arena arena;
     float* gdn = nullptr;                        // per GDN layer: state [S][h_v][S], then conv history [C][3]
+    // the other state buffer: a one-row window writes its state after the row there (alt_ready), and keeping the row
+    // swaps the two instead of committing; the one-row window's graph per buffer (wg1_alt when gdn is gdn_alt's twin)
+    float* gdn_alt = nullptr;
+    float* gdn_first = nullptr;                  // the buffer gdn started as
+    bool alt_ready = false;
+    cudaGraphExec_t wg1_alt = nullptr;
     size_t gdn_floats = 0;                       // per layer
     std::vector<uint16_t*> kc, vc;               // per attention layer: [cell][n_kv][head_dim] fp16 (null with int8)
     std::vector<kernels::KvInt8> kq;             // per attention layer: the int8 cache ({} with fp16)

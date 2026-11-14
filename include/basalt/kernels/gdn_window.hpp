@@ -49,6 +49,9 @@ struct DecRecArgs {
     // nk = 0: every head, the layer's own layout.
     int k0 = 0, nk = 0;
     float* qkv_out = nullptr;
+    // state_out (dec_gdn_rec, nk = 0): the state and conv history after all T rows, laid out as `state` (which is not
+    // written) - the commit of all T rows, bitwise, without its pass
+    float* state_out = nullptr;
     unsigned long long* stamps = nullptr;   // bench: 10 per-phase timestamps per block
     bool early_trigger = true;   // let the next kernel launch once the constants are loaded
     GdnGate gate_act = GdnGate::Sigmoid;

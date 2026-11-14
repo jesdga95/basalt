@@ -318,6 +318,28 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         }
     }
     stamp(a, 6);
+    if (!SPLIT && a.state_out != nullptr) {   // every row kept: the commit's state and conv history, from registers
+        float* ob = a.state_out + ((size_t) (rg * RPG) * a.h_v + gh) * S + col;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) ob[r * row_stride] = s[r];
+        float* oh = a.state_out + (size_t) S * a.h_v * S;
+        const auto last3 = [&](const float (&h)[3], const float (&x)[MAXT], int j) {   // of [h | x_0 .. x_{T-1}]
+            const int src = T + j;
+            float v = src < 3 ? h[src < 3 ? src : 0] : 0.0f;
+#pragma unroll
+            for (int t = 0; t < MAXT; ++t)
+                if (src >= 3 && t == src - 3) v = x[t];
+            return v;
+        };
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            if (rank == 0 && head < hm.nkl) {
+                oh[cq * 3 + j] = last3(hq, xq, j);
+                oh[ck * 3 + j] = last3(hk, xk, j);
+            }
+            if (rg == 1) oh[cv * 3 + j] = last3(hv, xv, j);
+        }
+    }
     if (SPLIT) return;
     // every rank's sums of squares, pushed into every rank's shared memory (once every rank has started) before one
     // cluster barrier
