@@ -63,6 +63,17 @@ before both, with `--kv fp16`.
 | Before the BF16 residual: the prompt MLP on int8 below 1,024 rows (before NVFP4_PLANES) | 6.7850 | 0.0214 | 0.0118 | 0.179 | 92.87% |
 | Earlier pack: projections Q8_0 of the FP8 values, MLP int8 below 1,024 rows | 6.7889 | 0.0213 | 0.0118 | 0.178 | 92.93% |
 
+QUASAR's checkpoint ([model file](../model-file.md#qwen38-27b-pack): every projection NVFP4, quantization-aware trained),
+same gate and build: its GDN and attention projections run as the MLP does (NVFP4 planes, W4A4 in prompt chunks with FP32
+rows between the GDN and attention steps, bf16 rows in decode windows); the GDN a / b projections are BF16 of its NVFP4
+values; the head is its BF16 head rounded to NVFP4 by the converter (squared error 7% under NVIDIA's NVFP4 head of the same
+BF16 tensor).
+
+| Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
+|---|---:|---:|---:|---:|---:|
+| QUASAR, every projection NVFP4, `--kv fp16` | 6.8586 | 0.0314 | 0.0169 | 0.272 | 91.78% |
+| The same, `--kv int8` | 6.8640 | 0.0309 | 0.0169 | 0.271 | 91.82% |
+
 The F8 projections hold NVIDIA's values exactly but read prompt rows in E4M3 (one scale per row) where the Q8_0 pack read
 them in q8_1 (one scale per 32): perplexity 6.7889 -> 6.7850, KLD 0.0213 -> 0.0214, top-1 92.93 -> 92.87%.
 

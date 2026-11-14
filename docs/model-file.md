@@ -91,6 +91,20 @@ python3 tools/convert/convert.py --checkpoint nvidia --drafter dflash2 --out Qwe
   layer's rows as the layer ends. About 20 GiB, 22 GiB with the drafter; two minutes on 8 converter processes. The engine
   refuses a 27B pack whose MLP and head are NVFP4 in ggml blocks (type 40, before NVFP4_PLANES) and asks for a re-conversion.
 
+QUASAR's checkpoint ([QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4), every
+projection NVFP4 in compressed-tensors' form) converts with the same command:
+
+```sh
+hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 --local-dir quasar
+python3 tools/convert/convert.py --checkpoint quasar --drafter dflash2 --out Qwen3.8-27B-QUASAR-NVFP4.basalt --name "Qwen3.8-27B QUASAR NVFP4"
+```
+
+- GDN, attention and MLP projections move bit for bit as `NVFP4_PLANES`, `1 / weight_global_scale` in FP32 as `<name>.scale`.
+- The GDN a and b projections (NVFP4 in the checkpoint, 48 rows) become BF16 of their values, rounded once to nearest.
+- The BF16 output head is rounded to `NVFP4_PLANES`: tensor scale amax / (6 x 448), per 16 values the UE4M3 scale with the least
+  squared error among half to four times amax / 6. The token embedding, MTP layer and vision tower are as for NVIDIA's.
+- About 19 GiB with the drafter.
+
 ### `NVFP4_PLANES` (tensor type 45)
 
 An NVFP4 matrix of `rows` x `K` (rows a multiple of 128, K of 64) as two planes in one tensor, 36 bytes per 64 values like
