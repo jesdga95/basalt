@@ -113,6 +113,7 @@ struct Options {
     bool draft = false;                 ///< run the pack's drafter
     Drafter drafter = Drafter::None;    ///< which one
     uint64_t host_embedding_bytes = 0;  ///< the token embedding the adapter keeps in page-locked RAM (a row lookup per token)
+    uint64_t gpu_weight_bytes = 0;      ///< the weights the adapter put on the main card (its "GiB on the GPU" load figure, no KV cache)
     bool vision = false;                ///< requests may carry images
     bool kv_int8 = false;               ///< the attention layers' K/V as int8 codes with a scale per 64 values
     core::FileRange mmproj;             ///< the vision projector (vision/mmproj)

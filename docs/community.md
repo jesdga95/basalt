@@ -10,7 +10,7 @@
 
 The row records `model` (`Qwen3.8-Flash-Next`, `Qwen3.8-27B` or `DeepSeek-V4.1-Flash`, the name the model's adapter reports for the pack's architecture, not its file name) and `kv`, the KV cache format the run used: the preset passes `--kv int8` to Flash-Next and the 27B and `--kv fp8` to DeepSeek, and a model that takes neither runs its own format. Rows of different models are not comparable.
 
-You need enough free RAM that no expert is read from the SSD; the bench checks this and refuses to print a row otherwise. The 27B has no experts: the bench instead refuses a row if any of its weights sit in host RAM; its token embedding, which the engine keeps in page-locked RAM by design, does not count.
+You need enough free RAM that no expert is read from the SSD; the bench checks this and refuses to print a row otherwise. The 27B has no experts: the bench instead refuses a row if any of its weights sit in host RAM; its token embedding, which the engine keeps in page-locked RAM by design, and the `--vision dynamic` encoder, which waits in RAM and loads per request, do not count.
 
 Optional fields, recorded by `--community` before the engine starts (`basalt-bench --hardware` prints them alone):
 
