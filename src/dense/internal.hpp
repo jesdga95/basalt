@@ -47,8 +47,8 @@ private:
 /// A batch window's device table: per window row its GDN segment, where its GDN rows go in its session, per segment its
 /// first cell.
 struct BatchTable {
-    kernels::SegRow seg[kBatch];
-    kernels::GdnRowDst dst[kBatch];
+    kernels::SegRow first[kBatch];   // per segment its first row's entry, and where its GDN rows go
+    kernels::SegDst sdst[kBatch];
     int32_t pos0[kBatch];
 };
 
@@ -72,7 +72,7 @@ struct WindowScratch {
     int32_t *iota = nullptr, *bounds = nullptr;  // the products' row map and the window's rows
     int32_t* pos0 = nullptr;                     // the window's first cell (device), read by its attention
     // a batch window's: the packed GDN rows of the layer in hand (before they go to each session), its table
-    float *rq = nullptr, *rh = nullptr, *rgate = nullptr, *rbeta = nullptr;
+    float* rq = nullptr;
     BatchTable* btab = nullptr;
     // the block drafter's: its rows' q, k, v, attention and convolution coefficients, the selector's projection
     float *bq = nullptr, *bk = nullptr, *bv = nullptr, *bqo = nullptr, *bao = nullptr, *dyn = nullptr, *bh = nullptr;

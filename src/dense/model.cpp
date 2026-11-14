@@ -519,9 +519,6 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     b.pos0 = a.take<int32_t>(2);
     if (g.gdn_layers() > 0) {
         b.rq = a.take<float>(W * (size_t) g.conv_channels());
-        b.rh = a.take<float>(W * (size_t) g.conv_channels());
-        b.rgate = a.take<float>(W * (size_t) g.gdn_v_heads);
-        b.rbeta = a.take<float>(W * (size_t) g.gdn_v_heads);
     }
     b.btab = a.take<BatchTable>(1);
     if (!b.bounds) {
