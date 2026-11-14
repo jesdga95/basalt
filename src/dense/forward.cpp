@@ -287,6 +287,7 @@ void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStre
     a.gate = st.rec_gate + (size_t) gi * kWindow * g.gdn_v_heads;
     a.beta = st.rec_beta + (size_t) gi * kWindow * g.gdn_v_heads;
     if (on_wg(L.out.type)) a.y16 = (uint16_t*) b.xq;   // the out product's rows
+    if (T == 1 && st.gdn_alt) a.state_out = st.gdn_alt + (size_t) gi * st.gdn_floats;   // the state after the row
     kernels::dec_gdn_rec(a, T, s);
     prod_add(m, L.out, on_wg(L.out.type) ? b.xq : wact(m, b.y, L.out.type, g.value_width(), T, s), b.x, T, s);
 }
@@ -536,8 +537,11 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
     cudaMemcpyAsync(b.pos0, first, sizeof first, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.tok, tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.pos, pos3, (size_t) T * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-    if (st.wg[T]) {
-        if (cudaGraphLaunch(st.wg[T], s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
+    // a one-row window writes the other state buffer (st.alt_ready); its graph is the one of the buffer in use
+    st.alt_ready = T == 1 && st.gdn_alt != nullptr;
+    cudaGraphExec_t& wg = T == 1 && st.gdn != st.gdn_first ? st.wg1_alt : st.wg[T];
+    if (wg) {
+        if (cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
         return cuda_ok("dense window", err);
     }
     window_body(m, st, T, pos);   // the first window of T rows runs as launched, then is captured for the next ones
@@ -545,9 +549,9 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
     cudaGraph_t graph = nullptr;
     if (cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed) != cudaSuccess) return cuda_ok("dense window capture", err);
     window_body(m, st, T, pos);
-    if (cudaStreamEndCapture(s, &graph) != cudaSuccess || cudaGraphInstantiate(&st.wg[T], graph, 0) != cudaSuccess) {
+    if (cudaStreamEndCapture(s, &graph) != cudaSuccess || cudaGraphInstantiate(&wg, graph, 0) != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
-        st.wg[T] = nullptr;
+        wg = nullptr;
         return cuda_ok("dense window capture", err);
     }
     cudaGraphDestroy(graph);
@@ -662,6 +666,7 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
         SessionState& st = *segs[k].st;
         const int T = segs[k].T;
         key.emplace_back(&st, T);
+        st.alt_ready = false;   // the batch recurrence leaves its state to the commit
         tab.pos0[k] = (int32_t) segs[k].pos;
         for (int j = 0; j < T; ++j) {
             tab.seg[rows + j] = {st.gdn, rows, j, T, T, k, (int32_t) (segs[k].pos + j)};
