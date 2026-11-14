@@ -199,7 +199,7 @@ void parity(const Shape& sh) {
         for (size_t i = (size_t) T * sh.rows; i < yt.size(); ++i) diff += !std::isnan(yt[i]);   // rows past T untouched
         cudaFree(d_x2);
     }
-    std::printf("%-24s rows bitwise at T = 1..16: %s\n", sh.name, diff ? "DIFFER  FAIL" : "yes");
+    std::printf("%-24s rows bitwise at T = 1..32: %s\n", sh.name, diff ? "DIFFER  FAIL" : "yes");
     if (diff) ++fails;
     const std::vector<float> base((size_t) R * sh.rows, 0.5f);
     cudaMemcpy(d_y2, base.data(), base.size() * 4, cudaMemcpyHostToDevice);
@@ -286,7 +286,7 @@ void parity_swiglu(int64_t rows, int64_t K) {
     std::printf("%-24s SwiGLU vs double: %.3g%s\n", "FP4 gate+up", worst, ok ? "" : "  FAIL");
     if (!ok) ++fails;
     int diff = 0;
-    for (int T : {1, 3, 8, 9, 16}) {
+    for (int T : {1, 3, 8, 9, 16, 17, 32}) {
         cudaMemset(d_h, 0xFF, (size_t) R * rows * 4);
         wg::gemm(c, act, T, ws, nullptr);
         const auto ht = down(d_h, (size_t) R * rows);
@@ -343,7 +343,7 @@ void parity_q8(int64_t rows, int64_t K) {
             worst = std::max(worst, std::fabs(y[(size_t) t * rows + r] - sum) / std::max(sa, 1e-30));
         }
     int diff = 0;
-    for (int T : {1, 5, 8, 9, 16}) {
+    for (int T : {1, 5, 8, 9, 16, 17, 32}) {
         cudaMemset(d_y2, 0, (size_t) R * rows * 4);
         c.m[0].y = d_y2;
         wg::gemm(c, act, T, ws, nullptr);
@@ -471,7 +471,7 @@ void bench_call(const char* name, wg::Format fmt, int64_t rows, int64_t K, bool 
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
-    for (int T : {1, 8, 16}) {
+    for (int T : {1, 8, 16, 32}) {
         int it = 0;
         for (int i = 0; i < copies; ++i) {
             set(it++ % copies);

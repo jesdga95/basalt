@@ -230,7 +230,7 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
     const int64_t pr = part_rows(c);
     if (p.ks > 1 && ((size_t) p.ks * kRows * pr > ws.partial_floats || (size_t) p.tiles > ws.tickets_n))
         refuse("workspace too small", c);
-    const Kernel& k = kernel_for(c, T > 8 ? 2 : 1);
+    const Kernel& k = kernel_for(c, T > 16 ? 4 : T > 8 ? 2 : 1);   // 8-column tiles; a row's sums are the same in any
     resident(k);   // its smem allowance
     Args a{};
     int t0 = 0;
