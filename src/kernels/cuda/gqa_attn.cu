@@ -300,8 +300,6 @@ __device__ __forceinline__ void mma16832_u8s8(int (&c)[4], unsigned a0, unsigned
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-// exact for |v| < 2^22: the integer lands in the mantissa of 1.5 * 2^23
-__device__ __forceinline__ float small_int_to_float(int v) { return __int_as_float(v + 0x4B400000) - 12582912.0f; }
 __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
     const __half2 h = __floats2half2_rn(lo, hi);
     return *reinterpret_cast<const unsigned*>(&h);
@@ -759,14 +757,14 @@ __global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const IO* __restri
                 }
                 float (&e)[4] = acc[db][0];
                 float (&o)[4] = acc[db][1];
-                e[0] = fmaf(e[0], al0, step0 * small_int_to_float(ev[0]));
-                e[1] = fmaf(e[1], al0, step0 * small_int_to_float(ev[1]));
-                e[2] = fmaf(e[2], al1, step1 * small_int_to_float(ev[2]));
-                e[3] = fmaf(e[3], al1, step1 * small_int_to_float(ev[3]));
-                o[0] = fmaf(o[0], al0, step0 * small_int_to_float(od[0]));
-                o[1] = fmaf(o[1], al0, step0 * small_int_to_float(od[1]));
-                o[2] = fmaf(o[2], al1, step1 * small_int_to_float(od[2]));
-                o[3] = fmaf(o[3], al1, step1 * small_int_to_float(od[3]));
+                e[0] = fmaf(e[0], al0, step0 * (float) ev[0]);
+                e[1] = fmaf(e[1], al0, step0 * (float) ev[1]);
+                e[2] = fmaf(e[2], al1, step1 * (float) ev[2]);
+                e[3] = fmaf(e[3], al1, step1 * (float) ev[3]);
+                o[0] = fmaf(o[0], al0, step0 * (float) od[0]);
+                o[1] = fmaf(o[1], al0, step0 * (float) od[1]);
+                o[2] = fmaf(o[2], al1, step1 * (float) od[2]);
+                o[3] = fmaf(o[3], al1, step1 * (float) od[3]);
             }
         }
     }

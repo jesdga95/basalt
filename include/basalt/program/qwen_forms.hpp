@@ -33,7 +33,7 @@ inline grammar::ToolForm qwen_tool_form() {
 
 /// The end-of-turn, turn, image-pad and video-pad tokens.
 inline model::TokenNames qwen_token_names() {
-    return {{"<|endoftext|>", "<|im_end|>"}, "<|im_start|>", "<|image_pad|>", "<|video_pad|>"};
+    return {{"<|endoftext|>", "<|im_end|>"}, "<|im_start|>", "<|image_pad|>", "<|video_pad|>", "assistant"};
 }
 
 }  // namespace basalt::program

@@ -252,6 +252,8 @@ struct TokenNames {
     std::string turn;
     std::string image_pad;
     std::string video_pad;
+    /// The role word after `turn` that opens the model's own reply (empty: the turn token opens no reply).
+    std::string reply_role;
 };
 
 class FlagArgs;
