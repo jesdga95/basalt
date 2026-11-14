@@ -601,15 +601,31 @@ void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int S, in
     WindowScratch& b = m.ws;
     const int H = g.n_embd, C = g.conv_channels();
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.qkv.type, H, rows, g.eps, s);
-    prod_group(m, b.xn, xq, L.qkv.type, {{&L.qkv, b.rq}, {&L.z, b.z}}, rows, s);
     kernels::DecRecArgs a = gdn_args(m, L);
     a.qkv = b.rq;
+    // the gates once per row and head (they read b.xn only), beside the qkv/z product
+    cudaEventRecord(m.gate_fork, s);
+    cudaStreamWaitEvent(m.gate_side, m.gate_fork, 0);
+    {
+        kernels::PdlScope p(true, true);
+        kernels::dec_gdn_gates(a, rows, b.gab, m.gate_side);
+    }
+    cudaEventRecord(m.gate_join, m.gate_side);
+    prod_group(m, b.xn, xq, L.qkv.type, {{&L.qkv, b.rq}, {&L.z, b.z}}, rows, s);
+    cudaStreamWaitEvent(s, m.gate_join, 0);
     // the raw output in b.y, normed there in place when the out product reads fp32 rows
     a.o = b.y;
     if (on_wg(L.out.type)) { a.y16 = (uint16_t*) b.xq; a.y = nullptr; }
     // a block row a segment, its GDN rows straight into its session's store (the commit's)
-    kernels::dec_gdn_rec_seg_split(a, b.btab->first, (size_t) gi * segs[0].st->gdn_floats, S, max_n, rows, s, b.btab->sdst,
-                                   (size_t) gi * kWindow * C, (size_t) gi * kWindow * g.gdn_v_heads);
+    // in a graph the recurrence still starts early behind the product (its edge from the gates is programmatic too,
+    // and it reads them after its wait); launched directly it follows the join the plain way
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(s, &cap);
+    {
+        kernels::PdlScope p(true, cap != cudaStreamCaptureStatusActive);
+        kernels::dec_gdn_rec_seg_split(a, b.btab->first, (size_t) gi * segs[0].st->gdn_floats, S, max_n, rows, s,
+                                       b.btab->sdst, (size_t) gi * kWindow * C, (size_t) gi * kWindow * g.gdn_v_heads, b.gab);
+    }
     prod_add(m, L.out, on_wg(L.out.type) ? b.xq : wact(m, b.y, L.out.type, g.value_width(), rows, s), b.x, rows, s);
 }
 

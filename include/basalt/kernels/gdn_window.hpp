@@ -89,10 +89,13 @@ struct SegDst {
 void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, void* stream,
                      const SegDst* dst = nullptr, size_t off_c = 0, size_t off_hv = 0);
 /// dec_gdn_rec_seg in two launches, the same bits: dec_gdn_rec_split's kernel per segment (no clusters, so two segments
-/// run in one wave), then dec_gdn_rec_norm over the window's n_tok rows.  a.o: the raw output, laid out as y (it may be
-/// a.y: each value is read and then written by one thread).
+/// run in one wave) on the gates dec_gdn_gates wrote for the window's n_tok rows (`gates`), then dec_gdn_rec_norm over
+/// those rows.  a.o: the raw output, laid out as y (it may be a.y: each value is read and then written by one thread).
 void dec_gdn_rec_seg_split(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, int n_tok,
-                           void* stream, const SegDst* dst = nullptr, size_t off_c = 0, size_t off_hv = 0);
+                           void* stream, const SegDst* dst, size_t off_c, size_t off_hv, const float* gates);
+/// The gates of rows [0, n_tok) and every value head (a.nk = 0): alpha [n_tok][h_v] at `gates`, then beta, the values
+/// the recurrence kernels compute.  Reads a.x, a.w_alpha, a.w_beta, a.dt, a.ssm_a only.
+void dec_gdn_gates(const DecRecArgs& a, int n_tok, float* gates, void* stream);
 /// dec_gdn_rec in two launches: the split kernel (conv, gates, recurrence; never reads z) writes the raw output to
 /// a.o, dec_gdn_rec_norm applies the gated RMS norm and writes a.yq (and a.y); the same bits as dec_gdn_rec.  The z
 /// projection can run beside the split kernel.
