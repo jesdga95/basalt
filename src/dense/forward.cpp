@@ -318,6 +318,11 @@ bool all_f8(std::initializer_list<const Linear*> ls) {
         if (l->type != kTypeF8) return false;
     return true;
 }
+bool all_nvfp4(std::initializer_list<const Linear*> ls) {
+    for (const Linear* l : ls)
+        if (l->type != kTypeNvfp4Planes) return false;
+    return true;
+}
 prefill::fp8::Segment f8_seg(const Linear& l, void* dst) { return {(const uint8_t*) l.w, l.rows, l.scale, dst, l.rows}; }
 
 // The prompt chunk's residual stream: BF16 rows in ChunkScratch::x's buffer; its activations between the F8 / NVFP4
@@ -378,18 +383,20 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         chunk_residual_f8(m, L.o, T, s);
         return;
     }
-    kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
+    const bool nvfp4_qkv = cells_only ? all_nvfp4({&L.k, &L.v}) : all_nvfp4({&L.q, &L.k, &L.v});
+    if (nvfp4_qkv) prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, s);
+    else kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
     if (cells_only) {
-        quantize_mmq(m, b.xn, b.xq, L.k.type, H, T, s);
+        if (!nvfp4_qkv) quantize_mmq(m, b.xn, b.xq, L.k.type, H, T, s);
         gemm(m, L.k, b.xq, b.k, T, s);
         gemm(m, L.v, b.xq, b.v, T, s);
         kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr, kc, vc, pos, s,
                                  256, true, 0, nullptr, q8);
         return;
     }
-    quantize_mmq(m, b.xn, b.xq, L.q.type, H, T, s);
+    if (!nvfp4_qkv) quantize_mmq(m, b.xn, b.xq, L.q.type, H, T, s);
     gemm(m, L.q, b.xq, b.qfull, T, s);
-    if (L.k.type != L.q.type) quantize_mmq(m, b.xn, b.xq, L.k.type, H, T, s);
+    if (!nvfp4_qkv && L.k.type != L.q.type) quantize_mmq(m, b.xn, b.xq, L.k.type, H, T, s);
     gemm(m, L.k, b.xq, b.k, T, s);
     gemm(m, L.v, b.xq, b.v, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
@@ -417,6 +424,18 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
         kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
                                      (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD));
         chunk_residual_f8(m, L.out, T, s);
+        return;
+    }
+    if (all_nvfp4({&L.qkv, &L.z, &L.out})) {
+        prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, s, bf(b.xn));
+        prefill::fp4_dense::product_bf16(L.qkv.w, L.qkv.scale, L.qkv.rows, H, b.a4, b.gs, T, bf(b.qkv), L.qkv.rows, s);
+        prefill::fp4_dense::product_bf16(L.z.w, L.z.scale, L.z.rows, H, b.a4, b.gs, T, bf(b.z), L.z.rows, s);
+        kernels::gdn_gating_proj(bf(b.xn), L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
+        kernels::gdn_conv(hist, bf(b.qkv), L.conv, bf(b.hc), T, s);
+        kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
+                                     nullptr, nullptr, bf(b.yn), b.hmax);
+        prefill::fp4_dense::quantize_amax(bf(b.yn), b.hmax, T, VD, VD, b.a4, b.gs, s);
+        prefill::fp4_dense::product_add_bf16(L.out.w, L.out.scale, L.out.rows, VD, b.a4, b.gs, T, residual(b), H, s);
         return;
     }
     {

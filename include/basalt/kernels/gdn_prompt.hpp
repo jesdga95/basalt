@@ -29,9 +29,10 @@ uint64_t gdn_work_bytes(int64_t T);
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, void* work, float* y, uint16_t* y16, int64_t T, void* stream,
                     GdnGate act = GdnGate::Sigmoid, float* yn = nullptr, uint8_t* y8 = nullptr, float* y8_scale = nullptr);
-/// As gdn_recurrence, of BF16 h and z (the prompt chunk's activations), the closing norm straight to E4M3 (y8, y8_scale).
+/// As gdn_recurrence, of BF16 h and z (the prompt chunk's activations), the closing norm straight to E4M3 (y8, y8_scale)
+/// or to BF16 (yn16) with per-token max |value| (rowmax) for FP4 quantization.
 void gdn_recurrence_bf16(float* state, const uint16_t* h, const float* gate, const float* beta, const uint16_t* z,
                          const float* gamma, float eps, void* work, float* y, int64_t T, void* stream, GdnGate act,
-                         uint8_t* y8, float* y8_scale);
+                         uint8_t* y8, float* y8_scale, uint16_t* yn16 = nullptr, float* rowmax = nullptr);
 
 }  // namespace basalt::kernels

@@ -424,12 +424,14 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
 // bitwise: each head's sum of squares adds in gdn_out_norm_kernel's order, so v is its value).  A warp takes a head at a
 // time, lane l holding columns l, l + 32, l + 64 and l + 96.
 constexpr int kNormWarps = 16, kNormHeads = (HV + kNormWarps - 1) / kNormWarps;
-template <class In>
+template <class In, bool E4M3>
 __global__ void __launch_bounds__(kNormWarps * 32) gdn_out_norm_e4m3_kernel(const In* __restrict__ z,
                                                                            const float* __restrict__ gamma, float eps,
                                                                            const float* __restrict__ y,
                                                                            uint8_t* __restrict__ codes,
-                                                                           float* __restrict__ scales, GdnGate act) {
+                                                                           float* __restrict__ scales,
+                                                                           __nv_bfloat16* __restrict__ yn16,
+                                                                           float* __restrict__ rowmax, GdnGate act) {
     __shared__ float red[kNormWarps];
     const int64_t t = blockIdx.x;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -455,8 +457,15 @@ __global__ void __launch_bounds__(kNormWarps * 32) gdn_out_norm_e4m3_kernel(cons
         for (int k = 0; k < 4; ++k) {
             const int col = lane + 32 * k;
             const float zv = ld1(z + base + col);
-            v[i][k] = oc[k] * inv * gamma[col] * (act == GdnGate::Silu ? zv * sigm(zv) : sigm(zv));
-            m = fmaxf(m, fabsf(v[i][k]));
+            const float val = oc[k] * inv * gamma[col] * (act == GdnGate::Silu ? zv * sigm(zv) : sigm(zv));
+            if constexpr (E4M3) {
+                v[i][k] = val;
+                m = fmaxf(m, fabsf(val));
+            } else {
+                const __nv_bfloat16 bv = __float2bfloat16_rn(val);
+                yn16[base + col] = bv;
+                m = fmaxf(m, fabsf(__bfloat162float(bv)));
+            }
         }
     }
 #pragma unroll
@@ -466,16 +475,20 @@ __global__ void __launch_bounds__(kNormWarps * 32) gdn_out_norm_e4m3_kernel(cons
     float amax = 0.0f;
 #pragma unroll
     for (int i = 0; i < kNormWarps; ++i) amax = fmaxf(amax, red[i]);
-    if (threadIdx.x == 0) scales[t] = amax / 448.0f;
-    const float q = amax > 0.0f ? 448.0f / amax : 0.0f;
+    if constexpr (E4M3) {
+        if (threadIdx.x == 0) scales[t] = amax / 448.0f;
+        const float q = amax > 0.0f ? 448.0f / amax : 0.0f;
 #pragma unroll
-    for (int i = 0; i < kNormHeads; ++i) {
-        const int head = warp + i * kNormWarps;
-        if (head >= HV) break;
-        uint8_t* row = codes + (size_t) t * HV * S + (size_t) head * S;
+        for (int i = 0; i < kNormHeads; ++i) {
+            const int head = warp + i * kNormWarps;
+            if (head >= HV) break;
+            uint8_t* row = codes + (size_t) t * HV * S + (size_t) head * S;
 #pragma unroll
-        for (int k = 0; k < 4; ++k)
-            row[lane + 32 * k] = (uint8_t) __nv_cvt_float_to_fp8(v[i][k] * q, __NV_SATFINITE, __NV_E4M3);
+            for (int k = 0; k < 4; ++k)
+                row[lane + 32 * k] = (uint8_t) __nv_cvt_float_to_fp8(v[i][k] * q, __NV_SATFINITE, __NV_E4M3);
+        }
+    } else {
+        if (threadIdx.x == 0 && rowmax) rowmax[t] = amax;
     }
 }
 
@@ -580,7 +593,8 @@ namespace {
 template <class In>
 void recurrence_impl(float* state, const In* h, const float* gate, const float* beta, const In* z,
                     const float* gamma, float eps, void* work, float* y, uint16_t* y16, int64_t T, void* stream,
-                    GdnGate act, float* yn, uint8_t* y8, float* y8_scale) {
+                    GdnGate act, float* yn, uint8_t* y8, float* y8_scale, uint16_t* yn16 = nullptr,
+                    float* rowmax = nullptr) {
     if (T > 0) {
         const cudaStream_t s = (cudaStream_t) stream;
         const int chunks = (int) ((T + CK - 1) / CK);
@@ -603,7 +617,9 @@ void recurrence_impl(float* state, const In* h, const float* gate, const float* 
         gdn_chunk_kernel<In><<<HV * (S / DV), NTH, sizeof(ChunkShared<In>), s>>>(state, h, qk, ctl, y, (int) T);
         if constexpr (sizeof(In) == 4)
             if (y16 || yn) gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, s>>>(z, gamma, eps, y, y16, yn, act);
-        if (y8) gdn_out_norm_e4m3_kernel<In><<<(unsigned) T, kNormWarps * 32, 0, s>>>(z, gamma, eps, y, y8, y8_scale, act);
+        if (y8) gdn_out_norm_e4m3_kernel<In, true><<<(unsigned) T, kNormWarps * 32, 0, s>>>(z, gamma, eps, y, y8, y8_scale, nullptr, nullptr, act);
+        else if (yn16) gdn_out_norm_e4m3_kernel<In, false><<<(unsigned) T, kNormWarps * 32, 0, s>>>(
+            z, gamma, eps, y, nullptr, nullptr, reinterpret_cast<__nv_bfloat16*>(yn16), rowmax, act);
     }
     check("gdn_recurrence");
 }
@@ -624,9 +640,9 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
 }
 void gdn_recurrence_bf16(float* state, const uint16_t* h, const float* gate, const float* beta, const uint16_t* z,
                          const float* gamma, float eps, void* work, float* y, int64_t T, void* stream, GdnGate act,
-                         uint8_t* y8, float* y8_scale) {
+                         uint8_t* y8, float* y8_scale, uint16_t* yn16, float* rowmax) {
     recurrence_impl(state, reinterpret_cast<const __nv_bfloat16*>(h), gate, beta, reinterpret_cast<const __nv_bfloat16*>(z), gamma,
-                    eps, work, y, nullptr, T, stream, act, nullptr, y8, y8_scale);
+                    eps, work, y, nullptr, T, stream, act, nullptr, y8, y8_scale, yn16, rowmax);
 }
 
 }  // namespace basalt::kernels
