@@ -383,6 +383,35 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         chunk_residual_f8(m, L.o, T, s);
         return;
     }
+    const bool nvfp4_attn = cells_only ? all_nvfp4({&L.k, &L.v}) : all_nvfp4({&L.q, &L.k, &L.v, &L.o});
+    if (nvfp4_attn && cells_only) {
+        prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, s);
+        prefill::fp4_dense::product_bf16(L.k.w, L.k.scale, L.k.rows, H, b.a4, b.gs, T, bf(b.k), L.k.rows, s);
+        prefill::fp4_dense::product_bf16(L.v.w, L.v.scale, L.v.rows, H, b.a4, b.gs, T, bf(b.v), L.v.rows, s);
+        kernels::attn_qk_prepare_bf16(nullptr, bf(b.k), bf(b.v), nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr,
+                                      pos, s, q8, kc, vc);
+        return;
+    }
+    if (nvfp4_attn) {
+        prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, s);
+        prefill::fp4_dense::product_bf16(L.q.w, L.q.scale, L.q.rows, H, b.a4, b.gs, T, bf(b.qfull), L.q.rows, s);
+        prefill::fp4_dense::product_bf16(L.k.w, L.k.scale, L.k.rows, H, b.a4, b.gs, T, bf(b.k), L.k.rows, s);
+        prefill::fp4_dense::product_bf16(L.v.w, L.v.scale, L.v.rows, H, b.a4, b.gs, T, bf(b.v), L.v.rows, s);
+        kernels::attn_qk_prepare_bf16(bf(b.qfull), bf(b.k), bf(b.v), L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv,
+                                      bf(b.qo), pos, s, q8, kc, vc);
+        const size_t split = kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits);
+        if (q8.k) {
+            kernels::gqa_prompt_attn_bf16(bf(b.qo), g.n_head, g.n_kv, pos, T, bf(b.ao), s, q8, b.attn_split, split);
+            kernels::attn_gate_bf16(bf(b.ao), bf(b.qfull), T, g.n_head, bf(b.ag), b.hmax, s);
+        } else {
+            kernels::to_f32(bf(b.qo), b.ag, (int64_t) T * AQ, s);
+            kernels::gqa_prompt_attn(b.ag, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split, split);
+            kernels::attn_gate_bf16(b.ao, bf(b.qfull), T, g.n_head, bf(b.ag), b.hmax, s);
+        }
+        prefill::fp4_dense::quantize_amax(bf(b.ag), b.hmax, T, AQ, AQ, b.a4, b.gs, s);
+        prefill::fp4_dense::product_add_bf16(L.o.w, L.o.scale, L.o.rows, AQ, b.a4, b.gs, T, residual(b), H, s);
+        return;
+    }
     const bool nvfp4_qkv = cells_only ? all_nvfp4({&L.k, &L.v}) : all_nvfp4({&L.q, &L.k, &L.v});
     if (nvfp4_qkv) prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, s);
     else kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);

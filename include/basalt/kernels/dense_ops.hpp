@@ -68,6 +68,11 @@ void attn_gate_e4m3(const float* attn, const float* q_full, int64_t T, int n_hea
 void attn_gate_e4m3(const float* attn, const uint16_t* q_full, int64_t T, int n_head, uint8_t* codes, float* scales, void* stream);
 void attn_gate_e4m3(const uint16_t* attn, const uint16_t* q_full, int64_t T, int n_head, uint8_t* codes, float* scales,
                     void* stream);
+/// attn_gate's rows rounded to BF16 with per-token max |output| (rowmax) for FP4 quantization.
+void attn_gate_bf16(const uint16_t* attn, const uint16_t* q_full, int64_t T, int n_head, uint16_t* out, float* rowmax,
+                    void* stream);
+void attn_gate_bf16(const float* attn, const uint16_t* q_full, int64_t T, int n_head, uint16_t* out, float* rowmax,
+                    void* stream);
 
 /// A block drafter's two-tap grouped dynamic convolution along a block's rows (DFlash 2):
 /// out[t][c] = sum over o in {0, 1} of (base[o][c] + dyn[t][o * groups + c / group]) * x[t - o][c], x[-1] = 0.
