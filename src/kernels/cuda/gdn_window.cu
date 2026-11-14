@@ -394,16 +394,9 @@ __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T)
     rec_block<MAXT, NJ, true>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, nullptr);
 }
 
-// rec_kernel over a segmented window: cluster row y is a window row, of which only a segment's first works, on the
-// segment's rows and state
-template<int MAXT, int NJ>
-__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
-                                                                              size_t state_off, const SegDst* dst,
-                                                                              size_t off_c, size_t off_hv) {
-    const SegRow r = rows[blockIdx.y];
-    if (r.j != 0) return;
-    __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
-    cg::cluster_group cl = cg::this_cluster();
+// A segment's arguments: its state, its window rows and, with `dst`, its own sequence's rows
+__device__ __forceinline__ DecRecArgs seg_args(const DecRecArgs& a0, const SegRow& r, size_t state_off, const SegDst* dst,
+                                               size_t off_c, size_t off_hv) {
     DecRecArgs a = a0;
     const size_t vd = (size_t) S * a.h_v, r0 = (size_t) r.row0;
     a.state = r.gdn + state_off;
@@ -420,8 +413,33 @@ __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(co
     }
     if (a.y) a.y += r0 * vd;
     if (a.y16) a.y16 += r0 * vd;
+    if (a.o) a.o += r0 * vd;
     a.yq = static_cast<char*>(a.yq) + r0 * (vd / 32) * sizeof(Q81);
-    rec_block<MAXT, NJ, false>(a, r.n, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
+    return a;
+}
+
+// rec_kernel over a segmented window: cluster row y is a window row, of which only a segment's first works, on the
+// segment's rows and state
+template<int MAXT, int NJ>
+__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
+                                                                              size_t state_off, const SegDst* dst,
+                                                                              size_t off_c, size_t off_hv) {
+    const SegRow r = rows[blockIdx.y];
+    if (r.j != 0) return;
+    __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
+    cg::cluster_group cl = cg::this_cluster();
+    rec_block<MAXT, NJ, false>(seg_args(a0, r, state_off, dst, off_c, off_hv), r.n, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
+}
+
+// rec_split_kernel over a segmented window (rec_seg_kernel's rows), without clusters: a cluster launch keeps at most two
+// blocks on an SM whatever its size, too few for two segments' heads in one wave
+template<int MAXT, int NJ>
+__global__ void __launch_bounds__(S) rec_split_seg_kernel(const DecRecArgs a0, const SegRow* rows, size_t state_off,
+                                                          const SegDst* dst, size_t off_c, size_t off_hv) {
+    const SegRow r = rows[blockIdx.y];
+    if (r.j != 0) return;
+    __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
+    rec_block<MAXT, NJ, true>(seg_args(a0, r, state_off, dst, off_c, off_hv), r.n, blockIdx.x / 4, blockIdx.x % 4, sm, nullptr);
 }
 
 // one warp per (token, value head): the head's four 32-value sums of squares in rank order, then norm_q8 per rank
@@ -470,6 +488,7 @@ static void by_width(int n_embd, int max_t, L launch) {
 template<int MAXT, int NJ> struct RecK { static constexpr auto f = rec_kernel<MAXT, NJ>; };
 template<int MAXT, int NJ> struct SplitK { static constexpr auto f = rec_split_kernel<MAXT, NJ>; };
 template<int MAXT, int NJ> struct SegK { static constexpr auto f = rec_seg_kernel<MAXT, NJ>; };
+template<int MAXT, int NJ> struct SplitSegK { static constexpr auto f = rec_split_seg_kernel<MAXT, NJ>; };
 
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
     if (n_tok < 1 || n_tok > kDecMaxT || !dec_gdn_rec_supported(a.n_embd) || a.h_k <= 0 || a.h_v % a.h_k != 0 ||
@@ -496,6 +515,21 @@ void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, 
     by_width<SegK>(a.n_embd, max_n, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, rows, state_off, dst, off_c, off_hv); });
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec_seg: %s", cudaGetErrorString(e)); std::exit(1); }
+}
+
+void dec_gdn_rec_seg_split(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, int n_tok,
+                           void* stream, const SegDst* dst, size_t off_c, size_t off_hv) {
+    if (n_rows < 1 || max_n < 1 || max_n > kDecMaxT || n_tok < 1 || n_tok > 2 * kDecMaxT || !rows || !a.o ||
+        !dec_gdn_rec_supported(a.n_embd) || a.h_k <= 0 || a.h_v % a.h_k != 0 || a.nk != 0) {
+        basalt::log::error("basalt", "dec_gdn_rec_seg_split: invalid arguments");
+        std::exit(1);
+    }
+    const dim3 grid((unsigned) (a.h_v * 4), (unsigned) n_rows), block(S);
+    const cudaStream_t s = (cudaStream_t) stream;
+    by_width<SplitSegK>(a.n_embd, max_n, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, rows, state_off, dst, off_c, off_hv); });
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec_seg_split: %s", cudaGetErrorString(e)); std::exit(1); }
+    dec_gdn_rec_norm(a, n_tok, stream);
 }
 
 void dec_gdn_rec_split(const DecRecArgs& a, int n_tok, void* stream) {
