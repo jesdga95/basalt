@@ -146,6 +146,7 @@ public:
         o.vision = req.vision;
         o.kv_int8 = req.kv == "int8";
         o.arch = "qwen35";
+        o.host_embedding_bytes = tensor_payload_bytes(*te);
         if (o.vision) {
             core::ModelFile file;
             core::ModelSources srcs;

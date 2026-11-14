@@ -5,6 +5,7 @@
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
+#include "basalt/program/expert_spill.hpp"
 #include "basalt/vision/encoder_cuda.hpp"
 #include "basalt/vision/preprocess.hpp"
 
@@ -577,7 +578,11 @@ public:
 
     std::string info_words() const override {
         const std::string kv = m_.o.kv_int8 ? "kv=int8" : "kv=fp16";
-        return kv + (block_ ? " drafter=block" : drafter_ ? " drafter=mtp" : "");
+        // a dense model has no routed experts, so none can sit on the SSD (the community check reads this)
+        // the weights not on the card: the vision projector when --vision staged it; the embedding is told apart
+        const uint64_t host_w = m_.encoder ? m_.encoder->weights_bytes() : 0;
+        return kv + " host_weight_bytes=" + std::to_string(host_w) + " host_embedding_bytes=" + std::to_string(m_.o.host_embedding_bytes) +
+               " " + program::spill_words({}) + (block_ ? " drafter=block" : drafter_ ? " drafter=mtp" : "");
     }
     int64_t disk_min_tokens() const override { return 4096; }
 

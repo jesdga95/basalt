@@ -112,6 +112,7 @@ struct Options {
     int spec = 0;                       ///< rows a decode window may hold (0 or 1: one)
     bool draft = false;                 ///< run the pack's drafter
     Drafter drafter = Drafter::None;    ///< which one
+    uint64_t host_embedding_bytes = 0;  ///< the token embedding the adapter keeps in page-locked RAM (a row lookup per token)
     bool vision = false;                ///< requests may carry images
     bool kv_int8 = false;               ///< the attention layers' K/V as int8 codes with a scale per 64 values
     core::FileRange mmproj;             ///< the vision projector (vision/mmproj)

@@ -4,13 +4,13 @@
 
 ## Add your run
 
-1. Stop any running Basalt server (the GPUs must be free), then run `basalt-bench --community --model PACK` (a Flash-Next or a DeepSeek pack). It starts its own engine (three times, once per measurement), shows the load progress on stderr while each one starts, adds its row to `docs/community/benchmarks.json` and prints it. It uses every visible Blackwell GPU: a second card is the peer, and `CUDA_VISIBLE_DEVICES=0` gives a single-card row.
+1. Stop any running Basalt server (the GPUs must be free), then run `basalt-bench --community --model PACK` (a Flash-Next, a 27B or a DeepSeek pack). It starts its own engine (three times, once per measurement), shows the load progress on stderr while each one starts, adds its row to `docs/community/benchmarks.json` and prints it. It uses every visible Blackwell GPU: a second card is the peer, and `CUDA_VISIBLE_DEVICES=0` gives a single-card row.
 2. `--submitter NAME` is required: the name you want shown (one name with no spaces, up to 40 characters; it is not verified). `notes` (up to 200 characters) is optional and added by hand.
 3. Review the row in `docs/community/benchmarks.json`, commit it and open a pull request. If the file already has a row of your setup (see below), the bench replaces that row in place, keeps its `notes` and says so; check the notes still apply. If the bench could not write the file, it prints the row and says where to paste it.
 
-The row records `model` (`Qwen3.8-Flash-Next` or `DeepSeek-V4.1-Flash`, the name the model's adapter reports for the pack's architecture, not its file name) and `kv`, the KV cache format the run used: the preset passes `--kv int8` to Flash-Next and `--kv fp8` to DeepSeek, and a model that takes neither runs its own format. Rows of different models are not comparable.
+The row records `model` (`Qwen3.8-Flash-Next`, `Qwen3.8-27B` or `DeepSeek-V4.1-Flash`, the name the model's adapter reports for the pack's architecture, not its file name) and `kv`, the KV cache format the run used: the preset passes `--kv int8` to Flash-Next and the 27B and `--kv fp8` to DeepSeek, and a model that takes neither runs its own format. Rows of different models are not comparable.
 
-You need enough free RAM that no expert is read from the SSD; the bench checks this and refuses to print a row otherwise.
+You need enough free RAM that no expert is read from the SSD; the bench checks this and refuses to print a row otherwise. The 27B has no experts: the bench instead refuses a row if any of its weights sit in host RAM; its token embedding, which the engine keeps in page-locked RAM by design, does not count.
 
 Optional fields, recorded by `--community` before the engine starts (`basalt-bench --hardware` prints them alone):
 
