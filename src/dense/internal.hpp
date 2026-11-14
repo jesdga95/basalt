@@ -94,7 +94,7 @@ struct ChunkScratch {
     float *g = nullptr, *u = nullptr, *h = nullptr;
     float *hn = nullptr, *cat = nullptr;          // the drafter's history: main's normed rows, its input rows
     float* dacc = nullptr;                        // the block drafter's projected features of the chunk's rows
-    void* a4 = nullptr;                           // the MLP's FP4 activations (fp4_dense), their token scales
+    void* a4 = nullptr;                           // the FP4 activations (fp4_dense), their token scales
     float* gs = nullptr;
     float* hmax = nullptr;                        // each row's largest |H| (the SwiGLU product's), for its FP4 rounding
     int32_t *tok = nullptr, *pos = nullptr, *iota = nullptr, *bounds = nullptr;
