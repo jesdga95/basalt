@@ -133,6 +133,9 @@ struct CommonOptions {
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
     int64_t turn_token = -1;
     bool turn_token_given = false;
+    /// The token of the role that opens the model's reply after turn_token (the template's TokenNames::reply_role; -1:
+    /// none): a boundary that opens the reply is the new turn's header, never the chain's root.
+    int64_t reply_role_token = -1;
     /// --serve (opt-in): the role token of a short turn the server puts right before the new assistant turn (the
     /// "system" of a trailing reasoning-effort turn).  When the turn before the last <|im_start|> opens with it,
     /// the checkpoint goes in front of that turn instead, so it holds the conversation and not the effort text.
