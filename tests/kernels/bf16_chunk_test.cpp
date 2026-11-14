@@ -1,8 +1,8 @@
 // tests/kernels/bf16_chunk_test.cpp - the prompt chunk's BF16 entry points (the BF16 residual stream and activations)
 // give, bitwise, what the FP32 kernels give on the same values widened, rounded once to BF16 where the output is BF16:
 // fp8 rms_norm_quantize and the StoreBf16 / AddBf16 epilogues, fp4_dense rms_norm_quantize, product_bf16 and
-// product_add_bf16, gdn_gating_proj, gdn_conv, gdn_recurrence_bf16 (E4M3 and BF16 out), attn_qk_prepare_bf16 and
-// attn_gate_e4m3.  A BF16 output's row amax is the largest |value| as stored.
+// product_add_bf16, gdn_gating_proj, gdn_conv, gdn_recurrence_bf16 (E4M3 and BF16 out), attn_qk_prepare_bf16,
+// attn_gate_e4m3 and attn_gate_bf16.  A BF16 output's row amax is the largest |value| as stored.
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
@@ -291,6 +291,17 @@ int main() {
         k::attn_gate_e4m3(dev(ab), dev(qb), T, NH, (uint8_t*) e3, fp8::act_scales(e3, T, NH * HD), nullptr);
         ok &= report("attn_gate_e4m3 of BF16 q_full and BF16 rows", host(e1, fp8::act_bytes(T, NH * HD)) == host(e2, fp8::act_bytes(T, NH * HD)) &&
                                                                      host(e1, fp8::act_bytes(T, NH * HD)) == host(e3, fp8::act_bytes(T, NH * HD)));
+        const int64_t AQ = (int64_t) NH * HD;
+        float* g1 = dev_n<float>((size_t) T * AQ);
+        uint16_t *g2 = dev_n<uint16_t>((size_t) T * AQ), *g3 = dev_n<uint16_t>((size_t) T * AQ);
+        float *m2 = dev_n<float>(T), *m3 = dev_n<float>(T);
+        k::attn_gate(dat, dev(qf), g1, T, NH, nullptr);
+        k::attn_gate_bf16(dat, dev(qb), T, NH, g2, m2, nullptr);
+        k::attn_gate_bf16(dev(ab), dev(qb), T, NH, g3, m3, nullptr);
+        const auto g1r = round_rows(host(g1, (size_t) T * AQ * 4));
+        ok &= report("attn_gate_bf16 of FP32 and BF16 rows (row amax)",
+                     g1r == host(g2, (size_t) T * AQ * 2) && g1r == host(g3, (size_t) T * AQ * 2) &&
+                         row_amax(g1r, T, AQ) == host(m2, T * 4) && row_amax(g1r, T, AQ) == host(m3, T * 4));
     }
     std::printf("%s\n", ok ? "bf16 chunk entry points ok" : "FAIL");
     return ok ? 0 : 1;

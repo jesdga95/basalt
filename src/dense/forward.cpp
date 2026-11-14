@@ -368,32 +368,52 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim;
-    const bool f8 = all_f8({&L.q, &L.k, &L.v, &L.o});
-    if (f8 && cells_only) {
-        prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, nullptr, s);
-        const prefill::fp8::Segment seg[2] = {f8_seg(L.k, b.k), f8_seg(L.v, b.v)};
-        prefill::fp8::gemm_segmented(seg, 2, H, b.xq, T, prefill::fp8::Epilogue::StoreBf16, s);
-        kernels::attn_qk_prepare_bf16(nullptr, bf(b.k), bf(b.v), nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr,
-                                      pos, s, q8, kc, vc);
-        return;
-    }
-    if (f8) {   // the norm in the quantizer, one FP8 product for q, k and v (BF16 out)
-        prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, nullptr, s);
-        const prefill::fp8::Segment seg[3] = {f8_seg(L.q, b.qfull), f8_seg(L.k, b.k), f8_seg(L.v, b.v)};
-        prefill::fp8::gemm_segmented(seg, 3, H, b.xq, T, prefill::fp8::Epilogue::StoreBf16, s);
+    const bool f8 = all_f8({&L.q, &L.k, &L.v, &L.o}), nvfp4 = all_nvfp4({&L.q, &L.k, &L.v, &L.o});
+    if (f8 || nvfp4) {
+        // the norm in the quantizer, the q, k and v products BF16 out (F8: one product), the gate's rows straight to E4M3 for
+        // an F8 o, else to BF16 rows with each row's amax, read once by o's FP4 quantizer
+        const auto product = [&](const Linear& l, float* dst) {
+            prefill::fp4_dense::product_bf16(l.w, l.scale, l.rows, H, b.a4, b.gs, T, bf(dst), l.rows, s);
+        };
+        if (f8) prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, nullptr, s);
+        else prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
+        if (cells_only) {
+            if (f8) {
+                const prefill::fp8::Segment seg[2] = {f8_seg(L.k, b.k), f8_seg(L.v, b.v)};
+                prefill::fp8::gemm_segmented(seg, 2, H, b.xq, T, prefill::fp8::Epilogue::StoreBf16, s);
+            } else {
+                product(L.k, b.k);
+                product(L.v, b.v);
+            }
+            kernels::attn_qk_prepare_bf16(nullptr, bf(b.k), bf(b.v), nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr,
+                                          pos, s, q8, kc, vc);
+            return;
+        }
+        if (f8) {
+            const prefill::fp8::Segment seg[3] = {f8_seg(L.q, b.qfull), f8_seg(L.k, b.k), f8_seg(L.v, b.v)};
+            prefill::fp8::gemm_segmented(seg, 3, H, b.xq, T, prefill::fp8::Epilogue::StoreBf16, s);
+        } else {
+            product(L.q, b.qfull);
+            product(L.k, b.k);
+            product(L.v, b.v);
+        }
         kernels::attn_qk_prepare_bf16(bf(b.qfull), bf(b.k), bf(b.v), L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv,
                                       bf(b.qo), pos, s, q8, kc, vc);
         const size_t split = kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits);
-        // the gate rounds its rows to E4M3 for o itself
+        uint8_t* e4 = (uint8_t*) b.xq;
+        float* e4s = prefill::fp8::act_scales(b.xq, T, AQ);
         if (q8.k) {   // BF16 queries and output rows
             kernels::gqa_prompt_attn_bf16(bf(b.qo), g.n_head, g.n_kv, pos, T, bf(b.ao), s, q8, b.attn_split, split);
-            kernels::attn_gate_e4m3(bf(b.ao), bf(b.qfull), T, g.n_head, (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, AQ), s);
-        } else {      // an fp16 cache's prompt kernel reads FP32 queries
+            if (f8) kernels::attn_gate_e4m3(bf(b.ao), bf(b.qfull), T, g.n_head, e4, e4s, s);
+            else kernels::attn_gate_bf16(bf(b.ao), bf(b.qfull), T, g.n_head, bf(b.ag), b.hmax, s);
+        } else {      // an fp16 cache's prompt kernel reads FP32 queries (the gate's BF16 rows reuse their buffer)
             kernels::to_f32(bf(b.qo), b.ag, (int64_t) T * AQ, s);
             kernels::gqa_prompt_attn(b.ag, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split, split);
-            kernels::attn_gate_e4m3(b.ao, bf(b.qfull), T, g.n_head, (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, AQ), s);
+            if (f8) kernels::attn_gate_e4m3(b.ao, bf(b.qfull), T, g.n_head, e4, e4s, s);
+            else kernels::attn_gate_bf16(b.ao, bf(b.qfull), T, g.n_head, bf(b.ag), b.hmax, s);
         }
-        chunk_residual_f8(m, L.o, T, s);
+        if (f8) chunk_residual_f8(m, L.o, T, s);
+        else chunk_residual_fp4(m, L.o, bf(b.ag), b.hmax, AQ, T, s);
         return;
     }
     kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
