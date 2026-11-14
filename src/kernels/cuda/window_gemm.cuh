@@ -202,6 +202,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
 
 #pragma unroll
     for (int i = 0; i < ST - 1; ++i) issue_next();
+    pdl_launch_dependents();   // the next kernel may take SM room as blocks finish and stage its weights meanwhile
     pdl_wait();   // the activations and the workspace come from the kernels before this one
 
     const int wm = NM == 1 ? 0 : warp / kWarpsPerM;   // this warp's matrix slot in the stage
@@ -323,7 +324,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
             }
             __syncthreads();
         }
-        if (item + G >= items) pdl_launch_dependents();   // the block's last weights are read
+        // (dependents were started at the top: see the trigger before the wait)
 
         // ---- the item's epilogue: its slice's sums to the workspace, the last slice of the tile adds them in order
         const int mat = NM == 1 ? mi : wm;
