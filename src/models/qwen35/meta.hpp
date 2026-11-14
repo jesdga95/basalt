@@ -4,11 +4,29 @@
 
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/dense/model.hpp"
+#include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/model/adapter.hpp"
 
 #include <string>
 
 namespace basalt::models::qwen35 {
+
+constexpr int kTypeF32 = 0, kTypeQ8_0 = 8, kTypeBf16 = 30, kTypeNvfp4 = 40, kTypeF8 = 44, kTypeNvfp4Planes = 45;
+
+/// Why `<base>.weight`, of tensor type `type` and rows x cols, is not a matrix the dense kernels read; empty when it is.
+inline std::string linear_type_error(const std::string& base, uint32_t type, int64_t rows, int64_t cols) {
+    if (type == kTypeNvfp4)
+        return "qwen35: " + base + ".weight is NVFP4 in ggml blocks, from a pack older than NVFP4_PLANES: re-convert the "
+               "pack (tools/convert/convert.py --checkpoint, docs/model-file.md)";
+    if (type != kTypeQ8_0 && type != kTypeNvfp4Planes && type != kTypeF8)
+        return "qwen35: " + base + ".weight is " + ggml_type_name(type) + "; the dense kernels read Q8_0, NVFP4_PLANES and F8_E4M3";
+    if (type == kTypeNvfp4Planes && !kernels::nvfp4p::fits(rows, cols))
+        return "qwen35: " + base + ".weight: NVFP4_PLANES of " + std::to_string(rows) + " x " + std::to_string(cols) +
+               " (planes need rows in 128s and 64-value groups)";
+    if (type == kTypeF8 && cols % 256 != 0)
+        return "qwen35: " + base + ".weight: F8_E4M3 rows of " + std::to_string(cols) + " values (the kernels read multiples of 256)";
+    return {};
+}
 
 inline const MetaValue* key(const GgufFile& g, const char* suffix) { return g.get(std::string("qwen35.") + suffix); }
 inline uint64_t key_u(const GgufFile& g, const char* suffix) {
