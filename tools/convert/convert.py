@@ -8,7 +8,7 @@
         [--name NAME] [--workers N] [--force]
     python3 tools/convert/convert.py --sections-from DEEPSEEK.basalt --checkpoint DIR --out MODEL.basalt [--stream-shards] \\
         [--name NAME] [--workers N] [--force]
-    python3 tools/convert/convert.py --checkpoint QWEN35_DIR --out MODEL.basalt [--drafter DFLASH2_DIR] [--name NAME] [--workers N] [--force]
+    python3 tools/convert/convert.py --checkpoint QWEN35_DIR --out MODEL.basalt [--drafter DFLASH2_DIR] [--head fp8] [--name NAME] [--workers N] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
@@ -49,6 +49,7 @@ From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoi
                      their values, a BF16 head is rounded to NVFP4 once, the drafter's BF16 projections Q8_0, the vision
                      tower an mmproj GGUF; tokenizer and metadata from the checkpoint's files. Everything comes from DIR.
   --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
+  --head fp8         a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448) instead of NVFP4
 
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
@@ -787,6 +788,9 @@ def main():
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
     ap.add_argument("--drafter", metavar="DIR", help="with a qwen35 --checkpoint: a DFlash 2 block drafter (z-lab's "
                     "DFlash2DraftModel safetensors and config.json) added as dflash.* tensors")
+    ap.add_argument("--head", choices=("nvfp4", "fp8"), default="nvfp4",
+                    help="with a qwen35 --checkpoint whose head is BF16: round it to NVFP4 (default) or to FP8 rows "
+                         "with a scale per row")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --gguf: print every section's offset and size and write nothing")
@@ -817,7 +821,7 @@ def main():
         return
     if a.checkpoint:
         if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards:
-            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --workers and --force")
+            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --head, --workers and --force")
         if a.drafter and not Path(a.drafter).is_dir():
             ap.error(f"missing input: {a.drafter}")
         if not Path(a.checkpoint).is_dir():
