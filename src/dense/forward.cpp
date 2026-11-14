@@ -604,10 +604,12 @@ void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int S, in
     prod_group(m, b.xn, xq, L.qkv.type, {{&L.qkv, b.rq}, {&L.z, b.z}}, rows, s);
     kernels::DecRecArgs a = gdn_args(m, L);
     a.qkv = b.rq;
-    if (on_wg(L.out.type)) a.y16 = (uint16_t*) b.xq;
-    // a cluster row a segment, its GDN rows straight into its session's store (the commit's)
-    kernels::dec_gdn_rec_seg(a, b.btab->first, (size_t) gi * segs[0].st->gdn_floats, S, max_n, s, b.btab->sdst,
-                             (size_t) gi * kWindow * C, (size_t) gi * kWindow * g.gdn_v_heads);
+    // the raw output in b.y, normed there in place when the out product reads fp32 rows
+    a.o = b.y;
+    if (on_wg(L.out.type)) { a.y16 = (uint16_t*) b.xq; a.y = nullptr; }
+    // a block row a segment, its GDN rows straight into its session's store (the commit's)
+    kernels::dec_gdn_rec_seg_split(a, b.btab->first, (size_t) gi * segs[0].st->gdn_floats, S, max_n, rows, s, b.btab->sdst,
+                                   (size_t) gi * kWindow * C, (size_t) gi * kWindow * g.gdn_v_heads);
     prod_add(m, L.out, on_wg(L.out.type) ? b.xq : wact(m, b.y, L.out.type, g.value_width(), rows, s), b.x, rows, s);
 }
 
