@@ -9,7 +9,7 @@ One file from NVIDIA's NVFP4 checkpoint ([nvidia/Qwen3.8-27B-NVFP4](https://hugg
 DFlash 2 block drafter ([z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)) when built with it:
 
 - MLP and output head: NVIDIA's NVFP4, moved bit for bit with their tensor scales.
-- GDN and attention projections: NVIDIA's FP8 values as Q8_0.
+- GDN and attention projections: NVIDIA's FP8 codes, moved bit for bit as `F8_E4M3` with their tensor scales.
 - The MTP layer and the block drafter: BF16 projections as Q8_0. Vision: the BF16 tower, as stored.
 - The BF16 token embedding stays in page-locked RAM (2.4 GiB); everything else sits on the main card (17.2 GiB with the
   MTP layer, 19.1 GiB with the block drafter).
@@ -46,5 +46,18 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 
 ## Limits
 
-- Slots whose windows fit 16 rows together (up to 16 slots plain, two slots of 8-row drafted windows) share one pass through the weights each round, and their block drafters run two blocks a pass; a window that does not fit takes a pass of its own. Prompt reads run per slot.
+- Slots whose windows fit 16 rows together (every slot in plain decoding, two slots of 8-row drafted windows) share one pass through the weights each round, and their block drafters run two blocks a pass; a window that does not fit takes a pass of its own. Prompt reads run per slot.
 - No layer split and no second-card drafting.
+
+## Speed
+
+Measured on one RTX 5090 at TBD-power-limit W, `--kv fp16`, cold first runs. Placeholders until the end measurement:
+
+| | Result |
+| --- | --- |
+| Prompt read, 4k tokens | TBD-prefill-4k tok/s |
+| Prompt read, 32k tokens | TBD-prefill-32k tok/s |
+| Decode, plain (`--spec 0`) | TBD-decode-plain tok/s |
+| Decode, drafted (`basalt-bench` conversation, struct, prose) | TBD-decode-conv, TBD-decode-struct, TBD-decode-prose tok/s |
+| Decode, `--parallel 4`, all slots | TBD-decode-parallel4 tok/s |
+| Weights on the card, with the MTP layer / with the block drafter | TBD-vram-mtp / TBD-vram-block GiB |
