@@ -8,7 +8,7 @@
         [--name NAME] [--workers N] [--force]
     python3 tools/convert/convert.py --sections-from DEEPSEEK.basalt --checkpoint DIR --out MODEL.basalt [--stream-shards] \\
         [--name NAME] [--workers N] [--force]
-    python3 tools/convert/convert.py --checkpoint QWEN35_DIR --out MODEL.basalt [--drafter DFLASH2_DIR] [--head fp8] [--name NAME] [--workers N] [--force]
+    python3 tools/convert/convert.py --checkpoint QWEN35_DIR --out MODEL.basalt [--drafter DFLASH2_DIR] [--head nvfp4] [--name NAME] [--workers N] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
@@ -46,10 +46,11 @@ From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoi
   --checkpoint DIR   an NVFP4 checkpoint of a Qwen3.5-family dense model, NVIDIA Model Optimizer's
                      (nvidia/Qwen3.8-27B-NVFP4) or compressed-tensors' (QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4): NVFP4
                      projections keep their codes and scales, FP8 ones their E4M3 codes, NVFP4 GDN a / b become BF16 of
-                     their values, a BF16 head is rounded to NVFP4 once, the drafter's BF16 projections Q8_0, the vision
+                     their values, a BF16 head becomes FP8 E4M3 rows, the drafter's BF16 projections Q8_0, the vision
                      tower an mmproj GGUF; tokenizer and metadata from the checkpoint's files. Everything comes from DIR.
   --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
-  --head fp8         a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448) instead of NVFP4
+  --head fp8|nvfp4   a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448, the default) or rounded once
+                     to NVFP4 (UE4M3 scale of least squared error per 16 values); a head already NVFP4 is kept
 
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
@@ -788,9 +789,9 @@ def main():
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
     ap.add_argument("--drafter", metavar="DIR", help="with a qwen35 --checkpoint: a DFlash 2 block drafter (z-lab's "
                     "DFlash2DraftModel safetensors and config.json) added as dflash.* tensors")
-    ap.add_argument("--head", choices=("nvfp4", "fp8"), default="nvfp4",
-                    help="with a qwen35 --checkpoint whose head is BF16: round it to NVFP4 (default) or to FP8 rows "
-                         "with a scale per row")
+    ap.add_argument("--head", choices=("fp8", "nvfp4"),
+                    help="with a qwen35 --checkpoint whose head is BF16: round it to FP8 rows with a scale per row "
+                         "(default) or to NVFP4")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --gguf: print every section's offset and size and write nothing")

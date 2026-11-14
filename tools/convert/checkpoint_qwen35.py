@@ -10,9 +10,9 @@ weight_scale, weight_global_scale, its reciprocal the tensor scale).
                           scale as `<name>.scale` (F32 [1])
                         FP8 projections: the E4M3 codes as stored (type 44, F8_E4M3; rows / columns in the GGUF
                           head order), the FP32 per-tensor weight_scale as `<name>.scale` (F32 [1])
-                        a BF16 head: rounded once to NVFP4_PLANES (per 16 values the UE4M3 scale of least squared
-                          error, tensor scale amax / (6 x 448)); with --head fp8 to F8_E4M3 rows, each row's FP32
-                          scale its amax / 448 as `output.scale` (F32 [rows]), the codes to nearest
+                        a BF16 head: rounded once to F8_E4M3 rows, each row's FP32 scale its amax / 448 as
+                          `output.scale` (F32 [rows]), the codes to nearest; with --head nvfp4 to NVFP4_PLANES (per
+                          16 values the UE4M3 scale of least squared error, tensor scale amax / (6 x 448))
                         BF16 projections (the drafter's): Q8_0
                         norms F32 with the offset "+1" folded in (exact), the GDN gated norm as stored
                         GDN value heads in the GGUF order (value head h meets key head h % 16)
@@ -54,8 +54,8 @@ UE4M3 = E4M3[:127].astype(np.float32)     # the finite non-negative codes, ascen
 
 # checkpoint tensor (after `model.language_model.layers.N.` or `mtp.layers.0.`) -> (GGUF name, form, transform)
 #   forms: Q8 (Q8_0 from BF16; the main model's FP8 projections become F8, their codes kept, NVFP4 ones FP4), FP4 (NVFP4
-#   kept, as planes; FP4Q when the checkpoint has it in BF16: rounded once; F8Q, a BF16 head with --head fp8: E4M3 rows
-#   with a scale per row), BF16, F32
+#   kept, as planes; F8Q when the checkpoint has the head in BF16: E4M3 rows with a scale per row; FP4Q, that head with
+#   --head nvfp4: rounded once to NVFP4), BF16, F32
 #   transforms as checkpoint.py names them: id, norm, heads, negexp, gconv, vrows, zrows, vcols
 LAYER = {
     "input_layernorm.weight": ("attn_norm.weight", "F32", "norm"),
@@ -107,7 +107,7 @@ class Tensor:
 class Plan:
     """The pack's `gguf` tensors in checkpoint order, each with how it is made."""
 
-    def __init__(self, ck: C.Checkpoint, head: str = "nvfp4"):
+    def __init__(self, ck: C.Checkpoint, head: str | None = None):
         tc = ck.text
         self.ck = ck
         if tc.get("model_type") != "qwen3_5_text":
@@ -151,9 +151,9 @@ class Plan:
             if form == "Q8" and packed and not mm:
                 form = "FP4"          # NVFP4 projections keep their codes and scales
             if form == "FP4" and dt == "BF16":
-                form = "F8Q" if head == "fp8" else "FP4Q"   # a BF16 head: rounded once to NVFP4 or FP8 rows
-            elif gname == "output.weight" and head != "nvfp4":
-                raise S.ConvertError(f"--head {head} rounds a BF16 head; {k} is {dt}")
+                form = "FP4Q" if head == "nvfp4" else "F8Q"   # a BF16 head: rounded once to FP8 rows or NVFP4
+            elif gname == "output.weight" and head == "fp8":
+                raise S.ConvertError(f"--head fp8 rounds a BF16 head; {k} is {dt}")
             if form == "FP4" and not packed:
                 raise S.ConvertError(f"{k} is {dt}; NVFP4 codes are U8")
             cols = shape[1] * 2 if packed and len(shape) == 2 else shape[-1]
@@ -741,7 +741,7 @@ def build(a, Job, fingerprint, die) -> None:
         die(f"{out} exists (use --force to overwrite)")
     try:
         ck = C.Checkpoint(a.checkpoint)
-        plan = Plan(ck, getattr(a, "head", "nvfp4"))
+        plan = Plan(ck, getattr(a, "head", None))
         name = a.name or C.front_matter(ck.dir / "README.md").get("base_model", ["Qwen3.5"])[0].split("/")[-1] + " NVFP4"
         kv = model_kv(ck, name)
         drafter = Drafter(a.drafter, ck) if getattr(a, "drafter", None) else None
