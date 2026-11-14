@@ -73,6 +73,7 @@ struct WindowScratch {
     int32_t* pos0 = nullptr;                     // the window's first cell (device), read by its attention
     // a batch window's: the packed GDN rows of the layer in hand (before they go to each session), its table
     float* rq = nullptr;
+    float* gab = nullptr;                        // its GDN gates (dec_gdn_gates): alpha [rows][h_v], then beta
     BatchTable* btab = nullptr;
     // the block drafter's: its rows' q, k, v, attention and convolution coefficients, the selector's projection
     float *bq = nullptr, *bk = nullptr, *bv = nullptr, *bqo = nullptr, *bao = nullptr, *dyn = nullptr, *bh = nullptr;
@@ -121,6 +122,9 @@ public:
     static constexpr size_t kBatchGraphs = 64;
     std::vector<BatchGraph> batch_graphs;
     uint64_t batch_clock = 0;
+    // a batch window's GDN gates run on gate_side beside the qkv/z product, from gate_fork to gate_join
+    cudaStream_t gate_side = nullptr;
+    cudaEvent_t gate_fork = nullptr, gate_join = nullptr;
     std::unique_ptr<vision::Mmproj> mmproj;
     std::unique_ptr<vision::CudaEncoder> encoder;
     BlockDrafter bd_dec;                         // the block drafter as decode windows run it (its products in Q8 planes)

@@ -305,6 +305,9 @@ uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv
 
 Model::~Model() {
     for (BatchGraph& g : batch_graphs) cudaGraphExecDestroy(g.exec);
+    if (gate_side) cudaStreamDestroy(gate_side);
+    if (gate_fork) cudaEventDestroy(gate_fork);
+    if (gate_join) cudaEventDestroy(gate_join);
     for (void* p : owned) cudaFree(p);
     vision_detach();
 }
@@ -519,6 +522,13 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     b.pos0 = a.take<int32_t>(2);
     if (g.gdn_layers() > 0) {
         b.rq = a.take<float>(W * (size_t) g.conv_channels());
+        b.gab = a.take<float>(2 * W * (size_t) g.gdn_v_heads);
+        if (cudaStreamCreateWithFlags(&m->gate_side, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&m->gate_fork, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&m->gate_join, cudaEventDisableTiming) != cudaSuccess) {
+            err = o.arch + ": creating the GDN gate stream failed";
+            return nullptr;
+        }
     }
     b.btab = a.take<BatchTable>(1);
     if (!b.bounds) {

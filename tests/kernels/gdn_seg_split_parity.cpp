@@ -1,5 +1,5 @@
-// tests/kernels/gdn_seg_split_parity.cpp - dec_gdn_rec_seg_split (split kernel per segment, then the norm) against
-// dec_gdn_rec_seg (a cluster per head) bitwise: h, gates, betas, the raw qkv channels, y, y16 and the q8_1 rows, over
+// tests/kernels/gdn_seg_split_parity.cpp - dec_gdn_gates, then dec_gdn_rec_seg_split (split kernel per segment, then
+// the norm), against dec_gdn_rec_seg (a cluster per head) bitwise: h, gates, betas, the raw qkv channels, y, y16 and the q8_1 rows, over
 // segment mixes up to the batch window's 16 rows, with and without SegDst, both widths and both output gates, and the
 // norm in place (a.o == a.y).  dec_gdn_rec_seg is itself bitwise to dec_gdn_rec per segment (dec_gdn_parity).
 // Exit 77 without a GPU.
@@ -107,6 +107,7 @@ void run(const Geo& g, const std::vector<int>& seg, bool use_dst, GdnGate gate, 
     // with SegDst, segment k's rows go to its own stretch (row 2 k kDecMaxT / seg size .. ) of each buffer
     std::vector<SegDst> dh[2];
     SegDst* dd[2] = {nullptr, nullptr};
+    float* gates = (float*) zeros((size_t) 2 * rows * g.h_v * 4);
     for (int p = 0; p < 2; ++p) {
         if (!use_dst) continue;
         for (size_t k = 0; k < seg.size(); ++k) {
@@ -119,16 +120,22 @@ void run(const Geo& g, const std::vector<int>& seg, bool use_dst, GdnGate gate, 
         DecRecArgs b = a;
         b.h = o[p].h; b.gate = o[p].gate; b.beta = o[p].beta; b.y = o[p].y; b.y16 = o[p].y16; b.yq = o[p].yq;
         if (p == 0) dec_gdn_rec_seg(b, d_rows, 0, (int) seg.size(), max_n, S0, dd[0]);
-        else { b.o = o[p].o; dec_gdn_rec_seg_split(b, d_rows, 0, (int) seg.size(), max_n, rows, S0, dd[1]); }
+        else {
+            b.o = o[p].o;
+            dec_gdn_gates(b, rows, gates, S0);
+            dec_gdn_rec_seg_split(b, d_rows, 0, (int) seg.size(), max_n, rows, S0, dd[1], 0, 0, gates);
+        }
     }
     bool ok = cudaStreamSynchronize(S0) == cudaSuccess;
-    ok = same("h", o[0].h, o[1].h, (size_t) 2 * kDecMaxT * C * 4) && ok;
-    ok = same("gate", o[0].gate, o[1].gate, (size_t) 2 * kDecMaxT * g.h_v * 4) && ok;
-    ok = same("beta", o[0].beta, o[1].beta, (size_t) 2 * kDecMaxT * g.h_v * 4) && ok;
-    ok = same("qkv", o[0].qkv, o[1].qkv, (size_t) 2 * kDecMaxT * C * 4) && ok;
-    ok = same("y", o[0].y, o[1].y, (size_t) rows * VD * 4) && ok;
-    ok = same("y16", o[0].y16, o[1].y16, (size_t) rows * VD * 2) && ok;
-    ok = same("yq", o[0].yq, o[1].yq, yq_bytes) && ok;
+    for (int p = 1; p < 2; ++p) {
+    ok = same("h", o[0].h, o[p].h, (size_t) 2 * kDecMaxT * C * 4) && ok;
+    ok = same("gate", o[0].gate, o[p].gate, (size_t) 2 * kDecMaxT * g.h_v * 4) && ok;
+    ok = same("beta", o[0].beta, o[p].beta, (size_t) 2 * kDecMaxT * g.h_v * 4) && ok;
+    ok = same("qkv", o[0].qkv, o[p].qkv, (size_t) 2 * kDecMaxT * C * 4) && ok;
+    ok = same("y", o[0].y, o[p].y, (size_t) rows * VD * 4) && ok;
+    ok = same("y16", o[0].y16, o[p].y16, (size_t) rows * VD * 2) && ok;
+    ok = same("yq", o[0].yq, o[p].yq, yq_bytes) && ok;
+    }
     std::printf("n_embd %d segments", E);
     for (int n : seg) std::printf(" %d", n);
     std::printf("%s%s%s: %s\n", use_dst ? ", dst" : "", gate == GdnGate::Silu ? ", silu" : "", in_place ? ", in place" : "",
@@ -137,7 +144,7 @@ void run(const Geo& g, const std::vector<int>& seg, bool use_dst, GdnGate gate, 
     for (float* p : states) cudaFree(p);
     for (const void* p : {(const void*) d_rows, (const void*) a.qkv, (const void*) a.conv_w, (const void*) a.x, (const void*) a.w_alpha,
                           (const void*) a.w_beta, (const void*) a.dt, (const void*) a.ssm_a, (const void*) a.z, (const void*) a.gamma,
-                          (const void*) dd[0], (const void*) dd[1]})
+                          (const void*) dd[0], (const void*) dd[1], (const void*) gates})
         cudaFree(const_cast<void*>(p));
     for (Out& x : o) {
         for (void* p : {(void*) x.h, (void*) x.gate, (void*) x.beta, (void*) x.qkv, (void*) x.y, (void*) x.y16, x.yq}) cudaFree(p);
