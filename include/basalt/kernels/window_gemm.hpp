@@ -15,7 +15,7 @@
 
 namespace basalt::kernels::wgemm {
 
-constexpr int kRows = 16;   // rows a window holds
+constexpr int kRows = 32;   // rows (columns of the product) a call takes: a window's 16, or two batched slots' blocks
 
 enum class Format {
     F8,      // E4M3 codes [rows][K]

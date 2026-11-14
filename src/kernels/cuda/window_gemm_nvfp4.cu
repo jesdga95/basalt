@@ -8,13 +8,15 @@ constexpr int F = (int) Format::Nvfp4, CH = 256, ST = 4, MW = 1;
 }
 
 const Kernel& nvfp4(int nt) {
-    static const Kernel k1 = make_kernel<F, 64, 1, CH, ST, 1, MW>(), k2 = make_kernel<F, 64, 1, CH, ST, 2, MW>();
-    return nt > 1 ? k2 : k1;
+    static const Kernel k1 = make_kernel<F, 64, 1, CH, ST, 1, MW>(), k2 = make_kernel<F, 64, 1, CH, ST, 2, MW>(),
+                        k4 = make_kernel<F, 64, 1, CH, ST, 4, MW>();
+    return nt > 2 ? k4 : nt > 1 ? k2 : k1;
 }
 
 const Kernel& nvfp4_swiglu(int nt) {
-    static const Kernel k1 = make_kernel<F, 32, 2, CH, ST, 1, MW>(), k2 = make_kernel<F, 32, 2, CH, ST, 2, MW>();
-    return nt > 1 ? k2 : k1;
+    static const Kernel k1 = make_kernel<F, 32, 2, CH, ST, 1, MW>(), k2 = make_kernel<F, 32, 2, CH, ST, 2, MW>(),
+                        k4 = make_kernel<F, 32, 2, CH, ST, 4, MW>();
+    return nt > 2 ? k4 : nt > 1 ? k2 : k1;
 }
 
 }  // namespace basalt::kernels::wgemm::detail

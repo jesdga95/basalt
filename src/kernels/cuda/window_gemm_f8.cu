@@ -7,20 +7,23 @@ constexpr int F = (int) Format::F8, RS = 64, CH = 128, ST = 4, MW = 1;
 }
 
 const Kernel& f8(int nt) {
-    static const Kernel k1 = make_kernel<F, RS, 1, CH, ST, 1, MW>(), k2 = make_kernel<F, RS, 1, CH, ST, 2, MW>();
-    return nt > 1 ? k2 : k1;
+    static const Kernel k1 = make_kernel<F, RS, 1, CH, ST, 1, MW>(), k2 = make_kernel<F, RS, 1, CH, ST, 2, MW>(),
+                        k4 = make_kernel<F, RS, 1, CH, ST, 4, MW>();
+    return nt > 2 ? k4 : nt > 1 ? k2 : k1;
 }
 
 const Kernel& bf16(int nt) {
     constexpr int B = (int) Format::Bf16;
-    static const Kernel k1 = make_kernel<B, RS, 1, CH, ST, 1, MW>(), k2 = make_kernel<B, RS, 1, CH, ST, 2, MW>();
-    return nt > 1 ? k2 : k1;
+    static const Kernel k1 = make_kernel<B, RS, 1, CH, ST, 1, MW>(), k2 = make_kernel<B, RS, 1, CH, ST, 2, MW>(),
+                        k4 = make_kernel<B, RS, 1, CH, ST, 4, MW>();
+    return nt > 2 ? k4 : nt > 1 ? k2 : k1;
 }
 
 const Kernel& q8(int nt) {
     constexpr int Q = (int) Format::Q8;
-    static const Kernel k1 = make_kernel<Q, RS, 1, CH, ST, 1, MW>(), k2 = make_kernel<Q, RS, 1, CH, ST, 2, MW>();
-    return nt > 1 ? k2 : k1;
+    static const Kernel k1 = make_kernel<Q, RS, 1, CH, ST, 1, MW>(), k2 = make_kernel<Q, RS, 1, CH, ST, 2, MW>(),
+                        k4 = make_kernel<Q, RS, 1, CH, ST, 4, MW>();
+    return nt > 2 ? k4 : nt > 1 ? k2 : k1;
 }
 
 }  // namespace basalt::kernels::wgemm::detail
