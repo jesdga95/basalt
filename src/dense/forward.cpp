@@ -39,10 +39,10 @@ bool on_wg(int type) { return type == kTypeF8 || type == kTypeNvfp4Planes || typ
 // F8 and NVFP4 planes (their products apply it)
 const float* post_scale(const Linear& l) { return l.type == kTypeF8 || l.type == kTypeNvfp4Planes ? nullptr : l.scale; }
 int mmq_tile(int T) { return T <= kNarrow ? kNarrow : kBatch; }
-// the vocabulary rows the block drafter's head scores: the first kDraftVocab when the head is in planes, else all
+// the vocabulary rows the block drafter's head scores: the first kDraftVocab when the head is in planes or F8, else all
 int64_t draft_vocab(const Model& m) {
     const Linear& hd = m.w.head;
-    return hd.type == kTypeNvfp4Planes && hd.rows > kDraftVocab ? kDraftVocab : m.g.n_vocab;
+    return (hd.type == kTypeNvfp4Planes || hd.type == kTypeF8) && hd.rows > kDraftVocab ? kDraftVocab : m.g.n_vocab;
 }
 
 // rows 0..T-1 of x readied for products of `type`
@@ -111,7 +111,11 @@ wg::Call wcall(const Linear& l, wg::Epilogue epi = wg::Epilogue::Store) {
     c.epi = epi;
     return c;
 }
-wg::Matrix wmat(const Linear& l, float* y) { return {(const uint8_t*) l.w, l.rows, l.scale, y, l.rows}; }
+wg::Matrix wmat(const Linear& l, float* y) {
+    wg::Matrix w{(const uint8_t*) l.w, l.rows, l.scale, y, l.rows};
+    w.row_scales = l.row_scales;
+    return w;
+}
 
 // y [T][rows] = scale W x
 void prod(Model& m, const Linear& l, const void* xq, float* y, int T, cudaStream_t s) {
@@ -927,9 +931,11 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
     const int64_t nv = draft_vocab(m);
     const void* hq = wnorm(m, b.x, bd.norm, b.xn, m.w.head.type, H, R, bd.eps, s);
     if (nv < g.n_vocab) {
-        const Linear& hd = m.w.head;
+        const Linear& hd = m.w.head;   // its first nv rows: F8 rows (and their scales) lead; planes keep the whole scale plane
         wg::Call c = wcall(hd);
-        c.m[0] = {(const uint8_t*) hd.w, nv, hd.scale, b.hl, nv, (const uint8_t*) hd.w + kernels::nvfp4p::scale_offset(hd.rows, hd.cols)};
+        c.m[0] = wmat(hd, b.hl);
+        c.m[0].rows = c.m[0].ld_y = nv;
+        if (hd.type == kTypeNvfp4Planes) c.m[0].scales = (const uint8_t*) hd.w + kernels::nvfp4p::scale_offset(hd.rows, hd.cols);
         wg::gemm(c, hq, R, m.ws.w8, s);
     } else {
         prod(m, m.w.head, hq, b.hl, R, s);

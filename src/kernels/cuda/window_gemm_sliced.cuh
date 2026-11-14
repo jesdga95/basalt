@@ -141,6 +141,7 @@ __device__ __forceinline__ void sliced_stage(const Args& a, int tile, uint8_t* s
         }
     __syncthreads();
     const float sc = a.scale[mi] ? *a.scale[mi] : 1.0f;
+    const float* rsc = a.row_scales[mi];
     const int64_t ld = a.ld_y[mi];
     for (int e = threadIdx.x; e < T * 16; e += C::kThreads) {
         const int col = e >> 4, r = e & 15;
@@ -149,15 +150,16 @@ __device__ __forceinline__ void sliced_stage(const Args& a, int tile, uint8_t* s
         for (int w = 1; w < KW; ++w) sum += part[(w * C::kCols + col) * C::kPartStride + r];
         const int64_t row = row0 + r;
         if (row >= rows) continue;
+        const float scr = rsc ? rsc[row] : sc;
         if (a.epi == (int) Epilogue::AddBf16) {
             uint16_t* d16 = a.y16[mi] + col * ld + row;
             // the product rounded as Store leaves it (no fma into the add), then one add, one rounding
             *d16 = __bfloat16_as_ushort(
-                __float2bfloat16_rn(__fadd_rn(__bfloat162float(__ushort_as_bfloat16(*d16)), __fmul_rn(sum, sc))));
+                __float2bfloat16_rn(__fadd_rn(__bfloat162float(__ushort_as_bfloat16(*d16)), __fmul_rn(sum, scr))));
             continue;
         }
         float* dst = a.y[mi] + col * ld + row;
-        const float v = sum * sc;
+        const float v = sum * scr;
         if (a.epi == (int) Epilogue::Add) *dst += v;
         else *dst = v;
     }

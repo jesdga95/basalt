@@ -31,6 +31,7 @@ struct Args {
     const uint8_t* sp[kMaxMatrices];   // NVFP4 scale planes
     int64_t rows[kMaxMatrices];
     const float* scale[kMaxMatrices];
+    const float* row_scales[kMaxMatrices];   // F8: a scale per row, or null
     float* y[kMaxMatrices];
     uint16_t* y16[kMaxMatrices];
     int64_t ld_y[kMaxMatrices];
