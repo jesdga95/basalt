@@ -253,7 +253,7 @@ kernels::DecRecArgs gdn_args(Model& m, const Layer& L) {
     a.h_k = g.gdn_k_heads;
     a.h_v = g.gdn_v_heads;
     a.eps = g.eps;
-    a.early_trigger = false;
+    a.early_trigger = true;   // the out projection stages its weights while the recurrence runs
     a.gate_act = g.gdn_gate;
     return a;
 }
