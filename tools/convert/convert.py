@@ -43,10 +43,11 @@ From NVIDIA's DeepSeek-V4.1 NVFP4 checkpoint (a deepseek41 BASE; tools/convert/c
                      each is deleted once its tensors are written: the disk holds the pack and a shard or two
 
 From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoint_qwen35.py)
-  --checkpoint DIR   NVIDIA Model Optimizer's checkpoint of a Qwen3.5-family dense model (nvidia/Qwen3.8-27B-NVFP4): the
-                     NVFP4 MLP and head keep their codes and scales, the FP8 projections become Q8_0 of their values, the
-                     drafter's BF16 projections Q8_0, the vision tower an mmproj GGUF; tokenizer and metadata from the
-                     checkpoint's files. Everything comes from DIR.
+  --checkpoint DIR   an NVFP4 checkpoint of a Qwen3.5-family dense model, NVIDIA Model Optimizer's
+                     (nvidia/Qwen3.8-27B-NVFP4) or compressed-tensors' (QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4): NVFP4
+                     projections keep their codes and scales, FP8 ones their E4M3 codes, NVFP4 GDN a / b become BF16 of
+                     their values, a BF16 head is rounded to NVFP4 once, the drafter's BF16 projections Q8_0, the vision
+                     tower an mmproj GGUF; tokenizer and metadata from the checkpoint's files. Everything comes from DIR.
   --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
 
 Dense requantization
