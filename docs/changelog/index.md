@@ -4,6 +4,7 @@ Releases, newest first. Versions are 0.x: a minor release adds a model or anothe
 
 | Release | Date | Summary |
 | --- | --- | --- |
+| [0.4.0](0.4.0.md) | 2026-11-14 | Qwen3.8-27B, the first dense model: NVFP4 and FP8 from NVIDIA's checkpoint, the DFlash 2 drafter in windows of up to 16, batched slots; one checkpoint transfer for every model. |
 | [0.3.3](0.3.3.md) | 2026-11-12 | Answer now, logprobs, documents and video in messages, session-affinity slots, faster Flash-Next long prompts on one card, a DeepSeek NVFP4 pack, a container image, `--no-answer-room` becomes `--answer-room 0`. |
 | [0.3.2](0.3.2.md) | 2026-11-08 | Faster DeepSeek decode on two cards, release archives for Linux and Windows x64, an install that finds its files beside `bin/`. |
 | [0.3.1](0.3.1.md) | 2026-11-08 | DeepSeek FP8/FP4 attention caches, drafting in every slot, a shared peer-card prompt path, faster decode kernels, new packs, one RAM reserve for every model (`--ram-reserve-mib`). |
