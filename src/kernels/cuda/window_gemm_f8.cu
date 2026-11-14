@@ -1,5 +1,6 @@
 // src/kernels/cuda/window_gemm_f8.cu - the decode window products against FP8 E4M3 (window_gemm_sliced.cuh), BF16 and Q8
 // matrices (window_gemm.cuh).
+// Adapted from Infernix (Ian Ranson and contributors), Apache-2.0: see THIRD_PARTY_LICENSES.
 #include "window_gemm_kernels.hpp"
 #include "window_gemm_sliced.cuh"
 
