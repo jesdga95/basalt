@@ -112,7 +112,7 @@ public:
                 return false;
             w.layers.push_back(L);
         }
-        const bool want_block = req.draft && tensors_.count("dflash.fc.0.weight") && drafter_choice_ != "mtp";
+        const bool want_block = req.draft && tensors_.count("dflash.fc.0.weight");
         if (want_block && !block_drafter(gg, w.dflash, H, err)) return false;
         if (req.draft && !want_block && tensors_.count("mtp.fc.weight")) {   // the pack's drafter layer, for --spec
             dense::Mtp& d = w.mtp;
@@ -173,8 +173,6 @@ public:
         model_ = dense::make_model(g, w, o, err);
         return model_ != nullptr;
     }
-
-    std::string drafter_choice_;   // --diag-drafter: mtp or block (empty: the pack's block drafter when it has one)
 
 private:
     // the pack's DFlash 2 block drafter (dflash.* tensors, qwen35.dflash.* metadata)
@@ -370,7 +368,6 @@ public:
     model::Result load(const model::LoadRequest& req, std::unique_ptr<model::LoadedModel>& out) const override {
         if (req.paths.empty()) return {model::Status::Error, "qwen35: no model path"};
         auto m = std::make_unique<Loaded>();
-        m->drafter_choice_ = drafter_choice();
         std::string err;
         if (!m->load(req, err)) return {model::Status::Error, err};
         out = std::move(m);
@@ -386,7 +383,6 @@ public:
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         (void) code;
         if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
-        else if (a == "--diag-drafter") { drafter_choice() = args.next("--diag-drafter"); }
         else if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
@@ -418,11 +414,6 @@ public:
     }
 
 private:
-    // diagnostic: --diag-drafter mtp runs the MTP layer where the pack also has a block drafter (A/B only)
-    static std::string& drafter_choice() {
-        static std::string c;
-        return c;
-    }
     static constexpr int kDefaultSpec = 16;
     static bool has_drafter(const std::string& path) {
         core::ModelFile file;
