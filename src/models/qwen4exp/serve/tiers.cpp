@@ -274,6 +274,7 @@ bool QfnRuntime::adapt() {
         return ok;
     };
     if (!resident_spare_swaps(src, host_res, g.n_expert, swaps, copy_back, wait_copies, pending_spare)) return false;
+    if (!swaps.empty()) ver.dm_link_busy(adapt_stream, true);
     bool main_live = false;
     for (const Swap& s : swaps) {
         const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
@@ -297,7 +298,10 @@ bool QfnRuntime::adapt() {
         pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
         if (peer.valid() && peer.has(s.layer, s.in)) promoted.push_back({s.layer, s.in, s.out});
     }
-    if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+    if (!swaps.empty()) {
+        ver.dm_link_busy(adapt_stream, false);
+        cudaEventRecord(adapt_ev, adapt_stream);
+    }
     (void) main_live;
     for (auto& st : stages)
         if (st->adapt_live) {
@@ -415,6 +419,7 @@ bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
     xq_swapped += (int64_t) xq.size();
     xq_noplace += (int64_t) n_noplace;
     if (!xq.empty()) {
+        ver.dm_link_busy(adapt_stream, true);   // until xq_advance has queued the copies into VRAM
         cudaEventRecord(adapt_ev, adapt_stream);
         xq_stage = 1;
     }
@@ -495,6 +500,7 @@ bool QfnRuntime::xq_advance(bool wait) {
                         basalt::log::warn("basalt serve", "the landed word's copy failed (layer %d): %s", (int) x.layer,
                                      cudaGetErrorString(cudaGetLastError()));
                 }
+                ver.dm_link_busy(adapt_stream, false);
                 cudaEventRecord(adapt_ev, adapt_stream);
             };
             // a copy from pageable RAM holds the calling thread until the copy runs, and a window launched ahead of it
@@ -504,6 +510,7 @@ bool QfnRuntime::xq_advance(bool wait) {
             else
                 copies();
         } else {
+            ver.dm_link_busy(adapt_stream, false);
             cudaEventRecord(adapt_ev, adapt_stream);
         }
         xq_stage = 2;

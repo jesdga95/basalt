@@ -199,6 +199,12 @@ bool Verifier::landed_need(uint32_t round, std::string& err) {
     return true;
 }
 
+void Verifier::dm_link_busy(cudaStream_t s, bool busy) {
+    if (dm_ == nullptr || dm_->stage_link == nullptr) return;
+    const OnDevice on_device(device_);
+    cudaMemsetAsync(dm_->stage_link, busy ? 1 : 0, 4, s);
+}
+
 bool Verifier::dm_fence(cudaStream_t s) {
     if (dm_ == nullptr) return true;
     const OnDevice on_device(device_);

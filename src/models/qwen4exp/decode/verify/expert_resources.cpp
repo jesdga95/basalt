@@ -194,15 +194,19 @@ bool Verifier::dm_init(std::string& err) {
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }
-    // The staged share: on one card, a batch window's layer with enough CPU misses sends some of them to CUDA0, copied
-    // over PCIe from their RAM copies into staging while the pool reads the rest.  An expert without a mapped RAM copy
-    // is never staged; the addresses are read again before a batch window when the source's places moved (a swap).
-    // The count staged for m misses balances the pool's time for the rest against the copy's, both reading host
-    // memory at once.
+    // The staged share: on one card, a window's layer with enough CPU misses sends some of them to CUDA0, copied over
+    // PCIe from their RAM copies into staging while the pool reads the rest.  An expert without a mapped RAM copy is
+    // never staged; the addresses are read again before a window when the source's places moved (a swap).  The count
+    // staged for m misses balances the pool's time for the rest against the copy's, both reading host memory at once.
+    // Layers whose blobs differ in size share one slot stride and one count table, both sized for the largest blob.
     bool stage = d->pdev < 0 && d->xp.empty() && lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
-                 warm_src_ != nullptr && staging_ != nullptr && warm_src_->pcie_layer(0) && lay.fmt[0].bytes % 16 == 0;
-    for (int64_t l = 1; stage && l < g.n_layers; ++l) stage = lay.fmt[(size_t) l].bytes == lay.fmt[0].bytes;
-    const int64_t blob = (int64_t) lay.fmt[0].bytes, stride = dec_moe_stage_stride(blob);
+                 warm_src_ != nullptr && staging_ != nullptr && warm_src_->pcie_layer(0);
+    int64_t blob = 0;
+    for (int64_t l = 0; stage && l < g.n_layers; ++l) {
+        stage = lay.fmt[(size_t) l].bytes % 16 == 0;
+        blob = std::max<int64_t>(blob, (int64_t) lay.fmt[(size_t) l].bytes);
+    }
+    const int64_t stride = dec_moe_stage_stride(blob);
     const int stage_slots =
         (int) std::min<int64_t>(kDmStageMax, (int64_t) (kStagingBlobs * (int64_t) lay.max_blob) / stride);
     if (stage && stage_slots >= 1) {
@@ -224,13 +228,15 @@ bool Verifier::dm_init(std::string& err) {
                    cudaMallocHost((void**) &d->stage_host, (size_t) LE * 8) == cudaSuccess &&
                    cudaMalloc((void**) &d->stage_k, kt.size() * 4) == cudaSuccess &&
                    cudaMemcpy(d->stage_k, kt.data(), kt.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+                   cudaMalloc((void**) &d->stage_link, 8) == cudaSuccess &&
+                   cudaMemset(d->stage_link, 0, 8) == cudaSuccess &&
                    cudaDeviceGetStreamPriorityRange(&st_least, &st_greatest) == cudaSuccess &&
                    cudaStreamCreateWithPriority(&d->st_s, cudaStreamNonBlocking, st_greatest) == cudaSuccess &&
                    cudaEventCreateWithFlags(&d->st_fork, cudaEventDisableTiming) == cudaSuccess &&
                    cudaEventCreateWithFlags(&d->st_join, cudaEventDisableTiming) == cudaSuccess;
         if (!sok) { err = "verify: the staged share's buffers"; return false; }
         std::memset(d->stage_host, 0, (size_t) LE * 8);
-        d->stage_gen = warm_src_->places_generation() + 1;   // read at the first batch window
+        d->stage_gen = warm_src_->places_generation() + 1;   // read at the first window
         d->stage_stride = stride;
         d->stage_blocks = 8;
         d->stage_min = 1;
@@ -243,6 +249,9 @@ bool Verifier::dm_init(std::string& err) {
         served += ")";
     }
     basalt::log::info("basalt verify", "the MoE tail planned on the device%s", served.c_str());
+    if (d->stage_src != nullptr)
+        basalt::log::info("basalt verify", "a layer with %d+ CPU misses sends a share of them over PCIe to CUDA0",
+                          d->stage_min);
     if (d->warm != nullptr)
         basalt::log::info("basalt verify", "the CPU pool warms its likeliest next-layer expert between doorbells");
     return true;
@@ -280,7 +289,7 @@ void Verifier::dm_free() {
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
                     (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed,
-                    (void*) d->stage_src, (void*) d->stage_k, (void*) d->route_counts})
+                    (void*) d->stage_src, (void*) d->stage_k, (void*) d->stage_link, (void*) d->route_counts})
         if (p) cudaFree(p);
     if (d->stage_host) cudaFreeHost(d->stage_host);
     if (d->pin) cudaFreeHost(d->pin);

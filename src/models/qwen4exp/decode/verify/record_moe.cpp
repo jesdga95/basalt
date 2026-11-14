@@ -122,7 +122,7 @@ bool Verifier::WindowRecorder::post(int64_t l) {
             native_expert_grouped(L, P->ptr, P->start, P->counts, P->dst, P->tok, cap, cap,
                                   v_.nat_xq_, v_.hit_scratch_, parts_out, cs);
         }
-        if (v_.dm_->stage_src != nullptr && v_.batch_rec_) {   // the staged share, once its copy is in staging
+        if (v_.dm_->stage_src != nullptr) {   // the staged share, once its copy is in staging
             cudaStreamWaitEvent(cs, v_.dm_->st_join, 0);
             PdlScope pst(false);
             native_expert_grouped(L, P->sptr, P->sstart, P->scounts, P->sdst, P->stok, cap, cap, v_.nat_xq_,
