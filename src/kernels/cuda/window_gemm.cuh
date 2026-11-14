@@ -16,6 +16,7 @@
 // see THIRD_PARTY_LICENSES): weights staged before the PDL wait, dependents started once the weights are read.
 #pragma once
 
+#include "basalt/kernels/narrow_bf16.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 
@@ -81,32 +82,6 @@ __device__ __forceinline__ void mma(float (&d)[4], unsigned a0, unsigned a1, uns
                  "{%0, %1, %2, %3};"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-// two E4M3 bytes (the low 16 bits of x, the low byte the lower half) as bf16x2 (exact)
-__device__ __forceinline__ unsigned e4m3x2_f16(unsigned x) {
-    unsigned h;
-    const unsigned short v = (unsigned short) x;
-    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"(v));
-    return h;
-}
-// the four bytes of w, each two E2M1 codes (the low nibble the lower half), as bf16x2 times the bf16x2 scale sc (exact:
-// a code times a UE4M3 scale has at most five significant bits)
-__device__ __forceinline__ void e2m1x8_f16(unsigned w, unsigned sc, unsigned (&h)[4]) {
-    asm("{\n"
-        ".reg .b8 b0, b1, b2, b3;\n"
-        ".reg .b32 t0, t1, t2, t3;\n"
-        "mov.b32 {b0, b1, b2, b3}, %4;\n"
-        "cvt.rn.bf16x2.e2m1x2 t0, b0;\n"
-        "cvt.rn.bf16x2.e2m1x2 t1, b1;\n"
-        "cvt.rn.bf16x2.e2m1x2 t2, b2;\n"
-        "cvt.rn.bf16x2.e2m1x2 t3, b3;\n"
-        "mul.rn.bf16x2 %0, t0, %5;\n"
-        "mul.rn.bf16x2 %1, t1, %5;\n"
-        "mul.rn.bf16x2 %2, t2, %5;\n"
-        "mul.rn.bf16x2 %3, t3, %5;\n"
-        "}\n"
-        : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
-        : "r"(w), "r"(sc));
 }
 // two int8 (the low 16 bits of x, the low byte the lower half) as bf16x2, exact
 __device__ __forceinline__ unsigned s8x2_bf16(unsigned x) {
@@ -304,12 +279,12 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                         const uint8_t* ss = sm + RS * C::CB + b * RS * 4;
                         const unsigned s0 = ss[(r0l & 31) * C::kScalePiece + (r0l >> 5) * 4 + c];
                         const unsigned s1 = ss[(r1l & 31) * C::kScalePiece + (r1l >> 5) * 4 + c];
-                        const unsigned sc0 = e4m3x2_f16(s0 | (s0 << 8)), sc1 = e4m3x2_f16(s1 | (s1 << 8));
+                        const unsigned sc0 = e4m3x2_bf16x2(s0 | (s0 << 8)), sc1 = e4m3x2_bf16x2(s1 | (s1 << 8));
                         unsigned h0[8], h1[8];
-                        e2m1x8_f16(w0.x, sc0, *reinterpret_cast<unsigned(*)[4]>(h0));
-                        e2m1x8_f16(w0.y, sc0, *reinterpret_cast<unsigned(*)[4]>(h0 + 4));
-                        e2m1x8_f16(w1.x, sc1, *reinterpret_cast<unsigned(*)[4]>(h1));
-                        e2m1x8_f16(w1.y, sc1, *reinterpret_cast<unsigned(*)[4]>(h1 + 4));
+                        e2m1x8_bf16x2_scaled(w0.x, sc0, *reinterpret_cast<unsigned(*)[4]>(h0));
+                        e2m1x8_bf16x2_scaled(w0.y, sc0, *reinterpret_cast<unsigned(*)[4]>(h0 + 4));
+                        e2m1x8_bf16x2_scaled(w1.x, sc1, *reinterpret_cast<unsigned(*)[4]>(h1));
+                        e2m1x8_bf16x2_scaled(w1.y, sc1, *reinterpret_cast<unsigned(*)[4]>(h1 + 4));
 #pragma unroll
                         for (int s = 0; s < 4; ++s) {
                             a0[s] = h0[2 * s];
