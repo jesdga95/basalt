@@ -1,6 +1,7 @@
 # GPUs
 
-Flash-Next uses every mechanism on this page. DeepSeek takes one second card as an expert tier and nothing else.
+Flash-Next uses every mechanism on this page. DeepSeek takes up to four second cards as expert tiers and nothing else, each
+holding the experts of its own block of layers ([DeepSeek memory](../models/deepseek41.md#memory)).
 Qwen3.8-27B uses a second card for long prompts only.
 
 One setting picks the cards: `gpu`. It means the same in the server (`"gpu"` in the config's `server` section, or

@@ -16,7 +16,9 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
 ## Memory
 
 - **Start:** experts are dealt out in routing order and loaded once per start, the same way on one card and two. A second card
-  (`--gpu 0,1`) holds experts nowhere else has; one second card is used, later cards idle. When RAM cannot take the rest, the main
+  (`--gpu 0,1`) holds experts nowhere else has. With several (`--gpu 0,1,2,3`, up to four after the main card) each holds the
+  second-card experts of one contiguous block of layers, the blocks sized to each card's free memory so that every layer keeps
+  the same number of second-card slots; a sixth card and later ones idle. When RAM cannot take the rest, the main
   card holds the most routed ones too (homes, sized to stay through a prompt at the full context); then RAM, most routed first; the
   rest are read from the pack by the CPU. When RAM takes them all, the main card's slots copy the RAM tier's head instead. Either way
   the main card fills the rest of its memory with copies, down to what a short prompt needs. The start line
@@ -47,9 +49,9 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
 - Chunks are 16,384 tokens, halved down to 256 to fit memory.
 - A read of more than 2,048 tokens gives back the copies the main card grew into its spare memory; from 4,096 tokens, a main card
   without homes gives back all its slots. Afterwards the grown copies reopen from routing order, the other slots empty.
-- With a second card, each layer of a chunk splits its experts: the second card computes its own and a share of the RAM ones,
-  read over its own PCIe link, while the main card computes the rest; the share is priced from each card's link and SM clock.
-  Its prompt buffers come out of the second card's memory before its slots are sized.
+- With a second card, each layer of a chunk splits its experts: the card holding that layer computes its own and a share of the
+  RAM ones, read over its own PCIe link, while the main card computes the rest; the share is priced from each card's link and SM
+  clock. Each second card's prompt buffers come out of its own memory before its slots are sized.
 - `--no-prompt-skip` runs every row through every layer. Without it, rows further than 2,668 positions from the read's end stop
   at layer 20 (the math is the same; rounding differs; [precision](../precision/deepseek41.md#prompt-skip)).
 - A next turn that starts with the held tokens (or the checkpoint) reads only the new tail. `pp=N/Mc` in the `done` line shows how many
