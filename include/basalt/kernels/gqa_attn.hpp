@@ -41,6 +41,20 @@ void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
                      uint16_t* gated16 = nullptr);
 /// (gate_q, gated16: also each head's output times sigmoid of its gate, q_full [T][n_head][512]'s second half, as bf16
 /// rows [T][n_head * 256] into gated16 (bitwise attn_gate, then rounded); `out` may then be null.)
+/// One window of each of several sequences (a batch window's segments) in one launch: segment k's rows follow segment
+/// k - 1's in q, out, gate_q and gated16, with its own cache and position; every row is what gqa_decode_attn of its
+/// segment alone gives.  At most kGqaMaxWindow rows in all.
+struct GqaSeg {
+    int T = 0;
+    const uint16_t* k_cache = nullptr;
+    const uint16_t* v_cache = nullptr;
+    int64_t pos0 = 0;
+    const int32_t* pos_dev = nullptr;
+    KvInt8 q8 = {};
+};
+void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* segs, int n_seg, float* scratch,
+                          int64_t max_cells, float* out, void* stream, const float* gate_q = nullptr,
+                          uint16_t* gated16 = nullptr);
 /// gqa_decode_attn for a block drafter's rows: head width 128 or 256, row t at position pos0 + t sees positions
 /// [pos0 + t - window + 1, hi) (not causal), position p in cache cell p % cap.
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,

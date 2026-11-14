@@ -43,6 +43,25 @@ struct Range {
     const int32_t* pos_dev = nullptr;   // pos0 read from the device (a captured window)
 };
 __device__ __forceinline__ int64_t row_pos0(const Range& r) { return r.pos_dev ? (int64_t) *r.pos_dev : r.pos0; }
+
+// The windows one launch takes: segment k is rows [row0[k], row0[k + 1]) of q, the partials and the output, its 16-row
+// tiles of (row, head) pairs [tile0[k], tile0[k + 1]) of the grid, with its own cache and range.  Each block and each
+// merged row computes exactly what a launch of its segment alone would.
+constexpr int kMaxSegs = kGqaMaxWindow;
+struct DecSegs {
+    int n = 1;
+    int row0[kMaxSegs + 1] = {};
+    int tile0[kMaxSegs + 1] = {};
+    const __half* kc[kMaxSegs] = {};
+    const __half* vc[kMaxSegs] = {};
+    KvInt8 q8[kMaxSegs] = {};
+    Range r[kMaxSegs];
+};
+__device__ __forceinline__ int seg_of(const int* first, int n, int i) {
+    int k = 0;
+    while (k + 1 < n && i >= first[k + 1]) ++k;
+    return k;
+}
 __device__ __forceinline__ int64_t row_hi(const Range& r, int t) { return r.causal ? row_pos0(r) + t + 1 : r.hi; }
 __device__ __forceinline__ int64_t row_lo(const Range& r, int t) {
     return r.window > 0 ? max((int64_t) 0, row_pos0(r) + t - r.window + 1) : 0;
@@ -53,11 +72,13 @@ __device__ __forceinline__ int64_t row_lo(const Range& r, int t) {
 // split that holds one of its cells; the sums and their order are those of the full loop.
 template <int HD>
 __global__ void __launch_bounds__(HD) decode_merge_kernel(const float* part, int n_head, int gx, float* out, const float* gate_q,
-                                                          uint16_t* gated16, Range r) {
+                                                          uint16_t* gated16, const DecSegs segs) {
     pdl_launch_dependents();
     pdl_wait();
-    const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-    const float* p = part + ((int64_t) t * n_head + h) * gx * (HD + 2);
+    const int h = blockIdx.x, row = blockIdx.y, d = threadIdx.x;   // row: of the launch, t: of its segment
+    const int k = seg_of(segs.row0, segs.n, row), t = row - segs.row0[k];
+    const Range& r = segs.r[k];
+    const float* p = part + ((int64_t) row * n_head + h) * gx * (HD + 2);
     const int64_t chunks = (row_hi(r, t) + CHUNK - 1) / CHUNK - r.base;   // the row's chunks from the first split's
     const int used = (int) max((int64_t) 1, min((int64_t) gx, chunks));
     float m = kNeg;
@@ -70,10 +91,10 @@ __global__ void __launch_bounds__(HD) decode_merge_kernel(const float* part, int
         a = fmaf(pb[2 + d], w, a);
     }
     const float o = a / l;
-    const int64_t i = ((int64_t) t * n_head + h) * HD + d;
+    const int64_t i = ((int64_t) row * n_head + h) * HD + d;
     if (out) out[i] = o;
     if (gated16) {
-        const float g = gate_q[((int64_t) t * n_head + h) * 2 * HD + HD + d];
+        const float g = gate_q[((int64_t) row * n_head + h) * 2 * HD + HD + d];
         gated16[i] = __bfloat16_as_ushort(__float2bfloat16_rn(o / (1.0f + expf(-g))));
     }
 }
@@ -127,8 +148,8 @@ __device__ __forceinline__ void ldsm_x2_t(unsigned& r0, unsigned& r1, const void
 // positions and the splits the capacity, so a row's bits are the same at any window width.
 template <int HD>
 // (launched through launch_pdl: q and the cache come from the kernels before, read after pdl_wait, so not __restrict__)
-__global__ void __launch_bounds__(128) decode_mma_kernel(const float* q, const __half* kc, const __half* vc, int n_head, int n_kv,
-                                                         Range r, int n_chunks, float scale, float* part, KvInt8 q8, int T) {
+__global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int n_head, int n_kv, const DecSegs segs, int n_chunks,
+                                                         float scale, float* part_all) {
     constexpr int LD = HD + 8;          // padded rows (halves): ldmatrix without bank conflicts
     constexpr int NT = HD / 32;         // P V: a warp's 8-dim tiles
     __shared__ __align__(16) __half qs[16][LD];
@@ -140,7 +161,15 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q, const _
     __shared__ int64_t rlo[16], rhi[16];
     pdl_launch_dependents();
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
-    const int kvh = blockIdx.y, gx = gridDim.x, G = n_head / n_kv, M = T * G, m0 = blockIdx.z * 16;
+    const int kvh = blockIdx.y, gx = gridDim.x, G = n_head / n_kv;
+    const int sk = seg_of(segs.tile0, segs.n, (int) blockIdx.z), row0 = segs.row0[sk], T = segs.row0[sk + 1] - row0;
+    const Range r = segs.r[sk];
+    const __half* kc = segs.kc[sk];
+    const __half* vc = segs.vc[sk];
+    const KvInt8 q8 = segs.q8[sk];
+    const float* q = q_all + (int64_t) row0 * n_head * HD;
+    float* part = part_all + (int64_t) row0 * n_head * gx * (HD + 2);
+    const int M = T * G, m0 = ((int) blockIdx.z - segs.tile0[sk]) * 16;
     // the chunk's cells [from, to) of K and V as fp16 (int8: code x scale), zero past the last row's cells
     const auto load_kv = [&](int64_t c0, int64_t hi_max, int from, int to) {
         const int64_t cell0 = c0 % r.cap;
@@ -293,19 +322,33 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q, const _
     }
 }
 
+// segs.n and segs.row0 set: the tiles from the rows, then both kernels over every segment
+template <int HD>
+void launch_segs(const float* q, int n_head, int n_kv, DecSegs& segs, float* scratch, int n_chunks, float* out, cudaStream_t s,
+                 const float* gate_q = nullptr, uint16_t* gated16 = nullptr) {
+    const float scale = 1.4426950408889634f / sqrtf((float) HD);
+    const int gx = decode_splits(n_chunks);
+    for (int k = 0; k < segs.n; ++k)
+        segs.tile0[k + 1] = segs.tile0[k] + ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16;
+    launch_pdl(decode_mma_kernel<HD>, dim3((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]), dim3(128), 0, s, q,
+               n_head, n_kv, segs, n_chunks, scale, scratch);
+    check("gqa decode attention");
+    launch_pdl(decode_merge_kernel<HD>, dim3((unsigned) n_head, (unsigned) segs.row0[segs.n]), dim3(HD), 0, s,
+               (const float*) scratch, n_head, gx, out, gate_q, gated16, segs);
+    check("gqa decode attention/merge");
+}
+
 template <int HD>
 void launch_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_kv, const Range& r, int T,
                    float* scratch, int n_chunks, float* out, cudaStream_t s, KvInt8 q8 = {}, const float* gate_q = nullptr,
                    uint16_t* gated16 = nullptr) {
-    const float scale = 1.4426950408889634f / sqrtf((float) HD);
-    const int gx = decode_splits(n_chunks);
-    const int tiles = (T * (n_head / n_kv) + 15) / 16;
-    launch_pdl(decode_mma_kernel<HD>, dim3((unsigned) gx, (unsigned) n_kv, (unsigned) tiles), dim3(128), 0, s, q,
-               (const __half*) kc, (const __half*) vc, n_head, n_kv, r, n_chunks, scale, scratch, q8, T);
-    check("gqa decode attention");
-    launch_pdl(decode_merge_kernel<HD>, dim3((unsigned) n_head, (unsigned) T), dim3(HD), 0, s, (const float*) scratch, n_head, gx,
-               out, gate_q, gated16, r);
-    check("gqa decode attention/merge");
+    DecSegs segs;
+    segs.row0[1] = T;
+    segs.kc[0] = (const __half*) kc;
+    segs.vc[0] = (const __half*) vc;
+    segs.q8[0] = q8;
+    segs.r[0] = r;
+    launch_segs<HD>(q, n_head, n_kv, segs, scratch, n_chunks, out, s, gate_q, gated16);
 }
 
 __device__ __forceinline__ void mma16832_u8s8(int (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
@@ -898,6 +941,32 @@ void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
     r.pos_dev = pos_dev;
     const int n_chunks = (int) ((max_cells + CHUNK - 1) / CHUNK);
     launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream, q8, gate_q, gated16);
+}
+
+void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* segs, int n_seg, float* scratch,
+                          int64_t max_cells, float* out, void* stream, const float* gate_q, uint16_t* gated16) {
+    if (n_seg < 1 || n_seg > kMaxSegs || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX) {
+        basalt::log::error("basalt", "gqa_decode_attn_segs: invalid arguments");
+        std::exit(1);
+    }
+    DecSegs d;
+    d.n = n_seg;
+    for (int k = 0; k < n_seg; ++k) {
+        const GqaSeg& g = segs[k];
+        if (g.T < 1 || g.pos0 + g.T > max_cells || d.row0[k] + g.T > kGqaMaxWindow) {
+            basalt::log::error("basalt", "gqa_decode_attn_segs: invalid segment");
+            std::exit(1);
+        }
+        d.row0[k + 1] = d.row0[k] + g.T;
+        d.kc[k] = (const __half*) g.k_cache;
+        d.vc[k] = (const __half*) g.v_cache;
+        d.q8[k] = g.q8;
+        d.r[k].pos0 = g.pos0;
+        d.r[k].cap = max_cells;
+        d.r[k].pos_dev = g.pos_dev;
+    }
+    const int n_chunks = (int) ((max_cells + CHUNK - 1) / CHUNK);
+    launch_segs<256>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream, gate_q, gated16);
 }
 
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
