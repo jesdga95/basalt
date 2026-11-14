@@ -64,21 +64,21 @@ before both, with `--kv fp16`.
 | Earlier pack: projections Q8_0 of the FP8 values, MLP int8 below 1,024 rows | 6.7889 | 0.0213 | 0.0118 | 0.178 | 92.93% |
 
 QUASAR's checkpoint ([model file](../model-file.md#qwen38-27b-pack): every projection NVFP4, quantization-aware trained),
-same gate and build: its GDN and attention projections run as the MLP does (NVFP4 planes, W4A4 in prompt chunks with FP32
-rows between the GDN and attention steps, bf16 rows in decode windows); the GDN a / b projections are BF16 of its NVFP4
+same gate and build: its GDN and attention projections run as the MLP does (NVFP4 planes, W4A4 in prompt chunks with BF16
+rows between the GDN and attention steps as on F8, bf16 rows in decode windows); the GDN a / b projections are BF16 of its NVFP4
 values; the head is its BF16 head rounded to NVFP4 by the converter (squared error 7% under NVIDIA's NVFP4 head of the same
 BF16 tensor).
 
 | Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
 |---|---:|---:|---:|---:|---:|
-| QUASAR, every projection NVFP4, `--kv fp16` | 6.8586 | 0.0314 | 0.0169 | 0.272 | 91.78% |
-| The same, `--kv int8` | 6.8640 | 0.0309 | 0.0169 | 0.271 | 91.82% |
-| The head as FP8 rows (`--head fp8`), `--kv fp16` | 6.8348 | 0.0264 | 0.0119 | 0.258 | 92.72% |
-| The same, `--kv int8` | 6.8410 | 0.0259 | 0.0119 | 0.257 | 92.90% |
-| Reference (a converter experiment): the head Q8_0, near its BF16 values, `--kv fp16` | 6.8335 | 0.0256 | 0.0111 | 0.257 | 93.13% |
+| QUASAR, every projection NVFP4, `--kv fp16` | 6.8622 | 0.0312 | 0.0168 | 0.265 | 91.83% |
+| The same, `--kv int8` | 6.8498 | 0.0308 | 0.0168 | 0.267 | 91.87% |
+| The head as FP8 rows (`--head fp8`), `--kv fp16` | 6.8388 | 0.0262 | 0.0119 | 0.252 | 92.82% |
+| The same, `--kv int8` | 6.8260 | 0.0259 | 0.0118 | 0.252 | 92.89% |
+| Reference (a converter experiment, FP32 prompt rows): the head Q8_0, near its BF16 values, `--kv fp16` | 6.8335 | 0.0256 | 0.0111 | 0.257 | 93.13% |
 
 The head carries most of the gap to NVIDIA's pack: rounding QUASAR's BF16 head to NVFP4 costs KLD 0.0058 over a Q8_0
-head, and FP8 rows (an FP32 scale per row) win back 0.0050 of it. What remains (0.0256 against 0.0239) is the body.
+head, and FP8 rows (an FP32 scale per row) win back most of it. What remains (about 0.026 against 0.0239) is the body.
 
 The F8 projections hold NVIDIA's values exactly but read prompt rows in E4M3 (one scale per row) where the Q8_0 pack read
 them in q8_1 (one scale per 32): perplexity 6.7889 -> 6.7850, KLD 0.0213 -> 0.0214, top-1 92.93 -> 92.87%.
