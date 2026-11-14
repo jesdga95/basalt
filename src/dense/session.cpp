@@ -200,7 +200,7 @@ public:
         for (int i = 0; i < count; ++i) {
             ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
             if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return fail(m_.o.arch + ": a draft batch of sessions of another model");
-            if (Result r = ss[(size_t) i]->settle(pos[i]); !r.ok()) return r;
+            if (Result r = ss[(size_t) i]->settle(pos[i], true); !r.ok()) return r;   // its commit beside the rest
             if (cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
         }
         if (!done_ && cudaEventCreateWithFlags(&done_, cudaEventDisableTiming) != cudaSuccess) return fail(m_.o.arch + ": no event");
@@ -224,6 +224,7 @@ public:
         }
         cudaEventRecord(done_, s0);
         for (int i = 1; i < count; ++i) cudaStreamWaitEvent(sts[(size_t) i]->stream, done_, 0);
+        for (int i = 0; i < count; ++i) ss[(size_t) i]->join_commit();   // the sessions' commits ran side by side
         for (int i = 0; i < count; ++i) ss[(size_t) i]->n_draft_ = std::min(nn[(size_t) i], width[(size_t) i] - 1);
         return {};
     }
@@ -297,7 +298,8 @@ public:
         }
         if (rows > kBatch) return fail(m_.o.arch + ": a batch of " + std::to_string(rows) + " rows");
         for (int i = 0; i < n; ++i)
-            if (Result s = ss[(size_t) i]->settle(reqs[i].pos); !s.ok()) return s;
+            if (Result s = ss[(size_t) i]->settle(reqs[i].pos, true); !s.ok()) return s;   // the commits run side by side
+        for (int i = 0; i < n; ++i) ss[(size_t) i]->join_commit();
         for (int i = 0; i < n; ++i)
             if (cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
         std::string err;
