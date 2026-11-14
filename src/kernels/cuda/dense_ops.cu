@@ -2,6 +2,7 @@
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "philox.cuh"
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -362,10 +363,12 @@ __global__ void dyn_conv2_kernel(const float* x, const float* dyn, int64_t ld_dy
 
 // One block of `rank` threads walks the positions: the predecessor's row times h into shared memory, then each warp
 // scores its candidates (a warp sum over the rank), then one thread picks.  Two barriers a position.
+// The pick: the best score (temperature <= 0), or a draw from softmax(score / temperature) on Philox's draft stream at
+// (seed, pos0 + position).  q gets that softmax (one-hot at the best for an argmax pick), conf the best entry's share.
 __global__ void candidate_path_kernel(const float* __restrict__ lp_rows, int stride, int top, const float* __restrict__ h,
                                       const uint16_t* __restrict__ pred, const uint16_t* __restrict__ succ, int rank,
                                       const int32_t* __restrict__ anchor, int n, int32_t* __restrict__ ids,
-                                      float* __restrict__ conf) {
+                                      float* __restrict__ conf, CandidateDraw draw) {
     extern __shared__ float ph[];   // [rank]
     __shared__ float score[64];
     __shared__ int32_t prev_s;
@@ -392,7 +395,26 @@ __global__ void candidate_path_kernel(const float* __restrict__ lp_rows, int str
                 if (score[k] > score[best]) best = k;
             float z = 0.0f;
             for (int k = 0; k < top; ++k) z += expf(score[k] - score[best]);
-            const int32_t id = __float_as_int(row[2 + 2 * best]);
+            int pick = best;
+            if (draw.temperature > 0.0f) {
+                const float inv_t = 1.0f / draw.temperature;
+                float zt = 0.0f;
+                for (int k = 0; k < top; ++k) zt += expf((score[k] - score[best]) * inv_t);
+                const float u = philox_uniform(draw.seed, (uint64_t) (draw.pos0 + p), kPhiloxDraft) * zt;
+                float cum = 0.0f;
+                bool found = false;
+                for (int k = 0; k < top; ++k) {
+                    const float e = expf((score[k] - score[best]) * inv_t);
+                    if (draw.q_p) draw.q_p[(size_t) p * top + k] = e / zt;
+                    cum += e;
+                    if (!found && u < cum) { pick = k; found = true; }
+                }
+            } else if (draw.q_p) {
+                for (int k = 0; k < top; ++k) draw.q_p[(size_t) p * top + k] = k == best ? 1.0f : 0.0f;
+            }
+            if (draw.q_ids)
+                for (int k = 0; k < top; ++k) draw.q_ids[(size_t) p * top + k] = __float_as_int(row[2 + 2 * k]);
+            const int32_t id = __float_as_int(row[2 + 2 * pick]);
             ids[p] = id;
             conf[p] = 1.0f / z;
             prev_s = id;
@@ -602,13 +624,13 @@ void dyn_conv2(const float* x, const float* dyn, int64_t ld_dyn, const float* ba
 }
 
 void candidate_path(const float* lp_rows, int stride, int top, const float* h, const uint16_t* pred, const uint16_t* succ,
-                    int rank, const int32_t* anchor, int n, int32_t* ids, float* conf, void* stream) {
+                    int rank, const int32_t* anchor, int n, int32_t* ids, float* conf, const CandidateDraw& draw, void* stream) {
     if (n <= 0) return;
     if (top > 64 || rank % 32 || rank > 1024) {
         basalt::log::error("basalt", "candidate_path: %d candidates of rank %d", top, rank);
         std::exit(1);
     }
-    candidate_path_kernel<<<1, rank, (size_t) rank * sizeof(float), (cudaStream_t) stream>>>(lp_rows, stride, top, h, pred, succ, rank, anchor, n, ids, conf);
+    candidate_path_kernel<<<1, rank, (size_t) rank * sizeof(float), (cudaStream_t) stream>>>(lp_rows, stride, top, h, pred, succ, rank, anchor, n, ids, conf, draw);
     check("candidate_path");
 }
 

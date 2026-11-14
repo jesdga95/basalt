@@ -946,8 +946,14 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
         const size_t q0 = (size_t) r0[k];
         const int B = widths[k];
         kernels::row_logprobs(b.hl + (q0 + 1) * nv, B - 1, nv, b.tok + q0 + 1, bd.top_k, b.blp, b.lp_scratch, s);
+        kernels::CandidateDraw draw;
+        draw.temperature = sts[k]->dtemp;
+        draw.seed = sts[k]->dseed;
+        draw.pos0 = pos[k] + 1;
+        draw.q_ids = sts[k]->dq_ids;
+        draw.q_p = sts[k]->dq_p;
         kernels::candidate_path(b.blp, kernels::kLogprobStride, bd.top_k, b.bsel + (q0 + 1) * bd.rank, bd.pred, bd.succ, bd.rank,
-                                sts[k]->win_tok, B - 1, sts[k]->dids, sts[k]->dconf, s);
+                                sts[k]->win_tok, B - 1, sts[k]->dids, sts[k]->dconf, draw, s);
     }
     return cuda_ok("block drafter", err);
 }

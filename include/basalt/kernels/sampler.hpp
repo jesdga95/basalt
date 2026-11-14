@@ -38,6 +38,10 @@ struct SamplerParams {
     // probability min(1, p(d) / q(d)) and otherwise draws from max(p - q, 0) renormalized: its token has the row's
     // distribution p exactly and is the draft whenever the draft is kept.  The sampled path's narrow lists only (64 or
     // fewer); the greedy path ignores them.
+    // The request lets its drafter draw drafts for the rows above.  The reply then has the model's distribution, but which
+    // tokens come out depends on the windows the draft policy picked, so a request that fixes its seed (a reproducible
+    // reply) leaves this off and its drafts are kept only where the row's own draw is the draft.
+    bool draw_drafts = false;
     const int* drafts = nullptr;
     const int* q_ids = nullptr;
     const float* q_p = nullptr;

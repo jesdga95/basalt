@@ -22,6 +22,7 @@ namespace basalt::dense {
 constexpr int kWindow = 16;       // rows one session's decode window holds
 constexpr int kBatch = 16;        // rows a batch window (several sessions' windows) holds
 constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
+constexpr int kDraftQ = 20;       // candidates a block drafter's position keeps at most (its selector's top_k)
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
 constexpr int kChunk = 4096;      // tokens a prompt chunk reads at once
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
@@ -172,12 +173,17 @@ struct SessionState {
     int32_t* win_tok = nullptr;                  // the last window's tokens (device)
     int64_t tail_cell = -1;
     // the block drafter: its context K/V per layer (cyclic, dctx_cap cells), the last window's projected features,
-    // its picks and their confidence
+    // its picks and their confidence, and the proposal each pick came from ([kWindow][top_k] candidates and their q)
     std::vector<uint16_t*> dk, dv;
     int64_t dctx_cap = 0, dctx_from = 0;         // cells; the first position its context holds
     float* dacc = nullptr;
     int32_t* dids = nullptr;
     float* dconf = nullptr;
+    int32_t* dq_ids = nullptr;
+    float* dq_p = nullptr;
+    // how the block drafter picks (temperature 0: its best candidates; above, drawn), set by the request's sampling
+    float dtemp = 0.0f;
+    uint64_t dseed = 0;
 };
 
 /// Runs a decode window of T rows at cells pos..pos+T-1 (`pos3` [T][3] their rope positions); leaves the logits in

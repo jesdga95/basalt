@@ -19,6 +19,7 @@ Flow Request::read_prompt() {
     req_sp.top_k = req_top_k;
     req_sp.seed = req_seed_given ? req_seed
                                  : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
+    req_sp.draw_drafts = !req_seed_given;   // a given seed fixes the reply at any window (sampler.hpp)
     req_sp.min_p = req_min_p;
     req_sp.penalty_last_n = req_penalty_last_n;   // 0..kPenaltyWindowCap: request_parse refuses a wider window
     req_sp.penalty_repeat = req_penalty_repeat;

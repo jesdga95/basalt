@@ -74,11 +74,23 @@ void attn_gate_e4m3(const uint16_t* attn, const uint16_t* q_full, int64_t T, int
 /// x, out [T][H]; base [2][H]; dyn rows `ld_dyn` floats apart.
 void dyn_conv2(const float* x, const float* dyn, int64_t ld_dyn, const float* base, float* out, int64_t T, int64_t H,
                int group, void* stream);
+/// How candidate_path picks: temperature <= 0 the best score; above 0 a draw from softmax(score / temperature) on
+/// Philox's draft stream at (seed, pos0 + position).  q_ids / q_p (optional, device [n][top]): the candidates and the
+/// distribution the pick came from (one-hot at the best for an argmax pick), what speculative sampling keeps drafts by.
+struct CandidateDraw {
+    float temperature = 0.0f;
+    uint64_t seed = 0;
+    int64_t pos0 = 0;
+    int32_t* q_ids = nullptr;
+    float* q_p = nullptr;
+};
 /// A block drafter's candidate path (DFlash 2's selector): for positions 0 .. n-1 in turn, among the row's candidates
-/// (rows of row_logprobs output, `top` each: ids and log probabilities) the one maximizing
-/// logprob + sum_r pred[prev][r] * h[pos][r] * succ[cand][r], prev the pick before it (`anchor` first, device).
-/// pred and succ: bf16 [vocab][rank]; h: fp32 [n][rank]. Writes ids[n] and conf[n] (the pick's softmax over the scores).
+/// (rows of row_logprobs output, `top` each: ids and log probabilities) scored
+/// logprob + sum_r pred[prev][r] * h[pos][r] * succ[cand][r], prev the pick before it (`anchor` first, device), one is
+/// picked as `draw` says.  pred and succ: bf16 [vocab][rank]; h: fp32 [n][rank].  Writes ids[n] and conf[n] (the best
+/// score's softmax share at temperature 1, whichever is picked).
 void candidate_path(const float* lp_rows, int stride, int top, const float* h, const uint16_t* pred, const uint16_t* succ,
-                    int rank, const int32_t* anchor, int n, int32_t* ids, float* conf, void* stream);
+                    int rank, const int32_t* anchor, int n, int32_t* ids, float* conf, const CandidateDraw& draw,
+                    void* stream);
 
 }  // namespace basalt::kernels
