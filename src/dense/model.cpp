@@ -4,6 +4,7 @@
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/logprobs.hpp"
+#include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/prefill/fp8_gemm.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -12,6 +13,7 @@
 #include "basalt/vision/mmproj.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace basalt::dense {
 
@@ -189,10 +191,52 @@ bool decode_drafter(Model& m, std::string& err) {
         l.type = kTypeQ8P;
         return true;
     };
+    // The drafter's big products (gate, up, down, q, o) in NVFP4 planes, rounded from its Q8_0 at load: the drafts' precision
+    // only (every draft is verified exactly, so the output does not change); about half the bytes a pass reads.
+    // BASALT_DRAFT_Q8 keeps them Q8 (A/B).
+    const bool fp4 = std::getenv("BASALT_DRAFT_Q8") == nullptr;
+    auto to_fp4 = [&](Linear& l) -> bool {
+        if (!q8(l) || !kernels::nvfp4p::fits(l.rows, l.cols)) return in_place(l);
+        const size_t n = bytes(l);
+        if (n > tmp_bytes) {
+            if (tmp) cudaFree(tmp);
+            tmp = nullptr;
+            if (cudaMalloc(&tmp, n) != cudaSuccess) return false;
+            tmp_bytes = n;
+        }
+        void* sc = nullptr;
+        if (cudaMemcpy(tmp, l.w, n, cudaMemcpyDeviceToDevice) != cudaSuccess || cudaMalloc(&sc, 16) != cudaSuccess) return false;
+        m.owned.push_back(sc);
+        kernels::nvfp4p::from_q8(tmp, l.rows, l.cols, const_cast<void*>(l.w), (float*) sc, nullptr);
+        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+        l.scale = (const float*) sc;
+        l.type = kTypeNvfp4Planes;
+        return true;
+    };
     bool ok = true;
     for (BlockDrafter::Layer& D : bd.layers) {
-        for (Linear* l : {&D.q, &D.o, &D.gate, &D.up, &D.down, &D.conv_a, &D.conv_f}) ok = ok && in_place(*l);
-        ok = ok && copy(D.k) && copy(D.v);
+        for (Linear* l : {&D.gate, &D.up, &D.down, &D.q, &D.o}) ok = ok && (fp4 ? to_fp4(*l) : in_place(*l));
+        for (Linear* l : {&D.conv_a, &D.conv_f}) ok = ok && in_place(*l);
+        if (fp4 && kernels::nvfp4p::fits(D.k.rows, D.k.cols) && kernels::nvfp4p::fits(D.v.rows, D.v.cols)) {
+            // k and v as NVFP4 copies (prompt chunks read their blocks), so q, k and v stay one call
+            for (Linear* l : {&D.k, &D.v}) {
+                void* p = nullptr;
+                void* sc = nullptr;
+                if (!q8(*l) || cudaMalloc(&p, kernels::nvfp4p::bytes(l->rows, l->cols)) != cudaSuccess ||
+                    cudaMalloc(&sc, 16) != cudaSuccess) {
+                    ok = false;
+                    break;
+                }
+                m.owned.push_back(p);
+                m.owned.push_back(sc);
+                kernels::nvfp4p::from_q8(l->w, l->rows, l->cols, p, (float*) sc, nullptr);
+                l->w = p;
+                l->scale = (const float*) sc;
+                l->type = kTypeNvfp4Planes;
+            }
+        } else {
+            ok = ok && copy(D.k) && copy(D.v);
+        }
     }
     for (Linear& l : bd.fc) ok = ok && copy(l);
     if (tmp) cudaFree(tmp);
@@ -208,10 +252,12 @@ bool decode_drafter(Model& m, std::string& err) {
         c.fmt = wg::Format::Q8;
         c.n = 0;
         for (const Linear* l : ls) {
-            if (l->type != kTypeQ8P) return;
+            if (l->type != kTypeQ8P && l->type != kTypeNvfp4Planes) return;
+            c.fmt = l->type == kTypeQ8P ? wg::Format::Q8 : wg::Format::Nvfp4;
             c.K = l->cols;
             c.m[c.n++].rows = l->rows;
         }
+        if (ls.size() == 2 && c.fmt == wg::Format::Nvfp4) c.epi = wg::Epilogue::SwiGLU;   // the FFN pair
         size_t p, t;
         wg::workspace_need(c, p, t);
         need_p = std::max(need_p, p);
