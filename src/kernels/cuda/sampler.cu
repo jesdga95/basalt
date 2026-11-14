@@ -25,6 +25,7 @@
 // the same arithmetic over the sorted list.
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/core/diag.hpp"
+#include "philox.cuh"
 
 #include <cub/device/device_radix_sort.cuh>
 #include <cuda_runtime.h>
@@ -40,33 +41,6 @@
 
 namespace basalt::kernels {
 namespace {
-
-// Philox 4x32-10, a counter-based generator.  Counter-based matters because it makes the stream a function of
-// (seed, position) rather than of how many draws came before - so a batch can be sampled in any order and a run is
-// reproducible.
-__device__ __forceinline__ uint32_t philox4x32_round(uint32_t& c0, uint32_t& c1, uint32_t& c2, uint32_t& c3,
-                                                     uint32_t k0, uint32_t k1) {
-    const uint32_t hi0 = __umulhi(0x9E3779B9u, c0);
-    const uint32_t hi1 = __umulhi(0xBB67AE85u, c2);
-    const uint32_t lo0 = 0x9E3779B9u * c0;
-    const uint32_t lo1 = 0xBB67AE85u * c2;
-    const uint32_t n0 = hi1 ^ c1 ^ k0;
-    const uint32_t n1 = lo1;
-    const uint32_t n2 = hi0 ^ c3 ^ k1;
-    const uint32_t n3 = lo0;
-    c0 = n0; c1 = n1; c2 = n2; c3 = n3;
-    return 0;
-}
-
-__device__ __forceinline__ float philox_uniform(uint64_t seed, uint64_t counter) {
-    uint32_t c0 = (uint32_t) counter, c1 = (uint32_t) (counter >> 32);
-    uint32_t c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
-    for (int i = 0; i < 10; ++i) {
-        philox4x32_round(c0, c1, c2, c3, (uint32_t) i, 0u);
-    }
-    // 24 bits of mantissa, so the value is uniform in [0,1) with no rounding to 1.0
-    return (float) (c0 >> 8) * (1.0f / 16777216.0f);
-}
 
 // `count_in_history` and the penalty application, transcribed from `llama_sampler_penalties_apply`.
 // The repeat penalty MULTIPLIES for non-positive logits and DIVIDES for positive ones - dividing
