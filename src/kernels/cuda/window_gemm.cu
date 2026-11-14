@@ -144,10 +144,18 @@ int resident(const Kernel& k) {
     return r;
 }
 
+// An F8 call's warps per block (its K slices), from its shapes alone: more slices when its 16-row tiles are few
+int f8_warps(const Call& c) {
+    int64_t tiles = 0;
+    for (int i = 0; i < c.n; ++i) tiles += (c.m[i].rows + 15) / 16;
+    if (c.K % 512 == 0 && tiles < 512) return 8;
+    return c.K % 256 == 0 ? 4 : 2;
+}
+
 const Kernel& kernel_for(const Call& c, int nt) {
     const bool swiglu = c.epi == Epilogue::SwiGLU;
     if (c.fmt != Format::Nvfp4 && swiglu) refuse("an FP8 or BF16 SwiGLU pair", c);
-    if (c.fmt == Format::F8) return detail::f8(nt);
+    if (c.fmt == Format::F8) return detail::f8(f8_warps(c), nt);
     if (c.fmt == Format::Bf16) return detail::bf16(nt);
     if (c.fmt == Format::Q8) return detail::q8(nt);
     return swiglu ? detail::nvfp4_swiglu(nt) : detail::nvfp4(nt);
@@ -164,6 +172,11 @@ Plan plan_for(const Call& c) {
     else
         for (int i = 0; i < c.n; ++i) p.tiles += (int) ((c.m[i].rows + rs - 1) / rs);
     p.nchunks = (int) (c.K / p.k->ch);
+    if (c.fmt == Format::F8) {   // whole K in each block: one item a tile, no slices
+        p.cps = p.nchunks;
+        p.grid = p.tiles;
+        return p;
+    }
     const int64_t R = resident(*p.k);
     const int cb = c.fmt == Format::F8 || c.fmt == Format::Q8 ? p.k->ch : c.fmt == Format::Bf16 ? 2 * p.k->ch : p.k->ch / 2;   // weight bytes per row per chunk
     const double sums = 1.0 + 64.0 / cb;   // an item's fixed cost in chunks: its pipeline turn and its slice's sums
@@ -239,7 +252,7 @@ void norm_pack(const uint16_t* x, const float* w, float eps, int64_t K, int T, v
 void workspace_need(const Call& c, std::size_t& partial_floats, std::size_t& tickets) {
     const Plan p = plan_for(c);
     partial_floats = p.ks > 1 ? (size_t) p.ks * kRows * part_rows(c) : 0;
-    tickets = (size_t) p.tiles;
+    tickets = p.ks > 1 ? (size_t) p.tiles : 0;
 }
 
 void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stream) {
