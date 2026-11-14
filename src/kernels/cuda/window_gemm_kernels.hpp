@@ -1,4 +1,5 @@
 // src/kernels/cuda/window_gemm_kernels.hpp - the decode window products' kernel instantiations, one .cu per format.
+// Adapted from Infernix (Ian Ranson and contributors), Apache-2.0: see THIRD_PARTY_LICENSES.
 #pragma once
 
 #include "window_gemm.cuh"

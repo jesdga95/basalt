@@ -146,7 +146,7 @@ Infernix (https://github.com/Wallawalla47/Infernix), Apache License 2.0
 By Ian Ranson and the Infernix contributors.
 ================================================================================
 
-The grouped NVFP4 expert GEMM in src/prefill/fp4/moe_fp4.cu adapts code from Infernix.
+The grouped NVFP4 expert GEMM in src/prefill/moe_fp4.cu adapts code from Infernix.
 The dense W4A4 product in src/prefill/fp4_dense.cu adapts Infernix's TMA NVFP4 GEMM (src/ops/linear/nvfp4/nvfp4_a4_tma.cuh,
 nvfp4_schedule.cuh; src/ops/common/mbarrier.cuh, mma.cuh): the mbarrier full/empty tensor-load pipeline, the producer warpgroup
 beside eight consumer warps, the 128 x 256 x 128 block-scaled MMA tile and the tiled activation-scale layout.

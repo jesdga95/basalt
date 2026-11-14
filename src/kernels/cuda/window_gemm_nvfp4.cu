@@ -1,5 +1,6 @@
 // src/kernels/cuda/window_gemm_nvfp4.cu - the decode window products against NVFP4 matrices in planes, alone and as a
 // SwiGLU pair (window_gemm.cuh).
+// Adapted from Infernix (Ian Ranson and contributors), Apache-2.0: see THIRD_PARTY_LICENSES.
 #include "window_gemm_kernels.hpp"
 
 namespace basalt::kernels::wgemm::detail {
