@@ -1011,6 +1011,7 @@ target_include_directories(sampler_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(sampler_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME sampler_parity COMMAND sampler_parity --selftest)
 basalt_gpu_test(NAME sampler_split_parity COMMAND sampler_parity --split)
+basalt_gpu_test(NAME sampler_drawn_parity COMMAND sampler_parity --drawn)
 # a pick's log probability and the row's likeliest tokens (row_logprobs) against a double CPU reference
 add_executable(logprobs_parity tests/kernels/logprobs_parity.cpp)
 target_include_directories(logprobs_parity PRIVATE ${_gpu_include_directories})

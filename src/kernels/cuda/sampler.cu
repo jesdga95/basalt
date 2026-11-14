@@ -341,6 +341,42 @@ __device__ __forceinline__ void warp_first(float& bv, int& bi) {
     }
 }
 
+/// Row t's token under a drawn draft (one thread, after the row's final distribution: prob(i) for ids[0 .. n), n > 0):
+/// the draft kept with probability min(1, p(d) / q(d)) on the keep stream, else the residual max(p - q, 0) drawn with the
+/// row's own uniform.  `pick`, the plain draw, stands when the residual has no mass left (only by rounding: an empty
+/// residual means p <= q everywhere, which keeps the draft).
+template <class Prob>
+__device__ int drawn_pick(const int* ids, Prob prob, int n, const SamplerParams& p, int t, int pick) {
+    const int d = p.drafts[t];
+    const int* qi = p.q_ids + (size_t) t * p.q_n;
+    const float* qp = p.q_p + (size_t) t * p.q_n;
+    const auto q_of = [&](int v) {
+        for (int j = 0; j < p.q_n; ++j)
+            if (qi[j] == v) return (double) qp[j];
+        return 0.0;
+    };
+    double pd = 0.0;
+    for (int i = 0; i < n; ++i)
+        if (ids[i] == d) { pd = prob(i); break; }
+    const double qd = q_of(d);
+    const float keep = philox_uniform(p.seed, p.counter + (uint64_t) t, kPhiloxKeep);
+    if (qd > 0.0 && (pd >= qd || (double) keep * qd < pd)) return d;
+    double mass = 0.0;
+    for (int i = 0; i < n; ++i) mass += fmax(prob(i) - q_of(ids[i]), 0.0);
+    if (!(mass > 0.0)) return pick;
+    const double thr = (double) philox_uniform(p.seed, p.counter + (uint64_t) t) * mass;
+    double cum = 0.0;
+    int last = -1;
+    for (int i = 0; i < n; ++i) {
+        const double r = fmax(prob(i) - q_of(ids[i]), 0.0);
+        if (r <= 0.0) continue;
+        cum += r;
+        last = i;
+        if (thr < cum) return ids[i];
+    }
+    return last >= 0 ? ids[last] : pick;
+}
+
 /// /// **THE TAIL ON ONE WARP.**  `sel_ids` / `sel_logit` (shared, `k` entries) are the top_k list in selection order;
 /// /// the 32 lanes of one warp call this and lane 0 writes `out[t]`.  The tail's doubles run on one warp (FP64 issues
 /// /// at a small fraction of FP32): the lanes share the `exp`s (one per entry, into `ex`) and then the quotients, and
@@ -409,6 +445,11 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
         for (int i = 0; i < n_keep; ++i) {
             cum += ex[i];
             if ((double) u < cum) { pick = sel_ids[i]; pi = i; break; }
+        }
+        if (t < p.n_drawn && n_keep > 0) {
+            pick = drawn_pick(sel_ids, [&](int i) { return ex[i]; }, n_keep, p, t, pick);
+            for (int i = 0; i < n_keep; ++i)
+                if (sel_ids[i] == pick) { pi = i; break; }
         }
         out[t] = pick;
         if constexpr (kProb) *prob_out = n_keep > 0 ? (float) ex[pi] : 1.0f;
@@ -1010,7 +1051,8 @@ __device__ void sampled_tail_pair(TailShared& ts, int k, const SamplerParams& p,
             if (!found && (double) u < cum) { pi = i; found = true; }
             return found;
         });
-        out[t] = ts.id[pi];
+        out[t] = t < p.n_drawn && n_keep > 0 ? drawn_pick(ts.id, [&](int i) { return ts.e2[i]; }, n_keep, p, t, ts.id[pi])
+                                              : ts.id[pi];
         if (qprob != nullptr && t < nq) {
             const int q = query[t];
             float pq = 0.0f;
@@ -1705,6 +1747,10 @@ void sample_tokens_impl(int split, const float* logits, int n_tokens, int n_voca
             // sized for 16 rows and 64 entries at least, so a verify window or a wider top_k does not regrow it
             scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax, &done);
         const dim3 grid((unsigned) n_blocks, (unsigned) n_tokens);
+        if ((k > kSelMax || split == 3) && p.n_drawn > 0) {
+            basalt::log::error("basalt", "sample_tokens: drawn drafts on the wide path (a list of %d)", k);
+            std::exit(1);
+        }
         if (k > kSelMax || split == 3) {
             sample_wide(logits, n_tokens, n_vocab, history, history_len, p, k, out, query, n_query, qprob, stream);
         } else if (scratch == nullptr) {
