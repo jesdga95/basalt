@@ -49,7 +49,7 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 
 | | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | Qwen3.8-27B |
 |---|---|---|---|
-| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) |
+| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-QUASAR-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) |
 | Context | default 8,192; `--max-context` sets it | default 8,192; `--max-context` sets it, up to 1,048,576 | default 8,192; up to 262,144 |
 | Drafting | MTP, on by default | DSpark, on by default | DFlash 2 (or MTP), on by default |
 | Images | yes | yes | yes |
@@ -79,11 +79,13 @@ All models compared: [models](docs/models/index.md).
 - [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (and [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)) and [DeepSeek](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017):
   the models. Their packs carry the models' own licences (see the Hugging Face cards).
 - [unsloth](https://huggingface.co/unsloth) (GGUFs), [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) (NVFP4 experts and the
-  [NVFP4 27B](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)), [z-lab](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) (the
+  [NVFP4 27B](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)), [QUASAR-QAT](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)
+  (the 27B pack's quantization-aware NVFP4 checkpoint, Apache-2.0), [z-lab](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) (the
   27B's DFlash 2 drafter), [NInfer](https://github.com/Neroued/ninfer) (the reference for the 27B).
 - [Infernix](https://github.com/Wallawalla47/Infernix) (Ian Ranson and contributors): prompt and decode kernels adapted for the 27B
   and Flash-Next (Apache-2.0, [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)).
-- [@giveen](https://huggingface.co/giveen): the BF16 reference for the DeepSeek quality numbers.
+- [@giveen](https://huggingface.co/giveen): the BF16 reference for the DeepSeek quality numbers, and prompt kernels for the 27B's NVFP4
+  GDN and attention layers.
 - [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp): quantization formats and kernels in `src/` (MIT,
   [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)).
 

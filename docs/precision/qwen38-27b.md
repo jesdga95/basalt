@@ -5,24 +5,32 @@ What the dense stack computes in, where it rounds, and what that costs against t
 
 ## Weights
 
-| Tensors | Stored as | From NVIDIA's checkpoint |
+The published pack, from QUASAR's quantization-aware checkpoint ([model file](../model-file.md#qwen38-27b-pack)):
+
+| Tensors | Stored as | From QUASAR's checkpoint |
 | --- | --- | --- |
-| MLP gate, up, down; output head | NVFP4_PLANES (E2M1, UE4M3 per 16, FP32 per matrix) | bit for bit |
-| GDN qkv, z, out; attention q, k, v, o | F8_E4M3 (E4M3 codes, FP32 per matrix) | bit for bit |
-| GDN a, b; conv; norms | BF16, F32 | as stored (norms with the offset folded in, exact) |
+| MLP gate, up, down; GDN qkv, z, out; attention q, k, v, o | NVFP4_PLANES (E2M1, UE4M3 per 16, FP32 per matrix) | bit for bit (the FP32 scale is 1 / weight_global_scale, rounded once) |
+| Output head | F8_E4M3 rows (E4M3 codes, FP32 per row: amax / 448) | its BF16 values rounded once to nearest |
+| GDN a, b | BF16 | its NVFP4 values rounded once to nearest (within 2^-9 relative) |
+| GDN conv; norms | BF16, F32 | as stored (norms with the offset folded in, exact) |
 | Token embedding | BF16, in page-locked RAM | as stored |
 | MTP layer, block drafter | Q8_0 from BF16; the block drafter's projections rounded to NVFP4 at load (its conv stays Q8_0) | drafting only: cannot change output |
 
+A pack converted from NVIDIA's checkpoint holds its MLP and output head as NVFP4_PLANES and its GDN and attention projections
+as F8_E4M3 (E4M3 codes, FP32 per matrix), both bit for bit; the rest as above.
+
 ## Where each stage rounds
 
-- **Products:** NVFP4 matrices (MLP, head): in decode windows each E2M1 code times its UE4M3 group scale is converted to bf16
-  exactly and multiplied by the window's bf16 rows on the bf16 tensor cores with fp32 accumulation; prompt chunks run
-  the MLP W4A4 on every chunk: each row rounded to FP4 (E2M1 with a UE4M3 scale per 16 values against a per-row FP32 scale,
-  amax / (6 x 448)) and multiplied on the FP4 tensor cores, fp32 accumulation. An NVFP4 matrix's FP32 scale is applied to
-  its fp32 output. F8_E4M3 projections: in prompt chunks the activations are
-  rounded to E4M3 once per row (scale amax / 448) and multiplied on FP8 tensor cores (W8A8, as NVIDIA's checkpoint
-  specifies; its static input_scale is not used); in decode windows the codes are converted to bf16 exactly and multiplied by
-  the window's bf16 rows with fp32 accumulation. Both apply the matrix's FP32 scale at the end.
+- **Products:** NVFP4 matrices: in decode windows each E2M1 code times its UE4M3 group scale is converted to bf16 exactly and
+  multiplied by the window's bf16 rows on the bf16 tensor cores with fp32 accumulation; prompt chunks run them W4A4 on every
+  chunk: each row rounded to FP4 (E2M1 with a UE4M3 scale per 16 values against a per-row FP32 scale, amax / (6 x 448)) and
+  multiplied on the FP4 tensor cores, fp32 accumulation, the GDN and attention products writing BF16 rows for the next step.
+  An NVFP4 matrix's FP32 scale is applied to its fp32 output. The FP8-row head runs in decode windows only (a prompt chunk
+  gives no logits; its last token runs as a decode window): codes converted to bf16 exactly, multiplied by the window's bf16
+  rows with fp32 accumulation, each output row times its row's FP32 scale. F8_E4M3 projections (NVIDIA's pack): in prompt
+  chunks the activations are rounded to E4M3 once per row (scale amax / 448) and multiplied on FP8 tensor cores (W8A8, as
+  NVIDIA's checkpoint specifies; its static input_scale is not used); in decode windows as the head, with the matrix's FP32
+  scale at the end.
 - **Decode windows:** a row's products are summed in K slices fixed by the matrix's shape and added in order, and the
   attention splits a row's cells by position alone, so a token's arithmetic is the same in a drafted window and in plain
   decoding: greedy output with drafting is bitwise plain greedy, alone or beside other slots. Tokens read through the
@@ -42,8 +50,8 @@ What the dense stack computes in, where it rounds, and what that costs against t
   each probability times its cell's fp16 scale, rounded to u8 against the row's largest product in the 64-cell tile
   (255 = that maximum), times the stored V codes on the int8 tensor cores with exact int32 sums, scaled back into the
   fp32 output; long prompts split the cells and merge the splits in fp32. Softmax in fp32. Measured against serial
-  decode (the prompt path vs the same prompt one token at a time, int8 KV, natural text): KL 0.059 at 16,023 tokens and
-  0.016 at 64,023, the same next token (one row each, BF16 activations in both paths). The gate's int8-KV row below reads
+  decode (the prompt path vs the same prompt one token at a time, int8 KV, natural text, NVIDIA's pack): KL 0.059 at 16,023 tokens and
+  0.016 at 64,023, the same next token (one row each, BF16 activations in both paths). The gate's int8-KV rows below read
   this path.
 - **Residual and norms:** prompt chunks keep the residual stream in BF16 (each add in fp32, rounded once) and pass BF16
   activations between kernels (qkv, z, the conv output, q/k/v, the normed rows for GDN's a/b); norms and softmax in fp32.
@@ -52,43 +60,26 @@ What the dense stack computes in, where it rounds, and what that costs against t
 
 ## Quality against BF16
 
-Reference: [quality](quality.md#the-bf16-reference). 100 chunks, 25,500 rows, one RTX 5090 at 400 W. The first two rows are
-the current build, with the BF16 residual and activations; the int8-KV row also reads the 8-bit P V. The last two were measured
-before both, with `--kv fp16`.
+Reference: [quality](quality.md#the-bf16-reference). 100 chunks, 25,500 rows, one RTX 5090 at 400 W, the current build.
 
 | Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
 |---|---:|---:|---:|---:|---:|
-| NVFP4 + F8_E4M3 projections, the prompt MLP W4A4 on every chunk (the default), `--kv fp16` | 6.7843 | 0.0239 | 0.0128 | 0.209 | 92.52% |
-| The same, `--kv int8` | 6.7814 | 0.0240 | 0.0129 | 0.203 | 92.56% |
-| Before the BF16 residual: the prompt MLP on int8 below 1,024 rows (before NVFP4_PLANES) | 6.7850 | 0.0214 | 0.0118 | 0.179 | 92.87% |
-| Earlier pack: projections Q8_0 of the FP8 values, MLP int8 below 1,024 rows | 6.7889 | 0.0213 | 0.0118 | 0.178 | 92.93% |
-
-QUASAR's checkpoint ([model file](../model-file.md#qwen38-27b-pack): every projection NVFP4, quantization-aware trained),
-same gate and build: its GDN and attention projections run as the MLP does (NVFP4 planes, W4A4 in prompt chunks with BF16
-rows between the GDN and attention steps as on F8, bf16 rows in decode windows); the GDN a / b projections are BF16 of its NVFP4
-values; the head is its BF16 head rounded to NVFP4 by the converter (squared error 7% under NVIDIA's NVFP4 head of the same
-BF16 tensor).
-
-| Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
-|---|---:|---:|---:|---:|---:|
-| QUASAR, every projection NVFP4, `--kv fp16` | 6.8622 | 0.0312 | 0.0168 | 0.265 | 91.83% |
-| The same, `--kv int8` | 6.8498 | 0.0308 | 0.0168 | 0.267 | 91.87% |
-| The head as FP8 rows (`--head fp8`), `--kv fp16` | 6.8388 | 0.0262 | 0.0119 | 0.252 | 92.82% |
+| QUASAR, every projection NVFP4, the head FP8 rows (the published pack), `--kv fp16` | 6.8388 | 0.0262 | 0.0119 | 0.252 | 92.82% |
 | The same, `--kv int8` | 6.8260 | 0.0259 | 0.0118 | 0.252 | 92.89% |
-| Reference (a converter experiment, FP32 prompt rows): the head Q8_0, near its BF16 values, `--kv fp16` | 6.8335 | 0.0256 | 0.0111 | 0.257 | 93.13% |
+| QUASAR with the head rounded to NVFP4 (`--head nvfp4`), `--kv fp16` | 6.8622 | 0.0312 | 0.0168 | 0.265 | 91.83% |
+| The same, `--kv int8` | 6.8498 | 0.0308 | 0.0168 | 0.267 | 91.87% |
+| NVIDIA's checkpoint: NVFP4 MLP and head, F8_E4M3 GDN and attention, `--kv fp16` | 6.7843 | 0.0239 | 0.0128 | 0.209 | 92.52% |
+| The same, `--kv int8` | 6.7814 | 0.0240 | 0.0129 | 0.203 | 92.56% |
+| Reference (a converter experiment, FP32 prompt rows): QUASAR with the head Q8_0, near its BF16 values, `--kv fp16` | 6.8335 | 0.0256 | 0.0111 | 0.257 | 93.13% |
 
-The head carries most of the gap to NVIDIA's pack: rounding QUASAR's BF16 head to NVFP4 costs KLD 0.0058 over a Q8_0
-head, and FP8 rows (an FP32 scale per row) win back most of it. What remains (about 0.026 against 0.0239) is the body.
-
-The F8 projections hold NVIDIA's values exactly but read prompt rows in E4M3 (one scale per row) where the Q8_0 pack read
-them in q8_1 (one scale per 32): perplexity 6.7889 -> 6.7850, KLD 0.0213 -> 0.0214, top-1 92.93 -> 92.87%.
+The head carries most of QUASAR's gap: rounding its BF16 head to NVFP4 costs KLD 0.0058 over a Q8_0 head, and FP8 rows (an
+FP32 scale per row) win back most of it at 0.55 GB more on the card. Against NVIDIA's pack, QUASAR's has the higher top-1 and
+the lower median, NVIDIA's the lower mean and p99. NVIDIA's GDN and attention projections keep 8 bits where QUASAR's take 4;
+QUASAR's weights take 2.4 GiB less on the card and decode faster ([guide](../models/qwen38-27b.md#speed)).
 
 The base scores 6.7411 on the same rows. Each chunk's first half is read as one 257-row prompt and the scored rows are then
-decoded against it, so every scored row sees a cache and recurrent state the prompt path wrote. With the MLP in NVFP4 planes
-the prompt path runs it W4A4 at any chunk length (as NVIDIA's checkpoint and Infernix do); before, chunks under 1,024 rows
-took int8 activations, and the gate's 257-row reads never reached W4A4. That costs this gate KLD +0.0025 and top-1 -0.3
-points; long prompts were W4A4 already. Decode never uses it. (The first row was measured with W4A4 forced on the earlier
-F8 pack: the same arithmetic.)
+decoded against it, so every scored row sees a cache and recurrent state the prompt path wrote, W4A4 on the NVFP4 matrices at
+any chunk length (as the checkpoints and Infernix do). Decode never uses it.
 
 ## Sampling with drafts
 
@@ -109,7 +100,7 @@ plain rule, which is exact too.
 ## Agreement with Hugging Face
 
 Four short prompts (5, 15, 21 and 60 tokens; the last a chat-templated question), every position's logits through the decode
-path against Hugging Face transformers' own Qwen3.5 modules run in fp32 on the CPU, with the same NVFP4 and FP8 weights
+path against Hugging Face transformers' own Qwen3.5 modules run in fp32 on the CPU, with NVIDIA's pack's NVFP4 and FP8 weights
 dequantized (`basalt --diag-serial-prompt --diag-logits`):
 
 | Prompt | Positions | Top-1 agreement | Mean KL | Max KL |
