@@ -114,6 +114,8 @@ public:
             st_.dacc = st_.arena.take<float>((size_t) kWindow * g.n_embd);
             st_.dids = st_.arena.take<int32_t>(kWindow);
             st_.dconf = st_.arena.take<float>(kWindow);
+            st_.dq_ids = st_.arena.take<int32_t>((size_t) kWindow * kDraftQ);
+            st_.dq_p = st_.arena.take<float>((size_t) kWindow * kDraftQ);
             st_.win_tok = st_.arena.take<int32_t>(kWindow);
             if (!st_.win_tok) {
                 err = m_.o.arch + ": the block drafter's buffers do not fit the session's arena";
@@ -544,6 +546,7 @@ public:
         kernels::SamplerParams sp = sampling_;
         sp.logit_bias = d_mask_;
         sp.counter += (uint64_t) row;
+        sp.n_drawn = 0;   // the row is drawn again under the mask, whatever its draft was
         kernels::sample_tokens(st_.logits + (size_t) row * g_.n_vocab, 1, g_.n_vocab,
                                history_len_ > 0 ? d_hist_ + (size_t) row * history_len_ : nullptr, history_len_, sp,
                                st_.picks, st_.stream);
@@ -677,10 +680,25 @@ private:
         if (r.sampling != nullptr) sampling_ = *r.sampling;
         sampling_.logit_bias = bias_on_ ? d_bias_ : nullptr;
         history_len_ = r.history != nullptr ? r.history_len : 0;
-        if (!sampling_.greedy && kernels::sampler_list_len(sampling_.top_k, g_.n_vocab) > kernels::kSamplerNarrowMax &&
-            !kernels::sampler_wide_reserve(g_.n_vocab, st_.stream)) {
+        const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+        const bool narrow = kernels::sampler_list_len(sampling_.top_k, g_.n_vocab) <= kernels::kSamplerNarrowMax;
+        if (sampled && !narrow && !kernels::sampler_wide_reserve(g_.n_vocab, st_.stream)) {
             err = "out of device memory for the sampler";
             return false;
+        }
+        // Speculative sampling: on the narrow lists the block drafter draws its drafts from its own distribution and a
+        // window of them keeps each by min(1, p / q), else draws the residual (sampler.hpp): the tokens are distributed as
+        // the model's, and a drafter that spreads its guesses like the model keeps more of them than its best guesses would.
+        // Greedy requests, the wide lists and a request with its own seed keep the drafter's best candidates and the
+        // plain draws.
+        st_.dtemp = block_ && sampled && narrow && sampling_.draw_drafts ? sampling_.temperature : 0.0f;
+        st_.dseed = sampling_.seed;
+        if (r.drawn_drafts && st_.dtemp > 0.0f && r.n_tokens > 1) {
+            sampling_.drafts = st_.dids;
+            sampling_.q_ids = st_.dq_ids;
+            sampling_.q_p = st_.dq_p;
+            sampling_.q_n = m_.w.dflash.top_k;
+            sampling_.n_drawn = r.n_tokens - 1;
         }
         if (history_len_ > 0) {
             if (history_len_ > kHistoryCap) history_len_ = kHistoryCap;

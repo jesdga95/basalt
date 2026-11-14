@@ -84,6 +84,22 @@ took int8 activations, and the gate's 257-row reads never reached W4A4. That cos
 points; long prompts were W4A4 already. Decode never uses it. (The first row was measured with W4A4 forced on the earlier
 F8 pack: the same arithmetic.)
 
+## Sampling with drafts
+
+A sampled request (temperature above 0, `top_k` 1 to 64) that gives no `seed` drafts by speculative sampling. The block
+drafter draws each draft from its own distribution q, the softmax of its selector's scores over its 16 candidates at the
+request's temperature, on a Philox stream of its own. The window keeps draft d with probability min(1, p(d) / q(d)), p the
+target row's distribution after the sampler chain, and at the first draft it does not keep it draws the token from
+max(p - q, 0), renormalized; a window whose drafts are all kept draws its last token from p. Every token then has p's
+distribution exactly. `sampler_drawn_parity` checks it on each sampler implementation the engine runs: 180,000 draws a case
+give a total-variation distance of 0.001 to 0.003 from p (the sampling noise) and keep the draft as often as the sum of
+min(p, q).
+
+Which tokens come out depends on the drafts, and so on the windows the draft policy picks from measured round times. A request
+with a `seed` keeps the plain rule instead (the drafter's best candidates, kept where the row's own draw is the draft), so its
+reply is the same at any window. Greedy requests, `top_k` 0 or above 64, lookup drafts and the MTP drafter also keep the
+plain rule, which is exact too.
+
 ## Agreement with Hugging Face
 
 Four short prompts (5, 15, 21 and 60 tokens; the last a chat-templated question), every position's logits through the decode

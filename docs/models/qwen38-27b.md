@@ -40,6 +40,9 @@ drafter runs its block of 8 rows, and a wider block (up to the window) after win
 policy reads each draft's confidence to pick the window. Without it the MTP layer drafts one token per step. `--suffix-draft N` (default 3, `0` = off)
 also fills a window from an earlier repeat of at least N tokens in the context, where the draft policy expects it to pay.
 Output is exactly plain decoding's: a row's arithmetic does not depend on the window's rows, drafted or not, alone or batched.
+A sampled request without a `seed` draws the block drafter's drafts and keeps them by speculative sampling: its tokens follow the
+model's distribution exactly, and more drafts are kept than the drafter's best guesses would give
+([precision](../precision/qwen38-27b.md#sampling-with-drafts)).
 
 ## Images and video
 

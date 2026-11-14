@@ -430,6 +430,7 @@ public:
     }
     void fill_drafts(int T, bool from_sfx) {
         for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf_[(size_t) i - 1] : drafts_[(size_t) i - 1];
+        own_drafts_ = !from_sfx;
     }
     int before_window(int, int64_t) { return 0; }
     int32_t* history_stage() {
@@ -438,11 +439,12 @@ public:
     }
     void upload_history(int) {}
     void mark_before_run() {}
-    bool run_window(int T, int, int&) {
+    bool run_window(int T, int e0, int&) {
         basalt::model::DecodeRequest d;
         d.tokens = window.data();
         d.n_tokens = T;
         d.pos = p;
+        d.drawn_drafts = own_drafts_ && e0 == 0 && ppl == nullptr && T > 1;
         (T > 1 ? d.row_tokens : d.next_token) = outv.data();
         d.sampling = &req_sp;
         d.history = hist_n > 0 ? history_.data() : nullptr;
@@ -604,6 +606,7 @@ private:
     std::vector<Block> blocks_;
     std::vector<int32_t> history_;
     uint64_t draws_ = 0;
+    bool own_drafts_ = false;   // the window's drafts are the drafter's (fill_drafts), not a lookup proposal
     std::vector<int32_t> drafts_, sbuf_;
     std::vector<float> conf_, window_conf_;
     int n_draft_ = 0;
@@ -662,6 +665,7 @@ void SessionRuntime::slot_window_begin(int b, SlotWin& w, int limit) {
     w.d.pos = sl.p;
     (T > 1 ? w.d.row_tokens : w.d.next_token) = w.out.data();
     w.d.sampling = &sp;
+    w.d.drawn_drafts = !w.from_sfx && T > 1;
     if (sl.pen_n > 0) {
         w.history.resize((size_t) T * sl.pen_n);
         basalt::kernels::penalty_rows(sl.ids.data(), (int64_t) sl.ids.size(), w.win.data(), T, sl.pen_n, w.history.data());
