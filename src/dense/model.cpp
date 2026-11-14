@@ -155,9 +155,10 @@ size_t chunk_bytes(const Geometry& g) {
 }  // namespace
 
 namespace {
-// The block drafter as decode windows run it: its Q8_0 products in Q8 planes for the window gemm.  q, o, gate, up, down and
-// the convolutions are repacked in place (prompt chunks never read them); k, v and the feature projection, which prompt
-// chunks read as blocks, get plane copies.  Then the window gemm's workspace grows to its calls if they need more.
+// The block drafter as decode windows run it, on the window gemm: q, o, gate, up and down rounded to NVFP4 planes in place
+// and the convolutions repacked to Q8 planes in place (prompt chunks never read them); k and v (NVFP4) and the feature
+// projection (Q8 planes), which prompt chunks read as blocks, get copies.  Then the window gemm's workspace grows to its
+// calls if they need more.
 bool decode_drafter(Model& m, std::string& err) {
     m.bd_dec = m.w.dflash;
     BlockDrafter& bd = m.bd_dec;
@@ -193,8 +194,6 @@ bool decode_drafter(Model& m, std::string& err) {
     };
     // The drafter's big products (gate, up, down, q, o) in NVFP4 planes, rounded from its Q8_0 at load: the drafts' precision
     // only (every draft is verified exactly, so the output does not change); about half the bytes a pass reads.
-    // BASALT_DRAFT_Q8 keeps them Q8 (A/B).
-    const bool fp4 = std::getenv("BASALT_DRAFT_Q8") == nullptr;
     auto to_fp4 = [&](Linear& l) -> bool {
         if (!q8(l) || !kernels::nvfp4p::fits(l.rows, l.cols)) return in_place(l);
         const size_t n = bytes(l);
@@ -215,9 +214,9 @@ bool decode_drafter(Model& m, std::string& err) {
     };
     bool ok = true;
     for (BlockDrafter::Layer& D : bd.layers) {
-        for (Linear* l : {&D.gate, &D.up, &D.down, &D.q, &D.o}) ok = ok && (fp4 ? to_fp4(*l) : in_place(*l));
+        for (Linear* l : {&D.gate, &D.up, &D.down, &D.q, &D.o}) ok = ok && to_fp4(*l);
         for (Linear* l : {&D.conv_a, &D.conv_f}) ok = ok && in_place(*l);
-        if (fp4 && kernels::nvfp4p::fits(D.k.rows, D.k.cols) && kernels::nvfp4p::fits(D.v.rows, D.v.cols)) {
+        if (kernels::nvfp4p::fits(D.k.rows, D.k.cols) && kernels::nvfp4p::fits(D.v.rows, D.v.cols)) {
             // k and v as NVFP4 copies (prompt chunks read their blocks), so q, k and v stay one call
             for (Linear* l : {&D.k, &D.v}) {
                 void* p = nullptr;
