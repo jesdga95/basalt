@@ -9,11 +9,12 @@ One setting picks the cards: `gpu`. It means the same in the server (`"gpu"` in 
 | --- | --- | --- |
 | not set | GPU 0 alone; one warning at start names the other visible cards | GPU 0 |
 | `"0,1"`, `"1,0"`, ... | exactly these, in this order | the first one listed |
-| `"auto"` | every visible Blackwell (sm_120) card; any other card is skipped with one line naming it | the one with the most memory bandwidth, then the most VRAM |
+| `"auto"` | every visible Blackwell (sm_120) card, and every sm_89 card as an expert tier; any other card is skipped with one line naming it | the one with the most memory bandwidth, then the most VRAM |
 
 Cards are numbered as `nvidia-smi` numbers them. When `CUDA_VISIBLE_DEVICES` is set, the numbers count within its list
 (`CUDA_VISIBLE_DEVICES=1,0` makes `gpu 0` the card `nvidia-smi` calls 1), and its numbers are read as `nvidia-smi`'s
-too. A number past the visible cards, a card listed twice or a card that is not Blackwell stops the start with an error.
+too. A number past the visible cards, a card listed twice, a first card that is not sm_120, or a later card that is
+neither sm_120 nor sm_89 stops the start with an error.
 
 The main card holds the dense weights, the KV cache, the drafter and its own expert cache. The engine decides what the
 other cards do and prints one line at start, for example `gpus: RTX 5090 (nvidia-smi 0) main, RTX 5060 Ti (nvidia-smi 1)
@@ -99,3 +100,22 @@ room for the buffers of that share (about 200 MiB, the size is computed, not a s
 `prefill peer: the peer's buffers do not fit`, raise `peer-reserve-mib` (the card shows a display or another program using
 its VRAM) and the second card's experts shrink by the same amount. The start line `peer GPU 1: N experts` says how many
 it holds.
+
+## An older peer card
+
+One older architecture is built for the peer's kernels: sm_89 (Ada), beside an sm_120 main card. A card of any other
+pre-Blackwell architecture is refused at the start rather than failing at its first kernel. What such a peer does and
+does not do:
+
+- It holds experts and computes their rows in every decode window, with the standard-CUDA kernels (Q8_1/Q2_0 and the
+  GGUF i-quant rows, dp4a arithmetic) compiled for its own architecture. Where an expert sits does not change its rows.
+- It reads its experts' share of a prompt chunk, under the slower-card rule above (chunks up to 2,559 rows).
+- It does not run the main card's work: the dense weights, the KV cache, the drafter, TMA and the FP4 tensor-core
+  expert kernels stay on the Blackwell card. An NVFP4 pack's FP4 experts are main-card only.
+- DeepSeek does not take an older peer: its peer-tier kernels are built for sm_120 only, and the start says so.
+- Layer split, overlapped windows and tensor parallel need matched Blackwell cards; an unlike pair always uses the
+  expert tier, as before.
+
+The mixed pair is priced like any other: on an RTX 5080 with an RTX 4060 Ti the start prints
+`multi-gpu: 2 cards unlike; ms per window: expert tier 13.0, layer split 19.8, tensor parallel 13.5 (not built); picked
+expert tier`.

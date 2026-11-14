@@ -37,11 +37,13 @@ endfunction()
 # the CUDA language gives the .cu compile rules but not the imported targets, so `CUDA::cudart` is brought in
 # explicitly for the host-side programs that call the runtime themselves
 find_package(CUDAToolkit REQUIRED)
-# One architecture only: the kernels use its instructions and nothing else is tested.
+# Main kernels (NVFP4 tensor cores, TMA, Blackwell instructions) compile for sm_120 only.
+# Peer kernels (Q8_1/Q2_0 expert rows, standard CUDA) additionally compile for sm_89 (Ada)
+# so a non-Blackwell card can serve as the expert tier.
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
   if(NOT _base STREQUAL "120")
-    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 only")
+    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 only (peer-arch kernels are compiled separately below)")
   endif()
 endforeach()
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
@@ -340,6 +342,42 @@ if(BASALT_MODEL_QWEN4EXP)
 add_executable(basalt-load src/models/qwen4exp/plan/load_main.cpp)
 target_link_libraries(basalt-load PRIVATE core kernels)
 endif()
+
+# Peer-tier compilation: the expert-window decode kernels, the peer prefill mmq/iota kernels and the
+# small utility kernels that run on the peer card additionally compile for sm_89 (Ada), so a non-Blackwell
+# card can serve as the expert tier. Must be set BEFORE the targets that compile these files are defined.
+set_source_files_properties(
+  src/models/qwen4exp/kernels/dec_moe.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q0_m0.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q0_m1.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q1_m0.cu
+  src/models/qwen4exp/kernels/dec_moe_peer_q1_m1.cu
+  src/prefill/moe_mmq.cu
+  src/prefill/mmq/mmq_host.cu
+  src/prefill/mmq/quantize.cu
+  src/prefill/mmq/instances/mmq_q2_0.cu
+  src/prefill/mmq/instances/mmq_iq1_s.cu
+  src/prefill/mmq/instances/mmq_iq1_m.cu
+  src/prefill/mmq/instances/mmq_iq2_xxs.cu
+  src/prefill/mmq/instances/mmq_iq2_xs.cu
+  src/prefill/mmq/instances/mmq_iq2_s.cu
+  src/prefill/mmq/instances/mmq_iq3_xxs.cu
+  src/prefill/mmq/instances/mmq_iq3_s.cu
+  src/prefill/mmq/instances/mmq_iq4_nl.cu
+  src/prefill/mmq/instances/mmq_iq4_xs.cu
+  src/prefill/mmq/instances/mmq_q8_0.cu
+  src/prefill/mmq/instances/mmq_q5_0.cu
+  src/prefill/mmq/instances/mmq_q5_1.cu
+  src/prefill/mmq/instances/mmq_q2_k.cu
+  src/prefill/mmq/instances/mmq_q3_k.cu
+  src/prefill/mmq/instances/mmq_q4_k.cu
+  src/prefill/mmq/instances/mmq_q5_k.cu
+  src/prefill/mmq/instances/mmq_q6_k.cu
+  src/kernels/cuda/iq_kernels.cu
+  src/kernels/cuda/quantize_act.cu
+  src/kernels/cuda/wait_abort.cu
+  src/kernels/cuda/elementwise.cu
+  PROPERTIES COMPILE_OPTIONS "--generate-code=arch=compute_89,code=sm_89")
 
 # ---- kernels ----
 # Naive first, each with a parity test against a reference that was itself validated against ggml.  The

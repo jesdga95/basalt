@@ -3,6 +3,10 @@
 Linux x64 and Windows x64, NVIDIA Blackwell (sm_120). Linux is where the engine is tested and benchmarked. CI builds both and runs
 the CPU tests on each. The GPU tests and the quality gate need a card.
 
+The main card is always sm_120, with one exception in the multi-GPU tier: a second card of sm_89 (Ada) can hold and
+compute the expert tier ([GPUs](configuration/gpus.md#an-older-peer-card)); every other path and every other
+architecture is Blackwell-only.
+
 | | Linux | Windows |
 | --- | --- | --- |
 | OS | x86-64, AVX2 (AVX-512 used when present) | Windows 10 1903+ x64 |
