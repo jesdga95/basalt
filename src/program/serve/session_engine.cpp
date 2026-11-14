@@ -1,6 +1,7 @@
 // src/program/serve/session_engine.cpp - the shared server over a model's ModelSession: one token per window.
 #include "session_engine.hpp"
 
+#include "batch_plan.hpp"
 #include "decode_loop.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
@@ -809,18 +810,12 @@ bool SessionRuntime::next_batch_window() {
     // the windows of a round share the batch's rows: with no more slots than rows each takes its share, so one pass serves all
     const int n_act = (int) act.size();
     std::vector<SlotWin> wins(act.size());
-    for (int i = 0; i < n_act; ++i) slot_window_begin(act[(size_t) i], wins[(size_t) i], n_act <= cap ? cap / n_act + (i < cap % n_act ? 1 : 0) : cap);
-    std::vector<bool> taken(act.size(), false);
-    for (size_t first = 0; first < act.size(); ++first) {
-        if (taken[first]) continue;
-        std::vector<size_t> group;
-        int rows = 0;
-        for (size_t i = first; i < act.size(); ++i)
-            if (!taken[i] && rows + wins[i].T <= cap) {
-                group.push_back(i);
-                taken[i] = true;
-                rows += wins[i].T;
-            }
+    std::vector<int> rows(act.size());
+    for (int i = 0; i < n_act; ++i) {
+        slot_window_begin(act[(size_t) i], wins[(size_t) i], batch_share(i, n_act, cap));
+        rows[(size_t) i] = wins[(size_t) i].T;
+    }
+    for (const std::vector<size_t>& group : batch_groups(rows, cap)) {
         const Clock::time_point t0 = Clock::now();
         if (group.size() == 1) {
             if (const basalt::model::Result r = sessions_[(size_t) act[group[0]]]->decode_window(wins[group[0]].d); !r.ok()) return failed(r.message);
