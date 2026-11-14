@@ -33,6 +33,8 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
   `elastic KV: about N cells fit in the S sessions ...` gives the ceiling: the cells all sessions can hold before the expert
   cache reaches the slots a prompt chunk needs, past which a request is refused. `/v1/status` gives its current value as
   `context.elastic_kv_ceiling` (null without elastic KV), so a client can compact a conversation first.
+- **KV pool** (`--kv-pool`, opt-in): conversations switched away from keep their KV in VRAM, within `--max-context` together
+  with the live one, oldest out first ([running](../running.md#conversations-in-vram---kv-pool)).
 
 ## Long prompts
 

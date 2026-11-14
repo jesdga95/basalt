@@ -86,6 +86,8 @@ void usage() {
                  "  --ram-reserve-mib N  RAM left free for the rest of the system (default 2048); the expert tiers leave\n"
                  "                       it and the --serve RAM guard holds it (0 = keep nothing, guard off)\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens (default 0 = park every one)\n"
+                 "  --kv-pool            --serve (opt-in, one GPU, no --batch): parked conversations stay in VRAM, oldest\n"
+                 "                       out first when they and the live one would pass --max-context\n"
                  "  --conversation-cache-disk-mib N  --serve: park conversations on disk, at most N MiB, and read them back\n"
                  "                       when a prompt starts with one, also after a restart (default 0 = off)\n"
                  "  --conversation-cache-dir DIR  --serve: the disk tier's folder (required with a budget unless the\n"
