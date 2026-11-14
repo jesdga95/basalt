@@ -4,8 +4,9 @@
 // Activations: bf16 rows.  Weights: E4M3 codes, or E2M1 codes times their UE4M3 group scale, converted to bf16 in registers
 // (both exact).  Products: mma m16n8k16 (bf16 in, fp32 accumulate) with the window's rows as the columns, 8 per mma.  A
 // column's sums never meet another column's, and the order of a row's sums (fixed chunks of K in order within a K slice,
-// the slices added in slice order) depends only on the shapes of the call's matrices: a row's bits do not depend on T or
-// on what the other rows hold, so a drafted or batched window gives the same rows as plain decoding.
+// the slices added in slice order; FP8 slices K across a block's warps, the others across blocks) depends only on the
+// shapes of the call's matrices: a row's bits do not depend on T or on what the other rows hold, so a drafted or
+// batched window gives the same rows as plain decoding.
 //
 // Products start as programmatic dependents inside a PdlScope (pdl.hpp): each stages its first weights before it waits
 // for the kernel before it.
@@ -37,7 +38,7 @@ void pack(const float* x, int64_t ld_x, int64_t K, int T, void* act, void* strea
 /// rows too (bitwise rms_norm_rows; the BF16 overload reads BF16 rows, a BF16 residual, widened).
 void norm_pack(const float* x, const float* w, float eps, int64_t K, int T, void* act, float* xn, void* stream);
 void norm_pack(const uint16_t* x, const float* w, float eps, int64_t K, int T, void* act, float* xn, void* stream);
-/// The device scratch for split-K sums, sized with workspace_need over every call a model makes.
+/// The device scratch for split-K sums (not FP8), sized with workspace_need over every call a model makes.
 struct Workspace {
     float* partial = nullptr;    // [slices][16][rows] of the product in flight
     int32_t* tickets = nullptr;  // per row tile, back to 0 after each product

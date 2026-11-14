@@ -170,6 +170,10 @@ The decode-window products in src/kernels/cuda/window_gemm*.cu adapt the launch 
 (src/core/pdl.cuh, src/ops/linear/nvfp4/nvfp4_a16_gemv.cuh): weights staged before the programmatic-launch wait,
 dependents started once the weights are read, and the slice-ordered split-K reduction; Basalt fixes the split by the
 matrix shape so a row's bits do not depend on the window.
+The FP8 decode-window product in src/kernels/cuda/window_gemm_sliced.cuh adapts the layout of Infernix's
+fp8_a16_sliced_k_mma (src/ops/linear/fp8/fp8_a16_sliced_k_mma.cuh, fp8_schedule.cuh): a 16-row block over the whole K,
+its warps on fixed K slices, the activations staged in shared memory beside the weights, and the slices reduced in the
+block in a fixed order.
 
 Licensed under the Apache License, Version 2.0, reproduced below.
 
