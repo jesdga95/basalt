@@ -517,6 +517,31 @@ def fp8_e4m3_table() -> np.ndarray:
     return (sign * v).astype(np.float32)
 
 
+# The IQ4_NL codebook: ggml's 16 fp4 values, one fp16 scale per 32 values, d = amax / 127.
+IQ4_NL_TABLE = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], np.float32)
+PLE_ROW_BYTES = {"iq4_nl": PLE_DIM // 32 * 18, "q8_0": PLE_DIM // 32 * 34}   # 90 and 170, the engine's rows
+PLE_TYPES = {"iq4_nl": ("IQ4_NL", 20), "q8_0": ("Q8_0", 8)}
+
+
+def fp8_rows_to_iq4_nl(raw: np.ndarray, scale: float, chunk: int = 8192) -> bytes:
+    """Rows of PLE_DIM FP8 codes times the tensor's scale -> IQ4_NL rows (5 blocks of 18 bytes each).
+
+    The nearest codebook entry per value against a per-32 scale of amax / 127, the layout of ggml block_iq4_nl. Bounded
+    to `chunk` rows at a time: the codebook distance pass is 32 x 16 per row, and the PLE job's rows run into millions."""
+    x = fp8_e4m3_table()[raw.reshape(-1)] * np.float32(scale)
+    if not np.isfinite(x).all():
+        raise ConvertError("the FP8 table holds a non-finite value")
+    b = x.reshape(-1, 32)
+    out = np.empty((b.shape[0], 18), np.uint8)
+    for i in range(0, b.shape[0], chunk):
+        blk = b[i:i + chunk]
+        d = (np.abs(blk).max(axis=1) / 127).astype(np.float16)
+        q = np.abs(blk[:, :, None] - IQ4_NL_TABLE[None, None, :] * d.astype(np.float32)[:, None, None]).argmin(axis=2).astype(np.uint8)
+        out[i:i + chunk, :2] = d.view(np.uint8).reshape(-1, 2)
+        out[i:i + chunk, 2:] = q[:, :16] | (q[:, 16:] << 4)
+    return out.tobytes()
+
+
 def fp8_rows_to_q8_0(raw: np.ndarray, scale: float) -> bytes:
     """Rows of PLE_DIM FP8 codes times the tensor's scale -> Q8_0 rows (5 blocks of 34 bytes each)."""
     x = fp8_e4m3_table()[raw.reshape(-1)] * np.float32(scale)
@@ -526,9 +551,9 @@ def fp8_rows_to_q8_0(raw: np.ndarray, scale: float) -> bytes:
 
 
 def _ple_job(args):
-    path, off, rows, scale = args
+    path, off, rows, scale, quant = args
     raw = np.fromfile(path, dtype=np.uint8, count=rows * PLE_DIM, offset=off)
-    return fp8_rows_to_q8_0(raw, scale)
+    return fp8_rows_to_iq4_nl(raw, scale) if quant == "iq4_nl" else fp8_rows_to_q8_0(raw, scale)
 
 
 def read_safetensors_header(path):
@@ -570,8 +595,10 @@ class PleFp8:
     """The PLE n-gram table of a checkpoint that stores it as FP8 shards (`...ngram_embedding.shard_K.weight`) with one
     BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values."""
 
-    def __init__(self, path, chunk_rows: int = 65536):
-        self.path, self.chunk_rows = path, chunk_rows
+    def __init__(self, path, chunk_rows: int = 65536, quant: str = "q8_0"):
+        if quant not in PLE_ROW_BYTES:
+            raise ConvertError(f"{quant}: the PLE is iq4_nl or q8_0")
+        self.path, self.chunk_rows, self.quant = path, chunk_rows, quant
         head, base = read_safetensors_header(path)
         scales = [k for k in head if k.endswith("ngram_embedding.weight_scale")]
         if len(scales) != 1:
@@ -594,17 +621,18 @@ class PleFp8:
             raise ConvertError(f"{path}: no PLE shards")
         self.shards = shards
         self.rows = sum(r for _, r in shards)
-        self.row_bytes = PLE_DIM // 32 * 34
+        self.row_bytes = PLE_ROW_BYTES[quant]
+        self.type_name, self.type_id = PLE_TYPES[quant]
         self.nbytes = self.rows * self.row_bytes
 
     def jobs(self):
         for off, rows in self.shards:
             for r in range(0, rows, self.chunk_rows):
                 n = min(self.chunk_rows, rows - r)
-                yield (self.path, off + r * PLE_DIM, n, self.scale)
+                yield (self.path, off + r * PLE_DIM, n, self.scale, self.quant)
 
     def chunks(self, pool, depth: int = 16):
-        """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
+        """The rows in order, made on `pool` with at most `depth` chunks in flight."""
         yield from bounded_imap(pool, _ple_job, self.jobs(), depth)
 
 

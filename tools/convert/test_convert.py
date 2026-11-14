@@ -487,6 +487,17 @@ class PleFp8Test(unittest.TestCase):
         codes = rng.integers(0, 256, size=(7, S.PLE_DIM), dtype=np.uint8)
         codes[(codes & 0x7F) == 0x7F] = 0x38
         scale = 0.0125
+        # IQ4_NL: 18 bytes a block, and the bytes are ggml's packing (fp16 d, then 16 bytes of nibbles low-first)
+        iq = S.fp8_rows_to_iq4_nl(codes, scale)
+        x = S.fp8_e4m3_table()[np.frombuffer(codes, np.uint8)] * np.float32(scale)
+        b = x.reshape(-1, 32)
+        d = (np.abs(b).max(axis=1) / 127).astype(np.float16)
+        q = np.abs(b[:, :, None] - S.IQ4_NL_TABLE[None, None, :] * d.astype(np.float32)[:, None, None]).argmin(axis=2)
+        want = np.empty((b.shape[0], 18), np.uint8)
+        want[:, :2] = d.view(np.uint8).reshape(-1, 2)
+        want[:, 2:] = q[:, :16] | (q[:, 16:] << 4)
+        self.assertEqual(iq, want.tobytes())
+        self.assertEqual(len(iq), (codes.size // 32) * 18)
         got = S.fp8_rows_to_q8_0(codes, scale)
         self.assertEqual(len(got), 7 * S.PLE_DIM // 32 * 34)
         deq = ggufq.dequantize(np.frombuffer(got, dtype=np.uint8), ggufq.GGMLQuantizationType.Q8_0).reshape(-1, 32)
@@ -512,7 +523,8 @@ class PleFp8Test(unittest.TestCase):
             path.write_bytes(struct.pack("<Q", len(hb)) + hb + data)
             ple = S.PleFp8(str(path), chunk_rows=4)
             self.assertEqual(ple.rows, 8)
-            self.assertAlmostEqual(ple.scale, float((np.uint32(0x3C23) << 16).view(np.float32)), places=9)
+            self.assertAlmostEqual(ple.scale, float(np.array([np.uint32(0x3C23) << 16], np.uint32).view(np.float32)[0]),
+                                   places=9)
             got = b"".join(S._ple_job(j) for j in ple.jobs())
             self.assertEqual(len(got), ple.nbytes)
             want = b"".join(S.fp8_rows_to_q8_0(a, ple.scale) for a in shards)
