@@ -407,75 +407,53 @@ public:
         return {};
     }
 
+    // The running state for the shared checkpoint transfer: the head {rope_delta, pos, tail_cell, valid} on the host,
+    // then the regions the engine moves itself: the GDN state, the drafter's waiting row, and the block drafter's
+    // context rings per layer (K, V) whole as they lie. A ring holds cell c at slot c % capacity, so a restore at the
+    // same position finds every cell where it was; `valid` says how many cells below the position are this
+    // conversation's.
+    static constexpr size_t kHeadBytes = 4 * sizeof(int64_t);
+    size_t block_ring_bytes() const { return (size_t) st_.dctx_cap * m_.w.dflash.n_kv * m_.w.dflash.head_dim * sizeof(uint16_t); }
     size_t running_bytes() const override {
-        return (size_t) g_.gdn_layers() * st_.gdn_floats * 4 + 24 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) + block_ctx_bytes();
+        return kHeadBytes + (size_t) g_.gdn_layers() * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
+               (block_ ? st_.dk.size() * 2 * block_ring_bytes() : 0);
     }
 
-    Result save_running(uint8_t* host, int64_t pos) override {
-        if (Result s = settle(pos); !s.ok()) return s;
-        const size_t n = (size_t) g_.gdn_layers() * st_.gdn_floats * 4;
-        if (n && cudaMemcpyAsync(host, st_.gdn, n, cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess) return fail("saving the state failed");
-        if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail("saving the state failed");
-        const int64_t tail[3] = {st_.rope_delta, pos, st_.tail_cell};
-        if (drafter_ && cudaMemcpy(host + n + sizeof tail, st_.tail, (size_t) g_.n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
-            return fail("saving the state failed");
-        std::memcpy(host + n, tail, sizeof tail);
-        if (block_ && !block_ctx_copy(host + n + sizeof tail, pos, false)) return fail("saving the state failed");
-        return {};
-    }
-
-    Result restore_running(const uint8_t* host, int64_t pos) override {
-        pend_T_ = 0;
-        st_.dctx_from = pos;   // until its saved context is back, the block drafter's cells are another conversation's
-        const size_t n = (size_t) g_.gdn_layers() * st_.gdn_floats * 4;
-        if (n && cudaMemcpyAsync(st_.gdn, host, n, cudaMemcpyHostToDevice, st_.stream) != cudaSuccess) return fail("restoring the state failed");
-        if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail("restoring the state failed");
-        int64_t tail[3];
-        std::memcpy(tail, host + n, sizeof tail);
-        st_.rope_delta = tail[0];
-        st_.tail_cell = tail[2];
-        if (drafter_ && cudaMemcpy(st_.tail, host + n + sizeof tail, (size_t) g_.n_embd * 4, cudaMemcpyHostToDevice) != cudaSuccess)
-            return fail("restoring the state failed");
-        if (block_ && !block_ctx_copy(const_cast<uint8_t*>(host) + n + sizeof tail, pos, true)) return fail("restoring the state failed");
-        return {};
-    }
-
-    // The block drafter's context in a running state: how many cells below the position hold it, then per layer its K and
-    // V for the window's cells below the position, oldest first (the cells under the count are not written).
-    size_t block_ctx_cells() const { return block_ ? (size_t) std::min<int64_t>(m_.w.dflash.window, st_.dctx_cap) : 0; }
-    size_t block_ctx_row() const { return (size_t) m_.w.dflash.n_kv * m_.w.dflash.head_dim * sizeof(uint16_t); }
-    size_t block_ctx_bytes() const {
-        return block_ ? sizeof(int64_t) + m_.w.dflash.layers.size() * 2 * block_ctx_cells() * block_ctx_row() : 0;
-    }
-    bool block_ctx_copy(uint8_t* host, int64_t pos, bool restore) {
-        const int64_t W = (int64_t) block_ctx_cells(), cap = st_.dctx_cap;
-        const size_t row = block_ctx_row();
-        int64_t valid = 0;
-        if (restore) {
-            std::memcpy(&valid, host, sizeof valid);
-            if (valid < 0 || valid > W || valid > pos) return false;
-            st_.dctx_from = pos - valid;
+    Result running_state(int64_t pos, bool save, core::RunningState& s) override {
+        if (save) {
+            if (Result r = settle(pos); !r.ok()) return r;
+            const int64_t W = block_ ? std::min<int64_t>(m_.w.dflash.window, st_.dctx_cap) : 0;
+            const int64_t valid = std::clamp<int64_t>(pos - st_.dctx_from, 0, std::min<int64_t>(W, pos));
+            const int64_t head[4] = {st_.rope_delta, pos, st_.tail_cell, valid};
+            s.head.assign((const uint8_t*) head, (const uint8_t*) head + sizeof head);
         } else {
-            valid = std::clamp<int64_t>(pos - st_.dctx_from, 0, std::min<int64_t>(W, pos));
-            std::memcpy(host, &valid, sizeof valid);
+            s.head.assign(kHeadBytes, 0);
         }
-        uint8_t* at = host + sizeof(int64_t);
-        for (size_t l = 0; l < st_.dk.size(); ++l)
-            for (int kv = 0; kv < 2; ++kv) {
-                uint8_t* dev = (uint8_t*) (kv == 0 ? st_.dk[l] : st_.dv[l]);
-                uint8_t* layer = at + (size_t) (2 * l + kv) * W * row;
-                // cells pos - valid .. pos - 1 at their offset from the window's start, in up to two runs of the ring
-                for (int64_t c = pos - valid; c < pos;) {
-                    const int64_t slot = c % cap, run = std::min(pos - c, cap - slot);
-                    uint8_t* h = layer + (size_t) (c - (pos - W)) * row;
-                    uint8_t* d = dev + (size_t) slot * row;
-                    const cudaError_t e = restore ? cudaMemcpyAsync(d, h, (size_t) run * row, cudaMemcpyHostToDevice, st_.stream)
-                                                  : cudaMemcpyAsync(h, d, (size_t) run * row, cudaMemcpyDeviceToHost, st_.stream);
-                    if (e != cudaSuccess) return false;
-                    c += run;
-                }
+        s.regions.clear();
+        if (const size_t n = (size_t) g_.gdn_layers() * st_.gdn_floats * 4) s.regions.push_back({st_.gdn, n});
+        if (drafter_) s.regions.push_back({st_.tail, (size_t) g_.n_embd * 4});
+        if (block_)
+            for (size_t l = 0; l < st_.dk.size(); ++l) {
+                s.regions.push_back({st_.dk[l], block_ring_bytes()});
+                s.regions.push_back({st_.dv[l], block_ring_bytes()});
             }
-        return cudaStreamSynchronize(st_.stream) == cudaSuccess;
+        s.stream = st_.stream;
+        return {};
+    }
+
+    Result running_restored(int64_t pos, const uint8_t* head) override {
+        pend_T_ = 0;
+        int64_t h[4];
+        std::memcpy(h, head, sizeof h);
+        const int64_t W = block_ ? std::min<int64_t>(m_.w.dflash.window, st_.dctx_cap) : 0;
+        if (h[1] != pos || h[3] < 0 || h[3] > W || h[3] > pos) {
+            st_.dctx_from = pos;   // the block drafter's cells are not this conversation's
+            return fail("restoring the state failed: its head does not match the position");
+        }
+        st_.rope_delta = h[0];
+        st_.tail_cell = h[2];
+        st_.dctx_from = pos - h[3];
+        return {};
     }
 
     // a layer's cells: fp16 K and V (format 1), or int8 codes with fp16 scales per 64 values (format 2); the MTP

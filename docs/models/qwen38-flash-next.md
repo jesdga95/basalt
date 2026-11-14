@@ -21,7 +21,8 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
   and `k8v4` trade precision for VRAM ([precision](../precision/qwen38-flash-next.md#measured-costs)).
 - **Experts:** the main card's cache holds the most routed ones, system RAM the rest, and an adaptive tier moves them as the
   conversation changes ([adaptive tier](../configuration/adaptive.md)).
-- **RAM:** before the RAM copy, the checkpoint blocks of every slot are allocated and the RAM of the page-locked prompt buffers
+- **RAM:** before the RAM copy, the checkpoint blocks of every slot are allocated (page-locked, so a checkpoint saves and
+  restores at link speed and a save runs beside the first decode window) and the RAM of the page-locked prompt buffers
   is held: the PLE rows at the largest chunk, a layer split's hand-offs, and the prompt split's weights, hand-offs and staging.
   Each buffer takes its held RAM when it is made; what none takes goes back before the top-up. The copy then leaves
   `--ram-reserve-mib` free beside the driver's page tracking (`RAM floor X GiB of N GiB free` when experts stay on the SSD).

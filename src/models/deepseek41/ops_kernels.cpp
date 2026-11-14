@@ -269,42 +269,19 @@ public:
         return total;
     }
 
-    void save_turn(void* stream, uint8_t* host) override {
-        cudaStreamSynchronize((cudaStream_t) stream);
+    void turn_regions(std::vector<core::DeviceRegion>& out) const override {
         const size_t ring_b = (size_t) kWindowSlots * win_row_bytes(fmt_);
-        size_t at = 0;
-        auto put = [&](const void* dev, size_t bytes) {
-            cudaMemcpy(host + at, dev, bytes, cudaMemcpyDeviceToHost);
-            at += bytes;
-        };
         for (size_t il = 0; il < ring_.size(); ++il) {
-            if (ring_[il]) put(ring_[il], ring_b);
+            if (ring_[il]) out.push_back({ring_[il], ring_b});
             if (st_kv_[il]) {
                 const size_t n = (size_t) g_.compress_ratio[il] * kLatent * 4;
-                put(st_kv_[il], n);
-                put(st_sc_[il], n);
+                out.push_back({st_kv_[il], n});
+                out.push_back({st_sc_[il], n});
             }
         }
     }
 
-    void restore_turn(void* stream, const uint8_t* host) override {
-        cudaStreamSynchronize((cudaStream_t) stream);
-        win_n_ = 0;
-        const size_t ring_b = (size_t) kWindowSlots * win_row_bytes(fmt_);
-        size_t at = 0;
-        auto get = [&](void* dev, size_t bytes) {
-            cudaMemcpy(dev, host + at, bytes, cudaMemcpyHostToDevice);
-            at += bytes;
-        };
-        for (size_t il = 0; il < ring_.size(); ++il) {
-            if (ring_[il]) get(ring_[il], ring_b);
-            if (st_kv_[il]) {
-                const size_t n = (size_t) g_.compress_ratio[il] * kLatent * 4;
-                get(st_kv_[il], n);
-                get(st_sc_[il], n);
-            }
-        }
-    }
+    void turn_restored() override { win_n_ = 0; }
 
     void reset() override {
         for (size_t il = 0; il < st_kv_.size(); ++il) {

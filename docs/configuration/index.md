@@ -154,7 +154,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept, about 118 MB of RAM each. `0` reads every prompt from the start. |
+| `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept, about 118 MB of RAM each on Flash-Next (page-locked, held from start with one more per slot). `0` reads every prompt from the start. |
 | `prompt-cache-every` | engine | tokens | 16384 (`0` = off) | Flash-Next only. Also checkpoint every N freshly read tokens (RAM only). |
 | `prompt-cache-root` | engine | tokens | 2048 (`0` = never) | Checkpoint the end of the system prompt when it is at least this long. |
 | `turn-token` | engine | token id | 248045 | The token that opens a chat turn; checkpoints go at the last one. |

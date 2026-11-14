@@ -1,5 +1,6 @@
 #pragma once
 
+#include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/models/qwen4exp/decode/session.hpp"
@@ -53,33 +54,13 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
 /// that holds those layers (another card's share of a prompt read).  The caller has synchronized `part`'s device.
 bool conversation_checkpoint_save_layers(ConversationCheckpoint& checkpoint, const SessionState& part,
                                          const ModelGeometry& g, int64_t layer_lo, int64_t layer_hi, std::string& error);
-/// Saves a checkpoint's GDN recurrences off the caller's critical path: the device state is copied into a spare
-/// device buffer at device bandwidth, and a helper thread moves it to the checkpoint's host bytes while the caller
-/// carries on.  The checkpoint's `gdn` bytes are valid only once finish() has returned true; nothing may read,
-/// move-from or free them before then.  The caller synchronizes the device before save(), as for a plain save.
-class ConversationCheckpointDeferral {
-public:
-    ConversationCheckpointDeferral() = default;
-    ~ConversationCheckpointDeferral();
-    ConversationCheckpointDeferral(const ConversationCheckpointDeferral&) = delete;
-    ConversationCheckpointDeferral& operator=(const ConversationCheckpointDeferral&) = delete;
-    /// Allocates the spare buffer on the current device; save() falls back to a plain save without one.
-    bool reserve(size_t bytes, std::string& error);
-    bool save(ConversationCheckpoint& checkpoint, const SessionState& session, const ModelGeometry& g,
-              std::string& error);
-    /// The host bytes still being written (null: none in flight).
-    const void* pending() const { return dst_; }
-    /// Waits for the host copy; false if it failed (the checkpoint's gdn bytes are then unusable).
-    bool finish(std::string& error);
-
-private:
-    void* spare_ = nullptr;
-    void* stream_ = nullptr;
-    size_t cap_ = 0;
-    std::thread worker_;
-    const void* dst_ = nullptr;
-    int status_ = 0;
-};
+/// The bytes of one checkpoint of this session's carve: what its host parts add up to, and the size of the device buffer
+/// a deferred save snapshots into.
+size_t conversation_checkpoint_bytes(const SessionState& session, const ModelGeometry& g);
+/// The same save with the host copy off the caller's critical path (basalt/core/checkpoint_transfer.hpp): the checkpoint's
+/// bytes are valid only once the deferral has finished.  Without a deferral buffer it is a plain save.
+bool conversation_checkpoint_save_deferred(CheckpointDeferral& deferral, ConversationCheckpoint& checkpoint,
+                                           const SessionState& session, const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
 

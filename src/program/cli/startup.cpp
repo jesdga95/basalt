@@ -40,7 +40,7 @@ std::optional<int> find_model(int argc, char** argv, const model::ModelAdapter*&
     const std::string name = arch && arch->is_string() ? arch->s : std::string();
     adapter = model::find_adapter(name);
     if (adapter == nullptr) {
-        basalt::log::error("basalt", "--model: no model adapter for architecture '%s'", name.c_str());
+        basalt::log::error("basalt", "--model: %s", model::unavailable_architecture(name).c_str());
         return 2;
     }
     return std::nullopt;

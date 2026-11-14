@@ -24,6 +24,11 @@ extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t n, c
     std::memcpy(dst, src, n);
     return cudaSuccess;
 }
+// the checkpoint transfer queues its copies and waits on the stream once: the same fault points as blocking copies
+extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, size_t n, cudaMemcpyKind kind, cudaStream_t) {
+    return __wrap_cudaMemcpy(dst, src, n, kind);
+}
+extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
 extern "C" cudaError_t __wrap_cudaDeviceSynchronize() {
     return ++sync_calls == fail_sync ? cudaErrorUnknown : cudaSuccess;
 }

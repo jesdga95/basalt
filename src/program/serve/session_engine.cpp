@@ -106,6 +106,7 @@ public:
                " gpus=" + ids + " ";
     }
     int init_after_input() override {
+        reserve_checkpoints();
         for (auto& s : sessions_)
             if (const basalt::model::Result r = s->prepare(); !r.ok()) {
                 basalt::log::error("basalt serve", "%s", r.message.c_str());
@@ -183,6 +184,7 @@ public:
     // the solo session's and every idle slot's.
     int64_t disk_min_tokens() const override { return sessions_[0]->disk_min_tokens(); }
     size_t spill_to_disk(bool at_exit, size_t limit) override {
+        ckd_finish();   // a turn checkpoint's state may still be on its way to the host
         size_t written = 0;
         if (at_exit)
             while (conversations->size() > 0) {
@@ -232,8 +234,7 @@ public:
         const int64_t positions = (int64_t) ids.size();
         image.live.ids = ids;
         image.live.imgs = imgs;
-        image.live.state_a.resize(session().running_bytes());
-        basalt::model::Result r = session().save_running(image.live.state_a.data(), positions);
+        basalt::model::Result r = save_running_now(image.live.state_a, positions);
         if (r.ok()) r = session().save_cells(image.kv, positions);
         if (!r.ok()) { e = r.message; return false; }
         image.checkpoints = cks;
@@ -243,6 +244,7 @@ public:
     // The outgoing conversation leaves the session for the RAM tier, or the disk tier when there is no room or the
     // session goes on holding it (`kept`) and only the disk lacks it.
     bool park_current(size_t held, int64_t kept) override {
+        ckd_finish();   // a turn checkpoint's state may still be on its way to the host
         if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
         if (o.conversation_cache_min_tokens > 0 && (int64_t) live.size() < o.conversation_cache_min_tokens) return true;
         int64_t deepest = 0;
@@ -282,30 +284,58 @@ public:
     /// The running state at `to`, kept in the chain; the oldest goes first past --prompt-cache.
     bool checkpoint_at(int64_t to, ConvCheckpoint::Source source, const std::vector<int64_t>& prompt) {
         if (o.prompt_cache <= 0 || to < 1) return true;
-        for (ConvCheckpoint& c : checks)
-            if ((int64_t) c.ids.size() == to) {
-                c.used = ++check_clock;
-                if (source > c.source) c.source = source;
-                return true;
-            }
+        ckd_finish();   // the save before this one lands first; one that failed has left the chain
+        if (touch_check(to, source)) return true;
         ConvCheckpoint c;
         c.source = source;
         c.ids.assign(prompt.begin(), prompt.begin() + to);
         c.imgs = imgs_below(req_imgs, to);
-        c.state_a.resize(session().running_bytes());
-        if (const basalt::model::Result r = session().save_running(c.state_a.data(), to); !r.ok()) {
+        basalt::core::RunningState rs;
+        if (const basalt::model::Result r = session().running_state(to, true, rs); !r.ok()) {
             err = r.message;
             return false;
         }
-        c.used = ++check_clock;
-        checks.push_back(std::move(c));
-        while ((int) checks.size() > o.prompt_cache) {
-            std::vector<uint64_t> stamps;
-            stamps.reserve(checks.size());
-            for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
-            checks.erase(checks.begin() + (std::ptrdiff_t) basalt::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), o.prompt_cache));
-        }
+        c.state_a.resize(rs.bytes());
+        std::memcpy(c.state_a.data(), rs.head.data(), rs.head.size());
+        // the state is snapshotted on the device now and moves to the host while the request goes on
+        const std::vector<basalt::core::SaveSegment> seg{{c.state_a.data() + rs.head.size(), rs.regions}};
+        if (!ckd.save(seg, (cudaStream_t) rs.stream, c.state_a.data(), err)) return false;
+        keep_check(std::move(c));
         return true;
+    }
+
+    /// The running state as it is now, into `to`: when this returns it has landed.
+    basalt::model::Result save_running_now(basalt::core::CheckpointBytes& to, int64_t pos) {
+        basalt::core::RunningState rs;
+        if (const basalt::model::Result r = session().running_state(pos, true, rs); !r.ok()) return r;
+        to.resize(rs.bytes());
+        std::memcpy(to.data(), rs.head.data(), rs.head.size());
+        std::string e;
+        if (!basalt::core::checkpoint_copy_out({{to.data() + rs.head.size(), rs.regions}}, (cudaStream_t) rs.stream, e))
+            return {basalt::model::Status::Error, e};
+        return {};
+    }
+    /// A checkpoint's or a parked conversation's running state back into the session.
+    basalt::model::Result restore_running_from(const basalt::core::CheckpointBytes& from, int64_t pos) {
+        basalt::core::RunningState rs;
+        if (const basalt::model::Result r = session().running_state(pos, false, rs); !r.ok()) return r;
+        if (from.size() != rs.bytes()) return {basalt::model::Status::Error, "a checkpoint's running state has the wrong size"};
+        std::string e;
+        if (!basalt::core::checkpoint_copy_in({{from.data() + rs.head.size(), rs.regions}}, (cudaStream_t) rs.stream, e))
+            return {basalt::model::Status::Error, e};
+        return session().running_restored(pos, from.data());
+    }
+
+    /// The host blocks the checkpoints take (page-locked, their pages written) and the device buffer a save is
+    /// snapshotted into, held before the models' RAM and VRAM tiers are sized so they plan beside them.
+    void reserve_checkpoints() {
+        if (o.prompt_cache <= 0) return;
+        const size_t bytes = session().running_bytes();
+        if (bytes == 0) return;
+        const size_t keep = (size_t) (o.prompt_cache + 1) * (size_t) std::max(o.batch, 1);
+        if (!basalt::core::CheckpointBytes::allocator_type::reserve(bytes, keep, &basalt::core::kCheckpointPin))
+            basalt::log::warn("basalt serve", "checkpoint blocks not reserved: out of host memory");
+        if (std::string e; !ckd.reserve(bytes, e)) basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", e.c_str());
     }
 
     basalt::model::ModelSession& session() { return *sessions_[(size_t) active_]; }
@@ -501,7 +531,7 @@ private:
     Flow decode() override { return decode_loop(*this); }
     bool release_room() override { return true; }
     bool checkpoint_mount(const ConvCheckpoint& c) override {
-        const basalt::model::Result r = rt_.session().restore_running(c.state_a.data(), (int64_t) c.ids.size());
+        const basalt::model::Result r = rt_.restore_running_from(c.state_a, (int64_t) c.ids.size());
         if (!r.ok()) runtime_.err = r.message;
         return r.ok();
     }
@@ -531,7 +561,7 @@ private:
         for (const ConvCheckpoint& c : incoming->checkpoints) sized = sized && c.state_a.size() == rt_.session().running_bytes();
         basalt::model::Result r = sized ? rt_.session().restore_cells(incoming->kv, positions)
                                         : basalt::model::Result{basalt::model::Status::Error, "its running state has another size"};
-        if (r.ok()) r = rt_.session().restore_running(incoming->live.state_a.data(), positions);
+        if (r.ok()) r = rt_.restore_running_from(incoming->live.state_a, positions);
         if (r.ok()) r = rt_.session().set_history(incoming->live.ids.data(), positions);
         if (!r.ok()) {
             basalt::log::warn("basalt serve", "conversation cache: restoring a parked conversation failed (%s); reading the prompt from the start", r.message.c_str());

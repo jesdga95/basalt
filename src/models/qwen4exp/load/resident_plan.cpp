@@ -1,4 +1,5 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/core/checkpoint_transfer.hpp"
 #include "context.hpp"
 
 namespace basalt::models::qwen4exp::generate {
@@ -168,7 +169,7 @@ int resident_plan(Context& context) {
                 basalt::core::ConversationStateSizes z;
                 std::string ze;
                 return !basalt::core::conversation_session_sizes(g, u, z, ze) ||
-                       basalt::core::CheckpointBytes::allocator_type::reserve(z.gdn, keep);
+                       basalt::core::CheckpointBytes::allocator_type::reserve(z.gdn, keep, &basalt::core::kCheckpointPin);
             };
             ok = reserve(ss);
             for (size_t i = 0; ok && i < stages.size(); ++i) ok = reserve(stages[i]->ss);
