@@ -24,9 +24,9 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(Model& m) : m_(m), g_(m.g) {}
     ~Session() override {
-        for (cudaGraphExec_t& e : st_.wg)
-            if (e) cudaGraphExecDestroy(e);
-        if (st_.wg1_alt) cudaGraphExecDestroy(st_.wg1_alt);
+        for (auto& per_buffer : st_.wg)
+            for (cudaGraphExec_t& e : per_buffer)
+                if (e) cudaGraphExecDestroy(e);
         if (st_.stream) cudaStreamDestroy(st_.stream);
         if (st_.side) cudaStreamDestroy(st_.side);
         if (st_.fork) cudaEventDestroy(st_.fork);

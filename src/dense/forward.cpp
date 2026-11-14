@@ -537,9 +537,9 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
     cudaMemcpyAsync(b.pos0, first, sizeof first, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.tok, tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.pos, pos3, (size_t) T * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-    // a one-row window writes the other state buffer (st.alt_ready); its graph is the one of the buffer in use
+    // a one-row window writes the other state buffer (st.alt_ready); the graph is the one of the buffer in use
     st.alt_ready = T == 1 && st.gdn_alt != nullptr;
-    cudaGraphExec_t& wg = T == 1 && st.gdn != st.gdn_first ? st.wg1_alt : st.wg[T];
+    cudaGraphExec_t& wg = st.wg[st.gdn != st.gdn_first ? 1 : 0][T];
     if (wg) {
         if (cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
         return cuda_ok("dense window", err);

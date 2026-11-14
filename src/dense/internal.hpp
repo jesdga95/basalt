@@ -145,11 +145,11 @@ struct SessionState {
     Arena arena;
     float* gdn = nullptr;                        // per GDN layer: state [S][h_v][S], then conv history [C][3]
     // the other state buffer: a one-row window writes its state after the row there (alt_ready), and keeping the row
-    // swaps the two instead of committing; the one-row window's graph per buffer (wg1_alt when gdn is gdn_alt's twin)
+    // swaps the two instead of committing.  Every window graph reads the state where it was captured: wg[1] holds the
+    // graphs captured while gdn was the second buffer
     float* gdn_alt = nullptr;
     float* gdn_first = nullptr;                  // the buffer gdn started as
     bool alt_ready = false;
-    cudaGraphExec_t wg1_alt = nullptr;
     size_t gdn_floats = 0;                       // per layer
     std::vector<uint16_t*> kc, vc;               // per attention layer: [cell][n_kv][head_dim] fp16 (null with int8)
     std::vector<kernels::KvInt8> kq;             // per attention layer: the int8 cache ({} with fp16)
@@ -159,7 +159,7 @@ struct SessionState {
     float* logits = nullptr;                     // [kWindow][n_vocab]
     int32_t* picks = nullptr;                    // device [kWindow]
     int64_t rope_delta = 0;                      // rope position - cell index for the next text token
-    cudaGraphExec_t wg[kWindow + 1] = {};        // the decode window of T rows, captured once per T
+    cudaGraphExec_t wg[2][kWindow + 1] = {};     // the decode window of T rows, captured once per T and state buffer
     // the drafter (null without one): its KV, the last window's normed hidden rows, and the row waiting for the
     // token after it (cell tail_cell, -1 none)
     uint16_t *mtp_kc = nullptr, *mtp_vc = nullptr;
