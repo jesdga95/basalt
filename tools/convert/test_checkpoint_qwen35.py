@@ -1,6 +1,7 @@
 """Tests for checkpoint_qwen35.py (convert.py --checkpoint DIR, no --sections-from) on a tiny synthetic Model Optimizer
 checkpoint: two layers (GDN, then gated attention) at the real GDN head geometry with narrow matrices, FP8 projections,
-NVFP4 MLPs and head, a BF16 drafter, a two-block vision tower and tokenizer files.
+NVFP4 MLPs and head, a BF16 drafter, a two-block vision tower and tokenizer files; and on its compressed-tensors
+variant: every projection NVFP4 (weight_packed, weight_global_scale), the a / b projections too, the head BF16.
 
     python3 tools/convert/test_checkpoint_qwen35.py
     python3 -m unittest discover -s tools/convert -p 'test_checkpoint_qwen35.py'"""
@@ -66,25 +67,33 @@ def q8_values(blob: bytes, rows: int, cols: int):
 class Fixture:
     """Writes the checkpoint and keeps the values it holds."""
 
-    def __init__(self, d: Path, extra: dict | None = None):
+    def __init__(self, d: Path, extra: dict | None = None, ct: bool = False):
+        self.ct = ct                            # compressed-tensors: every projection NVFP4, the head BF16
         self.rng = np.random.default_rng(7)
         self.v: dict[str, np.ndarray] = {}      # BF16 / F32 tensors as float32
         self.fp8: dict[str, tuple] = {}         # name -> (codes, scale)
         self.fp4: dict[str, tuple] = {}         # name -> (codes, scales, weight_scale_2)
         self.tens: dict = {}
         r = self.rng
+        HD = 128 if ct else globals()["HD"]      # NVFP4 planes need the k / v rows in 128s
         P = "model.language_model."
         L0, L1, M = P + "layers.0.", P + "layers.1.", "mtp.layers.0."
         self.bf(P + "embed_tokens.weight", (VOCAB, H))
         self.bf(P + "norm.weight", (H,))
-        self.fp4w("lm_head.weight", VOCAB, H)
+        if ct:
+            self.head(VOCAB, H)
+        else:
+            self.fp4w("lm_head.weight", VOCAB, H)
         self.bf(L0 + "input_layernorm.weight", (H,))
         self.bf(L0 + "post_attention_layernorm.weight", (H,))
-        self.f8(L0 + "linear_attn.in_proj_qkv.weight", (QKV, H))
-        self.f8(L0 + "linear_attn.in_proj_z.weight", (VALUE, H))
-        self.f8(L0 + "linear_attn.out_proj.weight", (H, VALUE))
-        self.bf(L0 + "linear_attn.in_proj_a.weight", (48, H))
-        self.bf(L0 + "linear_attn.in_proj_b.weight", (48, H))
+        self.proj(L0 + "linear_attn.in_proj_qkv.weight", (QKV, H))
+        self.proj(L0 + "linear_attn.in_proj_z.weight", (VALUE, H))
+        self.proj(L0 + "linear_attn.out_proj.weight", (H, VALUE))
+        for n in ("in_proj_a", "in_proj_b"):
+            if ct:
+                self.fp4w(L0 + f"linear_attn.{n}.weight", 48, H)
+            else:
+                self.bf(L0 + f"linear_attn.{n}.weight", (48, H))
         self.bf(L0 + "linear_attn.A_log", (48,))
         self.bf(L0 + "linear_attn.dt_bias", (48,))
         self.bf(L0 + "linear_attn.conv1d.weight", (QKV, 1, 4))
@@ -93,10 +102,10 @@ class Fixture:
             self.fp4w(L0 + f"mlp.{n}.weight", rows, cols)
         self.bf(L1 + "input_layernorm.weight", (H,))
         self.bf(L1 + "post_attention_layernorm.weight", (H,))
-        self.f8(L1 + "self_attn.q_proj.weight", (2 * NHEAD * HD, H))      # query and its output gate
-        self.f8(L1 + "self_attn.k_proj.weight", (NKV * HD, H))
-        self.f8(L1 + "self_attn.v_proj.weight", (NKV * HD, H))
-        self.f8(L1 + "self_attn.o_proj.weight", (H, NHEAD * HD))
+        self.proj(L1 + "self_attn.q_proj.weight", (2 * NHEAD * HD, H))      # query and its output gate
+        self.proj(L1 + "self_attn.k_proj.weight", (NKV * HD, H))
+        self.proj(L1 + "self_attn.v_proj.weight", (NKV * HD, H))
+        self.proj(L1 + "self_attn.o_proj.weight", (H, NHEAD * HD))
         self.bf(L1 + "self_attn.q_norm.weight", (HD,))
         self.bf(L1 + "self_attn.k_norm.weight", (HD,))
         for n, rows, cols in (("gate_proj", FF, H), ("up_proj", FF, H), ("down_proj", H, FF)):
@@ -142,7 +151,7 @@ class Fixture:
             self.tens[k] = v
         write_safetensors(d / "model-00001-of-00001.safetensors", self.tens)
         cfg = {"architectures": ["Qwen3_5ForConditionalGeneration"], "image_token_id": 11, "video_token_id": 10,
-               "vision_start_token_id": 15, "text_config": TEXT_CONFIG, "vision_config": VISION_CONFIG}
+               "vision_start_token_id": 15, "text_config": dict(TEXT_CONFIG, head_dim=HD), "vision_config": VISION_CONFIG}
         (d / "config.json").write_text(json.dumps(cfg))
         (d / "generation_config.json").write_text(json.dumps({"top_k": 20, "top_p": 0.95, "temperature": 0.6}))
         (d / "README.md").write_text("---\nlicense: apache-2.0\nbase_model:\n- Qwen/Qwen3.8-27B\n---\n# card\n")
@@ -164,6 +173,20 @@ class Fixture:
         u = x.view(np.uint32)
         self.tens[name] = ("BF16", shape, (u >> 16).astype("<u2").tobytes())
 
+    def proj(self, name, shape):
+        if self.ct:
+            self.fp4w(name, *shape)
+        else:
+            self.f8(name, shape)
+
+    def head(self, rows, cols):
+        # BF16 values with a spread of group magnitudes and an outlier per row, so the scale search has work to do
+        x = self.rng.standard_normal((rows, cols)) * np.exp(self.rng.uniform(-3, 0, (rows, cols // 16))).repeat(16, 1)
+        x[:, 5] *= 8
+        u = (x.astype(np.float32).view(np.uint32) + 0x8000) & 0xFFFF0000
+        self.v["lm_head.weight"] = u.view(np.float32)
+        self.tens["lm_head.weight"] = ("BF16", (rows, cols), (u >> 16).astype("<u2").tobytes())
+
     def f8(self, name, shape):
         codes = self.rng.integers(0, 127, size=shape, dtype=np.uint8) | (self.rng.integers(0, 2, size=shape, dtype=np.uint8) << 7)
         scale = np.float32(0.0123 + 0.001 * len(self.fp8))
@@ -177,8 +200,16 @@ class Fixture:
         codes = self.rng.integers(0, 256, size=(rows, cols // 2), dtype=np.uint8)
         sc = self.rng.integers(1, 0x7F, size=(rows, cols // 16), dtype=np.uint8)
         g = np.float32(0.25 + 0.125 * len(self.fp4))
+        if self.ct:
+            g = np.float32(3000 + 7 * len(self.fp4))      # weight_global_scale: the divisor
         self.fp4[name] = (codes, sc, g)
         base = name[:-len(".weight")]
+        if self.ct:
+            self.tens[base + ".weight_packed"] = ("U8", codes.shape, codes.tobytes())
+            self.tens[base + ".weight_scale"] = ("F8_E4M3", sc.shape, sc.tobytes())
+            self.tens[base + ".weight_global_scale"] = ("F32", (1,), g.tobytes())
+            self.tens[base + ".input_global_scale"] = ("F32", (1,), np.float32(100).tobytes())
+            return
         self.tens[name] = ("U8", codes.shape, codes.tobytes())
         self.tens[base + ".weight_scale"] = ("F8_E4M3", sc.shape, sc.tobytes())
         self.tens[base + ".weight_scale_2"] = ("F32", (), g.tobytes())
@@ -468,6 +499,111 @@ class Qwen35Test(unittest.TestCase):
         np.testing.assert_array_equal(np.frombuffer(self.p.mm_raw("v.post_ln.weight"), "<f4"), v[V + "merger.norm.weight"])
 
 
+def planes(codes: np.ndarray, sc: np.ndarray) -> bytes:
+    """NVFP4_PLANES bytes of codes [rows, K / 2] and UE4M3 scales [rows, K / 16] (nvfp4_planes.hpp's formula)."""
+    rows, cols = codes.shape[0], codes.shape[1] * 2
+    tiles = np.zeros(rows * cols // 16, np.uint8)
+    r, q = np.meshgrid(np.arange(rows), np.arange(cols // 16), indexing="ij")
+    tiles[((r // 128) * (cols // 64) + q // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + q % 4] = sc
+    return codes.tobytes() + tiles.tobytes()
+
+
+def nvfp4_dequant(codes: np.ndarray, sc: np.ndarray) -> np.ndarray:
+    v = np.empty((codes.shape[0], codes.shape[1] * 2), np.float64)
+    v[:, 0::2], v[:, 1::2] = Q.E2M1[codes & 15], Q.E2M1[codes >> 4]
+    return v * np.repeat(E4M3[sc], 16, axis=1)
+
+
+class Qwen35CompressedTensorsTest(unittest.TestCase):
+    """The compressed-tensors checkpoint: GDN, attention and MLP projections move as planes with 1 / weight_global_scale,
+    the a / b projections become BF16 of their values, the BF16 head is rounded to NVFP4."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        t = Path(cls.tmp.name)
+        (t / "ck").mkdir()
+        cls.fx = Fixture(t / "ck", ct=True)
+        out = t / "x.basalt"
+        r = subprocess.run([sys.executable, str(HERE / "convert.py"), "--checkpoint", str(t / "ck"), "--out", str(out),
+                            "--workers", "2"], capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(r.stdout + r.stderr)
+        cls.p = Pack(out, t)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.fx, self.p = type(self).fx, type(self).p
+
+    def check_planes(self, name, src, rows=None, cols=None):
+        codes, sc, g = self.fx.fp4[src]
+        if rows is not None:
+            codes, sc = codes[rows], sc[rows]
+        if cols is not None:   # whole 128-value heads move: their code bytes and their group scales
+            codes, sc = codes[:, cols[::2] // 2], sc[:, cols[::16] // 16]
+        T = self.p.meta["tensors"][name]
+        self.assertEqual((T["type"], T["shape"]), ("NVFP4_PLANES", [codes.shape[1] * 2, codes.shape[0]]), name)
+        self.assertEqual(self.p.raw(name), planes(np.ascontiguousarray(codes), np.ascontiguousarray(sc)), name)
+        self.assertEqual(self.p.f32(name[:-len(".weight")] + ".scale").tolist(), [float(np.float32(1 / np.float64(g)))], name)
+
+    def test_projections_as_planes(self):
+        L0, L1 = "model.language_model.layers.0.", "model.language_model.layers.1."
+        self.check_planes("blk.0.attn_qkv.weight", L0 + "linear_attn.in_proj_qkv.weight", rows=S.gdn_index(QKV, S.GDN_QK_ROWS))
+        self.check_planes("blk.0.attn_gate.weight", L0 + "linear_attn.in_proj_z.weight", rows=S.gdn_index(VALUE, 0))
+        self.check_planes("blk.0.ssm_out.weight", L0 + "linear_attn.out_proj.weight", cols=S.gdn_index(VALUE, 0))
+        for hf, g in (("q_proj", "attn_q"), ("k_proj", "attn_k"), ("v_proj", "attn_v"), ("o_proj", "attn_output")):
+            self.check_planes(f"blk.1.{g}.weight", L1 + f"self_attn.{hf}.weight")
+        for l in (0, 1):
+            for n in ("gate", "up", "down"):
+                self.check_planes(f"blk.{l}.ffn_{n}.weight", f"model.language_model.layers.{l}.mlp.{n}_proj.weight")
+        self.assertEqual(self.p.meta["tensors"]["mtp.ffn_gate.weight"]["type"], "Q8_0")
+
+    def test_gdn_gates_as_bf16(self):
+        L = "model.language_model.layers.0.linear_attn."
+        for hf, g in (("in_proj_a", "ssm_alpha"), ("in_proj_b", "ssm_beta")):
+            codes, sc, gs = self.fx.fp4[L + hf + ".weight"]
+            x = (nvfp4_dequant(codes, sc) / np.float64(gs))[S.gdn_block_source()]
+            got = self.p.bf16(f"blk.0.{g}.weight").astype(np.float64)
+            self.assertEqual(self.p.meta["tensors"][f"blk.0.{g}.weight"]["type"], "BF16")
+            # to nearest: within half a BF16 step (8 significant bits)
+            self.assertTrue((np.abs(got - x) <= np.abs(x) * 2.0 ** -8 + 1e-30).all(), g)
+            np.testing.assert_array_equal(got, Q.bf16_round(x).astype(np.uint32).__lshift__(16).view(np.float32))
+
+    def test_bf16_rounding(self):
+        x = np.array([1 + 2 ** -8, 1 + 3 * 2 ** -8, 1 + 2 ** -8 + 2 ** -30, -(1 + 2 ** -8), 0.0, 3.0])
+        u = Q.bf16_round(x).astype(np.uint32) << 16
+        np.testing.assert_array_equal(u.view(np.float32), [1.0, 1 + 4 * 2 ** -8, 1 + 2 * 2 ** -8, -1.0, 0.0, 3.0])
+
+    def test_head_rounded_to_nvfp4(self):
+        x = self.fx.v["lm_head.weight"]
+        T = self.p.meta["tensors"]["output.weight"]
+        self.assertEqual((T["type"], T["shape"]), ("NVFP4_PLANES", [H, VOCAB]))
+        gs = np.float32(np.abs(x).max()) / np.float32(2688)
+        self.assertEqual(self.p.f32("output.scale").tolist(), [float(gs)])
+        raw = np.frombuffer(self.p.raw("output.weight"), np.uint8)
+        codes = raw[:VOCAB * H // 2].reshape(VOCAB, H // 2)
+        r, q = np.meshgrid(np.arange(VOCAB), np.arange(H // 16), indexing="ij")
+        sc = raw[VOCAB * H // 2:][((r // 128) * (H // 64) + q // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + q % 4]
+        got = nvfp4_dequant(codes, sc) * np.float64(gs)
+        # each group's scale is the least-error one of those tried, so no worse than amax / 6 (round to nearest)
+        g = x.reshape(VOCAB, H // 16, 16).astype(np.float64)
+        s0 = E4M3[Q.ue4m3_round(np.abs(g).max(-1).astype(np.float32) / (np.float32(6) * gs))] * gs
+        q0 = Q.E2M1[Q.e2m1_round((g / np.where(s0 > 0, s0, 1)[..., None]).astype(np.float32))] * s0[..., None]
+        err = ((got.reshape(g.shape) - g) ** 2).sum(-1)
+        err0 = ((q0 - g) ** 2).sum(-1)
+        self.assertTrue((err <= err0 * (1 + 1e-6) + 1e-30).all())
+        self.assertLess(err.sum(), err0.sum())
+        self.assertIn("bf16_to_nvfp4", self.p.meta["checkpoint"])
+        self.assertIn("nvfp4_bf16", self.p.meta["checkpoint"])
+
+    def test_e2m1_rounding(self):
+        x = np.array([0.25, 0.26, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 5.1, 100, -0.75, -0.1], np.float32)
+        np.testing.assert_array_equal(Q.e2m1_round(x), [0, 1, 2, 2, 4, 4, 6, 6, 7, 7, 10, 0])
+
+
 class Qwen35RefusalTest(unittest.TestCase):
     """The plan refuses checkpoints it would convert wrongly; Plan reads headers only, so no conversion runs."""
 
@@ -518,12 +654,13 @@ class Qwen35RefusalTest(unittest.TestCase):
             sc = sc.copy()
             sc[0, 0] |= 0x80
             data = Q._job(("fp4s", str(d / "model-00001-of-00001.safetensors"),
-                           C.Checkpoint(d).t["lm_head.weight_scale"][1], H, 0, VOCAB))
+                           C.Checkpoint(d).t["lm_head.weight_scale"][1], H, VOCAB, 0, VOCAB, None, 0))
             self.assertIsInstance(data, bytes)      # the intact scales convert
             fx.tens["lm_head.weight_scale"] = ("F8_E4M3", sc.shape, sc.tobytes())
             write_safetensors(d / "model-00001-of-00001.safetensors", fx.tens)
             ck = C.Checkpoint(d)
-            bad = Q._job(("fp4s", str(d / "model-00001-of-00001.safetensors"), ck.t["lm_head.weight_scale"][1], H, 0, VOCAB))
+            bad = Q._job(("fp4s", str(d / "model-00001-of-00001.safetensors"), ck.t["lm_head.weight_scale"][1], H, VOCAB, 0,
+                          VOCAB, None, 0))
             self.assertIsInstance(bad, str)
 
 
