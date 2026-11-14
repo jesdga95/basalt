@@ -76,10 +76,18 @@ struct SegRow {
 };
 static_assert(sizeof(SegRow) == 32, "SegRow is copied as eight words");
 
+/// Where a segment's rows go in its own sequence (its row 0; rows follow at the same strides as a.h, a.gate, a.beta):
+/// its raw qkv channels (the commit's), conv outputs, gates and betas.
+struct SegDst {
+    float *qkv = nullptr, *h = nullptr, *gate = nullptr, *beta = nullptr;
+};
 /// dec_gdn_rec over a segmented window: each segment's tokens from its own state (the layer's at rows[].gdn +
 /// state_off), one launch for all n_rows window rows; a.state is unused.  max_n: the most rows a segment holds (at
-/// most kDecMaxT).  Every output is the segment's own dec_gdn_rec's, bitwise.
-void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, void* stream);
+/// most kDecMaxT).  Every output is the segment's own dec_gdn_rec's, bitwise.  With `dst` (one entry per entry of
+/// `rows`): `rows` lists the segments' first rows only, and each segment's qkv channels, h, gate and beta go to
+/// dst[k] + {off_c, off_c, off_hv, off_hv} instead of a.h / a.gate / a.beta at its window rows.
+void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, void* stream,
+                     const SegDst* dst = nullptr, size_t off_c = 0, size_t off_hv = 0);
 /// dec_gdn_rec in two launches: the split kernel (conv, gates, recurrence; never reads z) writes the raw output to
 /// a.o, dec_gdn_rec_norm applies the gated RMS norm and writes a.yq (and a.y); the same bits as dec_gdn_rec.  The z
 /// projection can run beside the split kernel.

@@ -590,7 +590,7 @@ void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, i
     win_attn_out(m, L, rows, s);
 }
 
-void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int rows, int max_n, cudaStream_t s) {
+void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int S, int rows, int max_n, cudaStream_t s) {
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const int H = g.n_embd, C = g.conv_channels();
@@ -598,12 +598,10 @@ void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int rows,
     prod_group(m, b.xn, xq, L.qkv.type, {{&L.qkv, b.rq}, {&L.z, b.z}}, rows, s);
     kernels::DecRecArgs a = gdn_args(m, L);
     a.qkv = b.rq;
-    a.h = b.rh;
-    a.gate = b.rgate;
-    a.beta = b.rbeta;
     if (on_wg(L.out.type)) a.y16 = (uint16_t*) b.xq;
-    kernels::dec_gdn_rec_seg(a, b.btab->seg, (size_t) gi * segs[0].st->gdn_floats, rows, max_n, s);
-    kernels::gdn_rows_scatter(b.btab->dst, rows, b.rq, b.rh, b.rgate, b.rbeta, C, g.gdn_v_heads, gi, kWindow, s);
+    // a cluster row a segment, its GDN rows straight into its session's store (the commit's)
+    kernels::dec_gdn_rec_seg(a, b.btab->first, (size_t) gi * segs[0].st->gdn_floats, S, max_n, s, b.btab->sdst,
+                             (size_t) gi * kWindow * C, (size_t) gi * kWindow * g.gdn_v_heads);
     prod_add(m, L.out, on_wg(L.out.type) ? b.xq : wact(m, b.y, L.out.type, g.value_width(), rows, s), b.x, rows, s);
 }
 
@@ -627,7 +625,7 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
         size_t next_target = 0;
         for (int il = 0; il < g.n_layers; ++il) {
             const Layer& L = w.layers[(size_t) il];
-            if (L.kind == Mixer::Gdn) batch_gdn(m, L, m.gdn_index[(size_t) il], segs, rows, max_n, s);
+            if (L.kind == Mixer::Gdn) batch_gdn(m, L, m.gdn_index[(size_t) il], segs, S, rows, max_n, s);
             else batch_attn(m, L, m.attn_index[(size_t) il], segs, S, rows, s);
             win_ffn(m, L, rows, s);
             if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) {
@@ -655,10 +653,8 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
 }  // namespace
 
 bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
-    const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const cudaStream_t s = segs[0].st->stream;
-    const int C = g.conv_channels(), HV = g.gdn_v_heads;
     int rows = 0, max_n = 1;
     BatchTable tab{};
     Model::BatchKey key;
@@ -668,12 +664,8 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
         key.emplace_back(&st, T);
         st.alt_ready = false;   // the batch recurrence leaves its state to the commit
         tab.pos0[k] = (int32_t) segs[k].pos;
-        for (int j = 0; j < T; ++j) {
-            tab.seg[rows + j] = {st.gdn, rows, j, T, T, k, (int32_t) (segs[k].pos + j)};
-            if (st.rec_qkv)
-                tab.dst[rows + j] = {st.rec_qkv + (size_t) j * C, st.rec_h + (size_t) j * C, st.rec_gate + (size_t) j * HV,
-                                     st.rec_beta + (size_t) j * HV};
-        }
+        tab.first[k] = {st.gdn, rows, 0, T, T, k, (int32_t) segs[k].pos};
+        tab.sdst[k] = {st.rec_qkv, st.rec_h, st.rec_gate, st.rec_beta};
         rows += T;
         max_n = std::max(max_n, T);
     }

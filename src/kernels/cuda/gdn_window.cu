@@ -385,7 +385,8 @@ __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T)
 // segment's rows and state
 template<int MAXT, int NJ>
 __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
-                                                                              size_t state_off) {
+                                                                              size_t state_off, const SegDst* dst,
+                                                                              size_t off_c, size_t off_hv) {
     const SegRow r = rows[blockIdx.y];
     if (r.j != 0) return;
     __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
@@ -393,8 +394,17 @@ __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(co
     DecRecArgs a = a0;
     const size_t vd = (size_t) S * a.h_v, r0 = (size_t) r.row0;
     a.state = r.gdn + state_off;
-    a.qkv += r0 * a.C; a.x += r0 * a.n_embd; a.z += r0 * vd; a.h += r0 * a.C;
-    a.gate += r0 * a.h_v; a.beta += r0 * a.h_v;
+    a.qkv += r0 * a.C; a.x += r0 * a.n_embd; a.z += r0 * vd;
+    if (!dst) {
+        a.h += r0 * a.C;
+        a.gate += r0 * a.h_v; a.beta += r0 * a.h_v;
+    } else {   // the segment's own rows in its sequence
+        const SegDst d = dst[blockIdx.y];
+        a.h = d.h + off_c;
+        a.gate = d.gate + off_hv;
+        a.beta = d.beta + off_hv;
+        a.qkv_out = d.qkv + off_c;
+    }
     if (a.y) a.y += r0 * vd;
     if (a.y16) a.y16 += r0 * vd;
     a.yq = static_cast<char*>(a.yq) + r0 * (vd / 32) * sizeof(Q81);
@@ -461,7 +471,8 @@ void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
-void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, void* stream) {
+void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, void* stream,
+                     const SegDst* dst, size_t off_c, size_t off_hv) {
     if (n_rows < 1 || max_n < 1 || max_n > kDecMaxT || !rows || !dec_gdn_rec_supported(a.n_embd) || a.h_k <= 0 ||
         a.h_v % a.h_k != 0 || a.nk != 0) {
         basalt::log::error("basalt", "dec_gdn_rec_seg: invalid arguments");
@@ -469,7 +480,7 @@ void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, 
     }
     const dim3 grid((unsigned) (a.h_v * 4), (unsigned) n_rows), block(S);
     const cudaStream_t s = (cudaStream_t) stream;
-    by_width<SegK>(a.n_embd, max_n, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, rows, state_off); });
+    by_width<SegK>(a.n_embd, max_n, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, rows, state_off, dst, off_c, off_hv); });
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec_seg: %s", cudaGetErrorString(e)); std::exit(1); }
 }

@@ -466,33 +466,9 @@ __global__ void __launch_bounds__(256) attn_gate_e4m3_kernel(const A* __restrict
     }
 }
 
-__global__ void gdn_rows_scatter_kernel(const GdnRowDst* __restrict__ dst, const float* __restrict__ qkv, const float* __restrict__ h,
-                                        const float* __restrict__ gate, const float* __restrict__ beta, int C, int h_v,
-                                        int64_t layer, int window_rows) {
-    const int r = blockIdx.x;
-    const GdnRowDst d = dst[r];
-    float* dq = d.qkv + layer * window_rows * C;
-    float* dh = d.h + layer * window_rows * C;
-    float* dg = d.gate + layer * window_rows * h_v;
-    float* db = d.beta + layer * window_rows * h_v;
-    for (int c = threadIdx.x; c < C; c += blockDim.x) {
-        dq[c] = qkv[(int64_t) r * C + c];
-        dh[c] = h[(int64_t) r * C + c];
-    }
-    for (int c = threadIdx.x; c < h_v; c += blockDim.x) {
-        dg[c] = gate[(int64_t) r * h_v + c];
-        db[c] = beta[(int64_t) r * h_v + c];
-    }
-}
 
 }  // namespace
 
-void gdn_rows_scatter(const GdnRowDst* dst, int n_rows, const float* qkv, const float* h, const float* gate, const float* beta,
-                      int C, int h_v, int64_t layer, int window_rows, void* stream) {
-    if (n_rows <= 0) return;
-    gdn_rows_scatter_kernel<<<(unsigned) n_rows, 256, 0, (cudaStream_t) stream>>>(dst, qkv, h, gate, beta, C, h_v, layer, window_rows);
-    check("gdn_rows_scatter");
-}
 
 void rms_norm_rows(const float* x, const float* w, float* out, int64_t rows, int64_t cols, float eps, void* stream,
                    int64_t ld_out) {
