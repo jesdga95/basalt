@@ -54,8 +54,11 @@ __global__ void rms_norm_rows_kernel(const float* __restrict__ x, const float* _
     for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) yr[c] = xr[c] * inv * w[c];
 }
 
-__global__ void add_scaled_kernel(float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ scale,
-                                  int64_t n) {
+// (the elementwise kernels below go through launch_pdl: they read earlier kernels' outputs after pdl_wait, so those
+// pointers are not __restrict__)
+__global__ void add_scaled_kernel(float* x, const float* y, const float* __restrict__ scale, int64_t n) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += scale ? y[i] * *scale : y[i];
 }
@@ -73,8 +76,9 @@ __global__ void rms_norm_rows_bf16_kernel(const __nv_bfloat16* __restrict__ x, c
     const float inv = rsqrtf(block_sum(ss, red) / (float) cols + eps);
     for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) yr[c] = __bfloat162float(xr[c]) * inv * w[c];
 }
-__global__ void add_scaled_bf16_kernel(__nv_bfloat16* __restrict__ x, const float* __restrict__ y, const float* __restrict__ scale,
-                                       int64_t n) {
+__global__ void add_scaled_bf16_kernel(__nv_bfloat16* x, const float* y, const float* __restrict__ scale, int64_t n) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) + (scale ? y[i] * *scale : y[i]));
 }
@@ -92,9 +96,10 @@ __global__ void scale_values_kernel(float* __restrict__ y, const float* __restri
     if (i < n) y[i] *= *scale;
 }
 
-__global__ void swiglu_scaled_kernel(const float* __restrict__ g, const float* __restrict__ u, const float* __restrict__ sg,
-                                     const float* __restrict__ su, float* __restrict__ h, int64_t rows, int64_t width,
-                                     int64_t ld) {
+__global__ void swiglu_scaled_kernel(const float* g, const float* u, const float* __restrict__ sg,
+                                     const float* __restrict__ su, float* h, int64_t rows, int64_t width, int64_t ld) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * width) return;
     const int64_t r = i / width, c = i % width;
@@ -341,8 +346,10 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
     }
 }
 
-__global__ void dyn_conv2_kernel(const float* __restrict__ x, const float* __restrict__ dyn, int64_t ld_dyn,
-                                 const float* __restrict__ base, float* __restrict__ out, int64_t T, int64_t H, int group) {
+__global__ void dyn_conv2_kernel(const float* x, const float* dyn, int64_t ld_dyn, const float* __restrict__ base, float* out,
+                                 int64_t T, int64_t H, int group) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * H) return;
     const int64_t t = i / H, c = i % H;
@@ -496,7 +503,7 @@ void rms_norm_rows(const float* x, const float* w, float* out, int64_t rows, int
 
 void add_scaled(float* x, const float* y, const float* scale, int64_t n, void* stream) {
     if (n <= 0) return;
-    add_scaled_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(x, y, scale, n);
+    launch_pdl(add_scaled_kernel, blocks_for(n), dim3(256), 0, (cudaStream_t) stream, x, y, scale, n);
     check("add_scaled");
 }
 
@@ -508,7 +515,8 @@ void rms_norm_rows(const uint16_t* x, const float* w, float* out, int64_t rows, 
 }
 void add_scaled(uint16_t* x, const float* y, const float* scale, int64_t n, void* stream) {
     if (n <= 0) return;
-    add_scaled_bf16_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(reinterpret_cast<__nv_bfloat16*>(x), y, scale, n);
+    launch_pdl(add_scaled_bf16_kernel, blocks_for(n), dim3(256), 0, (cudaStream_t) stream, reinterpret_cast<__nv_bfloat16*>(x), y,
+               scale, n);
     check("add_scaled");
 }
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream) {
@@ -531,7 +539,8 @@ void scale_values(float* y, const float* scale, int64_t n, void* stream) {
 void swiglu_scaled(const float* g, const float* u, const float* sg, const float* su, float* h, int64_t rows,
                    int64_t width, int64_t ld_gu, void* stream) {
     if (rows <= 0) return;
-    swiglu_scaled_kernel<<<blocks_for(rows * width), 256, 0, (cudaStream_t) stream>>>(g, u, sg, su, h, rows, width, ld_gu);
+    launch_pdl(swiglu_scaled_kernel, blocks_for(rows * width), dim3(256), 0, (cudaStream_t) stream, g, u, sg, su, h, rows, width,
+               ld_gu);
     check("swiglu_scaled");
 }
 
@@ -612,7 +621,7 @@ void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint1
 void dyn_conv2(const float* x, const float* dyn, int64_t ld_dyn, const float* base, float* out, int64_t T, int64_t H,
                int group, void* stream) {
     if (T <= 0) return;
-    dyn_conv2_kernel<<<blocks_for(T * H), 256, 0, (cudaStream_t) stream>>>(x, dyn, ld_dyn, base, out, T, H, group);
+    launch_pdl(dyn_conv2_kernel, blocks_for(T * H), dim3(256), 0, (cudaStream_t) stream, x, dyn, ld_dyn, base, out, T, H, group);
     check("dyn_conv2");
 }
 

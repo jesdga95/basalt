@@ -853,6 +853,7 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.tok, tok, (size_t) R * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.bpos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    kernels::PdlScope pdl(true, true);   // after the uploads: each product stages its weights during the kernel before
     embed_rows(m, b.tok, R, s);
     const kernels::RopeSpec rope = block_rope(bd);
     // the dynamic convolution runs along each block's own rows into b.bh
