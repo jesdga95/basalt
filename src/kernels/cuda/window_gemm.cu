@@ -65,19 +65,46 @@ __global__ void __launch_bounds__(256) pack_kernel(const float* x, int64_t ld_x,
 __device__ __forceinline__ float widen(float v) { return v; }
 __device__ __forceinline__ float widen(uint16_t v) { return __bfloat162float(__ushort_as_bfloat16(v)); }
 
+// A row of up to kPackHeld values a thread: its weights are read before the wait (they are constant) and its values once,
+// kept in registers for the second pass; longer rows loop.  The sums and products are rms_norm_rows' in its order.
+constexpr int kPackHeld = 16;
 template <class X>
 __global__ void __launch_bounds__(kPackThreads) norm_pack_kernel(const X* x, const float* __restrict__ w, float eps,
                                                                  int64_t K, uint16_t* out, float* xn) {
     __shared__ float red[32];
     pdl_launch_dependents();
+    const int tid = threadIdx.x, bd = blockDim.x;
+    const bool held = K <= (int64_t) kPackHeld * bd;
+    const int n = held ? (int) (K > tid ? (K - tid + bd - 1) / bd : 0) : 0;   // this thread's values: tid + j * bd
+    float wv[kPackHeld];
+#pragma unroll
+    for (int j = 0; j < kPackHeld; ++j) wv[j] = j < n ? w[tid + j * bd] : 0.0f;
     pdl_wait();
     const X* xr = x + (int64_t) blockIdx.x * K;
-    float ss = 0.0f;
-    for (int64_t c = threadIdx.x; c < K; c += blockDim.x) ss = fmaf(widen(xr[c]), widen(xr[c]), ss);
-    const float inv = rsqrtf(block_sum(ss, red) / (float) K + eps);
     float* yr = xn ? xn + (int64_t) blockIdx.x * K : nullptr;
     uint16_t* o = out + (int64_t) blockIdx.x * K;
-    for (int64_t c = threadIdx.x; c < K; c += blockDim.x) {
+    if (held) {
+        float xv[kPackHeld];
+#pragma unroll
+        for (int j = 0; j < kPackHeld; ++j) xv[j] = j < n ? widen(xr[tid + j * bd]) : 0.0f;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kPackHeld; ++j)
+            if (j < n) ss = fmaf(xv[j], xv[j], ss);
+        const float inv = rsqrtf(block_sum(ss, red) / (float) K + eps);
+#pragma unroll
+        for (int j = 0; j < kPackHeld; ++j)
+            if (j < n) {
+                const float v = xv[j] * inv * wv[j];
+                if (yr) yr[tid + j * bd] = v;
+                o[tid + j * bd] = bf16_bits(v);
+            }
+        return;
+    }
+    float ss = 0.0f;
+    for (int64_t c = tid; c < K; c += bd) ss = fmaf(widen(xr[c]), widen(xr[c]), ss);
+    const float inv = rsqrtf(block_sum(ss, red) / (float) K + eps);
+    for (int64_t c = tid; c < K; c += bd) {
         const float v = widen(xr[c]) * inv * w[c];
         if (yr) yr[c] = v;
         o[c] = bf16_bits(v);
