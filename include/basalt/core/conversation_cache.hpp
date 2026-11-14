@@ -275,6 +275,53 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
+/// The images of `all` that begin before token position L.  A checkpoint at length L must hold exactly these to be a
+/// state of this conversation.  Shared by the serving slot's own `imgs_below` and the routing report, so both agree.
+inline std::vector<ConversationImageKey> conversation_images_below(const std::vector<ConversationImageKey>& all, int64_t L) {
+    std::vector<ConversationImageKey> v;
+    for (const ConversationImageKey& k : all) if (k.start < L) v.push_back(k);
+    return v;
+}
+
+/// A checkpoint holds state this conversation can resume from at `held`: its tokens are a prefix of it and its images
+/// match those below it.  Unlike `conversation_prefix` the whole prompt is allowed - resuming at the very end re-reads
+/// no token, which is what an identical retry does.
+inline bool conversation_checkpoint_valid(const ConversationCheckpoint& c, const std::vector<int32_t>& held,
+                                          const std::vector<ConversationImageKey>& images) {
+    return c.ids.size() <= held.size() &&
+           conversation_ids_equal(c.ids.data(), c.ids.size(), held.data()) &&
+           c.imgs == conversation_images_below(images, (int64_t) c.ids.size());
+}
+
+/// The shared system-prefix length among `saved`: the deepest checkpoint the engine marked as the root (the end of the
+/// system prompt, `ConversationCheckpoint::kRoot`) that is a valid prefix of this conversation.  At or below it a
+/// checkpoint is reusable but establishes no conversation affinity - every chat of the client shares it - so routing
+/// does not report those.  A foreign or stale root (another token prefix or images) never sets the boundary.  Returns 0
+/// when none of `saved` is a valid root, so a lone conversation checkpoint keeps its affinity for its retry.
+inline size_t conversation_shared_boundary(const std::vector<int32_t>& held,
+                                           const std::vector<ConversationImageKey>& images,
+                                           const std::vector<ConversationCheckpoint>& saved) {
+    size_t shared = 0;
+    for (const ConversationCheckpoint& c : saved)
+        if (c.source == ConversationCheckpoint::kRoot && conversation_checkpoint_valid(c, held, images) &&
+            c.ids.size() > shared)
+            shared = c.ids.size();
+    return shared;
+}
+
+/// The checkpoint lengths routing publishes: every valid one deeper than the shared boundary.  Model-agnostic - it
+/// reads only the engine's own provenance marks and token/image prefixes, never a chat template or role text.
+inline std::vector<size_t> conversation_report_checkpoints(const std::vector<int32_t>& held,
+                                                           const std::vector<ConversationImageKey>& images,
+                                                           const std::vector<ConversationCheckpoint>& saved) {
+    const size_t shared = conversation_shared_boundary(held, images, saved);
+    std::vector<size_t> out;
+    for (const ConversationCheckpoint& c : saved)
+        if (c.ids.size() > shared && conversation_checkpoint_valid(c, held, images))
+            out.push_back(c.ids.size());
+    return out;
+}
+
 class ConversationCache {
 public:
     struct Match {

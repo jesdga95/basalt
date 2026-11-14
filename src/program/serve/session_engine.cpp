@@ -623,13 +623,14 @@ bool SessionRuntime::next_batch_window() {
             bpolicy->observe_window(chance, T, a, std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
         }
         if (fin != nullptr) {
+            sl.active = false;
+            sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids for the next turn
+            sl.idle_busy = busy_now();
+            sl.guard.reset();
+            report_cache(b, sl.cached, sl.ids, sl.imgs, sl.checks);   // confirmed cache, before the slot's BDONE
             std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin,
                         std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
                         (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
-            sl.active = false;
-            sl.cached = o.prompt_cache > 0;
-            sl.idle_busy = busy_now();
-            sl.guard.reset();
         }
         std::fflush(stdout);
     }

@@ -28,9 +28,7 @@ uint64_t fnv1a(const void* data, size_t n, uint64_t h) {
 }
 
 std::vector<ImgKey> Runtime::imgs_below(const std::vector<ImgKey>& all, int64_t L) {
-    std::vector<ImgKey> v;
-    for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
-    return v;
+    return basalt::core::conversation_images_below(all, L);   // one definition, shared with the routing report
 }
 
 bool Runtime::batch_on() { for (const BSlot& b : bs) if (b.active) return true; return false; }

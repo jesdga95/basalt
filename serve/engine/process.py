@@ -17,6 +17,9 @@ Protocol (one line each):
     `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`).
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
     that slot's own state, answered like a GEN.
+  * cache routing: `SCACHE <slot> <live_len> [checkpoint_len ...]` precedes the slot's terminal frame and publishes the
+    native-confirmed token run it retains and its conversation-checkpoint lengths; the router resumes retries and
+    edited tails from them instead of assuming every emitted token was fed.
   * `VRAM [mib]` -> `VRAM k=v ...`; `QUIT` ends the engine.
   * `ENC <image> <out> [<image> <out> ...]` (--vision): one `ENC OK <n> <nx> <ny> <ms>` per image, or `ENC ERR`;
     `ENCV <video> <out> [k=v ...]`: one `ENC OK <groups> <nx> <ny> <ms> <time,...>`, or `ENC ERR`. At start a
@@ -114,7 +117,7 @@ def relay_auto_flags(line: str) -> bool:
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
 PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
-                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ")
+                  "BADM ", "BT ", "BP ", "BDONE ", "SCACHE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ")
 
 
 def log_unparsed(line: str, log) -> None:
@@ -354,6 +357,8 @@ class ProcessEngine:
         self.slot_busy = [False] * self.batch
         # tokens each slot holds (for prefix reuse by a conversation's next turn) and when it was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+        self.slot_checkpoints: list[list[int]] = [[] for _ in range(self.batch)]
+        self.slot_reports = [None for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
         # session identity (a load-balancer header) -> its slot: a conversation stays in one slot, so its next
         # turn continues the K/V that is already there instead of being admitted wherever and copied in
@@ -397,10 +402,14 @@ class ProcessEngine:
     def _pump(self):
         proc, lines, log = self.proc, self.lines, self.log   # a restart replaces all three
         slot_q = self.slot_q
+        reports = self.slot_reports
         line = None
         for line in proc.stdout:
             line = engine_line(line)
             log_unparsed(line, log)
+            if line.startswith("SCACHE "):
+                self._slot_report(line, reports)
+                continue
             if line.startswith(AUTO_FLAGS):             # printed once, before READY; never a reply line
                 continue
             if line.startswith("INFO "):                # a fact the engine updates as it runs; never a reply line
@@ -805,7 +814,7 @@ class ProcessEngine:
                 self._ctl_result = ("done", None)
                 return
 
-    def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None):
+    def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None, on_token=None):
         """Read control lines up to `until` (DONE or BADM) so the next request sees no leftovers; None if the engine
         ended or `born` (the starting engine generation) is gone."""
         end = time.monotonic() + timeout
@@ -820,6 +829,8 @@ class ProcessEngine:
                 return None
             if line.startswith("DONE"):
                 self._parse_done(line)
+            if line.startswith("T ") and on_token is not None:
+                on_token(int(line[2:]))
             if line.startswith(until) or line.startswith("ERR"):
                 return line
         return None
@@ -835,6 +846,7 @@ class ProcessEngine:
         except EngineDied:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # restart() replaces them
+        reports, checkpoints = self.slot_reports, self.slot_checkpoints
         tail = list(stream or [])
 
         def drain(end):             # "done" (fields) | "gone" (engine ended) | "wait" (not yet)
@@ -857,20 +869,21 @@ class ProcessEngine:
                     return "done", f
             return "wait", None
 
-        def free():
-            held[slot] = tail[:-1] if stream and tail else []
+        def free(confirmed):
+            report = reports[slot] if confirmed else (0, [])
+            held[slot], checkpoints[slot] = self._retained_slot(tail, report, len(tail) - 1 if stream else 0)
             with self.slot_cv:
                 busy[slot] = False
                 self.slot_cv.notify_all()
 
         state, fields = drain(time.monotonic() + wait_s) if wait_s > 0 else ("wait", None)
         if state != "wait":
-            free()
+            free(state == "done")
             return fields
 
         def wait():
-            drain(time.monotonic() + 600.0)
-            free()
+            state, _ = drain(time.monotonic() + 600.0)
+            free(state == "done")
         threading.Thread(target=wait, daemon=True).start()
         return None
 
@@ -1055,10 +1068,12 @@ class ProcessEngine:
                             f"SGEN {solo_slot} {left}{gen_keys()}"
                     else:
                         head = f"GENI {left}{gen_keys()} {embeddings}" if embeddings else f"GEN {left}{gen_keys()}"
-                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     run0, yield_sent = len(out), False
                     if solo_slot is not None:
                         self.slot_held[solo_slot] = []          # the run overwrites what the slot held
+                        self.slot_checkpoints[solo_slot] = []
+                        self.slot_reports[solo_slot] = None
+                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
                     self._ctl_erred = False
@@ -1137,7 +1152,8 @@ class ProcessEngine:
                             return
                         holding, born = True, self.gen
                     if self._yielded is not None:           # gave way: waiting requests go first
-                        self.slot_held[slot] = list(prompt[:self._yielded[1]])
+                        prefix = prompt[:self._yielded[1]]
+                        self._keep_slot(slot, prefix, len(prefix))
                         self._yielded = None
                         yields += 1
                         self.ctl.release()
@@ -1152,8 +1168,11 @@ class ProcessEngine:
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
-                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # admission overwrites the slot
+                    self.slot_checkpoints[slot] = []
+                    self.slot_reports[slot] = None
+                    run0 = len(out)
+                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
@@ -1186,6 +1205,8 @@ class ProcessEngine:
                 self.ctl.release()
                 holding = False
                 if not cont:
+                    if self._yielded is None:
+                        self._keep_slot(slot, prompt + out[run0:])
                     return
                 notok = bool(self._ctl_result and len(self._ctl_result) > 2 and self._ctl_result[2])
                 gen0 = len(out) if notok else len(out) - 1  # the admission's token, if any; the slot feeds it first
@@ -1231,7 +1252,8 @@ class ProcessEngine:
                         self._note_bdone(slot, f)
                         self._bdone_last(f)
                         # the slot holds the prompt and every token fed (all but the last)
-                        self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        stream = list(prompt) + out[gen0:]
+                        self._keep_slot(slot, stream, len(stream) - 1 if len(out) > gen0 else 0)
                         again = (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                  and not (out and out[-1] in self.eos_ids())
                                  and not (stop_soon is not None and stop_soon.is_set()))
@@ -1257,20 +1279,25 @@ class ProcessEngine:
                 drained = phase in ("solo", "admit")    # this run's DONE is read below
                 if phase == "solo":
                     self._send("STOP")
-                    self._drain_control("DONE", born=born)
+                    line = self._drain_control("DONE", born=born, on_token=pending.append)
+                    if line and line.startswith("DONE"):
+                        self._solo_kept(solo_slot, prompt, out[run0:] + pending)
                 elif phase == "admit":
-                    line = self._drain_control("BADM", born=born)
+                    line = self._drain_control("BADM", born=born, on_token=pending.append)
                     if line and line.startswith("BADM ") and line.split()[2:3] in (["1"], ["2"]):
                         phase = "slot"
+                        gen0 = run0
+                    elif line and line.startswith("BADM "):
+                        self._keep_slot(slot, prompt + out[run0:] + pending)
                 if drained and phase != "slot":
                     self._carry_run(carry, first, last0, True)     # a request that ran in earlier runs too
             except EngineDied:
                 pass
             if holding:
                 self.ctl.release()
+            if self.gen != born:
+                reserved = slot = None
             if reserved is not None:
-                if reserved == solo_slot:
-                    self._solo_kept(solo_slot, prompt, out[run0:])
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
                     self.slot_cv.notify_all()
@@ -1278,7 +1305,8 @@ class ProcessEngine:
                 self.slot_used[slot] = time.time()
                 if phase == "slot":
                     self.slot_held[slot] = []
-                    stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                    self.slot_checkpoints[slot] = []
+                    stream = list(prompt) + out[gen0:] + pending if gen0 is not None else None
                     f = self._release_slot_when_done(slot, stream, wait_s=self.BDONE_WAIT_S)
                     if f is not None:
                         self._bdone_last(f)
@@ -1297,13 +1325,52 @@ class ProcessEngine:
         """A solo run in `slot` ended: the engine keeps its prompt and every token it fed (all but the last) there."""
         if slot is None:
             return
-        self.slot_held[slot] = list(prompt) + gen[:-1] if gen else []
+        self._keep_slot(slot, list(prompt) + gen, len(prompt) + len(gen) - 1 if gen else 0)
         self.slot_used[slot] = time.time()
+
+    @staticmethod
+    def _slot_report(line, reports):
+        """SCACHE publishes native-confirmed live length and conversation checkpoint lengths, before the terminal."""
+        f = line.split()
+        if len(f) < 2 or not f[1].isdigit() or not 0 <= int(f[1]) < len(reports):
+            return
+        b = int(f[1])
+        reports[b] = (0, [])
+        if len(f) < 3 or not all(x.isdigit() for x in f[2:]):
+            return
+        live, *checks = map(int, f[2:])
+        if all(0 < n <= live for n in checks):
+            reports[b] = (live, sorted(set(checks)))
+
+    @staticmethod
+    def _retained_slot(stream, report, fallback=0):
+        # Older binaries report no checkpoints; their known fed stream is still a continuation candidate.
+        n, checks = report if report is not None else (fallback, [])
+        if n < 0:
+            return [], []
+        held = list(stream[:n])
+        return held, [c for c in checks if 0 < c <= len(held)]
+
+    def _keep_slot(self, slot, stream, fallback=0):
+        self.slot_held[slot], self.slot_checkpoints[slot] = self._retained_slot(
+            stream, self.slot_reports[slot], fallback)
+
+    def _slot_match(self, slot, prompt):
+        h = self.slot_held[slot]
+        report = self.slot_reports[slot]
+        # A committed speculative tail may extend past the emitted tokens.
+        live = report is None or report[0] == len(h)
+        if h and live and len(h) < len(prompt) and prompt[:len(h)] == h:
+            return (2, len(h))
+        # Reports keep checkpoint lengths sorted; the first match is the longest.
+        for n in reversed(self.slot_checkpoints[slot]):
+            if 0 < n < len(prompt) and prompt[:n] == h[:n]:
+                return (1, n)
+        return (0, 0)
 
     def _resumes(self, slot: int, prompt: list[int]) -> bool:
         """Whether `slot` holds the start of `prompt`."""
-        h = self.slot_held[slot]
-        return bool(h) and len(h) < len(prompt) and prompt[:len(h)] == h
+        return self._slot_match(slot, prompt)[0] > 0
 
     def queue_depth(self) -> int:
         """Requests waiting for the engine or a free slot."""
@@ -1323,12 +1390,11 @@ class ProcessEngine:
         if own is not None and own in free:
             return own
 
-        def held_prefix(b):
-            h = self.slot_held[b]
-            return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
         pool = [b for b in free if b not in self.slot_owner] or free   # slot_owner is keyed by slot
-        best = max(pool, key=held_prefix)
-        return best if held_prefix(best) > 0 else min(pool, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
+        best, match = max(((b, self._slot_match(b, prompt)) for b in pool), key=lambda item: item[1])
+        if match[0]:
+            return best
+        return min(pool, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
 
     def claim_slot(self, slot: int, session: str | None) -> None:
         """Bind `slot` to `session` (caller holds slot_cv), dropping whoever held it and the session's own previous

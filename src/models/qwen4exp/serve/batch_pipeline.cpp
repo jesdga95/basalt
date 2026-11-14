@@ -47,9 +47,10 @@ bool QfnRuntime::pump(bool may_start) {
             sl.ids.push_back(sl.x);
             if (fin != nullptr) {
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                std::printf("BDONE %d %lld %s %.1f 0 0\n", gi * GS + t, (long long) sl.produced, fin, ms);
                 sl.active = false;
                 sl.cached = false;   // the pipeline's pad rows: a pipelined slot is not reused as a cache
+                report_cache(gi * GS + t, false, sl.ids, sl.imgs, sl.checks);
+                std::printf("BDONE %d %lld %s %.1f 0 0\n", gi * GS + t, (long long) sl.produced, fin, ms);
             } else {
                 sl.x = y;
                 sl.p += 1;
