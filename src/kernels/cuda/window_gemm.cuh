@@ -1,5 +1,5 @@
-// src/kernels/cuda/window_gemm.cuh - the decode window products' kernel (see include/basalt/kernels/window_gemm.hpp),
-// shared by its FP8 and NVFP4 instantiations.  No kernel is instantiated here.
+// src/kernels/cuda/window_gemm.cuh - the decode window products' kernel for NVFP4, BF16 and Q8 matrices (see
+// include/basalt/kernels/window_gemm.hpp; FP8 runs window_gemm_sliced.cuh).  No kernel is instantiated here.
 //
 // A work item is RS rows of each of NM matrices (NM 2: a SwiGLU pair, gate rows in the first warps, up rows in the
 // others) over one slice of K; a warp owns 16 MW rows.  The grid is at most one wave of blocks, each taking items
@@ -47,7 +47,7 @@ struct Args {
 template <int F, int RS, int NM, int CH, int ST>
 struct Cfg {
     static constexpr int kThreads = 32 * NM * RS / 16;   // with one 16-row tile per warp
-    static constexpr int CB = F == (int) Format::F8 || F == (int) Format::Q8 ? CH : F == (int) Format::Bf16 ? 2 * CH : CH / 2;   // weight bytes per row per chunk
+    static constexpr int CB = F == (int) Format::Q8 ? CH : F == (int) Format::Bf16 ? 2 * CH : CH / 2;   // weight bytes per row per chunk
     static constexpr int P = CB / 16;                                        // 16-byte pieces per row per chunk
     static constexpr int SB = F == (int) Format::Nvfp4 ? (CH / 64) * RS * 4 : F == (int) Format::Q8 ? RS * (CH / 16) : 0;   // scale bytes per matrix per chunk
     static constexpr int MB = RS * CB + SB;                                  // bytes per matrix per stage
@@ -60,7 +60,7 @@ struct Cfg {
 
 // the piece a row's 16-byte piece q lands on in shared memory (bank spread for the reads below)
 template <int F, int P> __device__ __forceinline__ int swz(int r) {
-    if constexpr (F == (int) Format::F8 || F == (int) Format::Q8) return P >= 8 ? (r & 1) << 2 : 0;
+    if constexpr (F == (int) Format::Q8) return P >= 8 ? (r & 1) << 2 : 0;
     else if constexpr (F == (int) Format::Bf16) return P >= 16 ? (r & 1) << 3 : 0;
     else if constexpr (P >= 8) return (r & 3) << 1;
     else if constexpr (P == 4) return ((r >> 1) & 1) << 1;
@@ -130,7 +130,7 @@ __device__ __forceinline__ uint4 ld_nc16(const void* p) {
 template <int F, int RS, int NM, int CH, int ST, int NT, int MW>
 __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgemm_kernel(const Args a) {
     using C = Cfg<F, RS, NM, CH, ST>;
-    constexpr bool kF8 = F == (int) Format::F8, kBf16 = F == (int) Format::Bf16, kQ8 = F == (int) Format::Q8;
+    constexpr bool kBf16 = F == (int) Format::Bf16, kQ8 = F == (int) Format::Q8;
     constexpr int KB = CH / 64;                       // 64-value blocks per chunk
     constexpr int kWarpsPerM = RS / (16 * MW);        // warps per matrix
     constexpr int kThreads = 32 * NM * kWarpsPerM;
@@ -139,7 +139,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
     __shared__ float xchg[NM == 2 ? RS * kRows : 1];   // SwiGLU: the up rows for the gate warps
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
     const int ks = a.ks, items = a.tiles * ks, G = gridDim.x;
-    const int64_t row_bytes = kF8 || kQ8 ? a.K : kBf16 ? 2 * a.K : a.K / 2;
+    const int64_t row_bytes = kQ8 ? a.K : kBf16 ? 2 * a.K : a.K / 2;
 
     // a work item is (row tile, K slice); a block takes items blockIdx.x, + G, ... and streams their chunks as one
     // sequence through the stages
@@ -296,18 +296,6 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                             a1[s] = bf16x2_mul(s8x2_bf16(u1[s]), sc1);
                             a2[s] = bf16x2_mul(s8x2_bf16(u0[s] >> 16), sc0);
                             a3[s] = bf16x2_mul(s8x2_bf16(u1[s] >> 16), sc1);
-                        }
-                    } else if constexpr (kF8) {
-                        const int pc = 4 * b + c;
-                        const uint4 w0 = *(const uint4*) (q0 + ((pc ^ swz<F, C::P>(r0l)) << 4));
-                        const uint4 w1 = *(const uint4*) (q1 + ((pc ^ swz<F, C::P>(r1l)) << 4));
-                        const unsigned u0[4] = {w0.x, w0.y, w0.z, w0.w}, u1[4] = {w1.x, w1.y, w1.z, w1.w};
-#pragma unroll
-                        for (int s = 0; s < 4; ++s) {
-                            a0[s] = e4m3x2_f16(u0[s]);
-                            a1[s] = e4m3x2_f16(u1[s]);
-                            a2[s] = e4m3x2_f16(u0[s] >> 16);
-                            a3[s] = e4m3x2_f16(u1[s] >> 16);
                         }
                     } else {
                         const int pc = 2 * b + (c >> 1), half = (c & 1) * 8;

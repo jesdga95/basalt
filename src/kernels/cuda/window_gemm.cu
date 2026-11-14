@@ -178,7 +178,7 @@ Plan plan_for(const Call& c) {
         return p;
     }
     const int64_t R = resident(*p.k);
-    const int cb = c.fmt == Format::F8 || c.fmt == Format::Q8 ? p.k->ch : c.fmt == Format::Bf16 ? 2 * p.k->ch : p.k->ch / 2;   // weight bytes per row per chunk
+    const int cb = c.fmt == Format::Q8 ? p.k->ch : c.fmt == Format::Bf16 ? 2 * p.k->ch : p.k->ch / 2;   // weight bytes per row per chunk
     const double sums = 1.0 + 64.0 / cb;   // an item's fixed cost in chunks: its pipeline turn and its slice's sums
     double best = 1e30;
     for (int ks = 1; ks <= std::min(p.nchunks, 64); ++ks) {
