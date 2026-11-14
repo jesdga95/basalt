@@ -323,11 +323,13 @@ void win_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
 
 // ---- prompt chunk layers: the residual rows are m.cs.x
 
-bool all_f8(std::initializer_list<const Linear*> ls) {
+bool all_of(int type, std::initializer_list<const Linear*> ls) {
     for (const Linear* l : ls)
-        if (l->type != kTypeF8) return false;
+        if (l->type != type) return false;
     return true;
 }
+bool all_f8(std::initializer_list<const Linear*> ls) { return all_of(kTypeF8, ls); }
+bool all_nvfp4(std::initializer_list<const Linear*> ls) { return all_of(kTypeNvfp4Planes, ls); }
 prefill::fp8::Segment f8_seg(const Linear& l, void* dst) { return {(const uint8_t*) l.w, l.rows, l.scale, dst, l.rows}; }
 
 // The prompt chunk's residual stream: BF16 rows in ChunkScratch::x's buffer; its activations between the F8 / NVFP4
@@ -351,6 +353,12 @@ void chunk_residual(Model& m, const Linear& l, const float* a, int64_t cols, int
 void chunk_residual_f8(Model& m, const Linear& l, int T, cudaStream_t s) {
     prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, residual(m.cs), l.rows,
                        prefill::fp8::Epilogue::AddBf16, s);
+}
+// x += W . a for an NVFP4 planes output projection of BF16 rows a whose producer gave each row's largest |value| (rowmax)
+void chunk_residual_fp4(Model& m, const Linear& l, const uint16_t* a, const float* rowmax, int64_t cols, int T, cudaStream_t s) {
+    ChunkScratch& b = m.cs;
+    prefill::fp4_dense::quantize_amax(a, rowmax, T, cols, cols, b.a4, b.gs, s);
+    prefill::fp4_dense::product_add_bf16(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, residual(b), l.rows, s);
 }
 
 // `cells_only`: nothing reads the layer's rows (a chunk's last layer), so only its K and V cells are made: the same k
@@ -416,17 +424,31 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
     const int H = g.n_embd, VD = g.value_width(), HV = g.gdn_v_heads;
     float* state = st.gdn + (size_t) gi * st.gdn_floats;
     float* hist = state + (size_t) g.gdn_state * HV * g.gdn_state;
-    if (all_f8({&L.qkv, &L.z, &L.out})) {
-        // the norm in the quantizer (the normed rows kept for a/b, BF16), one product for qkv and z (BF16 out), the conv and
-        // the recurrence on BF16 rows, the closing norm straight to E4M3 for out
-        prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, bf(b.xn), s);
-        const prefill::fp8::Segment seg[2] = {f8_seg(L.qkv, b.qkv), f8_seg(L.z, b.z)};
-        prefill::fp8::gemm_segmented(seg, 2, H, b.xq, T, prefill::fp8::Epilogue::StoreBf16, s);
+    const bool f8 = all_f8({&L.qkv, &L.z, &L.out}), nvfp4 = all_nvfp4({&L.qkv, &L.z, &L.out});
+    if (f8 || nvfp4) {
+        // the norm in the quantizer (the normed rows kept for a/b, BF16), the qkv and z products BF16 out (F8: one product),
+        // the conv and the recurrence on BF16 rows, the closing norm straight to E4M3 for an F8 out, else to BF16 rows with
+        // each row's amax, read once by out's FP4 quantizer
+        if (f8) {
+            prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, bf(b.xn), s);
+            const prefill::fp8::Segment seg[2] = {f8_seg(L.qkv, b.qkv), f8_seg(L.z, b.z)};
+            prefill::fp8::gemm_segmented(seg, 2, H, b.xq, T, prefill::fp8::Epilogue::StoreBf16, s);
+        } else {
+            prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, bf(b.xn), s);
+            prefill::fp4_dense::product_bf16(L.qkv.w, L.qkv.scale, L.qkv.rows, H, b.a4, b.gs, T, bf(b.qkv), L.qkv.rows, s);
+            prefill::fp4_dense::product_bf16(L.z.w, L.z.scale, L.z.rows, H, b.a4, b.gs, T, bf(b.z), L.z.rows, s);
+        }
         kernels::gdn_gating_proj(bf(b.xn), L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
         kernels::gdn_conv(hist, bf(b.qkv), L.conv, bf(b.hc), T, s);
+        if (f8) {
+            kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
+                                         (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD));
+            chunk_residual_f8(m, L.out, T, s);
+            return;
+        }
         kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
-                                     (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD));
-        chunk_residual_f8(m, L.out, T, s);
+                                     nullptr, nullptr, bf(b.yn), b.hmax);
+        chunk_residual_fp4(m, L.out, bf(b.yn), b.hmax, VD, T, s);
         return;
     }
     {
@@ -451,7 +473,7 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
         // NVFP4 planes: the norm in the quantizer, W4A4 on the TMA products, gate and up as one SwiGLU product, the residual
         // added by down's; H is BF16 (in b.h's buffer), read once by its quantizer
         uint16_t* h16 = reinterpret_cast<uint16_t*>(b.h);
-        prefill::fp4_dense::rms_norm_quantize(residual(b), L.ffn_norm, g.eps, T, H, b.a4, b.gs, s);
+        prefill::fp4_dense::rms_norm_quantize(residual(b), L.ffn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
         prefill::fp4_dense::swiglu(L.gate.w, L.up.w, L.gate.scale, L.up.scale, L.gate.rows, H, b.a4, b.gs, T, h16, g.n_ff, s,
                                    b.hmax);
         prefill::fp4_dense::quantize_amax(h16, b.hmax, T, g.n_ff, g.n_ff, b.a4, b.gs, s);
