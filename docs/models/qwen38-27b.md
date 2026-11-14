@@ -10,9 +10,10 @@ DFlash 2 block drafter ([z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab
 
 - MLP and output head: NVIDIA's NVFP4, moved bit for bit with their tensor scales.
 - GDN and attention projections: NVIDIA's FP8 codes, moved bit for bit as `F8_E4M3` with their tensor scales.
-- The MTP layer and the block drafter: BF16 projections as Q8_0. Vision: the BF16 tower, as stored.
-- The BF16 token embedding stays in page-locked RAM (2.4 GiB); everything else sits on the main card (17.2 GiB with the
-  MTP layer, 19.1 GiB with the block drafter).
+- The MTP layer and the block drafter: BF16 projections as Q8_0; at load the block drafter's projections are rounded to
+  NVFP4 (drafts only: the target model checks every draft). Vision: the BF16 tower, as stored.
+- The BF16 token embedding stays in page-locked RAM (2.4 GiB); everything else sits on the main card (18.4 GiB with
+  the block drafter, 16.4 GiB without a drafter).
 
 How to build it: [model file](../model-file.md#qwen38-27b-pack).
 
@@ -51,13 +52,11 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 
 ## Speed
 
-Measured on one RTX 5090 at TBD-power-limit W, `--kv fp16`, cold first runs. Placeholders until the end measurement:
+`basalt-bench` on one RTX 5090 at 400 W, `--kv fp16`, the pack with the block drafter, cold first runs:
 
 | | Result |
 | --- | --- |
-| Prompt read, 4k tokens | TBD-prefill-4k tok/s |
-| Prompt read, 32k tokens | TBD-prefill-32k tok/s |
-| Decode, plain (`--spec 0`) | TBD-decode-plain tok/s |
-| Decode, drafted (`basalt-bench` conversation, struct, prose) | TBD-decode-conv, TBD-decode-struct, TBD-decode-prose tok/s |
-| Decode, `--parallel 4`, all slots | TBD-decode-parallel4 tok/s |
-| Weights on the card, with the MTP layer / with the block drafter | TBD-vram-mtp / TBD-vram-block GiB |
+| Prompt read, 4k / 16k / 32k / 64k tokens | 10,727 / 9,318 / 7,708 / 5,623 tok/s |
+| Decode, plain (`--spec 0`, conversation) | 78 tok/s |
+| Decode, drafted (conversation, struct, prose) | 204, 700, 179 tok/s |
+| Decode, `--parallel 2` / `--parallel 4`, every slot on the same chat, all slots together | 406 / 542 tok/s |

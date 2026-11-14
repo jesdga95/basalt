@@ -81,6 +81,8 @@ All models compared: [models](docs/models/index.md).
 - [unsloth](https://huggingface.co/unsloth) (GGUFs), [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) (NVFP4 experts and the
   [NVFP4 27B](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)), [z-lab](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) (the
   27B's DFlash 2 drafter), [NInfer](https://github.com/Neroued/ninfer) (the reference for the 27B).
+- [Infernix](https://github.com/Wallawalla47/Infernix) (Ian Ranson and contributors): prompt and decode kernels adapted for the 27B
+  and Flash-Next (Apache-2.0, [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)).
 - [@giveen](https://huggingface.co/giveen): the BF16 reference for the DeepSeek quality numbers.
 - [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp): quantization formats and kernels in `src/` (MIT,
   [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)).
