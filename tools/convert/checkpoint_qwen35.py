@@ -42,6 +42,9 @@ ARCH = "qwen35"
 TYPE_ID = {"F32": 0, "F16": 1, "Q8_0": 8, "BF16": 30, "NVFP4": 40, "F8_E4M3": 44, "NVFP4_PLANES": 45}
 ROWS_PER_JOB = 1 << 22
 E4M3 = S.fp8_e4m3_table()
+E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=np.float32)
+E2M1_BINS = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=np.float32)
+UE4M3 = E4M3[:127]
 
 # checkpoint tensor (after `model.language_model.layers.N.` or `mtp.layers.0.`) -> (GGUF name, form, transform)
 #   forms: Q8 (Q8_0 from BF16; the main model's FP8 projections become F8, their codes kept), FP4 (NVFP4 kept, as planes),
@@ -78,7 +81,7 @@ GLOBAL = {
     "mtp.pre_fc_norm_embedding.weight": ("mtp.pre_fc_norm_embedding.weight", "F32", "norm"),
     "mtp.pre_fc_norm_hidden.weight": ("mtp.pre_fc_norm_hidden.weight", "F32", "norm"),
 }
-QUANT_SIDE = re.compile(r"\.(weight_scale|weight_scale_2|input_scale)$")
+QUANT_SIDE = re.compile(r"\.(weight_scale|weight_scale_2|weight_global_scale|input_scale|input_global_scale)$")
 METHODS = dict(C.METHODS, id="as stored")
 
 
@@ -108,19 +111,21 @@ class Plan:
                 or int(tc["linear_key_head_dim"]) != S.GDN_HEAD or int(tc["linear_value_head_dim"]) != S.GDN_HEAD:
             raise S.ConvertError("the GDN head geometry differs from the GGUF head order this converter knows")
         self.tensors: dict[str, Tensor] = {}
-        self.scales: dict[str, str] = {}      # NVFP4 tensor -> its weight_scale_2 source, F8 tensor -> its weight_scale
+        self.scales: dict[str, str] = {}      # NVFP4 tensor -> its weight_scale_2 / weight_global_scale / BF16 source, F8 tensor -> its weight_scale
+        self._bf16_fp4_scale: dict[str, float] = {}
         unknown = []
         for k in ck.order:
             if k.startswith("model.visual.") or QUANT_SIDE.search(k):
                 continue
-            m = re.fullmatch(r"model\.language_model\.layers\.(\d+)\.(.+)", k)
-            mm = re.fullmatch(r"mtp\.layers\.0\.(.+)", k)
+            key = k[:-len("_packed")] if k.endswith(".weight_packed") else k
+            m = re.fullmatch(r"model\.language_model\.layers\.(\d+)\.(.+)", key)
+            mm = re.fullmatch(r"mtp\.layers\.0\.(.+)", key)
             if m:
                 rule, name = LAYER.get(m.group(2)), lambda r: f"blk.{m.group(1)}.{r}"
             elif mm:
                 rule, name = LAYER.get(mm.group(1)), lambda r: f"mtp.{r}"
             else:
-                rule, name = GLOBAL.get(k), lambda r: r
+                rule, name = GLOBAL.get(key), lambda r: r
             if rule is None:
                 unknown.append(k)
                 continue
@@ -131,15 +136,19 @@ class Plan:
                 form = "Q8"           # the drafter's MLP is BF16 in the checkpoint
             if form == "Q8" and dt == "F8_E4M3":
                 form = "F8"           # FP8 projections keep their codes and scale
-            if form == "FP4" and dt != "U8":
-                raise S.ConvertError(f"{k} is {dt}; NVFP4 codes are U8")
-            if form == "FP4" and (shape[0] % 128 or (shape[1] * 2) % 64):
-                raise S.ConvertError(f"{k}: NVFP4 planes need rows in 128s and 64-value groups, not {shape}")
+            if form == "Q8" and dt == "U8" and not mm:
+                form = "FP4"          # compressed-tensors NVFP4 attention / GDN projections
+            if form == "FP4" and dt not in ("U8", "BF16"):
+                raise S.ConvertError(f"{k} is {dt}; NVFP4 codes are U8 or quantized from BF16")
+            if form == "FP4":
+                cols = shape[1] * 2 if dt == "U8" else shape[1]
+                if len(shape) != 2 or shape[0] % 128 or cols % 64:
+                    raise S.ConvertError(f"{k}: NVFP4 planes need rows in 128s and 64-value groups, not {shape}")
             if how == "gconv":
                 if len(shape) != 3 or shape[1] != 1:
                     raise S.ConvertError(f"{k}: a conv weight of shape {shape}")
                 ne = [shape[2], shape[0]]
-            elif form == "FP4":
+            elif dt == "U8":
                 ne = [shape[1] * 2, shape[0]]
             else:
                 ne = list(reversed(shape))
@@ -147,16 +156,24 @@ class Plan:
                 raise S.ConvertError(f"{k}: rows of {ne[0]} values cannot be Q8_0")
             if form == "Q8" and dt != "BF16":
                 raise S.ConvertError(f"{k} is {dt}; projections are read from FP8 or BF16")
-            if form in ("F32", "BF16") and dt != "BF16":
-                raise S.ConvertError(f"{k} is {dt}, expected BF16")
+            if form in ("F32", "BF16") and dt not in ("BF16", "U8"):
+                raise S.ConvertError(f"{k} is {dt}, expected BF16 or U8")
             if gname in self.tensors:
                 raise S.ConvertError(f"two checkpoint tensors map to {gname}")
             self.tensors[gname] = Tensor(gname, form, k, how, ne)
-            if form == "FP4":
-                base = k[:-len(".weight")]
+            if dt == "U8":
+                base = k[:-len(".weight_packed")] if k.endswith(".weight_packed") else k[:-len(".weight")]
                 ck.need(base + ".weight_scale", "F8_E4M3", (shape[0], shape[1] * 2 // 16))
-                ck.need(base + ".weight_scale_2", "F32", ())
-                self.scales[gname] = base + ".weight_scale_2"
+                if k.endswith(".weight_packed"):
+                    ck.need(base + ".weight_global_scale", "F32", (1,))
+                    if form == "FP4":
+                        self.scales[gname] = base + ".weight_global_scale"
+                else:
+                    ck.need(base + ".weight_scale_2", "F32", ())
+                    if form == "FP4":
+                        self.scales[gname] = base + ".weight_scale_2"
+            elif form == "FP4" and dt == "BF16":
+                self.scales[gname] = k
             if dt == "F8_E4M3":
                 ck.need(k[:-len(".weight")] + ".weight_scale", "F32", ())
                 self.scales[gname] = k[:-len(".weight")] + ".weight_scale"
@@ -184,7 +201,17 @@ class Plan:
     # ---- float tensors
     def values(self, name) -> np.ndarray:
         t = self.tensors[name]
-        x = self.ck.values(t.src)
+        if self.ck.t[t.src][2] == "U8":
+            base = t.src[:-len(".weight_packed")] if t.src.endswith(".weight_packed") else t.src[:-len(".weight")]
+            codes = self.ck.raw(t.src).reshape(t.ne[1], t.ne[0] // 2)
+            scales = self.ck.raw(base + ".weight_scale").reshape(t.ne[1], t.ne[0] // 16)
+            if base + ".weight_global_scale" in self.ck.t:
+                scale2 = 1.0 / float(self.ck.values(base + ".weight_global_scale").reshape(-1)[0])
+            else:
+                scale2 = float(self.ck.values(base + ".weight_scale_2"))
+            x = dequantize_nvfp4(codes, scales, scale2)
+        else:
+            x = self.ck.values(t.src)
         if t.how == "gconv":
             x = x[:, 0, :]
         if t.how == "norm":
@@ -204,14 +231,41 @@ class Plan:
         if t.type_name == "F32":
             return x.astype("<f4").tobytes()
         u = x.view(np.uint32)
+        if self.ck.t[t.src][2] == "U8":
+            r = (u + np.uint32(0x7FFF) + ((u >> np.uint32(16)) & np.uint32(1))) >> np.uint32(16)
+            return r.astype("<u2").tobytes()
         if np.count_nonzero(u & 0xFFFF):
             raise S.ConvertError(f"{name}: a value that is not BF16")
         return (u >> 16).astype("<u2").tobytes()
 
+    def _bf16_scale2(self, name) -> float:
+        if name not in self._bf16_fp4_scale:
+            t = self.tensors[name]
+            p, off, _, _, _ = self.ck.t[t.src]
+            ne0, ne1 = t.ne
+            mm = np.memmap(p, dtype="<u2", mode="r", offset=off, shape=(ne1, ne0))
+            amax = 0.0
+            for r in range(0, ne1, 4096):
+                x = S._bf16_to_f32(np.ascontiguousarray(mm[r:min(ne1, r + 4096)]))
+                if not np.isfinite(x).all():
+                    raise S.ConvertError(f"{name} has a non-finite value")
+                amax = max(amax, float(np.max(np.abs(x))))
+            self._bf16_fp4_scale[name] = amax / (448.0 * 6.0) if amax > 0 else 1.0
+        return self._bf16_fp4_scale[name]
+
     def scale_value(self, name) -> np.ndarray:
-        v = self.ck.values(self.scales[name]).astype("<f4").reshape(1)
+        src = self.scales[name]
+        if src == self.tensors[name].src:
+            v = np.array([self._bf16_scale2(name)], dtype="<f4")
+        elif src.endswith(".weight_global_scale"):
+            g = float(self.ck.values(src).reshape(-1)[0])
+            if not (np.isfinite(g) and g > 0):
+                raise S.ConvertError(f"{src} is not finite and positive")
+            v = np.array([1.0 / g], dtype="<f4")
+        else:
+            v = self.ck.values(src).astype("<f4").reshape(1)
         if not (np.isfinite(v).all() and v[0] > 0):
-            raise S.ConvertError(f"{self.scales[name]} is not finite and positive")
+            raise S.ConvertError(f"{src} is not finite and positive")
         return v
 
     # ---- quantized tensors, streamed
@@ -219,13 +273,22 @@ class Plan:
         t = self.tensors[name]
         p, off, dt, shape, _ = self.ck.t[t.src]
         ne0, ne1 = t.ne
-        if t.form == "FP4":   # the code plane, then the scale plane in 128-row tiles
-            sp, soff = self.ck.t[t.src[:-len(".weight")] + ".weight_scale"][:2]
+        if t.form == "FP4":
+            if dt == "BF16":
+                scale2 = self._bf16_scale2(name)
+                step = max(128, ROWS_PER_JOB // ne0 // 128 * 128)
+                for r in range(0, ne1, step):
+                    yield ("fp4_bf16", str(p), off, ne0, r, min(step, ne1 - r), scale2)
+                return
+            base = t.src[:-len(".weight_packed")] if t.src.endswith(".weight_packed") else t.src[:-len(".weight")]
+            sp, soff = self.ck.t[base + ".weight_scale"][:2]
+            kind = {"vrows": "rows", "zrows": "rows", "vcols": "cols"}.get(t.how)
+            first = S.GDN_QK_ROWS if t.how == "vrows" else 0
             step = max(128, ROWS_PER_JOB // ne0 // 128 * 128)
             for r in range(0, ne1, step):
-                yield ("fp4c", str(p), off, ne0, r, min(step, ne1 - r))
+                yield ("fp4c", str(p), off, ne0, ne1, r, min(step, ne1 - r), kind, first)
             for r in range(0, ne1, step):
-                yield ("fp4s", str(sp), soff, ne0, r, min(step, ne1 - r))
+                yield ("fp4s", str(sp), soff, ne0, ne1, r, min(step, ne1 - r), kind, first)
             return
         scale = float(self.ck.values(t.src[:-len(".weight")] + ".weight_scale")) if dt == "F8_E4M3" else None
         kind = {"vrows": "rows", "zrows": "rows", "vcols": "cols"}.get(t.how)
@@ -235,6 +298,18 @@ class Plan:
             yield ("f8" if t.form == "F8" else "q8", str(p), off, dt, scale, ne0, ne1, r, min(step, ne1 - r), kind, first)
 
     def chunks(self, name, pool, depth: int = 64):
+        t = self.tensors[name]
+        if t.form == "FP4" and self.ck.t[t.src][2] == "BF16":
+            scale_chunks = []
+            for b in S.bounded_imap(pool, _job, self.jobs(name), depth):
+                if isinstance(b, str):
+                    raise S.ConvertError(f"{name}: {b}")
+                cb, sb = b
+                yield cb
+                scale_chunks.append(sb)
+            for sb in scale_chunks:
+                yield sb
+            return
         for b in S.bounded_imap(pool, _job, self.jobs(name), depth):
             if isinstance(b, str):
                 raise S.ConvertError(f"{name}: {b}")
@@ -248,14 +323,43 @@ def _job(args):
         x = S._bf16_to_f32(np.ascontiguousarray(mm[:, c0:c0 + ne0])).reshape(-1)
         return S.q8_0(x) if np.isfinite(x).all() else "a non-finite value"
     if args[0] == "fp4c":   # code rows as stored (value 2i in the low nibble of byte i)
-        _, path, off, ne0, row0, rows = args
+        if len(args) == 6:
+            _, path, off, ne0, row0, rows = args
+            kind = None
+        else:
+            _, path, off, ne0, ne1, row0, rows, kind, first = args
+        if kind == "rows":
+            mm = np.memmap(path, dtype=np.uint8, mode="r", offset=off, shape=(ne1, ne0 // 2))
+            return np.ascontiguousarray(mm[S.gdn_index(ne1, first)[row0:row0 + rows]]).tobytes()
+        if kind == "cols":
+            mm = np.memmap(path, dtype=np.uint8, mode="r", offset=off + row0 * (ne0 // 2), shape=(rows, ne0 // 2))
+            return np.ascontiguousarray(mm.reshape(rows, ne0 // 128, 64)[:, S.gdn_block_source(), :]).tobytes()
         return np.fromfile(path, dtype=np.uint8, count=rows * ne0 // 2, offset=off + row0 * ne0 // 2).tobytes()
     if args[0] == "fp4s":   # scale rows [row0, row0 + rows), rows in 128s, into their tiles
-        _, spath, soff, ne0, row0, rows = args
-        sc = np.fromfile(spath, dtype=np.uint8, count=rows * ne0 // 16, offset=soff + row0 * ne0 // 16).reshape(rows, ne0 // 16)
+        if len(args) == 6:
+            _, spath, soff, ne0, row0, rows = args
+            kind = None
+        else:
+            _, spath, soff, ne0, ne1, row0, rows, kind, first = args
+        if kind == "rows":
+            mm = np.memmap(spath, dtype=np.uint8, mode="r", offset=soff, shape=(ne1, ne0 // 16))
+            sc = np.ascontiguousarray(mm[S.gdn_index(ne1, first)[row0:row0 + rows]])
+        elif kind == "cols":
+            mm = np.memmap(spath, dtype=np.uint8, mode="r", offset=soff + row0 * (ne0 // 16), shape=(rows, ne0 // 16))
+            sc = np.ascontiguousarray(mm.reshape(rows, ne0 // 128, 8)[:, S.gdn_block_source(), :]).reshape(rows, ne0 // 16)
+        else:
+            sc = np.fromfile(spath, dtype=np.uint8, count=rows * ne0 // 16, offset=soff + row0 * ne0 // 16).reshape(rows, ne0 // 16)
         if (sc & 0x80).any() or (sc == 0x7F).any():
             return "a UE4M3 scale with the sign bit set or NaN"
         return nvfp4_scale_tiles(sc).tobytes()
+    if args[0] == "fp4_bf16":
+        _, path, off, ne0, row0, rows, scale2 = args
+        mm = np.memmap(path, dtype="<u2", mode="r", offset=off + row0 * ne0 * 2, shape=(rows, ne0))
+        x = S._bf16_to_f32(np.ascontiguousarray(mm))
+        if not np.isfinite(x).all():
+            return "a non-finite value"
+        codes, sc = quantize_nvfp4_chunk(x, scale2)
+        return codes.tobytes(), nvfp4_scale_tiles(sc).tobytes()
     op, path, off, dt, scale, ne0, ne1, row0, rows, kind, first = args
     if dt == "F8_E4M3":
         mm = np.memmap(path, dtype=np.uint8, mode="r", offset=off, shape=(ne1, ne0))
@@ -283,6 +387,35 @@ def nvfp4_scale_tiles(sc: np.ndarray) -> np.ndarray:
     (tiles row-block major), byte (r % 32) * 16 + ((r % 128) // 32) * 4 + g % 4 (include/basalt/kernels/nvfp4_planes.hpp)."""
     rows, groups = sc.shape
     return np.ascontiguousarray(sc.reshape(rows // 128, 4, 32, groups // 4, 4).transpose(0, 3, 2, 1, 4)).reshape(-1)
+
+
+def dequantize_nvfp4(codes: np.ndarray, scales: np.ndarray, scale2: float) -> np.ndarray:
+    """Dequantize NVFP4 packed codes [rows, cols/2] and UE4M3 scales [rows, cols/16] with tensor scale2."""
+    nib = np.empty((codes.shape[0], codes.shape[1] * 2), dtype=np.uint8)
+    nib[:, 0::2] = codes & 0xF
+    nib[:, 1::2] = codes >> 4
+    val = E2M1[nib & 7] * np.where(nib & 8, np.float32(-1.0), np.float32(1.0))
+    sc = np.repeat(E4M3[scales], 16, axis=1)
+    return (val * sc * np.float32(scale2)).astype(np.float32)
+
+
+def quantize_nvfp4_chunk(x: np.ndarray, scale2: float) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize float32 [rows, cols] to NVFP4 packed codes [rows, cols/2] and UE4M3 scales [rows, cols/16]."""
+    rows, cols = x.shape
+    xb = x.reshape(rows, cols // 16, 16)
+    s_target = np.max(np.abs(xb), axis=2) / np.float32(6.0 * scale2)
+    idx = np.searchsorted(UE4M3, s_target, side="left").clip(0, 126)
+    prev = (idx - 1).clip(0, 126)
+    choose_prev = (idx > 0) & (np.abs(UE4M3[prev] - s_target) <= np.abs(UE4M3[idx] - s_target))
+    s_code = np.where(choose_prev, prev, idx).astype(np.uint8)
+    s_val = UE4M3[s_code] * np.float32(scale2)
+    inv = np.where(s_val > 0, np.float32(1.0) / s_val, np.float32(0.0))[..., None]
+    q = xb * inv
+    mag = np.digitize(np.abs(q), E2M1_BINS).astype(np.uint8)
+    sign = np.where(q < 0, np.uint8(8), np.uint8(0))
+    nib = (mag | sign).reshape(rows, cols)
+    codes = (nib[:, 0::2] | (nib[:, 1::2] << 4)).astype(np.uint8)
+    return codes, s_code
 
 
 # ------------------------------------------------------------------ metadata
@@ -370,7 +503,7 @@ VISION_GLOBAL = {
 def mmproj(ck: C.Checkpoint, out: pathlib.Path, name: str) -> None:
     """The vision tower as the clip GGUF the engine's encoder reads (llama.cpp's qwen3vl_merger layout)."""
     vc = ck.config["vision_config"]
-    if vc.get("model_type") not in ("qwen3_5_vision",) or vc.get("deepstack_visual_indexes"):
+    if vc.get("model_type") not in ("qwen3_5_vision", "qwen3_5") or vc.get("deepstack_visual_indexes"):
         raise S.ConvertError("config.json: the vision tower is not the Qwen3-VL one without deepstack layers")
     pp = json.loads((ck.dir / "preprocessor_config.json").read_text(encoding="utf-8"))
     w = GGUFWriter()

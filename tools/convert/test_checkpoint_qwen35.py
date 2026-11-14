@@ -527,5 +527,101 @@ class Qwen35RefusalTest(unittest.TestCase):
             self.assertIsInstance(bad, str)
 
 
+class CompressedTensorsQwen35Test(unittest.TestCase):
+    """compressed-tensors nvfp4-pack-quantized support: weight_packed, 1/weight_global_scale, NVFP4 GDN reorder,
+    NVFP4->BF16 in_proj_a/b, and BF16->NVFP4_PLANES lm_head."""
+
+    @staticmethod
+    def _untile_scales(tiled: np.ndarray, rows: int, cols: int) -> np.ndarray:
+        groups = cols // 16
+        return tiled.reshape(rows // 128, groups // 4, 32, 4, 4).transpose(0, 3, 2, 1, 4).reshape(rows, groups)
+
+    def test_compressed_tensors_plan_and_gdn_nvfp4(self):
+        import multiprocessing
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            fx = Fixture(d)
+            rng = np.random.default_rng(19)
+
+            raw_c, raw_s = {}, {}
+
+            def add_ct_nvfp4(base: str, rows: int, cols: int, gs: float):
+                codes = rng.integers(0, 256, (rows, cols // 2), dtype=np.uint8)
+                sc = rng.integers(56, 88, (rows, cols // 16), dtype=np.uint8)
+                raw_c[base], raw_s[base] = codes, sc
+                fx.tens[base + ".weight_packed"] = ("U8", codes.shape, codes.tobytes())
+                fx.tens[base + ".weight_scale"] = ("F8_E4M3", sc.shape, sc.tobytes())
+                fx.tens[base + ".weight_global_scale"] = ("F32", (1,), np.array([gs], dtype="<f4").tobytes())
+                fx.tens[base + ".input_global_scale"] = ("F32", (1,), np.array([1.0], dtype="<f4").tobytes())
+                return Q.dequantize_nvfp4(codes, sc, float(np.float32(1.0 / gs)))
+
+            P = "model.language_model."
+            L0, L1 = P + "layers.0.", P + "layers.1."
+            for k in list(fx.tens):
+                if any(k.startswith(p) for p in (
+                    L0 + "linear_attn.in_proj_qkv.", L0 + "linear_attn.in_proj_z.", L0 + "linear_attn.out_proj.",
+                    L0 + "linear_attn.in_proj_a.", L0 + "linear_attn.in_proj_b.",
+                    L1 + "self_attn.q_proj.", L1 + "self_attn.k_proj.", L1 + "self_attn.v_proj.", L1 + "self_attn.o_proj.",
+                )):
+                    del fx.tens[k]
+
+            qkv_ref = add_ct_nvfp4(L0 + "linear_attn.in_proj_qkv", QKV, H, 5000.0)
+            z_ref = add_ct_nvfp4(L0 + "linear_attn.in_proj_z", VALUE, H, 4000.0)
+            out_ref = add_ct_nvfp4(L0 + "linear_attn.out_proj", H, VALUE, 6000.0)
+            a_ref = add_ct_nvfp4(L0 + "linear_attn.in_proj_a", 48, H, 2000.0)
+            add_ct_nvfp4(L0 + "linear_attn.in_proj_b", 48, H, 2000.0)
+            add_ct_nvfp4(L1 + "self_attn.q_proj", 2 * NHEAD * HD, H, 3000.0)
+            add_ct_nvfp4(L1 + "self_attn.k_proj", 128, H, 3000.0)
+            add_ct_nvfp4(L1 + "self_attn.v_proj", 128, H, 3000.0)
+            add_ct_nvfp4(L1 + "self_attn.o_proj", H, 128, 3000.0)
+
+            # Also replace lm_head with BF16
+            del fx.tens["lm_head.weight"], fx.tens["lm_head.weight_scale"], fx.tens["lm_head.weight_scale_2"]
+            head_f32 = (rng.standard_normal((VOCAB, H)) * 0.02).astype(np.float32)
+            head_u16 = (head_f32.view(np.uint32) >> 16).astype("<u2")
+            head_bf16 = S._bf16_to_f32(head_u16)
+            fx.tens["lm_head.weight"] = ("BF16", (VOCAB, H), head_u16.tobytes())
+
+            write_safetensors(d / "model-00001-of-00001.safetensors", fx.tens)
+            ck = C.Checkpoint(d)
+            plan = Q.Plan(ck)
+
+            self.assertEqual(plan.tensors["blk.0.attn_qkv.weight"].type_name, "NVFP4_PLANES")
+            self.assertEqual(plan.tensors["blk.0.ssm_alpha.weight"].type_name, "BF16")
+            self.assertEqual(plan.tensors["output.weight"].type_name, "NVFP4_PLANES")
+            self.assertAlmostEqual(float(plan.scale_value("blk.0.attn_qkv.weight")[0]), 1.0 / 5000.0, places=9)
+
+            with multiprocessing.Pool(2) as pool:
+                def raw_fp4(gname, rows, cols):
+                    blob = b"".join(plan.chunks(gname, pool))
+                    cbytes = rows * cols // 2
+                    codes = np.frombuffer(blob[:cbytes], np.uint8).reshape(rows, cols // 2)
+                    sc = self._untile_scales(np.frombuffer(blob[cbytes:], np.uint8), rows, cols)
+                    return codes, sc
+
+                qkv_c, qkv_s = raw_fp4("blk.0.attn_qkv.weight", QKV, H)
+                idx_qkv = S.gdn_index(QKV, S.GDN_QK_ROWS)
+                self.assertTrue(np.array_equal(qkv_c, raw_c[L0 + "linear_attn.in_proj_qkv"][idx_qkv]))
+                self.assertTrue(np.array_equal(qkv_s, raw_s[L0 + "linear_attn.in_proj_qkv"][idx_qkv]))
+
+                z_c, z_s = raw_fp4("blk.0.attn_gate.weight", VALUE, H)
+                idx_z = S.gdn_index(VALUE, 0)
+                self.assertTrue(np.array_equal(z_c, raw_c[L0 + "linear_attn.in_proj_z"][idx_z]))
+                self.assertTrue(np.array_equal(z_s, raw_s[L0 + "linear_attn.in_proj_z"][idx_z]))
+
+                out_c, out_s = raw_fp4("blk.0.ssm_out.weight", H, VALUE)
+                gsrc = S.gdn_block_source()
+                self.assertTrue(np.array_equal(out_c, raw_c[L0 + "linear_attn.out_proj"].reshape(H, 48, 64)[:, gsrc, :].reshape(H, VALUE // 2)))
+                self.assertTrue(np.array_equal(out_s, raw_s[L0 + "linear_attn.out_proj"].reshape(H, 48, 8)[:, gsrc, :].reshape(H, VALUE // 16)))
+
+                head_c, head_s = raw_fp4("output.weight", VOCAB, H)
+                head_got = Q.dequantize_nvfp4(head_c, head_s, float(plan.scale_value("output.weight")[0]))
+                self.assertLess(np.max(np.abs(head_got - head_bf16)), 0.03)
+
+            a_bytes = plan.float_bytes("blk.0.ssm_alpha.weight")
+            a_got = S._bf16_to_f32(np.frombuffer(a_bytes, "<u2").reshape(48, H))
+            self.assertTrue(np.allclose(a_got, a_ref[S.gdn_block_source()], rtol=1e-2, atol=1e-4))
+
+
 if __name__ == "__main__":
     unittest.main()

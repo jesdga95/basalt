@@ -35,14 +35,18 @@ void quantize_amax(const uint16_t* x, const float* rowmax, int64_t rows, int64_t
                    void* stream);
 void rms_norm_quantize(const float* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* gs, float* xn,
                        void* stream);
-/// As rms_norm_quantize, of BF16 rows (the residual stream).
+/// As rms_norm_quantize, of BF16 rows (the residual stream); xn (optional) gets the normed BF16 rows.
 void rms_norm_quantize(const uint16_t* x, const float* w, float eps, int64_t rows, int64_t cols, void* act, float* gs,
-                       void* stream);
+                       void* stream, uint16_t* xn = nullptr);
 
 /// dst[t * ld + r] (+)= gs[t] * (*w_scale) * sum_k w[r][k] x[t][k], r < rows, t < tokens.  w: planes of rows x K
 /// (nvfp4p::bytes); w_scale: the matrix's device FP32 scale.  add: dst += (the residual epilogue), else dst = .
 void product(const void* w, const float* w_scale, int64_t rows, int64_t K, const void* act, const float* gs,
              int64_t tokens, float* dst, int64_t ld, bool add, void* stream);
+
+/// product's Store into a BF16 dst (rounded once to BF16).
+void product_bf16(const void* w, const float* w_scale, int64_t rows, int64_t K, const void* act, const float* gs,
+                  int64_t tokens, uint16_t* dst, int64_t ld, void* stream);
 
 /// product's Add into a BF16 dst (the residual stream): the BF16 value widened, the product added in fp32, rounded once.
 void product_add_bf16(const void* w, const float* w_scale, int64_t rows, int64_t K, const void* act, const float* gs,
