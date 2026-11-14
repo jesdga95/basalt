@@ -1,7 +1,8 @@
 // tests/kernels/bf16_chunk_test.cpp - the prompt chunk's BF16 entry points (the BF16 residual stream and activations)
 // give, bitwise, what the FP32 kernels give on the same values widened, rounded once to BF16 where the output is BF16:
-// fp8 rms_norm_quantize and the StoreBf16 / AddBf16 epilogues, fp4_dense rms_norm_quantize and product_add_bf16,
-// gdn_gating_proj, gdn_conv, gdn_recurrence_bf16, attn_qk_prepare_bf16 and attn_gate_e4m3.
+// fp8 rms_norm_quantize and the StoreBf16 / AddBf16 epilogues, fp4_dense rms_norm_quantize, product_bf16 and
+// product_add_bf16, gdn_gating_proj, gdn_conv, gdn_recurrence_bf16 (E4M3 and BF16 out), attn_qk_prepare_bf16 and
+// attn_gate_e4m3.  A BF16 output's row amax is the largest |value| as stored.
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
@@ -10,6 +11,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -72,6 +75,20 @@ std::vector<uint8_t> round_rows(const std::vector<uint8_t>& f32) {
     }
     return out;
 }
+// each row's largest |value| of BF16 rows (rows x cols), as FP32 bytes
+std::vector<uint8_t> row_amax(const std::vector<uint8_t>& b16, int64_t rows, int64_t cols) {
+    std::vector<uint8_t> out((size_t) rows * 4);
+    for (int64_t r = 0; r < rows; ++r) {
+        float m = 0.0f;
+        for (int64_t c = 0; c < cols; ++c) {
+            uint16_t b;
+            std::memcpy(&b, &b16[2 * (size_t) (r * cols + c)], 2);
+            m = std::max(m, std::fabs(from_bf(b)));
+        }
+        std::memcpy(&out[4 * (size_t) r], &m, 4);
+    }
+    return out;
+}
 bool report(const char* what, bool same) {
     std::printf("%s: %s\n", what, same ? "bitwise" : "DIFFER");
     return same;
@@ -125,10 +142,13 @@ int main() {
     {   // FP4: norm + quantize, then the down product's Add into a BF16 residual
         void *a1 = dev_n<uint8_t>(fd::act_bytes(T, H)), *a2 = dev_n<uint8_t>(fd::act_bytes(T, H));
         float *g1 = dev_n<float>(T), *g2 = dev_n<float>(T);
-        fd::rms_norm_quantize(dxf, dnw, 1e-6f, T, H, a1, g1, nullptr, nullptr);
-        fd::rms_norm_quantize(dxb, dnw, 1e-6f, T, H, a2, g2, nullptr);
+        float* xn1 = dev_n<float>((size_t) T * H);
+        uint16_t* xn2 = dev_n<uint16_t>((size_t) T * H);
+        fd::rms_norm_quantize(dxf, dnw, 1e-6f, T, H, a1, g1, xn1, nullptr);
+        fd::rms_norm_quantize(dxb, dnw, 1e-6f, T, H, a2, g2, xn2, nullptr);
         ok &= report("fp4 rms_norm_quantize of BF16 rows", host(a1, fd::act_bytes(T, H)) == host(a2, fd::act_bytes(T, H)) &&
                                                                 host(g1, T * 4) == host(g2, T * 4));
+        ok &= report("fp4 rms_norm_quantize BF16 normed rows", round_rows(host(xn1, (size_t) T * H * 4)) == host(xn2, (size_t) T * H * 2));
         const int64_t R = 512;
         std::vector<uint8_t> w((size_t) R * H / 64 * 36);
         for (size_t i = 0; i < (size_t) R * H / 2; ++i) w[i] = (uint8_t) rng();
@@ -143,6 +163,11 @@ int main() {
         fd::product(dw, dsc, R, H, a1, g1, T, r1, R, true, nullptr);
         fd::product_add_bf16(dw, dsc, R, H, a1, g1, T, r2, R, nullptr);
         ok &= report("fp4 product_add_bf16", round_rows(host(r1, (size_t) T * R * 4)) == host(r2, (size_t) T * R * 2));
+        float* y1 = dev_n<float>((size_t) T * R);
+        uint16_t* y2 = dev_n<uint16_t>((size_t) T * R);
+        fd::product(dw, dsc, R, H, a1, g1, T, y1, R, false, nullptr);
+        fd::product_bf16(dw, dsc, R, H, a1, g1, T, y2, R, nullptr);
+        ok &= report("fp4 product_bf16", round_rows(host(y1, (size_t) T * R * 4)) == host(y2, (size_t) T * R * 2));
     }
     {   // GDN: the gating projection, the conv and the recurrence on BF16 rows
         const int64_t HV = 48, S = 128, C = 2 * 16 * S + HV * S, VD = HV * S;
@@ -196,6 +221,17 @@ int main() {
                                fp8::act_scales(e2, T, VD));
         ok &= report("gdn_recurrence_bf16 (E4M3 out, state)", host(e1, fp8::act_bytes(T, VD)) == host(e2, fp8::act_bytes(T, VD)) &&
                                                                   host(s1, st0.size() * 4) == host(s2, st0.size() * 4));
+        float *s3 = dev(st0), *s4 = dev(st0);
+        float* yn1 = dev_n<float>((size_t) T * VD);
+        uint16_t* yn2 = dev_n<uint16_t>((size_t) T * VD);
+        float* ymax = dev_n<float>(T);
+        k::gdn_recurrence(s3, dev(hcw), dg, db, dev(zf), gm, 1e-6f, work, y, nullptr, T, nullptr, k::GdnGate::Silu, yn1);
+        k::gdn_recurrence_bf16(s4, hc2, dg, db, dev(zb), gm, 1e-6f, work, y, T, nullptr, k::GdnGate::Silu, nullptr, nullptr, yn2,
+                               ymax);
+        const auto yn2h = host(yn2, (size_t) T * VD * 2);
+        ok &= report("gdn_recurrence_bf16 (BF16 out, row amax, state)",
+                     round_rows(host(yn1, (size_t) T * VD * 4)) == yn2h && row_amax(yn2h, T, VD) == host(ymax, T * 4) &&
+                         host(s3, st0.size() * 4) == host(s4, st0.size() * 4));
     }
     {   // attention: q/k norm + rope into the int8 cache from BF16 q_full / k / v, and the gate to E4M3
         const int NH = 24, NKV = 4, HD = 256;
