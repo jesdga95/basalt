@@ -73,6 +73,8 @@ struct Options : CommonOptions {
     /// Opt-in: the expert cache in physical segments (CUDA virtual memory management), so the serve loop's
     /// `VRAM <reserve_mib>` command can give part of it back to other programs and take it again.  Off: one cudaMalloc.
     bool vram_elastic = false;
+    /// --kv-pool (opt-in, --serve): conversations switched away from stay in VRAM, together within --max-context
+    bool kv_pool = false;
     int64_t vram_segment_mib = 512;
     /// Batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;

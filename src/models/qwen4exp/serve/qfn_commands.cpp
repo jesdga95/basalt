@@ -78,6 +78,10 @@ void QfnRuntime::sleep_command(bool down, std::string& verr) {
         src.repin_start(4);
         ready = [this](const void* p, uint64_t n) { return src.repin_wait(p, n); };
     }
+    if (down && kv_pool && kv_pool->size() > 0) {   // the pooled conversations' VRAM goes back too
+        basalt::log::info("basalt serve", "SLEEP: %zu pooled conversations dropped", kv_pool->size());
+        (void) kv_pool->clear();
+    }
     const bool peer_ok = !peer.valid() || (down ? peer.sleep(perr) : peer.wake(perr, ready));
     vram_command(down ? "VRAM " + std::to_string(1ll << 30) : std::string("VRAM"), verr, true, &reply);
     if (repin) {

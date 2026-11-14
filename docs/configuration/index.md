@@ -165,6 +165,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | `conversation-cache-min-tokens` | engine | tokens | 0 | Park only conversations of at least this many tokens. |
 | `conversation-cache-disk-mib` | engine | MiB | 0 (off) | Disk budget for parked conversations. [running](../running.md#conversations-on-disk---conversation-cache-disk-mib) |
 | `conversation-cache-dir` | engine | directory | model cache folder | Another folder for the disk tier. |
+| `kv-pool` | engine | switch | off | Flash-Next on one card only. Parked conversations stay in VRAM, within `max-context` together with the live one. [running](../running.md#conversations-in-vram---kv-pool) |
 
 ## Vision
 

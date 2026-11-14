@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <utility>
 
 namespace basalt::core {
 namespace {
@@ -363,6 +364,132 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
+}
+
+namespace {
+// The regions a DeviceConversation holds, in save order: the running state (GDN, PLE history, then each owned QSA
+// layer's tail, dead row and block position), then each owned layer's K/V pools and the draft layer's.
+// `check` false: the sizes only.
+bool device_regions(const SessionState& ss, const ModelGeometry& g, const QsaState* draft, int64_t upto, bool check,
+                    std::vector<std::pair<void*, size_t>>& out, std::string& error) {
+    out.clear();
+    ConversationStateSizes z;
+    if (check ? !checkpoint_targets(ss, g, (size_t) upto, z, error) : !conversation_session_sizes(g, ss, z, error))
+        return false;
+    out.emplace_back(ss.gdn_state, z.gdn);
+    out.emplace_back(ss.ple_hist, ss.ple_hist ? z.ple : 0);
+    for (size_t j = 0; j < owned_qsa(ss); ++j) {
+        const auto& st = owned(ss, j);
+        out.emplace_back(st.idx_tail, z.tail);
+        out.emplace_back(st.idx_dead, z.dead);
+        out.emplace_back(st.idx_block_pos, z.block_pos);
+    }
+    for (size_t j = 0; j < owned_qsa(ss); ++j)
+        if (!conversation_kv_regions(owned(ss, j), g, upto, true, out, check, error)) return false;
+    return !draft || conversation_kv_regions(*draft, g, upto, false, out, check, error);
+}
+} // namespace
+
+DeviceConversation& DeviceConversation::operator=(DeviceConversation&& o) noexcept {
+    if (this == &o) return *this;
+    if (mem) cudaFree(mem);
+    live = std::move(o.live);
+    checkpoints = std::move(o.checkpoints);
+    cvec = o.cvec;
+    from_slot = o.from_slot;
+    mem = std::exchange(o.mem, nullptr);
+    sizes = std::move(o.sizes);
+    mem_bytes = std::exchange(o.mem_bytes, 0);
+    layer_lo = o.layer_lo;
+    layer_hi = o.layer_hi;
+    return *this;
+}
+
+DeviceConversation::~DeviceConversation() {
+    if (mem) cudaFree(mem);
+}
+
+size_t conversation_device_bytes(const SessionState& ss, const ModelGeometry& g, const QsaState* draft,
+                                 int64_t tokens) {
+    std::vector<std::pair<void*, size_t>> r;
+    std::string error;
+    if (!device_regions(ss, g, draft, tokens, false, r, error)) return 0;
+    size_t n = 0;
+    for (const auto& x : r)
+        if (!add(n, x.second)) return 0;
+    return n;
+}
+
+bool conversation_device_save(DeviceConversation& image, const ConversationView& view, const SessionState& ss,
+                              const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    std::vector<std::pair<void*, size_t>> r;
+    if (!view_validate(view, ss, g, error) ||
+        !device_regions(ss, g, draft, (int64_t) view.ids.size(), true, r, error) || !sync(error))
+        return false;
+    DeviceConversation out;
+    for (const auto& x : r) {
+        out.sizes.push_back(x.second);
+        if (!add(out.mem_bytes, x.second)) return fail(error, "device image byte count overflow");
+    }
+    if (cudaMalloc(&out.mem, out.mem_bytes) != cudaSuccess) {
+        cudaGetLastError();
+        out.mem = nullptr;
+        return fail(error, "cannot allocate the device image");
+    }
+    size_t at = 0;
+    for (const auto& x : r) {
+        if (!copy(static_cast<uint8_t*>(out.mem) + at, x.first, x.second, error)) return false;
+        at += x.second;
+    }
+    if (!sync(error)) return false;   // a device-to-device copy returns before it lands: the session is written next
+    out.live.ids = view.ids;
+    out.live.imgs = view.images;
+    out.cvec = view.cvec;
+    out.layer_lo = ss.layer_lo;
+    out.layer_hi = ss.layer_hi;
+    image = std::move(out);
+    return true;
+}
+
+ConversationRestore conversation_device_restore(const DeviceConversation& image, SessionState& ss,
+                                                const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    const int64_t upto = (int64_t) image.live.ids.size();
+    std::vector<std::pair<void*, size_t>> r;
+    if (!image.mem || upto < 1) {
+        fail(error, "an empty device image");
+        return ConversationRestore::invalid;
+    }
+    if (!device_regions(ss, g, draft, upto, true, r, error)) return ConversationRestore::invalid;
+    bool same = image.layer_lo == ss.layer_lo && image.layer_hi == ss.layer_hi && r.size() == image.sizes.size();
+    for (size_t i = 0; same && i < r.size(); ++i) same = r[i].second == image.sizes[i];
+    if (!same) {
+        fail(error, "a device image of another layout");
+        return ConversationRestore::invalid;
+    }
+    if (!sync(error)) return ConversationRestore::transfer_failed;
+    size_t at = 0;
+    for (size_t i = 0; i < r.size(); ++i) {
+        if (!copy(r[i].first, static_cast<const uint8_t*>(image.mem) + at, r[i].second, error))
+            return ConversationRestore::transfer_failed;
+        at += r[i].second;
+    }
+    for (size_t j = 0; j < owned_qsa(ss); ++j)
+        if (!conversation_kv_settle(owned(ss, j), g, upto, error)) return ConversationRestore::transfer_failed;
+    if (draft && !conversation_kv_settle(*draft, g, upto, error)) return ConversationRestore::transfer_failed;
+    // as a checkpoint restore leaves it: the indexer's moving row holds the dead row
+    ConversationStateSizes z;
+    if (!conversation_session_sizes(g, ss, z, error)) return ConversationRestore::transfer_failed;
+    const size_t row = (size_t) upto / basalt::kernels::qsa_real_shapes().idx_block;
+    for (size_t j = 0; j < owned_qsa(ss); ++j) {
+        size_t dead_at = image.sizes[0] + image.sizes[1];
+        for (size_t k = 0; k < 3 * j + 1; ++k) dead_at += image.sizes[2 + k];
+        if (!copy(owned(ss, j).idx_pooled + row * g.idx_key_dim, static_cast<const uint8_t*>(image.mem) + dead_at,
+                  z.dead, error))
+            return ConversationRestore::transfer_failed;
+    }
+    ss.ple_prev[0] = upto >= 2 ? image.live.ids[(size_t) upto - 2] : -1;
+    ss.ple_prev[1] = image.live.ids[(size_t) upto - 1];
+    return sync(error) ? ConversationRestore::restored : ConversationRestore::transfer_failed;
 }
 
 // the draft layer's K/V included (the stage that owns the draft head, or no layer split)

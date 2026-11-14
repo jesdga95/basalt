@@ -21,9 +21,35 @@ SavedConversation image(std::initializer_list<int32_t> ids, bool cvec = true) {
     s.cvec = cvec;
     return s;
 }
+// a VRAM image's shape (as --kv-pool's): the cache sees only these members
+struct PoolImage {
+    ConversationCheckpoint live;
+    std::vector<ConversationCheckpoint> checkpoints;
+    bool cvec = true, from_slot = false;
+    size_t n = 0;
+    size_t bytes() const { return n; }
+};
+PoolImage pooled(std::initializer_list<int32_t> ids, size_t n) {
+    PoolImage s;
+    s.live.ids = ids;
+    s.n = n;
+    return s;
+}
 }
 
 int main() {
+    {   // --kv-pool's policy: a byte cap shared with the live conversation (`held`), oldest out first
+        BasicConversationCache<PoolImage> pool(200, SIZE_MAX);
+        check(pool.put(pooled({1, 2, 3}, 50), 50) && pool.put(pooled({4, 5, 6}, 50), 50) &&
+              pool.put(pooled({7, 8, 9}, 50), 50), "A, B, C fit beside the live conversation");
+        check(pool.size() == 3 && pool.bytes() == 150 && pool.evictions() == 0, "nothing evicted below the cap");
+        check(pool.put(pooled({10, 11, 12}, 80), 0), "D needs room");
+        check(pool.size() == 3 && pool.evictions() == 1 && pool.best(std::vector<int32_t>{1, 2, 3, 4}, {}, true).tokens == 0 &&
+              pool.best(std::vector<int32_t>{4, 5, 6, 7}, {}, true).tokens == 3, "D evicts the oldest (A) only");
+        check(!pool.make_room(0, 201), "a live conversation past the cap evicts nothing");
+        check(pool.make_room(0, 200) && pool.size() == 0, "a live conversation of the whole cap evicts every entry");
+        check(!pool.put(pooled({1, 2}, 120), 100), "an entry that cannot fit beside the live one is refused");
+    }
     {
         ConversationBuffer bytes;
         const size_t first = ConversationBuffer::segment_bytes + 17;

@@ -55,6 +55,7 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
         o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
     }
     else if (a == "--vram-elastic") o.vram_elastic = true;
+    else if (a == "--kv-pool") o.kv_pool = true;
     else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(args.next("--vram-segment-mib"));
     else if (a == "--prefill-until") o.prefill_until = std::atoll(args.next("--prefill-until"));
     else if (a == "--dump-final-r") o.dump_final_r = args.next("--dump-final-r");
