@@ -71,41 +71,45 @@ records it in `meta.mtp.dense`. Output is about 122 GiB (123 GiB for the 8-bit v
 
 ## Qwen3.8-27B pack
 
-From NVIDIA's checkpoint ([nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4), revision `482ca0f3`)
-alone, no base pack: tokenizer, metadata, MTP layer and vision tower come from the checkpoint's own files. `--drafter` adds the
-DFlash 2 block drafter ([z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)).
+The published pack comes from QUASAR's quantization-aware NVFP4 checkpoint
+([QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4), revision `4a22293a`,
+Apache-2.0, every projection NVFP4 in compressed-tensors' form) alone, no base pack: tokenizer, metadata, MTP layer and vision
+tower come from the checkpoint's own files. `--drafter` adds the DFlash 2 block drafter
+([z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), revision `50307d4c`).
 
 ```sh
-hf download nvidia/Qwen3.8-27B-NVFP4 --revision 482ca0f3 --local-dir nvidia
-hf download z-lab/Qwen3.8-27B-DFlash2 --local-dir dflash2
-python3 tools/convert/convert.py --checkpoint nvidia --drafter dflash2 --out Qwen3.8-27B-NVFP4.basalt --name "Qwen3.8-27B NVFP4"
-```
-
-- `gguf`: every tensor in llama.cpp's `qwen35` names. NVFP4 MLP and head move bit for bit as `NVFP4_PLANES` (type 45, below)
-  with each matrix's FP32 scale as `<name>.scale`; the FP8 projections keep their E4M3 codes (type 44, `F8_E4M3`: one
-  byte per value, Basalt's own type id) with each matrix's FP32 `weight_scale` as `<name>.scale`; the MTP layer's and the
-  drafter's BF16 projections Q8_0; norms F32 with the offset folded in (exact); GDN value heads in the GGUF order (rows of
-  qkv and z, columns of the out projection, moved whole).
-- `vision/mmproj`: the BF16 tower written as llama.cpp's clip GGUF (`qwen3vl_merger`); `vision/text_vocab` beside it.
-- The drafter's feature projection is stored as one block per target layer (`dflash.fc.N`), so the engine projects each
-  layer's rows as the layer ends. About 20 GiB, 22 GiB with the drafter; two minutes on 8 converter processes. The engine
-  refuses a 27B pack whose MLP and head are NVFP4 in ggml blocks (type 40, before NVFP4_PLANES) and asks for a re-conversion.
-
-QUASAR's checkpoint ([QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4), every
-projection NVFP4 in compressed-tensors' form) converts with the same command:
-
-```sh
-hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 --local-dir quasar
+hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 --revision 4a22293a --local-dir quasar
+hf download z-lab/Qwen3.8-27B-DFlash2 --revision 50307d4c --local-dir dflash2
 python3 tools/convert/convert.py --checkpoint quasar --drafter dflash2 --out Qwen3.8-27B-QUASAR-NVFP4.basalt --name "Qwen3.8-27B QUASAR NVFP4"
 ```
 
-- GDN, attention and MLP projections move bit for bit as `NVFP4_PLANES`, `1 / weight_global_scale` in FP32 as `<name>.scale`.
-- The GDN a and b projections (NVFP4 in the checkpoint, 48 rows) become BF16 of their values, rounded once to nearest.
-- The BF16 output head is rounded to `NVFP4_PLANES`: tensor scale amax / (6 x 448), per 16 values the UE4M3 scale with the least
-  squared error among half to four times amax / 6. With `--head fp8` it becomes `F8_E4M3` rows instead, each row's FP32
-  scale (its amax / 448) in `output.scale` (F32 [rows]), each value the nearest E4M3 code: 1.27 GB instead of 0.72 GB, a
-  ninth of the squared error. The token embedding, MTP layer and vision tower are as for NVIDIA's.
-- About 19 GiB with the drafter (19.7 GiB with `--head fp8`).
+- `gguf`: every tensor in llama.cpp's `qwen35` names. GDN, attention and MLP projections move bit for bit as `NVFP4_PLANES`
+  (type 45, below), `1 / weight_global_scale` in FP32 (rounded once) as `<name>.scale`. The GDN a and b projections (NVFP4 in
+  the checkpoint, 48 rows) become BF16 of their values, rounded once to nearest. The MTP layer's and the drafter's BF16
+  projections Q8_0; token embedding BF16 as stored; norms F32 with the offset folded in (exact); GDN value heads in the GGUF
+  order (rows of qkv and z, columns of the out projection, moved whole).
+- The BF16 output head becomes `F8_E4M3` rows (type 44: one byte per value, Basalt's own type id), each row's FP32 scale (its
+  amax / 448) in `output.scale` (F32 [rows]), each value the nearest E4M3 code. `--head nvfp4` rounds it to `NVFP4_PLANES`
+  instead (tensor scale amax / (6 x 448), per 16 values the UE4M3 scale with the least squared error among half to four times
+  amax / 6): 0.72 GB instead of 1.27 GB, nine times the squared error ([precision](precision/qwen38-27b.md#quality-against-bf16)).
+- `vision/mmproj`: the BF16 tower written as llama.cpp's clip GGUF (`qwen3vl_merger`); `vision/text_vocab` beside it.
+- The drafter's feature projection is stored as one block per target layer (`dflash.fc.N`), so the engine projects each
+  layer's rows as the layer ends. 19.7 GiB with the drafter (21,149,505,930 bytes, SHA-256
+  `5ec89e71b4bd461a5abf607825d3cd99e74d2476b8ba087fd690f09a067919ba` for the published file); about a minute on the default
+  16 converter processes. The engine refuses a 27B pack whose MLP and head are NVFP4 in ggml blocks (type 40, before
+  NVFP4_PLANES) and asks for a re-conversion.
+
+NVIDIA's checkpoint ([nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4), revision `482ca0f3`) converts
+with the same command:
+
+```sh
+hf download nvidia/Qwen3.8-27B-NVFP4 --revision 482ca0f3 --local-dir nvidia
+python3 tools/convert/convert.py --checkpoint nvidia --drafter dflash2 --out Qwen3.8-27B-NVFP4.basalt --name "Qwen3.8-27B NVFP4"
+```
+
+- Its MLP and output head are NVFP4 and move bit for bit as `NVFP4_PLANES` with each matrix's FP32 `weight_scale_2` as
+  `<name>.scale`; its GDN and attention projections are FP8 and keep their E4M3 codes as `F8_E4M3` with each matrix's FP32
+  `weight_scale` as `<name>.scale`. Everything else as above. About 22 GiB with the drafter.
 
 ### `NVFP4_PLANES` (tensor type 45)
 
