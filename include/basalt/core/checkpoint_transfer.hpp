@@ -2,8 +2,9 @@
 //
 // Every model's checkpoint is the same job: a set of device regions copied into host bytes when it is taken and back
 // when a request resumes from it.  The host bytes come from the pooled, page-locked blocks of CheckpointBytes
-// (conversation_cache.hpp), so the copies run at link speed and need no staging by the driver; the many small pieces
-// of a model's state (a ring and a compressor per layer) go through one device-side gather and one host copy.
+// (conversation_cache.hpp), so the copies run at link speed and need no staging by the driver.  copy_out and copy_in
+// issue one async copy per region of a model's state (a ring and a compressor per layer) and synchronize once; a
+// deferred save gathers the regions into one device buffer and copies each segment to the host from there.
 //
 //   copy_out / copy_in   the state lands (or is back) when the call returns;
 //   CheckpointDeferral   the state is snapshotted on the device at once, in the order of the stream's own work, and
