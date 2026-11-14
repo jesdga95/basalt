@@ -45,7 +45,8 @@ struct Workspace {
     std::size_t partial_floats = 0, tickets_n = 0;
 };
 
-/// One matrix of a call: W [rows][K], its output y[t * ld_y + r], `scale` a device fp32 scalar or null.
+/// One matrix of a call: W [rows][K], its output y[t * ld_y + r], `scale` a device fp32 scalar or null; an F8 matrix may
+/// instead have a scale per row (`row_scales`, fp32 [rows], `scale` then unused).
 struct Matrix {
     const uint8_t* w = nullptr;
     int64_t rows = 0;
@@ -55,6 +56,7 @@ struct Matrix {
     const uint8_t* scales = nullptr;   // NVFP4, Q8: the scale plane when `rows` are the first rows of a larger matrix (null: after
                                        // the codes of these rows)
     uint16_t* y16 = nullptr;           // AddBf16: the BF16 rows added into (y unused)
+    const float* row_scales = nullptr; // F8: row r's scale row_scales[r] in place of `scale`
 };
 
 enum class Epilogue {

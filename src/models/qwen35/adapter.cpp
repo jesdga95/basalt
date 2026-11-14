@@ -305,6 +305,7 @@ private:
     }
 
     // `<base>.weight` (Q8_0, NVFP4_PLANES or F8_E4M3, rows x cols) and, for the last two, its tensor scale `<base>.scale`
+    // (F32 [1]; the F8 head's may be F32 [rows], a scale per row)
     bool linear(const GgufFile& gg, const std::string& base, int64_t rows, int64_t cols, dense::Linear& l, std::string& err) {
         auto it = tensors_.find(base + ".weight");
         if (it == tensors_.end()) {
@@ -324,6 +325,11 @@ private:
         l.w = upload(gg, *t, err);
         if (!l.w) return false;
         if (type == kTypeNvfp4Planes || type == kTypeF8) {
+            auto sc = tensors_.find(base + ".scale");
+            if (type == kTypeF8 && base == "output" && sc != tensors_.end() && (int64_t) sc->second.elements() == rows && rows > 1) {
+                l.row_scales = floats(gg, base + ".scale", rows, err);
+                return l.row_scales != nullptr;
+            }
             l.scale = floats(gg, base + ".scale", 1, err);
             if (!l.scale) return false;
         }

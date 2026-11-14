@@ -267,6 +267,7 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
     for (int i = 0; i < c.n; ++i) {
         if (((uintptr_t) c.m[i].w & 15) != 0) refuse("unaligned matrix", c);
         if (c.fmt == Format::Nvfp4 && c.m[i].rows % 128 != 0) refuse("NVFP4 rows not a multiple of 128", c);
+        if (c.m[i].row_scales && c.fmt != Format::F8) refuse("a scale per row on a matrix other than F8", c);
     }
     const int64_t pr = part_rows(c);
     if (p.ks > 1 && ((size_t) p.ks * kRows * pr > ws.partial_floats || (size_t) p.tiles > ws.tickets_n))
@@ -281,6 +282,7 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
         a.sp[i] = c.m[i].scales ? c.m[i].scales : c.m[i].w + c.m[i].rows * (c.fmt == Format::Q8 ? c.K : c.K / 2);
         a.rows[i] = c.m[i].rows;
         a.scale[i] = c.m[i].scale;
+        a.row_scales[i] = c.m[i].row_scales;
         a.y[i] = c.m[i].y;
         a.y16[i] = c.m[i].y16;
         a.ld_y[i] = c.m[i].ld_y;

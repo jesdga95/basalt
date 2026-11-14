@@ -1,7 +1,8 @@
 // tests/kernels/window_gemm_parity.cpp - a decode window's products (window_gemm.hpp) at Qwen3.8-27B widths, FP8 E4M3 and
 // NVFP4 planes: against a double-precision reference on the fp16-packed activations, each row of a window bitwise the
 // same whatever the window's rows (1..16) and whatever the other rows hold, the Add, AddBf16 and SwiGLU epilogues, a call of
-// several matrices, and the fused packs against rms_norm_rows / attn_gate followed by pack.
+// several matrices, an F8 matrix with a scale per row (the head's; its leading rows alone too, as the block drafter reads
+// them), and the fused packs against rms_norm_rows / attn_gate followed by pack.
 // --bench: us per call and GB/s of weights, the weights rotated through copies larger than L2.  Exit 77 without a GPU.
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/nvfp4_planes.hpp"
@@ -428,6 +429,91 @@ void parity_packs() {
     cudaFree(d_x); cudaFree(d_w); cudaFree(d_xn); cudaFree(d_xn2); cudaFree(a1); cudaFree(a2);
 }
 
+// An F8 matrix with a scale per row: against the double reference (row r scaled by its own), rows bitwise across T, its
+// leading rows alone against the reference too, and every row's scale equal to the tensor scale bitwise the tensor-scale
+// product
+void parity_row_scales(int64_t rows, int64_t K) {
+    const Mat m = make_mat(wg::Format::F8, rows, K);
+    const auto x = make_x(K);
+    std::vector<float> rs((size_t) rows);
+    std::uniform_real_distribution<float> ud(-12.0f, -4.0f);
+    for (float& v : rs) v = std::exp2(ud(rng));
+    uint8_t* d_w = up(m.bytes);
+    float* d_x = up(x);
+    float* d_rs = up(rs);
+    float* d_sc = up(std::vector<float>{0.03f});
+    float* d_rs1 = up(std::vector<float>((size_t) rows, 0.03f));
+    void* act;
+    cudaMalloc(&act, wg::act_bytes(K));
+    float *d_y, *d_y2;
+    cudaMalloc(&d_y, (size_t) R * rows * 4);
+    cudaMalloc(&d_y2, (size_t) R * rows * 4);
+    wg::Call c;
+    c.fmt = wg::Format::F8;
+    c.K = K;
+    c.m[0] = {d_w, rows, nullptr, d_y, rows};
+    c.m[0].row_scales = d_rs;
+    need(c);
+    wg::pack(d_x, K, K, R, act, nullptr);
+    wg::gemm(c, act, R, ws, nullptr);
+    const auto y = down(d_y, (size_t) R * rows);
+    const auto hx = bf16_rows(act, (size_t) R * K);
+    auto ref_worst = [&](const std::vector<float>& yy, int64_t n) {   // rows 0..n-1 of yy ([R][n])
+        double worst = 0;
+        for (int t = 0; t < R; ++t)
+            for (int64_t r = 0; r < n; r += 7) {
+                double s = 0, sa = 0;
+                for (int64_t k = 0; k < K; ++k) {
+                    const double p = (double) m.value(r, k) * (double) hx[(size_t) t * K + k];
+                    s += p;
+                    sa += std::fabs(p);
+                }
+                worst = std::max(worst, std::fabs(yy[(size_t) t * n + r] - s * rs[(size_t) r]) / std::max(sa * rs[(size_t) r], 1e-30));
+            }
+        return worst;
+    };
+    const double worst = ref_worst(y, rows);
+    const bool ok = worst < 5e-5;
+    std::printf("%-24s vs double: max |err| / sum|w x| %.3g%s\n", "F8 row scales", worst, ok ? "" : "  FAIL");
+    if (!ok) ++fails;
+    int diff = 0;
+    std::normal_distribution<float> nd;
+    for (int T = 1; T <= R; ++T) {
+        std::vector<float> x2 = x;
+        for (int t = T; t < R; ++t)
+            for (int64_t k = 0; k < K; ++k) x2[(size_t) t * K + k] = 1e3f * nd(rng);
+        float* d_x2 = up(x2);
+        wg::pack(d_x2, K, K, T, act, nullptr);
+        cudaMemset(d_y2, 0xFF, (size_t) R * rows * 4);
+        c.m[0].y = d_y2;
+        wg::gemm(c, act, T, ws, nullptr);
+        const auto yt = down(d_y2, (size_t) R * rows);
+        diff += std::memcmp(yt.data(), y.data(), (size_t) T * rows * 4) != 0;
+        cudaFree(d_x2);
+    }
+    std::printf("%-24s rows bitwise at T = 1..32: %s\n", "F8 row scales", diff ? "DIFFER  FAIL" : "yes");
+    if (diff) ++fails;
+    wg::pack(d_x, K, K, R, act, nullptr);
+    const int64_t lead = rows / 2;   // the leading rows alone, written at their own stride
+    c.m[0] = {d_w, lead, nullptr, d_y2, lead};
+    c.m[0].row_scales = d_rs;
+    wg::gemm(c, act, R, ws, nullptr);
+    const double wl = ref_worst(down(d_y2, (size_t) R * lead), lead);
+    std::printf("%-24s leading rows alone vs double: %.3g%s\n", "F8 row scales", wl, wl < 5e-5 ? "" : "  FAIL");
+    if (wl >= 5e-5) ++fails;
+    c.m[0] = {d_w, rows, d_sc, d_y, rows};
+    wg::gemm(c, act, R, ws, nullptr);
+    const auto ys = down(d_y, (size_t) R * rows);
+    c.m[0] = {d_w, rows, nullptr, d_y2, rows};
+    c.m[0].row_scales = d_rs1;
+    wg::gemm(c, act, R, ws, nullptr);
+    const auto yr = down(d_y2, (size_t) R * rows);
+    const bool same = std::memcmp(ys.data(), yr.data(), ys.size() * 4) == 0;
+    std::printf("%-24s equal row scales == tensor scale bitwise: %s\n", "F8 row scales", same ? "yes" : "NO  FAIL");
+    if (!same) ++fails;
+    cudaFree(d_w); cudaFree(d_x); cudaFree(d_rs); cudaFree(d_sc); cudaFree(d_rs1); cudaFree(act); cudaFree(d_y); cudaFree(d_y2);
+}
+
 void bench_call(const char* name, wg::Format fmt, int64_t rows, int64_t K, bool swiglu) {
     const size_t wb = fmt == wg::Format::F8 ? (size_t) rows * K : fmt == wg::Format::Bf16 ? (size_t) rows * K * 2
                       : fmt == wg::Format::Q8 ? (size_t) rows * K / 32 * 34 : np::bytes(rows, K);
@@ -503,12 +589,14 @@ int main(int argc, char** argv) {
         for (const Shape& sh : kShapes) bench_call(sh.name, sh.fmt, sh.rows, sh.K, false);
         bench_call("FP4 gate+up SwiGLU", wg::Format::Nvfp4, 17408, 5120, true);
         bench_call("FP4 head 248320x5120", wg::Format::Nvfp4, 248320, 5120, false);
+        bench_call("F8 head 248320x5120", wg::Format::F8, 248320, 5120, false);
         bench_call("Q8 gate 17408x5120", wg::Format::Q8, 17408, 5120, false);
         return 0;
     }
     for (const Shape& sh : kShapes) parity(sh);
     parity_swiglu(17408, 5120);
     parity_multi();
+    parity_row_scales(8192, 5120);
     parity_q8(5120, 5120);
     parity_packs();
     std::printf("%s\n", fails ? "FAILED" : "all passed");
