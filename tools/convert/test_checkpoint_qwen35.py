@@ -604,6 +604,52 @@ class Qwen35CompressedTensorsTest(unittest.TestCase):
         np.testing.assert_array_equal(Q.e2m1_round(x), [0, 1, 2, 2, 4, 4, 6, 6, 7, 7, 10, 0])
 
 
+class Qwen35Fp8HeadTest(unittest.TestCase):
+    """--head fp8 on the compressed-tensors checkpoint: the BF16 head becomes E4M3 rows, each with its FP32 scale."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        t = Path(cls.tmp.name)
+        (t / "ck").mkdir()
+        cls.fx = Fixture(t / "ck", ct=True)
+        out = t / "x.basalt"
+        r = subprocess.run([sys.executable, str(HERE / "convert.py"), "--checkpoint", str(t / "ck"), "--out", str(out),
+                            "--head", "fp8", "--workers", "2"], capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(r.stdout + r.stderr)
+        cls.p = Pack(out, t)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_head_as_fp8_rows(self):
+        x = type(self).fx.v["lm_head.weight"]
+        p = type(self).p
+        T = p.meta["tensors"]["output.weight"]
+        self.assertEqual((T["type"], T["type_id"], T["shape"]), ("F8_E4M3", 44, [H, VOCAB]))
+        self.assertEqual(p.meta["tensors"]["output.scale"]["shape"], [VOCAB])
+        sc = p.f32("output.scale")
+        np.testing.assert_array_equal(sc, (np.abs(x).max(-1).astype(np.float32) / np.float32(448)).astype(np.float32))
+        codes = np.frombuffer(p.raw("output.weight"), np.uint8).reshape(VOCAB, H)
+        self.assertFalse(((codes & 0x7F) == 0x7F).any())
+        got = E4M3[codes].astype(np.float64)
+        ref = x.astype(np.float64) / sc.astype(np.float64)[:, None]
+        # to nearest: no E4M3 value is closer than the one written
+        cand = np.sort(np.unique(E4M3[np.isfinite(E4M3)]).astype(np.float64))
+        i = np.clip(np.searchsorted(cand, ref), 1, len(cand) - 1)
+        best = np.minimum(np.abs(cand[i] - ref), np.abs(cand[i - 1] - ref))
+        np.testing.assert_array_equal(np.abs(got - ref), best)
+        self.assertEqual(np.abs(got).max(-1).tolist(), [448.0] * VOCAB)   # each row's amax lands on the largest code
+        self.assertIn("bf16_to_fp8", p.meta["checkpoint"])
+        self.assertEqual(p.meta["tensors"]["blk.0.ffn_gate.weight"]["type"], "NVFP4_PLANES")   # only the head changes
+
+    def test_e4m3_rounding(self):
+        x = np.array([0.0, -0.0, 1.0625, 1.1875, -1.0625, 448.0, 500.0, -1000.0, 2.0 ** -10, 3 * 2.0 ** -10])
+        np.testing.assert_array_equal(E4M3[Q.e4m3_round(x)], [0, 0, 1.0, 1.25, -1.0, 448, 448, -448, 0, 2.0 ** -8])
+
+
 class Qwen35RefusalTest(unittest.TestCase):
     """The plan refuses checkpoints it would convert wrongly; Plan reads headers only, so no conversion runs."""
 
@@ -635,6 +681,13 @@ class Qwen35RefusalTest(unittest.TestCase):
     def test_wrong_model_type(self):
         with self.assertRaisesRegex(S.ConvertError, "qwen3_5_text"):
             self.plan(edit=lambda c: c["text_config"].update(model_type="qwen3_moe"))
+
+    def test_fp8_head_needs_a_bf16_head(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            Fixture(d)
+            with self.assertRaisesRegex(S.ConvertError, "--head fp8 rounds a BF16 head; lm_head.weight"):
+                Q.Plan(C.Checkpoint(d), "fp8")
 
     def test_missing_layer_tensor(self):
         with tempfile.TemporaryDirectory() as tmp:
