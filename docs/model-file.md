@@ -102,8 +102,10 @@ python3 tools/convert/convert.py --checkpoint quasar --drafter dflash2 --out Qwe
 - GDN, attention and MLP projections move bit for bit as `NVFP4_PLANES`, `1 / weight_global_scale` in FP32 as `<name>.scale`.
 - The GDN a and b projections (NVFP4 in the checkpoint, 48 rows) become BF16 of their values, rounded once to nearest.
 - The BF16 output head is rounded to `NVFP4_PLANES`: tensor scale amax / (6 x 448), per 16 values the UE4M3 scale with the least
-  squared error among half to four times amax / 6. The token embedding, MTP layer and vision tower are as for NVIDIA's.
-- About 19 GiB with the drafter.
+  squared error among half to four times amax / 6. With `--head fp8` it becomes `F8_E4M3` rows instead, each row's FP32
+  scale (its amax / 448) in `output.scale` (F32 [rows]), each value the nearest E4M3 code: 1.27 GB instead of 0.72 GB, a
+  ninth of the squared error. The token embedding, MTP layer and vision tower are as for NVIDIA's.
+- About 19 GiB with the drafter (19.7 GiB with `--head fp8`).
 
 ### `NVFP4_PLANES` (tensor type 45)
 

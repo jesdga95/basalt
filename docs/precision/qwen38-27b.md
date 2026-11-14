@@ -73,6 +73,12 @@ BF16 tensor).
 |---|---:|---:|---:|---:|---:|
 | QUASAR, every projection NVFP4, `--kv fp16` | 6.8586 | 0.0314 | 0.0169 | 0.272 | 91.78% |
 | The same, `--kv int8` | 6.8640 | 0.0309 | 0.0169 | 0.271 | 91.82% |
+| The head as FP8 rows (`--head fp8`), `--kv fp16` | 6.8348 | 0.0264 | 0.0119 | 0.258 | 92.72% |
+| The same, `--kv int8` | 6.8410 | 0.0259 | 0.0119 | 0.257 | 92.90% |
+| Reference (a converter experiment): the head Q8_0, near its BF16 values, `--kv fp16` | 6.8335 | 0.0256 | 0.0111 | 0.257 | 93.13% |
+
+The head carries most of the gap to NVIDIA's pack: rounding QUASAR's BF16 head to NVFP4 costs KLD 0.0058 over a Q8_0
+head, and FP8 rows (an FP32 scale per row) win back 0.0050 of it. What remains (0.0256 against 0.0239) is the body.
 
 The F8 projections hold NVIDIA's values exactly but read prompt rows in E4M3 (one scale per row) where the Q8_0 pack read
 them in q8_1 (one scale per 32): perplexity 6.7889 -> 6.7850, KLD 0.0213 -> 0.0214, top-1 92.93 -> 92.87%.
