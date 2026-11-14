@@ -403,7 +403,10 @@ public:
         if (!r.ok()) e = r.message;
         return r.ok();
     }
-    bool copy_logits(int, float* out) { return rt_.session().copy_logits(out).ok(); }
+    bool copy_logits(int row, float* out) { return rt_.session().copy_logits(row, out).ok(); }
+    bool row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) {
+        return rt_.session().row_logprobs(row0, n, picks, top, out).ok();
+    }
     bool after_accept(int, int&, int, bool, bool, bool, bool& hold) {
         hold = false;
         return true;
@@ -535,6 +538,7 @@ private:
 bool SessionRuntime::next_batch_window() {
     std::vector<int32_t> history;
     std::vector<float> grammar_bias;
+    std::vector<float> lp_rows;   // a logprobs slot's kept rows (row_logprobs)
     const auto failed = [&](const std::string& m) {
         std::printf("ERR %s\n", m.c_str());
         set_active(0);
@@ -586,8 +590,16 @@ bool SessionRuntime::next_batch_window() {
         sl.drafts_accepted += a;
         std::string line = "BT " + std::to_string(b);
         const char* fin = nullptr;
+        if (sl.lp_top >= 0) {   // the kept rows' logprobs, read before the drafts touch the head
+            lp_rows.resize((size_t) (a + 1) * basalt::kernels::kLogprobStride);
+            if (const basalt::model::Result r = session().row_logprobs(0, a + 1, out_.data(), sl.lp_top, lp_rows.data()); !r.ok())
+                return failed(r.message);
+        }
         for (int i = 0; i <= a && fin == nullptr; ++i) {
             const int32_t y = out_[(size_t) i];
+            if (sl.lp_top >= 0)   // ahead of the BT line
+                basalt::protocol::emit_text("BP " + std::to_string(b) +
+                                            logprob_fields(lp_rows.data() + (size_t) i * basalt::kernels::kLogprobStride, y, sl.lp_top) + "\n");
             sl.ids.push_back(win_[(size_t) i]);
             ++sl.produced;
             ++sl.p;
@@ -707,7 +719,7 @@ Flow SessionRequest::read_to(int64_t to) {
         if (runtime_.halted()) { cancelled = true; return Flow::quit; }
         progress_line("PP", at);
     }
-    if ((to == turn_at || to == root_at) &&
+    if (part_checkpoint(to) &&
         !rt_.checkpoint_at(to, to == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd, ids)) {
         std::printf("ERR saving a conversation checkpoint failed: %s\n", runtime_.err.c_str());
         return Flow::error;
@@ -717,6 +729,11 @@ Flow SessionRequest::read_to(int64_t to) {
 
 // ENC <image> <out> [<image> <out> ...]: one `ENC OK <n> <nx> <ny> <ms>` per image, or one `ENC ERR <message>`.
 void SessionRuntime::enc_command(const std::string& cmd) {
+    if (cmd.rfind("ENCV ", 0) == 0) {
+        std::printf("ENC ERR this model reads no video\n");
+        std::fflush(stdout);
+        return;
+    }
     std::istringstream in(cmd);
     std::string word;
     in >> word;

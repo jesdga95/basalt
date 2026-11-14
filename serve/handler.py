@@ -8,6 +8,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -16,15 +17,18 @@ from serve.api import responses as responses_api
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
+from serve.api.documents import sources as document_sources
 from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
+from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, checked as checked_logprobs
 from serve.config import checked_sampling
 from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
 from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
+from serve.live import AnswerNowRefused
 from serve.router import Router
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, QUEUE_BEAT_S, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
@@ -32,6 +36,8 @@ from serve.util.text import stop_strings
 
 
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
+# What this server offers beyond the OpenAI, Anthropic and llama.cpp APIs, listed under /props "basalt"
+CAPABILITIES = ["answer_now", "logprobs", "documents"]
 TURN_POLL_S = 0.5                           # how soon a request waiting for its turn notices its client left
 
 
@@ -58,6 +64,7 @@ def make_handler(target: Service | Router):
         cancel = None                                       # set when the client left
         turn = None                                         # this request's router turn
         sse_open = False                                    # the stream's headers went out
+        live = None                                         # this request's entry in router.live (answer now)
 
         # a request's session identity, the headers a load balancer names its flows by (tinyllb's order), then the
         # request body's own field; the slot the engine runs a conversation in follows it.  Deliberately not here:
@@ -75,6 +82,17 @@ def make_handler(target: Service | Router):
 
         def log_message(self, fmt, *args):
             pass
+
+        def end_headers(self):
+            """A chat response names its request id."""
+            if self.live is not None:
+                self.send_header("X-Request-Id", self.live.id)
+            super().end_headers()
+
+        def _open_live(self, rid: str, req: dict) -> None:
+            """Register this request under its response id (and the client's x-client-request-id) for answer now."""
+            client = (self.headers.get("x-client-request-id") or "").strip()[:256] or None
+            self.live = router.live.open(rid, self._session_id(req), client)
 
         def parse_request(self):
             """Without an API key, check the Host header (DNS-rebinding protection); a key makes the check moot."""
@@ -237,6 +255,7 @@ def make_handler(target: Service | Router):
             self.send_header("Access-Control-Allow-Headers",
                              asked or "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta")
             self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Access-Control-Expose-Headers", "X-Request-Id")    # readable by a page's script
 
         def do_OPTIONS(self):
             # preflights carry no credentials, so no API key check
@@ -442,6 +461,15 @@ def make_handler(target: Service | Router):
                         result = "loaded"
                     self._json(200, {"status": result, **target.v1_status()})
                     return
+                if path == "/v1/answer_now":
+                    rid = req.get("request_id")
+                    if rid is not None and not isinstance(rid, str):
+                        raise ValueError("request_id: a string")
+                    try:
+                        self._json(200, router.live.answer_now(rid, None if rid else self._session_id(req)))
+                    except AnswerNowRefused as e:
+                        self._json(e.status, e.body())
+                    return
                 if path == "/v1/vram":                       # resize the VRAM reserve
                     if not self._own_page("the VRAM reserve can be changed"):
                         return
@@ -460,16 +488,17 @@ def make_handler(target: Service | Router):
                     return
                 self.svc.request_ctx.path = path
                 self.svc.request_ctx.model = self.svc.model  # always the served name, never the requested one
-                if path == "/v1/responses":
-                    self._responses(req)
-                elif path == "/v1/chat/completions":
-                    self._openai(req)
-                elif path == "/v1/messages":
-                    self._anthropic(req)
-                elif path == "/v1/messages/count_tokens":
-                    self._count_tokens(req)
-                else:
-                    self._json(404, {"error": {"message": "not found"}})
+                with document_sources(self._image_access()):   # a document by URL or path follows the image rules
+                    if path == "/v1/responses":
+                        self._responses(req)
+                    elif path == "/v1/chat/completions":
+                        self._openai(req)
+                    elif path == "/v1/messages":
+                        self._anthropic(req)
+                    elif path == "/v1/messages/count_tokens":
+                        self._count_tokens(req)
+                    else:
+                        self._json(404, {"error": {"message": "not found"}})
             except EngineError as e:                         # the engine failed: not the request's fault
                 if path == "/v1/responses":
                     self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
@@ -504,6 +533,8 @@ def make_handler(target: Service | Router):
                 self.turn = None
             if self.watch_done is not None:
                 self.watch_done.set()
+            if self.live is not None:
+                router.live.close(self.live)
 
         def _props(self):
             name = parse_qs(urlsplit(self.path).query).get("model", [None])[0]
@@ -527,13 +558,17 @@ def make_handler(target: Service | Router):
             params["n_predict"] = -1
             props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
                      "total_slots": svc.slot_stats()["total"], "model_alias": svc.model, "chat_template": svc.template.source,
-                     "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
+                     "modalities": {"vision": svc.vision is not None, "video": svc.video_on()},
+                     "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded(), "chat_template_caps": dict(svc.dialect.caps)}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
             if version:
                 props["build_info"] = "basalt " + str(version)
+            # "video" only where a video can be read: image input on, a model that reads video, FFmpeg found
+            props["basalt"] = {"version": str(version) if version else None,
+                               "capabilities": list(CAPABILITIES) + (["video"] if svc.video_on() else [])}
             self._json(200, props)
 
         def _control_body(self) -> bool:
@@ -625,6 +660,8 @@ def make_handler(target: Service | Router):
             check_format(req.get("response_format"))
             self.svc.require_grammar(req.get("response_format"))
             checked_sampling(req)                             # a sampling value out of range is a 400 likewise
+            self._open_live("chatcmpl-" + uuid.uuid4().hex[:24], req)
+            req[LOGPROBS_KEY] = checked_logprobs(req)         # and a bad logprobs / top_logprobs
             self._take_turn(bool(req.get("stream")))
             self.svc.load()
             req[BIAS_KEY] = checked_bias(req, self.svc.engine)     # a bad logit_bias is a 400 before streaming
@@ -638,7 +675,7 @@ def make_handler(target: Service | Router):
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
             chunks = primed(openai_chunks(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
-                                          session=self._session_id(req)), ids)
+                                          session=self._session_id(req), live=self.live), ids)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
@@ -676,11 +713,13 @@ def make_handler(target: Service | Router):
                 yield from asm.start()
                 done = None
                 for kind, x in self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
-                                            session=self._session_id(req)):
+                                            session=self._session_id(req), live=self.live):
                     if kind == "ping":
                         yield None
                     elif kind == "event":
                         yield from asm.feed(x)
+                    elif kind == "logprobs":
+                        asm.logprob(*x)
                     elif kind == "done":
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
@@ -771,10 +810,12 @@ def make_handler(target: Service | Router):
                 checked_sampling(req)
             except ValueError as e:
                 raise ResponsesError(str(e), str(e).split(":")[0]) from None
+            req[LOGPROBS_KEY] = responses_api.requested_logprobs(req)
             try:
                 stop_strings(req)
             except ValueError as e:
                 raise ResponsesError(str(e), "stop") from None
+            self._open_live(responses_api.new_id("resp"), req)
             self._take_turn(bool(req.get("stream")))
             self.svc.load()
             try:
@@ -788,7 +829,7 @@ def make_handler(target: Service | Router):
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, self.svc.model, len(ids), names,
-                                          "reasoning.encrypted_content" in include)
+                                          "reasoning.encrypted_content" in include, rid=self.live.id)
             return ids, thinking, tools, max_new, asm, req, force
 
         def _count_tokens(self, req):
@@ -810,7 +851,9 @@ def make_handler(target: Service | Router):
             req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
             self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             checked_sampling(req)                             # likewise a sampling value out of range
+            req[LOGPROBS_KEY] = checked_logprobs(req)         # Basalt's logprobs, as Chat Completions takes them
             stop_strings(req)                                 # likewise a bad stop
+            self._open_live("msg_" + uuid.uuid4().hex[:24], req)
             self._take_turn(bool(req.get("stream")))
             self.svc.load()
             ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
@@ -818,7 +861,7 @@ def make_handler(target: Service | Router):
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
             events = primed(anthropic_events(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
-                                              session=self._session_id(req)), ids)
+                                              session=self._session_id(req), live=self.live), ids)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()

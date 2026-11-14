@@ -23,9 +23,12 @@ find_package(Threads REQUIRED)
 
 set(VISION_ROOT ${CMAKE_CURRENT_LIST_DIR}/../..)
 
-# host side: preprocessing, projector file, CPU encoder
+# host side: preprocessing, FFmpeg loaded at run time, projector file, CPU encoder
 add_library(vision_core STATIC
   ${VISION_ROOT}/src/vision/preprocess.cpp
+  ${VISION_ROOT}/src/vision/ffmpeg_api.cpp
+  ${VISION_ROOT}/src/vision/video.cpp
+  ${VISION_ROOT}/src/vision/mrope_positions.cpp
   ${VISION_ROOT}/src/vision/mmproj.cpp
   ${VISION_ROOT}/src/vision/encoder_cpu.cpp
   ${VISION_ROOT}/src/vision/gemm_cpu.cpp

@@ -22,7 +22,8 @@ from serve.util.text import ByteTokenizer
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
 # A window gives a slot up to MULTI tokens in ONE line, `BT <slot> <id> [<id> ..]`.
-# Every reply is the bytes of "ok, done." then <|im_end|> (ByteTokenizer: 257).
+# Every reply is the bytes of "ok, done." then <|im_end|> (ByteTokenizer: 257). A request with logprobs=K gets a
+# P line ahead of each T line (BP <slot> ahead of a BT line): the pick at -0.25, then K alternatives.
 FAKE_BATCH = r'''import queue, sys, threading, time
 args = sys.argv[1:]
 slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
@@ -66,6 +67,9 @@ def reply(ids):            # the rest of the reply after what the prompt already
     k = max(k for k in range(len(R)) if k == 0 or ids[-k:] == R[:k])
     return R[k:]
 active = {}          # slot -> [tokens left, max_new, produced]
+lp_top = {}          # slot (None: solo) -> the request's logprobs=K
+def lp_fields(t, k):
+    return f"{t} -0.25" + "".join(f" {t if i == 0 else 32 + i}:{-0.25 - 2 * i}" for i in range(k))
 stopped = set()      # BSTOPped slots: they end "cancel"
 def window():        # one batch window: every active slot one token
     if fail and len(active) >= 2:     # as the engine: the reason on stdout, then exit code 1
@@ -80,6 +84,9 @@ def window():        # one batch window: every active slot one token
             got.append(t)
             if t == 257 or produced >= max_new or len(got) >= MULTI:
                 break
+        if lp_top.get(b) is not None:
+            for t2 in got:
+                print(f"BP {b} " + lp_fields(t2, lp_top[b]), flush=True)
         print(f"BT {b} " + " ".join(map(str, got)), flush=True)
         if t == 257 or produced >= max_new:
             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
@@ -113,6 +120,13 @@ while True:
         max_new = int(f[2] if slot is not None else f[1])
         bslot = slot if f[0] == "BGEN" else None      # SGEN: a solo run on that slot's own state
         ids = f[-1].split(",")
+        lp = next((int(x[9:]) for x in f if x.startswith("logprobs=")), None)
+        lp_top[None] = lp
+        if bslot is not None:
+            lp_top[bslot] = lp
+        if lp is not None and bytes(int(x) & 255 for x in ids).find(b"PIPELINED") >= 0:   # as a layer-split engine
+            print("ERR sampling logprobs: pipelined batch groups are not supported", flush=True)
+            continue
         if bytes(int(x) & 255 for x in ids).find(b"REFUSEME") >= 0:   # refused up front, then idle (no DONE)
             print("ERR refused: images are not enabled", flush=True)
             continue
@@ -161,6 +175,8 @@ while True:
         for t in toks[:n]:
             if stop.is_set():
                 break
+            if lp is not None:
+                print("P " + lp_fields(t, lp), flush=True)
             print(f"T {t}", flush=True)
             out += 1
             time.sleep(STEP)

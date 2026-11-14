@@ -74,7 +74,7 @@ Flow Runtime::dispatch() {
         return Flow::next;
     }
     if (line.rfind("BYIELD", 0) == 0) return Flow::next;   // for a prompt read that has ended meanwhile
-    if (line.rfind("ENC ", 0) == 0) {   // the in-engine image encoder, between requests and windows
+    if (line.rfind("ENC ", 0) == 0 || line.rfind("ENCV ", 0) == 0) {   // the in-engine encoder, between requests and windows
         enc_command(line);
         return Flow::next;
     }

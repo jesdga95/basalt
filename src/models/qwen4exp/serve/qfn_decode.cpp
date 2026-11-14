@@ -69,7 +69,7 @@ void QfnRequest::decode_state_begin() {
     n_chain = 0;                       // drafts the last chain produced
     full_ema = 0.5;                 // how often windows are accepted whole
     pair_hint = false;                // windows are accepted whole often enough to run the chain on for a guess
-    pair_req = runtime_.pipe_on && ppl == nullptr && !relax_on && gguard == nullptr && hist_n == 0 && !in_slot &&
+    pair_req = runtime_.pipe_on && ppl == nullptr && !relax_on && gguard == nullptr && hist_n == 0 && !in_slot && req_logprobs < 0 &&
                           runtime_.kv_floor == 0;
     if (runtime_.pipe_on) runtime_.mtp.set_max_drafts((pair_req ? basalt::core::kMtpChainMax : runtime_.S_mtp) - 1);
     pair_runs = 0;

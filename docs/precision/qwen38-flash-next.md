@@ -190,6 +190,17 @@ changes in the last bits. Quality against the BF16 reference, swapped card order
 split: PPL 2.3129 / 2.2999, KLD 0.07294 / 0.07262, top-1 92.94% / 92.96%. The paired KLD difference is -0.00032 ± 0.0014. With a
 slower peer the split is not taken and output is bitwise the same as without it.
 
+## Video input
+
+A video reaches the encoder as transformers' Qwen3VLVideoProcessor prepares it. On four clips the sampled frames, canvas, groups and
+timestamps are identical. The pixel values after normalisation are within one uint8 step: 0.016% and 0.007% of values are one step
+off on 320x240 and 640x360 sources, 0.1% on a 720x358 one (40 of 14.9 M two steps). Frames convert to RGB with their own colour matrix, as PyAV's do.
+What differs is the resize: the image path's Pillow-style bicubic against torchvision's float antialiased bicubic.
+
+A group's two frames go through the patch embedding's two temporal taps apart (W0 a + W1 b, rel L2 6e-7 to 9e-7 against double
+precision). A picture keeps the summed taps, so image output is bitwise as before. In the prompt, the template's whole video marker
+becomes per-group `<t seconds>` text and pads, as the processor at the model's release (transformers 4.57.1) writes it.
+
 ## Lossy routing flags
 
 Off by default, never picked automatically, and the two flags need the device-planned MoE tail. Both apply to experts held by any GPU tier.

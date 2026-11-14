@@ -13,6 +13,7 @@ switch. Several models can share one address ([router](../configuration/models.m
 | Chat, tools, thinking | yes; `<tool_call>` tools | yes; DSML tools |
 | Reasoning effort | `none`, `low`, `medium`, `high`, `max` (`high` = `max`); a number is refused | `none`, `low` (50), `medium` and `high` (75), `max` (100), or 1 to 100 |
 | Images | `--vision dynamic`, a GPU number or `cpu` | `--vision dynamic` only |
+| Video | with images, and FFmpeg on the machine ([video](../running.md#video)) | no |
 | `--kv` | fp16 (default), int8, q4_0, k8v4 | fp8 (default: FP8 window, FP4 compressed rows), fp16 |
 | Cards | main card plus up to three expert-tier cards | main card plus one expert-tier card |
 | Layer split | yes, matched cards, priced at start | no |

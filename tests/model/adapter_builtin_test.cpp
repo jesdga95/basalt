@@ -1,4 +1,4 @@
-// tests/model/adapter_builtin_test.cpp - the program's own registration: both real adapters, once each, DeepSeek's
+// tests/model/adapter_builtin_test.cpp - the program's own registration: every adapter the build holds, once each, DeepSeek's
 // load error and the flags each model reports as lossy. Linking the models needs the CUDA runtime, so this runs where
 // that is installed; no GPU work.
 #include "basalt/model/adapter.hpp"
@@ -20,8 +20,29 @@ int main() {
     };
     models::register_builtin_models();
     models::register_builtin_models();
-    check(model::find_adapter("qwen4exp") && model::find_adapter("deepseek41"), "both adapters registered");
-    check(model::adapter_names().size() == 2, "registering twice keeps one adapter per name");
+    // BASALT_MODELS decides which adapters exist: each built model is registered once, each left out is refused by name
+    size_t built = 0;
+    const auto expect = [&](const char* arch, bool is_built) {
+        built += is_built ? 1 : 0;
+        check((model::find_adapter(arch) != nullptr) == is_built, is_built ? "a built model is registered" : "a model left out is not registered");
+        if (!is_built) {
+            const std::string why = model::unavailable_architecture(arch);
+            check(why.find("left out") != std::string::npos && why.find("BASALT_MODELS=") != std::string::npos &&
+                      why.find(std::string("-DBASALT_MODELS=\"")) != std::string::npos && why.find(arch) != std::string::npos,
+                  "a model left out is refused with the option that adds it");
+        }
+    };
+#ifdef BASALT_MODEL_QWEN4EXP
+    expect("qwen4exp", true);
+#else
+    expect("qwen4exp", false);
+#endif
+#ifdef BASALT_MODEL_DEEPSEEK41
+    expect("deepseek41", true);
+#else
+    expect("deepseek41", false);
+#endif
+    check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
         std::unique_ptr<model::LoadedModel> loaded;
         check(ds->load({}, loaded).status == model::Status::Error, "deepseek41 load without a path is an error");

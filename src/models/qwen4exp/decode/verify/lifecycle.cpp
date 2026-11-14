@@ -68,6 +68,7 @@ Verifier::~Verifier() {
     if (arena_b_) cudaFree(arena_b_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (row_bias_device_) cudaFree(row_bias_device_);
+    if (lp_buf_) cudaFree(lp_buf_);
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (h_segb_) cudaFreeHost(h_segb_);
     if (h_qseg_) cudaFreeHost(h_qseg_);

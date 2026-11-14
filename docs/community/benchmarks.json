@@ -1101,8 +1101,8 @@
     },
     {
       "submitter": "wadeubuntu",
-      "date": "2026-11-05",
-      "commit": "dc047a77be",
+      "date": "2026-11-12",
+      "commit": "17579fbc6a",
       "preset": "community-1",
       "model": "Qwen3.8-Flash-Next",
       "gpus": [
@@ -1111,18 +1111,28 @@
           "vram_gib": 16,
           "power_w": 360,
           "pcie": "5.0 x16",
-          "h2d_gbps": 26.1
+          "h2d_gbps": 29.2
         }
       ],
       "ram_gib": 61,
       "cpu": "13th Gen Intel Core i7-13700K, 16 cores",
-      "ram_gbps": 69.4,
+      "ram_gbps": 90.7,
       "os": "Linux",
       "quant": "IQ3_S",
       "kv": "int8",
-      "prefill_16k_tps": 4730.4,
-      "prefill_64k_tps": 5045.3,
-      "decode_tps": 192.3
+      "prefill_16k_tps": 4826.8,
+      "prefill_64k_tps": 5102.7,
+      "decode_tps": 218.6,
+      "decode_conv_tps": 157.4,
+      "decode_struct_tps": 248.7,
+      "decode_prose_tps": 158.2,
+      "accept_conv_pct": 72.9,
+      "accept_struct_pct": 95.9,
+      "accept_prose_pct": 66.9,
+      "draft_len_conv": 2.7,
+      "draft_len_struct": 6.7,
+      "draft_len_prose": 1.9,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     },
     {
       "submitter": "polygizer",
@@ -1959,6 +1969,77 @@
       "draft_len_prose": 1.0,
       "engine_args": "--gpu 0 --max-context 61709 --kv fp8",
       "notes": "Proxmox unprivileged LXC; 384 GiB container RAM limit (ram_gib is host-visible); 48 CPUs; swap disabled; no expert SSD spill."
+    },
+    {
+      "submitter": "changlv",
+      "date": "2026-11-12",
+      "commit": "17579fbc6a",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 160,
+          "pcie": "3.0 x8",
+          "h2d_gbps": 6.9
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "Intel Xeon CPU E5-2686 v4, 18 cores",
+      "ram_gbps": 51.2,
+      "os": "Linux",
+      "quant": "IQ4_XS",
+      "kv": "int8",
+      "prefill_16k_tps": 1662.5,
+      "prefill_64k_tps": 1770.6,
+      "decode_tps": 86.1,
+      "decode_conv_tps": 61.3,
+      "decode_struct_tps": 97.8,
+      "decode_prose_tps": 61.3,
+      "accept_conv_pct": 73.5,
+      "accept_struct_pct": 96.3,
+      "accept_prose_pct": 65.6,
+      "draft_len_conv": 2.4,
+      "draft_len_struct": 6.7,
+      "draft_len_prose": 1.7,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+    },
+    {
+      "submitter": "changlv",
+      "date": "2026-11-13",
+      "commit": "17579fbc6a",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 160,
+          "pcie": "3.0 x8",
+          "h2d_gbps": 7.0
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "Intel Xeon CPU E5-2686 v4, 18 cores",
+      "ram_gbps": 49.2,
+      "os": "Linux",
+      "quant": "Q4_K_XL",
+      "kv": "int8",
+      "prefill_16k_tps": 1334.7,
+      "prefill_64k_tps": 1434.2,
+      "decode_tps": 64.6,
+      "decode_conv_tps": 43.8,
+      "decode_struct_tps": 74.7,
+      "decode_prose_tps": 46.4,
+      "accept_conv_pct": 71.1,
+      "accept_struct_pct": 98.2,
+      "accept_prose_pct": 68.2,
+      "draft_len_conv": 2.0,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.5,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+      "notes": "Q4_K/Q5_1 and Q4_K/Q8_0 expert layers take the engine's 'glue off' fallback, so decode trails the NVFP4 and IQ4_XS packs on this card"
     },
     {
       "submitter": "shining",

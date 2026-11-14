@@ -10,12 +10,37 @@
 #include <string>
 
 #include "basalt/program/tokenizer.hpp"
-#include "models/deepseek41/adapter.hpp"
 #include "unicode_flags.hpp"
 
+// The pre-tokenizers of the models this build contains (BASALT_MODELS).
+#ifdef BASALT_MODEL_DEEPSEEK41
+#include "models/deepseek41/adapter.hpp"
+#endif
+#ifdef BASALT_MODEL_QWEN4EXP
 namespace basalt::models::qwen4exp::tokenizer { void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends); }
+#endif
 
 using basalt::program::Tokenizer;
+
+namespace {
+using PreTok = void (*)(const char*, size_t, std::vector<size_t>&);
+#ifdef BASALT_MODEL_DEEPSEEK41
+constexpr PreTok kJoyai = basalt::models::deepseek41::pretok_joyai;
+#else
+constexpr PreTok kJoyai = nullptr;
+#endif
+#ifdef BASALT_MODEL_QWEN4EXP
+constexpr PreTok kQwen35 = basalt::models::qwen4exp::tokenizer::pretok_qwen35;
+#else
+constexpr PreTok kQwen35 = nullptr;
+#endif
+// the synthetic vocab below runs under whichever pre-tokenizer this build has, Qwen first
+#ifdef BASALT_MODEL_QWEN4EXP
+constexpr PreTok kAny = kQwen35;
+#else
+constexpr PreTok kAny = kJoyai;
+#endif
+}  // namespace
 
 namespace {
 
@@ -65,7 +90,7 @@ void synthetic() {
     merges = "b c\na b\nab c\na a\naa a";   // ranks: bc 0, ab 1, abc 2, aa 3, aaa 4
     Tokenizer t;
     std::string err;
-    t.set_pretokenize(basalt::models::qwen4exp::tokenizer::pretok_qwen35);
+    t.set_pretokenize(kAny);
     CHECK(t.load(vocab, merges, types, err));
     std::vector<int32_t> ids;
     CHECK(t.encode("abc", false, {}, ids, err));
@@ -109,8 +134,12 @@ int parity(const std::string& dir, const std::string& golden) {
     std::string err;
     const auto t0 = std::chrono::steady_clock::now();
     // the rule the pack names
-    t.set_pretokenize(read_all(dir + "/tokenizer.json").find("\"pre\": \"joyai-llm\"") != std::string::npos
-                          ? basalt::models::deepseek41::pretok_joyai : basalt::models::qwen4exp::tokenizer::pretok_qwen35);
+    const PreTok pre = read_all(dir + "/tokenizer.json").find("\"pre\": \"joyai-llm\"") != std::string::npos ? kJoyai : kQwen35;
+    if (pre == nullptr) {
+        std::fprintf(stderr, "the pre-tokenizer of this pack belongs to a model this build left out\n");
+        return 1;
+    }
+    t.set_pretokenize(pre);
     if (!t.load(read_all(dir + "/vocab.json"), read_all(dir + "/merges.txt"), read_all(dir + "/token_type.json"), err)) {
         std::fprintf(stderr, "load: %s\n", err.c_str());
         return 1;

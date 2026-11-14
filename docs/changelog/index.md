@@ -4,6 +4,7 @@ Releases, newest first. Versions are 0.x: a minor release adds a model or anothe
 
 | Release | Date | Summary |
 | --- | --- | --- |
+| [0.3.3](0.3.3.md) | 2026-11-12 | Answer now, logprobs, documents and video in messages, session-affinity slots, faster Flash-Next long prompts on one card, a DeepSeek NVFP4 pack, a container image, `--no-answer-room` becomes `--answer-room 0`. |
 | [0.3.2](0.3.2.md) | 2026-11-08 | Faster DeepSeek decode on two cards, release archives for Linux and Windows x64, an install that finds its files beside `bin/`. |
 | [0.3.1](0.3.1.md) | 2026-11-08 | DeepSeek FP8/FP4 attention caches, drafting in every slot, a shared peer-card prompt path, faster decode kernels, new packs, one RAM reserve for every model (`--ram-reserve-mib`). |
 | [0.3.0](0.3.0.md) | 2026-11-05 | Two models on one engine: DeepSeek-Flash joins Qwen3.8-Flash-Next, a router swaps between them, and the config format changes. |

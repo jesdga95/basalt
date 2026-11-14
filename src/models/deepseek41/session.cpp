@@ -8,6 +8,7 @@
 #include "basalt/ggml/ggml.h"
 
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
@@ -113,7 +114,8 @@ public:
                   buf(attn_out_, n * W) && buf(moe_out_, n * W) && buf(sh_out_, n * W) && buf(ffn_sum_, n * W) &&
                   buf(coef_a_, kHcCoef * W) && buf(coef_f_[0], kHcCoef * W) && buf(coef_f_[1], kHcCoef * W) &&
                   buf(hc_ws_, hc_mixes_workspace_floats(W)) && buf(rlogits_, (size_t) g_.n_expert * W) &&
-                  buf(rw_, 64) && buf(logits_, (size_t) g_.n_vocab * W);
+                  buf(rw_, 64) && buf(logits_, (size_t) g_.n_vocab * W) &&
+                  buf(lp_buf_, kernels::row_logprobs_scratch_floats(W, (int) g_.n_vocab) + (size_t) W * (kernels::kLogprobStride + 1));
         for (size_t k = 0; ok && k < en.layers.size(); ++k) {
             float *h = nullptr, *d = nullptr, *kv = nullptr;
             void* q = nullptr;
@@ -423,9 +425,22 @@ public:
         return {};
     }
 
-    model::Result copy_logits(float* out) override {
+    model::Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) override {
+        if (n <= 0 || row0 < 0 || row0 + n > kMaxWindow) return {model::Status::Error, "row_logprobs: rows out of range"};
+        float* d_out = lp_buf_ + kernels::row_logprobs_scratch_floats(kMaxWindow, (int) g_.n_vocab);
+        int32_t* d_picks = reinterpret_cast<int32_t*>(d_out + (size_t) kMaxWindow * kernels::kLogprobStride);
+        if (cudaMemcpyAsync(d_picks, picks, (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+            return {model::Status::Error, "row_logprobs: the picks copy failed"};
+        kernels::row_logprobs(logits_ + (size_t) row0 * g_.n_vocab, n, (int) g_.n_vocab, d_picks, top, d_out, lp_buf_, stream_);
+        if (cudaMemcpyAsync(out, d_out, (size_t) n * kernels::kLogprobStride * sizeof(float), cudaMemcpyDeviceToHost,
+                            stream_) != cudaSuccess || cudaStreamSynchronize(stream_) != cudaSuccess)
+            return {model::Status::Error, "row_logprobs: the kernel failed"};
+        return {};
+    }
+
+    model::Result copy_logits(int row, float* out) override {
         cudaStreamSynchronize(stream_);
-        if (cudaMemcpy(out, logits_, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        if (cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
             return {model::Status::Error, "the head logits copy failed"};
         return {};
     }
@@ -1135,6 +1150,7 @@ private:
     float *x_ = nullptr, *x2_ = nullptr, *cur_ = nullptr, *normed_ = nullptr, *attn_out_ = nullptr, *moe_out_ = nullptr,
           *sh_out_ = nullptr, *ffn_sum_ = nullptr, *coef_a_ = nullptr, *coef_f_[2] = {nullptr, nullptr},
           *hc_ws_ = nullptr, *rlogits_ = nullptr, *rw_ = nullptr, *logits_ = nullptr;
+    float* lp_buf_ = nullptr;   // row_logprobs: its scratch, kLogprobStride floats a row, then the picks
     // per Engram layer: its dequantized rows (mapped host memory) as the host and the kernels see them, the projection's
     // q8_1 scratch and result; the stream a projection one layer ahead runs on, its start and its end per layer
     std::vector<float*> erow_h_, erow_d_, ekv_;

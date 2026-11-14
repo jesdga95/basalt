@@ -41,6 +41,19 @@ bool probe_device(std::string& err) {
     return true;
 }
 
+void* current_context() {
+    // the runtime makes its context current on first use; the driver's own call through the runtime's entry
+    // points, so nothing links the driver library
+    if (cudaFree(nullptr) != cudaSuccess) return nullptr;
+    void* fn = nullptr;
+    cudaDriverEntryPointQueryResult q{};
+    if (cudaGetDriverEntryPointByVersion("cuCtxGetCurrent", &fn, 12000, cudaEnableDefault, &q) != cudaSuccess || fn == nullptr ||
+        q != cudaDriverEntryPointSuccess)
+        return nullptr;
+    void* ctx = nullptr;
+    return reinterpret_cast<int (*)(void**)>(fn)(&ctx) == 0 ? ctx : nullptr;
+}
+
 namespace {
 constexpr int E = 1152, F = 4304, H = 16, D = 72, DP = 80;
 
@@ -70,13 +83,13 @@ struct CudaEncoder::Impl {
     uint8_t* image = nullptr;
     bool image_pinned = false;
     size_t wbytes = 0;
-    size_t o_wpatch = 0, o_bpatch = 0, o_pos = 0, o_postw = 0, o_postb = 0, o_bm0 = 0, o_bm2 = 0, o_wm0 = 0, o_wm2 = 0;
+    size_t o_wpatch = 0, o_wpatch2 = 0, o_bpatch = 0, o_pos = 0, o_postw = 0, o_postb = 0, o_bm0 = 0, o_bm2 = 0, o_wm0 = 0, o_wm2 = 0;
     std::vector<LayerOff> LO;
     // placement
     uint8_t* arena = nullptr;
     size_t arena_size = 0;
     std::vector<Layer> L;
-    float *wpatch = nullptr, *bpatch = nullptr, *pos = nullptr, *postw = nullptr, *postb = nullptr, *bm0 = nullptr, *bm2 = nullptr;
+    float *wpatch = nullptr, *wpatch2 = nullptr, *bpatch = nullptr, *pos = nullptr, *postw = nullptr, *postb = nullptr, *bm0 = nullptr, *bm2 = nullptr;
     __nv_bfloat16 *wm0 = nullptr, *wm2 = nullptr;
     // work buffers (nmax patches)
     float *d_patches = nullptr, *x = nullptr, *g = nullptr, *rope = nullptr, *d_out = nullptr;
@@ -143,6 +156,7 @@ struct CudaEncoder::Impl {
         size_t cur = 0;
         auto take = [&](size_t bytes) { const size_t o = cur; cur += up(bytes); return o; };
         o_wpatch = take((size_t) E * 768 * 4);
+        o_wpatch2 = take((size_t) E * 1536 * 4);
         o_bpatch = take((size_t) E * 4);
         o_pos = take((size_t) E * 2304 * 4);
         o_postw = take((size_t) E * 4);
@@ -184,6 +198,13 @@ struct CudaEncoder::Impl {
             if (w0 && w1) {
                 float* w = (float*) (image + o_wpatch);
                 for (size_t i = 0; i < (size_t) E * 768; ++i) w[i] = ((const float*) w0->data)[i] + ((const float*) w1->data)[i];
+                // a video group's taps apart: per channel, tap 0's 256 weights then tap 1's
+                float* w2 = (float*) (image + o_wpatch2);
+                for (size_t e = 0; e < (size_t) E; ++e)
+                    for (size_t c = 0; c < 3; ++c) {
+                        std::memcpy(w2 + e * 1536 + c * 512, (const float*) w0->data + e * 768 + c * 256, 256 * sizeof(float));
+                        std::memcpy(w2 + e * 1536 + c * 512 + 256, (const float*) w1->data + e * 768 + c * 256, 256 * sizeof(float));
+                    }
             } else ok = false;
         }
         f32(o_bpatch, "v.patch_embd.bias", E);
@@ -219,7 +240,7 @@ struct CudaEncoder::Impl {
         arena = (uint8_t*) base;
         arena_size = bytes;
         auto at = [&](size_t off) { return arena + off; };
-        wpatch = (float*) at(o_wpatch); bpatch = (float*) at(o_bpatch); pos = (float*) at(o_pos);
+        wpatch = (float*) at(o_wpatch); wpatch2 = (float*) at(o_wpatch2); bpatch = (float*) at(o_bpatch); pos = (float*) at(o_pos);
         postw = (float*) at(o_postw); postb = (float*) at(o_postb); bm0 = (float*) at(o_bm0); bm2 = (float*) at(o_bm2);
         wm0 = (__nv_bfloat16*) at(o_wm0); wm2 = (__nv_bfloat16*) at(o_wm2);
         L.resize(layers);
@@ -269,7 +290,8 @@ struct CudaEncoder::Impl {
 
     bool run(const std::vector<float>& patches, Size canvas, std::vector<float>& out, const TapFn& tap) {
         const int gx = canvas.w / 16, gy = canvas.h / 16, n = gx * gy, m = n / 4;
-        if (n % 4 != 0 || n > nmax || (int) patches.size() != n * 768) { fail("image outside the sized range"); return false; }
+        const bool pair = (int64_t) patches.size() == (int64_t) n * 1536;   // a video group: the two taps apart
+        if (n % 4 != 0 || n > nmax || (!pair && (int) patches.size() != n * 768)) { fail("image outside the sized range"); return false; }
         auto host_tap = [&](const std::string& name, const void* dev, size_t count, bool bf) -> bool {
             if (!tap) return true;
             CK(cudaStreamSynchronize(stream));
@@ -283,8 +305,10 @@ struct CudaEncoder::Impl {
             tap(name, h.data(), count);
             return true;
         };
-        CK(cudaMemcpyAsync(d_patches, patches.data(), patches.size() * 4, cudaMemcpyHostToDevice, stream));
-        if (!gemm_f32(d_patches, wpatch, x, n, E, 768)) return false;
+        // a video group's rows are twice as wide: they go to the FFN buffer, which is free until the first layer
+        float* in = pair ? g : d_patches;
+        CK(cudaMemcpyAsync(in, patches.data(), patches.size() * 4, cudaMemcpyHostToDevice, stream));
+        if (!gemm_f32(in, pair ? wpatch2 : wpatch, x, n, E, pair ? 1536 : 768)) return false;
         launch_embed_finish(x, bpatch, pos, n, gx, gy, stream);
         launch_rope_table(rope, n, gx, stream);
         if (!host_tap("embed", x, (size_t) n * E, false)) return false;

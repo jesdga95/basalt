@@ -18,6 +18,8 @@ from pathlib import Path
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+from serve.api.documents import expand_documents, has_document
+
 
 # ------------------------------------------------------------------------------------------------ template
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
@@ -61,6 +63,8 @@ def _text_of(content) -> str:
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
+VIDEO_PARTS = ("video_url", "input_video", "video")
+VIDEO_OPTIONS = ("fps", "max_frames")         # a video part's own sampling, as vLLM takes them
 
 # client spellings of a thinking level -> low, medium, high, max or none; a dialect says what its template takes for each
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
@@ -117,7 +121,8 @@ def preserve_kwargs(value) -> dict:
 
 
 def _has_image(content) -> bool:
-    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
+    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS + VIDEO_PARTS
+                                             for p in content)
 
 
 def _image_source(part: dict) -> str:
@@ -133,11 +138,48 @@ def _image_source(part: dict) -> str:
     return url or ""
 
 
+def _video_source(part: dict) -> str:
+    """A video part's source as a data: URL, http(s) URL or local path: OpenAI's video_url (a string or {"url"}),
+    llama.cpp's input_video ({"url"} or {"data", "format"}), the Responses API's input_video with a video_url string,
+    and the Anthropic-style video block (a "source" of type base64 or url, as an image block's)."""
+    if part.get("type") == "video" and part.get("source") is not None:
+        src = part.get("source")
+        if isinstance(src, str):
+            return src
+        src = src if isinstance(src, dict) else {}
+        if src.get("type") == "base64":
+            return f"data:{src.get('media_type', 'video/mp4')};base64,{src.get('data', '')}"
+        return src.get("url") or src.get("path") or ""
+    url = part.get("video_url")
+    if url is None and isinstance(part.get("input_video"), dict):
+        iv = part["input_video"]
+        if iv.get("data"):
+            return f"data:video/{iv.get('format') or 'mp4'};base64,{iv['data']}"
+        url = iv.get("url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    return url if isinstance(url, str) else ""
+
+
+def _video_item(part: dict) -> dict:
+    """The template's video item: its source and the sampling the part asks for (on the part or in video_url)."""
+    item = {"type": "video", "source": _video_source(part)}
+    holders = [part] + [part[k] for k in ("video_url", "input_video") if isinstance(part.get(k), dict)]
+    for key in VIDEO_OPTIONS:
+        for h in holders:
+            if h.get(key) is not None:
+                item[key] = h[key]
+                break
+    return item
+
+
 def _parts_of(content):
-    """The one form of message and tool result content in every API: a string without images, else its list of text
-    and image items."""
+    """The one form of message and tool result content in every API: a string without images or videos, else its list
+    of text, image and video items. Documents become their text and page images first."""
     if isinstance(content, dict):
         content = [content]
+    if has_document(content):
+        content = expand_documents(content)
     if not _has_image(content):
         return _text_of(content)
     items = []
@@ -146,6 +188,8 @@ def _parts_of(content):
             continue
         if part.get("type") in IMAGE_PARTS:
             items.append({"type": "image", "source": _image_source(part)})
+        elif part.get("type") in VIDEO_PARTS:
+            items.append(_video_item(part))
         elif part.get("type") in ("text", "input_text", None) and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
@@ -155,6 +199,12 @@ def images_of(messages: list[dict]) -> list[str]:
     """The image sources of the conversation in prompt order."""
     return [item["source"] for m in messages if isinstance(m.get("content"), list)
             for item in m["content"] if item.get("type") == "image"]
+
+
+def media_of(messages) -> list[dict]:
+    """The image and video items of the conversation in prompt order, each with the role of its message."""
+    return [dict(item, role=m.get("role")) for m in messages if isinstance(m.get("content"), list)
+            for item in m["content"] if item.get("type") in ("image", "video")]
 
 
 # Literal think and vision tags in message text must stay plain text, but the tokenizer would turn them into
@@ -196,9 +246,9 @@ def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
 
 
 def _is_source(item: dict, key: str) -> bool:
-    """An image item's source (a path, URL or base64 data URL) never reaches the prompt as text, so it is neither
-    scanned nor marked."""
-    return key == "source" and item.get("type") == "image"
+    """An image or video item's source (a path, URL or base64 data URL) never reaches the prompt as text, so it is
+    neither scanned nor marked."""
+    return key == "source" and item.get("type") in ("image", "video")
 
 
 def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
@@ -486,7 +536,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         parts, reasoning, calls = [], [], []
         for block in content or []:
             kind = block.get("type")
-            if kind in ("text", "input_text", None) or kind in IMAGE_PARTS:
+            if kind in ("text", "input_text", None) or kind in IMAGE_PARTS or kind in VIDEO_PARTS or kind == "document":
                 parts.append(block)
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))

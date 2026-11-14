@@ -22,6 +22,7 @@ Prebuilt Linux and Windows archives are attached to each [release](https://githu
 git clone https://github.com/jesdga95/basalt && cd basalt
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
+                                        # one model only: -DBASALT_MODELS=qwen4exp or deepseek41 ([building](docs/building.md#building-only-some-models))
 pip install -r requirements.txt
 hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-NVFP4-DQ6_K.basalt --local-dir models
 ```
@@ -52,6 +53,8 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 | Context | default 8,192; `--max-context` sets it | default 8,192; `--max-context` sets it, up to 1,048,576 |
 | Drafting | MTP, on by default | DSpark, on by default |
 | Images | yes | yes |
+| Documents (PDF, text) | yes | yes |
+| Video | yes, with FFmpeg ([video](docs/running.md#video)) | no |
 | Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) |
 | Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) |
 
@@ -61,6 +64,7 @@ All models compared: [models](docs/models/index.md).
 
 - **Run:** [running](docs/running.md), [configuration](docs/configuration/index.md), [models and the router](docs/configuration/models.md),
   [sampling](docs/configuration/sampling.md), [image sources](docs/configuration/image-sources.md),
+  [documents](docs/configuration/documents.md),
   [diagnostics](docs/configuration/diagnostics.md), [basalt-probe](docs/probe.md), [platforms](docs/platforms.md).
 - **Models:** [models](docs/models/index.md), [Flash-Next](docs/models/qwen38-flash-next.md), [DeepSeek](docs/models/deepseek41.md),
   [the `.basalt` file](docs/model-file.md), [file format changes](docs/basalt-file-changelog.md).

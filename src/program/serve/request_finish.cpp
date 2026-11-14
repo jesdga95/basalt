@@ -107,6 +107,7 @@ Flow Request::complete() {
             sl.ids = runtime_.live;
             sl.cvec = runtime_.cvec_cached;
             sl.imgs = runtime_.live_imgs;
+            sl.lp_top = req_logprobs;
                             sl.guard = std::move(gguard);   // the request's grammar, already past the tokens the request decoded here
             // the slot keeps its conversation's longest checkpoint (its next turn) and its shortest (the
             // system prompt, which other requests may share)

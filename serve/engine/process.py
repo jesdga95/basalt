@@ -3,7 +3,8 @@
 Protocol (one line each):
   * start: stdout `INFO k=v ...` lines, then `READY <ctx> [stop]` (stop: STOP is honoured mid-request).
   * solo: `GEN <max_new> [k=v ...] <ids>` (GENI with embeddings) -> `T <id>`, `PP <read> <total> ...`,
-    `RESUME <n>`, then `DONE ...`; `STOP` ends it early. `ERR ...` is a failure; a prompt that does not fit the
+    `RESUME <n>`, then `DONE ...`; `STOP` ends it early. With `logprobs=K` each `T` line follows its
+    `P <id> <lp> [<id>:<lp> ...]` line (the pick's log probability and the K likeliest tokens). `ERR ...` is a failure; a prompt that does not fit the
     context is `ERR <context_overflow|context_no_room> prompt=N [max_new=N] context=N [slot=N]: <message>`.
   * any time after READY: `CONV parked=N bytes=N evictions=N [restored=N restored_ms=X]`, the conversation cache's
     figures after a park or a restore (never a reply line, like INFO).
@@ -11,12 +12,15 @@ Protocol (one line each):
     raw UTF-8: the engine tokenizes (control literals on; `plain` byte spans are text) and answers like a GEN, with
     `PT <n> <max_new>` before the first PP line. `clip=1` cuts max_new to the room the context leaves after the prompt.
     The slot and batch forms are SGENT and BGENT; the server uses only GENT.
-  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> ...`;
+  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> ...`; with
+    `logprobs=K`, one `BP <slot> <id> <lp> [...]` line per kept pick ahead of its `BT` line;
     `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`).
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
     that slot's own state, answered like a GEN.
   * `VRAM [mib]` -> `VRAM k=v ...`; `QUIT` ends the engine.
-  * `ENC <image> <out> [<image> <out> ...]` (--vision): one `ENC OK <n> <nx> <ny> <ms>` per image, or `ENC ERR`.
+  * `ENC <image> <out> [<image> <out> ...]` (--vision): one `ENC OK <n> <nx> <ny> <ms>` per image, or `ENC ERR`;
+    `ENCV <video> <out> [k=v ...]`: one `ENC OK <groups> <nx> <ny> <ms> <time,...>`, or `ENC ERR`. At start a
+    `VIDEO on|off ...` line says whether the encoder reads video.
   * Requests share one pipe, serialized by the service FIFO (batch: by the `ctl` lock).
 """
 from __future__ import annotations
@@ -35,6 +39,8 @@ from pathlib import Path
 
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
+from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, engine_key as logprobs_key, parse_line as logprob_line, \
+    token as logprob_token
 from serve.engine import lifeline, suspend
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, split_err
@@ -107,8 +113,8 @@ def relay_auto_flags(line: str) -> bool:
 
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
-PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR", "BADM ",
-                  "BT ", "BDONE ", "YIELDED ", "VRAM ", "ENC ")
+PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
+                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ")
 
 
 def log_unparsed(line: str, log) -> None:
@@ -242,6 +248,7 @@ class ProcessEngine:
         self.last = {}
         self.slot_drafts = {}
         self.info = {}                   # INFO key=value facts
+        self.video = None                # the in-engine encoder's VIDEO line: "on ..." or "off <reason>"
         self.conversation = {}           # the cache's figures from the engine's CONV lines; this process's only
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens, from PP lines
@@ -299,6 +306,8 @@ class ProcessEngine:
                 continue
             if line.startswith("INFO "):
                 self.info.update(info_facts(line))
+            if line.startswith("VIDEO "):                # whether the in-engine encoder reads video
+                self.video = line[6:].strip()
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -411,7 +420,7 @@ class ProcessEngine:
                 except OSError:
                     pass
                 break                                   # publish EOF, never the trailing DONE
-            if line.startswith(("BT ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
+            if line.startswith(("BT ", "BP ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
                 try:
                     slot_q[int(line.split()[1])].put(line)
                     continue
@@ -620,6 +629,14 @@ class ProcessEngine:
         """ENC: the engine's in-process image encoder reads each (image file, output file) of `jobs` and answers one
         `OK <n> <nx> <ny> <ms>` line per image. Caller holds the service FIFO; with batch slots the control lines are
         taken here too (a decoding slot pauses for the encode). ValueError carries the engine's refusal."""
+        return self._encode("ENC " + " ".join(f"{img} {out}" for img, out in jobs), len(jobs), "image", timeout)
+
+    def encode_video(self, video, out, words: str = "", timeout: float | None = None) -> str:
+        """ENCV: the engine's in-process encoder reads the video file and writes one record per group to `out`; its
+        `OK <groups> <nx> <ny> <ms> <time,...>` line. As encode_images otherwise."""
+        return self._encode(f"ENCV {video} {out} {words}".rstrip(), 1, "video", timeout)[0]
+
+    def _encode(self, command: str, replies: int, what: str, timeout: float | None) -> list[str]:
         if not self.alive():
             raise EngineDied("the engine is not running")
         timeout = self.ENC_TIMEOUT_S if timeout is None else timeout
@@ -632,23 +649,23 @@ class ProcessEngine:
             except StopIteration:
                 have_ctl = True
         try:
-            self._send("ENC " + " ".join(f"{img} {out}" for img, out in jobs))
+            self._send(command)
             deadline = time.time() + timeout
             got: list[str] = []
-            while len(got) < len(jobs):
+            while len(got) < replies:
                 try:
                     line = self.lines.get(timeout=max(0.1, deadline - time.time()))
                 except queue.Empty:
-                    raise EngineDied("the engine did not answer the image command") from None
+                    raise EngineDied(f"the engine did not answer the {what} command") from None
                 if line is None:
                     raise EngineDied("the engine ended")
                 line = line.strip()
                 if line.startswith("ENC ERR"):
-                    raise ValueError("the image could not be read: " + (line[8:].strip() or "the engine refused it"))
+                    raise ValueError(f"the {what} could not be read: " + (line[8:].strip() or "the engine refused it"))
                 if line.startswith("ENC OK "):
                     got.append(line[4:])
                 elif time.time() > deadline:
-                    raise EngineDied("the engine did not answer the image command")
+                    raise EngineDied(f"the engine did not answer the {what} command")
             return got
         finally:
             if have_ctl:
@@ -698,7 +715,7 @@ class ProcessEngine:
         elif _number(rd):
             keys += f" relax={float(rd)!r}"
         return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
-            + grammar_key(sampling.get(GRAMMAR_KEY))
+            + grammar_key(sampling.get(GRAMMAR_KEY)) + logprobs_key(sampling.get(LOGPROBS_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -714,13 +731,18 @@ class ProcessEngine:
         except (OSError, AttributeError):                # the pipe is gone
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
-    def _control(self, cancel, on_token, stop_when=None, idle=None):
+    def _control(self, cancel, on_token, stop_when=None, idle=None, stop_soon=None):
         """Read the control lines of a GEN/BGEN, yielding None as heartbeat and False per token (on_token gets the id).
-        Ends at DONE (solo) or BADM; `stop_when()` true sends STOP once. `idle()` runs whenever no line came for
-        0.5 s: a prompt read beside the slots' windows sends no progress line."""
+        Ends at DONE (solo) or BADM; `stop_when()` true sends STOP once, and so does `stop_soon` once set (checked
+        as well whenever the consumer comes back). `idle()` runs whenever no line came for 0.5 s: a prompt read
+        beside the slots' windows sends no progress line."""
         stopped = False
         beat = time.monotonic()
+        lp = None                                        # the P line of the next T line (logprobs)
         while True:
+            if not stopped and stop_soon is not None and stop_soon.is_set() and self._ctl_mode == "solo":
+                self._send("STOP")
+                stopped = True
             try:
                 # polls the cancel event every 0.5 s; the HTTP heartbeat stays at 10 s
                 line = self.lines.get(timeout=0.5)
@@ -737,8 +759,12 @@ class ProcessEngine:
             beat = time.monotonic()
             if line is None:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+            if line.startswith("P "):
+                lp = logprob_line(line.split()[1:])
+                continue
             if line.startswith("T "):
-                on_token(int(line[2:]))
+                on_token(logprob_token(int(line[2:]), lp))
+                lp = None
                 if not stopped and (cancel.is_set() or (stop_when is not None and stop_when())):
                     self._send("STOP")
                     stopped = True
@@ -973,7 +999,7 @@ class ProcessEngine:
             return (sum(1 for b in self.slot_busy if not b) >= free and
                     any(e[0] * 2 <= plen for e in self.wait_lens))
 
-    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None, session=None, stop_soon=None):
         """--batch: run solo (GEN) while alone, move to a batch slot (BGEN) when others arrive, and return to solo
         when left alone. Prompt reads and admissions take the control lines one at a time; a long read may give way
         to a much shorter waiting one (BYIELD). An early-leaving consumer is STOPped/BSTOPped and drained."""
@@ -1039,7 +1065,7 @@ class ProcessEngine:
                     def others():       # a request waiting moves this one into a slot, if one can ever hold it
                         with self.slot_cv:
                             return self.waiting > 0
-                    for x in self._control(cancel, pending.append, stop_when=others):
+                    for x in self._control(cancel, pending.append, stop_when=others, stop_soon=stop_soon):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
@@ -1074,7 +1100,8 @@ class ProcessEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in self.eos_ids()):
+                        soft = stop_soon is not None and stop_soon.is_set()
+                        if cancel.is_set() or soft or left <= 0 or finish in ("stop", "length") or (out and out[-1] in self.eos_ids()):
                             self._carry_run(carry, first, last0, True)
                             return
                         self._carry_run(carry, first, last0, False)
@@ -1163,7 +1190,11 @@ class ProcessEngine:
                 notok = bool(self._ctl_result and len(self._ctl_result) > 2 and self._ctl_result[2])
                 gen0 = len(out) if notok else len(out) - 1  # the admission's token, if any; the slot feeds it first
                 going_solo = False
+                slot_lp: list = []                       # BP lines waiting for their BT line
                 while True:
+                    if not stop_sent and not going_solo and stop_soon is not None and stop_soon.is_set():
+                        self._send(f"BSTOP {slot}")             # the windows under way still come, then BDONE
+                        stop_sent = True
                     try:
                         line = self.slot_q[slot].get(timeout=10.0)
                     except queue.Empty:
@@ -1175,9 +1206,14 @@ class ProcessEngine:
                     if line is None:
                         phase = "none"
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                    if line.startswith("BP "):                  # a kept pick's logprobs, ahead of its BT line
+                        slot_lp.append(logprob_line(line.split()[2:]))
+                        continue
                     if line.startswith("BT "):
                         self._count_window(len(line.split()) - 2)
-                        for t in (int(x) for x in line.split()[2:]):    # a window's tokens for this slot, in order
+                        lps, slot_lp[:] = list(slot_lp), []
+                        for k, t in enumerate(int(x) for x in line.split()[2:]):   # a window's tokens for this slot, in order
+                            t = logprob_token(t, lps[k] if k < len(lps) else None)
                             out.append(t)
                             if cancel.is_set():
                                 if not stop_sent:
@@ -1197,7 +1233,8 @@ class ProcessEngine:
                         # the slot holds the prompt and every token fed (all but the last)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         again = (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
-                                 and not (out and out[-1] in self.eos_ids()))
+                                 and not (out and out[-1] in self.eos_ids())
+                                 and not (stop_soon is not None and stop_soon.is_set()))
                         self._carry_run(carry, first, last0, not again)
                         if again:
                             # continue on the solo path
@@ -1308,9 +1345,11 @@ class ProcessEngine:
         self.slot_owner[slot] = session
         self.session_slot[session] = slot
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None, stop_soon=None):
         """Yield token ids, and None as a 10 s heartbeat while the engine is quiet. An early-leaving consumer or
-        `cancel` makes the engine STOP."""
+        `cancel` makes the engine STOP. `stop_soon` (an Event), once set, makes it STOP too, but the tokens of the
+        windows already under way still come and the generator ends at the DONE: the engine holds exactly the prompt
+        and every token yielded but the last, so a next request that extends them reads only its new tokens."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         text = ids if isinstance(ids, PromptText) else None
@@ -1318,7 +1357,7 @@ class ProcessEngine:
             ids, max_new = text.resolve(int(max_new), self.max_context)    # this engine takes ids
             text = None
         if getattr(self, "batch", 0):
-            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, session)
+            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, session, stop_soon)
             return
         self.progress = None
         self.prefill_tok_s_mean = None
@@ -1343,8 +1382,19 @@ class ProcessEngine:
         allow = silence + min(len(ids), PP_CHUNK_MAX) / PP_FLOOR_TOK_S if silence > 0 else 0.0
         heard, read_to = time.monotonic(), 0
         beat = heard
+        soft_sent = False
+        lp = None                                         # the P line of the next T line (logprobs)
         try:
             while True:
+                if not soft_sent and stop_soon is not None and stop_soon.is_set():
+                    if not self.can_stop:
+                        return                            # an engine that cannot stop early: STOP and drain below
+                    try:
+                        self.proc.stdin.write("STOP\n")
+                        self.proc.stdin.flush()
+                    except OSError:
+                        pass
+                    soft_sent = True
                 wait = 10.0
                 if allow > 0:
                     wait = min(wait, allow - (time.monotonic() - heard))
@@ -1368,11 +1418,15 @@ class ProcessEngine:
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                 heard = time.monotonic()                  # any line counts as output
                 beat = heard
+                if line.startswith("P "):
+                    lp = logprob_line(line.split()[1:])
+                    continue
                 if line.startswith("T "):
                     allow = silence
                     if cancel.is_set():
                         return
-                    yield int(line[2:])
+                    yield logprob_token(int(line[2:]), lp)
+                    lp = None
                 elif line.startswith("PT ") and text is not None:   # the engine tokenized the text
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].lstrip("-").isdigit():

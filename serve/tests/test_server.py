@@ -2946,6 +2946,7 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_a_looped_thinking_that_fills_the_cap_is_length(self):
         """No room left after the end of the thinking: finish_reason stays "length"."""
+        self.svc.answer_room = 0
         self.engine.THOUGHT = "0" * 400
         code, b = self.openai(max_tokens=260)
         self.assertEqual(code, 200, b)
@@ -2991,18 +2992,30 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:512] + REASONING_CLOSE.split("</think>")[0])
         self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
 
-    def test_answer_room_off_and_below_its_cap(self):
+    def test_answer_room_zero_reserves_nothing(self):
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
-        self.svc.answer_room = False                                   # --no-answer-room: thinks it all out
+        self.svc.answer_room = 0
         code, b = self.openai(max_tokens=1024)
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT)
-        self.svc.answer_room = True                                    # below max_tokens 1024: left as it was
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT
-        code, b = self.openai(max_tokens=400)
+
+    def test_answer_room_auto_halves_small_caps_without_a_budget(self):
+        from serve.service import REASONING_CLOSE
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        for cap in (200, 400, 700):
+            with self.subTest(cap=cap):
+                code, b = self.openai(max_tokens=cap)
+                self.assertEqual(code, 200, b)
+                msg = b["choices"][0]["message"]
+                self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:cap // 2] + REASONING_CLOSE.split("</think>")[0])
+                self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+
+    def test_answer_room_fixed_reserve_lets_the_model_think_more(self):
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.svc.answer_room = 100                                     # auto would keep 512 at this cap
+        code, b = self.openai(max_tokens=1024)
         self.assertEqual(code, 200, b)
-        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
-        self.assertEqual(len(self.engine.prompts), 2)                  # one pass each, no wrap-up
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT)   # 924 allowed, 736 used
 
     def test_answer_room_preserves_explicit_opt_outs_and_budget_precedence(self):
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
@@ -3058,8 +3071,9 @@ class ThinkingBudget(unittest.TestCase):
         effective_cap = 400
         code, b = self.openai(max_tokens=8192)
         self.assertEqual(code, 200, b)
-        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT[:400])
-        self.assertEqual(b["choices"][0]["finish_reason"], "length")
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"],
+                         self.engine.THOUGHT[:200] + REASONING_CLOSE.split("</think>")[0])
+        self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
 
     def test_answer_room_reserves_a_quarter_of_an_8192_token_cap(self):
         from serve.service import REASONING_CLOSE

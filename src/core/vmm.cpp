@@ -1,9 +1,11 @@
 // src/core/vmm.cpp - the driver's virtual memory functions through the runtime's entry points (no link against the
 // driver library).  Read the header first.
 #include "basalt/core/vmm.hpp"
+#include "basalt/log.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda.h>
+#include <algorithm>
 
 namespace basalt::core::vmm {
 namespace {
@@ -82,6 +84,82 @@ uint64_t granularity() {
     size_t g = 0;
     if (v.granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS) return 0;
     return (uint64_t) g;
+}
+
+namespace {
+// Separate backing allocations avoid the driver's single-allocation limit while preserving one address range.
+constexpr uint64_t kHostPieceBytes = 2ull << 30;
+
+bool host_prop(CUmemAllocationProp& prop, size_t& g) {
+    const Fns& v = fns();
+    int dev = 0, supported = 0, node = -1;
+    CUdevice cu;
+    if (!v.ok || cudaGetDevice(&dev) != cudaSuccess || v.device_get(&cu, dev) != CUDA_SUCCESS ||
+        v.attribute(&supported, CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu) != CUDA_SUCCESS ||
+        !supported || v.attribute(&node, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, cu) != CUDA_SUCCESS) return false;
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location = {CU_MEM_LOCATION_TYPE_HOST_NUMA, node < 0 ? 0 : node};
+    return v.granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS && g;
+}
+}
+
+uint64_t host_granularity() {
+    CUmemAllocationProp prop{};
+    size_t g = 0;
+    return host_prop(prop, g) ? g : 0;
+}
+
+uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
+    mapped = 0;
+    const Fns& v = fns();
+    CUmemAllocationProp prop{};
+    size_t g = 0;
+    if (!bytes || !host_prop(prop, g) || kHostPieceBytes % g != 0) return nullptr;
+    const int dev = current_device();
+    if (bytes > SIZE_MAX - (g - 1)) return nullptr;
+    size_t n = (bytes + g - 1) / g * g;
+    CUdeviceptr p = 0;
+    const auto refused = [&](const char* op, CUresult error, uint64_t off) {
+        basalt::log::warn("basalt memory", "host VMM %s at %.2f of %.2f GiB on CUDA%d failed (driver code %d)",
+                          op, off / 1073741824.0, n / 1073741824.0, dev, (int) error);
+    };
+    CUresult error = v.reserve(&p, n, 0, 0, 0);
+    if (error != CUDA_SUCCESS) { refused("reserve", error, 0); return nullptr; }
+    uint64_t off = 0;
+    for (; off < n;) {
+        const uint64_t piece = std::min<uint64_t>(kHostPieceBytes, n - off);
+        CUmemGenericAllocationHandle h;
+        const char* op = "create";
+        error = v.create(&h, piece, &prop, 0);
+        if (error == CUDA_SUCCESS) {
+            op = "map";
+            error = v.map(p + off, piece, 0, h, 0);
+            v.release(h);   // a successful mapping owns the physical allocation
+            if (error == CUDA_SUCCESS) {
+                CUmemAccessDesc a[] = {{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE},
+                    {{CU_MEM_LOCATION_TYPE_DEVICE, dev}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}};
+                op = "access";
+                error = v.set_access(p + off, piece, a, 2);
+                if (error == CUDA_SUCCESS) { off += piece; continue; }
+                v.unmap(p + off, piece);
+            }
+        }
+        refused(op, error, off);
+        for (uint64_t at = 0; at < off; at += kHostPieceBytes)
+            v.unmap(p + at, std::min<uint64_t>(kHostPieceBytes, off - at));
+        v.address_free(p, n);
+        return nullptr;
+    }
+    mapped = n;
+    return reinterpret_cast<uint8_t*>(p);
+}
+
+void free_host(uint8_t* ptr, uint64_t mapped) {
+    if (!ptr) return;
+    auto p = reinterpret_cast<CUdeviceptr>(ptr);
+    for (uint64_t off = 0; off < mapped; off += kHostPieceBytes)
+        fns().unmap(p + off, std::min<uint64_t>(kHostPieceBytes, mapped - off));
+    fns().address_free(p, mapped);
 }
 
 uint8_t* reserve(uint64_t bytes) {

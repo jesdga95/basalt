@@ -114,3 +114,32 @@ last bits of the logits, so a greedy answer can fork after some tokens (`dynamic
 
 `dynamic` borrows the cache's last slots per image and refills them afterwards (about 70 ms), so the cache is identical after. Which
 images a request may name: [image sources](configuration/image-sources.md). An image may not sit in a system prompt.
+
+## Video
+
+With image input on, Qwen3.8-Flash-Next also reads video (DeepSeek does not). A user message names a video as it names an image, from
+the same [sources](configuration/image-sources.md):
+
+| API | Part |
+| --- | --- |
+| OpenAI chat | `{"type": "video_url", "video_url": {"url": "..."}}`; llama.cpp's `{"type": "input_video", "input_video": {"url": "..."}}` |
+| Responses | `{"type": "input_video", "video_url": "..."}` |
+| Anthropic | `{"type": "video", "source": {"type": "base64", "media_type": "video/mp4", "data": "..."}}`, or a `url` source |
+
+Frames are sampled as the model's own processor samples them: 2 a second, 4 to 768, evenly spaced. A part may set `fps` (up to 60)
+and `max_frames` (4 to 768). All frames are scaled to one size so the whole video fits `video-max-tokens` (default 8192 image
+tokens), and each pair of frames is read as one picture with its time in the prompt. Audio and rotation metadata are not read: a
+phone's portrait clip arrives sideways.
+
+Decoding uses FFmpeg 6, 7 or 8 from the machine ([platforms](platforms.md#ffmpeg-for-video)). At start the server prints
+`video  on, FFmpeg 8 (...)`, or `video  off` with the reason, and then a video is refused with that reason. A video may be 1 GiB.
+
+Frames decode on the encoder's GPU with NVDEC (H.264, HEVC, AV1, VP9 and the older codecs FFmpeg's NVDEC takes); a stream NVDEC
+refuses decodes on the CPU, with the same pixels. With `dynamic` the expert cache lends NVDEC the memory for the decode when no
+reply is running (tens of ms to lend and refill); beside a running reply the video decodes on the CPU, and the reply keeps going
+until the frames are encoded. Another question about the same video, in the same chat or a new one, starts from the video
+already read.
+
+NVFP4 pack, `dynamic`, 400 W + 180 W, cold, time to the first token: a 30 s 1280x720 clip (8,202 prompt tokens) 2.7 s; a minute of
+3840x2160 HEVC 5.2 s (decode 2.6 s, encode 0.3 s, prompt read 1.9 s); of 1920x1080 H.264 4.3 s. A new question on the same 30 s
+clip: 0.4 s.

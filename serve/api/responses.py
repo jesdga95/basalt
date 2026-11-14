@@ -20,7 +20,8 @@ import json
 import time
 import uuid
 
-from serve.frontend import IMAGE_PARTS, Event, _late_system_to_user, _parts_of, effort_kwargs, stable_tool_order
+from serve.api.logprobs import MAX_TOP as MAX_TOP_LOGPROBS, REQUEST_KEY as LOGPROBS_KEY
+from serve.frontend import IMAGE_PARTS, VIDEO_PARTS, Event, _late_system_to_user, _parts_of, effort_kwargs, stable_tool_order
 
 ENCRYPTED_PREFIX = "basalt.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -67,14 +68,27 @@ def _content(content, param):
             parts.append({"type": "text", "text": part.get("text") or ""})
         elif kind == "refusal":
             parts.append({"type": "text", "text": part.get("refusal") or ""})
+        elif kind == "input_file":
+            if not (part.get("file_data") or part.get("file_url")):
+                field = "file_id" if part.get("file_id") else "file_data"
+                raise ResponsesError("only files given as file_data (a data: URL with the file's bytes) or file_url "
+                                     "are read; this server keeps no files", f"{param}[{j}].{field}",
+                                     "unsupported_parameter")
+            parts.append(part)
         elif kind in IMAGE_PARTS:
             if not part.get("image_url"):
                 print("[server] error: an image part has no image_url", flush=True)
                 raise ResponsesError("only images given as image_url (a data: or http(s) URL) are supported; "
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
             parts.append({"type": "input_image", "image_url": part["image_url"]})
+        elif kind in VIDEO_PARTS:
+            if not isinstance(part.get("video_url"), str) or not part["video_url"]:
+                raise ResponsesError("only videos given as video_url (a data: or http(s) URL) are supported; "
+                                     "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
+            parts.append({**{k: part[k] for k in ("fps", "max_frames") if k in part},
+                          "type": "input_video", "video_url": part["video_url"]})
         else:
-            raise ResponsesError(f"content parts of type {kind!r} are not supported (text and images are)",
+            raise ResponsesError(f"content parts of type {kind!r} are not supported (text, images, videos and files are)",
                                  f"{param}[{j}].type", "unsupported_parameter")
     return _parts_of(parts)
 
@@ -113,7 +127,7 @@ def _arguments(raw, param) -> dict:
 def _tool_output(item, param):
     out = item.get("output")
     if isinstance(out, dict):
-        if out.get("type") in IMAGE_PARTS:
+        if out.get("type") in IMAGE_PARTS or out.get("type") == "input_file":
             return _content([out], param + ".output")
         return json.dumps(out, ensure_ascii=False)   # some clients send a JSON result as an object
     return out if isinstance(out, str) else _content(out, param + ".output")
@@ -320,6 +334,16 @@ def check_request(req: dict) -> None:
         raise ResponsesError("reasoning must be an object", "reasoning")
 
 
+def requested_logprobs(req: dict) -> int | None:
+    """The alternatives a response's output text carries (`top_logprobs`, 0..20) when `include` names
+    message.output_text.logprobs, else None; a bad top_logprobs is refused."""
+    top = req.get("top_logprobs")
+    if top is not None and (isinstance(top, bool) or not isinstance(top, int) or not 0 <= top <= MAX_TOP_LOGPROBS):
+        raise ResponsesError(f"top_logprobs must be a whole number from 0 to {MAX_TOP_LOGPROBS}", "top_logprobs")
+    include = req.get("include") if isinstance(req.get("include"), list) else []
+    return (top or 0) if "message.output_text.logprobs" in include else None
+
+
 def template_kwargs(req: dict) -> dict:
     effort = (req.get("reasoning") or {}).get("effort")
     try:
@@ -332,14 +356,20 @@ def template_kwargs(req: dict) -> dict:
 class Assembler:
     """Builds one response's output items and typed events from Service.run's events."""
 
-    def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool):
+    def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool, rid: str | None = None):
         self.names, self.encrypted = names, encrypted
         self.prompt_tokens = prompt_tokens
         self.seq = 0
         self.item = None                             # the open output item
+        self.lps: list[dict] = []                    # the answer tokens' logprobs not yet in a delta
+        # Basalt's: a reasoning item's and each call item's tokens, on the item as `logprobs`
+        self.want_lp = req.get(LOGPROBS_KEY) is not None
+        self.lps_reasoning: list[dict] = []
+        self.lps_tools: dict[int, list[dict]] = {}
+        self.calls: list[dict] = []                  # the call items, in order: tool call i is calls[i]
         reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
         self.response = {
-            "id": new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
+            "id": rid or new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
             "background": False, "error": None, "incomplete_details": None,
             "instructions": req.get("instructions"), "max_output_tokens": req.get("max_output_tokens"),
             "model": model, "output": [], "parallel_tool_calls": req.get("parallel_tool_calls", True),
@@ -348,7 +378,7 @@ class Assembler:
             "store": False, "temperature": req.get("temperature"),
             "text": req.get("text") if isinstance(req.get("text"), dict) else {"format": {"type": "text"}},
             "tool_choice": req.get("tool_choice", "auto"), "tools": req.get("tools") or [],
-            "top_p": req.get("top_p"), "truncation": "disabled", "usage": None, "user": None,
+            "top_p": req.get("top_p"), "top_logprobs": req.get("top_logprobs"), "truncation": "disabled", "usage": None, "user": None,
             "metadata": req.get("metadata") or {}}
 
     # --- events
@@ -371,6 +401,10 @@ class Assembler:
     def _open(self, item) -> list[dict]:
         self.response["output"].append(item)
         self.item = item
+        if self.want_lp and item["type"] in ("reasoning", "function_call", "custom_tool_call"):
+            item["logprobs"] = []
+            if item["type"] != "reasoning":
+                self.calls.append(item)
         out = [self.event("response.output_item.added", output_index=self.index, item=copy.deepcopy(item))]
         if item["type"] == "message":
             part = {"type": "output_text", "text": "", "annotations": [], "logprobs": []}
@@ -389,10 +423,12 @@ class Assembler:
             return []
         at, out = self.response["output"].index(item), []
         item["status"] = status
+        if self.want_lp and item in self.calls:
+            item["logprobs"] += self.lps_tools.pop(self.calls.index(item), [])
         if item["type"] == "message":
             part = item["content"][0]
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,
-                               text=part["text"], logprobs=[]),
+                               text=part["text"], logprobs=copy.deepcopy(part["logprobs"])),
                     self.event("response.content_part.done", item_id=item["id"], output_index=at, content_index=0,
                                part=copy.deepcopy(part))]
         elif item["type"] == "reasoning":
@@ -411,6 +447,16 @@ class Assembler:
         out.append(self.event("response.output_item.done", output_index=at, item=copy.deepcopy(item)))
         return out
 
+    def logprob(self, channel: str, entry: dict, index: int | None = None) -> None:
+        """A generated token's logprobs (Service.run's "logprobs" event): the answer's and the thinking's ride their next
+        text delta, a call's go on its item when it closes."""
+        if channel == "content":
+            self.lps.append(entry)
+        elif channel == "reasoning":
+            self.lps_reasoning.append(entry)
+        else:
+            self.lps_tools.setdefault(index, []).append(entry)
+
     def feed(self, ev: Event) -> list[dict]:
         out = []
         kind = ev.kind
@@ -422,8 +468,12 @@ class Assembler:
                 out += self._open({"id": new_id("rs"), "type": "reasoning", "status": "in_progress", "summary": [],
                                    "content": [{"type": "reasoning_text", "text": ""}]})
             self.item["content"][0]["text"] += ev.text
+            extra = {}
+            if self.want_lp:
+                self.item["logprobs"] += self.lps_reasoning
+                extra, self.lps_reasoning = {"logprobs": self.lps_reasoning}, []
             out.append(self.event("response.reasoning_text.delta", item_id=self.item["id"], output_index=self.index,
-                                  content_index=0, delta=ev.text))
+                                  content_index=0, delta=ev.text, **extra))
         elif kind == "content":
             if not ev.text:
                 return out
@@ -432,8 +482,10 @@ class Assembler:
                 out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress",
                                    "role": "assistant", "content": []})
             self.item["content"][0]["text"] += ev.text
+            self.item["content"][0]["logprobs"] += self.lps
             out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
-                                  content_index=0, delta=ev.text, logprobs=[]))
+                                  content_index=0, delta=ev.text, logprobs=self.lps))
+            self.lps = []
         elif kind == "tool_start":
             out += self.close()
             out += self._open(self._call_item(ev))
@@ -443,8 +495,13 @@ class Assembler:
                 return out
             if item["type"] == "function_call":         # a custom tool's input is sent whole, at its end
                 item["arguments"] += ev.text
+                extra = {}
+                if self.want_lp and item in self.calls:   # the call's tokens so far ride its delta
+                    got = self.lps_tools.pop(self.calls.index(item), [])
+                    item["logprobs"] += got
+                    extra = {"logprobs": got}
                 out.append(self.event("response.function_call_arguments.delta", item_id=item["id"],
-                                      output_index=self.index, delta=ev.text))
+                                      output_index=self.index, delta=ev.text, **extra))
         elif kind == "tool_call":
             item = self.item
             if item is None or item.get("call_id") != ev.call.id:     # a call that was not announced while written
@@ -481,6 +538,10 @@ class Assembler:
         # an open call was cut off: incomplete whatever the finish
         unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
         out = self.close("incomplete" if length or unfinished else "completed")
+        for k, entries in sorted(self.lps_tools.items()):    # a call's closing markup, after its item closed
+            if k < len(self.calls):
+                self.calls[k]["logprobs"] += entries
+        self.lps_tools.clear()
         n = done.get("completion_tokens", 0)
         prompt = done.get("prompt_tokens", self.prompt_tokens)
         self.response["usage"] = {

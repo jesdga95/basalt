@@ -2,6 +2,7 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "basalt/protocol.hpp"
 #include "qfn_state.hpp"
+#include "../../../program/serve/logprobs.hpp"
 
 namespace basalt::models::qwen4exp::serve {
 
@@ -275,6 +276,21 @@ bool QfnRuntime::batch_step() {
         n_keep[sg] = miss + 1;
         fin_of[sg] = fin_at(sl, rows[sg], gtok, miss);
     }
+    // logprobs: a slot that asked gets a BP line per kept pick, read before the commit and the drafts touch the head
+    std::string lp_lines[MR];
+    for (int sg = 0; sg < S; ++sg) {
+        const int top = bs[(size_t) rows[sg]].lp_top;
+        if (top < 0) continue;
+        constexpr int LS = basalt::kernels::kLogprobStride;
+        lh_buf.resize((size_t) n_keep[sg] * LS);
+        if (!ver.row_logprobs(r0s[sg], n_keep[sg], outb + r0s[sg], top, lh_buf.data())) {
+            std::printf("ERR logprobs: the head logits read failed\n");
+            return false;
+        }
+        for (int e = 0; e < n_keep[sg]; ++e)
+            lp_lines[sg] += "BP " + std::to_string(rows[sg]) +
+                            basalt::program::serve::logprob_fields(lh_buf.data() + (size_t) e * LS, outb[r0s[sg] + e], top) + "\n";
+    }
     if (logit_hash)
         for (int sg = 0; sg < S; ++sg)
             for (int e = 0; e < n_keep[sg]; ++e)
@@ -301,7 +317,7 @@ bool QfnRuntime::batch_step() {
             sl.ids.push_back(tok[r0s[sg] + e]);    // the window fed it: the slot's sessions hold it now
             bt += " " + std::to_string((int) outb[r0s[sg] + e]);
         }
-        basalt::protocol::emit_text(bt + "\n");
+        basalt::protocol::emit_text(lp_lines[sg] + bt + "\n");
         sl.produced += k;
         if (real) {   // the window's verdict on its drafts: the draft-length rule, the lookup history, the policy
             const int a = k - 1, Tw = lens[sg];

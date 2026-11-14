@@ -4,13 +4,15 @@ from __future__ import annotations
 import json
 import uuid
 
+from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, logprobs_part
 from serve.frontend import Event
 from serve.prompt import tokens_known
 from serve.service import Service
 
 
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, session=None):
-    mid = "msg_" + uuid.uuid4().hex[:24]
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, session=None,
+                     live=None):
+    mid = live.id if live else "msg_" + uuid.uuid4().hex[:24]
 
     def start():
         return "message_start", {"type": "message_start", "message": {
@@ -22,23 +24,39 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
     if started:
         yield start()
     index, open_kind, used_tool = -1, None, False
+    # Basalt's logprobs (the Messages API has none): each delta carries the entries of its tokens, the thinking's,
+    # the text's or its call's; what is left rides message_delta
+    want_lp = req.get(LOGPROBS_KEY) is not None
+    lps: dict = {"content": [], "reasoning": [], "tool": {}}
+    calls = -1                                     # the tool_use block being written
 
     def close():
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
+    def delta(d, channel):
+        e = {"type": "content_block_delta", "index": index, "delta": d}
+        if want_lp:
+            e["logprobs"] = lps["tool"].pop(calls, []) if channel == "tool" else lps[channel]
+            if channel != "tool":
+                lps[channel] = []
+        return "content_block_delta", e
+
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, session=session):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, session=session, live=live):
         if not started and (kind != "ping" or tokens_known(ids)):
             started = True
             yield start()
         if kind == "ping":
             yield None
             continue
+        if kind == "logprobs":
+            channel, entry, call = x
+            (lps["tool"].setdefault(call, []) if channel == "tool" else lps[channel]).append(entry)
+            continue
         if kind == "event":
             ev: Event = x
             if ev.kind == "tool_args":
-                yield "content_block_delta", {"type": "content_block_delta", "index": index,
-                                              "delta": {"type": "input_json_delta", "partial_json": ev.text}}
+                yield delta({"type": "input_json_delta", "partial_json": ev.text}, "tool")
                 continue
             if ev.kind == "tool_call" and ev.call.id in streamed:
                 finished.add(ev.call.id)
@@ -58,19 +76,18 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                          "text": {"type": "text", "text": ""},
                          "tool_use": {"type": "tool_use", "id": ev.call.id if ev.call else "", "name":
                                       ev.call.name if ev.call else "", "input": {}}}[want]
+                calls += want == "tool_use"
                 yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": block}
             if want == "thinking":
-                yield "content_block_delta", {"type": "content_block_delta", "index": index,
-                                              "delta": {"type": "thinking_delta", "thinking": ev.text}}
+                yield delta({"type": "thinking_delta", "thinking": ev.text}, "reasoning")
             elif want == "text":
-                yield "content_block_delta", {"type": "content_block_delta", "index": index,
-                                              "delta": {"type": "text_delta", "text": ev.text}}
+                yield delta({"type": "text_delta", "text": ev.text}, "content")
             elif ev.kind == "tool_start":
                 pass                                # its input follows as tool_args pieces
             else:
                 used_tool = True
-                yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
-                    "type": "input_json_delta", "partial_json": json.dumps(ev.call.arguments, ensure_ascii=False)}}
+                yield delta({"type": "input_json_delta",
+                             "partial_json": json.dumps(ev.call.arguments, ensure_ascii=False)}, "tool")
         else:
             if open_kind is not None:
                 yield close()
@@ -79,19 +96,38 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
             # input_tokens excludes the cached part, which is cache_read_input_tokens
             reused = min(x.get("reused") or 0, len(ids))
-            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop,
-                                                                       "stop_sequence": x.get("stop_sequence")},
-                                    "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
-                                              "output_tokens": x["completion_tokens"]}}
+            last = {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
+                    "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
+                              "output_tokens": x["completion_tokens"]}}
+            if want_lp:                             # entries no delta took (a call's closing markup)
+                last["logprobs"] = logprobs_part(lps["content"], lps["reasoning"], lps["tool"])
+            yield "message_delta", last
             yield "message_stop", {"type": "message_stop"}
 
 
 def anthropic_collect(events) -> dict:
     msg, blocks = None, []
+    lps, lps_reasoning, lps_tools, tool_n = None, [], {}, -1   # Basalt's logprobs, when the request asked
     for item in events:
         if item is None:                           # a heartbeat
             continue
         name, e = item
+        if name == "content_block_start" and e["content_block"]["type"] == "tool_use":
+            tool_n += 1
+        if "logprobs" in e:
+            lps = lps or []
+            if name == "message_delta":
+                part = e["logprobs"]
+                lps += part["content"]
+                lps_reasoning += part.get("reasoning_content") or []
+                for t in part.get("tool_calls") or []:
+                    lps_tools.setdefault(t["index"], []).extend(t["content"])
+            elif e["delta"]["type"] == "text_delta":
+                lps += e["logprobs"]
+            elif e["delta"]["type"] == "thinking_delta":
+                lps_reasoning += e["logprobs"]
+            else:
+                lps_tools.setdefault(tool_n, []).extend(e["logprobs"])
         if name == "message_start":
             msg = e["message"]
         elif name == "content_block_start":
@@ -115,4 +151,6 @@ def anthropic_collect(events) -> dict:
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
     msg["content"] = blocks
+    if lps is not None:
+        msg["logprobs"] = logprobs_part(lps, lps_reasoning, lps_tools)
     return msg

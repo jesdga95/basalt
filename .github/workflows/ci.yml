@@ -59,7 +59,6 @@ jobs:
         run: python -m unittest discover -s tools/migrations -p "test_*.py"
 
   build-test:
-    needs: lint
     strategy:
       fail-fast: false
       matrix:
@@ -137,3 +136,46 @@ jobs:
           name: test-logs-${{ matrix.os }}
           path: build/Testing/Temporary/
           if-no-files-found: ignore
+
+  # A build of one model compiles and tests none of the others (-DBASALT_MODELS).
+  build-single-model:
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [qwen4exp, deepseek41]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/toolchain
+        with:
+          cuda-version: ${{ env.CUDA_VERSION }}
+          cache-key: ubuntu-24.04
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DWERROR=ON
+          -DBUILD_TESTING=ON
+          -DBASALT_MODELS=${{ matrix.model }}
+          -DCMAKE_CUDA_ARCHITECTURES=120
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)" -- -k 0
+
+      - name: CPU tests
+        run: |
+          mkdir -p build/tmp
+          export TEMP="$PWD/build/tmp" TMP="$PWD/build/tmp" TMPDIR="$PWD/build/tmp"
+          ctest --test-dir build -L cpu -LE avx512 -j 4 --output-on-failure --timeout 300

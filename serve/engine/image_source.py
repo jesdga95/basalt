@@ -1,4 +1,4 @@
-"""Where a request's images may come from, and the bounded read of each one.
+"""Where a request's images and videos may come from, and the bounded read of each one.
 
 A request from this machine may name any path or URL. Any other request gets `data:` URLs plus the hosts and
 directories the operator allowed. `ImageSources()` is that remote policy with nothing allowed, so a caller that
@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from serve.security import is_ip
 
 IMAGE_MAX_BYTES = 32 << 20                      # one image's bytes, from any source
+VIDEO_MAX_BYTES = 1 << 30                       # one video's bytes, from any source (a minute of 4K is 300-400 MB)
 IMAGE_READ_S = 60.0                             # one source's whole read, name lookup and connect included
 USER_AGENT = "local-server"
 USAGE = "an image must be a data: URL, an http(s) URL or a local file path"
@@ -54,6 +55,22 @@ _V6_NOT_PUBLIC = tuple(ipaddress.ip_network(n) for n in (
     "2001::/23", "2001:db8::/32", "2002::/16", "2620:4f:8000::/48", "3fff::/20"))   # IETF, docs, 6to4, AS112, docs
 _NT_RESERVED = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
                 *(f"{d}{n}" for d in ("COM", "LPT") for n in (*"0123456789", "\u00b9", "\u00b2", "\u00b3"))}
+
+
+@dataclass(frozen=True)
+class Kind:
+    """What is read: its name in messages, the module constant that holds its byte cap, and its usage line."""
+    noun: str
+    cap: str
+    usage: str
+
+    @property
+    def max_bytes(self) -> int:
+        return globals()[self.cap]
+
+
+IMAGE = Kind("image", "IMAGE_MAX_BYTES", USAGE)
+VIDEO = Kind("video", "VIDEO_MAX_BYTES", "a video must be a data: URL, an http(s) URL or a local file path")
 
 
 @dataclass(frozen=True)
@@ -152,7 +169,7 @@ def _url_host(source: str) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ data: URLs
-def _read_data(source: str) -> bytes:
+def _read_data(source: str, kind: Kind = IMAGE) -> bytes:
     head, comma, payload = source.partition(",")
     if not comma:
         raise ValueError("a data: URL needs a comma before its payload")
@@ -161,8 +178,8 @@ def _read_data(source: str) -> bytes:
     payload = payload.translate(_WS)                    # line-wrapped base64 is common
     if not payload:
         raise ValueError("a data: URL's payload is empty")
-    if len(payload) > (IMAGE_MAX_BYTES + 2) // 3 * 4:   # checked before anything is decoded
-        raise ValueError(f"the image is larger than {IMAGE_MAX_BYTES >> 20} MiB")
+    if len(payload) > (kind.max_bytes + 2) // 3 * 4:   # checked before anything is decoded
+        raise ValueError(f"the {kind.noun} is larger than {kind.max_bytes >> 20} MiB")
     try:
         return base64.b64decode(payload, validate=True)
     except ValueError:
@@ -202,21 +219,21 @@ def windows_path_refused(path: str) -> bool:
     return False
 
 
-def _read_handle(fd: int) -> bytes:
+def _read_handle(fd: int, limit: int) -> bytes:
     """The bytes of an open regular file, at most the cap; the handle is closed. OverflowError past the cap, OSError
     for anything but a regular file."""
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise OSError(errno.EINVAL, "not a regular file")
-        if info.st_size > IMAGE_MAX_BYTES:
+        if info.st_size > limit:
             raise OverflowError
     except BaseException:
         os.close(fd)
         raise
     with os.fdopen(fd, "rb") as f:
-        data = f.read(IMAGE_MAX_BYTES + 1)              # also for a file that grew, or that reports no size
-    if len(data) > IMAGE_MAX_BYTES:
+        data = f.read(limit + 1)                        # also for a file that grew, or that reports no size
+    if len(data) > limit:
         raise OverflowError
     return data
 
@@ -227,7 +244,7 @@ def _open_flags() -> int:
             | getattr(os, "O_NOINHERIT", 0))
 
 
-def _read_local_file(source: str, allowed: ImageSources) -> bytes:
+def _read_local_file(source: str, allowed: ImageSources, kind: Kind = IMAGE) -> bytes:
     path = source
     if source[:6].lower() == "file:/":
         # percent-decoded, as a URL is; a client that joined "file://" and a path means a `%` in a name literally
@@ -236,17 +253,17 @@ def _read_local_file(source: str, allowed: ImageSources) -> bytes:
             literal = file_url_path(source, relative=True, decode=False)
             path = path if os.path.exists(path) or not os.path.exists(literal) else literal
     if not path:
-        raise ValueError(USAGE)
+        raise ValueError(kind.usage)
     try:
         if not stat.S_ISREG(os.stat(path).st_mode):     # before an open, which can have side effects on a device
-            raise _local_failed(allowed, "the image path is not a regular file", path)
-        return _read_handle(os.open(path, _open_flags()))
+            raise _local_failed(allowed, f"the {kind.noun} path is not a regular file", path)
+        return _read_handle(os.open(path, _open_flags()), kind.max_bytes)
     except FileNotFoundError:
-        raise _local_failed(allowed, "the image file does not exist", path) from None
+        raise _local_failed(allowed, f"the {kind.noun} file does not exist", path) from None
     except OverflowError:
-        raise _local_failed(allowed, f"the image is larger than {IMAGE_MAX_BYTES >> 20} MiB", path) from None
+        raise _local_failed(allowed, f"the {kind.noun} is larger than {kind.max_bytes >> 20} MiB", path) from None
     except OSError as e:
-        raise _local_failed(allowed, "the image file could not be read", path, e.strerror or "error") from None
+        raise _local_failed(allowed, f"the {kind.noun} file could not be read", path, e.strerror or "error") from None
 
 
 def _within(path: str, root: str) -> bool:
@@ -282,7 +299,7 @@ def _open_under(root: str, real: str) -> int:
     raise PermissionError(13, "the path changed while it was opened")
 
 
-def _read_allowed_file(source: str, allowed: ImageSources, windows: bool = os.name == "nt") -> bytes:
+def _read_allowed_file(source: str, allowed: ImageSources, windows: bool = os.name == "nt", kind: Kind = IMAGE) -> bytes:
     """A file a remote request names: it must resolve under an --image-dir. Every refusal reads the same, whether the
     file exists or not, and nothing outside the directories is opened. The check is on the resolved path: the path as
     named may reach the directory through a symlink."""
@@ -298,9 +315,9 @@ def _read_allowed_file(source: str, allowed: ImageSources, windows: bool = os.na
         root = next((r for r in allowed.dirs if _within(real, r)), None)
         if root is None or real == root:
             raise refused
-        return _read_handle(_open_under(root, real))
+        return _read_handle(_open_under(root, real), kind.max_bytes)
     except OverflowError:
-        raise _failed(allowed, f"the image is larger than {IMAGE_MAX_BYTES >> 20} MiB", "kind=path") from None
+        raise _failed(allowed, f"the {kind.noun} is larger than {kind.max_bytes >> 20} MiB", "kind=path") from None
     except (OSError, ValueError) as e:
         if e is refused:
             raise
@@ -363,7 +380,7 @@ class _WatchedHTTPS(_Watched, urllib.request.HTTPSHandler):
     pass
 
 
-def _read_response(r) -> bytes:
+def _read_response(r, limit: int) -> bytes:
     """The response's bytes up to the cap. At the deadline _bounded ends the connection, which ends this loop."""
     parts, total = [], 0
     while True:
@@ -373,27 +390,27 @@ def _read_response(r) -> bytes:
                 raise http.client.IncompleteRead(b"", r.length)
             return b"".join(parts)
         total += len(piece)
-        if total > IMAGE_MAX_BYTES:
+        if total > limit:
             raise OverflowError
         parts.append(piece)
 
 
-def _read_local_url(source: str, allowed: ImageSources, watch: _Watch) -> bytes:
+def _read_local_url(source: str, allowed: ImageSources, watch: _Watch, kind: Kind = IMAGE) -> bytes:
     req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT})
     handlers = _WatchedHTTP(), _WatchedHTTPS()
     for handler in handlers:
         handler.watch = watch
     try:
         with urllib.request.build_opener(*handlers).open(req, timeout=IMAGE_READ_S) as r:
-            return _read_response(r)
+            return _read_response(r, kind.max_bytes)
     except OverflowError:
-        raise _local_failed(allowed, f"the image is larger than {IMAGE_MAX_BYTES >> 20} MiB", source) from None
+        raise _local_failed(allowed, f"the {kind.noun} is larger than {kind.max_bytes >> 20} MiB", source) from None
     except urllib.error.HTTPError as e:
         e.close()
-        raise _local_failed(allowed, f"the image URL answered HTTP {e.code}", source) from None
+        raise _local_failed(allowed, f"the {kind.noun} URL answered HTTP {e.code}", source) from None
     except (OSError, http.client.HTTPException, ValueError) as e:
         reason = getattr(e, "reason", None) or e
-        raise _local_failed(allowed, "the image URL could not be read", source, shown(reason)) from None
+        raise _local_failed(allowed, f"the {kind.noun} URL could not be read", source, shown(reason)) from None
 
 
 def _resolve(host: str, port: int) -> list[str]:
@@ -469,7 +486,7 @@ class _PinnedHandler(urllib.request.AbstractHTTPHandler):
     https_request = urllib.request.AbstractHTTPHandler.do_request_
 
 
-def _read_allowed_url(source: str, allowed: ImageSources, watch: _Watch) -> bytes:
+def _read_allowed_url(source: str, allowed: ImageSources, watch: _Watch, kind: Kind = IMAGE) -> bytes:
     """A URL a remote request names: exactly an allowed host and port. A name must resolve to public addresses only,
     and the connection goes to those; an IP literal the operator named is taken as written. No proxy, no redirect."""
     refused = _refused(allowed, "and the URL's host and port are not among those allowed with --image-url-host"
@@ -488,7 +505,7 @@ def _read_allowed_url(source: str, allowed: ImageSources, watch: _Watch) -> byte
     if not any(h == host and (p or default) == (port or default) for h, p in allowed.url_hosts):
         raise refused
     port = port or default
-    fetch_failed = _failed(allowed, "the image URL could not be fetched", f"host={shown(host)}")
+    fetch_failed = _failed(allowed, f"the {kind.noun} URL could not be fetched", f"host={shown(host)}")
     if is_ip(host):
         addresses = [host]
     else:
@@ -508,24 +525,24 @@ def _read_allowed_url(source: str, allowed: ImageSources, watch: _Watch) -> byte
     req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT})
     try:
         with opener.open(req, timeout=IMAGE_READ_S) as r:
-            return _read_response(r)
+            return _read_response(r, kind.max_bytes)
     except OverflowError:
-        raise _failed(allowed, f"the image is larger than {IMAGE_MAX_BYTES >> 20} MiB", f"host={shown(host)}") from None
+        raise _failed(allowed, f"the {kind.noun} is larger than {kind.max_bytes >> 20} MiB", f"host={shown(host)}") from None
     except urllib.error.HTTPError as e:                 # with no redirect handler, every 3xx lands here too
         e.close()
         if 300 <= e.code < 400:
-            raise ImageRefused(f"{POLICY}: the image URL redirected, and redirects are not followed for this client; "
+            raise ImageRefused(f"{POLICY}: the {kind.noun} URL redirected, and redirects are not followed for this client; "
                                f"name the final URL's host with --image-url-host on the server. {DATA_WORKS}",
                                f"{POLICY}: peer={shown(allowed.peer)} redirect={e.code} "
                                f"host={shown(host)}") from None
-        raise _failed(allowed, f"the image URL answered HTTP {e.code}", f"host={shown(host)}") from None
+        raise _failed(allowed, f"the {kind.noun} URL answered HTTP {e.code}", f"host={shown(host)}") from None
     except (OSError, http.client.HTTPException, ValueError) as e:
         fetch_failed.log_line += f" reason={shown(e)}"
         raise fetch_failed from None
 
 
 # ------------------------------------------------------------------------------------------------ the one entry
-def _bounded(read, allowed: ImageSources, source: str) -> bytes:
+def _bounded(read, allowed: ImageSources, source: str, kind: Kind = IMAGE) -> bytes:
     """`read(watch)` with a deadline, whatever blocks it. A slow host's connection is ended at the deadline, so its
     thread ends too. A name lookup or a dead network mount cannot be ended: that thread stays until the system gives
     up, as a daemon, and the request goes on."""
@@ -545,7 +562,7 @@ def _bounded(read, allowed: ImageSources, source: str) -> bytes:
         data, error = done.get(timeout=IMAGE_READ_S)
     except queue.Empty:
         watch.close()
-        message = f"the image source did not answer within {IMAGE_READ_S:.0f} s"
+        message = f"the {kind.noun} source did not answer within {IMAGE_READ_S:.0f} s"
         raise ImageRefused(message if not allowed.local else f"{message}: {shown(source)}",
                            f"{message}: peer={shown(allowed.peer)}") from None
     if error is not None:
@@ -553,18 +570,20 @@ def _bounded(read, allowed: ImageSources, source: str) -> bytes:
     return data
 
 
-def load_image(source, allowed: ImageSources | None = None) -> bytes:
-    """One request image's bytes, under the policy; no policy is the remote one with nothing allowed."""
+def load_image(source, allowed: ImageSources | None = None, kind: Kind = IMAGE) -> bytes:
+    """One request image's (or, with VIDEO, video's) bytes, under the policy; no policy is the remote one with nothing
+    allowed."""
     allowed = allowed or ImageSources()
     if not isinstance(source, str) or not source:
-        raise ValueError(USAGE)
+        raise ValueError(kind.usage)
     low = source[:32].lower()
     if low.startswith("data:"):
-        return _read_data(source)
+        return _read_data(source, kind)
     if low.startswith(("http://", "https://")):
         fetch = _read_local_url if allowed.local else _read_allowed_url
-        return _bounded(lambda watch: fetch(source, allowed, watch), allowed, source)
+        return _bounded(lambda watch: fetch(source, allowed, watch, kind=kind), allowed, source, kind)
     if _SCHEME.match(low) and not low.startswith("file://"):
-        raise ValueError(USAGE)
-    read = _read_local_file if allowed.local else _read_allowed_file
-    return _bounded(lambda watch: read(source, allowed), allowed, source)
+        raise ValueError(kind.usage)
+    if allowed.local:
+        return _bounded(lambda watch: _read_local_file(source, allowed, kind), allowed, source, kind)
+    return _bounded(lambda watch: _read_allowed_file(source, allowed, kind=kind), allowed, source, kind)
