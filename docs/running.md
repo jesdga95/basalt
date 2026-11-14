@@ -19,10 +19,10 @@ Each slot keeps two checkpoints (end of the system prompt, last turn), so reques
 
 With `--parallel`, a request that names its session goes to the slot that session last used, so the next turn continues the K/V already
 there. The session is the first of these headers that is set, then the request body's `session_id`: `x-llm-flow-id`,
-`x-claude-code-session-id`, `x-session-id`, `x-session-affinity`. A request with none picks a slot by the longest shared prefix, then
-the least recently used. When the session's slot is busy, the request takes that normal pick and the session's slot becomes the new
-one. Claude Code sends one `x-claude-code-session-id` for a session and its parallel subagents, so their overlapping requests spread
-over slots.
+`x-claude-code-session-id`, `x-session-id`, `x-session-affinity`, `x-grok-conv-id`, `x-grok-session-id`. A request with none picks a
+slot by the longest shared prefix, then the least recently used. When the session's slot is busy, the request takes that normal pick
+and the session's slot becomes the new one. Claude Code sends one `x-claude-code-session-id` for a session and its parallel
+subagents, so their overlapping requests spread over slots.
 
 ### Prompts beside decoding slots
 
