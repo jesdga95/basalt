@@ -49,7 +49,7 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 
 | | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | Qwen3.8-27B |
 |---|---|---|---|
-| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-NVFP4`, built from NVIDIA's checkpoint ([how](docs/model-file.md#qwen38-27b-pack)) |
+| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) |
 | Context | default 8,192; `--max-context` sets it | default 8,192; `--max-context` sets it, up to 1,048,576 | default 8,192; up to 262,144 |
 | Drafting | MTP, on by default | DSpark, on by default | DFlash 2 (or MTP), on by default |
 | Images | yes | yes | yes |
