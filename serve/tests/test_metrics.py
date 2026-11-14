@@ -100,6 +100,19 @@ class Http(unittest.TestCase):
         self.engine.info = {"expert_slots": 9}                       # an engine that reports no total
         self.assertIsNone(self.call("/metrics")[1]["engine"]["expert_total"])
 
+    def test_a_dense_model_reports_its_host_weights(self):
+        self.engine.info = {"gpu_weight_bytes": 19756849562, "host_weight_bytes": 0, "host_embedding_bytes": 2576980378, "host_vision_bytes": 900000000, "spill_experts": 0, "spill_total": 0, "spill_bytes": 0}
+        e = self.call("/metrics")[1]["engine"]
+        self.assertEqual((e["host_weight_bytes"], e["host_embedding_bytes"], e["expert_total"], e["spill"]), (0, 2576980378, 0, None))
+        js = (TEMPLATE.parent / "web/app.js").read_text(encoding="utf-8")
+        self.assertIn("num(eng.host_weight_bytes)", js)          # the page tells a dense model by the field only it reports
+        self.assertIn("function drawWeights", js)
+        self.assertEqual(self.call("/metrics")[1]["engine"]["host_vision_bytes"], 900000000)
+        self.assertEqual(self.call("/metrics")[1]["engine"]["gpu_weight_bytes"], 19756849562)
+        self.assertIn("eng.gpu_weight_bytes", js)                # the VRAM segment of the Weights bar
+        self.assertIn('"On the GPU"', js)
+        self.assertNotIn("Vision encoder in RAM", js)
+
     def test_the_experts_card_reads_the_engine_when_there_is_no_ledger(self):
         js = (TEMPLATE.parent / "web/app.js").read_text(encoding="utf-8")
         self.assertIn("eng.expert_slots >= eng.expert_total", js)

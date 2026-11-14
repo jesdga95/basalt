@@ -971,7 +971,7 @@ int main(int argc, char** argv) {
         if (o.community && eng.info.count("host_weight_bytes")) {
             // a dense model keeps every weight on the card and the whole KV in VRAM; weights the engine holds in host
             // RAM would make the row incomparable. The token embedding (host_embedding_bytes) is a row lookup per
-            // token and is reported, not refused.
+            // token and the --vision dynamic encoder (host_vision_bytes) loads per request: both are reported, not refused.
             const double host = std::atof(eng.info["host_weight_bytes"].c_str()) / 1073741824.0;
             if (host > 0.0) {
                 eng.stop();
@@ -982,6 +982,9 @@ int main(int argc, char** argv) {
             if (eng.info.count("host_embedding_bytes") && std::atof(eng.info["host_embedding_bytes"].c_str()) > 0.0)
                 basalt::log::info("basalt-bench", "note: the token embedding (%.2f GiB) stays in page-locked host RAM by design; not counted as spill",
                                   std::atof(eng.info["host_embedding_bytes"].c_str()) / 1073741824.0);
+            if (eng.info.count("host_vision_bytes") && std::atof(eng.info["host_vision_bytes"].c_str()) > 0.0)
+                basalt::log::info("basalt-bench", "note: the vision encoder (%.2f GiB) waits in host RAM and loads per request; not counted as spill",
+                                  std::atof(eng.info["host_vision_bytes"].c_str()) / 1073741824.0);
         }
         if (si == 0) {
             info = eng.info;

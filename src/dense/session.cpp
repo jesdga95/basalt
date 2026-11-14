@@ -579,9 +579,11 @@ public:
     std::string info_words() const override {
         const std::string kv = m_.o.kv_int8 ? "kv=int8" : "kv=fp16";
         // a dense model has no routed experts, so none can sit on the SSD (the community check reads this)
-        // the weights not on the card: the vision projector when --vision staged it; the embedding is told apart
-        const uint64_t host_w = m_.encoder ? m_.encoder->weights_bytes() : 0;
-        return kv + " host_weight_bytes=" + std::to_string(host_w) + " host_embedding_bytes=" + std::to_string(m_.o.host_embedding_bytes) +
+        // host_weight_bytes: model weights held in host RAM, none for the dense stack (the community check refuses a row if
+        // any). gpu_weight_bytes is what the load log calls "GiB on the GPU". The token embedding and the --vision dynamic encoder wait in host RAM by design and are told apart.
+        const uint64_t host_vision = m_.encoder ? m_.encoder->weights_bytes() : 0;
+        return kv + " gpu_weight_bytes=" + std::to_string(m_.o.gpu_weight_bytes) + " host_weight_bytes=0 host_embedding_bytes=" + std::to_string(m_.o.host_embedding_bytes) +
+               " host_vision_bytes=" + std::to_string(host_vision) +
                " " + program::spill_words({}) + (block_ ? " drafter=block" : drafter_ ? " drafter=mtp" : "");
     }
     int64_t disk_min_tokens() const override { return 4096; }

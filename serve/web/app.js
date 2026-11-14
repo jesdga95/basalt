@@ -164,6 +164,11 @@ function drawSide(hw, st, hist, eng, r) {
     + sbRow("Disk read", num(hw.disk_read_mb) ? hw.disk_read_mb.toFixed(1) : "-", "MB/s")
     + (st.driver ? `<div class="sb-foot">Driver ${esc(st.driver)}${st.cuda ? ` · CUDA ${esc(st.cuda)}` : ""}</div>` : ""));
 
+  // a dense model has no experts: the card says where its weights live, and flags any that are off the GPU
+  const dense = num(eng.host_weight_bytes);
+  text($("#exp-h"), dense ? "Weights" : "Experts");
+  if (dense) return drawWeights(eng);
+
   // the tier split of the last request's routed lookups; the peer tier shows only when the engine reports it, the SSD
   // tier and the warning only while experts are read from the SSD
   // every expert in VRAM: no lookup ledger exists to read, and the split is all VRAM
@@ -180,6 +185,23 @@ function drawSide(hw, st, hist, eng, r) {
   html($("#experts"), `<div class="sb-stack" aria-hidden="true">${tiers.map(t => `<i style="width:${((t[2] || 0) * 100).toFixed(1)}%;background:${t[1]}"></i>`).join("")}</div>`
     + `<div class="sb-leg${spill ? " q" : ""}">${tiers.map(t => `<div style="--c:${t[1]}"><span>${t[0]}</span><b>${t[2] == null ? "-" : `${(t[2] * 100).toFixed(1)}%`}</b></div>`).join("")}</div>`
     + (spill ? `<div class="sb-note"><span><b>${spill.experts} experts on SSD (${gb})</b> ·</span> <span>free ${gb} RAM</span></div>` : ""));
+}
+
+// the Weights card of a dense model, drawn like the experts card: a bar of where the weights sit (VRAM, RAM, SSD). The token
+// embedding and the vision encoder kept in RAM on purpose count in the RAM segment; weights spilled to RAM or the SSD add a warning
+function drawWeights(eng) {
+  const B = n => num(n) && n > 0 ? n : 0, G = n => `${(n / 1024 ** 3).toFixed(1)}`;
+  const spillRam = B(eng.host_weight_bytes), ssd = eng.spill ? B(eng.spill.bytes) : 0, emb = B(eng.host_embedding_bytes), vis = B(eng.host_vision_bytes);
+  const gpu = num(eng.gpu_weight_bytes) ? eng.gpu_weight_bytes : null, ram = spillRam + emb + vis, bad = spillRam > 0 || ssd > 0;
+  const tiers = [["VRAM", "var(--fg)", gpu || 0, gpu == null], ["RAM", "var(--basalt-500)", ram, false]];
+  if (ssd > 0) tiers.push(["SSD", "var(--warn)", ssd, false]);
+  const total = tiers.reduce((a, t) => a + t[2], 0) || 1;
+  $(".sb-exp").classList.toggle("spill", bad);
+  text($("#exp-note"), ssd > 0 ? "SSD in use" : spillRam > 0 ? "RAM in use" : "On the GPU");
+  const warn = ssd > 0 ? `${G(ssd)} GiB of weights on SSD` : `${G(spillRam)} GiB of weights in RAM`;
+  html($("#experts"), `<div class="sb-stack" aria-hidden="true">${tiers.map(t => `<i style="width:${(t[2] / total * 100).toFixed(1)}%;background:${t[1]}"></i>`).join("")}</div>`
+    + `<div class="sb-leg">${tiers.map(t => `<div style="--c:${t[1]}"><span>${t[0]}</span><b>${t[3] ? "-" : `${G(t[2])} GiB`}</b></div>`).join("")}</div>`
+    + (bad ? `<div class="sb-note"><span><b>${warn}</b> · slower decode</span></div>` : ""));
 }
 
 /* ---- Speed ---- */
