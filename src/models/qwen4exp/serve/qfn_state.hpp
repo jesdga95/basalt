@@ -417,6 +417,7 @@ private:
     bool peer_take(const std::vector<int32_t>& off, std::string& e);
     void peer_due_lent(std::vector<std::pair<int32_t, int32_t>>& lent);
     bool peer_due_apply(std::string& e);
+    bool cache_yield(int64_t add, int64_t room, std::vector<int32_t>& off, std::string& e);
     bool kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true, int64_t min_cells = -1);
     bool kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e);
     uint64_t row_hash(int t);
