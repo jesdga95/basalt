@@ -2,7 +2,6 @@
 // pack into the shared dense stack and hands out its sessions.
 #include "models/qwen35/adapter.hpp"
 
-#include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/model_file.hpp"
@@ -21,8 +20,6 @@
 
 namespace basalt::models::qwen35 {
 namespace {
-
-constexpr int kTypeF32 = 0, kTypeQ8_0 = 8, kTypeBf16 = 30, kTypeNvfp4 = 40, kTypeF8 = 44, kTypeNvfp4Planes = 45;
 
 class Loaded final : public model::LoadedModel {
 public:
@@ -313,24 +310,7 @@ private:
             return false;
         }
         const int type = (int) it->second.type;
-        if (type == kTypeNvfp4) {
-            err = "qwen35: " + base + ".weight is NVFP4 in ggml blocks, from a pack older than NVFP4_PLANES: re-convert the "
-                  "pack (tools/convert/convert.py --checkpoint, docs/model-file.md)";
-            return false;
-        }
-        if (type != kTypeQ8_0 && type != kTypeNvfp4Planes && type != kTypeF8) {
-            err = "qwen35: " + base + ".weight is " + it->second.type_name() + "; the dense kernels read Q8_0, NVFP4_PLANES and F8_E4M3";
-            return false;
-        }
-        if (type == kTypeNvfp4Planes && !kernels::nvfp4p::fits(rows, cols)) {
-            err = "qwen35: " + base + ".weight: NVFP4_PLANES of " + std::to_string(rows) + " x " + std::to_string(cols) +
-                  " (planes need rows in 128s and 64-value groups)";
-            return false;
-        }
-        if (type == kTypeF8 && cols % 256 != 0) {
-            err = "qwen35: " + base + ".weight: F8_E4M3 rows of " + std::to_string(cols) + " values (the kernels read multiples of 256)";
-            return false;
-        }
+        if (err = linear_type_error(base, it->second.type, rows, cols); !err.empty()) return false;
         const TensorInfo* t = need(gg, base + ".weight", type, rows * cols, err);
         if (!t || (int64_t) t->shape[0] != cols) {
             if (err.empty()) err = "qwen35: " + base + ".weight has the wrong shape";
