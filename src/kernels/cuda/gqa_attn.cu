@@ -48,18 +48,22 @@ __device__ __forceinline__ int64_t row_lo(const Range& r, int t) {
     return r.window > 0 ? max((int64_t) 0, row_pos0(r) + t - r.window + 1) : 0;
 }
 
-// Block (query head, row t), one thread per dim: the row's splits merged in order.
+// Block (query head, row t), one thread per dim: the row's splits merged in order.  Splits past the row's last chunk
+// saw no cell of it ({max kNeg, sum 0, zeros}: every term they add is an exact zero), so the merge stops at the last
+// split that holds one of its cells; the sums and their order are those of the full loop.
 template <int HD>
 __global__ void __launch_bounds__(HD) decode_merge_kernel(const float* part, int n_head, int gx, float* out, const float* gate_q,
-                                                          uint16_t* gated16) {
+                                                          uint16_t* gated16, Range r) {
     pdl_launch_dependents();
     pdl_wait();
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const float* p = part + ((int64_t) t * n_head + h) * gx * (HD + 2);
+    const int64_t chunks = (row_hi(r, t) + CHUNK - 1) / CHUNK - r.base;   // the row's chunks from the first split's
+    const int used = (int) max((int64_t) 1, min((int64_t) gx, chunks));
     float m = kNeg;
-    for (int b = 0; b < gx; ++b) m = fmaxf(m, p[(int64_t) b * (HD + 2)]);
+    for (int b = 0; b < used; ++b) m = fmaxf(m, p[(int64_t) b * (HD + 2)]);
     float l = 0.0f, a = 0.0f;
-    for (int b = 0; b < gx; ++b) {
+    for (int b = 0; b < used; ++b) {
         const float* pb = p + (int64_t) b * (HD + 2);
         const float w = exp2f(pb[0] - m);
         l = fmaf(pb[1], w, l);
@@ -135,35 +139,14 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q, const _
     __shared__ float rm[16], rl[16], ra[16];
     __shared__ int64_t rlo[16], rhi[16];
     pdl_launch_dependents();
-    pdl_wait();
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
     const int kvh = blockIdx.y, gx = gridDim.x, G = n_head / n_kv, M = T * G, m0 = blockIdx.z * 16;
-    for (int idx = tid; idx < 16 * HD; idx += 128) {
-        const int i = idx / HD, d = idx - i * HD, m = m0 + i;
-        const float v = m < M ? q[((int64_t) (m / G) * n_head + kvh * G + m % G) * HD + d] * scale : 0.0f;
-        qs[i][d] = __float2half_rn(v);
-    }
-    if (tid < 16) {
-        const int m = m0 + tid;
-        rlo[tid] = m < M ? row_lo(r, m / G) : 0;
-        rhi[tid] = m < M ? row_hi(r, m / G) : 0;
-        rm[tid] = kNeg;
-        rl[tid] = 0.0f;
-    }
-    __syncthreads();
-    int64_t hi_max = 0;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) hi_max = max(hi_max, rhi[i]);
-    float acc[NT][4];
-#pragma unroll
-    for (int n = 0; n < NT; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
-    for (int chunk = blockIdx.x; chunk < n_chunks; chunk += gx) {
-        const int64_t c0 = (int64_t) (r.base + chunk) * CHUNK;
-        if (c0 >= hi_max) break;   // past every row's cells
+    // the chunk's cells [from, to) of K and V as fp16 (int8: code x scale), zero past the last row's cells
+    const auto load_kv = [&](int64_t c0, int64_t hi_max, int from, int to) {
         const int64_t cell0 = c0 % r.cap;
-        // K and V of the chunk's cells as fp16 (int8: code x scale), zero past the last row's cells
         for (int idx = tid; idx < CHUNK * HD / 8; idx += 128) {
             const int cell = idx / (HD / 8), d8 = (idx - cell * (HD / 8)) * 8;
+            if (cell < from || cell >= to) continue;
             uint4 kw = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
             if (c0 + cell < hi_max) {
                 int64_t ce = cell0 + cell;
@@ -191,6 +174,37 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q, const _
             *reinterpret_cast<uint4*>(&ks[cell][d8]) = kw;
             *reinterpret_cast<uint4*>(&vs[cell][d8]) = vw;
         }
+    };
+    // before the wait: the rows' ranges (positions come from the host) and, of the block's first chunk, the cells below
+    // the window's first position, which earlier windows wrote; the window's own cells and the queries come after it
+    if (tid < 16) {
+        const int m = m0 + tid;
+        rlo[tid] = m < M ? row_lo(r, m / G) : 0;
+        rhi[tid] = m < M ? row_hi(r, m / G) : 0;
+        rm[tid] = kNeg;
+        rl[tid] = 0.0f;
+    }
+    __syncthreads();
+    int64_t hi_max = 0;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) hi_max = max(hi_max, rhi[i]);
+    const int64_t first_c0 = (int64_t) (r.base + blockIdx.x) * CHUNK;
+    const int64_t own = row_pos0(r);   // cells from the window's first position on are this window's (written just before)
+    const int pre = (int) max((int64_t) 0, min((int64_t) CHUNK, own - first_c0));
+    if ((int) blockIdx.x < n_chunks && first_c0 < hi_max && pre > 0) load_kv(first_c0, hi_max, 0, pre);
+    pdl_wait();
+    for (int idx = tid; idx < 16 * HD; idx += 128) {
+        const int i = idx / HD, d = idx - i * HD, m = m0 + i;
+        const float v = m < M ? q[((int64_t) (m / G) * n_head + kvh * G + m % G) * HD + d] * scale : 0.0f;
+        qs[i][d] = __float2half_rn(v);
+    }
+    float acc[NT][4];
+#pragma unroll
+    for (int n = 0; n < NT; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+    for (int chunk = blockIdx.x; chunk < n_chunks; chunk += gx) {
+        const int64_t c0 = (int64_t) (r.base + chunk) * CHUNK;
+        if (c0 >= hi_max) break;   // past every row's cells
+        load_kv(c0, hi_max, chunk == (int) blockIdx.x ? pre : 0, CHUNK);   // the first chunk's earlier cells are in
         __syncthreads();
         // S = Q K^T: warp w the cells 8w .. 8w + 7
         for (int nc = warp; nc < CHUNK / 8; nc += 4) {
@@ -290,7 +304,7 @@ void launch_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n
                (const __half*) kc, (const __half*) vc, n_head, n_kv, r, n_chunks, scale, scratch, q8, T);
     check("gqa decode attention");
     launch_pdl(decode_merge_kernel<HD>, dim3((unsigned) n_head, (unsigned) T), dim3(HD), 0, s, (const float*) scratch, n_head, gx,
-               out, gate_q, gated16);
+               out, gate_q, gated16, r);
     check("gqa decode attention/merge");
 }
 
