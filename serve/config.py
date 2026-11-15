@@ -24,7 +24,7 @@ CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the confi
 ENTRY_OPTIONS = frozenset({"model", "alias"})
 MODEL_OPTIONS = frozenset({
     "gpu", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
-    "grammar", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
+    "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
     "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
 
@@ -604,6 +604,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"default {key.replace('-', '_')} for requests that leave it out, over the model file's: {text}")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
                     help="load an unloaded model only when this much VRAM is free, else answer 503")
+    ap.add_argument("--reasoning-effort", type=str.lower, choices=("none", "low", "medium", "high", "xhigh", "max"),
+                    default=None, help="default reasoning effort for requests that name none (no effort, thinking "
+                                       "switch or budget); unset, the model's template decides")
     ap.add_argument("--reasoning-budget-tokens", type=budget_count, default=None, metavar="N",
                     help="default thinking budget for requests that leave reasoning_budget_tokens out (0 = none): at "
                          "the budget the thinking is closed and the answer starts, so set it below the request's "
