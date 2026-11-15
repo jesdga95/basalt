@@ -128,10 +128,11 @@ public:
             for (const auto& [name, rows] : shexp)
                 if (const DevTensor* t = m_.tensor(il, name); t && mmq::fits(t->type, rows)) add(all, t->type, rows);
         for (const auto& [t, rows] : all) mmq::load(t, rows);
-        if (tier_->peer_share()) {
-            const core::OnDevice od(tier_->peer()->device());
-            for (const auto& [t, rows] : routed) mmq::load(t, rows);
-        }
+        if (tier_->peer_share())   // every second card runs its block's prompt products
+            for (const auto& p : tier_->peers()) {
+                const core::OnDevice od(p->device());
+                for (const auto& [t, rows] : routed) mmq::load(t, rows);
+            }
         return true;
     }
 
@@ -328,6 +329,7 @@ private:
         int cpu_rows = 0;
         int64_t cpu_at = 0;                      // the CPU rows' first row in the layer's rows
         bool peer = false;                       // the second card took a share
+        int layer = -1;                          // whose: the share of that layer's card joins it
         std::thread cpu_thread;
         void join() {
             if (cpu_thread.joinable()) cpu_thread.join();
@@ -378,12 +380,12 @@ private:
             x1.n = (int) tok[i].size();
             ex.push_back(x1);
         }
-        return tier_->peer_share()->run(share_layer(il), x, T, ex, rows_ + (size_t) at * (size_t) g_.n_embd, stream, err);
+        return tier_->share_for(il)->run(share_layer(il), x, T, ex, rows_ + (size_t) at * (size_t) g_.n_embd, stream, err);
     }
 
     // The second card's experts of layer `il` in a long chunk start their staging before its routing.
     void prepare_peer(int il) {
-        if (!tier_->peer_share()) return;
+        if (!tier_->share_for(il)) return;
         std::vector<prefill::PeerShare::Expert> ex;
         for (int e = 0; e < g_.n_expert; ++e) {
             if (!on_peer_[(size_t) il][(size_t) e]) continue;
@@ -393,7 +395,7 @@ private:
             x1.on_peer = src.peer != nullptr;
             ex.push_back(x1);
         }
-        if (!ex.empty()) tier_->peer_share()->prepare(share_layer(il), ex);
+        if (!ex.empty()) tier_->share_for(il)->prepare(share_layer(il), ex);
     }
 
     // Of the RAM experts `ram` (highest ids first, `rows` each), how many the second card takes beside its own experts. In a
@@ -491,6 +493,7 @@ private:
         if (!peer.empty()) {
             if (!start_peer(il, T, x, by, peer, at, at, stream, err)) return false;
             s.peer = true;
+            s.layer = il;
         }
         s.cpu_at = at;
         for (size_t i = 0; i < s.pair.size(); ++i) map_h_[(size_t) s.pair[i]] = (int32_t) (at + (int64_t) i);
@@ -511,7 +514,7 @@ private:
     // The rows of the CPU and the second card join the others'.
     bool finish_share(Share& s, void* stream, std::string& err) {
         s.join();
-        if (s.peer && !tier_->peer_share()->join(stream, err)) return false;
+        if (s.peer && !tier_->share_for(s.layer)->join(stream, err)) return false;
         if (s.pair.empty()) return true;
         const size_t rows = s.pair.size(), n = (size_t) g_.n_embd;
         cudaMemcpyAsync(rows_ + (size_t) s.cpu_at * n, hrows_, rows * n * 4, cudaMemcpyHostToDevice, (cudaStream_t) stream);
@@ -806,7 +809,7 @@ private:
             while (issued_ < std::min<int64_t>(consumed_ + prefillp::kAheadSlots, (int64_t) run_layers_ * G))
                 if (!issue_next(err)) return false;
         }
-        if (!peer.empty() && !tier_->peer_share()->join(st, err)) return false;
+        if (!peer.empty() && !tier_->share_for(il)->join(st, err)) return false;
         cudaMemcpyAsync(map_, map_h_.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, st);
         weighted_sum_tokens(rows_, map_, w, T, K, g_.n_embd, out, st);
         return true;

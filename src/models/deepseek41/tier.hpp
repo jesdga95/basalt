@@ -135,9 +135,20 @@ public:
         const uint8_t* pinned = nullptr;
     };
     Source locate(int layer, int e) const;
-    core::PeerExperts* peer() const { return peer_.get(); }
-    /// The second card's share of a prompt chunk's experts; null without a second card.
-    prefill::PeerShare* peer_share() const { return share_.get(); }
+    /// The first second card (null without any): for "is there a second card" questions; per-layer work takes peer_for.
+    core::PeerExperts* peer() const { return peers_.empty() ? nullptr : peers_[0].get(); }
+    /// The second card that holds `layer`'s second-card homes (each card owns a block of layers), or null.
+    core::PeerExperts* peer_for(int layer) const {
+        return peers_.empty() ? nullptr : peers_[(size_t) layer_card_[(size_t) layer]].get();
+    }
+    /// Every second card, in block order (for work each card does once, such as loading kernel modules).
+    const std::vector<std::unique_ptr<core::PeerExperts>>& peers() const { return peers_; }
+    /// The first second card's share of a prompt chunk's experts; null without a second card.
+    prefill::PeerShare* peer_share() const { return shares_.empty() ? nullptr : shares_[0].get(); }
+    /// The share of `layer`'s prompt experts, opened on peer_for(layer)'s card; null without a second card.
+    prefill::PeerShare* share_for(int layer) const {
+        return shares_.empty() ? nullptr : shares_[(size_t) layer_card_[(size_t) layer]].get();
+    }
     /// What the split of a layer's experts between the cards prices them at.
     const prefill::ShareRates& share_rates(int layer) const { return rates_[(size_t) layer]; }
     /// The prompt path's and the images' host buffers, allocated before the RAM tier is sized.
@@ -194,7 +205,8 @@ private:
     void apply(const Pending& p);
     void apply(const PeerMove& m);
     bool load_ram(std::string& err);
-    bool open_share(std::string& err);
+    bool open_share(size_t card, std::string& err);
+    void fill_share_rates();
     int ranked(int layer, int r) const;
     bool load_rank(std::string& err);
     void seed_copies(int64_t n);
@@ -263,8 +275,10 @@ private:
     std::vector<uint16_t> uses_;            ///< [layer * n_expert + e] CPU uses toward a promotion, with reads_ open
     int64_t read_ = 0;                      ///< experts read into the RAM tier
     PromptHost host_;
-    std::unique_ptr<core::PeerExperts> peer_;
-    std::unique_ptr<prefill::PeerShare> share_;
+    std::vector<std::unique_ptr<core::PeerExperts>> peers_;   ///< [card] the second cards, each holding blocks_'s layers
+    std::vector<std::unique_ptr<prefill::PeerShare>> shares_; ///< [card] the prompt share on the same card
+    policy::PeerBlocks blocks_;             ///< card c holds the second-card homes of layers [lo[c], hi[c])
+    std::vector<int> layer_card_;           ///< [layer] its card in peers_ / shares_
     std::vector<prefill::ShareRates> rates_;    ///< [layer]
     std::vector<kernels::cpu::NativeFmt> fmt_;   ///< [layer]
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;

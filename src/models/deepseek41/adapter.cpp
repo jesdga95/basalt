@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -47,8 +48,13 @@ public:
         m->set_diag_dump(req.diag_dump);
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
         m->set_tiers(req);
-        if (!req.peer_devices.empty()) m->set_peer_device(req.peer_devices.front());
-        if (req.peer_devices.size() > 1) basalt::log::warn("basalt deepseek41", "one second card holds experts; later cards idle");
+        std::vector<int> peers = req.peer_devices;
+        if (peers.size() > (size_t) kMaxSecondCards) {
+            basalt::log::warn("basalt deepseek41", "%zu second cards given, %d hold experts; later cards idle", peers.size(),
+                              kMaxSecondCards);
+            peers.resize((size_t) kMaxSecondCards);
+        }
+        m->set_peer_devices(std::move(peers));
         out = std::move(m);
         return {};
     }
@@ -81,7 +87,9 @@ public:
 
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
 
-    int max_expert_cards() const override { return 1; }
+    /// Second cards that hold experts, each a contiguous block of layers.
+    static constexpr int kMaxSecondCards = 4;
+    int max_expert_cards() const override { return kMaxSecondCards; }
 
     const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
 
