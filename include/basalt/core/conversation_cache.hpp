@@ -14,6 +14,7 @@
 #include <set>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -401,6 +402,14 @@ public:
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         forget(out);
         return out;
+    }
+
+    /// The longest parked conversation `leaves` accepts, out of the cache (an idle slot's or a budgeted one alike);
+    /// none when it accepts no entry.
+    template<class Fn> std::optional<SavedConversation> take_oldest(Fn leaves) {
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (leaves(std::as_const(entries_[i]))) return take(i);
+        return std::nullopt;
     }
 
     // Reserve before allocating a snapshot. held is an incoming image removed

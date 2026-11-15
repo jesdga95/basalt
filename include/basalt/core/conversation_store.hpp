@@ -66,6 +66,7 @@ public:
     /// identity's files count).  False with `error` when the directory cannot be used.
     bool open(const std::string& dir, uint64_t identity, uint64_t budget, std::string& error);
     bool enabled() const { return open_; }
+    uint64_t budget() const { return budget_; }
 
     /// The longest stored prefix of `prompt` (live tokens or a checkpoint, with the same pictures and control-vector
     /// state), at most prompt.size() - 1 tokens; tokens == 0 when there is none.
@@ -100,8 +101,9 @@ public:
     /// Whether an image with these live tokens is stored or queued.
     bool holds(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const;
 
-    /// Waits until every queued image is written.
-    void flush();
+    /// Waits until every queued image is written and its RAM given back; `waiting` is called about once a second
+    /// meanwhile.
+    void flush(const std::function<void()>& waiting = {});
 
     Stats stats() const;
     uint64_t queued_bytes() const;
@@ -150,6 +152,22 @@ private:
     std::thread thread_;
     int64_t row_cells_ = 1;
 };
+
+/// What conversation_cache_to_store moved: the conversations that left the cache and their bytes, those of them it
+/// wrote, and whether the caller's condition held at the end.
+struct ConversationsToStore {
+    size_t left = 0, bytes = 0, written = 0;
+    bool admitted = false;
+};
+
+/// Conversations parked in `cache` leave for `store`, the longest parked first, until `admitted()` holds or none is
+/// left to go.  One that `stored` says the store holds already only leaves the cache; the others are written first
+/// and waited for (`waiting`, as for flush): an image's RAM is free once it is written.  One shorter than `shortest`
+/// tokens or larger than the store's budget stays parked, and once the store did not write one, no more are given up.
+ConversationsToStore conversation_cache_to_store(ConversationCache& cache, ConversationStore& store, int64_t shortest,
+                                                 const std::function<bool(const SavedConversation&)>& stored,
+                                                 const std::function<bool()>& admitted,
+                                                 const std::function<void()>& waiting = {});
 
 /// The 64-bit hash the store's identity and file checks use (XXH64's rounds).
 uint64_t conversation_store_hash(const void* data, size_t n, uint64_t seed);

@@ -1631,12 +1631,11 @@ void ConversationStore::writer() {
         uint64_t wrote = 0, whole = 0;
         const bool ok = write_now(*job, image_source(job->image), wrote, whole, why, nullptr);
         if (!ok) basalt::log::warn("basalt serve", "conversation cache: %s", why.c_str());
-        std::lock_guard<std::mutex> lk(mu_);
+        std::unique_lock<std::mutex> lk(mu_);
         if (!queue_.empty() && queue_.front() == job) {
             queue_.pop_front();
             queue_bytes_ -= job->bytes;
         }
-        busy_ = false;
         stats_.written_bytes += wrote;
         Entry* mine = nullptr;
         for (auto& e : entries_) if (e->job == job) mine = e.get();
@@ -1676,6 +1675,10 @@ void ConversationStore::writer() {
         if (queue_.empty()) gc_locked(0);   // between bursts: the files the writes left behind
         evict_locked();
         unlink_unread_locked();
+        lk.unlock();
+        job.reset();   // its image's RAM is free before a flush returns
+        lk.lock();
+        busy_ = false;
         idle_.notify_all();
     }
 }
@@ -1866,9 +1869,14 @@ bool ConversationStore::write_job(Job& job, const ConversationSource& img, uint6
     return true;
 }
 
-void ConversationStore::flush() {
+void ConversationStore::flush(const std::function<void()>& waiting) {
     std::unique_lock<std::mutex> lk(mu_);
-    idle_.wait(lk, [&] { return queue_.empty() && !busy_; });
+    while (!idle_.wait_for(lk, std::chrono::seconds(1), [&] { return queue_.empty() && !busy_; })) {
+        if (!waiting) continue;
+        lk.unlock();
+        waiting();
+        lk.lock();
+    }
 }
 
 ConversationStore::Stats ConversationStore::stats() const {
@@ -1885,6 +1893,34 @@ ConversationStore::Stats ConversationStore::stats() const {
 uint64_t ConversationStore::queued_bytes() const {
     std::lock_guard<std::mutex> lk(mu_);
     return queue_bytes_;
+}
+
+ConversationsToStore conversation_cache_to_store(ConversationCache& cache, ConversationStore& store, int64_t shortest,
+                                                 const std::function<bool(const SavedConversation&)>& stored,
+                                                 const std::function<bool()>& admitted,
+                                                 const std::function<void()>& waiting) {
+    ConversationsToStore r;
+    r.admitted = admitted();
+    while (!r.admitted) {
+        auto image = cache.take_oldest([&](const SavedConversation& c) {
+            return (int64_t) c.live.ids.size() >= shortest && c.bytes() <= store.budget();
+        });
+        if (!image) break;
+        ++r.left;
+        r.bytes += image->bytes();
+        bool held = stored(*image);
+        if (!held) {   // in RAM already: no queue cap, and it is waited for
+            const size_t before = store.stats().written;
+            held = store.put(std::move(*image), std::numeric_limits<uint64_t>::max());
+            store.flush(waiting);
+            held = held && store.stats().written > before;
+            r.written += held;
+        }
+        image.reset();
+        r.admitted = admitted();
+        if (!held) break;
+    }
+    return r;
 }
 
 uint64_t conversation_store_hash_file(const std::string& path, uint64_t seed) {
