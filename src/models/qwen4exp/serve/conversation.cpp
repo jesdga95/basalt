@@ -444,8 +444,9 @@ bool QfnRuntime::park_idle_engine(std::string& e) {
 }
 
 // Idle conversation `b` (a batch slot; -1: the solo session's) out of VRAM, its K/V cells beyond the base back to the
-// driver: into the RAM tier when the RAM a capture must leave admits it, else nothing is copied when the disk tier
-// holds it.  False when it stays in VRAM (`e` empty) or its cells could not be given back (`e` set).
+// driver: into the RAM tier when the RAM a capture must leave admits it, else to the disk tier, written from the
+// session unless a stored copy reaches it.  False when it stays in VRAM (`e` empty) or its cells could not be given
+// back (`e` set).
 bool QfnRuntime::park_one(int b, std::string& e) {
     const auto t0 = Clock::now();
     basalt::core::SessionState& u = b >= 0 ? *bslot_ss[0][(size_t) b] : ss;
@@ -476,11 +477,32 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     const bool keep = o.conversation_cache_min_tokens <= 0 ||
                       (int64_t) ids.size() >= o.conversation_cache_min_tokens;
     bool to_ram = keep && capture_admit(est > moved ? est - moved : 0, floor);
-    const bool on_disk = keep && !to_ram && disk.enabled() && (int64_t) ids.size() >= disk_min_tokens() &&
-                         disk_has(ids, imgs, cks, cvec);
-    if (!to_ram && !on_disk && keep) {   // said once per idle stretch
-        double& noted = b >= 0 ? bs[(size_t) b].park_noted : solo_park_noted;
-        const double since = b >= 0 ? bs[(size_t) b].idle_busy : solo_idle_busy;
+    const bool disk_takes = keep && !to_ram && disk.enabled() && (int64_t) ids.size() >= disk_min_tokens();
+    bool on_disk = disk_takes && disk_has(ids, imgs, cks, cvec);
+    size_t bytes = 0;
+    bool written = false;
+    double& noted = b >= 0 ? bs[(size_t) b].park_noted : solo_park_noted;   // what is said once per idle stretch
+    const double since = b >= 0 ? bs[(size_t) b].idle_busy : solo_idle_busy;
+    if (disk_takes && !on_disk && disk_stream > 0 &&
+        capture_admit(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
+        ckd_finish();   // the write reads its checkpoints' bytes
+        // its own K/V from the session, its draft layer's from the store that holds it
+        basalt::core::ConversationSource src;
+        try {
+            written = basalt::core::conversation_snapshot_source(src, view, *cap, g,
+                          static_cast<const basalt::core::QsaState*>(nullptr), se) &&
+                      (mtp_kv == nullptr || mtp.store_source(store, (int64_t) ids.size(), src.kv.emplace_back(), se)) &&
+                      disk_write(src, se);
+        } catch (const std::bad_alloc&) {
+            se = "allocation failed";
+        }
+        on_disk = written;
+        bytes = (size_t) src.bytes();
+        if (!written && noted != since)
+            basalt::log::warn("basalt serve", "%s's idle conversation is not written to disk (%s)", who.c_str(),
+                              se.c_str());
+    }
+    if (!to_ram && !on_disk && keep) {
         if (noted != since)
             basalt::log::info("basalt serve", "%s's idle conversation stays in VRAM: %zu MiB do not fit in RAM above "
                               "the %llu MiB floor", who.c_str(), (est - std::min(est, moved)) >> 20,
@@ -488,7 +510,6 @@ bool QfnRuntime::park_one(int b, std::string& e) {
         noted = since;
         return false;
     }
-    size_t bytes = 0;
     if (to_ram) {
         try {
             basalt::core::SavedConversation image;
@@ -528,6 +549,8 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     ++kv_moves;
     char where[64];
     if (to_ram) std::snprintf(where, sizeof where, "to RAM (%.0f MiB)", (double) bytes / 1048576.0);
+    else if (written)
+        std::snprintf(where, sizeof where, "to disk from the session (%.0f MiB)", (double) bytes / 1048576.0);
     else if (on_disk) std::snprintf(where, sizeof where, "kept on disk only");
     else std::snprintf(where, sizeof where, "dropped, below the %d token minimum", o.conversation_cache_min_tokens);
     basalt::log::info("basalt serve", "%s's idle conversation, %lld tokens, %s in %.0f ms: %lld KV cells back",

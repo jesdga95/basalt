@@ -333,9 +333,9 @@ public:
     // expert-cache slots its cells hold have then cost that work about what moving it out and back costs, both
     // in proportion to its tokens.  From then on, the VRAM a session is short of comes from it before the expert
     // cache's slots, and an idle engine moves it out to regrow the cache.  It goes to the RAM tier outside its
-    // budget when RAM admits it, else it stays only on the disk tier when that holds it, else in VRAM; its next
-    // turn reads it back like any parked conversation.  Before a prompt is refused for want of VRAM, any idle
-    // conversation goes.
+    // budget when RAM admits it, else to the disk tier (nothing is copied when that holds it), else it stays in
+    // VRAM; its next turn reads it back like any parked conversation.  Before a prompt is refused for want of VRAM,
+    // any idle conversation goes.
     static constexpr double kParkAfterBusy = 15.0;
     /// the solo session's conversation while a request works in another slot (that request's, moved out of `live`)
     struct SoloBook {
