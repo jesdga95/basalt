@@ -148,6 +148,13 @@ constexpr int kPromptLineLayers = 20;
 /// chunk's first layers.  `w` holds the weights of layers [l_min, n_layers) on `dev` (the others empty).  Called with the
 /// main card current, before any session is made.
 bool attach_prompt_line(Model& m, int dev, int l_min, const Weights& w, std::string& err);
+/// The layer split: CUDA device `dev` holds layers [cut, n) of `w` (their weights already on `dev`, the others empty) with
+/// their cells and recurrent state, and runs them in every decode window and prompt chunk of `m`, which holds layers
+/// [0, cut).  The second card plans its products as the main card, so the output is the main card's alone to the bit.
+/// Called with the main card current, before any session is made.
+bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err);
+/// Main-card bytes a second card's stage keeps (its hand-off buffers and the drafter features it holds back).
+uint64_t stage_main_bytes(const Geometry& g, const BlockDrafter& drafter);
 /// Main-card bytes a prompt line keeps (its hand-off buffers and the drafter features it holds back); 0 when a context of
 /// `max_context` cells is too short for one.
 uint64_t prompt_line_main_bytes(const Geometry& g, const BlockDrafter& drafter, int64_t max_context);

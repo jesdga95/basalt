@@ -345,7 +345,7 @@ SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter
     const uint64_t slot_rest = session_bytes(g, o.max_context, mtp, o.kv_int8, o.kv_resident) - layers +
                                (o.drafter == Drafter::Block ? block_session_bytes(g, bd) : 0);
     const uint64_t scratch = shared_bytes(g, o.max_context, o.kv_int8, o.kv_resident);
-    in.main_fixed = main_weights + scratch + (uint64_t) in.slots * slot_rest + prompt_line_main_bytes(g, bd, o.max_context);
+    in.main_fixed = main_weights + scratch + (uint64_t) in.slots * slot_rest + stage_main_bytes(g, bd);
     in.peer_fixed = scratch + 2ull * kChunk * g.n_embd * 2;   // its own scratch and the landing residuals
     in.main = main_card;
     in.peer = peer_card;

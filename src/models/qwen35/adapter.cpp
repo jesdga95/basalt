@@ -116,10 +116,22 @@ public:
         w.out_norm = floats(gg, "output_norm.weight", H, err);
         if (!w.out_norm || !linear(gg, "output", g.n_vocab, H, w.head, err)) return false;
         const int AQ = g.n_head * g.head_dim, KV = g.n_kv * g.head_dim;
+        // a layer split's later layers go to the second card (their own weights there; the main card's entries empty)
+        dense::Weights peer_w;
         for (int il = 0; il < g.n_layers; ++il) {
-            dense::Layer L;
-            if (!layer(gg, g, il, L, err)) return false;
+            dense::Layer L, P;
+            L.kind = P.kind = g.kinds[(size_t) il];
+            if (split_at_ > 0 && il >= split_at_) {
+                const uint64_t before = dev_bytes_;
+                const core::OnDevice on(req.peer_devices.front());
+                if (!layer(gg, g, il, P, err)) return false;
+                peer_bytes_ += dev_bytes_ - before;
+                dev_bytes_ = before;
+            } else if (!layer(gg, g, il, L, err)) {
+                return false;
+            }
             w.layers.push_back(L);
+            peer_w.layers.push_back(P);
         }
         if (want_block && !block_drafter(gg, w.dflash, H, err)) return false;
         if (want_mtp) {   // the pack's drafter layer, for --spec
@@ -148,8 +160,12 @@ public:
         basalt::log::info("basalt qwen35", "%zu tensors, %.2f GiB on the GPU, %.2f GiB of embedding in page-locked RAM; "
                           "%.2f GiB free", dev_.size(), (double) dev_bytes_ / 1073741824.0, (double) tensor_payload_bytes(*te) / 1073741824.0,
                           (double) free_b / 1073741824.0);
+        if (split_at_ > 0)
+            basalt::log::info("basalt qwen35", "layer split: %.2f GiB of layers %d-%d on CUDA%d", (double) peer_bytes_ / 1073741824.0, split_at_,
+                              g.n_layers - 1, req.peer_devices.front());
         o.host_embedding_bytes = tensor_payload_bytes(*te);
-        o.gpu_weight_bytes = dev_bytes_;
+        o.gpu_weight_bytes = dev_bytes_ + peer_bytes_;
+        o.layer_end = split_at_;
         if (o.vision) {
             core::ModelFile file;
             core::ModelSources srcs;
@@ -159,8 +175,10 @@ public:
         }
         const uint64_t need_b = dense::shared_bytes(g, o.max_context, o.kv_int8, o.kv_resident) +
                                 (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_int8,
-                                                                             o.kv_resident) +
-                                (req.peer_devices.empty() ? 0 : dense::prompt_line_main_bytes(g, w.dflash, o.max_context));
+                                                                             o.kv_resident, 0, split_at_) +
+                                (req.peer_devices.empty() ? 0
+                                 : split_at_ > 0           ? dense::stage_main_bytes(g, w.dflash)
+                                                           : dense::prompt_line_main_bytes(g, w.dflash, o.max_context));
         if (const uint64_t host_b = dense::session_host_bytes(g, o.max_context, o.kv_int8, o.kv_resident))
             basalt::log::info("basalt qwen35", "K/V streaming: %lld of %lld cells per attention layer in VRAM, %.2f GiB in page-locked "
                               "RAM per slot", (long long) dense::resident_cells(o.max_context, o.kv_resident), (long long) o.max_context,
@@ -174,6 +192,7 @@ public:
         }
         model_ = dense::make_model(g, w, o, err);
         if (!model_) return false;
+        if (split_at_ > 0) return dense::attach_split(*model_, req.peer_devices.front(), split_at_, peer_w, err);
         if (!req.peer_devices.empty()) prompt_line(gg, g, req.peer_devices.front(), o.max_context, o.kv_resident);
         return true;
     }
@@ -214,11 +233,10 @@ private:
             return false;
         }
         split_at_ = p.cut;
-        if (p.cut == 0) return true;
-        basalt::log::info("basalt qwen35", "layer split: layers 0-%d (%.2f GiB) on CUDA0, %d-%d (%.2f GiB) on CUDA%d", p.cut - 1,
-                          (double) p.main_bytes / 1073741824.0, p.cut, g.n_layers - 1, (double) p.peer_bytes / 1073741824.0, peer);
-        err = "qwen35: the model needs both cards (a layer split at layer " + std::to_string(p.cut) + "), which this build does not run yet";
-        return false;
+        if (p.cut > 0)
+            basalt::log::info("basalt qwen35", "layer split: layers 0-%d (%.2f GiB) on CUDA0, %d-%d (%.2f GiB) on CUDA%d", p.cut - 1,
+                              (double) p.main_bytes / 1073741824.0, p.cut, g.n_layers - 1, (double) p.peer_bytes / 1073741824.0, peer);
+        return true;
     }
 
     // A second card reads long prompts' last layers (dense::attach_prompt_line): their weights go to that card too.  Without
@@ -476,6 +494,7 @@ private:
     int fd_ = -1;
     std::vector<uint8_t> staging_;
     int split_at_ = 0;                   // the first layer on the second card (0: no split)
+    uint64_t peer_bytes_ = 0;            // the weights there
     core::LoadProgress* progress_ = nullptr;
 };
 

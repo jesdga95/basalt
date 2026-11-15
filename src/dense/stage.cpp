@@ -17,6 +17,7 @@
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/staged_copy.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
+#include "basalt/kernels/window_gemm.hpp"
 #include "basalt/log.hpp"
 
 #include <algorithm>
@@ -68,7 +69,9 @@ public:
 
     /// The stage on CUDA device `d` with layers [l, n) of `w` (their weights already on `d`), its chunk scratch, the landing
     /// buffers and the main card's outgoing ones; called with the main card current.
-    bool open(Model& main, int d, int l, const Weights& w, std::string& err);
+    /// `split`: the stage keeps its layers' cells and runs every window too (its model sized for decode windows of the main
+    /// card's context and sessions), and its landing buffers are its own.
+    bool open(Model& main, int d, int l, const Weights& w, bool split, std::string& err);
     /// Chunk slot k's residual (m.cs.x after the main card's layers, on `st`'s stream) on its way to the stage's card;
     /// `tail` (null: none) takes the chunk's drafter features too.  `again`: the slot held an earlier chunk.
     void send(Model& m, SessionState& st, int k, bool again, float* tail);
@@ -76,7 +79,10 @@ public:
     /// line_ev[2i + 1]; with `tail` >= 0 the rows of the drafter's target layers `tap_layers` (those at or past l0) go to
     /// tap_rows[tail].
     void read(SessionState& ps, int i, int k, bool again, int64_t p, const int32_t* p3, const int32_t* bnd, int l0,
-              const std::vector<int>& tap_layers, int tail, bool read_last);
+              const std::vector<int>& tap_layers, int tail, bool read_last, int T = kChunk, uint8_t* last = nullptr);
+    /// The layer split's: its decode hand-off (both models point at it).
+    SplitHand split_hand;
+    uint8_t* hand_mem = nullptr;                 // page-locked, mapped: split_hand's buffers
 };
 
 void StageDeleter::operator()(Stage* p) const { delete p; }
@@ -107,6 +113,7 @@ Stage::~Stage() {
     for (uint8_t* p : tap_rows) if (p) cudaFreeHost(p);
     if (state) cudaFreeHost(state);
     if (pos3) cudaFreeHost(pos3);
+    if (hand_mem) cudaFreeHost(hand_mem);
 }
 
 void Stage::send(Model& m, SessionState& st, int k, bool again, float* tail) {
@@ -123,10 +130,10 @@ void Stage::send(Model& m, SessionState& st, int k, bool again, float* tail) {
 }
 
 void Stage::read(SessionState& ps, int i, int k, bool again, int64_t p, const int32_t* p3, const int32_t* bnd, int l0,
-                 const std::vector<int>& tap_layers, int tail, bool read_last) {
+                 const std::vector<int>& tap_layers, int tail, bool read_last, int T, uint8_t* last) {
     const core::OnDevice on(dev);
     Model& lm = *model;
-    const int T = kChunk, n = lm.g.n_layers;
+    const int n = lm.g.n_layers;
     const size_t bytes = (size_t) T * lm.g.n_embd * 2;
     const cudaStream_t ls = ps.stream;
     // lands beside the read of the chunk before
@@ -151,6 +158,7 @@ void Stage::read(SessionState& ps, int i, int k, bool again, int64_t p, const in
         cudaEventRecord(taps_ready, ls);
     }
     chunk_layers(lm, ps, T, p, at, n, nullptr, read_last);
+    if (last) cudaMemcpyAsync(last, lm.cs.x, (size_t) T * lm.g.n_embd * 2, cudaMemcpyDeviceToHost, ls);
     cudaEventRecord(line_ev[2 * (size_t) i + 1], ls);
     cudaEventRecord(l_done[k], ls);
 }
@@ -489,7 +497,7 @@ static bool calibrate(Stage& L, Model& main, std::string& err) {
     return true;
 }
 
-bool Stage::open(Model& main, int d, int l, const Weights& w, std::string& err) {
+bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::string& err) {
     cudaGetDevice(&main_dev);
     dev = d;
     lo = l;
@@ -503,9 +511,14 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, std::string& err) 
     {
         const core::OnDevice on(dev);
         Options o = main.o;
-        o.max_context = kChunk;   // its decode scratch is never used: the stage reads prompt chunks only
-        o.sessions = 1;
-        o.spec = 0;
+        if (split) {
+            o.layer_begin = l;
+            o.layer_end = 0;
+        } else {
+            o.max_context = kChunk;   // its decode scratch is never used: the line reads prompt chunks only
+            o.sessions = 1;
+            o.spec = 0;
+        }
         o.draft = false;
         o.drafter = Drafter::None;
         o.vision = false;
@@ -517,6 +530,13 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, std::string& err) 
         model = make_model(g, lw, o, err);
         if (!model) return false;
         if (!model->ensure_chunk(err)) return false;
+        if (split) {   // the landing residuals
+            if (!arena.reserve(kSlots * T * H * 2 + 4096)) {
+                err = "out of device memory for its landing buffers";
+                return false;
+            }
+            for (uint16_t*& b : lin) b = arena.take<uint16_t>(T * H);
+        }
         bool ok = true;
         for (cudaStream_t* s : {&l_in}) ok = ok && cudaStreamCreateWithFlags(s, cudaStreamNonBlocking) == cudaSuccess;
         for (cudaEvent_t* set : {lin_ready, lin_free, l_done})
@@ -529,7 +549,7 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, std::string& err) 
     }
     {
         const core::OnDevice on(main_dev);
-        const size_t bytes = prompt_line_main_bytes(g, block ? bd : BlockDrafter{}, max_context);
+        const size_t bytes = stage_main_bytes(g, block ? bd : BlockDrafter{});
         if (cudaMalloc(&main_mem, bytes) != cudaSuccess) {
             err = "out of device memory for its buffers on the main card";
             return false;
@@ -556,6 +576,17 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, std::string& err) 
         return false;
     }
     if (!state_in.init(main_dev, dev, kStatePiece, err)) return false;
+    for (auto [evs, d2] : {std::pair{&main_ev, main_dev}, std::pair{&line_ev, dev}}) {   // a chunk's timing events
+        const core::OnDevice on(d2);
+        for (int j = 0; j < 2; ++j) {
+            cudaEvent_t e = nullptr;
+            if (cudaEventCreate(&e) != cudaSuccess) {
+                err = "cannot create CUDA events";
+                return false;
+            }
+            evs->push_back(e);
+        }
+    }
     // the second card's int8 prompt attention splits its keys as the main card's does, so its rows round the same
     kernels::gqa_prompt_plan_device(main_dev);
     return true;
@@ -570,7 +601,7 @@ StagePtr make_prompt_line(Model& main, int dev, int l_min, const Weights& w, std
         err = main.o.arch + ": the prompt line on CUDA" + std::to_string(dev) + ": " + what;
         return nullptr;
     };
-    if (!L.open(main, dev, l_min, w, err)) return fail(err);
+    if (!L.open(main, dev, l_min, w, false, err)) return fail(err);
     {   // its session: every GDN layer's state, the cells of its attention layers, and its streams for the cells going back
         const core::OnDevice on(dev);
         SessionState& s = L.st;
@@ -614,11 +645,14 @@ StagePtr make_prompt_line(Model& main, int dev, int l_min, const Weights& w, std
     return p;
 }
 
-uint64_t prompt_line_main_bytes(const Geometry& g, const BlockDrafter& drafter, int64_t max_context) {
-    if (max_context <= 2 * (int64_t) kChunk) return 0;
+uint64_t stage_main_bytes(const Geometry& g, const BlockDrafter& drafter) {
     const int n_tail = ring_tails(&drafter);   // and one more: the main card's first chunk's, kept aside
     const uint64_t T = kChunk, H = (uint64_t) g.n_embd;
     return Stage::kSlots * T * H * 2 + (uint64_t) (n_tail ? n_tail + 1 : 0) * T * H * 4;
+}
+
+uint64_t prompt_line_main_bytes(const Geometry& g, const BlockDrafter& drafter, int64_t max_context) {
+    return max_context <= 2 * (int64_t) kChunk ? 0 : stage_main_bytes(g, drafter);
 }
 
 bool attach_prompt_line(Model& m, int dev, int l_min, const Weights& w, std::string& err) {
@@ -849,6 +883,97 @@ bool prompt_line_read(Stage& L, Model& m, SessionState& st, const int32_t* token
     basalt::log::info("basalt dense", "prompt line: %d tokens, layers %d-%d of chunks 1-%d on CUDA%d; priced %.0f ms, %.0f ms alone", n,
                       l0, g.n_layers - 1, lc, L.dev, plan.ms, plan.alone_ms);
     return true;
+}
+
+void PeerStateDeleter::operator()(SessionState* s) const {
+    const core::OnDevice on(s->dev);
+    free_state(*s);
+    delete s;
+}
+
+bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err) {
+    const Geometry& g = m.g;
+    const size_t H = (size_t) g.n_embd, slot = (size_t) kBatch * H * 2;
+    int main_dev = 0;
+    cudaGetDevice(&main_dev);
+    // the second card's window products plan as the main card's (before its model sizes their workspace), so its rows round
+    // as the main card's
+    kernels::wgemm::plan_device(main_dev);
+    StagePtr p(new Stage());
+    Stage& L = *p;
+    const auto fail = [&](const std::string& what) {
+        err = m.o.arch + ": the layer split on CUDA" + std::to_string(dev) + ": " + what;
+        return false;
+    };
+    if (!L.open(m, dev, cut, w, true, err)) return fail(err);
+    SplitHand& h = L.split_hand;
+    const BlockDrafter& bd = m.w.dflash;
+    if (m.o.drafter == Drafter::Block)
+        for (size_t j = 0; j < bd.target_layers.size(); ++j)
+            if (bd.target_layers[j] >= cut) {
+                if (h.taps.empty()) h.first_tap = j;
+                h.taps.push_back(bd.target_layers[j]);
+            }
+    const size_t bytes = slot * (2 + h.taps.size()) + 256;
+    void* dptr = nullptr;
+    if (cudaHostAlloc((void**) &L.hand_mem, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostGetDevicePointer(&dptr, L.hand_mem, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        L.hand_mem = nullptr;
+        return fail("out of page-locked memory for its hand-off");
+    }
+    std::memset(L.hand_mem, 0, bytes);
+    uint8_t* at = (uint8_t*) dptr;
+    h.flag = (uint32_t*) at;
+    h.fwd = (uint16_t*) (at + 256);
+    h.ret = (uint16_t*) (at + 256 + slot);
+    m.hand = &h;
+    L.model->hand = &h;
+    m.split_model = L.model.get();
+    m.split_dev = dev;
+    basalt::log::info("basalt dense", "layer split: CUDA%d runs layers %d-%d of every window and prompt chunk; its products planned as "
+                      "CUDA%d's", dev, cut, g.n_layers - 1, main_dev);
+    m.split = std::move(p);
+    return true;
+}
+
+bool split_session(Model& m, SessionState& st, std::string& err) {
+    st.peer.reset(new SessionState());
+    st.peer->dev = m.split_dev;
+    const core::OnDevice on(m.split_dev);
+    return init_state(*m.split_model, *st.peer, err);
+}
+
+bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos, const int32_t* pos3,
+                 std::string& err) {
+    Stage& L = *m.split;
+    const Geometry& g = m.g;
+    if (!m.ensure_chunk(err)) return false;
+    const bool block = m.o.drafter == Drafter::Block, mtp = st.mtp_kc != nullptr;
+    const BlockDrafter& bd = m.w.dflash;
+    const SplitHand& h = L.split_hand;
+    const size_t bytes = (size_t) T * g.n_embd * 2;
+    // the bounds and positions page-locked (the stage's uploads are queued)
+    int32_t* bnd = L.pos3;
+    bnd[0] = 0;
+    bnd[1] = T;
+    std::memcpy(L.pos3 + 4, pos3, (size_t) T * 3 * sizeof(int32_t));
+    const cudaStream_t ms = st.stream;
+    // the main card's layers, the residual across, the second card's layers; the rows of the drafter's target layers there (and
+    // with an MTP drafter the last layer's) come back
+    chunk_start(m, st, tokens, rows, T, L.pos3 + 4, bnd);
+    chunk_layers(m, st, T, pos, 0, L.lo, block ? &bd : nullptr);
+    L.send(m, st, 0, false, nullptr);
+    const bool taps = block && !h.taps.empty();
+    const bool read_last = mtp || (taps && h.taps.back() == g.n_layers - 1);
+    L.read(*st.peer, 0, 0, false, pos, L.pos3 + 4, bnd, L.lo, h.taps, taps ? 0 : -1, read_last, T, mtp ? L.hand[1] : nullptr);
+    cudaStreamWaitEvent(ms, L.l_done[0], 0);
+    for (size_t q = 0; taps && q < h.taps.size(); ++q) {   // their features after the main card's, in order
+        cudaMemcpyAsync(m.cs.x, L.tap_rows[q], bytes, cudaMemcpyHostToDevice, ms);
+        chunk_tap(m, st, T, bd, h.first_tap + q);
+    }
+    if (mtp) cudaMemcpyAsync(m.cs.x, L.hand[1], bytes, cudaMemcpyHostToDevice, ms);
+    return chunk_finish(m, st, T, pos, err);
 }
 
 }  // namespace basalt::dense

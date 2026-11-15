@@ -12,7 +12,11 @@
 #include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/prefill/fp8_gemm.hpp"
 
+#include "basalt/core/on_device.hpp"
+#include "basalt/kernels/elementwise.hpp"
+
 #include <algorithm>
+#include <atomic>
 #include <initializer_list>
 #include <cstddef>
 #include <vector>
@@ -73,12 +77,6 @@ const void* wnorm(Model& m, const uint16_t* x, const float* w, float* xn, int ty
     }
     kernels::rms_norm_rows(x, w, xn, T, cols, eps, s);
     return wact(m, xn, type, cols, T, s);
-}
-// the BF16 residual rows readied for a product: as they are on the window gemm, else widened and quantized
-const void* resid_act(Model& m, const Linear& l, int T, cudaStream_t s) {
-    if (on_wg(l.type)) return m.ws.x;
-    kernels::to_f32(m.ws.x, m.ws.tmp, (int64_t) T * l.cols, s);
-    return wact(m, m.ws.tmp, l.type, l.cols, T, s);
 }
 // the window's first rows: the embedding (BF16 in the pack) into the BF16 residual, exactly
 void embed_rows(Model& m, const int32_t* tok, int T, cudaStream_t s) {
@@ -595,6 +593,57 @@ void commit_window(Model& m, SessionState& st, int n, cudaStream_t s) {
 
 namespace {
 
+// The block drafter's features of target layer j: its rows (`rows16`, the BF16 residual after it) through its block of the
+// projection into `dacc` (j == 0 writes it, later ones add).
+void win_tap(Model& m, size_t j, const uint16_t* rows16, float* dacc, int T, cudaStream_t s) {
+    const Linear& fc = m.bd_dec.fc[j];
+    const void* xq = rows16;
+    if (!on_wg(fc.type)) {
+        kernels::to_f32(rows16, m.ws.tmp, (int64_t) T * fc.cols, s);
+        xq = wact(m, m.ws.tmp, fc.type, fc.cols, T, s);
+    }
+    prod(m, fc, xq, j == 0 ? dacc : m.ws.tmp, T, s);
+    if (j > 0) kernels::add_scaled(dacc, m.ws.tmp, nullptr, (int64_t) T * m.g.n_embd, s);
+}
+
+// A window's layers [m.lb, m.le) of `rows` rows in m.ws.x, the drafter's features of its target layers into `dacc`; on a layer
+// split, the window's first rows from the main card (the second card's model) and its later layers' rows from the second
+// card (the main card's), each card raising the other's flag (SplitHand).  `layer` runs one layer.
+template <class LayerFn>
+void window_layers(Model& m, int rows, float* dacc, LayerFn layer, cudaStream_t s) {
+    const Geometry& g = m.g;
+    WindowScratch& b = m.ws;
+    const SplitHand* h = m.hand;
+    const int64_t half = (int64_t) rows * g.n_embd / 2;   // the rows' BF16 values, as floats for the mapped copies
+    const size_t slot = (size_t) kBatch * g.n_embd;
+    const BlockDrafter& bd = m.bd_dec;
+    const bool block = m.o.drafter == Drafter::Block;
+    if (m.lb > 0) {
+        kernels::wait_flag_ge(h->flag, 1, s);
+        kernels::copy_from_mapped((float*) b.x, (const float*) h->fwd, half, s);
+    }
+    size_t next_target = 0, next_tap = 0;
+    for (int il = m.lb; il < m.le; ++il) {
+        layer(il);
+        if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) win_tap(m, next_target++, b.x, dacc, rows, s);
+        if (m.lb > 0 && next_tap < h->taps.size() && h->taps[next_tap] == il)
+            kernels::copy_from_mapped((float*) (h->ret + (1 + next_tap++) * slot), (const float*) b.x, half, s);
+    }
+    if (m.lb > 0) {   // the second card: its last rows back
+        kernels::copy_from_mapped((float*) h->ret, (const float*) b.x, half, s);
+        kernels::signal_flag(h->flag + 1, 1, s);
+    } else if (h) {   // the main card: on to the second card, then its rows back and the features of its target layers
+        kernels::copy_from_mapped((float*) h->fwd, (const float*) b.x, half, s);
+        kernels::signal_flag(h->flag, 1, s);
+        kernels::wait_flag_ge(h->flag + 1, 1, s);
+        kernels::copy_from_mapped((float*) b.x, (const float*) h->ret, half, s);
+        for (size_t q = 0; block && q < h->taps.size(); ++q) {
+            kernels::copy_from_mapped((float*) b.hq, (const float*) (h->ret + (1 + q) * slot), half, s);
+            win_tap(m, h->first_tap + q, (const uint16_t*) b.hq, dacc, rows, s);
+        }
+    }
+}
+
 // The window's work on the device, all of it from device inputs (tokens, positions, rows, first cell), so it can be
 // captured once per row count and replayed at any position.
 void window_body(Model& m, SessionState& st, int T, int64_t pos) {
@@ -604,11 +653,8 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
     const cudaStream_t s = st.stream;
     const int H = g.n_embd;
     kernels::PdlScope pdl(true);   // the window gemm and its packs start early: their weights are read meanwhile
-    embed_rows(m, b.tok, T, s);
-    const BlockDrafter& bd = m.bd_dec;
-    const bool block = m.o.drafter == Drafter::Block;
-    size_t next_target = 0;
-    for (int il = m.lb; il < m.le; ++il) {
+    if (m.lb == 0) embed_rows(m, b.tok, T, s);
+    window_layers(m, T, st.dacc, [&](int il) {
         const Layer& L = w.layers[(size_t) il];
         if (L.kind == Mixer::Gdn) {
             win_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
@@ -617,28 +663,25 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
             win_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], st.far_kv[(size_t) ai]);
         }
         win_ffn(m, L, T, s);
-        if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) {
-            // the block drafter's features: this layer's rows through its block of the projection, summed
-            const Linear& fc = bd.fc[next_target];
-            prod(m, fc, resid_act(m, fc, T, s), next_target == 0 ? st.dacc : b.tmp, T, s);
-            if (next_target > 0) kernels::add_scaled(st.dacc, b.tmp, nullptr, (int64_t) T * H, s);
-            ++next_target;
-        }
-    }
+    }, s);
+    if (m.lb > 0) return;   // the second card of a split has no head
     prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, T, g.eps, s), st.logits, T, s);
     if (st.hid) cudaMemcpyAsync(st.hid, b.xn, (size_t) T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);   // the drafter's
 }
 
 }  // namespace
 
-bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3,
-                    std::string& err) {
+namespace {
+
+// One card's window: its inputs uploaded, then its graph for T rows (the first window of T rows runs as launched, then is
+// captured for the next ones).  `tokens` null: the card takes its rows from the other (a split's second card).
+bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3, std::string& err) {
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
     const int32_t bounds[2] = {0, T}, first[2] = {(int32_t) pos, 0};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.pos0, first, sizeof first, cudaMemcpyHostToDevice, s);
-    cudaMemcpyAsync(b.tok, tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    if (tokens) cudaMemcpyAsync(b.tok, tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.pos, pos3, (size_t) T * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     // a one-row window writes the other state buffer (st.alt_ready); the graph is the one of the buffer in use
     st.alt_ready = T == 1 && st.gdn_alt != nullptr;
@@ -647,8 +690,14 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
         if (cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
         return cuda_ok("dense window", err);
     }
-    window_body(m, st, T, pos);   // the first window of T rows runs as launched, then is captured for the next ones
-    if (!cuda_ok("dense window", err)) return false;
+    // The first window of T rows runs as launched, then is captured for the next ones.  A layer split's window waits on the
+    // other card's inside its graph: it is captured first and only its graph runs, so no kernel loads lazily (which waits for
+    // the card to idle) while a wait holds the card.
+    const bool split = m.hand != nullptr;
+    if (!split) {
+        window_body(m, st, T, pos);
+        if (!cuda_ok("dense window", err)) return false;
+    }
     cudaGraph_t graph = nullptr;
     if (cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed) != cudaSuccess) return cuda_ok("dense window capture", err);
     window_body(m, st, T, pos);
@@ -658,9 +707,30 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
         return cuda_ok("dense window capture", err);
     }
     cudaGraphDestroy(graph);
-    return true;
+    if (split && cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
+    return cuda_ok("dense window", err);
 }
 
+// The split's flags lowered for the next window: both cards are past the last one's (the main card's stream has met the
+// second card's flag, and the second card met the main card's before raising it).
+void lower_flags(SplitHand& h) {
+    volatile uint32_t* f = h.flag;
+    f[0] = 0;
+    f[1] = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+}  // namespace
+
+bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3,
+                    std::string& err) {
+    if (m.split) {   // the second card's graph first: it waits for the main card's rows
+        lower_flags(*m.hand);
+        const core::OnDevice on(m.split_dev);
+        if (!launch_window(*m.split_model, *st.peer, nullptr, T, pos, pos3, err)) return false;
+    }
+    return launch_window(m, st, tokens, T, pos, pos3, err);
+}
 
 namespace {
 
@@ -747,23 +817,15 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
     const int H = g.n_embd;
     {
         kernels::PdlScope pdl(true);
-        embed_rows(m, b.tok, rows, s);
-        const BlockDrafter& bd = m.bd_dec;
-        const bool block = m.o.drafter == Drafter::Block;
-        size_t next_target = 0;
-        for (int il = m.lb; il < m.le; ++il) {
+        if (m.lb == 0) embed_rows(m, b.tok, rows, s);
+        // the block drafter's features packed in b.dacc until every session has its own
+        window_layers(m, rows, b.dacc, [&](int il) {
             const Layer& L = w.layers[(size_t) il];
             if (L.kind == Mixer::Gdn) batch_gdn(m, L, m.gdn_index[(size_t) il], segs, S, rows, max_n, s);
             else batch_attn(m, L, m.attn_index[(size_t) il], segs, S, rows, s);
             win_ffn(m, L, rows, s);
-            if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) {
-                // the block drafter's features, packed in b.dacc until every session has its own
-                const Linear& fc = bd.fc[next_target];
-                prod(m, fc, resid_act(m, fc, rows, s), next_target == 0 ? b.dacc : b.tmp, rows, s);
-                if (next_target > 0) kernels::add_scaled(b.dacc, b.tmp, nullptr, (int64_t) rows * H, s);
-                ++next_target;
-            }
-        }
+        }, s);
+        if (m.lb > 0) return;   // the second card of a split has no head
         prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, rows, g.eps, s), b.hl, rows, s);
     }
     int row = 0;
@@ -780,7 +842,10 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
 
 }  // namespace
 
-bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
+namespace {
+
+// One card's batch window (forward_batch); `tokens` null on a split's second card.
+bool launch_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
     WindowScratch& b = m.ws;
     const cudaStream_t s = segs[0].st->stream;
     int rows = 0, max_n = 1;
@@ -800,7 +865,7 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
     const int32_t bounds[2] = {0, rows};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.btab, &tab, sizeof tab, cudaMemcpyHostToDevice, s);
-    cudaMemcpyAsync(b.tok, tokens, (size_t) rows * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    if (tokens) cudaMemcpyAsync(b.tok, tokens, (size_t) rows * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.pos, pos3, (size_t) rows * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     for (Model::BatchGraph& bg : m.batch_graphs)
         if (bg.key == key) {
@@ -808,8 +873,13 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
             if (cudaGraphLaunch(bg.exec, s) != cudaSuccess) return cuda_ok("dense batch graph", err) && false;
             return cuda_ok("dense batch window", err);
         }
-    batch_body(m, segs, S, rows, max_n);   // a composition's first window runs as launched, then is captured for the next ones
-    if (!cuda_ok("dense batch window", err)) return false;
+    // a composition's first window runs as launched, then is captured for the next ones (a layer split's: only captured, as
+    // launch_window's)
+    const bool split = m.hand != nullptr;
+    if (!split) {
+        batch_body(m, segs, S, rows, max_n);
+        if (!cuda_ok("dense batch window", err)) return false;
+    }
     cudaGraph_t graph = nullptr;
     if (cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed) != cudaSuccess) return cuda_ok("dense batch capture", err);
     batch_body(m, segs, S, rows, max_n);
@@ -826,7 +896,21 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
         m.batch_graphs.erase(old);
     }
     m.batch_graphs.push_back({std::move(key), exec, ++m.batch_clock});
-    return true;
+    if (split && cudaGraphLaunch(exec, s) != cudaSuccess) return cuda_ok("dense batch graph", err) && false;
+    return cuda_ok("dense batch window", err);
+}
+
+}  // namespace
+
+bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
+    if (m.split) {   // the second card's sessions, their graph first: it waits for the main card's rows
+        lower_flags(*m.hand);
+        std::vector<BatchSeg> ps((size_t) S);
+        for (int k = 0; k < S; ++k) ps[(size_t) k] = {segs[k].st->peer.get(), segs[k].T, segs[k].pos};
+        const core::OnDevice on(m.split_dev);
+        if (!launch_batch(*m.split_model, ps.data(), S, nullptr, pos3, err)) return false;
+    }
+    return launch_batch(m, segs, S, tokens, pos3, err);
 }
 
 void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, const int32_t* pos3,
@@ -946,6 +1030,7 @@ bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& e
 
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
                    const int32_t* pos3, std::string& err) {
+    if (m.split) return split_chunk(m, st, tokens, rows, T, pos, pos3, err);
     if (!m.ensure_chunk(err)) return false;
     chunk_start(m, st, tokens, rows, T, pos3);
     chunk_layers(m, st, T, pos, 0, m.g.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
