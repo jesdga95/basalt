@@ -688,7 +688,7 @@ if(BUILD_TESTING)
     set_tests_properties(ffmpeg_abi_test PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 endif()
-add_dependencies(basalt-bench git_stamp)
+add_dependencies(basalt-bench basalt basalt-device git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_link_libraries(basalt-bench PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
 basalt_embed_manifest(basalt-bench)
@@ -703,6 +703,7 @@ target_compile_definitions(basalt-bench PRIVATE
 # basalt-probe: starts the engine, measures its rates and cold decode speed, prints a report
 add_executable(basalt-probe src/program/probe_main.cpp)
 set_target_properties(basalt-probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+add_dependencies(basalt-probe basalt)
 target_link_libraries(basalt-probe PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
 basalt_embed_manifest(basalt-probe)
 target_compile_definitions(basalt-probe PRIVATE
