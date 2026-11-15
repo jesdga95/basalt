@@ -598,7 +598,7 @@ add_executable(basalt src/program/generate.cpp
                        src/program/cli/serve.cpp
                        src/program/cli/startup.cpp
                        src/program/cli/gpu.cpp)
-set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+basalt_ship_to_bin(basalt)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt PRIVATE models serve_shared engine_session ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
@@ -648,7 +648,7 @@ basalt_embed_manifest(tokenizer_bench)
 basalt_cpu_test(NAME tokenizer_test COMMAND tokenizer_test)
 set_tests_properties(tokenizer_test PROPERTIES TIMEOUT 60)
 add_executable(basalt-bench src/program/bench_main.cpp)
-set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+basalt_ship_to_bin(basalt-bench)
 # the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
 add_subdirectory(tools/vision)
 if(BASALT_MODEL_QWEN4EXP)
@@ -705,7 +705,7 @@ target_compile_definitions(basalt-bench PRIVATE
 
 # basalt-probe: starts the engine, measures its rates and cold decode speed, prints a report
 add_executable(basalt-probe src/program/probe_main.cpp)
-set_target_properties(basalt-probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+basalt_ship_to_bin(basalt-probe)
 add_dependencies(basalt-probe basalt)
 target_link_libraries(basalt-probe PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
 basalt_embed_manifest(basalt-probe)
