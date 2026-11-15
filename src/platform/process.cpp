@@ -3,6 +3,7 @@
 
 #include "basalt/core/progress.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/system.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -18,6 +19,7 @@
 #include <fcntl.h>   // _O_BINARY, _O_WRONLY, _O_RDONLY
 #include <io.h>      // _open_osfhandle, _read, _write, _close
 #else
+#include <execinfo.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
@@ -350,6 +352,14 @@ void append_crash_stage(CrashBuf& b) noexcept {
         b.puts(" chunk ");
         b.put_i64(chunk);
     }
+    const ProcessMemory pm = process_memory();
+    if (pm.rss_mib > 0 || pm.avail_mib > 0) {
+        b.puts(", ");
+        b.put_u64(pm.rss_mib);
+        b.puts(" MiB RSS, ");
+        b.put_u64(pm.avail_mib);
+        b.puts(" MiB RAM free");
+    }
 }
 
 void write_crash_line(const CrashBuf& b) noexcept {
@@ -362,6 +372,26 @@ void write_crash_line(const CrashBuf& b) noexcept {
 #else
     const ssize_t r = ::write(STDERR_FILENO, b.data, b.n);
     (void) r;
+#endif
+}
+
+void write_crash_backtrace() noexcept {
+    void* frames[24]{};
+#if defined(_WIN32)
+    const USHORT n = CaptureStackBackTrace(0, 24, frames, nullptr);
+    if (n > 0) {
+        CrashBuf b;
+        b.puts("basalt crash: error: backtrace:");
+        for (USHORT i = 0; i < n; ++i) {
+            b.putc(' ');
+            b.put_hex((uintptr_t) frames[i]);
+        }
+        b.putc('\n');
+        write_crash_line(b);
+    }
+#else
+    const int n = ::backtrace(frames, 24);
+    if (n > 0) ::backtrace_symbols_fd(frames, n, STDERR_FILENO);
 #endif
 }
 
@@ -381,6 +411,7 @@ void on_terminate() noexcept {
         append_crash_stage(b);
         b.putc('\n');
         write_crash_line(b);
+        write_crash_backtrace();
     }
     std::abort();
 }
@@ -420,6 +451,7 @@ LONG WINAPI on_win_exception(EXCEPTION_POINTERS* ep) noexcept {
         append_crash_stage(b);
         b.putc('\n');
         write_crash_line(b);
+        write_crash_backtrace();
     }
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -446,6 +478,7 @@ void on_crash_signal(int sig, siginfo_t* info, void*) noexcept {
         append_crash_stage(b);
         b.putc('\n');
         write_crash_line(b);
+        write_crash_backtrace();
     }
     (void) ::raise(sig);
 }

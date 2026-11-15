@@ -94,6 +94,14 @@ class DeathNote(unittest.TestCase):
         self.assertIn("/tmp/fake-engine.log", out)
         self.assertIn("restarting it", out)
 
+    def test_rotate_log_moves_oversized_file_to_dot_1(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "engine.log"
+            log.write_text("old crash\n", encoding="utf-8")
+            ProcessEngine._rotate_log(str(log), max_bytes=5)
+            self.assertFalse(log.exists())
+            self.assertEqual((Path(d) / "engine.log.1").read_text(encoding="utf-8"), "old crash\n")
+
 
 if __name__ == "__main__":
     unittest.main()

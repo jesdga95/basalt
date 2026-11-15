@@ -261,6 +261,8 @@ class ProcessEngine:
         if lazy:
             return
         self.unloaded = False            # `ended` stays True until READY
+        if log:
+            self._rotate_log(log)
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: stops the narrator
         log_start = os.path.getsize(log) if log else 0  # where this start's log lines begin
@@ -452,6 +454,14 @@ class ProcessEngine:
         0xC0000409: "STATUS_STACK_BUFFER_OVERRUN",
         0xE06D7363: "C++ exception",
     }
+
+    @staticmethod
+    def _rotate_log(path: str, max_bytes: int = 10 << 20) -> None:
+        try:
+            if os.path.getsize(path) >= max_bytes:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
 
     @classmethod
     def _format_exit_status(cls, rc: int | None) -> str:
