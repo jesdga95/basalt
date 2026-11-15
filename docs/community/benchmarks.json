@@ -2182,6 +2182,41 @@
       "draft_len_struct": 6.4,
       "draft_len_prose": 1.8,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+    },
+    {
+      "submitter": "neuro",
+      "date": "2026-11-15",
+      "commit": "d7347724b7",
+      "preset": "community-1",
+      "model": "Qwen3.8-27B",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 500,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 27.1
+        }
+      ],
+      "ram_gib": 123,
+      "cpu": "13th Gen Intel Core i9-13900F, 24 cores",
+      "ram_gbps": 79.6,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 14504.7,
+      "prefill_64k_tps": 10268.7,
+      "decode_tps": 505.5,
+      "decode_conv_tps": 244.5,
+      "decode_struct_tps": 815.9,
+      "decode_prose_tps": 206.3,
+      "accept_conv_pct": 45.9,
+      "accept_struct_pct": 86.2,
+      "accept_prose_pct": 33.3,
+      "draft_len_conv": 4.8,
+      "draft_len_struct": 14.0,
+      "draft_len_prose": 5.2,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     }
   ]
 }
