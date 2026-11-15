@@ -31,6 +31,18 @@ struct KvInt8 {
     uint16_t* vs = nullptr;
 };
 
+/// A cache in two places: cells from `at` on are in these buffers instead (cell c at row c - at there, the same layout:
+/// fp16 `k`, `v`, or the int8 `q8`), cells below `at` in the main ones.  A cache streamed from page-locked host memory
+/// keeps its first `at` cells on the card and the rest here (device-mapped); a prompt chunk reads a VRAM copy of them.
+/// Every kernel that takes one reads and writes each cell where it lives and computes exactly what it computes on one
+/// buffer.  The default: one buffer.
+struct KvFar {
+    int64_t at = INT64_MAX;
+    uint16_t* k = nullptr;
+    uint16_t* v = nullptr;
+    KvInt8 q8 = {};
+};
+
 /// Scratch floats gqa_decode_attn needs for up to `max_cells` cells and `T` rows (gqa_window_attn: cells its window
 /// spans plus the window's rows).
 size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_dim = 256);
@@ -38,7 +50,7 @@ size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_
 void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int T, float* scratch, int64_t max_cells, float* out, void* stream,
                      const int32_t* pos_dev = nullptr, KvInt8 q8 = {}, const float* gate_q = nullptr,
-                     uint16_t* gated16 = nullptr);
+                     uint16_t* gated16 = nullptr, KvFar far = {});
 /// (gate_q, gated16: also each head's output times sigmoid of its gate, q_full [T][n_head][512]'s second half, as bf16
 /// rows [T][n_head * 256] into gated16 (bitwise attn_gate, then rounded); `out` may then be null.)
 /// One window of each of several sequences (a batch window's segments) in one launch: segment k's rows follow segment
@@ -51,6 +63,7 @@ struct GqaSeg {
     int64_t pos0 = 0;
     const int32_t* pos_dev = nullptr;
     KvInt8 q8 = {};
+    KvFar far = {};
 };
 void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* segs, int n_seg, float* scratch,
                           int64_t max_cells, float* out, void* stream, const float* gate_q = nullptr,
@@ -68,9 +81,9 @@ size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits);
 /// `split_scratch` (optional, `split_floats` floats): lets an int8-cache launch split its cells over more blocks.
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8 = {}, float* split_scratch = nullptr,
-                     size_t split_floats = 0);
+                     size_t split_floats = 0, KvFar far = {});
 /// The prompt chunk's form on an int8 cache: BF16 queries and BF16 output rows (the same arithmetic; the output rounded once).
 void gqa_prompt_attn_bf16(const uint16_t* q, int n_head, int n_kv, int64_t pos0, int64_t T, uint16_t* out, void* stream,
-                          KvInt8 q8, float* split_scratch = nullptr, size_t split_floats = 0);
+                          KvInt8 q8, float* split_scratch = nullptr, size_t split_floats = 0, KvFar far = {});
 
 }  // namespace basalt::kernels
