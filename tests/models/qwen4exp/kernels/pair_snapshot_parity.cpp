@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 
+#include "basalt/kernels/elementwise.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 
 namespace {
