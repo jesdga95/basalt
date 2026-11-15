@@ -169,7 +169,7 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
     if (disk_wants && n_st == 0 && disk_stream > 0 && (to_disk || !whole_ok)) {
         reuse = {};   // its RAM goes before the write
         const size_t need = basalt::core::ConversationStore::write_bytes(live.size());
-        if (!capture_admit(need, floor)) {
+        if (!admit_streamed(need, floor)) {
             basalt::log::info("basalt serve", "conversation cache: skip parking (physical RAM admission; need %zu MiB "
                               "to write from the session)", need >> 20);
             return true;
@@ -318,7 +318,7 @@ size_t QfnRuntime::spill_to_disk(bool at_exit, size_t limit) {
         size_t bytes = 0;
         std::string se;
         if (disk_stream > 0) {   // from the session, with no image of it in RAM
-            if (!capture_admit(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
+            if (!admit_streamed(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
                 basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM "
                                   "admission)", ids.size());
                 return;
@@ -503,7 +503,7 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     double& noted = b >= 0 ? bs[(size_t) b].park_noted : solo_park_noted;   // what is said once per idle stretch
     const double since = b >= 0 ? bs[(size_t) b].idle_busy : solo_idle_busy;
     if (disk_takes && !on_disk && disk_stream > 0 &&
-        capture_admit(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
+        admit_streamed(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
         ckd_finish();   // the write reads its checkpoints' bytes
         // its own K/V from the session, its draft layer's from the store that holds it
         basalt::core::ConversationSource src;

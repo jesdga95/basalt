@@ -235,14 +235,17 @@ Flow Request::restore() {
         std::string de;
         bool admitted = runtime_.capture_admit(need, floor);
         const bool in_files = disk_kv_in_files(admitted);
+        const int64_t wanted = on_disk.tokens;
         if (in_files) {   // only the running states come to RAM
             need = runtime_.disk.load_bytes(on_disk, false);
-            admitted = runtime_.capture_admit(need, floor);
+            admitted = runtime_.admit_streamed(need, floor);
+            // what left RAM for it went into the disk tier's index: the match is looked up again
+            on_disk = runtime_.disk.best(ids32.data(), ids32.size(), runtime_.req_imgs, want_cvec);
+            admitted = admitted && on_disk.tokens == wanted;
         }
         if (!admitted) {
             basalt::log::info("basalt serve", "conversation cache: %lld tokens on disk not read (physical RAM "
-                              "admission; need %llu MiB)", (long long) on_disk.tokens,
-                              (unsigned long long) (need >> 20));
+                              "admission; need %llu MiB)", (long long) wanted, (unsigned long long) (need >> 20));
         } else if (!runtime_.disk.load(on_disk, image, de, in_files ? &incoming_kv : nullptr)) {
             incoming_kv.reset();
             basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
