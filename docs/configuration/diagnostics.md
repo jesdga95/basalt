@@ -12,7 +12,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--greedy` | CLI | on | Argmax decoding. |
 | `--seed` | CLI | | Sample with this seed under `--top-k` 20, `--top-p` 0.95, `--temperature` 1.0. |
 | `--stop-eos` | CLI | off | Stop at an end-of-turn token. |
-| `--eos-ids` | engine | `248044,248046` | The end-of-turn tokens. |
+| `--eos-ids` | engine | the pack's | The end-of-turn tokens. |
 | `--gpu-plan` | engine | | Print the `--gpu` choice as JSON and exit. |
 
 ## Timing and profiles

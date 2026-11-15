@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash
 
-Runs with the same command as any model: `basalt serve PACK`. What it supports next to Flash-Next: [models](index.md). Rounding and
+Runs with the same command as any model: `basalt serve PACK`. What it supports next to the others: [models](index.md). Rounding and
 quality: [precision](../precision/deepseek41.md).
 
 ## Pack
