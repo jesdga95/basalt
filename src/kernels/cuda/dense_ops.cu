@@ -305,6 +305,10 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         const float ang = (float) pos[t * 3 + rope.axis[i]] * inv_freq;
         float sn, cs;
         sincosf(ang, &sn, &cs);
+        if (rope.mscale != 1.0f) {
+            sn *= rope.mscale;
+            cs *= rope.mscale;
+        }
         y = d < half ? y * cs - xs[d + half] * sn : y * cs + xs[d - half] * sn;
     }
     if (is_q) {
@@ -591,6 +595,31 @@ void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, c
     check("gdn_gating_proj");
 }
 
+namespace {
+// Each pair's inverse frequency and the magnitude correction, once on the host in double.  Unscaled: theta^(-2i/rot).
+// Scaled: ggml's rope_yarn on the frequency instead of the angle (the angle is the position times it): the
+// interpolated frequency freq_scale theta^(-2i/rot), blended toward the trained one by the ramp at pair i times
+// ext_factor; cos and sin times mscale.
+RopeSpec rope_tables(const RopeSpec& rope) {
+    RopeSpec r = rope;
+    const RopeScaling& sc = rope.scaling;
+    if (sc.type == RopeScalingType::None) {
+        for (int i = 0; i < rope.rot / 2; ++i) r.inv_freq[i] = (float) std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+        return r;
+    }
+    const double fs = sc.freq_scale();
+    double cd[2];
+    sc.corr_dims(rope.rot, cd);
+    for (int i = 0; i < rope.rot / 2; ++i) {
+        const double extrap = std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+        const double mix = sc.ext_factor != 0 ? (double) rope_yarn_ramp((float) cd[0], (float) cd[1], i) * sc.ext_factor : 0.0;
+        r.inv_freq[i] = (float) (fs * extrap * (1.0 - mix) + extrap * mix);
+    }
+    r.mscale = (float) sc.mscale();
+    return r;
+}
+}  // namespace
+
 void attn_qk_prepare(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
                      float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv,
                      float* q_out, uint16_t* k_cache, uint16_t* v_cache, int64_t cell0, void* stream, int hd, bool gated,
@@ -602,9 +631,7 @@ void attn_qk_prepare(const float* q_full, const float* k, const float* v, const 
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head + n_kv));
     const int qs = gated ? 2 * hd : hd;
-    // each pair's inverse frequency, once on the host in double (the kernel used to take a double pow per thread)
-    RopeSpec r = rope;
-    for (int i = 0; i < rope.rot / 2; ++i) r.inv_freq[i] = (float) std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+    const RopeSpec r = rope_tables(rope);
     if (hd == 256)
         launch_pdl(attn_qk_prepare_kernel<256>, grid, dim3(256), 0, (cudaStream_t) stream, q_full, k, v, q_norm, k_norm, eps, r,
                    pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8);
@@ -623,8 +650,7 @@ void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint1
         std::exit(1);
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head + n_kv));
-    RopeSpec r = rope;
-    for (int i = 0; i < rope.rot / 2; ++i) r.inv_freq[i] = (float) std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+    const RopeSpec r = rope_tables(rope);
     const __nv_bfloat16* qf = reinterpret_cast<const __nv_bfloat16*>(q_full);
     const __nv_bfloat16* kk = reinterpret_cast<const __nv_bfloat16*>(k);
     const __nv_bfloat16* vv = reinterpret_cast<const __nv_bfloat16*>(v);

@@ -1,6 +1,6 @@
 // tests/kernels/gqa_attn_parity.cpp - gqa_decode_attn and gqa_prompt_attn (basalt/kernels/gqa_attn.hpp) and
 // attn_qk_prepare (dense_ops.hpp) against a CPU reference in double precision, at the Qwen3.5-27B attention geometry
-// (24 query heads, 4 KV heads, 256 wide, 64 rotated dims, interleaved M-RoPE sections 11/11/10).
+// (24 query heads, 4 KV heads, 256 wide, 64 rotated dims, interleaved M-RoPE sections 11/11/10), unscaled and under YaRN.
 //
 // Checks: each kernel's max absolute and relative error to the reference (the int8 prompt kernel's narrow, split and
 // 8-warp launches); a decode row's output is bitwise the same
@@ -81,8 +81,10 @@ int main(int argc, char** argv) {
     std::normal_distribution<float> nd(0.f, 1.f);
     int fails = 0;
 
-    // ---- attn_qk_prepare: q/k norm, partial rope with M-RoPE axes, cache write
-    {
+    // ---- attn_qk_prepare: q/k norm, partial rope with M-RoPE axes, cache write; unscaled, then under YaRN x2 past the
+    // trained 262,144 against transformers' YaRN (_compute_yarn_parameters: the frequency blend by pair index, cos and sin
+    // times 0.1 ln(factor) + 1), the angle rounded as the kernel takes it (fp32 position times fp32 frequency)
+    for (const bool yarn : {false, true}) {
         const int T = 3;
         std::vector<float> qf((size_t) T * NH * 2 * HD), k((size_t) T * NKV * HD), v(k.size()), qn(HD), kn(HD);
         for (auto& x : qf) x = nd(rng);
@@ -91,10 +93,33 @@ int main(int argc, char** argv) {
         for (auto& x : qn) x = 1.0f + 0.1f * nd(rng);
         for (auto& x : kn) x = 1.0f + 0.1f * nd(rng);
         std::vector<int32_t> pos = {5, 5, 5, 6, 9, 11, 7, 7, 7};   // a text row, an image row (t, h, w), a text row
+        if (yarn) pos = {300001, 300001, 300001, 400000, 400003, 400005, 524287, 524287, 524287};
         basalt::kernels::RopeSpec rope;
         rope.rot = ROT;
         rope.theta = 1e7f;
         for (int i = 0; i < ROT / 2; ++i) rope.axis[i] = (int8_t) (i % 3 == 1 && i < 33 ? 1 : i % 3 == 2 && i < 30 ? 2 : 0);
+        const double factor = 2.0, orig = 262144.0, base = 1e7;
+        std::vector<double> inv_freq(ROT / 2);
+        double mscale = 1.0;
+        for (int i = 0; i < ROT / 2; ++i) inv_freq[(size_t) i] = std::pow(base, -2.0 * i / ROT);
+        if (yarn) {
+            rope.scaling.type = basalt::kernels::RopeScalingType::YaRN;
+            rope.scaling.factor = factor;
+            rope.scaling.orig_ctx = orig;
+            rope.scaling.freq_base = base;
+            rope.scaling.ext_factor = 1.0;
+            // transformers: find_correction_range(beta_fast 32, beta_slow 1, dim, base, orig) with truncation, a linear
+            // ramp over dim / 2 pairs, inv = interp (1 - extrap_factor) + extrap extrap_factor, extrap_factor = 1 - ramp
+            const auto corr = [&](double rot) { return ROT * std::log(orig / (rot * 2 * M_PI)) / (2 * std::log(base)); };
+            const double lo = std::max(0.0, std::floor(corr(32))), hi0 = std::min((double) ROT - 1, std::ceil(corr(1)));
+            const double hi = lo == hi0 ? hi0 + 0.001 : hi0;
+            for (int i = 0; i < ROT / 2; ++i) {
+                const double ramp = std::min(1.0, std::max(0.0, (i - lo) / (hi - lo)));
+                const double ex = 1.0 - ramp, extrap = inv_freq[(size_t) i];
+                inv_freq[(size_t) i] = extrap / factor * (1.0 - ex) + extrap * ex;
+            }
+            mscale = 0.1 * std::log(factor) + 1.0;
+        }
         float *d_qf = dev<float>(qf.size()), *d_k = dev<float>(k.size()), *d_v = dev<float>(v.size()), *d_qn = dev<float>(HD),
               *d_kn = dev<float>(HD), *d_qo = dev<float>((size_t) T * NH * HD);
         int32_t* d_pos = dev<int32_t>(pos.size());
@@ -124,16 +149,19 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < HD; ++i) y[(size_t) i] = x[i] * inv * w[i];
                 std::vector<double> r = y;
                 for (int i = 0; i < ROT / 2; ++i) {
-                    const double f = std::pow(1e7, -2.0 * i / ROT) * pos[(size_t) t * 3 + rope.axis[i]];
-                    r[(size_t) i] = y[(size_t) i] * std::cos(f) - y[(size_t) i + ROT / 2] * std::sin(f);
-                    r[(size_t) i + ROT / 2] = y[(size_t) i + ROT / 2] * std::cos(f) + y[(size_t) i] * std::sin(f);
+                    const int32_t p = pos[(size_t) t * 3 + rope.axis[i]];
+                    const double f = yarn ? (double) ((float) p * (float) inv_freq[(size_t) i]) : inv_freq[(size_t) i] * p;
+                    const double c = std::cos(f) * mscale, sn = std::sin(f) * mscale;
+                    r[(size_t) i] = y[(size_t) i] * c - y[(size_t) i + ROT / 2] * sn;
+                    r[(size_t) i + ROT / 2] = y[(size_t) i + ROT / 2] * c + y[(size_t) i] * sn;
                 }
                 for (int i = 0; i < HD; ++i) {
                     if (isq) eq.add(qo[((size_t) t * NH + j) * HD + i], r[(size_t) i]);
                     else ek.add(h2f(kc[(((size_t) cell0 + t) * NKV + (j - NH)) * HD + i]), r[(size_t) i]);
                 }
             }
-        std::printf("attn_qk_prepare: q max abs %.3g rel %.3g; k (fp16 cache) max abs %.3g rel %.3g\n", eq.abs, eq.rel, ek.abs, ek.rel);
+        std::printf("attn_qk_prepare%s: q max abs %.3g rel %.3g; k (fp16 cache) max abs %.3g rel %.3g\n", yarn ? " (YaRN x2)" : "",
+                    eq.abs, eq.rel, ek.abs, ek.rel);
         if (eq.abs > 1e-3 || ek.rel > 2e-3) ++fails;
     }
 
