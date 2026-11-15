@@ -33,8 +33,9 @@ public:
     /// `path` is the file, `fd` a descriptor of it that reads through the file cache.
     bool open(const std::string& path, int fd, std::string& err);
     bool is_open() const { return thread_.joinable(); }
-    /// Whether the reads go around the file cache.
-    bool unbuffered() const { return direct_.is_open(); }
+    /// Whether the reads go around the file cache: not on Windows, where the file is also mapped, so its reads are cached
+    /// there too (the reads are asynchronous either way); a file that refused the direct open reads through `fd`.
+    bool unbuffered() const { return direct_.bypasses_cache(); }
 
     /// Starts reading `blobs` (the previous batch was waited for). Their destinations stay untouched by the caller until `wait`.
     void start(const std::vector<Blob>& blobs);
