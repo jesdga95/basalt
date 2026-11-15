@@ -291,6 +291,13 @@ void test_resident_lend_region() {
     require(budget_lend_room(10, 10) == 10, "a budget of exactly the complement must keep the lend region");
     require(budget_lend_room(68, 39) == 68, "a budget above the complement must give the lend region its rest");
     require(budget_lend_room(17, 10) - 10 == 7, "the lend region's room is what the budget has after the complement");
+    // a RAM budget that holds the complement keeps the adaptive swaps' free places in RAM before lending slots (#366)
+    require(choose_resident_room(slots, 10, 19, 1, 6, fit, 15) == 4 && fit,
+            "a budget cap that holds the complement but not the free places must not trade the places for lent slots");
+    require(choose_resident_room(slots, 10, 19, 1, 6, fit, 10) == 4 && fit,
+            "a budget of exactly the complement must keep the free places when RAM has room");
+    require(choose_resident_room(slots, 10, 100, 1, 4, fit, 19) == 3 && fit,
+            "lent slots fill what the budget cap has left after the free places");
 }
 
 // A 62 GiB machine with swap, one card, a third of the experts left in the file (issue #285): the tier leaves the OS

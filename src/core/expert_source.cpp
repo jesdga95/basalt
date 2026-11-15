@@ -184,9 +184,13 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
 }
 
 int64_t choose_resident_room(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
-                             int64_t lend_from, uint64_t spare_bytes, bool& spares_fit) {
+                             int64_t lend_from, uint64_t spare_bytes, bool& spares_fit, uint64_t lend_cap) {
     spares_fit = spare_bytes > 0 && base_bytes <= budget && spare_bytes <= budget - base_bytes;
-    return choose_resident_keep_from(slot_bytes, base_bytes, spares_fit ? budget - spare_bytes : budget, lend_from);
+    if (base_bytes > budget) return -1;
+    const uint64_t cap = std::min(budget, lend_cap);
+    const uint64_t room = spares_fit ? (cap > spare_bytes ? cap - spare_bytes : 0) : cap;
+    if (room < base_bytes) return (int64_t) slot_bytes.size();
+    return choose_resident_keep_from(slot_bytes, base_bytes, room, lend_from);
 }
 
 uint64_t budget_lend_room(uint64_t budget_bytes, uint64_t complement_bytes) {
@@ -901,8 +905,8 @@ bool FileExpertSource::pin_cache_complement(
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
             return false;
         }
-        budget = std::min(ram_tier_room(physical, headroom_bytes, pin), lend_cap);
-        if (bytes > budget) {
+        budget = ram_tier_room(physical, headroom_bytes, pin);
+        if (bytes > std::min(budget, lend_cap)) {
             char message[320];
             std::snprintf(message, sizeof message,
                           "FileExpertSource: resident complement %.2f GiB exceeds available RAM (%.2f GiB) minus the "
@@ -936,7 +940,7 @@ bool FileExpertSource::pin_cache_complement(
     int64_t keep_from = n_slots;
     if (lend) {
         bool spares_fit = false;
-        keep_from = detail::choose_resident_room(slot_bytes, bytes, budget, lend_from_slot, spare_bytes, spares_fit);
+        keep_from = detail::choose_resident_room(slot_bytes, bytes, budget, lend_from_slot, spare_bytes, spares_fit, lend_cap);
         if (keep_from < 0) keep_from = n_slots;
         if (keep_from < n_slots) {
             std::vector<std::pair<int32_t, int32_t>> core;
