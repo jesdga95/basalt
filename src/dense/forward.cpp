@@ -787,38 +787,43 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
     return true;
 }
 
-bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
-                   const int32_t* pos3, std::string& err) {
-    if (!m.ensure_chunk(err)) return false;
+void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, const int32_t* pos3,
+                 const int32_t* bounds) {
     const Geometry& g = m.g;
-    const Weights& w = m.w;
     ChunkScratch& b = m.cs;
     const cudaStream_t s = st.stream;
     const int H = g.n_embd;
-    const int32_t bounds[2] = {0, T};
-    cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
+    const int32_t own[2] = {0, T};
+    cudaMemcpyAsync(b.bounds, bounds ? bounds : own, sizeof own, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.pos, pos3, (size_t) T * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    if (tokens == nullptr && rows == nullptr) return;   // the residual is placed by the caller
     // the chunk's input rows in FP32 (tmp), then the BF16 residual (the BF16 embedding rows exactly)
     if (rows != nullptr) {
         cudaMemcpyAsync(b.tmp, rows, (size_t) T * H * sizeof(float), cudaMemcpyHostToDevice, s);
     } else {
         cudaMemcpyAsync(b.tok, tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-        kernels::iq_embed_rows(30, w.embd, (size_t) H * 2, b.tok, T, H, b.tmp, s);
+        kernels::iq_embed_rows(30, m.w.embd, (size_t) H * 2, b.tok, T, H, b.tmp, s);
     }
     kernels::to_bf16(b.tmp, residual(b), (int64_t) T * H, s);
     // the drafter's history needs the chunk's inputs: its next-token embeddings are the chunk's own rows 1..T-1
-    const bool drafter = st.mtp_kc != nullptr;
-    if (drafter) cudaMemcpyAsync(b.cat, b.tmp, (size_t) T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
-    const BlockDrafter& bd = w.dflash;
-    const bool block = m.o.drafter == Drafter::Block;
+    if (st.mtp_kc != nullptr) cudaMemcpyAsync(b.cat, b.tmp, (size_t) T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
+}
+
+void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last) {
+    const Geometry& g = m.g;
+    const Weights& w = m.w;
+    const cudaStream_t s = st.stream;
     // A chunk gives no logits (a prompt's last token runs as a decode window), so the last layer's rows are read only by
     // a drafter: the MTP history takes every row's final hidden state, a block drafter the rows of its target layers.
     // When neither reads them, the last layer leaves only what the session keeps: an attention layer its cells; its FFN
     // is not run.
-    const bool last_read = drafter || (block && std::find(bd.target_layers.begin(), bd.target_layers.end(), g.n_layers - 1) !=
-                                                    bd.target_layers.end());
+    const bool last_read = read_last || st.mtp_kc != nullptr ||
+                           (taps && std::find(taps->target_layers.begin(), taps->target_layers.end(), g.n_layers - 1) !=
+                                        taps->target_layers.end());
     size_t next_target = 0;
-    for (int il = 0; il < g.n_layers; ++il) {
+    if (taps)
+        while (next_target < taps->target_layers.size() && taps->target_layers[next_target] < l0) ++next_target;
+    for (int il = l0; il < l1; ++il) {
         const Layer& L = w.layers[(size_t) il];
         const bool unread = il == g.n_layers - 1 && !last_read;
         if (L.kind == Mixer::Gdn) {
@@ -829,32 +834,51 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
         }
         if (unread) break;
         chunk_ffn(m, L, T, s);
-        if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) {
-            const Linear& fc = bd.fc[next_target];
-            kernels::to_f32(residual(b), b.xn, (int64_t) T * H, s);   // the target layer's rows for the drafter's fc
-            chunk_act(m, b.xn, fc.type, H, T, s);
-            gemm(m, fc, next_target == 0 ? b.dacc : b.tmp, T, s);
-            if (next_target > 0) kernels::add_scaled(b.dacc, b.tmp, nullptr, (int64_t) T * H, s);
-            ++next_target;
-        }
+        if (taps && next_target < taps->target_layers.size() && taps->target_layers[next_target] == il)
+            chunk_tap(m, st, T, *taps, next_target++);
     }
-    if (block) {   // the chunk's rows become the block drafter's context
-        kernels::rms_norm_rows(b.dacc, bd.hidden_norm, b.xn, T, H, bd.eps, s);
-        chunk_act(m, b.xn, bd.layers[0].k.type, H, T, s);
-        std::vector<int32_t> p3;
-        text_positions(p3, T, pos, 0);
-        cudaMemcpyAsync(b.pos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-        kernels::RopeSpec rope = block_rope(bd);
-        for (size_t l = 0; l < bd.layers.size(); ++l) {
-            const BlockDrafter::Layer& D = bd.layers[l];
-            gemm(m, D.k, b.k, T, s);
-            gemm(m, D.v, b.v, T, s);
-            kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, D.k_norm, bd.eps, rope, b.pos, T, 0, bd.n_kv, nullptr,
-                                     st.dk[l], st.dv[l], pos, s, bd.head_dim, false, st.dctx_cap);
-        }
+}
+
+void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size_t j) {
+    ChunkScratch& b = m.cs;
+    const cudaStream_t s = st.stream;
+    const int H = m.g.n_embd;
+    const Linear& fc = taps.fc[j];
+    kernels::to_f32(residual(b), b.xn, (int64_t) T * H, s);   // the target layer's rows for the drafter's fc
+    chunk_act(m, b.xn, fc.type, H, T, s);
+    gemm(m, fc, j == 0 ? b.dacc : b.tmp, T, s);
+    if (j > 0) kernels::add_scaled(b.dacc, b.tmp, nullptr, (int64_t) T * H, s);
+}
+
+void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64_t pos) {
+    const BlockDrafter& bd = m.w.dflash;
+    ChunkScratch& b = m.cs;
+    const cudaStream_t s = st.stream;
+    const int H = m.g.n_embd;
+    kernels::rms_norm_rows(dacc, bd.hidden_norm, b.xn, n, H, bd.eps, s);
+    chunk_act(m, b.xn, bd.layers[0].k.type, H, n, s);
+    std::vector<int32_t> p3;
+    text_positions(p3, n, pos, 0);
+    cudaMemcpyAsync(b.pos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    kernels::RopeSpec rope = block_rope(bd);
+    for (size_t l = 0; l < bd.layers.size(); ++l) {
+        const BlockDrafter::Layer& D = bd.layers[l];
+        gemm(m, D.k, b.k, n, s);
+        gemm(m, D.v, b.v, n, s);
+        kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, D.k_norm, bd.eps, rope, b.pos, n, 0, bd.n_kv, nullptr,
+                                 st.dk[l], st.dv[l], pos, s, bd.head_dim, false, st.dctx_cap);
     }
+}
+
+bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& err) {
+    const Geometry& g = m.g;
+    const Weights& w = m.w;
+    ChunkScratch& b = m.cs;
+    const cudaStream_t s = st.stream;
+    const int H = g.n_embd;
+    if (m.o.drafter == Drafter::Block) block_ctx_chunk(m, st, b.dacc, T, pos);   // the chunk's rows become its context
     if (!cuda_ok("dense chunk", err)) return false;
-    if (!drafter) return true;
+    if (st.mtp_kc == nullptr) return true;
     // the drafter's pairs (main's normed row at cell c, the input row at c + 1): the waiting tail first
     kernels::rms_norm_rows(residual(b), w.out_norm, b.hn + H, T, H, g.eps, s);
     const bool tail = st.tail_cell == pos - 1 && pos > 0;
@@ -865,6 +889,14 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
     const int n = tail ? T : T - 1;
     if (n <= 0) return true;
     return mtp_chunk(m, st, tail ? b.hn : b.hn + H, nullptr, tail ? b.cat : b.cat + H, n, tail ? pos - 1 : pos, err);
+}
+
+bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
+                   const int32_t* pos3, std::string& err) {
+    if (!m.ensure_chunk(err)) return false;
+    chunk_start(m, st, tokens, rows, T, pos3);
+    chunk_layers(m, st, T, pos, 0, m.g.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
+    return chunk_finish(m, st, T, pos, err);
 }
 
 bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err) {

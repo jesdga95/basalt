@@ -202,6 +202,21 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
 /// Runs a prompt chunk; rows are token embeddings, or `rows` (fp32 [T][n_embd]) when given.  `pos3` [T][3].
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
                    const int32_t* pos3, std::string& err);
+/// A prompt chunk in phases (forward_chunk runs them in turn).  chunk_start: the bounds (host [2], null: {0, T}) and
+/// positions, then the input rows into the BF16 residual (token embeddings, or `rows`; neither: the caller places it).
+void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, const int32_t* pos3,
+                 const int32_t* bounds = nullptr);
+/// Layers [l0, l1) of the chunk in m.cs; with `taps`, the block drafter's features of its target layers in the range
+/// into cs.dacc (the first target layer's written, the later ones' added).  The last layer's rows are made in full when
+/// something reads them (`read_last`, a drafter), else only its cells.
+void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last = false);
+/// The block drafter's feature projection j of the rows in cs.x into cs.dacc (j == 0 writes it, later ones add).
+void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size_t j);
+/// After the last layer: the block drafter's context from cs.dacc, or the MTP history.
+bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& err);
+/// The block drafter's context cells at positions pos .. pos + n - 1 from n rows of features `dacc` (device).
+void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64_t pos);
+
 /// The commit of the last window's first n rows into the recurrent state.
 void commit_window(Model& m, SessionState& st, int n, cudaStream_t s);
 
