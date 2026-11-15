@@ -215,7 +215,8 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
 }
 
 const char* gpu_role_name(GpuRole r) {
-    return r == GpuRole::Main ? "main" : r == GpuRole::ExpertTier ? "expert tier" : r == GpuRole::PromptLine ? "prompt line" : "idle";
+    return r == GpuRole::Main ? "main" : r == GpuRole::ExpertTier ? "expert tier" : r == GpuRole::PromptLine ? "prompt line"
+         : r == GpuRole::LayerStage ? "layer stage" : "idle";
 }
 
 std::vector<GpuRole> choose_roles(const RoleInputs& in) {
@@ -223,7 +224,8 @@ std::vector<GpuRole> choose_roles(const RoleInputs& in) {
     if (r.empty()) return r;
     r[0] = GpuRole::Main;
     int tiers = 0;
-    for (size_t i = 1; i < r.size() && tiers < in.max_expert_tiers; ++i, ++tiers) r[i] = in.prompt_line ? GpuRole::PromptLine : GpuRole::ExpertTier;
+    const GpuRole helper = !in.prompt_line ? GpuRole::ExpertTier : in.layer_stage ? GpuRole::LayerStage : GpuRole::PromptLine;
+    for (size_t i = 1; i < r.size() && tiers < in.max_expert_tiers; ++i, ++tiers) r[i] = helper;
     return r;
 }
 

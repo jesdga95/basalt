@@ -298,6 +298,12 @@ public:
     virtual int max_expert_cards() const = 0;
     /// A model with no experts to put on a second card reads long prompts there instead (a prompt line, not an expert tier).
     virtual bool second_card_reads_prompts() const { return false; }
+    /// Such a model with these flags does not fit its main card and splits its layers across the main card and the second
+    /// (a layer stage), given the two cards' memory bandwidth; asked once the run's cards are visible, before the load.
+    virtual bool second_card_runs_layers(const program::CommonOptions& o, double main_gbps, double peer_gbps) const {
+        (void) o; (void) main_gbps; (void) peer_gbps;
+        return false;
+    }
     virtual TokenNames token_names() const = 0;
     /// The pre-tokenizer's name in the pack's tokenizer.json and its rule.
     struct PreTokenizer {

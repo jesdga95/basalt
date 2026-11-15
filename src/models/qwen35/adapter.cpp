@@ -24,6 +24,91 @@
 namespace basalt::models::qwen35 {
 namespace {
 
+// the pack's DFlash 2 block drafter's shape (qwen35.dflash.* metadata)
+bool block_meta(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& err) {
+    const auto u = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (int) v->u : 0; };
+    const auto f = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (float) v->num() : 0.0f; };
+    d.block = u("block_size");
+    d.mask_id = u("mask_token_id");
+    d.conv_group = u("conv_group");
+    d.rank = u("selector_rank");
+    d.top_k = u("selector_top_k");
+    d.window = u("sliding_window");
+    d.n_head = u("attention.head_count");
+    d.n_kv = u("attention.head_count_kv");
+    d.head_dim = u("attention.key_length");
+    d.theta = f("rope.freq_base");
+    d.eps = f("attention.layer_norm_rms_epsilon");
+    if (const MetaValue* t = gg.get("qwen35.dflash.target_layers"))
+        for (const MetaValue& x : t->items) d.target_layers.push_back((int) x.u);
+    if (d.block < 2 || d.block > 8 || d.target_layers.empty() || u("conv_kernel") != 2 || d.n_kv <= 0 ||
+        (d.head_dim != 128 && d.head_dim != 256) || d.top_k > 20 || H % d.conv_group) {
+        err = "qwen35: the pack's block drafter has a shape the engine does not run";
+        return false;
+    }
+    for (int l = 0; l < u("block_count"); ++l) d.layers.emplace_back();
+    d.present = true;
+    return true;
+}
+
+
+// The dense stack's options for a run of these flags (the drafter the pack carries, when drafting).
+dense::Options run_options(const GgufFile& gg, int64_t max_context, int sessions, int spec, bool draft, bool vision, const std::string& kv,
+                           int64_t kv_resident) {
+    const auto has = [&](const char* name) {
+        for (const TensorInfo& t : gg.tensors())
+            if (t.name == name) return true;
+        return false;
+    };
+    const bool block = draft && has("dflash.fc.0.weight"), mtp = draft && !block && has("mtp.fc.weight");
+    dense::Options o;
+    o.max_context = max_context;
+    o.sessions = sessions;
+    o.spec = spec;
+    o.draft = draft;
+    o.drafter = block ? dense::Drafter::Block : mtp ? dense::Drafter::Mtp : dense::Drafter::None;
+    o.vision = vision;
+    o.kv_int8 = kv == "int8";
+    o.kv_resident = kv_resident;
+    o.arch = "qwen35";
+    return o;
+}
+
+// Where the layers go with a second card: all on the main card when the model, its cells and scratch fit there (the second card
+// then reads long prompts), else split across the two (dense::plan_split), from the pack's bytes per layer and both cards'
+// free memory (CUDA device 0 and `peer`).  `forced`: a cut taken as given.
+dense::SplitPlan plan_pack(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd, int peer,
+                           double main_gbps, double peer_gbps, int reserve_mib, int forced) {
+    std::vector<uint64_t> layer((size_t) g.n_layers, 0);
+    uint64_t main_weights = 0;
+    for (const TensorInfo& t : gg.tensors()) {
+        const std::string& name = t.name;
+        if (name.starts_with("blk.")) {
+            const int il = std::atoi(name.c_str() + 4);
+            if (il >= 0 && il < g.n_layers) layer[(size_t) il] += tensor_payload_bytes(t);
+        } else if (name.starts_with("output") || (o.drafter == dense::Drafter::Block && name.starts_with("dflash.")) ||
+                   (o.drafter == dense::Drafter::Mtp && name.starts_with("mtp."))) {
+            main_weights += tensor_payload_bytes(t);
+        }
+    }
+    size_t main_free = 0, peer_free = 0, total = 0;
+    {
+        const core::OnDevice on(0);
+        cudaMemGetInfo(&main_free, &total);
+    }
+    {
+        const core::OnDevice on(peer);
+        cudaMemGetInfo(&peer_free, &total);
+    }
+    constexpr uint64_t kMargin = 512ull << 20;
+    const uint64_t reserve = ((uint64_t) std::max(reserve_mib, 0) << 20) + kMargin;
+    const dense::SplitCard mc{main_free > reserve ? main_free - reserve : 0, main_gbps};
+    const dense::SplitCard pc{peer_free > kMargin ? peer_free - kMargin : 0, peer_gbps};
+    dense::SplitInputs in = dense::split_inputs(g, o, bd, layer, main_weights, mc, pc);
+    in.forced = forced;
+    return dense::plan_split(in);
+}
+
 class Loaded final : public model::LoadedModel {
 public:
     ~Loaded() override {
@@ -69,21 +154,11 @@ public:
             return false;
         }
         for (const TensorInfo& t : gg.tensors()) tensors_[t.name] = t;
-        const bool want_block = req.draft && tensors_.count("dflash.fc.0.weight");
-        const bool want_mtp = req.draft && !want_block && tensors_.count("mtp.fc.weight");
-        dense::Options o;
-        o.max_context = req.max_context;
-        o.sessions = req.sessions;
-        o.spec = req.spec;
-        o.draft = req.draft;
-        o.drafter = want_block ? dense::Drafter::Block : want_mtp ? dense::Drafter::Mtp : dense::Drafter::None;
-        o.vision = req.vision;
-        o.kv_int8 = req.kv == "int8";
-        o.kv_resident = req.kv_resident;
-        o.arch = "qwen35";
+        dense::Options o = run_options(gg, req.max_context, req.sessions, req.spec, req.draft, req.vision, req.kv, req.kv_resident);
+        const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
         dense::BlockDrafter bd_meta;
         if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;
-        if (!req.peer_devices.empty() && !plan_cards(g, o, bd_meta, req, err)) return false;
+        if (!req.peer_devices.empty() && !plan_cards(gg, g, o, bd_meta, req, err)) return false;
         fd_ = platform::open_fd_utf8(path);
         if (fd_ < 0) {
             err = "cannot open " + path;
@@ -92,9 +167,16 @@ public:
         uint64_t total = 0;
         for (const TensorInfo& t : gg.tensors())
             if (!t.name.starts_with("mtp.")) total += tensor_payload_bytes(t);
+        // a layer split's later layers count on the second card
+        uint64_t peer_total = 0;
+        for (const TensorInfo& t : gg.tensors())
+            if (split_at_ > 0 && t.name.starts_with("blk.") && std::atoi(t.name.c_str() + 4) >= split_at_) peer_total += tensor_payload_bytes(t);
         core::LoadProgress::announce_total(total);
-        core::LoadProgress::plan(core::LoadProgress::cuda(0), total);
-        core::LoadProgress progress(core::LoadProgress::cuda(0), total);
+        core::LoadProgress::plan(core::LoadProgress::cuda(0), total - peer_total);
+        if (peer_total) core::LoadProgress::plan(core::LoadProgress::cuda(req.peer_devices.front()), peer_total);
+        core::LoadProgress progress(core::LoadProgress::cuda(0), total - peer_total);
+        std::optional<core::LoadProgress> peer_progress;
+        if (peer_total) peer_progress.emplace(core::LoadProgress::cuda(req.peer_devices.front()), peer_total);
         progress_ = &progress;
         dense::Weights w;
         const int H = g.n_embd;
@@ -124,7 +206,10 @@ public:
             if (split_at_ > 0 && il >= split_at_) {
                 const uint64_t before = dev_bytes_;
                 const core::OnDevice on(req.peer_devices.front());
-                if (!layer(gg, g, il, P, err)) return false;
+                progress_ = &*peer_progress;
+                const bool ok = layer(gg, g, il, P, err);
+                progress_ = &progress;
+                if (!ok) return false;
                 peer_bytes_ += dev_bytes_ - before;
                 dev_bytes_ = before;
             } else if (!layer(gg, g, il, L, err)) {
@@ -154,6 +239,7 @@ public:
             d.present = true;
         }
         progress.finish();
+        if (peer_progress) peer_progress->finish();
         progress_ = nullptr;
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
@@ -198,36 +284,12 @@ public:
     }
 
 private:
-    // Where the layers go with a second card: all on the main card when the model, its cells and scratch fit there (the second
-    // card then reads long prompts), else split across the two (dense::plan_split), from the pack's bytes per layer and both
-    // cards' free memory.  --diag-split-at takes its cut as given.
-    bool plan_cards(const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd, const model::LoadRequest& req,
-                    std::string& err) {
-        std::vector<uint64_t> layer((size_t) g.n_layers, 0);
-        uint64_t main_weights = 0;
-        for (const auto& [name, t] : tensors_) {
-            if (name.starts_with("blk.")) {
-                const int il = std::atoi(name.c_str() + 4);
-                if (il >= 0 && il < g.n_layers) layer[(size_t) il] += tensor_payload_bytes(t);
-            } else if (name.starts_with("output") || (o.drafter == dense::Drafter::Block && name.starts_with("dflash.")) ||
-                       (o.drafter == dense::Drafter::Mtp && name.starts_with("mtp."))) {
-                main_weights += tensor_payload_bytes(t);
-            }
-        }
+    // Where the layers go with a second card (plan_pack); --diag-split-at takes its cut as given.
+    bool plan_cards(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd,
+                    const model::LoadRequest& req, std::string& err) {
         const int peer = req.peer_devices.front();
-        size_t main_free = 0, peer_free = 0, total = 0;
-        cudaMemGetInfo(&main_free, &total);
-        {
-            const core::OnDevice on(peer);
-            cudaMemGetInfo(&peer_free, &total);
-        }
-        constexpr uint64_t kMargin = 512ull << 20;
-        const uint64_t reserve = ((uint64_t) std::max(req.vram_reserve_mib, 0) << 20) + kMargin;
-        dense::SplitCard mc{main_free > reserve ? main_free - reserve : 0, req.card_gbps.size() > 0 ? req.card_gbps[0] : 0};
-        dense::SplitCard pc{peer_free > kMargin ? peer_free - kMargin : 0, req.card_gbps.size() > 1 ? req.card_gbps[1] : 0};
-        dense::SplitInputs in = dense::split_inputs(g, o, bd, layer, main_weights, mc, pc);
-        in.forced = req.diag_split_at;
-        const dense::SplitPlan p = dense::plan_split(in);
+        const dense::SplitPlan p = plan_pack(gg, g, o, bd, peer, req.card_gbps.size() > 0 ? req.card_gbps[0] : 0,
+                                             req.card_gbps.size() > 1 ? req.card_gbps[1] : 0, req.vram_reserve_mib, req.diag_split_at);
         if (!p.error.empty()) {
             err = "qwen35: " + p.error + "; lower --max-context or --parallel";
             return false;
@@ -309,33 +371,6 @@ private:
         if (!linear(gg, p + "ffn_gate", g.n_ff, H, L.gate, err) || !linear(gg, p + "ffn_up", g.n_ff, H, L.up, err) ||
             !linear(gg, p + "ffn_down", H, g.n_ff, L.down, err))
             return false;
-        return true;
-    }
-
-    // the pack's DFlash 2 block drafter's shape (qwen35.dflash.* metadata)
-    bool block_meta(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& err) {
-        const auto u = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (int) v->u : 0; };
-        const auto f = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (float) v->num() : 0.0f; };
-        d.block = u("block_size");
-        d.mask_id = u("mask_token_id");
-        d.conv_group = u("conv_group");
-        d.rank = u("selector_rank");
-        d.top_k = u("selector_top_k");
-        d.window = u("sliding_window");
-        d.n_head = u("attention.head_count");
-        d.n_kv = u("attention.head_count_kv");
-        d.head_dim = u("attention.key_length");
-        d.theta = f("rope.freq_base");
-        d.eps = f("attention.layer_norm_rms_epsilon");
-        if (const MetaValue* t = gg.get("qwen35.dflash.target_layers"))
-            for (const MetaValue& x : t->items) d.target_layers.push_back((int) x.u);
-        if (d.block < 2 || d.block > 8 || d.target_layers.empty() || u("conv_kernel") != 2 || d.n_kv <= 0 ||
-            (d.head_dim != 128 && d.head_dim != 256) || d.top_k > 20 || H % d.conv_group) {
-            err = "qwen35: the pack's block drafter has a shape the engine does not run";
-            return false;
-        }
-        for (int l = 0; l < u("block_count"); ++l) d.layers.emplace_back();
-        d.present = true;
         return true;
     }
 
@@ -519,6 +554,22 @@ public:
     program::grammar::ToolForm tool_form() const override { return program::qwen_tool_form(); }
     int max_expert_cards() const override { return 0; }
     bool second_card_reads_prompts() const override { return true; }
+    // the load's own plan (plan_pack) on the flags and both cards' free memory before it
+    bool second_card_runs_layers(const program::CommonOptions& o, double main_gbps, double peer_gbps) const override {
+        if (o.diag_split_at > 0) return true;
+        core::ModelFile file;   // the pack's tensor table, read in place (as the load reads it)
+        std::string err;
+        if (!file.open(o.model, err) || !file.load_meta(err) || !file.register_gguf_view(err)) return false;
+        const GgufFile gg(o.model);
+        const dense::Geometry g = geometry(gg, err);
+        if (!err.empty()) return false;
+        const bool draft = o.spec >= 2 && o.spec_oracle.empty();
+        const dense::Options opt = run_options(gg, o.max_context, std::max(o.batch, 1), o.spec, draft, o.vision, o.kv, o.kv_resident);
+        dense::BlockDrafter bd;
+        if (opt.drafter == dense::Drafter::Block && !block_meta(gg, bd, g.n_embd, err)) return false;
+        const dense::SplitPlan p = plan_pack(gg, g, opt, bd, 1, main_gbps, peer_gbps, o.vram_reserve_given ? o.vram_reserve_mib : 0, 0);
+        return p.error.empty() && p.cut > 0;
+    }
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         (void) code;

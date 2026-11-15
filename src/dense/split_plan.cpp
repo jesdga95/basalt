@@ -49,7 +49,10 @@ SplitPlan plan_split(const SplitInputs& in) {
         for (int c = 1; c < n; ++c) {
             if (!fits(c)) continue;
             const double off = std::fabs((double) weights[(size_t) c] - (double) weights[(size_t) n] / 2);
-            if (best < 0 || off < best) best = off, p.cut = c;
+            if (best < 0 || off < best) {
+                best = off;
+                p.cut = c;
+            }
         }
     } else if (in.main.mem_gbps >= in.peer.mem_gbps) {
         for (int c = n - 1; c >= 1 && p.cut == 0; --c)
