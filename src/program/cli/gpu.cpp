@@ -64,6 +64,7 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
                           (prompt_line ? std::string("one card reads prompts beside the main card; later cards idle")
                                        : "expert tiers max " + std::to_string(ri.max_expert_tiers) + "; later cards idle").c_str());
     if (!o.peer_devices.empty()) o.peer_device = o.peer_devices[0];
+    if (!ri.cards.empty()) o.main_gbps = ri.cards[0].mem_gbps;
     chosen_cards = ri.cards;
     // The split hands a window's activations from one card to the next, and a tier card reads its experts d2d: both
     // want peer access, which every pair must opt into once per process.  A pair the driver refuses is left alone and
