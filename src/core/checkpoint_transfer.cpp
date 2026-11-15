@@ -1,6 +1,7 @@
 // src/core/checkpoint_transfer.cpp - a conversation checkpoint's running state between the device and the host.
 #include "basalt/core/checkpoint_transfer.hpp"
 
+#include "basalt/core/on_device.hpp"
 #include "basalt/core/ram_load.hpp"
 
 #include <cstring>
@@ -68,6 +69,22 @@ bool checkpoint_copy_in(const std::vector<RestoreSegment>& segments, cudaStream_
     // the host bytes are free to move once the last copy has left them
     if (const cudaError_t e = cudaStreamSynchronize(stream); e != cudaSuccess) return fail(error, "synchronize", e);
     return true;
+}
+
+bool running_copy_out(const RunningState& rs, uint8_t* host, std::string& error) {
+    uint8_t* at = host + rs.head.size();
+    if (!checkpoint_copy_out({{at, rs.regions}}, (cudaStream_t) rs.stream, error)) return false;
+    if (rs.peer_regions.empty()) return true;
+    const OnDevice on(rs.peer_device);
+    return checkpoint_copy_out({{at + rs.regions_bytes(), rs.peer_regions}}, (cudaStream_t) rs.peer_stream, error);
+}
+
+bool running_copy_in(const RunningState& rs, const uint8_t* host, std::string& error) {
+    const uint8_t* at = host + rs.head.size();
+    if (!checkpoint_copy_in({{at, rs.regions}}, (cudaStream_t) rs.stream, error)) return false;
+    if (rs.peer_regions.empty()) return true;
+    const OnDevice on(rs.peer_device);
+    return checkpoint_copy_in({{at + rs.regions_bytes(), rs.peer_regions}}, (cudaStream_t) rs.peer_stream, error);
 }
 
 CheckpointDeferral::~CheckpointDeferral() { release(); }

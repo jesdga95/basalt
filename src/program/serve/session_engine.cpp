@@ -5,6 +5,7 @@
 #include "decode_loop.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/probe_rates.hpp"
@@ -300,9 +301,16 @@ public:
         }
         c.state_a.resize(rs.bytes());
         std::memcpy(c.state_a.data(), rs.head.data(), rs.head.size());
-        // the state is snapshotted on the device now and moves to the host while the request goes on
+        // the state is snapshotted on the device now and moves to the host while the request goes on (each card's part on
+        // its own device)
         const std::vector<basalt::core::SaveSegment> seg{{c.state_a.data() + rs.head.size(), rs.regions}};
         if (!ckd.save(seg, (cudaStream_t) rs.stream, c.state_a.data(), err)) return false;
+        if (!rs.peer_regions.empty()) {
+            const basalt::core::OnDevice on(rs.peer_device);
+            ckd_peer_dev = rs.peer_device;
+            const std::vector<basalt::core::SaveSegment> ps{{c.state_a.data() + rs.head.size() + rs.regions_bytes(), rs.peer_regions}};
+            if (!ckd_peer.save(ps, (cudaStream_t) rs.peer_stream, c.state_a.data(), err)) return false;
+        }
         keep_check(std::move(c));
         return true;
     }
@@ -314,8 +322,7 @@ public:
         to.resize(rs.bytes());
         std::memcpy(to.data(), rs.head.data(), rs.head.size());
         std::string e;
-        if (!basalt::core::checkpoint_copy_out({{to.data() + rs.head.size(), rs.regions}}, (cudaStream_t) rs.stream, e))
-            return {basalt::model::Status::Error, e};
+        if (!basalt::core::running_copy_out(rs, to.data(), e)) return {basalt::model::Status::Error, e};
         return {};
     }
     /// A checkpoint's or a parked conversation's running state back into the session.
@@ -324,8 +331,7 @@ public:
         if (const basalt::model::Result r = session().running_state(pos, false, rs); !r.ok()) return r;
         if (from.size() != rs.bytes()) return {basalt::model::Status::Error, "a checkpoint's running state has the wrong size"};
         std::string e;
-        if (!basalt::core::checkpoint_copy_in({{from.data() + rs.head.size(), rs.regions}}, (cudaStream_t) rs.stream, e))
-            return {basalt::model::Status::Error, e};
+        if (!basalt::core::running_copy_in(rs, from.data(), e)) return {basalt::model::Status::Error, e};
         return session().running_restored(pos, from.data());
     }
 
@@ -339,6 +345,13 @@ public:
         if (!basalt::core::CheckpointBytes::allocator_type::reserve(bytes, keep, &basalt::core::kCheckpointPin))
             basalt::log::warn("basalt serve", "checkpoint blocks not reserved: out of host memory");
         if (std::string e; !ckd.reserve(bytes, e)) basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", e.c_str());
+        basalt::core::RunningState rs;   // a split model's second card keeps a spare of its own part
+        if (session().running_state(0, false, rs).ok() && !rs.peer_regions.empty()) {
+            const basalt::core::OnDevice on(rs.peer_device);
+            ckd_peer_dev = rs.peer_device;
+            if (std::string e; !ckd_peer.reserve(basalt::core::RunningState::sum(rs.peer_regions), e))
+                basalt::log::warn("basalt serve", "deferred checkpoint copy off on the second card: %s", e.c_str());
+        }
     }
 
     basalt::model::ModelSession& session() { return *sessions_[(size_t) active_]; }
