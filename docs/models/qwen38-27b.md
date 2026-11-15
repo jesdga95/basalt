@@ -39,7 +39,8 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
   position for every token, so each decoded token reads all positions past N over the bus: decode slows with every position
   in RAM. A prompt chunk copies each layer's positions in RAM to the card once (one layer's worth of VRAM, kept for the run)
   while the layers before it run, so prompt reads stay close. The output is bitwise the same as with every position on the
-  card. One RTX 5090 at 400 W on a PCIe 5.0 x8 link (28.8 GB/s measured host to card), `--kv int8`, a 250,038-token prompt
+  card. With `--kv-resident` below the context the second card does not read prompts ([below](#long-prompts-on-two-cards)).
+  One RTX 5090 at 400 W on a PCIe 5.0 x8 link (28.8 GB/s measured host to card), `--kv int8`, a 250,038-token prompt
   (repeating text, which drafts well), 64 to 256 tokens decoded:
 
   | Positions in RAM | Prompt read | Decode, `--spec 0` | Decode, drafted |
@@ -83,7 +84,7 @@ from every split read, and is split, at the layer the price picks, only when tha
 The start line names it (`gpus: RTX 5090 (nvidia-smi 0) main, RTX 5060 Ti (nvidia-smi 1) prompt line`), then `prompt line: layers 44-63
 (4.00 GiB) on CUDA1`, the two cards' timed rates and the page-locked RAM (0.4 GiB). It costs about 5 s at start (the upload and the
 timing) and 0.4 GiB of the main card. The second card holds the 4 GiB of layers, their attention layers' cells and a chunk's scratch: 6 to
-9 GiB, 8.7 GiB at 262,144 positions in `int8`. A context of 16,384 or less holds no prompt the line would split, and then nothing goes to
+9 GiB, 8.7 GiB at 262,144 positions in `int8`. A context of 16,384 or less holds no prompt the line would split, and with `--kv-resident` below the context (K/V in RAM, [memory](#memory)) the line stays off; in both cases nothing goes to
 the second card.
 
 The line works with everything a read on the main card does: `--parallel` slots (a slot's read runs while the others wait, as on one

@@ -39,7 +39,7 @@ second one. Reports from machines with three or four cards are welcome (see [com
 
 A dense model (Qwen3.8-27B) decodes on the main card alone: it reads every weight every token, so a layer split would put part of
 each token on the slower card. A second card (the start line calls it the `prompt line`) reads the last layers of long prompts as a
-pipeline beside the main card ([Qwen3.8-27B](../models/qwen38-27b.md#long-prompts-on-two-cards)); later cards idle. `"auto"` gives
+pipeline beside the main card ([Qwen3.8-27B](../models/qwen38-27b.md#long-prompts-on-two-cards)); later cards idle (the line is off with `kv-resident`). `"auto"` gives
 the 27B both cards when two Blackwell cards are visible; without room on the second card the start says why and the model runs on the main
 card alone.
 
