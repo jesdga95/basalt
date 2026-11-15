@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -55,7 +56,11 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--crash-terminate") == 0) {
         basalt::platform::install_crash_handler();
         basalt::core::progress_at("decode", 17, 64);
-        throw std::runtime_error("boom");
+        try {
+            throw std::runtime_error("boom");
+        } catch (...) {
+            std::terminate();
+        }
     }
     using namespace basalt::platform;
     const std::string self = module_path();
