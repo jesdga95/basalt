@@ -64,7 +64,7 @@ void QfnRequest::validate_incoming() {
     // state. Invalid entries can safely fall back to its existing prefix.
     if (incoming && incoming->stage_images.size() != runtime_.stages.size()) {
         basalt::log::info("basalt serve", "conversation cache: discard snapshot (stage count)");
-        incoming.reset();
+        drop_incoming();
     }
     if (incoming) for (size_t i = 0; i < runtime_.stages.size(); ++i) {
         const basalt::core::OnDevice on(runtime_.stages[i]->dev);
@@ -72,15 +72,15 @@ void QfnRequest::validate_incoming() {
                 nullptr, runtime_.err)) {
             basalt::log::warn("basalt serve", "conversation cache: discard invalid stage snapshot (%s)",
                          runtime_.err.c_str());
-            incoming.reset();
+            drop_incoming();
             runtime_.err.clear();
             break;
         }
     }
     if (incoming && !basalt::core::conversation_snapshot_validate(*incoming, *runtime_.rsp, runtime_.g,
-            runtime_.mtp_kv, runtime_.err)) {
+            runtime_.mtp_kv, runtime_.err, incoming_kv.get())) {
         basalt::log::warn("basalt serve", "conversation cache: discard invalid snapshot (%s)", runtime_.err.c_str());
-        incoming.reset();
+        drop_incoming();
         runtime_.err.clear();
     }
 }
@@ -170,6 +170,11 @@ Flow QfnRequest::make_room() {
     return Flow::proceed;
 }
 
+// When RAM does not admit the whole image; --exp disk_stream: 0 never, 2 always.
+bool QfnRequest::disk_kv_in_files(bool whole) const {
+    return runtime_.disk_stream == 2 || (runtime_.disk_stream == 1 && !whole);
+}
+
 Flow QfnRequest::restore_image() {
         // the draft layer's K/V goes to the main sequence, which then holds it as written
         if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) {
@@ -177,8 +182,8 @@ Flow QfnRequest::restore_image() {
             return Flow::error;
         }
         // a snapshot that cannot be restored is dropped and the prompt read from the start
-        bool restored = basalt::core::conversation_snapshot_restore(*incoming, *runtime_.rsp,
-                runtime_.g, runtime_.mtp_kv, runtime_.err) == basalt::core::ConversationRestore::restored;
+        bool restored = basalt::core::conversation_snapshot_restore(*incoming, *runtime_.rsp, runtime_.g,
+                runtime_.mtp_kv, runtime_.err, incoming_kv.get()) == basalt::core::ConversationRestore::restored;
         if (restored && runtime_.mtp_on) runtime_.mtp.wrote(0, (int64_t) incoming->live.ids.size());
         int failed_stage = -1;
         for (size_t i = 0; restored && i < runtime_.stages.size(); ++i) {   // the later stages' parts
@@ -206,7 +211,7 @@ Flow QfnRequest::restore_image() {
                 return Flow::error;
             }
             runtime_.err.clear();
-            incoming.reset();
+            drop_incoming();
             runtime_.live.clear();
             runtime_.live_imgs.clear();
             runtime_.checks.clear();
@@ -230,7 +235,10 @@ void QfnRequest::adopt_checkpoints() {
 void QfnRequest::retain_image() {
         std::vector<std::vector<basalt::core::ConversationKv>> stage_kv;   // every stage's, for its next park
         for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-        runtime_.conversations->retain(std::move(incoming->kv), int64_t(runtime_.live.size()), std::move(stage_kv), runtime_.rsp);
+        // (K/V that came from its files left nothing in RAM to retain)
+        std::vector<basalt::core::ConversationKv> kv;
+        if (!incoming_kv) kv = std::move(incoming->kv);
+        runtime_.conversations->retain(std::move(kv), int64_t(runtime_.live.size()), std::move(stage_kv), runtime_.rsp);
 }
 
 bool QfnRequest::session_reset() {

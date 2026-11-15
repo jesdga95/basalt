@@ -53,8 +53,10 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
 // A capture of a conversation's state, or a read of one from disk, takes `need` bytes of RAM: only while the RAM
 // guard reads its level as ok, and with `floor` left free after it (the disk tier's floor sits above the guard's).
 bool QfnRuntime::capture_admit(uint64_t need, uint64_t floor) {
+    auto avail = basalt::core::conversation_available_memory();
+    if (avail && ram_seen_cap > 0) avail = std::min(*avail, floor + ram_seen_cap);
     return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
-           basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
+           basalt::core::conversation_memory_admit(avail, need, floor);
 }
 
 // Save only on a switch/rewind, not on each continuing request. No graph
@@ -509,6 +511,8 @@ int QfnRuntime::init_conversations() {
         (size_t) o.conversation_cache_slots);
 
     disk_floor = 0;                              // the RAM a capture or a read leaves free (set below)
+    disk_stream = (int) basalt::core::exp_flag("disk_stream", 1);
+    ram_seen_cap = (uint64_t) std::max(0.0, basalt::core::exp_flag("conv_ram_mib", 0)) << 20;
 
     if (o.conversation_cache_disk_mib > 0) {
         std::string de;

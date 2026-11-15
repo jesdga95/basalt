@@ -223,6 +223,7 @@ private:
     void validate_incoming() override;
     Flow make_room() override;
     Flow restore_image() override;
+    bool disk_kv_in_files(bool whole) const override;
     void adopt_checkpoints() override;
     void retain_image() override;
     bool session_reset() override;
