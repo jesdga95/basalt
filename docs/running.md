@@ -131,7 +131,7 @@ and `max_frames` (4 to 768). All frames are scaled to one size so the whole vide
 tokens), and each pair of frames is read as one picture with its time in the prompt. Audio and rotation metadata are not read: a
 phone's portrait clip arrives sideways.
 
-Decoding uses FFmpeg 6, 7 or 8 from the machine ([platforms](platforms.md#ffmpeg-for-video)). At start the server prints
+Decoding uses FFmpeg 6, 7, 8 or 9 from the machine ([platforms](platforms.md#ffmpeg-for-video)). At start the server prints
 `video  on, FFmpeg 8 (...)`, or `video  off` with the reason, and then a video is refused with that reason. A video may be 1 GiB.
 
 Frames decode on the encoder's GPU with NVDEC (H.264, HEVC, AV1, VP9 and the older codecs FFmpeg's NVDEC takes); a stream NVDEC
