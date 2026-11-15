@@ -482,7 +482,9 @@ def make_handler(target: Service | Router):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 requested = req.get("model")
-                self.svc = router.service_for(requested)
+                # llama.cpp's tokenizer routes name no model: the shown one's tokenizer, as /props describes it
+                self.svc = router.shown() if requested is None and path in ("/tokenize", "/detokenize") else \
+                    router.service_for(requested)
                 if self.svc is None:
                     self._unknown_model(path, requested)
                     return
@@ -497,6 +499,10 @@ def make_handler(target: Service | Router):
                         self._anthropic(req)
                     elif path == "/v1/messages/count_tokens":
                         self._count_tokens(req)
+                    elif path == "/tokenize":
+                        self._tokenize(req)
+                    elif path == "/detokenize":
+                        self._detokenize(req)
                     else:
                         self._json(404, {"error": {"message": "not found"}})
             except EngineError as e:                         # the engine failed: not the request's fault
@@ -831,6 +837,27 @@ def make_handler(target: Service | Router):
             asm = responses_api.Assembler(req, self.svc.model, len(ids), names,
                                           "reasoning.encrypted_content" in include, rid=self.live.id)
             return ids, thinking, tools, max_new, asm, req, force
+
+        def _tokenize(self, req):
+            """llama.cpp's /tokenize: the model's token ids for `content`, special-token text read as its token unless
+            `parse_special` is false."""
+            content, parse = req.get("content"), req.get("parse_special", True)
+            if not isinstance(content, str):
+                raise ValueError("content: a string")
+            if not isinstance(parse, bool):
+                raise ValueError("parse_special: true or false")
+            self._json(200, {"tokens": self.svc.tok.encode(content, parse_special=parse)})
+
+        def _detokenize(self, req):
+            """llama.cpp's /detokenize: the text of `tokens`, a list of the model's token ids."""
+            ids = req.get("tokens")
+            if not isinstance(ids, list) or not all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in ids):
+                raise ValueError("tokens: a list of token ids")
+            try:
+                text = self.svc.tok.decode(ids)
+            except (IndexError, KeyError):
+                raise ValueError("tokens: an id outside the model's vocabulary") from None
+            self._json(200, {"content": text})
 
         def _count_tokens(self, req):
             """Anthropic's token count: the rendered, tokenized prompt, without running the model."""
