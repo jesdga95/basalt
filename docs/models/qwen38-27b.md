@@ -1,7 +1,6 @@
 # Qwen3.8-27B
 
-Basalt's first dense model. Runs with the same command as any model: `basalt serve PACK`. What it supports next to the others:
-[models](index.md). Rounding and quality: [precision](../precision/qwen38-27b.md).
+A dense model. Runs with the same command as any model: `basalt serve PACK`. What it supports next to the others: [models](index.md). Rounding and quality: [precision](../precision/qwen38-27b.md).
 
 ## Pack
 

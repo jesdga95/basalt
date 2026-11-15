@@ -186,6 +186,9 @@ class Routing(Base):
         self.assertEqual(data["A"]["status"]["value"], "loaded")
         self.assertEqual(data["B"]["status"]["value"], "unloaded")
         self.assertEqual(data["B"]["meta"]["n_ctx"], 4096)
+        for row in data.values():   # the OpenAI model object's required fields
+            self.assertIs(type(row["created"]), int)
+            self.assertEqual(row["owned_by"], "basalt")
 
     def test_status_routes_answer_for_the_loaded_model(self):
         self.assertEqual(self.chat("B")[0], 200)

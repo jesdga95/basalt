@@ -76,7 +76,8 @@ class Service:
     def model_entry(self) -> dict:
         """This model's row in /v1/models."""
         value = "loading" if self.loading else "loaded" if self.loaded() else "unloaded"
-        return {"id": self.model, "object": "model", "status": {"value": value},
+        return {"id": self.model, "object": "model", "created": int(self.started_at), "owned_by": "basalt",
+                "status": {"value": value},
                 "asleep": getattr(self.engine, "asleep", False) is True,
                 "meta": {"n_ctx": self.engine.max_context},
                 "architecture": {"input_modalities": ["text", "image"] + (["video"] if self.video_on() else [])
