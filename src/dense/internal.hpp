@@ -102,13 +102,13 @@ struct ChunkScratch {
 };
 
 struct SessionState;
-/// The prompt line: a second card that holds the last layers' weights and reads them for a long prompt's chunks while the
-/// main card reads the next chunk's first layers (prompt_line.cpp).
-class PromptLine;
-struct PromptLineDeleter {
-    void operator()(PromptLine* p) const;
+/// A second card that holds the model's last layers and reads them for the main card: the prompt line reads a long prompt's
+/// chunks through them while the main card reads the next chunk's first layers (stage.cpp).
+class Stage;
+struct StageDeleter {
+    void operator()(Stage* p) const;
 };
-using PromptLinePtr = std::unique_ptr<PromptLine, PromptLineDeleter>;
+using StagePtr = std::unique_ptr<Stage, StageDeleter>;
 
 class Model {
 public:
@@ -145,7 +145,7 @@ public:
     std::vector<void*> owned;                    // device buffers the model allocated (Q8 plane copies, a wider workspace)
     void* enc_arena = nullptr;
     size_t enc_bytes = 0;
-    PromptLinePtr line;                          // a second card reading long prompts' last layers (null: none)
+    StagePtr line;                               // the prompt line: a second card reading long prompts' last layers (null: none)
     ~Model();
     bool ensure_chunk(std::string& err);
     /// llama.cpp's MMQ readied for every product of the model (its kernels loaded for each format and height).
@@ -237,12 +237,12 @@ void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64
 
 /// The line on CUDA device `dev` with layers [l_min, n_layers) of `w` (their weights already on `dev`, the other layers
 /// empty); both cards' prompt rates are timed here.
-PromptLinePtr make_prompt_line(Model& main, int dev, int l_min, const Weights& w, std::string& err);
+StagePtr make_prompt_line(Model& main, int dev, int l_min, const Weights& w, std::string& err);
 /// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards when the rates price that cheaper,
 /// true; false with empty `err` when it does not (the caller reads them on the main card).
 /// `stop` is asked between chunks on both cards: true ends the read where it is (the session then holds a part of the prompt
 /// only, as after a stopped read on the main card), true returned.
-bool prompt_line_read(PromptLine& line, Model& main, SessionState& st, const int32_t* tokens, int n, int64_t pos,
+bool prompt_line_read(Stage& line, Model& main, SessionState& st, const int32_t* tokens, int n, int64_t pos,
                       const std::function<void(int)>& progress, const std::function<bool()>& stop, std::string& err);
 
 /// The commit of the last window's first n rows into the recurrent state.
