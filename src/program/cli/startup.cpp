@@ -79,6 +79,7 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
+    basalt::platform::install_crash_handler();
     // if memory runs out the kernel ends this process first, not the rest of the machine
     basalt::platform::prefer_oom_victim();
     // the CPU expert pool keeps its speed while the window is in the background

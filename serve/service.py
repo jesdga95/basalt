@@ -301,8 +301,12 @@ class Service:
         elif getattr(self.engine, "unloaded", False):
             print("[server] loading the model again", flush=True)
         else:
-            code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-            print(f"[server] warning: the engine stopped (exit code {code}), restarting it", flush=True)
+            note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
+            if not note:
+                code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
+                note = f"the engine stopped (exit code {code})"
+            log = getattr(self.engine, "log_path", None)
+            print(f"[server] warning: {note}, restarting it{', log ' + log if log else ''}", flush=True)
         try:
             tries = 1 if self.booting else self.start_tries   # the start-up load tries once
             self.engine.restart(tries=tries) if tries else self.engine.restart()
@@ -353,7 +357,10 @@ class Service:
         """Print the server-window line for an engine that ended mid-request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
-        why = f"{e}: {note}" if note else str(e)
+        if note and note in str(e):
+            why = str(e)
+        else:
+            why = f"{e}: {note}" if note else str(e)
         print(f"[server] warning: {why} (the next request restarts it{', log ' + log if log else ''})", flush=True)
 
     def require_grammar(self, response_format) -> None:

@@ -179,6 +179,20 @@ class Tail(unittest.TestCase):
             self.wait_for(b, 1)
             self.assertEqual(b.since(0)[0][0]["msg"], "hello")
 
+    def test_on_line_reports_exact_byte_offsets(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "events.log"
+            log.write_text("before\n", encoding="utf-8")
+            b = LogBuffer()
+            seen = []
+            threading.Thread(target=tail_file, args=(b, str(log), "eng", 0.02),
+                             kwargs={"on_line": lambda text, pos: seen.append((text, pos))}, daemon=True).start()
+            time.sleep(0.1)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("basalt serve: warning: hot\n")
+            self.wait_for(b, 1)
+            self.assertEqual(seen, [("basalt serve: warning: hot", len("before\nbasalt serve: warning: hot\n"))])
+
 
 class Tty(io.StringIO):
     def isatty(self):
