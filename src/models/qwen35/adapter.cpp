@@ -414,6 +414,7 @@ public:
     model::TokenNames token_names() const override { return program::qwen_token_names(); }
     program::grammar::ToolForm tool_form() const override { return program::qwen_tool_form(); }
     int max_expert_cards() const override { return 0; }
+    bool second_card_reads_prompts() const override { return true; }
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         (void) code;

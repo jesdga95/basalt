@@ -9,7 +9,7 @@
 
 namespace basalt::program::cli {
 
-std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers) {
+std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers, bool prompt_line) {
     namespace bp = basalt::program;
     bp::GpuSpec spec;
     std::string gerr;
@@ -46,13 +46,14 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     bp::RoleInputs ri;
     for (int i : choice.cards) ri.cards.push_back((size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{});
     ri.max_expert_tiers = max_expert_tiers;   // the device-planned tail's peer windows
+    ri.prompt_line = prompt_line;
     const std::vector<bp::GpuRole> roles = bp::choose_roles(ri);
     std::string line;
     for (size_t d = 0; d < roles.size(); ++d) {
         const bp::GpuCard& c = ri.cards[d];
         line += std::string(d ? ", " : "") + (c.name.empty() ? "GPU" : c.name) +
                 (c.smi >= 0 ? " (nvidia-smi " + std::to_string(c.smi) + ")" : "") + " " + bp::gpu_role_name(roles[d]);
-        if (roles[d] == bp::GpuRole::ExpertTier) {
+        if (roles[d] == bp::GpuRole::ExpertTier || roles[d] == bp::GpuRole::PromptLine) {
             o.peer_devices.push_back((int) d);
             o.peer_gbps.push_back(c.mem_gbps);
         }
@@ -60,7 +61,8 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     basalt::log::info("basalt", "gpus: %s", line.c_str());
     if (std::count(roles.begin(), roles.end(), bp::GpuRole::Idle) > 0)
         basalt::log::warn("basalt", "%s",
-                          ("expert tiers max " + std::to_string(ri.max_expert_tiers) + "; later cards idle").c_str());
+                          (prompt_line ? std::string("one card reads prompts beside the main card; later cards idle")
+                                       : "expert tiers max " + std::to_string(ri.max_expert_tiers) + "; later cards idle").c_str());
     if (!o.peer_devices.empty()) o.peer_device = o.peer_devices[0];
     chosen_cards = ri.cards;
     // The split hands a window's activations from one card to the next, and a tier card reads its experts d2d: both
