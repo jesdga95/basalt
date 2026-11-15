@@ -1048,13 +1048,6 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 }
 
 namespace {
-__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
-    while (*flag < value) spin_pause();
-    __threadfence_system();
-}
-}  // namespace
-
-namespace {
 // one thread per window entry: up to kVerifyMaxT tokens x 10 routed experts (80), so 128 (a smaller table drops the last entries of a long window)
 constexpr int kResidentPlanMax = 128;
 static_assert(kVerifyMaxT * 10 <= kResidentPlanMax, "resident_plan: one thread per entry");
@@ -1247,19 +1240,6 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     check("copy_or_zero_from_mapped");
 }
 
-void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
-    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
-    check("wait_flag_ge");
-}
-
-namespace {
-__global__ void signal_flag_kernel(volatile uint32_t* flag, uint32_t value) {
-    __threadfence_system();
-    *flag = value;
-    __threadfence_system();
-}
-}  // namespace
-
 namespace {
 __global__ void word_copy_list_kernel(WordCopyList l) {
     const WordCopy e = l.e[blockIdx.x];
@@ -1271,11 +1251,6 @@ void word_copy_list(const WordCopyList& l, void* stream) {
     if (l.n <= 0) return;
     word_copy_list_kernel<<<l.n, 128, 0, (cudaStream_t) stream>>>(l);
     check("word_copy_list");
-}
-
-void signal_flag(uint32_t* flag, uint32_t value, void* stream) {
-    signal_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
-    check("signal_flag");
 }
 
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
