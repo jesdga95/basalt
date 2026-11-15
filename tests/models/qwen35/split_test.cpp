@@ -1,9 +1,10 @@
 // tests/models/qwen35/split_test.cpp - the layer split (layers [0, cut) on the main card, [cut, n) on a second card) gives the
-// main card's output to the bit: after a prompt the running state has the same bytes (the main card's recurrent state
-// followed by the second card's), and the windows that follow (one row, drafted windows of several rows kept in part or
+// main card's output to the bit: after a prompt (read in chunks pipelined over the cards, once stopped part-way and then
+// whole) the running state has the same bytes (the main card's recurrent state followed by the second card's), and the
+// windows that follow (one row, drafted windows of several rows kept in part or
 // whole, two sessions batched) give the same picks and logits; a checkpoint taken, decoded past and restored gives them
-// again.  Cuts 56, 48 and 44, fp16 and int8 KV, the block drafter on and off.  Needs a 27B pack (argument or
-// BASALT_QWEN35_PACK) and two GPUs; exits 77 without them.
+// again.  Cuts 56, 48 and 44, fp16 and int8 KV, the block drafter on and off; with a picture's path as the second argument,
+// a picture read across the cards too.  Needs a 27B pack (argument or BASALT_QWEN35_PACK) and two GPUs; exits 77 without them.
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/model/adapter.hpp"
@@ -51,6 +52,7 @@ struct Out {
     std::vector<uint64_t> logits;
     std::vector<uint64_t> batch;   // two sessions in one batch
     std::vector<int32_t> again;    // after a restore
+    int stopped = 0;               // reports a stopped read gave
 };
 
 std::vector<uint8_t> save(model::ModelSession& s, int64_t pos) {
@@ -122,6 +124,17 @@ Out run(const model::ModelAdapter& a, const std::string& pack, const Setup& su) 
     }
     Out o;
     const int n = su.prompt - 1;
+    {   // a read stopped after its second report, then the whole prompt again from the start
+        int reports = 0;
+        model::PrefillRequest p;
+        p.tokens = prompt.data();
+        p.n_tokens = n;
+        p.total_tokens = n;
+        p.progress = [&](int) { ++reports; };
+        p.stop = [&] { return reports >= 2; };
+        if (const model::Result e = s->prefill_chunk(p); !e.ok()) die("stopped prefill", e.message);
+        o.stopped = reports;
+    }
     for (model::ModelSession* ss : {s.get(), s2.get()}) {
         model::PrefillRequest p;
         p.tokens = prompt.data();
@@ -180,6 +193,40 @@ Out run(const model::ModelAdapter& a, const std::string& pack, const Setup& su) 
     return o;
 }
 
+// a picture's rows read after a short text, then one-row windows: the logits of each, hashed
+std::vector<uint64_t> vision_run(const model::ModelAdapter& a, const std::string& pack, const std::vector<uint8_t>& image, int cut) {
+    model::LoadRequest req;
+    req.paths = {pack};
+    req.max_context = 8192;
+    req.vision = true;
+    if (cut) {
+        req.peer_devices = {1};
+        req.diag_split_at = cut;
+    }
+    std::unique_ptr<model::LoadedModel> loaded;
+    if (const model::Result e = a.load(req, loaded); !e.ok()) die("load", e.message);
+    std::unique_ptr<model::ModelSession> s;
+    if (const model::Result e = loaded->make_session(s); !e.ok() || !s->prepare().ok()) die("session", e.message);
+    std::vector<int32_t> text(64);
+    for (size_t i = 0; i < text.size(); ++i) text[i] = 1000 + (int32_t) (i * 37 % 20000);
+    model::PrefillRequest p;
+    p.tokens = text.data();
+    p.n_tokens = (int) text.size();
+    p.total_tokens = p.n_tokens;
+    if (const model::Result e = s->prefill_chunk(p); !e.ok()) die("prefill", e.message);
+    std::vector<float> rows;
+    int n_rows = 0;
+    model::ImageGrid grid;
+    if (const model::Result e = s->encode_image(image.data(), image.size(), rows, n_rows, grid); !e.ok()) die("encode", e.message);
+    if (const model::Result e = s->prefill_embeddings(rows.data(), n_rows, p.n_tokens, grid); !e.ok()) die("image", e.message);
+    s->images_done();
+    Out o;
+    int32_t tok = 1000;
+    for (int i = 0; i < 8; ++i) tok = window(*s, &tok, 1, p.n_tokens + n_rows + i, o);
+    o.logits.push_back(fnv(o.picks.data(), o.picks.size() * 4));
+    return o.logits;
+}
+
 void compare(const model::ModelAdapter& a, const std::string& pack, Setup su, const std::vector<int>& cuts) {
     const std::string tag = std::string(su.draft ? "drafter on, " : "plain, ") + (su.int8 ? "int8 KV, " : "fp16 KV, ") +
                             std::to_string(su.prompt) + "-token prompt";
@@ -188,7 +235,8 @@ void compare(const model::ModelAdapter& a, const std::string& pack, Setup su, co
         su.cut = c;
         const Out two = run(a, pack, su);
         const std::string at = " (cut " + std::to_string(c) + ", " + tag + ")";
-        check(one.state == two.state, "the state after the prompt has the same bytes" + at);
+        check(two.stopped >= 2 && two.stopped <= (su.prompt + 4095) / 4096, "a stopped read reports its chunks (" + std::to_string(two.stopped) + ")" + at);
+        check(one.state == two.state, "the state after the prompt (read again after a stopped read) has the same bytes" + at);
         check(one.picks == two.picks && one.logits == two.logits, "the same picks and logits in windows of 1 to 16 rows" + at);
         check(one.again == two.again, "the same again after a checkpoint is restored" + at);
         check(one.batch == two.batch, "the same for two sessions in one batch" + at);
@@ -211,6 +259,16 @@ int main(int argc, char** argv) {
     compare(*a, pack, {0, true, false, 8200}, {56, 48, 44});
     compare(*a, pack, {0, true, true, 16400}, {48});
     compare(*a, pack, {0, false, true, 8200}, {44});
+    if (argc > 2) {   // a picture (its path the second argument)
+        std::vector<uint8_t> image;
+        if (FILE* f = std::fopen(argv[2], "rb")) {
+            int c;
+            while ((c = std::fgetc(f)) != EOF) image.push_back((uint8_t) c);
+            std::fclose(f);
+        }
+        if (image.empty()) die(argv[2], "cannot read the picture");
+        check(vision_run(*a, pack, image, 0) == vision_run(*a, pack, image, 48), "a picture and the windows after it give the same logits (cut 48)");
+    }
     std::printf("%s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;
 }

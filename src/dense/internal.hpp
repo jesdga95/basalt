@@ -234,6 +234,11 @@ bool init_state(Model& m, SessionState& st, std::string& err);
 void free_state(SessionState& st);
 /// The layer split's second card's state of the session `st` of model `m` (st.peer).
 bool split_session(Model& m, SessionState& st, std::string& err);
+/// Tokens [pos, pos + n) of the session `st` across the layer split's cards, the chunks pipelined (the second card reads a
+/// chunk's later layers while the main card reads the next one's first layers); `progress` and `stop` as prompt_line_read's.
+/// A session with an MTP drafter reads its prompt chunk by chunk (split_chunk): that drafter reads every chunk's last rows.
+bool split_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_t pos, const std::function<void(int)>& progress,
+                const std::function<bool()>& stop, std::string& err);
 /// A prompt chunk across the layer split's cards, one after the other (forward_chunk's arguments).
 bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos, const int32_t* pos3,
                  std::string& err);
