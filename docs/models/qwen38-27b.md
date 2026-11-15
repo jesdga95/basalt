@@ -55,7 +55,9 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
   6.3 tok/s against 59.9). Decode reads them at about 24 GB/s of the link's 28.8, so the link sets the speed.
 - **Slots:** `--parallel N` gives each slot its own cache and recurrent state (157 MiB). Slots share the weights.
 - **Cards:** the main card decodes and holds everything. A second Blackwell card (`gpu "0,1"`, or `"auto"` when two are visible) is the
-  prompt line: it reads the last layers of long prompts ([below](#long-prompts-on-two-cards)). Further cards idle.
+  prompt line: it reads the last layers of long prompts ([below](#long-prompts-on-two-cards)). When the model, the context and the slots do
+  not fit the main card, the second card holds and runs the later layers instead ([below](#two-cards-when-it-does-not-fit-one)). Further
+  cards idle.
 
 ## Drafting
 
@@ -92,6 +94,35 @@ card), pictures and video (a picture's rows go through the main card; the text b
 its checkpoints, the thinking budget. A cancelled request is met within two chunks on either card (0.9 s into a 16K read and 1.4 s into a 40K one, against 0.5 and 0.8 s on one card)
 and the next request finds the state it would find after a cancel on one card.
 
+## Two cards when it does not fit one
+
+With a second Blackwell card, a start whose weights, KV cache, recurrent state and scratch do not fit the main card splits the layers:
+the main card keeps layers 0 to N-1 with the head, the drafter and the image encoder, the second card layers N to 63 with their own KV
+cache and recurrent state for every slot. The start line calls that card the `layer stage` (`gpus: RTX 5090 (nvidia-smi 0) main,
+RTX 5060 Ti (nvidia-smi 1) layer stage`), then `layer split: layers 0-54 (29.82 GiB) on CUDA0, 55-63 (6.86 GiB) on CUDA1`.
+
+- **The cut** is planned at start from the pack's bytes per layer and both cards' free memory. Cards whose memory bandwidth differs
+  by more than 10% keep the most layers that fit on the faster card (the main card, the one `"auto"` picks first); alike cards halve
+  the layers' bytes, so a prompt's chunks take the same time on both. A start that fits one card does not split; one that fits neither
+  one card nor any cut stops and names both cards' free memory.
+- **Decode:** each card runs its layers of every window as its own CUDA graph; the residual crosses through page-locked RAM that both
+  graphs read and write with kernels, and the main card reads the block drafter's rows of the later layers back. Every product on the
+  second card is planned as on the main card, so the output is the main card's alone to the bit, at every window width, with
+  `--parallel`, checkpoints and parked conversations.
+- **Prompts:** chunks run as a pipeline, the second card reading a chunk's later layers while the main card reads the next chunk's
+  first layers. With the MTP drafter (no block drafter in the pack) a prompt runs chunk by chunk.
+- **`--kv-resident`** applies on both cards: each keeps the first N positions of its attention layers in VRAM.
+
+What a split costs per window on an RTX 5090 (400 W) with an RTX 5060 Ti (180 W), PCIe x8 without GPU-to-GPU access, conversation,
+cold, three runs each: about 0.37 ms per layer the 5060 Ti runs. ms per window, `--spec 0` / drafted (`--spec 16`):
+
+| Layers on the 5060 Ti | `--spec 0` | `--spec 16` |
+| --- | ---: | ---: |
+| none (one card) | 11.2 | 14.4 |
+| 8 (cut 56) | 13.9 | 17.4 |
+| 16 (cut 48) | 17.2 | 20.6 |
+| 20 (cut 44) | 18.8 | 22.4 |
+
 ## Images and video
 
 `--vision dynamic`: the encoder's weights wait in page-locked RAM and go to the card for each request's pictures. Video works as
@@ -101,11 +132,12 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 
 - `--kv-resident` keeps the MTP drafter's own cache on the card (the block drafter's is a short window).
 - Slots whose windows fit 16 rows together (every slot in plain decoding, two slots of 8-row drafted windows) share one pass through the weights each round, and their block drafters run two blocks a pass; a window that does not fit takes a pass of its own. Prompt reads run per slot.
-- Decoding runs on the main card: a second card reads long prompts only (no layer split, no second-card drafting).
+- A second card either reads long prompts or runs the later layers (when the model does not fit one card), never both; no second-card
+  drafting.
 
 ## Speed
 
-`basalt-bench` on an RTX 5090 at 400 W, `--kv fp16` unless stated, the pack with the block drafter, cold first runs (one card except the last two rows):
+`basalt-bench` on an RTX 5090 at 400 W, `--kv fp16` unless stated, the pack with the block drafter, cold first runs (one card except the last three rows):
 
 | | Result |
 | --- | --- |
@@ -115,3 +147,4 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 | Decode, `--parallel 2` / `--parallel 4`, every slot on the same chat, all slots together | 408 / 566 tok/s |
 | Prompt read, 8k / 16k / 32k / 64k, one card, then with an RTX 5060 Ti (180 W) as the prompt line | 12,072 / 10,716 / 8,654 / 6,137, then 13,606 / 12,699 / 10,518 / 7,570 tok/s (+13% / +19% / +22% / +23%) |
 | The same with `--kv int8` | 12,822 / 12,070 / 10,644 / 8,637, then 14,610 / 14,828 / 13,214 / 10,991 tok/s (+14% / +23% / +24% / +27%) |
+| Prompt read, 4k / 16k / 32k / 64k, `--kv int8`, split across the RTX 5090 and an RTX 5060 Ti at layer 56, then 48 ([split](#two-cards-when-it-does-not-fit-one)) | 12,272 / 13,245 / 11,883 / 9,682, then 9,824 / 13,238 / 12,557 / 10,558 tok/s (a 4k prompt is one chunk: nothing overlaps) |
