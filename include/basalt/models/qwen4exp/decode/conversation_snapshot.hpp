@@ -39,6 +39,10 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state,
 // state stays unchanged while `out` is read, on the thread and device of this call.
 bool conversation_kv_source(ConversationKvSource& out, const QsaState& state, const ModelGeometry& g, int64_t upto,
                             bool include_index, std::string& error);
+// `base` with the bytes of its pages [first, last), `page_bytes` each, read from a ring that keeps them apart: page p
+// at `ring + (p % ring_pages) * page_bytes`, device memory copied out on the calling thread.
+ConversationBytes conversation_bytes_over_ring(ConversationBytes base, const void* ring, uint64_t page_bytes,
+                                               int64_t ring_pages, int64_t first, int64_t last);
 // A restore of every layer at once from K/V left where a disk read found it: layer j of `kv` goes into
 // `targets[j]`, each piece copied as it arrives.  Caller synchronizes the device before; a failure may leave the
 // states partly written.

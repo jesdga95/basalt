@@ -142,6 +142,39 @@ bool MtpDrafter::save_store(int id, int64_t cells, ConversationKv& out, std::str
     return cur_ == prev || use_store(prev, err);
 }
 
+bool MtpDrafter::store_source(int id, int64_t cells, ConversationKvSource& out, std::string& err) {
+    if (n_stores_ == 0) return conversation_kv_source(out, st_, *g_, cells, false, err);
+    if (id < 0 || id > n_stores_) { err = "mtp: no such K/V store"; return false; }
+    const int prev = cur_;
+    if (!pend_tok_[(size_t) id].empty()) {
+        // its deferred rows are computed in the working state, which then goes back to the sequence it held
+        note_cells(0, store_hi_[(size_t) prev]);
+        if (!flush(id, err) || !use_store(prev, err)) return false;
+        // the readers copy on other streams than the one those rows and page copies run on
+        const OnDevice on_device(device_);
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
+    }
+    // as save_store: the working state's bytes (the host copy's with a ring, once the sequence it holds has put its
+    // pages back), with another sequence's pages read from its store
+    if (cur_ == id && !ring_to_host(err)) return false;
+    if (!conversation_kv_source(out, st_, *g_, cells, false, err)) return false;
+    if (cur_ == id) return true;
+    KvArr lay[4];
+    const int na = kv_layout(lay);
+    const int64_t ps = shapes_of(*g_).page_size, ring = store_ring_[(size_t) id];
+    const int64_t n1 = std::min<int64_t>(store_pages_[(size_t) id], (cells + ps - 1) / ps);
+    for (int i = 0; i < na; ++i) {
+        ConversationBytes& part = out.parts[(size_t) i];
+        part = conversation_bytes_over_ring(std::move(part), stores_[(size_t) id][(size_t) i], lay[i].page_bytes, ring,
+                                            std::max<int64_t>(0, n1 - ring), n1);
+        part.read = [read = std::move(part.read), device = device_](uint64_t o, uint8_t* d, uint64_t n) {
+            const OnDevice on_device(device);
+            return read(o, d, n);
+        };
+    }
+    return true;
+}
+
 bool MtpDrafter::ring_to_host(std::string& err) {
     if (st_.kv_mode != 2 || n_stores_ == 0) return true;
     const OnDevice on_device(device_);

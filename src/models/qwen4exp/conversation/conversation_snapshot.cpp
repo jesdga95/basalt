@@ -237,6 +237,27 @@ bool conversation_kv_source(ConversationKvSource& out, const QsaState& st, const
     return true;
 }
 
+ConversationBytes conversation_bytes_over_ring(ConversationBytes base, const void* ring, uint64_t page_bytes,
+                                               int64_t ring_pages, int64_t first, int64_t last) {
+    const uint8_t* r = static_cast<const uint8_t*>(ring);
+    const uint64_t lo = (uint64_t) std::max<int64_t>(first, 0) * page_bytes;
+    const uint64_t hi = std::min<uint64_t>((uint64_t) std::max<int64_t>(last, 0) * page_bytes, base.size);
+    const uint64_t span = (uint64_t) ring_pages * page_bytes;
+    if (r == nullptr || span == 0 || lo >= hi) return base;
+    ConversationBytes b;
+    b.size = base.size;
+    b.read = [read = std::move(base.read), r, lo, hi, span](uint64_t o, uint8_t* d, uint64_t n) {
+        if ((o < lo || o + n > hi) && !read(o, d, n)) return false;   // what the ring does not cover
+        for (uint64_t at = std::max(o, lo), end = std::min(o + n, hi); at < end;) {
+            const uint64_t in = at % span, c = std::min(end - at, span - in);
+            if (cudaMemcpy(d + (at - o), r + in, c, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+            at += c;
+        }
+        return true;
+    };
+    return b;
+}
+
 namespace {
 // After the authoritative pools are written: the resident copies refill from them before any attention reads.
 bool settle_resident(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
