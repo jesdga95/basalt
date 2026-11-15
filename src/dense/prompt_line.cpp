@@ -161,6 +161,7 @@ bool take_cells(Arena& a, SessionState& s, const Geometry& g, bool int8, int ai0
         s.kc.push_back(k);
         s.vc.push_back(v);
         s.kq.push_back(q8);
+        s.far.push_back({});   // all of its cells are on the card
     }
     return true;
 }
