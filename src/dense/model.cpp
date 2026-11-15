@@ -561,11 +561,11 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         return nullptr;
     }
     prefill::mmq::iota(b.iota, kBatch, nullptr);
-    if (const int64_t near = resident_cells(o.max_context, o.kv_resident); near < o.max_context && g.attn_layers() > 0) {
+    if (const int64_t kept = resident_cells(o.max_context, o.kv_resident); kept < o.max_context && g.attn_layers() > 0) {
         // the prompt chunks' VRAM copy of one layer's far cells, laid out as a session's far buffers
-        const size_t cells = (size_t) (o.max_context - near) * g.n_kv * g.head_dim;
+        const size_t cells = (size_t) (o.max_context - kept) * g.n_kv * g.head_dim;
         void* p = nullptr;
-        if (cudaMalloc(&p, (size_t) (o.max_context - near) * cell_bytes(g, o.kv_int8)) != cudaSuccess ||
+        if (cudaMalloc(&p, (size_t) (o.max_context - kept) * cell_bytes(g, o.kv_int8)) != cudaSuccess ||
             cudaStreamCreateWithFlags(&m->stage_side, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&m->stage_free, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&m->stage_ready, cudaEventDisableTiming) != cudaSuccess) {
@@ -575,7 +575,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         }
         m->owned.push_back(p);
         kernels::KvFar& f = m->stage;
-        f.at = near;
+        f.at = kept;
         if (o.kv_int8) {
             f.q8.k = (int8_t*) p;
             f.q8.v = f.q8.k + cells;

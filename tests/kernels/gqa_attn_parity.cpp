@@ -23,6 +23,7 @@
 namespace {
 
 constexpr int NH = 24, NKV = 4, HD = 256, ROT = 64;
+constexpr double kPi = 3.14159265358979323846;
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
@@ -110,7 +111,7 @@ int main(int argc, char** argv) {
             rope.scaling.ext_factor = 1.0;
             // transformers: find_correction_range(beta_fast 32, beta_slow 1, dim, base, orig) with truncation, a linear
             // ramp over dim / 2 pairs, inv = interp (1 - extrap_factor) + extrap extrap_factor, extrap_factor = 1 - ramp
-            const auto corr = [&](double rot) { return ROT * std::log(orig / (rot * 2 * M_PI)) / (2 * std::log(base)); };
+            const auto corr = [&](double rot) { return ROT * std::log(orig / (rot * 2 * kPi)) / (2 * std::log(base)); };
             const double lo = std::max(0.0, std::floor(corr(32))), hi0 = std::min((double) ROT - 1, std::ceil(corr(1)));
             const double hi = lo == hi0 ? hi0 + 0.001 : hi0;
             for (int i = 0; i < ROT / 2; ++i) {
@@ -251,8 +252,8 @@ int main(int argc, char** argv) {
             ck(cudaMemcpy(d_at, at2, sizeof at2, cudaMemcpyHostToDevice), "copy");
         }
         // its cost at a short context in a large capacity, against the host launch's grid of the chunks in use
-        const int32_t near[2] = {2999, 0};
-        ck(cudaMemcpy(d_at, near, sizeof near, cudaMemcpyHostToDevice), "copy");
+        const int32_t near_at[2] = {2999, 0};
+        ck(cudaMemcpy(d_at, near_at, sizeof near_at, cudaMemcpyHostToDevice), "copy");
         double us[2];
         for (int dv = 0; dv < 2; ++dv) {
             for (int i = 0; i < 5; ++i)

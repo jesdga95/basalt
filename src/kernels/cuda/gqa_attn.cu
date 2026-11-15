@@ -62,7 +62,7 @@ struct DecSegs {
     const __half* kc[kMaxSegs] = {};
     const __half* vc[kMaxSegs] = {};
     KvInt8 q8[kMaxSegs] = {};
-    KvFar far[kMaxSegs] = {};
+    KvFar far_kv[kMaxSegs] = {};
     Range r[kMaxSegs];
 };
 __device__ __forceinline__ int seg_of(const int* first, int n, int i) {
@@ -175,7 +175,7 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
     const __half* kc = segs.kc[sk];
     const __half* vc = segs.vc[sk];
     const KvInt8 q8 = segs.q8[sk];
-    const KvFar fr = segs.far[sk];
+    const KvFar fr = segs.far_kv[sk];
     const float* q = q_all + (int64_t) row0 * n_head * HD;
     float* part = part_all + (int64_t) row0 * n_head * gx * (HD + 2);
     const int M = T * G, m0 = ((int) blockIdx.z - segs.tile0[sk]) * 16;
@@ -189,10 +189,10 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
             if (c0 + cell < hi_max) {
                 int64_t ce = cell0 + cell;
                 if (ce >= r.cap) ce -= r.cap;
-                const bool far = kv_far(fr, ce);
+                const bool far_kv = kv_far(fr, ce);
                 const int64_t row = ce * n_kv + kvh;
                 if (q8.k) {
-                    const KvInt8& c8 = far ? fr.q8 : q8;
+                    const KvInt8& c8 = far_kv ? fr.q8 : q8;
                     const float sk = __half2float(__ushort_as_half(c8.ks[row * (HD / 64) + d8 / 64]));
                     const float sv = __half2float(__ushort_as_half(c8.vs[row * (HD / 64) + d8 / 64]));
                     int8_t kb[8], vb[8];
@@ -207,8 +207,8 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
                     kw = *reinterpret_cast<uint4*>(kh);
                     vw = *reinterpret_cast<uint4*>(vh);
                 } else {
-                    kw = *reinterpret_cast<const uint4*>((far ? (const __half*) fr.k : kc) + row * HD + d8);
-                    vw = *reinterpret_cast<const uint4*>((far ? (const __half*) fr.v : vc) + row * HD + d8);
+                    kw = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.k : kc) + row * HD + d8);
+                    vw = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.v : vc) + row * HD + d8);
                 }
             }
             *reinterpret_cast<uint4*>(&ks[cell][d8]) = kw;
@@ -352,13 +352,13 @@ void launch_segs(const float* q, int n_head, int n_kv, DecSegs& segs, float* scr
 template <int HD>
 void launch_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_kv, const Range& r, int T,
                    float* scratch, int n_chunks, float* out, cudaStream_t s, KvInt8 q8 = {}, const float* gate_q = nullptr,
-                   uint16_t* gated16 = nullptr, KvFar far = {}) {
+                   uint16_t* gated16 = nullptr, KvFar far_kv = {}) {
     DecSegs segs;
     segs.row0[1] = T;
     segs.kc[0] = (const __half*) kc;
     segs.vc[0] = (const __half*) vc;
     segs.q8[0] = q8;
-    segs.far[0] = far;
+    segs.far_kv[0] = far_kv;
     segs.r[0] = r;
     launch_segs<HD>(q, n_head, n_kv, segs, scratch, n_chunks, out, s, gate_q, gated16);
 }
@@ -415,7 +415,7 @@ struct PromptSmem16 {
 
 __global__ void __launch_bounds__(PNW * 32) prompt_f16_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
                                                               const __half* __restrict__ vc, int n_head, int n_kv,
-                                                              int64_t pos0, int64_t T, float* __restrict__ out, KvFar far) {
+                                                              int64_t pos0, int64_t T, float* __restrict__ out, KvFar far_kv) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     PromptSmem16& sm = *reinterpret_cast<PromptSmem16*>(smem_raw);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -452,10 +452,10 @@ __global__ void __launch_bounds__(PNW * 32) prompt_f16_kernel(const float* __res
             const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
             const bool ok = c0 + r < cells;
             int64_t cell = ok ? c0 + r : 0;
-            const bool fa = kv_far(far, cell);
+            const bool fa = kv_far(far_kv, cell);
             const int64_t row = cell * n_kv + kvh;
-            cp16(&sm.k[r][c], (fa ? (const __half*) far.k : kc) + row * HD + c, ok);
-            cp16(&sm.v[r][c], (fa ? (const __half*) far.v : vc) + row * HD + c, ok);
+            cp16(&sm.k[r][c], (fa ? (const __half*) far_kv.k : kc) + row * HD + c, ok);
+            cp16(&sm.v[r][c], (fa ? (const __half*) far_kv.v : vc) + row * HD + c, ok);
         }
         asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
         __syncthreads();
@@ -585,7 +585,7 @@ template <int W, bool Split, class IO = float>
 __global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const IO* __restrict__ q, int n_head, int n_kv, int pos0,
                                                               int T, IO* __restrict__ out, KvInt8 q8,
                                                               float* __restrict__ part_rows, float2* __restrict__ part_stats,
-                                                              KvFar far) {
+                                                              KvFar far_kv) {
     constexpr int Threads = W * 32, Br = W * 16;
     constexpr int G4 = HD / 64;           // scale groups per row
     constexpr int NT = I8BC / 8;          // score n8 tiles per key tile
@@ -647,7 +647,7 @@ __global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const IO* __restri
             const int key = chunk >> 4, c = chunk & 15;
             const bool ok = key < valid;
             int64_t cell = (int64_t) kb * I8BC + (ok ? key : 0);
-            const KvInt8& c8 = kv_far(far, cell) ? far.q8 : q8;
+            const KvInt8& c8 = kv_far(far_kv, cell) ? far_kv.q8 : q8;
             const int64_t src = (cell * n_kv + kvh) * HD + c * 16;
             const int dst = key * HD + ((c ^ (key & 7)) << 4);
             cp16(k_s + dst, c8.k + src, ok);
@@ -657,7 +657,7 @@ __global__ void __launch_bounds__(W * 32, 1) prompt_i8_kernel(const IO* __restri
             const int key = tid & (I8BC - 1);
             const bool ok = key < valid;
             int64_t cell = (int64_t) kb * I8BC + (ok ? key : 0);
-            const KvInt8& c8 = kv_far(far, cell) ? far.q8 : q8;
+            const KvInt8& c8 = kv_far(far_kv, cell) ? far_kv.q8 : q8;
             const int64_t src = (cell * n_kv + kvh) * G4;
             if (tid < I8BC) cp8(ks_s + key * G4, c8.ks + src, ok);
             else cp8(vs_s + key * G4, c8.vs + src, ok);
@@ -901,7 +901,7 @@ int opt_in_device() {
 
 template <int W, bool Split, class IO = float>
 void launch_prompt_i8(const IO* q, int n_head, int n_kv, int pos0, int T, IO* out, KvInt8 q8, int splits,
-                      float* scratch, cudaStream_t st, KvFar far) {
+                      float* scratch, cudaStream_t st, KvFar far_kv) {
     static std::atomic<bool> raised[64];   // the shared-memory opt-in is per device
     const int dev = opt_in_device();
     if (!raised[dev].load(std::memory_order_acquire)) {
@@ -915,7 +915,7 @@ void launch_prompt_i8(const IO* q, int n_head, int n_kv, int pos0, int T, IO* ou
     float* rows = scratch;
     float2* stats = reinterpret_cast<float2*>(scratch + (size_t) splits * T * n_head * HD);
     const dim3 grid((unsigned) ((T + W * 16 - 1) / (W * 16)), (unsigned) n_head, (unsigned) splits);
-    prompt_i8_kernel<W, Split, IO><<<grid, W * 32, i8_smem<W>(), st>>>(q, n_head, n_kv, pos0, T, out, q8, rows, stats, far);
+    prompt_i8_kernel<W, Split, IO><<<grid, W * 32, i8_smem<W>(), st>>>(q, n_head, n_kv, pos0, T, out, q8, rows, stats, far_kv);
     if (Split) {
         check("gqa_prompt_attn");
         prompt_i8_merge_kernel<IO><<<dim3((unsigned) T, (unsigned) n_head), HD, 0, st>>>(rows, stats, n_head, T, splits, out);
@@ -962,7 +962,7 @@ size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_
 
 void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int T, float* scratch, int64_t max_cells, float* out, void* stream,
-                     const int32_t* pos_dev, KvInt8 q8, const float* gate_q, uint16_t* gated16, KvFar far) {
+                     const int32_t* pos_dev, KvInt8 q8, const float* gate_q, uint16_t* gated16, KvFar far_kv) {
     if (T < 1 || T > kGqaMaxWindow || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX || pos0 + T > max_cells) {
         basalt::log::error("basalt", "gqa_decode_attn: invalid arguments");
         std::exit(1);
@@ -973,7 +973,7 @@ void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
     r.pos_dev = pos_dev;
     const int n_chunks = (int) ((max_cells + CHUNK - 1) / CHUNK);
     launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream, q8, gate_q, gated16,
-                       far);
+                       far_kv);
 }
 
 void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* segs, int n_seg, float* scratch,
@@ -994,7 +994,7 @@ void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* se
         d.kc[k] = (const __half*) g.k_cache;
         d.vc[k] = (const __half*) g.v_cache;
         d.q8[k] = g.q8;
-        d.far[k] = g.far;
+        d.far_kv[k] = g.far_kv;
         d.r[k].pos0 = g.pos0;
         d.r[k].cap = max_cells;
         d.r[k].pos_dev = g.pos_dev;
@@ -1036,7 +1036,7 @@ size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits) {
 }
 
 void gqa_prompt_attn_bf16(const uint16_t* q, int n_head, int n_kv, int64_t pos0, int64_t T, uint16_t* out, void* stream,
-                          KvInt8 q8, float* split_scratch, size_t split_floats, KvFar far) {
+                          KvInt8 q8, float* split_scratch, size_t split_floats, KvFar far_kv) {
     if (T <= 0) return;
     if (!q8.k || n_kv < 1 || n_head % n_kv || pos0 + T > INT32_MAX) {
         basalt::log::error("basalt", "gqa_prompt_attn_bf16: an int8 cache and a supported head layout");
@@ -1046,15 +1046,15 @@ void gqa_prompt_attn_bf16(const uint16_t* q, int n_head, int n_kv, int64_t pos0,
     const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(q);
     __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(out);
     const I8Plan p = plan_prompt_i8(n_head, T, pos0 + T, split_scratch ? split_floats : 0);
-    if (p.warps == 4) launch_prompt_i8<4, false>(qb, n_head, n_kv, (int) pos0, (int) T, ob, q8, 1, nullptr, st, far);
-    else if (p.splits == 1) launch_prompt_i8<8, false>(qb, n_head, n_kv, (int) pos0, (int) T, ob, q8, 1, nullptr, st, far);
-    else launch_prompt_i8<8, true>(qb, n_head, n_kv, (int) pos0, (int) T, ob, q8, p.splits, split_scratch, st, far);
+    if (p.warps == 4) launch_prompt_i8<4, false>(qb, n_head, n_kv, (int) pos0, (int) T, ob, q8, 1, nullptr, st, far_kv);
+    else if (p.splits == 1) launch_prompt_i8<8, false>(qb, n_head, n_kv, (int) pos0, (int) T, ob, q8, 1, nullptr, st, far_kv);
+    else launch_prompt_i8<8, true>(qb, n_head, n_kv, (int) pos0, (int) T, ob, q8, p.splits, split_scratch, st, far_kv);
     check("gqa_prompt_attn_bf16");
 }
 
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8, float* split_scratch, size_t split_floats,
-                     KvFar far) {
+                     KvFar far_kv) {
     if (T <= 0) return;
     if (n_kv < 1 || n_head % n_kv || (!q8.k && PROWS % (n_head / n_kv)) || pos0 + T > INT32_MAX) {
         basalt::log::error("basalt", "gqa_prompt_attn: unsupported head layout or cell count");
@@ -1063,9 +1063,9 @@ void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
     const cudaStream_t st = (cudaStream_t) stream;
     if (q8.k) {
         const I8Plan p = plan_prompt_i8(n_head, T, pos0 + T, split_scratch ? split_floats : 0);
-        if (p.warps == 4) launch_prompt_i8<4, false>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, 1, nullptr, st, far);
-        else if (p.splits == 1) launch_prompt_i8<8, false>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, 1, nullptr, st, far);
-        else launch_prompt_i8<8, true>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, p.splits, split_scratch, st, far);
+        if (p.warps == 4) launch_prompt_i8<4, false>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, 1, nullptr, st, far_kv);
+        else if (p.splits == 1) launch_prompt_i8<8, false>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, 1, nullptr, st, far_kv);
+        else launch_prompt_i8<8, true>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, p.splits, split_scratch, st, far_kv);
     } else {
         static std::atomic<bool> raised[64];   // the shared-memory opt-in is per device
         const int dev = opt_in_device();
@@ -1080,7 +1080,7 @@ void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
         const int pb = PROWS / (n_head / n_kv);
         const dim3 grid((unsigned) ((T + pb - 1) / pb), (unsigned) n_kv);
         prompt_f16_kernel<<<grid, PNW * 32, sizeof(PromptSmem16), st>>>(q, (const __half*) k_cache, (const __half*) v_cache,
-                                                                         n_head, n_kv, pos0, T, out, far);
+                                                                         n_head, n_kv, pos0, T, out, far_kv);
     }
     check("gqa_prompt_attn");
 }

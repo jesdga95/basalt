@@ -52,9 +52,9 @@ struct Cache {
     int64_t cells = 0, at = 0;
     uint16_t *k = nullptr, *v = nullptr;            // one buffer, fp16
     basalt::kernels::KvInt8 q8;                     // one buffer, int8
-    uint16_t *nk = nullptr, *nv = nullptr;          // split: near
+    uint16_t *nk = nullptr, *nv = nullptr;          // split: near_p
     basalt::kernels::KvInt8 n8;
-    basalt::kernels::KvFar far;                     // split: far
+    basalt::kernels::KvFar far_kv;                     // split: far
     size_t bytes(int64_t n, bool scales) const { return (size_t) n * ROW * (int8 ? 1 : 2) / (scales ? 32 : 1); }
 
     bool on_host = false;
@@ -64,25 +64,25 @@ struct Cache {
         for (void* p : {(void*) k, (void*) v, (void*) nk, (void*) nv, (void*) q8.k, (void*) q8.v, (void*) q8.ks, (void*) q8.vs,
                         (void*) n8.k, (void*) n8.v, (void*) n8.ks, (void*) n8.vs})
             if (p) cudaFree(p);
-        for (void* p : {(void*) far.k, (void*) far.v, (void*) far.q8.k, (void*) far.q8.v, (void*) far.q8.ks, (void*) far.q8.vs})
+        for (void* p : {(void*) far_kv.k, (void*) far_kv.v, (void*) far_kv.q8.k, (void*) far_kv.q8.v, (void*) far_kv.q8.ks, (void*) far_kv.q8.vs})
             if (p) (void) (on_host ? cudaFreeHost(p) : cudaFree(p));
     }
     Cache(bool i8, int64_t n, int64_t split, bool far_on_host, std::mt19937& rng) : int8(i8), cells(n), at(split), on_host(far_on_host) {
-        far.at = split;
+        far_kv.at = split;
         const auto alloc_far = [&](size_t b) { return far_on_host ? host_bytes(b) : dev_bytes(b); };
         if (!int8) {
             k = (uint16_t*) dev_bytes(bytes(n, false));
             v = (uint16_t*) dev_bytes(bytes(n, false));
             nk = (uint16_t*) dev_bytes(bytes(split, false));
             nv = (uint16_t*) dev_bytes(bytes(split, false));
-            far.k = (uint16_t*) alloc_far(bytes(n - split, false));
-            far.v = (uint16_t*) alloc_far(bytes(n - split, false));
+            far_kv.k = (uint16_t*) alloc_far(bytes(n - split, false));
+            far_kv.v = (uint16_t*) alloc_far(bytes(n - split, false));
         } else {
             q8 = {(int8_t*) dev_bytes(bytes(n, false)), (int8_t*) dev_bytes(bytes(n, false)), (uint16_t*) dev_bytes(bytes(n, true)),
                   (uint16_t*) dev_bytes(bytes(n, true))};
             n8 = {(int8_t*) dev_bytes(bytes(split, false)), (int8_t*) dev_bytes(bytes(split, false)),
                   (uint16_t*) dev_bytes(bytes(split, true)), (uint16_t*) dev_bytes(bytes(split, true))};
-            far.q8 = {(int8_t*) alloc_far(bytes(n - split, false)), (int8_t*) alloc_far(bytes(n - split, false)),
+            far_kv.q8 = {(int8_t*) alloc_far(bytes(n - split, false)), (int8_t*) alloc_far(bytes(n - split, false)),
                       (uint16_t*) alloc_far(bytes(n - split, true)), (uint16_t*) alloc_far(bytes(n - split, true))};
         }
         fill(rng);
@@ -91,12 +91,12 @@ struct Cache {
     void fill(std::mt19937& rng) {
         std::normal_distribution<float> nd(0.f, 1.f);
         std::uniform_int_distribution<int> code(-127, 127);
-        const auto put = [&](void* one, void* near, void* farp, size_t elem, bool scales, auto gen) {
+        const auto put = [&](void* one, void* near_p, void* farp, size_t elem, bool scales, auto gen) {
             const size_t n = bytes(cells, scales) / elem, a = bytes(at, scales) / elem;
             std::vector<uint8_t> h(n * elem);
             for (size_t i = 0; i < n; ++i) gen(h.data() + i * elem);
             ck(cudaMemcpy(one, h.data(), n * elem, cudaMemcpyDefault), "copy");
-            ck(cudaMemcpy(near, h.data(), a * elem, cudaMemcpyDefault), "copy");
+            ck(cudaMemcpy(near_p, h.data(), a * elem, cudaMemcpyDefault), "copy");
             ck(cudaMemcpy(farp, h.data() + a * elem, (n - a) * elem, cudaMemcpyDefault), "copy");
         };
         const auto f16 = [&](uint8_t* p) { const uint16_t x = basalt::kernels::f16_from_f32(nd(rng)); std::memcpy(p, &x, 2); };
@@ -106,28 +106,28 @@ struct Cache {
             std::memcpy(p, &x, 2);
         };
         if (!int8) {
-            put(k, nk, far.k, 2, false, f16);
-            put(v, nv, far.v, 2, false, f16);
+            put(k, nk, far_kv.k, 2, false, f16);
+            put(v, nv, far_kv.v, 2, false, f16);
         } else {
-            put(q8.k, n8.k, far.q8.k, 1, false, i8);
-            put(q8.v, n8.v, far.q8.v, 1, false, i8);
-            put(q8.ks, n8.ks, far.q8.ks, 2, true, sc);
-            put(q8.vs, n8.vs, far.q8.vs, 2, true, sc);
+            put(q8.k, n8.k, far_kv.q8.k, 1, false, i8);
+            put(q8.v, n8.v, far_kv.q8.v, 1, false, i8);
+            put(q8.ks, n8.ks, far_kv.q8.ks, 2, true, sc);
+            put(q8.vs, n8.vs, far_kv.q8.vs, 2, true, sc);
         }
     }
     // the split form's bytes, near then far, equal the one buffer's
     bool same() const {
-        const auto eq = [&](const void* one, const void* near, const void* farp, bool scales) {
+        const auto eq = [&](const void* one, const void* near_p, const void* farp, bool scales) {
             const size_t n = bytes(cells, scales), a = bytes(at, scales);
             std::vector<uint8_t> x(n), y(n);
             ck(cudaMemcpy(x.data(), one, n, cudaMemcpyDefault), "copy");
-            ck(cudaMemcpy(y.data(), near, a, cudaMemcpyDefault), "copy");
+            ck(cudaMemcpy(y.data(), near_p, a, cudaMemcpyDefault), "copy");
             ck(cudaMemcpy(y.data() + a, farp, n - a, cudaMemcpyDefault), "copy");
             return x == y;
         };
-        if (!int8) return eq(k, nk, far.k, false) && eq(v, nv, far.v, false);
-        return eq(q8.k, n8.k, far.q8.k, false) && eq(q8.v, n8.v, far.q8.v, false) && eq(q8.ks, n8.ks, far.q8.ks, true) &&
-               eq(q8.vs, n8.vs, far.q8.vs, true);
+        if (!int8) return eq(k, nk, far_kv.k, false) && eq(v, nv, far_kv.v, false);
+        return eq(q8.k, n8.k, far_kv.q8.k, false) && eq(q8.v, n8.v, far_kv.q8.v, false) && eq(q8.ks, n8.ks, far_kv.q8.ks, true) &&
+               eq(q8.vs, n8.vs, far_kv.q8.vs, true);
     }
 };
 
@@ -199,7 +199,7 @@ int main(int argc, char** argv) {
             basalt::kernels::attn_qk_prepare(d_qf, d_kr, d_vr, d_norm, d_norm, 1e-6f, rope, d_pos, T, NH, NKV, d_qo, c.k, c.v, cell0,
                                              nullptr, 256, true, 0, nullptr, c.q8);
             basalt::kernels::attn_qk_prepare(d_qf, d_kr, d_vr, d_norm, d_norm, 1e-6f, rope, d_pos, T, NH, NKV, d_qo, c.nk, c.nv,
-                                             cell0, nullptr, 256, true, 0, nullptr, c.n8, c.far);
+                                             cell0, nullptr, 256, true, 0, nullptr, c.n8, c.far_kv);
             ck(cudaDeviceSynchronize(), "prepare");
             std::snprintf(what, sizeof what, "%s attn_qk_prepare across the split: the two buffers hold the one buffer's bytes", kv);
             report(what, c.same());
@@ -211,7 +211,7 @@ int main(int argc, char** argv) {
             const int64_t p0 = L - T;
             basalt::kernels::gqa_decode_attn(d_q, c.k, c.v, NH, NKV, p0, T, d_scr, L, d_o1, nullptr, nullptr, c.q8);
             basalt::kernels::gqa_decode_attn(d_q, c.nk, c.nv, NH, NKV, p0, T, d_scr, L, d_o2, nullptr, nullptr, c.n8, nullptr,
-                                             nullptr, c.far);
+                                             nullptr, c.far_kv);
             ok = ok && same((size_t) T * NH * HD);
         }
         std::snprintf(what, sizeof what, "%s gqa_decode_attn, windows of 1-16 rows, far cells in host memory", kv);
@@ -221,11 +221,11 @@ int main(int argc, char** argv) {
             ck(cudaMemcpy(d_at, a2, sizeof a2, cudaMemcpyHostToDevice), "copy");
             basalt::kernels::gqa_decode_attn(d_q, c.k, c.v, NH, NKV, L - 8, 8, d_scr, L, d_o1, nullptr, d_at, c.q8);
             basalt::kernels::gqa_decode_attn(d_q, c.nk, c.nv, NH, NKV, L - 8, 8, d_scr, L, d_o2, nullptr, d_at, c.n8, nullptr, nullptr,
-                                             c.far);
+                                             c.far_kv);
             bool ok2 = same((size_t) 8 * NH * HD);
             basalt::kernels::gqa_decode_attn(d_q, c.k, c.v, NH, NKV, at - 40, 3, d_scr, L, d_o1, nullptr, nullptr, c.q8);
             basalt::kernels::gqa_decode_attn(d_q, c.nk, c.nv, NH, NKV, at - 40, 3, d_scr, L, d_o2, nullptr, nullptr, c.n8, nullptr,
-                                             nullptr, c.far);
+                                             nullptr, c.far_kv);
             ok2 = ok2 && same((size_t) 3 * NH * HD);
             std::snprintf(what, sizeof what, "%s gqa_decode_attn, a device first cell and a window before the split", kv);
             report(what, ok2);
@@ -242,7 +242,7 @@ int main(int argc, char** argv) {
             s2[0].k_cache = c.nk;
             s2[0].v_cache = c.nv;
             s2[0].q8 = c.n8;
-            s2[0].far = c.far;
+            s2[0].far_kv = c.far_kv;
             basalt::kernels::gqa_decode_attn_segs(d_q, NH, NKV, s1, 2, d_scr, L, d_o1, nullptr);
             basalt::kernels::gqa_decode_attn_segs(d_q, NH, NKV, s2, 2, d_scr, L, d_o2, nullptr);
             std::snprintf(what, sizeof what, "%s gqa_decode_attn_segs, a split segment beside a one-buffer one", kv);
@@ -256,11 +256,11 @@ int main(int argc, char** argv) {
             float* sp = cfg == 1 ? d_split : nullptr;
             const size_t sf = cfg == 1 ? split_floats : 0;
             basalt::kernels::gqa_prompt_attn(d_q, p.k, p.v, NH, NKV, p0, T, d_o1, nullptr, p.q8, sp, sf);
-            basalt::kernels::gqa_prompt_attn(d_q, p.nk, p.nv, NH, NKV, p0, T, d_o2, nullptr, p.n8, sp, sf, p.far);
+            basalt::kernels::gqa_prompt_attn(d_q, p.nk, p.nv, NH, NKV, p0, T, d_o2, nullptr, p.n8, sp, sf, p.far_kv);
             bool okp = same((size_t) T * NH * HD);
             if (int8) {   // the BF16 form
                 basalt::kernels::gqa_prompt_attn_bf16(d_qb, NH, NKV, p0, T, (uint16_t*) d_o1, nullptr, p.q8, sp, sf);
-                basalt::kernels::gqa_prompt_attn_bf16(d_qb, NH, NKV, p0, T, (uint16_t*) d_o2, nullptr, p.n8, sp, sf, p.far);
+                basalt::kernels::gqa_prompt_attn_bf16(d_qb, NH, NKV, p0, T, (uint16_t*) d_o2, nullptr, p.n8, sp, sf, p.far_kv);
                 okp = okp && same((size_t) T * NH * HD / 2);
             }
             static const char* shape[3] = {"300 rows", "300 rows split", "2048 rows"};
@@ -283,12 +283,12 @@ int main(int argc, char** argv) {
                     cudaEventCreate(&e1);
                     for (int i = 0; i < 3; ++i)
                         basalt::kernels::gqa_decode_attn(d_q, b.nk, b.nv, NH, NKV, N - T, T, d_s, N, d_o2, nullptr, nullptr, b.n8,
-                                                         nullptr, nullptr, b.far);
+                                                         nullptr, nullptr, b.far_kv);
                     cudaEventRecord(e0);
                     const int reps = 20;
                     for (int i = 0; i < reps; ++i)
                         basalt::kernels::gqa_decode_attn(d_q, b.nk, b.nv, NH, NKV, N - T, T, d_s, N, d_o2, nullptr, nullptr, b.n8,
-                                                         nullptr, nullptr, b.far);
+                                                         nullptr, nullptr, b.far_kv);
                     cudaEventRecord(e1);
                     cudaEventSynchronize(e1);
                     float ms = 0;

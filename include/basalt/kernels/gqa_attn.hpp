@@ -50,7 +50,7 @@ size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_
 void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int T, float* scratch, int64_t max_cells, float* out, void* stream,
                      const int32_t* pos_dev = nullptr, KvInt8 q8 = {}, const float* gate_q = nullptr,
-                     uint16_t* gated16 = nullptr, KvFar far = {});
+                     uint16_t* gated16 = nullptr, KvFar far_kv = {});
 /// (gate_q, gated16: also each head's output times sigmoid of its gate, q_full [T][n_head][512]'s second half, as bf16
 /// rows [T][n_head * 256] into gated16 (bitwise attn_gate, then rounded); `out` may then be null.)
 /// One window of each of several sequences (a batch window's segments) in one launch: segment k's rows follow segment
@@ -63,7 +63,7 @@ struct GqaSeg {
     int64_t pos0 = 0;
     const int32_t* pos_dev = nullptr;
     KvInt8 q8 = {};
-    KvFar far = {};
+    KvFar far_kv = {};
 };
 void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* segs, int n_seg, float* scratch,
                           int64_t max_cells, float* out, void* stream, const float* gate_q = nullptr,
@@ -81,9 +81,9 @@ size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits);
 /// `split_scratch` (optional, `split_floats` floats): lets an int8-cache launch split its cells over more blocks.
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8 = {}, float* split_scratch = nullptr,
-                     size_t split_floats = 0, KvFar far = {});
+                     size_t split_floats = 0, KvFar far_kv = {});
 /// The prompt chunk's form on an int8 cache: BF16 queries and BF16 output rows (the same arithmetic; the output rounded once).
 void gqa_prompt_attn_bf16(const uint16_t* q, int n_head, int n_kv, int64_t pos0, int64_t T, uint16_t* out, void* stream,
-                          KvInt8 q8, float* split_scratch = nullptr, size_t split_floats = 0, KvFar far = {});
+                          KvInt8 q8, float* split_scratch = nullptr, size_t split_floats = 0, KvFar far_kv = {});
 
 }  // namespace basalt::kernels

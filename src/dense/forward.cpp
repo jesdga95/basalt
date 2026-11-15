@@ -274,17 +274,17 @@ kernels::DecRecArgs gdn_args(Model& m, const Layer& L) {
 }
 
 void win_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
-              kernels::KvInt8 q8 = {}, kernels::KvFar far = {}) {
+              kernels::KvInt8 q8 = {}, kernels::KvFar far_kv = {}) {
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.q.type, H, T, g.eps, s);
     prod_group(m, b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
-                             pos, s, 256, true, 0, b.pos0, q8, far);
+                             pos, s, 256, true, 0, b.pos0, q8, far_kv);
     const bool gated = on_wg(L.o.type);   // the merge gates and readies the rows for o
     kernels::gqa_decode_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.attn, m.o.max_context, gated ? nullptr : b.ao, s, b.pos0, q8,
-                             gated ? b.qfull : nullptr, gated ? (uint16_t*) b.xq : nullptr, far);
+                             gated ? b.qfull : nullptr, gated ? (uint16_t*) b.xq : nullptr, far_kv);
     win_attn_out(m, L, T, s);
 }
 
@@ -367,36 +367,36 @@ void chunk_residual_fp4(Model& m, const Linear& l, const uint16_t* a, const floa
 // stage); the chunk's own far cells follow its cache write (stage_far).
 
 // rows [r0, r1) of a far region, host to stage, on s
-void stage_rows(Model& m, const kernels::KvFar& far, int64_t r0, int64_t r1, cudaStream_t s) {
+void stage_rows(Model& m, const kernels::KvFar& far_kv, int64_t r0, int64_t r1, cudaStream_t s) {
     if (r1 <= r0) return;
     const kernels::KvFar& st = m.stage;
     const size_t row = (size_t) m.g.n_kv * m.g.head_dim, o = (size_t) r0 * row, n = (size_t) (r1 - r0) * row;
-    if (far.q8.k) {
-        cudaMemcpyAsync(st.q8.k + o, far.q8.k + o, n, cudaMemcpyHostToDevice, s);
-        cudaMemcpyAsync(st.q8.v + o, far.q8.v + o, n, cudaMemcpyHostToDevice, s);
-        cudaMemcpyAsync(st.q8.ks + o / 64, far.q8.ks + o / 64, n / 64 * 2, cudaMemcpyHostToDevice, s);
-        cudaMemcpyAsync(st.q8.vs + o / 64, far.q8.vs + o / 64, n / 64 * 2, cudaMemcpyHostToDevice, s);
+    if (far_kv.q8.k) {
+        cudaMemcpyAsync(st.q8.k + o, far_kv.q8.k + o, n, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(st.q8.v + o, far_kv.q8.v + o, n, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(st.q8.ks + o / 64, far_kv.q8.ks + o / 64, n / 64 * 2, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(st.q8.vs + o / 64, far_kv.q8.vs + o / 64, n / 64 * 2, cudaMemcpyHostToDevice, s);
     } else {
-        cudaMemcpyAsync(st.k + o, far.k + o, n * 2, cudaMemcpyHostToDevice, s);
-        cudaMemcpyAsync(st.v + o, far.v + o, n * 2, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(st.k + o, far_kv.k + o, n * 2, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(st.v + o, far_kv.v + o, n * 2, cudaMemcpyHostToDevice, s);
     }
 }
 
 // the far cells below `pos` (earlier chunks') to the stage on the stage stream, after what s has queued
-void stage_prefetch(Model& m, const kernels::KvFar& far, int64_t pos, cudaStream_t s) {
-    if (pos <= far.at) return;
+void stage_prefetch(Model& m, const kernels::KvFar& far_kv, int64_t pos, cudaStream_t s) {
+    if (pos <= far_kv.at) return;
     cudaEventRecord(m.stage_free, s);
     cudaStreamWaitEvent(m.stage_side, m.stage_free, 0);
-    stage_rows(m, far, 0, pos - far.at, m.stage_side);
+    stage_rows(m, far_kv, 0, pos - far_kv.at, m.stage_side);
     cudaEventRecord(m.stage_ready, m.stage_side);
 }
 
 // the cells a chunk at pos.. of T rows reads: `far` itself when they are all on the card, else the stage, completed with
 // the chunk's own far cells (after its cache write) once the prefetch is in
-kernels::KvFar stage_far(Model& m, const kernels::KvFar& far, int64_t pos, int T, cudaStream_t s) {
-    if (pos + T <= far.at) return far;
-    if (pos > far.at) cudaStreamWaitEvent(s, m.stage_ready, 0);
-    stage_rows(m, far, std::max<int64_t>(0, pos - far.at), pos + T - far.at, s);
+kernels::KvFar stage_far(Model& m, const kernels::KvFar& far_kv, int64_t pos, int T, cudaStream_t s) {
+    if (pos + T <= far_kv.at) return far_kv;
+    if (pos > far_kv.at) cudaStreamWaitEvent(s, m.stage_ready, 0);
+    stage_rows(m, far_kv, std::max<int64_t>(0, pos - far_kv.at), pos + T - far_kv.at, s);
     return m.stage;
 }
 
@@ -404,7 +404,7 @@ kernels::KvFar stage_far(Model& m, const kernels::KvFar& far, int64_t pos, int T
 // and v products and the same cache write, without the queries, the attention and the output projection.  `far`: a
 // streamed cache's far cells (the chunk's rows are written there and read from the stage; stage_prefetch has run).
 void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
-                kernels::KvInt8 q8 = {}, bool cells_only = false, kernels::KvFar far = {}) {
+                kernels::KvInt8 q8 = {}, bool cells_only = false, kernels::KvFar far_kv = {}) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim;
@@ -426,7 +426,7 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
                 product(L.v, b.v);
             }
             kernels::attn_qk_prepare_bf16(nullptr, bf(b.k), bf(b.v), nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr,
-                                          pos, s, q8, kc, vc, far);
+                                          pos, s, q8, kc, vc, far_kv);
             return;
         }
         if (f8) {
@@ -438,8 +438,8 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
             product(L.v, b.v);
         }
         kernels::attn_qk_prepare_bf16(bf(b.qfull), bf(b.k), bf(b.v), L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv,
-                                      bf(b.qo), pos, s, q8, kc, vc, far);
-        const kernels::KvFar read = stage_far(m, far, pos, T, s);
+                                      bf(b.qo), pos, s, q8, kc, vc, far_kv);
+        const kernels::KvFar read = stage_far(m, far_kv, pos, T, s);
         const size_t split = kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits);
         uint8_t* e4 = (uint8_t*) b.xq;
         float* e4s = prefill::fp8::act_scales(b.xq, T, AQ);
@@ -463,7 +463,7 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         gemm(m, L.k, b.k, T, s);
         gemm(m, L.v, b.v, T, s);
         kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr, kc, vc, pos, s,
-                                 256, true, 0, nullptr, q8, far);
+                                 256, true, 0, nullptr, q8, far_kv);
         return;
     }
     chunk_act(m, b.xn, L.q.type, H, T, s);
@@ -472,9 +472,9 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     gemm(m, L.k, b.k, T, s);
     gemm(m, L.v, b.v, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
-                             pos, s, 256, true, 0, nullptr, q8, far);
+                             pos, s, 256, true, 0, nullptr, q8, far_kv);
     kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split,
-                             kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits), stage_far(m, far, pos, T, s));
+                             kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits), stage_far(m, far_kv, pos, T, s));
     kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
     chunk_residual(m, L.o, b.ag, AQ, T, s);
 }
@@ -614,7 +614,7 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
             win_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
         } else {
             const int ai = m.attn_index[(size_t) il];
-            win_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], st.far[(size_t) ai]);
+            win_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], st.far_kv[(size_t) ai]);
         }
         win_ffn(m, L, T, s);
         if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) {
@@ -684,14 +684,14 @@ void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, i
         kernels::attn_qk_prepare(b.qfull + (size_t) row * 2 * AQ, b.k + (size_t) row * KV, b.v + (size_t) row * KV, L.q_norm,
                                  L.k_norm, g.eps, g.rope, b.pos + (size_t) row * 3, T, g.n_head, g.n_kv,
                                  b.qo + (size_t) row * AQ, st.kc[(size_t) ai], st.vc[(size_t) ai], segs[k].pos, s, 256, true, 0, p0,
-                                 st.kq[(size_t) ai], st.far[(size_t) ai]);
+                                 st.kq[(size_t) ai], st.far_kv[(size_t) ai]);
         as[k].T = T;
         as[k].k_cache = st.kc[(size_t) ai];
         as[k].v_cache = st.vc[(size_t) ai];
         as[k].pos0 = segs[k].pos;
         as[k].pos_dev = p0;
         as[k].q8 = st.kq[(size_t) ai];
-        as[k].far = st.far[(size_t) ai];
+        as[k].far_kv = st.far_kv[(size_t) ai];
         row += T;
     }
     const bool gated = on_wg(L.o.type);
@@ -867,7 +867,7 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
         if (m.stage.at >= pos) return;
         for (int j = il0; j < l1; ++j)
             if (w.layers[(size_t) j].kind == Mixer::Attention) {
-                if (j < g.n_layers - 1 || last_read) stage_prefetch(m, st.far[(size_t) m.attn_index[(size_t) j]], pos, s);
+                if (j < g.n_layers - 1 || last_read) stage_prefetch(m, st.far_kv[(size_t) m.attn_index[(size_t) j]], pos, s);
                 return;
             }
     };
@@ -882,7 +882,7 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
             chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
         } else {
             const int ai = m.attn_index[(size_t) il];
-            chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread, st.far[(size_t) ai]);
+            chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread, st.far_kv[(size_t) ai]);
             if (!unread) prefetch_from(il + 1);
         }
         if (unread) break;
