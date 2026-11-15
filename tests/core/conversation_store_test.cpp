@@ -4,7 +4,10 @@
 // or the identity differs, written again a turn on with only its new state, stored as of its last checkpoint when its
 // live end is a reply past it, the directory kept to its budget, and only a chat's root and last three turn-end states
 // written (a cut at a state not written goes back to the nearest one before it, refcounts of a shared root kept).  A
-// read that leaves the K/V in its files gives the same bytes through its sink as a whole read.
+// read that leaves the K/V in its files gives the same bytes through its sink as a whole read.  A conversation
+// written from its source a buffer at a time (as from a session's device buffers) leaves the same files as the queued
+// write of its image, and a write that fails leaves the files and the index as they were; one the budget does not
+// hold is refused or reported, and the budget does not count what a read still holds open.
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/platform/file.hpp"
@@ -12,12 +15,17 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace basalt::core;
@@ -270,10 +278,278 @@ void check_kv_read(ConversationStore& st, const ConversationStore::Match& m) {
     std::vector<ConversationKv> got;
     CHECK(read_kv(*kv, part.kv, got, err) && same_kv(got, whole.kv));
 }
+
+// bytes a source only copies out (as from a device), never in place: `budget` copies at most, then a failure
+template <class Bytes>
+ConversationBytes copy_only(const Bytes& b, int* budget, uint64_t* largest) {
+    ConversationBytes r;
+    r.size = b.size();
+    r.read = [&b, budget, largest](uint64_t o, uint8_t* d, uint64_t n) {
+        if (budget && (*budget)-- <= 0) return false;
+        if (largest) *largest = std::max(*largest, n);
+        if constexpr (std::is_same_v<Bytes, ConversationBuffer>) {
+            return b.read(d, o, n);
+        } else {
+            std::memcpy(d, b.data() + o, n);
+            return true;
+        }
+    };
+    return r;
+}
+
+// `s` as a write reads a session: its state through readers
+ConversationSource source(const SavedConversation& s, int* budget = nullptr, uint64_t* largest = nullptr) {
+    ConversationSource r;
+    r.geometry = s.geometry;
+    r.layer_lo = s.layer_lo;
+    r.layer_hi = s.layer_hi;
+    r.cvec = s.cvec;
+    r.ids = &s.live.ids;
+    r.imgs = &s.live.imgs;
+    for (const auto& c : s.checkpoints) r.checkpoints.push_back(&c);
+    r.live = {copy_only(s.live.state_a, budget, largest), copy_only(s.live.state_b, budget, largest),
+              copy_only(s.live.state_c, budget, largest), copy_only(s.live.state_d, budget, largest),
+              copy_only(s.live.state_e, budget, largest)};
+    for (const ConversationKv& kv : s.kv) {
+        ConversationKvSource k;
+        k.format = kv.format;
+        k.cells = kv.cells;
+        k.heads = kv.heads;
+        k.head_dim = kv.head_dim;
+        k.page_size = kv.page_size;
+        k.pooled_rows = kv.pooled_rows;
+        k.idx_dim = kv.idx_dim;
+        k.parts = {copy_only(kv.k, budget, largest), copy_only(kv.v, budget, largest),
+                   copy_only(kv.k_scale, budget, largest), copy_only(kv.v_scale, budget, largest),
+                   copy_only(kv.pooled, budget, largest)};
+        r.kv.push_back(std::move(k));
+    }
+    return r;
+}
+
+// every file of a directory, by name
+std::map<std::string, std::vector<uint8_t>> dir_files(const std::string& dir) {
+    std::map<std::string, std::vector<uint8_t>> out;
+    std::vector<basalt::platform::DirFile> files;
+    if (!basalt::platform::list_files(dir, files)) return out;
+    for (const auto& f : files) {
+        std::vector<uint8_t>& b = out[f.name];
+        b.resize((size_t) f.bytes);
+        std::FILE* fp = basalt::platform::open_file_utf8(dir + "/" + f.name, "rb");
+        if (!fp || std::fread(b.data(), 1, b.size(), fp) != b.size()) b.clear();
+        if (fp) std::fclose(fp);
+    }
+    return out;
+}
 }  // namespace
 
+// A conversation written from its source: the files of the queued write of its image, read back the same, whole and
+// with the K/V left in them; no read of the source larger than a write buffer.
+void written_from_source(const std::string& dir, uint64_t id) {
+    std::string err;
+    for (const Shape& c : kShapes) {
+        const std::string qdir = dir + "-q", ddir = dir + "-d";
+        std::vector<int32_t> ids;
+        const SavedConversation img = shaped(c, ids);
+        {
+            Store q;
+            CHECK(q.open(qdir, id, 1ull << 30, err));
+            CHECK(q.put(SavedConversation(img), 1ull << 30));
+            q.flush();
+            CHECK(q.stats().written == 1);
+        }
+        Store d;
+        CHECK(d.open(ddir, id, 1ull << 30, err));
+        uint64_t largest = 0;
+        CHECK(d.write(source(img, nullptr, &largest), err));
+        CHECK(largest > 0 && largest <= (8ull << 20));
+        size_t deepest = 0;
+        for (size_t k : c.checks) deepest = std::max(deepest, k);
+        const bool trimmed = deepest >= 2 && deepest < c.tokens && c.tokens - deepest <= 4096;   // stored as of it
+        CHECK(d.queued_bytes() == 0 && d.stats().written == 1);
+        CHECK(d.holds(img.live.ids, img.live.imgs, img.cvec) == !trimmed);
+        const auto qf = dir_files(qdir), df = dir_files(ddir);
+        CHECK(!qf.empty() && qf == df);
+        const std::vector<int32_t> p = prompt_at(ids, ids.size());
+        {   // after a restart, beside the queued write's files
+            Store restarted, baseline;
+            CHECK(restarted.open(ddir, id, 1ull << 30, err) && baseline.open(qdir, id, 1ull << 30, err));
+            const auto m = restarted.best(p.data(), p.size(), {}, true);
+            const auto qm = baseline.best(p.data(), p.size(), {}, true);
+            SavedConversation got, want;
+            CHECK(m.tokens == (int64_t) (trimmed ? deepest : c.tokens) && restarted.load(m, got, err));
+            CHECK(qm.tokens == m.tokens && baseline.load(qm, want, err));
+            CHECK(got.live.ids == want.live.ids && same_state(got.live, want.live) && same_kv(got.kv, want.kv));
+            CHECK(got.checkpoints.size() == want.checkpoints.size());
+            for (size_t i = 0; i < got.checkpoints.size() && i < want.checkpoints.size(); ++i)
+                CHECK(got.checkpoints[i].ids == want.checkpoints[i].ids &&
+                      same_state(got.checkpoints[i], want.checkpoints[i]));
+        }
+        check_kv_read(d, d.best(p.data(), p.size(), {}, true));
+        remove_dir(qdir);
+        remove_dir(ddir);
+    }
+    {
+        // a source that fails partway: nothing indexed, nothing left behind
+        std::vector<int32_t> ids;
+        const SavedConversation img = shaped(kShapes[0], ids);
+        Store d;
+        CHECK(d.open(dir, id, 1ull << 30, err));
+        int budget = 20;
+        CHECK(!d.write(source(img, &budget), err));
+        CHECK(d.stats().files == 0 && dir_bytes(dir) == 0);
+        CHECK(d.write(source(img), err) && d.stats().files == 1);
+        remove_dir(dir);
+    }
+}
+
+// A write that fails, or that the index changed under, leaves the stored copy of the conversation and what it refers
+// to readable, after a restart too; a write of a conversation a read holds open replaces it where the platform lets it.
+void failed_write_keeps_stored(const std::string& dir, uint64_t id) {
+    std::vector<int32_t> old_ids(300);
+    for (size_t i = 0; i < old_ids.size(); ++i) old_ids[i] = (int32_t) (i * 3 + 1);
+    const SavedConversation old = chat(old_ids, {{old_ids.size(), ConversationCheckpoint::kTurnEnd}});
+    const SavedConversation same = image(old_ids, {});
+    std::vector<int32_t> longer_ids = old_ids;
+    longer_ids.resize(5000, 19);
+    const SavedConversation longer = chat(longer_ids, {{old_ids.size(), ConversationCheckpoint::kTurnEnd}});
+    const std::vector<int32_t> prompt = prompt_at(old_ids, old_ids.size());
+    std::string err;
+    const auto holds_old = [&](ConversationStore& d) {
+        const auto match = d.best(prompt.data(), prompt.size(), {}, true);
+        SavedConversation got;
+        CHECK(match.tokens == (int64_t) old_ids.size() && d.load(match, got, err));
+        CHECK(same_state(got.live, old.checkpoints[0]) && same_kv(got.kv, old.kv));
+    };
+    {
+        Store d;
+        CHECK(d.open(dir, id, 1ull << 30, err));
+        CHECK(d.write(source(old), err));
+        const auto before = dir_files(dir);
+        for (const SavedConversation* replacement : {&same, &longer}) {
+            int budget = 0;
+            CHECK(!d.write(source(*replacement, &budget), err));
+            CHECK(d.stats().files == 1 && dir_files(dir) == before);
+            holds_old(d);
+        }
+        // an image queued during the write changes the index: the write is refused, neither entry is lost
+        std::vector<int32_t> other_ids(300, 777);
+        SavedConversation other = image(other_ids, {});
+        ConversationSource concurrent = source(same);
+        const auto read = concurrent.kv[0].parts[0].read;
+        bool queued = false;
+        concurrent.kv[0].parts[0].read = [&](uint64_t off, uint8_t* dst, uint64_t n) {
+            if (!queued) {
+                queued = true;
+                CHECK(d.put(std::move(other), 1ull << 30));
+            }
+            return read(off, dst, n);
+        };
+        CHECK(!d.write(concurrent, err) && queued);
+        d.flush();
+        CHECK(d.stats().files == 2);
+        holds_old(d);
+    }
+    {
+        Store d;
+        CHECK(d.open(dir, id, 1ull << 30, err));
+        holds_old(d);
+        const auto match = d.best(prompt.data(), prompt.size(), {}, true);
+        std::unique_ptr<ConversationKvRead> held;
+        SavedConversation shape;
+        CHECK(d.load(match, shape, err, &held) && held);
+        std::vector<ConversationKv> got;
+        if (d.write(source(same), err)) {   // the read goes on in the file it opened
+            CHECK(held && read_kv(*held, shape.kv, got, err) && same_kv(got, old.kv));
+        } else {
+            held.reset();
+            CHECK(d.write(source(same), err));
+        }
+        held.reset();
+        const auto updated = d.best(prompt.data(), prompt.size(), {}, true);
+        SavedConversation replacement;
+        CHECK(updated.tokens == (int64_t) old_ids.size() && d.load(updated, replacement, err));
+        CHECK(same_state(replacement.live, same.live) && same_kv(replacement.kv, same.kv));
+        CHECK(d.stats().files == 2 && files_of(dir, 0).size() == 2 && files_of(dir, 's').empty());
+    }
+    remove_dir(dir);
+    // what a write that was cut short left behind goes at open once it is an hour old; a newer one may be in progress
+    CHECK(basalt::platform::make_dirs(dir));
+    const std::string cut = "000000000000002a-0000000000000001.bcs.7.tmp";
+    const std::string fresh = "000000000000002a-0000000000000002.bcs.7.tmp";
+    for (const std::string& name : {cut, fresh}) {
+        std::FILE* f = basalt::platform::open_file_utf8(dir + "/" + name, "wb");
+        CHECK(f != nullptr);
+        if (f) { std::fputc(1, f); std::fclose(f); }
+    }
+    {
+        std::error_code ec;
+        const std::string utf8 = dir + "/" + cut;
+        std::filesystem::last_write_time(std::filesystem::path(std::u8string(utf8.begin(), utf8.end())),
+                                         std::filesystem::file_time_type::clock::now() - std::chrono::hours(2), ec);
+        CHECK(!ec);
+        Store d;
+        CHECK(d.open(dir, id, 1ull << 30, err));
+        uint64_t bytes = 0;
+        CHECK(!basalt::platform::file_size(dir + "/" + cut, bytes));
+        CHECK(basalt::platform::file_size(dir + "/" + fresh, bytes));
+        CHECK(d.stats().bytes == 0);
+    }
+    remove_dir(dir);
+}
+
+// A write from a source against the budget: a conversation larger than it is not begun, one its files exceed is
+// written, evicted and reported, and the files of a dropped conversation that a read still holds open do not push the
+// one just written out.
+void written_within_budget(const std::string& dir, uint64_t id) {
+    std::string err;
+    std::vector<int32_t> ids, other(9001);
+    const SavedConversation x = shaped(kShapes[0], ids);
+    for (size_t i = 0; i < other.size(); ++i) other[i] = (int32_t) (i * 5 + 2);
+    const SavedConversation y = image(other, {1000});
+    const uint64_t state = source(x).bytes();
+    {
+        Store st;
+        CHECK(st.open(dir, id, state - 1, err));
+        uint64_t largest = 0;
+        CHECK(!st.write(source(x, nullptr, &largest), err) && largest == 0);
+        CHECK(st.stats().files == 0 && st.stats().written == 0 && dir_bytes(dir) == 0);
+    }
+    {
+        Store st;
+        CHECK(st.open(dir, id, state + 4096, err));   // its state, not the files' tables beside it
+        CHECK(!st.write(source(x), err));
+        const auto s = st.stats();
+        CHECK(s.files == 0 && s.written == 1 && s.evicted == 1 && dir_bytes(dir) == 0);
+    }
+    uint64_t one = 0;
+    {
+        Store st;
+        CHECK(st.open(dir, id, 1ull << 30, err));
+        CHECK(st.write(source(x), err));
+        one = dir_bytes(dir);
+    }
+    Store st;
+    CHECK(st.open(dir, id, one + one / 2, err));
+    const std::vector<int32_t> p = prompt_at(ids, ids.size());
+    const auto m = st.best(p.data(), p.size(), {}, true);
+    SavedConversation whole, part;
+    std::unique_ptr<ConversationKvRead> kv;
+    CHECK(m.tokens == (int64_t) ids.size() && st.load(m, whole, err) && st.load(m, part, err, &kv) && kv);
+    CHECK(st.write(source(y), err));   // the budget drops x, whose files the read holds
+    CHECK(st.stats().files == 1 && st.stats().evicted == 1 && dir_bytes(dir) > one);
+    std::vector<ConversationKv> got;
+    CHECK(kv && read_kv(*kv, part.kv, got, err) && same_kv(got, whole.kv));
+    kv.reset();
+    CHECK(files_of(dir, 0).size() == 1 && files_of(dir, 'b').size() == 2);
+    const std::vector<int32_t> q = prompt_at(other, other.size());
+    check_kv_read(st, st.best(q.data(), q.size(), {}, true));
+    remove_dir(dir);
+}
+
 // A conversation queued again under the name of the file a read holds open: written, its new file stays when the read
-// closes; not written, the old file goes then.
+// closes; not written, the old file goes then.  A write from a source of a conversation that is queued takes its place
+// in the queue's books.  The RAM figures of a write and of a read that leaves the K/V in its files.
 void same_name_again(const std::string& dir, uint64_t id) {
     std::string err;
     std::vector<int32_t> ids;
@@ -307,6 +583,71 @@ void same_name_again(const std::string& dir, uint64_t id) {
         CHECK(files_of(dir, 'b').size() == (again ? 2u : 0u));
         if (again) check_kv_read(st, st.best(p.data(), p.size(), {}, true));
         if (fails) basalt::platform::remove_file(blocker);
+        remove_dir(dir);
+    }
+    {
+        Store st;
+        CHECK(st.open(dir, id, 1ull << 30, err));
+        CHECK(st.put(SavedConversation(x), 1ull << 30));
+        CHECK(st.write(source(x), err));
+        st.flush();
+        CHECK(st.queued_bytes() == 0 && st.stats().files == 1 && files_of(dir, 0).size() == 1);
+        const auto m = st.best(p.data(), p.size(), {}, true);
+        SavedConversation got;
+        CHECK(m.tokens == (int64_t) ids.size() && st.load(m, got, err));
+        CHECK(same_state(got.live, x.live) && same_kv(got.kv, x.kv));
+        check_kv_read(st, m);
+        // a read with the K/V left in its files: the tokens three times, the state at the match three times, the read
+        // buffers; a whole read takes the K/V beside them
+        const uint64_t live = x.live.state_a.size() + x.live.state_b.size() + x.live.state_c.size() +
+                              x.live.state_d.size() + x.live.state_e.size();
+        const uint64_t cells = ids.size() + 4, rows = cells / basalt::kernels::qsa_real_shapes().idx_block + 1;
+        uint64_t kv_bytes = 0;
+        for (const ConversationKv& k : got.kv)
+            kv_bytes += cells * (uint64_t) (2 * kHeads * kDim + 2 * kHeads * 4) +
+                        (k.pooled_rows > 0 ? rows * (uint64_t) (kIdx * 4) : 0);
+        const uint64_t states = (uint64_t) ids.size() * 12 + live * 3;
+        CHECK(st.load_bytes(m, false) == states + (32ull << 20));
+        CHECK(st.load_bytes(m) == states + kv_bytes);
+        CHECK(ConversationStore::write_bytes(1000) == (10ull << 20) + 8000);
+        remove_dir(dir);
+    }
+}
+
+// A write from a source says how it moves, and one whose source runs out of memory partway ends as a failed write:
+// nothing left behind, and the writer thread goes on.
+void interrupted_write(const std::string& dir, uint64_t id) {
+    std::string err;
+    std::vector<int32_t> ids;
+    const SavedConversation x = shaped(kShapes[0], ids);
+    {
+        Store st;
+        CHECK(st.open(dir, id, 1ull << 30, err));
+        for (int upto : {0, 7, 20, 45}) {
+            ConversationSource src = source(x);
+            int left = upto;
+            const auto failing = [&left](ConversationBytes& b) {
+                b.read = [read = b.read, &left](uint64_t o, uint8_t* d, uint64_t n) {
+                    if (left-- <= 0) throw std::bad_alloc();
+                    return read(o, d, n);
+                };
+            };
+            for (auto& part : src.live) failing(part);
+            for (auto& layer : src.kv)
+                for (auto& part : layer.parts) failing(part);
+            CHECK(!st.write(src, err));
+            CHECK(st.stats().files == 0 && dir_bytes(dir) == 0);
+        }
+        CHECK(st.put(SavedConversation(x), 1ull << 30));
+        st.flush();
+        CHECK(st.stats().written == 1 && st.write(source(x), err) && st.stats().files == 1);
+        remove_dir(dir);
+    }
+    {
+        Store st;
+        CHECK(st.open(dir, id, 1ull << 30, err));
+        int moved = 0;
+        CHECK(st.write(source(x), err, [&] { ++moved; }) && moved > 0);
         remove_dir(dir);
     }
 }
@@ -762,7 +1103,11 @@ int main() {
         remove_dir(d3);
     }
     kv_left_in_files(dir + "-kv", id);
+    written_from_source(dir + "-source", id);
+    failed_write_keeps_stored(dir + "-failed", id);
+    written_within_budget(dir + "-budget", id);
     same_name_again(dir + "-again", id);
+    interrupted_write(dir + "-interrupted", id);
     {
         const std::string dir2 = dir + "-rows";
         compressed_rows(dir2);

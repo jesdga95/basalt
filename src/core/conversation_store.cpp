@@ -24,9 +24,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <new>
 
 namespace basalt::core {
 
@@ -283,9 +286,23 @@ bool hash_srcs(const Srcs& srcs, Aligned& stage, std::vector<uint64_t>& hashes) 
     return true;
 }
 
-// Writes `srcs` (numbered) under `h` (kind, identity, keys and counts set) to `path` through a temporary file in the
-// same directory.  `hashes`: the block hashes when known, else computed on the way.  The file's size in `file_bytes`.
-bool write_container(const std::string& path, Header h, Srcs& srcs, std::vector<uint64_t>* known, Aligned& stage,
+// the temporary file a write of `path` goes through, in the same directory
+std::string temp_path(const std::string& path) {
+    return path + "." + std::to_string((long long) basalt::platform::process_id()) + ".tmp";
+}
+
+// `tmp`, written whole, becomes `path`
+bool place(const std::string& tmp, const std::string& path, std::string& error) {
+    if (basalt::platform::rename_replace(tmp, path)) return true;
+    basalt::platform::remove_file(tmp);
+    error = "cannot write " + tmp;
+    return false;
+}
+
+// Writes `srcs` (numbered) under `h` (kind, identity, keys and counts set) to the temporary file `tmp`, which the
+// caller puts in place.  `hashes`: the block hashes when known, else computed on the way.  The file's size in
+// `file_bytes`.
+bool write_container(const std::string& tmp, Header h, Srcs& srcs, std::vector<uint64_t>* known, Aligned& stage,
                      uint64_t& file_bytes, std::string& error) {
     std::memcpy(h.magic, kMagic, sizeof kMagic);
     h.version = kConversationFormat;
@@ -300,9 +317,18 @@ bool write_container(const std::string& path, Header h, Srcs& srcs, std::vector<
     for (auto& s : srcs) { s.s.offset = at; at = align_up(at + s.s.bytes, kAlign); }
     h.file_bytes = at;
     file_bytes = at;
-    const std::string tmp = path + "." + std::to_string((long long) basalt::platform::process_id()) + ".tmp";
-    int fd = basalt::platform::open_write_unbuffered(tmp);
-    if (fd < 0) fd = basalt::platform::open_write_utf8(tmp);
+    struct File {   // closed, and removed unless it was written whole, whichever way this ends
+        int fd = -1;
+        const std::string& path;
+        bool whole = false;
+        ~File() {
+            if (fd < 0) return;
+            basalt::platform::close_fd(fd);
+            if (!whole) basalt::platform::remove_file(path);
+        }
+    } file{basalt::platform::open_write_unbuffered(tmp), tmp};
+    if (file.fd < 0) file.fd = basalt::platform::open_write_utf8(tmp);
+    const int fd = file.fd;
     if (fd < 0) { error = "cannot create " + tmp; return false; }
     std::vector<uint64_t> own;
     std::vector<uint64_t>& hashes = known ? *known : own;
@@ -336,14 +362,9 @@ bool write_container(const std::string& path, Header h, Srcs& srcs, std::vector<
             ok = basalt::platform::pwrite_all(fd, meta.data(), payload_at, 0);
         }
     }
-    ok = ok && basalt::platform::sync_fd(fd);
-    basalt::platform::close_fd(fd);
-    if (ok) ok = basalt::platform::rename_replace(tmp, path);
-    if (!ok) {
-        basalt::platform::remove_file(tmp);
-        error = copied ? "cannot write " + tmp : "cannot read the state to write";
-    }
-    return ok;
+    file.whole = ok && basalt::platform::sync_fd(fd);
+    if (!file.whole) error = copied ? "cannot write " + tmp : "cannot read the state to write";
+    return file.whole;
 }
 
 }  // namespace
@@ -376,7 +397,7 @@ uint64_t conversation_store_hash(const void* data, size_t n, uint64_t seed) {
 // ------------------------------------------------------------------------------------------------ index entries
 
 struct ConversationStore::Job {
-    SavedConversation image;
+    SavedConversation image;                  ///< what put() queued (empty for a write())
     std::string name;
     uint64_t key = 0, bytes = 0;
     std::vector<std::string> held;            ///< part files it refers to, counted while it is written
@@ -936,6 +957,7 @@ void ConversationStore::drop_read(const std::string& name, uint64_t generation, 
 
 bool ConversationStore::load(const Match& m, SavedConversation& out, std::string& error,
                              std::unique_ptr<ConversationKvRead>* kv_read) {
+    std::shared_lock<std::shared_mutex> publication(publish_mu_);   // the files are the indexed ones while they open
     std::shared_ptr<Job> job;
     std::string name;
     uint64_t generation = 0;
@@ -1256,37 +1278,108 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
 
 namespace {
 
+using Checks = std::vector<const ConversationCheckpoint*>;
+
 // The disk keeps a chat's root and the states of its last kTurnStates turn ends; the other checkpoints (a stride inside
 // a long prompt, older turn ends) live in RAM only, and a cut at one goes back to the nearest stored state before it.
-void keep_stored_checkpoints(std::vector<ConversationCheckpoint>& v) {
+// The indices of the kept ones, in their order.
+std::vector<size_t> stored_checkpoints(const Checks& v) {
     std::vector<size_t> turns;
     for (size_t j = 0; j < v.size(); ++j)
-        if (v[j].source == ConversationCheckpoint::kTurnEnd) turns.push_back(j);
-    std::sort(turns.begin(), turns.end(), [&](size_t a, size_t b) { return v[a].ids.size() > v[b].ids.size(); });
+        if (v[j]->source == ConversationCheckpoint::kTurnEnd) turns.push_back(j);
+    std::sort(turns.begin(), turns.end(), [&](size_t a, size_t b) { return v[a]->ids.size() > v[b]->ids.size(); });
     if (turns.size() > (size_t) kTurnStates) turns.resize((size_t) kTurnStates);
-    std::vector<ConversationCheckpoint> kept;
+    std::vector<size_t> kept;
     for (size_t j = 0; j < v.size(); ++j)
-        if (v[j].source == ConversationCheckpoint::kRoot || std::find(turns.begin(), turns.end(), j) != turns.end())
-            kept.push_back(std::move(v[j]));
-    v = std::move(kept);
+        if (v[j]->source == ConversationCheckpoint::kRoot || std::find(turns.begin(), turns.end(), j) != turns.end())
+            kept.push_back(j);
+    return kept;
+}
+
+Checks refs_of(const std::vector<ConversationCheckpoint>& v) {
+    Checks r;
+    for (const auto& c : v) r.push_back(&c);
+    return r;
+}
+
+// Whether a conversation can be stored: live tokens, and checkpoints that are prefixes of them with their pictures.
+bool storable(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, const Checks& checks) {
+    if (ids.empty()) return false;
+    for (const ConversationCheckpoint* c : checks)
+        if (c->ids.size() > ids.size() || !std::equal(c->ids.begin(), c->ids.end(), ids.begin()) ||
+            c->imgs != imgs_below(imgs, (int64_t) c->ids.size()) || !c->stage_parts.empty())
+            return false;
+    return true;
+}
+
+// The live end a reply past the last checkpoint: stored as of that checkpoint (the next turn goes on from there; a
+// reply sent back as it was is read again), whose state file then stands in for the live state.  The tokens it is
+// stored with, or 0 when the live end is stored.
+size_t stored_end(const std::vector<int32_t>& ids, const Checks& checks) {
+    size_t deepest = 0;
+    for (const ConversationCheckpoint* c : checks) deepest = std::max(deepest, c->ids.size());
+    return deepest >= 2 && deepest < ids.size() && ids.size() - deepest <= (size_t) kLiveSlack ? deepest : 0;
 }
 
 }  // namespace
 
+// Indexes a conversation of `bytes` in place of the entries it supersedes: its own earlier copy and the same
+// conversation a turn back.  `own_file`: the file of its name is this one's already and stays.
+ConversationStore::Entry& ConversationStore::index_locked(const ConversationSource& c, uint64_t bytes, bool own_file) {
+    const std::vector<int32_t>& ids = *c.ids;
+    const std::vector<ConversationImageKey>& imgs = *c.imgs;
+    ++revision_;
+    auto e = std::make_unique<Entry>();
+    e->key = key_of(ids, imgs, c.cvec);
+    e->name = conversation_name(identity_, e->key);
+    // the same conversation a turn back: its deepest checkpoint is one this chain holds
+    auto held = [&](const std::vector<int32_t>& eids, int64_t len) {
+        if ((size_t) len > ids.size() || std::memcmp(eids.data(), ids.data(), (size_t) len * 4) != 0) return false;
+        if ((size_t) len == ids.size()) return true;
+        for (const ConversationCheckpoint* k : c.checkpoints) if ((int64_t) k->ids.size() == len) return true;
+        return false;
+    };
+    for (size_t i = 0; i < entries_.size();) {
+        Entry& old = *entries_[i];
+        int64_t deepest = 0;
+        for (int64_t k : old.checks) deepest = std::max(deepest, k);
+        const bool same = old.mine && old.key == e->key;
+        const bool superseded = old.mine && old.cvec == c.cvec && deepest > 0 && held(old.ids, deepest) &&
+                                imgs_below(old.imgs, deepest) == imgs_below(imgs, deepest);
+        if (same || superseded) {
+            if (!same) ++stats_.dropped;
+            // its block and state files stay until the write of this one has used them
+            drop_locked(i, own_file && old.name == e->name);
+            continue;
+        }
+        ++i;
+    }
+    e->bytes = bytes;
+    e->used = ++clock_;
+    e->generation = ++generation_;
+    e->cvec = c.cvec;
+    e->ids = ids;
+    e->imgs = imgs;
+    for (const ConversationCheckpoint* k : c.checkpoints) {
+        e->checks.push_back((int64_t) k->ids.size());
+        e->sources.push_back((uint8_t) k->source);
+    }
+    entries_.push_back(std::move(e));
+    return *entries_.back();
+}
+
 bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
-    if (!open_ || image.live.ids.empty() || !image.stage_images.empty()) return false;
-    keep_stored_checkpoints(image.checkpoints);
-    for (const auto& c : image.checkpoints)
-        if (c.ids.size() > image.live.ids.size() || !std::equal(c.ids.begin(), c.ids.end(), image.live.ids.begin()) ||
-            c.imgs != imgs_below(image.live.imgs, (int64_t) c.ids.size()) || !c.stage_parts.empty())
-            return false;
-    // The live end a reply past the last checkpoint: stored as of that checkpoint (the next turn goes on from there; a
-    // reply sent back as it was is read again), whose state file then stands in for the live state.
-    size_t deepest = 0;
-    for (const auto& c : image.checkpoints) deepest = std::max(deepest, c.ids.size());
-    if (deepest >= 2 && deepest < image.live.ids.size() && image.live.ids.size() - deepest <= (size_t) kLiveSlack) {
-        image.live.ids.resize(deepest);
-        image.live.imgs = imgs_below(image.live.imgs, (int64_t) deepest);
+    if (!open_ || !image.stage_images.empty()) return false;
+    {
+        std::vector<ConversationCheckpoint> kept;
+        for (size_t j : stored_checkpoints(refs_of(image.checkpoints))) kept.push_back(std::move(image.checkpoints[j]));
+        image.checkpoints = std::move(kept);
+    }
+    const Checks checks = refs_of(image.checkpoints);
+    if (!storable(image.live.ids, image.live.imgs, checks)) return false;
+    if (const size_t end = stored_end(image.live.ids, checks); end > 0) {
+        image.live.ids.resize(end);
+        image.live.imgs = imgs_below(image.live.imgs, (int64_t) end);
         image.live.state_a = {};
         image.live.state_b = {};
         image.live.state_c = {};
@@ -1297,51 +1390,143 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     std::lock_guard<std::mutex> lk(mu_);
     if (queue_bytes_ + bytes > queue_cap) return false;
     auto job = std::make_shared<Job>();
-    job->key = key_of(image.live.ids, image.live.imgs, image.cvec);
-    job->name = conversation_name(identity_, job->key);
-    job->bytes = bytes;
-    // the same conversation a turn back: its deepest checkpoint is one this chain holds
-    auto held = [&](const std::vector<int32_t>& eids, int64_t len) {
-        if ((size_t) len > image.live.ids.size() ||
-            std::memcmp(eids.data(), image.live.ids.data(), (size_t) len * 4) != 0) return false;
-        if ((size_t) len == image.live.ids.size()) return true;
-        for (const auto& c : image.checkpoints) if ((int64_t) c.ids.size() == len) return true;
-        return false;
-    };
-    for (size_t i = 0; i < entries_.size();) {
-        Entry& e = *entries_[i];
-        int64_t deepest = 0;
-        for (int64_t c : e.checks) deepest = std::max(deepest, c);
-        const bool same = e.mine && e.key == job->key;
-        const bool superseded = e.mine && e.cvec == image.cvec && deepest > 0 && held(e.ids, deepest) &&
-                                imgs_below(e.imgs, deepest) == imgs_below(image.live.imgs, deepest);
-        if (same || superseded) {
-            if (!same) ++stats_.dropped;
-            drop_locked(i);   // its block and state files stay until the writer has used them for this one
-            continue;
-        }
-        ++i;
-    }
     job->image = std::move(image);
-    auto e = std::make_unique<Entry>();
-    e->name = job->name;
-    e->key = job->key;
-    e->bytes = bytes;
-    e->used = ++clock_;
-    e->generation = ++generation_;
-    e->cvec = job->image.cvec;
-    e->ids = job->image.live.ids;
-    e->imgs = job->image.live.imgs;
-    for (const auto& c : job->image.checkpoints) {
-        e->checks.push_back((int64_t) c.ids.size());
-        e->sources.push_back((uint8_t) c.source);
-    }
-    e->job = job;
-    entries_.push_back(std::move(e));
+    Entry& e = index_locked(image_source(job->image), bytes, false);
+    job->key = e.key;
+    job->name = e.name;
+    job->bytes = bytes;
+    e.job = job;
     queue_.push_back(job);
     queue_bytes_ += bytes;
     cv_.notify_all();
     return true;
+}
+
+uint64_t ConversationStore::write_bytes(size_t tokens) {
+    // the write buffer, the files' tables (a hash per MiB, a section per part), the tokens as stored and as indexed
+    return kStage + (2ull << 20) + (uint64_t) tokens * 8;
+}
+
+bool ConversationStore::write(const ConversationSource& src, std::string& error,
+                              const std::function<void()>& progress) try {
+    if (!open_ || !src.ids || !src.imgs) { error = "conversation store: nothing to write"; return false; }
+    // what put() stores of an image: the kept checkpoints, and the live end as of the last one when it is a reply
+    // past it
+    ConversationSource img = src;
+    img.checkpoints.clear();
+    for (size_t j : stored_checkpoints(src.checkpoints)) img.checkpoints.push_back(src.checkpoints[j]);
+    if (!storable(*src.ids, *src.imgs, img.checkpoints)) {
+        error = "conversation store: its checkpoints are not prefixes of it";
+        return false;
+    }
+    std::vector<int32_t> ids;
+    std::vector<ConversationImageKey> imgs;
+    if (const size_t end = stored_end(*src.ids, img.checkpoints); end > 0) {
+        ids.assign(src.ids->begin(), src.ids->begin() + (std::ptrdiff_t) end);
+        imgs = imgs_below(*src.imgs, (int64_t) end);
+        img.ids = &ids;
+        img.imgs = &imgs;
+        img.live = {};
+    }
+    Job job;
+    job.key = key_of(*img.ids, *img.imgs, img.cvec);
+    job.name = conversation_name(identity_, job.key);
+    job.bytes = img.bytes();
+    if (job.bytes > budget_) {   // the eviction after it would remove it again
+        char text[160];
+        std::snprintf(text, sizeof text, "conversation store: %.2f GiB of state do not fit the %.2f GiB budget",
+                      (double) job.bytes / 1073741824.0, (double) budget_ / 1073741824.0);
+        error = text;
+        return false;
+    }
+    if (progress) {
+        const auto note = [&progress](ConversationBytes& b) {
+            if (!b.read) return;
+            b.read = [read = std::move(b.read), &progress](uint64_t o, uint8_t* d, uint64_t n) {
+                progress();
+                return read(o, d, n);
+            };
+        };
+        for (auto& part : img.live) note(part);
+        for (auto& layer : img.kv)
+            for (auto& part : layer.parts) note(part);
+    }
+    {   // after a write in progress on the writer thread, before the queued ones
+        std::lock_guard<std::mutex> lk(mu_);
+        ++direct_waiting_;
+    }
+    std::unique_lock<std::timed_mutex> wl(write_mu_, std::defer_lock);
+    while (!wl.try_lock_for(std::chrono::seconds(1)))
+        if (progress) progress();
+    uint64_t revision = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        --direct_waiting_;
+        revision = revision_;
+    }
+    // The conversation file stays beside its name until it has been checked: the index and the files it names are
+    // as they were while this can still fail.  What a write that is not published holds goes whichever way it ends.
+    std::string staged;
+    struct End {
+        ConversationStore& st;
+        Job& job;
+        const std::string& staged;
+        bool published = false;
+        ~End() {
+            if (!published && !staged.empty()) basalt::platform::remove_file(staged);
+            std::lock_guard<std::mutex> lk(st.mu_);
+            if (!published) {
+                st.release_locked(job.held);
+                ++st.stats_.dropped;
+            }
+            if (st.queue_.empty()) st.gc_locked(0);
+            st.unlink_unread_locked();
+            st.cv_.notify_all();
+        }
+    } end{*this, job, staged};
+    uint64_t wrote = 0, whole = 0, file_bytes = 0;
+    std::string why;
+    Header head{};
+    std::vector<Section> table;
+    bool ok = write_now(job, img, wrote, whole, why, &staged);
+    if (ok) {
+        ReadFd rf(staged);
+        std::vector<uint64_t> hashes;
+        ok = rf.fd >= 0 && basalt::platform::file_size(staged, file_bytes) &&
+             read_index(rf.fd, file_bytes, head, table, hashes, why);
+        if (!ok && why.empty()) why = "cannot read " + staged;
+    }
+    std::unique_lock<std::shared_mutex> publication(publish_mu_);
+    std::lock_guard<std::mutex> lk(mu_);
+    stats_.written_bytes += wrote;
+    if (ok && revision != revision_) {
+        ok = false;
+        why = "the index changed during the write";
+    }
+    if (ok && !basalt::platform::rename_replace(staged, dir_ + "/" + job.name)) {
+        ok = false;
+        why = "cannot replace " + job.name;
+    }
+    if (ok) {
+        Entry& e = index_locked(img, file_bytes, true);
+        e.head = head;
+        e.table = std::move(table);
+        e.blocks = std::move(job.blocks);
+        e.check_keys = std::move(job.check_keys);
+        e.refs = std::move(job.held);
+        const uint64_t generation = e.generation;
+        end.published = true;
+        ++stats_.written;
+        stats_.whole_bytes += whole;
+        evict_locked();
+        ok = std::any_of(entries_.begin(), entries_.end(), [&](const auto& k) { return k->generation == generation; });
+        if (!ok) why = "the budget did not hold it: evicted as it was written";
+    }
+    if (!ok) error = "conversation store: " + why;
+    return ok;
+} catch (const std::bad_alloc&) {
+    error = "conversation store: allocation failed";
+    return false;
 }
 
 void ConversationStore::release_locked(const std::vector<std::string>& refs) {
@@ -1351,7 +1536,8 @@ void ConversationStore::release_locked(const std::vector<std::string>& refs) {
     }
 }
 
-void ConversationStore::drop_locked(size_t index) {
+void ConversationStore::drop_locked(size_t index, bool keep_file) {
+    ++revision_;
     Entry& e = *entries_[index];
     if (e.job) {   // queued: it never reaches the disk
         auto it = std::find(queue_.begin(), queue_.end(), e.job);
@@ -1361,8 +1547,10 @@ void ConversationStore::drop_locked(size_t index) {
         }
         // a write in progress finishes into a file nobody indexes: the writer removes it (see writer)
     } else {
-        if (reading_.count(e.name)) unlinked_.push_back(e.name);
-        else basalt::platform::remove_file(dir_ + "/" + e.name);
+        if (!keep_file) {
+            if (reading_.count(e.name)) unlinked_.push_back(e.name);
+            else basalt::platform::remove_file(dir_ + "/" + e.name);
+        }
         release_locked(e.refs);
     }
     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
@@ -1422,24 +1610,27 @@ void ConversationStore::evict_locked() {
 void ConversationStore::writer() {
     for (;;) {
         std::shared_ptr<Job> job;
+        // one write at a time: a write() holds the files until it has finished, and one that waits goes first
+        std::unique_lock<std::timed_mutex> wl(write_mu_, std::defer_lock);
         {
             std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
+            cv_.wait(lk, [&] { return stop_ || (!queue_.empty() && direct_waiting_ == 0); });
             if (queue_.empty()) return;   // stop_ with nothing left
+            lk.unlock();
+            wl.lock();
+            lk.lock();
+            if (queue_.empty()) {   // dropped meanwhile
+                idle_.notify_all();
+                continue;
+            }
+            if (direct_waiting_ > 0 && !stop_) continue;
             job = queue_.front();
             busy_ = true;
         }
         std::string why;
         uint64_t wrote = 0, whole = 0;
-        const uint64_t free_bytes = basalt::platform::disk_free_bytes(dir_);
-        const bool room = free_bytes >= job->bytes + kSpaceFloor;
-        const bool ok = room && write_job(*job, image_source(job->image), wrote, whole, why);
-        if (!room)
-            basalt::log::warn("basalt serve", "conversation cache: %s has %.1f GiB free, not written (%.1f GiB "
-                              "image, %.0f GiB kept free)", dir_.c_str(), (double) free_bytes / 1073741824.0,
-                              (double) job->bytes / 1073741824.0, (double) kSpaceFloor / 1073741824.0);
-        else if (!ok)
-            basalt::log::warn("basalt serve", "conversation cache: %s", why.c_str());
+        const bool ok = write_now(*job, image_source(job->image), wrote, whole, why, nullptr);
+        if (!ok) basalt::log::warn("basalt serve", "conversation cache: %s", why.c_str());
         std::lock_guard<std::mutex> lk(mu_);
         if (!queue_.empty() && queue_.front() == job) {
             queue_.pop_front();
@@ -1489,8 +1680,22 @@ void ConversationStore::writer() {
     }
 }
 
+// Writes `job` from `src`; false with the reason when the volume is short of room or the write failed.
+bool ConversationStore::write_now(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole,
+                                  std::string& why, std::string* staged) {
+    const uint64_t free_bytes = basalt::platform::disk_free_bytes(dir_);
+    if (free_bytes >= job.bytes + kSpaceFloor) return write_job(job, src, wrote, whole, why, staged);
+    char text[512];
+    std::snprintf(text, sizeof text, "%s has %.1f GiB free, not written (%.1f GiB image, %.0f GiB kept free)",
+                  dir_.c_str(), (double) free_bytes / 1073741824.0, (double) job.bytes / 1073741824.0,
+                  (double) kSpaceFloor / 1073741824.0);
+    why = text;
+    return false;
+}
+
+// `staged`: the conversation file is left written under a temporary name, given there, for the caller to put in place.
 bool ConversationStore::write_job(Job& job, const ConversationSource& img, uint64_t& wrote, uint64_t& whole,
-                                  std::string& error) {
+                                  std::string& error, std::string* staged) {
     const std::vector<int32_t>& ids = *img.ids;
     const std::vector<ConversationImageKey>& imgs = *img.imgs;
     const int64_t n_ids = (int64_t) ids.size();
@@ -1530,16 +1735,15 @@ bool ConversationStore::write_job(Job& job, const ConversationSource& img, uint6
         {
             std::lock_guard<std::mutex> lk(mu_);
             auto it = parts_.find(name);
+            job.held.push_back(name);
             if (it != parts_.end()) {   // there (or being written by this job): one more reference
                 ++it->second.refs;
-                job.held.push_back(name);
                 whole += it->second.bytes;
                 return true;
             }
             PartFile& p = parts_[name];
             p.refs = 1;
             p.mtime = basalt::platform::file_time_now();
-            job.held.push_back(name);
         }
         h.identity = identity_;
         h.key = key;
@@ -1548,7 +1752,8 @@ bool ConversationStore::write_job(Job& job, const ConversationSource& img, uint6
         h.layer_lo = img.layer_lo;
         h.layer_hi = img.layer_hi;
         uint64_t file_bytes = 0;
-        if (!write_container(dir_ + "/" + name, h, srcs, &hashes, stage, file_bytes, error)) {
+        const std::string path = dir_ + "/" + name, tmp = temp_path(path);
+        if (!write_container(tmp, h, srcs, &hashes, stage, file_bytes, error) || !place(tmp, path, error)) {
             std::lock_guard<std::mutex> lk(mu_);
             parts_.erase(name);
             job.held.pop_back();
@@ -1652,7 +1857,10 @@ bool ConversationStore::write_job(Job& job, const ConversationSource& img, uint6
     h.block_cells = nb > 0 ? kBlockCells : 0;
     h.n_blocks = nb;
     uint64_t conv_bytes = 0;
-    if (!write_container(dir_ + "/" + job.name, h, srcs, nullptr, stage, conv_bytes, error)) return false;
+    const std::string path = dir_ + "/" + job.name, tmp = temp_path(path);
+    if (!write_container(tmp, h, srcs, nullptr, stage, conv_bytes, error)) return false;
+    if (staged) *staged = tmp;
+    else if (!place(tmp, path, error)) return false;
     wrote += conv_bytes;
     whole += conv_bytes;
     return true;

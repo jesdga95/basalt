@@ -15,6 +15,8 @@
 // budget, least recently used conversations first.  A read can leave the K/V in its files until it is copied to where
 // it is used (load() with a ConversationKvRead); such a read checks each block as it copies it, so a bad block is
 // found after part of the K/V was delivered.  A file such a read holds open is removed once the read has closed it.
+// A conversation can also be written where it is, a write buffer at a time, with no image of it in RAM (write()): the
+// same files, a new block's bytes copied out twice (once to name its file by their hashes, once to write it).
 #pragma once
 
 #include "basalt/core/conversation_cache.hpp"
@@ -23,9 +25,11 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -83,6 +87,16 @@ public:
     /// a turn back) are dropped.  False when the queue is over its byte cap (nothing queued).
     bool put(SavedConversation&& image, uint64_t queue_cap);
 
+    /// Writes `src` now, on the caller's thread, a write buffer at a time, after a write in progress on the writer
+    /// thread and before the queued ones: the files put() writes of its image.  Until it has succeeded the index and
+    /// the files it names stay as they were; an entry indexed or dropped during the write refuses it too.  False with
+    /// `error` when the conversation is not stored once this returns: not written (one larger than the budget is not
+    /// begun), or evicted by the budget at once.  `progress` is called while it waits for the writer thread, about
+    /// once a second, and for every piece it copies from `src`.
+    bool write(const ConversationSource& src, std::string& error, const std::function<void()>& progress = {});
+    /// The RAM a write() of `tokens` tokens takes beside its source.
+    static uint64_t write_bytes(size_t tokens);
+
     /// Whether an image with these live tokens is stored or queued.
     bool holds(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const;
 
@@ -103,9 +117,13 @@ private:
     class KvFileRead;
     class KvQueuedRead;
     void writer();
-    bool write_job(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole, std::string& error);
+    Entry& index_locked(const ConversationSource& c, uint64_t bytes, bool own_file);
+    bool write_now(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole, std::string& why,
+                   std::string* staged);
+    bool write_job(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole, std::string& error,
+                   std::string* staged);
     void evict_locked();
-    void drop_locked(size_t index);
+    void drop_locked(size_t index, bool keep_file = false);
     void drop_read(const std::string& name, uint64_t generation, const std::string& part, std::string& error);
     void unlink_unread_locked();             ///< removes the dropped files no read holds open any more
     void release_locked(const std::vector<std::string>& refs);
@@ -115,6 +133,9 @@ private:
     uint64_t identity_ = 0, budget_ = 0;
     bool open_ = false;
     mutable std::mutex mu_;
+    std::shared_mutex publish_mu_;            ///< shared by a load opening its files, held by a write() to publish
+    std::timed_mutex write_mu_;               ///< held while a conversation's files are written
+    int direct_waiting_ = 0;                  ///< write() calls waiting for write_mu_
     std::condition_variable cv_, idle_;
     std::map<std::string, int> reading_;      ///< files a ConversationKvRead holds open: removed once it closed them
     std::vector<std::string> unlinked_;       ///< conversation files dropped while open for such a read
@@ -122,6 +143,7 @@ private:
     std::map<std::string, PartFile> parts_;   ///< block and state files of this identity, by name
     std::deque<std::shared_ptr<Job>> queue_;
     uint64_t queue_bytes_ = 0, clock_ = 0, generation_ = 0;
+    uint64_t revision_ = 0;                   ///< counts the entries indexed and dropped
     bool stop_ = false, busy_ = false;
     Stats stats_;
     std::vector<std::unique_ptr<ConversationStoreBuffer>> read_bufs_;   ///< the loads' aligned read buffers, kept
