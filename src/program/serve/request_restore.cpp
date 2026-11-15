@@ -233,21 +233,39 @@ Flow Request::restore() {
         }
     }
     if (from_disk) {
-        const uint64_t need = runtime_.disk.load_bytes(on_disk);
+        uint64_t need = runtime_.disk.load_bytes(on_disk);
         const uint64_t floor = std::max<uint64_t>((uint64_t) runtime_.o.conversation_cache_min_free_mib << 20, runtime_.disk_floor);
         const auto t0 = Clock::now();
         basalt::core::SavedConversation image;
         std::string de;
-        if (basalt::core::Admission why; !runtime_.capture_admit(need, floor, &why)) {
+        basalt::core::Admission why;
+        bool admitted = runtime_.capture_admit(need, floor, &why);
+        const bool in_files = disk_kv_in_files(admitted);
+        if (in_files) {   // only the running states come to RAM
+            need = runtime_.disk.load_bytes(on_disk, false);
+            admitted = runtime_.capture_admit(need, floor, &why);
+        }
+        if (!admitted) {
             basalt::log::warn("basalt serve", "conversation cache: %lld tokens on disk not read: %s",
                               (long long) on_disk.tokens, basalt::core::conversation_refusal(why).c_str());
-        } else if (!runtime_.disk.load(on_disk, image, de)) {
+        } else if (!runtime_.disk.load(on_disk, image, de, in_files ? &incoming_kv : nullptr)) {
+            incoming_kv.reset();
             basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
                               "dropped", de.c_str());
         } else {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
-                              "(%.2f GB of state)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9);
+            if (incoming_kv) {
+                uint64_t kv_bytes = 0;
+                for (size_t i = 0; i < incoming_kv->layers(); ++i)
+                    for (int b = 0; b < 5; ++b) kv_bytes += incoming_kv->bytes(i, b);
+                basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
+                                  "(%.2f GB of running state; %.2f GB of K/V go from the files into the session at "
+                                  "the restore)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9,
+                                  (double) kv_bytes / 1e9);
+            } else {
+                basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
+                                  "(%.2f GB of state)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9);
+            }
             incoming.emplace(std::move(image));
             in_tokens = on_disk.tokens;
             in_live = true;
@@ -331,7 +349,7 @@ Flow Request::restore() {
         resume = in_tokens;
         from_live = in_live;
         retain_image();
-        incoming.reset();   // its running state and checkpoints are in the session now
+        drop_incoming();   // its running state and checkpoints are in the session now
         const double restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - restore_t0).count();
         basalt::log::info("basalt serve", "conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu",
                      (long long) resume, from_live ? "live" : "checkpoint", restore_ms,
