@@ -35,6 +35,7 @@ namespace basalt::core {
 inline constexpr uint32_t kConversationFormat = 2;
 
 struct ConversationStoreBuffer;
+struct ConversationSource;
 
 class ConversationStore {
 public:
@@ -94,7 +95,7 @@ private:
         int64_t mtime = 0;
     };
     void writer();
-    bool write_job(Job& job, uint64_t& wrote, uint64_t& whole, std::string& error);
+    bool write_job(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole, std::string& error);
     void evict_locked();
     void drop_locked(size_t index);
     void release_locked(const std::vector<std::string>& refs);

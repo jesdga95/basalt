@@ -16,6 +16,7 @@
 // turn ends; the checkpoints a stride inside a long prompt and older turn ends are not written.
 #include "basalt/core/conversation_store.hpp"
 
+#include "basalt/core/conversation_stream.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/direct_file.hpp"
 #include "basalt/platform/file.hpp"
@@ -159,47 +160,92 @@ uint64_t content_key(const std::vector<Section>& table, const std::vector<uint64
     return conversation_store_hash(&h, sizeof h, prefix_key);
 }
 
-// one section to write and where its bytes come from
+// one section to write and where its bytes come from: bytes [base, base + s.bytes) of `from`
 struct Src {
     Section s{};
-    std::function<void(uint64_t, uint8_t*, uint64_t)> copy;            // (offset, destination, count)
-    std::function<const uint8_t*(uint64_t, uint64_t)> view;            // the bytes in place when contiguous, or null
+    ConversationBytes from;
+    uint64_t base = 0;
+    bool copy(uint64_t o, uint8_t* d, uint64_t n) const { return from.read && from.read(base + o, d, n); }
+    const uint8_t* view(uint64_t o, uint64_t n) const { return from.view ? from.view(base + o, n) : nullptr; }
 };
 using Srcs = std::vector<Src>;
 
-Section& add(Srcs& v, uint32_t kind, uint32_t index, uint64_t n, std::function<void(uint64_t, uint8_t*, uint64_t)> copy,
-             std::function<const uint8_t*(uint64_t, uint64_t)> view = nullptr) {
+Section& add(Srcs& v, uint32_t kind, uint32_t index, uint64_t n, ConversationBytes from = {}, uint64_t base = 0) {
     Src s;
     std::memset(&s.s, 0, sizeof s.s);
     s.s.kind = kind;
     s.s.index = index;
     s.s.bytes = n;
-    s.copy = std::move(copy);
-    s.view = std::move(view);
+    s.from = std::move(from);
+    s.base = base;
     v.push_back(std::move(s));
     return v.back().s;
 }
 
-// a K/V buffer's bytes from `base` on
-Section& add_kv(Srcs& v, uint32_t kind, uint32_t index, uint64_t n, const ConversationBuffer* buf, uint64_t base) {
-    return add(v, kind, index, n, [buf, base](uint64_t o, uint8_t* d, uint64_t c) { buf->read(d, base + o, c); },
-               [buf, base](uint64_t o, uint64_t c) -> const uint8_t* {
-                   const uint8_t* r = nullptr;
-                   buf->visit(base + o, c, [&](const uint8_t* p, size_t got, size_t) {
-                       if (got == c) r = p;
-                       return false;   // the first piece only: contiguous or not
-                   });
-                   return r;
-               });
+// bytes in host memory, read in place
+ConversationBytes host_bytes(const void* data, uint64_t n) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    ConversationBytes b;
+    b.size = n;
+    b.read = [p](uint64_t o, uint8_t* d, uint64_t c) {
+        std::memcpy(d, p + o, c);
+        return true;
+    };
+    b.view = [p](uint64_t o, uint64_t) -> const uint8_t* { return p + o; };
+    return b;
 }
 
-void add_state(Srcs& v, const ConversationCheckpoint& c, uint32_t index) {
-    const CheckpointBytes* f[5] = {&c.state_a, &c.state_b, &c.state_c, &c.state_d, &c.state_e};
-    for (int k = 0; k < 5; ++k) {
-        const CheckpointBytes* b = f[k];
-        add(v, kGdn + k, index, b->size(), [b](uint64_t o, uint8_t* d, uint64_t n) { std::memcpy(d, b->data() + o, n); },
-            [b](uint64_t o, uint64_t) -> const uint8_t* { return b->data() + o; });
+// a segmented buffer's bytes: in place where a piece lies in one segment
+ConversationBytes buffer_bytes(const ConversationBuffer& buf) {
+    ConversationBytes b;
+    b.size = buf.size();
+    b.read = [&buf](uint64_t o, uint8_t* d, uint64_t c) { return buf.read(d, o, c); };
+    b.view = [&buf](uint64_t o, uint64_t c) -> const uint8_t* {
+        const uint8_t* r = nullptr;
+        buf.visit(o, c, [&](const uint8_t* p, size_t got, size_t) {
+            if (got == c) r = p;
+            return false;   // the first piece only: contiguous or not
+        });
+        return r;
+    };
+    return b;
+}
+
+std::array<ConversationBytes, 5> state_bytes(const ConversationCheckpoint& c) {
+    return {host_bytes(c.state_a.data(), c.state_a.size()), host_bytes(c.state_b.data(), c.state_b.size()),
+            host_bytes(c.state_c.data(), c.state_c.size()), host_bytes(c.state_d.data(), c.state_d.size()),
+            host_bytes(c.state_e.data(), c.state_e.size())};
+}
+
+// an image in RAM as a write reads it
+ConversationSource image_source(const SavedConversation& img) {
+    ConversationSource s;
+    s.geometry = img.geometry;
+    s.layer_lo = img.layer_lo;
+    s.layer_hi = img.layer_hi;
+    s.cvec = img.cvec;
+    s.ids = &img.live.ids;
+    s.imgs = &img.live.imgs;
+    for (const auto& c : img.checkpoints) s.checkpoints.push_back(&c);
+    s.live = state_bytes(img.live);
+    for (const ConversationKv& kv : img.kv) {
+        ConversationKvSource k;
+        k.format = kv.format;
+        k.cells = kv.cells;
+        k.heads = kv.heads;
+        k.head_dim = kv.head_dim;
+        k.page_size = kv.page_size;
+        k.pooled_rows = kv.pooled_rows;
+        k.idx_dim = kv.idx_dim;
+        k.parts = {buffer_bytes(kv.k), buffer_bytes(kv.v), buffer_bytes(kv.k_scale), buffer_bytes(kv.v_scale),
+                   buffer_bytes(kv.pooled)};
+        s.kv.push_back(std::move(k));
     }
+    return s;
+}
+
+void add_state(Srcs& v, const std::array<ConversationBytes, 5>& state, uint32_t index) {
+    for (int k = 0; k < 5; ++k) add(v, kGdn + k, index, state[(size_t) k].size, state[(size_t) k]);
 }
 
 // the table of `srcs` with each section's first block hash; the number of block hashes
@@ -215,21 +261,23 @@ std::vector<Section> table_of(const Srcs& srcs) {
     return t;
 }
 
-// the block hashes of `srcs` (numbered): read in place where the source is contiguous, else copied to `stage`
-void hash_srcs(const Srcs& srcs, Aligned& stage, std::vector<uint64_t>& hashes) {
+// the block hashes of `srcs` (numbered): read in place where the source is contiguous, else copied to `stage`; false
+// when a copy failed
+bool hash_srcs(const Srcs& srcs, Aligned& stage, std::vector<uint64_t>& hashes) {
     uint64_t n_hashes = 0;
     for (const auto& s : srcs) n_hashes += blocks_of(s.s.bytes);
     hashes.assign(n_hashes, 0);
     for (const auto& s : srcs)
         for (uint64_t from = 0; from < s.s.bytes; from += kBlock) {
             const uint64_t n = std::min(kBlock, s.s.bytes - from);
-            const uint8_t* p = s.view ? s.view(from, n) : nullptr;
+            const uint8_t* p = s.view(from, n);
             if (p == nullptr) {
-                s.copy(from, stage.data(), n);
+                if (!s.copy(from, stage.data(), n)) return false;
                 p = stage.data();
             }
             hashes[s.s.first_hash + from / kBlock] = conversation_store_hash(p, n, s.s.kind * 131 + s.s.index);
         }
+    return true;
 }
 
 // Writes `srcs` (numbered) under `h` (kind, identity, keys and counts set) to `path` through a temporary file in the
@@ -256,11 +304,11 @@ bool write_container(const std::string& path, Header h, Srcs& srcs, std::vector<
     std::vector<uint64_t> own;
     std::vector<uint64_t>& hashes = known ? *known : own;
     if (!known) hashes.assign(h.hash_count, 0);
-    bool ok = stage.p != nullptr && hashes.size() == h.hash_count;
+    bool ok = stage.p != nullptr && hashes.size() == h.hash_count, copied = true;
     for (const auto& s : srcs) {
         for (uint64_t from = 0; ok && from < s.s.bytes; from += kStage) {
             const uint64_t n = std::min(kStage, s.s.bytes - from), len = align_up(n, kAlign);
-            s.copy(from, stage.data(), n);
+            if (!s.copy(from, stage.data(), n)) { ok = copied = false; break; }
             if (len > n) std::memset(stage.data() + n, 0, len - n);
             if (!known)
                 for (uint64_t b = 0; b < n; b += kBlock)
@@ -290,7 +338,7 @@ bool write_container(const std::string& path, Header h, Srcs& srcs, std::vector<
     if (ok) ok = basalt::platform::rename_replace(tmp, path);
     if (!ok) {
         basalt::platform::remove_file(tmp);
-        error = "cannot write " + tmp;
+        error = copied ? "cannot write " + tmp : "cannot read the state to write";
     }
     return ok;
 }
@@ -1204,7 +1252,7 @@ void ConversationStore::writer() {
         uint64_t wrote = 0, whole = 0;
         const uint64_t free_bytes = basalt::platform::disk_free_bytes(dir_);
         const bool room = free_bytes >= job->bytes + kSpaceFloor;
-        const bool ok = room && write_job(*job, wrote, whole, why);
+        const bool ok = room && write_job(*job, image_source(job->image), wrote, whole, why);
         if (!room)
             basalt::log::warn("basalt serve", "conversation cache: %s has %.1f GiB free, not written (%.1f GiB "
                               "image, %.0f GiB kept free)", dir_.c_str(), (double) free_bytes / 1073741824.0,
@@ -1259,23 +1307,25 @@ void ConversationStore::writer() {
     }
 }
 
-bool ConversationStore::write_job(Job& job, uint64_t& wrote, uint64_t& whole, std::string& error) {
-    const SavedConversation& img = job.image;
-    const int64_t n_ids = (int64_t) img.live.ids.size();
+bool ConversationStore::write_job(Job& job, const ConversationSource& img, uint64_t& wrote, uint64_t& whole,
+                                  std::string& error) {
+    const std::vector<int32_t>& ids = *img.ids;
+    const std::vector<ConversationImageKey>& imgs = *img.imgs;
+    const int64_t n_ids = (int64_t) ids.size();
     const int64_t ib = std::max<int64_t>(1, row_cells_);
     // each layer's bytes per cell and per pooled row; whole blocks need every layer's buffers to divide evenly
     std::vector<Rate> rates(img.kv.size());
     bool blocky = !img.kv.empty() && kBlockCells % ib == 0;
     for (size_t i = 0; i < img.kv.size(); ++i) {
-        const ConversationKv& kv = img.kv[i];
-        const ConversationBuffer* b[4] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale};
+        const ConversationKvSource& kv = img.kv[i];
         for (int k = 0; k < 4; ++k) {
-            rates[i].cell[k] = kv.cells > 0 ? b[k]->size() / (uint64_t) kv.cells : 0;
-            if (kv.cells <= 0 || b[k]->size() % (uint64_t) kv.cells) blocky = false;
+            const uint64_t size = kv.parts[(size_t) k].size;
+            rates[i].cell[k] = kv.cells > 0 ? size / (uint64_t) kv.cells : 0;
+            if (kv.cells <= 0 || size % (uint64_t) kv.cells) blocky = false;
         }
-        rates[i].row = kv.pooled_rows > 0 ? kv.pooled.size() / (uint64_t) kv.pooled_rows : 0;
-        if ((kv.pooled_rows > 0 && kv.pooled.size() % (uint64_t) kv.pooled_rows) ||
-            (kv.pooled_rows == 0 && kv.pooled.size() != 0))
+        const uint64_t pooled = kv.parts[4].size;
+        rates[i].row = kv.pooled_rows > 0 ? pooled / (uint64_t) kv.pooled_rows : 0;
+        if ((kv.pooled_rows > 0 && pooled % (uint64_t) kv.pooled_rows) || (kv.pooled_rows == 0 && pooled != 0))
             blocky = false;
         if (kv.page_size <= 0 || kBlockCells % kv.page_size || kv.cells < n_ids ||
             (kv.pooled_rows > 0 && kv.pooled_rows < n_ids / ib))
@@ -1289,7 +1339,10 @@ bool ConversationStore::write_job(Job& job, uint64_t& wrote, uint64_t& whole, st
     auto part = [&](char kind, Srcs& srcs, Header h, uint64_t& key) -> bool {
         number_blocks(srcs);
         std::vector<uint64_t> hashes;
-        hash_srcs(srcs, stage, hashes);
+        if (!hash_srcs(srcs, stage, hashes)) {
+            error = "cannot read the state to write";
+            return false;
+        }
         key = content_key(table_of(srcs), hashes, h.prefix_key);
         const std::string name = part_name(identity_, kind, key);
         {
@@ -1331,20 +1384,18 @@ bool ConversationStore::write_job(Job& job, uint64_t& wrote, uint64_t& whole, st
         Srcs srcs;
         const int64_t c0 = b * kBlockCells;
         for (size_t i = 0; i < img.kv.size(); ++i) {
-            const ConversationKv& kv = img.kv[i];
-            const ConversationBuffer* bufs[5] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
+            const ConversationKvSource& kv = img.kv[i];
             for (int k = 0; k < 5; ++k) {
-                const ConversationBuffer* buf = bufs[k];
                 const uint64_t unit = k < 4 ? rates[i].cell[k] : rates[i].row;
                 const uint64_t base = unit * (uint64_t) (k < 4 ? c0 : c0 / ib);
                 const uint64_t n = unit * (uint64_t) (k < 4 ? kBlockCells : kBlockCells / ib);
-                add_kv(srcs, kK + k, (uint32_t) i, n, buf, base);
+                add(srcs, kK + k, (uint32_t) i, n, kv.parts[(size_t) k], base);
             }
         }
         Header h;
         std::memset(&h, 0, sizeof h);
         h.file_kind = kBlockFile;
-        h.prefix_key = key_of(img.live.ids.data(), (size_t) (c0 + kBlockCells), img.live.imgs, img.cvec);
+        h.prefix_key = key_of(ids.data(), (size_t) (c0 + kBlockCells), imgs, img.cvec);
         h.n_kv = (int64_t) img.kv.size();
         h.block_cells = kBlockCells;
         h.position = b;
@@ -1354,15 +1405,15 @@ bool ConversationStore::write_job(Job& job, uint64_t& wrote, uint64_t& whole, st
     }
     // the checkpoints' states
     job.check_keys.clear();
-    for (const auto& c : img.checkpoints) {
+    for (const ConversationCheckpoint* c : img.checkpoints) {
         Srcs srcs;
-        add_state(srcs, c, 0);
+        add_state(srcs, state_bytes(*c), 0);
         Header h;
         std::memset(&h, 0, sizeof h);
         h.file_kind = kStateFile;
-        h.prefix_key = key_of(img.live.ids.data(), c.ids.size(), img.live.imgs, img.cvec);
+        h.prefix_key = key_of(ids.data(), c->ids.size(), imgs, img.cvec);
         h.n_ids = 0;
-        h.position = (int64_t) c.ids.size();
+        h.position = (int64_t) c->ids.size();
         uint64_t key = 0;
         if (!part('s', srcs, h, key)) return false;
         job.check_keys.push_back(key);
@@ -1370,41 +1421,39 @@ bool ConversationStore::write_job(Job& job, uint64_t& wrote, uint64_t& whole, st
     // the conversation file: tokens, pictures, the live state, the checkpoints, the K/V shapes and its tail
     Srcs srcs;
     srcs.reserve(16 + img.checkpoints.size() + img.kv.size() * 7);
-    add(srcs, kIds, 0, img.live.ids.size() * 4, [&](uint64_t o, uint8_t* d, uint64_t n) {
-        std::memcpy(d, reinterpret_cast<const uint8_t*>(img.live.ids.data()) + o, n); });
-    add(srcs, kImgs, 0, img.live.imgs.size() * sizeof(ConversationImageKey), [&](uint64_t o, uint8_t* d, uint64_t n) {
-        std::memcpy(d, reinterpret_cast<const uint8_t*>(img.live.imgs.data()) + o, n); });
+    add(srcs, kIds, 0, ids.size() * 4, host_bytes(ids.data(), ids.size() * 4));
+    add(srcs, kImgs, 0, imgs.size() * sizeof(ConversationImageKey),
+        host_bytes(imgs.data(), imgs.size() * sizeof(ConversationImageKey)));
     bool live_checked = false;   // a checkpoint at the live end: its state file holds the live state
-    for (const auto& c : img.checkpoints) live_checked = live_checked || (int64_t) c.ids.size() == n_ids;
+    for (const ConversationCheckpoint* c : img.checkpoints)
+        live_checked = live_checked || (int64_t) c->ids.size() == n_ids;
     if (!live_checked) add_state(srcs, img.live, kLive);
     for (size_t j = 0; j < img.checkpoints.size(); ++j) {
-        Section& s = add(srcs, kCheck, (uint32_t) j, 0, nullptr);
-        s.meta[0] = (int64_t) img.checkpoints[j].ids.size();
-        s.meta[1] = (int64_t) img.checkpoints[j].imgs.size();
+        Section& s = add(srcs, kCheck, (uint32_t) j, 0);
+        s.meta[0] = (int64_t) img.checkpoints[j]->ids.size();
+        s.meta[1] = (int64_t) img.checkpoints[j]->imgs.size();
         s.meta[2] = (int64_t) job.check_keys[j];
-        s.meta[3] = (int64_t) img.checkpoints[j].source;
+        s.meta[3] = (int64_t) img.checkpoints[j]->source;
     }
     for (size_t i = 0; i < img.kv.size(); ++i) {
-        const ConversationKv& kv = img.kv[i];
-        Section& s = add(srcs, kKvHead, (uint32_t) i, 0, nullptr);
+        const ConversationKvSource& kv = img.kv[i];
+        Section& s = add(srcs, kKvHead, (uint32_t) i, 0);
         const int64_t meta[7] = {kv.format, kv.cells, kv.heads, kv.head_dim, kv.page_size, kv.pooled_rows, kv.idx_dim};
         std::copy(meta, meta + 7, s.meta);
-        Section& r = add(srcs, kKvRate, (uint32_t) i, 0, nullptr);
+        Section& r = add(srcs, kKvRate, (uint32_t) i, 0);
         for (int k = 0; k < 4; ++k) r.meta[k] = (int64_t) rates[i].cell[k];
         r.meta[4] = (int64_t) rates[i].row;
         r.meta[5] = kv.cells;
-        const ConversationBuffer* bufs[5] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
         for (int k = 0; k < 5; ++k) {
-            const ConversationBuffer* buf = bufs[k];
+            const ConversationBytes& buf = kv.parts[(size_t) k];
             // with no blocks the rates are not needed: the whole buffer is the tail
             const uint64_t base = nb == 0 ? 0 : (k < 4 ? rates[i].cell[k] * (uint64_t) tail_from
                                                        : rates[i].row * (uint64_t) (tail_from / ib));
-            const uint64_t n = buf->size() > base ? buf->size() - base : 0;
-            add_kv(srcs, kK + k, (uint32_t) i, n, buf, base);
+            const uint64_t n = buf.size > base ? buf.size - base : 0;
+            add(srcs, kK + k, (uint32_t) i, n, buf, base);
         }
     }
-    add(srcs, kRefs, 0, job.blocks.size() * 8, [&](uint64_t o, uint8_t* d, uint64_t n) {
-        std::memcpy(d, reinterpret_cast<const uint8_t*>(job.blocks.data()) + o, n); });
+    add(srcs, kRefs, 0, job.blocks.size() * 8, host_bytes(job.blocks.data(), job.blocks.size() * 8));
     Header h;
     std::memset(&h, 0, sizeof h);
     h.file_kind = kConversationFile;
@@ -1415,7 +1464,7 @@ bool ConversationStore::write_job(Job& job, uint64_t& wrote, uint64_t& whole, st
     h.layer_hi = img.layer_hi;
     h.cvec = img.cvec ? 1 : 0;
     h.n_ids = n_ids;
-    h.n_imgs = (int64_t) img.live.imgs.size();
+    h.n_imgs = (int64_t) imgs.size();
     h.n_checks = (int64_t) img.checkpoints.size();
     h.n_kv = (int64_t) img.kv.size();
     h.block_cells = nb > 0 ? kBlockCells : 0;
