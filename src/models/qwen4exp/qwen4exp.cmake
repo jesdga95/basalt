@@ -99,10 +99,7 @@ add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp sr
   src/models/qwen4exp/decode/mtp/stores.cpp
   src/models/qwen4exp/decode/mtp/batching.cpp
   src/models/qwen4exp/conversation/conversation_snapshot.cpp
-  src/models/qwen4exp/conversation/conversation_state.cpp
- 
- 
-  src/core/staged_copy.cpp)
+  src/models/qwen4exp/conversation/conversation_state.cpp)
 target_include_directories(model_qwen4exp_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model_qwen4exp_engine PUBLIC core model tiers model_qwen4exp_kernels kernels_cpu ${_gpu_runtime_target})
 
