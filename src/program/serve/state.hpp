@@ -156,6 +156,9 @@ public:
     std::vector<ConvCheckpoint> checks{};
     /// The checkpoint save in flight (see ckd_finish).  Declared after `checks`: its wait runs before their bytes are freed.
     basalt::core::CheckpointDeferral ckd{};
+    /// A model split across two cards: the second card's part of that save, on its device.
+    basalt::core::CheckpointDeferral ckd_peer{};
+    int ckd_peer_dev = -1;
     /// A checkpoint of `to` tokens already in the chain is used again (and keeps the higher `source`): true.
     bool touch_check(int64_t to, ConvCheckpoint::Source source);
     /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache.

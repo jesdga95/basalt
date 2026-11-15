@@ -35,6 +35,11 @@ bool checkpoint_copy_out(const std::vector<SaveSegment>& segments, cudaStream_t 
 /// the host bytes have been read, so they may be freed.
 bool checkpoint_copy_in(const std::vector<RestoreSegment>& segments, cudaStream_t stream, std::string& error);
 
+/// A running state's regions (both cards' for a split model) into the bytes after its head at `host`, or back from them, each
+/// card's on its own stream: copy_out and copy_in for both.
+bool running_copy_out(const RunningState& rs, uint8_t* host, std::string& error);
+bool running_copy_in(const RunningState& rs, const uint8_t* host, std::string& error);
+
 /// Saves a checkpoint off the caller's critical path.  save() copies the regions into a spare device buffer at device
 /// speed, ordered after the stream's earlier work and before its later work, so decode may change the live state at
 /// once; the spare then moves to the host on a side stream while the caller carries on.  Nothing may read, move-from or
