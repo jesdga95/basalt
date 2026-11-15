@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/model/rope_flags.hpp"
 #include "basalt/platform/memory.hpp"
 
 namespace basalt::program {
@@ -48,6 +49,8 @@ struct CommonOptions {
     int peer_reserve_mib = 600;
     bool no_prompt_skip = false;  ///< --no-prompt-skip: every prompt row through every layer
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
+    /// --rope-scaling, --rope-scale, --yarn-* ...: taken by the models that extend their context (basalt/model/rope_flags.hpp)
+    basalt::model::RopeFlags rope;
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
     /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.

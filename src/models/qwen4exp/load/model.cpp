@@ -1,3 +1,4 @@
+#include "basalt/model/rope_flags.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
@@ -16,13 +17,9 @@ int model(Context& context) {
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
     // and `session_init` below builds the rope table from it and captures the kernels reading its constants
     // (rope_scaling.hpp); the only hard constraint is "set before that", and dying on a bad rope key beats
-    // scanning gigabytes of shards first.  Precedence: an EXPLICIT flag over the model file's rope keys over
-    // the struct defaults.  The empty --rope-scaling and the 0 --rope-scale mean the flag is absent, so the
-    // model file decides; an explicit value - `none` and `1` included, the opt-outs - wins over the model file.
+    // scanning gigabytes of shards first (precedence: basalt/model/rope_flags.hpp).
     {
-        // The model file's rope keys (llama.cpp's names under the arch prefix), when it carries any.
-        std::string gguf_rope_type;
-        double gguf_rope_base = 0, gguf_rope_factor = 0, gguf_rope_orig_ctx = 0;
+        basalt::model::RopeKeys keys;   // the model file's rope keys, when it carries any
         {
             // the model file is the authority on its own MoE shape (a pruned variant has fewer experts);
             // everything else in the geometry is unchanged
@@ -30,85 +27,18 @@ int model(Context& context) {
                 basalt::GgufFile model_gguf(o.native_shards.front());   // the metadata shard
                 if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
                 if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
-                if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.rope.freq_base")) gguf_rope_base = v->num();
-                if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.type")) gguf_rope_type = v->s;
-                if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.factor")) gguf_rope_factor = v->num();
-                if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.original_context_length"))
-                    gguf_rope_orig_ctx = v->num();
+                keys = basalt::model::rope_keys(model_gguf, "qwen4exp");
             } catch (const std::exception& e) {
                 basalt::log::error("basalt generate", "reading the model's expert shape from %s: %s",
                              o.model.c_str(), e.what());
                 return 1;
             }
         }
-        using RST = basalt::kernels::RopeScalingType;
-        if (!o.rope_scaling.empty()) {
-            // the early validation pinned the spelling; `none` here is the CLI opting OUT of the model file's keys
-            if (o.rope_scaling == "linear") rope_cfg.type = RST::Linear;
-            else if (o.rope_scaling == "yarn") rope_cfg.type = RST::YaRN;
-            else rope_cfg.type = RST::None;
-        } else if (!gguf_rope_type.empty()) {
-            if (gguf_rope_type == "linear") rope_cfg.type = RST::Linear;
-            else if (gguf_rope_type == "yarn") rope_cfg.type = RST::YaRN;
-            else if (gguf_rope_type != "none") {
-                basalt::log::error("basalt generate", "%s carries rope.scaling.type '%s' - none, linear or yarn only",
-                             o.model.c_str(), gguf_rope_type.c_str());
-                return 2;
-            }
-        }
-        if (o.rope_scale > 0) rope_cfg.factor = o.rope_scale;            // an explicit factor, 1 included
-        else if (gguf_rope_factor > 1.0) rope_cfg.factor = gguf_rope_factor;
-        if (o.rope_freq_base > 0) rope_cfg.freq_base = o.rope_freq_base;
-        else if (gguf_rope_base > 1.0) rope_cfg.freq_base = gguf_rope_base;
-        if (o.yarn_orig_ctx > 0) rope_cfg.orig_ctx = o.yarn_orig_ctx;
-        else if (gguf_rope_orig_ctx >= 1) rope_cfg.orig_ctx = gguf_rope_orig_ctx;
-        rope_cfg.freq_scale_in = o.rope_freq_scale;
-        rope_cfg.ext_factor = o.yarn_ext_factor >= 0 ? o.yarn_ext_factor
-                                                     : (rope_cfg.type == RST::YaRN ? 1.0 : 0.0);
-        rope_cfg.attn_factor = o.yarn_attn_factor;
-        rope_cfg.beta_fast = o.yarn_beta_fast;
-        rope_cfg.beta_slow = o.yarn_beta_slow;
-        if (rope_cfg.type == RST::None) {
-            // none is the trained rotation, exactly: the scaling knobs are inert (the table builder and
-            // `kernel_args` ignore them), and resetting them keeps the logged/queried config honest.  Only the
-            // frequency base survives - it is the rotation itself, not a scaling knob.
-            const bool knobs = o.rope_scale > 1.0 || o.rope_freq_scale > 0 || o.yarn_ext_factor > 0 ||
-                               o.yarn_attn_factor != 1.0;
-            const double base = rope_cfg.freq_base;
-            rope_cfg = basalt::kernels::RopeScaling{};
-            rope_cfg.freq_base = base;
-            if (knobs)
-                basalt::log::info("basalt generate", "note: no rope scaling is active (none), so --rope-scale, "
-                                     "--rope-freq-scale and the --yarn-* knobs have no effect");
-        }
-        // THE RESOLVED CONFIG IS VALIDATED AS A WHOLE, with the one rule every rotation site also applies
-        // (rope_scaling.hpp): the CLI ranges above cannot see a model-file value, nor a combination such as a
-        // --rope-freq-scale that turns the resolved factor non-finite.
-        if (const char* why = basalt::kernels::rope_scaling_invalid(rope_cfg)) {
-            basalt::log::error("basalt generate", "invalid rope scaling configuration: %s (type %s, factor %g, "
-                                 "freq_scale %g, base %g, original context %g)",
-                         why, rope_cfg.type == RST::YaRN ? "yarn" : rope_cfg.type == RST::Linear ? "linear" : "none",
-                         rope_cfg.factor, rope_cfg.freq_scale(), rope_cfg.freq_base, rope_cfg.orig_ctx);
+        if (!basalt::model::resolve_rope_scaling(o.rope, keys, o.max_context, "basalt generate", rope_cfg, err)) {
+            basalt::log::error("basalt generate", "%s: %s", o.model.c_str(), err.c_str());
             return 2;
         }
         basalt::kernels::rope_scaling_set(rope_cfg);
-        if (rope_cfg.type != RST::None) {
-            const char* tn = rope_cfg.type == RST::YaRN ? "yarn" : "linear";
-            basalt::log::info("basalt generate", "rope scaling %s, factor %.6g (freq_scale %.6g, base %.6g, mscale %.6f), "
-                         "--max-context %lld against a trained context of %.0f",
-                         tn, rope_cfg.factor, rope_cfg.freq_scale(), rope_cfg.freq_base, rope_cfg.mscale(),
-                         (long long) o.max_context, rope_cfg.orig_ctx);
-            if ((double) o.max_context <= rope_cfg.orig_ctx)
-                basalt::log::info("basalt generate", "note: the context is within the trained %.0f - no position needs the "
-                             "extension, and the resolved scaling still applies to every angle",
-                             rope_cfg.orig_ctx);
-            // only when there IS a magnitude correction: YaRN's log term (ext_factor != 0) or an explicit
-            // --yarn-attn-factor; plain linear (mscale 1) has none, and saying otherwise was TODO 22
-            if (rope_cfg.mscale() != 1.0)
-                basalt::log::info("basalt generate", "note: the %s magnitude correction scales cos and sin by %.6f "
-                             "at every position",
-                             rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
-        }
     }
     basalt::core::NativeEmbed native_embed;
     {
