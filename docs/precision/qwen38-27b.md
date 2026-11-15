@@ -81,6 +81,23 @@ The base scores 6.7411 on the same rows. Each chunk's first half is read as one 
 decoded against it, so every scored row sees a cache and recurrent state the prompt path wrote, W4A4 on the NVFP4 matrices at
 any chunk length (as the checkpoints and Infernix do). Decode never uses it.
 
+## Context past 262,144
+
+`--rope-scaling yarn --rope-scale F` rotates every query and key by YaRN, as transformers' Qwen3.5 rotary and llama.cpp's
+`rope_multi` do for the interleaved M-RoPE: each of the 32 rotated pairs keeps its trained frequency (pairs 0 to 14 at the
+defaults, beta 32 and 1 over the trained 262,144), takes 1/F of it (pairs 22 to 31) or a blend between, whichever position
+(t, h, w) it rotates by, and cos and sin are scaled by 0.1 ln F + 1. The frequencies are worked out once in double precision;
+prompt chunks and decode windows rotate by the same table. Every position turns the scaled way, short ones too, which costs a
+little there (the gate on 20 chunks, `--kv int8`; llama.cpp's YaRN on unsloth's Q4_K_M, same text, for scale):
+
+| | PPL | KLD mean | Top-1 | llama.cpp PPL |
+| --- | ---: | ---: | ---: | ---: |
+| Off | 7.0321 | 0.0257 | 93.14% | 6.9154 |
+| `--rope-scaling yarn --rope-scale 2` | 7.0708 | 0.0274 | 92.73% | 6.9339 |
+
+Past the trained length, a passphrase hidden at 10%, 50% and 90% of a 380,541-token prompt (synthetic filler, `--max-context
+400000 --kv int8`, YaRN x2) was found at every depth.
+
 ## Sampling with drafts
 
 A sampled request (temperature above 0, `top_k` 1 to 64) that gives no `seed` drafts by speculative sampling. The block

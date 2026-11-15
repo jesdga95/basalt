@@ -5,6 +5,7 @@
 #pragma once
 
 #include "basalt/kernels/gqa_attn.hpp"
+#include "basalt/kernels/rope_scaling.hpp"
 
 #include <cstdint>
 
@@ -39,12 +40,16 @@ void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, c
 
 /// The rotary part of a gated GQA attention layer: `rot` leading dims of each head rotate NeoX-style (pairs i and
 /// i + rot/2) with inverse frequency theta^(-2i/rot); pair i takes its position from axis `axis[i]` (0 t, 1 h, 2 w:
-/// interleaved M-RoPE; all 0 for plain rope).
+/// interleaved M-RoPE; all 0 for plain rope).  `scaling` (rope_scaling.hpp; none by default) blends each pair's
+/// frequency between the trained one and the interpolated one by its pair index, whatever its axis, and scales cos and
+/// sin by its magnitude correction.
 struct RopeSpec {
     int rot = 0;
     float theta = 0.0f;
-    int8_t axis[64] = {};   // per rotated pair
-    float inv_freq[64] = {};   // filled by attn_qk_prepare from theta and rot (the kernels read the table)
+    int8_t axis[64] = {};      // per rotated pair
+    RopeScaling scaling;       // its freq_base is theta's
+    float inv_freq[64] = {};   // filled by attn_qk_prepare from theta, rot and scaling (the kernels read the table)
+    float mscale = 1.0f;       // likewise: the magnitude correction
 };
 
 /// One window's or chunk's query and key heads: q_full [T][n_head][2 hd] (query | gate per head; `gated` false:

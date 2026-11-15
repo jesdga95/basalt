@@ -28,7 +28,9 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
 
 ## Memory
 
-- **Context:** `--max-context`, default 8,192, up to the model's 262,144. The KV cache is allocated at start for every slot:
+- **Context:** `--max-context`, default 8,192, up to the model's 262,144; past it with `--rope-scaling yarn --rope-scale F`
+  (up to 262,144 x F; [configuration](../configuration/index.md#context-and-kv-cache)), which also changes short prompts'
+  output, so leave it off below 262,144 ([precision](../precision/qwen38-27b.md#context-past-262144)). The KV cache is allocated at start for every slot:
   `--kv fp16` (default) takes 64 KiB per position over the 16 attention layers, `--kv int8` 33 KiB (int8 codes with an fp16
   scale per 64 values; [precision](../precision/qwen38-27b.md)). On a 32 GB card one slot holds about 190K positions in fp16
   and the full 262,144 in int8. The start refuses a context that does not fit and names the free memory.

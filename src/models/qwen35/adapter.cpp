@@ -6,6 +6,7 @@
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/model/flags.hpp"
+#include "basalt/model/rope_flags.hpp"
 #include "basalt/program/options.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
@@ -46,6 +47,26 @@ public:
         desc_ = describe_meta(gg);
         dense::Geometry g = geometry(gg, err);
         if (!err.empty()) return false;
+        // the rope scaling of the run (rope_flags.hpp): the model's own base and trained context, the pack's keys, the flags
+        g.rope.scaling.freq_base = g.rope.theta;
+        g.rope.scaling.orig_ctx = (double) (g.context_length > 0 ? g.context_length : 262144);
+        if (!model::resolve_rope_scaling(req.rope, model::rope_keys(gg, "qwen35"), req.max_context, "basalt qwen35", g.rope.scaling,
+                                         err)) {
+            err = "qwen35: " + err;
+            return false;
+        }
+        g.rope.theta = (float) g.rope.scaling.freq_base;
+        // the longest context: the trained one, or as far as the scaling stretches it
+        const int64_t longest = g.rope.scaling.type == kernels::RopeScalingType::None
+                                    ? g.context_length
+                                    : (int64_t) (g.rope.scaling.orig_ctx / g.rope.scaling.freq_scale());
+        if (longest > 0 && req.max_context > longest) {
+            err = "qwen35: --max-context " + std::to_string((long long) req.max_context) + " is beyond the model's " +
+                  std::to_string((long long) longest) +
+                  (g.rope.scaling.type == kernels::RopeScalingType::None ? " (--rope-scaling yarn --rope-scale F extends it)"
+                                                                         : " with this rope scaling");
+            return false;
+        }
         for (const TensorInfo& t : gg.tensors()) tensors_[t.name] = t;
         fd_ = platform::open_fd_utf8(path);
         if (fd_ < 0) {
@@ -129,11 +150,6 @@ public:
             if (!file.open(path, err)) return false;
             core::model_sources(file, srcs);
             o.mmproj = srcs.vision;
-        }
-        if (g.context_length > 0 && o.max_context > g.context_length) {
-            err = "qwen35: --max-context " + std::to_string((long long) o.max_context) + " is beyond the model's " +
-                  std::to_string((long long) g.context_length);
-            return false;
         }
         const uint64_t need_b = dense::shared_bytes(g, o.max_context) +
                                 (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_int8) +
@@ -418,7 +434,8 @@ public:
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         (void) code;
-        if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
+        if (model::parse_rope_flag(a, args, o.rope)) {}
+        else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
@@ -437,6 +454,7 @@ public:
             basalt::log::error("basalt qwen35", "--kv %s: fp16 (the default) or int8", o.kv.c_str());
             return 2;
         }
+        if (const auto code = model::check_rope_flags(o.rope, "basalt qwen35")) return code;
         if (o.spec_given && (o.spec < 0 || o.spec > 16)) {
             basalt::log::error("basalt qwen35", "--spec %d: 0 (off) to 16", o.spec);
             return 2;
