@@ -290,6 +290,28 @@ int main() {
         cache.put_slot(std::move(turn), 4);
         check(cache.superseded() == 1 && cache.slot_size() == 2, "a later turn of the same conversation supersedes its copy");
     }
+    {   // the longest parked conversation a caller accepts leaves, an idle slot's or a budgeted one alike
+        ConversationCache cache(1 << 20, 4);
+        cache.set_spill(true);
+        cache.put_slot(image({9, 8, 7}), 4);
+        check(cache.put(image({1, 2, 3})) && cache.put(image({5, 6})), "park two beside an idle slot's conversation");
+        cache.put_slot(image({4, 4, 4, 4}), 4);
+        const auto any = [](const SavedConversation&) { return true; };
+        const auto longer = [](const SavedConversation& c) { return c.live.ids.size() >= 3; };
+        check(!cache.take_oldest([](const SavedConversation&) { return false; }) && cache.size() == 4,
+              "nothing leaves when no conversation is accepted");
+        auto first = cache.take_oldest(any);
+        check(first && first->from_slot && first->live.ids == std::vector<int32_t>({9, 8, 7}) && cache.slot_size() == 1,
+              "the longest parked one leaves first, with its bookkeeping");
+        auto second = cache.take_oldest(longer);
+        check(second && !second->from_slot && second->live.ids == std::vector<int32_t>({1, 2, 3}), "then the next");
+        auto third = cache.take_oldest(longer);
+        check(third && third->live.ids == std::vector<int32_t>({4, 4, 4, 4}) && cache.slot_size() == 0 &&
+                  cache.slot_bytes() == 0, "one that is not accepted is passed over");
+        check(!cache.take_oldest(longer) && cache.size() == 1 && cache.bytes() == image({5, 6}).bytes() &&
+                  cache.best(std::vector<int64_t>{5, 6, 7}, {}, true).tokens == 2, "and stays parked");
+        check(cache.evictions() == 0 && cache.take_spilled().empty(), "taking is no eviction and spills nothing");
+    }
     {
         // layer-split parking: checkpoints moved apart into stage parts and put back, no running state copied
         auto running = [](std::initializer_list<int32_t> ids, uint8_t salt, size_t parts) {
