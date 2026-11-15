@@ -2218,7 +2218,7 @@
       "draft_len_prose": 5.2,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     },
-        {
+    {
       "submitter": "ivd",
       "date": "2026-11-15",
       "commit": "7bdb81ceb9",
