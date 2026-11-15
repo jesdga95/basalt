@@ -161,7 +161,7 @@ bool take_cells(Arena& a, SessionState& s, const Geometry& g, bool int8, int ai0
         s.kc.push_back(k);
         s.vc.push_back(v);
         s.kq.push_back(q8);
-        s.far.push_back({});   // all of its cells are on the card
+        s.far_kv.push_back({});   // all of its cells are on the card
     }
     return true;
 }
@@ -292,7 +292,7 @@ void refit(PromptLine::Rate& r, const Geometry& g, int l0, int l1, int64_t pos, 
 static bool calibrate(PromptLine& L, Model& main, std::string& err) {
     const Geometry& g = main.g;
     const size_t T = kChunk, H = (size_t) g.n_embd;
-    const int64_t far = std::max<int64_t>(0, std::min<int64_t>(L.max_context - kChunk, kCalFar)) / kChunk * kChunk;
+    const int64_t far_pos = std::max<int64_t>(0, std::min<int64_t>(L.max_context - kChunk, kCalFar)) / kChunk * kChunk;
     const int nl = g.n_layers - L.l_min, na = g.attn_layers() - count_kind(g, L.l_min, Mixer::Attention);
     std::memset(L.pos3, 0, ((size_t) kChunk * 3 + 4) * sizeof(int32_t));
     L.pos3[1] = kChunk;
@@ -335,14 +335,14 @@ static bool calibrate(PromptLine& L, Model& main, std::string& err) {
     SessionState s;
     s.gdn_floats = L.st.gdn_floats;
     const int ai0 = count_kind(g, L.l_min, Mixer::Attention);
-    const size_t need = (size_t) g.gdn_layers() * s.gdn_floats * 4 + (size_t) na * (size_t) (far + kChunk) * cell_bytes(g, main.o.kv_int8) +
+    const size_t need = (size_t) g.gdn_layers() * s.gdn_floats * 4 + (size_t) na * (size_t) (far_pos + kChunk) * cell_bytes(g, main.o.kv_int8) +
                         (size_t) ai0 * kChunk * cell_bytes(g, main.o.kv_int8) + (size_t) g.attn_layers() * 4 * 256 + 4096;
-    bool ok = far > 0 && a.reserve(need) && cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) == cudaSuccess;
+    bool ok = far_pos > 0 && a.reserve(need) && cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) == cudaSuccess;
     s.gdn = ok ? a.take<float>((size_t) g.gdn_layers() * s.gdn_floats) : nullptr;
-    ok = ok && s.gdn && take_cells(a, s, g, main.o.kv_int8, ai0, far + kChunk, kChunk);
+    ok = ok && s.gdn && take_cells(a, s, g, main.o.kv_int8, ai0, far_pos + kChunk, kChunk);
     // the cells the runs further on read hold random values too: what attention multiplies moves a card's speed as well
     const auto fill = [&](const SessionState& ss, cudaStream_t st) {
-        for (const Region& r : cell_regions(main, ss, ss, ai0, 0, far)) {
+        for (const Region& r : cell_regions(main, ss, ss, ai0, 0, far_pos)) {
             for (size_t at = 0; at < r.bytes; at += T * H * 2)
                 if (cudaMemcpyAsync((uint8_t*) r.line + at, L.hand[0], std::min(T * H * 2, r.bytes - at), cudaMemcpyHostToDevice, st) !=
                     cudaSuccess)
@@ -382,7 +382,7 @@ static bool calibrate(PromptLine& L, Model& main, std::string& err) {
         runs(m0, false, kCalRuns);
         runs(mf, false, kCalRuns);
         runs(lf, true, kCalRuns);
-        ok = lf.queue(L.l_min, far, bnd, pos3) && m0.queue(L.l_min, 0, bnd, pos3) && mf.queue(L.l_min, far, bnd, pos3);
+        ok = lf.queue(L.l_min, far_pos, bnd, pos3) && m0.queue(L.l_min, 0, bnd, pos3) && mf.queue(L.l_min, far_pos, bnd, pos3);
         main_0 = ok ? m0.ms() : -1;
         main_far = ok ? mf.ms() : -1;
         line_far = ok ? lf.ms() : -1;
@@ -395,12 +395,12 @@ static bool calibrate(PromptLine& L, Model& main, std::string& err) {
     }
     ok = ok && main_all >= 0 && main_0 >= 0 && main_far >= 0 && line_0 >= 0 && line_far >= 0;
     if (!ok) {
-        err = far > 0 ? std::string("timing the cards' layers failed: ") + cudaGetErrorString(cudaGetLastError())
+        err = far_pos > 0 ? std::string("timing the cards' layers failed: ") + cudaGetErrorString(cudaGetLastError())
                       : "the context is too short for a split";
         return false;
     }
-    L.line_rate = fit_rate(line_0, line_far, far, nl, na);
-    L.main_rate.cell = fit_rate(main_0, main_far, far, nl, na).cell;
+    L.line_rate = fit_rate(line_0, line_far, far_pos, nl, na);
+    L.main_rate.cell = fit_rate(main_0, main_far, far_pos, nl, na).cell;
     L.main_rate.row = std::max(0.0, (double) main_all - L.main_rate.cell * g.attn_layers() * (double) T * T / 2) /
                       ((double) g.n_layers * T);
     L.hand_row_ms = hand_ms / (double) T;

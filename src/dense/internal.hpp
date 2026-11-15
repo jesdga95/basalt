@@ -174,7 +174,7 @@ struct SessionState {
     std::vector<kernels::KvInt8> kq;             // per attention layer: the int8 cache ({} with fp16)
     // per attention layer, with K/V streaming: the cells from Options::kv_resident on, in page-locked host memory
     // (device-mapped); {} without.  kc/vc/kq then hold only the first kv_resident cells
-    std::vector<kernels::KvFar> far;
+    std::vector<kernels::KvFar> far_kv;
     void* far_host = nullptr;
     // the last window's rows per GDN layer, until its commit
     float *rec_qkv = nullptr, *rec_h = nullptr, *rec_gate = nullptr, *rec_beta = nullptr;

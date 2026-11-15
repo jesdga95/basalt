@@ -74,9 +74,9 @@ public:
         const size_t cells = (size_t) m_.o.max_context * g.n_kv * g.head_dim;
         // with K/V streaming each layer keeps its first `near` cells here and the rest in page-locked host memory
         const int64_t near_cells = resident_cells(m_.o.max_context, m_.o.kv_resident);
-        const size_t near = (size_t) near_cells * g.n_kv * g.head_dim, far = cells - near;
+        const size_t n_near = (size_t) near_cells * g.n_kv * g.head_dim, n_far = cells - n_near;
         uint8_t* host = nullptr;
-        if (far > 0 && g.attn_layers() > 0) {
+        if (n_far > 0 && g.attn_layers() > 0) {
             const uint64_t hb = session_host_bytes(g, m_.o.max_context, m_.o.kv_int8, m_.o.kv_resident);
             if (cudaHostAlloc(&st_.far_host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
                 cudaGetLastError();
@@ -92,25 +92,25 @@ public:
             f.at = near_cells;
             if (m_.o.kv_int8) {
                 f.q8.k = (int8_t*) host;
-                f.q8.v = f.q8.k + far;
-                f.q8.ks = (uint16_t*) (f.q8.v + far);
-                f.q8.vs = f.q8.ks + far / 64;
-                host = (uint8_t*) (f.q8.vs + far / 64);
+                f.q8.v = f.q8.k + n_far;
+                f.q8.ks = (uint16_t*) (f.q8.v + n_far);
+                f.q8.vs = f.q8.ks + n_far / 64;
+                host = (uint8_t*) (f.q8.vs + n_far / 64);
             } else {
                 f.k = (uint16_t*) host;
-                f.v = f.k + far;
-                host = (uint8_t*) (f.v + far);
+                f.v = f.k + n_far;
+                host = (uint8_t*) (f.v + n_far);
             }
         };
         for (int i = 0; i < g.attn_layers(); ++i) {
             kernels::KvInt8 q8;
-            st_.far.emplace_back();
-            if (far > 0) far_view(st_.far.back());
+            st_.far_kv.emplace_back();
+            if (n_far > 0) far_view(st_.far_kv.back());
             if (m_.o.kv_int8) {
-                q8.k = st_.arena.take<int8_t>(near);
-                q8.v = st_.arena.take<int8_t>(near);
-                q8.ks = st_.arena.take<uint16_t>(near / 64);
-                q8.vs = st_.arena.take<uint16_t>(near / 64);
+                q8.k = st_.arena.take<int8_t>(n_near);
+                q8.v = st_.arena.take<int8_t>(n_near);
+                q8.ks = st_.arena.take<uint16_t>(n_near / 64);
+                q8.vs = st_.arena.take<uint16_t>(n_near / 64);
                 st_.kc.push_back(nullptr);
                 st_.vc.push_back(nullptr);
                 if (!q8.vs) {
@@ -118,8 +118,8 @@ public:
                     return false;
                 }
             } else {
-                st_.kc.push_back(st_.arena.take<uint16_t>(near));
-                st_.vc.push_back(st_.arena.take<uint16_t>(near));
+                st_.kc.push_back(st_.arena.take<uint16_t>(n_near));
+                st_.vc.push_back(st_.arena.take<uint16_t>(n_near));
             }
             st_.kq.push_back(q8);
         }
@@ -514,12 +514,12 @@ public:
         cudaStreamSynchronize(st_.stream);
         kv.clear();
         // a layer's array: its first `split` bytes on the card (`dev`), the rest streamed (`far`, host memory)
-        const auto down = [&](const void* dev, const void* far, size_t split, core::ConversationBuffer& to, size_t bytes) {
+        const auto down = [&](const void* dev, const void* far_buf, size_t split, core::ConversationBuffer& to, size_t bytes) {
             to.resize_for_overwrite(bytes);
             return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
                 const size_t a = at < split ? std::min(n, split - at) : 0;
                 return (a == 0 || cudaMemcpy(p, (const uint8_t*) dev + at, a, cudaMemcpyDeviceToHost) == cudaSuccess) &&
-                       (a == n || cudaMemcpy(p + a, (const uint8_t*) far + (at + a - split), n - a, cudaMemcpyDefault) == cudaSuccess);
+                       (a == n || cudaMemcpy(p + a, (const uint8_t*) far_buf + (at + a - split), n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
         for (size_t i = 0; i < st_.kc.size() + (drafter_ ? 1 : 0); ++i) {
@@ -532,7 +532,7 @@ public:
             k.head_dim = g_.head_dim;
             k.page_size = 1;
             const size_t rows = (size_t) positions * row_bytes(int8);
-            const kernels::KvFar f = mtp ? kernels::KvFar{} : st_.far[i];
+            const kernels::KvFar f = mtp ? kernels::KvFar{} : st_.far_kv[i];
             const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(int8);
             bool ok;
             if (int8) {
@@ -552,11 +552,11 @@ public:
         cudaStreamSynchronize(st_.stream);
         if (kv.size() != st_.kc.size() + (drafter_ ? 1 : 0)) return fail(m_.o.arch + ": a parked conversation has other caches");
         if (positions > m_.o.max_context) return fail(m_.o.arch + ": a parked conversation is longer than the context");
-        const auto up = [&](void* dev, void* far, size_t split, const core::ConversationBuffer& from, size_t bytes) {
+        const auto up = [&](void* dev, void* far_buf, size_t split, const core::ConversationBuffer& from, size_t bytes) {
             return from.size() >= bytes && from.visit(0, bytes, [&](const uint8_t* p, size_t n, size_t at) {
                 const size_t a = at < split ? std::min(n, split - at) : 0;
                 return (a == 0 || cudaMemcpy((uint8_t*) dev + at, p, a, cudaMemcpyHostToDevice) == cudaSuccess) &&
-                       (a == n || cudaMemcpy((uint8_t*) far + (at + a - split), p + a, n - a, cudaMemcpyDefault) == cudaSuccess);
+                       (a == n || cudaMemcpy((uint8_t*) far_buf + (at + a - split), p + a, n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
         for (size_t i = 0; i < kv.size(); ++i) {
@@ -566,7 +566,7 @@ public:
             if (k.format != (int8 ? 2 : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
                 return fail(m_.o.arch + ": a parked conversation has other caches");
             const size_t rows = (size_t) positions * row_bytes(int8);
-            const kernels::KvFar f = mtp ? kernels::KvFar{} : st_.far[i];
+            const kernels::KvFar f = mtp ? kernels::KvFar{} : st_.far_kv[i];
             const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(int8);
             bool ok;
             if (int8) {
