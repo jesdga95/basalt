@@ -2042,20 +2042,13 @@
       "notes": "Q4_K/Q5_1 and Q4_K/Q8_0 expert layers take the engine's 'glue off' fallback, so decode trails the NVFP4 and IQ4_XS packs on this card"
     },
     {
-<<<<<<< HEAD
       "submitter": "shining",
       "date": "2026-11-14",
       "commit": "8471072850",
-=======
-      "submitter": "gweyer-dual5090",
-      "date": "2026-11-14",
-      "commit": "71be0a452b",
->>>>>>> 9ea735a (community: add gweyer-dual5090 IQ1_M run (dual RTX 5090, 655.9 tok/s))
       "preset": "community-1",
       "model": "Qwen3.8-Flash-Next",
       "gpus": [
         {
-<<<<<<< HEAD
           "name": "RTX PRO 6000 Blackwell Max-Q Workstation Edition",
           "vram_gib": 96,
           "power_w": 300,
@@ -2224,7 +2217,15 @@
       "draft_len_struct": 14.0,
       "draft_len_prose": 5.2,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8"
-=======
+    },
+    {
+      "submitter": "gweyer-dual5090",
+      "date": "2026-11-14",
+      "commit": "71be0a452b",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
           "name": "RTX 5090",
           "vram_gib": 32,
           "power_w": 550,
@@ -2257,8 +2258,8 @@
       "draft_len_conv": 2.7,
       "draft_len_struct": 6.9,
       "draft_len_prose": 1.8,
-      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8"
->>>>>>> 9ea735a (community: add gweyer-dual5090 IQ1_M run (dual RTX 5090, 655.9 tok/s))
+      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
+      "notes": "Peer access on between the two 5090s (patched open-driver build, P2P verified with data check)."
     }
   ]
 }
