@@ -443,10 +443,12 @@ private:
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
     bool fixed_experts(basalt::core::VerifyHits& h, int dev);
-    // The disk tier a buffer at a time: a conversation on disk that RAM does not admit whole is read with its K/V
-    // going from the files into the session.  --exp disk_stream: 0 never, 2 every read.
+    // The disk tier a buffer at a time: a conversation that goes only to disk is written from the session, and one
+    // on disk that RAM does not admit whole is read with its K/V going from the files into the session.
+    // --exp disk_stream: 0 neither, 2 every read too.
     int disk_stream{1};
     uint64_t ram_seen_cap{};   // --exp conv_ram_mib: the most RAM above its floor a conversation's admission sees
+    bool disk_write(const basalt::core::ConversationSource& src, std::string& e);
     bool park_current(size_t held, int64_t kept) override;
     bool gpu_sync_ok();
     bool checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool defer = false,
