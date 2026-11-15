@@ -108,7 +108,7 @@ void usage() {
                  "                       token plus up to N-1 MTP drafts, sized per window by the drafts' joint chance\n"
                  "                       of acceptance against a threshold adapted per request); 0 or 1 = no\n"
                  "                       speculation (default: the pack's drafter decides, 8 with an MTP drafter\n"
-                 "                       and 3 with a DSpark one; 0 without a drafter)\n"
+                 "                       and 6 with a DSpark one; 0 without a drafter)\n"
                  "  --draft-experts N    a DSpark drafter keeps each stage's N most routed experts by the shipped ranking\n"
                  "                       (32, 64, 96 or 128; default 32; 0 = all)\n"
                  "  --relaxed-drafting [P]  sampled requests keep a draft the target gives probability >= P even when\n"
