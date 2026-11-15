@@ -524,7 +524,8 @@ void ExpertTier::seed_copies(int64_t n) {
             if (!pinned(l, e) || res_[(size_t) l * n_expert_ + e] >= 0) continue;
             ++tick_;
             if (claim(l, e, blob_of(l, e), copy_stream_) < 0) {
-                cudaStreamSynchronize(copy_stream_);
+                if (const cudaError_t ce = cudaStreamSynchronize(copy_stream_); ce != cudaSuccess)
+                    basalt::log::error("basalt deepseek41", "tier seed copy sync: %s", cudaGetErrorString(ce));
                 land_all();
                 ++tick_;
                 if (claim(l, e, blob_of(l, e), copy_stream_) < 0) return;
@@ -532,7 +533,8 @@ void ExpertTier::seed_copies(int64_t n) {
             ++placed;
         }
     }
-    cudaStreamSynchronize(copy_stream_);
+    if (const cudaError_t ce = cudaStreamSynchronize(copy_stream_); ce != cudaSuccess)
+        basalt::log::error("basalt deepseek41", "tier seed sync: %s", cudaGetErrorString(ce));
     land_all();
 }
 
@@ -580,7 +582,8 @@ void ExpertTier::land(int layer) {
             pending_[keep++] = p;
             continue;
         }
-        cudaEventSynchronize(events_[(size_t) p.event]);
+        if (const cudaError_t ce = cudaEventSynchronize(events_[(size_t) p.event]); ce != cudaSuccess)
+            basalt::log::error("basalt deepseek41", "tier land layer %d sync: %s", layer, cudaGetErrorString(ce));
         apply(p);
     }
     pending_.resize(keep);
@@ -602,7 +605,8 @@ void ExpertTier::land(int layer) {
 void ExpertTier::land_all() {
     issue(-1, kAllPieces);
     for (const Pending& p : pending_) {
-        cudaEventSynchronize(events_[(size_t) p.event]);
+        if (const cudaError_t ce = cudaEventSynchronize(events_[(size_t) p.event]); ce != cudaSuccess)
+            basalt::log::error("basalt deepseek41", "tier land_all layer %d sync: %s", p.layer, cudaGetErrorString(ce));
         apply(p);
     }
     pending_.clear();
@@ -618,9 +622,11 @@ void ExpertTier::settle() {
     std::string err;
     if (!await_reads(err)) basalt::log::error("basalt deepseek41", "%s", err.c_str());
     land_all();
-    cudaStreamSynchronize(copy_stream_);
-    cudaStreamSynchronize(out_stream_);
-    cudaStreamSynchronize(fetch_stream_);
+    for (const auto& [name, st] : std::array<std::pair<const char*, cudaStream_t>, 3>{
+             {{"copy", copy_stream_}, {"out", out_stream_}, {"fetch", fetch_stream_}}}) {
+        if (const cudaError_t ce = cudaStreamSynchronize(st); ce != cudaSuccess)
+            basalt::log::error("basalt deepseek41", "tier settle %s sync: %s", name, cudaGetErrorString(ce));
+    }
 }
 
 void ExpertTier::begin_token(int n_tokens) {

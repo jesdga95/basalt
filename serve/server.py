@@ -40,6 +40,7 @@ from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, expose
                             lan_addresses, origins_of)
 from serve.router import Router  # noqa: E402
 from serve.service import Service  # noqa: E402
+from serve.engine.progress import load_progress                             # noqa: E402
 from serve.util.logbuf import ColorStream, LogBuffer, TeeStream, tail_file  # noqa: E402
 from serve.util.loglevel import ERR, WARN, LevelReader                     # noqa: E402
 from serve.util.console import LEGEND, tagged  # noqa: E402
@@ -252,6 +253,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         # always built unloaded: the load itself is the lazy path's, started by the caller instead of by a request
         engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
         if cfg.get("log"):                              # follow the engine's log file
+            print(f"[server] engine log: {cfg['log']}", flush=True)
             eng_lvl = LevelReader()
             in_err_block = False
 
@@ -272,7 +274,8 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
                     out.flush()
 
             threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"),
-                             kwargs={"on_line": echo_engine_line}, daemon=True).start()
+                             kwargs={"on_line": echo_engine_line,
+                                     "skip": lambda line: load_progress(line) is not None}, daemon=True).start()
         else:
             ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
         if isinstance(vision, EngineVision):

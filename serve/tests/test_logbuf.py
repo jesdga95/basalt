@@ -193,6 +193,19 @@ class Tail(unittest.TestCase):
             self.wait_for(b, 1)
             self.assertEqual(seen, [("basalt serve: warning: hot", len("before\nbasalt serve: warning: hot\n"))])
 
+    def test_skip_omits_matching_lines_from_buffer(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "skip.log"
+            log.write_text("", encoding="utf-8")
+            b = LogBuffer()
+            threading.Thread(target=tail_file, args=(b, str(log), "eng", 0.02),
+                             kwargs={"skip": lambda line: line.startswith("basalt load: cuda0 ")}, daemon=True).start()
+            time.sleep(0.1)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("basalt load: cuda0 100 200\nbasalt: system: Linux\n")
+            self.wait_for(b, 1)
+            self.assertEqual([x["msg"] for x in b.since(0)[0]], ["basalt: system: Linux"])
+
 
 class Tty(io.StringIO):
     def isatty(self):
