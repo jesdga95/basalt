@@ -34,6 +34,7 @@ public:
         if (st_.join) cudaEventDestroy(st_.join);
         if (done_) cudaEventDestroy(done_);
         if (h_picks_) cudaFreeHost(h_picks_);
+        if (st_.far_host) cudaFreeHost(st_.far_host);
     }
 
     bool init(std::string& err) {
@@ -53,10 +54,10 @@ public:
             block_bytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
                           (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
         }
-        if (!st_.arena.reserve(session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8) + block_bytes)) {
+        const uint64_t dev_bytes = session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8, m_.o.kv_resident);
+        if (!st_.arena.reserve(dev_bytes + block_bytes)) {
             err = m_.o.arch + ": out of device memory for a session of " + std::to_string((long long) m_.o.max_context) +
-                  " cells (" + std::to_string((unsigned long long) (session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8) >> 20)) +
-                  " MiB); lower --max-context or --parallel";
+                  " cells (" + std::to_string((unsigned long long) (dev_bytes >> 20)) + " MiB); lower --max-context or --parallel";
             return false;
         }
         const size_t C = (size_t) g.conv_channels(), HV = (size_t) g.gdn_v_heads;
@@ -71,13 +72,45 @@ public:
             st_.rec_beta = st_.arena.take<float>(ng * kWindow * HV);
         }
         const size_t cells = (size_t) m_.o.max_context * g.n_kv * g.head_dim;
+        // with K/V streaming each layer keeps its first `near` cells here and the rest in page-locked host memory
+        const int64_t near_cells = resident_cells(m_.o.max_context, m_.o.kv_resident);
+        const size_t near = (size_t) near_cells * g.n_kv * g.head_dim, far = cells - near;
+        uint8_t* host = nullptr;
+        if (far > 0 && g.attn_layers() > 0) {
+            const uint64_t hb = session_host_bytes(g, m_.o.max_context, m_.o.kv_int8, m_.o.kv_resident);
+            if (cudaHostAlloc(&st_.far_host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                cudaGetLastError();
+                st_.far_host = nullptr;
+                err = m_.o.arch + ": out of page-locked memory for the streamed K/V (" + std::to_string((unsigned long long) (hb >> 20)) +
+                      " MiB); raise --kv-resident or lower --max-context or --parallel";
+                return false;
+            }
+            host = (uint8_t*) st_.far_host;
+        }
+        // the far cells of one layer, carved from the host block (device-mapped: the same address on the card)
+        const auto far_view = [&](kernels::KvFar& f) {
+            f.at = near_cells;
+            if (m_.o.kv_int8) {
+                f.q8.k = (int8_t*) host;
+                f.q8.v = f.q8.k + far;
+                f.q8.ks = (uint16_t*) (f.q8.v + far);
+                f.q8.vs = f.q8.ks + far / 64;
+                host = (uint8_t*) (f.q8.vs + far / 64);
+            } else {
+                f.k = (uint16_t*) host;
+                f.v = f.k + far;
+                host = (uint8_t*) (f.v + far);
+            }
+        };
         for (int i = 0; i < g.attn_layers(); ++i) {
             kernels::KvInt8 q8;
+            st_.far.emplace_back();
+            if (far > 0) far_view(st_.far.back());
             if (m_.o.kv_int8) {
-                q8.k = st_.arena.take<int8_t>(cells);
-                q8.v = st_.arena.take<int8_t>(cells);
-                q8.ks = st_.arena.take<uint16_t>(cells / 64);
-                q8.vs = st_.arena.take<uint16_t>(cells / 64);
+                q8.k = st_.arena.take<int8_t>(near);
+                q8.v = st_.arena.take<int8_t>(near);
+                q8.ks = st_.arena.take<uint16_t>(near / 64);
+                q8.vs = st_.arena.take<uint16_t>(near / 64);
                 st_.kc.push_back(nullptr);
                 st_.vc.push_back(nullptr);
                 if (!q8.vs) {
@@ -85,8 +118,8 @@ public:
                     return false;
                 }
             } else {
-                st_.kc.push_back(st_.arena.take<uint16_t>(cells));
-                st_.vc.push_back(st_.arena.take<uint16_t>(cells));
+                st_.kc.push_back(st_.arena.take<uint16_t>(near));
+                st_.vc.push_back(st_.arena.take<uint16_t>(near));
             }
             st_.kq.push_back(q8);
         }
@@ -480,10 +513,13 @@ public:
     Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         cudaStreamSynchronize(st_.stream);
         kv.clear();
-        const auto down = [&](const void* dev, core::ConversationBuffer& to, size_t bytes) {
+        // a layer's array: its first `split` bytes on the card (`dev`), the rest streamed (`far`, host memory)
+        const auto down = [&](const void* dev, const void* far, size_t split, core::ConversationBuffer& to, size_t bytes) {
             to.resize_for_overwrite(bytes);
             return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
-                return cudaMemcpy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+                const size_t a = at < split ? std::min(n, split - at) : 0;
+                return (a == 0 || cudaMemcpy(p, (const uint8_t*) dev + at, a, cudaMemcpyDeviceToHost) == cudaSuccess) &&
+                       (a == n || cudaMemcpy(p + a, (const uint8_t*) far + (at + a - split), n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
         for (size_t i = 0; i < st_.kc.size() + (drafter_ ? 1 : 0); ++i) {
@@ -496,12 +532,15 @@ public:
             k.head_dim = g_.head_dim;
             k.page_size = 1;
             const size_t rows = (size_t) positions * row_bytes(int8);
+            const kernels::KvFar f = mtp ? kernels::KvFar{} : st_.far[i];
+            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(int8);
             bool ok;
             if (int8) {
                 const kernels::KvInt8& q = st_.kq[i];
-                ok = down(q.k, k.k, rows) && down(q.v, k.v, rows) && down(q.ks, k.k_scale, rows / 32) && down(q.vs, k.v_scale, rows / 32);
+                ok = down(q.k, f.q8.k, split, k.k, rows) && down(q.v, f.q8.v, split, k.v, rows) &&
+                     down(q.ks, f.q8.ks, split / 32, k.k_scale, rows / 32) && down(q.vs, f.q8.vs, split / 32, k.v_scale, rows / 32);
             } else {
-                ok = down(mtp ? st_.mtp_kc : st_.kc[i], k.k, rows) && down(mtp ? st_.mtp_vc : st_.vc[i], k.v, rows);
+                ok = down(mtp ? st_.mtp_kc : st_.kc[i], f.k, split, k.k, rows) && down(mtp ? st_.mtp_vc : st_.vc[i], f.v, split, k.v, rows);
             }
             if (!ok) return fail("reading the KV cells back failed");
             kv.push_back(std::move(k));
@@ -513,9 +552,11 @@ public:
         cudaStreamSynchronize(st_.stream);
         if (kv.size() != st_.kc.size() + (drafter_ ? 1 : 0)) return fail(m_.o.arch + ": a parked conversation has other caches");
         if (positions > m_.o.max_context) return fail(m_.o.arch + ": a parked conversation is longer than the context");
-        const auto up = [&](void* dev, const core::ConversationBuffer& from, size_t bytes) {
+        const auto up = [&](void* dev, void* far, size_t split, const core::ConversationBuffer& from, size_t bytes) {
             return from.size() >= bytes && from.visit(0, bytes, [&](const uint8_t* p, size_t n, size_t at) {
-                return cudaMemcpy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
+                const size_t a = at < split ? std::min(n, split - at) : 0;
+                return (a == 0 || cudaMemcpy((uint8_t*) dev + at, p, a, cudaMemcpyHostToDevice) == cudaSuccess) &&
+                       (a == n || cudaMemcpy((uint8_t*) far + (at + a - split), p + a, n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
         for (size_t i = 0; i < kv.size(); ++i) {
@@ -525,12 +566,15 @@ public:
             if (k.format != (int8 ? 2 : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
                 return fail(m_.o.arch + ": a parked conversation has other caches");
             const size_t rows = (size_t) positions * row_bytes(int8);
+            const kernels::KvFar f = mtp ? kernels::KvFar{} : st_.far[i];
+            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(int8);
             bool ok;
             if (int8) {
                 const kernels::KvInt8& q = st_.kq[i];
-                ok = up(q.k, k.k, rows) && up(q.v, k.v, rows) && up(q.ks, k.k_scale, rows / 32) && up(q.vs, k.v_scale, rows / 32);
+                ok = up(q.k, f.q8.k, split, k.k, rows) && up(q.v, f.q8.v, split, k.v, rows) &&
+                     up(q.ks, f.q8.ks, split / 32, k.k_scale, rows / 32) && up(q.vs, f.q8.vs, split / 32, k.v_scale, rows / 32);
             } else {
-                ok = up(mtp ? st_.mtp_kc : st_.kc[i], k.k, rows) && up(mtp ? st_.mtp_vc : st_.vc[i], k.v, rows);
+                ok = up(mtp ? st_.mtp_kc : st_.kc[i], f.k, split, k.k, rows) && up(mtp ? st_.mtp_vc : st_.vc[i], f.v, split, k.v, rows);
             }
             if (!ok) return fail(m_.o.arch + ": a parked conversation has other caches");
         }

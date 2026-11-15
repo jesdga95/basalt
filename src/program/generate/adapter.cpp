@@ -368,6 +368,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         lreq.kv = o.kv;
         lreq.rope = o.rope;
+        lreq.kv_resident = o.kv_resident;
         const basalt::model::Result r = adapter->load(lreq, loaded);
         if (!r.ok() || !loaded) return fatal_start_error(r.message);
         std::vector<int64_t> stop;

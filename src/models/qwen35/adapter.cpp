@@ -141,6 +141,7 @@ public:
         o.drafter = w.dflash.present ? dense::Drafter::Block : w.mtp.present ? dense::Drafter::Mtp : dense::Drafter::None;
         o.vision = req.vision;
         o.kv_int8 = req.kv == "int8";
+        o.kv_resident = req.kv_resident;
         o.arch = "qwen35";
         o.host_embedding_bytes = tensor_payload_bytes(*te);
         o.gpu_weight_bytes = dev_bytes_;
@@ -151,9 +152,14 @@ public:
             core::model_sources(file, srcs);
             o.mmproj = srcs.vision;
         }
-        const uint64_t need_b = dense::shared_bytes(g, o.max_context) +
-                                (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_int8) +
+        const uint64_t need_b = dense::shared_bytes(g, o.max_context, o.kv_int8, o.kv_resident) +
+                                (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_int8,
+                                                                             o.kv_resident) +
                                 (req.peer_devices.empty() ? 0 : dense::prompt_line_main_bytes(g, w.dflash, o.max_context));
+        if (const uint64_t host_b = dense::session_host_bytes(g, o.max_context, o.kv_int8, o.kv_resident))
+            basalt::log::info("basalt qwen35", "K/V streaming: %lld of %lld cells per attention layer in VRAM, %.2f GiB in page-locked "
+                              "RAM per slot", (long long) dense::resident_cells(o.max_context, o.kv_resident), (long long) o.max_context,
+                              (double) host_b / 1073741824.0);
         const uint64_t reserve = (uint64_t) std::max(req.vram_reserve_mib, 0) << 20;
         if (need_b + reserve + (512ull << 20) > free_b) {
             err = "qwen35: " + std::to_string((long long) o.sessions) + " session(s) of " + std::to_string((long long) o.max_context) +
@@ -163,17 +169,21 @@ public:
         }
         model_ = dense::make_model(g, w, o, err);
         if (!model_) return false;
-        if (!req.peer_devices.empty()) prompt_line(gg, g, req.peer_devices.front(), o.max_context);
+        if (!req.peer_devices.empty()) prompt_line(gg, g, req.peer_devices.front(), o.max_context, o.kv_resident);
         return true;
     }
 
 private:
     // A second card reads long prompts' last layers (dense::attach_prompt_line): their weights go to that card too.  Without
     // room for it there the prompts stay on the main card.
-    void prompt_line(const GgufFile& gg, const dense::Geometry& g, int dev, int64_t max_context) {
+    void prompt_line(const GgufFile& gg, const dense::Geometry& g, int dev, int64_t max_context, int64_t kv_resident) {
         const int l_min = std::max(0, g.n_layers - dense::kPromptLineLayers);
         int main_dev = 0;
         cudaGetDevice(&main_dev);
+        if (dense::resident_cells(max_context, kv_resident) < max_context) {   // the line copies cells between the cards' caches
+            basalt::log::info("basalt qwen35", "prompt line off: K/V streaming (--kv-resident) keeps part of the cache in RAM");
+            return;
+        }
         if (dense::prompt_line_main_bytes(g, dense::BlockDrafter{}, max_context) == 0) {   // before the weights go over
             basalt::log::info("basalt qwen35", "prompt line off: a context of %lld holds no prompt that a second card would read",
                               (long long) max_context);
@@ -437,6 +447,7 @@ public:
         if (model::parse_rope_flag(a, args, o.rope)) {}
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--kv") o.kv = args.next("--kv");
+        else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
@@ -455,6 +466,11 @@ public:
             return 2;
         }
         if (const auto code = model::check_rope_flags(o.rope, "basalt qwen35")) return code;
+        if (o.kv_resident < 0) {
+            basalt::log::error("basalt qwen35", "--kv-resident %lld: cells per attention layer kept in VRAM, or 0 (all)",
+                               (long long) o.kv_resident);
+            return 2;
+        }
         if (o.spec_given && (o.spec < 0 || o.spec > 16)) {
             basalt::log::error("basalt qwen35", "--spec %d: 0 (off) to 16", o.spec);
             return 2;

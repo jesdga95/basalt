@@ -119,6 +119,11 @@ public:
     WindowScratch ws;
     ChunkScratch cs;
     bool chunk_ready = false;
+    // K/V streaming: the VRAM copy of one attention layer's far cells a prompt chunk reads (at = the resident cells; at
+    // INT64_MAX without streaming), filled on stage_side from stage_free (the stage's last reader done) to stage_ready
+    kernels::KvFar stage;
+    cudaStream_t stage_side = nullptr;
+    cudaEvent_t stage_free = nullptr, stage_ready = nullptr;
     std::unique_ptr<prefill::mmq::Context> mmq;
     std::vector<int> gdn_index, attn_index;      // per layer: its index among the GDN or attention layers (-1)
     // the batch windows' graphs, one per composition (the sessions in the window and their rows), the least recently used out
@@ -167,6 +172,10 @@ struct SessionState {
     size_t gdn_floats = 0;                       // per layer
     std::vector<uint16_t*> kc, vc;               // per attention layer: [cell][n_kv][head_dim] fp16 (null with int8)
     std::vector<kernels::KvInt8> kq;             // per attention layer: the int8 cache ({} with fp16)
+    // per attention layer, with K/V streaming: the cells from Options::kv_resident on, in page-locked host memory
+    // (device-mapped); {} without.  kc/vc/kq then hold only the first kv_resident cells
+    std::vector<kernels::KvFar> far;
+    void* far_host = nullptr;
     // the last window's rows per GDN layer, until its commit
     float *rec_qkv = nullptr, *rec_h = nullptr, *rec_gate = nullptr, *rec_beta = nullptr;
     int32_t* n_keep = nullptr;                   // device

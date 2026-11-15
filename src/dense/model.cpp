@@ -288,17 +288,34 @@ bool decode_drafter(Model& m, std::string& err) {
 
 }  // namespace
 
-uint64_t shared_bytes(const Geometry& g, int64_t max_context) { return window_bytes(g, BlockDrafter{}, max_context) + chunk_bytes(g) + (512ull << 20); }
+namespace {
+// a cell of one attention layer, K and V: fp16, or int8 codes with their fp16 scales
+uint64_t cell_bytes(const Geometry& g, bool kv_int8) {
+    return kv_int8 ? (uint64_t) g.n_kv * (g.head_dim + g.head_dim / 64 * 2) * 2 : (uint64_t) g.n_kv * g.head_dim * 2 * 2;
+}
+}  // namespace
 
-uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8) {
+int64_t resident_cells(int64_t max_context, int64_t kv_resident) {
+    return kv_resident > 0 && kv_resident < max_context ? kv_resident : max_context;
+}
+
+uint64_t shared_bytes(const Geometry& g, int64_t max_context, bool kv_int8, int64_t kv_resident) {
+    const uint64_t stage = g.attn_layers() > 0 ? (uint64_t) (max_context - resident_cells(max_context, kv_resident)) * cell_bytes(g, kv_int8) : 0;
+    return window_bytes(g, BlockDrafter{}, max_context) + chunk_bytes(g) + stage + (512ull << 20);
+}
+
+uint64_t session_host_bytes(const Geometry& g, int64_t max_context, bool kv_int8, int64_t kv_resident) {
+    return (uint64_t) (max_context - resident_cells(max_context, kv_resident)) * g.attn_layers() * cell_bytes(g, kv_int8);
+}
+
+uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8, int64_t kv_resident) {
     const uint64_t C = (uint64_t) g.conv_channels();
     const uint64_t gdn = (uint64_t) g.gdn_layers() *
                          (2 * ((uint64_t) g.gdn_state * g.gdn_v_heads * g.gdn_state + C * 3) +
                           kWindow * (2 * C + 2 * (uint64_t) g.gdn_v_heads)) * 4;
-    const uint64_t cell16 = (uint64_t) g.n_kv * g.head_dim * 2 * 2;   // a cell of one layer, K and V, fp16
-    const uint64_t cell8 = (uint64_t) g.n_kv * (g.head_dim + g.head_dim / 64 * 2) * 2;
-    const uint64_t kv = (uint64_t) max_context * ((uint64_t) g.attn_layers() * (kv_int8 ? cell8 : cell16) + (mtp ? cell16 : 0)) +
-                        (uint64_t) g.attn_layers() * 4 * 256;
+    const uint64_t cell16 = cell_bytes(g, false);
+    const uint64_t kv = (uint64_t) resident_cells(max_context, kv_resident) * g.attn_layers() * cell_bytes(g, kv_int8) +
+                        (uint64_t) max_context * (mtp ? cell16 : 0) + (uint64_t) g.attn_layers() * 4 * 256;
     const uint64_t drafter = mtp ? ((uint64_t) (kWindow + 3) * g.n_embd + g.n_vocab + (uint64_t) kWindow * 64) * 4 : 0;
     return gdn + kv + drafter + (uint64_t) kWindow * g.n_vocab * 4 + 64 * 256;
 }
@@ -308,6 +325,9 @@ Model::~Model() {
     if (gate_side) cudaStreamDestroy(gate_side);
     if (gate_fork) cudaEventDestroy(gate_fork);
     if (gate_join) cudaEventDestroy(gate_join);
+    if (stage_side) cudaStreamDestroy(stage_side);
+    if (stage_free) cudaEventDestroy(stage_free);
+    if (stage_ready) cudaEventDestroy(stage_ready);
     for (void* p : owned) cudaFree(p);
     vision_detach();
 }
@@ -541,6 +561,31 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         return nullptr;
     }
     prefill::mmq::iota(b.iota, kBatch, nullptr);
+    if (const int64_t near = resident_cells(o.max_context, o.kv_resident); near < o.max_context && g.attn_layers() > 0) {
+        // the prompt chunks' VRAM copy of one layer's far cells, laid out as a session's far buffers
+        const size_t cells = (size_t) (o.max_context - near) * g.n_kv * g.head_dim;
+        void* p = nullptr;
+        if (cudaMalloc(&p, (size_t) (o.max_context - near) * cell_bytes(g, o.kv_int8)) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&m->stage_side, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&m->stage_free, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&m->stage_ready, cudaEventDisableTiming) != cudaSuccess) {
+            if (p) cudaFree(p);
+            err = o.arch + ": out of device memory for the streamed K/V's prompt copy";
+            return nullptr;
+        }
+        m->owned.push_back(p);
+        kernels::KvFar& f = m->stage;
+        f.at = near;
+        if (o.kv_int8) {
+            f.q8.k = (int8_t*) p;
+            f.q8.v = f.q8.k + cells;
+            f.q8.ks = (uint16_t*) (f.q8.v + cells);
+            f.q8.vs = f.q8.ks + cells / 64;
+        } else {
+            f.k = (uint16_t*) p;
+            f.v = f.k + cells;
+        }
+    }
     if (!decode_drafter(*m, err)) return nullptr;
     if (!m->ready_products(err) || cudaDeviceSynchronize() != cudaSuccess) {
         if (err.empty()) err = o.arch + ": readying the products failed";
