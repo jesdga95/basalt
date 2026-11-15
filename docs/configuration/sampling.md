@@ -18,7 +18,7 @@ default, then the engine's. `/props` reports what is in effect. An out-of-range 
 Also read: `max_tokens` / `max_completion_tokens` (`0` or `-1` = the rest of the context), `stop`, `logit_bias`, `reasoning_effort`,
 `enable_thinking`, `reasoning_budget_tokens` (`0` = no thinking budget). Anthropic's `thinking.budget_tokens` is the same budget.
 
-llama.cpp clients also work: `/props` reports `chat_template_caps` for the model (tool calls, parallel calls, reasoning effort,
+llama.cpp clients also work: `POST /tokenize` (`content`, `parse_special`) and `/detokenize` (`tokens`) use the model's tokenizer, `/props` reports `chat_template_caps` for the model (tool calls, parallel calls, reasoning effort,
 system role, preserve reasoning), `chat_template_kwargs.preserve_reasoning` keeps earlier turns' thinking in the prompt, and
 `reasoning_budget` is read on the chat endpoint: `0` is thinking off, `-1` is no cap at the highest effort, and N > 0 is an N-token
 budget at the level it names (up to 2048 low, up to 8192 medium, else high; DeepSeek renders medium as high, 75 of 100). When fields disagree, off from any of them wins, then
