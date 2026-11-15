@@ -1492,8 +1492,9 @@ class Service:
             yield "event", ev
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string
+        # prompt_tokens: the engine's count, now known; a text prompt's length before the engine reads it is an estimate
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                "timings": timings, "reasoning_tokens": thinking_n}
+                "timings": timings, "reasoning_tokens": thinking_n, "prompt_tokens": len(ids)}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done
