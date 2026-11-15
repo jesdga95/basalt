@@ -5,7 +5,7 @@
 // THIRD_PARTY_LICENSES): opaque structure types, the functions' signatures, the constants used, and the offsets of
 // the few structure fields read directly. Fields at the start of a structure have kept their place in every release
 // read here; the others move between major versions and come from the row of `kAbiRows` for the loaded release,
-// transcribed from the headers of FFmpeg 6.0/6.1, 7.0/7.1 and 8.0 (each pair of the same major has one layout).
+// transcribed from the headers of FFmpeg 6.0/6.1, 7.0/7.1, 8.0 and 9.0 (each pair of the same major has one layout).
 #pragma once
 
 #include <cstddef>
@@ -115,6 +115,7 @@ struct AbiRow {
 
 /// Newest first: the loader takes the first release whose libraries are all present.
 inline constexpr AbiRow kAbiRows[] = {
+    {"9", 63, 63, 61, 10, 104, 16, 32, 48, 56, 88, 204, 72, 76, 280, 292, 560, 117, 158, 16},
     {"8", 62, 62, 60, 9, 104, 16, 32, 48, 56, 88, 204, 72, 76, 280, 292, 560, 117, 158, 16},
     {"7", 61, 61, 59, 8, 104, 16, 32, 48, 56, 88, 216, 72, 76, 296, 308, 560, 117, 158, 16},
     {"6", 60, 60, 58, 7, 72, 16, 32, 48, 56, 88, 216, 56, 60, 320, 332, 864, 117, 159, 24},

@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next
 
-Runs with the same command as any model: `basalt serve PACK`. What it supports next to DeepSeek: [models](index.md). Rounding and
+Runs with the same command as any model: `basalt serve PACK`. What it supports next to the others: [models](index.md). Rounding and
 quality: [precision](../precision/qwen38-flash-next.md).
 
 ## Pack
@@ -21,7 +21,8 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
   and `k8v4` trade precision for VRAM ([precision](../precision/qwen38-flash-next.md#measured-costs)).
 - **Experts:** the main card's cache holds the most routed ones, system RAM the rest, and an adaptive tier moves them as the
   conversation changes ([adaptive tier](../configuration/adaptive.md)).
-- **RAM:** before the RAM copy, the checkpoint blocks of every slot are allocated and the RAM of the page-locked prompt buffers
+- **RAM:** before the RAM copy, the checkpoint blocks of every slot are allocated (page-locked, so a checkpoint saves and
+  restores at link speed and a save runs beside the first decode window) and the RAM of the page-locked prompt buffers
   is held: the PLE rows at the largest chunk, a layer split's hand-offs, and the prompt split's weights, hand-offs and staging.
   Each buffer takes its held RAM when it is made; what none takes goes back before the top-up. The copy then leaves
   `--ram-reserve-mib` free beside the driver's page tracking (`RAM floor X GiB of N GiB free` when experts stay on the SSD).
@@ -53,6 +54,11 @@ and prose least.
 
 `--parallel N` (1 to 8) serves N requests at once ([running](../running.md#concurrent-requests---parallel-n)).
 
+## Images and video
+
+`--vision dynamic`, a GPU number or `cpu` ([vision](../running.md#vision---vision)). Video works with images on and FFmpeg on the
+machine; frames decode on the GPU with NVDEC ([video](../running.md#video)).
+
 ## Lossy flags
 
 Off by default. `--relaxed-drafting`, `--route-prior` and `--route-tail-skip` each change output, and each is named in one start
@@ -60,6 +66,5 @@ warning. What they do and what they cost: [precision](../precision/qwen38-flash-
 
 ## Limits
 
-- **No video.**
 - **Two-card idle sleep** can drop the second card's experts until restart (seen at context 8,192 without elastic KV, not at 64K or
   262,144).

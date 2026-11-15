@@ -1,4 +1,5 @@
-"""The Qwen dialect: the model's Jinja chat template and `<tool_call><function=...>` calls."""
+"""The Qwen dialect, every Qwen model's (the MoE Flash-Next and the dense hybrids): the model's Jinja chat template and
+`<tool_call><function=...>` calls."""
 from __future__ import annotations
 
 from serve import frontend
@@ -6,8 +7,8 @@ from serve.models import Dialect
 from serve.util.text import IM_END
 
 
-class Qwen4Exp(Dialect):
-    name = "qwen4exp"
+class Qwen(Dialect):
+    name = "qwen"
     stop_texts = (IM_END, "<|endoftext|>")
     reasoning_close = "\n</think>\n\n"
     effort_turn = "<|im_start|>system\n{}<|im_end|>\n"

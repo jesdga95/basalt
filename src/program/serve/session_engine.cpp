@@ -1,6 +1,7 @@
 // src/program/serve/session_engine.cpp - the shared server over a model's ModelSession: one token per window.
 #include "session_engine.hpp"
 
+#include "batch_plan.hpp"
 #include "decode_loop.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
@@ -9,6 +10,8 @@
 #include "basalt/program/probe_rates.hpp"
 #include "basalt/protocol.hpp"
 #include "basalt/spec/draft_policy.hpp"
+#include "basalt/vision/ffmpeg_api.hpp"
+#include "basalt/vision/video.hpp"
 
 #include <iterator>
 #include <sstream>
@@ -20,16 +23,19 @@ namespace {
 constexpr int32_t kEmbeddingsMagic = 0x31455653;
 
 class SessionRuntime;
+struct SlotWin;
 
-/// The drafts to make for the next window: up to one more than the window just verified used (at least 2), so a long
-/// window grows a row at a time where its drafts pay and the drafter's head runs only the rows a window can take.
+/// The drafts to ask for the next window: up to one more than the window just verified used (at least 2), so a chained
+/// drafter's long window grows a row at a time where its drafts pay.  A block drafter makes its whole block in one pass and
+/// offers every draft of it; the drafts read back are as many as the session made.
 int drafts_ahead(int T, int most) { return std::clamp(std::max(T, 2), 1, most - 1); }
 
-/// A picture's embedding rows, placed at prompt position `at`.
+/// A picture's (or a video group's) embedding rows, placed at prompt position `at`, and its grid.
 struct Block {
     int64_t at = 0;
     std::vector<float> rows;
     int n_rows = 0;
+    basalt::model::ImageGrid grid;
 };
 
 class SessionRuntime final : public Runtime {
@@ -47,6 +53,7 @@ public:
         // one policy for the solo windows and one for the batch windows, whose rounds cost differently
         policy.emplace(session().max_window());
         bpolicy.emplace(session().max_window());
+        if (lookup_on()) sfx.emplace(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         if (o.batch > 0) {
             bs.resize((size_t) o.batch);
             slot_sampling_.resize((size_t) o.batch);
@@ -101,12 +108,15 @@ public:
                " gpus=" + ids + " ";
     }
     int init_after_input() override {
+        reserve_checkpoints();
         for (auto& s : sessions_)
             if (const basalt::model::Result r = s->prepare(); !r.ok()) {
                 basalt::log::error("basalt serve", "%s", r.message.c_str());
                 return 1;
             }
         start_guard();
+        // whether the in-engine encoder reads video: FFmpeg found, for a model that reads the shared patches
+        if (o.vision_in_engine && sessions_[0]->reads_patches()) std::printf("%s\n", basalt::vision::video_line().c_str());
         std::printf("INFO %s\n", (identity_words() + sessions_[0]->info_words()).c_str());
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);
@@ -121,6 +131,10 @@ public:
     }
     bool windows_in_flight() override { return false; }
     bool next_batch_window() override;
+    void slot_window_begin(int b, SlotWin& w, int limit);
+    bool slot_window_finish(int b, SlotWin& w);
+    bool slot_window_accept(int b, SlotWin& w);
+    bool slot_window_end(int b, SlotWin& w);
     bool drain_windows() override { return true; }
     void script_command(const std::string&) override {
         std::printf("ERR BSCRIPT: this model's slots take no scripts\n");
@@ -172,6 +186,7 @@ public:
     // the solo session's and every idle slot's.
     int64_t disk_min_tokens() const override { return sessions_[0]->disk_min_tokens(); }
     size_t spill_to_disk(bool at_exit, size_t limit) override {
+        ckd_finish();   // a turn checkpoint's state may still be on its way to the host
         size_t written = 0;
         if (at_exit)
             while (conversations->size() > 0) {
@@ -221,8 +236,7 @@ public:
         const int64_t positions = (int64_t) ids.size();
         image.live.ids = ids;
         image.live.imgs = imgs;
-        image.live.state_a.resize(session().running_bytes());
-        basalt::model::Result r = session().save_running(image.live.state_a.data(), positions);
+        basalt::model::Result r = save_running_now(image.live.state_a, positions);
         if (r.ok()) r = session().save_cells(image.kv, positions);
         if (!r.ok()) { e = r.message; return false; }
         image.checkpoints = cks;
@@ -232,6 +246,7 @@ public:
     // The outgoing conversation leaves the session for the RAM tier, or the disk tier when there is no room or the
     // session goes on holding it (`kept`) and only the disk lacks it.
     bool park_current(size_t held, int64_t kept) override {
+        ckd_finish();   // a turn checkpoint's state may still be on its way to the host
         if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
         if (o.conversation_cache_min_tokens > 0 && (int64_t) live.size() < o.conversation_cache_min_tokens) return true;
         int64_t deepest = 0;
@@ -271,30 +286,58 @@ public:
     /// The running state at `to`, kept in the chain; the oldest goes first past --prompt-cache.
     bool checkpoint_at(int64_t to, ConvCheckpoint::Source source, const std::vector<int64_t>& prompt) {
         if (o.prompt_cache <= 0 || to < 1) return true;
-        for (ConvCheckpoint& c : checks)
-            if ((int64_t) c.ids.size() == to) {
-                c.used = ++check_clock;
-                if (source > c.source) c.source = source;
-                return true;
-            }
+        ckd_finish();   // the save before this one lands first; one that failed has left the chain
+        if (touch_check(to, source)) return true;
         ConvCheckpoint c;
         c.source = source;
         c.ids.assign(prompt.begin(), prompt.begin() + to);
         c.imgs = imgs_below(req_imgs, to);
-        c.state_a.resize(session().running_bytes());
-        if (const basalt::model::Result r = session().save_running(c.state_a.data(), to); !r.ok()) {
+        basalt::core::RunningState rs;
+        if (const basalt::model::Result r = session().running_state(to, true, rs); !r.ok()) {
             err = r.message;
             return false;
         }
-        c.used = ++check_clock;
-        checks.push_back(std::move(c));
-        while ((int) checks.size() > o.prompt_cache) {
-            std::vector<uint64_t> stamps;
-            stamps.reserve(checks.size());
-            for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
-            checks.erase(checks.begin() + (std::ptrdiff_t) basalt::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), o.prompt_cache));
-        }
+        c.state_a.resize(rs.bytes());
+        std::memcpy(c.state_a.data(), rs.head.data(), rs.head.size());
+        // the state is snapshotted on the device now and moves to the host while the request goes on
+        const std::vector<basalt::core::SaveSegment> seg{{c.state_a.data() + rs.head.size(), rs.regions}};
+        if (!ckd.save(seg, (cudaStream_t) rs.stream, c.state_a.data(), err)) return false;
+        keep_check(std::move(c));
         return true;
+    }
+
+    /// The running state as it is now, into `to`: when this returns it has landed.
+    basalt::model::Result save_running_now(basalt::core::CheckpointBytes& to, int64_t pos) {
+        basalt::core::RunningState rs;
+        if (const basalt::model::Result r = session().running_state(pos, true, rs); !r.ok()) return r;
+        to.resize(rs.bytes());
+        std::memcpy(to.data(), rs.head.data(), rs.head.size());
+        std::string e;
+        if (!basalt::core::checkpoint_copy_out({{to.data() + rs.head.size(), rs.regions}}, (cudaStream_t) rs.stream, e))
+            return {basalt::model::Status::Error, e};
+        return {};
+    }
+    /// A checkpoint's or a parked conversation's running state back into the session.
+    basalt::model::Result restore_running_from(const basalt::core::CheckpointBytes& from, int64_t pos) {
+        basalt::core::RunningState rs;
+        if (const basalt::model::Result r = session().running_state(pos, false, rs); !r.ok()) return r;
+        if (from.size() != rs.bytes()) return {basalt::model::Status::Error, "a checkpoint's running state has the wrong size"};
+        std::string e;
+        if (!basalt::core::checkpoint_copy_in({{from.data() + rs.head.size(), rs.regions}}, (cudaStream_t) rs.stream, e))
+            return {basalt::model::Status::Error, e};
+        return session().running_restored(pos, from.data());
+    }
+
+    /// The host blocks the checkpoints take (page-locked, their pages written) and the device buffer a save is
+    /// snapshotted into, held before the models' RAM and VRAM tiers are sized so they plan beside them.
+    void reserve_checkpoints() {
+        if (o.prompt_cache <= 0) return;
+        const size_t bytes = session().running_bytes();
+        if (bytes == 0) return;
+        const size_t keep = (size_t) (o.prompt_cache + 1) * (size_t) std::max(o.batch, 1);
+        if (!basalt::core::CheckpointBytes::allocator_type::reserve(bytes, keep, &basalt::core::kCheckpointPin))
+            basalt::log::warn("basalt serve", "checkpoint blocks not reserved: out of host memory");
+        if (std::string e; !ckd.reserve(bytes, e)) basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", e.c_str());
     }
 
     basalt::model::ModelSession& session() { return *sessions_[(size_t) active_]; }
@@ -304,6 +347,9 @@ public:
     /// The draft windows' policy (basalt/spec/draft_policy.hpp): learns this machine's round times and the drafter's
     /// acceptance across requests.
     std::optional<basalt::spec::DraftPolicy> policy, bpolicy;
+    /// Prompt lookup (--suffix-draft) for a model whose sessions take copied drafts: the solo request's history.
+    bool lookup_on() const { return o.suffix_draft > 0 && sessions_[0]->copy_drafts(); }
+    std::optional<basalt::spec::SuffixDrafter> sfx;
     /// --draft-log FILE, opened once.
     FILE* draft_log() {
         static FILE* const f = std::fopen(basalt::core::diagnostics().draft_log.c_str(), "a");
@@ -326,7 +372,6 @@ private:
     basalt::model::LoadedModel& model_;
     std::vector<std::unique_ptr<basalt::model::ModelSession>> sessions_;
     std::vector<basalt::kernels::SamplerParams> slot_sampling_;
-    std::vector<int32_t> win_, out_;   // a batch window's fed tokens and picks
     int active_ = 0;
 };
 
@@ -350,6 +395,11 @@ public:
         n_draft_ = 0;
         drafts_.assign((size_t) max_window(), 0);
         conf_.assign((size_t) max_window(), 0.0f);
+        sbuf_.assign((size_t) max_window(), 0);
+        if (rt_.sfx) {
+            rt_.sfx->reset();
+            for (int64_t t : ids) rt_.sfx->append((int32_t) t);
+        }
     }
     void decode_stats_begin() {
         counts0_ = rt_.session().expert_counts();
@@ -364,9 +414,24 @@ public:
         const int T = rt_.policy->window(conf_.data(), n_draft_);
         return (int) std::max<int64_t>(1, std::min<int64_t>(T, runtime_.o.max_context - p));
     }
-    void lookup_window(int&, bool&, int&) {}
-    void fill_drafts(int T, bool) {
-        for (int i = 1; i < T; ++i) window[(size_t) i] = drafts_[(size_t) i - 1];
+    // a lookup proposal takes the window when its first token is the drafter's (or the drafter has none) and the policy
+    // expects more tokens per ms from it
+    void lookup_window(int& T, bool& from_sfx, int& sfx_match) {
+        if (!rt_.sfx || first_window || ppl != nullptr) return;
+        const int most = (int) std::min<int64_t>(max_window(), runtime_.o.max_context - p);
+        if (most < 2) return;
+        const int k = rt_.sfx->propose(most - 1, sbuf_.data());
+        sfx_match = rt_.sfx->last_match();
+        if (k <= 0 || (n_draft_ > 0 && sbuf_[0] != drafts_[0])) return;
+        const basalt::spec::DraftPolicy::Pick pk = rt_.policy->choose_window(conf_.data(), n_draft_, k, sfx_match);
+        if (pk.lookup) {
+            T = std::min(pk.t, most);
+            from_sfx = true;
+        }
+    }
+    void fill_drafts(int T, bool from_sfx) {
+        for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf_[(size_t) i - 1] : drafts_[(size_t) i - 1];
+        own_drafts_ = !from_sfx;
     }
     int before_window(int, int64_t) { return 0; }
     int32_t* history_stage() {
@@ -375,11 +440,12 @@ public:
     }
     void upload_history(int) {}
     void mark_before_run() {}
-    bool run_window(int T, int, int&) {
+    bool run_window(int T, int e0, int&) {
         basalt::model::DecodeRequest d;
         d.tokens = window.data();
         d.n_tokens = T;
         d.pos = p;
+        d.drawn_drafts = own_drafts_ && e0 == 0 && ppl == nullptr && T > 1;
         (T > 1 ? d.row_tokens : d.next_token) = outv.data();
         d.sampling = &req_sp;
         d.history = hist_n > 0 ? history_.data() : nullptr;
@@ -411,8 +477,9 @@ public:
         hold = false;
         return true;
     }
-    void note_draft_probs(bool) {
-        window_conf_.assign(conf_.begin(), conf_.begin() + n_draft_);
+    void note_draft_probs(bool from_sfx) {
+        if (from_sfx) window_conf_.clear();
+        else window_conf_.assign(conf_.begin(), conf_.begin() + n_draft_);
     }
     void stamp_before_commit() {}
     // each row's pick is the draw of its own index, whatever the width of the window
@@ -420,7 +487,9 @@ public:
         if (phase == 2) draws_ += (uint64_t) keep;
         return true;
     }
-    void on_token(int32_t) {}
+    void on_token(int32_t tok) {
+        if (rt_.sfx) rt_.sfx->append(tok);
+    }
     void count_round() {}
     // The next window's drafts start before this window's tokens go out, which run in their shadow.
     template <class After>
@@ -434,23 +503,26 @@ public:
             return false;
         }
         after_launch();
-        if (basalt::model::Result r = rt_.session().draft_end(drafts_.data(), conf_.data(), n, n_draft_); !r.ok()) {
+        // room for every draft the session makes (a block drafter may make more than asked, the policy picks)
+        if (basalt::model::Result r = rt_.session().draft_end(drafts_.data(), conf_.data(), max_window() - 1, n_draft_); !r.ok()) {
             runtime_.err = r.message;
             return false;
         }
         return true;
     }
     bool draft_fatal() const { return false; }
-    void window_timing(int T, int a, bool, Clock::time_point round0, Clock::time_point tw0, Clock::time_point tw1, Clock::time_point) {
+    void window_timing(int T, int a, bool from_sfx, Clock::time_point round0, Clock::time_point tw0, Clock::time_point tw1, Clock::time_point) {
         if (draft_log_ == nullptr) return;
         const auto msd = [](Clock::time_point x, Clock::time_point y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
-        std::fprintf(draft_log_, "W %d %d 0 %.3f %.3f %.3f", T, a, msd(round0, tw0), msd(tw0, tw1), msd(tw1, Clock::now()));
+        std::fprintf(draft_log_, "W %d %d %d %.3f %.3f %.3f", T, a, from_sfx ? 1 : 0, msd(round0, tw0), msd(tw0, tw1), msd(tw1, Clock::now()));
         for (float c : window_conf_) std::fprintf(draft_log_, " %.4f", (double) c);
         std::fputc('\n', draft_log_);
     }
-    void observe_policy(bool, int T, int a, int, Clock::time_point round0) {
+    void observe_policy(bool from_sfx, int T, int a, int sfx_match, Clock::time_point round0) {
         if (ppl != nullptr) return;   // a quality gate's windows are forced, not drafted
-        rt_.policy->observe_window(window_conf_.data(), T, a, std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+        if (from_sfx) rt_.policy->observe(true, T, a, sfx_match, ms);
+        else rt_.policy->observe_window(window_conf_.data(), T, a, ms);
     }
     void mark_after_window() {}
     void mark_loop_end() {}
@@ -463,7 +535,7 @@ private:
     Flow decode() override { return decode_loop(*this); }
     bool release_room() override { return true; }
     bool checkpoint_mount(const ConvCheckpoint& c) override {
-        const basalt::model::Result r = rt_.session().restore_running(c.state_a.data(), (int64_t) c.ids.size());
+        const basalt::model::Result r = rt_.restore_running_from(c.state_a, (int64_t) c.ids.size());
         if (!r.ok()) runtime_.err = r.message;
         return r.ok();
     }
@@ -478,10 +550,22 @@ private:
     }
     Flow read_to(int64_t to) override;
     Flow slot_bind() override { rt_.set_active(slot_b); return Flow::proceed; }
+    // a slot's prompt lookup history: the conversation, then the token its first window feeds
+    void slot_init(BSlot& sl) override {
+        if (!rt_.lookup_on()) return;
+        sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
+                                                               (size_t) runtime_.o.max_context + 4096);
+        for (int32_t t : runtime_.live) sl.sfx->append(t);
+        sl.sfx->append(x);
+    }
     Flow restore_image() override {
         const int64_t positions = (int64_t) incoming->live.ids.size();
-        basalt::model::Result r = rt_.session().restore_cells(incoming->kv, positions);
-        if (r.ok()) r = rt_.session().restore_running(incoming->live.state_a.data(), positions);
+        // a conversation stored by a build whose running state had another layout is read again, not mounted
+        bool sized = incoming->live.state_a.size() == rt_.session().running_bytes();
+        for (const ConvCheckpoint& c : incoming->checkpoints) sized = sized && c.state_a.size() == rt_.session().running_bytes();
+        basalt::model::Result r = sized ? rt_.session().restore_cells(incoming->kv, positions)
+                                        : basalt::model::Result{basalt::model::Status::Error, "its running state has another size"};
+        if (r.ok()) r = rt_.restore_running_from(incoming->live.state_a, positions);
         if (r.ok()) r = rt_.session().set_history(incoming->live.ids.data(), positions);
         if (!r.ok()) {
             basalt::log::warn("basalt serve", "conversation cache: restoring a parked conversation failed (%s); reading the prompt from the start", r.message.c_str());
@@ -523,7 +607,8 @@ private:
     std::vector<Block> blocks_;
     std::vector<int32_t> history_;
     uint64_t draws_ = 0;
-    std::vector<int32_t> drafts_;
+    bool own_drafts_ = false;   // the window's drafts are the drafter's (fill_drafts), not a lookup proposal
+    std::vector<int32_t> drafts_, sbuf_;
     std::vector<float> conf_, window_conf_;
     int n_draft_ = 0;
     FILE* draft_log_ = nullptr;
@@ -533,10 +618,82 @@ private:
     double live_ms_ = -1e9;
 };
 
-// One window of every active slot, one session at a time: the slot's drafts as a solo window takes them, then the
-// drafts of its next window, which run while its tokens go out.
-bool SessionRuntime::next_batch_window() {
-    std::vector<int32_t> history;
+// A slot's window of one round: what it feeds, what it drew, and the penalty history rows of its draws.
+struct SlotWin {
+    int T = 1;
+    bool from_sfx = false;   // the drafts are a lookup proposal behind a match of `match` tokens
+    int match = 0;
+    std::vector<int32_t> win, out, history;
+    float chance[basalt::spec::DraftPolicy::kMaxT] = {};
+    Clock::time_point round0;
+    basalt::model::DecodeRequest d;
+    // set by slot_window_accept: the accepted drafts, the tokens' line, the finish reason, the drafts to start next
+    int a = 0;
+    std::string line;
+    const char* fin = nullptr;
+    int want = 0;
+    bool drafting = false;
+};
+
+// The slot's next window: its anchor and the drafts its drafter left (as many as the draft policy takes).
+void SessionRuntime::slot_window_begin(int b, SlotWin& w, int limit) {
+    BSlot& sl = bs[(size_t) b];
+    const int most = (int) std::min<int64_t>({(int64_t) sessions_[(size_t) b]->max_window(), o.max_context - sl.p, (int64_t) std::size(sl.dr) + 1, (int64_t) limit});
+    w.T = std::max(1, std::min(bpolicy->window(sl.dprob, sl.n_dr), most));
+    w.from_sfx = false;
+    w.match = 0;
+    if (sl.sfx && most >= 2) {   // a lookup proposal, as in the solo loop
+        const int k = sl.sfx->propose(most - 1, sl.sbuf);
+        w.match = sl.sfx->last_match();
+        if (k > 0 && (sl.n_dr == 0 || sl.sbuf[0] == sl.dr[0])) {
+            const basalt::spec::DraftPolicy::Pick pk = bpolicy->choose_window(sl.dprob, std::min(sl.n_dr, most - 1), k, w.match);
+            if (pk.lookup) {
+                w.T = std::min(pk.t, most);
+                w.from_sfx = true;
+            }
+        }
+    }
+    const int T = w.T;
+    std::copy(sl.dprob, sl.dprob + (T - 1), w.chance);
+    w.win.assign((size_t) T, 0);
+    w.out.assign((size_t) T, -1);
+    w.win[0] = sl.x;
+    std::copy(w.from_sfx ? sl.sbuf : sl.dr, (w.from_sfx ? sl.sbuf : sl.dr) + (T - 1), w.win.begin() + 1);
+    basalt::kernels::SamplerParams& sp = slot_sampling_[(size_t) b];
+    w.d = {};
+    w.d.tokens = w.win.data();
+    w.d.n_tokens = T;
+    w.d.pos = sl.p;
+    (T > 1 ? w.d.row_tokens : w.d.next_token) = w.out.data();
+    w.d.sampling = &sp;
+    w.d.drawn_drafts = !w.from_sfx && T > 1;
+    if (sl.pen_n > 0) {
+        w.history.resize((size_t) T * sl.pen_n);
+        basalt::kernels::penalty_rows(sl.ids.data(), (int64_t) sl.ids.size(), w.win.data(), T, sl.pen_n, w.history.data());
+        w.d.history = w.history.data();
+        w.d.history_len = sl.pen_n;
+    }
+    sp.counter = (uint64_t) sl.produced;
+}
+
+// The slot's window is drawn: the accepted drafts, the grammar's mask, the logprobs, the tokens out, the slot's next drafts
+// (made while the tokens go out), and its end.
+bool SessionRuntime::slot_window_finish(int b, SlotWin& w) {
+    if (!slot_window_accept(b, w)) return false;
+    if (w.want > 0) {
+        const basalt::model::Result r = session().draft_begin(bs[(size_t) b].x, bs[(size_t) b].p, w.want);
+        if (!r.ok() && r.status != basalt::model::Status::NotImplemented) {
+            std::printf("ERR %s\n", r.message.c_str());
+            set_active(0);
+            return false;
+        }
+        w.drafting = r.ok();
+    }
+    return slot_window_end(b, w);
+}
+
+// The window's accepted drafts, grammar, logprobs and tokens; whether drafts follow (w.want).
+bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
     std::vector<float> grammar_bias;
     std::vector<float> lp_rows;   // a logprobs slot's kept rows (row_logprobs)
     const auto failed = [&](const std::string& m) {
@@ -544,94 +701,161 @@ bool SessionRuntime::next_batch_window() {
         set_active(0);
         return false;
     };
-    for (int b = 0; b < (int) bs.size(); ++b) {
-        BSlot& sl = bs[(size_t) b];
-        if (!sl.active) continue;
-        set_active(b);
-        const Clock::time_point round0 = Clock::now();
-        const int most = (int) std::min<int64_t>({(int64_t) session().max_window(), o.max_context - sl.p, (int64_t) std::size(sl.dr) + 1});
-        const int T = std::max(1, std::min(bpolicy->window(sl.dprob, sl.n_dr), most));
-        float chance[std::size(sl.dprob)];
-        std::copy(sl.dprob, sl.dprob + (T - 1), chance);
-        win_.assign((size_t) T, 0);
-        out_.assign((size_t) T, -1);
-        win_[0] = sl.x;
-        std::copy(sl.dr, sl.dr + (T - 1), win_.begin() + 1);
-        basalt::kernels::SamplerParams& sp = slot_sampling_[(size_t) b];
-        basalt::model::DecodeRequest d;
-        d.tokens = win_.data();
-        d.n_tokens = T;
-        d.pos = sl.p;
-        (T > 1 ? d.row_tokens : d.next_token) = out_.data();
-        d.sampling = &sp;
-        if (sl.pen_n > 0) {
-            history.resize((size_t) T * sl.pen_n);
-            basalt::kernels::penalty_rows(sl.ids.data(), (int64_t) sl.ids.size(), win_.data(), T, sl.pen_n, history.data());
-            d.history = history.data();
-            d.history_len = sl.pen_n;
+    BSlot& sl = bs[(size_t) b];
+    set_active(b);
+    const int T = w.T;
+    std::vector<int32_t>& win_ = w.win;
+    std::vector<int32_t>& out_ = w.out;
+    int a = 0;
+    while (a < T - 1 && win_[(size_t) a + 1] == out_[(size_t) a]) ++a;
+    if (sl.guard != nullptr && sl.guard->on()) {
+        // the first pick the grammar refuses is drawn again under its mask, and the window ends there
+        const int miss = sl.guard->scan(out_.data(), a + 1);
+        if (miss >= 0) {
+            sl.guard->mask_bias({}, grammar_bias);
+            int32_t y = -1;
+            if (const basalt::model::Result r = session().resample_row(miss, grammar_bias.data(), y); !r.ok()) return failed(r.message);
+            out_[(size_t) miss] = y;
+            a = miss;
+            if (!sl.guard->take(y)) basalt::log::info("basalt grammar", "slot %d: the masked draw was token %d", b, (int) y);
         }
-        sp.counter = (uint64_t) sl.produced;
-        if (const basalt::model::Result r = session().decode_window(d); !r.ok()) return failed(r.message);
-        int a = 0;
-        while (a < T - 1 && win_[(size_t) a + 1] == out_[(size_t) a]) ++a;
-        if (sl.guard != nullptr && sl.guard->on()) {
-            // the first pick the grammar refuses is drawn again under its mask, and the window ends there
-            const int miss = sl.guard->scan(out_.data(), a + 1);
-            if (miss >= 0) {
-                sl.guard->mask_bias({}, grammar_bias);
-                int32_t y = -1;
-                if (const basalt::model::Result r = session().resample_row(miss, grammar_bias.data(), y); !r.ok()) return failed(r.message);
-                out_[(size_t) miss] = y;
-                a = miss;
-                if (!sl.guard->take(y)) basalt::log::info("basalt grammar", "slot %d: the masked draw was token %d", b, (int) y);
+    }
+    sl.drafts_offered += T - 1;
+    sl.drafts_accepted += a;
+    std::string line = "BT " + std::to_string(b);
+    const char* fin = nullptr;
+    if (sl.lp_top >= 0) {   // the kept rows' logprobs, read before the drafts touch the head
+        lp_rows.resize((size_t) (a + 1) * basalt::kernels::kLogprobStride);
+        if (const basalt::model::Result r = session().row_logprobs(0, a + 1, out_.data(), sl.lp_top, lp_rows.data()); !r.ok())
+            return failed(r.message);
+    }
+    for (int i = 0; i <= a && fin == nullptr; ++i) {
+        const int32_t y = out_[(size_t) i];
+        if (sl.lp_top >= 0)   // ahead of the BT line
+            basalt::protocol::emit_text("BP " + std::to_string(b) +
+                                        logprob_fields(lp_rows.data() + (size_t) i * basalt::kernels::kLogprobStride, y, sl.lp_top) + "\n");
+        sl.ids.push_back(win_[(size_t) i]);
+        ++sl.produced;
+        ++sl.p;
+        sl.x = y;
+        if (sl.sfx) sl.sfx->append(y);
+        line += " " + std::to_string(y);
+        const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+        fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
+    }
+    sl.n_dr = 0;
+    w.a = a;
+    w.line = line;
+    w.fin = fin;
+    w.want = fin == nullptr && session().max_window() > 1 ? drafts_ahead(T, session().max_window()) : 0;
+    w.drafting = false;
+    return true;
+}
+
+// The tokens go out while the drafts run; then the drafts are read, and the slot ends or goes on.
+bool SessionRuntime::slot_window_end(int b, SlotWin& w) {
+    const auto failed = [&](const std::string& m) {
+        std::printf("ERR %s\n", m.c_str());
+        set_active(0);
+        return false;
+    };
+    BSlot& sl = bs[(size_t) b];
+    set_active(b);
+    const int T = w.T, a = w.a;
+    const char* fin = w.fin;
+    basalt::protocol::emit_text(w.line + "\n");
+    basalt::core::progress_beat();
+    if (w.drafting) {
+        const int max_n = std::min(session().max_window() - 1, (int) std::size(sl.dr));
+        if (const basalt::model::Result r = session().draft_end(sl.dr, sl.dprob, max_n, sl.n_dr); !r.ok()) return failed(r.message);
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
+        if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
+        else bpolicy->observe_window(w.chance, T, a, ms);
+    }
+    if (fin != nullptr) {
+        std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin,
+                    std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
+                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+        sl.active = false;
+        sl.cached = o.prompt_cache > 0;
+        sl.idle_busy = busy_now();
+        sl.guard.reset();
+    }
+    std::fflush(stdout);
+    return true;
+}
+
+// One window of every active slot.  A model that does not batch decodes them one session at a time: the slot's drafts as a
+// solo window takes them, then the drafts of its next window, which run while its tokens go out.  A model that does packs the
+// windows into groups of at most batch_rows() rows (first fit); a group of several runs as one batch through the weights,
+// a lone window as a solo one, and every slot then finishes as above.
+bool SessionRuntime::next_batch_window() {
+    std::vector<int> act;
+    for (int b = 0; b < (int) bs.size(); ++b)
+        if (bs[(size_t) b].active) act.push_back(b);
+    if (act.empty()) return true;
+    const auto failed = [&](const std::string& m) {
+        std::printf("ERR %s\n", m.c_str());
+        set_active(0);
+        return false;
+    };
+    const int cap = sessions_[(size_t) act[0]]->batch_rows();
+    if (cap <= 0) {
+        SlotWin w;
+        for (const int b : act) {
+            set_active(b);
+            w.round0 = Clock::now();
+            slot_window_begin(b, w, 1 << 20);
+            if (const basalt::model::Result r = session().decode_window(w.d); !r.ok()) return failed(r.message);
+            if (!slot_window_finish(b, w)) return false;
+        }
+        set_active(0);
+        return true;
+    }
+    // the windows of a round share the batch's rows: with no more slots than rows each takes its share, so one pass serves all
+    const int n_act = (int) act.size();
+    std::vector<SlotWin> wins(act.size());
+    std::vector<int> rows(act.size());
+    for (int i = 0; i < n_act; ++i) {
+        slot_window_begin(act[(size_t) i], wins[(size_t) i], batch_share(i, n_act, cap));
+        rows[(size_t) i] = wins[(size_t) i].T;
+    }
+    for (const std::vector<size_t>& group : batch_groups(rows, cap)) {
+        const Clock::time_point t0 = Clock::now();
+        if (group.size() == 1) {
+            if (const basalt::model::Result r = sessions_[(size_t) act[group[0]]]->decode_window(wins[group[0]].d); !r.ok()) return failed(r.message);
+        } else {
+            std::vector<basalt::model::ModelSession*> ss;
+            std::vector<basalt::model::DecodeRequest> rq;
+            for (const size_t i : group) {
+                ss.push_back(sessions_[(size_t) act[i]].get());
+                rq.push_back(wins[i].d);
+            }
+            if (const basalt::model::Result r = ss[0]->decode_batch(ss.data(), rq.data(), (int) group.size()); !r.ok()) return failed(r.message);
+        }
+        // every slot's tokens, then the group's drafts as one pass, then each slot's tokens out and drafts read
+        std::vector<basalt::model::ModelSession*> ds;
+        std::vector<int32_t> anchors;
+        std::vector<int64_t> dpos;
+        std::vector<int> dn;
+        for (const size_t i : group) {
+            wins[i].round0 = t0;
+            if (!slot_window_accept(act[i], wins[i])) return false;
+            if (wins[i].want > 0) {
+                const BSlot& sl = bs[(size_t) act[i]];
+                ds.push_back(sessions_[(size_t) act[i]].get());
+                anchors.push_back(sl.x);
+                dpos.push_back(sl.p);
+                dn.push_back(wins[i].want);
             }
         }
-        sl.drafts_offered += T - 1;
-        sl.drafts_accepted += a;
-        std::string line = "BT " + std::to_string(b);
-        const char* fin = nullptr;
-        if (sl.lp_top >= 0) {   // the kept rows' logprobs, read before the drafts touch the head
-            lp_rows.resize((size_t) (a + 1) * basalt::kernels::kLogprobStride);
-            if (const basalt::model::Result r = session().row_logprobs(0, a + 1, out_.data(), sl.lp_top, lp_rows.data()); !r.ok())
-                return failed(r.message);
-        }
-        for (int i = 0; i <= a && fin == nullptr; ++i) {
-            const int32_t y = out_[(size_t) i];
-            if (sl.lp_top >= 0)   // ahead of the BT line
-                basalt::protocol::emit_text("BP " + std::to_string(b) +
-                                            logprob_fields(lp_rows.data() + (size_t) i * basalt::kernels::kLogprobStride, y, sl.lp_top) + "\n");
-            sl.ids.push_back(win_[(size_t) i]);
-            ++sl.produced;
-            ++sl.p;
-            sl.x = y;
-            line += " " + std::to_string(y);
-            const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
-            fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
-        }
-        sl.n_dr = 0;
-        bool drafting = false;
-        if (fin == nullptr && session().max_window() > 1) {
-            const basalt::model::Result r = session().draft_begin(sl.x, sl.p, drafts_ahead(T, session().max_window()));
+        if (!ds.empty()) {
+            const basalt::model::Result r = ds[0]->draft_batch(ds.data(), anchors.data(), dpos.data(), dn.data(), (int) ds.size());
             if (!r.ok() && r.status != basalt::model::Status::NotImplemented) return failed(r.message);
-            drafting = r.ok();
+            for (const size_t i : group) wins[i].drafting = r.ok() && wins[i].want > 0;
         }
-        basalt::protocol::emit_text(line + "\n");
-        basalt::core::progress_beat();
-        if (drafting) {
-            const int max_n = std::min(drafts_ahead(T, session().max_window()), (int) std::size(sl.dr));
-            if (const basalt::model::Result r = session().draft_end(sl.dr, sl.dprob, max_n, sl.n_dr); !r.ok()) return failed(r.message);
-            bpolicy->observe_window(chance, T, a, std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
-        }
-        if (fin != nullptr) {
-            std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin,
-                        std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
-                        (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
-            sl.active = false;
-            sl.cached = o.prompt_cache > 0;
-            sl.idle_busy = busy_now();
-            sl.guard.reset();
-        }
-        std::fflush(stdout);
+        for (const size_t i : group)
+            if (!slot_window_end(act[i], wins[i])) return false;
     }
     set_active(0);
     return true;
@@ -650,16 +874,20 @@ Flow SessionRequest::prepare_image() {
     std::string bad;
     std::ifstream ef(emb_path, std::ios::binary);
     if (!ef) bad = "cannot open " + emb_path;
+    const int64_t vpad = runtime_.o.video_pad_id;
+    const auto is_pad = [&](int64_t id) { return id == runtime_.o.image_pad_id || (vpad >= 0 && id == vpad); };
     for (int64_t i = 0; bad.empty() && i < n;) {
-        if (ids[(size_t) i] != runtime_.o.image_pad_id) { ++i; continue; }
+        if (!is_pad(ids[(size_t) i])) { ++i; continue; }
         int32_t hdr[5];
         if (!ef.read((char*) hdr, sizeof hdr) || hdr[0] != kEmbeddingsMagic) { bad = "bad embeddings file"; break; }
+        // a run is one record's rows: a picture, or one two-frame group of a video (groups sit between their times)
         int64_t run = 0;
-        while (i + run < n && ids[(size_t) (i + run)] == runtime_.o.image_pad_id) ++run;
-        if (hdr[1] != run) { bad = "the prompt and its images do not match"; break; }
+        while (i + run < n && run < hdr[1] && ids[(size_t) (i + run)] == ids[(size_t) i]) ++run;
+        if (hdr[1] != run || (i + run < n && ids[(size_t) (i + run)] == ids[(size_t) i])) { bad = "the prompt and its images do not match"; break; }
         Block b;
         b.at = i;
         b.n_rows = hdr[1];
+        if (hdr[2] > 0 && hdr[3] > 0 && (int64_t) hdr[2] * hdr[3] == hdr[1]) b.grid = {hdr[2], hdr[3]};
         b.rows.resize((size_t) hdr[1] * (size_t) hdr[4]);
         if (!ef.read((char*) b.rows.data(), (std::streamsize) (b.rows.size() * sizeof(float)))) { bad = "short embeddings file"; break; }
         const int64_t grid[3] = {hdr[1], hdr[2], hdr[3]};
@@ -669,7 +897,7 @@ Flow SessionRequest::prepare_image() {
         blocks_.push_back(std::move(b));
         i += run;
     }
-    if (bad.empty() && ids[(size_t) (n - 1)] == runtime_.o.image_pad_id) bad = "the prompt must end with text";
+    if (bad.empty() && is_pad(ids[(size_t) (n - 1)])) bad = "the prompt must end with text";
     if (!bad.empty()) {
         std::printf("ERR %s\n", bad.c_str());
         std::fflush(stdout);
@@ -687,7 +915,7 @@ Flow SessionRequest::read_to(int64_t to) {
         basalt::model::Result r;
         if (image) {
             const Block& b = blocks_[next_block_++];
-            r = rt_.session().prefill_embeddings(b.rows.data(), b.n_rows, at);
+            r = rt_.session().prefill_embeddings(b.rows.data(), b.n_rows, at, b.grid);
             at += b.n_rows;
         } else {
             const int64_t end = next_block_ < blocks_.size() ? std::min(to, blocks_[next_block_].at) : to;
@@ -728,37 +956,70 @@ Flow SessionRequest::read_to(int64_t to) {
 }
 
 // ENC <image> <out> [<image> <out> ...]: one `ENC OK <n> <nx> <ny> <ms>` per image, or one `ENC ERR <message>`.
+// ENCV <video> <out> [k=v ...] (a model that reads the shared preprocessor's patches): one `ENC OK <groups> <nx> <ny>
+// <ms> <time,time,...>`, the file holding one record per two-frame group.
 void SessionRuntime::enc_command(const std::string& cmd) {
-    if (cmd.rfind("ENCV ", 0) == 0) {
-        std::printf("ENC ERR this model reads no video\n");
-        std::fflush(stdout);
-        return;
-    }
-    std::istringstream in(cmd);
-    std::string word;
-    in >> word;
-    std::vector<std::string> words;
-    while (in >> word) words.push_back(word);
+    const bool video = cmd.rfind("ENCV ", 0) == 0;
     std::vector<std::string> replies;
     std::string fail;
-    for (size_t i = 0; i + 1 < words.size() && fail.empty(); i += 2) {
-        std::ifstream f(words[i], std::ios::binary);
-        const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        std::vector<float> rows;
-        int rows_n = 0;
+    const auto ms_since = [](Clock::time_point t) { return (int) std::chrono::duration<double, std::milli>(Clock::now() - t).count(); };
+    const auto write_record = [&](std::FILE* fo, const std::vector<float>& rows, int n, basalt::model::ImageGrid grid) {
+        const int32_t width = n > 0 ? (int32_t) (rows.size() / (size_t) n) : 0;
+        const int32_t hdr[5] = {kEmbeddingsMagic, n, grid.nx, grid.ny, width};
+        return std::fwrite(hdr, sizeof hdr, 1, fo) == 1 && std::fwrite(rows.data(), sizeof(float), rows.size(), fo) == rows.size();
+    };
+    if (video) {
+        std::string vpath, opath;
+        basalt::vision::VideoOptions vo;
+        const basalt::vision::Geometry geo;
+        vo.group_tokens = geo.max_tokens;
+        basalt::vision::Video v;
         const auto te = Clock::now();
-        const basalt::model::Result er = bytes.empty() ? basalt::model::Result{basalt::model::Status::Error, "cannot read the image " + words[i]}
-                                                       : session().encode_image(bytes.data(), bytes.size(), rows, rows_n);
-        if (!er.ok()) { fail = er.message; break; }
-        const int32_t nx = 0, ny = 0, width = (int32_t) (rows.size() / (size_t) rows_n);
-        const int32_t hdr[5] = {kEmbeddingsMagic, rows_n, nx, ny, width};
-        std::FILE* fo = std::fopen(words[i + 1].c_str(), "wb");
-        const bool ok = fo && std::fwrite(hdr, sizeof hdr, 1, fo) == 1 &&
-                        std::fwrite(rows.data(), sizeof(float), rows.size(), fo) == rows.size();
-        if (fo) std::fclose(fo);
-        if (!ok) { fail = "cannot write " + words[i + 1]; break; }
-        replies.push_back("ENC OK " + std::to_string(rows_n) + " " + std::to_string(nx) + " " + std::to_string(ny) + " " +
-                          std::to_string((int) std::chrono::duration<double, std::milli>(Clock::now() - te).count()));
+        if (!session().reads_patches()) fail = "this model reads no video";
+        else if (!basalt::vision::parse_encv(cmd, vpath, opath, vo, fail)) {
+        } else if (!basalt::vision::read_video(vpath, vo, v, fail)) {
+        } else {
+            std::vector<float> patches, rows;
+            basalt::vision::patchify_video(v.frames, (int) v.indices.size(), v.canvas, geo, patches);
+            const int groups = v.groups(), nx = v.canvas.w / 32, ny = v.canvas.h / 32;
+            const size_t per = patches.size() / (size_t) groups;
+            std::FILE* fo = std::fopen(opath.c_str(), "wb");
+            if (!fo) fail = "cannot write " + opath;
+            for (int gi = 0; fail.empty() && gi < groups; ++gi) {
+                const std::vector<float> part(patches.begin() + (ptrdiff_t) (gi * per), patches.begin() + (ptrdiff_t) ((gi + 1) * per));
+                const basalt::model::Result er = session().encode_patches(part, v.canvas.w, v.canvas.h, rows);
+                if (!er.ok()) fail = er.message;
+                else if (!write_record(fo, rows, nx * ny, {nx, ny})) fail = "short write to " + opath;
+            }
+            if (fo) std::fclose(fo);
+            if (fail.empty())
+                replies.push_back("ENC OK " + std::to_string(groups) + " " + std::to_string(nx) + " " + std::to_string(ny) + " " +
+                                  std::to_string(ms_since(te)) + " " +
+                                  basalt::vision::times_text(basalt::vision::group_times(v.indices, v.fps)));
+        }
+    } else {
+        std::istringstream in(cmd);
+        std::string word;
+        in >> word;
+        std::vector<std::string> words;
+        while (in >> word) words.push_back(word);
+        for (size_t i = 0; i + 1 < words.size() && fail.empty(); i += 2) {
+            std::ifstream f(words[i], std::ios::binary);
+            const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            std::vector<float> rows;
+            int rows_n = 0;
+            basalt::model::ImageGrid grid;
+            const auto te = Clock::now();
+            const basalt::model::Result er = bytes.empty() ? basalt::model::Result{basalt::model::Status::Error, "cannot read the image " + words[i]}
+                                                           : session().encode_image(bytes.data(), bytes.size(), rows, rows_n, grid);
+            if (!er.ok()) { fail = er.message; break; }
+            std::FILE* fo = std::fopen(words[i + 1].c_str(), "wb");
+            const bool ok = fo && write_record(fo, rows, rows_n, grid);
+            if (fo) std::fclose(fo);
+            if (!ok) { fail = "cannot write " + words[i + 1]; break; }
+            replies.push_back("ENC OK " + std::to_string(rows_n) + " " + std::to_string(grid.nx) + " " + std::to_string(grid.ny) + " " +
+                              std::to_string(ms_since(te)));
+        }
     }
     session().images_done();
     if (!fail.empty()) std::printf("ENC ERR %s\n", fail.c_str());

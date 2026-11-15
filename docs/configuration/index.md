@@ -89,7 +89,7 @@ Command line `--name`; the Where column says which config block takes it.
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
 | `max-context` | engine | tokens | 8192 | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
-| `kv` | engine | Flash-Next: `fp16`, `int8`, `q4_0`, `k8v4`; DeepSeek: `fp8`, `fp16` | Flash-Next `fp16`, DeepSeek `fp8` | KV storage. Flash-Next: `int8` halves VRAM; `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056); not with `kv-resident`. DeepSeek: `fp8` rounds as the model's reference (FP8 window rows, FP4 compressed rows and index keys, 920 bytes per position); `fp16` keeps the unrounded values (3,200 bytes per position). A model refuses the other's values. |
+| `kv` | engine | Flash-Next: `fp16`, `int8`, `q4_0`, `k8v4`; DeepSeek: `fp8`, `fp16`; Qwen3.8-27B: `fp16`, `int8` | Flash-Next `fp16`, DeepSeek `fp8`, Qwen3.8-27B `fp16` | KV storage. Qwen3.8-27B: `int8` takes about half of `fp16`'s memory per position ([guide](../models/qwen38-27b.md#memory)). Flash-Next: `int8` halves VRAM; `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056); not with `kv-resident`. DeepSeek: `fp8` rounds as the model's reference (FP8 window rows, FP4 compressed rows and index keys, 920 bytes per position); `fp16` keeps the unrounded values (3,200 bytes per position). A model refuses the other's values. |
 | `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. With `parallel` and `kv` `int8`, every slot streams its own K/V this way. |
 | `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next only. Extend past the trained length. Fixed for the run. |
 | `rope-scale` | engine | number | model's, else 1 | Flash-Next only. Factor for `linear` and `yarn`. |
@@ -134,9 +134,9 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `spec` | engine | integer | 8 (MTP), 6 (DSpark), else 0 | Verify windows of at most N tokens. `0` or `1` turns it off. |
+| `spec` | engine | integer | 8 (MTP), 6 (DSpark), 16 (Qwen3.8-27B), else 0 | Verify windows of at most N tokens (Qwen3.8-27B: up to 16). `0` or `1` turns it off. |
 | `draft-experts` | engine | 32, 64, 96, 128, or 0 | 32 | DeepSeek only. Experts each drafter stage keeps (`0` = all 128). |
-| `suffix-draft` | engine | tokens | 3 (`0` = MTP only) | Flash-Next only. Prompt lookup: fill a window from an earlier repeat of at least N tokens. |
+| `suffix-draft` | engine | tokens | 3 (`0` = the drafter only) | Flash-Next and Qwen3.8-27B. Prompt lookup: fill a window from an earlier repeat of at least N tokens. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Flash-Next only. Caps the MTP's own windows. |
 | `mtp-window` | engine | cells | 32768 (`0` = all) | Flash-Next only. The drafter attends to the last N cells. |
 | `relaxed-drafting` | engine (`[P]`) | `true` or 0 to 1 | off | Flash-Next only. **Changes output.** Under sampling, keeps a draft the model gives probability P or more. Greedy, `logit_bias`, JSON and tool calls stay exact. [precision](../precision/qwen38-flash-next.md#relaxed-drafting) |
@@ -154,7 +154,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept, about 118 MB of RAM each. `0` reads every prompt from the start. |
+| `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept, about 118 MB of RAM each on Flash-Next (page-locked, held from start with one more per slot). `0` reads every prompt from the start. |
 | `prompt-cache-every` | engine | tokens | 16384 (`0` = off) | Flash-Next only. Also checkpoint every N freshly read tokens (RAM only). |
 | `prompt-cache-root` | engine | tokens | 2048 (`0` = never) | Checkpoint the end of the system prompt when it is at least this long. |
 | `turn-token` | engine | token id | 248045 | The token that opens a chat turn; checkpoints go at the last one. |
@@ -174,7 +174,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | `image-url-host` | server | `HOST` or `HOST:PORT`, repeatable | none | Allow `http(s)` image URLs on this host from other machines. [image sources](image-sources.md) |
 | `image-dir` | server | directory, repeatable | none | Allow image files under this directory from other machines. [image sources](image-sources.md) |
 | `image-remote-only` | server | switch | off | Treat this machine's requests as remote too. [image sources](image-sources.md) |
-| `video-max-tokens` | entry | 64 to 65536 | 8192 | The most image tokens one video takes over all its frames. Video needs `vision` and FFmpeg 6, 7 or 8 on the machine. [running](../running.md#video) |
+| `video-max-tokens` | entry | 64 to 65536 | 8192 | The most image tokens one video takes over all its frames. Video needs `vision` and FFmpeg 6, 7, 8 or 9 on the machine. [running](../running.md#video) |
 
 Diagnostic flags: [diagnostics](diagnostics.md).
 

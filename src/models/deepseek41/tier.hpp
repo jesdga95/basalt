@@ -1,7 +1,9 @@
 // src/models/deepseek41/tier.hpp - where the routed experts of a DeepSeek-V4.1 pack live while a token runs.
 //
 // An expert's home is a slot of the main card, a slot of a second card, the pinned RAM tier or the pack file mapped
-// read-only (policy::Homes); the routing order deals them out at the start. The main card's other slots (shared
+// read-only (policy::Homes); the routing order deals them out at the start. With experts left in the file, the RAM tier
+// is also a cache of it: a lookup reads the file experts it routes to into the places of the layer's least recently used
+// pinned ones (FileReads), and the CPU computes them from there. The main card's other slots (shared
 // core::ExpertCache storage) hold copies of pinned experts; its homes and copies share a per-layer LRU, and a home that
 // loses its slot, on either card, goes to RAM, into the place of the expert taking the slot. The GPUs compute the experts they
 // hold; the CPU pool computes the rest from RAM or the mapped file while the GPUs work, and the pinned experts it
@@ -17,18 +19,15 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/prefill/peer_share.hpp"
 #include "basalt/platform/mapped_file.hpp"
+#include "models/deepseek41/file_reads.hpp"
 #include "models/deepseek41/prompt_host.hpp"
 #include "models/deepseek41/tier_policy.hpp"
 
 #include <cuda_runtime.h>
 
-#include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace basalt::models::deepseek41 {
@@ -49,6 +48,7 @@ public:
         int experts[kMaxK] = {};
         bool again[kMaxK] = {};            ///< a miss that repeats one from the last kPromoteWindow tokens
         bool fetched[kMaxK] = {};          ///< `dev` or `peer` is being copied in by `fetch`
+        bool reading[kMaxK] = {};          ///<  is a RAM place a file read is filling (await_reads)
     };
 
     /// The window rows that use one looked-up expert: row i of token tok[i] is `row[i]` of the output rows.
@@ -90,15 +90,19 @@ public:
     /// land layer by layer: each before its layer's next lookup (`pump`), so what a lookup finds depends only on the
     /// routing history, as if every copy had landed at the window's start.
     void begin_token(int n_tokens = 1);
-    /// Looks up `ids[0..k)` of `layer` and stamps them as used; `layer`'s queued copies land first.
+    /// Looks up `ids[0..k)` of `layer` and stamps them as used; `layer`'s queued copies land first. The file experts
+    /// among them start reading into the RAM tier (`reading`).
     bool lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err);
+    /// The reads the last lookup started have landed.
+    bool await_reads(std::string& err);
     /// The CPU's share: the experts of `lk` without a device blob, over the activation `x` (n_embd floats, host).
     /// Row i of `rows` (n_embd floats each) gets expert i's output. Started here, it runs on the pool's workers while
     /// the caller launches the GPUs' shares; finish_cpu joins it. `lk` and `rows` stay as they are until then.
-    void start_cpu(int layer, const float* x, const Lookup& lk, float* rows);
+    /// `reading` picks the experts being read instead of the others: they start once finish_cpu and await_reads returned.
+    void start_cpu(int layer, const float* x, const Lookup& lk, float* rows, bool reading = false);
     /// The same over a window: `x` holds a row per token and each expert i runs over the rows `use[i]` names, into those
     /// rows of `rows`.
-    void start_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows);
+    void start_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows, bool reading = false);
     void finish_cpu();
     /// The promotions' copies, and the second card's exchanges, wait for the bus to idle: mark_gap notes the point of
     /// `main` (a layer's sum) they start behind, and pump issues up to `pieces` promotion pieces there (and at most
@@ -189,23 +193,18 @@ private:
     void land_all();
     void apply(const Pending& p);
     void apply(const PeerMove& m);
-    /// A cold pinned expert (victim) replaced by a hot file-backed one (expert), read into the layer's spare slot.
-    struct Swap {
-        int layer, expert, victim, place;
-    };
     bool load_ram(std::string& err);
     bool open_share(std::string& err);
     int ranked(int layer, int r) const;
     bool load_rank(std::string& err);
     void seed_copies(int64_t n);
-    void preread();
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
+    /// Gives the file experts of `ids` the RAM places of the layer's least recently used pinned experts outside `ids`
+    /// and starts reading them there; `reading[i]` marks those of `ids`.
+    bool read_misses(int layer, const int32_t* ids, int k, bool* reading, std::string& err);
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;
     uint64_t slot_total() const { return (uint64_t) n_layers_ * (uint64_t) (per_layer_ + ext_per_layer_); }
-    void finish_swaps();
-    void start_swaps();
-    void swap_worker();
     /// Copies (layer, e) from `src` into the least recently used free slot of the layer; the slot, or -1. With `homes_too`
     /// that slot may be a home's, when the layer has a free RAM place for it. `whole`: one copy, for a layer that waits
     /// on it; else pieces, which let a waited copy pass. With `later` the pieces wait in the queue for pump.
@@ -248,29 +247,21 @@ private:
     uint64_t start_floor_ = 0, free_floor_ = 0;
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
 
+    std::vector<core::RamAllocation> ram_allocations_;
     std::vector<core::RamPin> ram_pins_;    ///< [layer] what each span's pin got
     std::vector<uint8_t*> ram_;             ///< [layer] cover_ + 1 pinned expert slots (the last starts as the spare)
     policy::Homes homes_;
     std::vector<int32_t> rank_;             ///< [layer * n_expert + rank] expert; empty: the file's order
     int cover_ = 0;                         ///< experts per layer in the RAM tier
     std::vector<int32_t> ram_idx_;          ///< [layer * n_expert + e] pinned slot or -1
-    std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a swap, or -1
-    std::vector<uint8_t> swapping_;         ///< [layer] a file expert is being read into its spare
-    std::vector<uint64_t> spare_since_;     ///< [layer] token at which the spare became free
+    std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a home leaving the main card, or -1
     std::vector<uint64_t> last_miss_;       ///< [layer * n_expert + e] token + 1 of the last miss
-    std::vector<std::pair<int, int>> want_; ///< file-backed experts that missed twice, in lookup order
-    std::vector<Swap> flight_;              ///< swaps started at the previous begin_token
-    std::thread worker_;
-    std::thread preread_;
-    std::atomic<bool> preread_quit_{false};
-    std::mutex mu_;
-    std::condition_variable cv_;
-    std::vector<Swap> jobs_;
-    size_t jobs_done_ = 0;
-    bool quit_ = false;
     uint64_t token_ = 0;
-    int64_t swapped_ = 0;
     platform::MappedFile file_;             ///< the experts section
+    FileReads reads_;                       ///< open when the file holds experts and the RAM tier caches them
+    std::vector<FileReads::Blob> blobs_;    ///< the reads of the last lookup
+    std::vector<uint16_t> uses_;            ///< [layer * n_expert + e] CPU uses toward a promotion, with reads_ open
+    int64_t read_ = 0;                      ///< experts read into the RAM tier
     PromptHost host_;
     std::unique_ptr<core::PeerExperts> peer_;
     std::unique_ptr<prefill::PeerShare> share_;

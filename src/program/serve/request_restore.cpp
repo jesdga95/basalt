@@ -13,6 +13,7 @@ bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<Img
 }
 
 Flow Request::restore() {
+    runtime_.ckd_finish();   // a save that a request left behind (an error, a cancel) lands before anything moves
     runtime_.cur = ids;
     // The conversation cache's keys are int32: one narrow view per request, so a parked entry or a checkpoint
     // is matched by one bulk compare over the slice instead of a per-token scan.

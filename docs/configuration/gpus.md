@@ -36,6 +36,9 @@ second one. Reports from machines with three or four cards are welcome (see [com
 
 ## What several cards do together
 
+A dense model (Qwen3.8-27B) runs on the main card alone: it reads every weight every token, so a layer split would put part of
+each token on the slower card. The server warns that the other cards are unused.
+
 With two or more cards the engine prices three mechanisms at start, as milliseconds per decode window, from the cards'
 memory bandwidth, their VRAM and the model's size, and prints one line, for example
 `multi-gpu: 2 cards unlike; ms per window: expert tier 7.9, layer split 13.5, tensor parallel 9.0

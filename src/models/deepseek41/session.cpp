@@ -299,17 +299,20 @@ public:
 
     size_t running_bytes() const override { return ops_ ? ops_->turn_bytes() : 0; }
 
-    model::Result save_running(uint8_t* host, int64_t pos) override {
-        if (!prefillp::may_save(pos, whole_from_)) return {model::Status::Error, kSkippedRows};
-        sync_rewind(pos);
+    model::Result running_state(int64_t pos, bool save, core::RunningState& s) override {
         if (!ops_) return {model::Status::NotImplemented, "no state yet"};
-        ops_->save_turn(stream_, host);
+        if (save) {
+            if (!prefillp::may_save(pos, whole_from_)) return {model::Status::Error, kSkippedRows};
+            sync_rewind(pos);
+        }
+        ops_->turn_regions(s.regions);
+        s.stream = stream_;
         return {};
     }
 
-    model::Result restore_running(const uint8_t* host, int64_t pos) override {
+    model::Result running_restored(int64_t pos, const uint8_t*) override {
         if (!ops_) return {model::Status::Error, "no state yet"};
-        ops_->restore_turn(stream_, host);
+        ops_->turn_restored();
         whole_from_ = 0;
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         feat_n_ = 0;
@@ -445,7 +448,7 @@ public:
         return {};
     }
 
-    model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) override {
+    model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid&) override {
         std::string err;
         if (!image_) {   // this slot's image buffers, allocated with the tier
             ExpertTier* tier = ops_ ? ops_->expert_tier(err) : nullptr;
@@ -506,7 +509,7 @@ public:
         }
     }
 
-    model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) override {
+    model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
         if (!prefillp::may_resume(pos, (int64_t) hist_.size(), whole_from_)) return {model::Status::Error, kSkippedRows};
         sync_rewind(pos);
         settle_tier();

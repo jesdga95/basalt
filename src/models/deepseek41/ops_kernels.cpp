@@ -269,42 +269,19 @@ public:
         return total;
     }
 
-    void save_turn(void* stream, uint8_t* host) override {
-        cudaStreamSynchronize((cudaStream_t) stream);
+    void turn_regions(std::vector<core::DeviceRegion>& out) const override {
         const size_t ring_b = (size_t) kWindowSlots * win_row_bytes(fmt_);
-        size_t at = 0;
-        auto put = [&](const void* dev, size_t bytes) {
-            cudaMemcpy(host + at, dev, bytes, cudaMemcpyDeviceToHost);
-            at += bytes;
-        };
         for (size_t il = 0; il < ring_.size(); ++il) {
-            if (ring_[il]) put(ring_[il], ring_b);
+            if (ring_[il]) out.push_back({ring_[il], ring_b});
             if (st_kv_[il]) {
                 const size_t n = (size_t) g_.compress_ratio[il] * kLatent * 4;
-                put(st_kv_[il], n);
-                put(st_sc_[il], n);
+                out.push_back({st_kv_[il], n});
+                out.push_back({st_sc_[il], n});
             }
         }
     }
 
-    void restore_turn(void* stream, const uint8_t* host) override {
-        cudaStreamSynchronize((cudaStream_t) stream);
-        win_n_ = 0;
-        const size_t ring_b = (size_t) kWindowSlots * win_row_bytes(fmt_);
-        size_t at = 0;
-        auto get = [&](void* dev, size_t bytes) {
-            cudaMemcpy(dev, host + at, bytes, cudaMemcpyHostToDevice);
-            at += bytes;
-        };
-        for (size_t il = 0; il < ring_.size(); ++il) {
-            if (ring_[il]) get(ring_[il], ring_b);
-            if (st_kv_[il]) {
-                const size_t n = (size_t) g_.compress_ratio[il] * kLatent * 4;
-                get(st_kv_[il], n);
-                get(st_sc_[il], n);
-            }
-        }
-    }
+    void turn_restored() override { win_n_ = 0; }
 
     void reset() override {
         for (size_t il = 0; il < st_kv_.size(); ++il) {
@@ -767,10 +744,12 @@ public:
             for (int r = 0; r < T * K; ++r) kind[r] = !lk.peer[uidx[r]] ? 0 : lk.fetched[uidx[r]] ? 3 : 2;
             if (!peer->raise(il, h_ids_, kind, err)) return false;
         }
-        // then the CPU's share: it takes longest, and the pool's workers run it while the main card's share launches
-        bool cpu = false, on_peer = false;
+        // then the CPU's share: it takes longest, and the pool's workers run it while the main card's share launches;
+        // the experts still being read from the file follow it
+        bool cpu = false, reading = false, on_peer = false;
         for (int i = 0; i < nu; ++i) {
-            cpu = cpu || (!lk.dev[i] && !lk.peer[i]);
+            cpu = cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i]);
+            reading = reading || lk.reading[i];
             on_peer = on_peer || lk.peer[i];
         }
         JoinWord jw;
@@ -821,7 +800,7 @@ public:
         WindowRowPtrs rp{};
         for (int r = 0; r < T * K; ++r)
             rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
-        if (cpu || on_peer) {
+        if (cpu || reading || on_peer) {
             jw.word = h_join_;
             jw.value = ++join_seq_;
             jw.armed = true;
@@ -829,10 +808,14 @@ public:
         }
         weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in their rows
-        if (cpu) {
+        if (cpu) join.now();
+        if (reading) {
+            if (!tier_->await_reads(err)) return false;
+            tier_->start_cpu_window(il, h_x_, lk, use, h_rows_, /*reading=*/true);
+            join.tier = tier_.get();
             join.now();
-            tier_->promote(il, lk);
         }
+        if (cpu || reading) tier_->promote(il, lk);
         if (peer && !peer->finish(nullptr, err)) return false;
         jw.raise();
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
@@ -897,10 +880,12 @@ public:
             for (int k = 0; k < K; ++k) kind[k] = !lk.peer[k] ? 0 : lk.fetched[k] ? 3 : 2;
             if (!peer->raise(il, lk.experts, kind, err)) return false;
         }
-        // then the CPU's share: it takes longest, and the pool's workers run it while the main card's share launches
-        bool cpu = false, on_peer = false;
+        // then the CPU's share: it takes longest, and the pool's workers run it while the main card's share launches;
+        // the experts still being read from the file follow it
+        bool cpu = false, reading = false, on_peer = false;
         for (int k = 0; k < K; ++k) {
-            cpu = cpu || (!lk.dev[k] && !lk.peer[k]);
+            cpu = cpu || (!lk.dev[k] && !lk.peer[k] && !lk.reading[k]);
+            reading = reading || lk.reading[k];
             on_peer = on_peer || lk.peer[k];
         }
         JoinWord jw;
@@ -973,7 +958,7 @@ public:
         RowPtrs rp{};
         for (int k = 0; k < K; ++k)
             rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
-        if (cpu || on_peer) {
+        if (cpu || reading || on_peer) {
             jw.word = h_join_;
             jw.value = ++join_seq_;
             jw.armed = true;
@@ -981,10 +966,14 @@ public:
         }
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in the router index's row
-        if (cpu) {
+        if (cpu) join.now();
+        if (reading) {
+            if (!tier_->await_reads(err)) return false;
+            tier_->start_cpu(il, h_x_, lk, h_rows_, /*reading=*/true);
+            join.tier = tier_.get();
             join.now();
-            tier_->promote(il, lk);
         }
+        if (cpu || reading) tier_->promote(il, lk);
         if (peer && !peer->finish(nullptr, err)) return false;
         jw.raise();
         tier_->mark_gap(st);
