@@ -16,7 +16,6 @@
 // turn ends; the checkpoints a stride inside a long prompt and older turn ends are not written.
 #include "basalt/core/conversation_store.hpp"
 
-#include "basalt/core/conversation_stream.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/direct_file.hpp"
 #include "basalt/platform/file.hpp"
@@ -217,6 +216,10 @@ std::array<ConversationBytes, 5> state_bytes(const ConversationCheckpoint& c) {
             host_bytes(c.state_e.data(), c.state_e.size())};
 }
 
+uint64_t state_size(const ConversationCheckpoint& c) {
+    return c.state_a.size() + c.state_b.size() + c.state_c.size() + c.state_d.size() + c.state_e.size();
+}
+
 // an image in RAM as a write reads it
 ConversationSource image_source(const SavedConversation& img) {
     ConversationSource s;
@@ -383,6 +386,7 @@ struct ConversationStore::Job {
 struct ConversationStore::Entry {
     std::string name;                         ///< file name in the directory
     uint64_t key = 0, bytes = 0, used = 0;
+    uint64_t generation = 0;                  ///< tells this entry from a later one of the same name
     bool mine = true;                         ///< written under this identity (others count for the budget only)
     bool cvec = true;
     std::vector<int32_t> ids;                 ///< live tokens
@@ -459,17 +463,26 @@ struct Source {
     const std::vector<uint64_t>* hashes = nullptr;
 };
 
-// One part to read: section bytes [0, need) of file `file` into `dst(offset, src, n)`, verified block by block.
+// One part to read: section bytes [0, need) of file `file` into `dst(offset, src, n)` (false: the copy failed),
+// verified block by block.  A K/V part left in its file records where its bytes go instead: bytes
+// [base, base + need) of buffer `kind` of K/V layer `layer`.
 struct Part {
     size_t file = 0;
     const Section* s = nullptr;
     uint64_t need = 0;
-    std::function<void(uint64_t, const uint8_t*, uint64_t)> dst;
+    std::function<bool(uint64_t, const uint8_t*, uint64_t)> dst;
+    size_t layer = 0;
+    int kind = 0;
+    uint64_t base = 0;
 };
 
+// How a read of parts ended: done; a read or a block hash failed (the file is at fault); or it stopped with the files
+// as good as they were (no read buffer, a destination that refused a piece).
+enum class Read { kDone, kFault, kStopped };
+
 // Reads the parts with a few threads (each its own aligned buffer of kPiece bytes from `bufs`, allocated on first
-// use and kept); false at the first failed read or block hash, with the file it was in.
-bool read_parts(const std::vector<Source>& files, const std::vector<Part>& parts, uint64_t& bytes_read,
+// use and kept), up to the first failure; a fault names the file it was in.
+Read read_parts(const std::vector<Source>& files, const std::vector<Part>& parts, uint64_t& bytes_read,
                 std::string& error, size_t& bad_file, std::vector<std::unique_ptr<Aligned>>& bufs) {
     struct Piece { const Part* part; uint64_t from, to; };   // [from, to): whole blocks of one section
     std::vector<Piece> pieces;
@@ -479,13 +492,14 @@ bool read_parts(const std::vector<Source>& files, const std::vector<Part>& parts
         for (uint64_t from = 0; from < end; from += kPiece) pieces.push_back({&p, from, std::min(end, from + kPiece)});
     }
     std::atomic<size_t> next{0};
-    std::atomic<bool> failed{false};
+    std::atomic<bool> failed{false}, fault{false};
     std::atomic<uint64_t> got{0};
     std::mutex emu;
     const int n_threads = (int) std::min<size_t>(kReaders, std::max<size_t>(1, pieces.size()));
     while ((int) bufs.size() < n_threads) bufs.push_back(std::make_unique<Aligned>(kPiece));
-    auto fail = [&](const char* why, size_t file) {
+    auto fail = [&](const char* why, size_t file) {   // `file`: at fault, SIZE_MAX when none is
         failed = true;
+        if (file != SIZE_MAX) fault = true;
         std::lock_guard<std::mutex> lk(emu);
         error = why;
         bad_file = file;
@@ -510,7 +524,10 @@ bool read_parts(const std::vector<Source>& files, const std::vector<Part>& parts
                 }
             }
             const uint64_t want = std::min(pc.to, pc.part->need);
-            if (want > pc.from) pc.part->dst(pc.from, buf.data(), want - pc.from);
+            if (want > pc.from && !pc.part->dst(pc.from, buf.data(), want - pc.from)) {
+                fail("copy failed", SIZE_MAX);
+                return;
+            }
             got += len;
         }
     };
@@ -519,7 +536,7 @@ bool read_parts(const std::vector<Source>& files, const std::vector<Part>& parts
     work(0);
     for (auto& t : pool) t.join();
     bytes_read += got;
-    return !failed;
+    return !failed ? Read::kDone : fault ? Read::kFault : Read::kStopped;
 }
 
 // the K/V shapes a conversation file records: a layer's bytes per cell (k, v and their scales) and per pooled row
@@ -590,6 +607,7 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
         e->name = f.name;
         e->bytes = f.bytes;
         e->used = ++clock_;
+        e->generation = ++generation_;
         e->mine = nk == NameKind::kConversation;
         if (e->mine) {
             std::string why;
@@ -623,14 +641,17 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
                     e->blocks.resize((size_t) e->head.n_blocks);
                     std::vector<Part> parts(3);
                     parts[0] = {0, ids, ids->bytes, [&](uint64_t at, const uint8_t* p, uint64_t n) {
-                                    std::memcpy(reinterpret_cast<uint8_t*>(e->ids.data()) + at, p, n); }};
+                                    std::memcpy(reinterpret_cast<uint8_t*>(e->ids.data()) + at, p, n);
+                                    return true; }};
                     parts[1] = {0, imgs, imgs->bytes, [&](uint64_t at, const uint8_t* p, uint64_t n) {
-                                    std::memcpy(reinterpret_cast<uint8_t*>(e->imgs.data()) + at, p, n); }};
+                                    std::memcpy(reinterpret_cast<uint8_t*>(e->imgs.data()) + at, p, n);
+                                    return true; }};
                     parts[2] = {0, refs, refs->bytes, [&](uint64_t at, const uint8_t* p, uint64_t n) {
-                                    std::memcpy(reinterpret_cast<uint8_t*>(e->blocks.data()) + at, p, n); }};
+                                    std::memcpy(reinterpret_cast<uint8_t*>(e->blocks.data()) + at, p, n);
+                                    return true; }};
                     uint64_t read = 0;
                     size_t bad = 0;
-                    ok = read_parts({Source{rf.fd, &hashes}}, parts, read, why, bad, read_bufs_);
+                    ok = read_parts({Source{rf.fd, &hashes}}, parts, read, why, bad, read_bufs_) == Read::kDone;
                 }
                 ok = ok && key_of(e->ids, e->imgs, e->head.cvec != 0) == e->head.key;
                 for (int64_t c : e->checks) ok = ok && c > 0 && c <= e->head.n_ids;
@@ -757,15 +778,20 @@ uint64_t kv_part_bytes(uint32_t kind, uint64_t stored, int64_t stored_cells, int
 
 }  // namespace
 
-uint64_t ConversationStore::load_bytes(const Match& m) const {
+uint64_t ConversationStore::load_bytes(const Match& m, bool kv) const {
     std::lock_guard<std::mutex> lk(mu_);
     if (m.index >= entries_.size()) return 0;
     const Entry& e = *entries_[m.index];
-    if (e.job) return e.job->image.bytes();   // an upper bound for a copy out of the queue
     uint64_t n = (uint64_t) m.tokens * 4 * 3, state = 0;
+    if (e.job) {
+        if (kv) return e.job->image.bytes();   // an upper bound for a copy out of the queue
+        state = state_size(e.job->image.live);
+        for (const auto& c : e.job->image.checkpoints) state = std::max(state, state_size(c));
+        return n + state * 3;   // its K/V stays in the queued image
+    }
     for (const Section& s : e.table) {
         if (s.kind >= kGdn && s.kind <= kBlockPos && s.index == kLive) state += s.bytes;
-        if (s.kind == kKvRate) {   // the cells up to the match, at most the stored ones
+        if (kv && s.kind == kKvRate) {   // the cells up to the match, at most the stored ones
             const int64_t cells = std::min<int64_t>(m.tokens + 4, s.meta[5]);
             n += (s.meta[0] + s.meta[1] + s.meta[2] + s.meta[3]) * (uint64_t) cells +
                  (uint64_t) s.meta[4] * (uint64_t) (cells / std::max<int64_t>(1, row_cells_) + 1);
@@ -776,12 +802,143 @@ uint64_t ConversationStore::load_bytes(const Match& m) const {
             auto it = parts_.find(part_name(identity_, 's', k));
             if (it != parts_.end()) state = std::max(state, it->second.bytes);
         }
-    return n + state * 3;   // the state at the match, once more as its checkpoint, and the root
+    // the state at the match, once more as its checkpoint, and the root; K/V left in its files passes through the
+    // read buffers
+    return n + state * 3 + (kv ? 0 : (uint64_t) kReaders * kPiece);
 }
 
-bool ConversationStore::load(const Match& m, SavedConversation& out, std::string& error) {
+namespace {
+
+// a file of a read, checked: its descriptor, header, section table and block hashes
+struct Opened {
+    std::string name;
+    std::unique_ptr<ReadFd> rf;
+    Header h{};
+    std::vector<Section> tab;
+    std::vector<uint64_t> hashes;
+};
+
+using KvSizes = std::vector<std::array<uint64_t, 5>>;
+
+uint64_t kv_size(const KvSizes& sizes, size_t layer, int part) {
+    return layer < sizes.size() && part >= 0 && part < 5 ? sizes[layer][(size_t) part] : 0;
+}
+
+}  // namespace
+
+// The K/V of a read left in its files: they stay open, and the parts point into their tables, until it is read.
+class ConversationStore::KvFileRead final : public ConversationKvRead {
+public:
+    KvFileRead(ConversationStore& store, std::string name, uint64_t generation, std::vector<Opened>&& opened,
+               std::vector<Part>&& parts, KvSizes&& sizes)
+        : store_(store), name_(std::move(name)), generation_(generation), opened_(std::move(opened)),
+          parts_(std::move(parts)), sizes_(std::move(sizes)) {
+        std::lock_guard<std::mutex> lk(store_.mu_);
+        for (const auto& f : opened_) ++store_.reading_[f.name];
+    }
+    ~KvFileRead() override { release(); }
+    size_t layers() const override { return sizes_.size(); }
+    uint64_t bytes(size_t layer, int part) const override { return kv_size(sizes_, layer, part); }
+    bool read(const ConversationKvSink& sink, std::string& error) override {
+        if (released_) { error = "conversation store: the K/V was read already"; return false; }
+        for (Part& p : parts_)
+            p.dst = [&sink, layer = p.layer, kind = p.kind, base = p.base](uint64_t o, const uint8_t* src, uint64_t n) {
+                return sink(layer, kind, base + o, src, n);
+            };
+        std::vector<Source> sources;
+        for (const auto& f : opened_) sources.push_back({f.rf->fd, &f.hashes});
+        uint64_t got = 0;
+        size_t bad = SIZE_MAX;
+        std::string why;
+        const Read end = read_parts(sources, parts_, got, why, bad, store_.read_bufs_);
+        release();
+        if (end != Read::kDone) {
+            error = "conversation store: " + name_ + ": " + why;
+            const std::string part = bad > 0 && bad < opened_.size() ? opened_[bad].name : "";
+            if (end == Read::kFault) store_.drop_read(name_, generation_, part, error);
+            return false;
+        }
+        for (const auto& f : opened_) basalt::platform::touch_file(store_.dir_ + "/" + f.name);
+        std::lock_guard<std::mutex> lk(store_.mu_);
+        store_.stats_.read_bytes += got;
+        return true;
+    }
+
+private:
+    // closes the files; a removal that waited for them happens now
+    void release() {
+        if (released_) return;
+        released_ = true;
+        for (auto& f : opened_) f.rf->close();
+        std::lock_guard<std::mutex> lk(store_.mu_);
+        for (const auto& f : opened_) {
+            auto it = store_.reading_.find(f.name);
+            if (it != store_.reading_.end() && --it->second <= 0) store_.reading_.erase(it);
+        }
+        store_.unlink_unread_locked();
+        if (store_.queue_.empty()) store_.gc_locked(0);   // the block and state files that waited for it too
+    }
+
+    ConversationStore& store_;
+    std::string name_;
+    uint64_t generation_;
+    std::vector<Opened> opened_;
+    std::vector<Part> parts_;
+    KvSizes sizes_;
+    bool released_ = false;
+};
+
+// The K/V of a read out of the write queue: the image stays in RAM, held here, until it is read.
+class ConversationStore::KvQueuedRead final : public ConversationKvRead {
+public:
+    KvQueuedRead(std::shared_ptr<Job> job, KvSizes&& sizes) : job_(std::move(job)), sizes_(std::move(sizes)) {}
+    size_t layers() const override { return sizes_.size(); }
+    uint64_t bytes(size_t layer, int part) const override { return kv_size(sizes_, layer, part); }
+    bool read(const ConversationKvSink& sink, std::string& error) override {
+        const auto& kv = job_->image.kv;
+        for (size_t i = 0; i < sizes_.size(); ++i) {
+            const ConversationBuffer* from[5] = {&kv[i].k, &kv[i].v, &kv[i].k_scale, &kv[i].v_scale, &kv[i].pooled};
+            for (int b = 0; b < 5; ++b)
+                if (!from[b]->visit(0, sizes_[i][(size_t) b], [&](const uint8_t* p, size_t n, size_t at) {
+                        return sink(i, b, at, p, n);
+                    })) {
+                    error = "conversation store: copying the K/V out of the write queue failed";
+                    return false;
+                }
+        }
+        return true;
+    }
+
+private:
+    std::shared_ptr<Job> job_;
+    KvSizes sizes_;
+};
+
+// A read of `name` (the entry of `generation`) failed a check: the entry goes, with the block or state file `part`
+// that did not check out (every conversation that refers to it then fails its read).  An entry dropped or written
+// again since is left alone.
+void ConversationStore::drop_read(const std::string& name, uint64_t generation, const std::string& part,
+                                  std::string& error) {
+    if (!part.empty()) error += " (" + part + ")";
+    std::lock_guard<std::mutex> lk(mu_);
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        const Entry& e = *entries_[i];
+        if (e.name != name || e.generation != generation || e.job) continue;
+        if (!part.empty()) {
+            basalt::platform::remove_file(dir_ + "/" + part);
+            parts_.erase(part);
+        }
+        drop_locked(i);
+        ++stats_.dropped;
+        return;
+    }
+}
+
+bool ConversationStore::load(const Match& m, SavedConversation& out, std::string& error,
+                             std::unique_ptr<ConversationKvRead>* kv_read) {
     std::shared_ptr<Job> job;
     std::string name;
+    uint64_t generation = 0;
     Header head{};
     std::vector<Section> table;
     std::vector<int32_t> all_ids, ids;
@@ -796,6 +953,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
         e.used = ++clock_;
         job = e.job;
         name = e.name;
+        generation = e.generation;
         head = e.head;
         table = e.table;
         all_ids = e.ids;
@@ -815,6 +973,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     if (job) {
         // still queued: the parts come out of the image in RAM (the writer only reads it too)
         const SavedConversation& src = job->image;
+        KvSizes sizes;
         const int64_t n_ids = (int64_t) src.live.ids.size();
         std::vector<int64_t> lens;
         for (const auto& c : src.checkpoints) lens.push_back((int64_t) c.ids.size());
@@ -850,43 +1009,31 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
             k.pooled_rows = kv.pooled_rows > 0 ? P / row_cells_ + 1 : 0;
             const ConversationBuffer* from[5] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
             ConversationBuffer* to[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+            sizes.emplace_back();
             for (int b = 0; b < 5; ++b) {
                 const uint64_t n = kv_part_bytes((uint32_t) (kK + b), from[b]->size(), kv.cells, k.cells,
                                                  k.pooled_rows, kv.idx_dim);
                 if (n > from[b]->size()) { error = "conversation store: K/V shorter than the match"; return false; }
+                sizes.back()[(size_t) b] = n;
+                if (kv_read) continue;
                 to[b]->resize_for_overwrite(n);
                 to[b]->visit(0, n, [&](uint8_t* p, size_t c, size_t at) { return from[b]->read(p, at, c); });
             }
             img.kv.push_back(std::move(k));
         }
+        if (kv_read) *kv_read = std::make_unique<KvQueuedRead>(job, std::move(sizes));
         out = std::move(img);
         std::lock_guard<std::mutex> lk(mu_);
         ++stats_.restored;
         return true;
     }
     // the files of the read: the conversation's, then each block and state file it needs
-    struct Opened {
-        std::string name;
-        std::unique_ptr<ReadFd> rf;
-        Header h{};
-        std::vector<Section> tab;
-        std::vector<uint64_t> hashes;
-    };
     std::vector<Opened> opened;
     opened.reserve(3 + blocks.size());   // no reallocation: parts point into the tables
     auto fail = [&](const std::string& why, size_t bad) {
         for (auto& f : opened) f.rf->close();
         error = "conversation store: " + name + ": " + why;
-        std::lock_guard<std::mutex> lk(mu_);
-        if (bad != SIZE_MAX && bad > 0 && bad < opened.size()) {
-            // a block or state file that does not check out goes; every conversation that refers to it fails its read
-            basalt::platform::remove_file(dir_ + "/" + opened[bad].name);
-            parts_.erase(opened[bad].name);
-            error += " (" + opened[bad].name + ")";
-        }
-        for (size_t i = 0; i < entries_.size(); ++i)
-            if (entries_[i]->name == name && !entries_[i]->job) { drop_locked(i); break; }
-        ++stats_.dropped;
+        drop_read(name, generation, bad > 0 && bad < opened.size() ? opened[bad].name : "", error);
         return false;
     };
     auto open_file = [&](const std::string& fname, uint32_t kind, uint64_t key) -> bool {
@@ -946,7 +1093,10 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
             if (s.kind < kGdn || s.kind > kBlockPos || s.index != index) continue;
             CheckpointBytes& d = state_field(c, s.kind);
             d.resize(s.bytes);
-            parts.push_back({file, &s, s.bytes, [&d](uint64_t o, const uint8_t* p, uint64_t n) { std::memcpy(d.data() + o, p, n); }});
+            parts.push_back({file, &s, s.bytes, [&d](uint64_t o, const uint8_t* p, uint64_t n) {
+                                 std::memcpy(d.data() + o, p, n);
+                                 return true;
+                             }});
         }
     };
     if (cut.live < 0) {
@@ -996,15 +1146,19 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     if (B <= 0 && h.n_blocks > 0) return fail("blocks of no size", SIZE_MAX);
     if (h.n_blocks > 0 && (B % row_cells_ != 0 || (int64_t) blocks.size() != h.n_blocks))
         return fail("inconsistent blocks", SIZE_MAX);
-    // the destination of each layer's buffer, sized for the match
+    // the destination of each layer's buffer, sized for the match (left empty when the K/V stays in its files)
     std::vector<std::array<ConversationBuffer*, 5>> dsts((size_t) h.n_kv);
+    KvSizes sizes((size_t) h.n_kv);
     for (int64_t i = 0; i < h.n_kv; ++i) {
         ConversationKv& k = img.kv[(size_t) i];
         const Rate& r = rates[(size_t) i];
         dsts[(size_t) i] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
-        for (int b = 0; b < 4; ++b) dsts[(size_t) i][(size_t) b]->resize_for_overwrite(r.cell[b] * (uint64_t) k.cells);
-        k.pooled.resize_for_overwrite(r.row * (uint64_t) k.pooled_rows);
+        for (int b = 0; b < 4; ++b) sizes[(size_t) i][(size_t) b] = r.cell[b] * (uint64_t) k.cells;
+        sizes[(size_t) i][4] = r.row * (uint64_t) k.pooled_rows;
+        if (kv_read) continue;
+        for (int b = 0; b < 5; ++b) dsts[(size_t) i][(size_t) b]->resize_for_overwrite(sizes[(size_t) i][(size_t) b]);
     }
+    std::vector<Part> kv_parts;
     // `kind`'s bytes of layer `i` in [from_unit, to_unit) (cells, or pooled rows) of the destination: the start of a
     // section of `file` that begins at unit `from_unit`
     auto take = [&](size_t file, const Section& s, int64_t i, int kind, int64_t from_unit, int64_t to_unit) -> bool {
@@ -1015,8 +1169,12 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
         if (need > s.bytes) return false;
         ConversationBuffer* d = dsts[(size_t) i][(size_t) kind];
         const uint64_t base = (uint64_t) from_unit * unit;
+        if (kv_read) {
+            kv_parts.push_back({file, &s, need, nullptr, (size_t) i, kind, base});
+            return true;
+        }
         parts.push_back({file, &s, need, [d, base](uint64_t o, const uint8_t* p, uint64_t c) {
-                             d->visit(base + o, c, [&](uint8_t* q, size_t m2, size_t at) {
+                             return d->visit(base + o, c, [&](uint8_t* q, size_t m2, size_t at) {
                                  std::memcpy(q, p + (at - base - o), m2);
                                  return true;
                              });
@@ -1063,7 +1221,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     size_t bad = SIZE_MAX;
     std::vector<Source> sources;
     for (const auto& f : opened) sources.push_back({f.rf->fd, &f.hashes});
-    if (!read_parts(sources, parts, read, error, bad, read_bufs_)) return fail(error, bad);
+    if (read_parts(sources, parts, read, error, bad, read_bufs_) != Read::kDone) return fail(error, bad);
     auto source_of = [&](int j) {
         return j >= 0 && (size_t) j < kinds.size() ? (ConversationCheckpoint::Source) kinds[(size_t) j]
                                                       : ConversationCheckpoint::kTurnEnd;
@@ -1079,9 +1237,14 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
         img.checkpoints.push_back(std::move(at));
     }
     out = std::move(img);
-    for (auto& f : opened) {
-        f.rf->close();
-        basalt::platform::touch_file(dir_ + "/" + f.name);
+    if (kv_read) {
+        *kv_read = std::make_unique<KvFileRead>(*this, name, generation, std::move(opened), std::move(kv_parts),
+                                                std::move(sizes));
+    } else {
+        for (auto& f : opened) {
+            f.rf->close();
+            basalt::platform::touch_file(dir_ + "/" + f.name);
+        }
     }
     std::lock_guard<std::mutex> lk(mu_);
     ++stats_.restored;
@@ -1165,6 +1328,7 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     e->key = job->key;
     e->bytes = bytes;
     e->used = ++clock_;
+    e->generation = ++generation_;
     e->cvec = job->image.cvec;
     e->ids = job->image.live.ids;
     e->imgs = job->image.live.imgs;
@@ -1197,16 +1361,32 @@ void ConversationStore::drop_locked(size_t index) {
         }
         // a write in progress finishes into a file nobody indexes: the writer removes it (see writer)
     } else {
-        basalt::platform::remove_file(dir_ + "/" + e.name);
+        if (reading_.count(e.name)) unlinked_.push_back(e.name);
+        else basalt::platform::remove_file(dir_ + "/" + e.name);
         release_locked(e.refs);
     }
     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
 }
 
+void ConversationStore::unlink_unread_locked() {
+    for (size_t i = 0; i < unlinked_.size();) {
+        const std::string& name = unlinked_[i];
+        const auto again =
+            std::find_if(entries_.begin(), entries_.end(), [&](const auto& e) { return e->name == name; });
+        // open for a read still, or queued again under the name: the next pass
+        if (reading_.count(name) || (again != entries_.end() && (*again)->job)) { ++i; continue; }
+        if (again == entries_.end()) basalt::platform::remove_file(dir_ + "/" + name);   // else written again: its file
+        unlinked_.erase(unlinked_.begin() + (std::ptrdiff_t) i);
+    }
+}
+
 void ConversationStore::gc_locked(int64_t min_age) {
     const int64_t now = min_age > 0 ? basalt::platform::file_time_now() : 0;
     for (auto it = parts_.begin(); it != parts_.end();) {
-        if (it->second.refs > 0 || (min_age > 0 && now - it->second.mtime < min_age)) { ++it; continue; }
+        if (it->second.refs > 0 || reading_.count(it->first) || (min_age > 0 && now - it->second.mtime < min_age)) {
+            ++it;
+            continue;
+        }
         const std::string path = dir_ + "/" + it->first;
         uint64_t bytes = 0;
         if (basalt::platform::remove_file(path) || !basalt::platform::file_size(path, bytes)) it = parts_.erase(it);
@@ -1218,7 +1398,8 @@ void ConversationStore::evict_locked() {
     auto total = [&]() {
         uint64_t t = 0;
         for (const auto& e : entries_) t += e->bytes;
-        for (const auto& [n, p] : parts_) t += p.bytes;
+        // (a file nothing refers to that a read still holds open goes when the read closes it, not by an eviction)
+        for (const auto& [n, p] : parts_) if (p.refs > 0 || !reading_.count(n)) t += p.bytes;
         return t;
     };
     uint64_t have = total();
@@ -1303,6 +1484,7 @@ void ConversationStore::writer() {
         }
         if (queue_.empty()) gc_locked(0);   // between bursts: the files the writes left behind
         evict_locked();
+        unlink_unread_locked();
         idle_.notify_all();
     }
 }

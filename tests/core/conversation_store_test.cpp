@@ -3,15 +3,19 @@
 // restart; inside a K/V block, on a block's edge and in the tail), refused when a payload byte of a shared block changed
 // or the identity differs, written again a turn on with only its new state, stored as of its last checkpoint when its
 // live end is a reply past it, the directory kept to its budget, and only a chat's root and last three turn-end states
-// written (a cut at a state not written goes back to the nearest one before it, refcounts of a shared root kept).
+// written (a cut at a state not written goes back to the nearest one before it, refcounts of a shared root kept).  A
+// read that leaves the K/V in its files gives the same bytes through its sink as a whole read.
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/system.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -158,7 +162,242 @@ void remove_dir(const std::string& dir) {
         for (const auto& f : left) basalt::platform::remove_file(dir + "/" + f.name);
     basalt::platform::remove_file(dir);
 }
+
+// the K/V of `kv` read through its sink into buffers shaped like `shapes`: every byte once
+bool read_kv(ConversationKvRead& kv, const std::vector<ConversationKv>& shapes, std::vector<ConversationKv>& out,
+             std::string& err) {
+    out = shapes;
+    if (kv.layers() != out.size()) return false;
+    std::vector<std::array<ConversationBuffer*, 5>> bufs;
+    std::vector<std::vector<uint8_t>> seen(out.size() * 5);
+    for (size_t i = 0; i < out.size(); ++i) {
+        ConversationKv& k = out[i];
+        bufs.push_back({&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled});
+        for (int b = 0; b < 5; ++b) {
+            if (!bufs[i][(size_t) b]->empty()) return false;   // shapes only
+            bufs[i][(size_t) b]->resize((size_t) kv.bytes(i, b));
+            seen[i * 5 + (size_t) b].assign((size_t) kv.bytes(i, b), 0);
+        }
+    }
+    std::mutex mu;
+    bool once = true;
+    const bool ok = kv.read([&](size_t layer, int part, uint64_t off, const uint8_t* src, uint64_t n) {
+        if (layer >= out.size() || part < 0 || part >= 5) return false;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            std::vector<uint8_t>& got = seen[layer * 5 + (size_t) part];
+            if (off + n > got.size()) return false;
+            for (uint64_t j = off; j < off + n; ++j) once = once && got[j]++ == 0;
+        }
+        return bufs[layer][(size_t) part]->visit(off, n, [&](uint8_t* q, size_t c, size_t at) {
+            std::memcpy(q, src + (at - off), c);
+            return true;
+        });
+    }, err);
+    for (const auto& got : seen)
+        for (uint8_t c : got) once = once && c == 1;
+    return ok && once;
+}
+
+bool same_kv(const std::vector<ConversationKv>& a, const std::vector<ConversationKv>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!(a[i].k == b[i].k && a[i].v == b[i].v && a[i].k_scale == b[i].k_scale && a[i].v_scale == b[i].v_scale &&
+              a[i].pooled == b[i].pooled && a[i].cells == b[i].cells && a[i].pooled_rows == b[i].pooled_rows &&
+              a[i].format == b[i].format))
+            return false;
+    return true;
+}
+
+// the files of `dir` of one kind: 'b' a K/V block, 's' a state, 0 a conversation
+std::vector<std::string> files_of(const std::string& dir, char kind) {
+    std::vector<basalt::platform::DirFile> files;
+    std::vector<std::string> names;
+    if (basalt::platform::list_files(dir, files))
+        for (const auto& f : files)
+            if (kind == 0 ? f.name.size() == 16 + 1 + 16 + 4 : f.name.size() == 16 + 1 + 17 + 4 && f.name[17] == kind)
+                names.push_back(f.name);
+    return names;
+}
+
+// the stores of these cases index pooled rows as kv_layer makes them
+struct Store : ConversationStore {
+    Store() { set_row_cells(basalt::kernels::qsa_real_shapes().idx_block); }
+};
+
+// conversations of every stored shape: {tokens, checkpoints, a live state of this size or the usual one}
+struct Shape {
+    size_t tokens;
+    std::vector<size_t> checks;
+    size_t state;
+};
+const Shape kShapes[] = {
+    {9001, {1000}, 0},                            // the live state stored, a tail past two whole blocks
+    {13001, {2048, 4096, 9500}, 0},               // stored as of its last checkpoint
+    {4096, {}, (17u << 20) + 5},                  // one whole block, no tail; a live state over two write buffers
+    {8191, {4096, 8191}, 0},                      // a checkpoint at the live end
+    {300, {7}, 0},                                // no whole block
+    {13001, {1000, 2048, 4096, 6000, 9500}, 0},   // only the last three turn ends' states written
+};
+
+SavedConversation shaped(const Shape& c, std::vector<int32_t>& ids) {
+    ids.resize(c.tokens);
+    for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t) (i * 13 + c.tokens);
+    SavedConversation img = image(ids, c.checks);
+    if (c.state) fill(img.live.state_a, c.state);
+    return img;
+}
+
+// the prompt that continues `ids` cut at `at`
+std::vector<int32_t> prompt_at(const std::vector<int32_t>& ids, size_t at) {
+    std::vector<int32_t> p(ids.begin(), ids.begin() + (std::ptrdiff_t) at);
+    p.push_back(-7);
+    return p;
+}
+
+// `m` of `st` read whole and with its K/V left where it is: the same states, the same K/V through the sink, once
+void check_kv_read(ConversationStore& st, const ConversationStore::Match& m) {
+    std::string err;
+    SavedConversation whole, part;
+    std::unique_ptr<ConversationKvRead> kv;
+    CHECK(st.load(m, whole, err));
+    CHECK(st.load(m, part, err, &kv) && kv != nullptr);
+    if (!kv) return;
+    CHECK(part.live.ids == whole.live.ids && same_state(part.live, whole.live));
+    CHECK(part.checkpoints.size() == whole.checkpoints.size());
+    for (size_t i = 0; i < part.checkpoints.size() && i < whole.checkpoints.size(); ++i)
+        CHECK(same_state(part.checkpoints[i], whole.checkpoints[i]));
+    std::vector<ConversationKv> got;
+    CHECK(read_kv(*kv, part.kv, got, err) && same_kv(got, whole.kv));
+}
 }  // namespace
+
+// A conversation queued again under the name of the file a read holds open: written, its new file stays when the read
+// closes; not written, the old file goes then.
+void same_name_again(const std::string& dir, uint64_t id) {
+    std::string err;
+    std::vector<int32_t> ids;
+    const SavedConversation x = shaped(kShapes[0], ids);
+    const std::vector<int32_t> p = prompt_at(ids, ids.size());
+    for (bool fails : {false, true}) {
+        Store st;
+        CHECK(st.open(dir, id, 1ull << 30, err));
+        CHECK(st.put(SavedConversation(x), 1ull << 30));
+        st.flush();
+        const auto m = st.best(p.data(), p.size(), {}, true);
+        SavedConversation whole, part;
+        std::unique_ptr<ConversationKvRead> kv;
+        CHECK(m.tokens == (int64_t) ids.size() && st.load(m, whole, err) && st.load(m, part, err, &kv) && kv);
+        const std::vector<std::string> names = files_of(dir, 0);
+        CHECK(names.size() == 1);
+        if (names.empty()) return;
+        const std::string path = dir + "/" + names[0];
+        // (a directory where the write's temporary file goes: the write of the conversation file fails)
+        const std::string blocker = path + "." + std::to_string((long long) basalt::platform::process_id()) + ".tmp";
+        if (fails) CHECK(basalt::platform::make_dirs(blocker));
+        CHECK(st.put(SavedConversation(x), 1ull << 30));
+        st.flush();
+        const bool again = st.stats().files == 1;   // (not where a file open for a read cannot be replaced)
+        CHECK(!(fails && again));
+        std::vector<ConversationKv> got;
+        CHECK(kv && read_kv(*kv, part.kv, got, err) && same_kv(got, whole.kv));
+        kv.reset();
+        uint64_t sz = 0;
+        CHECK(basalt::platform::file_size(path, sz) == again);
+        CHECK(files_of(dir, 'b').size() == (again ? 2u : 0u));
+        if (again) check_kv_read(st, st.best(p.data(), p.size(), {}, true));
+        if (fails) basalt::platform::remove_file(blocker);
+        remove_dir(dir);
+    }
+}
+
+// A read with the K/V left in its files, or in the queued image: the same bytes through the sink as a whole read, at
+// the live end and at every checkpoint.  The files read once; a sink that refuses leaves the conversation stored, a
+// block that fails its hash drops it; a conversation dropped while such a read holds its files keeps them until then.
+void kv_left_in_files(const std::string& dir, uint64_t id) {
+    std::string err;
+    for (const Shape& c : kShapes) {
+        std::vector<int32_t> ids;
+        const SavedConversation img = shaped(c, ids);
+        Store st;
+        CHECK(st.open(dir, id, 1ull << 30, err));
+        CHECK(st.put(SavedConversation(img), 1ull << 30));
+        const auto queued = st.best(prompt_at(ids, ids.size()).data(), ids.size() + 1, {}, true);
+        CHECK(queued.tokens > 0);
+        check_kv_read(st, queued);   // out of the write queue, when the writer has not reached it yet
+        st.flush();
+        std::vector<size_t> ends = c.checks;
+        ends.push_back(c.tokens);
+        for (size_t at : ends) {
+            const auto m = st.best(prompt_at(ids, at).data(), at + 1, {}, true);
+            if (m.tokens != (int64_t) at) continue;   // a state that is not stored
+            check_kv_read(st, m);
+            SavedConversation part;
+            std::unique_ptr<ConversationKvRead> kv;
+            const auto take = [](size_t, int, uint64_t, const uint8_t*, uint64_t) { return true; };
+            CHECK(st.load(m, part, err, &kv) && kv && kv->read(take, err) && !kv->read(take, err));
+        }
+        remove_dir(dir);
+    }
+    std::vector<int32_t> ids;
+    const SavedConversation x = shaped(kShapes[0], ids);
+    const std::vector<int32_t> p = prompt_at(ids, ids.size());
+    {
+        Store st;
+        CHECK(st.open(dir, id, 1ull << 30, err));
+        CHECK(st.put(SavedConversation(x), 1ull << 30));
+        st.flush();
+        const auto m = st.best(p.data(), p.size(), {}, true);
+        SavedConversation whole, part;
+        std::unique_ptr<ConversationKvRead> kv;
+        CHECK(m.tokens == (int64_t) ids.size() && st.load(m, whole, err) && st.load(m, part, err, &kv) && kv);
+        const std::vector<std::string> xname = files_of(dir, 0);
+        CHECK(xname.size() == 1 && files_of(dir, 'b').size() == 2);
+        // its next turn, with K/V of its own, supersedes it while the read holds its files
+        std::vector<int32_t> next = ids;
+        for (int i = 0; i < 5000; ++i) next.push_back(5 + i);
+        CHECK(st.put(image(next, {1000, ids.size()}), 1ull << 30));
+        st.flush();
+        uint64_t sz = 0;
+        CHECK(st.stats().files == 1 && !xname.empty() && basalt::platform::file_size(dir + "/" + xname[0], sz));
+        CHECK(files_of(dir, 'b').size() == 2 + 3);
+        std::vector<ConversationKv> got;
+        CHECK(kv && read_kv(*kv, part.kv, got, err) && same_kv(got, whole.kv));
+        kv.reset();
+        CHECK(!xname.empty() && !basalt::platform::file_size(dir + "/" + xname[0], sz));
+        CHECK(files_of(dir, 0).size() == 1 && files_of(dir, 'b').size() == 3);
+        remove_dir(dir);
+    }
+    {
+        Store st;
+        CHECK(st.open(dir, id, 1ull << 30, err));
+        CHECK(st.put(SavedConversation(x), 1ull << 30));
+        st.flush();
+        const auto m = st.best(p.data(), p.size(), {}, true);
+        SavedConversation part;
+        std::unique_ptr<ConversationKvRead> kv;
+        CHECK(st.load(m, part, err, &kv) && kv);
+        CHECK(kv && !kv->read([](size_t, int, uint64_t, const uint8_t*, uint64_t) { return false; }, err));
+        CHECK(st.stats().files == 1);   // the sink refused: the files are as good as they were
+        check_kv_read(st, m);
+        const std::vector<std::string> blocks = files_of(dir, 'b');
+        std::FILE* f = blocks.empty() ? nullptr : basalt::platform::open_file_utf8(dir + "/" + blocks[0], "r+b");
+        CHECK(f != nullptr);
+        if (f) {
+            basalt::platform::fseek64(f, 3 * 4096 + 100, SEEK_SET);
+            const int ch = std::fgetc(f);
+            basalt::platform::fseek64(f, 3 * 4096 + 100, SEEK_SET);
+            std::fputc(ch ^ 0x33, f);
+            std::fclose(f);
+        }
+        CHECK(st.load(m, part, err, &kv) && kv);   // the states check out; the block is read with the K/V
+        std::vector<ConversationKv> got;
+        CHECK(kv && !read_kv(*kv, part.kv, got, err));
+        kv.reset();
+        CHECK(st.stats().files == 0 && files_of(dir, 'b').size() == 1);
+        remove_dir(dir);
+    }
+}
 
 // A model with compressed caches: its layers hold rows of `page_size` cells, no scales or pooled rows, and only one
 // part of running state.
@@ -522,6 +761,8 @@ int main() {
         CHECK(same_state(got.live, sb.checkpoints[1]) && same_state(got.checkpoints[0], sa.checkpoints[0]));
         remove_dir(d3);
     }
+    kv_left_in_files(dir + "-kv", id);
+    same_name_again(dir + "-again", id);
     {
         const std::string dir2 = dir + "-rows";
         compressed_rows(dir2);

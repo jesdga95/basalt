@@ -12,10 +12,13 @@
 // are removed.  Every name carries the identity it was written under (the model file and every setting
 // that changes the state's bytes).  Reads are fail-closed: header, section table and every 1 MiB block of payload carry
 // hashes, a shared file must match its name, and any mismatch drops the conversation.  The directory keeps to a byte
-// budget, least recently used conversations first.
+// budget, least recently used conversations first.  A read can leave the K/V in its files until it is copied to where
+// it is used (load() with a ConversationKvRead); such a read checks each block as it copies it, so a bad block is
+// found after part of the K/V was delivered.  A file such a read holds open is removed once the read has closed it.
 #pragma once
 
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/conversation_stream.hpp"
 
 #include <condition_variable>
 #include <cstdint>
@@ -35,7 +38,6 @@ namespace basalt::core {
 inline constexpr uint32_t kConversationFormat = 2;
 
 struct ConversationStoreBuffer;
-struct ConversationSource;
 
 class ConversationStore {
 public:
@@ -65,13 +67,17 @@ public:
     /// state), at most prompt.size() - 1 tokens; tokens == 0 when there is none.
     Match best(const int32_t* prompt, size_t n, const std::vector<ConversationImageKey>& images, bool cvec) const;
 
-    /// Bytes `load` allocates for `m` (the RAM admission's figure).
-    uint64_t load_bytes(const Match& m) const;
+    /// Bytes `load` allocates for `m` (the RAM admission's figure); with `kv` false, those of a load that leaves the
+    /// K/V in its files.
+    uint64_t load_bytes(const Match& m, bool kv = true) const;
 
     /// The image of `m` cut at m.tokens: `out.live` is the state there, `out.kv` the K/V up to it, `out.checkpoints`
     /// the chain's root (its shortest checkpoint) and that state once more when it is a checkpoint.  A file that fails
     /// any check is deleted and false returned with `error`; the file stays otherwise (a later prompt may match it).
-    bool load(const Match& m, SavedConversation& out, std::string& error);
+    /// With `kv`, the K/V is not copied: `out.kv` holds the layers' shapes with empty buffers and `*kv` reads their
+    /// bytes later (the store outlives it; one load or K/V read runs at a time).
+    bool load(const Match& m, SavedConversation& out, std::string& error,
+              std::unique_ptr<ConversationKvRead>* kv = nullptr);
 
     /// Queues `image` for writing; the writer thread owns it from here.  Files it supersedes (the same conversation
     /// a turn back) are dropped.  False when the queue is over its byte cap (nothing queued).
@@ -94,10 +100,14 @@ private:
         int refs = 0;
         int64_t mtime = 0;
     };
+    class KvFileRead;
+    class KvQueuedRead;
     void writer();
     bool write_job(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole, std::string& error);
     void evict_locked();
     void drop_locked(size_t index);
+    void drop_read(const std::string& name, uint64_t generation, const std::string& part, std::string& error);
+    void unlink_unread_locked();             ///< removes the dropped files no read holds open any more
     void release_locked(const std::vector<std::string>& refs);
     void gc_locked(int64_t min_age);         ///< removes unused block and state files at least `min_age` s old
 
@@ -106,10 +116,12 @@ private:
     bool open_ = false;
     mutable std::mutex mu_;
     std::condition_variable cv_, idle_;
+    std::map<std::string, int> reading_;      ///< files a ConversationKvRead holds open: removed once it closed them
+    std::vector<std::string> unlinked_;       ///< conversation files dropped while open for such a read
     std::vector<std::unique_ptr<Entry>> entries_;
     std::map<std::string, PartFile> parts_;   ///< block and state files of this identity, by name
     std::deque<std::shared_ptr<Job>> queue_;
-    uint64_t queue_bytes_ = 0, clock_ = 0;
+    uint64_t queue_bytes_ = 0, clock_ = 0, generation_ = 0;
     bool stop_ = false, busy_ = false;
     Stats stats_;
     std::vector<std::unique_ptr<ConversationStoreBuffer>> read_bufs_;   ///< the loads' aligned read buffers, kept

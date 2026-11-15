@@ -2,7 +2,8 @@
 // whole copy of it in RAM.
 //
 // A write to the disk tier reads a ConversationSource: the tokens, pictures and checkpoints by reference, the live
-// running state and the K/V as readers of the buffers that hold them, copied out a write buffer at a time.
+// running state and the K/V as readers of the buffers that hold them, copied out a write buffer at a time.  A read
+// can leave the K/V in its files (a ConversationKvRead) until a ConversationKvSink takes it to where it is used.
 #pragma once
 
 #include "basalt/core/conversation_cache.hpp"
@@ -10,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace basalt::core {
@@ -51,6 +53,22 @@ struct ConversationSource {
             n += c->state_a.size() + c->state_b.size() + c->state_c.size() + c->state_d.size() + c->state_e.size();
         return n;
     }
+};
+
+/// Where a read puts K/V bytes: sink(layer, part, offset, src, n) copies n bytes from src to bytes [offset, offset + n)
+/// of buffer `part` (as in ConversationKvSource) of K/V layer `layer`; false when the copy failed.  It may be called
+/// from several threads at once, each byte once.
+using ConversationKvSink = std::function<bool(size_t, int, uint64_t, const uint8_t*, uint64_t)>;
+
+/// The K/V of a conversation read from the disk tier and not copied yet: the image it belongs to carries the K/V
+/// layers' shapes with empty buffers, and bytes() the sizes the buffers would have.
+class ConversationKvRead {
+public:
+    virtual ~ConversationKvRead() = default;
+    virtual size_t layers() const = 0;
+    virtual uint64_t bytes(size_t layer, int part) const = 0;
+    /// Reads every byte into `sink`, once; false at the first failed read, check or sink call.
+    virtual bool read(const ConversationKvSink& sink, std::string& error) = 0;
 };
 
 }  // namespace basalt::core
