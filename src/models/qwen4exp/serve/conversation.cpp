@@ -161,7 +161,11 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
     if (disk_wants && n_st == 0 && disk_stream > 0 && (to_disk || !whole_ok)) {
         reuse = {};   // its RAM goes before the write
         const size_t need = basalt::core::ConversationStore::write_bytes(live.size());
-        if (!admit_parking(need, floor, "parking (written from the session)", live.size(), need)) return true;
+        if (basalt::core::Admission why; !admit_streamed(need, floor, &why)) {
+            refuse_parking(why, "parking (written from the session)", live.size(), need);
+            return true;
+        }
+        parking_admitted();
         if (draft0 != nullptr && !mtp.snapshot_main(err)) return false;   // a streamed draft ring's own window
         basalt::core::ConversationSource src;
         std::string se;
@@ -307,7 +311,11 @@ size_t QfnRuntime::spill_to_disk(bool at_exit, size_t limit) {
         std::string se;
         if (disk_stream > 0) {   // from the session, with no image of it in RAM
             const uint64_t need = basalt::core::ConversationStore::write_bytes(ids.size());
-            if (!admit_parking(need, floor, "disk write", ids.size(), need)) return;
+            if (basalt::core::Admission why; !admit_streamed(need, floor, &why)) {
+                refuse_parking(why, "disk write", ids.size(), need);
+                return;
+            }
+            parking_admitted();
             if (at_exit) disk.flush();   // the queued images first: the budget then keeps this one before them
             const auto t0 = Clock::now();
             basalt::core::ConversationSource src;
@@ -484,7 +492,7 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     double& noted = b >= 0 ? bs[(size_t) b].park_noted : solo_park_noted;   // what is said once per idle stretch
     const double since = b >= 0 ? bs[(size_t) b].idle_busy : solo_idle_busy;
     if (disk_takes && !on_disk && disk_stream > 0 &&
-        capture_admit(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
+        admit_streamed(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
         ckd_finish();   // the write reads its checkpoints' bytes
         // its own K/V from the session, its draft layer's from the store that holds it
         basalt::core::ConversationSource src;

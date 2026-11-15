@@ -134,6 +134,11 @@ public:
     /// when it is on and holds no copy of them yet, the others are dropped), the checkpoint blocks kept for reuse are
     /// freed and the heap's free pages return to the OS. The checkpoints stay: a request may already resume from one.
     void shed_if_low();
+    /// capture_admit for a step of the disk tier that takes no whole image (a write from a session, a read with the
+    /// K/V left in its files).  When RAM refuses it while the RAM tier holds conversations, those leave for the disk
+    /// tier until RAM admits it or none is left to go (conversation_cache_to_store), and the caller waits for the
+    /// writer.  The disk tier's index may change.  `verdict` gets the last check, as capture_admit's.
+    bool admit_streamed(uint64_t need, uint64_t floor, basalt::core::Admission* verdict = nullptr);
     /// From READY on the RAM guard watches MemAvailable against the reserve (--ram-reserve-mib); with 0 it never
     /// starts. The disk tier keeps a GiB above that floor either way.
     void start_guard();
