@@ -118,6 +118,10 @@ struct Options {
     uint64_t gpu_weight_bytes = 0;      ///< the weights the adapter put on the main card (its "GiB on the GPU" load figure, no KV cache)
     bool vision = false;                ///< requests may carry images
     bool kv_int8 = false;               ///< the attention layers' K/V as int8 codes with a scale per 64 values
+    /// K/V streaming: each attention layer keeps its first kv_resident cells on the card and the rest in page-locked RAM,
+    /// read over the bus by every decode window and staged to the card for each prompt chunk (0, or at least max_context:
+    /// all on the card)
+    int64_t kv_resident = 0;
     core::FileRange mmproj;             ///< the vision projector (vision/mmproj)
     std::string arch;                   ///< the architecture name, for messages
 };
@@ -143,9 +147,13 @@ bool attach_prompt_line(Model& m, int dev, int l_min, const Weights& w, std::str
 /// Main-card bytes a prompt line keeps (its hand-off buffers and the drafter features it holds back); 0 when a context of
 /// `max_context` cells is too short for one.
 uint64_t prompt_line_main_bytes(const Geometry& g, const BlockDrafter& drafter, int64_t max_context);
-/// Device bytes one session takes (its KV cells, recurrent states and window rows).
-uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8 = false);
-/// Device bytes the model's shared scratch takes.
-uint64_t shared_bytes(const Geometry& g, int64_t max_context);
+/// The cells of each attention layer a session keeps on the card (kv_resident's rule).
+int64_t resident_cells(int64_t max_context, int64_t kv_resident);
+/// Device bytes one session takes (its KV cells on the card, recurrent states and window rows).
+uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8 = false, int64_t kv_resident = 0);
+/// Page-locked host bytes one session's streamed K/V takes (0 without streaming).
+uint64_t session_host_bytes(const Geometry& g, int64_t max_context, bool kv_int8, int64_t kv_resident);
+/// Device bytes the model's shared scratch takes (with streaming, the VRAM copy a prompt chunk reads one layer's far cells from).
+uint64_t shared_bytes(const Geometry& g, int64_t max_context, bool kv_int8 = false, int64_t kv_resident = 0);
 
 }  // namespace basalt::dense

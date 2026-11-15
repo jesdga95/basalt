@@ -34,6 +34,24 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
   `--kv fp16` (default) takes 64 KiB per position over the 16 attention layers, `--kv int8` 33 KiB (int8 codes with an fp16
   scale per 64 values; [precision](../precision/qwen38-27b.md)). On a 32 GB card one slot holds about 190K positions in fp16
   and the full 262,144 in int8. The start refuses a context that does not fit and names the free memory.
+- **K/V streaming:** `--kv-resident N` (default 0, off) keeps each attention layer's first N positions on the card and the
+  rest in page-locked RAM, so a context or `--parallel` whose cache does not fit the card still starts. Attention reads every
+  position for every token, so each decoded token reads all positions past N over the bus: decode slows with every position
+  in RAM. A prompt chunk copies each layer's positions in RAM to the card once (one layer's worth of VRAM, kept for the run)
+  while the layers before it run, so prompt reads stay close. The output is bitwise the same as with every position on the
+  card. One RTX 5090 at 400 W on a PCIe 5.0 x8 link (28.8 GB/s measured host to card), `--kv int8`, a 250,038-token prompt
+  (repeating text, which drafts well), 64 to 256 tokens decoded:
+
+  | Positions in RAM | Prompt read | Decode, `--spec 0` | Decode, drafted |
+  | --- | --- | --- | --- |
+  | none (`--kv-resident 0`) | 4,345 tok/s | 45.4 tok/s | 79.0 tok/s |
+  | 32K | 4,251 tok/s | 14.6 tok/s | |
+  | 64K | 4,212 tok/s | 8.6 tok/s | 15.7 tok/s |
+  | 128K | 4,183 tok/s | 4.7 tok/s | 8.4 tok/s |
+  | 200K | 4,171 tok/s | 3.1 tok/s | |
+
+  Each position in RAM costs a token 33 KiB of bus reads (`--kv fp16`: 64 KiB; 60K positions at a 120K prompt decode at
+  6.3 tok/s against 59.9). Decode reads them at about 24 GB/s of the link's 28.8, so the link sets the speed.
 - **Slots:** `--parallel N` gives each slot its own cache and recurrent state (157 MiB). Slots share the weights.
 - **Cards:** the main card decodes and holds everything. A second Blackwell card (`gpu "0,1"`, or `"auto"` when two are visible) is the
   prompt line: it reads the last layers of long prompts ([below](#long-prompts-on-two-cards)). Further cards idle.
@@ -80,6 +98,7 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 
 ## Limits
 
+- `--kv-resident` keeps the MTP drafter's own cache on the card (the block drafter's is a short window).
 - Slots whose windows fit 16 rows together (every slot in plain decoding, two slots of 8-row drafted windows) share one pass through the weights each round, and their block drafters run two blocks a pass; a window that does not fit takes a pass of its own. Prompt reads run per slot.
 - Decoding runs on the main card: a second card reads long prompts only (no layer split, no second-card drafting).
 

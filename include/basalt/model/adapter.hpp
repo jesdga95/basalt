@@ -98,6 +98,7 @@ struct LoadRequest {
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
     RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
+    int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
 };
 
 struct DecodeRequest {

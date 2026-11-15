@@ -42,7 +42,8 @@ as F8_E4M3 (E4M3 codes, FP32 per matrix), both bit for bit; the rest as above.
   rule with q/k in BF16 and the state in fp32 (shared with Flash-Next). The prompt's a/b projections (BF16 weights) take the
   normed rows as two bf16 terms on tensor cores (about fp32's precision), the gates applied in the same kernel.
 - **Attention:** K and V stored fp16, or with `--kv int8` as int8 codes and an fp16 scale per 64 values (amax / 127, codes rounded
-  to nearest against the stored scale). Decode reads them with fp32 dot products and softmax (int8: code x scale in fp32), in chunks of 64 cells folded in a fixed
+  to nearest against the stored scale); with `--kv-resident` the positions in RAM are read where they live, the same bytes in
+  the same order (bitwise the output with every position on the card). Decode reads them with fp32 dot products and softmax (int8: code x scale in fp32), in chunks of 64 cells folded in a fixed
   order.
   Prompt chunks, fp16 cache: QK^T with fp16 q and k on tensor cores, fp32 accumulation; P V with fp16 p and v, each tile of
   32 cells summed in fp16 and added to the fp32 output. int8 cache: q rounded to int8 per 64 values (amax / 127), each
@@ -96,7 +97,8 @@ little there (the gate on 20 chunks, `--kv int8`; llama.cpp's YaRN on unsloth's 
 | `--rope-scaling yarn --rope-scale 2` | 7.0708 | 0.0274 | 92.73% | 6.9339 |
 
 Past the trained length, a passphrase hidden at 10%, 50% and 90% of a 380,541-token prompt (synthetic filler, `--max-context
-400000 --kv int8`, YaRN x2) was found at every depth.
+400000 --kv int8`, YaRN x2) was found at every depth, and at 25% and 75% of 500,573 tokens (`--max-context 524288
+--kv-resident 200000`).
 
 ## Sampling with drafts
 
