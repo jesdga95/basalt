@@ -33,7 +33,8 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
   scale per 64 values; [precision](../precision/qwen38-27b.md)). On a 32 GB card one slot holds about 190K positions in fp16
   and the full 262,144 in int8. The start refuses a context that does not fit and names the free memory.
 - **Slots:** `--parallel N` gives each slot its own cache and recurrent state (157 MiB). Slots share the weights.
-- **Cards:** one. The second card idles (see [GPUs](../configuration/gpus.md)).
+- **Cards:** the main card decodes and holds everything. A second Blackwell card (`gpu "0,1"`, or `"auto"` when two are visible) is the
+  prompt line: it reads the last layers of long prompts ([below](#long-prompts-on-two-cards)). Further cards idle.
 
 ## Drafting
 
@@ -47,6 +48,29 @@ A sampled request without a `seed` draws the block drafter's drafts and keeps th
 model's distribution exactly, and more drafts are kept than the drafter's best guesses would give
 ([precision](../precision/qwen38-27b.md#sampling-with-drafts)).
 
+## Long prompts on two cards
+
+With a second Blackwell card (`gpu "0,1"`, [GPUs](../configuration/gpus.md)) that card holds the last 20 layers (4 GiB) and the
+KV cache of their attention layers. A prompt part longer than two chunks (8,192 tokens) is read as a pipeline: the main card
+reads the first layers of a chunk and hands its rows over through page-locked RAM, the second card reads the remaining layers of
+that chunk while the main card reads the next one, and each chunk's KV cells come back as it finishes. The main card reads the
+last one or two chunks whole once the second card's recurrent state is back, so decoding, the conversation cache and later
+requests find the session a read on the main card alone leaves: the output is the same to the bit (the second card runs the
+main card's kernels on the same rows). Each read is priced from both cards' rates, timed at start on random rows and refitted
+from every split read, and is split, at the layer the price picks, only when that is at least 5% faster. Log lines start with
+`prompt line:`. Decoding never uses the second card. Without room on it the start warns and prompts stay on the main card.
+
+The start line names it (`gpus: RTX 5090 (nvidia-smi 0) main, RTX 5060 Ti (nvidia-smi 1) prompt line`), then `prompt line: layers 44-63
+(4.00 GiB) on CUDA1`, the two cards' timed rates and the page-locked RAM (0.4 GiB). It costs about 5 s at start (the upload and the
+timing) and 0.4 GiB of the main card. The second card holds the 4 GiB of layers, their attention layers' cells and a chunk's scratch: 6 to
+9 GiB, 8.7 GiB at 262,144 positions in `int8`. A context of 16,384 or less holds no prompt the line would split, and then nothing goes to
+the second card.
+
+The line works with everything a read on the main card does: `--parallel` slots (a slot's read runs while the others wait, as on one
+card), pictures and video (a picture's rows go through the main card; the text before and after reads on the line), the conversation cache and
+its checkpoints, the thinking budget. A cancelled request is met within two chunks on either card (0.9 s into a 16K read and 1.4 s into a 40K one, against 0.5 and 0.8 s on one card)
+and the next request finds the state it would find after a cancel on one card.
+
 ## Images and video
 
 `--vision dynamic`: the encoder's weights wait in page-locked RAM and go to the card for each request's pictures. Video works as
@@ -55,11 +79,11 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 ## Limits
 
 - Slots whose windows fit 16 rows together (every slot in plain decoding, two slots of 8-row drafted windows) share one pass through the weights each round, and their block drafters run two blocks a pass; a window that does not fit takes a pass of its own. Prompt reads run per slot.
-- No layer split and no second-card drafting.
+- Decoding runs on the main card: a second card reads long prompts only (no layer split, no second-card drafting).
 
 ## Speed
 
-`basalt-bench` on one RTX 5090 at 400 W, `--kv fp16`, the pack with the block drafter, cold first runs:
+`basalt-bench` on an RTX 5090 at 400 W, `--kv fp16` unless stated, the pack with the block drafter, cold first runs (one card except the last two rows):
 
 | | Result |
 | --- | --- |
@@ -67,3 +91,5 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 | Decode, plain (`--spec 0`, conversation) | 90 tok/s |
 | Decode, drafted (conversation, struct, prose) | 262, 776, 194 tok/s |
 | Decode, `--parallel 2` / `--parallel 4`, every slot on the same chat, all slots together | 408 / 566 tok/s |
+| Prompt read, 8k / 16k / 32k / 64k, one card, then with an RTX 5060 Ti (180 W) as the prompt line | 12,072 / 10,716 / 8,654 / 6,137, then 13,606 / 12,699 / 10,518 / 7,570 tok/s (+13% / +19% / +22% / +23%) |
+| The same with `--kv int8` | 12,822 / 12,070 / 10,644 / 8,637, then 14,610 / 14,828 / 13,214 / 10,991 tok/s (+14% / +23% / +24% / +27%) |
