@@ -110,6 +110,16 @@ struct StageDeleter {
 };
 using StagePtr = std::unique_ptr<Stage, StageDeleter>;
 
+/// The layer split's decode hand-off, page-locked and device-mapped: each card's window graph writes and reads its rows with
+/// kernels and raises the other card's flag (the host lowers both before a window).
+struct SplitHand {
+    uint16_t* fwd = nullptr;       ///< [kBatch][n_embd] BF16: the main card's residual after its last layer
+    uint16_t* ret = nullptr;       ///< [1 + taps][kBatch][n_embd] BF16: the second card's after the last layer, then after each tap
+    uint32_t* flag = nullptr;      ///< [0]: fwd is in; [1]: ret is in
+    std::vector<int> taps;         ///< the block drafter's target layers on the second card, in order
+    size_t first_tap = 0;          ///< the first of them among the drafter's target layers
+};
+
 class Model {
 public:
     Geometry g;
@@ -148,6 +158,10 @@ public:
     void* enc_arena = nullptr;
     size_t enc_bytes = 0;
     StagePtr line;                               // the prompt line: a second card reading long prompts' last layers (null: none)
+    StagePtr split;                              // the layer split's second card: layers [le, n) (null: none)
+    SplitHand* hand = nullptr;                   // the layer split's decode hand-off, on both cards' models (null: none)
+    Model* split_model = nullptr;                // the split's second card's model, and its CUDA device
+    int split_dev = -1;
     ~Model();
     bool ensure_chunk(std::string& err);
     /// llama.cpp's MMQ readied for every product of the model (its kernels loaded for each format and height).
@@ -158,6 +172,10 @@ public:
     void vision_detach();
 };
 
+struct SessionState;
+struct PeerStateDeleter {
+    void operator()(SessionState* s) const;
+};
 /// One conversation's device state.
 struct SessionState {
     cudaStream_t stream = nullptr;
@@ -204,7 +222,21 @@ struct SessionState {
     // how the block drafter picks (temperature 0: its best candidates; above, drawn), set by the request's sampling
     float dtemp = 0.0f;
     uint64_t dseed = 0;
+    // the layer split: the second card's state of this conversation (its layers' cells and recurrent state; null: none),
+    // and the device a second card's state lives on
+    std::unique_ptr<SessionState, PeerStateDeleter> peer;
+    int dev = -1;
 };
+
+/// One session's device state on the card of model `m` (its layers' cells and recurrent state; on the card that holds layer
+/// 0 also the logits, the picks and the drafter's state), on the current device; free_state releases it there.
+bool init_state(Model& m, SessionState& st, std::string& err);
+void free_state(SessionState& st);
+/// The layer split's second card's state of the session `st` of model `m` (st.peer).
+bool split_session(Model& m, SessionState& st, std::string& err);
+/// A prompt chunk across the layer split's cards, one after the other (forward_chunk's arguments).
+bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos, const int32_t* pos3,
+                 std::string& err);
 
 /// Runs a decode window of T rows at cells pos..pos+T-1 (`pos3` [T][3] their rope positions); leaves the logits in
 /// st.logits and the GDN rows for the commit.
