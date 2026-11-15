@@ -15,6 +15,7 @@
 #include "internal.hpp"
 
 #include "basalt/core/on_device.hpp"
+#include "basalt/core/staged_copy.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/log.hpp"
 
@@ -46,6 +47,7 @@ public:
     uint8_t* state = nullptr;                    // page-locked: the line's GDN states
     int32_t* pos3 = nullptr;                     // page-locked: two bounds pairs, then [max_context][3] positions
     size_t kv_bytes = 0, state_bytes = 0;
+    core::StagedCopy state_in;                   // a read's starting state, main card to dev
     // each card's prompt rates, timed at start over the card's layers: ms per row per layer, and per row per visible cell
     // per attention layer; a chunk's residual crossing over (ms per row), the state's return (ms)
     struct Rate {
@@ -107,6 +109,7 @@ constexpr int kRefitChunks = 6;             // line chunks a read needs for its 
 constexpr int kAhead = 2;                   // chunks the host queues ahead of the line's finished ones: a stop waits for at most these
 constexpr int kCalRuns = 4;                 // timed runs per card and position at start (the later half counts)
 constexpr int64_t kCalFar = 11 * kChunk;   // the furthest position timed at start
+constexpr size_t kStatePiece = 8u << 20;   // the pieces a read's starting state crosses over in
 
 struct Region {
     void* main;
@@ -311,22 +314,27 @@ static bool calibrate(PromptLine& L, Model& main, std::string& err) {
             h[i] = (uint16_t) (bits >> 16);
         }
     }
-    const auto t_hand = std::chrono::steady_clock::now();
-    {
-        const core::OnDevice on(L.dev);
-        if (cudaMemcpy(L.lin[0], L.hand[0], T * H * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
-            err = "a copy to the card failed";
-            return false;
-        }
-    }
+    // the rows on both cards, then one hand-off timed as a read makes it: the main card's rows to page-locked memory, then
+    // to the line's card (each copy synchronous, so the clock sees both whole)
+    bool placed;
     {
         const core::OnDevice on(L.main_dev);
-        if (cudaMemcpy(L.mout[0], L.lin[0], T * H * 2, cudaMemcpyDefault) != cudaSuccess) {   // (staged when no peer access)
-            err = "a copy to the main card failed";
-            return false;
-        }
+        placed = cudaMemcpy(L.mout[0], L.hand[0], T * H * 2, cudaMemcpyHostToDevice) == cudaSuccess;
     }
-    const double hand_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_hand).count() * 2 / 3;   // three hops timed, a hand-off takes two
+    const auto t_hand = std::chrono::steady_clock::now();
+    {
+        const core::OnDevice on(L.main_dev);
+        placed = placed && cudaMemcpy(L.hand[1], L.mout[0], T * H * 2, cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+    {
+        const core::OnDevice on(L.dev);
+        placed = placed && cudaMemcpy(L.lin[0], L.hand[1], T * H * 2, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    const double hand_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_hand).count();
+    if (!placed) {
+        err = "a copy between the cards failed";
+        return false;
+    }
     // both cards at once, as a read runs them: the main card's whole stack and the line's layers at position 0, then the
     // line's layers further on beside the main card's same layers at 0 and further on (attention's part is their difference)
     const core::OnDevice on_main(L.main_dev);
@@ -499,10 +507,12 @@ PromptLinePtr make_prompt_line(Model& main, int dev, int l_min, const Weights& w
         err = main.o.arch + ": out of page-locked memory for the prompt line";
         return nullptr;
     }
+    if (!L.state_in.init(L.main_dev, dev, kStatePiece, err)) return fail(err);
     // the second card's int8 prompt attention splits its keys as the main card's does, so its rows round the same
     kernels::gqa_prompt_plan_device(L.main_dev);
     if (!calibrate(L, main, err)) return fail(err);
-    const size_t pinned = PromptLine::kSlots * (T * H * 2 + L.kv_bytes) + L.tap_rows.size() * T * H * 2 + L.state_bytes;
+    const size_t pinned = PromptLine::kSlots * (T * H * 2 + L.kv_bytes) + L.tap_rows.size() * T * H * 2 + L.state_bytes +
+                          core::StagedCopy::kBufs * kStatePiece;
     basalt::log::info("basalt dense", "prompt line: CUDA%d reads layers %d-%d of prompts over %d tokens; %.2f GiB of page-locked "
                       "hand-off buffers", dev, l_min, g.n_layers - 1, 2 * kChunk, (double) pinned / 1073741824.0);
     return p;
@@ -572,8 +582,9 @@ bool prompt_line_read(PromptLine& L, Model& m, SessionState& st, const int32_t* 
         if (pos == 0) {
             cudaMemsetAsync(L.st.gdn + gdn_off, 0, gdn_bytes, ls);
         } else {
-            cudaMemcpyPeerAsync(L.st.gdn + gdn_off, L.dev, st.gdn + gdn_off, L.main_dev, gdn_bytes, ls);
-            for (const Region& r : cell_regions(m, st, L.st, ai0, 0, pos)) cudaMemcpyPeerAsync(r.line, L.dev, r.main, L.main_dev, r.bytes, ls);
+            bool ok = L.state_in.copy(L.st.gdn + gdn_off, st.gdn + gdn_off, gdn_bytes, err);
+            for (const Region& r : cell_regions(m, st, L.st, ai0, 0, pos)) ok = ok && L.state_in.copy(r.line, r.main, r.bytes, err);
+            if (!ok || !L.state_in.wait(err)) return false;
         }
     }
     for (auto [evs, dev] : {std::pair{&L.main_ev, L.main_dev}, std::pair{&L.line_ev, L.dev}}) {
