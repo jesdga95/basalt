@@ -403,6 +403,11 @@ public:
     Result prefill_chunk(const model::PrefillRequest& r) override {
         if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the prompt passes the context");
         if (Result s = settle(r.pos); !s.ok()) return s;
+        if (m_.split && !drafter_) {   // the layer split: the chunks pipelined over the two cards
+            std::string err;
+            if (!split_read(m_, st_, r.tokens, r.n_tokens, r.pos, r.progress, r.stop, err)) return fail(err);
+            return {};
+        }
         if (m_.line) {   // a long prompt across the cards (the prompt line)
             std::string err;
             if (prompt_line_read(*m_.line, m_, st_, r.tokens, r.n_tokens, r.pos, r.progress, r.stop, err)) return {};

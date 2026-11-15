@@ -976,4 +976,115 @@ bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float*
     return chunk_finish(m, st, T, pos, err);
 }
 
+bool split_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_t pos, const std::function<void(int)>& progress,
+                const std::function<bool()>& stop, std::string& err) {
+    Stage& L = *m.split;
+    const Geometry& g = m.g;
+    const int T = kChunk, H = g.n_embd;
+    constexpr int S = Stage::kSlots;
+    if (!m.ensure_chunk(err)) return false;
+    const bool block = m.o.drafter == Drafter::Block;
+    const BlockDrafter& bd = m.w.dflash;
+    const SplitHand& h = L.split_hand;
+    const bool taps = block && !h.taps.empty();
+    const bool read_last = taps && h.taps.back() == g.n_layers - 1;
+    const int64_t cap = block ? st.dctx_cap : 0, b0 = pos + n;
+    const int chunks = (n + T - 1) / T;
+    const int t_last = n - (chunks - 1) * T;
+    // the bounds of a whole chunk and of the last one, then the positions, page-locked so that every upload is queued
+    int32_t* bnd = L.pos3;
+    int32_t* pos3 = L.pos3 + 4;
+    bnd[0] = 0;
+    bnd[1] = T;
+    bnd[2] = 0;
+    bnd[3] = t_last;
+    for (int t = 0; t < n; ++t) pos3[t * 3] = pos3[t * 3 + 1] = pos3[t * 3 + 2] = (int32_t) (pos + t + st.rope_delta);
+    const cudaStream_t ms = st.stream;
+    for (auto [evs, dev] : {std::pair{&L.main_ev, L.main_dev}, std::pair{&L.line_ev, L.dev}}) {
+        const core::OnDevice on(dev);
+        while (evs->size() < 2 * (size_t) chunks) {
+            cudaEvent_t e = nullptr;
+            if (cudaEventCreate(&e) != cudaSuccess) {
+                err = "cannot create CUDA events";
+                return false;
+            }
+            evs->push_back(e);
+        }
+    }
+    // the chunks whose drafter features the context ring keeps: the main card's part kept aside, the second card's rows back
+    std::vector<int64_t> tail_pos;
+    std::vector<int> tail_rows;
+    const size_t n_tail = L.n_taps ? L.tap_rows.size() / (size_t) L.n_taps : 0;
+    cudaError_t e = cudaSuccess;
+    bool stopped = false;
+    int reaped = 0;   // chunks seen finished on the second card
+    const auto reap = [&](int upto) {
+        for (; reaped < upto && e == cudaSuccess; ++reaped) {
+            {
+                const core::OnDevice on(L.dev);
+                e = cudaEventSynchronize(L.line_ev[2 * (size_t) reaped + 1]);
+            }
+            if (e == cudaSuccess && progress) progress(std::min(n, (reaped + 1) * T));
+        }
+    };
+    for (int i = 0; i < chunks; ++i) {
+        if (i >= kAhead) {
+            reap(i - kAhead + 1);
+            if (e != cudaSuccess) break;
+            if (stop && stop()) {
+                stopped = true;
+                break;
+            }
+        }
+        const int64_t p = pos + (int64_t) i * T;
+        const int k = i % S, t = i == chunks - 1 ? t_last : T;
+        const bool again = i >= S;
+        const int32_t* bc = t == T ? bnd : bnd + 2;
+        const bool tail = taps && p + t > b0 - cap && tail_pos.size() < n_tail && tail_pos.size() < L.mtail.size();
+        const int32_t* p3 = pos3 + (size_t) i * T * 3;
+        // the main card's layers, its residual on to the second card, whose layers run beside the main card's next chunk
+        chunk_start(m, st, tokens + (size_t) i * T, nullptr, t, p3, bc);
+        cudaEventRecord(L.main_ev[2 * (size_t) i], ms);
+        chunk_layers(m, st, t, p, 0, L.lo, block ? &bd : nullptr);
+        cudaEventRecord(L.main_ev[2 * (size_t) i + 1], ms);
+        L.send(m, st, k, again, tail ? L.mtail[tail_pos.size()] : nullptr);
+        L.read(*st.peer, i, k, again, p, p3, bc, L.lo, h.taps, tail ? (int) tail_pos.size() : -1, read_last, t);
+        if (tail) {
+            tail_pos.push_back(p);
+            tail_rows.push_back(t);
+        }
+    }
+    if (e == cudaSuccess && !stopped) {
+        // the ring's chunks' features in order: the main card's part, then the projections of the second card's rows, as a
+        // read on the main card makes them; their cells, so the ring ends as a read on one card leaves it
+        cudaStreamWaitEvent(ms, L.l_done[(chunks - 1) % S], 0);
+        for (size_t j = 0; j < tail_pos.size(); ++j) {
+            const int t = tail_rows[j];
+            cudaMemcpyAsync(m.cs.bounds, t == T ? bnd : bnd + 2, 2 * sizeof(int32_t), cudaMemcpyHostToDevice, ms);
+            cudaMemcpyAsync(m.cs.dacc, L.mtail[j], (size_t) t * H * 4, cudaMemcpyDeviceToDevice, ms);
+            for (size_t q = 0; q < h.taps.size(); ++q) {
+                cudaMemcpyAsync(m.cs.x, L.tap_rows[j * (size_t) L.n_taps + q], (size_t) t * H * 2, cudaMemcpyHostToDevice, ms);
+                chunk_tap(m, st, t, bd, h.first_tap + q);
+            }
+            block_ctx_chunk(m, st, m.cs.dacc, t, tail_pos[j]);
+        }
+    }
+    // what is queued runs out, so that no copy is left in flight (after a stop the session holds part of the prompt)
+    for (int d : {L.main_dev, L.dev}) {
+        const core::OnDevice on(d);
+        const cudaError_t s = cudaDeviceSynchronize();
+        if (e == cudaSuccess) e = s;
+    }
+    if (e != cudaSuccess) {
+        err = m.o.arch + ": the layer split's prompt read failed: " + cudaGetErrorString(e);
+        return false;
+    }
+    if (stopped) {
+        basalt::log::info("basalt dense", "layer split: stopped, %d of %d tokens read", std::min(n, reaped * T), n);
+        return true;
+    }
+    reap(chunks);
+    return true;
+}
+
 }  // namespace basalt::dense
