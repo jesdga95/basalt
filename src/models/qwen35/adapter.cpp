@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <map>
 #include <optional>
@@ -77,36 +78,10 @@ public:
         w.embd = (const uint16_t*) dev_embd;
         w.out_norm = floats(gg, "output_norm.weight", H, err);
         if (!w.out_norm || !linear(gg, "output", g.n_vocab, H, w.head, err)) return false;
-        const int C = g.conv_channels(), VD = g.value_width(), HV = g.gdn_v_heads, AQ = g.n_head * g.head_dim;
-        const int KV = g.n_kv * g.head_dim;
+        const int AQ = g.n_head * g.head_dim, KV = g.n_kv * g.head_dim;
         for (int il = 0; il < g.n_layers; ++il) {
-            const std::string p = "blk." + std::to_string(il) + ".";
             dense::Layer L;
-            L.kind = g.kinds[(size_t) il];
-            L.attn_norm = floats(gg, p + "attn_norm.weight", H, err);
-            L.ffn_norm = floats(gg, p + "post_attention_norm.weight", H, err);
-            if (!L.attn_norm || !L.ffn_norm) return false;
-            if (L.kind == dense::Mixer::Gdn) {
-                if (!linear(gg, p + "attn_qkv", C, H, L.qkv, err) || !linear(gg, p + "attn_gate", VD, H, L.z, err) ||
-                    !linear(gg, p + "ssm_out", H, VD, L.out, err))
-                    return false;
-                L.w_ab = bf16_pair(gg, p + "ssm_alpha.weight", p + "ssm_beta.weight", (int64_t) HV * H, err);
-                L.dt = floats(gg, p + "ssm_dt.bias", HV, err);
-                L.ssm_a = floats(gg, p + "ssm_a", HV, err);
-                L.conv = floats(gg, p + "ssm_conv1d.weight", (int64_t) C * g.gdn_conv, err);
-                L.gamma = floats(gg, p + "ssm_norm.weight", g.gdn_state, err);
-                if (!L.w_ab || !L.dt || !L.ssm_a || !L.conv || !L.gamma) return false;
-            } else {
-                if (!linear(gg, p + "attn_q", 2 * AQ, H, L.q, err) || !linear(gg, p + "attn_k", KV, H, L.k, err) ||
-                    !linear(gg, p + "attn_v", KV, H, L.v, err) || !linear(gg, p + "attn_output", H, AQ, L.o, err))
-                    return false;
-                L.q_norm = floats(gg, p + "attn_q_norm.weight", g.head_dim, err);
-                L.k_norm = floats(gg, p + "attn_k_norm.weight", g.head_dim, err);
-                if (!L.q_norm || !L.k_norm) return false;
-            }
-            if (!linear(gg, p + "ffn_gate", g.n_ff, H, L.gate, err) || !linear(gg, p + "ffn_up", g.n_ff, H, L.up, err) ||
-                !linear(gg, p + "ffn_down", H, g.n_ff, L.down, err))
-                return false;
+            if (!layer(gg, g, il, L, err)) return false;
             w.layers.push_back(L);
         }
         const bool want_block = req.draft && tensors_.count("dflash.fc.0.weight");
@@ -161,7 +136,8 @@ public:
             return false;
         }
         const uint64_t need_b = dense::shared_bytes(g, o.max_context) +
-                                (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_int8);
+                                (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_int8) +
+                                (req.peer_devices.empty() ? 0 : dense::prompt_line_main_bytes(g, w.dflash, o.max_context));
         const uint64_t reserve = (uint64_t) std::max(req.vram_reserve_mib, 0) << 20;
         if (need_b + reserve + (512ull << 20) > free_b) {
             err = "qwen35: " + std::to_string((long long) o.sessions) + " session(s) of " + std::to_string((long long) o.max_context) +
@@ -170,10 +146,81 @@ public:
             return false;
         }
         model_ = dense::make_model(g, w, o, err);
-        return model_ != nullptr;
+        if (!model_) return false;
+        if (!req.peer_devices.empty()) prompt_line(gg, g, req.peer_devices.front(), o.max_context);
+        return true;
     }
 
 private:
+    // A second card reads long prompts' last layers (dense::attach_prompt_line): their weights go to that card too.  Without
+    // room for it there the prompts stay on the main card.
+    void prompt_line(const GgufFile& gg, const dense::Geometry& g, int dev, int64_t max_context) {
+        const int l_min = std::max(0, g.n_layers - dense::kPromptLineLayers);
+        int main_dev = 0;
+        cudaGetDevice(&main_dev);
+        if (dense::prompt_line_main_bytes(g, dense::BlockDrafter{}, max_context) == 0) {   // before the weights go over
+            basalt::log::info("basalt qwen35", "prompt line off: a context of %lld holds no prompt that a second card would read",
+                              (long long) max_context);
+            return;
+        }
+        const uint64_t main_bytes = dev_bytes_;
+        const size_t first = dev_.size();
+        std::string err;
+        dense::Weights lw;
+        bool ok = cudaSetDevice(dev) == cudaSuccess;
+        if (!ok) err = "qwen35: cannot use CUDA" + std::to_string(dev);
+        for (int il = 0; ok && il < g.n_layers; ++il) {
+            dense::Layer L;
+            L.kind = g.kinds[(size_t) il];
+            if (il >= l_min) ok = layer(gg, g, il, L, err);
+            lw.layers.push_back(L);
+        }
+        const uint64_t line_bytes = dev_bytes_ - main_bytes;
+        dev_bytes_ = main_bytes;
+        cudaSetDevice(main_dev);
+        if (ok) basalt::log::info("basalt qwen35", "prompt line: layers %d-%d (%.2f GiB) on CUDA%d, read beside the main card's on CUDA%d", l_min,
+                                  g.n_layers - 1, (double) line_bytes / 1073741824.0, dev, main_dev);
+        if (ok && dense::attach_prompt_line(*model_, dev, l_min, lw, err)) return;
+        basalt::log::warn("basalt qwen35", "prompt line off, prompts read on CUDA%d: %s", main_dev, err.c_str());
+        for (size_t i = first; i < dev_.size(); ++i) cudaFree(dev_[i]);
+        dev_.resize(first);
+        (void) cudaGetLastError();
+    }
+
+    // layer il's weights (on the current device)
+    bool layer(const GgufFile& gg, const dense::Geometry& g, int il, dense::Layer& L, std::string& err) {
+        const int H = g.n_embd;
+        const int C = g.conv_channels(), VD = g.value_width(), HV = g.gdn_v_heads, AQ = g.n_head * g.head_dim;
+        const int KV = g.n_kv * g.head_dim;
+        const std::string p = "blk." + std::to_string(il) + ".";
+        L.kind = g.kinds[(size_t) il];
+        L.attn_norm = floats(gg, p + "attn_norm.weight", H, err);
+        L.ffn_norm = floats(gg, p + "post_attention_norm.weight", H, err);
+        if (!L.attn_norm || !L.ffn_norm) return false;
+        if (L.kind == dense::Mixer::Gdn) {
+            if (!linear(gg, p + "attn_qkv", C, H, L.qkv, err) || !linear(gg, p + "attn_gate", VD, H, L.z, err) ||
+                !linear(gg, p + "ssm_out", H, VD, L.out, err))
+                return false;
+            L.w_ab = bf16_pair(gg, p + "ssm_alpha.weight", p + "ssm_beta.weight", (int64_t) HV * H, err);
+            L.dt = floats(gg, p + "ssm_dt.bias", HV, err);
+            L.ssm_a = floats(gg, p + "ssm_a", HV, err);
+            L.conv = floats(gg, p + "ssm_conv1d.weight", (int64_t) C * g.gdn_conv, err);
+            L.gamma = floats(gg, p + "ssm_norm.weight", g.gdn_state, err);
+            if (!L.w_ab || !L.dt || !L.ssm_a || !L.conv || !L.gamma) return false;
+        } else {
+            if (!linear(gg, p + "attn_q", 2 * AQ, H, L.q, err) || !linear(gg, p + "attn_k", KV, H, L.k, err) ||
+                !linear(gg, p + "attn_v", KV, H, L.v, err) || !linear(gg, p + "attn_output", H, AQ, L.o, err))
+                return false;
+            L.q_norm = floats(gg, p + "attn_q_norm.weight", g.head_dim, err);
+            L.k_norm = floats(gg, p + "attn_k_norm.weight", g.head_dim, err);
+            if (!L.q_norm || !L.k_norm) return false;
+        }
+        if (!linear(gg, p + "ffn_gate", g.n_ff, H, L.gate, err) || !linear(gg, p + "ffn_up", g.n_ff, H, L.up, err) ||
+            !linear(gg, p + "ffn_down", H, g.n_ff, L.down, err))
+            return false;
+        return true;
+    }
+
     // the pack's DFlash 2 block drafter (dflash.* tensors, qwen35.dflash.* metadata)
     bool block_drafter(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& err) {
         const auto u = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (int) v->u : 0; };

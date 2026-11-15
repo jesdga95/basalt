@@ -345,6 +345,11 @@ public:
     Result prefill_chunk(const model::PrefillRequest& r) override {
         if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the prompt passes the context");
         if (Result s = settle(r.pos); !s.ok()) return s;
+        if (m_.line) {   // a long prompt across the cards
+            std::string err;
+            if (prompt_line_read(*m_.line, m_, st_, r.tokens, r.n_tokens, r.pos, r.progress, r.stop, err)) return {};
+            if (!err.empty()) return fail(err);
+        }
         std::vector<int32_t> pos3;
         for (int at = 0; at < r.n_tokens;) {
             const int n = std::min(kChunk, r.n_tokens - at);

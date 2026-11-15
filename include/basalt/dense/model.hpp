@@ -134,6 +134,15 @@ using ModelPtr = std::unique_ptr<Model, ModelDeleter>;
 /// sessions (at most kWindow rows in all) run as one batch through `ModelSession::decode_batch`.
 ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::string& err);
 std::unique_ptr<model::ModelSession> make_session(Model& m, std::string& err);
+/// Layers a prompt line's card holds (the last ones): the most any prompt's split puts there.
+constexpr int kPromptLineLayers = 20;
+/// The prompt line: CUDA device `dev` reads the last layers of long prompts' chunks while the main card reads the next
+/// chunk's first layers.  `w` holds the weights of layers [l_min, n_layers) on `dev` (the others empty).  Called with the
+/// main card current, before any session is made.
+bool attach_prompt_line(Model& m, int dev, int l_min, const Weights& w, std::string& err);
+/// Main-card bytes a prompt line keeps (its hand-off buffers and the drafter features it holds back); 0 when a context of
+/// `max_context` cells is too short for one.
+uint64_t prompt_line_main_bytes(const Geometry& g, const BlockDrafter& drafter, int64_t max_context);
 /// Device bytes one session takes (its KV cells, recurrent states and window rows).
 uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8 = false);
 /// Device bytes the model's shared scratch takes.
