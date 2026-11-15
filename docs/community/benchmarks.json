@@ -2217,6 +2217,49 @@
       "draft_len_struct": 14.0,
       "draft_len_prose": 5.2,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+    },
+    {
+      "submitter": "gweyer-dual5090",
+      "date": "2026-11-14",
+      "commit": "71be0a452b",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 550,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 14.5
+        },
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 550,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 14.5
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "AMD Ryzen 9 5950X, 16 cores",
+      "ram_gbps": 48.3,
+      "os": "Linux",
+      "quant": "IQ1_M",
+      "kv": "int8",
+      "prefill_16k_tps": 8032.8,
+      "prefill_64k_tps": 11555.6,
+      "decode_tps": 655.9,
+      "decode_conv_tps": 460.0,
+      "decode_struct_tps": 790.9,
+      "decode_prose_tps": 390.6,
+      "accept_conv_pct": 69.3,
+      "accept_struct_pct": 94.3,
+      "accept_prose_pct": 64.3,
+      "draft_len_conv": 2.7,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
+      "notes": "Peer access on between the two 5090s (patched open-driver build, P2P verified with data check)."
     }
   ]
 }
