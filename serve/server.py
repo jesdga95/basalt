@@ -273,6 +273,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     svc.min_free_vram_mib = a.min_free_vram_mib or 0
     svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
     svc.answer_room = a.answer_room
+    svc.reasoning_effort = a.reasoning_effort
     svc.thinking_loop_tokens = a.thinking_loop_tokens
     svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
     svc.gpu_index = svc.gpu_indices[0]

@@ -157,6 +157,32 @@ class Budget(unittest.TestCase):
                     with self.subTest(room=room, req=req, cap=cap):
                         self.assertIsNone(svc.answer_budget(req, cap, None))
 
+    def test_server_default_effort(self):
+        svc = qwen_service()
+        msgs = [{"role": "user", "content": "hi"}]
+        def ids(**req):
+            m, tools, kw = openai_to_messages({"messages": msgs, **req})
+            return svc.encode_prompt(m, tools, kw)
+        unset, medium, high, off = ids(), ids(reasoning_effort="medium"), ids(reasoning_effort="high"), \
+            ids(chat_template_kwargs={"enable_thinking": False})
+        self.assertNotEqual(unset, medium)
+        svc.reasoning_effort = "medium"
+        self.assertEqual(ids(), medium)                                   # a request that names none gets the default
+        self.assertEqual(ids(reasoning_effort="high"), high)              # a named effort, or thinking off, wins
+        self.assertEqual(ids(chat_template_kwargs={"enable_thinking": False}), off)
+        self.assertEqual(ids(reasoning_budget=-1), ids(reasoning_effort="max"))    # a budget names its own level
+        svc.reasoning_effort = "none"
+        self.assertEqual(ids(), off)
+        self.assertFalse(svc.prepare(msgs, None, {})[1])                  # and the reply is not a thinking one
+
+    def test_server_default_effort_flag(self):
+        from serve.config import build_parser
+        ap = build_parser()
+        self.assertIsNone(ap.parse_args([]).reasoning_effort)
+        self.assertEqual(ap.parse_args(["--reasoning-effort", "Medium"]).reasoning_effort, "medium")
+        with self.assertRaises(SystemExit):
+            ap.parse_args(["--reasoning-effort", "lots"])
+
     def test_token_budget_fields(self):
         svc = qwen_service()
         for req, want in (({"reasoning_budget": 500}, 500), ({"reasoning_budget": -1}, None), ({"reasoning_budget": 0}, None),

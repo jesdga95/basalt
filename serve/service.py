@@ -13,7 +13,7 @@ from typing import Iterator
 
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.engine.mock import Engine
-from serve.frontend import ChatTemplate, Event, images_of, mark_think_literals, media_of, unmark_think_literals
+from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
@@ -148,6 +148,7 @@ class Service:
         self.vram_reserve = None                         # last POST /v1/vram reserve (None: the start's)
         self.reasoning_budget_tokens = 0                 # default thinking budget (0: none)
         self.answer_room: str | int = "auto"             # answer reserve when thinking: "auto" or a fixed token count (0: none)
+        self.reasoning_effort: str | None = None         # effort for a request that names none (None: the template's)
         self.thinking_loop_tokens = 256                  # one token repeated this often in the thinking ends it (0: off)
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = {t for s in self.dialect.stop_texts for t in tokenizer.encode(s, parse_special=True)}
@@ -776,10 +777,18 @@ class Service:
             return prompt, []
         return unmark_think_literals(prompt, self.literals)
 
+    def thinking_kwargs(self, kwargs: dict) -> dict:
+        """The request's template kwargs, with the server's default effort when it names no effort and no thinking
+        switch (a request's budget already named a level)."""
+        if self.reasoning_effort is None or "reasoning_effort" in kwargs or "enable_thinking" in kwargs:
+            return kwargs
+        return {**kwargs, **effort_kwargs(self.reasoning_effort)}
+
     def encode_prompt(self, messages, tools, kwargs, videos=None) -> list[int]:
         """The rendered, tokenized prompt (see render_text). `videos`: the text standing for each video in prompt order,
         put in place of the template's marker before the prompt is tokenized, so its timestamps are tokenized with the
         text around them as the reference processor's are."""
+        kwargs = self.thinking_kwargs(kwargs)
         prompt, plain = self.render_text(messages, tools, kwargs)
         if videos is not None:
             prompt, plain = self._splice_videos(prompt, plain, videos)
@@ -846,6 +855,7 @@ class Service:
         prompt; with thinking, run() writes it once the thinking is over.  `image_access`: what this request's
         connection may name as an image; without one, the remote policy."""
         self.embeddings.path = None
+        kwargs = self.thinking_kwargs(kwargs)
         try:
             return self._prepare(messages, tools, kwargs, max_new, force, image_access or self.image_sources)
         except BaseException:
