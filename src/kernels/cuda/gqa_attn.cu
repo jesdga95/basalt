@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include "basalt/log.hpp"
@@ -869,17 +870,29 @@ __global__ void __launch_bounds__(HD) prompt_i8_merge_kernel(const float* __rest
     io_st1(out + ((int64_t) t * n_head + head) * HD + d, den > 0.0f ? num / den : 0.0f);
 }
 
+// the current device, for a per-device shared-memory opt-in
+int opt_in_device() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) {
+        basalt::log::error("basalt", "gqa_prompt_attn: device %d out of range", dev);
+        std::exit(1);
+    }
+    return dev;
+}
+
 template <int W, bool Split, class IO = float>
 void launch_prompt_i8(const IO* q, int n_head, int n_kv, int pos0, int T, IO* out, KvInt8 q8, int splits,
                       float* scratch, cudaStream_t st) {
-    static bool raised = false;
-    if (!raised) {
+    static std::atomic<bool> raised[64];   // the shared-memory opt-in is per device
+    const int dev = opt_in_device();
+    if (!raised[dev].load(std::memory_order_acquire)) {
         if (cudaFuncSetAttribute(prompt_i8_kernel<W, Split, IO>, cudaFuncAttributeMaxDynamicSharedMemorySize, i8_smem<W>()) !=
             cudaSuccess) {
             basalt::log::error("basalt", "gqa_prompt_attn: shared-memory opt-in failed");
             std::exit(1);
         }
-        raised = true;
+        raised[dev].store(true, std::memory_order_release);
     }
     float* rows = scratch;
     float2* stats = reinterpret_cast<float2*>(scratch + (size_t) splits * T * n_head * HD);
@@ -898,10 +911,11 @@ void launch_prompt_i8(const IO* q, int n_head, int n_kv, int pos0, int T, IO* ou
 struct I8Plan {
     int warps = 8, splits = 1;
 };
+std::atomic<int> plan_device{-1};   // gqa_prompt_plan_device
 I8Plan plan_prompt_i8(int n_head, int64_t T, int64_t cells, size_t split_floats) {
     constexpr int kMaxSplits = 8;
-    int dev = 0, sms = 0;
-    cudaGetDevice(&dev);
+    int dev = plan_device.load(std::memory_order_relaxed), sms = 0;
+    if (dev < 0) cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
     sms = std::max(sms, 1);
     const auto waves = [&](int64_t blocks) { return (double) ((blocks + sms - 1) / sms); };
@@ -995,6 +1009,8 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
     else launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream);
 }
 
+void gqa_prompt_plan_device(int device) { plan_device.store(device, std::memory_order_relaxed); }
+
 size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits) {
     return (size_t) splits * T * n_head * (HD + 2);   // the splits' rows, then their (max, sum) pairs
 }
@@ -1030,14 +1046,15 @@ void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
         else if (p.splits == 1) launch_prompt_i8<8, false>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, 1, nullptr, st);
         else launch_prompt_i8<8, true>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, p.splits, split_scratch, st);
     } else {
-        static bool raised = false;
-        if (!raised) {
+        static std::atomic<bool> raised[64];   // the shared-memory opt-in is per device
+        const int dev = opt_in_device();
+        if (!raised[dev].load(std::memory_order_acquire)) {
             if (cudaFuncSetAttribute(prompt_f16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(PromptSmem16)) !=
                 cudaSuccess) {
                 basalt::log::error("basalt", "gqa_prompt_attn: shared-memory opt-in failed");
                 std::exit(1);
             }
-            raised = true;
+            raised[dev].store(true, std::memory_order_release);
         }
         const int pb = PROWS / (n_head / n_kv);
         const dim3 grid((unsigned) ((T + pb - 1) / pb), (unsigned) n_kv);
