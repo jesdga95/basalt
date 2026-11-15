@@ -308,16 +308,48 @@ uint64_t session_host_bytes(const Geometry& g, int64_t max_context, bool kv_int8
     return (uint64_t) (max_context - resident_cells(max_context, kv_resident)) * g.attn_layers() * cell_bytes(g, kv_int8);
 }
 
-uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8, int64_t kv_resident) {
-    const uint64_t C = (uint64_t) g.conv_channels();
-    const uint64_t gdn = (uint64_t) g.gdn_layers() *
-                         (2 * ((uint64_t) g.gdn_state * g.gdn_v_heads * g.gdn_state + C * 3) +
-                          kWindow * (2 * C + 2 * (uint64_t) g.gdn_v_heads)) * 4;
-    const uint64_t cell16 = cell_bytes(g, false);
-    const uint64_t kv = (uint64_t) resident_cells(max_context, kv_resident) * g.attn_layers() * cell_bytes(g, kv_int8) +
-                        (uint64_t) max_context * (mtp ? cell16 : 0) + (uint64_t) g.attn_layers() * 4 * 256;
-    const uint64_t drafter = mtp ? ((uint64_t) (kWindow + 3) * g.n_embd + g.n_vocab + (uint64_t) kWindow * 64) * 4 : 0;
-    return gdn + kv + drafter + (uint64_t) kWindow * g.n_vocab * 4 + 64 * 256;
+uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, bool kv_int8, int64_t kv_resident) {
+    if (g.kinds[(size_t) il] == Mixer::Gdn) {
+        const uint64_t C = (uint64_t) g.conv_channels();
+        return (2 * ((uint64_t) g.gdn_state * g.gdn_v_heads * g.gdn_state + C * 3) + kWindow * (2 * C + 2 * (uint64_t) g.gdn_v_heads)) * 4;
+    }
+    return (uint64_t) resident_cells(max_context, kv_resident) * cell_bytes(g, kv_int8) + 4 * 256;
+}
+
+uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8, int64_t kv_resident, int lb, int le) {
+    uint64_t b = 64 * 256;
+    for (int il = lb; il < (le > 0 ? le : g.n_layers); ++il) b += session_layer_bytes(g, il, max_context, kv_int8, kv_resident);
+    if (lb > 0) return b;
+    const uint64_t drafter = mtp ? (uint64_t) max_context * cell_bytes(g, false) + ((uint64_t) (kWindow + 3) * g.n_embd + g.n_vocab + (uint64_t) kWindow * 64) * 4
+                                 : 0;
+    return b + drafter + (uint64_t) kWindow * g.n_vocab * 4;
+}
+
+uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd) {
+    if (!bd.present) return 0;
+    return bd.layers.size() * 2 * (uint64_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 + (uint64_t) kWindow * (g.n_embd * 4 + 16) +
+           64 * 256;
+}
+
+SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
+                         uint64_t main_weights, SplitCard main_card, SplitCard peer_card) {
+    SplitInputs in;
+    const bool mtp = o.drafter == Drafter::Mtp;
+    in.layer = layer_weights;
+    in.slots = std::max(o.sessions, 1);
+    uint64_t layers = 0;
+    for (int il = 0; il < g.n_layers; ++il) {
+        in.per_slot.push_back(session_layer_bytes(g, il, o.max_context, o.kv_int8, o.kv_resident));
+        layers += in.per_slot.back();
+    }
+    const uint64_t slot_rest = session_bytes(g, o.max_context, mtp, o.kv_int8, o.kv_resident) - layers +
+                               (o.drafter == Drafter::Block ? block_session_bytes(g, bd) : 0);
+    const uint64_t scratch = shared_bytes(g, o.max_context, o.kv_int8, o.kv_resident);
+    in.main_fixed = main_weights + scratch + (uint64_t) in.slots * slot_rest + prompt_line_main_bytes(g, bd, o.max_context);
+    in.peer_fixed = scratch + 2ull * kChunk * g.n_embd * 2;   // its own scratch and the landing residuals
+    in.main = main_card;
+    in.peer = peer_card;
+    return in;
 }
 
 Model::~Model() {
@@ -464,10 +496,17 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         err = o.arch + ": " + e;
         return nullptr;
     }
-    int gi = 0, ai = 0;
-    for (Mixer k : g.kinds) {
-        m->gdn_index.push_back(k == Mixer::Gdn ? gi++ : -1);
-        m->attn_index.push_back(k == Mixer::Attention ? ai++ : -1);
+    m->lb = o.layer_begin;
+    m->le = o.layer_end > 0 ? o.layer_end : g.n_layers;
+    if (m->lb < 0 || m->lb >= m->le || m->le > g.n_layers) {
+        err = o.arch + ": layers " + std::to_string(m->lb) + "-" + std::to_string(m->le - 1) + " of " + std::to_string(g.n_layers);
+        return nullptr;
+    }
+    for (int il = 0; il < g.n_layers; ++il) {
+        const bool here = il >= m->lb && il < m->le;
+        const Mixer k = g.kinds[(size_t) il];
+        m->gdn_index.push_back(here && k == Mixer::Gdn ? m->n_gdn++ : -1);
+        m->attn_index.push_back(here && k == Mixer::Attention ? m->n_attn++ : -1);
     }
     if (o.vision) {   // the projector stays in page-locked RAM; each request's pictures take it to the card
         m->mmproj = std::make_unique<vision::Mmproj>();

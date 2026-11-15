@@ -574,7 +574,7 @@ void mtp_input(Model& m, const float* emb, const float* hid, float* cat, int n, 
 void commit_window(Model& m, SessionState& st, int n, cudaStream_t s) {
     const Geometry& g = m.g;
     const int C = g.conv_channels();
-    if (g.gdn_layers() == 0 || n <= 0) return;
+    if (m.n_gdn == 0 || n <= 0) return;
     cudaMemcpyAsync(st.n_keep, &n, sizeof(int32_t), cudaMemcpyHostToDevice, s);
     kernels::GdnCommitLayers a;
     a.state = st.gdn;
@@ -588,7 +588,7 @@ void commit_window(Model& m, SessionState& st, int n, cudaStream_t s) {
     a.C = C;
     a.h_k = g.gdn_k_heads;
     a.h_v = g.gdn_v_heads;
-    a.n_layers = g.gdn_layers();
+    a.n_layers = m.n_gdn;
     a.n_keep = st.n_keep;
     kernels::gdn_commit_layers(a, s, 64, n);
 }
@@ -608,7 +608,7 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
     const BlockDrafter& bd = m.bd_dec;
     const bool block = m.o.drafter == Drafter::Block;
     size_t next_target = 0;
-    for (int il = 0; il < g.n_layers; ++il) {
+    for (int il = m.lb; il < m.le; ++il) {
         const Layer& L = w.layers[(size_t) il];
         if (L.kind == Mixer::Gdn) {
             win_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
@@ -751,7 +751,7 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
         const BlockDrafter& bd = m.bd_dec;
         const bool block = m.o.drafter == Drafter::Block;
         size_t next_target = 0;
-        for (int il = 0; il < g.n_layers; ++il) {
+        for (int il = m.lb; il < m.le; ++il) {
             const Layer& L = w.layers[(size_t) il];
             if (L.kind == Mixer::Gdn) batch_gdn(m, L, m.gdn_index[(size_t) il], segs, S, rows, max_n, s);
             else batch_attn(m, L, m.attn_index[(size_t) il], segs, S, rows, s);

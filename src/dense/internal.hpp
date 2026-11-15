@@ -125,7 +125,9 @@ public:
     cudaStream_t stage_side = nullptr;
     cudaEvent_t stage_free = nullptr, stage_ready = nullptr;
     std::unique_ptr<prefill::mmq::Context> mmq;
-    std::vector<int> gdn_index, attn_index;      // per layer: its index among the GDN or attention layers (-1)
+    int lb = 0, le = 0;                          // the layers this card runs: [lb, le)
+    int n_gdn = 0, n_attn = 0;                   // the GDN and attention layers among them
+    std::vector<int> gdn_index, attn_index;      // per layer: its index among the card's GDN or attention layers (-1)
     // the batch windows' graphs, one per composition (the sessions in the window and their rows), the least recently used out
     using BatchKey = std::vector<std::pair<const SessionState*, int>>;
     struct BatchGraph {

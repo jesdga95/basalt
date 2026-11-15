@@ -54,7 +54,7 @@ public:
             block_bytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
                           (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
         }
-        const uint64_t dev_bytes = session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8, m_.o.kv_resident);
+        const uint64_t dev_bytes = session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8, m_.o.kv_resident, m_.lb, m_.le);
         if (!st_.arena.reserve(dev_bytes + block_bytes)) {
             err = m_.o.arch + ": out of device memory for a session of " + std::to_string((long long) m_.o.max_context) +
                   " cells (" + std::to_string((unsigned long long) (dev_bytes >> 20)) + " MiB); lower --max-context or --parallel";
@@ -62,7 +62,7 @@ public:
         }
         const size_t C = (size_t) g.conv_channels(), HV = (size_t) g.gdn_v_heads;
         st_.gdn_floats = (size_t) g.gdn_state * HV * g.gdn_state + C * 3;
-        const size_t ng = (size_t) g.gdn_layers();
+        const size_t ng = (size_t) m_.n_gdn;
         if (ng) {
             st_.gdn = st_.gdn_first = st_.arena.take<float>(ng * st_.gdn_floats);
             st_.gdn_alt = st_.arena.take<float>(ng * st_.gdn_floats);
@@ -76,8 +76,8 @@ public:
         const int64_t near_cells = resident_cells(m_.o.max_context, m_.o.kv_resident);
         const size_t n_near = (size_t) near_cells * g.n_kv * g.head_dim, n_far = cells - n_near;
         uint8_t* host = nullptr;
-        if (n_far > 0 && g.attn_layers() > 0) {
-            const uint64_t hb = session_host_bytes(g, m_.o.max_context, m_.o.kv_int8, m_.o.kv_resident);
+        if (n_far > 0 && m_.n_attn > 0) {
+            const uint64_t hb = session_host_bytes(g, m_.o.max_context, m_.o.kv_int8, m_.o.kv_resident) / (uint64_t) g.attn_layers() * m_.n_attn;
             if (cudaHostAlloc(&st_.far_host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
                 cudaGetLastError();
                 st_.far_host = nullptr;
@@ -102,7 +102,7 @@ public:
                 host = (uint8_t*) (f.v + n_far);
             }
         };
-        for (int i = 0; i < g.attn_layers(); ++i) {
+        for (int i = 0; i < m_.n_attn; ++i) {
             kernels::KvInt8 q8;
             st_.far_kv.emplace_back();
             if (n_far > 0) far_view(st_.far_kv.back());
@@ -461,7 +461,7 @@ public:
     static constexpr size_t kHeadBytes = 4 * sizeof(int64_t);
     size_t block_ring_bytes() const { return (size_t) st_.dctx_cap * m_.w.dflash.n_kv * m_.w.dflash.head_dim * sizeof(uint16_t); }
     size_t running_bytes() const override {
-        return kHeadBytes + (size_t) g_.gdn_layers() * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
+        return kHeadBytes + (size_t) m_.n_gdn * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
                (block_ ? st_.dk.size() * 2 * block_ring_bytes() : 0);
     }
 
@@ -476,7 +476,7 @@ public:
             s.head.assign(kHeadBytes, 0);
         }
         s.regions.clear();
-        if (const size_t n = (size_t) g_.gdn_layers() * st_.gdn_floats * 4) s.regions.push_back({st_.gdn, n});
+        if (const size_t n = (size_t) m_.n_gdn * st_.gdn_floats * 4) s.regions.push_back({st_.gdn, n});
         if (drafter_) s.regions.push_back({st_.tail, (size_t) g_.n_embd * 4});
         if (block_)
             for (size_t l = 0; l < st_.dk.size(); ++l) {
@@ -507,7 +507,7 @@ public:
     size_t row_bytes(bool int8) const { return (size_t) g_.n_kv * g_.head_dim * (int8 ? 1 : 2); }
     size_t cells_bytes(int64_t positions) const override {
         const size_t main = m_.o.kv_int8 ? 2 * (row_bytes(true) + row_bytes(true) / 32) : 2 * row_bytes(false);
-        return (size_t) positions * ((size_t) g_.attn_layers() * main + (drafter_ ? 2 * row_bytes(false) : 0));
+        return (size_t) positions * ((size_t) m_.n_attn * main + (drafter_ ? 2 * row_bytes(false) : 0));
     }
 
     Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
@@ -657,8 +657,8 @@ private:
             st_.dctx_from = 0;
             wide_ = false;
             st_.alt_ready = false;
-            if (g_.gdn_layers() &&
-                cudaMemsetAsync(st_.gdn, 0, (size_t) g_.gdn_layers() * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
+            if (m_.n_gdn &&
+                cudaMemsetAsync(st_.gdn, 0, (size_t) m_.n_gdn * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
                 return fail("clearing the recurrent state failed");
             return {};
         }
@@ -675,7 +675,7 @@ private:
         const bool swap = st_.alt_ready && T == 1 && n == 1;
         st_.alt_ready = false;
         if (swap) std::swap(st_.gdn, st_.gdn_alt);   // the window left its state after the row: nothing to commit
-        if (g_.gdn_layers() && n > 0 && !swap) {
+        if (m_.n_gdn && n > 0 && !swap) {
             cudaEventRecord(st_.fork, st_.stream);
             cudaStreamWaitEvent(st_.side, st_.fork, 0);
             commit_window(m_, st_, (int) n, st_.side);
