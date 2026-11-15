@@ -15,11 +15,13 @@
 #include "models/deepseek41/prefill_plan.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <utility>
 #include <vector>
 
 namespace basalt::models::deepseek41 {
