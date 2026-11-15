@@ -7,9 +7,11 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <utility>
 
 #include "basalt/log.hpp"
 
@@ -119,30 +121,43 @@ struct Plan {
     int tiles = 0, ks = 1, cps = 0, nchunks = 0, grid = 1;
 };
 
+std::atomic<int> plan_dev{-1};   // plan_device
+
+// the SM count of the device that plans (plan_device's, else the current one)
 int sm_count() {
-    static int n = [] {
-        int dev = 0, v = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev);
-        return v > 0 ? v : 1;
-    }();
-    return n;
+    static std::mutex mu;
+    static std::map<int, int> known;
+    int dev = plan_dev.load(std::memory_order_relaxed);
+    if (dev < 0) cudaGetDevice(&dev);
+    std::lock_guard<std::mutex> lock(mu);
+    const auto it = known.find(dev);
+    if (it != known.end()) return it->second;
+    int v = 0;
+    cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev);
+    return known[dev] = v > 0 ? v : 1;
 }
 
-// blocks of k that fit on the device at once (its smem allowance raised first)
+// blocks of k that fit on the planning device at once: its blocks per SM (the same on every card of the architecture,
+// read on the current one after raising the kernel's smem allowance there) times the planning device's SMs
 int resident(const Kernel& k) {
     static std::mutex mu;
-    static std::map<const void*, int> known;
-    std::lock_guard<std::mutex> lock(mu);
-    const auto it = known.find((const void*) k.fn);
-    if (it != known.end()) return it->second;
-    cudaFuncSetAttribute(k.fn, cudaFuncAttributeMaxDynamicSharedMemorySize, k.smem);
+    static std::map<std::pair<int, const void*>, int> known;   // per device and kernel: blocks per SM
+    int dev = 0;
+    cudaGetDevice(&dev);
     int per_sm = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k.fn, k.threads, k.smem);
-    check("window gemm: occupancy");
-    const int r = std::max(1, per_sm) * sm_count();
-    known[(const void*) k.fn] = r;
-    return r;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        const auto it = known.find({dev, (const void*) k.fn});
+        if (it != known.end()) {
+            per_sm = it->second;
+        } else {
+            cudaFuncSetAttribute(k.fn, cudaFuncAttributeMaxDynamicSharedMemorySize, k.smem);
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k.fn, k.threads, k.smem);
+            check("window gemm: occupancy");
+            per_sm = known[{dev, (const void*) k.fn}] = std::max(1, per_sm);
+        }
+    }
+    return per_sm * sm_count();
 }
 
 // An F8 call's warps per block (its K slices), from its shapes alone: more slices when its 16-row tiles are few
@@ -249,6 +264,8 @@ void norm_pack(const uint16_t* x, const float* w, float eps, int64_t K, int T, v
     launch_pdl(norm_pack_kernel<uint16_t>, dim3(T), dim3(kPackThreads), 0, (cudaStream_t) stream, x, w, eps, K, (uint16_t*) act, xn);
     check("window gemm: norm_pack");
 }
+
+void plan_device(int device) { plan_dev.store(device, std::memory_order_relaxed); }
 
 void workspace_need(const Call& c, std::size_t& partial_floats, std::size_t& tickets) {
     const Plan p = plan_for(c);
