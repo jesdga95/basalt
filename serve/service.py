@@ -583,12 +583,22 @@ class Service:
         return {"total": max(1, total), "active": max(0, min(max(1, total), running - waiting)),
                 "queue_depth": queued + waiting}
 
+    def _engine_slots(self, total: int) -> list[dict] | None:
+        """The engine's own slots (ProcessEngine.slot_view), when it has one per row; None otherwise."""
+        view = getattr(self.engine, "slot_view", None)
+        view = view() if callable(view) else None
+        return view if isinstance(view, list) and len(view) == total else None
+
     def slot_table(self) -> tuple[list[dict], list[dict]]:
-        """Per-slot rows and the waiting requests. The oldest running requests take the slots, each keeping its
-        slot until it ends; the rest of the live requests wait for admission."""
+        """Per-slot rows and the waiting requests. Row N is the engine's slot N when the engine says which request
+        runs where (an idle row then shows what its slot holds for the next turn); otherwise the oldest running
+        requests take the rows, each keeping its row until it ends. The rest of the live requests wait for
+        admission."""
         base = self.slot_stats()
         total, active = base["total"], base["active"]
         now = time.time()
+        view = self._engine_slots(total)
+        owners = {v["owner"]: b for b, v in enumerate(view or []) if v["owner"] is not None}
         with self.status_lock:
             if self.live_reqs:
                 live = [st for st, _ in self.live_reqs.values()]
@@ -597,7 +607,13 @@ class Service:
                 live = [self.status] if self.status.get("busy") else []
                 rates = {id(self.status): list(self.rate)}
             live.sort(key=lambda st: st.get("started") or 0)
-            running, waiting = live[:active], live[active:]
+            if owners:                                  # a request in no slot waits for one
+                running = [st for st in live if st.get("thread") in owners]
+                waiting = [st for st in live if st.get("thread") not in owners]
+                for st in running:
+                    st["slot"] = owners[st["thread"]]
+            else:
+                running, waiting = live[:active], live[active:]
             taken = {st["slot"] for st in running if st.get("slot") is not None and st["slot"] < total}
             for st in running:
                 if st.get("slot") is None or st["slot"] >= total:
@@ -621,6 +637,8 @@ class Service:
                    "prefill_done": 0, "reused": None, "ttft_s": None, "draft_len": None,
                    "ctx_used": held.get("ctx", 0), "drafts_offered": held.get("offered"),
                    "drafts_accepted": held.get("accepted")}       # draft counts are the slot's last finished request's
+            if view:
+                row["ctx_used"] = view[i]["held"]
             if i in by_slot:
                 st, rate = by_slot[i]
                 prompt, gen = int(st.get("prompt_tokens") or 0), int(st.get("generated") or 0)
@@ -1183,7 +1201,7 @@ class Service:
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  max_tokens=max_new, slot=None, reused=None,
+                                  max_tokens=max_new, slot=None, reused=None, thread=threading.get_ident(),
                                   api="anthropic" if path == "/v1/messages" else "openai",
                                   model=getattr(self.request_ctx, "model", None) or self.model)
                         if par:
