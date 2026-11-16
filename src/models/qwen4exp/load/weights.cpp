@@ -138,9 +138,9 @@ int weights(Context& context) {
     }
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
-    if (!o.cvec_files.empty()) {
+    if (o.cvec.given()) {
         std::string ce;
-        if (!cli::load_control_vectors(o, g, cvec_summary, ce)) {
+        if (!basalt::model::load_control_vectors(o.cvec, g.n_layers, g.n_embd, g.hc, "qwen4exp", cvec_summary, ce)) {
             basalt::log::error("basalt generate", "control vector: %s", ce.c_str());
             return 2;
         }

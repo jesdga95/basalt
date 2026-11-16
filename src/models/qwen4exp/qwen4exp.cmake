@@ -32,7 +32,6 @@ add_library(model_qwen4exp_kernels STATIC
   src/models/qwen4exp/kernels/kv_stream.cu
   src/models/qwen4exp/kernels/kv_q4.cu
   src/models/qwen4exp/kernels/fused_gr.cu
-  src/models/qwen4exp/kernels/cvec.cu
   src/models/qwen4exp/kernels/qsa_decode_attn.cu
   src/models/qwen4exp/kernels/qsa_dec_attn.cu
   src/models/qwen4exp/kernels/qsa_dec_fused.cu

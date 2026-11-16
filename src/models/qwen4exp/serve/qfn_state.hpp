@@ -10,7 +10,7 @@
 #include "loan_moves.hpp"
 #include "basalt/models/qwen4exp/options.hpp"
 #include "basalt/program/community_row.hpp"
-#include "basalt/models/qwen4exp/kernels/cvec.hpp"
+#include "basalt/kernels/cvec.hpp"
 #include "basalt/core/logit_bias.hpp"
 #include "basalt/program/grammar/guard.hpp"
 #include "basalt/core/device.hpp"
