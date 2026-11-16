@@ -1,6 +1,8 @@
 // src/program/serve/runtime.cpp - lifecycle of the persistent engine.
 #include "state.hpp"
 
+#include "basalt/core/on_device.hpp"
+
 namespace basalt::program::serve {
 
 void Runtime::start_guard() {
@@ -39,6 +41,47 @@ void Runtime::shed_if_low() {
     const uint64_t after = basalt::platform::available_memory();
     basalt::log::info("basalt serve", "RAM guard: free heap returned to the OS, %lld MiB free now (%+lld MiB)",
                       (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
+}
+
+void Runtime::ckd_finish() {
+    const void* dst = ckd.pending();
+    if (dst == nullptr) return;
+    std::string ce;
+    bool ok = ckd.finish(ce);
+    if (ckd_peer.pending()) {
+        const basalt::core::OnDevice on(ckd_peer_dev);
+        ok = ckd_peer.finish(ce) && ok;
+    }
+    if (ok) return;
+    basalt::log::error("basalt serve", "%s", ce.c_str());
+    checks.erase(std::remove_if(checks.begin(), checks.end(),
+                                [&](const ConvCheckpoint& k) { return k.state_a.data() == dst; }), checks.end());
+}
+
+bool Runtime::touch_check(int64_t to, ConvCheckpoint::Source source) {
+    for (ConvCheckpoint& c : checks)
+        if ((int64_t) c.ids.size() == to) {   // a turn end or the root outranks a stride that landed on it
+            c.used = ++check_clock;
+            if (source > c.source) c.source = source;
+            return true;
+        }
+    return false;
+}
+
+void Runtime::keep_check(ConvCheckpoint&& c) {
+    c.used = ++check_clock;
+    checks.push_back(std::move(c));
+    while ((int) checks.size() > o.prompt_cache) {
+        std::vector<uint64_t> stamps;
+        stamps.reserve(checks.size());
+        for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
+        const size_t victim = basalt::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), o.prompt_cache);
+        if (checks[victim].state_a.data() == ckd.pending()) {
+            ckd_finish();   // a failed save drops its own checkpoint: look again
+            continue;
+        }
+        checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+    }
 }
 
 int Runtime::execute() {

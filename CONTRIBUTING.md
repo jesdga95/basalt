@@ -1,6 +1,6 @@
 # Contributing to Basalt
 
-Basalt is an engine for mixture-of-experts models on NVIDIA Blackwell GPUs. Every rule below exists to keep its models fast and correct on that one target.
+Basalt is a local inference engine for NVIDIA Blackwell GPUs. Every rule below exists to keep its models fast and correct on that one target.
 
 ## Scope
 

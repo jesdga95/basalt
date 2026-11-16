@@ -13,7 +13,7 @@ from typing import Iterator
 
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.engine.mock import Engine
-from serve.frontend import ChatTemplate, Event, images_of, mark_think_literals, media_of, unmark_think_literals
+from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
@@ -76,7 +76,8 @@ class Service:
     def model_entry(self) -> dict:
         """This model's row in /v1/models."""
         value = "loading" if self.loading else "loaded" if self.loaded() else "unloaded"
-        return {"id": self.model, "object": "model", "status": {"value": value},
+        return {"id": self.model, "object": "model", "created": int(self.started_at), "owned_by": "basalt",
+                "status": {"value": value},
                 "asleep": getattr(self.engine, "asleep", False) is True,
                 "meta": {"n_ctx": self.engine.max_context},
                 "architecture": {"input_modalities": ["text", "image"] + (["video"] if self.video_on() else [])
@@ -147,6 +148,7 @@ class Service:
         self.vram_reserve = None                         # last POST /v1/vram reserve (None: the start's)
         self.reasoning_budget_tokens = 0                 # default thinking budget (0: none)
         self.answer_room: str | int = "auto"             # answer reserve when thinking: "auto" or a fixed token count (0: none)
+        self.reasoning_effort: str | None = None         # effort for a request that names none (None: the template's)
         self.thinking_loop_tokens = 256                  # one token repeated this often in the thinking ends it (0: off)
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = {t for s in self.dialect.stop_texts for t in tokenizer.encode(s, parse_special=True)}
@@ -775,10 +777,18 @@ class Service:
             return prompt, []
         return unmark_think_literals(prompt, self.literals)
 
+    def thinking_kwargs(self, kwargs: dict) -> dict:
+        """The request's template kwargs, with the server's default effort when it names no effort and no thinking
+        switch (a request's budget already named a level)."""
+        if self.reasoning_effort is None or "reasoning_effort" in kwargs or "enable_thinking" in kwargs:
+            return kwargs
+        return {**kwargs, **effort_kwargs(self.reasoning_effort)}
+
     def encode_prompt(self, messages, tools, kwargs, videos=None) -> list[int]:
         """The rendered, tokenized prompt (see render_text). `videos`: the text standing for each video in prompt order,
         put in place of the template's marker before the prompt is tokenized, so its timestamps are tokenized with the
         text around them as the reference processor's are."""
+        kwargs = self.thinking_kwargs(kwargs)
         prompt, plain = self.render_text(messages, tools, kwargs)
         if videos is not None:
             prompt, plain = self._splice_videos(prompt, plain, videos)
@@ -845,6 +855,7 @@ class Service:
         prompt; with thinking, run() writes it once the thinking is over.  `image_access`: what this request's
         connection may name as an image; without one, the remote policy."""
         self.embeddings.path = None
+        kwargs = self.thinking_kwargs(kwargs)
         try:
             return self._prepare(messages, tools, kwargs, max_new, force, image_access or self.image_sources)
         except BaseException:
@@ -1198,9 +1209,20 @@ class Service:
                         # next pass extends exactly what it holds and reads only the close
                         soft = threading.Event() if soft_stops else None
                         more = {"stop_soon": soft} if soft is not None else {}
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb,
+                        # A thinking budget caps the pass itself, so the engine stops on the budget's token and holds
+                        # exactly what was kept: the next pass extends its live state instead of reading the overshoot
+                        # again through the prompt path (which rounds differently from decoding).
+                        if thinking and not budget_ready and not isinstance(ids, PromptText):
+                            budget = self.answer_budget(budget_req, max_new, budget)
+                            budget_ready = True
+                        cap = max_new - n
+                        capped = bool(budget) and parser.state == "reasoning" and budget - thought < cap
+                        if capped:
+                            cap = max(1, budget - thought)
+                        gen = self.engine.generate(prompt, cap, sampling, cancel, embeddings=emb,
                                                    session=session, **more) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel, session=session, **more)
+                            else self.engine.generate(prompt, cap, sampling, cancel, session=session, **more)
+                        n_pass0 = n
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
                         looped = False                  # the wrap is for a repeated token, not the budget
                         asked = False                   # the wrap is the client's answer now
@@ -1322,6 +1344,11 @@ class Service:
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
+                        if drained and capped and not wrap and n - n_pass0 >= cap and n < max_new and not cancel.is_set():
+                            if parser.state == "reasoning" and thought >= budget and not parser.buf and not detok.pending():
+                                wrap = True             # the budget's last token: close the thinking
+                            else:                       # a split tag or character, or the thinking ended on it
+                                resumed = True
                         if drained and soft is not None and soft.is_set() and n < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and not parser.buf and not detok.pending():
                                 wrap = asked = True
@@ -1465,8 +1492,9 @@ class Service:
             yield "event", ev
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string
+        # prompt_tokens: the engine's count, now known; a text prompt's length before the engine reads it is an estimate
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                "timings": timings, "reasoning_tokens": thinking_n}
+                "timings": timings, "reasoning_tokens": thinking_n, "prompt_tokens": len(ids)}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done

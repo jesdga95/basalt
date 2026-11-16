@@ -2,7 +2,7 @@
 #include "record.hpp"
 #include "expert_plan.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
-#include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
+#include "basalt/kernels/gdn_window.hpp"
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -49,12 +49,12 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         goto gdn_done;
     }
     // conv, gates, recurrence, gated norm and the output's q8_1 in dec_gdn_rec's one or two launches; at
-    // 2/3 the z projection runs on the side stream beside the recurrence (dec_gdn.hpp)
+    // 2/3 the z projection runs on the side stream beside the recurrence (gdn_window.hpp)
     {
     // a batch window may take the fused recurrence where the qkv and z projections are one pair launch
     const bool pair_ok = kernels::dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&
                          ((uintptr_t) wqkv->native_data & 15) == 0 && ((uintptr_t) wg->native_data & 15) == 0;
-    const int gdnf = ((!v_.batch_rec_ || pair_ok) && N == 2560 && n <= kDecMaxT) ? dec_gdnf_mode() : 0;
+    const int gdnf = ((!v_.batch_rec_ || pair_ok) && N == 2560 && n <= kVerifyMaxT) ? dec_gdnf_mode() : 0;
     auto rec = [&](const DecRecArgs& ra) {
         if (v_.batch_rec_) dec_gdn_rec_seg(ra, v_.segb_, (size_t) gi * gdn_floats, n, n, cs);
         else dec_gdn_rec(ra, n, cs);

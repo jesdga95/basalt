@@ -48,6 +48,7 @@ class MaxTokens(unittest.TestCase):
         tok = ByteTokenizer()
         cls.engine = RecordingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
+        cls.svc.answer_room = 0     # no thinking budget: a thinking request's first pass would stop at it
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -177,6 +178,7 @@ class FitMaxTokens(unittest.TestCase):
         tok = ByteTokenizer()
         cls.engine = RecordingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), fit_max_tokens=True)
+        cls.svc.answer_room = 0     # no thinking budget: a thinking request's first pass would stop at it
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -2824,11 +2826,18 @@ class ThinkingEngine(MockEngine):
     def __init__(self, tok):
         super().__init__(tok, "x", max_context=CTX)
         self.prompts = []
+        self.caps = []          # each pass's max_new
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.prompts.append(list(ids))
-        done = self.tok.decode(ids).endswith("</think>\n\n")
-        text = self.ANSWER if done else self.THOUGHT + ("" if self.end_in_thought else "</think>\n\n" + self.ANSWER)
+        self.caps.append(max_new)
+        text = self.tok.decode(ids)
+        if text.endswith("</think>\n\n"):
+            text = self.ANSWER
+        else:   # a pass that continues an earlier one picks up where its prompt ends
+            full = self.THOUGHT + ("" if self.end_in_thought else "</think>\n\n" + self.ANSWER)
+            said = text.split("<think>\n")[-1] if "<think>\n" in text else ""
+            text = full[len(said):] if full.startswith(said) else full
         for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
             if cancel.is_set():
                 return
@@ -2886,7 +2895,17 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(code, 200, b)
         msg = b["choices"][0]["message"]
         self.assertEqual((msg["reasoning_content"], msg["content"]), (ThinkingEngine.THOUGHT, ThinkingEngine.ANSWER))
-        self.assertEqual(len(self.engine.prompts), 1)
+        self.assert_one_reply()
+
+    def assert_one_reply(self):
+        """Every pass after the first (the first stops at the thinking budget) extends the one before with exactly what
+        it wrote: nothing inserted, so the reply is the one a single pass gives."""
+        from serve.service import REASONING_CLOSE
+        ps = self.engine.prompts
+        for a, b in zip(ps, ps[1:]):
+            said = self.tok.decode(b[len(a):])
+            self.assertEqual(b[:len(a)], a)
+            self.assertNotIn(REASONING_CLOSE, said)          # the server closed nothing
 
     def test_cached_tokens_of_a_wrapped_up_request_come_from_its_first_pass(self):
         self.engine = CachingThinkingEngine(self.tok)
@@ -2912,6 +2931,22 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)   # a prefix + more
         self.assertEqual(b["usage"]["completion_tokens"], 20 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
         self.assertEqual(b["usage"]["prompt_tokens"], len(first))
+
+    def test_the_budget_caps_the_engine_pass(self):
+        """The first pass asks for the budget's tokens only, so the engine stops on its last one and the next pass
+        extends what it holds (an overshoot would be read again through the prompt path, which rounds differently)."""
+        code, b = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(self.engine.caps[0], 20)
+
+    def test_a_thinking_shorter_than_the_budget_answers_as_one_reply(self):
+        """The thinking ends inside the capped pass: the answer goes on in a further pass, unchanged."""
+        code, b = self.openai(reasoning_budget_tokens=len(ThinkingEngine.THOUGHT) + 5)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual((msg["reasoning_content"], msg["content"]), (ThinkingEngine.THOUGHT, ThinkingEngine.ANSWER))
+        self.assertEqual(self.engine.caps[0], len(ThinkingEngine.THOUGHT) + 5)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
 
     def test_a_token_repeated_in_the_thinking_ends_it(self):
         """256 of one token in a row inside the thinking: the thinking is ended and the model answers."""
@@ -3142,7 +3177,7 @@ class ThinkingBudget(unittest.TestCase):
     def test_a_budget_the_thinking_stays_under(self):
         code, b = self.openai(reasoning_budget_tokens=10_000)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
-        self.assertEqual(len(self.engine.prompts), 1)
+        self.assert_one_reply()
 
     def test_the_config_default_and_a_request_that_turns_it_off(self):
         self.svc.reasoning_budget_tokens = 20                          # what --reasoning-budget-tokens sets

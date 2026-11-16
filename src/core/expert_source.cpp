@@ -854,11 +854,29 @@ bool FileExpertSource::pin_cache_complement(
             budget_bytes = room;
         }
     }
+    // The free places after the experts (see set_spares).  A swap takes a place of its layer's blob size and gives one
+    // of the same size back, so each size keeps its own share of the n places: its layers' share, at least 8.
+    std::vector<std::pair<uint64_t, int64_t>> spare_sizes;   // (blob bytes, places)
+    uint64_t spare_bytes = 0;
+    if (spares_want_ > 0 && n_layers_ > 0) {
+        for (const uint64_t b : layer_blob_bytes_) {
+            if (b == 0) continue;
+            auto it = std::find_if(spare_sizes.begin(), spare_sizes.end(), [&](const auto& x) { return x.first == b; });
+            if (it == spare_sizes.end()) spare_sizes.emplace_back(b, 1);
+            else ++it->second;
+        }
+        for (auto& [b, n] : spare_sizes) {
+            n = std::max<int64_t>(8, (spares_want_ * n + n_layers_ - 1) / n_layers_);
+            spare_bytes += (uint64_t) n * b;
+        }
+    }
+
     uint64_t lend_cap = std::numeric_limits<uint64_t>::max();   // the RAM the lend region and the spares may fill up to
-    const uint64_t lend_room = what_fits ? 0 : detail::budget_lend_room(budget_bytes, bytes);
+    const uint64_t lend_room = what_fits ? 0 : detail::budget_lend_room(budget_bytes, bytes + spare_bytes);
     if (lend_room > 0) {
-        // the budget holds every expert of the complement: none is left to the files, and the prompt path's lend
-        // region is kept in what the budget has left
+        // the budget holds every expert of the complement and the free places for the adaptive swaps: none is left to
+        // the files, and the prompt path's lend region is kept in what the budget has left (a budget that holds the
+        // experts but not the free places keeps them as before: the swaps would lose their places, #342, #366)
         basalt::log::info("basalt", "FileExpertSource: RAM budget %.2f GiB holds the %.2f GiB of experts the GPU cache does "
                              "not hold; the prompt path's lend region takes the rest of it",
                      (double) budget_bytes / 1073741824.0, (double) bytes / 1073741824.0);
@@ -913,23 +931,6 @@ bool FileExpertSource::pin_cache_complement(
             return false;
         }
     }
-    // The free places after the experts (see set_spares).  A swap takes a place of its layer's blob size and gives one
-    // of the same size back, so each size keeps its own share of the n places: its layers' share, at least 8.
-    std::vector<std::pair<uint64_t, int64_t>> spare_sizes;   // (blob bytes, places)
-    uint64_t spare_bytes = 0;
-    if (spares_want_ > 0 && n_layers_ > 0) {
-        for (const uint64_t b : layer_blob_bytes_) {
-            if (b == 0) continue;
-            auto it = std::find_if(spare_sizes.begin(), spare_sizes.end(), [&](const auto& x) { return x.first == b; });
-            if (it == spare_sizes.end()) spare_sizes.emplace_back(b, 1);
-            else ++it->second;
-        }
-        for (auto& [b, n] : spare_sizes) {
-            n = std::max<int64_t>(8, (spares_want_ * n + n_layers_ - 1) / n_layers_);
-            spare_bytes += (uint64_t) n * b;
-        }
-    }
-
     // The prompt path's lend region: its slots' experts are streamed from here during a prompt and copied back into
     // their slots after it, so the ones that fit next to the free places are kept here too (from the last slot down:
     // a short prompt lends only the last few).  The rest keep the mapped-file fallback.

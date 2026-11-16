@@ -5,8 +5,10 @@
 // never includes a model's headers, and models never include each other (tools/check_model_layering.sh).
 #pragma once
 
+#include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/model/rope_flags.hpp"
 #include "basalt/program/grammar/tool_form.hpp"
 
 #include <cstdint>
@@ -95,6 +97,10 @@ struct LoadRequest {
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
+    RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
+    int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
+    std::vector<double> card_gbps;    ///< memory bandwidth of the main card, then of each peer device (GB/s, 0: unknown)
+    int diag_split_at = 0;            ///< diagnostic: a dense model's layers split at this one across two cards (0: off)
 };
 
 struct DecodeRequest {
@@ -109,6 +115,9 @@ struct DecodeRequest {
     const kernels::SamplerParams* sampling = nullptr;   ///< how next_token is drawn (null: greedy)
     const int32_t* history = nullptr; ///< per row, the last `history_len` tokens the pick follows (host), for the penalties
     int history_len = 0;
+    /// Rows 1 .. n_tokens-1 are the drafts the session's own drafter left last (draft_end), in order. A sampled window may
+    /// then keep each by the drafter's proposal (speculative sampling) instead of comparing it with its own draw.
+    bool drawn_drafts = false;
 };
 
 struct PrefillRequest {
@@ -125,12 +134,27 @@ struct PrefillRequest {
     bool more = false;                   ///< another part follows: the workspaces stay until end_prompt()
 };
 
+/// The merged tokens of an encoded picture or video group: `nx` across, `ny` down (0: placed as a sequence).
+struct ImageGrid {
+    int nx = 0, ny = 0;
+};
+
 /// Model-owned per-conversation state (recurrent state, KV, windows).
 class ModelSession {
 public:
     virtual ~ModelSession() = default;
     virtual Result decode_window(const DecodeRequest& r) = 0;
     virtual Result prefill_chunk(const PrefillRequest& r) = 0;
+    /// The rows a decode_batch call holds in all; 0: this model's sessions do not batch their windows.
+    virtual int batch_rows() const { return 0; }
+    /// The windows reqs[0..n) of the distinct sessions[0..n) (sessions of one model, this one among them) as one batch, the
+    /// model's weights read once: each session ends as after its own decode_window(reqs[i]). The windows' rows total at most
+    /// batch_rows().
+    virtual Result decode_batch(ModelSession* const* sessions, const DecodeRequest* reqs, int n) {
+        for (int i = 0; i < n; ++i)
+            if (Result r = sessions[i]->decode_window(reqs[i]); !r.ok()) return r;
+        return {};
+    }
     /// Takes the memory the session will hold (expert tiers), so the first request does not wait for it.
     virtual Result prepare() { return {}; }
     /// The prompt is read: workspaces a part kept with `more` go back.
@@ -141,9 +165,19 @@ public:
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
+    /// Whether the engine may fill a window with prompt-lookup drafts (CommonOptions::suffix_draft) in place of the
+    /// drafter's: any window's rows are verified the same way, so only speed changes.
+    virtual bool copy_drafts() const { return false; }
     /// Starts `n` drafts (at most max_window() - 1) after `anchor`, the token at position `pos`. The rows of the last window
     /// before `pos` were accepted.
     virtual Result draft_begin(int32_t anchor, int64_t pos, int n) { (void) anchor; (void) pos; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
+    /// draft_begin for `count` sessions of this model (peers[i] after anchors[i] at pos[i], n[i] drafts), in one pass where
+    /// the model can; each session's draft_end then reads its own.  The default starts each in turn.
+    virtual Result draft_batch(ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n, int count) {
+        for (int i = 0; i < count; ++i)
+            if (Result r = peers[i]->draft_begin(anchors[i], pos[i], n[i]); !r.ok()) return r;
+        return {};
+    }
     /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`.
     virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n) { (void) ids; (void) conf; (void) max_n; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
     /// Rows row0..row0+n of the last decoded window: picks[t]'s log probability and the row's `top` likeliest tokens,
@@ -151,15 +185,23 @@ public:
     virtual Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) { (void) row0; (void) n; (void) picks; (void) top; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
     /// The logits of row `row` of the last decoded window (n_vocab floats).
     virtual Result copy_logits(int row, float* out) { (void) row; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
-    /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now.
+    /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now,
+    /// left at -1 by a session with no cache to lend (it answers ok and SLEEP goes on to the driver). Without this the
+    /// model cannot sleep.
     virtual Result set_low_memory(bool low, int64_t& expert_slots) { (void) low; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
     /// What the session leaves free on the main card from now on (`mib` < 0: the start's reserve), through prompts and
     /// images too; its VRAM use is resized to that now. The slots it holds now.
     virtual Result set_vram_reserve(int64_t mib, int64_t& expert_slots) { (void) mib; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
-    /// The running state at position `pos`: what cannot be rewound. Positional state stays valid below it.
+    /// The running state at position `pos`: what cannot be rewound. Positional state stays valid below it.  Its size, which
+    /// a checkpoint's host buffer takes, and the device regions it lives in (packed in this order into the checkpoint's
+    /// bytes, the same list whatever the position) with the stream the session works on: the shared engine copies them
+    /// (basalt/core/checkpoint_transfer.hpp).  `save`: a checkpoint is about to be taken at `pos`; the session brings its
+    /// state to `pos` first, or refuses.
     virtual size_t running_bytes() const { return 0; }
-    virtual Result save_running(uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
-    virtual Result restore_running(const uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
+    virtual Result running_state(int64_t pos, bool save, core::RunningState& s) { (void) pos; (void) save; (void) s; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
+    /// The regions of running_state() hold a checkpoint's bytes again, `head` (its size as running_state gave it) the host
+    /// part saved with them: the session's own record of them follows.
+    virtual Result running_restored(int64_t pos, const uint8_t* head) { (void) pos; (void) head; return {}; }
     /// The positional state below `positions`, one entry per layer that holds any, in the store's K/V form: a layer's
     /// `page_size` is the positions behind one of its rows, `cells` its rows times that.  What a conversation parked
     /// out of VRAM takes along; a store cuts it at any position, so restore takes what a cut left.
@@ -179,17 +221,26 @@ public:
     virtual ExpertCounts expert_counts() const { return {}; }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
-    /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block). Rows with no
-    /// vision support leave the default.
-    virtual Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) {
-        (void) data; (void) bytes; (void) rows; (void) n_rows;
+    /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block), and its grid of
+    /// merged tokens when the model places rows by it (else {0, 0}). Rows with no vision support leave the default.
+    virtual Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, ImageGrid& grid) {
+        (void) data; (void) bytes; (void) rows; (void) n_rows; (void) grid;
         return {Status::NotImplemented, "this model takes no images"};
     }
+    /// For a model whose encoder reads the shared preprocessor's patches (basalt/vision/preprocess.hpp and video.hpp):
+    /// one picture's [n][768] or one two-frame video group's [n][1536] patch rows, in merge order, of a w x h canvas,
+    /// to n / 4 embedding rows.  What lets the server send it video.
+    virtual Result encode_patches(const std::vector<float>& patches, int w, int h, std::vector<float>& rows) {
+        (void) patches; (void) w; (void) h; (void) rows;
+        return {Status::NotImplemented, "this model reads no video"};
+    }
+    virtual bool reads_patches() const { return false; }
     /// A request's pictures are encoded: the encoder gives its memory back.
     virtual void images_done() {}
-    /// Feeds `n_rows` embedding rows (from encode_image) at positions pos.. instead of token embeddings.
-    virtual Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) {
-        (void) rows; (void) n_rows; (void) pos;
+    /// Feeds `n_rows` embedding rows (from encode_image) at positions pos.. instead of token embeddings; `grid` as
+    /// encode_image gave it.
+    virtual Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, ImageGrid grid) {
+        (void) rows; (void) n_rows; (void) pos; (void) grid;
         return {Status::NotImplemented, "this model takes no images"};
     }
 };
@@ -211,6 +262,8 @@ struct TokenNames {
     std::string turn;
     std::string image_pad;
     std::string video_pad;
+    /// The role word after `turn` that opens the model's own reply (empty: the turn token opens no reply).
+    std::string reply_role;
 };
 
 class FlagArgs;
@@ -245,6 +298,14 @@ public:
     virtual int quality_window() const { return 1; }
     /// The cards that may hold experts beside the main one.
     virtual int max_expert_cards() const = 0;
+    /// A model with no experts to put on a second card reads long prompts there instead (a prompt line, not an expert tier).
+    virtual bool second_card_reads_prompts() const { return false; }
+    /// Such a model with these flags does not fit its main card and splits its layers across the main card and the second
+    /// (a layer stage), given the two cards' memory bandwidth; asked once the run's cards are visible, before the load.
+    virtual bool second_card_runs_layers(const program::CommonOptions& o, double main_gbps, double peer_gbps) const {
+        (void) o; (void) main_gbps; (void) peer_gbps;
+        return false;
+    }
     virtual TokenNames token_names() const = 0;
     /// The pre-tokenizer's name in the pack's tokenizer.json and its rule.
     struct PreTokenizer {
@@ -272,6 +333,9 @@ const ModelAdapter* find_adapter(const std::string& arch);
 std::vector<std::string> adapter_names();
 /// The most expert cards any registered model takes: a card plan before a model is known.
 int max_expert_cards();
+/// Why no adapter serves `arch`: a Basalt model this build left out (what the build holds and the option that adds
+/// it), or an architecture Basalt does not have.
+std::string unavailable_architecture(const std::string& arch);
 /// The adapter for a file's `general.architecture`, or null with `err` set.
 const ModelAdapter* adapter_for(const GgufFile& meta, std::string& err);
 /// Replaces the old architecture guard: empty when the file belongs to a registered model and validates.

@@ -77,7 +77,7 @@ write always leaves 4 GiB of the volume free. After a restart, a prompt that sta
 ## Sleep: `--idle-sleep`
 
 After the given seconds without requests, the engine frees its VRAM (the driver moves the GPU state to host memory). The process and its
-RAM copy of the experts stay. The next request wakes it in seconds. Linux only. The server stays awake when the GPU state would not fit in
+RAM copy of the experts stay (a dense model has no cache to give back first: the driver moves all its GPU state, both cards' on two cards). The next request wakes it in seconds. Linux only. The server stays awake when the GPU state would not fit in
 free RAM with 8 GiB to spare. `--idle-unload` ends the process instead.
 
 ## Memory floors
@@ -117,7 +117,7 @@ images a request may name: [image sources](configuration/image-sources.md). An i
 
 ## Video
 
-With image input on, Qwen3.8-Flash-Next also reads video (DeepSeek does not). A user message names a video as it names an image, from
+With image input on, Qwen3.8-Flash-Next and Qwen3.8-27B read video (DeepSeek does not). A user message names a video as it names an image, from
 the same [sources](configuration/image-sources.md):
 
 | API | Part |
@@ -131,11 +131,11 @@ and `max_frames` (4 to 768). All frames are scaled to one size so the whole vide
 tokens), and each pair of frames is read as one picture with its time in the prompt. Audio and rotation metadata are not read: a
 phone's portrait clip arrives sideways.
 
-Decoding uses FFmpeg 6, 7 or 8 from the machine ([platforms](platforms.md#ffmpeg-for-video)). At start the server prints
+Decoding uses FFmpeg 6, 7, 8 or 9 from the machine ([platforms](platforms.md#ffmpeg-for-video)). At start the server prints
 `video  on, FFmpeg 8 (...)`, or `video  off` with the reason, and then a video is refused with that reason. A video may be 1 GiB.
 
-Frames decode on the encoder's GPU with NVDEC (H.264, HEVC, AV1, VP9 and the older codecs FFmpeg's NVDEC takes); a stream NVDEC
-refuses decodes on the CPU, with the same pixels. With `dynamic` the expert cache lends NVDEC the memory for the decode when no
+Qwen3.8-Flash-Next's frames decode on the encoder's GPU with NVDEC (H.264, HEVC, AV1, VP9 and the older codecs FFmpeg's NVDEC takes); a stream NVDEC
+refuses decodes on the CPU, with the same pixels. Qwen3.8-27B's frames always decode on the CPU. With `dynamic` the expert cache lends NVDEC the memory for the decode when no
 reply is running (tens of ms to lend and refill); beside a running reply the video decodes on the CPU, and the reply keeps going
 until the frames are encoded. Another question about the same video, in the same chat or a new one, starts from the video
 already read.

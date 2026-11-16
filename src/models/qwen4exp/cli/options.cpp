@@ -3,7 +3,7 @@
 #include "../../../program/cli/help.hpp"
 
 #include "basalt/core/model_file.hpp"
-#include "basalt/models/qwen4exp/kernels/rope_scaling.hpp"
+#include "basalt/model/rope_flags.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/qwen4exp/options.hpp"
@@ -89,8 +89,7 @@ std::optional<int> prepare_input_options(Options& o) {
     return std::nullopt;
 }
 
-std::optional<int> validate_generation_options(const Options& o, bool multi_gpu, int min_vram_reserve_mib,
-                                              basalt::kernels::RopeScaling& rope_cfg) {
+std::optional<int> validate_generation_options(const Options& o, bool multi_gpu, int min_vram_reserve_mib) {
     // positions, cells and pooled-block indices are cast to int32 on the device path.
     if (o.max_context > 2147483647LL - 8) {
         basalt::log::error("basalt generate", "--max-context must be below 2^31");
@@ -101,45 +100,7 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
         basalt::log::error("basalt generate", "positive --max-new and --max-context must fit the prompt and generation");
         return 2;
     }
-    // THE ROPE KNOBS (rope_scaling.hpp).  Anything invalid dies here, at second zero, rather than becoming a
-    // NaN angle inside one of the twelve QSA layers.  Only the RANGES are checked - the config itself is
-    // resolved after the model file has had its say, right before session_init.
-    {
-        using RST = basalt::kernels::RopeScalingType;
-        // an absent --rope-scaling (the empty default) leaves the type to the model file's rope keys,
-        // resolved below; anything present must be one of the three names
-        if (o.rope_scaling == "none") rope_cfg.type = RST::None;
-        else if (o.rope_scaling == "linear") rope_cfg.type = RST::Linear;
-        else if (o.rope_scaling == "yarn") rope_cfg.type = RST::YaRN;
-        else if (!o.rope_scaling.empty()) {
-            basalt::log::error("basalt generate", "--rope-scaling must be none, linear or yarn (got '%s')",
-                         o.rope_scaling.c_str());
-            return 2;
-        }
-        // every knob FINITE first: `atof("nan")` is NaN, and a NaN passes every range comparison below
-        for (const double v : {o.rope_scale, o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx, o.yarn_ext_factor,
-                               o.yarn_attn_factor, o.yarn_beta_fast, o.yarn_beta_slow})
-            if (!std::isfinite(v)) {
-                basalt::log::error("basalt generate", "a rope scaling knob is not a finite number (%g)", v);
-                return 2;
-            }
-        // 0 is the absent default; an explicit factor must extend, not shrink
-        if (o.rope_scale != 0 && o.rope_scale < 1.0) {
-            basalt::log::error("basalt generate", "--rope-scale %g must be >= 1 (it extends the context, not shrinks it)",
-                         o.rope_scale);
-            return 2;
-        }
-        if (o.rope_freq_base != 0 && o.rope_freq_base <= 1.0) {
-            basalt::log::error("basalt generate", "--rope-freq-base must be a base above 1 (0 = the model's)");
-            return 2;
-        }
-        if (o.rope_freq_scale < 0 || o.yarn_orig_ctx < 0 || o.yarn_ext_factor < -1.0 || o.yarn_attn_factor <= 0 ||
-            o.yarn_beta_fast <= 0 || o.yarn_beta_slow <= 0) {
-            basalt::log::error("basalt generate", "invalid rope scaling knob (see usage: --yarn-ext-factor <0 = auto, "
-                                 "--yarn-orig-ctx 0 = default, the rest positive)");
-            return 2;
-        }
-    }
+    if (const auto code = basalt::model::check_rope_flags(o.rope, "basalt generate")) return code;
     if (!std::isfinite(o.temperature) || o.temperature < 0 || !std::isfinite(o.top_p) ||
         o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 ||
         o.pool_workers < 0) {

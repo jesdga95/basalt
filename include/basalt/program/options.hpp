@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/model/rope_flags.hpp"
 #include "basalt/platform/memory.hpp"
 
 namespace basalt::program {
@@ -45,9 +46,17 @@ struct CommonOptions {
     /// every expert tier's device, the first one peer_device, and each card's memory bandwidth (GB/s, 0 unknown)
     std::vector<int> peer_devices;
     std::vector<double> peer_gbps;
+    double main_gbps = 0;         ///< the main card's memory bandwidth (GB/s, 0 unknown)
     int peer_reserve_mib = 600;
     bool no_prompt_skip = false;  ///< --no-prompt-skip: every prompt row through every layer
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
+    /// --rope-scaling, --rope-scale, --yarn-* ...: taken by the models that extend their context (basalt/model/rope_flags.hpp)
+    basalt::model::RopeFlags rope;
+    /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
+    /// VRAM), for the models that take it
+    int64_t kv_resident = 0;
+    /// --diag-split-at N: diagnostic, a dense model split across two cards at layer N whether or not it fits one (0: off)
+    int diag_split_at = 0;
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
     /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.
@@ -84,6 +93,11 @@ struct CommonOptions {
     /// 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for the exactness test).
     int spec = 0;
     bool spec_given = false;           ///< --spec on the command line
+    /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
+    /// edits, quoted input, tool-call JSON) by at least this many tokens, a window may hold what followed it there instead
+    /// of the drafter's drafts, where the draft policy expects it to pay (basalt/spec/draft_policy.hpp).  Read by the models
+    /// that take --suffix-draft; 0 = the drafter only.
+    int suffix_draft = 3;
     std::string spec_oracle;
     int draft_experts = 32;            ///< --draft-experts N: the drafter's routed experts each stage keeps (0: all)
     int drafter_device = -1;           ///< --diag-drafter-gpu N: the CUDA device it runs on (-1: the main card)
@@ -128,6 +142,9 @@ struct CommonOptions {
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
     int64_t turn_token = -1;
     bool turn_token_given = false;
+    /// The token of the role that opens the model's reply after turn_token (the template's TokenNames::reply_role; -1:
+    /// none): a boundary that opens the reply is the new turn's header, never the chain's root.
+    int64_t reply_role_token = -1;
     /// --serve (opt-in): the role token of a short turn the server puts right before the new assistant turn (the
     /// "system" of a trailing reasoning-effort turn).  When the turn before the last <|im_start|> opens with it,
     /// the checkpoint goes in front of that turn instead, so it holds the conversation and not the effort text.

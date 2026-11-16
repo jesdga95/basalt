@@ -60,6 +60,17 @@ class EngineCommand(unittest.TestCase):
         e.vram(None)
         self.assertEqual(e.proc.stdin.getvalue(), "VRAM\n")
 
+    def test_a_model_with_no_cache_answers_without_slots(self):
+        e = self.engine(["VRAM reserve_mib=-1 vram_free_mib=9000\n"])
+        e.info["expert_slots"] = 5
+        with mock.patch("serve.engine.process.suspend.suspend", return_value=None) as sus:
+            out = e.sleep()
+        sus.assert_called_once()
+        self.assertEqual(e.proc.stdin.getvalue(), "SLEEP\n")
+        self.assertTrue(e.asleep)
+        self.assertEqual((out["vram_free_mib"], "expert_slots" in out), (9000, False))
+        self.assertEqual(e.info["expert_slots"], 5)
+
     def test_refused_and_died(self):
         e = self.engine(["ERR VRAM needs an engine started with --vram-elastic\n"])
         with self.assertRaisesRegex(ValueError, "--vram-elastic"):

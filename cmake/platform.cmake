@@ -44,3 +44,10 @@ endif()
 add_library(model_file STATIC ${BASALT_CMAKE_ROOT}/src/core/model_file.cpp)
 target_include_directories(model_file PUBLIC ${BASALT_CMAKE_ROOT}/include)
 target_link_libraries(model_file PUBLIC platform warnings)
+
+# The executables a release ships go to <source>/bin for every generator. A plain RUNTIME_OUTPUT_DIRECTORY gets a
+# per-configuration subdirectory (bin/Release) from the multi-config generators (Visual Studio, Ninja Multi-Config),
+# and the engine finds data/ and its sibling programs relative to bin/; the generator expression stops that.
+function(basalt_ship_to_bin target)
+  set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${BASALT_CMAKE_ROOT}/bin>")
+endfunction()
