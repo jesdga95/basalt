@@ -549,7 +549,14 @@ bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout
     if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * n_embd_) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
         !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
         return false;
-    basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
+    // APR: a Hadamard-folded layer rotates its input before the q8_1 quantizer, never after
+    const auto& lay_hm = basalt::kernels::cpu::expert_layout();
+    const auto& fmt_hm = lay_hm.fmt[(size_t) layer];
+    if (fmt_hm.had_gu)
+        basalt::kernels::hadamard_q8_1_rows(d_x_, n_tok, n_embd_, fmt_hm.had_block,
+                                            basalt::kernels::native_expert_gu_signs(fmt_hm), d_q8_, s);
+    else
+        basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
     Meta* dm = (Meta*) d_meta_;
     basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
     basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,

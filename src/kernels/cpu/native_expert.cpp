@@ -9,12 +9,16 @@
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/hadamard.hpp"
+#include "basalt/kernels/cpu/tq_cpu.hpp"
 
 #include "basalt/ggml/ggml.h"
+#include "basalt/ggml/ggml_common_tq.h"
 
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace basalt::kernels::cpu {
 namespace {
@@ -73,48 +77,71 @@ void gu_rows_mixed(Rows rows, const NativeFmt& f, const uint8_t* blob, const voi
 
 }  // namespace
 
+// The trellis types are not in the vendored ggml: their geometry comes from ggml_common_tq.h, and their rows take
+// Q8_0 activations (tq_cpu.hpp).
+size_t tq_block_bytes(int type) {
+    switch (type) {
+        case 144: return sizeof(block_tq2_t);
+        case 145: return sizeof(block_tqk6);
+        case 146: return sizeof(block_tqk7);
+        case 147: return sizeof(block_tqp5);
+        case 148: return sizeof(block_tqp6);
+        case 149: return sizeof(block_tqp7);
+        default: return 0;
+    }
+}
+
+// a weight type's row bytes, block size and activation type; false when the CPU has no dot product for it
+bool weight_geometry(int type, int64_t n, size_t& row, int64_t& blck, int& act) {
+    if (tq_supported(type)) {
+        row = (size_t) (n / 128) * tq_block_bytes(type);
+        blck = 128;
+        act = (int) GGML_TYPE_Q8_0;
+        return true;
+    }
+    if (type < 0 || type >= (int) GGML_TYPE_COUNT) return false;
+    const ggml_type_traits_cpu* t = traits(type);
+    if (t == nullptr || t->vec_dot == nullptr) return false;
+    row = ggml_row_size((ggml_type) type, n);
+    blck = ggml_blck_size((ggml_type) type);
+    act = (int) t->vec_dot_type;
+    return true;
+}
+
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
                 float swiglu_limit, int up_type) {
     if (up_type < 0) up_type = gu_type;
-    const ggml_type_traits_cpu* tg = traits(gu_type);
-    const ggml_type_traits_cpu* tu = traits(up_type);
-    const ggml_type_traits_cpu* td = traits(d_type);
-    if (tg == nullptr || tg->vec_dot == nullptr || td == nullptr || td->vec_dot == nullptr || tu == nullptr ||
-        tu->vec_dot == nullptr) {
-        err = "native experts: no CPU dot product for type " +
-              std::to_string(!(tg && tg->vec_dot) ? gu_type : !(tu && tu->vec_dot) ? up_type : d_type);
+    size_t gu_row = 0, d_row = 0, up_row = 0;
+    int64_t gu_blck = 0, d_blck = 0, up_blck = 0;
+    int gu_act = -1, d_act = -1, up_act = -1;
+    if (!weight_geometry(gu_type, n_embd, gu_row, gu_blck, gu_act) ||
+        !weight_geometry(up_type, n_embd, up_row, up_blck, up_act) ||
+        !weight_geometry(d_type, n_ff, d_row, d_blck, d_act)) {
+        err = "native experts: no CPU dot product for this layer's gate, up or down type";
         return false;
     }
-    if (tu->vec_dot_type != tg->vec_dot_type || n_embd % ggml_blck_size((ggml_type) up_type) ||
-        (up_type != gu_type && (gu_type == GGML_TYPE_NVFP4 || up_type == GGML_TYPE_NVFP4 || gu_type == GGML_TYPE_Q2_0 ||
-                               up_type == GGML_TYPE_Q2_0))) {
-        // NVFP4's scale tail and the Q2_0 kernels' own activations are whole-layer
-        err = "native experts: gate type " + std::to_string(gu_type) + " and up type " + std::to_string(up_type) +
-              " cannot share one layer";
-        return false;
-    }
-    const ggml_type_traits_cpu* ag = traits(tg->vec_dot_type);
-    const ggml_type_traits_cpu* ad = traits(td->vec_dot_type);
+    const ggml_type_traits_cpu* ag = traits(gu_act);
+    const ggml_type_traits_cpu* ad = traits(d_act);
     if (ag == nullptr || ag->from_float == nullptr || ad == nullptr || ad->from_float == nullptr) {
         err = "native experts: cannot quantize an activation for this layer";
         return false;
     }
-    if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_ff % ggml_blck_size((ggml_type) d_type) ||
-        n_embd % ggml_blck_size(tg->vec_dot_type) || n_ff % ggml_blck_size(td->vec_dot_type)) {
+    if (n_embd % gu_blck || n_ff % d_blck || n_embd % ggml_blck_size((ggml_type) gu_act) ||
+        n_ff % ggml_blck_size((ggml_type) d_act)) {
         err = "native experts: expert geometry is not whole blocks";
         return false;
     }
     f.gu_type = gu_type;
     f.d_type = d_type;
-    f.gu_act = (int) tg->vec_dot_type;
-    f.d_act = (int) td->vec_dot_type;
+    f.gu_act = gu_act;
+    f.d_act = d_act;
     f.n_embd = n_embd;
     f.n_ff = n_ff;
     f.swiglu_limit = swiglu_limit;
     f.up_type = up_type;
-    f.gu_row = ggml_row_size((ggml_type) gu_type, n_embd);
-    f.up_row = ggml_row_size((ggml_type) up_type, n_embd);
-    f.d_row = ggml_row_size((ggml_type) d_type, n_ff);
+    f.gu_row = gu_row;
+    f.up_row = up_row;
+    f.d_row = d_row;
     f.up_off = f.gu_row * (size_t) n_ff;
     f.down_off = f.up_off + f.up_row * (size_t) n_ff;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
@@ -126,8 +153,8 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     }
     f.tail = gu_type == GGML_TYPE_NVFP4 ? kNvfp4Tail : 0;
     f.bytes += f.tail;
-    f.act_bytes = ggml_row_size(tg->vec_dot_type, n_embd);
-    f.h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
+    f.act_bytes = ggml_row_size((ggml_type) gu_act, n_embd);
+    f.h_bytes = ggml_row_size((ggml_type) d_act, n_ff);
     if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
         err = "native experts: activation larger than the pool's buffers";
         return false;
@@ -136,6 +163,12 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if (f.had_gu) {   // Hadamard-folded gate/up: quantize H (s * x), never x itself
+        thread_local std::vector<float> tmp;
+        tmp.assign(x, x + f.n_embd);
+        hadamard_rotate(tmp.data(), (int) f.n_embd, f.had_block, f.gu_signs);
+        x = tmp.data();
+    }
     static const bool avx512 = cpu_avx512_ok();
     if (f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
         if (avx512) {
@@ -149,6 +182,12 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (f.had_d) {
+        thread_local std::vector<float> tmp;
+        tmp.assign(h, h + f.n_ff);
+        hadamard_rotate(tmp.data(), (int) f.n_ff, f.had_block, f.d_signs);
+        h = tmp.data();
+    }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
@@ -158,6 +197,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // formats without one.  A token's rows round the same alone as in a group, so greedy output does not depend on
     // the number of drafts in a window.  A format with only an AVX-2 kernel (IQ4_XS) takes it on AVX-2 CPUs
     // only: an AVX-512 CPU keeps the ggml dot for it.
+    if (tq_supported(f.gu_type)) {   // one block decode for all the tokens: a token's bits do not depend on the group
+        tq_gu_rows(tq_isa(), f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     static const bool avx512 = cpu_avx512_ok();
     static const bool avx2 = cpu_avx2_ok();
     static const bool cpu512 = avx512;
@@ -219,6 +262,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    // the APR trellis down rows decode a block once for all the tokens, like the other multi-token kernels
+    if (tq_supported(f.d_type)) {
+        tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles once per block instead of once per token;
     // the ggml dot is single-token.
     if (cpu_avx2_ok() && f.d_type == 20 && iq4nl256_fits((int) f.n_ff)) {   // the same rule as the gate/up rows

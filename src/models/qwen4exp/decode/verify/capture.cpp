@@ -2,6 +2,8 @@
 #include "basalt/core/load_progress.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include <algorithm>
 #include <cmath>
 #include <string>
@@ -30,6 +32,17 @@ void Verifier::refresh_ar() {
 bool Verifier::capture(int T, std::string& err) {
     cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
     if (exec_t != nullptr) return true;
+    // APR: the folded layers' sign vectors are uploaded once here, before any capture (a cudaMalloc/cudaMemcpy
+    // inside a capture is not permitted).  native_expert_gu_signs / native_expert_layout cache them.
+    {
+        const auto& lay_hm = basalt::kernels::cpu::expert_layout();
+        for (size_t li = 0; lay_hm.native && li < lay_hm.fmt.size(); ++li) {
+            const auto& f_hm = lay_hm.fmt[li];
+            if (f_hm.had_gu) (void) basalt::kernels::native_expert_gu_signs(f_hm);
+            if (f_hm.had_d) (void) basalt::kernels::native_expert_layout(f_hm).d_signs;
+        }
+        cudaDeviceSynchronize();
+    }
     const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_;
     // a window that does not capture or instantiate with programmatic dependent launch is captured again without it
     auto retry_plain = [&](const std::string& why) {

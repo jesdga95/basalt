@@ -20,6 +20,8 @@
 //   dense.index              its tensor index (text, first line "# dense index v3")
 //   experts                  the routed experts' blobs
 //   experts.layout           their per-layer layout (text, first line "# experts v3"; offsets relative to `experts`)
+//   experts.hadamard         Hadamard-folded experts only: the rotation's block, sign vectors and folded roles per
+//                            layer (text, first line "# basalt hadamard v1"; kernels/cpu/hadamard.hpp)
 //   gguf                     every non-expert tensor of the source GGUFs (token_embd.weight,
 //                            per_layer_token_embd.weight, ...), raw bytes, each starting at a multiple of
 //                            kTensorAlign within the section; meta.tensors[name].offset is relative to the section
