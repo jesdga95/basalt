@@ -83,6 +83,10 @@ struct TierRoom {
 /// fills. A tier closes at the first expert that no longer fits it. Returns each expert's tier, -1 when none takes it.
 std::vector<int> spread_experts(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers);
 
+/// The tiers, ascending, that spread_experts gives at least one expert. A tier left out has nothing to hold (no expert
+/// outside the main card, or no room for one) and takes no part in the expert tier.
+std::vector<size_t> tiers_holding(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers);
+
 /// The visible cards: CUDA_VISIBLE_DEVICES when set (integers read as nvidia-smi numbers), else every card the NVIDIA
 /// management library lists, with what that library says about each. `known` false: neither was available.
 std::vector<GpuCard> visible_gpus(bool& known);

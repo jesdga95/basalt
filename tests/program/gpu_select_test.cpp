@@ -218,6 +218,20 @@ int main() {
         const std::vector<int> o4 = spread_experts(mixed, {{16, 448}, {16, 448}, {16, 448}, {200, 1792}});
         CHECK_STR(owners(o4), "012333333333");
         CHECK_STR(owners(spread_experts(eq, {{0, 1}, {0, 1}, {0, 1}})), "--------");
+        // the tiers that hold something: none when no expert is outside the main card or no tier has room, and a tier
+        // without room is left out beside tiers that have it
+        auto holding = [](const std::vector<size_t>& v) {
+            std::string s;
+            for (size_t x : v) s += std::to_string(x);
+            return s.empty() ? std::string("-") : s;
+        };
+        CHECK_STR(holding(tiers_holding({}, {{40, 448}})), "-");
+        CHECK_STR(holding(tiers_holding({}, {{40, 448}, {40, 448}, {40, 448}})), "-");
+        CHECK_STR(holding(tiers_holding(eq, {{5, 448}})), "-");
+        CHECK_STR(holding(tiers_holding(eq, {{40, 448}})), "0");
+        CHECK_STR(holding(tiers_holding(eq, {{40, 448}, {0, 448}, {40, 448}})), "02");
+        CHECK_STR(holding(tiers_holding(eq, {{0, 448}, {0, 448}})), "-");
+        CHECK_STR(holding(tiers_holding(eq, {{10, 448}, {40, 448}})), "01");
     }
     if (g_fail) { std::printf("gpu_select_test: %d failures\n", g_fail); return 1; }
     std::printf("gpu_select_test: ok\n");
