@@ -421,6 +421,7 @@ if(PEER_ADA)
     src/kernels/cuda/iq_kernels.cu
     src/kernels/cuda/quantize_act.cu
     src/kernels/cuda/wait_abort.cu
+    src/kernels/cuda/sampler.cu
     src/kernels/cuda/elementwise.cu
     PROPERTIES COMPILE_OPTIONS "--generate-code=arch=compute_89,code=sm_89")
 endif()
