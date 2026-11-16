@@ -214,6 +214,7 @@ class PickSlot(unittest.TestCase):
         e.slot_used = [0.0] * n
         e.slot_owner = {}
         e.session_slot = {}
+        e.slot_thread = [None] * n
         return e
 
     def test_the_slot_that_holds_the_conversation(self):
@@ -732,6 +733,21 @@ class ParallelService(unittest.TestCase):
         self.assertTrue(self.kept(u, sizes[0]), (u, sizes))             # A kept its slot
         u = self.convo(b, "after C")                                    # B was the one evicted
         self.assertLess(u["prompt_tokens_details"]["cached_tokens"], 100, u)
+
+    def test_slot_rows_are_the_engine_s_slots(self):
+        # each idle row shows what its own engine slot holds for the next turn, not the last request it showed
+        self.start(3, reuse=True, slot_cache=True, slot0_solo=True, ready=200000)
+        a = [{"role": "user", "content": "conversation A " + "a" * 2000}, {"role": "assistant", "content": "ok, done."}]
+        b = [{"role": "user", "content": "conversation B " + "b" * 4000}, {"role": "assistant", "content": "ok, done."}]
+        self.chat("short")
+        self.convo(a, "first")
+        self.convo(b, "first")
+        self.convo(a, "next")
+        rows = self.get("/slots")
+        held = [len(h) for h in self.engine.slot_held]
+        self.assertEqual(sum(1 for n in held if n), 3, held)        # the short request and both conversations
+        self.assertEqual([r["ctx_used"] for r in rows], held)
+        self.assertFalse(any(r["is_processing"] for r in rows))
 
     def check_counts(self, timings, batch_admissions):
         # the fake drafts 2 per accepted; the admission's own token is nobody's draft

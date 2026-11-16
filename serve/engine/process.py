@@ -359,6 +359,8 @@ class ProcessEngine:
         # turn continues the K/V that is already there instead of being admitted wherever and copied in
         self.slot_owner: dict[int, str] = {}
         self.session_slot: dict[str, int] = {}
+        # the request thread that last took each slot: the slot table shows a running request on its own slot
+        self.slot_thread: list[int | None] = [None] * self.batch
         # admission state outlives engine processes: restart() re-runs this while requests wait on it
         if "ctl" not in self.__dict__:
             self.waiting = 0                            # requests waiting for ctl
@@ -1333,6 +1335,7 @@ class ProcessEngine:
     def claim_slot(self, slot: int, session: str | None) -> None:
         """Bind `slot` to `session` (caller holds slot_cv), dropping whoever held it and the session's own previous
         slot: two owners of one slot, or one session in two slots, would both be lies the next turn acts on."""
+        self.slot_thread[slot] = threading.get_ident()
         if session is None:
             return
         for s, o in list(self.session_slot.items()):    # anyone else owning this slot loses it
@@ -1344,6 +1347,15 @@ class ProcessEngine:
             del self.slot_owner[old]
         self.slot_owner[slot] = session
         self.session_slot[session] = slot
+
+    def slot_view(self) -> list[dict]:
+        """Per batch slot: the thread whose request runs in it (None when idle) and the tokens it holds for the
+        next turn."""
+        if not self.batch:
+            return []
+        with self.slot_cv:
+            return [{"owner": self.slot_thread[b] if self.slot_busy[b] else None, "held": len(self.slot_held[b])}
+                    for b in range(self.batch)]
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None, stop_soon=None):
         """Yield token ids, and None as a 10 s heartbeat while the engine is quiet. An early-leaving consumer or
