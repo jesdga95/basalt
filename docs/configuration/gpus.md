@@ -32,7 +32,9 @@ expert tier`:
   2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
   When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
   each; see [the GDN split](../precision/qwen38-flash-next.md#gdn-split-across-two-cards)).
-- **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle.
+- **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle. So does a card that would hold no
+  expert: when the main card holds every expert, or a card has no room for one, the start says `no expert tier` for that
+  card and runs without it.
 
 Three or more cards are community-tested: the path is checked here on two cards, with two expert tiers sharing the
 second one. Reports from machines with three or four cards are welcome (see [community](../community.md)).
