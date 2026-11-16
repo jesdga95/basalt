@@ -86,7 +86,7 @@ int cache_fill(Context& context) {
             const uint64_t vram = cuda0_fixed_bytes + cache_bytes_now;
             uint64_t outside = expert_total_bytes - cache_bytes_now;   // the experts no cache on the primary holds
             uint64_t ram = basalt::core::ram_tier_room(
-                *free_ram, std::max(o.resident_headroom, basalt::platform::ram_reserve()), o.resident_pin);
+                *free_ram, std::max(o.resident_headroom, basalt::core::plan_reserve(basalt::platform::ram_reserve())), o.resident_pin);
             if (o.resident_cpu_experts && (o.resident_budget > 0 || o.resident_soft)) {
                 const uint64_t margin = 256ull << 20;
                 ram = ram > margin ? ram - margin : 0;

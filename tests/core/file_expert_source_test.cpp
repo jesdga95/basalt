@@ -329,6 +329,23 @@ void test_file_cache_keep() {
     require(file_cache_floor(want, want, FileCache{4 * kGiB, kGiB}) == 9 * kGiB + 2, "two whole layers and a chunk");
 }
 
+void test_plan_reserve() {
+    using basalt::core::kPostPlanHostBytes;
+    using basalt::core::plan_reserve;
+    using basalt::core::ram_tier_room;
+    constexpr uint64_t kGiB = 1ull << 30;
+    require(plan_reserve(2 * kGiB) == 2 * kGiB + kPostPlanHostBytes, "the plan leaves the reserve and the late allowance");
+    require(plan_reserve(0) == 0, "a guard that is off leaves nothing");
+    // a tier sized against plan_reserve() still has the guard's line free after the engine takes its late memory, where one
+    // sized against the reserve alone ends on it (#339)
+    const uint64_t avail = 55 * kGiB, reserve = 2 * kGiB;
+    const uint64_t on_line = avail - ram_tier_room(avail, reserve, false);
+    const uint64_t with_allowance = avail - ram_tier_room(avail, plan_reserve(reserve), false);
+    require(on_line == reserve, "sized by the reserve alone, the tier leaves exactly the guard's line");
+    require(with_allowance - kPostPlanHostBytes >= reserve, "with the allowance, the late memory does not reach the guard");
+    require(ram_tier_room(kPostPlanHostBytes, plan_reserve(reserve), true) == 0, "RAM below the plan's reserve leaves no room");
+}
+
 void test_ram_tier_room() {
     using basalt::core::ram_tier_room;
     using basalt::core::pin_tracking_bytes;
@@ -646,6 +663,7 @@ int main() {
         test_complement_plan();
         test_resident_lend_region();
         test_resident_exchange();
+        test_plan_reserve();
         test_ram_tier_room();
         test_file_cache_keep();
         test_cgroup_memory_budget();

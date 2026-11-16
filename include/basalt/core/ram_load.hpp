@@ -139,6 +139,16 @@ const uint8_t* ram_pin_alias(const std::vector<uint64_t>& starts, const std::vec
 /// that pins counts it with them.
 inline uint64_t pin_tracking_bytes(uint64_t pinned) { return pinned / 36; }
 
+/// Host memory an engine takes after its RAM tier has read the free RAM: the CUDA runtime's own host memory for the graphs it
+/// captures, the first request's buffers, the second card's context.  The tier's plan leaves it free beside the reserve; the
+/// serving RAM guard still holds the reserve alone, so the settled free RAM is above the guard and not on it.  0.2.1 left
+/// 2 GiB for it (kLateHostBytes); 0.3.1 removed that and a 64 GB box started at or below its guard (#339).
+inline constexpr uint64_t kPostPlanHostBytes = 2ull << 30;
+
+/// The reserve a RAM tier is sized against: the free RAM the user asked for (`reserve`, the guard's line) and the
+/// allowance for what the engine takes after the sizing.  0 (the guard off) leaves nothing, as asked.
+inline uint64_t plan_reserve(uint64_t reserve) { return reserve > 0 ? reserve + kPostPlanHostBytes : 0; }
+
 /// The bytes a RAM tier or copy of experts may take with `avail` bytes available: everything above `reserve`, less the
 /// driver's tracking of its pages when it is `pinned`.  Every model sizes its tier with this, after it has allocated
 /// (or held the RAM of) the host buffers it takes later, and with the file cache's keep (file_cache_keep) in `reserve`

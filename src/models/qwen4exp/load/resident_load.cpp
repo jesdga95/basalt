@@ -50,7 +50,7 @@ int resident_load(Context& context) {
                                             : o.adapt_swaps * kSatBoost);
         // the copy leaves the reserve free (or the legacy headroom, when larger), and the driver's tracking of the
         // buffers whose RAM is held for them
-        const uint64_t reserve = basalt::platform::ram_reserve();
+        const uint64_t reserve = basalt::core::plan_reserve(basalt::platform::ram_reserve());
         uint64_t resident_headroom =
             std::max(o.resident_headroom, reserve) + basalt::core::pin_tracking_bytes(basalt::core::host_plan_bytes());
         // the adaptive swaps' exchange buffers, before the copy reads the free memory

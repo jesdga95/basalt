@@ -90,7 +90,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - `--vram-reserve-mib` below 256 is refused on Windows and WSL2 (128 on Linux): less free VRAM makes the driver page GPU memory.
 - `--ram-reserve-mib` (default 2048) is the RAM left free for the rest of the system. The engine allocates its host buffers
   first, or holds their RAM when it page-locks them later; the expert tiers then take the free RAM less the reserve and less
-  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). When some experts stay in the file, the
+  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). Flash-Next's copy and top-up also leave 2 GiB beside the reserve
+  for the host memory the engine takes after they read the free RAM (CUDA graphs, the first request), so the free RAM settles
+  above the guard, not on it. When some experts stay in the file, the
   tiers also leave the OS file cache they are read through a floor: one prompt chunk's file reads and two layers' share of
   those experts, at least 4 GiB. Programs left idle beside a small reserve may be swapped out.
 - While serving, the RAM guard holds the reserve: below it, it parks conversations to disk or drops them. A request waits up to 30 s
