@@ -208,7 +208,7 @@ Flow Request::restore() {
                 basalt::log::info("basalt serve", "prompt %lld tokens = 0 reused + 0 of %lld read in 0 ms "
                                   "(0.0 tok/s), 0 generated in 0 ms (0.0 tok/s), drafts accepted 0 of 0, %zu "
                                   "checkpoints (cancelled)", (long long) n, (long long) n, runtime_.checks.size());
-                std::printf("DONE 0 %lld 0.0 0.0 cancel 0 0 0 0 0 0 0 0.0 0 0\n", (long long) n);
+                std::printf("DONE 0 %lld 0.0 0.0 cancel 0 0 0 0 0 0 0 0.0 0 0 0\n", (long long) n);
                 std::fflush(stdout);
                 return Flow::next;
             }

@@ -105,6 +105,7 @@ lp_top = {}          # slot (None: solo) -> the request's logprobs=K
 def lp_fields(t, k):
     return f"{t} -0.25" + "".join(f" {t if i == 0 else 32 + i}:{-0.25 - 2 * i}" for i in range(k))
 stopped = set()      # BSTOPped slots: they end "cancel"
+wins = {}            # slot -> its windows so far (--windows: BDONE and DONE say how many windows the run took)
 def window():        # one batch window: every active slot one token
     if fail and len(active) >= 2:     # as the engine: the reason on stdout, then exit code 1
         print("ERR verify batch: layer 34 never rang (graph finished)", flush=True)
@@ -123,12 +124,16 @@ def window():        # one batch window: every active slot one token
             for t2 in got:
                 print(f"BP {b} " + lp_fields(t2, lp_top[b]), flush=True)
         print(f"BT {b} " + " ".join(map(str, got)), flush=True)
+        wins[b] = wins.get(b, 0) + 1
         if t == 257 or produced >= max_new:
             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
             stopped.discard(b)
             counts = f" {b + 3} {10 * (b + 1)}" if "--bdone-drafts" in args else ""   # accepted, offered
             if "--draft-counts" in args:      # as the engine: the slot's own windows (not the admission's token)
                 counts = f" {produced - 1} {2 * (produced - 1)}"
+            if "--windows" in args:
+                counts = (counts or " 0 0") + f" {wins.get(b, 0)}"
+            wins.pop(b, None)
             print(f"BDONE {b} {produced} {fin} 1.0{counts}", flush=True)
             held_slot[b] = active[b][3] + active[b][4][:produced][:-1]
             del active[b]
@@ -238,7 +243,8 @@ while True:
         mine_ids = [int(x) for x in ids]
         pm = (0.4 if any(mine_ids[:len(h)] == h for h in seen) else 500.0) if pms else 5.0
         seen.append(mine_ids)
-        print(f"DONE {out} {len(ids)} {pm} {out * STEP * 1000:.1f} {fin} {dc} {reused}", flush=True)
+        win = f" 0 0 0 0 0.0 {len(ids) - reused} 0 {-(-out // MULTI)}" if "--windows" in args else ""   # a solo window keeps MULTI
+        print(f"DONE {out} {len(ids)} {pm} {out * STEP * 1000:.1f} {fin} {dc} {reused}{win}", flush=True)
         if slot is not None and bslot is None:         # a solo run in a slot keeps its conversation there
             held_slot[slot] = [int(x) for x in ids] + toks[:out][:-1]
         if s0:
@@ -305,7 +311,7 @@ class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
-              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False):
+              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False, windows=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -323,6 +329,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--slot0solo"] if slot0_solo else []
         extra += ["--soloany"] if solo_any else []
         extra += ["--pms"] if pms else []
+        extra += ["--windows"] if windows else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -686,6 +693,60 @@ class ParallelService(unittest.TestCase):
         th.join(30)
         got = self.slot_drafts()
         self.assertEqual(got, {0: (3, 10), 1: (4, 20)})
+
+    def done_lines(self, texts, gap=0.05):
+        """The server's done line of each request, the texts sent `gap` s apart (all at once when 0 is not wanted)."""
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            threads = [threading.Thread(target=lambda t=t: self.chat(t, max_tokens=200)) for t in texts]
+            for th in threads:
+                th.start()
+                time.sleep(gap)
+            for th in threads:
+                th.join(30)
+            time.sleep(0.2)
+        return [l for l in out.getvalue().splitlines() if " done " in l]
+
+    def test_dl_is_the_engines_windows_alone(self):
+        # a request alone runs solo: DONE's last field is its windows, MULTI tokens each: 55 tokens in 19 windows
+        self.start(2, multi=3, counts=True, windows=True)
+        lines = self.done_lines(["only LONGREPLY"])
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("tg=55", lines[0])
+        self.assertIn(" dl=2.9 ", lines[0])
+        self.assertEqual(self.svc.history[-1]["draft_len"], 2.89)
+
+    def test_dl_is_the_engines_windows_in_the_slots(self):
+        # two requests decoding together: each one's windows are its own, over its solo and slot runs
+        self.start(2, multi=3, counts=True, windows=True)
+        lines = self.done_lines(["first LONGREPLY", "second LONGREPLY"])
+        self.assertEqual(len(lines), 2, lines)
+        for l in lines:
+            self.assertIn("tg=55", l)
+            dl = float(l.split(" dl=")[1].split()[0])
+            self.assertTrue(2.5 <= dl <= 3.5, l)       # 3 tokens a window, the odd ones out at a run's ends
+        self.assertTrue(all(2.5 <= h["draft_len"] <= 3.5 for h in self.svc.history), self.svc.history)
+
+    def test_no_windows_from_the_engine_no_dl(self):
+        self.start(2, multi=3, counts=True)
+        lines = self.done_lines(["first LONGREPLY", "second LONGREPLY"])
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(all(" dl=" not in l and " acc=" in l for l in lines), lines)
+
+    def test_windows_of_a_request_in_several_runs_add_up(self):
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.batch = 2
+        carry = [0, 0, 0]
+        e._parse_done("DONE 1 10 1.0 2.0 length 0 0 0 0 0 0 0 0.0 10 0 1")          # the admission: one window
+        e._carry_drafts(carry, False)
+        e._bdone_last("BDONE 0 30 stop 9.0 20 40 6".split())                         # the slot: six windows
+        e._carry_drafts(carry, True)
+        self.assertEqual(e.last["windows"], 7)
+        self.assertEqual((e.last["drafts_accepted"], e.last["drafts_offered"]), (20, 40))
+        e._bdone_last("BDONE 0 30 stop 9.0 20 40".split())                           # an older engine: no windows
+        self.assertNotIn("windows", e.last)
 
     def timed_chats(self, texts, gap=0.05, max_tokens=200):
         """Each text as a streamed request started `gap` s after the previous; the `timings` of every reply."""

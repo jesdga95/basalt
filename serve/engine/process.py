@@ -3,7 +3,7 @@
 Protocol (one line each):
   * start: stdout `INFO k=v ...` lines, then `READY <ctx> [stop]` (stop: STOP is honoured mid-request).
   * solo: `GEN <max_new> [k=v ...] <ids>` (GENI with embeddings) -> `T <id>`, `PP <read> <total> ...`,
-    `RESUME <n>`, then `DONE ...`; `STOP` ends it early. With `logprobs=K` each `T` line follows its
+    `RESUME <n>`, then `DONE ...` (its last field: the run's decode windows); `STOP` ends it early. With `logprobs=K` each `T` line follows its
     `P <id> <lp> [<id>:<lp> ...]` line (the pick's log probability and the K likeliest tokens). `ERR ...` is a failure; a prompt that does not fit the
     context is `ERR <context_overflow|context_no_room> prompt=N [max_new=N] context=N [slot=N]: <message>`.
   * any time after READY: `CONV parked=N bytes=N evictions=N [restored=N restored_ms=X]`, the conversation cache's
@@ -18,7 +18,7 @@ Protocol (one line each):
     engine's own matching: an exact prefix, or the model's own pieces for the same bytes) and the tokens it holds.
     `BGEN`/`SGEN` then name the prompt where the ids go: `#<handle>[+<id>,...]` (the ids a request that ran in several
     engine runs adds after it); `PFREE <handle>` drops it.
-  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> ...`; with
+  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> <n> <finish> <ms> [<drafts accepted> <drafts offered> [<windows>]]`; with
     `logprobs=K`, one `BP <slot> <id> <lp> [...]` line per kept pick ahead of its `BT` line;
     `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`).
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
@@ -206,8 +206,9 @@ class ProcessEngine:
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
-    # Windows of the request in progress on this thread: (windows, tokens in them), counted from the batch slot's
-    # `BT` lines.
+    # The batch windows of the engine run in progress on this thread: (windows, tokens in them), counted from its
+    # `BT` lines. Only the live figure of the status page; a finished request's windows are the engine's own (`windows`
+    # on DONE and BDONE), which also cover its solo runs and every pass.
     def window_stats(self) -> tuple[int, int]:
         tl = self.__dict__.setdefault("_wtl", threading.local())
         return getattr(tl, "windows", 0), getattr(tl, "tokens", 0)
@@ -581,6 +582,8 @@ class ProcessEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+        if len(f) >= 17:                                  # decode windows of this run
+            self.last.update(windows=int(f[16]))
         if REQUEST_LINES:
             self._echo_request()
 
@@ -924,31 +927,39 @@ class ProcessEngine:
         self.slot_drafts[slot] = (int(f[5]) if known else None, int(f[6]) if known else None, time.time())
 
     def _bdone_last(self, f: list[str]):
-        """This thread's `last` after a BDONE: finish, decode ms and the request's own draft counts (optional trailing
-        accepted, offered; without them they are unknown, never an earlier request's)."""
+        """This thread's `last` after a BDONE: finish, decode ms and the request's own draft counts and windows
+        (optional trailing accepted, offered, windows; without them they are unknown, never an earlier run's)."""
         if len(f) < 5 or not isinstance(self.last, dict):
             return
-        prev = {k: v for k, v in self.last.items() if k not in ("drafts_accepted", "drafts_offered")}
+        prev = {k: v for k, v in self.last.items() if k not in ("drafts_accepted", "drafts_offered", "windows")}
         counts = {"drafts_accepted": int(f[5]), "drafts_offered": int(f[6])} \
             if len(f) >= 7 and f[5].isdigit() and f[6].isdigit() else {}
+        if len(f) >= 8 and f[7].isdigit():
+            counts["windows"] = int(f[7])
         self.last = {**prev, **counts, "finish": f[3], "decode_ms": float(f[4]),
                      "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
 
     def _carry_drafts(self, carry: list[int], final: bool):
-        """Draft counts of a request that ran in several engine runs (solo, then a slot, ...): the run just read adds
-        to `carry`; at the request's last run `carry` joins its counts."""
+        """Draft counts and windows of a request that ran in several engine runs (solo, then a slot, ...): the run
+        just read adds to `carry`; at the request's last run `carry` joins its counts."""
         last = self.last
-        if not isinstance(last, dict) or last.get("drafts_offered") is None or last.get("drafts_accepted") is None:
-            if final:
-                carry[:] = [0, 0]
-            return
+        if not isinstance(last, dict):
+            last = {}
+        drafts = last.get("drafts_offered") is not None and last.get("drafts_accepted") is not None
+        windows = last.get("windows") is not None
         if final:
-            last["drafts_accepted"] += carry[0]
-            last["drafts_offered"] += carry[1]
-            carry[:] = [0, 0]
+            if drafts:
+                last["drafts_accepted"] += carry[0]
+                last["drafts_offered"] += carry[1]
+            if windows:
+                last["windows"] += carry[2]
+            carry[:] = [0, 0, 0]
         else:
-            carry[0] += last["drafts_accepted"]
-            carry[1] += last["drafts_offered"]
+            if drafts:
+                carry[0] += last["drafts_accepted"]
+                carry[1] += last["drafts_offered"]
+            if windows:
+                carry[2] += last["windows"]
 
     def _note_live(self, line: str):
         """A `PL <position> <total> <ms> <tok/s>` line: the display's position and speed inside a chunk."""
@@ -1109,7 +1120,7 @@ class ProcessEngine:
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
         yields, solo_again = 0, 0
-        carry = [0, 0]            # draft counts (accepted, offered) of the runs before the current one
+        carry = [0, 0, 0]         # draft counts (accepted, offered) and windows of the runs before the current one
         first, last0 = [], self.last   # reused prefix of the first run; `last` before this request's first DONE
         self.read_ms = 0.0             # the prompt-read time of every run this request makes
         try:
@@ -1379,9 +1390,9 @@ class ProcessEngine:
                         self._carry_run(carry, first, last0, True)
                     elif isinstance(self.last, dict):
                         # the BDONE is still to come: the counts of the DONE before it are not this request's
-                        for k in ("drafts_accepted", "drafts_offered"):
+                        for k in ("drafts_accepted", "drafts_offered", "windows"):
                             self.last.pop(k, None)
-                        carry[:] = [0, 0]
+                        carry[:] = [0, 0, 0]
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False

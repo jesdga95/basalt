@@ -753,6 +753,7 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
     }
     sl.drafts_offered += T - 1;
     sl.drafts_accepted += a;
+    ++sl.windows;
     std::string line = "BT " + std::to_string(b);
     const char* fin = nullptr;
     if (sl.lp_top >= 0) {   // the kept rows' logprobs, read before the drafts touch the head
@@ -805,9 +806,9 @@ bool SessionRuntime::slot_window_end(int b, SlotWin& w) {
         else bpolicy->observe_window(w.chance, T, a, ms);
     }
     if (fin != nullptr) {
-        std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin,
+        std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin,
                     std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
-                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
         sl.active = false;
         sl.cached = o.prompt_cache > 0;
         sl.idle_busy = busy_now();

@@ -38,6 +38,7 @@ Flow Request::complete() {
     //      [prompt tokens read]   (fewer than <prompt> - <reused> when a cancel stopped the read)
     //      [offloaded]   (the decode's routed experts the GPU read over PCIe or another GPU computed;
     //                    not in [lookups])
+    //      [windows]   (the decode windows of this run; a window's tokens are the server's tokens per window)
     ram_out = runtime_.ram_stop.load() || !kv_stop.empty();
     if (!kv_stop.empty()) {
         basalt::log::warn("basalt serve", "request stopped after %lld tokens: %s", (long long) produced_n,
@@ -58,12 +59,12 @@ Flow Request::complete() {
         std::printf("ERR %s\n", msg.c_str());
     }
     if (!ram_out && yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
-    if (!ram_out) std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
+    if (!ram_out) std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld %lld\n",
                 (long long) produced_n,
                 (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                 (long long) resume, (long long) dc.hits, (long long) dc.lookups,
                 (long long) dc.ram_blobs, (long long) dc.file_blobs, dc.file_mb, (long long) read_n,
-                (long long) dc.offloaded);
+                (long long) dc.offloaded, (long long) windows);
     std::fflush(stdout);
     // no swap stays in flight between requests: the last round's copies land once the reply is out
     if (!tiers_settle()) {

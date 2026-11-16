@@ -40,6 +40,7 @@ bool QfnRuntime::pump(bool may_start) {
             const int32_t y = outb[t];
             basalt::protocol::emit("BT %d %d\n", gi * GS + t, (int) y);
             ++sl.produced;
+            ++sl.windows;   // a pipelined slot takes one row a window
             ++bt_rows;
             const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
             const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
@@ -47,7 +48,7 @@ bool QfnRuntime::pump(bool may_start) {
             sl.ids.push_back(sl.x);
             if (fin != nullptr) {
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                std::printf("BDONE %d %lld %s %.1f 0 0\n", gi * GS + t, (long long) sl.produced, fin, ms);
+                std::printf("BDONE %d %lld %s %.1f 0 0 %lld\n", gi * GS + t, (long long) sl.produced, fin, ms, (long long) sl.windows);
                 sl.active = false;
                 sl.cached = false;   // the pipeline's pad rows: a pipelined slot is not reused as a cache
             } else {

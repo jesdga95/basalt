@@ -21,6 +21,7 @@ Flow Request::decode_loop(B& b) {
     produced_n = 0;
     draft_offered = 0;
     draft_accepted = 0;
+    windows = 0;
     window = std::vector<int32_t>((size_t) b.max_window());
     outv = std::vector<int32_t>((size_t) b.max_window());
     consumed.reserve((size_t) (n + max_new + b.max_window()));
@@ -156,6 +157,7 @@ Flow Request::decode_loop(B& b) {
         for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
         draft_offered += T - 1 - e0;
         draft_accepted += a - e0;
+        ++windows;
         first_window = false;
         bool commit_ok = true, after_ran = false, eos = false;
         std::string cerr;

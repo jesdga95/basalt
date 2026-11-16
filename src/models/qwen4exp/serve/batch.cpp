@@ -53,9 +53,9 @@ bool QfnRuntime::batch_step() {
             if (!ke.empty() && kv_short) {   // the expert cache's floor: this slot's reply ends here
                 BSlot& sl = bs[(size_t) b];
                 basalt::log::warn("basalt batch", "slot %d stopped at %lld cells: %s", b, (long long) at, ke.c_str());
-                std::printf("BDONE %d %lld length %.1f %lld %lld\n", b, (long long) sl.produced,
+                std::printf("BDONE %d %lld length %.1f %lld %lld %lld\n", b, (long long) sl.produced,
                             std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
-                            (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+                            (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
                 sl.active = false;
                 sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids
                 sl.idle_busy = busy_now();
@@ -337,13 +337,13 @@ bool QfnRuntime::batch_step() {
             if (sl.sfx) for (int e = 0; e < k; ++e) sl.sfx->append(outb[r0s[sg] + e]);
             if (sl.windows > 0 && fin_of[sg] == nullptr)
                 bpolicy->observe(sl.from_sfx, Tw, a, sl.smatch, (msd(w0, w2) + bt_draft_last) * (double) Tw / (double) R);
-            ++sl.windows;
             bt_slotwin += 1;
             bt_tokens += k;
             bt_dr_off += Tw - 1;
             bt_dr_acc += a;
             p0s[sg] = sl.p;
         }
+        ++sl.windows;
         if (bdigest) {
             uint64_t part[10] = {};
             slot_digest(b, sl.p + k, part);
@@ -353,8 +353,8 @@ bool QfnRuntime::batch_step() {
         }
         if (fin_of[sg] != nullptr) {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-            std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin_of[sg], ms,
-                        (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+            std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin_of[sg], ms,
+                        (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
             sl.active = false;
             sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids for the next turn
             sl.idle_busy = busy_now();

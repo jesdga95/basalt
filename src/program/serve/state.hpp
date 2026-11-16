@@ -278,7 +278,7 @@ public:
         bool from_sfx = false;
         double acc = 0.6;          ///< drafts accepted per offered, smoothed: who gets the free rows
         int64_t since_draft = 0;   ///< windows since the slot last drafted
-        int64_t windows = 0;
+        int64_t windows = 0;   ///< the request's windows in this slot, for BDONE
         int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
     };
     std::vector<BSlot> bs{};
