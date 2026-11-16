@@ -184,11 +184,15 @@ Diagnostic flags: [diagnostics](diagnostics.md).
 ## Control vectors
 
 A GGUF control vector added to the residual stream, after each steered layer's output. Qwen3.8-Flash-Next and
-Qwen3.8-27B take these flags. A request switches it with `experimental_speed_projection`. A split or a peer's prompt
-stage keeps it on every card: each stage applies the vector to the steered layers it reads.
+Qwen3.8-27B take these flags. A vector that was loaded applies to every request; a request turns it off with
+`experimental_speed_projection: false` (`cvec=0` to the engine). A run without one is the stock model. A split or a
+peer's prompt stage keeps it on every card: each stage applies the vector to the steered layers it reads.
 
 A vector is model-specific: it holds one direction of the model's width per layer, so a Flash-Next vector is refused
-by a 27B run, and the other way round.
+by a 27B run, and the other way round. Layer 0 is never steered, as in llama.cpp.
+
+The vector is part of a conversation cache's identity, as the rope is: conversations parked by another vector, scale,
+mode or layer range are never resumed, because their K/V and recurrent state were read and written through it.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
