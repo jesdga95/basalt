@@ -52,6 +52,20 @@ bool block_meta(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& 
 }
 
 
+// The device bytes a weight takes: its payload in its card's weight block, 256-byte aligned (load_weights carves every
+// tensor from one allocation per card, so the planner counts exactly what the load takes).
+uint64_t weight_bytes(const TensorInfo& t) { return (tensor_payload_bytes(t) + 255) & ~(uint64_t) 255; }
+
+// Whether the load places tensor `name` on a card: the layers [lo, hi), and with lo == 0 the head and the drafter in use.
+bool on_card(const std::string& name, const dense::Options& o, int lo, int hi) {
+    if (name.starts_with("blk.")) {
+        const int il = std::atoi(name.c_str() + 4);
+        return il >= lo && il < hi;
+    }
+    return lo == 0 && (name.starts_with("output") || (o.drafter == dense::Drafter::Block && name.starts_with("dflash.")) ||
+                       (o.drafter == dense::Drafter::Mtp && name.starts_with("mtp.")));
+}
+
 // The dense stack's options for a run of these flags (the drafter the pack carries, when drafting).
 dense::Options run_options(const GgufFile& gg, int64_t max_context, int sessions, int spec, bool draft, bool vision, const std::string& kv,
                            int64_t kv_resident) {
@@ -82,13 +96,11 @@ dense::SplitPlan plan_pack(const GgufFile& gg, const dense::Geometry& g, const d
     std::vector<uint64_t> layer((size_t) g.n_layers, 0);
     uint64_t main_weights = 0;
     for (const TensorInfo& t : gg.tensors()) {
-        const std::string& name = t.name;
-        if (name.starts_with("blk.")) {
-            const int il = std::atoi(name.c_str() + 4);
-            if (il >= 0 && il < g.n_layers) layer[(size_t) il] += tensor_payload_bytes(t);
-        } else if (name.starts_with("output") || (o.drafter == dense::Drafter::Block && name.starts_with("dflash.")) ||
-                   (o.drafter == dense::Drafter::Mtp && name.starts_with("mtp."))) {
-            main_weights += tensor_payload_bytes(t);
+        if (t.name.starts_with("blk.")) {
+            const int il = std::atoi(t.name.c_str() + 4);
+            if (il >= 0 && il < g.n_layers) layer[(size_t) il] += weight_bytes(t);
+        } else if (on_card(t.name, o, 0, 0)) {
+            main_weights += weight_bytes(t);
         }
     }
     size_t main_free = 0, peer_free = 0, total = 0;
@@ -113,7 +125,7 @@ class Loaded final : public model::LoadedModel {
 public:
     ~Loaded() override {
         model_.reset();
-        for (void* p : dev_) cudaFree(p);
+        for (auto& [dev, b] : blocks_) cudaFree(b.base);
         if (embd_) cudaFreeHost(embd_);
         if (fd_ >= 0) platform::close_fd(fd_);
     }
@@ -178,6 +190,14 @@ public:
         std::optional<core::LoadProgress> peer_progress;
         if (peer_total) peer_progress.emplace(core::LoadProgress::cuda(req.peer_devices.front()), peer_total);
         progress_ = &progress;
+        {   // each card's weights in one block: the main card's, and a split's later layers on the second card
+            const int end = split_at_ > 0 ? split_at_ : g.n_layers;
+            if (!reserve_block(gg, o, 0, end, err)) return false;
+            if (split_at_ > 0) {
+                const core::OnDevice on(req.peer_devices.front());
+                if (!reserve_block(gg, o, split_at_, g.n_layers, err)) return false;
+            }
+        }
         dense::Weights w;
         const int H = g.n_embd;
         // the token embedding stays in page-locked host memory; the kernels read the rows they need
@@ -244,7 +264,7 @@ public:
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         basalt::log::info("basalt qwen35", "%zu tensors, %.2f GiB on the GPU, %.2f GiB of embedding in page-locked RAM; "
-                          "%.2f GiB free", dev_.size(), (double) dev_bytes_ / 1073741824.0, (double) tensor_payload_bytes(*te) / 1073741824.0,
+                          "%.2f GiB free", n_tensors_, (double) dev_bytes_ / 1073741824.0, (double) tensor_payload_bytes(*te) / 1073741824.0,
                           (double) free_b / 1073741824.0);
         if (split_at_ > 0)
             basalt::log::info("basalt qwen35", "layer split: %.2f GiB of layers %d-%d on CUDA%d", (double) peer_bytes_ / 1073741824.0, split_at_,
@@ -317,11 +337,12 @@ private:
             return;
         }
         const uint64_t main_bytes = dev_bytes_;
-        const size_t first = dev_.size();
         std::string err;
         dense::Weights lw;
         bool ok = cudaSetDevice(dev) == cudaSuccess;
         if (!ok) err = "qwen35: cannot use CUDA" + std::to_string(dev);
+        dense::Options lo;
+        ok = ok && reserve_block(gg, lo, l_min, g.n_layers, err);
         for (int il = 0; ok && il < g.n_layers; ++il) {
             dense::Layer L;
             L.kind = g.kinds[(size_t) il];
@@ -335,8 +356,10 @@ private:
                                   g.n_layers - 1, (double) line_bytes / 1073741824.0, dev, main_dev);
         if (ok && dense::attach_prompt_line(*model_, dev, l_min, lw, err)) return;
         basalt::log::warn("basalt qwen35", "prompt line off, prompts read on CUDA%d: %s", main_dev, err.c_str());
-        for (size_t i = first; i < dev_.size(); ++i) cudaFree(dev_[i]);
-        dev_.resize(first);
+        if (auto it = blocks_.find(dev); it != blocks_.end()) {
+            cudaFree(it->second.base);
+            blocks_.erase(it);
+        }
         (void) cudaGetLastError();
     }
 
@@ -435,13 +458,43 @@ private:
         return t;
     }
 
-    void* upload(const GgufFile& gg, const TensorInfo& t, std::string& err) {
-        void* d = nullptr;
-        if (cudaMalloc(&d, tensor_payload_bytes(t)) != cudaSuccess) {
-            err = "qwen35: out of device memory loading " + t.name;
+    // One allocation on the current device for the tensors the load places there (on_card's), carved by take().
+    bool reserve_block(const GgufFile& gg, const dense::Options& o, int lo, int hi, std::string& err) {
+        uint64_t bytes = 0;
+        for (const TensorInfo& t : gg.tensors())
+            if (on_card(t.name, o, lo, hi)) bytes += weight_bytes(t);
+        int dev = 0;
+        cudaGetDevice(&dev);
+        Block& b = blocks_[dev];
+        if (cudaMalloc((void**) &b.base, bytes) != cudaSuccess) {
+            (void) cudaGetLastError();
+            blocks_.erase(dev);
+            err = "qwen35: out of device memory for " + std::to_string((unsigned long long) (bytes >> 20)) + " MiB of weights on CUDA" +
+                  std::to_string(dev);
+            return false;
+        }
+        b.size = bytes;
+        return true;
+    }
+    // `bytes` of the current device's block (256-byte aligned)
+    void* take(uint64_t bytes, const std::string& name, std::string& err) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        const auto it = blocks_.find(dev);
+        const uint64_t need = (bytes + 255) & ~(uint64_t) 255;
+        if (it == blocks_.end() || it->second.used + need > it->second.size) {
+            err = "qwen35: " + name + " does not fit the weights' block on CUDA" + std::to_string(dev);
             return nullptr;
         }
-        dev_.push_back(d);
+        void* d = it->second.base + it->second.used;
+        it->second.used += need;
+        ++n_tensors_;
+        return d;
+    }
+
+    void* upload(const GgufFile& gg, const TensorInfo& t, std::string& err) {
+        void* d = take(tensor_payload_bytes(t), t.name, err);
+        if (!d) return nullptr;
         constexpr uint64_t kChunk = 64ull << 20;
         staging_.resize((size_t) std::min<uint64_t>(tensor_payload_bytes(t), kChunk));
         for (uint64_t off = 0; off < tensor_payload_bytes(t); off += kChunk) {
@@ -467,12 +520,8 @@ private:
         const TensorInfo* ta = need(gg, a, kTypeBf16, elems, err);
         const TensorInfo* tb = ta ? need(gg, b, kTypeBf16, elems, err) : nullptr;
         if (!tb) return nullptr;
-        void* d = nullptr;
-        if (cudaMalloc(&d, tensor_payload_bytes(*ta) + tensor_payload_bytes(*tb)) != cudaSuccess) {
-            err = "qwen35: out of device memory loading " + a;
-            return nullptr;
-        }
-        dev_.push_back(d);
+        void* d = take(tensor_payload_bytes(*ta) + tensor_payload_bytes(*tb), a, err);
+        if (!d) return nullptr;
         uint64_t at = 0;
         for (const TensorInfo* t : {ta, tb}) {
             staging_.resize((size_t) tensor_payload_bytes(*t));
@@ -523,7 +572,12 @@ private:
     model::ModelDesc desc_;
     dense::ModelPtr model_;
     std::map<std::string, TensorInfo> tensors_;
-    std::vector<void*> dev_;
+    struct Block {
+        uint8_t* base = nullptr;
+        uint64_t size = 0, used = 0;
+    };
+    std::map<int, Block> blocks_;        // per CUDA device: its weights, one allocation
+    size_t n_tensors_ = 0;
     uint64_t dev_bytes_ = 0;
     void* embd_ = nullptr;
     int fd_ = -1;

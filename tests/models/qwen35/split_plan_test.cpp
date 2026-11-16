@@ -21,7 +21,7 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++failures;
 }
 
-constexpr uint64_t kGdnLayer = 216474520, kAttnLayer = 209430556;    // weights: a GDN layer, an attention layer
+constexpr uint64_t kGdnLayer = 216476160, kAttnLayer = 209432320;    // weights: a GDN layer, an attention layer (256-byte aligned)
 constexpr uint64_t kGdnSlot = 7854080;                               // a slot's recurrent state in a GDN layer
 constexpr uint64_t kMainFixed = 5918443012, kMainFixed8K = 5582898692;   // head, drafter, scratch, a slot's logits (spec 16)
 constexpr uint64_t kSlotRest = 20000000;                              // another slot's logits and drafter ring
@@ -69,6 +69,18 @@ int main() {
     expect("32+16, 8K fp16 (fits the main card)", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060), 0);
     expect("32+16, 262K fp16", inputs(fp16_262k, 1, kMainFixed, r5090, r5060), 55);
     expect("32+16, 262K int8, two slots", inputs(int8_262k, 2, kMainFixed, r5090, r5060), 51);
+    {   // --parallel 2 through the server (every kernel loaded at start: less free); these cut the model, then ran short at load
+        // while each weight was an allocation of its own, rounded up to the allocator's 2 MiB pages
+        const SplitCard m5090{32515883008ull, 1792}, m5060{15872884736ull, 448};   // free past the margin, as planned
+        const auto two = [&](uint64_t attn_slot) {
+            SplitInputs in = inputs(attn_slot, 2, kMainFixed, m5090, m5060);
+            in.main_fixed = 5981882116ull;   // head, drafter, scratch, both slots' logits and drafter rings
+            return in;
+        };
+        expect("32+16, 262K int8, two slots, served", two(553649152), 53);
+        expect("32+16, 229K int8, two slots, served", two(484443136), 57);
+        expect("32+16, 196K int8, two slots, served", two(415237120), 62);
+    }
     // a slower main card than the second (listed first): the most layers on the second card
     {
         const SplitPlan p = basalt::dense::plan_split(inputs(fp16_262k, 1, kMainFixed, card(k5090, 448), card(k5090, 1792)));
