@@ -27,8 +27,9 @@ struct QsaAttnPools {
     const int8_t* v_q = nullptr;
     const uint16_t* k_scale = nullptr;  ///< fp16 [page][kv_head][page_size][head_dim / 64]
     const uint16_t* v_scale = nullptr;
-    const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
-    const uint8_t* v_q4 = nullptr;
+    const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18] (q4_fmt 0)
+    const uint8_t* v_q4 = nullptr;      ///< ... or NVFP4 rows [head_dim / 2 codes][head_dim / 16 E4M3 scales] (q4_fmt 1)
+    int q4_fmt = 0;                     ///< 4-bit pools: 0 = q4_0 blocks, 1 = NVFP4 (kv_q4.hpp)
     const int32_t* page_table = nullptr;
 };
 

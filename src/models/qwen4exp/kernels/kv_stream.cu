@@ -48,7 +48,7 @@ __host__ __device__ Runs runs_int8(const QsaAttnPools& slots, const KvHostPools&
 Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const QsaShapes& s) {
     const int rows = (int) (s.n_head_kv * s.page_size);
     Runs r{};
-    if (fmt == kKvQ4) {
+    if (fmt == kKvQ4 || fmt == kKvFp4) {   // the two 4-bit formats share the k_q4/v_q4 runs (kv_q4.hpp)
         const int bytes = rows * (int) kv_q4_bytes_per_head((int) s.head_dim);
         r.src[0] = (const uint8_t*) host.k_q4; r.dst[0] = (uint8_t*) slots.k_q4; r.len[0] = bytes;
         r.src[1] = (const uint8_t*) host.v_q4; r.dst[1] = (uint8_t*) slots.v_q4; r.len[1] = bytes;
@@ -231,7 +231,7 @@ __global__ void ring_kernel(int32_t* table, long long n_blocks, long long n_slot
 
 uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
     const uint64_t rows = (uint64_t) (s.n_head_kv * s.page_size);
-    if (fmt == kKvQ4) return rows * kv_q4_bytes_per_head((int) s.head_dim) * 2;
+    if (fmt == kKvQ4 || fmt == kKvFp4) return rows * kv_q4_bytes_per_head((int) s.head_dim) * 2;   // = the fp4 row at 256
     return fmt == kKvInt8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
                 : rows * (uint64_t) s.head_dim * 2 * 2;
 }

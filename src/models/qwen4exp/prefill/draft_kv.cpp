@@ -156,7 +156,9 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             basalt::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
             basalt::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
         }
-        if (st.kv_q4) {
+        if (st.kv_nvfp4) {
+            basalt::kernels::kv_append_fp4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
+        } else if (st.kv_q4) {
             basalt::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
         } else {
             kv_append(Kc, Vc, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,

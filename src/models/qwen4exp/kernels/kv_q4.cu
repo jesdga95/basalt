@@ -2,6 +2,7 @@
 // (with KV-streaming integration and a deterministic group maximum).
 #include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/kernels/f16_bits.hpp"
+#include "basalt/models/qwen4exp/kernels/fp4_bits.cuh"
 #include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
 
 #include <cuda_fp16.h>
@@ -136,6 +137,105 @@ __global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* _
     if (stage.k_q4 != nullptr) q4_store(is_v ? stage.v_q4 : stage.k_q4, row_id, b, th, d, byte);
 }
 
+// ---- NVFP4 (`--kv nvfp4`, kv_q4.hpp): the same grids as the Q4_0 kernels, one 32-thread block covering two E2M1
+// groups of 16. A head row is head_dim / 2 code bytes (element c in the low nibble of byte c / 2) then head_dim / 16
+// E4M3 scale bytes; the pool rows themselves are q4_0-sized (equal at head_dim 256, which need_256 enforces).
+
+// One block = two 16-value groups of one KV head of K (blockIdx.z = 0) or V (1); 32 threads.
+__global__ void kv_append_fp4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
+                                     const int32_t* __restrict__ table, const int32_t* __restrict__ step,
+                                     const float* __restrict__ kcur, const float* __restrict__ vcur,
+                                     int kv_heads, int head_dim, int page_size, KvHostPools host) {
+    const long long pos = (long long) __ldg(step + kStepPos);
+    const int h = blockIdx.x, b = blockIdx.y, t = threadIdx.x;
+    const bool is_v = blockIdx.z == 1;
+    const float x = (is_v ? vcur : kcur)[h * head_dim + b * 32 + t];
+    const uint32_t sc = fp4_group_scale(fp4_amax16(x));
+    const uint32_t code = fp4_group_code(x, fp4_e4m3_value(sc));
+    const uint32_t next = __shfl_down_sync(0xffffffffu, code, 1);   // lane 15's and 31's are out of group, unused
+    const long long page = (long long) table[pos / page_size];
+    const int bytes_per_head = (head_dim / QK4_0) * (int) sizeof(block_q4_0);
+    if (page >= 0) {
+        uint8_t* codes = (is_v ? v_q4 : k_q4) +
+                         ((page * kv_heads + h) * page_size + (pos % page_size)) * bytes_per_head;
+        if ((t & 1) == 0) codes[b * 16 + t / 2] = (uint8_t) (code | (next << 4));
+        if ((t & 15) == 0) codes[head_dim / 2 + 2 * b + (t >> 4)] = (uint8_t) sc;
+    }
+    if (host.k_q4 != nullptr) {   // the host copy is laid out with the identity page table
+        uint8_t* hrows = (is_v ? host.v_q4 : host.k_q4) +
+                         ((((pos / page_size) * kv_heads + h) * page_size + (pos % page_size)) * bytes_per_head);
+        if ((t & 1) == 0) hrows[b * 16 + t / 2] = (uint8_t) (code | (next << 4));
+        if ((t & 15) == 0) hrows[head_dim / 2 + 2 * b + (t >> 4)] = (uint8_t) sc;
+    }
+}
+
+// The prompt path: grid (T, kv_heads, groups of 32), K then V; also into the staging pool when given.
+__global__ void kv_append_fp4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
+                                           const int32_t* __restrict__ table, int64_t pos0,
+                                           const float* __restrict__ K, const float* __restrict__ V,
+                                           int kv_heads, int head_dim, int page_size, int is_v_grid, KvHostPools host,
+                                           KvHostPools stage) {
+    const long long t = blockIdx.x;
+    const long long pos = pos0 + t;
+    const int h = blockIdx.y, b = blockIdx.z, th = threadIdx.x;
+    const bool is_v = is_v_grid != 0;
+    const float x = (is_v ? V : K)[t * (kv_heads * head_dim) + h * head_dim + b * 32 + th];
+    const uint32_t sc = fp4_group_scale(fp4_amax16(x));
+    const uint32_t code = fp4_group_code(x, fp4_e4m3_value(sc));
+    const uint32_t next = __shfl_down_sync(0xffffffffu, code, 1);
+    const long long page = (long long) table[pos / page_size];
+    const int bytes_per_head = (head_dim / QK4_0) * (int) sizeof(block_q4_0);
+    const long long row_id = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+    const long long vrow = (page * kv_heads + h) * page_size + (pos % page_size);
+    uint8_t* pools[3] = { page >= 0 ? (is_v ? v_q4 : k_q4) + vrow * bytes_per_head : nullptr,
+                          host.k_q4 != nullptr ? (is_v ? host.v_q4 : host.k_q4) + row_id * bytes_per_head : nullptr,
+                          stage.k_q4 != nullptr ? (is_v ? stage.v_q4 : stage.k_q4) + row_id * bytes_per_head : nullptr };
+#pragma unroll
+    for (uint8_t* p : pools)
+        if (p != nullptr) {
+            if ((th & 1) == 0) p[b * 16 + th / 2] = (uint8_t) (code | (next << 4));
+            if ((th & 15) == 0) p[head_dim / 2 + 2 * b + (th >> 4)] = (uint8_t) sc;
+        }
+}
+
+// Gather step[kStepWidth] cells into FP16 scratch: one (id, kv head, group of 32) per 32-thread block, lane t
+// decoding element b * 32 + t (the low nibble of code byte (b * 32 + t) / 2, its group's scale at head_dim / 2 +
+// (b * 32 + t) / 16).
+__global__ void kv_gather_fp4_kernel(const uint8_t* __restrict__ k_q4, const uint8_t* __restrict__ v_q4,
+                                     const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
+                                     const int32_t* __restrict__ step, int kv_heads, int head_dim, int page_size,
+                                     uint16_t* __restrict__ k_scratch, uint16_t* __restrict__ v_scratch) {
+    const long long n_ids = (long long) __ldg(step + kStepWidth);
+    const int blocks_per_head = head_dim / 32;                              // 8
+    const int bytes_per_head = blocks_per_head * (int) sizeof(block_q4_0);  // 144
+    const long long total_blocks = n_ids * kv_heads * blocks_per_head;
+
+    const long long blk_idx = (long long) blockIdx.x * blockDim.y + threadIdx.y;
+    if (blk_idx >= total_blocks) return;
+
+    const int t = threadIdx.x;
+    const long long id = blk_idx / (kv_heads * blocks_per_head);
+    const int rem = (int) (blk_idx % (kv_heads * blocks_per_head));
+    const int h = rem / blocks_per_head;
+    const int b = rem % blocks_per_head;
+
+    const int cell = ids[id];
+    const long long page = (long long) table[cell / page_size];
+    const long long row = (page * kv_heads + h) * page_size + (cell % page_size);
+
+    const uint8_t* kc = k_q4 + row * bytes_per_head;
+    const uint8_t* vc = v_q4 + row * bytes_per_head;
+    const int e = b * 32 + t;
+    const float ks = fp4_e4m3_value(kc[head_dim / 2 + e / 16]);
+    const float vs = fp4_e4m3_value(vc[head_dim / 2 + e / 16]);
+    const uint32_t kcode = (kc[e / 2] >> (4 * (e & 1))) & 0x0Fu;
+    const uint32_t vcode = (vc[e / 2] >> (4 * (e & 1))) & 0x0Fu;
+    const long long dst_offset = ((id * kv_heads + h) * head_dim) + e;
+    // E2M1 value times the E4M3 scale, exact in FP32 (1 + 3 mantissa bits), before the fp16 round
+    k_scratch[dst_offset] = f16_from_f32(fp4_e2m1_value14(kcode) * (16384.0f * ks));
+    v_scratch[dst_offset] = f16_from_f32(fp4_e2m1_value14(vcode) * (16384.0f * vs));
+}
+
 // Gather step[kStepWidth] cells into FP16 scratch (the non-fused attention paths)
 __global__ void kv_gather_q4_kernel(const uint8_t* __restrict__ k_q4, const uint8_t* __restrict__ v_q4,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
@@ -227,6 +327,47 @@ void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* 
         k_q4, v_q4, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size, k_scratch,
         v_scratch);
     check("kv_gather_q4 launch");
+}
+
+// ---- NVFP4 wrappers (kv_q4.hpp): the Q4_0 launches' twins, on the same pools.
+
+void kv_append_fp4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
+                        const KvHostPools* host) {
+    need_256(s, "kv_append_fp4");
+    const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / 32), 2);
+    kv_append_fp4_kernel<<<grid, 32, 0, (cudaStream_t) stream>>>(
+        k_q4, v_q4, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
+        host ? *host : KvHostPools{});
+    check("kv_append_fp4 launch");
+}
+
+void kv_append_fp4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,
+                   const float* V, const QsaShapes& s, void* stream, const KvHostPools* host,
+                   const KvHostPools* stage) {
+    if (T <= 0) return;
+    need_256(s, "kv_append_fp4");
+    const dim3 grid((unsigned) T, (unsigned) s.n_head_kv, (unsigned) (s.head_dim / 32));
+    cudaStream_t cs = (cudaStream_t) stream;
+    const KvHostPools h = host ? *host : KvHostPools{}, st = stage ? *stage : KvHostPools{};
+    for (int is_v = 0; is_v < 2; ++is_v)
+        kv_append_fp4_batch_kernel<<<grid, 32, 0, cs>>>(k_q4, v_q4, page_table, pos0, K, V, (int) s.n_head_kv,
+                                                        (int) s.head_dim, (int) s.page_size, is_v, h, st);
+    check("kv_append_fp4 batch launch");
+}
+
+void kv_gather_fp4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* page_table, const int32_t* ids,
+                        const int32_t* step, int64_t max_ids, const QsaShapes& s, uint16_t* k_scratch,
+                        uint16_t* v_scratch, void* stream) {
+    if (max_ids <= 0) return;
+    const int blocks_per_head = (int) (s.head_dim / 32);
+    const int64_t total_blocks = max_ids * s.n_head_kv * blocks_per_head;
+    const int rows_per_block = 4;
+    const unsigned num_blocks = (unsigned) ((total_blocks + rows_per_block - 1) / rows_per_block);
+    kv_gather_fp4_kernel<<<dim3(num_blocks), dim3(32, rows_per_block), 0, (cudaStream_t) stream>>>(
+        k_q4, v_q4, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size, k_scratch,
+        v_scratch);
+    check("kv_gather_fp4 launch");
 }
 
 }  // namespace basalt::kernels

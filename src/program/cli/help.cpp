@@ -31,6 +31,8 @@ void usage() {
                  "                       VRAM; default fp16\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation: half of int8's memory,\n"
                  "                       slightly lower precision\n"
+                 "  --kv nvfp4           same size as q4_0, the model's own 4-bit grid: E2M1 codes with an\n"
+                 "                       E4M3 scale per 16 values after the rotation (finer than q4_0's)\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); not with --kv-resident\n"
                  "  --kv fp8             compressed-attention caches (their default): FP8 window rows and FP4\n"

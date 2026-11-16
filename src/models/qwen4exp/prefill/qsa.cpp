@@ -57,7 +57,10 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
             basalt::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
             basalt::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
         }
-        if (st.kv_q4)
+        if (st.kv_nvfp4)
+            basalt::kernels::kv_append_fp4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
+                                           host_w, staged ? &m.stage : nullptr);
+        else if (st.kv_q4)
             basalt::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
                                           host_w, staged ? &m.stage : nullptr);
         else
@@ -96,8 +99,9 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
         basalt::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                         m.sel_ids + t0 * m.cap, m.cs, active);
     }
-    const basalt::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
-                                                       : core::qsa_attn_pools(st);
+    basalt::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
+                                                 : core::qsa_attn_pools(st);
+    pools.q4_fmt = st.kv_nvfp4 ? 1 : 0;   // pools_of carries the stage's bytes, not their format
     // the whole chunk on tensor cores, one block per (query, KV head), FP32-level
     // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV (or a shape it does not take): the
     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,

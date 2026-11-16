@@ -162,7 +162,10 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                     fwht256_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs);
                 }
                 // stored in the state's own format (rotated INT8 K/V are not appended as Q4_0)
-                if (st_.kv_q4)
+                if (st_.kv_nvfp4)
+                    kv_append_fp4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
+                                       vcur_ + t * NKV * HD, s, cs, &st_.host);
+                else if (st_.kv_q4)
                     kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
                                       vcur_ + t * NKV * HD, s, cs, &st_.host);
                 else if (st_.kv_int8)
