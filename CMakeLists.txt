@@ -140,7 +140,9 @@ target_link_libraries(artifact INTERFACE platform warnings)
 add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/route_flags.cpp src/model/start.cpp src/model/batch_check.cpp src/model/gpu_check.cpp src/model/multi_gpu.cpp src/model/peer_hooks.cpp src/model/split_hooks.cpp src/model/control_vectors.cpp)
 target_compile_definitions(model PRIVATE BASALT_KNOWN_MODELS="${_basalt_known}" BASALT_BUILT_MODELS="${_basalt_built}")
 target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(model PUBLIC artifact warnings)
+# `kernels` is a real dependency, not a header one: control_vectors.cpp uploads the vector it read through the
+# kernel's cvec_upload.
+target_link_libraries(model PUBLIC artifact kernels warnings)
 
 if(BASALT_MODEL_QWEN4EXP)
 add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp
