@@ -7,6 +7,7 @@
 #include "basalt/core/loader.hpp"
 #include "basalt/core/prompt_stage.hpp"
 #include "basalt/core/model_file.hpp"
+#include "basalt/model/control_vectors.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/model/peer_hooks.hpp"
 #include "basalt/model/split_hooks.hpp"
@@ -317,6 +318,15 @@ private:
                   " cells need " + std::to_string((unsigned long long) (need_b >> 20)) + " MiB, " +
                   std::to_string((unsigned long long) (free_b >> 20)) + " MiB are free; lower --max-context or --parallel";
             return false;
+        }
+        // The control vector (the speed projection): its tables on the main card, before any graph is captured and
+        // before a second card is asked to hold them too.  Every layer this card runs applies it after its FFN.
+        if (req.cvec.given()) {
+            std::string ce;
+            if (!model::load_control_vectors(req.cvec, g.n_layers, g.n_embd, 1, "qwen35", o.cvec_summary, ce)) {
+                err = "qwen35: control vector: " + ce;
+                return false;
+            }
         }
         model_ = dense::make_model(g, w, o, err);
         if (!model_) return false;
@@ -670,8 +680,8 @@ public:
     program::GpuModes gpu_modes() const override { return {2, 2, 0}; }   // peer: one prompt stage; split: the layer stage
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
-        (void) code;
         if (model::parse_rope_flag(a, args, o.rope)) {}
+        else if (model::parse_cvec_flag(a, args, o.cvec, code)) {}
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
