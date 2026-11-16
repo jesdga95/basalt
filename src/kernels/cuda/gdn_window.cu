@@ -222,10 +222,6 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     const float dt = a.dt[gh], sa = a.ssm_a[gh], gam = a.gamma[col];
     stamp(a, 1);
     if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights (a no-op below sm_90)
-    // this block has started: the barrier the ranks wait on before writing into each other's shared memory
-#if !DM_REC_NO_CLUSTERS
-    if (!SPLIT) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-#endif
     // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
     // predecessor passed its own wait on the hc read), so they are computed while the projections still run
     asm volatile("cp.async.wait_all;" ::: "memory");
@@ -382,7 +378,6 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
 #if !DM_REC_NO_CLUSTERS
     // every rank's sums of squares, pushed into every rank's shared memory (every rank has started: the gates' barrier)
     // before one cluster barrier
-    asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
     if (rg == 0) {
 #pragma unroll
         for (int t0 = 0; t0 < MAXT; t0 += 8) {   // eight tokens a pass: lane 4 i + r sends token t0 + i to rank r
