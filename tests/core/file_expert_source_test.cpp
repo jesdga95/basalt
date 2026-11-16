@@ -6,6 +6,7 @@
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/platform/direct_file.hpp"
+#include "basalt/platform/memory.hpp"
 #include "basalt/platform/system.hpp"
 
 #include <cuda_runtime.h>
@@ -421,7 +422,7 @@ void test_home_regions() {
 }
 
 void test_cgroup_memory_budget() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     uint64_t bytes = 0;
 
@@ -458,7 +459,7 @@ void test_cgroup_memory_budget() {
 // memory.stat text -> available bytes, with no /sys read.  A container's own reads sit on the active list, so the
 // file total (active + inactive) is what counts as reclaimable.
 void test_cgroup_memory_stat_text() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     auto gib = [](uint64_t n) { return std::to_string(n * GiB); };
     CgroupMemoryStat stat;
@@ -499,7 +500,7 @@ void test_cgroup_memory_stat_text() {
 // The host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
 // (a limit, unlimited), and no cgroup line at all.
 void test_host_memory() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     HostMemory m;
     TempDirectory t;
@@ -557,13 +558,18 @@ void test_host_memory() {
     // the system's own files (empty paths): some RAM, and no container limit where the OS keeps no accounting file
     require(host_available_memory(m) && m.available > 0, "this machine's RAM");
     if (basalt::platform::meminfo_path().empty()) require(m.cgroup_limit == ~0ull, "no cgroup limit without cgroup files");
+    // available_memory() is that same reading (in a memory-limited cgroup, the room under the limit, not MemAvailable);
+    // the two reads are moments apart, so they agree within a GiB
+    const uint64_t avail = available_memory();
+    require(host_available_memory(m) && avail > 0 && avail <= m.available + GiB && m.available <= avail + GiB,
+            "available_memory() is not the host reading");
 }
 
 // A container whose own cgroup namespace shows its group as the mount's root, while /proc/self/cgroup names the
 // group by its host path (not visible here): the limit is read at the root.  The hybrid layout (v1 controllers plus a
 // unified line) reads the v1 memory controller.
 void test_host_memory_namespaced() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     const std::string id = "/docker/4f3c2a";
     struct Tree {

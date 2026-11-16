@@ -129,8 +129,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
 
     // The prompt and image buffers first, so the free memory the tier reads already lacks them. The ring of file reads
     // comes only when experts may stay in the file.
-    core::detail::HostMemory hm;
-    auto available = [&] { return core::detail::host_available_memory(hm) ? hm.available : 0; };
+    platform::HostMemory hm;
+    auto available = [&] { return platform::host_available_memory(hm) ? hm.available : 0; };
     const uint64_t ram_reserve = platform::ram_reserve();
     uint64_t tier_reserve = ram_reserve;   // and the file cache's floor once experts stay in the file
     // the image encoder's cuBLAS handle takes host memory when created, so it is taken before the reading
