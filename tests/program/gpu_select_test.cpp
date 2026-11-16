@@ -162,7 +162,11 @@ int main() {
     {
         const std::vector<GpuCard> v = {card(0, "RTX 4090", 8, 9, 1008, 24), card(1, "RTX 5090", 12, 0, 1792, 32)};
         CHECK(!pick("", v).error.empty());
+#if defined(BASALT_PEER_ADA)
+        CHECK_STR(cards(pick("auto", v)), "1,0");   // the sm_89 card is a second card in a -DPEER_ADA=ON build
+#else
         CHECK_STR(cards(pick("auto", v)), "1");
+#endif
         CHECK(pick("auto", v).notes.size() == 1);
     }
     // No card list (no management library, no CUDA_VISIBLE_DEVICES): numbers pass, auto cannot run.
