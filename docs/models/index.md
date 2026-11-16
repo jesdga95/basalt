@@ -19,6 +19,7 @@ file and picks the chat format, tool syntax and thinking switch. Several models 
 | Layer split | yes, matched cards, priced at start | no | no | no |
 | Parallel slots | yes; each slot drafts | yes; each slot drafts | yes; each slot drafts | not measured |
 | Lossy flags | `--relaxed-drafting`, `--route-prior`, `--route-tail-skip` (off) | none | none | none |
+| Control vectors | yes, a model-specific vector ([control vectors](../configuration/index.md#control-vectors)) | no | yes, a model-specific vector | no |
 | Prompt skip | no | yes (`--no-prompt-skip` turns it off) | no | no |
 | Idle sleep, wake | yes (Linux) | yes (Linux); a second-card sleep may be refused | no | yes (Linux) |
 | `basalt-bench --quality` | yes | yes, one row per window | yes | yes |
