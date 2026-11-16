@@ -74,13 +74,14 @@ bool on_card(const std::string& name, const dense::Options& o, int lo, int hi) {
 
 // The dense stack's options for a run of these flags (the drafter the pack carries, when drafting).
 dense::Options run_options(const GgufFile& gg, int64_t max_context, int sessions, int spec, bool draft, bool vision, const std::string& kv,
-                           int64_t kv_resident) {
+                           int64_t kv_resident, bool prefer_mtp = false) {
     const auto has = [&](const char* name) {
         for (const TensorInfo& t : gg.tensors())
             if (t.name == name) return true;
         return false;
     };
-    const bool block = draft && has("dflash.fc.0.weight"), mtp = draft && !block && has("mtp.fc.weight");
+    const bool has_mtp = has("mtp.fc.weight");
+    const bool block = draft && !(prefer_mtp && has_mtp) && has("dflash.fc.0.weight"), mtp = draft && !block && has_mtp;
     dense::Options o;
     o.max_context = max_context;
     o.sessions = sessions;
@@ -192,7 +193,8 @@ private:
             return false;
         }
         for (const TensorInfo& t : gg.tensors()) tensors_[t.name] = t;
-        dense::Options o = run_options(gg, req.max_context, req.sessions, req.spec, req.draft, req.vision, req.kv, req.kv_resident);
+        dense::Options o = run_options(gg, req.max_context, req.sessions, req.spec, req.draft, req.vision, req.kv, req.kv_resident,
+                                       req.diag_mtp_drafter);
         const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
         dense::BlockDrafter bd_meta;
         if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;

@@ -746,6 +746,7 @@ bool chain_chunk(Model& root, SessionState& root_st, const int32_t* tokens, cons
     const bool block = root.o.drafter == Drafter::Block;
     const BlockDrafter* bd = block ? &root.w.dflash : nullptr;
     const bool tap_last = bd && std::find(bd->target_layers.begin(), bd->target_layers.end(), root.g.n_layers - 1) != bd->target_layers.end();
+    const bool mtp = root_st.mtp_kc != nullptr;   // only the main card's session holds the MTP drafter
     uint8_t* residual = nullptr;
     uint8_t* back = copy_back ? root.split->hand[1] : nullptr;
     Model* card = &root;
@@ -767,7 +768,7 @@ bool chain_chunk(Model& root, SessionState& root_st, const int32_t* tokens, cons
             Stage* mine = stage_owning(root, card);
             int at = card->lb;
             int q = 0;
-            const bool read_last = card->le >= card->g.n_layers && (ss->mtp_kc != nullptr || tap_last);
+            const bool read_last = card->le >= card->g.n_layers && (mtp || tap_last);
             if (mine != nullptr) {
                 for (int tl : mine->split_hand.taps) {
                     if (tl >= card->le) break;
