@@ -310,6 +310,14 @@ public:
             const std::vector<basalt::core::SaveSegment> ps{{c.state_a.data() + rs.head.size() + rs.regions_bytes(), rs.peer_regions}};
             if (!ckd_peer.save(ps, (cudaStream_t) rs.peer_stream, c.state_a.data(), err)) return false;
         }
+        size_t skip = rs.head.size() + rs.regions_bytes() + basalt::core::RunningState::sum(rs.peer_regions);
+        for (const basalt::core::RunningState::LaterCard& later : rs.further) {
+            if (later.regions.empty()) continue;
+            const basalt::core::OnDevice on(later.device);
+            const std::vector<basalt::core::SaveSegment> later_seg{{c.state_a.data() + skip, later.regions}};
+            if (!basalt::core::checkpoint_copy_out(later_seg, (cudaStream_t) later.stream, err)) return false;
+            skip += basalt::core::RunningState::sum(later.regions);
+        }
         keep_check(std::move(c));
         return true;
     }
