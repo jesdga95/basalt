@@ -1182,7 +1182,7 @@ uint64_t FileExpertSource::top_up(const std::vector<std::pair<int32_t, int32_t>>
         for (int32_t e = 0; e < (int32_t) n_expert_; ++e)
             if (complement_offsets_[(size_t) l * (size_t) n_expert_ + (size_t) e] == kNoComplement && !skip(l, e))
                 want += layer_blob_bytes_[(size_t) l];
-    const uint64_t reserve = basalt::platform::ram_reserve();
+    const uint64_t reserve = plan_reserve(basalt::platform::ram_reserve());
     const uint64_t room = ram_tier_room(avail, reserve + file_cache_keep(avail, reserve, pin, want, file_cache_), pin);
     // hottest first, as many as fit
     std::vector<std::pair<int32_t, int32_t>> pick;

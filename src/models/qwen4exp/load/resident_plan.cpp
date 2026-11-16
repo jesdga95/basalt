@@ -241,7 +241,7 @@ int resident_plan(Context& context) {
         in.extra_peer_excl = lent_bytes + spares_excl;
         in.floor_bytes = in.ram_available - basalt::core::ram_tier_room(
             in.ram_available,
-            std::max(o.resident_headroom, basalt::platform::ram_reserve()) +
+            std::max(o.resident_headroom, basalt::core::plan_reserve(basalt::platform::ram_reserve())) +
                 basalt::core::pin_tracking_bytes(basalt::core::host_plan_bytes()),
             o.resident_pin);
         bp::AutoGiven& gv = in.given;
