@@ -24,7 +24,7 @@ from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bia
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, checked as checked_logprobs
 from serve.config import checked_sampling
 from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
-from serve.api.openai import openai_chunks, openai_collect
+from serve.api.openai import checked_return_progress, openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
 from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
@@ -666,6 +666,7 @@ def make_handler(target: Service | Router):
             check_format(req.get("response_format"))
             self.svc.require_grammar(req.get("response_format"))
             checked_sampling(req)                             # a sampling value out of range is a 400 likewise
+            checked_return_progress(req)                      # and a return_progress that is not a boolean
             self._open_live("chatcmpl-" + uuid.uuid4().hex[:24], req)
             req[LOGPROBS_KEY] = checked_logprobs(req)         # and a bad logprobs / top_logprobs
             self._take_turn(bool(req.get("stream")))

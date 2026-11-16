@@ -654,6 +654,21 @@ class Service:
             rows.append(row)
         return rows, queue
 
+    def prompt_progress(self, n_prompt: int | None) -> dict | None:
+        """llama.cpp's `prompt_progress` for the request this thread runs: {total, cache, processed, time_ms}, where
+        `processed` counts the cached prefix too; None before the engine has said anything of the read (or when it has
+        no such figures). `n_prompt` stands in for the total when only the cache is known."""
+        state = getattr(self.engine, "prompt_progress", None)
+        s = state() if callable(state) else None
+        if not isinstance(s, dict) or not s:
+            return None
+        total = s.get("total") if s.get("total") is not None else n_prompt
+        if total is None:
+            return None
+        cache = min(int(s.get("cache") or 0), total)
+        processed = min(max(int(s["read"]), cache), total) if s.get("read") is not None else cache
+        return {"total": total, "cache": cache, "processed": processed, "time_ms": int(s.get("ms") or 0)}
+
     def metrics(self) -> dict:
         """GET /metrics: engine facts, live state, recent requests, hardware and speed history."""
         with self.status_lock:
