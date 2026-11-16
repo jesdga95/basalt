@@ -49,11 +49,18 @@ threading.Thread(target=reader, daemon=True).start()
 if batch:
     print(f'INFO batch_slots={batch}', flush=True)
 print('READY 4096 stop', flush=True)
-count = 0
+count = held = 0
 while True:
     line = commands.get()
     if line == 'QUIT':
         break
+    if line.startswith('PROMPTI'):             # a held prompt: answered at once, then matched against the idle slots
+        held += 1
+        print(f'PROMPT {held} {len(line.split()[-1].split(","))}', flush=True)
+        continue
+    if line.startswith('PMATCH '):
+        print('PMATCH ' + line.split()[1] + ' ' + ' '.join(['0:0'] * batch), flush=True)
+        continue
     if not line.startswith(('GEN ', 'BGEN ')):
         continue
     count += 1

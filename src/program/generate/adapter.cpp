@@ -62,6 +62,7 @@ struct AdapterImage {
     int64_t at = 0;
     std::vector<float> rows;
     int n_rows = 0;
+    basalt::model::ImageGrid grid;
 };
 
 struct AdapterTimes {
@@ -143,7 +144,7 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
         }
         if (r.ok() && i < images.size()) {
             const auto tp = Clock::now();
-            r = sess.prefill_embeddings(images[i].rows.data(), images[i].n_rows, pos);
+            r = sess.prefill_embeddings(images[i].rows.data(), images[i].n_rows, pos, images[i].grid);
             basalt::log::info("basalt generate", "image prefill %d rows in %.0f ms", images[i].n_rows,
                          std::chrono::duration<double, std::milli>(Clock::now() - tp).count());
             pos += images[i].n_rows;
@@ -202,7 +203,7 @@ int adapter_generate(basalt::model::LoadedModel& loaded, const std::vector<int64
         std::ifstream f(images[i], std::ios::binary);
         const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         const auto te = Clock::now();
-        const basalt::model::Result er = sess->encode_image(bytes.data(), bytes.size(), blocks[i].rows, blocks[i].n_rows);
+        const basalt::model::Result er = sess->encode_image(bytes.data(), bytes.size(), blocks[i].rows, blocks[i].n_rows, blocks[i].grid);
         if (!er.ok()) {
             basalt::log::error("basalt generate", "%s: %s", images[i].c_str(), er.message.c_str());
             return 1;
@@ -366,6 +367,11 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.draft_experts = o.draft_experts;
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         lreq.kv = o.kv;
+        lreq.rope = o.rope;
+        lreq.kv_resident = o.kv_resident;
+        lreq.card_gbps.push_back(o.main_gbps);
+        lreq.card_gbps.insert(lreq.card_gbps.end(), o.peer_gbps.begin(), o.peer_gbps.end());
+        lreq.diag_split_at = o.diag_split_at;
         const basalt::model::Result r = adapter->load(lreq, loaded);
         if (!r.ok() || !loaded) return fatal_start_error(r.message);
         std::vector<int64_t> stop;

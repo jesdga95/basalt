@@ -80,6 +80,20 @@ class TextService(unittest.TestCase):
         self.assertEqual(start["message"]["usage"]["input_tokens"],
                          len(ByteTokenizer().encode(self.engine.seen_text, parse_special=True)))
 
+    def test_responses_usage_carries_the_engines_count(self):
+        for stream in (False, True):
+            status, body = self.post("/v1/responses", {"model": "basalt", "input": "hi " * 50, "max_output_tokens": 8,
+                                                       "stream": stream})
+            self.assertEqual(status, 200, body)
+            if stream:
+                events = [json.loads(line[5:]) for line in body.splitlines() if line.startswith("data:")]
+                response = [e for e in events if e.get("type") == "response.completed"][0]["response"]
+            else:
+                response = json.loads(body)
+            usage = response["usage"]
+            self.assertEqual(usage["input_tokens"], len(ByteTokenizer().encode(self.engine.seen_text, parse_special=True)))
+            self.assertEqual(usage["total_tokens"], usage["input_tokens"] + usage["output_tokens"])
+
     def test_a_prompt_over_the_context_is_a_400_before_streaming(self):
         for stream in (False, True):
             status, body = self.post("/v1/chat/completions", self.chat("y" * (CTX + 10), max_tokens=8, stream=stream))

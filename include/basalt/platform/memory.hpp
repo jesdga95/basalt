@@ -77,7 +77,45 @@ inline uint64_t pin_reserve(uint64_t budget) { return budget / 20 > (1ull << 30)
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 
-/// The RAM the OS can hand out without paging, in bytes (0 when unknown).
+/// Required cgroup-v2 usage counters for the conservative cache-reclaim allowance.
+struct CgroupMemoryStat {
+    uint64_t current = 0;
+    uint64_t inactive_file = 0;
+    uint64_t file_dirty = 0;
+    uint64_t file_writeback = 0;
+    bool valid = false;
+    uint64_t file = 0;  // page cache, active + inactive; 0 when memory.stat does not report it
+    uint64_t shmem = 0; // the part of `file` that is shared memory (pinned host buffers among it): never reclaimed
+};
+
+/// Parse a cgroup-v2 memory.stat text (inactive_file, file_dirty, file_writeback required; file and shmem optional).
+/// False on a malformed or incomplete text.
+bool parse_cgroup_memory_stat(const std::string& text, uint64_t current, CgroupMemoryStat& stat);
+
+/// Calculate additional bytes under a finite cgroup limit after reclaiming clean file cache.
+/// Returns false when the required memory.stat counters were unavailable.
+bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes);
+
+/// the RAM this process can get.  `available`: MemAvailable, lowered to the room under the tightest cgroup limit;
+/// `cgroup_limit`: that tightest limit itself (v2 memory.max of the group and its ancestors, or v1
+/// memory.limit_in_bytes), ~0 when there is none - what a container can never exceed.
+struct HostMemory {
+    uint64_t available = 0;
+    uint64_t cgroup_limit = ~uint64_t{0};
+};
+
+/// This reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; an
+/// empty one is the system's own file, see platform::meminfo_path - and on a system with none, the OS's available-RAM
+/// reading is the whole answer and no container limit is tighter than it).  A v1 memory controller line wins over the unified line (the hybrid layout): v1 reads
+/// `<root>/memory/<path>` (memory.limit_in_bytes - memory.usage_in_bytes, clean inactive file cache counted as free),
+/// v2 reads `<root>/<path>` (memory.max, memory.current, memory.stat).  A group not visible here is read at the mount's
+/// root (a container's own namespace); groups without a readable limit add none; no cgroup file or line is MemAvailable
+/// alone.  False when MemAvailable is missing or a visible v2 limit or its memory.stat is malformed.
+bool host_available_memory(HostMemory& m, const std::string& meminfo = "", const std::string& self_cgroup = "",
+                           const std::string& cgroup_root = "");
+
+/// The RAM this process can get without paging, in bytes (0 when unknown): host_available_memory of the system's own
+/// files, so a container's memory limit lowers it as it does the RAM tiers' plan; the OS reading where that fails.
 uint64_t available_memory();
 
 /// The RAM left free for the rest of the system (--ram-reserve-mib): the expert tiers leave it, and while serving the

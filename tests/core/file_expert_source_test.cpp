@@ -6,6 +6,7 @@
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/platform/direct_file.hpp"
+#include "basalt/platform/memory.hpp"
 #include "basalt/platform/system.hpp"
 
 #include <cuda_runtime.h>
@@ -291,6 +292,14 @@ void test_resident_lend_region() {
     require(budget_lend_room(10, 10) == 10, "a budget of exactly the complement must keep the lend region");
     require(budget_lend_room(68, 39) == 68, "a budget above the complement must give the lend region its rest");
     require(budget_lend_room(17, 10) - 10 == 7, "the lend region's room is what the budget has after the complement");
+    // the caller asks with the complement plus the adaptive swaps' free places (#342, #366): a budget that holds the
+    // experts but not the places keeps no lend region, so the places stay; one that holds both keeps it
+    constexpr uint64_t experts = 3779, places = 75;   // 37.79 GiB and 749 MiB, in 10 MiB
+    require(budget_lend_room(3700, experts + places) == 0, "a budget short of the experts kept the lend region");
+    require(budget_lend_room(3800, experts + places) == 0, "a budget between the experts and the places kept the lend region");
+    require(budget_lend_room(experts + places - 1, experts + places) == 0, "a budget one short of the places kept it");
+    require(budget_lend_room(experts + places, experts + places) == experts + places, "a budget holding both must keep it");
+    require(budget_lend_room(3900, experts + places) == 3900, "a budget above both must give the lend region its rest");
 }
 
 // A 62 GiB machine with swap, one card, a third of the experts left in the file (issue #285): the tier leaves the OS
@@ -318,6 +327,23 @@ void test_file_cache_keep() {
             "the file cache keeps at least its minimum");
     // everything in the file (no RAM above the reserve): the whole largest layer twice and a chunk
     require(file_cache_floor(want, want, FileCache{4 * kGiB, kGiB}) == 9 * kGiB + 2, "two whole layers and a chunk");
+}
+
+void test_plan_reserve() {
+    using basalt::core::kPostPlanHostBytes;
+    using basalt::core::plan_reserve;
+    using basalt::core::ram_tier_room;
+    constexpr uint64_t kGiB = 1ull << 30;
+    require(plan_reserve(2 * kGiB) == 2 * kGiB + kPostPlanHostBytes, "the plan leaves the reserve and the late allowance");
+    require(plan_reserve(0) == 0, "a guard that is off leaves nothing");
+    // a tier sized against plan_reserve() still has the guard's line free after the engine takes its late memory, where one
+    // sized against the reserve alone ends on it (#339)
+    const uint64_t avail = 55 * kGiB, reserve = 2 * kGiB;
+    const uint64_t on_line = avail - ram_tier_room(avail, reserve, false);
+    const uint64_t with_allowance = avail - ram_tier_room(avail, plan_reserve(reserve), false);
+    require(on_line == reserve, "sized by the reserve alone, the tier leaves exactly the guard's line");
+    require(with_allowance - kPostPlanHostBytes >= reserve, "with the allowance, the late memory does not reach the guard");
+    require(ram_tier_room(kPostPlanHostBytes, plan_reserve(reserve), true) == 0, "RAM below the plan's reserve leaves no room");
 }
 
 void test_ram_tier_room() {
@@ -413,7 +439,7 @@ void test_home_regions() {
 }
 
 void test_cgroup_memory_budget() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     uint64_t bytes = 0;
 
@@ -450,7 +476,7 @@ void test_cgroup_memory_budget() {
 // memory.stat text -> available bytes, with no /sys read.  A container's own reads sit on the active list, so the
 // file total (active + inactive) is what counts as reclaimable.
 void test_cgroup_memory_stat_text() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     auto gib = [](uint64_t n) { return std::to_string(n * GiB); };
     CgroupMemoryStat stat;
@@ -481,6 +507,16 @@ void test_cgroup_memory_stat_text() {
             "small text rejected");
     require(cgroup_available_bytes(64000, stat, bytes) && bytes == 64000 - 680, "margin exceeded half the reclaimable");
 
+    // shared memory (pinned host buffers) is in `file` but never reclaimed
+    require(parse_cgroup_memory_stat("file " + gib(40) + "\nshmem " + gib(30) + "\ninactive_file " + gib(2) +
+                                         "\nfile_dirty 0\nfile_writeback 0\n", current, stat) && stat.shmem == 30 * GiB,
+            "memory.stat with shmem was rejected");
+    require(cgroup_available_bytes(limit, stat, bytes), "shmem: available refused");
+    require(bytes == (limit - (current - 10 * GiB)) - limit / 64, "shared memory counted reclaimable");
+    require(parse_cgroup_memory_stat("file " + gib(4) + "\nshmem " + gib(6) + "\ninactive_file " + gib(1) +
+                                         "\nfile_dirty 0\nfile_writeback 0\n", current, stat) &&
+                cgroup_available_bytes(limit, stat, bytes) && bytes == (limit - (current - 1 * GiB)) - 1 * GiB / 2,
+            "shmem above file: the inactive list alone");
     // malformed text fails closed
     require(!parse_cgroup_memory_stat("inactive_file 1\nfile_dirty 0\n", current, stat), "missing writeback accepted");
     require(!parse_cgroup_memory_stat("file 1\nfile 2\ninactive_file 1\nfile_dirty 0\nfile_writeback 0\n", current, stat),
@@ -491,7 +527,7 @@ void test_cgroup_memory_stat_text() {
 // The host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
 // (a limit, unlimited), and no cgroup line at all.
 void test_host_memory() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     HostMemory m;
     TempDirectory t;
@@ -549,13 +585,18 @@ void test_host_memory() {
     // the system's own files (empty paths): some RAM, and no container limit where the OS keeps no accounting file
     require(host_available_memory(m) && m.available > 0, "this machine's RAM");
     if (basalt::platform::meminfo_path().empty()) require(m.cgroup_limit == ~0ull, "no cgroup limit without cgroup files");
+    // available_memory() is that same reading (in a memory-limited cgroup, the room under the limit, not MemAvailable);
+    // the two reads are moments apart, so they agree within a GiB
+    const uint64_t avail = available_memory();
+    require(host_available_memory(m) && avail > 0 && avail <= m.available + GiB && m.available <= avail + GiB,
+            "available_memory() is not the host reading");
 }
 
 // A container whose own cgroup namespace shows its group as the mount's root, while /proc/self/cgroup names the
 // group by its host path (not visible here): the limit is read at the root.  The hybrid layout (v1 controllers plus a
 // unified line) reads the v1 memory controller.
 void test_host_memory_namespaced() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     const std::string id = "/docker/4f3c2a";
     struct Tree {
@@ -622,6 +663,7 @@ int main() {
         test_complement_plan();
         test_resident_lend_region();
         test_resident_exchange();
+        test_plan_reserve();
         test_ram_tier_room();
         test_file_cache_keep();
         test_cgroup_memory_budget();

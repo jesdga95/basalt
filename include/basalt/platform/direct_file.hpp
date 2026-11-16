@@ -36,6 +36,8 @@ public:
     bool open(const std::string& path, std::string& err, int workers = 0, bool mapped_elsewhere = false);
     void close();
     bool is_open() const;
+    /// Whether the open file is read around the file cache. False for an open with `mapped_elsewhere` on Windows.
+    bool bypasses_cache() const;
     uint64_t size() const;
     static constexpr uint32_t alignment() { return 4096; }
 

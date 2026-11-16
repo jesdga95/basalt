@@ -123,6 +123,18 @@ Flow Request::parse() {
             } else {
                 pe = "the tokenized prompt is gone";
             }
+        } else if (*endp == '#') {   // a prompt held by handle, then the ids this request adds after it
+            char* after = nullptr;
+            std::lock_guard<std::mutex> lk(runtime_.gent_mu);
+            const auto it = runtime_.prompts.find(std::strtoull(endp + 1, &after, 10));
+            if (it == runtime_.prompts.end()) {
+                pe = "the held prompt is gone";
+            } else {
+                ids.assign(it->second.ids.begin(), it->second.ids.end());
+                std::vector<int64_t> more;
+                ids_ok = *after != '+' || cli::parse_i64_list(after + 1, more, pe);
+                ids.insert(ids.end(), more.begin(), more.end());
+            }
         } else {
             ids_ok = cli::parse_i64_list(endp, ids, pe);
         }

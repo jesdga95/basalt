@@ -1,6 +1,8 @@
 # GPUs
 
-Flash-Next uses every mechanism on this page. DeepSeek takes one second card as an expert tier and nothing else.
+Flash-Next uses every mechanism on this page. DeepSeek takes up to four second cards as expert tiers and nothing else, each
+holding the experts of its own block of layers ([DeepSeek memory](../models/deepseek41.md#memory)).
+Qwen3.8-27B uses a second card for long prompts, or for its later layers when it does not fit the main card.
 
 One setting picks the cards: `gpu`. It means the same in the server (`"gpu"` in the config's `server` section, or
 `--gpu`), in `basalt` itself, in `basalt-bench` and in `basalt-probe`.
@@ -35,6 +37,14 @@ Three or more cards are community-tested: the path is checked here on two cards,
 second one. Reports from machines with three or four cards are welcome (see [community](../community.md)).
 
 ## What several cards do together
+
+A dense model (Qwen3.8-27B) decodes on the main card alone when the model, its context and its slots fit there: it reads every weight
+every token, so a split would put part of each token on the slower card. A second card (the start line calls it the `prompt line`) then
+reads the last layers of long prompts as a pipeline beside the main card ([Qwen3.8-27B](../models/qwen38-27b.md#long-prompts-on-two-cards));
+the line is off with `kv-resident`. When they do not fit, the second card is a `layer stage`: it holds the later layers with their KV cache
+and recurrent state and runs them in every decode window and prompt chunk, and the output is the main card's alone to the bit
+([Qwen3.8-27B](../models/qwen38-27b.md#two-cards-when-it-does-not-fit-one)). Later cards idle. `"auto"` gives the 27B both cards when two
+Blackwell cards are visible; without room on the second card the start says why and the model runs on the main card alone.
 
 With two or more cards the engine prices three mechanisms at start, as milliseconds per decode window, from the cards'
 memory bandwidth, their VRAM and the model's size, and prints one line, for example

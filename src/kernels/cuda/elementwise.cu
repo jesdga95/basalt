@@ -206,6 +206,27 @@ void wait_word(const uint32_t* word, uint32_t value, void* stream) {
     check_launch("wait_word");
 }
 
+__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+    while (*flag < value) spin_pause();
+    __threadfence_system();
+}
+
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
+    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check_launch("wait_flag_ge");
+}
+
+__global__ void signal_flag_kernel(volatile uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *flag = value;
+    __threadfence_system();
+}
+
+void signal_flag(uint32_t* flag, uint32_t value, void* stream) {
+    signal_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check_launch("signal_flag");
+}
+
 __global__ void copy_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t n4) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
         const float4 v = const_cast<const float4*>(src)[i];

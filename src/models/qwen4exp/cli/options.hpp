@@ -30,8 +30,7 @@ std::optional<int> validate_kv_streaming(const Options& o);
 bool normalize_speculation_options(Options& o);
 
 // Check CLI ranges and conflicts before allocating weights; seed the RoPE type for model resolution.
-std::optional<int> validate_generation_options(const Options& o, bool multi_gpu, int min_vram_reserve_mib,
-                                              basalt::kernels::RopeScaling& rope_cfg);
+std::optional<int> validate_generation_options(const Options& o, bool multi_gpu, int min_vram_reserve_mib);
 basalt::kernels::SamplerParams sampling_options(const Options& o);
 
 }  // namespace basalt::models::qwen4exp::cli

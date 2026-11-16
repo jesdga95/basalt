@@ -42,6 +42,11 @@ int main() {
 #else
     expect("deepseek41", false);
 #endif
+#ifdef BASALT_MODEL_QWEN35
+    expect("qwen35", true);
+#else
+    expect("qwen35", false);
+#endif
     check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
         std::unique_ptr<model::LoadedModel> loaded;

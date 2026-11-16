@@ -12,6 +12,12 @@ Protocol (one line each):
     raw UTF-8: the engine tokenizes (control literals on; `plain` byte spans are text) and answers like a GEN, with
     `PT <n> <max_new>` before the first PP line. `clip=1` cuts max_new to the room the context leaves after the prompt.
     The slot and batch forms are SGENT and BGENT; the server uses only GENT.
+  * held prompts (--batch): `PROMPT <nbytes> [plain=a:b,...]` + text (the engine tokenizes) or `PROMPTI [img] <ids>` ->
+    `PROMPT <handle> <n>` at once, even while a request runs (or `PROMPT ERR <why>`). `PMATCH <handle>` -> `PMATCH
+    <handle> <match>:<held> ...`, one pair per slot: the tokens of the prompt the slot's idle conversation covers (the
+    engine's own matching: an exact prefix, or the model's own pieces for the same bytes) and the tokens it holds.
+    `BGEN`/`SGEN` then name the prompt where the ids go: `#<handle>[+<id>,...]` (the ids a request that ran in several
+    engine runs adds after it); `PFREE <handle>` drops it.
   * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> ...`; with
     `logprobs=K`, one `BP <slot> <id> <lp> [...]` line per kept pick ahead of its `BT` line;
     `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`).
@@ -344,6 +350,7 @@ class ProcessEngine:
         self.ended = False                              # READY: alive from here
         # stdout is pumped on a thread so requests can wait with a timeout
         self.lines: queue.Queue = queue.Queue()
+        self.prompt_q: queue.Queue = queue.Queue()      # the engine's answers to held prompts
         # the engine reports the slots it actually runs (INFO batch_slots=N), possibly fewer than asked
         asked = next((int(v) for v in (flag_value(args, k) for k in ("--batch", "--slots")) if v), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
@@ -352,13 +359,17 @@ class ProcessEngine:
         self.slot_order = list(range(self.batch))
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
-        # tokens each slot holds (for prefix reuse by a conversation's next turn) and when it was last used
-        self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+        # tokens each slot holds (the engine's count, kept up to date as requests end), when it was last used, and a
+        # count of its changes: what a prompt's held prefix said of the slot is stale once the slot changed
+        self.slot_held: list[int] = [0] * self.batch
         self.slot_used = [0.0] * self.batch
+        self.slot_epoch = [0] * self.batch
         # session identity (a load-balancer header) -> its slot: a conversation stays in one slot, so its next
         # turn continues the K/V that is already there instead of being admitted wherever and copied in
         self.slot_owner: dict[int, str] = {}
         self.session_slot: dict[str, int] = {}
+        # the request thread that last took each slot: the slot table shows a running request on its own slot
+        self.slot_thread: list[int | None] = [None] * self.batch
         # admission state outlives engine processes: restart() re-runs this while requests wait on it
         if "ctl" not in self.__dict__:
             self.waiting = 0                            # requests waiting for ctl
@@ -366,6 +377,7 @@ class ProcessEngine:
             self.ctl_epoch = 0                          # times ctl was taken
             self.ctl = threading.Lock()                 # one admission or solo request at a time
             self.admission = AdmissionQueue()           # requests waiting for a free slot
+            self.prompt_lock = threading.Lock()         # one held prompt asked at a time: its answers come in order
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is
         self._yielded = None                            # (slot, tokens read) of a read that gave way
         self._ctl_erred = False                         # the control lines ended on an ERR
@@ -396,7 +408,7 @@ class ProcessEngine:
 
     def _pump(self):
         proc, lines, log = self.proc, self.lines, self.log   # a restart replaces all three
-        slot_q = self.slot_q
+        slot_q, prompt_q = self.slot_q, self.prompt_q
         line = None
         for line in proc.stdout:
             line = engine_line(line)
@@ -420,6 +432,9 @@ class ProcessEngine:
                 except OSError:
                     pass
                 break                                   # publish EOF, never the trailing DONE
+            if line.startswith("PROMPT "):              # the answer to a held prompt, for whoever sent it
+                prompt_q.put(line)
+                continue
             if line.startswith(("BT ", "BP ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
                 try:
                     slot_q[int(line.split()[1])].put(line)
@@ -432,6 +447,7 @@ class ProcessEngine:
             if line and line.startswith("ERR"):         # why it exited, when no request read it
                 self.last_err = line[4:].strip()
         lines.put(None)
+        prompt_q.put(None)
         for q in slot_q:
             q.put(None)
 
@@ -824,9 +840,9 @@ class ProcessEngine:
                 return line
         return None
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, wait_s: float = 0.0):
-        """BSTOP a slot whose consumer left and free it at BDONE; `stream` (prompt + tokens so far) becomes what the
-        slot holds. Waits up to `wait_s` for the BDONE and returns its fields (None when it has not come: the
+    def _release_slot_when_done(self, slot: int, stream: int | None = None, wait_s: float = 0.0):
+        """BSTOP a slot whose consumer left and free it at BDONE; `stream` (the tokens of the prompt and the tokens so
+        far) becomes what the slot holds. Waits up to `wait_s` for the BDONE and returns its fields (None when it has not come: the
         rest is freed in the background)."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots
             return None
@@ -834,8 +850,8 @@ class ProcessEngine:
             self._send(f"BSTOP {slot}")
         except EngineDied:
             pass
-        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # restart() replaces them
-        tail = list(stream or [])
+        q, busy = self.slot_q[slot], self.slot_busy     # restart() replaces them
+        tail = [stream or 0]                            # the tokens the slot holds so far, one counted past the fed ones
 
         def drain(end):             # "done" (fields) | "gone" (engine ended) | "wait" (not yet)
             while time.monotonic() < end:
@@ -844,13 +860,10 @@ class ProcessEngine:
                 except queue.Empty:
                     continue
                 if line is None:
-                    tail.clear()
+                    tail[0] = 0
                     return "gone", None
                 if line.startswith("BT "):
-                    try:
-                        tail.extend(int(x) for x in line.split()[2:])
-                    except ValueError:
-                        tail.clear()
+                    tail[0] += len(line.split()) - 2
                 if line.startswith("BDONE "):
                     f = line.split()
                     self._note_bdone(slot, f)
@@ -858,7 +871,7 @@ class ProcessEngine:
             return "wait", None
 
         def free():
-            held[slot] = tail[:-1] if stream and tail else []
+            self._hold(slot, tail[0] - 1 if stream and tail[0] else 0)
             with self.slot_cv:
                 busy[slot] = False
                 self.slot_cv.notify_all()
@@ -1002,24 +1015,65 @@ class ProcessEngine:
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None, session=None, stop_soon=None):
         """--batch: run solo (GEN) while alone, move to a batch slot (BGEN) when others arrive, and return to solo
         when left alone. Prompt reads and admissions take the control lines one at a time; a long read may give way
-        to a much shorter waiting one (BYIELD). An early-leaving consumer is STOPped/BSTOPped and drained."""
+        to a much shorter waiting one (BYIELD). An early-leaving consumer is STOPped/BSTOPped and drained. The prompt
+        goes to the engine once, as a text it tokenizes or as ids, and every run of the request names it by handle."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress = None
         self._reset_windows()
+        handle, n = self._hold_prompt(ids, embeddings)
+        held = {"handle": handle, "gen": self.gen}      # the prompt on this engine process (a restart loses it)
+        try:
+            if isinstance(ids, PromptText):     # counted: an over-long prompt is refused here, before the stream starts
+                max_new = ids.settle(n, int(max_new), self.max_context)
+                yield None
+            yield from self._generate_batched(ids, held, n, max_new, sampling, cancel, embeddings, session, stop_soon)
+        finally:
+            if held["gen"] == self.gen and self.alive():
+                try:
+                    self._send(f"PFREE {held['handle']}")       # the engine drops the held prompt
+                except EngineDied:
+                    pass
+
+    def _generate_batched(self, ids, held, n, max_new, sampling, cancel, embeddings, session, stop_soon):
         keys = self.sampling_keys(sampling or {})
         out: list[int] = []
         pending: list[int] = []
-        prompt, left = list(ids), int(max_new)
+        left = int(max_new)
+        extra: list[int] = []         # the tokens an earlier run of this request generated: the held prompt, then these
+        meet, epoch = [], []          # per slot: the tokens of the prompt it covers, and the slot's epoch when it said so
+        handle = held["handle"]
+
+        def attach() -> None:       # the control lines are held: the prompt on this engine, and what its slots cover of it
+            nonlocal handle, meet, epoch
+            if held["gen"] != self.gen:             # the engine restarted while this request waited: hold it again
+                handle, _ = self._hold_prompt(ids, embeddings)
+                held.update(handle=handle, gen=self.gen)
+                meet = []
+            if not meet:
+                meet = self._meet(handle, self.gen)
+                epoch = list(self.slot_epoch)
 
         def gen_keys() -> str:      # a run that continues after tokens were generated tells the grammar where the prompt ends
-            return keys + (f" gprompt={len(ids)}" if out and " grammar=" in keys else "")
-        ok = yield from self._take_control(cancel, len(prompt))
+            return keys + (f" gprompt={n}" if out and " grammar=" in keys else "")
+
+        def size() -> int:
+            return n + len(extra)
+
+        def ref() -> str:           # where a GEN line has its ids
+            return f"#{handle}" + ("+" + ",".join(str(int(t)) for t in extra) if extra else "")
+
+        def meets() -> list[int]:   # what each slot still covers of the prompt: nothing once the slot changed
+            return [m if e == self.slot_epoch[b] else 0 for b, (m, e) in enumerate(zip(meet, epoch))]
+
+        def note(slot: int) -> None:     # the slot now holds a start of the prompt: its own run's tokens
+            meet[slot], epoch[slot] = self.slot_held[slot], self.slot_epoch[slot]
+        ok = yield from self._take_control(cancel, size())
         if not ok:
             return
         holding, born = True, self.gen                  # born: engine generation holding the control lines
         slot, gen0, reserved = None, None, None
-        solo_slot, run0 = None, 0
+        solo_slot, run0, run_size, ctl_epoch = None, 0, 0, 0
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
         yields, solo_again = 0, 0
@@ -1027,12 +1081,14 @@ class ProcessEngine:
         first, last0 = [], self.last   # reused prefix of the first run; `last` before this request's first DONE
         self.read_ms = 0.0             # the prompt-read time of every run this request makes
         try:
+            attach()
             while True:   # loops when a request alone in a slot returns to solo
                 if not holding:
-                    ok = yield from self._take_control(cancel, len(prompt))
+                    ok = yield from self._take_control(cancel, size())
                     if not ok:
                         return
                     holding, born = True, self.gen
+                    attach()
                 solo_slot = None
                 with self.slot_cv:
                     # With slot 0 as the solo session, a solo run on another slot's state is only possible when the
@@ -1042,7 +1098,7 @@ class ProcessEngine:
                     any_slot = bool(self.info.get("solo_any_slot"))
                     alone = not any(self.slot_busy) and self.waiting == 0 and (any_slot or not self.info.get("slot0_solo"))
                     if alone and left > 1 and any_slot:
-                        solo_slot = self.pick_slot(prompt, session)   # the slot holding the longest start, else a free one
+                        solo_slot = self.pick_slot(meets(), size(), session)   # the slot holding the longest start, else a free one
                         if solo_slot is None:
                             alone = False
                         else:
@@ -1055,10 +1111,10 @@ class ProcessEngine:
                             f"SGEN {solo_slot} {left}{gen_keys()}"
                     else:
                         head = f"GENI {left}{gen_keys()} {embeddings}" if embeddings else f"GEN {left}{gen_keys()}"
-                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
-                    run0, yield_sent = len(out), False
+                    self._send(f"{head} {ref()}")
+                    run0, run_size, yield_sent = len(out), size(), False
                     if solo_slot is not None:
-                        self.slot_held[solo_slot] = []          # the run overwrites what the slot held
+                        self._hold(solo_slot, 0)                # the run overwrites what the slot held
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
                     self._ctl_erred = False
@@ -1072,10 +1128,10 @@ class ProcessEngine:
                             yield t
                         if x is None:                       # heartbeat
                             if (not yield_sent and not out and not embeddings and yields < self.YIELDS_MAX and
-                                    self._shorter_waiting(len(prompt), 2 if solo_slot is None else 1)):
+                                    self._shorter_waiting(size(), 2 if solo_slot is None else 1)):
                                 if solo_slot is None:
                                     with self.slot_cv:      # slot the partial read will wait in
-                                        reserved = self.pick_slot(prompt, session)
+                                        reserved = self.pick_slot(meets(), size(), session)
                                         if reserved is not None:
                                             self.slot_busy[reserved] = True
                                             self.claim_slot(reserved, session)
@@ -1092,7 +1148,9 @@ class ProcessEngine:
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read continues in that slot
                     elif reserved is not None:              # did not give way: release the slot
-                        self._solo_kept(solo_slot, prompt, out[run0:])
+                        self._solo_kept(solo_slot, run_size, out[run0:])
+                        if solo_slot is not None:
+                            note(solo_slot)
                         with self.slot_cv:
                             self.slot_busy[reserved] = False
                             self.slot_cv.notify_all()
@@ -1105,7 +1163,7 @@ class ProcessEngine:
                             self._carry_run(carry, first, last0, True)
                             return
                         self._carry_run(carry, first, last0, False)
-                        prompt = list(ids) + out            # continues in a batch slot
+                        extra = list(out)                   # continues in a batch slot
                 while True:
                     if slot is None:
                         # prefer the slot holding this prompt's start, else the longest unused
@@ -1113,8 +1171,8 @@ class ProcessEngine:
                             ticket = self.admission.join()
                             try:
                                 while True:
-                                    slot = self.pick_slot(prompt, session)
-                                    if slot is not None and self.admission.may_go(ticket, self._resumes(slot, prompt)):
+                                    slot = self.pick_slot(meets(), size(), session)
+                                    if slot is not None and self.admission.may_go(ticket, self._resumes(slot, meets(), size())):
                                         self.slot_busy[slot] = True
                                         self.claim_slot(slot, session)
                                         break
@@ -1132,28 +1190,31 @@ class ProcessEngine:
                                 self.admission.leave(ticket)
                                 self.slot_cv.notify_all()
                     if not holding:                         # waited for the slot: take the control lines again
-                        ok = yield from self._take_control(cancel, len(prompt))
+                        ok = yield from self._take_control(cancel, size())
                         if not ok:
                             return
                         holding, born = True, self.gen
+                        attach()
                     if self._yielded is not None:           # gave way: waiting requests go first
-                        self.slot_held[slot] = list(prompt[:self._yielded[1]])
+                        self._hold(slot, self._yielded[1])
+                        note(slot)
                         self._yielded = None
                         yields += 1
                         self.ctl.release()
                         holding = False
                         with self.slot_cv:
-                            epoch = self.ctl_epoch
-                        ok = yield from self._take_control(cancel, len(prompt), after_epoch=epoch)
+                            ctl_epoch = self.ctl_epoch
+                        ok = yield from self._take_control(cancel, size(), after_epoch=ctl_epoch)
                         if not ok:
                             return
                         holding, born = True, self.gen
-                    left = max(1, min(left, self.max_context - len(prompt) - SLOT_MARGIN))   # the slot's room
+                        attach()
+                    left = max(1, min(left, self.max_context - size() - SLOT_MARGIN))   # the slot's room
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
-                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
-                    self.slot_held[slot] = []               # admission overwrites the slot
+                    self._send(f"{head} {ref()}")
+                    self._hold(slot, 0)                     # admission overwrites the slot
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
@@ -1162,7 +1223,7 @@ class ProcessEngine:
                     def ask_yield():    # a shorter request waits: the read gives way at its next chunk boundary
                         nonlocal asked
                         if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                self._shorter_waiting(len(prompt))):
+                                self._shorter_waiting(size())):
                             self._send(f"BYIELD {slot}")
                             asked = True
                     for x in self._control(cancel, pending.append, idle=ask_yield):
@@ -1231,7 +1292,8 @@ class ProcessEngine:
                         self._note_bdone(slot, f)
                         self._bdone_last(f)
                         # the slot holds the prompt and every token fed (all but the last)
-                        self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        self._hold(slot, size() + len(out) - gen0 - 1 if len(out) > gen0 else 0)
+                        note(slot)
                         again = (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                  and not (out and out[-1] in self.eos_ids())
                                  and not (stop_soon is not None and stop_soon.is_set()))
@@ -1243,7 +1305,7 @@ class ProcessEngine:
                                 self.slot_busy[slot] = False
                                 self.slot_cv.notify_all()
                             slot, gen0 = None, None
-                            prompt, left = list(ids) + out, int(max_new) - len(out)
+                            extra, left = list(out), int(max_new) - len(out)
                             solo_again += 1
                             break
                         return
@@ -1270,15 +1332,15 @@ class ProcessEngine:
                 self.ctl.release()
             if reserved is not None:
                 if reserved == solo_slot:
-                    self._solo_kept(solo_slot, prompt, out[run0:])
+                    self._solo_kept(solo_slot, run_size, out[run0:])
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
                     self.slot_cv.notify_all()
             if slot is not None:
                 self.slot_used[slot] = time.time()
                 if phase == "slot":
-                    self.slot_held[slot] = []
-                    stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                    self._hold(slot, 0)
+                    stream = size() + len(out) - gen0 if gen0 is not None and len(out) > gen0 else None
                     f = self._release_slot_when_done(slot, stream, wait_s=self.BDONE_WAIT_S)
                     if f is not None:
                         self._bdone_last(f)
@@ -1293,25 +1355,86 @@ class ProcessEngine:
                         self.slot_busy[slot] = False
                         self.slot_cv.notify_all()
 
-    def _solo_kept(self, slot, prompt: list[int], gen: list[int]) -> None:
-        """A solo run in `slot` ended: the engine keeps its prompt and every token it fed (all but the last) there."""
+    def _hold(self, slot: int, count: int) -> None:
+        """`slot` now holds `count` tokens (the epoch moves: what a prompt's held prefix said of it is stale)."""
+        self.slot_held[slot] = max(0, int(count))
+        self.slot_epoch[slot] += 1
+
+    def _solo_kept(self, slot, run_size: int, gen: list[int]) -> None:
+        """A solo run in `slot` ended: the engine keeps its prompt (`run_size` tokens) and every token it fed (all but
+        the last) there."""
         if slot is None:
             return
-        self.slot_held[slot] = list(prompt) + gen[:-1] if gen else []
+        self._hold(slot, run_size + len(gen) - 1 if gen else 0)
         self.slot_used[slot] = time.time()
 
-    def _resumes(self, slot: int, prompt: list[int]) -> bool:
-        """Whether `slot` holds the start of `prompt`."""
-        h = self.slot_held[slot]
-        return bool(h) and len(h) < len(prompt) and prompt[:len(h)] == h
+    @staticmethod
+    def _resumes(slot: int, meet: list[int], size: int) -> bool:
+        """Whether `slot` holds the start of a prompt of `size` tokens (`meet`: what each slot covers of it)."""
+        return 0 < meet[slot] < size
+
+    def _hold_prompt(self, ids, embeddings):
+        """Hand the engine the prompt once: its text to tokenize, or its ids (a picture's request, a continued one).
+        The engine answers at once, whatever it is doing. Returns (handle, tokens)."""
+        with self.prompt_lock:                  # the answers come in the order the prompts were sent
+            try:
+                if isinstance(ids, PromptText):
+                    body = ids.text
+                    spans = ids.byte_spans()
+                    plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
+                    with self.wlock:
+                        self.proc.stdin.write(f"PROMPT {len(body.encode('utf-8'))}{plain}\n{body}")
+                        self.proc.stdin.flush()
+                else:
+                    self._send("PROMPTI" + (" img" if embeddings else "") + " " + ",".join(str(int(t)) for t in ids))
+            except (OSError, AttributeError):
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            while True:
+                try:
+                    line = self.prompt_q.get(timeout=1.0)
+                    break
+                except queue.Empty:
+                    if not self.alive():
+                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        if line is None:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+        f = line.split()
+        if f[1:2] == ["ERR"]:
+            err = line[len("PROMPT ERR "):].strip()
+            raise request_err(err, ids.explain(err) if isinstance(ids, PromptText) else None)
+        try:
+            return int(f[1]), int(f[2])
+        except (IndexError, ValueError):
+            raise EngineError(f"the engine's reply to a prompt was not understood: {line}") from None
+
+    def _meet(self, handle: int, born: int) -> list[int]:
+        """Per slot, the tokens of the held prompt its idle conversation covers (the engine's matching); the caller
+        holds the control lines. The engine's counts of what each idle slot holds also correct ours."""
+        self._send(f"PMATCH {handle}")
+        line = self._drain_control("PMATCH", born=born)
+        if line is None:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+        if line.startswith("ERR"):
+            raise request_err(line[4:].strip())
+        meet = [0] * self.batch
+        try:
+            for b, w in enumerate(line.split()[2:self.batch + 2]):
+                match, held = (int(v) for v in w.split(":"))
+                meet[b] = match
+                if not self.slot_busy[b]:
+                    self.slot_held[b] = held
+        except ValueError:
+            raise EngineError(f"the engine's reply to a prompt was not understood: {line}") from None
+        return meet
 
     def queue_depth(self) -> int:
         """Requests waiting for the engine or a free slot."""
         with self.slot_cv:
             return self.waiting + len(self.admission)
 
-    def pick_slot(self, prompt: list[int], session: str | None = None) -> int | None:
-        """A free slot for `prompt` (caller holds slot_cv): this session's own slot first (a conversation stays
+    def pick_slot(self, meet: list[int], size: int, session: str | None = None) -> int | None:
+        """A free slot for a prompt of `size` tokens (caller holds slot_cv; `meet`: the tokens of it each slot's idle
+        conversation covers, as the engine matched them): this session's own slot first (a conversation stays
         where its K/V sits), then the longest held prefix, else an empty one, then the least recently used; None
         when none is free.  A slot owned by another session is taken only when no unowned one is free: the owner
         lost its conversation either way, and the least recently used goes first.  Read-only: `claim_slot` records
@@ -1324,15 +1447,15 @@ class ProcessEngine:
             return own
 
         def held_prefix(b):
-            h = self.slot_held[b]
-            return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
+            return meet[b] if 0 < meet[b] < size else 0
         pool = [b for b in free if b not in self.slot_owner] or free   # slot_owner is keyed by slot
         best = max(pool, key=held_prefix)
-        return best if held_prefix(best) > 0 else min(pool, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
+        return best if held_prefix(best) > 0 else min(pool, key=lambda b: (self.slot_held[b] > 0, self.slot_used[b]))
 
     def claim_slot(self, slot: int, session: str | None) -> None:
         """Bind `slot` to `session` (caller holds slot_cv), dropping whoever held it and the session's own previous
         slot: two owners of one slot, or one session in two slots, would both be lies the next turn acts on."""
+        self.slot_thread[slot] = threading.get_ident()
         if session is None:
             return
         for s, o in list(self.session_slot.items()):    # anyone else owning this slot loses it
@@ -1345,6 +1468,15 @@ class ProcessEngine:
         self.slot_owner[slot] = session
         self.session_slot[session] = slot
 
+    def slot_view(self) -> list[dict]:
+        """Per batch slot: the thread whose request runs in it (None when idle) and the tokens it holds for the
+        next turn."""
+        if not self.batch:
+            return []
+        with self.slot_cv:
+            return [{"owner": self.slot_thread[b] if self.slot_busy[b] else None, "held": self.slot_held[b]}
+                    for b in range(self.batch)]
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None, stop_soon=None):
         """Yield token ids, and None as a 10 s heartbeat while the engine is quiet. An early-leaving consumer or
         `cancel` makes the engine STOP. `stop_soon` (an Event), once set, makes it STOP too, but the tokens of the
@@ -1353,7 +1485,7 @@ class ProcessEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         text = ids if isinstance(ids, PromptText) else None
-        if text is not None and (getattr(self, "batch", 0) or embeddings or not self.info.get("text_prompt")):
+        if text is not None and (embeddings or not self.info.get("text_prompt")):
             ids, max_new = text.resolve(int(max_new), self.max_context)    # this engine takes ids
             text = None
         if getattr(self, "batch", 0):

@@ -1,8 +1,10 @@
 // src/models/deepseek41/tier_policy_test.cpp - the tier admission and placement rules on synthetic id streams.
 #include "models/deepseek41/tier_policy.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <vector>
 
 using namespace basalt::models::deepseek41::policy;
@@ -204,6 +206,184 @@ int main() {
         CHECK(halvings == 10);
         CHECK(!use_half_life(0, kUseHalfLife - 1));
         CHECK(use_half_life(kUseHalfLife - 1, 1));
+    }
+
+    // several second cards: each owns a contiguous block of layers, larger blocks first
+    {
+        const PeerBlocks b3 = split_layers(40, 3);
+        CHECK((b3.lo == std::vector<int>{0, 14, 27}) && (b3.hi == std::vector<int>{14, 27, 40}));
+        const PeerBlocks b1 = split_layers(40, 1);
+        CHECK((b1.lo == std::vector<int>{0}) && (b1.hi == std::vector<int>{40}));
+        const PeerBlocks bb = split_layers(3, 3);
+        CHECK((bb.lo == std::vector<int>{0, 1, 2}) && (bb.hi == std::vector<int>{1, 2, 3}));
+        const PeerBlocks b2 = split_layers(40, 2);
+        CHECK((b2.lo == std::vector<int>{0, 20}) && (b2.hi == std::vector<int>{20, 40}));
+        const PeerBlocks b4 = split_layers(40, 4);
+        CHECK((b4.lo == std::vector<int>{0, 10, 20, 30}) && (b4.hi == std::vector<int>{10, 20, 30, 40}));
+
+        const int layers[] = {0, 13, 14, 26, 27, 39}, owners[] = {0, 0, 1, 1, 2, 2};
+        for (int i = 0; i < 6; ++i) CHECK(owner_of(b3, layers[i]) == owners[i]);
+
+        // the uniform per-layer count is the smallest any card holds for ITS block, never card 0's alone
+        const uint64_t blob = (6430000ull + 255) / 256 * 256, reserve = 600ull << 20;
+        const std::vector<uint64_t> rooms{15000000000ull, 15000000000ull, 12000000000ull};   // the last card binds, not card 0
+        const std::vector<uint64_t> blocks{14 * blob, 13 * blob, 13 * blob};
+        uint64_t want = ~0ull;
+        for (size_t c = 0; c < rooms.size(); ++c) want = std::min<uint64_t>(want, (rooms[c] - reserve) / blocks[c]);
+        CHECK(uniform_peer_slots(rooms, blocks, reserve, 384) == (int) std::min<uint64_t>(want, 384));
+        CHECK(want < (rooms[0] - reserve) / blocks[0]);   // so a card-0-only sizing would be caught here
+        CHECK(uniform_peer_slots({15000000000ull, reserve, 14000000000ull}, blocks, reserve, 384) == 0);
+        CHECK(uniform_peer_slots(rooms, {blob, blob, blob}, reserve, 384) == 384);   // capped at the layer's experts
+
+        // one card holding every layer is the single second card's count: min((room - reserve) / one_each, n_expert), 0 at or under the reserve
+        const uint64_t one_each = 40 * blob, R = 15405465600ull;
+        CHECK(uniform_peer_slots({R}, {one_each}, reserve, 384) == (int) std::min<uint64_t>((R - reserve) / one_each, 384));
+        CHECK(uniform_peer_slots({reserve}, {one_each}, reserve, 384) == 0);
+
+        // a card's local slots are dense and distinct; their sum is the global slot count (n_layers * homes_peer)
+        for (const PeerBlocks* b : {&b1, &b2, &b3, &b4}) {
+            const int hp = 7;
+            int total = 0;
+            for (size_t c = 0; c < b->lo.size(); ++c) {
+                const int span = (b->hi[c] - b->lo[c]) * hp;
+                std::vector<int> seen((size_t) span, 0);
+                for (int l = b->lo[c]; l < b->hi[c]; ++l)
+                    for (int n = 0; n < hp; ++n) {
+                        const int32_t s = local_slot(*b, hp, l, n);
+                        CHECK(s >= 0 && s < span);
+                        if (s >= 0 && s < span) ++seen[(size_t) s];
+                    }
+                for (int v : seen) CHECK(v == 1);
+                total += span;
+            }
+            CHECK(total == 40 * hp);
+        }
+    }
+
+    // blocks sized to each card's room (split_by_bytes): the uniform homes a contiguous split can give, at its best
+    {
+        auto rnd = [](uint64_t b) { return (b + 255) / 256 * 256; };
+        auto block_bytes = [](const std::vector<uint64_t>& lb, const PeerBlocks& b) {
+            std::vector<uint64_t> out;
+            for (size_t c = 0; c < b.lo.size(); ++c) {
+                uint64_t s = 0;
+                for (int l = b.lo[c]; l < b.hi[c]; ++l) s += lb[(size_t) l];
+                out.push_back(s);
+            }
+            return out;
+        };
+        // the best uniform homes over EVERY contiguous split into n non-empty blocks (brute force, small cases)
+        auto best = [&](const std::vector<uint64_t>& lb, const std::vector<uint64_t>& room, uint64_t res, int ne) {
+            const int L = (int) lb.size(), n = (int) room.size();
+            int top = 0;
+            std::vector<int> cut((size_t) n + 1, 0);
+            cut[(size_t) n] = L;
+            std::function<void(int, int)> rec = [&](int c, int at) {
+                if (c == n - 1) {
+                    if (L - at < 1) return;
+                    cut[(size_t) c] = at;
+                    PeerBlocks b;
+                    for (int k = 0; k < n; ++k) { b.lo.push_back(cut[(size_t) k]); b.hi.push_back(cut[(size_t) k + 1]); }
+                    top = std::max(top, uniform_peer_slots(room, block_bytes(lb, b), res, ne));
+                    return;
+                }
+                cut[(size_t) c] = at;
+                for (int nx = at + 1; nx <= L - (n - 1 - c); ++nx) {
+                    cut[(size_t) c + 1] = nx;
+                    rec(c + 1, nx);
+                }
+            };
+            if (n == 1) {
+                PeerBlocks b{{0}, {L}};
+                return uniform_peer_slots(room, block_bytes(lb, b), res, ne);
+            }
+            rec(0, 0);
+            return top;
+        };
+        auto valid = [](const PeerBlocks& b, int L) {
+            bool ok = !b.lo.empty() && b.lo[0] == 0 && b.hi.back() == L;
+            for (size_t c = 0; c < b.lo.size(); ++c) ok = ok && b.hi[c] > b.lo[c] && (c == 0 || b.lo[c] == b.hi[c - 1]);
+            return ok;
+        };
+        const uint64_t reserve = 600ull << 20, card = 15405465600ull;   // one card's room after its buffers
+
+        // (a) equal layers, equal cards: as good as the best contiguous split, every card used
+        {
+            const std::vector<uint64_t> lb(12, rnd(9000000));
+            const std::vector<uint64_t> room(3, card);
+            int h = -1;
+            const PeerBlocks b = split_by_bytes(lb, room, reserve, 384, h);
+            CHECK(valid(b, 12) && b.lo.size() == 3);
+            CHECK(h == best(lb, room, reserve, 384));
+            CHECK(uniform_peer_slots(room, block_bytes(lb, b), reserve, 384) == h);   // (g)
+        }
+        // (b) the UD-IQ2_XXS pack's layer sizes (its experts.layout): beats the count split, and the
+        //     card holding the late (bigger) layers takes fewer of them than the first card
+        {
+            const uint64_t ud[40] = {8478720, 8017920, 7649280, 7649280, 7649280, 8017920, 8017920, 8017920, 8017920, 8017920,
+                                     9861120, 9861120, 9861120, 9861120, 9861120, 9861120, 9861120, 9861120, 9861120, 9861120,
+                                     10598400, 10598400, 10598400, 10598400, 10598400, 12072960, 12072960, 12072960, 12072960, 12072960,
+                                     12072960, 12072960, 12072960, 12072960, 12072960, 11335680, 11335680, 11335680, 11335680, 11335680};
+            std::vector<uint64_t> lb;
+            for (uint64_t v : ud) lb.push_back(rnd(v));
+            const std::vector<uint64_t> room(3, card);
+            int h = -1;
+            const PeerBlocks b = split_by_bytes(lb, room, reserve, 384, h);
+            const PeerBlocks bc = split_layers(40, 3);
+            const int hc = uniform_peer_slots(room, block_bytes(lb, bc), reserve, 384);
+            CHECK(valid(b, 40) && b.lo.size() == 3);
+            CHECK(h > hc);
+            CHECK(b.hi[2] - b.lo[2] < b.hi[0] - b.lo[0]);
+            CHECK(uniform_peer_slots(room, block_bytes(lb, b), reserve, 384) == h);
+            std::printf("  UD-IQ2_XXS on 3 equal cards: count split %d homes, byte split %d (blocks %d/%d/%d)\n", hc, h,
+                        b.hi[0] - b.lo[0], b.hi[1] - b.lo[1], b.hi[2] - b.lo[2]);
+        }
+        // (c) a small card among big ones gets fewer layers
+        {
+            const std::vector<uint64_t> lb(20, rnd(9000000));
+            const std::vector<uint64_t> room{card, 8000000000ull, card};
+            int h = -1;
+            const PeerBlocks b = split_by_bytes(lb, room, reserve, 384, h);
+            CHECK(valid(b, 20));
+            CHECK(b.hi[1] - b.lo[1] < b.hi[0] - b.lo[0] && b.hi[1] - b.lo[1] < b.hi[2] - b.lo[2]);
+            CHECK(h == best(lb, room, reserve, 384));
+        }
+        // (d) one card holding every layer is the single second card's slots_in
+        {
+            const std::vector<uint64_t> lb(40, rnd(9861120));
+            uint64_t one_each = 0;
+            for (uint64_t v : lb) one_each += v;
+            int h = -1;
+            const PeerBlocks b = split_by_bytes(lb, {card}, reserve, 384, h);
+            CHECK(valid(b, 40) && b.lo.size() == 1);
+            CHECK(h == (int) std::min<uint64_t>((card - reserve) / one_each, 384));
+        }
+        // (e) a card at or under its reserve: no homes; and more cards than layers: no homes
+        {
+            int h = -1;
+            split_by_bytes(std::vector<uint64_t>(10, rnd(9000000)), {card, reserve, card}, reserve, 384, h);
+            CHECK(h == 0);
+            h = -1;
+            split_by_bytes(std::vector<uint64_t>(2, rnd(9000000)), {card, card, card}, reserve, 384, h);
+            CHECK(h == 0);
+        }
+        // (f) optimal against brute force on seeded small cases
+        {
+            uint64_t seed = 12345;
+            auto next = [&seed] { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+            for (int it = 0; it < 200; ++it) {
+                const int L = 4 + (int) (next() % 7), n = 2 + (int) (next() % 3);
+                if (n > L) continue;
+                std::vector<uint64_t> lb, room;
+                for (int l = 0; l < L; ++l) lb.push_back(rnd(5000000 + next() % 9000000));
+                for (int c = 0; c < n; ++c) room.push_back(reserve + 2000000000ull + (uint64_t) (next() % 14000000000ull));
+                int h = -1;
+                const PeerBlocks b = split_by_bytes(lb, room, reserve, 384, h);
+                const int want = best(lb, room, reserve, 384);
+                CHECK(h == want);
+                CHECK(h == 0 || (valid(b, L) && uniform_peer_slots(room, block_bytes(lb, b), reserve, 384) == h));
+            }
+        }
     }
 
     if (g_fail) return 1;

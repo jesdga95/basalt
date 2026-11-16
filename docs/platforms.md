@@ -60,9 +60,9 @@ through the platform file calls.
 
 ## FFmpeg for video
 
-Video input loads FFmpeg's shared libraries at run time (libavformat, libavcodec, libavutil and libswscale of release 6, 7 or 8; nothing
+Video input loads FFmpeg's shared libraries at run time (libavformat, libavcodec, libavutil and libswscale of release 6, 7, 8 or 9; nothing
 is linked or shipped). Linux: the distribution's runtime packages (`libavformat62` and its siblings on Ubuntu 26.04, `libavformat60`
-on 24.04), found by the system loader. Windows: a shared FFmpeg build (`avformat-62.dll` and the rest, from gyan.dev or BtbN) beside
+on 24.04), found by the system loader. Windows: a shared FFmpeg build (`avformat-62.dll` for 8, `avformat-63.dll` for 9, and the rest, from gyan.dev or BtbN) beside
 `basalt.exe` or in a `PATH` directory; the current directory is never searched. Without them video is off and the server says why.
 GPU decoding needs an FFmpeg build with NVDEC (the distribution packages and the gyan.dev and BtbN builds have it); without it
 frames decode on the CPU.
@@ -91,7 +91,9 @@ cmake --build build -j
 ctest --test-dir build -L cpu -j 8 --output-on-failure
 ```
 
-`-DBASALT_MODELS=qwen4exp` or `deepseek41` builds one model ([building](building.md#building-only-some-models)); the option works the same here.
+The executables land in `bin/` whatever the generator is (a Visual Studio generator would otherwise put them in `bin/Release`, away from `data/`).
+
+`-DBASALT_MODELS=qwen4exp`, `deepseek41` or `qwen35` builds one model ([building](building.md#building-only-some-models)); the option works the same here.
 
 If tests fail to create fixtures, point `TEMP` and `TMP` into the build tree. CUDA 13.2+ headers need `/Zc:preprocessor`; the CMakeLists
 passes it to nvcc's host compiler.

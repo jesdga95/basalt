@@ -6,7 +6,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -25,6 +27,7 @@
 #include <cerrno>
 #include <cstring>
 #include "basalt/log.hpp"
+#include "basalt/platform/system.hpp"
 
 namespace basalt::platform {
 
@@ -151,13 +154,14 @@ void memory_status(uint64_t& avail, uint64_t& total) {
     avail = (uint64_t) ms.ullAvailPhys;
     total = (uint64_t) ms.ullTotalPhys;
 }
-}  // namespace
 
-uint64_t available_memory() {
+// The OS's own reading, before a container limit lowers it (available_memory).
+uint64_t os_available_memory() {
     uint64_t avail = 0, total = 0;
     memory_status(avail, total);
     return avail;
 }
+}  // namespace
 #else
 namespace {
 // One "<key>: <n> kB" line of /proc/meminfo in bytes (0 when absent).
@@ -169,10 +173,204 @@ uint64_t meminfo_bytes(const char* key) {
         if (line.compare(0, k.size(), k) == 0) return std::strtoull(line.c_str() + k.size(), nullptr, 10) * 1024;
     return 0;
 }
+
+// The OS's own reading, before a container limit lowers it (available_memory).
+uint64_t os_available_memory() { return meminfo_bytes("MemAvailable"); }
+}  // namespace
+#endif
+
+namespace {
+
+bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current,
+                             CgroupMemoryStat& stat) {
+    std::ifstream input(path / "memory.stat");
+    if (!input) return false;
+    std::ostringstream text;
+    text << input.rdbuf();
+    return text.good() && parse_cgroup_memory_stat(text.str(), current, stat);
+}
+
+// cgroup v1's memory.stat: the group's hierarchical counters (total_*), the same allowance as v2's.  False when the
+// file or total_inactive_file is missing (the usage is then taken as it is).
+bool read_cgroup_v1_memory_stat(const std::filesystem::path& path, uint64_t usage, CgroupMemoryStat& stat) {
+    std::ifstream input(path / "memory.stat");
+    if (!input) return false;
+    bool inactive_file = false;
+    std::string key;
+    uint64_t value = 0, active_file = 0;
+    while (input >> key >> value) {
+        if (key == "total_inactive_file") { stat.inactive_file = value; inactive_file = true; }
+        else if (key == "total_active_file") active_file = value;
+        else if (key == "total_dirty") stat.file_dirty = value;
+        else if (key == "total_writeback") stat.file_writeback = value;
+    }
+    if (!inactive_file) return false;
+    stat.file = stat.inactive_file + active_file;
+    stat.current = usage;
+    stat.valid = true;
+    return true;
+}
+
 }  // namespace
 
-uint64_t available_memory() { return meminfo_bytes("MemAvailable"); }
-#endif
+bool parse_cgroup_memory_stat(const std::string& text, uint64_t current, CgroupMemoryStat& stat) {
+    stat = CgroupMemoryStat{};
+    bool inactive_file = false, file_dirty = false, file_writeback = false, file = false, shmem = false;
+    std::istringstream input(text);
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream fields(line);
+        std::string key;
+        uint64_t value = 0;
+        if (!(fields >> key >> value)) return false;
+        fields >> std::ws;
+        if (!fields.eof()) return false;
+
+        auto take = [&](bool& seen, uint64_t& out) {
+            if (seen) return false;
+            seen = true;
+            out = value;
+            return true;
+        };
+        if (key == "file") { if (!take(file, stat.file)) return false; }
+        else if (key == "shmem") { if (!take(shmem, stat.shmem)) return false; }
+        else if (key == "inactive_file") { if (!take(inactive_file, stat.inactive_file)) return false; }
+        else if (key == "file_dirty") { if (!take(file_dirty, stat.file_dirty)) return false; }
+        else if (key == "file_writeback") { if (!take(file_writeback, stat.file_writeback)) return false; }
+    }
+    if (!inactive_file || !file_dirty || !file_writeback) return false;
+    stat.current = current;
+    stat.valid = true;
+    return true;
+}
+
+bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes) {
+    bytes = 0;
+    if (!stat.valid) return false;
+
+    // Clean file pages are reclaimable.  The page cache is the active and inactive lists together (`file`; the
+    // inactive list alone when the file total is not reported), because the container's own reads move pages to
+    // the active list.  The counters can race memory.current, so bound them to charged usage first.
+    // `file` counts shared memory too (pinned host buffers, tmpfs), which reclaim never frees: it is left out.
+    const uint64_t page_cache = stat.file > stat.shmem ? stat.file - stat.shmem : 0;
+    uint64_t reclaimable = std::min(std::max(page_cache, stat.inactive_file), stat.current);
+    reclaimable = stat.file_dirty >= reclaimable ? 0 : reclaimable - stat.file_dirty;
+    reclaimable = stat.file_writeback >= reclaimable ? 0 : reclaimable - stat.file_writeback;
+    // Keep a margin: part of the cache is mapped or locked and does not come back on demand.
+    reclaimable -= std::min(reclaimable / 2, limit / 64);
+
+    // Reclaiming clean file pages reduces usage; saturating subtraction also handles a transient over-limit read.
+    const uint64_t usage_after_reclaim = stat.current - reclaimable;
+    bytes = usage_after_reclaim < limit ? limit - usage_after_reclaim : 0;
+    return true;
+}
+
+bool host_available_memory(HostMemory& m, const std::string& meminfo_arg, const std::string& self_cgroup_arg,
+                           const std::string& cgroup_root_arg) {
+    m = HostMemory{};
+    const std::string meminfo = meminfo_arg.empty() ? basalt::platform::meminfo_path() : meminfo_arg;
+    const std::string self_cgroup = self_cgroup_arg.empty() ? basalt::platform::self_cgroup_path() : self_cgroup_arg;
+    const std::string cgroup_root = cgroup_root_arg.empty() ? basalt::platform::cgroup_root() : cgroup_root_arg;
+    if (meminfo.empty()) {
+        // No memory accounting files and no cgroup hierarchy here: the OS reading is the whole answer, and there is
+        // no container limit tighter than it.
+        const uint64_t avail = os_available_memory();
+        if (avail == 0) return false;
+        m.available = avail;
+        m.cgroup_limit = ~0ull;
+        return true;
+    }
+    // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
+    std::ifstream info(meminfo);
+    std::string line;
+    uint64_t bytes = 0;
+    while (std::getline(info, line)) {
+        std::istringstream fields(line);
+        std::string key, unit;
+        uint64_t value = 0;
+        if (fields >> key >> value >> unit && key == "MemAvailable:" && unit == "kB" &&
+            value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
+    }
+    if (bytes == 0) return false;
+    // The tightest cgroup limit of this process's group and its ancestors.  A group whose path is not visible here
+    // (a container's own cgroup namespace shows its group as the mount's root) is read at that root; a group without
+    // a readable limit has none of its own.  No cgroup file or line: MemAvailable alone.
+    // This is a point-in-time guard, not a reservation against concurrent allocations.
+    const std::filesystem::path root(cgroup_root);
+    bool v2 = false;
+    std::string v2_path, v1_path;   // the unified group; the v1 memory controller's group
+    if (std::ifstream groups(self_cgroup); groups) {
+        while (std::getline(groups, line)) {
+            if (line.rfind("0::/", 0) == 0) {
+                v2 = true;
+                v2_path = line.substr(4);
+                continue;
+            }
+            // v1: "N:controller[,controller]:/path"
+            const size_t c1 = line.find(':'), c2 = c1 == std::string::npos ? c1 : line.find(':', c1 + 1);
+            if (c2 == std::string::npos) continue;
+            std::istringstream ctl(line.substr(c1 + 1, c2 - c1 - 1));
+            for (std::string c; std::getline(ctl, c, ',');)
+                if (c == "memory") v1_path = line.substr(c2 + 1);
+        }
+    }
+    // the group's directory under `top`, or `top` itself when the group is not visible there
+    auto visible_group = [](const std::filesystem::path& top, const std::string& rel) {
+        const std::string sub = rel.substr(rel.rfind('/', 0) == 0 ? 1 : 0);
+        if (sub.empty()) return top;
+        auto path = (top / sub).lexically_normal();
+        if (path.string().rfind(top.string(), 0) != 0 || !std::filesystem::is_directory(path)) return top;
+        return path;
+    };
+    if (!v1_path.empty()) {
+        // cgroup v1 (also the hybrid layout, where the unified line carries no memory controller): the memory
+        // controller's memory.limit_in_bytes - memory.usage_in_bytes, with the clean inactive file cache counted as
+        // free as for v2.  An unlimited group says a number near 2^63 (rounded to its page size).
+        const std::filesystem::path mroot = root / "memory";
+        for (auto path = visible_group(mroot, v1_path); path.string().rfind(mroot.string(), 0) == 0;
+             path = path.parent_path()) {
+            std::ifstream limit_file(path / "memory.limit_in_bytes"), usage_file(path / "memory.usage_in_bytes");
+            uint64_t cap = 0, usage = 0;
+            if (limit_file >> cap && usage_file >> usage && cap < (1ull << 62)) {
+                uint64_t room = usage < cap ? cap - usage : 0;
+                CgroupMemoryStat stat;
+                if (read_cgroup_v1_memory_stat(path, usage, stat) && !cgroup_available_bytes(cap, stat, room)) return false;
+                bytes = std::min(bytes, room);
+                m.cgroup_limit = std::min(m.cgroup_limit, cap);
+            }
+            if (path == mroot) break;
+        }
+    } else if (v2) {
+        for (auto path = visible_group(root, v2_path); path.string().rfind(root.string(), 0) == 0;
+             path = path.parent_path()) {
+            std::ifstream limit_file(path / "memory.max"), current_file(path / "memory.current");
+            std::string limit;
+            uint64_t current = 0;
+            // the host's root group, and a group whose parent does not enable the memory controller, have no limit
+            if (limit_file >> limit && current_file >> current && limit != "max") {
+                try {
+                    size_t consumed = 0;
+                    const uint64_t cap = std::stoull(limit, &consumed);
+                    if (consumed != limit.size()) return false;
+                    CgroupMemoryStat stat;
+                    if (!read_cgroup_memory_stat(path, current, stat)) return false;
+                    uint64_t cgroup_available = 0;
+                    if (!cgroup_available_bytes(cap, stat, cgroup_available)) return false;
+                    bytes = std::min(bytes, cgroup_available);
+                    m.cgroup_limit = std::min(m.cgroup_limit, cap);
+                } catch (...) { return false; }
+            }
+            if (path == root) break;
+        }
+    }
+    m.available = bytes;
+    return true;
+}
+
+uint64_t available_memory() {
+    HostMemory m;
+    return host_available_memory(m) ? m.available : os_available_memory();
+}
 
 namespace {
 std::atomic<uint64_t> g_ram_reserve{kDefaultRamReserveBytes};

@@ -39,7 +39,7 @@ int resident_load(Context& context) {
     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
     if (o.resident_cpu_experts) {
         // the RAM copy is sized from the available RAM: without a reading the experts would silently stay in the file
-        if (basalt::core::detail::HostMemory hm; !basalt::core::detail::host_available_memory(hm))
+        if (basalt::platform::HostMemory hm; !basalt::platform::host_available_memory(hm))
             return fatal_start_error(
                 "cannot determine the available RAM (no MemAvailable in /proc/meminfo, or a malformed cgroup memory "
                 "limit or memory.stat), which the resident RAM mode (--resident-experts) sizes its copy of the "
@@ -50,7 +50,7 @@ int resident_load(Context& context) {
                                             : o.adapt_swaps * kSatBoost);
         // the copy leaves the reserve free (or the legacy headroom, when larger), and the driver's tracking of the
         // buffers whose RAM is held for them
-        const uint64_t reserve = basalt::platform::ram_reserve();
+        const uint64_t reserve = basalt::core::plan_reserve(basalt::platform::ram_reserve());
         uint64_t resident_headroom =
             std::max(o.resident_headroom, reserve) + basalt::core::pin_tracking_bytes(basalt::core::host_plan_bytes());
         // the adaptive swaps' exchange buffers, before the copy reads the free memory
@@ -67,8 +67,8 @@ int resident_load(Context& context) {
         {
             const uint64_t gpu_held = std::min(expert_total_bytes, cache_fill_bytes + peer_only_bytes);
             const uint64_t complement = expert_total_bytes - gpu_held;
-            basalt::core::detail::HostMemory hm;
-            const uint64_t avail = basalt::core::detail::host_available_memory(hm) ? hm.available : 0;
+            basalt::platform::HostMemory hm;
+            const uint64_t avail = basalt::platform::host_available_memory(hm) ? hm.available : 0;
             const uint64_t cache_keep =
                 basalt::core::file_cache_keep(avail, resident_headroom, o.resident_pin, complement, *context.file_cache);
             resident_headroom += cache_keep;

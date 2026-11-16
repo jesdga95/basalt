@@ -13,7 +13,8 @@ pays no indirect call. `Flow::next` returns to command dispatch; `Flow::error` e
 | Request order | `request.cpp` |
 | Request keys, token ids and grammar | `request_parse.cpp` |
 | Prompt limits | `request_image.cpp` |
-| Which source holds the prompt's start | `request_restore.cpp` |
+| Which source holds the prompt's start, and the model's own pieces for the same bytes | `request_restore.cpp`, `prefix_anchor.hpp` |
+| Prompts held by handle and what each slot holds of them | `prompt_handles.cpp` |
 | Sampling setup, turn and root parts | `request_prefill.cpp` |
 | The window's order | `decode_loop.hpp`, `reply_rows.hpp` |
 | Completion, slot admission and reports | `request_finish.cpp` |

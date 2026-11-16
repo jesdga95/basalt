@@ -4,6 +4,7 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
+#include "basalt/model/rope_flags.hpp"
 #include "basalt/models/qwen4exp/options.hpp"
 
 #include <algorithm>
@@ -20,15 +21,7 @@ constexpr float kRoutePriorDefault = 0.5f;
 }  // namespace
 
 bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& code) {
-    if (a == "--rope-scaling") o.rope_scaling = args.next("--rope-scaling");
-    else if (a == "--rope-scale") o.rope_scale = std::atof(args.next("--rope-scale"));
-    else if (a == "--rope-freq-base") o.rope_freq_base = std::atof(args.next("--rope-freq-base"));
-    else if (a == "--rope-freq-scale") o.rope_freq_scale = std::atof(args.next("--rope-freq-scale"));
-    else if (a == "--yarn-orig-ctx") o.yarn_orig_ctx = std::atof(args.next("--yarn-orig-ctx"));
-    else if (a == "--yarn-ext-factor") o.yarn_ext_factor = std::atof(args.next("--yarn-ext-factor"));
-    else if (a == "--yarn-attn-factor") o.yarn_attn_factor = std::atof(args.next("--yarn-attn-factor"));
-    else if (a == "--yarn-beta-fast") o.yarn_beta_fast = std::atof(args.next("--yarn-beta-fast"));
-    else if (a == "--yarn-beta-slow") o.yarn_beta_slow = std::atof(args.next("--yarn-beta-slow"));
+    if (model::parse_rope_flag(a, args, o.rope)) {}
     else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(args.next("--prompt-cache-every")));
     else if (a == "--dump-residual") o.dump_residual = args.next("--dump-residual");
     else if (a == "--dump-mixed") o.dump_mixed = args.next("--dump-mixed");

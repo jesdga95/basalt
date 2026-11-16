@@ -3,7 +3,7 @@
 # `if(BASALT_MODEL_<ARCH>)`. A model left out is not compiled, not linked and not registered.
 
 # Every model that ships: the architecture ids, as `general.architecture` names them.
-set(BASALT_BUILTIN_MODELS qwen4exp deepseek41)
+set(BASALT_BUILTIN_MODELS qwen4exp deepseek41 qwen35)
 
 set(BASALT_MODELS "${BASALT_BUILTIN_MODELS}" CACHE STRING
     "Semicolon list of the models to build, from: ${BASALT_BUILTIN_MODELS}")

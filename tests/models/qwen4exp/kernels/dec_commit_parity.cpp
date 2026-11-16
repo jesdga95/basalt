@@ -20,6 +20,7 @@
 #include "basalt/models/qwen4exp/kernels/native_qsa_indexer.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/rope_scaling.hpp"
+#include "basalt/kernels/elementwise.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/kernels/wait_abort.hpp"

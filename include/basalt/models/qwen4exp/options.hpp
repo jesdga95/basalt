@@ -7,26 +7,11 @@
 namespace basalt::models::qwen4exp {
 
 struct Options : CommonOptions {
-    /// THE CONTEXT EXTENSION (rope scaling, rope_scaling.hpp).  These knobs resolve to ONE process config,
-    /// set once before `session_init` builds the rope table and the graphs capture the kernels.  There is
-    /// deliberately no per-request form: K sits in the cache POST-RoPE, so one cache must never mix two
-    /// scalings.  Precedence: an EXPLICIT flag over the model file's rope keys over the struct defaults -
-    /// `none` and `1` are explicit values (the opt-outs), the absent flag is not.
-    std::string rope_scaling;           ///< --rope-scaling none|linear|yarn (llama.cpp's names); empty = the flag is absent
-    double rope_scale = 0;              ///< --rope-scale F: the extension factor; 0 = the flag is absent (the model file's, else 1 = off)
-    double rope_freq_base = 0;          ///< --rope-freq-base N: 0 = the model's (1e7)
-    double rope_freq_scale = 0;         ///< --rope-freq-scale F: the raw ggml knob; 0 = 1/--rope-scale
-    double yarn_orig_ctx = 0;           ///< --yarn-orig-ctx N: 0 = the model's, else 262144
-    double yarn_ext_factor = -1.0;      ///< --yarn-ext-factor F: <0 = auto (1 for yarn, 0 otherwise)
-    double yarn_attn_factor = 1.0;      ///< --yarn-attn-factor F
-    double yarn_beta_fast = 32.0;       ///< --yarn-beta-fast F
-    double yarn_beta_slow = 1.0;        ///< --yarn-beta-slow F
     /// How the n-gram table is read.  Direct (default) = unbuffered SSD reads, table never in RAM.
     std::string ple_io = "direct";
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
     int ple_inflight = 256;   // the prompt path reads a chunk's rows at once, so the SSD stays busy
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
-    int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the large GEMV does not.
@@ -143,11 +128,6 @@ struct Options : CommonOptions {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
-    /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
-    /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
-    /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
-    /// pay (basalt/spec/draft_policy.hpp).  On by default; 0 = MTP only.
-    int suffix_draft = 3;
     /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
     /// A control vector on the residual stream (basalt/kernels/cvec.hpp), with llama.cpp's flags: the
