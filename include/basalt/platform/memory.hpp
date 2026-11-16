@@ -85,9 +85,10 @@ struct CgroupMemoryStat {
     uint64_t file_writeback = 0;
     bool valid = false;
     uint64_t file = 0;  // page cache, active + inactive; 0 when memory.stat does not report it
+    uint64_t shmem = 0; // the part of `file` that is shared memory (pinned host buffers among it): never reclaimed
 };
 
-/// Parse a cgroup-v2 memory.stat text (inactive_file, file_dirty, file_writeback required; file optional).
+/// Parse a cgroup-v2 memory.stat text (inactive_file, file_dirty, file_writeback required; file and shmem optional).
 /// False on a malformed or incomplete text.
 bool parse_cgroup_memory_stat(const std::string& text, uint64_t current, CgroupMemoryStat& stat);
 

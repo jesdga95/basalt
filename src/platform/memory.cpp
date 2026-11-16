@@ -215,7 +215,7 @@ bool read_cgroup_v1_memory_stat(const std::filesystem::path& path, uint64_t usag
 
 bool parse_cgroup_memory_stat(const std::string& text, uint64_t current, CgroupMemoryStat& stat) {
     stat = CgroupMemoryStat{};
-    bool inactive_file = false, file_dirty = false, file_writeback = false, file = false;
+    bool inactive_file = false, file_dirty = false, file_writeback = false, file = false, shmem = false;
     std::istringstream input(text);
     std::string line;
     while (std::getline(input, line)) {
@@ -233,6 +233,7 @@ bool parse_cgroup_memory_stat(const std::string& text, uint64_t current, CgroupM
             return true;
         };
         if (key == "file") { if (!take(file, stat.file)) return false; }
+        else if (key == "shmem") { if (!take(shmem, stat.shmem)) return false; }
         else if (key == "inactive_file") { if (!take(inactive_file, stat.inactive_file)) return false; }
         else if (key == "file_dirty") { if (!take(file_dirty, stat.file_dirty)) return false; }
         else if (key == "file_writeback") { if (!take(file_writeback, stat.file_writeback)) return false; }
@@ -250,7 +251,9 @@ bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64
     // Clean file pages are reclaimable.  The page cache is the active and inactive lists together (`file`; the
     // inactive list alone when the file total is not reported), because the container's own reads move pages to
     // the active list.  The counters can race memory.current, so bound them to charged usage first.
-    uint64_t reclaimable = std::min(std::max(stat.file, stat.inactive_file), stat.current);
+    // `file` counts shared memory too (pinned host buffers, tmpfs), which reclaim never frees: it is left out.
+    const uint64_t page_cache = stat.file > stat.shmem ? stat.file - stat.shmem : 0;
+    uint64_t reclaimable = std::min(std::max(page_cache, stat.inactive_file), stat.current);
     reclaimable = stat.file_dirty >= reclaimable ? 0 : reclaimable - stat.file_dirty;
     reclaimable = stat.file_writeback >= reclaimable ? 0 : reclaimable - stat.file_writeback;
     // Keep a margin: part of the cache is mapped or locked and does not come back on demand.
