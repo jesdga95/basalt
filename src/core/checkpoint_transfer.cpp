@@ -75,17 +75,37 @@ bool checkpoint_copy_in(const std::vector<RestoreSegment>& segments, cudaStream_
 bool running_copy_out(const RunningState& rs, uint8_t* host, std::string& error) {
     uint8_t* at = host + rs.head.size();
     if (!checkpoint_copy_out({{at, rs.regions}}, (cudaStream_t) rs.stream, error)) return false;
-    if (rs.peer_regions.empty()) return true;
-    const OnDevice on(rs.peer_device);
-    return checkpoint_copy_out({{at + rs.regions_bytes(), rs.peer_regions}}, (cudaStream_t) rs.peer_stream, error);
+    size_t skip = rs.regions_bytes();
+    if (!rs.peer_regions.empty()) {
+        const OnDevice on(rs.peer_device);
+        if (!checkpoint_copy_out({{at + skip, rs.peer_regions}}, (cudaStream_t) rs.peer_stream, error)) return false;
+    }
+    skip += RunningState::sum(rs.peer_regions);
+    for (const RunningState::LaterCard& c : rs.further) {
+        if (c.regions.empty()) continue;
+        const OnDevice on(c.device);
+        if (!checkpoint_copy_out({{at + skip, c.regions}}, (cudaStream_t) c.stream, error)) return false;
+        skip += RunningState::sum(c.regions);
+    }
+    return true;
 }
 
 bool running_copy_in(const RunningState& rs, const uint8_t* host, std::string& error) {
     const uint8_t* at = host + rs.head.size();
     if (!checkpoint_copy_in({{at, rs.regions}}, (cudaStream_t) rs.stream, error)) return false;
-    if (rs.peer_regions.empty()) return true;
-    const OnDevice on(rs.peer_device);
-    return checkpoint_copy_in({{at + rs.regions_bytes(), rs.peer_regions}}, (cudaStream_t) rs.peer_stream, error);
+    size_t skip = rs.regions_bytes();
+    if (!rs.peer_regions.empty()) {
+        const OnDevice on(rs.peer_device);
+        if (!checkpoint_copy_in({{at + skip, rs.peer_regions}}, (cudaStream_t) rs.peer_stream, error)) return false;
+    }
+    skip += RunningState::sum(rs.peer_regions);
+    for (const RunningState::LaterCard& c : rs.further) {
+        if (c.regions.empty()) continue;
+        const OnDevice on(c.device);
+        if (!checkpoint_copy_in({{at + skip, c.regions}}, (cudaStream_t) c.stream, error)) return false;
+        skip += RunningState::sum(c.regions);
+    }
+    return true;
 }
 
 CheckpointDeferral::~CheckpointDeferral() { release(); }

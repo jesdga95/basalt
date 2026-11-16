@@ -173,7 +173,7 @@ int main() {
         const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, kOursMinor, 1792, 32), card(1, "RTX 5060 Ti", 12, kOursMinor, 448, 16),
                                         card(2, "RTX 5060 Ti", 12, kOursMinor, 448, 16), card(3, "RTX 5060 Ti", 12, kOursMinor, 448, 16),
                                         card(4, "RTX 5060 Ti", 12, kOursMinor, 448, 16)};
-        const GpuModes hy4{4, 0, 0}, dense{2, 2, 0}, flash{4, 8, 0};
+        const GpuModes hy4{4, 0, 0}, dense{2, 8, 0}, flash{4, 8, 0};
         CHECK_STR(check_gpu_modes(pick("0,1", v, "peer"), "Hy4-flash", hy4), "");
         CHECK_STR(check_gpu_modes(pick("0,1,2,3", v, "peer"), "Hy4-flash", hy4), "");
         CHECK_STR(check_gpu_modes(pick("0", v), "Hy4-flash", hy4), "");
@@ -188,7 +188,7 @@ int main() {
                   "gpu-mode peer: Hy4-flash takes at most 4 cards (the main card and 3 peers); gpu names 5");
         CHECK_STR(check_gpu_modes(pick("0,1,2", v, "peer"), "Qwen3.8-27B", dense),
                   "gpu-mode peer: Qwen3.8-27B takes at most 2 cards (the main card and 1 peer); gpu names 3");
-        CHECK_STR(check_gpu_modes(pick("0,1,2", v, "split"), "Qwen3.8-27B", dense), "gpu-mode split: Qwen3.8-27B takes at most 2 cards; gpu names 3");
+        CHECK_STR(check_gpu_modes(pick("0,1,2", v, "split"), "Qwen3.8-27B", dense), "");
         CHECK_STR(check_gpu_modes(pick("0,1,2,3,4", v, "split"), "Qwen3.8-Flash-Next", flash), "");
         CHECK_STR(check_gpu_modes(pick("0,1,2,3,4", v, "peer"), "Qwen3.8-Flash-Next", flash),
                   "gpu-mode peer: Qwen3.8-Flash-Next takes at most 4 cards (the main card and 3 peers); gpu names 5");

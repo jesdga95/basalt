@@ -493,6 +493,15 @@ public:
             if (!ckd_peer.restore({{at + rs.regions_bytes(), rs.peer_regions}}, (cudaStream_t) rs.peer_stream, e))
                 return {basalt::model::Status::Error, e};
         }
+        size_t skip = rs.head.size() + rs.regions_bytes() + basalt::core::RunningState::sum(rs.peer_regions);
+        for (const basalt::core::RunningState::LaterCard& later : rs.further) {
+            if (later.regions.empty()) continue;
+            const basalt::core::OnDevice on(later.device);
+            const std::vector<basalt::core::RestoreSegment> later_seg{{from.data() + skip, later.regions}};
+            if (!basalt::core::checkpoint_copy_in(later_seg, (cudaStream_t) later.stream, e))
+                return {basalt::model::Status::Error, e};
+            skip += basalt::core::RunningState::sum(later.regions);
+        }
         return session().running_restored(pos, from.data());
     }
 

@@ -16,7 +16,7 @@ file and picks the chat format, tool syntax and thinking switch. Several models 
 | Video | with images, and FFmpeg on the machine ([video](../running.md#video)) | no | with images, and FFmpeg on the machine | no | no | no | no |
 | `--kv` | fp16 (default), int8, q4_0, k8v4 | fp8 (default: FP8 window, FP4 compressed rows), fp16 | fp16 (default), int8, nvfp4 | fp16 (default), fp8 | fp16 (default), fp8 | fp8 (default: compressed HCA, FP8 MLA-DSA, MXFP4 indexer), fp16 | fp16 (default), fp8 |
 | `gpu-mode peer` | up to 4 cards: experts and prompt layers | up to 5 cards: experts | 2 cards: the last layers of long prompts | up to 4 cards: experts | 2 cards: the experts that spill from the main card | up to 4 cards: experts, a block of layers each | refused |
-| `gpu-mode split` | up to 8 cards | refused | 2 cards | refused | 2 cards | refused | refused |
+| `gpu-mode split` | up to 8 cards | refused | up to 8 cards | refused | 2 cards | refused | refused |
 | Cards by default | the main card alone | the main card alone | the main card alone | the main card alone | the main card, experts in RAM when the context needs their room | the main card alone | the main card; the 26B A4B's experts in RAM when the card cannot hold them |
 | Parallel slots | yes; each slot drafts | yes; each slot drafts | yes; each slot drafts | not measured | not measured | sequential (1 slot per pass) | not measured |
 | Lossy flags | `--relaxed-drafting`, `--route-prior`, `--route-tail-skip` (off) | none | none | none | none | `--route-prior`, `--route-tail-skip` (off) | none |

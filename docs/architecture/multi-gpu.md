@@ -165,7 +165,7 @@ The most cards each mode takes, from each adapter's `gpu_modes()`. A model also 
 | DeepSeek-V4.1-Flash | 5 cards: experts by layer block | refused | refused |
 | Hy4-flash | 4 cards: experts by layer block | refused | refused |
 | ERNIE-5.5-Flash | 4 cards: experts by layer block | refused | refused |
-| Qwen3.8-27B | 2 cards: one prompt stage; decode stays on the main card | 2 cards | refused |
+| Qwen3.8-27B | 2 cards: one prompt stage; decode stays on the main card | 8 cards | refused |
 | Inkling 2 Mini | 2 cards: the experts that spilled from the main card, held on the peer | 2 cards | refused |
 | Gemma 4 (single card only) | refused | refused | refused |
 

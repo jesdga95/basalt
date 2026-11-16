@@ -43,7 +43,7 @@ the shares, and checks the model's modes without loading it.
 | [Qwen3.8-Flash-Next](../models/qwen38-flash-next.md#memory) | up to 4 cards: experts and prompt layers | up to 8 cards | refused |
 | [DeepSeek-V4.1-Flash](../models/deepseek41.md#cards) | up to 5 cards: experts, a block of layers each | refused | refused |
 | [Hy4-flash](../models/hy4-flash.md#cards) | up to 4 cards: experts, a block of layers each | refused | refused |
-| [Qwen3.8-27B](../models/qwen38-27b.md#cards) | 2 cards: the last layers of long prompts | 2 cards | refused |
+| [Qwen3.8-27B](../models/qwen38-27b.md#cards) | 2 cards: the last layers of long prompts | up to 8 cards | refused |
 | [Inkling 2 Mini](../models/inkling2.md#two-cards) | 2 cards: the experts that spill from the main card | 2 cards | refused |
 | [ERNIE-5.5-Flash](../models/ernie55.md#cards) | up to 4 cards: experts, a block of layers each | refused | refused |
 
