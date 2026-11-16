@@ -291,6 +291,16 @@ std::vector<int> spread_experts(const std::vector<uint64_t>& bytes, const std::v
     return owner;
 }
 
+std::vector<size_t> tiers_holding(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers) {
+    std::vector<bool> holds(tiers.size(), false);
+    for (int t : spread_experts(bytes, tiers))
+        if (t >= 0) holds[(size_t) t] = true;
+    std::vector<size_t> out;
+    for (size_t t = 0; t < tiers.size(); ++t)
+        if (holds[t]) out.push_back(t);
+    return out;
+}
+
 std::vector<GpuCard> visible_gpus(bool& known) {
     const NvmlCards nv = read_nvml();
     const char* env = std::getenv("CUDA_VISIBLE_DEVICES");

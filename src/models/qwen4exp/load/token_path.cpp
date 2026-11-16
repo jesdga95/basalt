@@ -30,6 +30,38 @@ int token_path(Context& context) {
         basalt::log::error("basalt generate", "a second GPU as expert tier needs an expert profile and the expert cache; run on one GPU (--gpu 0)");
         return 1;
     }
+    // A tier card with no expert to hold takes no part in the expert tier: the pairs the main card does not hold, dealt
+    // out by room as the fill will, leave it nothing (the main card holds every expert, or the card has no room for one).
+    // The cards left out idle; with none left the start is the main card's alone.
+    if (o.peer_device >= 1) {
+        std::vector<uint64_t> outside;
+        for (const auto& pr : profile)
+            if (xcache.slot_of(pr.first, pr.second) < 0) outside.push_back(basalt::core::PeerExperts::slot_bytes(pr.first));
+        const std::vector<size_t> keep = basalt::program::tiers_holding(outside, context.peer_tier_rooms());
+        if (keep.size() < o.peer_devices.size()) {
+            const std::string why = outside.empty() ? "the main card holds every expert" : "no room for an expert";
+            std::vector<int> devs;
+            std::vector<double> gbps;
+            for (size_t i = 0; i < o.peer_devices.size(); ++i) {
+                if (std::find(keep.begin(), keep.end(), i) != keep.end()) {
+                    devs.push_back(o.peer_devices[i]);
+                    if (i < o.peer_gbps.size()) gbps.push_back(o.peer_gbps[i]);
+                } else {
+                    basalt::log::info("basalt generate", "peer GPU %d: no expert tier, %s; the card idles", o.peer_devices[i],
+                                      why.c_str());
+                }
+            }
+            o.peer_devices = devs;
+            o.peer_gbps = gbps;
+            o.peer_device = devs.empty() ? -1 : devs.front();
+            if (o.peer_device < 1) {
+                *context.split_want = false;
+                o.peer_exclusive = false;
+                context.set_stream_all_min();
+            }
+            context.set_split_cap();
+        }
+    }
 
     Drive drive;
     drive.d.src = srcp;

@@ -31,7 +31,7 @@ namespace basalt::prefill {
 using namespace detail;
 
 namespace detail {
-int64_t g_stream_all_min = 6144;
+int64_t g_stream_all_min = Prefill::kStreamAllMinDefault;
 int g_ring_depth = kPrefillRingDeep;
 double g_pinned_share = 1.0;
 // Whether the fused experts' buffers apply: a streamed chunk of a pack the fused kernels cover.

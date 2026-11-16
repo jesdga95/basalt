@@ -19,6 +19,8 @@ struct Context {
     const bool* peer_streamed_share = nullptr;
     bool* split_want = nullptr;
     const int* split_cap = nullptr;
+    std::function<void ()> set_split_cap;
+    std::function<std::vector<basalt::program::TierRoom> ()> peer_tier_rooms;
     std::function<void ()> set_stream_all_min;
     std::vector<int64_t>* split_at = nullptr;
     std::vector<int>* split_devs = nullptr;
