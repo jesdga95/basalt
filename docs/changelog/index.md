@@ -4,6 +4,7 @@ Releases, newest first. Versions are 0.x: a minor release adds a model or anothe
 
 | Release | Date | Summary |
 | --- | --- | --- |
+| [0.4.1](0.4.1.md) | 2026-11-16 | Qwen3.8-27B on two cards (prompt line, layer split), YaRN past 262,144 and K/V streaming; Flash-Next's RAM plan leaves room again on 64 GB boxes; `--parallel` prompts tokenized in the engine; DeepSeek tiers on up to four cards. |
 | [0.4.0](0.4.0.md) | 2026-11-14 | Qwen3.8-27B, the first dense model: QUASAR's NVFP4 checkpoint with an FP8 head, the DFlash 2 drafter in windows of up to 16 with exact speculative sampling, batched slots; one checkpoint transfer for every model. |
 | [0.3.3](0.3.3.md) | 2026-11-12 | Answer now, logprobs, documents and video in messages, session-affinity slots, faster Flash-Next long prompts on one card, a DeepSeek NVFP4 pack, a container image, `--no-answer-room` becomes `--answer-room 0`. |
 | [0.3.2](0.3.2.md) | 2026-11-08 | Faster DeepSeek decode on two cards, release archives for Linux and Windows x64, an install that finds its files beside `bin/`. |
