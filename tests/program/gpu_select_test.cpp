@@ -132,6 +132,21 @@ int main() {
         CHECK_STR(pick("1", v).error, "gpu: GPU 1 (RTX 3090) is sm_86, not sm_120");
         CHECK_STR(cards(pick("3,2,0", v)), "3,2,0");
     }
+    // An Ada (sm_89) card: never the main card; a second card only in a -DPEER_ADA=ON build
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 5080", 12, 0, 960, 16), card(1, "RTX 4060 Ti", 8, 9, 288, 16)};
+        CHECK_STR(pick("1,0", v).error, "gpu: GPU 1 (RTX 4060 Ti) is sm_89, not sm_120");
+#if defined(BASALT_PEER_ADA)
+        CHECK_STR(cards(pick("0,1", v)), "0,1");
+        CHECK_STR(cards(pick("auto", v)), "0,1");
+#else
+        CHECK_STR(pick("0,1", v).error, "gpu: GPU 1 (RTX 4060 Ti) is sm_89 (rebuild with -DPEER_ADA=ON to enable sm_89 peer support)");
+        GpuChoice c = pick("auto", v);
+        CHECK_STR(cards(c), "0");
+        CHECK(c.notes.size() == 1);
+        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 4060 Ti) skipped, not sm_120");
+#endif
+    }
     // A laptop's own card beside a desktop card in an enclosure: the desktop card's bandwidth makes it main; the
     // laptop card is the first visible, so it runs alone when nothing is set.
     {
@@ -147,7 +162,11 @@ int main() {
     {
         const std::vector<GpuCard> v = {card(0, "RTX 4090", 8, 9, 1008, 24), card(1, "RTX 5090", 12, 0, 1792, 32)};
         CHECK(!pick("", v).error.empty());
+#if defined(BASALT_PEER_ADA)
+        CHECK_STR(cards(pick("auto", v)), "1,0");   // the sm_89 card is a second card in a -DPEER_ADA=ON build
+#else
         CHECK_STR(cards(pick("auto", v)), "1");
+#endif
         CHECK(pick("auto", v).notes.size() == 1);
     }
     // No card list (no management library, no CUDA_VISIBLE_DEVICES): numbers pass, auto cannot run.
