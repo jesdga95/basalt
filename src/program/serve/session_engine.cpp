@@ -173,7 +173,7 @@ public:
     }
     void sleep_command(bool down, std::string& e) override {
         std::string reply;
-        int64_t slots = 0;
+        int64_t slots = -1;
         if (const basalt::model::Result r = session().set_low_memory(down, slots); !r.ok()) {
             e = r.message;
             return;
@@ -375,8 +375,10 @@ private:
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         char line[160];
-        std::snprintf(line, sizeof line, "VRAM reserve_mib=%lld expert_slots=%lld vram_free_mib=%lld\n", reserve,
-                      (long long) slots, (long long) (free_b >> 20));
+        char held[48] = "";   // a session with no cache names no slots
+        if (slots >= 0) std::snprintf(held, sizeof held, " expert_slots=%lld", (long long) slots);
+        std::snprintf(line, sizeof line, "VRAM reserve_mib=%lld%s vram_free_mib=%lld\n", reserve, held,
+                      (long long) (free_b >> 20));
         if (reply != nullptr) *reply = line;
         else std::fputs(line, stdout);
         return true;

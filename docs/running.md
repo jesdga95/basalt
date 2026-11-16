@@ -77,7 +77,7 @@ write always leaves 4 GiB of the volume free. After a restart, a prompt that sta
 ## Sleep: `--idle-sleep`
 
 After the given seconds without requests, the engine frees its VRAM (the driver moves the GPU state to host memory). The process and its
-RAM copy of the experts stay. The next request wakes it in seconds. Linux only. The server stays awake when the GPU state would not fit in
+RAM copy of the experts stay (a dense model has no cache to give back first: the driver moves all its GPU state, both cards' on two cards). The next request wakes it in seconds. Linux only. The server stays awake when the GPU state would not fit in
 free RAM with 8 GiB to spare. `--idle-unload` ends the process instead.
 
 ## Memory floors

@@ -132,6 +132,7 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 
 - `--kv-resident` keeps the MTP drafter's own cache on the card (the block drafter's is a short window).
 - Slots whose windows fit 16 rows together (every slot in plain decoding, two slots of 8-row drafted windows) share one pass through the weights each round, and their block drafters run two blocks a pass; a window that does not fit takes a pass of its own. Prompt reads run per slot.
+- **Idle sleep** (`--idle-sleep`) has no cache to give back first: the driver moves all the GPU state, both cards' on two cards (prompt line or layer split), to RAM (one card: 3.8 s down, 1.7 s back; the layer split: 7.7 s and 3.6 s). The next greedy reply is the same as before the sleep.
 - A second card either reads long prompts or runs the later layers (when the model does not fit one card), never both; no second-card
   drafting.
 

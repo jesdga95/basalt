@@ -538,6 +538,13 @@ public:
         return {};
     }
 
+    // No cache to lend: all it holds is state the driver moves to host memory. Both cards' work is finished first.
+    Result set_low_memory(bool, int64_t&) override {
+        cudaStreamSynchronize(st_.stream);
+        if (st_.peer) cudaStreamSynchronize(st_.peer->stream);
+        return {};
+    }
+
     // a layer's cells: fp16 K and V (format 1), or int8 codes with fp16 scales per 64 values (format 2); the MTP
     // drafter's own layer is fp16 and comes last
     size_t row_bytes(bool int8) const { return (size_t) g_.n_kv * g_.head_dim * (int8 ? 1 : 2); }
