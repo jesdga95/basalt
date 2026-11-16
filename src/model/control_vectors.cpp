@@ -7,10 +7,20 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <sstream>
 
 namespace basalt::model {
+
+std::string cvec_identity_words(const CvecFlags& f) {
+    if (!f.given()) return {};
+    char num[96];
+    std::snprintf(num, sizeof num, " cvec %d %d %d %d", f.first, f.last, f.mode, f.single);
+    std::string text = num;
+    for (const auto& [path, scale] : f.files) text += " cvec " + path + " " + std::to_string(scale);
+    return text;
+}
 
 bool parse_cvec_flag(const std::string& a, FlagArgs& args, CvecFlags& f, int& code) {
     if (a == "--control-vector") f.files.push_back({args.next("--control-vector"), 1.0f});

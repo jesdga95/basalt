@@ -27,6 +27,11 @@ struct CvecFlags {
 /// is another flag.  `code`: an exit code for a bad value.
 bool parse_cvec_flag(const std::string& a, FlagArgs& args, CvecFlags& f, int& code);
 
+/// The words a conversation cache keys a vector under: the range, mode and direction the flags name, then each file
+/// and the scale it is read with.  Empty when none was asked for.  A model's conversation identity builds these in
+/// (see its `conversation_identity`), and hashes each file's bytes too: the same path can hold a different vector.
+std::string cvec_identity_words(const CvecFlags& f);
+
 /// Reads the files llama.cpp's `common_control_vector_load` would (every file's `direction.<l>` times its scale,
 /// summed; layer 0 has none), applies the range, the mode and the direction the flags name, and uploads the result
 /// (see `kernels::cvec_upload`).  `n_layers` and `n_embd` are the model's geometry, `hc` the residual streams its

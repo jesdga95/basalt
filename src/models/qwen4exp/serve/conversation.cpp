@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/conversation.cpp - conversation operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/model/control_vectors.hpp"
 #include "basalt/protocol.hpp"
 #include "qfn_state.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
@@ -33,20 +34,22 @@ bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss,
 
 /// The identity parked conversations on disk are written under (conversation_store.hpp): the model file
 /// (its size and samples of its bytes) and the settings that change a state's bytes - the K/V type, the rope, the draft
-/// layer, the image encoder, control vectors.  A file of another identity is never restored.
+/// layer, the image encoder, control vectors, the bytes of the vector files among them.  A file of another identity is
+/// never restored.
 uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeometry& g) {
     using basalt::core::conversation_store_hash;
     char num[512];
-    std::snprintf(num, sizeof num, " rope %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g cvec %d %d %d %d", o.rope.scale,
+    std::snprintf(num, sizeof num, " rope %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g", o.rope.scale,
                   o.rope.freq_base, o.rope.freq_scale, o.rope.orig_ctx, o.rope.ext_factor, o.rope.attn_factor,
-                  o.rope.beta_fast, o.rope.beta_slow, o.cvec.first, o.cvec.last, o.cvec.mode, o.cvec.single);
+                  o.rope.beta_fast, o.rope.beta_slow);
     std::string text = std::string("basalt conversation state kv ") + o.kv + " rope " +
-                       o.rope.type + num + " mtp " + o.mtp + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
-    for (const auto& [path, scale] : o.cvec.files) text += " cvec " + path + " " + std::to_string(scale);
+                       o.rope.type + num + " mtp " + o.mtp + " vision_in_engine " + (o.vision_in_engine ? "1" : "0") +
+                       basalt::model::cvec_identity_words(o.cvec);
     uint64_t h = conversation_store_hash(text.data(), text.size(), 1);
     const int64_t geo[] = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_v_heads, g.n_head_kv,
                            g.head_dim, g.idx_key_dim, g.n_expert, g.n_ff};
     h = conversation_store_hash(geo, sizeof geo, h);
+    for (const auto& [path, scale] : o.cvec.files) h = basalt::core::conversation_store_hash_file(path, h);
     return basalt::core::conversation_store_hash_file(o.model, h);
 }
 
