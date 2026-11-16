@@ -219,7 +219,8 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
                      "l"(src) : "memory");
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
-    const float dt = a.dt[gh], sa = a.ssm_a[gh], gam = a.gamma[col];
+    const float dt = a.dt[gh], sa = a.ssm_a[gh];
+    [[maybe_unused]] const float gam = a.gamma[col];   // read by the norm, which a build below sm_90 does not compile
     stamp(a, 1);
     if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights (a no-op below sm_90)
     // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
