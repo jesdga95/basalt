@@ -131,6 +131,7 @@ struct Options {
     int layer_begin = 0, layer_end = 0;
     core::FileRange mmproj;             ///< the vision projector (vision/mmproj)
     std::string arch;                   ///< the architecture name, for messages
+    std::string cvec_summary;           ///< the control vector loaded for this run, as INFO reports it (empty: none)
 };
 
 class Model;
