@@ -11,7 +11,7 @@ namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 256;
-constexpr int64_t kMaxEmb = 32 * THREADS;   // the widest residual the kernels below hold in registers (K = 32)
+constexpr int64_t kMaxEmb = 32 * THREADS;   // the widest residual the instantiations below cover (K = 32 values per thread)
 
 // the block's two-level sum over one row (its value ranges never span more than one block)
 __device__ __forceinline__ float block_sum(float v, float* part) {
@@ -123,15 +123,21 @@ bool upload_here(std::string& err) {
     DevTables& t = g_dev[cur_device()];
     if (t.dir != nullptr) return true;
     const int flag = g_on_host ? 1 : 0;
-    if (cudaMalloc(&t.dir, g_dir_host.size() * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&t.s, g_s_host.size() * sizeof(float)) != cudaSuccess || cudaMalloc(&t.on, sizeof(int)) != cudaSuccess ||
-        cudaMemcpy(t.dir, g_dir_host.data(), g_dir_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(t.s, g_s_host.data(), g_s_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(t.on, &flag, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+    DevTables n;   // installed only once every allocation and copy went through, so a failure leaves nothing behind
+    const bool ok = cudaMalloc(&n.dir, g_dir_host.size() * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc(&n.s, g_s_host.size() * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc(&n.on, sizeof(int)) == cudaSuccess &&
+                    cudaMemcpy(n.dir, g_dir_host.data(), g_dir_host.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
+                    cudaMemcpy(n.s, g_s_host.data(), g_s_host.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
+                    cudaMemcpy(n.on, &flag, sizeof(int), cudaMemcpyHostToDevice) == cudaSuccess;
+    if (!ok) {
         err = "control vector: device allocation failed";
-        t = DevTables{};
+        cudaFree(n.dir);   // cudaFree of a null pointer is a no-op
+        cudaFree(n.s);
+        cudaFree(n.on);
         return false;
     }
+    t = n;
     return true;
 }
 
@@ -155,6 +161,7 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
     if (s.empty() || dir.size() != s.size() * (size_t) n_embd) { err = "control vector: bad table sizes"; return false; }
     int prev = 0;   // a new vector replaces the old one on every device
     cudaGetDevice(&prev);
+    g_cvec = Cvec{};   // the old tables are gone now: a failed upload below leaves no vector, not dangling pointers
     for (int d = 0; d < kDevices; ++d) {
         if (g_dev[d].dir == nullptr) continue;
         cudaSetDevice(d);
@@ -232,8 +239,8 @@ void cvec_apply_bf16(uint16_t* R, int64_t layer, int64_t T, int64_t r_ld, void* 
     const dim3 grid((unsigned) T);
     const cudaStream_t s = (cudaStream_t) stream;
     const int n = (int) g_cvec.n_embd, mode = g_cvec.mode;
-    auto* dir = (__nv_bfloat16*) R;
-#define CVEC_BF16(K) launch_pdl(cvec_bf16_kernel<K>, grid, dim3(THREADS), 0, s, dir, t.dir, t.s, t.on, mode, layer, n, r_ld)
+    auto* rows = (__nv_bfloat16*) R;   // R is uint16_t* to the caller; the vector's own rows are t.dir
+#define CVEC_BF16(K) launch_pdl(cvec_bf16_kernel<K>, grid, dim3(THREADS), 0, s, rows, t.dir, t.s, t.on, mode, layer, n, r_ld)
     switch (chunks_for(g_cvec.n_embd)) {   // cvec_upload refused anything wider, so one of these always covers the row
         case 4: CVEC_BF16(4); break;
         case 8: CVEC_BF16(8); break;
