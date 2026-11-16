@@ -45,7 +45,9 @@ Each request ends with one `done` line:
 - `hit`: expert cache hit rate. `pcie`: share of routed experts read over PCIe.
 
 The engine's own `basalt ...` lines go to `~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits
-taken from the file); `[server] engine log: PATH` names it when the engine fails to start. The folder also holds the conversation
+taken from the file); `[server] engine log: PATH` names it at start. A log of 10 MiB or more moves to `engine.log.1` at the
+next start. An engine that dies of a fault or an unhandled exception writes a `basalt crash: error: ...` line (the fault, the stage
+it was in) and the server's warning quotes it with the exit status. The folder also holds the conversation
 cache. Nothing is unpacked from the model file: the server reads the tokenizer from its sections, and the engine and `basalt-vision`
 read the vision projector inside it.
 

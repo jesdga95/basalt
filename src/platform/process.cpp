@@ -336,7 +336,9 @@ struct CrashBuf {
     }
 };
 
-void append_crash_stage(CrashBuf& b) noexcept {
+// `with_memory` is false in a POSIX signal handler: the Linux reading opens and parses /proc files, which is not
+// async-signal-safe.
+void append_crash_stage(CrashBuf& b, bool with_memory) noexcept {
     const auto& p = basalt::core::progress();
     const char* where = p.where.load(std::memory_order_relaxed);
     const int64_t detail = p.detail.load(std::memory_order_relaxed);
@@ -352,6 +354,7 @@ void append_crash_stage(CrashBuf& b) noexcept {
         b.puts(" chunk ");
         b.put_i64(chunk);
     }
+    if (!with_memory) return;
     const ProcessMemory pm = process_memory();
     if (pm.rss_mib > 0 || pm.avail_mib > 0) {
         b.puts(", ");
@@ -408,7 +411,7 @@ void on_terminate() noexcept {
         b.puts("basalt crash: error: unhandled exception (");
         b.puts(what);
         b.putc(')');
-        append_crash_stage(b);
+        append_crash_stage(b, true);
         b.putc('\n');
         write_crash_line(b);
         write_crash_backtrace();
@@ -448,12 +451,12 @@ LONG WINAPI on_win_exception(EXCEPTION_POINTERS* ep) noexcept {
             b.put_hex((uint64_t) r->ExceptionInformation[1]);
             b.putc(')');
         }
-        append_crash_stage(b);
+        append_crash_stage(b, true);
         b.putc('\n');
         write_crash_line(b);
         write_crash_backtrace();
     }
-    return EXCEPTION_EXECUTE_HANDLER;
+    return EXCEPTION_CONTINUE_SEARCH;   // the system's own crash handling and the exit status stay as they were
 }
 #else
 const char* posix_signal_name(int sig) noexcept {
@@ -475,12 +478,12 @@ void on_crash_signal(int sig, siginfo_t* info, void*) noexcept {
             b.puts(" at ");
             b.put_hex((uintptr_t) info->si_addr);
         }
-        append_crash_stage(b);
+        append_crash_stage(b, false);
         b.putc('\n');
         write_crash_line(b);
         write_crash_backtrace();
     }
-    (void) ::raise(sig);
+    (void) ::raise(sig);   // blocked until this returns, then the default action (SA_RESETHAND) ends the process
 }
 #endif
 }  // namespace
@@ -488,14 +491,21 @@ void on_crash_signal(int sig, siginfo_t* info, void*) noexcept {
 void install_crash_handler() {
     (void) std::set_terminate(on_terminate);
 #if defined(_WIN32)
-    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
-    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     (void) SetUnhandledExceptionFilter(on_win_exception);
 #else
+    // backtrace() loads its unwinder on first use, which allocates: do it now, not in the handler
+    void* warm[1];
+    (void) ::backtrace(warm, 1);
+    // a stack overflow of the calling thread faults with no stack left to run a handler on
+    static char alt_stack[64 * 1024];
+    stack_t ss{};
+    ss.ss_sp = alt_stack;
+    ss.ss_size = sizeof alt_stack;
+    (void) ::sigaltstack(&ss, nullptr);
     struct sigaction sa{};
     sa.sa_sigaction = on_crash_signal;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
     for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) (void) sigaction(sig, &sa, nullptr);
 #endif
 }
