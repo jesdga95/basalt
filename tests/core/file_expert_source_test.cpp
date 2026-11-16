@@ -490,6 +490,16 @@ void test_cgroup_memory_stat_text() {
             "small text rejected");
     require(cgroup_available_bytes(64000, stat, bytes) && bytes == 64000 - 680, "margin exceeded half the reclaimable");
 
+    // shared memory (pinned host buffers) is in `file` but never reclaimed
+    require(parse_cgroup_memory_stat("file " + gib(40) + "\nshmem " + gib(30) + "\ninactive_file " + gib(2) +
+                                         "\nfile_dirty 0\nfile_writeback 0\n", current, stat) && stat.shmem == 30 * GiB,
+            "memory.stat with shmem was rejected");
+    require(cgroup_available_bytes(limit, stat, bytes), "shmem: available refused");
+    require(bytes == (limit - (current - 10 * GiB)) - limit / 64, "shared memory counted reclaimable");
+    require(parse_cgroup_memory_stat("file " + gib(4) + "\nshmem " + gib(6) + "\ninactive_file " + gib(1) +
+                                         "\nfile_dirty 0\nfile_writeback 0\n", current, stat) &&
+                cgroup_available_bytes(limit, stat, bytes) && bytes == (limit - (current - 1 * GiB)) - 1 * GiB / 2,
+            "shmem above file: the inactive list alone");
     // malformed text fails closed
     require(!parse_cgroup_memory_stat("inactive_file 1\nfile_dirty 0\n", current, stat), "missing writeback accepted");
     require(!parse_cgroup_memory_stat("file 1\nfile 2\ninactive_file 1\nfile_dirty 0\nfile_writeback 0\n", current, stat),
