@@ -194,6 +194,29 @@ public:
     std::mutex gent_mu{};
     std::map<uint64_t, std::vector<int32_t>> gent_ids{};   // tokenized prompts waiting for their request line, by sequence
     uint64_t gent_seq{};
+    // ---- --batch: a prompt the server sends once (`PROMPT`: text the engine tokenizes, `PROMPTI`: ids) and then names by
+    // handle (`#<handle>[+<id>,...]` where a GEN line has its ids), so a request that runs in several engine runs or
+    // waits for a slot does not send or tokenize it again.  The input thread takes it in and answers `PROMPT <handle>
+    // <n>` at once, even while a request runs; `PMATCH <handle>` then says what each idle slot holds of it.  Guarded by gent_mu.
+    struct HeldPrompt {
+        std::vector<int32_t> ids;
+        bool media = false;   ///< its pictures are placed by the request that reads it: a held conversation meets it only as an exact prefix
+    };
+    std::map<uint64_t, HeldPrompt> prompts{};
+    static constexpr size_t kPromptsMax = 64;
+    /// The tokens an idle slot's conversation holds for its next turn; null when it holds none (or is decoding).
+    const std::vector<int32_t>* idle_ids(int b) const;
+    struct SlotMeet {
+        int64_t match = 0;   ///< the tokens of the prompt the slot's conversation covers, the same ones the request would reuse from it
+        int64_t held = 0;    ///< the tokens it holds
+    };
+    std::vector<SlotMeet> slot_meets(const std::vector<int32_t>& prompt, bool media) const;
+    /// Holds a prompt and returns its handle.
+    uint64_t hold_prompt(HeldPrompt&& p);
+    /// PROMPTI [img] <id,id,...>, from the input thread: held and answered.
+    void take_prompt_ids(const std::string& line);
+    /// PMATCH <handle> | PFREE <handle>, from the main loop.
+    void prompt_command(const std::string& line);
     std::atomic<bool> stop_req{};
     std::atomic<bool> stdin_lost{};
     std::thread reader_{};

@@ -597,6 +597,7 @@ add_library(serve_shared STATIC src/program/serve/commands.cpp
             src/program/serve/request_parse.cpp
             src/program/serve/request_prefill.cpp
             src/program/serve/request_restore.cpp
+            src/program/serve/prompt_handles.cpp
             src/program/serve/session_engine.cpp
             src/program/cli/tokens.cpp
             src/program/cli/help.cpp)

@@ -113,6 +113,10 @@ Flow Runtime::dispatch() {
         std::fflush(stdout);
         return Flow::next;
     }
+    if (line.rfind("PMATCH ", 0) == 0 || line.rfind("PFREE ", 0) == 0) {   // a prompt held by handle, between requests and windows
+        prompt_command(line);
+        return Flow::next;
+    }
     if (line.rfind("ERR_GENT ", 0) == 0) {
         std::printf("ERR %s\n", line.c_str() + 9);
         std::fflush(stdout);
