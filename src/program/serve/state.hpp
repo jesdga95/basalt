@@ -186,6 +186,11 @@ public:
     // GENT: the request text arrives as bytes and the reader thread turns it into ids, from the pack's tokenizer tables
     basalt::program::Tokenizer text_tokenizer{};
     std::string text_tokenizer_note{};
+    /// The raw bytes a token stands for; empty when the pack's tokenizer tables are not loaded or the id has none.
+    std::string_view token_bytes(int32_t id) const {
+        return !text_tokenizer_note.empty() || id < 0 || (size_t) id >= text_tokenizer.vocab_size()
+                   ? std::string_view() : std::string_view(text_tokenizer.token_bytes(id));
+    }
     std::mutex gent_mu{};
     std::map<uint64_t, std::vector<int32_t>> gent_ids{};   // tokenized prompts waiting for their request line, by sequence
     uint64_t gent_seq{};
