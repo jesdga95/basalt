@@ -183,13 +183,17 @@ Diagnostic flags: [diagnostics](diagnostics.md).
 
 ## Control vectors
 
-A GGUF control vector added to the residual stream. A request switches it with `experimental_speed_projection`. A split
-or a peer's prompt stage keeps it on every card: each stage applies the vector to the steered layers it reads.
+A GGUF control vector added to the residual stream, after each steered layer's output. Qwen3.8-Flash-Next and
+Qwen3.8-27B take these flags. A request switches it with `experimental_speed_projection`. A split or a peer's prompt
+stage keeps it on every card: each stage applies the vector to the steered layers it reads.
+
+A vector is model-specific: it holds one direction of the model's width per layer, so a Flash-Next vector is refused
+by a 27B run, and the other way round.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `control-vector` | engine | file | off | Flash-Next only. A vector at scale 1. |
-| `control-vector-scaled` | engine | `FILE:SCALE[,...]` | off | Flash-Next only. Vectors with their scales. |
-| `control-vector-layer-range` | engine | `A B` | 1 to last layer | Flash-Next only. Layers it applies to, inclusive. |
-| `cvec-mode` | engine | `add`, `project` | `add` | Flash-Next only. `add`: h += s v. `project`: h -= s (h.v) v. |
-| `cvec-dir` | engine | `per-layer`, `single:L` | `per-layer` | Flash-Next only. Each layer's own direction, or layer L's everywhere. |
+| `control-vector` | engine | file | off | A vector at scale 1. |
+| `control-vector-scaled` | engine | `FILE:SCALE[,...]` | off | Vectors with their scales. |
+| `control-vector-layer-range` | engine | `A B` | 1 to last layer | Layers it applies to, inclusive. |
+| `cvec-mode` | engine | `add`, `project` | `add` | `add`: h += s v. `project`: h -= s (h.v) v. |
+| `cvec-dir` | engine | `per-layer`, `single:L` | `per-layer` | Each layer's own direction, or layer L's everywhere. |
