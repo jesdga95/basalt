@@ -290,6 +290,23 @@ int main() {
         cache.put_slot(std::move(turn), 4);
         check(cache.superseded() == 1 && cache.slot_size() == 2, "a later turn of the same conversation supersedes its copy");
     }
+    {   // a conversation taken out and put back (the request that took it was declined) displaces nothing
+        const size_t one = image({1, 2, 3}).bytes();
+        ConversationCache cache(2 * one, 2);
+        cache.set_spill(true);
+        check(cache.put(image({1, 2, 3})) && cache.put(image({9, 8, 7})), "park two, the budget and the slots full");
+        cache.put_slot(image({4, 4, 4}), 2);
+        const size_t held = cache.bytes();
+        auto budgeted = cache.take(cache.best(a, {}, true).index);
+        check(!budgeted.from_slot && cache.put(std::move(budgeted)) && cache.size() == 3 && cache.bytes() == held &&
+                  cache.best(a, {}, true).tokens == 3 && cache.best(b, {}, true).tokens == 3,
+              "a budgeted one goes back into the room it left");
+        auto slot = cache.take(cache.best(std::vector<int64_t>{4, 4, 4, 5}, {}, true).index);
+        check(slot.from_slot && cache.slot_size() == 0, "an idle slot's one taken out");
+        cache.put_slot(std::move(slot), 2);
+        check(cache.slot_size() == 1 && cache.size() == 3 && cache.bytes() == held, "and put back beside the others");
+        check(cache.evictions() == 0 && cache.take_spilled().empty(), "neither return evicts or spills anything");
+    }
     {   // the longest parked conversation a caller accepts leaves, an idle slot's or a budgeted one alike
         ConversationCache cache(1 << 20, 4);
         cache.set_spill(true);

@@ -79,6 +79,10 @@ protected:
         incoming.reset();
         incoming_kv.reset();
     }
+    /// The incoming image came out of the RAM tier, which takes it back when the request ends before restoring it.
+    bool incoming_parked{};
+    /// Puts such an image back where it was parked; true when the RAM tier holds it again.
+    bool repark_incoming();
     int64_t in_tokens{};
     bool in_live{};
     basalt::core::ConversationStore::Match on_disk{};
