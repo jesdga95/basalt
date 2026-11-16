@@ -257,23 +257,32 @@ bool QfnRuntime::batch_step() {
         n_keep[sg] = k;
     }
     // grammar: a slot with a guard scans its kept picks; the first one the grammar refuses is drawn again
-    // under the mask (the solo rule) and the segment ends at that row, which stays committed
-    std::vector<float> grammar_bias;
+    // under the mask (the solo rule) and the segment ends at that row, which stays committed; with no token allowed
+    // at all the request ends there as an error
     for (int sg = 0; sg < S; ++sg) {
         BSlot& sl = bs[(size_t) rows[sg]];
         if (sl.guard == nullptr || !sl.guard->on()) continue;
-        const int miss = sl.guard->scan(outb + r0s[sg], n_keep[sg]);
-            if (miss < 0) continue;
-        sl.guard->mask_bias({}, grammar_bias);
+        const int miss = sl.guard->scan(outb + r0s[sg], n_keep[sg], 0);
+        if (miss < 0) continue;
         int32_t gtok = 0;
-        if (!ver.resample_row(r0s[sg] + miss, p0s[sg], grammar_bias, gtok, err)) {
-            std::printf("ERR %s\n", err.c_str());
+        const basalt::program::grammar::Redraw verdict = sl.guard->redraw(
+            {},
+            [&](const std::vector<float>& bias, int32_t& t) { return ver.resample_row(r0s[sg] + miss, p0s[sg], bias, t, err); },
+            [&](std::vector<float>& lg) {
+                lg.resize((size_t) n_vocab);
+                return ver.copy_logits(r0s[sg] + miss, lg.data());
+            },
+            gtok);
+        if (verdict == basalt::program::grammar::Redraw::failed) {
+            std::printf("ERR %s\n", err.empty() ? "the masked draw failed" : err.c_str());
             return false;
         }
-        outb[r0s[sg] + miss] = gtok;
-        if (!sl.guard->take(gtok))
-            basalt::log::info("basalt grammar", "slot %d: the masked draw at row %d was token %d", rows[sg], miss, (int) gtok);
         n_keep[sg] = miss + 1;
+        if (verdict == basalt::program::grammar::Redraw::dead) {
+            fin_of[sg] = "error";
+            continue;
+        }
+        outb[r0s[sg] + miss] = gtok;
         fin_of[sg] = fin_at(sl, rows[sg], gtok, miss);
     }
     // logprobs: a slot that asked gets a BP line per kept pick, read before the commit and the drafts touch the head

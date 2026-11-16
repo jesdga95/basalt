@@ -338,6 +338,13 @@ static void test_partial_utf8() {
     t.fill_mask(voc, mask);
     CHECK(mask[0xE2] && mask[257] && mask['a'] && !mask[0xA9] && !mask[0xFF]);
     CHECK(t.accept("\xE2\x82") && t.accept("\xAC") && t.accept("\xF0\x9F") && t.accept("\x98\x80") && t.accepting());
+    // the same stacks with a character half read give another mask, and the cached one for the whole state is not served
+    GrammarState w(any);
+    w.fill_mask(voc, mask);
+    CHECK(mask['a'] && mask[0xE2] && !mask[0xA9]);
+    CHECK(w.accept("\xE2"));
+    w.fill_mask(voc, mask);
+    CHECK(mask[0xA9] && !mask['a'] && !mask[0xE2]);
     // a continuation byte after a finished character, or a bad lead, is refused
     GrammarState u(any);
     CHECK(!u.accept("\x80") && !u.accept("\xC0\x80") && !u.accept("\xFF"));

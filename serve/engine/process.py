@@ -1159,7 +1159,7 @@ class ProcessEngine:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
                         soft = stop_soon is not None and stop_soon.is_set()
-                        if cancel.is_set() or soft or left <= 0 or finish in ("stop", "length") or (out and out[-1] in self.eos_ids()):
+                        if cancel.is_set() or soft or left <= 0 or finish in ("stop", "length", "error") or (out and out[-1] in self.eos_ids()):
                             self._carry_run(carry, first, last0, True)
                             return
                         self._carry_run(carry, first, last0, False)

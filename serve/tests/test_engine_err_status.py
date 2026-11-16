@@ -34,6 +34,15 @@ class ErrEngine(MockEngine):
         raise request_err(self.err)
 
 
+class GrammarEndEngine(MockEngine):
+    """A reply the engine ends itself: tokens, then a DONE whose finish is "error" (the grammar allowed no token)."""
+    last = None
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+        yield from self.tok.encode("{\"a\":")
+        self.last = {"generated": 3, "prompt_tokens": len(ids), "prompt_ms": 1.0, "decode_ms": 1.0, "finish": "error"}
+
+
 class EngineErrStatus(unittest.TestCase):
     def test_request_err_classifies_the_text(self):
         self.assertIsInstance(request_err(FAILED), EngineError)
@@ -46,6 +55,9 @@ class EngineErrStatus(unittest.TestCase):
         tok = ByteTokenizer()
         eng = ErrEngine(tok, "xy", max_context=CTX)
         eng.err = err
+        return self.serve_statuses(tok, eng)
+
+    def serve_statuses(self, tok, eng):
         svc = Service(eng, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -69,6 +81,12 @@ class EngineErrStatus(unittest.TestCase):
             self.assertEqual(code, 500, (path, text))
             self.assertIn("device wait timed out", text, path)
             self.assertIn("server_error", text, path)
+
+    def test_a_reply_the_engine_ends_as_an_error_is_a_500(self):
+        tok = ByteTokenizer()
+        for path, code, text in self.serve_statuses(tok, GrammarEndEngine(tok, "xy", max_context=CTX)):
+            self.assertEqual(code, 500, (path, text))
+            self.assertIn("grammar allowed no token", text, path)
 
     def test_a_request_error_is_a_400(self):
         for path, code, text in self.statuses(REFUSED):

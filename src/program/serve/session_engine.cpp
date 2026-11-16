@@ -710,8 +710,8 @@ bool SessionRuntime::slot_window_finish(int b, SlotWin& w) {
 
 // The window's accepted drafts, grammar, logprobs and tokens; whether drafts follow (w.want).
 bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
-    std::vector<float> grammar_bias;
     std::vector<float> lp_rows;   // a logprobs slot's kept rows (row_logprobs)
+    bool grammar_dead = false;    // the grammar allowed no token: the slot ends as an error after this window
     const auto failed = [&](const std::string& m) {
         std::printf("ERR %s\n", m.c_str());
         set_active(0);
@@ -725,15 +725,30 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
     int a = 0;
     while (a < T - 1 && win_[(size_t) a + 1] == out_[(size_t) a]) ++a;
     if (sl.guard != nullptr && sl.guard->on()) {
-        // the first pick the grammar refuses is drawn again under its mask, and the window ends there
-        const int miss = sl.guard->scan(out_.data(), a + 1);
+        // the first pick the grammar refuses is drawn again under its mask, and the window ends there; with no token
+        // allowed at all the slot ends after it, as an error
+        const int miss = sl.guard->scan(out_.data(), a + 1, 0);
         if (miss >= 0) {
-            sl.guard->mask_bias({}, grammar_bias);
             int32_t y = -1;
-            if (const basalt::model::Result r = session().resample_row(miss, grammar_bias.data(), y); !r.ok()) return failed(r.message);
-            out_[(size_t) miss] = y;
+            std::string why;
+            const basalt::program::grammar::Redraw verdict = sl.guard->redraw(
+                {},
+                [&](const std::vector<float>& bias, int32_t& t) {
+                    const basalt::model::Result r = session().resample_row(miss, bias.data(), t);
+                    if (!r.ok()) why = r.message;
+                    return r.ok();
+                },
+                [&](std::vector<float>& lg) {
+                    lg.resize((size_t) n_vocab);
+                    const basalt::model::Result r = session().copy_logits(miss, lg.data());
+                    if (!r.ok()) why = r.message;
+                    return r.ok();
+                },
+                y);
+            if (verdict == basalt::program::grammar::Redraw::failed) return failed(why.empty() ? "the masked draw failed" : why);
+            if (verdict == basalt::program::grammar::Redraw::dead) grammar_dead = true;
+            else out_[(size_t) miss] = y;
             a = miss;
-            if (!sl.guard->take(y)) basalt::log::info("basalt grammar", "slot %d: the masked draw was token %d", b, (int) y);
         }
     }
     sl.drafts_offered += T - 1;
@@ -759,6 +774,7 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
         const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
         fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
     }
+    if (grammar_dead) fin = "error";
     sl.n_dr = 0;
     w.a = a;
     w.line = line;

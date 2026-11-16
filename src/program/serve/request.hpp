@@ -46,7 +46,7 @@ protected:
     bool from_text{};
     int64_t n{};
     std::unique_ptr<basalt::program::grammar::Guard> gguard{};
-    std::vector<float> grammar_bias{};
+    bool grammar_dead{};   // the grammar allowed no token: the reply ends as an error
     int64_t grammar_resamples{};
     basalt::program::PplGate* ppl{};
     bool bad{};
