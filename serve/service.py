@@ -918,7 +918,7 @@ class Service:
             self._check_images(messages, images)
         if videos:
             self._check_videos(videos)
-        if not media and getattr(self.engine, "takes_text", False) and not getattr(self.engine, "batch", 0):
+        if not media and getattr(self.engine, "takes_text", False):
             return self._prepare_text(messages, tools, kwargs, max_new, force)
         results, spliced = [], None
         if media:
