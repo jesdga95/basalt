@@ -173,12 +173,22 @@ __device__ __forceinline__ void rec_sync() {
     else __syncthreads();
 }
 
+// Below sm_90 (a peer-tier build for an older card) the cluster machinery does not exist: only the SPLIT
+// instantiation is compiled there, where `cluster` is always null, so its type degenerates to void*.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define DM_REC_NO_CLUSTERS 1
+using DmRecClusterPtr = void*;
+#else
+#define DM_REC_NO_CLUSTERS 0
+using DmRecClusterPtr = cg::cluster_group*;
+#endif
+
 // One block of a head's cluster.  `head` = the launch's value head (head_map), `rank` = its column group.  SPLIT: no cluster and no z; the
 // head's raw output goes to a.o for dec_gdn_rec_norm.  GIN (with SPLIT): the gates come computed, alpha of token t at
 // gin_a[t * h_v + gh] and beta at gin_b[t * h_v + gh] (dec_gdn_gates).
 template<int MAXT, int NJ, bool SPLIT, bool SUB = false, bool GIN = false>
 __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem<NJ, rec_rows(MAXT)>& sm,
-                                          cg::cluster_group* cluster, const float* gin_a = nullptr,
+                                          DmRecClusterPtr cluster, const float* gin_a = nullptr,
                                           const float* gin_b = nullptr) {
     const int rg = threadIdx.x / 32, lane = threadIdx.x % 32, tid = threadIdx.x;
     stamp(a, 0);
@@ -209,9 +219,10 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
                      "l"(src) : "memory");
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
-    const float dt = a.dt[gh], sa = a.ssm_a[gh], gam = a.gamma[col];
+    const float dt = a.dt[gh], sa = a.ssm_a[gh];
+    [[maybe_unused]] const float gam = a.gamma[col];   // read by the norm, which a build below sm_90 does not compile
     stamp(a, 1);
-    if (a.early_trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the out projection may stage its weights
+    if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights (a no-op below sm_90)
     // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
     // predecessor passed its own wait on the hc read), so they are computed while the projections still run
     asm volatile("cp.async.wait_all;" ::: "memory");
@@ -223,6 +234,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
             ab_pair<NJ>(a, sm.wab, t, lane, dt, sa, al, be);
             if (lane == 0) { sm.g[t] = al; sm.b[t] = be; }
         }
+#if !DM_REC_NO_CLUSTERS
     } else {   // a token per warp of the cluster, written into every rank's shared memory once all four have started
         asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
@@ -235,9 +247,12 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
             }
         }
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");   // waited on before the gates are read
+#endif
     }
     pdl_wait();
+#if !DM_REC_NO_CLUSTERS
     if constexpr (!SPLIT) asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+#endif
     if constexpr (GIN) {   // thread t's gates, read by thread t and, past the barriers below, the block
         if (tid < T) { sm.g[tid] = gin_a[(size_t) tid * a.h_v + gh]; sm.b[tid] = gin_b[(size_t) tid * a.h_v + gh]; }
     }
@@ -361,6 +376,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         }
     }
     if (SPLIT) return;
+#if !DM_REC_NO_CLUSTERS
     // every rank's sums of squares, pushed into every rank's shared memory (every rank has started: the gates' barrier)
     // before one cluster barrier
     if (rg == 0) {
@@ -385,14 +401,17 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     }
     stamp(a, 8);
     stamp(a, 9);
+#endif  // !DM_REC_NO_CLUSTERS
 }
 
+#if !DM_REC_NO_CLUSTERS
 template<int MAXT, int NJ>
 __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_kernel(const DecRecArgs a, int T) {
     __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
     cg::cluster_group cl = cg::this_cluster();
     rec_block<MAXT, NJ, false>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
 }
+#endif  // !DM_REC_NO_CLUSTERS
 
 template<int MAXT, int NJ>
 __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T) {
@@ -426,6 +445,7 @@ __device__ __forceinline__ DecRecArgs seg_args(const DecRecArgs& a0, const SegRo
 
 // rec_kernel over a segmented window: cluster row y is a window row, of which only a segment's first works, on the
 // segment's rows and state
+#if !DM_REC_NO_CLUSTERS
 template<int MAXT, int NJ>
 __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
                                                                               size_t state_off, const SegDst* dst,
@@ -469,6 +489,7 @@ __global__ void __launch_bounds__(128) gates_kernel(const DecRecArgs a, int n_to
     ab_pair<NJ>(a, wab, t, lane, dt, sa, al, be);
     if (lane == 0) { gates[(size_t) t * a.h_v + gh] = al; gates[((size_t) n_tok + t) * a.h_v + gh] = be; }
 }
+#endif  // !DM_REC_NO_CLUSTERS
 
 // one warp per (token, value head): the head's four 32-value sums of squares in rank order, then norm_q8 per rank
 __global__ void __launch_bounds__(128) rec_norm_kernel(const DecRecArgs a, int T) {
