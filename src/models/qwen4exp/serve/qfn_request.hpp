@@ -210,8 +210,6 @@ private:
     void slot_init(BSlot& sl) override;
     bool slot_leave() override;
     void report_request(const DoneCounts& dc) override;
-    bool cvec_wanted() const override;
-    void set_cvec() override;
     void select_view() override;
     bool slot_draft_in(int slot) override;
     void drop_stale_reuse() override;

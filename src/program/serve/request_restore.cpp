@@ -2,7 +2,16 @@
 #include "prefix_anchor.hpp"
 #include "request.hpp"
 
+#include "basalt/kernels/cvec.hpp"
+
 namespace basalt::program::serve {
+
+// The engine keeps one vector's tables and a device switch (basalt/kernels/cvec.hpp): the graphs are the same
+// either way, and a request only moves the switch.  Called here, between requests, where nothing is in flight.
+bool Request::cvec_wanted() const { return basalt::kernels::cvec().loaded() ? req_cvec != 0 : true; }
+void Request::set_cvec() {
+    if (basalt::kernels::cvec().loaded()) basalt::kernels::cvec_set_enabled(want_cvec);
+}
 
 // ---- where this request starts reading: the live session, or a checkpoint, whose tokens and pictures are
 // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
