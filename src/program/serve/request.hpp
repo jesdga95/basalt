@@ -153,8 +153,11 @@ protected:
     /// A template whose turn token opens the user's turn: the turn's checkpoint sits before the prompt's last token.
     virtual bool turn_checkpoint_at_last_token() const { return false; }
     // ---- restoring a conversation: what it does to the model's sessions.  Per request.
-    virtual bool cvec_wanted() const { return true; }
-    virtual void set_cvec() {}
+    /// A control vector the engine loaded is on unless this request turned it off (cvec=0); where none was loaded
+    /// every request runs the stock model.  The conversation cache keys on it: a state read with the vector on is
+    /// not one that can be continued with it off (basalt/kernels/cvec.hpp).
+    bool cvec_wanted() const;
+    void set_cvec();
     virtual void select_view() {}
     virtual bool slot_draft_in(int) { return true; }
     virtual void drop_stale_reuse() {}

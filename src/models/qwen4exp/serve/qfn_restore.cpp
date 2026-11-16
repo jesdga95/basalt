@@ -4,8 +4,6 @@
 
 namespace basalt::models::qwen4exp::serve {
 
-bool QfnRequest::cvec_wanted() const { return basalt::kernels::cvec().loaded() ? req_cvec != 0 : true; }
-void QfnRequest::set_cvec() { if (basalt::kernels::cvec().loaded()) basalt::kernels::cvec_set_enabled(want_cvec); }
 void QfnRequest::select_view() { rview = &(runtime_.rviews[(size_t) std::max(slot_b, 0)]); }
 bool QfnRequest::slot_draft_in(int slot) {
     if (runtime_.batch_spec && !runtime_.mtp.copy_store(slot, runtime_.mtp.main_store(), (int64_t) runtime_.live.size(), runtime_.err)) {
