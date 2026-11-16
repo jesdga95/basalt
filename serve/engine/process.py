@@ -233,6 +233,35 @@ class ProcessEngine:
         if self.batch:
             self.__dict__.setdefault("_tl", threading.local()).read_ms = value
 
+    # The prompt read of the request in progress on this thread (`progress` is the last line of any request):
+    # {"read", "total", "ms"} from its PP/PL lines and "cache" from its RESUME line.
+    def prompt_progress(self) -> dict:
+        return dict(getattr(self.__dict__.setdefault("_ptl", threading.local()), "state", None) or {})
+
+    def _note_read(self, f: list[str]) -> None:
+        """A `PP`/`PL <position> <total> <ms> <tok/s>` line: this thread's read, as well as `progress`."""
+        self.progress = (int(f[1]), int(f[2]))
+        tl = self.__dict__.setdefault("_ptl", threading.local())
+        state = dict(getattr(tl, "state", None) or {})
+        state.update(read=int(f[1]), total=int(f[2]))
+        try:
+            state["ms"] = float(f[3])
+        except (IndexError, ValueError):
+            pass
+        tl.state = state
+
+    def _note_resume(self, line: str) -> None:
+        """A `RESUME <n>` line: the prompt tokens this request does not read again."""
+        try:
+            n = int(line.split()[1])
+        except (IndexError, ValueError):
+            return
+        tl = self.__dict__.setdefault("_ptl", threading.local())
+        tl.state = {**(getattr(tl, "state", None) or {}), "cache": n}
+
+    def _reset_read(self) -> None:
+        self.__dict__.setdefault("_ptl", threading.local()).state = None
+
     def __init__(self, engine_bin: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
         self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again
@@ -788,7 +817,7 @@ class ProcessEngine:
             elif line.startswith("PP "):
                 f = line.split()
                 if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                    self.progress = (int(f[1]), int(f[2]))
+                    self._note_read(f)
                     self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                 if not stopped and cancel.is_set():
                     # stop during the prompt read, not after the first token
@@ -801,6 +830,8 @@ class ProcessEngine:
                     self._send("STOP")
                     stopped = True
                 yield None
+            elif line.startswith("RESUME "):
+                self._note_resume(line)
             elif line.startswith("DONE"):
                 self._parse_done(line)
                 self._last_done = line
@@ -923,7 +954,7 @@ class ProcessEngine:
         """A `PL <position> <total> <ms> <tok/s>` line: the display's position and speed inside a chunk."""
         f = line.split()
         if len(f) >= 5 and f[1].isdigit() and f[2].isdigit():
-            self.progress = (int(f[1]), int(f[2]))
+            self._note_read(f)
             try:
                 self.prefill_tok_s_mean = float(f[4])
             except ValueError:
@@ -1020,6 +1051,7 @@ class ProcessEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress = None
+        self._reset_read()
         self._reset_windows()
         handle, n = self._hold_prompt(ids, embeddings)
         held = {"handle": handle, "gen": self.gen}      # the prompt on this engine process (a restart loses it)
@@ -1492,6 +1524,7 @@ class ProcessEngine:
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, session, stop_soon)
             return
         self.progress = None
+        self._reset_read()
         self.prefill_tok_s_mean = None
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -1568,7 +1601,7 @@ class ProcessEngine:
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                        self.progress = (int(f[1]), int(f[2]))
+                        self._note_read(f)
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                         rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
                         read_to = int(f[1])
@@ -1583,6 +1616,7 @@ class ProcessEngine:
                         return
                     yield None
                 elif line.startswith("RESUME "):          # reused tokens: the first chunk starts after them
+                    self._note_resume(line)
                     try:
                         read_to = int(line.split()[1])
                     except (IndexError, ValueError):

@@ -26,6 +26,15 @@ budget at the level it names (up to 2048 low, up to 8192 medium, else high; Deep
 `reasoning-effort` (unset: the template's default). For the token
 cap, `reasoning_budget_tokens` wins over `thinking_budget_tokens`, then `reasoning_budget`, then `thinking.budget_tokens`.
 
+## Prompt progress
+
+A streamed Chat Completions request with `return_progress: true` (llama.cpp's field) gets `prompt_progress` on the chunks sent
+while the prompt is read: `{total, cache, processed, time_ms}`. `total` is the prompt's tokens, `cache` the ones taken from the
+conversation cache, `processed` the ones read so far including the cache, and `time_ms` the milliseconds spent reading. The overall
+progress is `processed / total`, the timed progress `(processed - cache) / (total - cache)`. As in llama.cpp, such a chunk has the
+delta `{"role": "assistant", "content": null}`; the last one has `processed` equal to `total`. Without the field, or when it is
+`false`, the stream is unchanged; a value that is not a boolean is a 400.
+
 ## Logprobs
 
 A request can ask for each generated token's log probability and the likeliest tokens at its place. The engine computes them
