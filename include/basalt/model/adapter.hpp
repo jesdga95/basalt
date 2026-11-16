@@ -185,7 +185,9 @@ public:
     virtual Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) { (void) row0; (void) n; (void) picks; (void) top; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
     /// The logits of row `row` of the last decoded window (n_vocab floats).
     virtual Result copy_logits(int row, float* out) { (void) row; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
-    /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now.
+    /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now,
+    /// left at -1 by a session with no cache to lend (it answers ok and SLEEP goes on to the driver). Without this the
+    /// model cannot sleep.
     virtual Result set_low_memory(bool low, int64_t& expert_slots) { (void) low; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
     /// What the session leaves free on the main card from now on (`mib` < 0: the start's reserve), through prompts and
     /// images too; its VRAM use is resized to that now. The slots it holds now.
