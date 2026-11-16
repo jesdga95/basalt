@@ -237,6 +237,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
             ab_pair<NJ>(a, sm.wab, t, lane, dt, sa, al, be);
             if (lane == 0) { sm.g[t] = al; sm.b[t] = be; }
         }
+#if !DM_REC_NO_CLUSTERS
     } else {   // a token per warp of the cluster, written into every rank's shared memory once all four have started
         asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
@@ -249,9 +250,12 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
             }
         }
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");   // waited on before the gates are read
+#endif
     }
     pdl_wait();
+#if !DM_REC_NO_CLUSTERS
     if constexpr (!SPLIT) asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+#endif
     if constexpr (GIN) {   // thread t's gates, read by thread t and, past the barriers below, the block
         if (tid < T) { sm.g[tid] = gin_a[(size_t) tid * a.h_v + gh]; sm.b[tid] = gin_b[(size_t) tid * a.h_v + gh]; }
     }
