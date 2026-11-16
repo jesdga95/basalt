@@ -789,7 +789,8 @@ private:
             owned_.emplace_back(v);
             dev = (float*) v;
         }
-        if (cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
+        // on the sampling stream itself: a plain cudaMemcpy does not order against it, so a draw could read the previous bias
+        if (cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, st_.stream) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
         return true;
     }
 
