@@ -95,6 +95,7 @@ protected:
     int64_t produced_n{};
     int64_t draft_offered{};
     int64_t draft_accepted{};
+    int64_t windows{};   ///< the decode windows this run took, for DONE (the server's tokens per window)
     double decode_ms{};
     Clock::time_point d0{};
     int64_t fresh{};

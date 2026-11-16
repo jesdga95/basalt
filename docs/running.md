@@ -43,7 +43,7 @@ Each request ends with one `done` line:
 ```
 
 - `pp=<prompt tokens>/<cached>c`: the rate counts newly read tokens only.
-- `acc`: drafts accepted over drafts offered. `dl`: tokens per window. Both are absent when the request did not draft.
+- `acc`: drafts accepted over drafts offered. `dl`: tokens per window, from the engine's own window count over the whole request (its solo and batch runs and every pass). With `--parallel` a window serves every busy slot in a fixed number of rows, so `dl` falls toward 1.0 as the slots fill. Both are absent when the request did not draft.
 - `end`: `stop`, `length`, `cancelled`, `disconnect` or `error`.
 - `hit`: expert cache hit rate. `pcie`: share of routed experts read over PCIe.
 

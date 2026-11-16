@@ -644,13 +644,15 @@ class Service:
                 prompt, gen = int(st.get("prompt_tokens") or 0), int(st.get("generated") or 0)
                 decoding = st.get("first_token") is not None
                 done = prompt if decoding else (min(progress[0], prompt) if progress and reading == [i] else None)
-                windows = st.get("windows") or 0
+                # the finished passes' windows (the engine's own) and the run in progress (counted from its BT lines)
+                windows = (st.get("windows") or 0) + (st.get("run_windows") or 0)
+                win_tokens = (st.get("window_tokens") or 0) + (st.get("run_tokens") or 0)
                 row.update(state="decoding" if decoding else "prefill", api=st.get("api"), model=st.get("model"),
                            tok_s=round(self._rate_of(st, rate), 1), generated=gen, max_tokens=st.get("max_tokens"),
                            prompt_tokens=prompt, prefill_done=done, ctx_used=prompt + gen, reused=st.get("reused"),
                            ttft_s=round(st["first_token"] - st["started"], 2) if decoding and st.get("started")
                            else None,
-                           draft_len=round(st.get("window_tokens", 0) / windows, 2) if windows else None)
+                           draft_len=round(win_tokens / windows, 2) if windows else None)
             rows.append(row)
         return rows, queue
 
@@ -1039,9 +1041,9 @@ class Service:
         with self.status_lock:
             s = self.status if st is None else st
             s["generated"] = n
-            windows = getattr(self.engine, "window_stats", None)
-            if windows is not None:
-                s["windows"], s["window_tokens"] = windows()
+            run_windows = getattr(self.engine, "window_stats", None)
+            if run_windows is not None:                  # the run in progress: its windows are known at its end
+                s["run_windows"], s["run_tokens"] = run_windows()
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
             (self.rate if rate is None else rate).append((time.time(), n))   # live rate window
@@ -1165,6 +1167,7 @@ class Service:
         emb = getattr(self.embeddings, "path", None)
         # identity token: only a DONE line replaces engine.last, so a request without one records no stale figures
         engine_last0 = getattr(self.engine, "last", None)
+        counted_last = engine_last0                     # the `last` whose windows are in st: a pass without a DONE adds none
         path = getattr(self.request_ctx, "path", None)   # the API path serving this request
         # parallel requests keep their own status and rate window; otherwise self.status / self.rate
         par = bool(getattr(self.engine, "batch", 0))
@@ -1374,6 +1377,13 @@ class Service:
                                 if not leaving and not cancel.is_set():
                                     raise
                         run_last = getattr(self.engine, "last", None)
+                        with self.status_lock:
+                            st["run_windows"] = st["run_tokens"] = 0
+                            if isinstance(run_last, dict) and run_last is not counted_last and run_last.get("windows"):
+                                # the pass's windows as the engine counted them over all its runs (solo and slot)
+                                st["windows"] = (st.get("windows") or 0) + run_last["windows"]
+                                st["window_tokens"] = (st.get("window_tokens") or 0) + n - n_pass0
+                                counted_last = run_last
                         if isinstance(run_last, dict) and run_last is not engine_last0 and run_last.get("finish") == "error":
                             finish = "error"          # the engine ended the request itself: the grammar allowed no token
                             err = "the grammar allowed no token to continue the reply; the engine log has the state"
