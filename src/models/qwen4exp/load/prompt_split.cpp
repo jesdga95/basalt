@@ -5,7 +5,7 @@
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/kernels/bf16_bits.hpp"
-#include "basalt/models/qwen4exp/kernels/cvec.hpp"
+#include "basalt/kernels/cvec.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 

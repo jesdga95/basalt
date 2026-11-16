@@ -404,6 +404,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.kv = o.kv;
         lreq.rope = o.rope;
         lreq.route = o.route;
+        lreq.cvec = o.cvec;
         lreq.kv_resident = o.kv_resident;
         lreq.diag_rows = o.diag_rows;
         const basalt::model::Result r = adapter->start(lreq, started);

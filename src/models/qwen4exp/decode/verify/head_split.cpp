@@ -3,7 +3,7 @@
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/core/on_device.hpp"
-#include "basalt/models/qwen4exp/kernels/cvec.hpp"
+#include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/models/qwen4exp/kernels/q5k_head.hpp"

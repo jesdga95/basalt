@@ -113,13 +113,6 @@ struct Options : CommonOptions {
     int64_t short_read = 64;
     /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
-    /// A control vector on the residual stream (basalt/kernels/cvec.hpp), with llama.cpp's flags: the
-    /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
-    /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
-    std::vector<std::pair<std::string, float>> cvec_files;
-    int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
-    int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
-    int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
 };

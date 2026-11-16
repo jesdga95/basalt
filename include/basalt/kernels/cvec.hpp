@@ -1,9 +1,9 @@
-// include/basalt/models/qwen4exp/kernels/cvec.hpp - a control vector on the residual stream: the engine's side of llama.cpp's
+// include/basalt/kernels/cvec.hpp - a control vector on the residual stream: the engine's side of llama.cpp's
 // `llama_adapter_cvec` with the `--cvec-mode` / `--cvec-dir` extension of the `experimental-speed-projection`
-// package (its `02-cvec-projection-mode.patch`, and `01-qwen4exp-cvec-hooks.patch` for WHERE it applies).
+// package (its `02-cvec-projection-mode.patch`, and its hooks patch for WHERE it applies).
 //
-// After layer l's FFN write - llama.cpp's `build_cvec(res_hc, il)` right after the layer's second
-// `build_hc_combine` - every one of the hc residual streams h of every token becomes
+// After a layer's output is in the residual - llama.cpp's `build_cvec(res_hc, il)` right after the layer's second
+// `build_hc_combine` - every one of the residual streams h of every token becomes
 //
 //   project:  h <- h - s_l (h . v_l) v_l        v_l = d / |d|, s_l = |d|, d = the scaled direction
 //   add:      h <- h + d                        llama.cpp's stock additive control vector
@@ -14,6 +14,9 @@
 // per request through a device flag, so the captured graphs are the same either way.  With the flag off the
 // result is bit-identical to the engine without a vector: the kernel then only applies the pending residual
 // write, with the fused read's own arithmetic.
+//
+// Two residual layouts, one vector: `cvec_apply` the hyper-connection model's FP32 streams (its FFN write may still
+// be pending), `cvec_apply_bf16` a dense model's BF16 rows, which its output projections have already added to.
 #pragma once
 
 #include <cstdint>
@@ -30,7 +33,7 @@ struct Cvec {
     int first = 0, last = -1;     ///< the steered layers, inclusive
     int64_t n_embd = 0, hc = 0;
     bool loaded() const { return dir != nullptr; }
-    /// Layer l's FFN write is followed by the vector (with a real direction there).  Decided at load time, never
+    /// Layer l's output is followed by the vector (with a real direction there).  Decided at load time, never
     /// per request: it changes where the residual write happens, so the graphs depend on it.
     bool covers(int64_t l) const { return loaded() && l >= first && l <= last && l < (int64_t) steered.size() && steered[(size_t) l]; }
     std::vector<bool> steered;    ///< host copy of s_l != 0
@@ -39,7 +42,8 @@ struct Cvec {
 /// The loaded vector (empty until `cvec_upload`).
 const Cvec& cvec();
 
-/// Upload a vector built by the loader: `dir` is n_layers * n_embd, `s` n_layers (see `Cvec`).  Starts ON.
+/// Upload a vector built by the loader: `dir` is n_layers * n_embd, `s` n_layers (see `Cvec`).  `hc` the streams a
+/// hyper-connection model keeps per token (1 for a dense model).  Starts ON.
 bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int first, int last,
                  int64_t n_embd, int64_t hc, std::string& err);
 
@@ -58,5 +62,8 @@ bool cvec_enabled();
 /// whose writes are folded into the next layer's read; without it, R must already hold the layer's output.
 void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* bo, int64_t bo_ld, const float* inj,
                 int64_t inj_ld, bool write, void* stream);
+
+/// The same on one BF16 residual row per token (`R + t * r_ld`, n_embd values), its layer's output already there.
+void cvec_apply_bf16(uint16_t* R, int64_t layer, int64_t T, int64_t r_ld, void* stream);
 
 }  // namespace basalt::kernels

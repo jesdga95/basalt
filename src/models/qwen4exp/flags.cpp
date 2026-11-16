@@ -3,6 +3,7 @@
 
 #include "basalt/core/diag.hpp"
 #include "basalt/log.hpp"
+#include "basalt/model/control_vectors.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/model/route_flags.hpp"
@@ -11,7 +12,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
-#include <sstream>
 #include <string>
 
 namespace basalt::models::qwen4exp {
@@ -77,38 +77,7 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(args.next("--short-read")));
     else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
     else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(args.next("--mtp-max-t")));
-    else if (a == "--control-vector") o.cvec_files.push_back({args.next("--control-vector"), 1.0f});
-    else if (a == "--control-vector-scaled") {
-        // FILE:SCALE, comma-separated; the LAST colon splits
-        std::stringstream list(args.next("--control-vector-scaled"));
-        std::string item;
-        while (std::getline(list, item, ',')) {
-            const size_t colon = item.rfind(':');
-            char* end = nullptr;
-            const float sc = colon == std::string::npos ? 0.0f : std::strtof(item.c_str() + colon + 1, &end);
-            if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0') {
-                basalt::log::error("basalt", "--control-vector-scaled: expected FILE:SCALE, got '%s'", item.c_str());
-                { code = 2; return true; }
-            }
-            o.cvec_files.push_back({item.substr(0, colon), sc});
-        }
-    }
-    else if (a == "--control-vector-layer-range") {
-        o.cvec_first = std::atoi(args.next("--control-vector-layer-range"));
-        o.cvec_last = std::atoi(args.next("--control-vector-layer-range"));
-    }
-    else if (a == "--cvec-mode") {
-        const std::string m = args.next("--cvec-mode");
-        if (m == "project") o.cvec_mode = 0;
-        else if (m == "add") o.cvec_mode = 1;
-        else { basalt::log::error("basalt", "--cvec-mode: add or project, got '%s'", m.c_str()); { code = 2; return true; } }
-    }
-    else if (a == "--cvec-dir") {
-        const std::string d = args.next("--cvec-dir");
-        if (d == "per-layer") o.cvec_single = -1;
-        else if (d.rfind("single:", 0) == 0) o.cvec_single = std::atoi(d.c_str() + 7);
-        else { basalt::log::error("basalt", "--cvec-dir: per-layer or single:L, got '%s'", d.c_str()); { code = 2; return true; } }
-    }
+    else if (model::parse_cvec_flag(a, args, o.cvec, code)) {}
     else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(args.next("--adapt-swaps"));
     else if (a == "--peer-exclusive") { o.peer_exclusive = true; o.peer_exclusive_given = true; }
     else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(args.next("--peer-adapt-swaps"));
