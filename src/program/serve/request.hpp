@@ -115,6 +115,8 @@ protected:
     int64_t fold_p0{};
     double prompt_ms{};
     bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
+    /// The prompt, with the ids a held conversation wrote standing for the tokens that spell the same bytes.
+    void respell_prompt();
     Flow restore();
     Flow parse();
     Flow prepare_prompt();

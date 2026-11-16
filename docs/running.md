@@ -15,6 +15,9 @@ is refused with a 400 that names the length. `--slot-full-context` gives every s
 
 Each slot keeps two checkpoints (end of the system prompt, last turn), so requests that share a long system prompt read it once.
 
+A reply the client sends back unchanged continues the conversation's own tokens even when the model wrote it in other pieces than the
+tokenizer cuts the same bytes into (not with images).
+
 ### Session affinity
 
 With `--parallel`, a request that names its session goes to the slot that session last used, so the next turn continues the K/V already
