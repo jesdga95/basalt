@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Iterator
 
-from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
+from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.engine.mock import Engine
 from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util.logbuf import LogBuffer
@@ -1359,6 +1359,11 @@ class Service:
                                 if not leaving and not cancel.is_set():
                                     raise
                         run_last = getattr(self.engine, "last", None)
+                        if isinstance(run_last, dict) and run_last is not engine_last0 and run_last.get("finish") == "error":
+                            finish = "error"          # the engine ended the request itself: the grammar allowed no token
+                            err = "the grammar allowed no token to continue the reply; the engine log has the state"
+                            print(f"[server] error: engine reported {err}", flush=True)
+                            raise EngineError(err)
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply

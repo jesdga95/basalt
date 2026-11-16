@@ -88,19 +88,26 @@ Flow Request::decode_loop(B& b) {
             a = b.accept_drafts(T);
         }
         if (gguard != nullptr && gguard->on()) {
-            // the first sampled token the grammar refuses is drawn again under the grammar's mask, and the window ends there
-            const int miss = gguard->scan(outv.data(), a + 1);
+            // the first generated token the grammar refuses is drawn again under the grammar's mask, and the window
+            // ends there; with no token allowed at all the reply ends after this window, as an error
+            const int miss = gguard->scan(outv.data(), a + 1, e0);
             if (miss >= 0) {
-                gguard->mask_bias(req_bias, grammar_bias);
                 int32_t gtok = 0;
-                if (!b.resample_row(miss, p, grammar_bias, gtok, runtime_.err)) {
-                    std::printf("ERR %s\n", runtime_.err.c_str());
+                const basalt::program::grammar::Redraw verdict = gguard->redraw(
+                    req_bias,
+                    [&](const std::vector<float>& bias, int32_t& t) { return b.resample_row(miss, p, bias, t, runtime_.err); },
+                    [&](std::vector<float>& lg) {
+                        lg.resize((size_t) runtime_.n_vocab);
+                        return b.copy_logits(miss, lg.data());
+                    },
+                    gtok);
+                if (verdict == basalt::program::grammar::Redraw::failed) {
+                    std::printf("ERR %s\n", runtime_.err.empty() ? "the masked draw failed" : runtime_.err.c_str());
                     return Flow::error;
                 }
-                outv[(size_t) miss] = gtok;
+                if (verdict == basalt::program::grammar::Redraw::dead) grammar_dead = true;
+                else outv[(size_t) miss] = gtok;
                 a = miss;
-                if (!gguard->take(gtok))
-                    basalt::log::info("basalt grammar", "the masked draw at row %d of %d was token %d", miss, T, (int) gtok);
                 ++grammar_resamples;
             }
         }
@@ -195,6 +202,7 @@ Flow Request::decode_loop(B& b) {
         }
         b.mark_loop_end();
         if (eos) { finish = "stop"; break; }
+        if (grammar_dead) { finish = "error"; break; }
         b.shed_low();
         if (runtime_.halted()) { finish = "cancel"; break; }
         x = outv[(size_t) keep - 1];
