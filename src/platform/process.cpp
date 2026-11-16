@@ -474,7 +474,7 @@ void on_crash_signal(int sig, siginfo_t* info, void*) noexcept {
         CrashBuf b;
         b.puts("basalt crash: error: ");
         b.puts(posix_signal_name(sig));
-        if (info != nullptr && info->si_addr != nullptr) {
+        if (info != nullptr && info->si_code > 0 && info->si_addr != nullptr) {   // a fault, not a sent signal
             b.puts(" at ");
             b.put_hex((uintptr_t) info->si_addr);
         }

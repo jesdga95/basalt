@@ -200,6 +200,31 @@ def drop_sidecar_vision(cfg: dict) -> None:
     del cfg["vision"]
 
 
+def engine_echo(engine):
+    """The tail callback that repeats the engine log's warnings and errors (and the indented lines of an error's
+    report) in the server window once the engine is ready; what it wrote while loading is the load bars' business."""
+    level = LevelReader()
+    in_err_block = False
+
+    def echo_engine_line(text: str, end_pos: int) -> None:
+        nonlocal in_err_block
+        lvl = level.read(text)
+        if lvl == ERR:
+            in_err_block = True
+            echo = True
+        elif in_err_block and text.startswith(("  ", "\t")) and text.strip():
+            echo = True
+        else:
+            in_err_block = False
+            echo = lvl == WARN
+        if echo and getattr(engine, "known_ctx", 0) > 0 and not engine.loading and end_pos > getattr(engine, "log_ready_pos", 0):
+            out = getattr(sys.stdout, "_stream", sys.stdout)
+            out.write(text.rstrip() + "\n")
+            out.flush()
+
+    return echo_engine_line
+
+
 def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     """The Service of one checked model, unloaded. With several models a numbered vision sidecar waits for its model's
     turn too."""
@@ -254,25 +279,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
         if cfg.get("log"):                              # follow the engine's log file
             print(f"[server] engine log: {cfg['log']}", flush=True)
-            eng_lvl = LevelReader()
-            in_err_block = False
-
-            def echo_engine_line(text: str, end_pos: int) -> None:
-                nonlocal in_err_block
-                lvl = eng_lvl.read(text)
-                if lvl == ERR:
-                    in_err_block = True
-                    echo = True
-                elif in_err_block and text.startswith(("  ", "\t")) and text.strip():
-                    echo = True
-                else:
-                    in_err_block = False
-                    echo = lvl == WARN
-                if echo and engine.known_ctx > 0 and not engine.loading and end_pos > getattr(engine, "log_ready_pos", 0):
-                    out = getattr(sys.stdout, "_stream", sys.stdout)
-                    out.write(text.rstrip() + "\n")
-                    out.flush()
-
+            echo_engine_line = engine_echo(engine)
             threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"),
                              kwargs={"on_line": echo_engine_line,
                                      "skip": lambda line: load_progress(line) is not None}, daemon=True).start()

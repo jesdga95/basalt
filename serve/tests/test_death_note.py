@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from serve.engine.process import ProcessEngine
+from serve.server import engine_echo
 from serve.service import Service
 
 
@@ -101,6 +102,29 @@ class DeathNote(unittest.TestCase):
             ProcessEngine._rotate_log(str(log), max_bytes=5)
             self.assertFalse(log.exists())
             self.assertEqual((Path(d) / "engine.log.1").read_text(encoding="utf-8"), "old crash\n")
+
+
+class EngineEcho(unittest.TestCase):
+    def echo(self, engine, lines, pos=100):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cb = engine_echo(engine)
+            for line in lines:
+                cb(line, pos)
+        return out.getvalue()
+
+    def test_an_engine_never_started_has_no_known_ctx_and_does_not_break_the_tail(self):
+        engine = SimpleNamespace(loading=False)          # no known_ctx until the first READY
+        self.assertEqual(self.echo(engine, ["basalt serve: error: boom"]), "")
+
+    def test_errors_and_their_indented_report_are_echoed_once_ready(self):
+        engine = SimpleNamespace(loading=False, known_ctx=4096, log_ready_pos=10)
+        got = self.echo(engine, ["basalt serve: error: stall", "  pool: 0 waiting", "basalt serve: info: fine"])
+        self.assertEqual(got, "basalt serve: error: stall\n  pool: 0 waiting\n")
+
+    def test_nothing_is_echoed_before_ready(self):
+        engine = SimpleNamespace(loading=False, known_ctx=4096, log_ready_pos=500)
+        self.assertEqual(self.echo(engine, ["basalt serve: warning: slow"]), "")
 
 
 if __name__ == "__main__":
