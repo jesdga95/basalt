@@ -155,7 +155,9 @@ protected:
     // ---- restoring a conversation: what it does to the model's sessions.  Per request.
     /// A control vector the engine loaded is on unless this request turned it off (cvec=0); where none was loaded
     /// every request runs the stock model.  The conversation cache keys on it: a state read with the vector on is
-    /// not one that can be continued with it off (basalt/kernels/cvec.hpp).
+    /// not one that can be continued with it off (basalt/kernels/cvec.hpp).  The switch is one device flag for the
+    /// process, which holds because one request's windows are in flight at a time; slots that ever decoded
+    /// concurrently with different values would need it per window.
     bool cvec_wanted() const;
     void set_cvec();
     virtual void select_view() {}
