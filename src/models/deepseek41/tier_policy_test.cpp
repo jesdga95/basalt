@@ -191,6 +191,15 @@ int main() {
         CHECK(reclaim_slots(3000, room, 2200, one, 8) == 8);
         CHECK(reclaim_slots(3000, room, 1500, one, 30) == 5);
         CHECK(reclaim_slots(3000, room, 2500, one, 30) == 0);
+        // the plan's size is fixed: what grow plans at the start is what a prompt's shrink and grow open again, and an
+        // exact count the card cannot hold (base + ext below it) is refused while one it holds, or auto, is not
+        const int64_t ext = grow_slots(3000, room, 0, one, 4, 384, 10);   // capped at 10 per layer: 6 beside 4
+        CHECK(holds_exact(10, 4, ext));
+        CHECK(holds_exact(0, 4, 0));
+        CHECK(holds_exact(-1, 0, 0));
+        CHECK(!holds_exact(12, 4, grow_slots(1000, room, 0, one, 4, 384, 12)));   // room for none: 4 of the 12
+        CHECK(holds_exact(12, 4, grow_slots(3000, room, 0, one, 4, 384, 12)));    // room for 8: all 12
+        CHECK(holds_exact(5, 8, 0));                                              // base alone above the count
     }
 
     // promotion by CPU uses: the kPromoteUses-th use earns it and the count starts over; the counts halve once per

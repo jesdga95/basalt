@@ -343,10 +343,7 @@ public:
         if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
         cudaStreamSynchronize(stream_);
         release_short_prompt();
-        t->set_free_floor(mib);
-        t->lend_all();
-        if (!t->reclaim(e)) return {model::Status::Error, e};
-        t->grow();
+        if (!t->replan(mib, e)) return {model::Status::Error, e};
         expert_slots = t->slots();
         return {};
     }

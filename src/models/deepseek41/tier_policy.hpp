@@ -204,6 +204,10 @@ inline int64_t grow_slots(uint64_t free_bytes, uint64_t room, uint64_t floor, ui
     return slots_beside(free_bytes, room + floor, one_each, limit - per_layer);
 }
 
+/// Whether a tier of `base` + `ext` slots per layer honours an exact count of `asked` per layer (`asked` <= 0: auto,
+/// anything goes). The plan caps its slots at the count, so fewer than it means the card could not hold it.
+inline bool holds_exact(int64_t asked, int64_t base, int64_t ext) { return asked <= 0 || base + ext >= asked; }
+
 /// Slots per layer a lent arena opens again with: all `lent` when they fit above the reserve, else what fits above the
 /// tier's own room and the reserve.
 inline int64_t reclaim_slots(uint64_t free_bytes, uint64_t room, uint64_t floor, uint64_t one_each, int64_t lent) {
