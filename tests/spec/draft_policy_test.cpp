@@ -151,6 +151,21 @@ int main() {
         const float sure[7] = {0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f};
         check(!p.choose_window(sure, 7, 5, 4).lookup, "drafter vs lookup: a failing short copy loses to sure drafts");
     }
+    {   // an untimed policy ignores round times: the same outcomes give the same picks whatever the clock said
+        DraftPolicy fast(8, 0.03, false), slow(8, 0.03, false);
+        std::mt19937 rng(7);
+        std::uniform_int_distribution<int> acc(0, 5);
+        bool same = true;
+        for (int i = 0; i < 300; ++i) {
+            const int t = 2 + i % 6, a2 = std::min(acc(rng), t - 1), m = 3 + (i * 5) % 40;
+            const bool lk = i % 3 == 0;
+            fast.observe(lk, t, a2, m, 10.0 + 7.0 * t);
+            slow.observe(lk, t, a2, m, 55.0 - 3.0 * t + (i % 11));
+            const DraftPolicy::Pick x = fast.choose(t, 5 + i % 9, m), y = slow.choose(t, 5 + i % 9, m);
+            same = same && x.lookup == y.lookup && x.t == y.t;
+        }
+        check(same, "untimed: the picks do not depend on the round times");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

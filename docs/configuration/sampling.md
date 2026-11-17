@@ -12,7 +12,7 @@ default, then the engine's. `/props` reports what is in effect. An out-of-range 
 | `repetition_penalty` | > 0 | Multiplicative penalty on tokens in the window. `1` is off. |
 | `presence_penalty`, `frequency_penalty` | number | Flat, and count-based, penalties. `0` is off. |
 | `penalty_last_n` | 0..4096 | Window for the penalties (default 64). |
-| `seed` | integer | Fixes the draw for a reproducible sampled reply on Qwen3.8-27B; on Flash-Next two runs of the same seeded request can still differ. Without one, a request with `top_k` 1 to 64 on a model with a block drafter (Qwen3.8-27B) draws its drafts and keeps them by speculative sampling ([precision](../precision/qwen38-27b.md#sampling-with-drafts)): the same distribution, more drafts kept, but the text then depends on the windows the draft policy picks. |
+| `seed` | integer | Fixes the draw for a reproducible sampled reply on Qwen3.8-27B; on Flash-Next the same seeded request repeats run to run for the same session history (the same requests in the same order, one at a time; see [adaptive tier](adaptive.md)). Without one, a request with `top_k` 1 to 64 on a model with a block drafter (Qwen3.8-27B) draws its drafts and keeps them by speculative sampling ([precision](../precision/qwen38-27b.md#sampling-with-drafts)): the same distribution, more drafts kept, but the text then depends on the windows the draft policy picks. |
 | `relaxed_drafting` | [0, 1] or `false` | This request's relaxed-drafting threshold. `false` or `0` forces exact sampling. |
 
 Also read: `max_tokens` / `max_completion_tokens` (`0` or `-1` = the rest of the context), `stop`, `logit_bias`, `reasoning_effort`,
