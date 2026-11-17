@@ -7,7 +7,7 @@
 // Index: every trigram of the history (prompt + accepted output) maps to its WAYS most recent end positions in a
 // fixed-size open-addressing table, and so does every LONG_ORDER-gram in a second one: a common trigram's few slots
 // fill with recent repeats, while the longer key still finds an old source of the text being quoted. Memory is
-// bounded (128 to 256 bytes per token of capacity) and appends are O(1).
+// bounded (128 to 256 bytes per token of capacity, 8 more per token used) and appends are O(1).
 // A proposal checks the candidates of both, extends each match backwards up to `max_match`, and takes the longest
 // (most recent on ties). Matches shorter than `min_match` propose nothing.
 #pragma once
@@ -50,7 +50,9 @@ private:
 
     int min_match_, max_match_;
     std::vector<int32_t> hist_;
+    static constexpr uint32_t kLongBit = 1u << 31;
     std::vector<Slot> table_, long_;
+    std::vector<uint32_t> dirty_;   // the slots in use (long table flagged), so a reset clears only those
     size_t mask_ = 0;
     int last_match_ = 0;
 };

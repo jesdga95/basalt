@@ -27,8 +27,8 @@ SuffixDrafter::SuffixDrafter(int min_match, int max_match, size_t capacity_token
 
 void SuffixDrafter::reset() {
     hist_.clear();
-    std::fill(table_.begin(), table_.end(), Slot{});
-    std::fill(long_.begin(), long_.end(), Slot{});
+    for (const uint32_t d : dirty_) (d & kLongBit ? long_ : table_)[d & ~kLongBit] = Slot{};   // only what was filled
+    dirty_.clear();
     last_match_ = 0;
 }
 
@@ -50,6 +50,7 @@ SuffixDrafter::Slot* SuffixDrafter::find_slot(std::vector<Slot>& table, uint64_t
         if (s.key == 0) {
             if (!insert) return nullptr;
             s.key = key;
+            dirty_.push_back((uint32_t) i | (&table == &long_ ? kLongBit : 0u));
             return &s;
         }
     }
