@@ -162,6 +162,42 @@ CpuInfo cpu_info() {
 #else
 // --------------------------------------------------------------------------------------------- Linux
 
+namespace {
+// A kernel CPU list file ("0-7", "0-3,8-11", "5"): mark[cpu] = 1 for each CPU it names. False when the file is
+// missing, empty or not a list.
+bool read_cpu_list(const char* path, std::vector<char>& mark) {
+    mark.clear();
+    std::FILE* f = std::fopen(path, "r");
+    if (!f) return false;
+    char buf[1024];
+    const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    buf[n] = 0;
+    const char* s = buf;
+    bool any = false;
+    while (*s) {
+        char* end = nullptr;
+        const long lo = std::strtol(s, &end, 10);
+        if (end == s || lo < 0) return false;
+        long hi = lo;
+        s = end;
+        if (*s == '-') {
+            hi = std::strtol(s + 1, &end, 10);
+            if (end == s + 1 || hi < lo) return false;
+            s = end;
+        }
+        if (hi >= 1 << 20) return false;
+        if ((size_t) hi >= mark.size()) mark.resize((size_t) hi + 1, 0);
+        for (long c = lo; c <= hi; ++c) mark[(size_t) c] = 1;
+        any = true;
+        if (*s == ',') ++s;
+        else if (*s == '\n' || *s == 0) break;
+        else return false;
+    }
+    return any;
+}
+}  // namespace
+
 CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
     CpuTopology topo;
     // The logical CPUs this process may run on, ONE PER PHYSICAL CORE: SMT siblings share a core's load/store
@@ -225,6 +261,27 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
             }
         }
         all_cpus.push_back(cl);
+    }
+
+    // x86 kernels publish no cpu_capacity (the file comes from the arch_topology driver, which x86 does not build), so
+    // a hybrid Intel processor read as one class of cores. Its classes are the CPU lists of the kernel's two hybrid
+    // PMUs instead (Linux 5.13 and later): cpu_core names the performance cores' CPUs, cpu_atom the efficient ones.
+    // They stand in as two capacities for the rule below. A CPU in neither list keeps none and counts as efficient.
+    if (max_cap == 0) {
+        std::vector<char> in_core, in_atom;
+        if (read_cpu_list("/sys/devices/cpu_core/cpus", in_core) && read_cpu_list("/sys/devices/cpu_atom/cpus", in_atom)) {
+            const auto has = [](const std::vector<char>& mark, int cpu) {
+                return cpu >= 0 && (size_t) cpu < mark.size() && mark[(size_t) cpu] != 0;
+            };
+            for (auto& cl : all_cpus) {
+                if (has(in_core, cl.cpu)) cl.cap = 1024;
+                else if (has(in_atom, cl.cpu)) cl.cap = 512;
+                if (cl.cap > 0) {
+                    max_cap = (std::max)(max_cap, cl.cap);
+                    min_cap = (std::min)(min_cap, cl.cap);
+                }
+            }
+        }
     }
 
     // A core class is a capacity band, not one value: cores of one class report different capacities.
