@@ -69,6 +69,32 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
 `--mtp-dense FILE` (the `mtp/dense` bytes of an official NVFP4, UD-IQ1_M, UD-IQ2_XS or UD-IQ3_XXS pack) swaps in a tuned drafter layer; the converter
 records it in `meta.mtp.dense`. Output is about 122 GiB (123 GiB for the 8-bit variant). The base's vocabulary must be NVIDIA's.
 
+### The QAD checkpoint
+
+[nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) converts with the same command and
+the same base pack. It is a quantization-aware-distilled checkpoint with a more aggressive recipe than the standard one, and the
+converter reads all of it as stored:
+
+| in the checkpoint | where it goes |
+| --- | --- |
+| routed experts, NVFP4 with a plain UE4M3 `weight_scale` | `experts`, bit for bit |
+| 144 shared-expert matrices, NVFP4 (packed E2M1, UE4M3 per 16 values, one FP32 `weight_scale_2`) | the dense projection it is, quantized once as Q6_K (Q8_0 with `--dense-q8-0`) |
+| GDN, QSA and indexer projections, MXFP8 (E4M3 values, one UE8M0 scale per 32) | the same, quantized once |
+| the n-gram table, FP8 E4M3 rows with one BF16 table scale, its 128 shards spread over 18 of the 36 files | `gguf`, gathered in shard order and written as Q8_0 rows of code x scale |
+| MTP drafter, vision tower, PLE head tables | copied from the base pack |
+
+```sh
+hf download nvidia/Qwen3.8-Flash-Next-NVFP4-QAD --local-dir qad
+python3 tools/convert/convert.py --sections-from Qwen3.8-FN-FP4Local.v2.basalt --checkpoint qad \
+    --out Qwen3.8-FN-QAD.basalt --name "Qwen3.8-Flash-Next NVFP4-QAD"
+```
+
+Output is 122.6 GiB, of which the n-gram table is 50.7 GiB (the standard checkpoint keeps its table as NVFP4 rows instead, about 29 GiB;
+FP8 rows carry no such packing, so they are requantized once to Q8_0, which is what the DeepSeek NVFP4 pack does with its FP8
+projections too). The MXFP8 and NVFP4 dense matrices are the one place where "as stored" is not free: no existing pack tensor type
+holds an E4M3 value with an E8M0 scale per 32 values, so they are quantized once to Q6_K instead, the same rounding the standard
+Flash-Next NVFP4 pack applies to its BF16 projections.
+
 ## Qwen3.8-27B pack
 
 The published pack comes from QUASAR's quantization-aware NVFP4 checkpoint
