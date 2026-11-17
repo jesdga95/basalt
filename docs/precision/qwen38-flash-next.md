@@ -53,7 +53,7 @@ scores the decode path.
 | Routed experts, MMQ | q8_1 activations, int8 mma | int8 activation rounding (every MMQ format) |
 | Routed experts, FP4 tensor cores (NVFP4, chunks of 1,024 or more) | E2M1 activations with a UE4M3 scale per 16 values and one fp32 scale per token; `mma kind::mxf4nvf4` | W4A4; numerics change against MMQ |
 | Routed experts, CPU pool (chunks under 6,144 tokens) | ggml dot products, the same as decode's RAM tier | the CPU rounding above |
-| Attention | int8 KV: q and p in fp16, one fp16 mma, fp32 accumulate | output within 1.5e-3 of an FP64 reference |
+| Attention | int8 and fp16 KV: q and p in fp16, one fp16 mma, fp32 accumulate (q4_0 KV: hi + lo fp16 parts) | output within 1.5e-3 of an FP64 reference |
 | GDN | chunked delta rule, 16 tokens per chunk; state and gates fp32; BF16 and TF32 tensor cores | output depends on where the 16-token grid falls (about 1e-3 relative) |
 
 Rounding moves with the chunking: `--prefill auto` reads at most 16,384 tokens per chunk (32,768 for NVFP4), and the K/V rounding follows
@@ -88,6 +88,7 @@ means it excludes 0.
 | int8 activations into routed experts (W4A8) | +0.0002 [-0.0008, +0.0012] | -0.15 | lossless |
 | fast math and approximate intrinsics | -0.0003 [-0.0012, +0.0006] | +0.11 | lossless |
 | int8 KV against fp16 KV | +0.0000 [-0.0010, +0.0010] | +0.15 | lossless |
+| fp16 KV prompt attention, one fp16 mma against hi + lo parts | -0.0003 [-0.0012, +0.0006] | -0.09 | lossless |
 | k8v4 KV | +0.0056 [+0.0038, +0.0073] | -0.20 | measurable |
 | q4_0 KV | +0.0093 [+0.0074, +0.0112] | -0.38 | measurable |
 | CPU tier against GPU tiers (98.8% of rows on the CPU) | -0.0005 [-0.0015, +0.0005] | +0.28 | lossless |
