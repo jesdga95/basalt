@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <type_traits>
 #include "basalt/log.hpp"
 
 namespace basalt::kernels {
@@ -154,7 +155,7 @@ __device__ __forceinline__ void ldsm_x2_t(unsigned& r0, unsigned& r1, const void
 // fp32 accumulate), an online softmax per row over its cells, O = O alpha + P V (P in fp16) on mma; the rows' partials
 // {max, sum, O} go to the merge.  Every row's arithmetic is its own (mma columns and rows never meet), the chunks follow
 // positions and the splits the capacity, so a row's bits are the same at any window width.
-template <int HD>
+template <int HD, bool I8>
 // (launched through launch_pdl: q and the cache come from the kernels before, read after pdl_wait, so not __restrict__)
 __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int n_head, int n_kv, const DecSegs segs, int n_chunks,
                                                          float scale, float* part_all) {
@@ -215,6 +216,68 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
             *reinterpret_cast<uint4*>(&vs[cell][d8]) = vw;
         }
     };
+    // the next chunk's cells are fetched into registers while this one is computed (the same values, the same order of
+    // arithmetic: only when the loads are issued changes); an int8 cache's codes take the first two words
+    constexpr int NI = CHUNK * HD / 8 / 128;
+    using Word = std::conditional_t<I8, uint2, uint4>;
+    Word pk[NI], pv[NI];
+    uint16_t psk[NI], psv[NI];
+    unsigned pmask = 0;
+    const auto fetch = [&](int64_t c0, int64_t hi_max) {
+        const int64_t cell0 = c0 % r.cap;
+        pmask = 0;
+#pragma unroll
+        for (int j = 0; j < NI; ++j) {
+            const int idx = tid + j * 128, cell = idx / (HD / 8), d8 = (idx - cell * (HD / 8)) * 8;
+            if (c0 + cell < hi_max) {
+                int64_t ce = cell0 + cell;
+                if (ce >= r.cap) ce -= r.cap;
+                const bool far_kv = kv_far(fr, ce);
+                const int64_t row = ce * n_kv + kvh;
+                if constexpr (I8) {
+                    const KvInt8& c8 = far_kv ? fr.q8 : q8;
+                    psk[j] = c8.ks[row * (HD / 64) + d8 / 64];
+                    psv[j] = c8.vs[row * (HD / 64) + d8 / 64];
+                    pk[j] = *reinterpret_cast<const uint2*>(c8.k + row * HD + d8);
+                    pv[j] = *reinterpret_cast<const uint2*>(c8.v + row * HD + d8);
+                } else {
+                    pk[j] = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.k : kc) + row * HD + d8);
+                    pv[j] = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.v : vc) + row * HD + d8);
+                }
+                pmask |= 1u << j;
+            }
+        }
+    };
+    const auto commit = [&]() {
+#pragma unroll
+        for (int j = 0; j < NI; ++j) {
+            const int idx = tid + j * 128, cell = idx / (HD / 8), d8 = (idx - cell * (HD / 8)) * 8;
+            uint4 kw = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
+            if ((pmask >> j) & 1u) {
+                if constexpr (I8) {
+                    const float sk = __half2float(__ushort_as_half(psk[j]));
+                    const float sv = __half2float(__ushort_as_half(psv[j]));
+                    int8_t kb[8], vb[8];
+                    *reinterpret_cast<uint2*>(kb) = pk[j];
+                    *reinterpret_cast<uint2*>(vb) = pv[j];
+                    __half2 kh[4], vh[4];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        kh[e] = __floats2half2_rn((float) kb[2 * e] * sk, (float) kb[2 * e + 1] * sk);
+                        vh[e] = __floats2half2_rn((float) vb[2 * e] * sv, (float) vb[2 * e + 1] * sv);
+                    }
+                    kw = *reinterpret_cast<uint4*>(kh);
+                    vw = *reinterpret_cast<uint4*>(vh);
+                } else {
+                    kw = pk[j];
+                    vw = pv[j];
+                }
+            }
+            *reinterpret_cast<uint4*>(&ks[cell][d8]) = kw;
+            *reinterpret_cast<uint4*>(&vs[cell][d8]) = vw;
+        }
+    };
+    bool staged = false;
     // before the wait: the rows' ranges (positions come from the host) and, of the block's first chunk, the cells below
     // the window's first position, which earlier windows wrote; the window's own cells and the queries come after it
     if (tid < 16) {
@@ -244,8 +307,17 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
     for (int chunk = blockIdx.x; chunk < n_chunks; chunk += gx) {
         const int64_t c0 = (int64_t) (r.base + chunk) * CHUNK;
         if (c0 >= hi_max) break;   // past every row's cells
-        load_kv(c0, hi_max, chunk == (int) blockIdx.x ? pre : 0, CHUNK);   // the first chunk's earlier cells are in
+        if (staged) commit();
+        else load_kv(c0, hi_max, chunk == (int) blockIdx.x ? pre : 0, CHUNK);   // the first chunk's earlier cells are in
+        staged = false;
         __syncthreads();
+        if (chunk + gx < n_chunks) {   // the chunk after this one, in flight while this one is computed
+            const int64_t c02 = (int64_t) (r.base + chunk + gx) * CHUNK;
+            if (c02 < hi_max) {
+                fetch(c02, hi_max);
+                staged = true;
+            }
+        }
         // S = Q K^T: warp w the cells 8w .. 8w + 7
         for (int nc = warp; nc < CHUNK / 8; nc += 4) {
             float s4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -341,8 +413,9 @@ void launch_segs(const float* q, int n_head, int n_kv, DecSegs& segs, float* scr
     const int gx = decode_splits(n_chunks);
     for (int k = 0; k < segs.n; ++k)
         segs.tile0[k + 1] = segs.tile0[k] + ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16;
-    launch_pdl(decode_mma_kernel<HD>, dim3((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]), dim3(128), 0, s, q,
-               n_head, n_kv, segs, n_chunks, scale, scratch);
+    const dim3 grid((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]);
+    if (segs.q8[0].k) launch_pdl(decode_mma_kernel<HD, true>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+    else launch_pdl(decode_mma_kernel<HD, false>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
     check("gqa decode attention");
     launch_pdl(decode_merge_kernel<HD>, dim3((unsigned) n_head, (unsigned) segs.row0[segs.n]), dim3(HD), 0, s,
                (const float*) scratch, n_head, gx, out, gate_q, gated16, segs);
