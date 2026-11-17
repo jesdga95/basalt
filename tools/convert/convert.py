@@ -4,7 +4,7 @@
         [--mtp-source DIR] [--mtp-dense FILE] [--draft-vocab FILE] [--name NAME] [--compat-bf16] [--no-vision] [--force]
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --sections-from BASE.basalt --out MODEL.basalt [--name NAME] [--force]
     python3 tools/convert/convert.py --dspark FILE --into PACK.basalt --undo-dir DIR
-    python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] [--expert-q5-k] [--mtp-dense FILE] \\
+    python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] [--mtp-dense FILE] \\
         [--name NAME] [--workers N] [--force]
     python3 tools/convert/convert.py --sections-from DEEPSEEK.basalt --checkpoint DIR --out MODEL.basalt [--stream-shards] \\
         [--name NAME] [--workers N] [--force]
@@ -36,8 +36,6 @@ From an NVFP4 checkpoint (--sections-from with --checkpoint)
                      the other tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table is FP8
                      code x scale as Q8_0. The GGUF metadata and the tokenizer come from the checkpoint's files.
   --dense-q8-0       Q8_0 projections instead of Q6_K (the 8-bit dense variant)
-  --expert-q5-k      the routed experts decoded from their NVFP4 codes and re-quantized: gate and up to Q5_K, down to
-                     Q5_1 (its 640-value rows are not whole Q5_K blocks)
   The drafter and vision sections come from BASE byte for byte; BASE's vocabulary must be the checkpoint's.
 
 From NVIDIA's DeepSeek-V4.1 NVFP4 checkpoint (a deepseek41 BASE; tools/convert/checkpoint_deepseek41.py)
@@ -550,8 +548,8 @@ def from_checkpoint(a) -> None:
     import checkpoint as C
     out, src = Path(a.out), Path(a.sections_from)
     if src.is_file() and json.loads(ModelFile(str(src)).read("meta")).get("arch") == "deepseek41":
-        if a.dense_q8_0 or a.mtp_dense or a.expert_q5_k:
-            die("a deepseek41 BASE takes no --dense-q8-0, --expert-q5-k or --mtp-dense")
+        if a.dense_q8_0 or a.mtp_dense:
+            die("a deepseek41 BASE takes no --dense-q8-0 or --mtp-dense")
         import checkpoint_deepseek41 as D
         D.build(a, Job, fingerprint, source_record)
         return
@@ -567,7 +565,7 @@ def from_checkpoint(a) -> None:
     q6k = not a.dense_q8_0
     try:
         ck = C.Checkpoint(a.checkpoint)
-        experts = C.CheckpointExperts(ck, q5_k=a.expert_q5_k)
+        experts = C.CheckpointExperts(ck)
         dense_src = C.CheckpointDense(ck, q6k)
         ple_paths = C.ple_table(ck)
         ple = S.PleFp8([str(p) for p in ple_paths])
@@ -659,15 +657,10 @@ def from_checkpoint(a) -> None:
             srcs = list(dense_src.sources.values())
             meta["checkpoint"] = {
                 "dir": Path(a.checkpoint).name, "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
-                "experts": ({"format": "q5_k", "source": "weight (E2M1 pairs) x weight_scale x weight_scale_2, "
-                             "input_scale unused",
-                             "repack": "each matrix decoded to its values, then Q5_K blocks of 256 (down: Q5_1 blocks "
-                                       "of 32, its rows are 640 values)",
-                             "tail": "none"} if a.expert_q5_k else
-                            {"format": "nvfp4", "source": "weight (E2M1 pairs), weight_scale (UE4M3 per 16), "
-                             "weight_scale_2 (FP32); input_scale unused",
-                             "repack": "codes and scales unchanged, nibbles moved into 64-value blocks",
-                             "tail": "fp32 {s_gate, s_up, s_down, 0} per expert"}),
+                "experts": {"format": "nvfp4", "source": "weight (E2M1 pairs), weight_scale (UE4M3 per 16), "
+                            "weight_scale_2 (FP32); input_scale unused",
+                            "repack": "codes and scales unchanged, nibbles moved into 64-value blocks",
+                            "tail": "fp32 {s_gate, s_up, s_down, 0} per expert"},
                 "dense": {"projections": "Q6_K where rows are whole 256-value blocks, else Q8_0" if q6k else "Q8_0",
                           "q6_k_method": "least-squares 16-value group scales, 8-bit group scales, fp16 super-scale",
                           "q8_0_method": "ggml reference rounding",
@@ -797,9 +790,6 @@ def main():
                          "with --requant-dense-q6k, the BF16 projections")
     ap.add_argument("--dense-q8-0", action="store_true",
                     help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")
-    ap.add_argument("--expert-q5-k", action="store_true",
-                    help="with --checkpoint and --sections-from: routed experts re-quantized from the checkpoint's "
-                         "NVFP4, gate/up to Q5_K and down to Q5_1 (its rows are not whole Q5_K blocks)")
     ap.add_argument("--stream-shards", action="store_true",
                     help="with --checkpoint and a deepseek41 --sections-from: shards arrive in file order and are deleted once used")
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
@@ -828,7 +818,7 @@ def main():
         return
     if a.sections_from and a.checkpoint:
         if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab:
-            ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, --expert-q5-k, "
+            ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, "
                      "--stream-shards, --workers and --force")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")

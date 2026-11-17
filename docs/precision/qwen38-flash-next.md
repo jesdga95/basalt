@@ -136,19 +136,20 @@ pack alone gives -0.0059 of that. The Q8_0-dense pack is about 7% slower on pros
 UD-IQ1_S, converted as shipped (layer 18: IQ2_S gate, IQ2_XXS up; each half on its own format's kernels, the same bits as
 a uniform layer's rows): PPL 3.4049, KLD 0.2676, top-1 82.76% (100 chunks, T 3, int8 KV, resident experts).
 
-The QAD checkpoint's routed experts re-quantized to Q5_K (`--expert-q5-k`: gate and up as 5-bit codes with 6-bit scales
-and mins per 32 values, down as Q5_1 since its rows are 640 values): PPL 2.2095 against 2.1847 for the NVFP4 pack, over
-the same 20 chunks and 5,100 scored rows (T 3, int8 KV, adaptation off; the base is a fixed dummy, so KLD and
-top-1-against-base are not comparable, but the two packs' rows are). 96.6% of the rows keep their top-1 token and the
-largest NLL move is 3.31 on a single row, against 76.8% and 15.4 for the 2-bit Q2_0 test. The experts are 79.7 GiB against
-63.3 (0.69 against 0.56 bytes per value), so the expert set spills: 44.6% of the decode windows hit VRAM against 54.5% and
-23.3% of the routed rows cross PCIe. Decode is 173.1 tok/s against 392.4 (conv 112.4 against 323.4, struct 198.1 against
-670.0, prose 134.4 against 302.4; int8 KV, drafting at its default), prefill 19% slower at 64k (8,489 against 10,781).
+Re-quantizing the QAD checkpoint's routed experts to Q5_K (gate and up as 5-bit codes with 6-bit scales and mins per 32
+values, down as Q5_1 since its rows are 640 values) was measured and not shipped: PPL 2.2095 against 2.1847 for the
+NVFP4 pack, over the same 20 chunks and 5,100 scored rows (T 3, int8 KV, adaptation off; the base is a fixed dummy, so
+KLD and top-1-against-base are not comparable, but the two packs' rows are). 96.6% of the rows keep their top-1 token and
+the largest NLL move is 3.31 on a single row, against 76.8% and 15.4 for the 2-bit test. The experts would be 79.7 GiB
+against 63.3 (0.69 against 0.56 bytes per value), so the set spills: 44.6% of the decode windows hit VRAM against 54.5%
+and 23.3% of the routed rows cross PCIe. Decode is 173.1 tok/s against 392.4 (conv 112.4 against 323.4, struct 198.1
+against 670.0, prose 134.4 against 302.4; int8 KV, drafting at its default), prefill 19% slower at 64k (8,489 against
+10,781).
 
 That makes Q5_K dominated on this 32 GB card: +1.1% PPL and −56% decode against the pack it is built from. The quality it
-preserves is near the checkpoint's own 4-bit form, so it is the switch for a machine whose expert tier holds 80 GiB; here
+preserves is near the checkpoint's own 4-bit form, so it would only pay on a machine whose expert tier holds 80 GiB; here
 the NVFP4 pack is the faster and better trade, and the only way to make decode much faster is to shrink the experts until
-the set fits, which the Q2_0 measurement puts at a PPL of 3.42 (+57%) -- too much.
+the set fits, which the 2-bit measurement puts at a PPL of 3.42 (+57%) -- too much.
 
 ## 6-bit dense projections
 

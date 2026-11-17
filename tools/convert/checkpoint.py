@@ -28,7 +28,6 @@ import numpy as np
 import model_sections as S
 
 NVFP4 = S.NVFP4
-Q5_K, Q5_1 = 13, 7
 UNUSED, NORMAL, CONTROL, USER_DEFINED = 5, 1, 3, 4
 # The pre-tokenizer split of the qwen35 vocabulary as Hugging Face tokenizers writes it.
 QWEN35_HF_SPLIT = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
@@ -110,11 +109,8 @@ def nvfp4_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
 
 
 def _expert_job(args):
-    """Blobs of experts [s, s + n) of one layer: [gate | up | down] blocks, and for NVFP4 the FP32 scale tail. With
-    `q5` each matrix is decoded from its NVFP4 codes and re-quantized instead: gate and up to Q5_K (5-bit codes, 6-bit
-    scales and mins per 32 values) and down to Q5_1 (640-value rows are not whole 256-value blocks)."""
+    """Blobs of experts [s, s + n) of one layer: [gate | up | down] blocks, and for NVFP4 the FP32 scale tail."""
     entries, n = args[0], args[1]
-    q5 = args[2] if len(args) > 2 else False
     out = []
     for e in range(n):
         parts, tail = [], []
@@ -124,20 +120,12 @@ def _expert_job(args):
             if (sc & 0x80).any() or (sc == 0x7F).any():
                 return f"a UE4M3 scale with the sign bit set or NaN at {wp.name}+{wo}"
             tail.append(np.fromfile(tp, dtype="<f4", count=1, offset=to)[0])
-            if q5:
-                v = np.empty((wshape[0], wshape[1] * 2), np.float32)
-                v[:, 0::2] = E2M1[w & 15]
-                v[:, 1::2] = E2M1[w >> 4]
-                v = v * np.repeat(E4M3[sc] * np.float32(tail[-1]), 16, axis=1)
-                parts.append(S.q5_k(v) if wshape[1] * 2 % S.Q5K_BLOCK == 0 else S.q5_1(v))
-            else:
-                parts.append(nvfp4_rows(w, sc))
+            parts.append(nvfp4_rows(w, sc))
         t = np.array(tail + [0.0], dtype="<f4")
         if not (np.isfinite(t).all() and (t[:3] > 0).all()):
             return f"a weight_scale_2 that is not finite and positive: {t[:3].tolist()}"
-        out.append(b"".join(parts) if q5 else np.concatenate(parts).tobytes())
-        if not q5:
-            out.append(t.tobytes())
+        out.append(np.concatenate(parts).tobytes())
+        out.append(t.tobytes())
     return b"".join(out)
 
 
@@ -145,27 +133,20 @@ bounded_imap = S.bounded_imap
 
 
 class CheckpointExperts:
-    """The `experts` section from the checkpoint's per-expert NVFP4 tensors (`input_scale` is not used). Kept as
-    NVFP4_PLANES blocks by default; with `q5_k` each expert's three matrices are decoded and re-quantized instead, gate
-    and up to Q5_K (6-bit scales and mins per 32 values against one fp16 pair) and down to Q5_1 (its rows are 640 values,
-    not whole 256-value blocks), so the section carries no scale tail."""
+    """The `experts` section from the checkpoint's per-expert NVFP4 tensors (`input_scale` is not used), kept as
+    NVFP4_PLANES blocks: codes and scales unchanged, the nibbles moved into 64-value blocks, and the FP32 scale tail
+    {s_gate, s_up, s_down, 0} per expert."""
 
     ROLES = ("gate_proj", "up_proj", "down_proj")
 
-    def __init__(self, ck: Checkpoint, q5_k: bool = False):
+    def __init__(self, ck: Checkpoint):
         tc = ck.text
-        self.ck, self.q5_k = ck, q5_k
+        self.ck = ck
         self.n_layers, self.n_expert = int(tc["num_hidden_layers"]), int(tc["num_experts"])
         h, ff = int(tc["hidden_size"]), int(tc["moe_intermediate_size"])
         shapes = {"gate_proj": (ff, h), "up_proj": (ff, h), "down_proj": (h, ff)}
-        if q5_k:
-            if h % S.Q5K_BLOCK or ff % S.Q51_BLOCK:
-                raise S.ConvertError(f"Q5_K expert rows need {S.Q5K_BLOCK} and Q5_1 {S.Q51_BLOCK} values, not {h} x {ff}")
-            self.blob = 2 * (h // S.Q5K_BLOCK) * S.Q5K_BYTES * ff + (ff // S.Q51_BLOCK) * S.Q51_BYTES * h
-            self.gu_type, self.d_type = Q5_K, Q5_1
-        else:
-            self.blob = 2 * ff * S.nvfp4_row_bytes(h) + h * S.nvfp4_row_bytes(ff) + S.NVFP4_TAIL
-            self.gu_type = self.d_type = NVFP4
+        self.blob = 2 * ff * S.nvfp4_row_bytes(h) + h * S.nvfp4_row_bytes(ff) + S.NVFP4_TAIL
+        self.gu_type = self.d_type = NVFP4
         known = {f"{r}.{k}" for r in self.ROLES for k in ("weight", "weight_scale", "weight_scale_2", "input_scale")}
         for k in ck.t:
             m = re.fullmatch(r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(.+)", k)
@@ -192,11 +173,7 @@ class CheckpointExperts:
         self.total = self.n_layers * self.n_expert * self.blob
 
     def layout_text(self) -> bytes:
-        if not self.q5_k:
-            return S.nvfp4_layout_text(self.n_expert, self.total, self.layout)
-        head = ("# experts v5: layer gu_type d_type offset blob_bytes (n_expert %d, total %d)\n"
-                % (self.n_expert, self.total))
-        return (head + "".join("%d %d %d %d %d\n" % x for x in self.layout)).encode("utf-8")
+        return S.nvfp4_layout_text(self.n_expert, self.total, self.layout)
 
     def jobs(self, group: int):
         for l in range(self.n_layers):
@@ -205,9 +182,7 @@ class CheckpointExperts:
                 yield self.entries[l][s:s + n], n
 
     def chunks(self, pool, group: int | None = None, depth: int = 32):
-        if group is None:
-            group = 2 if self.q5_k else 32      # a Q5_K job holds its expert's three matrices decoded, in float32
-        for b in bounded_imap(pool, _expert_job, ((e, n, self.q5_k) for e, n in self.jobs(group)), depth):
+        for b in bounded_imap(pool, _expert_job, ((e, n) for e, n in self.jobs(group or 32)), depth):
             if isinstance(b, str):
                 raise S.ConvertError(b)
             yield b

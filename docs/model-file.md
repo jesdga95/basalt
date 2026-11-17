@@ -98,20 +98,6 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --check
   shared experts' NVFP4 codes would be 4.5 bits; they are re-quantized to Q6_K/Q8_0 because the MoE model's kernels read
   GGUF block forms, which costs about 80 MB per decoded token against keeping them in NVFP4.
 
-`--expert-q5-k` goes the other way for the routed experts: each expert's gate and up matrices are decoded from their NVFP4
-codes and re-quantized to Q5_K (5-bit codes, 6-bit scales and mins per 32 values), and down to Q5_1 because its 640-value
-rows are not whole 256-value blocks, so the section carries no per-matrix scale. The experts grow from 63.3 to 79.7 GiB
-and the pack from 122.6 to 139.0. On a 32 GB card that is a large loss of decode speed: 173.1 tok/s against 392.4 on the
-community preset, because the larger set no longer fits (44.6% of windows hit VRAM against 54.5%), and prefill is 19%
-slower at 64k. The quality it buys is small: PPL 2.2095 against 2.1847 over 20 chunks of wikitext-2 (5,100 rows, T 3,
-int8 KV), with 96.6% of rows keeping their top-1 token. The NVFP4 pack is the better trade on this hardware; the switch
-is for a machine whose expert tier holds the larger set (see [precision/qwen38-flash-next.md](../precision/qwen38-flash-next.md)).
-
-```sh
-python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --checkpoint qad --expert-q5-k \
-    --out Qwen3.8-FN-QAD-Q5_K.basalt --name "Qwen3.8-Flash-Next QAD Q5_K experts"
-```
-
 ## Qwen3.8-27B pack
 
 The published pack comes from QUASAR's quantization-aware NVFP4 checkpoint
