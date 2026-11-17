@@ -2442,6 +2442,92 @@
       "draft_len_prose": 2.2,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8",
       "notes": "OrcaRouter-abliterated NVFP4-DQ8 pack; single RTX Pro 5000 72GB; Docker benchmark."
+    },
+    {
+      "submitter": "h255_64g_5060ti16g",
+      "date": "2026-11-16",
+      "commit": "0d95afa18e",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "4.0 x4",
+          "h2d_gbps": 7.2
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "4.0 x4",
+          "h2d_gbps": 7.2
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "AMD Ryzen 7 255 w/ Radeon 780M Graphics, 8 cores",
+      "ram_gbps": 59.1,
+      "os": "Linux",
+      "quant": "IQ3_XXS",
+      "kv": "int8",
+      "prefill_16k_tps": 1869.1,
+      "prefill_64k_tps": 2804.7,
+      "decode_tps": 182.8,
+      "decode_conv_tps": 122.1,
+      "decode_struct_tps": 223.6,
+      "decode_prose_tps": 107.4,
+      "accept_conv_pct": 70.2,
+      "accept_struct_pct": 95.3,
+      "accept_prose_pct": 64.3,
+      "draft_len_conv": 2.5,
+      "draft_len_struct": 6.8,
+      "draft_len_prose": 1.9,
+      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
+      "notes": "AOOSTAR MACO mini PC, 64 GB DDR5-5600. GPU 0 on the OCuLink port, GPU 1 on an M.2 to OCuLink adapter."
+    },
+    {
+      "submitter": "h255_64g_5060ti16g_dual",
+      "date": "2026-11-17",
+      "commit": "6aba181826",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 150,
+          "pcie": "4.0 x4",
+          "h2d_gbps": 7.2
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 150,
+          "pcie": "4.0 x4",
+          "h2d_gbps": 7.2
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "AMD Ryzen 7 255 w/ Radeon 780M Graphics, 8 cores",
+      "ram_gbps": 58.8,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 1662.2,
+      "prefill_64k_tps": 2070.7,
+      "decode_tps": 140.9,
+      "decode_conv_tps": 87.9,
+      "decode_struct_tps": 175.7,
+      "decode_prose_tps": 87.3,
+      "accept_conv_pct": 72.1,
+      "accept_struct_pct": 98.4,
+      "accept_prose_pct": 68.4,
+      "draft_len_conv": 2.5,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 2.0,
+      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
+      "notes": "AOOSTAR MACO mini PC, 64 GB DDR5-5600, OCuLink + M.2 OCuLink. peer-exclusive on: 39.8 GiB of experts in RAM, no SSD spill."
     }
   ]
 }
