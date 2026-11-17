@@ -384,8 +384,9 @@ class Nvfp4DenseTest(unittest.TestCase):
         n = self.NAME
         small_checkpoint(self.d, {n: ("U8", self.codes.shape, self.codes.tobytes()),
                                   n + "_scale": ("F8_E4M3", self.scales.shape, self.scales.tobytes()),
-                                  n + "_scale_2": ("F32", (1,), np.array([self.scale2], "<f4").tobytes()),
-                                  n + "_input_scale": ("F32", (1,), np.array([3.0], "<f4").tobytes())},
+                                  n + "_scale_2": ("F32", (), np.array(self.scale2, "<f4").tobytes()),
+                                  n[:-len("weight")] + "input_scale": ("F32", (1,),
+                                                                       np.array([3.0], "<f4").tobytes())},
                           cfg=GDN_CFG_ONE_PLE if False else None)
 
     def test_the_bits_the_checkpoint_holds_reach_the_pack(self):

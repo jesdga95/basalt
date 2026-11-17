@@ -403,8 +403,10 @@ class CheckpointDense:
                 consumed.add(k + "_scale")
             elif ck.t[k][2] == "U8" and k + "_scale" in ck.t and ck.t[k + "_scale"][2] == "F8_E4M3":
                 # a dense matrix stored NVFP4: its UE4M3 scales, its FP32 matrix scale and its input scale are its
-                # own bytes, not tensors the engine reads
-                consumed.update(n for n in (k + "_scale", k + "_scale_2", k + "_input_scale") if n in ck.t)
+                # own bytes, not tensors the engine reads. ModelOpt names the members off the module, so the input
+                # scale is `<module>.input_scale`, not `<module>.weight_input_scale`.
+                consumed.update(n for n in (k + "_scale", k + "_scale_2", k[:-len("weight")] + "input_scale")
+                                if n in ck.t)
         for k in ck.order:
             _, _, dt, shape, _ = ck.t[k]
             if SKIP.match(k) or k in consumed:
@@ -496,7 +498,7 @@ class CheckpointDense:
             return None
         if len(shape) != 2 or self.ck.t[sc][2] != "F8_E4M3" or self.ck.t[s2][2] != "F32":
             return None
-        if self.ck.t[sc][3] != [shape[0], shape[1] // 8] or self.ck.t[s2][3] != [1]:
+        if self.ck.t[sc][3] != [shape[0], shape[1] // 8] or self.ck.t[s2][3] not in ([], [1]):
             raise S.ConvertError(f"{name}: NVFP4 scales of {self.ck.t[sc][3]} and {self.ck.t[s2][3]} for codes of "
                                  f"{shape} (expected one UE4M3 per 16 values and one F32 matrix scale)")
         return (sc, s2)
