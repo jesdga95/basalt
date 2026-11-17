@@ -30,17 +30,15 @@ int main() {
     LoadProgress::complete();
     std::fflush(stderr);
     // let go of the file before reading and removing it (Windows cannot remove a file stderr still holds)
-#ifdef _WIN32
-    if (std::freopen("NUL", "w", stderr) == nullptr) return 1;
-#else
-    if (std::freopen("/dev/null", "w", stderr) == nullptr) return 1;
-#endif
+    const std::string after = path + ".after";
+    if (std::freopen(after.c_str(), "w", stderr) == nullptr) return 1;
     std::ifstream in(path);
     std::vector<std::string> lines;
     for (std::string l; std::getline(in, l);) lines.push_back(l);
     in.close();
     std::error_code ec;
     std::filesystem::remove(path, ec);
+    std::filesystem::remove(after, ec);   // still held on Windows: an empty file stays
     int totals = 0, warnings = 0, fails = 0;
     long long last_done = -1;
     bool total_first = false;
