@@ -33,7 +33,7 @@ import numpy as np
 
 import ggufq
 import model_sections as S
-from checkpoint import _expert_job, bounded_imap
+from checkpoint import bounded_imap, nvfp4_rows
 from model_file import TENSOR_ALIGN, ModelFile, ModelWriter
 
 MXFP4 = 39
@@ -132,6 +132,29 @@ def _engram_job(args):
     if (scales == 255).any():
         return f"{pathlib.Path(path).name}: an Engram scale is NaN"
     return mxfp4_rows(codes, scales).tobytes()
+
+
+def _expert_job(args):
+    """Blobs of experts [s, s + n) of one layer: [gate | up | down] blocks and the FP32 scale tail. DeepSeek's
+    checkpoint stores one plain UE4M3 `weight_scale` per matrix, so this job is its own and does not take the NVIDIA
+    checkpoint's CSF pair."""
+    entries, n = args
+    out = []
+    for e in range(n):
+        parts, tail = [], []
+        for (wp, wo, wshape), (sp, so, sshape), (tp, to) in entries[e]:
+            w = np.fromfile(wp, dtype=np.uint8, count=wshape[0] * wshape[1], offset=wo).reshape(wshape)
+            sc = np.fromfile(sp, dtype=np.uint8, count=sshape[0] * sshape[1], offset=so).reshape(sshape)
+            if (sc & 0x80).any() or (sc == 0x7F).any():
+                return f"a UE4M3 scale with the sign bit set or NaN at {wp}+{wo}"
+            parts.append(nvfp4_rows(w, sc))
+            tail.append(np.fromfile(tp, dtype="<f4", count=1, offset=to)[0])
+        t = np.array(tail + [0.0], dtype="<f4")
+        if not (np.isfinite(t).all() and (t[:3] > 0).all()):
+            return f"a weight_scale_2 that is not finite and positive: {t[:3].tolist()}"
+        out.append(np.concatenate(parts).tobytes())
+        out.append(t.tobytes())
+    return b"".join(out)
 
 
 def _dense_job(args):
