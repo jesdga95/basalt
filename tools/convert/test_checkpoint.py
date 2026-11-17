@@ -362,6 +362,104 @@ GDN_CFG = {"text_config": {"linear_num_key_heads": 16, "linear_num_value_heads":
                            "linear_value_head_dim": 128, "indexer_n_heads": 4, "indexer_head_dim": 128}}
 
 
+class Nvfp4DenseTest(unittest.TestCase):
+    """A dense projection the checkpoint stores as NVFP4: packed E2M1 pairs, one UE4M3 scale per 16 values and one
+    FP32 matrix scale (QAD moves the 144 shared-expert matrices to this form). The values must come out of the
+    converter as NATIVE NVIDIA numbers - the same ones Model Optimizer wrote - not as a rounding of a decode."""
+
+    NAME = "model.language_model.layers.1.mlp.shared_expert.gate_proj.weight"   # layer 1: no PLE in this config
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = Path(self.tmp.name)
+        rng = np.random.default_rng(11)
+        self.codes = rng.integers(0, 256, size=(256, 320), dtype=np.uint8)      # 640 values per row
+        self.scales = rng.integers(120, 127, size=(256, 40), dtype=np.uint8)    # UE4M3, one per 16 values (0x7F is NaN)
+        self.scale2 = np.float32(0.0173)
+        self.write()
+        self.exact = modelopt_values(self.codes, self.scales).astype(np.float32) * self.scale2
+
+    def write(self):
+        n = self.NAME
+        small_checkpoint(self.d, {n: ("U8", self.codes.shape, self.codes.tobytes()),
+                                  n + "_scale": ("F8_E4M3", self.scales.shape, self.scales.tobytes()),
+                                  n + "_scale_2": ("F32", (1,), np.array([self.scale2], "<f4").tobytes()),
+                                  n + "_input_scale": ("F32", (1,), np.array([3.0], "<f4").tobytes())},
+                          cfg=GDN_CFG_ONE_PLE if False else None)
+
+    def test_the_bits_the_checkpoint_holds_reach_the_pack(self):
+        import multiprocessing
+        dn = C.CheckpointDense(C.Checkpoint(self.d), require_complete=False)
+        t = dn.tensors["blk.1.ffn_gate_shexp.weight"]
+        self.assertEqual((t.type_name, t.nvfp4 is not None, t.scale is None), ("Q8_0", True, True))
+        np.testing.assert_allclose(dn.values("blk.1.ffn_gate_shexp.weight"), self.exact, rtol=0, atol=1e-7)
+        with multiprocessing.Pool(2) as pool:
+            got = b"".join(dn.chunks("blk.1.ffn_gate_shexp.weight", pool))
+        self.assertEqual(got, S.q8_0(self.exact.reshape(-1)))
+        self.assertEqual(len(got), t.expected_bytes())
+
+    def test_its_scales_are_its_own_bytes_not_tensors(self):
+        """`weight_scale`, `weight_scale_2` and `input_scale` are consumed, not reported as tensors with no GGUF
+        counterpart (the QAD checkpoint's 672 extra names are exactly these three per matrix)."""
+        C.CheckpointDense(C.Checkpoint(self.d), require_complete=False)
+
+    def test_a_scale_of_the_wrong_geometry_is_refused(self):
+        n = self.NAME
+        small_checkpoint(self.d, {n: ("U8", self.codes.shape, self.codes.tobytes()),
+                                  n + "_scale": ("F8_E4M3", (256, 41), bytes(256 * 41)),
+                                  n + "_scale_2": ("F32", (1,), np.array([1.0], "<f4").tobytes())})
+        with self.assertRaisesRegex(S.ConvertError, "NVFP4 scales"):
+            C.CheckpointDense(C.Checkpoint(self.d), require_complete=False)
+
+
+class ShardedPleTest(unittest.TestCase):
+    """QAD's PLE table is 128 `shard_K.weight` tensors spread over 18 of its 36 files. The rows must be gathered in
+    shard order across files: a reader that walks one file's header stops at the first missing number and ships a
+    truncated table, which is a silently wrong model rather than an error."""
+
+    STEM = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+    ROWS = 3
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = Path(self.tmp.name)
+        (self.d / "config.json").write_text(json.dumps(GDN_CFG))
+
+    def shard(self, k: int, rows: int, seed: int):
+        rng = np.random.default_rng(seed)
+        raw = rng.integers(0, 256, size=(rows, S.PLE_DIM), dtype=np.uint8)
+        raw[raw == 0x7F] = 0x7E                          # the two E4M3 NaN codes are not weights
+        raw[raw == 0xFF] = 0xFE
+        return (f"{self.STEM}shard_{k}.weight", ("F8_E4M3", (rows, S.PLE_DIM), raw.tobytes())), raw
+
+    def scale_tensor(self):
+        return (f"{self.STEM}weight_scale", ("BF16", (1,), bf16(np.array([0.25], np.float32)).tobytes()))
+
+    def test_rows_come_from_every_file_in_shard_order(self):
+        t0, r0 = self.shard(0, 2, 1)
+        t1, r1 = self.shard(1, 3, 2)
+        t2, r2 = self.shard(2, 1, 3)
+        write_safetensors(self.d / "model-00001-of-00002.safetensors", dict([t0, t2, self.scale_tensor()]))
+        write_safetensors(self.d / "model-00002-of-00002.safetensors", dict([t1]))
+        ple = C.ple_table(C.Checkpoint(self.d))
+        self.assertEqual((ple.rows, len(ple.files)), (6, 2))
+        self.assertAlmostEqual(ple.scale, 0.25)
+        import multiprocessing
+        with multiprocessing.Pool(1) as pool:
+            got = b"".join(ple.chunks(pool))
+        rows = np.concatenate([r0, r1, r2])
+        want = S.fp8_e4m3_table()[rows].astype(np.float32) * np.float32(0.25)
+        self.assertEqual(got, S.q8_0(want.reshape(-1)))
+
+    def test_a_missing_shard_number_is_refused(self):
+        write_safetensors(self.d / "model-00001-of-00001.safetensors",
+                          dict([self.shard(0, 2, 1)[0], self.shard(2, 1, 3)[0], self.scale_tensor()]),)
+        with self.assertRaisesRegex(S.ConvertError, "numbered"):
+            C.ple_table(C.Checkpoint(self.d))
+
+
 def small_checkpoint(d: Path, tens: dict, cfg=None) -> None:
     write_safetensors(d / "model-00001-of-00001.safetensors", tens)
     (d / "config.json").write_text(json.dumps(cfg or GDN_CFG))

@@ -613,6 +613,30 @@ class PleFp8:
         yield from bounded_imap(pool, _ple_job, self.jobs(), depth)
 
 
+class PleFp8Across(PleFp8):
+    """The same FP8 table when its `shard_K.weight` tensors are spread over several safetensors files: ModelOpt
+    consolidated a distribution shard set, so `shard_0..shard_N` are not all in one file (QAD's 128 shards sit in 18
+    of its 36). `shards` is [(path, offset, rows)] in shard order; the scale is the one BF16 `weight_scale`."""
+
+    def __init__(self, shards, scale: float, chunk_rows: int = 65536):
+        self.path, self.chunk_rows = None, chunk_rows
+        self.shards, self.scale = shards, scale
+        self.rows = sum(r for _, _, r in shards)
+        self.row_bytes = PLE_DIM // 32 * 34
+        self.nbytes = self.rows * self.row_bytes
+        self.gguf_type, self.gguf_type_id = "Q8_0", 8
+        self.folded = True
+        self.files = sorted({pathlib.Path(p) for p, _, _ in shards})
+        self.conversion = {"name": "per_layer_token_embd.weight", "src_type": "F8_E4M3", "dst_type": "Q8_0",
+                           "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)"}
+
+    def jobs(self):
+        for path, off, rows in self.shards:
+            for r in range(0, rows, self.chunk_rows):
+                n = min(self.chunk_rows, rows - r)
+                yield (path, off + r * PLE_DIM, n, self.scale)
+
+
 def _ple_nvfp4_job(args):
     path, off, spath, soff, rows = args
     codes = np.fromfile(path, dtype=np.uint8, count=rows * (PLE_DIM // 2), offset=off).reshape(rows, PLE_DIM // 2)
