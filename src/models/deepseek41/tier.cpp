@@ -3,6 +3,7 @@
 #include "models/deepseek41/tier.hpp"
 
 #include "basalt/core/device.hpp"
+#include "basalt/core/exact_slots.hpp"
 
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/loader.hpp"
@@ -88,7 +89,10 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     int copies = slots_in(free_b, reserve.copies + asked_free);
     int main_homes = slots_in(free_b, reserve.homes + asked_free);
     start_floor_ = free_floor_ = asked_free;
-    if (m_.tiers().expert_cache > 0) cap_per_layer_ = m_.tiers().expert_cache / n_layers_;
+    if (m_.tiers().expert_cache > 0) {
+        cap_per_layer_ = m_.tiers().expert_cache / n_layers_;
+        exact_per_layer_ = std::min<int64_t>(cap_per_layer_, n_expert_);   // honoured or refused (plan_ext), never trimmed
+    }
     if (m_.diag_tier_vram() >= 0) cap_per_layer_ = cap_per_layer_ >= 0 ? std::min<int64_t>(cap_per_layer_, m_.diag_tier_vram()) : m_.diag_tier_vram();
     if (cap_per_layer_ >= 0) {
         copies = (int) std::min<int64_t>(copies, cap_per_layer_);
@@ -181,7 +185,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
         peers_.clear();
     }
 
-    // the base arena (homes, or copies a long prompt borrows) leaves its reserve free; grow() fills it beside a short prompt
+    // the base arena (homes, or copies a long prompt borrows) leaves its reserve free; plan_ext() sizes what fills it
+    // beside a short prompt
     reserve_ = reserve.beside_homes;
     modules_ = reserve.modules;
     per_layer_ = homes_.main > 0 ? homes_.main : copies;
@@ -497,8 +502,7 @@ bool ExpertTier::attach(std::string& err) {
     if (!land_ram(err)) return false;
     if (homes_.main == 0) seed_copies(per_layer_);
     promoted_ = 0;
-    grow();
-    return true;
+    return plan_ext(err);   // after the RAM tier is pinned: its registration takes VRAM too
 }
 
 // The RAM tier's experts have landed (the pass's pinned staging is freed by then): its spans are pinned.
@@ -1031,20 +1035,15 @@ void ExpertTier::lend_all() {
     cache_.close();
 }
 
-bool ExpertTier::reclaim(std::string& err) {
-    if (lent_per_layer_ == 0) return true;
-    uint64_t free_b = 0, total_b = 0;
-    std::string why;
-    if (!core::device_memory(-1, free_b, total_b, why)) {
-        err = "deepseek41: cannot query the free device memory: " + why;
-        return false;
-    }
-    const int64_t n = policy::reclaim_slots(free_b, reserve_, free_floor_, one_each_, lent_per_layer_);
-    if (n < 1) return true;   // nothing fits above the reserve: the slots stay lent
+bool ExpertTier::reopen_base(int64_t n, std::string& err) {
     std::vector<int64_t> slot_bytes;
     for (int l = 0; l < n_layers_; ++l)
         for (int64_t s = 0; s < n; ++s) slot_bytes.push_back((int64_t) m_.pack().experts[(size_t) l].blob_bytes);
-    if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) return false;
+    std::string e;
+    if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, e)) {
+        err = "deepseek41: the VRAM expert tier cannot take back its " + std::to_string(n) + " slots per layer: " + e;
+        return false;
+    }
     per_layer_ = n;
     lent_per_layer_ = 0;
     owner_.assign(slot_bytes.size(), -1);
@@ -1052,23 +1051,67 @@ bool ExpertTier::reclaim(std::string& err) {
     return true;
 }
 
-void ExpertTier::grow() {
-    if (ext_per_layer_ > 0 || per_layer_ >= n_expert_ || !cache_.valid()) return;
+// The slots a prompt borrowed come back at the size they had: the size was planned once, at the start.
+bool ExpertTier::reclaim(std::string& err) {
+    if (lent_per_layer_ == 0) return true;
+    return reopen_base(lent_per_layer_, err);
+}
+
+// The start's one plan of the slots beside the base arena: read once, after everything else the start allocates, then
+// held for good (a prompt's shrink and grow open the same size again). An exact --expert-cache the card cannot hold
+// stops the start.
+bool ExpertTier::plan_ext(std::string& err) {
     uint64_t free_b = 0, total_b = 0;
     std::string why;
     if (!core::device_memory(-1, free_b, total_b, why)) {
-        if (!unread_said_) basalt::log::warn("basalt deepseek41", "VRAM expert tier cannot grow: cannot read the free device memory: %s", why.c_str());
-        unread_said_ = true;
-        return;
+        err = "deepseek41: cannot query the free device memory: " + why;
+        return false;
     }
-    const int64_t n = policy::grow_slots(free_b, reserve_ + (token_ > 0 ? 0 : modules_), free_floor_, one_each_, per_layer_, n_expert_, cap_per_layer_);
-    if (n < 1) return;
+    ext_n_ = per_layer_ >= n_expert_ || !cache_.valid()
+        ? 0 : policy::grow_slots(free_b, reserve_ + modules_, free_floor_, one_each_, per_layer_, n_expert_, cap_per_layer_);
+    if (!policy::holds_exact(exact_per_layer_, per_layer_, ext_n_)) {
+        err = core::exact_slots_refusal(m_.tiers().expert_cache, per_layer_ + ext_n_, " per layer", free_b,
+                                        m_.tiers().vram_reserve_mib);
+        return false;
+    }
+    grow();
+    return true;
+}
+
+// An explicit new --vram-reserve-mib: the one place the size is planned again after the start.
+bool ExpertTier::replan(int64_t mib, std::string& err) {
+    set_free_floor(mib);
+    lend_all();
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        err = "deepseek41: cannot query the free device memory: " + why;
+        return false;
+    }
+    if (lent_per_layer_ > 0) {
+        const int64_t n = policy::reclaim_slots(free_b, reserve_, free_floor_, one_each_, lent_per_layer_);
+        if (n >= 1 && !reopen_base(n, err)) return false;   // nothing fits above the new reserve: the slots stay lent
+        if (!core::device_memory(-1, free_b, total_b, why)) {
+            err = "deepseek41: cannot query the free device memory: " + why;
+            return false;
+        }
+    }
+    ext_n_ = per_layer_ >= n_expert_ || !cache_.valid()
+        ? 0 : policy::grow_slots(free_b, reserve_ + (token_ > 0 ? 0 : modules_), free_floor_, one_each_, per_layer_, n_expert_, cap_per_layer_);
+    grow();
+    return true;
+}
+
+void ExpertTier::grow() {
+    if (ext_per_layer_ > 0 || ext_n_ < 1 || per_layer_ >= n_expert_ || !cache_.valid()) return;
+    const int64_t n = ext_n_;
     std::vector<int64_t> slot_bytes;
     for (int l = 0; l < n_layers_; ++l)
         for (int64_t s = 0; s < n; ++s) slot_bytes.push_back((int64_t) m_.pack().experts[(size_t) l].blob_bytes);
     std::string err;
     if (!ext_.open_sized(slot_bytes, n_layers_, n_expert_, err)) {
-        basalt::log::warn("basalt deepseek41", "VRAM expert tier cannot grow: %s", err.c_str());
+        basalt::log::warn("basalt deepseek41", "VRAM expert tier cannot take back its %lld slots per layer beside the prompt workspaces: %s",
+                          (long long) n, err.c_str());
         return;
     }
     ext_per_layer_ = n;

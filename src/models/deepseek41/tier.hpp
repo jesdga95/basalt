@@ -75,17 +75,25 @@ public:
     /// Sizes the tiers and queues their experts' reads in `reads` (the start's one pass places them). `h_rows`: the mapped
     /// rows a second card shares with the CPU pool.
     bool open(const Reserve& reserve, float* h_rows, core::LoadPlan& reads, std::string& err);
-    /// Once the experts have landed: the RAM tier pinned, the main card's copies seeded and its slots grown.
+    /// Once the experts have landed: the RAM tier pinned, the main card's copies seeded, and the slots beside the base arena
+    /// planned once (an exact --expert-cache that does not fit stops the start here) and opened.
     bool attach(std::string& err);
 
+    /// The tier's size is planned once, at the start (`attach`); nothing reads the free VRAM afterwards. A prompt
+    /// borrows slots inside that total and gives the same number back.
+    ///
     /// Gives the VRAM slots that the prompt path's workspaces occupy back to the driver (call before they are
-    /// allocated); `grow` takes the memory freed after them as extra slots. Residency in those slots is dropped.
+    /// allocated); `grow` opens the planned slots beside the base arena again, empty, once they are free.
     void shrink();
     void grow();
     /// A long prompt streams every expert to the main card and needs the card for its chunks: the slots that are
-    /// copies go back whole, and reclaim() opens them again empty. Homes stay.
+    /// copies go back whole, and reclaim() opens the same number again, empty (an error if the card cannot hold them
+    /// any more). Homes stay.
     void lend_all();
     bool reclaim(std::string& err);
+    /// An explicit new --vram-reserve-mib (`mib` < 0: the start's): the one time the size is planned again after the
+    /// start. The slots that fit above the new reserve are opened; the response reports them.
+    bool replan(int64_t mib, std::string& err);
     /// Main card bytes the tier, the caches and the prompt path leave free: --vram-reserve-mib, or `mib` once set
     /// (`mib` < 0: back to the start's). The arena is not resized here.
     void set_free_floor(int64_t mib);
@@ -177,6 +185,8 @@ public:
     void probe_env(program::ProbeEnv& env);
 
 private:
+    bool plan_ext(std::string& err);
+    bool reopen_base(int64_t n, std::string& err);
     /// A slot's copy on its way. `out` >= 0: the home it replaces is on its way to RAM place `place`.
     struct Pending {
         int layer, expert, slot, event;
@@ -242,7 +252,8 @@ private:
     int64_t ext_per_layer_ = 0;             ///< slots each layer owns in `ext_`
     bool ram_queued_ = false;               ///< the RAM tier's reads are in the start's pass
     std::chrono::steady_clock::time_point ram_t0_{};
-    bool unread_said_ = false;              ///< `grow` has said that the runtime could not answer
+    int64_t ext_n_ = 0;                     ///< the slots per layer `grow` opens in `ext_`: planned at the start (and by replan)
+    int64_t exact_per_layer_ = 0;           ///< an exact --expert-cache, per layer; 0 when auto
     int64_t lent_per_layer_ = 0;            ///< base slots given up by lend_all(), 0 when none
     std::vector<int32_t> res_;              ///< [layer * n_expert + e] VRAM slot or -1
     std::vector<uint64_t> stamp_;           ///< [layer * n_expert + e] last use
