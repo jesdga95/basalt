@@ -7,7 +7,7 @@
 // Index: every trigram of the history (prompt + accepted output) maps to its WAYS most recent end positions in a
 // fixed-size open-addressing table, and so does every LONG_ORDER-gram in a second one: a common trigram's few slots
 // fill with recent repeats, while the longer key still finds an old source of the text being quoted. Memory is
-// bounded (~64 bytes per history token) and appends are O(1).
+// bounded (128 to 256 bytes per token of capacity) and appends are O(1).
 // A proposal checks the candidates of both, extends each match backwards up to `max_match`, and takes the longest
 // (most recent on ties). Matches shorter than `min_match` propose nothing.
 #pragma once
