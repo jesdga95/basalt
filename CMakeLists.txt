@@ -605,7 +605,7 @@ if(BUILD_TESTING)
   # an NVFP4 n-gram table read through the table reader: the row stride, the metadata table scale, the gather and
   # the refusals (CPU, synthetic file, no model)
   add_executable(ple_nvfp4_test tests/core/ple_nvfp4_test.cpp)
-  target_link_libraries(ple_nvfp4_test PRIVATE engine)
+  target_link_libraries(ple_nvfp4_test PRIVATE model_qwen4exp_engine)
   basalt_embed_manifest(ple_nvfp4_test)
   basalt_cpu_test(NAME ple_nvfp4_test COMMAND ple_nvfp4_test)
   set_tests_properties(ple_nvfp4_test PROPERTIES TIMEOUT 60)
