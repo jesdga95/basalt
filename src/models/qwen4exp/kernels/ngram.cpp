@@ -154,6 +154,16 @@ struct PleTable::Impl {
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q8_0(row + (size_t) b * 34, out160 + b * 32);
             break;
         case PleFormat::NVFP4: nvfp4_dequant_row(row, out160, nvfp4_scale); break;
+        case PleFormat::BF16:
+            for (int j = 0; j < PLE_HEAD_DIM; ++j) {
+                uint16_t u;
+                std::memcpy(&u, row + 2 * (size_t) j, 2);
+                const uint32_t w = (uint32_t) u << 16;
+                float f;
+                std::memcpy(&f, &w, 4);
+                out160[j] = f;
+            }
+            break;
         default: iq4nl_dequant_row(row, out160); break;
         }
     }
