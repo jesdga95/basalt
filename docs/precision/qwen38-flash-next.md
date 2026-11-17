@@ -70,6 +70,28 @@ Measured prefill numbers (NVIDIA-checkpoint NVFP4 pack, 400 W + 180 W, T 3, int8
 | CPU share 0 (all GPU) against 1 (all CPU), NVFP4 DQ6_K, 20 chunks | PPL 2.3046 / 2.3068, KLD 0.07337 / 0.07085, top-1 93.04% / 93.12%; paired +0.0025 [-0.0005, +0.0055] |
 | K-quant MMQ against the FP16 path | rel RMS 1.08e-2 against 5e-4 (MMQ carries int8 activation rounding); 100-chunk gate within run noise |
 
+## Mixed-precision (QAD) checkpoint
+
+NVIDIA's quantization-aware distillation export
+([nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)) quantizes more of the
+model than the plain NVFP4 release, and the pack reads each tensor from the form it is stored in:
+
+| Tensors | Checkpoint | Pack |
+| --- | --- | --- |
+| Routed experts | NVFP4, 4.5 bits | NVFP4_PLANES, codes and scales bit for bit |
+| Shared experts (gate, up) | NVFP4 | Q6_K of their values |
+| Shared experts (down) | NVFP4 | Q8_0 (640-value rows are not whole Q6_K blocks) |
+| GDN qkv, z, out; QSA q, k, v, o | MXFP8 (E4M3, one E8M0 scale per 32) | Q6_K of their values |
+| Sparse indexer; GDN a, b | MXFP8 | BF16 (the kernels read these unquantized) |
+| n-gram table | FP8, one BF16 scale | Q8_0 |
+| Head, token embedding | BF16 | Q8_0 |
+| MTP layer, vision tower, routers, gates | as the NVFP4 release | as the NVFP4 pack |
+
+Q6_K is the finer form: 6-bit codes with a scale per 16 values, against a 4-bit significand with one power-of-two scale
+per 32. It also reads fewer bytes: the 252 projection matrices at 0.820 bytes per value against MXFP8's 1.031, which is
+0.56 GiB less per decoded token (2.16 against 2.72 GiB). The shared experts keep a 4-bit-trained checkpoint in 6 bits
+for the same reason the rest of the pack does: the MoE model's kernels read GGUF block forms.
+
 ## Measured costs
 
 Gate: 100 chunks, 400 W + 180 W, tiers pinned. Paired against the default (Q6_K dense, int8 KV),
@@ -103,6 +125,14 @@ pack alone gives -0.0059 of that. The Q8_0-dense pack is about 7% slower on pros
 
 UD-IQ1_S, converted as shipped (layer 18: IQ2_S gate, IQ2_XXS up; each half on its own format's kernels, the same bits as
 a uniform layer's rows): PPL 3.4049, KLD 0.2676, top-1 82.76% (100 chunks, T 3, int8 KV, resident experts).
+
+The QAD checkpoint's routed experts re-quantized to Q2_0 (`--expert-q2-0`, 2 bits, group 64): PPL 3.4214 against 2.1847 for
+the NVFP4 pack, over the same 20 chunks and 5,100 scored rows (T 3, int8 KV, adaptation off; the base is a fixed dummy, so
+KLD and top-1-against-base are not comparable, but the two packs' rows are). 76.8% of the rows keep the same top-1 token and
+the largest NLL move is 15.4 on a single row. The experts drop from 49.2 to 31.6 GiB (the pack from 123.6 to 91.0), which
+takes the expert working set from 45.5% of the windows served from RAM to 10.4%, and decode runs 674.9 tok/s against 392.4
+(prose 386.0 against 302.4, conv 423.6 against 323.4, struct 826.0 against 670.0; int8 KV, drafting at its default). Prefill
+is 12% slower, 8,590 against 9,777 at 16k and 9,459 against 10,781 at 64k: its expert rows read the 2-bit kernel.
 
 The Q5_0 rows: KLD 0.0943 against 0.0948 on UD-Q3_K_XL, 0.1520 against 0.1517 on UD-Q2_K_XL, tiers auto-sized. The
 device-planned tail runs only when every layer's expert formats are in it, so on these packs the decode rounding moves as well as

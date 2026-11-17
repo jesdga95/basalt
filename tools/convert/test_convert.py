@@ -507,19 +507,44 @@ class PleFp8Test(unittest.TestCase):
             data += raw
             at += len(raw)
         hb = json.dumps(head).encode()
+        want = b"".join(S.fp8_rows_to_q8_0(a, float(np.array([0x3C23 << 16], np.uint32).view(np.float32)[0]))
+                        for a in shards)
+
+        def write(path, entries):
+            head, data, at = {}, b"", 0
+            for k, arr, dt in entries:
+                raw = arr.tobytes()
+                head[k] = {"dtype": dt, "shape": list(arr.shape) if arr.ndim > 1 else [1],
+                           "data_offsets": [at, at + len(raw)]}
+                data += raw
+                at += len(raw)
+            hb = json.dumps(head).encode()
+            path.write_bytes(struct.pack("<Q", len(hb)) + hb + data)
+
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "t.safetensors"
             path.write_bytes(struct.pack("<Q", len(hb)) + hb + data)
             ple = S.PleFp8(str(path), chunk_rows=4)
             self.assertEqual(ple.rows, 8)
-            self.assertAlmostEqual(ple.scale, float((np.uint32(0x3C23) << 16).view(np.float32)), places=9)
+            self.assertAlmostEqual(ple.scale, float(np.array([0x3C23 << 16], np.uint32).view(np.float32)[0]), places=9)
             got = b"".join(S._ple_job(j) for j in ple.jobs())
             self.assertEqual(len(got), ple.nbytes)
-            want = b"".join(S.fp8_rows_to_q8_0(a, ple.scale) for a in shards)
             self.assertEqual(got, want)
             import multiprocessing
             with multiprocessing.Pool(2) as pool:
                 self.assertEqual(b"".join(ple.chunks(pool, depth=2)), want)
+
+            # a consolidated release spreads the shards over several files; the scale sits in one of them
+            a, b = Path(tmp) / "a.safetensors", Path(tmp) / "b.safetensors"
+            write(a, [(stem + "shard_1.weight", shards[1], "F8_E4M3")])
+            write(b, [(stem + "weight_scale", scale_bf16, "BF16"), (stem + "shard_0.weight", shards[0], "F8_E4M3")])
+            split = S.PleFp8([str(a), str(b)], chunk_rows=4)
+            self.assertEqual(split.rows, 8)
+            self.assertEqual(b"".join(S._ple_job(j) for j in split.jobs()), want)
+            # a missing shard is refused, not silently dropped
+            write(a, [(stem + "shard_2.weight", shards[1], "F8_E4M3")])
+            with self.assertRaises(S.ConvertError):
+                S.PleFp8([str(a), str(b)])
 
 
 class BoundedImapTest(unittest.TestCase):
@@ -569,6 +594,17 @@ class Q6KRequantTest(unittest.TestCase):
         self.assertLessEqual(np.abs(vals - x).max(), np.abs(x).max() / 127 * 0.51)
         deq = self.dequant(S.q6_k(vals)).reshape(x.shape)
         self.assertLess(np.sqrt(((deq - x) ** 2).mean()), 0.025 * x.std())
+
+    def test_large_input_quantizes_each_block_once(self):
+        """A matrix of many blocks must quantize each block the same as it does alone: a per-group term that goes
+        wrong only at scale zeroes whole 16-value groups, which both checks below catch."""
+        rng = np.random.default_rng(6)
+        x = (rng.standard_normal((512, 512)) * 0.03).astype(np.float32)       # 1024 blocks
+        blob = S.q6_k(x)
+        self.assertEqual(blob[:len(S.q6_k(x[:8]))], S.q6_k(x[:8]))
+        deq = self.dequant(blob).reshape(x.shape)
+        self.assertLess(np.sqrt(((deq - x) ** 2).mean()), 0.02 * x.std())
+        self.assertLess((deq == 0).mean(), 0.06)
 
     def test_gdn_head_order(self):
         src = S.gdn_block_source()

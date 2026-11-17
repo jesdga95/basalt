@@ -69,6 +69,47 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
 `--mtp-dense FILE` (the `mtp/dense` bytes of an official NVFP4, UD-IQ1_M, UD-IQ2_XS or UD-IQ3_XXS pack) swaps in a tuned drafter layer; the converter
 records it in `meta.mtp.dense`. Output is about 122 GiB (123 GiB for the 8-bit variant). The base's vocabulary must be NVIDIA's.
 
+## Flash-Next mixed-precision (QAD) pack
+
+NVIDIA's quantization-aware distillation export
+([nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)) stores more of the
+model quantized than the plain NVFP4 release: routed and shared experts in NVFP4, the GDN and attention (QSA) projections
+and the sparse indexer in MXFP8, and the n-gram table in FP8, with the vision encoder, the MTP layer, the routers and the
+head left in their own precisions. The converter reads every dense tensor from the form it is stored in and quantizes it
+once for the engine: MXFP8 and NVFP4 projections to Q6_K (Q8_0 where rows are not whole 256-value blocks), the indexer and
+the GDN a/b rows to BF16, the n-gram shards to Q8_0. The routed experts keep their codes and scales. Sections the pack does
+not rebuild (the drafter and the vision tower) come from a base pack.
+
+```sh
+hf download nvidia/Qwen3.8-Flash-Next-NVFP4-QAD --local-dir qad
+
+python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --checkpoint qad \
+    --out Qwen3.8-FN-NVFP4-QAD.basalt --name "Qwen3.8-Flash-Next NVFP4-QAD"
+```
+
+- MXFP8 is E4M3 codes with one E8M0 scale per 32 values; the value is `e4m3 * 2^(scale - 127)`.
+- NVFP4 dense tensors (the shared experts) use the same layout as the experts: E2M1 pairs, one UE4M3 scale per 16 values
+  and one FP32 matrix scale (`weight_scale_2`).
+- FP8 is E4M3 codes with one FP32 matrix scale.
+- The n-gram table is the same FP8 shards the plain NVFP4 release carries, one per tokenizer head; a release that spread
+  them over several files is gathered by shard index.
+- Q6_K carries more precision than the MXFP8 it replaces (6-bit codes with per-16 scales against a 4-bit significand and a
+  power-of-two block scale) and fewer bytes than the 8-bit form, so decode speed and quality both move the same way. The
+  shared experts' NVFP4 codes would be 4.5 bits; they are re-quantized to Q6_K/Q8_0 because the MoE model's kernels read
+  GGUF block forms, which costs about 80 MB per decoded token against keeping them in NVFP4.
+
+`--expert-q2-0` goes the other way for the routed experts: each expert's gate, up and down matrices are decoded from their
+NVFP4 codes and re-quantized to Q2_0 (2 bits, group 64, the form the expert kernels read as S2), so the section carries no
+per-matrix scale. The experts fall from 49.2 to 31.6 GiB and the pack from 123.6 to 91.0. The rounding is not free: over
+20 chunks of wikitext-2 the pack's PPL is 3.4214 against 2.1847 for the NVFP4 one, 76.8% of the scored rows keep the same
+top-1 token, and decode runs 674.9 tok/s against 392.4 on the community preset while the 2-bit prefill path is 12% slower
+(see [precision/qwen38-flash-next.md](../precision/qwen38-flash-next.md)).
+
+```sh
+python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --checkpoint qad --expert-q2-0 \
+    --out Qwen3.8-FN-QAD-Q2_0.basalt --name "Qwen3.8-Flash-Next QAD Q2_0 experts"
+```
+
 ## Qwen3.8-27B pack
 
 The published pack comes from QUASAR's quantization-aware NVFP4 checkpoint
