@@ -38,8 +38,8 @@ constexpr double kProbeChance = 0.85;   // the joint chance at which a drafter w
 
 }  // namespace
 
-DraftPolicy::DraftPolicy(int max_t, double margin)
-    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {}
+DraftPolicy::DraftPolicy(int max_t, double margin, bool timed)
+    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin), timed_(timed) {}
 
 int DraftPolicy::bucket(int match) {
     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
@@ -195,6 +195,7 @@ void DraftPolicy::observe_window(const float* chance, int t, int accepted, doubl
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
     ++round_;
+    if (!timed_) round_ms = kShape[t];
     if (round_ms > 0) {
         if (scale_ <= 0) scale_ = round_ms / kShape[t];          // the first round sets the scale
         if (!recent(t)) {                                        // new, or measured too long ago: start over from

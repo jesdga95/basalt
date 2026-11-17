@@ -247,8 +247,8 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
     ba_win = 0;
     xq_saturated = false;
     prof_rank = rank_new;
-    (*policy) = basalt::spec::DraftPolicy(S);
-    (*bpolicy) = basalt::spec::DraftPolicy(S);
+    (*policy) = basalt::spec::DraftPolicy(S, 0.03, false);
+    (*bpolicy) = basalt::spec::DraftPolicy(S, 0.03, false);
     // a request after this reads its whole prompt
     ckd_finish();
     live.clear();
