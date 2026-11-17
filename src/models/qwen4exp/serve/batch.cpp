@@ -463,7 +463,7 @@ int QfnRuntime::init_batch() {
     // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
     batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
     S_all = S;
-    bpolicy.emplace(S);   // the lookup-or-MTP choice, costs per row
+    bpolicy.emplace(S, 0.03, false);   // the lookup-or-MTP choice, costs per row
     bt_draft = 0;
     bt_draft_last = 0;
     bt_slotwin = 0;
