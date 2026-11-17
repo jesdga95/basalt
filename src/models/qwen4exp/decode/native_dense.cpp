@@ -1,7 +1,6 @@
 #include "basalt/models/qwen4exp/decode/native_dense.hpp"
 #include "basalt/model/adapter.hpp"
-#include "basalt/core/direct_upload.hpp"
-#include "basalt/core/load_progress.hpp"
+#include "basalt/core/loader.hpp"
 #include <cstdlib>
 #include "basalt/core/weights.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
@@ -141,7 +140,8 @@ constexpr uint64_t kSlabAlign = 256;   // matrices start at 256-byte offsets, as
 uint64_t NativeDense::slab_bytes(uint64_t plan_total) { return plan_total + kSlabAlign * 1024; }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, void* slab_at, uint64_t slab_cap) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, void* slab_at, uint64_t slab_cap,
+                       LoadPlan* into) {
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -157,8 +157,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (!plan_bytes(shards, include_ple_key, layer_lo, layer_hi, plan_total, err)) return false;
         int load_dev = 0;
         if (cudaGetDevice(&load_dev) != cudaSuccess) load_dev = 0;
-        LoadProgress progress(LoadProgress::cuda(load_dev), plan_total);
-        DirectUploader uploader;   // unbuffered reads, overlapped with the copies
+        LoadPlan own;   // every matrix's bytes, read after the checks below (or by the caller's pass)
+        LoadPlan& file_plan = into != nullptr ? *into : own;
         // One allocation holds every matrix: separate cudaMalloc calls each round up to the allocator's granularity,
         // which costs about a MiB per matrix.  Matrices start at 256-byte offsets, as separate allocations do.
         constexpr uint64_t kAlign = kSlabAlign;
@@ -273,19 +273,28 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     if (cudaMalloc(&allocation, bytes) == cudaSuccess) own.reset(allocation);
                     where = allocation;
                 }
-                std::string upload_err;
-                if (where == nullptr || !uploader.upload(gguf.path(), gguf.data_start() + tensor.offset, bytes, where, upload_err)) {
-                    err = "native dense upload " + tensor.name + ": " +
-                          (where == nullptr ? std::string("no device memory") : upload_err);
+                if (where == nullptr) {
+                    err = "native dense upload " + tensor.name + ": no device memory";
                     return false;
                 }
+                LoadItem it;
+                it.file = file_plan.file(gguf.path());
+                it.off = gguf.data_start() + tensor.offset;
+                it.bytes = bytes;
+                it.dev = where;
+                it.device = load_dev;
+                file_plan.add(it);
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
-                progress.add(bytes);
                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, where, std::move(own)});
             }
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
+        if (into == nullptr) {
+            Loader loader;
+            std::string upload_err;
+            if (!loader.run(file_plan, upload_err)) { err = "native dense upload: " + upload_err; return false; }
+        }
         void* allocation = nullptr;
         const auto status = cudaMalloc(&allocation, basalt::kernels::native_q8_1_bytes(max_in));
         DevicePtr scratch(allocation);
@@ -302,7 +311,6 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (slab) allocs_.push_back(slab.release());
         scratch_ = scratch.release();
         bytes_ = total;
-        progress.finish();
         return true;
     } catch (const std::exception& error) {
         err = std::string("native dense: ") + error.what();

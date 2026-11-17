@@ -11,6 +11,7 @@
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/loader.hpp"
 #include "basalt/core/ram_load.hpp"
 #include "basalt/program/expert_spill.hpp"
 #include "basalt/program/probe_rates.hpp"
@@ -26,6 +27,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -70,8 +72,11 @@ public:
         uint64_t beside_homes = 0; ///< beside homes and the copies next to them, where a short prompt's workspaces fit
         uint64_t modules = 0;      ///< ... until a first token has loaded the kernel modules
     };
-    /// Sizes the tiers and loads them. `h_rows`: the mapped rows a second card shares with the CPU pool.
-    bool open(const Reserve& reserve, float* h_rows, std::string& err);
+    /// Sizes the tiers and queues their experts' reads in `reads` (the start's one pass places them). `h_rows`: the mapped
+    /// rows a second card shares with the CPU pool.
+    bool open(const Reserve& reserve, float* h_rows, core::LoadPlan& reads, std::string& err);
+    /// Once the experts have landed: the RAM tier pinned, the main card's copies seeded and its slots grown.
+    bool attach(std::string& err);
 
     /// Gives the VRAM slots that the prompt path's workspaces occupy back to the driver (call before they are
     /// allocated); `grow` takes the memory freed after them as extra slots. Residency in those slots is dropped.
@@ -204,7 +209,8 @@ private:
     void land_all();
     void apply(const Pending& p);
     void apply(const PeerMove& m);
-    bool load_ram(std::string& err);
+    bool load_ram(core::LoadPlan& reads, std::string& err);
+    bool land_ram(std::string& err);
     bool open_share(size_t card, std::string& err);
     void fill_share_rates();
     int ranked(int layer, int r) const;
@@ -234,6 +240,8 @@ private:
     int64_t per_layer_ = 0;                 ///< VRAM slots each layer owns in the base arena
     core::ExpertCache ext_;                 ///< slots beside the base arena, open only while no prompt workspace is
     int64_t ext_per_layer_ = 0;             ///< slots each layer owns in `ext_`
+    bool ram_queued_ = false;               ///< the RAM tier's reads are in the start's pass
+    std::chrono::steady_clock::time_point ram_t0_{};
     bool unread_said_ = false;              ///< `grow` has said that the runtime could not answer
     int64_t lent_per_layer_ = 0;            ///< base slots given up by lend_all(), 0 when none
     std::vector<int32_t> res_;              ///< [layer * n_expert + e] VRAM slot or -1

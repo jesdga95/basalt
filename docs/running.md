@@ -5,7 +5,7 @@ Settings: [configuration](configuration/index.md). Diagnostic flags: `bin/basalt
 ## Start-up
 
 The page is up at once and the model loads behind it. The header reads `Loading` with the percent over a progress bar while weights load; choosing a model in the picker loads it. `/health` and `/metrics`
-show the load. A failed start-up load ends the server. Requests wait during a load and get a 503 if it fails.
+show the load: `load.percent` and `load.gib`, the GiB placed so far in one figure over every byte the model loads (a card, a second card, RAM), where it was one figure per target. A failed start-up load ends the server. Requests wait during a load and get a 503 if it fails.
 
 ## Concurrent requests: `--parallel N`
 

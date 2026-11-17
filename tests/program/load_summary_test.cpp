@@ -1,5 +1,5 @@
 // tests/program/load_summary_test.cpp - the load summary basalt-bench prints from the engine's `basalt load:` lines:
-// every line kind, a skipped() re-print, a copy phase, an error and a warning line, the throttling and the terminal
+// the one weights line, the total, a total that moves, an error and a warning line, the throttling and the terminal
 // mode. CPU only; the clock is passed in.
 #include "basalt/program/load_summary.hpp"
 
@@ -16,9 +16,9 @@ void check(bool ok, const std::string& what, const std::string& got = "") {
 void is(const std::string& got, const std::string& want, const std::string& what) { check(got == want, what, got); }
 
 constexpr unsigned long long G = 1ull << 30;
-std::string ld(const std::string& t, double done_gib, double total_gib, bool copy = false) {
-    return std::string("basalt load: ") + (copy ? "copy " : "") + t + " " + std::to_string((unsigned long long) (done_gib * G)) +
-           " " + std::to_string((unsigned long long) (total_gib * G));
+std::string ld(double done_gib, double total_gib) {
+    return "basalt load: weights " + std::to_string((unsigned long long) (done_gib * G)) + " " +
+           std::to_string((unsigned long long) (total_gib * G));
 }
 std::string gb(const char* kind, double v) { return std::string("basalt load: ") + kind + " " + std::to_string((unsigned long long) (v * G)); }
 }  // namespace
@@ -30,56 +30,35 @@ int main() {
         LoadSummary s("basalt-bench", false, 0.0);
         is(s.feed("basalt: some other line", 0.1), "", "an unrelated line prints nothing");
         is(s.feed(gb("total", 52.5), 0.2), "", "the total alone prints nothing");
-        is(s.feed(gb("plan cuda0", 14.0), 0.2), "", "a plan alone prints nothing");
-        is(s.feed(gb("plan ram", 38.0), 0.2), "", "a second plan prints nothing");
-        is(s.feed(gb("plan copy cuda1", 5.0), 0.2), "", "a copy plan prints nothing");
         is(s.feed("basalt load: kv cuda0 1000 4096 1000", 0.3), "", "a kv line is skipped");
-        is(s.feed(ld("cuda0", 0, 14.0), 0.5),
-           "basalt-bench: loading 52.5 GiB: cuda0 0.0 / 14.0 GiB, ram 0.0 / 38.0 GiB, cuda1 copy 0.0 / 5.0 GiB\n",
-           "the first phase line prints the header with every plan");
-        is(s.feed(ld("cuda0", 7.0, 14.0), 1.0), "", "progress inside a phase prints nothing by itself");
-        is(s.feed(ld("cuda0", 14.0, 14.0), 6.5), "basalt-bench: loading cuda0 14.0 / 14.0 GiB done (6 s)\n",
-           "a finished phase prints a done line with its duration");
-        is(s.feed(ld("cuda0", 14.0, 14.0), 6.6), "", "a repeated final line prints nothing more");
-        is(s.feed(ld("ram", 0, 38.0), 7.0), "", "a new target starts silently");
-        is(s.tick(8.0), "", "no periodic line before the period");
-        is(s.feed(ld("ram", 10.0, 38.0), 15.0), "", "progress is not printed on its own");
-        is(s.tick(16.6), "basalt-bench: loading ram 10.0 / 38.0 GiB (26%)\n", "a periodic line after 10 s lists the running target");
-        is(s.tick(20.0), "", "and then waits another period");
-        is(s.feed(ld("ram", 38.0, 38.0), 21.0), "basalt-bench: loading ram 38.0 / 38.0 GiB done (14 s)\n", "the copy to ram finishes");
-        is(s.feed(gb("total", 40.0), 21.1), "", "a skipped() re-print only changes the total");
-        is(s.feed(ld("cuda1", 0, 5.0, true), 21.2), "", "a copy phase starts silently");
-        is(s.tick(31.5), "basalt-bench: loading cuda1 copy 0.0 / 5.0 GiB (0%)\n", "a copy phase is named as one");
-        is(s.feed(ld("cuda1", 5.0, 5.0, true), 33.0), "basalt-bench: loading cuda1 copy 5.0 / 5.0 GiB done (12 s)\n",
-           "and finishes");
+        is(s.feed("basalt load: ngram 1000 3000", 0.3), "", "the n-gram table lock is not the weights");
+        is(s.feed(ld(0, 52.5), 0.5), "basalt-bench: loading 52.5 GiB\n",
+           "the first weights line prints the header with the total");
+        is(s.feed(ld(7.0, 52.5), 1.0), "", "progress prints nothing by itself");
+        is(s.tick(5.0), "", "no periodic line before the period");
+        is(s.tick(10.6), "basalt-bench: loading 7.0 / 52.5 GiB (13%)\n", "a periodic line after 10 s gives the percent");
+        is(s.tick(15.0), "", "and then waits another period");
+        is(s.feed(ld(52.5, 52.5), 21.0), "basalt-bench: loading weights 52.5 / 52.5 GiB done (21 s)\n",
+           "the end prints a done line with the duration");
+        is(s.feed(ld(52.5, 52.5), 21.1), "", "a repeated final line prints nothing more");
+        is(s.tick(40.0), "", "no periodic line once done");
         is(s.feed("basalt error: out of memory on cuda0", 34.0), "basalt-bench: engine: out of memory on cuda0\n",
            "an error line is shown at once without its prefix");
         is(s.feed("basalt generate: error: the weight arena failed", 34.5), "basalt-bench: engine: the weight arena failed\n",
            "a line of any area marked error is shown the same way");
         is(s.feed("basalt generate: warning: the cache is short", 34.6), "basalt-bench: engine: warning: the cache is short\n",
            "a warning line is shown at once with its marker");
-        is(s.feed("basalt: warning: --route-tail-skip 7 drops low-ranked missed experts", 34.65),
-           "basalt-bench: engine: warning: --route-tail-skip 7 drops low-ranked missed experts\n",
-           "a lossy-flag warning is shown the same way");
         is(s.feed("basalt generate: no error here", 34.7), "", "the word error in a message is not a marker");
         is(s.finish(80.0, true), "basalt-bench: engine ready in 80 s\n", "READY prints the ready line");
     }
-    {   // several phases of one target add up against the plan
+    {   // lines that read done == total while the total grows (a phase decided later): the end is reported once
         LoadSummary s("basalt-bench", false, 0.0);
-        s.feed(gb("plan cuda0", 10.0), 0.0);
-        is(s.feed(ld("cuda0", 0, 4.0), 0.0), "basalt-bench: loading cuda0 0.0 / 10.0 GiB\n", "the header without a total");
-        is(s.feed(ld("cuda0", 4.0, 4.0), 1.0), "", "a phase that ends below the plan is not done yet");
-        s.feed(ld("cuda0", 0, 6.0), 2.0);
-        is(s.feed(ld("cuda0", 6.0, 6.0), 3.0), "basalt-bench: loading cuda0 10.0 / 10.0 GiB done (3 s)\n",
-           "the next phase adds on and completes the plan");
-    }
-    {   // a plan above what the phases place: the target is done when the next one starts
-        LoadSummary s("basalt-bench", false, 0.0);
-        s.feed(gb("plan cuda0", 10.0), 0.0);
-        s.feed(ld("cuda0", 0, 9.8), 0.0);
-        is(s.feed(ld("cuda0", 9.8, 9.8), 4.0), "", "a phase below its plan is not reported on its own");
-        is(s.feed(ld("ram", 0, 3.0), 5.0), "basalt-bench: loading cuda0 9.8 / 9.8 GiB done (4 s)\n",
-           "and is reported done when the next target starts");
+        s.feed(ld(0, 10.0), 0.0);
+        is(s.feed(ld(10.0, 10.0), 3.0), "basalt-bench: loading weights 10.0 / 10.0 GiB done (3 s)\n", "the first end");
+        is(s.feed(ld(10.5, 10.5), 3.25), "", "an equal line after a raised total prints nothing");
+        is(s.feed(ld(11.0, 11.0), 3.5), "", "nor the next");
+        is(s.feed(ld(11.0, 11.0), 3.75), "", "nor a repeat");
+        is(s.tick(30.0), "", "and no periodic line follows");
     }
     {   // a failure prints no ready line
         LoadSummary s("basalt-probe", false, 0.0);
@@ -89,22 +68,18 @@ int main() {
     {   // a terminal
         LoadSummary s("basalt-bench", true, 0.0);
         s.feed(gb("total", 52.0), 0.0);
-        s.feed(gb("plan cuda0", 14.0), 0.0);
-        s.feed(gb("plan ram", 38.0), 0.0);
-        const std::string a = s.feed(ld("cuda0", 0, 14.0), 0.1);
-        is(a, "\r\x1b[2Kbasalt-bench: loading cuda0 0.0/14.0 GiB \xC2\xB7 0% \xC2\xB7 0 s", "the first line is drawn in place");
-        is(s.feed(ld("cuda0", 7.0, 14.0), 0.3), "", "a redraw closer than the interval is held back");
-        is(s.feed(ld("cuda0", 14.0, 14.0), 0.4),
-           "\r\x1b[2Kbasalt-bench: loading cuda0 14.0/14.0 GiB \xC2\xB7 26% \xC2\xB7 0 s", "a finished phase redraws at once");
-        s.feed(ld("ram", 0, 38.0), 0.5);
-        is(s.tick(1.2), "\r\x1b[2Kbasalt-bench: loading cuda0 14.0/14.0 GiB \xC2\xB7 ram 0.0/38.0 GiB \xC2\xB7 26% \xC2\xB7 1 s",
+        const std::string a = s.feed(ld(0, 52.0), 0.1);
+        is(a, "\r\x1b[2Kbasalt-bench: loading weights 0.0/52.0 GiB \xC2\xB7 0% \xC2\xB7 0 s", "the first line is drawn in place");
+        is(s.feed(ld(14.0, 52.0), 0.3), "", "a redraw closer than the interval is held back");
+        is(s.tick(1.2), "\r\x1b[2Kbasalt-bench: loading weights 14.0/52.0 GiB \xC2\xB7 26% \xC2\xB7 1 s",
            "the clock redraws with time passing");
         is(s.feed("basalt error: bad", 1.3), "\r\x1b[2Kbasalt-bench: engine: bad\n", "an error clears the line and prints its own");
-        s.feed(ld("ram", 10.0, 38.0), 1.4);
+        is(s.feed(ld(30.0, 52.0), 1.4), "\r\x1b[2Kbasalt-bench: loading weights 30.0/52.0 GiB \xC2\xB7 57% \xC2\xB7 1 s",
+           "the line is drawn again after it");
         is(s.feed("basalt: warning: slow", 1.5), "\r\x1b[2Kbasalt-bench: engine: warning: slow\n", "so does a warning");
-        s.feed(ld("ram", 21.0, 38.0), 2.0);
+        s.feed(ld(52.0, 52.0), 2.0);
         is(s.finish(41.0, true),
-           "\r\x1b[2Kbasalt-bench: loading cuda0 14.0/14.0 GiB \xC2\xB7 ram 21.0/21.0 GiB \xC2\xB7 100% \xC2\xB7 41 s\n"
+           "\r\x1b[2Kbasalt-bench: loading weights 52.0/52.0 GiB \xC2\xB7 100% \xC2\xB7 41 s\n"
            "basalt-bench: engine ready in 41 s\n",
            "READY leaves the last status line and adds the ready line");
     }

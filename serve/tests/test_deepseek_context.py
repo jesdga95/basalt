@@ -77,7 +77,7 @@ class EngineSide(unittest.TestCase):
         self.assertIn("lreq.max_context = o.max_context;", self.src)
 
     def test_the_ready_line_reports_the_models_resolved_context(self):
-        self.assertIn("if (loaded->context() != 0) o.max_context = loaded->context();", self.src)
+        self.assertIn("if (started.model->context() != 0) o.max_context = started.model->context();", self.src)
 
     def test_the_rope_flags_are_not_common_flags(self):
         self.assertNotIn("--rope-scale", self.src)

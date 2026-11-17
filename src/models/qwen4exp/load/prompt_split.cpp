@@ -1,3 +1,4 @@
+#include "basalt/core/prompt_stage.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
@@ -58,7 +59,7 @@ int split_plan(Context& context) {
                                   split_host_gbps, devs.size());
         }
         if (off != nullptr) {
-            basalt::log::info("basalt generate", "prompt split: off (%s)", off);
+            basalt::core::log_prompt_split_off("basalt generate", off);
             split_want = false;
             pstages.clear();
         }
@@ -80,7 +81,7 @@ int split_plan(Context& context) {
             for (int b = 0; ok && b < 2 * basalt::core::StagedCopy::kBufs; ++b) ok = basalt::core::host_plan(8u << 20);
         }
         if (!ok) {
-            basalt::log::info("basalt generate", "prompt split: off (RAM for its buffers)");
+            basalt::core::log_prompt_split_off("basalt generate", "RAM for its buffers");
             err.clear();
             split_want = false;
             pstages.clear();
@@ -118,13 +119,13 @@ int prompt_split(Context& context) {
 
     // the split reads the experts its cards lack from the RAM copy: without one it is off
     if (split_want && !src.complement_ready()) {
-        basalt::log::info("basalt generate", "prompt split: off (no RAM copy of the experts)");
+        basalt::core::log_prompt_split_off("basalt generate", "no RAM copy of the experts");
         split_want = false;
         pstages.clear();
     }
     // ---- the peer's experts: the ranked pairs the primary does not hold.  Without --peer-exclusive they are copies of
     // experts the RAM complement holds, so with the complement built they are read from it, not from the file.
-    if (o.peer_device >= 1 && !peer.valid() && !open_peer(false)) return 1;
+    if (o.peer_device >= 1 && !peer.valid() && !open_peer()) return 1;
     for (auto& st : pstages) st->tier = st->tier_at == 0 ? &peer : xpeers[st->tier_at - 1].get();
     // ---- the prompt-time split's price (price_prompt_split): each card's side of a part read, from what its slots hold
     // The largest chunk a read alone takes now (the loan's chunk follows the slots left: see relend).  The split reads a
@@ -281,20 +282,23 @@ int prompt_split(Context& context) {
         const engine_local::SplitPricing ref = ok && split_cap >= 2 && split_cap < all ? split_price(0, longest, longest, split_cap) : ref_all;
         for (auto& st : pstages) st->lo = st->hi = 0, st->image_bytes = 0;
         if (!ok) {
-            basalt::log::info("basalt generate", "prompt split: off (its weights' sizes: %s)", err.c_str());
+            basalt::core::log_prompt_split_off("basalt generate", "its weights' sizes: " + err);
             err.clear();
         } else if (ref.chunk <= 0) {
-            basalt::log::info("basalt generate", "prompt split: off (a %lld-token context is too short for it)",
-                              (long long) o.max_context);
+            basalt::core::log_prompt_split_off("basalt generate", "a " + std::to_string((long long) o.max_context) +
+                                                                      "-token context is too short for it");
         } else if (split_cap < 2) {
-            basalt::log::info("basalt generate", "prompt split: off on %zu unlike cards until measured there (a %lld-token "
-                                 "prompt: %.0f ms on CUDA0, %.0f ms with %s%s)",
-                              pstages.size() + 1, (long long) longest, ref_all.price.tier_ms, ref_all.price.split_ms,
-                              split_layers_text(ref_all.price.stages, ref_all.price.cuts).c_str(),
-                              split_stages_text(ref_all.price).c_str());
+            char why[320];
+            std::snprintf(why, sizeof why, "%zu unlike cards, until measured there: a %lld-token prompt %.0f ms on CUDA0, "
+                          "%.0f ms with %s%s", pstages.size() + 1, (long long) longest, ref_all.price.tier_ms,
+                          ref_all.price.split_ms, split_layers_text(ref_all.price.stages, ref_all.price.cuts).c_str(),
+                          split_stages_text(ref_all.price).c_str());
+            basalt::core::log_prompt_split_off("basalt generate", why);
         } else if (!ref.price.split) {
-            basalt::log::info("basalt generate", "prompt split: off (a %lld-token prompt: %.0f ms on CUDA0, %.0f ms across%s)",
-                              (long long) longest, ref.price.tier_ms, ref.price.split_ms, split_stages_text(ref.price).c_str());
+            char why[256];
+            std::snprintf(why, sizeof why, "a %lld-token prompt: %.0f ms on CUDA0, %.0f ms across%s", (long long) longest,
+                          ref.price.tier_ms, ref.price.split_ms, split_stages_text(ref.price).c_str());
+            basalt::core::log_prompt_split_off("basalt generate", why);
         } else {
             // each card's window, and the stages that have one (a prefix of the join order)
             const std::vector<std::pair<int, int>> win =
@@ -320,7 +324,7 @@ int prompt_split(Context& context) {
                 images += st.image_bytes;
             }
             if (!ok) {
-                basalt::log::info("basalt generate", "prompt split: off (its weights' sizes)");
+                basalt::core::log_prompt_split_off("basalt generate", "its weights' sizes");
                 err.clear();
             } else {
                 // its pinned RAM (the weights' images, the two hand-off buffers of each card that hands chunks on, the
@@ -332,9 +336,10 @@ int prompt_split(Context& context) {
                 const uint64_t keep = basalt::platform::ram_reserve();
                 const uint64_t avail = basalt::platform::available_memory() + basalt::core::host_plan_bytes();
                 if (avail < need + keep) {
-                    basalt::log::info("basalt generate", "prompt split: off (RAM: %.1f GiB free, it takes %.1f GiB beside "
-                                         "%.1f GiB kept)", (double) avail / 1073741824.0, (double) need / 1073741824.0,
-                                      (double) keep / 1073741824.0);
+                    char why[160];
+                    std::snprintf(why, sizeof why, "RAM: %.1f GiB free, it takes %.1f GiB beside %.1f GiB kept",
+                                  (double) avail / 1073741824.0, (double) need / 1073741824.0, (double) keep / 1073741824.0);
+                    basalt::core::log_prompt_split_off("basalt generate", why);
                 } else {
                     split_stages = std::min((int) pstages.size() + 1, split_cap);
                 }
@@ -342,42 +347,53 @@ int prompt_split(Context& context) {
         }
         if (split_stages == 0) pstages.clear();
     }
-    // each stage's weights are loaded where a split read places them, in tier slots lent for the load, copied into pinned
-    // RAM, and the slots get their experts back: the tiers are as without the split
-    for (size_t j = 0; j < pstages.size(); ++j) {
+    // each stage's weights: the page-locked image a split read takes to the card's last slots, laid out for those slots,
+    // and filled in the start's pass from the bytes it places on CUDA0 (a range CUDA0 does not hold is read from the file).
+    // The images join the pass once every stage has its own.
+    std::vector<basalt::core::LoadPlan> images(pstages.size());
+    for (size_t j = 0; j < pstages.size() && split_stages > 0; ++j) {
         PromptStage& st = *pstages[j];
         const basalt::core::OnDevice on(st.dev);
         const basalt::core::ExpertCache& pc = st.tier->cache();
         uint8_t* base = const_cast<uint8_t*>(pc.device_slot(0));
         uint8_t* w_at = (uint8_t*) ((uintptr_t) (base + pc.bytes() - st.image_bytes) & ~(uintptr_t) 255);
         const int64_t k = serve_loans::cache_slots_for(pc, (uint64_t) (base + pc.bytes() - w_at));
-        bool ok = k > 0 && k < pc.slots() / 2 && st.tier->lend((int32_t) (pc.slots() - k), st.lent, err) &&
-                  st.wt.load(pack_files, w_at, st.pool, err, &st.skip, false);
+        bool ok = k > 0 && k < pc.slots() / 2 &&
+                  basalt::core::host_alloc((void**) &st.image, st.image_bytes, cudaHostAllocPortable) == cudaSuccess &&
+                  st.wt.load(pack_files, w_at, st.pool, err, &st.skip, true, &images[j]);
         if (ok) {
             basalt::core::NativeDense::set_layer_range((int) st.lo, (int) st.hi);
-            ok = st.dense.load(o.native_shards, st.wt, err, true, 0, -1, w_at + st.arena_bytes,
-                               st.image_bytes - st.arena_bytes);
+            ok = st.dense.load(o.native_shards, st.wt, err, true, 0, -1, w_at + st.arena_bytes, st.image_bytes - st.arena_bytes,
+                               &images[j]);
             basalt::core::NativeDense::set_layer_range(-1, -1);
         }
-        ok = ok && cudaDeviceSynchronize() == cudaSuccess &&   // (the uploads ran on their own streams)
-             basalt::core::host_alloc((void**) &st.image, st.image_bytes, cudaHostAllocPortable) == cudaSuccess &&
-             cudaMemcpy(st.image, w_at, st.image_bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
-        std::string ge;
-        if (!(st.tier->give_back(st.lent, ge) && st.tier->give_back_wait(st.lent, ge))) {
-            basalt::log::error("basalt generate", "prompt split: refilling the tier: %s", ge.c_str());
-            return 1;
+        if (ok) {
+            images[j].to_host(w_at, st.image_bytes, st.image);
+            continue;
         }
-        if (!ok) {
-            (void) cudaGetLastError();
-            basalt::log::warn("basalt generate", "prompt split: off (CUDA%d's weights: %s)", st.dev,
-                              err.empty() ? "no memory" : err.c_str());
-            err.clear();
-            for (auto& x : pstages)
-                if (x->image != nullptr) cudaFreeHost(x->image);
-            pstages.clear();
-            split_stages = 0;
-        }
+        (void) cudaGetLastError();
+        basalt::core::log_prompt_split_off("basalt generate", "CUDA" + std::to_string(st.dev) + "'s weights: " +
+                                                                   (err.empty() ? std::string("no memory") : err), true);
+        err.clear();
+        for (auto& x : pstages)
+            if (x->image != nullptr) cudaFreeHost(x->image);
+        pstages.clear();
+        split_stages = 0;
     }
+    if (split_stages > 0) {
+        std::vector<basalt::core::PromptStage> on;
+        for (size_t j = 0; j < pstages.size(); ++j) {
+            context.reads->append_reusing(images[j]);
+            on.push_back({pstages[j]->dev, (int) pstages[j]->lo, (int) pstages[j]->hi, basalt::core::StageHome::PinnedRam,
+                          pstages[j]->image_bytes});
+        }
+        basalt::core::log_prompt_split("basalt generate", on);
+    }
+    // ---- the start's one pass: every byte the phases queued lands, then what needs them landed runs
+    if (!basalt::core::place_start(*context.loader, *context.reads, err)) return fatal_start_error("reading the model: " + err);
+    for (auto& step : *context.after)
+        if (!step(err)) return fatal_start_error(err);
+    context.after->clear();
     drive.d.peer = peer.valid() ? &peer : nullptr;
 
     context.read_cap = read_cap;

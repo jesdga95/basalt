@@ -1,4 +1,4 @@
-// tests/models/qwen35/prompt_line_test.cpp - the prompt line (a second card reading a long prompt's last layers) leaves the
+// tests/models/qwen35/prompt_split_test.cpp - the prompt split (a second card reading a long prompt's last layers) leaves the
 // session as a read on the main card alone does: after a long prompt the running state (recurrent state, the drafter's
 // context) has the same bytes and the greedy tokens that follow, which read every KV cell, are the same; a read stopped part-way ends
 // within a few chunks and the same session then reads the prompt again to the same bytes.  Needs a 27B pack (argument or
@@ -58,24 +58,24 @@ std::vector<uint8_t> save(model::ModelSession& s, int64_t pos) {
 struct Read {
     std::vector<uint8_t> state;      // the running state after the whole prompt
     std::vector<int32_t> tokens;     // greedy tokens after it
-    std::vector<uint8_t> state_again;   // after a stopped read and a second whole one (the line's session only)
+    std::vector<uint8_t> state_again;   // after a stopped read and a second whole one (the stage's session only)
     int stopped_at = 0;              // tokens the stopped read had read when it ended
 };
 
 // A model with (or without) the second card, a session, `n` prompt tokens read; with `stop_test`, a read that is stopped
 // after its second progress report, then the whole prompt again.
-Read run(const model::ModelAdapter& a, const std::string& pack, bool line, bool draft, bool int8, int n, bool stop_test) {
+Read run(const model::ModelAdapter& a, const std::string& pack, bool stage, bool draft, bool int8, int n, bool stop_test) {
     model::LoadRequest req;
     req.paths = {pack};
     req.max_context = n + 256;
     req.draft = draft;
     req.spec = draft ? 16 : 0;
     if (int8) req.kv = "int8";
-    if (line) req.peer_devices = {1};
-    std::unique_ptr<model::LoadedModel> loaded;
-    if (const model::Result e = a.load(req, loaded); !e.ok()) die("load", e.message);
-    std::unique_ptr<model::ModelSession> s;
-    if (const model::Result e = loaded->make_session(s); !e.ok() || !s->prepare().ok()) die("session", e.message);
+    if (stage) req.peer_devices = {1};
+    model::Started started;
+    if (const model::Result e = a.start(req, started); !e.ok()) die("start", e.message);
+    std::unique_ptr<model::ModelSession>& s = started.sessions.front();
+    if (const model::Result e = s->prepare(); !e.ok()) die("session", e.message);
     std::vector<int32_t> prompt((size_t) n);
     uint32_t x = 12345;
     for (int i = 0; i < n; ++i) {
@@ -109,7 +109,7 @@ Read run(const model::ModelAdapter& a, const std::string& pack, bool line, bool 
 
 void compare(const model::ModelAdapter& a, const std::string& pack, bool draft, bool int8) {
     const std::string tag = std::string(draft ? " (drafter on, " : " (plain, ") + (int8 ? "int8 KV)" : "fp16 KV)");
-    const int n = 30000;   // 3 whole chunks short of 4: the line splits it and the main card reads the last chunks
+    const int n = 30000;   // 3 whole chunks short of 4: the stage splits it and the main card reads the last chunks
     const Read one = run(a, pack, false, draft, int8, n, false);
     const Read two = run(a, pack, true, draft, int8, n, false);
     check(one.state.size() == two.state.size() && one.state == two.state, "the state after a long prompt has the same bytes on two cards" + tag);

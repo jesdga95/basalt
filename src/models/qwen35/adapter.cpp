@@ -4,7 +4,8 @@
 
 #include "basalt/core/diag.hpp"
 #include "basalt/core/on_device.hpp"
-#include "basalt/core/load_progress.hpp"
+#include "basalt/core/loader.hpp"
+#include "basalt/core/prompt_stage.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/model/rope_flags.hpp"
@@ -127,19 +128,33 @@ public:
         model_.reset();
         for (auto& [dev, b] : blocks_) cudaFree(b.base);
         if (embd_) cudaFreeHost(embd_);
-        if (fd_ >= 0) platform::close_fd(fd_);
     }
 
     const model::ModelDesc& desc() const override { return desc_; }
 
-    model::Result make_session(std::unique_ptr<model::ModelSession>& out) override {
+    // The weights and the model are planned, the sessions made in attach(): the prompt split times its cards on the landed
+    // weights before them, as it is measured.
+    model::Result plan(const model::LoadRequest& req, core::LoadPlan& reads, std::vector<std::unique_ptr<model::ModelSession>>&) override {
         std::string err;
-        out = dense::make_session(*model_, err);
-        if (!out) return {model::Status::Error, err};
+        if (req.paths.empty()) return {model::Status::Error, "qwen35: no model path"};
+        if (!plan_load(req, reads, err)) return {model::Status::Error, err};
         return {};
     }
 
-    bool load(const model::LoadRequest& req, std::string& err) {
+    model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override {
+        if (std::string err; !dense::attach_drafter(*model_, err)) return {model::Status::Error, err};
+        if (stage_.device >= 0) attach_stage();
+        for (int i = 0; i < std::max(req.sessions, 1); ++i) {
+            std::string err;
+            std::unique_ptr<model::ModelSession> s = dense::make_session(*model_, err);
+            if (!s) return {model::Status::Error, err};
+            sessions.push_back(std::move(s));
+        }
+        return {};
+    }
+
+private:
+    bool plan_load(const model::LoadRequest& req, core::LoadPlan& reads, std::string& err) {
         const std::string& path = req.paths.front();
         const GgufFile gg(path);
         desc_ = describe_meta(gg);
@@ -171,25 +186,8 @@ public:
         dense::BlockDrafter bd_meta;
         if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;
         if (!req.peer_devices.empty() && !plan_cards(gg, g, o, bd_meta, req, err)) return false;
-        fd_ = platform::open_fd_utf8(path);
-        if (fd_ < 0) {
-            err = "cannot open " + path;
-            return false;
-        }
-        uint64_t total = 0;
-        for (const TensorInfo& t : gg.tensors())
-            if (!t.name.starts_with("mtp.")) total += tensor_payload_bytes(t);
-        // a layer split's later layers count on the second card
-        uint64_t peer_total = 0;
-        for (const TensorInfo& t : gg.tensors())
-            if (split_at_ > 0 && t.name.starts_with("blk.") && std::atoi(t.name.c_str() + 4) >= split_at_) peer_total += tensor_payload_bytes(t);
-        core::LoadProgress::announce_total(total);
-        core::LoadProgress::plan(core::LoadProgress::cuda(0), total - peer_total);
-        if (peer_total) core::LoadProgress::plan(core::LoadProgress::cuda(req.peer_devices.front()), peer_total);
-        core::LoadProgress progress(core::LoadProgress::cuda(0), total - peer_total);
-        std::optional<core::LoadProgress> peer_progress;
-        if (peer_total) peer_progress.emplace(core::LoadProgress::cuda(req.peer_devices.front()), peer_total);
-        progress_ = &progress;
+        plan_file_ = plan_.file(path);
+        stage_file_ = stage_plan_.file(path);
         {   // each card's weights in one block: the main card's, and a split's later layers on the second card
             const int end = split_at_ > 0 ? split_at_ : g.n_layers;
             if (!reserve_block(gg, o, 0, end, err)) return false;
@@ -198,6 +196,8 @@ public:
                 if (!reserve_block(gg, o, split_at_, g.n_layers, err)) return false;
             }
         }
+        // the prompt split's copy of the last layers: its card's block reserved now, its weights read in the start's pass
+        if (split_at_ == 0 && !req.peer_devices.empty()) plan_stage(gg, g, req.peer_devices.front(), o.max_context, o.kv_resident);
         dense::Weights w;
         const int H = g.n_embd;
         // the token embedding stays in page-locked host memory; the kernels read the rows they need
@@ -207,11 +207,14 @@ public:
             err = "out of page-locked memory for the token embedding";
             return false;
         }
-        if (!platform::pread_all(fd_, embd_, tensor_payload_bytes(*te), gg.data_start() + te->offset)) {
-            err = "short read of token_embd.weight";
-            return false;
+        {   // read into the page-locked host memory with the rest
+            core::LoadItem it;
+            it.file = plan_file_;
+            it.off = gg.data_start() + te->offset;
+            it.bytes = tensor_payload_bytes(*te);
+            it.host = (uint8_t*) embd_;
+            plan_.add(it);   // (the token embedding is host memory: never the stage's)
         }
-        progress.add(tensor_payload_bytes(*te));
         void* dev_embd = nullptr;
         cudaHostGetDevicePointer(&dev_embd, embd_, 0);
         w.embd = (const uint16_t*) dev_embd;
@@ -226,10 +229,7 @@ public:
             if (split_at_ > 0 && il >= split_at_) {
                 const uint64_t before = dev_bytes_;
                 const core::OnDevice on(req.peer_devices.front());
-                progress_ = &*peer_progress;
-                const bool ok = layer(gg, g, il, P, err);
-                progress_ = &progress;
-                if (!ok) return false;
+                if (!layer(gg, g, il, P, err)) return false;
                 peer_bytes_ += dev_bytes_ - before;
                 dev_bytes_ = before;
             } else if (!layer(gg, g, il, L, err)) {
@@ -237,6 +237,20 @@ public:
             }
             w.layers.push_back(L);
             peer_w.layers.push_back(P);
+        }
+        dense::Weights stage_w;   // the prompt split's layers on its card (empty entries below them), queued on their own
+        if (stage_.device >= 0) {
+            const uint64_t before = dev_bytes_;
+            const core::OnDevice on(stage_.device);
+            queue_to_ = &stage_plan_;
+            for (int il = 0; il < g.n_layers; ++il) {
+                dense::Layer L;
+                L.kind = g.kinds[(size_t) il];
+                if (il >= stage_.lo && !layer(gg, g, il, L, err)) return false;
+                stage_w.layers.push_back(L);
+            }
+            queue_to_ = &plan_;
+            dev_bytes_ = before;
         }
         if (want_block && !block_drafter(gg, w.dflash, H, err)) return false;
         if (want_mtp) {   // the pack's drafter layer, for --spec
@@ -258,9 +272,6 @@ public:
                 return false;
             d.present = true;
         }
-        progress.finish();
-        if (peer_progress) peer_progress->finish();
-        progress_ = nullptr;
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         basalt::log::info("basalt qwen35", "%zu tensors, %.2f GiB on the GPU, %.2f GiB of embedding in page-locked RAM; "
@@ -284,7 +295,7 @@ public:
                                                                              o.kv_resident, 0, split_at_) +
                                 (req.peer_devices.empty() ? 0
                                  : split_at_ > 0           ? dense::stage_main_bytes(g, w.dflash)
-                                                           : dense::prompt_line_main_bytes(g, w.dflash, o.max_context));
+                                                           : dense::prompt_split_main_bytes(g, w.dflash, o.max_context));
         if (const uint64_t host_b = dense::session_host_bytes(g, o.max_context, o.kv_int8, o.kv_resident))
             basalt::log::info("basalt qwen35", "K/V streaming: %lld of %lld cells per attention layer in VRAM, %.2f GiB in page-locked "
                               "RAM per slot", (long long) dense::resident_cells(o.max_context, o.kv_resident), (long long) o.max_context,
@@ -298,12 +309,13 @@ public:
         }
         model_ = dense::make_model(g, w, o, err);
         if (!model_) return false;
-        if (split_at_ > 0) return dense::attach_split(*model_, req.peer_devices.front(), split_at_, peer_w, err);
-        if (!req.peer_devices.empty()) prompt_line(gg, g, req.peer_devices.front(), o.max_context, o.kv_resident);
+        if (split_at_ > 0 && !dense::attach_split(*model_, req.peer_devices.front(), split_at_, peer_w, err)) return false;
+        if (stage_.device >= 0) plan_stage_memory(stage_w);
+        reads.append(plan_);
+        if (stage_.device >= 0) reads.append(stage_plan_);
         return true;
     }
 
-private:
     // Where the layers go with a second card (plan_pack); --diag-split-at takes its cut as given.
     bool plan_cards(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd,
                     const model::LoadRequest& req, std::string& err) {
@@ -321,46 +333,63 @@ private:
         return true;
     }
 
-    // A second card reads long prompts' last layers (dense::attach_prompt_line): their weights go to that card too.  Without
-    // room for it there the prompts stay on the main card.
-    void prompt_line(const GgufFile& gg, const dense::Geometry& g, int dev, int64_t max_context, int64_t kv_resident) {
-        const int l_min = std::max(0, g.n_layers - dense::kPromptLineLayers);
-        int main_dev = 0;
-        cudaGetDevice(&main_dev);
-        if (dense::resident_cells(max_context, kv_resident) < max_context) {   // the line copies cells between the cards' caches
-            basalt::log::info("basalt qwen35", "prompt line off: K/V streaming (--kv-resident) keeps part of the cache in RAM");
+    // The prompt split's one stage: a second card reads long prompts' last layers (dense::plan_prompt_split), their weights
+    // resident there.  Its block is reserved here, before the rest is sized; without room on that card the prompts stay on
+    // the main card.
+    void plan_stage(const GgufFile& gg, const dense::Geometry& g, int dev, int64_t max_context, int64_t kv_resident) {
+        if (dense::resident_cells(max_context, kv_resident) < max_context) {   // the stage copies cells between the cards' caches
+            core::log_prompt_split_off("basalt qwen35", "K/V streaming (--kv-resident) keeps part of the cache in RAM");
             return;
         }
-        if (dense::prompt_line_main_bytes(g, dense::BlockDrafter{}, max_context) == 0) {   // before the weights go over
-            basalt::log::info("basalt qwen35", "prompt line off: a context of %lld holds no prompt that a second card would read",
-                              (long long) max_context);
+        if (dense::prompt_split_main_bytes(g, dense::BlockDrafter{}, max_context) == 0) {
+            core::log_prompt_split_off("basalt qwen35", "a context of " + std::to_string((long long) max_context) +
+                                                               " holds no prompt that a second card would read");
             return;
         }
-        const uint64_t main_bytes = dev_bytes_;
+        const int l_min = std::max(0, g.n_layers - dense::kPromptSplitLayers);
         std::string err;
-        dense::Weights lw;
-        bool ok = cudaSetDevice(dev) == cudaSuccess;
-        if (!ok) err = "qwen35: cannot use CUDA" + std::to_string(dev);
-        dense::Options lo;
-        ok = ok && reserve_block(gg, lo, l_min, g.n_layers, err);
-        for (int il = 0; ok && il < g.n_layers; ++il) {
-            dense::Layer L;
-            L.kind = g.kinds[(size_t) il];
-            if (il >= l_min) ok = layer(gg, g, il, L, err);
-            lw.layers.push_back(L);
+        bool ok = false;
+        {
+            const core::OnDevice on(dev);
+            ok = reserve_block(gg, dense::Options{}, l_min, g.n_layers, err);
         }
-        const uint64_t line_bytes = dev_bytes_ - main_bytes;
-        dev_bytes_ = main_bytes;
-        cudaSetDevice(main_dev);
-        if (ok) basalt::log::info("basalt qwen35", "prompt line: layers %d-%d (%.2f GiB) on CUDA%d, read beside the main card's on CUDA%d", l_min,
-                                  g.n_layers - 1, (double) line_bytes / 1073741824.0, dev, main_dev);
-        if (ok && dense::attach_prompt_line(*model_, dev, l_min, lw, err)) return;
-        basalt::log::warn("basalt qwen35", "prompt line off, prompts read on CUDA%d: %s", main_dev, err.c_str());
-        if (auto it = blocks_.find(dev); it != blocks_.end()) {
+        if (!ok) {
+            core::log_prompt_split_off("basalt qwen35", err, true);
+            return;
+        }
+        stage_ = core::PromptStage{dev, l_min, g.n_layers, core::StageHome::Card, 0};
+        for (const TensorInfo& t : gg.tensors())
+            if (t.name.starts_with("blk.") && std::atoi(t.name.c_str() + 4) >= l_min) stage_.bytes += tensor_payload_bytes(t);
+    }
+
+    // The stage's memory beside its weights' block, before the sessions; when it does not fit, the split is off and its
+    // weights are not read.
+    void plan_stage_memory(const dense::Weights& sw) {
+        std::string err;
+        if (dense::plan_prompt_split(*model_, stage_.device, stage_.lo, sw, err)) return;
+        core::log_prompt_split_off("basalt qwen35", err, true);
+        drop_stage();
+    }
+
+    // Once its weights have landed the stage times both cards; the split is on, or off and its block freed.
+    void attach_stage() {
+        std::string err;
+        if (dense::attach_prompt_split(*model_, err)) {
+            core::log_prompt_split("basalt qwen35", {stage_});
+            return;
+        }
+        core::log_prompt_split_off("basalt qwen35", err, true);
+        drop_stage();
+    }
+
+    void drop_stage() {
+        if (auto it = blocks_.find(stage_.device); it != blocks_.end()) {
             cudaFree(it->second.base);
             blocks_.erase(it);
         }
         (void) cudaGetLastError();
+        stage_ = core::PromptStage{};
+        stage_plan_ = core::LoadPlan();
     }
 
     // layer il's weights (on the current device)
@@ -495,19 +524,20 @@ private:
     void* upload(const GgufFile& gg, const TensorInfo& t, std::string& err) {
         void* d = take(tensor_payload_bytes(t), t.name, err);
         if (!d) return nullptr;
-        constexpr uint64_t kChunk = 64ull << 20;
-        staging_.resize((size_t) std::min<uint64_t>(tensor_payload_bytes(t), kChunk));
-        for (uint64_t off = 0; off < tensor_payload_bytes(t); off += kChunk) {
-            const uint64_t n = std::min<uint64_t>(kChunk, tensor_payload_bytes(t) - off);
-            if (!platform::pread_all(fd_, staging_.data(), n, gg.data_start() + t.offset + off) ||
-                cudaMemcpy((char*) d + off, staging_.data(), n, cudaMemcpyHostToDevice) != cudaSuccess) {
-                err = "qwen35: reading " + t.name + " failed";
-                return nullptr;
-            }
-            if (progress_) progress_->add(n);
-        }
+        queue(gg, t, d);
         dev_bytes_ += tensor_payload_bytes(t);
         return d;
+    }
+
+    // `t`'s bytes to device memory `dst` on the current device, read in the start's one pass
+    void queue(const GgufFile& gg, const TensorInfo& t, void* dst) {
+        core::LoadItem it;
+        it.file = queue_to_ == &plan_ ? plan_file_ : stage_file_;
+        it.off = gg.data_start() + t.offset;
+        it.bytes = tensor_payload_bytes(t);
+        it.dev = dst;
+        cudaGetDevice(&it.device);
+        queue_to_->add(it);
     }
 
     const float* floats(const GgufFile& gg, const std::string& name, int64_t elems, std::string& err) {
@@ -524,14 +554,8 @@ private:
         if (!d) return nullptr;
         uint64_t at = 0;
         for (const TensorInfo* t : {ta, tb}) {
-            staging_.resize((size_t) tensor_payload_bytes(*t));
-            if (!platform::pread_all(fd_, staging_.data(), tensor_payload_bytes(*t), gg.data_start() + t->offset) ||
-                cudaMemcpy((char*) d + at, staging_.data(), tensor_payload_bytes(*t), cudaMemcpyHostToDevice) != cudaSuccess) {
-                err = "qwen35: reading " + t->name + " failed";
-                return nullptr;
-            }
+            queue(gg, *t, (char*) d + at);
             at += tensor_payload_bytes(*t);
-            if (progress_) progress_->add(tensor_payload_bytes(*t));
         }
         dev_bytes_ += at;
         return (const uint16_t*) d;
@@ -580,11 +604,13 @@ private:
     size_t n_tensors_ = 0;
     uint64_t dev_bytes_ = 0;
     void* embd_ = nullptr;
-    int fd_ = -1;
-    std::vector<uint8_t> staging_;
+    core::LoadPlan plan_;                // the model's reads, for the start's one pass
+    core::LoadPlan stage_plan_;          // the prompt split's, joined once its stage's memory is held
+    core::LoadPlan* queue_to_ = &plan_;
+    int plan_file_ = 0, stage_file_ = 0;
     int split_at_ = 0;                   // the first layer on the second card (0: no split)
     uint64_t peer_bytes_ = 0;            // the weights there
-    core::LoadProgress* progress_ = nullptr;
+    core::PromptStage stage_;         // the prompt split's stage (device -1: none)
 };
 
 class Adapter final : public model::ModelAdapter {
@@ -593,14 +619,7 @@ public:
     std::string validate(const GgufFile& g) const override { return validate_meta(g); }
     model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
 
-    model::Result load(const model::LoadRequest& req, std::unique_ptr<model::LoadedModel>& out) const override {
-        if (req.paths.empty()) return {model::Status::Error, "qwen35: no model path"};
-        auto m = std::make_unique<Loaded>();
-        std::string err;
-        if (!m->load(req, err)) return {model::Status::Error, err};
-        out = std::move(m);
-        return {};
-    }
+    std::unique_ptr<model::LoadedModel> make_model() const override { return std::make_unique<Loaded>(); }
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "qwen"}; }
     PreTokenizer pretokenizer() const override { return {"qwen35", program::tokenizer::pretok_qwen35}; }

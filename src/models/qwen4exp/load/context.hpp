@@ -1,5 +1,6 @@
 #pragma once
 
+#include "basalt/core/loader.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "helpers.hpp"
 
@@ -8,6 +9,11 @@ namespace basalt::models::qwen4exp::generate {
 // Startup phases keep their resources on the stack until the following phases return.
 // This view borrows those resources without changing their construction or destruction order.
 struct Context {
+    // The start's one pass: the phases decide and allocate, and queue every byte they place in `reads`; the last of them
+    // (prompt_split) places the plan, then runs `after` in order: what needs the bytes landed (checks, forms made from them).
+    basalt::core::LoadPlan* reads = nullptr;
+    std::vector<std::function<bool(std::string&)>>* after = nullptr;
+    basalt::core::Loader* loader = nullptr;   ///< the pass's, prepared before anything is sized
     Options* o = nullptr;
     std::string* ppl_base = nullptr;
     std::string* ppl_out = nullptr;
@@ -125,7 +131,7 @@ struct Context {
     int64_t* auto_lend_pct = nullptr;
     const int64_t* kMaxAutoChunk = nullptr;
     int64_t* auto_ceiling = nullptr;
-    std::function<bool(bool)> open_peer;
+    std::function<bool()> open_peer;
     const bool* adapt_fast_on = nullptr;
     int64_t* lend_from = nullptr;
     std::vector<std::pair<int32_t, int32_t>>* stage_held = nullptr;

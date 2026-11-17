@@ -58,5 +58,9 @@ class EngineStuck(RuntimeError):
     """The engine survived QUIT, terminate and kill."""
 
 
+class WakeBlocked(RuntimeError):
+    """A sleeping engine cannot wake yet: the VRAM its state needs is not free. The engine is untouched and stays asleep."""
+
+
 class GpuBusy(RuntimeError):
     """The model is unloaded and free VRAM is below min_free_vram_mib, so the engine is not started."""

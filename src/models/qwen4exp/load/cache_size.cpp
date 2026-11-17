@@ -28,7 +28,7 @@ int cache_size(Context& context) {
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
-    if (!basalt::core::Verifier::prepare_hc8(wt, g, err)) {   // before the cache sizes itself
+    if (!basalt::core::Verifier::prepare_hc8(wt, g, *context.reads, err)) {   // before the cache sizes itself
         basalt::log::error("basalt generate", "%s", err.c_str());
         return 1;
     }

@@ -178,15 +178,9 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
 
 // The CLI path of a session model: greedy decode of a pre-tokenized prompt, one `T <id>` line per token.
 // Each --image's embedding block goes before the prompt token at its --image-at index.
-int adapter_generate(basalt::model::LoadedModel& loaded, const std::vector<int64_t>& prompt, int64_t max_new,
+int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_t>& prompt, int64_t max_new,
                             const std::vector<int64_t>& stop_ids, const std::vector<std::string>& images,
                             const std::vector<int64_t>& image_at, const std::vector<int64_t>& oracle, bool teacher) {
-    std::unique_ptr<basalt::model::ModelSession> sess;
-    const basalt::model::Result mr = loaded.make_session(sess);
-    if (!mr.ok()) {
-        basalt::log::error("basalt generate", "%s", mr.message.c_str());
-        return 1;
-    }
     if (images.size() != image_at.size()) {
         basalt::log::error("basalt generate", "every --image needs an --image-at");
         return 2;
@@ -327,7 +321,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         if (!err.empty()) return fatal_start_error(err);
         const basalt::model::ModelDesc desc = adapter->describe(model_gguf);
         g_n_vocab = desc.n_vocab;
-        std::unique_ptr<basalt::model::LoadedModel> loaded;
+        basalt::model::Started started;
         basalt::model::LoadRequest lreq;
         lreq.paths = o.native_shards;
         lreq.diag_dump = o.diag_dump;
@@ -372,16 +366,16 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.card_gbps.push_back(o.main_gbps);
         lreq.card_gbps.insert(lreq.card_gbps.end(), o.peer_gbps.begin(), o.peer_gbps.end());
         lreq.diag_split_at = o.diag_split_at;
-        const basalt::model::Result r = adapter->load(lreq, loaded);
-        if (!r.ok() || !loaded) return fatal_start_error(r.message);
+        const basalt::model::Result r = adapter->start(lreq, started);
+        if (!r.ok() || started.sessions.empty()) return fatal_start_error(r.message);
         std::vector<int64_t> stop;
         if (o.stop_eos) stop = o.eos_ids;
-        if (loaded->context() != 0) o.max_context = loaded->context();
-        if (o.serve) return basalt::program::serve::run_session(o, model_file, *adapter, *loaded);
+        if (started.model->context() != 0) o.max_context = started.model->context();
+        if (o.serve) return basalt::program::serve::run_session(o, model_file, *adapter, started);
         std::vector<int64_t> oracle;
         if (const auto code = cli::load_spec_oracle(o.spec_oracle, oracle)) return *code;
         if (o.diag_teacher && oracle.empty()) return fatal_start_error("--diag-teacher needs --spec-oracle");
-        return adapter_generate(*loaded, o.tokens, o.max_new, stop, o.images, o.image_at, oracle, o.diag_teacher);
+        return adapter_generate(started.sessions.front().get(), o.tokens, o.max_new, stop, o.images, o.image_at, oracle, o.diag_teacher);
     } catch (const std::exception& e) {
         return fatal_start_error(e.what());
     }

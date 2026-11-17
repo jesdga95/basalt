@@ -49,9 +49,10 @@ from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, engine_key as logpro
     token as logprob_token
 from serve.engine import lifeline, suspend
 from serve.engine.flags import flag_value
-from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, split_err
+from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, WakeBlocked, split_err
 from serve.engine.slots import AdmissionQueue
 from serve.prompt import PromptText
+from serve.util import vram
 from serve.util.console import tagged
 from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
 
@@ -278,6 +279,7 @@ class ProcessEngine:
         if "loading" not in self.__dict__:               # restart() holds these across its __init__ calls
             self.loading, self.load_status = False, {}
         self.asleep = False              # its GPU state suspended by the driver (sleep/wake)
+        self.parked = None               # the VRAM that state held on each card ({gpu: MiB}) from NVML at the sleep; None: unknown
         self.restore_s = 0.0             # the driver's part of the last wake
         self.max_context = int(flag_value(args, "--max-context") or 0)   # the engine's own at READY
         self.can_stop = False            # READY <ctx> stop
@@ -660,18 +662,26 @@ class ProcessEngine:
         with self.sleep_lock:
             out = self._vram_command("SLEEP", timeout)
             why = ram_check() if ram_check is not None else None
+            held = None
             if why is None:
+                held = vram.process_by_gpu(self.proc.pid)   # what the driver is about to move out of VRAM, per card
                 why = suspend.suspend(self.proc.pid)
             if why is not None:
                 self._vram_command("WAKE", timeout)
                 raise ValueError(why)
+            self.parked = held
             self.asleep = True
             return out
 
-    def wake(self, timeout: float = 120.0) -> dict:
-        """The driver puts the GPU state back, then WAKE refills the expert cache from RAM. EngineDied when the GPU
-        state cannot come back (the engine is ended so the next request starts it again)."""
+    def wake(self, timeout: float = 120.0, vram_check=None) -> dict:
+        """The driver puts the GPU state back, then WAKE refills the expert cache from RAM. `vram_check(parked)`,
+        asked first, says why the VRAM the state needs is not free (None: it is); WakeBlocked then, the engine untouched
+        and still asleep. EngineDied when the GPU state cannot come back (the engine is ended so the next request
+        starts it again)."""
         with self.sleep_lock:
+            why = vram_check(self.parked) if vram_check is not None else None
+            if why is not None:
+                raise WakeBlocked(why)
             t = time.time()
             why = suspend.resume(self.proc.pid)
             self.restore_s = time.time() - t
@@ -1734,7 +1744,12 @@ class ProcessEngine:
         with self.sleep_lock:                        # a sleep in progress ends first
             if self.asleep:                          # its GPU state back first: QUIT runs CUDA calls
                 self.asleep = False
-                suspend.resume(self.proc.pid)
+                if suspend.resume(self.proc.pid) is not None:   # it cannot run, so QUIT would never be answered
+                    try:
+                        self.proc.kill()
+                        self.proc.wait(timeout=20)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
         try:
             if self.proc.poll() is None:
                 try:

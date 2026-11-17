@@ -19,9 +19,6 @@ public:
     const char* arch() const override { return arch_; }
     std::string validate(const GgufFile& g) const override { return validate_(g); }
     model::ModelDesc describe(const GgufFile& g) const override { return describe_(g); }
-    model::Result load(const model::LoadRequest&, std::unique_ptr<model::LoadedModel>&) const override {
-        return {model::Status::NotImplemented, "metadata only"};
-    }
     model::TokenizerSpec tokenizer_spec() const override { return {}; }
     int max_expert_cards() const override { return 0; }
     model::TokenNames token_names() const override { return {}; }

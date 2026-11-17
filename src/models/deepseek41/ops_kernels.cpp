@@ -655,7 +655,13 @@ public:
         r.homes = prompt_room + prefillp::ahead_bytes(d) + prefillp::kMargin + kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
         r.beside_homes = prefillp::workspace_bytes(d, prefillp::kShortChunk) + prefillp::kShortMargin;
         r.modules = kModuleRoom;
-        if (!t->open(r, h_rows_, err)) return false;
+        // the tier is opened once, in the start's plan, which reads its experts in the start's pass
+        core::LoadPlan* reads = m_.planning();
+        if (reads == nullptr) {
+            err = "deepseek41: the expert tier opens only while the model starts";
+            return false;
+        }
+        if (!t->open(r, h_rows_, *reads, err)) return false;
         tier_ = t;
         shared = {std::move(t), h_x_, h_rows_};
         return true;

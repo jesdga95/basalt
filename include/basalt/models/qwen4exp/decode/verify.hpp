@@ -45,6 +45,7 @@ namespace basalt::kernels::cpu { class ExpertPool; }
 namespace basalt::kernels { struct DmMixLayer; }
 
 namespace basalt::core {
+class LoadPlan;
 
 class NativeHead;
 class PeerExperts;
@@ -229,9 +230,9 @@ public:
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
     /// The 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current device, from the
-    /// model file's table; called before the expert cache takes the free memory.  False with `err` when a matrix this
-    /// device holds has no copy in the table or no VRAM for it.
-    static bool prepare_hc8(const WeightTable& wt, const ModelGeometry& g, std::string& err);
+    /// model file's table, their bytes copied in `reads`' pass; called before the expert cache takes the free memory.
+    /// False with `err` when a matrix this device holds has no copy in the table or no VRAM for it.
+    static bool prepare_hc8(const WeightTable& wt, const ModelGeometry& g, LoadPlan& reads, std::string& err);
     /// The CUDA0 bytes the GDN mixer split by key head loads after the expert cache is sized (CUDA0's packed rows and
     /// columns of its key heads), for CUDA0 on dev0 and the peer on dev1; 0 when the split is not taken.
     static int64_t gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
@@ -748,7 +749,8 @@ private:
 /// The loaded hc8 table (model_file.hpp) has a copy of `name` of this shape.
 bool hc8_table_has(const std::string& name, int rows, int cols);
 /// Registers the table's copy of `name` on the current device, keyed by the bf16 matrix `w` or, with w == nullptr, by
-/// the copy itself (the key is returned).  nullptr: no such copy, or no VRAM.
-const void* hc8_table_adopt(const std::string& name, const uint16_t* w, int rows, int cols);
+/// the copy itself (the key is returned); its bytes are copied from the table in `reads`' pass.  nullptr: no such
+/// copy, or no VRAM.
+const void* hc8_table_adopt(const std::string& name, const uint16_t* w, int rows, int cols, LoadPlan& reads);
 
 }  // namespace basalt::core

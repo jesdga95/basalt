@@ -49,8 +49,8 @@ int main() {
 #endif
     check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
-        std::unique_ptr<model::LoadedModel> loaded;
-        check(ds->load({}, loaded).status == model::Status::Error, "deepseek41 load without a path is an error");
+        model::Started started;
+        check(ds->start({}, started).status == model::Status::Error, "deepseek41 start without a path is an error");
         const auto o = ds->make_options();
         check(!ds->finish_flags(*o) && o->lossy.empty(), "deepseek41 has no lossy flag");
     }

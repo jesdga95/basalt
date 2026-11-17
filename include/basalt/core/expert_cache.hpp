@@ -183,6 +183,8 @@ public:
 
     /// Slots filled so far, for the startup report.
     int64_t fills() const { return fills_.load(); }
+    /// `n` slots were filled from outside (the loader writes the slots itself).
+    void note_filled(int64_t n) { fills_.fetch_add(n); }
 
 private:
     int64_t slot_end(int64_t n) const { return off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n]; }

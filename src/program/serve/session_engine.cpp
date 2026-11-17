@@ -41,15 +41,14 @@ struct Block {
 
 class SessionRuntime final : public Runtime {
 public:
-    SessionRuntime(CommonOptions& options, basalt::core::ModelFile& file, std::string& error, basalt::model::LoadedModel& model)
-        : Runtime(options, file, error, model.desc().n_vocab, vocab_), model_(model) {}
+    SessionRuntime(CommonOptions& options, basalt::core::ModelFile& file, std::string& error, basalt::model::Started& started)
+        : Runtime(options, file, error, started.model->desc().n_vocab, vocab_), model_(*started.model),
+          sessions_(std::move(started.sessions)) {}
 
     int init_before_input() override {
-        const int slots = std::max(o.batch, 1);
-        sessions_.resize((size_t) slots);
-        for (auto& s : sessions_) {
-            const basalt::model::Result r = model_.make_session(s);
-            if (!r.ok()) { basalt::log::error("basalt serve", "%s", r.message.c_str()); return 1; }
+        if (sessions_.size() != (size_t) std::max(o.batch, 1)) {   // the start makes one per slot
+            basalt::log::error("basalt serve", "the model has %zu sessions for %d slots", sessions_.size(), std::max(o.batch, 1));
+            return 1;
         }
         // one policy for the solo windows and one for the batch windows, whose rounds cost differently
         policy.emplace(session().max_window());
@@ -1063,9 +1062,9 @@ void SessionRuntime::enc_command(const std::string& cmd) {
 }  // namespace
 
 int run_session(CommonOptions& o, basalt::core::ModelFile& file, const basalt::model::ModelAdapter& adapter,
-                basalt::model::LoadedModel& model) {
+                basalt::model::Started& started) {
     std::string err;
-    SessionRuntime runtime(o, file, err, model);
+    SessionRuntime runtime(o, file, err, started);
     runtime.pre_ = adapter.pretokenizer();
     return runtime.execute();
 }

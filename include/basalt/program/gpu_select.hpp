@@ -56,19 +56,19 @@ struct GpuChoice {
 GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, bool known = true);
 
 /// What a chosen card does.
-enum class GpuRole { Main, ExpertTier, PromptLine, LayerStage, Idle };
+enum class GpuRole { Main, ExpertTier, PromptSplit, LayerStage, Idle };
 const char* gpu_role_name(GpuRole r);
 
 /// The inputs of the role decision: the chosen cards, main first, and what this platform and engine can run.
 struct RoleInputs {
     std::vector<GpuCard> cards;
     int max_expert_tiers = 1;       ///< how many cards the engine can run as expert tiers
-    bool prompt_line = false;       ///< the model puts its one helper card on long prompts (a dense model), not on experts
+    bool prompt_split = false;       ///< the model puts its one helper card on long prompts (a dense model), not on experts
     bool layer_stage = false;       ///< such a model does not fit its main card: the helper card runs its later layers
 };
 
 /// The role of each card, in order: the cards after the main one are expert tiers, as many as the engine runs, and idle
-/// otherwise (PromptLine in place of ExpertTier when `prompt_line`, LayerStage when `layer_stage` too). How a model with
+/// otherwise (PromptSplit in place of ExpertTier when `prompt_split`, LayerStage when `layer_stage` too). How a model with
 /// experts spreads over its tier cards (expert tier or layer split) is priced at its load (multi_gpu_plan.hpp).
 std::vector<GpuRole> choose_roles(const RoleInputs& in);
 

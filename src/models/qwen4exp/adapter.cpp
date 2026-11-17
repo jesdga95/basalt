@@ -24,10 +24,6 @@ public:
 
     model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
 
-    model::Result load(const model::LoadRequest&, std::unique_ptr<model::LoadedModel>&) const override {
-        return {model::Status::NotImplemented, "Flash-Next runs its own start"};
-    }
-
     std::optional<int> run(program::CommonOptions& o, std::vector<program::GpuCard>& cards) const override {
         return run_engine(static_cast<Options&>(o), cards);
     }

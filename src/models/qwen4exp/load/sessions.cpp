@@ -80,7 +80,7 @@ int sessions(Context& context) {
         }
         void* arena_s = nullptr;
         if (cudaMalloc(&arena_s, pool_s) != cudaSuccess ||
-            !st.wt.load(pack_files, arena_s, pool_s, err, skip_s.empty() ? nullptr : &skip_s)) {
+            !st.wt.load(pack_files, arena_s, pool_s, err, skip_s.empty() ? nullptr : &skip_s, true, context.reads)) {
             cudaGetLastError();
             size_t free_b = 0, total_b = 0;   // what that card had free
             cudaMemGetInfo(&free_b, &total_b);
@@ -91,13 +91,13 @@ int sessions(Context& context) {
                          (unsigned long long) (total_b >> 20));
             return 1;
         }
-        if (!st.dense.load(o.native_shards, st.wt, err, true)) {
+        if (!st.dense.load(o.native_shards, st.wt, err, true, 0, -1, nullptr, 0, context.reads)) {
             basalt::log::error("basalt generate", "layer split, CUDA%d native dense projections: %s", st.dev,
                          err.c_str());
             return 1;
         }
         // this stage's fused hyper-connection reads need its device's copies
-        if (!basalt::core::Verifier::prepare_hc8(st.wt, g, err)) {
+        if (!basalt::core::Verifier::prepare_hc8(st.wt, g, *context.reads, err)) {
             basalt::log::error("basalt generate", "layer split, CUDA%d: %s", st.dev, err.c_str());
             return 1;
         }
@@ -232,12 +232,17 @@ int sessions(Context& context) {
         const bool last = i + 1 == stages.size();
         const basalt::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
-            (last && !st.head.load(o.native_shards, g.n_embd, wo_s->ne1, err))) {
+            (last && !st.head.load(o.native_shards, g.n_embd, wo_s->ne1, *context.reads, err))) {
             basalt::log::error("basalt generate", "layer split, CUDA%d head: %s%s", st.dev,
                          wo_s == nullptr ? "output.weight is missing" : err.c_str(),
                          wo_s == nullptr ? "" : vram_free_note().c_str());
             return 1;
         }
+        if (last)
+            context.after->push_back([&st](std::string& e) {
+                const basalt::core::OnDevice on(st.dev);
+                return st.head.finish(e);
+            });
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
         basalt::log::info("basalt generate", "layer split: CUDA%d holds its weights, session [%lld, %lld)%s; "
@@ -371,7 +376,7 @@ int sessions(Context& context) {
         static const basalt::core::ModelGeometry draft_geometry{};
         // with a layer split across GPUs the drafter stays on CUDA0 (the fastest card) and reads the last stage's
         // residual rows through a relay
-        if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, ss, pipe_want ? basalt::core::kMtpChainMax : o.spec, err, o.mtp_window)) { basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, ss, pipe_want ? basalt::core::kMtpChainMax : o.spec, *context.reads, err, o.mtp_window)) { basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
     }
     basalt::core::qsa_set_kv_elastic(0);   // every later state: whole
@@ -404,17 +409,25 @@ int sessions(Context& context) {
     basalt::core::NativeHead native_head;
     basalt::core::NativeHead mtp_head;   // a layer split: the drafter's copy of the head on CUDA0
     if (multi_gpu && mtp_on) {
-        if (!mtp_head.load(o.native_shards, g.n_embd, n_vocab, err)) {
+        if (!mtp_head.load(o.native_shards, g.n_embd, n_vocab, *context.reads, err)) {
             basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
             return 1;
         }
+        context.after->push_back([&mtp_head](std::string& e) {
+            const basalt::core::OnDevice on(0);
+            return mtp_head.finish(e);
+        });
     }
     if (!multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
-        if (!native_head.load(o.native_shards, g.n_embd, n_vocab, err)) {
+        if (!native_head.load(o.native_shards, g.n_embd, n_vocab, *context.reads, err)) {
             basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
             return 1;
         }
+        context.after->push_back([&native_head](std::string& e) {
+            const basalt::core::OnDevice on(0);
+            return native_head.finish(e);
+        });
         basalt::log::info("basalt generate", "native head: %s, %llu bytes, in %.1f s",
                      basalt::ggml_type_name((uint32_t) native_head.type()),
                      (unsigned long long) native_head.weight_bytes(),

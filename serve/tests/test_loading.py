@@ -33,7 +33,7 @@ class GatedEngine(ProcessEngine):
         self.asleep, self.unloaded, self.progress, self.restore_s = False, not loaded, None, 0.0
         self.up = loaded
         self.go, self.entered, self.fail = threading.Event(), threading.Event(), None
-        self.load_status = {"percent": 42, "gib": {"cuda0": 12.3, "ram": 4.0}}
+        self.load_status = {"percent": 42, "gib": 12.3}
         self.restarts = 0
 
     def alive(self):
@@ -51,7 +51,7 @@ class GatedEngine(ProcessEngine):
     def unload(self):
         self.up, self.unloaded = False, True
 
-    def wake(self, timeout=120.0):
+    def wake(self, timeout=120.0, vram_check=None):
         self.entered.set()
         self.go.wait(10)
         self.asleep = False
@@ -106,7 +106,7 @@ class Loading(unittest.TestCase):
         self.assertTrue(status["loading"])
         if kind == "weights":
             self.assertEqual(live["load"]["percent"], 42)
-            self.assertEqual(live["load"]["gib"], {"cuda0": 12.3, "ram": 4.0})
+            self.assertEqual(live["load"]["gib"], 12.3)
             self.assertEqual(status["load"]["percent"], 42)
         else:
             self.assertNotIn("percent", live["load"])
