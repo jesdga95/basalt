@@ -96,12 +96,12 @@ Against the pack built from the plain NVFP4 release (same 122.6 GiB, the same se
 expert values differ), the QAD pack is 5.3% lower on PPL: 2.1847 against 2.3063 over the same 20 chunks and 5,100 scored
 rows (paired dNLL -0.0542 +- 0.0071, t -7.6, ratio 0.947 with a 95% interval of [0.934, 0.961]; T 3, int8 KV, a fixed
 dummy base, so only the two packs' rows are compared), with 93.5% of the rows keeping the same top-1 token. It is also a
-little faster: 388.5 and 392.4 tok/s decoded against 374.2 and 373.2 (two runs each, interleaved in one session, the
-community preset at 475 W, drafting at its default), and prefill 9,722/9,777 against 9,233/9,272 at 16k. Per-fixture
-decode speeds move up to 40% between runs of one pack (conv 232 against 323, struct 482 against 670), so only the
-token-weighted decode and the prefill depths are compared; acceptance is within a point (72-74% conv, 98% struct,
-67-69% prose) and both packs carry the same tuned drafter bit for bit. So the QAD conversion drifts the published
-pack's quality upward, not downward.
+little faster: 388.5 and 392.4 tok/s decoded against 374.2 and 373.2, +4.5% on the mean of the two runs (two runs
+each, interleaved in one session, the community preset at 475 W, drafting at its default), and prefill 9,722/9,777
+against 9,233/9,272 at 16k (+5.4%). Per-fixture decode speeds move up to 40% between runs of one pack (conv 232
+against 323, struct 482 against 670), so only the token-weighted decode and the prefill depths are compared;
+acceptance is within a point (72-74% conv, 98% struct, 67-69% prose) and both packs carry the same tuned drafter bit
+for bit. So the QAD conversion drifts the published pack's quality upward, not downward.
 
 ## Measured costs
 
