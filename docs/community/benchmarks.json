@@ -2442,6 +2442,40 @@
       "draft_len_prose": 2.2,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8",
       "notes": "OrcaRouter-abliterated NVFP4-DQ8 pack; single RTX Pro 5000 72GB; Docker benchmark."
+    },
+    {
+      "submitter": "hexhamallstar",
+      "date": "2026-11-17",
+      "commit": "d3b7574296",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 300,
+          "pcie": "4.0 x16"
+        }
+      ],
+      "ram_gib": 96,
+      "cpu": "AMD Ryzen 7 5700X3D, 8 cores",
+      "ram_gbps": 39.1,
+      "os": "Windows",
+      "quant": "IQ3_XXS",
+      "kv": "int8",
+      "prefill_16k_tps": 3259.5,
+      "prefill_64k_tps": 3664.7,
+      "decode_tps": 100.4,
+      "decode_conv_tps": 72.7,
+      "decode_struct_tps": 112.9,
+      "decode_prose_tps": 75.3,
+      "accept_conv_pct": 72.9,
+      "accept_struct_pct": 97.1,
+      "accept_prose_pct": 64.3,
+      "draft_len_conv": 2.3,
+      "draft_len_struct": 6.4,
+      "draft_len_prose": 1.7,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     }
   ]
 }
