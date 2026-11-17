@@ -1348,8 +1348,10 @@ const void* hc8_adopt(const uint16_t* w, int rows, int cols) {
     return c.q;
 }
 
-const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, int rows, int cols) {
-    if (q == nullptr || s == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return nullptr;
+const void* hc8_register(const uint16_t* w, int rows, int cols, int8_t** q, uint16_t** s) {
+    *q = nullptr;
+    *s = nullptr;
+    if (rows <= 0 || cols <= 0 || cols % G8 != 0) return nullptr;
     std::lock_guard<std::mutex> lk(g_hc8_mu);
     if (w != nullptr && g_hc8.count(w)) return w;
     const int64_t n = (int64_t) rows * cols;
@@ -1364,15 +1366,12 @@ const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, in
         return nullptr;
     }
     c.s = reinterpret_cast<uint16_t*>(c.q + n);
-    if (cudaMemcpy(c.q, q, (size_t) n, cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(c.s, s, (size_t) rows * c.srow * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaGetLastError();
-        return nullptr;
-    }
     c.owned = w == nullptr;
     const void* key = w != nullptr ? (const void*) w : (const void*) c.q;
     g_hc8[key] = c;
     g_hc8_bytes += c.bytes;
+    *q = c.q;
+    *s = c.s;
     return key;
 }
 

@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/verify.cpp - verify operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
+#include "basalt/core/load_progress.hpp"
 
 namespace basalt::models::qwen4exp::serve {
 
@@ -212,6 +213,7 @@ int QfnRuntime::capture_windows() {
                           (long long) cache_floor_slots());
     }
     std::printf("INFO %s\n", basalt::program::spill_words(tier_spill).c_str());   // experts only the file holds
+    basalt::core::LoadProgress::complete();   // the weights bar ends before the engine says ready
     std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
     std::fflush(stdout);
 

@@ -8,6 +8,6 @@ namespace basalt::program::serve {
 
 /// Serves until QUIT or stdin closes; returns the process exit code.
 int run_session(CommonOptions& o, basalt::core::ModelFile& file, const basalt::model::ModelAdapter& adapter,
-                basalt::model::LoadedModel& model);
+                basalt::model::Started& started);
 
 }  // namespace basalt::program::serve

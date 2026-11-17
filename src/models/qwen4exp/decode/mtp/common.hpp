@@ -6,7 +6,7 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
-#include "basalt/core/direct_upload.hpp"
+#include "basalt/core/loader.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/on_device.hpp"
 

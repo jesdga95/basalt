@@ -18,7 +18,6 @@ int cache_fill(Context& context) {
     auto& stages = *context.stages;
     auto& n_vocab = *context.n_vocab;
     auto& native_head = *context.native_head;
-    auto& src = *context.src;
     auto& srcp = *context.srcp;
     auto& peer_prompt_bytes = context.peer_prompt_bytes;
     auto& xcache = *context.xcache;
@@ -133,21 +132,11 @@ int cache_fill(Context& context) {
         const bool per_layer = xcache.per_layer_admission();
         const int64_t want = per_layer ? (int64_t) profile.size()
                                        : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
-        const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
         uint64_t fill_total = 0;
         for (int64_t i = 0; i < want; ++i)
             fill_total += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
         cache_fill_bytes = fill_total;
-        if (model_bytes > 0) {
-            if (srcp == &src) {
-                basalt::core::LoadProgress::plan("cuda0", cuda0_fixed_bytes + fill_total);
-                basalt::core::LoadProgress::plan("ram", expert_total_bytes - fill_total);
-            } else {
-                basalt::core::LoadProgress::plan("cuda0", fill_total, true);
-            }
-        }
-        basalt::core::LoadProgress fill_progress(basalt::core::LoadProgress::cuda(0), fill_total, srcp != &src);
         // the slots are handed out in profile order, then the blobs are read and copied together
         std::vector<std::pair<int32_t, int32_t>> fill_pairs;
         std::vector<int32_t> fill_slots;
@@ -161,27 +150,25 @@ int cache_fill(Context& context) {
             fill_slots.push_back(slot);
             fill_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
         }
-        if (!basalt::core::fill_cache_slots(*srcp, xcache, 0, fill_pairs.data(), fill_slots.data(),
-                                            (int64_t) fill_pairs.size(),
-                                            [&](uint64_t bytes) { fill_progress.add(bytes); }, err)) {
+        if (!basalt::core::plan_cache_slots(*context.reads, *srcp, xcache, 0, fill_pairs.data(), fill_slots.data(),
+                                            (int64_t) fill_pairs.size(), err)) {
             basalt::log::error("basalt generate", "the profile fill failed: %s", err.c_str());
             return 1;
         }
         prefilled += (int64_t) fill_pairs.size();
-        fill_progress.finish();
-        const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
-        // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
-        // about bytes produces a plausible token, which is this project's most expensive failure mode; the
-        // cache's own `verify_slot` is the check and it costs one blob-sized D2H at startup.
-        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                srcp->blob(profile[0].first, profile[0].second), err,
-                                (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
-            return fatal_start_error(err);
-        }
-        basalt::log::info("basalt generate", "pre-filled %lld of %lld slots from the profile in %.1f s (%.0f MB/s); "
-                             "slot 0 verified",
-                     (long long) prefilled, (long long) (per_layer ? xcache.slots() : want), fill_s,
-                     fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0);
+        // **AND ONE SLOT IS READ BACK AND COMPARED** once the pass has filled it.  A residency table that is right about
+        // indices and wrong about bytes produces a plausible token, which is this project's most expensive failure mode;
+        // the cache's own `verify_slot` is the check and it costs one blob-sized D2H at startup.
+        if (prefilled > 0)
+            context.after->push_back([&xcache, &profile, srcp](std::string& e) {
+                const basalt::core::OnDevice on(0);
+                return xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
+                                          srcp->blob(profile[0].first, profile[0].second), e,
+                                          (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[0].first));
+            });
+        basalt::log::info("basalt generate", "pre-filled %lld of %lld slots from the profile (%.0f MB, read in the start's "
+                             "pass; slot 0 verified after it)",
+                     (long long) prefilled, (long long) (per_layer ? xcache.slots() : want), (double) fill_bytes / 1e6);
     }
 
     for (auto& stp : stages) {
@@ -212,10 +199,6 @@ int cache_fill(Context& context) {
             return 1;
         }
         int64_t filled = 0;
-        uint64_t stage_fill_total = 0;
-        for (size_t i = 0; i < st.profile.size() && (int64_t) i < st.cache.slots(); ++i)
-            stage_fill_total += lay.blob_bytes(st.profile[i].first);
-        basalt::core::LoadProgress stage_progress(basalt::core::LoadProgress::cuda(st.dev), stage_fill_total);
         std::vector<std::pair<int32_t, int32_t>> stage_pairs;
         std::vector<int32_t> stage_slots;
         for (const auto& pr : st.profile) {
@@ -226,20 +209,24 @@ int cache_fill(Context& context) {
             stage_slots.push_back(slot);
             ++filled;
         }
-        if (!basalt::core::fill_cache_slots(*srcp, st.cache, st.dev, stage_pairs.data(), stage_slots.data(),
-                                            (int64_t) stage_pairs.size(),
-                                            [&](uint64_t bytes) { stage_progress.add(bytes); }, err)) {
+        if (!basalt::core::plan_cache_slots(*context.reads, *srcp, st.cache, st.dev, stage_pairs.data(), stage_slots.data(),
+                                            (int64_t) stage_pairs.size(), err)) {
             basalt::log::error("basalt generate", "layer split, CUDA%d profile fill failed: %s", st.dev, err.c_str());
             return 1;
         }
-        stage_progress.finish();
-        if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
-                                                 srcp->blob(st.profile[0].first, st.profile[0].second), err,
-                                                 (int64_t) lay.blob_bytes(st.profile[0].first))) {
-            basalt::log::error("basalt generate", "layer split, CUDA%d expert cache: %s", st.dev,
-                         filled == 0 ? "nothing filled" : err.c_str());
+        if (filled == 0) {
+            basalt::log::error("basalt generate", "layer split, CUDA%d expert cache: nothing filled", st.dev);
             return 1;
         }
+        context.after->push_back([&st, srcp](std::string& e) {
+            const basalt::core::OnDevice on(st.dev);
+            if (st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
+                                     srcp->blob(st.profile[0].first, st.profile[0].second), e,
+                                     (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(st.profile[0].first)))
+                return true;
+            e = "layer split, CUDA" + std::to_string(st.dev) + " expert cache: " + e;
+            return false;
+        });
         basalt::log::info("basalt generate", "layer split: CUDA%d runs layers %lld-%lld, expert cache %lld slots "
                              "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified",
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),

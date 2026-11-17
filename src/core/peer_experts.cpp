@@ -132,7 +132,7 @@ uint64_t PeerExperts::device_overhead_bytes(int64_t n_embd, int64_t n_ff) {
 
 bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
                        ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, int reserve_mib,
-                       int64_t max_slots, std::string& err, bool exclusive) {
+                       int64_t max_slots, LoadPlan& reads, std::string& err) {
     if (!prepare(device, src, n_layers, n_expert, n_embd, n_ff, err)) return false;
     // the pairs the primary does not hold, in rank order, as many as fit
     On on(device);
@@ -150,7 +150,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         used += b256;
         pick.push_back(pr);
     }
-    return fill(pick, err, exclusive);
+    return fill(pick, reads, err);
 }
 
 uint64_t PeerExperts::slot_bytes(int64_t layer) {
@@ -244,11 +244,6 @@ bool PeerExperts::open_slots(const std::vector<int64_t>& slot_bytes, std::string
     return ck(cudaDeviceSynchronize(), "slots", err);
 }
 
-bool PeerExperts::fill_slot(int32_t slot, const uint8_t* src, uint64_t bytes) {
-    On on(device_);
-    return cudaMemcpy(cache_.device_slot(slot), src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
-}
-
 void PeerExperts::exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes) {
     slot_out(slot, out, 0, bytes);
     slot_in(slot, in, 0, bytes);
@@ -287,7 +282,7 @@ bool PeerExperts::read_until(int64_t m, std::string& err) {
     return ck(cudaEventSynchronize(marks_[(size_t) (m % (int64_t) marks_.size())]), "reading experts", err);
 }
 
-bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive) {
+bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, LoadPlan& reads, std::string& err) {
     const auto& lay = basalt::kernels::cpu::expert_layout();
     const int device = device_;
     const int64_t n_layers = n_layers_, n_expert = n_expert_;
@@ -304,10 +299,6 @@ bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std
     // open() zeroes the arena with cudaMemset on the legacy stream, which is not ordered against the non-blocking
     // refill stream: wait for it, or the zeroing can land on top of the fills
     if (!ck(cudaDeviceSynchronize(), "arena zeroing", err)) { close(); return false; }
-    uint64_t fill_total = 0;
-    for (const auto& pr : pick) fill_total += lay.blob_bytes(pr.first);
-    LoadProgress::plan(LoadProgress::cuda(device), fill_total, !exclusive);
-    LoadProgress progress(LoadProgress::cuda(device), fill_total, !exclusive);
     std::vector<int32_t> pick_slots(pick.size());
     for (size_t i = 0; i < pick.size(); ++i) {
         const auto& pr = pick[i];
@@ -320,22 +311,24 @@ bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std
         pick_slots[i] = slot;
         res_[(size_t) (pr.first * n_expert + pr.second)] = slot;
     }
-    if (!fill_cache_slots(src, cache_, device, pick.data(), pick_slots.data(), (int64_t) pick.size(),
-                          [&](uint64_t bytes) { progress.add(bytes); }, err)) {
+    if (!plan_cache_slots(reads, src, cache_, device, pick.data(), pick_slots.data(), (int64_t) pick.size(), err)) {
         err = "peer experts: fill failed: " + err;
         close();
         return false;
     }
-    if (!ck(cudaStreamSynchronize(refill_), "fill", err)) { close(); return false; }
-    progress.finish();
-    const auto& f0 = pick.front();
-    if (!cache_.verify_slot(res_[(size_t) (f0.first * n_expert + f0.second)], src.blob(f0.first, f0.second), err,
-                            (int64_t) lay.blob_bytes(f0.first))) {
+    first_ = pick.front();
+    resident_ = (int64_t) pick.size();
+    return true;
+}
+
+bool PeerExperts::verify_fill(std::string& err) {
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    On on(device_);
+    if (!cache_.verify_slot(res_[(size_t) (first_.first * n_expert_ + first_.second)], src_->blob(first_.first, first_.second), err,
+                            (int64_t) lay.blob_bytes(first_.first))) {
         err = "peer experts: " + err;
-        close();
         return false;
     }
-    resident_ = (int64_t) pick.size();
     return true;
 }
 

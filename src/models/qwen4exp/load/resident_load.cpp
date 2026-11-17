@@ -94,16 +94,16 @@ int resident_load(Context& context) {
         std::vector<std::pair<int32_t, int32_t>> gpu_only = peer_only;
         gpu_only.insert(gpu_only.end(), stage_held.begin(), stage_held.end());
         const auto& rank = stages.empty() ? profile : profile_all;
-        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, gpu_only, lend_from, resident_headroom,
-                                                    o.resident_budget, &rank);
+        bool resident_ok = src.plan_cache_complement(*context.reads, xcache, err, o.resident_pin, gpu_only, lend_from,
+                                                     resident_headroom, o.resident_budget, &rank);
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
             // the whole complement does not fit - keep what does, the hottest by the profile, through the budget
             // path (sized by the RAM alone) instead of none: the misses outside it read the same file bytes the mmap
             // fallback reads, so the answers are unchanged.  Nothing pinned: the fallback below.
             whole_err = err;
-            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, gpu_only, -1, resident_headroom,
-                                                   basalt::core::FileExpertSource::kResidentWhatFits, &rank);
+            resident_ok = src.plan_cache_complement(*context.reads, xcache, err, o.resident_pin, gpu_only, -1, resident_headroom,
+                                                    basalt::core::FileExpertSource::kResidentWhatFits, &rank);
             if (resident_ok) {
                 basalt::log::warn("basalt generate", "the whole complement does not fit in RAM (%s); the hottest %.2f GiB "
                                      "are kept in RAM", whole_err.c_str(), (double) src.resident_bytes() / 1073741824.0);
@@ -122,20 +122,25 @@ int resident_load(Context& context) {
                                                                  [&](int64_t t) { return serve_loans::lend_slots(xcache, g, ss, t) <= allow; }));
         }
         if (resident_ok) {
-            if (o.serve) basalt::platform::watch_resident_ram(true, src.resident_bytes());
-            basalt::log::info("basalt generate", "resident RAM mode: %.2f GiB of experts in RAM (%s), %lld in the GPU "
-                                 "cache; adaptive swaps %s",
-                         (double) src.resident_bytes() / 1073741824.0,
-                         src.complement_pinned() ? "page-locked" : src.locked_bytes() > 0 ? "locked" : "pageable",
-                         (long long) xcache.resident(),
-                         o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange them with the GPU cache (no file reads)"
-                                                                : "off");
-            measure_pinned_share();   // the loans sized from here on see the pinned complement
-            auto_lend_pct = lend_pct_for_share();
-            if (o.prefill_auto)
-                basalt::log::info("basalt generate", "prompt path lends at most %lld%% of the cache (%.0f%% of the expert "
-                                     "bytes pinned)", (long long) auto_lend_pct,
-                             100.0 * basalt::prefill::Prefill::pinned_share());
+            // the copy is registered with the driver once the pass has filled it, and what it pinned then sizes the loans
+            context.after->push_back([&](std::string& e) {
+                if (!src.finish_complement(context.loader->unbuffered(), e)) return false;
+                if (o.serve) basalt::platform::watch_resident_ram(true, src.resident_bytes());
+                basalt::log::info("basalt generate", "resident RAM mode: %.2f GiB of experts in RAM (%s), %lld in the GPU "
+                                     "cache; adaptive swaps %s",
+                             (double) src.resident_bytes() / 1073741824.0,
+                             src.complement_pinned() ? "page-locked" : src.locked_bytes() > 0 ? "locked" : "pageable",
+                             (long long) xcache.resident(),
+                             o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange them with the GPU cache (no file reads)"
+                                                                    : "off");
+                measure_pinned_share();   // the loans sized from here on see the pinned complement
+                auto_lend_pct = lend_pct_for_share();
+                if (o.prefill_auto)
+                    basalt::log::info("basalt generate", "prompt path lends at most %lld%% of the cache (%.0f%% of the expert "
+                                         "bytes pinned)", (long long) auto_lend_pct,
+                                 100.0 * basalt::prefill::Prefill::pinned_share());
+                return true;
+            });
         } else if (o.resident_soft) {
             basalt::log::warn("basalt generate", "the resident RAM mode does not fit (%s)", err.c_str());
         } else if (o.resident_budget > 0) {
@@ -147,11 +152,6 @@ int resident_load(Context& context) {
             basalt::log::error("basalt generate", "CPU expert residency: %s", err.c_str());
             return 1;
         }
-    }
-    // experts no RAM tier holds (none was asked for, or the RAM is short) are read from the file when needed
-    if (srcp == &src && !src.complement_ready() && expert_total_bytes > cache_fill_bytes) {
-        basalt::core::LoadProgress::skipped(expert_total_bytes - cache_fill_bytes - peer_only_bytes);
-        basalt::core::LoadProgress::plan("ram", 0);
     }
     // the peer's swaps keep their experts in RAM or on a GPU, never only in the file
     if (o.peer_exclusive && peer.valid() && srcp == &src && src.complement_ready()) peer.set_exclusive(&src);

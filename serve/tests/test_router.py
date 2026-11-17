@@ -290,7 +290,7 @@ class Swap(Base):
         a = self.engines["A"]
         a.asleep = True
 
-        def wake(timeout=120.0):
+        def wake(timeout=120.0, vram_check=None):
             a.asleep = False
             self.events.append(("wake", "A"))
             return {}

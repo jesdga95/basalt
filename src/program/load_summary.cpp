@@ -27,46 +27,17 @@ std::string gib(unsigned long long bytes) {
     std::snprintf(b, sizeof b, "%.1f", (double) bytes / 1073741824.0);
     return b;
 }
-std::string label_of(const std::string& name, bool copy) { return copy ? name + " copy" : name; }
 }  // namespace
 
-LoadSummary::Target& LoadSummary::target(const std::string& name, bool copy) {
-    for (auto& t : targets_)
-        if (t.name == name && t.copy == copy) return t;
-    targets_.emplace_back();
-    targets_.back().name = name;
-    targets_.back().copy = copy;
-    return targets_.back();
-}
-
-std::string LoadSummary::running() const {
-    std::string list;
-    unsigned long long d = 0, p = 0;
-    for (const auto& t : targets_) {
-        if (t.start < 0 || t.reported || t.size() == 0) continue;
-        list += (list.empty() ? "" : ", ") + label_of(t.name, t.copy) + " " + gib(t.have()) + " / " + gib(t.size()) + " GiB";
-        d += t.have();
-        p += t.size();
-    }
-    return list.empty() ? "" : "loading " + list + " (" + pct(d, p) + ")";
-}
-
-std::string LoadSummary::all_targets(double now, bool final) const {
-    std::string list;
-    unsigned long long d = 0, whole = total_;
-    for (const auto& t : targets_) {
-        if (t.start < 0 || t.size() == 0) continue;
-        list += (list.empty() ? "" : kDot) + label_of(t.name, t.copy) + " " + gib(t.have()) + "/" + gib(t.size()) + " GiB";
-        if (!t.copy) {
-            d += t.have();
-            if (!total_) whole += t.size();
-        }
-    }
-    return list.empty() ? "" : "loading " + list + kDot + (final ? "100%" : pct(d, whole)) + kDot + secs(now - t0_);
+std::string LoadSummary::status(double now, bool final) const {
+    const unsigned long long whole = size();
+    if (start_ < 0 || whole == 0) return "";
+    return "loading weights " + gib(done_) + "/" + gib(whole) + " GiB" + kDot + (final ? "100%" : pct(done_, whole)) + kDot +
+           secs(now - t0_);
 }
 
 std::string LoadSummary::redraw(double now) {
-    const std::string s = all_targets(now, false);
+    const std::string s = status(now, false);
     if (s.empty()) return "";
     drawn_ = true;
     last_out_ = now;
@@ -86,61 +57,35 @@ std::string LoadSummary::feed(const std::string& raw, double now) {
     std::istringstream is(raw.substr(tag.size()));
     std::vector<std::string> w;
     for (std::string x; is >> x;) w.push_back(x);
-    if (w.empty() || w[0] == "kv") return "";
+    if (w.empty()) return "";
 
     unsigned long long a = 0, b = 0;
     if (w[0] == "total") {
         if (w.size() == 2 && number(w[1], a)) total_ = a;
         return "";
     }
-    if (w[0] == "plan") {
-        const bool copy = w.size() == 4 && w[1] == "copy";
-        if ((w.size() == 3 || copy) && number(w.back(), a)) target(w[copy ? 2 : 1], copy).plan = a;
-        return "";
-    }
-    const bool copy = w[0] == "copy";
-    if (copy) w.erase(w.begin());
-    if (w.size() != 3 || !number(w[1], a) || !number(w[2], b)) return "";
+    // the weights line is the load; the n-gram table lock and the session state are outside it
+    if (w[0] != "weights" || w.size() != 3 || !number(w[1], a) || !number(w[2], b)) return "";
 
-    Target& t = target(w[0], copy);
     std::string out;
-    if (t.start < 0) {
-        t.start = now;
-        // phases run one after another: a target whose last phase ended is done, whatever its plan said
-        for (auto& o : targets_)
-            if (&o != &t && o.copy == copy && o.start >= 0 && !o.reported && o.seen && o.last >= o.seen) {
-                o.reported = true;
-                if (!tty_) out += line("loading " + label_of(o.name, o.copy) + " " + gib(o.have()) + " / " + gib(o.size()) + " GiB done (" + secs(o.end - o.start) + ")");
-            }
-    }
-    t.end = now;
-    if (t.seen != b || a < t.last) {   // a new phase: the previous one is complete
-        t.done += t.seen ? t.last : 0;
-        t.last = 0;
-        t.seen = b;
-        t.reported = false;
-    }
-    t.last = a < b ? a : b;
+    plan_ = b;
+    done_ = a < b ? a : b;
+    if (start_ < 0) start_ = now;
     if (b == 0) return out;
-
-    const bool complete = a >= b && (t.plan == 0 || t.have() >= t.plan);
+    const bool complete = done_ >= size();
     if (tty_) {
         if (!drawn_ || now - last_out_ >= redraw_ || complete) return redraw(now);
         return "";
     }
     if (!header_) {
         header_ = true;
-        std::string parts;
-        for (const auto& x : targets_)
-            if (x.plan > 0) parts += (parts.empty() ? "" : ", ") + label_of(x.name, x.copy) + " " + gib(x.have()) + " / " + gib(x.plan) + " GiB";
-        out += line("loading" + (total_ ? " " + gib(total_) + " GiB" : std::string()) +
-                    (parts.empty() ? "" : (total_ ? ": " : " ") + parts));
+        const unsigned long long whole = total_ ? total_ : size();
+        out += line("loading " + gib(whole) + " GiB");
         last_out_ = now;
     }
-    if (complete && !t.reported) {
-        t.reported = true;
-        out += line("loading " + label_of(t.name, t.copy) + " " + gib(t.have()) + " / " + gib(t.size()) + " GiB done (" +
-                    secs(now - t.start) + ")");
+    if (complete && !reported_) {
+        reported_ = true;
+        out += line("loading weights " + gib(done_) + " / " + gib(size()) + " GiB done (" + secs(now - start_) + ")");
         last_out_ = now;
     }
     return out;
@@ -149,17 +94,15 @@ std::string LoadSummary::feed(const std::string& raw, double now) {
 std::string LoadSummary::tick(double now) {
     if (tty_) return drawn_ && now - last_out_ >= redraw_ ? redraw(now) : "";
     if (now - last_out_ < period_) return "";
-    const std::string s = running();
-    if (s.empty()) return "";
+    if (start_ < 0 || reported_ || size() == 0) return "";
     last_out_ = now;
-    return line(s);
+    return line("loading " + gib(done_) + " / " + gib(size()) + " GiB (" + pct(done_, size()) + ")");
 }
 
 std::string LoadSummary::finish(double now, bool ready) {
     std::string out;
     if (tty_ && drawn_) {
-        for (auto& t : targets_) t.reported = t.reported || ready;
-        out = std::string(kClear) + label_ + ": " + all_targets(now, ready) + "\n";
+        out = std::string(kClear) + label_ + ": " + status(now, ready) + "\n";
         drawn_ = false;
     }
     if (ready) out += line("engine ready in " + secs(now - t0_));

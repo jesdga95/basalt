@@ -34,21 +34,29 @@ inline void dense_f32(const DevTensor& w, const float* x, void* scratch_q8_1, fl
 class ExpertTier;
 class DsparkDrafter;
 
+/// The second cards whose expert tiers a start uses; later cards idle.
+constexpr int kMaxSecondCards = 4;
+
 class DsModel final : public model::LoadedModel {
 public:
     ~DsModel() override;
-    /// Reads the pack and uploads every dense tensor except the token embedding (read per token from the file).
-    bool load(const std::string& path, std::string& err);
+    /// The dense tensors (every one but the token embedding, read per token from the file), the context, the sessions and
+    /// then the expert tier, sized from what they leave; every read queued in `reads`.
+    model::Result plan(const model::LoadRequest& req, core::LoadPlan& reads,
+                       std::vector<std::unique_ptr<model::ModelSession>>& sessions) override;
+    /// The expert tier, its experts landed: pinned, its copies seeded and grown.
+    model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override;
+    /// The start's reads while it plans (null after): what the sessions' shared parts (the tier, the drafter) queue into.
+    core::LoadPlan* planning() const { return planning_; }
 
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_ ? ctx_ : ctxp_default(); }
-    /// Fixes the context from --max-context (`set`) or the model's maximum, bounded by the free device memory. Call
-    /// once after load(), before a session is made. False with `err` when the request cannot be honoured.
+    /// Fixes the context from --max-context (`set`) or the model's maximum, bounded by the free device memory. Called
+    /// once the dense tensors are allocated, before a session is made. False with `err` when the request cannot be honoured.
     bool resolve_context(int64_t requested, std::string& err);
     /// The caches' format (--kv); set before resolve_context.
     CacheFormat cache_format() const { return cache_format_; }
     void set_cache_format(CacheFormat f) { cache_format_ = f; }
-    model::Result make_session(std::unique_ptr<model::ModelSession>& out) override;
 
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }
@@ -104,6 +112,10 @@ public:
     VisionBlas& vision_blas() const { return vision_blas_; }
 
 private:
+    /// Opens the pack and allocates every dense tensor, their reads queued in `reads`.
+    bool load(const std::string& path, core::LoadPlan& reads, std::string& err);
+
+    core::LoadPlan* planning_ = nullptr;
     CacheFormat cache_format_ = CacheFormat::Fp8;
     Pack pack_;
     model::ModelDesc desc_;

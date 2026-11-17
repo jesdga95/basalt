@@ -1,3 +1,4 @@
+#include "basalt/core/load_progress.hpp"
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
@@ -12,6 +13,7 @@ int model(Context& context) {
     auto& rope_cfg = *context.rope_cfg;
     auto& err = *context.err;
 
+    basalt::core::LoadProgress::planning();
     basalt::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
@@ -40,6 +42,20 @@ int model(Context& context) {
         }
         basalt::kernels::rope_scaling_set(rope_cfg);
     }
+    basalt::core::LoadPlan reads;
+    std::vector<std::function<bool(std::string&)>> after;
+    basalt::core::Loader loader;
+    {   // its copy streams on the cards whose weights are read before their caches are sized (the main card, a layer
+        // split's stages), before anything is sized there; a tier card's come with its experts, after its slots are sized
+        std::vector<int> devices = {0};
+        if (context.split_devs != nullptr) devices.insert(devices.end(), context.split_devs->begin(), context.split_devs->end());
+        std::sort(devices.begin(), devices.end());
+        devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
+        if (!loader.prepare(devices, err)) return fatal_start_error(err);
+    }
+    context.reads = &reads;
+    context.after = &after;
+    context.loader = &loader;
     basalt::core::NativeEmbed native_embed;
     {
         if ((o.spec < 2 && !no_spec) || (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
@@ -49,7 +65,7 @@ int model(Context& context) {
         }
         const basalt::core::ModelGeometry g0;
         const auto embed_t0 = std::chrono::steady_clock::now();
-        if (!native_embed.load(o.native_shards, g0.n_embd, 248320, err)) {
+        if (!native_embed.load(o.native_shards, g0.n_embd, 248320, reads, err)) {
             return fatal_start_error(err);
         }
         basalt::core::set_native_embed(&native_embed);

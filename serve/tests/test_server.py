@@ -1718,20 +1718,15 @@ class LoadProgress(unittest.TestCase):
 
     def test_parse(self):
         from serve.engine.progress import engine_warning, load_progress, load_total
-        self.assertEqual(load_progress("basalt load: cuda0 10 100"), ("cuda0", 10, 100, False))
-        self.assertEqual(load_progress("basalt load: copy cuda1 10 100"), ("cuda1", 10, 100, True))
+        self.assertEqual(load_progress("basalt load: weights 10 100"), ("weights", 10, 100))
+        self.assertEqual(load_progress("basalt load: ngram 1073741824 3221225472"), ("ngram", 1 << 30, 3 << 30))
         self.assertIsNone(load_progress("basalt load: total 100"))
-        self.assertIsNone(load_progress("basalt load: cuda0 ten 100"))
+        self.assertIsNone(load_progress("basalt load: weights ten 100"))
+        self.assertIsNone(load_progress("basalt load: cuda0 10 100"))        # no per-device lines any more
         self.assertIsNone(load_progress("basalt generate: loaded 3 GiB"))
-        from serve.engine.progress import load_plan
-        self.assertEqual(load_plan("basalt load: plan cuda0 100"), ("cuda0", 100, False))
-        self.assertEqual(load_plan("basalt load: plan copy cuda1 100"), ("cuda1", 100, True))
-        self.assertIsNone(load_plan("basalt load: plan cuda0 x"))
-        self.assertIsNone(load_plan("basalt load: cuda0 1 2"))
-        self.assertIsNone(load_progress("basalt load: plan cuda0 100"))
         self.assertEqual(load_total("basalt load: total 4096"), 4096)
         self.assertIsNone(load_total("basalt load: total many"))
-        self.assertIsNone(load_total("basalt load: cuda0 1 2"))
+        self.assertIsNone(load_total("basalt load: weights 1 2"))
         self.assertEqual(engine_warning("basalt warning: model 60.0 GiB, free 40.0 GiB"), "model 60.0 GiB, free 40.0 GiB")
         self.assertIsNone(engine_warning("basalt warning: "))
         self.assertIsNone(engine_warning("basalt generate: WARNING: x"))
@@ -1741,91 +1736,57 @@ class LoadProgress(unittest.TestCase):
         out = io.StringIO()
         bars = LoadBars(out)
         bars.set_total(100 << 30)
-        bars.set_plan("ram", 100 << 30)
         for d in range(0, 101, 5):
-            bars.update("ram", d << 30, 100 << 30)
+            bars.update("weights", d << 30, 100 << 30)
         self.assertEqual(out.getvalue(), "")
         bars.finish()
         lines = out.getvalue().splitlines()
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith("[server] loaded   100.0GiB "))
-        self.assertTrue(lines[0].endswith("ram=100.0GiB"))
-
-    def test_phases_add_up_to_one_result(self):
-        from serve.engine.progress import LoadBars
-        out = io.StringIO()
-        bars = LoadBars(out, gpus=[2, 3])
-        bars.set_total(5 << 30)
-        for size in (1 << 30, 4 << 30):                                # two phases of one target
-            bars.update("cuda0", 0, size)
-            bars.update("cuda0", size, size)
-        bars.update("cuda1", 0, 2 << 30, copy=True)
-        bars.update("cuda1", 2 << 30, 2 << 30, copy=True)
-        bars.finish()
-        line, = out.getvalue().splitlines()
-        self.assertTrue(line.startswith("[server] loaded   5.0GiB "))
-        self.assertTrue(line.endswith("cuda2=5.0GiB cuda3-copy=2.0GiB"))
 
     def test_unfinished_start_is_not_reported(self):
         from serve.engine.progress import LoadBars
         out = io.StringIO()
         bars = LoadBars(out)
         bars.set_total(4 << 30)
-        bars.update("cuda0", 1 << 30, 4 << 30)
+        bars.update("weights", 1 << 30, 4 << 30)
         bars.finish()
         self.assertEqual(out.getvalue(), "")
 
-    def test_one_bar_per_target_against_its_own_plan(self):
+    def test_one_bar_for_the_whole_model(self):
         from serve.engine.progress import LoadBars
         out = Tty()
         bars = LoadBars(out, gpus=[2, 3])
-        bars.update("cuda0", 1 << 30, 1 << 30)                          # no plan yet: a count
-        self.assertEqual(out.getvalue().splitlines()[-1].split("\x1b[2K")[-1],
-                         "[server] loading weights into cuda2    1.0 GiB")
-        bars.set_plan("cuda0", 4 << 30)
-        bars.set_plan("ram", 2 << 30)
-        bars.set_plan("cuda1", 1 << 30, copy=True)
-        bars.update("cuda0", 0, 3 << 30)                                # the second phase of the target
-        bars.update("cuda0", 2 << 30, 3 << 30)
-        bars.update("ram", 0, 2 << 30)
-        bars.update("cuda1", 0, 1 << 30, copy=True)
-        rows = [r.split("\x1b[2K")[-1] for r in out.getvalue().splitlines()[-3:]]
-        self.assertEqual(rows[0], "[server] loading weights into cuda2      [" + "=" * 18 + ">" + " " * 5 + "]   3.0/4.0 GiB")
-        self.assertEqual(rows[1], "[server] loading weights into system ram [>" + " " * 23 + "]   0.0/2.0 GiB")
-        self.assertEqual(rows[2], "[server] copying experts to cuda3        [>" + " " * 23 + "]   0.0/1.0 GiB")
-        self.assertEqual(len({r.index("[", 8) for r in rows}), 1)       # the bars line up
+        bars.update("weights", 1 << 30, 0)                              # no total yet: a count
+        self.assertEqual(out.getvalue().splitlines()[-1].split("\x1b[2K")[-1], "[server] loading model weights    1.0 GiB")
+        bars.update("weights", 3 << 30, 4 << 30)
+        self.assertEqual(len(bars.lines()), 1)
+        self.assertEqual(bars.lines()[0], "[server] loading model weights [" + "=" * 18 + ">" + " " * 5 + "]   3.0/4.0 GiB")
         bars.say("[server] warning: x")
-        self.assertIn("\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K[server] warning: x\n", out.getvalue())
+        self.assertIn("\x1b[1A\x1b[2K[server] warning: x\n", out.getvalue())
 
-    def test_bars_follow_the_order_targets_start_loading(self):
+    def test_a_total_that_grows_or_shrinks_moves_the_bar(self):
         from serve.engine.progress import LoadBars
-        out = Tty()
-        bars = LoadBars(out, gpus=[2, 3])
-        bars.set_plan("cuda0", 1 << 30)
-        bars.set_plan("ram", 2 << 30)
-        bars.update("cuda0", 1 << 30, 1 << 30)
-        bars.set_plan("cuda1", 1 << 30)
-        self.assertEqual([r.split(" [")[0].split()[-1] for r in bars.lines()], ["cuda2"])   # ram waits unseen
-        bars.update("cuda1", 0, 1 << 30)                                # planned after ram, loads before it
-        bars.update("ram", 0, 2 << 30)
-        self.assertEqual([r.split(" [")[0].split()[-1] for r in bars.lines()], ["cuda2", "cuda3", "ram"])
+        bars = LoadBars(io.StringIO())
+        bars.update("weights", 2 << 30, 4 << 30)
+        bars.update("weights", 3 << 30, 8 << 30)                        # a stage's share was added
+        self.assertEqual(bars.progress(), {"percent": 37, "gib": 3.0})
+        bars.update("weights", 4 << 30, 4 << 30)                        # a part was left on the file
+        self.assertEqual(bars.progress()["gib"], 4.0)
 
     def test_the_ngram_table_lock_is_its_own_row_outside_the_total(self):
-        from serve.engine.progress import LoadBars, load_progress
-        self.assertEqual(load_progress("basalt load: ngram 1073741824 3221225472"), ("ngram", 1 << 30, 3 << 30, False))
+        from serve.engine.progress import LoadBars
         out = Tty()
         bars = LoadBars(out, gpus=[2, 3])
         bars.set_total(2 << 30)
-        bars.set_plan("cuda0", 2 << 30)
-        bars.update("cuda0", 2 << 30, 2 << 30)
-        bars.update("ngram", 1 << 30, 3 << 30)                          # no plan line: the total is the plan
+        bars.update("weights", 2 << 30, 2 << 30)
+        bars.update("ngram", 1 << 30, 3 << 30)
         rows = [r.split("\x1b[2K")[-1] for r in out.getvalue().splitlines()[-2:]]
-        self.assertEqual(rows[0], "[server] loading weights into cuda2".ljust(49) + " [" + "=" * 24 + "]   2.0/2.0 GiB")
+        self.assertEqual(rows[0], "[server] loading model weights".ljust(49) + " [" + "=" * 24 + "]   2.0/2.0 GiB")
         self.assertEqual(rows[1], "[server] loading the n-gram table into system ram [" + "=" * 8 + ">" + " " * 15 + "]   1.0/3.0 GiB")
         bars.update("ngram", 3 << 30, 3 << 30)
         bars.finish()
         self.assertIn("[server] loaded   2.0GiB ", out.getvalue())     # the table is not part of the loaded bytes
-        self.assertIn("cuda2=2.0GiB", out.getvalue())
 
     @staticmethod
     def _screen(raw: str) -> list[str]:
@@ -1844,22 +1805,19 @@ class LoadProgress(unittest.TestCase):
         return [x for x in rows if x]
 
     def _ple_ram_start(self, out, foreign):
-        """The line sequence of a start with the n-gram table in RAM: the table rows come while cuda0 is loading."""
+        """The line sequence of a start with the n-gram table in RAM: the table row comes while the weights load."""
         from serve.engine import progress
         from serve.engine.progress import LoadBars
         G = 1 << 30
         bars = progress._active = LoadBars(out, gpus=[0, 1])
         try:
             bars.set_total(40 * G)
-            bars.set_plan("cuda0", 30 * G)
-            bars.set_plan("ram", 10 * G)
             for k in range(1, 6):
-                bars.update("cuda0", 5 * G * k, 30 * G)
+                bars.update("weights", 5 * G * k, 40 * G)
             for k in range(0, 4):
                 bars.update("ngram", 18 * G * k // 3 * 1, 18 * G)
-                bars.update("cuda0", (25 + k) * G, 30 * G)
-            bars.update("cuda0", 30 * G, 30 * G)
-            bars.update("ram", 10 * G, 10 * G)
+                bars.update("weights", (25 + k) * G, 40 * G)
+            bars.update("weights", 40 * G, 40 * G)
             bars.update("ngram", 18 * G, 18 * G)
             if foreign:
                 progress.server_line("[server] auto flags: spec 7")
@@ -1880,12 +1838,11 @@ class LoadProgress(unittest.TestCase):
         out = Tty()
         from serve.engine.progress import LoadBars
         bars = LoadBars(out)
-        bars.set_plan("cuda0", 4 << 30)
-        bars.update("cuda0", 3 << 30, 4 << 30)
+        bars.update("weights", 3 << 30, 4 << 30)
         bars.update("ngram", 1 << 30, 3 << 30)
         shown = self._screen(out.getvalue())
         self.assertEqual([x.split(" [")[0].rstrip() for x in shown],
-                         ["[server] loading weights into cuda0", "[server] loading the n-gram table into system ram"])
+                         ["[server] loading model weights", "[server] loading the n-gram table into system ram"])
 
     def test_off_a_terminal_only_the_result_line_prints(self):
         out = io.StringIO()
@@ -1908,7 +1865,7 @@ class LoadProgress(unittest.TestCase):
         bars = LoadBars(out, gpus=[2, 3])
         bars.set_total(2 << 30)
         bars.set_kv("cuda0", 4 << 30, 262144)
-        bars.update("cuda0", 2 << 30, 2 << 30)
+        bars.update("weights", 2 << 30, 2 << 30)
         bars.finish()
         first, second = out.getvalue().splitlines()
         self.assertTrue(first.startswith("[server] loaded   2.0GiB "))   # the allocation is not in the total
@@ -1937,41 +1894,19 @@ class LoadProgress(unittest.TestCase):
         slots.set_kv("cuda0", 1 << 29, 262144, "slot", 4 << 30)
         self.assertEqual(slots.kv_lines(), ["[server] kv       1.0/8.0GiB cuda0 elastic slots=2"])
 
-    def test_a_target_planned_empty_shows_nothing(self):
-        from serve.engine.progress import LoadBars
-        out = Tty()
-        bars = LoadBars(out)
-        bars.set_plan("cuda0", 1 << 30)
-        bars.set_plan("ram", 0)
-        bars.update("cuda0", 0, 1 << 30)
-        bars.update("ram", 0, 0)
-        self.assertEqual(len(bars.lines()), 1)
-
-    def test_a_lowered_total_ends_at_full(self):
-        from serve.engine.progress import LoadBars
-        out = io.StringIO()
-        bars = LoadBars(out)
-        bars.set_total(6 << 30)
-        bars.update("cuda0", 0, 4 << 30)
-        bars.update("cuda0", 4 << 30, 4 << 30)
-        bars.set_total(4 << 30)                                         # the engine left 2 GiB on the file
-        bars.finish()
-        self.assertTrue(out.getvalue().startswith("[server] loaded   4.0GiB "))
-
     def test_names_follow_the_picked_cards(self):
         from serve.engine.progress import LoadBars
-        self.assertEqual(LoadBars(gpus=[2, 3]).name("cuda1"), "cuda3")
-        self.assertEqual(LoadBars().name("cuda1"), "cuda1")
-        self.assertEqual(LoadBars().name("ram"), "system ram")
+        self.assertEqual(LoadBars(gpus=[2, 3]).key("cuda1"), "cuda3")
+        self.assertEqual(LoadBars().key("cuda1"), "cuda1")
 
     def test_narrator_shows_warnings_and_the_result(self):
         from serve.engine.progress import narrate_start
         d = tempfile.mkdtemp()
         log = Path(d) / "engine.log"
-        log.write_text("basalt load: total 200\nbasalt load: plan cuda0 100\nbasalt load: plan ram 100\nbasalt load: plan copy cuda1 100\nbasalt warning: model 1.0 GiB, free VRAM + RAM 0.5 GiB: slow\n"
-                       "basalt load: cuda0 0 100\nbasalt generate: expert arena: resident, 31.64 GiB\n"
-                       "basalt load: cuda0 100 100\nbasalt load: ram 0 100\nbasalt load: ram 100 100\n"
-                       "basalt load: copy cuda1 100 100\nbasalt generate: session is up (engine 1)\n", encoding="utf-8")
+        log.write_text("basalt load: total 200\nbasalt warning: model 1.0 GiB, free VRAM + RAM 0.5 GiB: slow\n"
+                       "basalt load: weights 0 200\nbasalt generate: expert arena: resident, 31.64 GiB\n"
+                       "basalt load: weights 100 200\nbasalt load: weights 200 200\n"
+                       "basalt generate: session is up (engine 1)\n", encoding="utf-8")
         done, out = threading.Event(), io.StringIO()
         with contextlib.redirect_stdout(out):
             t = threading.Thread(target=narrate_start, args=(str(log), 0, done))
@@ -1983,7 +1918,6 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(lines[0], "[server] warning: model 1.0 GiB, free VRAM + RAM 0.5 GiB: slow")
         self.assertEqual(len(lines), 2)
         self.assertTrue(lines[1].startswith("[server] loaded   0.0GiB "))
-        self.assertTrue(lines[1].endswith("cuda0=0.0GiB ram=0.0GiB cuda1-copy=0.0GiB"))
 
     def test_narrator_shows_the_ram_floor_line(self):
         from serve.engine.progress import engine_ram_floor, narrate_start
@@ -2003,11 +1937,13 @@ class LoadProgress(unittest.TestCase):
             t.join(5)
         self.assertEqual(out.getvalue().splitlines()[0], "[server] ram      floor " + text)
 
-    def test_an_older_engine_without_a_total_counts_bytes(self):
-        from serve.engine.progress import narrate_start
+    def test_planning_is_said_before_the_bar(self):
+        from serve.engine.progress import load_planning, narrate_start
+        self.assertTrue(load_planning("basalt load: planning"))
+        self.assertFalse(load_planning("basalt load: total 4096"))
         d = tempfile.mkdtemp()
         log = Path(d) / "engine.log"
-        log.write_text("basalt load: cuda0 0 100\nbasalt load: cuda0 100 100\n", encoding="utf-8")
+        log.write_text("basalt load: planning\nbasalt load: total 4096\nbasalt load: weights 0 4096\n", encoding="utf-8")
         done, out = threading.Event(), Tty()
         t = threading.Thread(target=narrate_start, args=(str(log), 0, done), kwargs={"out": out})
         t.start()
@@ -2015,7 +1951,22 @@ class LoadProgress(unittest.TestCase):
         done.set()
         t.join(5)
         text = out.getvalue()
-        self.assertIn("[server] loading weights into cuda0    0.0 GiB", text)
+        self.assertIn("[server] planning weight allocation", text)
+        self.assertLess(text.index("planning weight allocation"), text.index("loading model weights"))
+
+    def test_an_engine_without_a_total_counts_bytes(self):
+        from serve.engine.progress import narrate_start
+        d = tempfile.mkdtemp()
+        log = Path(d) / "engine.log"
+        log.write_text("basalt load: weights 0 0\nbasalt load: weights 100 0\n", encoding="utf-8")
+        done, out = threading.Event(), Tty()
+        t = threading.Thread(target=narrate_start, args=(str(log), 0, done), kwargs={"out": out})
+        t.start()
+        time.sleep(0.6)
+        done.set()
+        t.join(5)
+        text = out.getvalue()
+        self.assertIn("[server] loading model weights    0.0 GiB", text)
         self.assertNotIn("[=", text)
 
 

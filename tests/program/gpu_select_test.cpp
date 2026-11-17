@@ -51,11 +51,11 @@ static std::string cards(const GpuChoice& c) {
     return s;
 }
 
-static std::string roles(const std::vector<GpuCard>& v, const GpuChoice& c, int tiers, bool prompt_line = false, bool layer_stage = false) {
+static std::string roles(const std::vector<GpuCard>& v, const GpuChoice& c, int tiers, bool prompt_split = false, bool layer_stage = false) {
     RoleInputs in;
     for (int i : c.cards) in.cards.push_back(v[(size_t) i]);
     in.max_expert_tiers = tiers;
-    in.prompt_line = prompt_line;
+    in.prompt_split = prompt_split;
     in.layer_stage = layer_stage;
     std::string s;
     for (GpuRole r : choose_roles(in)) s += (s.empty() ? "" : ",") + std::string(gpu_role_name(r));
@@ -124,7 +124,7 @@ int main() {
         if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 3090) skipped, not sm_120");
         CHECK_STR(roles(v, c, 1), "main,expert tier,idle");
         CHECK_STR(roles(v, c, 3), "main,expert tier,expert tier");
-        CHECK_STR(roles(v, c, 1, true), "main,prompt line,idle");
+        CHECK_STR(roles(v, c, 1, true), "main,prompt split,idle");
         CHECK_STR(roles(v, c, 1, true, true), "main,layer stage,idle");
         c = pick("", v);
         CHECK_STR(cards(c), "0");

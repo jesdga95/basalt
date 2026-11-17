@@ -1,6 +1,8 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
 #include "basalt/core/device.hpp"
 #include "basalt/core/load_progress.hpp"
+#include "models/deepseek41/tier.hpp"
+#include "basalt/core/loader.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/model.hpp"
 
@@ -26,7 +28,7 @@ DsModel::~DsModel() {
     if (experts_fd_ >= 0) platform::close_fd(experts_fd_);
 }
 
-bool DsModel::load(const std::string& path, std::string& err) {
+bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& err) {
     if (!open_pack(path, pack_, err)) return false;
     path_ = path;
     cudaGetDevice(&device_);
@@ -53,18 +55,10 @@ bool DsModel::load(const std::string& path, std::string& err) {
     }
 
     // dense tensors to the device; the token embedding and the Engram table stay in the file
-    std::vector<uint8_t> staging;
-    std::vector<float> wide;
     uint64_t total = 0;
-    uint64_t dense_bytes = 0;
-    for (const auto& [name, t] : pack_.tensors) {
-        if (name == "token_embd.weight" || name == "per_layer_token_embd.weight") continue;
-        const bool wide_gate = t.type == 30 && name.find("ffn_gate_inp.weight") != std::string::npos;
-        dense_bytes += wide_gate ? t.bytes * 2 : t.bytes;
-    }
-    core::LoadProgress::announce_total(dense_bytes + pack_.experts_range.size());
-    core::LoadProgress::plan(core::LoadProgress::cuda(0), dense_bytes);
-    core::LoadProgress dense_load(core::LoadProgress::cuda(0), dense_bytes);
+    const int dense_file = plan.file_fd(embd_fd_);
+    int dense_device = 0;
+    if (cudaGetDevice(&dense_device) != cudaSuccess) dense_device = 0;
     for (const auto& [name, t] : pack_.tensors) {
         if (name == "token_embd.weight" || name == "per_layer_token_embd.weight") continue;
         DevTensor d;
@@ -81,31 +75,17 @@ bool DsModel::load(const std::string& path, std::string& err) {
             err = "out of device memory loading " + name;
             return false;
         }
-        constexpr uint64_t kChunk = 64ull << 20;
-        staging.resize((size_t) std::min<uint64_t>(t.bytes, kChunk));
-        for (uint64_t off = 0; off < t.bytes; off += kChunk) {
-            const uint64_t n = std::min<uint64_t>(kChunk, t.bytes - off);
-            if (!platform::pread_all(embd_fd_, staging.data(), n, t.offset + off)) {
-                err = "short read of " + name;
-                cudaFree(d.ptr);
-                return false;
-            }
-            if (widen) {
-                wide.resize((size_t) n / 2);
-                dequantize_bf16(staging.data(), wide.data(), (int) (n / 2));
-            }
-            if (cudaMemcpy((char*) d.ptr + off * (widen ? 2 : 1), widen ? (const void*) wide.data() : staging.data(),
-                           widen ? n * 2 : n, cudaMemcpyHostToDevice) != cudaSuccess) {
-                err = "upload of " + name + " failed";
-                cudaFree(d.ptr);
-                return false;
-            }
-            dense_load.add(widen ? n * 2 : n);
-        }
+        core::LoadItem it;
+        it.file = dense_file;
+        it.off = t.offset;
+        it.bytes = t.bytes;
+        it.dev = d.ptr;
+        it.device = dense_device;
+        it.conv = widen ? core::Conv::Bf16ToF32 : core::Conv::Copy;
+        plan.add(it);
         total += d.bytes;
         dev_.emplace(name, std::move(d));
     }
-    dense_load.finish();
     basalt::log::info("basalt deepseek41", "%zu dense tensors, %.2f GiB on the GPU", dev_.size(),
                  (double) total / (1024.0 * 1024.0 * 1024.0));
 
@@ -217,10 +197,50 @@ bool DsModel::open_mmproj(vision::Mmproj& mp, std::string& err) const {
     return mp.open(pack_.vision, err, "deepseek41v");
 }
 
-model::Result DsModel::make_session(std::unique_ptr<model::ModelSession>& out) {
+model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads,
+                            std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
+    if (req.paths.empty()) return {model::Status::Error, "deepseek41: no model path"};
     std::string err;
-    out = make_session_impl(*this, err);
-    if (!out) return {model::Status::Error, err};
+    if (!load(req.paths.front(), reads, err)) return {model::Status::Error, "deepseek41: " + err};
+    CacheFormat fmt = CacheFormat::Fp8;
+    if (!req.kv.empty() && !ctxp::cache_format(req.kv, fmt)) return {model::Status::Error, "deepseek41: --kv " + req.kv + ": fp8 or fp16"};
+    set_cache_format(fmt);
+    if (!resolve_context(req.max_context, err)) return {model::Status::Error, err};
+    set_diag_dump(req.diag_dump);
+    set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
+    set_tiers(req);
+    std::vector<int> peers = req.peer_devices;
+    if (peers.size() > (size_t) kMaxSecondCards) {
+        basalt::log::warn("basalt deepseek41", "%zu second cards given, %d hold experts; later cards idle", peers.size(),
+                          kMaxSecondCards);
+        peers.resize((size_t) kMaxSecondCards);
+    }
+    // The peer-tier kernels of this architecture are built for sm_120 only: refuse an older
+    // peer card here rather than failing at its first launch with 'no kernel image'.
+    for (int dev : peers) {
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.major != 0 && !(prop.major == 12 && prop.minor == 0))
+            return {model::Status::Error, "deepseek41: GPU " + std::to_string(dev) + " (" + prop.name +
+                                              ") is not sm_120: the DeepSeek peer-tier kernels are built for Blackwell only"};
+    }
+    set_peer_devices(std::move(peers));
+    // the sessions first (the drafter takes its memory with the first), then the expert tier, sized from what they leave,
+    // opened by the first session; what those share queues its reads in the start's plan
+    planning_ = &reads;
+    model::Result r;
+    for (int i = 0; r.ok() && i < std::max(req.sessions, 1); ++i) {
+        std::unique_ptr<model::ModelSession> s = make_session_impl(*this, err);
+        if (!s) r = {model::Status::Error, err};
+        else sessions.push_back(std::move(s));
+    }
+    if (r.ok()) r = sessions.front()->prepare();
+    planning_ = nullptr;
+    return r;
+}
+
+model::Result DsModel::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>&) {
+    std::string err;
+    if (shared_tier_.tier && !shared_tier_.tier->attach(err)) return {model::Status::Error, err};
     return {};
 }
 
