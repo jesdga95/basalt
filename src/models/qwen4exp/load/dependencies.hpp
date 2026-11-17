@@ -17,6 +17,7 @@
 #include "basalt/core/device.hpp"
 #include "basalt/core/draft_cum.hpp"
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/exact_slots.hpp"
 #include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/expert_source.hpp"
