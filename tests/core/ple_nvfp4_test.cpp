@@ -12,7 +12,7 @@
 #include "gguf_fixture.hpp"
 
 #include "basalt/artifact/dequant.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 
 #include <chrono>
 #include <cmath>
