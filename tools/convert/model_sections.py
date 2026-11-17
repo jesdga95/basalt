@@ -384,6 +384,181 @@ def q8_0(x: np.ndarray) -> bytes:
     return out.tobytes()
 
 
+Q5K_BLOCK, Q5K_BYTES = 256, 176
+Q51_BLOCK, Q51_BYTES = 32, 24
+
+
+def _sum32(a: np.ndarray) -> np.ndarray:
+    """(nb, 32) summed over the last axis in 32 explicit steps: a bulk reduction can return wrong sums for these
+    shapes on some hosts (the same reason q6_k builds its terms elementwise)."""
+    s = a[:, 0].copy()
+    for k in range(1, a.shape[1]):
+        s += a[:, k]
+    return s
+
+
+def get_scale_min_k4(ls: np.ndarray, lm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """llama.cpp's get_scale_min_k4 as it PACKS the 12 bytes: `ls`/`lm` (nb, 8) 6-bit scales and mins -> (nb, 12)."""
+    out = np.empty((ls.shape[0], 12), np.uint8)
+    out[:, 0:4] = ls[:, 0:4] | ((ls[:, 4:8] >> 4) << 6)
+    out[:, 4:8] = lm[:, 0:4] | ((lm[:, 4:8] >> 4) << 6)
+    out[:, 8:12] = (ls[:, 4:8] & 0xF) | ((lm[:, 4:8] & 0xF) << 4)
+    return out
+
+
+def _qkx2(x: np.ndarray, nmax: int, rmin: float, rdelta: float, nstep: int) -> tuple[np.ndarray, np.ndarray]:
+    """make_qkx2_quants (ggml-quants.c) over rows of `x` (nb, n): the weighted search for the scale and the offset
+    that fit `v = scale * q - offset`, q in 0..nmax. Returns (scale, offset), both (nb,) float32."""
+    if x.shape[0] > 512:
+        # numpy on some hosts returns wrong results for these shapes once the array is large (the same host effect
+        # q6_k's elementwise reductions avoid): search in bounded batches and stack the outcomes
+        out = [_qkx2(x[i:i + 512], nmax, rmin, rdelta, nstep) for i in range(0, x.shape[0], 512)]
+        return np.concatenate([o[0] for o in out]), np.concatenate([o[1] for o in out])
+    nb, n = x.shape
+    x = x.astype(np.float64)     # the search in float64: near-constant 32-value groups cancel in float32
+    xx = np.empty((nb, n), np.float64)
+    ax = np.empty((nb, n), np.float64)
+    for k in range(n):
+        xx[:, k] = x[:, k] * x[:, k]
+        ax[:, k] = np.abs(x[:, k])
+    av = np.sqrt(_sum32(xx) / n)
+    w = av[:, None] + ax
+    sum_w = _sum32(w)
+    sum_x = _sum32(w * x)
+    lo, hi = x[:, 0].copy(), x[:, 0].copy()
+    for k in range(1, n):
+        v = x[:, k]
+        lo = np.where(v < lo, v, lo)
+        hi = np.where(v > hi, v, hi)
+    lo = np.minimum(lo, 0.0)
+    dead = hi == lo
+    span = np.where(dead, 1.0, hi - lo)
+
+    def codes(isc):
+        q = np.rint(isc[:, None] * (x - lo[:, None]))
+        return np.clip(q, 0, nmax).astype(np.float32)
+
+    # numpy on some hosts reports overflow/invalid for these shapes and magnitudes (nothing here exceeds ~1e3); the
+    # encoders are checked numerically by the round-trip tests, so the flags only add noise
+    state = np.errstate(over="ignore", invalid="ignore", divide="ignore", under="ignore")
+    state.__enter__()
+    isc = nmax / span
+    scale = 1.0 / isc
+    l = codes(isc)
+    diff = scale[:, None] * l + lo[:, None] - x      # llama.cpp keeps `min` (<= 0) in the fit; off = -min >= 0
+    best = _sum32(w * diff * diff)
+    best_scale, best_off = scale, -lo
+    for step in range(nstep + 1):
+        ic = (rmin + rdelta * step + nmax) / span
+        lc = codes(ic)
+        sum_l = _sum32(w * lc)
+        sum_l2 = _sum32(w * lc * lc)
+        sum_xl = _sum32(w * lc * x)
+        det = sum_w * sum_l2 - sum_l * sum_l
+        ok = det > 0
+        if True:
+            safe = np.where(ok, det, 1.0)
+            this_scale = (sum_w * sum_xl - sum_x * sum_l) / safe
+            this_min = (sum_l2 * sum_x - sum_l * sum_xl) / safe
+            pos = this_min > 0
+            this_scale = np.where(pos, sum_xl / np.where(sum_l2 > 0, sum_l2, 1.0), this_scale)
+            this_min = np.where(pos, 0.0, this_min)
+            # a near-constant block cancels `det` down to noise: its fit is garbage, so keep the initial one.  A fit
+            # cannot widen the grid the codes were found on (the range over 31 levels), so that bounds it too.
+            solid = ok & (det > 1e-9 * np.maximum(sum_w * sum_l2, 1e-30)) & np.isfinite(this_scale) & \
+                (this_scale > 0) & (this_scale <= 2.0 * scale)
+            this_scale = np.where(solid, this_scale, 0.0)
+            this_min = np.where(solid, this_min, 0.0)
+            d2 = this_scale[:, None] * lc + this_min[:, None] - x
+            err = _sum32(w * d2 * d2)
+        better = solid & (err < best)
+        best_scale = np.where(better, this_scale, best_scale)
+        best_off = np.where(better, -this_min, best_off)
+        best = np.where(better, err, best)
+    state.__exit__(None, None, None)
+    return np.where(dead, 0.0, best_scale).astype(np.float32), \
+        np.where(dead, -lo, best_off).astype(np.float32)
+
+
+def q5_1(x: np.ndarray) -> bytes:
+    """Q5_1 blocks of 32 over a float32 array (length a multiple of 32): d = (max - min) / 31, m the min, both fp16,
+    5-bit codes with the high bits in one u32. quantize_row_q5_1_ref, rounded against the stored d and m."""
+    b = np.ascontiguousarray(x, np.float32).reshape(-1, Q51_BLOCK)
+    nb = b.shape[0]
+    lo, hi = b[:, 0].copy(), b[:, 0].copy()
+    for k in range(1, Q51_BLOCK):
+        v = b[:, k]
+        lo = np.where(v < lo, v, lo)
+        hi = np.where(v > hi, v, hi)
+    d16 = ((hi - lo) / np.float32(31)).astype(np.float16)
+    m16 = lo.astype(np.float16)
+    df, mf = d16.astype(np.float32), m16.astype(np.float32)
+    inv = np.where(df != 0, np.float32(1) / np.where(df != 0, df, np.float32(1)), np.float32(0))
+    q0 = np.empty((nb, 16), np.uint8)
+    q1 = np.empty((nb, 16), np.uint8)
+    for k in range(16):
+        e0 = b[:, k] - mf
+        e1 = b[:, k + 16] - mf
+        q0[:, k] = np.clip(np.rint(e0 * inv), 0, 31).astype(np.uint8)
+        q1[:, k] = np.clip(np.rint(e1 * inv), 0, 31).astype(np.uint8)
+    qh = np.zeros((nb,), np.uint32)
+    for k in range(16):
+        qh |= (q0[:, k] & np.uint32(0x10)).astype(np.uint32) >> np.uint32(4) << np.uint32(k)
+        qh |= (q1[:, k] & np.uint32(0x10)).astype(np.uint32) >> np.uint32(4) << np.uint32(k + 16)
+    out = np.empty((nb, Q51_BYTES), np.uint8)
+    out[:, 0:2] = d16.view(np.uint8).reshape(nb, 2)
+    out[:, 2:4] = m16.view(np.uint8).reshape(nb, 2)
+    out[:, 4:8] = qh.view(np.uint8).reshape(nb, 4)
+    out[:, 8:24] = (q0 & np.uint8(15)) | ((q1 & np.uint8(15)) << np.uint8(4))
+    return out.tobytes()
+
+
+def q5_k(x: np.ndarray) -> bytes:
+    """Q5_K blocks of 256 over a float32 array (length a multiple of 256): per 32-value sub-block make_qkx2_quants
+    (weights av_x + |x|, 15-step search), the 8 sub-block scales and mins as 6-bit pairs against one fp16 d and dmin
+    and 5-bit codes; the layout is ggml block_q5_K. Transcribed from quantize_row_q5_K_ref."""
+    nb = np.asarray(x).size // Q5K_BLOCK
+    xb = np.ascontiguousarray(x, np.float32).reshape(nb * 8, 32)
+    scale, off = _qkx2(xb, 31, -0.5, 0.1, 15)
+    scale, off = scale.reshape(nb, 8), off.reshape(nb, 8)
+    max_scale, max_off = scale[:, 0].copy(), off[:, 0].copy()
+    for j in range(1, 8):
+        max_scale = np.maximum(max_scale, scale[:, j])
+        max_off = np.maximum(max_off, off[:, j])
+    inv_scale = np.where(max_scale > 0, np.float32(63) / np.where(max_scale > 0, max_scale, np.float32(1)), np.float32(0))
+    inv_off = np.where(max_off > 0, np.float32(63) / np.where(max_off > 0, max_off, np.float32(1)), np.float32(0))
+    ls = np.clip(np.rint(inv_scale[:, None] * scale), 0, 63).astype(np.uint8)
+    lm = np.clip(np.rint(inv_off[:, None] * off), 0, 63).astype(np.uint8)
+    d16 = (max_scale / np.float32(63)).astype(np.float16)
+    dmin16 = (max_off / np.float32(63)).astype(np.float16)
+    packed = get_scale_min_k4(ls, lm)
+    codes = np.empty((nb, 8, 32), np.uint8)
+    for j in range(8):
+        dj = d16.astype(np.float32) * ls[:, j]
+        dm = dmin16.astype(np.float32) * lm[:, j]
+        safe = np.where(dj != 0, dj, np.float32(1))
+        e = np.empty((nb, 32), np.float32)
+        for k in range(32):
+            e[:, k] = xb.reshape(nb, 8, 32)[:, j, k] + dm
+        q = np.where(dj[:, None] != 0, np.rint(e / safe[:, None]), np.float32(0))
+        codes[:, j] = np.clip(q, 0, 31).astype(np.uint8)
+    qh = np.zeros((nb, 32), np.uint8)
+    ql = np.empty((nb, 4, 32), np.uint8)
+    for g in range(4):
+        l1 = codes[:, 2 * g] & np.uint8(15)
+        l2 = codes[:, 2 * g + 1] & np.uint8(15)
+        qh[:, :] |= ((codes[:, 2 * g] >> np.uint8(4)) << np.uint8(2 * g)) | \
+                    ((codes[:, 2 * g + 1] >> np.uint8(4)) << np.uint8(2 * g + 1))
+        ql[:, g] = l1 | (l2 << np.uint8(4))
+    out = np.empty((nb, Q5K_BYTES), np.uint8)
+    out[:, 0:2] = d16.view(np.uint8).reshape(nb, 2)
+    out[:, 2:4] = dmin16.view(np.uint8).reshape(nb, 2)
+    out[:, 4:16] = packed
+    out[:, 16:48] = qh
+    out[:, 48:176] = ql.reshape(nb, 128)
+    return out.tobytes()
+
+
 def _bf16_to_f32(u16: np.ndarray) -> np.ndarray:
     return (u16.astype(np.uint32) << 16).view(np.float32)
 

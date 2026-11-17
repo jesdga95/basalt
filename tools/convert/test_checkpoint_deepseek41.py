@@ -170,7 +170,7 @@ class DeepSeekCheckpointTest(unittest.TestCase):
     def run_ck(self, out, stream=False, base=None, ck=None):
         a = dict(sections_from=str(base or self.base), checkpoint=str(ck or self.ck), out=str(self.t / out),
                  stream_shards=stream, workers=2, name="Tiny NVFP4", force=False,
-                 dense_q8_0=False, expert_q2_0=False, mtp_dense=None)
+                 dense_q8_0=False, expert_q5_k=False, mtp_dense=None)
         convert.from_checkpoint(type("A", (), a)())
         return ModelFile(str(self.t / out))
 
