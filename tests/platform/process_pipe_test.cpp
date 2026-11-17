@@ -1,6 +1,7 @@
 // tests/platform/process_pipe_test.cpp - platform::spawn_piped, the pipe calls and capture_output, with this program as
 // the child. CPU only, no model. `--echo` is the child's mode: it answers each line of its input with the same line
 // upper-cased on its output, reports on its error stream, and ends with code 7 when its input ends.
+#include "basalt/core/progress.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/platform/system.hpp"
@@ -9,8 +10,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -49,6 +52,15 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         std::fputs("to stderr\n", stderr);
         return 0;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--crash-terminate") == 0) {
+        basalt::platform::install_crash_handler();
+        basalt::core::progress_at("decode", 17, 64);
+        try {
+            throw std::runtime_error("boom");
+        } catch (...) {
+            std::terminate();
+        }
     }
     using namespace basalt::platform;
     const std::string self = module_path();
@@ -104,5 +116,23 @@ int main(int argc, char** argv) {
     const auto only = capture_output({self, "--both"}, false);
     check(only && only->find("to stdout") != std::string::npos && only->find("to stderr") == std::string::npos,
           "capture_output without stderr");
+
+    const std::string crash_log = temp_dir() + "/basalt_process_crash_test.err";
+    PipedChild crashed;
+    std::string crash_err;
+    check(spawn_piped({self, "--crash-terminate"}, crash_log, crashed, crash_err), "crash child starts: " + crash_err);
+    if (crashed.in_fd >= 0) {
+        const int rc = child_wait(crashed.child, 10000);
+        check(rc != 0, "crash child exits non-zero");
+        close_fd(crashed.in_fd);
+        close_fd(crashed.out_fd);
+        child_close(crashed.child);
+        std::ifstream cf(crash_log);
+        std::string cline;
+        std::getline(cf, cline);
+        check(cline.find("basalt crash: error: unhandled exception (boom) in decode (17) chunk 64") != std::string::npos,
+              "crash handler writes exception and stage to stderr");
+    }
+    std::remove(crash_log.c_str());
     return failures ? 1 : 0;
 }

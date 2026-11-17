@@ -297,6 +297,8 @@ class ProcessEngine:
         if lazy:
             return
         self.unloaded = False            # `ended` stays True until READY
+        if log:
+            self._rotate_log(log)
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: stops the narrator
         log_start = os.path.getsize(log) if log else 0  # where this start's log lines begin
@@ -352,6 +354,10 @@ class ProcessEngine:
         loading.set()
         if log:
             narrator.join(2)                            # its lines precede what follows READY
+            try:
+                self.log_ready_pos = os.path.getsize(log)
+            except OSError:
+                self.log_ready_pos = 0
         if self.max_context <= 0:
             if timed_out:                               # still loading, or hung: end it so the turn is not held
                 try:
@@ -481,6 +487,47 @@ class ProcessEngine:
         for q in slot_q:
             q.put(None)
 
+    _NT_CRASH_CODES = {
+        0x40000015: "STATUS_FATAL_APP_EXIT",
+        0xC0000005: "STATUS_ACCESS_VIOLATION",
+        0xC0000006: "STATUS_IN_PAGE_ERROR",
+        0xC000001D: "STATUS_ILLEGAL_INSTRUCTION",
+        0xC0000094: "STATUS_INTEGER_DIVIDE_BY_ZERO",
+        0xC00000FD: "STATUS_STACK_OVERFLOW",
+        0xC0000135: "STATUS_DLL_NOT_FOUND",
+        0xC000013A: "STATUS_CONTROL_C_EXIT",
+        0xC0000374: "STATUS_HEAP_CORRUPTION",
+        0xC0000409: "STATUS_STACK_BUFFER_OVERRUN",
+        0xE06D7363: "C++ exception",
+    }
+
+    @staticmethod
+    def _rotate_log(path: str, max_bytes: int = 10 << 20) -> None:
+        try:
+            if os.path.getsize(path) >= max_bytes:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+
+    @classmethod
+    def _format_exit_status(cls, rc: int | None) -> str:
+        """Human-readable exit status, decoding POSIX signals and Windows NTSTATUS crash codes."""
+        if rc is None:
+            return "the engine ended (no exit status)"
+        if rc < 0:
+            try:
+                return f"the engine was killed by {signal.Signals(-rc).name}"
+            except ValueError:
+                return f"the engine was killed by signal {-rc}"
+        if rc in cls._NT_CRASH_CODES:
+            return f"the engine crashed (0x{rc:08X} {cls._NT_CRASH_CODES[rc]})"
+        if rc >= 0x80000000:
+            return f"the engine crashed (0x{rc:08X})"
+        return f"the engine exited (code {rc})"
+
+    def _died(self) -> EngineDied:
+        return EngineDied(self.death_note())
+
     def death_note(self) -> str:
         """What is known of why the engine ended: its exit code or signal and its last error line, never a guess."""
         if getattr(self, "silent_note", None):          # the server ended it
@@ -498,21 +545,21 @@ class ProcessEngine:
                 return "the engine's watchdog stopped it: " + line.strip()
         proc = self.proc                                 # None between restart's close and start
         rc = proc.poll() if proc is not None else None
-        if rc is None:
-            status = "the engine ended (no exit status)"
-        elif rc < 0:
-            try:
-                status = f"the engine was killed by {signal.Signals(-rc).name}"
-            except ValueError:
-                status = f"the engine was killed by signal {-rc}"
-        else:
-            status = f"the engine exited (code {rc})"
+        status = self._format_exit_status(rc)
         if rc is not None and rc >= 0 and self.last_err:  # its last stdout words
             return f"{status} after it reported: {self.last_err}"
-        lines = [x.strip() for x in tail.splitlines()]
-        err = next((x for x in reversed(lines) if ": error: " in x or x.startswith("ERR")), "")
-        if err:
-            return f"{status}, last error in its log: {err}"
+        raw_lines = tail.splitlines()
+        err_idx = next((i for i in range(len(raw_lines) - 1, -1, -1)
+                        if ": error: " in raw_lines[i] or raw_lines[i].lstrip().startswith("ERR")), None)
+        if err_idx is not None:
+            block = [raw_lines[err_idx].strip()]
+            for nxt in raw_lines[err_idx + 1:]:
+                if nxt.startswith(("  ", "\t")) and nxt.strip():
+                    block.append(nxt.strip())
+                else:
+                    break
+            return f"{status}, last error in its log: {' | '.join(block)}"
+        lines = [x.strip() for x in raw_lines]
         last = next((x for x in reversed(lines) if x.startswith("basalt")), "")
         return f"{status}, last log line: {last}" if last else f"{status}, nothing in its log"
 
@@ -777,7 +824,7 @@ class ProcessEngine:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
         except (OSError, AttributeError):                # the pipe is gone
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            raise self._died() from None
 
     def _control(self, cancel, on_token, stop_when=None, idle=None, stop_soon=None):
         """Read the control lines of a GEN/BGEN, yielding None as heartbeat and False per token (on_token gets the id).
@@ -806,7 +853,7 @@ class ProcessEngine:
                 continue
             beat = time.monotonic()
             if line is None:
-                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                raise self._died()
             if line.startswith("P "):
                 lp = logprob_line(line.split()[1:])
                 continue
@@ -1309,7 +1356,7 @@ class ProcessEngine:
                         continue
                     if line is None:
                         phase = "none"
-                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                        raise self._died()
                     if line.startswith("BP "):                  # a kept pick's logprobs, ahead of its BT line
                         slot_lp.append(logprob_line(line.split()[2:]))
                         continue
@@ -1551,7 +1598,7 @@ class ProcessEngine:
                 self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            raise self._died() from None
         done = False
         # silence allowance: silence_s plus the first chunk's read time; each PP line resets it to its chunk's time
         silence = float(self.silence_s or 0)
@@ -1591,7 +1638,7 @@ class ProcessEngine:
                     continue
                 if line is None:
                     done = True
-                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                    raise self._died()
                 heard = time.monotonic()                  # any line counts as output
                 beat = heard
                 if line.startswith("P "):

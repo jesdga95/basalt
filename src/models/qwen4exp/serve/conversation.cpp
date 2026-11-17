@@ -173,7 +173,10 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
         for (size_t k = 0; k < n_st; ++k) {   // the later stages
             auto& st = stages[k];
             const basalt::core::OnDevice on(st->dev);
-            if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+            if (const cudaError_t ce = cudaDeviceSynchronize(); ce != cudaSuccess) {
+                err = std::string("stage sync failed: ") + cudaGetErrorString(ce);
+                return false;
+            }
             const basalt::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
             basalt::core::SavedConversation part;
             if (!basalt::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
