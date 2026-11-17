@@ -445,6 +445,95 @@ int main(int argc, char** argv) {
             cudaFree(bk); cudaFree(bv); cudaFree(bq); cudaFree(bo); cudaFree(b8.k); cudaFree(b8.v); cudaFree(b8.ks); cudaFree(b8.vs);
         }
     }
+    // ---- the decode kernel's bits are frozen: random fp16 and int8 caches, many (pos0, T), a device pos0, two windows in one launch.
+    // The hashes below are those of the kernel before its next-chunk fetch; a change that must not move a bit leaves them as they are.
+    {
+        std::mt19937 hr(99);
+        std::normal_distribution<float> hn(0.f, 1.f);
+        const int64_t cap = 4096;
+        const size_t n = (size_t) cap * NKV * HD;
+        std::vector<uint16_t> hk(n), hv(n);
+        for (size_t i = 0; i < n; ++i) {
+            hk[i] = basalt::kernels::f16_from_f32(hn(hr));
+            hv[i] = basalt::kernels::f16_from_f32(hn(hr));
+        }
+        std::vector<int8_t> k8(n), v8(n);
+        std::vector<uint16_t> ks(n / 64), vs(n / 64);
+        const auto quant = [&](const std::vector<uint16_t>& src, std::vector<int8_t>& q8v, std::vector<uint16_t>& sc) {
+            for (size_t g = 0; g < n / 64; ++g) {
+                float amax = 0;
+                for (int i = 0; i < 64; ++i) amax = std::max(amax, std::fabs(h2f(src[g * 64 + i])));
+                sc[g] = basalt::kernels::f16_from_f32(amax / 127.0f);
+                const float s16 = h2f(sc[g]);
+                for (int i = 0; i < 64; ++i) q8v[g * 64 + i] = (int8_t) (s16 > 0 ? std::lrint(h2f(src[g * 64 + i]) / s16) : 0);
+            }
+        };
+        quant(hk, k8, ks);
+        quant(hv, v8, vs);
+        uint16_t *dk = dev<uint16_t>(n), *dv = dev<uint16_t>(n);
+        ck(cudaMemcpy(dk, hk.data(), n * 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(dv, hv.data(), n * 2, cudaMemcpyHostToDevice), "copy");
+        basalt::kernels::KvInt8 c8;
+        ck(cudaMalloc(&c8.k, n), "malloc");
+        ck(cudaMalloc(&c8.v, n), "malloc");
+        ck(cudaMalloc(&c8.ks, ks.size() * 2), "malloc");
+        ck(cudaMalloc(&c8.vs, vs.size() * 2), "malloc");
+        ck(cudaMemcpy(c8.k, k8.data(), n, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(c8.v, v8.data(), n, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(c8.ks, ks.data(), ks.size() * 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(c8.vs, vs.data(), vs.size() * 2, cudaMemcpyHostToDevice), "copy");
+        constexpr int TW2 = basalt::kernels::kGqaMaxWindow;
+        std::vector<float> hq((size_t) TW2 * NH * HD);
+        for (auto& x : hq) x = 2.0f * hn(hr);
+        float *dq = dev<float>(hq.size()), *dout = dev<float>(hq.size());
+        float* dscr = dev<float>(basalt::kernels::gqa_decode_scratch_floats(cap, TW2, NH));
+        int32_t* dpos = dev<int32_t>(1);
+        ck(cudaMemcpy(dq, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice), "copy");
+        std::vector<float> got(hq.size());
+        unsigned long long hash[4] = {1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull};
+        const auto fold = [&](unsigned long long& h, size_t floats) {
+            ck(cudaMemcpy(got.data(), dout, floats * 4, cudaMemcpyDeviceToHost), "copy");
+            for (size_t i = 0; i < floats; ++i) {
+                unsigned u;
+                std::memcpy(&u, &got[i], 4);
+                h = (h ^ u) * 1099511628211ull;
+            }
+        };
+        const int64_t starts[] = {0, 1, 31, 32, 33, 500, 1999, 2047, 3000, 4000};
+        for (int cache = 0; cache < 2; ++cache) {
+            const uint16_t* kk = cache ? nullptr : dk;
+            const uint16_t* vv = cache ? nullptr : dv;
+            const basalt::kernels::KvInt8 q8 = cache ? c8 : basalt::kernels::KvInt8{};
+            for (int T : {1, 2, 5, 8, 12, 16})
+                for (int64_t p0 : starts) {
+                    if (p0 + T > cap) continue;
+                    basalt::kernels::gqa_decode_attn(dq, kk, vv, NH, NKV, p0, T, dscr, cap, dout, nullptr, nullptr, q8);
+                    fold(hash[cache], (size_t) T * NH * HD);
+                }
+            for (int p0 : {1500, 3000}) {
+                ck(cudaMemcpy(dpos, &p0, 4, cudaMemcpyHostToDevice), "copy");
+                basalt::kernels::gqa_decode_attn(dq, kk, vv, NH, NKV, 0, 3, dscr, cap, dout, nullptr, dpos, q8);
+                fold(hash[2], (size_t) 3 * NH * HD);
+            }
+            basalt::kernels::GqaSeg sg[2];
+            sg[0].T = 5;
+            sg[0].k_cache = kk;
+            sg[0].v_cache = vv;
+            sg[0].pos0 = 1000;
+            sg[0].q8 = q8;
+            sg[1] = sg[0];
+            sg[1].T = 7;
+            sg[1].pos0 = 3333;
+            basalt::kernels::gqa_decode_attn_segs(dq, NH, NKV, sg, 2, dscr, cap, dout, nullptr);
+            fold(hash[3], (size_t) 12 * NH * HD);
+        }
+        const unsigned long long frozen[4] = {0x430a8888287f57faull, 0xb6471ecdf9c79b73ull, 0x1c64ae81d108b6b5ull, 0x24e2ead0c780fabeull};
+        std::printf("decode hashes: %016llx %016llx %016llx %016llx\n", hash[0], hash[1], hash[2], hash[3]);
+        bool frozen_ok = true;
+        for (int i = 0; i < 4; ++i) frozen_ok = frozen_ok && hash[i] == frozen[i];
+        std::printf("decode kernel bits against the frozen hashes: %s\n", frozen_ok ? "identical" : "DIFFERENT");
+        if (!frozen_ok) ++fails;
+    }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }
