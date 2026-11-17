@@ -20,13 +20,13 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "basalt/models/deepseek41/kernels.hpp"
+#include "basalt/kernels/mhc.hpp"
 
 #include <cuda_runtime.h>
 
 #include <stdexcept>
 
-namespace basalt::models::deepseek41 {
+namespace basalt::kernels {
 namespace {
 
 constexpr int kThreads = 256;
@@ -193,7 +193,7 @@ __global__ void hc_post_kernel(const float* __restrict__ f, const float* __restr
 void hc_mixes(const float* x, const float* hc_fn, const float* hc_scale, const float* hc_base, int n_tokens,
               const HcArgs& a, float* workspace, float* coef, void* stream) {
     const int flat = kHcMult * a.n_embd;
-    if (flat % (kHcSplits * 4) || a.sinkhorn_iters < 1) throw std::invalid_argument("deepseek41 hc_mixes: geometry");
+    if (flat % (kHcSplits * 4) || a.sinkhorn_iters < 1) throw std::invalid_argument("hc_mixes: geometry");
     cudaStream_t st = (cudaStream_t) stream;
     hc_partial_kernel<<<dim3(kHcSplits, kHcCoef, n_tokens), kThreads, 0, st>>>(x, hc_fn, flat, workspace);
     hc_coef_kernel<<<n_tokens, 32, 0, st>>>(workspace, hc_scale, hc_base, flat, a.rms_eps, a.hc_eps,
@@ -216,4 +216,4 @@ void hc_post(const float* f, const float* x, const float* coef, int coef_stride,
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
-}  // namespace basalt::models::deepseek41
+}  // namespace basalt::kernels
