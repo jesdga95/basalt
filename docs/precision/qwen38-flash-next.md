@@ -93,15 +93,36 @@ per 32. It also reads fewer bytes: the 252 projection matrices at 0.820 bytes pe
 for the same reason the rest of the pack does: the MoE model's kernels read GGUF block forms.
 
 Against the pack built from the plain NVFP4 release (same 122.6 GiB, the same section sizes, only the dense, GGUF and
-expert values differ), the QAD pack is 5.3% lower on PPL: 2.1847 against 2.3063 over the same 20 chunks and 5,100 scored
-rows (paired dNLL -0.0542 +- 0.0071, t -7.6, ratio 0.947 with a 95% interval of [0.934, 0.961]; T 3, int8 KV, a fixed
-dummy base, so only the two packs' rows are compared), with 93.5% of the rows keeping the same top-1 token. It is also a
-little faster: 388.5 and 392.4 tok/s decoded against 374.2 and 373.2, +4.5% on the mean of the two runs (two runs
+expert values differ), the QAD pack is 4.5% lower on PPL: 3.1547 against 3.3022 over 100 chunks and 25,500 scored rows
+(paired dNLL -0.0457 +- 0.0053, t -16.9), and 5.3% lower over the first 20 (2.1847 against 2.3063). It is also a little
+faster: 388.5 and 392.4 tok/s decoded against 374.2 and 373.2, +4.5% on the mean of the two runs (two runs
 each, interleaved in one session, the community preset at 475 W, drafting at its default), and prefill 9,722/9,777
 against 9,233/9,272 at 16k (+5.4%). Per-fixture decode speeds move up to 40% between runs of one pack (conv 232
 against 323, struct 482 against 670), so only the token-weighted decode and the prefill depths are compared;
 acceptance is within a point (72-74% conv, 98% struct, 67-69% prose) and both packs carry the same tuned drafter bit
-for bit. So the QAD conversion drifts the published pack's quality upward, not downward.
+for bit.
+
+Lower PPL is not more fidelity. Against the BF16 reference (`flashnext-bf16-base.kld`, the gate of
+[quality](quality.md): 100 chunks, T 3, int8 KV, adaptation off, one RTX 5090 at 475 W), the QAD pack is 34% further from
+the original model than the plain pack:
+
+| Pack | PPL | KLD mean | same top-1 |
+| --- | --- | --- | --- |
+| Q8_0 | 3.2756 | 0.0204 | 95.37% |
+| NVFP4 (plain) | 3.3022 | 0.0620 | 91.70% |
+| NVFP4 (QAD) | 3.1547 | 0.0831 | 90.64% |
+
+Paired over the 25,500 rows, QAD against the plain pack is dKLD +0.0211 +- 0.0018 (t 22.7) with dNLL -0.0457 +-
+0.0053, so both moves are far outside their intervals; 97 of the 100 chunks read QAD higher on KLD and 68% of the rows do.
+The cause is the checkpoint, not the conversion: QAD is 100 optimizer updates against a frozen BF16 teacher
+(`quantization_recipe.json` in the release), so it is a trained model, and on the same rows it scores NLL below the BF16
+reference itself (1.1489 against 1.1858 nats, PPL 3.1547 against 3.2733), which a re-quantization cannot do. Training
+moved the distribution: sharper on wikitext, further in KL from the model it was distilled from. Its GDN and QSA
+projections are also MXFP8 in the checkpoint where the plain release is BF16, and re-encoding them as Q6_K does not
+recover that rounding; at 0.006 to 0.007 KLD for the whole dense-precision switch, that cannot account for the 0.021.
+
+So the QAD pack is the faster of the two and the lower on PPL, and the worse on KLD and top-1 agreement: pick it for
+speed, not for closeness to the original.
 
 ## Measured costs
 
