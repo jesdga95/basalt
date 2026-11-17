@@ -50,19 +50,17 @@ __device__ __forceinline__ uint32_t pack_h2(float lo_k, float hi_k) {   // eleme
     return *reinterpret_cast<uint32_t*>(&h);
 }
 
-// KV_MODE 1: int8 codes + fp16 scale per 64 values (served by `prompt_attn_i8_kernel`, not instantiated from
-// this template). KV_MODE 0: fp16 values (scales 1).
-// KV_MODE 3 (hybrid K8V4): K as mode 1, V as mode 0 - the row's q4_0 blocks are dequantized to fp16 at
-// gather, so everything downstream of the load is the mode-0 V path; the caller un-rotates the output.
-// KV_MODE 4 (Q4_0 K and V, `--kv q4_0`): mode 1 with a scale per 32 values - each q4_0 block's codes enter as exact
-// int8 (code - 8) and its fp16 scale is applied in FP32, as mode 1's are; the caller rotates q and un-rotates the
-// output (kv_q4.hpp).
+// This template serves the Q4_0 forms; int8 and fp16 KV are `prompt_attn_warp_kernel`'s.
+// KV_MODE 3 (hybrid K8V4): K as int8 codes with an fp16 scale per 64 values, V from q4_0 blocks dequantized to fp16 at
+// gather; the caller un-rotates the output.
+// KV_MODE 4 (Q4_0 K and V, `--kv q4_0`): a scale per 32 values - each q4_0 block's codes enter as exact int8
+// (code - 8) and its fp16 scale is applied in FP32; the caller rotates q and un-rotates the output (kv_q4.hpp).
 template <int KV_MODE>
 struct Smem {
-    using KElem = typename std::conditional<KV_MODE == 0, __half, int8_t>::type;
-    using VElem = typename std::conditional<KV_MODE == 1 || KV_MODE == 4, int8_t, __half>::type;
-    static constexpr int KROW = KV_MODE == 0 ? HD + 8 : HD + 16;   // elements; 16-byte aligned rows, banks spread
-    static constexpr int VROW = (KV_MODE == 1 || KV_MODE == 4) ? HD + 16 : HD + 8;
+    using KElem = int8_t;
+    using VElem = typename std::conditional<KV_MODE == 4, int8_t, __half>::type;
+    static constexpr int KROW = HD + 16;   // elements; 16-byte aligned rows, banks spread
+    static constexpr int VROW = KV_MODE == 4 ? HD + 16 : HD + 8;
     static constexpr int NG = KV_MODE == 4 ? HD / QK4_0 : 4;      // scale groups per row (q4_0: 8 of 32, else 4 of 64)
     __half qh[16][QS];
     __half ql[16][QS];
@@ -172,15 +170,10 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                 const int c = i / KPIECES, pc = i % KPIECES;
                 const long long r = S.row[c];
                 uint4 kx = make_uint4(0, 0, 0, 0);
-                if (r >= 0) {
-                    if constexpr (KV_MODE == 0)
-                        kx = __ldg(reinterpret_cast<const uint4*>(p.k_pool + r * HD) + pc);
-                    else   // modes 1 and 3: the K side is INT8
-                        kx = __ldg(reinterpret_cast<const uint4*>(p.k_q + r * HD) + pc);
-                }
+                if (r >= 0) kx = __ldg(reinterpret_cast<const uint4*>(p.k_q + r * HD) + pc);   // mode 3: K is INT8
                 *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(&S.k[c][0]) + pc * 16) = kx;
             }
-            if constexpr (KV_MODE == 3) {   // V: dequantize the row's q4_0 blocks straight into the fp16 V row
+            {   // V: dequantize the row's q4_0 blocks straight into the fp16 V row
                 constexpr int BLKS = HD / QK4_0;
                 constexpr int BYTES = BLKS * (int) sizeof(block_q4_0);
                 for (int i = t; i < CH * BLKS; i += THREADS) {
@@ -199,35 +192,14 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                         }
                     }
                 }
-            } else {
-                constexpr int VPIECES = HD * (int) sizeof(typename Smem<KV_MODE>::VElem) / 16;   // per V row
-                for (int i = t; i < CH * VPIECES; i += THREADS) {
-                    const int c = i / VPIECES, pc = i % VPIECES;
-                    const long long r = S.row[c];
-                    uint4 vx = make_uint4(0, 0, 0, 0);
-                    if (r >= 0) {
-                        if constexpr (KV_MODE == 1)
-                            vx = __ldg(reinterpret_cast<const uint4*>(p.v_q + r * HD) + pc);
-                        else
-                            vx = __ldg(reinterpret_cast<const uint4*>(p.v_pool + r * HD) + pc);
-                    }
-                    *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(&S.v[c][0]) + pc * 16) = vx;
-                }
             }
             for (int i = t; i < CH * 4; i += THREADS) {
                 const int c = i / 4, g = i % 4;
                 const long long r = S.row[c];
                 float a = 0.0f, b = 0.0f;
-                if (r >= 0) {
-                    if constexpr (KV_MODE == 1) {
-                        a = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
-                        b = __half2float(__ushort_as_half(p.v_scale[r * (HD / KV_Q8_GROUP) + g]));
-                    } else if constexpr (KV_MODE == 3) {   // K as int8, V dequantized to fp16 (scale 1)
-                        a = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
-                        b = 1.0f;
-                    } else {
-                        a = b = 1.0f;
-                    }
+                if (r >= 0) {   // K as int8, V dequantized to fp16 (scale 1)
+                    a = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
+                    b = 1.0f;
                 }
                 S.ks[c][g] = a;
                 S.vs[c][g] = b;
@@ -255,13 +227,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                     al[1] = *reinterpret_cast<const uint32_t*>(&S.ql[gid + 8][k0 + 2 * tig]);
                     al[2] = *reinterpret_cast<const uint32_t*>(&S.ql[gid][k0 + 2 * tig + 8]);
                     al[3] = *reinterpret_cast<const uint32_t*>(&S.ql[gid + 8][k0 + 2 * tig + 8]);
-                    if constexpr (KV_MODE != 0) {   // modes 1 and 3: the K side is INT8 codes
-                        b[0] = i8x2_to_h2(*reinterpret_cast<const uint16_t*>(&S.k[cb + gid][k0 + 2 * tig]));
-                        b[1] = i8x2_to_h2(*reinterpret_cast<const uint16_t*>(&S.k[cb + gid][k0 + 2 * tig + 8]));
-                    } else {
-                        b[0] = *reinterpret_cast<const uint32_t*>(&S.k[cb + gid][k0 + 2 * tig]);
-                        b[1] = *reinterpret_cast<const uint32_t*>(&S.k[cb + gid][k0 + 2 * tig + 8]);
-                    }
+                    b[0] = i8x2_to_h2(*reinterpret_cast<const uint16_t*>(&S.k[cb + gid][k0 + 2 * tig]));
+                    b[1] = i8x2_to_h2(*reinterpret_cast<const uint16_t*>(&S.k[cb + gid][k0 + 2 * tig + 8]));
                     mma16816(tg, ah, b);
 #ifndef D1_NO_QLO
                     mma16816(tg, al, b);
@@ -356,7 +323,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                     const int j = gi * JPG + jj;
                     const int d = warp * 64 + j * 8 + gid;
                     uint32_t b[2];
-                    if constexpr (KV_MODE == 1 || KV_MODE == 4) {
+                    if constexpr (KV_MODE == 4) {
                         const uint32_t x0 = (uint8_t) S.v[cA][d] | ((uint32_t) (uint8_t) S.v[cA + 1][d] << 8);
                         const uint32_t x1 = (uint8_t) S.v[cB][d] | ((uint32_t) (uint8_t) S.v[cB + 1][d] << 8);
                         b[0] = i8x2_to_h2(x0);
