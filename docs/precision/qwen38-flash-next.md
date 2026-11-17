@@ -96,11 +96,12 @@ Against the pack built from the plain NVFP4 release (same 122.6 GiB, the same se
 expert values differ), the QAD pack is 5.3% lower on PPL: 2.1847 against 2.3063 over the same 20 chunks and 5,100 scored
 rows (paired dNLL -0.0542 +- 0.0071, t -7.6, ratio 0.947 with a 95% interval of [0.934, 0.961]; T 3, int8 KV, a fixed
 dummy base, so only the two packs' rows are compared), with 93.5% of the rows keeping the same top-1 token. It is also a
-little faster: 388.5 and 392.4 tok/s decoded against 374.2 and 373.2 (the community preset, drafting at its default),
-and prefill 9,722/9,777 against 9,233/9,272 at 16k. Per-fixture decode speeds move up to 40% between runs of one pack
-(conv 232 against 323, struct 482 against 670), so only the token-weighted decode and the prefill depths are compared;
-acceptance is within a point (72-74% conv, 98% struct, 67-69% prose) and both packs carry the same tuned drafter bit for
-bit. So the QAD conversion drifts the published pack's quality upward, not downward.
+little faster: 388.5 and 392.4 tok/s decoded against 374.2 and 373.2 (two runs each, interleaved in one session, the
+community preset at 475 W, drafting at its default), and prefill 9,722/9,777 against 9,233/9,272 at 16k. Per-fixture
+decode speeds move up to 40% between runs of one pack (conv 232 against 323, struct 482 against 670), so only the
+token-weighted decode and the prefill depths are compared; acceptance is within a point (72-74% conv, 98% struct,
+67-69% prose) and both packs carry the same tuned drafter bit for bit. So the QAD conversion drifts the published
+pack's quality upward, not downward.
 
 ## Measured costs
 
@@ -147,8 +148,8 @@ KLD and top-1-against-base are not comparable, but the two packs' rows are). 96.
 the largest NLL move is 3.31 on a single row, against 76.8% and 15.4 for the 2-bit test. The experts would be 79.7 GiB
 against 63.3 (0.69 against 0.56 bytes per value), so the set spills: 44.6% of the decode windows hit VRAM against 54.5%
 and 23.3% of the routed rows cross PCIe. Decode is 173.1 tok/s against 392.4 (conv 112.4 against 323.4, struct 198.1
-against 670.0, prose 134.4 against 302.4; int8 KV, drafting at its default), prefill 19% slower at 64k (8,489 against
-10,781).
+against 670.0, prose 134.4 against 302.4; int8 KV at 475 W, drafting at its default), prefill 19% slower at 64k (8,489
+against 10,781).
 
 That makes Q5_K dominated on this 32 GB card: +1.1% PPL and −56% decode against the pack it is built from. The quality it
 preserves is near the checkpoint's own 4-bit form, so it would only pay on a machine whose expert tier holds 80 GiB; here
