@@ -120,10 +120,6 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
         basalt::log::error("basalt generate", "--peer-exclusive needs a second GPU (--gpu 0,1 --gpu-mode peer), --resident-experts and --serve");
         return 2;
     }
-    if (o.peer_exclusive && o.peer_devices.size() > 1) {
-        basalt::log::error("basalt generate", "--peer-exclusive runs with one peer card (--gpu 0,1 --gpu-mode peer)");
-        return 2;
-    }
 
     // The whole-model graph measurements replay every layer through CUDA0's session, which a layer split carves to
     // CUDA0's own range - the answer would read another stage's state.  Refused here rather than at the call, so

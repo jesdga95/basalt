@@ -22,6 +22,7 @@ int resident_plan(Context& context) {
     auto& peer_split_bytes = context.peer_split_bytes;
     auto& peer_expert_room = context.peer_expert_room;
     auto& peer = *context.peer;
+    auto& xpeers = *context.xpeers;
     auto& drive = *context.drive;
     auto& d_res = *context.d_res;
 
@@ -259,13 +260,20 @@ int resident_plan(Context& context) {
         drive.d.pool = &pool;
     }
     auto& pool = *pool_store;
-    std::vector<std::pair<int32_t, int32_t>> peer_only;   // experts only the peer holds (--peer-exclusive)
+    std::vector<std::pair<int32_t, int32_t>> peer_only;   // experts only the peers hold (--peer-exclusive)
     uint64_t peer_only_bytes = 0;
     if (o.resident_cpu_experts && o.peer_exclusive && o.peer_device >= 1) {
         if (const int rc = open_peer()) return rc;
+        // every peer's experts: the RAM copy leaves them all out
+        auto held = [&](int64_t l, int64_t e) {
+            if (peer.has(l, e)) return true;
+            for (const auto& x : xpeers)
+                if (x->has(l, e)) return true;
+            return false;
+        };
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e)
-                if (peer.has(l, e)) {
+                if (held(l, e)) {
                     peer_only.emplace_back((int32_t) l, (int32_t) e);
                     peer_only_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(l);
                 }

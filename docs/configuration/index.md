@@ -43,7 +43,7 @@ always wins. It prints one `[server] auto` line, where `ram-experts` is the `res
 
 | Setting | Rule |
 | --- | --- |
-| `peer-exclusive` | Flash-Next only. On only with a peer card, when the full expert set does not fit in free RAM but the set without the peer's share does |
+| `peer-exclusive` | Flash-Next only. On only with one peer card, when the full expert set does not fit in free RAM but the set without the peer's share does. Given with several peer cards, every peer holds experts the RAM copy leaves out; the peers after the first keep their start-up placement |
 | `resident` | Flash-Next only. Free RAM above the safety floor, capped at the experts the GPUs do not hold |
 | `pool-affinity` | `auto` |
 | `pool-workers` | physical cores minus the host thread; on hybrid CPUs, P-cores minus one plus half the E-cores |
