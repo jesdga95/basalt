@@ -2446,7 +2446,7 @@
     {
       "submitter": "zlosim",
       "date": "2026-11-17",
-      "commit": "d3b7574296",
+      "commit": "7b6a26a649",
       "preset": "community-1",
       "model": "Qwen3.8-Flash-Next",
       "gpus": [
@@ -2455,29 +2455,29 @@
           "vram_gib": 8,
           "power_w": 35,
           "pcie": "5.0 x8",
-          "h2d_gbps": 25.7
+          "h2d_gbps": 26.1
         }
       ],
       "ram_gib": 94,
       "cpu": "Intel Core Ultra 7 265H, 16 cores",
-      "ram_gbps": 55.6,
+      "ram_gbps": 66.3,
       "os": "Linux",
       "quant": "GSQ-RCO-IQ3_S",
       "kv": "int8",
-      "prefill_16k_tps": 481.6,
-      "prefill_64k_tps": 166.6,
-      "decode_tps": 19.6,
-      "decode_conv_tps": 19.6,
-      "decode_struct_tps": 20.2,
-      "decode_prose_tps": 16.6,
-      "accept_conv_pct": 68.4,
-      "accept_struct_pct": 94.7,
-      "accept_prose_pct": 66.8,
-      "draft_len_conv": 2.1,
-      "draft_len_struct": 6.7,
-      "draft_len_prose": 1.6,
+      "prefill_16k_tps": 561.4,
+      "prefill_64k_tps": 374.0,
+      "decode_tps": 42.4,
+      "decode_conv_tps": 39.9,
+      "decode_struct_tps": 44.9,
+      "decode_prose_tps": 33.1,
+      "accept_conv_pct": 75.1,
+      "accept_struct_pct": 94.2,
+      "accept_prose_pct": 67.5,
+      "draft_len_conv": 2.2,
+      "draft_len_struct": 6.8,
+      "draft_len_prose": 1.7,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8",
-      "notes": "Self-converted pack, tuned MTP drafter. 8 GB card: 64k prefill is limited by elastic KV; --kv-resident 20480 keeps ~500 t/s. Leave ~10% RAM free or desktop earlyoom kills the engine"
+      "notes": "Self-converted pack, tuned MTP drafter. AC + performance profile: power-saver (PL1 15 W) halves decode. --kv-resident 20480 keeps prefill ~500 t/s to 128k. Keep ~10% RAM free (earlyoom)"
     }
   ]
 }
