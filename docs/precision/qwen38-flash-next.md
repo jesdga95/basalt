@@ -136,6 +136,10 @@ pack alone gives -0.0059 of that. The Q8_0-dense pack is about 7% slower on pros
 UD-IQ1_S, converted as shipped (layer 18: IQ2_S gate, IQ2_XXS up; each half on its own format's kernels, the same bits as
 a uniform layer's rows): PPL 3.4049, KLD 0.2676, top-1 82.76% (100 chunks, T 3, int8 KV, resident experts).
 
+The Q5_0 rows: KLD 0.0943 against 0.0948 on UD-Q3_K_XL, 0.1520 against 0.1517 on UD-Q2_K_XL, tiers auto-sized. The
+device-planned tail runs only when every layer's expert formats are in it, so on these packs the decode rounding moves as well as
+the prompt's.
+
 Re-quantizing the QAD checkpoint's routed experts to Q5_K (gate and up as 5-bit codes with 6-bit scales and mins per 32
 values, down as Q5_1 since its rows are 640 values) was measured and not shipped: PPL 2.2095 against 2.1847 for the
 NVFP4 pack, over the same 20 chunks and 5,100 scored rows (T 3, int8 KV, adaptation off; the base is a fixed dummy, so
