@@ -52,7 +52,7 @@ Flow Runtime::dispatch() {
         std::string pe;
         while (!got && (disk.enabled() || parking)) {
             const int r = next_line_within(line, 1000);
-            if (r < 0) return Flow::quit;
+            if (r < 0) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
             got = r == 1;
             while (!got && !(got = try_next_line(line)) && disk.enabled() && spill_to_disk(false, 1) > 0) {}
             if (got) break;
@@ -60,7 +60,7 @@ Flow Runtime::dispatch() {
             if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
             if (!parking) break;
         }
-        if (!got && !next_line(line)) return Flow::quit;
+        if (!got && !next_line(line)) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
     }
     // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
     // request's prompt and first token as a GEN 1, then continues it in that slot

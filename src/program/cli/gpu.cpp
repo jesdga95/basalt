@@ -1,6 +1,7 @@
 #include "gpu.hpp"
 
 #include "basalt/log.hpp"
+#include "basalt/platform/system.hpp"
 #include "basalt/program/options.hpp"
 
 #include <algorithm>
@@ -60,6 +61,12 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
             o.peer_gbps.push_back(c.mem_gbps);
         }
     }
+    int drv = 0, rt = 0;
+    (void) cudaDriverGetVersion(&drv);
+    (void) cudaRuntimeGetVersion(&rt);
+    basalt::log::info("basalt", "system: %s, CUDA driver %d.%d / runtime %d.%d",
+                      basalt::platform::host_os_name().c_str(),
+                      drv / 1000, (drv % 1000) / 10, rt / 1000, (rt % 1000) / 10);
     basalt::log::info("basalt", "gpus: %s", line.c_str());
     if (std::count(roles.begin(), roles.end(), bp::GpuRole::Idle) > 0)
         basalt::log::warn("basalt", "%s",

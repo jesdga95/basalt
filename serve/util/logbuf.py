@@ -121,7 +121,7 @@ class ColorStream:
         return getattr(self._stream, name)
 
 
-def tail_file(buffer: LogBuffer, path: str, src: str = "eng", poll_s: float = 0.25) -> None:
+def tail_file(buffer: LogBuffer, path: str, src: str = "eng", poll_s: float = 0.25, on_line=None, skip=None) -> None:
     """Follow a file from its end, adding complete lines to the buffer; waits for a missing file and rereads a
     shrunk one from the start."""
     try:
@@ -138,10 +138,17 @@ def tail_file(buffer: LogBuffer, path: str, src: str = "eng", poll_s: float = 0.
                 with open(path, "rb") as f:
                     f.seek(pos)
                     data = f.read(min(size - pos, 1 << 20))
+                line_end = pos - len(partial)
                 pos += len(data)
                 *done, partial = (partial + data).split(b"\n")
                 for line in done:
-                    buffer.add(src, line.decode("utf-8", "replace"))
+                    line_end += len(line) + 1
+                    text = line.decode("utf-8", "replace")
+                    if skip is not None and skip(text):
+                        continue
+                    buffer.add(src, text)
+                    if on_line is not None:
+                        on_line(text, line_end)
                 continue
         except OSError:
             pass

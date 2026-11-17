@@ -4,6 +4,17 @@
 
 namespace basalt::models::qwen4exp::serve {
 
+namespace {
+bool sync_event(cudaEvent_t ev, const char* what) {
+    const cudaError_t e = cudaEventSynchronize(ev);
+    if (e != cudaSuccess) {
+        basalt::log::error("basalt serve", "%s: %s", what, cudaGetErrorString(e));
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
 // Seeds the adaptive tier's usage counts from the routing of the prompt just read, so the first adaptation rounds
 // of a request already move the experts the new topic uses toward the GPUs.  The earlier usage decays to kSeedKeep and
 // the prompt adds its routed-entry counts scaled to kSeedTokens tokens of usage.  Resident experts are always seeded;
@@ -52,6 +63,8 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
         uint8_t* dst = src.spare_take(s.layer, off);
         if (dst == nullptr) continue;
         if (!copy_back(s.layer, slot, dst)) {
+            basalt::log::error("basalt serve", "adaptive spare copy failed at layer %d slot %d (%s)",
+                               (int) s.layer, (int) slot, cudaGetErrorString(cudaPeekAtLastError()));
             src.spare_return(s.layer, off);
             return false;
         }
@@ -60,9 +73,17 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
         kept.push_back(s);
     }
     if (!homes.empty()) {
-        if (!wait()) return false;
+        if (!wait()) {
+            basalt::log::error("basalt serve", "adaptive spare wait failed (%s)",
+                               cudaGetErrorString(cudaPeekAtLastError()));
+            return false;
+        }
         for (const Home& h : homes)
-            if (!src.spare_land(h.layer, h.out, h.off)) return false;
+            if (!src.spare_land(h.layer, h.out, h.off)) {
+                basalt::log::error("basalt serve", "adaptive spare land failed at layer %d expert %d",
+                                   (int) h.layer, (int) h.out);
+                return false;
+            }
     }
     swaps.swap(kept);
     return true;
@@ -115,12 +136,14 @@ void QfnRuntime::apply_pending(bool wait, bool exchanges) {
         else if (x.has_pending()) { x.issue_pending(true); xlanding[q] = 1; }
     }
     if (pending.empty()) return;
-    if (wait) cudaEventSynchronize(adapt_ev);
-    else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+    if (wait) {
+        if (!sync_event(adapt_ev, "adaptive tier sync")) return;
+    } else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
     for (auto& st : stages)
         if (st->adapt_live) {
-            if (wait) cudaEventSynchronize(st->adapt_ev);
-            else if (cudaEventQuery(st->adapt_ev) != cudaSuccess) return;
+            if (wait) {
+                if (!sync_event(st->adapt_ev, "adaptive stage sync")) return;
+            } else if (cudaEventQuery(st->adapt_ev) != cudaSuccess) return;
         }
     for (auto& st : stages) st->adapt_live = false;
     if (exchanges) src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
@@ -322,7 +345,7 @@ bool QfnRuntime::adapt() {
 
 void QfnRuntime::xq_settle() {
     if (!xq_unsettled) return;
-    cudaEventSynchronize(adapt_ev);
+    (void) sync_event(adapt_ev, "adaptive settle sync");
     for (const auto& [l, e] : xq_released) srcp->release(l, e);
     xq_released.clear();
     res_upload();
@@ -427,7 +450,7 @@ bool QfnRuntime::xq_advance(bool wait) {
     if (xq_stage == 0) return true;
     if (xq_stage == 2) ver.flush_post_launch();
     const bool nowait = xq_stage == 2 && xq_words && !wait;
-    if (!nowait) cudaEventSynchronize(adapt_ev);
+    if (!nowait && !sync_event(adapt_ev, "adaptive advance sync")) return false;
     if (xq_stage == 1) {
         for (const XSwap& x : xq) {
             if (x.xchg && !src.spare_land(x.lout, x.out, x.off)) {
@@ -512,7 +535,7 @@ bool QfnRuntime::xq_advance(bool wait) {
     // with the landed words the incoming experts are resident from the next window on while their copies land:
     // its gate/up launches wait for them, and what needs them done waits in xq_settle
     if (nowait && std::any_of(xq.begin(), xq.end(), [](const XSwap& x) { return x.p2p; }))
-        cudaEventSynchronize(p2p_ev);   // a promotion's peer slot is refilled below
+        if (!sync_event(p2p_ev, "adaptive p2p sync")) return false;   // a promotion's peer slot is refilled below
     for (const XSwap& x : xq) {
         host_res[(size_t) x.layer * g.n_expert + x.in] = x.slot;
         if (x.xchg && !x.p2p) src.spare_release(x.layer, x.in);
