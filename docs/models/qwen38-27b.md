@@ -53,6 +53,10 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
 
   Each position in RAM costs a token 33 KiB of bus reads (`--kv fp16`: 64 KiB; 60K positions at a 120K prompt decode at
   6.3 tok/s against 59.9). Decode reads them at about 24 GB/s of the link's 28.8, so the link sets the speed.
+  With every position on the card, decode attention fetches each chunk of the cache while the one before it is computed. Decode
+  (default drafting, a book's summary, an RTX 5090 at 400 W, interleaved runs against the build before): 108 to 122 tok/s at
+  131K and 70 to 86 at 250K with `--kv int8`, 107 to 116 at 131K with `--kv fp16`; `--spec 0` at 250K, 44 to 51. The tokens are
+  identical.
 - **Slots:** `--parallel N` gives each slot its own cache and recurrent state (157 MiB). Slots share the weights.
 - **Cards:** the main card decodes and holds everything. A second Blackwell card (`gpu "0,1"`, or `"auto"` when two are visible) is the
   prompt line: it reads the last layers of long prompts ([below](#long-prompts-on-two-cards)). When the model, the context and the slots do
