@@ -56,7 +56,7 @@ public:
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        if (!o.kv.empty() && o.kv != "bf16" && o.kv != "fp8") {
+        if (!o.kv.empty() && o.kv != "bf16" && o.kv != "fp8" && o.kv != "f32") {
             basalt::log::error("basalt hy4flash", "--kv %s: the latent caches are bf16 (the default) or fp8", o.kv.c_str());
             return 2;
         }
