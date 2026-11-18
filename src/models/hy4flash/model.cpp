@@ -19,6 +19,8 @@ constexpr uint64_t kGiB = 1ull << 30;
 constexpr int kTypeQ8_0 = 8;
 // CPU uses of a missed expert that earn it a slot on the card
 constexpr int kAdmitUses = 2;
+// copies a decode window may claim per row (a window's rows route to mostly different experts)
+constexpr int kClaimsPerRow = 128;
 }  // namespace
 
 Hy4Model::Hy4Model() = default;
@@ -73,6 +75,7 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.pool_affinity_given = flags_.pool_affinity_given;
     s.expert_profile = flags_.expert_profile;
     s.admit_uses = kAdmitUses;
+    s.claims_per_row = kClaimsPerRow;
     s.share_max_tokens = 16384;
     return s;
 }
