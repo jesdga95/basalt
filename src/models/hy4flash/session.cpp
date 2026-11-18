@@ -757,7 +757,7 @@ private:
         else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
         else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
         if (diag(l) && f32() && !swa) {   // the inputs of the attention, for the reference's tensors (fp32 caches only)
-            cudaStreamSynchronize(stream_);
+            diag_sync();
             dump("q_resid-" + std::to_string(l), qan_, (int64_t) R * g_.q_lora);
             std::vector<float> rows((size_t) R * kRowWidth), lat((size_t) R * rank), pe((size_t) R * g_.rope_dim), qp((size_t) R * H * g_.rope_dim),
                                qc((size_t) R * H * kRowWidth);
@@ -1690,9 +1690,18 @@ private:
     // diagnostic: a layer whose inner tensors are dumped (the first three)
     bool diag(int l) const { return !m_.diag_dump().empty() && l < 3; }
 
+    // diagnostic: the stream drained. A window's weighted sum waits on the device for the word join_moe writes, so the MoE is
+    // joined first: a wait for the stream before it would never end.
+    void diag_sync() {
+        std::string e;
+        if (!join_moe(e)) basalt::log::warn("basalt hy4flash", "--diag-dump: %s", e.c_str());
+        cudaStreamSynchronize(stream_);
+    }
+
     // diagnostic: a tensor of this call appended to <dir>/<name>.f32
     void dump(const std::string& name, const float* d, int64_t n) {
         std::vector<float> h((size_t) n);
+        diag_sync();
         cudaMemcpyAsync(h.data(), d, (size_t) n * 4, cudaMemcpyDeviceToHost, stream_);
         cudaStreamSynchronize(stream_);
         const std::string path = m_.diag_dump() + "/" + name + ".f32";
