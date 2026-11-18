@@ -134,6 +134,7 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
             return false;
         }
 
+    p.vision = p.file.range("vision/mmproj");
     for (const auto& [name, t] : tj->members) {
         TensorRef r;
         r.name = name;
