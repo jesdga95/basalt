@@ -35,9 +35,9 @@ Test pack (Q4_K_M GGUF): [pack](hy4-flash/pack.md). Release pack, from the BF16 
   blob: both are 4.5 bits), 83.6 GB for 21,012 experts. The checkpoint stores `gate_up_proj` fused: split it.
 - **Dense: Q8_0** of the BF16 values (attention, latent projections, shared experts, dense FFN, `engram_kv`, indexer projections,
   embedding); BF16 head (742 MB) first, `F8_E4M3` rows with a scale (type 44) later if it pays; norms, hc, router, biases F32.
-  Quantising from BF16 should reproduce AngelSlim's Q8_0 bytes: a check of both pipelines.
-- **Engram table: FP8 E4M3 as stored**, 96 values per row, own `engram` section, read by row from the SSD. Check: the BF16
-  checkpoint's table values are exactly E4M3 (`engram_fp8_embedding`), else the conversion is lossy and gets its own gate.
+  Quantising from BF16 reproduces AngelSlim's Q8_0 bytes (checked: blocks 0 to 5, the embedding, the head).
+- **Engram table: E4M3, rounded once** from the BF16 values (not E4M3: 9 % exact, 2.7 % RMS error; the test pack's rows are the same
+  rounding scaled to a largest code of 448, scale dropped), 96 values per row, no scale (type 43), own `engram` section, read by row.
 - **Side sections**, from the checkpoint, no weight copies: `dfly` (the 0.85B drafter: Q8_0 projections, F32 norms), `vision/mmproj`
   (ViT and projector BF16, plus `image_newline`), `dfly/draft_vocab` later. Tokenizer, chat template, generation defaults.
 - Whether NVFP4 RTN beats Q4_K_M quality is not known (Q4_K_M used an imatrix; RTN has no calibration): the KLD gate decides the
@@ -293,7 +293,7 @@ Exit: layer 0 to 2 hidden states within gate 1, then all 42. GPU tests are queue
 6. **Engram SSD.** 64 random 96-byte rows per token (4 KB reads), about 1M reads per 16K chunk. Measure: 4K random read IOPS at
    QD64 on `/mnt/nvme`; hot-row hit rate by replaying the trace's token streams through the hash (CPU only); prefetch overlap.
 7. **NVFP4 RTN quality** without calibration. Measure KLD against Q4_K_M and BF16; fall back: per-layer scale search, a higher-bit
-   `down`, or Q4_K as the default pack. The Engram FP8 table is lossless only if the BF16 values are E4M3 (check).
+   `down`, or Q4_K as the default pack. Weight RMS error: NVFP4 0.081; Q4_K 0.071 (gate, up), 0.077 (down); Q6_K down 0.018 (19 layers).
 8. **KV precision.** BF16 default (the reference's own); FP8 FlashMLA rows halve 1M's cache; measure KLD at 32K and 128K prompts and
    needle at 1M before it is a default.
 9. **Selection ties and T invariance.** FP16 tensor-core scoring versus the reference's BF16 can flip near-tied pools; measure the
