@@ -50,8 +50,16 @@ class Generation(unittest.TestCase):
                         session=session, live=live)
 
     def test_close_during_keepalive_cancels_and_releases_retained_iterator(self):
-        primary = Primary([("ping", None)])
-        stream = self.start(primary)
+        cancel = threading.Event()
+
+        def values():
+            try:
+                yield "ping", None
+            finally:
+                self.assertTrue(cancel.is_set())
+
+        primary = Primary(values())
+        stream = self.start(primary, cancel=cancel)
         self.addCleanup(stream.close)
         for event in stream:
             if event is None:
@@ -97,11 +105,35 @@ class Generation(unittest.TestCase):
             list(self.start(primary))
         self.assertTrue(primary.closed.is_set())
 
-    def test_cancelled_generation_does_not_complete(self):
+    def test_engine_cancellation_without_disconnect_is_an_error(self):
         primary = Primary([("done", {"finish": "cancel", "completion_tokens": 0})])
-        events = list(self.start(primary))
+        events = []
+        with self.assertRaisesRegex(EngineError, "cancelled without a client disconnect"):
+            for event in self.start(primary):
+                events.append(event)
         self.assertTrue(primary.closed.is_set())
+        self.assertTrue(self.cancel.is_set())
         self.assertNotIn("response.completed", [e["type"] for e in events])
+
+    def test_cancelled_request_after_inference_exits_quietly(self):
+        for finish in (None, "cancel", "stop"):
+            with self.subTest(finish=finish):
+                cancel = threading.Event()
+
+                def values():
+                    yield "event", Event("content", "partial")
+                    cancel.set()
+                    if finish is not None:
+                        yield "done", {"finish": finish, "completion_tokens": 1}
+
+                primary = Primary(values())
+                events = []
+                with self.assertRaises(ClientGone):
+                    for event in self.start(primary, cancel=cancel):
+                        events.append(event)
+                self.assertTrue(primary.closed.is_set())
+                self.assertNotIn("response.completed", [e["type"] for e in events])
+                self.assertNotIn("response.incomplete", [e["type"] for e in events])
 
     def test_cancelled_request_does_not_start_inference(self):
         cancel = threading.Event()
@@ -115,11 +147,60 @@ class Generation(unittest.TestCase):
         self.addCleanup(stream.close)
         self.assertEqual(next(stream)["type"], "response.created")
         self.cancel.set()
-        self.assertNotIn("response.completed", [e["type"] for e in stream])
+        events = []
+        with self.assertRaises(ClientGone):
+            for event in stream:
+                events.append(event)
+        self.assertNotIn("response.completed", [e["type"] for e in events])
         self.svc.run.assert_not_called()
 
 
 class RecoveryHttp(Server):
+    def test_cancel_after_start_or_inference_does_not_return_an_unfinished_response(self):
+        start = Assembler.start
+        for during_inference in (False, True):
+            for stream in (False, True):
+                with self.subTest(during_inference=during_inference, stream=stream):
+                    cancel = threading.Event()
+
+                    def events(asm):
+                        yield from start(asm)
+                        if not during_inference:
+                            cancel.set()
+
+                    def values():
+                        yield "event", Event("content", "partial")
+                        cancel.set()
+                        yield "done", {"finish": "cancel", "completion_tokens": 1}
+
+                    primary = Primary(values())
+                    with patch.object(Assembler, "start", events), \
+                         patch.object(self.httpd.RequestHandlerClass, "_client_cancel", return_value=cancel), \
+                         patch.object(self.httpd, "handle_error") as error, \
+                         patch.object(self.svc, "run", return_value=primary) as run:
+                        req = {"model": "basalt", "input": "hi", "stream": stream}
+                        if stream:
+                            status, response = self.post(req)
+                            self.assertEqual(status, 200)
+                            types = [e["type"] for e in response]
+                            self.assertIn("response.created", types)
+                            self.assertNotIn("response.completed", types)
+                            self.assertNotIn("response.incomplete", types)
+                            self.assertNotIn("response.failed", types)
+                            if during_inference:
+                                self.assertIn("response.output_text.delta", types)
+                        else:
+                            with self.assertRaises(http.client.RemoteDisconnected):
+                                self.post(req)
+                    error.assert_not_called()
+                    if during_inference:
+                        run.assert_called_once()
+                        self.assertTrue(primary.closed.is_set())
+                    else:
+                        run.assert_not_called()
+                    status, response = self.post({"model": "basalt", "input": "recover", "max_output_tokens": 8})
+                    self.assertEqual(status, 200, response)
+
     def test_cancel_before_first_event_does_not_traceback_or_start_inference(self):
         for text_engine in (False, True):
             with self.subTest(text_engine=text_engine):
@@ -179,6 +260,32 @@ class RecoveryHttp(Server):
                 else:
                     self.assertEqual(status, 500)
                     self.assertEqual(response["error"]["code"], "server_error")
+                status, response = self.post({"model": "basalt", "input": "recover", "max_output_tokens": 8})
+                self.assertEqual(status, 200, response)
+
+    def test_engine_cancellation_is_500_or_stream_failure_and_releases_iterator(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                primary = Primary([("event", Event("content", "partial")),
+                                   ("done", {"finish": "cancel", "completion_tokens": 1})])
+                cancel = threading.Event()
+                with patch.object(self.httpd.RequestHandlerClass, "_client_cancel", return_value=cancel), \
+                     patch.object(self.svc, "run", return_value=primary):
+                    status, response = self.post({"model": "basalt", "input": "hi", "stream": stream})
+                self.assertTrue(primary.closed.is_set())
+                self.assertTrue(cancel.is_set())
+                if stream:
+                    self.assertEqual(status, 200)
+                    self.assertEqual(response[-1]["type"], "response.failed")
+                    self.assertEqual(response[-1]["response"]["output"][0]["status"], "incomplete")
+                    error = response[-1]["response"]["error"]
+                    self.assertNotIn("response.completed", [e["type"] for e in response])
+                    self.assertEqual([e["sequence_number"] for e in response], list(range(len(response))))
+                else:
+                    self.assertEqual(status, 500)
+                    error = response["error"]
+                self.assertEqual(error["code"], "server_error")
+                self.assertIn("cancelled without a client disconnect", error["message"])
                 status, response = self.post({"model": "basalt", "input": "recover", "max_output_tokens": 8})
                 self.assertEqual(status, 200, response)
 
