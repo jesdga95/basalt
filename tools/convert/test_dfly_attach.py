@@ -71,6 +71,11 @@ class DflyAttachTest(unittest.TestCase):
         convert.add_dspark(type("A", (), dict(into=str(self.pack), dspark=None, undo_dir=str(self.t / "undo"), roll_back=True))())
         self.assertEqual(sorted(ModelFile(str(self.pack)).names()), sorted(before.names()))
 
+    def test_the_released_config_keeps_the_dfly_keys_at_its_top_level(self):
+        write_safetensors(self.st, self.names)
+        rec = dfly_attach.dfly_record(self.st, {"text_config": {}, **CONFIG["text_config"]})
+        self.assertEqual((rec["layers"], rec["mask_token_id"], rec["target_index_layers"]), (2, 7, [3, 5]))
+
     def test_a_missing_tensor_a_wrong_dtype_and_a_second_drafter_are_refused(self):
         write_safetensors(self.st, self.names[:-1])
         with self.assertRaises(SystemExit):

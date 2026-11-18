@@ -54,7 +54,8 @@ def wanted(layers: int) -> set[str]:
 
 def dfly_record(path: Path, hf_config: dict | None) -> dict:
     """meta.dfly2 for the file: what the engine loads by, from the file's header and the checkpoint's config."""
-    text = (hf_config or {}).get("text_config", hf_config or {})
+    cfg = hf_config or {}
+    text = {**cfg.get("text_config", {}), **cfg}      # the released config.json keeps the dfly_* keys at its top level
     for k in ("dfly_num_hidden_layers", "dfly_mask_token_id", "dfly_target_kv_layers", "dfly_target_index_layer"):
         if text.get(k) is None:
             die(f"the pack's meta.hf_config has no {k}: the pack was made without --hf-dir, or not from Hy4-flash")

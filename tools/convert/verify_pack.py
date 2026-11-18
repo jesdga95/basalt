@@ -62,7 +62,10 @@ def parse_index(text: bytes) -> dict:
     return out
 
 
-def verify(pack: str, first_gguf: str) -> bool:
+def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
+    if "quantized_from" in json.loads(ModelFile(pack).read("meta")):
+        import hy4flash_bf16
+        return hy4flash_bf16.verify(pack, first_gguf, workers)
     t0 = time.time()
     problems: list[str] = []
 
