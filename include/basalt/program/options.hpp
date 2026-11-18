@@ -102,7 +102,7 @@ struct CommonOptions {
     int draft_experts = 32;            ///< --draft-experts N: the drafter's routed experts each stage keeps (0: all)
     /// --route-prior [LAMBDA]: cache-aware routing on the decode path.  An expert a GPU holds gets +LAMBDA on the score
     /// the top k is chosen by, so a near tie goes to the warm expert; the pick's weight is still the unbiased one.  CHANGES
-    /// THE ANSWERS.  Scores run about 0.5 to 3, so 0.02 to 0.1 to try.  0 = off (docs/precision/deepseek41.md).
+    /// THE ANSWERS.  Scores run about 0.5 to 3, so 0.02 to 0.1 to try.  0 = off (docs/precision/index.md).
     float route_prior = 0.0f;
     int drafter_device = -1;           ///< --diag-drafter-gpu N: the CUDA device it runs on (-1: the main card)
     bool diag_teacher = false;         ///< --diag-teacher: --spec-oracle's tokens go on whatever the picks
