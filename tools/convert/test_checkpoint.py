@@ -576,6 +576,88 @@ class CsfExpertTest(unittest.TestCase):
             self.experts({"model-00001-of-00001.safetensors": {n: v for n, v in self.csf.items() if n != k + C.CSF_EXC}})
 
 
+def e4m3(code: int) -> float:
+    """An E4M3 byte's value by the format's definition (bias 7, no infinities); the two NaN codes are NaN."""
+    sign, e, m = -1.0 if code >> 7 else 1.0, (code >> 3) & 15, code & 7
+    if e == 15 and m == 7:
+        return float("nan")
+    return sign * (m / 8 * 2.0 ** -6 if e == 0 else (1 + m / 8) * 2.0 ** (e - 7))
+
+
+
+def mxfp8(rng, rows, cols):
+    """Random MXFP8 rows (no NaN code) and the float32 values they hold, decoded by the format's definition."""
+    codes = rng.integers(0, 256, size=(rows, cols), dtype=np.uint8)
+    codes[(codes & 0x7F) == 0x7F] = 0x38
+    scales = rng.integers(118, 124, size=(rows, cols // 32), dtype=np.uint8)
+    table = np.array([e4m3(c) for c in range(256)])
+    return codes, scales, (table[codes] * np.exp2(scales - 127.0).repeat(32, axis=1)).astype(np.float32)
+
+
+class Mxfp8DenseTest(unittest.TestCase):
+    """CheckpointDenseTest's layer with MXFP8 projections and an F32 norm, as the FP4-Local layout stores them."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.d, self.L, H = Path(tmp.name), "model.language_model.layers.0.", 256
+        rng = np.random.default_rng(5)
+        self.v, tens = {}, {}
+        for name, shape in {"linear_attn.in_proj_a.weight": (48, H), "linear_attn.in_proj_z.weight": (48 * 128, H),
+                            "linear_attn.out_proj.weight": (H, 48 * 128), "mlp.shared_expert.down_proj.weight": (H, 640),
+                            "self_attn.indexer.index_qk_proj.weight": (640, H)}.items():
+            codes, scales, self.v[name] = mxfp8(rng, *shape)
+            tens[self.L + name] = ("F8_E4M3", codes.shape, codes.tobytes())
+            tens[self.L + name + "_scale"] = ("U8", scales.shape, scales.tobytes())
+        self.v["norm"] = (rng.integers(-64, 64, size=(H,)) / 64).astype(np.float32)
+        tens[self.L + "attn_hyper_connection.hc_norm.weight"] = ("F32", (H,), self.v["norm"].tobytes())
+        self.tens = tens
+        small_checkpoint(self.d, tens)
+
+    def dense(self):
+        return C.CheckpointDense(C.Checkpoint(self.d), q6k=True, require_complete=False)
+
+    def test_values_widen_exactly(self):
+        dn, v = self.dense(), self.v
+        self.assertEqual(dn.bytes("blk.0.ssm_alpha.weight").tobytes(),
+                         bf16(v["linear_attn.in_proj_a.weight"][S.gdn_block_source()]).tobytes())
+        self.assertEqual(dn.bytes("blk.0.indexer.k_proj.weight").tobytes(),
+                         bf16(v["self_attn.indexer.index_qk_proj.weight"][512:]).tobytes())
+        np.testing.assert_array_equal(dn.bytes("blk.0.hc_attn_norm.weight").view("<f4"), v["norm"] + 1)
+
+    def test_quantized_streams(self):
+        import multiprocessing
+        dn, v = self.dense(), self.v
+        with multiprocessing.Pool(2) as pool:
+            z = b"".join(dn.chunks("blk.0.attn_gate.weight", pool))
+            o = b"".join(dn.chunks("blk.0.ssm_out.weight", pool))
+            dw = b"".join(dn.chunks("blk.0.ffn_down_shexp.weight", pool))
+        self.assertEqual(z, S.q6_k(v["linear_attn.in_proj_z.weight"][S.gdn_index(6144, 0)].reshape(-1)))
+        o_want = v["linear_attn.out_proj.weight"][:, S.gdn_index(6144, 0)]     # scales apply before the columns move
+        self.assertEqual(o, S.q6_k(np.ascontiguousarray(o_want).reshape(-1)))
+        self.assertEqual(dw, S.q8_0(v["mlp.shared_expert.down_proj.weight"].reshape(-1)))
+
+    def test_nan_scale_is_refused(self):
+        for name in ("linear_attn.in_proj_a.weight_scale", "linear_attn.in_proj_z.weight_scale"):
+            dt, shape, raw = self.tens[self.L + name]
+            self.tens[self.L + name] = (dt, shape, b"\xff" + raw[1:])
+        small_checkpoint(self.d, self.tens)
+        dn = self.dense()
+        with self.assertRaisesRegex(S.ConvertError, "non-finite"):
+            dn.bytes("blk.0.ssm_alpha.weight")
+        self.assertIn("a non-finite value", [C._mat_job(j) for j in dn.jobs("blk.0.attn_gate.weight")])
+
+    def test_missing_scale_and_f32_projection_are_refused(self):
+        del self.tens[self.L + "linear_attn.out_proj.weight_scale"]
+        small_checkpoint(self.d, self.tens)
+        with self.assertRaisesRegex(S.ConvertError, "out_proj\\.weight is F8_E4M3 and has no weight_scale"):
+            self.dense()
+        self.tens[self.L + "linear_attn.out_proj.weight"] = ("F32", (2, 32), bytes(256))
+        small_checkpoint(self.d, self.tens)
+        with self.assertRaisesRegex(S.ConvertError, "out_proj\\.weight is F32"):
+            self.dense()
+
+
 if __name__ == "__main__":
     unittest.main()
 

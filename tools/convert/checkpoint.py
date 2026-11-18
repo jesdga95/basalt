@@ -371,7 +371,7 @@ class CheckpointDense:
             if rule is None:
                 unknown.append(k)
                 continue
-            qsrc, how = self._source(k, dt, shape)
+            qsrc, how = self._source(k, dt, shape, f32=rule[1] == "F32")
             name = f"blk.{m.group(1)}.{rule[0]}" if m else rule[0]
             ty, transform = rule[1], rule[2]
             if transform in ("conv", "gconv"):
@@ -394,10 +394,13 @@ class CheckpointDense:
             self._check_complete(tc)
         self.where = {n: (None, t, ck.t[t.src][0]) for n, t in self.tensors.items()}
 
-    def _source(self, name, dt, shape):
-        """How a checkpoint tensor stores its values, and that in words: (qsrc or None, description)."""
+    def _source(self, name, dt, shape, f32=False):
+        """How a checkpoint tensor stores its values, and that in words: (qsrc or None, description). F32 is read only
+        for a tensor the pack stores as F32 (`f32`)."""
         if dt == "BF16":
             return None, "bf16"
+        if dt == "F32" and f32:
+            return None, "f32"
         base = name[:-len(".weight")] if name.endswith(".weight") else name
         scale = base + ".weight_scale"
         if dt == "F8_E4M3":
@@ -424,7 +427,8 @@ class CheckpointDense:
             return {"kind": "nvfp4", "codes": (self.ck.t[name][0], self.ck.t[name][1]),
                     "scales": (sp, soff), "scale": float(np.asarray(self.ck.values(scale2)).reshape(-1)[0])}, \
                 "nvfp4 (E2M1 codes, one E4M3 scale per 16, one FP32 matrix scale)"
-        raise S.ConvertError(f"{name} is {dt}; the dense tensors are read from BF16, MXFP8, FP8 or NVFP4")
+        raise S.ConvertError(f"{name} is {dt}; the dense tensors are read from BF16, MXFP8, FP8 or NVFP4, "
+                             "the F32 ones also from F32")
 
     def _check_complete(self, tc):
         """Refuses a checkpoint that lacks a tensor the engine reads (each layer's by its type) or has a layer the
