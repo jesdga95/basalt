@@ -98,7 +98,8 @@ __device__ __forceinline__ void store_cell(uint8_t* cache, size_t cell, const fl
     __syncthreads();
 }
 
-// A warp per output row; z = the token.
+// A warp per output row; z = the token. The activation is rounded to q8_1 per 32 values, as every other product of the model's
+// Q8_0 weights does: d = amax / 127, codes round half away from zero, the block's dot is an integer sum times d_w * d.
 __global__ void heads_gemv_kernel(const uint8_t* __restrict__ w, const float* __restrict__ x, int x_head_stride, int x_tok_stride,
                                   int rows, int nb, int heads, float* __restrict__ y) {
     const int h = blockIdx.y, t = blockIdx.z, lane = threadIdx.x & 31;
@@ -109,11 +110,18 @@ __global__ void heads_gemv_kernel(const uint8_t* __restrict__ w, const float* __
     float acc = 0.f;
     for (int b = 0; b < nb; ++b) {
         const uint8_t* blk = row + (size_t) b * 34;
-        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
-        const float q = (float) (int8_t) blk[2 + lane];
-        acc = fmaf(d * q, xv[b * 32 + lane], acc);
+        const float dw = __half2float(*reinterpret_cast<const __half*>(blk));
+        const int qw = (int8_t) blk[2 + lane];
+        const float v = xv[b * 32 + lane];
+        const float amax = warp_max(fabsf(v));
+        const float d = amax / 127.f;
+        const float id = d != 0.f ? 1.f / d : 0.f;
+        const int qx = __float2int_rn(roundf(v * id));
+        int isum = qw * qx;
+#pragma unroll
+        for (int m = 16; m; m >>= 1) isum += __shfl_xor_sync(0xffffffffu, isum, m);
+        acc = fmaf(dw * d, (float) isum, acc);
     }
-    acc = warp_sum(acc);
     if (lane == 0) y[((size_t) t * heads + h) * rows + r] = acc;
 }
 

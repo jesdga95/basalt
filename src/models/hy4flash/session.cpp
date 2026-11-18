@@ -67,6 +67,7 @@ public:
     explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
         for (void* p : bufs_) cudaFree(p);
+        if (d_hist_) cudaFree(d_hist_);
         for (void* p : pinned_) cudaFreeHost(p);
         if (ev_) cudaEventDestroy(ev_);
         if (stream_) cudaStreamDestroy(stream_);
@@ -135,7 +136,7 @@ public:
         pea_.resize((size_t) g_.n_layers);
         for (int l = 0; ok && l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) {
-                cache_[(size_t) l] = (uint8_t*) alloc((size_t) swa_ring() * kRowWidth * 2, ok);
+                cache_[(size_t) l] = (uint8_t*) alloc((size_t) swa_ring() * kRowWidth * elem(), ok);
             } else {
                 ea_[(size_t) l] = std::make_unique<core::ElasticArray>();
                 pea_[(size_t) l] = std::make_unique<core::ElasticArray>();
@@ -281,6 +282,31 @@ public:
         return {};
     }
 
+    model::Result set_logit_bias(const float* bias) override {
+        bias_on_ = bias != nullptr;
+        if (!bias_on_) return {};
+        std::string e;
+        if (!device_bias(d_bias_, bias, e)) return {model::Status::Error, "hy4flash: " + e};
+        return {};
+    }
+
+    // a draw of one row again, with the tokens the mask bans
+    model::Result resample_row(int row, const float* bias, int32_t& token) override {
+        std::string e;
+        if (row < 0 || row >= last_rows_) return {model::Status::Error, "hy4flash: the row is not in the last window"};
+        if (!device_bias(d_mask_, bias, e)) return {model::Status::Error, "hy4flash: " + e};
+        bk::SamplerParams sp = sampling_;
+        sp.logit_bias = d_mask_;
+        sp.counter += (uint64_t) row;
+        bk::sample_tokens(logits_ + (size_t) row * g_.n_vocab, 1, (int) g_.n_vocab, history_len_ > 0 ? d_hist_ + (size_t) row * history_len_ : nullptr,
+                          history_len_, sp, pick_ + 24, stream_);
+        int32_t t = 0;
+        if (cudaMemcpyAsync(&t, pick_ + 24, 4, cudaMemcpyDeviceToHost, stream_) != cudaSuccess || cudaStreamSynchronize(stream_) != cudaSuccess)
+            return {model::Status::Error, "hy4flash: the masked draw failed"};
+        token = t;
+        return {};
+    }
+
     model::Result copy_logits(int row, float* out) override {
         if (row < 0 || row >= last_rows_) return {model::Status::Error, "hy4flash: the session keeps the last window's logits only"};
         cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost);
@@ -310,7 +336,9 @@ private:
 
     int swa_ring() const { return g_.window + kMaxRows; }
     bool fp8() const { return m_.cache_fp8(); }
-    int sparse_row_bytes() const { return fp8() ? kFp8RowBytes : kRowWidth * 2; }
+    bool f32() const { return m_.cache_f32(); }
+    int elem() const { return f32() ? 4 : 2; }
+    int sparse_row_bytes() const { return fp8() ? kFp8RowBytes : kRowWidth * elem(); }
 
     // y[r] = W x[r] for R rows, 8 at a time: a row's product does not depend on the rows beside it
     void gemm(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R) {
@@ -377,7 +405,29 @@ private:
         const bool f8 = !swa && fp8();
         const float* kvn = F(l, "attn_kv_a_norm.weight");
         if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
+        else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
         else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
+        if (diag(l) && f32() && !swa) {   // the inputs of the attention, for the reference's tensors (fp32 caches only)
+            cudaStreamSynchronize(stream_);
+            dump("q_resid-" + std::to_string(l), qan_, (int64_t) R * g_.q_lora);
+            std::vector<float> rows((size_t) R * kRowWidth), lat((size_t) R * rank), pe((size_t) R * g_.rope_dim), qp((size_t) R * H * g_.rope_dim),
+                               qc((size_t) R * H * kRowWidth);
+            cudaMemcpy(rows.data(), (const float*) cache + (size_t) pos0 * kRowWidth, rows.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(qc.data(), qcur_, qc.size() * 4, cudaMemcpyDeviceToHost);
+            for (int t = 0; t < R; ++t) {
+                for (int c = 0; c < rank; ++c) lat[(size_t) t * rank + c] = rows[(size_t) t * kRowWidth + c];
+                for (int c = 0; c < g_.rope_dim; ++c) pe[(size_t) t * g_.rope_dim + c] = rows[(size_t) t * kRowWidth + rank + c];
+                for (int h = 0; h < H; ++h)
+                    for (int c = 0; c < g_.rope_dim; ++c) qp[((size_t) t * H + h) * g_.rope_dim + c] = qc[((size_t) t * H + h) * kRowWidth + rank + c];
+            }
+            auto put = [&](const std::string& n, const std::vector<float>& v) {
+                std::FILE* f = std::fopen((m_.diag_dump() + "/" + n + ".f32").c_str(), "ab");
+                if (f) { std::fwrite(v.data(), 4, v.size(), f); std::fclose(f); }
+            };
+            put("kv_cmpr-" + std::to_string(l), lat);
+            put("k_pe-" + std::to_string(l), pe);
+            put("q_pe-" + std::to_string(l), qp);
+        }
         // the cells each row attends
         int32_t* meta = meta_h_ + (size_t) l * 3 * kMaxRows;   // firsts, counts, fill
         int32_t *firsts = meta, *counts = meta + kMaxRows, *fill = meta + 2 * kMaxRows;
@@ -421,12 +471,16 @@ private:
             rs.cells_stride = cells_stride_;
         }
         if (f8) mla_attend(qcur_, (const uint8_t*) cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
+        else if (f32()) mla_attend(qcur_, (const float*) cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
         else mla_attend(qcur_, (const uint16_t*) cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
         q8_0_heads_gemv(T(l, "attn_v_b.weight")->ptr, olat_, rank, H * rank, H, g_.v_dim, rank, R, vout_, stream_);
+        if (diag(l)) dump("attn_kqv-" + std::to_string(l), vout_, (int64_t) R * H * g_.v_dim);
         gemm(T(l, "attn_gate.weight"), xn_, gate_, E, H * g_.v_dim, R);
         mul_sigmoid(gate_, vout_, R * H * g_.v_dim, stream_);
+        if (diag(l)) dump("attn_gated-" + std::to_string(l), vout_, (int64_t) R * H * g_.v_dim);
         gemm(T(l, "attn_output.weight"), vout_, attn_raw_, H * g_.v_dim, E, R);
         bk::rms_norm_rows(attn_raw_, F(l, "post_attention_norm.weight"), attn_, R, E, g_.rms_eps, stream_);
+        if (diag(l)) dump("attn_out-" + std::to_string(l), attn_, (int64_t) R * E);
         return true;
     }
 
@@ -745,17 +799,23 @@ private:
             }
         cudaMemcpyAsync(e_, h_e_, (size_t) R * E * 4, cudaMemcpyHostToDevice, stream_);
         fill_streams(e_, E, R, X_, stream_);
+        if (!m_.diag_dump().empty()) dump("hc_init", X_, (int64_t) R * 4 * E);
         for (int l = 0; l < g_.n_layers; ++l) {
             if (!engram(l, pos0, R, tokens, err)) return false;
+            if (diag(l) && !g_.swa.empty() && l >= 1) dump("engram_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
             bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
             bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+            if (diag(l)) dump("attn_norm-" + std::to_string(l), xn_, (int64_t) R * E);
             if (!attention(l, pos0, R, err)) return false;
             bk::hc_post(attn_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
             std::swap(X_, Xn_);
+            if (diag(l)) dump("hc_attn_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
             bk::hc_mixes_plain(X_, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
             bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+            if (diag(l)) dump("ffn_norm-" + std::to_string(l), xn_, (int64_t) R * E);
             if (!ffn(l, R, err)) return false;
             bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, R, E, g_.rms_eps, stream_);
+            if (diag(l)) dump("ffn_out-" + std::to_string(l), mlp2_, (int64_t) R * E);
             bk::hc_post(mlp2_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
             std::swap(X_, Xn_);
             if (!m_.diag_dump().empty()) dump("l_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
@@ -821,6 +881,9 @@ private:
         cudaStreamSynchronize(stream_);   // the host table is a temporary
     }
 
+    // diagnostic: a layer whose inner tensors are dumped (the first three)
+    bool diag(int l) const { return !m_.diag_dump().empty() && l < 3; }
+
     // diagnostic: a tensor of this call appended to <dir>/<name>.f32
     void dump(const std::string& name, const float* d, int64_t n) {
         std::vector<float> h((size_t) n);
@@ -836,14 +899,38 @@ private:
         std::fclose(f);
     }
 
+    bool device_bias(float*& dev, const float* host, std::string& err) {
+        const size_t bytes = (size_t) g_.n_vocab * sizeof(float);
+        if (dev == nullptr) {
+            void* v = nullptr;
+            if (cudaMalloc(&v, bytes) != cudaSuccess) { err = "out of device memory for a logit bias"; return false; }
+            bufs_.push_back(v);
+            dev = (float*) v;
+        }
+        if (cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, stream_) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
+        return true;
+    }
+
     // The picks of the last `rows` rows of logits_ (row t of the window is draw counter + t0 + t).
     bool pick(const model::DecodeRequest& r, int t0, int rows, std::string& err) {
         bk::SamplerParams sp;
         if (r.sampling) sp = *r.sampling;
         else sp.greedy = true;
         if (!r.sampling) sp.temperature = 0.f;
-        sp.counter += (uint64_t) (t0 + (r.row_tokens ? 0 : 0));
-        bk::sample_tokens(logits_, rows, (int) g_.n_vocab, nullptr, 0, sp, pick_, stream_);
+        sp.counter += (uint64_t) t0;
+        sp.logit_bias = bias_on_ ? d_bias_ : nullptr;
+        history_len_ = r.history != nullptr ? r.history_len : 0;
+        if (history_len_ > 0) {   // the penalties' history of each row of the window
+            const size_t n = (size_t) kMaxWindow * history_len_;
+            if (d_hist_len_ < n) {
+                if (d_hist_) cudaFree(d_hist_);
+                if (cudaMalloc((void**) &d_hist_, n * 4) != cudaSuccess) { err = "out of device memory for the sampling history"; return false; }
+                d_hist_len_ = n;
+            }
+            cudaMemcpyAsync(d_hist_, r.history, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, stream_);
+        }
+        sampling_ = sp;
+        bk::sample_tokens(logits_, rows, (int) g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, pick_, stream_);
         picks_.assign((size_t) rows, 0);
         if (cudaMemcpyAsync(picks_.data(), pick_, (size_t) rows * 4, cudaMemcpyDeviceToHost, stream_) != cudaSuccess || cudaStreamSynchronize(stream_) != cudaSuccess) {
             err = "the pick failed";
@@ -888,6 +975,12 @@ private:
     std::vector<std::unique_ptr<core::ElasticArray>> ea_, pea_;
     int64_t backed_ = 0;   // positions the sparse layers' caches are backed for
     std::vector<int32_t> hist_, picks_;
+    bool bias_on_ = false;
+    float *d_bias_ = nullptr, *d_mask_ = nullptr;
+    int* d_hist_ = nullptr;
+    size_t d_hist_len_ = 0;
+    int history_len_ = 0;
+    bk::SamplerParams sampling_;
     // [vision]
     ImageEncoder vis_;
     RopeTrack rope_;

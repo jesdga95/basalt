@@ -137,6 +137,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         dev_.emplace(name, std::move(d));
     }
     fp8_ = req.kv == "fp8";
+    f32_ = req.kv == "f32";
     // DFLY HOOK: the drafter's weights, with the dense ones so the context is sized after them (no pack drafter, or --spec 0: none)
     spec_ = req.spec;
     if (req.draft)

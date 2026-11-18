@@ -199,17 +199,35 @@ void test_gemv() {
         float *dx = dev(x), *dy = devf((size_t) T * heads * rows);
         q8_0_heads_gemv(dw, dx, xs, tok, heads, rows, k, T, dy, nullptr);
         std::vector<float> got = host(dy, (size_t) T * heads * rows);
-        std::vector<double> ref((size_t) T * heads * rows);
+        // the reference rounds the activation to q8_1 per 32 values as the kernel does (d = amax / 127, half away from zero) and
+        // keeps the integer sums exact; the exact-activation product is compared too
+        std::vector<double> ref((size_t) T * heads * rows), exact((size_t) T * heads * rows);
         for (int t = 0; t < T; ++t)
             for (int h = 0; h < heads; ++h)
                 for (int r = 0; r < rows; ++r) {
-                    double d = 0;
-                    for (int i = 0; i < k; ++i) d += (double) w.vals[((size_t) h * rows + r) * k + i] * x[(size_t) t * tok + (size_t) h * xs + i];
-                    ref[((size_t) t * heads + h) * rows + r] = d;
+                    const uint8_t* row = &w.bytes[((size_t) h * rows + r) * (k / 32) * 34];
+                    double acc = 0, ex = 0;
+                    for (int b = 0; b < k / 32; ++b) {
+                        const uint8_t* blk = row + (size_t) b * 34;
+                        const float dw = h2f((uint16_t) (blk[0] | (blk[1] << 8)));
+                        const float* xv = &x[(size_t) t * tok + (size_t) h * xs + b * 32];
+                        float amax = 0;
+                        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(xv[i]));
+                        const float d = amax / 127.f, id = d != 0.f ? 1.f / d : 0.f;
+                        long isum = 0;
+                        for (int i = 0; i < 32; ++i) {
+                            isum += (long) (int8_t) blk[2 + i] * (long) std::lround(xv[i] * id);
+                            ex += (double) dw * (int8_t) blk[2 + i] * xv[i];
+                        }
+                        acc += (double) (dw * d) * (double) isum;
+                    }
+                    ref[((size_t) t * heads + h) * rows + r] = acc;
+                    exact[((size_t) t * heads + h) * rows + r] = ex;
                 }
         char name[64];
         std::snprintf(name, sizeof name, "q8_0_heads_gemv %dx%dx%d", heads, rows, k);
-        report(name, got, ref, 1e-5);
+        report(name, got, ref, 2e-5);
+        report("  against exact activations", got, exact, 5e-2);   // the q8_1 rounding
         float* d1 = devf((size_t) heads * rows);
         q8_0_heads_gemv(dw, dx + (size_t) 1 * tok, xs, tok, heads, rows, k, 1, d1, nullptr);
         const bool same = std::memcmp(host(d1, (size_t) heads * rows).data(), got.data() + (size_t) heads * rows, (size_t) heads * rows * 4) == 0;
