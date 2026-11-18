@@ -1,5 +1,5 @@
 // src/models/hy4flash/session.cpp - one conversation of Hy4-flash: its latent caches, indexer rows and pooled keys, and the
-// forward of a run of rows that every decode window (up to 8 rows) and every prompt chunk (up to kMaxRows) goes through.
+// forward of a run of rows that every decode window (up to 8 rows) and every prompt chunk (up to kMaxChunk) goes through.
 //
 // Per layer: the Engram step (on its layers), the attention's hyper-connection pre-mix and norm, the absorbed MLA over the
 // shared latent (a ring on the window layers, the indexer's selection on the others), the gate, the output projection and its
@@ -46,11 +46,11 @@ namespace {
 namespace bk = basalt::kernels;
 
 constexpr int kRowWidth = 576;                 // a cache row: 512 latent values and 64 rotated
-constexpr int kMaxRows = 1024;                 // rows one call carries: a prompt chunk
+constexpr int kMaxChunk = 4096;                // rows a prompt chunk may carry (the rings are sized for it)
 constexpr int kStageExperts = 16;              // experts of one prompt launch (a blob each in the staging)
 constexpr int kLaunchRows = 4096;              // most (row, expert) pairs of one prompt launch
 constexpr int kMaxWindow = 8;                  // rows of a decode window, and of one expert group
-constexpr int kRawRing = kMaxRows + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
+constexpr int kRawRing = kMaxChunk + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
 constexpr int64_t kGrowPositions = 16384;      // positions the caches are backed in
 constexpr uint64_t kModuleRoom = 7ull << 27;   // kernel modules still to load when the tier opens
 constexpr uint64_t kPromptRoom = 5ull << 29;   // the prompt path's workspaces beside the homes
@@ -65,10 +65,33 @@ struct WindowPlan {
     int32_t tok[kLookupK];
 };
 
+// The buffers that scale with the rows of a call: a decode window's, or a prompt chunk's (opened while a prompt runs, with the tier's
+// slots lent to them).
+struct Bufs {
+    int rows = 0;
+    std::vector<void*> dev, host;
+    float *X = nullptr, *Xn = nullptr, *coef = nullptr, *hcws = nullptr, *e = nullptr, *cur = nullptr, *xn = nullptr, *attn = nullptr,
+          *attn_raw = nullptr, *mlp = nullptr, *mlp2 = nullptr, *qa = nullptr, *qan = nullptr, *q = nullptr, *kvraw = nullptr,
+          *qabs = nullptr, *qcur = nullptr, *olat = nullptr, *vout = nullptr, *gate = nullptr, *ik = nullptr, *ikn = nullptr,
+          *ivt = nullptr, *igt = nullptr, *iq = nullptr, *iw = nullptr, *gu = nullptr, *h = nullptr, *rlog = nullptr, *rw = nullptr,
+          *xlat = nullptr, *lat_out = nullptr, *moe_out = nullptr, *sh = nullptr, *erows = nullptr, *ekv = nullptr, *evalid = nullptr,
+          *pair_rows = nullptr, *h_erows = nullptr, *h_e = nullptr, *h_evalid = nullptr;
+    int32_t *icells = nullptr, *meta_d = nullptr, *meta_h = nullptr, *ids = nullptr, *pair_map = nullptr, *pair_ident = nullptr,
+            *mmq_ident = nullptr;
+    void* mmq_xq = nullptr;
+    void release() {
+        for (void* p : dev) cudaFree(p);
+        for (void* p : host) cudaFreeHost(p);
+        *this = Bufs();
+    }
+};
+
 class Session final : public model::ModelSession {
 public:
     explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
+        dec_.release();
+        big_.release();
         for (void* p : bufs_) cudaFree(p);
         if (d_hist_) cudaFree(d_hist_);
         for (void* p : pinned_) cudaFreeHost(p);
@@ -82,7 +105,8 @@ public:
             err = "cannot create a stream";
             return false;
         }
-        const int64_t E = g_.n_embd, ctx = m_.context(), R = kMaxRows;
+        const int64_t E = g_.n_embd, ctx = m_.context();
+        (void) E;
         int max_heads = 0;
         for (int h : g_.heads) max_heads = std::max(max_heads, h);
         bool ok = true;
@@ -93,33 +117,15 @@ public:
             else pinned_.push_back(p);
             return (float*) p;
         };
-        X_ = f(R * 4 * E); Xn_ = f(R * 4 * E); coef_ = f(R * bk::kHcCoef); hcws_ = f((int64_t) bk::hc_plain_workspace_floats(kMaxRows));
-        e_ = f(R * E); cur_ = f(R * E); xn_ = f(R * E); attn_ = f(R * E); attn_raw_ = f(R * E); mlp_ = f(R * E); mlp2_ = f(R * E);
         fin_ = f(kMaxWindow * E);
-        qa_ = f(R * g_.q_lora); qan_ = f(R * g_.q_lora); q_ = f(R * max_heads * g_.qk_dim); kvraw_ = f(R * kRowWidth);
-        qabs_ = f(R * max_heads * g_.kv_lora); qcur_ = f(R * max_heads * kRowWidth);
-        olat_ = f(R * max_heads * g_.kv_lora); vout_ = f(R * max_heads * g_.v_dim); gate_ = f(R * max_heads * g_.v_dim);
-        ik_ = f(R * g_.idx_dim); ikn_ = f(R * g_.idx_dim); ivt_ = f(R * g_.idx_dim); igt_ = f(R * g_.idx_dim);
-        iq_ = f(R * g_.idx_heads * g_.idx_dim); iw_ = f(R * g_.idx_heads);
         const int64_t pools = ctx / g_.idx_pool + 1;
         iscore_ = f(pools);
         cells_stride_ = g_.idx_top_k + 2 * g_.idx_pool;
-        icells_ = (int32_t*) alloc((size_t) R * cells_stride_ * 4, ok);
-        meta_d_ = (int32_t*) alloc((size_t) 3 * R * 4, ok);
-        meta_h_ = (int32_t*) pin((size_t) g_.n_layers * 3 * R);
-        gu_ = f(2 * R * (int64_t) g_.n_ff); h_ = f(R * (int64_t) g_.n_ff);
-        rlog_ = f(R * g_.n_expert); rw_ = f(R * 16); ids_ = (int32_t*) alloc((size_t) R * 16 * 4, ok);
-        xlat_ = f(R * g_.n_latent); lat_out_ = f(R * g_.n_latent); moe_out_ = f(R * E); sh_ = f(R * E);
+        max_heads_ = max_heads;
         logits_ = f((int64_t) kMaxWindow * g_.n_vocab); pick_ = (int32_t*) alloc(4 * 32, ok);
-        erows_ = f(R * g_.n_embd);   // the Engram's normed rows: 16 x 96 values a row
-        ekv_ = f(R * 5 * E);
-        evalid_ = f(R);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxWindow, (int) g_.n_vocab) + (int64_t) kMaxWindow * (bk::kLogprobStride + 1));
         q8_ = alloc(std::max<size_t>(bk::native_q8_1_bytes(16384, kMaxWindow), 1 << 16), ok);
-        mmq_xq_ = alloc(basalt::prefill::mmq::q8_bytes(kMaxRows, 16384), ok);
         mmq_bounds_ = (int32_t*) alloc(2 * 4, ok);
-        mmq_ident_ = (int32_t*) alloc((size_t) kMaxRows * 4, ok);
-        if (ok && basalt::prefill::mmq::built()) basalt::prefill::mmq::iota(mmq_ident_, kMaxRows, nullptr);
         ex_xq_ = alloc(bk::native_q8_1_bytes(g_.n_latent, kMaxWindow), ok);
         ex_scr_ = alloc(bk::native_expert_scratch_bytes(kLookupK, g_.n_ff_exp), ok);
         ex_rows_ = f((int64_t) kLookupK * g_.n_latent);
@@ -137,18 +143,13 @@ public:
                 if (cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) != cudaSuccess) ok = false;
             }
             if (cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) ok = false;
-            pair_rows_ = f((int64_t) kMaxRows * g_.n_used * g_.n_latent);
-            pair_map_ = (int32_t*) alloc((size_t) kMaxRows * g_.n_used * 4, ok);
-            pair_ident_ = (int32_t*) alloc((size_t) kMaxRows * g_.n_used * 4, ok);
             xq1_ = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
             xq2_ = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
-            if (ok && mmq::built()) mmq::iota(pair_ident_, (int64_t) kMaxRows * g_.n_used, nullptr);
         }
         rowptr_d_ = (const float**) alloc(kLookupK * sizeof(void*), ok);
         h_rowptr_ = (const float**) pin(kLookupK * 2);
         h_rw_ = pin(kMaxWindow * 16); h_ids_ = (int32_t*) pin(kMaxWindow * 16);
         rope_dev_ = (int32_t*) alloc((size_t) ctx * 12, ok);   // [vision] the 3-D rotary position of every cell
-        h_erows_ = pin(R * g_.n_embd); h_e_ = pin(R * E); h_evalid_ = pin(R);
         if (cudaHostAlloc((void**) &h_plan_, sizeof(WindowPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
         else pinned_.push_back(h_plan_);
         cache_.assign((size_t) g_.n_layers, nullptr);
@@ -174,6 +175,8 @@ public:
             err = "out of device memory for the session";
             return false;
         }
+        if (!make_bufs(dec_, kMaxWindow, err)) return false;
+        use(dec_);
         if (m_.dfly() && fp8()) {
             err = "--spec reads the target's BF16 latent rows: it cannot run with --kv fp8 (use --kv bf16 or --spec 0)";
             return false;
@@ -184,6 +187,121 @@ public:
             return false;
         return true;
     }
+
+    // The buffers for `R` rows; false (with nothing left allocated) when the card has no room.
+    bool make_bufs(Bufs& b, int R, std::string& err) {
+        const int64_t E = g_.n_embd;
+        bool ok = true;
+        auto f = [&](int64_t n) {
+            void* p = nullptr;
+            if (!ok || cudaMalloc(&p, std::max<size_t>((size_t) n * 4, 16)) != cudaSuccess) {
+                ok = false;
+                return (float*) nullptr;
+            }
+            b.dev.push_back(p);
+            return (float*) p;
+        };
+        auto pin = [&](int64_t n) {
+            void* p = nullptr;
+            if (!ok || cudaMallocHost(&p, (size_t) n * 4) != cudaSuccess) {
+                ok = false;
+                return (float*) nullptr;
+            }
+            b.host.push_back(p);
+            return (float*) p;
+        };
+        b.rows = R;
+        b.X = f((int64_t) R * 4 * E); b.Xn = f((int64_t) R * 4 * E); b.coef = f((int64_t) R * bk::kHcCoef);
+        b.hcws = f((int64_t) bk::hc_plain_workspace_floats(R));
+        b.e = f((int64_t) R * E); b.cur = f((int64_t) R * E); b.xn = f((int64_t) R * E); b.attn = f((int64_t) R * E);
+        b.attn_raw = f((int64_t) R * E); b.mlp = f((int64_t) R * E); b.mlp2 = f((int64_t) R * E);
+        b.qa = f((int64_t) R * g_.q_lora); b.qan = f((int64_t) R * g_.q_lora); b.q = f((int64_t) R * max_heads_ * g_.qk_dim);
+        b.kvraw = f((int64_t) R * kRowWidth); b.qabs = f((int64_t) R * max_heads_ * g_.kv_lora);
+        b.qcur = f((int64_t) R * max_heads_ * kRowWidth); b.olat = f((int64_t) R * max_heads_ * g_.kv_lora);
+        b.vout = f((int64_t) R * max_heads_ * g_.v_dim); b.gate = f((int64_t) R * max_heads_ * g_.v_dim);
+        b.ik = f((int64_t) R * g_.idx_dim); b.ikn = f((int64_t) R * g_.idx_dim); b.ivt = f((int64_t) R * g_.idx_dim);
+        b.igt = f((int64_t) R * g_.idx_dim); b.iq = f((int64_t) R * g_.idx_heads * g_.idx_dim); b.iw = f((int64_t) R * g_.idx_heads);
+        b.icells = (int32_t*) f((int64_t) R * cells_stride_);
+        b.meta_d = (int32_t*) f(3 * (int64_t) R);
+        b.meta_h = (int32_t*) pin((int64_t) g_.n_layers * 3 * R);
+        b.gu = f(2 * (int64_t) R * g_.n_ff); b.h = f((int64_t) R * g_.n_ff);
+        b.rlog = f((int64_t) R * g_.n_expert); b.rw = f((int64_t) R * 16); b.ids = (int32_t*) f((int64_t) R * 16);
+        b.xlat = f((int64_t) R * g_.n_latent); b.lat_out = f((int64_t) R * g_.n_latent); b.moe_out = f((int64_t) R * E); b.sh = f((int64_t) R * E);
+        b.erows = f((int64_t) R * g_.n_embd); b.ekv = f((int64_t) R * 5 * E); b.evalid = f(R);
+        b.pair_rows = f((int64_t) R * g_.n_used * g_.n_latent);
+        b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used);
+        b.mmq_ident = (int32_t*) f(R);
+        b.h_erows = pin((int64_t) R * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(R);
+        if (ok) {
+            void* q = nullptr;
+            if (cudaMalloc(&q, basalt::prefill::mmq::q8_bytes(R, 16384)) != cudaSuccess) ok = false;
+            else {
+                b.dev.push_back(q);
+                b.mmq_xq = q;
+            }
+        }
+        if (!ok) {
+            b.release();
+            err = "out of device memory for " + std::to_string(R) + " rows";
+            return false;
+        }
+        if (basalt::prefill::mmq::built()) {
+            basalt::prefill::mmq::iota(b.mmq_ident, R, nullptr);
+            basalt::prefill::mmq::iota(b.pair_ident, (int64_t) R * g_.n_used, nullptr);
+        }
+        cudaDeviceSynchronize();
+        return true;
+    }
+
+    // The session's row buffers are `b`'s from here on.
+    void use(const Bufs& b) {
+        rows_ = b.rows;
+        X_ = b.X; Xn_ = b.Xn; coef_ = b.coef; hcws_ = b.hcws; e_ = b.e; cur_ = b.cur; xn_ = b.xn; attn_ = b.attn; attn_raw_ = b.attn_raw;
+        mlp_ = b.mlp; mlp2_ = b.mlp2; qa_ = b.qa; qan_ = b.qan; q_ = b.q; kvraw_ = b.kvraw; qabs_ = b.qabs; qcur_ = b.qcur;
+        olat_ = b.olat; vout_ = b.vout; gate_ = b.gate; ik_ = b.ik; ikn_ = b.ikn; ivt_ = b.ivt; igt_ = b.igt; iq_ = b.iq; iw_ = b.iw;
+        icells_ = b.icells; meta_d_ = b.meta_d; meta_h_ = b.meta_h; gu_ = b.gu; h_ = b.h; rlog_ = b.rlog; rw_ = b.rw; ids_ = b.ids;
+        xlat_ = b.xlat; lat_out_ = b.lat_out; moe_out_ = b.moe_out; sh_ = b.sh; erows_ = b.erows; ekv_ = b.ekv; evalid_ = b.evalid;
+        pair_rows_ = b.pair_rows; pair_map_ = b.pair_map; pair_ident_ = b.pair_ident; mmq_ident_ = b.mmq_ident; mmq_xq_ = b.mmq_xq;
+        h_erows_ = b.h_erows; h_e_ = b.h_e; h_evalid_ = b.h_evalid;
+    }
+
+    // A prompt of `total` rows: the tier lends its slots and the row buffers of a chunk (up to kMaxChunk rows) are made.
+    bool open_prompt(int total, std::string& err) {
+        if (big_.rows) {
+            use(big_);
+            return true;
+        }
+        cudaStreamSynchronize(stream_);
+        if (tier_) tier_->lend_all();
+        int want = kMaxWindow;
+        while (want < total && want < kMaxChunk) want *= 2;
+        for (int R = std::min(want, kMaxChunk); R >= kMaxWindow; R /= 2)
+            if (make_bufs(big_, R, err)) {
+                use(big_);
+                return true;
+            }
+        if (tier_) {
+            std::string e;
+            tier_->reclaim(e);
+            tier_->grow();
+        }
+        return false;
+    }
+
+    // The prompt's buffers go back; the tier takes its slots again.
+    void release_prompt() {
+        if (!big_.rows) return;
+        cudaStreamSynchronize(stream_);
+        use(dec_);
+        big_.release();
+        if (tier_) {
+            std::string e;
+            if (!tier_->reclaim(e)) basalt::log::warn("basalt hy4flash", "the expert tier stays small: %s", e.c_str());
+            tier_->grow();
+        }
+    }
+
+    void end_prompt() override { release_prompt(); }
 
     // DFLY HOOK: --spec sets the window (DeepSeek's rule: 0 or 1 is plain decode), and the drafter's calls (dfly.hpp)
     int max_window() const override { return std::clamp(m_.spec(), 1, kMaxWindow); }
@@ -197,6 +315,7 @@ public:
     model::Result decode_window(const model::DecodeRequest& r) override {
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
+        release_prompt();
         dfly_.begin_window(r.pos);   // DFLY HOOK
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxWindow) {
             const int n = std::min(kMaxWindow, r.n_tokens - t0);
@@ -220,7 +339,8 @@ public:
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
         dfly_.invalidate();   // DFLY HOOK
-        const int chunk = m_.diag_rows() > 0 ? std::min(kMaxRows, m_.diag_rows()) : kMaxRows;
+        if (!open_prompt(std::max(r.total_tokens, r.n_tokens), err)) return {model::Status::Error, "hy4flash: " + err};
+        const int chunk = m_.diag_rows() > 0 ? std::min(rows_, m_.diag_rows()) : rows_;
         for (int t0 = 0; t0 < r.n_tokens; t0 += chunk) {
             if (r.stop && r.stop()) break;
             const int n = std::min(chunk, r.n_tokens - t0);
@@ -231,6 +351,7 @@ public:
             }
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "hy4flash: the prompt failed"};
+        if (!r.more) release_prompt();
         return {};
     }
 
@@ -255,9 +376,10 @@ public:
         img_start_ = rope_.next();
         img_nx_ = grid.nx;
         std::string err;
-        const std::vector<int32_t> dead((size_t) kMaxRows, -1);
-        for (int at = 0; at < n_rows; at += kMaxRows) {
-            const int n = std::min(kMaxRows, n_rows - at);
+        if (!open_prompt(n_rows, err)) return {model::Status::Error, "hy4flash: " + err};
+        const std::vector<int32_t> dead((size_t) rows_, -1);
+        for (int at = 0; at < n_rows; at += rows_) {
+            const int n = std::min(rows_, n_rows - at);
             emb_rows_ = rows + (size_t) at * (size_t) g_.n_embd;
             img_j_ = at;
             const bool ok = run_rows(dead.data(), n, pos + at, 0, err);
@@ -321,8 +443,8 @@ public:
     }
 
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
-        if (save && (int64_t) hist_.size() - pos > kMaxRows)
-            return {model::Status::Error, "hy4flash: the rings have moved on more than " + std::to_string(kMaxRows) + " positions past the checkpoint"};
+        if (save && (int64_t) hist_.size() - pos > kMaxChunk)
+            return {model::Status::Error, "hy4flash: the rings have moved on more than " + std::to_string(kMaxChunk) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "hy4flash: a checkpoint past the session's position"};
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) {
@@ -451,7 +573,7 @@ private:
         return p;
     }
 
-    int swa_ring() const { return g_.window + kMaxRows; }
+    int swa_ring() const { return g_.window + kMaxChunk; }
     bool fp8() const { return m_.cache_fp8(); }
     bool f32() const { return m_.cache_f32(); }
     int elem() const { return f32() ? 4 : 2; }
@@ -546,8 +668,8 @@ private:
             put("q_pe-" + std::to_string(l), qp);
         }
         // the cells each row attends
-        int32_t* meta = meta_h_ + (size_t) l * 3 * kMaxRows;   // firsts, counts, fill
-        int32_t *firsts = meta, *counts = meta + kMaxRows, *fill = meta + 2 * kMaxRows;
+        int32_t* meta = meta_h_ + (size_t) l * 3 * rows_;   // firsts, counts, fill
+        int32_t *firsts = meta, *counts = meta + rows_, *fill = meta + 2 * rows_;
         bool selecting = false;
         std::vector<int> pools_of(R, 0);
         if (swa) {
@@ -578,12 +700,12 @@ private:
                 dfly_.selection(l, t, sel ? icells_ + (size_t) t * cells_stride_ : nullptr, sel ? counts[t] : -1, stream_);
             }
         }
-        cudaMemcpyAsync(meta_d_, meta, (size_t) 3 * kMaxRows * 4, cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(meta_d_, meta, (size_t) 3 * rows_ * 4, cudaMemcpyHostToDevice, stream_);
         RowSpans rs;
         rs.firsts = meta_d_;
-        rs.counts = meta_d_ + kMaxRows;
+        rs.counts = meta_d_ + rows_;
         if (!swa) {
-            iota_cells(icells_, cells_stride_, meta_d_ + 2 * kMaxRows, R, stream_);
+            iota_cells(icells_, cells_stride_, meta_d_ + 2 * rows_, R, stream_);
             rs.cells = icells_;
             rs.cells_stride = cells_stride_;
         }
@@ -1183,7 +1305,8 @@ private:
     float *qa_ = nullptr, *qan_ = nullptr, *q_ = nullptr, *kvraw_ = nullptr, *qabs_ = nullptr, *qcur_ = nullptr, *olat_ = nullptr, *vout_ = nullptr, *gate_ = nullptr;
     float *ik_ = nullptr, *ikn_ = nullptr, *ivt_ = nullptr, *igt_ = nullptr, *iq_ = nullptr, *iw_ = nullptr, *iscore_ = nullptr;
     int32_t *icells_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
-    int cells_stride_ = 0;
+    int cells_stride_ = 0, rows_ = 0, max_heads_ = 0;
+    Bufs dec_, big_;   // a window's row buffers, and a prompt chunk's while one runs
     float *gu_ = nullptr, *h_ = nullptr, *rlog_ = nullptr, *rw_ = nullptr;
     int32_t* ids_ = nullptr;
     float *xlat_ = nullptr, *lat_out_ = nullptr, *moe_out_ = nullptr, *sh_ = nullptr, *logits_ = nullptr, *lp_ = nullptr, *erows_ = nullptr, *ekv_ = nullptr, *evalid_ = nullptr;
