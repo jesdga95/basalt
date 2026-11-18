@@ -11,12 +11,12 @@ One setting picks the cards: `gpu`. It means the same in the server (`"gpu"` in 
 | --- | --- | --- |
 | not set | GPU 0 alone; one warning at start names the other visible cards | GPU 0 |
 | `"0,1"`, `"1,0"`, ... | exactly these, in this order | the first one listed |
-| `"auto"` | every visible Blackwell (sm_120) card, and when built with `-DPEER_ADA=ON`, every sm_89 card as an expert tier; any other card is skipped with one line naming it | the one with the most memory bandwidth, then the most VRAM |
+| `"auto"` | every visible Blackwell (sm_120) card, and the older cards the build takes as expert tiers (`-DPEER_ADA=ON`: sm_89; `-DPEER_AMPERE=ON`: sm_86 and sm_80); any other card is skipped with one line naming it | the one with the most memory bandwidth, then the most VRAM |
 
 Cards are numbered as `nvidia-smi` numbers them. When `CUDA_VISIBLE_DEVICES` is set, the numbers count within its list
 (`CUDA_VISIBLE_DEVICES=1,0` makes `gpu 0` the card `nvidia-smi` calls 1), and its numbers are read as `nvidia-smi`'s
 too. A number past the visible cards, a card listed twice, a first card that is not sm_120, or a later card that is
-neither sm_120 nor (when built with `-DPEER_ADA=ON`) sm_89 stops the start with an error.
+neither sm_120 nor an architecture the build takes as a peer (above) stops the start with an error.
 
 The main card holds the dense weights, the KV cache, the drafter and its own expert cache. The engine decides what the
 other cards do and prints one line at start, for example `gpus: RTX 5090 (nvidia-smi 0) main, RTX 5060 Ti (nvidia-smi 1)
@@ -115,16 +115,17 @@ it holds.
 
 ## An older peer card
 
-One older architecture can be built for the peer's kernels: sm_89 (Ada), beside an sm_120 main card, enabled with the
-`-DPEER_ADA=ON` build flag (off by default to keep build times fast for users without a hybrid setup). Without this flag,
-or for a card of any other pre-Blackwell architecture, the card is refused at the start rather than failing at its first
-kernel. What such a peer does and does not do:
+Two older architectures can be built for the peer's kernels, each beside an sm_120 main card: sm_89 (Ada) with the
+`-DPEER_ADA=ON` build flag and sm_86 (Ampere) with `-DPEER_AMPERE=ON` (both off by default to keep build times fast for
+users without a hybrid setup). Without the flag, or for a card of any other pre-Blackwell architecture, the card is
+refused at the start rather than failing at its first kernel. What such a peer does and does not do:
 
 - It holds experts and computes their rows in every decode window, with the standard-CUDA kernels (Q8_1/Q2_0 and the
   GGUF i-quant rows, dp4a arithmetic) compiled for its own architecture. Where an expert sits does not change its rows.
 - It reads its experts' share of a prompt chunk, under the slower-card rule above (chunks up to 2,559 rows).
-- It does not run the main card's work: the dense weights, the KV cache, the drafter, TMA and the FP4 tensor-core
-  expert kernels stay on the Blackwell card. An NVFP4 pack's FP4 experts are main-card only.
+- It takes a share of the LM head, split by vocabulary, when its bandwidth earns more than a quarter of the rows.
+- It does not run the rest of the main card's work: the dense weights, the KV cache, the drafter, TMA and the FP4
+  tensor-core expert kernels stay on the Blackwell card. An NVFP4 pack's FP4 experts are main-card only.
 - DeepSeek does not take an older peer: its peer-tier kernels are built for sm_120 only, and the start says so.
 - Layer split, overlapped windows and tensor parallel need matched Blackwell cards; an unlike pair always uses the
   expert tier, as before.
