@@ -1,5 +1,5 @@
-// src/models/deepseek41/file_reads.cpp - expert blobs read from the pack into RAM places, off the caller's thread.
-#include "models/deepseek41/file_reads.hpp"
+// src/core/file_reads.cpp - expert blobs read from the pack into RAM places, off the caller's thread.
+#include "basalt/core/file_reads.hpp"
 
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <cstring>
 
-namespace basalt::models::deepseek41 {
+namespace basalt::core {
 namespace {
 
 constexpr uint32_t kPiece = 1u << 20;    // one unbuffered read
@@ -40,16 +40,16 @@ bool FileReads::open(const std::string& path, int fd, std::string& err) {
     if (direct_.open(path, why, kReaders, /*mapped_elsewhere=*/true)) {
         stage_ = (uint8_t*) platform::alloc_aligned(kStage * kDepth, kAlign);
         if (stage_ == nullptr) {
-            err = "deepseek41: cannot allocate the file read buffers";
+            err = "cannot allocate the file read buffers";
             return false;
         }
     } else {
-        basalt::log::warn("basalt deepseek41", "file experts read through the file cache: %s", why.c_str());
+        basalt::log::warn("basalt", "file experts read through the file cache: %s", why.c_str());
     }
     try {
         thread_ = std::thread([this] { run(); });
     } catch (const std::exception& e) {
-        err = std::string("deepseek41: cannot start the file read thread: ") + e.what();
+        err = std::string("cannot start the file read thread: ") + e.what();
         return false;
     }
     return true;
@@ -73,7 +73,7 @@ bool FileReads::wait(std::string& err) {
     started_ = false;
     if (ok_) return true;
     ok_ = true;
-    err = "deepseek41: cannot read an expert from the pack";
+    err = "cannot read an expert from the pack";
     return false;
 }
 
@@ -144,4 +144,4 @@ bool FileReads::read_direct(const std::vector<Blob>& blobs) {
     return ok;
 }
 
-}  // namespace basalt::models::deepseek41
+}  // namespace basalt::core

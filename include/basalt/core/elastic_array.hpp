@@ -1,4 +1,4 @@
-// src/models/deepseek41/elastic.hpp - a device array that reserves its whole address range up front and backs it with
+// include/basalt/core/elastic_array.hpp - a device array that reserves its whole address range up front and backs it with
 // physical memory as it is used. The address never moves, so kernel arguments and captured graphs stay valid.
 #pragma once
 
@@ -6,14 +6,14 @@
 #include <string>
 #include <vector>
 
-namespace basalt::models::deepseek41 {
+namespace basalt::core {
 
-class ElasticBuf {
+class ElasticArray {
 public:
-    ElasticBuf() = default;
-    ~ElasticBuf();
-    ElasticBuf(const ElasticBuf&) = delete;
-    ElasticBuf& operator=(const ElasticBuf&) = delete;
+    ElasticArray() = default;
+    ~ElasticArray();
+    ElasticArray(const ElasticArray&) = delete;
+    ElasticArray& operator=(const ElasticArray&) = delete;
 
     /// Reserves `bytes` of address space. Without virtual memory management the whole array is allocated at once.
     bool open(uint64_t bytes, std::string& err);
@@ -37,4 +37,4 @@ private:
     std::vector<Extent> extents_;
 };
 
-}  // namespace basalt::models::deepseek41
+}  // namespace basalt::core

@@ -1,7 +1,7 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
 #include "basalt/core/device.hpp"
 #include "basalt/core/load_progress.hpp"
-#include "models/deepseek41/tier.hpp"
+#include "basalt/core/expert_tier.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/model.hpp"
@@ -110,6 +110,50 @@ uint64_t DsModel::context_bytes() const { return ctxp::context_bytes(context(), 
 
 int64_t DsModel::keep_positions(int64_t backed) const {
     return prefillp::keep_positions(backed, cache_ratios(pack_.geo), cache_format_);
+}
+
+core::ExpertTierSpec DsModel::tier_spec() const {
+    const Geometry& g = pack_.geo;
+    core::ExpertTierSpec s;
+    s.area = "basalt deepseek41";
+    s.name = "deepseek41";
+    s.n_layers = g.n_layers;
+    s.n_expert = g.n_expert;
+    s.top_k = g.n_used;
+    s.n_embd = g.n_embd;
+    s.n_ff = g.n_ff_exp;
+    for (int l = 0; l < g.n_layers; ++l) {
+        const ExpertLayer& e = pack_.experts[(size_t) l];
+        s.layers.push_back({e.gu_type, e.d_type, e.offset, e.blob_bytes, g.clamp_exp[(size_t) l]});
+        s.share_stride = std::max<uint64_t>(s.share_stride, staged_stride(e));
+    }
+    s.path = path_;
+    s.fd = experts_fd();
+    s.range = pack_.experts_range;
+    s.peer_devices = peer_devices_;
+    s.diag_tier_ram = diag_tier_ram_;
+    s.diag_tier_vram = diag_tier_vram_;
+    s.diag_tier_frozen = tiers_.diag_tier_frozen;
+    s.vram_reserve_mib = tiers_.vram_reserve_mib;
+    s.peer_reserve_mib = tiers_.peer_reserve_mib;
+    s.expert_cache = tiers_.expert_cache;
+    s.resident_budget = tiers_.resident_budget;
+    s.pool_workers = tiers_.pool_workers;
+    s.pool_affinity = tiers_.pool_affinity;
+    s.pool_affinity_given = tiers_.pool_affinity_given;
+    s.expert_profile = tiers_.expert_profile;
+    s.ring_pieces = prefillp::kRingPieces;
+    s.share_max_tokens = prefillp::kMaxChunk;
+    // the image encoder's cuBLAS handle takes host memory when created, so it opens before the RAM tier reads the free
+    // memory, with the prompt path's buffers
+    s.host.open = [this](std::string& err) {
+        if (tiers_.vision && !vision_blas().open(err)) return false;
+        return prompt_host_.open(*this, 0, sessions(), tiers_.vision, err);
+    };
+    s.host.bytes = [this] { return prompt_host_.bytes(); };
+    s.host.set_ring = [this](int pieces, std::string& err) { return prompt_host_.set_ring(pieces, err); };
+    s.host.ram_only = [this] { warm_token_table(); };
+    return s;
 }
 
 prefillp::Dims DsModel::prompt_dims() const {
