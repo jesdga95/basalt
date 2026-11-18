@@ -1242,11 +1242,12 @@ class Service:
                     # answer now stops an engine that takes `stop_soon` at its own pace (see the pass below)
                     soft_stops = live is not None and "stop_soon" in inspect.signature(self.engine.generate).parameters
                     closed_early = False                # the thinking was already closed once
+                    first_cap = None                    # the first pass's cap (a budget can make it smaller than max_new)
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
                     for ev in opening:
                         yield "event", ev
                     while True:
-                        if isinstance(ids, PromptText) and ids.max_new:
+                        if isinstance(ids, PromptText) and ids.max_new and (first_cap is None or ids.max_new < first_cap):
                             max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
                         # answer now stops the engine at its own pace: the tokens it still writes are kept, so the
                         # next pass extends exactly what it holds and reads only the close
@@ -1262,6 +1263,8 @@ class Service:
                         capped = bool(budget) and parser.state == "reasoning" and budget - thought < cap
                         if capped:
                             cap = max(1, budget - thought)
+                        if first_cap is None:
+                            first_cap = cap             # what the first pass asks for; the engine settles THIS for a text prompt
                         gen = self.engine.generate(prompt, cap, sampling, cancel, embeddings=emb,
                                                    session=session, **more) if emb \
                             else self.engine.generate(prompt, cap, sampling, cancel, session=session, **more)
@@ -1278,7 +1281,8 @@ class Service:
                             last_out = time.monotonic()
                             for t in gen:
                                 # The engine settles a text prompt's output cap before its first token.
-                                if isinstance(ids, PromptText) and ids.max_new:
+                                # a settled cap equal to a budget-capped first pass is the budget, not the reply's room
+                                if isinstance(ids, PromptText) and ids.max_new and (first_cap is None or ids.max_new < first_cap):
                                     max_new = ids.max_new
                                 if thinking and not budget_ready and (not isinstance(ids, PromptText) or ids.n is not None):
                                     budget = self.answer_budget(budget_req, max_new, budget)
