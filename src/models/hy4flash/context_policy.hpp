@@ -12,18 +12,19 @@ constexpr int64_t kMinContext = 1024;
 constexpr int64_t kLegacyContext = 8192;   ///< the maximum of a pack that names no context length
 constexpr int kRowWidth = 576;             ///< a latent row: 512 latent values and 64 rotated
 constexpr int kRowBytes = kRowWidth * 2;   ///< BF16
+constexpr int kFp8RowBytes = 656;          ///< --kv fp8: 512 E4M3 codes, four fp32 scales, 64 BF16
 constexpr int kPoolDim = 128, kPoolSize = 4;
-constexpr int kPoolRowBytes = kPoolDim * 4;   ///< a pooled key, fp32
+constexpr int kPoolRowBytes = kPoolDim * 2;   ///< a pooled key, fp16
 
 /// Device bytes of the sparse layers' caches for `positions` positions.
-inline uint64_t cache_bytes(int64_t positions, int sparse_layers) {
-    return (uint64_t) sparse_layers * ((uint64_t) positions * kRowBytes + ((uint64_t) positions / kPoolSize + 1) * kPoolRowBytes);
+inline uint64_t cache_bytes(int64_t positions, int sparse_layers, bool fp8 = false) {
+    return (uint64_t) sparse_layers * ((uint64_t) positions * (fp8 ? kFp8RowBytes : kRowBytes) + ((uint64_t) positions / kPoolSize + 1) * kPoolRowBytes);
 }
 /// What does not grow: the window layers' rings.
 inline uint64_t ring_bytes(int window, int swa_layers) { return (uint64_t) swa_layers * (uint64_t) window * kRowBytes; }
 /// The decode indexer's score row.
 inline uint64_t workspace_bytes(int64_t positions) { return ((uint64_t) positions / kPoolSize + 1) * 4; }
-inline uint64_t context_bytes(int64_t positions, int sparse_layers) { return cache_bytes(positions, sparse_layers) + workspace_bytes(positions); }
+inline uint64_t context_bytes(int64_t positions, int sparse_layers, bool fp8 = false) { return cache_bytes(positions, sparse_layers, fp8) + workspace_bytes(positions); }
 
 struct Plan {
     int64_t context = 0;   ///< the context the engine runs with; 0 when refused
@@ -34,7 +35,7 @@ struct Plan {
 /// The context from --max-context (`requested`), the model's native maximum and the free device memory once the dense weights
 /// are resident: below kMinContext or past the native maximum is refused, so are caches that need more than half the free
 /// memory; a quarter or more gives a note (the expert tier needs the rest).
-inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, int sparse_layers) {
+inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, int sparse_layers, bool fp8 = false) {
     Plan p;
     if (native <= 0) native = kLegacyContext;
     if (requested < kMinContext) {
@@ -45,7 +46,7 @@ inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes,
         p.error = "--max-context " + std::to_string(requested) + " is past the model's maximum context of " + std::to_string(native) + " tokens";
         return p;
     }
-    const uint64_t need = context_bytes(requested, sparse_layers);
+    const uint64_t need = context_bytes(requested, sparse_layers, fp8);
     if (need > free_bytes / 2) {
         p.error = "--max-context " + std::to_string(requested) + " needs " + std::to_string(need >> 20) +
                   " MiB of latent caches, more than half of the " + std::to_string(free_bytes >> 20) +

@@ -35,9 +35,9 @@ Test pack (Q4_K_M GGUF): [pack](hy4-flash/pack.md). Release pack, from the BF16 
   blob: both are 4.5 bits), 83.6 GB for 21,012 experts. The checkpoint stores `gate_up_proj` fused: split it.
 - **Dense: Q8_0** of the BF16 values (attention, latent projections, shared experts, dense FFN, `engram_kv`, indexer projections,
   embedding); BF16 head (742 MB) first, `F8_E4M3` rows with a scale (type 44) later if it pays; norms, hc, router, biases F32.
-  Quantising from BF16 should reproduce AngelSlim's Q8_0 bytes: a check of both pipelines.
-- **Engram table: FP8 E4M3 as stored**, 96 values per row, own `engram` section, read by row from the SSD. Check: the BF16
-  checkpoint's table values are exactly E4M3 (`engram_fp8_embedding`), else the conversion is lossy and gets its own gate.
+  Quantising from BF16 reproduces AngelSlim's Q8_0 bytes (checked: blocks 0 to 5, the embedding, the head).
+- **Engram table: E4M3, rounded once** from the BF16 values (not E4M3: 9 % exact, 2.7 % RMS error; the test pack's rows are the same
+  rounding scaled to a largest code of 448, scale dropped), 96 values per row, no scale (type 43), own `engram` section, read by row.
 - **Side sections**, from the checkpoint, no weight copies: `dfly` (the 0.85B drafter: Q8_0 projections, F32 norms), `vision/mmproj`
   (ViT and projector BF16, plus `image_newline`), `dfly/draft_vocab` later. Tokenizer, chat template, generation defaults.
 - Whether NVFP4 RTN beats Q4_K_M quality is not known (Q4_K_M used an imatrix; RTN has no calibration): the KLD gate decides the
@@ -155,16 +155,48 @@ reach 75 % of experts.
 
 ## Vision
 
-The ViT is Qwen3-VL's So400m geometry (27 x 1152, 16 heads, 4304 MLP, patch 16, merge 2), so `src/vision/encoder_cuda.cu` (written for the Qwen3-VL style projector file) should run it with these changes:
-lent memory by `attach`/`detach`, BF16 weights, fp16 tensor-core attention. The position table is 128 x 128 (read from the
-pack, interpolated per grid); the projector is RMS then two linear layers (`proj.0`, `proj.1`), not Qwen's merger, and there are
-no deepstack taps; `image_newline` is a row in the file. `preprocess.hpp` takes the resize filter as a parameter (Lanczos, the
-processor's `resample: 1`, next to the bicubic Flash-Next uses), `fit_size` the Hy4 bounds (min_pixels 4,096, max_pixels
-4,194,304, 4,096 merged tokens). `--vision dynamic` only (as DS). Prompt: `image_start` pad-run `image_end` expand to rows; if the
-processor inserts `image_newline` per grid row, DeepSeek's layout `lh x (lw + 1) + 2` applies. Image rows enter as embeddings
-(Engram masked, valid 0). MRoPE: interleaved 12/10/10; `mrope_positions.hpp` (the Qwen3-VL rule) after a check against the
-processor's `get_rope_index`; the pooled indexer keys use the group's first position plane (to confirm against the reference).
-Video is out of the first cut. Open: the processor's exact token layout and rope index (run `HYV4FlashProcessor` on CPU once).
+The ViT runs on `src/vision/encoder_cuda.cu` (and the CPU reference `encoder_cpu.cpp`) selected by the projector file's `hy_v4_flash`
+type; Flash-Next's `qwen3vl_merger` path is untouched (its kernels are not edited, only new ones added). What differs from Qwen3-VL:
+
+| | Qwen3-VL (Flash-Next) | Hy4-flash |
+|---|---|---|
+| Patch embedding | two temporal taps summed | one 16 x 16 conv, bias |
+| Position table | 48 x 48, align-corners bilinear | 128 x 128 (row 0, the CLS slot, dropped), `interpolate(scale_factor=(size + 0.1) / 128, align_corners=False)`; an axis whose size equals the table's is copied |
+| In-layer rotation | 2-D RoPE on q, k | none |
+| After the layers | LayerNorm, merger (tanh GELU) | RMS norm (eps 1e-5), 2 x 2 merge conv 4,608 -> erf GELU -> 1 x 1 conv 3,072, a learned `image_newline` row after each line |
+| Encoder FFN | tanh GELU | tanh GELU (`bias_activation_fusion`, as llama.cpp's hy_v4_flash) |
+
+The projector is the side file's `mmproj-Hy4-flash-BF16.gguf` (llama.cpp's `hy_v4_flash` layout: F32 convs and position table, BF16
+products, q, k and v separate). The encoder reads it as is: q, k, v become one product, and the merge conv is reordered into a 4,608 x 4,608
+BF16 product over a group's four patch rows in merge order, at stage time. `convert.py --mmproj FILE` (arch `mmproj_only`) adds it
+as `vision/mmproj`; the engine opens it per request, uploads it to the main card (about 1.9 GB with the work buffers for 4,096
+merged tokens; `cudaMalloc`, no tier lending yet) and frees it in `images_done`.
+
+Preprocessing (`vision.hpp`): `smart_resize` with factor 32, min 4,096 and max 4,194,304 pixels (4 and 4,096 merged tokens), a ratio over
+200 refused; Lanczos(3) to the canvas (bit-exact against Pillow); (v / 255 - 0.5) / 0.5; patches in merge order. **Open: the filter.**
+`processor_config.json` says `resample: 1` (Lanczos) and llama.cpp's `hy_v4_flash` uses it, but transformers' `hy_v4_vl` processor
+(the same `HYV4VLImageProcessor`) resizes with Pillow's default BICUBIC and says the original never used the configured filter.
+One constant (`kVisionFilter`) switches it; compare the two on the model before release.
+
+Prompt: `<image_start>` pad x (oh x (ow + 1)) `<image_end>`; the pads of the newline slots are in the run, so the block of
+embedding rows is `oh * (ow + 1)` long and the engine's pad-run expansion (`encode_image` row count) already fits. The server's Hy4
+dialect (not in this milestone) sets `image_pad` and `image_start` to the pack's `<hy_image_pad..>` and `<hy_image_start..>` tokens.
+
+MRoPE: interleaved sections [12, 10, 10] over the 32 rotated pairs: pair i turns by h when i % 3 == 1 and i < 30, by w when
+i % 3 == 2 and i < 30, by t otherwise. Text takes the running position on all three; a picture block starting at p puts row j (column
+newline included, nx = ow + 1) at (p, p + j / nx, p + j % nx), and the text after it continues at p + max(oh, ow + 1)
+(transformers' `get_rope_index` of `hy_v4_vl`, tested on five prompts). The session keeps each cell's triple (`RopeTrack`) and,
+once a picture is in, a device table `cell_rope` that `mla_prepare`, `idx_rope_heads` and `idx_pool` read (null: the cell index, so
+text-only output is unchanged). The indexer's pooled key turns by its group's first cell's triple; to confirm against the reference.
+
+Engram: llama.cpp's hy-v4-flash treats an embedding (image) position as a token that cannot be hashed, so an image row's
+own Engram contribution is masked (valid 0) and, to the rows after it, it is a padded history entry. The session passes -1 as the token
+of an image row (`run_rows` accepts it only with embedding rows) and `engram_ids` reads -1 as dead on both counts. No HF reference
+is public for the flash model to check this against.
+
+Images enter `session.cpp` through three marked hooks (`[vision]`): `encode_image`/`images_done`/`prefill_embeddings` (chunks of up
+to 256 rows through `run_rows` with the rows as the embeddings), `place_rope` in `run_rows`, and the `cell_rope` pointers in
+`mla_args` and `indexer`. Video is out of the first cut.
 
 ## DFly2
 
@@ -193,13 +225,11 @@ Video is out of the first cut. Open: the processor's exact token layout and rope
 ## Serve
 
 - Registry: the id in `BASALT_BUILTIN_MODELS`; `dialect_for("hy_v4_flash")` in `serve/models/hy4flash.py`; one router config entry.
-- Prompt: the HF `chat_template.jinja` rendered by the shared jinja path (`tojson(ensure_ascii=False)`, `namespace`, `raise_exception`
-  checked against HF's output on a corpus: system, multi-turn, tools, tool results, thinking history, images). The special-token
-  suffix is read from the pack's vocabulary: the AngelSlim GGUF names them `<...:6124c78e｜>`, the HF release `:opensource`.
-- `reasoning_effort`: `none` -> `no_think`, `low`/`medium`/`high` -> `high`, `max` -> `max`, numbers refused; `no_think` and
-  `high` open the assistant turn with an empty or open `<think>`; `preserve_reasoning` -> the template's `preserved_thinking`.
-- Tools: `<tool_calls><tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call></tool_calls>`; parser in the
-  dialect (events from the stream), `reasoning_close` the think end token, stop text the `hy_end` token (120025).
+- Prompt, effort, tools, images, sampling: [serving](hy4-flash/serve.md). The template is the pack's (the special-token suffix is read
+  from it: the AngelSlim GGUF names them `:6124c78e`, the HF release `:opensource`); `reasoning_effort` `none` is `no_think`,
+  `low`/`medium`/`high` are `high`, `max` is `max`, numbers are refused; `preserve_reasoning` is the template's `preserved_thinking`.
+- Tools: `<tool_calls><tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call></tool_calls>`; the parser is the
+  dialect's, `reasoning_close` is the think end token and the stop text is the `hy_end` token (120025).
 - Engine: `session` calls (`decode_window`, `prefill_chunk`, `save_cells`, `restore_cells`, `running_state`: the SWA ring, pooled
   keys, the raw indexer ring, the last two token ids for Engram, DFly's last hidden state). Sleep frees the slots and the dense
   weights (re-read from the pack in seconds) and keeps RAM; the slot residency table is saved and refilled from the RAM tier at
@@ -263,7 +293,7 @@ Exit: layer 0 to 2 hidden states within gate 1, then all 42. GPU tests are queue
 6. **Engram SSD.** 64 random 96-byte rows per token (4 KB reads), about 1M reads per 16K chunk. Measure: 4K random read IOPS at
    QD64 on `/mnt/nvme`; hot-row hit rate by replaying the trace's token streams through the hash (CPU only); prefetch overlap.
 7. **NVFP4 RTN quality** without calibration. Measure KLD against Q4_K_M and BF16; fall back: per-layer scale search, a higher-bit
-   `down`, or Q4_K as the default pack. The Engram FP8 table is lossless only if the BF16 values are E4M3 (check).
+   `down`, or Q4_K as the default pack. Weight RMS error: NVFP4 0.081; Q4_K 0.071 (gate, up), 0.077 (down); Q6_K down 0.018 (19 layers).
 8. **KV precision.** BF16 default (the reference's own); FP8 FlashMLA rows halve 1M's cache; measure KLD at 32K and 128K prompts and
    needle at 1M before it is a default.
 9. **Selection ties and T invariance.** FP16 tensor-core scoring versus the reference's BF16 can flip near-tied pools; measure the

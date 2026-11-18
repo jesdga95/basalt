@@ -5,6 +5,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -52,13 +53,53 @@ __device__ __forceinline__ float block_max(float v, float* red) {
     return r;
 }
 
-// A cache row's element type: fp32, or BF16 (the reference's own rounding of the latent rows).
-__device__ __forceinline__ float load_row(const float* p) { return *p; }
-__device__ __forceinline__ float load_row(const uint16_t* p) { return __uint_as_float((uint32_t) *p << 16); }
-__device__ __forceinline__ void store_row(float* p, float v) { *p = v; }
-__device__ __forceinline__ void store_row(uint16_t* p, float v) { *p = __bfloat16_as_ushort(__float2bfloat16_rn(v)); }
+// A cache holds rows of rank + rope values as fp32, as BF16 (the reference's own rounding of the latent rows), or as the FP8 row
+// the flash-MLA kernels read: 512 E4M3 codes, four fp32 scales (one per 128 codes), 64 BF16 rope values (656 bytes).
+constexpr int kFp8Codes = 512, kFp8ScaleOff = 512, kFp8RopeOff = 528;
+__device__ __forceinline__ float row_at(const float* cache, size_t cell, int c, int W) { return cache[cell * W + c]; }
+__device__ __forceinline__ float row_at(const uint16_t* cache, size_t cell, int c, int W) {
+    return __uint_as_float((uint32_t) cache[cell * W + c] << 16);
+}
+__device__ __forceinline__ float row_at(const uint8_t* cache, size_t cell, int c, int) {
+    const uint8_t* row = cache + cell * kFp8RowBytes;
+    if (c < kFp8Codes) {
+        const __half_raw h = __nv_cvt_fp8_to_halfraw(row[c], __NV_E4M3);
+        return __half2float(__half(h)) * reinterpret_cast<const float*>(row + kFp8ScaleOff)[c >> 7];
+    }
+    return __uint_as_float((uint32_t) reinterpret_cast<const uint16_t*>(row + kFp8RopeOff)[c - kFp8Codes] << 16);
+}
+__device__ __forceinline__ uint16_t bf16_bits(float v) { return __bfloat16_as_ushort(__float2bfloat16_rn(v)); }
 
-// A warp per output row; z = the token.
+// The cell's row from the normed latent lat[rank] and the rotated rope values rp[rope] (shared memory); every thread of the
+// block takes part.
+__device__ __forceinline__ void store_cell(float* cache, size_t cell, const float* lat, const float* rp, const MlaArgs& a, float* red) {
+    float* row = cache + cell * (a.rank + a.rope);
+    for (int c = threadIdx.x; c < a.rank; c += blockDim.x) row[c] = lat[c];
+    for (int c = threadIdx.x; c < a.rope; c += blockDim.x) row[a.rank + c] = rp[c];
+}
+__device__ __forceinline__ void store_cell(uint16_t* cache, size_t cell, const float* lat, const float* rp, const MlaArgs& a, float* red) {
+    uint16_t* row = cache + cell * (a.rank + a.rope);
+    for (int c = threadIdx.x; c < a.rank; c += blockDim.x) row[c] = bf16_bits(lat[c]);
+    for (int c = threadIdx.x; c < a.rope; c += blockDim.x) row[a.rank + c] = bf16_bits(rp[c]);
+}
+__device__ __forceinline__ void store_cell(uint8_t* cache, size_t cell, const float* lat, const float* rp, const MlaArgs& a, float* red) {
+    uint8_t* row = cache + cell * kFp8RowBytes;
+    // a scale per 128 latent values: amax / 448 (a 512-thread block: a quarter each)
+    const int c = threadIdx.x, g = c >> 7;
+    float amax = c < kFp8Codes ? fabsf(lat[c]) : 0.f;
+    amax = warp_max(amax);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    const float m = fmaxf(fmaxf(red[g * 4], red[g * 4 + 1]), fmaxf(red[g * 4 + 2], red[g * 4 + 3]));
+    const float scale = m > 0.f ? m / 448.f : 1.f;
+    if (c < kFp8Codes) row[c] = __nv_cvt_float_to_fp8(lat[c] / scale, __NV_SATFINITE, __NV_E4M3);
+    if ((c & 127) == 0 && c < kFp8Codes) reinterpret_cast<float*>(row + kFp8ScaleOff)[g] = scale;
+    for (int i = threadIdx.x; i < a.rope; i += blockDim.x) reinterpret_cast<uint16_t*>(row + kFp8RopeOff)[i] = bf16_bits(rp[i]);
+    __syncthreads();
+}
+
+// A warp per output row; z = the token. The activation is rounded to q8_1 per 32 values, as every other product of the model's
+// Q8_0 weights does: d = amax / 127, codes round half away from zero, the block's dot is an integer sum times d_w * d.
 __global__ void heads_gemv_kernel(const uint8_t* __restrict__ w, const float* __restrict__ x, int x_head_stride, int x_tok_stride,
                                   int rows, int nb, int heads, float* __restrict__ y) {
     const int h = blockIdx.y, t = blockIdx.z, lane = threadIdx.x & 31;
@@ -69,11 +110,18 @@ __global__ void heads_gemv_kernel(const uint8_t* __restrict__ w, const float* __
     float acc = 0.f;
     for (int b = 0; b < nb; ++b) {
         const uint8_t* blk = row + (size_t) b * 34;
-        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
-        const float q = (float) (int8_t) blk[2 + lane];
-        acc = fmaf(d * q, xv[b * 32 + lane], acc);
+        const float dw = __half2float(*reinterpret_cast<const __half*>(blk));
+        const int qw = (int8_t) blk[2 + lane];
+        const float v = xv[b * 32 + lane];
+        const float amax = warp_max(fabsf(v));
+        const float d = amax / 127.f;
+        const float id = d != 0.f ? 1.f / d : 0.f;
+        const int qx = __float2int_rn(roundf(v * id));
+        int isum = qw * qx;
+#pragma unroll
+        for (int m = 16; m; m >>= 1) isum += __shfl_xor_sync(0xffffffffu, isum, m);
+        acc = fmaf(dw * d, (float) isum, acc);
     }
-    acc = warp_sum(acc);
     if (lane == 0) y[((size_t) t * heads + h) * rows + r] = acc;
 }
 
@@ -86,12 +134,23 @@ __device__ __forceinline__ void rope_pair(float x0, float x1, int i, int n_rot, 
     o1 = x0 * s + x1 * c;
 }
 
+// The position pair i of the rotated part of the row at cell `cell` turns by (see MlaArgs::cell_rope).
+template <typename A>
+__device__ __forceinline__ int axis_pos(const A& a, int cell, int i) {
+    if (a.cell_rope == nullptr) return cell;
+    const int32_t* p = a.cell_rope + (size_t) cell * 3;
+    if (i % 3 == 1 && i < 3 * a.sec_h) return p[1];
+    if (i % 3 == 2 && i < 3 * a.sec_w) return p[2];
+    return p[0];
+}
+
 // Block h < heads: the head's query row; block `heads`: the cache row. y = the token.
 template <typename C>
 __global__ void prepare_kernel(const float* __restrict__ q, const float* __restrict__ q_abs, const float* __restrict__ kv_raw,
                                const float* __restrict__ kv_norm, MlaArgs a, int pos0, int ring, float* __restrict__ qcur,
                                C* __restrict__ cache) {
     __shared__ float red[kThreads / 32];
+    __shared__ float lat[512], rp[64];
     const int h = blockIdx.x, t = blockIdx.y, W = a.rank + a.rope, Q = a.nope + a.rope, pos = pos0 + t;
     if (h < a.heads) {
         const float* qt = q + (size_t) t * a.heads * Q;
@@ -102,26 +161,27 @@ __global__ void prepare_kernel(const float* __restrict__ q, const float* __restr
             const int i = threadIdx.x;
             const float* p = qt + (size_t) h * Q + a.nope + 2 * i;
             float o0, o1;
-            rope_pair(p[0], p[1], i, a.rope, a.rope_base, pos, o0, o1);
+            rope_pair(p[0], p[1], i, a.rope, a.rope_base, axis_pos(a, pos, i), o0, o1);
             out[(size_t) h * W + a.rank + 2 * i] = o0;
             out[(size_t) h * W + a.rank + 2 * i + 1] = o1;
         }
         return;
     }
     const float* kr = kv_raw + (size_t) t * W;
-    C* row = cache + (size_t) (ring ? pos % ring : pos) * W;
     float ss = 0.f;
     for (int c = threadIdx.x; c < a.rank; c += blockDim.x) ss = fmaf(kr[c], kr[c], ss);
     ss = block_sum<kThreads>(ss, red);
     const float rs = rsqrtf(ss / (float) a.rank + a.rms_eps);
-    for (int c = threadIdx.x; c < a.rank; c += blockDim.x) store_row(row + c, kr[c] * rs * kv_norm[c]);
+    for (int c = threadIdx.x; c < a.rank; c += blockDim.x) lat[c] = kr[c] * rs * kv_norm[c];
     if (threadIdx.x < a.rope / 2) {
         const int i = threadIdx.x;
         float o0, o1;
-        rope_pair(kr[a.rank + 2 * i], kr[a.rank + 2 * i + 1], i, a.rope, a.rope_base, pos, o0, o1);
-        store_row(row + a.rank + 2 * i, o0);
-        store_row(row + a.rank + 2 * i + 1, o1);
+        rope_pair(kr[a.rank + 2 * i], kr[a.rank + 2 * i + 1], i, a.rope, a.rope_base, axis_pos(a, pos, i), o0, o1);
+        rp[2 * i] = o0;
+        rp[2 * i + 1] = o1;
     }
+    __syncthreads();
+    store_cell(cache, (size_t) (ring ? pos % ring : pos), lat, rp, a, red);
 }
 
 // A block per head and row: the scores (a warp per cell), the softmax with the sink, the weighted sum of the latents.
@@ -137,9 +197,8 @@ __global__ void attend_kernel(const float* __restrict__ qcur, const C* __restric
     const float* qv = qcur + ((size_t) t * a.heads + h) * W;
     for (int j = warp; j < n; j += kThreads / 32) {
         const int cell = cl ? cl[j] : ring ? (first + j) % ring : first + j;
-        const C* kr = cache + (size_t) cell * W;
         float acc = 0.f;
-        for (int c = lane; c < W; c += 32) acc = fmaf(qv[c], load_row(kr + c), acc);
+        for (int c = lane; c < W; c += 32) acc = fmaf(qv[c], row_at(cache, (size_t) cell, c, W), acc);
         acc = warp_sum(acc);
         if (lane == 0) s[j] = acc * a.scale;
     }
@@ -161,7 +220,7 @@ __global__ void attend_kernel(const float* __restrict__ qcur, const C* __restric
         float acc = 0.f;
         for (int j = 0; j < n; ++j) {
             const int cell = cl ? cl[j] : ring ? (first + j) % ring : first + j;
-            acc = fmaf(s[j], load_row(cache + (size_t) cell * W + c), acc);
+            acc = fmaf(s[j], row_at(cache, (size_t) cell, c, W), acc);
         }
         o_lat[((size_t) t * a.heads + h) * a.rank + c] = acc * inv;
     }
@@ -211,6 +270,15 @@ void mla_attend(const float* qcur, const float* cache, const RowSpans& r, int n_
     attend_impl(qcur, cache, r, n_tok, sinks, a, ring, o_lat, stream);
 }
 void mla_attend(const float* qcur, const uint16_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
+                float* o_lat, void* stream) {
+    attend_impl(qcur, cache, r, n_tok, sinks, a, ring, o_lat, stream);
+}
+
+void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
+                 int n_tok, int ring, float* qcur, uint8_t* cache, void* stream) {
+    prepare_impl(q, q_abs, kv_raw, kv_norm, a, pos0, n_tok, ring, qcur, cache, stream);
+}
+void mla_attend(const float* qcur, const uint8_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                 float* o_lat, void* stream) {
     attend_impl(qcur, cache, r, n_tok, sinks, a, ring, o_lat, stream);
 }

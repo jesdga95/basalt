@@ -43,7 +43,7 @@ void hc_post(const float* f, const float* x, const float* coef, int coef_stride,
              float* out, void* stream);
 
 // ---- identity connections ---------------------------------------------------------------------------------------------
-// Hy4-flash's iHC: a sublayer has 8 mixes (pre 4, post 4) and no cross-stream mix: stream i keeps its own residual,
+// The identity-connection form: a sublayer has 8 mixes (pre 4, post 4) and no cross-stream mix: stream i keeps its own residual,
 // out[i] = x[i] + post[i] * f. The coefficients are written in the layout above with comb the identity, so hc_pre and
 // hc_post run on them unchanged. The head has 4 mixes (the pre weights alone).
 
