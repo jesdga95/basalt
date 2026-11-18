@@ -83,6 +83,25 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --check
     --out Qwen3.8-FN-NVFP4-QAD.basalt --name "Qwen3.8-Flash-Next NVFP4-QAD"
 ```
 
+## Flash-Next FP4-Local pack
+
+`--checkpoint` also reads Model Optimizer's FP4-Local layout, as in
+[nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local): the shards sit in `tensors/`,
+the routed experts' scales are CSF stream pairs (`weight_scale.nvfp4_csf_fixed`, `weight_scale.nvfp4_csf_exceptions`), the
+projections are MXFP8, the norm weights F32 and the n-gram table NVFP4.
+
+- **Experts:** each CSF pair decodes to the UE4M3 scales bit for bit; codes and scales then move as in the NVFP4 pack.
+- **Projections:** MXFP8 values (E4M3 codes, one E8M0 scale per 32) widen to f32 exactly, then become Q6_K (Q8_0 where rows
+  are not whole blocks), or BF16 where the engine reads BF16, as in the QAD pack.
+- **N-gram table:** E2M1 code × UE4M3 block scale × `weight_scale_2`, stored as Q8_0 (one rounding).
+- **Drafter and vision:** copied from the base pack.
+
+```sh
+hf download nvidia/Qwen3.8-Flash-Next-FP4-Local --revision b9ce18a6 --local-dir fp4-local
+python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --checkpoint fp4-local \
+    --out Qwen3.8-FN-FP4-Local.basalt --name "Qwen3.8-Flash-Next FP4-Local"
+```
+
 ## Qwen3.8-27B pack
 
 The published pack comes from QUASAR's quantization-aware NVFP4 checkpoint

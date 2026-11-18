@@ -35,6 +35,9 @@ From an NVFP4 checkpoint (--sections-from with --checkpoint)
                      where rows are whole 256-value blocks, Q8_0 elsewhere and for the output head and token embedding;
                      the other tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table is FP8
                      code x scale as Q8_0. The GGUF metadata and the tokenizer come from the checkpoint's files.
+                     Model Optimizer's FP4-Local layout is read too: the shards in tensors/, expert scales as CSF stream
+                     pairs (decoded bit for bit), MXFP8 projections, F32 norm weights, and an NVFP4 n-gram table (E2M1
+                     code x UE4M3 block scale x weight_scale_2 as Q8_0)
   --dense-q8-0       Q8_0 projections instead of Q6_K (the 8-bit dense variant)
   The drafter and vision sections come from BASE byte for byte; BASE's vocabulary must be the checkpoint's.
 
@@ -783,7 +786,7 @@ def main():
     ap.add_argument("--requant-dense-q6k", metavar="PACK.basalt",
                     help="copy PACK with its Q8_0 dense projections requantized to Q6_K")
     ap.add_argument("--checkpoint", metavar="DIR",
-                    help="an NVFP4 safetensors checkpoint: with --sections-from, the language model is read from it; "
+                    help="an NVFP4 or FP4-Local safetensors checkpoint: with --sections-from, the language model is read from it; "
                          "with --requant-dense-q6k, the BF16 projections")
     ap.add_argument("--dense-q8-0", action="store_true",
                     help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")
