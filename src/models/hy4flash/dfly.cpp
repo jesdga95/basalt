@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
@@ -193,6 +194,7 @@ struct DflyRunner::Impl {
     int32_t* h_tok = nullptr;
     std::vector<float> mask;
     float bias = 0.f;          ///< the confidence head's bias
+    bool ready = false;        ///< the mask row and the bias are read (at the first block: a session is made before the weights are placed)
     int n = 0;                 ///< drafts of the block begin() enqueued
     int32_t anchor = 0;
     bool pending = false;
@@ -256,11 +258,6 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
         return nullptr;
     }
     p.mask.resize(E);
-    if (!env.embed || !env.embed(d.mask_id, p.mask.data())) {
-        err = "no embedding row for the drafter's mask token";
-        return nullptr;
-    }
-    cudaMemcpy(&p.bias, env.w->conf_b, 4, cudaMemcpyDeviceToHost);
     return r;
 }
 
@@ -278,6 +275,14 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
     cudaStream_t st = (cudaStream_t) stream;
     if (p.pending) cudaStreamSynchronize(st);   // the host rows the last block copied from are free again
     const int R = n + 1, E = d.E, H = d.heads;
+    if (!p.ready) {   // a session is made before the load places the embedding and the weights: these are read now
+        if (!p.env.embed || !p.env.embed(d.mask_id, p.mask.data())) {
+            err = "no embedding row for the drafter's mask token";
+            return false;
+        }
+        cudaMemcpy(&p.bias, w.conf_b, 4, cudaMemcpyDeviceToHost);
+        p.ready = true;
+    }
     try {
         if (!p.env.embed(anchor, p.h_emb)) {
             err = "dfly: the anchor token has no embedding row";
@@ -365,6 +370,11 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
     return true;
 }
 
+void DflyRunner::copy_block(float* host, int rows, void* stream) const {
+    cudaMemcpyAsync(host, p_->z, (size_t) rows * p_->d.E * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
+    cudaStreamSynchronize((cudaStream_t) stream);
+}
+
 bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& err) {
     Impl& p = *p_;
     if (!p.pending) {
@@ -425,8 +435,11 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
 DflyHook::~DflyHook() = default;
 
 bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16_t* head, std::function<bool(int32_t, float*)> embed,
-                    std::string& err) {
+                    const std::string& dump, std::string& err) {
     if (!w) return true;
+    dump_ = dump;
+    head_ = head;
+    embed_ = embed;
     w_ = w;
     ctx_ = ctx;
     tap_ = DflyTap::create(w->dims, sel_cap, err);
@@ -451,6 +464,25 @@ model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const st
     std::string err;
     if (!runner_->begin(anchor, pos, n, *tap_, row, caches, stream, err)) return {model::Status::Error, "hy4flash: " + err};
     pending_ = n;
+    if (!dump_.empty() && dumped_ < 200) {   // --diag-dump: this block's inputs, for a comparison with a reference
+        ++dumped_;
+        cudaStreamSynchronize((cudaStream_t) stream);
+        const std::string base = dump_ + "/dfly_" + std::to_string(pos) + "_";
+        auto put = [&](const std::string& name, const void* dev, size_t bytes) {
+            std::vector<uint8_t> h(bytes);
+            cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost);
+            if (std::FILE* f = std::fopen((base + name).c_str(), "wb")) {
+                std::fwrite(h.data(), 1, bytes, f);
+                std::fclose(f);
+            }
+        };
+        dump_pos_ = pos;
+        dump_anchor_ = anchor;
+        dump_n_ = n;
+        put("hid.f32", tap_->hidden_row(row), (size_t) w_->dims.E * 4);
+        for (int i = 0; i < w_->dims.layers; ++i)
+            if (tap_->count(i, row) < 0) put("kv" + std::to_string(i) + ".u16", caches[i], (size_t) pos * kDflyRowWidth * 2);
+    }
     return {};
 }
 
@@ -464,6 +496,24 @@ model::Result DflyHook::draft_end(int32_t* ids, float* conf, int max_n, int& n, 
     const int made = pending_;
     pending_ = 0;
     if (!runner_->finish(tok, ch, stream, err)) return {model::Status::Error, "hy4flash: " + err};
+    if (dump_pos_ >= 0 && !dump_.empty()) {   // --diag-dump: what the block computed
+        std::vector<float> z((size_t) (made + 1) * w_->dims.E), a(w_->dims.E), m(w_->dims.E);
+        runner_->copy_block(z.data(), made + 1, stream);
+        embed_(dump_anchor_, a.data());
+        embed_(w_->dims.mask_id, m.data());
+        const std::string base = dump_ + "/dfly_" + std::to_string(dump_pos_) + "_out_";
+        auto wr = [&](const char* name, const void* p, size_t bytes) {
+            if (std::FILE* f = std::fopen((base + name).c_str(), "wb")) { std::fwrite(p, 1, bytes, f); std::fclose(f); }
+        };
+        wr("z.f32", z.data(), z.size() * 4);
+        wr("anchor_emb.f32", a.data(), a.size() * 4);
+        wr("mask_emb.f32", m.data(), m.size() * 4);
+        wr("tok.i32", tok, (size_t) made * 4);
+        std::vector<uint16_t> row((size_t) w_->dims.E);
+        cudaMemcpy(row.data(), head_ + (size_t) tok[0] * w_->dims.E, (size_t) w_->dims.E * 2, cudaMemcpyDeviceToHost);
+        wr("head_row0.bf16", row.data(), row.size() * 2);
+        dump_pos_ = -1;
+    }
     n = std::min(max_n, made);
     std::copy(tok, tok + n, ids);
     std::copy(ch, ch + n, conf);

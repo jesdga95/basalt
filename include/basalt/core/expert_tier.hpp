@@ -66,6 +66,9 @@ struct ExpertTierSpec {
     /// CPU uses that earn a slot (policy::count_use) for every placement; 0: the repeat-miss rule with RAM holding all
     /// experts and kPromoteUses with the file's, the way the first model ran them.
     int admit_uses = 0;
+    /// Copies (bus fetches and promotions) a window may claim per row; 0: 128 a window whatever its rows, the way the first
+    /// model ran them. A window's rows route to mostly different experts, so a per-row budget keeps their admissions.
+    int claims_per_row = 0;
     /// The prompt path's host buffers, which are allocated before the RAM tier is sized beside them. Each is optional.
     struct Host {
         std::function<bool(std::string&)> open;                 ///< before the RAM tier is sized
@@ -306,7 +309,8 @@ private:
     std::vector<cudaEvent_t> events_;       ///< [event] behind a copy's last piece in
     std::vector<cudaEvent_t> out_events_;   ///< [event] behind the last piece out of the home a promotion replaces
     std::vector<int> free_events_;
-    int claims_ = 0;                        ///< copies claimed since the last begin_token (at most kMaxPending)
+    int claims_ = 0;                        ///< copies claimed since the last begin_token (at most claim_cap_)
+    int claim_cap_ = 0;                     ///< what this window may claim
     cudaStream_t copy_stream_ = nullptr;    ///< promotions, off the token path
     cudaStream_t out_stream_ = nullptr;     ///< the homes they replace, out to RAM beside them
     cudaStream_t fetch_stream_ = nullptr;   ///< copies a layer waits for (high priority)

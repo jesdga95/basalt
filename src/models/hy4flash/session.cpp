@@ -13,6 +13,7 @@
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
+#include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/mhc.hpp"
@@ -22,6 +23,7 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/log.hpp"
+#include "basalt/platform/compiler.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
 #include "models/hy4flash/context_policy.hpp"
 #include "models/hy4flash/dfly.hpp"   // DFLY HOOK
@@ -33,6 +35,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <numeric>
@@ -70,6 +73,12 @@ struct WindowPlan {
     int32_t dst[kLookupK];
     int32_t tok[kLookupK];
 };
+// The hits' plan and every routed row's pointer (a slot's output or the CPU's mapped row), put in one launch.
+struct WindowPut {
+    WindowPlan plan;
+    unsigned long long rows[kLookupK];
+};
+static_assert(sizeof(WindowPut) <= 4 * kPutWords, "a window's plan fits put_words");
 
 // The buffers that scale with the rows of a call: a decode window's, or a prompt chunk's (opened while a prompt runs, with the tier's
 // slots lent to them).
@@ -98,6 +107,8 @@ public:
     ~Session() override {
         dec_.release();
         big_.release();
+        std::string e;
+        join_moe(e);
         for (void* p : bufs_) cudaFree(p);
         if (d_hist_) cudaFree(d_hist_);
         for (void* p : pinned_) cudaFreeHost(p);
@@ -136,7 +147,8 @@ public:
         ex_xq_ = alloc(bk::native_q8_1_bytes(g_.n_latent, kMaxWindow), ok);
         ex_scr_ = alloc(bk::native_expert_scratch_bytes(kLookupK, g_.n_ff_exp), ok);
         ex_rows_ = f((int64_t) kLookupK * g_.n_latent);
-        ex_plan_ = alloc(sizeof(WindowPlan), ok);
+        ex_plan_ = alloc(sizeof(WindowPut), ok);
+        ex_plan2_ = alloc(sizeof(WindowPlan), ok);
         // the prompt path's experts: two staged launches (blobs, rows and bounds), the pairs' outputs, and the quantised rows
         {
             namespace mmq = basalt::prefill::mmq;
@@ -163,7 +175,22 @@ public:
         heads_bounds_ = (int32_t*) alloc((size_t) (max_heads + 1) * 4, ok);
         rowptr_d_ = (const float**) alloc(kLookupK * sizeof(void*), ok);
         h_rowptr_ = (const float**) pin(kLookupK * 2);
-        h_rw_ = pin(kMaxWindow * 16); h_ids_ = (int32_t*) pin(kMaxWindow * 16);
+        // the router's ids reach the host through mapped memory behind a sequence word; the weighted sum waits for a word the
+        // host writes once the CPU's and the second card's rows landed
+        {
+            constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
+            if (cudaHostAlloc((void**) &h_ids_, (size_t) kLookupK * 4, kMapped) != cudaSuccess ||
+                cudaHostAlloc((void**) &h_words_, 64, kMapped) != cudaSuccess)
+                ok = false;
+            else {
+                pinned_.push_back(h_ids_);
+                pinned_.push_back(h_words_);
+                h_words_[0] = h_words_[1] = 0;
+                if (cudaHostGetDevicePointer((void**) &d_ids_, h_ids_, 0) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &d_words_, h_words_, 0) != cudaSuccess)
+                    ok = false;
+            }
+        }
         rope_dev_ = (int32_t*) alloc((size_t) ctx * 12, ok);   // [vision] the 3-D rotary position of every cell
         if (cudaHostAlloc((void**) &h_plan_, sizeof(WindowPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
         else pinned_.push_back(h_plan_);
@@ -198,7 +225,7 @@ public:
         }
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
         if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, m_.dfly() ? (const uint16_t*) m_.tensor("output.weight")->ptr : nullptr,
-                        [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, err))
+                        [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), err))
             return false;
         return true;
     }
@@ -1032,6 +1059,7 @@ private:
             for (int i = 0; i < 256; ++i) t[(size_t) i] = e4m3_to_f32((uint8_t) i);
             return t;
         }();
+        if (eng_ev_) cudaEventSynchronize(eng_ev_);   // the last Engram layer's copies out of these host rows have landed
         Prefetch* pf = (size_t) e < pf_.size() && pf_[(size_t) e].issued ? &pf_[(size_t) e] : nullptr;
         std::vector<uint8_t> own_raw;
         const uint8_t* raw = nullptr;
@@ -1080,6 +1108,8 @@ private:
         }
         cudaMemcpyAsync(erows_, h_erows_, (size_t) R * n_cols * W * 4, cudaMemcpyHostToDevice, stream_);
         cudaMemcpyAsync(evalid_, h_evalid_, (size_t) R * 4, cudaMemcpyHostToDevice, stream_);
+        if (!eng_ev_) cudaEventCreateWithFlags(&eng_ev_, cudaEventDisableTiming);
+        cudaEventRecord(eng_ev_, stream_);
         gemm(T(l, "engram_kv.weight"), erows_, ekv_, n_cols * W, 5 * g_.n_embd, R);
         EngramArgs a;
         a.n_embd = g_.n_embd;
@@ -1138,7 +1168,8 @@ private:
         tier_ = shared.tier;
         h_x_ = shared.h_x;
         h_rows_ = shared.h_rows;
-        if (cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess) {
+        if (cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_x_, h_x_, 0) != cudaSuccess) {
             err = "cannot map the expert rows";
             return false;
         }
@@ -1166,13 +1197,15 @@ private:
         ra.gate = bk::RouterGate::Sigmoid;
         bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, st);
         gemm(T(l, "ffn_routed_down.weight"), xn_, xlat_, E, L, R);
-        // the shared expert on the card while the experts run elsewhere
+        const bool prompt = R > kMaxWindow && basalt::prefill::mmq::built();
+        // a window's first group goes to the host first: the shared expert runs while the host places the experts
+        if (!prompt) publish(0, std::min(kMaxWindow, R));
         float *sg = gu_, *su = gu_ + (size_t) R * g_.n_ff_exp;
         gemm(T(l, "ffn_gate_shexp.weight"), xn_, sg, E, g_.n_ff_exp, R);
         gemm(T(l, "ffn_up_shexp.weight"), xn_, su, E, g_.n_ff_exp, R);
         bk::swiglu_scaled(sg, su, nullptr, nullptr, h_, R, g_.n_ff_exp, g_.n_ff_exp, st);
         gemm(T(l, "ffn_down_shexp.weight"), h_, sh_, g_.n_ff_exp, E, R);
-        if (R > kMaxWindow && basalt::prefill::mmq::built()) {
+        if (prompt) {
             if (!moe_prompt(l, tl, R, lay, err)) return false;
         } else {
             for (int g0 = 0; g0 < R; g0 += kMaxWindow)
@@ -1340,30 +1373,60 @@ private:
         return true;
     }
 
-    // The routed experts of rows g0..g0+G of a layer: the tier is asked once per distinct expert of the group; each card runs
-    // what it holds over every row that routed to it, the CPU does the same for the rest.
+    // Rows g0..g0+G of the latent, their ids, to the mapped staging, behind the sequence word the host waits on; and the rows
+    // quantised for the card's experts.
+    void publish(int g0, int G) {
+        const int K = g_.n_used, L = g_.n_latent;
+        bk::doorbell_publish(xlat_ + (size_t) g0 * L, ids_ + (size_t) g0 * K, nullptr, (int64_t) G * L, (int64_t) G * K, d_x_, d_ids_,
+                             nullptr, d_words_, stream_);
+        ++seq_want_;
+        bk::native_quantize_q8_1(xlat_ + (size_t) g0 * L, ex_xq_, L, G, stream_);
+    }
+
+    // The published ids have landed (the stream goes on meanwhile); a launch that failed never writes them.
+    bool await_ids(std::string& err) {
+        const volatile uint32_t* seq = h_words_;
+        for (int s = 0; s < (1 << 22); ++s) {
+            if (*seq == seq_want_) {
+                std::atomic_thread_fence(std::memory_order_acquire);
+                return true;
+            }
+            platform::cpu_relax();
+        }
+        cudaStreamSynchronize(stream_);
+        if (*seq == seq_want_) return true;
+        err = "the router's ids did not arrive";
+        seq_want_ = *seq;
+        return false;
+    }
+
+    // The routed experts of rows g0..g0+G of a layer, as DeepSeek's decode places them: the tier is asked once per distinct
+    // expert of the group; the second card's share is raised first, then the CPU pool starts on the RAM experts, the card
+    // runs its slot hits and then the bus fetches, and the weighted sum is queued behind a word the host writes once the
+    // CPU's and the second card's rows landed. The host does not wait here: join_moe, called once the next layer's work is
+    // queued, finishes the CPU share and writes the word.
     bool moe_group(int l, int tl, const kernels::NativeExpertLayout& lay, int g0, int G, std::string& err) {
         const int K = g_.n_used, L = g_.n_latent;
         cudaStream_t st = stream_;
-        cudaMemcpyAsync(h_x_, xlat_ + (size_t) g0 * L, (size_t) G * L * 4, cudaMemcpyDeviceToHost, st);
-        cudaMemcpyAsync(h_ids_, ids_ + (size_t) g0 * K, (size_t) G * K * 4, cudaMemcpyDeviceToHost, st);
-        cudaMemcpyAsync(h_rw_, rw_ + (size_t) g0 * K, (size_t) G * K * 4, cudaMemcpyDeviceToHost, st);
-        bk::native_quantize_q8_1(xlat_ + (size_t) g0 * L, ex_xq_, L, G, st);
-        cudaEventRecord(ev_, st);
+        if (g0 > 0) publish(g0, G);
+        if (!join_moe(err)) return false;
+        Pending& pd = pend_;
+        pd = Pending{};
+        pd.on = true;
+        pd.tl = tl;
+        // the second card's share goes out while the head runs: its kernels wait on the card for the plan
         core::PeerExperts* peer = tier_->peer_for(tl);
-        tier_->pump(tl, 2 + G);
-        if (cudaEventSynchronize(ev_) != cudaSuccess) {
-            err = "the router's ids did not arrive";
-            return false;
-        }
         if (peer) {
             kernels::NativeExpertLayout limited = lay;
             limited.swiglu_limit = g_.clamp_exp[(size_t) l];
             if (!peer->arm(limited, h_x_, G, K, core::policy::peer_groups(G), err)) return false;
+            pd.peer = peer;
         }
+        tier_->pump(tl, 2 + G);   // what this layer's head leaves the bus of the promotions queued before it
+        if (!await_ids(err)) return false;
         int32_t uniq[kLookupK];
         int uidx[kLookupK], nu = 0;
-        core::ExpertTier::Use use[kLookupK];
+        core::ExpertTier::Use* use = pd.use;
         for (int t = 0; t < G; ++t)
             for (int k = 0; k < K; ++k) {
                 const int32_t e = h_ids_[t * K + k];
@@ -1383,67 +1446,116 @@ private:
                 ++us.nt;
                 uidx[t * K + k] = u;
             }
-        core::ExpertTier::Lookup lk;
+        core::ExpertTier::Lookup& lk = pd.lk;
         if (!tier_->lookup(tl, uniq, nu, lk, err)) return false;
         const int n_fetched = tier_->fetch(tl, lk);
+        // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land
         if (peer) {
             int32_t kind[kLookupK] = {};
             for (int r = 0; r < G * K; ++r) kind[r] = !lk.peer[uidx[r]] ? 0 : lk.fetched[uidx[r]] ? 3 : 2;
             if (!peer->raise(tl, h_ids_, kind, err)) return false;
+            pd.peer_raised = true;
         }
-        bool cpu = false, reading = false;
+        bool on_peer = false;
         for (int i = 0; i < nu; ++i) {
-            cpu = cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i]);
-            reading = reading || lk.reading[i];
+            pd.cpu = pd.cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i]);
+            pd.reading = pd.reading || lk.reading[i];
+            on_peer = on_peer || lk.peer[i];
         }
-        if (cpu) tier_->start_cpu_window(tl, h_x_, lk, use, h_rows_);
-        const auto launch = [&](bool fetched) {
-            WindowPlan* p = h_plan_;
-            int ng = 0, ne = 0;
+        // a promotion only queues its copies (they go out at a later pump), so it is decided now and the copies start behind
+        // this layer's sum; experts still being read from the file are decided once they landed
+        if (pd.cpu && !pd.reading) tier_->promote(tl, lk);
+        // then the CPU's share: it takes longest, and the pool's workers run it while the card's share launches
+        if (pd.cpu) tier_->start_cpu_window(tl, h_x_, lk, use, h_rows_);
+        // the card's share: the experts its slots hold, then the fetched ones once their copies landed; the plans travel in
+        // kernel parameters, in stream order
+        const auto make_plan = [&](WindowPlan& p, bool fetched, int& ne) {
+            int ng = 0;
+            ne = 0;
             for (int i = 0; i < nu; ++i) {
                 if (!lk.dev[i] || lk.fetched[i] != fetched) continue;
-                p->ptr[ng] = (unsigned long long) lk.dev[i];
-                p->start[ng] = ne;
+                p.ptr[ng] = (unsigned long long) lk.dev[i];
+                p.start[ng] = ne;
                 for (int j = 0; j < use[i].nt; ++j) {
-                    p->dst[ne] = use[i].row[j];
-                    p->tok[ne] = use[i].tok[j];
+                    p.dst[ne] = use[i].row[j];
+                    p.tok[ne] = use[i].tok[j];
                     ++ne;
                 }
                 ++ng;
             }
-            p->start[ng] = ne;
-            p->ng[0] = ng;
-            if (!ng) return;
-            cudaMemcpyAsync(ex_plan_, p, sizeof(WindowPlan), cudaMemcpyHostToDevice, st);
-            WindowPlan* dp = (WindowPlan*) ex_plan_;
+            p.start[ng] = ne;
+            p.ng[0] = ng;
+            return ng;
+        };
+        const auto launch = [&](void* dev, int ng, int ne) {
+            WindowPlan* dp = (WindowPlan*) dev;
             kernels::native_expert_grouped_clamped(lay, g_.clamp_exp[(size_t) l], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, ng, ne,
                                                    ex_xq_, ex_scr_, ex_rows_, st);
-            cudaStreamSynchronize(st);   // the plan buffer is reused by the next launch
         };
-        launch(false);
+        WindowPut put;
+        int ne = 0;
+        const int nhits = make_plan(put.plan, false, ne);
+        for (int r = 0; r < G * K; ++r)
+            put.rows[r] = (unsigned long long) (lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * L : d_rows_ + (size_t) r * L);
+        put_words(&put, ex_plan_, (int) ((offsetof(WindowPut, rows) + (size_t) G * K * 8) / 4), st);
+        if (nhits) launch(ex_plan_, nhits, ne);
         if (n_fetched) {
+            WindowPlan p2;
+            const int ng = make_plan(p2, true, ne);
             tier_->await_fetch(st);
-            launch(true);
+            put_words(&p2, ex_plan2_, (int) (sizeof(WindowPlan) / 4), st);
+            launch(ex_plan2_, ng, ne);
         }
+        // the second card's fetched experts run once their copies land, long after these launches
         if (peer && !peer->run_fetched(err)) return false;
-        if (cpu) tier_->finish_cpu();
-        if (reading) {
-            if (!tier_->await_reads(err)) return false;
-            tier_->start_cpu_window(tl, h_x_, lk, use, h_rows_, /*reading=*/true);
-            tier_->finish_cpu();
+        if (pd.cpu || pd.reading || on_peer) {
+            pd.word = ++join_seq_;
+            kernels::wait_word(d_words_ + 1, pd.word, st);
         }
-        if (peer && !peer->finish(nullptr, err)) return false;
-        for (int r = 0; r < G * K; ++r) h_rowptr_[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * L : d_rows_ + (size_t) r * L;
-        cudaMemcpyAsync(rowptr_d_, h_rowptr_, (size_t) G * K * sizeof(void*), cudaMemcpyHostToDevice, st);
-        weighted_sum_window(rowptr_d_, rw_ + (size_t) g0 * K, G, K, L, lat_out_ + (size_t) g0 * L, st);
-        if (cpu || reading) tier_->promote(tl, lk);
-        tier_->mark_gap(st);
-        cudaStreamSynchronize(st);   // the row pointer table and the staged rows are reused by the next group
+        const float* const* rows = (const float* const*) ((uint8_t*) ex_plan_ + offsetof(WindowPut, rows));
+        weighted_sum_window(rows, rw_ + (size_t) g0 * K, G, K, L, lat_out_ + (size_t) g0 * L, st);
+        if (pd.cpu && !pd.reading) tier_->mark_gap(st);   // the promotions' copies start behind the sum
         return true;
+    }
+
+    // The CPU's and the second card's share of the last group placed: the pool's rows land, the experts read from the file
+    // run, the second card's rows land, and the word its weighted sum waits for is written. On every way out, so the stream
+    // never waits for good.
+    bool join_moe(std::string& err) {
+        Pending& pd = pend_;
+        if (!pd.on) return true;
+        pd.on = false;
+        bool ok = true;
+        if (pd.cpu) tier_->finish_cpu();
+        if (pd.reading) {
+            if (tier_->await_reads(err)) {
+                tier_->start_cpu_window(pd.tl, h_x_, pd.lk, pd.use, h_rows_, /*reading=*/true);
+                tier_->finish_cpu();
+            } else {
+                ok = false;
+            }
+            tier_->promote(pd.tl, pd.lk);
+        }
+        std::string pe;
+        if (pd.peer && pd.peer_raised && !pd.peer->finish(nullptr, pe)) ok = false;
+        if (pd.peer && !pd.peer_raised) pd.peer->raise(0, nullptr, nullptr, pe);
+        if (!pe.empty() && err.empty()) err = pe;
+        if (pd.word) {
+            std::atomic_thread_fence(std::memory_order_release);   // the rows before the word
+            *(volatile uint32_t*) (h_words_ + 1) = pd.word;
+        }
+        if (pd.reading) tier_->mark_gap(stream_);
+        return ok;
     }
 
     // R rows at pos0..: the whole forward; the logits of the last `head_rows` rows go to logits_.
     bool run_rows(const int32_t* tokens, int R, int64_t pos0, int head_rows, std::string& err) {
+        bool ok = run_rows_impl(tokens, R, pos0, head_rows, err);
+        if (!join_moe(err)) ok = false;
+        if (!ok) cudaStreamSynchronize(stream_);
+        return ok;
+    }
+    bool run_rows_impl(const int32_t* tokens, int R, int64_t pos0, int head_rows, std::string& err) {
         if (pos0 + R > m_.context()) {
             err = "position " + std::to_string(pos0 + R - 1) + " is past the context of " + std::to_string(m_.context());
             return false;
@@ -1466,7 +1578,7 @@ private:
             Session* s;
             ~Drain() { s->drain_prefetch(); }
         } drain{this};
-        if (R > kMaxWindow) prefetch_engram(pos0, R);
+        prefetch_engram(pos0, R);   // every Engram layer's rows are asked for before the first layer runs
         const int E = g_.n_embd;
         bk::HcPlainArgs hc;
         hc.n_embd = E;
@@ -1510,6 +1622,7 @@ private:
             std::swap(X_, Xn_);
             if (!m_.diag_dump().empty()) dump("l_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
         }
+        if (!join_moe(err)) return false;
         if (tier_) tier_->pump(-1, core::ExpertTier::kAllPieces);
         if (head_rows > 0) {
             const float* x = X_ + (size_t) (R - head_rows) * 4 * E;
@@ -1632,7 +1745,7 @@ private:
     Hy4Model& m_;
     const Geometry& g_;
     cudaStream_t stream_ = nullptr;
-    cudaEvent_t ev_ = nullptr;
+    cudaEvent_t ev_ = nullptr, eng_ev_ = nullptr;
     std::vector<void*> bufs_, pinned_;
     float *X_ = nullptr, *Xn_ = nullptr, *coef_ = nullptr, *hcws_ = nullptr;
     float *e_ = nullptr, *cur_ = nullptr, *xn_ = nullptr, *attn_ = nullptr, *attn_raw_ = nullptr, *mlp_ = nullptr, *mlp2_ = nullptr, *fin_ = nullptr;
@@ -1660,13 +1773,25 @@ private:
     std::set<std::pair<int, int>> loaded_;   // (type, rows) the MMQ tiles are loaded for
     void *mmq_xq_ = nullptr;
     int32_t *mmq_bounds_ = nullptr, *mmq_ident_ = nullptr, *heads_ids_ = nullptr, *heads_bounds_ = nullptr;
-    void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr;
+    void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr, *ex_plan2_ = nullptr;
     float* ex_rows_ = nullptr;
+    float *h_x_ = nullptr, *d_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_e_ = nullptr, *h_erows_ = nullptr, *h_evalid_ = nullptr;
     const float** rowptr_d_ = nullptr;
     const float** h_rowptr_ = nullptr;
-    float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_rw_ = nullptr, *h_erows_ = nullptr, *h_e_ = nullptr, *h_evalid_ = nullptr;
-    int32_t* h_ids_ = nullptr;
     WindowPlan* h_plan_ = nullptr;
+    float* h_rw_ = nullptr;
+    int32_t *h_ids_ = nullptr, *d_ids_ = nullptr;
+    uint32_t *h_words_ = nullptr, *d_words_ = nullptr;   // mapped: [0] the ids' sequence word, [1] the word a weighted sum waits for
+    uint32_t seq_want_ = 0, join_seq_ = 0;
+    // the group whose CPU and second-card share is still running (join_moe ends it)
+    struct Pending {
+        bool on = false, cpu = false, reading = false, peer_raised = false;
+        int tl = 0;
+        uint32_t word = 0;
+        core::PeerExperts* peer = nullptr;
+        core::ExpertTier::Lookup lk;
+        core::ExpertTier::Use use[kLookupK];
+    } pend_;
     std::shared_ptr<core::ExpertTier> tier_;
     std::vector<float> lookup_host_;
     std::vector<bool> lookup_loaded_;

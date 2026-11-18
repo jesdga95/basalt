@@ -204,7 +204,9 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
         err = s_.name + ": cannot create the promotion stream";
         return false;
     }
-    for (size_t i = 0; i < kEvents; ++i) {
+    claim_cap_ = (int) kMaxPending;
+    const size_t n_events = std::max(kEvents, (size_t) 2 * (size_t) std::max(s_.claims_per_row, 0) * kMaxWindow);
+    for (size_t i = 0; i < n_events; ++i) {
         cudaEvent_t e, o;
         if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
             err = s_.name + ": cannot create a promotion event";
@@ -675,6 +677,7 @@ void ExpertTier::begin_token(int n_tokens) {
         for (uint16_t& u : uses_) u >>= 1;
     token_ += (uint64_t) n_tokens;
     claims_ = 0;
+    claim_cap_ = s_.claims_per_row > 0 ? s_.claims_per_row * std::max(n_tokens, 1) : (int) kMaxPending;
 }
 
 bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err) {
@@ -820,7 +823,7 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
 }
 
 int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too, bool whole, bool later) {
-    if (claims_ >= (int) kMaxPending || free_events_.empty()) {
+    if (claims_ >= claim_cap_ || free_events_.empty()) {
         ++dropped_;
         return -1;
     }
