@@ -1,6 +1,5 @@
 # DeepSeek-V4.1 kernels: the library and its parity tests. Included from the top-level CMakeLists.txt.
 add_library(deepseek41_kernels STATIC
-  src/models/deepseek41/kernels/router.cu
   src/models/deepseek41/kernels/norm.cu
   src/models/deepseek41/kernels/engram.cu
   src/models/deepseek41/kernels/attn_index.cu
