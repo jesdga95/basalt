@@ -1,7 +1,9 @@
-// src/models/hy4flash/kernels/mla.cu - the absorbed MLA of Hy4-flash for one token: the per-head Q8_0 products,
-// the query and cache-row preparation, and the attention over the shared latent with a per-head sink.
+// src/models/hy4flash/kernels/mla.cu - the absorbed MLA of Hy4-flash over a window or chunk of rows: the per-head Q8_0
+// products, the query and cache-row preparation, and the attention over the shared latent with a per-head sink. A row's
+// result does not depend on the other rows or on how many there are.
 #include "basalt/models/hy4flash/kernels.hpp"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -50,14 +52,20 @@ __device__ __forceinline__ float block_max(float v, float* red) {
     return r;
 }
 
-// A warp per output row.
-__global__ void heads_gemv_kernel(const uint8_t* __restrict__ w, const float* __restrict__ x, int x_stride, int rows,
-                                  int nb, float* __restrict__ y) {
-    const int h = blockIdx.y, lane = threadIdx.x & 31;
+// A cache row's element type: fp32, or BF16 (the reference's own rounding of the latent rows).
+__device__ __forceinline__ float load_row(const float* p) { return *p; }
+__device__ __forceinline__ float load_row(const uint16_t* p) { return __uint_as_float((uint32_t) *p << 16); }
+__device__ __forceinline__ void store_row(float* p, float v) { *p = v; }
+__device__ __forceinline__ void store_row(uint16_t* p, float v) { *p = __bfloat16_as_ushort(__float2bfloat16_rn(v)); }
+
+// A warp per output row; z = the token.
+__global__ void heads_gemv_kernel(const uint8_t* __restrict__ w, const float* __restrict__ x, int x_head_stride, int x_tok_stride,
+                                  int rows, int nb, int heads, float* __restrict__ y) {
+    const int h = blockIdx.y, t = blockIdx.z, lane = threadIdx.x & 31;
     const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (r >= rows) return;
     const uint8_t* row = w + ((size_t) h * rows + r) * nb * 34;
-    const float* xv = x + (size_t) h * x_stride;
+    const float* xv = x + (size_t) t * x_tok_stride + (size_t) h * x_head_stride;
     float acc = 0.f;
     for (int b = 0; b < nb; ++b) {
         const uint8_t* blk = row + (size_t) b * 34;
@@ -66,7 +74,7 @@ __global__ void heads_gemv_kernel(const uint8_t* __restrict__ w, const float* __
         acc = fmaf(d * q, xv[b * 32 + lane], acc);
     }
     acc = warp_sum(acc);
-    if (lane == 0) y[(size_t) h * rows + r] = acc;
+    if (lane == 0) y[((size_t) t * heads + h) * rows + r] = acc;
 }
 
 // Rotation of consecutive pairs (2i, 2i + 1) by pos * base^(-2i / n_rot).
@@ -78,50 +86,60 @@ __device__ __forceinline__ void rope_pair(float x0, float x1, int i, int n_rot, 
     o1 = x0 * s + x1 * c;
 }
 
-// Block h < heads: the head's query row; block `heads`: the cache row.
+// Block h < heads: the head's query row; block `heads`: the cache row. y = the token.
+template <typename C>
 __global__ void prepare_kernel(const float* __restrict__ q, const float* __restrict__ q_abs, const float* __restrict__ kv_raw,
-                               const float* __restrict__ kv_norm, MlaArgs a, int pos, float* __restrict__ qcur,
-                               float* __restrict__ cache_row) {
+                               const float* __restrict__ kv_norm, MlaArgs a, int pos0, int ring, float* __restrict__ qcur,
+                               C* __restrict__ cache) {
     __shared__ float red[kThreads / 32];
-    const int h = blockIdx.x, W = a.rank + a.rope, Q = a.nope + a.rope;
+    const int h = blockIdx.x, t = blockIdx.y, W = a.rank + a.rope, Q = a.nope + a.rope, pos = pos0 + t;
     if (h < a.heads) {
-        for (int c = threadIdx.x; c < a.rank; c += blockDim.x) qcur[(size_t) h * W + c] = q_abs[(size_t) h * a.rank + c];
+        const float* qt = q + (size_t) t * a.heads * Q;
+        const float* qa = q_abs + (size_t) t * a.heads * a.rank;
+        float* out = qcur + (size_t) t * a.heads * W;
+        for (int c = threadIdx.x; c < a.rank; c += blockDim.x) out[(size_t) h * W + c] = qa[(size_t) h * a.rank + c];
         if (threadIdx.x < a.rope / 2) {
             const int i = threadIdx.x;
-            const float* p = q + (size_t) h * Q + a.nope + 2 * i;
+            const float* p = qt + (size_t) h * Q + a.nope + 2 * i;
             float o0, o1;
             rope_pair(p[0], p[1], i, a.rope, a.rope_base, pos, o0, o1);
-            qcur[(size_t) h * W + a.rank + 2 * i] = o0;
-            qcur[(size_t) h * W + a.rank + 2 * i + 1] = o1;
+            out[(size_t) h * W + a.rank + 2 * i] = o0;
+            out[(size_t) h * W + a.rank + 2 * i + 1] = o1;
         }
         return;
     }
+    const float* kr = kv_raw + (size_t) t * W;
+    C* row = cache + (size_t) (ring ? pos % ring : pos) * W;
     float ss = 0.f;
-    for (int c = threadIdx.x; c < a.rank; c += blockDim.x) ss = fmaf(kv_raw[c], kv_raw[c], ss);
+    for (int c = threadIdx.x; c < a.rank; c += blockDim.x) ss = fmaf(kr[c], kr[c], ss);
     ss = block_sum<kThreads>(ss, red);
     const float rs = rsqrtf(ss / (float) a.rank + a.rms_eps);
-    for (int c = threadIdx.x; c < a.rank; c += blockDim.x) cache_row[c] = kv_raw[c] * rs * kv_norm[c];
+    for (int c = threadIdx.x; c < a.rank; c += blockDim.x) store_row(row + c, kr[c] * rs * kv_norm[c]);
     if (threadIdx.x < a.rope / 2) {
         const int i = threadIdx.x;
         float o0, o1;
-        rope_pair(kv_raw[a.rank + 2 * i], kv_raw[a.rank + 2 * i + 1], i, a.rope, a.rope_base, pos, o0, o1);
-        cache_row[a.rank + 2 * i] = o0;
-        cache_row[a.rank + 2 * i + 1] = o1;
+        rope_pair(kr[a.rank + 2 * i], kr[a.rank + 2 * i + 1], i, a.rope, a.rope_base, pos, o0, o1);
+        store_row(row + a.rank + 2 * i, o0);
+        store_row(row + a.rank + 2 * i + 1, o1);
     }
 }
 
-// A block per head: the scores (a warp per cell), the softmax with the sink, the weighted sum of the latents.
-__global__ void attend_kernel(const float* __restrict__ qcur, const float* __restrict__ cache, int first, int n,
-                              const float* __restrict__ sinks, MlaArgs a, float* __restrict__ o_lat,
-                              const int32_t* __restrict__ cells, int ring) {
+// A block per head and row: the scores (a warp per cell), the softmax with the sink, the weighted sum of the latents.
+template <typename C>
+__global__ void attend_kernel(const float* __restrict__ qcur, const C* __restrict__ cache, const int32_t* __restrict__ firsts,
+                              const int32_t* __restrict__ counts, const int32_t* __restrict__ cells, int cells_stride,
+                              const float* __restrict__ sinks, MlaArgs a, int ring, float* __restrict__ o_lat) {
     __shared__ float s[kMaxCells];
     __shared__ float red[kThreads / 32];
-    const int h = blockIdx.x, W = a.rank + a.rope, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const float* qv = qcur + (size_t) h * W;
+    const int h = blockIdx.x, t = blockIdx.y, W = a.rank + a.rope, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n = counts[t], first = firsts[t];
+    const int32_t* cl = cells ? cells + (size_t) t * cells_stride : nullptr;
+    const float* qv = qcur + ((size_t) t * a.heads + h) * W;
     for (int j = warp; j < n; j += kThreads / 32) {
-        const float* kr = cache + (size_t) (cells ? cells[j] : ring ? (first + j) % ring : first + j) * W;
+        const int cell = cl ? cl[j] : ring ? (first + j) % ring : first + j;
+        const C* kr = cache + (size_t) cell * W;
         float acc = 0.f;
-        for (int c = lane; c < W; c += 32) acc = fmaf(qv[c], kr[c], acc);
+        for (int c = lane; c < W; c += 32) acc = fmaf(qv[c], load_row(kr + c), acc);
         acc = warp_sum(acc);
         if (lane == 0) s[j] = acc * a.scale;
     }
@@ -141,30 +159,64 @@ __global__ void attend_kernel(const float* __restrict__ qcur, const float* __res
     const float inv = 1.f / den;
     for (int c = threadIdx.x; c < a.rank; c += kThreads) {
         float acc = 0.f;
-        for (int j = 0; j < n; ++j) acc = fmaf(s[j], cache[(size_t) (cells ? cells[j] : ring ? (first + j) % ring : first + j) * W + c], acc);
-        o_lat[(size_t) h * a.rank + c] = acc * inv;
+        for (int j = 0; j < n; ++j) {
+            const int cell = cl ? cl[j] : ring ? (first + j) % ring : first + j;
+            acc = fmaf(s[j], load_row(cache + (size_t) cell * W + c), acc);
+        }
+        o_lat[((size_t) t * a.heads + h) * a.rank + c] = acc * inv;
     }
+}
+
+// cells[t][j] = j for j < fill[t] (rows with fill 0 are left alone).
+__global__ void iota_cells_kernel(int32_t* __restrict__ cells, int stride, const int32_t* __restrict__ fill) {
+    const int t = blockIdx.x, n = fill[t];
+    for (int j = threadIdx.x; j < n; j += blockDim.x) cells[(size_t) t * stride + j] = j;
+}
+
+template <typename C>
+void prepare_impl(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
+                  int n_tok, int ring, float* qcur, C* cache, void* stream) {
+    prepare_kernel<C><<<dim3(a.heads + 1, n_tok), kThreads, 0, (cudaStream_t) stream>>>(q, q_abs, kv_raw, kv_norm, a, pos0, ring, qcur, cache);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+template <typename C>
+void attend_impl(const float* qcur, const C* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
+                 float* o_lat, void* stream) {
+    attend_kernel<C><<<dim3(a.heads, n_tok), kThreads, 0, (cudaStream_t) stream>>>(qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride,
+                                                                               sinks, a, ring, o_lat);
+    if (!stream) cudaStreamSynchronize(nullptr);
 }
 
 }  // namespace
 
-void q8_0_heads_gemv(const void* w, const float* x, int x_stride, int heads, int rows, int k, float* y, void* stream) {
+void q8_0_heads_gemv(const void* w, const float* x, int x_head_stride, int x_tok_stride, int heads, int rows, int k, int n_tok,
+                     float* y, void* stream) {
     if (k % 32) throw std::invalid_argument("q8_0_heads_gemv: k is not a multiple of 32");
-    heads_gemv_kernel<<<dim3((rows + 7) / 8, heads), 256, 0, (cudaStream_t) stream>>>((const uint8_t*) w, x, x_stride, rows,
-                                                                                    k / 32, y);
+    heads_gemv_kernel<<<dim3((rows + 7) / 8, heads, n_tok), 256, 0, (cudaStream_t) stream>>>((const uint8_t*) w, x, x_head_stride,
+                                                                                         x_tok_stride, rows, k / 32, heads, y);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
-void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos,
-                 float* qcur, float* cache_row, void* stream) {
-    prepare_kernel<<<a.heads + 1, kThreads, 0, (cudaStream_t) stream>>>(q, q_abs, kv_raw, kv_norm, a, pos, qcur, cache_row);
-    if (!stream) cudaStreamSynchronize(nullptr);
+void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
+                 int n_tok, int ring, float* qcur, float* cache, void* stream) {
+    prepare_impl(q, q_abs, kv_raw, kv_norm, a, pos0, n_tok, ring, qcur, cache, stream);
+}
+void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
+                 int n_tok, int ring, float* qcur, uint16_t* cache, void* stream) {
+    prepare_impl(q, q_abs, kv_raw, kv_norm, a, pos0, n_tok, ring, qcur, cache, stream);
+}
+void mla_attend(const float* qcur, const float* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
+                float* o_lat, void* stream) {
+    attend_impl(qcur, cache, r, n_tok, sinks, a, ring, o_lat, stream);
+}
+void mla_attend(const float* qcur, const uint16_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
+                float* o_lat, void* stream) {
+    attend_impl(qcur, cache, r, n_tok, sinks, a, ring, o_lat, stream);
 }
 
-void mla_attend(const float* qcur, const float* cache, int first, int n, const float* sinks, const MlaArgs& a,
-                float* o_lat, void* stream, const int32_t* cells, int ring) {
-    if (n < 1 || n > kMaxCells) throw std::invalid_argument("mla_attend: cells");
-    attend_kernel<<<a.heads, kThreads, 0, (cudaStream_t) stream>>>(qcur, cache, first, n, sinks, a, o_lat, cells, ring);
+void iota_cells(int32_t* cells, int stride, const int32_t* fill, int n_tok, void* stream) {
+    iota_cells_kernel<<<n_tok, 256, 0, (cudaStream_t) stream>>>(cells, stride, fill);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
