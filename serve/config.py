@@ -573,6 +573,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--api-key", default="",
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); command line only, "
                          "not allowed in a --config file")
+    ap.add_argument("--api-key-file", default="", metavar="FILE",
+                    help="read that key from the first line of FILE, which keeps it out of the process list; command "
+                         "line only")
     ap.add_argument("--allowed-host", action="append", default=[], metavar="NAME",
                     help="also answer to this Host name (repeatable; \"*\" turns the check off)")
     ap.add_argument("--cors-origin", action="append", default=[], metavar="ORIGIN",
