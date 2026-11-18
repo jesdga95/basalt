@@ -20,7 +20,7 @@
 #include "models/deepseek41/ops.hpp"
 #include "models/deepseek41/prefill.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
-#include "models/deepseek41/tier.hpp"
+#include "basalt/core/expert_tier.hpp"
 #include "basalt/models/deepseek41/vision.hpp"
 
 #include <cuda_runtime.h>
@@ -256,7 +256,7 @@ public:
                 open_prompt_path(plan_tokens);
                 if (plan_tokens >= kLendTierTokens) {
                     std::string te;
-                    if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
+                    if (core::ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
                 }
                 // the caches take their memory before the prompt workspaces do
                 if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
@@ -271,7 +271,7 @@ public:
                     std::string te;
                     err.clear();
                     short_prompt_ = false;
-                    if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
+                    if (core::ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
                     if (!make_prefill_fit(plan_tokens, err)) return prompt_failed(err);
                 }
                 prefill_->progress = r.progress;
@@ -323,7 +323,7 @@ public:
 
     model::Result set_low_memory(bool low, int64_t& expert_slots) override {
         std::string e;
-        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
         cudaStreamSynchronize(stream_);
         release_short_prompt();
@@ -339,7 +339,7 @@ public:
 
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
         std::string e;
-        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
         cudaStreamSynchronize(stream_);
         release_short_prompt();
@@ -350,7 +350,7 @@ public:
 
     model::Result probe_env(program::ProbeEnv& env) override {
         std::string e;
-        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
         cudaStreamSynchronize(stream_);
         t->probe_env(env);
@@ -362,13 +362,13 @@ public:
 
     ExpertCounts expert_counts() const override {
         std::string e;
-        const ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        const core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
     }
 
     std::string info_words() const override {
         std::string e;
-        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         const std::string kv = m_.cache_format() == CacheFormat::Fp8 ? "kv=fp8+fp4" : "kv=fp16";
         return t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill());
     }
@@ -448,8 +448,8 @@ public:
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid&) override {
         std::string err;
         if (!image_) {   // this slot's image buffers, allocated with the tier
-            ExpertTier* tier = ops_ ? ops_->expert_tier(err) : nullptr;
-            image_ = tier ? tier->host().take_image() : nullptr;
+            core::ExpertTier* tier = ops_ ? ops_->expert_tier(err) : nullptr;
+            image_ = tier ? m_.prompt_host().take_image() : nullptr;
             if (!image_) return {model::Status::Error, err.empty() ? "deepseek41: no image buffers for this slot" : err};
         }
         vision::Image& img = image_->picture;
@@ -459,7 +459,7 @@ public:
             // the encoder takes the memory of the tier's extra copies, and of all its copies when that is short;
             // images_done gives it back
             std::string te;
-            ExpertTier* t = ops_->expert_tier(te);
+            core::ExpertTier* t = ops_->expert_tier(te);
             cudaStreamSynchronize(stream_);
             vis_borrowed_ = true;
             if (t) t->shrink();
@@ -500,7 +500,7 @@ public:
         cudaStreamSynchronize(stream_);
         vis_.reset();
         std::string e;
-        if (ExpertTier* t = ops_->expert_tier(e)) {
+        if (core::ExpertTier* t = ops_->expert_tier(e)) {
             if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
             t->grow();
         }
@@ -518,7 +518,7 @@ public:
             std::string te;
             err.clear();
             short_prompt_ = false;
-            if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
+            if (core::ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
             if (!make_prefill_fit(n_rows, err)) return prompt_failed(err);
         }
         tap_features();
@@ -543,7 +543,7 @@ private:
         }
         // the reserve stays free through the read: the chunk halves to fit above it
         std::string te;
-        const ExpertTier* tier = ops_->expert_tier(te);
+        const core::ExpertTier* tier = ops_->expert_tier(te);
         const bool beside = short_prompt_;
         const uint64_t margin = std::max(beside ? prefillp::kShortMargin : prefillp::kMargin, tier ? tier->free_floor() : 0);
         if (beside) tokens = prefillp::kShortChunk;   // these workspaces stay for the next short read, whatever its size
@@ -574,7 +574,7 @@ private:
         prefill_.reset();
         short_prompt_ = false;
         std::string e;
-        if (ExpertTier* t = ops_->expert_tier(e)) {
+        if (core::ExpertTier* t = ops_->expert_tier(e)) {
             if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
             t->grow();
         }
@@ -584,14 +584,14 @@ private:
     void open_prompt_path(int n_tokens) {
         std::string e;
         // the tier opens at its normal size before anything else takes the card; the workspaces size to what is left
-        ExpertTier* t = ops_->expert_tier(e);
+        core::ExpertTier* t = ops_->expert_tier(e);
         if (!t || prefill_) return;
         short_prompt_ = n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
         if (!short_prompt_) t->shrink();
     }
     void settle_tier() {
         std::string e;
-        if (ExpertTier* t = ops_->expert_tier(e)) t->settle();
+        if (core::ExpertTier* t = ops_->expert_tier(e)) t->settle();
     }
     void release_short_prompt() {
         if (!short_prompt_) return;
@@ -602,7 +602,7 @@ private:
     // A short read's workspaces stay for the next one: the tier planned for them.
     void close_prompt_path() {
         std::string e;
-        ExpertTier* t = ops_->expert_tier(e);
+        core::ExpertTier* t = ops_->expert_tier(e);
         if (!t) return;
         if (short_prompt_) return;
         cudaStreamSynchronize(stream_);

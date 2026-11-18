@@ -1,5 +1,5 @@
-// src/models/deepseek41/file_reads_test.cpp - FileReads lands every blob byte for byte, whatever its alignment (no GPU).
-#include "models/deepseek41/file_reads.hpp"
+// tests/core/file_reads_test.cpp - FileReads lands every blob byte for byte, whatever its alignment (no GPU).
+#include "basalt/core/file_reads.hpp"
 
 #include "basalt/platform/file.hpp"
 
@@ -22,7 +22,7 @@ static int g_fail = 0;
         }                                                              \
     } while (0)
 
-using basalt::models::deepseek41::FileReads;
+using basalt::core::FileReads;
 
 int main() {
     const std::string path = std::string(BASALT_TEST_TMPDIR) + "/file_reads_test.bin";

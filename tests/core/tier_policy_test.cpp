@@ -1,5 +1,5 @@
-// src/models/deepseek41/tier_policy_test.cpp - the tier admission and placement rules on synthetic id streams.
-#include "models/deepseek41/tier_policy.hpp"
+// tests/core/tier_policy_test.cpp - the tier admission and placement rules on synthetic id streams.
+#include "basalt/core/tier_policy.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -7,7 +7,7 @@
 #include <functional>
 #include <vector>
 
-using namespace basalt::models::deepseek41::policy;
+using namespace basalt::core::policy;
 
 static int g_fail = 0;
 #define CHECK(c)                                                          \
@@ -200,6 +200,16 @@ int main() {
         CHECK(!holds_exact(12, 4, grow_slots(1000, room, 0, one, 4, 384, 12)));   // room for none: 4 of the 12
         CHECK(holds_exact(12, 4, grow_slots(3000, room, 0, one, 4, 384, 12)));    // room for 8: all 12
         CHECK(holds_exact(5, 8, 0));                                              // base alone above the count
+    }
+
+    // the admission threshold is a parameter: k uses admit, and the count starts over
+    for (int k : {1, 2, 3}) {
+        uint16_t uses = 0;
+        for (int round = 0; round < 3; ++round) {
+            for (int i = 1; i < k; ++i) CHECK(!count_use(uses, k));
+            CHECK(count_use(uses, k));
+            CHECK(uses == 0);
+        }
     }
 
     // promotion by CPU uses: the kPromoteUses-th use earns it and the count starts over; the counts halve once per

@@ -1,5 +1,5 @@
-// src/models/deepseek41/elastic.cpp - see elastic.hpp.
-#include "models/deepseek41/elastic.hpp"
+// src/core/elastic_array.cpp - see elastic_array.hpp.
+#include "basalt/core/elastic_array.hpp"
 
 #include "basalt/core/device.hpp"
 #include "basalt/core/vmm.hpp"
@@ -8,32 +8,32 @@
 
 #include <algorithm>
 
-namespace basalt::models::deepseek41 {
+namespace basalt::core {
 
-ElasticBuf::~ElasticBuf() {
+ElasticArray::~ElasticArray() {
     if (!base_) return;
     if (plain_) {
         cudaFree(base_);
         return;
     }
     cudaDeviceSynchronize();
-    for (const Extent& e : extents_) core::vmm::unmap(base_ + e.off, e.bytes, e.handle);
-    core::vmm::release_range(base_, reserved_);
+    for (const Extent& e : extents_) vmm::unmap(base_ + e.off, e.bytes, e.handle);
+    vmm::release_range(base_, reserved_);
 }
 
-bool ElasticBuf::open(uint64_t bytes, std::string& err) {
+bool ElasticArray::open(uint64_t bytes, std::string& err) {
     if (bytes == 0) bytes = 1;
-    if (core::vmm::supported()) {
-        gran_ = core::vmm::granularity();
+    if (vmm::supported()) {
+        gran_ = vmm::granularity();
         if (gran_) {
             reserved_ = (bytes + gran_ - 1) / gran_ * gran_;
-            base_ = core::vmm::reserve(reserved_);
+            base_ = vmm::reserve(reserved_);
             if (base_) return true;
         }
     }
     void* p = nullptr;
     if (cudaMalloc(&p, bytes) != cudaSuccess) {
-        err = "out of device memory for the compressed caches";
+        err = "out of device memory for the array";
         return false;
     }
     cudaMemset(p, 0, bytes);
@@ -43,10 +43,10 @@ bool ElasticBuf::open(uint64_t bytes, std::string& err) {
     return true;
 }
 
-bool ElasticBuf::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
+bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
     if (bytes <= backed_) return true;
     if (bytes > reserved_) {
-        err = "the compressed cache is full";
+        err = "the array is full";
         return false;
     }
     // grow in steps of a few granules so a long generation maps rarely
@@ -56,7 +56,7 @@ bool ElasticBuf::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
     if (keep_free > 0) {
         uint64_t free_b = 0, total_b = 0;
         std::string why;
-        if (!core::device_memory(-1, free_b, total_b, why)) {
+        if (!device_memory(-1, free_b, total_b, why)) {
             err = "cannot read the free device memory: " + why;
             return false;
         }
@@ -65,9 +65,9 @@ bool ElasticBuf::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
             return false;
         }
     }
-    const unsigned long long h = core::vmm::map(base_ + backed_, n);
+    const unsigned long long h = vmm::map(base_ + backed_, n);
     if (!h) {
-        err = "out of device memory for the compressed caches";
+        err = "out of device memory for the array";
         return false;
     }
     cudaMemset(base_ + backed_, 0, n);
@@ -76,15 +76,15 @@ bool ElasticBuf::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
     return true;
 }
 
-void ElasticBuf::trim(uint64_t bytes) {
+void ElasticArray::trim(uint64_t bytes) {
     if (plain_ || !base_ || extents_.empty() || extents_.back().off < bytes) return;
     cudaDeviceSynchronize();
     while (!extents_.empty() && extents_.back().off >= bytes) {
         const Extent& e = extents_.back();
-        core::vmm::unmap(base_ + e.off, e.bytes, e.handle);
+        vmm::unmap(base_ + e.off, e.bytes, e.handle);
         extents_.pop_back();
     }
     backed_ = extents_.empty() ? 0 : extents_.back().off + extents_.back().bytes;
 }
 
-}  // namespace basalt::models::deepseek41
+}  // namespace basalt::core
