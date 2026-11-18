@@ -104,6 +104,10 @@ glm53 branch: take `a62b2de5` (the hc kernels in shared code) only, by cherry-pi
 (`model_sections.py`, `convert.py`) overlap with the Hy4 converter changes, so whichever lands second rebases. Its MLA and indexer
 kernels are single-query FP32 decode kernels with a 4,096-cell cap.
 
+Follow-up, with the DeepSeek pack present: Hy4 keeps its own attention kernels (`src/models/hy4flash/kernels/mla.cu`, rows as blocks over a BF16 or
+fp32 latent cache with a sink); `attn_mqa.cu` is to be generalised (dK != dV, head count, one row source) so the two share one kernel, each step
+with the DeepSeek parity and speed runs. The router and the row norms are shared already (`basalt/kernels/router.hpp`, `row_norm.hpp`).
+
 Prefill plan: chunks of 16,384 tokens halved to fit, as DeepSeek; each chunk runs 42 layers with the sparse layers' indexer for
 every row of the chunk against the pooled keys of all earlier positions, then selected-row attention; SWA layers attend the previous
 511 rows (the chunk's tail plus the ring). No prompt skip (every layer's output matters). Engram rows of chunk n + 1 are read while

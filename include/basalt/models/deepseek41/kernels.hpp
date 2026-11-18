@@ -8,6 +8,8 @@
 #pragma once
 
 #include "basalt/kernels/mhc.hpp"
+#include "basalt/kernels/router.hpp"
+#include "basalt/kernels/row_norm.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -26,27 +28,15 @@ using kernels::kHcSplits;
 
 // ---- router ---------------------------------------------------------------------------------------------------
 
-struct RouterArgs {
-    int n_expert = 384;               ///< multiple of 32, at most 512
-    int n_embd = 5120;                ///< multiple of 128
-    int k = 6;                        ///< at most 8
-    float weight_scale = 1.5f;        ///< multiplies the normalised weights
-};
-
-/// logits = gate . x (fp32, gate row-major [n_expert][n_embd]); s = sqrt(softplus(logit)); the top-k of s + bias
-/// are chosen (the lower index wins a tie); weights are the unbiased s of those experts, divided by their sum plus
-/// 1e-20, times weight_scale. `logits` is a [T][n_expert] output (workspace); ids and weights are [T][k].
-void router(const float* x, const float* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
-            int32_t* ids, float* weights, void* stream);
+// The router is shared (basalt/kernels/router.hpp); DeepSeek's gate is the default, sqrt-softplus, and its k is at most 8.
+using kernels::RouterArgs;
+using kernels::router;
 
 // ---- row norms ------------------------------------------------------------------------------------------------
 
-/// out[t][i] = x[t][i] * rsqrt(mean(x[t]^2) + eps) * w[i], one fp32 row of n (multiple of 4, at most 8192) per token.
-void rms_norm_rows(const float* x, const float* w, int n_tokens, int n, float eps, float* out, void* stream);
-
-/// hc_pre followed by rms_norm_rows in one launch: cur = hc_pre(x, pre) is stored, out = rms_norm(cur) * w.
-void hc_pre_rms_norm(const float* x, const float* pre, int pre_stride, const float* w, int n_tokens, int n, float eps,
-                     float* cur, float* out, void* stream);
+// The row norms are shared (basalt/kernels/row_norm.hpp).
+using kernels::hc_pre_rms_norm;
+using kernels::rms_norm_rows;
 
 // ---- Engram ---------------------------------------------------------------------------------------------------
 
