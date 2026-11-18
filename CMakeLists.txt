@@ -496,6 +496,20 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
     src/models/qwen4exp/kernels/q80_vhead.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
+# The peer serves its share of the LM head: with two cards the head is split by vocabulary
+# (src/models/qwen4exp/decode/verify/head_split.cpp) whenever the peer bandwidth earns a share - in the
+# expert-tier mechanism too, not only a layer split - so these kernels need the peer architecture as
+# well.  APPEND, and after the block above: COMPILE_OPTIONS is a single property, and a second
+# set_source_files_properties on the same source replaces whatever the first one set.
+if(BASALT_PEER_ARCH_FLAGS)
+  set_property(SOURCE
+      src/models/qwen4exp/kernels/q5k_head.cu
+      src/models/qwen4exp/kernels/q80_vhead.cu
+      src/models/qwen4exp/kernels/cvec.cu
+      src/kernels/cuda/native_mmvq.cu
+      APPEND PROPERTY COMPILE_OPTIONS ${BASALT_PEER_ARCH_FLAGS})
+endif()
+
 # ---- engine -----------------------------------------------------
 # The COMPOSED layer lives here and not in `core`, because it calls kernels and `kernels`
 # already links `core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
