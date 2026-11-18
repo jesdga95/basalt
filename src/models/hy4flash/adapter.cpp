@@ -68,8 +68,11 @@ public:
         return std::nullopt;
     }
 
-    // the end-of-turn token is read from the pack's vocabulary (<hy_end> is 120025)
-    model::TokenNames token_names() const override { return {{"<hy_end>"}, "<hy_User>", "", "", ""}; }
+    // The pack's own special tokens, by name: their suffix differs between the packs (the test pack's GGUF carries a hash, the
+    // release `opensource`), so the names take a `*`. <hy_end> ends a reply, <hy_start> opens a turn.
+    model::TokenNames token_names() const override {
+        return {{"<\xef\xbd\x9c" "hy_end:*\xef\xbd\x9c>"}, "<\xef\xbd\x9c" "hy_start:*\xef\xbd\x9c>", "", "", ""};
+    }
 
 private:
     const char* name_;
