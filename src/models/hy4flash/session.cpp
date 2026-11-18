@@ -854,13 +854,49 @@ private:
         bool ok = true;
         for (int off = 0; ok && off < R; off += arows_) {
             X_ = x0 + (size_t) off * 4 * g_.n_embd;
-            ok = engram_step(l, pos0 + off, std::min(arows_, R - off), tokens + off, err);
+            ok = engram_step(l, pos0 + off, std::min(arows_, R - off), tokens + off, err, off);
         }
         X_ = x0;
         return ok;
     }
 
-    bool engram_step(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err) {
+    // What the Engram reads of a prompt need is known from the token ids alone: every Engram layer's rows for the whole chunk are
+    // asked for before the first layer runs, so the SSD works while the GPU does the layers in between.
+    struct Prefetch {
+        std::vector<float> valid;
+        std::vector<uint8_t> raw;
+        ngram::PleReader::Ticket tk;
+        bool issued = false, collected = false;
+    };
+    std::vector<Prefetch> pf_;
+
+    void prefetch_engram(int64_t pos0, int R) {
+        const EngramInfo& en = m_.pack().engram;
+        const int n_cols = en.n_cols(), W = en.row_values;
+        pf_.assign(en.layers.size(), Prefetch());
+        for (size_t e = 0; e < en.layers.size(); ++e) {
+            Prefetch& p = pf_[e];
+            std::vector<uint32_t> ids((size_t) R * n_cols);
+            p.valid.assign((size_t) R, 1.f);
+            for (int t = 0; t < R; ++t) {
+                const int64_t pos = pos0 + t;
+                const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
+                engram_ids(en, (int) e, hist_[(size_t) pos], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, p.valid[(size_t) t]);
+            }
+            p.raw.resize((size_t) R * n_cols * W);
+            p.tk = m_.engram_reader().issue(ids.data(), ids.size(), p.raw.data());
+            p.issued = true;
+        }
+    }
+    // Waits for the reads still in flight (their buffers are ours).
+    void drain_prefetch() {
+        std::string ignore;
+        for (Prefetch& p : pf_)
+            if (p.issued && !p.collected) m_.engram_reader().collect(p.tk, ignore);
+        pf_.clear();
+    }
+
+    bool engram_step(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err, int off = 0) {
         const double te = now_ms();
         struct Lap {
             double& acc;
@@ -873,18 +909,36 @@ private:
             if (en.layers[k] == l) e = (int) k;
         if (e < 0) return true;
         const int n_cols = en.n_cols(), W = en.row_values;
-        std::vector<uint32_t> ids((size_t) R * n_cols);
-        for (int t = 0; t < R; ++t) {
-            const int64_t pos = pos0 + t;
-            const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
-            float valid = 1.f;
-            engram_ids(en, e, tokens[t], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, valid);
-            h_evalid_[t] = valid;
+        static const std::vector<float> lut = [] {
+            std::vector<float> t(256);
+            for (int i = 0; i < 256; ++i) t[(size_t) i] = e4m3_to_f32((uint8_t) i);
+            return t;
+        }();
+        Prefetch* pf = (size_t) e < pf_.size() && pf_[(size_t) e].issued ? &pf_[(size_t) e] : nullptr;
+        std::vector<uint8_t> own_raw;
+        const uint8_t* raw = nullptr;
+        if (pf) {
+            if (!pf->collected) {
+                if (!m_.engram_reader().collect(pf->tk, err)) return false;
+                pf->collected = true;
+            }
+            for (int t = 0; t < R; ++t) h_evalid_[t] = pf->valid[(size_t) (off + t)];
+            raw = pf->raw.data() + (size_t) off * n_cols * W;
+        } else {
+            std::vector<uint32_t> ids((size_t) R * n_cols);
+            for (int t = 0; t < R; ++t) {
+                const int64_t pos = pos0 + t;
+                const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
+                float valid = 1.f;
+                engram_ids(en, e, tokens[t], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, valid);
+                h_evalid_[t] = valid;
+            }
+            own_raw.resize((size_t) R * n_cols * W);
+            ngram::PleReader& rd = m_.engram_reader();
+            const ngram::PleReader::Ticket tk = rd.issue(ids.data(), ids.size(), own_raw.data());
+            if (!rd.collect(tk, err)) return false;
+            raw = own_raw.data();
         }
-        std::vector<uint8_t> raw((size_t) R * n_cols * W);
-        ngram::PleReader& rd = m_.engram_reader();
-        const ngram::PleReader::Ticket tk = rd.issue(ids.data(), ids.size(), raw.data());
-        if (!rd.collect(tk, err)) return false;
         if (lookup_host_.empty()) lookup_host_.resize((size_t) n_cols * W * en.layers.size());
         float* nrm = lookup_host_.data() + (size_t) e * n_cols * W;
         if (lookup_loaded_.empty()) lookup_loaded_.assign(en.layers.size(), false);
@@ -896,10 +950,10 @@ private:
             const float valid = h_evalid_[t];
             for (int c = 0; c < n_cols; ++c) {
                 float* row = h_erows_ + ((size_t) t * n_cols + c) * W;
-                const uint8_t* src = raw.data() + ((size_t) t * n_cols + c) * W;
+                const uint8_t* src = raw + ((size_t) t * n_cols + c) * W;
                 float ss = 0.f;
                 for (int d = 0; d < W; ++d) {
-                    row[d] = e4m3_to_f32(src[d]);
+                    row[d] = lut[src[d]];
                     ss += row[d] * row[d];
                 }
                 const float r = 1.0f / std::sqrt(ss / (float) W + 1.1920929e-07f);
@@ -1252,6 +1306,11 @@ private:
         if (!ensure_positions(pos0 + R, err)) return false;
         place_rope(pos0, R);   // [vision]
         if (tier_) tier_->begin_token(std::min(R, kMaxWindow));
+        struct Drain {
+            Session* s;
+            ~Drain() { s->drain_prefetch(); }
+        } drain{this};
+        if (R > kMaxWindow) prefetch_engram(pos0, R);
         const int E = g_.n_embd;
         bk::HcPlainArgs hc;
         hc.n_embd = E;
