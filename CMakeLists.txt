@@ -420,6 +420,7 @@ if(BASALT_PEER_ARCH_FLAGS)
     src/prefill/mmq/instances/mmq_iq3_xxs.cu
     src/prefill/mmq/instances/mmq_iq3_s.cu
     src/prefill/mmq/instances/mmq_iq4_nl.cu
+    src/prefill/mmq/instances/mmq_nvfp4.cu
     src/prefill/mmq/instances/mmq_iq4_xs.cu
     src/prefill/mmq/instances/mmq_q8_0.cu
     src/prefill/mmq/instances/mmq_q5_0.cu

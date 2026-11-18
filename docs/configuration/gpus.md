@@ -125,7 +125,8 @@ refused at the start rather than failing at its first kernel. What such a peer d
 - It reads its experts' share of a prompt chunk, under the slower-card rule above (chunks up to 2,559 rows).
 - It takes a share of the LM head, split by vocabulary, when its bandwidth earns more than a quarter of the rows.
 - It does not run the rest of the main card's work: the dense weights, the KV cache, the drafter, TMA and the FP4
-  tensor-core expert kernels stay on the Blackwell card. An NVFP4 pack's FP4 experts are main-card only.
+  tensor-core expert kernels stay on the Blackwell card. An NVFP4 pack's FP4 prompt share is main-card only, and
+  such a peer reads its experts' share through the int8 MMQ kernels instead: correct, and not FP4 speed.
 - DeepSeek does not take an older peer: its peer-tier kernels are built for sm_120 only, and the start says so.
 - Layer split, overlapped windows and tensor parallel need matched Blackwell cards; an unlike pair always uses the
   expert tier, as before.
