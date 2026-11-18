@@ -211,7 +211,7 @@ public:
         }
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
         if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, m_.dfly() ? (const uint16_t*) m_.tensor("output.weight")->ptr : nullptr,
-                        [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, err))
+                        [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), err))
             return false;
         return true;
     }
