@@ -32,6 +32,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <numeric>
@@ -308,6 +309,8 @@ public:
     void release_prompt() {
         if (!big_.rows) return;
         cudaStreamSynchronize(stream_);
+        basalt::log::info("basalt hy4flash", "prompt time: %.0f ms queued ahead of the MoE (attention, dense), %.0f ms in the MoE, %.0f ms in the Engram's host step", t_pre_ms_, t_moe_ms_, t_eng_ms_);
+        t_pre_ms_ = t_moe_ms_ = t_eng_ms_ = 0;
         use(dec_);
         big_.release();
         if (tier_) {
@@ -815,6 +818,12 @@ private:
     }
 
     bool engram_step(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err) {
+        const double te = now_ms();
+        struct Lap {
+            double& acc;
+            double t;
+            ~Lap() { acc += now_ms() - t; }
+        } lap{t_eng_ms_, te};
         const EngramInfo& en = m_.pack().engram;
         int e = -1;
         for (size_t k = 0; k < en.layers.size(); ++k)
@@ -976,8 +985,11 @@ private:
         if (loaded_.insert({el.d_type, L}).second) mmq::load(el.d_type, L);
         cudaStream_t st = stream_;
         std::vector<int32_t> hid((size_t) R * K);
+        const double t0 = now_ms();
         cudaStreamSynchronize(st);
         cudaMemcpy(hid.data(), ids_, hid.size() * 4, cudaMemcpyDeviceToHost);
+        const double t1 = now_ms();
+        t_pre_ms_ += t1 - t0;
         std::vector<std::vector<int32_t>> by((size_t) g_.n_expert);   // pair = t * K + slot
         for (int p = 0; p < R * K; ++p) {
             if (hid[(size_t) p] < 0 || hid[(size_t) p] >= g_.n_expert) {
@@ -1071,6 +1083,7 @@ private:
         cudaMemcpyAsync(pair_map_, map_h.data(), (size_t) R * K * 4, cudaMemcpyHostToDevice, st);
         weighted_sum_tokens(pair_rows_, pair_map_, rw_, R, K, L, lat_out_, st);
         cudaStreamSynchronize(st);   // the host's map is read until the copy lands
+        t_moe_ms_ += now_ms() - t1;
         return true;
     }
 
@@ -1414,6 +1427,9 @@ private:
     int32_t img_start_ = 0;              // the first position of the block being fed
     int img_nx_ = 1, img_j_ = 0;         // its columns (newline included) and the row of its first run row
     int last_rows_ = 0;
+    // prompt timing (host wall time at the sync points): the work queued before a layer's MoE, the MoE itself, the Engram's reads
+    double t_pre_ms_ = 0, t_moe_ms_ = 0, t_eng_ms_ = 0;
+    static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 };
 
 }  // namespace
