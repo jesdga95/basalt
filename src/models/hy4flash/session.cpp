@@ -14,6 +14,7 @@
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/router.hpp"
+#include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
@@ -526,14 +527,12 @@ private:
         for (int l = 0; l < g_.n_layers; ++l) {
             if (!engram(l, pos, token, err)) return false;
             bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), 1, 8, hc, hcws_, coef_, stream_);
-            bk::hc_pre(X_, coef_, bk::kHcCoef, 1, E, cur_, stream_);
-            bk::rms_norm_rows(cur_, F(l, "attn_norm.weight"), xn_, 1, E, g_.rms_eps, stream_);
+            bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), 1, E, g_.rms_eps, cur_, xn_, stream_);
             if (!attention(l, pos, err)) return false;
             bk::hc_post(attn_, X_, coef_, bk::kHcCoef, 1, E, Xn_, stream_);
             std::swap(X_, Xn_);
             bk::hc_mixes_plain(X_, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), 1, 8, hc, hcws_, coef_, stream_);
-            bk::hc_pre(X_, coef_, bk::kHcCoef, 1, E, cur_, stream_);
-            bk::rms_norm_rows(cur_, F(l, "ffn_norm.weight"), xn_, 1, E, g_.rms_eps, stream_);
+            bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), 1, E, g_.rms_eps, cur_, xn_, stream_);
             if (!ffn(l, err)) return false;
             bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, 1, E, g_.rms_eps, stream_);
             bk::hc_post(mlp2_, X_, coef_, bk::kHcCoef, 1, E, Xn_, stream_);
