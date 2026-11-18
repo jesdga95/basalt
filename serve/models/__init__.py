@@ -8,7 +8,8 @@ from __future__ import annotations
 class Dialect:
     name = ""
     stop_texts: tuple[str, ...] = ()        # texts that end the model's turn
-    reasoning_close = ""                    # closes thinking the model left open, or that reached its budget or repeats one token
+    reasoning_close = ""                    # closes thinking the model left open, or that repeats one token
+    reasoning_wrap_up = ""                  # closes thinking that reached its budget: a short wrap-up, then the close
     forced_call_ends_reply = False          # a named tool_choice ends the reply after its one call
     nothink_lead = ""                       # text between a no-thinking prompt and a forced call's opening
     image_pad = "<|image_pad|>"             # the prompt token that stands for one row of an image's embeddings

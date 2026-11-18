@@ -46,6 +46,7 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                          "elaboration."}
 # the Qwen dialect's closer of thinking; other dialects carry their own
 REASONING_CLOSE = "\n</think>\n\n"
+REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # Automatic answer room: thinking leaves the answer max(512, cap // 4) tokens, at most half the cap; a cap below
 # ANSWER_ROOM_MIN_CAP is too small to split and is left as it is.
 ANSWER_ROOM_MIN_CAP = 32
@@ -1453,7 +1454,9 @@ class Service:
                             print("[server] the model ended while thinking, closing it for an answer", flush=True)
                         elif wrap:
                             budget = None
-                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
+                            close = self.dialect.reasoning_close if looped or asked else \
+                                (self.dialect.reasoning_wrap_up or self.dialect.reasoning_close)
+                            extra = self.tok.encode(close + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 break                   # no room to answer: "length"
