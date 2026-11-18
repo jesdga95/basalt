@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstring>
 #include <stdexcept>
 
 namespace basalt::models::hy4flash {
@@ -57,6 +58,14 @@ __global__ void wsum_kernel(const float* const* __restrict__ rows, const float* 
     float acc = 0.f;
     for (int e = 0; e < k; ++e) acc += w[t * k + e] * rows[t * k + e][i];
     out[(size_t) t * n + i] = acc;
+}
+
+struct PutWords {
+    int w[kPutWords];
+};
+
+__global__ void put_words_kernel(const PutWords s, int* dst, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = s.w[i];
 }
 
 __global__ void swiglu_split_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int n_ff, float limit) {
@@ -147,6 +156,13 @@ void add_vectors(const float* a, const float* b, float* out, int n, void* stream
 void weighted_sum_window(const float* const* rows, const float* w, int n_tok, int K, int n, float* out, void* stream) {
     wsum_kernel<<<dim3((n + 255) / 256, n_tok), 256, 0, (cudaStream_t) stream>>>(rows, w, K, n, out);
     if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void put_words(const void* src, void* dst, int n_words, void* stream) {
+    if (n_words < 1 || n_words > kPutWords) throw std::invalid_argument("put_words: n_words");
+    PutWords s;
+    std::memcpy(s.w, src, (size_t) n_words * 4);
+    put_words_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(s, (int*) dst, n_words);
 }
 
 void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, float limit, void* stream) {

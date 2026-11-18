@@ -105,6 +105,13 @@ void add_vectors(const float* a, const float* b, float* out, int n, void* stream
 
 // ---- MoE ----------------------------------------------------------------------------------------------------------
 
+/// Most words put_words carries: a decode window's expert plan and its row pointers (the kernel's parameters stay under 4 KB).
+constexpr int kPutWords = 960;
+/// dst[0..n_words) = src[0..n_words) for `src` in host memory, n_words <= kPutWords: the words travel in the kernel's
+/// parameters, so a plan reaches the device in stream order without a copy-engine job (which would queue behind the tier's
+/// copies) and the host may reuse `src` at once.
+void put_words(const void* src, void* dst, int n_words, void* stream);
+
 /// out[t][i] = sum_k w[t * K + k] * rows[t * K + k][i] for k < K, in that order (rows: device array of T * K row pointers, each
 /// device or mapped host memory).
 void weighted_sum_window(const float* const* rows, const float* w, int n_tok, int K, int n, float* out, void* stream);
