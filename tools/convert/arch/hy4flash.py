@@ -4,8 +4,8 @@ Every tensor keeps the GGUF's type: the float tensors in `dense`, the Q8_0 proje
 gate and up, Q6_K or Q4_K down) in `experts` for the layers that have them (layer 0 is dense, so the layout lists layers
 1 .. N-1 by layer id), and the Engram table (`per_layer_token_embd.weight`, rows of 96 F8_E4M3 values, llama.cpp's type 43)
 in a section of its own so it can be read by row with O_DIRECT. The GGUF's next-n block (the last layer, BF16) is the
-drafter: `mtp/dense` and `mtp/experts`, laid out like the main sections. The vision tower and the DFly2 drafter come
-from the Hugging Face checkpoint later; meta.vision and meta.dfly2 are null until then. The Hugging Face directory
+drafter: `mtp/dense` and `mtp/experts`, laid out like the main sections. The vision tower comes as `--mmproj` (the section `vision/mmproj`, read in place by src/models/hy4flash/vision_encoder.cpp);
+the DFly2 drafter comes from the Hugging Face checkpoint later; meta.dfly2 is null until then. The Hugging Face directory
 (`--hf-dir`) supplies the LICENSE text and config.json (meta.hf_config), which carries what the GGUF omits (the MRoPE
 sections, the vision tower's geometry, the DFly2 settings).
 """
@@ -37,6 +37,8 @@ class Hy4Flash(Arch):
     not_in_dense = frozenset({ENGRAM_TENSOR})
     own_sections = {ENGRAM_TENSOR: ENGRAM_SECTION}
     side_sections = False
+    mmproj_only = True            # `--mmproj` adds llama.cpp's hy_v4_flash projector GGUF (the side file of the BF16 checkpoint) as vision/mmproj
+    projector_type = "hy_v4_flash"
     needs_hf_dir = True
     sampling_kv = {}
 

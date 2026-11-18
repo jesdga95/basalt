@@ -64,6 +64,7 @@ struct Pack {
     std::vector<ExpertLayer> experts;   ///< per layer
     core::FileRange experts_range;
     EngramInfo engram;
+    core::FileRange vision;   ///< the vision/mmproj section (empty when the pack carries none)
 
     const TensorRef* find(const std::string& n) const {
         auto it = tensors.find(n);
