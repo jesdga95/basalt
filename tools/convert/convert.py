@@ -4,6 +4,8 @@
         [--mtp-source DIR] [--mtp-dense FILE] [--draft-vocab FILE] [--name NAME] [--compat-bf16] [--no-vision] [--force]
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --sections-from BASE.basalt --out MODEL.basalt [--name NAME] [--force]
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --hf-dir HF_DIR --out MODEL.basalt [--name NAME] [--force]
+    python3 tools/convert/convert.py --gguf Hy4-flash-BF16.gguf --nvfp4 --hf-dir HF_DIR --mmproj MMPROJ.gguf [--dfly FILE] --out MODEL.basalt \\
+        [--dense-q6k] [--name NAME] [--workers N] [--force]
     python3 tools/convert/convert.py --verify PACK.basalt --gguf MODEL-00001-of-0000N.gguf
     python3 tools/convert/convert.py --dspark FILE --into PACK.basalt --undo-dir DIR
     python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] [--mtp-dense FILE] \\
@@ -21,8 +23,12 @@ Inputs
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
   --hf-dir DIR       hy_v4_flash only: the tencent/Hy4-flash directory (LICENSE and config.json are embedded, the
                      weights are not read); the pack is the GGUF's tensors as they are, with the next-n block as mtp/*
+  --nvfp4            hy4flash: the release pack from the BF16 GGUF (tools/convert/hy4flash_bf16.py): routed experts rounded
+                     to NVFP4, projections to Q8_0 (--dense-q6k: Q6_K where rows are whole blocks), the Engram table to
+                     E4M3; needs --hf-dir (its tokenizer files must equal the GGUF's); --dfly FILE adds the drafter
   --verify PACK      read PACK back against its source --gguf: every section's SHA-256, and every source tensor's
-                     bytes (type, shape and SHA-256) at the place the pack's index and layout name; writes nothing
+                     bytes (type, shape and SHA-256) at the place the pack's index and layout name; writes nothing.
+                     A pack made with --nvfp4 is checked by repeating its roundings
   --dspark FILE      deepseek41 only: the DSpark drafter GGUF, stored whole as the dspark/gguf section
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
   --mtp-dense FILE   a tuned `mtp/dense` section (raw bytes, same layout as the source; needs --mtp-source); the packs
@@ -570,6 +576,12 @@ def convert(a) -> None:
     print(f"done: {len(job.rows)} sections, {total / (1 << 30):.3f} GiB, {time.time() - job.t0:.1f} s -> {out}")
 
 
+def convert_bf16(a) -> None:
+    """--nvfp4: the hy4flash release pack from the BF16 GGUF."""
+    import hy4flash_bf16
+    hy4flash_bf16.build(a, Job, DryWriter, fingerprint, source_record, source_tensors, export_tokenizer)
+
+
 def warn_unofficial():
     msg = ("WARNING: packs converted yourself are significantly slower than the official .basalt files. "
            "Download them from https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt")
@@ -813,6 +825,9 @@ def main():
     ap.add_argument("--verify", metavar="PACK.basalt", help="read PACK back against its source --gguf and report; writes nothing")
     ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf")
     ap.add_argument("--dfly", metavar="FILE", help="hy4flash: the DFly2 drafter's safetensors (model.dfly_layers.*), stored whole as dfly")
+    ap.add_argument("--nvfp4", action="store_true",
+                    help="hy4flash: from the BF16 GGUF, the routed experts as NVFP4, projections Q8_0, the Engram table E4M3 (needs --hf-dir)")
+    ap.add_argument("--dense-q6k", action="store_true", help="with --nvfp4: the attention, shared-expert and dense FFN projections as Q6_K")
     ap.add_argument("--into", metavar="PACK.basalt", help="with --dspark or --dfly: add it to this pack, whose other sections stay as they are")
     ap.add_argument("--undo-dir", metavar="DIR", help="with --into: a new directory for what --roll-back restores")
     ap.add_argument("--roll-back", action="store_true", help="with --into and --undo-dir: restore the pack as it was")
@@ -852,13 +867,15 @@ def main():
         else:
             add_dspark(a)
         return
-    if a.dfly:
-        ap.error("--dfly takes --into and --undo-dir")
+    if a.dfly and not a.nvfp4:
+        ap.error("--dfly takes --into and --undo-dir, or --nvfp4")
+    if a.dense_q6k and not a.nvfp4:
+        ap.error("--dense-q6k needs --nvfp4")
     if a.verify:
         if not a.gguf or a.out or a.sections_from or a.checkpoint or a.dspark:
             ap.error("--verify takes --gguf and nothing else")
         import verify_pack
-        sys.exit(0 if verify_pack.verify(a.verify, a.gguf[0]) else 1)
+        sys.exit(0 if verify_pack.verify(a.verify, a.gguf[0], a.workers) else 1)
     if not a.out:
         ap.error("--out is required")
     if a.dspark and (a.checkpoint or a.requant_dense_q6k or a.sections_from):
@@ -894,6 +911,15 @@ def main():
         ap.error("--gguf is required")
     if not Path(a.gguf[0]).is_file():
         ap.error(f"missing input: {a.gguf[0]}")
+    if a.nvfp4:
+        if a.sections_from or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dspark:
+            ap.error("--nvfp4 takes --gguf, --hf-dir, --mmproj, --dfly, --dense-q6k, --name, --workers, --dry-run, --no-vision and --force")
+        if source_architecture(Path(a.gguf[0])) != "hy_v4_flash" or not a.hf_dir:
+            ap.error("--nvfp4 takes a hy_v4_flash BF16 GGUF and --hf-dir")
+        if not a.mmproj and not a.no_vision:
+            ap.error("--mmproj is required unless --no-vision")
+        convert_bf16(a)
+        return
     arch = A.for_architecture(source_architecture(Path(a.gguf[0])))
     if arch.side_sections:
         a.name = a.name or arch.default_name(a.gguf[0], {}, bool(a.sections_from))
