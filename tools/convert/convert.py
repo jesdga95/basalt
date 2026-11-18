@@ -812,7 +812,8 @@ def main():
     ap.add_argument("--hf-dir", metavar="DIR", help="hy_v4_flash: the tencent/Hy4-flash directory (LICENSE, config.json)")
     ap.add_argument("--verify", metavar="PACK.basalt", help="read PACK back against its source --gguf and report; writes nothing")
     ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf")
-    ap.add_argument("--into", metavar="PACK.basalt", help="with --dspark: add it to this pack, whose other sections stay as they are")
+    ap.add_argument("--dfly", metavar="FILE", help="hy4flash: the DFly2 drafter's safetensors (model.dfly_layers.*), stored whole as dfly")
+    ap.add_argument("--into", metavar="PACK.basalt", help="with --dspark or --dfly: add it to this pack, whose other sections stay as they are")
     ap.add_argument("--undo-dir", metavar="DIR", help="with --into: a new directory for what --roll-back restores")
     ap.add_argument("--roll-back", action="store_true", help="with --into and --undo-dir: restore the pack as it was")
     ap.add_argument("--out", help="the .basalt file to write")
@@ -843,10 +844,16 @@ def main():
                     help="with --gguf: print every section's offset and size and write nothing")
     a = ap.parse_args()
     if a.into or a.roll_back or a.undo_dir:
-        if not a.into or not a.undo_dir or bool(a.dspark) == a.roll_back or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k:
-            ap.error("--into takes --undo-dir and either --dspark or --roll-back, and nothing else")
-        add_dspark(a)
+        if not a.into or not a.undo_dir or bool(a.dspark) + bool(a.dfly) + a.roll_back != 1 or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k:
+            ap.error("--into takes --undo-dir and one of --dspark, --dfly or --roll-back, and nothing else")
+        if a.dfly:
+            from dfly_attach import add_dfly
+            add_dfly(a, source_record)
+        else:
+            add_dspark(a)
         return
+    if a.dfly:
+        ap.error("--dfly takes --into and --undo-dir")
     if a.verify:
         if not a.gguf or a.out or a.sections_from or a.checkpoint or a.dspark:
             ap.error("--verify takes --gguf and nothing else")
