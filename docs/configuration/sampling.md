@@ -21,7 +21,7 @@ Also read: `max_tokens` / `max_completion_tokens` (`0` or `-1` = the rest of the
 llama.cpp clients also work: `POST /tokenize` (`content`, `parse_special`) and `/detokenize` (`tokens`) use the model's tokenizer, `/props` reports `chat_template_caps` for the model (tool calls, parallel calls, reasoning effort,
 system role, preserve reasoning), `chat_template_kwargs.preserve_reasoning` keeps earlier turns' thinking in the prompt, and
 `reasoning_budget` is read on the chat endpoint: `0` is thinking off, `-1` is no cap at the highest effort, and N > 0 is an N-token
-budget at the level it names (up to 2048 low, up to 8192 medium, else high; DeepSeek renders medium as high, 75 of 100). When fields disagree, off from any of them wins, then
+budget at the level it names (up to 2048 low, up to 8192 medium, else high; DeepSeek renders medium as high, 75 of 100; Hy4-flash renders low and medium as high). When fields disagree, off from any of them wins, then
 `chat_template_kwargs.reasoning_effort`, then `reasoning_effort`, then the level a `reasoning_budget` implies, and last the entry's
 `reasoning-effort` (unset: the template's default). For the token
 cap, `reasoning_budget_tokens` wins over `thinking_budget_tokens`, then `reasoning_budget`, then `thinking.budget_tokens`.

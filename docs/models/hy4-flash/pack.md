@@ -1,7 +1,7 @@
 # Hy4-flash pack and converter
 
 The first pack is a test pack from the AngelSlim Q4_K_M GGUF (`general.architecture` `hy_v4_flash`, llama.cpp PR 32517 names), so
-the engine can run before the NVFP4 pack exists. The NVFP4 pack from BF16 comes after. Architecture id: `hy4flash`
+the engine can run before the NVFP4 pack exists. The NVFP4 pack from the BF16 GGUF is [below](#the-nvfp4-pack-from-the-bf16-gguf). Architecture id: `hy4flash`
 (`src/models/hy4flash`, `tools/convert/arch/hy4flash.py`).
 
 ## Source facts (gguf-py over the two shards, 1,416 tensors)
@@ -79,3 +79,26 @@ tensors are sliced by expert as deepseek41's are.
   to it for the 19 down matrices, with its parity test, before RAM-tier decode runs.
 - The F8_E4M3 Engram rows are decoded by a 256-entry table (host first, a GPU gather later); the lookup norm and everything
   after it are FP32.
+
+## The NVFP4 pack from the BF16 GGUF
+
+`convert.py --gguf Hy4-flash-BF16.gguf --nvfp4 --hf-dir REPO --mmproj MMPROJ.gguf --dfly hy4-dfly.safetensors --out P.basalt`
+(`tools/convert/hy4flash_bf16.py`). The BF16 GGUF is llama.cpp's converter run on the checkpoint: 42 blocks (no next-n block), the
+Engram tables as one BF16 tensor of 660,006,416 rows, the head as F32 holding BF16 numbers. Every rounding is deterministic and
+runs once, in pieces by worker processes (no tensor is held whole, the source's page cache is dropped behind each read).
+
+| Tensors | Pack |
+|---|---|
+| routed experts (layers 1 to 41) | NVFP4 (type 40), blobs `[gate \| up \| down]` + FP32 tail `{s_gate, s_up, s_down, 0}`: 3,981,328 B each, 83.58 GB; per matrix the tensor scale amax / (6 x 448), per 16 values the UE4M3 scale of least squared error among half to four times amax / 6 (the 27B pack's rounding) |
+| BF16 projections (attention, latent, shared expert, dense FFN, `engram_kv`, indexer, embedding) | Q8_0, ggml reference rounding: byte-identical to AngelSlim's Q8_0 tensors. `--dense-q6k`: Q6_K for `Q6K_TARGETS` with whole 256-value rows (attention q, gate, output, kv_a, shared expert, latent projections, dense FFN), the rest Q8_0 |
+| head | BF16 (the F32 values are BF16 numbers; checked) |
+| norms, hc, router, biases | F32 as stored |
+| Engram table | E4M3 codes (type 43), to nearest, ties to even, no scale; the exact fraction and RMS error go to `meta.quantized_from.engram` and the log |
+| tokenizer, template | the GGUF's, refused unless ids, merges, special ids and chat template equal `--hf-dir`'s `tokenizer.json`, `tokenizer_config.json` and `chat_template.jinja` |
+| `vision/mmproj`, `dfly` | the side files, whole (`meta.dfly2` as `--dfly --into` writes it) |
+
+`general.architecture` is `hy4flash`; the other keys keep the GGUF's `hy_v4_flash.` prefix, which the engine reads. Size: 158.7 GB
+(experts 83.58, Engram 63.36, dense 7.45 + 0.97, mmproj 1.04, DFly 1.69).
+
+`--verify P.basalt --gguf Hy4-flash-BF16.gguf` checks every section's SHA-256 and repeats each rounding against the BF16 GGUF,
+comparing the bytes (it takes as long as the build). Tests: `tools/convert/test_convert_hy4flash_bf16.py`.

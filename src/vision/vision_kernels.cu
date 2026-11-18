@@ -253,6 +253,82 @@ __global__ void bias_copy_k(const float* g, const float* bias, float* y, size_t 
     if (i < total) y[i] = g[i] + bias[i % cols];
 }
 
+__device__ __forceinline__ float gelu_erf(float x) { return 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f)); }
+
+// Hy4: bilinear taps along one axis of an S-entry table, align_corners false, with the reference's scale factor
+// (size + 0.1) / S: source = (i + 0.5) / scale_factor - 0.5, clamped at 0 (torch's upsample_bilinear2d)
+// An axis whose output size is the table's is copied (torch's special case; inv_scale 0).
+__device__ __forceinline__ void interp_taps(float inv_scale, int S, int i, int& i0, int& i1, float& d) {
+    if (inv_scale == 0.0f) { i0 = i1 = i; d = 0.0f; return; }
+    const float src = fmaxf(inv_scale * ((float) i + 0.5f) - 0.5f, 0.0f);
+    const int a = min((int) floorf(src), S - 1);
+    i0 = a;
+    i1 = a + (a < S - 1 ? 1 : 0);
+    d = fminf(fmaxf(src - (float) a, 0.0f), 1.0f);
+}
+
+__global__ void embed_finish_interp_k(float* x, const float* bias, const float* pos, int gx, int S, float inv_sx, float inv_sy) {
+    const int t = blockIdx.x;
+    int py, px, x0, x1, y0, y1;
+    float dx, dy;
+    patch_pos(t, gx, py, px);
+    interp_taps(inv_sx, S, px, x0, x1, dx);
+    interp_taps(inv_sy, S, py, y0, y1, dy);
+    for (int c = threadIdx.x; c < E; c += blockDim.x) {
+        const float a = pos[((size_t) y0 * S + x0) * E + c], b = pos[((size_t) y0 * S + x1) * E + c],
+                    cc = pos[((size_t) y1 * S + x0) * E + c], d = pos[((size_t) y1 * S + x1) * E + c];
+        const float pe = (1 - dy) * ((1 - dx) * a + dx * b) + dy * ((1 - dx) * cc + dx * d);
+        x[(size_t) t * E + c] += bias[c] + pe;
+    }
+}
+
+// the split of the plain qkv product (no rotation): bias, then the fp16 head-major q, k, v
+__global__ void qkv_plain_k(const float* g, const float* bias, __half* q, __half* k, __half* v, int n) {
+    const int t = blockIdx.x;
+    const float* r = g + (size_t) t * 3 * E;
+    for (int i = threadIdx.x; i < H * D; i += blockDim.x) {
+        const int hd = i / D, d = i % D;
+        const size_t o = ((size_t) hd * n + t) * DP + d;
+        q[o] = __float2half_rn(r[i] + bias[i]);
+        k[o] = __float2half_rn(r[E + i] + bias[E + i]);
+        v[o] = __float2half_rn(r[2 * E + i] + bias[2 * E + i]);
+    }
+}
+
+// one warp a row: y = x / sqrt(mean(x^2) + eps) * w, as bf16
+__global__ void rmsnorm_k(const float* x, const float* w, __nv_bfloat16* y, int n, float eps) {
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (row >= n) return;
+    const float* xr = x + (size_t) row * E;
+    float v[36];
+    float q = 0;
+#pragma unroll
+    for (int i = 0; i < 36; ++i) { v[i] = xr[i * 32 + lane]; q += v[i] * v[i]; }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(0xffffffffu, q, o);
+    const float inv = 1.0f / sqrtf(q / E + eps);
+#pragma unroll
+    for (int i = 0; i < 36; ++i) {
+        const int c = i * 32 + lane;
+        y[(size_t) row * E + c] = __float2bfloat16_rn(v[i] * inv * w[c]);
+    }
+}
+
+__global__ void bias_gelu_erf_k(const float* g, const float* bias, __nv_bfloat16* y, size_t total, int cols) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) y[i] = __float2bfloat16_rn(gelu_erf(g[i] + bias[i % cols]));
+}
+
+// m merged rows g[m][cols] + bias as lines of `ow` rows, each followed by the newline row: y[m + m / ow][cols]
+__global__ void bias_copy_lines_k(const float* g, const float* bias, const float* newline, float* y, size_t total, int cols, int ow) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const size_t r = i / cols;
+    const int c = (int) (i % cols);
+    const size_t line = r / (ow + 1), col = r % (ow + 1);
+    y[i] = col == (size_t) ow ? newline[c] : g[(line * ow + col) * cols + c] + bias[c];
+}
+
 inline unsigned blocks(size_t total, int per) { return (unsigned) ((total + per - 1) / per); }
 
 }  // namespace
@@ -280,6 +356,27 @@ void launch_bias_gelu(const float* g, const float* bias, __nv_bfloat16* y, int n
 }
 void launch_bias_copy(const float* g, const float* bias, float* y, int n, int cols, cudaStream_t s) {
     bias_copy_k<<<blocks((size_t) n * cols, 256), 256, 0, s>>>(g, bias, y, (size_t) n * cols, cols);
+}
+
+void launch_embed_finish_interp(float* x, const float* bias, const float* pos_table, int n, int gx, int gy, int table_edge,
+                                cudaStream_t s) {
+    const float isx = gx == table_edge ? 0.0f : (float) (1.0 / (((double) gx + 0.1) / table_edge)),
+                isy = gy == table_edge ? 0.0f : (float) (1.0 / (((double) gy + 0.1) / table_edge));
+    embed_finish_interp_k<<<n, 128, 0, s>>>(x, bias, pos_table, gx, table_edge, isx, isy);
+}
+void launch_qkv_plain(const float* g, const float* bias, __half* q, __half* k, __half* v, int n, cudaStream_t s) {
+    qkv_plain_k<<<n, 256, 0, s>>>(g, bias, q, k, v, n);
+}
+void launch_rmsnorm(const float* x, const float* w, __nv_bfloat16* y, int n, float eps, cudaStream_t s) {
+    rmsnorm_k<<<blocks(n, 4), 128, 0, s>>>(x, w, y, n, eps);
+}
+void launch_bias_gelu_erf(const float* g, const float* bias, __nv_bfloat16* y, int n, int cols, cudaStream_t s) {
+    bias_gelu_erf_k<<<blocks((size_t) n * cols, 256), 256, 0, s>>>(g, bias, y, (size_t) n * cols, cols);
+}
+void launch_bias_copy_lines(const float* g, const float* bias, const float* newline, float* y, int m, int cols, int ow,
+                            cudaStream_t s) {
+    const size_t rows = (size_t) m + (size_t) (m / ow);
+    bias_copy_lines_k<<<blocks(rows * cols, 256), 256, 0, s>>>(g, bias, newline, y, rows * cols, cols, ow);
 }
 
 }  // namespace basalt::vision

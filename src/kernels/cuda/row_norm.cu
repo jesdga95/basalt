@@ -1,4 +1,4 @@
-// DeepSeek-V4.1 row norms: a weighted RMSNorm over one fp32 row per block, and the same norm fused behind the
+// Row norms: a weighted RMSNorm over one fp32 row per block, and the same norm fused behind the
 // hyper-connection collapse (hc_pre), so the collapsed row never makes a round trip through memory before it is
 // normalised.
 #include "basalt/kernels/row_norm.hpp"
@@ -103,7 +103,7 @@ hc_pre_rms_norm_kernel(const float* __restrict__ x, const float* __restrict__ pr
 }
 
 void check_geometry(int n) {
-    if (n % 4 || n > 4 * kMaxVec * kThreads) throw std::invalid_argument("deepseek41 norm: unsupported width");
+    if (n % 4 || n > 4 * kMaxVec * kThreads) throw std::invalid_argument("row norm: unsupported width");
 }
 
 }  // namespace

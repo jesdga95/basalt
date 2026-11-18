@@ -3,6 +3,7 @@
 #include "models/hy4flash/adapter.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/program/options.hpp"
 #include "models/hy4flash/dfly.hpp"   // DFLY HOOK
@@ -41,22 +42,37 @@ public:
         return f;
     }
 
-    // DFLY HOOK: --spec and its companions, as DeepSeek's
-    bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
-        (void) code;
-        return dfly_parse_flag(a, args, o);
-    }
-    std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        dfly_finish_flags(o);
-        return std::nullopt;
-    }
-
     PreTokenizer pretokenizer() const override { return {"hy_v4", pretok_hy4}; }
     int max_expert_cards() const override { return kMaxSecondCards; }
     const char* model_name() const override { return "Hy4-flash"; }
 
-    // the end-of-turn token is read from the pack's vocabulary (<hy_end> is 120025)
-    model::TokenNames token_names() const override { return {{"<hy_end>"}, "<hy_User>", "", "", ""}; }
+    // --kv (the sparse layers' latent rows, bf16 by default or fp8) and, DFLY HOOK, --spec and its companions as DeepSeek's
+    bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
+        if (a == "--diag-rows") {
+            o.diag_rows = std::atoi(args.next("--diag-rows"));
+            return true;
+        }
+        if (a == "--kv") {
+            o.kv = args.next("--kv");
+            return true;
+        }
+        return dfly_parse_flag(a, args, o);
+    }
+
+    std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        if (!o.kv.empty() && o.kv != "bf16" && o.kv != "fp8" && o.kv != "f32") {
+            basalt::log::error("basalt hy4flash", "--kv %s: the latent caches are bf16 (the default) or fp8", o.kv.c_str());
+            return 2;
+        }
+        dfly_finish_flags(o);
+        return std::nullopt;
+    }
+
+    // The pack's own special tokens, by name: their suffix differs between the packs (the test pack's GGUF carries a hash, the
+    // release `opensource`), so the names take a `*`. <hy_end> ends a reply, <hy_start> opens a turn.
+    model::TokenNames token_names() const override {
+        return {{"<\xef\xbd\x9c" "hy_end:*\xef\xbd\x9c>"}, "<\xef\xbd\x9c" "hy_start:*\xef\xbd\x9c>", "", "", ""};
+    }
 
 private:
     const char* name_;

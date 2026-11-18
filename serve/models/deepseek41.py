@@ -57,17 +57,6 @@ class DeepseekTemplate:
         return text
 
 
-def _hold(text: str, tags: tuple[str, ...]) -> int:
-    """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
-    best = 0
-    for tag in tags:
-        for n in range(len(tag) - 1, best, -1):
-            if text.endswith(tag[:n]):
-                best = n
-                break
-    return best
-
-
 def _value(text: str, is_string: bool):
     if is_string:
         return text
@@ -117,7 +106,7 @@ class DeepseekParser:
                 out.append(Event("reasoning", text))
             self.buf, self.state = self.buf[calls + len(CALLS_START):], "call"
             return True
-        keep = _hold(self.buf, (THINK_END, CALLS_GAP + CALLS_START, CALLS_START))
+        keep = frontend.hold_back(self.buf, (THINK_END, CALLS_GAP + CALLS_START, CALLS_START))
         if len(self.buf) > keep:
             out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
             self.buf = self.buf[len(self.buf) - keep:]
@@ -131,7 +120,7 @@ class DeepseekParser:
                 out.append(Event("content", text))
             self.buf, self.state = self.buf[calls + len(CALLS_START):], "call"
             return True
-        keep = _hold(self.buf, (CALLS_GAP + CALLS_START, CALLS_START))
+        keep = frontend.hold_back(self.buf, (CALLS_GAP + CALLS_START, CALLS_START))
         if len(self.buf) > keep:
             out.append(Event("content", self.buf[:len(self.buf) - keep]))
             self.buf = self.buf[len(self.buf) - keep:]
@@ -188,7 +177,7 @@ class DeepseekParser:
                 self._args(out, json.dumps(self.args[self.pname], ensure_ascii=False))
             self.buf, self.sub = self.buf[end + len(PARAM_END):], "invoke"
             return True
-        keep = _hold(self.buf, (PARAM_END,))
+        keep = frontend.hold_back(self.buf, (PARAM_END,))
         text, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
         self.pvalue += text
         if self.pstring:

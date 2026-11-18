@@ -11,6 +11,7 @@ class Dialect:
     reasoning_close = ""                    # closes thinking the model left open, or that reached its budget or repeats one token
     forced_call_ends_reply = False          # a named tool_choice ends the reply after its one call
     nothink_lead = ""                       # text between a no-thinking prompt and a forced call's opening
+    call_newlines = 2                       # newlines the model writes between its thinking and a call
     image_pad = "<|image_pad|>"             # the prompt token that stands for one row of an image's embeddings
     image_start = "<|vision_start|>"        # the token an image's pad run follows ("" : every pad is an image row)
     video_pad = ""                          # the prompt token for one row of a video group ("": the model reads no video)
@@ -66,6 +67,9 @@ def dialect_for(arch: str | None) -> Dialect:
     if arch == "deepseek41":
         from serve.models.deepseek41 import DeepSeek41
         return DeepSeek41()
+    if arch in ("hy4flash", "hy_v4_flash"):
+        from serve.models.hy4flash import Hy4Flash
+        return Hy4Flash()
     if arch in ("qwen4exp", "qwen35", None):
         from serve.models.qwen import Qwen
         return Qwen()

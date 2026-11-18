@@ -3,6 +3,7 @@
 // the best pools.
 #include "basalt/models/hy4flash/kernels.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -26,9 +27,19 @@ __device__ __forceinline__ void rot_pair(float* row, int i, int n_rot, float bas
     row[2 * i + 1] = x0 * s + x1 * c;
 }
 
+// The position pair i of the rotated part of the row at cell `cell` turns by (see MlaArgs::cell_rope).
+template <typename A>
+__device__ __forceinline__ int axis_pos(const A& a, int cell, int i) {
+    if (a.cell_rope == nullptr) return cell;
+    const int32_t* p = a.cell_rope + (size_t) cell * 3;
+    if (i % 3 == 1 && i < 3 * a.sec_h) return p[1];
+    if (i % 3 == 2 && i < 3 * a.sec_w) return p[2];
+    return p[0];
+}
+
 // One block of `dim` threads: the pooled key of a group.
 __global__ void pool_kernel(const float* __restrict__ values, const float* __restrict__ gates, const float* __restrict__ ape,
-                            const float* __restrict__ norm_w, IndexerArgs a, int ring, int first_pos, float* __restrict__ pooled) {
+                            const float* __restrict__ norm_w, IndexerArgs a, int ring, int first_pos, __half* __restrict__ pooled) {
     __shared__ float row[128];
     __shared__ float red[4];
     const int d = threadIdx.x;
@@ -54,18 +65,18 @@ __global__ void pool_kernel(const float* __restrict__ values, const float* __res
     ss = red[0] + red[1] + red[2] + red[3];
     row[d] = acc * rsqrtf(ss / (float) a.dim + a.eps) * norm_w[d];
     __syncthreads();
-    if (d < a.rope / 2) rot_pair(row + a.dim - a.rope, d, a.rope, a.rope_base, group_pos);
+    if (d < a.rope / 2) rot_pair(row + a.dim - a.rope, d, a.rope, a.rope_base, axis_pos(a, group_pos, d));
     __syncthreads();
-    pooled[(size_t) (group_pos / a.pool) * a.dim + d] = row[d];
+    pooled[(size_t) (group_pos / a.pool) * a.dim + d] = __float2half_rn(row[d]);
 }
 
 __global__ void rope_heads_kernel(float* __restrict__ q, IndexerArgs a, int pos0) {
     const int h = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
-    if (i < a.rope / 2) rot_pair(q + ((size_t) t * a.heads + h) * a.dim + a.dim - a.rope, i, a.rope, a.rope_base, pos0 + t);
+    if (i < a.rope / 2) rot_pair(q + ((size_t) t * a.heads + h) * a.dim + a.dim - a.rope, i, a.rope, a.rope_base, axis_pos(a, pos0 + t, i));
 }
 
 // A thread per pooled key.
-__global__ void scores_kernel(const float* __restrict__ q, const float* __restrict__ w, const float* __restrict__ pooled,
+__global__ void scores_kernel(const float* __restrict__ q, const float* __restrict__ w, const __half* __restrict__ pooled,
                               int n_pool, IndexerArgs a, float* __restrict__ scores) {
     extern __shared__ float qs[];   // [heads][dim] and [heads]
     for (int i = threadIdx.x; i < a.heads * a.dim; i += blockDim.x) qs[i] = q[i];
@@ -73,14 +84,14 @@ __global__ void scores_kernel(const float* __restrict__ q, const float* __restri
     __syncthreads();
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n_pool) return;
-    const float4* k = reinterpret_cast<const float4*>(pooled + (size_t) p * a.dim);
+    const __half2* k = reinterpret_cast<const __half2*>(pooled + (size_t) p * a.dim);
     float total = 0.f;
     for (int h = 0; h < a.heads; ++h) {
-        const float4* qh = reinterpret_cast<const float4*>(qs + (size_t) h * a.dim);
+        const float2* qh = reinterpret_cast<const float2*>(qs + (size_t) h * a.dim);
         float dot = 0.f;
-        for (int i = 0; i < a.dim / 4; ++i) {
-            const float4 kv = k[i], qv = qh[i];
-            dot = fmaf(qv.x, kv.x, dot); dot = fmaf(qv.y, kv.y, dot); dot = fmaf(qv.z, kv.z, dot); dot = fmaf(qv.w, kv.w, dot);
+        for (int i = 0; i < a.dim / 2; ++i) {
+            const float2 kv = __half22float2(k[i]), qv = qh[i];
+            dot = fmaf(qv.x, kv.x, dot); dot = fmaf(qv.y, kv.y, dot);
         }
         total = fmaf(qs[a.heads * a.dim + h], fmaxf(dot, 0.f), total);
     }
@@ -173,9 +184,9 @@ __global__ void select_kernel(const float* __restrict__ scores, int n, int k, in
 }  // namespace
 
 void idx_pool(const float* values, const float* gates, const float* ape, const float* norm_w, const IndexerArgs& a, int ring,
-              int first_pos, int n_groups, float* pooled, void* stream) {
+              int first_pos, int n_groups, uint16_t* pooled, void* stream) {
     if (a.dim != 128 || a.pool > 8 || ring % a.pool || first_pos % a.pool) throw std::invalid_argument("idx_pool: geometry");
-    if (n_groups > 0) pool_kernel<<<n_groups, a.dim, 0, (cudaStream_t) stream>>>(values, gates, ape, norm_w, a, ring, first_pos, pooled);
+    if (n_groups > 0) pool_kernel<<<n_groups, a.dim, 0, (cudaStream_t) stream>>>(values, gates, ape, norm_w, a, ring, first_pos, reinterpret_cast<__half*>(pooled));
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
@@ -184,10 +195,10 @@ void idx_rope_heads(float* q, const IndexerArgs& a, int pos0, int n_tok, void* s
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
-void idx_scores(const float* q, const float* w, const float* pooled, int n_pool, const IndexerArgs& a, float* scores,
+void idx_scores(const float* q, const float* w, const uint16_t* pooled, int n_pool, const IndexerArgs& a, float* scores,
                 void* stream) {
     const size_t smem = ((size_t) a.heads * a.dim + a.heads) * sizeof(float);
-    scores_kernel<<<(n_pool + 127) / 128, 128, smem, (cudaStream_t) stream>>>(q, w, pooled, n_pool, a, scores);
+    scores_kernel<<<(n_pool + 127) / 128, 128, smem, (cudaStream_t) stream>>>(q, w, reinterpret_cast<const __half*>(pooled), n_pool, a, scores);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

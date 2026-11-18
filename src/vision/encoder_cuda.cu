@@ -6,10 +6,12 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 
+#include "hy4_weights.hpp"
 #include "vision_kernels.cuh"
 
 namespace basalt::vision {
@@ -60,6 +62,9 @@ constexpr int E = 1152, F = 4304, H = 16, D = 72, DP = 80;
 constexpr size_t kAlign = 256;
 // the product library's scratch: a fixed size, so the algorithm choice never depends on where the arena sits
 constexpr size_t kBlasWorkspace = 32u << 20;
+// merged rows of room beyond a picture's tokens for the newline rows of its lines (a picture 200 times as wide as it is tall
+// at most, 4096 merged tokens: 905 lines)
+constexpr size_t kNewlineRows = 1024;
 
 size_t up(size_t n) { return (n + kAlign - 1) / kAlign * kAlign; }
 
@@ -76,6 +81,10 @@ struct CudaEncoder::Impl {
     };
     int layers = 0, proj = 0, nmax = 0;
     float eps = 1e-6f;
+    // A SigLIP2-derived tower (projector hy_v4_flash): one patch tap, an edge x edge position table resampled per grid, no rotation,
+    // an RMS norm then a 2x2 merge product with an erf GELU, and a newline row after each merged row
+    bool hy4 = false;
+    int edge = 48;
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
     std::string err;
@@ -83,13 +92,13 @@ struct CudaEncoder::Impl {
     uint8_t* image = nullptr;
     bool image_pinned = false;
     size_t wbytes = 0;
-    size_t o_wpatch = 0, o_wpatch2 = 0, o_bpatch = 0, o_pos = 0, o_postw = 0, o_postb = 0, o_bm0 = 0, o_bm2 = 0, o_wm0 = 0, o_wm2 = 0;
+    size_t o_wpatch = 0, o_wpatch2 = 0, o_bpatch = 0, o_pos = 0, o_postw = 0, o_postb = 0, o_bm0 = 0, o_bm2 = 0, o_wm0 = 0, o_wm2 = 0, o_newline = 0;
     std::vector<LayerOff> LO;
     // placement
     uint8_t* arena = nullptr;
     size_t arena_size = 0;
     std::vector<Layer> L;
-    float *wpatch = nullptr, *wpatch2 = nullptr, *bpatch = nullptr, *pos = nullptr, *postw = nullptr, *postb = nullptr, *bm0 = nullptr, *bm2 = nullptr;
+    float *wpatch = nullptr, *wpatch2 = nullptr, *bpatch = nullptr, *pos = nullptr, *postw = nullptr, *postb = nullptr, *bm0 = nullptr, *bm2 = nullptr, *newline = nullptr;
     __nv_bfloat16 *wm0 = nullptr, *wm2 = nullptr;
     // work buffers (nmax patches)
     float *d_patches = nullptr, *x = nullptr, *g = nullptr, *rope = nullptr, *d_out = nullptr;
@@ -117,7 +126,7 @@ struct CudaEncoder::Impl {
     Work work(size_t N) const {
         return {up(N * 768 * 4), up(N * E * 4), up(N * F * 4), up(N * F * 2), up(N * 36 * 2 * 4),
                 up((size_t) H * N * DP * 2), up((size_t) H * N * DP * 2), up((size_t) H * N * DP * 2),
-                up(N / 4 * (size_t) proj * 4), kBlasWorkspace};
+                up((N / 4 + (hy4 ? kNewlineRows : 0)) * (size_t) proj * 4), kBlasWorkspace};
     }
 
     // Y[M][N] = X[M][K] . W[N][K]^T
@@ -150,17 +159,28 @@ struct CudaEncoder::Impl {
             e = "unexpected projector hyper-parameters";
             return false;
         }
+        hy4 = m.projector() == "hy_v4_flash";
+        if (hy4) {
+            const TensorRef* pt = m.find("v.position_embd.weight");
+            const int64_t rows = pt && pt->ne.size() == 2 && pt->ne[0] == E ? pt->ne[1] : 0;
+            edge = (int) std::lround(std::sqrt((double) rows));
+            if (edge < 2 || (int64_t) edge * edge != rows) {
+                e = "the position table of the projector is not a square grid";
+                return false;
+            }
+        }
         layers = h.layers;
         proj = h.proj;
         eps = h.eps;
         size_t cur = 0;
         auto take = [&](size_t bytes) { const size_t o = cur; cur += up(bytes); return o; };
         o_wpatch = take((size_t) E * 768 * 4);
-        o_wpatch2 = take((size_t) E * 1536 * 4);
+        o_wpatch2 = take(hy4 ? 0 : (size_t) E * 1536 * 4);
         o_bpatch = take((size_t) E * 4);
-        o_pos = take((size_t) E * 2304 * 4);
+        o_pos = take((size_t) E * (hy4 ? (size_t) edge * edge : 2304) * 4);
         o_postw = take((size_t) E * 4);
-        o_postb = take((size_t) E * 4);
+        o_postb = take(hy4 ? 0 : (size_t) E * 4);
+        o_newline = take(hy4 ? (size_t) proj * 4 : 0);
         o_bm0 = take((size_t) 4 * E * 4);
         o_bm2 = take((size_t) proj * 4);
         o_wm0 = take((size_t) 4 * E * 4 * E * 2);
@@ -192,7 +212,10 @@ struct CudaEncoder::Impl {
         };
         auto f32 = [&](size_t off, const std::string& n, int64_t c) { put(off, n, 0, c, 4); };
         auto b16 = [&](size_t off, const std::string& n, int64_t c) { put(off, n, 30, c, 2); };
-        {
+        if (hy4) {
+            f32(o_wpatch, "v.patch_embd.weight", (int64_t) E * 768);
+            f32(o_newline, "v.image_newline", proj);
+        } else {
             const auto* w0 = m.need("v.patch_embd.weight", 0, (int64_t) E * 768, er);
             const auto* w1 = m.need("v.patch_embd.weight.1", 0, (int64_t) E * 768, er);
             if (w0 && w1) {
@@ -208,21 +231,39 @@ struct CudaEncoder::Impl {
             } else ok = false;
         }
         f32(o_bpatch, "v.patch_embd.bias", E);
-        f32(o_pos, "v.position_embd.weight", (int64_t) E * 2304);
-        f32(o_postw, "v.post_ln.weight", E);
-        f32(o_postb, "v.post_ln.bias", E);
+        f32(o_pos, "v.position_embd.weight", hy4 ? (int64_t) E * edge * edge : (int64_t) E * 2304);
+        if (hy4) {
+            f32(o_postw, "mm.pre_norm.weight", E);
+        } else {
+            f32(o_postw, "v.post_ln.weight", E);
+            f32(o_postb, "v.post_ln.bias", E);
+        }
         f32(o_bm0, "mm.0.bias", 4 * E);
         f32(o_bm2, "mm.2.bias", proj);
-        b16(o_wm0, "mm.0.weight", (int64_t) 4 * E * 4 * E);
-        b16(o_wm2, "mm.2.weight", (int64_t) 4 * E * proj);
+        if (hy4) {   // F32 convolutions in the file: the merge product's columns in merge order, bf16
+            if (!hy4::merge_matrix(m, E, (uint16_t*) (image + o_wm0), er) || !hy4::out_matrix(m, E, proj, (uint16_t*) (image + o_wm2), er)) ok = false;
+        } else {
+            b16(o_wm0, "mm.0.weight", (int64_t) 4 * E * 4 * E);
+            b16(o_wm2, "mm.2.weight", (int64_t) 4 * E * proj);
+        }
         for (int l = 0; ok && l < layers; ++l) {
             const std::string p = "v.blk." + std::to_string(l) + ".";
             const LayerOff& y = LO[l];
             f32(y.ln1w, p + "ln1.weight", E); f32(y.ln1b, p + "ln1.bias", E);
             f32(y.ln2w, p + "ln2.weight", E); f32(y.ln2b, p + "ln2.bias", E);
-            f32(y.bqkv, p + "attn_qkv.bias", 3 * E); f32(y.bo, p + "attn_out.bias", E);
+            f32(y.bo, p + "attn_out.bias", E);
             f32(y.bup, p + "ffn_up.bias", F); f32(y.bdown, p + "ffn_down.bias", E);
-            b16(y.wqkv, p + "attn_qkv.weight", (int64_t) 3 * E * E); b16(y.wo, p + "attn_out.weight", (int64_t) E * E);
+            if (hy4) {   // q, k and v are three tensors in the file, one product here
+                static const char* const qkv[3] = {"attn_q", "attn_k", "attn_v"};
+                for (int i = 0; i < 3; ++i) {
+                    f32(y.bqkv + (size_t) i * E * 4, p + qkv[i] + ".bias", E);
+                    b16(y.wqkv + (size_t) i * E * E * 2, p + qkv[i] + ".weight", (int64_t) E * E);
+                }
+            } else {
+                f32(y.bqkv, p + "attn_qkv.bias", 3 * E);
+                b16(y.wqkv, p + "attn_qkv.weight", (int64_t) 3 * E * E);
+            }
+            b16(y.wo, p + "attn_out.weight", (int64_t) E * E);
             b16(y.wup, p + "ffn_up.weight", (int64_t) F * E); b16(y.wdown, p + "ffn_down.weight", (int64_t) E * F);
         }
         if (!ok) { e = er; release_image(); return false; }
@@ -241,7 +282,7 @@ struct CudaEncoder::Impl {
         arena_size = bytes;
         auto at = [&](size_t off) { return arena + off; };
         wpatch = (float*) at(o_wpatch); wpatch2 = (float*) at(o_wpatch2); bpatch = (float*) at(o_bpatch); pos = (float*) at(o_pos);
-        postw = (float*) at(o_postw); postb = (float*) at(o_postb); bm0 = (float*) at(o_bm0); bm2 = (float*) at(o_bm2);
+        postw = (float*) at(o_postw); postb = (float*) at(o_postb); newline = (float*) at(o_newline); bm0 = (float*) at(o_bm0); bm2 = (float*) at(o_bm2);
         wm0 = (__nv_bfloat16*) at(o_wm0); wm2 = (__nv_bfloat16*) at(o_wm2);
         L.resize(layers);
         for (int l = 0; l < layers; ++l) {
@@ -290,8 +331,12 @@ struct CudaEncoder::Impl {
 
     bool run(const std::vector<float>& patches, Size canvas, std::vector<float>& out, const TapFn& tap) {
         const int gx = canvas.w / 16, gy = canvas.h / 16, n = gx * gy, m = n / 4;
-        const bool pair = (int64_t) patches.size() == (int64_t) n * 1536;   // a video group: the two taps apart
-        if (n % 4 != 0 || n > nmax || (!pair && (int) patches.size() != n * 768)) { fail("image outside the sized range"); return false; }
+        const bool pair = !hy4 && (int64_t) patches.size() == (int64_t) n * 1536;   // a video group: the two taps apart
+        const int ow = gx / 2, out_rows = hy4 ? m + m / std::max(ow, 1) : m;
+        if (n % 4 != 0 || n > nmax || (!pair && (int) patches.size() != n * 768) || (hy4 && (gx % 2 || out_rows > nmax / 4 + (int) kNewlineRows))) {
+            fail("image outside the sized range");
+            return false;
+        }
         auto host_tap = [&](const std::string& name, const void* dev, size_t count, bool bf) -> bool {
             if (!tap) return true;
             CK(cudaStreamSynchronize(stream));
@@ -309,15 +354,17 @@ struct CudaEncoder::Impl {
         float* in = pair ? g : d_patches;
         CK(cudaMemcpyAsync(in, patches.data(), patches.size() * 4, cudaMemcpyHostToDevice, stream));
         if (!gemm_f32(in, pair ? wpatch2 : wpatch, x, n, E, pair ? 1536 : 768)) return false;
-        launch_embed_finish(x, bpatch, pos, n, gx, gy, stream);
-        launch_rope_table(rope, n, gx, stream);
+        if (hy4) launch_embed_finish_interp(x, bpatch, pos, n, gx, gy, edge, stream);
+        else launch_embed_finish(x, bpatch, pos, n, gx, gy, stream);
+        if (!hy4) launch_rope_table(rope, n, gx, stream);
         if (!host_tap("embed", x, (size_t) n * E, false)) return false;
         const float scale_log2 = (1.0f / sqrtf((float) D)) * 1.4426950408889634f;
         for (int l = 0; l < layers; ++l) {
             const Layer& y = L[l];
             launch_layernorm(x, y.ln1w, y.ln1b, act, n, eps, stream);
             if (!gemm_bf16(act, y.wqkv, g, n, 3 * E, E)) return false;
-            launch_qkv_epilogue(g, y.bqkv, rope, qh, kh, vh, n, stream);
+            if (hy4) launch_qkv_plain(g, y.bqkv, qh, kh, vh, n, stream);
+            else launch_qkv_epilogue(g, y.bqkv, rope, qh, kh, vh, n, stream);
             launch_attention(qh, kh, vh, act, n, scale_log2, stream);
             if (!gemm_bf16(act, y.wo, g, n, E, E)) return false;
             launch_bias_residual(x, g, y.bo, n, E, stream);
@@ -329,13 +376,16 @@ struct CudaEncoder::Impl {
             launch_bias_residual(x, g, y.bdown, n, E, stream);
             if (!host_tap("layer_out." + std::to_string(l), x, (size_t) n * E, false)) return false;
         }
-        launch_layernorm(x, postw, postb, act, n, eps, stream);
+        if (hy4) launch_rmsnorm(x, postw, act, n, eps, stream);
+        else launch_layernorm(x, postw, postb, act, n, eps, stream);
         if (!host_tap("post_ln", act, (size_t) n * E, true)) return false;
         if (!gemm_bf16(act, wm0, g, m, 4 * E, 4 * E)) return false;
-        launch_bias_gelu(g, bm0, act, m, 4 * E, stream);
+        if (hy4) launch_bias_gelu_erf(g, bm0, act, m, 4 * E, stream);
+        else launch_bias_gelu(g, bm0, act, m, 4 * E, stream);
         if (!gemm_bf16(act, wm2, g, m, proj, 4 * E)) return false;
-        launch_bias_copy(g, bm2, d_out, m, proj, stream);
-        out.resize((size_t) m * proj);
+        if (hy4) launch_bias_copy_lines(g, bm2, newline, d_out, m, proj, ow, stream);
+        else launch_bias_copy(g, bm2, d_out, m, proj, stream);
+        out.resize((size_t) out_rows * proj);
         CK(cudaMemcpyAsync(out.data(), d_out, out.size() * 4, cudaMemcpyDeviceToHost, stream));
         CK(cudaStreamSynchronize(stream));
         CK(cudaGetLastError());
