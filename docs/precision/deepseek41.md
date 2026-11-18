@@ -134,21 +134,33 @@ picked automatically, and declared lossy: the start warns, `--serve` reports it 
 batched prompt path routes unbiased.
 
 Its speed comes from fewer misses, so it grows with the share of experts no GPU holds, and so does the error. UD-IQ1_M
-on one 32 GB card (243 GB pack, 123 GiB RAM tier, 475 W), decode of the conv fixture: step time is tokens/s over tokens
-per step, so drafting luck cancels; the tier shares are the run's own `TIER` line.
+on one 32 GB card (243 GB pack, 123 GiB RAM tier, 475 W): step time is tokens/s over tokens per step from the conv
+fixture, so drafting luck cancels; the tier shares are the run's own `TIER` line; quality is the gate at 100 chunks
+against the BF16 base (2.7314 PPL there).
 
 | `--route-prior` | picks in VRAM | bus copy / CPU picks | step time | PPL | KLD | same top-1 |
 |---|---:|---:|---:|---:|---:|---:|
-| off | 69.8-70.9% | 11.6-11.8% / 17.5-18.4% | 31.9-34.3 ms | 2.4757 | 0.2555 | 86.96% |
-| 0.1 | 81.0-81.2% | 6.9-7.2% / 11.8-11.9% | 24.0-24.8 ms | 2.4950 | 0.2630 | 86.65% |
-| 0.25 | 86.3% | 4.9% / 8.9% | 24.1 ms | 2.5749 | 0.2879 | 86.49% |
-| 0.5 (bare) | 91.2% | 2.9% / 6.0% | 18.8 ms | 2.8027 | 0.3646 | 83.88% |
+| off | 69.8-70.9% | 11.6-11.8% / 17.5-18.4% | 31.9-34.3 ms | 3.0507 | 0.2800 | 83.77% |
+| 0.1 | 81.0-81.2% | 6.9-7.2% / 11.8-11.9% | 24.0-24.8 ms | 3.0595 | 0.2847 | 83.68% |
+| 0.25 | 86.3% | 4.9% / 8.9% | 24.1 ms | 3.1515 | 0.3082 | 83.24% |
+| 0.5 (bare default) | 91.2% | 2.9% / 6.0% | 18.8 ms | 3.4108 | 0.3787 | 81.03% |
 
-Quality gate: 20 chunks (the quick check), against the BF16 base (2.2717 PPL on those chunks). The pack's own
-quantization costs 0.2555 KLD there, so 0.1 adds 3% to it for a quarter of the decode time; 0.25 is dominated by 0.1
-(the same step time, four times the error); the bare 0.5 costs 43% of the pack's own KLD and three points of top-1.
+The pack's own quantization costs 0.2800 KLD and its published row reads 0.2779 and 83.88%, so this build is 0.002 worse
+than that measurement. Against that, 0.1 adds 0.0047 KLD (1.7% of the pack's own error, about three quarters of what
+the Q6_K dense projections cost) and 0.09 top-1 points for a quarter of the decode time. 0.25 is dominated by 0.1 (the
+same step time, six times the error); the bare 0.5 costs 35% of the pack's own KLD and 2.7 points of top-1. The 20-chunk
+quick check overstates the low boosts by about half (0.0075 and 0.0324 at 0.1 and 0.25): its text slice is easier (base
+PPL 2.2717 there against 2.7314 over all 100).
 
 Routing follows the placement, and the placement follows history (promotions, what the last prompt left warm), so the
-same prompt takes a different route - and gives different text - on different runs. The decode fixture's acceptance
+same prompt takes a different route, and gives different text, on different runs. The decode fixture's acceptance
 moved from 79.0% to 66-72% at 0.25-0.5, which is why the step time, not the token rate, is the number to read. A machine
 whose VRAM alone holds the experts has nothing to gain here and pays the same error.
+
+Reproduce (the base is [basalt-kld-bases](https://huggingface.co/datasets/jesdga/basalt-kld-bases)):
+
+```sh
+basalt-bench --model DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt --quality 20 \
+             --kld-base dsv41-bf16-base.kld -- --route-prior 0.1
+basalt-bench --model DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt -t conv -- --route-prior 0.1
+```
