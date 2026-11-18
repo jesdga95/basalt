@@ -76,12 +76,22 @@ struct WindowPut {
 };
 static_assert(sizeof(WindowPut) <= 4 * kPutWords, "a window's plan fits put_words");
 
+// One Engram layer's rows of the call being run: asked for when it starts, taken by the layer.
+struct EngramRead {
+    std::vector<uint32_t> ids;
+    std::vector<uint8_t> raw;
+    float *h_rows = nullptr, *d_rows = nullptr, *h_valid = nullptr, *d_valid = nullptr;   // mapped
+    ngram::PleReader::Ticket ticket;
+    int rows = 0;
+};
+
 class Session final : public model::ModelSession {
 public:
     explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
         std::string e;
         join_moe(e);
+        for (EngramRead& er : eread_) engram_finish(er);
         for (void* p : bufs_) cudaFree(p);
         if (d_hist_) cudaFree(d_hist_);
         for (void* p : pinned_) cudaFreeHost(p);
@@ -107,7 +117,7 @@ public:
             return (float*) p;
         };
         X_ = f(R * 4 * E); Xn_ = f(R * 4 * E); coef_ = f(R * bk::kHcCoef); hcws_ = f((int64_t) bk::hc_plain_workspace_floats(kMaxRows));
-        e_ = f(R * E); cur_ = f(R * E); xn_ = f(R * E); attn_ = f(R * E); attn_raw_ = f(R * E); mlp_ = f(R * E); mlp2_ = f(R * E);
+        cur_ = f(R * E); xn_ = f(R * E); attn_ = f(R * E); attn_raw_ = f(R * E); mlp_ = f(R * E); mlp2_ = f(R * E);
         fin_ = f(kMaxWindow * E);
         qa_ = f(R * g_.q_lora); qan_ = f(R * g_.q_lora); q_ = f(R * max_heads * g_.qk_dim); kvraw_ = f(R * kRowWidth);
         qabs_ = f(R * max_heads * g_.kv_lora); qcur_ = f(R * max_heads * kRowWidth);
@@ -124,9 +134,7 @@ public:
         rlog_ = f(R * g_.n_expert); rw_ = f(R * 16); ids_ = (int32_t*) alloc((size_t) R * 16 * 4, ok);
         xlat_ = f(R * g_.n_latent); lat_out_ = f(R * g_.n_latent); moe_out_ = f(R * E); sh_ = f(R * E);
         logits_ = f((int64_t) kMaxWindow * g_.n_vocab); pick_ = (int32_t*) alloc(4 * 32, ok);
-        erows_ = f(R * g_.n_embd);   // the Engram's normed rows: 16 x 96 values a row
         ekv_ = f(R * 5 * E);
-        evalid_ = f(R);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxWindow, (int) g_.n_vocab) + (int64_t) kMaxWindow * (bk::kLogprobStride + 1));
         q8_ = alloc(std::max<size_t>(bk::native_q8_1_bytes(16384, kMaxWindow), 1 << 16), ok);
         mmq_xq_ = alloc(basalt::prefill::mmq::q8_bytes(kMaxRows, 16384), ok);
@@ -181,7 +189,29 @@ public:
             }
         }
         rope_dev_ = (int32_t*) alloc((size_t) ctx * 12, ok);   // [vision] the 3-D rotary position of every cell
-        h_erows_ = pin(R * g_.n_embd); h_e_ = pin(R * E); h_evalid_ = pin(R);
+        // host rows the kernels read in place (mapped): the embeddings, and each Engram layer's rows and validity, whose reads
+        // all go out when a call starts
+        auto mapped = [&](size_t n, float*& dev) {
+            void* p = nullptr;
+            if (cudaHostAlloc(&p, n * 4, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
+                ok = false;
+                return (float*) nullptr;
+            }
+            pinned_.push_back(p);
+            if (cudaHostGetDevicePointer((void**) &dev, p, 0) != cudaSuccess) ok = false;
+            return (float*) p;
+        };
+        h_e_ = mapped((size_t) R * E, d_e_);
+        {
+            const EngramInfo& en = m_.pack().engram;
+            eread_.resize(en.layers.size());
+            for (EngramRead& er : eread_) {
+                er.h_rows = mapped((size_t) R * en.n_cols() * en.row_values, er.d_rows);
+                er.h_valid = mapped((size_t) R, er.d_valid);
+                er.ids.resize((size_t) R * en.n_cols());
+                er.raw.resize((size_t) R * en.n_cols() * en.row_values);
+            }
+        }
         cache_.assign((size_t) g_.n_layers, nullptr);
         ival_.assign((size_t) g_.n_layers, nullptr);
         igate_.assign((size_t) g_.n_layers, nullptr);
@@ -676,26 +706,49 @@ private:
         }
     }
 
+    // The Engram rows of every Engram layer for R rows at pos0.. are asked for when the call starts (the hash needs only the
+    // tokens), so the SSD reads run behind the layers before them.
+    void engram_issue(int64_t pos0, int R, const int32_t* tokens) {
+        const EngramInfo& en = m_.pack().engram;
+        const int n_cols = en.n_cols();
+        for (size_t e = 0; e < eread_.size(); ++e) {
+            EngramRead& er = eread_[e];
+            engram_finish(er);
+            for (int t = 0; t < R; ++t) {
+                const int64_t pos = pos0 + t;
+                const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
+                float valid = 1.f;
+                engram_ids(en, (int) e, tokens[t], p1, p2, pos, false, er.ids.data() + (size_t) t * n_cols, valid);
+                er.h_valid[t] = valid;
+            }
+            er.ticket = m_.engram_reader().issue(er.ids.data(), (size_t) R * n_cols, er.raw.data());
+            er.rows = R;
+        }
+    }
+    // A read no layer took lands before its buffer is asked for again.
+    bool engram_finish(EngramRead& er, std::string* err = nullptr) {
+        if (!er.ticket.id) return true;
+        std::string e;
+        const bool ok = m_.engram_reader().collect(er.ticket, e);
+        er.ticket = {};
+        if (!ok && err) *err = e;
+        return ok;
+    }
+
     // The Engram step of layer `l` on the streams of R rows.
-    bool engram(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err) {
+    bool engram(int l, int R, std::string& err) {
         const EngramInfo& en = m_.pack().engram;
         int e = -1;
         for (size_t k = 0; k < en.layers.size(); ++k)
             if (en.layers[k] == l) e = (int) k;
         if (e < 0) return true;
-        const int n_cols = en.n_cols(), W = en.row_values;
-        std::vector<uint32_t> ids((size_t) R * n_cols);
-        for (int t = 0; t < R; ++t) {
-            const int64_t pos = pos0 + t;
-            const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
-            float valid = 1.f;
-            engram_ids(en, e, tokens[t], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, valid);
-            h_evalid_[t] = valid;
+        EngramRead& er = eread_[(size_t) e];
+        if (er.rows != R || !er.ticket.id) {
+            err = "the Engram rows of layer " + std::to_string(l) + " were not asked for";
+            return false;
         }
-        std::vector<uint8_t> raw((size_t) R * n_cols * W);
-        ngram::PleReader& rd = m_.engram_reader();
-        const ngram::PleReader::Ticket tk = rd.issue(ids.data(), ids.size(), raw.data());
-        if (!rd.collect(tk, err)) return false;
+        if (!engram_finish(er, &err)) return false;
+        const int n_cols = en.n_cols(), W = en.row_values;
         if (lookup_host_.empty()) lookup_host_.resize((size_t) n_cols * W * en.layers.size());
         float* nrm = lookup_host_.data() + (size_t) e * n_cols * W;
         if (lookup_loaded_.empty()) lookup_loaded_.assign(en.layers.size(), false);
@@ -704,10 +757,10 @@ private:
             lookup_loaded_[(size_t) e] = true;
         }
         for (int t = 0; t < R; ++t) {
-            const float valid = h_evalid_[t];
+            const float valid = er.h_valid[t];
             for (int c = 0; c < n_cols; ++c) {
-                float* row = h_erows_ + ((size_t) t * n_cols + c) * W;
-                const uint8_t* src = raw.data() + ((size_t) t * n_cols + c) * W;
+                float* row = er.h_rows + ((size_t) t * n_cols + c) * W;
+                const uint8_t* src = er.raw.data() + ((size_t) t * n_cols + c) * W;
                 float ss = 0.f;
                 for (int d = 0; d < W; ++d) {
                     row[d] = e4m3_to_f32(src[d]);
@@ -717,13 +770,11 @@ private:
                 for (int d = 0; d < W; ++d) row[d] = row[d] * r * nrm[(size_t) c * W + d] * valid;
             }
         }
-        cudaMemcpyAsync(erows_, h_erows_, (size_t) R * n_cols * W * 4, cudaMemcpyHostToDevice, stream_);
-        cudaMemcpyAsync(evalid_, h_evalid_, (size_t) R * 4, cudaMemcpyHostToDevice, stream_);
-        gemm(T(l, "engram_kv.weight"), erows_, ekv_, n_cols * W, 5 * g_.n_embd, R);
+        gemm(T(l, "engram_kv.weight"), er.d_rows, ekv_, n_cols * W, 5 * g_.n_embd, R);
         EngramArgs a;
         a.n_embd = g_.n_embd;
         engram_apply(ekv_, F(l, "engram_kv_b.weight"), F(l, "engram_gate.weight"), F(l, "engram_pre_gamma.weight"),
-                     F(l, "engram_hc_scale.weight"), evalid_, R, a, X_, stream_);
+                     F(l, "engram_hc_scale.weight"), er.d_valid, R, a, X_, stream_);
         return true;
     }
 
@@ -1132,6 +1183,7 @@ private:
         hist_.insert(hist_.end(), tokens, tokens + R);
         if (!ensure_positions(pos0 + R, err)) return false;
         place_rope(pos0, R);   // [vision]
+        engram_issue(pos0, R, tokens);
         if (tier_) tier_->begin_token(std::min(R, kMaxWindow));
         const int E = g_.n_embd;
         bk::HcPlainArgs hc;
@@ -1146,11 +1198,10 @@ private:
                 err = "no embedding row";
                 return false;
             }
-        cudaMemcpyAsync(e_, h_e_, (size_t) R * E * 4, cudaMemcpyHostToDevice, stream_);
-        fill_streams(e_, E, R, X_, stream_);
+        fill_streams(d_e_, E, R, X_, stream_);
         if (!m_.diag_dump().empty()) dump("hc_init", X_, (int64_t) R * 4 * E);
         for (int l = 0; l < g_.n_layers; ++l) {
-            if (!engram(l, pos0, R, tokens, err)) return false;
+            if (!engram(l, R, err)) return false;
             if (diag(l) && !g_.swa.empty() && l >= 1) dump("engram_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
             bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
             bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
@@ -1295,14 +1346,14 @@ private:
     cudaEvent_t ev_ = nullptr;
     std::vector<void*> bufs_, pinned_;
     float *X_ = nullptr, *Xn_ = nullptr, *coef_ = nullptr, *hcws_ = nullptr;
-    float *e_ = nullptr, *cur_ = nullptr, *xn_ = nullptr, *attn_ = nullptr, *attn_raw_ = nullptr, *mlp_ = nullptr, *mlp2_ = nullptr, *fin_ = nullptr;
+    float *cur_ = nullptr, *xn_ = nullptr, *attn_ = nullptr, *attn_raw_ = nullptr, *mlp_ = nullptr, *mlp2_ = nullptr, *fin_ = nullptr;
     float *qa_ = nullptr, *qan_ = nullptr, *q_ = nullptr, *kvraw_ = nullptr, *qabs_ = nullptr, *qcur_ = nullptr, *olat_ = nullptr, *vout_ = nullptr, *gate_ = nullptr;
     float *ik_ = nullptr, *ikn_ = nullptr, *ivt_ = nullptr, *igt_ = nullptr, *iq_ = nullptr, *iw_ = nullptr, *iscore_ = nullptr;
     int32_t *icells_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
     int cells_stride_ = 0;
     float *gu_ = nullptr, *h_ = nullptr, *rlog_ = nullptr, *rw_ = nullptr;
     int32_t* ids_ = nullptr;
-    float *xlat_ = nullptr, *lat_out_ = nullptr, *moe_out_ = nullptr, *sh_ = nullptr, *logits_ = nullptr, *lp_ = nullptr, *erows_ = nullptr, *ekv_ = nullptr, *evalid_ = nullptr;
+    float *xlat_ = nullptr, *lat_out_ = nullptr, *moe_out_ = nullptr, *sh_ = nullptr, *logits_ = nullptr, *lp_ = nullptr, *ekv_ = nullptr;
     int32_t* pick_ = nullptr;
     struct Stage {
         uint8_t* blobs = nullptr;
@@ -1321,7 +1372,8 @@ private:
     int32_t *mmq_bounds_ = nullptr, *mmq_ident_ = nullptr;
     void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr, *ex_plan2_ = nullptr;
     float* ex_rows_ = nullptr;
-    float *h_x_ = nullptr, *d_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_erows_ = nullptr, *h_e_ = nullptr, *h_evalid_ = nullptr;
+    float *h_x_ = nullptr, *d_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_e_ = nullptr, *d_e_ = nullptr;
+    std::vector<EngramRead> eread_;
     int32_t *h_ids_ = nullptr, *d_ids_ = nullptr;
     uint32_t *h_words_ = nullptr, *d_words_ = nullptr;   // mapped: [0] the ids' sequence word, [1] the word a weighted sum waits for
     uint32_t seq_want_ = 0, join_seq_ = 0;
