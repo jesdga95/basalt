@@ -74,6 +74,14 @@ struct Taps {
     std::vector<int32_t> w;
 };
 
+double lanczos3(double x) {
+    x = std::fabs(x);
+    if (x >= 3.0) return 0.0;
+    if (x < 1e-12) return 1.0;
+    const double px = 3.14159265358979323846 * x;
+    return 3.0 * std::sin(px) * std::sin(px / 3.0) / (px * px);
+}
+
 double cubic(double x) {
     constexpr double a = -0.5;
     x = std::fabs(x);
@@ -82,11 +90,11 @@ double cubic(double x) {
     return 0.0;
 }
 
-Taps make_taps(int in, int out) {
+Taps make_taps(int in, int out, Filter filter) {
     constexpr int kBits = 22;
     const double scale = (double) in / out;
     const double fscale = std::max(1.0, scale);
-    const double support = 2.0 * fscale;
+    const double support = (filter == Filter::Lanczos ? 3.0 : 2.0) * fscale;
     Taps t;
     t.ksize = (int) std::ceil(support) * 2 + 1;
     t.start.resize(out);
@@ -102,7 +110,7 @@ Taps make_taps(int in, int out) {
         const double ss = 1.0 / fscale;
         double sum = 0.0;
         for (int i = 0; i < hi; ++i) {
-            tmp[i] = cubic((i + lo - center + 0.5) * ss);
+            tmp[i] = filter == Filter::Lanczos ? lanczos3((i + lo - center + 0.5) * ss) : cubic((i + lo - center + 0.5) * ss);
             sum += tmp[i];
         }
         for (int i = 0; i < hi; ++i) {
@@ -158,18 +166,18 @@ std::vector<uint8_t> resample_y(const uint8_t* src, int iw, int oh, const Taps& 
     return dst;
 }
 
-Image resize_bicubic(const Image& s, int ow, int oh) {
+Image resize_with(const Image& s, int ow, int oh, Filter filter) {
     Image d;
     d.w = ow;
     d.h = oh;
     const bool hx = ow != s.w, hy = oh != s.h;
     if (hx && hy) {
-        const auto mid = resample_x(s.rgb.data(), s.w, s.h, ow, make_taps(s.w, ow));
-        d.rgb = resample_y(mid.data(), ow, oh, make_taps(s.h, oh));
+        const auto mid = resample_x(s.rgb.data(), s.w, s.h, ow, make_taps(s.w, ow, filter));
+        d.rgb = resample_y(mid.data(), ow, oh, make_taps(s.h, oh, filter));
     } else if (hx) {
-        d.rgb = resample_x(s.rgb.data(), s.w, s.h, ow, make_taps(s.w, ow));
+        d.rgb = resample_x(s.rgb.data(), s.w, s.h, ow, make_taps(s.w, ow, filter));
     } else if (hy) {
-        d.rgb = resample_y(s.rgb.data(), s.w, oh, make_taps(s.h, oh));
+        d.rgb = resample_y(s.rgb.data(), s.w, oh, make_taps(s.h, oh, filter));
     } else {
         d.rgb = s.rgb;
     }
@@ -178,10 +186,12 @@ Image resize_bicubic(const Image& s, int ow, int oh) {
 
 }  // namespace
 
-Image resize_bicubic_to(const Image& src, int w, int h) { return resize_bicubic(src, w, h); }
+Image resize_to(const Image& src, int w, int h, Filter filter) { return resize_with(src, w, h, filter); }
 
-Image to_canvas(const Image& src, Size target) {
-    return resize_bicubic(src, target.w, target.h);
+Image resize_bicubic_to(const Image& src, int w, int h) { return resize_with(src, w, h, Filter::Bicubic); }
+
+Image to_canvas(const Image& src, Size target, Filter filter) {
+    return resize_with(src, target.w, target.h, filter);
 }
 
 void normalize_planar(const Image& c, std::vector<float>& out) {
