@@ -742,13 +742,78 @@ def model_kv(ck: Checkpoint, ple_dim: int, file_type: int, name: str | None) -> 
     return kv
 
 
-def ple_table(ck: Checkpoint) -> list[pathlib.Path]:
-    """The checkpoint files that hold the FP8 n-gram table: the one scale tensor, and the shards it scales (a release
-    that consolidated its files may spread them over several)."""
+def ple_table(ck: Checkpoint):
+    """The n-gram table's reader: NVFP4 shards with one FP32 weight_scale_2 (PleNvfp4), or FP8 shards with one BF16
+    weight_scale (model_sections.PleFp8, given the files that hold them; a release that consolidated its files may
+    spread them over several)."""
+    if any(k.endswith("ngram_embedding.weight_scale_2") for k in ck.t):
+        return PleNvfp4(ck)
     hits = sorted({ck.t[k][0] for k in ck.t
                    if "ngram_embedding.shard_" in k or k.endswith("ngram_embedding.weight_scale")})
     if not any(k.endswith("ngram_embedding.weight_scale") for k in ck.t):
         raise S.ConvertError(f"{ck.dir}: no ngram_embedding.weight_scale")
     if not hits:
         raise S.ConvertError(f"{ck.dir}: no ngram_embedding shards")
-    return hits
+    return S.PleFp8([str(p) for p in hits])
+
+
+class PleNvfp4:
+    """The n-gram table of a checkpoint that stores it as NVFP4 shards (`...ngram_embedding.shard_K.weight`, E2M1 pairs,
+    with `.weight_scale`, UE4M3 per 16 values) and one FP32 `...ngram_embedding.weight_scale_2`, as Q8_0 rows: values
+    are code x block scale x weight_scale_2, re-blocked per 32 values. The shards may sit in several files."""
+
+    def __init__(self, ck: Checkpoint, chunk_rows: int = 65536):
+        self.chunk_rows = chunk_rows
+        g = [k for k in ck.t if k.endswith("ngram_embedding.weight_scale_2")]
+        if len(g) != 1:
+            raise S.ConvertError(f"{ck.dir}: {len(g)} ngram_embedding.weight_scale_2 tensors")
+        stem = g[0][:-len("weight_scale_2")]
+        ck.need(g[0], "F32", (1,))
+        self.scale = float(ck.values(g[0])[0])
+        found = {int(m.group(1)) for k in ck.t for m in [re.fullmatch(re.escape(stem) + r"shard_(\d+)\.weight", k)] if m}
+        if not found:
+            raise S.ConvertError(f"{ck.dir}: no n-gram table shards beside {g[0]}")
+        missing = sorted(set(range(max(found) + 1)) - found)
+        if missing:
+            raise S.ConvertError(f"the PLE table lacks shards {missing[:8]} of {max(found) + 1}")
+        self.shards = []
+        for i in range(max(found) + 1):
+            k = f"{stem}shard_{i}."
+            shape = ck.t[k + "weight"][3]
+            rows = shape[0] if shape else 0
+            ck.need(k + "weight", "U8", (rows, S.PLE_DIM // 2))
+            ck.need(k + "weight_scale", "F8_E4M3", (rows, S.PLE_DIM // 16))
+            w, s = ck.t[k + "weight"], ck.t[k + "weight_scale"]
+            self.shards.append((w[0], w[1], s[0], s[1], rows))
+        self.paths = sorted({x for w, _, s, _, _ in self.shards for x in (w, s)} | {ck.t[g[0]][0]})
+        self.rows = sum(sh[4] for sh in self.shards)
+        self.nbytes = self.rows * (S.PLE_DIM // 32 * 34)
+        self.conversion = {"src_type": "NVFP4", "dst_type": "Q8_0",
+                           "method": "e2m1 code x ue4m3 scale per 16 x fp32 weight_scale_2, Q8_0 blocks of 32 "
+                                     "(ggml reference rounding)", "scale": self.scale}
+
+    def jobs(self):
+        for wp, wo, sp, so, rows in self.shards:
+            for r in range(0, rows, self.chunk_rows):
+                n = min(self.chunk_rows, rows - r)
+                yield (str(wp), wo + r * S.PLE_DIM // 2, str(sp), so + r * S.PLE_DIM // 16, n, self.scale)
+
+    def chunks(self, pool, depth: int = 16):
+        """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
+        yield from bounded_imap(pool, _ple_nvfp4_job, self.jobs(), depth)
+
+
+def _ple_nvfp4_job(args):
+    """Rows of an NVFP4 table shard as Q8_0. Code x block scale is exact in f32, so weight_scale_2 rounds each value
+    once."""
+    wp, wo, sp, so, rows, scale = args
+    codes = np.fromfile(wp, dtype=np.uint8, count=rows * S.PLE_DIM // 2, offset=wo).reshape(rows, -1)
+    sc = np.fromfile(sp, dtype=np.uint8, count=rows * S.PLE_DIM // 16, offset=so).reshape(rows, -1)
+    if (sc & 0x80).any() or (sc == 0x7F).any():
+        raise S.ConvertError(f"a UE4M3 scale with the sign bit set or NaN at {pathlib.Path(sp).name}+{so}")
+    v = np.empty((rows, S.PLE_DIM), np.uint8)
+    v[:, 0::2], v[:, 1::2] = codes & 15, codes >> 4
+    x = E2M1[v] * np.repeat(E4M3[sc], 16, axis=1) * np.float32(scale)
+    if not np.isfinite(x).all():
+        raise S.ConvertError("the NVFP4 table holds a non-finite value")
+    return S.q8_0(x)

@@ -658,6 +658,64 @@ class Mxfp8DenseTest(unittest.TestCase):
             self.dense()
 
 
+class PleNvfp4Test(unittest.TestCase):
+    """The NVFP4 n-gram table as Q8_0 rows, its two shards in two files."""
+    STEM = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.d = Path(tmp.name)
+        rng = np.random.default_rng(6)
+        self.codes = [rng.integers(0, 256, size=(r, S.PLE_DIM // 2), dtype=np.uint8) for r in (3, 5)]
+        self.scales = [rng.integers(0x20, 0x50, size=(r, S.PLE_DIM // 16), dtype=np.uint8) for r in (3, 5)]
+        self.s2 = np.float32(0.0123)
+        files = [{}, {}]
+        for i in range(2):
+            files[i][f"{self.STEM}shard_{i}.weight"] = ("U8", self.codes[i].shape, self.codes[i].tobytes())
+            files[i][f"{self.STEM}shard_{i}.weight_scale"] = ("F8_E4M3", self.scales[i].shape, self.scales[i].tobytes())
+        files[1][self.STEM + "weight_scale_2"] = ("F32", (1,), self.s2.tobytes())
+        for i, t in enumerate(files):
+            write_safetensors(self.d / f"model-0000{i + 1}-of-00002.safetensors", t)
+        (self.d / "config.json").write_text("{}")
+
+    def test_rows_from_both_files(self):
+        ple = C.ple_table(C.Checkpoint(self.d))
+        self.assertIsInstance(ple, C.PleNvfp4)
+        self.assertEqual((ple.rows, ple.nbytes), (8, 8 * 170))
+        self.assertEqual([p.name for p in ple.paths], ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"])
+        want = []
+        for codes, scales in zip(self.codes, self.scales):
+            nib = np.empty((codes.shape[0], S.PLE_DIM), np.uint8)
+            nib[:, 0::2], nib[:, 1::2] = codes & 15, codes >> 4
+            mag = np.array(E2M1, np.float32)[nib & 7] * np.where(nib & 8, -1, 1).astype(np.float32)
+            sc = np.vectorize(ue4m3)(scales).astype(np.float32)
+            want.append(S.q8_0(mag * np.repeat(sc, 16, axis=1) * self.s2))
+        ple.chunk_rows = 2
+        self.assertEqual(b"".join(C._ple_nvfp4_job(j) for j in ple.jobs()), b"".join(want))
+
+    def test_sign_bit_scale_is_refused(self):
+        p = self.d / "model-00002-of-00002.safetensors"
+        head, base = S.read_safetensors_header(p)
+        raw = bytearray(p.read_bytes())
+        raw[base + head[self.STEM + "shard_1.weight_scale"]["data_offsets"][0]] |= 0x80
+        p.write_bytes(bytes(raw))
+        ple = C.ple_table(C.Checkpoint(self.d))
+        with self.assertRaisesRegex(S.ConvertError, "sign bit"):
+            for j in ple.jobs():
+                C._ple_nvfp4_job(j)
+
+    def test_fp8_table_keeps_its_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            small_checkpoint(d, {self.STEM + "weight_scale": ("BF16", (1,), np.array([0x3C23], "<u2").tobytes()),
+                                 self.STEM + "shard_0.weight": ("F8_E4M3", (2, S.PLE_DIM), bytes(2 * S.PLE_DIM))})
+            ple = C.ple_table(C.Checkpoint(d))
+            self.assertIsInstance(ple, S.PleFp8)
+            self.assertEqual(ple.paths, [d / "model-00001-of-00001.safetensors"])
+            self.assertEqual(ple.conversion["src_type"], "F8_E4M3")
+
+
 if __name__ == "__main__":
     unittest.main()
 
