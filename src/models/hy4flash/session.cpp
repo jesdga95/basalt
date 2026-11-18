@@ -123,7 +123,8 @@ public:
         };
         fin_ = f(kMaxWindow * E);
         const int64_t pools = ctx / g_.idx_pool + 1;
-        iscore_ = f(pools);
+        iscore_ = f(pools * kIdxRows);
+        iidx_meta_ = (int32_t*) alloc((size_t) kIdxRows * 3 * 4, ok);
         cells_stride_ = g_.idx_top_k + 2 * g_.idx_pool;
         max_heads_ = max_heads;
         logits_ = f((int64_t) kMaxWindow * g_.n_vocab); pick_ = (int32_t*) alloc(4 * 32, ok);
@@ -794,6 +795,7 @@ private:
 
     // The indexer of sparse layer `l` for R rows at pos0..: the rows of the keys and the pooled keys of the groups they
     // complete; for the rows with more pools than it keeps, its selection into icells_.
+    static constexpr int kIdxRows = 64;
     void indexer(int l, int64_t pos0, int R, bool selecting, const std::vector<int>& pools_of, std::string&) {
         const int D = g_.idx_dim, P = g_.idx_pool, E = g_.n_embd;
         IndexerArgs a;
@@ -826,13 +828,23 @@ private:
         gemm(T(l, "indexer.attn_q_b.weight"), qan_, iq_, g_.q_lora, a.heads * D, R);
         idx_rope_heads(iq_, a, (int) pos0, R, stream_);
         f32_gemm_rows(xn_, F(l, "indexer.proj.weight"), a.heads, E, 1.0f / std::sqrt((float) (D * a.heads)), R, iw_, stream_);
-        for (int t = 0; t < R; ++t) {
-            const int pools = pools_of[(size_t) t];
-            if (pools <= keep) continue;
-            const int64_t pos = pos0 + t;
-            const int tail0 = pools * P, tail_n = (int) (pos - tail0 + 1);
-            idx_scores(iq_ + (size_t) t * a.heads * D, iw_ + (size_t) t * a.heads, ipool_[(size_t) l], pools, a, iscore_, stream_);
-            idx_select(iscore_, pools, keep, P, tail0, tail_n, icells_ + (size_t) t * cells_stride_, stream_);
+        // the rows that select, kIdxRows at a time
+        const int stride = (int) (m_.context() / P + 1);
+        for (int t0 = 0; t0 < R; t0 += kIdxRows) {
+            const int n = std::min(kIdxRows, R - t0);
+            int32_t meta[kIdxRows * 3];
+            int max_pool = 0;
+            for (int i = 0; i < n; ++i) {
+                const int pools = pools_of[(size_t) (t0 + i)], tail0 = pools * P;
+                meta[i * 3] = pools;
+                meta[i * 3 + 1] = tail0;
+                meta[i * 3 + 2] = (int) (pos0 + t0 + i - tail0 + 1);
+                max_pool = std::max(max_pool, pools);
+            }
+            if (max_pool <= keep) continue;
+            cudaMemcpyAsync(iidx_meta_, meta, (size_t) n * 3 * 4, cudaMemcpyHostToDevice, stream_);
+            idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
+            idx_select_rows(iscore_, stride, iidx_meta_, n, keep, P, icells_ + (size_t) t0 * cells_stride_, cells_stride_, stream_);
         }
     }
 
@@ -1404,7 +1416,7 @@ private:
     float *e_ = nullptr, *cur_ = nullptr, *xn_ = nullptr, *attn_ = nullptr, *attn_raw_ = nullptr, *mlp_ = nullptr, *mlp2_ = nullptr, *fin_ = nullptr;
     float *qa_ = nullptr, *qan_ = nullptr, *q_ = nullptr, *kvraw_ = nullptr, *qabs_ = nullptr, *qcur_ = nullptr, *olat_ = nullptr, *vout_ = nullptr, *gate_ = nullptr;
     float *ik_ = nullptr, *ikn_ = nullptr, *ivt_ = nullptr, *igt_ = nullptr, *iq_ = nullptr, *iw_ = nullptr, *iscore_ = nullptr;
-    int32_t *icells_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
+    int32_t *iidx_meta_ = nullptr, *icells_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
     int cells_stride_ = 0, rows_ = 0, arows_ = 0, max_heads_ = 0;
     Bufs dec_, big_;   // a window's row buffers, and a prompt chunk's while one runs
     float *gu_ = nullptr, *h_ = nullptr, *rlog_ = nullptr, *rw_ = nullptr;

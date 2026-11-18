@@ -76,8 +76,17 @@ __global__ void rope_heads_kernel(float* __restrict__ q, IndexerArgs a, int pos0
 }
 
 // A thread per pooled key.
+// With `meta` ([row][3] = pools, tail0, tail_n) a row of blockIdx.y: its q and w, its pool count, its scores at row * stride.
 __global__ void scores_kernel(const float* __restrict__ q, const float* __restrict__ w, const __half* __restrict__ pooled,
-                              int n_pool, IndexerArgs a, float* __restrict__ scores) {
+                              int n_pool, IndexerArgs a, float* __restrict__ scores, const int32_t* __restrict__ meta, int stride) {
+    if (meta) {
+        const int row = blockIdx.y;
+        n_pool = meta[row * 3];
+        if (blockIdx.x * blockDim.x >= n_pool) return;
+        q += (size_t) row * a.heads * a.dim;
+        w += (size_t) row * a.heads;
+        scores += (size_t) row * stride;
+    }
     extern __shared__ float qs[];   // [heads][dim] and [heads]
     for (int i = threadIdx.x; i < a.heads * a.dim; i += blockDim.x) qs[i] = q[i];
     for (int i = threadIdx.x; i < a.heads; i += blockDim.x) qs[a.heads * a.dim + i] = w[i];
@@ -108,7 +117,16 @@ __device__ __forceinline__ uint32_t order_key(float f) {
 // One block. The k-th largest score by a search over its order key's bits, then the pools above it and the lowest-indexed
 // ties, written in pool order as their cells, then the tail's.
 __global__ void select_kernel(const float* __restrict__ scores, int n, int k, int pool, int tail0, int tail_n,
-                              int32_t* __restrict__ cells) {
+                              int32_t* __restrict__ cells, const int32_t* __restrict__ meta, int stride, int cells_stride) {
+    if (meta) {   // a row per block: n <= k means the row attends everything and has no selection
+        const int row = blockIdx.x;
+        n = meta[row * 3];
+        if (n <= k) return;
+        tail0 = meta[row * 3 + 1];
+        tail_n = meta[row * 3 + 2];
+        scores += (size_t) row * stride;
+        cells += (size_t) row * cells_stride;
+    }
     __shared__ uint32_t red[kSelThreads / 32];
     __shared__ uint32_t sh_thr;
     __shared__ int sh_count[kSelThreads + 1], sh_eq[kSelThreads + 1], sh_need;
@@ -198,13 +216,26 @@ void idx_rope_heads(float* q, const IndexerArgs& a, int pos0, int n_tok, void* s
 void idx_scores(const float* q, const float* w, const uint16_t* pooled, int n_pool, const IndexerArgs& a, float* scores,
                 void* stream) {
     const size_t smem = ((size_t) a.heads * a.dim + a.heads) * sizeof(float);
-    scores_kernel<<<(n_pool + 127) / 128, 128, smem, (cudaStream_t) stream>>>(q, w, reinterpret_cast<const __half*>(pooled), n_pool, a, scores);
+    scores_kernel<<<(n_pool + 127) / 128, 128, smem, (cudaStream_t) stream>>>(q, w, reinterpret_cast<const __half*>(pooled), n_pool, a, scores, nullptr, 0);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
 void idx_select(const float* scores, int n_pool, int k, int pool, int tail0, int tail_n, int32_t* cells, void* stream) {
     if (k < 1 || k > n_pool) throw std::invalid_argument("idx_select: k");
-    select_kernel<<<1, kSelThreads, 0, (cudaStream_t) stream>>>(scores, n_pool, k, pool, tail0, tail_n, cells);
+    select_kernel<<<1, kSelThreads, 0, (cudaStream_t) stream>>>(scores, n_pool, k, pool, tail0, tail_n, cells, nullptr, 0, 0);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void idx_scores_rows(const float* q, const float* w, const uint16_t* pooled, const int32_t* meta, int max_pool, int rows, const IndexerArgs& a,
+                     float* scores, int stride, void* stream) {
+    const size_t smem = ((size_t) a.heads * a.dim + a.heads) * sizeof(float);
+    scores_kernel<<<dim3((max_pool + 127) / 128, rows), 128, smem, (cudaStream_t) stream>>>(q, w, reinterpret_cast<const __half*>(pooled), 0, a, scores,
+                                                                                             meta, stride);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void idx_select_rows(const float* scores, int stride, const int32_t* meta, int rows, int k, int pool, int32_t* cells, int cells_stride, void* stream) {
+    select_kernel<<<rows, kSelThreads, 0, (cudaStream_t) stream>>>(scores, 0, k, pool, 0, 0, cells, meta, stride, cells_stride);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

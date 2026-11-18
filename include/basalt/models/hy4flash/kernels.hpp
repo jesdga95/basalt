@@ -98,6 +98,12 @@ void idx_scores(const float* q, const float* w, const uint16_t* pooled, int n_po
 /// tail cells tail0 .. tail0 + tail_n - 1. cells[k * pool + tail_n]; k <= n_pool.
 void idx_select(const float* scores, int n_pool, int k, int pool, int tail0, int tail_n, int32_t* cells, void* stream);
 
+/// The same for `rows` rows at once: row t has q[t][heads][dim], w[t][heads], and meta[t] = {pools, tail0, tail_n} (device); its scores
+/// go to scores[t * stride ..] (stride >= max_pool), its cells to cells[t * cells_stride ..]. A row with pools <= k is left alone.
+void idx_scores_rows(const float* q, const float* w, const uint16_t* pooled, const int32_t* meta, int max_pool, int rows, const IndexerArgs& a,
+                     float* scores, int stride, void* stream);
+void idx_select_rows(const float* scores, int stride, const int32_t* meta, int rows, int k, int pool, int32_t* cells, int cells_stride, void* stream);
+
 /// y[t][r] = scale * w[r] . x[t] for r < rows over `cols` values, t < n_tok (w fp32 [rows][cols], cols % 4 == 0).
 void f32_gemm_rows(const float* x, const float* w, int rows, int cols, float scale, int n_tok, float* y, void* stream);
 /// out[i] = a[i] + b[i].
