@@ -13,8 +13,8 @@ namespace {
 
 class Adapter final : public model::ModelAdapter {
 public:
-    // the name the pack's metadata carries
-    const char* arch() const override { return kGgufArch; }
+    explicit Adapter(const char* name) : name_(name) {}
+    const char* arch() const override { return name_; }
     std::string validate(const GgufFile& g) const override { return validate_meta(g); }
     model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
     std::unique_ptr<model::LoadedModel> make_model() const override { return std::make_unique<Hy4Model>(); }
@@ -46,10 +46,18 @@ public:
 
     // the end-of-turn token is read from the pack's vocabulary (<hy_end> is 120025)
     model::TokenNames token_names() const override { return {{"<hy_end>"}, "<hy_User>", "", "", ""}; }
+
+private:
+    const char* name_;
 };
 
 }  // namespace
 
-std::unique_ptr<model::ModelAdapter> make_adapter() { return std::make_unique<Adapter>(); }
+std::unique_ptr<model::ModelAdapter> make_adapter() {
+    // The test pack made from the AngelSlim GGUF keeps that file's `general.architecture` (hy_v4_flash) in its gguf_kv, which is
+    // what the registry looks an adapter up by; the same adapter answers to it. Packs written with hy4flash need no alias.
+    if (model::find_adapter(kGgufArch) == nullptr) model::register_adapter(std::make_unique<Adapter>(kGgufArch));
+    return std::make_unique<Adapter>("hy4flash");
+}
 
 }  // namespace basalt::models::hy4flash

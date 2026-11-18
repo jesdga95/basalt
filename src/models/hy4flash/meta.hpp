@@ -11,16 +11,19 @@ namespace basalt::models::hy4flash {
 
 /// The architecture name the GGUF metadata (and so the pack's `gguf_kv`) carries.
 inline constexpr const char* kGgufArch = "hy_v4_flash";
+/// The id of the model (the converter's NVFP4 packs carry it in `general.architecture`).
+inline constexpr const char* kArch = "hy4flash";
 
 inline uint64_t key_u(const GgufFile& g, const char* suffix) {
-    const MetaValue* v = g.get(std::string(kGgufArch) + "." + suffix);
+    const MetaValue* v = g.get(std::string(kGgufArch) + "." + suffix);   // the keys keep the GGUF's prefix in both
     return v ? v->u : 0;
 }
 
 inline std::string validate_meta(const GgufFile& g) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
-    if (arch->s != kGgufArch) return "architecture is '" + arch->s + "', this adapter requires '" + kGgufArch + "'";
+    if (arch->s != kGgufArch && arch->s != kArch)
+        return "architecture is '" + arch->s + "', this adapter requires '" + kArch + "' (or '" + kGgufArch + "', the test pack's)";
     for (const char* k : {"block_count", "embedding_length", "expert_count", "expert_used_count", "expert_feed_forward_length",
                           "attention.kv_lora_rank", "expert_latent_length"})
         if (key_u(g, k) == 0) return std::string("missing or zero ") + kGgufArch + "." + k;
