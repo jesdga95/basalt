@@ -3,6 +3,7 @@
 #include "models/hy4flash/adapter.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/program/options.hpp"
 #include "models/hy4flash/meta.hpp"
@@ -43,6 +44,19 @@ public:
     PreTokenizer pretokenizer() const override { return {"hy_v4", pretok_hy4}; }
     int max_expert_cards() const override { return kMaxSecondCards; }
     const char* model_name() const override { return "Hy4-flash"; }
+
+    bool parse_flag(const std::string& name, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
+        if (name != "--kv") return false;
+        o.kv = args.next("--kv");
+        return true;
+    }
+
+    // --kv: the sparse layers' latent rows, BF16 (the default) or FP8
+    std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        if (o.kv.empty() || o.kv == "bf16" || o.kv == "fp8") return std::nullopt;
+        basalt::log::error("basalt hy4flash", "--kv %s: the latent caches are bf16 (the default) or fp8", o.kv.c_str());
+        return 2;
+    }
 
     // the end-of-turn token is read from the pack's vocabulary (<hy_end> is 120025)
     model::TokenNames token_names() const override { return {{"<hy_end>"}, "<hy_User>", "", "", ""}; }

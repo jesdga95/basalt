@@ -12,8 +12,9 @@ int main() {
         failures += !ok;
     };
     // 12 sparse layers: 13,824 B of rows per position (design: 14.5 GB at 1M, BF16)
-    check(cache_bytes(1 << 20, 12) >= 12ull * (1 << 20) * 1152 && cache_bytes(1 << 20, 12) < 17ull << 30, "1M positions: BF16 rows plus pooled keys");
+    check(cache_bytes(1 << 20, 12) >= 12ull * (1 << 20) * 1152 && cache_bytes(1 << 20, 12) < 16ull << 30, "1M positions: BF16 rows plus fp16 pooled keys");
     check(ring_bytes(512, 30) == 30ull * 512 * 1152, "window rings");
+    check(cache_bytes(1 << 20, 12, true) < 10ull << 30 && cache_bytes(1 << 20, 12, true) > 8ull << 30, "1M positions: FP8 rows (656 B) and fp16 pooled keys");
     const uint64_t gib = 1ull << 30;
     check(plan_context(8192, 1 << 20, 20 * gib, 12).context == 8192, "8K fits");
     check(!plan_context(1 << 20, 1 << 20, 20 * gib, 12).error.empty(), "1M refused with 20 GiB free (half rule)");
