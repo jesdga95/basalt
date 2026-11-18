@@ -39,6 +39,12 @@ CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unlo
 # What this server offers beyond the OpenAI, Anthropic and llama.cpp APIs, listed under /props "basalt"
 CAPABILITIES = ["answer_now", "logprobs", "documents"]
 TURN_POLL_S = 0.5                           # how soon a request waiting for its turn notices its client left
+# The longest a connection may stay silent before its handler thread gives it up. Without one, a client whose
+# connection died without a close (a laptop sleeping, a link dropping mid-body) left the thread blocked in
+# rfile.read() for the life of the server: the request never reached the engine and the thread was lost. It is a
+# per-read deadline, not a total one - a slow client that keeps sending bytes is never cut off. A header read that
+# expires is ended by handle_one_request itself; a body that stops arriving is the 408 in _body.
+HTTP_BODY_S = 60.0
 
 
 class BadBody(Exception):
@@ -59,6 +65,8 @@ def make_handler(target: Service | Router):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
+        timeout = HTTP_BODY_S                               # StreamRequestHandler.setup puts it on the connection:
+        # every header, body read and write carries the deadline, so no half-open client holds a thread forever
 
         watch_done = None                                   # stops this request's disconnect watcher
         cancel = None                                       # set when the client left
@@ -115,12 +123,29 @@ def make_handler(target: Service | Router):
             te = self.headers.get("Transfer-Encoding", "") or ""
             return te.split(",")[-1].strip().lower() == "chunked"
 
+        def _read(self, n: int) -> bytes:
+            """rfile.read with the stalled client named: the handler's timeout (HTTP_BODY_S) turns a connection that
+            stopped arriving into a 408 and gives the thread back, instead of holding it for the life of the server."""
+            try:
+                return self.rfile.read(n)
+            except (TimeoutError, OSError) as e:
+                self.close_connection = True
+                raise BadBody(408, "the request body stopped arriving") from e
+
+        def _readline(self, n: int) -> bytes:
+            """rfile.readline under the same deadline."""
+            try:
+                return self.rfile.readline(n)
+            except (TimeoutError, OSError) as e:
+                self.close_connection = True
+                raise BadBody(408, "the request body stopped arriving") from e
+
         def _read_chunked(self, limit: int, keep: bool = True) -> bytes:
             """Decode a chunked body: at most `limit` bytes (413 beyond it; the size is checked before a chunk is
             read, so a huge announced chunk is never allocated), 400 for a malformed one. keep=False drops it."""
             parts, total = [], 0
             while True:
-                line = self.rfile.readline(1025)
+                line = self._readline(1025)
                 if not line.endswith(b"\n"):
                     raise BadBody(400, "malformed chunked request body")
                 try:
@@ -131,7 +156,7 @@ def make_handler(target: Service | Router):
                     raise BadBody(400, "malformed chunk size in the request body")
                 if size == 0:
                     for _ in range(64):                       # the trailers, up to the blank line
-                        if self.rfile.readline(8193).strip() == b"":
+                        if self._readline(8193).strip() == b"":
                             break
                     return b"".join(parts)
                 total += size
@@ -140,13 +165,13 @@ def make_handler(target: Service | Router):
                     raise BadBody(413, f"the request body is larger than {_size_text(limit)}")
                 left = size
                 while left > 0:
-                    piece = self.rfile.read(min(left, 1 << 20))
+                    piece = self._read(min(left, 1 << 20))
                     if not piece:
                         raise BadBody(400, "the chunked request body ended early")
                     left -= len(piece)
                     if keep:
                         parts.append(piece)
-                if self.rfile.read(2) != b"\r\n":
+                if self._read(2) != b"\r\n":
                     raise BadBody(400, "malformed chunked request body")
 
         def _body(self) -> bytes:
@@ -163,7 +188,7 @@ def make_handler(target: Service | Router):
             if length > limit:
                 self.close_connection = True
                 raise BadBody(413, f"the request body is larger than {_size_text(limit)}")
-            return self.rfile.read(length)
+            return self._read(length)
 
         def _foreign_page(self) -> bool:
             """Without an API key, refuse a /v1 POST from another site's page: its Origin must be allowed (no Origin
