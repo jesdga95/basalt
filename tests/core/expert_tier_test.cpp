@@ -1,0 +1,215 @@
+// tests/core/expert_tier_test.cpp - the shared expert tier on a synthetic pack: its per-layer LRU slots follow a routing
+// stream with an admission threshold exactly as a host model of the rule does, and every resident slot holds the pack's bytes.
+#include "basalt/core/expert_tier.hpp"
+
+#include "basalt/core/loader.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/platform/file.hpp"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <string>
+#include <vector>
+
+using namespace basalt;
+
+static int g_fail = 0;
+#define CHECK(c)                                                              \
+    do {                                                                      \
+        if (!(c)) {                                                           \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); \
+            ++g_fail;                                                         \
+        }                                                                     \
+    } while (0)
+
+namespace {
+
+constexpr int kLayers = 3, kExperts = 48, kSlots = 8, kDim = 256, kQ4K = 12;
+
+struct Lcg {
+    uint64_t s;
+    uint32_t next() {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return (uint32_t) (s >> 33);
+    }
+};
+
+// a skewed draw: the low ids are hot
+int draw(Lcg& r) {
+    const uint32_t a = r.next() % kExperts, b = r.next() % kExperts;
+    return (int) std::min(a, b);
+}
+
+// the rule on the host: per layer an LRU of kSlots experts seeded 0..kSlots-1 (0 the oldest), a miss counted per expert,
+// the k-th use admitting it in place of the least recently used, the counts halving at every 128-token boundary
+struct Model {
+    int k;
+    uint64_t token = 0, tick = 0;
+    std::vector<std::vector<std::pair<int, uint64_t>>> res;   // [layer] (expert, stamp)
+    std::vector<uint16_t> uses;
+    int64_t hits = 0, misses = 0;
+    explicit Model(int k_) : k(k_), res(kLayers), uses((size_t) kLayers * kExperts, 0) {
+        for (auto& l : res)
+            for (int e = 0; e < kSlots; ++e) l.push_back({e, (uint64_t) e});
+        tick = (uint64_t) kLayers * kSlots;   // the seeding's own ticks: only their order matters
+    }
+    void begin() {
+        if (token / 128 != (token + 1) / 128)
+            for (uint16_t& u : uses) u >>= 1;
+        ++token;
+    }
+    void look(int layer, int e) {
+        const uint64_t now = ++tick;
+        for (auto& [ex, st] : res[(size_t) layer])
+            if (ex == e) {
+                st = now;
+                ++hits;
+                return;
+            }
+        ++misses;
+        uint16_t& u = uses[(size_t) layer * kExperts + e];
+        if (++u < (uint16_t) k) return;
+        u = 0;
+        auto victim = res[(size_t) layer].begin();
+        for (auto it = res[(size_t) layer].begin(); it != res[(size_t) layer].end(); ++it)
+            if (it->second < victim->second) victim = it;
+        *victim = {e, now};
+    }
+};
+
+}  // namespace
+
+int main() {
+    int n_dev = 0;
+    if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) {
+        std::printf("expert_tier_test: no GPU, skipped\n");
+        return 77;
+    }
+    const kernels::NativeExpertLayout L = kernels::native_expert_layout(kQ4K, kQ4K, kDim, kDim);
+    const uint64_t blob = L.bytes;
+    const std::string path = std::string(BASALT_TEST_TMPDIR) + "/expert_tier_test.bin";
+    std::vector<uint8_t> data((size_t) kLayers * kExperts * blob);
+    {
+        Lcg r{7};
+        for (uint8_t& b : data) b = (uint8_t) r.next();
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f.write((const char*) data.data(), (std::streamsize) data.size());
+    }
+    const int fd = platform::open_fd_utf8(path);
+    CHECK(fd >= 0);
+    if (fd < 0) return 1;
+
+    for (int k : {1, 2, 3}) {
+        core::ExpertTierSpec spec;
+        spec.area = "basalt test";
+        spec.name = "test";
+        spec.n_layers = kLayers;
+        spec.n_expert = kExperts;
+        spec.top_k = 1;
+        spec.n_embd = kDim;
+        spec.n_ff = kDim;
+        for (int l = 0; l < kLayers; ++l) spec.layers.push_back({kQ4K, kQ4K, (uint64_t) l * kExperts * blob, blob, 0.f});
+        spec.path = path;
+        spec.fd = fd;
+        spec.range = core::FileRange(path, 0, data.size());
+        spec.diag_tier_ram = kExperts;   // every expert in RAM: the slots are copies the stream moves
+        spec.diag_tier_vram = kSlots;
+        spec.admit_uses = k;
+        core::ExpertTier tier(spec);
+        float* h_rows = nullptr;
+        CHECK(cudaHostAlloc((void**) &h_rows, 128 * kDim * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess);
+        core::LoadPlan plan;
+        std::string err;
+        core::ExpertTier::Reserve reserve;
+        bool ok = tier.open(reserve, h_rows, plan, err);
+        if (ok) {
+            core::Loader loader;
+            ok = loader.run(plan, err) && tier.attach(err);
+        }
+        if (!ok) std::fprintf(stderr, "k=%d: %s\n", k, err.c_str());
+        CHECK(ok);
+        if (!ok) return 1;
+        CHECK(tier.slots() == (int64_t) kLayers * kSlots);
+
+        // single-expert lookups: the tier's hits equal the rule's, token by token
+        Model model(k);
+        Lcg r{1234};
+        const int kTokens = 3000;
+        for (int t = 0; t < kTokens; ++t) {
+            tier.begin_token(1);
+            model.begin();
+            for (int l = 0; l < kLayers; ++l) {
+                const int32_t id = draw(r);
+                core::ExpertTier::Lookup lk;
+                CHECK(tier.lookup(l, &id, 1, lk, err));
+                tier.promote(l, lk);
+                tier.pump(-1, core::ExpertTier::kAllPieces);
+                model.look(l, id);
+            }
+            if (tier.hits() != model.hits) {
+                std::fprintf(stderr, "k=%d: token %d: tier %lld hits, rule %lld\n", k, t, (long long) tier.hits(), (long long) model.hits);
+                CHECK(false);
+                break;
+            }
+        }
+        tier.settle();
+        CHECK(tier.lookups() == (int64_t) kTokens * kLayers);
+        std::printf("expert_tier_test: k=%d hit rate %.3f (%lld of %d)\n", k, (double) tier.hits() / (double) tier.lookups(),
+                    (long long) tier.hits(), kTokens * kLayers);
+
+        // every expert the tier says a slot holds is the pack's bytes
+        int checked = 0;
+        std::vector<uint8_t> back(blob);
+        for (int l = 0; l < kLayers; ++l)
+            for (int e = 0; e < kExperts; ++e) {
+                const core::ExpertTier::Source src = tier.locate(l, e);
+                if (!src.dev) continue;
+                CHECK(cudaMemcpy(back.data(), src.dev, blob, cudaMemcpyDeviceToHost) == cudaSuccess);
+                CHECK(std::memcmp(back.data(), data.data() + ((size_t) l * kExperts + (size_t) e) * blob, blob) == 0);
+                ++checked;
+            }
+        CHECK(checked == kLayers * kSlots);
+
+        // windows of several experts at once keep the slots full and the bytes right
+        for (int t = 0; t < 500; ++t) {
+            tier.begin_token(4);
+            for (int l = 0; l < kLayers; ++l) {
+                int32_t ids[12];
+                int n = 0;
+                while (n < 12) {
+                    const int e = draw(r);
+                    bool dup = false;
+                    for (int j = 0; j < n; ++j) dup = dup || ids[j] == e;
+                    if (!dup) ids[n++] = e;
+                }
+                core::ExpertTier::Lookup lk;
+                CHECK(tier.lookup(l, ids, 12, lk, err));
+                tier.fetch(l, lk);
+                tier.await_fetch(nullptr);
+                tier.promote(l, lk);
+                tier.mark_gap(nullptr);
+                tier.pump(l, 3);
+            }
+        }
+        tier.settle();
+        checked = 0;
+        for (int l = 0; l < kLayers; ++l)
+            for (int e = 0; e < kExperts; ++e) {
+                const core::ExpertTier::Source src = tier.locate(l, e);
+                if (!src.dev) continue;
+                CHECK(cudaMemcpy(back.data(), src.dev, blob, cudaMemcpyDeviceToHost) == cudaSuccess);
+                CHECK(std::memcmp(back.data(), data.data() + ((size_t) l * kExperts + (size_t) e) * blob, blob) == 0);
+                ++checked;
+            }
+        CHECK(checked == kLayers * kSlots);
+        cudaFreeHost(h_rows);
+    }
+    platform::close_fd(fd);
+    std::printf("expert_tier_test: %s\n", g_fail ? "FAILED" : "ok");
+    return g_fail ? 1 : 0;
+}
