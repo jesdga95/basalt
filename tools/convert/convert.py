@@ -809,12 +809,12 @@ def main():
     if a.dspark and (a.checkpoint or a.requant_dense_q6k or a.sections_from):
         ap.error("--dspark goes with --gguf")
     if a.requant_dense_q6k:
-        if a.sections_from or a.gguf or a.dense_q8_0:
+        if a.sections_from or a.gguf or a.dense_q8_0 or a.dry_run:
             ap.error("--requant-dense-q6k takes only --checkpoint, --out, --workers and --force")
         requant_dense(a)
         return
     if a.sections_from and a.checkpoint:
-        if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab:
+        if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab or a.dry_run:
             ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, "
                      "--stream-shards, --workers and --force")
         if not Path(a.checkpoint).is_dir():
@@ -824,7 +824,8 @@ def main():
         from_checkpoint(a)
         return
     if a.checkpoint:
-        if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards:
+        if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards \
+                or a.dry_run:
             ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --head, --workers and --force")
         if a.drafter and not Path(a.drafter).is_dir():
             ap.error(f"missing input: {a.drafter}")

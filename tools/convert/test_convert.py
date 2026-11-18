@@ -346,6 +346,9 @@ class ConvertTest(unittest.TestCase):
         r = run("--mtp-source", str(self.t))
         self.assertEqual(r.returncode, 2)
         self.assertIn("--mtp-dense", r.stderr)
+        r = run("--dry-run")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("takes only", r.stderr)
 
 
 class DrafterTest(unittest.TestCase):
