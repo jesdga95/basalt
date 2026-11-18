@@ -7,6 +7,7 @@
 // the tier places in groups of up to 8 rows beside the shared expert, routed_up). A row's result does not depend on the other
 // rows of its call: the dense products take 8 rows at most per launch with the single-row kernels' reduction order, the
 // attention kernels take a block per row, and the experts are run per row.
+#include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/elastic_array.hpp"
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
@@ -279,6 +280,99 @@ public:
         cudaStreamSynchronize(stream_);
         if (!tier_->replan(mib, e)) return {model::Status::Error, "hy4flash: " + e};
         expert_slots = tier_->slots();
+        return {};
+    }
+
+    // ---- conversations: the latent rows and pooled keys by position (save_cells / restore_cells), the rings by checkpoint
+    // (running_state). A ring holds the last swa_ring() (window layers) or kRawRing (indexer rows) positions, so a checkpoint
+    // at `pos` is intact while the session has not run more than kMaxRows rows past it.
+
+    int cell_format() const { return fp8() ? 1 : f32() ? 2 : 0; }
+    size_t ring_bytes() const { return (size_t) swa_ring() * kRowWidth * elem(); }
+    size_t raw_bytes() const { return (size_t) kRawRing * g_.idx_dim * 4; }
+
+    size_t running_bytes() const override {
+        size_t n = 0;
+        for (int l = 0; l < g_.n_layers; ++l) n += g_.swa[(size_t) l] ? ring_bytes() : 2 * raw_bytes();
+        return n;
+    }
+
+    model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
+        if (save && (int64_t) hist_.size() - pos > kMaxRows)
+            return {model::Status::Error, "hy4flash: the rings have moved on more than " + std::to_string(kMaxRows) + " positions past the checkpoint"};
+        if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "hy4flash: a checkpoint past the session's position"};
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) {
+                st.regions.push_back({cache_[(size_t) l], ring_bytes()});
+            } else {
+                st.regions.push_back({ival_[(size_t) l], raw_bytes()});
+                st.regions.push_back({igate_[(size_t) l], raw_bytes()});
+            }
+        }
+        st.stream = stream_;
+        return {};
+    }
+
+    model::Result running_restored(int64_t pos, const uint8_t*) override {
+        if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
+        dfly_.invalidate();   // DFLY HOOK
+        return {};
+    }
+
+    size_t cells_bytes(int64_t positions) const override {
+        int sparse = 0;
+        for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
+        return ctxp::cache_bytes(positions, sparse, fp8()) * (f32() ? 2 : 1);
+    }
+
+    model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
+        if (positions > backed_) return {model::Status::Error, "hy4flash: positions that were never run"};
+        cudaStreamSynchronize(stream_);
+        kv.clear();
+        const size_t rb = (size_t) sparse_row_bytes(), pools = (size_t) (positions / g_.idx_pool + 1), pb = (size_t) g_.idx_dim * 2;
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) continue;
+            core::ConversationKv k;
+            k.format = cell_format();
+            k.page_size = g_.idx_pool;
+            k.cells = positions;
+            k.pooled_rows = (int64_t) pools;
+            k.idx_dim = g_.idx_dim;
+            k.k.resize_for_overwrite((size_t) positions * rb);
+            k.pooled.resize_for_overwrite(pools * pb);
+            const auto down = [&](const uint8_t* dev, core::ConversationBuffer& to) {
+                return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) { return cudaMemcpy(p, dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess; });
+            };
+            if (!down(cache_[(size_t) l], k.k) || !down((const uint8_t*) ipool_[(size_t) l], k.pooled))
+                return {model::Status::Error, "hy4flash: reading a cache back failed"};
+            kv.push_back(std::move(k));
+        }
+        return {};
+    }
+
+    model::Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
+        std::string e;
+        if (!ensure_positions(positions, e)) return {model::Status::Error, "hy4flash: " + e};
+        cudaStreamSynchronize(stream_);
+        size_t i = 0;
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) continue;
+            if (i >= kv.size() || kv[i].format != cell_format() || kv[i].page_size != g_.idx_pool || kv[i].cells != positions)
+                return {model::Status::Error, "hy4flash: a parked conversation has other caches"};
+            const auto up = [&](uint8_t* dev, const core::ConversationBuffer& from) {
+                return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t at) { return cudaMemcpy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess; });
+            };
+            if (!up(cache_[(size_t) l], kv[i].k) || !up((uint8_t*) ipool_[(size_t) l], kv[i].pooled))
+                return {model::Status::Error, "hy4flash: writing a cache back failed"};
+            ++i;
+        }
+        dfly_.invalidate();   // DFLY HOOK
+        return {};
+    }
+
+    // the tokens below `n` come back with a restored conversation: the Engram's history
+    model::Result set_history(const int32_t* tokens, int64_t n) override {
+        hist_.assign(tokens, tokens + n);
         return {};
     }
 
