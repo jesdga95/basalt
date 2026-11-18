@@ -466,6 +466,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/mhc.cu
                         src/kernels/cuda/mhc_plain.cu
                         src/kernels/cuda/router.cu
+                        src/kernels/cuda/row_norm.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 if(BASALT_MODEL_QWEN4EXP)

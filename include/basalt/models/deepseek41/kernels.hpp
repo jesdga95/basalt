@@ -9,6 +9,7 @@
 
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/router.hpp"
+#include "basalt/kernels/row_norm.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -33,12 +34,9 @@ using kernels::router;
 
 // ---- row norms ------------------------------------------------------------------------------------------------
 
-/// out[t][i] = x[t][i] * rsqrt(mean(x[t]^2) + eps) * w[i], one fp32 row of n (multiple of 4, at most 8192) per token.
-void rms_norm_rows(const float* x, const float* w, int n_tokens, int n, float eps, float* out, void* stream);
-
-/// hc_pre followed by rms_norm_rows in one launch: cur = hc_pre(x, pre) is stored, out = rms_norm(cur) * w.
-void hc_pre_rms_norm(const float* x, const float* pre, int pre_stride, const float* w, int n_tokens, int n, float eps,
-                     float* cur, float* out, void* stream);
+// The row norms are shared (basalt/kernels/row_norm.hpp).
+using kernels::hc_pre_rms_norm;
+using kernels::rms_norm_rows;
 
 // ---- Engram ---------------------------------------------------------------------------------------------------
 
