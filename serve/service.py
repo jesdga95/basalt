@@ -1169,6 +1169,7 @@ class Service:
             opening, force = parser.feed(self.dialect.nothink_lead + force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
+        passes_done = []                                # each engine pass's DONE figures (a budget makes several)
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (--debug)
         emb = getattr(self.embeddings, "path", None)
@@ -1388,6 +1389,9 @@ class Service:
                                 if not leaving and not cancel.is_set():
                                     raise
                         run_last = getattr(self.engine, "last", None)
+                        if isinstance(run_last, dict) and run_last is not engine_last0 \
+                                and not any(x is run_last for x in passes_done):
+                            passes_done.append(run_last)
                         with self.status_lock:
                             st["run_windows"] = st["run_tokens"] = 0
                             if isinstance(run_last, dict) and run_last is not counted_last and run_last.get("windows"):
@@ -1479,6 +1483,10 @@ class Service:
                                 if getattr(self.engine, "last", None) is not engine_last0 else {}
                             if reused0 is not None and last.get("reused") is not None:
                                 last["reused"] = reused0
+                            if last and len(passes_done) > 1:   # several passes: read = the first, writing = all
+                                last["prompt_ms"] = passes_done[0].get("prompt_ms", last.get("prompt_ms"))
+                                last["decode_ms"] = sum(float(x.get("decode_ms") or 0) for x in passes_done)
+                                last["generated"] = sum(int(x.get("generated") or 0) for x in passes_done)
                             started = st.get("started", time.time())
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                             # experts read over PCIe or computed elsewhere are not in the hit rate's lookups
