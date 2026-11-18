@@ -67,6 +67,12 @@ class BenchFlags(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--kv") + 1], "int8")
         self.assertEqual(cmd.count("--max-context"), 1)
 
+    def test_a_flag_the_engine_keeps_every_value_of_is_passed_each_time(self):
+        cmd = self.command("--exp", "a=1", "--exp", "b=2", "--kv", "int8", "--kv", "f16")
+        self.assertEqual([cmd[i + 1] for i, w in enumerate(cmd) if w == "--exp"], ["a=1", "b=2"])
+        self.assertEqual(cmd.count("--kv"), 1)
+        self.assertEqual(cmd[cmd.index("--kv") + 1], "f16")
+
     def test_a_switch_does_not_take_the_next_option(self):
         cmd = self.command("--peer-exclusive", "-p", "16384", "-t", "prose", "--vram-reserve-mib", "-1")
         self.assertIn("--peer-exclusive", cmd)
