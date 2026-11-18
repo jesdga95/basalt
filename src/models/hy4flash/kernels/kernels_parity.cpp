@@ -409,22 +409,22 @@ void test_engram() {
     engram_apply(dkv, dkb, dgw, dgm, dhs, dv, T, a, dx, nullptr);
     std::vector<float> got = host(dx, (size_t) T * 4 * n);
     std::vector<double> ref((size_t) T * 4 * n);
-    auto rms = [&](const std::vector<double>& v) {
+    auto rms = [&](const std::vector<double>& v, double eps) {
         double ss = 0;
         for (double e : v) ss += e * e;
-        return 1.0 / std::sqrt(ss / v.size() + a.eps);
+        return 1.0 / std::sqrt(ss / v.size() + eps);
     };
     for (int t = 0; t < T; ++t) {
         std::vector<double> val(n);
         for (int j = 0; j < n; ++j) val[j] = (double) kv[((size_t) t * 5 + 4) * n + j] + kvb[(size_t) 4 * n + j];
-        const double rv = rms(val);
+        const double rv = rms(val, a.eps);
         for (int i = 0; i < 4; ++i) {
             std::vector<double> xi(n), key(n);
             for (int j = 0; j < n; ++j) {
                 xi[j] = x[((size_t) t * 4 + i) * n + j];
                 key[j] = (double) kv[((size_t) t * 5 + i) * n + j] + kvb[(size_t) i * n + j];
             }
-            const double rx = rms(xi), rk = rms(key);
+            const double rx = rms(xi, a.gate_eps), rk = rms(key, a.gate_eps);
             double d = 0;
             for (int j = 0; j < n; ++j) d += xi[j] * rx * key[j] * rk * gw[(size_t) i * n + j];
             d /= std::sqrt((double) n);
