@@ -19,6 +19,7 @@ option(WERROR "Treat compiler warnings as errors" OFF)
 # Optional peer architectures: building the peer-tier kernels for sm_89 (Ada) in addition to sm_120
 # allows a non-Blackwell card to serve as the expert tier, but adds build time.
 option(PEER_ADA "Compile peer kernels for sm_89 (Ada) in addition to sm_120" OFF)
+option(PEER_AMPERE "Compile peer kernels for sm_86 (Ampere) in addition to sm_120" OFF)
 if(BUILD_TESTING)
   enable_testing()
 endif()
@@ -387,10 +388,19 @@ target_link_libraries(basalt-load PRIVATE core kernels)
 endif()
 
 # Peer-tier compilation: the expert-window decode kernels, the peer prefill mmq/iota kernels and the
-# small utility kernels that run on the peer card additionally compile for sm_89 (Ada), so a non-Blackwell
-# card can serve as the expert tier. Must be set BEFORE the targets that compile these files are defined.
+# small utility kernels that run on the peer card additionally compile for sm_89 (Ada) or sm_86 (Ampere),
+# so a non-Blackwell card can serve as the expert tier. Both options may be on at once. Must be set
+# BEFORE the targets that compile these files are defined.
+set(BASALT_PEER_ARCH_FLAGS "")
 if(PEER_ADA)
   add_compile_definitions(BASALT_PEER_ADA=1)
+  list(APPEND BASALT_PEER_ARCH_FLAGS "--generate-code=arch=compute_89,code=sm_89")
+endif()
+if(PEER_AMPERE)
+  add_compile_definitions(BASALT_PEER_AMPERE=1)
+  list(APPEND BASALT_PEER_ARCH_FLAGS "--generate-code=arch=compute_86,code=sm_86")
+endif()
+if(BASALT_PEER_ARCH_FLAGS)
   set_source_files_properties(
     src/models/qwen4exp/kernels/dec_moe.cu
     src/models/qwen4exp/kernels/dec_moe_peer_q0_m0.cu
@@ -423,7 +433,7 @@ if(PEER_ADA)
     src/kernels/cuda/wait_abort.cu
     src/kernels/cuda/sampler.cu
     src/kernels/cuda/elementwise.cu
-    PROPERTIES COMPILE_OPTIONS "--generate-code=arch=compute_89,code=sm_89")
+    PROPERTIES COMPILE_OPTIONS "${BASALT_PEER_ARCH_FLAGS}")
 endif()
 
 # ---- kernels ----

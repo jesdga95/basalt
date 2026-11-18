@@ -137,15 +137,19 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err) {
 // A peer GPU runs only the expert tier's standard CUDA kernels (Q8_1/Q2_0 rows, shared-memory rings,
 // doorbells), which a build with -DPEER_ADA=ON also compiles for sm_89 (Ada).
 bool gpu_main_supported(const GpuCard& c) { return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0); }
-// sm_89 (Ada) is the one older architecture the peer kernels can be compiled for (when built with PEER_ADA);
-// a peer card of any other pre-Blackwell arch (or an sm_89 card without PEER_ADA) is rejected here
+// sm_89 (Ada, -DPEER_ADA=ON) and sm_86 (Ampere, -DPEER_AMPERE=ON) are the older architectures the peer
+// kernels can be compiled for; a peer card of any other pre-Blackwell arch, or one whose option is off,
+// is rejected here
 // rather than failing later with 'no kernel image' at the first peer launch.
 bool gpu_peer_supported(const GpuCard& c) {
+    if (c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0)) return true;
 #if defined(BASALT_PEER_ADA)
-    return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0) || (c.cc_major == 8 && c.cc_minor == 9);
-#else
-    return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0);
+    if (c.cc_major == 8 && c.cc_minor == 9) return true;
 #endif
+#if defined(BASALT_PEER_AMPERE)
+    if (c.cc_major == 8 && c.cc_minor == 6) return true;
+#endif
+    return false;
 }
 
 std::string gpu_label(const std::vector<GpuCard>& visible, int index) {
@@ -235,6 +239,13 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
 #if !defined(BASALT_PEER_ADA)
             if (visible[(size_t) i].cc_major == 8 && visible[(size_t) i].cc_minor == 9) {
                 c.error = "gpu: " + gpu_label(visible, i) + " is sm_89 (rebuild with -DPEER_ADA=ON to enable sm_89 peer support)";
+                c.cards.clear();
+                return c;
+            }
+#endif
+#if !defined(BASALT_PEER_AMPERE)
+            if (visible[(size_t) i].cc_major == 8 && visible[(size_t) i].cc_minor == 6) {
+                c.error = "gpu: " + gpu_label(visible, i) + " is sm_86 (rebuild with -DPEER_AMPERE=ON to enable sm_86 peer support)";
                 c.cards.clear();
                 return c;
             }
