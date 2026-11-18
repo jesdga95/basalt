@@ -21,10 +21,8 @@ struct DevTensor {
     std::vector<uint64_t> shape;
 };
 
-/// The longest context this build keeps (fp32 latent rows).
 /// The second cards whose expert tiers a start uses; later cards idle.
 constexpr int kMaxSecondCards = 3;
-constexpr int64_t kMaxContext = 131072;
 constexpr int64_t kDefaultContext = 8192;
 
 class Hy4Model final : public model::LoadedModel {

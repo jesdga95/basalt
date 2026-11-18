@@ -5,6 +5,7 @@
 // the shared latent (a window ring on the window layers, the indexer's selection on the others), the gate, the output
 // projection and its post-norm, the stream expansion, and the same for the FFN: the dense MLP, or the latent MoE (router,
 // the routed experts on the CPU beside the shared expert on the card, the up projection).
+#include "basalt/core/elastic_array.hpp"
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -15,6 +16,7 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
+#include "models/hy4flash/context_policy.hpp"
 #include "models/hy4flash/engram.hpp"
 #include "models/hy4flash/model.hpp"
 
@@ -33,6 +35,8 @@ namespace {
 namespace bk = basalt::kernels;
 
 constexpr int kRowWidth = 576;   // a cache row: 512 latent values and 64 rotated
+constexpr int kRawRing = 8;      // the indexer's rows of the last positions: a group of 4 and the one before it
+constexpr int64_t kGrowPositions = 16384;   // positions the caches are backed in
 constexpr uint64_t kModuleRoom = 7ull << 27;   // kernel modules still to load when the tier opens
 constexpr uint64_t kPromptRoom = 5ull << 29;   // the prompt path's workspaces beside the homes
 
@@ -102,14 +106,19 @@ public:
         ival_.assign((size_t) g_.n_layers, nullptr);
         igate_.assign((size_t) g_.n_layers, nullptr);
         ipool_.assign((size_t) g_.n_layers, nullptr);
+        ea_.resize((size_t) g_.n_layers);
+        pea_.resize((size_t) g_.n_layers);
         for (int l = 0; ok && l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) {
-                cache_[(size_t) l] = f((int64_t) g_.window * kRowWidth);
+                cache_[(size_t) l] = (uint16_t*) alloc((size_t) g_.window * kRowWidth * 2, ok);
             } else {
-                cache_[(size_t) l] = f(ctx * kRowWidth);
-                ival_[(size_t) l] = f(ctx * g_.idx_dim);
-                igate_[(size_t) l] = f(ctx * g_.idx_dim);
-                ipool_[(size_t) l] = f(pools * g_.idx_dim);
+                ea_[(size_t) l] = std::make_unique<core::ElasticArray>();
+                pea_[(size_t) l] = std::make_unique<core::ElasticArray>();
+                if (!ea_[(size_t) l]->open((uint64_t) ctx * kRowWidth * 2, err) || !pea_[(size_t) l]->open((uint64_t) pools * g_.idx_dim * 4, err)) return false;
+                cache_[(size_t) l] = (uint16_t*) ea_[(size_t) l]->data();
+                ipool_[(size_t) l] = (float*) pea_[(size_t) l]->data();
+                ival_[(size_t) l] = f((int64_t) kRawRing * g_.idx_dim);
+                igate_[(size_t) l] = f((int64_t) kRawRing * g_.idx_dim);
             }
         }
         if (!ok) {
@@ -225,7 +234,7 @@ private:
         mm(T(l, "attn_kv_a_mqa.weight"), q8a_, kvraw_, E, rank + g_.rope_dim);
         q8_0_heads_gemv(T(l, "attn_k_b.weight")->ptr, q_, g_.qk_dim, H, rank, a.nope, qabs_, stream_);
         const int64_t slot = swa ? pos % g_.window : pos;
-        float* cache = cache_[(size_t) l];
+        uint16_t* cache = cache_[(size_t) l];
         mla_prepare(q_, qabs_, kvraw_, F(l, "attn_kv_a_norm.weight"), a, (int) pos, qcur_, cache + (size_t) slot * kRowWidth, stream_);
         if (swa) {
             const int first = (int) std::max<int64_t>(0, pos + 1 - g_.window);
@@ -260,11 +269,11 @@ private:
         quant(ikn_, q8d(), D);
         float* vals = ival_[(size_t) l];
         float* gates = igate_[(size_t) l];
-        mm(T(l, "indexer_compressor_value.weight"), q8d(), vals + (size_t) pos * D, D, D);
-        mm(T(l, "indexer_compressor_gate.weight"), q8d(), gates + (size_t) pos * D, D, D);
+        mm(T(l, "indexer_compressor_value.weight"), q8d(), vals + (size_t) (pos % kRawRing) * D, D, D);
+        mm(T(l, "indexer_compressor_gate.weight"), q8d(), gates + (size_t) (pos % kRawRing) * D, D, D);
         if ((pos + 1) % P == 0) {
             const int64_t p0 = pos + 1 - P;
-            idx_pool(vals + (size_t) p0 * D, gates + (size_t) p0 * D, F(l, "indexer_compressor_ape.weight"),
+            idx_pool(vals + (size_t) (p0 % kRawRing) * D, gates + (size_t) (p0 % kRawRing) * D, F(l, "indexer_compressor_ape.weight"),
                      F(l, "indexer_compressor_norm.weight"), a, (int) p0, ipool_[(size_t) l] + (size_t) (pos / P) * D, stream_);
         }
         const int keep = g_.idx_top_k / P - (g_.idx_select_tail ? 1 : 0);
@@ -491,6 +500,7 @@ private:
             return false;
         }
         hist_.resize((size_t) pos);   // a position before the end drops the rows after it
+        if (!ensure_positions(pos + 1, err)) return false;
         if (tier_) tier_->begin_token(1);
         hist_.push_back(token);
         if (lookup_loaded_.empty()) lookup_loaded_.assign(m_.pack().engram.layers.size(), false);
@@ -542,6 +552,22 @@ private:
             err = std::string("CUDA: ") + cudaGetErrorString(ce);
             return false;
         }
+        return true;
+    }
+
+    // Backs the sparse layers' caches for `positions` positions, in steps of kGrowPositions.
+    bool ensure_positions(int64_t positions, std::string& err) {
+        if (positions <= backed_) return true;
+        const int64_t target = std::min<int64_t>(m_.context(), (positions + kGrowPositions - 1) / kGrowPositions * kGrowPositions);
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) continue;
+            if (!ea_[(size_t) l]->ensure((uint64_t) target * kRowWidth * 2, 256ull << 20, err) ||
+                !pea_[(size_t) l]->ensure((uint64_t) (target / g_.idx_pool + 1) * g_.idx_dim * 4, 256ull << 20, err)) {
+                err = "the latent caches cannot grow to " + std::to_string(target) + " positions: " + err;
+                return false;
+            }
+        }
+        backed_ = target;
         return true;
     }
 
@@ -597,7 +623,10 @@ private:
     std::shared_ptr<core::ExpertTier> tier_;
     std::vector<float> lookup_host_;
     std::vector<bool> lookup_loaded_;
-    std::vector<float*> cache_, ival_, igate_, ipool_;
+    std::vector<uint16_t*> cache_;
+    std::vector<float*> ival_, igate_, ipool_;
+    std::vector<std::unique_ptr<core::ElasticArray>> ea_, pea_;
+    int64_t backed_ = 0;   // positions the sparse layers' caches are backed for
     std::vector<int32_t> hist_;
     int last_row_ = -1;
 };
