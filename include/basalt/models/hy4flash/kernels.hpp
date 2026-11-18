@@ -68,6 +68,13 @@ void add_vectors(const float* a, const float* b, float* out, int n, void* stream
 
 // ---- MoE ----------------------------------------------------------------------------------------------------------
 
+/// Row pointers of the routed experts' outputs (device or mapped host memory).
+struct RowPtrs {
+    const float* p[16];
+};
+/// out[i] = sum_k w[k] * rows.p[k][i] for k < n_rows, in that order.
+void weighted_sum_rows(const RowPtrs& rows, const float* w, int n_rows, int n, float* out, void* stream);
+
 /// The router of one token: logits = gate . x (gate fp32 [n_expert][n_embd]); s = sigmoid(logits); the top-k of s + bias
 /// (a lower index wins a tie); weights the unbiased s of those over their sum, times `scale`. n_expert <= 512, k <= 16.
 void router_sigmoid(const float* x, const float* gate, const float* bias, int n_expert, int n_embd, int k, float scale,
