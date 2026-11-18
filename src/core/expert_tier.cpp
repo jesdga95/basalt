@@ -241,6 +241,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
         if (!reads_.open(s_.path, s_.fd, err)) return false;
         uses_.assign((size_t) n_layers_ * n_expert_, 0);
     }
+    if (s_.admit_uses > 0) uses_.assign((size_t) n_layers_ * n_expert_, 0);
     // what the start picked by itself, on the server's auto line; the RAM floor the tier left free
     std::printf("auto flags: resident %.1f GB, pool-workers %d\n",
                 (double) one_each_ram * cover_ / 1e9, pool_->workers());   // the server keeps the words after the name
@@ -705,7 +706,8 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         } else {
             lk.dev[i] = nullptr;
             lk.host[i] = blob_of(layer, e);
-            lk.again[i] = core::policy::repeat_miss(last_miss_[idx], token_, core::policy::kPromoteWindow);
+            lk.again[i] = s_.admit_uses > 0 ? core::policy::count_use(uses_[idx], s_.admit_uses)
+                                            : core::policy::repeat_miss(last_miss_[idx], token_, core::policy::kPromoteWindow);
             ++(pinned(layer, e) && !lk.reading[i] ? ram_hits_ : file_hits_);
             last_miss_[idx] = token_ + 1;
             ++cpu_;
@@ -952,8 +954,10 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     // with the RAM tier caching the file the bus stays with the reads and the promotions
     if (s_.diag_tier_frozen || reads_.is_open()) return 0;
     int np = 0, nf = 0;
+    // with an admission threshold only an expert that earned its slot goes over the bus; the others stay with the CPU
+    const auto eligible = [&](int i) { return pinned(layer, lk.experts[i]) && (s_.admit_uses == 0 || lk.again[i]); };
     for (int i = 0; i < lk.k; ++i)
-        if (!lk.dev[i] && !lk.peer[i]) ++(pinned(layer, lk.experts[i]) ? np : nf);
+        if (!lk.dev[i] && !lk.peer[i]) ++(eligible(i) ? np : nf);
     int left = core::policy::bus_count(np, nf);
     // A second card fetches some over its own link into a scratch slot and computes them there. Their main card slots are
     // claimed all the same, filled behind the window's work as a promotion is, so every expert's place is the one the
@@ -963,7 +967,7 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     const uint64_t bytes = s_.layers[(size_t) layer].blob_bytes;
     int started = 0;
     for (int i = lk.k - 1; i >= 0 && left > 0; --i) {
-        if (lk.dev[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
+        if (lk.dev[i] || !eligible(i)) continue;   // pinned sources only
         --left;
         const int32_t slot = far > 0 ? claim(layer, lk.experts[i], lk.host[i], copy_stream_, false, false, /*later=*/true)
                                      : claim(layer, lk.experts[i], lk.host[i], fetch_stream_, false, /*whole=*/true);
@@ -991,7 +995,7 @@ void ExpertTier::promote(int layer, const Lookup& lk) {
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || lk.fetched[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
         // with the RAM tier caching the file, the experts the CPU keeps computing; else a repeat miss
-        if (reads_.is_open() ? !core::policy::count_use(uses_[(size_t) layer * n_expert_ + lk.experts[i]]) : !lk.again[i]) continue;
+        if (reads_.is_open() && s_.admit_uses == 0 ? !core::policy::count_use(uses_[(size_t) layer * n_expert_ + lk.experts[i]]) : !lk.again[i]) continue;
         if (!move_to_peer(layer, lk.experts[i], lk.host[i]))
             claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true, /*whole=*/false, /*later=*/true);
     }

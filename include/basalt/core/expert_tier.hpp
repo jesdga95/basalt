@@ -63,6 +63,9 @@ struct ExpertTierSpec {
     kernels::cpu::PoolAffinity pool_affinity = kernels::cpu::PoolAffinity::All;
     bool pool_affinity_given = false;
     std::string expert_profile;   ///< the routing order of the experts (empty: the file's own)
+    /// CPU uses that earn a slot (policy::count_use) for every placement; 0: the repeat-miss rule with RAM holding all
+    /// experts and kPromoteUses with the file's, the way the first model ran them.
+    int admit_uses = 0;
     /// The prompt path's host buffers, which are allocated before the RAM tier is sized beside them. Each is optional.
     struct Host {
         std::function<bool(std::string&)> open;                 ///< before the RAM tier is sized
