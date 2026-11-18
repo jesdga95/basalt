@@ -24,12 +24,14 @@
 #include "models/hy4flash/context_policy.hpp"
 #include "models/hy4flash/engram.hpp"
 #include "models/hy4flash/model.hpp"
+#include "models/hy4flash/vision_encoder.hpp"   // [vision]
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <utility>
@@ -120,6 +122,7 @@ public:
         rowptr_d_ = (const float**) alloc(kLookupK * sizeof(void*), ok);
         h_rowptr_ = (const float**) pin(kLookupK * 2);
         h_rw_ = pin(kMaxWindow * 16); h_ids_ = (int32_t*) pin(kMaxWindow * 16);
+        rope_dev_ = (int32_t*) alloc((size_t) ctx * 12, ok);   // [vision] the 3-D rotary position of every cell
         h_erows_ = pin(R * g_.n_embd); h_e_ = pin(R * E); h_evalid_ = pin(R);
         if (cudaHostAlloc((void**) &h_plan_, sizeof(WindowPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
         else pinned_.push_back(h_plan_);
@@ -183,6 +186,40 @@ public:
             }
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "hy4flash: the prompt failed"};
+        return {};
+    }
+
+    // ---- [vision] images (vision.hpp, vision_encoder.hpp) ------------------------------------------------------------------
+    // The Engram of an image row: llama.cpp's hy-v4-flash treats an embedding position as a token that cannot be hashed, so its own
+    // contribution is masked (valid 0) and, to the rows after it, it is a padded history entry. The history therefore holds -1 for
+    // an image row, which engram_ids reads as "no n-gram" on both counts.
+    model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid& grid) override {
+        vision::Image img;
+        std::string err;
+        if (!vision::decode_image(data, bytes, img, err) || !vis_.encode(m_.pack().vision, img, rows, n_rows, grid, err))
+            return {model::Status::Error, "hy4flash: " + err};
+        if (n_rows <= 0 || rows.size() != (size_t) n_rows * (size_t) g_.n_embd)
+            return {model::Status::Error, "hy4flash: the projector's rows are not the model's width"};
+        return {};
+    }
+    void images_done() override { vis_.release(); }
+    // The rows of a picture block (newline rows included) at positions pos..: chunks of the row pass with the rows as the embeddings.
+    model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid grid) override {
+        if (grid.nx <= 0 || (int64_t) grid.nx * grid.ny != n_rows) return {model::Status::Error, "hy4flash: an image block needs its grid"};
+        sync_rope(pos);
+        img_start_ = rope_.next();
+        img_nx_ = grid.nx;
+        std::string err;
+        const std::vector<int32_t> dead((size_t) kMaxRows, -1);
+        for (int at = 0; at < n_rows; at += kMaxRows) {
+            const int n = std::min(kMaxRows, n_rows - at);
+            emb_rows_ = rows + (size_t) at * (size_t) g_.n_embd;
+            img_j_ = at;
+            const bool ok = run_rows(dead.data(), n, pos + at, 0, err);
+            emb_rows_ = nullptr;
+            if (!ok) return {model::Status::Error, "hy4flash: " + err};
+        }
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "hy4flash: the image rows failed"};
         return {};
     }
 
@@ -273,6 +310,9 @@ private:
         a.rope_base = base;
         a.scale = 1.0f / std::sqrt((float) g_.qk_dim);
         a.rms_eps = g_.rms_eps;
+        a.cell_rope = rope_on_ ? rope_dev_ : nullptr;   // [vision]
+        a.sec_h = kMropeH;
+        a.sec_w = kMropeW;
         return a;
     }
 
@@ -351,6 +391,9 @@ private:
         a.pool = P;
         a.rope_base = g_.rope_base;
         a.eps = g_.rms_eps;
+        a.cell_rope = rope_on_ ? rope_dev_ : nullptr;   // [vision]
+        a.sec_h = kMropeH;
+        a.sec_w = kMropeW;
         gemm(T(l, "indexer.attn_k.weight"), xn_, ik_, E, D, R);
         bk::rms_norm_rows(ik_, F(l, "indexer.k_norm.weight"), ikn_, R, D, g_.rms_eps, stream_);
         gemm(T(l, "indexer_compressor_value.weight"), ikn_, ivt_, D, D, R);
@@ -625,7 +668,7 @@ private:
             return false;
         }
         for (int t = 0; t < R; ++t)
-            if (tokens[t] < 0 || tokens[t] >= g_.n_vocab) {
+            if ((tokens[t] < 0 && !emb_rows_) || tokens[t] >= g_.n_vocab) {   // [vision] -1: an embedding row
                 err = "token " + std::to_string(tokens[t]) + " is out of the vocabulary";
                 return false;
             }
@@ -636,6 +679,7 @@ private:
         hist_.resize((size_t) pos0);   // a position before the end drops the rows after it
         hist_.insert(hist_.end(), tokens, tokens + R);
         if (!ensure_positions(pos0 + R, err)) return false;
+        place_rope(pos0, R);   // [vision]
         if (tier_) tier_->begin_token(std::min(R, kMaxWindow));
         const int E = g_.n_embd;
         bk::HcPlainArgs hc;
@@ -644,7 +688,9 @@ private:
         hc.hc_eps = g_.hc_eps;
         hc.magnitude = g_.hc_magnitude;
         for (int t = 0; t < R; ++t)
-            if (!m_.embedding_row(tokens[t], h_e_ + (size_t) t * E)) {
+            if (emb_rows_) {   // [vision] an image row stands in for the token's embedding
+                std::memcpy(h_e_ + (size_t) t * E, emb_rows_ + (size_t) t * E, (size_t) E * 4);
+            } else if (!m_.embedding_row(tokens[t], h_e_ + (size_t) t * E)) {
                 err = "no embedding row";
                 return false;
             }
@@ -702,6 +748,27 @@ private:
         }
         backed_ = target;
         return true;
+    }
+
+    // [vision] The rotary positions of the R cells about to be filled (text, or the rows of the picture block being fed), kept per
+    // cell on the host and, once a picture is in the session, on the device where the kernels read them (MlaArgs::cell_rope).
+    void sync_rope(int64_t pos) {
+        rope_.rewind(pos);
+        while (rope_.size() < pos) rope_.push_text();   // cells the session never placed (a restored history) count as text
+    }
+    void place_rope(int64_t pos0, int R) {
+        sync_rope(pos0);
+        const bool was_on = rope_on_;
+        for (int t = 0; t < R; ++t) {
+            if (emb_rows_) { rope_.push_row(img_start_, img_nx_, img_j_ + t); rope_on_ = true; }
+            else rope_.push_text();
+        }
+        if (!rope_on_) return;
+        std::vector<int32_t> tab;
+        const int64_t from = was_on ? pos0 : 0;
+        for (int64_t c = from; c < pos0 + R; ++c) tab.insert(tab.end(), {rope_.at(c).t, rope_.at(c).h, rope_.at(c).w});
+        cudaMemcpyAsync(rope_dev_ + from * 3, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice, stream_);
+        cudaStreamSynchronize(stream_);   // the host table is a temporary
     }
 
     // diagnostic: a tensor of this call appended to <dir>/<name>.f32
@@ -770,6 +837,14 @@ private:
     std::vector<std::unique_ptr<core::ElasticArray>> ea_, pea_;
     int64_t backed_ = 0;   // positions the sparse layers' caches are backed for
     std::vector<int32_t> hist_, picks_;
+    // [vision]
+    ImageEncoder vis_;
+    RopeTrack rope_;
+    int32_t* rope_dev_ = nullptr;
+    bool rope_on_ = false;               // a picture has been fed: the kernels read the rotary table
+    const float* emb_rows_ = nullptr;    // the embeddings of the rows being run, in place of the tokens'
+    int32_t img_start_ = 0;              // the first position of the block being fed
+    int img_nx_ = 1, img_j_ = 0;         // its columns (newline included) and the row of its first run row
     int last_rows_ = 0;
 };
 

@@ -9,6 +9,7 @@
 #include "basalt/platform/compiler.hpp"
 
 #include "gemm_cpu.hpp"
+#include "hy4_weights.hpp"
 
 namespace basalt::vision {
 
@@ -26,6 +27,8 @@ void parallel_for(int threads, int n, const std::function<void(int, int)>& fn) {
     }
     for (auto& t : ts) t.join();
 }
+
+float gelu_erf(float x) { return 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f)); }
 
 float gelu_exact(float x) {
     return 0.5f * x * (1.0f + tanhf(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x)));
@@ -67,22 +70,44 @@ bool CpuEncoder::init(const Mmproj& mp, int threads, bool round_bf16, bool f16_q
         return false;
     }
     const int64_t E = h.embd, F = h.ffn;
+    hy4_ = mp.projector() == "hy_v4_flash";
     auto f32 = [&](const std::string& n, int64_t e) { const auto* t = mp.need(n, 0, e, err); return t ? (const float*) t->data : nullptr; };
     auto b16 = [&](const std::string& n, int64_t e) { const auto* t = mp.need(n, 30, e, err); return t ? (const uint16_t*) t->data : nullptr; };
-    const float *w0 = f32("v.patch_embd.weight", E * 768), *w1 = f32("v.patch_embd.weight.1", E * 768);
+    const float *w0 = f32("v.patch_embd.weight", E * 768), *w1 = hy4_ ? w0 : f32("v.patch_embd.weight.1", E * 768);
     bpatch_ = f32("v.patch_embd.bias", E);
-    pos_ = f32("v.position_embd.weight", E * 2304);
-    postw_ = f32("v.post_ln.weight", E);
-    postb_ = f32("v.post_ln.bias", E);
+    if (hy4_) {
+        const TensorRef* pt = mp.find("v.position_embd.weight");
+        const int64_t rows = pt && pt->ne.size() == 2 && pt->ne[0] == E ? pt->ne[1] : 0;
+        edge_ = (int) std::lround(std::sqrt((double) rows));
+        if (edge_ < 2 || (int64_t) edge_ * edge_ != rows) { err = "the position table of the projector is not a square grid"; return false; }
+        pos_ = f32("v.position_embd.weight", E * rows);
+        postw_ = f32("mm.pre_norm.weight", E);
+        postb_ = postw_;
+        newline_ = f32("v.image_newline", h.proj);
+        if (!newline_) return false;
+    } else {
+        pos_ = f32("v.position_embd.weight", E * 2304);
+        postw_ = f32("v.post_ln.weight", E);
+        postb_ = f32("v.post_ln.bias", E);
+    }
     bm0_ = f32("mm.0.bias", 4 * E);
     bm2_ = f32("mm.2.bias", h.proj);
-    wm0_ = b16("mm.0.weight", 4 * E * 4 * E);
-    wm2_ = b16("mm.2.weight", 4 * E * h.proj);
+    if (hy4_) {
+        own_w_.resize(2);
+        own_w_[0].resize((size_t) 4 * E * 4 * E);
+        own_w_[1].resize((size_t) 4 * E * h.proj);
+        if (!hy4::merge_matrix(mp, (int) E, own_w_[0].data(), err) || !hy4::out_matrix(mp, (int) E, h.proj, own_w_[1].data(), err)) return false;
+        wm0_ = own_w_[0].data();
+        wm2_ = own_w_[1].data();
+    } else {
+        wm0_ = b16("mm.0.weight", 4 * E * 4 * E);
+        wm2_ = b16("mm.2.weight", 4 * E * h.proj);
+    }
     if (!w0 || !w1 || !bpatch_ || !pos_ || !postw_ || !postb_ || !bm0_ || !bm2_ || !wm0_ || !wm2_) return false;
     wpatch_.resize((size_t) E * 768);
-    for (size_t i = 0; i < wpatch_.size(); ++i) wpatch_[i] = w0[i] + w1[i];
-    wpatch2_.resize((size_t) E * 1536);
-    for (int64_t e = 0; e < E; ++e)
+    for (size_t i = 0; i < wpatch_.size(); ++i) wpatch_[i] = hy4_ ? w0[i] : w0[i] + w1[i];
+    wpatch2_.resize(hy4_ ? 0 : (size_t) E * 1536);
+    for (int64_t e = 0; !hy4_ && e < E; ++e)
         for (int c = 0; c < 3; ++c) {
             std::memcpy(&wpatch2_[(size_t) e * 1536 + c * 512], w0 + e * 768 + c * 256, 256 * sizeof(float));
             std::memcpy(&wpatch2_[(size_t) e * 1536 + c * 512 + 256], w1 + e * 768 + c * 256, 256 * sizeof(float));
@@ -95,11 +120,26 @@ bool CpuEncoder::init(const Mmproj& mp, int threads, bool round_bf16, bool f16_q
         L.ln1b = f32(p + "ln1.bias", E);
         L.ln2w = f32(p + "ln2.weight", E);
         L.ln2b = f32(p + "ln2.bias", E);
-        L.bqkv = f32(p + "attn_qkv.bias", 3 * E);
+        if (hy4_) {   // q, k and v are three tensors in the file, one product here
+            own_w_.emplace_back((size_t) 3 * E * E);
+            own_b_.emplace_back((size_t) 3 * E);
+            static const char* const qkv[3] = {"attn_q", "attn_k", "attn_v"};
+            for (int i = 0; i < 3; ++i) {
+                const uint16_t* w = b16(p + qkv[i] + ".weight", E * E);
+                const float* b = f32(p + qkv[i] + ".bias", E);
+                if (!w || !b) return false;
+                std::memcpy(&own_w_.back()[(size_t) i * E * E], w, (size_t) E * E * 2);
+                std::memcpy(&own_b_.back()[(size_t) i * E], b, (size_t) E * 4);
+            }
+            L.wqkv = own_w_.back().data();
+            L.bqkv = own_b_.back().data();
+        } else {
+            L.bqkv = f32(p + "attn_qkv.bias", 3 * E);
+        }
         L.bo = f32(p + "attn_out.bias", E);
         L.bup = f32(p + "ffn_up.bias", F);
         L.bdown = f32(p + "ffn_down.bias", E);
-        L.wqkv = b16(p + "attn_qkv.weight", 3 * E * E);
+        if (!hy4_) L.wqkv = b16(p + "attn_qkv.weight", 3 * E * E);
         L.wo = b16(p + "attn_out.weight", E * E);
         L.wup = b16(p + "ffn_up.weight", F * E);
         L.wdown = b16(p + "ffn_down.weight", E * F);
@@ -114,7 +154,8 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
     const Hparams& hp = mp_->hp();
     const int E = hp.embd, F = hp.ffn, H = hp.heads, D = E / H, gx = canvas.w / 16, gy = canvas.h / 16;
     const int n = gx * gy;
-    const bool pair = (int64_t) patches.size() == (int64_t) n * 1536;   // a video group: the two taps apart
+    const bool pair = !hy4_ && (int64_t) patches.size() == (int64_t) n * 1536;   // a video group: the two taps apart
+    if (hy4_ && gx % 2 != 0) return false;
     if (n % 4 != 0 || (!pair && (int) patches.size() != n * 768)) return false;
     std::vector<float> x((size_t) n * E), h((size_t) n * E), qkv((size_t) n * 3 * E), att((size_t) n * E),
         tmp((size_t) n * E), ffn((size_t) n * F), attk((size_t) H * n * D), attv((size_t) H * D * n);
@@ -126,8 +167,18 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
     if (pair) gemm_f32w(p16.data(), wpatch2_.data(), x.data(), n, E, 1536, T);
     else gemm_f32w(p16.data(), wpatch_.data(), x.data(), n, E, 768, T);
     {
-        const int S = 48;
+        const int S = hy4_ ? edge_ : 48;
         auto src = [&](int axis_out, int axis_in, int i, int& i0, int& i1, float& d) {
+            if (hy4_) {   // the reference's scale factor (size + 0.1) / S, align_corners false (torch's upsample_bilinear2d)
+                if (axis_out == axis_in) { i0 = i1 = i; d = 0.0f; return; }   // torch copies an axis whose size is unchanged
+                const float inv = (float) (1.0 / (((double) axis_out + 0.1) / axis_in));
+                const float v = std::max(inv * ((float) i + 0.5f) - 0.5f, 0.0f);
+                const int a = std::min((int) floorf(v), axis_in - 1);
+                i0 = a;
+                i1 = a + (a < axis_in - 1 ? 1 : 0);
+                d = std::max(0.0f, std::min(v - (float) a, 1.0f));
+                return;
+            }
             float sf = (float) axis_out / axis_in;
             if (axis_out > 1 && axis_in > 1) sf = (float) (axis_out - 1) / (axis_in - 1);
             const float v = (float) i / sf;
@@ -150,7 +201,8 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
                 for (int c = 0; c < E; ++c) {
                     const float a = pos_[((size_t) y0 * S + x0) * E + c], b = pos_[((size_t) y0 * S + x1) * E + c],
                                 cc = pos_[((size_t) y1 * S + x0) * E + c], d = pos_[((size_t) y1 * S + x1) * E + c];
-                    const float pe = a * (1 - dx) * (1 - dy) + b * dx * (1 - dy) + cc * (1 - dx) * dy + d * dx * dy;
+                    const float pe = hy4_ ? (1 - dy) * ((1 - dx) * a + dx * b) + dy * ((1 - dx) * cc + dx * d)
+                                          : a * (1 - dx) * (1 - dy) + b * dx * (1 - dy) + cc * (1 - dx) * dy + d * dx * dy;
                     row[c] += bpatch_[c] + pe;
                 }
             }
@@ -159,8 +211,8 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
     if (tap) tap("embed", x.data(), x.size());
 
     // rotation tables per patch: 36 cos/sin pairs, rows in merge order
-    std::vector<float> rc((size_t) n * 36), rs((size_t) n * 36);
-    {
+    std::vector<float> rc(hy4_ ? 0 : (size_t) n * 36), rs(hy4_ ? 0 : (size_t) n * 36);
+    if (!hy4_) {
         const float ts = powf(10000.0f, -2.0f / 36);
         for (int t = 0; t < n; ++t) {
             const int g = t / 4, r = t % 4;
@@ -183,7 +235,7 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
             for (int t = t0; t < t1; ++t) {
                 float* r = &qkv[(size_t) t * 3 * E];
                 for (int i = 0; i < 3 * E; ++i) r[i] += L.bqkv[i];
-                for (int part = 0; part < 2; ++part)
+                for (int part = 0; !hy4_ && part < 2; ++part)
                     for (int hd = 0; hd < H; ++hd) {
                         float* v = r + part * E + hd * D;
                         for (int j = 0; j < 36; ++j) {
@@ -254,19 +306,41 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
         });
         if (tap) tap("layer_out." + std::to_string(l), x.data(), x.size());
     }
-    layer_norm(x.data(), postw_, postb_, h.data(), n, E, hp.eps, T);
+    if (hy4_) {
+        for (int t = 0; t < n; ++t) {
+            const float* xr = &x[(size_t) t * E];
+            double sq = 0;
+            for (int i = 0; i < E; ++i) sq += (double) xr[i] * xr[i];
+            const float inv = 1.0f / sqrtf((float) (sq / E) + hp.eps);
+            for (int i = 0; i < E; ++i) h[(size_t) t * E + i] = xr[i] * inv * postw_[i];
+        }
+    } else {
+        layer_norm(x.data(), postw_, postb_, h.data(), n, E, hp.eps, T);
+    }
     if (tap) tap("post_ln", h.data(), h.size());
     const int m = n / 4, P = hp.proj;
     std::vector<float> mid((size_t) m * 4 * E);
     gemm_bf16w(h.data(), wm0_, mid.data(), m, 4 * E, 4 * E, T, round_);
     parallel_for(T, m, [&](int t0, int t1) {
         for (int t = t0; t < t1; ++t)
-            for (int c = 0; c < 4 * E; ++c) mid[(size_t) t * 4 * E + c] = f16_ ? gelu_f16(mid[(size_t) t * 4 * E + c] + bm0_[c]) : gelu_exact(mid[(size_t) t * 4 * E + c] + bm0_[c]);
+            for (int c = 0; c < 4 * E; ++c) {
+                const float v = mid[(size_t) t * 4 * E + c] + bm0_[c];
+                mid[(size_t) t * 4 * E + c] = hy4_ ? gelu_erf(v) : f16_ ? gelu_f16(v) : gelu_exact(v);
+            }
     });
     out.resize((size_t) m * P);
     gemm_bf16w(mid.data(), wm2_, out.data(), m, P, 4 * E, T, round_);
     for (int t = 0; t < m; ++t)
         for (int c = 0; c < P; ++c) out[(size_t) t * P + c] += bm2_[c];
+    if (hy4_) {   // each line of gx / 2 merged rows is followed by the newline row
+        const int ow = gx / 2, lines = m / ow;
+        std::vector<float> lined((size_t) (m + lines) * P);
+        for (int r = 0; r < lines; ++r) {
+            std::memcpy(&lined[(size_t) r * (ow + 1) * P], &out[(size_t) r * ow * P], (size_t) ow * P * sizeof(float));
+            std::memcpy(&lined[((size_t) r * (ow + 1) + ow) * P], newline_, (size_t) P * sizeof(float));
+        }
+        out.swap(lined);
+    }
     if (tap) tap("out", out.data(), out.size());
     return true;
 }

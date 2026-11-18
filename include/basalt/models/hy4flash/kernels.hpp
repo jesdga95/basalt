@@ -17,6 +17,11 @@ struct MlaArgs {
     float rope_base = 1e7f;                  ///< rotation of consecutive pairs
     float scale = 0.0625f;                   ///< of the scores
     float rms_eps = 1e-5f;                   ///< of the latent's norm
+    /// Interleaved MRoPE for pictures: when `cell_rope` (device, [cell][3] = t, h, w) is set, pair i of the rotated part of the row at
+    /// cell c turns by the h axis of c when i % 3 == 1 and i < 3 * sec_h, by the w axis when i % 3 == 2 and i < 3 * sec_w, by the t
+    /// axis otherwise; null: every pair turns by the cell index, as text does.
+    const int32_t* cell_rope = nullptr;
+    int sec_h = 0, sec_w = 0;
 };
 
 /// A product per head over Q8_0 rows, for n_tok tokens: y[t][h][r] = w[h * rows + r] . x[t][h] for h < heads, r < rows, over `k`
@@ -71,6 +76,11 @@ struct IndexerArgs {
     int heads = 16, dim = 128, rope = 64, pool = 4;
     float rope_base = 1e7f;
     float eps = 1e-5f;   ///< of the pooled key's norm
+    /// Interleaved MRoPE for pictures: when `cell_rope` (device, [cell][3] = t, h, w) is set, pair i of the rotated part of the row at
+    /// cell c turns by the h axis of c when i % 3 == 1 and i < 3 * sec_h, by the w axis when i % 3 == 2 and i < 3 * sec_w, by the t
+    /// axis otherwise; null: every pair turns by the cell index, as text does.
+    const int32_t* cell_rope = nullptr;
+    int sec_h = 0, sec_w = 0;
 };
 
 /// The pooled keys of n_groups consecutive groups of `pool` positions starting at first_pos (a multiple of `pool`): the rows of

@@ -155,16 +155,48 @@ reach 75 % of experts.
 
 ## Vision
 
-The ViT is Qwen3-VL's So400m geometry (27 x 1152, 16 heads, 4304 MLP, patch 16, merge 2), so `src/vision/encoder_cuda.cu` (written for the Qwen3-VL style projector file) should run it with these changes:
-lent memory by `attach`/`detach`, BF16 weights, fp16 tensor-core attention. The position table is 128 x 128 (read from the
-pack, interpolated per grid); the projector is RMS then two linear layers (`proj.0`, `proj.1`), not Qwen's merger, and there are
-no deepstack taps; `image_newline` is a row in the file. `preprocess.hpp` takes the resize filter as a parameter (Lanczos, the
-processor's `resample: 1`, next to the bicubic Flash-Next uses), `fit_size` the Hy4 bounds (min_pixels 4,096, max_pixels
-4,194,304, 4,096 merged tokens). `--vision dynamic` only (as DS). Prompt: `image_start` pad-run `image_end` expand to rows; if the
-processor inserts `image_newline` per grid row, DeepSeek's layout `lh x (lw + 1) + 2` applies. Image rows enter as embeddings
-(Engram masked, valid 0). MRoPE: interleaved 12/10/10; `mrope_positions.hpp` (the Qwen3-VL rule) after a check against the
-processor's `get_rope_index`; the pooled indexer keys use the group's first position plane (to confirm against the reference).
-Video is out of the first cut. Open: the processor's exact token layout and rope index (run `HYV4FlashProcessor` on CPU once).
+The ViT runs on `src/vision/encoder_cuda.cu` (and the CPU reference `encoder_cpu.cpp`) selected by the projector file's `hy_v4_flash`
+type; Flash-Next's `qwen3vl_merger` path is untouched (its kernels are not edited, only new ones added). What differs from Qwen3-VL:
+
+| | Qwen3-VL (Flash-Next) | Hy4-flash |
+|---|---|---|
+| Patch embedding | two temporal taps summed | one 16 x 16 conv, bias |
+| Position table | 48 x 48, align-corners bilinear | 128 x 128 (row 0, the CLS slot, dropped), `interpolate(scale_factor=(size + 0.1) / 128, align_corners=False)`; an axis whose size equals the table's is copied |
+| In-layer rotation | 2-D RoPE on q, k | none |
+| After the layers | LayerNorm, merger (tanh GELU) | RMS norm (eps 1e-5), 2 x 2 merge conv 4,608 -> erf GELU -> 1 x 1 conv 3,072, a learned `image_newline` row after each line |
+| Encoder FFN | tanh GELU | tanh GELU (`bias_activation_fusion`, as llama.cpp's hy_v4_flash) |
+
+The projector is the side file's `mmproj-Hy4-flash-BF16.gguf` (llama.cpp's `hy_v4_flash` layout: F32 convs and position table, BF16
+products, q, k and v separate). The encoder reads it as is: q, k, v become one product, and the merge conv is reordered into a 4,608 x 4,608
+BF16 product over a group's four patch rows in merge order, at stage time. `convert.py --mmproj FILE` (arch `mmproj_only`) adds it
+as `vision/mmproj`; the engine opens it per request, uploads it to the main card (about 1.9 GB with the work buffers for 4,096
+merged tokens; `cudaMalloc`, no tier lending yet) and frees it in `images_done`.
+
+Preprocessing (`vision.hpp`): `smart_resize` with factor 32, min 4,096 and max 4,194,304 pixels (4 and 4,096 merged tokens), a ratio over
+200 refused; Lanczos(3) to the canvas (bit-exact against Pillow); (v / 255 - 0.5) / 0.5; patches in merge order. **Open: the filter.**
+`processor_config.json` says `resample: 1` (Lanczos) and llama.cpp's `hy_v4_flash` uses it, but transformers' `hy_v4_vl` processor
+(the same `HYV4VLImageProcessor`) resizes with Pillow's default BICUBIC and says the original never used the configured filter.
+One constant (`kVisionFilter`) switches it; compare the two on the model before release.
+
+Prompt: `<image_start>` pad x (oh x (ow + 1)) `<image_end>`; the pads of the newline slots are in the run, so the block of
+embedding rows is `oh * (ow + 1)` long and the engine's pad-run expansion (`encode_image` row count) already fits. The server's Hy4
+dialect (not in this milestone) sets `image_pad` and `image_start` to the pack's `<hy_image_pad..>` and `<hy_image_start..>` tokens.
+
+MRoPE: interleaved sections [12, 10, 10] over the 32 rotated pairs: pair i turns by h when i % 3 == 1 and i < 30, by w when
+i % 3 == 2 and i < 30, by t otherwise. Text takes the running position on all three; a picture block starting at p puts row j (column
+newline included, nx = ow + 1) at (p, p + j / nx, p + j % nx), and the text after it continues at p + max(oh, ow + 1)
+(transformers' `get_rope_index` of `hy_v4_vl`, tested on five prompts). The session keeps each cell's triple (`RopeTrack`) and,
+once a picture is in, a device table `cell_rope` that `mla_prepare`, `idx_rope_heads` and `idx_pool` read (null: the cell index, so
+text-only output is unchanged). The indexer's pooled key turns by its group's first cell's triple; to confirm against the reference.
+
+Engram: llama.cpp's hy-v4-flash treats an embedding (image) position as a token that cannot be hashed, so an image row's
+own Engram contribution is masked (valid 0) and, to the rows after it, it is a padded history entry. The session passes -1 as the token
+of an image row (`run_rows` accepts it only with embedding rows) and `engram_ids` reads -1 as dead on both counts. No HF reference
+is public for the flash model to check this against.
+
+Images enter `session.cpp` through three marked hooks (`[vision]`): `encode_image`/`images_done`/`prefill_embeddings` (chunks of up
+to 256 rows through `run_rows` with the rows as the embeddings), `place_rope` in `run_rows`, and the `cell_rope` pointers in
+`mla_args` and `indexer`. Video is out of the first cut.
 
 ## DFly2
 
