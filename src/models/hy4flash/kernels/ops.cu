@@ -1,4 +1,4 @@
-// src/models/hy4flash/kernels/ops.cu - the sigmoid gate, the sigmoid router, the stream fill and the Engram apply of
+// src/models/hy4flash/kernels/ops.cu - the sigmoid gate, small products, the stream fill and the Engram apply of
 // Hy4-flash.
 #include "basalt/models/hy4flash/kernels.hpp"
 
@@ -35,7 +35,7 @@ __global__ void mul_sigmoid_kernel(const float* __restrict__ g, float* __restric
     if (i < n) x[i] *= sigmoidf(g[i]);
 }
 
-// A warp per expert.
+// A warp per row.
 __global__ void router_logits_kernel(const float* __restrict__ x, const float* __restrict__ gate, int n_expert, int n_embd,
                                      float scale, float* __restrict__ logits) {
     const int e = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
@@ -49,53 +49,6 @@ __global__ void router_logits_kernel(const float* __restrict__ x, const float* _
     }
     acc = warp_sum(acc);
     if (lane == 0) logits[e] = acc * scale;
-}
-
-constexpr int kRouterThreads = 512;
-
-// One block: k rounds of the largest biased score, the lower index winning a tie.
-__global__ void router_select_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int n_expert, int k,
-                                     float scale, int32_t* __restrict__ ids, float* __restrict__ weights) {
-    __shared__ float s[512], sel[512];
-    __shared__ float red_v[kRouterThreads / 32];
-    __shared__ int red_i[kRouterThreads / 32];
-    __shared__ int pick[16];
-    __shared__ float sum;
-    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    s[t] = t < n_expert ? sigmoidf(logits[t]) : 0.f;
-    sel[t] = t < n_expert ? s[t] + bias[t] : -INFINITY;
-    __syncthreads();
-    for (int r = 0; r < k; ++r) {
-        float v = sel[t];
-        int i = t;
-#pragma unroll
-        for (int m = 16; m; m >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, v, m);
-            const int oi = __shfl_xor_sync(0xffffffffu, i, m);
-            if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
-        }
-        if (lane == 0) { red_v[warp] = v; red_i[warp] = i; }
-        __syncthreads();
-        if (t == 0) {
-            float bv = red_v[0];
-            int bi = red_i[0];
-            for (int w = 1; w < kRouterThreads / 32; ++w)
-                if (red_v[w] > bv || (red_v[w] == bv && red_i[w] < bi)) { bv = red_v[w]; bi = red_i[w]; }
-            pick[r] = bi;
-            sel[bi] = -INFINITY;
-        }
-        __syncthreads();
-    }
-    if (t == 0) {
-        float total = 0.f;
-        for (int r = 0; r < k; ++r) total += s[pick[r]];
-        sum = fmaxf(total, 6.103515625e-5f);
-    }
-    __syncthreads();
-    if (t < k) {
-        ids[t] = pick[t];
-        weights[t] = s[pick[t]] / sum * scale;
-    }
 }
 
 __global__ void wsum_kernel(RowPtrs rows, const float* __restrict__ w, int k, int n, float* __restrict__ out) {
@@ -153,15 +106,6 @@ __global__ void engram_kernel(const float* __restrict__ kv, const float* __restr
 
 void mul_sigmoid(const float* g, float* x, int n, void* stream) {
     mul_sigmoid_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(g, x, n);
-    if (!stream) cudaStreamSynchronize(nullptr);
-}
-
-void router_sigmoid(const float* x, const float* gate, const float* bias, int n_expert, int n_embd, int k, float scale,
-                    float* logits, int32_t* ids, float* weights, void* stream) {
-    if (n_expert > 512 || k > 16 || n_embd % 4) throw std::invalid_argument("router_sigmoid: geometry");
-    cudaStream_t st = (cudaStream_t) stream;
-    router_logits_kernel<<<(n_expert + 7) / 8, 256, 0, st>>>(x, gate, n_expert, n_embd, 1.0f, logits);
-    router_select_kernel<<<1, kRouterThreads, 0, st>>>(logits, bias, n_expert, k, scale, ids, weights);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

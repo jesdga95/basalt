@@ -2,6 +2,7 @@
 // accumulation) at the model's geometry: the identity hyper-connections, the per-head Q8_0 products, the MLA
 // preparation and attention with a sink, the router and the Engram apply. Exit 77 without a GPU.
 #include "basalt/kernels/mhc.hpp"
+#include "basalt/kernels/router.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -237,7 +238,13 @@ void test_router() {
     float *dx = dev(x), *dg = dev(gate), *db = dev(bias), *dl = devf(NE), *dw = devf(K);
     int32_t* di = nullptr;
     cudaMalloc(&di, K * 4);
-    router_sigmoid(dx, dg, db, NE, E, K, 3.998f, dl, di, dw, nullptr);
+    bk::RouterArgs ra;
+    ra.n_expert = NE;
+    ra.n_embd = E;
+    ra.k = K;
+    ra.weight_scale = 3.998f;
+    ra.gate = bk::RouterGate::Sigmoid;
+    bk::router(dx, dg, db, 1, ra, dl, di, dw, nullptr);
     std::vector<int32_t> ids = host(di, K);
     std::vector<float> w = host(dw, K), logits = host(dl, NE);
     std::vector<double> s(NE), sel(NE), rlog(NE);

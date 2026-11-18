@@ -1,6 +1,5 @@
 // include/basalt/models/hy4flash/kernels.hpp - the Hy4-flash decode kernels: the per-head Q8_0 products of the absorbed
-// MLA, its query/key preparation and attention over the shared latent with a learnable sink, the sigmoid router and the
-// Engram apply.
+// MLA, its query/key preparation and attention over the shared latent with a learnable sink, and the Engram apply.
 //
 // One token per call; all activations fp32, all pointers device memory. `stream` may be null (the call then
 // synchronises).
@@ -80,11 +79,6 @@ struct RowPtrs {
 };
 /// out[i] = sum_k w[k] * rows.p[k][i] for k < n_rows, in that order.
 void weighted_sum_rows(const RowPtrs& rows, const float* w, int n_rows, int n, float* out, void* stream);
-
-/// The router of one token: logits = gate . x (gate fp32 [n_expert][n_embd]); s = sigmoid(logits); the top-k of s + bias
-/// (a lower index wins a tie); weights the unbiased s of those over their sum, times `scale`. n_expert <= 512, k <= 16.
-void router_sigmoid(const float* x, const float* gate, const float* bias, int n_expert, int n_embd, int k, float scale,
-                    float* logits, int32_t* ids, float* weights, void* stream);
 
 // ---- hyper-connection streams -------------------------------------------------------------------------------------
 
