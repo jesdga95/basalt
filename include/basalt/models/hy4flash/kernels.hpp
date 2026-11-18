@@ -35,6 +35,12 @@ void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const 
 void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
                  int n_tok, int ring, float* qcur, uint16_t* cache, void* stream);
 
+/// The same with an FP8 cache: rows of kFp8RowBytes (512 E4M3 codes, four fp32 scales, one per 128 codes, amax / 448, then the 64 rope
+/// values as BF16), written and read as the flash-MLA kernels' rows are.
+constexpr int kFp8RowBytes = 656;
+void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
+                 int n_tok, int ring, float* qcur, uint8_t* cache, void* stream);
+
 /// The cells each row attends (device arrays of n_tok entries): row t takes counts[t] cells, the cells of row t listed at
 /// cells + t * cells_stride, or (cells null) firsts[t] + j (modulo the ring when it is set).
 struct RowSpans {
@@ -50,6 +56,8 @@ void mla_attend(const float* qcur, const float* cache, const RowSpans& r, int n_
                 float* o_lat, void* stream);
 /// The same over a BF16 cache.
 void mla_attend(const float* qcur, const uint16_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
+                float* o_lat, void* stream);
+void mla_attend(const float* qcur, const uint8_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                 float* o_lat, void* stream);
 /// cells[t][j] = j for j < fill[t]; a row with fill 0 is left alone.
 void iota_cells(int32_t* cells, int stride, const int32_t* fill, int n_tok, void* stream);
@@ -68,13 +76,13 @@ struct IndexerArgs {
 /// The pooled keys of n_groups consecutive groups of `pool` positions starting at first_pos (a multiple of `pool`): the rows of
 /// position p are at cell p % ring of values and gates [ring][dim] (the projections of the normed keys; ring a multiple of
 /// `pool`), ape [pool][dim]; pooled[d] = sum_j softmax_j(gates[j][d] + ape[j][d]) * values[j][d], normed by norm_w, its last
-/// `rope` values rotated at the group's first position; written to pooled[(first_pos + g * pool) / pool]. dim = 128.
+/// `rope` values rotated at the group's first position; written as fp16 bits to pooled[(first_pos + g * pool) / pool]. dim = 128.
 void idx_pool(const float* values, const float* gates, const float* ape, const float* norm_w, const IndexerArgs& a, int ring,
-              int first_pos, int n_groups, float* pooled, void* stream);
+              int first_pos, int n_groups, uint16_t* pooled, void* stream);
 /// The last `rope` values of each head of n_tok queries q[t][heads][dim], rotated at pos0 + t, in place.
 void idx_rope_heads(float* q, const IndexerArgs& a, int pos0, int n_tok, void* stream);
-/// scores[p] = sum_h w[h] * relu(q[h] . pooled[p]) for p < n_pool (q [heads][dim], pooled [n_pool][dim]).
-void idx_scores(const float* q, const float* w, const float* pooled, int n_pool, const IndexerArgs& a, float* scores,
+/// scores[p] = sum_h w[h] * relu(q[h] . pooled[p]) for p < n_pool (q [heads][dim], pooled [n_pool][dim] fp16 bits).
+void idx_scores(const float* q, const float* w, const uint16_t* pooled, int n_pool, const IndexerArgs& a, float* scores,
                 void* stream);
 /// The cells a query attends: those of the k pools with the largest scores (a lower pool wins a tie), in pool order, then the
 /// tail cells tail0 .. tail0 + tail_n - 1. cells[k * pool + tail_n]; k <= n_pool.

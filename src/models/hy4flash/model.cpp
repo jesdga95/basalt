@@ -136,6 +136,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         dense += d.bytes;
         dev_.emplace(name, std::move(d));
     }
+    fp8_ = req.kv == "fp8";
     // the context: refused when its caches would take more than half of what the weights leave
     {
         size_t free_b = 0, total_b = 0;
@@ -143,7 +144,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         int sparse = 0;
         for (int l = 0; l < g.n_layers; ++l) sparse += !g.swa[(size_t) l];
         const ctxp::Plan p = ctxp::plan_context(req.max_context > 0 ? req.max_context : kDefaultContext, g.context_length,
-                                                free_b / (uint64_t) std::max(req.sessions, 1), sparse);
+                                                free_b / (uint64_t) std::max(req.sessions, 1), sparse, fp8_);
         if (!p.error.empty()) return {model::Status::Error, "hy4flash: " + p.error};
         if (!p.note.empty()) basalt::log::info("basalt hy4flash", "%s", p.note.c_str());
         ctx_ = p.context;

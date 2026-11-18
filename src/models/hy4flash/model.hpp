@@ -59,6 +59,8 @@ public:
     const std::string& path() const { return path_; }
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     int device() const { return device_; }
+    /// --kv fp8: the sparse layers' latent rows as FP8 (default BF16).
+    bool cache_fp8() const { return fp8_; }
     const std::string& diag_dump() const { return diag_dump_; }
 
 private:
@@ -74,6 +76,7 @@ private:
     std::string diag_dump_;
     std::unique_ptr<ngram::PleReader> engram_;
     int device_ = 0, fd_ = -1;
+    bool fp8_ = false;
     int64_t ctx_ = kDefaultContext;
 };
 

@@ -18,6 +18,7 @@
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
 #include "models/hy4flash/context_policy.hpp"
@@ -30,6 +31,8 @@
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#include <set>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -106,6 +109,10 @@ public:
         evalid_ = f(R);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxWindow, (int) g_.n_vocab) + (int64_t) kMaxWindow * (bk::kLogprobStride + 1));
         q8_ = alloc(std::max<size_t>(bk::native_q8_1_bytes(16384, kMaxWindow), 1 << 16), ok);
+        mmq_xq_ = alloc(basalt::prefill::mmq::q8_bytes(kMaxRows, 16384), ok);
+        mmq_bounds_ = (int32_t*) alloc(2 * 4, ok);
+        mmq_ident_ = (int32_t*) alloc((size_t) kMaxRows * 4, ok);
+        if (ok && basalt::prefill::mmq::built()) basalt::prefill::mmq::iota(mmq_ident_, kMaxRows, nullptr);
         ex_xq_ = alloc(bk::native_q8_1_bytes(g_.n_latent, kMaxWindow), ok);
         ex_scr_ = alloc(bk::native_expert_scratch_bytes(kLookupK, g_.n_ff_exp), ok);
         ex_rows_ = f((int64_t) kLookupK * g_.n_latent);
@@ -124,13 +131,13 @@ public:
         pea_.resize((size_t) g_.n_layers);
         for (int l = 0; ok && l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) {
-                cache_[(size_t) l] = (uint16_t*) alloc((size_t) swa_ring() * kRowWidth * 2, ok);
+                cache_[(size_t) l] = (uint8_t*) alloc((size_t) swa_ring() * kRowWidth * 2, ok);
             } else {
                 ea_[(size_t) l] = std::make_unique<core::ElasticArray>();
                 pea_[(size_t) l] = std::make_unique<core::ElasticArray>();
-                if (!ea_[(size_t) l]->open((uint64_t) ctx * kRowWidth * 2, err) || !pea_[(size_t) l]->open((uint64_t) pools * g_.idx_dim * 4, err)) return false;
-                cache_[(size_t) l] = (uint16_t*) ea_[(size_t) l]->data();
-                ipool_[(size_t) l] = (float*) pea_[(size_t) l]->data();
+                if (!ea_[(size_t) l]->open((uint64_t) ctx * sparse_row_bytes(), err) || !pea_[(size_t) l]->open((uint64_t) pools * g_.idx_dim * 2, err)) return false;
+                cache_[(size_t) l] = ea_[(size_t) l]->data();
+                ipool_[(size_t) l] = (uint16_t*) pea_[(size_t) l]->data();
                 ival_[(size_t) l] = f((int64_t) kRawRing * g_.idx_dim);
                 igate_[(size_t) l] = f((int64_t) kRawRing * g_.idx_dim);
             }
@@ -220,9 +227,34 @@ private:
     }
 
     int swa_ring() const { return g_.window + kMaxRows; }
+    bool fp8() const { return m_.cache_fp8(); }
+    int sparse_row_bytes() const { return fp8() ? kFp8RowBytes : kRowWidth * 2; }
 
     // y[r] = W x[r] for R rows, 8 at a time: a row's product does not depend on the rows beside it
     void gemm(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R) {
+        namespace mmq = basalt::prefill::mmq;
+        if (R > kMaxWindow && mmq::built() && mmq::fits(w->type, n_out)) {   // a chunk: the tensor-core MMQ product
+            if (loaded_.insert({w->type, n_out}).second) mmq::load(w->type, n_out);
+            const int32_t b[2] = {0, R};
+            cudaMemcpyAsync(mmq_bounds_, b, sizeof b, cudaMemcpyHostToDevice, stream_);
+            mmq::quantize(x, nullptr, mmq_xq_, w->type, n_in, n_in, R, stream_);
+            mmq::Product p;
+            p.w = w->ptr;
+            p.type = w->type;
+            p.w_rows = n_out;
+            p.w_cols = n_in;
+            p.expert_bytes = mmq::matrix_bytes(w->type, n_out, n_in);
+            p.n = 1;
+            p.xq = mmq_xq_;
+            p.bounds = mmq_bounds_;
+            p.ids = mmq_ident_;
+            p.total_rows = R;
+            p.max_rows = R;
+            p.dst = y;
+            p.ld_dst = n_out;
+            mmq_.run(p, stream_);
+            return;
+        }
         for (int c0 = 0; c0 < R; c0 += kMaxWindow) {
             const int nc = std::min(kMaxWindow, R - c0);
             bk::native_quantize_q8_1(x + (size_t) c0 * n_in, q8_, n_in, nc, stream_);
@@ -255,9 +287,12 @@ private:
         gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
         gemm(T(l, "attn_kv_a_mqa.weight"), xn_, kvraw_, E, rank + g_.rope_dim, R);
         q8_0_heads_gemv(T(l, "attn_k_b.weight")->ptr, q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_, stream_);
-        uint16_t* cache = cache_[(size_t) l];
+        uint8_t* cache = cache_[(size_t) l];
         const int ring = swa ? swa_ring() : 0;
-        mla_prepare(q_, qabs_, kvraw_, F(l, "attn_kv_a_norm.weight"), a, (int) pos0, R, ring, qcur_, cache, stream_);
+        const bool f8 = !swa && fp8();
+        const float* kvn = F(l, "attn_kv_a_norm.weight");
+        if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
+        else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
         // the cells each row attends
         int32_t* meta = meta_h_ + (size_t) l * 3 * kMaxRows;   // firsts, counts, fill
         int32_t *firsts = meta, *counts = meta + kMaxRows, *fill = meta + 2 * kMaxRows;
@@ -296,7 +331,8 @@ private:
             rs.cells = icells_;
             rs.cells_stride = cells_stride_;
         }
-        mla_attend(qcur_, cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
+        if (f8) mla_attend(qcur_, (const uint8_t*) cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
+        else mla_attend(qcur_, (const uint16_t*) cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
         q8_0_heads_gemv(T(l, "attn_v_b.weight")->ptr, olat_, rank, H * rank, H, g_.v_dim, rank, R, vout_, stream_);
         gemm(T(l, "attn_gate.weight"), xn_, gate_, E, H * g_.v_dim, R);
         mul_sigmoid(gate_, vout_, R * H * g_.v_dim, stream_);
@@ -658,8 +694,8 @@ private:
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kGrowPositions - 1) / kGrowPositions * kGrowPositions);
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) continue;
-            if (!ea_[(size_t) l]->ensure((uint64_t) target * kRowWidth * 2, 256ull << 20, err) ||
-                !pea_[(size_t) l]->ensure((uint64_t) (target / g_.idx_pool + 1) * g_.idx_dim * 4, 256ull << 20, err)) {
+            if (!ea_[(size_t) l]->ensure((uint64_t) target * sparse_row_bytes(), 256ull << 20, err) ||
+                !pea_[(size_t) l]->ensure((uint64_t) (target / g_.idx_pool + 1) * g_.idx_dim * 2, 256ull << 20, err)) {
                 err = "the latent caches cannot grow to " + std::to_string(target) + " positions: " + err;
                 return false;
             }
@@ -714,6 +750,10 @@ private:
     int32_t* ids_ = nullptr;
     float *xlat_ = nullptr, *lat_out_ = nullptr, *moe_out_ = nullptr, *sh_ = nullptr, *logits_ = nullptr, *lp_ = nullptr, *erows_ = nullptr, *ekv_ = nullptr, *evalid_ = nullptr;
     int32_t* pick_ = nullptr;
+    basalt::prefill::mmq::Context mmq_;
+    std::set<std::pair<int, int>> loaded_;   // (type, rows) the MMQ tiles are loaded for
+    void *mmq_xq_ = nullptr;
+    int32_t *mmq_bounds_ = nullptr, *mmq_ident_ = nullptr;
     void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr;
     float* ex_rows_ = nullptr;
     const float** rowptr_d_ = nullptr;
@@ -724,8 +764,9 @@ private:
     std::shared_ptr<core::ExpertTier> tier_;
     std::vector<float> lookup_host_;
     std::vector<bool> lookup_loaded_;
-    std::vector<uint16_t*> cache_;
-    std::vector<float*> ival_, igate_, ipool_;
+    std::vector<uint8_t*> cache_;   // a sparse layer's rows in the --kv format, a window layer's BF16
+    std::vector<float*> ival_, igate_;
+    std::vector<uint16_t*> ipool_;   // fp16 pooled keys
     std::vector<std::unique_ptr<core::ElasticArray>> ea_, pea_;
     int64_t backed_ = 0;   // positions the sparse layers' caches are backed for
     std::vector<int32_t> hist_, picks_;

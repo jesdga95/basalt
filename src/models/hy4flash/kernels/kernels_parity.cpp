@@ -3,6 +3,7 @@
 // preparation and attention with a sink, the router and the Engram apply. Exit 77 without a GPU.
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/router.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -425,9 +426,13 @@ void test_indexer() {
     std::vector<float> vals = randn((size_t) RING * D), gates = randn((size_t) RING * D), ape = randn((size_t) P * D, 0.3f), nw = randn(D, 0.2f);
     for (auto& v : nw) v += 1.f;
     const int first = 1228, G = 3, NP = 5000;
-    float *dv = dev(vals), *dg = dev(gates), *da = dev(ape), *dn = dev(nw), *dp = devf((size_t) (first / P + G) * D);
+    float *dv = dev(vals), *dg = dev(gates), *da = dev(ape), *dn = dev(nw);
+    uint16_t* dp = nullptr;
+    cudaMalloc(&dp, (size_t) (first / P + G) * D * 2);
     idx_pool(dv, dg, da, dn, a, RING, first, G, dp, nullptr);
-    std::vector<float> got = host(dp + (size_t) (first / P) * D, (size_t) G * D);
+    std::vector<uint16_t> gh = host(dp + (size_t) (first / P) * D, (size_t) G * D);
+    std::vector<float> got(gh.size());
+    for (size_t i = 0; i < gh.size(); ++i) got[i] = h2f(gh[i]);
     std::vector<double> ref((size_t) G * D);
     for (int g = 0; g < G; ++g) {
         const int p0 = first + g * P;
@@ -451,7 +456,7 @@ void test_indexer() {
             ref[(size_t) g * D + D - a.rope + 2 * i + 1] = x0 * std::sin(th) + x1 * std::cos(th);
         }
     }
-    report("idx_pool (3 groups, ring)", got, ref, 1e-4);   // the rotation's angle is fp32
+    report("idx_pool (3 groups, ring, fp16)", got, ref, 2e-3);   // the keys are rounded to fp16
     // the query rotation of 2 rows
     std::vector<float> qq = randn((size_t) 2 * a.heads * D);
     float* dqq = dev(qq);
@@ -470,7 +475,13 @@ void test_indexer() {
     // scores and selection over many pools, with ties
     const int K = 511;
     std::vector<float> q = randn((size_t) a.heads * D), w = randn(a.heads, 0.05f), pooled = randn((size_t) NP * D);
-    float *dq = dev(q), *dw = dev(w), *dpool = dev(pooled), *dsc = devf(NP);
+    std::vector<uint16_t> ph(pooled.size());
+    for (size_t i = 0; i < pooled.size(); ++i) {
+        ph[i] = f2h(pooled[i]);
+        pooled[i] = h2f(ph[i]);   // the reference reads what the kernel reads
+    }
+    float *dq = dev(q), *dw = dev(w), *dsc = devf(NP);
+    uint16_t* dpool = dev(ph);
     idx_scores(dq, dw, dpool, NP, a, dsc, nullptr);
     std::vector<float> sc = host(dsc, NP);
     std::vector<double> rsc(NP);
@@ -508,6 +519,122 @@ void test_indexer() {
     }
 }
 
+
+void test_fp8() {
+    MlaArgs a;
+    a.heads = 32;
+    const int W = a.rank + a.rope, Q = a.nope + a.rope, T = 3, pos0 = 100, cap = 400;
+    std::vector<float> q = randn((size_t) T * a.heads * Q), qabs = randn((size_t) T * a.heads * a.rank, 0.3f), kvraw = randn((size_t) T * W, 2.f),
+                       norm = randn(a.rank, 0.5f), sinks = randn(a.heads);
+    for (auto& v : norm) v += 1.f;
+    float *dq = dev(q), *dqa = dev(qabs), *dkv = dev(kvraw), *dn = dev(norm), *ds = dev(sinks);
+    float *dqcur = devf((size_t) T * a.heads * W), *dlat = devf((size_t) T * a.heads * a.rank);
+    uint8_t* dc = nullptr;
+    cudaMalloc(&dc, (size_t) cap * kFp8RowBytes);
+    cudaMemset(dc, 0, (size_t) cap * kFp8RowBytes);
+    mla_prepare(dq, dqa, dkv, dn, a, pos0, T, 0, dqcur, dc, nullptr);
+    std::vector<uint8_t> rows = host(dc, (size_t) cap * kFp8RowBytes);
+    auto e4m3 = [](uint8_t b) {
+        const int e = (b >> 3) & 15, m = b & 7;
+        const double v = e ? std::ldexp(1.0 + m / 8.0, e - 7) : std::ldexp((double) m, -9);
+        return (b & 0x80) ? -v : v;
+    };
+    // decoded rows (what the attention reads) and a check of the rows against the fp32 preparation
+    std::vector<float> dec((size_t) cap * W, 0.f);
+    bool ok = true;
+    for (int t = 0; t < T; ++t) {
+        const uint8_t* row = &rows[(size_t) (pos0 + t) * kFp8RowBytes];
+        double ss = 0;
+        for (int c = 0; c < a.rank; ++c) ss += (double) kvraw[(size_t) t * W + c] * kvraw[(size_t) t * W + c];
+        const double rs = 1.0 / std::sqrt(ss / a.rank + a.rms_eps);
+        const float* scales = reinterpret_cast<const float*>(row + 512);
+        for (int g = 0; g < 4; ++g) {
+            double amax = 0;
+            for (int c = g * 128; c < g * 128 + 128; ++c) amax = std::max(amax, std::fabs(kvraw[(size_t) t * W + c] * rs * norm[c]));
+            ok = ok && std::fabs(scales[g] - amax / 448.0) <= 1e-6 * amax / 448.0 + 1e-12;
+            for (int c = g * 128; c < g * 128 + 128; ++c) {
+                const double ref = kvraw[(size_t) t * W + c] * rs * norm[c], got = e4m3(row[c]) * scales[g];
+                dec[(size_t) (pos0 + t) * W + c] = (float) got;
+                ok = ok && std::fabs(got - ref) <= 0.0625 * amax + 1e-6;   // E4M3: 3 mantissa bits
+            }
+        }
+        for (int c = 0; c < a.rope; ++c) {
+            uint16_t b;
+            std::memcpy(&b, row + 528 + 2 * c, 2);
+            dec[(size_t) (pos0 + t) * W + a.rank + c] = from_bf16(b);
+        }
+    }
+    std::printf("%-30s %s\n", "mla_prepare fp8 rows", ok ? "ok" : "FAIL");
+    failures += !ok;
+    // attention over the decoded rows of the three written positions and some earlier (zero) ones
+    std::vector<int32_t> firsts = {pos0, pos0, pos0}, counts = {1, 2, 3};
+    int32_t *df = dev(firsts), *dcnt = dev(counts);
+    RowSpans rs;
+    rs.firsts = df;
+    rs.counts = dcnt;
+    mla_attend(dqcur, dc, rs, T, ds, a, 0, dlat, nullptr);
+    std::vector<float> got = host(dlat, (size_t) T * a.heads * a.rank), qcur = host(dqcur, (size_t) T * a.heads * W);
+    std::vector<double> ref;
+    for (int t = 0; t < T; ++t)
+        for (int h = 0; h < a.heads; ++h) {
+            std::vector<float> qrow(qcur.begin() + (size_t) t * a.heads * W, qcur.begin() + (size_t) (t + 1) * a.heads * W);
+            std::vector<int> cl;
+            for (int j = 0; j <= t; ++j) cl.push_back(pos0 + j);
+            std::vector<double> o = ref_attend(qrow, dec, cl, h, a, sinks[h]);
+            ref.insert(ref.end(), o.begin(), o.end());
+        }
+    report("mla_attend (fp8 cache)", got, ref, 1e-4);
+}
+
+void test_mmq_dense() {
+    namespace mmq = basalt::prefill::mmq;
+    const int R = 64, rows = 1536, K = 3072;
+    if (!mmq::built() || !mmq::fits(8, rows)) {
+        std::printf("%-30s skipped (no MMQ for Q8_0)\n", "mmq dense Q8_0");
+        return;
+    }
+    Q8 w = make_q8(rows, K);
+    std::vector<float> x = randn((size_t) R * K);
+    uint8_t* dw = dev(w.bytes);
+    float *dx = dev(x), *dy = devf((size_t) R * rows);
+    void* xq = nullptr;
+    cudaMalloc(&xq, mmq::q8_bytes(R, K));
+    int32_t *bounds = nullptr, *ident = nullptr;
+    cudaMalloc(&bounds, 8);
+    cudaMalloc(&ident, R * 4);
+    mmq::iota(ident, R, nullptr);
+    const int32_t b[2] = {0, R};
+    cudaMemcpy(bounds, b, 8, cudaMemcpyHostToDevice);
+    mmq::load(8, rows);
+    mmq::quantize(dx, nullptr, xq, 8, K, K, R, nullptr);
+    mmq::Product p;
+    p.w = dw;
+    p.type = 8;
+    p.w_rows = rows;
+    p.w_cols = K;
+    p.expert_bytes = mmq::matrix_bytes(8, rows, K);
+    p.n = 1;
+    p.xq = xq;
+    p.bounds = bounds;
+    p.ids = ident;
+    p.total_rows = R;
+    p.max_rows = R;
+    p.dst = dy;
+    p.ld_dst = rows;
+    mmq::Context ctx;
+    ctx.run(p, nullptr);
+    cudaDeviceSynchronize();
+    std::vector<float> got = host(dy, (size_t) R * rows);
+    std::vector<double> ref((size_t) R * rows);
+    for (int t = 0; t < R; ++t)
+        for (int r = 0; r < rows; ++r) {
+            double d = 0;
+            for (int i = 0; i < K; ++i) d += (double) w.vals[(size_t) r * K + i] * x[(size_t) t * K + i];
+            ref[(size_t) t * rows + r] = d;
+        }
+    report("mmq dense Q8_0 64x1536x3072", got, ref, 2e-2);   // the activations are rounded to q8_1
+}
+
 }  // namespace
 
 int main() {
@@ -519,6 +646,8 @@ int main() {
     test_router();
     test_engram();
     test_indexer();
+    test_fp8();
+    test_mmq_dense();
     std::printf(failures ? "FAILED\n" : "all ok\n");
     return failures ? 1 : 0;
 }
