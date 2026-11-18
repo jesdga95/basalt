@@ -225,13 +225,11 @@ to 256 rows through `run_rows` with the rows as the embeddings), `place_rope` in
 ## Serve
 
 - Registry: the id in `BASALT_BUILTIN_MODELS`; `dialect_for("hy_v4_flash")` in `serve/models/hy4flash.py`; one router config entry.
-- Prompt: the HF `chat_template.jinja` rendered by the shared jinja path (`tojson(ensure_ascii=False)`, `namespace`, `raise_exception`
-  checked against HF's output on a corpus: system, multi-turn, tools, tool results, thinking history, images). The special-token
-  suffix is read from the pack's vocabulary: the AngelSlim GGUF names them `<...:6124c78e｜>`, the HF release `:opensource`.
-- `reasoning_effort`: `none` -> `no_think`, `low`/`medium`/`high` -> `high`, `max` -> `max`, numbers refused; `no_think` and
-  `high` open the assistant turn with an empty or open `<think>`; `preserve_reasoning` -> the template's `preserved_thinking`.
-- Tools: `<tool_calls><tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call></tool_calls>`; parser in the
-  dialect (events from the stream), `reasoning_close` the think end token, stop text the `hy_end` token (120025).
+- Prompt, effort, tools, images, sampling: [serving](hy4-flash/serve.md). The template is the pack's (the special-token suffix is read
+  from it: the AngelSlim GGUF names them `:6124c78e`, the HF release `:opensource`); `reasoning_effort` `none` is `no_think`,
+  `low`/`medium`/`high` are `high`, `max` is `max`, numbers are refused; `preserve_reasoning` is the template's `preserved_thinking`.
+- Tools: `<tool_calls><tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call></tool_calls>`; the parser is the
+  dialect's, `reasoning_close` is the think end token and the stop text is the `hy_end` token (120025).
 - Engine: `session` calls (`decode_window`, `prefill_chunk`, `save_cells`, `restore_cells`, `running_state`: the SWA ring, pooled
   keys, the raw indexer ring, the last two token ids for Engram, DFly's last hidden state). Sleep frees the slots and the dense
   weights (re-read from the pack in seconds) and keeps RAM; the slot residency table is saved and refilled from the RAM tier at

@@ -1468,7 +1468,7 @@ class Service:
                         else:
                             # the thinking closed itself: the call opens after the blank line the template puts
                             # before a call
-                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
+                            text = "\n" * max(0, self.dialect.call_newlines - (len(tail) - len(tail.rstrip("\n")))) + force
                             force = None
                             extra = self.tok.encode(text, parse_special=True)
                             if max_new - n - len(extra) < 1:
