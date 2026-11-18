@@ -196,9 +196,14 @@ target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_q
 endif()
 
 if(BASALT_MODEL_HY4FLASH)
-add_library(hy4flash_kernels STATIC src/models/hy4flash/kernels/mla.cu src/models/hy4flash/kernels/ops.cu)
+add_library(hy4flash_kernels STATIC src/models/hy4flash/kernels/mla.cu src/models/hy4flash/kernels/ops.cu
+  src/models/hy4flash/kernels/indexer.cu)
 target_include_directories(hy4flash_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(hy4flash_kernels PUBLIC ${_gpu_runtime_target})
+add_library(model_hy4flash STATIC src/models/hy4flash/adapter.cpp src/models/hy4flash/pretok_hy4.cpp src/models/hy4flash/pack.cpp
+  src/models/hy4flash/model.cpp src/models/hy4flash/session.cpp src/models/hy4flash/cpu_experts.cpp)
+target_include_directories(model_hy4flash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
+target_link_libraries(model_hy4flash PUBLIC model tokenizer hy4flash_kernels kernels core ${_gpu_runtime_target})
 if(BUILD_TESTING)
   add_executable(hy4flash_kernels_parity src/models/hy4flash/kernels/kernels_parity.cpp)
   target_include_directories(hy4flash_kernels_parity PRIVATE ${_gpu_include_directories})

@@ -302,6 +302,109 @@ void test_engram() {
     }
 }
 
+void test_indexer() {
+    IndexerArgs a;
+    const int D = a.dim, P = a.pool;
+    // pooling
+    std::vector<float> vals = randn((size_t) P * D), gates = randn((size_t) P * D), ape = randn((size_t) P * D, 0.3f), nw = randn(D, 0.2f);
+    for (auto& v : nw) v += 1.f;
+    const int first = 1236;
+    float *dv = dev(vals), *dg = dev(gates), *da = dev(ape), *dn = dev(nw), *dp = devf(D);
+    idx_pool(dv, dg, da, dn, a, first, dp, nullptr);
+    std::vector<float> got = host(dp, D);
+    std::vector<double> ref(D), row(D);
+    for (int d = 0; d < D; ++d) {
+        double mx = -1e30, s = 0, acc = 0;
+        for (int j = 0; j < P; ++j) mx = std::max(mx, (double) gates[(size_t) j * D + d] + ape[(size_t) j * D + d]);
+        for (int j = 0; j < P; ++j) s += std::exp(gates[(size_t) j * D + d] + ape[(size_t) j * D + d] - mx);
+        for (int j = 0; j < P; ++j) acc += std::exp(gates[(size_t) j * D + d] + ape[(size_t) j * D + d] - mx) / s * vals[(size_t) j * D + d];
+        row[d] = acc;
+    }
+    double ss = 0;
+    for (double v : row) ss += v * v;
+    for (int d = 0; d < D; ++d) row[d] = row[d] / std::sqrt(ss / D + a.eps) * nw[d];
+    ref = row;
+    for (int i = 0; i < a.rope / 2; ++i) {
+        const double th = first * std::pow((double) a.rope_base, -2.0 * i / a.rope);
+        const double x0 = row[D - a.rope + 2 * i], x1 = row[D - a.rope + 2 * i + 1];
+        ref[D - a.rope + 2 * i] = x0 * std::cos(th) - x1 * std::sin(th);
+        ref[D - a.rope + 2 * i + 1] = x0 * std::sin(th) + x1 * std::cos(th);
+    }
+    report("idx_pool", got, ref, 2e-5);
+    // scores and selection over many pools, with ties
+    const int NP = 5000, K = 511;
+    std::vector<float> q = randn((size_t) a.heads * D), w = randn(a.heads, 0.05f), pooled = randn((size_t) NP * D);
+    float *dq = dev(q), *dw = dev(w), *dpool = dev(pooled), *dsc = devf(NP);
+    idx_scores(dq, dw, dpool, NP, a, dsc, nullptr);
+    std::vector<float> sc = host(dsc, NP);
+    std::vector<double> rsc(NP);
+    for (int p = 0; p < NP; ++p) {
+        double t = 0;
+        for (int h = 0; h < a.heads; ++h) {
+            double d = 0;
+            for (int i = 0; i < D; ++i) d += (double) q[(size_t) h * D + i] * pooled[(size_t) p * D + i];
+            t += w[h] * std::max(d, 0.0);
+        }
+        rsc[p] = t;
+    }
+    report("idx_scores", sc, rsc, 1e-5);
+    for (int ties = 0; ties < 2; ++ties) {
+        std::vector<float> s2 = sc;
+        if (ties)   // many equal scores around the cut
+            for (int p = 0; p < NP; ++p) s2[p] = std::floor(s2[p] * 4.f) / 4.f;
+        float* ds2 = dev(s2);
+        const int tail0 = NP * P, tail_n = 3;
+        int32_t* dc = nullptr;
+        cudaMalloc(&dc, (size_t) (K * P + tail_n) * 4);
+        idx_select(ds2, NP, K, P, tail0, tail_n, dc, nullptr);
+        std::vector<int32_t> cells = host(dc, (size_t) K * P + tail_n);
+        std::vector<int> order(NP);
+        for (int i = 0; i < NP; ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return s2[x] > s2[y]; });
+        std::vector<int> pick(order.begin(), order.begin() + K);
+        std::sort(pick.begin(), pick.end());
+        bool ok = true;
+        for (int i = 0; i < K && ok; ++i)
+            for (int j = 0; j < P; ++j) ok = ok && cells[(size_t) i * P + j] == pick[i] * P + j;
+        for (int j = 0; j < tail_n; ++j) ok = ok && cells[(size_t) K * P + j] == tail0 + j;
+        std::printf("%-30s %s\n", ties ? "idx_select (ties)" : "idx_select", ok ? "equal" : "FAIL");
+        failures += !ok;
+    }
+}
+
+void test_attend_cells() {
+    MlaArgs a;
+    a.heads = 32;
+    const int W = a.rank + a.rope, cells_n = 3000, n = 2052;
+    std::vector<float> qcur = randn((size_t) a.heads * W, 0.3f), cache = randn((size_t) cells_n * W, 0.5f), sinks = randn(a.heads);
+    std::vector<int32_t> cells(n);
+    for (int j = 0; j < n; ++j) cells[j] = (j * 7 + 3) % cells_n;   // distinct for n <= cells_n (7 and 3000 are coprime)
+    std::sort(cells.begin(), cells.end());
+    float *dq = dev(qcur), *dc = dev(cache), *ds = dev(sinks), *dl = devf((size_t) a.heads * a.rank);
+    int32_t* dcells = dev(cells);
+    mla_attend(dq, dc, 0, n, ds, a, dl, nullptr, dcells);
+    std::vector<float> got = host(dl, (size_t) a.heads * a.rank);
+    std::vector<double> ref((size_t) a.heads * a.rank);
+    for (int h = 0; h < a.heads; ++h) {
+        std::vector<double> s(n);
+        double m = sinks[h];
+        for (int j = 0; j < n; ++j) {
+            double d = 0;
+            for (int c = 0; c < W; ++c) d += (double) qcur[(size_t) h * W + c] * cache[(size_t) cells[j] * W + c];
+            s[j] = d * a.scale;
+            m = std::max(m, s[j]);
+        }
+        double den = std::exp(sinks[h] - m);
+        for (int j = 0; j < n; ++j) { s[j] = std::exp(s[j] - m); den += s[j]; }
+        for (int c = 0; c < a.rank; ++c) {
+            double o = 0;
+            for (int j = 0; j < n; ++j) o += s[j] * cache[(size_t) cells[j] * W + c];
+            ref[(size_t) h * a.rank + c] = o / den;
+        }
+    }
+    report("mla_attend (cell list)", got, ref, 1e-4);
+}
+
 }  // namespace
 
 int main() {
@@ -312,6 +415,8 @@ int main() {
     test_mla();
     test_router();
     test_engram();
+    test_indexer();
+    test_attend_cells();
     std::printf(failures ? "FAILED\n" : "all ok\n");
     return failures ? 1 : 0;
 }
