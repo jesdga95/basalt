@@ -279,7 +279,7 @@ void test_mla() {
         MlaArgs a;
         a.heads = heads;
         a.rope_base = base_f;
-        const int W = a.rank + a.rope, Q = a.nope + a.rope, T = 3, pos0 = 650, cap = ring ? ring : 1000;
+        const int W = a.rank + a.rope, Q = a.nope + a.rope, T = 12, pos0 = 650, cap = ring ? ring : 1000;
         std::vector<float> q = randn((size_t) T * heads * Q), qabs = randn((size_t) T * heads * a.rank, 0.3f), kvraw = randn((size_t) T * W),
                            norm = randn(a.rank, 0.2f), sinks = randn(heads, 1.f), cache0 = randn((size_t) cap * W, 0.5f);
         for (auto& v : norm) v += 1.f;
@@ -372,11 +372,12 @@ void test_mla() {
                 std::snprintf(name, sizeof name, "mla_attend %d heads%s%s", heads, use_cells ? ", cell lists" : ", spans", bf ? ", bf16" : "");
                 report(name, got, ref, 1e-4);
                 if (!use_cells && !ring) {   // row independence: row 1 alone
-                    float* d1 = devf((size_t) heads * a.rank);
+                    float* d1 = devf((size_t) 9 * heads * a.rank);
                     RowSpans r1;
                     r1.firsts = df + 1;
                     r1.counts = dcnt + 1;
-                    if (bf) mla_attend(dqcur + (size_t) heads * W, dc16, r1, 1, ds, a, 0, d1, nullptr);
+                    // a BF16 chunk (more than 8 rows) takes the tensor-core kernel: row 1 as the first of 9 rows
+                    if (bf) mla_attend(dqcur + (size_t) heads * W, dc16, r1, 9, ds, a, 0, d1, nullptr);
                     else mla_attend(dqcur + (size_t) heads * W, dc32, r1, 1, ds, a, 0, d1, nullptr);
                     const bool same = std::memcmp(host(d1, (size_t) heads * a.rank).data(), got.data() + (size_t) heads * a.rank, (size_t) heads * a.rank * 4) == 0;
                     std::printf("%-30s %s\n", "  row independence", same ? "bitwise" : "FAIL");
@@ -514,6 +515,28 @@ void test_indexer() {
         rsc[p] = t;
     }
     report("idx_scores", sc, rsc, 1e-5);
+    {   // the tensor-core scores of 3 rows (different pool counts) against the same reference
+        const int rows = 3, pc[3] = {NP, NP / 2 + 3, 100};
+        std::vector<float> q3, w3;
+        std::vector<int32_t> meta3;
+        for (int r = 0; r < rows; ++r) {
+            q3.insert(q3.end(), q.begin(), q.end());
+            w3.insert(w3.end(), w.begin(), w.end());
+            meta3.insert(meta3.end(), {pc[r], pc[r] * a.pool, 1});
+        }
+        float *dq3 = dev(q3), *dw3 = dev(w3), *dsc3 = devf((size_t) rows * NP);
+        int32_t* dm3 = dev(meta3);
+        idx_scores_rows(dq3, dw3, dpool, dm3, NP, rows, a, dsc3, NP, nullptr);
+        std::vector<float> s3 = host(dsc3, (size_t) rows * NP);
+        std::vector<float> g3;
+        std::vector<double> r3;
+        for (int r = 0; r < rows; ++r)
+            for (int p = 0; p < pc[r]; ++p) {
+                g3.push_back(s3[(size_t) r * NP + p]);
+                r3.push_back(rsc[p]);
+            }
+        report("idx_scores_rows (tensor cores)", g3, r3, 1e-5);
+    }
     for (int ties = 0; ties < 2; ++ties) {
         std::vector<float> s2 = sc;
         if (ties)   // many equal scores around the cut

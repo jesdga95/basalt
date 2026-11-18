@@ -41,6 +41,8 @@
 #include <set>
 #include <utility>
 #include <string>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 namespace basalt::models::hy4flash {
@@ -157,6 +159,8 @@ public:
             xq1_ = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
             xq2_ = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
         }
+        heads_ids_ = (int32_t*) alloc((size_t) max_heads * kAttRows * 4, ok);
+        heads_bounds_ = (int32_t*) alloc((size_t) (max_heads + 1) * 4, ok);
         rowptr_d_ = (const float**) alloc(kLookupK * sizeof(void*), ok);
         h_rowptr_ = (const float**) pin(kLookupK * 2);
         h_rw_ = pin(kMaxWindow * 16); h_ids_ = (int32_t*) pin(kMaxWindow * 16);
@@ -251,7 +255,7 @@ public:
         b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
         if (ok) {
             void* q = nullptr;
-            if (cudaMalloc(&q, basalt::prefill::mmq::q8_bytes(A, 16384)) != cudaSuccess) ok = false;
+            if (cudaMalloc(&q, std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim)))) != cudaSuccess) ok = false;
             else {
                 b.dev.push_back(q);
                 b.mmq_xq = q;
@@ -285,6 +289,8 @@ public:
 
     // A prompt of `total` rows: the tier lends its slots and the row buffers of a chunk (up to kMaxChunk rows) are made.
     bool open_prompt(int total, std::string& err) {
+        const double to = now_ms();
+        struct L2 { double t; ~L2() { basalt::log::info("basalt hy4flash", "open_prompt %.0f ms", now_ms() - t); } } l2{to};
         if (big_.rows) {
             use(big_);
             return true;
@@ -296,6 +302,7 @@ public:
         for (int R = std::min(want, kMaxChunk); R >= kMaxWindow; R /= 2)
             if (make_bufs(big_, R, err)) {
                 use(big_);
+                if (total >= kRingRows && tier_ && !ring_) ring_open();
                 return true;
             }
         if (tier_) {
@@ -310,9 +317,11 @@ public:
     void release_prompt() {
         if (!big_.rows) return;
         cudaStreamSynchronize(stream_);
-        basalt::log::info("basalt hy4flash", "prompt time: %.0f ms queued ahead of the MoE (attention, dense), %.0f ms in the MoE, %.0f ms in the Engram's host step", t_pre_ms_, t_moe_ms_, t_eng_ms_);
-        t_pre_ms_ = t_moe_ms_ = t_eng_ms_ = 0;
+        basalt::log::info("basalt hy4flash", "prompt time: %.0f ms queued ahead of the MoE (attention, dense), %.0f ms in the MoE (%.0f ms sorting the pairs, %.0f ms issuing the launches), %.0f ms in the Engram's host step; host time in attention() %.0f ms, in ffn() %.0f ms, issuing the ring copies %.0f ms", t_pre_ms_, t_moe_ms_, t_build_ms_, t_issue_ms_, t_eng_ms_, t_att_ms_, t_ffn_ms_, t_ring_ms_.load());
+        t_pre_ms_ = t_moe_ms_ = t_eng_ms_ = t_build_ms_ = t_issue_ms_ = t_att_ms_ = t_ffn_ms_ = 0;
+        t_ring_ms_ = 0;
         use(dec_);
+        ring_close();
         big_.release();
         if (tier_) {
             std::string e;
@@ -639,27 +648,28 @@ private:
         namespace mmq = basalt::prefill::mmq;
         if (R > kMaxWindow && R <= arows_ && mmq::built() && mmq::fits(w->type, rows)) {
             if (loaded_.insert({w->type, rows}).second) mmq::load(w->type, rows);
-            const int32_t b[2] = {0, R};
-            cudaMemcpyAsync(mmq_bounds_, b, sizeof b, cudaMemcpyHostToDevice, stream_);
+            // every head is an "expert" of the product with the R rows of the step: one quantisation and one launch for all heads
+            std::vector<int32_t> bounds((size_t) H + 1);
+            for (int h = 0; h <= H; ++h) bounds[(size_t) h] = h * R;
+            cudaMemcpyAsync(heads_bounds_, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice, stream_);
+            head_major_ids(heads_ids_, H, R, stream_);
             const size_t mat = mmq::matrix_bytes(w->type, rows, k);
-            for (int h = 0; h < H; ++h) {
-                mmq::quantize(x + (size_t) h * x_head_stride, nullptr, mmq_xq_, w->type, k, x_tok_stride, R, stream_);
-                mmq::Product p;
-                p.w = (const uint8_t*) w->ptr + (size_t) h * mat;
-                p.type = w->type;
-                p.w_rows = rows;
-                p.w_cols = k;
-                p.expert_bytes = mat;
-                p.n = 1;
-                p.xq = mmq_xq_;
-                p.bounds = mmq_bounds_;
-                p.ids = mmq_ident_;
-                p.total_rows = R;
-                p.max_rows = R;
-                p.dst = y + (size_t) h * rows;
-                p.ld_dst = (int64_t) H * rows;
-                mmq_.run(p, stream_);
-            }
+            mmq::quantize(x, heads_ids_, mmq_xq_, w->type, k, x_head_stride, (int64_t) H * R, stream_);
+            mmq::Product p;
+            p.w = (const uint8_t*) w->ptr;
+            p.type = w->type;
+            p.w_rows = rows;
+            p.w_cols = k;
+            p.expert_bytes = mat;
+            p.n = H;
+            p.xq = mmq_xq_;
+            p.bounds = heads_bounds_;
+            p.ids = heads_ids_;
+            p.total_rows = (int64_t) H * R;
+            p.max_rows = R;
+            p.dst = y;
+            p.ld_dst = rows;
+            mmq_.run(p, stream_);
             return;
         }
         q8_0_heads_gemv(w->ptr, x, x_head_stride, x_tok_stride, H, rows, k, R, y, stream_);
@@ -869,6 +879,114 @@ private:
         bool issued = false, collected = false;
     };
     std::vector<Prefetch> pf_;
+
+    // A prompt chunk of kRingRows rows or more routes to every expert of every layer, so the next layer's experts do not wait for
+    // its router: all of a layer's experts are copied into one of two slots of the ring while the layer before it computes.
+    static constexpr int kRingRows = 1024;
+    uint8_t* ring_ = nullptr;
+    cudaEvent_t ring_copied_[2] = {nullptr, nullptr}, ring_done_[2] = {nullptr, nullptr};
+    int ring_layer_[2] = {-1, -1};
+    std::thread ring_thr_[2];
+    bool ring_ok_[2] = {false, false};
+
+    void ring_open() {
+        const size_t bytes = 2 * (size_t) g_.n_expert * stride_;
+        if (cudaMalloc((void**) &ring_, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            ring_ = nullptr;
+            basalt::log::info("basalt hy4flash", "no room for the expert ring (%.1f GB): the prompt stages its experts per layer", (double) bytes / 1e9);
+            return;
+        }
+        for (int i = 0; i < 2; ++i) {
+            cudaEventCreateWithFlags(&ring_copied_[i], cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&ring_done_[i], cudaEventDisableTiming);
+            cudaEventRecord(ring_done_[i], stream_);
+        }
+        ring_layer_[0] = ring_layer_[1] = -1;
+    }
+    void ring_join() {
+        for (std::thread& t : ring_thr_)
+            if (t.joinable()) t.join();
+    }
+    void ring_close() {
+        if (!ring_) return;
+        ring_join();
+        cudaStreamSynchronize(copy_);
+        cudaStreamSynchronize(stream_);
+        cudaFree(ring_);
+        ring_ = nullptr;
+        for (int i = 0; i < 2; ++i) {
+            cudaEventDestroy(ring_copied_[i]);
+            cudaEventDestroy(ring_done_[i]);
+        }
+    }
+    // All the experts of tier layer `tl` into its slot, on the copy stream once the layer that used the slot is done.
+    bool ring_copy(int tl) {
+        const int slot = tl & 1;
+        const ExpertLayer& el = m_.pack().experts[(size_t) (tl + g_.n_dense)];
+        uint8_t* base = ring_ + (size_t) slot * g_.n_expert * stride_;
+        cudaStreamWaitEvent(copy_, ring_done_[slot], 0);
+        // runs of experts in RAM at an even spacing go in one strided copy
+        int e = 0;
+        while (e < g_.n_expert) {
+            const core::ExpertTier::Source src = tier_->locate(tl, e);
+            uint8_t* dst = base + stride_ * (size_t) e;
+            if (src.pinned) {
+                int n = 1;
+                ptrdiff_t gap = 0;
+                while (e + n < g_.n_expert) {
+                    const core::ExpertTier::Source nx = tier_->locate(tl, e + n);
+                    if (!nx.pinned) break;
+                    const ptrdiff_t d = (const uint8_t*) nx.pinned - (const uint8_t*) src.pinned - (ptrdiff_t) (n - 1) * gap;
+                    if (n == 1) gap = (const uint8_t*) nx.pinned - (const uint8_t*) src.pinned;
+                    else if (d != gap) break;
+                    if (gap < (ptrdiff_t) el.blob_bytes) break;
+                    ++n;
+                }
+                if (n > 1) {
+                    cudaMemcpy2DAsync(dst, stride_, src.pinned, (size_t) gap, el.blob_bytes, (size_t) n, cudaMemcpyHostToDevice, copy_);
+                } else {
+                    cudaMemcpyAsync(dst, src.pinned, el.blob_bytes, cudaMemcpyHostToDevice, copy_);
+                }
+                e += n;
+                continue;
+            }
+            if (src.dev) cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
+            else if (src.peer) cudaMemcpyPeerAsync(dst, m_.device(), src.peer, tier_->peer_for(tl)->device(), el.blob_bytes, copy_);
+            else return false;
+            ++e;
+        }
+        cudaEventRecord(ring_copied_[slot], copy_);
+        return true;
+    }
+    // The copy is issued from a thread of its own: hundreds of copy calls can hold the caller until the bus has taken most of them.
+    void ring_start(int tl) {
+        const int slot = tl & 1;
+        if (ring_thr_[slot].joinable()) ring_thr_[slot].join();
+        ring_layer_[slot] = tl;
+        ring_ok_[slot] = false;
+        const int dev = m_.device();
+        ring_thr_[slot] = std::thread([this, tl, slot, dev] {
+            cudaSetDevice(dev);
+            const double t0 = now_ms();
+            ring_ok_[slot] = ring_copy(tl);
+            t_ring_ms_ += now_ms() - t0;
+        });
+    }
+    // Layer `tl`'s experts are in their slot (waits for the thread that issued the copy); false when they could not be.
+    bool ring_ready(int tl) {
+        const int slot = tl & 1;
+        if (ring_layer_[slot] != tl) ring_start(tl);
+        if (ring_thr_[slot].joinable()) ring_thr_[slot].join();
+        return ring_ok_[slot];
+    }
+    // At the start of layer `l`: the next layer with routed experts starts its copy.
+    void ring_ahead(int l, int R) {
+        if (!ring_ || !tier_ || R < kRingRows) return;
+        const int target = l < g_.n_dense ? 0 : l - g_.n_dense + 1;
+        if (target >= g_.n_layers - g_.n_dense) return;
+        if (ring_layer_[target & 1] != target) ring_start(target);
+    }
 
     void prefetch_engram(int64_t pos0, int R) {
         const EngramInfo& en = m_.pack().engram;
@@ -1098,8 +1216,80 @@ private:
         std::vector<int> used;
         for (int e = 0; e < g_.n_expert; ++e)
             if (!by[(size_t) e].empty()) used.push_back(e);
+        const double t2 = now_ms();
+        t_build_ms_ += t2 - t1;
         std::vector<int32_t> map_h((size_t) R * K);
         int64_t pos = 0;
+        auto launch = [&](Stage& B, const uint8_t* blobs, int nb, int64_t rows, int64_t max_rows, const std::vector<int32_t>& tok,
+                          const std::vector<int32_t>& bounds) {
+            cudaMemcpyAsync(B.tok, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(B.bounds, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice, st);
+            mmq::quantize(xlat_, B.tok, xq1_, el.gu_type, L, L, rows, st);
+            mmq::Product p;
+            p.w = blobs;
+            p.type = el.gu_type;
+            p.w_rows = 2 * (int64_t) F;
+            p.w_cols = L;
+            p.expert_bytes = stride_;
+            p.n = nb;
+            p.xq = xq1_;
+            p.bounds = B.bounds;
+            p.ids = pair_ident_;
+            p.total_rows = rows;
+            p.max_rows = max_rows;
+            p.dst = gu_;
+            p.ld_dst = p.w_rows;
+            mmq_.run(p, st);
+            swiglu_split_clamped(gu_, h_, rows, F, g_.clamp_exp[(size_t) l], st);
+            mmq::quantize(h_, nullptr, xq2_, el.d_type, F, F, rows, st);
+            mmq::Product d;
+            d.w = blobs + lay.down_off;
+            d.type = el.d_type;
+            d.w_rows = L;
+            d.w_cols = F;
+            d.expert_bytes = stride_;
+            d.n = nb;
+            d.xq = xq2_;
+            d.bounds = B.bounds;
+            d.ids = pair_ident_ + pos;
+            d.total_rows = rows;
+            d.max_rows = max_rows;
+            d.dst = pair_rows_;
+            d.ld_dst = L;
+            mmq_.run(d, st);
+            cudaEventRecord(B.done, st);
+            pos += rows;
+        };
+        bool ringed = ring_ && R >= kRingRows && tier_ && ring_ready(tl);
+        if (ringed) {
+            const int slot = tl & 1;
+            cudaStreamWaitEvent(st, ring_copied_[slot], 0);
+            const uint8_t* base = ring_ + (size_t) slot * g_.n_expert * stride_;
+            for (size_t b0 = 0; b0 < used.size();) {
+                const int e0 = used[b0];
+                size_t b1 = b0;
+                int64_t rows = 0, max_rows = 0;
+                while (b1 < used.size() && used[b1] < e0 + kStageExperts) {
+                    const int64_t c = (int64_t) by[(size_t) used[b1]].size();
+                    if (b1 > b0 && rows + c > kLaunchRows) break;
+                    rows += c;
+                    max_rows = std::max(max_rows, c);
+                    ++b1;
+                }
+                const int nb = used[b1 - 1] - e0 + 1;
+                std::vector<int32_t> tok, bounds{0};
+                for (int e = e0; e < e0 + nb; ++e) {
+                    for (int32_t p : by[(size_t) e]) {
+                        map_h[(size_t) p] = (int32_t) (pos + (int64_t) tok.size());
+                        tok.push_back(p / K);
+                    }
+                    bounds.push_back((int32_t) tok.size());
+                }
+                launch(stage_[launch_++ & 1], base + (size_t) e0 * stride_, nb, rows, max_rows, tok, bounds);
+                b0 = b1;
+            }
+            cudaEventRecord(ring_done_[slot], st);
+        } else
         for (size_t b0 = 0; b0 < used.size();) {
             int nb = 0;
             int64_t rows = 0, max_rows = 0;
@@ -1137,46 +1327,12 @@ private:
                 }
                 bounds.push_back((int32_t) tok.size());
             }
-            cudaMemcpyAsync(B.tok, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice, st);
-            cudaMemcpyAsync(B.bounds, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice, st);
             cudaStreamWaitEvent(st, B.copied, 0);
-            mmq::quantize(xlat_, B.tok, xq1_, el.gu_type, L, L, rows, st);
-            mmq::Product p;
-            p.w = B.blobs;
-            p.type = el.gu_type;
-            p.w_rows = 2 * (int64_t) F;
-            p.w_cols = L;
-            p.expert_bytes = stride_;
-            p.n = nb;
-            p.xq = xq1_;
-            p.bounds = B.bounds;
-            p.ids = pair_ident_;
-            p.total_rows = rows;
-            p.max_rows = max_rows;
-            p.dst = gu_;
-            p.ld_dst = p.w_rows;
-            mmq_.run(p, st);
-            swiglu_split_clamped(gu_, h_, rows, F, g_.clamp_exp[(size_t) l], st);
-            mmq::quantize(h_, nullptr, xq2_, el.d_type, F, F, rows, st);
-            mmq::Product d;
-            d.w = B.blobs + lay.down_off;
-            d.type = el.d_type;
-            d.w_rows = L;
-            d.w_cols = F;
-            d.expert_bytes = stride_;
-            d.n = nb;
-            d.xq = xq2_;
-            d.bounds = B.bounds;
-            d.ids = pair_ident_ + pos;
-            d.total_rows = rows;
-            d.max_rows = max_rows;
-            d.dst = pair_rows_;
-            d.ld_dst = L;
-            mmq_.run(d, st);
-            cudaEventRecord(B.done, st);
+            launch(B, B.blobs, nb, rows, max_rows, tok, bounds);
             b0 += (size_t) nb;
-            pos += rows;
         }
+        const double t3 = now_ms();
+        t_issue_ms_ += t3 - t2;
         cudaMemcpyAsync(pair_map_, map_h.data(), (size_t) R * K * 4, cudaMemcpyHostToDevice, st);
         weighted_sum_tokens(pair_rows_, pair_map_, rw_, R, K, L, lat_out_, st);
         cudaStreamSynchronize(st);   // the host's map is read until the copy lands
@@ -1327,20 +1483,27 @@ private:
         cudaMemcpyAsync(e_, h_e_, (size_t) R * E * 4, cudaMemcpyHostToDevice, stream_);
         fill_streams(e_, E, R, X_, stream_);
         if (!m_.diag_dump().empty()) dump("hc_init", X_, (int64_t) R * 4 * E);
+        ring_join();
+        ring_layer_[0] = ring_layer_[1] = -1;
         for (int l = 0; l < g_.n_layers; ++l) {
+            ring_ahead(l, R);
             if (!engram(l, pos0, R, tokens, err)) return false;
             if (diag(l) && !g_.swa.empty() && l >= 1) dump("engram_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
             bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
             bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
             if (diag(l)) dump("attn_norm-" + std::to_string(l), xn_, (int64_t) R * E);
+            const double ta = now_ms();
             if (!attention(l, pos0, R, err)) return false;
+            t_att_ms_ += now_ms() - ta;
             bk::hc_post(attn_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
             std::swap(X_, Xn_);
             if (diag(l)) dump("hc_attn_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
             bk::hc_mixes_plain(X_, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
             bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
             if (diag(l)) dump("ffn_norm-" + std::to_string(l), xn_, (int64_t) R * E);
+            const double tf = now_ms();
             if (!ffn(l, R, err)) return false;
+            t_ffn_ms_ += now_ms() - tf;
             bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, R, E, g_.rms_eps, stream_);
             if (diag(l)) dump("ffn_out-" + std::to_string(l), mlp2_, (int64_t) R * E);
             bk::hc_post(mlp2_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
@@ -1496,7 +1659,7 @@ private:
     basalt::prefill::mmq::Context mmq_;
     std::set<std::pair<int, int>> loaded_;   // (type, rows) the MMQ tiles are loaded for
     void *mmq_xq_ = nullptr;
-    int32_t *mmq_bounds_ = nullptr, *mmq_ident_ = nullptr;
+    int32_t *mmq_bounds_ = nullptr, *mmq_ident_ = nullptr, *heads_ids_ = nullptr, *heads_bounds_ = nullptr;
     void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr;
     float* ex_rows_ = nullptr;
     const float** rowptr_d_ = nullptr;
@@ -1530,7 +1693,8 @@ private:
     int img_nx_ = 1, img_j_ = 0;         // its columns (newline included) and the row of its first run row
     int last_rows_ = 0;
     // prompt timing (host wall time at the sync points): the work queued before a layer's MoE, the MoE itself, the Engram's reads
-    double t_pre_ms_ = 0, t_moe_ms_ = 0, t_eng_ms_ = 0;
+    double t_pre_ms_ = 0, t_moe_ms_ = 0, t_eng_ms_ = 0, t_build_ms_ = 0, t_issue_ms_ = 0, t_att_ms_ = 0, t_ffn_ms_ = 0;
+    std::atomic<double> t_ring_ms_{0};
     static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 };
 

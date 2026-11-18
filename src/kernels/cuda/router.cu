@@ -86,7 +86,10 @@ router_logits_kernel(const float* __restrict__ x, const float* __restrict__ gate
                      int n_tokens, float* __restrict__ logits) {
     __shared__ float red[kMaxTok * (kLogitThreads / 32)];
     const int row = blockIdx.x;
-    router_logits_row(gate + (size_t) row * n_embd, x, n_embd, n_tokens, logits, n_expert, row, red);
+    // blockIdx.y: a group of kMaxTok tokens of the launch
+    const int t0 = blockIdx.y * kMaxTok;
+    router_logits_row(gate + (size_t) row * n_embd, x + (size_t) t0 * n_embd, n_embd, min(kMaxTok, n_tokens - t0), logits + (size_t) t0 * n_expert,
+                      n_expert, row, red);
 }
 
 __device__ __forceinline__ float sqrt_softplus(float x) {
@@ -172,9 +175,10 @@ void router(const float* x, const float* gate, const float* bias, int n_tokens, 
     if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.n_embd % 128 || a.n_embd > 4 * kMaxVec * kLogitThreads || a.k < 1 || a.k > 16 || a.k > a.n_expert)
         throw std::invalid_argument("router: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
-    for (int t0 = 0; t0 < n_tokens; t0 += kMaxTok) {
-        const int nt = n_tokens - t0 < kMaxTok ? n_tokens - t0 : kMaxTok;
-        router_logits_kernel<<<a.n_expert, kLogitThreads, 0, st>>>(
+    constexpr int kLaunchTok = kMaxTok * 65535;   // grid.y limit
+    for (int t0 = 0; t0 < n_tokens; t0 += kLaunchTok) {
+        const int nt = n_tokens - t0 < kLaunchTok ? n_tokens - t0 : kLaunchTok;
+        router_logits_kernel<<<dim3(a.n_expert, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
             x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
     }
     router_select_kernel<<<n_tokens, a.n_expert, 0, st>>>(logits, bias, a.n_expert, a.k, a.weight_scale, (int) a.gate, ids, weights);
