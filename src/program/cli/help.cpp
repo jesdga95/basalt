@@ -182,7 +182,7 @@ void usage() {
                  "                       server, with or without the peer tier; 4 with the layers split over GPUs\n"
                  "                       and outside --serve; 0 = the VRAM experts stay as loaded)\n"
                  "  --adapt-decay F      factor the routing counts are multiplied by after each round (default\n"
-                 "                       0.85 on a server with or without the peer tier, 0.7 with the layers\n"
+                 "                       0.95 on a server with or without the peer tier, 0.7 with the layers\n"
                  "                       split over GPUs and outside --serve); lower forgets sooner\n"
                  "  --prefill-cpu-share F  share of the streamed prompt experts the CPU computes, 0 to 1 (default\n"
                  "                       0.6; 0 = the GPU streams them all).  Fixed, so the output is the same\n"
