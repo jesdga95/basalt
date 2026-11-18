@@ -445,6 +445,69 @@ int main(int argc, char** argv) {
             cudaFree(bk); cudaFree(bv); cudaFree(bq); cudaFree(bo); cudaFree(b8.k); cudaFree(b8.v); cudaFree(b8.ks); cudaFree(b8.vs);
         }
     }
+    // ---- the fp16 prompt kernel's bits are frozen: a random cache, chunks at many (pos0, T), and a row's bits the same
+    // whatever the chunk around it.  The hashes below are those of the kernel before its K/V prefetch; a change that must
+    // not move a bit leaves them as they are.
+    {
+        std::mt19937 hr(31);
+        std::normal_distribution<float> hn(0.f, 1.f);
+        const int64_t cap = 4200;
+        const size_t n = (size_t) cap * NKV * HD;
+        std::vector<uint16_t> hk(n), hv(n);
+        for (size_t i = 0; i < n; ++i) {
+            hk[i] = basalt::kernels::f16_from_f32(hn(hr));
+            hv[i] = basalt::kernels::f16_from_f32(hn(hr));
+        }
+        uint16_t* dk = dev<uint16_t>(n);
+        uint16_t* dv = dev<uint16_t>(n);
+        ck(cudaMemcpy(dk, hk.data(), n * 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(dv, hv.data(), n * 2, cudaMemcpyHostToDevice), "copy");
+        std::vector<float> hqa((size_t) cap * NH * HD);
+        for (auto& x : hqa) x = 2.0f * hn(hr);
+        float* dq2 = dev<float>(hqa.size());
+        float* do2 = dev<float>(hqa.size());
+        std::vector<float> got2(hqa.size());
+        // a run: the chunk rows [p0, p0 + T) of the same queries
+        const auto run = [&](int64_t p0, int T) {
+            ck(cudaMemcpy(dq2, &hqa[(size_t) p0 * NH * HD], (size_t) T * NH * HD * 4, cudaMemcpyHostToDevice), "copy");
+            basalt::kernels::gqa_prompt_attn(dq2, dk, dv, NH, NKV, p0, T, do2, nullptr);
+            ck(cudaMemcpy(got2.data(), do2, (size_t) T * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
+        };
+        unsigned long long hp = 1469598103934665603ull;
+        const int64_t starts2[] = {0, 13, 31, 32, 96, 1000, 3688};
+        for (const int64_t p0 : starts2)
+            for (int T : {1, 7, 96, 300, 512}) {
+                if (p0 + T > cap) continue;
+                run(p0, T);
+                for (size_t i = 0; i < (size_t) T * NH * HD; ++i) {
+                    unsigned u;
+                    std::memcpy(&u, &got2[i], 4);
+                    hp = (hp ^ u) * 1099511628211ull;
+                }
+            }
+        // the same absolute positions read at the end of chunks of three widths: bitwise the same row
+        bool same_row = true;
+        for (int p : {1500, 3088}) {
+            std::vector<float> first;
+            for (const int T : {300, 100, 1000}) {
+                const int64_t p0 = p - T + 1;
+                run(p0, T);
+                const float* row = &got2[(size_t) (p - p0) * NH * HD];
+                if (first.empty()) first.assign(row, row + NH * HD);
+                else if (std::memcmp(first.data(), row, (size_t) NH * HD * 4) != 0) same_row = false;
+            }
+        }
+        std::printf("gqa_prompt_attn: a row bitwise the same in chunks of 300, 100 and 1000 rows: %s\n", same_row ? "yes" : "NO");
+        if (!same_row) ++fails;
+        std::printf("prompt fp16 hash: %016llx\n", hp);
+        const unsigned long long frozen_p = 0x0c727624c207753full;
+        std::printf("prompt fp16 bits against the frozen hash: %s\n", hp == frozen_p ? "identical" : "DIFFERENT");
+        if (hp != frozen_p) ++fails;
+        cudaFree(dk);
+        cudaFree(dv);
+        cudaFree(dq2);
+        cudaFree(do2);
+    }
     // ---- the decode kernel's bits are frozen: random fp16 and int8 caches, many (pos0, T), a device pos0, two windows in one launch.
     // The hashes below are those of the kernel before its next-chunk fetch; a change that must not move a bit leaves them as they are.
     {
