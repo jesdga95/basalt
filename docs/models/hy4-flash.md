@@ -219,10 +219,8 @@ to 256 rows through `run_rows` with the rows as the embeddings), `place_rope` in
   positions are overwritten, and the SWA ring is sized 512 + window. The drafter reads the target's caches read-only and writes
   only its own block rows (scratch), so a rejected block leaves no trace. Tests: greedy identity with and without `--spec`, tiers
   pinned; per-kernel T = 1..8 identity.
-- **Risk**: no DFly2 inference source is public (vLLM's `hy_v4` package lacks it; the AngelSpec code is the Qwen-style training
-  model). The forward above is inferred from the tensor shapes, the config and the diagram; acceptance only affects speed, never
-  output. Plan: implement from the shapes, measure acceptance against the README's claim, then resolve differences with the
-  `vllm/vllm-openai:hy4-flash` image's source, if it can be fetched.
+- **Source and forward**: vLLM PR 68296 has the inference code (the drafter files under `vllm/models/hy_v4/nvidia/`); the forward, the Basalt mapping and the
+  assumptions that remain are in [dfly2](hy4-flash/dfly2.md). Acceptance only affects speed, never output.
 
 ## Serve
 
@@ -291,7 +289,7 @@ Exit: layer 0 to 2 hidden states within gate 1, then all 42. GPU tests are queue
    Hy4's at 4K, 16K, 128K. A 1M prompt is minutes.
 3. **Indexer cost and numerics at 1M.** Measure the fused score + streaming top-k kernel at 262K pooled keys (TFLOP/s against the
    55 est.); FP8 pooled keys only if the selected-id overlap with FP16 is above 99.9 % and KLD is unchanged.
-4. **DFly2 forward undocumented** (above). Measure acceptance per position on code and prose; compare with README's 150+ tok/s claim.
+4. **DFly2 acceptance** (the forward is in dfly2.md). Measure acceptance per position on code and prose; compare with README's 150+ tok/s claim.
 5. **Test pack revision / tokenizer suffix.** Gate 6, a day-1 check. If it is a pre-release revision, its KLD against the BF16 file
    is not a quantisation figure; use llama.cpp's Q4_K_M on the same file as the parity base and the BF16 file for NVFP4 only.
 6. **Engram SSD.** 64 random 96-byte rows per token (4 KB reads), about 1M reads per 16K chunk. Measure: 4K random read IOPS at
