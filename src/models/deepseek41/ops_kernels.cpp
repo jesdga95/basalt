@@ -9,12 +9,12 @@
 #include "basalt/models/deepseek41/attn.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "models/deepseek41/attn_batch.hpp"
-#include "models/deepseek41/elastic.hpp"
+#include "basalt/core/elastic_array.hpp"
 #include "models/deepseek41/layer_ops.hpp"
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
 #include "models/deepseek41/ops.hpp"
-#include "models/deepseek41/tier.hpp"
+#include "basalt/core/expert_tier.hpp"
 
 #include <cuda_runtime.h>
 
@@ -38,9 +38,12 @@ struct ExpertPlan {
     int32_t tok[8];
 };
 
+// Experts one lookup holds: a window of up to 8 rows, 6 each.
+constexpr int kLookupK = 48;
+
 // Joins a started CPU share on every way out of a layer's experts.
 struct CpuJoin {
-    ExpertTier* tier = nullptr;
+    core::ExpertTier* tier = nullptr;
     ~CpuJoin() { now(); }
     void now() {
         if (tier) tier->finish_cpu();
@@ -75,11 +78,11 @@ struct PeerArm {
 
 // A window's plan: the distinct experts of its rows, each with the rows it computes.
 struct WindowPlan {
-    unsigned long long ptr[ExpertTier::kMaxK];
-    int32_t start[ExpertTier::kMaxK + 2];
+    unsigned long long ptr[kLookupK];
+    int32_t start[kLookupK + 2];
     int32_t ng[4];
-    int32_t dst[ExpertTier::kMaxK];
-    int32_t tok[ExpertTier::kMaxK];
+    int32_t dst[kLookupK];
+    int32_t tok[kLookupK];
 };
 static_assert(sizeof(WindowPlan) <= 4 * kPutWords && sizeof(ExpertPlan) <= 4 * kPutWords, "a plan fits put_words");
 
@@ -142,8 +145,8 @@ public:
                 const int ratio = g_.compress_ratio[(size_t) il];
                 // the caches reserve the address range of the whole context and are backed as positions arrive
                 const size_t cap = (size_t) ctx_ / ratio + 1;
-                el_kv_[il] = std::make_unique<ElasticBuf>();
-                el_ik_[il] = std::make_unique<ElasticBuf>();
+                el_kv_[il] = std::make_unique<core::ElasticArray>();
+                el_ik_[il] = std::make_unique<core::ElasticArray>();
                 if (!el_kv_[il]->open(cap * lat_b_, err) || !el_ik_[il]->open(cap * idx_b_, err))
                     return false;
                 comp_kv_[il] = el_kv_[il]->data();
@@ -298,7 +301,7 @@ public:
         if (tier_) tier_->begin_token(n_tokens);
     }
     void end_window() override {
-        if (tier_) tier_->pump(-1, ExpertTier::kAllPieces);
+        if (tier_) tier_->pump(-1, core::ExpertTier::kAllPieces);
     }
 
     bool attention_batch(int il, int64_t pos0, int n_tokens, const int32_t*, const float* x, float* out, int,
@@ -601,7 +604,7 @@ public:
     /// The expert staging and the tier, built on first use.
     bool ensure_tier(std::string& err) {
         if (tier_) return true;
-        constexpr int kRows = ExpertTier::kMaxK;   // routed outputs of a window: tokens x slots
+        constexpr int kRows = kLookupK;   // routed outputs of a window: tokens x slots
         constexpr size_t kPlanBytes = std::max(sizeof(ExpertPlan), sizeof(WindowPlan));
         share_g_.assign((size_t) g_.n_layers * (kMaxK + 1), nullptr);
         if (!alloc(&ex_xq_, kernels::native_q8_1_bytes(g_.n_embd, kMaxT)) ||
@@ -643,9 +646,9 @@ public:
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
         }
-        auto t = std::make_shared<ExpertTier>(m_);
+        auto t = std::make_shared<core::ExpertTier>(m_.tier_spec());
         const prefillp::Dims d = m_.prompt_dims();
-        ExpertTier::Reserve r;
+        core::ExpertTier::Reserve r;
         // the caches of a full context grow into the reserve beside the copies; a prompt borrows the copies
         r.copies = m_.context_bytes() * (uint64_t) m_.sessions() + kModuleRoom;
         // beside the homes a prompt keeps the full context's caches and a kHomeChunk chunk, and a shorter prompt (whose
@@ -667,7 +670,7 @@ public:
         return true;
     }
 
-    ExpertTier* expert_tier(std::string& err) override { return ensure_tier(err) ? tier_.get() : nullptr; }
+    core::ExpertTier* expert_tier(std::string& err) override { return ensure_tier(err) ? tier_.get() : nullptr; }
 
     // Kernels write the mapped activation and ids: no copy-engine job queues behind the copies of experts.
     void stage_rows(int T, const float* x, void* stream) override {
@@ -716,15 +719,15 @@ public:
         if (peer) {
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
-            if (!peer->arm(limited, h_x_, T, K, policy::peer_groups(T), err)) return false;
+            if (!peer->arm(limited, h_x_, T, K, core::policy::peer_groups(T), err)) return false;
             armed.peer = peer;
         }
         tier_->pump(il, 2 + T);   // what this layer's head leaves the bus of the promotions queued before it
         await_ids(st, T * K);
-        int32_t uniq[ExpertTier::kMaxK];
+        int32_t uniq[kLookupK];
         int nu = 0;
-        int uidx[ExpertTier::kMaxK];   // [t * K + k] -> index in uniq
-        ExpertTier::Use use[ExpertTier::kMaxK];
+        int uidx[kLookupK];   // [t * K + k] -> index in uniq
+        core::ExpertTier::Use use[kLookupK];
         for (int t = 0; t < T; ++t)
             for (int k = 0; k < K; ++k) {
                 const int32_t e = h_ids_[t * K + k];
@@ -732,21 +735,21 @@ public:
                 while (u < nu && uniq[u] != e) ++u;
                 if (u == nu) {
                     uniq[nu++] = e;
-                    use[u] = ExpertTier::Use{};
+                    use[u] = core::ExpertTier::Use{};
                 }
-                ExpertTier::Use& us = use[u];
+                core::ExpertTier::Use& us = use[u];
                 us.tok[us.nt] = t;
                 us.row[us.nt] = t * K + k;
                 ++us.nt;
                 uidx[t * K + k] = u;
             }
-        ExpertTier::Lookup lk;
+        core::ExpertTier::Lookup lk;
         if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
         // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land; the
         // experts it fetched over its own link are planned beside the ones it holds
         if (peer) {
-            int32_t kind[ExpertTier::kMaxK] = {};
+            int32_t kind[kLookupK] = {};
             for (int r = 0; r < T * K; ++r) kind[r] = !lk.peer[uidx[r]] ? 0 : lk.fetched[uidx[r]] ? 3 : 2;
             if (!peer->raise(il, h_ids_, kind, err)) return false;
         }
@@ -870,19 +873,19 @@ public:
         if (peer) {
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
-            if (!peer->arm(limited, h_x_, 1, K, policy::peer_groups(1), err)) return false;
+            if (!peer->arm(limited, h_x_, 1, K, core::policy::peer_groups(1), err)) return false;
             armed.peer = peer;
         }
         tier_->pump(il, 3);
         if (shared_out) await_ids(st, K);
         else cudaStreamSynchronize(st);
-        ExpertTier::Lookup lk;
+        core::ExpertTier::Lookup lk;
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
         // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land; the
         // experts it fetched over its own link are planned beside the ones it holds
         if (peer) {
-            int32_t kind[ExpertTier::kMaxK] = {};
+            int32_t kind[kLookupK] = {};
             for (int k = 0; k < K; ++k) kind[k] = !lk.peer[k] ? 0 : lk.fetched[k] ? 3 : 2;
             if (!peer->raise(il, lk.experts, kind, err)) return false;
         }
@@ -1030,7 +1033,7 @@ private:
     std::unique_ptr<AttnBatch> batch_;
     std::vector<void*> allocs_;
     std::vector<uint8_t*> ring_, comp_kv_, comp_ik_;
-    std::vector<std::unique_ptr<ElasticBuf>> el_kv_, el_ik_;   // backing of comp_kv_ / comp_ik_ per kv-source layer
+    std::vector<std::unique_ptr<core::ElasticArray>> el_kv_, el_ik_;   // backing of comp_kv_ / comp_ik_ per kv-source layer
     int64_t backed_positions_ = 0;
     bool lent_here_ = false;   // ensure_positions lent the tier's slots; stage_token takes back what is left
     int ctx_ = 0;
@@ -1055,7 +1058,7 @@ private:
     uint32_t *h_join_ = nullptr, *d_join_ = nullptr;   // the word a layer's weighted sum waits for (mapped)
     uint32_t join_seq_ = 0;                             // the value it was last armed with
     int64_t staged_pos_ = -1;
-    std::shared_ptr<ExpertTier> tier_;
+    std::shared_ptr<core::ExpertTier> tier_;
     static constexpr int kMaxK = 8;                 // routed experts of a token
     std::vector<cudaGraphExec_t> share_g_;          // [layer * (kMaxK + 1) + experts on the card]: their launch and the shared expert's
     float *sh_g_ = nullptr, *sh_u_ = nullptr, *sh_h_ = nullptr;

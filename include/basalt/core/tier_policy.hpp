@@ -1,4 +1,4 @@
-// src/models/deepseek41/tier_policy.hpp - the admission and placement rules of the expert tiers, free of CUDA so a
+// include/basalt/core/tier_policy.hpp - the admission and placement rules of the expert tiers, free of CUDA so a
 // CPU test can drive them with synthetic id streams.
 #pragma once
 
@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace basalt::models::deepseek41::policy {
+namespace basalt::core::policy {
 
 constexpr int kPromoteWindow = 64;              // tokens within which a repeat miss earns a VRAM slot
 constexpr uint64_t kPieceBytes = 1ull << 20;    // largest single promotion copy
@@ -15,9 +15,9 @@ constexpr uint64_t kPeerMoveAge = 1280;         // lookups (~32 windows) the sec
 constexpr int kPromoteUses = 12;                // CPU uses that earn a VRAM slot when the RAM tier caches the file
 constexpr int kUseHalfLife = 128;               // tokens after which those counts halve
 
-/// One more CPU use of an expert: true, and the count starts over, when it reaches kPromoteUses.
-inline bool count_use(uint16_t& uses) {
-    if (++uses < kPromoteUses) return false;
+/// One more CPU use of an expert: true, and the count starts over, when it reaches `threshold` (1: every use admits).
+inline bool count_use(uint16_t& uses, int threshold = kPromoteUses) {
+    if (++uses < threshold) return false;
     uses = 0;
     return true;
 }
@@ -229,4 +229,4 @@ inline int pick_victim(const int32_t* idx, const uint64_t* stamp, int n_expert, 
     return best;
 }
 
-}  // namespace basalt::models::deepseek41::policy
+}  // namespace basalt::core::policy
