@@ -405,6 +405,29 @@ int main() {
         }
     }
 
+    // 41 layers of 512 experts of 4.59 MB over one to three second cards of 14.4 GB with RAM for every expert: the blocks cover
+    // every layer once and the homes follow the room
+    {
+        const uint64_t blob = (4591616 + 255) / 256 * 256, reserve = 600ull << 20, room = 14400ull << 20;
+        const std::vector<uint64_t> lb(41, blob);
+        int prev = 0;
+        for (int cards = 1; cards <= 3; ++cards) {
+            int h = 0;
+            const PeerBlocks b = split_by_bytes(lb, std::vector<uint64_t>((size_t) cards, room), reserve, 512, h);
+            CHECK(b.lo.size() == (size_t) cards && b.lo[0] == 0 && b.hi.back() == 41);
+            for (int c = 1; c < cards; ++c) CHECK(b.lo[(size_t) c] == b.hi[(size_t) c - 1]);
+            CHECK(h > prev);   // each card adds second-card homes
+            prev = h;
+            const Homes hm = plan_homes(512, 0, h, 512, -1);
+            CHECK(hm.main == 0 && hm.peer == h && hm.peer + hm.ram + hm.file == 512 && hm.file == 0);
+        }
+        const Homes full = plan_homes(512, 0, 512, 512, -1);
+        CHECK(full.peer == 512 && full.ram == 0);
+        // admission at k = 2 on a miss stream: the second miss of an expert admits it
+        uint16_t u = 0;
+        CHECK(!count_use(u, 2) && count_use(u, 2));
+    }
+
     if (g_fail) return 1;
     std::printf("tier_policy_test: ok\n");
     return 0;
