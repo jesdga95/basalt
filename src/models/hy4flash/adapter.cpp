@@ -48,6 +48,10 @@ public:
 
     // --kv (the sparse layers' latent rows, bf16 by default or fp8) and, DFLY HOOK, --spec and its companions as DeepSeek's
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
+        if (a == "--diag-rows") {
+            o.diag_rows = std::atoi(args.next("--diag-rows"));
+            return true;
+        }
         if (a == "--kv") {
             o.kv = args.next("--kv");
             return true;

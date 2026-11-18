@@ -64,6 +64,8 @@ public:
     bool cache_fp8() const { return fp8_; }
     /// --kv f32 (diagnostic): every latent row as fp32, the reference's own precision.
     bool cache_f32() const { return f32_; }
+    /// --diag-rows: the rows of one forward call of a prompt (0: the largest the session takes).
+    int diag_rows() const { return diag_rows_; }
     /// DFLY HOOK: the drafter's weights (null: none in the pack, or no drafting) and the verify window --spec asked for.
     const DflyWeights* dfly() const { return dfly_.get(); }
     int spec() const { return spec_; }
@@ -83,6 +85,7 @@ private:
     std::unique_ptr<ngram::PleReader> engram_;
     int device_ = 0, fd_ = -1;
     bool fp8_ = false, f32_ = false;
+    int diag_rows_ = 0;
     std::unique_ptr<DflyWeights> dfly_;   // DFLY HOOK
     int spec_ = 0;
     int64_t ctx_ = kDefaultContext;
