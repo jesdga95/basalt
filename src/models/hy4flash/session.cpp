@@ -143,7 +143,6 @@ public:
         logits_ = f((int64_t) kMaxWindow * g_.n_vocab); pick_ = (int32_t*) alloc(4 * 32, ok);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxWindow, (int) g_.n_vocab) + (int64_t) kMaxWindow * (bk::kLogprobStride + 1));
         q8_ = alloc(std::max<size_t>(bk::native_q8_1_bytes(16384, kMaxWindow), 1 << 16), ok);
-        mmq_bounds_ = (int32_t*) alloc(2 * 4, ok);
         ex_xq_ = alloc(bk::native_q8_1_bytes(g_.n_latent, kMaxWindow), ok);
         ex_scr_ = alloc(bk::native_expert_scratch_bytes(kLookupK, g_.n_ff_exp), ok);
         ex_rows_ = f((int64_t) kLookupK * g_.n_latent);
@@ -190,6 +189,18 @@ public:
                     cudaHostGetDevicePointer((void**) &d_words_, h_words_, 0) != cudaSuccess)
                     ok = false;
             }
+            if (cudaHostAlloc((void**) &stage_h_, kStageInts * 4, kMapped) != cudaSuccess) ok = false;
+            else {
+                pinned_.push_back(stage_h_);
+                if (cudaHostGetDevicePointer((void**) &stage_d_, stage_h_, 0) != cudaSuccess) ok = false;
+            }
+        }
+        // MMQ's row bounds {0, n} of a product of n rows, for every n of an attention step
+        bounds_tab_ = (int32_t*) alloc((size_t) 2 * (kAttRows + 1) * 4, ok);
+        if (ok) {
+            std::vector<int32_t> tab((size_t) 2 * (kAttRows + 1));
+            for (int n = 0; n <= kAttRows; ++n) tab[(size_t) 2 * n + 1] = n;
+            cudaMemcpy(bounds_tab_, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
         }
         rope_dev_ = (int32_t*) alloc((size_t) ctx * 12, ok);   // [vision] the 3-D rotary position of every cell
         if (cudaHostAlloc((void**) &h_plan_, sizeof(WindowPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
@@ -638,6 +649,33 @@ private:
     int elem() const { return f32() ? 4 : 2; }
     int sparse_row_bytes() const { return fp8() ? kFp8RowBytes : kRowWidth * elem(); }
 
+    // A prompt chunk's small inputs from the host: staged in mapped memory and copied by a kernel, so they do not wait on a copy
+    // engine behind the expert ring's copies (one piece queued there holds every later copy). A window copies as before.
+    void put_i32(int32_t* dst, const int32_t* src, size_t n) {
+        if (rows_ <= kMaxWindow || n == 0) {
+            cudaMemcpyAsync(dst, src, n * 4, cudaMemcpyHostToDevice, stream_);
+            return;
+        }
+        if (stage_at_ + n > kStageInts) {   // full: wait until the kernels queued so far have read their rows
+            cudaStreamSynchronize(stream_);
+            stage_at_ = 0;
+        }
+        std::memcpy(stage_h_ + stage_at_, src, n * 4);
+        bk::copy_i32x3_from_mapped(dst, stage_d_ + stage_at_, (int64_t) n, nullptr, nullptr, 0, nullptr, nullptr, 0, stream_);
+        stage_at_ += (n + 3) & ~(size_t) 3;
+    }
+    // n floats from pinned host memory the caller keeps until the stream has read it
+    void put_f32(float* dst, const float* src, int64_t n) {
+        if (rows_ <= kMaxWindow) {
+            cudaMemcpyAsync(dst, src, (size_t) n * 4, cudaMemcpyHostToDevice, stream_);
+            return;
+        }
+        if (n % 4 || (uintptr_t) src % 16 || (uintptr_t) dst % 16)
+            bk::copy_i32x3_from_mapped((int32_t*) dst, (const int32_t*) src, n, nullptr, nullptr, 0, nullptr, nullptr, 0, stream_);
+        else
+            bk::copy_from_mapped(dst, src, n, stream_);
+    }
+
     // y[r] = W x[r] for R rows, 8 at a time: a row's product does not depend on the rows beside it
     void gemm(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R) {
         namespace mmq = basalt::prefill::mmq;
@@ -645,8 +683,6 @@ private:
             if (loaded_.insert({w->type, n_out}).second) mmq::load(w->type, n_out);
             for (int r0 = 0; r0 < R; r0 += arows_) {
                 const int nb = std::min(arows_, R - r0);
-                const int32_t b[2] = {0, nb};
-                cudaMemcpyAsync(mmq_bounds_, b, sizeof b, cudaMemcpyHostToDevice, stream_);
                 mmq::quantize(x + (size_t) r0 * n_in, nullptr, mmq_xq_, w->type, n_in, n_in, nb, stream_);
                 mmq::Product p;
                 p.w = w->ptr;
@@ -656,7 +692,7 @@ private:
                 p.expert_bytes = mmq::matrix_bytes(w->type, n_out, n_in);
                 p.n = 1;
                 p.xq = mmq_xq_;
-                p.bounds = mmq_bounds_;
+                p.bounds = bounds_tab_ + 2 * nb;
                 p.ids = mmq_ident_;
                 p.total_rows = nb;
                 p.max_rows = nb;
@@ -679,10 +715,7 @@ private:
         if (R > kMaxWindow && R <= arows_ && mmq::built() && mmq::fits(w->type, rows)) {
             if (loaded_.insert({w->type, rows}).second) mmq::load(w->type, rows);
             // every head is an "expert" of the product with the R rows of the step: one quantisation and one launch for all heads
-            std::vector<int32_t> bounds((size_t) H + 1);
-            for (int h = 0; h <= H; ++h) bounds[(size_t) h] = h * R;
-            cudaMemcpyAsync(heads_bounds_, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice, stream_);
-            head_major_ids(heads_ids_, H, R, stream_);
+            head_major_ids(heads_ids_, heads_bounds_, H, R, stream_);
             const size_t mat = mmq::matrix_bytes(w->type, rows, k);
             mmq::quantize(x, heads_ids_, mmq_xq_, w->type, k, x_head_stride, (int64_t) H * R, stream_);
             mmq::Product p;
@@ -810,7 +843,7 @@ private:
                 dfly_.selection(l, t, sel ? icells_ + (size_t) t * cells_stride_ : nullptr, sel ? counts[t] : -1, stream_);
             }
         }
-        cudaMemcpyAsync(meta_d_, meta, (size_t) 3 * arows_ * 4, cudaMemcpyHostToDevice, stream_);
+        put_i32(meta_d_, meta, (size_t) 3 * arows_);
         RowSpans rs;
         rs.firsts = meta_d_;
         rs.counts = meta_d_ + arows_;
@@ -882,7 +915,7 @@ private:
                 max_pool = std::max(max_pool, pools);
             }
             if (max_pool <= keep) continue;
-            cudaMemcpyAsync(iidx_meta_, meta, (size_t) n * 3 * 4, cudaMemcpyHostToDevice, stream_);
+            put_i32(iidx_meta_, meta, (size_t) n * 3);
             idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
             idx_select_rows(iscore_, stride, iidx_meta_, n, keep, P, icells_ + (size_t) t0 * cells_stride_, cells_stride_, stream_);
         }
@@ -1109,8 +1142,8 @@ private:
                 for (int d = 0; d < W; ++d) row[d] = row[d] * r * nrm[(size_t) c * W + d] * valid;
             }
         }
-        cudaMemcpyAsync(erows_, h_erows_, (size_t) R * n_cols * W * 4, cudaMemcpyHostToDevice, stream_);
-        cudaMemcpyAsync(evalid_, h_evalid_, (size_t) R * 4, cudaMemcpyHostToDevice, stream_);
+        put_f32(erows_, h_erows_, (int64_t) R * n_cols * W);
+        put_f32(evalid_, h_evalid_, R);
         if (!eng_ev_) cudaEventCreateWithFlags(&eng_ev_, cudaEventDisableTiming);
         cudaEventRecord(eng_ev_, stream_);
         gemm(T(l, "engram_kv.weight"), erows_, ekv_, n_cols * W, 5 * g_.n_embd, R);
@@ -1238,6 +1271,7 @@ private:
         std::vector<int32_t> hid((size_t) R * K);
         const double t0 = now_ms();
         cudaStreamSynchronize(st);
+        stage_at_ = 0;   // the stream has drained: what was staged is read
         cudaMemcpy(hid.data(), ids_, hid.size() * 4, cudaMemcpyDeviceToHost);
         const double t1 = now_ms();
         t_pre_ms_ += t1 - t0;
@@ -1258,8 +1292,8 @@ private:
         int64_t pos = 0;
         auto launch = [&](Stage& B, const uint8_t* blobs, int nb, int64_t rows, int64_t max_rows, const std::vector<int32_t>& tok,
                           const std::vector<int32_t>& bounds) {
-            cudaMemcpyAsync(B.tok, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice, st);
-            cudaMemcpyAsync(B.bounds, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice, st);
+            put_i32(B.tok, tok.data(), tok.size());
+            put_i32(B.bounds, bounds.data(), bounds.size());
             mmq::quantize(xlat_, B.tok, xq1_, el.gu_type, L, L, rows, st);
             mmq::Product p;
             p.w = blobs;
@@ -1369,7 +1403,7 @@ private:
         }
         const double t3 = now_ms();
         t_issue_ms_ += t3 - t2;
-        cudaMemcpyAsync(pair_map_, map_h.data(), (size_t) R * K * 4, cudaMemcpyHostToDevice, st);
+        put_i32(pair_map_, map_h.data(), (size_t) R * K);
         weighted_sum_tokens(pair_rows_, pair_map_, rw_, R, K, L, lat_out_, st);
         cudaStreamSynchronize(st);   // the host's map is read until the copy lands
         t_moe_ms_ += now_ms() - t1;
@@ -1595,7 +1629,7 @@ private:
                 err = "no embedding row";
                 return false;
             }
-        cudaMemcpyAsync(e_, h_e_, (size_t) R * E * 4, cudaMemcpyHostToDevice, stream_);
+        put_f32(e_, h_e_, (int64_t) R * E);
         fill_streams(e_, E, R, X_, stream_);
         if (!m_.diag_dump().empty()) dump("hc_init", X_, (int64_t) R * 4 * E);
         ring_join();
@@ -1765,6 +1799,9 @@ private:
     float *ik_ = nullptr, *ikn_ = nullptr, *ivt_ = nullptr, *igt_ = nullptr, *iq_ = nullptr, *iw_ = nullptr, *iscore_ = nullptr;
     int32_t *iidx_meta_ = nullptr, *icells_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
     int cells_stride_ = 0, rows_ = 0, arows_ = 0, steps_ = 0, max_heads_ = 0;
+    static constexpr size_t kStageInts = (size_t) 4 << 20;   // the mapped staging of a prompt's small inputs
+    int32_t *stage_h_ = nullptr, *stage_d_ = nullptr, *bounds_tab_ = nullptr;
+    size_t stage_at_ = 0;
     Bufs dec_, big_;   // a window's row buffers, and a prompt chunk's while one runs
     float *gu_ = nullptr, *h_ = nullptr, *rlog_ = nullptr, *rw_ = nullptr;
     int32_t* ids_ = nullptr;
@@ -1784,7 +1821,7 @@ private:
     basalt::prefill::mmq::Context mmq_;
     std::set<std::pair<int, int>> loaded_;   // (type, rows) the MMQ tiles are loaded for
     void *mmq_xq_ = nullptr;
-    int32_t *mmq_bounds_ = nullptr, *mmq_ident_ = nullptr, *heads_ids_ = nullptr, *heads_bounds_ = nullptr;
+    int32_t *mmq_ident_ = nullptr, *heads_ids_ = nullptr, *heads_bounds_ = nullptr;
     void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr, *ex_plan2_ = nullptr;
     float* ex_rows_ = nullptr;
     float *h_x_ = nullptr, *d_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_e_ = nullptr, *h_erows_ = nullptr, *h_evalid_ = nullptr;

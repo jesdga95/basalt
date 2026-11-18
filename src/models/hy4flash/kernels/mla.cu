@@ -8,6 +8,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace basalt::models::hy4flash {
@@ -379,9 +380,10 @@ __global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict
 }
 
 
-__global__ void head_major_ids_kernel(int32_t* ids, int heads, int rows) {
+__global__ void head_major_ids_kernel(int32_t* ids, int32_t* bounds, int heads, int rows) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < heads * rows) ids[i] = (i % rows) * heads + i / rows;
+    if (i <= heads) bounds[i] = i * rows;
 }
 
 // cells[t][j] = j for j < fill[t] (rows with fill 0 are left alone).
@@ -420,9 +422,9 @@ void attend_impl(const float* qcur, const C* cache, const RowSpans& r, int n_tok
 
 }  // namespace
 
-void head_major_ids(int32_t* ids, int heads, int rows, void* stream) {
-    const int n = heads * rows;
-    head_major_ids_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(ids, heads, rows);
+void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* stream) {
+    const int n = std::max(heads * rows, heads + 1);
+    head_major_ids_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(ids, bounds, heads, rows);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
