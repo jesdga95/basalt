@@ -147,9 +147,10 @@ against the BF16 base (2.7314 PPL there).
 | 0.5 (bare default) | 91.2% | 2.9% / 6.0% | 18.8 ms | 3.4108 | 0.3787 | 81.03% |
 
 The pack's own quantization costs 0.2800 KLD and its published row reads 0.2779 and 83.88%, so this build is 0.002 worse
-than that measurement. Against that, 0.1 adds 0.0047 KLD (1.7% of the pack's own error, about three quarters of what
-the Q6_K dense projections cost) and 0.09 top-1 points, for a quarter to a half of the decode time. 0.25 is dominated by
-0.1 (the same step time, six times the error); the bare 0.5 costs 35% of the pack's own KLD and 2.7 points of top-1. The 20-chunk
+than that measurement. Against that, 0.1 is the point worth trying: it adds 0.0047 KLD (1.7% of the pack's own error,
+about three quarters of what the Q6_K dense projections cost) and 0.09 top-1 points, for a quarter more decode speed
+on the conversation fixture and double on the structured one. 0.25 is dominated by 0.1 (the same step time, six times the
+error); the bare 0.5 costs 35% of the pack's own KLD and 2.7 points of top-1. The 20-chunk
 quick check overstates the low boosts by about half (0.0075 and 0.0324 at 0.1 and 0.25): its text slice is easier (base
 PPL 2.2717 there against 2.7314 over all 100).
 
