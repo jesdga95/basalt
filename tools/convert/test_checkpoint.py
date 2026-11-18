@@ -201,6 +201,90 @@ class CheckpointDenseTest(unittest.TestCase):
             C.CheckpointDense(C.Checkpoint(self.d), require_complete=False)
 
 
+class QuantizedSourceTest(unittest.TestCase):
+    """Dense tensors that the checkpoint stores as MXFP8 or NVFP4 (NVIDIA's quantization-aware distillation export):
+    the values decode as the codes say, and the engine forms are quantized once from those values."""
+
+    H = 256
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        rng = np.random.default_rng(7)
+        H = self.H
+        L = "model.language_model.layers.0."
+        self.mx = {}
+        self.nv = {}
+        tens = {}
+
+        def mxfp8(name, rows, cols):
+            codes = rng.integers(0, 0x7F, size=(rows, cols), dtype=np.uint8)
+            scales = rng.integers(120, 134, size=(rows, cols // 32), dtype=np.uint8)
+            self.mx[name] = (codes, scales)
+            tens[name + ".weight"] = ("F8_E4M3", (rows, cols), codes.tobytes())
+            tens[name + ".weight_scale"] = ("U8", (rows, cols // 32), scales.tobytes())
+
+        def nvfp4(name, rows, cols, scale2=0.5):
+            codes = rng.integers(0, 256, size=(rows, cols // 2), dtype=np.uint8)
+            scales = rng.integers(120, 0x7F, size=(rows, cols // 16), dtype=np.uint8)
+            self.nv[name] = (codes, scales, scale2)
+            tens[name + ".weight"] = ("U8", (rows, cols // 2), codes.tobytes())
+            tens[name + ".weight_scale"] = ("F8_E4M3", (rows, cols // 16), scales.tobytes())
+            tens[name + ".weight_scale_2"] = ("F32", (), np.float32(scale2).tobytes())
+
+        mxfp8(L + "linear_attn.in_proj_a", 48, H)          # a BF16 target
+        mxfp8(L + "linear_attn.in_proj_z", 48 * S.GDN_HEAD, H)    # a Q6_K target, zrows (real geometry)
+        nvfp4(L + "linear_attn.out_proj", H, 48 * S.GDN_HEAD)     # a Q6_K target, vcols
+        small_checkpoint(self.d, tens)
+        self.L = L
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def decode_mx(self, name):
+        codes, scales = self.mx[name]
+        return S.fp8_e4m3_table()[codes] * np.repeat(np.exp2(scales.astype(np.float32) - np.float32(127)), 32, axis=1)
+
+    def decode_nv(self, name):
+        codes, scales, scale2 = self.nv[name]
+        v = np.empty((codes.shape[0], codes.shape[1] * 2), np.float32)
+        v[:, 0::2] = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], np.float32)[codes & 15]
+        v[:, 1::2] = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], np.float32)[codes >> 4]
+        return v * np.repeat(S.fp8_e4m3_table()[scales] * np.float32(scale2), 16, axis=1)
+
+    def test_mxfp8_decodes_and_rounds_once(self):
+        import multiprocessing
+        dn = C.CheckpointDense(C.Checkpoint(self.d), q6k=True, require_complete=False)
+        L = self.L
+        # a BF16 target: E4M3 codes times a power of two are exactly BF16, so the bytes must be exact
+        self.assertEqual(dn.bytes("blk.0.ssm_alpha.weight").tobytes(),
+                         bf16(self.decode_mx(L + "linear_attn.in_proj_a")[S.gdn_block_source()]).tobytes())
+        with multiprocessing.Pool(2) as pool:
+            got = b"".join(dn.chunks("blk.0.attn_gate.weight", pool))
+        want = self.decode_mx(L + "linear_attn.in_proj_z")[S.gdn_index(48 * S.GDN_HEAD, 0)]
+        self.assertEqual(got, S.q6_k(want.reshape(-1)))
+
+    def test_nvfp4_decodes_and_rounds_once(self):
+        import multiprocessing
+        dn = C.CheckpointDense(C.Checkpoint(self.d), q6k=True, require_complete=False)
+        with multiprocessing.Pool(2) as pool:
+            got = b"".join(dn.chunks("blk.0.ssm_out.weight", pool))
+        want = np.ascontiguousarray(self.decode_nv(self.L + "linear_attn.out_proj")[:, S.gdn_index(48 * S.GDN_HEAD, 0)])
+        self.assertEqual(got, S.q6_k(want.reshape(-1)))
+
+    def test_a_wrong_scale_shape_is_refused(self):
+        p = self.d / "model-00001-of-00001.safetensors"
+        head, base = S.read_safetensors_header(p)
+        tens = {k: (h["dtype"], h["shape"], p.read_bytes()[base + h["data_offsets"][0]:base + h["data_offsets"][1]])
+                for k, h in head.items()}
+        k = self.L + "linear_attn.in_proj_a.weight_scale"
+        dt, shape, raw = tens[k]
+        tens[k] = (dt, (24, 8), raw)
+        write_safetensors(p, tens)
+        with self.assertRaisesRegex(S.ConvertError, "weight_scale"):
+            C.CheckpointDense(C.Checkpoint(self.d), require_complete=False)
+
+
 GDN_CFG = {"text_config": {"linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_key_head_dim": 128,
                            "linear_value_head_dim": 128, "indexer_n_heads": 4, "indexer_head_dim": 128}}
 
@@ -384,3 +468,4 @@ class TokenizerKvTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -568,40 +568,58 @@ def bounded_imap(pool, fn, jobs, depth: int):
 
 class PleFp8:
     """The PLE n-gram table of a checkpoint that stores it as FP8 shards (`...ngram_embedding.shard_K.weight`) with one
-    BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values."""
+    BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values.  A release
+    that consolidates its weight files spreads the shards over several of them; they are gathered by their index."""
 
-    def __init__(self, path, chunk_rows: int = 65536):
-        self.path, self.chunk_rows = path, chunk_rows
-        head, base = read_safetensors_header(path)
-        scales = [k for k in head if k.endswith("ngram_embedding.weight_scale")]
-        if len(scales) != 1:
-            raise ConvertError(f"{path}: {len(scales)} ngram_embedding.weight_scale tensors")
-        stem = scales[0][:-len("weight_scale")]
-        sc = head[scales[0]]
-        if sc["dtype"] != "BF16" or sc["shape"] != [1]:
-            raise ConvertError(f"{path}: the PLE scale is not one BF16 value")
-        with open(path, "rb") as f:
-            f.seek(base + sc["data_offsets"][0])
-            u = np.frombuffer(f.read(2), dtype="<u2").astype(np.uint32) << 16
-        self.scale = float(u.view(np.float32)[0])
-        shards = []
-        while f"{stem}shard_{len(shards)}.weight" in head:
-            t = head[f"{stem}shard_{len(shards)}.weight"]
-            if t["dtype"] != "F8_E4M3" or len(t["shape"]) != 2 or t["shape"][1] != PLE_DIM:
-                raise ConvertError(f"{path}: shard {len(shards)} is not FP8 rows of {PLE_DIM}")
-            shards.append((base + t["data_offsets"][0], t["shape"][0]))
-        if not shards:
-            raise ConvertError(f"{path}: no PLE shards")
-        self.shards = shards
-        self.rows = sum(r for _, r in shards)
+    def __init__(self, paths, chunk_rows: int = 65536):
+        if isinstance(paths, (str, pathlib.Path)):
+            paths = [paths]
+        self.paths, self.chunk_rows = [pathlib.Path(p) for p in paths], chunk_rows
+        stem, scale, found = None, None, {}
+        for path in self.paths:
+            head, base = read_safetensors_header(path)
+            scales = [k for k in head if k.endswith("ngram_embedding.weight_scale")]
+            for k in scales:
+                if scale is not None:
+                    raise ConvertError(f"{path}: a second ngram_embedding.weight_scale")
+                sc = head[k]
+                if sc["dtype"] != "BF16" or sc["shape"] != [1]:
+                    raise ConvertError(f"{path}: the PLE scale is not one BF16 value")
+                with open(path, "rb") as f:
+                    f.seek(base + sc["data_offsets"][0])
+                    u = np.frombuffer(f.read(2), dtype="<u2").astype(np.uint32) << 16
+                scale = float(u.view(np.float32)[0])
+                stem = k[:-len("weight_scale")]
+            if stem is None:      # a file with shards but the scale in another file: its own prefix
+                heads = [k for k in head if "ngram_embedding.shard_" in k]
+                stem = heads[0][:heads[0].index("shard_")] if heads else None
+            for k, t in head.items():
+                if stem is None or not k.startswith(stem + "shard_") or not k.endswith(".weight"):
+                    continue
+                i = int(k[len(stem) + len("shard_"):-len(".weight")])
+                if i in found:
+                    raise ConvertError(f"{path}: PLE shard {i} is in two files")
+                if t["dtype"] != "F8_E4M3" or len(t["shape"]) != 2 or t["shape"][1] != PLE_DIM:
+                    raise ConvertError(f"{path}: shard {i} is not FP8 rows of {PLE_DIM}")
+                found[i] = (path, base + t["data_offsets"][0], t["shape"][0])
+        if scale is None:
+            raise ConvertError("no ngram_embedding.weight_scale in " + ", ".join(str(p) for p in self.paths))
+        if not found:
+            raise ConvertError("no PLE shards in " + ", ".join(str(p) for p in self.paths))
+        missing = sorted(set(range(max(found) + 1)) - set(found))
+        if missing:
+            raise ConvertError(f"the PLE table lacks shards {missing[:8]} of {max(found) + 1}")
+        self.scale = scale
+        self.shards = [found[i] for i in range(max(found) + 1)]
+        self.rows = sum(r for _, _, r in self.shards)
         self.row_bytes = PLE_DIM // 32 * 34
         self.nbytes = self.rows * self.row_bytes
 
     def jobs(self):
-        for off, rows in self.shards:
+        for path, off, rows in self.shards:
             for r in range(0, rows, self.chunk_rows):
                 n = min(self.chunk_rows, rows - r)
-                yield (self.path, off + r * PLE_DIM, n, self.scale)
+                yield (str(path), off + r * PLE_DIM, n, self.scale)
 
     def chunks(self, pool, depth: int = 16):
         """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
@@ -615,16 +633,33 @@ Q6K_BLOCK, Q6K_BYTES = 256, 210
 def q6_k(x: np.ndarray) -> bytes:
     """Q6_K blocks of 256 over a float32 array (length a multiple of 256): per 16-value group the least-squares
     scale from the signed-max starting grid, 8-bit group scales against one fp16 super-scale, values re-rounded
-    against the scales as stored. The layout is ggml block_q6_K."""
+    against the scales as stored. The layout is ggml block_q6_K.
+
+    Every per-group term is built by 16 explicit elementwise steps instead of a reduction over the last axis: a bulk
+    reduction can return wrong sums for these shapes, which shows up as whole 16-value groups turning to zero. The
+    elementwise form is exact and costs nothing at this width."""
     nb = x.size // Q6K_BLOCK
     x = np.ascontiguousarray(x, dtype=np.float32).reshape(nb, 16, 16)
     with np.errstate(divide="ignore", invalid="ignore"):
-        mx = np.take_along_axis(x, np.abs(x).argmax(-1)[..., None], -1)[..., 0]
+        # the signed value of the largest magnitude in each group (the first of equals, as argmax takes)
+        mx = x[:, :, 0].copy()
+        for k in range(1, 16):
+            v = x[:, :, k]
+            mx = np.where(np.abs(v) > np.abs(mx), v, mx)
         start = np.where(mx != 0, -32.0 / np.where(mx == 0, 1, mx), 0.0)
         l = np.clip(np.rint(x * start[..., None]), -32, 31)
-        den, num = (l * l).sum(-1), (x * l).sum(-1)
+        x64 = x.astype(np.float64)
+        l64 = l.astype(np.float64)
+        den = np.zeros((nb, 16))
+        num = np.zeros((nb, 16))
+        for k in range(16):
+            c, v = l64[:, :, k], x64[:, :, k]
+            den += c * c
+            num += v * c
         scale = np.where(den > 0, num / np.where(den == 0, 1, den), 0.0)
-        smax = np.take_along_axis(scale, np.abs(scale).argmax(-1)[..., None], -1)[..., 0]
+        smax = scale[:, 0].copy()
+        for g in range(1, 16):
+            smax = np.where(np.abs(scale[:, g]) > np.abs(smax), scale[:, g], smax)
         d = smax / 127.0
         d16 = d.astype(np.float16)
         sc = np.clip(np.rint(scale / np.where(d == 0, 1, d)[..., None]), -128, 127)

@@ -26,12 +26,15 @@ Inputs
 
 From an NVFP4 checkpoint (--sections-from with --checkpoint)
   --checkpoint DIR   NVIDIA Model Optimizer's NVFP4 safetensors (config.json, the model-NNNNN-of-NNNNN shards, the FP8
-                     n-gram table file, tokenizer files, generation_config.json, README.md). The routed experts keep
+                     n-gram table shards, tokenizer files, generation_config.json, README.md). The routed experts keep
                      their E2M1 codes and UE4M3 scales, moved into Basalt's blocks with the FP32 tail {s_gate, s_up,
-                     s_down, 0} from weight_scale_2; the projections are quantized once from BF16 to Q6_K (Q8_0 where
-                     rows are not whole 256-value blocks, and for the output head and token embedding); the other
-                     tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table is FP8 code x scale
-                     as Q8_0. The GGUF metadata and the tokenizer come from the checkpoint's files.
+                     s_down, 0} from weight_scale_2. A dense projection the checkpoint stores in a quantized form is
+                     decoded to its values and quantized once: MXFP8 (E4M3 codes, one E8M0 scale per 32) and FP8 (one
+                     FP32 scale) to Q6_K, NVFP4 (as NVIDIA's quantization-aware distillation exports its shared
+                     experts) likewise to Q6_K or Q8_0, and BF16 where the checkpoint has BF16. Each form goes to Q6_K
+                     where rows are whole 256-value blocks, Q8_0 elsewhere and for the output head and token embedding;
+                     the other tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table is FP8
+                     code x scale as Q8_0. The GGUF metadata and the tokenizer come from the checkpoint's files.
   --dense-q8-0       Q8_0 projections instead of Q6_K (the 8-bit dense variant)
   The drafter and vision sections come from BASE byte for byte; BASE's vocabulary must be the checkpoint's.
 
@@ -564,8 +567,8 @@ def from_checkpoint(a) -> None:
         ck = C.Checkpoint(a.checkpoint)
         experts = C.CheckpointExperts(ck)
         dense_src = C.CheckpointDense(ck, q6k)
-        ple_path = C.ple_table(ck)
-        ple = S.PleFp8(str(ple_path))
+        ple_paths = C.ple_table(ck)
+        ple = S.PleFp8([str(p) for p in ple_paths])
         kv = C.model_kv(ck, S.PLE_DIM, 18 if q6k else 7, a.name)
         dense = S.Dense(dense_src, False)
     except S.ConvertError as e:
@@ -632,7 +635,7 @@ def from_checkpoint(a) -> None:
                         "bytes": t.expected_bytes(), "offset": tensor_offsets[n]} for n, t in dense_src.tensors.items()}
             tens["per_layer_token_embd.weight"] = {"type": "Q8_0", "type_id": 8, "shape": [S.PLE_DIM, ple.rows],
                                                   "bytes": ple.nbytes, "offset": tensor_offsets["per_layer_token_embd.weight"]}
-            ck_files = sorted(set(ck.shards) | {ple_path})
+            ck_files = sorted(set(ck.shards) | set(ple_paths))
             meta = {
                 "format": "basalt", "version": 2, "name": a.name or base_meta.get("name"),
                 "converter": {"tool": "tools/convert/convert.py"},
@@ -651,14 +654,17 @@ def from_checkpoint(a) -> None:
             if tuned_sha:
                 meta["mtp"] = {**meta["mtp"], "dense": {"tuning": "self_distilled", "sha256": tuned_sha}}
             used = sorted({t.how for t in dense_src.tensors.values()})
+            srcs = list(dense_src.sources.values())
             meta["checkpoint"] = {
                 "dir": Path(a.checkpoint).name, "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
                 "experts": {"format": "nvfp4", "source": "weight (E2M1 pairs), weight_scale (UE4M3 per 16), "
-                            "weight_scale_2 (FP32); input_scale unused", "repack": "codes and scales unchanged, "
-                            "nibbles moved into 64-value blocks", "tail": "fp32 {s_gate, s_up, s_down, 0} per expert"},
+                            "weight_scale_2 (FP32); input_scale unused",
+                            "repack": "codes and scales unchanged, nibbles moved into 64-value blocks",
+                            "tail": "fp32 {s_gate, s_up, s_down, 0} per expert"},
                 "dense": {"projections": "Q6_K where rows are whole 256-value blocks, else Q8_0" if q6k else "Q8_0",
                           "q6_k_method": "least-squares 16-value group scales, 8-bit group scales, fp16 super-scale",
-                          "q8_0_method": "ggml reference rounding", "from": "BF16, quantized once",
+                          "q8_0_method": "ggml reference rounding",
+                          "from": {f: srcs.count(f) for f in sorted(set(srcs))},
                           "transforms": {k: C.METHODS[k] for k in used}},
                 "sections_from": {"path": src.name, "size": src.stat().st_size,
                                   "fingerprint_sha256_first_last_64mib_and_size": fingerprint(src),
