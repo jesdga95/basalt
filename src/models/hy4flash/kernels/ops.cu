@@ -98,6 +98,14 @@ __global__ void router_select_kernel(const float* __restrict__ logits, const flo
     }
 }
 
+__global__ void wsum_kernel(RowPtrs rows, const float* __restrict__ w, int k, int n, float* __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float acc = 0.f;
+    for (int e = 0; e < k; ++e) acc += w[e] * rows.p[e][i];
+    out[i] = acc;
+}
+
 __global__ void fill_kernel(const float* __restrict__ e, int n, float* __restrict__ x) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -170,6 +178,11 @@ __global__ void add_kernel(const float* __restrict__ a, const float* __restrict_
 
 void add_vectors(const float* a, const float* b, float* out, int n, void* stream) {
     add_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(a, b, out, n);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void weighted_sum_rows(const RowPtrs& rows, const float* w, int n_rows, int n, float* out, void* stream) {
+    wsum_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(rows, w, n_rows, n, out);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

@@ -11,12 +11,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <thread>
 
 namespace basalt::models::hy4flash {
 namespace {
 constexpr uint64_t kGiB = 1ull << 30;
 constexpr int kTypeQ8_0 = 8;
+// CPU uses of a missed expert that earn it a slot on the card
+constexpr int kAdmitUses = 2;
 }  // namespace
 
 Hy4Model::Hy4Model() = default;
@@ -40,13 +41,43 @@ bool Hy4Model::embedding_row(int32_t token, float* out) const {
     return true;
 }
 
-ExpertBlob Hy4Model::expert(int layer, int e) const {
-    const ExpertLayer& L = pack_.experts[(size_t) layer];
-    return {ram_[(size_t) ram_index_[(size_t) layer]].data() + (uint64_t) e * L.blob_bytes, L.gu_type, L.d_type};
+core::ExpertTierSpec Hy4Model::tier_spec() const {
+    const Geometry& g = pack_.geo;
+    core::ExpertTierSpec s;
+    s.area = "basalt hy4flash";
+    s.name = "hy4flash";
+    s.n_layers = g.n_layers - g.n_dense;
+    s.n_expert = g.n_expert;
+    s.top_k = g.n_used;
+    s.n_embd = g.n_latent;   // the experts run over the latent that routed_down makes
+    s.n_ff = g.n_ff_exp;
+    for (int l = g.n_dense; l < g.n_layers; ++l) {
+        const ExpertLayer& e = pack_.experts[(size_t) l];
+        s.layers.push_back({e.gu_type, e.d_type, e.offset, e.blob_bytes, g.clamp_exp[(size_t) l]});
+        s.share_stride = std::max<uint64_t>(s.share_stride, e.blob_bytes);
+    }
+    s.path = path_;
+    s.fd = fd_;
+    s.range = pack_.experts_range;
+    s.peer_devices = peer_devices_;
+    s.diag_tier_ram = flags_.diag_tier_ram;
+    s.diag_tier_vram = flags_.diag_tier_vram;
+    s.diag_tier_frozen = flags_.diag_tier_frozen;
+    s.vram_reserve_mib = flags_.vram_reserve_mib;
+    s.peer_reserve_mib = flags_.peer_reserve_mib;
+    s.expert_cache = flags_.expert_cache;
+    s.resident_budget = flags_.resident_budget;
+    s.pool_workers = flags_.pool_workers;
+    s.pool_affinity = flags_.pool_affinity;
+    s.pool_affinity_given = flags_.pool_affinity_given;
+    s.expert_profile = flags_.expert_profile;
+    s.admit_uses = kAdmitUses;
+    s.share_max_tokens = 16384;
+    return s;
 }
 
 model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& reads,
-                             std::vector<std::unique_ptr<model::ModelSession>>&) {
+                             std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
     if (req.paths.empty()) return {model::Status::Error, "hy4flash: no model path"};
     std::string err;
     const std::string& path = req.paths.front();
@@ -109,47 +140,37 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     }
     basalt::log::info("basalt hy4flash", "%zu dense tensors, %.2f GiB on the GPU", dev_.size(), (double) dense / (double) kGiB);
 
-    // every routed expert in RAM, one allocation per layer
-    const core::ModelFile::Section* xs = pack_.file.find("experts");
-    if (!xs) return {model::Status::Error, "hy4flash: the pack has no experts section"};
-    ram_.resize(pack_.experts.size());
-    ram_index_.assign(pack_.experts.size(), -1);
-    uint64_t total = 0;
-    for (size_t l = 0; l < pack_.experts.size(); ++l) {
-        const ExpertLayer& L = pack_.experts[l];
-        if (!L.present) continue;
-        const uint64_t bytes = L.blob_bytes * (uint64_t) g.n_expert;
-        if (!ram_[l].allocate(bytes, false)) return {model::Status::Error, "hy4flash: no RAM for the experts of layer " + std::to_string(l)};
-        ram_index_[l] = (int) l;
-        core::LoadItem it;
-        it.file = file;
-        it.off = xs->offset + L.offset;
-        it.bytes = bytes;
-        it.host = ram_[l].data();
-        reads.add(it);
-        total += bytes;
-    }
-    basalt::log::info("basalt hy4flash", "RAM tier: all %d experts of %d layers (%.1f GiB), run by the CPU", g.n_expert,
-                      g.n_layers - g.n_dense, (double) total / (double) kGiB);
-
     if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
         if (!engram_->open(path, e.file_offset, e.rows, 64, 1 << 16, err, e.row_bytes))
             return {model::Status::Error, "hy4flash: " + err};
     }
-    const int threads = req.pool_workers > 0 ? req.pool_workers : (int) std::max(2u, std::thread::hardware_concurrency() / 2);
-    workers_ = std::make_unique<Workers>(threads);
-    return {};
+    // the sessions first, then the expert tier, sized from what they leave and opened by the first session; its reads are
+    // queued in the start's plan
+    flags_ = req;
+    path_ = path;
+    std::vector<int> peers = req.peer_devices;
+    if (peers.size() > (size_t) kMaxSecondCards) {
+        basalt::log::warn("basalt hy4flash", "%zu second cards given, %d hold experts; later cards idle", peers.size(), kMaxSecondCards);
+        peers.resize((size_t) kMaxSecondCards);
+    }
+    peer_devices_ = std::move(peers);
+    planning_ = &reads;
+    model::Result r;
+    for (int i = 0; r.ok() && i < std::max(req.sessions, 1); ++i) {
+        std::unique_ptr<model::ModelSession> s = make_session(*this, err);
+        if (!s) r = {model::Status::Error, "hy4flash: " + err};
+        else sessions.push_back(std::move(s));
+    }
+    if (r.ok()) r = sessions.front()->prepare();
+    planning_ = nullptr;
+    return r;
 }
 
-model::Result Hy4Model::attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
+model::Result Hy4Model::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>&) {
     std::string err;
-    for (int i = 0; i < std::max(req.sessions, 1); ++i) {
-        std::unique_ptr<model::ModelSession> s = make_session(*this, err);
-        if (!s) return {model::Status::Error, "hy4flash: " + err};
-        sessions.push_back(std::move(s));
-    }
+    if (shared_tier_.tier && !shared_tier_.tier->attach(err)) return {model::Status::Error, "hy4flash: " + err};
     return {};
 }
 

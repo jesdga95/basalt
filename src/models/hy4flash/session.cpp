@@ -5,7 +5,9 @@
 // the shared latent (a window ring on the window layers, the indexer's selection on the others), the gate, the output
 // projection and its post-norm, the stream expansion, and the same for the FFN: the dense MLP, or the latent MoE (router,
 // the routed experts on the CPU beside the shared expert on the card, the up projection).
+#include "basalt/core/expert_tier.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/mhc.hpp"
@@ -21,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -30,6 +33,17 @@ namespace {
 namespace bk = basalt::kernels;
 
 constexpr int kRowWidth = 576;   // a cache row: 512 latent values and 64 rotated
+constexpr uint64_t kModuleRoom = 7ull << 27;   // kernel modules still to load when the tier opens
+constexpr uint64_t kPromptRoom = 5ull << 29;   // the prompt path's workspaces beside the homes
+
+// One layer's GPU plan for the grouped expert kernel, uploaded with a single copy.
+struct ExpertPlan {
+    unsigned long long ptr[16];
+    int32_t start[17];
+    int32_t ng[3];
+    int32_t dst[16];
+    int32_t tok[16];
+};
 
 class Session final : public model::ModelSession {
 public:
@@ -76,9 +90,14 @@ public:
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(1, (int) g_.n_vocab) + bk::kLogprobStride + 16);
         const size_t q8 = std::max<size_t>(bk::native_q8_1_bytes(16384, 1), 1 << 16);
         q8a_ = alloc(q8, ok); q8b_ = alloc(q8, ok); q8c_ = alloc(q8, ok);
-        h_xlat_ = pin(g_.n_latent); h_out_ = pin(g_.n_latent); h_rw_ = pin(16); h_ids_ = (int32_t*) pin(16);
+        h_rw_ = pin(16); h_ids_ = (int32_t*) pin(16);
         h_erows_ = pin(g_.n_embd); h_e_ = pin(E);
-        h_ee_.resize(16 * 96);
+        ex_xq_ = alloc(bk::native_q8_1_bytes(g_.n_latent, 1), ok);
+        ex_scr_ = alloc(bk::native_expert_scratch_bytes(16, g_.n_ff_exp), ok);
+        ex_rows_ = f((int64_t) 16 * g_.n_latent);
+        ex_plan_ = alloc(sizeof(ExpertPlan), ok);
+        if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
+        else pinned_.push_back(h_plan_);
         cache_.assign((size_t) g_.n_layers, nullptr);
         ival_.assign((size_t) g_.n_layers, nullptr);
         igate_.assign((size_t) g_.n_layers, nullptr);
@@ -132,6 +151,19 @@ public:
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "hy4flash: the prompt failed"};
         return {};
     }
+
+    model::Result prepare() override {
+        std::string e;
+        if (!ensure_tier(e)) return {model::Status::Error, "hy4flash: " + e};
+        return {};
+    }
+
+    ExpertCounts expert_counts() const override {
+        const core::ExpertTier* t = tier_.get();
+        return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
+    }
+
+    std::string info_words() const override { return tier_ ? "expert_slots=" + std::to_string(tier_->slots()) : std::string(); }
 
     model::Result copy_logits(int row, float* out) override {
         if (row != last_row_) return {model::Status::Error, "hy4flash: the session keeps the last row's logits only"};
@@ -303,36 +335,145 @@ private:
             mm(T(l, "ffn_down.weight"), q8b_, mlp_, g_.n_ff, E);
             return true;
         }
-        const int K = g_.n_used, L = g_.n_latent;
-        router_sigmoid(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), g_.n_expert, E, K, g_.expert_scale, rlog_, ids_, rw_, stream_);
+        return moe(l, err);
+    }
+
+    // The expert tier, opened by the first session while the model starts and shared by the rest: the sessions run one at a
+    // time over the same pinned rows.
+    bool ensure_tier(std::string& err) {
+        if (tier_) return true;
+        Hy4Model::SharedTier& shared = m_.shared_tier();
+        constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
+        if (!shared.tier) {
+            if (cudaHostAlloc((void**) &shared.h_x, (size_t) g_.n_latent * 4, kMapped) != cudaSuccess ||
+                cudaHostAlloc((void**) &shared.h_rows, (size_t) 16 * g_.n_latent * 4, kMapped) != cudaSuccess) {
+                err = "cannot allocate the pinned expert staging";
+                return false;
+            }
+            auto t = std::make_shared<core::ExpertTier>(m_.tier_spec());
+            core::ExpertTier::Reserve r;
+            r.copies = kModuleRoom;
+            r.homes = kPromptRoom + kModuleRoom;
+            r.beside_homes = 1ull << 30;
+            r.modules = kModuleRoom;
+            core::LoadPlan* reads = m_.planning();
+            if (reads == nullptr) {
+                err = "the expert tier opens only while the model starts";
+                return false;
+            }
+            if (!t->open(r, shared.h_rows, *reads, err)) return false;
+            shared.tier = std::move(t);
+        }
+        tier_ = shared.tier;
+        h_x_ = shared.h_x;
+        h_rows_ = shared.h_rows;
+        if (cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess) {
+            err = "cannot map the expert rows";
+            return false;
+        }
+        return true;
+    }
+
+    // The latent MoE of a layer over its normed input: the router, routed_down, the experts the tier places (the
+    // card's slots and the second cards' on the GPUs, the rest on the CPU) beside the shared expert, routed_up.
+    bool moe(int l, std::string& err) {
+        const int E = g_.n_embd, K = g_.n_used, L = g_.n_latent;
+        const int tl = l - g_.n_dense;   // the tier's layer
+        const ExpertLayer& el = m_.pack().experts[(size_t) l];
+        kernels::NativeExpertLayout lay = kernels::native_expert_layout(el.gu_type, el.d_type, L, g_.n_ff_exp);
+        if (lay.bytes != el.blob_bytes) {
+            err = "layer " + std::to_string(l) + "'s expert blob size does not match the layout";
+            return false;
+        }
+        cudaStream_t st = stream_;
+        router_sigmoid(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), g_.n_expert, E, K, g_.expert_scale, rlog_, ids_, rw_, st);
         mm(T(l, "ffn_routed_down.weight"), q8a_, xlat_, E, L);
-        cudaMemcpyAsync(h_xlat_, xlat_, (size_t) L * 4, cudaMemcpyDeviceToHost, stream_);
-        cudaMemcpyAsync(h_ids_, ids_, (size_t) K * 4, cudaMemcpyDeviceToHost, stream_);
-        cudaMemcpyAsync(h_rw_, rw_, (size_t) K * 4, cudaMemcpyDeviceToHost, stream_);
-        cudaEventRecord(ev_, stream_);
-        // the shared expert on the card while the CPU runs the routed ones
+        bk::native_quantize_q8_1(xlat_, ex_xq_, L, 1, st);
+        cudaMemcpyAsync(h_x_, xlat_, (size_t) L * 4, cudaMemcpyDeviceToHost, st);
+        cudaMemcpyAsync(h_ids_, ids_, (size_t) K * 4, cudaMemcpyDeviceToHost, st);
+        cudaMemcpyAsync(h_rw_, rw_, (size_t) K * 4, cudaMemcpyDeviceToHost, st);
+        cudaEventRecord(ev_, st);
+        // the shared expert on the card while the experts run elsewhere
         mm(T(l, "ffn_gate_shexp.weight"), q8a_, gu_, E, g_.n_ff_exp);
         mm(T(l, "ffn_up_shexp.weight"), q8a_, gu_ + g_.n_ff_exp, E, g_.n_ff_exp);
-        bk::swiglu_scaled(gu_, gu_ + g_.n_ff_exp, nullptr, nullptr, h_, 1, g_.n_ff_exp, 0, stream_);
+        bk::swiglu_scaled(gu_, gu_ + g_.n_ff_exp, nullptr, nullptr, h_, 1, g_.n_ff_exp, 0, st);
         quant(h_, q8b_, g_.n_ff_exp);
         mm(T(l, "ffn_down_shexp.weight"), q8b_, sh_, g_.n_ff_exp, E);
+        core::PeerExperts* peer = tier_->peer_for(tl);
+        if (peer) {
+            kernels::NativeExpertLayout limited = lay;
+            limited.swiglu_limit = g_.clamp_exp[(size_t) l];
+            if (!peer->arm(limited, h_x_, 1, K, core::policy::peer_groups(1), err)) return false;
+        }
+        tier_->pump(tl, 3);
         if (cudaEventSynchronize(ev_) != cudaSuccess) {
             err = "the router's ids did not arrive";
             return false;
         }
-        ExpertBlob blobs[16];
-        for (int i = 0; i < K; ++i) {
+        for (int i = 0; i < K; ++i)
             if (h_ids_[i] < 0 || h_ids_[i] >= g_.n_expert) {
                 err = "the router picked expert " + std::to_string(h_ids_[i]);
                 return false;
             }
-            blobs[i] = m_.expert(l, h_ids_[i]);
+        core::ExpertTier::Lookup lk;
+        if (!tier_->lookup(tl, h_ids_, K, lk, err)) return false;
+        const int n_fetched = tier_->fetch(tl, lk);
+        if (peer) {
+            int32_t kind[core::ExpertTier::kMaxK] = {};
+            for (int k = 0; k < K; ++k) kind[k] = !lk.peer[k] ? 0 : lk.fetched[k] ? 3 : 2;
+            if (!peer->raise(tl, lk.experts, kind, err)) return false;
         }
-        cpu_experts(m_.workers(), blobs, h_rw_, K, L, g_.clamp_exp[(size_t) l], h_xlat_, h_out_);
-        cudaMemcpyAsync(lat_out_, h_out_, (size_t) L * 4, cudaMemcpyHostToDevice, stream_);
+        bool cpu = false, reading = false;
+        for (int k = 0; k < K; ++k) {
+            cpu = cpu || (!lk.dev[k] && !lk.peer[k] && !lk.reading[k]);
+            reading = reading || lk.reading[k];
+        }
+        if (cpu) tier_->start_cpu(tl, h_x_, lk, h_rows_);
+        // the card's share: the experts its slots hold, one group each, writing the row of their router index; the fetched
+        // ones in a second plan, once their copies landed
+        const auto launch = [&](bool fetched, int count) {
+            ExpertPlan* p = h_plan_;
+            int m = 0;
+            for (int k = 0; k < K; ++k) {
+                if (!lk.dev[k] || lk.fetched[k] != fetched) continue;
+                p->ptr[m] = (unsigned long long) lk.dev[k];
+                p->start[m] = m;
+                p->dst[m] = k;
+                p->tok[m] = 0;
+                ++m;
+            }
+            p->start[m] = m;
+            p->ng[0] = m;
+            cudaMemcpyAsync(ex_plan_, p, sizeof(ExpertPlan), cudaMemcpyHostToDevice, st);
+            ExpertPlan* dp = (ExpertPlan*) ex_plan_;
+            kernels::native_expert_grouped_clamped(lay, g_.clamp_exp[(size_t) l], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, m, m,
+                                                   ex_xq_, ex_scr_, ex_rows_, st);
+            cudaStreamSynchronize(st);   // the plan buffer is reused by the next launch
+            (void) count;
+        };
+        int nhits = 0;
+        for (int k = 0; k < K; ++k) nhits += lk.dev[k] && !lk.fetched[k];
+        if (nhits) launch(false, nhits);
+        if (n_fetched) {
+            tier_->await_fetch(st);
+            launch(true, n_fetched);
+        }
+        if (peer && !peer->run_fetched(err)) return false;
+        if (cpu) tier_->finish_cpu();
+        if (reading) {
+            if (!tier_->await_reads(err)) return false;
+            tier_->start_cpu(tl, h_x_, lk, h_rows_, /*reading=*/true);
+            tier_->finish_cpu();
+        }
+        if (peer && !peer->finish(nullptr, err)) return false;
+        RowPtrs rp{};
+        for (int k = 0; k < K; ++k) rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * L : d_rows_ + (size_t) k * L;
+        weighted_sum_rows(rp, rw_, K, L, lat_out_, st);
+        if (cpu || reading) tier_->promote(tl, lk);
+        tier_->mark_gap(st);
         quant(lat_out_, q8c_, L);
         mm(T(l, "ffn_routed_up.weight"), q8c_, moe_out_, L, E);
-        add_vectors(moe_out_, sh_, mlp_, E, stream_);
+        add_vectors(moe_out_, sh_, mlp_, E, st);
         return true;
     }
 
@@ -350,6 +491,7 @@ private:
             return false;
         }
         hist_.resize((size_t) pos);   // a position before the end drops the rows after it
+        if (tier_) tier_->begin_token(1);
         hist_.push_back(token);
         if (lookup_loaded_.empty()) lookup_loaded_.assign(m_.pack().engram.layers.size(), false);
         const int E = g_.n_embd;
@@ -394,6 +536,7 @@ private:
             }
             last_row_ = 0;
         }
+        if (tier_) tier_->pump(-1, core::ExpertTier::kAllPieces);
         const cudaError_t ce = cudaGetLastError();
         if (ce != cudaSuccess) {
             err = std::string("CUDA: ") + cudaGetErrorString(ce);
@@ -446,9 +589,13 @@ private:
     float *xlat_ = nullptr, *lat_out_ = nullptr, *moe_out_ = nullptr, *sh_ = nullptr, *logits_ = nullptr, *lp_ = nullptr, *erows_ = nullptr, *ekv_ = nullptr;
     int32_t* pick_ = nullptr;
     void *q8a_ = nullptr, *q8b_ = nullptr, *q8c_ = nullptr;
-    float *h_xlat_ = nullptr, *h_out_ = nullptr, *h_rw_ = nullptr, *h_erows_ = nullptr, *h_e_ = nullptr;
+    float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_rw_ = nullptr, *h_erows_ = nullptr, *h_e_ = nullptr;
     int32_t* h_ids_ = nullptr;
-    std::vector<float> h_ee_, lookup_host_;
+    void *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr;
+    float* ex_rows_ = nullptr;
+    ExpertPlan* h_plan_ = nullptr;
+    std::shared_ptr<core::ExpertTier> tier_;
+    std::vector<float> lookup_host_;
     std::vector<bool> lookup_loaded_;
     std::vector<float*> cache_, ival_, igate_, ipool_;
     std::vector<int32_t> hist_;
