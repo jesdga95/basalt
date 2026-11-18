@@ -2,10 +2,9 @@
 // host memory, every routed expert in a RAM tier run by the CPU, and the Engram table read from the file by row.
 #pragma once
 
-#include "basalt/core/ram_load.hpp"
+#include "basalt/core/expert_tier.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/ngram/ple_reader.hpp"
-#include "models/hy4flash/cpu_experts.hpp"
 #include "models/hy4flash/pack.hpp"
 
 #include <map>
@@ -22,8 +21,8 @@ struct DevTensor {
     std::vector<uint64_t> shape;
 };
 
-/// The longest context this build keeps (fp32 latent rows).
-constexpr int64_t kMaxContext = 131072;
+/// The second cards whose expert tiers a start uses; later cards idle.
+constexpr int kMaxSecondCards = 3;
 constexpr int64_t kDefaultContext = 8192;
 
 class Hy4Model final : public model::LoadedModel {
@@ -43,10 +42,22 @@ public:
     const DevTensor* tensor(int layer, const char* suffix) const { return tensor("blk." + std::to_string(layer) + "." + suffix); }
     /// One token-embedding row, dequantised into `out` (n_embd floats).
     bool embedding_row(int32_t token, float* out) const;
-    /// The blob of routed expert `e` of `layer`.
-    ExpertBlob expert(int layer, int e) const;
     ngram::PleReader& engram_reader() const { return *engram_; }
-    Workers& workers() const { return *workers_; }
+    /// The tier's descriptor: the MoE layers only (the tier's layer 0 is the first of them), over the 1536-wide latent.
+    core::ExpertTierSpec tier_spec() const;
+    /// The start's reads while it plans (null after): what the first session's tier queues into.
+    core::LoadPlan* planning() const { return planning_; }
+    /// The expert tier and the pinned rows it shares with a second card: one per model, whatever the sessions.
+    struct SharedTier {
+        std::shared_ptr<core::ExpertTier> tier;
+        float* h_x = nullptr;
+        float* h_rows = nullptr;
+    };
+    SharedTier& shared_tier() const { return shared_tier_; }
+    const std::vector<int>& peer_devices() const { return peer_devices_; }
+    const model::LoadRequest& flags() const { return flags_; }
+    const std::string& path() const { return path_; }
+    int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     int device() const { return device_; }
     const std::string& diag_dump() const { return diag_dump_; }
 
@@ -54,12 +65,14 @@ private:
     Pack pack_;
     model::ModelDesc desc_;
     std::map<std::string, DevTensor> dev_;
-    std::vector<core::RamAllocation> ram_;      ///< per layer with experts
-    std::vector<int> ram_index_;                ///< layer -> index in ram_, or -1
+    core::LoadPlan* planning_ = nullptr;
+    mutable SharedTier shared_tier_;
+    std::vector<int> peer_devices_;
+    model::LoadRequest flags_;
+    std::string path_;
     std::vector<uint8_t> embd_;
     std::string diag_dump_;
     std::unique_ptr<ngram::PleReader> engram_;
-    std::unique_ptr<Workers> workers_;
     int device_ = 0, fd_ = -1;
     int64_t ctx_ = kDefaultContext;
 };

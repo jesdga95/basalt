@@ -41,7 +41,7 @@ public:
     }
 
     PreTokenizer pretokenizer() const override { return {"hy_v4", pretok_hy4}; }
-    int max_expert_cards() const override { return 0; }
+    int max_expert_cards() const override { return kMaxSecondCards; }
     const char* model_name() const override { return "Hy4-flash"; }
 
     // the end-of-turn token is read from the pack's vocabulary (<hy_end> is 120025)

@@ -201,9 +201,9 @@ add_library(hy4flash_kernels STATIC src/models/hy4flash/kernels/mla.cu src/model
 target_include_directories(hy4flash_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(hy4flash_kernels PUBLIC ${_gpu_runtime_target})
 add_library(model_hy4flash STATIC src/models/hy4flash/adapter.cpp src/models/hy4flash/pretok_hy4.cpp src/models/hy4flash/pack.cpp
-  src/models/hy4flash/model.cpp src/models/hy4flash/session.cpp src/models/hy4flash/cpu_experts.cpp)
+  src/models/hy4flash/model.cpp src/models/hy4flash/session.cpp)
 target_include_directories(model_hy4flash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(model_hy4flash PUBLIC model tokenizer hy4flash_kernels kernels core ${_gpu_runtime_target})
+target_link_libraries(model_hy4flash PUBLIC model tokenizer hy4flash_kernels tiers mmq peer_share kernels core ${_gpu_runtime_target})
 # the DFly2 drafter (src/models/hy4flash/dfly*)
 add_library(hy4flash_dfly_kernels STATIC src/models/hy4flash/dfly_kernels.cu)
 target_include_directories(hy4flash_dfly_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -225,10 +225,9 @@ if(BUILD_TESTING)
   target_include_directories(hy4flash_kernels_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(hy4flash_kernels_parity PRIVATE hy4flash_kernels kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME hy4flash_kernels_parity COMMAND hy4flash_kernels_parity)
-  add_executable(hy4flash_cpu_experts_test src/models/hy4flash/cpu_experts_test.cpp src/models/hy4flash/cpu_experts.cpp)
-  target_include_directories(hy4flash_cpu_experts_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(hy4flash_cpu_experts_test PRIVATE kernels_cpu ggml_quants Threads::Threads)
-  basalt_cpu_test(NAME hy4flash_cpu_experts_test COMMAND hy4flash_cpu_experts_test)
+  add_executable(hy4flash_context_policy_test src/models/hy4flash/context_policy_test.cpp)
+  target_include_directories(hy4flash_context_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  basalt_cpu_test(NAME hy4flash_context_policy_test COMMAND hy4flash_context_policy_test)
   add_executable(hy4flash_vision_test src/models/hy4flash/vision_test.cpp)
   target_include_directories(hy4flash_vision_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(hy4flash_vision_test PRIVATE vision_core)
@@ -482,6 +481,8 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/nvfp4_planes.cu
                         src/kernels/cuda/mhc.cu
                         src/kernels/cuda/mhc_plain.cu
+                        src/kernels/cuda/router.cu
+                        src/kernels/cuda/row_norm.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 if(BASALT_MODEL_QWEN4EXP)
