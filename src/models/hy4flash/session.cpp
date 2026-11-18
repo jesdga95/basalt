@@ -83,7 +83,7 @@ static_assert(sizeof(WindowPut) <= 4 * kPutWords, "a window's plan fits put_word
 // The buffers that scale with the rows of a call: a decode window's, or a prompt chunk's (opened while a prompt runs, with the tier's
 // slots lent to them).
 struct Bufs {
-    int rows = 0, arows = 0;   // the chunk's rows, and the rows of an attention step
+    int rows = 0, arows = 0, steps = 0;   // the chunk's rows, the rows of an attention step, and the steps of a chunk
     std::vector<void*> dev, host;
     float *X = nullptr, *Xn = nullptr, *coef = nullptr, *hcws = nullptr, *e = nullptr, *cur = nullptr, *xn = nullptr, *attn = nullptr,
           *attn_raw = nullptr, *mlp = nullptr, *mlp2 = nullptr, *qa = nullptr, *qan = nullptr, *q = nullptr, *kvraw = nullptr,
@@ -267,7 +267,9 @@ public:
         b.igt = f((int64_t) A * g_.idx_dim); b.iq = f((int64_t) A * g_.idx_heads * g_.idx_dim); b.iw = f((int64_t) A * g_.idx_heads);
         b.icells = (int32_t*) f((int64_t) A * cells_stride_);
         b.meta_d = (int32_t*) f(3 * (int64_t) A);
-        b.meta_h = (int32_t*) pin((int64_t) g_.n_layers * 3 * A);
+        // a layer's steps each have their own: the copy of step 0's spans is still queued when the host writes step 1's
+        b.steps = (R + A - 1) / A;
+        b.meta_h = (int32_t*) pin((int64_t) g_.n_layers * b.steps * 3 * A);
         // gate/up products of the dense layer (A rows of n_ff), of the shared expert (R rows of the expert width) and of a prompt
         // launch (kLaunchRows rows of twice the expert width); the SwiGLU outputs likewise
         const int64_t gu_n = std::max<int64_t>({2 * (int64_t) A * g_.n_ff, 2 * (int64_t) R * g_.n_ff_exp, 2 * (int64_t) kLaunchRows * g_.n_ff_exp});
@@ -305,6 +307,7 @@ public:
     void use(const Bufs& b) {
         rows_ = b.rows;
         arows_ = b.arows;
+        steps_ = b.steps;
         X_ = b.X; Xn_ = b.Xn; coef_ = b.coef; hcws_ = b.hcws; e_ = b.e; cur_ = b.cur; xn_ = b.xn; attn_ = b.attn; attn_raw_ = b.attn_raw;
         mlp_ = b.mlp; mlp2_ = b.mlp2; qa_ = b.qa; qan_ = b.qan; q_ = b.q; kvraw_ = b.kvraw; qabs_ = b.qabs; qcur_ = b.qcur;
         olat_ = b.olat; vout_ = b.vout; gate_ = b.gate; ik_ = b.ik; ikn_ = b.ikn; ivt_ = b.ivt; igt_ = b.igt; iq_ = b.iq; iw_ = b.iw;
@@ -729,14 +732,14 @@ private:
         for (int off = 0; ok && off < R; off += arows_) {
             xn_ = xn0 + (size_t) off * E;
             attn_ = at0 + (size_t) off * E;
-            ok = attention_step(l, pos0 + off, std::min(arows_, R - off), err);
+            ok = attention_step(l, pos0 + off, std::min(arows_, R - off), off / arows_, err);
         }
         xn_ = xn0;
         attn_ = at0;
         return ok;
     }
 
-    bool attention_step(int l, int64_t pos0, int R, std::string& err) {
+    bool attention_step(int l, int64_t pos0, int R, int step, std::string& err) {
         const int H = g_.heads[(size_t) l];
         const bool swa = g_.swa[(size_t) l];
         const int E = g_.n_embd, rank = g_.kv_lora;
@@ -775,7 +778,7 @@ private:
             put("q_pe-" + std::to_string(l), qp);
         }
         // the cells each row attends
-        int32_t* meta = meta_h_ + (size_t) l * 3 * arows_;   // firsts, counts, fill
+        int32_t* meta = meta_h_ + ((size_t) l * steps_ + step) * 3 * arows_;   // firsts, counts, fill
         int32_t *firsts = meta, *counts = meta + arows_, *fill = meta + 2 * arows_;
         bool selecting = false;
         std::vector<int> pools_of(R, 0);
@@ -1752,7 +1755,7 @@ private:
     float *qa_ = nullptr, *qan_ = nullptr, *q_ = nullptr, *kvraw_ = nullptr, *qabs_ = nullptr, *qcur_ = nullptr, *olat_ = nullptr, *vout_ = nullptr, *gate_ = nullptr;
     float *ik_ = nullptr, *ikn_ = nullptr, *ivt_ = nullptr, *igt_ = nullptr, *iq_ = nullptr, *iw_ = nullptr, *iscore_ = nullptr;
     int32_t *iidx_meta_ = nullptr, *icells_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
-    int cells_stride_ = 0, rows_ = 0, arows_ = 0, max_heads_ = 0;
+    int cells_stride_ = 0, rows_ = 0, arows_ = 0, steps_ = 0, max_heads_ = 0;
     Bufs dec_, big_;   // a window's row buffers, and a prompt chunk's while one runs
     float *gu_ = nullptr, *h_ = nullptr, *rlog_ = nullptr, *rw_ = nullptr;
     int32_t* ids_ = nullptr;
