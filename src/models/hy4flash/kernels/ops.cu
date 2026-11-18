@@ -37,7 +37,7 @@ __global__ void mul_sigmoid_kernel(const float* __restrict__ g, float* __restric
 
 // A warp per expert.
 __global__ void router_logits_kernel(const float* __restrict__ x, const float* __restrict__ gate, int n_expert, int n_embd,
-                                     float* __restrict__ logits) {
+                                     float scale, float* __restrict__ logits) {
     const int e = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (e >= n_expert) return;
     const float4* w = reinterpret_cast<const float4*>(gate + (size_t) e * n_embd);
@@ -48,7 +48,7 @@ __global__ void router_logits_kernel(const float* __restrict__ x, const float* _
         acc = fmaf(a.x, b.x, acc); acc = fmaf(a.y, b.y, acc); acc = fmaf(a.z, b.z, acc); acc = fmaf(a.w, b.w, acc);
     }
     acc = warp_sum(acc);
-    if (lane == 0) logits[e] = acc;
+    if (lane == 0) logits[e] = acc * scale;
 }
 
 constexpr int kRouterThreads = 512;
@@ -152,8 +152,24 @@ void router_sigmoid(const float* x, const float* gate, const float* bias, int n_
                     float* logits, int32_t* ids, float* weights, void* stream) {
     if (n_expert > 512 || k > 16 || n_embd % 4) throw std::invalid_argument("router_sigmoid: geometry");
     cudaStream_t st = (cudaStream_t) stream;
-    router_logits_kernel<<<(n_expert + 7) / 8, 256, 0, st>>>(x, gate, n_expert, n_embd, logits);
+    router_logits_kernel<<<(n_expert + 7) / 8, 256, 0, st>>>(x, gate, n_expert, n_embd, 1.0f, logits);
     router_select_kernel<<<1, kRouterThreads, 0, st>>>(logits, bias, n_expert, k, scale, ids, weights);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void f32_gemv(const float* x, const float* w, int rows, int cols, float scale, float* y, void* stream) {
+    if (cols % 4) throw std::invalid_argument("f32_gemv: cols");
+    router_logits_kernel<<<(rows + 7) / 8, 256, 0, (cudaStream_t) stream>>>(x, w, rows, cols, scale, y);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+__global__ void add_kernel(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i];
+}
+
+void add_vectors(const float* a, const float* b, float* out, int n, void* stream) {
+    add_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(a, b, out, n);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

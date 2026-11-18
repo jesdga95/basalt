@@ -112,13 +112,14 @@ __global__ void prepare_kernel(const float* __restrict__ q, const float* __restr
 
 // A block per head: the scores (a warp per cell), the softmax with the sink, the weighted sum of the latents.
 __global__ void attend_kernel(const float* __restrict__ qcur, const float* __restrict__ cache, int first, int n,
-                              const float* __restrict__ sinks, MlaArgs a, float* __restrict__ o_lat) {
+                              const float* __restrict__ sinks, MlaArgs a, float* __restrict__ o_lat,
+                              const int32_t* __restrict__ cells, int ring) {
     __shared__ float s[kMaxCells];
     __shared__ float red[kThreads / 32];
     const int h = blockIdx.x, W = a.rank + a.rope, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const float* qv = qcur + (size_t) h * W;
     for (int j = warp; j < n; j += kThreads / 32) {
-        const float* kr = cache + (size_t) (first + j) * W;
+        const float* kr = cache + (size_t) (cells ? cells[j] : ring ? (first + j) % ring : first + j) * W;
         float acc = 0.f;
         for (int c = lane; c < W; c += 32) acc = fmaf(qv[c], kr[c], acc);
         acc = warp_sum(acc);
@@ -140,7 +141,7 @@ __global__ void attend_kernel(const float* __restrict__ qcur, const float* __res
     const float inv = 1.f / den;
     for (int c = threadIdx.x; c < a.rank; c += kThreads) {
         float acc = 0.f;
-        for (int j = 0; j < n; ++j) acc = fmaf(s[j], cache[(size_t) (first + j) * W + c], acc);
+        for (int j = 0; j < n; ++j) acc = fmaf(s[j], cache[(size_t) (cells ? cells[j] : ring ? (first + j) % ring : first + j) * W + c], acc);
         o_lat[(size_t) h * a.rank + c] = acc * inv;
     }
 }
@@ -161,9 +162,9 @@ void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const 
 }
 
 void mla_attend(const float* qcur, const float* cache, int first, int n, const float* sinks, const MlaArgs& a,
-                float* o_lat, void* stream) {
+                float* o_lat, void* stream, const int32_t* cells, int ring) {
     if (n < 1 || n > kMaxCells) throw std::invalid_argument("mla_attend: cells");
-    attend_kernel<<<a.heads, kThreads, 0, (cudaStream_t) stream>>>(qcur, cache, first, n, sinks, a, o_lat);
+    attend_kernel<<<a.heads, kThreads, 0, (cudaStream_t) stream>>>(qcur, cache, first, n, sinks, a, o_lat, cells, ring);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
