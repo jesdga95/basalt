@@ -46,11 +46,12 @@ namespace {
 namespace bk = basalt::kernels;
 
 constexpr int kRowWidth = 576;                 // a cache row: 512 latent values and 64 rotated
-constexpr int kMaxChunk = 4096;                // rows a prompt chunk may carry (the rings are sized for it)
+constexpr int kMaxChunk = 16384;               // rows a prompt chunk may carry (the residual streams and the experts' pairs)
+constexpr int kAttRows = 2048;                 // rows of one attention step inside a chunk (the rings are sized for it)
 constexpr int kStageExperts = 16;              // experts of one prompt launch (a blob each in the staging)
-constexpr int kLaunchRows = 4096;              // most (row, expert) pairs of one prompt launch
+constexpr int kLaunchRows = 16384;              // most (row, expert) pairs of one prompt launch
 constexpr int kMaxWindow = 8;                  // rows of a decode window, and of one expert group
-constexpr int kRawRing = kMaxChunk + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
+constexpr int kRawRing = kAttRows + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
 constexpr int64_t kGrowPositions = 16384;      // positions the caches are backed in
 constexpr uint64_t kModuleRoom = 7ull << 27;   // kernel modules still to load when the tier opens
 constexpr uint64_t kPromptRoom = 5ull << 29;   // the prompt path's workspaces beside the homes
@@ -68,7 +69,7 @@ struct WindowPlan {
 // The buffers that scale with the rows of a call: a decode window's, or a prompt chunk's (opened while a prompt runs, with the tier's
 // slots lent to them).
 struct Bufs {
-    int rows = 0;
+    int rows = 0, arows = 0;   // the chunk's rows, and the rows of an attention step
     std::vector<void*> dev, host;
     float *X = nullptr, *Xn = nullptr, *coef = nullptr, *hcws = nullptr, *e = nullptr, *cur = nullptr, *xn = nullptr, *attn = nullptr,
           *attn_raw = nullptr, *mlp = nullptr, *mlp2 = nullptr, *qa = nullptr, *qan = nullptr, *q = nullptr, *kvraw = nullptr,
@@ -210,31 +211,37 @@ public:
             b.host.push_back(p);
             return (float*) p;
         };
+        const int A = std::min(R, kAttRows);
         b.rows = R;
+        b.arows = A;
         b.X = f((int64_t) R * 4 * E); b.Xn = f((int64_t) R * 4 * E); b.coef = f((int64_t) R * bk::kHcCoef);
         b.hcws = f((int64_t) bk::hc_plain_workspace_floats(R));
         b.e = f((int64_t) R * E); b.cur = f((int64_t) R * E); b.xn = f((int64_t) R * E); b.attn = f((int64_t) R * E);
-        b.attn_raw = f((int64_t) R * E); b.mlp = f((int64_t) R * E); b.mlp2 = f((int64_t) R * E);
-        b.qa = f((int64_t) R * g_.q_lora); b.qan = f((int64_t) R * g_.q_lora); b.q = f((int64_t) R * max_heads_ * g_.qk_dim);
-        b.kvraw = f((int64_t) R * kRowWidth); b.qabs = f((int64_t) R * max_heads_ * g_.kv_lora);
-        b.qcur = f((int64_t) R * max_heads_ * kRowWidth); b.olat = f((int64_t) R * max_heads_ * g_.kv_lora);
-        b.vout = f((int64_t) R * max_heads_ * g_.v_dim); b.gate = f((int64_t) R * max_heads_ * g_.v_dim);
-        b.ik = f((int64_t) R * g_.idx_dim); b.ikn = f((int64_t) R * g_.idx_dim); b.ivt = f((int64_t) R * g_.idx_dim);
-        b.igt = f((int64_t) R * g_.idx_dim); b.iq = f((int64_t) R * g_.idx_heads * g_.idx_dim); b.iw = f((int64_t) R * g_.idx_heads);
-        b.icells = (int32_t*) f((int64_t) R * cells_stride_);
-        b.meta_d = (int32_t*) f(3 * (int64_t) R);
-        b.meta_h = (int32_t*) pin((int64_t) g_.n_layers * 3 * R);
-        b.gu = f(2 * (int64_t) R * g_.n_ff); b.h = f((int64_t) R * g_.n_ff);
+        b.attn_raw = f((int64_t) A * E); b.mlp = f((int64_t) R * E); b.mlp2 = f((int64_t) R * E);
+        b.qa = f((int64_t) A * g_.q_lora); b.qan = f((int64_t) A * g_.q_lora); b.q = f((int64_t) A * max_heads_ * g_.qk_dim);
+        b.kvraw = f((int64_t) A * kRowWidth); b.qabs = f((int64_t) A * max_heads_ * g_.kv_lora);
+        b.qcur = f((int64_t) A * max_heads_ * kRowWidth); b.olat = f((int64_t) A * max_heads_ * g_.kv_lora);
+        b.vout = f((int64_t) A * max_heads_ * g_.v_dim); b.gate = f((int64_t) A * max_heads_ * g_.v_dim);
+        b.ik = f((int64_t) A * g_.idx_dim); b.ikn = f((int64_t) A * g_.idx_dim); b.ivt = f((int64_t) A * g_.idx_dim);
+        b.igt = f((int64_t) A * g_.idx_dim); b.iq = f((int64_t) A * g_.idx_heads * g_.idx_dim); b.iw = f((int64_t) A * g_.idx_heads);
+        b.icells = (int32_t*) f((int64_t) A * cells_stride_);
+        b.meta_d = (int32_t*) f(3 * (int64_t) A);
+        b.meta_h = (int32_t*) pin((int64_t) g_.n_layers * 3 * A);
+        // gate/up products of the dense layer (A rows of n_ff), of the shared expert (R rows of the expert width) and of a prompt
+        // launch (kLaunchRows rows of twice the expert width); the SwiGLU outputs likewise
+        const int64_t gu_n = std::max<int64_t>({2 * (int64_t) A * g_.n_ff, 2 * (int64_t) R * g_.n_ff_exp, 2 * (int64_t) kLaunchRows * g_.n_ff_exp});
+        const int64_t h_n = std::max<int64_t>({(int64_t) A * g_.n_ff, (int64_t) R * g_.n_ff_exp, (int64_t) kLaunchRows * g_.n_ff_exp});
+        b.gu = f(gu_n); b.h = f(h_n);
         b.rlog = f((int64_t) R * g_.n_expert); b.rw = f((int64_t) R * 16); b.ids = (int32_t*) f((int64_t) R * 16);
         b.xlat = f((int64_t) R * g_.n_latent); b.lat_out = f((int64_t) R * g_.n_latent); b.moe_out = f((int64_t) R * E); b.sh = f((int64_t) R * E);
-        b.erows = f((int64_t) R * g_.n_embd); b.ekv = f((int64_t) R * 5 * E); b.evalid = f(R);
+        b.erows = f((int64_t) A * g_.n_embd); b.ekv = f((int64_t) A * 5 * E); b.evalid = f(A);
         b.pair_rows = f((int64_t) R * g_.n_used * g_.n_latent);
         b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used);
-        b.mmq_ident = (int32_t*) f(R);
-        b.h_erows = pin((int64_t) R * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(R);
+        b.mmq_ident = (int32_t*) f(A);
+        b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
         if (ok) {
             void* q = nullptr;
-            if (cudaMalloc(&q, basalt::prefill::mmq::q8_bytes(R, 16384)) != cudaSuccess) ok = false;
+            if (cudaMalloc(&q, basalt::prefill::mmq::q8_bytes(A, 16384)) != cudaSuccess) ok = false;
             else {
                 b.dev.push_back(q);
                 b.mmq_xq = q;
@@ -246,7 +253,7 @@ public:
             return false;
         }
         if (basalt::prefill::mmq::built()) {
-            basalt::prefill::mmq::iota(b.mmq_ident, R, nullptr);
+            basalt::prefill::mmq::iota(b.mmq_ident, A, nullptr);
             basalt::prefill::mmq::iota(b.pair_ident, (int64_t) R * g_.n_used, nullptr);
         }
         cudaDeviceSynchronize();
@@ -256,6 +263,7 @@ public:
     // The session's row buffers are `b`'s from here on.
     void use(const Bufs& b) {
         rows_ = b.rows;
+        arows_ = b.arows;
         X_ = b.X; Xn_ = b.Xn; coef_ = b.coef; hcws_ = b.hcws; e_ = b.e; cur_ = b.cur; xn_ = b.xn; attn_ = b.attn; attn_raw_ = b.attn_raw;
         mlp_ = b.mlp; mlp2_ = b.mlp2; qa_ = b.qa; qan_ = b.qan; q_ = b.q; kvraw_ = b.kvraw; qabs_ = b.qabs; qcur_ = b.qcur;
         olat_ = b.olat; vout_ = b.vout; gate_ = b.gate; ik_ = b.ik; ikn_ = b.ikn; ivt_ = b.ivt; igt_ = b.igt; iq_ = b.iq; iw_ = b.iw;
@@ -443,8 +451,8 @@ public:
     }
 
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
-        if (save && (int64_t) hist_.size() - pos > kMaxChunk)
-            return {model::Status::Error, "hy4flash: the rings have moved on more than " + std::to_string(kMaxChunk) + " positions past the checkpoint"};
+        if (save && (int64_t) hist_.size() - pos > kAttRows)
+            return {model::Status::Error, "hy4flash: the rings have moved on more than " + std::to_string(kAttRows) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "hy4flash: a checkpoint past the session's position"};
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) {
@@ -573,7 +581,7 @@ private:
         return p;
     }
 
-    int swa_ring() const { return g_.window + kMaxChunk; }
+    int swa_ring() const { return g_.window + kAttRows; }
     bool fp8() const { return m_.cache_fp8(); }
     bool f32() const { return m_.cache_f32(); }
     int elem() const { return f32() ? 4 : 2; }
@@ -582,26 +590,29 @@ private:
     // y[r] = W x[r] for R rows, 8 at a time: a row's product does not depend on the rows beside it
     void gemm(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R) {
         namespace mmq = basalt::prefill::mmq;
-        if (R > kMaxWindow && mmq::built() && mmq::fits(w->type, n_out)) {   // a chunk: the tensor-core MMQ product
+        if (R > kMaxWindow && mmq::built() && mmq::fits(w->type, n_out)) {   // a chunk: the tensor-core MMQ product, arows_ rows a time
             if (loaded_.insert({w->type, n_out}).second) mmq::load(w->type, n_out);
-            const int32_t b[2] = {0, R};
-            cudaMemcpyAsync(mmq_bounds_, b, sizeof b, cudaMemcpyHostToDevice, stream_);
-            mmq::quantize(x, nullptr, mmq_xq_, w->type, n_in, n_in, R, stream_);
-            mmq::Product p;
-            p.w = w->ptr;
-            p.type = w->type;
-            p.w_rows = n_out;
-            p.w_cols = n_in;
-            p.expert_bytes = mmq::matrix_bytes(w->type, n_out, n_in);
-            p.n = 1;
-            p.xq = mmq_xq_;
-            p.bounds = mmq_bounds_;
-            p.ids = mmq_ident_;
-            p.total_rows = R;
-            p.max_rows = R;
-            p.dst = y;
-            p.ld_dst = n_out;
-            mmq_.run(p, stream_);
+            for (int r0 = 0; r0 < R; r0 += arows_) {
+                const int nb = std::min(arows_, R - r0);
+                const int32_t b[2] = {0, nb};
+                cudaMemcpyAsync(mmq_bounds_, b, sizeof b, cudaMemcpyHostToDevice, stream_);
+                mmq::quantize(x + (size_t) r0 * n_in, nullptr, mmq_xq_, w->type, n_in, n_in, nb, stream_);
+                mmq::Product p;
+                p.w = w->ptr;
+                p.type = w->type;
+                p.w_rows = n_out;
+                p.w_cols = n_in;
+                p.expert_bytes = mmq::matrix_bytes(w->type, n_out, n_in);
+                p.n = 1;
+                p.xq = mmq_xq_;
+                p.bounds = mmq_bounds_;
+                p.ids = mmq_ident_;
+                p.total_rows = nb;
+                p.max_rows = nb;
+                p.dst = y + (size_t) r0 * n_out;
+                p.ld_dst = n_out;
+                mmq_.run(p, stream_);
+            }
             return;
         }
         for (int c0 = 0; c0 < R; c0 += kMaxWindow) {
@@ -628,8 +639,24 @@ private:
         return a;
     }
 
-    // Attention of layer `l` over R rows at pos0.. of the normed input xn_; the post-normed result goes to attn_.
+    // Attention of layer `l` over R rows at pos0.. of the normed input xn_; the post-normed result goes to attn_. Steps of arows_ rows run
+    // one after the other (each writes its rows' cache cells before it attends, so a row sees the rows before it), over the streams
+    // offset to the step.
     bool attention(int l, int64_t pos0, int R, std::string& err) {
+        float *xn0 = xn_, *at0 = attn_;
+        const int E = g_.n_embd;
+        bool ok = true;
+        for (int off = 0; ok && off < R; off += arows_) {
+            xn_ = xn0 + (size_t) off * E;
+            attn_ = at0 + (size_t) off * E;
+            ok = attention_step(l, pos0 + off, std::min(arows_, R - off), err);
+        }
+        xn_ = xn0;
+        attn_ = at0;
+        return ok;
+    }
+
+    bool attention_step(int l, int64_t pos0, int R, std::string& err) {
         const int H = g_.heads[(size_t) l];
         const bool swa = g_.swa[(size_t) l];
         const int E = g_.n_embd, rank = g_.kv_lora;
@@ -668,8 +695,8 @@ private:
             put("q_pe-" + std::to_string(l), qp);
         }
         // the cells each row attends
-        int32_t* meta = meta_h_ + (size_t) l * 3 * rows_;   // firsts, counts, fill
-        int32_t *firsts = meta, *counts = meta + rows_, *fill = meta + 2 * rows_;
+        int32_t* meta = meta_h_ + (size_t) l * 3 * arows_;   // firsts, counts, fill
+        int32_t *firsts = meta, *counts = meta + arows_, *fill = meta + 2 * arows_;
         bool selecting = false;
         std::vector<int> pools_of(R, 0);
         if (swa) {
@@ -700,12 +727,12 @@ private:
                 dfly_.selection(l, t, sel ? icells_ + (size_t) t * cells_stride_ : nullptr, sel ? counts[t] : -1, stream_);
             }
         }
-        cudaMemcpyAsync(meta_d_, meta, (size_t) 3 * rows_ * 4, cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(meta_d_, meta, (size_t) 3 * arows_ * 4, cudaMemcpyHostToDevice, stream_);
         RowSpans rs;
         rs.firsts = meta_d_;
-        rs.counts = meta_d_ + rows_;
+        rs.counts = meta_d_ + arows_;
         if (!swa) {
-            iota_cells(icells_, cells_stride_, meta_d_ + 2 * rows_, R, stream_);
+            iota_cells(icells_, cells_stride_, meta_d_ + 2 * arows_, R, stream_);
             rs.cells = icells_;
             rs.cells_stride = cells_stride_;
         }
@@ -767,8 +794,19 @@ private:
         }
     }
 
-    // The Engram step of layer `l` on the streams of R rows.
+    // The Engram step of layer `l` on the streams of R rows, arows_ rows a step.
     bool engram(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err) {
+        float* x0 = X_;
+        bool ok = true;
+        for (int off = 0; ok && off < R; off += arows_) {
+            X_ = x0 + (size_t) off * 4 * g_.n_embd;
+            ok = engram_step(l, pos0 + off, std::min(arows_, R - off), tokens + off, err);
+        }
+        X_ = x0;
+        return ok;
+    }
+
+    bool engram_step(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err) {
         const EngramInfo& en = m_.pack().engram;
         int e = -1;
         for (size_t k = 0; k < en.layers.size(); ++k)
@@ -821,11 +859,19 @@ private:
     bool ffn(int l, int R, std::string& err) {
         const int E = g_.n_embd;
         if (l < g_.n_dense) {
-            float *gate = gu_, *up = gu_ + (size_t) R * g_.n_ff;
-            gemm(T(l, "ffn_gate.weight"), xn_, gate, E, g_.n_ff, R);
-            gemm(T(l, "ffn_up.weight"), xn_, up, E, g_.n_ff, R);
-            bk::swiglu_scaled(gate, up, nullptr, nullptr, h_, R, g_.n_ff, g_.n_ff, stream_);
-            gemm(T(l, "ffn_down.weight"), h_, mlp_, g_.n_ff, E, R);
+            float *xn0 = xn_, *ml0 = mlp_;
+            for (int off = 0; off < R; off += arows_) {
+                const int n = std::min(arows_, R - off);
+                xn_ = xn0 + (size_t) off * E;
+                mlp_ = ml0 + (size_t) off * E;
+                float *gate = gu_, *up = gu_ + (size_t) n * g_.n_ff;
+                gemm(T(l, "ffn_gate.weight"), xn_, gate, E, g_.n_ff, n);
+                gemm(T(l, "ffn_up.weight"), xn_, up, E, g_.n_ff, n);
+                bk::swiglu_scaled(gate, up, nullptr, nullptr, h_, n, g_.n_ff, g_.n_ff, stream_);
+                gemm(T(l, "ffn_down.weight"), h_, mlp_, g_.n_ff, E, n);
+            }
+            xn_ = xn0;
+            mlp_ = ml0;
             return true;
         }
         return moe(l, R, err);
@@ -1305,7 +1351,7 @@ private:
     float *qa_ = nullptr, *qan_ = nullptr, *q_ = nullptr, *kvraw_ = nullptr, *qabs_ = nullptr, *qcur_ = nullptr, *olat_ = nullptr, *vout_ = nullptr, *gate_ = nullptr;
     float *ik_ = nullptr, *ikn_ = nullptr, *ivt_ = nullptr, *igt_ = nullptr, *iq_ = nullptr, *iw_ = nullptr, *iscore_ = nullptr;
     int32_t *icells_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
-    int cells_stride_ = 0, rows_ = 0, max_heads_ = 0;
+    int cells_stride_ = 0, rows_ = 0, arows_ = 0, max_heads_ = 0;
     Bufs dec_, big_;   // a window's row buffers, and a prompt chunk's while one runs
     float *gu_ = nullptr, *h_ = nullptr, *rlog_ = nullptr, *rw_ = nullptr;
     int32_t* ids_ = nullptr;
