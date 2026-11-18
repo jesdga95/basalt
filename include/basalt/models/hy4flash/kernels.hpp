@@ -109,6 +109,12 @@ void add_vectors(const float* a, const float* b, float* out, int n, void* stream
 /// device or mapped host memory).
 void weighted_sum_window(const float* const* rows, const float* w, int n_tok, int K, int n, float* out, void* stream);
 
+/// h[r][k] = silu(min(gu[r][k], limit)) * clamp(gu[r][n_ff + k], -limit, limit) for rows of 2 * n_ff values (the gate rows' products
+/// then the up rows').
+void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, float limit, void* stream);
+/// out[t][i] = sum_k w[t * K + k] * rows[map[t * K + k]][i] for k < K, in that order.
+void weighted_sum_tokens(const float* rows, const int32_t* map, const float* w, int n_tok, int K, int n, float* out, void* stream);
+
 // ---- hyper-connection streams -------------------------------------------------------------------------------------
 
 /// x[t][4][n] = 4 copies of e[t][n], t < n_tok.

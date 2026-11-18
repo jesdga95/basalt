@@ -59,6 +59,23 @@ __global__ void wsum_kernel(const float* const* __restrict__ rows, const float* 
     out[(size_t) t * n + i] = acc;
 }
 
+__global__ void swiglu_split_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int n_ff, float limit) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * n_ff) return;
+    const int64_t r = i / n_ff, k = i - r * n_ff;
+    const float g = fminf(gu[r * 2 * n_ff + k], limit), u = fminf(fmaxf(gu[r * 2 * n_ff + n_ff + k], -limit), limit);
+    h[i] = g / (1.f + expf(-g)) * u;
+}
+
+__global__ void wsum_tokens_kernel(const float* __restrict__ rows, const int32_t* __restrict__ map, const float* __restrict__ w, int K, int n,
+                                   float* __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (i >= n) return;
+    float acc = 0.f;
+    for (int k = 0; k < K; ++k) acc += w[t * K + k] * rows[(size_t) map[t * K + k] * n + i];
+    out[(size_t) t * n + i] = acc;
+}
+
 __global__ void fill_kernel(const float* __restrict__ e, int n, float* __restrict__ x) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (i >= n) return;
@@ -129,6 +146,17 @@ void add_vectors(const float* a, const float* b, float* out, int n, void* stream
 
 void weighted_sum_window(const float* const* rows, const float* w, int n_tok, int K, int n, float* out, void* stream) {
     wsum_kernel<<<dim3((n + 255) / 256, n_tok), 256, 0, (cudaStream_t) stream>>>(rows, w, K, n, out);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, float limit, void* stream) {
+    if (rows <= 0) return;
+    swiglu_split_kernel<<<(unsigned) ((rows * n_ff + 255) / 256), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, limit);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void weighted_sum_tokens(const float* rows, const int32_t* map, const float* w, int n_tok, int K, int n, float* out, void* stream) {
+    wsum_tokens_kernel<<<dim3((n + 255) / 256, n_tok), 256, 0, (cudaStream_t) stream>>>(rows, map, w, K, n, out);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
