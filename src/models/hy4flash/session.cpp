@@ -1,15 +1,17 @@
 // src/models/hy4flash/session.cpp - one conversation of Hy4-flash: its latent caches, indexer rows and pooled keys, and the
-// forward of one token that every window and prompt row runs.
+// forward of a run of rows that every decode window (up to 8 rows) and every prompt chunk (up to kMaxRows) goes through.
 //
-// Per layer: the Engram step (on its layers), the attention's hyper-connection pre-mix and norm, the absorbed MLA over
-// the shared latent (a window ring on the window layers, the indexer's selection on the others), the gate, the output
-// projection and its post-norm, the stream expansion, and the same for the FFN: the dense MLP, or the latent MoE (router,
-// the routed experts on the CPU beside the shared expert on the card, the up projection).
+// Per layer: the Engram step (on its layers), the attention's hyper-connection pre-mix and norm, the absorbed MLA over the
+// shared latent (a ring on the window layers, the indexer's selection on the others), the gate, the output projection and its
+// post-norm, the stream expansion, and the same for the FFN: the dense MLP, or the latent MoE (router, routed_down, the experts
+// the tier places in groups of up to 8 rows beside the shared expert, routed_up). A row's result does not depend on the other
+// rows of its call: the dense products take 8 rows at most per launch with the single-row kernels' reduction order, the
+// attention kernels take a block per row, and the experts are run per row.
 #include "basalt/core/elastic_array.hpp"
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
-#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/dense_ops.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -36,19 +38,22 @@ namespace {
 
 namespace bk = basalt::kernels;
 
-constexpr int kRowWidth = 576;   // a cache row: 512 latent values and 64 rotated
-constexpr int kRawRing = 8;      // the indexer's rows of the last positions: a group of 4 and the one before it
-constexpr int64_t kGrowPositions = 16384;   // positions the caches are backed in
+constexpr int kRowWidth = 576;                 // a cache row: 512 latent values and 64 rotated
+constexpr int kMaxRows = 256;                  // rows one call carries: a prompt chunk
+constexpr int kMaxWindow = 8;                  // rows of a decode window, and of one expert group
+constexpr int kRawRing = kMaxRows + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
+constexpr int64_t kGrowPositions = 16384;      // positions the caches are backed in
 constexpr uint64_t kModuleRoom = 7ull << 27;   // kernel modules still to load when the tier opens
 constexpr uint64_t kPromptRoom = 5ull << 29;   // the prompt path's workspaces beside the homes
+constexpr int kLookupK = core::ExpertTier::kMaxK;
 
-// One layer's GPU plan for the grouped expert kernel, uploaded with a single copy.
-struct ExpertPlan {
-    unsigned long long ptr[16];
-    int32_t start[17];
-    int32_t ng[3];
-    int32_t dst[16];
-    int32_t tok[16];
+// One group's GPU plan for the grouped expert kernel, uploaded with a single copy.
+struct WindowPlan {
+    unsigned long long ptr[kLookupK];
+    int32_t start[kLookupK + 2];
+    int32_t ng[4];
+    int32_t dst[kLookupK];
+    int32_t tok[kLookupK];
 };
 
 class Session final : public model::ModelSession {
@@ -67,7 +72,7 @@ public:
             err = "cannot create a stream";
             return false;
         }
-        const int64_t E = g_.n_embd, ctx = m_.context();
+        const int64_t E = g_.n_embd, ctx = m_.context(), R = kMaxRows;
         int max_heads = 0;
         for (int h : g_.heads) max_heads = std::max(max_heads, h);
         bool ok = true;
@@ -78,31 +83,38 @@ public:
             else pinned_.push_back(p);
             return (float*) p;
         };
-        X_ = f(4 * E); Xn_ = f(4 * E); coef_ = f(bk::kHcCoef); hcws_ = f((int64_t) bk::hc_plain_workspace_floats(1));
-        e_ = f(E); cur_ = f(E); xn_ = f(E); attn_ = f(E); attn_raw_ = f(E); mlp_ = f(E); mlp2_ = f(E); fin_ = f(E);
-        qa_ = f(g_.q_lora); qan_ = f(g_.q_lora); q_ = f((int64_t) max_heads * g_.qk_dim); kvraw_ = f(kRowWidth);
-        qabs_ = f((int64_t) max_heads * g_.kv_lora); qcur_ = f((int64_t) max_heads * kRowWidth);
-        olat_ = f((int64_t) max_heads * g_.kv_lora); vout_ = f((int64_t) max_heads * g_.v_dim); gate_ = f((int64_t) max_heads * g_.v_dim);
-        ik_ = f(g_.idx_dim); ikn_ = f(g_.idx_dim); iq_ = f((int64_t) g_.idx_heads * g_.idx_dim); iw_ = f(g_.idx_heads);
+        X_ = f(R * 4 * E); Xn_ = f(R * 4 * E); coef_ = f(R * bk::kHcCoef); hcws_ = f((int64_t) bk::hc_plain_workspace_floats(kMaxRows));
+        e_ = f(R * E); cur_ = f(R * E); xn_ = f(R * E); attn_ = f(R * E); attn_raw_ = f(R * E); mlp_ = f(R * E); mlp2_ = f(R * E);
+        fin_ = f(kMaxWindow * E);
+        qa_ = f(R * g_.q_lora); qan_ = f(R * g_.q_lora); q_ = f(R * max_heads * g_.qk_dim); kvraw_ = f(R * kRowWidth);
+        qabs_ = f(R * max_heads * g_.kv_lora); qcur_ = f(R * max_heads * kRowWidth);
+        olat_ = f(R * max_heads * g_.kv_lora); vout_ = f(R * max_heads * g_.v_dim); gate_ = f(R * max_heads * g_.v_dim);
+        ik_ = f(R * g_.idx_dim); ikn_ = f(R * g_.idx_dim); ivt_ = f(R * g_.idx_dim); igt_ = f(R * g_.idx_dim);
+        iq_ = f(R * g_.idx_heads * g_.idx_dim); iw_ = f(R * g_.idx_heads);
         const int64_t pools = ctx / g_.idx_pool + 1;
         iscore_ = f(pools);
-        icells_ = (int32_t*) alloc((size_t) (g_.idx_top_k + g_.idx_pool) * 4, ok);
-        gu_ = f(2 * (int64_t) g_.n_ff); h_ = f(g_.n_ff);
-        rlog_ = f(g_.n_expert); rw_ = f(16); ids_ = (int32_t*) alloc(16 * 4, ok);
-        xlat_ = f(g_.n_latent); lat_out_ = f(g_.n_latent); moe_out_ = f(E); sh_ = f(E);
-        logits_ = f(g_.n_vocab); pick_ = (int32_t*) alloc(4 * 16, ok);
-        erows_ = f(g_.n_embd);   // the Engram's normed rows: 16 x 96 values
-        ekv_ = f(5 * E);
-        lp_ = f((int64_t) bk::row_logprobs_scratch_floats(1, (int) g_.n_vocab) + bk::kLogprobStride + 16);
-        const size_t q8 = std::max<size_t>(bk::native_q8_1_bytes(16384, 1), 1 << 16);
-        q8a_ = alloc(q8, ok); q8b_ = alloc(q8, ok); q8c_ = alloc(q8, ok);
-        h_rw_ = pin(16); h_ids_ = (int32_t*) pin(16);
-        h_erows_ = pin(g_.n_embd); h_e_ = pin(E);
-        ex_xq_ = alloc(bk::native_q8_1_bytes(g_.n_latent, 1), ok);
-        ex_scr_ = alloc(bk::native_expert_scratch_bytes(16, g_.n_ff_exp), ok);
-        ex_rows_ = f((int64_t) 16 * g_.n_latent);
-        ex_plan_ = alloc(sizeof(ExpertPlan), ok);
-        if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
+        cells_stride_ = g_.idx_top_k + 2 * g_.idx_pool;
+        icells_ = (int32_t*) alloc((size_t) R * cells_stride_ * 4, ok);
+        meta_d_ = (int32_t*) alloc((size_t) 3 * R * 4, ok);
+        meta_h_ = (int32_t*) pin((size_t) g_.n_layers * 3 * R);
+        gu_ = f(2 * R * (int64_t) g_.n_ff); h_ = f(R * (int64_t) g_.n_ff);
+        rlog_ = f(R * g_.n_expert); rw_ = f(R * 16); ids_ = (int32_t*) alloc((size_t) R * 16 * 4, ok);
+        xlat_ = f(R * g_.n_latent); lat_out_ = f(R * g_.n_latent); moe_out_ = f(R * E); sh_ = f(R * E);
+        logits_ = f((int64_t) kMaxWindow * g_.n_vocab); pick_ = (int32_t*) alloc(4 * 32, ok);
+        erows_ = f(R * g_.n_embd);   // the Engram's normed rows: 16 x 96 values a row
+        ekv_ = f(R * 5 * E);
+        evalid_ = f(R);
+        lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxWindow, (int) g_.n_vocab) + (int64_t) kMaxWindow * (bk::kLogprobStride + 1));
+        q8_ = alloc(std::max<size_t>(bk::native_q8_1_bytes(16384, kMaxWindow), 1 << 16), ok);
+        ex_xq_ = alloc(bk::native_q8_1_bytes(g_.n_latent, kMaxWindow), ok);
+        ex_scr_ = alloc(bk::native_expert_scratch_bytes(kLookupK, g_.n_ff_exp), ok);
+        ex_rows_ = f((int64_t) kLookupK * g_.n_latent);
+        ex_plan_ = alloc(sizeof(WindowPlan), ok);
+        rowptr_d_ = (const float**) alloc(kLookupK * sizeof(void*), ok);
+        h_rowptr_ = (const float**) pin(kLookupK * 2);
+        h_rw_ = pin(kMaxWindow * 16); h_ids_ = (int32_t*) pin(kMaxWindow * 16);
+        h_erows_ = pin(R * g_.n_embd); h_e_ = pin(R * E); h_evalid_ = pin(R);
+        if (cudaHostAlloc((void**) &h_plan_, sizeof(WindowPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
         else pinned_.push_back(h_plan_);
         cache_.assign((size_t) g_.n_layers, nullptr);
         ival_.assign((size_t) g_.n_layers, nullptr);
@@ -112,7 +124,7 @@ public:
         pea_.resize((size_t) g_.n_layers);
         for (int l = 0; ok && l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) {
-                cache_[(size_t) l] = (uint16_t*) alloc((size_t) g_.window * kRowWidth * 2, ok);
+                cache_[(size_t) l] = (uint16_t*) alloc((size_t) swa_ring() * kRowWidth * 2, ok);
             } else {
                 ea_[(size_t) l] = std::make_unique<core::ElasticArray>();
                 pea_[(size_t) l] = std::make_unique<core::ElasticArray>();
@@ -130,20 +142,23 @@ public:
         return true;
     }
 
+    int max_window() const override { return kMaxWindow; }
+
     model::Result decode_window(const model::DecodeRequest& r) override {
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
-        for (int t = 0; t < r.n_tokens; ++t) {
-            const bool last = t == r.n_tokens - 1;
+        for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxWindow) {
+            const int n = std::min(kMaxWindow, r.n_tokens - t0);
+            const bool last = t0 + n == r.n_tokens;
             const bool want = r.row_tokens || (last && (r.next_token || r.logits));
-            if (!forward(r.tokens[t], r.pos + t, want, err)) return {model::Status::Error, "hy4flash: " + err};
-            if (want) {
-                int32_t tok = 0;
-                if (!pick(r, t, tok, err)) return {model::Status::Error, "hy4flash: " + err};
-                if (r.row_tokens) r.row_tokens[t] = tok;
-                if (last && r.next_token) *r.next_token = tok;
-                if (last && r.logits) cudaMemcpyAsync(r.logits, logits_, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
-            }
+            const int head = !want ? 0 : r.row_tokens ? n : 1;
+            if (!run_rows(r.tokens + t0, n, r.pos + t0, head, err)) return {model::Status::Error, "hy4flash: " + err};
+            if (!want) continue;
+            if (!pick(r, t0, head, err)) return {model::Status::Error, "hy4flash: " + err};
+            if (r.row_tokens)
+                for (int i = 0; i < n; ++i) r.row_tokens[t0 + i] = picks_[(size_t) i];
+            if (last && r.next_token) *r.next_token = picks_[(size_t) head - 1];
+            if (last && r.logits) cudaMemcpyAsync(r.logits, logits_ + (size_t) (head - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "hy4flash: the window failed"};
         return {};
@@ -151,12 +166,13 @@ public:
 
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
-        for (int t = 0; t < r.n_tokens; ++t) {
+        for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
             if (r.stop && r.stop()) break;
-            if (!forward(r.tokens[t], r.pos + t, false, err)) return {model::Status::Error, "hy4flash: " + err};
-            if (r.progress && ((t + 1) % 16 == 0 || t + 1 == r.n_tokens)) {
+            const int n = std::min(kMaxRows, r.n_tokens - t0);
+            if (!run_rows(r.tokens + t0, n, r.pos + t0, 0, err)) return {model::Status::Error, "hy4flash: " + err};
+            if (r.progress) {
                 cudaStreamSynchronize(stream_);
-                r.progress(t + 1);
+                r.progress(t0 + n);
             }
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "hy4flash: the prompt failed"};
@@ -177,18 +193,18 @@ public:
     std::string info_words() const override { return tier_ ? "expert_slots=" + std::to_string(tier_->slots()) : std::string(); }
 
     model::Result copy_logits(int row, float* out) override {
-        if (row != last_row_) return {model::Status::Error, "hy4flash: the session keeps the last row's logits only"};
-        cudaMemcpy(out, logits_, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost);
+        if (row < 0 || row >= last_rows_) return {model::Status::Error, "hy4flash: the session keeps the last window's logits only"};
+        cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost);
         return {};
     }
 
     model::Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) override {
-        if (n != 1 || row0 != last_row_) return {model::Status::Error, "hy4flash: the session keeps the last row's logits only"};
-        float* d_out = lp_ + bk::row_logprobs_scratch_floats(1, (int) g_.n_vocab);
-        int32_t* d_pick = pick_ + 8;
-        cudaMemcpyAsync(d_pick, picks, 4, cudaMemcpyHostToDevice, stream_);
-        bk::row_logprobs(logits_, 1, (int) g_.n_vocab, d_pick, top, d_out, lp_, stream_);
-        cudaMemcpyAsync(out, d_out, bk::kLogprobStride * 4, cudaMemcpyDeviceToHost, stream_);
+        if (row0 < 0 || n < 1 || row0 + n > last_rows_) return {model::Status::Error, "hy4flash: the session keeps the last window's logits only"};
+        float* d_out = lp_ + bk::row_logprobs_scratch_floats(n, (int) g_.n_vocab);
+        int32_t* d_pick = pick_ + 16;
+        cudaMemcpyAsync(d_pick, picks, (size_t) n * 4, cudaMemcpyHostToDevice, stream_);
+        bk::row_logprobs(logits_ + (size_t) row0 * g_.n_vocab, n, (int) g_.n_vocab, d_pick, top, d_out, lp_, stream_);
+        cudaMemcpyAsync(out, d_out, (size_t) n * bk::kLogprobStride * 4, cudaMemcpyDeviceToHost, stream_);
         return cudaStreamSynchronize(stream_) == cudaSuccess ? model::Result{} : model::Result{model::Status::Error, "hy4flash: logprobs failed"};
     }
 
@@ -203,11 +219,16 @@ private:
         return p;
     }
 
-    // y = W x for the Q8_1-quantised activation in `q8`
-    void mm(const DevTensor* w, const void* q8, float* y, int n_in, int n_out) {
-        bk::native_mmvq(w->type, w->ptr, q8, y, n_in, n_out, 1, stream_);
+    int swa_ring() const { return g_.window + kMaxRows; }
+
+    // y[r] = W x[r] for R rows, 8 at a time: a row's product does not depend on the rows beside it
+    void gemm(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R) {
+        for (int c0 = 0; c0 < R; c0 += kMaxWindow) {
+            const int nc = std::min(kMaxWindow, R - c0);
+            bk::native_quantize_q8_1(x + (size_t) c0 * n_in, q8_, n_in, nc, stream_);
+            bk::native_mmvq(w->type, w->ptr, q8_, y + (size_t) c0 * n_out, n_in, n_out, nc, stream_);
+        }
     }
-    void quant(const float* x, void* q8, int n) { bk::native_quantize_q8_1(x, q8, n, 1, stream_); }
     const DevTensor* T(int l, const char* s) const { return m_.tensor(l, s); }
     const float* F(int l, const char* s) const { return (const float*) m_.tensor(l, s)->ptr; }
 
@@ -223,42 +244,70 @@ private:
         return a;
     }
 
-    bool attention(int l, int64_t pos, std::string& err) {
+    // Attention of layer `l` over R rows at pos0.. of the normed input xn_; the post-normed result goes to attn_.
+    bool attention(int l, int64_t pos0, int R, std::string& err) {
         const int H = g_.heads[(size_t) l];
         const bool swa = g_.swa[(size_t) l];
         const int E = g_.n_embd, rank = g_.kv_lora;
         const MlaArgs a = mla_args(H, swa ? g_.rope_base_swa : g_.rope_base);
-        quant(xn_, q8a_, E);
-        mm(T(l, "attn_q_a.weight"), q8a_, qa_, E, g_.q_lora);
-        bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, 1, g_.q_lora, g_.rms_eps, stream_);
-        quant(qan_, q8b_, g_.q_lora);
-        mm(T(l, "attn_q_b.weight"), q8b_, q_, g_.q_lora, H * g_.qk_dim);
-        mm(T(l, "attn_kv_a_mqa.weight"), q8a_, kvraw_, E, rank + g_.rope_dim);
-        q8_0_heads_gemv(T(l, "attn_k_b.weight")->ptr, q_, g_.qk_dim, H, rank, a.nope, qabs_, stream_);
-        const int64_t slot = swa ? pos % g_.window : pos;
+        gemm(T(l, "attn_q_a.weight"), xn_, qa_, E, g_.q_lora, R);
+        bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
+        gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
+        gemm(T(l, "attn_kv_a_mqa.weight"), xn_, kvraw_, E, rank + g_.rope_dim, R);
+        q8_0_heads_gemv(T(l, "attn_k_b.weight")->ptr, q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_, stream_);
         uint16_t* cache = cache_[(size_t) l];
-        mla_prepare(q_, qabs_, kvraw_, F(l, "attn_kv_a_norm.weight"), a, (int) pos, qcur_, cache + (size_t) slot * kRowWidth, stream_);
+        const int ring = swa ? swa_ring() : 0;
+        mla_prepare(q_, qabs_, kvraw_, F(l, "attn_kv_a_norm.weight"), a, (int) pos0, R, ring, qcur_, cache, stream_);
+        // the cells each row attends
+        int32_t* meta = meta_h_ + (size_t) l * 3 * kMaxRows;   // firsts, counts, fill
+        int32_t *firsts = meta, *counts = meta + kMaxRows, *fill = meta + 2 * kMaxRows;
+        bool selecting = false;
+        std::vector<int> pools_of(R, 0);
         if (swa) {
-            const int first = (int) std::max<int64_t>(0, pos + 1 - g_.window);
-            mla_attend(qcur_, cache, first, (int) (pos + 1 - first), F(l, "attn_sinks.weight"), a, olat_, stream_, nullptr, g_.window);
+            for (int t = 0; t < R; ++t) {
+                const int64_t pos = pos0 + t, first = std::max<int64_t>(0, pos + 1 - g_.window);
+                firsts[t] = (int32_t) first;
+                counts[t] = (int32_t) (pos + 1 - first);
+                fill[t] = 0;
+            }
         } else {
-            const int n = indexer(l, pos);
-            if (n < 0) mla_attend(qcur_, cache, 0, (int) pos + 1, F(l, "attn_sinks.weight"), a, olat_, stream_);
-            else mla_attend(qcur_, cache, 0, n, F(l, "attn_sinks.weight"), a, olat_, stream_, icells_);
+            const int keep = g_.idx_top_k / g_.idx_pool - (g_.idx_select_tail ? 1 : 0);
+            for (int t = 0; t < R; ++t) {
+                const int64_t pos = pos0 + t;
+                pools_of[(size_t) t] = (int) (pos / g_.idx_pool);   // complete groups before the row's own
+                firsts[t] = 0;
+                if (pools_of[(size_t) t] > keep) {
+                    selecting = true;
+                    counts[t] = keep * g_.idx_pool + (int32_t) (pos - (int64_t) pools_of[(size_t) t] * g_.idx_pool + 1);
+                    fill[t] = 0;
+                } else {
+                    counts[t] = (int32_t) (pos + 1);
+                    fill[t] = counts[t];
+                }
+            }
+            indexer(l, pos0, R, selecting, pools_of, err);
         }
-        q8_0_heads_gemv(T(l, "attn_v_b.weight")->ptr, olat_, rank, H, g_.v_dim, rank, vout_, stream_);
-        mm(T(l, "attn_gate.weight"), q8a_, gate_, E, H * g_.v_dim);
-        mul_sigmoid(gate_, vout_, H * g_.v_dim, stream_);
-        quant(vout_, q8c_, H * g_.v_dim);
-        mm(T(l, "attn_output.weight"), q8c_, attn_raw_, H * g_.v_dim, E);
-        bk::rms_norm_rows(attn_raw_, F(l, "post_attention_norm.weight"), attn_, 1, E, g_.rms_eps, stream_);
-        (void) err;
+        cudaMemcpyAsync(meta_d_, meta, (size_t) 3 * kMaxRows * 4, cudaMemcpyHostToDevice, stream_);
+        RowSpans rs;
+        rs.firsts = meta_d_;
+        rs.counts = meta_d_ + kMaxRows;
+        if (!swa) {
+            iota_cells(icells_, cells_stride_, meta_d_ + 2 * kMaxRows, R, stream_);
+            rs.cells = icells_;
+            rs.cells_stride = cells_stride_;
+        }
+        mla_attend(qcur_, cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
+        q8_0_heads_gemv(T(l, "attn_v_b.weight")->ptr, olat_, rank, H * rank, H, g_.v_dim, rank, R, vout_, stream_);
+        gemm(T(l, "attn_gate.weight"), xn_, gate_, E, H * g_.v_dim, R);
+        mul_sigmoid(gate_, vout_, R * H * g_.v_dim, stream_);
+        gemm(T(l, "attn_output.weight"), vout_, attn_raw_, H * g_.v_dim, E, R);
+        bk::rms_norm_rows(attn_raw_, F(l, "post_attention_norm.weight"), attn_, R, E, g_.rms_eps, stream_);
         return true;
     }
 
-    // The indexer's per-position rows and pooled keys of layer `l` for the token at `pos`; with more pools than it keeps, its
-    // selection: the cells in icells_ and their count, else -1 (every position is attended).
-    int indexer(int l, int64_t pos) {
+    // The indexer of sparse layer `l` for R rows at pos0..: the rows of the keys and the pooled keys of the groups they
+    // complete; for the rows with more pools than it keeps, its selection into icells_.
+    void indexer(int l, int64_t pos0, int R, bool selecting, const std::vector<int>& pools_of, std::string&) {
         const int D = g_.idx_dim, P = g_.idx_pool, E = g_.n_embd;
         IndexerArgs a;
         a.heads = g_.idx_heads;
@@ -266,87 +315,99 @@ private:
         a.pool = P;
         a.rope_base = g_.rope_base;
         a.eps = g_.rms_eps;
-        mm(T(l, "indexer.attn_k.weight"), q8a_, ik_, E, D);
-        bk::rms_norm_rows(ik_, F(l, "indexer.k_norm.weight"), ikn_, 1, D, g_.rms_eps, stream_);
-        quant(ikn_, q8d(), D);
-        float* vals = ival_[(size_t) l];
-        float* gates = igate_[(size_t) l];
-        mm(T(l, "indexer_compressor_value.weight"), q8d(), vals + (size_t) (pos % kRawRing) * D, D, D);
-        mm(T(l, "indexer_compressor_gate.weight"), q8d(), gates + (size_t) (pos % kRawRing) * D, D, D);
-        if ((pos + 1) % P == 0) {
-            const int64_t p0 = pos + 1 - P;
-            idx_pool(vals + (size_t) (p0 % kRawRing) * D, gates + (size_t) (p0 % kRawRing) * D, F(l, "indexer_compressor_ape.weight"),
-                     F(l, "indexer_compressor_norm.weight"), a, (int) p0, ipool_[(size_t) l] + (size_t) (pos / P) * D, stream_);
+        gemm(T(l, "indexer.attn_k.weight"), xn_, ik_, E, D, R);
+        bk::rms_norm_rows(ik_, F(l, "indexer.k_norm.weight"), ikn_, R, D, g_.rms_eps, stream_);
+        gemm(T(l, "indexer_compressor_value.weight"), ikn_, ivt_, D, D, R);
+        gemm(T(l, "indexer_compressor_gate.weight"), ikn_, igt_, D, D, R);
+        // into the ring of the last positions, at cell pos % kRawRing (one wrap at most)
+        const int64_t s0 = pos0 % kRawRing;
+        const int n1 = (int) std::min<int64_t>(R, kRawRing - s0);
+        for (auto [src, dst] : {std::pair<const float*, float*>{ivt_, ival_[(size_t) l]}, {igt_, igate_[(size_t) l]}}) {
+            cudaMemcpyAsync(dst + (size_t) s0 * D, src, (size_t) n1 * D * 4, cudaMemcpyDeviceToDevice, stream_);
+            if (n1 < R) cudaMemcpyAsync(dst, src + (size_t) n1 * D, (size_t) (R - n1) * D * 4, cudaMemcpyDeviceToDevice, stream_);
         }
+        // the groups whose last position is among the rows
+        const int64_t last = pos0 + R - 1;
+        const int64_t g0 = pos0 >= 3 ? (pos0 - 3 + P - 1) / P : 0, g1 = last >= 3 ? (last - 3) / P : -1;
+        if (g1 >= g0) idx_pool(ival_[(size_t) l], igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
+                               a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), ipool_[(size_t) l], stream_);
+        if (!selecting) return;
         const int keep = g_.idx_top_k / P - (g_.idx_select_tail ? 1 : 0);
-        const int pools = (int) (pos / P);   // complete groups before the token's own
-        if (pools <= keep) return -1;
-        mm(T(l, "indexer.attn_q_b.weight"), q8b_, iq_, g_.q_lora, a.heads * D);
-        idx_rope_heads(iq_, a, (int) pos, stream_);
-        f32_gemv(xn_, F(l, "indexer.proj.weight"), a.heads, E, 1.0f / std::sqrt((float) (D * a.heads)), iw_, stream_);
-        idx_scores(iq_, iw_, ipool_[(size_t) l], pools, a, iscore_, stream_);
-        const int tail0 = pools * P, tail_n = (int) (pos - tail0 + 1);
-        idx_select(iscore_, pools, keep, P, tail0, tail_n, icells_, stream_);
-        return keep * P + tail_n;
+        gemm(T(l, "indexer.attn_q_b.weight"), qan_, iq_, g_.q_lora, a.heads * D, R);
+        idx_rope_heads(iq_, a, (int) pos0, R, stream_);
+        f32_gemm_rows(xn_, F(l, "indexer.proj.weight"), a.heads, E, 1.0f / std::sqrt((float) (D * a.heads)), R, iw_, stream_);
+        for (int t = 0; t < R; ++t) {
+            const int pools = pools_of[(size_t) t];
+            if (pools <= keep) continue;
+            const int64_t pos = pos0 + t;
+            const int tail0 = pools * P, tail_n = (int) (pos - tail0 + 1);
+            idx_scores(iq_ + (size_t) t * a.heads * D, iw_ + (size_t) t * a.heads, ipool_[(size_t) l], pools, a, iscore_, stream_);
+            idx_select(iscore_, pools, keep, P, tail0, tail_n, icells_ + (size_t) t * cells_stride_, stream_);
+        }
     }
 
-    void* q8d() { return q8c_; }   // the indexer's rows are small: the output projection's scratch is free until it runs
-
-    // The Engram step of layer `l` on the streams.
-    bool engram(int l, int64_t pos, int32_t token, std::string& err) {
+    // The Engram step of layer `l` on the streams of R rows.
+    bool engram(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err) {
         const EngramInfo& en = m_.pack().engram;
         int e = -1;
         for (size_t k = 0; k < en.layers.size(); ++k)
             if (en.layers[k] == l) e = (int) k;
         if (e < 0) return true;
         const int n_cols = en.n_cols(), W = en.row_values;
-        uint32_t ids[16];
-        float valid = 1.f;
-        const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
-        engram_ids(en, e, token, p1, p2, pos, false, ids, valid);
-        uint8_t raw[16 * 96];
+        std::vector<uint32_t> ids((size_t) R * n_cols);
+        for (int t = 0; t < R; ++t) {
+            const int64_t pos = pos0 + t;
+            const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
+            float valid = 1.f;
+            engram_ids(en, e, tokens[t], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, valid);
+            h_evalid_[t] = valid;
+        }
+        std::vector<uint8_t> raw((size_t) R * n_cols * W);
         ngram::PleReader& rd = m_.engram_reader();
-        const ngram::PleReader::Ticket t = rd.issue(ids, (size_t) n_cols, raw);
-        if (!rd.collect(t, err)) return false;
-        const float* lookup = (const float*) m_.tensor(l, "engram_lookup_norm.weight")->ptr;
-        if (lookup_host_.empty()) lookup_host_.resize((size_t) n_cols * W * (en.layers.size()));
+        const ngram::PleReader::Ticket tk = rd.issue(ids.data(), ids.size(), raw.data());
+        if (!rd.collect(tk, err)) return false;
+        if (lookup_host_.empty()) lookup_host_.resize((size_t) n_cols * W * en.layers.size());
         float* nrm = lookup_host_.data() + (size_t) e * n_cols * W;
+        if (lookup_loaded_.empty()) lookup_loaded_.assign(en.layers.size(), false);
         if (!lookup_loaded_[(size_t) e]) {
-            cudaMemcpy(nrm, lookup, (size_t) n_cols * W * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(nrm, T(l, "engram_lookup_norm.weight")->ptr, (size_t) n_cols * W * 4, cudaMemcpyDeviceToHost);
             lookup_loaded_[(size_t) e] = true;
         }
-        for (int c = 0; c < n_cols; ++c) {
-            float ss = 0.f;
-            float* row = h_erows_ + (size_t) c * W;
-            for (int d = 0; d < W; ++d) {
-                row[d] = e4m3_to_f32(raw[(size_t) c * W + d]);
-                ss += row[d] * row[d];
+        for (int t = 0; t < R; ++t) {
+            const float valid = h_evalid_[t];
+            for (int c = 0; c < n_cols; ++c) {
+                float* row = h_erows_ + ((size_t) t * n_cols + c) * W;
+                const uint8_t* src = raw.data() + ((size_t) t * n_cols + c) * W;
+                float ss = 0.f;
+                for (int d = 0; d < W; ++d) {
+                    row[d] = e4m3_to_f32(src[d]);
+                    ss += row[d] * row[d];
+                }
+                const float r = 1.0f / std::sqrt(ss / (float) W + 1.1920929e-07f);
+                for (int d = 0; d < W; ++d) row[d] = row[d] * r * nrm[(size_t) c * W + d] * valid;
             }
-            const float r = 1.0f / std::sqrt(ss / (float) W + 1.1920929e-07f);
-            for (int d = 0; d < W; ++d) row[d] = row[d] * r * nrm[(size_t) c * W + d] * valid;
         }
-        cudaMemcpyAsync(erows_, h_erows_, (size_t) n_cols * W * 4, cudaMemcpyHostToDevice, stream_);
-        quant(erows_, q8a_, n_cols * W);
-        mm(T(l, "engram_kv.weight"), q8a_, ekv_, n_cols * W, 5 * g_.n_embd);
+        cudaMemcpyAsync(erows_, h_erows_, (size_t) R * n_cols * W * 4, cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(evalid_, h_evalid_, (size_t) R * 4, cudaMemcpyHostToDevice, stream_);
+        gemm(T(l, "engram_kv.weight"), erows_, ekv_, n_cols * W, 5 * g_.n_embd, R);
         EngramArgs a;
         a.n_embd = g_.n_embd;
         engram_apply(ekv_, F(l, "engram_kv_b.weight"), F(l, "engram_gate.weight"), F(l, "engram_pre_gamma.weight"),
-                     F(l, "engram_hc_scale.weight"), valid, a, X_, stream_);
+                     F(l, "engram_hc_scale.weight"), evalid_, R, a, X_, stream_);
         return true;
     }
 
-    bool ffn(int l, std::string& err) {
+    bool ffn(int l, int R, std::string& err) {
         const int E = g_.n_embd;
-        quant(xn_, q8a_, E);
         if (l < g_.n_dense) {
-            mm(T(l, "ffn_gate.weight"), q8a_, gu_, E, g_.n_ff);
-            mm(T(l, "ffn_up.weight"), q8a_, gu_ + g_.n_ff, E, g_.n_ff);
-            bk::swiglu_scaled(gu_, gu_ + g_.n_ff, nullptr, nullptr, h_, 1, g_.n_ff, 0, stream_);
-            quant(h_, q8b_, g_.n_ff);
-            mm(T(l, "ffn_down.weight"), q8b_, mlp_, g_.n_ff, E);
+            float *gate = gu_, *up = gu_ + (size_t) R * g_.n_ff;
+            gemm(T(l, "ffn_gate.weight"), xn_, gate, E, g_.n_ff, R);
+            gemm(T(l, "ffn_up.weight"), xn_, up, E, g_.n_ff, R);
+            bk::swiglu_scaled(gate, up, nullptr, nullptr, h_, R, g_.n_ff, g_.n_ff, stream_);
+            gemm(T(l, "ffn_down.weight"), h_, mlp_, g_.n_ff, E, R);
             return true;
         }
-        return moe(l, err);
+        return moe(l, R, err);
     }
 
     // The expert tier, opened by the first session while the model starts and shared by the rest: the sessions run one at a
@@ -356,8 +417,8 @@ private:
         Hy4Model::SharedTier& shared = m_.shared_tier();
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
         if (!shared.tier) {
-            if (cudaHostAlloc((void**) &shared.h_x, (size_t) g_.n_latent * 4, kMapped) != cudaSuccess ||
-                cudaHostAlloc((void**) &shared.h_rows, (size_t) 16 * g_.n_latent * 4, kMapped) != cudaSuccess) {
+            if (cudaHostAlloc((void**) &shared.h_x, (size_t) kMaxWindow * g_.n_latent * 4, kMapped) != cudaSuccess ||
+                cudaHostAlloc((void**) &shared.h_rows, (size_t) kLookupK * g_.n_latent * 4, kMapped) != cudaSuccess) {
                 err = "cannot allocate the pinned expert staging";
                 return false;
             }
@@ -385,9 +446,10 @@ private:
         return true;
     }
 
-    // The latent MoE of a layer over its normed input: the router, routed_down, the experts the tier places (the
-    // card's slots and the second cards' on the GPUs, the rest on the CPU) beside the shared expert, routed_up.
-    bool moe(int l, std::string& err) {
+    // The latent MoE of a layer over its R normed rows: the router and routed_down and the shared expert for all rows, the
+    // routed experts in groups of up to 8 rows (the tier places them: the card's slots and the second cards' on the GPUs, the rest
+    // on the CPU), then routed_up.
+    bool moe(int l, int R, std::string& err) {
         const int E = g_.n_embd, K = g_.n_used, L = g_.n_latent;
         const int tl = l - g_.n_dense;   // the tier's layer
         const ExpertLayer& el = m_.pack().experts[(size_t) l];
@@ -403,156 +465,185 @@ private:
         ra.k = K;
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
-        bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), 1, ra, rlog_, ids_, rw_, st);
-        mm(T(l, "ffn_routed_down.weight"), q8a_, xlat_, E, L);
-        bk::native_quantize_q8_1(xlat_, ex_xq_, L, 1, st);
-        cudaMemcpyAsync(h_x_, xlat_, (size_t) L * 4, cudaMemcpyDeviceToHost, st);
-        cudaMemcpyAsync(h_ids_, ids_, (size_t) K * 4, cudaMemcpyDeviceToHost, st);
-        cudaMemcpyAsync(h_rw_, rw_, (size_t) K * 4, cudaMemcpyDeviceToHost, st);
-        cudaEventRecord(ev_, st);
+        bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, st);
+        gemm(T(l, "ffn_routed_down.weight"), xn_, xlat_, E, L, R);
         // the shared expert on the card while the experts run elsewhere
-        mm(T(l, "ffn_gate_shexp.weight"), q8a_, gu_, E, g_.n_ff_exp);
-        mm(T(l, "ffn_up_shexp.weight"), q8a_, gu_ + g_.n_ff_exp, E, g_.n_ff_exp);
-        bk::swiglu_scaled(gu_, gu_ + g_.n_ff_exp, nullptr, nullptr, h_, 1, g_.n_ff_exp, 0, st);
-        quant(h_, q8b_, g_.n_ff_exp);
-        mm(T(l, "ffn_down_shexp.weight"), q8b_, sh_, g_.n_ff_exp, E);
+        float *sg = gu_, *su = gu_ + (size_t) R * g_.n_ff_exp;
+        gemm(T(l, "ffn_gate_shexp.weight"), xn_, sg, E, g_.n_ff_exp, R);
+        gemm(T(l, "ffn_up_shexp.weight"), xn_, su, E, g_.n_ff_exp, R);
+        bk::swiglu_scaled(sg, su, nullptr, nullptr, h_, R, g_.n_ff_exp, g_.n_ff_exp, st);
+        gemm(T(l, "ffn_down_shexp.weight"), h_, sh_, g_.n_ff_exp, E, R);
+        for (int g0 = 0; g0 < R; g0 += kMaxWindow)
+            if (!moe_group(l, tl, lay, g0, std::min(kMaxWindow, R - g0), err)) return false;
+        gemm(T(l, "ffn_routed_up.weight"), lat_out_, moe_out_, L, E, R);
+        add_vectors(moe_out_, sh_, mlp_, R * E, st);
+        return true;
+    }
+
+    // The routed experts of rows g0..g0+G of a layer: the tier is asked once per distinct expert of the group; each card runs
+    // what it holds over every row that routed to it, the CPU does the same for the rest.
+    bool moe_group(int l, int tl, const kernels::NativeExpertLayout& lay, int g0, int G, std::string& err) {
+        const int K = g_.n_used, L = g_.n_latent;
+        cudaStream_t st = stream_;
+        cudaMemcpyAsync(h_x_, xlat_ + (size_t) g0 * L, (size_t) G * L * 4, cudaMemcpyDeviceToHost, st);
+        cudaMemcpyAsync(h_ids_, ids_ + (size_t) g0 * K, (size_t) G * K * 4, cudaMemcpyDeviceToHost, st);
+        cudaMemcpyAsync(h_rw_, rw_ + (size_t) g0 * K, (size_t) G * K * 4, cudaMemcpyDeviceToHost, st);
+        bk::native_quantize_q8_1(xlat_ + (size_t) g0 * L, ex_xq_, L, G, st);
+        cudaEventRecord(ev_, st);
         core::PeerExperts* peer = tier_->peer_for(tl);
-        if (peer) {
-            kernels::NativeExpertLayout limited = lay;
-            limited.swiglu_limit = g_.clamp_exp[(size_t) l];
-            if (!peer->arm(limited, h_x_, 1, K, core::policy::peer_groups(1), err)) return false;
-        }
-        tier_->pump(tl, 3);
+        tier_->pump(tl, 2 + G);
         if (cudaEventSynchronize(ev_) != cudaSuccess) {
             err = "the router's ids did not arrive";
             return false;
         }
-        for (int i = 0; i < K; ++i)
-            if (h_ids_[i] < 0 || h_ids_[i] >= g_.n_expert) {
-                err = "the router picked expert " + std::to_string(h_ids_[i]);
-                return false;
+        if (peer) {
+            kernels::NativeExpertLayout limited = lay;
+            limited.swiglu_limit = g_.clamp_exp[(size_t) l];
+            if (!peer->arm(limited, h_x_, G, K, core::policy::peer_groups(G), err)) return false;
+        }
+        int32_t uniq[kLookupK];
+        int uidx[kLookupK], nu = 0;
+        core::ExpertTier::Use use[kLookupK];
+        for (int t = 0; t < G; ++t)
+            for (int k = 0; k < K; ++k) {
+                const int32_t e = h_ids_[t * K + k];
+                if (e < 0 || e >= g_.n_expert) {
+                    err = "the router picked expert " + std::to_string(e);
+                    return false;
+                }
+                int u = 0;
+                while (u < nu && uniq[u] != e) ++u;
+                if (u == nu) {
+                    uniq[nu++] = e;
+                    use[u] = core::ExpertTier::Use{};
+                }
+                core::ExpertTier::Use& us = use[u];
+                us.tok[us.nt] = t;
+                us.row[us.nt] = t * K + k;
+                ++us.nt;
+                uidx[t * K + k] = u;
             }
         core::ExpertTier::Lookup lk;
-        if (!tier_->lookup(tl, h_ids_, K, lk, err)) return false;
+        if (!tier_->lookup(tl, uniq, nu, lk, err)) return false;
         const int n_fetched = tier_->fetch(tl, lk);
         if (peer) {
-            int32_t kind[core::ExpertTier::kMaxK] = {};
-            for (int k = 0; k < K; ++k) kind[k] = !lk.peer[k] ? 0 : lk.fetched[k] ? 3 : 2;
-            if (!peer->raise(tl, lk.experts, kind, err)) return false;
+            int32_t kind[kLookupK] = {};
+            for (int r = 0; r < G * K; ++r) kind[r] = !lk.peer[uidx[r]] ? 0 : lk.fetched[uidx[r]] ? 3 : 2;
+            if (!peer->raise(tl, h_ids_, kind, err)) return false;
         }
         bool cpu = false, reading = false;
-        for (int k = 0; k < K; ++k) {
-            cpu = cpu || (!lk.dev[k] && !lk.peer[k] && !lk.reading[k]);
-            reading = reading || lk.reading[k];
+        for (int i = 0; i < nu; ++i) {
+            cpu = cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i]);
+            reading = reading || lk.reading[i];
         }
-        if (cpu) tier_->start_cpu(tl, h_x_, lk, h_rows_);
-        // the card's share: the experts its slots hold, one group each, writing the row of their router index; the fetched
-        // ones in a second plan, once their copies landed
-        const auto launch = [&](bool fetched, int count) {
-            ExpertPlan* p = h_plan_;
-            int m = 0;
-            for (int k = 0; k < K; ++k) {
-                if (!lk.dev[k] || lk.fetched[k] != fetched) continue;
-                p->ptr[m] = (unsigned long long) lk.dev[k];
-                p->start[m] = m;
-                p->dst[m] = k;
-                p->tok[m] = 0;
-                ++m;
+        if (cpu) tier_->start_cpu_window(tl, h_x_, lk, use, h_rows_);
+        const auto launch = [&](bool fetched) {
+            WindowPlan* p = h_plan_;
+            int ng = 0, ne = 0;
+            for (int i = 0; i < nu; ++i) {
+                if (!lk.dev[i] || lk.fetched[i] != fetched) continue;
+                p->ptr[ng] = (unsigned long long) lk.dev[i];
+                p->start[ng] = ne;
+                for (int j = 0; j < use[i].nt; ++j) {
+                    p->dst[ne] = use[i].row[j];
+                    p->tok[ne] = use[i].tok[j];
+                    ++ne;
+                }
+                ++ng;
             }
-            p->start[m] = m;
-            p->ng[0] = m;
-            cudaMemcpyAsync(ex_plan_, p, sizeof(ExpertPlan), cudaMemcpyHostToDevice, st);
-            ExpertPlan* dp = (ExpertPlan*) ex_plan_;
-            kernels::native_expert_grouped_clamped(lay, g_.clamp_exp[(size_t) l], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, m, m,
+            p->start[ng] = ne;
+            p->ng[0] = ng;
+            if (!ng) return;
+            cudaMemcpyAsync(ex_plan_, p, sizeof(WindowPlan), cudaMemcpyHostToDevice, st);
+            WindowPlan* dp = (WindowPlan*) ex_plan_;
+            kernels::native_expert_grouped_clamped(lay, g_.clamp_exp[(size_t) l], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, ng, ne,
                                                    ex_xq_, ex_scr_, ex_rows_, st);
             cudaStreamSynchronize(st);   // the plan buffer is reused by the next launch
-            (void) count;
         };
-        int nhits = 0;
-        for (int k = 0; k < K; ++k) nhits += lk.dev[k] && !lk.fetched[k];
-        if (nhits) launch(false, nhits);
+        launch(false);
         if (n_fetched) {
             tier_->await_fetch(st);
-            launch(true, n_fetched);
+            launch(true);
         }
         if (peer && !peer->run_fetched(err)) return false;
         if (cpu) tier_->finish_cpu();
         if (reading) {
             if (!tier_->await_reads(err)) return false;
-            tier_->start_cpu(tl, h_x_, lk, h_rows_, /*reading=*/true);
+            tier_->start_cpu_window(tl, h_x_, lk, use, h_rows_, /*reading=*/true);
             tier_->finish_cpu();
         }
         if (peer && !peer->finish(nullptr, err)) return false;
-        RowPtrs rp{};
-        for (int k = 0; k < K; ++k) rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * L : d_rows_ + (size_t) k * L;
-        weighted_sum_rows(rp, rw_, K, L, lat_out_, st);
+        for (int r = 0; r < G * K; ++r) h_rowptr_[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * L : d_rows_ + (size_t) r * L;
+        cudaMemcpyAsync(rowptr_d_, h_rowptr_, (size_t) G * K * sizeof(void*), cudaMemcpyHostToDevice, st);
+        weighted_sum_window(rowptr_d_, rw_ + (size_t) g0 * K, G, K, L, lat_out_ + (size_t) g0 * L, st);
         if (cpu || reading) tier_->promote(tl, lk);
         tier_->mark_gap(st);
-        quant(lat_out_, q8c_, L);
-        mm(T(l, "ffn_routed_up.weight"), q8c_, moe_out_, L, E);
-        add_vectors(moe_out_, sh_, mlp_, E, st);
+        cudaStreamSynchronize(st);   // the row pointer table and the staged rows are reused by the next group
         return true;
     }
 
-    bool forward(int32_t token, int64_t pos, bool logits, std::string& err) {
-        if (pos >= m_.context()) {
-            err = "position " + std::to_string(pos) + " is past the context of " + std::to_string(m_.context());
+    // R rows at pos0..: the whole forward; the logits of the last `head_rows` rows go to logits_.
+    bool run_rows(const int32_t* tokens, int R, int64_t pos0, int head_rows, std::string& err) {
+        if (pos0 + R > m_.context()) {
+            err = "position " + std::to_string(pos0 + R - 1) + " is past the context of " + std::to_string(m_.context());
             return false;
         }
-        if (token < 0 || token >= g_.n_vocab) {
-            err = "token " + std::to_string(token) + " is out of the vocabulary";
+        for (int t = 0; t < R; ++t)
+            if (tokens[t] < 0 || tokens[t] >= g_.n_vocab) {
+                err = "token " + std::to_string(tokens[t]) + " is out of the vocabulary";
+                return false;
+            }
+        if (pos0 > (int64_t) hist_.size()) {
+            err = "position " + std::to_string(pos0) + " does not follow the state's " + std::to_string(hist_.size());
             return false;
         }
-        if (pos > (int64_t) hist_.size()) {
-            err = "position " + std::to_string(pos) + " does not follow the state's " + std::to_string(hist_.size());
-            return false;
-        }
-        hist_.resize((size_t) pos);   // a position before the end drops the rows after it
-        if (!ensure_positions(pos + 1, err)) return false;
-        if (tier_) tier_->begin_token(1);
-        hist_.push_back(token);
-        if (lookup_loaded_.empty()) lookup_loaded_.assign(m_.pack().engram.layers.size(), false);
+        hist_.resize((size_t) pos0);   // a position before the end drops the rows after it
+        hist_.insert(hist_.end(), tokens, tokens + R);
+        if (!ensure_positions(pos0 + R, err)) return false;
+        if (tier_) tier_->begin_token(std::min(R, kMaxWindow));
         const int E = g_.n_embd;
         bk::HcPlainArgs hc;
         hc.n_embd = E;
         hc.rms_eps = g_.rms_eps;
         hc.hc_eps = g_.hc_eps;
         hc.magnitude = g_.hc_magnitude;
-        if (!m_.embedding_row(token, h_e_)) {
-            err = "no embedding row";
-            return false;
-        }
-        cudaMemcpyAsync(e_, h_e_, (size_t) E * 4, cudaMemcpyHostToDevice, stream_);
-        fill_streams(e_, E, X_, stream_);
-        for (int l = 0; l < g_.n_layers; ++l) {
-            if (!engram(l, pos, token, err)) return false;
-            bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), 1, 8, hc, hcws_, coef_, stream_);
-            bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), 1, E, g_.rms_eps, cur_, xn_, stream_);
-            if (!attention(l, pos, err)) return false;
-            bk::hc_post(attn_, X_, coef_, bk::kHcCoef, 1, E, Xn_, stream_);
-            std::swap(X_, Xn_);
-            bk::hc_mixes_plain(X_, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), 1, 8, hc, hcws_, coef_, stream_);
-            bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), 1, E, g_.rms_eps, cur_, xn_, stream_);
-            if (!ffn(l, err)) return false;
-            bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, 1, E, g_.rms_eps, stream_);
-            bk::hc_post(mlp2_, X_, coef_, bk::kHcCoef, 1, E, Xn_, stream_);
-            std::swap(X_, Xn_);
-            if (!m_.diag_dump().empty()) dump("l_out-" + std::to_string(l), X_, 4 * E);
-        }
-        if (logits) {
-            bk::hc_mixes_plain(X_, (const float*) m_.tensor("output_hc_fn.weight")->ptr, (const float*) m_.tensor("output_hc_scale.weight")->ptr,
-                               (const float*) m_.tensor("output_hc_base.weight")->ptr, 1, 4, hc, hcws_, coef_, stream_);
-            bk::hc_pre(X_, coef_, bk::hc_plain_coef_stride(4), 1, E, cur_, stream_);
-            bk::rms_norm_rows(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, fin_, 1, E, g_.rms_eps, stream_);
-            const DevTensor* head = m_.tensor("output.weight");
-            bk::bf16_gemv_fp32_mmvf(fin_, (const uint16_t*) head->ptr, logits_, E, g_.n_vocab, stream_);
-            if (!m_.diag_dump().empty()) {
-                dump("result_norm", fin_, E);
-                dump("result_output", logits_, g_.n_vocab);
+        for (int t = 0; t < R; ++t)
+            if (!m_.embedding_row(tokens[t], h_e_ + (size_t) t * E)) {
+                err = "no embedding row";
+                return false;
             }
-            last_row_ = 0;
+        cudaMemcpyAsync(e_, h_e_, (size_t) R * E * 4, cudaMemcpyHostToDevice, stream_);
+        fill_streams(e_, E, R, X_, stream_);
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (!engram(l, pos0, R, tokens, err)) return false;
+            bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
+            bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+            if (!attention(l, pos0, R, err)) return false;
+            bk::hc_post(attn_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
+            std::swap(X_, Xn_);
+            bk::hc_mixes_plain(X_, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
+            bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+            if (!ffn(l, R, err)) return false;
+            bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, R, E, g_.rms_eps, stream_);
+            bk::hc_post(mlp2_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
+            std::swap(X_, Xn_);
+            if (!m_.diag_dump().empty()) dump("l_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
         }
         if (tier_) tier_->pump(-1, core::ExpertTier::kAllPieces);
+        if (head_rows > 0) {
+            const float* x = X_ + (size_t) (R - head_rows) * 4 * E;
+            bk::hc_mixes_plain(x, (const float*) m_.tensor("output_hc_fn.weight")->ptr, (const float*) m_.tensor("output_hc_scale.weight")->ptr,
+                               (const float*) m_.tensor("output_hc_base.weight")->ptr, head_rows, 4, hc, hcws_, coef_, stream_);
+            bk::hc_pre(x, coef_, bk::hc_plain_coef_stride(4), head_rows, E, cur_, stream_);
+            bk::rms_norm_rows(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, fin_, head_rows, E, g_.rms_eps, stream_);
+            const DevTensor* head = m_.tensor("output.weight");
+            bk::bf16_gemv_fp32_mmvf_multi(fin_, E, (const uint16_t*) head->ptr, logits_, g_.n_vocab, E, g_.n_vocab, head_rows, stream_);
+            if (!m_.diag_dump().empty()) {
+                dump("result_norm", fin_, (int64_t) head_rows * E);
+                dump("result_output", logits_, (int64_t) head_rows * g_.n_vocab);
+            }
+            last_rows_ = head_rows;
+        }
         const cudaError_t ce = cudaGetLastError();
         if (ce != cudaSuccess) {
             err = std::string("CUDA: ") + cudaGetErrorString(ce);
@@ -577,7 +668,7 @@ private:
         return true;
     }
 
-    // diagnostic: a tensor of this position appended to <dir>/<name>.f32
+    // diagnostic: a tensor of this call appended to <dir>/<name>.f32
     void dump(const std::string& name, const float* d, int64_t n) {
         std::vector<float> h((size_t) n);
         cudaMemcpyAsync(h.data(), d, (size_t) n * 4, cudaMemcpyDeviceToHost, stream_);
@@ -592,14 +683,16 @@ private:
         std::fclose(f);
     }
 
-    bool pick(const model::DecodeRequest& r, int row, int32_t& tok, std::string& err) {
+    // The picks of the last `rows` rows of logits_ (row t of the window is draw counter + t0 + t).
+    bool pick(const model::DecodeRequest& r, int t0, int rows, std::string& err) {
         bk::SamplerParams sp;
         if (r.sampling) sp = *r.sampling;
         else sp.greedy = true;
         if (!r.sampling) sp.temperature = 0.f;
-        sp.counter += (uint64_t) row;
-        bk::sample_tokens(logits_, 1, (int) g_.n_vocab, nullptr, 0, sp, pick_, stream_);
-        if (cudaMemcpyAsync(&tok, pick_, 4, cudaMemcpyDeviceToHost, stream_) != cudaSuccess || cudaStreamSynchronize(stream_) != cudaSuccess) {
+        sp.counter += (uint64_t) (t0 + (r.row_tokens ? 0 : 0));
+        bk::sample_tokens(logits_, rows, (int) g_.n_vocab, nullptr, 0, sp, pick_, stream_);
+        picks_.assign((size_t) rows, 0);
+        if (cudaMemcpyAsync(picks_.data(), pick_, (size_t) rows * 4, cudaMemcpyDeviceToHost, stream_) != cudaSuccess || cudaStreamSynchronize(stream_) != cudaSuccess) {
             err = "the pick failed";
             return false;
         }
@@ -614,18 +707,20 @@ private:
     float *X_ = nullptr, *Xn_ = nullptr, *coef_ = nullptr, *hcws_ = nullptr;
     float *e_ = nullptr, *cur_ = nullptr, *xn_ = nullptr, *attn_ = nullptr, *attn_raw_ = nullptr, *mlp_ = nullptr, *mlp2_ = nullptr, *fin_ = nullptr;
     float *qa_ = nullptr, *qan_ = nullptr, *q_ = nullptr, *kvraw_ = nullptr, *qabs_ = nullptr, *qcur_ = nullptr, *olat_ = nullptr, *vout_ = nullptr, *gate_ = nullptr;
-    float *ik_ = nullptr, *ikn_ = nullptr, *iq_ = nullptr, *iw_ = nullptr, *iscore_ = nullptr;
-    int32_t* icells_ = nullptr;
+    float *ik_ = nullptr, *ikn_ = nullptr, *ivt_ = nullptr, *igt_ = nullptr, *iq_ = nullptr, *iw_ = nullptr, *iscore_ = nullptr;
+    int32_t *icells_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
+    int cells_stride_ = 0;
     float *gu_ = nullptr, *h_ = nullptr, *rlog_ = nullptr, *rw_ = nullptr;
     int32_t* ids_ = nullptr;
-    float *xlat_ = nullptr, *lat_out_ = nullptr, *moe_out_ = nullptr, *sh_ = nullptr, *logits_ = nullptr, *lp_ = nullptr, *erows_ = nullptr, *ekv_ = nullptr;
+    float *xlat_ = nullptr, *lat_out_ = nullptr, *moe_out_ = nullptr, *sh_ = nullptr, *logits_ = nullptr, *lp_ = nullptr, *erows_ = nullptr, *ekv_ = nullptr, *evalid_ = nullptr;
     int32_t* pick_ = nullptr;
-    void *q8a_ = nullptr, *q8b_ = nullptr, *q8c_ = nullptr;
-    float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_rw_ = nullptr, *h_erows_ = nullptr, *h_e_ = nullptr;
-    int32_t* h_ids_ = nullptr;
-    void *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr;
+    void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr;
     float* ex_rows_ = nullptr;
-    ExpertPlan* h_plan_ = nullptr;
+    const float** rowptr_d_ = nullptr;
+    const float** h_rowptr_ = nullptr;
+    float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_rw_ = nullptr, *h_erows_ = nullptr, *h_e_ = nullptr, *h_evalid_ = nullptr;
+    int32_t* h_ids_ = nullptr;
+    WindowPlan* h_plan_ = nullptr;
     std::shared_ptr<core::ExpertTier> tier_;
     std::vector<float> lookup_host_;
     std::vector<bool> lookup_loaded_;
@@ -633,8 +728,8 @@ private:
     std::vector<float*> ival_, igate_, ipool_;
     std::vector<std::unique_ptr<core::ElasticArray>> ea_, pea_;
     int64_t backed_ = 0;   // positions the sparse layers' caches are backed for
-    std::vector<int32_t> hist_;
-    int last_row_ = -1;
+    std::vector<int32_t> hist_, picks_;
+    int last_rows_ = 0;
 };
 
 }  // namespace
