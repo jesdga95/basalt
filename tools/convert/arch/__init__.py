@@ -22,6 +22,8 @@ class Arch:
     # only the vision projector section (vision/mmproj), written when --mmproj is given
     mmproj_only = False
     projector_type = ""
+    # needs the model's Hugging Face directory (--hf-dir) for its license text and config.json
+    needs_hf_dir = False
     # takes a DSpark drafter GGUF (--dspark) as the dspark/gguf section
     dspark_ok = False
     # the model's sampling defaults, for a GGUF that does not carry them (llama.cpp's general.sampling.* keys)
@@ -33,6 +35,14 @@ class Arch:
     def native(self, name: str, type_name: str) -> bool:
         """A quantized tensor the engine reads from the source bytes as they are."""
         return self.form_of(name) is None
+
+    def mtp_layers(self, kv: dict) -> list[int]:
+        """Layers of the source that are the drafter's: written to mtp/* sections instead of the main ones."""
+        return []
+
+    def hf_meta(self, hf_dir) -> dict:
+        """Meta keys read from the Hugging Face directory (--hf-dir): the license text and the config."""
+        return {}
 
     def license(self, kv: dict) -> dict:
         raise NotImplementedError
@@ -58,5 +68,5 @@ def register(arch: Arch, *names: str) -> None:
 
 def for_architecture(name) -> Arch:
     """The rules for `general.architecture`; an architecture without its own entry is converted as Flash-Next."""
-    from . import qwen4exp, deepseek41  # noqa: F401  (register themselves)
+    from . import qwen4exp, deepseek41, hy4flash  # noqa: F401  (register themselves)
     return REGISTRY.get(name) or REGISTRY["qwen4exp"]

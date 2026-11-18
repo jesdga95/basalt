@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import pathlib
 import re
 import struct
@@ -203,7 +204,8 @@ class Dense:
     """The `dense` section: `plan` validates every tensor first, `chunks` streams the pool and fills `rows` and `records`,
         `index_text` is the `dense.index`."""
 
-    def __init__(self, model: SourceModel, compat_bf16: bool = False, arch=QWEN):
+    def __init__(self, model: SourceModel, compat_bf16: bool = False, arch=QWEN, only=None):
+        """`only`: a predicate on tensor names; the tensors it rejects are not in this pool."""
         self.model = model
         self.arch = arch
         self.compat_bf16 = compat_bf16
@@ -213,13 +215,12 @@ class Dense:
         self.pool_bytes = 0
         problems = []
         for name, (g, t, p) in model.where.items():
-            if is_expert(name) or name in arch.not_in_dense:
+            if is_expert(name) or name in arch.not_in_dense or (only is not None and not only(name)):
                 continue
-            if len(t.shape) > 2:
-                raise ConvertError(f"tensor {name} has {len(t.shape)} dimensions; the index holds two")
             form = arch.form_of(name)
             # quantized tensors are served from the source unless the pool needs them dequantized (--compat-bf16)
             native = t.type_name not in FLOAT and arch.native(name, t.type_name)
+            # a row gives the first dimension and the rest flattened; meta.tensors has a served tensor's own shape
             if t.type_name not in FLOAT and not native and not compat_bf16:
                 problems.append(f"{name} is {t.type_name}, but the engine requires {form}; use --compat-bf16")
             self.todo.append((name, t, p, native))
@@ -231,7 +232,7 @@ class Dense:
         at = 0
         for name, t, p, native in self.todo:
             ne0 = int(t.shape[0])
-            ne1 = int(t.shape[1]) if len(t.shape) > 1 else 0
+            ne1 = math.prod(int(d) for d in t.shape[1:]) if len(t.shape) > 1 else 0
             if native:
                 self.rows.append([name, "0", "0", "0", "0", "0", "0", str(ne0), str(ne1), "8", "0", "32"] + ["0"] * 7)
                 continue
@@ -269,20 +270,25 @@ class Dense:
 class Experts:
     """The `experts` section and its `experts.layout`; each role is resolved by name in the shard that holds it."""
 
-    def __init__(self, model: SourceModel):
+    def __init__(self, model: SourceModel, layers=None):
+        """`layers`: the layer ids that hold routed experts (default 0 .. the last layer with expert tensors); the
+            layout lists exactly these, by layer id."""
         T = {n: w[1] for n, w in model.where.items()}
         exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
         if not exps:
             raise ConvertError("the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)")
         self.model = model
-        self.n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
+        self.layers = list(layers) if layers is not None else list(range(1 + max(int(n.split(".")[1]) for n in exps)))
+        if not self.layers:
+            raise ConvertError("no layer holds routed experts")
+        self.n_layers = len(self.layers)
         # router rows = experts kept (a pruned model has fewer)
-        self.n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])
-        if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != self.n_expert for l in range(self.n_layers)):
+        self.n_expert = int(T["blk.%d.ffn_gate_inp.weight" % self.layers[0]].shape[1])
+        if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != self.n_expert for l in self.layers):
             raise ConvertError("the routers disagree on the expert count; a per-layer pruned model cannot be converted")
         self.layout = []
         offset = 0
-        for l in range(self.n_layers):
+        for l in self.layers:
             names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
             if any(n not in T for n in names):
                 raise ConvertError("layer %d: missing %s" % (l, ", ".join(n for n in names if n not in T)))
