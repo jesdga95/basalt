@@ -164,6 +164,19 @@ int main() {
         if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 4060 Ti) skipped, not sm_120");
 #endif
     }
+    // A data-centre Ampere card (sm_80): the Ampere option covers the line, not only sm_86
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, 0, 1792, 32), card(1, "A100-PCIE-40GB", 8, 0, 1555, 40)};
+        CHECK_STR(pick("1,0", v).error, "gpu: GPU 1 (A100-PCIE-40GB) is sm_80, not sm_120");
+#if defined(BASALT_PEER_AMPERE)
+        CHECK_STR(cards(pick("0,1", v)), "0,1");
+        CHECK_STR(cards(pick("auto", v)), "0,1");
+#else
+        CHECK_STR(pick("0,1", v).error,
+                  "gpu: GPU 1 (A100-PCIE-40GB) is sm_80 (rebuild with -DPEER_AMPERE=ON to enable sm_80 peer support)");
+        CHECK_STR(cards(pick("auto", v)), "0");
+#endif
+    }
     // A laptop's own card beside a desktop card in an enclosure: the desktop card's bandwidth makes it main; the
     // laptop card is the first visible, so it runs alone when nothing is set.
     {

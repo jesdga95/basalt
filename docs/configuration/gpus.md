@@ -116,7 +116,7 @@ it holds.
 ## An older peer card
 
 Two older architectures can be built for the peer's kernels, each beside an sm_120 main card: sm_89 (Ada) with the
-`-DPEER_ADA=ON` build flag and sm_86 (Ampere) with `-DPEER_AMPERE=ON` (both off by default to keep build times fast for
+`-DPEER_ADA=ON` build flag and sm_86 or sm_80 (Ampere) with `-DPEER_AMPERE=ON` (both off by default to keep build times fast for
 users without a hybrid setup). Without the flag, or for a card of any other pre-Blackwell architecture, the card is
 refused at the start rather than failing at its first kernel. What such a peer does and does not do:
 
