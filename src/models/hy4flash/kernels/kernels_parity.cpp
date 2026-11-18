@@ -370,7 +370,7 @@ void test_mla() {
                     }
                 char name[96];
                 std::snprintf(name, sizeof name, "mla_attend %d heads%s%s", heads, use_cells ? ", cell lists" : ", spans", bf ? ", bf16" : "");
-                report(name, got, ref, 1e-4);
+                report(name, got, ref, bf ? 1e-3 : 1e-4);   // a BF16 chunk: fp16 query and probabilities on the tensor cores
                 if (!use_cells && !ring) {   // row independence: row 1 alone
                     float* d1 = devf((size_t) 9 * heads * a.rank);
                     RowSpans r1;
