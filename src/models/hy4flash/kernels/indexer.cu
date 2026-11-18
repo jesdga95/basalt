@@ -107,6 +107,59 @@ __global__ void scores_kernel(const float* __restrict__ q, const float* __restri
     scores[p] = total;
 }
 
+// Tensor-core scores of a row (16 heads, dim 128): S = Q K^T per 8 pooled keys on mma.m16n8k16 with q split into an fp16 high and low
+// part (the keys are fp16 already), then sum_h w_h relu(S_h). A block of 4 warps takes 512 pools of a row (blockIdx.y), a warp 128.
+__device__ __forceinline__ void mma_f16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__global__ void __launch_bounds__(128) scores_mma_kernel(const float* __restrict__ q, const float* __restrict__ w, const __half* __restrict__ pooled,
+                                                         const int32_t* __restrict__ meta, int stride, float* __restrict__ scores) {
+    const int row = blockIdx.y, n_pool = meta[row * 3];
+    if ((int) blockIdx.x * 512 >= n_pool) return;
+    q += (size_t) row * 16 * 128;
+    w += (size_t) row * 16;
+    scores += (size_t) row * stride;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    uint32_t qh[8][4], ql[8][4];
+    for (int ks = 0; ks < 8; ++ks)
+        for (int j = 0; j < 4; ++j) {
+            const int r = (lane >> 2) + (j & 1) * 8, c = ks * 16 + (lane & 3) * 2 + (j >> 1) * 8;
+            const float2 v = *reinterpret_cast<const float2*>(q + r * 128 + c);
+            const __half2 h = __floats2half2_rn(v.x, v.y);
+            const float2 hf = __half22float2(h);
+            const __half2 l = __floats2half2_rn(v.x - hf.x, v.y - hf.y);
+            qh[ks][j] = *reinterpret_cast<const uint32_t*>(&h);
+            ql[ks][j] = *reinterpret_cast<const uint32_t*>(&l);
+        }
+    const float wr0 = w[lane >> 2], wr1 = w[(lane >> 2) + 8];
+    const int base = blockIdx.x * 512 + warp * 128;
+    for (int nt = 0; nt < 16; ++nt) {
+        const int p0 = base + nt * 8;
+        if (p0 >= n_pool) break;
+        const int pn = min(p0 + (lane >> 2), n_pool - 1);
+        const uint32_t* kr = reinterpret_cast<const uint32_t*>(pooled + (size_t) pn * 128);
+        float c[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int ks = 0; ks < 8; ++ks) {
+            const uint32_t b0 = kr[ks * 8 + (lane & 3)], b1 = kr[ks * 8 + 4 + (lane & 3)];
+            mma_f16(c, qh[ks], b0, b1);
+            mma_f16(c, ql[ks], b0, b1);
+        }
+        float v0 = wr0 * fmaxf(c[0], 0.f) + wr1 * fmaxf(c[2], 0.f);
+        float v1 = wr0 * fmaxf(c[1], 0.f) + wr1 * fmaxf(c[3], 0.f);
+        for (int o = 4; o < 32; o <<= 1) {
+            v0 += __shfl_xor_sync(0xffffffffu, v0, o);
+            v1 += __shfl_xor_sync(0xffffffffu, v1, o);
+        }
+        if (lane < 4) {
+            const int p = p0 + lane * 2;
+            if (p < n_pool) scores[p] = v0;
+            if (p + 1 < n_pool) scores[p + 1] = v1;
+        }
+    }
+}
+
 constexpr int kSelThreads = 1024;
 
 __device__ __forceinline__ uint32_t order_key(float f) {
@@ -228,6 +281,11 @@ void idx_select(const float* scores, int n_pool, int k, int pool, int tail0, int
 
 void idx_scores_rows(const float* q, const float* w, const uint16_t* pooled, const int32_t* meta, int max_pool, int rows, const IndexerArgs& a,
                      float* scores, int stride, void* stream) {
+    if (a.heads == 16 && a.dim == 128) {
+        scores_mma_kernel<<<dim3((max_pool + 511) / 512, rows), 128, 0, (cudaStream_t) stream>>>(q, w, reinterpret_cast<const __half*>(pooled), meta, stride, scores);
+        if (!stream) cudaStreamSynchronize(nullptr);
+        return;
+    }
     const size_t smem = ((size_t) a.heads * a.dim + a.heads) * sizeof(float);
     scores_kernel<<<dim3((max_pool + 127) / 128, rows), 128, smem, (cudaStream_t) stream>>>(q, w, reinterpret_cast<const __half*>(pooled), 0, a, scores,
                                                                                              meta, stride);
