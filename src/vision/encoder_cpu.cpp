@@ -170,6 +170,7 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
         const int S = hy4_ ? edge_ : 48;
         auto src = [&](int axis_out, int axis_in, int i, int& i0, int& i1, float& d) {
             if (hy4_) {   // the reference's scale factor (size + 0.1) / S, align_corners false (torch's upsample_bilinear2d)
+                if (axis_out == axis_in) { i0 = i1 = i; d = 0.0f; return; }   // torch copies an axis whose size is unchanged
                 const float inv = (float) (1.0 / (((double) axis_out + 0.1) / axis_in));
                 const float v = std::max(inv * ((float) i + 0.5f) - 0.5f, 0.0f);
                 const int a = std::min((int) floorf(v), axis_in - 1);
