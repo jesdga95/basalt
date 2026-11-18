@@ -869,13 +869,13 @@ bool chain_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_
     }
     for (const Hop& h : hops) {
         const core::OnDevice on(h.stage->dev);
-        while (h.stage->line_ev.size() < 2 * (size_t) chunks) {
+        while (h.stage->stage_ev.size() < 2 * (size_t) chunks) {
             cudaEvent_t e = nullptr;
             if (cudaEventCreate(&e) != cudaSuccess) {
                 err = "cannot create CUDA events";
                 return false;
             }
-            h.stage->line_ev.push_back(e);
+            h.stage->stage_ev.push_back(e);
         }
         if (block && h.stage->n_taps > 0 && h.stage->tap_rows.size() < n_keep * (size_t) h.stage->n_taps) {
             err = m.o.arch + ": a layer-split card has too few drafter rows for the ring";
@@ -895,7 +895,7 @@ bool chain_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_
         for (; reaped < upto && e == cudaSuccess; ++reaped) {
             {
                 const core::OnDevice on(last.dev);
-                e = cudaEventSynchronize(last.line_ev[2 * (size_t) reaped + 1]);
+                e = cudaEventSynchronize(last.stage_ev[2 * (size_t) reaped + 1]);
             }
             if (e == cudaSuccess && progress) progress(std::min(n, (reaped + 1) * T));
         }
