@@ -81,7 +81,7 @@ struct CudaEncoder::Impl {
     };
     int layers = 0, proj = 0, nmax = 0;
     float eps = 1e-6f;
-    // Hy4-flash's tower (projector hy_v4_flash): one patch tap, an edge x edge position table resampled per grid, no rotation,
+    // A SigLIP2-derived tower (projector hy_v4_flash): one patch tap, an edge x edge position table resampled per grid, no rotation,
     // an RMS norm then a 2x2 merge product with an erf GELU, and a newline row after each merged row
     bool hy4 = false;
     int edge = 48;

@@ -29,7 +29,7 @@ void launch_bias_gelu(const float* g, const float* bias, __nv_bfloat16* y, int n
 /// y[t][c] = g[t][c] + bias[c]
 void launch_bias_copy(const float* g, const float* bias, float* y, int n, int cols, cudaStream_t s);
 
-// Hy4-flash's ViT (SigLIP2-derived: a learned position table, no rotation, an RMS norm and an erf-GELU projector).
+// The SigLIP2-derived ViT (SigLIP2-derived: a learned position table, no rotation, an RMS norm and an erf-GELU projector).
 /// x[t] += patch bias + the position table (table_edge x table_edge entries of 1152) bilinearly resampled to the gx x gy
 /// grid with the reference's scale factor (size + 0.1) / table_edge, for the patch at merge-order row t.
 void launch_embed_finish_interp(float* x, const float* bias, const float* pos_table, int n, int gx, int gy, int table_edge,

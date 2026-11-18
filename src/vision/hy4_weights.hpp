@@ -1,4 +1,4 @@
-// src/vision/hy4_weights.hpp - the projector file's weights of Hy4-flash's tower (llama.cpp's hy_v4_flash GGUF) in the form
+// src/vision/hy4_weights.hpp - the projector file's weights of the SigLIP2-derived tower (llama.cpp's hy_v4_flash GGUF) in the form
 // both encoders compute with: bf16 matrices, the merge convolution as one product.
 #pragma once
 

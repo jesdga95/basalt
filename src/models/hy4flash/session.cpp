@@ -256,6 +256,31 @@ public:
 
     std::string info_words() const override { return tier_ ? "expert_slots=" + std::to_string(tier_->slots()) : std::string(); }
 
+    // SLEEP / WAKE: the tier's card slots go back to the card (every expert keeps its RAM copy and its slot is remembered), and
+    // return at the wake. The latent caches, the rings and the drafter's rows are conversation state and stay.
+    model::Result set_low_memory(bool low, int64_t& expert_slots) override {
+        std::string e;
+        if (!tier_) return {model::Status::Error, "hy4flash: the expert tier is not open"};
+        cudaStreamSynchronize(stream_);
+        if (low) {
+            tier_->lend_all();
+        } else {
+            if (!tier_->reclaim(e)) return {model::Status::Error, "hy4flash: " + e};
+            tier_->grow();
+        }
+        expert_slots = tier_->slots();
+        return {};
+    }
+
+    model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
+        std::string e;
+        if (!tier_) return {model::Status::Error, "hy4flash: the expert tier is not open"};
+        cudaStreamSynchronize(stream_);
+        if (!tier_->replan(mib, e)) return {model::Status::Error, "hy4flash: " + e};
+        expert_slots = tier_->slots();
+        return {};
+    }
+
     model::Result copy_logits(int row, float* out) override {
         if (row < 0 || row >= last_rows_) return {model::Status::Error, "hy4flash: the session keeps the last window's logits only"};
         cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost);
