@@ -1,5 +1,5 @@
 // Hyper-connections: adapted from build_hc_mixes, build_hc_sinkhorn, build_hc_pre and build_hc_post in the llama.cpp
-// DeepSeek-V4 support (src/models/deepseek4.cpp).
+// support for a model with hyper-connections (src/models/ of llama.cpp).
 // MIT License
 // Copyright (c) 2023-2026 The ggml authors
 //
