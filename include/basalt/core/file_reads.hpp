@@ -1,4 +1,4 @@
-// src/models/deepseek41/file_reads.hpp - expert blobs read from the pack into RAM places, off the caller's thread.
+// include/basalt/core/file_reads.hpp - expert blobs read from the pack into RAM places, off the caller's thread.
 //
 // A lookup that routes to experts only the file holds reads each one whole into a place of the RAM tier. The reads go
 // around the OS file cache (platform::DirectFile) in aligned pieces staged through a few buffers, so the CPU never
@@ -15,7 +15,7 @@
 #include <thread>
 #include <vector>
 
-namespace basalt::models::deepseek41 {
+namespace basalt::core {
 
 class FileReads {
 public:
@@ -67,4 +67,4 @@ private:
     bool started_ = false;        ///< caller side: a batch is out
 };
 
-}  // namespace basalt::models::deepseek41
+}  // namespace basalt::core

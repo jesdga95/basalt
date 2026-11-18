@@ -198,11 +198,11 @@ endif()
 if(BASALT_MODEL_DEEPSEEK41)
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
-  src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/file_reads.cpp src/models/deepseek41/prompt_host.cpp src/models/deepseek41/ops.cu
+  src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/prompt_host.cpp src/models/deepseek41/ops.cu
   src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu
   src/models/deepseek41/dspark.cpp src/models/deepseek41/dspark_kernels.cu)
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision tiers mmq peer_share kernels core ${_gpu_runtime_target})
+target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision expert_tier tiers mmq peer_share kernels core ${_gpu_runtime_target})
 endif()
 
 if(BASALT_MODEL_QWEN35)
@@ -310,18 +310,7 @@ if(BUILD_TESTING)
   basalt_embed_manifest(adapter_builtin_test)
   basalt_gpu_test(NAME adapter_builtin_test COMMAND adapter_builtin_test)
   if(BASALT_MODEL_DEEPSEEK41)
-  # the DeepSeek expert tiers' admission and placement rules on synthetic id streams (no GPU)
-  add_executable(tier_policy_test src/models/deepseek41/tier_policy_test.cpp)
-  target_include_directories(tier_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  basalt_embed_manifest(tier_policy_test)
-  basalt_cpu_test(NAME tier_policy_test COMMAND tier_policy_test)
   # the RAM tier's file reads land every blob byte for byte (no GPU)
-  add_executable(file_reads_test src/models/deepseek41/file_reads_test.cpp src/models/deepseek41/file_reads.cpp)
-  target_include_directories(file_reads_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_compile_definitions(file_reads_test PRIVATE BASALT_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}")
-  target_link_libraries(file_reads_test PRIVATE platform Threads::Threads)
-  basalt_embed_manifest(file_reads_test)
-  basalt_cpu_test(NAME file_reads_test COMMAND file_reads_test)
   # the DeepSeek context: the refusals, the warning and the cache sizes (no GPU)
   add_executable(context_policy_test src/models/deepseek41/context_policy_test.cpp)
   target_include_directories(context_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -370,7 +359,7 @@ endif()
 # Defined in cmake/platform.cmake, included above with `warnings`.
 
 # ---- core (GPU runtime) ---------------------------------------------
-add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/graph.cpp src/core/weights.cpp src/core/loader.cpp
+add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/elastic_array.cpp src/core/file_reads.cpp src/core/graph.cpp src/core/weights.cpp src/core/loader.cpp
                              src/core/host_plan.cpp src/core/checkpoint_transfer.cpp src/core/staged_copy.cpp src/core/prompt_stage.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
@@ -495,6 +484,10 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp src/core/peer_experts.cpp src/core/conversation_store.cpp src/core/conversation_memory.cpp)
 target_include_directories(tiers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(tiers PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
+# the routed-expert tier: slots, per-layer LRU, RAM tier with CPU compute, file reads, second cards
+add_library(expert_tier STATIC src/core/expert_tier.cpp)
+target_include_directories(expert_tier PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
+target_link_libraries(expert_tier PUBLIC tiers peer_share mmq core kernels kernels_cpu platform ${_gpu_runtime_target})
 if(BASALT_MODEL_QWEN4EXP)
 include(src/models/qwen4exp/qwen4exp.cmake)
 endif()
@@ -1315,6 +1308,17 @@ target_link_libraries(log_test PRIVATE warnings)
 basalt_embed_manifest(log_test)
 basalt_cpu_test(NAME log_test COMMAND log_test)
 set_tests_properties(log_test PROPERTIES TIMEOUT 60)
+# the expert tiers' admission and placement rules on synthetic id streams (no GPU)
+add_executable(tier_policy_test tests/core/tier_policy_test.cpp)
+target_include_directories(tier_policy_test PRIVATE include)
+basalt_embed_manifest(tier_policy_test)
+basalt_cpu_test(NAME tier_policy_test COMMAND tier_policy_test)
+add_executable(file_reads_test tests/core/file_reads_test.cpp src/core/file_reads.cpp)
+target_include_directories(file_reads_test PRIVATE include)
+target_compile_definitions(file_reads_test PRIVATE BASALT_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(file_reads_test PRIVATE platform Threads::Threads)
+basalt_embed_manifest(file_reads_test)
+basalt_cpu_test(NAME file_reads_test COMMAND file_reads_test)
 add_executable(exact_slots_test tests/core/exact_slots_test.cpp)
 target_include_directories(exact_slots_test PRIVATE include)
 target_link_libraries(exact_slots_test PRIVATE warnings)

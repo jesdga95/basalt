@@ -8,12 +8,18 @@
 #include "basalt/models/deepseek41/vision.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "models/deepseek41/pack.hpp"
+#include "models/deepseek41/prompt_host.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
 
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
+
+namespace basalt::core {
+class ExpertTier;
+struct ExpertTierSpec;
+}
 
 namespace basalt::models::deepseek41 {
 
@@ -31,7 +37,6 @@ inline void dense_f32(const DevTensor& w, const float* x, void* scratch_q8_1, fl
     kernels::native_mmvq(w.type, w.ptr, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
-class ExpertTier;
 class DsparkDrafter;
 
 /// The second cards whose expert tiers a start uses; later cards idle.
@@ -80,7 +85,7 @@ public:
     void set_diag_tier(int ram, int vram) { diag_tier_ram_ = ram; diag_tier_vram_ = vram; }
     /// The expert tier and the pinned rows it shares with a second card: one per model, whatever the sessions.
     struct SharedTier {
-        std::shared_ptr<ExpertTier> tier;
+        std::shared_ptr<core::ExpertTier> tier;
         float* h_x = nullptr;
         float* h_rows = nullptr;
     };
@@ -108,6 +113,10 @@ public:
     /// Opens the image projector: the diagnostic standalone file when set, else the pack's vision section.
     /// False with `err` set when neither exists.
     bool open_mmproj(vision::Mmproj& mp, std::string& err) const;
+    /// What the expert tier is told of this model's experts and flags (its host buffers are `prompt_host()`).
+    core::ExpertTierSpec tier_spec() const;
+    /// The prompt path's and the images' host buffers, allocated before the RAM tier is sized.
+    PromptHost& prompt_host() const { return prompt_host_; }
     /// The image encoders' cuBLAS handle, opened by the expert tier at load when images are on.
     VisionBlas& vision_blas() const { return vision_blas_; }
 
@@ -125,6 +134,7 @@ private:
     std::vector<int> peer_devices_;
     int device_ = 0;
     model::LoadRequest tiers_;
+    mutable PromptHost prompt_host_;   // before the tier: the tier goes first
     mutable SharedTier shared_tier_;
     mutable std::weak_ptr<DsparkDrafter> shared_drafter_;
     mutable VisionBlas vision_blas_;

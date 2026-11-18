@@ -15,7 +15,7 @@
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/ops.hpp"
 #include "models/deepseek41/prefill_ffn.hpp"
-#include "models/deepseek41/tier.hpp"
+#include "basalt/core/expert_tier.hpp"
 
 #include <cuda_runtime.h>
 
@@ -57,9 +57,9 @@ public:
         dump_dir_ = m_.diag_dump();
         ffn_ = make_prefill_ffn(m_, ops_, cap_, err);
         if (!ffn_) return false;
-        ExpertTier* tier = ops_.expert_tier(err);   // the FFN has it open by now
+        core::ExpertTier* tier = ops_.expert_tier(err);   // the FFN has it open by now
         if (!tier) return false;
-        host_ = &tier->host();
+        host_ = &m_.prompt_host();
         batch_open_ = ops_.open_batch(cap_, err);
         if (!batch_open_) return false;
         const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), 8), 1 << 16);
