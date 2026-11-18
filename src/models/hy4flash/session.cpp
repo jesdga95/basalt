@@ -13,6 +13,7 @@
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/router.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
@@ -395,7 +396,13 @@ private:
             return false;
         }
         cudaStream_t st = stream_;
-        router_sigmoid(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), g_.n_expert, E, K, g_.expert_scale, rlog_, ids_, rw_, st);
+        bk::RouterArgs ra;
+        ra.n_expert = g_.n_expert;
+        ra.n_embd = E;
+        ra.k = K;
+        ra.weight_scale = g_.expert_scale;
+        ra.gate = bk::RouterGate::Sigmoid;
+        bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), 1, ra, rlog_, ids_, rw_, st);
         mm(T(l, "ffn_routed_down.weight"), q8a_, xlat_, E, L);
         bk::native_quantize_q8_1(xlat_, ex_xq_, L, 1, st);
         cudaMemcpyAsync(h_x_, xlat_, (size_t) L * 4, cudaMemcpyDeviceToHost, st);
