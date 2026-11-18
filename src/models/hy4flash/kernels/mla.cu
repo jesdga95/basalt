@@ -275,6 +275,159 @@ __global__ void __launch_bounds__(512) attend_kernel(const float* __restrict__ q
         for (int h = 0; h < kGroup; ++h) o_lat[((size_t) t * a.heads + h0 + h) * a.rank + tid] = acc[h] / l_s[h];
 }
 
+// ---- tensor-core attention over a BF16 cache -------------------------------------------------------------------------------
+// A block per row and 16 heads, 8 warps. The row's cells go through shared memory 32 at a time; S = Q K^T and O += P V run on
+// mma.m16n8k16 with the fp32 operands (q, p) split into a bf16 high and low part, so the products are exact in the cache's bf16 and
+// carry about 16 bits of the other factor, accumulated in fp32. The softmax is the same running one as above, the sink its first element.
+constexpr int kMmaCells = 32, kLd = 584, kPLd = 40;   // smem row strides in bf16 elements (avoid bank conflicts)
+
+__device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"((uint32_t) __cvta_generic_to_shared(p)));
+}
+__device__ __forceinline__ void ldsm4t(uint32_t (&r)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"((uint32_t) __cvta_generic_to_shared(p)));
+}
+__device__ __forceinline__ void mma16816(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void split_bf16(float x, uint16_t& hi, uint16_t& lo) {
+    const __nv_bfloat16 h = __float2bfloat16_rn(x);
+    hi = __bfloat16_as_ushort(h);
+    lo = __bfloat16_as_ushort(__float2bfloat16_rn(x - __bfloat162float(h)));
+}
+
+__global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict__ qcur, const uint16_t* __restrict__ cache, const int32_t* __restrict__ firsts,
+                                                         const int32_t* __restrict__ counts, const int32_t* __restrict__ cells, int cells_stride,
+                                                         const float* __restrict__ sinks, MlaArgs a, int ring, float* __restrict__ o_lat) {
+    extern __shared__ __align__(16) unsigned char smraw[];
+    constexpr int W = 576;
+    uint16_t* qh = (uint16_t*) smraw;
+    uint16_t* ql = qh + 16 * kLd;
+    uint16_t* ks = ql + 16 * kLd;
+    uint16_t* ph = ks + kMmaCells * kLd;
+    uint16_t* pl = ph + 16 * kPLd;
+    float* sp = (float*) (pl + 16 * kPLd);   // [2][16][32]
+    float* alpha_s = sp + 2 * 16 * 32;
+    float* l_s = alpha_s + 16;
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    const int t = blockIdx.y, h0 = blockIdx.x * 16;
+    const int n = counts[t], first = firsts[t];
+    const int32_t* cl = cells ? cells + (size_t) t * cells_stride : nullptr;
+    for (int i = tid; i < 16 * W; i += 256) {
+        uint16_t hi, lo;
+        split_bf16(qcur[((size_t) t * a.heads + h0) * W + i], hi, lo);
+        const int h = i / W, e = i - h * W;
+        qh[h * kLd + e] = hi;
+        ql[h * kLd + e] = lo;
+    }
+    float m[2], l[2];
+    for (int hh = 0; hh < 2; ++hh) {
+        m[hh] = sinks[h0 + w * 2 + hh];
+        l[hh] = 1.f;
+    }
+    if (tid < 16) l_s[tid] = 1.f;
+    float acc[8][4];
+    for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    const int nt = w & 3, kh = w >> 2, id = lane >> 3, r8 = lane & 7;
+    for (int j0 = 0; j0 < n; j0 += kMmaCells) {
+        const int tn = min(kMmaCells, n - j0);
+        __syncthreads();
+        for (int i = tid; i < kMmaCells * (W / 8); i += 256) {
+            const int c = i / (W / 8), ch = i - c * (W / 8);
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (c < tn) {
+                const int j = j0 + c;
+                const int cell = cl ? cl[j] : ring ? (first + j) % ring : first + j;
+                v = *reinterpret_cast<const uint4*>(cache + (size_t) cell * W + ch * 8);
+            }
+            *reinterpret_cast<uint4*>(ks + c * kLd + ch * 8) = v;
+        }
+        __syncthreads();
+        // S: this warp's 8 cells and half of the 576 dimensions
+        {
+            float c[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int kk = 0; kk < 9; ++kk) {
+                const int kb = (kh * 18 + kk * 2) * 16;
+                uint32_t b[4];
+                ldsm4(b, ks + (nt * 8 + r8) * kLd + kb + id * 8);
+                for (int s2 = 0; s2 < 2; ++s2) {
+                    const int kd = kb + s2 * 16;
+                    uint32_t ah[4], al[4];
+                    const int off = ((id & 1) * 8 + r8) * kLd + kd + (id >> 1) * 8;
+                    ldsm4(ah, qh + off);
+                    ldsm4(al, ql + off);
+                    mma16816(c, ah, b[2 * s2], b[2 * s2 + 1]);
+                    mma16816(c, al, b[2 * s2], b[2 * s2 + 1]);
+                }
+            }
+            const int row = lane >> 2, col = nt * 8 + (lane & 3) * 2;
+            sp[(kh * 16 + row) * 32 + col] = c[0];
+            sp[(kh * 16 + row) * 32 + col + 1] = c[1];
+            sp[(kh * 16 + row + 8) * 32 + col] = c[2];
+            sp[(kh * 16 + row + 8) * 32 + col + 1] = c[3];
+        }
+        __syncthreads();
+        // the running softmax: a warp takes 2 heads, a lane a cell
+        for (int hh = 0; hh < 2; ++hh) {
+            const int h = w * 2 + hh;
+            const bool valid = lane < tn;
+            const float sc = valid ? (sp[h * 32 + lane] + sp[(16 + h) * 32 + lane]) * a.scale : -INFINITY;
+            float mx = sc;
+            for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float nm = fmaxf(m[hh], mx);
+            const float alpha = expf(m[hh] - nm);
+            const float p = valid ? expf(sc - nm) : 0.f;
+            float sum = p;
+            for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            l[hh] = l[hh] * alpha + sum;
+            m[hh] = nm;
+            uint16_t hi, lo;
+            split_bf16(p, hi, lo);
+            ph[h * kPLd + lane] = hi;
+            pl[h * kPLd + lane] = lo;
+            if (lane == 0) {
+                alpha_s[h] = alpha;
+                l_s[h] = l[hh];
+            }
+        }
+        __syncthreads();
+        // O = O * alpha + P V: this warp's 64 latent dimensions
+        {
+            const float a0 = alpha_s[lane >> 2], a1 = alpha_s[(lane >> 2) + 8];
+            for (int j = 0; j < 8; ++j) {
+                acc[j][0] *= a0; acc[j][1] *= a0;
+                acc[j][2] *= a1; acc[j][3] *= a1;
+            }
+            for (int s2 = 0; s2 < 2; ++s2) {
+                uint32_t ah[4], al[4];
+                const int off = ((id & 1) * 8 + r8) * kPLd + s2 * 16 + (id >> 1) * 8;
+                ldsm4(ah, ph + off);
+                ldsm4(al, pl + off);
+                for (int jj = 0; jj < 4; ++jj) {
+                    uint32_t b[4];
+                    ldsm4t(b, ks + (s2 * 16 + (id & 1) * 8 + r8) * kLd + w * 64 + jj * 16 + (id >> 1) * 8);
+                    mma16816(acc[2 * jj], ah, b[0], b[1]);
+                    mma16816(acc[2 * jj], al, b[0], b[1]);
+                    mma16816(acc[2 * jj + 1], ah, b[2], b[3]);
+                    mma16816(acc[2 * jj + 1], al, b[2], b[3]);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const int row = lane >> 2;
+    const float i0 = 1.f / l_s[row], i1 = 1.f / l_s[row + 8];
+    for (int j = 0; j < 8; ++j) {
+        const int d = w * 64 + j * 8 + (lane & 3) * 2;
+        float* o0 = o_lat + ((size_t) t * a.heads + h0 + row) * a.rank + d;
+        float* o1 = o_lat + ((size_t) t * a.heads + h0 + row + 8) * a.rank + d;
+        o0[0] = acc[j][0] * i0; o0[1] = acc[j][1] * i0;
+        o1[0] = acc[j][2] * i1; o1[1] = acc[j][3] * i1;
+    }
+}
+
+
 // cells[t][j] = j for j < fill[t] (rows with fill 0 are left alone).
 __global__ void iota_cells_kernel(int32_t* __restrict__ cells, int stride, const int32_t* __restrict__ fill) {
     const int t = blockIdx.x, n = fill[t];
@@ -291,6 +444,19 @@ void prepare_impl(const float* q, const float* q_abs, const float* kv_raw, const
 template <typename C>
 void attend_impl(const float* qcur, const C* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                  float* o_lat, void* stream) {
+    if constexpr (std::is_same_v<C, unsigned short>) {
+        if (a.rank == 512 && a.rope == 64 && a.heads % 16 == 0) {
+            const size_t smem = (size_t) (2 * 16 * kLd + kMmaCells * kLd + 2 * 16 * kPLd) * 2 + (2 * 16 * 32 + 32) * sizeof(float);
+            static bool raised_mma = false;
+            if (!raised_mma) {
+                cudaFuncSetAttribute(attend_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+                raised_mma = true;
+            }
+            attend_mma_kernel<<<dim3(a.heads / 16, n_tok), 256, smem, (cudaStream_t) stream>>>(qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride, sinks, a, ring, o_lat);
+            if (!stream) cudaStreamSynchronize(nullptr);
+            return;
+        }
+    }
     if (a.heads % kGroup || a.rank > 512) throw std::invalid_argument("mla_attend: heads");
     const size_t W = (size_t) a.rank + a.rope;
     const size_t smem = (kGroup * W + kTile * W + kGroup * kTile + 3 * kGroup) * sizeof(float);
