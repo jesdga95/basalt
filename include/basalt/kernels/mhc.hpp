@@ -42,4 +42,29 @@ void hc_pre(const float* x, const float* pre, int pre_stride, int n_tokens, int 
 void hc_post(const float* f, const float* x, const float* coef, int coef_stride, int n_tokens, int n_embd,
              float* out, void* stream);
 
+// ---- identity connections ---------------------------------------------------------------------------------------------
+// Hy4-flash's iHC: a sublayer has 8 mixes (pre 4, post 4) and no cross-stream mix: stream i keeps its own residual,
+// out[i] = x[i] + post[i] * f. The coefficients are written in the layout above with comb the identity, so hc_pre and
+// hc_post run on them unchanged. The head has 4 mixes (the pre weights alone).
+
+struct HcPlainArgs {
+    int n_embd = 3072;
+    float rms_eps = 1e-5f;            ///< of the stream's rms
+    float hc_eps = 1e-6f;             ///< offset of both sigmoids
+    float magnitude = 2.0f;           ///< post = magnitude * sigmoid + eps
+};
+
+/// Floats per token of the coefficients hc_mixes_plain writes for `n_mix` mixes: 24 (pre, post, identity comb) for 8
+/// mixes, 4 (pre) for the head's 4.
+inline int hc_plain_coef_stride(int n_mix) { return n_mix == 8 ? kHcCoef : n_mix; }
+
+/// Floats of workspace hc_mixes_plain needs for n_tokens.
+inline size_t hc_plain_workspace_floats(int n_tokens, int n_mix = 8) { return (size_t) n_tokens * kHcSplits * (n_mix + 1); }
+
+/// coef from the streams: mixes = hc_fn[n_mix][4*n_embd] . x_flat * rsqrt(mean(x_flat^2) + rms_eps), then pre =
+/// sigmoid(mix*scale[0] + base) + eps and, with 8 mixes, post = magnitude * sigmoid(mix*scale[1] + base) + eps. The
+/// result for a token does not depend on n_tokens.
+void hc_mixes_plain(const float* x, const float* hc_fn, const float* hc_scale, const float* hc_base, int n_tokens,
+                    int n_mix, const HcPlainArgs& a, float* workspace, float* coef, void* stream);
+
 }  // namespace basalt::kernels
