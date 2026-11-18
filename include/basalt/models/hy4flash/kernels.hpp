@@ -29,11 +29,17 @@ void q8_0_heads_gemv(const void* w, const float* x, int x_stride, int heads, int
 /// the rotated rope part, and the cache row [rank + rope] = the latent normed by kv_norm then the rotated rope part.
 void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos,
                  float* qcur, float* cache_row, void* stream);
+/// The same with a BF16 cache row (round to nearest even).
+void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos,
+                 float* qcur, uint16_t* cache_row, void* stream);
 
 /// o_lat[h][c] = sum_j softmax_j(scale * qcur[h] . cache[cell_j]) * cache[cell_j][c] for c < rank, j < n, where the
 /// softmax's denominator also holds exp(sinks[h]) and cell_j = cells[j] (cells null: first + j, modulo `ring` when it is set). cache [cells][rank + rope];
 /// n <= 4096.
 void mla_attend(const float* qcur, const float* cache, int first, int n, const float* sinks, const MlaArgs& a,
+                float* o_lat, void* stream, const int32_t* cells = nullptr, int ring = 0);
+/// The same over a BF16 cache.
+void mla_attend(const float* qcur, const uint16_t* cache, int first, int n, const float* sinks, const MlaArgs& a,
                 float* o_lat, void* stream, const int32_t* cells = nullptr, int ring = 0);
 
 /// x[i] *= sigmoid(g[i]).

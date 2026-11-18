@@ -372,6 +372,67 @@ void test_indexer() {
     }
 }
 
+uint16_t to_bf16(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    u += 0x7FFF + ((u >> 16) & 1);
+    return (uint16_t) (u >> 16);
+}
+float from_bf16(uint16_t b) {
+    uint32_t u = (uint32_t) b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+void test_mla_bf16() {
+    MlaArgs a;
+    a.heads = 32;
+    const int W = a.rank + a.rope, Q = a.nope + a.rope, cells = 900, pos = cells - 1, n = cells;
+    std::vector<float> q = randn((size_t) a.heads * Q), qabs = randn((size_t) a.heads * a.rank, 0.3f), kvraw = randn(W),
+                       norm = randn(a.rank, 0.2f), sinks = randn(a.heads);
+    for (auto& v : norm) v += 1.f;
+    std::vector<float> rows = randn((size_t) cells * W, 0.5f);
+    std::vector<uint16_t> bf((size_t) cells * W);
+    for (size_t i = 0; i < bf.size(); ++i) bf[i] = to_bf16(rows[i]);
+    float *dq = dev(q), *dqa = dev(qabs), *dkv = dev(kvraw), *dn = dev(norm), *ds = dev(sinks);
+    uint16_t* dc = dev(bf);
+    float *dqcur = devf((size_t) a.heads * W), *dlat = devf((size_t) a.heads * a.rank);
+    mla_prepare(dq, dqa, dkv, dn, a, pos, dqcur, dc + (size_t) pos * W, nullptr);
+    std::vector<uint16_t> row = host(dc + (size_t) pos * W, W);
+    // the row against fp32 preparation, within BF16's rounding
+    float* dr32 = devf(W);
+    mla_prepare(dq, dqa, dkv, dn, a, pos, dqcur, dr32, nullptr);
+    std::vector<float> r32 = host(dr32, W);
+    bool exact = true;
+    for (int c = 0; c < W; ++c) exact = exact && row[c] == to_bf16(r32[c]);
+    std::printf("%-30s %s\n", "mla_prepare bf16 row", exact ? "bitwise = rn(fp32 row)" : "FAIL");
+    failures += !exact;
+    bf = host(dc, (size_t) cells * W);
+    std::vector<float> qcur = host(dqcur, (size_t) a.heads * W);
+    mla_attend(dqcur, dc, 0, n, ds, a, dlat, nullptr);
+    std::vector<float> got = host(dlat, (size_t) a.heads * a.rank);
+    std::vector<double> ref((size_t) a.heads * a.rank);
+    for (int h = 0; h < a.heads; ++h) {
+        std::vector<double> sc(n);
+        double m = sinks[h];
+        for (int j = 0; j < n; ++j) {
+            double d = 0;
+            for (int c = 0; c < W; ++c) d += (double) qcur[(size_t) h * W + c] * from_bf16(bf[(size_t) j * W + c]);
+            sc[j] = d * a.scale;
+            m = std::max(m, sc[j]);
+        }
+        double den = std::exp(sinks[h] - m);
+        for (int j = 0; j < n; ++j) { sc[j] = std::exp(sc[j] - m); den += sc[j]; }
+        for (int c = 0; c < a.rank; ++c) {
+            double o = 0;
+            for (int j = 0; j < n; ++j) o += sc[j] * from_bf16(bf[(size_t) j * W + c]);
+            ref[(size_t) h * a.rank + c] = o / den;
+        }
+    }
+    report("mla_attend (bf16 cache)", got, ref, 1e-4);
+}
+
 void test_attend_cells() {
     MlaArgs a;
     a.heads = 32;
@@ -417,6 +478,7 @@ int main() {
     test_engram();
     test_indexer();
     test_attend_cells();
+    test_mla_bf16();
     std::printf(failures ? "FAILED\n" : "all ok\n");
     return failures ? 1 : 0;
 }

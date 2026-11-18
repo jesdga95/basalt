@@ -7,6 +7,7 @@
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
+#include "models/hy4flash/context_policy.hpp"
 
 #include <cuda_runtime.h>
 
@@ -97,9 +98,6 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         desc_.expert_gate_up_type.push_back(e.gu_type);
         desc_.expert_down_type.push_back(e.d_type);
     }
-    ctx_ = req.max_context > 0 ? std::min<int64_t>(req.max_context, kMaxContext) : kDefaultContext;
-    if (req.max_context > kMaxContext)
-        basalt::log::warn("basalt hy4flash", "context %lld capped at %lld", (long long) req.max_context, (long long) kMaxContext);
     diag_dump_ = req.diag_dump;
     if (!diag_dump_.empty()) basalt::log::info("basalt hy4flash", "--diag-dump: each layer's streams to %s", diag_dump_.c_str());
 
@@ -137,6 +135,18 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         reads.add(it);
         dense += d.bytes;
         dev_.emplace(name, std::move(d));
+    }
+    // the context: refused when its caches would take more than half of what the weights leave
+    {
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        int sparse = 0;
+        for (int l = 0; l < g.n_layers; ++l) sparse += !g.swa[(size_t) l];
+        const ctxp::Plan p = ctxp::plan_context(req.max_context > 0 ? req.max_context : kDefaultContext, g.context_length,
+                                                free_b / (uint64_t) std::max(req.sessions, 1), sparse);
+        if (!p.error.empty()) return {model::Status::Error, "hy4flash: " + p.error};
+        if (!p.note.empty()) basalt::log::info("basalt hy4flash", "%s", p.note.c_str());
+        ctx_ = p.context;
     }
     basalt::log::info("basalt hy4flash", "%zu dense tensors, %.2f GiB on the GPU", dev_.size(), (double) dense / (double) kGiB);
 
