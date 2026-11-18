@@ -3,6 +3,8 @@
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \\
         [--mtp-source DIR] [--mtp-dense FILE] [--draft-vocab FILE] [--name NAME] [--compat-bf16] [--no-vision] [--force]
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --sections-from BASE.basalt --out MODEL.basalt [--name NAME] [--force]
+    python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --hf-dir HF_DIR --out MODEL.basalt [--name NAME] [--force]
+    python3 tools/convert/convert.py --verify PACK.basalt --gguf MODEL-00001-of-0000N.gguf
     python3 tools/convert/convert.py --dspark FILE --into PACK.basalt --undo-dir DIR
     python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] [--mtp-dense FILE] \\
         [--name NAME] [--workers N] [--force]
@@ -17,6 +19,10 @@ Inputs
                      tensor with a section of its own (the Engram table) whose shard stops after its header is copied
                      from BASE's section of the same tensor
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
+  --hf-dir DIR       hy_v4_flash only: the tencent/Hy4-flash directory (LICENSE and config.json are embedded, the
+                     weights are not read); the pack is the GGUF's tensors as they are, with the next-n block as mtp/*
+  --verify PACK      read PACK back against its source --gguf: every section's SHA-256, and every source tensor's
+                     bytes (type, shape and SHA-256) at the place the pack's index and layout name; writes nothing
   --dspark FILE      deepseek41 only: the DSpark drafter GGUF, stored whole as the dspark/gguf section
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
   --mtp-dense FILE   a tuned `mtp/dense` section (raw bytes, same layout as the source; needs --mtp-source); the packs
@@ -336,6 +342,9 @@ def convert(a) -> None:
                  if v]
         if given:
             die(f"{arch.name} packs have no MTP drafter or hc8 sections; drop {', '.join(given)}")
+    hf_dir = Path(a.hf_dir) if getattr(a, "hf_dir", None) else None
+    if arch.needs_hf_dir != (hf_dir is not None):
+        die(f"{arch.name} packs {'need' if arch.needs_hf_dir else 'take no'} --hf-dir")
     dspark = Path(a.dspark) if getattr(a, "dspark", None) else None
     if dspark is not None:
         if not arch.dspark_ok:
@@ -376,8 +385,19 @@ def convert(a) -> None:
             arch.check(kv, own)
         for k, v in arch.sampling_kv.items():
             kv.setdefault(k, v)
-        dense = S.Dense(model, a.compat_bf16, arch)
-        experts = S.Experts(model)
+        hf_meta = arch.hf_meta(hf_dir) if hf_dir else {}
+        mtp_ids = arch.mtp_layers(kv)
+        in_mtp = lambda n: (m := re.match(r"blk\.(\d+)\.", n)) is not None and int(m.group(1)) in mtp_ids
+        mtp_gguf = None
+        if mtp_ids:
+            # the drafter's layers come from the GGUF itself: its own dense pool and experts, the main sections without them
+            tensors = [x for x in tensors if not in_mtp(x[0])]
+            dense = S.Dense(model, a.compat_bf16, arch, only=lambda n: not in_mtp(n))
+            experts = S.Experts(model, [l for l in range(min(mtp_ids)) if f"blk.{l}.ffn_gate_exps.weight" in model.where])
+            mtp_gguf = (S.Dense(model, a.compat_bf16, arch, only=in_mtp), S.Experts(model, mtp_ids))
+        else:
+            dense = S.Dense(model, a.compat_bf16, arch)
+            experts = S.Experts(model)
         mtp = S.Mtp(a.mtp_source, a.mtp_dense) if a.mtp_source else None
         n_vocab = len(kv.get("tokenizer.ggml.tokens") or []) or None
         draft_vocab = S.draft_vocab_bytes(a.draft_vocab, n_vocab) if a.draft_vocab else None
@@ -457,6 +477,12 @@ def convert(a) -> None:
                             break
                     else:
                         die("none of the source GGUF files carries the tokenizer metadata the vision sidecar needs")
+            if mtp_gguf is not None:
+                m_dense, m_experts = mtp_gguf
+                job.chunks("mtp/dense", m_dense.chunks())
+                job.bytes("mtp/dense.index", m_dense.index_text())
+                job.chunks("mtp/experts", m_experts.chunks(), m_experts.total)
+                job.bytes("mtp/experts.layout", m_experts.layout_text())
             if mtp is not None:
                 job.chunks("mtp/dense", mtp.dense_chunks())
                 job.bytes("mtp/dense.index", mtp.dense_index())
@@ -500,6 +526,18 @@ def convert(a) -> None:
                 **({"dspark": dspark_record(dspark)} if dspark else {}),
                 **({"dspark": base_meta["dspark"]} if base is not None and "dspark" in base_meta else {}),
             }
+            if mtp_gguf is not None:
+                meta["mtp"] = {"source": "gguf", "layers": mtp_ids, "format": "as stored in the GGUF",
+                               "sections": ["mtp/dense", "mtp/dense.index", "mtp/experts", "mtp/experts.layout"],
+                               "dense_shapes": {n: [int(d) for d in model.where[n][1].shape] for n in model.where if in_mtp(n)
+                                                and not S.is_expert(n)},
+                               "experts": {"layers": m_experts.layers, "gate_type_id": m_experts.layout[0][1],
+                                           "down_type_id": m_experts.layout[0][2], "bytes": m_experts.total}}
+            if hf_dir is not None:
+                meta.update(hf_meta)
+                meta["sources"] += [{"path": f"hf/{n}", "size": (hf_dir / n).stat().st_size,
+                                     "sha256": hashlib.sha256((hf_dir / n).read_bytes()).hexdigest()}
+                                    for n in ("config.json", "LICENSE")]
             if base is not None:
                 meta["sections_from"] = {"path": Path(a.sections_from).name, "size": Path(a.sections_from).stat().st_size,
                                          "fingerprint_sha256_first_last_64mib_and_size": fingerprint(Path(a.sections_from)),
@@ -771,6 +809,8 @@ def main():
     ap.add_argument("--gguf", action="append", metavar="FILE",
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
+    ap.add_argument("--hf-dir", metavar="DIR", help="hy_v4_flash: the tencent/Hy4-flash directory (LICENSE, config.json)")
+    ap.add_argument("--verify", metavar="PACK.basalt", help="read PACK back against its source --gguf and report; writes nothing")
     ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf")
     ap.add_argument("--into", metavar="PACK.basalt", help="with --dspark: add it to this pack, whose other sections stay as they are")
     ap.add_argument("--undo-dir", metavar="DIR", help="with --into: a new directory for what --roll-back restores")
@@ -807,6 +847,11 @@ def main():
             ap.error("--into takes --undo-dir and either --dspark or --roll-back, and nothing else")
         add_dspark(a)
         return
+    if a.verify:
+        if not a.gguf or a.out or a.sections_from or a.checkpoint or a.dspark:
+            ap.error("--verify takes --gguf and nothing else")
+        import verify_pack
+        sys.exit(0 if verify_pack.verify(a.verify, a.gguf[0]) else 1)
     if not a.out:
         ap.error("--out is required")
     if a.dspark and (a.checkpoint or a.requant_dense_q6k or a.sections_from):

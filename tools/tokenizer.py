@@ -51,7 +51,8 @@ JOYAI_PATTERNS = [
     r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 ]
-PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS}
+# `hy_v4` (Hy4-flash) is the same three regexes (LLAMA_VOCAB_PRE_TYPE_HY_V4 shares the JOYAI_LLM case).
+PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS, "hy_v4": JOYAI_PATTERNS}
 
 
 class Tokenizer:
@@ -288,7 +289,8 @@ def extract_metadata(md: dict, out_dir) -> dict:
     }
     if tk.pre in PRE_PATTERNS:
         cfg["pre_patterns"] = PRE_PATTERNS[tk.pre]
-        cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM), applied in order"
+        cfg["pre_pattern_source"] = ("llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_%s), applied in order"
+                                     % {"hy_v4": "HY_V4"}.get(tk.pre, "JOYAI_LLM"))
     else:
         cfg["pre_pattern"] = QWEN35_PATTERN
         cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)"

@@ -138,3 +138,29 @@ ggml's NVFP4 blocks, the layout the dense products read with TMA (NInfer's and I
 - The matrix's FP32 scale is a separate F32 [1] tensor `<name>.scale`; a value is `e2m1 * ue4m3 * scale`.
 
 [nvfp4_planes.hpp](../include/basalt/kernels/nvfp4_planes.hpp) is the engine's copy of this layout.
+
+## Hy4-flash test pack
+
+From [AngelSlim/Hy4-flash-GGUF](https://huggingface.co/AngelSlim/Hy4-flash-GGUF)'s Q4_K_M (`general.architecture` `hy_v4_flash`)
+plus the model's Hugging Face directory ([tencent/Hy4-flash](https://huggingface.co/tencent/Hy4-flash): `LICENSE` and `config.json`
+only). Nothing is requantized; [the design](models/hy4-flash/pack.md) has the tensor table.
+
+```sh
+python3 tools/convert/convert.py --gguf Hy4-flash-Q4_K_M-00001-of-00002.gguf --hf-dir tencent-Hy4-flash \
+    --out Hy4-flash-Q4_K_M-test.basalt --name "Hy4-flash Q4_K_M (test pack)"
+python3 tools/convert/convert.py --verify Hy4-flash-Q4_K_M-test.basalt --gguf Hy4-flash-Q4_K_M-00001-of-00002.gguf
+```
+
+- `dense`, `dense.index`, `gguf`: as the DeepSeek pack (`gguf` holds every non-expert tensor, so float tensors are also in
+  `dense`). Three-dimensional tensors (`attn_k_b`, `attn_v_b`) keep their GGUF shape in `meta.tensors`; their dense-index row is
+  `(ne0, product of the rest)`.
+- `experts`, `experts.layout` (v5): one row per MoE layer by layer id, 1 to 41 (layer 0 is dense and has no row). Gate and up are
+  Q4_K, down Q6_K or Q4_K, so a layer's blob is 3,981,312 or 4,589,568 bytes.
+- `engram`: the table, 96 x 660,006,416 `F8_E4M3_RAW` (llama.cpp's type 43: one E4M3 code per value, no scale), 2 MiB aligned.
+- `mtp/dense`, `mtp/dense.index`, `mtp/experts`, `mtp/experts.layout`: the GGUF's next-n block (the last block), BF16 as stored,
+  laid out like the main sections (`meta.mtp.dense_shapes` has the 3-D shapes). The official checkpoint has no such layer, so
+  the engine may ignore these sections.
+- `meta`: `arch` `hy4flash`, `geometry`, `engram`, `rope` (MRoPE sections from `config.json`), `hf_config` (the whole
+  `config.json`: vision tower and DFly2 settings), `license`. `vision` and `dfly2` are null until those sections are attached.
+- `--verify` reads the pack back: every section's SHA-256, each source tensor found where the index, layout or `meta.tensors`
+  puts it, with its type, shape, size and SHA-256.
