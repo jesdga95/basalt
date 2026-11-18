@@ -271,8 +271,8 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
         at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         at[0].val.programmaticStreamSerializationAllowed = 1;
         cudaLaunchConfig_t cfg{};
-        cfg.gridDim = dim3(unsigned((n_embd / 4 + 127) / 128), (unsigned) n_tok);
-        cfg.blockDim = dim3(128);
+        cfg.gridDim = dim3(unsigned((n_embd / 4 + 63) / 64), (unsigned) n_tok);
+        cfg.blockDim = dim3(64);
         cfg.stream = static_cast<cudaStream_t>(stream);
         cfg.attrs = at;
         cfg.numAttrs = dep ? 1 : 0;
