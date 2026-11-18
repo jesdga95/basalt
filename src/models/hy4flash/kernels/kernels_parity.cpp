@@ -3,6 +3,7 @@
 // preparation and attention with a sink, the router and the Engram apply. Exit 77 without a GPU.
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/router.hpp"
+#include "basalt/ggml/ggml.h"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
 
@@ -653,6 +654,72 @@ void test_mmq_dense() {
     report("mmq dense Q8_0 64x1536x3072", got, ref, 2e-2);   // the activations are rounded to q8_1
 }
 
+
+// the expert matrices of the K-quant formats through MMQ, as the prompt path runs them: n experts at a stride, rows given by bounds
+void test_mmq_expert(int type, const char* label) {
+    namespace mmq = basalt::prefill::mmq;
+    const int rows = 1536, K = 1536, NE = 3, R0 = 5, R1 = 3, R2 = 9;
+    if (!mmq::built() || !mmq::fits(type, rows)) {
+        std::printf("%-30s skipped\n", label);
+        return;
+    }
+    const size_t row_b = ggml_row_size((ggml_type) type, K), mat = row_b * rows, unit = ggml_type_size((ggml_type) type) * 16, stride = (mat + 4096 + unit - 1) / unit * unit;   // whole blocks, as MMQ steps
+    std::vector<uint8_t> blobs(stride * NE, 0);
+    std::vector<std::vector<float>> deq(NE, std::vector<float>((size_t) rows * K));
+    for (int e = 0; e < NE; ++e) {
+        std::vector<float> w((size_t) rows * K);
+        for (auto& v : w) v = randn(1, 0.05f)[0];
+        ggml_quantize_chunk((ggml_type) type, w.data(), blobs.data() + stride * e, 0, rows, K);
+        for (int r = 0; r < rows; ++r)
+            ggml_get_type_traits((ggml_type) type)->to_float(blobs.data() + stride * e + (size_t) r * row_b, deq[e].data() + (size_t) r * K, K);
+    }
+    const int R = R0 + R1 + R2;
+    std::vector<float> x = randn((size_t) R * K);
+    std::vector<int32_t> bounds = {0, R0, R0 + R1, R}, tok(R);
+    for (int i = 0; i < R; ++i) tok[i] = i;
+    uint8_t* dw = dev(blobs);
+    float *dx = dev(x), *dy = devf((size_t) R * rows);
+    int32_t *db = dev(bounds), *dt = dev(tok), *ident = nullptr;
+    void* xq = nullptr;
+    cudaMalloc(&xq, mmq::q8_bytes(R, K));
+    cudaMalloc(&ident, R * 4);
+    mmq::iota(ident, R, nullptr);
+    mmq::load(type, rows);
+    mmq::quantize(dx, dt, xq, type, K, K, R, nullptr);
+    mmq::Product p;
+    p.w = dw;
+    p.type = type;
+    p.w_rows = rows;
+    p.w_cols = K;
+    p.expert_bytes = stride;
+    p.n = NE;
+    p.xq = xq;
+    p.bounds = db;
+    p.ids = ident;
+    p.total_rows = R;
+    p.max_rows = std::max(R0, std::max(R1, R2));
+    p.dst = dy;
+    p.ld_dst = rows;
+    mmq::Context ctx;
+    ctx.run(p, nullptr);
+    cudaDeviceSynchronize();
+    std::vector<float> got = host(dy, (size_t) R * rows);
+    std::vector<double> ref((size_t) R * rows);
+    for (int e = 0; e < NE; ++e)
+        for (int t = bounds[e]; t < bounds[e + 1]; ++t)
+            for (int r = 0; r < rows; ++r) {
+                double d = 0;
+                for (int i = 0; i < K; ++i) d += (double) deq[e][(size_t) r * K + i] * x[(size_t) t * K + i];
+                ref[(size_t) t * rows + r] = d;
+            }
+    for (int t = 0; t < R; ++t) {
+        int bad = 0;
+        for (int r = 0; r < rows; ++r) bad += !(std::fabs(got[(size_t) t * rows + r] - ref[(size_t) t * rows + r]) <= 0.05 * 3 + 0.03 * std::fabs(ref[(size_t) t * rows + r]));
+        std::printf("  row %d (expert %d): %d of %d outputs off, first got %g want %g\n", t, t < bounds[1] ? 0 : t < bounds[2] ? 1 : 2, bad, rows, got[(size_t) t * rows], ref[(size_t) t * rows]);
+    }
+    report(label, got, ref, 3e-2);
+}
+
 }  // namespace
 
 int main() {
@@ -666,6 +733,8 @@ int main() {
     test_indexer();
     test_fp8();
     test_mmq_dense();
+    test_mmq_expert(12, "mmq experts Q4_K");
+    test_mmq_expert(14, "mmq experts Q6_K");
     std::printf(failures ? "FAILED\n" : "all ok\n");
     return failures ? 1 : 0;
 }
