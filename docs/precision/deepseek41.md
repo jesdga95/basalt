@@ -129,9 +129,10 @@ Prompt skip cannot be scored this way (512-token chunks). On a 64K prompt, the 2
 
 `--route-prior LAMBDA` (bare 0.5) picks a decode window's experts as if each expert a GPU holds had LAMBDA added to its
 router score (`sqrt(softplus(logit)) + bias`; scores run about 0.5 to 3). The weights stay the unbiased score,
-renormalised over the picks, so a substituted expert contributes only what the router gave it. Off by default, never
-picked automatically, and declared lossy: the start warns, `--serve` reports it and `--community` refuses the row. The
-batched prompt path routes unbiased.
+renormalised over the picks, so a substituted expert contributes only what the router gave it. A GPU holds an expert in
+a main-card slot (a home or a copy) or on a second card; no second card was measured here. Off by default, never picked
+automatically, and declared lossy: the start warns, `--serve` reports it and `--community` refuses the row. The batched
+prompt path routes unbiased.
 
 Its speed comes from fewer misses, so it grows with the share of experts no GPU holds, and so does the error. UD-IQ1_M
 on one 32 GB card (243 GB pack, 123 GiB RAM tier, 475 W): step time is tokens/s over tokens per step from the conv
@@ -147,15 +148,30 @@ against the BF16 base (2.7314 PPL there).
 
 The pack's own quantization costs 0.2800 KLD and its published row reads 0.2779 and 83.88%, so this build is 0.002 worse
 than that measurement. Against that, 0.1 adds 0.0047 KLD (1.7% of the pack's own error, about three quarters of what
-the Q6_K dense projections cost) and 0.09 top-1 points for a quarter of the decode time. 0.25 is dominated by 0.1 (the
-same step time, six times the error); the bare 0.5 costs 35% of the pack's own KLD and 2.7 points of top-1. The 20-chunk
+the Q6_K dense projections cost) and 0.09 top-1 points, for a quarter to a half of the decode time. 0.25 is dominated by
+0.1 (the same step time, six times the error); the bare 0.5 costs 35% of the pack's own KLD and 2.7 points of top-1. The 20-chunk
 quick check overstates the low boosts by about half (0.0075 and 0.0324 at 0.1 and 0.25): its text slice is easier (base
 PPL 2.2717 there against 2.7314 over all 100).
 
+The same four settings on the benchmark's own fixtures (`-t conv,struct,prose -p 16384,65536`, two runs each, `--seed 1`
+so every setting reads the same text; the mean):
+
+| `--route-prior` | tg conv | tg struct | tg prose | pp16384 | pp65536 |
+|---|---:|---:|---:|---:|---:|
+| off | 66 | 108 | 70 | 2465 | 3097 |
+| 0.1 | 82 (+23%) | 216 (+100%) | 83 (+18%) | 2459 | 3070 |
+| 0.25 | 93 (+40%) | 284 (+163%) | 96 (+37%) | 2427 | 3060 |
+| 0.5 | 125 (+89%) | 307 (+184%) | 121 (+72%) | 2461 | 3073 |
+
+Prefill does not move: the batched prompt path takes no mask. Decode gains with the window's width, because a step that
+carries four or five drafted tokens (struct accepts 98% at 4.6 to 4.9) asks the CPU lane for that many rows of every
+expert it computes, so each pick moved onto the card saves more: struct doubles at 0.1 where conv gains a quarter.
+Acceptance moves both ways in this sample (conv 74-83% off against 70-78% at 0.1, prose 70-75% against 64-68%), so the
+gains are step time, not drafting luck.
+
 Routing follows the placement, and the placement follows history (promotions, what the last prompt left warm), so the
-same prompt takes a different route, and gives different text, on different runs. The decode fixture's acceptance
-moved from 79.0% to 66-72% at 0.25-0.5, which is why the step time, not the token rate, is the number to read. A machine
-whose VRAM alone holds the experts has nothing to gain here and pays the same error.
+same prompt takes a different route, and gives different text, on different runs. A machine whose VRAM alone holds the
+experts has nothing to gain here and pays the same error.
 
 Reproduce (the base is [basalt-kld-bases](https://huggingface.co/datasets/jesdga/basalt-kld-bases)):
 
