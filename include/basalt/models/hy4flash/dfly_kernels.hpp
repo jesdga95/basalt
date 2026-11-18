@@ -22,8 +22,8 @@ void dfly_absorb_k(const uint16_t* kvb, const float* q, int q_stride, int q_head
 /// out[r][h][v] = sum_c olat[r][h][c] * kvb[(h * 448 + 192 + v) * 512 + c] for v < 256: the value half of `kvb`. rows <= 8.
 void dfly_expand_v(const uint16_t* kvb, const float* olat, int rows, int heads, float* out, void* stream);
 
-/// out[j] = cache[cells[j]] for j < n (rows of `width` floats); cells null: out[j] = cache[j].
-void dfly_gather_rows(const float* cache, const int32_t* cells, int n, int width, float* out, void* stream);
+/// out[j] = cache[cells[j]] for j < n (BF16 rows of `width` values, the target's cache form); cells null: out[j] = cache[j].
+void dfly_gather_rows(const uint16_t* cache, const int32_t* cells, int n, int width, uint16_t* out, void* stream);
 
 /// out[i] = base[i] + gate[i] * fused[i] for i < n (the Gated Fusion's residual).
 void dfly_gate_add(const float* base, const float* fused, const float* gate, int n, float* out, void* stream);

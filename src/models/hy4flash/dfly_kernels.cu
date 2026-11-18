@@ -68,9 +68,9 @@ __global__ void expand_v_kernel(const uint16_t* __restrict__ kvb, const float* _
     }
 }
 
-__global__ void gather_kernel(const float* __restrict__ cache, const int32_t* __restrict__ cells, int width, float* __restrict__ out) {
+__global__ void gather_kernel(const uint16_t* __restrict__ cache, const int32_t* __restrict__ cells, int width, uint16_t* __restrict__ out) {
     const int j = blockIdx.x;
-    const float* src = cache + (size_t) (cells ? cells[j] : j) * width;
+    const uint16_t* src = cache + (size_t) (cells ? cells[j] : j) * width;
     for (int c = threadIdx.x; c < width; c += blockDim.x) out[(size_t) j * width + c] = src[c];
 }
 
@@ -94,7 +94,7 @@ void dfly_expand_v(const uint16_t* kvb, const float* olat, int rows, int heads, 
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
-void dfly_gather_rows(const float* cache, const int32_t* cells, int n, int width, float* out, void* stream) {
+void dfly_gather_rows(const uint16_t* cache, const int32_t* cells, int n, int width, uint16_t* out, void* stream) {
     if (n < 1) return;
     gather_kernel<<<n, 192, 0, (cudaStream_t) stream>>>(cache, cells, width, out);
     if (!stream) cudaStreamSynchronize(nullptr);

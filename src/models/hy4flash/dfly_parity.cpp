@@ -121,14 +121,14 @@ void test_kernels() {
         cudaFree(dkvb); cudaFree(dq); cudaFree(dol); cudaFree(dqa); cudaFree(dout);
     }
     // gather (by cells, and by position) and the gated add
-    std::vector<float> cache(50 * kDflyRowWidth);
-    for (float& x : cache) x = gauss(1.f);
+    std::vector<uint16_t> cache(50 * kDflyRowWidth);
+    for (uint16_t& x : cache) x = to_bf16(gauss(1.f));
     std::vector<int32_t> cells = {49, 0, 7, 7, 31};
-    float *dc = upload(cache), *dout = nullptr;
+    uint16_t *dc = upload(cache), *dout = nullptr;
     int32_t* dcells = upload(cells);
-    cudaMalloc(&dout, 50 * kDflyRowWidth * 4);
+    cudaMalloc(&dout, 50 * kDflyRowWidth * 2);
     dfly_gather_rows(dc, dcells, 5, kDflyRowWidth, dout, nullptr);
-    std::vector<float> got = download(dout, 5 * kDflyRowWidth);
+    std::vector<uint16_t> got = download(dout, 5 * kDflyRowWidth);
     bool same = true;
     for (int j = 0; j < 5; ++j)
         for (int c = 0; c < kDflyRowWidth; ++c) same = same && got[(size_t) j * kDflyRowWidth + c] == cache[(size_t) cells[(size_t) j] * kDflyRowWidth + c];
@@ -136,14 +136,15 @@ void test_kernels() {
     dfly_gather_rows(dc, nullptr, 20, kDflyRowWidth, dout, nullptr);
     got = download(dout, 20 * kDflyRowWidth);
     CHECK(std::equal(got.begin(), got.end(), cache.begin()));
+    std::vector<float> gotf;
     std::vector<float> a(300), b(300), g(300);
     for (int i = 0; i < 300; ++i) { a[(size_t) i] = gauss(1.f); b[(size_t) i] = gauss(1.f); g[(size_t) i] = gauss(1.f); }
     float *da = upload(a), *db = upload(b), *dg = upload(g), *dr = nullptr;
     cudaMalloc(&dr, 300 * 4);
     dfly_gate_add(da, db, dg, 300, dr, nullptr);
-    got = download(dr, 300);
+    gotf = download(dr, 300);
     bool exact = true;
-    for (int i = 0; i < 300; ++i) exact = exact && std::fabs(got[(size_t) i] - (a[(size_t) i] + g[(size_t) i] * b[(size_t) i])) < 1e-6f;   // the device fuses the multiply-add
+    for (int i = 0; i < 300; ++i) exact = exact && std::fabs(gotf[(size_t) i] - (a[(size_t) i] + g[(size_t) i] * b[(size_t) i])) < 1e-6f;   // the device fuses the multiply-add
     CHECK(exact);
     cudaFree(dc); cudaFree(dcells); cudaFree(dout); cudaFree(da); cudaFree(db); cudaFree(dg); cudaFree(dr);
 }
@@ -257,10 +258,10 @@ void test_block() {
     uint16_t* dhead = upload(head.bits);
 
     // the target: caches, the tap's row, selections (a list for layer 0, every position for layer 1)
-    std::vector<std::vector<float>> cache(2, std::vector<float>((size_t) ctx_rows * kDflyRowWidth));
+    std::vector<std::vector<uint16_t>> cache(2, std::vector<uint16_t>((size_t) ctx_rows * kDflyRowWidth));
     for (auto& c : cache)
-        for (float& x : c) x = gauss(1.f);
-    std::vector<float*> dcache = {upload(cache[0]), upload(cache[1])};
+        for (uint16_t& x : c) x = to_bf16(gauss(1.f));
+    std::vector<uint16_t*> dcache = {upload(cache[0]), upload(cache[1])};
     std::vector<int32_t> cells;
     for (int i = 0; i < 37; ++i) cells.push_back(std::uniform_int_distribution<int>(0, pos - 1)(rng));
     cells.push_back(pos - 1);
@@ -286,7 +287,7 @@ void test_block() {
 
     for (int n : {1, 3, 5}) {
         const int32_t anchor = 17;
-        std::vector<const float*> caches = {dcache[0], dcache[1]};
+        std::vector<const uint16_t*> caches = {dcache[0], dcache[1]};
         CHECK(run->begin(anchor, pos, n, *tap, 0, caches.data(), nullptr, err));
         int32_t ids[5];
         float conf[5];
@@ -326,6 +327,7 @@ void test_block() {
                 std::vector<double> rp(kvr[(size_t) r].begin() + 512, kvr[(size_t) r].end());
                 Ref::rot(rp.data(), pos + r, d.rope_base);
                 krow[(size_t) r].insert(krow[(size_t) r].end(), rp.begin(), rp.end());
+                for (double& x : krow[(size_t) r]) x = from_bf16(to_bf16((float) x));   // the block's rows are held as BF16, as the target's cache
             }
             const Mat& kvb = r2.m[p + "self_attn.kv_b_proj.weight"];
             std::vector<std::vector<double>> vout((size_t) R, std::vector<double>((size_t) H * 256));
@@ -344,7 +346,11 @@ void test_block() {
                     std::vector<std::vector<double>> tmp;
                     std::vector<double> sc;
                     std::vector<std::vector<double>> rows;
-                    for (int c : rowsel) rows.emplace_back(cache[(size_t) l].begin() + (size_t) c * 576, cache[(size_t) l].begin() + (size_t) (c + 1) * 576);
+                    for (int c : rowsel) {
+                        std::vector<double> rw(576);
+                        for (int k = 0; k < 576; ++k) rw[(size_t) k] = from_bf16(cache[(size_t) l][(size_t) c * 576 + k]);
+                        rows.push_back(rw);
+                    }
                     for (int b = 0; b <= r; ++b) rows.push_back(krow[(size_t) b]);
                     const double sink = r2.f[p + "self_attn.learnable_sink_param"][(size_t) h];
                     double m = sink;

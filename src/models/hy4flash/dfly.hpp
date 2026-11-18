@@ -152,8 +152,8 @@ public:
     ~DflyRunner();
 
     /// Enqueues the block of `n` drafts (1..5) after `anchor` at `pos` on `stream`: the target's caches `cache[i]` (draft
-    /// layer i's, rows of 576 floats) and the tap's row `row`. Nothing is read from the host but the embeddings.
-    bool begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const float* const* cache, void* stream,
+    /// layer i's, BF16 rows of 576) and the tap's row `row`. Nothing is read from the host but the embeddings.
+    bool begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const uint16_t* const* cache, void* stream,
                std::string& err);
     /// Runs the heads over the block begin() made, in order, each with the token before it: the `n` drafts and each one's
     /// estimated chance of acceptance.
@@ -177,18 +177,23 @@ public:
     bool on() const { return runner_ != nullptr; }
     void begin_window(int64_t pos0) { if (tap_) tap_->begin_window(pos0); }
     void invalidate() { if (tap_) tap_->invalidate(); }
-    void row(int r) { row_ = r; }   ///< the window row the next forward() runs (-1: none is kept)
-    void hidden(const float* fin, void* stream) { if (tap_ && row_ >= 0) tap_->hidden(row_, fin, stream); }
-    void selection(int layer, const int32_t* cells, int n, void* stream) { if (tap_ && row_ >= 0) tap_->selection(layer, row_, cells, n, stream); }
+    void run(int row0) { row0_ = row0; }   ///< the next run of rows starts at this row of the window (-1: none is kept)
+    /// The run's rows `first` .. `first` + n - 1 have the hidden states fin[0..n) (rows of E floats).
+    void hidden(int first, int n, const float* fin, void* stream) {
+        if (tap_ && row0_ >= 0)
+            for (int i = 0; i < n; ++i) tap_->hidden(row0_ + first + i, fin + (size_t) i * w_->dims.E, stream);
+    }
+    /// Run row `t`'s selection in target layer `layer`: n cells (device), or n < 0 for every position up to the row.
+    void selection(int layer, int t, const int32_t* cells, int n, void* stream) { if (tap_ && row0_ >= 0) tap_->selection(layer, row0_ + t, cells, n, stream); }
     /// `cache`: the session's per-layer cache rows. A block is made only where the tap holds the row before `pos`.
-    model::Result draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<float*>& cache, void* stream);
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint16_t*>& cache, void* stream);
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream);
 
 private:
     std::unique_ptr<DflyTap> tap_;
     std::unique_ptr<DflyRunner> runner_;
     const DflyWeights* w_ = nullptr;
-    int row_ = -1, pending_ = 0;
+    int row0_ = -1, pending_ = 0;
     int64_t ctx_ = 0;
 };
 
