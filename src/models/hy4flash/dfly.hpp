@@ -174,8 +174,10 @@ class DflyHook {
 public:
     ~DflyHook();
     /// `w` null: no drafter. `ctx` the context in positions.
+    /// `dump` (--diag-dump's directory, may be empty): each block's inputs (the source row's hidden state, the cache rows it attends)
+    /// are written there for the first few blocks, to compare with a reference.
     bool init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16_t* head, std::function<bool(int32_t, float*)> embed,
-              std::string& err);
+              const std::string& dump, std::string& err);
     bool on() const { return runner_ != nullptr; }
     void begin_window(int64_t pos0) { if (tap_) tap_->begin_window(pos0); }
     void invalidate() { if (tap_) tap_->invalidate(); }
@@ -195,7 +197,12 @@ private:
     std::unique_ptr<DflyTap> tap_;
     std::unique_ptr<DflyRunner> runner_;
     const DflyWeights* w_ = nullptr;
-    int row0_ = -1, pending_ = 0;
+    int row0_ = -1, pending_ = 0, dumped_ = 0, dump_n_ = 0;
+    int64_t dump_pos_ = -1;
+    int32_t dump_anchor_ = 0;
+    const uint16_t* head_ = nullptr;
+    std::function<bool(int32_t, float*)> embed_;
+    std::string dump_;
     int64_t ctx_ = 0;
 };
 
