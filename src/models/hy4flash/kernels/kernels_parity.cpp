@@ -147,91 +147,6 @@ void test_hc() {
     }
 }
 
-void test_gemv() {
-    for (auto [heads, rows, k] : {std::tuple<int, int, int>{32, 512, 192}, {64, 256, 512}}) {
-        Q8 w = make_q8(heads * rows, k);
-        const int xs = k == 192 ? 256 : k;   // the query's head stride vs a packed latent
-        std::vector<float> x = randn((size_t) heads * xs);
-        uint8_t* dw = dev(w.bytes);
-        float *dx = dev(x), *dy = devf((size_t) heads * rows);
-        q8_0_heads_gemv(dw, dx, xs, heads, rows, k, dy, nullptr);
-        std::vector<float> got = host(dy, (size_t) heads * rows);
-        std::vector<double> ref((size_t) heads * rows);
-        for (int h = 0; h < heads; ++h)
-            for (int r = 0; r < rows; ++r) {
-                double d = 0;
-                for (int i = 0; i < k; ++i) d += (double) w.vals[((size_t) h * rows + r) * k + i] * x[(size_t) h * xs + i];
-                ref[(size_t) h * rows + r] = d;
-            }
-        char name[64];
-        std::snprintf(name, sizeof name, "q8_0_heads_gemv %dx%dx%d", heads, rows, k);
-        report(name, got, ref, 1e-5);
-    }
-}
-
-void test_mla() {
-    for (auto [heads, base_f, window] : {std::tuple<int, float, int>{32, 1e7f, 0}, {64, 1e4f, 512}}) {
-        MlaArgs a;
-        a.heads = heads;
-        a.rope_base = base_f;
-        const int W = a.rank + a.rope, Q = a.nope + a.rope, cells = 700, pos = cells - 1;
-        std::vector<float> q = randn((size_t) heads * Q), qabs = randn((size_t) heads * a.rank, 0.3f), kvraw = randn(W),
-                           norm = randn(a.rank, 0.2f), cache = randn((size_t) cells * W, 0.5f), sinks = randn(heads, 1.f);
-        for (auto& v : norm) v += 1.f;
-        float *dq = dev(q), *dqa = dev(qabs), *dkv = dev(kvraw), *dn = dev(norm), *dc = dev(cache), *ds = dev(sinks);
-        float *dqcur = devf((size_t) heads * W), *dlat = devf((size_t) heads * a.rank);
-        mla_prepare(dq, dqa, dkv, dn, a, pos, dqcur, dc + (size_t) pos * W, nullptr);
-        std::vector<float> qcur = host(dqcur, (size_t) heads * W), row = host(dc + (size_t) pos * W, W);
-        // references
-        std::vector<double> rq((size_t) heads * W), rrow(W);
-        auto rot = [&](const float* p, double* o, int h_unused) {
-            (void) h_unused;
-            for (int i = 0; i < a.rope / 2; ++i) {
-                const double th = pos * std::pow((double) base_f, -2.0 * i / a.rope);
-                o[2 * i] = p[2 * i] * std::cos(th) - p[2 * i + 1] * std::sin(th);
-                o[2 * i + 1] = p[2 * i] * std::sin(th) + p[2 * i + 1] * std::cos(th);
-            }
-        };
-        for (int h = 0; h < heads; ++h) {
-            for (int c = 0; c < a.rank; ++c) rq[(size_t) h * W + c] = qabs[(size_t) h * a.rank + c];
-            rot(&q[(size_t) h * Q + a.nope], &rq[(size_t) h * W + a.rank], h);
-        }
-        double ss = 0;
-        for (int c = 0; c < a.rank; ++c) ss += (double) kvraw[c] * kvraw[c];
-        const double rs = 1.0 / std::sqrt(ss / a.rank + a.rms_eps);
-        for (int c = 0; c < a.rank; ++c) rrow[c] = kvraw[c] * rs * norm[c];
-        rot(&kvraw[a.rank], &rrow[a.rank], 0);
-        report("mla_prepare query", qcur, rq, 2e-5);
-        report("mla_prepare cache row", row, rrow, 2e-5);
-        // attention over the window, over the prepared (device) rows
-        cache = host(dc, (size_t) cells * W);
-        const int first = window ? std::max(0, pos + 1 - window) : 0, n = pos + 1 - first;
-        mla_attend(dqcur, dc, first, n, ds, a, dlat, nullptr);
-        std::vector<float> got = host(dlat, (size_t) heads * a.rank);
-        std::vector<double> ref((size_t) heads * a.rank);
-        for (int h = 0; h < heads; ++h) {
-            std::vector<double> s(n);
-            double m = sinks[h];
-            for (int j = 0; j < n; ++j) {
-                double d = 0;
-                for (int c = 0; c < W; ++c) d += (double) qcur[(size_t) h * W + c] * cache[(size_t) (first + j) * W + c];
-                s[j] = d * a.scale;
-                m = std::max(m, s[j]);
-            }
-            double den = std::exp(sinks[h] - m);
-            for (int j = 0; j < n; ++j) { s[j] = std::exp(s[j] - m); den += s[j]; }
-            for (int c = 0; c < a.rank; ++c) {
-                double o = 0;
-                for (int j = 0; j < n; ++j) o += s[j] * cache[(size_t) (first + j) * W + c];
-                ref[(size_t) h * a.rank + c] = o / den;
-            }
-        }
-        char name[64];
-        std::snprintf(name, sizeof name, "mla_attend %d heads, %d cells", heads, n);
-        report(name, got, ref, 1e-4);
-    }
-}
-
 void test_router() {
     const int NE = 512, E = 3072, K = 16;
     std::vector<float> x = randn(E), gate = randn((size_t) NE * E, 0.05f), bias = randn(NE, 0.3f);
@@ -272,29 +187,223 @@ void test_router() {
     failures += !same;
 }
 
+void test_gemv() {
+    const int T = 3;
+    for (auto [heads, rows, k] : {std::tuple<int, int, int>{32, 512, 192}, {64, 256, 512}}) {
+        Q8 w = make_q8(heads * rows, k);
+        const int xs = k == 192 ? 256 : k;   // the query's head stride vs a packed latent
+        const int tok = heads * xs;
+        std::vector<float> x = randn((size_t) T * tok);
+        uint8_t* dw = dev(w.bytes);
+        float *dx = dev(x), *dy = devf((size_t) T * heads * rows);
+        q8_0_heads_gemv(dw, dx, xs, tok, heads, rows, k, T, dy, nullptr);
+        std::vector<float> got = host(dy, (size_t) T * heads * rows);
+        std::vector<double> ref((size_t) T * heads * rows);
+        for (int t = 0; t < T; ++t)
+            for (int h = 0; h < heads; ++h)
+                for (int r = 0; r < rows; ++r) {
+                    double d = 0;
+                    for (int i = 0; i < k; ++i) d += (double) w.vals[((size_t) h * rows + r) * k + i] * x[(size_t) t * tok + (size_t) h * xs + i];
+                    ref[((size_t) t * heads + h) * rows + r] = d;
+                }
+        char name[64];
+        std::snprintf(name, sizeof name, "q8_0_heads_gemv %dx%dx%d", heads, rows, k);
+        report(name, got, ref, 1e-5);
+        float* d1 = devf((size_t) heads * rows);
+        q8_0_heads_gemv(dw, dx + (size_t) 1 * tok, xs, tok, heads, rows, k, 1, d1, nullptr);
+        const bool same = std::memcmp(host(d1, (size_t) heads * rows).data(), got.data() + (size_t) heads * rows, (size_t) heads * rows * 4) == 0;
+        std::printf("%-30s %s\n", "  row independence", same ? "bitwise" : "FAIL");
+        failures += !same;
+    }
+}
+
+uint16_t to_bf16(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    u += 0x7FFF + ((u >> 16) & 1);
+    return (uint16_t) (u >> 16);
+}
+float from_bf16(uint16_t b) {
+    uint32_t u = (uint32_t) b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+// a reference for the attention of one row over `cells` of a cache (given as floats)
+std::vector<double> ref_attend(const std::vector<float>& qcur, const std::vector<float>& cache, const std::vector<int>& cells, int h,
+                               const MlaArgs& a, float sink) {
+    const int W = a.rank + a.rope, n = (int) cells.size();
+    std::vector<double> s(n);
+    double m = sink;
+    for (int j = 0; j < n; ++j) {
+        double d = 0;
+        for (int c = 0; c < W; ++c) d += (double) qcur[(size_t) h * W + c] * cache[(size_t) cells[j] * W + c];
+        s[j] = d * a.scale;
+        m = std::max(m, s[j]);
+    }
+    double den = std::exp(sink - m);
+    for (int j = 0; j < n; ++j) { s[j] = std::exp(s[j] - m); den += s[j]; }
+    std::vector<double> o(a.rank);
+    for (int c = 0; c < a.rank; ++c) {
+        double acc = 0;
+        for (int j = 0; j < n; ++j) acc += s[j] * cache[(size_t) cells[j] * W + c];
+        o[c] = acc / den;
+    }
+    return o;
+}
+
+void test_mla() {
+    // 1: three rows at pos0, a window ring; 2: the rows over explicit cell lists; both with fp32 and BF16 caches
+    for (auto [heads, base_f, ring] : {std::tuple<int, float, int>{32, 1e7f, 0}, {64, 1e4f, 700}}) {
+        MlaArgs a;
+        a.heads = heads;
+        a.rope_base = base_f;
+        const int W = a.rank + a.rope, Q = a.nope + a.rope, T = 3, pos0 = 650, cap = ring ? ring : 1000;
+        std::vector<float> q = randn((size_t) T * heads * Q), qabs = randn((size_t) T * heads * a.rank, 0.3f), kvraw = randn((size_t) T * W),
+                           norm = randn(a.rank, 0.2f), sinks = randn(heads, 1.f), cache0 = randn((size_t) cap * W, 0.5f);
+        for (auto& v : norm) v += 1.f;
+        for (int bf = 0; bf < 2; ++bf) {
+            float *dq = dev(q), *dqa = dev(qabs), *dkv = dev(kvraw), *dn = dev(norm), *ds = dev(sinks);
+            float *dqcur = devf((size_t) T * heads * W), *dlat = devf((size_t) T * heads * a.rank);
+            std::vector<float> cache = cache0;
+            std::vector<uint16_t> cbf(cache.size());
+            for (size_t i = 0; i < cache.size(); ++i) cbf[i] = to_bf16(cache[i]);
+            float* dc32 = dev(cache);
+            uint16_t* dc16 = dev(cbf);
+            if (bf) mla_prepare(dq, dqa, dkv, dn, a, pos0, T, ring, dqcur, dc16, nullptr);
+            else mla_prepare(dq, dqa, dkv, dn, a, pos0, T, ring, dqcur, dc32, nullptr);
+            std::vector<float> qcur = host(dqcur, (size_t) T * heads * W);
+            std::vector<float> rows32 = bf ? std::vector<float>() : host(dc32, cache.size());
+            if (bf) {
+                std::vector<uint16_t> r = host(dc16, cbf.size());
+                rows32.resize(r.size());
+                for (size_t i = 0; i < r.size(); ++i) rows32[i] = from_bf16(r[i]);
+            }
+            // references: query rows and cache rows
+            std::vector<double> rq((size_t) T * heads * W);
+            bool rows_ok = true;
+            for (int t = 0; t < T; ++t) {
+                const int pos = pos0 + t;
+                auto rot = [&](const float* p, double* o) {
+                    for (int i = 0; i < a.rope / 2; ++i) {
+                        const double th = pos * std::pow((double) base_f, -2.0 * i / a.rope);
+                        o[2 * i] = p[2 * i] * std::cos(th) - p[2 * i + 1] * std::sin(th);
+                        o[2 * i + 1] = p[2 * i] * std::sin(th) + p[2 * i + 1] * std::cos(th);
+                    }
+                };
+                for (int h = 0; h < heads; ++h) {
+                    for (int c = 0; c < a.rank; ++c) rq[((size_t) t * heads + h) * W + c] = qabs[((size_t) t * heads + h) * a.rank + c];
+                    rot(&q[((size_t) t * heads + h) * Q + a.nope], &rq[((size_t) t * heads + h) * W + a.rank]);
+                }
+                double ss = 0;
+                for (int c = 0; c < a.rank; ++c) ss += (double) kvraw[(size_t) t * W + c] * kvraw[(size_t) t * W + c];
+                const double rs = 1.0 / std::sqrt(ss / a.rank + a.rms_eps);
+                std::vector<double> row(W);
+                for (int c = 0; c < a.rank; ++c) row[c] = kvraw[(size_t) t * W + c] * rs * norm[c];
+                rot(&kvraw[(size_t) t * W + a.rank], &row[a.rank]);
+                const size_t cell = ring ? pos % ring : pos;
+                for (int c = 0; c < W; ++c) {
+                    const double got = rows32[cell * W + c];
+                    rows_ok = rows_ok && std::fabs(got - row[c]) <= (bf ? 8e-3 * (std::fabs(row[c]) + 1e-2) : 6e-5 + 3e-5 * std::fabs(row[c]));   // the rotation's angle is fp32
+                }
+            }
+            std::vector<float> qcur_ref(rq.begin(), rq.end());
+            report(bf ? "mla_prepare query (bf16 run)" : "mla_prepare query", qcur, rq, 3e-5);
+            std::printf("%-30s %s\n", bf ? "mla_prepare rows (bf16)" : "mla_prepare rows", rows_ok ? "ok" : "FAIL");
+            failures += !rows_ok;
+            // attention: row t over the last (up to) 512 positions, or over a given list
+            std::vector<int32_t> firsts(T), counts(T), cells_list;
+            const int stride = 1100;
+            cells_list.assign((size_t) T * stride, 0);
+            for (int use_cells = 0; use_cells < 2; ++use_cells) {
+                std::vector<std::vector<int>> lists(T);
+                for (int t = 0; t < T; ++t) {
+                    const int pos = pos0 + t;
+                    if (!use_cells) {
+                        const int first = ring ? std::max(0, pos + 1 - 512) : 0;
+                        firsts[t] = first;
+                        counts[t] = pos + 1 - first;
+                        for (int j = 0; j < counts[t]; ++j) lists[t].push_back(ring ? (first + j) % ring : first + j);
+                    } else {   // every 3rd cell of the cap: a selection
+                        firsts[t] = 0;
+                        for (int c = t % 3; c < cap && (int) lists[t].size() < 900 + t; c += 3) lists[t].push_back(c);
+                        counts[t] = (int) lists[t].size();
+                        for (int j = 0; j < counts[t]; ++j) cells_list[(size_t) t * stride + j] = lists[t][j];
+                    }
+                }
+                int32_t *df = dev(firsts), *dcnt = dev(counts), *dcl = dev(cells_list);
+                RowSpans rs;
+                rs.firsts = df;
+                rs.counts = dcnt;
+                rs.cells = use_cells ? dcl : nullptr;
+                rs.cells_stride = stride;
+                if (bf) mla_attend(dqcur, dc16, rs, T, ds, a, use_cells ? 0 : ring, dlat, nullptr);
+                else mla_attend(dqcur, dc32, rs, T, ds, a, use_cells ? 0 : ring, dlat, nullptr);
+                std::vector<float> got = host(dlat, (size_t) T * heads * a.rank);
+                std::vector<double> ref;
+                for (int t = 0; t < T; ++t)
+                    for (int h = 0; h < heads; ++h) {
+                        std::vector<float> qrow(qcur.begin() + (size_t) t * heads * W, qcur.begin() + (size_t) (t + 1) * heads * W);
+                        std::vector<double> o = ref_attend(qrow, rows32, lists[t], h, a, sinks[h]);
+                        ref.insert(ref.end(), o.begin(), o.end());
+                    }
+                char name[96];
+                std::snprintf(name, sizeof name, "mla_attend %d heads%s%s", heads, use_cells ? ", cell lists" : ", spans", bf ? ", bf16" : "");
+                report(name, got, ref, 1e-4);
+                if (!use_cells && !ring) {   // row independence: row 1 alone
+                    float* d1 = devf((size_t) heads * a.rank);
+                    RowSpans r1;
+                    r1.firsts = df + 1;
+                    r1.counts = dcnt + 1;
+                    if (bf) mla_attend(dqcur + (size_t) heads * W, dc16, r1, 1, ds, a, 0, d1, nullptr);
+                    else mla_attend(dqcur + (size_t) heads * W, dc32, r1, 1, ds, a, 0, d1, nullptr);
+                    const bool same = std::memcmp(host(d1, (size_t) heads * a.rank).data(), got.data() + (size_t) heads * a.rank, (size_t) heads * a.rank * 4) == 0;
+                    std::printf("%-30s %s\n", "  row independence", same ? "bitwise" : "FAIL");
+                    failures += !same;
+                }
+            }
+            // iota
+            int32_t* dcl = nullptr;
+            cudaMalloc(&dcl, (size_t) T * 64 * 4);
+            cudaMemset(dcl, 0xff, (size_t) T * 64 * 4);
+            std::vector<int32_t> fill = {10, 0, 33};
+            int32_t* dfill = dev(fill);
+            iota_cells(dcl, 64, dfill, T, nullptr);
+            std::vector<int32_t> ic = host(dcl, (size_t) T * 64);
+            bool ok = true;
+            for (int j = 0; j < 10; ++j) ok = ok && ic[j] == j;
+            ok = ok && ic[64] == -1;
+            for (int j = 0; j < 33; ++j) ok = ok && ic[2 * 64 + j] == j;
+            if (!bf) { std::printf("%-30s %s\n", "iota_cells", ok ? "equal" : "FAIL"); failures += !ok; }
+        }
+    }
+}
+
 void test_engram() {
-    const int n = 3072;
+    const int n = 3072, T = 3;
     EngramArgs a;
-    std::vector<float> x = randn((size_t) 4 * n), kv = randn((size_t) 5 * n), kvb = randn((size_t) 5 * n, 0.1f), gw = randn((size_t) 4 * n, 0.3f),
+    std::vector<float> x = randn((size_t) T * 4 * n), kv = randn((size_t) T * 5 * n), kvb = randn((size_t) 5 * n, 0.1f), gw = randn((size_t) 4 * n, 0.3f),
                        gamma = randn(n, 0.5f), hs = randn((size_t) 4 * n, 0.2f);
-    for (float valid : {1.f, 0.f}) {
-        float *dx = dev(x), *dkv = dev(kv), *dkb = dev(kvb), *dgw = dev(gw), *dgm = dev(gamma), *dhs = dev(hs);
-        engram_apply(dkv, dkb, dgw, dgm, dhs, valid, a, dx, nullptr);
-        std::vector<float> got = host(dx, (size_t) 4 * n);
-        std::vector<double> ref((size_t) 4 * n);
-        auto rms = [&](const std::vector<double>& v) {
-            double ss = 0;
-            for (double e : v) ss += e * e;
-            return 1.0 / std::sqrt(ss / v.size() + a.eps);
-        };
+    std::vector<float> valid = {1.f, 0.f, 1.f};
+    float *dx = dev(x), *dkv = dev(kv), *dkb = dev(kvb), *dgw = dev(gw), *dgm = dev(gamma), *dhs = dev(hs), *dv = dev(valid);
+    engram_apply(dkv, dkb, dgw, dgm, dhs, dv, T, a, dx, nullptr);
+    std::vector<float> got = host(dx, (size_t) T * 4 * n);
+    std::vector<double> ref((size_t) T * 4 * n);
+    auto rms = [&](const std::vector<double>& v) {
+        double ss = 0;
+        for (double e : v) ss += e * e;
+        return 1.0 / std::sqrt(ss / v.size() + a.eps);
+    };
+    for (int t = 0; t < T; ++t) {
         std::vector<double> val(n);
-        for (int j = 0; j < n; ++j) val[j] = (double) kv[(size_t) 4 * n + j] + kvb[(size_t) 4 * n + j];
+        for (int j = 0; j < n; ++j) val[j] = (double) kv[((size_t) t * 5 + 4) * n + j] + kvb[(size_t) 4 * n + j];
         const double rv = rms(val);
         for (int i = 0; i < 4; ++i) {
             std::vector<double> xi(n), key(n);
             for (int j = 0; j < n; ++j) {
-                xi[j] = x[(size_t) i * n + j];
-                key[j] = (double) kv[(size_t) i * n + j] + kvb[(size_t) i * n + j];
+                xi[j] = x[((size_t) t * 4 + i) * n + j];
+                key[j] = (double) kv[((size_t) t * 5 + i) * n + j] + kvb[(size_t) i * n + j];
             }
             const double rx = rms(xi), rk = rms(key);
             double d = 0;
@@ -303,43 +412,63 @@ void test_engram() {
             const double mag = std::sqrt(std::max(std::fabs(d), 1e-6));
             const double g = sig(d < 0 ? -mag : mag);
             for (int j = 0; j < n; ++j)
-                ref[(size_t) i * n + j] = xi[j] + valid * val[j] * rv * gamma[j] * (g + hs[(size_t) i * n + j]);
+                ref[((size_t) t * 4 + i) * n + j] = xi[j] + valid[t] * val[j] * rv * gamma[j] * (g + hs[(size_t) i * n + j]);
         }
-        report(valid > 0 ? "engram_apply" : "engram_apply (masked)", got, ref, 2e-6);
     }
+    report("engram_apply (rows, one masked)", got, ref, 2e-6);
 }
 
 void test_indexer() {
     IndexerArgs a;
-    const int D = a.dim, P = a.pool;
-    // pooling
-    std::vector<float> vals = randn((size_t) P * D), gates = randn((size_t) P * D), ape = randn((size_t) P * D, 0.3f), nw = randn(D, 0.2f);
+    const int D = a.dim, P = a.pool, RING = 16;
+    // pooling of 3 groups out of a ring (the groups start at 1228, a multiple of 4)
+    std::vector<float> vals = randn((size_t) RING * D), gates = randn((size_t) RING * D), ape = randn((size_t) P * D, 0.3f), nw = randn(D, 0.2f);
     for (auto& v : nw) v += 1.f;
-    const int first = 1236;
-    float *dv = dev(vals), *dg = dev(gates), *da = dev(ape), *dn = dev(nw), *dp = devf(D);
-    idx_pool(dv, dg, da, dn, a, first, dp, nullptr);
-    std::vector<float> got = host(dp, D);
-    std::vector<double> ref(D), row(D);
-    for (int d = 0; d < D; ++d) {
-        double mx = -1e30, s = 0, acc = 0;
-        for (int j = 0; j < P; ++j) mx = std::max(mx, (double) gates[(size_t) j * D + d] + ape[(size_t) j * D + d]);
-        for (int j = 0; j < P; ++j) s += std::exp(gates[(size_t) j * D + d] + ape[(size_t) j * D + d] - mx);
-        for (int j = 0; j < P; ++j) acc += std::exp(gates[(size_t) j * D + d] + ape[(size_t) j * D + d] - mx) / s * vals[(size_t) j * D + d];
-        row[d] = acc;
+    const int first = 1228, G = 3, NP = 5000;
+    float *dv = dev(vals), *dg = dev(gates), *da = dev(ape), *dn = dev(nw), *dp = devf((size_t) (first / P + G) * D);
+    idx_pool(dv, dg, da, dn, a, RING, first, G, dp, nullptr);
+    std::vector<float> got = host(dp + (size_t) (first / P) * D, (size_t) G * D);
+    std::vector<double> ref((size_t) G * D);
+    for (int g = 0; g < G; ++g) {
+        const int p0 = first + g * P;
+        std::vector<double> row(D);
+        for (int d = 0; d < D; ++d) {
+            double mx = -1e30, s = 0, acc = 0;
+            for (int j = 0; j < P; ++j) mx = std::max(mx, (double) gates[(size_t) ((p0 + j) % RING) * D + d] + ape[(size_t) j * D + d]);
+            for (int j = 0; j < P; ++j) s += std::exp(gates[(size_t) ((p0 + j) % RING) * D + d] + ape[(size_t) j * D + d] - mx);
+            for (int j = 0; j < P; ++j)
+                acc += std::exp(gates[(size_t) ((p0 + j) % RING) * D + d] + ape[(size_t) j * D + d] - mx) / s * vals[(size_t) ((p0 + j) % RING) * D + d];
+            row[d] = acc;
+        }
+        double ss = 0;
+        for (double v : row) ss += v * v;
+        for (int d = 0; d < D; ++d) row[d] = row[d] / std::sqrt(ss / D + a.eps) * nw[d];
+        for (int d = 0; d < D; ++d) ref[(size_t) g * D + d] = row[d];
+        for (int i = 0; i < a.rope / 2; ++i) {
+            const double th = p0 * std::pow((double) a.rope_base, -2.0 * i / a.rope);
+            const double x0 = row[D - a.rope + 2 * i], x1 = row[D - a.rope + 2 * i + 1];
+            ref[(size_t) g * D + D - a.rope + 2 * i] = x0 * std::cos(th) - x1 * std::sin(th);
+            ref[(size_t) g * D + D - a.rope + 2 * i + 1] = x0 * std::sin(th) + x1 * std::cos(th);
+        }
     }
-    double ss = 0;
-    for (double v : row) ss += v * v;
-    for (int d = 0; d < D; ++d) row[d] = row[d] / std::sqrt(ss / D + a.eps) * nw[d];
-    ref = row;
-    for (int i = 0; i < a.rope / 2; ++i) {
-        const double th = first * std::pow((double) a.rope_base, -2.0 * i / a.rope);
-        const double x0 = row[D - a.rope + 2 * i], x1 = row[D - a.rope + 2 * i + 1];
-        ref[D - a.rope + 2 * i] = x0 * std::cos(th) - x1 * std::sin(th);
-        ref[D - a.rope + 2 * i + 1] = x0 * std::sin(th) + x1 * std::cos(th);
-    }
-    report("idx_pool", got, ref, 2e-5);
+    report("idx_pool (3 groups, ring)", got, ref, 1e-4);   // the rotation's angle is fp32
+    // the query rotation of 2 rows
+    std::vector<float> qq = randn((size_t) 2 * a.heads * D);
+    float* dqq = dev(qq);
+    idx_rope_heads(dqq, a, 700, 2, nullptr);
+    std::vector<float> qg = host(dqq, qq.size());
+    std::vector<double> qr(qq.begin(), qq.end());
+    for (int t = 0; t < 2; ++t)
+        for (int h = 0; h < a.heads; ++h)
+            for (int i = 0; i < a.rope / 2; ++i) {
+                const double th = (700 + t) * std::pow((double) a.rope_base, -2.0 * i / a.rope);
+                const size_t o = ((size_t) t * a.heads + h) * D + D - a.rope + 2 * i;
+                qr[o] = qq[o] * std::cos(th) - qq[o + 1] * std::sin(th);
+                qr[o + 1] = qq[o] * std::sin(th) + qq[o + 1] * std::cos(th);
+            }
+    report("idx_rope_heads (2 rows)", qg, qr, 2e-5);
     // scores and selection over many pools, with ties
-    const int NP = 5000, K = 511;
+    const int K = 511;
     std::vector<float> q = randn((size_t) a.heads * D), w = randn(a.heads, 0.05f), pooled = randn((size_t) NP * D);
     float *dq = dev(q), *dw = dev(w), *dpool = dev(pooled), *dsc = devf(NP);
     idx_scores(dq, dw, dpool, NP, a, dsc, nullptr);
@@ -379,100 +508,6 @@ void test_indexer() {
     }
 }
 
-uint16_t to_bf16(float f) {
-    uint32_t u;
-    std::memcpy(&u, &f, 4);
-    u += 0x7FFF + ((u >> 16) & 1);
-    return (uint16_t) (u >> 16);
-}
-float from_bf16(uint16_t b) {
-    uint32_t u = (uint32_t) b << 16;
-    float f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-
-void test_mla_bf16() {
-    MlaArgs a;
-    a.heads = 32;
-    const int W = a.rank + a.rope, Q = a.nope + a.rope, cells = 900, pos = cells - 1, n = cells;
-    std::vector<float> q = randn((size_t) a.heads * Q), qabs = randn((size_t) a.heads * a.rank, 0.3f), kvraw = randn(W),
-                       norm = randn(a.rank, 0.2f), sinks = randn(a.heads);
-    for (auto& v : norm) v += 1.f;
-    std::vector<float> rows = randn((size_t) cells * W, 0.5f);
-    std::vector<uint16_t> bf((size_t) cells * W);
-    for (size_t i = 0; i < bf.size(); ++i) bf[i] = to_bf16(rows[i]);
-    float *dq = dev(q), *dqa = dev(qabs), *dkv = dev(kvraw), *dn = dev(norm), *ds = dev(sinks);
-    uint16_t* dc = dev(bf);
-    float *dqcur = devf((size_t) a.heads * W), *dlat = devf((size_t) a.heads * a.rank);
-    mla_prepare(dq, dqa, dkv, dn, a, pos, dqcur, dc + (size_t) pos * W, nullptr);
-    std::vector<uint16_t> row = host(dc + (size_t) pos * W, W);
-    // the row against fp32 preparation, within BF16's rounding
-    float* dr32 = devf(W);
-    mla_prepare(dq, dqa, dkv, dn, a, pos, dqcur, dr32, nullptr);
-    std::vector<float> r32 = host(dr32, W);
-    bool exact = true;
-    for (int c = 0; c < W; ++c) exact = exact && row[c] == to_bf16(r32[c]);
-    std::printf("%-30s %s\n", "mla_prepare bf16 row", exact ? "bitwise = rn(fp32 row)" : "FAIL");
-    failures += !exact;
-    bf = host(dc, (size_t) cells * W);
-    std::vector<float> qcur = host(dqcur, (size_t) a.heads * W);
-    mla_attend(dqcur, dc, 0, n, ds, a, dlat, nullptr);
-    std::vector<float> got = host(dlat, (size_t) a.heads * a.rank);
-    std::vector<double> ref((size_t) a.heads * a.rank);
-    for (int h = 0; h < a.heads; ++h) {
-        std::vector<double> sc(n);
-        double m = sinks[h];
-        for (int j = 0; j < n; ++j) {
-            double d = 0;
-            for (int c = 0; c < W; ++c) d += (double) qcur[(size_t) h * W + c] * from_bf16(bf[(size_t) j * W + c]);
-            sc[j] = d * a.scale;
-            m = std::max(m, sc[j]);
-        }
-        double den = std::exp(sinks[h] - m);
-        for (int j = 0; j < n; ++j) { sc[j] = std::exp(sc[j] - m); den += sc[j]; }
-        for (int c = 0; c < a.rank; ++c) {
-            double o = 0;
-            for (int j = 0; j < n; ++j) o += sc[j] * from_bf16(bf[(size_t) j * W + c]);
-            ref[(size_t) h * a.rank + c] = o / den;
-        }
-    }
-    report("mla_attend (bf16 cache)", got, ref, 1e-4);
-}
-
-void test_attend_cells() {
-    MlaArgs a;
-    a.heads = 32;
-    const int W = a.rank + a.rope, cells_n = 3000, n = 2052;
-    std::vector<float> qcur = randn((size_t) a.heads * W, 0.3f), cache = randn((size_t) cells_n * W, 0.5f), sinks = randn(a.heads);
-    std::vector<int32_t> cells(n);
-    for (int j = 0; j < n; ++j) cells[j] = (j * 7 + 3) % cells_n;   // distinct for n <= cells_n (7 and 3000 are coprime)
-    std::sort(cells.begin(), cells.end());
-    float *dq = dev(qcur), *dc = dev(cache), *ds = dev(sinks), *dl = devf((size_t) a.heads * a.rank);
-    int32_t* dcells = dev(cells);
-    mla_attend(dq, dc, 0, n, ds, a, dl, nullptr, dcells);
-    std::vector<float> got = host(dl, (size_t) a.heads * a.rank);
-    std::vector<double> ref((size_t) a.heads * a.rank);
-    for (int h = 0; h < a.heads; ++h) {
-        std::vector<double> s(n);
-        double m = sinks[h];
-        for (int j = 0; j < n; ++j) {
-            double d = 0;
-            for (int c = 0; c < W; ++c) d += (double) qcur[(size_t) h * W + c] * cache[(size_t) cells[j] * W + c];
-            s[j] = d * a.scale;
-            m = std::max(m, s[j]);
-        }
-        double den = std::exp(sinks[h] - m);
-        for (int j = 0; j < n; ++j) { s[j] = std::exp(s[j] - m); den += s[j]; }
-        for (int c = 0; c < a.rank; ++c) {
-            double o = 0;
-            for (int j = 0; j < n; ++j) o += s[j] * cache[(size_t) cells[j] * W + c];
-            ref[(size_t) h * a.rank + c] = o / den;
-        }
-    }
-    report("mla_attend (cell list)", got, ref, 1e-4);
-}
-
 }  // namespace
 
 int main() {
@@ -484,8 +519,6 @@ int main() {
     test_router();
     test_engram();
     test_indexer();
-    test_attend_cells();
-    test_mla_bf16();
     std::printf(failures ? "FAILED\n" : "all ok\n");
     return failures ? 1 : 0;
 }
