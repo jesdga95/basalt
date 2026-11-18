@@ -5,6 +5,7 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/program/options.hpp"
+#include "models/hy4flash/dfly.hpp"   // DFLY HOOK
 #include "models/hy4flash/meta.hpp"
 #include "models/hy4flash/model.hpp"
 
@@ -38,6 +39,16 @@ public:
         f.text_end = "</arg_value>";
         f.trigger = "<tool_calls>";
         return f;
+    }
+
+    // DFLY HOOK: --spec and its companions, as DeepSeek's
+    bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
+        (void) code;
+        return dfly_parse_flag(a, args, o);
+    }
+    std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        dfly_finish_flags(o);
+        return std::nullopt;
     }
 
     PreTokenizer pretokenizer() const override { return {"hy_v4", pretok_hy4}; }
