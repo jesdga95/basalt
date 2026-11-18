@@ -632,6 +632,37 @@ private:
             bk::native_mmvq(w->type, w->ptr, q8_, y + (size_t) c0 * n_out, n_in, n_out, nc, stream_);
         }
     }
+    // The per-head products of the absorbed attention (k_b: 192 -> 512, v_b: 512 -> 256 per head): a chunk takes MMQ, a head at a time
+    // over the rows of the step; a window keeps the kernel that rounds like the other single-row products.
+    void heads_product(const DevTensor* w, const float* x, int x_head_stride, int x_tok_stride, int H, int rows, int k, int R, float* y) {
+        namespace mmq = basalt::prefill::mmq;
+        if (R > kMaxWindow && R <= arows_ && mmq::built() && mmq::fits(w->type, rows)) {
+            if (loaded_.insert({w->type, rows}).second) mmq::load(w->type, rows);
+            const int32_t b[2] = {0, R};
+            cudaMemcpyAsync(mmq_bounds_, b, sizeof b, cudaMemcpyHostToDevice, stream_);
+            const size_t mat = mmq::matrix_bytes(w->type, rows, k);
+            for (int h = 0; h < H; ++h) {
+                mmq::quantize(x + (size_t) h * x_head_stride, nullptr, mmq_xq_, w->type, k, x_tok_stride, R, stream_);
+                mmq::Product p;
+                p.w = (const uint8_t*) w->ptr + (size_t) h * mat;
+                p.type = w->type;
+                p.w_rows = rows;
+                p.w_cols = k;
+                p.expert_bytes = mat;
+                p.n = 1;
+                p.xq = mmq_xq_;
+                p.bounds = mmq_bounds_;
+                p.ids = mmq_ident_;
+                p.total_rows = R;
+                p.max_rows = R;
+                p.dst = y + (size_t) h * rows;
+                p.ld_dst = (int64_t) H * rows;
+                mmq_.run(p, stream_);
+            }
+            return;
+        }
+        q8_0_heads_gemv(w->ptr, x, x_head_stride, x_tok_stride, H, rows, k, R, y, stream_);
+    }
     const DevTensor* T(int l, const char* s) const { return m_.tensor(l, s); }
     const float* F(int l, const char* s) const { return (const float*) m_.tensor(l, s)->ptr; }
 
@@ -676,7 +707,7 @@ private:
         bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
         gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
         gemm(T(l, "attn_kv_a_mqa.weight"), xn_, kvraw_, E, rank + g_.rope_dim, R);
-        q8_0_heads_gemv(T(l, "attn_k_b.weight")->ptr, q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_, stream_);
+        heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
         uint8_t* cache = cache_[(size_t) l];
         const int ring = swa ? swa_ring() : 0;
         const bool f8 = !swa && fp8();
@@ -750,7 +781,7 @@ private:
         if (f8) mla_attend(qcur_, (const uint8_t*) cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
         else if (f32()) mla_attend(qcur_, (const float*) cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
         else mla_attend(qcur_, (const uint16_t*) cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
-        q8_0_heads_gemv(T(l, "attn_v_b.weight")->ptr, olat_, rank, H * rank, H, g_.v_dim, rank, R, vout_, stream_);
+        heads_product(T(l, "attn_v_b.weight"), olat_, rank, H * rank, H, g_.v_dim, rank, R, vout_);
         if (diag(l)) dump("attn_kqv-" + std::to_string(l), vout_, (int64_t) R * H * g_.v_dim);
         gemm(T(l, "attn_gate.weight"), xn_, gate_, E, H * g_.v_dim, R);
         mul_sigmoid(gate_, vout_, R * H * g_.v_dim, stream_);
