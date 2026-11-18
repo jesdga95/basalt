@@ -1,6 +1,6 @@
 // include/basalt/kernels/mhc.hpp - manifold-constrained hyper-connections (mHC): the mixing coefficients of a sublayer
 // (projection, sigmoids, softmax and Sinkhorn), the collapse of the streams into a sublayer's input and the expansion of
-// its output back into them.  DeepSeek-V4.1 and GLM-5.3 share these formulas.
+// its output back into them.  Every model with such connections shares these formulas.
 //
 // All activations are fp32 and device pointers; a call takes T tokens (any T >= 1) and the result for a token does
 // not depend on T or on the token's place in the window. `stream` may be null (the call then synchronises).
