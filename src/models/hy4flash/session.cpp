@@ -220,9 +220,10 @@ public:
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
         dfly_.invalidate();   // DFLY HOOK
-        for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
+        const int chunk = m_.diag_rows() > 0 ? std::min(kMaxRows, m_.diag_rows()) : kMaxRows;
+        for (int t0 = 0; t0 < r.n_tokens; t0 += chunk) {
             if (r.stop && r.stop()) break;
-            const int n = std::min(kMaxRows, r.n_tokens - t0);
+            const int n = std::min(chunk, r.n_tokens - t0);
             if (!run_rows(r.tokens + t0, n, r.pos + t0, 0, err)) return {model::Status::Error, "hy4flash: " + err};
             if (r.progress) {
                 cudaStreamSynchronize(stream_);

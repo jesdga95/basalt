@@ -101,6 +101,7 @@ struct LoadRequest {
     RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
     std::vector<double> card_gbps;    ///< memory bandwidth of the main card, then of each peer device (GB/s, 0: unknown)
+    int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
     int diag_split_at = 0;            ///< diagnostic: a dense model's layers split at this one across two cards (0: off)
 };
 

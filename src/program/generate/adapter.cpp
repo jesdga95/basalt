@@ -366,6 +366,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.card_gbps.push_back(o.main_gbps);
         lreq.card_gbps.insert(lreq.card_gbps.end(), o.peer_gbps.begin(), o.peer_gbps.end());
         lreq.diag_split_at = o.diag_split_at;
+        lreq.diag_rows = o.diag_rows;
         const basalt::model::Result r = adapter->start(lreq, started);
         if (!r.ok() || started.sessions.empty()) return fatal_start_error(r.message);
         std::vector<int64_t> stop;
