@@ -209,6 +209,87 @@ int main() {
         CHECK(checked == kLayers * kSlots);
         cudaFreeHost(h_rows);
     }
+    // a second card holding homes of its own: a lookup of one of them is a second card hit, and its slots hold the pack's bytes
+    if (n_dev >= 2) {
+        core::ExpertTierSpec spec;
+        spec.area = "basalt test";
+        spec.name = "test";
+        spec.n_layers = kLayers;
+        spec.n_expert = kExperts;
+        spec.top_k = 6;
+        spec.n_embd = kDim;
+        spec.n_ff = kDim;
+        for (int l = 0; l < kLayers; ++l) spec.layers.push_back({kQ4K, kQ4K, (uint64_t) l * kExperts * blob, blob, 0.f});
+        spec.path = path;
+        spec.fd = fd;
+        spec.range = core::FileRange(path, 0, data.size());
+        spec.diag_tier_ram = kExperts;
+        spec.diag_tier_vram = kSlots;
+        spec.admit_uses = 2;
+        spec.share_stride = blob;
+        spec.share_max_tokens = 64;
+        spec.peer_devices = {1};
+        // the card is left room for only some of the homes
+        size_t free1 = 0, total1 = 0;
+        cudaSetDevice(1);
+        cudaMemGetInfo(&free1, &total1);
+        cudaSetDevice(0);
+        const uint64_t keep = (uint64_t) 20 << 20;   // what the card leaves for homes above its own buffers: a few of the 48
+        spec.peer_reserve_mib = (int) ((free1 - keep) >> 20);
+        core::ExpertTier tier(spec);
+        float* h_rows = nullptr;
+        CHECK(cudaHostAlloc((void**) &h_rows, 128 * kDim * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess);
+        core::LoadPlan plan;
+        std::string err;
+        core::ExpertTier::Reserve reserve;
+        bool ok = tier.open(reserve, h_rows, plan, err);
+        if (ok) {
+            core::Loader loader;
+            ok = loader.run(plan, err) && tier.attach(err);
+        }
+        if (!ok) std::fprintf(stderr, "two cards: %s\n", err.c_str());
+        CHECK(ok);
+        if (ok) {
+            Lcg r{99};
+            for (int t = 0; t < 400; ++t) {
+                tier.begin_token(1);
+                for (int l = 0; l < kLayers; ++l) {
+                    int32_t ids[6];
+                    int n = 0;
+                    while (n < 6) {
+                        const int e = (int) (r.next() % kExperts);
+                        bool dup = false;
+                        for (int j = 0; j < n; ++j) dup = dup || ids[j] == e;
+                        if (!dup) ids[n++] = e;
+                    }
+                    core::ExpertTier::Lookup lk;
+                    CHECK(tier.lookup(l, ids, 6, lk, err));
+                    tier.fetch(l, lk);
+                    tier.await_fetch(nullptr);
+                    tier.promote(l, lk);
+                    tier.mark_gap(nullptr);
+                    tier.pump(l, 3);
+                }
+            }
+            tier.settle();
+            CHECK(tier.offloaded() > 0);
+            int peer_seen = 0;
+            std::vector<uint8_t> back(blob);
+            for (int l = 0; l < kLayers; ++l)
+                for (int e = 0; e < kExperts; ++e) {
+                    const core::ExpertTier::Source src = tier.locate(l, e);
+                    const uint8_t* where = src.dev ? src.dev : src.peer;
+                    if (!where) continue;
+                    CHECK(cudaMemcpy(back.data(), where, blob, cudaMemcpyDefault) == cudaSuccess);
+                    CHECK(std::memcmp(back.data(), data.data() + ((size_t) l * kExperts + (size_t) e) * blob, blob) == 0);
+                    peer_seen += src.peer != nullptr;
+                }
+            CHECK(peer_seen > 0);
+            std::printf("expert_tier_test: two cards, %lld second-card or bus-fetched lookups, %d experts held by the second card\n",
+                        (long long) tier.offloaded(), peer_seen);
+        }
+        cudaFreeHost(h_rows);
+    }
     platform::close_fd(fd);
     std::printf("expert_tier_test: %s\n", g_fail ? "FAILED" : "ok");
     return g_fail ? 1 : 0;
