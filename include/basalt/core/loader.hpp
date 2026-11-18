@@ -8,12 +8,15 @@
 //
 // An item may instead copy bytes the same plan places (a second home of an expert, a stage's image of weights already on
 // a card): the loader runs those after every file read of the plan is complete, so one run is one pass over the file.
+// What must happen to the read bytes before those copies (a RAM tier registered with the driver) is a step of the plan,
+// run between the two.
 //
 // A start places its whole plan in one run (place_start); its staging is sized to that plan and freed with it, and its
 // copy streams are made before the start sizes anything (prepare).
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -71,15 +74,19 @@ public:
     /// Every device item whose destination lies in [dev_base, dev_base + bytes) lands at the same offset of `host`
     /// instead: a host image of that device region, laid out as the region would be.
     void to_host(const void* dev_base, uint64_t bytes, uint8_t* host);
+    /// Runs `step` once every file read of the plan has landed, before its copies from memory; a false fails the run.
+    void after_reads(std::function<bool(std::string&)> step);
     const std::vector<File>& files() const { return files_; }
     const std::vector<LoadItem>& items() const { return items_; }
-    bool empty() const { return items_.empty(); }
+    const std::vector<std::function<bool(std::string&)>>& steps() const { return steps_; }
+    bool empty() const { return items_.empty() && steps_.empty(); }
     /// The bytes the bar counts for the whole plan.
     uint64_t counted() const;
 
 private:
     std::vector<File> files_;
     std::vector<LoadItem> items_;
+    std::vector<std::function<bool(std::string&)>> steps_;
 };
 
 class Loader {
@@ -95,7 +102,7 @@ public:
     Loader(const Loader&) = delete;
     Loader& operator=(const Loader&) = delete;
 
-    /// Executes `plan`: its file reads, then its copies from memory; complete when it returns true.  False with `err` on
+    /// Executes `plan`: its file reads, its steps, then its copies from memory; complete when it returns true.  False with `err` on
     /// the first failure (the rest of the plan is not read).  The calling thread's current device is as it was.
     bool run(const LoadPlan& plan, std::string& err);
     /// Whether every byte read so far came around the file cache (a file that would not open that way, or a read that
