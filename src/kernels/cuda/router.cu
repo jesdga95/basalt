@@ -1,5 +1,5 @@
-// Router: adapted from the sqrt-softplus gating and top-k selection of build_moe_ffn in the llama.cpp DeepSeek-V4.1
-// support (src/llama-graph.cpp).
+// Router: adapted from the gating and top-k selection of build_moe_ffn in llama.cpp (src/llama-graph.cpp): sqrt-softplus or
+// sigmoid scores, a bias for the choice, the unbiased scores of the chosen normalised.
 // MIT License
 // Copyright (c) 2023-2026 The ggml authors
 //
@@ -20,14 +20,14 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "basalt/models/deepseek41/kernels.hpp"
+#include "basalt/kernels/router.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cmath>
 #include <stdexcept>
 
-namespace basalt::models::deepseek41 {
+namespace basalt::kernels {
 namespace {
 
 constexpr int kMaxTok = 8;          // tokens per logits launch
@@ -94,6 +94,8 @@ __device__ __forceinline__ float sqrt_softplus(float x) {
     return sqrtf(sp);
 }
 
+__device__ __forceinline__ float score(float x, int gate) { return gate == 0 ? sqrt_softplus(x) : 1.f / (1.f + expf(-x)); }
+
 // Shared memory of one token's selection.
 struct SelectScratch {
     float wmax[kMaxExpert / 32];   // each warp's largest biased score
@@ -101,7 +103,7 @@ struct SelectScratch {
     int le[kMaxExpert];
     float thr;
     int n;
-    float sel[8];
+    float sel[16];
 };
 
 // Stage: one token, one thread per expert. An expert's rank counts the experts ahead of it (higher biased score, or
@@ -109,10 +111,10 @@ struct SelectScratch {
 // k-th score from below (k distinct experts reach it), so only experts at or above it can rank below k, and they are
 // ranked among themselves.
 __device__ void router_select_token(const float* __restrict__ logits, const float* __restrict__ bias, int n_expert,
-                                    int k, float scale, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                    int k, float scale, int gate, int32_t* __restrict__ ids, float* __restrict__ weights,
                                     SelectScratch& sh) {
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5, nw = n_expert >> 5;
-    const float s = sqrt_softplus(logits[e]);
+    const float s = score(logits[e], gate);
     const float b = s + bias[e];
     float m = b;
 #pragma unroll
@@ -156,10 +158,10 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
 }
 
 __global__ void router_select_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int n_expert,
-                                     int k, float scale, int32_t* __restrict__ ids, float* __restrict__ weights) {
+                                     int k, float scale, int gate, int32_t* __restrict__ ids, float* __restrict__ weights) {
     __shared__ SelectScratch sh;
     const int t = blockIdx.x;
-    router_select_token(logits + (size_t) t * n_expert, bias, n_expert, k, scale, ids + (size_t) t * k,
+    router_select_token(logits + (size_t) t * n_expert, bias, n_expert, k, scale, gate, ids + (size_t) t * k,
                         weights + (size_t) t * k, sh);
 }
 
@@ -167,16 +169,16 @@ __global__ void router_select_kernel(const float* __restrict__ logits, const flo
 
 void router(const float* x, const float* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
             int32_t* ids, float* weights, void* stream) {
-    if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.n_embd % 128 || a.n_embd > 4 * kMaxVec * kLogitThreads || a.k < 1 || a.k > 8 || a.k > a.n_expert)
-        throw std::invalid_argument("deepseek41 router: unsupported geometry");
+    if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.n_embd % 128 || a.n_embd > 4 * kMaxVec * kLogitThreads || a.k < 1 || a.k > 16 || a.k > a.n_expert)
+        throw std::invalid_argument("router: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
     for (int t0 = 0; t0 < n_tokens; t0 += kMaxTok) {
         const int nt = n_tokens - t0 < kMaxTok ? n_tokens - t0 : kMaxTok;
         router_logits_kernel<<<a.n_expert, kLogitThreads, 0, st>>>(
             x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
     }
-    router_select_kernel<<<n_tokens, a.n_expert, 0, st>>>(logits, bias, a.n_expert, a.k, a.weight_scale, ids, weights);
+    router_select_kernel<<<n_tokens, a.n_expert, 0, st>>>(logits, bias, a.n_expert, a.k, a.weight_scale, (int) a.gate, ids, weights);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
-}  // namespace basalt::models::deepseek41
+}  // namespace basalt::kernels

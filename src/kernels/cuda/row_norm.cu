@@ -1,13 +1,15 @@
 // DeepSeek-V4.1 row norms: a weighted RMSNorm over one fp32 row per block, and the same norm fused behind the
 // hyper-connection collapse (hc_pre), so the collapsed row never makes a round trip through memory before it is
 // normalised.
-#include "basalt/models/deepseek41/kernels.hpp"
+#include "basalt/kernels/row_norm.hpp"
+
+#include "basalt/kernels/mhc.hpp"
 
 #include <cuda_runtime.h>
 
 #include <stdexcept>
 
-namespace basalt::models::deepseek41 {
+namespace basalt::kernels {
 namespace {
 
 constexpr int kThreads = 256;
@@ -119,4 +121,4 @@ void hc_pre_rms_norm(const float* x, const float* pre, int pre_stride, const flo
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
-}  // namespace basalt::models::deepseek41
+}  // namespace basalt::kernels
