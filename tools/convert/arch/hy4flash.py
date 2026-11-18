@@ -41,6 +41,8 @@ class Hy4Flash(Arch):
     projector_type = "hy_v4_flash"
     needs_hf_dir = True
     sampling_kv = {}
+    engram_type = F8_E4M3_RAW     # the source table's type; the BF16 GGUF's is BF16 (hy4flash_bf16.py rounds it)
+    needs_nextn = True            # the Q4_K_M GGUF keeps llama.cpp's next-n block (the BF16 GGUF has none)
 
     def mtp_layers(self, kv):
         n = int(kv[P + "block_count"])
@@ -83,8 +85,8 @@ class Hy4Flash(Arch):
         if t is None:
             raise ConvertError(f"the model has no {ENGRAM_TENSOR} (the Engram table)")
         width = int(kv.get(P + "embedding_length_per_layer_input", 0))
-        if t.type_id != F8_E4M3_RAW or len(t.shape) != 2 or int(t.shape[0]) != width:
-            raise ConvertError(f"{ENGRAM_TENSOR} is {t.type_name} {list(t.shape)}; expected rows of {width} F8_E4M3 values")
+        if t.type_id != self.engram_type or len(t.shape) != 2 or int(t.shape[0]) != width:
+            raise ConvertError(f"{ENGRAM_TENSOR} is {t.type_name} {list(t.shape)}; expected rows of {width} values of type {self.engram_type}")
         sizes = kv.get(P + "ple.head_vocab_sizes")
         offs = kv.get(P + "ple.head_offsets")
         if not sizes or not offs or len(sizes) != len(offs):
@@ -96,7 +98,7 @@ class Hy4Flash(Arch):
             raise ConvertError(f"{len(sizes)} Engram heads for {len(kv[P + 'ple.layers'])} layers of {n_head}")
         if [int(x) for x in kv[P + "ple.layers"]] != ENGRAM_LAYERS:
             raise ConvertError(f"the Engram layers are {kv[P + 'ple.layers']}, expected {ENGRAM_LAYERS}")
-        if not self.mtp_layers(kv):
+        if self.needs_nextn and not self.mtp_layers(kv):
             raise ConvertError("the GGUF has no next-n block")
 
     def meta_extra(self, kv, tensors, own):
