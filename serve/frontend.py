@@ -67,7 +67,7 @@ VIDEO_PARTS = ("video_url", "input_video", "video")
 VIDEO_OPTIONS = ("fps", "max_frames")         # a video part's own sampling, as vLLM takes them
 
 # client spellings of a thinking level -> low, medium, high, max or none; a dialect says what its template takes for each
-EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
+EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None, "no_think": None,
           "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 
 
@@ -838,6 +838,17 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     return ToolCall(name=name, arguments=args)
 
 
+def hold_back(text: str, tags: tuple[str, ...]) -> int:
+    """Length of the longest suffix of `text` that is a proper prefix of one of `tags`: what a streaming parser holds
+    back until it knows whether a tag follows."""
+    best = 0
+    for tag in tags:
+        for n in range(1, len(tag)):
+            if text.endswith(tag[:n]):
+                best = max(best, n)
+    return best
+
+
 class OutputParser:
     """Incremental parser of model text: feed deltas, get events; a split tag is held until complete."""
 
@@ -1007,13 +1018,7 @@ class OutputParser:
         return after[0] not in "\r\n"
 
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
-        """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
-        best = 0
-        for tag in tags:
-            for n in range(1, len(tag)):
-                if text.endswith(tag[:n]):
-                    best = max(best, n)
-        return best
+        return hold_back(text, tags)
 
     def feed(self, delta: str, *, final: bool = False) -> list[Event]:
         self.buf += delta
