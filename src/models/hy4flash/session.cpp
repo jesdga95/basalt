@@ -8,6 +8,7 @@
 // rows of its call: the dense products take 8 rows at most per launch with the single-row kernels' reduction order, the
 // attention kernels take a block per row, and the experts are run per row.
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/ggml/ggml.h"
 #include "basalt/core/elastic_array.hpp"
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
@@ -33,6 +34,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <numeric>
 #include <cstring>
 #include <memory>
 #include <set>
@@ -136,7 +138,13 @@ public:
             namespace mmq = basalt::prefill::mmq;
             size_t blob = 0;
             for (const ExpertLayer& el : m_.pack().experts) blob = std::max<size_t>(blob, el.blob_bytes);
-            stride_ = (blob + 255) / 256 * 256;
+            // MMQ steps from expert to expert in whole blocks of each matrix type: the stride is a multiple of every type size
+            size_t unit = 16;
+            for (const ExpertLayer& el : m_.pack().experts) {
+                if (!el.present) continue;
+                for (int t : {el.gu_type, el.d_type}) unit = std::lcm(unit, ggml_type_size((ggml_type) t));
+            }
+            stride_ = (blob + unit - 1) / unit * unit;
             for (Stage& b : stage_) {
                 b.blobs = (uint8_t*) alloc(stride_ * kStageExperts, ok);
                 b.tok = (int32_t*) alloc((size_t) kLaunchRows * 4, ok);
@@ -946,6 +954,8 @@ private:
             for (int g0 = 0; g0 < R; g0 += kMaxWindow)
                 if (!moe_group(l, tl, lay, g0, std::min(kMaxWindow, R - g0), err)) return false;
         }
+        if (diag(l)) dump("moe_lat-" + std::to_string(l), lat_out_, (int64_t) R * L);
+        if (diag(l)) dump("xlat-" + std::to_string(l), xlat_, (int64_t) R * L);
         gemm(T(l, "ffn_routed_up.weight"), lat_out_, moe_out_, L, E, R);
         add_vectors(moe_out_, sh_, mlp_, R * E, st);
         return true;

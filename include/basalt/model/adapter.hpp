@@ -271,7 +271,7 @@ struct Started {
     std::vector<std::unique_ptr<ModelSession>> sessions;
 };
 
-/// The texts of the model's own tokens in the pack's vocabulary: the defaults of --eos-ids, --turn-token, --image-pad-id,
+/// The texts of the model's own tokens in the pack's vocabulary (a name may hold one `*` for a suffix that differs between files): the defaults of --eos-ids, --turn-token, --image-pad-id,
 /// and a video group's pad ("" for a model that reads no video).
 struct TokenNames {
     std::vector<std::string> eos;
