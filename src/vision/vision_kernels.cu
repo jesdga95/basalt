@@ -257,7 +257,9 @@ __device__ __forceinline__ float gelu_erf(float x) { return 0.5f * x * (1.0f + e
 
 // Hy4: bilinear taps along one axis of an S-entry table, align_corners false, with the reference's scale factor
 // (size + 0.1) / S: source = (i + 0.5) / scale_factor - 0.5, clamped at 0 (torch's upsample_bilinear2d)
+// An axis whose output size is the table's is copied (torch's special case; inv_scale 0).
 __device__ __forceinline__ void interp_taps(float inv_scale, int S, int i, int& i0, int& i1, float& d) {
+    if (inv_scale == 0.0f) { i0 = i1 = i; d = 0.0f; return; }
     const float src = fmaxf(inv_scale * ((float) i + 0.5f) - 0.5f, 0.0f);
     const int a = min((int) floorf(src), S - 1);
     i0 = a;
@@ -358,7 +360,8 @@ void launch_bias_copy(const float* g, const float* bias, float* y, int n, int co
 
 void launch_embed_finish_interp(float* x, const float* bias, const float* pos_table, int n, int gx, int gy, int table_edge,
                                 cudaStream_t s) {
-    const float isx = (float) (1.0 / (((double) gx + 0.1) / table_edge)), isy = (float) (1.0 / (((double) gy + 0.1) / table_edge));
+    const float isx = gx == table_edge ? 0.0f : (float) (1.0 / (((double) gx + 0.1) / table_edge)),
+                isy = gy == table_edge ? 0.0f : (float) (1.0 / (((double) gy + 0.1) / table_edge));
     embed_finish_interp_k<<<n, 128, 0, s>>>(x, bias, pos_table, gx, table_edge, isx, isy);
 }
 void launch_qkv_plain(const float* g, const float* bias, __half* q, __half* k, __half* v, int n, cudaStream_t s) {

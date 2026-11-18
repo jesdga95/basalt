@@ -86,6 +86,16 @@ __device__ __forceinline__ void rope_pair(float x0, float x1, int i, int n_rot, 
     o1 = x0 * s + x1 * c;
 }
 
+// The position pair i of the rotated part of the row at cell `cell` turns by (see MlaArgs::cell_rope).
+template <typename A>
+__device__ __forceinline__ int axis_pos(const A& a, int cell, int i) {
+    if (a.cell_rope == nullptr) return cell;
+    const int32_t* p = a.cell_rope + (size_t) cell * 3;
+    if (i % 3 == 1 && i < 3 * a.sec_h) return p[1];
+    if (i % 3 == 2 && i < 3 * a.sec_w) return p[2];
+    return p[0];
+}
+
 // Block h < heads: the head's query row; block `heads`: the cache row. y = the token.
 template <typename C>
 __global__ void prepare_kernel(const float* __restrict__ q, const float* __restrict__ q_abs, const float* __restrict__ kv_raw,
@@ -102,7 +112,7 @@ __global__ void prepare_kernel(const float* __restrict__ q, const float* __restr
             const int i = threadIdx.x;
             const float* p = qt + (size_t) h * Q + a.nope + 2 * i;
             float o0, o1;
-            rope_pair(p[0], p[1], i, a.rope, a.rope_base, pos, o0, o1);
+            rope_pair(p[0], p[1], i, a.rope, a.rope_base, axis_pos(a, pos, i), o0, o1);
             out[(size_t) h * W + a.rank + 2 * i] = o0;
             out[(size_t) h * W + a.rank + 2 * i + 1] = o1;
         }
@@ -118,7 +128,7 @@ __global__ void prepare_kernel(const float* __restrict__ q, const float* __restr
     if (threadIdx.x < a.rope / 2) {
         const int i = threadIdx.x;
         float o0, o1;
-        rope_pair(kr[a.rank + 2 * i], kr[a.rank + 2 * i + 1], i, a.rope, a.rope_base, pos, o0, o1);
+        rope_pair(kr[a.rank + 2 * i], kr[a.rank + 2 * i + 1], i, a.rope, a.rope_base, axis_pos(a, pos, i), o0, o1);
         store_row(row + a.rank + 2 * i, o0);
         store_row(row + a.rank + 2 * i + 1, o1);
     }

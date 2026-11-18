@@ -26,6 +26,16 @@ __device__ __forceinline__ void rot_pair(float* row, int i, int n_rot, float bas
     row[2 * i + 1] = x0 * s + x1 * c;
 }
 
+// The position pair i of the rotated part of the row at cell `cell` turns by (see MlaArgs::cell_rope).
+template <typename A>
+__device__ __forceinline__ int axis_pos(const A& a, int cell, int i) {
+    if (a.cell_rope == nullptr) return cell;
+    const int32_t* p = a.cell_rope + (size_t) cell * 3;
+    if (i % 3 == 1 && i < 3 * a.sec_h) return p[1];
+    if (i % 3 == 2 && i < 3 * a.sec_w) return p[2];
+    return p[0];
+}
+
 // One block of `dim` threads: the pooled key of a group.
 __global__ void pool_kernel(const float* __restrict__ values, const float* __restrict__ gates, const float* __restrict__ ape,
                             const float* __restrict__ norm_w, IndexerArgs a, int ring, int first_pos, float* __restrict__ pooled) {
@@ -54,14 +64,14 @@ __global__ void pool_kernel(const float* __restrict__ values, const float* __res
     ss = red[0] + red[1] + red[2] + red[3];
     row[d] = acc * rsqrtf(ss / (float) a.dim + a.eps) * norm_w[d];
     __syncthreads();
-    if (d < a.rope / 2) rot_pair(row + a.dim - a.rope, d, a.rope, a.rope_base, group_pos);
+    if (d < a.rope / 2) rot_pair(row + a.dim - a.rope, d, a.rope, a.rope_base, axis_pos(a, group_pos, d));
     __syncthreads();
     pooled[(size_t) (group_pos / a.pool) * a.dim + d] = row[d];
 }
 
 __global__ void rope_heads_kernel(float* __restrict__ q, IndexerArgs a, int pos0) {
     const int h = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
-    if (i < a.rope / 2) rot_pair(q + ((size_t) t * a.heads + h) * a.dim + a.dim - a.rope, i, a.rope, a.rope_base, pos0 + t);
+    if (i < a.rope / 2) rot_pair(q + ((size_t) t * a.heads + h) * a.dim + a.dim - a.rope, i, a.rope, a.rope_base, axis_pos(a, pos0 + t, i));
 }
 
 // A thread per pooled key.
