@@ -195,6 +195,18 @@ target_include_directories(model_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src
 target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_qwen4exp_engine engine_session grammar model_qwen4exp_prefill spec ${_gpu_runtime_target})
 endif()
 
+if(BASALT_MODEL_HY4FLASH)
+add_library(hy4flash_kernels STATIC src/models/hy4flash/kernels/mla.cu src/models/hy4flash/kernels/ops.cu)
+target_include_directories(hy4flash_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(hy4flash_kernels PUBLIC ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  add_executable(hy4flash_kernels_parity src/models/hy4flash/kernels/kernels_parity.cpp)
+  target_include_directories(hy4flash_kernels_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(hy4flash_kernels_parity PRIVATE hy4flash_kernels kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME hy4flash_kernels_parity COMMAND hy4flash_kernels_parity)
+endif()
+endif()
+
 if(BASALT_MODEL_DEEPSEEK41)
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
@@ -447,6 +459,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/gqa_attn.cu
                         src/kernels/cuda/nvfp4_planes.cu
                         src/kernels/cuda/mhc.cu
+                        src/kernels/cuda/mhc_plain.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 if(BASALT_MODEL_QWEN4EXP)
