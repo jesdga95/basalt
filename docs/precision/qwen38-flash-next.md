@@ -128,7 +128,9 @@ the prompt's.
 ## 6-bit dense projections
 
 The NVFP4 pack's default `DQ6_K` stores attention q/k/v/o, GDN qkv/z/out and the shared experts' gate/up as Q6_K. The `DQ8` variant
-stores them as Q8_0. Each tensor is quantized once from NVIDIA's BF16, never from the Q8_0 copy (which would round twice).
+stores them as Q8_0. Each tensor is quantized once from NVIDIA's BF16, never from the Q8_0 copy (which would round twice). The QSA
+k/v projections take the tensor-core path; `dense_tc_parity` measures 1.02x at T=1 to 1.43x at T=8 against the SIMD kernel on the
+2560 x 512 Q6_K shape.
 
 Speed, 400 W + 180 W, ABBA, 6 fresh processes per arm:
 
