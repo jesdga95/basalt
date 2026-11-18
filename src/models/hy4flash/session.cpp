@@ -46,7 +46,9 @@ namespace {
 namespace bk = basalt::kernels;
 
 constexpr int kRowWidth = 576;                 // a cache row: 512 latent values and 64 rotated
-constexpr int kMaxRows = 256;                  // rows one call carries: a prompt chunk
+constexpr int kMaxRows = 1024;                 // rows one call carries: a prompt chunk
+constexpr int kStageExperts = 16;              // experts of one prompt launch (a blob each in the staging)
+constexpr int kLaunchRows = 4096;              // most (row, expert) pairs of one prompt launch
 constexpr int kMaxWindow = 8;                  // rows of a decode window, and of one expert group
 constexpr int kRawRing = kMaxRows + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
 constexpr int64_t kGrowPositions = 16384;      // positions the caches are backed in
@@ -122,6 +124,26 @@ public:
         ex_scr_ = alloc(bk::native_expert_scratch_bytes(kLookupK, g_.n_ff_exp), ok);
         ex_rows_ = f((int64_t) kLookupK * g_.n_latent);
         ex_plan_ = alloc(sizeof(WindowPlan), ok);
+        // the prompt path's experts: two staged launches (blobs, rows and bounds), the pairs' outputs, and the quantised rows
+        {
+            namespace mmq = basalt::prefill::mmq;
+            size_t blob = 0;
+            for (const ExpertLayer& el : m_.pack().experts) blob = std::max<size_t>(blob, el.blob_bytes);
+            stride_ = (blob + 255) / 256 * 256;
+            for (Stage& b : stage_) {
+                b.blobs = (uint8_t*) alloc(stride_ * kStageExperts, ok);
+                b.tok = (int32_t*) alloc((size_t) kLaunchRows * 4, ok);
+                b.bounds = (int32_t*) alloc((kStageExperts + 1) * 4, ok);
+                if (cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) != cudaSuccess) ok = false;
+            }
+            if (cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) ok = false;
+            pair_rows_ = f((int64_t) kMaxRows * g_.n_used * g_.n_latent);
+            pair_map_ = (int32_t*) alloc((size_t) kMaxRows * g_.n_used * 4, ok);
+            pair_ident_ = (int32_t*) alloc((size_t) kMaxRows * g_.n_used * 4, ok);
+            xq1_ = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
+            xq2_ = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
+            if (ok && mmq::built()) mmq::iota(pair_ident_, (int64_t) kMaxRows * g_.n_used, nullptr);
+        }
         rowptr_d_ = (const float**) alloc(kLookupK * sizeof(void*), ok);
         h_rowptr_ = (const float**) pin(kLookupK * 2);
         h_rw_ = pin(kMaxWindow * 16); h_ids_ = (int32_t*) pin(kMaxWindow * 16);
@@ -749,10 +771,127 @@ private:
         gemm(T(l, "ffn_up_shexp.weight"), xn_, su, E, g_.n_ff_exp, R);
         bk::swiglu_scaled(sg, su, nullptr, nullptr, h_, R, g_.n_ff_exp, g_.n_ff_exp, st);
         gemm(T(l, "ffn_down_shexp.weight"), h_, sh_, g_.n_ff_exp, E, R);
-        for (int g0 = 0; g0 < R; g0 += kMaxWindow)
-            if (!moe_group(l, tl, lay, g0, std::min(kMaxWindow, R - g0), err)) return false;
+        if (R > kMaxWindow && basalt::prefill::mmq::built()) {
+            if (!moe_prompt(l, tl, R, lay, err)) return false;
+        } else {
+            for (int g0 = 0; g0 < R; g0 += kMaxWindow)
+                if (!moe_group(l, tl, lay, g0, std::min(kMaxWindow, R - g0), err)) return false;
+        }
         gemm(T(l, "ffn_routed_up.weight"), lat_out_, moe_out_, L, E, R);
         add_vectors(moe_out_, sh_, mlp_, R * E, st);
+        return true;
+    }
+
+    // The routed experts of a prompt chunk, by expert: each used expert's blob is staged on the card (a copy from its slot, its
+    // pinned RAM or the second card), its rows (the pairs routed to it, with their activations quantised for MMQ) go through the
+    // gate/up product, the clamped SwiGLU and the down product, and a pair's output row is kept for the weighted sum.
+    bool moe_prompt(int l, int tl, int R, const kernels::NativeExpertLayout& lay, std::string& err) {
+        namespace mmq = basalt::prefill::mmq;
+        const int K = g_.n_used, L = g_.n_latent, F = g_.n_ff_exp;
+        const ExpertLayer& el = m_.pack().experts[(size_t) l];
+        if (!mmq::fits(el.gu_type, 2 * F) || !mmq::fits(el.d_type, L)) {
+            err = "the prompt MMQ path does not cover this layer's expert formats";
+            return false;
+        }
+        if (loaded_.insert({el.gu_type, 2 * F}).second) mmq::load(el.gu_type, 2 * F);
+        if (loaded_.insert({el.d_type, L}).second) mmq::load(el.d_type, L);
+        cudaStream_t st = stream_;
+        std::vector<int32_t> hid((size_t) R * K);
+        cudaStreamSynchronize(st);
+        cudaMemcpy(hid.data(), ids_, hid.size() * 4, cudaMemcpyDeviceToHost);
+        std::vector<std::vector<int32_t>> by((size_t) g_.n_expert);   // pair = t * K + slot
+        for (int p = 0; p < R * K; ++p) {
+            if (hid[(size_t) p] < 0 || hid[(size_t) p] >= g_.n_expert) {
+                err = "the router returned expert " + std::to_string(hid[(size_t) p]);
+                return false;
+            }
+            by[(size_t) hid[(size_t) p]].push_back(p);
+        }
+        std::vector<int> used;
+        for (int e = 0; e < g_.n_expert; ++e)
+            if (!by[(size_t) e].empty()) used.push_back(e);
+        std::vector<int32_t> map_h((size_t) R * K);
+        int64_t pos = 0;
+        for (size_t b0 = 0; b0 < used.size();) {
+            int nb = 0;
+            int64_t rows = 0, max_rows = 0;
+            while (b0 + (size_t) nb < used.size() && nb < kStageExperts) {
+                const int64_t c = (int64_t) by[(size_t) used[b0 + (size_t) nb]].size();
+                if (nb > 0 && rows + c > kLaunchRows) break;
+                rows += c;
+                max_rows = std::max(max_rows, c);
+                ++nb;
+            }
+            Stage& B = stage_[launch_++ & 1];
+            cudaStreamWaitEvent(copy_, B.done, 0);   // the device buffers of the launch before last are free
+            for (int q = 0; q < nb; ++q) {
+                const int e = used[b0 + (size_t) q];
+                uint8_t* dst = B.blobs + stride_ * (size_t) q;
+                const core::ExpertTier::Source src = tier_->locate(tl, e);
+                if (src.dev) {
+                    cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
+                } else if (src.pinned) {
+                    cudaMemcpyAsync(dst, src.pinned, el.blob_bytes, cudaMemcpyHostToDevice, copy_);
+                } else if (src.peer) {
+                    core::PeerExperts* pe = tier_->peer_for(tl);
+                    cudaMemcpyPeerAsync(dst, m_.device(), src.peer, pe->device(), el.blob_bytes, copy_);
+                } else {
+                    err = "expert " + std::to_string(e) + " of layer " + std::to_string(l) + " is not in RAM (a pack larger than RAM is not run yet)";
+                    return false;
+                }
+            }
+            cudaEventRecord(B.copied, copy_);
+            std::vector<int32_t> tok, bounds{0};
+            for (int q = 0; q < nb; ++q) {
+                for (int32_t p : by[(size_t) used[b0 + (size_t) q]]) {
+                    map_h[(size_t) p] = (int32_t) (pos + (int64_t) tok.size());
+                    tok.push_back(p / K);
+                }
+                bounds.push_back((int32_t) tok.size());
+            }
+            cudaMemcpyAsync(B.tok, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(B.bounds, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice, st);
+            cudaStreamWaitEvent(st, B.copied, 0);
+            mmq::quantize(xlat_, B.tok, xq1_, el.gu_type, L, L, rows, st);
+            mmq::Product p;
+            p.w = B.blobs;
+            p.type = el.gu_type;
+            p.w_rows = 2 * (int64_t) F;
+            p.w_cols = L;
+            p.expert_bytes = stride_;
+            p.n = nb;
+            p.xq = xq1_;
+            p.bounds = B.bounds;
+            p.ids = pair_ident_;
+            p.total_rows = rows;
+            p.max_rows = max_rows;
+            p.dst = gu_;
+            p.ld_dst = p.w_rows;
+            mmq_.run(p, st);
+            swiglu_split_clamped(gu_, h_, rows, F, g_.clamp_exp[(size_t) l], st);
+            mmq::quantize(h_, nullptr, xq2_, el.d_type, F, F, rows, st);
+            mmq::Product d;
+            d.w = B.blobs + lay.down_off;
+            d.type = el.d_type;
+            d.w_rows = L;
+            d.w_cols = F;
+            d.expert_bytes = stride_;
+            d.n = nb;
+            d.xq = xq2_;
+            d.bounds = B.bounds;
+            d.ids = pair_ident_ + pos;
+            d.total_rows = rows;
+            d.max_rows = max_rows;
+            d.dst = pair_rows_;
+            d.ld_dst = L;
+            mmq_.run(d, st);
+            cudaEventRecord(B.done, st);
+            b0 += (size_t) nb;
+            pos += rows;
+        }
+        cudaMemcpyAsync(pair_map_, map_h.data(), (size_t) R * K * 4, cudaMemcpyHostToDevice, st);
+        weighted_sum_tokens(pair_rows_, pair_map_, rw_, R, K, L, lat_out_, st);
+        cudaStreamSynchronize(st);   // the host's map is read until the copy lands
         return true;
     }
 
@@ -1048,6 +1187,17 @@ private:
     int32_t* ids_ = nullptr;
     float *xlat_ = nullptr, *lat_out_ = nullptr, *moe_out_ = nullptr, *sh_ = nullptr, *logits_ = nullptr, *lp_ = nullptr, *erows_ = nullptr, *ekv_ = nullptr, *evalid_ = nullptr;
     int32_t* pick_ = nullptr;
+    struct Stage {
+        uint8_t* blobs = nullptr;
+        int32_t *tok = nullptr, *bounds = nullptr;
+        cudaEvent_t copied = nullptr, done = nullptr;
+    } stage_[2];
+    cudaStream_t copy_ = nullptr;
+    size_t stride_ = 0;
+    uint64_t launch_ = 0;
+    float* pair_rows_ = nullptr;
+    int32_t *pair_map_ = nullptr, *pair_ident_ = nullptr;
+    void *xq1_ = nullptr, *xq2_ = nullptr;
     basalt::prefill::mmq::Context mmq_;
     std::set<std::pair<int, int>> loaded_;   // (type, rows) the MMQ tiles are loaded for
     void *mmq_xq_ = nullptr;
