@@ -657,8 +657,9 @@ def from_checkpoint(a) -> None:
             srcs = list(dense_src.sources.values())
             meta["checkpoint"] = {
                 "dir": Path(a.checkpoint).name, "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
-                "experts": {"format": "nvfp4", "source": "weight (E2M1 pairs), weight_scale (UE4M3 per 16), "
-                            "weight_scale_2 (FP32); input_scale unused",
+                "experts": {"format": "nvfp4", "source": "weight (E2M1 pairs), weight_scale (UE4M3 per 16"
+                            + (", stored as CSF stream pairs and decoded bit for bit" if experts.csf else "")
+                            + "), weight_scale_2 (FP32); input_scale unused",
                             "repack": "codes and scales unchanged, nibbles moved into 64-value blocks",
                             "tail": "fp32 {s_gate, s_up, s_down, 0} per expert"},
                 "dense": {"projections": "Q6_K where rows are whole 256-value blocks, else Q8_0" if q6k else "Q8_0",

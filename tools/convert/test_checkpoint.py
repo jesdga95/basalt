@@ -466,6 +466,116 @@ class TokenizerKvTest(unittest.TestCase):
                 C.tokenizer_kv(C.Checkpoint(d))
 
 
+def csf_encode(scales: np.ndarray):
+    """The CSF stream pair of scale bytes [rows, cols]: a row's base is the start of its fullest 16-wide window (at
+    most 240); a byte outside base..base+15 becomes an exception word."""
+    rows, cols = scales.shape
+    base = np.zeros(rows, np.int16)
+    for r in range(rows):
+        v = scales[r].astype(np.int16)
+        counts = [int(((v >= b) & (v <= b + 15)).sum()) for b in range(int(v.min()), int(v.max()) + 1)]
+        base[r] = min(int(v.min()) + int(np.argmax(counts)), 240)
+    code = scales.astype(np.int16) - base[:, None]
+    exc = (code < 0) | (code > 15)
+    code = np.where(exc, 0, code).astype(np.uint8)
+    packed = code[:, 0::2] | (code[:, 1::2] << 4)
+    fixed = np.concatenate([base.reshape(-1, 16).astype(np.uint8), packed.reshape(rows // 16, -1)], axis=1)
+    pos = np.flatnonzero(exc)
+    return fixed, (pos | scales.reshape(-1)[pos].astype(np.int64) << 24).astype(np.uint32)
+
+
+class CsfTest(unittest.TestCase):
+    def test_round_trip(self):
+        rng = np.random.default_rng(3)
+        scales = (rng.integers(0, 16, size=(48, 40)) + rng.integers(20, 90, size=(48, 1))).astype(np.uint8)
+        for r, c, b in ((5, 7, 0), (30, 0, 126), (47, 39, 1)):         # outside their rows' windows
+            scales[r, c] = b
+        fixed, exc = csf_encode(scales)
+        self.assertEqual((fixed.shape, exc.size), ((3, 16 + 8 * 40), 3))
+        np.testing.assert_array_equal(C.csf_decode(fixed, exc), scales)
+
+    def test_by_hand(self):
+        fixed = np.zeros((1, 32), np.uint8)                            # 16 rows of 2 scales
+        fixed[0, :16] = 40                                             # every row's base
+        fixed[0, 16] = 0x21                                            # row 0: codes 1, 2
+        fixed[0, 17] = 0xF0                                            # row 1: codes 0, 15
+        got = C.csf_decode(fixed, np.array([3 | 7 << 24], np.uint32))  # row 1, column 1 holds 7
+        self.assertEqual(got[:2].tolist(), [[41, 42], [40, 7]])
+        self.assertTrue((got[2:] == 40).all())
+
+    def test_bad_streams_are_refused(self):
+        fixed, exc = csf_encode(np.full((16, 4), 50, np.uint8))
+        high = fixed.copy()
+        high[0, 3] = 241
+        for f, x, want in ((high, exc, "above 240"), (fixed, np.array([16 * 4], np.uint32), "past the end"),
+                           (fixed[:, :-8], exc, "shape"), (fixed.reshape(-1), exc, "shape")):
+            with self.subTest(want=want), self.assertRaisesRegex(S.ConvertError, want):
+                C.csf_decode(f, x)
+
+
+def csf_expert_tensors(l, e, rng, h=128, ff=64):
+    """One expert's tensors twice: with plain scales, and with each scale matrix as a CSF stream pair."""
+    plain, csf = {}, {}
+    for r, (rows, cols) in {"gate_proj": (ff, h), "up_proj": (ff, h), "down_proj": (h, ff)}.items():
+        p = f"model.language_model.layers.{l}.mlp.experts.{e}.{r}."
+        w = rng.integers(0, 256, size=(rows, cols // 2), dtype=np.uint8)
+        s = (rng.integers(0, 16, size=(rows, cols // 16)) + 30).astype(np.uint8)
+        s[0, 0] = 0x7E                                                 # an exception
+        fixed, exc = csf_encode(s)
+        for t in (plain, csf):
+            t[p + "weight"] = ("U8", w.shape, w.tobytes())
+            t[p + "weight_scale_2"] = ("F32", (), np.float32(0.25 + e).tobytes())
+            t[p + "input_scale"] = ("F32", (), np.float32(1).tobytes())
+        plain[p + "weight_scale"] = ("F8_E4M3", s.shape, s.tobytes())
+        csf[p + "weight_scale" + C.CSF_FIXED] = ("U8", fixed.shape, fixed.tobytes())
+        csf[p + "weight_scale" + C.CSF_EXC] = ("U32", exc.shape, exc.tobytes())
+    return plain, csf
+
+
+class CsfExpertTest(unittest.TestCase):
+    """Experts whose scales are CSF stream pairs, with the shards in a `tensors/` folder."""
+
+    def setUp(self):
+        rng = np.random.default_rng(4)
+        self.plain, self.csf = {}, {}
+        for e in range(2):
+            p, c = csf_expert_tensors(0, e, rng)
+            self.plain.update(p)
+            self.csf.update(c)
+
+    def experts(self, files):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        (d / "tensors").mkdir()
+        for name, tens in files.items():
+            write_safetensors(d / "tensors" / name, tens)
+        (d / "config.json").write_text(json.dumps(UnexpectedTensorTest.CFG))
+        return C.CheckpointExperts(C.Checkpoint(d))
+
+    def test_same_blob_as_plain_scales(self):
+        plain = self.experts({"model-00001-of-00001.safetensors": self.plain})
+        exc = {k: v for k, v in self.csf.items() if k.endswith(C.CSF_EXC)}
+        rest = {k: v for k, v in self.csf.items() if k not in exc}
+        csf = self.experts({"model-00001-of-00002.safetensors": rest, "model-00002-of-00002.safetensors": exc})
+        self.assertEqual((plain.csf, csf.csf), (False, True))
+        self.assertEqual(C._expert_job(next(csf.jobs(32))), C._expert_job(next(plain.jobs(32))))
+
+    def test_bad_stream_is_reported(self):
+        k = "model.language_model.layers.0.mlp.experts.1.down_proj.weight_scale" + C.CSF_FIXED
+        dt, shape, raw = self.csf[k]
+        ex = self.experts({"model-00001-of-00001.safetensors": {**self.csf, k: (dt, shape, b"\xfa" + raw[1:])}})
+        self.assertRegex(C._expert_job(next(ex.jobs(32))), "above 240")
+
+    def test_wrong_shape_or_missing_exceptions_are_refused(self):
+        k = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale"
+        dt, shape, raw = self.csf[k + C.CSF_FIXED]
+        with self.assertRaisesRegex(S.ConvertError, "nvfp4_csf_fixed is U8"):
+            self.experts({"model-00001-of-00001.safetensors": {**self.csf, k + C.CSF_FIXED: (dt, (8, 40), raw)}})
+        with self.assertRaisesRegex(S.ConvertError, "no .*nvfp4_csf_exceptions"):
+            self.experts({"model-00001-of-00001.safetensors": {n: v for n, v in self.csf.items() if n != k + C.CSF_EXC}})
+
+
 if __name__ == "__main__":
     unittest.main()
 
