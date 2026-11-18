@@ -14,7 +14,6 @@ namespace basalt::models::hy4flash {
 namespace {
 
 constexpr int kThreads = 512;
-constexpr int kMaxCells = 4096;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -184,46 +183,96 @@ __global__ void prepare_kernel(const float* __restrict__ q, const float* __restr
     store_cell(cache, (size_t) (ring ? pos % ring : pos), lat, rp, a, red);
 }
 
-// A block per head and row: the scores (a warp per cell), the softmax with the sink, the weighted sum of the latents.
+// A block per row and group of kGroup heads: the cells go through shared memory in tiles of kTile rows that the group's heads share,
+// with a running softmax per head (the sink is the softmax's first element, worth exp(sink - max) to the denominator and nothing
+// to the numerator). A row's result does not depend on the other rows.
+constexpr int kGroup = 8, kTile = 16;
+
 template <typename C>
-__global__ void attend_kernel(const float* __restrict__ qcur, const C* __restrict__ cache, const int32_t* __restrict__ firsts,
-                              const int32_t* __restrict__ counts, const int32_t* __restrict__ cells, int cells_stride,
-                              const float* __restrict__ sinks, MlaArgs a, int ring, float* __restrict__ o_lat) {
-    __shared__ float s[kMaxCells];
-    __shared__ float red[kThreads / 32];
-    const int h = blockIdx.x, t = blockIdx.y, W = a.rank + a.rope, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+__global__ void __launch_bounds__(512) attend_kernel(const float* __restrict__ qcur, const C* __restrict__ cache, const int32_t* __restrict__ firsts,
+                                                     const int32_t* __restrict__ counts, const int32_t* __restrict__ cells, int cells_stride,
+                                                     const float* __restrict__ sinks, MlaArgs a, int ring, float* __restrict__ o_lat) {
+    extern __shared__ float smem[];
+    const int W = a.rank + a.rope;
+    float* q_s = smem;                       // [kGroup][W]
+    float* k_s = q_s + kGroup * W;           // [kTile][W]
+    float* p_s = k_s + kTile * W;            // [kGroup][kTile]
+    float* alpha_s = p_s + kGroup * kTile;   // [kGroup]
+    float* m_s = alpha_s + kGroup;           // [kGroup]
+    float* l_s = m_s + kGroup;               // [kGroup]
+    const int hg = blockIdx.x, t = blockIdx.y, tid = threadIdx.x;
+    const int h0 = hg * kGroup;
     const int n = counts[t], first = firsts[t];
     const int32_t* cl = cells ? cells + (size_t) t * cells_stride : nullptr;
-    const float* qv = qcur + ((size_t) t * a.heads + h) * W;
-    for (int j = warp; j < n; j += kThreads / 32) {
-        const int cell = cl ? cl[j] : ring ? (first + j) % ring : first + j;
-        float acc = 0.f;
-        for (int c = lane; c < W; c += 32) acc = fmaf(qv[c], row_at(cache, (size_t) cell, c, W), acc);
-        acc = warp_sum(acc);
-        if (lane == 0) s[j] = acc * a.scale;
+    for (int i = tid; i < kGroup * W; i += blockDim.x) q_s[i] = qcur[((size_t) t * a.heads + h0) * W + i];
+    if (tid < kGroup) {
+        m_s[tid] = sinks[h0 + tid];
+        l_s[tid] = 1.f;
+    }
+    float acc[kGroup];
+#pragma unroll
+    for (int h = 0; h < kGroup; ++h) acc[h] = 0.f;
+    for (int j0 = 0; j0 < n; j0 += kTile) {
+        const int tn = min(kTile, n - j0);
+        __syncthreads();
+        // the tile's rows
+        for (int i = tid; i < kTile * W; i += blockDim.x) {
+            const int c = i / W, e = i - c * W;
+            float v = 0.f;
+            if (c < tn) {
+                const int j = j0 + c;
+                const int cell = cl ? cl[j] : ring ? (first + j) % ring : first + j;
+                v = row_at(cache, (size_t) cell, e, W);
+            }
+            k_s[i] = v;
+        }
+        __syncthreads();
+        // scores: a (head, cell) pair on 4 threads
+        {
+            const int pair = tid >> 2, part = tid & 3;
+            const int h = pair / kTile, c = pair % kTile;
+            float dot = 0.f;
+            const float* qh = q_s + h * W;
+            const float* kc = k_s + c * W;
+            for (int e = part; e < W; e += 4) dot = fmaf(qh[e], kc[e], dot);
+            dot += __shfl_xor_sync(0xffffffffu, dot, 1);
+            dot += __shfl_xor_sync(0xffffffffu, dot, 2);
+            if (part == 0) p_s[h * kTile + c] = c < tn ? dot * a.scale : -INFINITY;
+        }
+        __syncthreads();
+        // the running softmax of each head
+        if (tid < kGroup) {
+            const int h = tid;
+            float m = m_s[h];
+            float mx = m;
+            for (int c = 0; c < kTile; ++c) mx = fmaxf(mx, p_s[h * kTile + c]);
+            const float alpha = expf(m - mx);
+            float sum = 0.f;
+            for (int c = 0; c < kTile; ++c) {
+                const float p = c < tn ? expf(p_s[h * kTile + c] - mx) : 0.f;
+                p_s[h * kTile + c] = p;
+                sum += p;
+            }
+            alpha_s[h] = alpha;
+            l_s[h] = l_s[h] * alpha + sum;
+            m_s[h] = mx;
+        }
+        __syncthreads();
+        // the weighted latents: thread = a latent dimension, one accumulator per head
+        if (tid < a.rank) {
+#pragma unroll
+            for (int h = 0; h < kGroup; ++h) acc[h] *= alpha_s[h];
+            for (int c = 0; c < tn; ++c) {
+                const float v = k_s[c * W + tid];
+#pragma unroll
+                for (int h = 0; h < kGroup; ++h) acc[h] = fmaf(p_s[h * kTile + c], v, acc[h]);
+            }
+        }
     }
     __syncthreads();
-    const float sink = sinks[h];
-    float m = sink;
-    for (int j = threadIdx.x; j < n; j += kThreads) m = fmaxf(m, s[j]);
-    m = block_max<kThreads>(m, red);
-    float den = 0.f;
-    for (int j = threadIdx.x; j < n; j += kThreads) {
-        const float p = expf(s[j] - m);
-        s[j] = p;
-        den += p;
-    }
-    den = block_sum<kThreads>(den, red);
-    den += expf(sink - m);
-    const float inv = 1.f / den;
-    for (int c = threadIdx.x; c < a.rank; c += kThreads) {
-        float acc = 0.f;
-        for (int j = 0; j < n; ++j) {
-            const int cell = cl ? cl[j] : ring ? (first + j) % ring : first + j;
-            acc = fmaf(s[j], row_at(cache, (size_t) cell, c, W), acc);
-        }
-        o_lat[((size_t) t * a.heads + h) * a.rank + c] = acc * inv;
-    }
+    if (tid < a.rank)
+#pragma unroll
+        for (int h = 0; h < kGroup; ++h) o_lat[((size_t) t * a.heads + h0 + h) * a.rank + tid] = acc[h] / l_s[h];
 }
 
 // cells[t][j] = j for j < fill[t] (rows with fill 0 are left alone).
@@ -242,8 +291,16 @@ void prepare_impl(const float* q, const float* q_abs, const float* kv_raw, const
 template <typename C>
 void attend_impl(const float* qcur, const C* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                  float* o_lat, void* stream) {
-    attend_kernel<C><<<dim3(a.heads, n_tok), kThreads, 0, (cudaStream_t) stream>>>(qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride,
-                                                                               sinks, a, ring, o_lat);
+    if (a.heads % kGroup || a.rank > 512) throw std::invalid_argument("mla_attend: heads");
+    const size_t W = (size_t) a.rank + a.rope;
+    const size_t smem = (kGroup * W + kTile * W + kGroup * kTile + 3 * kGroup) * sizeof(float);
+    static bool raised = false;   // per instantiation
+    if (!raised) {
+        cudaFuncSetAttribute(attend_kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        raised = true;
+    }
+    attend_kernel<C><<<dim3(a.heads / kGroup, n_tok), 512, smem, (cudaStream_t) stream>>>(qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride,
+                                                                                          sinks, a, ring, o_lat);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
