@@ -21,6 +21,7 @@
 #include "basalt/log.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
 #include "models/hy4flash/context_policy.hpp"
+#include "models/hy4flash/dfly.hpp"   // DFLY HOOK
 #include "models/hy4flash/engram.hpp"
 #include "models/hy4flash/model.hpp"
 
@@ -139,20 +140,30 @@ public:
             err = "out of device memory for the session";
             return false;
         }
+        // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
+        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, m_.dfly() ? (const uint16_t*) m_.tensor("output.weight")->ptr : nullptr,
+                        [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, err))
+            return false;
         return true;
     }
 
-    int max_window() const override { return kMaxWindow; }
+    // DFLY HOOK: --spec sets the window (DeepSeek's rule: 0 or 1 is plain decode), and the drafter's calls (dfly.hpp)
+    int max_window() const override { return std::clamp(m_.spec(), 1, kMaxWindow); }
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override { return dfly_.draft_begin(anchor, pos, n, cache_, stream_); }
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override { return dfly_.draft_end(ids, conf, max_n, n, stream_); }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
+        dfly_.begin_window(r.pos);   // DFLY HOOK
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxWindow) {
             const int n = std::min(kMaxWindow, r.n_tokens - t0);
+            dfly_.run(t0);   // DFLY HOOK
             const bool last = t0 + n == r.n_tokens;
             const bool want = r.row_tokens || (last && (r.next_token || r.logits));
             const int head = !want ? 0 : r.row_tokens ? n : 1;
             if (!run_rows(r.tokens + t0, n, r.pos + t0, head, err)) return {model::Status::Error, "hy4flash: " + err};
+            dfly_.run(-1);   // DFLY HOOK
             if (!want) continue;
             if (!pick(r, t0, head, err)) return {model::Status::Error, "hy4flash: " + err};
             if (r.row_tokens)
@@ -166,6 +177,7 @@ public:
 
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
+        dfly_.invalidate();   // DFLY HOOK
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
             if (r.stop && r.stop()) break;
             const int n = std::min(kMaxRows, r.n_tokens - t0);
@@ -286,6 +298,10 @@ private:
                 }
             }
             indexer(l, pos0, R, selecting, pools_of, err);
+            for (int t = 0; t < R; ++t) {   // DFLY HOOK: each row's selection, for the drafter
+                const bool sel = pools_of[(size_t) t] > keep;
+                dfly_.selection(l, t, sel ? icells_ + (size_t) t * cells_stride_ : nullptr, sel ? counts[t] : -1, stream_);
+            }
         }
         cudaMemcpyAsync(meta_d_, meta, (size_t) 3 * kMaxRows * 4, cudaMemcpyHostToDevice, stream_);
         RowSpans rs;
@@ -636,6 +652,7 @@ private:
                                (const float*) m_.tensor("output_hc_base.weight")->ptr, head_rows, 4, hc, hcws_, coef_, stream_);
             bk::hc_pre(x, coef_, bk::hc_plain_coef_stride(4), head_rows, E, cur_, stream_);
             bk::rms_norm_rows(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, fin_, head_rows, E, g_.rms_eps, stream_);
+            dfly_.hidden(R - head_rows, head_rows, fin_, stream_);   // DFLY HOOK
             const DevTensor* head = m_.tensor("output.weight");
             bk::bf16_gemv_fp32_mmvf_multi(fin_, E, (const uint16_t*) head->ptr, logits_, g_.n_vocab, E, g_.n_vocab, head_rows, stream_);
             if (!m_.diag_dump().empty()) {
@@ -724,6 +741,7 @@ private:
     std::shared_ptr<core::ExpertTier> tier_;
     std::vector<float> lookup_host_;
     std::vector<bool> lookup_loaded_;
+    DflyHook dfly_;   // DFLY HOOK
     std::vector<uint16_t*> cache_;
     std::vector<float*> ival_, igate_, ipool_;
     std::vector<std::unique_ptr<core::ElasticArray>> ea_, pea_;

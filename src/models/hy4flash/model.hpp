@@ -5,6 +5,7 @@
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/ngram/ple_reader.hpp"
+#include "models/hy4flash/dfly.hpp"   // DFLY HOOK
 #include "models/hy4flash/pack.hpp"
 
 #include <map>
@@ -59,6 +60,9 @@ public:
     const std::string& path() const { return path_; }
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     int device() const { return device_; }
+    /// DFLY HOOK: the drafter's weights (null: none in the pack, or no drafting) and the verify window --spec asked for.
+    const DflyWeights* dfly() const { return dfly_.get(); }
+    int spec() const { return spec_; }
     const std::string& diag_dump() const { return diag_dump_; }
 
 private:
@@ -74,6 +78,8 @@ private:
     std::string diag_dump_;
     std::unique_ptr<ngram::PleReader> engram_;
     int device_ = 0, fd_ = -1;
+    std::unique_ptr<DflyWeights> dfly_;   // DFLY HOOK
+    int spec_ = 0;
     int64_t ctx_ = kDefaultContext;
 };
 

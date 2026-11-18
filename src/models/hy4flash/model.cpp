@@ -136,6 +136,10 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         dense += d.bytes;
         dev_.emplace(name, std::move(d));
     }
+    // DFLY HOOK: the drafter's weights, with the dense ones so the context is sized after them (no pack drafter, or --spec 0: none)
+    spec_ = req.spec;
+    if (req.draft)
+        if (model::Result r = dfly_plan(pack_, reads, file, device_, dfly_); !r.ok()) return r;
     // the context: refused when its caches would take more than half of what the weights leave
     {
         size_t free_b = 0, total_b = 0;
