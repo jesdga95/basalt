@@ -160,6 +160,7 @@ bool dfly_parse_flag(const std::string& a, model::FlagArgs& args, program::Commo
         o.spec_given = true;
     } else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
     else if (a == "--diag-teacher") o.diag_teacher = true;
+    else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
     else if (a == "--draft-log") core::diagnostics().draft_log = args.next("--draft-log");
     else return false;
     return true;

@@ -222,6 +222,7 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
     std::vector<float> conf((size_t) cap);
     std::vector<float> diag_rows;
     int64_t made = 0, windows = 0, offered = 0, accepted = 0, differ = 0;
+    std::vector<int64_t> offered_at((size_t) cap, 0), accepted_at((size_t) cap, 0);   // by draft position (1 = the first draft)
     double ms_draft = 0, ms_verify = 0;
     bool stop = false;
     const auto emit = [&](int32_t tok) {
@@ -243,6 +244,14 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
         } else if (cap > 1) {
             basalt::model::Result dres = sess->draft_begin(next, pos, cap - 1);
             if (dres.ok()) dres = sess->draft_end(drafts.data(), conf.data(), cap - 1, n_draft);
+            if (dres.ok() && !basalt::core::diagnostics().draft_log.empty()) {   // --draft-log: the position, the anchor and the drafts of each window
+                if (std::FILE* f = std::fopen(basalt::core::diagnostics().draft_log.c_str(), "a")) {
+                    std::fprintf(f, "D %lld %d", (long long) pos, next);
+                    for (int i = 0; i < n_draft; ++i) std::fprintf(f, " %d/%.3f", drafts[(size_t) i], (double) conf[(size_t) i]);
+                    std::fputc('\n', f);
+                    std::fclose(f);
+                }
+            }
             if (!dres.ok() && dres.status != basalt::model::Status::NotImplemented) {
                 basalt::log::error("basalt generate", "%s", dres.message.c_str());
                 return 1;
@@ -274,6 +283,10 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
         ++windows;
         offered += T - 1;
         accepted += a;
+        for (int k = 0; k < T - 1; ++k) {
+            ++offered_at[(size_t) k];
+            accepted_at[(size_t) k] += k < a;
+        }
         if (g_diag_logits) std::fwrite(diag_rows.data(), sizeof(float), (size_t) (teacher ? T : a + 1) * (size_t) g_n_vocab, g_diag_logits);
         if (teacher) {
             // the expected text goes on whatever the picks: every row runs, and each pick that differs is counted
@@ -297,6 +310,12 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
     basalt::log::info("basalt generate", "prompt %.0f ms, %lld tokens in %.0f ms",
                  std::chrono::duration<double, std::milli>(t1 - t0).count(), (long long) made,
                  std::chrono::duration<double, std::milli>(t2 - t1).count());
+    if (cap > 1) {
+        std::string by;
+        for (int k = 0; k + 1 < cap && offered_at[(size_t) k] > 0; ++k)
+            by += (k ? " " : "") + std::to_string(accepted_at[(size_t) k]) + "/" + std::to_string(offered_at[(size_t) k]);
+        basalt::log::info("basalt generate", "drafts accepted by position: %s", by.c_str());
+    }
     if (cap > 1)
         basalt::log::info("basalt generate", "windows %lld of %.2f tokens: %lld of %lld drafts accepted, %lld picks differ from the oracle; draft %.2f ms, verify %.2f ms per window",
                           (long long) windows, windows ? (double) (accepted + windows) / (double) windows : 0.0, (long long) accepted,

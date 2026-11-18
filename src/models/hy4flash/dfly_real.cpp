@@ -1,7 +1,11 @@
 // src/models/hy4flash/dfly_real.cpp - the drafter's block pass on the real weights against a reference's outputs: the target's last
 // hidden state, the target's KV rows of layers 25, 29, .. and the expected block (tools: ~/poc/hy4-ref/dfly_ref.py, vLLM's forward
 // in fp32). usage: hy4flash_dfly_real DIR [DFLY.safetensors DENSE.safetensors]
+//        hy4flash_dfly_real --pack PACK.basalt [DFLY.safetensors]: the pack's dfly section as the loader places it, byte for byte against the file
+#include "basalt/core/loader.hpp"
+#include "basalt/platform/file.hpp"
 #include "models/hy4flash/dfly.hpp"
+#include "models/hy4flash/pack.hpp"
 
 #include <cuda_runtime.h>
 
@@ -70,7 +74,45 @@ float bf(uint16_t b) {
 
 }  // namespace
 
+// The drafter as the engine loads it (dfly_plan and the loader) against the safetensors file it came from.
+static int check_pack(const std::string& pack_path, const std::string& dfly_path) {
+    basalt::models::hy4flash::Pack pack;
+    std::string err;
+    if (!basalt::models::hy4flash::open_pack(pack_path, pack, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    cudaFree(nullptr);
+    basalt::core::LoadPlan plan;
+    const int fd = basalt::platform::open_fd_utf8(pack_path);
+    std::unique_ptr<DflyWeights> w;
+    const basalt::model::Result r = dfly_plan(pack, plan, plan.file_fd(fd), 0, w);
+    if (!r.ok() || !w) { std::fprintf(stderr, "dfly_plan: %s\n", r.message.c_str()); return 1; }
+    basalt::core::Loader loader(8);
+    if (!loader.prepare({0}, err) || !loader.run(plan, err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    cudaDeviceSynchronize();
+    St dfly;
+    open_st(dfly_path, dfly, "model.dfly_layers.");
+    int bad = 0;
+    for (const DflySpec& s : dfly_specs(w->dims)) {
+        const DflyTensor& t = dfly.t.at(s.name);
+        const std::vector<uint8_t> raw = read_at(dfly_path, t.offset, t.bytes);
+        size_t diff = 0, n = (size_t) s.elems();
+        if (s.f32) {
+            std::vector<float> got(n);
+            cudaMemcpy(got.data(), w->slot(s.name), n * 4, cudaMemcpyDeviceToHost);
+            for (size_t i = 0; i < n; ++i) diff += got[i] != bf(((const uint16_t*) raw.data())[i]);
+        } else {
+            std::vector<uint8_t> got(n * 2);
+            cudaMemcpy(got.data(), w->slot(s.name), n * 2, cudaMemcpyDeviceToHost);
+            for (size_t i = 0; i < n * 2; ++i) diff += got[i] != raw[i];
+        }
+        if (diff) { std::printf("MISMATCH %s: %zu of %zu differ\n", s.name.c_str(), diff, n); ++bad; }
+    }
+    std::printf("%s: %d of 87 tensors differ from %s\n", pack_path.c_str(), bad, dfly_path.c_str());
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 3 && std::string(argv[1]) == "--pack")
+        return check_pack(argv[2], argc > 3 ? argv[3] : "/mnt/nvme/models/hy4-bf16-extra/hy4-dfly.safetensors");
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s DIR [DFLY.safetensors DENSE.safetensors]\n", argv[0]);
         return 2;
@@ -146,19 +188,21 @@ int main(int argc, char** argv) {
     if (!run) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     std::vector<const uint16_t*> caches(dkv.begin(), dkv.end());
     int bad = 0;
+    cudaStream_t st = nullptr;
+    if (argc > 4 && std::string(argv[4]) == "stream") cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);   // as the session's
     for (int rep = 0; rep < 3; ++rep) {
         const auto t0 = std::chrono::steady_clock::now();
-        if (!run->begin(anchor, T, n, *tap, 0, caches.data(), nullptr, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (!run->begin(anchor, T, n, *tap, 0, caches.data(), st, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         const auto t1 = std::chrono::steady_clock::now();
         int32_t tok[8];
         float conf[8];
-        if (!run->finish(tok, conf, nullptr, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (!run->finish(tok, conf, st, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         const auto t2 = std::chrono::steady_clock::now();
         if (rep < 2) continue;
         std::printf("block %.2f ms (enqueue), heads %.2f ms\n", std::chrono::duration<double, std::milli>(t1 - t0).count(),
                     std::chrono::duration<double, std::milli>(t2 - t1).count());
         std::vector<float> z((size_t) (n + 1) * E);
-        run->copy_block(z.data(), n + 1, nullptr);
+        run->copy_block(z.data(), n + 1, st);
         for (int r = 0; r <= n; ++r) {
             double num = 0, den = 0, mx = 0;
             for (int i = 0; i < E; ++i) {
