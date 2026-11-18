@@ -96,6 +96,7 @@ struct LoadRequest {
     int drafter_device = -1;          ///< diagnostic: the CUDA device it runs on (-1: the main card)
     std::string profile_dir;          ///< the engine's data/profiles, where a model finds the files its name keys
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
+    float route_prior = 0.0f;         ///< --route-prior: bias the router toward the experts a GPU holds (0: off)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
     RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)

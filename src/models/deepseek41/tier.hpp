@@ -173,6 +173,13 @@ public:
     int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
 
     void report(const char* tag) const;
+    /// Whether a GPU holds `layer`'s expert `e` right now: a main-card slot (a home or a copy), or a second card's.  The
+    /// set --route-prior is biased toward.
+    bool held(int layer, int e) const {
+        if (res_[(size_t) layer * n_expert_ + e] >= 0) return true;
+        return !peers_.empty() && peer_for(layer)->slot_ptr(layer, e) != nullptr;
+    }
+
     /// The routed experts so far: hits of the main card's slots, those plus the CPU's, a bus copy's or the second card's.
     int64_t hits() const { return hits_; }
     int64_t lookups() const { return hits_ + cpu_; }

@@ -108,12 +108,17 @@ struct SelectScratch {
 // equal and a lower index); ranks below k are the selection, in rank order. The k-th largest warp maximum bounds the
 // k-th score from below (k distinct experts reach it), so only experts at or above it can rank below k, and they are
 // ranked among themselves.
-__device__ void router_select_token(const float* __restrict__ logits, const float* __restrict__ bias, int n_expert,
+template <bool prior>
+__device__ void router_select_token(const float* __restrict__ logits, const float* __restrict__ bias,
+                                    const uint8_t* __restrict__ held, float bonus, int n_expert,
                                     int k, float scale, int32_t* __restrict__ ids, float* __restrict__ weights,
                                     SelectScratch& sh) {
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5, nw = n_expert >> 5;
     const float s = sqrt_softplus(logits[e]);
-    const float b = s + bias[e];
+    // --route-prior: an expert a GPU holds gains `bonus` on the score the rank is taken from; its weight stays the
+    // unbiased s (`held` is one bit per expert, layer by layer).
+    const bool warm = prior && (held[e >> 3] & (uint8_t) (1u << (e & 7))) != 0;
+    const float b = s + bias[e] + (warm ? bonus : 0.0f);
     float m = b;
 #pragma unroll
     for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
@@ -155,18 +160,20 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
     }
 }
 
-__global__ void router_select_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int n_expert,
+template <bool prior>
+__global__ void router_select_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
+                                     const uint8_t* __restrict__ held, float bonus, int n_expert,
                                      int k, float scale, int32_t* __restrict__ ids, float* __restrict__ weights) {
     __shared__ SelectScratch sh;
     const int t = blockIdx.x;
-    router_select_token(logits + (size_t) t * n_expert, bias, n_expert, k, scale, ids + (size_t) t * k,
-                        weights + (size_t) t * k, sh);
+    router_select_token<prior>(logits + (size_t) t * n_expert, bias, held, bonus, n_expert, k, scale,
+                               ids + (size_t) t * k, weights + (size_t) t * k, sh);
 }
 
 }  // namespace
 
 void router(const float* x, const float* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
-            int32_t* ids, float* weights, void* stream) {
+            int32_t* ids, float* weights, void* stream, const uint8_t* held, float bonus) {
     if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.n_embd % 128 || a.n_embd > 4 * kMaxVec * kLogitThreads || a.k < 1 || a.k > 8 || a.k > a.n_expert)
         throw std::invalid_argument("deepseek41 router: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
@@ -175,7 +182,12 @@ void router(const float* x, const float* gate, const float* bias, int n_tokens, 
         router_logits_kernel<<<a.n_expert, kLogitThreads, 0, st>>>(
             x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
     }
-    router_select_kernel<<<n_tokens, a.n_expert, 0, st>>>(logits, bias, a.n_expert, a.k, a.weight_scale, ids, weights);
+    if (held != nullptr && bonus > 0.0f)
+        router_select_kernel<true><<<n_tokens, a.n_expert, 0, st>>>(logits, bias, held, bonus, a.n_expert, a.k,
+                                                                   a.weight_scale, ids, weights);
+    else
+        router_select_kernel<false><<<n_tokens, a.n_expert, 0, st>>>(logits, bias, nullptr, 0.0f, a.n_expert, a.k,
+                                                                    a.weight_scale, ids, weights);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

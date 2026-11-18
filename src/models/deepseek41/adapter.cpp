@@ -18,11 +18,14 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
 
 namespace basalt::models::deepseek41 {
 namespace {
+
+constexpr float kRoutePriorDefault = 0.5f;   // --route-prior with no value
 
 class Adapter final : public model::ModelAdapter {
 public:
@@ -83,6 +86,22 @@ public:
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
         else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
+        else if (a == "--route-prior") {   // the value is optional: a number in (0, 16] when one follows
+            o.route_prior = kRoutePriorDefault;
+            if (args.peek() != nullptr) {
+                char* e = nullptr;
+                const float v = std::strtof(args.peek(), &e);
+                if (e != args.peek() && *e == '\0') {
+                    args.take();
+                    if (!(v > 0.0f && v <= 16.0f)) {
+                        basalt::log::error("basalt deepseek41", "--route-prior: LAMBDA must be in (0, 16]");
+                        code = 2;
+                        return true;
+                    }
+                    o.route_prior = v;
+                }
+            }
+        }
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
         return true;
@@ -96,6 +115,12 @@ public:
             basalt::log::error("basalt deepseek41", "--kv %s: DeepSeek's caches are fp8 (the default: FP8 window rows, FP4 "
                                "compressed rows and index keys) or fp16", o.kv.c_str());
             return 2;
+        }
+        if (o.route_prior > 0.0f) {
+            char effect[128];
+            std::snprintf(effect, sizeof effect, "--route-prior %g biases the decode router toward the experts a GPU holds",
+                          (double) o.route_prior);
+            o.lossy.push_back({"--route-prior", effect});
         }
         if (o.draft_experts < 0 || o.draft_experts > 128 || o.draft_experts % 32 != 0) {
             basalt::log::error("basalt deepseek41", "--draft-experts %d: 32, 64, 96 or 128, or 0 for all", o.draft_experts);

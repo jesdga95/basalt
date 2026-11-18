@@ -361,6 +361,22 @@ int main() {
         for (int p = 0; p < kT * kK; ++p) same_r = same_r && gi2[p] >= 0 && gi2[p] < kKeep && gi1[p] == rk[(size_t) gi2[p]];
         std::printf("%-22s experts %s, router %s\n", "kept against whole", same_e ? "bit for bit" : "DIFFER", same_r ? "bit for bit" : "DIFFER");
         if (!same_e || !same_r) ++failures;
+
+        // --route-prior: a mask with no bit set, or with every bit set, must leave the selection and the weights bit for
+        // bit as they were (a uniform bonus moves every score the same way, and the weights never see the bonus)
+        Dev<float> drb(rb), du_l((size_t) kT * kAll), du_w(kT * kK), dp_l((size_t) kT * kAll), dp_w(kT * kK);
+        Dev<int32_t> du_i(kT * kK), dp_i(kT * kK);
+        Dev<uint8_t> dnone(std::vector<uint8_t>((size_t) (kAll / 8), 0x00)), dall(std::vector<uint8_t>((size_t) (kAll / 8), 0xff));
+        ra.n_expert = kAll;
+        router(dx.p, drw.p, drb.p, kT, ra, du_l.p, du_i.p, du_w.p, nullptr);
+        const auto bu_i = du_i.down();
+        const auto bu_w = du_w.down();
+        router(dx.p, drw.p, drb.p, kT, ra, dp_l.p, dp_i.p, dp_w.p, nullptr, dnone.p, 0.5f);
+        const bool inert_none = dp_i.down() == bu_i && dp_w.down() == bu_w;
+        router(dx.p, drw.p, drb.p, kT, ra, dp_l.p, dp_i.p, dp_w.p, nullptr, dall.p, 0.5f);
+        const bool inert_all = dp_i.down() == bu_i && dp_w.down() == bu_w;
+        std::printf("%-22s %s\n", "route-prior inert", inert_none && inert_all ? "bit for bit" : "DIFFER");
+        if (!inert_none || !inert_all) ++failures;
     }
 
     // ---- microbench: one layer's expert work for a 5-row block (bytes are what the kernels touch)

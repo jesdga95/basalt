@@ -359,6 +359,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.drafter_device = o.drafter_device;
         lreq.profile_dir = basalt::platform::install_root() + "/data/profiles";
         lreq.draft_experts = o.draft_experts;
+        lreq.route_prior = o.route_prior;
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         lreq.kv = o.kv;
         lreq.rope = o.rope;

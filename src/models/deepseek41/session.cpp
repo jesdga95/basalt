@@ -154,6 +154,16 @@ public:
         ok = ok && cudaMalloc(&v, q8) == cudaSuccess;
         q8_ = v;
         if (v) allocs_.push_back(v);
+        if (ok && m_.tiers().route_prior > 0.0f && g_.n_expert % 8 == 0) {
+            rp_lambda_ = m_.tiers().route_prior;
+            rp_words_ = (int) (g_.n_expert / 8);
+            rp_h_.assign((size_t) g_.n_layers * rp_words_, 0);
+            rp_sent_ = rp_h_;
+            v = nullptr;
+            ok = cudaMalloc(&v, rp_h_.size()) == cudaSuccess;
+            rp_dev_ = (uint8_t*) v;
+            if (v) allocs_.push_back(v);
+        }
         if (!ok) {
             err = "out of device memory for the session";
             return false;
@@ -593,6 +603,28 @@ private:
         std::string e;
         if (ExpertTier* t = ops_->expert_tier(e)) t->settle();
     }
+
+    /// --route-prior: the experts a GPU holds now, one bit per expert and layer, refreshed before a window and uploaded
+    /// only when the tier moved something.  The router reads the mask from the device, so the captured graphs replay it.
+    void refresh_route_mask() {
+        if (rp_lambda_ <= 0.0f) return;
+        if (tier_ == nullptr) {
+            std::string e;
+            tier_ = ops_ ? ops_->expert_tier(e) : nullptr;
+            if (tier_ == nullptr) return;
+        }
+        for (int l = 0; l < (int) g_.n_layers; ++l) {
+            uint8_t* w = rp_h_.data() + (size_t) l * rp_words_;
+            for (int e = 0; e < (int) g_.n_expert; ++e) {
+                const uint8_t bit = (uint8_t) (1u << (e & 7));
+                if (tier_->held(l, e)) w[e >> 3] |= bit;
+                else w[e >> 3] = (uint8_t) (w[e >> 3] & ~bit);
+            }
+        }
+        if (std::memcmp(rp_h_.data(), rp_sent_.data(), rp_h_.size()) == 0) return;
+        if (cudaMemcpyAsync(rp_dev_, rp_h_.data(), rp_h_.size(), cudaMemcpyHostToDevice, stream_) == cudaSuccess)
+            rp_sent_ = rp_h_;
+    }
     void release_short_prompt() {
         if (!short_prompt_) return;
         cudaStreamSynchronize(stream_);
@@ -868,7 +900,8 @@ private:
         DS_CUDA(cudaStreamWaitEvent(row_st_, row_ev_[0], 0));
         ops_->stage_rows(T, normed_, row_st_);
         DS_CUDA(cudaEventRecord(row_ev_[1], row_st_));
-        router(normed_, wf(il, "ffn_gate_inp.weight"), wf(il, "exp_probs_b.bias"), T, ra, rlogits_, ids_, rw_, st);
+        router(normed_, wf(il, "ffn_gate_inp.weight"), wf(il, "exp_probs_b.bias"), T, ra, rlogits_, ids_, rw_, st,
+               rp_dev_ != nullptr ? rp_dev_ + (size_t) il * rp_words_ : nullptr, rp_lambda_);
         dump("ffn_moe_logits", il, pos, rlogits_, (size_t) g_.n_expert * sizeof(float));
         dump("ffn_moe_topk", il, pos, ids_, (size_t) g_.n_used * sizeof(int32_t));
         dump("ffn_moe_weights_scaled", il, pos, rw_, (size_t) g_.n_used * sizeof(float));
@@ -953,6 +986,7 @@ private:
     bool step_impl(const int32_t* tokens, int T, int64_t pos, bool want_out, int32_t* next, float* logits_out) {
         const size_t n = (size_t) g_.n_embd;
         void* st = stream_;
+        refresh_route_mask();
         if (!prefillp::may_resume(pos, (int64_t) hist_.size(), whole_from_)) return fail(kSkippedRows);
         if (T > 1 && !dump_dir_.empty()) return fail("deepseek41: a decode window cannot run with tensor dumps");
         if (pos == 0) {
@@ -1172,6 +1206,12 @@ private:
     int64_t row0_pos_ = 0;
     int32_t row0_prev_[8] = {};
     int32_t* ids_ = nullptr;
+    // --route-prior: one bit per expert and layer for the experts a GPU holds; the router gains +rp_lambda_ for them
+    float rp_lambda_ = 0.0f;
+    int rp_words_ = 0;   ///< bytes of one layer's mask (n_expert / 8)
+    std::vector<uint8_t> rp_h_, rp_sent_;
+    uint8_t* rp_dev_ = nullptr;
+    ExpertTier* tier_ = nullptr;
     int32_t *am_dev_ = nullptr, *h_next_ = nullptr;
     void* am_ws_ = nullptr;
     float* h_emb4_ = nullptr;   // a window's embeddings in the four streams, pinned

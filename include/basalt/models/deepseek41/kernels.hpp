@@ -28,8 +28,10 @@ struct RouterArgs {
 /// logits = gate . x (fp32, gate row-major [n_expert][n_embd]); s = sqrt(softplus(logit)); the top-k of s + bias
 /// are chosen (the lower index wins a tie); weights are the unbiased s of those experts, divided by their sum plus
 /// 1e-20, times weight_scale. `logits` is a [T][n_expert] output (workspace); ids and weights are [T][k].
+/// `held` (optional, --route-prior): one bit per expert of this layer, set for the experts a GPU holds; those gain
+/// `bonus` on the score the rank is taken from, and their weights stay the unbiased s.
 void router(const float* x, const float* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
-            int32_t* ids, float* weights, void* stream);
+            int32_t* ids, float* weights, void* stream, const uint8_t* held = nullptr, float bonus = 0.0f);
 
 // ---- hyper-connections ----------------------------------------------------------------------------------------
 
