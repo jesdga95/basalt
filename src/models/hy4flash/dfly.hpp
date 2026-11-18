@@ -158,6 +158,8 @@ public:
     /// Runs the heads over the block begin() made, in order, each with the token before it: the `n` drafts and each one's
     /// estimated chance of acceptance.
     bool finish(int32_t* ids, float* conf, void* stream, std::string& err);
+    /// The block's outputs after the final norm, `rows` rows of E floats, to the host (for the tests against a reference).
+    void copy_block(float* host, int rows, void* stream) const;
 
 private:
     DflyRunner() = default;

@@ -365,6 +365,11 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
     return true;
 }
 
+void DflyRunner::copy_block(float* host, int rows, void* stream) const {
+    cudaMemcpyAsync(host, p_->z, (size_t) rows * p_->d.E * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
+    cudaStreamSynchronize((cudaStream_t) stream);
+}
+
 bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& err) {
     Impl& p = *p_;
     if (!p.pending) {
