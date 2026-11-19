@@ -126,16 +126,27 @@ class MaxTokens(unittest.TestCase):
                 self.assertEqual(ct, want)
 
     def test_explicit_budget_over_the_context_is_rejected(self):
+        self.svc.fit_max_tokens = False     # the default clamps; the old hard reject is the opt-out
+        try:
+            for api in ("openai", "anthropic"):
+                with self.subTest(api=api):
+                    s, b, _, _ = self.call(api, max_tokens=CTX)
+                    self.assertEqual(s, 400)
+                    self.assertIn("exceeds the context", b["error"]["message"])
+                    self.assertIn("--fit-max-tokens", b["error"]["message"])     # says how to get past it
+                    self.assertIn('"fit-max-tokens": true', b["error"]["message"])
+                    self.assertIn("model entry", b["error"]["message"])          # where the setting lives, not the server section
+                    self.assertNotIn(".json", b["error"]["message"])
+                    self.assertRegex(b["error"]["message"], r"at most \d+ here")
+        finally:
+            self.svc.fit_max_tokens = True
+
+    def test_default_clamps_an_over_the_context_budget(self):
         for api in ("openai", "anthropic"):
             with self.subTest(api=api):
-                s, b, _, _ = self.call(api, max_tokens=CTX)
-                self.assertEqual(s, 400)
-                self.assertIn("exceeds the context", b["error"]["message"])
-                self.assertIn("--fit-max-tokens", b["error"]["message"])     # says how to get past it
-                self.assertIn('"fit-max-tokens": true', b["error"]["message"])
-                self.assertIn('"server" section', b["error"]["message"])
-                self.assertNotIn(".json", b["error"]["message"])
-                self.assertRegex(b["error"]["message"], r"at most \d+ here")
+                s, b, pt, ct = self.call(api, max_tokens=CTX)
+                self.assertEqual(s, 200, b)
+                self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
 
     def test_unset_budget_with_a_near_full_prompt(self):
         _, _, pt0, _ = self.call("openai", max_tokens=1)

@@ -529,9 +529,14 @@ class EveryOption(unittest.TestCase):
             # grammar is on by default: its no- form differs (test_grammar)
             if name in ("api-key", "api-key-file", "engine-bin", "grammar"):
                 continue
+            if name.startswith("no-") and isinstance(act, argparse.BooleanOptionalAction):
+                continue        # the no- form shares its action with the positive option, exercised there
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):
                 cli, cfgv = ["--" + name, str(v)], [v]
+            elif isinstance(act, argparse.BooleanOptionalAction) and act.default is True:
+                # on by default (fit-max-tokens): the no- form is what differs from the default
+                cli, cfgv = ["--no-" + name], False
             elif v is True:
                 cli, cfgv = ["--" + name], True
             else:
