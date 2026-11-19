@@ -29,6 +29,12 @@ class ContextOverflow(ValueError):
                 f"> {self.context - CTX_SLACK}; {self}")
 
 
+def shortening_note(max_new: int, cap: int, n: int, ctx: int) -> str:
+    """The line the server logs when it shortens an answer cap to the room the context leaves."""
+    return (f"max_tokens {max_new} shortened to {cap}: the prompt ({n} tokens) leaves that much of the "
+            f"context ({ctx}); --no-fit-max-tokens answers 400 instead")
+
+
 def room_error(n: int, ctx: int) -> ValueError:
     return ContextOverflow("request exceeds the context window: "
                            f"prompt ({n} tokens) leaves no room to answer in the context "
@@ -91,6 +97,8 @@ class PromptText:
         if self.clip:
             if room < 1:
                 raise room_error(n, ctx)
+            if max_new > room:
+                print(f"[server] {shortening_note(max_new, room, n, ctx)}", flush=True)
             max_new = min(max_new, room)
         elif max_new > room:
             raise overflow_error(n, max_new, ctx)
