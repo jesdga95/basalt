@@ -1026,6 +1026,7 @@ void ExpertTier::lend_all() {
     owner_.clear();
     busy_.clear();
     lent_per_layer_ = per_layer_;
+    planned_per_layer_ = std::max(planned_per_layer_, per_layer_);
     per_layer_ = 0;
     cache_.close();
 }
@@ -1046,10 +1047,29 @@ bool ExpertTier::reopen_base(int64_t n, std::string& err) {
     return true;
 }
 
-// The slots a prompt borrowed come back at the size they had: the size was planned once, at the start.
+// The slots a prompt borrowed come back at the size planned at the start, or as many as the card holds above the tier's
+// room and the reserve when what the prompt left (caches that grew) takes some of theirs; a later reclaim opens the
+// planned size again once it fits.
 bool ExpertTier::reclaim(std::string& err) {
     if (lent_per_layer_ == 0) return true;
-    return reopen_base(lent_per_layer_, err);
+    const int64_t want = std::max(lent_per_layer_, planned_per_layer_);
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        err = s_.name + ": cannot query the free device memory: " + why;
+        return false;
+    }
+    const int64_t n = core::policy::reclaim_slots(free_b, reserve_, free_floor_, one_each_, want);
+    if (n < 1) {
+        err = s_.name + ": the VRAM expert tier cannot take back any of its " + std::to_string(want) + " slots per layer (" +
+              std::to_string(free_b >> 20) + " MiB free)";
+        return false;
+    }
+    if (!reopen_base(n, err)) return false;
+    if (n < want)
+        basalt::log::warn(s_.area.c_str(), "VRAM expert tier takes back %lld of its %lld slots per layer (%lld MiB free)", (long long) n,
+                          (long long) want, (long long) (free_b >> 20));
+    return true;
 }
 
 // The start's one plan of the slots beside the base arena: read once, after everything else the start allocates, then
@@ -1086,6 +1106,7 @@ bool ExpertTier::replan(int64_t mib, std::string& err) {
     if (lent_per_layer_ > 0) {
         const int64_t n = core::policy::reclaim_slots(free_b, reserve_, free_floor_, one_each_, lent_per_layer_);
         if (n >= 1 && !reopen_base(n, err)) return false;   // nothing fits above the new reserve: the slots stay lent
+        if (n >= 1) planned_per_layer_ = n;
         if (!core::device_memory(-1, free_b, total_b, why)) {
             err = s_.name + ": cannot query the free device memory: " + why;
             return false;
