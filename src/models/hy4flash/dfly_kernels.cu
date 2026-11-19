@@ -1,6 +1,9 @@
 // src/models/hy4flash/dfly_kernels.cu - kernels of the DFly2 drafter (include/basalt/models/hy4flash/dfly_kernels.hpp).
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
+#include "basalt/models/hy4flash/kernels.hpp"
 
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -74,6 +77,24 @@ __global__ void gather_kernel(const uint16_t* __restrict__ cache, const int32_t*
     for (int c = threadIdx.x; c < width; c += blockDim.x) out[(size_t) j * width + c] = src[c];
 }
 
+// An FP8 row: 512 E4M3 codes, four fp32 scales (one per 128 codes), 64 BF16 rope values.
+__global__ void gather_fp8_kernel(const uint8_t* __restrict__ cache, const int32_t* __restrict__ cells, uint16_t* __restrict__ out) {
+    const int j = blockIdx.x;
+    const uint8_t* src = cache + (size_t) (cells ? cells[j] : j) * kFp8RowBytes;
+    const float* scale = reinterpret_cast<const float*>(src + kDflyRank);
+    const uint16_t* rope = reinterpret_cast<const uint16_t*>(src + kDflyRank + 16);
+    for (int c = threadIdx.x; c < kDflyRowWidth; c += blockDim.x) {
+        uint16_t v;
+        if (c < kDflyRank) {
+            const float f = __half2float(__half(__nv_cvt_fp8_to_halfraw(src[c], __NV_E4M3))) * scale[c >> 7];
+            v = (uint16_t) (__float_as_uint(f) >> 16);   // exact: the value is a BF16 one
+        } else {
+            v = rope[c - kDflyRank];
+        }
+        out[(size_t) j * kDflyRowWidth + c] = v;
+    }
+}
+
 __global__ void gate_add_kernel(const float* __restrict__ base, const float* __restrict__ fused, const float* __restrict__ gate, int n,
                                 float* __restrict__ out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -97,6 +118,12 @@ void dfly_expand_v(const uint16_t* kvb, const float* olat, int rows, int heads, 
 void dfly_gather_rows(const uint16_t* cache, const int32_t* cells, int n, int width, uint16_t* out, void* stream) {
     if (n < 1) return;
     gather_kernel<<<n, 192, 0, (cudaStream_t) stream>>>(cache, cells, width, out);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void dfly_gather_rows_fp8(const uint8_t* cache, const int32_t* cells, int n, uint16_t* out, void* stream) {
+    if (n < 1) return;
+    gather_fp8_kernel<<<n, 192, 0, (cudaStream_t) stream>>>(cache, cells, out);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
