@@ -1765,6 +1765,54 @@ class LoadProgress(unittest.TestCase):
         bars.say("[server] warning: x")
         self.assertIn("\x1b[1A\x1b[2K[server] warning: x\n", out.getvalue())
 
+    def test_the_one_bar_says_where_the_engine_places(self):
+        from serve.engine.progress import LoadBars, load_into
+        self.assertEqual(load_into("basalt load: into cuda0"), "cuda0")
+        self.assertEqual(load_into("basalt load: into ram"), "ram")
+        self.assertIsNone(load_into("basalt load: into disk"))
+        self.assertIsNone(load_into("basalt load: weights 1 2"))
+        out = Tty()
+        bars = LoadBars(out, gpus=[2, 3])                               # CUDA ordinals 0, 1 are nvidia-smi 2, 3
+        bars.set_total(4 << 30)
+        bars.set_stages(["cuda0", "cuda1", "ram"])
+        bars.set_into("cuda0")                                          # each card's share in turn, first
+        bars.update("weights", 1 << 30, 4 << 30)
+        self.assertEqual(bars.lines(), ["[server] loading model weights: cuda2 [" + "=" * 6 + ">" + " " * 17 + "]   1.0/4.0 GiB"])
+        bars.set_into("cuda1")
+        bars.update("weights", 2 << 30, 4 << 30)
+        self.assertEqual(bars.lines(), ["[server] loading model weights: cuda3 [" + "=" * 12 + ">" + " " * 11 + "]   2.0/4.0 GiB"])
+        bars.set_into("ram")                                            # then RAM, on the same bar, which stays put
+        self.assertEqual(bars.lines(), ["[server] loading model weights: ram   [" + "=" * 12 + ">" + " " * 11 + "]   2.0/4.0 GiB"])
+        self.assertTrue(out.getvalue().splitlines()[-1].endswith("ram   [" + "=" * 12 + ">" + " " * 11 + "]   2.0/4.0 GiB"))
+        log = io.StringIO()                                             # off a terminal: one line at each change
+        bars = LoadBars(log)
+        bars.set_total(4 << 30)
+        bars.set_into("cuda0")                                          # before the first bytes: nothing to show yet
+        bars.update("weights", 3 << 30, 4 << 30)
+        bars.set_into("ram")
+        self.assertEqual(log.getvalue().splitlines(),
+                         ["[server] loading model weights: ram   [" + "=" * 18 + ">" + " " * 5 + "]   3.0/4.0 GiB"])
+
+    def test_four_cards_then_ram_on_one_bar_that_never_shifts(self):
+        from serve.engine.progress import LoadBars, load_stages
+        stages = load_stages("basalt load: stages cuda0 cuda1 cuda2 cuda3 ram")
+        self.assertEqual(stages, ["cuda0", "cuda1", "cuda2", "cuda3", "ram"])
+        self.assertIsNone(load_stages("basalt load: stages disk"))
+        bars = LoadBars(Tty(), gpus=[3, 10, 1, 0])                      # nvidia-smi numbers: cuda10 is the widest
+        bars.set_total(10 << 30)
+        bars.set_stages(stages)
+        seen = []
+        for i, target in enumerate(stages):
+            bars.set_into(target)
+            bars.update("weights", (2 * i + 1) << 30, 10 << 30)
+            seen.append(bars.lines()[0])
+        heads = [line.split(" [")[0] for line in seen]
+        self.assertEqual(heads, ["[server] loading model weights: cuda3 ", "[server] loading model weights: cuda10",
+                                 "[server] loading model weights: cuda1 ", "[server] loading model weights: cuda0 ",
+                                 "[server] loading model weights: ram   "])
+        self.assertEqual(len({line.index("[", 9) for line in seen}), 1)   # the bar starts in one column throughout
+        self.assertTrue(seen[-1].endswith("]   9.0/10.0 GiB"))
+
     def test_a_total_that_grows_or_shrinks_moves_the_bar(self):
         from serve.engine.progress import LoadBars
         bars = LoadBars(io.StringIO())

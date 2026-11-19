@@ -56,7 +56,9 @@ def start_last_line(log: str | None, offset: int) -> str:
 
 class LoadBars:
     """The load's progress bar: one row, "loading model weights", over every byte the engine placed (a card, a second
-    card, RAM) against the total it announced; the n-gram table lock is its own row, outside the total. finish()
+    card, RAM) against the total it announced, labelled with where the engine places now: each card's share in turn
+    ("loading model weights: cuda0", then "cuda1" ...), then "ram", the label padded to the longest stage so the bar
+    stays put; the n-gram table lock is its own row, outside the total. finish()
     collapses the bars into one result line. Off a terminal the rows print as text once per heartbeat, only while
     their bytes move.
 
@@ -82,6 +84,8 @@ class LoadBars:
         self.gpus = list(gpus or [])                   # CUDA ordinal -> nvidia-smi number
         self.tty = self.out.isatty()
         self.total = 0                                 # announced total bytes (0: none)
+        self.into = ""                                 # where the engine places now: `cuda<N>`, `ram` or none
+        self.into_pad = 0                              # the longest stage: the label's width
         self.rows: dict[str, dict] = {}                # target -> {have, plan, start, moves, phase, moved, cadence}
         self._beat_seen: dict[str, int] = {}           # bytes each row showed at the previous busy heartbeat
         self._beat_t: float | None = None              # when the previous busy heartbeat fired
@@ -96,6 +100,33 @@ class LoadBars:
         if target.startswith("cuda") and target[4:].isdigit() and int(target[4:]) < len(self.gpus):
             return f"cuda{self.gpus[int(target[4:])]}"
         return target
+
+    def label(self, target: str) -> str:
+        """A row's name: the weights' row says where the engine places now, as v0.4.1's stages read."""
+        name = self.LABELS.get(target, target)
+        if target != self.WEIGHTS or not self.into:
+            return name
+        return f"{name}: {self.key(self.into).ljust(self.into_pad)}"
+
+    def set_stages(self, targets: list[str]) -> None:
+        """Where the engine will place, in order (`basalt load: stages <target>...`): the label is as wide as the longest."""
+        with self.lock:
+            self.into_pad = max([self.into_pad] + [len(self.key(t)) for t in targets])
+
+    def set_into(self, target: str) -> None:
+        """The engine places into `target` from now on (`basalt load: into <target>`): the weights' row takes it as its
+        label. Off a terminal the row is printed once at each change."""
+        with self.lock:
+            self.into = target
+            self.into_pad = max(self.into_pad, len(self.key(target)))
+            if self.tty:
+                if self.drawn:
+                    self._erase()
+                    self._draw()
+            elif self.WEIGHTS in self.rows and self.rows[self.WEIGHTS]["start"] is not None:
+                for key, text in self._rows():
+                    if key == self.WEIGHTS:
+                        self.say(text)
 
     def _row(self, target: str) -> dict:
         # moves: (time, bytes) read while moving, the window the rate covers; phase: where the row's current stretch
@@ -187,7 +218,7 @@ class LoadBars:
             rate = self._rate(t, now)
             if not rate and beat is not None:
                 rate = self._beat_rate(have, now, (beat[0], beat[1].get(target, have)))
-            rows.append((target, f"[server] {self.LABELS.get(target, target)}", have, plan, rate))
+            rows.append((target, f"[server] {self.label(target)}", have, plan, rate))
         pad = max((len(r[1]) for r in rows), default=0)
         out = []
         for target, label, have, plan, rate in rows:
@@ -375,6 +406,25 @@ def load_planning(line: str) -> bool:
     return line.split() == ["basalt", "load:", "planning"]
 
 
+_STAGE = re.compile(r"ram|cuda\d+")
+
+
+def load_stages(line: str):
+    """The targets of an engine `basalt load: stages <target>...` line, in order, else None."""
+    parts = line.split()
+    if len(parts) >= 4 and parts[:3] == ["basalt", "load:", "stages"] and all(_STAGE.fullmatch(t) for t in parts[3:]):
+        return parts[3:]
+    return None
+
+
+def load_into(line: str):
+    """Where the engine places now from a `basalt load: into <target>` line (`cuda<N>` or `ram`), else None."""
+    parts = line.split()
+    if len(parts) == 4 and parts[:3] == ["basalt", "load:", "into"] and _STAGE.fullmatch(parts[3]):
+        return parts[3]
+    return None
+
+
 def load_total(line: str):
     """The bytes of the whole start from an engine `basalt load: total <bytes>` line, else None."""
     parts = line.split()
@@ -440,6 +490,10 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
                 if load_planning(line):
                     bars.say("[server] planning weight allocation")
                     last = time.time()
+                elif (stages := load_stages(line)) is not None:
+                    bars.set_stages(stages)
+                elif (into := load_into(line)) is not None:
+                    bars.set_into(into)
                 elif (n := load_total(line)) is not None:
                     bars.set_total(n)
                     last = time.time()
