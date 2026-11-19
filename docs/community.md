@@ -4,7 +4,7 @@
 
 ## Add your run
 
-1. Stop any running Basalt server (the GPUs must be free), then run `basalt-bench --community --model PACK` (a Flash-Next, a 27B or a DeepSeek pack). It starts its own engine (three times, once per measurement), shows the load progress on stderr while each one starts, adds its row to `docs/community/benchmarks.json` and prints it. It uses every visible Blackwell GPU: a second card is the peer, and `CUDA_VISIBLE_DEVICES=0` gives a single-card row.
+1. Stop any running Basalt server (the GPUs must be free), then run `basalt-bench --community --model PACK` (a Flash-Next, a 27B or a DeepSeek pack). It starts its own engine (three times, once per measurement), shows the load progress on stderr while each one starts, adds its row to `docs/community/benchmarks.json` and prints it. It uses every visible Blackwell GPU: a second card is the peer, and `CUDA_VISIBLE_DEVICES=0` gives a single-card row. Where the driver enumerates an older card first - a Blackwell card with an `-DPEER_ADA=ON` peer - put the Blackwell card first anyway: `CUDA_VISIBLE_DEVICES=1` for a single-card row, `CUDA_VISIBLE_DEVICES=1,0` with the peer, because the harness samples power and clocks from the first visible card while it measures.
 2. `--submitter NAME` is required: the name you want shown (one name with no spaces, up to 40 characters; it is not verified). `notes` (up to 200 characters) is optional and added by hand.
 3. Review the row in `docs/community/benchmarks.json`, commit it and open a pull request. If the file already has a row of your setup (see below), the bench replaces that row in place, keeps its `notes` and says so; check the notes still apply. If the bench could not write the file, it prints the row and says where to paste it.
 
