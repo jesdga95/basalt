@@ -541,8 +541,6 @@ target_link_libraries(tiers PUBLIC core kernels kernels_cpu ${_gpu_runtime_targe
 add_library(expert_tier STATIC src/core/expert_tier.cpp)
 target_include_directories(expert_tier PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
 target_link_libraries(expert_tier PUBLIC tiers peer_share mmq core kernels kernels_cpu platform ${_gpu_runtime_target})
-# the start-up pick the tier sizes its CPU pool by (program::auto_pool_workers), the one auto_plan applies
-target_link_libraries(expert_tier PRIVATE engine_session)
 if(BASALT_MODEL_QWEN4EXP)
 include(src/models/qwen4exp/qwen4exp.cmake)
 endif()
@@ -717,7 +715,7 @@ add_library(engine_session STATIC src/program/engine_session.cpp src/program/loa
             src/program/gpu_select.cpp src/program/multi_gpu_plan.cpp src/program/image_loan.cpp)
 target_include_directories(engine_session PUBLIC include)
 find_package(Threads REQUIRED)
-target_link_libraries(engine_session PUBLIC platform Threads::Threads)
+target_link_libraries(engine_session PUBLIC platform kernels_cpu Threads::Threads)   # the pool's sizing rule (auto_pool_workers)
 # the GBNF grammar engine and the JSON-schema and tool-call grammar builders (CPU only, no engine dependency)
 add_library(grammar STATIC src/program/grammar/grammar.cpp src/program/grammar/schema.cpp src/program/grammar/json_schema.cpp
             src/program/grammar/schema_convert.cpp src/program/grammar/guard.cpp)
