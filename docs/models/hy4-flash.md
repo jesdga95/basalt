@@ -126,7 +126,7 @@ bus: 89.5 GB of experts at 29 GB/s (the card's x8 PCIe 5 link) = 3.1 s a chunk, 
 
 ## 1M context
 
-Sparse layers keep every position (16-bit rows of 1,152 B x 12 and the pooled keys: 14.6 KB a position, 14.3 GiB at 1M; `--kv fp8`,
+Sparse layers keep every position (fp16 rows of 1,152 B x 12 and the pooled keys: 14.6 KB a position, 14.3 GiB at 1M; `--kv fp8`,
 vLLM's `fp8_ds_mla` row of 656 B: 8.4 GiB). The caches are elastic as Flash-Next's: the first 32,768 positions are backed at start, the rest
 come out of the expert tier when a prompt needs them and go back when a later prompt needs fewer; a prompt that would leave the
 tier below a prompt chunk's room is refused and the engine serves on. Formats, rounding, selection cost and the 1M measurements:
@@ -256,7 +256,7 @@ Exit: layer 0 to 2 hidden states within gate 1, then all 42. GPU tests are queue
    QD64 on `/mnt/nvme`; hot-row hit rate by replaying the trace's token streams through the hash (CPU only); prefetch overlap.
 7. **NVFP4 RTN quality** without calibration. Measure KLD against Q4_K_M and BF16; fall back: per-layer scale search, a higher-bit
    `down`, or Q4_K as the default pack. Weight RMS error: NVFP4 0.081; Q4_K 0.071 (gate, up), 0.077 (down); Q6_K down 0.018 (19 layers).
-8. **KV precision.** 16-bit default; `--kv fp8` (vLLM's rows) is opt-in, measured in [KV cache](hy4-flash/kv.md).
+8. **KV precision.** fp16 default (the reference run's cache, Basalt's convention); `--kv fp8` (vLLM's rows) is opt-in, measured in [KV cache](hy4-flash/kv.md).
 9. **Selection ties and T invariance.** FP16 tensor-core scoring versus the reference's BF16 can flip near-tied pools; measure the
    id overlap against llama.cpp per layer (decode and prefill) and the logit effect; keep the scoring order fixed across windows.
 10. **Q6_K down in the grouped expert kernels (GPU) and no `q6k_dot` on the CPU** for the test pack: parity tests first (pack doc).
