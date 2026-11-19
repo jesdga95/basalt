@@ -72,7 +72,9 @@ std::string cpu_label(const std::string& raw_name, int physical_cores) {
 }
 
 std::string pack_quant_label(const std::string& name) {
-    std::string q = name.substr(name.rfind(' ') == std::string::npos ? 0 : name.rfind(' ') + 1);
+    const size_t sp = name.rfind(' ');
+    if (sp == std::string::npos) return "unknown";   // a name without a space carries no quant label
+    std::string q = name.substr(sp + 1);
     for (const char* pre : {"NVIDIA-", "UD-"})
         if (q.rfind(pre, 0) == 0) q.erase(0, std::strlen(pre));
     return q.empty() ? "unknown" : q;

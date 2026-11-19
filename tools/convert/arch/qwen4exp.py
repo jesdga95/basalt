@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from . import Arch, register
+from . import Arch, gguf_stem, register
 
 LICENSE_TEXT = (Path(__file__).resolve().parent.parent / "qwen-community-license-1.0.txt").read_text(encoding="utf-8")
 
@@ -50,11 +50,9 @@ class Qwen4Exp(Arch):
         return lic
 
     def default_name(self, first_gguf, kv, sections_from=False):
-        name = re.sub(r"-\d{5}-of-\d{5}\.gguf$", "", Path(first_gguf).name)
-        stem = name.removesuffix(".gguf")
-        tag = stem.rsplit("Flash-Next-", 1)[-1] if "Flash-Next-" in stem else ""
+        tag = re.search(r"flash-next[-.](.+)$", gguf_stem(first_gguf), re.I)
         # the quant comes from the file name; without a tag the name carries none rather than a guessed one
-        return f"Qwen3.8-Flash-Next {tag}" if tag else "Qwen3.8-Flash-Next"
+        return f"Qwen3.8-Flash-Next {tag.group(1)}" if tag else "Qwen3.8-Flash-Next"
 
 
 register(Qwen4Exp())

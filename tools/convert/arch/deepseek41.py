@@ -7,10 +7,7 @@ projector GGUF as the `vision/mmproj` section, `--dspark` the DSpark drafter GGU
 """
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
-from . import Arch, register
+from . import Arch, gguf_stem, register
 
 ENGRAM_TENSOR = "per_layer_token_embd.weight"
 ENGRAM_SECTION = "engram"
@@ -82,7 +79,7 @@ class DeepSeek41(Arch):
 
     def default_name(self, first_gguf, kv, sections_from=False):
         base = kv.get("general.name") or "DeepSeek-V4.1-Flash"
-        stem = re.sub(r"-\d{5}-of-\d{5}\.gguf$", "", Path(first_gguf).name)
+        stem = gguf_stem(first_gguf)
         tail = stem[len(base):].strip("-_ ") if stem.startswith(base) else ""
         return f"{base} {tail}" if tail else base
 
