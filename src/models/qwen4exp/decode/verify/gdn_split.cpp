@@ -33,6 +33,7 @@ using namespace verify_detail;
 static bool g_gs_off = false;   // set by Verifier::gs_decide when the split does not pay
 
 static int gs_plan_bw(const ModelGeometry& g, int dev0, int dev1) {
+    if (card_cc(dev1) != card_cc(dev0)) return 0;   // the mixer's kernels exist for the main card's architecture only
     const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
     const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
     constexpr int kBlockCols = 256;
@@ -138,6 +139,10 @@ int64_t Verifier::gs_peer_bytes(const WeightTable& wt, const ModelGeometry& g, i
 void Verifier::gs_init() {
     using basalt::core::GdnHeadSlice;
     if (dm_ == nullptr || dm_->pdev < 0 || wt_ == nullptr) return;
+    if (card_cc(dm_->pdev) != card_cc(device_)) {   // one line at start; gs_plan_bw refuses it too
+        basalt::log::info("basalt verify", "the GDN mixers stay whole on CUDA0: the peer is not the main card's architecture");
+        return;
+    }
     const ModelGeometry& g = *g_;
     const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
     const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;

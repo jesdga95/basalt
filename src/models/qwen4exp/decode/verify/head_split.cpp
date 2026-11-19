@@ -1,3 +1,8 @@
+// The two-stage head split, the exact head split and the GDN mixer split all launch kernels on the peer from the
+// binaries that -DPEER_ADA=ON compiles for it: the expert-window decode kernels and the prompt mmq instances, not
+// the head's planes' (q80_vhead.cu) nor the mixers' (gdn.cu).  The three planners refuse a peer of a different
+// compute capability than the main card, so its VRAM goes to experts and the head and the mixers stay whole.
+
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
@@ -23,6 +28,7 @@ using namespace verify_detail;
 // does not pay for its two hand-offs, so it is taken only when the peer's share is large.
 // CUDA0's rows of the head split by vocabulary (0: no split), from the cards' bandwidths.
 static int hs_plan(size_t rb, int type, int V, int N, int T, int dev0, int dev1) {
+    if (card_cc(dev1) != card_cc(dev0)) return 0;   // an unlike peer runs the expert tier's kernels, not the head's
     if (type == 13 ? !basalt::kernels::q5k_head_supported(N, T) : type == 14) return 0;
     const double bw0 = card_bandwidth(dev0), bw1 = card_bandwidth(dev1);
     if (bw0 <= 0.0 || bw1 <= 0.0 || rb == 0) return 0;
@@ -38,6 +44,7 @@ static int hs_plan(size_t rb, int type, int V, int N, int T, int dev0, int dev1)
 // peer's share also pays its input's and its list's trips over the host, so it takes a little less than its bandwidth's
 // share.  CUDA0's rows (0: no split).
 static int hs_plan_two(int V, int dev0, int dev1) {
+    if (card_cc(dev1) != card_cc(dev0)) return 0;   // the planes' kernels exist for the main card's architecture only
     const double bw0 = card_bandwidth(dev0), bw1 = card_bandwidth(dev1);
     if (bw0 <= 0.0 || bw1 <= 0.0 || bw1 >= bw0) return 0;
     constexpr double screen_row = 2080.0, hand_off = 20e-6;   // the bytes a row's screen reads; the trips and the list
@@ -71,6 +78,10 @@ int64_t Verifier::hs_peer_bytes(size_t row_bytes, int type, int64_t n_vocab, int
 
 void Verifier::hs_init() {
     if (head_ == nullptr || !head_->loaded() || head_->vproxy() != nullptr || dm_ == nullptr || dm_->pdev < 0) return;
+    if (card_cc(dm_->pdev) != card_cc(device_)) {   // one line at start, then the exact head runs whole on CUDA0
+        basalt::log::info("basalt verify", "the head stays whole on CUDA0: the peer is not the main card's architecture");
+        return;
+    }
     const int N = (int) g_->n_embd, V = (int) n_vocab_, T = max_t_;
     const size_t rb = head_->row_bytes();
     if (head_->planes() && head_keep_d_ != nullptr && le_ >= g_->n_layers &&
