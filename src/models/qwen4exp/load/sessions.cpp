@@ -1,4 +1,5 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/core/elastic_kv.hpp"
 #include "context.hpp"
 
 namespace basalt::models::qwen4exp::generate {
@@ -170,14 +171,13 @@ int sessions(Context& context) {
     }
 
     uint64_t solo_kv_bytes = 0;   // the solo session's state on CUDA0, reported once it is known to be a session of its own
-    // ---- THE ELASTIC KV.  A server on one GPU backs only the first kKvElasticFloor cells of each session's K/V pools at
+    // ---- THE ELASTIC KV.  A server on one GPU backs only the first core::kElasticKvBase cells of each session's K/V pools at
     // start; the rest of their VRAM goes to the expert cache as its tail, and a request that needs more cells takes
     // them back from that tail (kv_fit below), so a short request decodes with the larger cache.  Not with KV
     // streaming (its pools are a fixed set of VRAM pages) nor with --vram-elastic (that resizes the same tail).
     // With --batch a session's base is smaller: the slots' sessions are many, and an idle or short one would hold its
     // whole base out of the expert cache.
-    constexpr int64_t kKvElasticFloor = 32768, kKvElasticFloorBatch = 4096;
-    const int64_t kv_base = o.batch > 0 ? kKvElasticFloorBatch : kKvElasticFloor;
+    const int64_t kv_base = o.batch > 0 ? basalt::core::kElasticKvBaseBatch : basalt::core::kElasticKvBase;
     const int64_t kv_floor = o.serve && !multi_gpu && o.kv_resident == 0 && !o.vram_elastic &&
                              o.max_context > kv_base ? kv_base : 0;
     basalt::core::qsa_set_kv_elastic(kv_floor);
