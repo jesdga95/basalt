@@ -921,6 +921,7 @@ private:
     // cells each row attends and the indexer (kCells: the positions), the attention over them and the output (kOutput: no
     // position). A decode window replays the first and last from graphs.
     static constexpr int kQuery = 1, kCells = 2, kOutput = 4, kAll = 7;
+    static constexpr int kRaw = 8;   // with kOutput: leave the output projection un-normed in attn_raw_ (add_norm_hc_post norms it)
     bool attention_step(int l, int64_t pos0, int R, int step, std::string& err, int phases = kAll) {
         const int H = g_.heads[(size_t) l];
         const bool swa = g_.swa[(size_t) l];
@@ -1031,6 +1032,7 @@ private:
         mul_sigmoid(gate_, vout_, R * H * g_.v_dim, stream_);
         if (diag(l)) dump("attn_gated-" + std::to_string(l), vout_, (int64_t) R * H * g_.v_dim);
         gemm(T(l, "attn_output.weight"), vout_, attn_raw_, H * g_.v_dim, E, R);
+        if (phases & kRaw) return true;
         bk::rms_norm_rows(attn_raw_, F(l, "post_attention_norm.weight"), attn_, R, E, g_.rms_eps, stream_);
         if (diag(l)) dump("attn_out-" + std::to_string(l), attn_, (int64_t) R * E);
         return true;
@@ -1703,8 +1705,8 @@ private:
         const uint32_t seq0 = seq_want_;
         if (!replay(l, R, 1, [&] {
                 std::string e;
-                attention_step(l, pos0, R, 0, e, kOutput);
-                bk::hc_post(attn_, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
+                attention_step(l, pos0, R, 0, e, kOutput | kRaw);
+                add_norm_hc_post(attn_raw_, nullptr, F(l, "post_attention_norm.weight"), g_.rms_eps, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
                 bk::hc_mixes_plain(xb, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
                 bk::hc_pre_rms_norm(xb, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
                 moe_head(l, R, false);
@@ -1716,9 +1718,8 @@ private:
         xa = X_;
         xb = Xn_;
         if (!replay(l, R, 2, [&] {
-                moe_tail(l, R);
-                bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, R, E, g_.rms_eps, stream_);
-                bk::hc_post(mlp2_, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
+                gemm(T(l, "ffn_routed_up.weight"), lat_out_, moe_out_, g_.n_latent, g_.n_embd, R);
+                add_norm_hc_post(moe_out_, sh_, F(l, "post_ffw_norm.weight"), g_.rms_eps, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
             }, err))
             return false;
         std::swap(X_, Xn_);
