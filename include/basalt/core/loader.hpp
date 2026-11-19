@@ -27,10 +27,15 @@ enum class Conv : uint8_t {
     ToF16,       ///< f32 -> fp16, round to nearest even
     WidenF16,    ///< fp16 -> f32, exact
     Bf16ToF32,   ///< bf16 -> f32, exact
+    Bf16ToQ8_0,  ///< bf16 -> ggml's block_q8_0 (34 bytes per 32 elements), rounded as quantize_bf16_q8_0
 };
 
 /// The bytes a converted range of `in` file bytes takes at its destination.
 uint64_t conv_out_bytes(Conv conv, uint64_t in);
+
+/// `n` bf16 values (a multiple of 32) -> ggml's block_q8_0, rounded as ggml's reference quantizer does: per 32 values
+/// d = amax / 127 stored as fp16, q = round(x / d).
+void quantize_bf16_q8_0(const uint16_t* bf16, uint64_t n, uint8_t* blocks);
 
 struct LoadItem {
     static constexpr uint64_t kOut = ~0ull;   ///< `count`: what the item adds to the bar is its destination bytes
