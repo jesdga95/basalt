@@ -1,6 +1,7 @@
 """Flash-Next (and any architecture without its own entry)."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from . import Arch, register
@@ -49,9 +50,11 @@ class Qwen4Exp(Arch):
         return lic
 
     def default_name(self, first_gguf, kv, sections_from=False):
-        if sections_from:
-            return "Qwen3.8-Flash-Next " + Path(first_gguf).name.split("Next-")[-1].split("-0000")[0]
-        return "Qwen3.8-Flash-Next IQ3_XXS"
+        name = re.sub(r"-\d{5}-of-\d{5}\.gguf$", "", Path(first_gguf).name)
+        stem = name.removesuffix(".gguf")
+        tag = stem.rsplit("Flash-Next-", 1)[-1] if "Flash-Next-" in stem else ""
+        # the quant comes from the file name; without a tag the name carries none rather than a guessed one
+        return f"Qwen3.8-Flash-Next {tag}" if tag else "Qwen3.8-Flash-Next"
 
 
 register(Qwen4Exp())
