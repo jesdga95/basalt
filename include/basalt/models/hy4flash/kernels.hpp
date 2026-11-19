@@ -27,7 +27,7 @@ struct MlaArgs {
 
 /// A product per head over Q8_0 rows, for n_tok tokens: y[t][h][r] = w[h * rows + r] . x[t][h] for h < heads, r < rows, over `k`
 /// values (k % 32 == 0); x of token t and head h starts at x + t * x_tok_stride + h * x_head_stride. `w` is the tensor's bytes
-/// (34 bytes per 32 values, rows of k / 32 blocks).
+/// (34 bytes per 32 values, rows of k / 32 blocks), 16-byte aligned.
 void q8_0_heads_gemv(const void* w, const float* x, int x_head_stride, int x_tok_stride, int heads, int rows, int k, int n_tok,
                      float* y, void* stream);
 
@@ -48,28 +48,41 @@ void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const 
                  int n_tok, int ring, float* qcur, uint8_t* cache, void* stream);
 
 /// The cells each row attends (device arrays of n_tok entries): row t takes counts[t] cells, the cells of row t listed at
-/// cells + t * cells_stride, or (cells null) firsts[t] + j (modulo the ring when it is set).
+/// cells + t * cells_stride, or (cells null, or fill set and fill[t] > 0) firsts[t] + j (modulo the ring when it is set).
 struct RowSpans {
     const int32_t* firsts = nullptr;
     const int32_t* counts = nullptr;
     const int32_t* cells = nullptr;
     int cells_stride = 0;
+    const int32_t* fill = nullptr;
 };
 
 /// o_lat[t][h][c] = sum_j softmax_j(scale * qcur[t][h] . cache[cell_j]) * cache[cell_j][c] for c < rank, j < counts[t], where the
-/// softmax's denominator also holds exp(sinks[h]). cache [cells][rank + rope]; counts <= 4096.
+/// softmax's denominator also holds exp(sinks[h]). cache [cells][rank + rope], rank 512 and rope 64; counts <= max_cells. Up to 8
+/// rows a launch, a block per 64 cells and 8 or 16 heads (all heads read a cell once), the chunks merged by the last block of a row's
+/// head group; a BF16 cache with more rows (a prompt's chunk) takes the tensor-core kernel. `work`: mla_attend_work_bytes for calls of
+/// up to max_rows rows, zeroed once before its first use (the launches leave it so).
+size_t mla_attend_work_bytes(int heads, int max_cells, int max_rows);
 void mla_attend(const float* qcur, const float* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
-                float* o_lat, void* stream);
+                int max_cells, void* work, float* o_lat, void* stream);
 /// The same over a BF16 cache.
 void mla_attend(const float* qcur, const uint16_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
-                float* o_lat, void* stream);
+                int max_cells, void* work, float* o_lat, void* stream);
 void mla_attend(const float* qcur, const uint8_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
-                float* o_lat, void* stream);
-/// cells[t][j] = j for j < fill[t]; a row with fill 0 is left alone.
+                int max_cells, void* work, float* o_lat, void* stream);
+
+/// mla_prepare for a window of 1 to 8 rows in one launch, with q_abs computed in it: the k_b product (w_kb: Q8_0 [heads][rank][nope],
+/// as q8_0_heads_gemv with the query's head stride) goes straight into qcur. Row t is at position pos[t] (device).
+void mla_query(const void* w_kb, const float* q, const float* kv_raw, const float* kv_norm, const MlaArgs& a, const int32_t* pos, int n_tok,
+               int ring, float* qcur, float* cache, void* stream);
+void mla_query(const void* w_kb, const float* q, const float* kv_raw, const float* kv_norm, const MlaArgs& a, const int32_t* pos, int n_tok,
+               int ring, float* qcur, uint16_t* cache, void* stream);
+void mla_query(const void* w_kb, const float* q, const float* kv_raw, const float* kv_norm, const MlaArgs& a, const int32_t* pos, int n_tok,
+               int ring, float* qcur, uint8_t* cache, void* stream);
+
 /// ids[h * rows + t] = t * heads + h: the (token, head) rows of a [token][head][k] array in head-major order; bounds[h] = h * rows
 /// for h <= heads (each head an "expert" of an MMQ product).
 void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* stream);
-void iota_cells(int32_t* cells, int stride, const int32_t* fill, int n_tok, void* stream);
 
 /// x[i] *= sigmoid(g[i]).
 void mul_sigmoid(const float* g, float* x, int n, void* stream);

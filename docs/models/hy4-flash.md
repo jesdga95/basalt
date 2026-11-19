@@ -104,9 +104,9 @@ glm53 branch: take `a62b2de5` (the hc kernels in shared code) only, by cherry-pi
 (`model_sections.py`, `convert.py`) overlap with the Hy4 converter changes, so whichever lands second rebases. Its MLA and indexer
 kernels are single-query FP32 decode kernels with a 4,096-cell cap.
 
-Follow-up, with the DeepSeek pack present: Hy4 keeps its own attention kernels (`src/models/hy4flash/kernels/mla.cu`, rows as blocks over a BF16 or
-fp32 latent cache with a sink); `attn_mqa.cu` is to be generalised (dK != dV, head count, one row source) so the two share one kernel, each step
-with the DeepSeek parity and speed runs. The router and the row norms are shared already (`basalt/kernels/router.hpp`, `row_norm.hpp`).
+Decode attention (`kernels/mla.cu`), up to 8 rows: `mla_query` (the `k_b` product into the query rows, their rope part, the cache rows), then
+`mla_attend` on DeepSeek's MQA chunk stage (`basalt/kernels/mqa_chunk.cuh`: a block per 64 cells and 8 or 16 heads reads each cell once, the
+last block of a row's head group merges the chunks with the sink), then the `v_b` product. The router and the row norms are shared already (`basalt/kernels/router.hpp`, `row_norm.hpp`).
 
 Prompt path (`session.cpp`): a prompt opens row buffers for chunks of up to 16,384 rows (halved to fit) and the VRAM tier lends its
 slots to them. Each chunk runs the 42 layers; the attention runs in steps of 2,048 rows (the rings are sized for a step), each step

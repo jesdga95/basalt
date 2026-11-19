@@ -188,6 +188,7 @@ struct DflyRunner::Impl {
     uint16_t* ctx = nullptr;   ///< the rows a layer attends, BF16: the selected ones, then the block's own
     uint8_t* blk8 = nullptr;   ///< with FP8 caches, the block's own rows as FP8 rows before they are decoded into ctx
     int32_t *meta_d = nullptr, *meta_h = nullptr;   ///< per layer, the rows' first cells (0) and counts
+    void* attw = nullptr;                           ///< the attention's workspace (zeroed once)
     float *cat = nullptr, *fused = nullptr, *emb0 = nullptr, *pe = nullptr, *hg = nullptr, *hu = nullptr, *hh = nullptr,
           *hd = nullptr, *hcout = nullptr, *logits = nullptr, *craw = nullptr;
     int32_t* pick = nullptr;
@@ -248,6 +249,9 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
     p.ctx = (uint16_t*) p.dev((size_t) (env.sel_cap + kDflyBlock) * kDflyRowWidth / 2 + 1, ok);
     if (env.fp8) p.blk8 = (uint8_t*) p.dev((size_t) kDflyBlock * kFp8RowBytes / 4, ok);
     p.meta_d = (int32_t*) p.dev(kDflyMaxLayers * 16, ok);
+    const size_t attw = mla_attend_work_bytes((int) H, env.sel_cap + kDflyBlock, kDflyBlock);
+    p.attw = p.dev((attw + 3) / 4, ok);
+    if (ok) cudaMemset(p.attw, 0, attw);
     p.cat = p.dev(2 * E, ok); p.fused = p.dev(E, ok); p.emb0 = p.dev(E, ok); p.pe = p.dev(E, ok);
     p.hg = p.dev(d.hc_ffn, ok); p.hu = p.dev(d.hc_ffn, ok); p.hh = p.dev(d.hc_ffn, ok); p.hd = p.dev(E, ok); p.hcout = p.dev(E, ok);
     p.logits = p.dev(d.vocab, ok); p.craw = p.dev(1, ok);
@@ -351,7 +355,7 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             RowSpans rs;
             rs.firsts = p.meta_d + i * 16;
             rs.counts = p.meta_d + i * 16 + 8;
-            mla_attend(p.qcur, p.ctx, rs, R, L.sink, a, 0, p.olat, st);
+            mla_attend(p.qcur, p.ctx, rs, R, L.sink, a, 0, p.env.sel_cap + kDflyBlock, p.attw, p.olat, st);
             dfly_expand_v(L.kv_b, p.olat, R, H, p.vout, st);
             p.mm(L.gate, p.xn, E, p.gate, H * kDflyV, E, H * kDflyV, R, st);
             mul_sigmoid(p.gate, p.vout, R * H * kDflyV, st);
