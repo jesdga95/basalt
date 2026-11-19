@@ -1,4 +1,5 @@
 #include "state.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "layout.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
@@ -106,7 +107,7 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t tf, std::u
     }
     {
         const core::OnDevice od(pp->dev);
-        cudaMemGetInfo(&fb, &tb);
+        basalt::core::device_mem_info(&fb, &tb);
     }
     if (!ok) {
         cudaGetLastError();

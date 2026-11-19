@@ -62,6 +62,20 @@ void free_region(void* mapping_base, uint64_t mapping_bytes);
 bool pin_budget(uint64_t& limit, std::string& why, const char* luid = nullptr,
                 uint32_t node_mask = 0, bool shared_mapping = false);
 
+/// What the OS says of a GPU adapter's memory (Windows: DXGI). `dedicated` is the segment only the GPU uses: a
+/// discrete card's VRAM, an integrated GPU's carve-out of the machine's RAM. `shared` is the system RAM it may use
+/// besides. The budgets and `local_usage` are this process's in each segment group; an integrated GPU has no
+/// non-local group (its budget is 0), and its local usage counts device memory and page-locked host memory together.
+struct AdapterMemory {
+    uint64_t dedicated = 0, shared = 0;
+    uint64_t local_budget = 0, local_usage = 0;
+    uint64_t nonlocal_budget = 0, nonlocal_usage = 0;
+};
+/// The adapter with this LUID (cudaDeviceProp::luid), its nodes of `node_mask` summed. false where the OS has no such
+/// reading (every platform but Windows) or does not know the adapter. Cheap enough for a serving path: the adapter is
+/// looked up once.
+bool adapter_memory(const char* luid, uint32_t node_mask, AdapterMemory& m);
+
 // Portable registrations consume each WDDM adapter's non-local budget. Host VMM instead backs the CPU tier
 // without registering the same pages on every adapter; other platforms keep their existing allocation path.
 #if defined(_WIN32)

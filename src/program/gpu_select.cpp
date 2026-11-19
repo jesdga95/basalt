@@ -95,7 +95,11 @@ NvmlCards read_nvml() {
                 char u[96] = {0};
                 if (uuid && uuid(h, u, sizeof u) == 0) id = u;
                 int ma = 0, mi = 0;
-                if (cc && cc(h, &ma, &mi) == 0) { c.cc_major = ma; c.cc_minor = mi; }
+                const int cc_rc = cc ? cc(h, &ma, &mi) : -1;
+                if (cc_rc == 0) { c.cc_major = ma; c.cc_minor = mi; }
+                // NVML_ERROR_NOT_SUPPORTED: a device the management library lists that is no CUDA device (the N1X's
+                // NPU). It is no card to choose from, and CUDA_VISIBLE_DEVICES does not number it.
+                if (cc_rc == 3) continue;
                 MemInfo m{};
                 if (mem && mem(h, &m) == 0) c.vram = m.total;
                 unsigned width = 0, mhz = 0;

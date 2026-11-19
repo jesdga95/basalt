@@ -2,6 +2,7 @@
 // back and keeps the cells below the cut exactly as they were; the addresses never move.  Needs a CUDA device with
 // virtual memory management (exits 77 without one).
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
+#include "basalt/core/device_memory.hpp"
 
 #include <cuda_runtime.h>
 
@@ -17,7 +18,7 @@ int fail(const char* what, const std::string& err = "") {
 
 size_t free_vram() {
     size_t f = 0, t = 0;
-    cudaMemGetInfo(&f, &t);
+    basalt::core::device_mem_info(&f, &t);   // the reading the engine sizes by (an integrated GPU: its carve-out)
     return f;
 }
 

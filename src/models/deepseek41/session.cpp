@@ -3,6 +3,7 @@
 // Per layer: Engram (on its layers), hyper-connection mixes and collapse, attention, expansion, the FFN's mixes and
 // collapse, router, routed and shared experts, expansion. Prefill runs the same path token by token.
 #include "basalt/core/device.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/session.hpp"
 #include "basalt/ggml/ggml.h"
@@ -469,7 +470,7 @@ public:
             vis_ = std::make_unique<VisionEncoder>();
             const auto above_floor = [&] {
                 size_t free_b = 0, total_b = 0;
-                return !t || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
+                return !t || basalt::core::device_mem_info(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
             };
             bool opened = vis_->init(mp, std::max(pl.n_patches(), 4096), m_.vision_blas(), err) && above_floor();
             if (!opened && t) {
@@ -556,7 +557,7 @@ private:
             std::string e;
             prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
             const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + margin;
-            if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= after) {
+            if (prefill_ && basalt::core::device_mem_info(&free_b, &total_b) == cudaSuccess && free_b >= after) {
                 cudaGetLastError();   // a larger size that did not fit left its error behind
                 return true;
             }

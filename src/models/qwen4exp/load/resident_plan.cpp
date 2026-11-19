@@ -1,4 +1,5 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "context.hpp"
 
@@ -112,7 +113,7 @@ int resident_plan(Context& context) {
             size_t fb = 0, tb = 0;
             {
                 const basalt::core::OnDevice on(dev);
-                cudaMemGetInfo(&fb, &tb);
+                basalt::core::device_mem_info(&fb, &tb);
             }
             const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) + pin_map +
                                      (dev == o.peer_device ? (uint64_t) peer_split_bytes(d0) + peer_prompt_bytes() : 0);

@@ -2,6 +2,7 @@
 // keeps every slot left exactly as it was (same address, same bytes); a grow maps them again at the same addresses.
 // Uniform and sized slots.  Needs a CUDA device with virtual memory management (exits 77 without one).
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/device_memory.hpp"
 
 #include <cuda_runtime.h>
 
@@ -17,7 +18,7 @@ int fail(const char* what, const std::string& err = "") {
 
 size_t free_vram() {
     size_t f = 0, t = 0;
-    cudaMemGetInfo(&f, &t);
+    basalt::core::device_mem_info(&f, &t);   // the reading the engine sizes by (an integrated GPU: its carve-out)
     return f;
 }
 

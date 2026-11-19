@@ -3,6 +3,7 @@
 // Each step reuses the code the microbenches use: the startup PCIe probe's burst timing and avx_bench's cold-expert
 // pool loop and its idle read.  A model's own peer path is measured through its ProbePeerPath.
 #include "basalt/program/probe_rates.hpp"
+#include "basalt/core/device_memory.hpp"
 
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
@@ -132,7 +133,7 @@ void step_facts(Probe& P) {
         size_t fr = 0, tot = 0;
         {
             core::OnDevice od(d);
-            cudaMemGetInfo(&fr, &tot);
+            basalt::core::device_mem_info(&fr, &tot);
         }
         int mclk = 0, bus = 0;
         cudaDeviceGetAttribute(&mclk, cudaDevAttrMemoryClockRate, d);
