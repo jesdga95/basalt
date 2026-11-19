@@ -145,7 +145,10 @@ void LoadPlan::add(LoadItem it) {
     items_.push_back(it);
 }
 
+void LoadPlan::after_reads(std::function<bool(std::string&)> step) { steps_.push_back(std::move(step)); }
+
 void LoadPlan::append(const LoadPlan& other) {
+    steps_.insert(steps_.end(), other.steps_.begin(), other.steps_.end());
     for (LoadItem it : other.items_) {
         if (it.from == nullptr) {
             const File& f = other.files_[(size_t) it.file];
@@ -162,6 +165,7 @@ void LoadPlan::append_reusing(const LoadPlan& other) {
                "/" + std::to_string((int) it.conv);
     };
     std::map<std::string, std::pair<void*, int>> on_device;   // its destination and device
+    steps_.insert(steps_.end(), other.steps_.begin(), other.steps_.end());
     for (const LoadItem& it : items_)
         if (it.from == nullptr && it.dev != nullptr) on_device.emplace(key(files_[(size_t) it.file], it), std::make_pair(it.dev, it.device));
     for (LoadItem it : other.items_) {
@@ -572,6 +576,11 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
     };
 
     for (const std::vector<Task>& tasks : rounds) {   // each round's copies are complete before the next round reads them
+        if (&tasks == &rounds[1] && !failed.load())   // the reads have landed: the plan's steps, before the copies
+            for (const auto& step : plan.steps()) {
+                std::string e;
+                if (!step(e)) { fail(e); break; }
+            }
         if (tasks.empty() || failed.load()) continue;
         std::atomic<size_t> next{0};
         const int n = (int) std::min<size_t>((size_t) n_workers, tasks.size());

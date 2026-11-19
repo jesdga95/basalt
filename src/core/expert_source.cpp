@@ -669,40 +669,26 @@ bool FileExpertSource::plan_cache_complement(
         basalt::platform::advise_dontneed(fd_, file_off_, mapped_bytes_);
     }
 
+    // The copy is allocated here and given its pages by the reads that fill it; it is pinned once they have landed
+    // (pin_landed_complement), so the RAM it holds grows with the pass instead of being held for the whole of it.
     RamAllocation allocation;
     void* arena = nullptr;
     const uint8_t* host = nullptr;
-    const uint8_t* device = nullptr;
-    bool pinned_ok = false;
-    uint64_t locked = 0;
-    uint64_t partial_pin = 0;   ///< a registered prefix of the arena (all of it once registered after the read)
-    std::vector<uint64_t> slice_at;
-    std::vector<const uint8_t*> slice_dev;
-    bool register_arena = false;   ///< the arena is registered with the driver (before its read)
-    uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
+    bool register_arena = false;   ///< ordinary memory registered with the driver after its reads
     std::string note;
     // One alignment for both arena paths, so one call releases it whichever way it was chosen.
     constexpr size_t kArenaAlign = 2ull << 20;
-    auto release = [&]() {
+    auto release = [&]() {   // nothing is pinned or locked before the reads
         if (arena == nullptr) return;
-        if (allocation.allocation_pinned()) allocation.reset();
-        else if (pinned_ok) (void) cudaFreeHost(arena);
-        else {
-            if (partial_pin > 0) {
-                if (slice_at.empty()) (void) cudaHostUnregister(arena);
-                else for (uint64_t off : slice_at) (void) cudaHostUnregister((uint8_t*) arena + off);
-            }
-            if (locked > 0) basalt::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
-            if (allocation.data()) allocation.reset();
-            else basalt::platform::free_aligned(arena);
-        }
+        if (allocation.data()) allocation.reset();
+        else basalt::platform::free_aligned(arena);
         arena = nullptr;
     };
     if (bytes > 0) {
         basalt::log::info("basalt", "FileExpertSource: allocating %.2f GiB %s cache complement",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         if (pin) {
-            // Allocation-backed pins need no portable registration. Ordinary spans are registered before the read.
+            // Allocation-backed pins need no portable registration. Ordinary spans are registered after the read.
             if (allocation.allocate(bytes)) arena = allocation.data();
             if (arena != nullptr) {
                 register_arena = true;
@@ -715,18 +701,6 @@ bool FileExpertSource::plan_cache_complement(
             if (arena == nullptr) {
                 err = "FileExpertSource: pageable resident complement allocation failed";
                 return false;
-            }
-            if (pin) {
-                // CS-T, a RAM budget: its bytes are in profile order, hottest first, so the driver is asked to
-                // register the largest prefix it takes (from the cap down in 2 GiB steps).  Those experts can be
-                // read by the GPU over PCIe (the PCIe share) and copied by DMA; only the rest is locked in the working
-                // set (the registered prefix is page-locked by the driver already - locking it twice made the next
-                // device allocation fail).
-                lock_off = partial_pin;
-                const basalt::platform::LockResult lr =
-                    basalt::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
-                locked = lr.locked_bytes;
-                note += (note.empty() ? "" : "; ") + lr.note;
             }
         }
         host = (const uint8_t*) arena;
@@ -744,33 +718,80 @@ bool FileExpertSource::plan_cache_complement(
                 return false;
             }
         }
-    // The copy is registered with the driver before it is read: what registration takes on each card (the mapping of
-    // the whole copy) is out of the free memory before the expert tiers after this size themselves.
+    std::vector<uint64_t> bounds;   // where a registration the driver refuses whole may be cut: blob starts
+    if (register_arena && platform::kBoundHostRegistration && !allocation.allocation_pinned()) {
+        std::vector<uint64_t> starts;
+        for (uint64_t off : offsets) if (off != kNoComplement) starts.push_back(off);
+        uint64_t at = spare_at;
+        for (const auto& [blob, count] : spare_sizes)
+            for (int64_t i = 0; i < count; ++i, at += blob) starts.push_back(at);
+        bounds = ram_pin_slices(std::move(starts), ram_padded(bytes), platform::system_page_size(), 1ull << 30);
+    }
+    // Experts are read straight into the arena with unbuffered reads, so the file cache neither copies them nor
+    // evicts anything; ranges that are not block-aligned, or a file system without unbuffered reads, take the mapped copy.
+    // The GPU cache's experts kept here for the prompt path's loan are counted by its fill; experts left on the file are
+    // not placed at all.
+    const int load_file = fd_ >= 0 ? load_plan.file_fd(fd_) : load_plan.file(path_);   // the path when the descriptor did not open
+    uint64_t read_bytes = 0;
+    for (int64_t layer = 0; layer < n_layers_; ++layer)
+        for (int64_t expert = 0; expert < n_expert_; ++expert) {
+            const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+            if (offsets[index] == kNoComplement) continue;
+            LoadItem it;
+            it.file = load_file;
+            it.off = file_off_ + layer_offsets_[(size_t) layer] + (uint64_t) expert * layer_blob_bytes_[(size_t) layer];
+            it.bytes = layer_blob_bytes_[(size_t) layer];
+            it.host = (uint8_t*) host + offsets[index];
+            it.count = on_gpu[index] ? 0 : it.bytes;
+            read_bytes += it.bytes;
+            load_plan.add(it);
+        }
+    pending_complement_ = PendingComplement{0, false, note, pin, pin_t0, alloc_s, read_bytes, lend, n_slots,
+                                            lend_from_slot, additional_gpu_pairs.size(), arena != nullptr && pin,
+                                            register_arena, std::move(bounds)};
+    load_plan.after_reads([this](std::string&) { pin_landed_complement(); return true; });
+    complement_arena_ = arena;
+    complement_allocation_ = std::move(allocation);
+    complement_host_ = host;
+    complement_device_ = nullptr;
+    complement_slice_at_.clear();
+    complement_slice_dev_.clear();
+    complement_bytes_ = bytes;
+    complement_offsets_ = std::move(offsets);
+    ++places_gen_;
+    complement_pinned_ = false;
+    complement_pin_limit_ = 0;
+    complement_partial_ = false;
+    complement_locked_ = 0;
+    complement_lock_off_ = 0;
+    complement_lent_slots_ = lend ? n_slots - keep_from : 0;
+    spare_free_.clear();
+    {
+        uint64_t at = spare_at;
+        for (const auto& [b, n] : spare_sizes)
+            for (int64_t i = 0; i < n; ++i, at += b) spare_free_.emplace_back(at, b);
+        if (!spare_sizes.empty())
+            basalt::log::info("basalt", "FileExpertSource: %lld free places for the adaptive swaps (%zu blob sizes, %.0f MiB)",
+                         (long long) spare_free_.size(), spare_sizes.size(), (double) (at - spare_at) / 1048576.0);
+    }
+    complement_ready_ = true;
+    return true;
+}
+
+void FileExpertSource::pin_landed_complement() {
+    PendingComplement& pc = pending_complement_;
+    if (!pc.pin_after_reads) return;
+    pc.pin_after_reads = false;
+    void* arena = complement_arena_;
+    const uint64_t bytes = complement_bytes_;
+    const uint8_t* device = nullptr;
+    uint64_t partial_pin = 0, locked = 0, lock_off = 0;
+    std::vector<uint64_t> slice_at;
+    std::vector<const uint8_t*> slice_dev;
+    std::string& note = pc.note;
     const auto reg_t0 = std::chrono::steady_clock::now();
-    if (register_arena) {
-        // its pages first, made on every core: registration then pins them, where it would fault each one in on one thread
-        if (!allocation.allocation_pinned()) {
-            const uint64_t page = platform::system_page_size();
-            const unsigned n = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
-            const uint64_t per = (bytes / n + page) / page * page;
-            std::vector<std::thread> touch;
-            for (unsigned i = 0; i < n; ++i)
-                touch.emplace_back([arena, bytes, page, per, i] {
-                    for (uint64_t o = (uint64_t) i * per; o < std::min(bytes, (uint64_t) (i + 1) * per); o += page)
-                        ((volatile uint8_t*) arena)[o] = 0;
-                });
-            for (auto& t : touch) t.join();
-        }
-        std::vector<uint64_t> bounds;
-        if (platform::kBoundHostRegistration && !allocation.allocation_pinned()) {
-            std::vector<uint64_t> starts;
-            for (uint64_t off : offsets) if (off != kNoComplement) starts.push_back(off);
-            uint64_t at = spare_at;
-            for (const auto& [blob, count] : spare_sizes)
-                for (int64_t i = 0; i < count; ++i, at += blob) starts.push_back(at);
-            bounds = ram_pin_slices(std::move(starts), ram_padded(bytes), platform::system_page_size(), 1ull << 30);
-        }
-        const RamPin rp = pin_ram(allocation, bounds, /*mapped=*/true, &device);
+    if (pc.register_arena) {
+        const RamPin rp = pin_ram(complement_allocation_, pc.bounds, /*mapped=*/true, &device);
         if (rp.allocation_backed) {
             partial_pin = bytes;
             note = "CUDA-pinned through host VMM";
@@ -793,55 +814,28 @@ bool FileExpertSource::plan_cache_complement(
             locked = rp.locked_bytes;
             note += "; " + rp.lock_note;
         }
+    } else {
+        // no memory the driver could register: the copy is locked in the working set instead
+        const basalt::platform::LockResult lr = basalt::platform::lock_resident((uint8_t*) arena, bytes);
+        locked = lr.locked_bytes;
+        note += (note.empty() ? "" : "; ") + lr.note;
     }
-    const double reg_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - reg_t0).count();
-    // Experts are read straight into the arena with unbuffered reads, so the file cache neither copies them nor
-    // evicts anything; ranges that are not block-aligned, or a file system without unbuffered reads, take the mapped copy.
-    // The GPU cache's experts kept here for the prompt path's loan are counted by its fill; experts left on the file are
-    // not placed at all.
-    const int load_file = fd_ >= 0 ? load_plan.file_fd(fd_) : load_plan.file(path_);   // the path when the descriptor did not open
-    uint64_t read_bytes = 0;
-    for (int64_t layer = 0; layer < n_layers_; ++layer)
-        for (int64_t expert = 0; expert < n_expert_; ++expert) {
-            const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-            if (offsets[index] == kNoComplement) continue;
-            LoadItem it;
-            it.file = load_file;
-            it.off = file_off_ + layer_offsets_[(size_t) layer] + (uint64_t) expert * layer_blob_bytes_[(size_t) layer];
-            it.bytes = layer_blob_bytes_[(size_t) layer];
-            it.host = (uint8_t*) host + offsets[index];
-            it.count = on_gpu[index] ? 0 : it.bytes;
-            read_bytes += it.bytes;
-            load_plan.add(it);
-        }
-    pending_complement_ = PendingComplement{reg_s, pinned_ok, note, pin, pin_t0, alloc_s, read_bytes, lend, n_slots,
-                                            lend_from_slot, additional_gpu_pairs.size()};
-    complement_arena_ = arena;
-    complement_allocation_ = std::move(allocation);
-    complement_host_ = host;
+    pc.register_arena = false;
+    pc.reg_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - reg_t0).count();
     complement_device_ = device;
     complement_slice_at_ = std::move(slice_at);
     complement_slice_dev_ = std::move(slice_dev);
-    complement_bytes_ = bytes;
-    complement_offsets_ = std::move(offsets);
-    ++places_gen_;
-    complement_pinned_ = (pinned_ok || partial_pin > 0) && bytes > 0;
-    complement_pin_limit_ = pinned_ok ? bytes : partial_pin;
-    complement_partial_ = !pinned_ok && partial_pin > 0;
+    complement_pinned_ = partial_pin > 0 && bytes > 0;
+    complement_pin_limit_ = partial_pin;
+    complement_partial_ = partial_pin > 0;
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
-    complement_lent_slots_ = lend ? n_slots - keep_from : 0;
-    spare_free_.clear();
-    {
-        uint64_t at = spare_at;
-        for (const auto& [b, n] : spare_sizes)
-            for (int64_t i = 0; i < n; ++i, at += b) spare_free_.emplace_back(at, b);
-        if (!spare_sizes.empty())
-            basalt::log::info("basalt", "FileExpertSource: %lld free places for the adaptive swaps (%zu blob sizes, %.0f MiB)",
-                         (long long) spare_free_.size(), spare_sizes.size(), (double) (at - spare_at) / 1048576.0);
-    }
-    complement_ready_ = true;
-    return true;
+}
+
+uint64_t FileExpertSource::pin_pending() const {
+    const PendingComplement& pc = pending_complement_;
+    return pc.pin_after_reads && pc.register_arena && !complement_allocation_.allocation_pinned()
+               ? complement_allocation_.capacity() : 0;
 }
 
 void FileExpertSource::release_complement() {
@@ -849,7 +843,7 @@ void FileExpertSource::release_complement() {
     if (complement_allocation_.allocation_pinned()) complement_allocation_.reset();
     else if (pending_complement_.pinned_ok) (void) cudaFreeHost(complement_arena_);
     else {
-        if (complement_pin_limit_ > 0) {   // registered before the read
+        if (complement_pin_limit_ > 0) {   // registered after the reads
             if (complement_slice_at_.empty()) (void) cudaHostUnregister(complement_arena_);
             else for (uint64_t off : complement_slice_at_) (void) cudaHostUnregister((uint8_t*) complement_arena_ + off);
         }

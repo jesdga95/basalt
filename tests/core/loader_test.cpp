@@ -1,6 +1,6 @@
 // The loader: file ranges land byte for byte in host memory and (with a device present) in device memory, on any
 // alignment and size, with every conversion, from a path or a descriptor, with items coalesced, counted exactly once,
-// copies of bytes the plan itself places run after its reads, and a failure or a cancel reported.  The host cases need no GPU.
+// copies of bytes the plan itself places run after its reads, its steps between the two, and a failure or a cancel reported.  The host cases need no GPU.
 #include "basalt/core/loader.hpp"
 
 #include "basalt/kernels/f16_bits.hpp"
@@ -397,6 +397,71 @@ void memory_sources(const TestFile& f) {
     }
 }
 
+// a plan's steps run once its reads have landed and before its copies from memory; an appended plan brings its steps,
+// a plan of steps alone runs them, and a step that fails fails the run
+void steps(const TestFile& f) {
+    for (int threads : {1, 8}) {
+        constexpr uint64_t kLen = (20u << 20) + 77;
+        std::vector<uint8_t> first(kLen), second(kLen, 0xEE);
+        LoadPlan plan;
+        LoadItem copy;
+        copy.from = first.data();
+        copy.bytes = kLen;
+        copy.host = second.data();
+        copy.count = 0;
+        plan.add(copy);
+        LoadPlan reads;
+        LoadItem read;
+        read.file = reads.file(f.path);
+        read.off = 333;
+        read.bytes = kLen;
+        read.host = first.data();
+        reads.add(read);
+        int ran = 0;
+        bool landed = false, before_copy = false;
+        reads.after_reads([&](std::string&) {
+            ++ran;
+            landed = std::memcmp(first.data(), f.bytes.data() + 333, kLen) == 0;
+            before_copy = second[0] == 0xEE && second[kLen - 1] == 0xEE;
+            return true;
+        });
+        plan.append(reads);
+        check(plan.steps().size() == 1, "an appended plan brings its steps");
+        Loader loader(threads);
+        std::string err;
+        check(loader.run(plan, err), "a run with a step");
+        check(ran == 1 && landed && before_copy, "a step runs once, after the reads and before the copies");
+        check(std::memcmp(second.data(), f.bytes.data() + 333, kLen) == 0, "the copies after a step");
+    }
+    {
+        LoadPlan only;
+        bool ran = false;
+        only.after_reads([&](std::string&) { ran = true; return true; });
+        Loader loader;
+        std::string err;
+        check(!only.empty() && loader.run(only, err) && ran, "a plan of steps alone runs them");
+    }
+    {
+        std::vector<uint8_t> dst(4096), out(4096, 0xEE);
+        LoadPlan plan;
+        LoadItem read;
+        read.file = plan.file(f.path);
+        read.bytes = dst.size();
+        read.host = dst.data();
+        plan.add(read);
+        LoadItem copy;
+        copy.from = dst.data();
+        copy.bytes = dst.size();
+        copy.host = out.data();
+        copy.count = 0;
+        plan.add(copy);
+        plan.after_reads([](std::string& e) { e = "step refused"; return false; });
+        Loader loader;
+        std::string err;
+        check(!loader.run(plan, err) && err == "step refused" && out[0] == 0xEE, "a failed step fails the run before the copies");
+    }
+}
+
 void descriptor(const TestFile& f) {
     const int fd = basalt::platform::open_fd_utf8(f.path);
     std::vector<uint8_t> dst(100000);
@@ -600,6 +665,7 @@ int main() {
     host_aligned(f);
     adjacent_device_allocations();
     memory_sources(f);
+    steps(f);
     descriptor(f);
     device(f);
     std::printf("loader_test: %s\n", fails ? "FAIL" : "ok");

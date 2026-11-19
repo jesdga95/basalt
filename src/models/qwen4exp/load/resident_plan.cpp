@@ -78,7 +78,10 @@ int resident_plan(Context& context) {
         // the GDN mixer split loads the peer's key heads after its tier is filled
         int d0 = 0;
         cudaGetDevice(&d0);
-        const int peer_reserve = o.peer_reserve_mib + (int) ((peer_split_bytes(d0) + peer_prompt_bytes() + (1 << 20) - 1) >> 20);
+        // the RAM copy, when it is registered after the start's pass, maps itself on this card then
+        const uint64_t pin_map = basalt::core::pin_mapping_bytes(context.src->pin_pending());
+        const int peer_reserve =
+            o.peer_reserve_mib + (int) ((peer_split_bytes(d0) + peer_prompt_bytes() + pin_map + (1 << 20) - 1) >> 20);
         if (o.peer_devices.size() <= 1) {
             if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, g.n_embd, g.n_ff, peer_reserve, o.peer_slots,
                            *context.reads, err)) {
@@ -111,7 +114,7 @@ int resident_plan(Context& context) {
                 const basalt::core::OnDevice on(dev);
                 cudaMemGetInfo(&fb, &tb);
             }
-            const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
+            const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) + pin_map +
                                      (dev == o.peer_device ? (uint64_t) peer_split_bytes(d0) + peer_prompt_bytes() : 0);
             const uint64_t share = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
             rooms[i].bytes = fb > reserve ? ((uint64_t) fb - reserve) / share : 0;
