@@ -65,7 +65,9 @@ struct TokenizerSpec {
 };
 
 /// Outcome of a model operation.
-enum class Status { Ok, NotImplemented, Error };
+/// Refused: the request cannot run (no room for its positions) and the session holds what it held before it; the engine
+/// answers ERR and serves the next request. Error: the session cannot go on.
+enum class Status { Ok, NotImplemented, Error, Refused };
 
 struct Result {
     Status status = Status::Ok;
@@ -223,6 +225,9 @@ public:
     virtual ExpertCounts expert_counts() const { return {}; }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
+    /// An elastic KV's ceiling (core/elastic_kv.hpp): the positions the session can back before the expert cache would go below
+    /// the slots a prompt chunk needs; -1 without an elastic KV.
+    virtual int64_t kv_ceiling() { return -1; }
     /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block), and its grid of
     /// merged tokens when the model places rows by it (else {0, 0}). Rows with no vision support leave the default.
     virtual Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, ImageGrid& grid) {

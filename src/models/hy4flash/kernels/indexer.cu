@@ -167,8 +167,9 @@ __device__ __forceinline__ uint32_t order_key(float f) {
     return u ^ ((u >> 31) ? 0xffffffffu : 0x80000000u);
 }
 
-// One block. The k-th largest score by a search over its order key's bits, then the pools above it and the lowest-indexed
-// ties, written in pool order as their cells, then the tail's.
+// One block. The k-th largest score's order key by a radix search over its top 11, next 11 and last 10 bits (a histogram of
+// the keys under the prefix found so far each, reads coalesced, one shared-memory add per bin and warp), then the pools above
+// it and the lowest-indexed ties, written in pool order as their cells, then the tail's.
 __global__ void select_kernel(const float* __restrict__ scores, int n, int k, int pool, int tail0, int tail_n,
                               int32_t* __restrict__ cells, const int32_t* __restrict__ meta, int stride, int cells_stride) {
     if (meta) {   // a row per block: n <= k means the row attends everything and has no selection
@@ -180,24 +181,50 @@ __global__ void select_kernel(const float* __restrict__ scores, int n, int k, in
         scores += (size_t) row * stride;
         cells += (size_t) row * cells_stride;
     }
-    __shared__ uint32_t red[kSelThreads / 32];
-    __shared__ uint32_t sh_thr;
+    __shared__ int hist[2048];
+    __shared__ uint32_t sh_prefix;
+    __shared__ int sh_rem;
     __shared__ int sh_count[kSelThreads + 1], sh_eq[kSelThreads + 1], sh_need;
-    const int t = threadIdx.x;
+    const int t = threadIdx.x, lane = t & 31;
     const int chunk = (n + kSelThreads - 1) / kSelThreads, lo = min(n, t * chunk), hi = min(n, lo + chunk);
-    uint32_t thr = 0;
-    for (int bit = 31; bit >= 0; --bit) {
-        const uint32_t cand = thr | (1u << bit);
-        int c = 0;
-        for (int i = lo; i < hi; ++i) c += order_key(scores[i]) >= cand;
-        for (int m = 16; m; m >>= 1) c += __shfl_xor_sync(0xffffffffu, c, m);
-        if ((t & 31) == 0) red[t >> 5] = c;
+    uint32_t prefix = 0, mask = 0;
+    int rem = k;   // the rank of the key sought among the keys under the prefix, from the largest
+    for (int pass = 0; pass < 3; ++pass) {
+        const int shift = pass == 0 ? 21 : pass == 1 ? 10 : 0, nb = pass == 2 ? 1024 : 2048;
+        for (int i = t; i < nb; i += kSelThreads) hist[i] = 0;
         __syncthreads();
-        int total = 0;
-        for (int i = 0; i < kSelThreads / 32; ++i) total += red[i];
+        for (int base = 0; base < n; base += kSelThreads) {
+            const int i = base + t;
+            const uint32_t key = i < n ? order_key(scores[i]) : 0u;
+            const int bin = i < n && (key & mask) == prefix ? (int) ((key >> shift) & (uint32_t) (nb - 1)) : -1;
+            const unsigned same = __match_any_sync(0xffffffffu, bin);
+            if (bin >= 0 && lane == __ffs(same) - 1) atomicAdd(&hist[bin], __popc(same));
+        }
         __syncthreads();
-        if (total >= k) thr = cand;
+        if (t < 32) {   // lane l sums the l-th run of nb / 32 bins from the top; the run where the running count reaches rem holds the key
+            const int per = nb / 32, top = nb - 1 - lane * per;
+            int s = 0;
+            for (int j = 0; j < per; ++j) s += hist[top - j];
+            int incl = s;
+            for (int o = 1; o < 32; o <<= 1) {
+                const int v = __shfl_up_sync(0xffffffffu, incl, o);
+                if (lane >= o) incl += v;
+            }
+            const int first = __ffs(__ballot_sync(0xffffffffu, incl >= rem)) - 1;
+            if (lane == first) {
+                int c = incl - s, b = top;
+                for (; c + hist[b] < rem; --b) c += hist[b];
+                sh_prefix = prefix | ((uint32_t) b << shift);
+                sh_rem = rem - c;
+            }
+        }
+        __syncthreads();
+        prefix = sh_prefix;
+        rem = sh_rem;
+        mask |= (uint32_t) (nb - 1) << shift;
+        __syncthreads();
     }
+    const uint32_t thr = prefix;
     int gt = 0, eq = 0;
     for (int i = lo; i < hi; ++i) {
         const uint32_t key = order_key(scores[i]);

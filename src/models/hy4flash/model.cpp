@@ -173,7 +173,6 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         const ctxp::Plan p = ctxp::plan_context(req.max_context > 0 ? req.max_context : kDefaultContext, g.context_length,
                                                 free_b / (uint64_t) std::max(req.sessions, 1), sparse, fp8_);
         if (!p.error.empty()) return {model::Status::Error, "hy4flash: " + p.error};
-        if (!p.note.empty()) basalt::log::info("basalt hy4flash", "%s", p.note.c_str());
         ctx_ = p.context;
     }
     basalt::log::info("basalt hy4flash", "%zu dense tensors, %.2f GiB on the GPU", dev_.size(), (double) dense / (double) kGiB);

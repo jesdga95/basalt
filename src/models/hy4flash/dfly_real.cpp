@@ -186,7 +186,7 @@ int main(int argc, char** argv) {
     };
     auto run = DflyRunner::create(env, err);
     if (!run) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
-    std::vector<const uint16_t*> caches(dkv.begin(), dkv.end());
+    std::vector<const void*> caches(dkv.begin(), dkv.end());
     int bad = 0;
     cudaStream_t st = nullptr;
     if (argc > 4 && std::string(argv[4]) == "stream") cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);   // as the session's
