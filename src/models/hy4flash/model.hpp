@@ -26,6 +26,7 @@ struct DevTensor {
 /// The second cards whose expert tiers a start uses; later cards idle.
 constexpr int kMaxSecondCards = 3;
 constexpr int64_t kDefaultContext = 8192;
+constexpr uint64_t kExpertLendSegment = 256ull << 20;
 
 class Hy4Model final : public model::LoadedModel {
 public:

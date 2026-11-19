@@ -11,6 +11,7 @@
 #include <optional>
 
 #include "basalt/core/expert_source.hpp"
+#include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -234,8 +235,22 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
         fmt_.push_back(f);
     }
     act_ = (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * kMaxWindow, 64);
-    const int workers = s_.pool_workers > 0 ? s_.pool_workers : (int) kernels::cpu::physical_cores(true).size();
-    pool_ = std::make_unique<kernels::cpu::ExpertPool>(workers, s_.pool_affinity_given ? s_.pool_affinity : kernels::cpu::PoolAffinity::All);
+    const kernels::cpu::PoolAffinity affinity = s_.pool_affinity_given ? s_.pool_affinity : kernels::cpu::PoolAffinity::All;
+    int workers = s_.pool_workers;
+    if (workers <= 0) {
+        // The start-up pick the pool's own rule makes: a hybrid CPU runs on its P-cores and half the E-cores, and the
+        // cgroup quota caps the workers and the host thread together.  It holds whatever the quant and whatever the peer
+        // cards, so no model decides it.
+        const kernels::cpu::CpuTopology topo = kernels::cpu::detect_cpu_topology(true);
+        const kernels::cpu::PoolAffinity auto_affinity = !s_.pool_affinity_given || affinity == kernels::cpu::PoolAffinity::Auto
+                                                             ? kernels::cpu::PoolAffinity::Auto
+                                                         : affinity == kernels::cpu::PoolAffinity::PCores
+                                                             ? kernels::cpu::PoolAffinity::PCores
+                                                             : kernels::cpu::PoolAffinity::All;
+        workers = kernels::cpu::auto_pool_workers((int) topo.worker_cores.size(), topo.p_cores, topo.e_cores, topo.is_hybrid,
+                                                  kernels::cpu::cgroup_cpu_quota(), auto_affinity);
+    }
+    pool_ = std::make_unique<kernels::cpu::ExpertPool>(workers, affinity);
 
     if (!load_ram(reads, err)) return false;
     if (homes_.file > 0 && cover_ > 0) {
