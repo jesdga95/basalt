@@ -255,12 +255,18 @@ public:
         return true;
     }
 
-    // The buffers for `R` rows; false (with nothing left allocated) when the card has no room.
-    bool make_bufs(Bufs& b, int R, std::string& err) {
+    // The buffers for `R` rows; false (with nothing left allocated) when the card has no room. With `count` it allocates nothing and
+    // adds up the device bytes they would take (each rounded up to the driver's 2 MiB pages, an upper bound).
+    bool make_bufs(Bufs& b, int R, std::string& err, uint64_t* count = nullptr) {
         const int64_t E = g_.n_embd;
         bool ok = true;
+        static float counted[4];   // a stand-in address the count mode hands out (nothing reads it)
         auto f = [&](int64_t n) {
             void* p = nullptr;
+            if (count) {
+                *count += (std::max<uint64_t>((uint64_t) n * 4, 16) + (2ull << 20) - 1) / (2ull << 20) * (2ull << 20);
+                return counted;
+            }
             if (!ok || cudaMalloc(&p, std::max<size_t>((size_t) n * 4, 16)) != cudaSuccess) {
                 ok = false;
                 return (float*) nullptr;
@@ -270,6 +276,7 @@ public:
         };
         auto pin = [&](int64_t n) {
             void* p = nullptr;
+            if (count) return counted;
             if (!ok || cudaMallocHost(&p, (size_t) n * 4) != cudaSuccess) {
                 ok = false;
                 return (float*) nullptr;
@@ -307,6 +314,11 @@ public:
         b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used);
         b.mmq_ident = (int32_t*) f(A);
         b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
+        if (count) {
+            f((int64_t) (std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim))) + 3) / 4);
+            b = Bufs();
+            return true;
+        }
         if (ok) {
             void* q = nullptr;
             if (cudaMalloc(&q, std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim)))) != cudaSuccess) ok = false;
@@ -370,10 +382,29 @@ public:
             }
         }
         lent_ = true;
-        if (tier_) tier_->lend_all();
         int want = kMaxWindow;
         while (want < total && want < kMaxChunk) want *= 2;
-        for (int R = std::min(want, kMaxChunk); R >= kMaxWindow; R /= 2)
+        want = std::min(want, kMaxChunk);
+        const bool ringed = total >= kRingRows && tier_ && !ring_;
+        // a bounded lend: the tier gives up only the slots the chunk's buffers and the ring need, and the rest keep their experts
+        // (the ring stages those card to card, and the first turn after the prompt finds them); all of them when that is not enough
+        if (tier_ && tier_->partial_lend()) {
+            Bufs probe;
+            uint64_t need = 0;
+            std::string e;
+            make_bufs(probe, want, e, &need);
+            if (ringed) need += expert_ring_bytes();
+            if (tier_->lend(need) && make_bufs(big_, want, e)) {
+                if (ringed) ring_open();
+                if (!ringed || ring_) {
+                    use(big_);
+                    return true;
+                }
+                big_.release();
+            }
+        }
+        if (tier_) tier_->lend_all();
+        for (int R = want; R >= kMaxWindow; R /= 2)
             if (make_bufs(big_, R, err)) {
                 use(big_);
                 if (total >= kRingRows && tier_ && !ring_) ring_open();
@@ -1124,8 +1155,9 @@ private:
     std::thread ring_thr_[2];
     bool ring_ok_[2] = {false, false};
 
+    size_t expert_ring_bytes() const { return 2 * (size_t) g_.n_expert * stride_; }
     void ring_open() {
-        const size_t bytes = 2 * (size_t) g_.n_expert * stride_;
+        const size_t bytes = expert_ring_bytes();
         if (cudaMalloc((void**) &ring_, bytes) != cudaSuccess) {
             cudaGetLastError();
             ring_ = nullptr;
@@ -2266,6 +2298,12 @@ private:
     // generation past the prompt, the expert tier holding the rest), the tier gives back its spare slots and the mapping is
     // tried again, then lends all its slots and takes back what is left once the caches have grown (as DeepSeek's caches do).
     bool grow_failed_ = false;   // the last ensure_positions found no room (a refusal: nothing was run past `backed_`)
+    // the device bytes the sparse layers' caches take to grow from `backed_` to `target` positions (a page more each array)
+    uint64_t grow_bytes(int64_t target) const {
+        int sparse = 0;
+        for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
+        return (uint64_t) ((double) (target - backed_) * cell_bytes()) + (uint64_t) sparse * 2 * (2ull << 20);
+    }
     bool ensure_positions(int64_t positions, std::string& err) {
         grow_failed_ = false;
         if (positions <= backed_) return true;
@@ -2294,7 +2332,7 @@ private:
             }
             cudaStreamSynchronize(stream_);
             if (attempt == 0) tier_->shrink();
-            else tier_->lend_all();
+            else if (!tier_->partial_lend() || !tier_->lend(grow_bytes(target))) tier_->lend_all();
         }
         return false;
     }
