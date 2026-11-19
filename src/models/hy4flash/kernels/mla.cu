@@ -406,7 +406,7 @@ __global__ void __launch_bounds__(mqa::kThreads) attend_kernel(const float* __re
     for (int h = 0; h < HB; ++h) reinterpret_cast<float2*>(o_lat + ((size_t) t * heads + head0 + h) * mqa::kLatent)[tid] = o[h];
 }
 
-// ---- tensor-core attention over a BF16 cache -------------------------------------------------------------------------------
+// ---- tensor-core attention over a BF16 or FP8 cache --------------------------------------------------------------------------
 // A block per row and 16 heads, 8 warps. The row's cells go through shared memory 32 at a time, as fp16 (a BF16 latent row is
 // exact in fp16 within its range); S = Q K^T and O += P V run on mma.m16n8k16 with the scaled query and the probabilities in
 // fp16, accumulated in fp32, as llama.cpp's flash attention does. The softmax is a running one, the sink its first element.
@@ -428,7 +428,35 @@ __device__ __forceinline__ uint32_t bf2_to_h2(uint32_t v) {
     return *reinterpret_cast<const uint32_t*>(&h);
 }
 
-__global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict__ qcur, const uint16_t* __restrict__ cache, const int32_t* __restrict__ firsts,
+// Eight values of a cell's row (chunk ch of 72) as raw words, and the same as eight fp16 values. BF16 rows: the eight values. FP8
+// rows: chunks below 64 are eight E4M3 codes then their group's scale, the rest eight BF16 rope values; a code times its
+// power-of-two scale is exact in fp16 (the scales are at least 2^-13).
+__device__ __forceinline__ uint4 fetch8(const uint16_t* cache, size_t cell, int ch) {
+    return *reinterpret_cast<const uint4*>(cache + cell * 576 + ch * 8);
+}
+__device__ __forceinline__ uint4 fetch8(const uint8_t* cache, size_t cell, int ch) {
+    const uint8_t* row = cache + cell * kFp8RowBytes;
+    if (ch < kFp8Codes / 8) {
+        const uint2 c = *reinterpret_cast<const uint2*>(row + ch * 8);
+        return make_uint4(c.x, c.y, __float_as_uint(reinterpret_cast<const float*>(row + kFp8ScaleOff)[ch >> 4]), 0);
+    }
+    return *reinterpret_cast<const uint4*>(row + kFp8RopeOff + (ch - kFp8Codes / 8) * 16);
+}
+__device__ __forceinline__ uint4 half8(const uint16_t*, uint4 v, int) {
+    return make_uint4(bf2_to_h2(v.x), bf2_to_h2(v.y), bf2_to_h2(v.z), bf2_to_h2(v.w));
+}
+__device__ __forceinline__ uint32_t e4m3x2_to_h2(uint32_t codes, __half2 scale) {
+    const __half2 h = __hmul2(__half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) codes, __NV_E4M3)), scale);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+__device__ __forceinline__ uint4 half8(const uint8_t*, uint4 v, int ch) {
+    if (ch >= kFp8Codes / 8) return half8((const uint16_t*) nullptr, v, ch);
+    const __half2 s = __float2half2_rn(__uint_as_float(v.z));
+    return make_uint4(e4m3x2_to_h2(v.x & 0xffffu, s), e4m3x2_to_h2(v.x >> 16, s), e4m3x2_to_h2(v.y & 0xffffu, s), e4m3x2_to_h2(v.y >> 16, s));
+}
+
+template <typename C>
+__global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict__ qcur, const C* __restrict__ cache, const int32_t* __restrict__ firsts,
                                                          const int32_t* __restrict__ counts, const int32_t* __restrict__ cells, int cells_stride,
                                                          const int32_t* __restrict__ fill, const float* __restrict__ sinks, MlaArgs a, int ring,
                                                          float* __restrict__ o_lat) {
@@ -469,7 +497,7 @@ __global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict
             if (c < tn) {
                 const int j = j0 + c;
                 const int cell = cl ? cl[j] : ring ? (first + j) % ring : first + j;
-                pre[k] = *reinterpret_cast<const uint4*>(cache + (size_t) cell * W + ch * 8);
+                pre[k] = fetch8(cache, (size_t) cell, ch);
             }
         }
     };
@@ -480,8 +508,7 @@ __global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict
 #pragma unroll
         for (int k = 0; k < kPer; ++k) {
             const int i = tid + k * 256, c = i / (W / 8), ch = i - c * (W / 8);
-            const uint4 v = pre[k];
-            *reinterpret_cast<uint4*>(ks + c * kLd + ch * 8) = make_uint4(bf2_to_h2(v.x), bf2_to_h2(v.y), bf2_to_h2(v.z), bf2_to_h2(v.w));
+            *reinterpret_cast<uint4*>(ks + c * kLd + ch * 8) = half8(cache, pre[k], ch);
         }
         __syncthreads();
         if (j0 + kMmaCells < n) fetch(j0 + kMmaCells);
@@ -595,15 +622,15 @@ void attend_impl(const float* qcur, const C* cache, const RowSpans& r, int n_tok
                  int max_cells, void* work, float* o_lat, void* stream) {
     if (a.rank != mqa::kLatent || a.rope != 64 || a.heads % 8) throw std::invalid_argument("mla_attend: a 512 + 64 row and heads in eights");
     cudaStream_t st = (cudaStream_t) stream;
-    if constexpr (std::is_same_v<C, unsigned short>) {
+    if constexpr (!std::is_same_v<C, float>) {
         if (n_tok > kAttTok && a.heads % 16 == 0) {   // a chunk of rows; a window keeps the kernel below
             const size_t smem = (size_t) (16 * kLd + kMmaCells * kLd + 16 * kPLd) * 2 + (2 * 16 * 32 + 32) * sizeof(float);
             static bool raised_mma = false;
             if (!raised_mma) {
-                cudaFuncSetAttribute(attend_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+                cudaFuncSetAttribute(attend_mma_kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
                 raised_mma = true;
             }
-            attend_mma_kernel<<<dim3(a.heads / 16, n_tok), 256, smem, st>>>(qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride, r.fill,
+            attend_mma_kernel<C><<<dim3(a.heads / 16, n_tok), 256, smem, st>>>(qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride, r.fill,
                                                                            sinks, a, ring, o_lat);
             if (!stream) cudaStreamSynchronize(nullptr);
             return;
