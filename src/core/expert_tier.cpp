@@ -7,6 +7,7 @@
 
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/loader.hpp"
+#include "basalt/core/vmm.hpp"
 #include <optional>
 
 #include "basalt/core/expert_source.hpp"
@@ -18,6 +19,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -186,15 +188,11 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
         err = s_.name + ": not enough device memory for the expert tier";
         return false;
     }
-    set_base(per_layer_);
-    std::vector<int64_t> slot_bytes;
-    for (int l = 0; l < n_layers_; ++l)
-        for (int64_t s = 0; s < base_n(l); ++s) slot_bytes.push_back((int64_t) s_.layers[(size_t) l].blob_bytes);
-    if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) return false;
+    if (!open_base(per_layer_, err)) return false;
     res_.assign((size_t) n_layers_ * n_expert_, -1);
     stamp_.assign((size_t) n_layers_ * n_expert_, 0);
-    owner_.assign(slot_bytes.size(), -1);
-    busy_.assign(slot_bytes.size(), 0);
+    owner_.assign((size_t) base_slots(), -1);
+    busy_.assign((size_t) base_slots(), 0);
     int lo_prio = 0, hi_prio = 0;
     cudaDeviceGetStreamPriorityRange(&lo_prio, &hi_prio);
     if (cudaEventCreateWithFlags(&fetch_ev_, cudaEventDisableTiming) != cudaSuccess ||
@@ -483,7 +481,7 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
             if (!device_home.empty() && device_home[idx] >= 0) {
                 const int32_t home = device_home[idx];
                 if (res_[idx] >= 0) {
-                    it.dev = cache_.device_slot(home);
+                    it.dev = const_cast<uint8_t*>(slot_ptr(home));
                     it.device = main_device;
                 } else {
                     it.dev = peer_for(l)->slot_ptr(home);
@@ -606,7 +604,8 @@ const uint8_t* ExpertTier::blob_of(int layer, int e) const {
 
 const uint8_t* ExpertTier::slot_ptr(int32_t slot) const {
     const int64_t nb = base_slots();
-    return slot < nb ? cache_.device_slot(slot) : ext_.device_slot((int32_t) (slot - nb));
+    if (slot < nb) return cache_.device_slot(phys_.empty() ? slot : phys_[(size_t) slot]);
+    return ext_.device_slot((int32_t) (slot - nb));
 }
 
 void ExpertTier::apply(const Pending& p) {
@@ -806,7 +805,7 @@ int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const
         }
     };
     if (homes_.main == 0 || (homes_too && spare_[(size_t) layer] >= 0))
-        scan(base_lo_[(size_t) layer], base_n(layer));
+        scan(base_lo_[(size_t) layer], live_n(layer));
     if (ext_per_layer_) scan(base_slots() + (int64_t) layer * ext_per_layer_, ext_per_layer_);
     return slot;
 }
@@ -1046,24 +1045,166 @@ void ExpertTier::lend_all() {
     planned_per_layer_ = std::max(planned_per_layer_, per_layer_);
     per_layer_ = 0;
     set_base(0);
+    phys_.clear();
+    live_.clear();
     cache_.close();
 }
 
 bool ExpertTier::reopen_base(int64_t n, std::string& err) {
-    set_base(n);
-    std::vector<int64_t> slot_bytes;
-    for (int l = 0; l < n_layers_; ++l)
-        for (int64_t s = 0; s < base_n(l); ++s) slot_bytes.push_back((int64_t) s_.layers[(size_t) l].blob_bytes);
     std::string e;
-    if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, e)) {
+    if (!open_base(n, e)) {
         set_base(0);
+        phys_.clear();
+        live_.clear();
         err = s_.name + ": the VRAM expert tier cannot take back its " + std::to_string(n) + " slots per layer: " + e;
         return false;
     }
     per_layer_ = n;
     lent_per_layer_ = 0;
-    owner_.assign(slot_bytes.size(), -1);
-    busy_.assign(slot_bytes.size(), 0);
+    owner_.assign((size_t) base_slots(), -1);
+    busy_.assign((size_t) base_slots(), 0);
+    return true;
+}
+
+bool ExpertTier::open_base(int64_t per_layer, std::string& err) {
+    set_base(per_layer);
+    const int64_t nb = base_slots();
+    std::vector<int32_t> order((size_t) nb);   // [place in the arena] its slot
+    std::vector<int> layer_of((size_t) nb);
+    std::vector<int64_t> k_of((size_t) nb);
+    for (int l = 0; l < n_layers_; ++l)
+        for (int64_t k = 0; k < base_n(l); ++k) {
+            layer_of[(size_t) (base_lo_[(size_t) l] + k)] = l;
+            k_of[(size_t) (base_lo_[(size_t) l] + k)] = k;
+        }
+    for (int64_t i = 0; i < nb; ++i) order[(size_t) i] = (int32_t) i;
+    phys_.clear();
+    live_.clear();
+    const bool seg = s_.lend_segment > 0 && homes_.main == 0 && nb > 0 && core::vmm::supported();
+    if (seg) {
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+            const int la = layer_of[(size_t) a], lb = layer_of[(size_t) b];
+            const int64_t x = (2 * k_of[(size_t) a] + 1) * base_n(lb), y = (2 * k_of[(size_t) b] + 1) * base_n(la);
+            return x != y ? x < y : la < lb;
+        });
+        phys_.resize((size_t) nb);
+        for (int64_t i = 0; i < nb; ++i) phys_[(size_t) order[(size_t) i]] = (int32_t) i;
+    }
+    std::vector<int64_t> slot_bytes;
+    for (int32_t s : order) slot_bytes.push_back((int64_t) s_.layers[(size_t) layer_of[(size_t) s]].blob_bytes);
+    cache_.set_segment_bytes(seg ? (int64_t) s_.lend_segment : 0);
+    if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) {
+        phys_.clear();
+        return false;
+    }
+    if (seg) count_live();
+    return true;
+}
+
+// Each layer's base slots inside the mapped part of the arena: a prefix, since a layer's slots lie deeper the later they are.
+void ExpertTier::count_live() {
+    live_.assign((size_t) n_layers_, 0);
+    const int64_t mapped = cache_.slots();
+    for (int l = 0; l < n_layers_; ++l) {
+        int64_t k = 0;
+        while (k < base_n(l) && phys_[(size_t) (base_lo_[(size_t) l] + k)] < mapped) ++k;
+        live_[(size_t) l] = k;
+    }
+}
+
+int64_t ExpertTier::live_base() const {
+    if (live_.empty()) return base_slots();
+    int64_t n = 0;
+    for (int64_t v : live_) n += v;
+    return n;
+}
+
+void ExpertTier::keep_hottest(const std::vector<int64_t>& keep) {
+    const int64_t nb = base_slots();
+    std::vector<int32_t> held;
+    std::vector<uint8_t> hot((size_t) n_expert_);
+    for (int l = 0; l < n_layers_; ++l) {
+        const size_t base = (size_t) l * n_expert_;
+        const int64_t lo = base_lo_[(size_t) l], kept = std::min(keep[(size_t) l], live_n(l));
+        // the layer's slots holding an expert, base then beside, the most recently used first
+        held.clear();
+        for (int64_t s = lo; s < lo + live_n(l); ++s)
+            if (owner_[(size_t) s] >= 0) held.push_back((int32_t) s);
+        for (int64_t s = nb + (int64_t) l * ext_per_layer_; ext_per_layer_ && s < nb + (int64_t) (l + 1) * ext_per_layer_; ++s)
+            if (owner_[(size_t) s] >= 0) held.push_back((int32_t) s);
+        std::stable_sort(held.begin(), held.end(), [&](int32_t a, int32_t b) {
+            const int ea = owner_[(size_t) a], eb = owner_[(size_t) b];
+            const uint64_t sa = stamp_[base + ea], sb = stamp_[base + eb];
+            return sa != sb ? sa > sb : ea < eb;
+        });
+        const size_t nh = std::min<size_t>(held.size(), (size_t) kept);
+        std::fill(hot.begin(), hot.end(), 0);
+        for (size_t i = 0; i < nh; ++i) hot[(size_t) owner_[(size_t) held[i]]] = 1;
+        // the hot ones outside the kept slots move into kept slots that hold none of them
+        int64_t d = lo;
+        for (size_t i = 0; i < nh; ++i) {
+            const int32_t src = held[i];
+            if (src >= lo && src < lo + kept) continue;
+            while (owner_[(size_t) d] >= 0 && hot[(size_t) owner_[(size_t) d]]) ++d;
+            const int e = owner_[(size_t) src];
+            if (owner_[(size_t) d] >= 0) res_[base + owner_[(size_t) d]] = -1;
+            cudaMemcpyAsync(const_cast<uint8_t*>(slot_ptr((int32_t) d)), slot_ptr(src), s_.layers[(size_t) l].blob_bytes, cudaMemcpyDeviceToDevice,
+                            copy_stream_);
+            owner_[(size_t) d] = e;
+            res_[base + e] = (int32_t) d;
+            owner_[(size_t) src] = -1;
+            ++d;
+        }
+        // the rest past the kept slots leave the card
+        auto drop = [&](int64_t s) {
+            const int32_t o = owner_[(size_t) s];
+            if (o >= 0 && res_[base + o] == (int32_t) s) res_[base + o] = -1;
+            owner_[(size_t) s] = -1;
+        };
+        for (int64_t s = lo + kept; s < lo + live_n(l); ++s) drop(s);
+        for (int64_t s = nb + (int64_t) l * ext_per_layer_; ext_per_layer_ && s < nb + (int64_t) (l + 1) * ext_per_layer_; ++s) drop(s);
+    }
+    if (const cudaError_t ce = cudaStreamSynchronize(copy_stream_); ce != cudaSuccess)
+        basalt::log::error(s_.area.c_str(), "tier keep sync: %s", cudaGetErrorString(ce));
+}
+
+bool ExpertTier::lend(uint64_t bytes) {
+    if (!partial_lend() || lent_per_layer_ > 0 || !cache_.valid()) return false;
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) return false;
+    if (free_b >= bytes + free_floor_) return true;
+    const uint64_t miss = bytes + free_floor_ - free_b;
+    const uint64_t beside = ext_per_layer_ ? (uint64_t) ext_.bytes() : 0;
+    const int64_t mapped = cache_.mapped_bytes();
+    int64_t keep_b = mapped;
+    if (miss > beside) {   // whole segments of the arena's tail
+        const int64_t more = (int64_t) (miss - beside), seg = cache_.segment_bytes();
+        if (more >= mapped || seg <= 0) return false;
+        keep_b = (mapped - more) / seg * seg;
+    }
+    std::vector<int64_t> keep((size_t) n_layers_);
+    const int64_t kept_slots = cache_.slots_within(keep_b);
+    for (int l = 0; l < n_layers_; ++l) {
+        int64_t k = 0;
+        while (k < live_n(l) && phys_[(size_t) (base_lo_[(size_t) l] + k)] < kept_slots) ++k;
+        keep[(size_t) l] = k;
+    }
+    settle();
+    const int64_t had = slots();
+    keep_hottest(keep);
+    shrink();
+    if (keep_b < mapped) {
+        std::string e;
+        const bool ok = cache_.shrink(keep_b, e);
+        count_live();
+        if (!ok) {
+            basalt::log::warn(s_.area.c_str(), "VRAM expert tier could not lend its slots: %s", e.c_str());
+            return false;
+        }
+    }
+    basalt::log::info(s_.area.c_str(), "VRAM expert tier lends %.2f GiB: %lld of its %lld slots stay (their most recent experts)",
+                      (double) (beside + (uint64_t) (mapped - cache_.mapped_bytes())) / 1073741824.0, (long long) slots(), (long long) had);
     return true;
 }
 
@@ -1071,6 +1212,25 @@ bool ExpertTier::reopen_base(int64_t n, std::string& err) {
 // room and the reserve when what the prompt left (caches that grew) takes some of theirs; a later reclaim opens the
 // planned size again once it fits.
 bool ExpertTier::reclaim(std::string& err) {
+    if (partial_lend() && lent_per_layer_ == 0 && cache_.mapped_bytes() < cache_.full_bytes()) {   // a bounded lend: map the tail again
+        uint64_t free_b = 0, total_b = 0;
+        std::string why;
+        if (!core::device_memory(-1, free_b, total_b, why)) {
+            err = s_.name + ": cannot query the free device memory: " + why;
+            return false;
+        }
+        const int64_t mapped = cache_.mapped_bytes(), lent = cache_.full_bytes() - mapped;
+        const bool all = free_b >= free_floor_ + (uint64_t) lent;
+        const int64_t room = all ? lent : free_b > reserve_ + free_floor_ ? (int64_t) (free_b - reserve_ - free_floor_) : 0;
+        std::string e;
+        const bool ok = cache_.grow(all ? INT64_MAX : mapped + room, e);
+        count_live();
+        if (!ok || !all)
+            basalt::log::warn(s_.area.c_str(), "VRAM expert tier takes back %.2f of its %.2f GiB lent (%lld MiB free)%s%s",
+                              (double) (cache_.mapped_bytes() - mapped) / 1073741824.0, (double) lent / 1073741824.0, (long long) (free_b >> 20),
+                              ok ? "" : ": ", e.c_str());
+        return true;
+    }
     if (lent_per_layer_ == 0) return true;
     const int64_t want = std::max(lent_per_layer_, planned_per_layer_);
     uint64_t free_b = 0, total_b = 0;
