@@ -145,6 +145,10 @@ public:
         iidx_meta_ = (int32_t*) alloc((size_t) kIdxRows * 3 * 4, ok);
         cells_stride_ = g_.idx_top_k + 2 * g_.idx_pool;
         max_heads_ = max_heads;
+        size_t attw = 0;   // the chunked attention's workspace: the largest a layer needs; zero from the start
+        for (int l = 0; l < g_.n_layers; ++l) attw = std::max(attw, mla_attend_work_bytes(g_.heads[(size_t) l], max_cells(l), kMaxWindow));
+        attw_ = alloc(attw, ok);
+        if (ok) cudaMemset(attw_, 0, attw);
         logits_ = f((int64_t) kMaxWindow * g_.n_vocab); pick_ = (int32_t*) alloc(4 * 32, ok);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxWindow, (int) g_.n_vocab) + (int64_t) kMaxWindow * (bk::kLogprobStride + 1));
         q8_ = alloc(std::max<size_t>(bk::native_q8_1_bytes(16384, kMaxWindow), 1 << 16), ok);
@@ -274,10 +278,10 @@ public:
         b.ik = f((int64_t) A * g_.idx_dim); b.ikn = f((int64_t) A * g_.idx_dim); b.ivt = f((int64_t) A * g_.idx_dim);
         b.igt = f((int64_t) A * g_.idx_dim); b.iq = f((int64_t) A * g_.idx_heads * g_.idx_dim); b.iw = f((int64_t) A * g_.idx_heads);
         b.icells = (int32_t*) f((int64_t) A * cells_stride_);
-        b.meta_d = (int32_t*) f(3 * (int64_t) A);
+        b.meta_d = (int32_t*) f(4 * (int64_t) A);
         // a layer's steps each have their own: the copy of step 0's spans is still queued when the host writes step 1's
         b.steps = (R + A - 1) / A;
-        b.meta_h = (int32_t*) pin((int64_t) g_.n_layers * b.steps * 3 * A);
+        b.meta_h = (int32_t*) pin((int64_t) g_.n_layers * b.steps * 4 * A);
         // gate/up products of the dense layer (A rows of n_ff), of the shared expert (R rows of the expert width) and of a prompt
         // launch (kLaunchRows rows of twice the expert width); the SwiGLU outputs likewise
         const int64_t gu_n = std::max<int64_t>({2 * (int64_t) A * g_.n_ff, 2 * (int64_t) R * g_.n_ff_exp, 2 * (int64_t) kLaunchRows * g_.n_ff_exp});
@@ -706,6 +710,7 @@ private:
     }
 
     int swa_ring() const { return g_.window + kAttRows; }
+    int max_cells(int l) const { return g_.swa[(size_t) l] ? g_.window : cells_stride_; }   // a row's cells in layer l
     bool fp8() const { return m_.cache_fp8(); }
     bool f32() const { return m_.cache_f32(); }
     int elem() const { return f32() ? 4 : 2; }
@@ -843,14 +848,52 @@ private:
         bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
         gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
         gemm(T(l, "attn_kv_a_mqa.weight"), xn_, kvraw_, E, rank + g_.rope_dim, R);
-        heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
+        // the cells each row attends
+        int32_t* meta = meta_h_ + ((size_t) l * steps_ + step) * 4 * arows_;   // firsts, counts, fill, positions
+        int32_t *firsts = meta, *counts = meta + arows_, *fill = meta + 2 * arows_, *posv = meta + 3 * arows_;
+        for (int t = 0; t < R; ++t) posv[t] = (int32_t) (pos0 + t);
+        bool selecting = false;
+        std::vector<int> pools_of(R, 0);
+        const int keep = g_.idx_top_k / g_.idx_pool - (g_.idx_select_tail ? 1 : 0);
+        if (swa) {
+            for (int t = 0; t < R; ++t) {
+                const int64_t pos = pos0 + t, first = std::max<int64_t>(0, pos + 1 - g_.window);
+                firsts[t] = (int32_t) first;
+                counts[t] = (int32_t) (pos + 1 - first);
+                fill[t] = 0;
+            }
+        } else {
+            for (int t = 0; t < R; ++t) {
+                const int64_t pos = pos0 + t;
+                pools_of[(size_t) t] = (int) (pos / g_.idx_pool);   // complete groups before the row's own
+                firsts[t] = 0;
+                if (pools_of[(size_t) t] > keep) {
+                    selecting = true;
+                    counts[t] = keep * g_.idx_pool + (int32_t) (pos - (int64_t) pools_of[(size_t) t] * g_.idx_pool + 1);
+                    fill[t] = 0;
+                } else {
+                    counts[t] = (int32_t) (pos + 1);
+                    fill[t] = counts[t];
+                }
+            }
+        }
+        put_i32(meta_d_, meta, (size_t) 4 * arows_);
         uint8_t* cache = cache_[(size_t) l];
         const int ring = swa ? swa_ring() : 0;
         const bool f8 = !swa && fp8();
         const float* kvn = F(l, "attn_kv_a_norm.weight");
-        if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
-        else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
-        else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
+        if (R <= kMaxWindow) {   // a window: the k_b product, the query rows and the cache rows in one launch
+            const void* kb = T(l, "attn_k_b.weight")->ptr;
+            const int32_t* pos_d = meta_d_ + 3 * arows_;
+            if (f8) mla_query(kb, q_, kvraw_, kvn, a, pos_d, R, ring, qcur_, cache, stream_);
+            else if (f32()) mla_query(kb, q_, kvraw_, kvn, a, pos_d, R, ring, qcur_, (float*) cache, stream_);
+            else mla_query(kb, q_, kvraw_, kvn, a, pos_d, R, ring, qcur_, (uint16_t*) cache, stream_);
+        } else {
+            heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
+            if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
+            else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
+            else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
+        }
         if (diag(l) && f32() && !swa) {   // the inputs of the attention, for the reference's tensors (fp32 caches only)
             diag_sync();
             dump("q_resid-" + std::to_string(l), qan_, (int64_t) R * g_.q_lora);
@@ -872,51 +915,25 @@ private:
             put("k_pe-" + std::to_string(l), pe);
             put("q_pe-" + std::to_string(l), qp);
         }
-        // the cells each row attends
-        int32_t* meta = meta_h_ + ((size_t) l * steps_ + step) * 3 * arows_;   // firsts, counts, fill
-        int32_t *firsts = meta, *counts = meta + arows_, *fill = meta + 2 * arows_;
-        bool selecting = false;
-        std::vector<int> pools_of(R, 0);
-        if (swa) {
-            for (int t = 0; t < R; ++t) {
-                const int64_t pos = pos0 + t, first = std::max<int64_t>(0, pos + 1 - g_.window);
-                firsts[t] = (int32_t) first;
-                counts[t] = (int32_t) (pos + 1 - first);
-                fill[t] = 0;
-            }
-        } else {
-            const int keep = g_.idx_top_k / g_.idx_pool - (g_.idx_select_tail ? 1 : 0);
-            for (int t = 0; t < R; ++t) {
-                const int64_t pos = pos0 + t;
-                pools_of[(size_t) t] = (int) (pos / g_.idx_pool);   // complete groups before the row's own
-                firsts[t] = 0;
-                if (pools_of[(size_t) t] > keep) {
-                    selecting = true;
-                    counts[t] = keep * g_.idx_pool + (int32_t) (pos - (int64_t) pools_of[(size_t) t] * g_.idx_pool + 1);
-                    fill[t] = 0;
-                } else {
-                    counts[t] = (int32_t) (pos + 1);
-                    fill[t] = counts[t];
-                }
-            }
+        if (!swa) {
             indexer(l, pos0, R, selecting, pools_of, err);
             for (int t = 0; t < R; ++t) {   // DFLY HOOK: each row's selection, for the drafter
                 const bool sel = pools_of[(size_t) t] > keep;
                 dfly_.selection(l, t, sel ? icells_ + (size_t) t * cells_stride_ : nullptr, sel ? counts[t] : -1, stream_);
             }
         }
-        put_i32(meta_d_, meta, (size_t) 3 * arows_);
         RowSpans rs;
         rs.firsts = meta_d_;
         rs.counts = meta_d_ + arows_;
         if (!swa) {
-            iota_cells(icells_, cells_stride_, meta_d_ + 2 * arows_, R, stream_);
             rs.cells = icells_;
             rs.cells_stride = cells_stride_;
+            rs.fill = meta_d_ + 2 * arows_;
         }
-        if (f8) mla_attend(qcur_, (const uint8_t*) cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
-        else if (f32()) mla_attend(qcur_, (const float*) cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
-        else mla_attend(qcur_, (const uint16_t*) cache, rs, R, F(l, "attn_sinks.weight"), a, ring, olat_, stream_);
+        const float* sinks = F(l, "attn_sinks.weight");
+        if (f8) mla_attend(qcur_, (const uint8_t*) cache, rs, R, sinks, a, ring, max_cells(l), attw_, olat_, stream_);
+        else if (f32()) mla_attend(qcur_, (const float*) cache, rs, R, sinks, a, ring, max_cells(l), attw_, olat_, stream_);
+        else mla_attend(qcur_, (const uint16_t*) cache, rs, R, sinks, a, ring, max_cells(l), attw_, olat_, stream_);
         heads_product(T(l, "attn_v_b.weight"), olat_, rank, H * rank, H, g_.v_dim, rank, R, vout_);
         if (diag(l)) dump("attn_kqv-" + std::to_string(l), vout_, (int64_t) R * H * g_.v_dim);
         gemm(T(l, "attn_gate.weight"), xn_, gate_, E, H * g_.v_dim, R);
@@ -2097,6 +2114,7 @@ private:
     float *qa_ = nullptr, *qan_ = nullptr, *q_ = nullptr, *kvraw_ = nullptr, *qabs_ = nullptr, *qcur_ = nullptr, *olat_ = nullptr, *vout_ = nullptr, *gate_ = nullptr;
     float *ik_ = nullptr, *ikn_ = nullptr, *ivt_ = nullptr, *igt_ = nullptr, *iq_ = nullptr, *iw_ = nullptr, *iscore_ = nullptr;
     int32_t *iidx_meta_ = nullptr, *icells_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
+    void* attw_ = nullptr;   // the chunked attention's workspace
     int cells_stride_ = 0, rows_ = 0, arows_ = 0, steps_ = 0, max_heads_ = 0;
     static constexpr size_t kStageInts = (size_t) 4 << 20;   // the mapped staging of a prompt's small inputs
     int32_t *stage_h_ = nullptr, *stage_d_ = nullptr, *bounds_tab_ = nullptr;
