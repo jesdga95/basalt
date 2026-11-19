@@ -9,6 +9,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/model/rope_flags.hpp"
+#include "basalt/model/route_flags.hpp"
 #include "basalt/program/grammar/tool_form.hpp"
 
 #include <cstdint>
@@ -101,6 +102,7 @@ struct LoadRequest {
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
     RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
+    RouteFlags route;                 ///< the lossy routing flags, for a model that takes them (route_flags.hpp)
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
     std::vector<double> card_gbps;    ///< memory bandwidth of the main card, then of each peer device (GB/s, 0: unknown)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)

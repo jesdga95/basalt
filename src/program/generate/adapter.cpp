@@ -392,6 +392,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         lreq.kv = o.kv;
         lreq.rope = o.rope;
+        lreq.route = o.route;
         lreq.kv_resident = o.kv_resident;
         lreq.card_gbps.push_back(o.main_gbps);
         lreq.card_gbps.insert(lreq.card_gbps.end(), o.peer_gbps.begin(), o.peer_gbps.end());
