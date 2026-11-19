@@ -12,6 +12,7 @@ in system RAM, and optionally on more GPUs. The server speaks the OpenAI and Ant
 
 - Linux x86-64 with AVX2, or Windows 10 1903+ x64 ([platforms](docs/platforms.md)).
 - An NVIDIA Blackwell GPU (compute capability 12.0) with CUDA 13.
+- Or Linux or Windows on Arm64 with the integrated 12.1 GPU of an RTX Spark N1X or DGX Spark ([Arm64](docs/arm64.md)).
 - CMake 3.24+, GCC 13+ (Linux), Python 3.10+, and enough system RAM for the experts that do not fit in VRAM.
 
 ## Quick start

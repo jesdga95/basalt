@@ -1,13 +1,13 @@
 # Building and testing
 
-The build commands are in the [README](../README.md). Windows: [platforms](platforms.md).
+The build commands are in the [README](../README.md). Windows: [platforms](platforms.md). Arm64 (Linux and Windows): [Arm64](arm64.md).
 
 ## What is in the repository
 
 - `src/`, `include/`: the engine (`basalt`, `basalt-bench`, `basalt-probe`, `basalt-vision`).
 - `serve/`: the Python server with the OpenAI and Anthropic API and the stats page.
 - `tools/`: the converter (`tools/convert/convert.py`), the `.basalt` reader (`model_file.py`), the quality gate (`ppl_gate.py`), the
-  greedy-identity check and the tokenizer.
+  greedy-identity check and the tokenizer; `tools/port/` builds for Arm64 ([Arm64](arm64.md)).
 - `tests/`: parity and unit tests. `data/`: expert profiles (`data/profiles`) and benchmark fixtures (`data/bench`).
 
 The build fetches nothing. The ggml and llama.cpp parts Basalt uses (quantization formats, CPU dot products, MMQ) are in `src/` and
