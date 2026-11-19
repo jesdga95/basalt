@@ -409,7 +409,7 @@ public:
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         std::vector<uint16_t*> rows;   // the drafter reads BF16 rows (--spec with --kv fp8 is refused at the start)
         for (uint8_t* p : cache_) rows.push_back((uint16_t*) p);
-        return dfly_.draft_begin(anchor, pos, n, rows, stream_);
+        return dfly_.draft_begin(anchor, pos, n, rows, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
     }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override { return dfly_.draft_end(ids, conf, max_n, n, stream_); }
 
@@ -1741,6 +1741,11 @@ private:
     void sync_rope(int64_t pos) {
         rope_.rewind(pos);
         while (rope_.size() < pos) rope_.push_text();   // cells the session never placed (a restored history) count as text
+    }
+    // The rotary position a text token at cell `pos` takes, the track left as it is (the drafter's block, before its window).
+    int64_t text_rope(int64_t pos) const {
+        const int64_t have = std::min<int64_t>(pos, rope_.size());
+        return (have > 0 ? rope_.at(have - 1).last() + 1 : 0) + (pos - have);
     }
     void place_rope(int64_t pos0, int R) {
         sync_rope(pos0);
