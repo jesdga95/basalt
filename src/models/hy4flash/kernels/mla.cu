@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace basalt::models::hy4flash {
@@ -460,36 +461,47 @@ __device__ __forceinline__ uint4 half8(const uint8_t*, uint4 v, int ch) {
     return make_uint4(e4m3x2_to_h2(v.x & 0xffffu, s), e4m3x2_to_h2(v.x >> 16, s), e4m3x2_to_h2(v.y & 0xffffu, s), e4m3x2_to_h2(v.y >> 16, s));
 }
 
-template <typename C>
+// G groups of 16 heads a block share each tile of cells (the cells are the row's for every head: one load, one conversion);
+// every output element sums its products in the same order whatever G is, so the groups only change how the work is shared.
+template <int G> constexpr size_t mma_smem() {
+    return (size_t) (16 * G * kLd + kMmaCells * kLd + 16 * G * kPLd) * 2 + (2 * 16 * G * 32 + 2 * 16 * G) * sizeof(float);
+}
+template <typename C, int G>
 __global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict__ qcur, const C* __restrict__ cache, const int32_t* __restrict__ firsts,
                                                          const int32_t* __restrict__ counts, const int32_t* __restrict__ cells, int cells_stride,
                                                          const int32_t* __restrict__ fill, const float* __restrict__ sinks, MlaArgs a, int ring,
                                                          float* __restrict__ o_lat) {
     extern __shared__ __align__(16) unsigned char smraw[];
-    constexpr int W = 576;
+    constexpr int W = 576, M = 16 * G;
     uint16_t* qh = (uint16_t*) smraw;
-    uint16_t* ks = qh + 16 * kLd;
+    uint16_t* ks = qh + M * kLd;
     uint16_t* ph = ks + kMmaCells * kLd;
-    float* sp = (float*) (ph + 16 * kPLd);   // [2][16][32]
-    float* alpha_s = sp + 2 * 16 * 32;
-    float* l_s = alpha_s + 16;
+    float* sp = (float*) (ph + M * kPLd);   // [2][M][32]
+    float* alpha_s = sp + 2 * M * 32;
+    float* l_s = alpha_s + M;
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
-    const int t = blockIdx.y, h0 = blockIdx.x * 16;
+    const int t = blockIdx.y, h0 = blockIdx.x * M;
     const int n = counts[t], first = firsts[t];
     const int32_t* cl = cells && !(fill && fill[t] > 0) ? cells + (size_t) t * cells_stride : nullptr;
-    for (int i = tid; i < 16 * W; i += 256) {
+    for (int i = tid; i < M * W; i += 256) {
         const int h = i / W, e = i - h * W;
         qh[h * kLd + e] = __half_as_ushort(__float2half_rn(qcur[((size_t) t * a.heads + h0) * W + i] * a.scale));
     }
-    float m[2], l[2];
-    for (int hh = 0; hh < 2; ++hh) {
-        m[hh] = sinks[h0 + w * 2 + hh];
+    // the softmax: a warp keeps 2G heads
+    float m[2 * G], l[2 * G];
+#pragma unroll
+    for (int hh = 0; hh < 2 * G; ++hh) {
+        m[hh] = sinks[h0 + w * 2 * G + hh];
         l[hh] = 1.f;
     }
-    if (tid < 16) l_s[tid] = 1.f;
-    float acc[8][4];
-    for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
-    const int nt = w & 3, kh = w >> 2, id = lane >> 3, r8 = lane & 7;
+    if (tid < M) l_s[tid] = 1.f;
+    // O: a warp keeps the 16 heads of group rg and 64G latent dimensions
+    float acc[8 * G][4];
+#pragma unroll
+    for (int j = 0; j < 8 * G; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    const int id = lane >> 3, r8 = lane & 7, rg = w % G, dq = w / G;
+    // S: a warp takes the heads of group rg, half kh of the 576 dimensions and G tiles of 8 cells from cell 8G cp
+    const int kh = (w / G) & 1, cp = w / (2 * G);
     // a thread's share of a tile, loaded a tile ahead: the next tile's reads are in flight while this one computes
     constexpr int kPer = kMmaCells * (W / 8) / 256;
     uint4 pre[kPer];
@@ -517,32 +529,41 @@ __global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict
         }
         __syncthreads();
         if (j0 + kMmaCells < n) fetch(j0 + kMmaCells);
-        // S: this warp's 8 cells and half of the 576 dimensions
         {
-            float c[4] = {0.f, 0.f, 0.f, 0.f};
+            float c[G][4];
+#pragma unroll
+            for (int nt = 0; nt < G; ++nt) c[nt][0] = c[nt][1] = c[nt][2] = c[nt][3] = 0.f;
             for (int kk = 0; kk < 9; ++kk) {
                 const int kb = (kh * 18 + kk * 2) * 16;
-                uint32_t b[4];
-                ldsm4(b, ks + (nt * 8 + r8) * kLd + kb + id * 8);
+                uint32_t b[G][4];
+#pragma unroll
+                for (int nt = 0; nt < G; ++nt) ldsm4(b[nt], ks + ((cp * G + nt) * 8 + r8) * kLd + kb + id * 8);
+#pragma unroll
                 for (int s2 = 0; s2 < 2; ++s2) {
                     const int kd = kb + s2 * 16;
                     uint32_t ah[4];
-                    ldsm4(ah, qh + ((id & 1) * 8 + r8) * kLd + kd + (id >> 1) * 8);
-                    mma16816h(c, ah, b[2 * s2], b[2 * s2 + 1]);
+                    ldsm4(ah, qh + (rg * 16 + (id & 1) * 8 + r8) * kLd + kd + (id >> 1) * 8);
+#pragma unroll
+                    for (int nt = 0; nt < G; ++nt) mma16816h(c[nt], ah, b[nt][2 * s2], b[nt][2 * s2 + 1]);
                 }
             }
-            const int row = lane >> 2, col = nt * 8 + (lane & 3) * 2;
-            sp[(kh * 16 + row) * 32 + col] = c[0];
-            sp[(kh * 16 + row) * 32 + col + 1] = c[1];
-            sp[(kh * 16 + row + 8) * 32 + col] = c[2];
-            sp[(kh * 16 + row + 8) * 32 + col + 1] = c[3];
+            const int row = rg * 16 + (lane >> 2);
+#pragma unroll
+            for (int nt = 0; nt < G; ++nt) {
+                const int col = (cp * G + nt) * 8 + (lane & 3) * 2;
+                sp[(kh * M + row) * 32 + col] = c[nt][0];
+                sp[(kh * M + row) * 32 + col + 1] = c[nt][1];
+                sp[(kh * M + row + 8) * 32 + col] = c[nt][2];
+                sp[(kh * M + row + 8) * 32 + col + 1] = c[nt][3];
+            }
         }
         __syncthreads();
-        // the running softmax: a warp takes 2 heads, a lane a cell
-        for (int hh = 0; hh < 2; ++hh) {
-            const int h = w * 2 + hh;
+        // the running softmax: a lane a cell
+#pragma unroll
+        for (int hh = 0; hh < 2 * G; ++hh) {
+            const int h = w * 2 * G + hh;
             const bool valid = lane < tn;
-            const float sc = valid ? sp[h * 32 + lane] + sp[(16 + h) * 32 + lane] : -INFINITY;
+            const float sc = valid ? sp[h * 32 + lane] + sp[(M + h) * 32 + lane] : -INFINITY;
             float mx = sc;
             for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
             const float nm = fmaxf(m[hh], mx);
@@ -559,19 +580,22 @@ __global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict
             }
         }
         __syncthreads();
-        // O = O * alpha + P V: this warp's 64 latent dimensions
+        // O = O * alpha + P V
         {
-            const float a0 = alpha_s[lane >> 2], a1 = alpha_s[(lane >> 2) + 8];
-            for (int j = 0; j < 8; ++j) {
+            const float a0 = alpha_s[rg * 16 + (lane >> 2)], a1 = alpha_s[rg * 16 + (lane >> 2) + 8];
+#pragma unroll
+            for (int j = 0; j < 8 * G; ++j) {
                 acc[j][0] *= a0; acc[j][1] *= a0;
                 acc[j][2] *= a1; acc[j][3] *= a1;
             }
+#pragma unroll
             for (int s2 = 0; s2 < 2; ++s2) {
                 uint32_t ah[4];
-                ldsm4(ah, ph + ((id & 1) * 8 + r8) * kPLd + s2 * 16 + (id >> 1) * 8);
-                for (int jj = 0; jj < 4; ++jj) {
+                ldsm4(ah, ph + (rg * 16 + (id & 1) * 8 + r8) * kPLd + s2 * 16 + (id >> 1) * 8);
+#pragma unroll
+                for (int jj = 0; jj < 4 * G; ++jj) {
                     uint32_t b[4];
-                    ldsm4t(b, ks + (s2 * 16 + (id & 1) * 8 + r8) * kLd + w * 64 + jj * 16 + (id >> 1) * 8);
+                    ldsm4t(b, ks + (s2 * 16 + (id & 1) * 8 + r8) * kLd + dq * 64 * G + jj * 16 + (id >> 1) * 8);
                     mma16816h(acc[2 * jj], ah, b[0], b[1]);
                     mma16816h(acc[2 * jj + 1], ah, b[2], b[3]);
                 }
@@ -579,10 +603,11 @@ __global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict
         }
     }
     __syncthreads();
-    const int row = lane >> 2;
+    const int row = rg * 16 + (lane >> 2);
     const float i0 = 1.f / l_s[row], i1 = 1.f / l_s[row + 8];
-    for (int j = 0; j < 8; ++j) {
-        const int d = w * 64 + j * 8 + (lane & 3) * 2;
+#pragma unroll
+    for (int j = 0; j < 8 * G; ++j) {
+        const int d = dq * 64 * G + j * 8 + (lane & 3) * 2;
         float* o0 = o_lat + ((size_t) t * a.heads + h0 + row) * a.rank + d;
         float* o1 = o_lat + ((size_t) t * a.heads + h0 + row + 8) * a.rank + d;
         o0[0] = acc[j][0] * i0; o0[1] = acc[j][1] * i0;
@@ -609,6 +634,13 @@ template <> struct RowOf<float> { using T = RowF32; };
 template <> struct RowOf<uint16_t> { using T = RowF16; };
 template <> struct RowOf<uint8_t> { using T = RowFp8; };
 
+// 16-head groups a block of the tensor-core kernel takes: 2 when the heads come in 32s
+int mma_groups(int heads) {
+    static const int force = [] { const char* e = std::getenv("HY4_MMA_GROUPS"); return e ? std::atoi(e) : 0; }();   // DIAG
+    if (force == 1 || force == 2) return heads % (16 * force) == 0 ? force : 1;
+    return heads % 32 == 0 ? 2 : 1;
+}
+
 int chunks_of(int max_cells) { return std::max(1, (max_cells + mqa::kChunk - 1) / mqa::kChunk); }
 size_t counters_bytes(int heads) { return ((size_t) kAttTok * (heads / 8) * 4 + 255) & ~(size_t) 255; }
 
@@ -629,14 +661,19 @@ void attend_impl(const float* qcur, const C* cache, const RowSpans& r, int n_tok
     cudaStream_t st = (cudaStream_t) stream;
     if constexpr (!std::is_same_v<C, float>) {
         if (n_tok > kAttTok && a.heads % 16 == 0) {   // a chunk of rows; a window keeps the kernel below
-            const size_t smem = (size_t) (16 * kLd + kMmaCells * kLd + 16 * kPLd) * 2 + (2 * 16 * 32 + 32) * sizeof(float);
-            static bool raised_mma = false;
-            if (!raised_mma) {
-                cudaFuncSetAttribute(attend_mma_kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-                raised_mma = true;
+            const int g = mma_groups(a.heads);
+            static bool raised[2] = {false, false};
+            if (!raised[g - 1]) {
+                if (g == 2) cudaFuncSetAttribute(attend_mma_kernel<C, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem<2>());
+                else cudaFuncSetAttribute(attend_mma_kernel<C, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem<1>());
+                raised[g - 1] = true;
             }
-            attend_mma_kernel<C><<<dim3(a.heads / 16, n_tok), 256, smem, st>>>(qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride, r.fill,
-                                                                           sinks, a, ring, o_lat);
+            if (g == 2)
+                attend_mma_kernel<C, 2><<<dim3(a.heads / 32, n_tok), 256, mma_smem<2>(), st>>>(qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride,
+                                                                                             r.fill, sinks, a, ring, o_lat);
+            else
+                attend_mma_kernel<C, 1><<<dim3(a.heads / 16, n_tok), 256, mma_smem<1>(), st>>>(qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride,
+                                                                                             r.fill, sinks, a, ring, o_lat);
             if (!stream) cudaStreamSynchronize(nullptr);
             return;
         }
