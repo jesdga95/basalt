@@ -96,7 +96,7 @@ class Service:
 
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "basalt",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
+                 fit_max_tokens: bool = True, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
                  dialect: Dialect | None = None, video_max_tokens: int = VIDEO_MAX_TOKENS):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.dialect = dialect or dialect_for(None)      # how this model's prompts and replies are written

@@ -62,7 +62,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `api-key-file` | command line | path | none | Read that key from the first line of this file, which keeps it out of the process list. Not with `api-key`. Command line only. |
 | `allowed-host` | server | string, repeatable | none | Also answer to this `Host` name; `"*"` turns the check off. |
 | `cors-origin` | server | string, repeatable | none | Let web pages from this origin call `/v1/*`. |
-| `fit-max-tokens` | entry | switch | off | Clamp `max_tokens` to the remaining context instead of a 400. |
+| `fit-max-tokens` | entry | switch | on | Clamp `max_tokens` to the remaining context instead of a 400 (`--no-fit-max-tokens` rejects instead). |
 | `open` | server | switch | off | Open the web page when ready. |
 | `lazy` | server | switch | off | Start unloaded; load on the first request. Drops a sidecar encoder. |
 | `idle-unload` | entry | seconds | off | Unload after this long idle. Frees VRAM for other programs. |
