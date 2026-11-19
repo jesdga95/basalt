@@ -34,6 +34,7 @@ constexpr int kMaxTok = 8;          // tokens per logits launch
 constexpr int kLogitThreads = 256;  // one block per gate row
 constexpr int kMaxVec = 8;          // float4 per thread: n_embd <= 4 * kMaxVec * kLogitThreads
 constexpr int kMaxExpert = 512;
+constexpr int kRowsMinTok = 64;     // tokens from which a launch takes several gate rows a block
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -90,6 +91,53 @@ router_logits_kernel(const float* __restrict__ x, const float* __restrict__ gate
     const int t0 = blockIdx.y * kMaxTok;
     router_logits_row(gate + (size_t) row * n_embd, x + (size_t) t0 * n_embd, n_embd, min(kMaxTok, n_tokens - t0), logits + (size_t) t0 * n_expert,
                       n_expert, row, red);
+}
+
+// The same logits, G gate rows a block: a token's float4 is read once for the G rows. Each (row, token) sum runs in exactly
+// router_logits_row's order (thread columns, then the warp tree, then the warps in order), so the bits are the same; for
+// n_embd = 4 * NV * kLogitThreads.
+template <int NV, int G>
+__global__ void __launch_bounds__(kLogitThreads)
+router_logits_rows_kernel(const float* __restrict__ x, const float* __restrict__ gate, int n_embd, int n_expert, int n_tokens,
+                          float* __restrict__ logits) {
+    __shared__ float red[G][kMaxTok * (kLogitThreads / 32)];
+    const int r0 = blockIdx.x * G, t0 = blockIdx.y * kMaxTok, nt = min(kMaxTok, n_tokens - t0);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    float4 w[G][NV];
+#pragma unroll
+    for (int g = 0; g < G; ++g)
+#pragma unroll
+        for (int c = 0; c < NV; ++c) w[g][c] = reinterpret_cast<const float4*>(gate + (size_t) (r0 + g) * n_embd)[threadIdx.x + c * kLogitThreads];
+    for (int t = 0; t < nt; ++t) {
+        const float4* xv = reinterpret_cast<const float4*>(x + (size_t) (t0 + t) * n_embd);
+        float acc[G];
+#pragma unroll
+        for (int g = 0; g < G; ++g) acc[g] = 0.f;
+#pragma unroll
+        for (int c = 0; c < NV; ++c) {
+            const float4 v = xv[threadIdx.x + c * kLogitThreads];
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                acc[g] = fmaf(w[g][c].x, v.x, acc[g]);
+                acc[g] = fmaf(w[g][c].y, v.y, acc[g]);
+                acc[g] = fmaf(w[g][c].z, v.z, acc[g]);
+                acc[g] = fmaf(w[g][c].w, v.w, acc[g]);
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            const float sum = warp_sum(acc[g]);
+            if (lane == 0) red[g][t * (kLogitThreads / 32) + warp] = sum;
+        }
+    }
+    __syncthreads();
+    const int g = threadIdx.x / kMaxTok, t = threadIdx.x % kMaxTok;
+    if (g < G && t < nt) {
+        float s = 0.f;
+#pragma unroll
+        for (int i = 0; i < kLogitThreads / 32; ++i) s += red[g][t * (kLogitThreads / 32) + i];
+        logits[(size_t) (t0 + t) * n_expert + r0 + g] = s;
+    }
 }
 
 __device__ __forceinline__ float sqrt_softplus(float x) {
@@ -176,8 +224,16 @@ void router(const float* x, const float* gate, const float* bias, int n_tokens, 
         throw std::invalid_argument("router: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
     constexpr int kLaunchTok = kMaxTok * 65535;   // grid.y limit
+    // a prompt's many tokens: gate rows four to a block where a thread's columns fit (the same bits, a quarter of the reads of x)
+    constexpr int kRowsG = 4;
+    const bool rows4 = n_tokens >= kRowsMinTok && a.n_embd == 4 * 3 * kLogitThreads && a.n_expert % kRowsG == 0;
     for (int t0 = 0; t0 < n_tokens; t0 += kLaunchTok) {
         const int nt = n_tokens - t0 < kLaunchTok ? n_tokens - t0 : kLaunchTok;
+        if (rows4) {
+            router_logits_rows_kernel<3, kRowsG><<<dim3(a.n_expert / kRowsG, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
+                x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
+            continue;
+        }
         router_logits_kernel<<<dim3(a.n_expert, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
             x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
     }
