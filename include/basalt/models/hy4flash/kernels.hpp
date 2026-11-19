@@ -65,8 +65,9 @@ void mla_attend(const float* qcur, const uint16_t* cache, const RowSpans& r, int
 void mla_attend(const float* qcur, const uint8_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                 float* o_lat, void* stream);
 /// cells[t][j] = j for j < fill[t]; a row with fill 0 is left alone.
-/// ids[h * rows + t] = t * heads + h: the (token, head) rows of a [token][head][k] array in head-major order.
-void head_major_ids(int32_t* ids, int heads, int rows, void* stream);
+/// ids[h * rows + t] = t * heads + h: the (token, head) rows of a [token][head][k] array in head-major order; bounds[h] = h * rows
+/// for h <= heads (each head an "expert" of an MMQ product).
+void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* stream);
 void iota_cells(int32_t* cells, int stride, const int32_t* fill, int n_tok, void* stream);
 
 /// x[i] *= sigmoid(g[i]).
