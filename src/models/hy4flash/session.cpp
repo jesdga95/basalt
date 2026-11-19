@@ -64,6 +64,7 @@ constexpr int64_t kGrowPositions = 16384;      // positions the caches are backe
 constexpr uint64_t kModuleRoom = 7ull << 27;   // kernel modules still to load when the tier opens
 constexpr uint64_t kPromptRoom = 5ull << 29;   // the prompt path's workspaces beside the homes
 constexpr int kLookupK = core::ExpertTier::kMaxK;
+constexpr int kTypeNvfp4 = 40;                 // ggml's NVFP4: blobs end in the FP32 scales {s_gate, s_up, s_down, 0}
 
 // One group's GPU plan for the grouped expert kernel, uploaded with a single copy.
 struct WindowPlan {
@@ -1276,7 +1277,10 @@ private:
             p.dst = gu_;
             p.ld_dst = p.w_rows;
             mmq_.run(p, st);
-            swiglu_split_clamped(gu_, h_, rows, F, g_.clamp_exp[(size_t) l], st);
+            // an NVFP4 blob's per-expert scales (its last 16 bytes), which the MMQ products leave out
+            ExpertTails tails;
+            if (el.gu_type == kTypeNvfp4) tails = ExpertTails{blobs, stride_, (size_t) el.blob_bytes - 16, B.bounds, nb};
+            swiglu_split_clamped(gu_, h_, rows, F, g_.clamp_exp[(size_t) l], st, el.gu_type == kTypeNvfp4 ? &tails : nullptr);
             mmq::quantize(h_, nullptr, xq2_, el.d_type, F, F, rows, st);
             mmq::Product d;
             d.w = blobs + lay.down_off;
