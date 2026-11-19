@@ -64,6 +64,9 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .ms .opt.go > span { color: var(--fg-2); }
 .ms .opt.go:hover > span { color: var(--accent); }
 .ms .opt:disabled { cursor: default; opacity: .5; }
+.unload { flex: none; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; font: 500 12px/1 var(--font-mono); color: var(--fg-2); }
+.unload:hover:not(:disabled), .unload:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+.unload:disabled { cursor: default; opacity: .5; }
 .state { font: 500 13px/1 var(--font-mono); color: var(--fg-2); white-space: nowrap; }
 .state[data-s="generating"], .state[data-s="reading"] { color: var(--accent); }
 .state[data-s="offline"] { color: var(--err); }
@@ -287,6 +290,7 @@ tr.live td { color: var(--accent); }
   .ms > button { font-size: 13px; padding: 6px 8px; gap: 6px; }
   .crumb-sep { display: none; }
   .crumb { gap: 0; }
+  .unload { margin-left: 8px; padding: 5px 8px; }
   .sp { width: 88px; }
   .lab .state { font-size: 12px; }
   .bar { position: relative; flex-wrap: nowrap; gap: 10px; }

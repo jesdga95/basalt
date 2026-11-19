@@ -381,9 +381,9 @@ function setPicker(open) {
   open ? root.setAttribute("data-open", "") : root.removeAttribute("data-open");
   root.firstElementChild.setAttribute("aria-expanded", String(open));
 }
-function loadModel(id) {
-  fetch("v1/load", { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
-                     body: JSON.stringify({ model: id }) }).catch(() => {});
+function control(path, id) {
+  fetch(path, { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+                body: JSON.stringify({ model: id }) }).catch(() => {});
 }
 function buildPicker(root) {
   const btn = document.createElement("button"); btn.type = "button"; btn.setAttribute("aria-haspopup", "true"); btn.setAttribute("aria-expanded", "false");
@@ -399,7 +399,7 @@ function buildPicker(root) {
   pop.onclick = e => {
     const o = e.target.closest(".opt"); if (!o || o.disabled) return;
     setPicker(false); btn.focus();
-    if (o.classList.contains("go")) loadModel(o.dataset.v);
+    if (o.classList.contains("go")) control("v1/load", o.dataset.v);
   };
   root.onkeydown = e => {
     const opts = live(), k = opts.indexOf(document.activeElement);
@@ -437,6 +437,17 @@ function drawModels(models, shown) {
   if (focused) [...pop.children].find(b => b.dataset.v === focused && !b.disabled)?.focus();
 }
 
+/* ---- the Unload button: beside the model name, for the loaded model; off while a request runs or waits ---- */
+function drawUnload(models, live) {
+  const b = $("#unload"), m = models.find(m => m.status.value === "loaded");
+  b.hidden = !m;
+  if (!m) return;
+  const busy = live.state === "reading" || live.state === "generating" || live.queued > 0;
+  b.dataset.v = m.id; b.disabled = busy;
+  b.title = busy ? "A request is running or queued" : `Unload ${m.id}; the next request loads it again`;
+}
+$("#unload").addEventListener("click", e => control("v1/unload", e.currentTarget.dataset.v));
+
 /* ---- the whole page ---- */
 function draw() {
   if (!M) return;
@@ -454,6 +465,7 @@ function draw() {
   $("#pbar").hidden = !weights; $("#pbar").firstElementChild.style.width = `${pct || 0}%`;
   text($("#model"), eng.model || "");
   drawModels(models, eng.model);
+  drawUnload(models, live);
   chip = cacheChip(M.conversation, live);
   drawTotals(M.totals);
   drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);
