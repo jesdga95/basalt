@@ -37,7 +37,7 @@ void q8_0_heads_gemv(const void* w, const float* x, int x_head_stride, int x_tok
 /// (modulo `ring` when it is set).
 void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
                  int n_tok, int ring, float* qcur, float* cache, void* stream);
-/// The same with a BF16 cache (round to nearest even).
+/// The same with an fp16 cache (round to nearest even).
 void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
                  int n_tok, int ring, float* qcur, uint16_t* cache, void* stream);
 
@@ -65,7 +65,7 @@ struct RowSpans {
 size_t mla_attend_work_bytes(int heads, int max_cells, int max_rows);
 void mla_attend(const float* qcur, const float* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                 int max_cells, void* work, float* o_lat, void* stream);
-/// The same over a BF16 cache.
+/// The same over an fp16 cache.
 void mla_attend(const float* qcur, const uint16_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                 int max_cells, void* work, float* o_lat, void* stream);
 void mla_attend(const float* qcur, const uint8_t* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,

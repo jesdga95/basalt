@@ -1,6 +1,6 @@
 // include/basalt/models/hy4flash/dfly_kernels.hpp - the device kernels of the DFly2 drafter that no other kernel covers:
 // the absorbed MLA's two products over the drafter's own BF16 `kv_b_proj` (rows of a block at once), the gather of the
-// target's selected cache rows (BF16, or FP8 decoded to BF16), and the fusion's gated add.
+// target's selected cache rows (fp16, or FP8 decoded to fp16), and the fusion's gated add.
 //
 // The drafter's matrices are BF16 and read by the shared BF16 products (basalt/kernels/bf16_gemv.hpp); its attention reuses
 // mla_prepare and mla_attend (kernels.hpp). Activations are fp32, pointers device memory; `stream` may be null.
@@ -22,10 +22,10 @@ void dfly_absorb_k(const uint16_t* kvb, const float* q, int q_stride, int q_head
 /// out[r][h][v] = sum_c olat[r][h][c] * kvb[(h * 448 + 192 + v) * 512 + c] for v < 256: the value half of `kvb`. rows <= 8.
 void dfly_expand_v(const uint16_t* kvb, const float* olat, int rows, int heads, float* out, void* stream);
 
-/// out[j] = cache[cells[j]] for j < n (BF16 rows of `width` values, the target's cache form); cells null: out[j] = cache[j].
+/// out[j] = cache[cells[j]] for j < n (fp16 rows of `width` values, the target's cache form); cells null: out[j] = cache[j].
 void dfly_gather_rows(const uint16_t* cache, const int32_t* cells, int n, int width, uint16_t* out, void* stream);
-/// The same from FP8 rows (--kv fp8: kFp8RowBytes each, kernels.hpp) to BF16 rows of 576: a code times its power-of-two scale
-/// is a BF16 value, so the decoded rows are exact.
+/// The same from FP8 rows (--kv fp8: kFp8RowBytes each, kernels.hpp) to fp16 rows of 576: a code times its power-of-two scale
+/// is an fp16 value, so the decoded latent is exact (the BF16 rope values round to fp16).
 void dfly_gather_rows_fp8(const uint8_t* cache, const int32_t* cells, int n, uint16_t* out, void* stream);
 
 /// out[i] = base[i] + gate[i] * fused[i] for i < n (the Gated Fusion's residual).
