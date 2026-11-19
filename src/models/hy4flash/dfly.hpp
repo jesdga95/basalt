@@ -147,13 +147,15 @@ public:
         const uint16_t* head = nullptr;                          ///< the target's output matrix, BF16 [vocab][E]
         std::function<bool(int32_t, float*)> embed;              ///< a token's embedding row (E floats, host)
         int sel_cap = 2056;                                      ///< cells of a selection
+        bool fp8 = false;                                        ///< the target's caches hold --kv fp8 rows (kFp8RowBytes)
     };
     static std::unique_ptr<DflyRunner> create(const Env& env, std::string& err);
     ~DflyRunner();
 
     /// Enqueues the block of `n` drafts (1..5) after `anchor` at `pos` on `stream`: the target's caches `cache[i]` (draft
-    /// layer i's, BF16 rows of 576) and the tap's row `row`. Nothing is read from the host but the embeddings.
-    bool begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const uint16_t* const* cache, void* stream,
+    /// layer i's: BF16 rows of 576, or FP8 rows with Env::fp8) and the tap's row `row`. Nothing is read from the host but the
+    /// embeddings. With FP8 caches the block's own rows are rounded to FP8 rows too, as the target's would be.
+    bool begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const void* const* cache, void* stream,
                std::string& err);
     /// Runs the heads over the block begin() made, in order, each with the token before it: the `n` drafts and each one's
     /// estimated chance of acceptance.
@@ -176,8 +178,9 @@ public:
     /// `w` null: no drafter. `ctx` the context in positions.
     /// `dump` (--diag-dump's directory, may be empty): each block's inputs (the source row's hidden state, the cache rows it attends)
     /// are written there for the first few blocks, to compare with a reference.
+    /// `fp8`: the target's sparse caches hold --kv fp8 rows.
     bool init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16_t* head, std::function<bool(int32_t, float*)> embed,
-              const std::string& dump, std::string& err);
+              const std::string& dump, bool fp8, std::string& err);
     bool on() const { return runner_ != nullptr; }
     void begin_window(int64_t pos0) { if (tap_) tap_->begin_window(pos0); }
     void invalidate() { if (tap_) tap_->invalidate(); }
@@ -190,7 +193,7 @@ public:
     /// Run row `t`'s selection in target layer `layer`: n cells (device), or n < 0 for every position up to the row.
     void selection(int layer, int t, const int32_t* cells, int n, void* stream) { if (tap_ && row0_ >= 0) tap_->selection(layer, row0_ + t, cells, n, stream); }
     /// `cache`: the session's per-layer cache rows. A block is made only where the tap holds the row before `pos`.
-    model::Result draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint16_t*>& cache, void* stream);
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint8_t*>& cache, void* stream);
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream);
 
 private:
@@ -204,6 +207,7 @@ private:
     std::function<bool(int32_t, float*)> embed_;
     std::string dump_;
     int64_t ctx_ = 0;
+    bool fp8_ = false;
 };
 
 /// The drafts of a block in order, `step(j, previous)` giving draft j after the token before it (the anchor first). The

@@ -5,6 +5,7 @@
 // synchronises).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace basalt::models::hy4flash {
