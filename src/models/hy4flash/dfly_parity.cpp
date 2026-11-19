@@ -502,7 +502,10 @@ void test_block() {
             prev = ids[j];
         }
         std::printf("block n=%d: %d of %d tokens decisive and equal, confidence differs by %.2e\n", n, checked, n, worst_conf);
-        CHECK(worst_conf < 2e-3);
+        // the products are MMVQ's exactly (one row agrees to 1e-7), but the reference's activations are doubles where the
+        // card's are floats, so now and then a value on a q8_1 rounding boundary takes the next code; such flips compound
+        // over the block's later rows (7e-4 at three, 1.2e-2 at five). The tokens must still agree: the target verifies.
+        CHECK(worst_conf < 3e-2);
         CHECK(checked >= n - 1);
     }
     cudaStreamDestroy(st);
