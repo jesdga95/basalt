@@ -264,7 +264,7 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
 DflyRunner::~DflyRunner() = default;
 
 bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const uint16_t* const* cache, void* stream,
-                       std::string& err) {
+                       std::string& err, int64_t rope_pos) {
     Impl& p = *p_;
     const DflyDims& d = p.d;
     const DflyWeights& w = *p.w;
@@ -335,8 +335,10 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             p.mm(L.q_b, p.qan, d.q_lora, p.q, H * QW, d.q_lora, H * QW, R, st);
             p.mm(L.kv_a, p.xn, E, p.kvraw, kDflyRowWidth, E, kDflyRowWidth, R, st);
             dfly_absorb_k(L.kv_b, p.q, H * QW, QW, R, H, p.qabs, st);
-            // the block's rows land after the selected ones: cell pos + r of this base is row nctx + r of ctx
-            mla_prepare(p.q, p.qabs, p.kvraw, L.kv_a_ln, a, (int) pos, R, 0, p.qcur, p.ctx + ((int64_t) nctx - pos) * kDflyRowWidth, st);
+            // the block's rows land after the selected ones, turned by their rotary positions: position rp + r of this base is
+            // row nctx + r of ctx
+            const int64_t rp = rope_pos < 0 ? pos : rope_pos;
+            mla_prepare(p.q, p.qabs, p.kvraw, L.kv_a_ln, a, (int) rp, R, 0, p.qcur, p.ctx + ((int64_t) nctx - rp) * kDflyRowWidth, st);
             RowSpans rs;
             rs.firsts = p.meta_d + i * 16;
             rs.counts = p.meta_d + i * 16 + 8;
@@ -453,7 +455,8 @@ bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16
     return runner_ != nullptr;
 }
 
-model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint16_t*>& cache, void* stream) {
+model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint16_t*>& cache, void* stream,
+                                    int64_t rope_pos) {
     if (!runner_) return {model::Status::NotImplemented, "hy4flash: the pack has no drafter, or --spec is 0"};
     pending_ = 0;
     const int row = tap_->source_row(pos);
@@ -462,7 +465,7 @@ model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const st
     for (int i = 0; i < w_->dims.layers; ++i) caches[i] = cache[(size_t) w_->dims.kv_layers[(size_t) i]];
     n = std::clamp(n, 1, kDflyDrafts);
     std::string err;
-    if (!runner_->begin(anchor, pos, n, *tap_, row, caches, stream, err)) return {model::Status::Error, "hy4flash: " + err};
+    if (!runner_->begin(anchor, pos, n, *tap_, row, caches, stream, err, rope_pos)) return {model::Status::Error, "hy4flash: " + err};
     pending_ = n;
     if (!dump_.empty() && dumped_ < 200) {   // --diag-dump: this block's inputs, for a comparison with a reference
         ++dumped_;
