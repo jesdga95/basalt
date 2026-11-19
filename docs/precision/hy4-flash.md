@@ -53,7 +53,16 @@ A decode row's arithmetic does not depend on how many rows share its window.
   even, saturating. A code times its power-of-two scale is exact in BF16 and in fp16, so every reader decodes the row exactly:
   decode attention in fp32, prompt attention's tensor cores in fp16, the drafter's gather into its fp16 scratch. The window
   rings and the pooled keys stay fp16.
-- `--kv fp8` has no score of its own against BF16 here. Needles in a 253,410-token prompt are found with both formats.
+- **`--kv fp8` against BF16:** mean KLD 0.2046, top-1 86.04%, PPL 17.4371 over the 100 chunks (`--expert-cache 4800`, T 1,
+  25,500 rows). The default's fp16 rows score mean KLD 0.2003, top-1 85.87% and PPL 17.4934 on the same tier size, so the
+  format costs 0.0043 KLD and a heavier tail (p99 3.21 against 3.01, max 23.3 against 20.8) while top-1 and PPL do not move
+  beyond their spread. It halves the cache: 8.6 KB a position against 14.6, and 8.4 GiB against 14.3 at 256K. The default stays
+  fp16, the format the BF16 reference kept; `--kv fp8` is the memory choice. The summary's 0.201 mean KLD for the pack was
+  measured before this comparison and without a pinned tier; the fp16 rows here land within 0.001 of it.
+- Needles in a 253,410-token prompt are found with both formats.
+- Pin the tier when comparing formats: this model declares no `quality_flags` for the gate, so pass `--expert-cache N` (and the
+  same count) to both runs. Without it the freer VRAM of fp8 moves experts onto the card and the two runs are not comparable: an
+  unpinned pair reads 0.2085 against 0.2030, the opposite sign to the pinned one.
 
 ## Experts and placement
 
