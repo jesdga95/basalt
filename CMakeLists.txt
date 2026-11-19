@@ -205,6 +205,7 @@ add_library(model_hy4flash STATIC src/models/hy4flash/adapter.cpp src/models/hy4
   src/models/hy4flash/vision.cpp src/models/hy4flash/vision_encoder.cpp)
 target_include_directories(model_hy4flash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_hy4flash PUBLIC model tokenizer hy4flash_kernels expert_tier tiers mmq peer_share kernels core vision_cuda ${_gpu_runtime_target})
+target_link_libraries(model_hy4flash PRIVATE engine_session)
 # the DFly2 drafter (src/models/hy4flash/dfly*)
 add_library(hy4flash_dfly_kernels STATIC src/models/hy4flash/dfly_kernels.cu)
 target_include_directories(hy4flash_dfly_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
