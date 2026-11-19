@@ -178,10 +178,6 @@ public:
     /// `fetched`); their VRAM tier copies follow off the token path. How many the main card's link started; `await_fetch`
     /// makes `main` wait for them.
     int fetch(int layer, Lookup& lk);
-    /// fetch with the model's count: `bus` of the pinned misses go over the bus (and the second card's link, as fetch shares
-    /// them), any pinned miss whether it earned a slot or not; the CPU computes the rest. A decode window sizes it with
-    /// prefill::cpu_take.
-    int fetch(int layer, Lookup& lk, int bus);
     void await_fetch(cudaStream_t main);
     /// Queues the pinned misses the CPU computed that missed before within kPromoteWindow tokens for a copy into the
     /// VRAM tier (side stream, off the token path, in pieces).
