@@ -1296,6 +1296,189 @@ int check_q8k_quant() {
     return failures;
 }
 
+// MXFP4 down experts at the deepseek41 expert geometry (n_embd 5120, n_ff 2304 - the shape of DeepSeek-V4.1-Flash's
+// MXFP4 layers), the CPU tier only:
+//  (1) the dequantizer bit for bit against the format's own definition (e2m1 x 2^(e-128), all 255 scale exponents
+//      and every code);
+//  (2) ggml_vec_dot_mxfp4_q8_0 (both ISA builds) for block counts that run the two-block SIMD loop and its scalar
+//      tail: against ggml's scalar fallback (the same integer sums - float order only) and against a double
+//      reference of the dequantized weights against the dequantized Q8_0 activation;
+//  (3) one native expert with IQ2_XXS gate/up and MXFP4 down (native_gu_rows / native_down_rows / the tier's
+//      quantizers) against a double expert over ggml's dequantize_row_mxfp4 / dequantize_row_iq2_xxs weights:
+//      3e-2 with the raw x and h (every format's activation rounding) and 1e-5 for the down rows against the
+//      double expert on the CPU's own Q8_0-rounded h.
+int check_mxfp4(int gu, int seed) {
+    constexpr int64_t HD = 5120, FD = 2304;
+    int failures = 0;
+    cpu::NativeFmt f;
+    std::string err;
+    if (!cpu::native_fmt(gu, GGML_TYPE_MXFP4, HD, FD, f, err)) {
+        std::printf("mxfp4: %s\n", err.c_str());
+        return 1;
+    }
+    const auto* tm = ggml_get_type_traits(GGML_TYPE_MXFP4);
+    const auto* tg = ggml_get_type_traits((ggml_type) gu);
+    if (tm == nullptr || tg == nullptr || f.gu_act != GGML_TYPE_Q8_K) {
+        std::printf("mxfp4: gate %s must be a Q8_K-activation format with a dequantizer\n",
+                    ggml_type_name((ggml_type) gu));
+        return 1;
+    }
+    // (1) dequantization, bit for bit, from the format definition: value = e2m1[c] x 2^(e - 127), the E8M0 scale;
+    // exact in fp32 (the e2m1 values are a small integer times a power of two)
+    {
+        static const int kE2M1x2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};   // doubled e2m1
+        std::mt19937 rng(4000 + seed);
+        std::vector<uint8_t> blocks(255 * 17);
+        for (int e = 0; e < 255; ++e) {   // 255 is the scale's NaN, as in engram_rows_test
+            blocks[(size_t) e * 17] = (uint8_t) e;
+            for (int j = 0; j < 16; ++j) blocks[(size_t) e * 17 + 1 + j] = (uint8_t) rng();
+        }
+        std::vector<float> got(255 * 32), want(255 * 32);
+        tm->to_float(blocks.data(), got.data(), 255 * 32);
+        for (int e = 0; e < 255; ++e) {
+            const double d = std::ldexp(1.0, e - 128);   // 2^(e - 128) on the doubled table
+            for (int j = 0; j < 32; ++j) {
+                const uint8_t byte = blocks[(size_t) e * 17 + 1 + (j % 16)];
+                const int c = j < 16 ? (byte & 0xf) : (byte >> 4);
+                want[(size_t) e * 32 + j] = (float) ((double) kE2M1x2[c] * d);
+            }
+        }
+        size_t differ = 0;
+        for (size_t i = 0; i < want.size(); ++i) differ += std::memcmp(&got[i], &want[i], 4) != 0;
+        std::printf("mxfp4 dequant: %zu of %zu values (all exponents 0..254, random codes) differ from the "
+                    "definition  %s\n", differ, want.size(), differ ? "FAIL" : "bitwise ok");
+        if (differ) ++failures;
+    }
+    // (2) the dot itself: several block counts x several rows, both ISA builds, ggml's scalar fallback and a
+    // double reference on the dequantized weights and the dequantized Q8_0 activation
+    {
+        const ggml_type_traits_cpu* isa[2] = {ggml_get_type_traits_cpu_avx2(GGML_TYPE_MXFP4),
+                                              cpu::cpu_avx512_ok() ? ggml_get_type_traits_cpu_avx512(GGML_TYPE_MXFP4)
+                                                                   : nullptr};
+        const char* isan[2] = {"avx2", "avx512"};
+        std::mt19937 rng(500 + seed);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        constexpr int kRows = 8;
+        for (int i = 0; i < 2; ++i) {
+            if (isa[i] == nullptr) { std::printf("mxfp4 %-6s dot: not on this CPU\n", isan[i]); continue; }
+            double worst_dbl = 0.0;
+            std::vector<float> gots, refs_v;
+            for (int nb : {1, 2, 3, 5, 17, 72}) {   // odd counts end in the scalar tail of the last block
+                const int n = nb * 32;
+                const size_t rb = ggml_row_size(GGML_TYPE_MXFP4, n);
+                std::vector<uint8_t> w((size_t) kRows * rb);
+                for (auto& b : w) b = (uint8_t) rng();
+                for (int r = 0; r < kRows; ++r)   // sane scale exponents (2^-11 .. 2^-4)
+                    for (int blk = 0; blk < nb; ++blk) w[(size_t) r * rb + (size_t) blk * 17] = (uint8_t) (116 + rng() % 8);
+                std::vector<float> x((size_t) n), wd((size_t) n);
+                for (auto& v : x) v = nd(rng);
+                std::vector<uint8_t> xq(ggml_row_size(GGML_TYPE_Q8_0, n));
+                ggml_quantize_chunk(GGML_TYPE_Q8_0, x.data(), xq.data(), 0, 1, n);
+                std::vector<float> xqf((size_t) n);
+                ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(xq.data(), xqf.data(), n);
+                for (int r = 0; r < kRows; ++r) {
+                    const uint8_t* row = w.data() + (size_t) r * ggml_row_size(GGML_TYPE_MXFP4, n);
+                    tm->to_float(row, wd.data(), n);
+                    float got = 0.f, refs = 0.f;
+                    isa[i]->vec_dot(n, &got, 0, row, 0, xq.data(), 0, 1);
+                    ggml_vec_dot_mxfp4_q8_0_ref(n, &refs, row, xq.data());
+                    double want = 0.0, mag = 0.0;
+                    for (int j = 0; j < n; ++j) {
+                        const double t = (double) wd[(size_t) j] * xqf[(size_t) j];
+                        want += t;
+                        mag += std::fabs(t);
+                    }
+                    worst_dbl = std::max(worst_dbl, std::fabs((double) got - want) / (mag + 1e-30));
+                    gots.push_back(got);
+                    refs_v.push_back(refs);
+                }
+            }
+            const double e_ref = rel(gots, refs_v);   // float order only: the SIMD keeps its block sums in lanes
+            const bool ok = e_ref < 1e-6 && worst_dbl < 1e-5;
+            std::printf("mxfp4 %-6s dot, %zu dots at 1..72 blocks: vs ggml's scalar fallback %.2e, vs double on the "
+                        "dequantized row and Q8_0 act %.2e  %s\n", isan[i], gots.size(), e_ref, worst_dbl,
+                        ok ? "ok" : "FAIL");
+            if (!ok) ++failures;
+        }
+    }
+    // (3) the native expert: IQ2_XXS (or IQ3_XXS) gate/up, MXFP4 down, at the model's geometry
+    {
+        std::mt19937 rng(900 + seed);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<uint8_t> blob(f.bytes);
+        for (auto& b : blob) b = (uint8_t) rng();   // random IQ2_XXS / MXFP4 rows are all valid...
+        for (int64_t r = 0; r < FD; ++r)            // ...but the gates' scales: finite halves where the block's d sits
+            for (int64_t blk = 0; blk < HD / 256; ++blk) {
+                const ggml_fp16_t d = ggml_fp32_to_fp16(((float) (rng() % 64) - 32.f) / 4096.f);
+                const size_t at = (size_t) r * f.gu_row + (size_t) blk * (f.gu_row / (HD / 256));
+                std::memcpy(blob.data() + at, &d, 2);
+                std::memcpy(blob.data() + f.up_off + at, &d, 2);
+            }
+        for (int64_t r = 0; r < HD; ++r)   // down: sane MXFP4 scale exponents (2^-10 .. 2^-3)
+            for (int64_t blk = 0; blk < FD / 32; ++blk)
+                blob[f.down_off + (size_t) r * f.d_row + (size_t) blk * 17] = (uint8_t) (117 + rng() % 8);
+        const int NT2 = 2;
+        std::vector<float> x((size_t) NT2 * HD);
+        for (auto& v : x) v = nd(rng);
+        std::vector<std::vector<uint8_t>> act(NT2, std::vector<uint8_t>(cpu::kNativeActBytes));
+        std::vector<std::vector<uint8_t>> hq(NT2, std::vector<uint8_t>(cpu::kNativeHBytes));
+        std::vector<std::vector<float>> ff(NT2, std::vector<float>(FD));
+        std::vector<float> got((size_t) NT2 * HD), ref((size_t) NT2 * HD), ref_q((size_t) NT2 * HD);
+        const void* a[NT2];
+        const void* hp[NT2];
+        float* ffp[NT2];
+        float* op[NT2];
+        for (int k = 0; k < NT2; ++k) {
+            cpu::native_quant_act(f, x.data() + (size_t) k * HD, act[k].data());
+            a[k] = act[k].data();
+            ffp[k] = ff[k].data();
+            hp[k] = hq[k].data();
+            op[k] = got.data() + (size_t) k * HD;
+        }
+        cpu::native_gu_rows(f, blob.data(), a, NT2, ffp, 0, (int) FD);
+        for (int k = 0; k < NT2; ++k) cpu::native_quant_h(f, ff[k].data(), hq[k].data());
+        cpu::native_down_rows(f, blob.data(), hp, NT2, op, 0, (int) HD);
+        std::vector<float> G((size_t) FD * HD), U((size_t) FD * HD), D((size_t) HD * FD);
+        for (int64_t r = 0; r < FD; ++r) {
+            tg->to_float(blob.data() + (size_t) r * f.gu_row, G.data() + (size_t) r * HD, HD);
+            tg->to_float(blob.data() + f.up_off + (size_t) r * f.gu_row, U.data() + (size_t) r * HD, HD);
+        }
+        for (int64_t r = 0; r < HD; ++r)
+            tm->to_float(blob.data() + f.down_off + (size_t) r * f.d_row, D.data() + (size_t) r * FD, FD);
+        std::vector<float> hd((size_t) FD);
+        for (int k = 0; k < NT2; ++k) {
+            std::vector<float> h(FD);
+            for (int64_t r = 0; r < FD; ++r) {
+                double g = 0, u = 0;
+                for (int64_t i = 0; i < HD; ++i) {
+                    g += (double) G[(size_t) r * HD + i] * x[(size_t) k * HD + i];
+                    u += (double) U[(size_t) r * HD + i] * x[(size_t) k * HD + i];
+                }
+                h[r] = (float) (g / (1.0 + std::exp(-g)) * u);
+            }
+            for (int64_t r = 0; r < HD; ++r) {
+                double o = 0;
+                for (int64_t i = 0; i < FD; ++i) o += (double) D[(size_t) r * FD + i] * h[i];
+                ref[(size_t) k * HD + r] = (float) o;
+            }
+            // the down rows against the double expert on the CPU's own h, rounded as the tier rounds it (Q8_0):
+            // only float order is left
+            ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(hq[k].data(), hd.data(), FD);
+            for (int64_t r = 0; r < HD; ++r) {
+                double o = 0;
+                for (int64_t i = 0; i < FD; ++i) o += (double) D[(size_t) r * FD + i] * hd[i];
+                ref_q[(size_t) k * HD + r] = (float) o;
+            }
+        }
+        const double e = rel(got, ref), eq = rel(got, ref_q);
+        const bool ok = e < 3e-2 && eq < 1e-5 && std::isfinite(e);
+        std::printf("%s/mxfp4 at %lld x %lld blob %8zu  cpu rel %.2e (down vs its own q8_0 h: %.2e)  %s\n",
+                    ggml_type_name((ggml_type) gu), (long long) HD, (long long) FD, f.bytes, e, eq, ok ? "ok" : "FAIL");
+        if (!ok) ++failures;
+    }
+    return failures;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1304,6 +1487,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: native_expert_parity <shard.gguf> [layer ...]\n"
                              "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
                              "       native_expert_parity --cpu-synthetic GU/DOWN ...   (CPU tier only, e.g. q6_K/q8_0)\n"
+                             "       native_expert_parity --mxfp4 [GU]   (MXFP4 down at the deepseek41 geometry, CPU tier only)\n"
                              "       native_expert_parity --experts experts.bin|MODEL.basalt [layer ...]   (NVFP4)\n"
                              "       native_expert_parity --q5_1-min\n"
                              "       native_expert_parity --q8k-quant\n"
@@ -1321,6 +1505,10 @@ int main(int argc, char** argv) {
     const std::string mode = argv[1];
     if (mode == "--q8k-quant") {
         failures += check_q8k_quant();
+    } else if (mode == "--mxfp4") {
+        const int gu = argc > 2 ? type_of(argv[2]) : type_of("iq2_XXS");
+        if (gu < 0) { std::printf("%s: not a gate type name\n", argc > 2 ? argv[2] : "?"); return 2; }
+        failures += check_mxfp4(gu, 1);
     } else if (mode == "--q5_1-min") {
         failures += check_q5_1_min(gpu());
     } else if (mode == "--bf16-embd") {
