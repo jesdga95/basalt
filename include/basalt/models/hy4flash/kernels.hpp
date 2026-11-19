@@ -126,7 +126,19 @@ void weighted_sum_window(const float* const* rows, const float* w, int n_tok, in
 
 /// h[r][k] = silu(min(gu[r][k], limit)) * clamp(gu[r][n_ff + k], -limit, limit) for rows of 2 * n_ff values (the gate rows' products
 /// then the up rows').
-void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, float limit, void* stream);
+/// The per-expert FP32 scales an NVFP4 blob ends with ({s_gate, s_up, s_down, 0} at blob + tail_off), for the rows of n experts
+/// staged `stride` bytes apart from `blobs`: expert q's rows are [bounds[q], bounds[q + 1]) (device). MMQ's NVFP4 products
+/// leave these scales out (DeepSeek's prompt path applies them the same way).
+struct ExpertTails {
+    const uint8_t* blobs = nullptr;
+    size_t stride = 0, tail_off = 0;
+    const int32_t* bounds = nullptr;
+    int n = 0;
+};
+/// With `tails`, gate and up are first times row r's expert's s_gate and s_up (before the clamp), and h times its s_down, so
+/// the down product's output carries s_down.
+void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, float limit, void* stream,
+                          const ExpertTails* tails = nullptr);
 /// out[t][i] = sum_k w[t * K + k] * rows[map[t * K + k]][i] for k < K, in that order.
 void weighted_sum_tokens(const float* rows, const int32_t* map, const float* w, int n_tok, int K, int n, float* out, void* stream);
 

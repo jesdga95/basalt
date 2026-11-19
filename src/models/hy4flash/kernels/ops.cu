@@ -68,12 +68,25 @@ __global__ void put_words_kernel(const PutWords s, int* dst, int n) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = s.w[i];
 }
 
-__global__ void swiglu_split_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int n_ff, float limit) {
+template <bool TAILS>
+__global__ void swiglu_split_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int n_ff, float limit,
+                                    ExpertTails t) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * n_ff) return;
     const int64_t r = i / n_ff, k = i - r * n_ff;
-    const float g = fminf(gu[r * 2 * n_ff + k], limit), u = fminf(fmaxf(gu[r * 2 * n_ff + n_ff + k], -limit), limit);
-    h[i] = g / (1.f + expf(-g)) * u;
+    float g = gu[r * 2 * n_ff + k], u = gu[r * 2 * n_ff + n_ff + k], sd = 1.f;
+    if constexpr (TAILS) {
+        int q = 0;   // the row's expert: the last q with bounds[q] <= r
+        while (q + 1 < t.n && t.bounds[q + 1] <= r) ++q;
+        const float* s = (const float*) (t.blobs + (size_t) q * t.stride + t.tail_off);
+        g *= s[0];
+        u *= s[1];
+        sd = s[2];
+    }
+    g = fminf(g, limit);
+    u = fminf(fmaxf(u, -limit), limit);
+    if constexpr (TAILS) h[i] = g / (1.f + expf(-g)) * u * sd;
+    else h[i] = g / (1.f + expf(-g)) * u;
 }
 
 __global__ void wsum_tokens_kernel(const float* __restrict__ rows, const int32_t* __restrict__ map, const float* __restrict__ w, int K, int n,
@@ -165,9 +178,11 @@ void put_words(const void* src, void* dst, int n_words, void* stream) {
     put_words_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(s, (int*) dst, n_words);
 }
 
-void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, float limit, void* stream) {
+void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, float limit, void* stream, const ExpertTails* tails) {
     if (rows <= 0) return;
-    swiglu_split_kernel<<<(unsigned) ((rows * n_ff + 255) / 256), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, limit);
+    const unsigned blocks = (unsigned) ((rows * n_ff + 255) / 256);
+    if (tails && tails->n > 0) swiglu_split_kernel<true><<<blocks, 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, limit, *tails);
+    else swiglu_split_kernel<false><<<blocks, 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, limit, ExpertTails{});
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
