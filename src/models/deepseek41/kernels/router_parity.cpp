@@ -22,7 +22,9 @@ struct Ref {
     std::vector<double> w;
 };
 
-Ref reference(const float* x, const std::vector<float>& gate, const std::vector<float>& bias, float scale) {
+// held/prior: --route-prior, the held experts chosen on their biased score plus prior
+Ref reference(const float* x, const std::vector<float>& gate, const std::vector<float>& bias, float scale,
+              const std::vector<int32_t>* held = nullptr, double prior = 0) {
     Ref r;
     r.logits.resize(NE);
     r.biased.resize(NE);
@@ -32,7 +34,8 @@ Ref reference(const float* x, const std::vector<float>& gate, const std::vector<
         for (int d = 0; d < ND; ++d) acc += (double) gate[(size_t) e * ND + d] * (double) x[d];
         r.logits[e] = acc;
         s[e] = std::sqrt(std::log1p(std::exp(acc)));
-        r.biased[e] = s[e] + (double) bias[e];
+        const bool bonus = held && (*held)[(size_t) e] >= 0;
+        r.biased[e] = s[e] + (double) bias[e] + (bonus ? prior : 0.0);
     }
     std::vector<int> idx(NE);
     std::iota(idx.begin(), idx.end(), 0);
@@ -135,6 +138,42 @@ int main(int argc, char** argv) {
         Out o = run(gate, tb, xs, 1, a);
         std::printf("tie: top ids %d %d\n", o.ids[0], o.ids[1]);
         v.expect(o.ids[0] == 77 && o.ids[1] == 201, "tie did not resolve to the lower index first");
+    }
+
+    // ---- --route-prior: with no expert held, or every one, the selection is the plain router's, bit for bit; with a held
+    // table the held experts are chosen on their biased score plus prior and every weight stays the unbiased score's,
+    // normalised over the picks
+    {
+        std::vector<int32_t> none(NE, -1), every(NE, 0), some(NE, -1);
+        for (int e = 0; e < NE; e += 3) some[(size_t) e] = e;
+        Dev<int32_t> dn(none), de(every), ds(some);
+        bool same = true;
+        for (const Dev<int32_t>* t : {&dn, &de}) {
+            RouterArgs p = a;
+            p.prior = 0.25f;
+            p.held.add(t->p);
+            Out o = run(gate, bias, x_h, Tmax, p);
+            same = same && o.ids == all.ids && !std::memcmp(o.w.data(), all.w.data(), o.w.size() * 4);
+        }
+        std::printf("route-prior, nothing or everything held: %s\n", same ? "bitwise the plain router" : "DIFFERS");
+        v.expect(same, "route-prior with nothing or everything held changes the router");
+        RouterArgs q = a;
+        q.prior = 0.25f;
+        q.held.add(ds.p);
+        Out o = run(gate, bias, x_h, Tmax, q);
+        int bad = 0, moved = 0;
+        double worst = 0;
+        for (int t = 0; t < Tmax; ++t) {
+            Ref r = reference(&x_h[(size_t) t * ND], gate_h, bias_h, a.weight_scale, &some, 0.25);
+            for (int k = 0; k < K; ++k) {
+                bad += o.ids[(size_t) t * K + k] != r.ids[k];
+                moved += o.ids[(size_t) t * K + k] != all.ids[(size_t) t * K + k];
+                worst = std::max(worst, std::fabs(o.w[(size_t) t * K + k] - r.w[k]) / r.w[k]);
+            }
+        }
+        std::printf("route-prior 0.25, a third held: %d ids differ from the reference, %d changed by the bias, weights max rel %.3g\n",
+                    bad, moved, worst);
+        v.expect(bad == 0 && moved > 0 && worst < 1e-4, "route-prior against the reference");
     }
 
     // ---- frozen: the ids and weights of many tokens hash to the bits of the kernel the selection replaced, here and

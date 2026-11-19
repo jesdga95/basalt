@@ -5,6 +5,8 @@
 // on T or on the token's place in the window. `stream` may be null (the call then synchronises).
 #pragma once
 
+#include "basalt/kernels/route_lossy.hpp"
+
 #include <cstdint>
 
 namespace basalt::kernels {
@@ -17,6 +19,10 @@ struct RouterArgs {
     int k = 6;                        ///< at most 16
     float weight_scale = 1.5f;        ///< multiplies the normalised weights
     RouterGate gate = RouterGate::SqrtSoftplus;
+    /// --route-prior (opt-in, changes the output): above 0, an expert `held` holds is chosen on s + bias + `prior`; the
+    /// weights stay the unbiased s of the chosen, normalised as above.  0 = the plain router, bit for bit.
+    float prior = 0.0f;
+    ResidentTabs held;
 };
 
 /// logits = gate . x (fp32, gate row-major [n_expert][n_embd]); s = the gate function of the logit; the top-k of s + bias

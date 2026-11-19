@@ -161,12 +161,15 @@ struct SelectScratch {
 // equal and a lower index); ranks below k are the selection, in rank order. The k-th largest warp maximum bounds the
 // k-th score from below (k distinct experts reach it), so only experts at or above it can rank below k, and they are
 // ranked among themselves.
+// kPrior (--route-prior): the experts `held` holds gain `prior` on the score the rank is taken from; their weights stay s.
+template <bool kPrior>
 __device__ void router_select_token(const float* __restrict__ logits, const float* __restrict__ bias, int n_expert,
                                     int k, float scale, int gate, int32_t* __restrict__ ids, float* __restrict__ weights,
-                                    SelectScratch& sh) {
+                                    SelectScratch& sh, const ResidentTabs& held, float prior) {
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5, nw = n_expert >> 5;
     const float s = score(logits[e], gate);
-    const float b = s + bias[e];
+    float b = s + bias[e];
+    if (kPrior && held.held(e)) b += prior;
     float m = b;
 #pragma unroll
     for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
@@ -208,12 +211,14 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
     }
 }
 
+template <bool kPrior>
 __global__ void router_select_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int n_expert,
-                                     int k, float scale, int gate, int32_t* __restrict__ ids, float* __restrict__ weights) {
+                                     int k, float scale, int gate, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                     ResidentTabs held, float prior) {
     __shared__ SelectScratch sh;
     const int t = blockIdx.x;
-    router_select_token(logits + (size_t) t * n_expert, bias, n_expert, k, scale, gate, ids + (size_t) t * k,
-                        weights + (size_t) t * k, sh);
+    router_select_token<kPrior>(logits + (size_t) t * n_expert, bias, n_expert, k, scale, gate, ids + (size_t) t * k,
+                                weights + (size_t) t * k, sh, held, prior);
 }
 
 }  // namespace
@@ -237,7 +242,12 @@ void router(const float* x, const float* gate, const float* bias, int n_tokens, 
         router_logits_kernel<<<dim3(a.n_expert, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
             x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
     }
-    router_select_kernel<<<n_tokens, a.n_expert, 0, st>>>(logits, bias, a.n_expert, a.k, a.weight_scale, (int) a.gate, ids, weights);
+    if (a.prior > 0.0f && a.held.n > 0)
+        router_select_kernel<true><<<n_tokens, a.n_expert, 0, st>>>(logits, bias, a.n_expert, a.k, a.weight_scale, (int) a.gate, ids,
+                                                                    weights, a.held, a.prior);
+    else
+        router_select_kernel<false><<<n_tokens, a.n_expert, 0, st>>>(logits, bias, a.n_expert, a.k, a.weight_scale, (int) a.gate, ids,
+                                                                     weights, a.held, 0.0f);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
