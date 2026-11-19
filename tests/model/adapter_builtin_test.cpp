@@ -47,6 +47,14 @@ int main() {
 #else
     expect("qwen35", false);
 #endif
+#ifdef BASALT_MODEL_HY4FLASH
+    expect("hy4flash", true);
+    // and under the architecture its test pack (made from the AngelSlim GGUF) carries
+    check(model::find_adapter("hy_v4_flash") != nullptr, "hy4flash also answers to hy_v4_flash");
+    ++built;
+#else
+    expect("hy4flash", false);
+#endif
     check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
         model::Started started;
