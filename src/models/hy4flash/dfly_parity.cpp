@@ -366,6 +366,10 @@ void test_block() {
         }
     }
     Mat head = rand_mat((uint64_t) d.vocab, (uint64_t) E, 2.0f / std::sqrt((float) E));
+    head.q8.resize((size_t) d.vocab * E / 32 * 34);   // the drafts' head, as the loader rounds it (core::Conv::Bf16ToQ8_0)
+    basalt::core::quantize_bf16_q8_0(head.bits.data(), head.bits.size(), head.q8.data());
+    CHECK(w.allocate_head(d.vocab, E, err));
+    cudaMemcpy(const_cast<void*>(w.head_q8), head.q8.data(), head.q8.size(), cudaMemcpyHostToDevice);
     std::vector<float> embed((size_t) d.vocab * E);
     for (float& x : embed) x = gauss(1.f);
     Ref r2{d, std::move(rm), std::move(rf), embed, head};
