@@ -9,6 +9,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -152,6 +154,83 @@ void conversions(const TestFile& f) {
         }
         check(ok, "converted elements");
     }
+}
+
+// bf16 -> block_q8_0 over several of a conversion's pieces, to host and to device memory, against ggml's reference rule
+void q8_0_blocks() {
+    const uint64_t n = (5ull << 20) + 96;   // elements, whole blocks; three 4 MiB pieces and a tail
+    const uint64_t off = 4098;
+    std::vector<uint16_t> vals(n);
+    std::mt19937 rng(11);
+    std::normal_distribution<float> g(0.f, 0.02f);
+    for (uint64_t i = 0; i < n; ++i) {
+        const float x = i % 4096 < 32 ? 0.f : g(rng);   // an all-zero block too
+        uint32_t u;
+        std::memcpy(&u, &x, 4);
+        vals[i] = (uint16_t) (u >> 16);
+    }
+    const std::string path = (std::filesystem::current_path() / "loader_q8_test.bin").string();
+    {
+        std::vector<uint8_t> pad(off, 0x5a);
+        std::FILE* fp = basalt::platform::open_file_utf8(path, "wb");
+        std::fwrite(pad.data(), 1, pad.size(), fp);
+        std::fwrite(vals.data(), 2, vals.size(), fp);
+        std::fclose(fp);
+    }
+    std::vector<uint8_t> want(n / 32 * 34);
+    for (uint64_t b = 0; b < n / 32; ++b) {   // ggml's quantize_row_q8_0_ref
+        float amax = 0.f, x[32];
+        for (int i = 0; i < 32; ++i) {
+            const uint32_t u = (uint32_t) vals[b * 32 + i] << 16;
+            std::memcpy(&x[i], &u, 4);
+            amax = std::max(amax, std::fabs(x[i]));
+        }
+        const float d = amax / 127.f, id = d ? 1.f / d : 0.f;
+        const uint16_t dh = basalt::kernels::f16_from_f32(d);
+        std::memcpy(&want[b * 34], &dh, 2);
+        for (int i = 0; i < 32; ++i) want[b * 34 + 2 + i] = (uint8_t) (int8_t) roundf(x[i] * id);
+    }
+    check(conv_out_bytes(Conv::Bf16ToQ8_0, n * 2) == want.size(), "q8_0 output bytes");
+    for (const bool to_dev : {false, true}) {
+        if (to_dev && !has_device()) continue;
+        std::vector<uint8_t> got(want.size());
+        void* dev = nullptr;
+        if (to_dev && cudaMalloc(&dev, got.size()) != cudaSuccess) {
+            check(false, "q8_0 device buffer");
+            continue;
+        }
+        LoadPlan plan;
+        LoadItem it;
+        it.file = plan.file(path);
+        it.off = off;
+        it.bytes = n * 2;
+        if (to_dev) it.dev = dev;
+        else it.host = got.data();
+        it.conv = Conv::Bf16ToQ8_0;
+        plan.add(it);
+        Loader loader;
+        std::string err;
+        check(loader.run(plan, err), "q8_0 run");
+        if (to_dev) {
+            cudaMemcpy(got.data(), dev, got.size(), cudaMemcpyDeviceToHost);
+            cudaFree(dev);
+        }
+        check(got == want, to_dev ? "q8_0 blocks on the device" : "q8_0 blocks in host memory");
+    }
+    {   // a range that is not whole blocks
+        std::vector<uint8_t> out(64);
+        LoadPlan plan;
+        LoadItem it;
+        it.file = plan.file(path);
+        it.bytes = 100;
+        it.host = out.data();
+        it.conv = Conv::Bf16ToQ8_0;
+        plan.add(it);
+        Loader loader;
+        std::string err;
+        check(!loader.run(plan, err), "a q8_0 range of partial blocks is refused");
+    }
+    std::filesystem::remove(path);
 }
 
 void errors(const TestFile& f) {
@@ -516,6 +595,7 @@ int main() {
     host_ranges(f, 8);
     coalescing(f);
     conversions(f);
+    q8_0_blocks();
     errors(f);
     host_aligned(f);
     adjacent_device_allocations();
