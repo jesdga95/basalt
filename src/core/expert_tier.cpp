@@ -1035,10 +1035,72 @@ void ExpertTier::promote(int layer, const Lookup& lk) {
     }
 }
 
+void ExpertTier::recall(int layer, int64_t lo, int64_t n) {
+    if (recall_.empty()) recall_.resize((size_t) n_layers_);
+    std::vector<int32_t>& r = recall_[(size_t) layer];
+    for (int64_t s = lo; s < lo + n; ++s) {
+        const int32_t o = owner_[(size_t) s];
+        if (o >= 0 && std::find(r.begin(), r.end(), o) == r.end()) r.push_back(o);
+    }
+    const size_t base = (size_t) layer * n_expert_;
+    std::stable_sort(r.begin(), r.end(), [&](int32_t a, int32_t b) { return stamp_[base + a] > stamp_[base + b]; });
+}
+
+bool ExpertTier::recalled() const {
+    for (const auto& r : recall_)
+        if (!r.empty()) return true;
+    return false;
+}
+
+void ExpertTier::restore(bool ranked_too) {
+    if (recall_.empty()) recall_.resize((size_t) n_layers_);
+    cudaDeviceSynchronize();   // a slot arena opened or mapped again is zeroed off the copy stream: the copies go after it
+    const int64_t nb = base_slots(), promoted = promoted_;
+    for (int l = 0; l < n_layers_; ++l) {
+        const int64_t lo = base_lo_[(size_t) l], xlo = nb + (int64_t) l * ext_per_layer_;
+        int64_t empty = 0;
+        for (int64_t s = lo; s < lo + live_n(l); ++s) empty += owner_[(size_t) s] < 0;
+        for (int64_t s = xlo; ext_per_layer_ && s < xlo + ext_per_layer_; ++s) empty += owner_[(size_t) s] < 0;
+        const auto held = [&](int e) {   // resident, or claimed and not landed yet
+            if (res_[(size_t) l * n_expert_ + e] >= 0) return true;
+            for (int64_t s = lo; s < lo + live_n(l); ++s)
+                if (owner_[(size_t) s] == e) return true;
+            for (int64_t s = xlo; ext_per_layer_ && s < xlo + ext_per_layer_; ++s)
+                if (owner_[(size_t) s] == e) return true;
+            return false;
+        };
+        const auto place = [&](int e) {
+            if (!pinned(l, e) || held(e)) return true;
+            ++tick_;
+            if (claim(l, e, blob_of(l, e), copy_stream_) < 0) {
+                if (const cudaError_t ce = cudaStreamSynchronize(copy_stream_); ce != cudaSuccess)
+                    basalt::log::error(s_.area.c_str(), "tier restore sync: %s", cudaGetErrorString(ce));
+                land_all();
+                ++tick_;
+                if (claim(l, e, blob_of(l, e), copy_stream_) < 0) return false;
+            }
+            --empty;
+            return true;
+        };
+        std::vector<int32_t>& r = recall_[(size_t) l];
+        size_t used = 0;
+        for (; used < r.size() && empty > 0; ++used)
+            if (!place(r[used])) break;
+        r.erase(r.begin(), r.begin() + (ptrdiff_t) used);
+        for (int k = 0; ranked_too && k < n_expert_ && empty > 0; ++k)
+            if (!place(ranked(l, k))) break;
+    }
+    if (const cudaError_t ce = cudaStreamSynchronize(copy_stream_); ce != cudaSuccess)
+        basalt::log::error(s_.area.c_str(), "tier restore sync: %s", cudaGetErrorString(ce));
+    land_all();
+    promoted_ = promoted;
+}
+
 void ExpertTier::shrink() {
     if (ext_per_layer_ == 0) return;
     settle();
     const int64_t nb = base_slots();
+    for (int l = 0; l < n_layers_; ++l) recall(l, nb + (int64_t) l * ext_per_layer_, ext_per_layer_);
     for (int64_t s = nb; s < (int64_t) owner_.size(); ++s) {
         const int32_t o = owner_[(size_t) s];
         if (o >= 0) res_[(size_t) ((s - nb) / ext_per_layer_) * n_expert_ + o] = -1;
@@ -1053,6 +1115,7 @@ void ExpertTier::lend_all() {
     shrink();
     if (lent_per_layer_ > 0 || !cache_.valid() || homes_.main > 0) return;
     settle();
+    for (int l = 0; l < n_layers_; ++l) recall(l, base_lo_[(size_t) l], live_n(l));
     std::fill(res_.begin(), res_.end(), -1);
     owner_.clear();
     busy_.clear();
@@ -1171,6 +1234,8 @@ void ExpertTier::keep_hottest(const std::vector<int64_t>& keep) {
             ++d;
         }
         // the rest past the kept slots leave the card
+        recall(l, lo + kept, live_n(l) - kept);
+        if (ext_per_layer_) recall(l, nb + (int64_t) l * ext_per_layer_, ext_per_layer_);
         auto drop = [&](int64_t s) {
             const int32_t o = owner_[(size_t) s];
             if (o >= 0 && res_[base + o] == (int32_t) s) res_[base + o] = -1;
@@ -1226,7 +1291,7 @@ bool ExpertTier::lend(uint64_t bytes) {
 // The slots a prompt borrowed come back at the size planned at the start, or as many as the card holds above the tier's
 // room and the reserve when what the prompt left (caches that grew) takes some of theirs; a later reclaim opens the
 // planned size again once it fits.
-bool ExpertTier::reclaim(std::string& err) {
+bool ExpertTier::reclaim(std::string& err, bool restore_lent) {
     if (partial_lend() && lent_per_layer_ == 0 && cache_.mapped_bytes() < cache_.full_bytes()) {   // a bounded lend: map the tail again
         uint64_t free_b = 0, total_b = 0;
         std::string why;
@@ -1244,6 +1309,7 @@ bool ExpertTier::reclaim(std::string& err) {
             basalt::log::warn(s_.area.c_str(), "VRAM expert tier takes back %.2f of its %.2f GiB lent (%lld MiB free)%s%s",
                               (double) (cache_.mapped_bytes() - mapped) / 1073741824.0, (double) lent / 1073741824.0, (long long) (free_b >> 20),
                               ok ? "" : ": ", e.c_str());
+        if (restore_lent) restore(false);
         return true;
     }
     if (lent_per_layer_ == 0) return true;
@@ -1261,6 +1327,7 @@ bool ExpertTier::reclaim(std::string& err) {
         return false;
     }
     if (!reopen_base(n, err)) return false;
+    if (restore_lent) restore(false);
     if (n < want)
         basalt::log::warn(s_.area.c_str(), "VRAM expert tier takes back %lld of its %lld slots per layer (%lld MiB free)", (long long) n,
                           (long long) want, (long long) (free_b >> 20));
@@ -1331,6 +1398,10 @@ void ExpertTier::grow() {
     basalt::log::info(s_.area.c_str(), "VRAM expert tier %lld of %d experts per layer (%lld beside the prompt workspaces)",
                  (long long) (per_layer_ + n), n_expert_, (long long) per_layer_);
     cudaDeviceSynchronize();   // the arena's zeroing is not ordered against the copy stream
+    if (recalled()) {   // what a shrink or lend took off the card goes back first
+        restore(true);
+        return;
+    }
     const int64_t promoted = promoted_;
     seed_copies(n);
     promoted_ = promoted;
