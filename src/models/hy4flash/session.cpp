@@ -1639,7 +1639,6 @@ private:
             err = "layer " + std::to_string(l) + "'s expert blob size does not match the layout";
             return false;
         }
-        cudaStream_t st = stream_;
         bk::RouterArgs ra;
         ra.n_expert = g_.n_expert;
         ra.n_embd = E;
