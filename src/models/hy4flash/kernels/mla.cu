@@ -277,21 +277,34 @@ __global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict
     float acc[8][4];
     for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
     const int nt = w & 3, kh = w >> 2, id = lane >> 3, r8 = lane & 7;
-    for (int j0 = 0; j0 < n; j0 += kMmaCells) {
+    // a thread's share of a tile, loaded a tile ahead: the next tile's reads are in flight while this one computes
+    constexpr int kPer = kMmaCells * (W / 8) / 256;
+    uint4 pre[kPer];
+    auto fetch = [&](int j0) {
         const int tn = min(kMmaCells, n - j0);
-        __syncthreads();
-        for (int i = tid; i < kMmaCells * (W / 8); i += 256) {
-            const int c = i / (W / 8), ch = i - c * (W / 8);
-            uint4 v = make_uint4(0, 0, 0, 0);
+#pragma unroll
+        for (int k = 0; k < kPer; ++k) {
+            const int i = tid + k * 256, c = i / (W / 8), ch = i - c * (W / 8);
+            pre[k] = make_uint4(0, 0, 0, 0);
             if (c < tn) {
                 const int j = j0 + c;
                 const int cell = cl ? cl[j] : ring ? (first + j) % ring : first + j;
-                v = *reinterpret_cast<const uint4*>(cache + (size_t) cell * W + ch * 8);
-                v = make_uint4(bf2_to_h2(v.x), bf2_to_h2(v.y), bf2_to_h2(v.z), bf2_to_h2(v.w));
+                pre[k] = *reinterpret_cast<const uint4*>(cache + (size_t) cell * W + ch * 8);
             }
-            *reinterpret_cast<uint4*>(ks + c * kLd + ch * 8) = v;
+        }
+    };
+    fetch(0);
+    for (int j0 = 0; j0 < n; j0 += kMmaCells) {
+        const int tn = min(kMmaCells, n - j0);
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < kPer; ++k) {
+            const int i = tid + k * 256, c = i / (W / 8), ch = i - c * (W / 8);
+            const uint4 v = pre[k];
+            *reinterpret_cast<uint4*>(ks + c * kLd + ch * 8) = make_uint4(bf2_to_h2(v.x), bf2_to_h2(v.y), bf2_to_h2(v.z), bf2_to_h2(v.w));
         }
         __syncthreads();
+        if (j0 + kMmaCells < n) fetch(j0 + kMmaCells);
         // S: this warp's 8 cells and half of the 576 dimensions
         {
             float c[4] = {0.f, 0.f, 0.f, 0.f};
