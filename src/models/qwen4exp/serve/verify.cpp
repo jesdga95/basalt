@@ -53,8 +53,8 @@ int QfnRuntime::init_verify() {
         split_drive.base = &drive;
         split_drive.n = n_stages;
         for (int st = 0; st < n_stages; ++st) {
-            stage_ver(st).set_route_tail_skip(o.route_tail_skip);
-            stage_ver(st).set_route_prior(o.route_prior);
+            stage_ver(st).set_route_tail_skip(o.route.tail_skip);
+            stage_ver(st).set_route_prior(o.route.prior);
             stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
                                     st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
             split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
@@ -98,10 +98,10 @@ int QfnRuntime::init_verify() {
                 return 1;
             }
             std::memset(hb_host, 0, hb);
-            ver_b.set_route_tail_skip(o.route_tail_skip);
-            gs.ver_b.set_route_tail_skip(o.route_tail_skip);
-            ver_b.set_route_prior(o.route_prior);
-            gs.ver_b.set_route_prior(o.route_prior);
+            ver_b.set_route_tail_skip(o.route.tail_skip);
+            gs.ver_b.set_route_tail_skip(o.route.tail_skip);
+            ver_b.set_route_prior(o.route.prior);
+            gs.ver_b.set_route_prior(o.route.prior);
             ver_b.set_stage(0, split_at[0], nullptr, hand_b);
             gs.ver_b.set_stage(split_at[0], -1, hand_b, nullptr);
             ver.set_pipelined(pair_snap);
@@ -128,8 +128,8 @@ int QfnRuntime::init_verify() {
                       " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
         basalt::log::info("basalt serve", "layer split: layers %s, one hand-off per window", plan_s.c_str());
     }
-    ver.set_route_tail_skip(o.route_tail_skip);
-    ver.set_route_prior(o.route_prior);
+    ver.set_route_tail_skip(o.route.tail_skip);
+    ver.set_route_prior(o.route.prior);
     ver.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
     if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
     for (const auto& xpe : xpeers)

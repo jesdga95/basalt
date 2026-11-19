@@ -8,6 +8,7 @@
 
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/model/rope_flags.hpp"
+#include "basalt/model/route_flags.hpp"
 #include "basalt/platform/memory.hpp"
 
 namespace basalt::program {
@@ -52,6 +53,8 @@ struct CommonOptions {
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
     /// --rope-scaling, --rope-scale, --yarn-* ...: taken by the models that extend their context (basalt/model/rope_flags.hpp)
     basalt::model::RopeFlags rope;
+    /// --route-tail-skip, --route-prior: taken by the mixture-of-experts models (basalt/model/route_flags.hpp)
+    basalt::model::RouteFlags route;
     /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
     /// VRAM), for the models that take it
     int64_t kv_resident = 0;

@@ -14,6 +14,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/progress.hpp"
+#include "basalt/core/route_report.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
@@ -299,21 +300,7 @@ std::vector<std::string> Verifier::route_report() const {
         cudaGetLastError();
         return {};
     }
-    std::vector<std::string> out;
-    char b[240];
-    if (route_tail_skip_ > 0 && c[0] > 0) {
-        std::snprintf(b, sizeof b, "route-tail-skip %d: %llu of %llu routed entries no GPU held dropped (%.1f%%); %.1f%% of all %llu entries",
-                      route_tail_skip_, c[2], c[1], c[1] > 0 ? 100.0 * (double) c[2] / (double) c[1] : 0.0,
-                      100.0 * (double) c[2] / (double) c[0], c[0]);
-        out.push_back(b);
-    }
-    if (route_prior_ > 0.0f && c[3] > 0) {
-        std::snprintf(b, sizeof b, "route-prior %g: %.1f%% of %llu routed entries picked because of the bias; %.1f%% of entries held by no GPU",
-                      (double) route_prior_, 100.0 * (double) c[4] / (double) c[3], c[3],
-                      100.0 * (double) c[5] / (double) c[3]);
-        out.push_back(b);
-    }
-    return out;
+    return ::basalt::core::route_report(c, route_tail_skip_, route_prior_);
 }
 
 }  // namespace basalt::core
