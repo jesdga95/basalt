@@ -318,7 +318,10 @@ public:
         h_erows_ = b.h_erows; h_e_ = b.h_e; h_evalid_ = b.h_evalid;
     }
 
-    // A prompt of `total` rows: the tier lends its slots and the row buffers of a chunk (up to kMaxChunk rows) are made.
+    // A prompt of `total` rows and the row buffers of a chunk (up to kMaxChunk rows). A short prompt (below kRingRows: an agent
+    // turn's new messages) keeps the card's expert slots, which its experts are staged from card to card, and makes its buffers
+    // beside them: first in what the tier left free, then in the slots beside the base arena (shrink: the base keeps its
+    // experts). A long prompt routes to every expert anyway: the tier lends all its slots for the chunk buffers and the ring.
     bool open_prompt(int total, std::string& err) {
         const double to = now_ms();
         struct L2 { double t; ~L2() { basalt::log::info("basalt hy4flash", "open_prompt %.0f ms", now_ms() - t); } } l2{to};
@@ -327,6 +330,21 @@ public:
             return true;
         }
         cudaStreamSynchronize(stream_);
+        if (tier_ && total < kRingRows) {
+            int want = kMaxWindow;
+            while (want < total && want < kShortChunk) want *= 2;
+            std::string e;
+            for (int pass = 0; pass < 2; ++pass) {
+                if (pass == 1) tier_->shrink();
+                for (int R = want; R >= std::min(want, 2 * kMaxWindow); R /= 2)
+                    if (make_bufs(big_, R, e)) {
+                        use(big_);
+                        lent_ = false;
+                        return true;
+                    }
+            }
+        }
+        lent_ = true;
         if (tier_) tier_->lend_all();
         int want = kMaxWindow;
         while (want < total && want < kMaxChunk) want *= 2;
@@ -356,12 +374,35 @@ public:
         big_.release();
         if (tier_) {
             std::string e;
-            if (!tier_->reclaim(e)) basalt::log::warn("basalt hy4flash", "the expert tier stays small: %s", e.c_str());
-            tier_->grow();
+            if (lent_ && !tier_->reclaim(e)) basalt::log::warn("basalt hy4flash", "the expert tier stays small: %s", e.c_str());
+            tier_->grow();   // the slots beside the base arena, if a short prompt took them
         }
+        lent_ = false;
     }
 
     void end_prompt() override { release_prompt(); }
+
+    // The decode tier hits of the turn so far: the first kEarlyTokens tokens after a prompt and the rest, logged when the next
+    // prompt starts (a turn that starts cold shows a low first share).
+    static constexpr int kEarlyTokens = 32;
+    int64_t turn_tokens_ = 0, turn_h0_ = 0, turn_l0_ = 0, early_h_ = 0, early_l_ = 0, late_h_ = 0, late_l_ = 0;
+    void turn_count(int n) {
+        if (!tier_) return;
+        const int64_t h = tier_->hits(), lk = tier_->lookups();
+        ((turn_tokens_ < kEarlyTokens) ? early_h_ : late_h_) += h - turn_h0_;
+        ((turn_tokens_ < kEarlyTokens) ? early_l_ : late_l_) += lk - turn_l0_;
+        turn_h0_ = h;
+        turn_l0_ = lk;
+        turn_tokens_ += n;
+    }
+    void turn_report() {
+        if (early_l_ + late_l_ > 0)
+            basalt::log::info("basalt hy4flash", "turn decode hits: first %d tokens %.1f%% (%lld lookups), later %.1f%% (%lld lookups)", kEarlyTokens,
+                              early_l_ ? 100.0 * early_h_ / early_l_ : 0.0, (long long) early_l_, late_l_ ? 100.0 * late_h_ / late_l_ : 0.0,
+                              (long long) late_l_);
+        turn_tokens_ = early_h_ = early_l_ = late_h_ = late_l_ = 0;
+        if (tier_) { turn_h0_ = tier_->hits(); turn_l0_ = tier_->lookups(); }
+    }
 
     // DFLY HOOK: --spec sets the window (DeepSeek's rule: 0 or 1 is plain decode), and the drafter's calls (dfly.hpp)
     int max_window() const override { return std::clamp(m_.spec(), 1, kMaxWindow); }
@@ -393,13 +434,16 @@ public:
             if (last && r.logits) cudaMemcpyAsync(r.logits, logits_ + (size_t) (head - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "hy4flash: the window failed"};
+        turn_count(r.n_tokens);
         return {};
     }
 
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
         dfly_.invalidate();   // DFLY HOOK
+        if (!big_.rows) turn_report();
         if (!open_prompt(std::max(r.total_tokens, r.n_tokens), err)) return {model::Status::Error, "hy4flash: " + err};
+        if (tier_) { turn_h0_ = tier_->hits(); turn_l0_ = tier_->lookups(); }
         const int chunk = m_.diag_rows() > 0 ? std::min(rows_, m_.diag_rows()) : rows_;
         for (int t0 = 0; t0 < r.n_tokens; t0 += chunk) {
             if (r.stop && r.stop()) break;
@@ -914,6 +958,8 @@ private:
     // A prompt chunk of kRingRows rows or more routes to every expert of every layer, so the next layer's experts do not wait for
     // its router: all of a layer's experts are copied into one of two slots of the ring while the layer before it computes.
     static constexpr int kRingRows = 1024;
+    static constexpr int kShortChunk = 512;   // the largest chunk of a short prompt, which keeps the card's expert slots
+    bool lent_ = false;                       // the open prompt lent the tier's slots
     uint8_t* ring_ = nullptr;
     cudaEvent_t ring_copied_[2] = {nullptr, nullptr}, ring_done_[2] = {nullptr, nullptr};
     int ring_layer_[2] = {-1, -1};
