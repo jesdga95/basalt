@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import closing
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -16,7 +17,6 @@ from urllib.parse import parse_qs, urlsplit
 from serve.api import responses as responses_api
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
-from serve.response_generation import generate as response_events
 from serve.api.anthropic import anthropic_collect, anthropic_events
 from serve.api.documents import sources as document_sources
 from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
@@ -717,8 +717,24 @@ def make_handler(target: Service | Router):
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
             cancel = self._client_cancel()
 
-            generation = response_events(self.svc, ids, thinking, tools, max_new, req, cancel, force, asm,
-                                         session=self._session_id(req), live=self.live)
+            def events():
+                yield from asm.start()
+                done = None
+                with closing(self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                          session=self._session_id(req), live=self.live)) as inference:
+                    for kind, x in inference:
+                        if kind == "ping":
+                            yield None
+                        elif kind == "event":
+                            yield from asm.feed(x)
+                        elif kind == "logprobs":
+                            asm.logprob(*x)
+                        elif kind == "done":
+                            done = x
+                if done is not None and done["finish"] != "cancel" and not cancel.is_set():
+                    yield from asm.finish(done)
+
+            generation = events()
             try:
                 items = primed(generation, ids)
             except EngineError:
