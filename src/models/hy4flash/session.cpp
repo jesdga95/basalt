@@ -158,6 +158,9 @@ public:
         const int64_t pools = ctx / g_.idx_pool + 1;
         iscore_ = f(pools * kIdxRows);
         iidx_meta_ = (int32_t*) alloc((size_t) kIdxRows * 3 * 4, ok);
+        pos_d_ = (int32_t*) alloc(16, ok);
+        if (ok && cudaMallocHost((void**) &pos_h_, 16) == cudaSuccess) pinned_.push_back(pos_h_);
+        else ok = false;
         cells_stride_ = g_.idx_top_k + 2 * g_.idx_pool;
         max_heads_ = max_heads;
         size_t attw = 0;   // the chunked attention's workspace: the largest a layer needs; zero from the start
@@ -953,6 +956,7 @@ private:
     // position). A decode window replays the first and last from graphs.
     static constexpr int kQuery = 1, kCells = 2, kOutput = 4, kAll = 7;
     static constexpr int kRaw = 8;   // with kOutput: leave the output projection un-normed in attn_raw_ (add_norm_hc_post norms it)
+    static constexpr int kDevMeta = 16;   // with kCells on a sliding-window layer: the row spans from pos_d_ on the card (capturable)
     bool attention_step(int l, int64_t pos0, int R, int step, std::string& err, int phases = kAll) {
         const int H = g_.heads[(size_t) l];
         const bool swa = g_.swa[(size_t) l];
@@ -972,7 +976,9 @@ private:
         bool selecting = false;
         std::vector<int> pools_of(R, 0);
         const int keep = g_.idx_top_k / g_.idx_pool - (g_.idx_select_tail ? 1 : 0);
-        if (phases & kCells) {   // the cells and positions: a window replays only what comes before and after
+        if ((phases & kCells) && (phases & kDevMeta) && swa) {
+            swa_meta(pos_d_, R, g_.window, arows_, meta_d_, stream_);
+        } else if (phases & kCells) {   // the cells and positions: a window replays only what comes before and after
             for (int t = 0; t < R; ++t) posv[t] = (int32_t) (pos0 + t);
             if (swa) {
                 for (int t = 0; t < R; ++t) {
@@ -1725,6 +1731,21 @@ private:
             return false;
         }
         float *xa = X_, *xb = Xn_;
+        if (g_.swa[(size_t) l]) {   // a sliding-window layer's attention is one graph: its row spans come from pos_d_ on the card
+            const uint32_t seq0 = seq_want_;
+            if (!replay(l, R, 0, [&] {
+                    bk::hc_mixes_plain(xa, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
+                    bk::hc_pre_rms_norm(xa, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+                    std::string e;
+                    attention_step(l, pos0, R, 0, e, kQuery | kCells | kDevMeta | kOutput | kRaw);
+                    add_norm_hc_post(attn_raw_, nullptr, F(l, "post_attention_norm.weight"), g_.rms_eps, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
+                    bk::hc_mixes_plain(xb, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
+                    bk::hc_pre_rms_norm(xb, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+                    moe_head(l, R, false);
+                }, err))
+                return false;
+            seq_want_ = seq0 + 1;
+        } else {
         if (!replay(l, R, 0, [&] {
                 bk::hc_mixes_plain(xa, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
                 bk::hc_pre_rms_norm(xa, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
@@ -1744,6 +1765,7 @@ private:
             }, err))
             return false;
         seq_want_ = seq0 + 1;   // the doorbell in the graph rings once a replay
+        }
         std::swap(X_, Xn_);
         if (!moe_group(l, tl, lay, 0, R, err)) return false;
         xa = X_;
@@ -2236,6 +2258,10 @@ private:
                 return false;
             }
         put_f32(e_, h_e_, (int64_t) R * E);
+        if (graphs_) {   // the window's first position, for the graphs' row spans (sliding-window layers)
+            *pos_h_ = (int32_t) pos0;
+            cudaMemcpyAsync(pos_d_, pos_h_, 4, cudaMemcpyHostToDevice, stream_);
+        }
         fill_streams(e_, E, R, X_, stream_);
         if (!m_.diag_dump().empty()) dump("hc_init", X_, (int64_t) R * 4 * E);
         ring_join();
@@ -2440,6 +2466,8 @@ private:
     float *qa_ = nullptr, *qan_ = nullptr, *q_ = nullptr, *kvraw_ = nullptr, *qabs_ = nullptr, *qcur_ = nullptr, *olat_ = nullptr, *vout_ = nullptr, *gate_ = nullptr;
     float *ik_ = nullptr, *ikn_ = nullptr, *ivt_ = nullptr, *igt_ = nullptr, *iq_ = nullptr, *iw_ = nullptr, *iscore_ = nullptr;
     int32_t *iidx_meta_ = nullptr, *icells_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
+    int32_t* pos_d_ = nullptr;   // a decode window's first position on the card (swa_meta reads it)
+    int32_t* pos_h_ = nullptr;   // its pinned host copy (a window ends synchronized, so the last copy has read it)
     void* attw_ = nullptr;   // the chunked attention's workspace
     int cells_stride_ = 0, rows_ = 0, arows_ = 0, steps_ = 0, max_heads_ = 0;
     static constexpr size_t kStageInts = (size_t) 4 << 20;   // the mapped staging of a prompt's small inputs

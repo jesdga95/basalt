@@ -220,6 +220,22 @@ void add_norm_hc_post(const float* a, const float* b, const float* w, float eps,
     add_norm_hc_post_kernel<<<n_tokens, 512, 0, (cudaStream_t) stream>>>(a, b, w, eps, x, coef, coef_stride, E, out);
 }
 
+// a sliding-window layer's row spans from the window's first position, read on the card (so a captured graph replays them for any
+// position): firsts, counts, fill and positions, `arows` apart
+__global__ void swa_meta_kernel(const int32_t* __restrict__ pos0, int R, int window, int arows, int32_t* __restrict__ meta) {
+    const int t = threadIdx.x;
+    if (t >= R) return;
+    const int pos = *pos0 + t, first = pos + 1 - window > 0 ? pos + 1 - window : 0;
+    meta[t] = first;
+    meta[arows + t] = pos + 1 - first;
+    meta[2 * arows + t] = 0;
+    meta[3 * arows + t] = pos;
+}
+
+void swa_meta(const int32_t* pos0, int R, int window, int arows, int32_t* meta, void* stream) {
+    swa_meta_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(pos0, R, window, arows, meta);
+}
+
 void add_vectors(const float* a, const float* b, float* out, int n, void* stream) {
     add_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(a, b, out, n);
     if (!stream) cudaStreamSynchronize(nullptr);
