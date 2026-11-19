@@ -146,6 +146,8 @@ static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 b
 
 // MXFP4: 32 values with one E8M0 scale (the byte is the fp32 exponent: d = 2^(e - 127), halved against the
 // doubled kvalues_mxfp4); byte j of qs holds value j (low nibble) and value j + 16 (high nibble).
+#define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
+#define QR_MXFP4 2
 #define QK_MXFP4 32
 typedef struct {
     uint8_t e; // E8M0

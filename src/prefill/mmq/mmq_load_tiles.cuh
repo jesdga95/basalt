@@ -575,6 +575,67 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// MXFP4 (Basalt): the E8M0 scale as ggml decodes it (half the value, kvalues_mxfp4 being doubled; the byte is the
+// fp32 exponent): the same float as the decode kernels' mxfp4_scale_dev and the CPU tier's GGML_E8M0_TO_FP32_HALF.
+static __device__ __forceinline__ float ggml_cuda_mmq_mxfp4_scale(const uint8_t e) {
+    const uint32_t bits = e < 2 ? (uint32_t) 0x00200000 << e : (uint32_t) (e - 1) << 23;
+    return __uint_as_float(bits);
+}
+
+// MXFP4 (Basalt): the IQ4_NL tile layout and dot (one float scale per 32-value block) - same traits (QK 32, QI 4),
+// same nibble layout.  The blocks are 17 bytes, so their qs is unaligned and goes through get_int_b1.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR_MXFP4);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI_MXFP4;
+    const int kqsx = txi % QI_MXFP4;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
+
+        const int aux_q4 = get_int_b1(bxi->qs, kqsx);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+        const int k0 = kbx * (2 * QI_MXFP4) + kqsx;
+
+        x_qs[i*sram_stride + k0 + 0]      = v.x;
+        x_qs[i*sram_stride + k0 + QI_MXFP4] = v.y;
+    }
+
+    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI_MXFP4;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbxd;
+
+        x_df[i*sram_stride                       + kbxd] = ggml_cuda_mmq_mxfp4_scale(bxi->e);
+    }
+}
+
 // NVFP4 (Basalt): the UE4M3 sub-block scale as ggml decodes it (half the value, kvalues_fp4 being doubled; 0 and 0x7F
 // as 0, bit 7 ignored), built from its bits: the same float as the decode kernels' nvfp4_scale_dev.
 static __device__ __forceinline__ float ggml_cuda_mmq_nvfp4_scale(const uint32_t x) {

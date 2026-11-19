@@ -17,6 +17,10 @@
 // NVFP4 blocks come in three scale profiles (narrow; pack-like block values with 2e-5..2e-4 tails; pack-like with scale
 // bytes 0x7F, 0xFF, bit 7 set, 0 and subnormals), all of which every path must decode alike.
 //
+// MXFP4 blocks take E8M0 scale bytes in the packs' range (118..123); the mmvq reference weights come from a host
+// port of ggml's dequantize_row_mxfp4 (not the GPU dequantizer this test also checks), which the GPU dq must match
+// bit for bit.
+//
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
 #include "basalt/kernels/f16_bits.hpp"
@@ -68,6 +72,7 @@ const char* name_of(int t) {
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
         case 40: return "NVFP4";
+        case 39: return "MXFP4";
         case 12: return "Q4_K";
         case 13: return "Q5_K";
         case 7: return "Q5_1";
@@ -75,7 +80,7 @@ const char* name_of(int t) {
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 7 || t == 8 || t == 39 ? 32 : t == 42 || t == 40 ? 64 : 256; }
 // A UE4M3 sub-block scale byte.  Profile 0: exponent 1..4 (small blocks).  Profile 1: exponent 6..14, block values in
 // the hundreds as the packs' are (their tails are 1e-5..1e-4).  Profile 2: profile 1 with the odd bytes mixed in: 0x7F
 // (the NaN code, decoded as 0), the sign bit set (ignored), zero and subnormals.
@@ -115,7 +120,9 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     std::uniform_int_distribution<int> byte(0, 255), ex(2, 8), man(0, 1023), sgn(0, 3);
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {
-        if (t == 40) {
+        if (t == 39) {
+            w[o] = (uint8_t) (118 + rng() % 6);   // MXFP4: an E8M0 scale byte, 2^-10 .. 2^-5 like the packs'
+        } else if (t == 40) {
             // NVFP4: four UE4M3 sub-block scales (profiles in nvfp4_scale_byte)
             const int prof = g_nv_profile >= 0 ? g_nv_profile : (int) (rng() % 3);
             for (int j = 0; j < 4; ++j) w[o + j] = nvfp4_scale_byte(prof, rng);
@@ -145,6 +152,24 @@ std::vector<float> random_x(size_t n, std::mt19937& rng) {
     return x;
 }
 
+// ggml's dequantize_row_mxfp4 (the reference the GPU dq must match bit for bit): E8M0 scale halved against the
+// doubled kvalues_mxfp4, both products exact in float (a power of two times an int8 value)
+std::vector<float> mxfp4_dequant_host(const std::vector<uint8_t>& w, int64_t rows, int64_t n) {
+    static const int8_t kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    std::vector<float> v((size_t) rows * n);
+    for (int64_t b = 0; b < rows * (n / 32); ++b) {
+        const uint8_t* blk = w.data() + (size_t) b * 17;
+        const uint32_t bits = blk[0] < 2 ? (uint32_t) 0x00200000 << blk[0] : (uint32_t) (blk[0] - 1) << 23;
+        float d;
+        std::memcpy(&d, &bits, 4);
+        for (int j = 0; j < 16; ++j) {
+            v[(size_t) b * 32 + j] = kv[blk[1 + j] & 0xf] * d;
+            v[(size_t) b * 32 + 16 + j] = kv[blk[1 + j] >> 4] * d;
+        }
+    }
+    return v;
+}
+
 // q8_1 blocks (fp16 scale, fp16 sum, 32 int8) back to floats
 std::vector<double> dequant_q8_1(const std::vector<uint8_t>& q, size_t n) {
     std::vector<double> v(n);
@@ -167,6 +192,19 @@ void check_mmvq(int t, int n_in, int n_out, cudaStream_t s, std::mt19937& rng) {
     k::iq_dequant_f32(t, dw, (int64_t) n_out * n_in, dwf, s);
     std::vector<float> wf((size_t) n_out * n_in);
     ck(cudaMemcpy(wf.data(), dwf, wf.size() * 4, cudaMemcpyDeviceToHost), "wf");
+    if (t == 39) {
+        // MXFP4: the host port of ggml's dequantize_row_mxfp4 as the reference instead of the GPU dequantizer (the
+        // dq itself is checked against it bit for bit here, the values being exact in float)
+        const auto host = mxfp4_dequant_host(w, n_out, n_in);
+        size_t dq_diff = 0;
+        for (size_t i = 0; i < wf.size(); ++i) dq_diff += std::memcmp(&wf[i], &host[i], 4) != 0;
+        if (dq_diff != 0) {
+            std::printf("  MXFP4    %5d x %5d  iq_dequant_f32: %zu values differ from the host reference  FAIL\n",
+                        n_out, n_in, dq_diff);
+            ++g_fail;
+        }
+        wf = host;
+    }
     const int max_cols = 11;
     const auto x = random_x((size_t) max_cols * n_in, rng);
     float* dx = dalloc<float>(x.size());
@@ -548,7 +586,7 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(18);
-    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 40, 12, 13, 7, 8}) {
+    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 39, 40, 12, 13, 7, 8}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
@@ -563,6 +601,10 @@ int main(int argc, char** argv) {
     }
     check_grouped(40, 40, 2560, 640, s, rng);                               // NVFP4: its own pair, with the scale tail
     check_grouped(40, 40, 1024, 512, s, rng);
+    for (int gu : {16, 18, 39}) check_grouped(gu, 39, 2560, 640, s, rng);   // MXFP4 down at the kDown40 shape
+    for (int gu : {18, 39}) check_grouped(gu, 39, 1024, 512, s, rng);       // and the generic down path
+    check_grouped(16, 39, 5120, 2304, s, rng);                              // deepseek41's real expert shape
+    check_grouped(18, 39, 5120, 2304, s, rng);
     check_mmvq_mma(s, rng);
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
