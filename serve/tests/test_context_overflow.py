@@ -64,6 +64,10 @@ class ContextOverflow(unittest.TestCase):
                         self.assertIn("exceeds the context window", message)
                         self.assertIn(f"prompt ({prompt} tokens)", message)
                         self.assertIn(detail, message)
+                        if path == "/v1/messages":       # Anthropic's own wording first, ours after it
+                            want = ("prompt is too long" if budget is None or prompt > CTX - CTX_SLACK - 1
+                                    else "input length and `max_tokens` exceed context limit")
+                            self.assertIn(want, message)
 
     def test_one_token_of_room_answers_and_none_is_rejected(self):
         for path, key in APIS:
