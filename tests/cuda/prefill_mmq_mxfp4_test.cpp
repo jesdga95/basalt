@@ -1,8 +1,9 @@
 // prefill_mmq_mxfp4_test - the prompt path's MXFP4 experts through MMQ (moe_mmq.hpp): the MXFP4 tile loader with the
-// E8M0-scaled int8 dot and the IQ4_NL-layout Q8_0 tile, with IQ2_XXS gate/up, at the real deepseek41 geometry
-// (gate/up 4608 x 5120, down 5120 x 2304, top 6) on synthetic experts (IQ2_XXS random codes with small fp16 scales;
-// MXFP4 random codes with E8M0 scale bytes 118..123), in expert_mmq.cpp's sequence (16-expert groups, q8_1 of the
-// activations, gate/up, SwiGLU, q8_1 of H, down).  Checked against two CPU references:
+// E8M0-scaled int8 dot and the IQ4_NL-layout Q8_0 tile, at the real deepseek41 geometry (gate/up 4608 x 5120,
+// down 5120 x 2304, top 6) on synthetic experts (IQ2 random codes with small fp16 scales; MXFP4 random codes with
+// E8M0 scale bytes 118..123), in expert_mmq.cpp's sequence (16-expert groups, q8_1 of the activations, gate/up,
+// SwiGLU, q8_1 of H, down).  The parity runs once per gate/up format of the UD file's MXFP4 layers: IQ2_XXS,
+// IQ2_XS and IQ2_S.  Checked against two CPU references:
 //   - `same`: double-precision math on MMQ's own roundings (x and H rounded to int8 per 32 values the way the
 //     quantizer does).  The gate/up product isolates the loader and the dot: only fp32 accumulation order differs.
 //     Tolerance: RMS 1e-5, worst row 1e-4.  After the down product an H value whose x/d lands within fp32 rounding
@@ -33,8 +34,19 @@ namespace {
 namespace mmq = basalt::prefill::mmq;
 
 constexpr int N = 5120, FF = 2304, K = 6, GROUP = 16;
-const size_t GU_ROW = ggml_row_size(GGML_TYPE_IQ2_XXS, N), D_ROW = ggml_row_size(GGML_TYPE_MXFP4, FF);
-const size_t UP_OFF = GU_ROW * FF, DOWN_OFF = 2 * UP_OFF, BYTES = DOWN_OFF + D_ROW * N;
+const size_t D_ROW = ggml_row_size(GGML_TYPE_MXFP4, FF);
+
+// One parity/bench run's gate/up format and its blob layout: the expert is [gate | up | down] with gate/up rows of
+// `type` (an IQ2 format) and MXFP4 down rows.
+struct Gate {
+    int type;
+    size_t row, up_off, down_off, bytes;
+    explicit Gate(int t) : type(t), row(ggml_row_size((ggml_type) t, N)) {
+        const size_t gu = row * FF;
+        up_off = gu, down_off = 2 * gu, bytes = down_off + D_ROW * N;
+    }
+    const char* name() const { return ggml_type_name((ggml_type) type); }
+};
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
@@ -57,17 +69,17 @@ template <typename F> void parallel(int n, F f) {
     for (auto& x : th) x.join();
 }
 
-// one [gate | up | down] expert blob: IQ2_XXS gate/up rows (random code bytes, fp16 block scales in 2^-13 .. 2^-6)
-// and MXFP4 down rows (random codes, E8M0 scale bytes 118..123)
-std::vector<uint8_t> make_blob(std::mt19937& rng) {
-    std::vector<uint8_t> b(BYTES);
+// one [gate | up | down] expert blob: gate/up rows in the gate's IQ2 format (random code bytes, fp16 block scales
+// in 2^-13 .. 2^-6) and MXFP4 down rows (random codes, E8M0 scale bytes 118..123)
+std::vector<uint8_t> make_blob(const Gate& g, std::mt19937& rng) {
+    std::vector<uint8_t> b(g.bytes);
     for (auto& v : b) v = (uint8_t) rng();
     std::uniform_int_distribution<int> ex(3, 10), man(0, 1023), sgn(0, 3);
-    for (size_t o = 0; o < DOWN_OFF; o += GU_ROW / (N / 256)) {   // IQ2_XXS: the fp16 d at the head of every block
+    for (size_t o = 0; o < g.down_off; o += g.row / (N / 256)) {   // IQ2: the fp16 d at the head of every block
         const uint16_t h = (uint16_t) ((sgn(rng) == 0 ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));
         std::memcpy(b.data() + o, &h, 2);
     }
-    for (size_t o = DOWN_OFF; o < BYTES; o += 17) b[o] = (uint8_t) (118 + rng() % 6);
+    for (size_t o = g.down_off; o < g.bytes; o += 17) b[o] = (uint8_t) (118 + rng() % 6);
     return b;
 }
 
@@ -144,22 +156,22 @@ Layer route(int T, int E, std::mt19937& rng, int hot) {
 
 struct Bufs {
     Dev xq, gu, h, hq, dm, ident, bounds, grp_gu, grp_d;
-    Bufs(int64_t rows, size_t nb)
+    Bufs(int64_t rows, size_t nb, const Gate& gate)
         : xq(mmq::q8_bytes(rows, N)), gu((size_t) rows * 2 * FF * 4), h((size_t) rows * FF * 4),
           hq(mmq::q8_bytes(rows, FF)), dm((size_t) rows * N * 4), ident((size_t) rows * 4), bounds(nb * 4),
-          grp_gu(GROUP * mmq::matrix_bytes(GGML_TYPE_IQ2_XXS, 2 * FF, N)),
+          grp_gu(GROUP * mmq::matrix_bytes(gate.type, 2 * FF, N)),
           grp_d(GROUP * mmq::matrix_bytes(GGML_TYPE_MXFP4, N, FF)) {}
 };
 
 // expert_mmq.cpp's sequence for one layer; `grouped`: one gather launch per group, else one per expert
-void run_mmq(mmq::Context& ctx, Bufs& b, const Layer& L, const float* x_dev, const int32_t* src_dev,
-             const std::vector<const uint8_t*>& blob, bool grouped, cudaStream_t s) {
-    const size_t gub = mmq::matrix_bytes(GGML_TYPE_IQ2_XXS, 2 * FF, N), db = mmq::matrix_bytes(GGML_TYPE_MXFP4, N, FF);
+void run_mmq(mmq::Context& ctx, Bufs& b, const Gate& gate, const Layer& L, const float* x_dev,
+             const int32_t* src_dev, const std::vector<const uint8_t*>& blob, bool grouped, cudaStream_t s) {
+    const size_t gub = mmq::matrix_bytes(gate.type, 2 * FF, N), db = mmq::matrix_bytes(GGML_TYPE_MXFP4, N, FF);
     const int64_t rows = (int64_t) L.T * K;
     const size_t n = L.order.size();
     ck(cudaMemcpyAsync(b.bounds.p, L.bh.data(), L.bh.size() * 4, cudaMemcpyHostToDevice, s), "bounds");
     mmq::iota(b.ident.as<int32_t>(), rows, s);
-    mmq::quantize(x_dev, src_dev, b.xq.p, GGML_TYPE_IQ2_XXS, N, N, rows, s);
+    mmq::quantize(x_dev, src_dev, b.xq.p, gate.type, N, N, rows, s);
     mmq::GatherGroup gg;
     for (size_t j = 0; j < n; ++j) {
         const size_t q = j % GROUP;
@@ -168,12 +180,12 @@ void run_mmq(mmq::Context& ctx, Bufs& b, const Layer& L, const float* x_dev, con
             gg.blob[q] = bl;
             gg.n = (int) q + 1;
         } else {
-            mmq::gather_native(bl, bl + UP_OFF, gub / 2, bl + DOWN_OFF, db, b.grp_gu.as<uint8_t>() + q * gub,
-                               b.grp_d.as<uint8_t>() + q * db, s);
+            mmq::gather_native(bl, bl + gate.up_off, gub / 2, bl + gate.down_off, db,
+                               b.grp_gu.as<uint8_t>() + q * gub, b.grp_d.as<uint8_t>() + q * db, s);
         }
         if (q + 1 < GROUP && j + 1 < n) continue;
         if (grouped) {
-            if (!mmq::gather_native_group(gg, UP_OFF, gub / 2, DOWN_OFF, db, b.grp_gu.p, gub, b.grp_d.p, db, s))
+            if (!mmq::gather_native_group(gg, gate.up_off, gub / 2, gate.down_off, db, b.grp_gu.p, gub, b.grp_d.p, db, s))
                 throw std::runtime_error("gather_native_group refused aligned blobs");
             gg = mmq::GatherGroup{};
         }
@@ -184,7 +196,7 @@ void run_mmq(mmq::Context& ctx, Bufs& b, const Layer& L, const float* x_dev, con
         for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, L.cnt[(size_t) L.order[i]]);
         const int32_t* rel = b.bounds.as<int32_t>() + n + 1 + g * (GROUP + 1);
         mmq::Product gu;
-        gu.w = b.grp_gu.p; gu.type = GGML_TYPE_IQ2_XXS; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = gub;
+        gu.w = b.grp_gu.p; gu.type = gate.type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = gub;
         gu.n = ngx; gu.xq = b.xq.p; gu.bounds = b.bounds.as<int32_t>() + j0; gu.ids = b.ident.as<int32_t>();
         gu.total_rows = rows; gu.max_rows = maxr; gu.dst = b.gu.as<float>(); gu.ld_dst = 2 * FF;
         ctx.run(gu, s);
@@ -204,16 +216,16 @@ std::vector<float> download(const Dev& d, size_t n) {
     return h;
 }
 
-int parity(cudaStream_t s) {
+int parity(cudaStream_t s, const Gate& gate) {
     constexpr int T = 96, E = 32, ZERO = 33;
     std::mt19937 rng(4041);
     std::vector<std::vector<uint8_t>> host((size_t) E);
-    for (int e = 0; e < E; ++e) host[(size_t) e] = make_blob(rng);
+    for (int e = 0; e < E; ++e) host[(size_t) e] = make_blob(gate, rng);
     std::vector<std::unique_ptr<Dev>> dev;
     std::vector<const uint8_t*> blob((size_t) E);
     for (int e = 0; e < E; ++e) {
-        dev.push_back(std::make_unique<Dev>(BYTES));
-        ck(cudaMemcpy(dev.back()->p, host[(size_t) e].data(), BYTES, cudaMemcpyHostToDevice), "blob");
+        dev.push_back(std::make_unique<Dev>(gate.bytes));
+        ck(cudaMemcpy(dev.back()->p, host[(size_t) e].data(), gate.bytes, cudaMemcpyHostToDevice), "blob");
         blob[(size_t) e] = dev.back()->as<uint8_t>();
     }
     std::vector<float> x((size_t) T * N);
@@ -222,36 +234,37 @@ int parity(cudaStream_t s) {
     std::fill(x.begin() + (size_t) ZERO * N, x.begin() + (size_t) (ZERO + 1) * N, 0.0f);
     const Layer L = route(T, E, rng, 2);   // experts 0, 1 hot: several 64-row tiles
     const int64_t rows = (int64_t) L.T * K;
-    std::printf("parity: %d tokens, %d experts, %zu with rows, max rows per expert %d\n", T, E, L.order.size(),
-                *std::max_element(L.cnt.begin(), L.cnt.end()));
+    std::printf("parity (%s gate/up, MXFP4 down): %d tokens, %d experts, %zu with rows, max rows per expert %d\n",
+                gate.name(), T, E, L.order.size(), *std::max_element(L.cnt.begin(), L.cnt.end()));
 
     Dev x_dev(x.size() * 4), src_dev((size_t) rows * 4);
     ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
     ck(cudaMemcpy(src_dev.p, L.src.data(), L.src.size() * 4, cudaMemcpyHostToDevice), "src");
     ck(cudaDeviceSynchronize(), "uploads");
     mmq::Context ctx;
-    Bufs b(rows, L.bh.size());
-    run_mmq(ctx, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, false, s);
+    Bufs b(rows, L.bh.size(), gate);
+    run_mmq(ctx, b, gate, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, false, s);
     ck(cudaStreamSynchronize(s), "sync");
     const std::vector<float> y1 = download(b.dm, (size_t) rows * N);
     ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");
     ck(cudaDeviceSynchronize(), "sentinel");
-    run_mmq(ctx, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, true, s);
+    run_mmq(ctx, b, gate, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, true, s);
     ck(cudaStreamSynchronize(s), "sync");
     const std::vector<float> y = download(b.dm, (size_t) rows * N), ygu = download(b.gu, (size_t) rows * 2 * FF);
     const bool same_gather = std::memcmp(y.data(), y1.data(), y.size() * 4) == 0;
 
     // the references, an expert at a time on all cores
     std::vector<float> r_same((size_t) rows * N), r_dbl((size_t) rows * N), r_gu((size_t) rows * 2 * FF);
-    const auto* tr_gu = ggml_get_type_traits(GGML_TYPE_IQ2_XXS);
+    const auto* tr_gu = ggml_get_type_traits((ggml_type) gate.type);
     const auto* tr_d = ggml_get_type_traits(GGML_TYPE_MXFP4);
     parallel(E, [&](int e) {
         if (L.cnt[(size_t) e] == 0) return;
         std::vector<float> wgu((size_t) 2 * FF * N), wd((size_t) N * FF);
         for (int r = 0; r < 2 * FF; ++r)
-            tr_gu->to_float(host[(size_t) e].data() + (size_t) r * GU_ROW, wgu.data() + (size_t) r * N, N);
+            tr_gu->to_float(host[(size_t) e].data() + (size_t) r * gate.row, wgu.data() + (size_t) r * N, N);
         for (int r = 0; r < N; ++r)
-            tr_d->to_float(host[(size_t) e].data() + DOWN_OFF + (size_t) r * D_ROW, wd.data() + (size_t) r * FF, FF);
+            tr_d->to_float(host[(size_t) e].data() + gate.down_off + (size_t) r * D_ROW,
+                           wd.data() + (size_t) r * FF, FF);
         std::vector<float> xr(N), h(FF), hr(FF), hd(FF);
         for (int32_t p = L.off[(size_t) e]; p < L.off[(size_t) e + 1]; ++p) {
             const float* xt = x.data() + (size_t) L.src[(size_t) p] * N;
@@ -311,18 +324,19 @@ int parity(cudaStream_t s) {
                 same_gather ? "yes" : "NO", zero_ok ? "yes" : "NO");
     const bool ok = grms <= 1e-5 && gworst <= 1e-4 && es.rms <= 2e-4 && es.worst <= 1e-2 && ed.rms <= 2.5e-2 &&
                     same_gather && zero_ok;
-    std::printf("parity: %s\n", ok ? "PASS" : "FAIL");
+    std::printf("parity (%s): %s\n", gate.name(), ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
-void bench(cudaStream_t s) {
+void bench(cudaStream_t s, const Gate& gate) {
     constexpr int T = 512, E = 128;
     std::mt19937 rng(78);
     // one synthetic blob copied to every slot (timing only)
-    const std::vector<uint8_t> h = make_blob(rng);
-    const size_t stride = (BYTES + 255) / 256 * 256;
+    const std::vector<uint8_t> h = make_blob(gate, rng);
+    const size_t stride = (gate.bytes + 255) / 256 * 256;
     Dev all(stride * E);
-    for (int e = 0; e < E; ++e) ck(cudaMemcpy(all.as<uint8_t>() + stride * e, h.data(), BYTES, cudaMemcpyHostToDevice), "blob");
+    for (int e = 0; e < E; ++e)
+        ck(cudaMemcpy(all.as<uint8_t>() + stride * e, h.data(), gate.bytes, cudaMemcpyHostToDevice), "blob");
     std::vector<const uint8_t*> blob((size_t) E);
     for (int e = 0; e < E; ++e) blob[(size_t) e] = all.as<uint8_t>() + stride * e;
     std::vector<float> x((size_t) T * N);
@@ -335,21 +349,22 @@ void bench(cudaStream_t s) {
     ck(cudaMemcpy(src_dev.p, L.src.data(), L.src.size() * 4, cudaMemcpyHostToDevice), "src");
     ck(cudaDeviceSynchronize(), "uploads");
     mmq::Context ctx;
-    Bufs b(rows, L.bh.size());
+    Bufs b(rows, L.bh.size(), gate);
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
-    for (int w = 0; w < 2; ++w) run_mmq(ctx, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, true, s);
+    for (int w = 0; w < 2; ++w) run_mmq(ctx, b, gate, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, true, s);
     constexpr int R = 10;
     cudaEventRecord(e0, s);
-    for (int r = 0; r < R; ++r) run_mmq(ctx, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, true, s);
+    for (int r = 0; r < R; ++r) run_mmq(ctx, b, gate, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, true, s);
     cudaEventRecord(e1, s);
     ck(cudaEventSynchronize(e1), "bench");
     float ms = 0;
     cudaEventElapsedTime(&ms, e0, e1);
     const double us = 1e3 * ms / R, flop = 2.0 * (double) rows * (2.0 * FF * N + (double) N * FF);
-    std::printf("bench: MXFP4 MMQ layer, %d tokens x top %d over %d experts (%zu with rows): %.1f us, %.1f TFLOP/s "
-                "(gathers + q8_1 + gate/up + SwiGLU + down)\n", T, K, E, L.order.size(), us, flop / us * 1e-6);
+    std::printf("bench: %s/MXFP4 MMQ layer, %d tokens x top %d over %d experts (%zu with rows): %.1f us, "
+                "%.1f TFLOP/s (gathers + q8_1 + gate/up + SwiGLU + down)\n", gate.name(), T, K, E, L.order.size(), us,
+                flop / us * 1e-6);
 }
 
 }  // namespace
@@ -369,8 +384,17 @@ int main(int argc, char** argv) {
         }
         cudaStream_t s;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
-        const int rc = parity(s);
-        if (do_bench) bench(s);
+        int rc = 0;
+        // the three IQ2 gate/up formats the UD file's MXFP4 layers pair with MXFP4 down
+        for (const ggml_type gt : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S}) {
+            const Gate gate(gt);
+            if (!mmq::fits(gate.type, 2 * FF)) {   // IQ2_XXS failed above; a card without the other tiles skips them
+                std::printf("%s gate/up: MMQ has no tile on this device: skipped\n", gate.name());
+                continue;
+            }
+            rc |= parity(s, gate);
+        }
+        if (do_bench) bench(s, Gate(GGML_TYPE_IQ2_XXS));
         cudaStreamDestroy(s);
         return rc;
     } catch (const std::exception& ex) {
