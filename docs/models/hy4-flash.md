@@ -108,10 +108,18 @@ Follow-up, with the DeepSeek pack present: Hy4 keeps its own attention kernels (
 fp32 latent cache with a sink); `attn_mqa.cu` is to be generalised (dK != dV, head count, one row source) so the two share one kernel, each step
 with the DeepSeek parity and speed runs. The router and the row norms are shared already (`basalt/kernels/router.hpp`, `row_norm.hpp`).
 
-Prefill plan: chunks of 16,384 tokens halved to fit, as DeepSeek; each chunk runs 42 layers with the sparse layers' indexer for
-every row of the chunk against the pooled keys of all earlier positions, then selected-row attention; SWA layers attend the previous
-511 rows (the chunk's tail plus the ring). No prompt skip (every layer's output matters). Engram rows of chunk n + 1 are read while
-chunk n computes (the hash needs only token ids). Experts stream as in DS (CPU share, peer share, borrowed slots).
+Prompt path (`session.cpp`): a prompt opens row buffers for chunks of up to 16,384 rows (halved to fit) and the VRAM tier lends its
+slots to them. Each chunk runs the 42 layers; the attention runs in steps of 2,048 rows (the rings are sized for a step), each step
+with its own row spans. Sparse layers score every row against the pooled keys before it on tensor cores (`scores_mma_kernel`) and
+select 64 rows a launch; the attention over the selected or windowed cells runs on tensor cores with fp16 operands
+(`attend_mma_kernel`). The heads products and the router are one launch a step, the dense products MMQ launches of a step's rows. From 1,024 rows every
+expert is used: a ring of two layer slots copies the next layer's experts while a layer computes, and the chunk's small host inputs
+(spans, launch tables, Engram rows, embeddings) go through mapped memory and a copy kernel so they never wait on the copy engine
+behind the ring. Every Engram layer's rows are asked for when the chunk starts.
+
+Measured (1x RTX 5090 at 400 W, Q4_K_M test pack, greedy, real text): a 3,519-token summary prompt 3.27 s (1,076 tok/s), a
+16,191-token prompt 5.13 s (3,156 tok/s); hy4-a before this path: 18.7 s and 90.8 s. A chunk of 1,024 rows or more is bound by the
+bus: 89.5 GB of experts at 29 GB/s (the card's x8 PCIe 5 link) = 3.1 s a chunk, so short prompts sit near that floor.
 
 ## 1M context
 
