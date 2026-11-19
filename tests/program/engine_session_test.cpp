@@ -53,6 +53,10 @@ std::string read_all(const std::string& path) {
 
 int main(int argc, char** argv) {
     if (argc >= 3 && std::strcmp(argv[1], "--serve") == 0) return stand_in(argv[2]);
+    check(basalt::program::fixture_vocab_refusal(120831, 120832, "d").empty(), "fixtures inside the vocabulary run");
+    check(basalt::program::fixture_vocab_refusal(248069, 0, "d").empty(), "an unknown vocabulary refuses nothing");
+    check(basalt::program::fixture_vocab_refusal(248069, 120832, "d").find("token id 248069, past this model's vocabulary of 120832") != std::string::npos,
+          "fixtures of another tokenizer are refused by id and vocabulary");
 
     const std::string self = std::filesystem::absolute(argv[0]).string();
     const std::string dir = std::filesystem::temp_directory_path().string();

@@ -944,6 +944,19 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt-bench", "%s", err.c_str());
             return 1;
         }
+        {   // fixtures of another tokenizer would fail at the first request with ids past the vocabulary
+            int64_t max_id = -1;
+            for (const auto& v : decode_ids)
+                for (int64_t t : v) max_id = std::max(max_id, t);
+            for (const auto& v : prefill_parts)
+                for (int64_t t : v) max_id = std::max(max_id, t);
+            const int64_t n_vocab = eng.info.count("logit_bias") ? std::atoll(eng.info["logit_bias"].c_str()) : 0;
+            if (const std::string why = basalt::program::fixture_vocab_refusal(max_id, n_vocab, o.fixtures); !why.empty()) {
+                eng.stop();
+                basalt::log::error("basalt-bench", "%s", why.c_str());
+                return 2;
+            }
+        }
         if (eng.info.count("lossy")) {
             lossy = eng.info["lossy"];
             if (o.community) {
