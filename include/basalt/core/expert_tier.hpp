@@ -135,20 +135,22 @@ public:
     /// borrows slots inside that total and gives the same number back.
     ///
     /// Gives the VRAM slots that the prompt path's workspaces occupy back to the driver (call before they are
-    /// allocated); `grow` opens the planned slots beside the base arena again, empty, once they are free.
+    /// allocated); `grow` opens the planned slots beside the base arena again once they are free, with the experts a
+    /// shrink or lend took off the card (most recently used first) and then the profile's ranked ones.
     void shrink();
     void grow();
     /// A long prompt streams every expert to the main card and needs the card for its chunks: the slots that are
-    /// copies go back whole, and reclaim() opens the same number again, empty (an error if the card cannot hold them
-    /// any more). Homes stay.
+    /// copies go back whole, and reclaim() opens the same number again (an error if the card cannot hold them any
+    /// more): empty, or with `restore` holding the experts the lend took off the card, the most recently used first,
+    /// copied before it returns. Homes stay.
     void lend_all();
-    bool reclaim(std::string& err);
+    bool reclaim(std::string& err, bool restore = false);
     /// Whether lend() can give up part of the base arena (ExpertTierSpec::lend_segment, copies, a segmented arena).
     bool partial_lend() const { return !live_.empty(); }
     /// Leaves `bytes` device bytes free above the floor by giving up the fewest slots: the ones beside the base arena,
     /// then each layer's last base slots in proportion to its share (the arena's tail holds every layer's last ones).
     /// First the most recently used experts of each layer move into the slots it keeps. False, with nothing given up,
-    /// when all of them would not free that much (or without partial_lend). reclaim() maps them again, empty.
+    /// when all of them would not free that much (or without partial_lend). reclaim() maps them again (refilled with restore).
     bool lend(uint64_t bytes);
     /// An explicit new --vram-reserve-mib (`mib` < 0: the start's): the one time the size is planned again after the
     /// start. The slots that fit above the new reserve are opened; the response reports them.
@@ -284,6 +286,14 @@ private:
     bool load_rank(std::string& err);
     /// `n` copies in each layer, or with `base_shares` each layer's base arena share (base_n).
     void seed_copies(int64_t n, bool base_shares = false);
+    /// [layer] the experts a shrink, lend or lend_all took off the card that no restore has put back, the most recently used
+    /// first; `recall` adds the owners of slots [lo, lo + n) of `layer` (call before they are cleared).
+    std::vector<std::vector<int32_t>> recall_;
+    void recall(int layer, int64_t lo, int64_t n);
+    bool recalled() const;
+    /// Fills each layer's empty slots with its recall_ experts, then with `ranked_too` the profile's order, and waits for
+    /// the copies (a placement the next lookup sees whatever the timing).
+    void restore(bool ranked_too);
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
     /// Gives the file experts of `ids` the RAM places of the layer's least recently used pinned experts outside `ids`
     /// and starts reading them there; `reading[i]` marks those of `ids`.
