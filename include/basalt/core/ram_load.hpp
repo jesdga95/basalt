@@ -70,6 +70,10 @@ const uint8_t* ram_pin_alias(const std::vector<uint64_t>& starts, const std::vec
 /// that pins counts it with them.
 inline uint64_t pin_tracking_bytes(uint64_t pinned) { return pinned / 36; }
 
+/// VRAM every card's context keeps for `pinned` bytes of registered host memory (its page tables: 8 bytes a 4 KiB page),
+/// whether the context was made before the registration or after it.
+inline uint64_t pin_mapping_bytes(uint64_t pinned) { return pinned / 512; }
+
 /// Host memory an engine takes after its RAM tier has read the free RAM: the CUDA runtime's own host memory for the graphs it
 /// captures, the first request's buffers, the second card's context.  The tier's plan leaves it free beside the reserve; the
 /// serving RAM guard still holds the reserve alone, so the settled free RAM is above the guard and not on it.  0.2.1 left
