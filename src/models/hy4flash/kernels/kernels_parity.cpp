@@ -191,8 +191,32 @@ void test_router() {
     failures += !same;
 }
 
+// The kernel's own arithmetic on the CPU: the q8_1 rounding of each 32 values, exact integer block sums, the blocks added in
+// order with fmaf. Equal bits are expected.
+std::vector<float> gemv_emulated(const Q8& w, const std::vector<float>& x, int xs, int tok, int heads, int rows, int k, int T) {
+    std::vector<float> y((size_t) T * heads * rows);
+    for (int t = 0; t < T; ++t)
+        for (int h = 0; h < heads; ++h)
+            for (int r = 0; r < rows; ++r) {
+                const uint8_t* row = &w.bytes[((size_t) h * rows + r) * (k / 32) * 34];
+                float acc = 0.f;
+                for (int b = 0; b < k / 32; ++b) {
+                    const uint8_t* blk = row + (size_t) b * 34;
+                    const float* xv = &x[(size_t) t * tok + (size_t) h * xs + b * 32];
+                    float amax = 0.f;
+                    for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(xv[i]));
+                    const float d = amax / 127.f, id = d != 0.f ? 1.f / d : 0.f;
+                    int isum = 0;
+                    for (int i = 0; i < 32; ++i) isum += (int) (int8_t) blk[2 + i] * (int) std::round(xv[i] * id);
+                    acc = std::fmaf(h2f((uint16_t) (blk[0] | (blk[1] << 8))) * d, (float) isum, acc);
+                }
+                y[((size_t) t * heads + h) * rows + r] = acc;
+            }
+    return y;
+}
+
 void test_gemv() {
-    const int T = 3;
+    const int T = 9;   // two launches of up to 8 rows
     for (auto [heads, rows, k] : {std::tuple<int, int, int>{32, 512, 192}, {64, 256, 512}}) {
         Q8 w = make_q8(heads * rows, k);
         const int xs = k == 192 ? 256 : k;   // the query's head stride vs a packed latent
@@ -231,6 +255,10 @@ void test_gemv() {
         std::snprintf(name, sizeof name, "q8_0_heads_gemv %dx%dx%d", heads, rows, k);
         report(name, got, ref, 2e-5);
         report("  against exact activations", got, exact, 5e-2);   // the q8_1 rounding
+        const std::vector<float> emu = gemv_emulated(w, x, xs, tok, heads, rows, k, T);
+        const bool bit = std::memcmp(emu.data(), got.data(), got.size() * 4) == 0;
+        std::printf("%-30s %s\n", "  against the emulation", bit ? "bitwise" : "FAIL");
+        failures += !bit;
         float* d1 = devf((size_t) heads * rows);
         q8_0_heads_gemv(dw, dx + (size_t) 1 * tok, xs, tok, heads, rows, k, 1, d1, nullptr);
         const bool same = std::memcmp(host(d1, (size_t) heads * rows).data(), got.data() + (size_t) heads * rows, (size_t) heads * rows * 4) == 0;
@@ -338,7 +366,12 @@ void test_mla() {
             std::vector<int32_t> firsts(T), counts(T), cells_list;
             const int stride = 1100;
             cells_list.assign((size_t) T * stride, 0);
-            for (int use_cells = 0; use_cells < 2; ++use_cells) {
+            const int max_cells = 1100;
+            void* work = nullptr;
+            cudaMalloc(&work, mla_attend_work_bytes(heads, max_cells, T));
+            cudaMemset(work, 0, mla_attend_work_bytes(heads, max_cells, T));
+            std::vector<int32_t> fill(T, 0);
+            for (int use_cells = 0; use_cells < 3; ++use_cells) {   // spans, cell lists, lists with some rows filled (spans from 0)
                 std::vector<std::vector<int>> lists(T);
                 for (int t = 0; t < T; ++t) {
                     const int pos = pos0 + t;
@@ -349,20 +382,26 @@ void test_mla() {
                         for (int j = 0; j < counts[t]; ++j) lists[t].push_back(ring ? (first + j) % ring : first + j);
                     } else {   // every 3rd cell of the cap: a selection
                         firsts[t] = 0;
+                        fill[t] = 0;
+                        if (use_cells == 2 && t % 4 == 1) {   // a filled row: cells 0..pos, its list ignored
+                            counts[t] = fill[t] = pos + 1;
+                            for (int j = 0; j < counts[t]; ++j) lists[t].push_back(j);
+                            for (int j = 0; j < stride; ++j) cells_list[(size_t) t * stride + j] = cap - 1;
+                            continue;
+                        }
                         for (int c = t % 3; c < cap && (int) lists[t].size() < 900 + t; c += 3) lists[t].push_back(c);
                         counts[t] = (int) lists[t].size();
                         for (int j = 0; j < counts[t]; ++j) cells_list[(size_t) t * stride + j] = lists[t][j];
                     }
                 }
-                int32_t *df = dev(firsts), *dcnt = dev(counts), *dcl = dev(cells_list);
+                int32_t *df = dev(firsts), *dcnt = dev(counts), *dcl = dev(cells_list), *dfill = dev(fill);
                 RowSpans rs;
                 rs.firsts = df;
                 rs.counts = dcnt;
                 rs.cells = use_cells ? dcl : nullptr;
                 rs.cells_stride = stride;
-                if (bf) mla_attend(dqcur, dc16, rs, T, ds, a, use_cells ? 0 : ring, dlat, nullptr);
-                else mla_attend(dqcur, dc32, rs, T, ds, a, use_cells ? 0 : ring, dlat, nullptr);
-                std::vector<float> got = host(dlat, (size_t) T * heads * a.rank);
+                rs.fill = use_cells == 2 ? dfill : nullptr;
+                const int rg = use_cells ? 0 : ring;
                 std::vector<double> ref;
                 for (int t = 0; t < T; ++t)
                     for (int h = 0; h < heads; ++h) {
@@ -370,35 +409,42 @@ void test_mla() {
                         std::vector<double> o = ref_attend(qrow, rows32, lists[t], h, a, sinks[h]);
                         ref.insert(ref.end(), o.begin(), o.end());
                     }
+                const char* mode = use_cells == 0 ? ", spans" : use_cells == 1 ? ", cell lists" : ", lists + filled";
+                // all T rows: a BF16 chunk (more than 8 rows) takes the tensor-core kernel (fp16 query and probabilities), fp32 two
+                // launches of the chunked kernel; then a window of the first 6 rows
+                if (bf) mla_attend(dqcur, dc16, rs, T, ds, a, rg, max_cells, work, dlat, nullptr);
+                else mla_attend(dqcur, dc32, rs, T, ds, a, rg, max_cells, work, dlat, nullptr);
+                std::vector<float> got = host(dlat, (size_t) T * heads * a.rank);
                 char name[96];
-                std::snprintf(name, sizeof name, "mla_attend %d heads%s%s", heads, use_cells ? ", cell lists" : ", spans", bf ? ", bf16" : "");
-                report(name, got, ref, bf ? 1e-3 : 1e-4);   // a BF16 chunk: fp16 query and probabilities on the tensor cores
-                if (!use_cells && !ring) {   // row independence: row 1 alone
-                    float* d1 = devf((size_t) 9 * heads * a.rank);
-                    RowSpans r1;
-                    r1.firsts = df + 1;
-                    r1.counts = dcnt + 1;
-                    // a BF16 chunk (more than 8 rows) takes the tensor-core kernel: row 1 as the first of 9 rows
-                    if (bf) mla_attend(dqcur + (size_t) heads * W, dc16, r1, 9, ds, a, 0, d1, nullptr);
-                    else mla_attend(dqcur + (size_t) heads * W, dc32, r1, 1, ds, a, 0, d1, nullptr);
-                    const bool same = std::memcmp(host(d1, (size_t) heads * a.rank).data(), got.data() + (size_t) heads * a.rank, (size_t) heads * a.rank * 4) == 0;
-                    std::printf("%-30s %s\n", "  row independence", same ? "bitwise" : "FAIL");
+                std::snprintf(name, sizeof name, "mla_attend %d heads%s%s", heads, mode, bf ? ", bf16 chunk" : "");
+                report(name, got, ref, bf ? 1e-3 : 1e-4);
+                const int TW = 6;
+                if (bf) mla_attend(dqcur, dc16, rs, TW, ds, a, rg, max_cells, work, dlat, nullptr);
+                else mla_attend(dqcur, dc32, rs, TW, ds, a, rg, max_cells, work, dlat, nullptr);
+                std::vector<float> win = host(dlat, (size_t) TW * heads * a.rank);
+                std::snprintf(name, sizeof name, "  window of %d%s", TW, bf ? " (bf16)" : "");
+                report(name, win, std::vector<double>(ref.begin(), ref.begin() + win.size()), 1e-5);
+                if (!bf) {   // the chunked kernel's rows in the window are the T-row call's
+                    const bool same = std::memcmp(win.data(), got.data(), win.size() * 4) == 0;
+                    std::printf("%-30s %s\n", "  window width", same ? "bitwise" : "FAIL");
                     failures += !same;
                 }
+                {   // row independence: row 1 alone against row 1 of the window
+                    float* d1 = devf((size_t) heads * a.rank);
+                    RowSpans r1 = rs;
+                    r1.firsts = df + 1;
+                    r1.counts = dcnt + 1;
+                    r1.cells = use_cells ? dcl + stride : nullptr;
+                    r1.fill = use_cells == 2 ? dfill + 1 : nullptr;
+                    if (bf) mla_attend(dqcur + (size_t) heads * W, dc16, r1, 1, ds, a, rg, max_cells, work, d1, nullptr);
+                    else mla_attend(dqcur + (size_t) heads * W, dc32, r1, 1, ds, a, rg, max_cells, work, d1, nullptr);
+                    const bool same = std::memcmp(host(d1, (size_t) heads * a.rank).data(), win.data() + (size_t) heads * a.rank, (size_t) heads * a.rank * 4) == 0;
+                    std::printf("%-30s %s\n", "  row independence", same ? "bitwise" : "FAIL");
+                    failures += !same;
+                    cudaFree(d1);
+                }
             }
-            // iota
-            int32_t* dcl = nullptr;
-            cudaMalloc(&dcl, (size_t) T * 64 * 4);
-            cudaMemset(dcl, 0xff, (size_t) T * 64 * 4);
-            std::vector<int32_t> fill = {10, 0, 33};
-            int32_t* dfill = dev(fill);
-            iota_cells(dcl, 64, dfill, T, nullptr);
-            std::vector<int32_t> ic = host(dcl, (size_t) T * 64);
-            bool ok = true;
-            for (int j = 0; j < 10; ++j) ok = ok && ic[j] == j;
-            ok = ok && ic[64] == -1;
-            for (int j = 0; j < 33; ++j) ok = ok && ic[2 * 64 + j] == j;
-            if (!bf) { std::printf("%-30s %s\n", "iota_cells", ok ? "equal" : "FAIL"); failures += !ok; }
+            cudaFree(work);
         }
     }
 }
@@ -616,7 +662,10 @@ void test_fp8() {
     RowSpans rs;
     rs.firsts = df;
     rs.counts = dcnt;
-    mla_attend(dqcur, dc, rs, T, ds, a, 0, dlat, nullptr);
+    void* work = nullptr;
+    cudaMalloc(&work, mla_attend_work_bytes(a.heads, cap, T));
+    cudaMemset(work, 0, mla_attend_work_bytes(a.heads, cap, T));
+    mla_attend(dqcur, dc, rs, T, ds, a, 0, cap, work, dlat, nullptr);
     std::vector<float> got = host(dlat, (size_t) T * a.heads * a.rank), qcur = host(dqcur, (size_t) T * a.heads * W);
     std::vector<double> ref;
     for (int t = 0; t < T; ++t)
@@ -628,6 +677,193 @@ void test_fp8() {
             ref.insert(ref.end(), o.begin(), o.end());
         }
     report("mla_attend (fp8 cache)", got, ref, 1e-4);
+}
+
+// mla_query (the k_b product, the query rows and the cache rows of a window in one launch) against q8_0_heads_gemv then
+// mla_prepare: the same bits, for each cache type, both head counts, 1 and 6 rows.
+void test_query() {
+    for (auto [heads, base_f, ring] : {std::tuple<int, float, int>{32, 1e7f, 0}, {64, 1e4f, 700}}) {
+        MlaArgs a;
+        a.heads = heads;
+        a.rope_base = base_f;
+        const int W = a.rank + a.rope, Q = a.nope + a.rope, pos0 = 650, cap = 1000;
+        Q8 kb = make_q8(heads * a.rank, a.nope);
+        uint8_t* dkb = dev(kb.bytes);
+        for (int T : {1, 6}) {
+            std::vector<float> q = randn((size_t) T * heads * Q), kvraw = randn((size_t) T * W), norm = randn(a.rank, 0.2f);
+            for (auto& v : norm) v += 1.f;
+            std::vector<int32_t> pos(T);
+            for (int t = 0; t < T; ++t) pos[t] = pos0 + 3 * t;   // positions from device memory, not consecutive
+            float *dq = dev(q), *dkv = dev(kvraw), *dn = dev(norm), *dqa = devf((size_t) T * heads * a.rank);
+            float *qc1 = devf((size_t) T * heads * W), *qc2 = devf((size_t) T * heads * W);
+            int32_t* dpos = dev(pos);
+            for (int ty = 0; ty < 3; ++ty) {
+                const size_t rb = ty == 0 ? (size_t) W * 4 : ty == 1 ? (size_t) W * 2 : (size_t) kFp8RowBytes;
+                uint8_t *c1 = nullptr, *c2 = nullptr;
+                cudaMalloc(&c1, cap * rb);
+                cudaMalloc(&c2, cap * rb);
+                cudaMemset(c1, 0, cap * rb);
+                cudaMemset(c2, 0, cap * rb);
+                q8_0_heads_gemv(dkb, dq, Q, heads * Q, heads, a.rank, a.nope, T, dqa, nullptr);
+                for (int t = 0; t < T; ++t) {   // mla_prepare takes consecutive positions: a row at a time
+                    const size_t qo = (size_t) t * heads;
+                    if (ty == 0) mla_prepare(dq + qo * Q, dqa + qo * a.rank, dkv + (size_t) t * W, dn, a, pos[t], 1, ring, qc1 + qo * W, (float*) c1, nullptr);
+                    if (ty == 1) mla_prepare(dq + qo * Q, dqa + qo * a.rank, dkv + (size_t) t * W, dn, a, pos[t], 1, ring, qc1 + qo * W, (uint16_t*) c1, nullptr);
+                    if (ty == 2) mla_prepare(dq + qo * Q, dqa + qo * a.rank, dkv + (size_t) t * W, dn, a, pos[t], 1, ring, qc1 + qo * W, c1, nullptr);
+                }
+                if (ty == 0) mla_query(dkb, dq, dkv, dn, a, dpos, T, ring, qc2, (float*) c2, nullptr);
+                if (ty == 1) mla_query(dkb, dq, dkv, dn, a, dpos, T, ring, qc2, (uint16_t*) c2, nullptr);
+                if (ty == 2) mla_query(dkb, dq, dkv, dn, a, dpos, T, ring, qc2, c2, nullptr);
+                const bool sq = host(qc1, (size_t) T * heads * W) == host(qc2, (size_t) T * heads * W);
+                const bool sc = host(c1, cap * rb) == host(c2, cap * rb);
+                char name[96];
+                std::snprintf(name, sizeof name, "mla_query %d heads, %d rows, %s", heads, T, ty == 0 ? "fp32" : ty == 1 ? "bf16" : "fp8");
+                std::printf("%-30s query %s, rows %s\n", name, sq ? "bitwise" : "FAIL", sc ? "bitwise" : "FAIL");
+                failures += !sq + !sc;
+                cudaFree(c1);
+                cudaFree(c2);
+            }
+        }
+    }
+}
+
+// The sparse layer at a long context: 2,048 selected cells (and the group's tail) of a 20,000-cell BF16 cache, rows of 6 with
+// differing counts (one of a single cell), and the row's independence of the window.
+void test_mla_long() {
+    MlaArgs a;
+    a.heads = 32;
+    const int W = a.rank + a.rope, T = 6, cap = 20000, stride = 2056;
+    std::vector<float> qcur = randn((size_t) T * a.heads * W, 0.3f), sinks = randn(a.heads), cache = randn((size_t) cap * W, 0.5f);
+    std::vector<uint16_t> cbf(cache.size());
+    for (size_t i = 0; i < cache.size(); ++i) {
+        cbf[i] = to_bf16(cache[i]);
+        cache[i] = from_bf16(cbf[i]);
+    }
+    std::vector<int32_t> firsts(T, 0), counts(T), cells((size_t) T * stride);
+    std::vector<std::vector<int>> lists(T);
+    std::mt19937 r(5);
+    for (int t = 0; t < T; ++t) {
+        const int n = t == 3 ? 1 : 2044 + t % 4 + 1;
+        std::vector<int> all(cap - 8);
+        for (int i = 0; i < cap - 8; ++i) all[i] = i;
+        std::shuffle(all.begin(), all.end(), r);
+        std::sort(all.begin(), all.begin() + n);
+        for (int j = 0; j < n; ++j) {
+            lists[t].push_back(all[j]);
+            cells[(size_t) t * stride + j] = all[j];
+        }
+        counts[t] = n;
+    }
+    float *dq = dev(qcur), *ds = dev(sinks), *dlat = devf((size_t) T * a.heads * a.rank), *d1 = devf((size_t) a.heads * a.rank);
+    uint16_t* dc = dev(cbf);
+    int32_t *df = dev(firsts), *dcnt = dev(counts), *dcl = dev(cells);
+    void* work = nullptr;
+    cudaMalloc(&work, mla_attend_work_bytes(a.heads, stride, T));
+    cudaMemset(work, 0, mla_attend_work_bytes(a.heads, stride, T));
+    RowSpans rs;
+    rs.firsts = df;
+    rs.counts = dcnt;
+    rs.cells = dcl;
+    rs.cells_stride = stride;
+    mla_attend(dq, dc, rs, T, ds, a, 0, stride, work, dlat, nullptr);
+    std::vector<float> got = host(dlat, (size_t) T * a.heads * a.rank);
+    std::vector<double> ref;
+    for (int t = 0; t < T; ++t)
+        for (int h = 0; h < a.heads; ++h) {
+            std::vector<float> qrow(qcur.begin() + (size_t) t * a.heads * W, qcur.begin() + (size_t) (t + 1) * a.heads * W);
+            std::vector<double> o = ref_attend(qrow, cache, lists[t], h, a, sinks[h]);
+            ref.insert(ref.end(), o.begin(), o.end());
+        }
+    report("mla_attend 2,048 selected", got, ref, 1e-5);
+    RowSpans r1 = rs;
+    r1.firsts = df + 4;
+    r1.counts = dcnt + 4;
+    r1.cells = dcl + (size_t) 4 * stride;
+    mla_attend(dq + (size_t) 4 * a.heads * W, dc, r1, 1, ds, a, 0, stride, work, d1, nullptr);
+    const bool same = std::memcmp(host(d1, (size_t) a.heads * a.rank).data(), got.data() + (size_t) 4 * a.heads * a.rank, (size_t) a.heads * a.rank * 4) == 0;
+    std::printf("%-30s %s\n", "  row independence", same ? "bitwise" : "FAIL");
+    failures += !same;
+    cudaFree(work);
+}
+
+// Microbench of a window's attention kernels at the model's geometry (the weights rotate through more than the L2 holds):
+// us per call and GB/s of the bytes each must read.
+void bench_mla() {
+    cudaStream_t st;
+    cudaStreamCreate(&st);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    const size_t pool = (size_t) 256 << 20;
+    uint8_t* wp = nullptr;
+    cudaMalloc(&wp, pool);
+    cudaMemset(wp, 0x11, pool);
+    auto timed = [&](int reps, auto&& fn) {
+        fn(0);
+        cudaEventRecord(e0, st);
+        for (int i = 0; i < reps; ++i) fn(i);
+        cudaEventRecord(e1, st);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        return 1000.0 * ms / reps;
+    };
+    for (int heads : {32, 64}) {
+        MlaArgs a;
+        a.heads = heads;
+        const int W = a.rank + a.rope, Q = a.nope + a.rope;
+        const size_t kb = (size_t) heads * a.rank * (a.nope / 32) * 34, vb = (size_t) heads * 256 * (a.rank / 32) * 34;
+        const int nkb = (int) (pool / kb), nvb = (int) (pool / vb);
+        float *dq = dev(randn((size_t) 8 * heads * Q)), *dkv = dev(randn((size_t) 8 * W)), *dn = dev(randn(a.rank)),
+              *qc = devf((size_t) 8 * heads * W), *lat = dev(randn((size_t) 8 * heads * a.rank)), *vo = devf((size_t) 8 * heads * 256);
+        std::vector<int32_t> pos(8);
+        for (int t = 0; t < 8; ++t) pos[t] = 100 + t;
+        int32_t* dpos = dev(pos);
+        uint16_t* cache = nullptr;
+        cudaMalloc(&cache, (size_t) 4096 * W * 2);
+        for (int T : {1, 6}) {
+            const double uq = timed(200, [&](int i) { mla_query(wp + (size_t) (i % nkb) * kb, dq, dkv, dn, a, dpos, T, 0, qc, cache, st); });
+            const double uv = timed(200, [&](int i) { q8_0_heads_gemv(wp + (size_t) (i % nvb) * vb, lat, a.rank, heads * a.rank, heads, 256, a.rank, T, vo, st); });
+            std::printf("bench: %d heads, %d rows: mla_query %.1f us (%.0f GB/s of k_b), v_b %.1f us (%.0f GB/s)\n", heads, T, uq, kb / uq / 1e3, uv,
+                        vb / uv / 1e3);
+        }
+        cudaFree(cache);
+    }
+    // attention: SWA (64 heads, 512 cells) and sparse (32 heads, 2,048 cells; and 100 at a short context), BF16 rows
+    for (auto [heads, n, ring] : {std::tuple<int, int, int>{64, 512, 520}, {32, 2048, 0}, {32, 100, 0}}) {
+        MlaArgs a;
+        a.heads = heads;
+        const int W = a.rank + a.rope, cap = 20000, stride = 2056;
+        const int ncopies = (int) (pool / ((size_t) cap * W * 2));
+        float *qc = dev(randn((size_t) 8 * heads * W, 0.3f)), *sk = dev(randn(heads)), *lat = devf((size_t) 8 * heads * a.rank);
+        std::vector<int32_t> firsts(8), counts(8, n), cl((size_t) 8 * stride);
+        for (int t = 0; t < 8; ++t) {
+            firsts[t] = ring ? 7 : 0;
+            for (int j = 0; j < stride; ++j) cl[(size_t) t * stride + j] = (j * 9 + t) % cap;
+        }
+        int32_t *df = dev(firsts), *dc = dev(counts), *dl = dev(cl);
+        const int maxc = ring ? 512 : stride;
+        void* work = nullptr;
+        cudaMalloc(&work, mla_attend_work_bytes(heads, maxc, 8));
+        cudaMemset(work, 0, mla_attend_work_bytes(heads, maxc, 8));
+        RowSpans rs;
+        rs.firsts = df;
+        rs.counts = dc;
+        if (!ring) {
+            rs.cells = dl;
+            rs.cells_stride = stride;
+        }
+        for (int T : {1, 6}) {
+            const double u = timed(200, [&](int i) {
+                mla_attend(qc, (const uint16_t*) (wp + (size_t) (i % ncopies) * cap * W * 2), rs, T, sk, a, ring, maxc, work, lat, st);
+            });
+            const double bytes = (double) n * W * 2;   // a row's cells, read once for all heads (the rows of a window overlap)
+            std::printf("bench: attend %d heads, %d cells, %d rows: %.1f us (%.0f GB/s of the cells)\n", heads, n, T, u, bytes / u / 1e3);
+        }
+        cudaFree(work);
+    }
+    cudaFree(wp);
+    cudaStreamDestroy(st);
 }
 
 void test_mmq_dense() {
@@ -849,10 +1085,13 @@ int main() {
     test_engram();
     test_indexer();
     test_fp8();
+    test_query();
+    test_mla_long();
     test_mmq_dense();
     test_mmq_expert(12, "mmq experts Q4_K");
     test_mmq_expert(14, "mmq experts Q6_K");
     test_prompt_vs_decode_nvfp4();
+    bench_mla();
     std::printf(failures ? "FAILED\n" : "all ok\n");
     return failures ? 1 : 0;
 }
