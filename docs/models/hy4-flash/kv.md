@@ -45,3 +45,21 @@ The indexer scores every pooled key (one per 4 positions) for every row and keep
 time on the tensor cores (q in two fp16 halves): 564 us for 64 rows against 131,072 pools, 122 TFLOP/s, at the compute floor. The
 selection is a radix search over 11, 11 and 10 bits of the scores' order keys: 255 us for the same batch, 439 us for one row of
 262,144 pools (a 1M context). Summed over a 1M prompt the indexer takes about 2.5 minutes (*est*, from these figures).
+
+## Measured
+
+NVFP4 pack, RTX 5090 (main) + RTX 5060 Ti (expert tier), both at their default power limits, `--max-context` sized to the run.
+
+| | 16-bit rows | `--kv fp8` |
+|---|---|---|
+| Prompt read, 112,960 tokens (tiers pinned) | 3,291 tok/s | 3,208 tok/s |
+| Prompt read, 225,880 tokens (tiers pinned) | | 3,041 tok/s |
+| Needle at 10 / 50 / 90 % of 253,410 tokens | pass / pass / pass | pass / pass / pass |
+| Decode after a 116,202-token prompt (`--spec 6`) | 68.4 tok/s, hits 83 % | 69.9 tok/s, hits 84 % |
+| Decode after a 253,410-token prompt (`--spec 6`) | 54 to 62 tok/s, hits 64 to 80 % | |
+| Needle at 50 % of 1,015,207 tokens | | pass (read in 486 s, 2,090 tok/s) |
+| Decode after the 1,015,207-token prompt (`--spec 6`) | | 43.1 tok/s, hits 60 % |
+
+The needle is a passphrase sentence in wikitext, asked for with thinking off; prompts of 253K tokens read in 94 to 98 s. After a
+long prompt the tier takes back the slots its room still holds (114 to 122 of 129 per layer at 253K, 75 at 1M with FP8 rows) and
+decode refills them.
