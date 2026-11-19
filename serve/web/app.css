@@ -305,3 +305,19 @@ tr.live td { color: var(--accent); }
 .tot { flex: none; padding: 9px 20px; border-top: 1px solid var(--line); font: 400 11.5px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: default; }
 @media (max-width: 560px) { .tot { white-space: normal; line-height: 1.4; padding: 9px 16px; } }
 @media (max-width: 560px) { #foot-dec { flex-wrap: wrap; row-gap: 10px; } }
+
+/* pricing dialog */
+.pdlg { background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 12px; padding: 24px; max-width: 360px; width: 90vw; }
+.pdlg::backdrop { background: rgba(0,0,0,.5); }
+.pdlg h3 { margin: 0 0 16px; font-size: 15px; }
+.pf { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.pf label { flex: 0 0 110px; font-size: 12px; color: var(--fg-3); }
+.pf input { flex: 1; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--fg); padding: 6px 10px; font: 14px var(--font); }
+.pf input:focus { outline: none; border-color: var(--accent, #58a6ff); }
+.pa { display: flex; gap: 8px; margin-top: 16px; }
+.pb { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: 13px var(--font); cursor: pointer; }
+.pb:hover { border-color: var(--accent, #58a6ff); }
+.pb.pp { background: var(--accent, #1f6feb); border-color: var(--accent, #1f6feb); color: #fff; }
+.pb.pd { color: #f85149; border-color: #f85149; }
+.pm { margin-top: 10px; font-size: 12px; color: #f85149; min-height: 16px; }
+.pm.ok { color: #3fb950; }
