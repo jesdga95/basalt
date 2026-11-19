@@ -564,6 +564,124 @@ void test_indexer() {
 }
 
 
+// The selection at long range: 262,144 pools (a 1M context), random scores and runs of ties around the cut, by one row and by
+// rows of different pool counts, against a stable sort.
+// Microbench of a prompt's indexer batch at long range: 64 rows against 131,072 pools (the middle of a 1M prompt), the
+// tensor-core scores and the selection.
+void bench_indexer_batch() {
+    IndexerArgs a;
+    const int rows = 64, NP = 131072, K = 511, P = 4, cs = K * P + 8;
+    std::vector<float> q = randn((size_t) rows * a.heads * a.dim, 0.1f), w = randn((size_t) rows * a.heads);
+    std::vector<float> kf = randn((size_t) NP * a.dim);
+    std::vector<uint16_t> keys((size_t) NP * a.dim);
+    for (size_t i = 0; i < keys.size(); ++i) keys[i] = f2h(kf[i]);
+    std::vector<int32_t> meta;
+    for (int r = 0; r < rows; ++r) meta.insert(meta.end(), {NP - r, (NP - r) * P, 1});
+    float *dq = dev(q), *dw = dev(w), *ds = devf((size_t) rows * NP);
+    uint16_t* dk = dev(keys);
+    int32_t *dm = dev(meta), *dc = nullptr;
+    cudaMalloc(&dc, (size_t) rows * cs * 4);
+    cudaStream_t st;
+    cudaStreamCreate(&st);
+    cudaEvent_t e0, e1, e2;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    cudaEventCreate(&e2);
+    idx_scores_rows(dq, dw, dk, dm, NP, rows, a, ds, NP, st);
+    idx_select_rows(ds, NP, dm, rows, K, P, dc, cs, st);
+    cudaEventRecord(e0, st);
+    for (int it = 0; it < 10; ++it) idx_scores_rows(dq, dw, dk, dm, NP, rows, a, ds, NP, st);
+    cudaEventRecord(e1, st);
+    for (int it = 0; it < 10; ++it) idx_select_rows(ds, NP, dm, rows, K, P, dc, cs, st);
+    cudaEventRecord(e2, st);
+    cudaEventSynchronize(e2);
+    float m1 = 0.f, m2 = 0.f;
+    cudaEventElapsedTime(&m1, e0, e1);
+    cudaEventElapsedTime(&m2, e1, e2);
+    const double flop = 2.0 * 2.0 * rows * a.heads * (double) NP * a.dim;   // q in two fp16 halves
+    std::printf("%-30s scores %.0f us (%.1f TFLOP/s), select %.0f us, per 64 rows x 131072 pools\n", "indexer batch microbench",
+                m1 * 100.f, flop / (m1 / 10.0 * 1e-3) / 1e12, m2 * 100.f);
+    cudaFree(dq);
+    cudaFree(dw);
+    cudaFree(ds);
+    cudaFree(dk);
+    cudaFree(dm);
+    cudaFree(dc);
+    cudaStreamDestroy(st);
+}
+
+void test_select_long() {
+    const int NP = 262144, K = 511, P = 4, tail_n = 2;
+    std::vector<int> counts = {NP, NP - 77, 3000, 513};
+    for (int ties = 0; ties < 3; ++ties) {
+        std::vector<float> s = randn((size_t) NP);
+        if (ties == 1)
+            for (auto& v : s) v = std::floor(v * 64.f) / 64.f;   // many equal scores around the cut
+        if (ties == 2)
+            for (int p = 0; p < NP; ++p) s[(size_t) p] = (p % 7 == 0) ? 1.f : -std::fabs(s[(size_t) p]);   // more ties than K at the top
+        const int rows = (int) counts.size(), cs = K * P + 8;
+        std::vector<float> sr((size_t) rows * NP);
+        std::vector<int32_t> meta;
+        for (int r = 0; r < rows; ++r) {
+            std::copy(s.begin(), s.begin() + counts[(size_t) r], sr.begin() + (size_t) r * NP);
+            meta.insert(meta.end(), {counts[(size_t) r], counts[(size_t) r] * P, tail_n});
+        }
+        float* ds = dev(sr);
+        int32_t *dm = dev(meta), *dc = nullptr;
+        cudaMalloc(&dc, (size_t) rows * cs * 4);
+        idx_select_rows(ds, NP, dm, rows, K, P, dc, cs, nullptr);
+        std::vector<int32_t> got = host(dc, (size_t) rows * cs);
+        int32_t* d1 = nullptr;
+        cudaMalloc(&d1, (size_t) cs * 4);
+        idx_select(ds, NP, K, P, NP * P, tail_n, d1, nullptr);
+        std::vector<int32_t> one = host(d1, (size_t) cs);
+        if (ties == 0) {   // microbench: one row of 262,144 pools, and a decode window of 8 rows
+            cudaEvent_t e0, e1;
+            cudaEventCreate(&e0);
+            cudaEventCreate(&e1);
+            float ms1 = 0.f, ms8 = 0.f;
+            std::vector<int32_t> m8;
+            for (int r = 0; r < 8; ++r) m8.insert(m8.end(), {NP, NP * P, tail_n});
+            int32_t* dm8 = dev(m8);
+            float* ds8 = devf((size_t) 8 * NP);
+            for (int r = 0; r < 8; ++r) cudaMemcpy(ds8 + (size_t) r * NP, ds, (size_t) NP * 4, cudaMemcpyDeviceToDevice);
+            int32_t* dc8 = nullptr;
+            cudaMalloc(&dc8, (size_t) 8 * cs * 4);
+            idx_select(ds, NP, K, P, NP * P, tail_n, d1, nullptr);
+            cudaEventRecord(e0);
+            for (int it = 0; it < 20; ++it) idx_select_rows(ds8, NP, dm8, 1, K, P, dc8, cs, 0);
+            cudaEventRecord(e1);
+            cudaEventSynchronize(e1);
+            cudaEventElapsedTime(&ms1, e0, e1);
+            cudaEventRecord(e0);
+            for (int it = 0; it < 20; ++it) idx_select_rows(ds8, NP, dm8, 8, K, P, dc8, cs, 0);
+            cudaEventRecord(e1);
+            cudaEventSynchronize(e1);
+            cudaEventElapsedTime(&ms8, e0, e1);
+            std::printf("%-30s %.1f us per row alone, %.1f us per window of 8 rows\n", "  microbench", ms1 * 1000.f / 20.f, ms8 * 1000.f / 20.f);
+            cudaFree(dm8); cudaFree(ds8); cudaFree(dc8);
+        }
+        bool ok = true;
+        for (int r = 0; r < rows; ++r) {
+            const int n = counts[(size_t) r];
+            std::vector<int> order(n);
+            for (int i = 0; i < n; ++i) order[(size_t) i] = i;
+            std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return s[(size_t) x] > s[(size_t) y]; });
+            std::vector<int> pick(order.begin(), order.begin() + K);
+            std::sort(pick.begin(), pick.end());
+            for (int i = 0; i < K; ++i)
+                for (int j = 0; j < P; ++j) {
+                    ok = ok && got[(size_t) r * cs + i * P + j] == pick[(size_t) i] * P + j;
+                    if (r == 0) ok = ok && one[(size_t) i * P + j] == pick[(size_t) i] * P + j;
+                }
+            for (int j = 0; j < tail_n; ++j) ok = ok && got[(size_t) r * cs + K * P + j] == n * P + j;
+        }
+        std::printf("%-30s %s\n", ties == 0 ? "idx_select 262144 pools" : ties == 1 ? "  ties near the cut" : "  more ties than k", ok ? "equal" : "FAIL");
+        failures += !ok;
+        cudaFree(ds); cudaFree(dm); cudaFree(dc); cudaFree(d1);
+    }
+}
+
 void test_fp8() {
     MlaArgs a;
     a.heads = 32;
@@ -571,6 +689,7 @@ void test_fp8() {
     std::vector<float> q = randn((size_t) T * a.heads * Q), qabs = randn((size_t) T * a.heads * a.rank, 0.3f), kvraw = randn((size_t) T * W, 2.f),
                        norm = randn(a.rank, 0.5f), sinks = randn(a.heads);
     for (auto& v : norm) v += 1.f;
+    for (int c = 0; c < 128; ++c) norm[(size_t) c] *= 1e-5f;   // a group under the scale's floor
     float *dq = dev(q), *dqa = dev(qabs), *dkv = dev(kvraw), *dn = dev(norm), *ds = dev(sinks);
     float *dqcur = devf((size_t) T * a.heads * W), *dlat = devf((size_t) T * a.heads * a.rank);
     uint8_t* dc = nullptr;
@@ -583,6 +702,15 @@ void test_fp8() {
         const double v = e ? std::ldexp(1.0 + m / 8.0, e - 7) : std::ldexp((double) m, -9);
         return (b & 0x80) ? -v : v;
     };
+    auto e4m3_rn = [&](double x) {   // nearest code, ties to the even code, saturating at 448
+        uint8_t best = 0;
+        double bd = 1e300;
+        for (int b = 0; b < 127; ++b) {
+            const double d = std::fabs(std::fabs(x) - e4m3((uint8_t) b));
+            if (d < bd || (d == bd && (b & 1) == 0)) { bd = d; best = (uint8_t) b; }
+        }
+        return (uint8_t) (best | (std::signbit(x) ? 0x80 : 0));
+    };
     // decoded rows (what the attention reads) and a check of the rows against the fp32 preparation
     std::vector<float> dec((size_t) cap * W, 0.f);
     bool ok = true;
@@ -593,13 +721,24 @@ void test_fp8() {
         const double rs = 1.0 / std::sqrt(ss / a.rank + a.rms_eps);
         const float* scales = reinterpret_cast<const float*>(row + 512);
         for (int g = 0; g < 4; ++g) {
+            // vLLM's rule over the BF16 latent: scale 2^ceil(log2(max(amax / 448, 1e-4))), codes E4M3(v / scale) to nearest even
+            std::vector<double> v(128);
             double amax = 0;
-            for (int c = g * 128; c < g * 128 + 128; ++c) amax = std::max(amax, std::fabs(kvraw[(size_t) t * W + c] * rs * norm[c]));
-            ok = ok && std::fabs(scales[g] - amax / 448.0) <= 1e-6 * amax / 448.0 + 1e-12;
-            for (int c = g * 128; c < g * 128 + 128; ++c) {
-                const double ref = kvraw[(size_t) t * W + c] * rs * norm[c], got = e4m3(row[c]) * scales[g];
-                dec[(size_t) (pos0 + t) * W + c] = (float) got;
-                ok = ok && std::fabs(got - ref) <= 0.0625 * amax + 1e-6;   // E4M3: 3 mantissa bits
+            for (int c = 0; c < 128; ++c) {
+                const int k = g * 128 + c;
+                v[(size_t) c] = from_bf16(to_bf16((float) (kvraw[(size_t) t * W + k] * rs * norm[k])));
+                amax = std::max(amax, std::fabs(v[(size_t) c]));
+            }
+            int e;
+            const double fr = std::frexp(std::max(amax / 448.0, 1e-4), &e);
+            const double scale = std::ldexp(1.0, fr == 0.5 ? e - 1 : e);
+            ok = ok && scales[g] == (float) scale;
+            for (int c = 0; c < 128; ++c) {
+                const int k = g * 128 + c;
+                ok = ok && row[k] == e4m3_rn(v[(size_t) c] / scale);
+                const double got = e4m3(row[k]) * scales[g];
+                dec[(size_t) (pos0 + t) * W + k] = (float) got;
+                ok = ok && from_bf16(to_bf16((float) got)) == (float) got;   // decodes to a BF16 value
             }
         }
         for (int c = 0; c < a.rope; ++c) {
@@ -848,6 +987,8 @@ int main() {
     test_router();
     test_engram();
     test_indexer();
+    test_select_long();
+    bench_indexer_batch();
     test_fp8();
     test_mmq_dense();
     test_mmq_expert(12, "mmq experts Q4_K");
