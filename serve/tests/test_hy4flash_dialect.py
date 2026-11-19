@@ -170,10 +170,11 @@ class Tokens(unittest.TestCase):
             self.assertEqual(d.forced_opening("f"), f"<tool_calls{suffix}><tool_call{suffix}>f")
             self.assertEqual(d.forced_opening(None), f"<tool_calls{suffix}><tool_call{suffix}>")
 
-    def test_the_images_reach_the_engine_as_flash_next_s_do(self):
-        # a sidecar encodes them: the pad run follows the start token, one pad per row
+    def test_the_images_are_encoded_in_the_engine(self):
+        # --vision dynamic only: the engine places a pictures rows by the models grid (a newline column per line), which a
+        # sidecar does not know; the pad run follows the start token, one pad per row
         d = Hy4Flash()
-        self.assertFalse(d.in_engine_vision)
+        self.assertTrue(d.in_engine_vision)
         self.assertEqual(d.video_pad, "")
         self.assertTrue(d.image_start and d.image_pad)
 
