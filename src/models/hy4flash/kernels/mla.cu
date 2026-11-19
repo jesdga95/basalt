@@ -82,17 +82,19 @@ __device__ __forceinline__ void store_cell(uint16_t* cache, size_t cell, const f
     for (int c = threadIdx.x; c < a.rank; c += blockDim.x) row[c] = bf16_bits(lat[c]);
     for (int c = threadIdx.x; c < a.rope; c += blockDim.x) row[a.rank + c] = bf16_bits(rp[c]);
 }
+// vLLM's fp8_ds_mla row of the BF16 latent (concat_and_cache_ds_mla): per 128 values the scale 2^ceil(log2(max(amax / 448, 1e-4))),
+// codes = E4M3(v / scale) round to nearest, saturating; the rope values BF16. A code times its power-of-two scale is a BF16 value,
+// so the row decodes exactly. Needs a block of at least 512 threads (a quarter of them per scale).
 __device__ __forceinline__ void store_cell(uint8_t* cache, size_t cell, const float* lat, const float* rp, const MlaArgs& a, float* red) {
     uint8_t* row = cache + cell * kFp8RowBytes;
-    // a scale per 128 latent values: amax / 448 (a 512-thread block: a quarter each)
     const int c = threadIdx.x, g = c >> 7;
-    float amax = c < kFp8Codes ? fabsf(lat[c]) : 0.f;
-    amax = warp_max(amax);
+    const float v = c < kFp8Codes ? __bfloat162float(__float2bfloat16_rn(lat[c])) : 0.f;
+    const float amax = warp_max(fabsf(v));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = amax;
     __syncthreads();
     const float m = fmaxf(fmaxf(red[g * 4], red[g * 4 + 1]), fmaxf(red[g * 4 + 2], red[g * 4 + 3]));
-    const float scale = m > 0.f ? m / 448.f : 1.f;
-    if (c < kFp8Codes) row[c] = __nv_cvt_float_to_fp8(lat[c] / scale, __NV_SATFINITE, __NV_E4M3);
+    const float scale = exp2f(ceilf(log2f(fmaxf(m / 448.f, 1e-4f))));
+    if (c < kFp8Codes) row[c] = __nv_cvt_float_to_fp8(v / scale, __NV_SATFINITE, __NV_E4M3);
     if ((c & 127) == 0 && c < kFp8Codes) reinterpret_cast<float*>(row + kFp8ScaleOff)[g] = scale;
     for (int i = threadIdx.x; i < a.rope; i += blockDim.x) reinterpret_cast<uint16_t*>(row + kFp8RopeOff)[i] = bf16_bits(rp[i]);
     __syncthreads();

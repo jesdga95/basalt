@@ -569,6 +569,7 @@ void test_fp8() {
     std::vector<float> q = randn((size_t) T * a.heads * Q), qabs = randn((size_t) T * a.heads * a.rank, 0.3f), kvraw = randn((size_t) T * W, 2.f),
                        norm = randn(a.rank, 0.5f), sinks = randn(a.heads);
     for (auto& v : norm) v += 1.f;
+    for (int c = 0; c < 128; ++c) norm[(size_t) c] *= 1e-5f;   // a group under the scale's floor
     float *dq = dev(q), *dqa = dev(qabs), *dkv = dev(kvraw), *dn = dev(norm), *ds = dev(sinks);
     float *dqcur = devf((size_t) T * a.heads * W), *dlat = devf((size_t) T * a.heads * a.rank);
     uint8_t* dc = nullptr;
@@ -581,6 +582,15 @@ void test_fp8() {
         const double v = e ? std::ldexp(1.0 + m / 8.0, e - 7) : std::ldexp((double) m, -9);
         return (b & 0x80) ? -v : v;
     };
+    auto e4m3_rn = [&](double x) {   // nearest code, ties to the even code, saturating at 448
+        uint8_t best = 0;
+        double bd = 1e300;
+        for (int b = 0; b < 127; ++b) {
+            const double d = std::fabs(std::fabs(x) - e4m3((uint8_t) b));
+            if (d < bd || (d == bd && (b & 1) == 0)) { bd = d; best = (uint8_t) b; }
+        }
+        return (uint8_t) (best | (std::signbit(x) ? 0x80 : 0));
+    };
     // decoded rows (what the attention reads) and a check of the rows against the fp32 preparation
     std::vector<float> dec((size_t) cap * W, 0.f);
     bool ok = true;
@@ -591,13 +601,24 @@ void test_fp8() {
         const double rs = 1.0 / std::sqrt(ss / a.rank + a.rms_eps);
         const float* scales = reinterpret_cast<const float*>(row + 512);
         for (int g = 0; g < 4; ++g) {
+            // vLLM's rule over the BF16 latent: scale 2^ceil(log2(max(amax / 448, 1e-4))), codes E4M3(v / scale) to nearest even
+            std::vector<double> v(128);
             double amax = 0;
-            for (int c = g * 128; c < g * 128 + 128; ++c) amax = std::max(amax, std::fabs(kvraw[(size_t) t * W + c] * rs * norm[c]));
-            ok = ok && std::fabs(scales[g] - amax / 448.0) <= 1e-6 * amax / 448.0 + 1e-12;
-            for (int c = g * 128; c < g * 128 + 128; ++c) {
-                const double ref = kvraw[(size_t) t * W + c] * rs * norm[c], got = e4m3(row[c]) * scales[g];
-                dec[(size_t) (pos0 + t) * W + c] = (float) got;
-                ok = ok && std::fabs(got - ref) <= 0.0625 * amax + 1e-6;   // E4M3: 3 mantissa bits
+            for (int c = 0; c < 128; ++c) {
+                const int k = g * 128 + c;
+                v[(size_t) c] = from_bf16(to_bf16((float) (kvraw[(size_t) t * W + k] * rs * norm[k])));
+                amax = std::max(amax, std::fabs(v[(size_t) c]));
+            }
+            int e;
+            const double fr = std::frexp(std::max(amax / 448.0, 1e-4), &e);
+            const double scale = std::ldexp(1.0, fr == 0.5 ? e - 1 : e);
+            ok = ok && scales[g] == (float) scale;
+            for (int c = 0; c < 128; ++c) {
+                const int k = g * 128 + c;
+                ok = ok && row[k] == e4m3_rn(v[(size_t) c] / scale);
+                const double got = e4m3(row[k]) * scales[g];
+                dec[(size_t) (pos0 + t) * W + k] = (float) got;
+                ok = ok && from_bf16(to_bf16((float) got)) == (float) got;   // decodes to a BF16 value
             }
         }
         for (int c = 0; c < a.rope; ++c) {
