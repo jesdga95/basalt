@@ -220,13 +220,9 @@ public:
         }
         if (!make_bufs(dec_, kMaxWindow, err)) return false;
         use(dec_);
-        if (m_.dfly() && fp8()) {
-            err = "--spec reads the target's BF16 latent rows: it cannot run with --kv fp8 (use --kv bf16 or --spec 0)";
-            return false;
-        }
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
         if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, m_.dfly() ? (const uint16_t*) m_.tensor("output.weight")->ptr : nullptr,
-                        [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), err))
+                        [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
             return false;
         return true;
     }
@@ -366,9 +362,7 @@ public:
     // DFLY HOOK: --spec sets the window (DeepSeek's rule: 0 or 1 is plain decode), and the drafter's calls (dfly.hpp)
     int max_window() const override { return std::clamp(m_.spec(), 1, kMaxWindow); }
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
-        std::vector<uint16_t*> rows;   // the drafter reads BF16 rows (--spec with --kv fp8 is refused at the start)
-        for (uint8_t* p : cache_) rows.push_back((uint16_t*) p);
-        return dfly_.draft_begin(anchor, pos, n, rows, stream_);
+        return dfly_.draft_begin(anchor, pos, n, cache_, stream_);
     }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override { return dfly_.draft_end(ids, conf, max_n, n, stream_); }
 

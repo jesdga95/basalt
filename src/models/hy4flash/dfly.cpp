@@ -185,7 +185,8 @@ struct DflyRunner::Impl {
     float *X = nullptr, *X1 = nullptr, *xn = nullptr, *o = nullptr, *o2 = nullptr, *mlp = nullptr, *z = nullptr;
     float *qa = nullptr, *qan = nullptr, *q = nullptr, *kvraw = nullptr, *qabs = nullptr, *qcur = nullptr, *olat = nullptr,
           *vout = nullptr, *gate = nullptr, *g = nullptr, *u = nullptr, *h = nullptr;
-    uint16_t* ctx = nullptr;   ///< the rows a layer attends, BF16 as the target's cache: the selected ones, then the block's own
+    uint16_t* ctx = nullptr;   ///< the rows a layer attends, BF16: the selected ones, then the block's own
+    uint8_t* blk8 = nullptr;   ///< with FP8 caches, the block's own rows as FP8 rows before they are decoded into ctx
     int32_t *meta_d = nullptr, *meta_h = nullptr;   ///< per layer, the rows' first cells (0) and counts
     float *cat = nullptr, *fused = nullptr, *emb0 = nullptr, *pe = nullptr, *hg = nullptr, *hu = nullptr, *hh = nullptr,
           *hd = nullptr, *hcout = nullptr, *logits = nullptr, *craw = nullptr;
@@ -245,6 +246,7 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
     p.vout = p.dev(R * H * kDflyV, ok); p.gate = p.dev(R * H * kDflyV, ok);
     p.g = p.dev(R * d.ffn, ok); p.u = p.dev(R * d.ffn, ok); p.h = p.dev(R * d.ffn, ok);
     p.ctx = (uint16_t*) p.dev((size_t) (env.sel_cap + kDflyBlock) * kDflyRowWidth / 2 + 1, ok);
+    if (env.fp8) p.blk8 = (uint8_t*) p.dev((size_t) kDflyBlock * kFp8RowBytes / 4, ok);
     p.meta_d = (int32_t*) p.dev(kDflyMaxLayers * 16, ok);
     p.cat = p.dev(2 * E, ok); p.fused = p.dev(E, ok); p.emb0 = p.dev(E, ok); p.pe = p.dev(E, ok);
     p.hg = p.dev(d.hc_ffn, ok); p.hu = p.dev(d.hc_ffn, ok); p.hh = p.dev(d.hc_ffn, ok); p.hd = p.dev(E, ok); p.hcout = p.dev(E, ok);
@@ -263,7 +265,7 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
 
 DflyRunner::~DflyRunner() = default;
 
-bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const uint16_t* const* cache, void* stream,
+bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const void* const* cache, void* stream,
                        std::string& err) {
     Impl& p = *p_;
     const DflyDims& d = p.d;
@@ -327,7 +329,9 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             const DflyLayer& L = w.layer[(size_t) i];
             // the target's rows this block reads: the cells its row selected (or every position before the anchor)
             const int cnt = tap.count(i, row), nctx = nctxs[i];
-            dfly_gather_rows(cache[i], cnt < 0 ? nullptr : tap.cells(i, row), nctx, kDflyRowWidth, p.ctx, st);
+            const int32_t* cells = cnt < 0 ? nullptr : tap.cells(i, row);
+            if (p.env.fp8) dfly_gather_rows_fp8((const uint8_t*) cache[i], cells, nctx, p.ctx, st);
+            else dfly_gather_rows((const uint16_t*) cache[i], cells, nctx, kDflyRowWidth, p.ctx, st);
 
             bk::rms_norm_rows(p.X, L.in_ln, p.xn, R, E, d.rms_eps, st);
             p.mm(L.q_a, p.xn, E, p.qa, d.q_lora, E, d.q_lora, R, st);
@@ -336,7 +340,12 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             p.mm(L.kv_a, p.xn, E, p.kvraw, kDflyRowWidth, E, kDflyRowWidth, R, st);
             dfly_absorb_k(L.kv_b, p.q, H * QW, QW, R, H, p.qabs, st);
             // the block's rows land after the selected ones: cell pos + r of this base is row nctx + r of ctx
-            mla_prepare(p.q, p.qabs, p.kvraw, L.kv_a_ln, a, (int) pos, R, 0, p.qcur, p.ctx + ((int64_t) nctx - pos) * kDflyRowWidth, st);
+            if (p.env.fp8) {   // the block's rows as the target stores them: FP8 rows at cell pos + r of blk8's base, decoded after the selected ones
+                mla_prepare(p.q, p.qabs, p.kvraw, L.kv_a_ln, a, (int) pos, R, 0, p.qcur, p.blk8 - (int64_t) pos * kFp8RowBytes, st);
+                dfly_gather_rows_fp8(p.blk8, nullptr, R, p.ctx + (int64_t) nctx * kDflyRowWidth, st);
+            } else {
+                mla_prepare(p.q, p.qabs, p.kvraw, L.kv_a_ln, a, (int) pos, R, 0, p.qcur, p.ctx + ((int64_t) nctx - pos) * kDflyRowWidth, st);
+            }
             RowSpans rs;
             rs.firsts = p.meta_d + i * 16;
             rs.counts = p.meta_d + i * 16 + 8;
@@ -435,8 +444,9 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
 DflyHook::~DflyHook() = default;
 
 bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16_t* head, std::function<bool(int32_t, float*)> embed,
-                    const std::string& dump, std::string& err) {
+                    const std::string& dump, bool fp8, std::string& err) {
     if (!w) return true;
+    fp8_ = fp8;
     dump_ = dump;
     head_ = head;
     embed_ = embed;
@@ -449,16 +459,17 @@ bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16
     env.head = head;
     env.embed = std::move(embed);
     env.sel_cap = sel_cap;
+    env.fp8 = fp8;
     runner_ = DflyRunner::create(env, err);
     return runner_ != nullptr;
 }
 
-model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint16_t*>& cache, void* stream) {
+model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint8_t*>& cache, void* stream) {
     if (!runner_) return {model::Status::NotImplemented, "hy4flash: the pack has no drafter, or --spec is 0"};
     pending_ = 0;
     const int row = tap_->source_row(pos);
     if (row < 0 || pos + kDflyBlock > ctx_) return {};   // no hidden state to draft from (a prompt's end): the window goes plain
-    const uint16_t* caches[kDflyMaxLayers];
+    const void* caches[kDflyMaxLayers];
     for (int i = 0; i < w_->dims.layers; ++i) caches[i] = cache[(size_t) w_->dims.kv_layers[(size_t) i]];
     n = std::clamp(n, 1, kDflyDrafts);
     std::string err;
@@ -481,7 +492,7 @@ model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const st
         dump_n_ = n;
         put("hid.f32", tap_->hidden_row(row), (size_t) w_->dims.E * 4);
         for (int i = 0; i < w_->dims.layers; ++i)
-            if (tap_->count(i, row) < 0) put("kv" + std::to_string(i) + ".u16", caches[i], (size_t) pos * kDflyRowWidth * 2);
+            if (tap_->count(i, row) < 0 && !fp8_) put("kv" + std::to_string(i) + ".u16", caches[i], (size_t) pos * kDflyRowWidth * 2);
     }
     return {};
 }
