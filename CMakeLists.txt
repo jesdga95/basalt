@@ -456,6 +456,9 @@ if(PEER_ADA)
     src/prefill/mmq/instances/mmq_q4_k.cu
     src/prefill/mmq/instances/mmq_q5_k.cu
     src/prefill/mmq/instances/mmq_q6_k.cu
+    # NVFP4's instance is the Q3_K-layout Q8_1/DQ dot (mmq.cuh: "one scale per 16 values"), not the Blackwell FP4
+    # kernels: an Ada peer asked to compute its experts' rows of a prompt chunk reads them through this one.
+    src/prefill/mmq/instances/mmq_nvfp4.cu
     src/kernels/cuda/iq_kernels.cu
     src/kernels/cuda/quantize_act.cu
     src/kernels/cuda/wait_abort.cu
