@@ -1,7 +1,7 @@
 // include/basalt/kernels/mqa_chunk.cuh - one chunk of a decode MQA over a shared 512-wide latent: the scores of 64 rows
 // for 8 or 16 heads, their softmax statistics and the unnormalised weighted sum of the rows' latents, and the merge of
 // a head's chunks with an attention sink. Device code only (no kernel): include from a .cu. Adapted from the
-// DeepSeek-V4.1 attention graph (build_attention41) in the llama.cpp DeepSeek-V4.1 support.
+// llama.cpp latent MQA attention graph (build_attention41).
 // MIT License
 // Copyright (c) 2023-2026 The ggml authors
 //
