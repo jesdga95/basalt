@@ -460,7 +460,7 @@ public:
             if (need > backed_) {
                 const int64_t ceiling = kv_ceiling();
                 if (need > ceiling)
-                    return {model::Status::Error, "hy4flash: elastic KV: " + std::to_string(need) + " positions would take the expert tier below the " +
+                    return {model::Status::Refused, "hy4flash: elastic KV: " + std::to_string(need) + " positions would take the expert tier below the " +
                                                       std::to_string(prompt_floor_bytes() / stride_) + " slots a prompt chunk needs (about " +
                                                       std::to_string(ceiling) + " fit; --kv fp8 halves a position's bytes)"};
             }
@@ -471,7 +471,7 @@ public:
         for (int t0 = 0; t0 < r.n_tokens; t0 += chunk) {
             if (r.stop && r.stop()) break;
             const int n = std::min(chunk, r.n_tokens - t0);
-            if (!run_rows(r.tokens + t0, n, r.pos + t0, 0, err)) return {model::Status::Error, "hy4flash: " + err};
+            if (!run_rows(r.tokens + t0, n, r.pos + t0, 0, err)) return {grow_failed_ ? model::Status::Refused : model::Status::Error, "hy4flash: " + err};
             if (r.progress) {
                 cudaStreamSynchronize(stream_);
                 r.progress(t0 + n);
@@ -530,6 +530,7 @@ public:
             emb_rows_ = rows + (size_t) at * (size_t) g_.n_embd;
             img_j_ = at;
             const bool ok = run_rows(dead.data(), n, pos + at, 0, err);
+            if (!ok && grow_failed_) return {model::Status::Refused, "hy4flash: " + err};
             emb_rows_ = nullptr;
             if (!ok) return {model::Status::Error, "hy4flash: " + err};
         }
@@ -1998,9 +1999,9 @@ private:
             err = "position " + std::to_string(pos0) + " does not follow the state's " + std::to_string(hist_.size());
             return false;
         }
+        if (!ensure_positions(pos0 + R, err)) return false;   // before anything changes: a refusal leaves the state as it was
         hist_.resize((size_t) pos0);   // a position before the end drops the rows after it
         hist_.insert(hist_.end(), tokens, tokens + R);
-        if (!ensure_positions(pos0 + R, err)) return false;
         place_rope(pos0, R);   // [vision]
         if (tier_) tier_->begin_token(std::min(R, kMaxWindow));
         struct Drain {
@@ -2079,7 +2080,9 @@ private:
     // Backs the sparse layers' caches for `positions` positions, in steps of kGrowPositions. When the card is full (a long
     // generation past the prompt, the expert tier holding the rest), the tier gives back its spare slots and the mapping is
     // tried again, then lends all its slots and takes back what is left once the caches have grown (as DeepSeek's caches do).
+    bool grow_failed_ = false;   // the last ensure_positions found no room (a refusal: nothing was run past `backed_`)
     bool ensure_positions(int64_t positions, std::string& err) {
+        grow_failed_ = false;
         if (positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kGrowPositions - 1) / kGrowPositions * kGrowPositions);
         const uint64_t keep = tier_ ? tier_->free_floor() : 256ull << 20;
@@ -2101,6 +2104,7 @@ private:
             }
             if (!tier_ || attempt == 2) {
                 err = "the latent caches cannot grow to " + std::to_string(target) + " positions: " + e + "; a smaller --max-context leaves more for the expert tier";
+                grow_failed_ = true;
                 return false;
             }
             cudaStreamSynchronize(stream_);
