@@ -47,6 +47,8 @@
 #include <atomic>
 #include <thread>
 #include <vector>
+#include <condition_variable>
+#include <mutex>
 
 namespace basalt::models::hy4flash {
 namespace {
@@ -110,6 +112,16 @@ public:
         big_.release();
         std::string e;
         join_moe(e);
+        for (cudaGraphExec_t g : gx_)
+            if (g) cudaGraphExecDestroy(g);
+        if (joiner_.joinable()) {
+            {
+                std::lock_guard<std::mutex> g(jm_);
+                jstop_ = true;
+            }
+            jcv_.notify_one();
+            joiner_.join();
+        }
         for (void* p : bufs_) cudaFree(p);
         if (d_hist_) cudaFree(d_hist_);
         for (void* p : pinned_) cudaFreeHost(p);
@@ -424,7 +436,10 @@ public:
             const bool last = t0 + n == r.n_tokens;
             const bool want = r.row_tokens || (last && (r.next_token || r.logits));
             const int head = !want ? 0 : r.row_tokens ? n : 1;
-            if (!run_rows(r.tokens + t0, n, r.pos + t0, head, err)) return {model::Status::Error, "hy4flash: " + err};
+            graphs_ = use_graphs_ && m_.diag_dump().empty() && !rope_on_ && n <= kMaxWindow && n <= arows_;
+            const bool ran = run_rows(r.tokens + t0, n, r.pos + t0, head, err);
+            graphs_ = false;
+            if (!ran) return {model::Status::Error, "hy4flash: " + err};
             dfly_.run(-1);   // DFLY HOOK
             if (!want) continue;
             if (!pick(r, t0, head, err)) return {model::Status::Error, "hy4flash: " + err};
@@ -784,20 +799,27 @@ private:
         return ok;
     }
 
-    bool attention_step(int l, int64_t pos0, int R, int step, std::string& err) {
+    // The attention of R rows in three phases: the query and key products (kQuery: no position in them), the cache rows, the
+    // cells each row attends and the indexer (kCells: the positions), the attention over them and the output (kOutput: no
+    // position). A decode window replays the first and last from graphs.
+    static constexpr int kQuery = 1, kCells = 2, kOutput = 4, kAll = 7;
+    bool attention_step(int l, int64_t pos0, int R, int step, std::string& err, int phases = kAll) {
         const int H = g_.heads[(size_t) l];
         const bool swa = g_.swa[(size_t) l];
         const int E = g_.n_embd, rank = g_.kv_lora;
         const MlaArgs a = mla_args(H, swa ? g_.rope_base_swa : g_.rope_base);
-        gemm(T(l, "attn_q_a.weight"), xn_, qa_, E, g_.q_lora, R);
-        bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
-        gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
-        gemm(T(l, "attn_kv_a_mqa.weight"), xn_, kvraw_, E, rank + g_.rope_dim, R);
-        heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
+        if (phases & kQuery) {
+            gemm(T(l, "attn_q_a.weight"), xn_, qa_, E, g_.q_lora, R);
+            bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
+            gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
+            gemm(T(l, "attn_kv_a_mqa.weight"), xn_, kvraw_, E, rank + g_.rope_dim, R);
+            heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
+        }
         uint8_t* cache = cache_[(size_t) l];
         const int ring = swa ? swa_ring() : 0;
         const bool f8 = !swa && fp8();
         const float* kvn = F(l, "attn_kv_a_norm.weight");
+        if (phases & kCells) {
         if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
         else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
         else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
@@ -856,11 +878,13 @@ private:
             }
         }
         cudaMemcpyAsync(meta_d_, meta, (size_t) 3 * arows_ * 4, cudaMemcpyHostToDevice, stream_);
+        if (!swa) iota_cells(icells_, cells_stride_, meta_d_ + 2 * arows_, R, stream_);
+        }
+        if (!(phases & kOutput)) return true;
         RowSpans rs;
         rs.firsts = meta_d_;
         rs.counts = meta_d_ + arows_;
         if (!swa) {
-            iota_cells(icells_, cells_stride_, meta_d_ + 2 * arows_, R, stream_);
             rs.cells = icells_;
             rs.cells_stride = cells_stride_;
         }
@@ -1245,16 +1269,8 @@ private:
         ra.k = K;
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
-        bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, st);
-        gemm(T(l, "ffn_routed_down.weight"), xn_, xlat_, E, L, R);
         const bool prompt = R > kMaxWindow && basalt::prefill::mmq::built();
-        // a window's first group goes to the host first: the shared expert runs while the host places the experts
-        if (!prompt) publish(0, std::min(kMaxWindow, R));
-        float *sg = gu_, *su = gu_ + (size_t) R * g_.n_ff_exp;
-        gemm(T(l, "ffn_gate_shexp.weight"), xn_, sg, E, g_.n_ff_exp, R);
-        gemm(T(l, "ffn_up_shexp.weight"), xn_, su, E, g_.n_ff_exp, R);
-        bk::swiglu_scaled(sg, su, nullptr, nullptr, h_, R, g_.n_ff_exp, g_.n_ff_exp, st);
-        gemm(T(l, "ffn_down_shexp.weight"), h_, sh_, g_.n_ff_exp, E, R);
+        moe_head(l, R, prompt);
         if (prompt) {
             if (!moe_prompt(l, tl, R, lay, err)) return false;
         } else {
@@ -1263,8 +1279,105 @@ private:
         }
         if (diag(l)) dump("moe_lat-" + std::to_string(l), lat_out_, (int64_t) R * L);
         if (diag(l)) dump("xlat-" + std::to_string(l), xlat_, (int64_t) R * L);
-        gemm(T(l, "ffn_routed_up.weight"), lat_out_, moe_out_, L, E, R);
-        add_vectors(moe_out_, sh_, mlp_, R * E, st);
+        moe_tail(l, R);
+        return true;
+    }
+
+    // The router, routed_down and, for a window, its first group to the host; the shared expert behind them, which runs while
+    // the host places the experts. No position in it: a decode window replays it from a graph.
+    void moe_head(int l, int R, bool prompt) {
+        const int E = g_.n_embd, K = g_.n_used, L = g_.n_latent;
+        bk::RouterArgs ra;
+        ra.n_expert = g_.n_expert;
+        ra.n_embd = E;
+        ra.k = K;
+        ra.weight_scale = g_.expert_scale;
+        ra.gate = bk::RouterGate::Sigmoid;
+        bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
+        gemm(T(l, "ffn_routed_down.weight"), xn_, xlat_, E, L, R);
+        if (!prompt) publish(0, std::min(kMaxWindow, R));
+        float *sg = gu_, *su = gu_ + (size_t) R * g_.n_ff_exp;
+        gemm(T(l, "ffn_gate_shexp.weight"), xn_, sg, E, g_.n_ff_exp, R);
+        gemm(T(l, "ffn_up_shexp.weight"), xn_, su, E, g_.n_ff_exp, R);
+        bk::swiglu_scaled(sg, su, nullptr, nullptr, h_, R, g_.n_ff_exp, g_.n_ff_exp, stream_);
+        gemm(T(l, "ffn_down_shexp.weight"), h_, sh_, g_.n_ff_exp, E, R);
+    }
+    void moe_tail(int l, int R) {
+        gemm(T(l, "ffn_routed_up.weight"), lat_out_, moe_out_, g_.n_latent, g_.n_embd, R);
+        add_vectors(moe_out_, sh_, mlp_, R * g_.n_embd, stream_);
+    }
+
+    // ---- CUDA graphs of a decode window's layers: the stretches with no position in them, captured once per layer and row
+    // count and replayed (the launches of a token were ~2,200 one by one, and the host's launch rate set the pace).
+    std::vector<cudaGraphExec_t> gx_;   // [(R - 1) * n_layers * 3 + l * 3 + part]
+    bool graphs_ = false;               // this run_rows replays them (a decode window, no dumps, no picture)
+    template <class Fn>
+    bool replay(int l, int R, int part, Fn&& body, std::string& err) {
+        if (gx_.empty()) gx_.assign((size_t) kMaxWindow * g_.n_layers * 3, nullptr);
+        cudaGraphExec_t& ex = gx_[((size_t) (R - 1) * g_.n_layers + l) * 3 + part];
+        if (!ex) {
+            if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+                err = "cannot begin a graph capture";
+                return false;
+            }
+            body();
+            cudaGraph_t g = nullptr;
+            const cudaError_t ce = cudaStreamEndCapture(stream_, &g);
+            const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&ex, g, 0) : ce;
+            if (g) cudaGraphDestroy(g);
+            if (ci != cudaSuccess) {
+                ex = nullptr;
+                err = std::string("graph capture: ") + cudaGetErrorString(ci);
+                return false;
+            }
+        }
+        return cudaGraphLaunch(ex, stream_) == cudaSuccess || (err = "a graph launch failed", false);
+    }
+
+    // A decode window's MoE layer: the attention's query part, the hyper-connection collapse and norm before it (graph 0);
+    // the cells and the cache rows (by position); the attention's output, its expansion, the FFN's collapse, the router,
+    // routed_down, the doorbell and the shared expert (graph 1); the experts (placed by the host); routed_up and the FFN's
+    // expansion (graph 2). The same kernels in the same order as the direct path.
+    bool layer_replayed(int l, int64_t pos0, int R, const bk::HcPlainArgs& hc, std::string& err) {
+        const int E = g_.n_embd;
+        const int tl = l - g_.n_dense;
+        const ExpertLayer& el = m_.pack().experts[(size_t) l];
+        const kernels::NativeExpertLayout lay = kernels::native_expert_layout(el.gu_type, el.d_type, g_.n_latent, g_.n_ff_exp);
+        if (lay.bytes != el.blob_bytes) {
+            err = "layer " + std::to_string(l) + "'s expert blob size does not match the layout";
+            return false;
+        }
+        float *xa = X_, *xb = Xn_;
+        if (!replay(l, R, 0, [&] {
+                bk::hc_mixes_plain(xa, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
+                bk::hc_pre_rms_norm(xa, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+                std::string e;
+                attention_step(l, pos0, R, 0, e, kQuery);
+            }, err))
+            return false;
+        if (!attention_step(l, pos0, R, 0, err, kCells)) return false;
+        const uint32_t seq0 = seq_want_;
+        if (!replay(l, R, 1, [&] {
+                std::string e;
+                attention_step(l, pos0, R, 0, e, kOutput);
+                bk::hc_post(attn_, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
+                bk::hc_mixes_plain(xb, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
+                bk::hc_pre_rms_norm(xb, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+                moe_head(l, R, false);
+            }, err))
+            return false;
+        seq_want_ = seq0 + 1;   // the doorbell in the graph rings once a replay
+        std::swap(X_, Xn_);
+        if (!moe_group(l, tl, lay, 0, R, err)) return false;
+        xa = X_;
+        xb = Xn_;
+        if (!replay(l, R, 2, [&] {
+                moe_tail(l, R);
+                bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, R, E, g_.rms_eps, stream_);
+                bk::hc_post(mlp2_, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
+            }, err))
+            return false;
+        std::swap(X_, Xn_);
         return true;
     }
 
@@ -1568,16 +1681,52 @@ private:
         const float* const* rows = (const float* const*) ((uint8_t*) ex_plan_ + offsetof(WindowPut, rows));
         weighted_sum_window(rows, rw_ + (size_t) g0 * K, G, K, L, lat_out_ + (size_t) g0 * L, st);
         if (pd.cpu && !pd.reading) tier_->mark_gap(st);   // the promotions' copies start behind the sum
+        // the rows land and the word is written on the joiner thread, while this thread queues the next layer's work: the
+        // card goes on as soon as the CPU's and the second card's rows are in, not once the next launches are out
+        if (use_joiner_ && pd.word && !pd.reading) {
+            if (!joiner_.joinable()) joiner_ = std::thread([this] { joiner_loop(); });
+            {
+                std::lock_guard<std::mutex> g(jm_);
+                jwork_ = true;
+                jdone_.store(false, std::memory_order_relaxed);
+            }
+            jcv_.notify_one();
+        }
         return true;
+    }
+
+    void joiner_loop() {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(jm_);
+                jcv_.wait(lk, [this] { return jwork_ || jstop_; });
+                if (jstop_ && !jwork_) return;
+                jwork_ = false;
+            }
+            std::string e;
+            jok_ = join_body(e);
+            jerr_ = e;
+            jdone_.store(true, std::memory_order_release);
+        }
     }
 
     // The CPU's and the second card's share of the last group placed: the pool's rows land, the experts read from the file
     // run, the second card's rows land, and the word its weighted sum waits for is written. On every way out, so the stream
     // never waits for good.
     bool join_moe(std::string& err) {
+        if (!pend_.on) return true;
+        if (use_joiner_ && pend_.word && !pend_.reading && joiner_.joinable()) {   // handed to the joiner: its result
+            while (!jdone_.load(std::memory_order_acquire)) platform::cpu_relax();
+            pend_.on = false;
+            if (!jok_ && err.empty()) err = jerr_;
+            return jok_;
+        }
+        const bool ok = join_body(err);
+        pend_.on = false;
+        return ok;
+    }
+    bool join_body(std::string& err) {
         Pending& pd = pend_;
-        if (!pd.on) return true;
-        pd.on = false;
         bool ok = true;
         if (pd.cpu) tier_->finish_cpu();
         if (pd.reading) {
@@ -1654,6 +1803,10 @@ private:
             ring_ahead(l, R);
             if (!engram(l, pos0, R, tokens, err)) return false;
             if (diag(l) && !g_.swa.empty() && l >= 1) dump("engram_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
+            if (graphs_ && l >= g_.n_dense) {
+                if (!layer_replayed(l, pos0, R, hc, err)) return false;
+                continue;
+            }
             bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
             bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
             if (diag(l)) dump("attn_norm-" + std::to_string(l), xn_, (int64_t) R * E);
@@ -1845,6 +1998,15 @@ private:
     int32_t *h_ids_ = nullptr, *d_ids_ = nullptr;
     uint32_t *h_words_ = nullptr, *d_words_ = nullptr;   // mapped: [0] the ids' sequence word, [1] the word a weighted sum waits for
     uint32_t seq_want_ = 0, join_seq_ = 0;
+    // the joiner thread (moe_group hands it a group's CPU and second-card share; join_moe waits for its result)
+    bool use_joiner_ = true;
+    bool use_graphs_ = true;
+    std::thread joiner_;
+    std::mutex jm_;
+    std::condition_variable jcv_;
+    bool jwork_ = false, jstop_ = false, jok_ = true;
+    std::atomic<bool> jdone_{true};
+    std::string jerr_;
     // the group whose CPU and second-card share is still running (join_moe ends it)
     struct Pending {
         bool on = false, cpu = false, reading = false, peer_raised = false;
