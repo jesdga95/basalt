@@ -1,4 +1,4 @@
-// src/models/hy4flash/vision_test.cpp - the Lanczos resize against Pillow on a real picture, Hy4-flash's canvas grid against
+// src/models/hy4flash/vision_test.cpp - the bicubic resize against Pillow on a real picture, Hy4-flash's canvas grid against
 // the processor's smart_resize, and the rotary positions of a prompt with pictures against the reference's get_rope_index.
 // Host only. The reference values come from transformers' hy_v4_vl (image_processing_pil_hy_v4_vl.smart_resize and
 // modeling_hy_v4_vl.get_rope_index, run on CPU on the same token runs; 900 is a picture's pad, 5 text) and Pillow 12.3.0
@@ -41,38 +41,17 @@ int main(int argc, char** argv) {
         std::printf("%-44s %s\n", what, ok ? "ok" : "FAIL");
         failures += !ok;
     };
-    // a flat picture stays flat under both filters, up and down
+    // a flat picture stays flat, up and down
     vision::Image flat;
     flat.w = 64;
     flat.h = 48;
     flat.rgb.assign((size_t) 64 * 48 * 3, 117);
-    for (vision::Filter f : {vision::Filter::Bicubic, vision::Filter::Lanczos})
-        for (auto [w, h] : {std::pair<int, int>{32, 24}, {200, 150}}) {
-            const vision::Image r = vision::resize_to(flat, w, h, f);
-            bool ok = r.w == w && r.h == h;
-            for (uint8_t v : r.rgb) ok = ok && v == 117;
-            check(ok, "flat picture stays flat");
-        }
-    // bicubic through the old entry point is the same function
-    vision::Image ramp;
-    ramp.w = 40;
-    ramp.h = 40;
-    for (int y = 0; y < 40; ++y)
-        for (int x = 0; x < 40; ++x)
-            for (int c = 0; c < 3; ++c) ramp.rgb.push_back((uint8_t) (x * 6 + y + c));
-    check(vision::resize_bicubic_to(ramp, 17, 23).rgb == vision::resize_to(ramp, 17, 23, vision::Filter::Bicubic).rgb,
-          "bicubic entry points agree");
-    // a vertical step edge stays one step: monotone along the row, with the flat sides intact
-    vision::Image step;
-    step.w = 64;
-    step.h = 8;
-    for (int y = 0; y < 8; ++y)
-        for (int x = 0; x < 64; ++x)
-            for (int c = 0; c < 3; ++c) step.rgb.push_back(x < 32 ? 20 : 220);
-    const vision::Image dn = vision::resize_to(step, 32, 8, vision::Filter::Lanczos);
-    bool ok = dn.rgb[0] == 20 && dn.rgb[((size_t) 31) * 3] == 220;
-    for (int x = 1; x < 32; ++x) ok = ok && dn.rgb[(size_t) x * 3] >= dn.rgb[((size_t) x - 1) * 3] - 20;   // overshoot at the edge only
-    check(ok, "lanczos step edge");
+    for (auto [w, h] : {std::pair<int, int>{32, 24}, {200, 150}}) {
+        const vision::Image r = vision::resize_bicubic_to(flat, w, h);
+        bool ok = r.w == w && r.h == h;
+        for (uint8_t v : r.rgb) ok = ok && v == 117;
+        check(ok, "flat picture stays flat");
+    }
     // the processor's bounds: a tiny picture grows to 4 tokens, a huge one shrinks to at most 4,096
     const vision::Geometry g = hy4::vision_geometry();
     const vision::Size small = vision::fit_size(10, 10, g), big = vision::fit_size(8000, 6000, g);
@@ -152,25 +131,22 @@ int main(int argc, char** argv) {
         check(t.size() == 3 && t.next() == 3, "track: a rewind to before the picture");
     }
 
-    // Lanczos and bicubic against Pillow on a real picture, up, down and mixed
+    // bicubic against Pillow on a real picture, up, down and mixed
     if (argc > 1) {
         std::ifstream f(argv[1], std::ios::binary);
         const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         vision::Image pic;
         std::string err;
         check(vision::decode_image(bytes.data(), bytes.size(), pic, err) && pic.w == 930 && pic.h == 262, "the picture decodes");
-        struct Pillow { int w, h; bool lanczos; uint64_t hash; };
+        struct Pillow { int w, h; uint64_t hash; };
         const Pillow cases[] = {
-            {465, 131, true, 0x60c9debddc377c84ull}, {465, 131, false, 0x825c025a110a154full},
-            {1860, 524, true, 0x3154d33c50a2e8e7ull}, {1860, 524, false, 0xd748896413c7fabaull},
-            {640, 288, true, 0xa2bc7866a6f9162bull}, {640, 288, false, 0xdbbb9561afe16a22ull},
-            {224, 512, true, 0x66b80e712e791f55ull}, {224, 512, false, 0x7d55f6a23839be02ull},
-            {928, 256, true, 0x3709544264a61c99ull}, {928, 256, false, 0x10ecca7e5fc76a0full},
+            {465, 131, 0x825c025a110a154full}, {1860, 524, 0xd748896413c7fabaull}, {640, 288, 0xdbbb9561afe16a22ull},
+            {224, 512, 0x7d55f6a23839be02ull}, {928, 256, 0x10ecca7e5fc76a0full},
         };
         for (const Pillow& c : cases) {
-            const vision::Image r = vision::resize_to(pic, c.w, c.h, c.lanczos ? vision::Filter::Lanczos : vision::Filter::Bicubic);
+            const vision::Image r = vision::resize_bicubic_to(pic, c.w, c.h);
             char what[96];
-            std::snprintf(what, sizeof what, "pillow %s %dx%d -> %dx%d", c.lanczos ? "lanczos" : "bicubic", pic.w, pic.h, c.w, c.h);
+            std::snprintf(what, sizeof what, "pillow bicubic %dx%d -> %dx%d", pic.w, pic.h, c.w, c.h);
             check(fnv1a(r.rgb) == c.hash, what);
         }
     }

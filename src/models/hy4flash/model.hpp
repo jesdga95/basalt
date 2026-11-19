@@ -7,6 +7,7 @@
 #include "basalt/ngram/ple_reader.hpp"
 #include "models/hy4flash/dfly.hpp"   // DFLY HOOK
 #include "models/hy4flash/pack.hpp"
+#include "models/hy4flash/vision_encoder.hpp"   // [vision]
 
 #include <map>
 #include <memory>
@@ -46,6 +47,9 @@ public:
     ngram::PleReader& engram_reader() const { return *engram_; }
     /// The tier's descriptor: the MoE layers only (the tier's layer 0 is the first of them), over the 1536-wide latent.
     core::ExpertTierSpec tier_spec() const;
+    /// Bytes between two staged experts of the prompt path: the largest blob rounded to every matrix type's block size, as MMQ
+    /// steps from expert to expert in whole blocks (the main card's launches and the second card's share alike).
+    size_t expert_stride() const;
     /// The start's reads while it plans (null after): what the first session's tier queues into.
     core::LoadPlan* planning() const { return planning_; }
     /// The expert tier and the pinned rows it shares with a second card: one per model, whatever the sessions.
@@ -70,6 +74,8 @@ public:
     const DflyWeights* dfly() const { return dfly_.get(); }
     int spec() const { return spec_; }
     const std::string& diag_dump() const { return diag_dump_; }
+    /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests.
+    ImageEncoder& encoder() const { return vis_; }
 
 private:
     Pack pack_;
@@ -86,6 +92,7 @@ private:
     int device_ = 0, fd_ = -1;
     bool fp8_ = false, f32_ = false;
     int diag_rows_ = 0;
+    mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DflyWeights> dfly_;   // DFLY HOOK
     int spec_ = 0;
     int64_t ctx_ = kDefaultContext;
