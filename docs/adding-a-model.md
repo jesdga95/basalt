@@ -27,7 +27,9 @@ The router then needs one config entry. Nothing in the server names a model.
   sizing depends on (weights, then what is sized from the memory left: caches, tiers, prompt-split stages), and queues every
   range of the file it reads in one `LoadPlan` (`basalt/core/loader.hpp`), with copies of bytes the plan itself places (a second
   home, a stage's image) as memory sources; nothing is placed yet. The start announces the plan's bytes as the one total, places
-  them in one unbuffered pass on a thread pool, then calls the model's `attach`: what needs the bytes landed (packed forms,
+  them in one unbuffered pass on a thread pool (the ranges bound for a card first, the main card then the others, each streamed
+  through small pinned staging; then the ranges bound for RAM; the one bar names the stage: `loading model weights: cuda0`, ...,
+  `ram`), then calls the model's `attach`: what needs the bytes landed (packed forms,
   checks, timing a prompt split's cards) and the sessions, when nothing was sized after them. A model makes its sessions in
   `plan` instead when a cache or tier sizes itself from the memory they leave. `core/ram_load` allocates and pins the RAM tier:
   `plan` allocates it, the pass gives it its pages as it reads into it, and it is pinned once its reads have landed (in

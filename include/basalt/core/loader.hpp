@@ -110,6 +110,8 @@ public:
     /// Executes `plan`: its file reads, its steps, then its copies from memory; complete when it returns true.  False with `err` on
     /// the first failure (the rest of the plan is not read).  The calling thread's current device is as it was.
     bool run(const LoadPlan& plan, std::string& err);
+    /// Frees the staging buffers (pinned when the plan wrote a card); the next run allocates them again.
+    void release_staging();
     /// Whether every byte read so far came around the file cache (a file that would not open that way, or a read that
     /// fell back, says no).
     bool unbuffered() const;
@@ -119,7 +121,8 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-/// The one pass of a start: announces the bytes `plan` counts as the start's total, then places them with `loader`.
+/// The one pass of a start: announces the bytes `plan` counts as the start's total, then places them with `loader`, whose
+/// staging is freed after it (a start that serves keeps its loader, not its pinned staging).
 bool place_start(Loader& loader, const LoadPlan& plan, std::string& err);
 
 }  // namespace basalt::core
