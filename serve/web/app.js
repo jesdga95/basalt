@@ -104,10 +104,18 @@ function stateWord(live, name) {
 }
 // the conversation cache, only when something is cached and a model is up
 const cached = (conv, live) => !["unloaded", "asleep", "loading"].includes(live.state) && conv && num(conv.parked) && conv.parked > 0;
+const usd = v => !num(v) || v === 0 ? "$0" : v < 0.01 ? `$${v.toFixed(4)}` : v < 1 ? `$${v.toFixed(3)}` : v < 100 ? `$${v.toFixed(2)}` : `$${fmt(v, 2)}`;
 function drawTotals(t) {
   const n = t && num(t.requests) && t.requests > 0 ? t : null;
-  html($("#totals"), n ? `<b>${fmt(n.requests)}</b> requests served · <b>${fmt(n.written)}</b> tokens written` : "");
-  $("#totals").title = n ? `Since the server started: ${fmt(n.prompt)} prompt tokens (${fmt(n.reused)} reused), ${dur(n.prompt_ms)} reading, ${dur(n.decode_ms)} generating` : "";
+  const cost = n && num(n.cost_usd) && n.cost_usd > 0 ? `<b>${usd(n.cost_usd)}</b> · ` : "";
+  html($("#totals"), n ? `${cost}<b>${fmt(n.requests)}</b> requests · <b>${big(n.prompt)}</b> prompt · <b>${big(n.written)}</b> output` : "");
+  const tip = n ? `Since ${new Date((n.since || 0) * 1000).toLocaleDateString()}: ${fmt(n.prompt)} prompt tokens (${fmt(n.reused)} reused), ${dur(n.prompt_ms)} reading, ${dur(n.decode_ms)} generating` : "";
+  const pricing = n && (n.cost_input_per_million || n.cost_output_per_million) ? `\nPricing: $${n.cost_input_per_million}/M in · $${n.cost_output_per_million}/M out` +
+    (n.cost_cache_write_per_million !== n.cost_input_per_million || n.cost_cache_hit_per_million !== n.cost_input_per_million ?
+      ` · $${n.cost_cache_write_per_million}/M write · $${n.cost_cache_hit_per_million}/M hit` : "") : "";
+  $("#totals").title = tip + pricing;
+  $("#totals").style.cursor = "pointer";
+  $("#totals").onclick = () => openPricing(n);
 }
 
 /* ---- the heat scale: 0..400 tok/s and up; only the colour of the live decode number uses it ---- */
@@ -899,6 +907,58 @@ async function pollLog() {
 $("#auth").onsubmit = e => {
   e.preventDefault(); apiKey = $("#key").value.trim(); sessionStorage.setItem("basalt.key", apiKey);
 };
+
+/* ---- pricing dialog ---- */
+function openPricing(t) {
+  let d = $("#pricing-dlg");
+  if (!d) {
+    d = document.createElement("dialog"); d.id = "pricing-dlg"; d.className = "pdlg";
+    d.innerHTML = `<form method="dialog"><h3>Pricing &amp; Totals</h3>
+<div class="pf"><label>Input $/M</label><input id="p-in" type="number" step="0.01" min="0"></div>
+<div class="pf"><label>Output $/M</label><input id="p-out" type="number" step="0.01" min="0"></div>
+<div class="pf"><label>Cache Write $/M</label><input id="p-cw" type="number" step="0.01" min="0" placeholder="same as input"></div>
+<div class="pf"><label>Cache Hit $/M</label><input id="p-ch" type="number" step="0.01" min="0" placeholder="same as input"></div>
+<div class="pa"><button type="button" class="pb pp" id="p-save">Save</button><button type="button" class="pb pd" id="p-reset">Reset Totals</button><button type="button" class="pb" id="p-close">Close</button></div>
+<div class="pm" id="p-msg"></div></form>`;
+    document.body.append(d);
+    $("#p-save").onclick = savePricing;
+    $("#p-reset").onclick = resetTotals;
+    $("#p-close").onclick = () => d.close();
+    d.onclick = e => { if (e.target === d) d.close(); };
+  }
+  if (t) {
+    $("#p-in").value = t.cost_input_per_million || 0;
+    $("#p-out").value = t.cost_output_per_million || 0;
+    const ci = t.cost_input_per_million || 0;
+    $("#p-cw").value = t.cost_cache_write_per_million !== ci ? (t.cost_cache_write_per_million || "") : "";
+    $("#p-ch").value = t.cost_cache_hit_per_million !== ci ? (t.cost_cache_hit_per_million || "") : "";
+  }
+  $("#p-msg").textContent = "";
+  d.showModal();
+}
+async function savePricing() {
+  const body = { cost_input_per_million: parseFloat($("#p-in").value) || 0, cost_output_per_million: parseFloat($("#p-out").value) || 0 };
+  const cw = $("#p-cw").value.trim(), ch = $("#p-ch").value.trim();
+  body.cost_cache_write_per_million = cw !== "" ? parseFloat(cw) : null;
+  body.cost_cache_hit_per_million = ch !== "" ? parseFloat(ch) : null;
+  try {
+    const r = await fetch("api/pricing", { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+      body: JSON.stringify(body) });
+    const d = await r.json();
+    $("#p-msg").textContent = r.ok ? "Saved." : (d.error?.message || "Error");
+    $("#p-msg").className = r.ok ? "pm ok" : "pm";
+  } catch (e) { $("#p-msg").textContent = e.message; }
+}
+async function resetTotals() {
+  if (!confirm("Reset all lifetime counters? Previous totals saved to .prev.json.")) return;
+  try {
+    const r = await fetch("api/totals-reset", { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+      body: "{}" });
+    const d = await r.json();
+    $("#p-msg").textContent = r.ok ? "Reset." : (d.error?.message || "Error");
+    $("#p-msg").className = r.ok ? "pm ok" : "pm";
+  } catch (e) { $("#p-msg").textContent = e.message; }
+}
 
 $("#host").textContent = location.host;
 fetch("health").then(r => r.json()).then(h => { $("#keyed").hidden = !h.api_key; }).catch(() => {});
