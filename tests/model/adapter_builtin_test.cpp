@@ -47,6 +47,11 @@ int main() {
 #else
     expect("qwen35", false);
 #endif
+#ifdef BASALT_MODEL_HY4FLASH
+    expect("hy4flash", true);
+#else
+    expect("hy4flash", false);
+#endif
     check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
         model::Started started;
