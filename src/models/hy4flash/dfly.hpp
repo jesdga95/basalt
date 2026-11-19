@@ -110,6 +110,8 @@ public:
     /// Device memory for every tensor of `dims` on the current device; `slot` then says where each goes.
     bool allocate(const DflyDims& dims, std::string& err);
     void* slot(const std::string& name) const;   ///< null for an unknown name
+    /// Device memory for the drafts' copy of the target's head: `vocab` rows of `E` in Q8_0.
+    bool allocate_head(int64_t vocab, int64_t E, std::string& err);
     uint64_t bytes() const { return bytes_; }
 
     DflyDims dims;
@@ -117,6 +119,7 @@ public:
     const void *eh_proj = nullptr, *hc_gate = nullptr, *hc_up = nullptr, *hc_down = nullptr;   // Q8_0
     const float *enorm = nullptr, *hnorm = nullptr, *fuse_gate = nullptr, *hc_hidden_norm = nullptr, *hc_embed_norm = nullptr,
                 *final_norm = nullptr, *conf_w = nullptr, *conf_b = nullptr;
+    const void* head_q8 = nullptr;   ///< the target's head rounded to Q8_0: the drafts read it, verification the BF16 head
 
 private:
     std::map<std::string, void*> slots_;
