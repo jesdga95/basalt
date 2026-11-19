@@ -86,7 +86,10 @@ std::string pack_quant_label(const std::string& name) {
             if (std::tolower((unsigned char) q[i]) != std::tolower((unsigned char) pre[i])) return;
         q.erase(0, n);
     };
-    for (const char* pre : {"NVIDIA-", "UD-"}) strip(pre);
+    for (size_t before = 0; q.size() != before;) {   // repeatedly, in any order, until neither prefix matches
+        before = q.size();
+        for (const char* pre : {"NVIDIA-", "UD-"}) strip(pre);
+    }
     return q.empty() ? "unknown" : q;
 }
 

@@ -327,3 +327,7 @@ class DefaultNameTest(unittest.TestCase):
     def test_file_name_not_starting_with_the_base_has_no_quant(self):
         kv = {"general.name": "DeepSeek-V4.1-Flash"}
         self.assertEqual(self.arch.default_name("some-fork-Q8_0.gguf", kv), "DeepSeek-V4.1-Flash")
+
+    def test_base_only_counts_at_a_boundary(self):
+        kv = {"general.name": "DeepSeek-V4.1-Flash"}
+        self.assertEqual(self.arch.default_name("DeepSeek-V4.1-Flashy-Q8_0.gguf", kv), "DeepSeek-V4.1-Flash")
