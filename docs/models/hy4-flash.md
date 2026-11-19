@@ -112,7 +112,7 @@ Prompt path (`session.cpp`): a prompt opens row buffers for chunks of up to 16,3
 slots to them. Each chunk runs the 42 layers; the attention runs in steps of 2,048 rows (the rings are sized for a step), each step
 with its own row spans. Sparse layers score every row against the pooled keys before it on tensor cores (`scores_mma_kernel`) and
 select 64 rows a launch; the attention over the selected or windowed cells runs on tensor cores with fp16 operands
-(`attend_mma_kernel`). The heads products, the router and the dense products are one launch each (MMQ). From 1,024 rows every
+(`attend_mma_kernel`). The heads products and the router are one launch a step, the dense products MMQ launches of a step's rows. From 1,024 rows every
 expert is used: a ring of two layer slots copies the next layer's experts while a layer computes, and the chunk's small host inputs
 (spans, launch tables, Engram rows, embeddings) go through mapped memory and a copy kernel so they never wait on the copy engine
 behind the ring. Every Engram layer's rows are asked for when the chunk starts.
