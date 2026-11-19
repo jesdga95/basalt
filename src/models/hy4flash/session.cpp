@@ -92,7 +92,9 @@ static_assert(sizeof(WindowPut) <= 4 * kPutWords, "a window's plan fits put_word
 // The buffers that scale with the rows of a call: a decode window's, or a prompt chunk's (opened while a prompt runs, with the tier's
 // slots lent to them).
 struct Bufs {
-    int rows = 0, arows = 0, steps = 0;   // the chunk's rows, the rows of an attention step, and the steps of a chunk
+    int rows = 0;     // the rows the call covers (a prompt's group: the residual stream is this tall)
+    int block = 0;    // the rows one pass of a layer covers (a chunk's worth) and every row buffer is sized for
+    int arows = 0, steps = 0;   // the rows of an attention step, and the steps of a block
     std::vector<void*> dev, host;
     float *X = nullptr, *Xn = nullptr, *coef = nullptr, *hcws = nullptr, *e = nullptr, *cur = nullptr, *xn = nullptr, *attn = nullptr,
           *attn_raw = nullptr, *mlp = nullptr, *mlp2 = nullptr, *qa = nullptr, *qan = nullptr, *q = nullptr, *kvraw = nullptr,
@@ -249,7 +251,7 @@ public:
             return false;
         }
         if (!ensure_positions(kv_base(), err)) return false;   // the elastic KV's base; the rest comes from the expert tier
-        if (!make_bufs(dec_, kMaxWindow, err)) return false;
+        if (!make_bufs(dec_, kMaxWindow, kMaxWindow, err)) return false;
         use(dec_);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
         if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, m_.dfly() ? (const uint16_t*) m_.tensor("output.weight")->ptr : nullptr,
@@ -260,7 +262,9 @@ public:
 
     // The buffers for `R` rows; false (with nothing left allocated) when the card has no room. With `count` it allocates nothing and
     // adds up the device bytes they would take (each rounded up to the driver's 2 MiB pages, an upper bound).
-    bool make_bufs(Bufs& b, int R, std::string& err, uint64_t* count = nullptr) {
+    // R is the row set the call covers (a prompt's group) and B the rows one pass of a layer covers: only the residual
+    // stream and its coefficients scale with R, every other row buffer with B.
+    bool make_bufs(Bufs& b, int R, int B, std::string& err, uint64_t* count = nullptr) {
         const int64_t E = g_.n_embd;
         bool ok = true;
         static float counted[4];   // a stand-in address the count mode hands out (nothing reads it)
@@ -287,13 +291,14 @@ public:
             b.host.push_back(p);
             return (float*) p;
         };
-        const int A = std::min(R, kAttRows);
+        const int A = std::min(B, kAttRows);
         b.rows = R;
+        b.block = B;
         b.arows = A;
         b.X = f((int64_t) R * 4 * E); b.Xn = f((int64_t) R * 4 * E); b.coef = f((int64_t) R * bk::kHcCoef);
-        b.hcws = f((int64_t) bk::hc_plain_workspace_floats(R));
-        b.e = f((int64_t) R * E); b.cur = f((int64_t) R * E); b.xn = f((int64_t) R * E); b.attn = f((int64_t) R * E);
-        b.attn_raw = f((int64_t) A * E); b.mlp = f((int64_t) R * E); b.mlp2 = f((int64_t) R * E);
+        b.hcws = f((int64_t) bk::hc_plain_workspace_floats(B));
+        b.e = f((int64_t) B * E); b.cur = f((int64_t) B * E); b.xn = f((int64_t) B * E); b.attn = f((int64_t) B * E);
+        b.attn_raw = f((int64_t) A * E); b.mlp = f((int64_t) B * E); b.mlp2 = f((int64_t) B * E);
         b.qa = f((int64_t) A * g_.q_lora); b.qan = f((int64_t) A * g_.q_lora); b.q = f((int64_t) A * max_heads_ * g_.qk_dim);
         b.kvraw = f((int64_t) A * kRowWidth); b.qabs = f((int64_t) A * max_heads_ * g_.kv_lora);
         b.qcur = f((int64_t) A * max_heads_ * kRowWidth); b.olat = f((int64_t) A * max_heads_ * g_.kv_lora);
@@ -303,20 +308,20 @@ public:
         b.icells = (int32_t*) f((int64_t) A * cells_stride_);
         b.meta_d = (int32_t*) f(4 * (int64_t) A);
         // a layer's steps each have their own: the copy of step 0's spans is still queued when the host writes step 1's
-        b.steps = (R + A - 1) / A;
+        b.steps = (B + A - 1) / A;
         b.meta_h = (int32_t*) pin((int64_t) g_.n_layers * b.steps * 4 * A);
         // gate/up products of the dense layer (A rows of n_ff), of the shared expert (R rows of the expert width) and of a prompt
         // launch (kLaunchRows rows of twice the expert width); the SwiGLU outputs likewise
-        const int64_t gu_n = std::max<int64_t>({2 * (int64_t) A * g_.n_ff, 2 * (int64_t) R * g_.n_ff_exp, 2 * (int64_t) kLaunchRows * g_.n_ff_exp});
-        const int64_t h_n = std::max<int64_t>({(int64_t) A * g_.n_ff, (int64_t) R * g_.n_ff_exp, (int64_t) kLaunchRows * g_.n_ff_exp});
+        const int64_t gu_n = std::max<int64_t>({2 * (int64_t) A * g_.n_ff, 2 * (int64_t) B * g_.n_ff_exp, 2 * (int64_t) kLaunchRows * g_.n_ff_exp});
+        const int64_t h_n = std::max<int64_t>({(int64_t) A * g_.n_ff, (int64_t) B * g_.n_ff_exp, (int64_t) kLaunchRows * g_.n_ff_exp});
         b.gu = f(gu_n); b.h = f(h_n);
-        b.rlog = f((int64_t) R * g_.n_expert); b.rw = f((int64_t) R * 16); b.ids = (int32_t*) f((int64_t) R * 16);
-        b.xlat = f((int64_t) R * g_.n_latent); b.lat_out = f((int64_t) R * g_.n_latent); b.moe_out = f((int64_t) R * E); b.sh = f((int64_t) R * E);
+        b.rlog = f((int64_t) B * g_.n_expert); b.rw = f((int64_t) B * 16); b.ids = (int32_t*) f((int64_t) B * 16);
+        b.xlat = f((int64_t) B * g_.n_latent); b.lat_out = f((int64_t) B * g_.n_latent); b.moe_out = f((int64_t) B * E); b.sh = f((int64_t) B * E);
         b.erows = f((int64_t) A * g_.n_embd); b.ekv = f((int64_t) A * 5 * E); b.evalid = f(A);
-        b.pair_rows = f((int64_t) R * g_.n_used * g_.n_latent);
-        b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used);
+        b.pair_rows = f((int64_t) B * g_.n_used * g_.n_latent);
+        b.pair_map = (int32_t*) f((int64_t) B * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) B * g_.n_used);
         b.mmq_ident = (int32_t*) f(A);
-        b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
+        b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) B * E); b.h_evalid = pin(A);
         if (count) {
             f((int64_t) (std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim))) + 3) / 4);
             b = Bufs();
@@ -347,6 +352,7 @@ public:
     // The session's row buffers are `b`'s from here on.
     void use(const Bufs& b) {
         rows_ = b.rows;
+        block_ = b.block;
         arows_ = b.arows;
         steps_ = b.steps;
         X_ = b.X; Xn_ = b.Xn; coef_ = b.coef; hcws_ = b.hcws; e_ = b.e; cur_ = b.cur; xn_ = b.xn; attn_ = b.attn; attn_raw_ = b.attn_raw;
@@ -383,7 +389,7 @@ public:
             for (int pass = 0; pass < 2; ++pass) {
                 if (pass == 1) tier_->shrink();
                 for (int R = want; R >= std::min(want, 2 * kMaxWindow); R /= 2)
-                    if (make_bufs(big_, R, e)) {
+                    if (make_bufs(big_, R, R, e)) {
                         use(big_);
                         lent_ = false;
                         return true;
@@ -391,9 +397,13 @@ public:
             }
         }
         lent_ = true;
-        int want = kMaxWindow;
-        while (want < total && want < kMaxChunk) want *= 2;
-        want = std::min(want, kMaxChunk);
+        // A group is the rows one layer walks over before the next layer starts: up to two chunks' worth, so a long
+        // prompt streams each layer's experts once per group instead of once per chunk.  A layer still computes one
+        // block (a chunk's rows) at a time, so every row buffer keeps the chunk's size and only the residual stream
+        // and its coefficients are as tall as the group.
+        int want = std::min<int>(total, 2 * kMaxChunk);
+        want = std::max(want, kMaxWindow);
+        const int block = std::min(want, kMaxChunk);
         const bool ringed = total >= kRingRows && tier_ && !ring_;
         // a bounded lend: the tier gives up only the slots the chunk's buffers and the ring need, and the rest keep their experts
         // (the ring stages those card to card, and the first turn after the prompt finds them); all of them when that is not enough
@@ -401,9 +411,9 @@ public:
             Bufs probe;
             uint64_t need = 0;
             std::string e;
-            make_bufs(probe, want, e, &need);
+            make_bufs(probe, want, block, e, &need);
             if (ringed) need += expert_ring_bytes();
-            if (tier_->lend(need) && make_bufs(big_, want, e)) {
+            if (tier_->lend(need) && make_bufs(big_, want, block, e)) {
                 if (!ringed || ring_open() ||
                     (tier_->lend(expert_ring_bytes() + kExpertLendSegment) && ring_open())) {
                     use(big_);
@@ -414,7 +424,7 @@ public:
         }
         if (tier_) tier_->lend_all();
         for (int R = want; R >= kMaxWindow; R /= 2)
-            if (make_bufs(big_, R, err)) {
+            if (make_bufs(big_, R, std::min(R, kMaxChunk), err)) {
                 use(big_);
                 if (ringed && !ring_open())
                     basalt::log::info("basalt hy4flash", "cannot open the expert ring (%.1f GB): the prompt stages its experts per layer",
@@ -1588,7 +1598,9 @@ private:
         return true;
     }
 
-    bool ffn(int l, int R, std::string& err) {
+    // R is the rows this pass computes; rows_plan is the row set the experts were placed for (a block of a prompt's group
+    // passes the group's rows: the placement is planned once for the group, not once per block).
+    bool ffn(int l, int R, int rows_plan, std::string& err) {
         const int E = g_.n_embd;
         if (l < g_.n_dense) {
             float *xn0 = xn_, *ml0 = mlp_;
@@ -1606,7 +1618,7 @@ private:
             mlp_ = ml0;
             return true;
         }
-        return moe(l, R, err);
+        return moe(l, R, rows_plan, err);
     }
 
     // The expert tier, opened by the first session while the model starts and shared by the rest: the sessions run one at a
@@ -1649,7 +1661,7 @@ private:
     // The latent MoE of a layer over its R normed rows: the router and routed_down and the shared expert for all rows, the
     // routed experts in groups of up to 8 rows (the tier places them: the card's slots and the second cards' on the GPUs, the rest
     // on the CPU), then routed_up.
-    bool moe(int l, int R, std::string& err) {
+    bool moe(int l, int R, int rows_plan, std::string& err) {
         const int E = g_.n_embd, K = g_.n_used, L = g_.n_latent;
         const int tl = l - g_.n_dense;   // the tier's layer
         const ExpertLayer& el = m_.pack().experts[(size_t) l];
@@ -1667,7 +1679,7 @@ private:
         const bool prompt = R > kMaxWindow && basalt::prefill::mmq::built();
         moe_head(l, R, prompt);
         if (prompt) {
-            if (!moe_prompt(l, tl, R, lay, err)) return false;
+            if (!moe_prompt(l, tl, R, rows_plan, lay, err)) return false;
         } else {
             for (int g0 = 0; g0 < R; g0 += kMaxWindow)
                 if (!moe_group(l, tl, lay, g0, std::min(kMaxWindow, R - g0), err)) return false;
@@ -1795,7 +1807,7 @@ private:
     // The routed experts of a prompt chunk, by expert: each used expert's blob is staged on the card (a copy from its slot, its
     // pinned RAM or the second card), its rows (the pairs routed to it, with their activations quantised for MMQ) go through the
     // gate/up product, the clamped SwiGLU and the down product, and a pair's output row is kept for the weighted sum.
-    bool moe_prompt(int l, int tl, int R, const kernels::NativeExpertLayout& lay, std::string& err) {
+    bool moe_prompt(int l, int tl, int R, int rows_plan, const kernels::NativeExpertLayout& lay, std::string& err) {
         namespace mmq = basalt::prefill::mmq;
         const int K = g_.n_used, L = g_.n_latent, F = g_.n_ff_exp;
         const ExpertLayer& el = m_.pack().experts[(size_t) l];
@@ -1821,7 +1833,9 @@ private:
             }
             by[(size_t) hid[(size_t) p]].push_back(p);
         }
-        bool ringed = ring_ && R >= kRingRows && tier_ && ring_ready(tl, R);
+        // The ring and the away plan are the group's: a block's own row count would read as a short chunk and send the
+        // experts down the staging and CPU paths the chunked read does not take.
+        bool ringed = ring_ && rows_plan >= kRingRows && tier_ && ring_ready(tl, rows_plan);
         // the second card's experts: in a ringed chunk the ones planned with the ring copy (their staging may have started), else
         // the ones its link prices lower for this routing
         prefill::PeerShare* share = tier_ ? tier_->share_for(tl) : nullptr;
@@ -2263,19 +2277,24 @@ private:
         hc.rms_eps = g_.rms_eps;
         hc.hc_eps = g_.hc_eps;
         hc.magnitude = g_.hc_magnitude;
-        for (int t = 0; t < R; ++t)
-            if (emb_rows_) {   // [vision] an image row stands in for the token's embedding
-                std::memcpy(h_e_ + (size_t) t * E, emb_rows_ + (size_t) t * E, (size_t) E * 4);
-            } else if (!m_.embedding_row(tokens[t], h_e_ + (size_t) t * E)) {
-                err = "no embedding row";
-                return false;
-            }
-        put_f32(e_, h_e_, (int64_t) R * E);
+        // The residual stream is as tall as the call; its embedding staging is one block's, filled a block at a time.
+        const int block = std::min(block_, R);
+        for (int off = 0; off < R; off += block) {
+            const int n = std::min(block, R - off);
+            for (int t = 0; t < n; ++t)
+                if (emb_rows_) {   // [vision] an image row stands in for the token's embedding
+                    std::memcpy(h_e_ + (size_t) t * E, emb_rows_ + (size_t) (off + t) * E, (size_t) E * 4);
+                } else if (!m_.embedding_row(tokens[off + t], h_e_ + (size_t) t * E)) {
+                    err = "no embedding row";
+                    return false;
+                }
+            put_f32(e_, h_e_, (int64_t) n * E);
+            fill_streams(e_, E, n, X_ + (size_t) off * 4 * E, stream_);
+        }
         if (graphs_) {   // the window's first position, for the graphs' row spans (sliding-window layers)
             *pos_h_ = (int32_t) pos0;
             cudaMemcpyAsync(pos_d_, pos_h_, 4, cudaMemcpyHostToDevice, stream_);
         }
-        fill_streams(e_, E, R, X_, stream_);
         if (!m_.diag_dump().empty()) dump("hc_init", X_, (int64_t) R * 4 * E);
         ring_join();
         ring_layer_[0] = ring_layer_[1] = -1;
@@ -2287,25 +2306,38 @@ private:
                 if (!layer_replayed(l, pos0, R, hc, err)) return false;
                 continue;
             }
-            bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
-            bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
-            if (diag(l)) dump("attn_norm-" + std::to_string(l), xn_, (int64_t) R * E);
+            // One block of rows at a time: the attention half writes the post-attention stream into Xn_, the feed-forward
+            // half reads it there and writes the layer's output back into X_.  A block is a chunk's rows, so each pass
+            // is exactly the workload the chunked read gave it; a group only adds the blocks that used to be later chunks.
             const double ta = now_ms();
-            if (!attention(l, pos0, R, err)) return false;
+            for (int off = 0; off < R; off += block) {
+                const int n = std::min(block, R - off);
+                float* const Xb = X_ + (size_t) off * 4 * E;
+                float* const Xnb = Xn_ + (size_t) off * 4 * E;
+                float* const coefb = coef_ + (size_t) off * bk::kHcCoef;
+                bk::hc_mixes_plain(Xb, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), n, 8, hc, hcws_, coefb, stream_);
+                bk::hc_pre_rms_norm(Xb, coefb, bk::kHcCoef, F(l, "attn_norm.weight"), n, E, g_.rms_eps, cur_, xn_, stream_);
+                if (diag(l)) dump("attn_norm-" + std::to_string(l), xn_, (int64_t) n * E);
+                if (!attention(l, pos0 + off, n, err)) return false;
+                bk::hc_post(attn_, Xb, coefb, bk::kHcCoef, n, E, Xnb, stream_);
+            }
             t_att_ms_ += now_ms() - ta;
-            bk::hc_post(attn_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
-            std::swap(X_, Xn_);
-            if (diag(l)) dump("hc_attn_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
-            bk::hc_mixes_plain(X_, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
-            bk::hc_pre_rms_norm(X_, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
-            if (diag(l)) dump("ffn_norm-" + std::to_string(l), xn_, (int64_t) R * E);
+            if (diag(l)) dump("hc_attn_out-" + std::to_string(l), Xn_, (int64_t) R * 4 * E);
             const double tf = now_ms();
-            if (!ffn(l, R, err)) return false;
+            for (int off = 0; off < R; off += block) {
+                const int n = std::min(block, R - off);
+                float* const Xb = X_ + (size_t) off * 4 * E;
+                float* const Xnb = Xn_ + (size_t) off * 4 * E;
+                float* const coefb = coef_ + (size_t) off * bk::kHcCoef;
+                bk::hc_mixes_plain(Xnb, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), n, 8, hc, hcws_, coefb, stream_);
+                bk::hc_pre_rms_norm(Xnb, coefb, bk::kHcCoef, F(l, "ffn_norm.weight"), n, E, g_.rms_eps, cur_, xn_, stream_);
+                if (diag(l)) dump("ffn_norm-" + std::to_string(l), xn_, (int64_t) n * E);
+                if (!ffn(l, n, R, err)) return false;
+                bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, n, E, g_.rms_eps, stream_);
+                if (diag(l)) dump("ffn_out-" + std::to_string(l), mlp2_, (int64_t) n * E);
+                bk::hc_post(mlp2_, Xnb, coefb, bk::kHcCoef, n, E, Xb, stream_);
+            }
             t_ffn_ms_ += now_ms() - tf;
-            bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, R, E, g_.rms_eps, stream_);
-            if (diag(l)) dump("ffn_out-" + std::to_string(l), mlp2_, (int64_t) R * E);
-            bk::hc_post(mlp2_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
-            std::swap(X_, Xn_);
             if (!m_.diag_dump().empty()) dump("l_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
         }
         if (!join_moe(err)) return false;
@@ -2482,7 +2514,7 @@ private:
     int32_t* pos_d_ = nullptr;   // a decode window's first position on the card (swa_meta reads it)
     int32_t* pos_h_ = nullptr;   // its pinned host copy (a window ends synchronized, so the last copy has read it)
     void* attw_ = nullptr;   // the chunked attention's workspace
-    int cells_stride_ = 0, rows_ = 0, arows_ = 0, steps_ = 0, max_heads_ = 0;
+    int cells_stride_ = 0, rows_ = 0, block_ = 0, arows_ = 0, steps_ = 0, max_heads_ = 0;
     static constexpr size_t kStageInts = (size_t) 4 << 20;   // the mapped staging of a prompt's small inputs
     int32_t *stage_h_ = nullptr, *stage_d_ = nullptr, *bounds_tab_ = nullptr;
     size_t stage_at_ = 0;
