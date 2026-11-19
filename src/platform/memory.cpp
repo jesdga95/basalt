@@ -146,23 +146,25 @@ uint64_t total_physical_memory() {
 
 #if defined(_WIN32)
 namespace {
-/// The two figures the sizing reads, from one query: available and total physical RAM in bytes. Both are 0 when the
-/// query fails, which the callers read as unknown rather than as none.
-void memory_status(uint64_t& avail, uint64_t& total) {
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof ms;
-    if (!GlobalMemoryStatusEx(&ms)) { avail = 0; total = 0; return; }
-    avail = (uint64_t) ms.ullAvailPhys;
-    total = (uint64_t) ms.ullTotalPhys;
-}
-
 // The OS's own reading, before a container limit lowers it (available_memory).
 uint64_t os_available_memory() {
-    uint64_t avail = 0, total = 0;
-    memory_status(avail, total);
-    return avail;
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullAvailPhys : 0;
 }
 }  // namespace
+
+bool commit_headroom(uint64_t& available, uint64_t& limit) {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms) || ms.ullTotalPageFile == 0) {
+        available = limit = 0;
+        return false;
+    }
+    available = (uint64_t) ms.ullAvailPageFile;
+    limit = (uint64_t) ms.ullTotalPageFile;
+    return true;
+}
 #else
 namespace {
 // One "<key>: <n> kB" line of /proc/meminfo in bytes (0 when absent).
@@ -178,6 +180,11 @@ uint64_t meminfo_bytes(const char* key) {
 // The OS's own reading, before a container limit lowers it (available_memory).
 uint64_t os_available_memory() { return meminfo_bytes("MemAvailable"); }
 }  // namespace
+
+bool commit_headroom(uint64_t& available, uint64_t& limit) {   // Linux overcommits: no commit limit to keep under
+    available = limit = 0;
+    return false;
+}
 #endif
 
 namespace {
@@ -386,7 +393,10 @@ uint64_t ram_budget(bool* known) {
     if (known) *known = avail > 0;
     if (avail == 0) return UINT64_MAX;
     const uint64_t reserve = ram_reserve();
-    return avail > reserve ? avail - reserve : 0;
+    uint64_t budget = avail > reserve ? avail - reserve : 0;
+    // a page-locked or resident allocation is committed too: it leaves the reserve of the commit headroom as well
+    if (uint64_t c = 0, limit = 0; commit_headroom(c, limit)) budget = std::min(budget, c > reserve ? c - reserve : 0);
+    return budget;
 }
 
 namespace {

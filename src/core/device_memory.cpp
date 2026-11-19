@@ -1,6 +1,8 @@
 // src/core/device_memory.cpp - see the header.
 #include "basalt/core/device_memory.hpp"
 
+#include "basalt/core/ram_load.hpp"
+#include "basalt/log.hpp"
 #include "basalt/platform/dynlib.hpp"
 #include "basalt/platform/memory.hpp"
 
@@ -66,6 +68,7 @@ struct Device {
     bool based = false;                // the two figures below are taken
     uint64_t others0 = 0;              // what every process had written at this process's first reading
     uint64_t own0 = 0;                 // what this process held then
+    bool commit_told = false;          // the log has said once that the commit limit binds
 };
 
 constexpr int kMaxDevices = 64;
@@ -97,16 +100,21 @@ void probe(int dev, Device& d) {
         d.model.os_usage = true;
         if (d.model.dedicated == 0) d.model.dedicated = a.dedicated;
     }
+    // where the OS keeps a commit limit (Windows), an integrated GPU's allocations count against it (measured on the
+    // N1X: cudaMalloc and cuMemCreate each raise the commit charge by their full size when made)
+    uint64_t avail = 0, limit = 0;
+    d.model.commit_bound = platform::commit_headroom(avail, limit);
 }
 
 }  // namespace
 
-cudaError_t device_mem_info(size_t* free_b, size_t* total_b) {
+cudaError_t device_mem_reading(DeviceMemoryReading& r) {
+    r = DeviceMemoryReading{};
     size_t cf = 0, ct = 0;
     const cudaError_t e = cudaMemGetInfo(&cf, &ct);
     if (e != cudaSuccess) return e;
-    if (free_b) *free_b = cf;
-    if (total_b) *total_b = ct;
+    r.device_free = cf;
+    r.total = ct;
     int dev = -1;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDevices) {
         (void) cudaGetLastError();
@@ -115,25 +123,54 @@ cudaError_t device_mem_info(size_t* free_b, size_t* total_b) {
     const std::lock_guard<std::mutex> lock(g_mu);
     Device& d = g_dev[dev];
     if (!d.probed) probe(dev, d);
-    const uint64_t D = d.model.dedicated;
-    // a discrete card; or no carve-out below the runtime's total: the runtime's figures stand
-    if (!d.model.integrated || D == 0 || D >= ct) return e;
+    if (!d.model.integrated) return e;   // a discrete card: the runtime's figures stand
 
-    uint64_t touched = 0;   // written device pages, every process
-    Nvml::MemInfo m{};
-    if (d.handle != nullptr && nvml().mem(d.handle, &m) == 0) touched = m.used;
-    uint64_t own = ct - cf;   // what this process holds
-    platform::AdapterMemory a;
-    if (d.model.os_usage && platform::adapter_memory(d.luid, d.node_mask, a)) own = a.local_usage;
-    if (!d.based) {
-        d.based = true;
-        d.others0 = touched;
-        d.own0 = own;
+    const uint64_t D = d.model.dedicated;
+    if (D != 0 && D < ct) {   // a carve-out below the runtime's total: the carve-out is the device's memory
+        uint64_t touched = 0;   // written device pages, every process
+        Nvml::MemInfo m{};
+        if (d.handle != nullptr && nvml().mem(d.handle, &m) == 0) touched = m.used;
+        uint64_t own = ct - cf;   // what this process holds
+        platform::AdapterMemory a;
+        if (d.model.os_usage && platform::adapter_memory(d.luid, d.node_mask, a)) own = a.local_usage;
+        if (!d.based) {
+            d.based = true;
+            d.others0 = touched;
+            d.own0 = own;
+        }
+        const uint64_t held = d.others0 + (own > d.own0 ? own - d.own0 : 0);
+        const uint64_t used = std::min<uint64_t>(D, std::max<uint64_t>(touched, held));
+        r.device_free = D - used;
+        r.total = D;
     }
-    const uint64_t held = d.others0 + (own > d.own0 ? own - d.own0 : 0);
-    const uint64_t used = std::min<uint64_t>(D, std::max<uint64_t>(touched, held));
-    if (free_b) *free_b = (size_t) (D - used);
-    if (total_b) *total_b = (size_t) D;
+    // The OS charges device memory to the commit limit: past it nothing more is allocated, carve-out or not.  What the
+    // RAM tiers leave of the RAM, the device leaves of the commit: the reserve the RAM guard holds, plus what the engine
+    // takes after its plan (plan_reserve), so the settled headroom is above the guard and not on it.
+    uint64_t avail = 0, limit = 0;
+    if (d.model.commit_bound && platform::commit_headroom(avail, limit)) {
+        const uint64_t reserve = plan_reserve(platform::ram_reserve());
+        r.commit_room = avail > reserve ? avail - reserve : 0;
+        if (r.commit_room < r.device_free && !d.commit_told) {
+            d.commit_told = true;
+            constexpr double GiB = 1073741824.0;
+            basalt::log::info("basalt",
+                              "device memory: the commit limit binds before the GPU's own memory: %.2f GiB free of "
+                              "%.2f GiB of commit (RAM plus page file), %.2f GiB of it kept (--ram-reserve-mib plus "
+                              "what loads later), against %.2f GiB of the GPU's memory free. A larger page file lets "
+                              "the engine use more of it",
+                              (double) avail / GiB, (double) limit / GiB, (double) reserve / GiB,
+                              (double) r.device_free / GiB);
+        }
+    }
+    return e;
+}
+
+cudaError_t device_mem_info(size_t* free_b, size_t* total_b) {
+    DeviceMemoryReading r;
+    const cudaError_t e = device_mem_reading(r);
+    if (e != cudaSuccess) return e;
+    if (free_b) *free_b = (size_t) std::min(r.device_free, r.commit_room);
+    if (total_b) *total_b = (size_t) r.total;
     return e;
 }
 

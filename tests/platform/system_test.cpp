@@ -42,6 +42,20 @@ int main() {
         check(self_cgroup_path().empty() && cgroup_root().empty(), "no accounting file means no cgroup paths either");
     }
     check(available_memory() > 0, "available_memory reads");
+    // the commit limit: Windows keeps one, and a page-locked allocation's budget leaves the reserve of its headroom (the
+    // two reads are moments apart, so within 256 MiB); Linux keeps none
+    {
+        uint64_t cavail = 0, climit = 0;
+        const bool has = commit_headroom(cavail, climit);
+#if defined(_WIN32)
+        check(has && climit > 0 && cavail <= climit, "commit_headroom reads the commit limit on Windows");
+        const uint64_t room = cavail > ram_reserve() ? cavail - ram_reserve() : 0;
+        check(ram_budget() <= room + (256ull << 20), "and ram_budget leaves the reserve of the commit headroom");
+        check(climit >= total_physical_memory() / 2, "the commit limit is of the RAM's order at least");
+#else
+        check(!has && cavail == 0 && climit == 0, "commit_headroom: no commit limit off Windows");
+#endif
+    }
 
     const ProcessMemory pm = process_memory();
     check(pm.rss_mib > 0 && pm.avail_mib > 0, "process_memory reads this process's resident set");

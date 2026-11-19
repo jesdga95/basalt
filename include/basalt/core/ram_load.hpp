@@ -84,6 +84,12 @@ inline constexpr uint64_t kPostPlanHostBytes = 2ull << 30;
 /// allowance for what the engine takes after the sizing.  0 (the guard off) leaves nothing, as asked.
 inline uint64_t plan_reserve(uint64_t reserve) { return reserve > 0 ? reserve + kPostPlanHostBytes : 0; }
 
+/// What a committed copy (page-locked or resident) may take of the OS's commit headroom, leaving `reserve` of it (a
+/// plan_reserve): where the OS keeps a commit limit (Windows, platform::commit_headroom) it binds such a copy beside
+/// the RAM, and on an integrated GPU the device's memory has taken its share of it already.  UINT64_MAX where the OS
+/// keeps none.
+uint64_t commit_room(uint64_t reserve);
+
 /// The bytes a RAM tier or copy of experts may take with `avail` bytes available: everything above `reserve`, less the
 /// driver's tracking of its pages when it is `pinned`.  Every model sizes its tier with this, after it has allocated
 /// (or held the RAM of) the host buffers it takes later, and with the file cache's keep (file_cache_keep) in `reserve`

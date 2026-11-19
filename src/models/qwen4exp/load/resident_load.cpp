@@ -72,7 +72,9 @@ int resident_load(Context& context) {
             const uint64_t cache_keep =
                 basalt::core::file_cache_keep(avail, resident_headroom, o.resident_pin, complement, *context.file_cache);
             resident_headroom += cache_keep;
-            const uint64_t room = basalt::core::ram_tier_room(avail, resident_headroom, o.resident_pin);
+            // (and of the commit headroom, where the OS keeps one, the plan reserve: the copy is committed memory)
+            const uint64_t room = std::min(basalt::core::ram_tier_room(avail, resident_headroom, o.resident_pin),
+                                           basalt::core::commit_room(reserve));
             const uint64_t copy =
                 std::min({o.resident_budget > 0 ? o.resident_budget : auto_resident_bytes, complement, room});
             const uint64_t file_bytes = complement - copy;

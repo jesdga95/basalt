@@ -132,6 +132,13 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "", const
 /// files, so a container's memory limit lowers it as it does the RAM tiers' plan; the OS reading where that fails.
 uint64_t available_memory();
 
+/// The OS's commit limit, where it keeps one (Windows): `limit` is the most memory that may be committed (RAM plus page
+/// file, which a system-managed page file can grow), `available` what may be committed now. A committed allocation
+/// (a page-locked or resident copy, and on an integrated GPU device memory too: core/device_memory.hpp) needs it
+/// beside the RAM; the OS file cache does not. False where the OS keeps no such limit (Linux overcommits; there RAM
+/// is the limit).
+bool commit_headroom(uint64_t& available, uint64_t& limit);
+
 /// The RAM left free for the rest of the system (--ram-reserve-mib): the expert tiers leave it, and while serving the
 /// RAM guard holds that line.  0: nothing is kept and the guard is off.
 uint64_t ram_reserve();
@@ -142,8 +149,9 @@ inline constexpr uint64_t kDefaultRamReserveBytes = 2ull << 30;
 /// chunk is sized to stay within it).
 inline constexpr uint64_t kPromptFileReadBytes = 3584ull << 20;
 
-/// The RAM a page-locked or fully resident allocation may take now: available_memory() less ram_reserve().  `known`
-/// is false when the OS gives no reading (nothing is refused then).
+/// The RAM a page-locked or fully resident allocation may take now: available_memory() less ram_reserve(), and where
+/// the OS keeps a commit limit, the commit headroom less ram_reserve() at most.  `known` is false when the OS gives no
+/// RAM reading (nothing is refused then).
 uint64_t ram_budget(bool* known = nullptr);
 
 /// Polls available_memory() until `stop_memory_watchdog`.  Below `floor_bytes` it prints a `basalt error:` line and

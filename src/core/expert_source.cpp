@@ -628,14 +628,24 @@ bool FileExpertSource::plan_cache_complement(
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
             return false;
         }
-        budget = std::min(ram_tier_room(physical, headroom_bytes, pin), lend_cap);
+        // the copy is committed memory too: where the OS keeps a commit limit it leaves the plan reserve of that as well
+        const uint64_t ram_room = ram_tier_room(physical, headroom_bytes, pin);
+        const uint64_t commit = commit_room(plan_reserve(platform::ram_reserve()));
+        budget = std::min({ram_room, commit, lend_cap});
         if (bytes > budget) {
             char message[320];
-            std::snprintf(message, sizeof message,
-                          "FileExpertSource: resident complement %.2f GiB exceeds available RAM (%.2f GiB) minus the "
-                          "%.0f GiB safety headroom",
-                          (double) bytes / 1073741824.0, (double) physical / 1073741824.0,
-                          (double) headroom_bytes / 1073741824.0);
+            if (commit < ram_room)
+                std::snprintf(message, sizeof message,
+                              "FileExpertSource: resident complement %.2f GiB exceeds the commit headroom left (%.2f GiB "
+                              "above the %.0f GiB reserve; RAM plus page file)",
+                              (double) bytes / 1073741824.0, (double) commit / 1073741824.0,
+                              (double) plan_reserve(platform::ram_reserve()) / 1073741824.0);
+            else
+                std::snprintf(message, sizeof message,
+                              "FileExpertSource: resident complement %.2f GiB exceeds available RAM (%.2f GiB) minus the "
+                              "%.0f GiB safety headroom",
+                              (double) bytes / 1073741824.0, (double) physical / 1073741824.0,
+                              (double) headroom_bytes / 1073741824.0);
             err = message;
             return false;
         }

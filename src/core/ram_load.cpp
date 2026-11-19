@@ -309,4 +309,10 @@ std::vector<RamPin> pin_ram_spans(const std::vector<uint8_t*>& spans, const std:
     return pins;
 }
 
+uint64_t commit_room(uint64_t reserve) {
+    uint64_t avail = 0, limit = 0;
+    if (!platform::commit_headroom(avail, limit)) return UINT64_MAX;
+    return avail > reserve ? avail - reserve : 0;
+}
+
 }  // namespace basalt::core

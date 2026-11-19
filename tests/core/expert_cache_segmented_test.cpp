@@ -16,10 +16,12 @@ int fail(const char* what, const std::string& err = "") {
     return 1;
 }
 
+// The device's own memory as the engine reads it (an integrated GPU: its carve-out). Not device_mem_info's free, whose
+// commit bound (Windows, integrated) lags a release: the driver keeps a freed block charged for a while.
 size_t free_vram() {
-    size_t f = 0, t = 0;
-    basalt::core::device_mem_info(&f, &t);   // the reading the engine sizes by (an integrated GPU: its carve-out)
-    return f;
+    basalt::core::DeviceMemoryReading r;
+    basalt::core::device_mem_reading(r);
+    return (size_t) r.device_free;
 }
 
 // slot i holds the byte (i * 7 + 1) everywhere
