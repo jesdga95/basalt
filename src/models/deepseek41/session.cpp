@@ -93,7 +93,7 @@ public:
                 return false;
             }
         const size_t n = (size_t) g_.n_embd;
-        head_g_.assign((size_t) g_.n_layers * 2 * kMaxWindow, nullptr);   // [T - 1][layer][with previous tail]
+        head_g_.assign((size_t) g_.n_layers * 2 * kMaxWindow * 2, nullptr);   // [lossy][T - 1][layer][with previous tail]
         tail_g_.assign((size_t) g_.n_layers * kMaxWindow, nullptr);
         constexpr int W = kMaxWindow;
         auto buf = [&](float*& p, size_t floats) {
@@ -222,6 +222,16 @@ public:
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
+        // the lossy routing flags apply to decode windows only: prompts route as the model does
+        struct Lossy {
+            core::ExpertTier*& t;
+            ~Lossy() { t = nullptr; }
+        } lossy{lossy_};
+        {
+            std::string e;
+            core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+            lossy_ = t && t->route_lossy() ? t : nullptr;
+        }
         if (r.row_tokens) {
             if (r.n_tokens > kMaxWindow) return {model::Status::Error, "deepseek41: the decode window is too long"};
             std::string err;
@@ -830,6 +840,10 @@ private:
         ra.n_embd = (int) n;
         ra.k = g_.n_used;
         ra.weight_scale = g_.weight_scale;
+        if (lossy_) {   // a decode window with the lossy routing flags: the experts the GPUs hold
+            ra.held = lossy_->held_tabs(il);
+            ra.prior = lossy_->route_prior();
+        }
 
         // each sublayer's mixes run beside its collapse: only its expansion reads them (captured after the collapse, so a
         // graph launch starts the collapse's branch first)
@@ -869,6 +883,9 @@ private:
         ops_->stage_rows(T, normed_, row_st_);
         DS_CUDA(cudaEventRecord(row_ev_[1], row_st_));
         router(normed_, wf(il, "ffn_gate_inp.weight"), wf(il, "exp_probs_b.bias"), T, ra, rlogits_, ids_, rw_, st);
+        if (lossy_ && lossy_->route_tail_skip() > 0)
+            kernels::route_tail_skip(ids_, rw_, ra.held, T * g_.n_used, g_.n_used, lossy_->route_tail_skip(), g_.n_expert,
+                                     lossy_->route_counts(), st);
         dump("ffn_moe_logits", il, pos, rlogits_, (size_t) g_.n_expert * sizeof(float));
         dump("ffn_moe_topk", il, pos, ids_, (size_t) g_.n_used * sizeof(int32_t));
         dump("ffn_moe_weights_scaled", il, pos, rw_, (size_t) g_.n_used * sizeof(float));
@@ -919,7 +936,8 @@ private:
     int graph_row(int T) const { return T - 1; }
 
     bool run_head(int il, int64_t pos, int32_t token, bool with_prev_tail, int T = 1) {
-        return run_graph(head_g_[(((size_t) graph_row(T) * g_.n_layers) + il) * 2 + (with_prev_tail ? 1 : 0)],
+        const size_t lossy = lossy_ ? (size_t) g_.n_layers * 2 * kMaxWindow : 0;
+        return run_graph(head_g_[lossy + (((size_t) graph_row(T) * g_.n_layers) + il) * 2 + (with_prev_tail ? 1 : 0)],
                          [&]() { return enqueue_head(il, pos, token, stream_, with_prev_tail, T); });
     }
     bool run_tail(int il, int64_t pos, int T = 1) {
@@ -968,6 +986,7 @@ private:
             std::string se;
             if (!ops_->stage_token(pos, T, st, se)) return fail(se);
         }
+        if (lossy_) lossy_->publish_held(stream_);   // ahead of the window's first router
         const bool graphs = dump_dir_.empty() && ops_->graph_capable();
         fused_ = graphs;
 
@@ -1125,6 +1144,7 @@ private:
     DsModel& m_;
     const Geometry& g_;
     std::vector<cudaGraphExec_t> head_g_, tail_g_;
+    core::ExpertTier* lossy_ = nullptr;   ///< in a decode window with --route-tail-skip / --route-prior on: the tier
     static constexpr int kHistoryCap = 4096;
     kernels::SamplerParams sampling_{};
     bool draw_kernel_ = false, bias_on_ = false;
