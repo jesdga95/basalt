@@ -24,7 +24,7 @@ bool plan_image(int w, int h, ImagePlan& p, std::string& err) {
 
 void image_patches(const vision::Image& src, const ImagePlan& plan, std::vector<float>& patches) {
     std::vector<float> planar;
-    vision::normalize_planar(vision::to_canvas(src, plan.canvas, kVisionFilter), planar);
+    vision::normalize_planar(vision::to_canvas(src, plan.canvas), planar);
     vision::patchify(planar, plan.canvas, vision_geometry(), patches);
 }
 

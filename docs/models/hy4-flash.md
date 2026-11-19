@@ -17,7 +17,7 @@ package, AngelSpec's DFly drafter, a routing trace of 57K prefill and 3.6K decod
 | MoE | layer 0 dense (13,824); layers 1-41: 512 routed experts, top 16, sigmoid scores + `exp_probs_b` for the choice, weights normalised, x 3.998; routed experts run in a 1536 latent (`routed_down` 3072 -> 1536, experts 1536 -> 1536 -> 1536, `routed_up` 1536 -> 3072); one shared expert 1536; SwiGLU clamp 10 on routed only; post-norm after the FFN |
 | iHC | per sublayer 8 mixes (pre 4, post 4): `pre = sigmoid(m * s0 + b) + eps`, `post = 2 * sigmoid(m * s1 + b) + eps`, `out[i] = residual[i] + post[i] * f`; **no cross-stream mix and no Sinkhorn** (DeepSeek and GLM have both); RMS eps 1e-5; head: 4 sigmoid weights, weighted sum |
 | Engram | layers 1, 11, 21, 31 (0-based); trigram: 2 orders x 8 hash heads = 16 rows of 96 FP8 values per token and module; one table of 660,006,416 rows (63.4 GB); rows RMS-normed per head (eps 1.19e-7), fused projection with bias to 4 key copies + 1 value, gate as DeepSeek's, `delta = norm(value) * gamma * (gate + hc_scale)` added to each stream; masked (valid 0) at image positions and at the first token |
-| Vision | SigLIP2-So400m-derived ViT, 27 layers, 1152, 16 heads, MLP 4304, patch 16, learned 128 x 128 position table (bilinear), 2 x 2 merge, RMS + 2-layer MLP projector -> 3072, learned `image_newline` row; up to 4,096 merged tokens (max_pixels 2048^2); mean = std = 0.5; resize filter 1 (Lanczos) |
+| Vision | SigLIP2-So400m-derived ViT, 27 layers, 1152, 16 heads, MLP 4304, patch 16, learned 128 x 128 position table (bilinear), 2 x 2 merge, RMS + 2-layer MLP projector -> 3072, learned `image_newline` row; up to 4,096 merged tokens (max_pixels 2048^2); mean = std = 0.5; resized with Pillow's bicubic (the configured filter 1, Lanczos, is unused) |
 | DFly2 | 5 dense layers (MLA as the target's sparse layer, no indexer, MLP 9,216), initialised from target layers 25, 29, 33, 37, 41 and reading their KV and index selection; `mtp_fusion` (gated fusion of last token embedding and last-layer hidden state), `hidden_correction` (SwiGLU over `norm(h) :: norm(e_prev)`, applied sequentially), `confidence_head`, mask token 120009, 5 drafts per block |
 
 Differences that matter next to DeepSeek-V4.1: a K row is 576 wide with V = its first 512 (DeepSeek's key and value are the same 512
@@ -108,10 +108,21 @@ Follow-up, with the DeepSeek pack present: Hy4 keeps its own attention kernels (
 fp32 latent cache with a sink); `attn_mqa.cu` is to be generalised (dK != dV, head count, one row source) so the two share one kernel, each step
 with the DeepSeek parity and speed runs. The router and the row norms are shared already (`basalt/kernels/router.hpp`, `row_norm.hpp`).
 
-Prefill plan: chunks of 16,384 tokens halved to fit, as DeepSeek; each chunk runs 42 layers with the sparse layers' indexer for
-every row of the chunk against the pooled keys of all earlier positions, then selected-row attention; SWA layers attend the previous
-511 rows (the chunk's tail plus the ring). No prompt skip (every layer's output matters). Engram rows of chunk n + 1 are read while
-chunk n computes (the hash needs only token ids). Experts stream as in DS (CPU share, peer share, borrowed slots).
+Prompt path (`session.cpp`): a prompt opens row buffers for chunks of up to 16,384 rows (halved to fit) and the VRAM tier lends its
+slots to them. Each chunk runs the 42 layers; the attention runs in steps of 2,048 rows (the rings are sized for a step), each step
+with its own row spans. Sparse layers score every row against the pooled keys before it on tensor cores (`scores_mma_kernel`) and
+select 64 rows a launch; the attention over the selected or windowed cells runs on tensor cores with fp16 operands
+(`attend_mma_kernel`). The heads products and the router are one launch a step, the dense products MMQ launches of a step's rows. From 1,024 rows every
+expert is used: a ring of two layer slots copies the next layer's experts while a layer computes, and the chunk's small host inputs
+(spans, launch tables, Engram rows, embeddings) go through mapped memory and a copy kernel so they never wait on the copy engine
+behind the ring. Every Engram layer's rows are asked for when the chunk starts. With a second card, its prompt share (`prefill::PeerShare`) computes its own experts and the RAM experts
+its link prices lower (a ringed chunk plans before routing and the ring leaves them out). A chunk below 1,024 rows keeps the card's
+expert slots, and the CPU pool takes RAM experts of up to 8 rows: on one card as many as `prefill::cpu_take` prices to end with the
+bus (fixed prices, the same split every run), beside a second card by DeepSeek's rule. The prompt log counts the experts by source.
+
+Measured (1x RTX 5090 at 400 W, Q4_K_M test pack, greedy, real text): a 3,519-token summary prompt 3.27 s (1,076 tok/s), a
+16,191-token prompt 5.13 s (3,156 tok/s); hy4-a before this path: 18.7 s and 90.8 s. A chunk of 1,024 rows or more is bound by the
+bus: 89.5 GB of experts at 29 GB/s (the card's x8 PCIe 5 link) = 3.1 s a chunk, so short prompts sit near that floor.
 
 ## 1M context
 
@@ -169,34 +180,41 @@ type; Flash-Next's `qwen3vl_merger` path is untouched (its kernels are not edite
 The projector is the side file's `mmproj-Hy4-flash-BF16.gguf` (llama.cpp's `hy_v4_flash` layout: F32 convs and position table, BF16
 products, q, k and v separate). The encoder reads it as is: q, k, v become one product, and the merge conv is reordered into a 4,608 x 4,608
 BF16 product over a group's four patch rows in merge order, at stage time. `convert.py --mmproj FILE` (arch `mmproj_only`) adds it
-as `vision/mmproj`; the engine opens it per request, uploads it to the main card (about 1.9 GB with the work buffers for 4,096
-merged tokens; `cudaMalloc`, no tier lending yet) and frees it in `images_done`.
+as `vision/mmproj`. `--vision` (serve: `dynamic`, the only mode) stages it once in pinned RAM (928 MiB) before the tier is sized;
+a request's pictures then take a region on the main card (about 1.9 GB with the work buffers for 4,096 merged tokens) where a short
+prompt's buffers go: what the tier left free, then the slots beside the base arena, then every slot the tier lends. `images_done`
+frees it and the tier takes its slots back. A 600-token picture encodes in about 0.1 s, a 4,096-token one in 0.55 s.
 
 Preprocessing (`vision.hpp`): `smart_resize` with factor 32, min 4,096 and max 4,194,304 pixels (4 and 4,096 merged tokens), a ratio over
-200 refused; Lanczos(3) to the canvas (bit-exact against Pillow); (v / 255 - 0.5) / 0.5; patches in merge order. **Open: the filter.**
+200 refused; Pillow's bicubic to the canvas (bit-exact); (v / 255 - 0.5) / 0.5; patches in merge order. The filter:
 `processor_config.json` says `resample: 1` (Lanczos) and llama.cpp's `hy_v4_flash` uses it, but transformers' `hy_v4_vl` processor
-(the same `HYV4VLImageProcessor`) resizes with Pillow's default BICUBIC and says the original never used the configured filter.
-One constant (`kVisionFilter`) switches it; compare the two on the model before release.
+resizes with BICUBIC because the original's `PIL.Image.resize` call never passes the configured filter. Lanczos rows sit 3 to 7 %
+(relL2) from bicubic ones on real pictures, and the model reads finer print with bicubic (the newspaper's price and issue number).
 
 Prompt: `<image_start>` pad x (oh x (ow + 1)) `<image_end>`; the pads of the newline slots are in the run, so the block of
-embedding rows is `oh * (ow + 1)` long and the engine's pad-run expansion (`encode_image` row count) already fits. The server's Hy4
-dialect (not in this milestone) sets `image_pad` and `image_start` to the pack's `<hy_image_pad..>` and `<hy_image_start..>` tokens.
+embedding rows is `oh * (ow + 1)` long and the engine's pad-run expansion (`encode_image` row count) already fits. The adapter names
+`<hy_image_pad..>` as the image pad; the server's Hy4 dialect sets `image_pad` and `image_start` to the pack's tokens.
 
 MRoPE: interleaved sections [12, 10, 10] over the 32 rotated pairs: pair i turns by h when i % 3 == 1 and i < 30, by w when
 i % 3 == 2 and i < 30, by t otherwise. Text takes the running position on all three; a picture block starting at p puts row j (column
 newline included, nx = ow + 1) at (p, p + j / nx, p + j % nx), and the text after it continues at p + max(oh, ow + 1)
 (transformers' `get_rope_index` of `hy_v4_vl`, tested on five prompts). The session keeps each cell's triple (`RopeTrack`) and,
 once a picture is in, a device table `cell_rope` that `mla_prepare`, `idx_rope_heads` and `idx_pool` read (null: the cell index, so
-text-only output is unchanged). The indexer's pooled key turns by its group's first cell's triple; to confirm against the reference.
+text-only output is unchanged). The indexer's pooled key turns by its group's first cell's triple, llama.cpp's convention (its pool
+position is "the M-RoPE position of each new pool's first member"); vLLM's `rotate_indexer` takes three-axis group positions too.
+llama.cpp's flash path itself rotates by 1-D positions (rope type NORM), so it is not a reference for picture positions. After a
+picture the drafter turns its block by the text's rotary position, not the cell.
 
 Engram: llama.cpp's hy-v4-flash treats an embedding (image) position as a token that cannot be hashed, so an image row's
 own Engram contribution is masked (valid 0) and, to the rows after it, it is a padded history entry. The session passes -1 as the token
-of an image row (`run_rows` accepts it only with embedding rows) and `engram_ids` reads -1 as dead on both counts. No HF reference
-is public for the flash model to check this against.
+of an image row (`run_rows` accepts it only with embedding rows) and `engram_ids` reads -1 as dead on both counts. vLLM's flash
+Engram has the same hook for a picture's own rows (`visual_token_ids`, masked) but leaves it empty and reads the pad ids as history.
 
 Images enter `session.cpp` through three marked hooks (`[vision]`): `encode_image`/`images_done`/`prefill_embeddings` (chunks of up
 to 256 rows through `run_rows` with the rows as the embeddings), `place_rope` in `run_rows`, and the `cell_rope` pointers in
-`mla_args` and `indexer`. Video is out of the first cut.
+`mla_args` and `indexer`. Video is out of the first cut. Checks: a picture's rows match the torch reference (transformers'
+processor, the ViT on the checkpoint) at relL2 4 to 6e-3 for PNGs (JPEGs add about 1e-2: stb_image and libjpeg decode apart); fed
+llama.cpp's own rows with 1-D positions, NVFP4 two cards keeps the BF16 GGUF's first 12 greedy tokens on three prompts.
 
 ## DFly2
 
@@ -299,8 +317,7 @@ Exit: layer 0 to 2 hidden states within gate 1, then all 42. GPU tests are queue
 9. **Selection ties and T invariance.** FP16 tensor-core scoring versus the reference's BF16 can flip near-tied pools; measure the
    id overlap against llama.cpp per layer (decode and prefill) and the logit effect; keep the scoring order fixed across windows.
 10. **Q6_K down in the grouped expert kernels (GPU) and no `q6k_dot` on the CPU** for the test pack: parity tests first (pack doc).
-11. **Image tokens.** Layout of newline tokens, the rope index and Lanczos: one run of the HF processor settles it.
-12. **GPU time.** One shared GPU limits kernel and bench throughput; kernel parity runs on short slots, benches batched.
+11. **GPU time.** One shared GPU limits kernel and bench throughput; kernel parity runs on short slots, benches batched.
 
 ## Open decisions
 
