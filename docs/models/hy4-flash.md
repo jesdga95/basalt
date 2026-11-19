@@ -108,17 +108,20 @@ Decode attention (`kernels/mla.cu`), up to 8 rows: `mla_query` (the `k_b` produc
 `mla_attend` on DeepSeek's MQA chunk stage (`basalt/kernels/mqa_chunk.cuh`: a block per 64 cells and 8 or 16 heads reads each cell once, the
 last block of a row's head group merges the chunks with the sink), then the `v_b` product. The router and the row norms are shared already (`basalt/kernels/router.hpp`, `row_norm.hpp`).
 
-Prompt path (`session.cpp`): a prompt opens row buffers for chunks of up to 16,384 rows (halved to fit) and the VRAM tier lends its
-slots to them. Each chunk runs the 42 layers; the attention runs in steps of 2,048 rows (the rings are sized for a step), each step
+Prompt path (`session.cpp`): a prompt opens row buffers for chunks of up to 16,384 rows (halved to fit) and the VRAM tier lends
+them only the slots they and the expert ring need (`ExpertTier::lend`: the base arena is mapped in 256 MiB segments laid out by depth,
+so its tail holds every layer's last slots; each layer's most recently used experts move into the slots it keeps), all of them only
+when that is not enough; the latent caches borrow their growth the same way. Each chunk runs the 42 layers; the attention runs in steps of 2,048 rows (the rings are sized for a step), each step
 with its own row spans. Sparse layers score every row against the pooled keys before it on tensor cores (`scores_mma_kernel`) and
 select 64 rows a launch; the attention over the selected or windowed cells runs on tensor cores with fp16 operands
-(`attend_mma_kernel`). The heads products and the router are one launch a step, the dense products MMQ launches of a step's rows. From 1,024 rows every
+(`attend_mma_kernel`, 32 heads a block sharing each tile of cells). The heads products and the router are one launch a step, the dense products MMQ launches of a step's rows. From 1,024 rows every
 expert is used: a ring of two layer slots copies the next layer's experts while a layer computes, and the chunk's small host inputs
 (spans, launch tables, Engram rows, embeddings) go through mapped memory and a copy kernel so they never wait on the copy engine
 behind the ring. Every Engram layer's rows are asked for when the chunk starts. With a second card, its prompt share (`prefill::PeerShare`) computes its own experts and the RAM experts
 its link prices lower (a ringed chunk plans before routing and the ring leaves them out). A chunk below 1,024 rows keeps the card's
 expert slots, and the CPU pool takes RAM experts of up to 8 rows: on one card as many as `prefill::cpu_take` prices to end with the
 bus (fixed prices, the same split every run), beside a second card by DeepSeek's rule. The prompt log counts the experts by source.
+The slots a long prompt leaves resident are staged card to card by the ring, and the next turn and its decode find them.
 
 Measured (1x RTX 5090 at 400 W, Q4_K_M test pack, greedy, real text): a 3,519-token summary prompt 3.27 s (1,076 tok/s), a
 16,191-token prompt 5.13 s (3,156 tok/s); hy4-a before this path: 18.7 s and 90.8 s. A chunk of 1,024 rows or more is bound by the
