@@ -91,6 +91,8 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.diag_tier_ram = flags_.diag_tier_ram;
     s.diag_tier_vram = flags_.diag_tier_vram;
     s.diag_tier_frozen = flags_.diag_tier_frozen;
+    s.route_tail_skip = flags_.route.tail_skip;
+    s.route_prior = flags_.route.prior;
     s.vram_reserve_mib = flags_.vram_reserve_mib;
     s.peer_reserve_mib = flags_.peer_reserve_mib;
     s.expert_cache = flags_.expert_cache;

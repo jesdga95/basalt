@@ -490,6 +490,12 @@ public:
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
         release_prompt();
+        // the lossy routing flags apply to decode windows only: prompts route as the model does
+        struct Lossy {
+            core::ExpertTier*& t;
+            ~Lossy() { t = nullptr; }
+        } lossy{lossy_};
+        lossy_ = tier_ && tier_->route_lossy() ? tier_.get() : nullptr;
         dfly_.begin_window(r.pos);   // DFLY HOOK
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxWindow) {
             const int n = std::min(kMaxWindow, r.n_tokens - t0);
@@ -1701,7 +1707,16 @@ private:
         ra.k = K;
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
+        const bool lossy = lossy_ && !prompt;
+        if (lossy) {   // a decode window with the lossy routing flags: the experts the GPUs hold
+            ra.held = lossy_->held_tabs(l - g_.n_dense);
+            ra.prior = lossy_->route_prior();
+        }
         bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
+        if (lossy && lossy_->route_tail_skip() > 0)   // each group of rows the tier places together
+            for (int g0 = 0; g0 < R; g0 += kMaxWindow)
+                bk::route_tail_skip(ids_ + (size_t) g0 * K, rw_ + (size_t) g0 * K, ra.held, std::min(kMaxWindow, R - g0) * K, K,
+                                    lossy_->route_tail_skip(), g_.n_expert, lossy_->route_counts(), stream_);
         quant_n(R);
         gemm_n(T(l, "ffn_routed_down.weight"), xlat_, L, R);
         if (!prompt) publish(0, std::min(kMaxWindow, R));
@@ -2085,7 +2100,7 @@ private:
         for (int t = 0; t < G; ++t)
             for (int k = 0; k < K; ++k) {
                 const int32_t e = h_ids_[t * K + k];
-                if (e < 0 || e >= g_.n_expert) {
+                if ((e < 0 && !(e == -1 && lossy_)) || e >= g_.n_expert) {   // -1: --route-tail-skip dropped it
                     err = "the router picked expert " + std::to_string(e);
                     return false;
                 }
@@ -2113,7 +2128,7 @@ private:
         }
         bool on_peer = false;
         for (int i = 0; i < nu; ++i) {
-            pd.cpu = pd.cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i]);
+            pd.cpu = pd.cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i] && !lk.dropped[i]);
             pd.reading = pd.reading || lk.reading[i];
             on_peer = on_peer || lk.peer[i];
         }
@@ -2151,7 +2166,9 @@ private:
         int ne = 0;
         const int nhits = make_plan(put.plan, false, ne);
         for (int r = 0; r < G * K; ++r)
-            put.rows[r] = (unsigned long long) (lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * L : d_rows_ + (size_t) r * L);
+            put.rows[r] = (unsigned long long) (lk.dev[uidx[r]]       ? ex_rows_ + (size_t) r * L
+                                                : lk.dropped[uidx[r]] ? tier_->zero_row()
+                                                                      : d_rows_ + (size_t) r * L);
         put_words(&put, ex_plan_, (int) ((offsetof(WindowPut, rows) + (size_t) G * K * 8) / 4), st);
         if (nhits) launch(ex_plan_, nhits, ne);
         if (n_fetched) {
@@ -2265,6 +2282,7 @@ private:
         hist_.insert(hist_.end(), tokens, tokens + R);
         place_rope(pos0, R);   // [vision]
         if (tier_) tier_->begin_token(std::min(R, kMaxWindow));
+        if (lossy_) lossy_->publish_held(stream_);   // ahead of the rows' first router
         struct Drain {
             Session* s;
             ~Drain() { s->drain_prefetch(); }
@@ -2533,6 +2551,7 @@ private:
     // the joiner thread (moe_group hands it a group's CPU and second-card share; join_moe waits for its result)
     bool use_joiner_ = true;
     bool use_graphs_ = true;
+    core::ExpertTier* lossy_ = nullptr;   ///< in a decode window with --route-tail-skip / --route-prior on: the tier
     std::thread joiner_;
     std::mutex jm_;
     std::condition_variable jcv_;
