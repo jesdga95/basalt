@@ -418,7 +418,7 @@ public:
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         std::vector<uint16_t*> rows;   // the drafter reads BF16 rows (--spec with --kv fp8 is refused at the start)
         for (uint8_t* p : cache_) rows.push_back((uint16_t*) p);
-        return dfly_.draft_begin(anchor, pos, n, rows, stream_);
+        return dfly_.draft_begin(anchor, pos, n, rows, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
     }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override { return dfly_.draft_end(ids, conf, max_n, n, stream_); }
 
@@ -473,15 +473,35 @@ public:
     // contribution is masked (valid 0) and, to the rows after it, it is a padded history entry. The history therefore holds -1 for
     // an image row, which engram_ids reads as "no n-gram" on both counts.
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid& grid) override {
+        ImageEncoder& enc = m_.encoder();
+        if (!enc.staged()) return {model::Status::NotImplemented, "hy4flash: started without --vision"};
         vision::Image img;
+        ImagePlan plan;
         std::string err;
-        if (!vision::decode_image(data, bytes, img, err) || !vis_.encode(m_.pack().vision, img, rows, n_rows, grid, err))
-            return {model::Status::Error, "hy4flash: " + err};
+        if (!vision::decode_image(data, bytes, img, err) || !plan_image(img.w, img.h, plan, err)) return {model::Status::Error, "hy4flash: " + err};
+        // the encoder's region goes where a short prompt's buffers go (open_prompt): in what the tier left free, then in the
+        // slots beside the base arena, and only then in the room of every slot the tier lends; images_done gives them back
+        for (int step = 0; enc.needs_region(plan); ++step) {
+            if (enc.reserve(plan, err)) break;
+            if (!tier_ || step == 2) return {model::Status::Error, "hy4flash: " + err};
+            cudaStreamSynchronize(stream_);
+            if (step == 0) tier_->shrink();
+            else { tier_->lend_all(); vis_lent_ = true; }
+            vis_shrunk_ = true;
+        }
+        if (!enc.encode(img, plan, rows, n_rows, grid, err)) return {model::Status::Error, "hy4flash: " + err};
         if (n_rows <= 0 || rows.size() != (size_t) n_rows * (size_t) g_.n_embd)
             return {model::Status::Error, "hy4flash: the projector's rows are not the model's width"};
         return {};
     }
-    void images_done() override { vis_.release(); }
+    void images_done() override {
+        m_.encoder().release();
+        if (!vis_shrunk_) return;
+        std::string e;
+        if (vis_lent_ && !tier_->reclaim(e)) basalt::log::warn("basalt hy4flash", "the expert tier stays small: %s", e.c_str());
+        tier_->grow();
+        vis_lent_ = vis_shrunk_ = false;
+    }
     // The rows of a picture block (newline rows included) at positions pos..: chunks of the row pass with the rows as the embeddings.
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid grid) override {
         if (grid.nx <= 0 || (int64_t) grid.nx * grid.ny != n_rows) return {model::Status::Error, "hy4flash: an image block needs its grid"};
@@ -1981,6 +2001,11 @@ private:
         rope_.rewind(pos);
         while (rope_.size() < pos) rope_.push_text();   // cells the session never placed (a restored history) count as text
     }
+    // The rotary position a text token at cell `pos` takes, the track left as it is (the drafter's block, before its window).
+    int64_t text_rope(int64_t pos) const {
+        const int64_t have = std::min<int64_t>(pos, rope_.size());
+        return (have > 0 ? rope_.at(have - 1).last() + 1 : 0) + (pos - have);
+    }
     void place_rope(int64_t pos0, int R) {
         sync_rope(pos0);
         const bool was_on = rope_on_;
@@ -2133,7 +2158,8 @@ private:
     int history_len_ = 0;
     bk::SamplerParams sampling_;
     // [vision]
-    ImageEncoder vis_;
+    bool vis_shrunk_ = false;            // the image encoder took the slots beside the base arena
+    bool vis_lent_ = false;              // ... and every slot the tier lends
     RopeTrack rope_;
     int32_t* rope_dev_ = nullptr;
     bool rope_on_ = false;               // a picture has been fed: the kernels read the rotary table

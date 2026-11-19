@@ -152,9 +152,10 @@ public:
     ~DflyRunner();
 
     /// Enqueues the block of `n` drafts (1..5) after `anchor` at `pos` on `stream`: the target's caches `cache[i]` (draft
-    /// layer i's, BF16 rows of 576) and the tap's row `row`. Nothing is read from the host but the embeddings.
+    /// layer i's, BF16 rows of 576) and the tap's row `row`. Nothing is read from the host but the embeddings. `rope_pos`:
+    /// the rotary position of cell `pos` (< 0: `pos`); after a picture the text runs behind the cells (vision.hpp).
     bool begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const uint16_t* const* cache, void* stream,
-               std::string& err);
+               std::string& err, int64_t rope_pos = -1);
     /// Runs the heads over the block begin() made, in order, each with the token before it: the `n` drafts and each one's
     /// estimated chance of acceptance.
     bool finish(int32_t* ids, float* conf, void* stream, std::string& err);
@@ -189,8 +190,10 @@ public:
     }
     /// Run row `t`'s selection in target layer `layer`: n cells (device), or n < 0 for every position up to the row.
     void selection(int layer, int t, const int32_t* cells, int n, void* stream) { if (tap_ && row0_ >= 0) tap_->selection(layer, row0_ + t, cells, n, stream); }
-    /// `cache`: the session's per-layer cache rows. A block is made only where the tap holds the row before `pos`.
-    model::Result draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint16_t*>& cache, void* stream);
+    /// `cache`: the session's per-layer cache rows. A block is made only where the tap holds the row before `pos`. `rope_pos`
+    /// as DflyRunner::begin.
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint16_t*>& cache, void* stream,
+                              int64_t rope_pos = -1);
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream);
 
 private:

@@ -40,12 +40,6 @@ inline constexpr int64_t kMaxImagePixels = 64ll << 20;
 bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err,
                   int64_t max_pixels = kMaxImagePixels);
 
-/// The resampling filter of a model's processor (Pillow's BICUBIC or LANCZOS).
-enum class Filter { Bicubic, Lanczos };
-
-/// `src` resampled to w x h with `filter` (Pillow-style: separable, 22-bit fixed-point taps, support scaled when shrinking).
-Image resize_to(const Image& src, int w, int h, Filter filter);
-
 /// `src` resampled to w x h (Pillow-style bicubic).
 Image resize_bicubic_to(const Image& src, int w, int h);
 
@@ -53,7 +47,7 @@ Image resize_bicubic_to(const Image& src, int w, int h);
 Size fit_size(int w, int h, const Geometry& g);
 
 /// The picture resized to the `target` canvas, each side on its own (no padding).
-Image to_canvas(const Image& src, Size target, Filter filter = Filter::Bicubic);
+Image to_canvas(const Image& src, Size target);
 
 /// The canvas as planar float [3][h][w], (v / 255 - 0.5) / 0.5.
 void normalize_planar(const Image& canvas, std::vector<float>& out);

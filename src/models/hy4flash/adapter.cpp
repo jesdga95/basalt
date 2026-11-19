@@ -69,9 +69,11 @@ public:
     }
 
     // The pack's own special tokens, by name: their suffix differs between the packs (the test pack's GGUF carries a hash, the
-    // release `opensource`), so the names take a `*`. <hy_end> ends a reply, <hy_start> opens a turn.
+    // release `opensource`), so the names take a `*`. <hy_end> ends a reply, <hy_start> opens a turn, a run of
+    // <hy_image_pad> holds a picture's rows.
     model::TokenNames token_names() const override {
-        return {{"<\xef\xbd\x9c" "hy_end:*\xef\xbd\x9c>"}, "<\xef\xbd\x9c" "hy_start:*\xef\xbd\x9c>", "", "", ""};
+        return {{"<\xef\xbd\x9c" "hy_end:*\xef\xbd\x9c>"}, "<\xef\xbd\x9c" "hy_start:*\xef\xbd\x9c>",
+                "<\xef\xbd\x9c" "hy_image\xe2\x96\x81pad:*\xef\xbd\x9c>", "", ""};
     }
 
 private:

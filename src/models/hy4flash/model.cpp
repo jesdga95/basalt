@@ -158,6 +158,12 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     spec_ = req.spec;
     if (req.draft)
         if (model::Result r = dfly_plan(pack_, reads, file, device_, dfly_); !r.ok()) return r;
+    // [vision] the image encoder staged before the context and the tier are sized: it holds no VRAM afterwards
+    if (req.vision) {
+        if (!vis_.stage(pack_.vision, g.n_embd, err)) return {model::Status::Error, "hy4flash: vision: " + err};
+        basalt::log::info("basalt hy4flash", "image encoder staged: %.0f MiB of weights in pinned memory, an image borrows the "
+                          "expert tier's slots while it is read", (double) vis_.weights_bytes() / 1048576.0);
+    }
     // the context: refused when its caches would take more than half of what the weights leave
     {
         size_t free_b = 0, total_b = 0;
