@@ -981,6 +981,12 @@ Flow SessionRequest::read_to(int64_t to) {
             r = rt_.session().prefill_chunk(pr);
             at = end;
         }
+        if (r.status == basalt::model::Status::Refused) {   // no room for this prompt: the engine serves on
+            basalt::log::warn("basalt serve", "%s", r.message.c_str());
+            rt_.session().end_prompt();
+            std::printf("ERR %s\n", r.message.c_str());
+            return Flow::next;
+        }
         if (!r.ok()) {
             basalt::log::error("basalt serve", "%s", r.message.c_str());
             std::printf("ERR %s\n", r.message.c_str());
