@@ -370,6 +370,12 @@ public:
             return true;
         }
         cudaStreamSynchronize(stream_);
+        n_peer_rows_ = n_cpu_rows_ = n_stage_dev_ = n_stage_bus_ = n_stage_peer_ = n_cpu_exp_ = 0;
+        t_cpu_run_ms_ = 0;
+        t_cpu_wait_ms_ = t_peer_wait_ms_ = t_gpu_wait_ms_ = 0;
+        t_pre_ms_ = t_moe_ms_ = t_build_ms_ = t_issue_ms_ = t_att_ms_ = t_ffn_ms_ = 0;
+        t_eng_ms_ = t_eng_read_ms_ = t_eng_norm_ms_ = 0;
+        t_ring_ms_ = 0;
         if (tier_ && total < kRingRows) {
             int want = kMaxWindow;
             while (want < total && want < kShortChunk) want *= 2;
@@ -398,8 +404,8 @@ public:
             make_bufs(probe, want, e, &need);
             if (ringed) need += expert_ring_bytes();
             if (tier_->lend(need) && make_bufs(big_, want, e)) {
-                if (ringed) ring_open();
-                if (!ringed || ring_) {
+                if (!ringed || ring_open() ||
+                    (tier_->lend(expert_ring_bytes() + kExpertLendSegment) && ring_open())) {
                     use(big_);
                     return true;
                 }
@@ -410,7 +416,9 @@ public:
         for (int R = want; R >= kMaxWindow; R /= 2)
             if (make_bufs(big_, R, err)) {
                 use(big_);
-                if (total >= kRingRows && tier_ && !ring_) ring_open();
+                if (ringed && !ring_open())
+                    basalt::log::info("basalt hy4flash", "cannot open the expert ring (%.1f GB): the prompt stages its experts per layer",
+                                      (double) expert_ring_bytes() / 1e9);
                 return true;
             }
         if (tier_) {
@@ -424,15 +432,17 @@ public:
     // The prompt's buffers go back; the tier takes its slots again.
     void release_prompt() {
         if (!big_.rows) return;
+        ring_join();
         cudaStreamSynchronize(stream_);
-        basalt::log::info("basalt hy4flash", "prompt time: %.0f ms queued ahead of the MoE (attention, dense), %.0f ms in the MoE (%.0f ms sorting the pairs, %.0f ms issuing the launches), %.0f ms in the Engram's host step; host time in attention() %.0f ms, in ffn() %.0f ms, issuing the ring copies %.0f ms; expert rows on the second card %lld, on the CPU %lld", t_pre_ms_, t_moe_ms_, t_build_ms_, t_issue_ms_, t_eng_ms_, t_att_ms_, t_ffn_ms_, t_ring_ms_.load(), (long long) n_peer_rows_, (long long) n_cpu_rows_);
+        basalt::log::info("basalt hy4flash", "prompt time: %.0f ms queued ahead of the MoE (attention, dense), "
+                          "%.0f ms in the MoE (%.0f ms sorting the pairs, %.0f ms issuing the launches), "
+                          "%.0f ms in the Engram's host step (%.0f ms waiting for rows, %.0f ms normalizing); "
+                          "host time in attention() %.0f ms, in ffn() %.0f ms, issuing the ring copies %.0f ms; "
+                          "expert rows on the second card %lld, on the CPU %lld",
+                          t_pre_ms_, t_moe_ms_, t_build_ms_, t_issue_ms_, t_eng_ms_, t_eng_read_ms_, t_eng_norm_ms_,
+                          t_att_ms_, t_ffn_ms_, t_ring_ms_.load(), (long long) n_peer_rows_, (long long) n_cpu_rows_);
         basalt::log::info("basalt hy4flash", "prompt experts: staged from the card %lld, from RAM over the bus %lld, from the second card %lld, on the CPU %lld (its thread %.0f ms, waited for %.0f ms), second card's share waited for %.0f ms, the stream after the launches %.0f ms",
                           (long long) n_stage_dev_, (long long) n_stage_bus_, (long long) n_stage_peer_, (long long) n_cpu_exp_, t_cpu_run_ms_.load(), t_cpu_wait_ms_, t_peer_wait_ms_, t_gpu_wait_ms_);
-        n_peer_rows_ = n_cpu_rows_ = n_stage_dev_ = n_stage_bus_ = n_stage_peer_ = n_cpu_exp_ = 0;
-        t_cpu_run_ms_ = 0;
-        t_cpu_wait_ms_ = t_peer_wait_ms_ = t_gpu_wait_ms_ = 0;
-        t_pre_ms_ = t_moe_ms_ = t_eng_ms_ = t_build_ms_ = t_issue_ms_ = t_att_ms_ = t_ffn_ms_ = 0;
-        t_ring_ms_ = 0;
         use(dec_);
         ring_close();
         big_.release();
@@ -1164,20 +1174,23 @@ private:
     bool ring_ok_[2] = {false, false};
 
     size_t expert_ring_bytes() const { return 2 * (size_t) g_.n_expert * stride_; }
-    void ring_open() {
-        const size_t bytes = expert_ring_bytes();
-        if (cudaMalloc((void**) &ring_, bytes) != cudaSuccess) {
+    bool ring_open() {
+        if (cudaMalloc((void**) &ring_, expert_ring_bytes()) != cudaSuccess) {
             cudaGetLastError();
             ring_ = nullptr;
-            basalt::log::info("basalt hy4flash", "no room for the expert ring (%.1f GB): the prompt stages its experts per layer", (double) bytes / 1e9);
-            return;
+            return false;
         }
         for (int i = 0; i < 2; ++i) {
-            cudaEventCreateWithFlags(&ring_copied_[i], cudaEventDisableTiming);
-            cudaEventCreateWithFlags(&ring_done_[i], cudaEventDisableTiming);
-            cudaEventRecord(ring_done_[i], stream_);
+            if (cudaEventCreateWithFlags(&ring_copied_[i], cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&ring_done_[i], cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventRecord(ring_done_[i], stream_) != cudaSuccess) {
+                cudaGetLastError();
+                ring_close();
+                return false;
+            }
         }
         ring_layer_[0] = ring_layer_[1] = -1;
+        return true;
     }
     void ring_join() {
         for (std::thread& t : ring_thr_)
@@ -1191,8 +1204,9 @@ private:
         cudaFree(ring_);
         ring_ = nullptr;
         for (int i = 0; i < 2; ++i) {
-            cudaEventDestroy(ring_copied_[i]);
-            cudaEventDestroy(ring_done_[i]);
+            if (ring_copied_[i]) cudaEventDestroy(ring_copied_[i]);
+            if (ring_done_[i]) cudaEventDestroy(ring_done_[i]);
+            ring_copied_[i] = ring_done_[i] = nullptr;
         }
     }
     // All the experts of tier layer `tl` into its slot, on the copy stream once the layer that used the slot is done.
@@ -1499,17 +1513,21 @@ private:
     }
 
     bool engram_step(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err, int off = 0) {
-        const double te = now_ms();
-        struct Lap {
-            double& acc;
-            double t;
-            ~Lap() { acc += now_ms() - t; }
-        } lap{t_eng_ms_, te};
         const EngramInfo& en = m_.pack().engram;
         int e = -1;
         for (size_t k = 0; k < en.layers.size(); ++k)
             if (en.layers[k] == l) e = (int) k;
         if (e < 0) return true;
+        const bool time_prompt = big_.rows != 0;
+        struct Lap {
+            double* acc;
+            double start;
+            ~Lap() { if (acc) *acc += now_ms() - start; }
+        } lap{time_prompt ? &t_eng_ms_ : nullptr, time_prompt ? now_ms() : 0};
+        const auto collect = [&](ngram::PleReader::Ticket ticket) {
+            Lap wait{time_prompt ? &t_eng_read_ms_ : nullptr, time_prompt ? now_ms() : 0};
+            return m_.engram_reader().collect(ticket, err);
+        };
         const int n_cols = en.n_cols(), W = en.row_values;
         static const std::vector<float> lut = [] {
             std::vector<float> t(256);
@@ -1522,7 +1540,7 @@ private:
         const uint8_t* raw = nullptr;
         if (pf) {
             if (!pf->collected) {
-                if (!m_.engram_reader().collect(pf->tk, err)) return false;
+                if (!collect(pf->tk)) return false;
                 pf->collected = true;
             }
             for (int t = 0; t < R; ++t) h_evalid_[t] = pf->valid[(size_t) (off + t)];
@@ -1539,7 +1557,7 @@ private:
             own_raw.resize((size_t) R * n_cols * W);
             ngram::PleReader& rd = m_.engram_reader();
             const ngram::PleReader::Ticket tk = rd.issue(ids.data(), ids.size(), own_raw.data());
-            if (!rd.collect(tk, err)) return false;
+            if (!collect(tk)) return false;
             raw = own_raw.data();
         }
         if (lookup_host_.empty()) lookup_host_.resize((size_t) n_cols * W * en.layers.size());
@@ -1549,6 +1567,7 @@ private:
             cudaMemcpy(nrm, T(l, "engram_lookup_norm.weight")->ptr, (size_t) n_cols * W * 4, cudaMemcpyDeviceToHost);
             lookup_loaded_[(size_t) e] = true;
         }
+        const double norm_start = time_prompt ? now_ms() : 0;
         for (int t = 0; t < R; ++t) {
             const float valid = h_evalid_[t];
             for (int c = 0; c < n_cols; ++c) {
@@ -1563,6 +1582,7 @@ private:
                 for (int d = 0; d < W; ++d) row[d] = row[d] * r * nrm[(size_t) c * W + d] * valid;
             }
         }
+        if (time_prompt) t_eng_norm_ms_ += now_ms() - norm_start;
         put_f32(erows_, h_erows_, (int64_t) R * n_cols * W);
         put_f32(evalid_, h_evalid_, R);
         if (!eng_ev_) cudaEventCreateWithFlags(&eng_ev_, cudaEventDisableTiming);
@@ -2550,6 +2570,7 @@ private:
     int last_rows_ = 0;
     // prompt timing (host wall time at the sync points): the work queued before a layer's MoE, the MoE itself, the Engram's reads
     double t_pre_ms_ = 0, t_moe_ms_ = 0, t_eng_ms_ = 0, t_build_ms_ = 0, t_issue_ms_ = 0, t_att_ms_ = 0, t_ffn_ms_ = 0;
+    double t_eng_read_ms_ = 0, t_eng_norm_ms_ = 0;
     std::atomic<double> t_ring_ms_{0};
     static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 };
