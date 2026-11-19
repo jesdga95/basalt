@@ -162,6 +162,43 @@ inline int32_t local_slot(const PeerBlocks& b, int homes_peer, int layer, int n)
     return (int32_t) ((layer - b.lo[(size_t) owner_of(b, layer)]) * homes_peer + n);
 }
 
+/// Slots per layer in proportion to `weights` (one per layer), `per_layer` a layer on average: the same total as every layer
+/// holding `per_layer`, each layer within [lo, hi]. Shares are rounded down, then the slots left go one at a time to the
+/// layers furthest below their exact share (the lower layer first on a tie), so the same weights always give the same
+/// layout. When the bounds cannot hold the total, it holds as much of it as they allow.
+inline std::vector<int64_t> layer_slots(int64_t per_layer, const std::vector<float>& weights, int64_t lo, int64_t hi) {
+    const size_t n = weights.size();
+    std::vector<int64_t> out(n, 0);
+    if (n == 0) return out;
+    const int64_t total = per_layer * (int64_t) n;
+    double sum = 0;
+    for (float w : weights) sum += w > 0 ? w : 0;
+    std::vector<double> exact(n);
+    for (size_t l = 0; l < n; ++l) exact[l] = sum > 0 ? (double) total * (weights[l] > 0 ? weights[l] : 0) / sum : (double) per_layer;
+    int64_t have = 0;
+    for (size_t l = 0; l < n; ++l) {
+        out[l] = std::clamp<int64_t>((int64_t) exact[l], lo, hi);
+        have += out[l];
+    }
+    while (have != total) {
+        const bool up = have < total;
+        size_t pick = n;
+        double gap = 0;
+        for (size_t l = 0; l < n; ++l) {
+            if (up ? out[l] >= hi : out[l] <= lo) continue;
+            const double g = up ? exact[l] - (double) out[l] : (double) out[l] - exact[l];
+            if (pick == n || g > gap) {
+                pick = l;
+                gap = g;
+            }
+        }
+        if (pick == n) break;
+        out[pick] += up ? 1 : -1;
+        have += up ? 1 : -1;
+    }
+    return out;
+}
+
 /// Misses of a layer go half to the CPU (rounded up) and the rest to the bus; the file-backed ones can only go to the
 /// CPU. Returns how many of the `pinned` misses the bus fetches, given `file` file-backed misses.
 inline int bus_count(int pinned, int file) {

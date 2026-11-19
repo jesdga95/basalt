@@ -186,9 +186,10 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
         err = s_.name + ": not enough device memory for the expert tier";
         return false;
     }
+    set_base(per_layer_);
     std::vector<int64_t> slot_bytes;
     for (int l = 0; l < n_layers_; ++l)
-        for (int64_t s = 0; s < per_layer_; ++s) slot_bytes.push_back((int64_t) s_.layers[(size_t) l].blob_bytes);
+        for (int64_t s = 0; s < base_n(l); ++s) slot_bytes.push_back((int64_t) s_.layers[(size_t) l].blob_bytes);
     if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) return false;
     res_.assign((size_t) n_layers_ * n_expert_, -1);
     stamp_.assign((size_t) n_layers_ * n_expert_, 0);
@@ -263,6 +264,13 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     program::warn_spill(spill(), peers_.empty() ? ", or --gpu 0,1" : "");
     basalt::log::info(s_.area.c_str(), "VRAM expert tier %.2f GiB, %lld of %d experts per layer (%.0f%%); CPU pool %d workers",
                  cache_.gib(), (long long) per_layer_, n_expert_, 100.0 * (double) per_layer_ / n_expert_, pool_->workers());
+    bool uniform = true;
+    for (int l = 0; l < n_layers_; ++l) uniform = uniform && base_n(l) == per_layer_;
+    if (!uniform) {
+        std::string by;
+        for (int l = 0; l < n_layers_; ++l) by += (l ? " " : "") + std::to_string(base_n(l));
+        basalt::log::info(s_.area.c_str(), "VRAM expert tier copies by layer (the model's weights): %s", by.c_str());
+    }
     // the RAM the tier took emptied the file cache; with no expert read from the file, it takes the token embedding back
     if (homes_.file == 0 && s_.host.ram_only) s_.host.ram_only();
     return true;
@@ -389,7 +397,6 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
     ram_idx_.assign((size_t) n_layers_ * n_expert_, -1);
     spare_.assign((size_t) n_layers_, -1);
     last_miss_.assign((size_t) n_layers_ * n_expert_, 0);
-    const int64_t copies = homes_.main > 0 ? 0 : per_layer_;
     std::vector<int32_t> device_home;   // [layer * n_expert + e] the slot of a home on either card, or -1
     if (homes_.main > 0 || homes_.peer > 0) device_home.assign((size_t) n_layers_ * n_expert_, -1);
     if (!peers_.empty()) {   // peer_owner_ keeps the global slot l * homes_.peer + n; each card numbers its own from 0
@@ -415,9 +422,9 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
         for (int r = 0; r < n_expert_; ++r) {
             const int e = ranked(l, r);
             const size_t idx = (size_t) l * n_expert_ + e;
-            switch (core::policy::place_of_rank(homes_, (int) copies, r)) {
+            switch (core::policy::place_of_rank(homes_, homes_.main > 0 ? 0 : (int) base_n(l), r)) {
                 case core::policy::Place::Main: {
-                    const int32_t slot = (int32_t) ((int64_t) l * per_layer_ + n_main++);
+                    const int32_t slot = (int32_t) (base_lo_[(size_t) l] + n_main++);
                     res_[idx] = slot;
                     owner_[(size_t) slot] = e;
                     device_home[idx] = slot;
@@ -491,7 +498,7 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
 
 bool ExpertTier::attach(std::string& err) {
     if (!land_ram(err)) return false;
-    if (homes_.main == 0) seed_copies(per_layer_);
+    if (homes_.main == 0) seed_copies(0, /*base_shares=*/true);
     promoted_ = 0;
     return plan_ext(err);   // after the RAM tier is pinned: its registration takes VRAM too
 }
@@ -558,9 +565,19 @@ bool ExpertTier::load_rank(std::string& err) {
     return true;
 }
 
+// The base arena's layout: per_layer slots in every layer, or, for copies with layer weights, the same total spread by them.
+void ExpertTier::set_base(int64_t per_layer) {
+    const bool weighted = homes_.main == 0 && !s_.layer_weights.empty() && (int) s_.layer_weights.size() == n_layers_;
+    const std::vector<int64_t> n = weighted ? core::policy::layer_slots(per_layer, s_.layer_weights, std::min<int64_t>(per_layer, s_.top_k), n_expert_)
+                                            : std::vector<int64_t>((size_t) n_layers_, per_layer);
+    base_lo_.assign((size_t) n_layers_ + 1, 0);
+    for (int l = 0; l < n_layers_; ++l) base_lo_[(size_t) l + 1] = base_lo_[(size_t) l] + n[(size_t) l];
+}
+
 // Copies the most routed RAM tier experts the main card does not hold yet into `n` slots of each layer.
-void ExpertTier::seed_copies(int64_t n) {
+void ExpertTier::seed_copies(int64_t n_each, bool base_shares) {
     for (int l = 0; l < n_layers_; ++l) {
+        const int64_t n = base_shares ? base_n(l) : n_each;
         for (int64_t r = 0, placed = 0; r < n_expert_ && placed < n; ++r) {
             const int e = ranked(l, (int) r);
             if (!pinned(l, e) || res_[(size_t) l * n_expert_ + e] >= 0) continue;
@@ -588,7 +605,7 @@ const uint8_t* ExpertTier::blob_of(int layer, int e) const {
 }
 
 const uint8_t* ExpertTier::slot_ptr(int32_t slot) const {
-    const int64_t nb = (int64_t) n_layers_ * per_layer_;
+    const int64_t nb = base_slots();
     return slot < nb ? cache_.device_slot(slot) : ext_.device_slot((int32_t) (slot - nb));
 }
 
@@ -789,8 +806,8 @@ int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const
         }
     };
     if (homes_.main == 0 || (homes_too && spare_[(size_t) layer] >= 0))
-        scan((int64_t) layer * per_layer_, per_layer_);
-    if (ext_per_layer_) scan((int64_t) n_layers_ * per_layer_ + (int64_t) layer * ext_per_layer_, ext_per_layer_);
+        scan(base_lo_[(size_t) layer], base_n(layer));
+    if (ext_per_layer_) scan(base_slots() + (int64_t) layer * ext_per_layer_, ext_per_layer_);
     return slot;
 }
 
@@ -837,7 +854,7 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     stamp_[(size_t) layer * n_expert_ + e] = tick_;
     const uint64_t bytes = s_.layers[(size_t) layer].blob_bytes;
     uint8_t* dst = const_cast<uint8_t*>(slot_ptr(slot));
-    const bool home = homes_.main > 0 && slot < (int64_t) n_layers_ * per_layer_;
+    const bool home = homes_.main > 0 && slot < base_slots();
     int32_t place = -1;
     const uint64_t piece = whole ? bytes : core::policy::kPieceBytes;
     const auto pieces = [&](uint8_t* to, const uint8_t* from, cudaMemcpyKind kind) {
@@ -1007,7 +1024,7 @@ void ExpertTier::promote(int layer, const Lookup& lk) {
 void ExpertTier::shrink() {
     if (ext_per_layer_ == 0) return;
     settle();
-    const int64_t nb = (int64_t) n_layers_ * per_layer_;
+    const int64_t nb = base_slots();
     for (int64_t s = nb; s < (int64_t) owner_.size(); ++s) {
         const int32_t o = owner_[(size_t) s];
         if (o >= 0) res_[(size_t) ((s - nb) / ext_per_layer_) * n_expert_ + o] = -1;
@@ -1028,15 +1045,18 @@ void ExpertTier::lend_all() {
     lent_per_layer_ = per_layer_;
     planned_per_layer_ = std::max(planned_per_layer_, per_layer_);
     per_layer_ = 0;
+    set_base(0);
     cache_.close();
 }
 
 bool ExpertTier::reopen_base(int64_t n, std::string& err) {
+    set_base(n);
     std::vector<int64_t> slot_bytes;
     for (int l = 0; l < n_layers_; ++l)
-        for (int64_t s = 0; s < n; ++s) slot_bytes.push_back((int64_t) s_.layers[(size_t) l].blob_bytes);
+        for (int64_t s = 0; s < base_n(l); ++s) slot_bytes.push_back((int64_t) s_.layers[(size_t) l].blob_bytes);
     std::string e;
     if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, e)) {
+        set_base(0);
         err = s_.name + ": the VRAM expert tier cannot take back its " + std::to_string(n) + " slots per layer: " + e;
         return false;
     }

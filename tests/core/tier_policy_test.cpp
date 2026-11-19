@@ -67,6 +67,31 @@ int main() {
             CHECK(n >= 0 && n <= bus_count(p, f) - n);   // the main card's link keeps at least as many
         }
 
+    // slots by layer weight: the uniform total, within the bounds, deterministic; no weights or equal ones: uniform
+    {
+        CHECK(layer_slots(141, {}, 16, 512).empty());
+        CHECK(layer_slots(10, {1, 1, 1, 1}, 0, 512) == std::vector<int64_t>({10, 10, 10, 10}));
+        CHECK(layer_slots(10, {3, 1}, 0, 512) == std::vector<int64_t>({15, 5}));
+        CHECK(layer_slots(10, {1, 1, 1}, 0, 512) == std::vector<int64_t>({10, 10, 10}));
+        CHECK(layer_slots(1, {1, 1, 1}, 0, 512) == std::vector<int64_t>({1, 1, 1}));
+        CHECK(layer_slots(2, {1, 1, 1, 0}, 0, 512) == std::vector<int64_t>({3, 3, 2, 0}));   // the leftover to the lowest layer first
+        CHECK(layer_slots(10, {9, 1}, 4, 512) == std::vector<int64_t>({16, 4}));              // the floor holds
+        CHECK(layer_slots(10, {9, 1}, 0, 12) == std::vector<int64_t>({12, 8}));               // the ceiling holds
+        CHECK(layer_slots(10, {1, 1}, 0, 6) == std::vector<int64_t>({6, 6}));                 // bounds below the total: all they allow
+        CHECK(layer_slots(0, {2, 1}, 0, 512) == std::vector<int64_t>({0, 0}));
+        const std::vector<float> w = {1.76f, 1.84f, 0.45f, 0.62f, 1.13f};
+        for (int64_t pl : {16, 64, 135, 141, 300}) {
+            const std::vector<int64_t> n = layer_slots(pl, w, std::min<int64_t>(pl, 16), 512);
+            int64_t sum = 0;
+            for (int64_t x : n) {
+                CHECK(x >= std::min<int64_t>(pl, 16) && x <= 512);
+                sum += x;
+            }
+            CHECK(sum == pl * 5);
+            CHECK(n == layer_slots(pl, w, std::min<int64_t>(pl, 16), 512));
+        }
+    }
+
     // homes: a RAM shortfall puts homes on the main card, with or without a second card; RAM that takes the rest leaves
     // the main card all copies
     {
