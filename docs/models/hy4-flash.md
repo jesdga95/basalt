@@ -141,6 +141,10 @@ by their pack accessors. Extract, as its own commits with DS output hash-identic
 2. `core/expert_tier`: slots, per-layer LRU, RAM tier with CPU compute, file reads of experts left on the SSD, copies on a side
    stream, peer cards. The model supplies a descriptor: first MoE layer, experts per layer, top-k, per-layer blob offsets and
    sizes, formats, and the hooks `clamp` and `latent` (the expert input is the latent for Hy4, the layer input for DS).
+   Hy4 also gives per-layer weights for the main card's copies (`layer_weights`; DeepSeek gives none and keeps the same
+   copies in every layer): its early layers route more widely, so layers 0-3 hold about 1.4x the mean and layers 15, 27 and
+   31-33 about 0.73x, the same total (135 a layer on average beside the Q8_0 drafter). On serve bench.sh against the same
+   copies everywhere: struct +4.6%, prose +2.3%, conv and prefill within noise. The table and its traces are in `model.cpp`.
 3. `core/engram_table`: row reader (O_DIRECT, row-aligned, prefetch, hot-row LRU in pinned RAM); the row decode (IQ4_NL, MXFP4,
    E4M3) is the model's.
 4. `core/elastic_array` (DS `elastic.hpp`, beside `core/vmm.hpp`) for the KV backing.

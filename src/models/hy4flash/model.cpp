@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <iterator>
 #include <numeric>
 
 namespace basalt::models::hy4flash {
@@ -23,6 +24,18 @@ constexpr int kTypeQ8_0 = 8;
 constexpr int kAdmitUses = 2;
 // copies a decode window may claim per row (a window's rows route to mostly different experts)
 constexpr int kClaimsPerRow = 128;
+// The main card's copies by layer (core::ExpertTierSpec::layer_weights) for the 41 layers of 512 experts: the early layers
+// route more widely and miss far more often (layers 0-3 sent 2.3-2.9 experts a token to the CPU at 141 copies each,
+// layers 15, 27 and 31-33 under 0.6). From 768-token plain decode routing traces of one prose and one code prompt
+// (2026-11-19, Hy4-flash-NVFP4.basalt, RTX 5090 + RTX 5060 Ti, 141 copies a layer at the time): per layer, the misses an
+// LRU of each size leaves, priced at what that layer's CPU share took (93 us an expert, the MoE's GPU share 75 us), and
+// the copies given four at a time where they save the most. The table keeps half of that move (0.5 + 0.5 x copies over
+// their mean): the whole of it took struct's six-row windows of repeated keys down 2% on serve, half of it took them up
+// 4.6% and prose up 2.3% (bench.sh, none of its fixtures in the traces).
+constexpr float kLayerSlotWeights[41] = {1.380f, 1.420f, 1.410f, 1.310f, 1.195f, 1.155f, 1.080f, 1.195f, 1.065f, 1.195f, 1.295f,
+                                         1.025f, 1.165f, 1.240f, 1.065f, 0.725f, 0.940f, 0.785f, 1.040f, 0.925f, 1.265f, 1.010f,
+                                         0.910f, 0.800f, 0.995f, 0.925f, 0.840f, 0.725f, 0.770f, 0.925f, 0.870f, 0.725f, 0.725f,
+                                         0.725f, 0.870f, 0.785f, 1.010f, 0.825f, 0.925f, 0.810f, 0.940f};
 }  // namespace
 
 Hy4Model::Hy4Model() = default;
@@ -87,6 +100,7 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.expert_profile = flags_.expert_profile;
     s.admit_uses = kAdmitUses;
     s.claims_per_row = kClaimsPerRow;
+    if (s.n_layers == 41 && s.n_expert == 512) s.layer_weights.assign(std::begin(kLayerSlotWeights), std::end(kLayerSlotWeights));
     s.share_max_tokens = 16384;
     s.share_stride = expert_stride();
     return s;
