@@ -27,8 +27,12 @@ learnable_sink_param 32}`, `post_attention_layernorm`, `mlp.{gate,up}_proj 9216x
 `mtp_fusion.{eh_proj 3072x6144, enorm, hnorm, gate 3072}`, `hidden_correction.{gate,up}_proj 3072x6144, down_proj 3072x3072,
 hidden_norm, embed_norm}`, `confidence_head.proj {weight 1x3072, bias}`. The embedding and the output head are the target's.
 Settings (config.json): 5 layers, `dfly_mask_token_id` 120009, `dfly_target_kv_layers` = `dfly_target_index_layer` = [25, 29, 33, 37,
-41], `dfly_target_index_topk` 2048, no local window, slot0 fusion, hidden correction on. Matrices stay BF16 on the card (1.7 GB);
-the norms, the sink, the fusion gate and the confidence head are widened to FP32 at load. Q8_0 (0.9 GB) is a later step.
+41], `dfly_target_index_topk` 2048, no local window, slot0 fusion, hidden correction on. The block pass's projections (every
+matrix but `kv_b`, which the per-head kernels read as BF16) are rounded to Q8_0 as they load (`core::Conv::Bf16ToQ8_0`, ggml's
+reference rounding), so the drafter takes 0.87 GiB of the main card instead of 1.58 and the expert tier, sized after it, gets 4
+more experts per layer (131 to 135 of 512 with the NVFP4 pack on a 5090); their products quantize the rows to q8_1 and run MMVQ.
+The norms, the sink, the fusion gate and the confidence head are widened to FP32 at load. The drafter only proposes: the target
+verifies every draft, so the rounding changes which drafts are accepted, never the output.
 
 ## Forward (as vLLM's, with the Basalt mapping)
 

@@ -63,8 +63,10 @@ bool parse_dfly_meta(const core::Json& dfly2, uint64_t section_offset, DflyPack&
 struct DflySpec {
     std::string name;
     std::vector<uint64_t> shape;
-    bool f32 = false;
+    bool f32 = false;   ///< a vector widened to FP32
+    bool q8 = false;    ///< a projection of the block pass, rounded to Q8_0 as it loads
     uint64_t elems() const;
+    uint64_t bytes() const { return q8 ? elems() / 32 * 34 : elems() * (f32 ? 4 : 2); }   ///< on the card
 };
 /// Every tensor of a drafter of these dims.
 std::vector<DflySpec> dfly_specs(const DflyDims& d);
@@ -72,11 +74,13 @@ std::vector<DflySpec> dfly_specs(const DflyDims& d);
 bool dfly_check_shapes(const std::map<std::string, DflyTensor>& tensors, DflyDims& d, std::string& err);
 
 struct DflyLayer {
-    const uint16_t *q_a, *q_b, *kv_a, *kv_b, *gate, *o, *mlp_gate, *mlp_up, *mlp_down;
+    const void *q_a, *q_b, *kv_a, *gate, *o, *mlp_gate, *mlp_up, *mlp_down;   // Q8_0
+    const uint16_t* kv_b;                                                    // BF16: the per-head kernels read it
     const float *in_ln, *q_a_ln, *kv_a_ln, *post_proj_ln, *post_attn_ln, *sink;
 };
 
-/// The drafter's weights on the main card: BF16 matrices as stored, FP32 vectors.
+/// The drafter's weights on the main card: the block pass's projections in Q8_0 (rounded as they load, so the expert tier is
+/// sized after the smaller drafter), kv_b in BF16 as stored, FP32 vectors.
 class DflyWeights {
 public:
     ~DflyWeights();
@@ -87,7 +91,7 @@ public:
 
     DflyDims dims;
     std::vector<DflyLayer> layer;
-    const uint16_t *eh_proj = nullptr, *hc_gate = nullptr, *hc_up = nullptr, *hc_down = nullptr;
+    const void *eh_proj = nullptr, *hc_gate = nullptr, *hc_up = nullptr, *hc_down = nullptr;   // Q8_0
     const float *enorm = nullptr, *hnorm = nullptr, *fuse_gate = nullptr, *hc_hidden_norm = nullptr, *hc_embed_norm = nullptr,
                 *final_norm = nullptr, *conf_w = nullptr, *conf_b = nullptr;
 
