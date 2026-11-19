@@ -476,13 +476,16 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     _order_chat_tool_results(messages)
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
-    # Thinking, strongest first: off from any field (enable_thinking false, an effort of none, reasoning_budget 0),
-    # then chat_template_kwargs.reasoning_effort, "reasoning_effort" or Responses-style "reasoning": {"effort": ...},
-    # and last the level a reasoning_budget implies (-1: the highest, N: as Anthropic's budget_tokens)
+    # Thinking, strongest first: off from any field (enable_thinking false, an effort of none, reasoning_budget 0,
+    # a "reasoning": {"enabled": false}), then chat_template_kwargs.reasoning_effort, "reasoning_effort" or
+    # Responses-style "reasoning": {"effort": ...}, and last the level a reasoning_budget implies
+    # (-1: the highest, N: as Anthropic's budget_tokens)
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
     template_kw = req.get("chat_template_kwargs") or {}
     kwargs = {**llama_budget(req.get("reasoning_budget")),
               **effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort"))}
+    if reasoning.get("enabled") is False:                 # the generic off switch; true is the route's default
+        kwargs["enable_thinking"] = False
     if "reasoning_effort" in template_kw:
         kwargs.update(effort_kwargs(template_kw["reasoning_effort"]))
     if "enable_thinking" in template_kw and not template_kw["enable_thinking"]:
