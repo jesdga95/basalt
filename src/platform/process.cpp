@@ -400,11 +400,16 @@ void write_crash_backtrace() noexcept {
 
 void on_terminate() noexcept {
     if (!g_crash_logged.exchange(true, std::memory_order_relaxed)) {
-        const char* what = "unknown exception";
+        // The text is copied out inside the handler: rethrow_exception may throw a copy of the exception (MSVC does),
+        // which dies with the catch clause and takes what() with it.
+        char what[160] = "unknown exception";
         try {
             if (const std::exception_ptr ep = std::current_exception()) std::rethrow_exception(ep);
         } catch (const std::exception& e) {
-            what = e.what();
+            const char* w = e.what();
+            size_t i = 0;
+            for (; w != nullptr && w[i] != 0 && i + 1 < sizeof what; ++i) what[i] = w[i];
+            if (i > 0) what[i] = 0;
         } catch (...) {
         }
         CrashBuf b;

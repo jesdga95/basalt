@@ -129,14 +129,16 @@ inline void load_fence() {
 #endif
 }
 
-/// A read prefetch of the line at `p` into every cache level (`near`) or into L2 and beyond.
-inline void prefetch(const void* p, bool near = true) {
+/// A read prefetch of the line at `p` into every cache level (`to_l1`) or into L2 and beyond.
+inline void prefetch(const void* p, bool to_l1 = true) {
 #if defined(BASALT_ARCH_X86)
-    _mm_prefetch((const char*) p, near ? _MM_HINT_T0 : _MM_HINT_T1);
+    _mm_prefetch((const char*) p, to_l1 ? _MM_HINT_T0 : _MM_HINT_T1);
 #elif defined(_MSC_VER)
-    __prefetch2(p, near ? 0 /* PLDL1KEEP */ : 2 /* PLDL2KEEP */);
+    // the operation is an immediate of the instruction: 0 is PLDL1KEEP, 2 is PLDL2KEEP
+    if (to_l1) __prefetch2(p, 0);
+    else __prefetch2(p, 2);
 #else
-    if (near) __builtin_prefetch(p, 0, 3);
+    if (to_l1) __builtin_prefetch(p, 0, 3);
     else __builtin_prefetch(p, 0, 2);
 #endif
 }
