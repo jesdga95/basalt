@@ -3,6 +3,7 @@
 // sequential heads on small random weights (E = 256, two layers, two heads, a 300-token vocabulary) over random "target"
 // caches and selections. Synthetic: no model, no checkpoint.
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
+#include "basalt/models/hy4flash/kernels.hpp"
 #include "models/hy4flash/dfly.hpp"
 
 #include <cuda_runtime.h>
@@ -136,6 +137,47 @@ void test_kernels() {
     dfly_gather_rows(dc, nullptr, 20, kDflyRowWidth, dout, nullptr);
     got = download(dout, 20 * kDflyRowWidth);
     CHECK(std::equal(got.begin(), got.end(), cache.begin()));
+    {   // --kv fp8: rows written by mla_prepare, gathered and decoded to BF16 exactly
+        const int n8 = 50;
+        MlaArgs a;
+        std::vector<float> q((size_t) n8 * a.heads * 256), qa((size_t) n8 * a.heads * kDflyRank), kv((size_t) n8 * kDflyRowWidth), nw(kDflyRank);
+        for (float& x : q) x = gauss(1.f);
+        for (float& x : qa) x = gauss(1.f);
+        for (float& x : kv) x = gauss(3.f);
+        for (float& x : nw) x = 1.f + gauss(0.5f);
+        float *dq = upload(q), *dqa = upload(qa), *dkv = upload(kv), *dnw = upload(nw), *dqc = nullptr;
+        cudaMalloc(&dqc, (size_t) n8 * a.heads * kDflyRowWidth * 4);
+        uint8_t* d8 = nullptr;
+        cudaMalloc(&d8, (size_t) n8 * kFp8RowBytes);
+        mla_prepare(dq, dqa, dkv, dnw, a, 0, n8, 0, dqc, d8, nullptr);
+        std::vector<uint8_t> rows8 = download(d8, (size_t) n8 * kFp8RowBytes);
+        dfly_gather_rows_fp8(d8, dcells, 5, dout, nullptr);
+        got = download(dout, 5 * kDflyRowWidth);
+        bool exact = true;
+        for (int j = 0; j < 5; ++j) {
+            const uint8_t* row = &rows8[(size_t) cells[(size_t) j] * kFp8RowBytes];
+            float sc[4];
+            std::memcpy(sc, row + kDflyRank, sizeof sc);
+            for (int c = 0; c < kDflyRowWidth; ++c) {
+                uint16_t want;
+                if (c < kDflyRank) {
+                    const uint8_t b = row[c];
+                    const int e = (b >> 3) & 15, m = b & 7;
+                    double v = e ? std::ldexp(1.0 + m / 8.0, e - 7) : std::ldexp((double) m, -9);
+                    v = ((b & 0x80) ? -v : v) * sc[c >> 7];
+                    const float f = (float) v;
+                    exact = exact && from_bf16(to_bf16(f)) == f;
+                    want = to_bf16(f);
+                } else {
+                    std::memcpy(&want, row + kDflyRank + 16 + 2 * (c - kDflyRank), 2);
+                }
+                exact = exact && got[(size_t) j * kDflyRowWidth + c] == want;
+            }
+        }
+        std::printf("gather fp8 rows: %s\n", exact ? "exact" : "FAIL");
+        CHECK(exact);
+        cudaFree(dq); cudaFree(dqa); cudaFree(dkv); cudaFree(dnw); cudaFree(dqc); cudaFree(d8);
+    }
     std::vector<float> gotf;
     std::vector<float> a(300), b(300), g(300);
     for (int i = 0; i < 300; ++i) { a[(size_t) i] = gauss(1.f); b[(size_t) i] = gauss(1.f); g[(size_t) i] = gauss(1.f); }
@@ -287,7 +329,7 @@ void test_block() {
 
     for (int n : {1, 3, 5}) {
         const int32_t anchor = 17;
-        std::vector<const uint16_t*> caches = {dcache[0], dcache[1]};
+        std::vector<const void*> caches = {dcache[0], dcache[1]};
         CHECK(run->begin(anchor, pos, n, *tap, 0, caches.data(), nullptr, err));
         int32_t ids[5];
         float conf[5];

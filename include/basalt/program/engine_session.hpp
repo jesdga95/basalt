@@ -63,6 +63,9 @@ int engine_plan(const std::string& engine_bin, const std::vector<std::string>& a
 std::string plan_field(const std::string& plan_answer, const std::string& name);
 /// `dir`/<arch> when the model has its own fixtures there, else `dir`.
 std::string fixtures_for(const std::string& dir, const std::string& plan_answer);
+/// Why fixtures whose largest token id is `max_id` cannot run on a model of `n_vocab` tokens (the engine's INFO
+/// logit_bias): they were made with another tokenizer. Empty when they fit, or when the vocabulary is unknown (0).
+std::string fixture_vocab_refusal(int64_t max_id, int64_t n_vocab, const std::string& dir);
 /// The engine a benchmark program starts without --engine: the `basalt` executable beside the program (`self`, its
 /// own path) when there is one, else `built`, where the build wrote it.
 std::string default_engine(const std::string& self, const std::string& built);
