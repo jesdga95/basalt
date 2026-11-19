@@ -429,7 +429,8 @@ public:
         return false;
     }
 
-    // The prompt's buffers go back; the tier takes its slots again.
+    // The prompt's buffers go back; the tier takes its slots again, with the experts they held (most recently used first), so
+    // the turn's first tokens find the card as the last turn left it rather than refilling it a promotion at a time.
     void release_prompt() {
         if (!big_.rows) return;
         ring_join();
@@ -442,7 +443,7 @@ public:
         big_.release();
         if (tier_) {
             std::string e;
-            if (lent_ && !tier_->reclaim(e)) basalt::log::warn("basalt hy4flash", "the expert tier stays small: %s", e.c_str());
+            if (lent_ && !tier_->reclaim(e, /*restore=*/true)) basalt::log::warn("basalt hy4flash", "the expert tier stays small: %s", e.c_str());
             tier_->grow();   // the slots beside the base arena, if a short prompt took them
         }
         lent_ = false;
@@ -552,13 +553,17 @@ public:
         std::string err;
         if (!vision::decode_image(data, bytes, img, err) || !plan_image(img.w, img.h, plan, err)) return {model::Status::Error, "hy4flash: " + err};
         // the encoder's region goes where a short prompt's buffers go (open_prompt): in what the tier left free, then in the
-        // slots beside the base arena, and only then in the room of every slot the tier lends; images_done gives them back
+        // slots beside the base arena, then in the fewest base slots that make room for it (a bounded lend), and only then in
+        // the room of every slot the tier lends; images_done gives them back with their experts
         for (int step = 0; enc.needs_region(plan); ++step) {
             if (enc.reserve(plan, err)) break;
             if (!tier_ || step == 2) return {model::Status::Error, "hy4flash: " + err};
             cudaStreamSynchronize(stream_);
             if (step == 0) tier_->shrink();
-            else { tier_->lend_all(); vis_lent_ = true; }
+            else {
+                if (!tier_->partial_lend() || !tier_->lend(enc.region_bytes(plan))) tier_->lend_all();
+                vis_lent_ = true;
+            }
             vis_shrunk_ = true;
         }
         if (!enc.encode(img, plan, rows, n_rows, grid, err)) return {model::Status::Error, "hy4flash: " + err};
@@ -570,7 +575,7 @@ public:
         m_.encoder().release();
         if (!vis_shrunk_) return;
         std::string e;
-        if (vis_lent_ && !tier_->reclaim(e)) basalt::log::warn("basalt hy4flash", "the expert tier stays small: %s", e.c_str());
+        if (vis_lent_ && !tier_->reclaim(e, /*restore=*/true)) basalt::log::warn("basalt hy4flash", "the expert tier stays small: %s", e.c_str());
         tier_->grow();
         vis_lent_ = vis_shrunk_ = false;
     }
@@ -655,7 +660,7 @@ public:
         if (low) {
             tier_->lend_all();
         } else {
-            if (!tier_->reclaim(e)) return {model::Status::Error, "hy4flash: " + e};
+            if (!tier_->reclaim(e, /*restore=*/true)) return {model::Status::Error, "hy4flash: " + e};
             tier_->grow();
         }
         expert_slots = tier_->slots();
