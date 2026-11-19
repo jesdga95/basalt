@@ -7,6 +7,7 @@
 #include "basalt/ngram/ple_reader.hpp"
 #include "models/hy4flash/dfly.hpp"   // DFLY HOOK
 #include "models/hy4flash/pack.hpp"
+#include "models/hy4flash/vision_encoder.hpp"   // [vision]
 
 #include <map>
 #include <memory>
@@ -70,6 +71,8 @@ public:
     const DflyWeights* dfly() const { return dfly_.get(); }
     int spec() const { return spec_; }
     const std::string& diag_dump() const { return diag_dump_; }
+    /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests.
+    ImageEncoder& encoder() const { return vis_; }
 
 private:
     Pack pack_;
@@ -86,6 +89,7 @@ private:
     int device_ = 0, fd_ = -1;
     bool fp8_ = false, f32_ = false;
     int diag_rows_ = 0;
+    mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DflyWeights> dfly_;   // DFLY HOOK
     int spec_ = 0;
     int64_t ctx_ = kDefaultContext;
