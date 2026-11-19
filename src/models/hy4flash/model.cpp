@@ -153,7 +153,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         int sparse = 0;
         for (int l = 0; l < g.n_layers; ++l) sparse += !g.swa[(size_t) l];
         const ctxp::Plan p = ctxp::plan_context(req.max_context > 0 ? req.max_context : kDefaultContext, g.context_length,
-                                                free_b / (uint64_t) std::max(req.sessions, 1), sparse, fp8_);
+                                                free_b / (uint64_t) std::max(req.sessions, 1), sparse, fp8_, req.max_context > 0);
         if (!p.error.empty()) return {model::Status::Error, "hy4flash: " + p.error};
         if (!p.note.empty()) basalt::log::info("basalt hy4flash", "%s", p.note.c_str());
         ctx_ = p.context;
