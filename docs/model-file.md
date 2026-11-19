@@ -139,6 +139,35 @@ ggml's NVFP4 blocks, the layout the dense products read with TMA (NInfer's and I
 
 [nvfp4_planes.hpp](../include/basalt/kernels/nvfp4_planes.hpp) is the engine's copy of this layout.
 
+## Hy4-flash NVFP4 pack
+
+The published pack (`Hy4-flash-NVFP4.basalt`, [Hugging Face](https://huggingface.co/jesdga/Hy4-flash-Basalt)) comes from Tencent's
+BF16 checkpoint ([tencent/Hy4-flash](https://huggingface.co/tencent/Hy4-flash), 148 shards, Tencent Hy License 1.0), through three
+inputs: the checkpoint converted to a BF16 GGUF by llama.cpp's `convert_hf_to_gguf.py --outtype bf16` (llama.cpp 0a054d0b0, which
+has `hy_v4_flash`), the vision projector as llama.cpp's `mmproj-Hy4-flash-BF16.gguf`, and the DFly2 drafter, the checkpoint's
+`model.dfly_layers.*` tensors (its last shard, `model-00148-of-00148.safetensors`, or a side file with those 87 tensors).
+
+```sh
+python3 tools/convert/convert.py --gguf Hy4-flash-BF16.gguf --nvfp4 --hf-dir tencent-Hy4-flash \
+    --mmproj mmproj-Hy4-flash-BF16.gguf --dfly tencent-Hy4-flash/model-00148-of-00148.safetensors \
+    --out Hy4-flash-NVFP4.basalt --name "Hy4-flash NVFP4"
+python3 tools/convert/convert.py --verify Hy4-flash-NVFP4.basalt --gguf Hy4-flash-BF16.gguf
+```
+
+- Routed experts (layers 1 to 41) NVFP4 (type 40): blobs `[gate | up | down]` and an FP32 tail `{s_gate, s_up, s_down, 0}`, 3,981,328
+  bytes each; per matrix the tensor scale amax / (6 x 448), per 16 values the UE4M3 scale with the least squared error among half
+  to four times amax / 6 (the 27B pack's rounding).
+- The BF16 projections (attention, latent, shared expert, dense FFN, Engram key/value, indexer, embedding) Q8_0 in ggml's reference
+  rounding; `--dense-q6k` makes the projections with whole 256-value rows Q6_K. The head stays BF16; norms, hc, router and biases
+  F32 as stored.
+- The Engram table: E4M3 codes (type 43), to nearest with ties to even, no scale; the exact fraction and RMS error go to
+  `meta.quantized_from.engram`.
+- Tokenizer and chat template are the GGUF's, refused unless they equal `--hf-dir`'s. `vision/mmproj` and `dfly` hold the side files
+  whole; `--hf-dir` also gives `LICENSE` and `config.json`.
+- 158.7 GB (experts 83.58, Engram 63.36, dense 7.45 + 0.97, projector 1.04, drafter 1.69). Every rounding is deterministic and runs once,
+  in pieces by worker processes. `--verify` repeats each rounding against the BF16 GGUF and compares the bytes; it takes as long as
+  the build. The tensor table and the choices behind it: [pack](models/hy4-flash/pack.md#the-nvfp4-pack-from-the-bf16-gguf).
+
 ## Hy4-flash test pack
 
 From [AngelSlim/Hy4-flash-GGUF](https://huggingface.co/AngelSlim/Hy4-flash-GGUF)'s Q4_K_M (`general.architecture` `hy_v4_flash`)

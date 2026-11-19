@@ -48,21 +48,21 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 
 ## Models
 
-| | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | Qwen3.8-27B |
-|---|---|---|---|
-| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-QUASAR-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) |
-| Context | up to 262,144 (longer with YaRN) | up to 1,048,576 | up to 262,144 |
-| Drafting | MTP, on by default | DSpark, on by default | DFlash 2, on by default |
-| Images | yes | yes | yes |
-| Documents (PDF, text) | yes | yes | yes |
-| Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) | [guide](docs/models/qwen38-27b.md) |
-| Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) | [precision](docs/precision/qwen38-27b.md) |
+| | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | Qwen3.8-27B | Hy4-flash |
+|---|---|---|---|---|
+| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-QUASAR-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) | `Hy4-flash-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Hy4-flash-Basalt) |
+| Context | up to 262,144 (longer with YaRN) | up to 1,048,576 | up to 262,144 | up to 1,048,576 |
+| Drafting | MTP, on by default | DSpark, on by default | DFlash 2, on by default | DFly2, on by default |
+| Images | yes | yes | yes | yes |
+| Documents (PDF, text) | yes | yes | yes | yes |
+| Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) | [guide](docs/models/qwen38-27b.md) | [guide](docs/models/hy4-flash.md) |
+| Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) | [precision](docs/precision/qwen38-27b.md) | [quality](docs/precision/quality.md) |
 
 All models compared, with each one's context limit, flags and cards: [models](docs/models/index.md).
 
 ## Video
 
-Qwen3.8-Flash-Next and Qwen3.8-27B read video; DeepSeek does not. A video is named like an image in a chat message, and needs
+Qwen3.8-Flash-Next and Qwen3.8-27B read video; DeepSeek and Hy4-flash do not. A video is named like an image in a chat message, and needs
 `--vision` and FFmpeg on the machine. Flash-Next decodes frames on the GPU with NVDEC; the 27B decodes them on the CPU.
 How a request names a video, and the limits: [video](docs/running.md#video).
 

@@ -1,7 +1,7 @@
 # Hy4-flash (design)
 
 Full Basalt support for `tencent/Hy4-flash` (`HYV4FlashForConditionalGeneration`): architecture id `hy4flash`, code in
-`src/models/hy4flash`, `include/basalt/models/hy4flash`, `serve/models/hy4flash.py`. Not implemented yet. Pack and converter (the
+`src/models/hy4flash`, `include/basalt/models/hy4flash`, `serve/models/hy4flash.py`. Supported from 0.5.0. Pack and converter (the
 Q4_K_M test pack first): [pack](hy4-flash/pack.md). References read: llama.cpp PR 32517 (`hy-v4-flash.cpp`,
 `llama-memory-idx-iswa.cpp`, `conversion/hy_v4_flash.py`), the HF config, chat template and processor config, vLLM's `hy_v4` model
 package, AngelSpec's DFly drafter, a routing trace of 57K prefill and 3.6K decode tokens. Numbers marked *est* are not measured.
