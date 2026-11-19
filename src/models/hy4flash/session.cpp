@@ -300,6 +300,7 @@ public:
         }
         if (!ok) {
             b.release();
+            cudaGetLastError();   // a smaller try must not find this failed allocation as the last error of its first launch
             err = "out of device memory for " + std::to_string(R) + " rows";
             return false;
         }
