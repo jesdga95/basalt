@@ -564,6 +564,50 @@ void test_indexer() {
 
 // The selection at long range: 262,144 pools (a 1M context), random scores and runs of ties around the cut, by one row and by
 // rows of different pool counts, against a stable sort.
+// Microbench of a prompt's indexer batch at long range: 64 rows against 131,072 pools (the middle of a 1M prompt), the
+// tensor-core scores and the selection.
+void bench_indexer_batch() {
+    IndexerArgs a;
+    const int rows = 64, NP = 131072, K = 511, P = 4, cs = K * P + 8;
+    std::vector<float> q = randn((size_t) rows * a.heads * a.dim, 0.1f), w = randn((size_t) rows * a.heads);
+    std::vector<float> kf = randn((size_t) NP * a.dim);
+    std::vector<uint16_t> keys((size_t) NP * a.dim);
+    for (size_t i = 0; i < keys.size(); ++i) keys[i] = f2h(kf[i]);
+    std::vector<int32_t> meta;
+    for (int r = 0; r < rows; ++r) meta.insert(meta.end(), {NP - r, (NP - r) * P, 1});
+    float *dq = dev(q), *dw = dev(w), *ds = devf((size_t) rows * NP);
+    uint16_t* dk = dev(keys);
+    int32_t *dm = dev(meta), *dc = nullptr;
+    cudaMalloc(&dc, (size_t) rows * cs * 4);
+    cudaStream_t st;
+    cudaStreamCreate(&st);
+    cudaEvent_t e0, e1, e2;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    cudaEventCreate(&e2);
+    idx_scores_rows(dq, dw, dk, dm, NP, rows, a, ds, NP, st);
+    idx_select_rows(ds, NP, dm, rows, K, P, dc, cs, st);
+    cudaEventRecord(e0, st);
+    for (int it = 0; it < 10; ++it) idx_scores_rows(dq, dw, dk, dm, NP, rows, a, ds, NP, st);
+    cudaEventRecord(e1, st);
+    for (int it = 0; it < 10; ++it) idx_select_rows(ds, NP, dm, rows, K, P, dc, cs, st);
+    cudaEventRecord(e2, st);
+    cudaEventSynchronize(e2);
+    float m1 = 0.f, m2 = 0.f;
+    cudaEventElapsedTime(&m1, e0, e1);
+    cudaEventElapsedTime(&m2, e1, e2);
+    const double flop = 2.0 * 2.0 * rows * a.heads * (double) NP * a.dim;   // q in two fp16 halves
+    std::printf("%-30s scores %.0f us (%.1f TFLOP/s), select %.0f us, per 64 rows x 131072 pools\n", "indexer batch microbench",
+                m1 * 100.f, flop / (m1 / 10.0 * 1e-3) / 1e12, m2 * 100.f);
+    cudaFree(dq);
+    cudaFree(dw);
+    cudaFree(ds);
+    cudaFree(dk);
+    cudaFree(dm);
+    cudaFree(dc);
+    cudaStreamDestroy(st);
+}
+
 void test_select_long() {
     const int NP = 262144, K = 511, P = 4, tail_n = 2;
     std::vector<int> counts = {NP, NP - 77, 3000, 513};
@@ -850,6 +894,7 @@ int main() {
     test_engram();
     test_indexer();
     test_select_long();
+    bench_indexer_batch();
     test_fp8();
     test_mmq_dense();
     test_mmq_expert(12, "mmq experts Q4_K");
