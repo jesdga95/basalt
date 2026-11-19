@@ -239,9 +239,9 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     const kernels::cpu::PoolAffinity affinity = s_.pool_affinity_given ? s_.pool_affinity : kernels::cpu::PoolAffinity::All;
     int workers = s_.pool_workers;
     if (workers <= 0) {
-        // The start-up pick, the one Flash-Next sizes its pool by: a hybrid CPU runs on its P-cores and half the E-cores,
-        // and the cgroup quota caps the workers and the host thread together.  It holds whatever the quant and whatever
-        // the peer cards, so no model decides it.
+        // The start-up pick program::auto_plan applies to the models that plan their pool: a hybrid CPU runs on its
+        // P-cores and half the E-cores, and the cgroup quota caps the workers and the host thread together.  It holds
+        // whatever the quant and whatever the peer cards, so no model decides it.
         const kernels::cpu::CpuTopology topo = kernels::cpu::detect_cpu_topology(true);
         program::AutoInputs in;
         in.worker_cores = (int) topo.worker_cores.size();
