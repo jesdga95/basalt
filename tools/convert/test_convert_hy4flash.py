@@ -192,11 +192,14 @@ class Hy4FlashTest(unittest.TestCase):
             f.write(bytes([b[0] ^ 1]))
         self.assertFalse(verify_pack.verify(str(pack), str(self.gguf)))
 
-    def test_hf_dir_is_needed_and_the_side_inputs_are_refused(self):
+    def test_hf_dir_is_needed_and_the_wrong_side_inputs_are_refused(self):
         with self.assertRaises(SystemExit):
             convert.convert(self.args(hf_dir=None))
+        # --mmproj is the vision projector (vision/mmproj), accepted for this arch; a file that is not a projector GGUF is refused
+        notgguf = self.t / "not-a-projector.gguf"
+        notgguf.write_bytes(b"not a gguf")
         with self.assertRaises(SystemExit):
-            convert.convert(self.args(mmproj=str(self.gguf)))
+            convert.convert(self.args(mmproj=str(notgguf)))
         with self.assertRaises(SystemExit):
             convert.convert(self.args(draft_vocab=str(self.gguf)))
 
