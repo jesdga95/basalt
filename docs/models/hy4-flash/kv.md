@@ -57,6 +57,9 @@ NVFP4 pack, RTX 5090 (main) + RTX 5060 Ti (expert tier), both at their default p
 | Needle at 10 / 50 / 90 % of 253,410 tokens | pass / pass / pass | pass / pass / pass |
 | Decode after a 116,202-token prompt (`--spec 6`) | 68.4 tok/s, hits 83 % | 69.9 tok/s, hits 84 % |
 | Decode after a 253,410-token prompt (`--spec 6`) | 54 to 62 tok/s, hits 64 to 80 % | |
+| Needle at 50 % of 1,015,207 tokens | | pass (read in 486 s, 2,090 tok/s) |
+| Decode after the 1,015,207-token prompt (`--spec 6`) | | 43.1 tok/s, hits 60 % |
 
 The needle is a passphrase sentence in wikitext, asked for with thinking off; prompts of 253K tokens read in 94 to 98 s. After a
-long prompt the tier takes back the slots its room still holds (114 to 122 of 129 per layer) and decode refills them.
+long prompt the tier takes back the slots its room still holds (114 to 122 of 129 per layer at 253K, 75 at 1M with FP8 rows) and
+decode refills them.
