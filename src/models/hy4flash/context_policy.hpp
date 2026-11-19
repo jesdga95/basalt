@@ -32,10 +32,14 @@ struct Plan {
     std::string note;      ///< a warning to print
 };
 
+/// Free memory a context the user asked for leaves to the expert tier and the prompt workspaces at the least.
+constexpr uint64_t kSlotFloorBytes = 4ull << 30;
+
 /// The context from --max-context (`requested`), the model's native maximum and the free device memory once the dense weights
 /// are resident: below kMinContext or past the native maximum is refused, so are caches that need more than half the free
-/// memory; a quarter or more gives a note (the expert tier needs the rest).
-inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, int sparse_layers, bool fp8 = false) {
+/// memory, or, for a context the user named (`asked`), more than the free memory less kSlotFloorBytes; a quarter or more gives a
+/// note (the expert tier needs the rest).
+inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, int sparse_layers, bool fp8 = false, bool asked = false) {
     Plan p;
     if (native <= 0) native = kLegacyContext;
     if (requested < kMinContext) {
@@ -47,10 +51,12 @@ inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes,
         return p;
     }
     const uint64_t need = context_bytes(requested, sparse_layers, fp8);
-    if (need > free_bytes / 2) {
-        p.error = "--max-context " + std::to_string(requested) + " needs " + std::to_string(need >> 20) +
-                  " MiB of latent caches, more than half of the " + std::to_string(free_bytes >> 20) +
-                  " MiB free after the weights (a smaller --max-context makes them smaller)";
+    const uint64_t cap = asked ? (free_bytes > kSlotFloorBytes ? free_bytes - kSlotFloorBytes : 0) : free_bytes / 2;
+    if (need > cap) {
+        p.error = "--max-context " + std::to_string(requested) + " needs " + std::to_string(need >> 20) + " MiB of latent caches, more than " +
+                  (asked ? "the " + std::to_string(free_bytes >> 20) + " MiB free after the weights less " + std::to_string(kSlotFloorBytes >> 20) + " MiB for the expert tier"
+                         : "half of the " + std::to_string(free_bytes >> 20) + " MiB free after the weights") +
+                  " (a smaller --max-context or --kv fp8 makes them smaller)";
         return p;
     }
     if (need > free_bytes / 4)

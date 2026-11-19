@@ -19,6 +19,9 @@ int main() {
     check(plan_context(8192, 1 << 20, 20 * gib, 12).context == 8192, "8K fits");
     check(!plan_context(1 << 20, 1 << 20, 20 * gib, 12).error.empty(), "1M refused with 20 GiB free (half rule)");
     check(plan_context(1 << 20, 1 << 20, 40 * gib, 12).context == (1 << 20), "1M accepted with 40 GiB free");
+    check(plan_context(1 << 20, 1 << 20, 20 * gib, 12, false, true).context == (1 << 20), "1M asked for: accepted with 20 GiB free");
+    check(!plan_context(1 << 20, 1 << 20, 17 * gib, 12, false, true).error.empty(), "1M asked for: refused under the slot floor");
+    check(plan_context(1 << 20, 1 << 20, 17 * gib, 12, true, true).context == (1 << 20), "1M asked for, FP8: accepted with 17 GiB free");
     check(!plan_context(512, 1 << 20, 40 * gib, 12).error.empty(), "below the least refused");
     check(!plan_context(2 << 20, 1 << 20, 40 * gib, 12).error.empty(), "past the native maximum refused");
     return failures ? 1 : 0;
