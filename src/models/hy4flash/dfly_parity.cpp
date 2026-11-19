@@ -273,7 +273,7 @@ struct Ref {
 
 void test_block() {
     DflyDims d;
-    d.layers = 2; d.E = 256; d.q_lora = 128; d.heads = 2; d.ffn = 192; d.hc_ffn = 96; d.vocab = 300; d.mask_id = 299;
+    d.layers = 2; d.E = 256; d.q_lora = 128; d.heads = 8; d.ffn = 192; d.hc_ffn = 96; d.vocab = 300; d.mask_id = 299;
     d.topk = 64; d.rms_eps = 1e-5f; d.rope_base = 1e7f;
     d.kv_layers = {4, 6};
     d.idx_layers = {4, 6};
@@ -335,7 +335,9 @@ void test_block() {
     for (int n : {1, 3, 5}) {
         const int32_t anchor = 17;
         std::vector<const void*> caches = {dcache[0], dcache[1]};
-        CHECK(run->begin(anchor, pos, n, *tap, 0, caches.data(), nullptr, err));
+        const bool began = run->begin(anchor, pos, n, *tap, 0, caches.data(), nullptr, err);
+        if (!began) std::printf("begin: %s\n", err.c_str());
+        CHECK(began);
         int32_t ids[5];
         float conf[5];
         CHECK(run->finish(ids, conf, nullptr, err));
