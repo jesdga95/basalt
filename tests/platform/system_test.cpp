@@ -53,6 +53,16 @@ int main() {
     check(w.waiting <= w.threads, "threads_in_disk_wait counts waiting within all");
     if (!mi.empty()) check(w.threads >= 1, "and lists this process's threads");
 
+    // keep_awake asks something of a Modern Standby machine only, holds what it says it holds, and is idempotent
+    if (modern_standby()) {
+        check(keep_awake(true), "keep_awake(true) holds a power request on a Modern Standby machine");
+        check(keep_awake(true), "and holds it when asked again");
+        check(!keep_awake(false), "keep_awake(false) withdraws it");
+        check(!keep_awake(false), "and again");
+        check(keep_awake(true) && !keep_awake(false), "it can be held and withdrawn again");
+    } else {
+        check(!keep_awake(true) && !keep_awake(false), "keep_awake asks nothing where the machine has no Modern Standby");
+    }
     check(keep_full_speed(), "keep_full_speed is accepted");
     check(keep_full_speed(), "and accepted again");
 #if defined(_WIN32)

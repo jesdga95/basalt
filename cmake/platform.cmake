@@ -36,7 +36,7 @@ target_include_directories(platform PUBLIC ${BASALT_CMAKE_ROOT}/include)
 target_link_libraries(platform PUBLIC warnings ${CMAKE_DL_LIBS})
 
 if(WIN32)
-  target_link_libraries(platform PUBLIC advapi32 dxgi)   # processor name and adapter memory budgets
+  target_link_libraries(platform PUBLIC advapi32 dxgi powrprof)   # processor name, adapter memory budgets, power capabilities
 endif()
 
 # The .basalt reader (host-only like `platform`): the engine's `core` and the vision programs, which open a section in

@@ -10,12 +10,14 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
 #include <fcntl.h>   // _O_BINARY
 #include <io.h>      // _fileno, _setmode
+#include <powrprof.h>   // GetPwrCapabilities
 #include <psapi.h>   // K32GetProcessMemoryInfo
 #else
 #include <sys/stat.h>
@@ -93,6 +95,44 @@ bool keep_full_speed() {
     return SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &s, sizeof s) != 0;
 }
 
+bool modern_standby() {
+    static const bool aoac = [] {
+        SYSTEM_POWER_CAPABILITIES caps{};
+        return GetPwrCapabilities(&caps) != 0 && caps.AoAc != 0;
+    }();
+    return aoac;
+}
+
+bool keep_awake(bool on) {
+    static std::mutex mu;
+    static HANDLE request = nullptr;
+    static bool held = false;
+    const std::lock_guard<std::mutex> lock(mu);
+    if (!modern_standby()) return false;
+    if (on == held) return held;
+    if (request == nullptr) {
+        REASON_CONTEXT why{};
+        why.Version = POWER_REQUEST_CONTEXT_VERSION;
+        why.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+        static wchar_t text[] = L"Basalt is serving a model on the GPU";
+        why.Reason.SimpleReasonString = text;
+        request = PowerCreateRequest(&why);
+        if (request == INVALID_HANDLE_VALUE) request = nullptr;
+        if (request == nullptr) return false;
+    }
+    if (on) {
+        // system required: no idle sleep.  Execution required: the process runs on if standby is entered anyway (not
+        // every machine grants it, and the first request is the one that counts)
+        held = PowerSetRequest(request, PowerRequestSystemRequired) != 0;
+        if (held) (void) PowerSetRequest(request, PowerRequestExecutionRequired);
+    } else {
+        (void) PowerClearRequest(request, PowerRequestExecutionRequired);
+        (void) PowerClearRequest(request, PowerRequestSystemRequired);
+        held = false;
+    }
+    return held;
+}
+
 bool gpu_memory_pages() { return true; }
 
 bool stderr_is_terminal() {
@@ -159,6 +199,9 @@ void prefer_oom_victim() {
 }
 
 bool keep_full_speed() { return true; }   // the scheduler does not slow a process for its window's state
+
+bool modern_standby() { return false; }
+bool keep_awake(bool) { return false; }   // nothing to ask of this OS
 
 // WSL2 reaches the GPU through the Windows driver, which pages
 bool gpu_memory_pages() { return host_os_name() == "WSL2"; }

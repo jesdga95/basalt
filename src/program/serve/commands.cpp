@@ -1,5 +1,6 @@
 // src/program/serve/commands.cpp - scheduling and protocol command dispatch.
 #include "state.hpp"
+#include "basalt/platform/system.hpp"
 #include "../cli/tokens.hpp"
 
 namespace basalt::program::serve {
@@ -109,6 +110,9 @@ Flow Runtime::dispatch() {
         // then (no shed, no admission wait from it), and judges a fresh one at the wake
         if (down && verr.empty()) basalt::platform::ram_guard_pause(true);
         if (!down) basalt::platform::ram_guard_pause(false);
+        // asleep, the machine may sleep too; awake, it stays up (a Modern Standby machine only)
+        if (down && verr.empty()) (void) basalt::platform::keep_awake(false);
+        if (!down) (void) basalt::platform::keep_awake(true);
         if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
         std::fflush(stdout);
         return Flow::next;
@@ -123,6 +127,7 @@ Flow Runtime::dispatch() {
         return Flow::next;
     }
     basalt::platform::ram_guard_pause(false);   // a request without a WAKE first: the guard judges again
+    (void) basalt::platform::keep_awake(true);  // and the machine stays up for it
     admit_slot = -1;
     solo_slot = -1;
     if (line.rfind("SGEN ", 0) == 0 || line.rfind("SGENI ", 0) == 0) {   // SGEN <slot> <max_new> ...: a GEN in that slot

@@ -33,6 +33,17 @@ void prefer_oom_victim();
 /// such knob.
 bool keep_full_speed();
 
+/// Whether the machine sleeps the Modern Standby way (S0 low-power idle: Windows laptops and tablets, the N1X among
+/// them). There the driver may move a GPU's memory to RAM and the page file once the machine is in standby, and an
+/// engine that is running stalls until it wakes. False on every other machine and OS.
+bool modern_standby();
+
+/// Asks that the machine stay out of idle sleep, and that this process keep running should it enter standby anyway
+/// (`on`), or withdraws the request. Does something on a Modern Standby machine only (a power request, listed by
+/// `powercfg /requests`); elsewhere nothing is asked. It changes no setting, ends with the process, and does not keep
+/// the display on: a closed lid or a chosen Sleep still sleeps. Returns whether a request is now held.
+bool keep_awake(bool on);
+
 /// Whether the GPU driver pages device memory out to system memory when a card is full, so that an allocation past
 /// the end succeeds and the work using it stalls, instead of failing the allocation.
 bool gpu_memory_pages();

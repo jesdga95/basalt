@@ -85,6 +85,16 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     // the CPU expert pool keeps its speed while the window is in the background
     if (!basalt::platform::keep_full_speed())
         basalt::log::warn("basalt", "full-speed scheduling refused: decode slows while the window is in the background");
+    // a Modern Standby machine stays awake while the engine loads and serves: in standby the driver may move the GPU's
+    // memory out and the engine stalls until the wake.  SLEEP withdraws it, WAKE or a request asks again (serve).
+    if (basalt::platform::modern_standby()) {
+        if (basalt::platform::keep_awake(true))
+            basalt::log::info("basalt", "keeping the machine awake while the engine runs (Modern Standby); an idle "
+                                        "sleep (SLEEP) lets it sleep");
+        else
+            basalt::log::warn("basalt", "the power request was refused: if the machine enters standby the engine "
+                                        "stalls until it wakes");
+    }
     // Kernels load on first use: loading every kernel of the engine and of cuBLAS at context creation holds a few
     // hundred MiB of device memory for code that never runs.  The expert cache's sizing keeps back room for what loads
     // later (`kLazyKernelsMib`).  CUDA_MODULE_LOADING=EAGER restores the up-front load; batched serving sets it (below).
