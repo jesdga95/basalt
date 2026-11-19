@@ -953,15 +953,18 @@ void ExpertTier::pump(int layer, int pieces) {
     if (layer >= 0) land(layer);
 }
 
-int ExpertTier::fetch(int layer, Lookup& lk) {
+int ExpertTier::fetch(int layer, Lookup& lk) { return fetch(layer, lk, -1); }
+
+int ExpertTier::fetch(int layer, Lookup& lk, int bus) {
     // with the RAM tier caching the file the bus stays with the reads and the promotions
     if (s_.diag_tier_frozen || reads_.is_open()) return 0;
     int np = 0, nf = 0;
-    // with an admission threshold only an expert that earned its slot goes over the bus; the others stay with the CPU
-    const auto eligible = [&](int i) { return pinned(layer, lk.experts[i]) && (s_.admit_uses == 0 || lk.again[i]); };
+    // with an admission threshold only an expert that earned its slot goes over the bus; the others stay with the CPU (a
+    // count from the model takes any pinned miss)
+    const auto eligible = [&](int i) { return pinned(layer, lk.experts[i]) && (bus >= 0 || s_.admit_uses == 0 || lk.again[i]); };
     for (int i = 0; i < lk.k; ++i)
         if (!lk.dev[i] && !lk.peer[i]) ++(eligible(i) ? np : nf);
-    int left = core::policy::bus_count(np, nf);
+    int left = bus >= 0 ? std::min(bus, np) : core::policy::bus_count(np, nf);
     // A second card fetches some over its own link into a scratch slot and computes them there. Their main card slots are
     // claimed all the same, filled behind the window's work as a promotion is, so every expert's place is the one the
     // main card's link alone would have given it.
