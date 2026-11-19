@@ -17,6 +17,7 @@ Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W, 121 GiB of RAM. Geom
 | Stage | Format | Arithmetic |
 |---|---|---|
 | Routed experts (UD-IQ1_M) | IQ1_S, IQ2_XXS or IQ2_XS gate/up; IQ1_S, IQ2_XXS, IQ2_S or IQ2_XS down | q8_1 activations (GPU), Q8_K (CPU); fp32 scales |
+| Routed experts (UD-Q2_K_XL) | IQ2_XXS, IQ2_XS, IQ2_S or IQ3_XXS gate/up; IQ2_XXS, IQ3_XXS, IQ3_S or MXFP4 down | q8_1 activations (GPU), Q8_K (CPU; MXFP4: Q8_0); fp32 scales |
 | Attention and shared-expert projections | Q6_K, Q5_K or Q8_0 | q8_1 (decode); fp16 block-scaled int8 mma (prompt) |
 | Engram table | IQ4_NL, Q5_K or MXFP4, 256 values per row | dequantized to fp32 on the host |
 | Compressor and indexer projections | BF16 | fp32 activations and accumulation |
@@ -119,6 +120,9 @@ Reference: [quality](quality.md#the-bf16-reference). Two cards, 400 W + 180 W, 2
 | UD-IQ1_M (the published pack) | 3.0456 | 0.2779 | 0.0566 | 2.86 | 83.88% |
 | UD-IQ2_XXS (published, fp16 caches) | 3.1074 | 0.2408 | 0.0408 | 2.53 | 85.15% |
 | GSQ-RCO IQ2_XXS (tested, not shipped) | 3.6353 | 0.4311 | 0.0894 | 4.39 | 79.97% |
+| UD-Q2_K_XL (converted, not published; one card) | 2.7356 | 0.1501 | 0.0201 | 1.76 | 88.42% |
+
+The UD-Q2_K_XL row is one RTX PRO 6000 Blackwell Max-Q at 300 W with 121 GiB of RAM (homes main card 153, RAM 159, file 72).
 
 The cache roundings cost nothing measurable: the same run with `--kv fp16` scores PPL 3.0387, KLD 0.2777, top-1 83.97%.
 
