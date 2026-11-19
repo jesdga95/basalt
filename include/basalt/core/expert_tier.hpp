@@ -19,6 +19,7 @@
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/kernels/route_lossy.hpp"
 #include "basalt/prefill/peer_share.hpp"
 #include "basalt/platform/mapped_file.hpp"
 #include "basalt/core/file_reads.hpp"
@@ -86,6 +87,10 @@ struct ExpertTierSpec {
     int ring_pieces = 0;
     uint64_t share_stride = 0;   ///< bytes between experts in a second card's prompt staging (the largest layer's)
     int share_max_tokens = 0;    ///< most tokens of a prompt chunk
+    /// --route-tail-skip R and --route-prior LAMBDA (basalt/model/route_flags.hpp; 0 = off): the tier keeps the device
+    /// table of the experts the GPUs hold that the model's decode windows route with (ExpertTier::publish_held).
+    int route_tail_skip = 0;
+    float route_prior = 0.0f;
 };
 
 class ExpertTier {
@@ -103,6 +108,7 @@ public:
         bool again[kMaxK] = {};            ///< a miss that repeats one from the last kPromoteWindow tokens
         bool fetched[kMaxK] = {};          ///< `dev` or `peer` is being copied in by `fetch`
         bool reading[kMaxK] = {};          ///<  is a RAM place a file read is filling (await_reads)
+        bool dropped[kMaxK] = {};          ///< id -1: --route-tail-skip dropped the entry; nothing computes it
     };
 
     /// The window rows that use one looked-up expert: row i of token tok[i] is `row[i]` of the output rows.
@@ -165,7 +171,8 @@ public:
     /// routing history, as if every copy had landed at the window's start.
     void begin_token(int n_tokens = 1);
     /// Looks up `ids[0..k)` of `layer` and stamps them as used; `layer`'s queued copies land first. The file experts
-    /// among them start reading into the RAM tier (`reading`).
+    /// among them start reading into the RAM tier (`reading`). An id of -1 (route_tail_skip dropped it) is `dropped`: no
+    /// source, no stamp, and fetch, promote and the CPU's share pass it by.
     bool lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err);
     /// The reads the last lookup started have landed.
     bool await_reads(std::string& err);
@@ -230,6 +237,22 @@ public:
 
     /// The VRAM slots open now, every layer's.
     int64_t slots() const { return live_base() + (int64_t) n_layers_ * ext_per_layer_; }
+
+    /// The lossy routing flags (ExpertTierSpec::route_*) this tier applies: 0 when off, or when every expert is held by a
+    /// GPU (attach switches them off then, as nothing would be skipped and a bonus for every expert changes a biased choice).
+    int route_tail_skip() const { return route_tail_skip_; }
+    float route_prior() const { return route_prior_; }
+    bool route_lossy() const { return route_tail_skip_ > 0 || route_prior_ > 0.0f; }
+    /// A decode window starts: the device table of the experts the GPUs hold now (a main card or second card slot) goes
+    /// out on `stream` for the window's routers, the layers that changed since the last window. Copies that land during
+    /// the window count from the next one. Only with route_lossy().
+    void publish_held(cudaStream_t stream);
+    /// `layer`'s held table as the routing kernels read it (empty without route_lossy()).
+    kernels::ResidentTabs held_tabs(int layer) const;
+    /// The tail skip's counters (basalt/kernels/route_lossy.hpp), device; null without route_lossy().
+    unsigned long long* route_counts() const { return route_counts_; }
+    /// n_embd zeros on the main card: the output row of a dropped entry.
+    const float* zero_row() const { return zero_row_; }
 
     void report(const char* tag) const;
     /// The routed experts so far: hits of the main card's slots, those plus the CPU's, a bus copy's or the second card's.
@@ -390,6 +413,17 @@ private:
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;
     uint8_t* act_ = nullptr;                ///< the quantized activation the CPU jobs share
     kernels::cpu::ExpertJobMulti cpu_jobs_[kMaxK];   ///< the CPU share started and not yet joined
+
+    int route_tail_skip_ = 0;
+    float route_prior_ = 0.0f;
+    bool open_route(std::string& err);
+    bool held(int layer, int e) const;
+    int32_t* held_dev_ = nullptr;            ///< [layer * n_expert + e] 0 when a GPU holds it, else -1 (device)
+    int32_t* held_pin_ = nullptr;            ///< its staging (pinned host)
+    std::vector<int32_t> held_pub_;          ///< what was published last
+    cudaEvent_t held_ev_ = nullptr;          ///< behind the last publish's copies
+    unsigned long long* route_counts_ = nullptr;
+    float* zero_row_ = nullptr;
 
     int64_t hits_ = 0, cpu_ = 0, ram_hits_ = 0, promoted_ = 0, fetched_ = 0, dropped_ = 0, peer_hits_ = 0, file_hits_ = 0;
 };
