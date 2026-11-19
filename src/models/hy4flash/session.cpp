@@ -10,6 +10,7 @@
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/elastic_array.hpp"
+#include "basalt/core/device.hpp"
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
@@ -23,6 +24,7 @@
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/prefill/cpu_split.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/compiler.hpp"
@@ -375,7 +377,11 @@ public:
         if (!big_.rows) return;
         cudaStreamSynchronize(stream_);
         basalt::log::info("basalt hy4flash", "prompt time: %.0f ms queued ahead of the MoE (attention, dense), %.0f ms in the MoE (%.0f ms sorting the pairs, %.0f ms issuing the launches), %.0f ms in the Engram's host step; host time in attention() %.0f ms, in ffn() %.0f ms, issuing the ring copies %.0f ms; expert rows on the second card %lld, on the CPU %lld", t_pre_ms_, t_moe_ms_, t_build_ms_, t_issue_ms_, t_eng_ms_, t_att_ms_, t_ffn_ms_, t_ring_ms_.load(), (long long) n_peer_rows_, (long long) n_cpu_rows_);
-        n_peer_rows_ = n_cpu_rows_ = 0;
+        basalt::log::info("basalt hy4flash", "prompt experts: staged from the card %lld, from RAM over the bus %lld, from the second card %lld, on the CPU %lld (its thread %.0f ms, waited for %.0f ms), second card's share waited for %.0f ms, the stream after the launches %.0f ms",
+                          (long long) n_stage_dev_, (long long) n_stage_bus_, (long long) n_stage_peer_, (long long) n_cpu_exp_, t_cpu_run_ms_.load(), t_cpu_wait_ms_, t_peer_wait_ms_, t_gpu_wait_ms_);
+        n_peer_rows_ = n_cpu_rows_ = n_stage_dev_ = n_stage_bus_ = n_stage_peer_ = n_cpu_exp_ = 0;
+        t_cpu_run_ms_ = 0;
+        t_cpu_wait_ms_ = t_peer_wait_ms_ = t_gpu_wait_ms_ = 0;
         t_pre_ms_ = t_moe_ms_ = t_eng_ms_ = t_build_ms_ = t_issue_ms_ = t_att_ms_ = t_ffn_ms_ = 0;
         t_ring_ms_ = 0;
         use(dec_);
@@ -1127,10 +1133,23 @@ private:
     // A short chunk's experts the CPU computes: their jobs, (token, slot) pairs in row order, and the thread that runs them.
     static constexpr int kCpuRows = 8;          // a RAM expert with this few rows in a short chunk may go to the CPU
     static constexpr int kCpuMaxRows = 1024;    // the most rows the CPU takes of a layer
+    // The split's prices (prefill::cpu_take), measured on an RTX 5090 (x8 PCIe 5) with 15 pool workers over short turns: the CPU reads
+    // about 2.67 GB/s of expert weights a worker; the main card stages and runs RAM experts at 0.85 of its link's rate.
+    static constexpr double kCpuWorkerBytesPerMs = 2.67e6, kCpuMsPerRow = 0.006, kCardLinkShare = 0.85;
+    double link_bytes_ = -1;   // the main card's link (NVML), read once
+    prefill::CpuBusRates cpu_rates() {
+        if (link_bytes_ < 0) link_bytes_ = core::device_rates(m_.device()).link_bytes;
+        prefill::CpuBusRates r;
+        r.cpu_bytes_per_ms = kCpuWorkerBytesPerMs * tier_->pool()->workers();
+        r.cpu_ms_per_row = kCpuMsPerRow;
+        r.card_bytes_per_ms = link_bytes_ / 1000.0 * kCardLinkShare;
+        return r;
+    }
     struct CpuShare {
         std::vector<kernels::cpu::ExpertJobMulti> jobs;
         std::vector<int32_t> pair, act_tokens;
         int64_t at = 0;
+        double ms = 0;   // the thread's time
         std::thread th;
         void join() {
             if (th.joinable()) th.join();
@@ -1160,42 +1179,63 @@ private:
             pinned_.push_back(cpu_rows_);
             pinned_.push_back(cpu_x_);
         }
-        std::vector<uint8_t> takes((size_t) g_.n_expert, 0);
-        std::vector<int32_t> tok_row((size_t) R, -1);
-        int rows = 0;
+        // the candidates, fewest rows first, and how many of them the priced times give the CPU
+        std::vector<int> cand, cand_rows;
+        int crow = 0;
         for (int c = 1; c <= kCpuRows; ++c)
             for (int e : used) {
                 const core::ExpertTier::Source src = tier_->locate(tl, e);
-                if (!src.pinned || src.dev || (int) by[(size_t) e].size() != c || takes[(size_t) e]) continue;
-                if (rows + c > bus - (int) s.jobs.size() - 1 || rows + c > kCpuMaxRows) break;
-                kernels::cpu::ExpertJobMulti j;
-                j.blob = src.pinned;
-                j.nt = c;
-                for (int i = 0; i < c; ++i) {
-                    const int32_t p = by[(size_t) e][(size_t) i], t = p / K;
-                    if (tok_row[(size_t) t] < 0) {
-                        tok_row[(size_t) t] = (int32_t) s.act_tokens.size();
-                        s.act_tokens.push_back(t);
-                    }
-                    j.nact[i] = cpu_act_ + (size_t) tok_row[(size_t) t] * kernels::cpu::kNativeActBytes;
-                    j.out[i] = cpu_rows_ + (size_t) rows * L;
-                    s.pair.push_back(p);
-                    ++rows;
-                }
-                s.jobs.push_back(j);
-                takes[(size_t) e] = 1;
+                if (!src.pinned || src.dev || (int) by[(size_t) e].size() != c || crow + c > kCpuMaxRows) continue;
+                cand.push_back(e);
+                cand_rows.push_back(c);
+                crow += c;
             }
+        // one card: the priced split; with a second card reading its share from the same memory, DeepSeek's rule (the CPU's rows stay
+        // below the experts the bus still carries), which the priced split did not beat there
+        int take = 0;
+        if (tier_->peer_share()) {
+            int r = 0;
+            while (take < (int) cand.size() && r + cand_rows[(size_t) take] <= bus - take - 1) r += cand_rows[(size_t) take++];
+        } else {
+            take = prefill::cpu_take(cpu_rates(), (double) m_.pack().experts[(size_t) (tl + g_.n_dense)].blob_bytes, bus, cand_rows);
+        }
+        std::vector<uint8_t> takes((size_t) g_.n_expert, 0);
+        std::vector<int32_t> tok_row((size_t) R, -1);
+        int rows = 0;
+        for (int ci = 0; ci < take; ++ci) {
+            const int e = cand[(size_t) ci], c = cand_rows[(size_t) ci];
+            const core::ExpertTier::Source src = tier_->locate(tl, e);
+            kernels::cpu::ExpertJobMulti j;
+            j.blob = src.pinned;
+            j.nt = c;
+            for (int i = 0; i < c; ++i) {
+                const int32_t p = by[(size_t) e][(size_t) i], t = p / K;
+                if (tok_row[(size_t) t] < 0) {
+                    tok_row[(size_t) t] = (int32_t) s.act_tokens.size();
+                    s.act_tokens.push_back(t);
+                }
+                j.nact[i] = cpu_act_ + (size_t) tok_row[(size_t) t] * kernels::cpu::kNativeActBytes;
+                j.out[i] = cpu_rows_ + (size_t) rows * L;
+                s.pair.push_back(p);
+                ++rows;
+            }
+            s.jobs.push_back(j);
+            takes[(size_t) e] = 1;
+        }
         if (s.jobs.empty()) return true;
         used.erase(std::remove_if(used.begin(), used.end(), [&](int e) { return takes[(size_t) e] != 0; }), used.end());
         if (cudaMemcpy(cpu_x_, xlat_, (size_t) R * L * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
             err = "reading the chunk's latent rows for the CPU failed";
             return false;
         }
-        s.th = std::thread([this, tl, &s, L] {
+        n_cpu_exp_ += (int64_t) s.jobs.size();
+        s.th = std::thread([this, tl, &s, L, tc = now_ms()] {
             const kernels::cpu::NativeFmt& f = tier_->fmt(tl);
             for (size_t i = 0; i < s.act_tokens.size(); ++i)
                 kernels::cpu::native_quant_act(f, cpu_x_ + (size_t) s.act_tokens[i] * L, cpu_act_ + i * kernels::cpu::kNativeActBytes);
             tier_->pool()->run_split_multi_native(f, s.jobs.data(), (int) s.jobs.size());
+            s.ms = now_ms() - tc;
+            t_cpu_run_ms_ += s.ms;
         });
         return true;
     }
@@ -1286,6 +1326,9 @@ private:
         if (!ex.empty()) share->prepare(share_layer(tl), ex);
     }
     std::vector<std::vector<uint8_t>> away_;
+    int64_t n_stage_dev_ = 0, n_stage_bus_ = 0, n_stage_peer_ = 0, n_cpu_exp_ = 0;   // a prompt's staged experts by source, its CPU experts
+    std::atomic<double> t_cpu_run_ms_{0};
+    double t_cpu_wait_ms_ = 0, t_peer_wait_ms_ = 0, t_gpu_wait_ms_ = 0;
     int64_t n_peer_rows_ = 0, n_cpu_rows_ = 0;   // a prompt's expert rows the second card and the CPU computed   // [tier layer] the experts the second card computes in this chunk (ringed)
 
     void prefetch_engram(int64_t pos0, int R) {
@@ -1668,9 +1711,12 @@ private:
                 const core::ExpertTier::Source src = tier_->locate(tl, e);
                 if (src.dev) {
                     cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
+                    ++n_stage_dev_;
                 } else if (src.pinned) {
                     cudaMemcpyAsync(dst, src.pinned, el.blob_bytes, cudaMemcpyHostToDevice, copy_);
+                    ++n_stage_bus_;
                 } else if (src.peer) {
+                    ++n_stage_peer_;
                     core::PeerExperts* pe = tier_->peer_for(tl);
                     cudaMemcpyPeerAsync(dst, m_.device(), src.peer, pe->device(), el.blob_bytes, copy_);
                 } else {
@@ -1693,14 +1739,20 @@ private:
         }
         const double t3 = now_ms();
         t_issue_ms_ += t3 - t2;
+        const double tw0 = now_ms();
         if (!peer.empty() && !share->join(st, err)) return false;
+        const double tw1 = now_ms();
+        t_peer_wait_ms_ += tw1 - tw0;
         if (!cpu.jobs.empty()) {
             cpu.join();
+            t_cpu_wait_ms_ += now_ms() - tw1;
             put_f32(pair_rows_ + (size_t) cpu.at * L, cpu_rows_, (int64_t) cpu.pair.size() * L);
         }
         put_i32(pair_map_, map_h.data(), (size_t) R * K);
         weighted_sum_tokens(pair_rows_, pair_map_, rw_, R, K, L, lat_out_, st);
+        const double tg = now_ms();
         cudaStreamSynchronize(st);   // the host's map is read until the copy lands
+        t_gpu_wait_ms_ += now_ms() - tg;
         t_moe_ms_ += now_ms() - t1;
         return true;
     }
@@ -2052,7 +2104,7 @@ private:
         const size_t bytes = (size_t) g_.n_vocab * sizeof(float);
         if (dev == nullptr) {
             void* v = nullptr;
-            if (cudaMalloc(&v, bytes) != cudaSuccess) { err = "out of device memory for a logit bias"; return false; }
+            if (cudaMalloc(&v, bytes) != cudaSuccess) { cudaGetLastError(); err = "out of device memory for a logit bias"; return false; }
             bufs_.push_back(v);
             dev = (float*) v;
         }
@@ -2073,7 +2125,7 @@ private:
             const size_t n = (size_t) kMaxWindow * history_len_;
             if (d_hist_len_ < n) {
                 if (d_hist_) cudaFree(d_hist_);
-                if (cudaMalloc((void**) &d_hist_, n * 4) != cudaSuccess) { err = "out of device memory for the sampling history"; return false; }
+                if (cudaMalloc((void**) &d_hist_, n * 4) != cudaSuccess) { cudaGetLastError(); err = "out of device memory for the sampling history"; return false; }
                 d_hist_len_ = n;
             }
             cudaMemcpyAsync(d_hist_, r.history, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, stream_);
