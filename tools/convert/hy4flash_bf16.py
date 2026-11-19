@@ -60,9 +60,20 @@ ARCH = Hy4FlashBf16()
 
 # ------------------------------------------------------------------ reading and the rounding of one piece
 def pread(path, off: int, n: int) -> bytearray:
-    """`n` bytes at `off`; the source's page cache is dropped behind the read so a long conversion keeps the box's RAM."""
+    """`n` bytes at `off`. Where the OS has it (Linux), the source's page cache is dropped behind the read so a long conversion
+    keeps the box's RAM; elsewhere (Windows) a plain seek and read."""
     buf = bytearray(n)
     mv = memoryview(buf)
+    if not hasattr(os, "preadv"):
+        with open(path, "rb") as f:
+            f.seek(off)
+            got = 0
+            while got < n:
+                k = f.readinto(mv[got:])
+                if not k:
+                    raise IOError(f"{path}: short read at {off + got}")
+                got += k
+        return buf
     fd = os.open(path, os.O_RDONLY)
     try:
         got = 0
@@ -71,7 +82,8 @@ def pread(path, off: int, n: int) -> bytearray:
             if k <= 0:
                 raise IOError(f"{path}: short read at {off + got}")
             got += k
-        os.posix_fadvise(fd, off, n, os.POSIX_FADV_DONTNEED)
+        if hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(fd, off, n, os.POSIX_FADV_DONTNEED)
     finally:
         os.close(fd)
     return buf
