@@ -144,13 +144,22 @@ class MaxTokens(unittest.TestCase):
     def test_default_clamps_an_over_the_context_budget(self):
         for api in ("openai", "anthropic"):
             with self.subTest(api=api):
-                s, b, pt, ct = self.call(api, max_tokens=CTX)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    s, b, pt, ct = self.call(api, max_tokens=CTX)
                 self.assertEqual(s, 200, b)
                 self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
+                self.assertEqual(out.getvalue().count("shortened to"), 1)     # one line, naming the shortening
+                self.assertIn(f"max_tokens {CTX} shortened to {CTX - CTX_SLACK - pt}:", out.getvalue())
+                self.assertIn(f"the prompt ({pt} tokens) leaves that much of the context ({CTX})", out.getvalue())
+                self.assertIn("--no-fit-max-tokens answers 400 instead", out.getvalue())
         with self.subTest(api="responses"):
-            s, b = self.post("/v1/responses", {"model": "basalt", "input": "hi", "max_output_tokens": CTX})
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                s, b = self.post("/v1/responses", {"model": "basalt", "input": "hi", "max_output_tokens": CTX})
             self.assertEqual(s, 200, b)
             self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - b["usage"]["input_tokens"])
+            self.assertEqual(out.getvalue().count("shortened to"), 1)
 
     def test_the_text_prompt_path_says_the_overflow_like_anthropic(self):
         # a real engine tokenizes the prompt itself: the overflow surfaces after the count, through primed() —

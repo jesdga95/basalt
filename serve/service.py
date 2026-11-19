@@ -19,7 +19,7 @@ from serve.util import vram
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
-from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
+from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error, shortening_note
 from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_strings
 from serve.engine.image_source import USAGE as IMAGE_USAGE, VIDEO as VIDEO_KIND, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_MAX_TOKENS, VIDEO_REQUEST_BYTES, Vision
@@ -1173,7 +1173,9 @@ class Service:
         elif max_new > room:
             if not self.fit_max_tokens:
                 raise overflow_error(len(ids), max_new, ctx)
-            max_new = max(1, room)          # fit_max_tokens: shorten rather than 400
+            asked, max_new = max_new, max(1, room)          # fit_max_tokens: shorten rather than 400
+            if asked > max_new:
+                print(f"[server] {shortening_note(asked, max_new, len(ids), ctx)}", flush=True)
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     def _note(self, n, evs, st=None, rate=None):
