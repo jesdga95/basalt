@@ -147,6 +147,10 @@ class MaxTokens(unittest.TestCase):
                 s, b, pt, ct = self.call(api, max_tokens=CTX)
                 self.assertEqual(s, 200, b)
                 self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
+        with self.subTest(api="responses"):
+            s, b = self.post("/v1/responses", {"model": "basalt", "input": "hi", "max_output_tokens": CTX})
+            self.assertEqual(s, 200, b)
+            self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - b["usage"]["input_tokens"])
 
     def test_the_text_prompt_path_says_the_overflow_like_anthropic(self):
         # a real engine tokenizes the prompt itself: the overflow surfaces after the count, through primed() —
