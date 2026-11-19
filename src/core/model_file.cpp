@@ -427,6 +427,7 @@ void model_sources(const ModelFile& m, ModelSources& s) {
     s.dense_index = m.range("dense.index");
     s.experts = m.range("experts");
     s.experts_layout = m.range("experts.layout");
+    s.experts_hadamard = m.range("experts.hadamard");
     s.hc8 = m.range("hc8");
     s.mtp_dense = m.range("mtp/dense");
     s.mtp_dense_index = m.range("mtp/dense.index");

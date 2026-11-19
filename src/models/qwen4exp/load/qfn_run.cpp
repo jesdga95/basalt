@@ -230,9 +230,15 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     {
         const basalt::core::ModelGeometry g0;
         std::vector<uint8_t> text;
-        bool layout_ok = basalt::core::read_range(srcs.experts_layout, text, err) &&
+        // the Hadamard fold's section (empty for a model without folded experts); a v8 layout requires it
+        std::vector<uint8_t> had;
+        const bool had_ok = srcs.experts_hadamard.bytes == 0 ||
+                            basalt::core::read_range(srcs.experts_hadamard, had, err);
+        bool layout_ok = had_ok &&
+                         basalt::core::read_range(srcs.experts_layout, text, err) &&
                          basalt::kernels::cpu::expert_layout_load_text(std::string(text.begin(), text.end()), g0.n_layers,
-                                                                       g0.n_expert, err, g0.n_embd, g0.n_ff);
+                                                                       g0.n_expert, err, g0.n_embd, g0.n_ff, 0.f,
+                                                                       std::string(had.begin(), had.end()));
         if (!layout_ok) {
             return fatal_start_error(err);
         }

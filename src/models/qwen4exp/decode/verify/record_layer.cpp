@@ -402,8 +402,15 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         }
     }
     if (dm) {}   // the route kernel wrote nat_xq_
-    else if (basalt::kernels::cpu::expert_layout().native)
-        quantize_q8_1_rows(xm, n, N, v_.nat_xq_, cs);
+    else if (basalt::kernels::cpu::expert_layout().native) {
+        // APR: a Hadamard-folded layer rotates its input before the q8_1 quantizer, never after
+        const auto& f_hm = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
+        if (f_hm.had_gu)
+            basalt::kernels::hadamard_q8_1_rows(xm, n, N, f_hm.had_block,
+                                                basalt::kernels::native_expert_gu_signs(f_hm), v_.nat_xq_, cs);
+        else
+            quantize_q8_1_rows(xm, n, N, v_.nat_xq_, cs);
+    }
     else
         quantize_q8_0_scaled(xm, v_.hit_xq_, v_.hit_xs_, (int64_t) n * N, cs);
     stamp(l, 18);
