@@ -605,6 +605,9 @@ int main(int argc, char** argv) {
     for (int gu : {18, 39}) check_grouped(gu, 39, 1024, 512, s, rng);       // and the generic down path
     check_grouped(16, 39, 5120, 2304, s, rng);                              // deepseek41's real expert shape
     check_grouped(18, 39, 5120, 2304, s, rng);
+    check_grouped(22, 21, 5120, 2304, s, rng);                              // IQ3_S down (n_ff / 256 * 8 = 72 calls)
+    check_grouped(18, 21, 5120, 2304, s, rng);
+    check_mmvq(21, 2304, 67, s, rng);                                       // IQ3_S rows at the down row length
     check_mmvq_mma(s, rng);
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
