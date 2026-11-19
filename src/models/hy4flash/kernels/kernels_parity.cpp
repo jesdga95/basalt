@@ -3,6 +3,8 @@
 // preparation and attention with a sink, the router and the Engram apply. Exit 77 without a GPU.
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/router.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
@@ -743,6 +745,98 @@ void test_mmq_expert(int type, const char* label) {
     report(label, got, ref, 3e-2);
 }
 
+// An NVFP4 expert (blob [gate | up | down] and its FP32 tail {s_gate, s_up, s_down, 0}) through the prompt path's chain - MMQ
+// gate/up, the clamped SwiGLU with the blob's scales, MMQ down - against the decode path's grouped kernel on the same rows. The
+// MMQ products leave the tail out, so a prompt path that forgets it is off by the scales.
+void test_prompt_vs_decode_nvfp4() {
+    namespace mmq = basalt::prefill::mmq;
+    constexpr int kNvfp4 = 40;
+    const int L = 1536, F = 1536, NE = 3, R0 = 5, R1 = 3, R2 = 9, R = R0 + R1 + R2;
+    const float limit = 10.f;
+    const char* label = "prompt vs decode NVFP4 expert";
+    if (!mmq::built() || !mmq::fits(kNvfp4, 2 * F) || !mmq::fits(kNvfp4, L) || !bk::native_expert_supported(kNvfp4, kNvfp4, L, F)) {
+        std::printf("%-30s skipped\n", label);
+        return;
+    }
+    const bk::NativeExpertLayout lay = bk::native_expert_layout(kNvfp4, kNvfp4, L, F, limit);
+    const size_t unit = 144, stride = (lay.bytes + 4096 + unit - 1) / unit * unit;   // whole 36-byte blocks and 16 bytes, as MMQ steps
+    std::vector<uint8_t> blobs(stride * NE, 0);
+    const float scales[NE][3] = {{3.f, 2.f, 0.5f}, {0.25f, 4.f, 2.f}, {1.5f, 0.75f, 0.125f}};
+    // random NVFP4 blocks (64 values: four UE4M3 sub-block scales near 1/16 to 1/8, then 32 bytes of E2M1 codes), the tails set
+    std::uniform_int_distribution<int> sd(0x18, 0x20), code(0, 255);
+    for (int e = 0; e < NE; ++e) {
+        uint8_t* b = blobs.data() + stride * e;
+        for (size_t o = 0; o + 36 <= lay.bytes - 16; o += 36) {
+            for (int i = 0; i < 4; ++i) b[o + i] = (uint8_t) sd(rng);
+            for (int i = 4; i < 36; ++i) b[o + i] = (uint8_t) code(rng);
+        }
+        const float tail[4] = {scales[e][0], scales[e][1], scales[e][2], 0.f};
+        std::memcpy(b + lay.bytes - 16, tail, 16);
+    }
+    std::vector<float> x = randn((size_t) R * L);
+    std::vector<int32_t> bounds = {0, R0, R0 + R1, R}, tok(R);
+    for (int i = 0; i < R; ++i) tok[i] = i;
+    cudaStream_t st = nullptr;
+    cudaStreamCreate(&st);   // the native kernels take an explicit stream
+    uint8_t* dw = dev(blobs);
+    float* dx = dev(x);
+    int32_t *db = dev(bounds), *dt = dev(tok), *ident = nullptr;
+    cudaMalloc(&ident, R * 4);
+    mmq::iota(ident, R, st);
+    // the decode path: one group per expert
+    std::vector<unsigned long long> gp(NE);
+    for (int e = 0; e < NE; ++e) gp[e] = (unsigned long long) (dw + stride * e);
+    std::vector<int32_t> ng = {NE, R, 0, 0};
+    unsigned long long* dgp = dev(gp);
+    int32_t* dng = dev(ng);
+    void *x8 = nullptr, *scr = nullptr;
+    cudaMalloc(&x8, bk::native_q8_1_bytes(L, 1) * R);
+    cudaMalloc(&scr, bk::native_expert_scratch_bytes(R, F));
+    float* dec = devf((size_t) R * L);
+    const size_t row_q8 = bk::native_q8_1_bytes(L, 1);
+    for (int c0 = 0; c0 < R; c0 += 8)   // the decode quantizer takes up to 8 rows a launch
+        bk::native_quantize_q8_1(dx + (size_t) c0 * L, (uint8_t*) x8 + row_q8 * c0, L, std::min(8, R - c0), st);
+    bk::native_expert_grouped_clamped(lay, limit, dgp, db, dng, dt, dt, NE, R, x8, scr, dec, st);
+    // the prompt path's chain
+    void *xq1 = nullptr, *xq2 = nullptr;
+    cudaMalloc(&xq1, mmq::q8_bytes(R, L));
+    cudaMalloc(&xq2, mmq::q8_bytes(R, F));
+    float *gu = devf((size_t) R * 2 * F), *h = devf((size_t) R * F), *out = devf((size_t) R * L);
+    mmq::load(kNvfp4, 2 * F);
+    mmq::load(kNvfp4, L);
+    mmq::Context ctx;
+    mmq::quantize(dx, dt, xq1, kNvfp4, L, L, R, st);
+    mmq::Product p;
+    p.w = dw; p.type = kNvfp4; p.w_rows = 2 * F; p.w_cols = L; p.expert_bytes = stride; p.n = NE; p.xq = xq1; p.bounds = db;
+    p.ids = ident; p.total_rows = R; p.max_rows = R2; p.dst = gu; p.ld_dst = 2 * F;
+    ctx.run(p, st);
+    const ExpertTails tails{dw, stride, lay.bytes - 16, db, NE};
+    const auto chain = [&](const ExpertTails* t) {
+        swiglu_split_clamped(gu, h, R, F, limit, st, t);
+        mmq::quantize(h, nullptr, xq2, kNvfp4, F, F, R, st);
+        mmq::Product d = p;
+        d.w = dw + lay.down_off; d.w_rows = L; d.w_cols = F; d.xq = xq2; d.dst = out; d.ld_dst = L;
+        ctx.run(d, st);
+        cudaStreamSynchronize(st);
+        return host(out, (size_t) R * L);
+    };
+    cudaStreamSynchronize(st);
+    const std::vector<float> want = host(dec, (size_t) R * L);
+    const std::vector<double> ref(want.begin(), want.end());
+    const std::vector<float> got = chain(&tails);
+    report(label, got, ref, 3e-2);
+    // the same chain without the scales must not pass: the test sees a prompt path that forgets them
+    const std::vector<float> bare = chain(nullptr);
+    double max_abs = 0, max_ref = 0;
+    for (size_t i = 0; i < bare.size(); ++i) {
+        max_abs = std::max(max_abs, std::fabs(bare[i] - ref[i]));
+        max_ref = std::max(max_ref, std::fabs(ref[i]));
+    }
+    const bool caught = max_abs / std::max(max_ref, 1e-30) > 3e-2;
+    std::printf("%-30s max rel %.3e without the tails  %s\n", label, max_abs / std::max(max_ref, 1e-30), caught ? "ok (caught)" : "FAIL (not caught)");
+    failures += !caught;
+}
+
 }  // namespace
 
 int main() {
@@ -758,6 +852,7 @@ int main() {
     test_mmq_dense();
     test_mmq_expert(12, "mmq experts Q4_K");
     test_mmq_expert(14, "mmq experts Q6_K");
+    test_prompt_vs_decode_nvfp4();
     std::printf(failures ? "FAILED\n" : "all ok\n");
     return failures ? 1 : 0;
 }
