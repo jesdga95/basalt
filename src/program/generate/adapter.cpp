@@ -42,8 +42,19 @@ std::string profile_key(const basalt::core::Json& meta) {
     const basalt::core::Json* kv = meta.get("gguf_kv");
     const basalt::core::Json* arch = kv ? kv->get("general.architecture") : nullptr;
     if (arch == nullptr || !arch->is_string() || arch->s.empty()) return {};
-    const basalt::core::Json* nl = kv->get(arch->s + ".block_count");
-    const basalt::core::Json* ne = kv->get(arch->s + ".expert_count");
+    // the counts under the architecture's own prefix, or under the one other prefix a converter wrote them with
+    std::string prefix = arch->s;
+    if (kv->get(prefix + ".block_count") == nullptr) {
+        prefix.clear();
+        for (const auto& [name, v] : kv->members) {
+            const size_t at = name.size() > 12 ? name.size() - 12 : std::string::npos;
+            if (at == std::string::npos || name.compare(at, 12, ".block_count") != 0) continue;
+            if (!prefix.empty()) return {};
+            prefix = name.substr(0, at);
+        }
+    }
+    const basalt::core::Json* nl = kv->get(prefix + ".block_count");
+    const basalt::core::Json* ne = kv->get(prefix + ".expert_count");
     if (nl == nullptr || ne == nullptr || nl->type != T::Int || ne->type != T::Int || nl->neg || ne->neg) return {};
     return arch->s + "-" + std::to_string(nl->u64()) + "x" + std::to_string(ne->u64());
 }
