@@ -46,7 +46,7 @@ public:
     int max_expert_cards() const override { return kMaxSecondCards; }
     const char* model_name() const override { return "Hy4-flash"; }
 
-    // --kv (the sparse layers' latent rows, bf16 by default or fp8) and, DFLY HOOK, --spec and its companions as DeepSeek's
+    // --kv (the sparse layers' latent rows, fp16 by default or fp8) and, DFLY HOOK, --spec and its companions as DeepSeek's
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
         if (a == "--diag-rows") {
             o.diag_rows = std::atoi(args.next("--diag-rows"));
@@ -60,8 +60,8 @@ public:
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        if (!o.kv.empty() && o.kv != "bf16" && o.kv != "fp8" && o.kv != "f32") {
-            basalt::log::error("basalt hy4flash", "--kv %s: the latent caches are bf16 (the default) or fp8", o.kv.c_str());
+        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "f32") {
+            basalt::log::error("basalt hy4flash", "--kv %s: the latent caches are fp16 (the default) or fp8", o.kv.c_str());
             return 2;
         }
         dfly_finish_flags(o);

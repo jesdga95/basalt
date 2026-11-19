@@ -1,5 +1,5 @@
 // src/models/hy4flash/context_policy.hpp - how long a context the latent caches can hold, free of CUDA so a CPU test can drive
-// it. The sparse layers keep a BF16 row of every position and a pooled key per 4 positions; the window layers a ring. This sizes
+// it. The sparse layers keep a 16-bit row of every position and a pooled key per 4 positions; the window layers a ring. This sizes
 // the address range they may grow into and refuses a context whose first positions the card cannot back.
 #pragma once
 
@@ -14,7 +14,7 @@ namespace basalt::models::hy4flash::ctxp {
 constexpr int64_t kMinContext = 1024;
 constexpr int64_t kLegacyContext = 8192;   ///< the maximum of a pack that names no context length
 constexpr int kRowWidth = 576;             ///< a latent row: 512 latent values and 64 rotated
-constexpr int kRowBytes = kRowWidth * 2;   ///< BF16
+constexpr int kRowBytes = kRowWidth * 2;   ///< fp16
 constexpr int kFp8RowBytes = 656;          ///< --kv fp8: 512 E4M3 codes, four fp32 scales, 64 BF16
 constexpr int kPoolDim = 128, kPoolSize = 4;
 constexpr int kPoolRowBytes = kPoolDim * 2;   ///< a pooled key, fp16
