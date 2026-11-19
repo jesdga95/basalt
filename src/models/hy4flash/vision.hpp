@@ -1,5 +1,5 @@
 // src/models/hy4flash/vision.hpp - Hy4-flash image input: what the processor asks of the shared preprocessing (canvas bounds,
-// Lanczos), the token layout of a picture, its rotary positions, and the encoder wrapper the session drives.
+// bicubic), the token layout of a picture, its rotary positions, and the encoder wrapper the session drives.
 //
 // A picture becomes one block of embedding rows in the text model's width:
 //   <image_start> ( [merged patch] * ow  [newline] ) * oh <image_end>
@@ -28,9 +28,6 @@ inline vision::Geometry vision_geometry() {
     return g;
 }
 
-/// The processor's `resample: 1`.
-inline constexpr vision::Filter kVisionFilter = vision::Filter::Lanczos;
-
 /// The projector's name in the pack's `vision/mmproj` section.
 inline constexpr const char* kProjector = "hy_v4_flash";
 
@@ -50,8 +47,9 @@ struct ImagePlan {
 /// grid. False with `err` for an empty picture or an aspect ratio over kMaxAspect.
 bool plan_image(int w, int h, ImagePlan& p, std::string& err);
 
-/// The patch rows [n_patches][768] in merge order: the picture resized to the canvas with the Lanczos filter, scaled to
-/// [-1, 1], cut into 16 x 16 patches.
+/// The patch rows [n_patches][768] in merge order: the picture resized to the canvas with Pillow's bicubic (transformers'
+/// processor and the original it follows leave the configured `resample: 1`, Lanczos, unused), scaled to [-1, 1], cut into
+/// 16 x 16 patches.
 void image_patches(const vision::Image& src, const ImagePlan& plan, std::vector<float>& patches);
 
 /// A token's rotary position on the three axes.
