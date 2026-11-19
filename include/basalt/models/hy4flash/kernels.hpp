@@ -41,8 +41,8 @@ void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const 
 void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
                  int n_tok, int ring, float* qcur, uint16_t* cache, void* stream);
 
-/// The same with an FP8 cache: rows of kFp8RowBytes (512 E4M3 codes, four fp32 scales, one per 128 codes, amax / 448, then the 64 rope
-/// values as BF16), written and read as the flash-MLA kernels' rows are.
+/// The same with an FP8 cache: vLLM's fp8_ds_mla rows of kFp8RowBytes: 512 E4M3 codes of the BF16-rounded latent, four fp32 scales
+/// (one per 128 codes, 2^ceil(log2(max(amax / 448, 1e-4)))), then the 64 rope values as BF16.
 constexpr int kFp8RowBytes = 656;
 void mla_prepare(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
                  int n_tok, int ring, float* qcur, uint8_t* cache, void* stream);
