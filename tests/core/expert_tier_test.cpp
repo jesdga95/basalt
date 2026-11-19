@@ -302,6 +302,12 @@ int main() {
             run(200);   // the kept slots keep working
             CHECK(bytes_right());
             CHECK(tier.slots() == kept);
+            // A retry can borrow another segment while preserving the newest experts in the smaller arena.
+            CHECK(cudaMemGetInfo(&free_b, &total_b) == cudaSuccess);
+            CHECK(tier.lend((uint64_t) free_b - tier.free_floor() + spec.lend_segment));
+            CHECK(tier.slots() > 0 && tier.slots() < kept);
+            for (int l = 0; l < kLayers; ++l) CHECK(tier.locate(l, last[l][3]).dev != nullptr);
+            CHECK(bytes_right());
             CHECK(tier.reclaim(err));
             CHECK(tier.slots() == full);
             run(400);

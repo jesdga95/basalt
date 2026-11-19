@@ -61,9 +61,15 @@ using platform::detect_cpu_topology;
 /// `skip_first` drops the first core, which is reserved for the host loop.
 std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
 
+/// The pool's worker count when the operator gave none: every physical core the affinity allows, except that a hybrid CPU
+/// (`Auto` or `P-cores`) takes its P-cores less the host thread and then half its E-cores, and a cgroup CPU quota caps the
+/// workers and the host thread together.  A pure function of the machine's counts, so a model sizes its pool without the
+/// program layer.
+int auto_pool_workers(int worker_cores, int p_cores, int e_cores, bool hybrid, double cpu_quota, PoolAffinity affinity);
+
 class ExpertPool {
 public:
-    /// `n_workers` is the worker count (at least 1); the caller sizes it (see program/auto_plan).  Workers are not pinned (the OS places them) and each owns one `ExpertScratch`, so nothing in the token path allocates.
+    /// `n_workers` is the worker count (at least 1); the caller sizes it (see auto_pool_workers).  Workers are not pinned (the OS places them) and each owns one `ExpertScratch`, so nothing in the token path allocates.
     ///
     /// The host thread joins the drain: `run()` claims jobs itself instead of spinning on `done_`, so the pool uses
     /// every core.
