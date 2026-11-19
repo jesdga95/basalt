@@ -17,6 +17,9 @@
 #include <sched.h>
 #include <unistd.h>
 #include "affinity_linux.hpp"
+#if defined(__aarch64__)
+#include <sys/auxv.h>
+#endif
 #endif
 
 namespace basalt::platform {
@@ -373,6 +376,25 @@ CpuInfo cpu_info() {
     return info;
 }
 
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#if defined(_WIN32)
+bool cpu_has_arm_dotprod() { return IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE) != 0; }
+bool cpu_has_arm_i8mm() {
+#if defined(PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE)
+    return IsProcessorFeaturePresent(PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE) != 0;
+#else
+    return false;   // an SDK from before the constant: the baseline kernels run
+#endif
+}
+#else
+bool cpu_has_arm_dotprod() { return (getauxval(AT_HWCAP) & (1ul << 20)) != 0; }    // HWCAP_ASIMDDP
+bool cpu_has_arm_i8mm() { return (getauxval(AT_HWCAP2) & (1ul << 13)) != 0; }      // HWCAP2_I8MM
+#endif
+#else
+bool cpu_has_arm_dotprod() { return false; }
+bool cpu_has_arm_i8mm() { return false; }
 #endif
 
 }  // namespace basalt::platform

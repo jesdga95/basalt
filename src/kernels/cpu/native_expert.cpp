@@ -9,6 +9,7 @@
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/platform/compiler.hpp"
 
 #include "basalt/ggml/ggml.h"
 
@@ -136,6 +137,10 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if constexpr (platform::kArm64) {   // every activation format through the NEON build's quantizer
+        traits(f.gu_act)->from_float(x, dst, f.n_embd);
+        return;
+    }
     static const bool avx512 = cpu_avx512_ok();
     if (f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
         if (avx512) {

@@ -23,6 +23,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 
 #include "basalt/ggml/ggml.h"
+#include "basalt/platform/compiler.hpp"
 
 #include <cuda_runtime.h>
 
@@ -442,6 +443,16 @@ int gpu_nvfp4(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, const s
 // NVFP4 multi-token AVX-512 kernel against the single-token ggml dot this CPU would otherwise run (gate/up with s_gate,
 // s_up and SwiGLU, down with s_down): bitwise equal for every token count 1..9 (9 crosses the 8-token pass) and for
 // a row range that splits a down row pair; then a single-thread microbench, ggml dot vs the kernel, 1/2/4/8 tokens.
+// The x86 build's AVX2 or AVX-512 NVFP4 table; an Arm64 build has neither (and returns before asking).
+const ggml_type_traits_cpu* x86_nvfp4_table(bool avx2) {
+    if constexpr (basalt::platform::kX86) {
+        return avx2 ? ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4) : ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4);
+    } else {
+        (void) avx2;
+        return nullptr;
+    }
+}
+
 int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, bool avx2) {
     const char* isa = avx2 ? "avx2" : "avx512";
     if (!avx2 && !cpu::cpu_avx512_ok()) { std::printf("          nvfp4 multi-token avx512: no AVX-512 on this CPU\n"); return 0; }
@@ -449,8 +460,7 @@ int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob,
     constexpr int MT = 9;
     float sc[4];
     std::memcpy(sc, blob.data() + f.bytes - f.tail, sizeof sc);
-    const ggml_vec_dot_t dot = (avx2 ? ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4)
-                                      : ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4))->vec_dot;
+    const ggml_vec_dot_t dot = x86_nvfp4_table(avx2)->vec_dot;
     std::mt19937 rng(23 + seed);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<std::vector<uint8_t>> act(MT, std::vector<uint8_t>(f.act_bytes)), hq(MT, std::vector<uint8_t>(f.h_bytes));
@@ -550,17 +560,27 @@ int check_nvfp4_cpu(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, i
     for (auto& v : x) v = nd(rng);
     // (1) the dots
     {
-        const ggml_type_traits_cpu* isa[2] = {ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4),
-                                              cpu::cpu_avx512_ok() ? ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4)
-                                                                   : nullptr};
+        // x86-64: the AVX2 table always (the engine's floor there), the AVX-512 one where the CPU has it; Arm64: NEON
+        const ggml_type_traits_cpu* isa[2] = {nullptr, nullptr};
         const char* name[2] = {"avx2", "avx512"};
+        if constexpr (basalt::platform::kArm64) {
+            isa[0] = ggml_get_type_traits_cpu_neon(GGML_TYPE_NVFP4);
+            name[0] = "neon";
+            name[1] = "(none)";
+        } else {
+            isa[0] = ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4);
+            isa[1] = cpu::cpu_avx512_ok() ? ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4) : nullptr;
+        }
         std::vector<uint8_t> xq(ggml_row_size(GGML_TYPE_Q8_0, H)), hq(ggml_row_size(GGML_TYPE_Q8_0, FF));
         std::vector<float> h(FF);
         for (auto& v : h) v = 0.05f * nd(rng);
         ggml_quantize_chunk(GGML_TYPE_Q8_0, x.data(), xq.data(), 0, 1, H);
         ggml_quantize_chunk(GGML_TYPE_Q8_0, h.data(), hq.data(), 0, 1, FF);
         for (int i = 0; i < 2; ++i) {
-            if (isa[i] == nullptr) { std::printf("          nvfp4 %s dot: not on this CPU\n", name[i]); continue; }
+            if (isa[i] == nullptr) {
+                if (i == 0 || basalt::platform::kX86) std::printf("          nvfp4 %s dot: not on this CPU\n", name[i]);
+                continue;
+            }
             std::vector<float> want, got;
             for (int64_t r = 0; r < FF; ++r) {
                 float a = 0.f, b = 0.f;
@@ -970,10 +990,22 @@ int check_bf16_embd(cudaStream_t s) {
 // The CPU tier alone on random blobs of one pair (no GPU): each ISA build of the ggml dot against a double
 // reference over the dequantized weights and activations, the multi-row expert against the float expert, and the
 // time of one thread's gate/up rows.
-extern "C" {
-const ggml_type_traits_cpu* ggml_get_type_traits_cpu_avx2(ggml_type type);
-const ggml_type_traits_cpu* ggml_get_type_traits_cpu_avx512(ggml_type type);
+namespace {
+struct IsaTable {
+    const char* name;
+    const ggml_type_traits_cpu* (*get)(ggml_type);
+    bool ok;
+};
+// The ggml dot tables this build has, and whether this CPU runs each.
+std::vector<IsaTable> isa_tables() {
+    if constexpr (basalt::platform::kArm64) {
+        return {{"neon", ggml_get_type_traits_cpu_neon, cpu::cpu_neon_ok()}};
+    } else {
+        return {{"avx2", ggml_get_type_traits_cpu_avx2, cpu::cpu_avx2_ok()},
+                {"avx512", ggml_get_type_traits_cpu_avx512, cpu::cpu_avx512_ok()}};
+    }
 }
+}  // namespace
 
 int check_cpu_pair(int gu, int dn, int seed) {
     int failures = 0;
@@ -1017,9 +1049,7 @@ int check_cpu_pair(int gu, int dn, int seed) {
         tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
     }
     for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
-    const struct { const char* name; const ggml_type_traits_cpu* (*get)(ggml_type); bool ok; } isas[] = {
-        {"avx2", ggml_get_type_traits_cpu_avx2, cpu::cpu_avx2_ok()},
-        {"avx512", ggml_get_type_traits_cpu_avx512, cpu::cpu_avx512_ok()}};
+    const std::vector<IsaTable> isas = isa_tables();
     for (const auto& isa : isas) {
         if (!isa.ok) continue;
         const auto* tc = isa.get((ggml_type) gu);

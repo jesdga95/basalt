@@ -1,5 +1,6 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
 #include "basalt/core/device.hpp"
+#include "basalt/core/cuda_cc.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "models/deepseek41/tier.hpp"
 #include "basalt/core/loader.hpp"
@@ -219,9 +220,9 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
     // peer card here rather than failing at its first launch with 'no kernel image'.
     for (int dev : peers) {
         cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.major != 0 && !(prop.major == 12 && prop.minor == 0))
+        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.major != 0 && !core::cuda_cc_is_ours(prop.major, prop.minor))
             return {model::Status::Error, "deepseek41: GPU " + std::to_string(dev) + " (" + prop.name +
-                                              ") is not sm_120: the DeepSeek peer-tier kernels are built for Blackwell only"};
+                                              ") is not " + core::cuda_cc_name() + ": the DeepSeek peer-tier kernels are built for this capability only"};
     }
     set_peer_devices(std::move(peers));
     // the sessions first (the drafter takes its memory with the first), then the expert tier, sized from what they leave,

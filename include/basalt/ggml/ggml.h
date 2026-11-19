@@ -86,12 +86,14 @@ struct ggml_type_traits_cpu {
     int64_t nrows;
 };
 
-// The dot products run on the widest x86 vector unit the CPU has (AVX-512 build, else AVX2).  nullptr for a type
-// without a dot product, and for every type on a CPU with neither.
+// The dot products run on the widest x86 vector unit the CPU has (AVX-512 build, else AVX2), or on NEON with the dot
+// product on Arm64.  nullptr for a type without a dot product, and for every type on a CPU with none of them.
 const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu(enum ggml_type type);
 // Each instruction set's table, whatever this CPU has (parity tests compare them).
 const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu_avx2(enum ggml_type type);
 const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu_avx512(enum ggml_type type);
+// The Arm64 build's table (ggml_cpu_dots_neon.c); the two above exist on x86-64 only, this one on Arm64 only.
+const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu_neon(enum ggml_type type);
 
 // NVFP4 row . Q8_0 row in plain C: the reference for the SIMD vec_dot (ggml_quants.c).
 void ggml_vec_dot_nvfp4_q8_0_ref(int n, float* GGML_RESTRICT s, const void* GGML_RESTRICT x, const void* GGML_RESTRICT y);

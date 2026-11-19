@@ -1,7 +1,7 @@
 // src/core/graph.cpp - the GraphRegistry implementation.
 #include "basalt/core/graph.hpp"
 
-#include <immintrin.h>
+#include "basalt/platform/compiler.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -97,7 +97,7 @@ bool CapturedGraph::wait_ms(int timeout_ms) const {
         if (q == cudaSuccess) return true;
         if (q != cudaErrorNotReady) return false;   // a real error, not "not finished"
         if (std::chrono::steady_clock::now() >= deadline) return false;
-        for (int i = 0; i < 64; ++i) _mm_pause();
+        for (int i = 0; i < 64; ++i) basalt::platform::cpu_relax();
     }
 }
 

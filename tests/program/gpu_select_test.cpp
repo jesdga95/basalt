@@ -1,6 +1,8 @@
 // tests/program/gpu_select_test.cpp - the gpu setting over fake card tables: parsing, the card choice, the roles.
 #include "basalt/program/gpu_select.hpp"
 
+#include "basalt/core/cuda_cc.hpp"
+
 #include "basalt/platform/process.hpp"
 
 #include <cstdio>
@@ -8,6 +10,10 @@
 #include <string>
 
 using namespace basalt::program;
+
+// the capability this build is for: a "Blackwell" card of the tests is one of it
+static const int kOursMinor = basalt::core::kCudaCCMinor;
+static const std::string kOurs = basalt::core::cuda_cc_name();
 
 static int g_fail = 0;
 #define CHECK(c)                                                              \
@@ -17,7 +23,8 @@ static int g_fail = 0;
 #define CHECK_STR(got, want)                                                                         \
     do {                                                                                             \
         const std::string g_ = (got);                                                                \
-        if (g_ != (want)) { std::printf("FAIL %s:%d: got \"%s\" want \"%s\"\n", __FILE__, __LINE__, g_.c_str(), want); ++g_fail; } \
+        const std::string w_ = (want);                                                               \
+        if (g_ != w_) { std::printf("FAIL %s:%d: got \"%s\" want \"%s\"\n", __FILE__, __LINE__, g_.c_str(), w_.c_str()); ++g_fail; } \
     } while (0)
 
 static constexpr uint64_t G = 1ull << 30;
@@ -78,7 +85,7 @@ int main() {
     }
     // A 5090 and a 5060 Ti, in nvidia-smi order.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, 0, 1792, 32), card(1, "RTX 5060 Ti", 12, 0, 448, 16)};
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, kOursMinor, 1792, 32), card(1, "RTX 5060 Ti", 12, kOursMinor, 448, 16)};
         GpuChoice c = pick("", v);
         CHECK_STR(cards(c), "0");
         CHECK_STR(c.warning, "GPU 1 (RTX 5060 Ti) unused; use gpu 0,1 or gpu auto");
@@ -102,13 +109,13 @@ int main() {
     }
     // The same cards with the slower one first: auto still makes the 5090 main.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5060 Ti", 12, 0, 448, 16), card(1, "RTX 5090", 12, 0, 1792, 32)};
+        const std::vector<GpuCard> v = {card(0, "RTX 5060 Ti", 12, kOursMinor, 448, 16), card(1, "RTX 5090", 12, kOursMinor, 1792, 32)};
         CHECK_STR(cards(pick("auto", v)), "1,0");
         CHECK_STR(cards(pick("", v)), "0");
     }
     // Two equal 5090s: the lowest number is main.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, 0, 1792, 32), card(1, "RTX 5090", 12, 0, 1792, 32)};
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, kOursMinor, 1792, 32), card(1, "RTX 5090", 12, kOursMinor, 1792, 32)};
         const GpuChoice c = pick("auto", v);
         CHECK_STR(cards(c), "0,1");
         CHECK(c.notes.empty());
@@ -116,12 +123,12 @@ int main() {
     }
     // Four mixed cards, one of them not Blackwell.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5070 Ti", 12, 0, 896, 16), card(1, "RTX 3090", 8, 6, 936, 24),
-                                        card(2, "RTX 5090", 12, 0, 1792, 32), card(3, "RTX 5060 Ti", 12, 0, 448, 16)};
+        const std::vector<GpuCard> v = {card(0, "RTX 5070 Ti", 12, kOursMinor, 896, 16), card(1, "RTX 3090", 8, 6, 936, 24),
+                                        card(2, "RTX 5090", 12, kOursMinor, 1792, 32), card(3, "RTX 5060 Ti", 12, kOursMinor, 448, 16)};
         GpuChoice c = pick("auto", v);
         CHECK_STR(cards(c), "2,0,3");
         CHECK(c.notes.size() == 1);
-        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 3090) skipped, not sm_120");
+        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 3090) skipped, not " + kOurs);
         CHECK_STR(roles(v, c, 1), "main,expert tier,idle");
         CHECK_STR(roles(v, c, 3), "main,expert tier,expert tier");
         CHECK_STR(roles(v, c, 1, true), "main,prompt split,idle");
@@ -129,13 +136,13 @@ int main() {
         c = pick("", v);
         CHECK_STR(cards(c), "0");
         CHECK_STR(c.warning, "GPU 2 (RTX 5090), GPU 3 (RTX 5060 Ti) unused; use gpu 0,2,3 or gpu auto");
-        CHECK_STR(pick("1", v).error, "gpu: GPU 1 (RTX 3090) is sm_86, not sm_120");
+        CHECK_STR(pick("1", v).error, "gpu: GPU 1 (RTX 3090) is sm_86, not " + kOurs);
         CHECK_STR(cards(pick("3,2,0", v)), "3,2,0");
     }
     // An Ada (sm_89) card: never the main card; a second card only in a -DPEER_ADA=ON build
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5080", 12, 0, 960, 16), card(1, "RTX 4060 Ti", 8, 9, 288, 16)};
-        CHECK_STR(pick("1,0", v).error, "gpu: GPU 1 (RTX 4060 Ti) is sm_89, not sm_120");
+        const std::vector<GpuCard> v = {card(0, "RTX 5080", 12, kOursMinor, 960, 16), card(1, "RTX 4060 Ti", 8, 9, 288, 16)};
+        CHECK_STR(pick("1,0", v).error, "gpu: GPU 1 (RTX 4060 Ti) is sm_89, not " + kOurs);
 #if defined(BASALT_PEER_ADA)
         CHECK_STR(cards(pick("0,1", v)), "0,1");
         CHECK_STR(cards(pick("auto", v)), "0,1");
@@ -144,23 +151,23 @@ int main() {
         GpuChoice c = pick("auto", v);
         CHECK_STR(cards(c), "0");
         CHECK(c.notes.size() == 1);
-        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 4060 Ti) skipped, not sm_120");
+        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 4060 Ti) skipped, not " + kOurs);
 #endif
     }
     // A laptop's own card beside a desktop card in an enclosure: the desktop card's bandwidth makes it main; the
     // laptop card is the first visible, so it runs alone when nothing is set.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5080 Laptop GPU", 12, 0, 896, 16), card(1, "RTX 5090", 12, 0, 1792, 32)};
+        const std::vector<GpuCard> v = {card(0, "RTX 5080 Laptop GPU", 12, kOursMinor, 896, 16), card(1, "RTX 5090", 12, kOursMinor, 1792, 32)};
         CHECK_STR(cards(pick("auto", v)), "1,0");
         CHECK_STR(cards(pick("", v)), "0");
         CHECK(!pick("", v).warning.empty());
         // the same bandwidth: the larger card is main
-        const std::vector<GpuCard> w = {card(0, "RTX 5070 Ti Laptop GPU", 12, 0, 896, 12), card(1, "RTX 5080", 12, 0, 896, 16)};
+        const std::vector<GpuCard> w = {card(0, "RTX 5070 Ti Laptop GPU", 12, kOursMinor, 896, 12), card(1, "RTX 5080", 12, kOursMinor, 896, 16)};
         CHECK_STR(cards(pick("auto", w)), "1,0");
     }
     // A first card Basalt cannot run: unset is an error that points at gpu N and auto.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 4090", 8, 9, 1008, 24), card(1, "RTX 5090", 12, 0, 1792, 32)};
+        const std::vector<GpuCard> v = {card(0, "RTX 4090", 8, 9, 1008, 24), card(1, "RTX 5090", 12, kOursMinor, 1792, 32)};
         CHECK(!pick("", v).error.empty());
 #if defined(BASALT_PEER_ADA)
         CHECK_STR(cards(pick("auto", v)), "1,0");   // the sm_89 card is a second card in a -DPEER_ADA=ON build
