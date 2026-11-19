@@ -65,7 +65,9 @@ struct TokenizerSpec {
 };
 
 /// Outcome of a model operation.
-enum class Status { Ok, NotImplemented, Error };
+/// Refused: the request cannot run (no room for its positions) and the session holds what it held before it; the engine
+/// answers ERR and serves the next request. Error: the session cannot go on.
+enum class Status { Ok, NotImplemented, Error, Refused };
 
 struct Result {
     Status status = Status::Ok;
