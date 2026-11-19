@@ -3,6 +3,7 @@
 #include "models/hy4flash/model.hpp"
 
 #include "basalt/artifact/dequant.hpp"
+#include "basalt/ggml/ggml.h"
 #include "basalt/core/loader.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
@@ -12,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <numeric>
 
 namespace basalt::models::hy4flash {
 namespace {
@@ -24,6 +26,16 @@ constexpr int kClaimsPerRow = 128;
 }  // namespace
 
 Hy4Model::Hy4Model() = default;
+
+size_t Hy4Model::expert_stride() const {
+    size_t blob = 0, unit = 16;
+    for (const ExpertLayer& el : pack_.experts) {
+        blob = std::max<size_t>(blob, el.blob_bytes);
+        if (!el.present) continue;
+        for (int t : {el.gu_type, el.d_type}) unit = std::lcm(unit, ggml_type_size((ggml_type) t));
+    }
+    return (blob + unit - 1) / unit * unit;
+}
 
 Hy4Model::~Hy4Model() {
     for (auto& [name, t] : dev_)
@@ -57,7 +69,6 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     for (int l = g.n_dense; l < g.n_layers; ++l) {
         const ExpertLayer& e = pack_.experts[(size_t) l];
         s.layers.push_back({e.gu_type, e.d_type, e.offset, e.blob_bytes, g.clamp_exp[(size_t) l]});
-        s.share_stride = std::max<uint64_t>(s.share_stride, e.blob_bytes);
     }
     s.path = path_;
     s.fd = fd_;
@@ -77,6 +88,7 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.admit_uses = kAdmitUses;
     s.claims_per_row = kClaimsPerRow;
     s.share_max_tokens = 16384;
+    s.share_stride = expert_stride();
     return s;
 }
 

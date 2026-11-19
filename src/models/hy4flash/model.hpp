@@ -46,6 +46,9 @@ public:
     ngram::PleReader& engram_reader() const { return *engram_; }
     /// The tier's descriptor: the MoE layers only (the tier's layer 0 is the first of them), over the 1536-wide latent.
     core::ExpertTierSpec tier_spec() const;
+    /// Bytes between two staged experts of the prompt path: the largest blob rounded to every matrix type's block size, as MMQ
+    /// steps from expert to expert in whole blocks (the main card's launches and the second card's share alike).
+    size_t expert_stride() const;
     /// The start's reads while it plans (null after): what the first session's tier queues into.
     core::LoadPlan* planning() const { return planning_; }
     /// The expert tier and the pinned rows it shares with a second card: one per model, whatever the sessions.
