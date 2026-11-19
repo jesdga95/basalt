@@ -2023,18 +2023,7 @@ private:
             }
         core::ExpertTier::Lookup& lk = pd.lk;
         if (!tier_->lookup(tl, uniq, nu, lk, err)) return false;
-        // a window's misses: the CPU takes the experts with the fewest rows, as many as end with the bus's share at the split's
-        // fixed prices (cpu_take: no timing, the same request takes the same split); a single row keeps the tier's rule
-        int bus = -1;
-        if (G > 1 && tier_->pool()) {
-            std::vector<int> cand_rows;
-            for (int i = 0; i < nu; ++i)
-                if (!lk.dev[i] && !lk.peer[i] && lk.host[i]) cand_rows.push_back(use[i].nt);
-            std::sort(cand_rows.begin(), cand_rows.end());
-            const int n = (int) cand_rows.size();
-            bus = n - prefill::cpu_take(cpu_rates(), (double) m_.pack().experts[(size_t) l].blob_bytes, n, cand_rows);
-        }
-        const int n_fetched = bus >= 0 ? tier_->fetch(tl, lk, bus) : tier_->fetch(tl, lk);
+        const int n_fetched = tier_->fetch(tl, lk);
         // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land
         if (peer) {
             int32_t kind[kLookupK] = {};
