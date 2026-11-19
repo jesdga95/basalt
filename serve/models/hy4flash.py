@@ -222,6 +222,7 @@ class Hy4Parser:
 
 class Hy4Flash(Dialect):
     name = "hy4flash"
+    in_engine_vision = True             # the encoder places its rows by the model's own grid (newline column): no sidecar
     # chat_template.jinja: tools and several calls per turn, an effort of no_think/high/max, a leading system turn,
     # and `preserved_thinking`
     caps = {"supports_tool_calls": True, "supports_parallel_tool_calls": True, "supports_reasoning_effort": True,

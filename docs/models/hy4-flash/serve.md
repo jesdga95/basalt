@@ -36,8 +36,9 @@ without reporting it. A named `tool_choice` writes the opening of the call itsel
 
 ## Images, sampling, context
 
-- Images take Flash-Next's path through `--vision`: the template writes `image_start`, one `image_pad` and `image_end` per image and the
-  server expands the pad to the image's rows. The model reads no video yet.
+- Images take Flash-Next's path through `--vision dynamic` (the only mode: a sidecar does not know the newline column): the template
+  writes `image_start`, one `image_pad` and `image_end` per image and the server expands the pad to the image's rows, `oh * (ow + 1)`
+  of them. The model reads no video yet.
 - The pack's sampling keys give the defaults: temperature 0.9, top_p 1.0 and `top_k` -1, which is off. A request's fields win.
 - `--max-context` as for the other models; the engine refuses a context the cards cannot hold, and the server plans with the context the
   engine reports.
