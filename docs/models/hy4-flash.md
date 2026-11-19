@@ -148,6 +148,11 @@ by their pack accessors. Extract, as its own commits with DS output hash-identic
    copies in every layer): its early layers route more widely, so layers 0-3 hold about 1.4x the mean and layers 15, 27 and
    31-33 about 0.73x, the same total (135 a layer on average beside the Q8_0 drafter). On serve bench.sh against the same
    copies everywhere: struct +4.6%, prose +2.3%, conv and prefill within noise. The table and its traces are in `model.cpp`.
+   The start places copies, second-card homes and the slots beside the base arena by `data/profiles/hy4flash-42x512.prof`
+   (each layer's experts by decode routing over prose, code, conversation, structured output and agent turns): the first
+   request after a start decodes about 17% faster than with the experts in id order; after a few hundred tokens the LRU's own
+   placement takes over. The misses left are mostly reuse at one to two times the slots per layer (recency beats frequency:
+   decayed-count eviction, a pinned hot set and count-gated admission all simulated no better than the LRU).
 3. `core/engram_table`: row reader (O_DIRECT, row-aligned, prefetch, hot-row LRU in pinned RAM); the row decode (IQ4_NL, MXFP4,
    E4M3) is the model's.
 4. `core/elastic_array` (DS `elastic.hpp`, beside `core/vmm.hpp`) for the KV backing.
@@ -201,8 +206,8 @@ indexer's pooled key turns by its group's first cell), Engram masked at picture 
   dialect's, `reasoning_close` is the think end token and the stop text is the `hy_end` token (120025).
 - Engine: `session` calls (`decode_window`, `prefill_chunk`, `save_cells`, `restore_cells`, `running_state`: the SWA ring, pooled
   keys, the raw indexer ring, the last two token ids for Engram, DFly's last hidden state). Sleep frees the slots and the dense
-  weights (re-read from the pack in seconds) and keeps RAM; the slot residency table is saved and refilled from the RAM tier at
-  link speed (33 GB in about 1 s). With every expert in RAM, two-card sleep needs the KV in free RAM (DS's rule: 8 GiB spare), so
+  weights (re-read from the pack in seconds) and keeps RAM; wake opens the base slots again empty (the slots beside them are
+  seeded by the profile) and decode refills them. With every expert in RAM, two-card sleep needs the KV in free RAM (DS's rule: 8 GiB spare), so
   it may be refused at long contexts. Park and swap use the conversation cache; `POST /v1/vram` and `--vram-reserve-mib` as DS.
 - Load: `plan` sizes weights, then the KV, tier and workspace from what is left; the announced total is the dense bytes + the RAM
   tier + the drafter; one placement pass; `attach` packs forms and times nothing else.
