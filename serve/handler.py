@@ -27,7 +27,7 @@ from serve.config import checked_sampling
 from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
 from serve.api.openai import checked_return_progress, openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
-from serve.prompt import primed
+from serve.prompt import ContextOverflow, primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
 from serve.live import AnswerNowRefused
 from serve.router import Router
@@ -925,8 +925,11 @@ def make_handler(target: Service | Router):
             self._open_live("msg_" + uuid.uuid4().hex[:24], req)
             self._take_turn(bool(req.get("stream")))
             self.svc.load()
-            ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
-                                                 image_access=self._image_access())
+            try:
+                ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
+                                                     image_access=self._image_access())
+            except ContextOverflow as e:
+                raise ValueError(e.anthropic_text()) from None   # Anthropic's own wording first (#4838 parity)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
             events = primed(anthropic_events(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
