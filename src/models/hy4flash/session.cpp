@@ -295,7 +295,7 @@ public:
         b.rows = R;
         b.block = B;
         b.arows = A;
-        b.X = f((int64_t) R * 4 * E); b.Xn = f((int64_t) R * 4 * E); b.coef = f((int64_t) R * bk::kHcCoef);
+        b.X = f((int64_t) R * 4 * E); b.Xn = f((int64_t) B * 4 * E); b.coef = f((int64_t) R * bk::kHcCoef);
         b.hcws = f((int64_t) bk::hc_plain_workspace_floats(B));
         b.e = f((int64_t) B * E); b.cur = f((int64_t) B * E); b.xn = f((int64_t) B * E); b.attn = f((int64_t) B * E);
         b.attn_raw = f((int64_t) A * E); b.mlp = f((int64_t) B * E); b.mlp2 = f((int64_t) B * E);
@@ -2306,38 +2306,32 @@ private:
                 if (!layer_replayed(l, pos0, R, hc, err)) return false;
                 continue;
             }
-            // One block of rows at a time: the attention half writes the post-attention stream into Xn_, the feed-forward
-            // half reads it there and writes the layer's output back into X_.  A block is a chunk's rows, so each pass
-            // is exactly the workload the chunked read gave it; a group only adds the blocks that used to be later chunks.
-            const double ta = now_ms();
+            // One block of rows at a time: the attention half writes the block's post-attention stream into Xn_, the
+            // feed-forward half reads it there and writes the layer's output back into X_.  A block is a chunk's rows, so
+            // each pass is exactly the workload the chunked read gave it, and only the residual stream itself is as tall as
+            // the group: the second stream is one block's.
             for (int off = 0; off < R; off += block) {
                 const int n = std::min(block, R - off);
                 float* const Xb = X_ + (size_t) off * 4 * E;
-                float* const Xnb = Xn_ + (size_t) off * 4 * E;
                 float* const coefb = coef_ + (size_t) off * bk::kHcCoef;
                 bk::hc_mixes_plain(Xb, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), n, 8, hc, hcws_, coefb, stream_);
                 bk::hc_pre_rms_norm(Xb, coefb, bk::kHcCoef, F(l, "attn_norm.weight"), n, E, g_.rms_eps, cur_, xn_, stream_);
                 if (diag(l)) dump("attn_norm-" + std::to_string(l), xn_, (int64_t) n * E);
+                const double ta = now_ms();
                 if (!attention(l, pos0 + off, n, err)) return false;
-                bk::hc_post(attn_, Xb, coefb, bk::kHcCoef, n, E, Xnb, stream_);
-            }
-            t_att_ms_ += now_ms() - ta;
-            if (diag(l)) dump("hc_attn_out-" + std::to_string(l), Xn_, (int64_t) R * 4 * E);
-            const double tf = now_ms();
-            for (int off = 0; off < R; off += block) {
-                const int n = std::min(block, R - off);
-                float* const Xb = X_ + (size_t) off * 4 * E;
-                float* const Xnb = Xn_ + (size_t) off * 4 * E;
-                float* const coefb = coef_ + (size_t) off * bk::kHcCoef;
-                bk::hc_mixes_plain(Xnb, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), n, 8, hc, hcws_, coefb, stream_);
-                bk::hc_pre_rms_norm(Xnb, coefb, bk::kHcCoef, F(l, "ffn_norm.weight"), n, E, g_.rms_eps, cur_, xn_, stream_);
+                t_att_ms_ += now_ms() - ta;
+                bk::hc_post(attn_, Xb, coefb, bk::kHcCoef, n, E, Xn_, stream_);
+                if (diag(l)) dump("hc_attn_out-" + std::to_string(l), Xn_, (int64_t) n * 4 * E);
+                bk::hc_mixes_plain(Xn_, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), n, 8, hc, hcws_, coefb, stream_);
+                bk::hc_pre_rms_norm(Xn_, coefb, bk::kHcCoef, F(l, "ffn_norm.weight"), n, E, g_.rms_eps, cur_, xn_, stream_);
                 if (diag(l)) dump("ffn_norm-" + std::to_string(l), xn_, (int64_t) n * E);
+                const double tf = now_ms();
                 if (!ffn(l, n, R, err)) return false;
+                t_ffn_ms_ += now_ms() - tf;
                 bk::rms_norm_rows(mlp_, F(l, "post_ffw_norm.weight"), mlp2_, n, E, g_.rms_eps, stream_);
                 if (diag(l)) dump("ffn_out-" + std::to_string(l), mlp2_, (int64_t) n * E);
-                bk::hc_post(mlp2_, Xnb, coefb, bk::kHcCoef, n, E, Xb, stream_);
+                bk::hc_post(mlp2_, Xn_, coefb, bk::kHcCoef, n, E, Xb, stream_);
             }
-            t_ffn_ms_ += now_ms() - tf;
             if (!m_.diag_dump().empty()) dump("l_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
         }
         if (!join_moe(err)) return false;
