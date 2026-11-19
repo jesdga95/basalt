@@ -413,6 +413,20 @@ def main() -> int:
         print(tagged("cors", ",".join(svc.cors_origins)), flush=True)
         if "*" in svc.cors_origins and not svc.api_key:
             print(tagged("warning", "any web page can use the model (--api-key KEY)"), flush=True)
+    svc.cost_input_per_million = a.cost_in
+    svc.cost_output_per_million = a.cost_out
+    svc.cost_cache_write_per_million = a.cost_cache_write
+    svc.cost_cache_hit_per_million = a.cost_cache_hit
+    from serve.totals import totals_path_of, totals_reset_file
+    totals_path = totals_path_of(a.totals_file, a.config)
+    if totals_path:
+        if a.totals_reset:
+            prev = totals_reset_file(totals_path)
+            if prev:
+                print(tagged("totals", f"reset, previous saved to {prev}"), flush=True)
+        svc.totals_path = totals_path
+        svc.load_totals()
+        print(tagged("totals", f"persistent, {totals_path}"), flush=True)
     httpd = serve(router, host=a.host, port=a.port)
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
 

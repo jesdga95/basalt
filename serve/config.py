@@ -641,4 +641,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="output tokens kept for closing the thinking and the answer: auto (a quarter of the cap, at "
                          "least 512, at most half) or a whole number of tokens (0 = none); an explicit request budget "
                          "of 0 opts out")
+    ap.add_argument("--totals-file", default="", metavar="PATH",
+                    help="file for persistent token counts (default: <config>.totals.json next to the config; "
+                         "'none' disables)")
+    ap.add_argument("--totals-reset", action="store_true",
+                    help="reset the persistent counters: move the current file to .prev.json and start fresh")
+    ap.add_argument("--cost-in", type=float, default=0, metavar="USD",
+                    help="price per million input tokens in US dollars (default 0)")
+    ap.add_argument("--cost-out", type=float, default=0, metavar="USD",
+                    help="price per million output tokens in US dollars (default 0)")
+    ap.add_argument("--cost-cache-write", type=float, default=None, metavar="USD",
+                    help="price per million new (cache-write) input tokens (default: same as --cost-in)")
+    ap.add_argument("--cost-cache-hit", type=float, default=None, metavar="USD",
+                    help="price per million reused (cache-hit) input tokens (default: same as --cost-in)")
     return ap
