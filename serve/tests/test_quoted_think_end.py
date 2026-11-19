@@ -58,15 +58,17 @@ def split(text, width):
     return joined(evs, "reasoning"), joined(evs, "content")
 
 
-class EscapedMention(unittest.TestCase):
-    """A tag the model writes about: its quote sits a character or two back, not right before the tag."""
-
+class MentionCase(unittest.TestCase):
     def check(self, text, reasoning, content):
         for width in WIDTHS:
             with self.subTest(width=width):
                 r, c = split(text, width)
                 self.assertEqual(r, reasoning)
                 self.assertEqual(c, content)
+
+
+class EscapedMention(MentionCase):
+    """A tag the model writes about: its quote sits a character or two back, not right before the tag."""
 
     def test_a_typed_escape_before_the_tag_is_a_mention(self):
         # the live turn: the model writes its own closing tag, escaped, inside a backtick span
@@ -93,6 +95,23 @@ class EscapedMention(unittest.TestCase):
         # known limit: with no quote in the window this is the shape of a real end. Pinned as it is.
         self.check("the marker \\n" + THINK_END + "\\n appears\n" + THINK_END + "\n\nanswer",
                    "the marker \\n", "\\n appears\n" + THINK_END + "\n\nanswer")
+
+
+class QuoteBeforeTheTag(MentionCase):
+    """Which side of the tag a quote is on decides whether it quotes the tag or closes a sentence."""
+
+    def test_a_closing_quote_before_the_tag_is_a_real_end(self):
+        self.check('The user said "only."' + THINK_END + "2", 'The user said "only."', "2")
+
+    def test_an_opening_quote_before_the_tag_quotes_it(self):
+        mention = 'and he wrote "' + THINK_END + '" in the log'
+        self.check("plan\n" + mention + "\ndone\n" + THINK_END + "\n\nanswer",
+                   "plan\n" + mention + "\ndone\n", "answer")
+
+    def test_a_tag_after_an_opening_quote_with_prose_behind_it(self):
+        mention = 'he said "' + THINK_END + ' again" and more'
+        self.check("plan\n" + mention + "\ndone\n" + THINK_END + "\n\nanswer",
+                   "plan\n" + mention + "\ndone\n", "answer")
 
 
 if __name__ == "__main__":

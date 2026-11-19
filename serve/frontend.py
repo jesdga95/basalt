@@ -997,10 +997,10 @@ class OutputParser:
         return Event("reasoning", text)
 
     def _quoted_think_end(self, i: int) -> bool | None:
-        """Whether the `</think>` at self.buf[i] is the model mentioning the tag while it thinks: written right after
-        a quote or backtick and followed by anything but a line break, or after a typed `\\n` with a quote just before
-        it, where the model writes about the tag and the real end is elsewhere. None while the character after it has
-        not arrived."""
+        """Whether the `</think>` at self.buf[i] is the model mentioning the tag while it thinks: inside a pair of
+        quotes, right after a quote that opens a quotation, or after a typed `\\n` with a quote just before it, where
+        the model writes about the tag and the real end is elsewhere. A quote that closes a sentence precedes the
+        real end. None while the character after it has not arrived."""
         context = self.buf[:i] if i >= 2 else self.rtail + self.buf[:i]
         before = context[-1:]
         if before not in ('"', "'", "`"):
@@ -1015,7 +1015,11 @@ class OutputParser:
         after = self.buf[i + len(THINK_END):]
         if not after:
             return None
-        return after[0] not in "\r\n"
+        if after[0] == before:                    # the tag inside a pair of quotes
+            return True
+        # only a quote that opens a quotation quotes the tag; one that closes a sentence precedes the real end
+        opens = context[-2:-1] in ("", " ", "\t", "\n", "(", "[", "{", ":")
+        return opens and after[0] not in "\r\n"
 
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
