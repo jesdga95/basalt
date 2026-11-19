@@ -1,7 +1,10 @@
 // The loader: file ranges land byte for byte in host memory and (with a device present) in device memory, on any
 // alignment and size, with every conversion, from a path or a descriptor, with items coalesced, counted exactly once,
-// copies of bytes the plan itself places run after its reads, its steps between the two, and a failure or a cancel reported.  The host cases need no GPU.
+// copies of bytes the plan itself places run after its reads, its steps between the two, the reads that land on a card
+// before those that land in RAM (the start's bar says which), and a failure or a cancel reported.  The host cases need no GPU.
 #include "basalt/core/loader.hpp"
+
+#include "basalt/core/load_progress.hpp"
 
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/platform/file.hpp"
@@ -14,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -652,6 +656,61 @@ void device(const TestFile& f) {
     }
 }
 
+// A start's pass reads the card's share first though the plan queued its RAM item first: one worker, so the order is the
+// order the bytes land in, read back from the bar's lines (`into cuda0`, `weights`, `into ram`).  Last: it announces a
+// start's total, which every later placement would count against.
+void cards_first(const TestFile& f) {
+    if (!has_device()) return;
+    constexpr uint64_t kLen = 16u << 20;   // one staging piece each: every placement is a line of the bar
+    void* d = nullptr;
+    uint8_t* h = (uint8_t*) basalt::platform::alloc_aligned(kLen, 4096);
+    check(cudaMalloc(&d, kLen) == cudaSuccess && h != nullptr, "cards first: buffers");
+    LoadPlan plan;
+    const int file = plan.file(f.path);
+    LoadItem ram;
+    ram.file = file;
+    ram.off = 8192;
+    ram.bytes = kLen;
+    ram.host = h;
+    plan.add(ram);
+    LoadItem card = ram;
+    card.off = 4096 * 3 + 5;
+    card.host = nullptr;
+    card.dev = d;
+    plan.add(card);
+    const std::string path = (std::filesystem::current_path() / "loader_test_bar.txt").string();
+    std::fflush(stderr);
+    check(std::freopen(path.c_str(), "w", stderr) != nullptr, "cards first: capture the bar");
+    Loader loader(1);
+    std::string err;
+    const bool ok = place_start(loader, plan, err);
+    std::fflush(stderr);
+    const std::string after = path + ".after";   // let go of the file before reading it (Windows)
+    check(std::freopen(after.c_str(), "w", stderr) != nullptr, "cards first: release the bar");
+    check(ok, "cards first: run");
+    std::vector<uint8_t> back(kLen);
+    check(cudaMemcpy(back.data(), d, kLen, cudaMemcpyDeviceToHost) == cudaSuccess &&
+              std::memcmp(back.data(), f.bytes.data() + card.off, kLen) == 0 && std::memcmp(h, f.bytes.data() + ram.off, kLen) == 0,
+          "cards first: bytes");
+    std::ifstream in(path);
+    std::vector<std::string> seq;   // "cuda0", "ram" and the weights counts, in order
+    for (std::string l; std::getline(in, l);) {
+        unsigned long long a = 0, b = 0;
+        char into[32] = {};
+        if (l == "basalt load: stages cuda0 ram") seq.push_back("stages");
+        else if (std::sscanf(l.c_str(), "basalt load: into %31s", into) == 1) seq.push_back(into);
+        else if (std::sscanf(l.c_str(), "basalt load: weights %llu %llu", &a, &b) == 2) seq.push_back(std::to_string(a));
+    }
+    in.close();
+    const std::vector<std::string> want = {"0", "stages", "cuda0", std::to_string(kLen), "ram", std::to_string(2 * kLen)};
+    check(seq == want, "cards first: the card's bytes land first, then the bar reads ram");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(after, ec);
+    cudaFree(d);
+    basalt::platform::free_aligned(h);
+}
+
 }  // namespace
 
 int main() {
@@ -668,6 +727,7 @@ int main() {
     steps(f);
     descriptor(f);
     device(f);
+    cards_first(f);
     std::printf("loader_test: %s\n", fails ? "FAIL" : "ok");
     return fails ? 1 : 0;
 }

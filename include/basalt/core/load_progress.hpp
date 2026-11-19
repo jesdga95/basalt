@@ -4,6 +4,11 @@
 //   basalt load: planning                      the start is deciding where everything goes (nothing placed yet)
 //   basalt load: total <bytes>                 the bytes the whole start places, once, before any is placed
 //   basalt load: weights <done> <total>        every byte placed so far, wherever it went (a card, a second card, RAM)
+//   basalt load: stages <target>...            where the pass will place, in order: each card (`cuda<N>`, the main
+//                                              card first, one card after the other), then `ram`; once, before the
+//                                              first `into`
+//   basalt load: into <target>                 where the pass places now, one of the stages: a label of the one bar,
+//                                              not a phase of its own
 //   basalt load: ngram <done> <total>          the n-gram table locked in RAM: a phase of its own, outside the total
 //   basalt load: kv [slot|draft ]<target> <bytes> <tokens> <max_bytes>
 //                                              the session state (KV and recurrent state) allocated on a device
@@ -24,6 +29,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 #include "basalt/log.hpp"
 
 namespace basalt::core {
@@ -68,9 +74,25 @@ public:
         w.done = w.placed < w.total ? w.placed : w.total;
         if (due(w.done, w.last_done, w.total, w.last)) print_weights_locked();
     }
-    /// The load is over: the final line, done == total.
+    /// Where the pass will place, in order (`cuda<N>`..., `ram`): announced once, before the first `into`.
+    static void stages(const std::vector<std::string>& targets) {
+        std::lock_guard<std::mutex> lk(weights_mu());
+        if (!weights().announced || targets.empty()) return;
+        std::string line;
+        for (const std::string& t : targets) line += " " + t;
+        basalt::log::info("basalt load", "stages%s", line.c_str());
+    }
+    /// Where the pass places from now on (`cuda<N>` or `ram`), once per change; the bar keeps its one total.
+    static void into(const std::string& target) {
+        std::lock_guard<std::mutex> lk(weights_mu());
+        W& w = weights();
+        if (!w.announced || w.into == target) return;
+        w.into = target;
+        basalt::log::info("basalt load", "into %s", target.c_str());
+    }
     /// The start begins planning: the first line, before the total.
     static void planning() { basalt::log::info("basalt load", "planning"); }
+    /// The load is over: the final line, done == total.
     static void complete() {
         std::lock_guard<std::mutex> lk(weights_mu());
         W& w = weights();
@@ -95,6 +117,7 @@ private:
     struct W {
         uint64_t total = 0, done = 0, placed = 0, last_done = ~0ull;
         bool announced = false, miscounted = false;
+        std::string into;
         Clock::time_point last{};
     };
     static std::mutex& weights_mu() { static std::mutex m; return m; }
