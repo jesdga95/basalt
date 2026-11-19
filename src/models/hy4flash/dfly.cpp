@@ -3,6 +3,7 @@
 
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
@@ -32,7 +33,11 @@ DflyWeights::~DflyWeights() {
 bool DflyWeights::allocate(const DflyDims& d, std::string& err) {
     dims = d;
     for (const DflySpec& s : dfly_specs(d)) {
-        const uint64_t b = s.elems() * (s.f32 ? 4 : 2);
+        if (s.q8 && (s.shape.size() != 2 || s.shape[1] % 32 != 0)) {
+            err = "the drafter's " + s.name + " rows are not whole Q8_0 blocks";
+            return false;
+        }
+        const uint64_t b = s.bytes();
         void* p = nullptr;
         if (cudaMalloc(&p, b) != cudaSuccess) {
             err = "out of device memory for the drafter's " + s.name;
@@ -42,20 +47,21 @@ bool DflyWeights::allocate(const DflyDims& d, std::string& err) {
         bytes_ += b;
     }
     auto bf = [&](const std::string& n) { return (const uint16_t*) slot(n); };
+    auto q = [&](const std::string& n) { return (const void*) slot(n); };
     auto f = [&](const std::string& n) { return (const float*) slot(n); };
     layer.clear();
     for (int i = 0; i < d.layers; ++i) {
         const std::string p = std::to_string(i) + ".";
         DflyLayer l;
-        l.q_a = bf(p + "self_attn.q_a_proj.weight");
-        l.q_b = bf(p + "self_attn.q_b_proj.weight");
-        l.kv_a = bf(p + "self_attn.kv_a_proj_with_mqa.weight");
+        l.q_a = q(p + "self_attn.q_a_proj.weight");
+        l.q_b = q(p + "self_attn.q_b_proj.weight");
+        l.kv_a = q(p + "self_attn.kv_a_proj_with_mqa.weight");
         l.kv_b = bf(p + "self_attn.kv_b_proj.weight");
-        l.gate = bf(p + "self_attn.linear_gate.weight");
-        l.o = bf(p + "self_attn.o_proj.weight");
-        l.mlp_gate = bf(p + "mlp.gate_proj.weight");
-        l.mlp_up = bf(p + "mlp.up_proj.weight");
-        l.mlp_down = bf(p + "mlp.down_proj.weight");
+        l.gate = q(p + "self_attn.linear_gate.weight");
+        l.o = q(p + "self_attn.o_proj.weight");
+        l.mlp_gate = q(p + "mlp.gate_proj.weight");
+        l.mlp_up = q(p + "mlp.up_proj.weight");
+        l.mlp_down = q(p + "mlp.down_proj.weight");
         l.in_ln = f(p + "input_layernorm.weight");
         l.q_a_ln = f(p + "self_attn.q_a_layernorm.weight");
         l.kv_a_ln = f(p + "self_attn.kv_a_layernorm.weight");
@@ -64,10 +70,10 @@ bool DflyWeights::allocate(const DflyDims& d, std::string& err) {
         l.sink = f(p + "self_attn.learnable_sink_param");
         layer.push_back(l);
     }
-    eh_proj = bf("mtp_fusion.eh_proj.weight");
-    hc_gate = bf("hidden_correction.gate_proj.weight");
-    hc_up = bf("hidden_correction.up_proj.weight");
-    hc_down = bf("hidden_correction.down_proj.weight");
+    eh_proj = q("mtp_fusion.eh_proj.weight");
+    hc_gate = q("hidden_correction.gate_proj.weight");
+    hc_up = q("hidden_correction.up_proj.weight");
+    hc_down = q("hidden_correction.down_proj.weight");
     enorm = f("mtp_fusion.enorm.weight");
     hnorm = f("mtp_fusion.hnorm.weight");
     fuse_gate = f("mtp_fusion.gate");
@@ -117,10 +123,10 @@ model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int d
         it.bytes = t.bytes;
         it.dev = w->slot(s.name);
         it.device = device;
-        it.conv = s.f32 ? core::Conv::Bf16ToF32 : core::Conv::Copy;
+        it.conv = s.f32 ? core::Conv::Bf16ToF32 : s.q8 ? core::Conv::Bf16ToQ8_0 : core::Conv::Copy;
         reads.add(it);
     }
-    basalt::log::info("basalt hy4flash", "drafter: %d layers reading target layers %d..%d, %.2f GiB on the GPU (BF16)", d.layers,
+    basalt::log::info("basalt hy4flash", "drafter: %d layers reading target layers %d..%d, %.2f GiB on the GPU (Q8_0 projections)", d.layers,
                       d.kv_layers.front(), d.kv_layers.back(), (double) w->bytes() / (double) (1ull << 30));
     out = std::move(w);
     return {};
@@ -224,10 +230,13 @@ struct DflyRunner::Impl {
         return (float*) p;
     }
 
-    // y[r] = W x[r] for `rows` rows, W BF16 [n_out][n_in]
-    void mm(const uint16_t* wt, const float* x, int ldx, float* y, int ldy, int n_in, int n_out, int rows, void* st) {
-        bk::bf16_gemv_fp32_mmvf_multi(x, ldx, wt, y, ldy, n_in, n_out, rows, st);
+    // y[r] = W x[r] for `rows` (at most a block's) packed rows, W Q8_0 [n_out][n_in]: the rows in q8_1, then MMVQ
+    void mm(const void* wt, const float* x, int ldx, float* y, int ldy, int n_in, int n_out, int rows, void* st) {
+        if (ldx != n_in || ldy != n_out || rows > kDflyBlock) throw std::logic_error("dfly: a projection's rows are not packed");
+        bk::native_quantize_q8_1(x, act_q8, n_in, rows, st);
+        bk::native_mmvq(8, wt, act_q8, y, n_in, n_out, rows, st);
     }
+    void* act_q8 = nullptr;   // a projection's input rows in q8_1
 };
 
 std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err) {
@@ -255,6 +264,8 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
     p.cat = p.dev(2 * E, ok); p.fused = p.dev(E, ok); p.emb0 = p.dev(E, ok); p.pe = p.dev(E, ok);
     p.hg = p.dev(d.hc_ffn, ok); p.hu = p.dev(d.hc_ffn, ok); p.hh = p.dev(d.hc_ffn, ok); p.hd = p.dev(E, ok); p.hcout = p.dev(E, ok);
     p.logits = p.dev(d.vocab, ok); p.craw = p.dev(1, ok);
+    const int widest_in = std::max({2 * d.E, d.q_lora, d.heads * (int) kDflyV, d.ffn, d.hc_ffn});
+    p.act_q8 = p.dev(bk::native_q8_1_bytes(widest_in, kDflyBlock) / 4 + 1, ok);
     p.pick = (int32_t*) p.dev(1, ok);
     p.h_emb = p.host(R * E, ok); p.h_pe = p.host(E, ok); p.h_conf = p.host(1, ok);
     p.h_tok = (int32_t*) p.host(1, ok);

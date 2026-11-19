@@ -2,6 +2,8 @@
 // from the equations of docs/models/hy4-flash/dfly2.md: the four kernels, the tap, and the whole block pass with the
 // sequential heads on small random weights (E = 256, two layers, two heads, a 300-token vocabulary) over random "target"
 // caches and selections. Synthetic: no model, no checkpoint.
+#include "basalt/core/loader.hpp"
+#include "basalt/kernels/f16_bits.hpp"
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
 #include "models/hy4flash/dfly.hpp"
@@ -50,6 +52,7 @@ struct Mat {
     std::vector<uint16_t> bits;
     std::vector<float> v;   // the rounded values
     uint64_t rows = 0, cols = 0;
+    std::vector<uint8_t> q8;   // a projection the drafter keeps in Q8_0: its blocks (the reference's product is then MMVQ's)
 };
 Mat rand_mat(uint64_t rows, uint64_t cols, float sd) {
     Mat m;
@@ -240,10 +243,39 @@ struct Ref {
     const Mat& head;
 
     std::vector<double> mv(const Mat& w, const std::vector<double>& x) const {
+        if (!w.q8.empty()) return mvq(w, x);
         std::vector<double> y(w.rows);
         for (uint64_t r = 0; r < w.rows; ++r) {
             double s = 0;
             for (uint64_t c = 0; c < w.cols; ++c) s += (double) w.v[r * w.cols + c] * x[c];
+            y[r] = s;
+        }
+        return y;
+    }
+    // a Q8_0 product as MMVQ makes it: x in q8_1 blocks (q = round(x / d), d = amax / 127 kept as fp16), integer dots
+    // per block, scaled by both blocks' fp16 d
+    std::vector<double> mvq(const Mat& w, const std::vector<double>& x) const {
+        const uint64_t nb = w.cols / 32;
+        std::vector<int> qx(w.cols);
+        std::vector<double> dx(nb);
+        for (uint64_t b = 0; b < nb; ++b) {
+            float amax = 0.f;
+            for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs((float) x[b * 32 + i]));
+            const float d = amax / 127.f;
+            for (int i = 0; i < 32; ++i) qx[b * 32 + i] = amax == 0.f ? 0 : (int) std::round((float) x[b * 32 + i] / d);
+            dx[b] = basalt::kernels::f32_from_f16(basalt::kernels::f16_from_f32(d));
+        }
+        std::vector<double> y(w.rows);
+        for (uint64_t r = 0; r < w.rows; ++r) {
+            double s = 0;
+            for (uint64_t b = 0; b < nb; ++b) {
+                const uint8_t* blk = w.q8.data() + (r * nb + b) * 34;
+                uint16_t dh;
+                std::memcpy(&dh, blk, 2);
+                int dot = 0;
+                for (int i = 0; i < 32; ++i) dot += (int) (int8_t) blk[2 + i] * qx[b * 32 + i];
+                s += (double) basalt::kernels::f32_from_f16(dh) * dx[b] * dot;
+            }
             y[r] = s;
         }
         return y;
@@ -289,7 +321,13 @@ void test_block() {
             rf[s.name] = v;
         } else {
             Mat mat = rand_mat(s.shape[0], s.shape[1], 1.0f / std::sqrt((float) s.shape[1]));
-            cudaMemcpy(w.slot(s.name), mat.bits.data(), mat.bits.size() * 2, cudaMemcpyHostToDevice);
+            if (s.q8) {   // what the loader makes of it (core::Conv::Bf16ToQ8_0)
+                mat.q8.resize(s.bytes());
+                basalt::core::quantize_bf16_q8_0(mat.bits.data(), mat.bits.size(), mat.q8.data());
+                cudaMemcpy(w.slot(s.name), mat.q8.data(), mat.q8.size(), cudaMemcpyHostToDevice);
+            } else {
+                cudaMemcpy(w.slot(s.name), mat.bits.data(), mat.bits.size() * 2, cudaMemcpyHostToDevice);
+            }
             rm[s.name] = std::move(mat);
         }
     }
@@ -324,18 +362,20 @@ void test_block() {
     env.sel_cap = sel_cap;
     env.embed = [&](int32_t t, float* o) { std::memcpy(o, embed.data() + (size_t) t * E, (size_t) E * 4); return t >= 0 && t < d.vocab; };
     auto run = DflyRunner::create(env, err);
+    cudaStream_t st = nullptr;   // the block pass's MMVQ runs on an explicit stream, as the session's does
+    CHECK(cudaStreamCreate(&st) == cudaSuccess);
     CHECK(run != nullptr);
     if (!run) return;
 
     for (int n : {1, 3, 5}) {
         const int32_t anchor = 17;
         std::vector<const void*> caches = {dcache[0], dcache[1]};
-        const bool began = run->begin(anchor, pos, n, *tap, 0, caches.data(), nullptr, err);
+        const bool began = run->begin(anchor, pos, n, *tap, 0, caches.data(), st, err);
         if (!began) std::printf("begin: %s\n", err.c_str());
         CHECK(began);
         int32_t ids[5];
         float conf[5];
-        CHECK(run->finish(ids, conf, nullptr, err));
+        CHECK(run->finish(ids, conf, st, err));
 
         // the reference: the same equations in double
         const int R = n + 1;
@@ -465,6 +505,7 @@ void test_block() {
         CHECK(worst_conf < 2e-3);
         CHECK(checked >= n - 1);
     }
+    cudaStreamDestroy(st);
     cudaDeviceSynchronize();
     CHECK(cudaGetLastError() == cudaSuccess);
 }
