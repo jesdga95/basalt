@@ -69,6 +69,10 @@ struct ExpertTierSpec {
     /// Copies (bus fetches and promotions) a window may claim per row; 0: 128 a window whatever its rows, the way the first
     /// model ran them. A window's rows route to mostly different experts, so a per-row budget keeps their admissions.
     int claims_per_row = 0;
+    /// The main card's copies per layer in these proportions (one weight per layer; core::policy::layer_slots spreads the
+    /// same total), for a model whose layers miss at different rates. Empty: every layer the same, the way the first model
+    /// ran them. Main card homes are always the same in every layer.
+    std::vector<float> layer_weights;
     /// The prompt path's host buffers, which are allocated before the RAM tier is sized beside them. Each is optional.
     struct Host {
         std::function<bool(std::string&)> open;                 ///< before the RAM tier is sized
@@ -213,7 +217,7 @@ public:
     const kernels::cpu::NativeFmt& fmt(int layer) const { return fmt_[(size_t) layer]; }
 
     /// The VRAM slots open now, every layer's.
-    int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
+    int64_t slots() const { return base_slots() + (int64_t) n_layers_ * ext_per_layer_; }
 
     void report(const char* tag) const;
     /// The routed experts so far: hits of the main card's slots, those plus the CPU's, a bus copy's or the second card's.
@@ -268,14 +272,15 @@ private:
     void fill_share_rates();
     int ranked(int layer, int r) const;
     bool load_rank(std::string& err);
-    void seed_copies(int64_t n);
+    /// `n` copies in each layer, or with `base_shares` each layer's base arena share (base_n).
+    void seed_copies(int64_t n, bool base_shares = false);
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
     /// Gives the file experts of `ids` the RAM places of the layer's least recently used pinned experts outside `ids`
     /// and starts reading them there; `reading[i]` marks those of `ids`.
     bool read_misses(int layer, const int32_t* ids, int k, bool* reading, std::string& err);
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;
-    uint64_t slot_total() const { return (uint64_t) n_layers_ * (uint64_t) (per_layer_ + ext_per_layer_); }
+    uint64_t slot_total() const { return (uint64_t) slots(); }
     /// Copies (layer, e) from `src` into the least recently used free slot of the layer; the slot, or -1. With `homes_too`
     /// that slot may be a home's, when the layer has a free RAM place for it. `whole`: one copy, for a layer that waits
     /// on it; else pieces, which let a waited copy pass. With `later` the pieces wait in the queue for pump.
@@ -290,7 +295,12 @@ private:
     const ExpertTierSpec s_;
     core::ExpertCache cache_;
     int n_layers_ = 0, n_expert_ = 0;
-    int64_t per_layer_ = 0;                 ///< VRAM slots each layer owns in the base arena
+    int64_t per_layer_ = 0;                 ///< VRAM slots per layer in the base arena (their mean, with layer_weights)
+    std::vector<int64_t> base_lo_;          ///< [layer] its first base arena slot; [n_layers] the arena's size
+    /// The base arena's layout for `per_layer` slots a layer on average: the layers' shares (set_base), each layer's, all.
+    void set_base(int64_t per_layer);
+    int64_t base_n(int layer) const { return base_lo_[(size_t) layer + 1] - base_lo_[(size_t) layer]; }
+    int64_t base_slots() const { return base_lo_.empty() ? 0 : base_lo_.back(); }
     core::ExpertCache ext_;                 ///< slots beside the base arena, open only while no prompt workspace is
     int64_t ext_per_layer_ = 0;             ///< slots each layer owns in `ext_`
     bool ram_queued_ = false;               ///< the RAM tier's reads are in the start's pass
