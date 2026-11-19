@@ -1648,20 +1648,38 @@ private:
         return true;
     }
 
-    // Backs the sparse layers' caches for `positions` positions, in steps of kGrowPositions.
+    // Backs the sparse layers' caches for `positions` positions, in steps of kGrowPositions. When the card is full (a long
+    // generation past the prompt, the expert tier holding the rest), the tier gives back its spare slots and the mapping is
+    // tried again, then lends all its slots and takes back what is left once the caches have grown (as DeepSeek's caches do).
     bool ensure_positions(int64_t positions, std::string& err) {
         if (positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kGrowPositions - 1) / kGrowPositions * kGrowPositions);
-        for (int l = 0; l < g_.n_layers; ++l) {
-            if (g_.swa[(size_t) l]) continue;
-            if (!ea_[(size_t) l]->ensure((uint64_t) target * sparse_row_bytes(), 256ull << 20, err) ||
-                !pea_[(size_t) l]->ensure((uint64_t) (target / g_.idx_pool + 1) * g_.idx_dim * 2, 256ull << 20, err)) {
-                err = "the latent caches cannot grow to " + std::to_string(target) + " positions: " + err;
+        const uint64_t keep = tier_ ? tier_->free_floor() : 256ull << 20;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            std::string e;
+            bool ok = true;
+            for (int l = 0; ok && l < g_.n_layers; ++l) {
+                if (g_.swa[(size_t) l]) continue;
+                ok = ea_[(size_t) l]->ensure((uint64_t) target * sparse_row_bytes(), keep, e) &&
+                     pea_[(size_t) l]->ensure((uint64_t) (target / g_.idx_pool + 1) * g_.idx_dim * 2, keep, e);
+            }
+            if (ok) {
+                backed_ = target;
+                if (attempt == 2 && !big_.rows) {   // lent here, outside a prompt (which takes its slots back at its end)
+                    std::string r;
+                    if (!tier_->reclaim(r)) basalt::log::warn("basalt hy4flash", "the latent caches took expert slots at %lld positions: %s", (long long) target, r.c_str());
+                }
+                return true;
+            }
+            if (!tier_ || attempt == 2) {
+                err = "the latent caches cannot grow to " + std::to_string(target) + " positions: " + e + "; a smaller --max-context leaves more for the expert tier";
                 return false;
             }
+            cudaStreamSynchronize(stream_);
+            if (attempt == 0) tier_->shrink();
+            else tier_->lend_all();
         }
-        backed_ = target;
-        return true;
+        return false;
     }
 
     // [vision] The rotary positions of the R cells about to be filled (text, or the rows of the picture block being fed), kept per
