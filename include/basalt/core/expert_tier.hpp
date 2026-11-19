@@ -73,6 +73,9 @@ struct ExpertTierSpec {
     /// same total), for a model whose layers miss at different rates. Empty: every layer the same, the way the first model
     /// ran them. Main card homes are always the same in every layer.
     std::vector<float> layer_weights;
+    /// Bytes of each segment the base arena of copies is mapped in, so a prompt or the caches can borrow part of it
+    /// (ExpertTier::lend) and the rest keep their experts; 0: one allocation, which only lend_all gives up.
+    uint64_t lend_segment = 0;
     /// The prompt path's host buffers, which are allocated before the RAM tier is sized beside them. Each is optional.
     struct Host {
         std::function<bool(std::string&)> open;                 ///< before the RAM tier is sized
@@ -140,6 +143,13 @@ public:
     /// any more). Homes stay.
     void lend_all();
     bool reclaim(std::string& err);
+    /// Whether lend() can give up part of the base arena (ExpertTierSpec::lend_segment, copies, a segmented arena).
+    bool partial_lend() const { return !live_.empty(); }
+    /// Leaves `bytes` device bytes free above the floor by giving up the fewest slots: the ones beside the base arena,
+    /// then each layer's last base slots in proportion to its share (the arena's tail holds every layer's last ones).
+    /// First the most recently used experts of each layer move into the slots it keeps. False, with nothing given up,
+    /// when all of them would not free that much (or without partial_lend). reclaim() maps them again, empty.
+    bool lend(uint64_t bytes);
     /// An explicit new --vram-reserve-mib (`mib` < 0: the start's): the one time the size is planned again after the
     /// start. The slots that fit above the new reserve are opened; the response reports them.
     bool replan(int64_t mib, std::string& err);
@@ -217,7 +227,7 @@ public:
     const kernels::cpu::NativeFmt& fmt(int layer) const { return fmt_[(size_t) layer]; }
 
     /// The VRAM slots open now, every layer's.
-    int64_t slots() const { return base_slots() + (int64_t) n_layers_ * ext_per_layer_; }
+    int64_t slots() const { return live_base() + (int64_t) n_layers_ * ext_per_layer_; }
 
     void report(const char* tag) const;
     /// The routed experts so far: hits of the main card's slots, those plus the CPU's, a bus copy's or the second card's.
@@ -280,7 +290,7 @@ private:
     bool read_misses(int layer, const int32_t* ids, int k, bool* reading, std::string& err);
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;
-    uint64_t slot_total() const { return (uint64_t) slots(); }
+    uint64_t slot_total() const { return (uint64_t) (base_slots() + (int64_t) n_layers_ * ext_per_layer_); }   ///< slot numbers in use
     /// Copies (layer, e) from `src` into the least recently used free slot of the layer; the slot, or -1. With `homes_too`
     /// that slot may be a home's, when the layer has a free RAM place for it. `whole`: one copy, for a layer that waits
     /// on it; else pieces, which let a waited copy pass. With `later` the pieces wait in the queue for pump.
@@ -301,6 +311,18 @@ private:
     void set_base(int64_t per_layer);
     int64_t base_n(int layer) const { return base_lo_[(size_t) layer + 1] - base_lo_[(size_t) layer]; }
     int64_t base_slots() const { return base_lo_.empty() ? 0 : base_lo_.back(); }
+    /// Opens the base arena for `per_layer` slots a layer on average (set_base), segmented with ExpertTierSpec::lend_segment.
+    bool open_base(int64_t per_layer, std::string& err);
+    /// With a segmented arena: [base slot] its place in the arena, each layer's k-th slot at depth (k + 1/2) / base_n, so
+    /// cutting the arena's tail leaves every layer a prefix of its slots in proportion to its share. Empty: the slot's own.
+    std::vector<int32_t> phys_;
+    /// With a segmented arena: [layer] its base slots mapped now (a prefix); empty without one (all of base_n).
+    std::vector<int64_t> live_;
+    int64_t live_n(int layer) const { return live_.empty() ? base_n(layer) : live_[(size_t) layer]; }
+    int64_t live_base() const;
+    void count_live();
+    /// Moves the most recently used experts of each layer into its first keep[layer] base slots and clears the rest.
+    void keep_hottest(const std::vector<int64_t>& keep);
     core::ExpertCache ext_;                 ///< slots beside the base arena, open only while no prompt workspace is
     int64_t ext_per_layer_ = 0;             ///< slots each layer owns in `ext_`
     bool ram_queued_ = false;               ///< the RAM tier's reads are in the start's pass

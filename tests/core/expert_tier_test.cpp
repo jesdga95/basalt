@@ -209,6 +209,124 @@ int main() {
         CHECK(checked == kLayers * kSlots);
         cudaFreeHost(h_rows);
     }
+    // a bounded lend (ExpertTierSpec::lend_segment) with copies weighted by layer: half the arena goes, every layer keeps a
+    // prefix of its slots in proportion to its share and its most recently used experts, every slot it says it holds has
+    // the pack's bytes, and reclaim maps the slots again
+    {
+        core::ExpertTierSpec spec;
+        spec.area = "basalt test";
+        spec.name = "test";
+        spec.n_layers = kLayers;
+        spec.n_expert = kExperts;
+        spec.top_k = 1;
+        spec.n_embd = kDim;
+        spec.n_ff = kDim;
+        for (int l = 0; l < kLayers; ++l) spec.layers.push_back({kQ4K, kQ4K, (uint64_t) l * kExperts * blob, blob, 0.f});
+        spec.path = path;
+        spec.fd = fd;
+        spec.range = core::FileRange(path, 0, data.size());
+        spec.diag_tier_ram = kExperts;
+        spec.diag_tier_vram = 24;
+        spec.admit_uses = 1;
+        spec.layer_weights = {1.5f, 1.f, 0.5f};
+        spec.lend_segment = 2ull << 20;
+        core::ExpertTier tier(spec);
+        float* h_rows = nullptr;
+        CHECK(cudaHostAlloc((void**) &h_rows, 128 * kDim * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess);
+        core::LoadPlan plan;
+        std::string err;
+        core::ExpertTier::Reserve reserve;
+        bool ok = tier.open(reserve, h_rows, plan, err);
+        if (ok) {
+            core::Loader loader;
+            ok = loader.run(plan, err) && tier.attach(err);
+        }
+        if (!ok) std::fprintf(stderr, "bounded lend: %s\n", err.c_str());
+        CHECK(ok);
+        CHECK(tier.partial_lend());
+        auto held = [&](int l) {
+            int n = 0;
+            for (int e = 0; e < kExperts; ++e) n += tier.locate(l, e).dev != nullptr;
+            return n;
+        };
+        auto bytes_right = [&] {
+            std::vector<uint8_t> back(blob);
+            bool good = true;
+            for (int l = 0; l < kLayers; ++l)
+                for (int e = 0; e < kExperts; ++e) {
+                    const core::ExpertTier::Source src = tier.locate(l, e);
+                    if (!src.dev) continue;
+                    good = good && cudaMemcpy(back.data(), src.dev, blob, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                           std::memcmp(back.data(), data.data() + ((size_t) l * kExperts + (size_t) e) * blob, blob) == 0;
+                }
+            return good;
+        };
+        Lcg r{4321};
+        int32_t last[kLayers][4] = {};
+        auto run = [&](int tokens) {
+            for (int t = 0; t < tokens; ++t) {
+                tier.begin_token(1);
+                for (int l = 0; l < kLayers; ++l) {
+                    const int32_t id = (int32_t) (r.next() % kExperts);   // uniform: the slots churn
+                    last[l][t % 4] = id;
+                    core::ExpertTier::Lookup lk;
+                    CHECK(tier.lookup(l, &id, 1, lk, err));
+                    tier.promote(l, lk);
+                    tier.pump(-1, core::ExpertTier::kAllPieces);
+                }
+            }
+            tier.settle();
+        };
+        if (ok) {
+            run(400);
+            const int64_t full = tier.slots();
+            int before[kLayers];
+            for (int l = 0; l < kLayers; ++l) before[l] = held(l);
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            const uint64_t arena = (uint64_t) full * blob;
+            CHECK(tier.lend((uint64_t) free_b - tier.free_floor() + arena / 2));
+            const int64_t kept = tier.slots();
+            std::printf("expert_tier_test: bounded lend keeps %lld of %lld slots (by layer %d/%d, %d/%d, %d/%d)\n", (long long) kept,
+                        (long long) full, held(0), before[0], held(1), before[1], held(2), before[2]);
+            CHECK(kept < full && kept > 0);
+            for (int l = 0; l < kLayers; ++l) {
+                CHECK(held(l) > 0 && held(l) < before[l]);
+                // a layer keeps about its share of what stays (the arena's tail holds every layer's last slots)
+                const double share = (double) held(l) / before[l], all = (double) kept / full;
+                CHECK(share > all - 0.2 && share < all + 0.2);
+                // its last expert stays (the most recently used)
+                CHECK(tier.locate(l, last[l][3]).dev != nullptr);
+            }
+            CHECK(bytes_right());
+            run(200);   // the kept slots keep working
+            CHECK(bytes_right());
+            CHECK(tier.slots() == kept);
+            CHECK(tier.reclaim(err));
+            CHECK(tier.slots() == full);
+            run(400);
+            CHECK(bytes_right());
+            for (int l = 0; l < kLayers; ++l) CHECK(held(l) == before[l]);
+            // a lend that the arena cannot cover gives nothing up
+            cudaMemGetInfo(&free_b, &total_b);
+            CHECK(!tier.lend((uint64_t) free_b - tier.free_floor() + 4 * arena));
+            CHECK(tier.slots() == full);
+            // a part lent, then all of it (a prompt that needs more): reclaim opens the whole arena, which lends in parts again
+            cudaMemGetInfo(&free_b, &total_b);
+            CHECK(tier.lend((uint64_t) free_b - tier.free_floor() + arena / 2));
+            tier.lend_all();
+            CHECK(tier.slots() == 0 && !tier.partial_lend());
+            CHECK(tier.reclaim(err));
+            CHECK(tier.slots() == full && tier.partial_lend());
+            run(400);
+            CHECK(bytes_right());
+            cudaMemGetInfo(&free_b, &total_b);
+            CHECK(tier.lend((uint64_t) free_b - tier.free_floor() + arena / 2));
+            CHECK(tier.slots() > 0 && tier.slots() < full);
+            CHECK(bytes_right());
+        }
+        cudaFreeHost(h_rows);
+    }
     // a second card holding homes of its own: a lookup of one of them is a second card hit, and its slots hold the pack's bytes
     if (n_dev >= 2) {
         core::ExpertTierSpec spec;

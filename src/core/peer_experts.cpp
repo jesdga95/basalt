@@ -26,7 +26,7 @@ bool peer_portable() { return g_peer_portable; }
 
 namespace {
 
-constexpr int64_t CAP = basalt::kernels::cpu::MAXT * 16;   // entries per layer: MAXT tokens x top-16 (Hy4-flash)
+constexpr int64_t CAP = basalt::kernels::cpu::MAXT * 16;   // entries per layer: MAXT tokens x up to 16 routed experts
 
 struct Meta {                           // one block, uploaded with one copy per layer
     unsigned long long ptr[CAP];
