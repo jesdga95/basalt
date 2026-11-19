@@ -1199,6 +1199,7 @@ class Service:
             opening, force = parser.feed(self.dialect.nothink_lead + force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
+        prompt_ms0 = None                               # the first engine run's prompt read time
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (--debug)
         emb = getattr(self.embeddings, "path", None)
@@ -1429,6 +1430,7 @@ class Service:
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
+                            prompt_ms0 = run_last.get("prompt_ms")    # the prompt is read in that run only
                         if drained and capped and not wrap and n - n_pass0 >= cap and n < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and thought >= budget and not parser.buf and not detok.pending():
                                 wrap = True             # the budget's last token: close the thinking
@@ -1505,6 +1507,8 @@ class Service:
                                 if getattr(self.engine, "last", None) is not engine_last0 else {}
                             if reused0 is not None and last.get("reused") is not None:
                                 last["reused"] = reused0
+                                if prompt_ms0 is not None:
+                                    last["prompt_ms"] = prompt_ms0
                             started = st.get("started", time.time())
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                             # experts read over PCIe or computed elsewhere are not in the hit rate's lookups
