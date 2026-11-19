@@ -1199,6 +1199,7 @@ class Service:
             opening, force = parser.feed(self.dialect.nothink_lead + force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
+        passes_done = []                                # each engine pass's DONE figures (a budget makes several)
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (--debug)
         emb = getattr(self.embeddings, "path", None)
@@ -1272,11 +1273,12 @@ class Service:
                     # answer now stops an engine that takes `stop_soon` at its own pace (see the pass below)
                     soft_stops = live is not None and "stop_soon" in inspect.signature(self.engine.generate).parameters
                     closed_early = False                # the thinking was already closed once
+                    first_cap = None                    # the first pass's cap (a budget can make it smaller than max_new)
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
                     for ev in opening:
                         yield "event", ev
                     while True:
-                        if isinstance(ids, PromptText) and ids.max_new:
+                        if isinstance(ids, PromptText) and ids.max_new and (first_cap is None or ids.max_new < first_cap):
                             max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
                         # answer now stops the engine at its own pace: the tokens it still writes are kept, so the
                         # next pass extends exactly what it holds and reads only the close
@@ -1292,6 +1294,8 @@ class Service:
                         capped = bool(budget) and parser.state == "reasoning" and budget - thought < cap
                         if capped:
                             cap = max(1, budget - thought)
+                        if first_cap is None:
+                            first_cap = cap             # what the first pass asks for; the engine settles THIS for a text prompt
                         gen = self.engine.generate(prompt, cap, sampling, cancel, embeddings=emb,
                                                    session=session, **more) if emb \
                             else self.engine.generate(prompt, cap, sampling, cancel, session=session, **more)
@@ -1308,7 +1312,8 @@ class Service:
                             last_out = time.monotonic()
                             for t in gen:
                                 # The engine settles a text prompt's output cap before its first token.
-                                if isinstance(ids, PromptText) and ids.max_new:
+                                # a settled cap equal to a budget-capped first pass is the budget, not the reply's room
+                                if isinstance(ids, PromptText) and ids.max_new and (first_cap is None or ids.max_new < first_cap):
                                     max_new = ids.max_new
                                 if thinking and not budget_ready and (not isinstance(ids, PromptText) or ids.n is not None):
                                     budget = self.answer_budget(budget_req, max_new, budget)
@@ -1414,6 +1419,9 @@ class Service:
                                 if not leaving and not cancel.is_set():
                                     raise
                         run_last = getattr(self.engine, "last", None)
+                        if isinstance(run_last, dict) and run_last is not engine_last0 \
+                                and not any(x is run_last for x in passes_done):
+                            passes_done.append(run_last)
                         with self.status_lock:
                             st["run_windows"] = st["run_tokens"] = 0
                             if isinstance(run_last, dict) and run_last is not counted_last and run_last.get("windows"):
@@ -1505,6 +1513,10 @@ class Service:
                                 if getattr(self.engine, "last", None) is not engine_last0 else {}
                             if reused0 is not None and last.get("reused") is not None:
                                 last["reused"] = reused0
+                            if last and len(passes_done) > 1:   # several passes: read = the first, writing = all
+                                last["prompt_ms"] = passes_done[0].get("prompt_ms", last.get("prompt_ms"))
+                                last["decode_ms"] = sum(float(x.get("decode_ms") or 0) for x in passes_done)
+                                last["generated"] = sum(int(x.get("generated") or 0) for x in passes_done)
                             started = st.get("started", time.time())
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                             # experts read over PCIe or computed elsewhere are not in the hit rate's lookups
