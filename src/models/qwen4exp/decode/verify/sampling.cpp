@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "expert_plan.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
@@ -164,7 +165,7 @@ bool Verifier::copy_logits(int t, float* host) const {
     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
     if (head_screened_ && (!head_exact_again() || cudaStreamSynchronize(cs_) != cudaSuccess)) return false;
-    return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
+    return basalt::core::device_copy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 

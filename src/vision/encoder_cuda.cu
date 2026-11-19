@@ -1,5 +1,6 @@
 // src/vision/encoder_cuda.cu - see basalt/vision/encoder_cuda.hpp.
 #include "basalt/vision/encoder_cuda.hpp"
+#include "basalt/core/device_memory.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -296,10 +297,10 @@ struct CudaEncoder::Impl {
             if (!tap) return true;
             CK(cudaStreamSynchronize(stream));
             std::vector<float> h(count);
-            if (!bf) CK(cudaMemcpy(h.data(), dev, count * 4, cudaMemcpyDeviceToHost));
+            if (!bf) CK(basalt::core::device_copy(h.data(), dev, count * 4, cudaMemcpyDeviceToHost));
             else {
                 std::vector<__nv_bfloat16> b(count);
-                CK(cudaMemcpy(b.data(), dev, count * 2, cudaMemcpyDeviceToHost));
+                CK(basalt::core::device_copy(b.data(), dev, count * 2, cudaMemcpyDeviceToHost));
                 for (size_t i = 0; i < count; ++i) h[i] = __bfloat162float(b[i]);
             }
             tap(name, h.data(), count);

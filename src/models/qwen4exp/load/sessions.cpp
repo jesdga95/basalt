@@ -120,7 +120,7 @@ int sessions(Context& context) {
         // kernel its stage runs - set before any of its graphs is captured
         if (o.vision) {
             if (cudaMalloc(&st.mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
-                cudaMemcpy(st.mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
+                basalt::core::device_copy(st.mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                     cudaSuccess) {
                 basalt::log::error("basalt generate", "layer split, CUDA%d: the image position table failed", st.dev);
                 return 1;

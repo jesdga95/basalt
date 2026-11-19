@@ -477,7 +477,7 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
+    const cudaError_t e = basalt::core::device_copy(dst, host_blob, n, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
         return false;
@@ -523,7 +523,7 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
     // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
     // comparison meaningful.
     std::vector<uint8_t> got((size_t) nb);
-    const cudaError_t e = cudaMemcpy(got.data(), src, (size_t) nb, cudaMemcpyDeviceToHost);
+    const cudaError_t e = basalt::core::device_copy(got.data(), src, (size_t) nb, cudaMemcpyDeviceToHost);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::verify_slot: ") + cudaGetErrorString(e);
         return false;

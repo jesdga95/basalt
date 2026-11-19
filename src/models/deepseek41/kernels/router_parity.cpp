@@ -2,6 +2,7 @@
 // reference, independence from the window width and position, tie order, a microbench, and (with --fixture DIR)
 // real layers against the per-layer fixtures.
 #include "basalt/models/deepseek41/kernels.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "test_util.hpp"
 
 #include <algorithm>
@@ -179,7 +180,7 @@ int main(int argc, char** argv) {
         std::vector<float*> gates(kCopies);
         for (auto& g : gates) {
             check(cudaMalloc(&g, (size_t) NE * ND * 4), "cudaMalloc");
-            check(cudaMemcpy(g, gate.p, (size_t) NE * ND * 4, cudaMemcpyDeviceToDevice), "copy");
+            check(basalt::core::device_copy(g, gate.p, (size_t) NE * ND * 4, cudaMemcpyDeviceToDevice), "copy");
         }
         for (int T : {1, 4}) {
             Dev<float> dx(std::vector<float>(x_h.begin(), x_h.begin() + (size_t) T * ND)), dl((size_t) T * NE), dw((size_t) T * K);

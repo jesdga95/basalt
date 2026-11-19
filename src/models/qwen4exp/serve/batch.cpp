@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/batch.cpp - batch operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "basalt/protocol.hpp"
 #include "qfn_state.hpp"
 #include "../../../program/serve/logprobs.hpp"
@@ -174,7 +175,7 @@ bool QfnRuntime::batch_step() {
                                           hist_stage.data() + (size_t) r0s[sg] * (size_t) pen_h);
         }
         const basalt::core::OnDevice on_h(hist_dev);
-        if (cudaMemcpy(d_hist, hist_stage.data(), (size_t) R * (size_t) pen_h * sizeof(int32_t),
+        if (basalt::core::device_copy(d_hist, hist_stage.data(), (size_t) R * (size_t) pen_h * sizeof(int32_t),
                        cudaMemcpyHostToDevice) != cudaSuccess) {
             std::printf("ERR batch: the penalty histories could not be staged\n");
             return false;

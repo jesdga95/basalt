@@ -270,7 +270,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         std::vector<int32_t> id((size_t) (T * (uint64_t) cap_));
         for (uint64_t t = 0; t < T; ++t)
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
-        cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
     }
     const int prio = 0;
     if (cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio) != cudaSuccess) { err = "mtp: stream"; return false; }

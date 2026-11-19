@@ -2,6 +2,7 @@
 //
 // Lifted out of `main()` unchanged: same reads, same headers, same report lines, same log text.
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "dump_set.hpp"
 
 #include "basalt/models/qwen4exp/decode/layout.hpp"     // ModelGeometry
@@ -23,7 +24,7 @@ int write_host_dumps(const HostDumpContext& c, std::string& err) {
 
     if (!o.dump_mixed.empty()) {
         std::vector<float> mx((size_t) g.n_embd);
-        if (cudaMemcpy(mx.data(), ss.block.mixed, mx.size() * sizeof(float), cudaMemcpyDeviceToHost) !=
+        if (basalt::core::device_copy(mx.data(), ss.block.mixed, mx.size() * sizeof(float), cudaMemcpyDeviceToHost) !=
             cudaSuccess) {
             basalt::log::error("basalt generate", "reading mixed back failed");
             return 1;
@@ -44,7 +45,7 @@ int write_host_dumps(const HostDumpContext& c, std::string& err) {
     // ---- the residual, for bisecting the head against the layers (see `dump_residual`'s note)
     if (!o.dump_residual.empty()) {
         std::vector<float> R((size_t) g.hc * g.n_embd);
-        if (cudaMemcpy(R.data(), ss.R, R.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (basalt::core::device_copy(R.data(), ss.R, R.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
             basalt::log::error("basalt generate", "reading R back failed");
             return 1;
         }

@@ -128,7 +128,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             }
             rows_mapped_ = mapped;
             if (mapped) {
-                cudaMemcpy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
                 vram_ += map.size() * 4;
                 basalt::log::info("basalt mtp", "draft head over %lld tokens (rows read from the main head)",
                              (long long) n_dvocab_);
@@ -136,11 +136,11 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 // unused context rows read the first row's weights for the gather, then take their id -1
                 std::vector<int32_t> gmap = map;
                 for (int32_t& v : gmap) if (v < 0) v = ids[0];
-                cudaMemcpy(dvocab_, gmap.data(), gmap.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(dvocab_, gmap.data(), gmap.size() * 4, cudaMemcpyHostToDevice);
                 basalt::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_,
                                              nullptr);
                 cudaDeviceSynchronize();
-                cudaMemcpy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
                 vram_ += (uint64_t) (n_dvocab_ * row_bytes) + map.size() * 4 + (uint64_t) n_xcap_ * 4;
                 basalt::log::info("basalt mtp", "draft head over %lld tokens (%.1f MiB)", (long long) n_dvocab_,
                              (double) (n_dvocab_ * row_bytes) / 1048576.0);

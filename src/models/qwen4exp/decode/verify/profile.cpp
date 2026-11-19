@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/models/qwen4exp/decode/gdn_head_split.hpp"
@@ -250,7 +251,7 @@ std::string DecodeEvents::report() {
 
 void Verifier::collect_profile() {
     const ModelGeometry& g = *g_;
-    cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
+    basalt::core::device_copy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
     const int64_t L = g.n_layers;
     auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
     // the derived columns read stamps the hc-read kernels write themselves or the next layer's first; a slot no kernel

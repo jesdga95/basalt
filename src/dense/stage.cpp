@@ -13,6 +13,7 @@
 // last chunk, in order.
 // Without GPU-to-GPU access every copy goes card -> page-locked RAM -> card, each on a copy stream beside the reads.
 #include "internal.hpp"
+#include "basalt/core/device_memory.hpp"
 
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/staged_copy.hpp"
@@ -397,16 +398,16 @@ static bool calibrate(Stage& L, Model& main, std::string& err) {
     bool placed;
     {
         const core::OnDevice on(L.main_dev);
-        placed = cudaMemcpy(L.mout[0], L.hand[0], T * H * 2, cudaMemcpyHostToDevice) == cudaSuccess;
+        placed = basalt::core::device_copy(L.mout[0], L.hand[0], T * H * 2, cudaMemcpyHostToDevice) == cudaSuccess;
     }
     const auto t_hand = std::chrono::steady_clock::now();
     {
         const core::OnDevice on(L.main_dev);
-        placed = placed && cudaMemcpy(L.hand[1], L.mout[0], T * H * 2, cudaMemcpyDeviceToHost) == cudaSuccess;
+        placed = placed && basalt::core::device_copy(L.hand[1], L.mout[0], T * H * 2, cudaMemcpyDeviceToHost) == cudaSuccess;
     }
     {
         const core::OnDevice on(L.dev);
-        placed = placed && cudaMemcpy(L.lin[0], L.hand[1], T * H * 2, cudaMemcpyHostToDevice) == cudaSuccess;
+        placed = placed && basalt::core::device_copy(L.lin[0], L.hand[1], T * H * 2, cudaMemcpyHostToDevice) == cudaSuccess;
     }
     const double hand_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_hand).count();
     if (!placed) {

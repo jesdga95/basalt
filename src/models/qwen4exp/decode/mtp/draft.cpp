@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "basalt/core/spin_wait.hpp"
 
 namespace basalt::core {
@@ -152,7 +153,7 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
     decode_gaps().mark(9);
     if (gstamp_ != nullptr) {   // --profile: the GPU's idle time before the round and the draft's span
         unsigned long long st[2] = {0, 0};
-        cudaMemcpy(st, gstamp_, 16, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(st, gstamp_, 16, cudaMemcpyDeviceToHost);
         DecodeGaps& dg = decode_gaps();
         if (dg.verify_end != 0 && st[0] > dg.verify_end && st[1] > st[0]) {
             dg.v2d += (double) (st[0] - dg.verify_end);
@@ -221,7 +222,7 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
     for (int t = 0; t < T; ++t)
-        if (cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
+        if (basalt::core::device_copy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
                        cudaMemcpyDeviceToDevice) != cudaSuccess) {
             err = "mtp: staging the first residual failed";
             return false;

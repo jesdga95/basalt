@@ -28,6 +28,8 @@
 // the reading stays cudaMemGetInfo's.
 #pragma once
 
+#include "basalt/core/device_copy.hpp"
+
 #include <cuda_runtime_api.h>
 
 #include <cstddef>

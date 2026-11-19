@@ -2,6 +2,7 @@
 #pragma once
 
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "../../../program/serve/request.hpp"
 #include "qfn_state.hpp"
 
@@ -25,7 +26,7 @@ public:
     int32_t* history_stage() { return runtime_.hist_stage.data(); }
     void upload_history(int T) {
         const basalt::core::OnDevice on_h(runtime_.hist_dev);
-        cudaMemcpy(runtime_.d_hist, runtime_.hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
+        basalt::core::device_copy(runtime_.d_hist, runtime_.hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
                    cudaMemcpyHostToDevice);
     }
     void mark_before_run() {
