@@ -145,6 +145,12 @@ int main(int argc, char** argv) {
               pack_quant_label("") == "unknown", "pack_quant_label");
     check(pack_quant_label("Qwen3.8-Flash-Next") == "unknown" && pack_quant_label("Qwen3.8-Flash-Next UD-Q4_K_XL") == "Q4_K_XL" &&
               pack_quant_label("Qwen3.8-Flash-Next UD-IQ3_XXS") == "IQ3_XXS", "pack_quant_label: a name without a space is unknown");
+    check(pack_quant_label("Qwen3.8-Flash-Next ud-q4_k_m") == "q4_k_m" &&
+              pack_quant_label("Qwen3.8-Flash-Next Q4_K_M ") == "Q4_K_M" &&
+              pack_quant_label("Qwen3.8-Flash-Next nvidia-NVFP4-DQ8") == "NVFP4-DQ8" &&
+              pack_quant_label(" Qwen3.8-Flash-Next Huihui-Abliterated-V2\t") == "Huihui-Abliterated-V2" &&
+              pack_quant_label("  Qwen3.8-Flash-Next  ") == "unknown",
+          "pack_quant_label: edge spaces trimmed, prefixes stripped in any case, the label keeps its own case");
     check(cpu_label("", 8).empty() && cpu_label("X", 0) == "X", "cpu_label: empty name, unknown cores");
 
     const auto links = parse_link_rates("noise\npcie_h2d 0000:01:00.0 55.3\npcie_h2d 0000:02:00.0 bad\npcie_h2d 0000:03:00.0 27.9\n");

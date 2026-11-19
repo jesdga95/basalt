@@ -11,9 +11,9 @@ from pathlib import Path
 
 
 def gguf_stem(path) -> str:
-    """The file name alone, with a trailing `.gguf` (any case) and a shard suffix `-<digits>-of-<digits>` stripped."""
+    """The file name alone, with a trailing `.gguf` (any case) and a shard suffix `-<digits>-of-<digits>` (any case) stripped."""
     name = re.sub(r"\.gguf$", "", Path(path).name, flags=re.IGNORECASE)
-    return re.sub(r"-\d+-of-\d+$", "", name)
+    return re.sub(r"-\d+-of-\d+$", "", name, flags=re.IGNORECASE)
 
 
 class Arch:

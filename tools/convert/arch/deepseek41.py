@@ -80,7 +80,7 @@ class DeepSeek41(Arch):
     def default_name(self, first_gguf, kv, sections_from=False):
         base = kv.get("general.name") or "DeepSeek-V4.1-Flash"
         stem = gguf_stem(first_gguf)
-        tail = stem[len(base):].strip("-_ ") if stem.startswith(base) else ""
+        tail = stem[len(base):].strip("-_. ") if stem.startswith(base) else ""
         return f"{base} {tail}" if tail else base
 
     def check(self, kv, own):
