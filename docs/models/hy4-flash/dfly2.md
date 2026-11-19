@@ -43,7 +43,7 @@ positions `pos .. pos + n`. `s = pos - 1` is the **source row**: the target row 
    latent `kv_a_ln(kv_a(n)[:512])`, rope part `kv_a(n)[512:]`; interleaved-pair rope at base 1e7 (the target's sparse layers), position `pos + r`;
    `kv_b_proj` rows per head: 192 key rows then 256 value rows, used absorbed (`q_abs = W_k^T q_nope`, value `W_v o_lat`); scale 1/16; learnable sink in the
    denominator; sigmoid gate `linear_gate(n)` over the 8192 outputs; `o_proj`. **KV Share**: the keys and values are the cache rows of target layer
-   `kv_layers[i]` (the BF16 rows of 576 the target wrote). **Index Share**: the rows are the cells the target's indexer selected in layer `idx_layers[i]` for
+   `kv_layers[i]` (the rows of 576 the target wrote; with `--kv fp8` its FP8 rows, decoded exactly). **Index Share**: the rows are the cells the target's indexer selected in layer `idx_layers[i]` for
    the source row `s` (every position before `pos` where the indexer keeps all of them), at most 2,048, the same for every block row; each block row also
    attends the block's own rows 0..r (causal), whose K/V the drafter computes from its own `kv_a` and holds as BF16 in scratch (vLLM writes them into the
    target's cache slots at `pos..`, where verification overwrites them; Basalt writes nothing into the target's cache).

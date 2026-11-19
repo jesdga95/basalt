@@ -298,6 +298,7 @@ private:
     int64_t ext_n_ = 0;                     ///< the slots per layer `grow` opens in `ext_`: planned at the start (and by replan)
     int64_t exact_per_layer_ = 0;           ///< an exact --expert-cache, per layer; 0 when auto
     int64_t lent_per_layer_ = 0;            ///< base slots given up by lend_all(), 0 when none
+    int64_t planned_per_layer_ = 0;         ///< the base slots a reclaim opens again when they fit (the largest lent)
     std::vector<int32_t> res_;              ///< [layer * n_expert + e] VRAM slot or -1
     std::vector<uint64_t> stamp_;           ///< [layer * n_expert + e] last use
     std::vector<int32_t> owner_;            ///< [slot] expert it holds or is receiving, or -1
