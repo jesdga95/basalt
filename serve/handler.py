@@ -928,12 +928,14 @@ def make_handler(target: Service | Router):
             try:
                 ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
                                                      image_access=self._image_access())
+                _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
+                cancel = self._client_cancel()
+                # primed() until the engine has counted a text prompt: an overflow it finds is raised before the SSE
+                # headers go out, as it is on the id path, so /v1/messages says it in Anthropic's words either way
+                events = primed(anthropic_events(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
+                                                 session=self._session_id(req), live=self.live), ids)
             except ContextOverflow as e:
                 raise ValueError(e.anthropic_text()) from None   # Anthropic's own wording first (#4838 parity)
-            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            cancel = self._client_cancel()
-            events = primed(anthropic_events(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
-                                              session=self._session_id(req), live=self.live), ids)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()

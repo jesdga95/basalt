@@ -148,6 +148,42 @@ class MaxTokens(unittest.TestCase):
                 self.assertEqual(s, 200, b)
                 self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
 
+    def test_the_text_prompt_path_says_the_overflow_like_anthropic(self):
+        # a real engine tokenizes the prompt itself: the overflow surfaces after the count, through primed() —
+        # /v1/messages must still answer in Anthropic's words, streaming or not
+        from serve.prompt import PromptText
+        self.engine.takes_text = True
+        self.svc.fit_max_tokens = False     # an overshooting budget the client could have sized: the keyword contract
+        original = self.engine.generate
+
+        def counted(ids, max_new, sampling, cancel, embeddings=None, session=None):
+            if isinstance(ids, PromptText):
+                yield None                              # waiting for the engine's prompt count
+                ids.settle(len(ids.ids()), int(max_new), CTX)
+                yield None                              # the PT heartbeat
+                ids = ids.ids()
+            yield from original(ids, max_new, sampling, cancel, embeddings)
+
+        self.engine.generate = counted
+        try:
+            for stream in (False, True):
+                with self.subTest(stream=stream):
+                    s, b = self.post("/v1/messages", {"model": "basalt", "messages": [{"role": "user", "content": "hi"}],
+                                                      "max_tokens": CTX, "stream": stream})
+                    self.assertEqual(s, 400, b)
+                    self.assertIn("input length and `max_tokens` exceed context limit", b["error"]["message"])
+            for stream in (False, True):
+                with self.subTest(stream=stream, prompt="too long"):
+                    text = "y" * (CTX + 64)             # the prompt alone no longer fits
+                    s, b = self.post("/v1/messages", {"model": "basalt", "messages": [{"role": "user", "content": text}],
+                                                      "max_tokens": 1, "stream": stream})
+                    self.assertEqual(s, 400, b)
+                    self.assertIn("prompt is too long", b["error"]["message"])
+        finally:
+            self.engine.generate = original
+            self.engine.takes_text = False
+            self.svc.fit_max_tokens = True
+
     def test_unset_budget_with_a_near_full_prompt(self):
         _, _, pt0, _ = self.call("openai", max_tokens=1)
         overhead = pt0 - len("hi")                  # the template's tokens around the user text
