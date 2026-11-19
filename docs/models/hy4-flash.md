@@ -126,22 +126,11 @@ bus: 89.5 GB of experts at 29 GB/s (the card's x8 PCIe 5 link) = 3.1 s a chunk, 
 
 ## 1M context
 
-- **Cache.** Sparse layers keep every position (1,152 B x 12 = 13.8 KB BF16, 1M = 14.5 GB; the reference's own rounding is BF16,
-  so BF16 rows are the exact copy of what it computes). `--kv fp8` stores vLLM's FlashMLA row (512 E4M3 codes, 4 FP32 scales,
-  64 BF16 rope values = 656 B) = 8.25 GB at 1M; it is a quality-gated option (risk 8), default after measurement. Pooled keys FP16,
-  64 B per position and layer.
-- **Backing.** Elastic KV as Flash-Next and DS do (virtual range reserved, backed on demand, the first 32,768 positions at start,
-  the rest taken from the expert slots and given back when idle). DS's `elastic.hpp` moves to shared code (below).
-- **Selection at 1M.** Decode scans 262,144 pooled keys per sparse layer: 805 MB per token for 12 layers = 0.55 ms (4 % of a
-  token; 0.07 ms at 128K). Prefill's scoring is quadratic: sum over chunks of `C x N/4 x 16 x 128 x 2` = 6.7 PFLOP for a 1M
-  prompt, about 2 minutes at 55 TFLOP/s effective FP16 *est*; FP8 pooled keys would halve it but can change selections (risk 3).
-  Selected-row attention is 2.1 + 1.7 GFLOP per token (SWA + sparse) = under a minute at 1M.
-- **1M end to end (*est*).** Prefill 3 to 6 minutes (experts stream per chunk: DS's measured prefill rate on this box is the anchor,
-  risk 2). Decode with BF16 KV on two cards: 1,500 + 3,620 slots = 24 % of experts, hit about 0.7, 40 to 50 tok/s; with FP8 KV
-  about 55. A third card as KV home (queries out, attention results back: 66 KB per layer per token) is an option, not planned.
-- **Default and refusal.** `--max-context` default 8,192, up to 1,048,576; refused when the caches need more than half the free
-  memory (DS rule). Conversation checkpoints are position rows (about 14.6 KB per position): 128K = 1.9 GB, so parked conversations
-  use `save_cells`/`restore_cells` ranges like Flash-Next, not DS's fixed 3 MB blocks.
+Sparse layers keep every position (16-bit rows of 1,152 B x 12 and the pooled keys: 14.6 KB a position, 14.3 GiB at 1M; `--kv fp8`,
+vLLM's `fp8_ds_mla` row of 656 B: 8.4 GiB). The caches are elastic as Flash-Next's: the first 32,768 positions are backed at start, the rest
+come out of the expert tier when a prompt needs them and go back when a later prompt needs fewer; a prompt that would leave the
+tier below a prompt chunk's room is refused and the engine serves on. Formats, rounding, selection cost and the 1M measurements:
+[KV cache](hy4-flash/kv.md).
 
 ## Expert tier and what becomes shared
 
@@ -166,55 +155,10 @@ reach 75 % of experts.
 
 ## Vision
 
-The ViT runs on `src/vision/encoder_cuda.cu` (and the CPU reference `encoder_cpu.cpp`) selected by the projector file's `hy_v4_flash`
-type; Flash-Next's `qwen3vl_merger` path is untouched (its kernels are not edited, only new ones added). What differs from Qwen3-VL:
-
-| | Qwen3-VL (Flash-Next) | Hy4-flash |
-|---|---|---|
-| Patch embedding | two temporal taps summed | one 16 x 16 conv, bias |
-| Position table | 48 x 48, align-corners bilinear | 128 x 128 (row 0, the CLS slot, dropped), `interpolate(scale_factor=(size + 0.1) / 128, align_corners=False)`; an axis whose size equals the table's is copied |
-| In-layer rotation | 2-D RoPE on q, k | none |
-| After the layers | LayerNorm, merger (tanh GELU) | RMS norm (eps 1e-5), 2 x 2 merge conv 4,608 -> erf GELU -> 1 x 1 conv 3,072, a learned `image_newline` row after each line |
-| Encoder FFN | tanh GELU | tanh GELU (`bias_activation_fusion`, as llama.cpp's hy_v4_flash) |
-
-The projector is the side file's `mmproj-Hy4-flash-BF16.gguf` (llama.cpp's `hy_v4_flash` layout: F32 convs and position table, BF16
-products, q, k and v separate). The encoder reads it as is: q, k, v become one product, and the merge conv is reordered into a 4,608 x 4,608
-BF16 product over a group's four patch rows in merge order, at stage time. `convert.py --mmproj FILE` (arch `mmproj_only`) adds it
-as `vision/mmproj`. `--vision` (serve: `dynamic`, the only mode) stages it once in pinned RAM (928 MiB) before the tier is sized;
-a request's pictures then take a region on the main card (about 1.9 GB with the work buffers for 4,096 merged tokens) where a short
-prompt's buffers go: what the tier left free, then the slots beside the base arena, then every slot the tier lends. `images_done`
-frees it and the tier takes its slots back. A 600-token picture encodes in about 0.1 s, a 4,096-token one in 0.55 s.
-
-Preprocessing (`vision.hpp`): `smart_resize` with factor 32, min 4,096 and max 4,194,304 pixels (4 and 4,096 merged tokens), a ratio over
-200 refused; Pillow's bicubic to the canvas (bit-exact); (v / 255 - 0.5) / 0.5; patches in merge order. The filter:
-`processor_config.json` says `resample: 1` (Lanczos) and llama.cpp's `hy_v4_flash` uses it, but transformers' `hy_v4_vl` processor
-resizes with BICUBIC because the original's `PIL.Image.resize` call never passes the configured filter. Lanczos rows sit 3 to 7 %
-(relL2) from bicubic ones on real pictures, and the model reads finer print with bicubic (the newspaper's price and issue number).
-
-Prompt: `<image_start>` pad x (oh x (ow + 1)) `<image_end>`; the pads of the newline slots are in the run, so the block of
-embedding rows is `oh * (ow + 1)` long and the engine's pad-run expansion (`encode_image` row count) already fits. The adapter names
-`<hy_image_pad..>` as the image pad; the server's Hy4 dialect sets `image_pad` and `image_start` to the pack's tokens.
-
-MRoPE: interleaved sections [12, 10, 10] over the 32 rotated pairs: pair i turns by h when i % 3 == 1 and i < 30, by w when
-i % 3 == 2 and i < 30, by t otherwise. Text takes the running position on all three; a picture block starting at p puts row j (column
-newline included, nx = ow + 1) at (p, p + j / nx, p + j % nx), and the text after it continues at p + max(oh, ow + 1)
-(transformers' `get_rope_index` of `hy_v4_vl`, tested on five prompts). The session keeps each cell's triple (`RopeTrack`) and,
-once a picture is in, a device table `cell_rope` that `mla_prepare`, `idx_rope_heads` and `idx_pool` read (null: the cell index, so
-text-only output is unchanged). The indexer's pooled key turns by its group's first cell's triple, llama.cpp's convention (its pool
-position is "the M-RoPE position of each new pool's first member"); vLLM's `rotate_indexer` takes three-axis group positions too.
-llama.cpp's flash path itself rotates by 1-D positions (rope type NORM), so it is not a reference for picture positions. After a
-picture the drafter turns its block by the text's rotary position, not the cell.
-
-Engram: llama.cpp's hy-v4-flash treats an embedding (image) position as a token that cannot be hashed, so an image row's
-own Engram contribution is masked (valid 0) and, to the rows after it, it is a padded history entry. The session passes -1 as the token
-of an image row (`run_rows` accepts it only with embedding rows) and `engram_ids` reads -1 as dead on both counts. vLLM's flash
-Engram has the same hook for a picture's own rows (`visual_token_ids`, masked) but leaves it empty and reads the pad ids as history.
-
-Images enter `session.cpp` through three marked hooks (`[vision]`): `encode_image`/`images_done`/`prefill_embeddings` (chunks of up
-to 256 rows through `run_rows` with the rows as the embeddings), `place_rope` in `run_rows`, and the `cell_rope` pointers in
-`mla_args` and `indexer`. Video is out of the first cut. Checks: a picture's rows match the torch reference (transformers'
-processor, the ViT on the checkpoint) at relL2 4 to 6e-3 for PNGs (JPEGs add about 1e-2: stb_image and libjpeg decode apart); fed
-llama.cpp's own rows with 1-D positions, NVFP4 two cards keeps the BF16 GGUF's first 12 greedy tokens on three prompts.
+The SigLIP2-derived ViT runs on the shared CUDA encoder (`src/vision/encoder_cuda.cu`) from the side file's projector,
+staged once in pinned RAM; a request's pictures borrow the expert tier's room on the main card while they are encoded. Pillow's
+bicubic resize (as transformers' processor), the `<image_start>` pad run with newline slots, interleaved MRoPE [12, 10, 10] (the
+indexer's pooled key turns by its group's first cell), Engram masked at picture rows: [vision](hy4-flash/vision.md).
 
 ## DFly2
 
@@ -312,8 +256,7 @@ Exit: layer 0 to 2 hidden states within gate 1, then all 42. GPU tests are queue
    QD64 on `/mnt/nvme`; hot-row hit rate by replaying the trace's token streams through the hash (CPU only); prefetch overlap.
 7. **NVFP4 RTN quality** without calibration. Measure KLD against Q4_K_M and BF16; fall back: per-layer scale search, a higher-bit
    `down`, or Q4_K as the default pack. Weight RMS error: NVFP4 0.081; Q4_K 0.071 (gate, up), 0.077 (down); Q6_K down 0.018 (19 layers).
-8. **KV precision.** BF16 default (the reference's own); FP8 FlashMLA rows halve 1M's cache; measure KLD at 32K and 128K prompts and
-   needle at 1M before it is a default.
+8. **KV precision.** 16-bit default; `--kv fp8` (vLLM's rows) is opt-in, measured in [KV cache](hy4-flash/kv.md).
 9. **Selection ties and T invariance.** FP16 tensor-core scoring versus the reference's BF16 can flip near-tied pools; measure the
    id overlap against llama.cpp per layer (decode and prefill) and the logit effect; keep the scoring order fixed across windows.
 10. **Q6_K down in the grouped expert kernels (GPU) and no `q6k_dot` on the CPU** for the test pack: parity tests first (pack doc).
