@@ -1,4 +1,4 @@
-"""A request must name the served model; unknown or missing is a 404 in the API's own shape (mock engine)."""
+"""One model served: any non-blank name is served by it (#456); missing or blank is a 404 in the API's own shape (mock engine)."""
 from __future__ import annotations
 
 import http.client
@@ -53,17 +53,32 @@ class ModelName(unittest.TestCase):
                     status, _ = self.post(path, {"model": name, **body})
                     self.assertEqual(status, 200)
 
-    def test_unknown_is_404_in_the_api_shape(self):
+    def test_an_unknown_name_is_served_by_the_one_model(self):
+        # #456: one model loaded cannot route anywhere else, so any non-blank name is served by it, as Strata does.
         for path, body in PATHS.items():
             with self.subTest(path=path):
-                status, raw = self.post(path, {"model": "gpt-x", **body})
+                status, raw = self.post(path, {"model": "本机-anything", **body})
+                self.assertEqual(status, 200, raw)
+
+    def test_the_fallback_reply_names_the_served_model_not_the_requested(self):
+        _, raw = self.post("/v1/chat/completions", {"model": "gpt-x", **PATHS["/v1/chat/completions"]})
+        self.assertIn(f'"model": "{ALIAS}"', raw)
+        self.assertNotIn("gpt-x", raw)
+        _, raw = self.post("/v1/messages", {"model": "gpt-x", **PATHS["/v1/messages"]})
+        self.assertIn(f'"model": "{ALIAS}"', raw)
+        self.assertNotIn("gpt-x", raw)
+
+    def test_blank_is_404_in_the_api_shape(self):
+        for path, body in PATHS.items():
+            with self.subTest(path=path):
+                status, raw = self.post(path, {"model": "  ", **body})
                 self.assertEqual(status, 404)
                 if path.startswith("/v1/messages"):
                     self.assertEqual(json.loads(raw), {"type": "error", "error": {
-                        "type": "not_found_error", "message": "model: gpt-x"}})
+                        "type": "not_found_error", "message": "model:   "}})
                 else:
                     self.assertEqual(json.loads(raw), {"error": {
-                        "message": "The model 'gpt-x' does not exist", "type": "invalid_request_error",
+                        "message": "The model '  ' does not exist", "type": "invalid_request_error",
                         "param": "model", "code": "model_not_found"}})
 
     def test_missing_or_null_is_404(self):
