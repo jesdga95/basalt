@@ -1,6 +1,7 @@
 // src/models/hy4flash/kernels/kernels_parity.cpp - the Hy4-flash decode kernels against plain CPU references (double
 // accumulation) at the model's geometry: the identity hyper-connections, the per-head Q8_0 products, the MLA
 // preparation and attention with a sink, the router and the Engram apply. Exit 77 without a GPU.
+#include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -154,6 +155,33 @@ void test_hc() {
                     for (int d = 0; d < E; ++d)
                         r2[((size_t) t * 4 + s) * E + d] = (double) x[((size_t) t * 4 + s) * E + d] + ref[(size_t) t * stride + 4 + s] * f[(size_t) t * E + d];
             report("hc_post (identity comb)", o, r2, 1e-6);
+            // the MoE's end fused: add_vectors, rms_norm_rows and hc_post in one launch, bit for bit
+            std::vector<float> ra = randn((size_t) T * E), rb = randn((size_t) T * E, 0.3f), w = randn(E, 0.2f);
+            for (float& v : w) v += 1.0f;
+            float *da = dev(ra), *db = dev(rb), *dw = dev(w), *dsum = devf((size_t) T * E), *dn = devf((size_t) T * E);
+            float *d3 = devf((size_t) T * 4 * E), *d1 = devf((size_t) T * 4 * E);
+            cudaStream_t st;
+            cudaStreamCreate(&st);
+            add_vectors(da, db, dsum, T * E, st);
+            bk::rms_norm_rows(dsum, dw, dn, T, E, 1e-6f, st);
+            bk::hc_post(dn, dx, coef, stride, T, E, d3, st);
+            add_norm_hc_post(da, db, dw, 1e-6f, dx, coef, stride, T, E, d1, st);
+            cudaStreamSynchronize(st);
+            std::vector<float> h3 = host(d3, (size_t) T * 4 * E), h1 = host(d1, (size_t) T * 4 * E);
+            const bool fused_same = std::memcmp(h3.data(), h1.data(), h3.size() * 4) == 0;
+            std::printf("%-30s %s\n", "add_norm_hc_post", fused_same ? "bitwise" : "FAIL");
+            failures += !fused_same;
+            // and without the add (the attention's end): rms_norm_rows and hc_post
+            bk::rms_norm_rows(da, dw, dn, T, E, 1e-6f, st);
+            bk::hc_post(dn, dx, coef, stride, T, E, d3, st);
+            add_norm_hc_post(da, nullptr, dw, 1e-6f, dx, coef, stride, T, E, d1, st);
+            cudaStreamSynchronize(st);
+            h3 = host(d3, (size_t) T * 4 * E);
+            h1 = host(d1, (size_t) T * 4 * E);
+            const bool norm_same = std::memcmp(h3.data(), h1.data(), h3.size() * 4) == 0;
+            std::printf("%-30s %s\n", "add_norm_hc_post (no add)", norm_same ? "bitwise" : "FAIL");
+            failures += !norm_same;
+            cudaStreamDestroy(st);
         }
     }
 }

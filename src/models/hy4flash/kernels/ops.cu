@@ -161,6 +161,65 @@ __global__ void add_kernel(const float* __restrict__ a, const float* __restrict_
     if (i < n) out[i] = a[i] + b[i];
 }
 
+// one row a block of 512: f = a + b, its RMS over the row exactly as rms_norm_rows takes it (same threads, same sums), then
+// hc_post's four streams from f * inv * w, each value computed as the three kernels compute it, so the result is theirs bit
+// for bit
+__global__ void add_norm_hc_post_kernel(const float* __restrict__ a, const float* __restrict__ b, const float* __restrict__ w,
+                                        float eps, const float* __restrict__ x, const float* __restrict__ coef, int coef_stride,
+                                        int E, float* __restrict__ out) {
+    __shared__ float red[32];
+    const int t = blockIdx.x;
+    const float* ar = a + (size_t) t * E;
+    const float* br = b ? b + (size_t) t * E : nullptr;
+    float ss = 0.0f;
+    for (int c = threadIdx.x; c < E; c += blockDim.x) {
+        const float f = br ? ar[c] + br[c] : ar[c];
+        ss = fmaf(f, f, ss);
+    }
+    {   // block_sum of rms_norm_rows
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        __syncthreads();
+        if (lane == 0) red[warp] = ss;
+        __syncthreads();
+        float s = 0.0f;
+        for (int i = 0; i < nw; ++i) s += red[i];
+        ss = s;
+    }
+    const float inv = rsqrtf(ss / (float) E + eps);
+    const float* cf = coef + (size_t) t * coef_stride;
+    const float* xr = x + (size_t) t * 4 * E;
+    float* orow = out + (size_t) t * 4 * E;
+    const int n4 = E >> 2;
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        const int c = 4 * i;
+        float4 f4 = make_float4(ar[c], ar[c + 1], ar[c + 2], ar[c + 3]);
+        if (br) f4 = make_float4(f4.x + br[c], f4.y + br[c + 1], f4.z + br[c + 2], f4.w + br[c + 3]);
+        const float4 fv = make_float4(f4.x * inv * w[c], f4.y * inv * w[c + 1], f4.z * inv * w[c + 2], f4.w * inv * w[c + 3]);
+        float4 xs[4];
+#pragma unroll
+        for (int s = 0; s < 4; ++s) xs[s] = reinterpret_cast<const float4*>(xr)[(size_t) s * n4 + i];
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+            const float post = cf[4 + d];
+            float4 o = make_float4(fv.x * post, fv.y * post, fv.z * post, fv.w * post);
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const float cc = cf[8 + s * 4 + d];
+                o.x = fmaf(xs[s].x, cc, o.x); o.y = fmaf(xs[s].y, cc, o.y);
+                o.z = fmaf(xs[s].z, cc, o.z); o.w = fmaf(xs[s].w, cc, o.w);
+            }
+            reinterpret_cast<float4*>(orow)[(size_t) d * n4 + i] = o;
+        }
+    }
+}
+
+void add_norm_hc_post(const float* a, const float* b, const float* w, float eps, const float* x, const float* coef, int coef_stride,
+                      int n_tokens, int E, float* out, void* stream) {
+    add_norm_hc_post_kernel<<<n_tokens, 512, 0, (cudaStream_t) stream>>>(a, b, w, eps, x, coef, coef_stride, E, out);
+}
+
 void add_vectors(const float* a, const float* b, float* out, int n, void* stream) {
     add_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(a, b, out, n);
     if (!stream) cudaStreamSynchronize(nullptr);

@@ -125,6 +125,11 @@ void idx_select_rows(const float* scores, int stride, const int32_t* meta, int r
 void f32_gemm_rows(const float* x, const float* w, int rows, int cols, float scale, int n_tok, float* y, void* stream);
 /// out[i] = a[i] + b[i].
 void add_vectors(const float* a, const float* b, float* out, int n, void* stream);
+/// A sublayer's end in one launch: f = a + b (the MoE's routed and shared outputs; b null: f = a, the attention's output), its
+/// rms_norm_rows by `w`, then hc_post of f into the four streams of `x` by `coef` (n_tokens rows of E, E a multiple of 4):
+/// add_vectors, rms_norm_rows and hc_post bit for bit.
+void add_norm_hc_post(const float* a, const float* b, const float* w, float eps, const float* x, const float* coef, int coef_stride,
+                      int n_tokens, int E, float* out, void* stream);
 
 // ---- MoE ----------------------------------------------------------------------------------------------------------
 
