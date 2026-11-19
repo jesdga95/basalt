@@ -10,6 +10,7 @@
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/elastic_array.hpp"
+#include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
@@ -218,6 +219,7 @@ public:
             err = "out of device memory for the session";
             return false;
         }
+        if (!ensure_positions(kv_base(), err)) return false;   // the elastic KV's base; the rest comes from the expert tier
         if (!make_bufs(dec_, kMaxWindow, err)) return false;
         use(dec_);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
@@ -393,6 +395,18 @@ public:
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
         dfly_.invalidate();   // DFLY HOOK
+        if (!big_.rows && elastic()) {   // a prompt starts: its positions against what the caches back and can back
+            const int64_t need = std::min<int64_t>(m_.context(), r.pos + std::max(r.total_tokens, r.n_tokens));
+            const int64_t keep = std::max(kv_base(), std::min<int64_t>(m_.context(), (need + kGrowPositions - 1) / kGrowPositions * kGrowPositions));
+            if (backed_ > keep) trim_positions(keep);
+            if (need > backed_) {
+                const int64_t ceiling = kv_ceiling();
+                if (need > ceiling)
+                    return {model::Status::Error, "hy4flash: elastic KV: " + std::to_string(need) + " positions would take the expert tier below the " +
+                                                      std::to_string(prompt_floor_bytes() / stride_) + " slots a prompt chunk needs (about " +
+                                                      std::to_string(ceiling) + " fit; --kv fp8 halves a position's bytes)"};
+            }
+        }
         if (!open_prompt(std::max(r.total_tokens, r.n_tokens), err)) return {model::Status::Error, "hy4flash: " + err};
         const int chunk = m_.diag_rows() > 0 ? std::min(rows_, m_.diag_rows()) : rows_;
         for (int t0 = 0; t0 < r.n_tokens; t0 += chunk) {
@@ -447,7 +461,44 @@ public:
     model::Result prepare() override {
         std::string e;
         if (!ensure_tier(e)) return {model::Status::Error, "hy4flash: " + e};
+        if (elastic())
+            core::log_elastic_kv_ceiling(kv_ceiling(), m_.sessions(), (int64_t) m_.sessions() * m_.context(), (int64_t) (prompt_floor_bytes() / stride_));
         return {};
+    }
+
+    // ---- the elastic KV (core/elastic_kv.hpp): with a context above kElasticKvBase a session backs its first kElasticKvBase
+    // positions at start; more come out of the expert tier when a prompt or a generation needs them (ensure_positions), and a
+    // later prompt that needs fewer gives them back (trim_positions), so a short conversation decodes with the larger tier.
+    bool elastic() const { return m_.context() > core::kElasticKvBase; }
+    int64_t kv_base() const { return std::min<int64_t>(m_.context(), core::kElasticKvBase); }
+    // device bytes a position takes in the sparse layers' caches (its row and a quarter of a pooled key)
+    double cell_bytes() const {
+        int sparse = 0;
+        for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
+        return (double) sparse * ((double) sparse_row_bytes() + (double) g_.idx_dim * 2.0 / (double) g_.idx_pool);
+    }
+    // the free memory a prompt chunk needs: the expert ring and the buffers of a chunk of attention-step rows
+    static constexpr uint64_t kPromptFloorBuffers = 1ull << 30;
+    uint64_t prompt_floor_bytes() const { return 2ull * (uint64_t) g_.n_expert * stride_ + kPromptFloorBuffers; }
+    // the positions the caches can back before the expert tier's slots and the free memory above its floor would no longer hold
+    // a prompt chunk's needs
+    int64_t kv_ceiling() override {
+        if (!elastic() || !tier_) return -1;
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const double spare = (double) free_b - (double) tier_->free_floor() + (double) tier_->slots() * (double) stride_ - (double) prompt_floor_bytes();
+        return std::min<int64_t>(m_.context(), backed_ + (int64_t) (std::max(0.0, spare) / cell_bytes()));
+    }
+    // the backing past `keep` positions goes back to the driver (the tier takes it at the prompt's end)
+    void trim_positions(int64_t keep) {
+        cudaStreamSynchronize(stream_);
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) continue;
+            ea_[(size_t) l]->trim((uint64_t) keep * sparse_row_bytes());
+            pea_[(size_t) l]->trim((uint64_t) (keep / g_.idx_pool + 1) * g_.idx_dim * 2);
+        }
+        basalt::log::info("basalt hy4flash", "elastic KV: %lld -> %lld positions backed", (long long) backed_, (long long) keep);
+        backed_ = keep;
     }
 
     ExpertCounts expert_counts() const override {
