@@ -8,6 +8,7 @@
 #include "basalt/models/hy4flash/kernels.hpp"
 #include "models/hy4flash/dfly.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -47,6 +48,8 @@ float from_bf16(uint16_t b) {
     std::memcpy(&f, &u, 4);
     return f;
 }
+uint16_t to_f16(float x) { return __half_as_ushort(__float2half_rn(x)); }
+float from_f16(uint16_t b) { return __half2float(__ushort_as_half(b)); }
 
 struct Mat {
     std::vector<uint16_t> bits;
@@ -169,10 +172,12 @@ void test_kernels() {
                     double v = e ? std::ldexp(1.0 + m / 8.0, e - 7) : std::ldexp((double) m, -9);
                     v = ((b & 0x80) ? -v : v) * sc[c >> 7];
                     const float f = (float) v;
-                    exact = exact && from_bf16(to_bf16(f)) == f;
-                    want = to_bf16(f);
+                    exact = exact && from_f16(to_f16(f)) == f;
+                    want = to_f16(f);
                 } else {
-                    std::memcpy(&want, row + kDflyRank + 16 + 2 * (c - kDflyRank), 2);
+                    uint16_t b;
+                    std::memcpy(&b, row + kDflyRank + 16 + 2 * (c - kDflyRank), 2);
+                    want = to_f16(from_bf16(b));
                 }
                 exact = exact && got[(size_t) j * kDflyRowWidth + c] == want;
             }
@@ -340,7 +345,7 @@ void test_block() {
     // the target: caches, the tap's row, selections (a list for layer 0, every position for layer 1)
     std::vector<std::vector<uint16_t>> cache(2, std::vector<uint16_t>((size_t) ctx_rows * kDflyRowWidth));
     for (auto& c : cache)
-        for (uint16_t& x : c) x = to_bf16(gauss(1.f));
+        for (uint16_t& x : c) x = to_f16(gauss(1.f));
     std::vector<uint16_t*> dcache = {upload(cache[0]), upload(cache[1])};
     std::vector<int32_t> cells;
     for (int i = 0; i < 37; ++i) cells.push_back(std::uniform_int_distribution<int>(0, pos - 1)(rng));
@@ -411,7 +416,7 @@ void test_block() {
                 std::vector<double> rp(kvr[(size_t) r].begin() + 512, kvr[(size_t) r].end());
                 Ref::rot(rp.data(), pos + r, d.rope_base);
                 krow[(size_t) r].insert(krow[(size_t) r].end(), rp.begin(), rp.end());
-                for (double& x : krow[(size_t) r]) x = from_bf16(to_bf16((float) x));   // the block's rows are held as BF16, as the target's cache
+                for (double& x : krow[(size_t) r]) x = from_f16(to_f16((float) x));   // the block's rows are held as fp16, as the target's cache
             }
             const Mat& kvb = r2.m[p + "self_attn.kv_b_proj.weight"];
             std::vector<std::vector<double>> vout((size_t) R, std::vector<double>((size_t) H * 256));
@@ -432,7 +437,7 @@ void test_block() {
                     std::vector<std::vector<double>> rows;
                     for (int c : rowsel) {
                         std::vector<double> rw(576);
-                        for (int k = 0; k < 576; ++k) rw[(size_t) k] = from_bf16(cache[(size_t) l][(size_t) c * 576 + k]);
+                        for (int k = 0; k < 576; ++k) rw[(size_t) k] = from_f16(cache[(size_t) l][(size_t) c * 576 + k]);
                         rows.push_back(rw);
                     }
                     for (int b = 0; b <= r; ++b) rows.push_back(krow[(size_t) b]);

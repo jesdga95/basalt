@@ -45,10 +45,12 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
     return r;
 }
 
-// A cache holds rows of rank + rope values as fp32, as BF16 (the reference's own rounding of the latent rows), or as the FP8 row
-// the flash-MLA kernels read: 512 E4M3 codes, four fp32 scales (one per 128 codes), 64 BF16 rope values (656 bytes).
+// A cache holds rows of rank + rope values as fp32, as fp16 (the BF16 reference's llama.cpp cache rounding; the latent and rope values
+// of the model stay far inside fp16's range), or as the FP8 row the flash-MLA kernels read: 512 E4M3 codes, four fp32 scales (one per
+// 128 codes), 64 BF16 rope values (656 bytes).
 constexpr int kFp8Codes = 512, kFp8ScaleOff = 512, kFp8RopeOff = 528;
 __device__ __forceinline__ uint16_t bf16_bits(float v) { return __bfloat16_as_ushort(__float2bfloat16_rn(v)); }
+__device__ __forceinline__ uint16_t f16_bits(float v) { return __half_as_ushort(__float2half_rn(v)); }
 
 // The cell's row from the normed latent lat[rank] and the rotated rope values rp[rope] (shared memory); every thread of the
 // block takes part.
@@ -59,8 +61,8 @@ __device__ __forceinline__ void store_cell(float* cache, size_t cell, const floa
 }
 __device__ __forceinline__ void store_cell(uint16_t* cache, size_t cell, const float* lat, const float* rp, const MlaArgs& a, float* red) {
     uint16_t* row = cache + cell * (a.rank + a.rope);
-    for (int c = threadIdx.x; c < a.rank; c += blockDim.x) row[c] = bf16_bits(lat[c]);
-    for (int c = threadIdx.x; c < a.rope; c += blockDim.x) row[a.rank + c] = bf16_bits(rp[c]);
+    for (int c = threadIdx.x; c < a.rank; c += blockDim.x) row[c] = f16_bits(lat[c]);
+    for (int c = threadIdx.x; c < a.rope; c += blockDim.x) row[a.rank + c] = f16_bits(rp[c]);
 }
 // vLLM's fp8_ds_mla row of the BF16 latent (concat_and_cache_ds_mla): per 128 values the scale 2^ceil(log2(max(amax / 448, 1e-4))),
 // codes = E4M3(v / scale) round to nearest, saturating; the rope values BF16. A code times its power-of-two scale is a BF16 value,
@@ -293,7 +295,12 @@ __device__ __forceinline__ void bf16x2(uint32_t v, float* k) {
     k[0] = __uint_as_float(v << 16);
     k[1] = __uint_as_float(v & 0xffff0000u);
 }
-struct RowBf16 {
+__device__ __forceinline__ void f16x2(uint32_t v, float* k) {
+    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&v));
+    k[0] = f.x;
+    k[1] = f.y;
+}
+struct RowF16 {
     using Raw4 = uint2;
     using Raw2 = uint32_t;
     using RawR = uint32_t;
@@ -303,9 +310,9 @@ struct RowBf16 {
     static __device__ __forceinline__ Raw4 load4(const uint8_t* r, int i) { return reinterpret_cast<const uint2*>(r)[i]; }
     static __device__ __forceinline__ Raw2 load2(const uint8_t* r, int i) { return reinterpret_cast<const uint32_t*>(r)[i]; }
     static __device__ __forceinline__ RawR loadr(const uint8_t* r, int i) { return reinterpret_cast<const uint32_t*>(r + 1024)[i]; }
-    static __device__ __forceinline__ void cvt4(const Raw4& v, const Scales&, int, float k[4]) { bf16x2(v.x, k); bf16x2(v.y, k + 2); }
-    static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) { bf16x2(v, k); }
-    static __device__ __forceinline__ void cvtr(const RawR& v, float k[2]) { bf16x2(v, k); }
+    static __device__ __forceinline__ void cvt4(const Raw4& v, const Scales&, int, float k[4]) { f16x2(v.x, k); f16x2(v.y, k + 2); }
+    static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) { f16x2(v, k); }
+    static __device__ __forceinline__ void cvtr(const RawR& v, float k[2]) { f16x2(v, k); }
 };
 // the FP8 row: a code times its group's scale (load4's j is its group: values 4 (lane + 32 j)..)
 __device__ __forceinline__ float fp8_value(uint32_t code, float scale) {
@@ -428,7 +435,7 @@ __device__ __forceinline__ uint32_t bf2_to_h2(uint32_t v) {
     return *reinterpret_cast<const uint32_t*>(&h);
 }
 
-// Eight values of a cell's row (chunk ch of 72) as raw words, and the same as eight fp16 values. BF16 rows: the eight values. FP8
+// Eight values of a cell's row (chunk ch of 72) as raw words, and the same as eight fp16 values. fp16 rows: the eight values. FP8
 // rows: chunks below 64 are eight E4M3 codes then their group's scale, the rest eight BF16 rope values; a code times its
 // power-of-two scale is exact in fp16 (the scales are at least 2^-13).
 __device__ __forceinline__ uint4 fetch8(const uint16_t* cache, size_t cell, int ch) {
@@ -442,15 +449,13 @@ __device__ __forceinline__ uint4 fetch8(const uint8_t* cache, size_t cell, int c
     }
     return *reinterpret_cast<const uint4*>(row + kFp8RopeOff + (ch - kFp8Codes / 8) * 16);
 }
-__device__ __forceinline__ uint4 half8(const uint16_t*, uint4 v, int) {
-    return make_uint4(bf2_to_h2(v.x), bf2_to_h2(v.y), bf2_to_h2(v.z), bf2_to_h2(v.w));
-}
+__device__ __forceinline__ uint4 half8(const uint16_t*, uint4 v, int) { return v; }
 __device__ __forceinline__ uint32_t e4m3x2_to_h2(uint32_t codes, __half2 scale) {
     const __half2 h = __hmul2(__half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) codes, __NV_E4M3)), scale);
     return *reinterpret_cast<const uint32_t*>(&h);
 }
 __device__ __forceinline__ uint4 half8(const uint8_t*, uint4 v, int ch) {
-    if (ch >= kFp8Codes / 8) return half8((const uint16_t*) nullptr, v, ch);
+    if (ch >= kFp8Codes / 8) return make_uint4(bf2_to_h2(v.x), bf2_to_h2(v.y), bf2_to_h2(v.z), bf2_to_h2(v.w));
     const __half2 s = __float2half2_rn(__uint_as_float(v.z));
     return make_uint4(e4m3x2_to_h2(v.x & 0xffffu, s), e4m3x2_to_h2(v.x >> 16, s), e4m3x2_to_h2(v.y & 0xffffu, s), e4m3x2_to_h2(v.y >> 16, s));
 }
@@ -601,7 +606,7 @@ void prepare_impl(const float* q, const float* q_abs, const float* kv_raw, const
 
 template <typename C> struct RowOf;
 template <> struct RowOf<float> { using T = RowF32; };
-template <> struct RowOf<uint16_t> { using T = RowBf16; };
+template <> struct RowOf<uint16_t> { using T = RowF16; };
 template <> struct RowOf<uint8_t> { using T = RowFp8; };
 
 int chunks_of(int max_cells) { return std::max(1, (max_cells + mqa::kChunk - 1) / mqa::kChunk); }

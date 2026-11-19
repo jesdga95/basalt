@@ -64,7 +64,7 @@ public:
     const std::string& path() const { return path_; }
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     int device() const { return device_; }
-    /// --kv fp8: the sparse layers' latent rows as FP8 (default BF16).
+    /// --kv fp8: the sparse layers' latent rows as FP8 (default fp16).
     bool cache_fp8() const { return fp8_; }
     /// --kv f32 (diagnostic): every latent row as fp32, the reference's own precision.
     bool cache_f32() const { return f32_; }

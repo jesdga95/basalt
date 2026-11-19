@@ -637,7 +637,7 @@ public:
     // (running_state). A ring holds the last swa_ring() (window layers) or kRawRing (indexer rows) positions, so a checkpoint
     // at `pos` is intact while the session has not run more than kMaxRows rows past it.
 
-    int cell_format() const { return fp8() ? 1 : f32() ? 2 : 0; }
+    int cell_format() const { return fp8() ? 1 : f32() ? 2 : 3; }   // 3: fp16 rows
     size_t ring_bytes() const { return (size_t) swa_ring() * kRowWidth * elem(); }
     size_t raw_bytes() const { return (size_t) kRawRing * g_.idx_dim * 4; }
 
@@ -2459,7 +2459,7 @@ private:
     std::shared_ptr<core::ExpertTier> tier_;
     std::vector<float> lookup_host_;
     std::vector<bool> lookup_loaded_;
-    std::vector<uint8_t*> cache_;   // a sparse layer's rows in the --kv format, a window layer's BF16
+    std::vector<uint8_t*> cache_;   // a sparse layer's rows in the --kv format, a window layer's fp16
     std::vector<float*> ival_, igate_;
     std::vector<uint16_t*> ipool_;   // fp16 pooled keys
     DflyHook dfly_;   // DFLY HOOK
