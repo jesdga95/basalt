@@ -58,8 +58,8 @@ constexpr int kCandCap = 5120;
 constexpr int kResCap = 128;
 constexpr int kSampleStride = 32;             ///< the candidate threshold comes from every 32nd block
 /// The calls (a batch of up to 256 queries) that take the two-pass path: the batch's last query has at least this
-/// many blocks (32,768 cells).
-constexpr int64_t kMinBlocks = 8192;
+/// many blocks (65,536 cells).
+constexpr int64_t kMinBlocks = 16384;
 
 /// The per-query coefficients of eps_b = kl_b * P + kh_b * Q (+ kAbs), from the head norm sums a and c.
 BASALT_TP_HD inline void coefficients(double a, double c, double& P, double& Q) {
