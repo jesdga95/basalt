@@ -167,6 +167,7 @@ public:
         logits_ = f((int64_t) kMaxWindow * g_.n_vocab); pick_ = (int32_t*) alloc(4 * 32, ok);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxWindow, (int) g_.n_vocab) + (int64_t) kMaxWindow * (bk::kLogprobStride + 1));
         q8_ = alloc(std::max<size_t>(bk::native_q8_1_bytes(16384, kMaxWindow), 1 << 16), ok);
+        xq_n_ = alloc(bk::native_q8_1_bytes(g_.n_embd, kMaxWindow), ok);
         ex_xq_ = alloc(bk::native_q8_1_bytes(g_.n_latent, kMaxWindow), ok);
         ex_scr_ = alloc(bk::native_expert_scratch_bytes(kLookupK, g_.n_ff_exp), ok);
         ex_rows_ = f((int64_t) kLookupK * g_.n_latent);
@@ -872,6 +873,15 @@ private:
         }
         q8_0_heads_gemv(w->ptr, x, x_head_stride, x_tok_stride, H, rows, k, R, y, stream_);
     }
+    // A window's normed input xn_ quantized once for the products that read it (gemm quantizes per call): the same kernels and
+    // bits, fewer launches. A chunk keeps gemm.
+    void quant_n(int R) {
+        if (R <= kMaxWindow) bk::native_quantize_q8_1(xn_, xq_n_, g_.n_embd, R, stream_);
+    }
+    void gemm_n(const DevTensor* w, float* y, int n_out, int R) {
+        if (R > kMaxWindow) return gemm(w, xn_, y, g_.n_embd, n_out, R);
+        bk::native_mmvq(w->type, w->ptr, xq_n_, y, g_.n_embd, n_out, R, stream_);
+    }
     const DevTensor* T(int l, const char* s) const { return m_.tensor(l, s); }
     const float* F(int l, const char* s) const { return (const float*) m_.tensor(l, s)->ptr; }
 
@@ -917,10 +927,11 @@ private:
         const int E = g_.n_embd, rank = g_.kv_lora;
         const MlaArgs a = mla_args(H, swa ? g_.rope_base_swa : g_.rope_base);
         if (phases & kQuery) {
-            gemm(T(l, "attn_q_a.weight"), xn_, qa_, E, g_.q_lora, R);
+            quant_n(R);
+            gemm_n(T(l, "attn_q_a.weight"), qa_, g_.q_lora, R);
             bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
             gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
-            gemm(T(l, "attn_kv_a_mqa.weight"), xn_, kvraw_, E, rank + g_.rope_dim, R);
+            gemm_n(T(l, "attn_kv_a_mqa.weight"), kvraw_, rank + g_.rope_dim, R);
         }
         if (!(phases & (kCells | kOutput))) return true;
         // the cells each row attends
@@ -1016,7 +1027,7 @@ private:
         else mla_attend(qcur_, (const uint16_t*) cache, rs, R, sinks, a, ring, max_cells(l), attw_, olat_, stream_);
         heads_product(T(l, "attn_v_b.weight"), olat_, rank, H * rank, H, g_.v_dim, rank, R, vout_);
         if (diag(l)) dump("attn_kqv-" + std::to_string(l), vout_, (int64_t) R * H * g_.v_dim);
-        gemm(T(l, "attn_gate.weight"), xn_, gate_, E, H * g_.v_dim, R);
+        gemm_n(T(l, "attn_gate.weight"), gate_, H * g_.v_dim, R);   // xn_ as the query phase quantized it
         mul_sigmoid(gate_, vout_, R * H * g_.v_dim, stream_);
         if (diag(l)) dump("attn_gated-" + std::to_string(l), vout_, (int64_t) R * H * g_.v_dim);
         gemm(T(l, "attn_output.weight"), vout_, attn_raw_, H * g_.v_dim, E, R);
@@ -1626,11 +1637,12 @@ private:
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
         bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
-        gemm(T(l, "ffn_routed_down.weight"), xn_, xlat_, E, L, R);
+        quant_n(R);
+        gemm_n(T(l, "ffn_routed_down.weight"), xlat_, L, R);
         if (!prompt) publish(0, std::min(kMaxWindow, R));
         float *sg = gu_, *su = gu_ + (size_t) R * g_.n_ff_exp;
-        gemm(T(l, "ffn_gate_shexp.weight"), xn_, sg, E, g_.n_ff_exp, R);
-        gemm(T(l, "ffn_up_shexp.weight"), xn_, su, E, g_.n_ff_exp, R);
+        gemm_n(T(l, "ffn_gate_shexp.weight"), sg, g_.n_ff_exp, R);
+        gemm_n(T(l, "ffn_up_shexp.weight"), su, g_.n_ff_exp, R);
         bk::swiglu_scaled(sg, su, nullptr, nullptr, h_, R, g_.n_ff_exp, g_.n_ff_exp, stream_);
         gemm(T(l, "ffn_down_shexp.weight"), h_, sh_, g_.n_ff_exp, E, R);
     }
@@ -2415,6 +2427,7 @@ private:
     std::set<std::pair<int, int>> loaded_;   // (type, rows) the MMQ tiles are loaded for
     void *mmq_xq_ = nullptr;
     int32_t *mmq_ident_ = nullptr, *heads_ids_ = nullptr, *heads_bounds_ = nullptr;
+    void* xq_n_ = nullptr;   // quant_n
     void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr, *ex_plan2_ = nullptr;
     float* ex_rows_ = nullptr;
     float *h_x_ = nullptr, *d_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_e_ = nullptr, *h_erows_ = nullptr, *h_evalid_ = nullptr;
