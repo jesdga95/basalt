@@ -17,10 +17,10 @@ file and picks the chat format, tool syntax and thinking switch. Several models 
 | `--kv` | fp16 (default), int8, q4_0, k8v4 | fp8 (default: FP8 window, FP4 compressed rows), fp16 | fp16 (default), int8 | fp16 (default), fp8 |
 | Cards | main card plus up to three expert-tier cards | main card plus one expert-tier card | main card only | main card plus up to three expert-tier cards |
 | Layer split | yes, matched cards, priced at start | no | no | no |
-| Parallel slots | yes; each slot drafts | yes; each slot drafts | yes; each slot drafts | — |
+| Parallel slots | yes; each slot drafts | yes; each slot drafts | yes; each slot drafts | not measured |
 | Lossy flags | `--relaxed-drafting`, `--route-prior`, `--route-tail-skip` (off) | none | none | none |
 | Prompt skip | no | yes (`--no-prompt-skip` turns it off) | no | no |
 | Idle sleep, wake | yes (Linux) | yes (Linux); a second-card sleep may be refused | no | yes (Linux) |
 | `basalt-bench --quality` | yes | yes, one row per window | yes | yes |
 | Guide | [guide](qwen38-flash-next.md) | [guide](deepseek41.md) | [guide](qwen38-27b.md) | [guide](hy4-flash.md) |
-| Precision | [precision](../precision/qwen38-flash-next.md) | [precision](../precision/deepseek41.md) | [precision](../precision/qwen38-27b.md) | [quality](../precision/quality.md) |
+| Precision | [precision](../precision/qwen38-flash-next.md) | [precision](../precision/deepseek41.md) | [precision](../precision/qwen38-27b.md) | [precision](../precision/hy4-flash.md) |

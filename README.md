@@ -56,7 +56,7 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 | Images | yes | yes | yes | yes |
 | Documents (PDF, text) | yes | yes | yes | yes |
 | Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) | [guide](docs/models/qwen38-27b.md) | [guide](docs/models/hy4-flash.md) |
-| Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) | [precision](docs/precision/qwen38-27b.md) | [quality](docs/precision/quality.md) |
+| Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) | [precision](docs/precision/qwen38-27b.md) | [precision](docs/precision/hy4-flash.md) |
 
 All models compared, with each one's context limit, flags and cards: [models](docs/models/index.md).
 

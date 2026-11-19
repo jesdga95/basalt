@@ -166,13 +166,13 @@ python3 tools/convert/convert.py --verify Hy4-flash-NVFP4.basalt --gguf Hy4-flas
   whole; `--hf-dir` also gives `LICENSE` and `config.json`.
 - 158.7 GB (experts 83.58, Engram 63.36, dense 7.45 + 0.97, projector 1.04, drafter 1.69). Every rounding is deterministic and runs once,
   in pieces by worker processes. `--verify` repeats each rounding against the BF16 GGUF and compares the bytes; it takes as long as
-  the build. The tensor table and the choices behind it: [pack](models/hy4-flash/pack.md#the-nvfp4-pack-from-the-bf16-gguf).
+  the build. How each tensor rounds: [precision](precision/hy4-flash.md#weights).
 
 ## Hy4-flash test pack
 
 From [AngelSlim/Hy4-flash-GGUF](https://huggingface.co/AngelSlim/Hy4-flash-GGUF)'s Q4_K_M (`general.architecture` `hy_v4_flash`)
 plus the model's Hugging Face directory ([tencent/Hy4-flash](https://huggingface.co/tencent/Hy4-flash): `LICENSE` and `config.json`
-only). Nothing is requantized; [the design](models/hy4-flash/pack.md) has the tensor table.
+only). Nothing is requantized: every tensor keeps its GGUF bytes and name.
 
 ```sh
 python3 tools/convert/convert.py --gguf Hy4-flash-Q4_K_M-00001-of-00002.gguf --hf-dir tencent-Hy4-flash \
@@ -182,9 +182,10 @@ python3 tools/convert/convert.py --verify Hy4-flash-Q4_K_M-test.basalt --gguf Hy
 
 - `dense`, `dense.index`, `gguf`: as the DeepSeek pack (`gguf` holds every non-expert tensor, so float tensors are also in
   `dense`). Three-dimensional tensors (`attn_k_b`, `attn_v_b`) keep their GGUF shape in `meta.tensors`; their dense-index row is
-  `(ne0, product of the rest)`.
+  `(ne0, product of the rest)`. The projections (attention, latent, shared expert, layer 0's FFN, Engram key/value, indexer)
+  and the token embedding are Q8_0, the head BF16 (742 MB), norms, hyper-connections, router and biases F32.
 - `experts`, `experts.layout` (v5): one row per MoE layer by layer id, 1 to 41 (layer 0 is dense and has no row). Gate and up are
-  Q4_K, down Q6_K or Q4_K, so a layer's blob is 3,981,312 or 4,589,568 bytes.
+  Q4_K, down Q6_K (19 layers) or Q4_K (22), so a layer's blob is 3,981,312 or 4,589,568 bytes; 89.49 GB in all.
 - `engram`: the table, 96 x 660,006,416 `F8_E4M3_RAW` (llama.cpp's type 43: one E4M3 code per value, no scale), 2 MiB aligned.
 - `mtp/dense`, `mtp/dense.index`, `mtp/experts`, `mtp/experts.layout`: the GGUF's next-n block (the last block), BF16 as stored,
   laid out like the main sections (`meta.mtp.dense_shapes` has the 3-D shapes). The official checkpoint has no such layer, so

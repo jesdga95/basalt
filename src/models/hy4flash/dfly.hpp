@@ -1,6 +1,6 @@
 // src/models/hy4flash/dfly.hpp - the DFly2 drafter of Hy4-flash: its pack section and weights, what the target leaves for it
 // (a tap of each window's last-layer hidden states and index selections), the block pass over the target's own KV, and the
-// flags. The forward and every assumption in it are in docs/models/hy4-flash/dfly2.md.
+// flags. The forward and its assumptions are below; the inference reference is vLLM's hy_v4 DFly drafter.
 //
 // A block is the anchor token (the last pick, whose position the target has not run) and `n` mask tokens. The anchor's
 // embedding is fused with the target's last-layer hidden state at the row before it (Gated Fusion); five dense MLA layers
@@ -9,6 +9,29 @@
 // with the embedding of the token drafted before it, and the target's output head gives the draft. The drafter keeps no
 // cache and no indexer: a rejected block leaves nothing behind. Drafts are greedy; the target's own pick decides every row,
 // so a draft only changes the speed.
+//
+// The forward. A block is the anchor `a` at position `pos` and n (1..5) mask tokens, rows at pos .. pos + n; `s` = pos - 1 is
+// the source row, the target row whose output chose `a`; e() is the target's token embedding.
+//   1. Gated Fusion, row 0 only: x0 = e(a) + gate * eh_proj(enorm(e(a)) :: hnorm(h_s)), h_s the target's last-layer hidden
+//      state at row s after the output norm. Rows 1..n: e(mask).
+//   2. Five dense layers, one residual stream (no hyper-connections), pre-norm: y = input_ln(x);
+//      x += post_proj_norm(o_proj(attention(y))); x += mlp(post_attention_ln(x)), a plain SwiGLU (no clamp). z = final_norm(x).
+//   3. Attention of layer i: the target's absorbed MLA with the drafter's own weights. q = q_b(q_a_ln(q_a(y))), heads of 192
+//      nope + 64 rope; latent kv_a_ln(kv_a(y)[:512]), rope part kv_a(y)[512:]; interleaved-pair rope at the target sparse layers'
+//      base, position pos + r; kv_b rows per head are 192 key rows then 256 value rows, used absorbed; scale 1/sqrt(256);
+//      the sink adds exp(sink) to the softmax denominator; the output is gated by sigmoid(linear_gate(y)), then o_proj.
+//      KV Share: the keys and values are target layer kv_layers[i]'s cache rows (FP8 rows decoded exactly under --kv fp8).
+//      Index Share: the rows are the cells target layer idx_layers[i] selected for row s (every position before pos while its
+//      indexer keeps them all), the same for every block row; block row r also attends the block's rows 0..r, whose K/V come
+//      from the drafter's own kv_a and live in scratch (rounded to FP8 rows first under --kv fp8). Nothing is written into
+//      the target's cache.
+//   4. Hidden-Correction, in order, draft j = 0..n-1 from row j + 1 and the token before it (a, then draft j - 1):
+//      c = hidden_norm(z[j+1]) :: embed_norm(e(prev)), h' = z[j+1] + down(silu(gate(c)) * up(c)).
+//   5. Head: the target's output head over h', argmax. Row 0's output is not used; its K/V feed the later rows.
+// Assumptions the reference leaves open: the confidence is sigmoid(confidence_head(h')) (vLLM does not load the head; it only
+// steers the draft policy's window choice); rope positions are text positions, so after a picture the block turns by the
+// text's rotary position; the draft layers read sparse target layers (checked at load); a pack with a context local window
+// (dfly_context_local_window) is refused.
 #pragma once
 
 #include "basalt/core/loader.hpp"
