@@ -87,9 +87,9 @@ __global__ void gather_fp8_kernel(const uint8_t* __restrict__ cache, const int32
         uint16_t v;
         if (c < kDflyRank) {
             const float f = __half2float(__half(__nv_cvt_fp8_to_halfraw(src[c], __NV_E4M3))) * scale[c >> 7];
-            v = (uint16_t) (__float_as_uint(f) >> 16);   // exact: the value is a BF16 one
+            v = __half_as_ushort(__float2half_rn(f));   // exact: the value is an fp16 one
         } else {
-            v = rope[c - kDflyRank];
+            v = __half_as_ushort(__float2half_rn(__uint_as_float((uint32_t) rope[c - kDflyRank] << 16)));
         }
         out[(size_t) j * kDflyRowWidth + c] = v;
     }

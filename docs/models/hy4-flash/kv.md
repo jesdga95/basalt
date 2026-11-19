@@ -7,13 +7,17 @@ What the attention caches hold under `--kv`, how the FP8 rows round, how the cac
 
 | Cache | Default (16-bit) | `--kv fp8` | vLLM, `--kv-cache-dtype fp8` |
 |---|---|---|---|
-| Sparse layers' latent rows (12 layers, every position) | 576 values, 1,152 B | `fp8_ds_mla` row, 656 B | `fp8_ds_mla` row, 656 B |
+| Sparse layers' latent rows (12 layers, every position) | 576 fp16 values, 1,152 B | `fp8_ds_mla` row, 656 B | `fp8_ds_mla` row, 656 B |
 | Window rings (30 layers, 512 + 2,048 rows) | 16-bit | 16-bit | `fp8_ds_mla` pages (the same backend as the sparse layers) |
 | Indexer pooled keys (12 layers, one per 4 positions) | FP16, 256 B | FP16 | E4M3 after a 128-point Walsh-Hadamard rotation, a power-of-two scale, whatever the KV type |
 | Drafter block rows (scratch) | 16-bit | FP8 rows, decoded | written into the target's FP8 cache |
 
 A position costs 14.6 KB with 16-bit rows and 8.6 KB with FP8 rows (12 rows and three pooled-key bytes in four): 3.6 / 2.1 GiB at
 256K, 14.3 / 8.4 GiB at 1M.
+
+The 16-bit rows are fp16 (`--kv fp16`, the default), as Basalt's other models keep theirs and as the BF16 reference's llama.cpp
+run kept its cache (its default `-ctk f16`): the latent is at most sqrt(512) x 0.652 = 14.8 and the rope values at most 89 over all 42
+layers' weights, far inside fp16's range, with 3 more mantissa bits than BF16.
 
 ## The FP8 row
 
