@@ -50,6 +50,12 @@ float* devf(size_t n) {
 double sig(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
 int failures = 0;
+uint64_t fnv(const std::vector<float>& v) {
+    uint64_t h = 1469598103934665603ull;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(v.data());
+    for (size_t i = 0; i < v.size() * 4; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
 void report(const char* what, const std::vector<float>& got, const std::vector<double>& ref, double tol) {
     double max_abs = 0, max_ref = 0;
     for (size_t i = 0; i < got.size(); ++i) {
@@ -418,6 +424,7 @@ void test_mla() {
                 char name[96];
                 std::snprintf(name, sizeof name, "mla_attend %d heads%s%s", heads, mode, bf ? ", bf16 chunk" : "");
                 report(name, got, ref, bf ? 1e-3 : 1e-4);
+                if (bf) std::printf("%-30s %016llx\n", "  output hash", (unsigned long long) fnv(got));
                 const int TW = 6;
                 if (bf) mla_attend(dqcur, dc16, rs, TW, ds, a, rg, max_cells, work, dlat, nullptr);
                 else mla_attend(dqcur, dc32, rs, TW, ds, a, rg, max_cells, work, dlat, nullptr);
@@ -1005,6 +1012,93 @@ void bench_mla() {
     cudaStreamDestroy(st);
 }
 
+// A chunk of rows (the tensor-core kernel) over FP8 rows: against the plain reference over the decoded rows, against the window
+// kernel row by row, and a row's output alone among 9 rows.
+void test_fp8_chunk() {
+    MlaArgs a;
+    a.heads = 32;
+    const int W = a.rank + a.rope, Q = a.nope + a.rope, N = 1200, T = 12, stride = 1300;
+    std::vector<float> q = randn((size_t) N * a.heads * Q), qabs = randn((size_t) N * a.heads * a.rank, 0.3f), kvraw = randn((size_t) N * W, 2.f),
+                       norm = randn(a.rank, 0.5f), sinks = randn(a.heads);
+    for (auto& v : norm) v += 1.f;
+    float *dq = dev(q), *dqa = dev(qabs), *dkv = dev(kvraw), *dn = dev(norm), *ds = dev(sinks);
+    float *dqcur = devf((size_t) N * a.heads * W), *dlat = devf((size_t) T * a.heads * a.rank), *d1 = devf((size_t) 9 * a.heads * a.rank);
+    void* work = nullptr;
+    cudaMalloc(&work, mla_attend_work_bytes(a.heads, N, T));
+    cudaMemset(work, 0, mla_attend_work_bytes(a.heads, N, T));
+    uint8_t* dc = nullptr;
+    cudaMalloc(&dc, (size_t) N * kFp8RowBytes);
+    mla_prepare(dq, dqa, dkv, dn, a, 0, N, 0, dqcur, dc, nullptr);
+    std::vector<uint8_t> rows = host(dc, (size_t) N * kFp8RowBytes);
+    std::vector<float> dec((size_t) N * W), qcur = host(dqcur, (size_t) T * a.heads * W);
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* row = &rows[(size_t) n * kFp8RowBytes];
+        float sc[4];
+        std::memcpy(sc, row + 512, sizeof sc);
+        for (int c = 0; c < a.rank; ++c) {
+            const uint8_t b = row[c];
+            const int e = (b >> 3) & 15, m = b & 7;
+            const double v = e ? std::ldexp(1.0 + m / 8.0, e - 7) : std::ldexp((double) m, -9);
+            dec[(size_t) n * W + c] = (float) (((b & 0x80) ? -v : v) * sc[c >> 7]);
+        }
+        for (int c = 0; c < a.rope; ++c) {
+            uint16_t b;
+            std::memcpy(&b, row + 528 + 2 * c, 2);
+            dec[(size_t) n * W + a.rank + c] = from_bf16(b);
+        }
+    }
+    for (int use_cells = 0; use_cells < 2; ++use_cells) {
+        std::vector<int32_t> firsts(T), counts(T), cl((size_t) T * stride, 0);
+        std::vector<std::vector<int>> lists(T);
+        for (int t = 0; t < T; ++t) {
+            firsts[t] = 0;
+            if (use_cells)
+                for (int c = t % 2; c < N && (int) lists[t].size() < 600 + 37 * t; c += 2) lists[t].push_back(c);
+            else
+                for (int c = 0; c < 1000 + 13 * t; ++c) lists[t].push_back(c);
+            counts[t] = (int) lists[t].size();
+            for (int j = 0; j < counts[t]; ++j) cl[(size_t) t * stride + j] = lists[t][j];
+        }
+        int32_t *df = dev(firsts), *dcnt = dev(counts), *dcl = dev(cl);
+        RowSpans rs;
+        rs.firsts = df;
+        rs.counts = dcnt;
+        rs.cells = use_cells ? dcl : nullptr;
+        rs.cells_stride = stride;
+        mla_attend(dqcur, dc, rs, T, ds, a, 0, N, work, dlat, nullptr);
+        const std::vector<float> got = host(dlat, (size_t) T * a.heads * a.rank);
+        std::vector<double> ref, win;
+        for (int t = 0; t < T; ++t) {
+            for (int h = 0; h < a.heads; ++h) {
+                std::vector<float> qrow(qcur.begin() + (size_t) t * a.heads * W, qcur.begin() + (size_t) (t + 1) * a.heads * W);
+                std::vector<double> o = ref_attend(qrow, dec, lists[t], h, a, sinks[h]);
+                ref.insert(ref.end(), o.begin(), o.end());
+            }
+            RowSpans r1;   // the window kernel: the row alone
+            r1.firsts = df + t;
+            r1.counts = dcnt + t;
+            r1.cells = use_cells ? dcl + (size_t) t * stride : nullptr;
+            r1.cells_stride = stride;
+            mla_attend(dqcur + (size_t) t * a.heads * W, dc, r1, 1, ds, a, 0, N, work, d1, nullptr);
+            const std::vector<float> w1 = host(d1, (size_t) a.heads * a.rank);
+            win.insert(win.end(), w1.begin(), w1.end());
+        }
+        report(use_cells ? "mla_attend fp8 chunk, cells" : "mla_attend fp8 chunk, spans", got, ref, 1e-3);
+        report("  against the window kernel", got, win, 1e-3);
+        if (!use_cells) {
+            RowSpans r9;
+            r9.firsts = df + 1;
+            r9.counts = dcnt + 1;
+            mla_attend(dqcur + (size_t) a.heads * W, dc, r9, 9, ds, a, 0, N, work, d1, nullptr);
+            const bool same = std::memcmp(host(d1, (size_t) a.heads * a.rank).data(), got.data() + (size_t) a.heads * a.rank, (size_t) a.heads * a.rank * 4) == 0;
+            std::printf("%-30s %s\n", "  row independence", same ? "bitwise" : "FAIL");
+            failures += !same;
+        }
+        cudaFree(df); cudaFree(dcnt); cudaFree(dcl);
+    }
+    cudaFree(dq); cudaFree(dqa); cudaFree(dkv); cudaFree(dn); cudaFree(ds); cudaFree(dqcur); cudaFree(dlat); cudaFree(d1); cudaFree(dc); cudaFree(work);
+}
+
 void test_mmq_dense() {
     namespace mmq = basalt::prefill::mmq;
     const int R = 64, rows = 1536, K = 3072;
@@ -1228,6 +1322,7 @@ int main() {
     test_fp8();
     test_query();
     test_mla_long();
+    test_fp8_chunk();
     test_mmq_dense();
     test_mmq_expert(12, "mmq experts Q4_K");
     test_mmq_expert(14, "mmq experts Q6_K");
