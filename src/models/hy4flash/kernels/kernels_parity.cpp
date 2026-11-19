@@ -9,6 +9,7 @@
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -285,6 +286,8 @@ float from_bf16(uint16_t b) {
     std::memcpy(&f, &u, 4);
     return f;
 }
+uint16_t to_f16(float f) { return __half_as_ushort(__float2half_rn(f)); }
+float from_f16(uint16_t b) { return __half2float(__ushort_as_half(b)); }
 
 // a reference for the attention of one row over `cells` of a cache (given as floats)
 std::vector<double> ref_attend(const std::vector<float>& qcur, const std::vector<float>& cache, const std::vector<int>& cells, int h,
@@ -324,7 +327,7 @@ void test_mla() {
             float *dqcur = devf((size_t) T * heads * W), *dlat = devf((size_t) T * heads * a.rank);
             std::vector<float> cache = cache0;
             std::vector<uint16_t> cbf(cache.size());
-            for (size_t i = 0; i < cache.size(); ++i) cbf[i] = to_bf16(cache[i]);
+            for (size_t i = 0; i < cache.size(); ++i) cbf[i] = to_f16(cache[i]);
             float* dc32 = dev(cache);
             uint16_t* dc16 = dev(cbf);
             if (bf) mla_prepare(dq, dqa, dkv, dn, a, pos0, T, ring, dqcur, dc16, nullptr);
@@ -334,7 +337,7 @@ void test_mla() {
             if (bf) {
                 std::vector<uint16_t> r = host(dc16, cbf.size());
                 rows32.resize(r.size());
-                for (size_t i = 0; i < r.size(); ++i) rows32[i] = from_bf16(r[i]);
+                for (size_t i = 0; i < r.size(); ++i) rows32[i] = from_f16(r[i]);
             }
             // references: query rows and cache rows
             std::vector<double> rq((size_t) T * heads * W);
@@ -361,12 +364,12 @@ void test_mla() {
                 const size_t cell = ring ? pos % ring : pos;
                 for (int c = 0; c < W; ++c) {
                     const double got = rows32[cell * W + c];
-                    rows_ok = rows_ok && std::fabs(got - row[c]) <= (bf ? 8e-3 * (std::fabs(row[c]) + 1e-2) : 6e-5 + 3e-5 * std::fabs(row[c]));   // the rotation's angle is fp32
+                    rows_ok = rows_ok && std::fabs(got - row[c]) <= (bf ? 6e-5 + 1e-3 * std::fabs(row[c]) : 6e-5 + 3e-5 * std::fabs(row[c]));   // the rotation's angle is fp32
                 }
             }
             std::vector<float> qcur_ref(rq.begin(), rq.end());
-            report(bf ? "mla_prepare query (bf16 run)" : "mla_prepare query", qcur, rq, 3e-5);
-            std::printf("%-30s %s\n", bf ? "mla_prepare rows (bf16)" : "mla_prepare rows", rows_ok ? "ok" : "FAIL");
+            report(bf ? "mla_prepare query (fp16 run)" : "mla_prepare query", qcur, rq, 3e-5);
+            std::printf("%-30s %s\n", bf ? "mla_prepare rows (fp16)" : "mla_prepare rows", rows_ok ? "ok" : "FAIL");
             failures += !rows_ok;
             // attention: row t over the last (up to) 512 positions, or over a given list
             std::vector<int32_t> firsts(T), counts(T), cells_list;
@@ -422,14 +425,14 @@ void test_mla() {
                 else mla_attend(dqcur, dc32, rs, T, ds, a, rg, max_cells, work, dlat, nullptr);
                 std::vector<float> got = host(dlat, (size_t) T * heads * a.rank);
                 char name[96];
-                std::snprintf(name, sizeof name, "mla_attend %d heads%s%s", heads, mode, bf ? ", bf16 chunk" : "");
+                std::snprintf(name, sizeof name, "mla_attend %d heads%s%s", heads, mode, bf ? ", fp16 chunk" : "");
                 report(name, got, ref, bf ? 1e-3 : 1e-4);
                 if (bf) std::printf("%-30s %016llx\n", "  output hash", (unsigned long long) fnv(got));
                 const int TW = 6;
                 if (bf) mla_attend(dqcur, dc16, rs, TW, ds, a, rg, max_cells, work, dlat, nullptr);
                 else mla_attend(dqcur, dc32, rs, TW, ds, a, rg, max_cells, work, dlat, nullptr);
                 std::vector<float> win = host(dlat, (size_t) TW * heads * a.rank);
-                std::snprintf(name, sizeof name, "  window of %d%s", TW, bf ? " (bf16)" : "");
+                std::snprintf(name, sizeof name, "  window of %d%s", TW, bf ? " (fp16)" : "");
                 report(name, win, std::vector<double>(ref.begin(), ref.begin() + win.size()), 1e-5);
                 if (!bf) {   // the chunked kernel's rows in the window are the T-row call's
                     const bool same = std::memcmp(win.data(), got.data(), win.size() * 4) == 0;
@@ -863,7 +866,7 @@ void test_query() {
                 const bool sq = host(qc1, (size_t) T * heads * W) == host(qc2, (size_t) T * heads * W);
                 const bool sc = host(c1, cap * rb) == host(c2, cap * rb);
                 char name[96];
-                std::snprintf(name, sizeof name, "mla_query %d heads, %d rows, %s", heads, T, ty == 0 ? "fp32" : ty == 1 ? "bf16" : "fp8");
+                std::snprintf(name, sizeof name, "mla_query %d heads, %d rows, %s", heads, T, ty == 0 ? "fp32" : ty == 1 ? "fp16" : "fp8");
                 std::printf("%-30s query %s, rows %s\n", name, sq ? "bitwise" : "FAIL", sc ? "bitwise" : "FAIL");
                 failures += !sq + !sc;
                 cudaFree(c1);
@@ -873,7 +876,7 @@ void test_query() {
     }
 }
 
-// The sparse layer at a long context: 2,048 selected cells (and the group's tail) of a 20,000-cell BF16 cache, rows of 6 with
+// The sparse layer at a long context: 2,048 selected cells (and the group's tail) of a 20,000-cell fp16 cache, rows of 6 with
 // differing counts (one of a single cell), and the row's independence of the window.
 void test_mla_long() {
     MlaArgs a;
@@ -882,8 +885,8 @@ void test_mla_long() {
     std::vector<float> qcur = randn((size_t) T * a.heads * W, 0.3f), sinks = randn(a.heads), cache = randn((size_t) cap * W, 0.5f);
     std::vector<uint16_t> cbf(cache.size());
     for (size_t i = 0; i < cache.size(); ++i) {
-        cbf[i] = to_bf16(cache[i]);
-        cache[i] = from_bf16(cbf[i]);
+        cbf[i] = to_f16(cache[i]);
+        cache[i] = from_f16(cbf[i]);
     }
     std::vector<int32_t> firsts(T, 0), counts(T), cells((size_t) T * stride);
     std::vector<std::vector<int>> lists(T);

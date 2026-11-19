@@ -191,7 +191,7 @@ struct DflyRunner::Impl {
     float *X = nullptr, *X1 = nullptr, *xn = nullptr, *o = nullptr, *o2 = nullptr, *mlp = nullptr, *z = nullptr;
     float *qa = nullptr, *qan = nullptr, *q = nullptr, *kvraw = nullptr, *qabs = nullptr, *qcur = nullptr, *olat = nullptr,
           *vout = nullptr, *gate = nullptr, *g = nullptr, *u = nullptr, *h = nullptr;
-    uint16_t* ctx = nullptr;   ///< the rows a layer attends, BF16: the selected ones, then the block's own
+    uint16_t* ctx = nullptr;   ///< the rows a layer attends, fp16: the selected ones, then the block's own
     uint8_t* blk8 = nullptr;   ///< with FP8 caches, the block's own rows as FP8 rows before they are decoded into ctx
     int32_t *meta_d = nullptr, *meta_h = nullptr;   ///< per layer, the rows' first cells (0) and counts
     void* attw = nullptr;                           ///< the attention's workspace (zeroed once)
@@ -510,7 +510,7 @@ model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const st
         dump_n_ = n;
         put("hid.f32", tap_->hidden_row(row), (size_t) w_->dims.E * 4);
         for (int i = 0; i < w_->dims.layers; ++i)
-            if (tap_->count(i, row) < 0 && !fp8_) put("kv" + std::to_string(i) + ".u16", caches[i], (size_t) pos * kDflyRowWidth * 2);
+            if (tap_->count(i, row) < 0 && !fp8_) put("kv" + std::to_string(i) + ".f16", caches[i], (size_t) pos * kDflyRowWidth * 2);
     }
     return {};
 }

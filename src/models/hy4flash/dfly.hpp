@@ -157,7 +157,7 @@ public:
     ~DflyRunner();
 
     /// Enqueues the block of `n` drafts (1..5) after `anchor` at `pos` on `stream`: the target's caches `cache[i]` (draft
-    /// layer i's: BF16 rows of 576, or FP8 rows with Env::fp8) and the tap's row `row`. Nothing is read from the host but the
+    /// layer i's: fp16 rows of 576, or FP8 rows with Env::fp8) and the tap's row `row`. Nothing is read from the host but the
     /// embeddings. With FP8 caches the block's own rows are rounded to FP8 rows too, as the target's would be. `rope_pos`: the
     /// rotary position of cell `pos` (< 0: `pos`); after a picture the text runs behind the cells (vision.hpp).
     bool begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const void* const* cache, void* stream,
