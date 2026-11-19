@@ -205,7 +205,6 @@ add_library(model_hy4flash STATIC src/models/hy4flash/adapter.cpp src/models/hy4
   src/models/hy4flash/vision.cpp src/models/hy4flash/vision_encoder.cpp)
 target_include_directories(model_hy4flash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_hy4flash PUBLIC model tokenizer hy4flash_kernels expert_tier tiers mmq peer_share kernels core vision_cuda ${_gpu_runtime_target})
-target_link_libraries(model_hy4flash PRIVATE engine_session)
 # the DFly2 drafter (src/models/hy4flash/dfly*)
 add_library(hy4flash_dfly_kernels STATIC src/models/hy4flash/dfly_kernels.cu)
 target_include_directories(hy4flash_dfly_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -542,6 +541,8 @@ target_link_libraries(tiers PUBLIC core kernels kernels_cpu ${_gpu_runtime_targe
 add_library(expert_tier STATIC src/core/expert_tier.cpp)
 target_include_directories(expert_tier PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
 target_link_libraries(expert_tier PUBLIC tiers peer_share mmq core kernels kernels_cpu platform ${_gpu_runtime_target})
+# the start-up pick the tier sizes its CPU pool by (program::auto_pool_workers), the same one Flash-Next uses
+target_link_libraries(expert_tier PRIVATE engine_session)
 if(BASALT_MODEL_QWEN4EXP)
 include(src/models/qwen4exp/qwen4exp.cmake)
 endif()

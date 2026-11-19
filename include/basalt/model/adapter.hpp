@@ -87,7 +87,7 @@ struct LoadRequest {
     std::string expert_profile;       ///< the routing order of the experts (empty: the file's own order)
     int expert_cache = 0;             ///< VRAM expert slots over all layers (0 or -1: from the free memory)
     uint64_t resident_budget = 0;     ///< bytes the RAM tier may take (0: from the free memory)
-    int pool_workers = 0;             ///< CPU pool workers (0: the machine's physical cores)
+    int pool_workers = 0;             ///< CPU pool workers (0: the start-up pick, program::auto_pool_workers)
     kernels::cpu::PoolAffinity pool_affinity = kernels::cpu::PoolAffinity::All;
     bool pool_affinity_given = false;
     int peer_reserve_mib = 600;       ///< VRAM a second card leaves free

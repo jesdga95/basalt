@@ -5,11 +5,9 @@
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/loader.hpp"
-#include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
-#include "basalt/program/auto_plan.hpp"
 #include "models/hy4flash/context_policy.hpp"
 
 #include <cuda_runtime.h>
@@ -99,21 +97,6 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.pool_workers = flags_.pool_workers;
     s.pool_affinity = flags_.pool_affinity;
     s.pool_affinity_given = flags_.pool_affinity_given;
-    if (s.pool_workers <= 0 && !s.pool_affinity_given && peer_devices_.empty() &&
-        std::all_of(s.layers.begin(), s.layers.end(), [](const core::ExpertTierSpec::Layer& l) {
-            return l.gu_type == GGML_TYPE_NVFP4 && l.d_type == GGML_TYPE_NVFP4;
-        })) {
-        const auto topology = platform::detect_cpu_topology(true);
-        if (topology.is_hybrid) {
-            program::AutoInputs inputs;
-            inputs.worker_cores = (int) topology.worker_cores.size();
-            inputs.p_cores = topology.p_cores;
-            inputs.e_cores = topology.e_cores;
-            inputs.hybrid = topology.is_hybrid;
-            inputs.cpu_quota = kernels::cpu::cgroup_cpu_quota();
-            s.pool_workers = program::auto_pool_workers(inputs, program::AutoAffinity::Auto);
-        }
-    }
     s.expert_profile = flags_.expert_profile;
     s.admit_uses = kAdmitUses;
     s.claims_per_row = kClaimsPerRow;
