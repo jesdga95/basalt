@@ -1,7 +1,7 @@
 // src/models/hy4flash/dfly_parity.cpp - GPU parity of the DFly2 drafter against a double-precision CPU reference written
-// from the equations of docs/models/hy4-flash/dfly2.md: the four kernels, the tap, and the whole block pass with the
-// sequential heads on small random weights (E = 256, two layers, two heads, a 300-token vocabulary) over random "target"
-// caches and selections. Synthetic: no model, no checkpoint.
+// from the equations in dfly.hpp: the four kernels, the tap, and the whole block pass with the sequential heads on small
+// random weights (E = 256, two layers, two heads, a 300-token vocabulary) over random "target" caches and selections.
+// Synthetic: no model, no checkpoint.
 #include "basalt/core/loader.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
