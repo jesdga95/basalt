@@ -21,6 +21,12 @@ public:
     model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
     std::unique_ptr<model::LoadedModel> make_model() const override { return std::make_unique<Hy4Model>(); }
 
+    // the routing order of the experts: decode routing over prose, code, conversation, structured output and agent turns
+    std::vector<std::string> shipped_profiles(const std::string& key) const override {
+        if (key != "hy4flash-42x512") return {};
+        return {key + ".prof"};
+    }
+
     std::vector<model::SideTableSpec> side_tables(const model::ModelDesc&) const override {
         return {{model::SideTableSpec::Kind::Engram, "per_layer_token_embd.weight", 96, 0}};
     }
