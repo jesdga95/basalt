@@ -1157,12 +1157,11 @@ int main(int argc, char** argv) {
                 std::printf("  glue: skipped (DEC_GU2=2 not set or formats)\n");
             }
 
-            // the staged share (no peers): the last stage_k[m] of a layer's m distinct CPU misses go to CUDA0, their blobs
-            // copied from host RAM into staging (dec_moe_stage) and computed by its grouped kernel.  The route's, the
-            // ring's, the glue's and the stage kernel's kinds against a CPU reference, the staged lists and bytes, and
-            // the tail against the same window with those experts resident in VRAM (the same bits)
+            // The staged share: the last stage_k[m] of m distinct CPU misses go to CUDA0; peer hits stay on the peer.
+            // Compare routing, copied blobs, and the tail with the same staged experts resident on CUDA0.
             if (L.bytes % 16 == 0) {
-                const int64_t stride = K::dec_moe_stage_stride((int64_t) L.bytes);
+                // A larger layer can determine the shared stride even when this layer copies fewer bytes.
+                const int64_t stride = K::dec_moe_stage_stride((int64_t) L.bytes + (two ? 128 : 0));
                 // host copies of the blobs, each 16-byte aligned at a varying offset within its 128-byte line
                 const size_t hstride = ((size_t) L.bytes + 255) / 128 * 128;
                 uint8_t* h_sb = hmap<uint8_t>((size_t) NX * hstride);
@@ -1182,10 +1181,9 @@ int main(int argc, char** argv) {
                 int32_t* d_kt = dmal<int32_t>(K::kDmCap + 1);
                 ck(cudaMemcpy(d_kt, kt.data(), kt.size() * 4, cudaMemcpyHostToDevice), "stage k");
                 uint8_t* d_stg = dmal<uint8_t>((size_t) K::kDmStageMax * stride);
-                // the reference: CUDA0's kinds, then the last stage_k[m] distinct misses with a host address, every
-                // entry of theirs
+                // Keep the peer tier in the two-device case; use the original single-card check on one device.
                 std::vector<int32_t> rk(n);
-                for (int i = 0; i < n; ++i) rk[i] = res0[ids[i]] >= 0 ? 0 : -1;
+                for (int i = 0; i < n; ++i) rk[i] = two ? kind[i] : res0[ids[i]] >= 0 ? 0 : -1;
                 std::vector<int> firsts;
                 for (int i = 0; i < n; ++i) {
                     bool first = rk[i] < 0;
@@ -1206,7 +1204,7 @@ int main(int argc, char** argv) {
                 }
                 uint32_t* sw = hmap<uint32_t>(64);
                 K::DmRouteArgs rs = ra;
-                rs.res1 = nullptr;
+                if (!two) rs.res1 = nullptr;
                 rs.host_seq_m = sw; rs.peer_seq_m = sw + 16;
                 rs.stage_src = d_src; rs.stage_k = d_kt;
                 ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
@@ -1219,6 +1217,7 @@ int main(int argc, char** argv) {
                 size_t bst = 0;
                 for (int i = 0; i < n; ++i) bst += S.kind[i] != rk[i] || h_rings[5].kind[i] != rk[i];
                 bst += h_rings[5].n_cpu != rnc || S.counts[3] != rnc || S.scounts[0] != (int) staged.size();
+                bst += h_rings[5].n_peer != (two ? np : 0) || S.counts[2] != (two ? np : 0);
                 const auto stg = down(d_stg, (size_t) K::kDmStageMax * stride);
                 std::vector<int> sseen(n, 0);
                 int nse = 0;
@@ -1254,7 +1253,7 @@ int main(int argc, char** argv) {
                 float* d_ba = dmal<float>((size_t) MT * H);
                 float* d_bb = dmal<float>((size_t) MT * H);
                 K::DmRouteArgs rr = ra;
-                rr.res0 = d_res2; rr.res1 = nullptr; rr.plan = d_plan2;
+                rr.res0 = d_res2; rr.res1 = rs.res1; rr.plan = d_plan2;
                 rr.ring_m = h_rings + 7; rr.x_m = h_x + (size_t) 7 * MT * H; rr.xq_m = h_xq + 7 * xq_stride;
                 rr.host_seq_m = sw + 32; rr.peer_seq_m = sw + 48;
                 K::dec_moe_route(rr, s0);
@@ -1327,6 +1326,20 @@ int main(int argc, char** argv) {
                         std::printf("  bench: staged compute T=%d, %d groups, %d block rows: %.1f us\n", T, (int) staged.size(),
                                     rows, us);
                     }
+                if (two && !staged.empty()) {
+                    int32_t* off = dmal<int32_t>(1);
+                    ck(cudaMemsetAsync(off, 1, sizeof(int32_t), s0), "busy staging window");
+                    rs.stage_off = off;
+                    K::dec_moe_route(rs, s0);
+                    K::dec_moe_stage(rs, d_stg, stride, (int64_t) L.bytes, 8, s0);
+                    ck(cudaStreamSynchronize(s0), "staging disabled during refill");
+                    K::DmPlan busy;
+                    ck(cudaMemcpy(&busy, d_plan, sizeof busy, cudaMemcpyDeviceToHost), "plan");
+                    size_t wrong = busy.scounts[0] != 0 || busy.counts[2] != np || busy.counts[3] != nc;
+                    for (int i = 0; i < n; ++i) wrong += busy.kind[i] != kind[i] || h_rings[5].kind[i] != kind[i];
+                    report("busy refill keeps peer and CPU", l, wrong, (size_t) n);
+                    cudaFree(off);
+                }
                 for (void* q : {(void*) d_src, (void*) d_kt, (void*) d_stg, (void*) d_res2, (void*) d_plan2, (void*) d_pa,
                                 (void*) d_pb, (void*) d_ba, (void*) d_bb})
                     cudaFree(q);

@@ -165,8 +165,8 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     }
 }
 
-// The staged share's copy and plan (dec_moe_stage): every block derives the layer's kinds (the ring's on a card without
-// peers) and the split, then copies its part of each staged blob from host RAM into its staging slot, whole 128-byte
+// The staged share's copy and plan (dec_moe_stage): every block derives the ring's tier kinds and the split,
+// then copies its part of each staged blob from host RAM into its staging slot, whole 128-byte
 // lines (a blob starts 16-byte aligned: its first line holds the bytes before it); block 0 writes the staged groups.
 constexpr int kDmStageUnroll = 4;
 __global__ void __launch_bounds__(kDmThreads) dm_stage_kernel(DmRouteArgs a, uint8_t* staging, long long stride,
@@ -182,7 +182,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_stage_kernel(DmRouteArgs a, uin
         const int32_t e = s_ids[tid];
         bool ok = e >= 0 && e < a.n_expert;
         for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
-        s_kind[tid] = ok && a.res0[e] >= 0 ? 0 : -1;
+        s_kind[tid] = ok ? dm_tier(a, e) : -1;
     }
     __syncthreads();
     dm_stage_split(a, s_ids, s_kind, n, tid, s_first);

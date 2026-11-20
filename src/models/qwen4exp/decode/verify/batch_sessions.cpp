@@ -127,9 +127,6 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     basalt::log::info("basalt verify", "batch windows of up to %lld sequences (layers [%lld, %lld))%s", (long long) S,
                  (long long) lb_, (long long) le_, batch_stream_ ? ", the slots' K/V streamed from RAM" : "");
-    if (dm_ != nullptr && dm_->stage_src != nullptr)
-        basalt::log::info("basalt verify", "batch windows: a layer with %d+ CPU misses sends a share of them over PCIe to "
-                          "CUDA0", dm_->stage_min);
     return true;
 }
 

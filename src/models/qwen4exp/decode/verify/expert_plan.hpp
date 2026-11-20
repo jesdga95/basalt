@@ -82,7 +82,7 @@ struct DecMoe {
         bool live = false;
     };
     std::vector<XPeer> xp;
-    // the staged share (a card without peers): every expert's host-RAM address (device alias) or 0, its host copy and
+    // the staged share: every expert's host-RAM address (device alias) or 0, its host copy and
     // the source's places it was read at, the staged count per count of distinct CPU misses, the copy's own stream
     unsigned long long* stage_src = nullptr;
     unsigned long long* stage_host = nullptr;
@@ -93,6 +93,10 @@ struct DecMoe {
     int64_t stage_stride = 0;
     int stage_blocks = 0;
     int stage_min = 0;   // the fewest distinct CPU misses a layer stages a share of
+    // [0]: set while an adaptive round's copies into VRAM run (written on the adapt stream); [1]: [0] as each window
+    // starts, which every split of the window reads
+    int32_t* stage_link = nullptr;
+    bool stage_single = false;   // the mixed-size or peer extension, only with one active sequence
     // pinned staging of the residency uploads: the copies take their source from here, so the call does
     // not wait for the stream; a ring of slots, each reused only after the window's stream sync
     uint8_t* pin = nullptr;
