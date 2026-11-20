@@ -1183,8 +1183,12 @@ class Service:
                 s["first_token"] = time.time()
                 # the read time as the engine's last progress line has it; its DONE line gives the exact one later
                 progress = getattr(self.engine, "prompt_progress", None)
-                ms = (progress() or {}).get("ms") if callable(progress) else None
+                pp = (progress() or {}) if callable(progress) else {}
+                ms = pp.get("ms")
                 s["prompt_ms"] = round(ms, 1) if isinstance(ms, (int, float)) else s.get("prompt_ms")
+                # the reused prefix as the engine's RESUME line said it, until its DONE line gives it
+                if s.get("reused") is None and isinstance(pp.get("cache"), int):
+                    s["reused"] = min(pp["cache"], int(s.get("prompt_tokens") or pp["cache"]))
             (self.rate if rate is None else rate).append((time.time(), n))   # live rate window
             for ev in evs:
                 if ev.kind == "reasoning":
