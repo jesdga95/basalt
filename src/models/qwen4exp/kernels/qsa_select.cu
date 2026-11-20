@@ -816,10 +816,10 @@ __device__ __forceinline__ void st_async2(uint32_t dst, unsigned long long v, ui
 #endif
 
 // The top-k of block_topk_kernel on a thread-block cluster, the radix passes exchanged as a reduce-scatter. Each pass: a CTA sends bins
-// [32 o, 32 o + 32) of its histogram to CTA o as 16-bit counts; CTA o totals them and sends its slice total to every CTA;
-// all see which slice holds the threshold digit, whose owner finds the digit and sends it (with the cells above it) to
-// every CTA. The stores land on the receiver's mbarrier, so there is no cluster barrier or release fence per pass. Needs
-// a CTA's cell count under 65,536 (the host checks).
+// [32 o, 32 o + 32) of its histogram to CTA o as 16-bit block counts. CTA o expands to cells, corrects the partial
+// tail block, and sends its slice total to every CTA. All see which slice holds the threshold digit, whose owner finds
+// the digit and sends it (with the cells above it) to every CTA. The stores land on the receiver's mbarrier, so there is
+// no cluster barrier or release fence per pass. The host checks that each CTA's block count fits in 16 bits.
 // grid (CL_N, nq), cluster (CL_N, 1, 1), CL_T threads, dynamic shared memory: ceil(max_blocks / CL_N) keys
 __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* __restrict__ scores,
                                                                   const int32_t* __restrict__ steps, int64_t max_blocks,
@@ -866,8 +866,9 @@ __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* _
     const int64_t hi = lo + per < nbe ? lo + per : nbe;
     const int n = (int) (hi - lo);
     const int tail_i = (wtail > 0 && n_bid >= lo && n_bid < hi) ? (int) (n_bid - lo) : -1;
-    const float* sc = scores + qi * max_blocks + lo;
-    for (int i = t; i < n; i += CL_T) keys[i] = order_key(sc[i]);
+    const float* sc = scores + qi * max_blocks;
+    const uint32_t tail_key = wtail > 0 ? order_key(sc[n_bid]) : 0;
+    for (int i = t; i < n; i += CL_T) keys[i] = order_key(sc[lo + i]);
     for (int i = t; i < 2 * 256; i += CL_T) (&hloc[0][0])[i] = 0;
     __syncthreads();
     uint32_t prefix = 0;
@@ -885,8 +886,7 @@ __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* _
                 if ((k & hmask) == prefix) bin = (int) ((k >> shift) & 255);
             }
             const unsigned same = __match_any_sync(0xffffffffu, bin);
-            if (bin >= 0 && lane == __ffs(same) - 1) atomicAdd(&hl[bin], __popc(same) * R);
-            if (bin >= 0 && i == tail_i) atomicAdd(&hl[bin], wtail - R);
+            if (bin >= 0 && lane == __ffs(same) - 1) atomicAdd(&hl[bin], __popc(same));
         }
         __syncthreads();
         if (pass == 0) cl_wait();                       // phase 0 done: every CTA's shared memory is there
@@ -909,6 +909,10 @@ __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* _
             int tj = 0;
 #pragma unroll
             for (int r = 0; r < CL_N; ++r) tj += (int) ((hin[pass][r][lane >> 1] >> ((lane & 1) * 16)) & 0xffffu);
+            tj *= R;
+            // The histogram counted the tail as a full block. Its receiving bin knows the actual weight.
+            if (wtail > 0 && (tail_key & hmask) == prefix && ((tail_key >> shift) & 255u) == rank * 32u + lane)
+                tj += wtail - R;
             int stotal = tj;
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) stotal += __shfl_xor_sync(0xffffffffu, stotal, o);
@@ -1118,7 +1122,7 @@ bool topk_cluster_launch(const float* scores, const int32_t* steps, int64_t nq, 
     if (nq <= 0) return true;
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s) || nq > 65535 || max_blocks <= 0) return false;
     const int64_t per_cta = (max_blocks + CL_N - 1) / CL_N;
-    if (per_cta * R + R >= 65536) return false;   // the kernel's 16-bit counts: the one-CTA kernels take it
+    if (per_cta > 0xffff) return false;   // at most this many blocks can land in a single 16-bit bin
     const size_t smem = (size_t) per_cta * sizeof(uint32_t);
     const auto kern = block_topk_cluster_kernel;
     // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not. It needs thread-block clusters (the
