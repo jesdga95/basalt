@@ -3078,7 +3078,7 @@
       "draft_len_struct": 6.7,
       "draft_len_prose": 1.8,
       "engine_args": "--gpu 0,1,2,3 --max-context 66661 --kv int8",
-      "notes": "4x RTX 5060 Ti 16GB (PCIe 4.0 x8, no P2P), EPYC 7452, 123 GiB; expert tier; every expert held by a GPU (no SSD reads). OC: core +350, mem +6000."
+      "notes": "4x RTX 5060 Ti 16GB, PCIe 4.0 x8, P2P on all 12 pairs (NODE; patched driver, 12.2 GB/s all-reduce); EPYC 7452, 123 GiB; expert tier; no SSD reads. OC core +350, mem +6000."
     },
     {
       "submitter": "sean-248",
@@ -3135,7 +3135,7 @@
       "draft_len_struct": 6.5,
       "draft_len_prose": 1.8,
       "engine_args": "--gpu 0,1,2,3 --max-context 66661 --kv int8",
-      "notes": "4x RTX 5060 Ti 16GB (PCIe 4.0 x8, no P2P), EPYC 7452, 123 GiB; expert tier; pack copied to NVMe for the run (no SSD reads). OC: core +350, mem +6000."
+      "notes": "4x RTX 5060 Ti 16GB, PCIe 4.0 x8, P2P on all 12 pairs (NODE; patched driver, 12.2 GB/s all-reduce); EPYC 7452, 123 GiB; expert tier; NVMe copy for the run. OC core +350, mem +6000."
     },
     {
       "submitter": "sean-248",
@@ -3192,7 +3192,7 @@
       "draft_len_struct": 7.0,
       "draft_len_prose": 2.0,
       "engine_args": "--gpu 0,1,2,3 --max-context 66661 --kv int8",
-      "notes": "4x RTX 5060 Ti 16GB (PCIe 4.0 x8, no P2P), EPYC 7452, 123 GiB; expert tier; pack copied to NVMe for the run (no SSD reads). OC: core +350, mem +6000."
+      "notes": "4x RTX 5060 Ti 16GB, PCIe 4.0 x8, P2P on all 12 pairs (NODE; patched driver, 12.2 GB/s all-reduce); EPYC 7452, 123 GiB; expert tier; NVMe copy for the run. OC core +350, mem +6000."
     },
     {
       "submitter": "sean-248",
@@ -3249,7 +3249,7 @@
       "draft_len_struct": 6.9,
       "draft_len_prose": 2.0,
       "engine_args": "--gpu 0,1,2,3 --max-context 66661 --kv int8",
-      "notes": "NVFP4-DQ6_K experts (default NVFP4 pack: dense stays Q6_K); 4x RTX 5060 Ti 16GB (PCIe 4.0 x8, no P2P), EPYC 7452, 123 GiB; expert tier; no SSD reads. OC: core +350, mem +6000."
+      "notes": "4x RTX 5060 Ti 16GB, PCIe 4.0 x8, P2P on all 12 pairs (NODE; patched driver, 12.2 GB/s all-reduce); EPYC 7452, 123 GiB; DQ6_K experts (default pack); expert tier; OC core +350, mem +6000."
     },
     {
       "submitter": "sean-248",
@@ -3302,7 +3302,7 @@
       "draft_len_struct": 7.0,
       "draft_len_prose": 2.0,
       "engine_args": "--gpu 0,1,2,3 --max-context 66661 --kv int8",
-      "notes": "NVFP4 experts, Q8_0 dense (the DQ8 pack); 4x RTX 5060 Ti 16GB (PCIe 4.0 x8, no P2P), EPYC 7452, 123 GiB; expert tier; no SSD reads. OC: core +350, mem +6000."
+      "notes": "4x RTX 5060 Ti 16GB, PCIe 4.0 x8, P2P on all 12 pairs (NODE; patched driver, 12.2 GB/s all-reduce); EPYC 7452, 123 GiB; Q8_0 dense (the DQ8 pack); expert tier; OC core +350, mem +6000."
     }
   ]
 }
