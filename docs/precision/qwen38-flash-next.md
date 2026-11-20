@@ -15,7 +15,9 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 - **Closer to BF16 than llama.cpp.** Same Q8_0 weights, against the BF16 reference: llama.cpp scores KLD 0.0325, top-1 93.98%;
   the Basalt Q8_0 pack scores KLD 0.0200, top-1 95.34%.
 - **Quantized once.** GGUF packs keep their blocks. The NVIDIA NVFP4 pack keeps NVIDIA's expert codes and scales bit for bit and
-  quantizes each dense tensor once from BF16.
+  quantizes each dense tensor once from BF16. A pack from an FP4-Local checkpoint keeps its expert codes and scales the same way
+  (the CSF scale streams decode bit for bit), quantizes each MXFP8 projection once after an exact widening to f32, and stores the
+  NVFP4 n-gram table as Q8_0.
 - **Only one rounding costs measurable quality by default:** the Q6_K dense projections, about 0.006 KLD and 0.3 to 0.6 points of
   top-1 against NVIDIA's precision. Everything else costs about 0.001 or less.
 

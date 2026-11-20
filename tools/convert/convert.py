@@ -47,6 +47,9 @@ From an NVFP4 checkpoint (--sections-from with --checkpoint)
                      where rows are whole 256-value blocks, Q8_0 elsewhere and for the output head and token embedding;
                      the other tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table is FP8
                      code x scale as Q8_0. The GGUF metadata and the tokenizer come from the checkpoint's files.
+                     Model Optimizer's FP4-Local layout is read too: the shards in tensors/, expert scales as CSF stream
+                     pairs (decoded bit for bit), MXFP8 projections, F32 norm weights, and an NVFP4 n-gram table (E2M1
+                     code x UE4M3 block scale x weight_scale_2 as Q8_0)
   --dense-q8-0       Q8_0 projections instead of Q6_K (the 8-bit dense variant)
   The drafter and vision sections come from BASE byte for byte; BASE's vocabulary must be the checkpoint's.
 
@@ -602,7 +605,7 @@ def warn_unofficial():
 
 def from_checkpoint(a) -> None:
     """The language model straight from an NVFP4 safetensors checkpoint (routed experts moved into Basalt's layout,
-    every other tensor converted once from BF16, the n-gram table from FP8, metadata and tokenizer from the
+    every other tensor converted once from BF16, the n-gram table from FP8 or NVFP4, metadata and tokenizer from the
     checkpoint's files); drafter and vision are copied from BASE byte for byte."""
     import multiprocessing
     import checkpoint as C
@@ -627,8 +630,7 @@ def from_checkpoint(a) -> None:
         ck = C.Checkpoint(a.checkpoint)
         experts = C.CheckpointExperts(ck)
         dense_src = C.CheckpointDense(ck, q6k)
-        ple_paths = C.ple_table(ck)
-        ple = S.PleFp8([str(p) for p in ple_paths])
+        ple = C.ple_table(ck)
         kv = C.model_kv(ck, S.PLE_DIM, 18 if q6k else 7, a.name)
         dense = S.Dense(dense_src, False)
     except S.ConvertError as e:
@@ -695,7 +697,7 @@ def from_checkpoint(a) -> None:
                         "bytes": t.expected_bytes(), "offset": tensor_offsets[n]} for n, t in dense_src.tensors.items()}
             tens["per_layer_token_embd.weight"] = {"type": "Q8_0", "type_id": 8, "shape": [S.PLE_DIM, ple.rows],
                                                   "bytes": ple.nbytes, "offset": tensor_offsets["per_layer_token_embd.weight"]}
-            ck_files = sorted(set(ck.shards) | set(ple_paths))
+            ck_files = sorted(set(ck.shards) | set(ple.paths))
             meta = {
                 "format": "basalt", "version": 2, "name": a.name or base_meta.get("name"),
                 "converter": {"tool": "tools/convert/convert.py"},
@@ -703,10 +705,7 @@ def from_checkpoint(a) -> None:
                              "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)} for p in ck_files],
                 "gguf_kv": kv,
                 "tensors": tens,
-                "conversions": {"compat_bf16": False, "tensors": [{
-                    "name": "per_layer_token_embd.weight", "src_type": "F8_E4M3", "dst_type": "Q8_0",
-                    "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)",
-                    "scale": ple.scale}]},
+                "conversions": {"compat_bf16": False, "tensors": [{"name": "per_layer_token_embd.weight", **ple.conversion}]},
                 "license": model_license(kv),
             }
             for k in ("mtp", "vision"):
@@ -717,8 +716,9 @@ def from_checkpoint(a) -> None:
             srcs = list(dense_src.sources.values())
             meta["checkpoint"] = {
                 "dir": Path(a.checkpoint).name, "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
-                "experts": {"format": "nvfp4", "source": "weight (E2M1 pairs), weight_scale (UE4M3 per 16), "
-                            "weight_scale_2 (FP32); input_scale unused",
+                "experts": {"format": "nvfp4", "source": "weight (E2M1 pairs), weight_scale (UE4M3 per 16"
+                            + (", stored as CSF stream pairs and decoded bit for bit" if experts.csf else "")
+                            + "), weight_scale_2 (FP32); input_scale unused",
                             "repack": "codes and scales unchanged, nibbles moved into 64-value blocks",
                             "tail": "fp32 {s_gate, s_up, s_down, 0} per expert"},
                 "dense": {"projections": "Q6_K where rows are whole 256-value blocks, else Q8_0" if q6k else "Q8_0",
@@ -852,7 +852,7 @@ def main():
     ap.add_argument("--requant-dense-q6k", metavar="PACK.basalt",
                     help="copy PACK with its Q8_0 dense projections requantized to Q6_K")
     ap.add_argument("--checkpoint", metavar="DIR",
-                    help="an NVFP4 safetensors checkpoint: with --sections-from, the language model is read from it; "
+                    help="an NVFP4 or FP4-Local safetensors checkpoint: with --sections-from, the language model is read from it; "
                          "with --requant-dense-q6k, the BF16 projections")
     ap.add_argument("--dense-q8-0", action="store_true",
                     help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")
@@ -891,12 +891,12 @@ def main():
     if a.dspark and (a.checkpoint or a.requant_dense_q6k or a.sections_from):
         ap.error("--dspark goes with --gguf")
     if a.requant_dense_q6k:
-        if a.sections_from or a.gguf or a.dense_q8_0:
+        if a.sections_from or a.gguf or a.dense_q8_0 or a.dry_run:
             ap.error("--requant-dense-q6k takes only --checkpoint, --out, --workers and --force")
         requant_dense(a)
         return
     if a.sections_from and a.checkpoint:
-        if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab:
+        if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab or a.dry_run:
             ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, "
                      "--stream-shards, --workers and --force")
         if not Path(a.checkpoint).is_dir():
@@ -906,7 +906,8 @@ def main():
         from_checkpoint(a)
         return
     if a.checkpoint:
-        if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards:
+        if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards \
+                or a.dry_run:
             ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --head, --workers and --force")
         if a.drafter and not Path(a.drafter).is_dir():
             ap.error(f"missing input: {a.drafter}")
