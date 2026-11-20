@@ -4,7 +4,7 @@ Settings: [configuration](configuration/index.md). Diagnostic flags: `bin/basalt
 
 ## Start-up
 
-The page is up at once and the model loads behind it. The header reads `Loading` with the percent over a progress bar while weights load; choosing a model in the picker loads it. `/health` and `/metrics`
+The page is up at once and the model loads behind it. The header reads `Loading` with the percent over a progress bar while weights load; choosing a model in the picker loads it, and the Unload button beside the model name unloads the loaded one until the next request; each reads `Loading…` or `Unloading…` until the server shows the change, and a refused one shows its error in the header. `/health` and `/metrics`
 show the load: `load.percent` and `load.gib`, the GiB placed so far in one figure over every byte the model loads (a card, a second card, RAM), where it was one figure per target. A failed start-up load ends the server. Requests wait during a load and get a 503 if it fails.
 
 ## Concurrent requests: `--parallel N`
@@ -56,21 +56,48 @@ read the vision projector inside it.
 
 ## The stats page
 
-The server's address serves a page, updated every second from `/metrics`, `/slots` and `/api/logs`: GPU load, power, VRAM and temperature,
-RAM and disk, decode and prefill rates with 60 s charts, slots, the newest requests, and the console lines.
+The server's address serves a page, updated every second from `/metrics`, `/slots` and `/api/logs`. The top of the page always shows:
 
-Three quiet figures sit in it, each from `/metrics`:
+- Decode and prefill: the live rate with a 60 s chart; when idle, the last request's decode and the last prompt read of at least 512
+  new tokens (a cached follow-up has no meaningful read rate). The decode number's tooltip has the best decode and the conversation
+  cache; the prefill number's has the last prompt, its prefix cache hit and the best prefill (the fastest read listed when the
+  server has none yet).
+- Experts: where the last request's expert lookups were served (VRAM, a peer card, CPU and RAM, the SSD), as a legend, and a map
+  of 640 experts sampled evenly from every layer (`experts_map`): its colour is where the expert lives now, its brightness how often
+  decode looked it up lately, an ember edge a lookup off the GPUs in the last second. A dense model shows its weights by bytes.
+  Experts on the SSD turn the heading amber.
+- With no model loaded, a slow field of basalt columns on its own (8 frames a second, paused while the tab is hidden, one still
+  frame under reduced motion).
 
-- `N chats cached · X GiB` at the right of the Speed footer: the conversations parked in RAM (`conversation`: `parked`,
-  `bytes`, `evictions`, and the last restore's `restored` tokens and `restored_ms`, in the tooltip). The server reads them
-  from the engine's `conversation cache:` lines and clears them when the engine unloads, sleeps or restarts. A model that
-  prints no line when it parks (DeepSeek) shows them after its first restore, without evictions.
-- `N requests served · M tokens written` under the Slots table (`totals`: requests, prompt, reused and written tokens, prompt
-  and decode time since the server started; the rest in the tooltip).
-- The header word reads `Thinking`, `Answering` or `Tool call` (`live.phase`) while exactly one request runs.
+Under it, four tabs (keys `1` to `4`, `L` for the logs, or `#tab=req|slots|hw|logs` in the address):
 
-The log panel shows the engine's long cache lines short (`cache: restored 187k tokens in 912 ms`); the log and `/api/logs`
-keep the raw line.
+- Requests: the queue, the recent requests, tokens per request, the last request, the best since the server started, the
+  conversation cache (`conversation`: `parked`, `bytes`, `evictions`, `restored`, `restored_ms`) and the totals (`totals`).
+- Slots: a card per slot with its current request, or for an idle slot its last one, its context and its drafting; past four
+  slots, compact rows. With no model loaded the cards stay, empty.
+- Hardware: each card's load, power, temperature, VRAM and PCIe traffic, and the CPU, RAM, disk reads, experts in VRAM, driver and
+  uptime.
+- Logs: the console lines, all or warnings only. The engine's long cache lines are shown short (`cache: restored 187k tokens in
+  912 ms`); the log and `/api/logs` keep the raw line. The footer always shows the newest line and the request and token totals.
+
+The engine's own figures, which the server asks for with `STATS` once the engine is ready:
+
+- `/metrics` `experts_map`: `total` experts, and for each sampled one `tier` (0 VRAM, 1 peer card, 2 RAM, 3 file),
+  `routed` (decode lookups a second, 0 once nothing runs) and `recent` (its lookups, fading by 0.85 a second).
+- `/slots` per slot: `started` (epoch seconds), `path` (the endpoint) and `prompt_ms` (the read time) of the running request;
+  for its current or last request `accept_pos` (drafts accepted over offered by draft position) and `accept_hist` (tokens per
+  decode window, a sample a second over 60 s); for a model with routed experts `hit`: its windows' lookups split `vram`, `peer`
+  (a bus copy or another card) and `cpu`, with `lookups_s`, `peer_s` and `ram_s` a second. A batch window several slots share
+  counts its lookups for each of them; a model whose slots run through layer split stages counts none per slot.
+- `/metrics` `engine`: `commit` (the build's), and `expert_slots`, the experts every card holds now (fewer while asleep).
+- `/metrics` `hardware`: each card's `sm_clock` and `mem_clock` (MHz), `throttle` (what holds the clocks down, empty for nothing),
+  `expert_slots` and `h2d_gbps` (the host-to-device link as the start measured it; Flash-Next measures it, the other models
+  leave it out); `cpu_ccd` (the load of each group of cores that share an L3 cache), `ram_parts` (`experts` the engine holds in
+  RAM, `page_cache`, `other`; Linux only) and `disk_hist` (the read rate's last 60 s).
+
+The header word reads `Thinking`, `Answering` or `Tool call` (`live.phase`) while exactly one request runs. The conversation cache
+figures come from the engine's `conversation cache:` lines and clear when the engine unloads, sleeps or restarts; a model that prints
+no line when it parks (DeepSeek) shows them after its first restore, without evictions.
 
 ## Conversations on disk: `--conversation-cache-disk-mib`
 
@@ -110,7 +137,7 @@ Basalt refuses settings that would leave the machine without memory, and never s
   for RAM to return. A running request stops with an error only when RAM is critical (under 1 GiB free, or below the reserve under
   memory pressure). `--ram-reserve-mib 0` turns the guard off.
 - Experts on the SSD give one warning, the same for every model: `N experts on SSD (X GiB) · free X GiB RAM`. The console
-  repeats it and the stats page turns its Experts block amber.
+  repeats it and the stats page adds an SSD tier and turns its Experts heading amber.
 - The disk tier keeps its floor a GiB above the reserve.
 - `--resident-budget-gib` that would leave less than the floor is refused with the largest safe value.
 

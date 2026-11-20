@@ -2482,7 +2482,11 @@ class WebApp(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn("text/html", ctype)
         self.assertIn(b"\"web/app.js\"", body)   # relative (works behind a path-prefixed proxy)
+        for icon in (b'"web/favicon.svg"', b'"web/favicon-32.png"', b'"web/apple-touch-icon.png"'):
+            self.assertIn(icon, body)
         for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/mark.svg", "image/svg+xml"),
+                           ("/web/favicon.svg", "image/svg+xml"), ("/web/favicon-32.png", "image/png"),
+                           ("/web/apple-touch-icon.png", "image/png"),
                            ("/fonts/geist-latin-wght.woff2", "font/woff2"),
                            ("/fonts/geist-mono-latin-wght.woff2", "font/woff2")):
             with self.subTest(path=path):
@@ -2491,7 +2495,7 @@ class WebApp(unittest.TestCase):
                 self.assertIn(want, ctype)
 
     def test_only_the_app_files_are_served(self):
-        for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
+        for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/web/missing.png", "/fonts/..%2F..%2Fsetup.py",
                      "/fonts/missing.woff2", "/fonts/x.ttf"):
             with self.subTest(path=path):
                 self.assertEqual(self.get(path)[0], 404)
