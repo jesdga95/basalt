@@ -202,13 +202,32 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             std::vector<float> ref((size_t) 8 * rows), got((size_t) 8 * rows);
             for (int t = 0; t < 8; ++t)
                 for (int r = 0; r < rows; ++r) tc->vec_dot(n, &ref[(size_t) t * rows + r], 0, w + (size_t) r * rb, 0, ap[t], 0, 1);
-            size_t differ = 0;
+            size_t differ = 0, down_dispatch_diff = 0;
+            const bool q5_down = role == 1 && type == GGML_TYPE_Q5_1;
             for (int nt = 1; nt <= 8; ++nt) {
                 float* op[8];
                 for (int t = 0; t < nt; ++t) op[t] = got.data() + (size_t) t * rows;
                 cpu::kq256_rows(type, w, rb, n, ap, nt, op, 0, rows);
                 for (int t = 0; t < nt; ++t)
-                    differ += std::memcmp(op[t], ref.data() + (size_t) t * rows, (size_t) rows * 4) != 0;
+                    differ += std::memcmp(op[t], ref.data() + (size_t) t * rows, (size_t) rows * sizeof(float)) != 0;
+                if (q5_down) {
+                    // The expert pool writes a row range. Check the dispatch and the untouched part of the output.
+                    constexpr float untouched = -123.f;
+                    const int first = 7, end = rows - 9;
+                    std::fill(got.begin(), got.end(), untouched);
+                    cpu::native_down_rows(f, blob.data(), ap, nt, op, first, end);
+                    for (int t = 0; t < 8; ++t)
+                        for (int r = 0; r < rows; ++r) {
+                            const size_t index = (size_t) t * rows + r;
+                            const float want = t < nt && r >= first && r < end ? ref[index] : untouched;
+                            down_dispatch_diff += std::memcmp(&got[index], &want, sizeof(float)) != 0;
+                        }
+                }
+            }
+            if (q5_down) {
+                std::printf("          Q5_1 down dispatch vs ggml at 1..8 tokens, partial rows: %zu values differ\n",
+                            down_dispatch_diff);
+                if (down_dispatch_diff) ++failures;
             }
             const int it = 30;
             float* op4[4] = {got.data(), got.data() + rows, got.data() + 2 * rows, got.data() + 3 * rows};
