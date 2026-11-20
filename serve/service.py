@@ -1254,8 +1254,9 @@ class Service:
             return last_print
         if s.get("first_token") is None:
             with self.status_lock:
-                slot = self._slot_of(st if st is not None else self.status)
-                prompt_tokens, started = s.get("prompt_tokens", 0), s.get("started", now)
+                cur = st if st is not None else self.status
+                slot = self._slot_of(cur)
+                prompt_tokens, started = cur.get("prompt_tokens", 0), cur.get("started", now)
             pr = getattr(self.engine, "progress", None)   # (position, prompt tokens); a reused prefix counts as read
             done = f"{pr[0]}/{pr[1]}" if pr and pr[1] else f"{prompt_tokens}"   # as read
             # the engine's average over the tokens it read for this request (a reused prefix is not in it)
