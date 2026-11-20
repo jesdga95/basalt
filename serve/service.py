@@ -1493,6 +1493,9 @@ class Service:
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
+                    elif finish == "length" and n < max_new and self.stopping.is_set():
+                        finish = "error"                # the engine's QUIT ended the reply short of its cap
+                        raise EngineDied("the server is stopping")
                 except GeneratorExit:                  # client disconnected
                     finish = "disconnect"
                     raise

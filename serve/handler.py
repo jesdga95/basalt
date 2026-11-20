@@ -316,6 +316,10 @@ def make_handler(target: Service | Router):
             self.end_headers()
             self.wfile.write(body)
 
+        def _died(self, e) -> str:
+            """An engine error's message; the restart hint applies while the server runs."""
+            return str(e) if router.stopping else f"{e}; the next request restarts it"
+
         def _authorized(self) -> bool:
             if not svc.api_key:
                 return True
@@ -553,7 +557,7 @@ def make_handler(target: Service | Router):
             except (GpuBusy, EngineStarting) as e:
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                self._json(503, {"error": {"type": "server_error", "message": self._died(e)}})
             except EngineStuck as e:                         # the engine could not be ended
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
             except ClientGone:                               # it left while queued
@@ -726,7 +730,7 @@ def make_handler(target: Service | Router):
                 cancel.set()                                 # client left: stop the engine
                 chunks.close()
             except EngineDied as e:                          # mid-stream
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                err = {"error": {"type": "server_error", "message": self._died(e)}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # engine ERR after the stream started: no 400 now
                 err = {"error": {"type": "server_error", "message": str(e)}}
@@ -773,7 +777,7 @@ def make_handler(target: Service | Router):
                 try:
                     result = responses_api.collect(items)
                 except EngineDied as e:
-                    return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
+                    return self._json(503, responses_error_body(self._died(e), "server_error",
                                                                 code="server_error"))
                 except EngineError as e:                     # the engine failed
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
@@ -804,7 +808,7 @@ def make_handler(target: Service | Router):
             except OSError:
                 cancel.set()                                 # client left: stop the engine
             except EngineDied as e:                          # mid-stream: response.failed
-                self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+                self._responses_failed(asm, self._died(e), "server_error", send)
             except ValueError as e:                          # engine ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
             finally:
@@ -942,7 +946,7 @@ def make_handler(target: Service | Router):
                 cancel.set()
                 events.close()
             except EngineDied as e:                          # mid-stream: an Anthropic error event
-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                err = {"type": "error", "error": {"type": "api_error", "message": self._died(e)}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # engine ERR after the stream started
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}

@@ -42,6 +42,7 @@ class SwapEngine(ProcessEngine):
         self.hold_start = False
         self.release = threading.Event()
         self.release.set()
+        self.quit = threading.Event()                   # QUIT at a stop: a held reply ends before its first token
         self.generating = 0
 
     def alive(self):
@@ -68,6 +69,8 @@ class SwapEngine(ProcessEngine):
         self.generating += 1
         try:
             while not self.release.wait(0.02):
+                if self.quit.is_set():
+                    return
                 yield None
             yield from self.reply.generate(*args, **kwargs)
         finally:
@@ -466,8 +469,49 @@ class Turns(Base):
         self.router.stop()
         tb.join(10)
         self.assertEqual(later["B"][0], 503)
+        self.assertIn("the server is stopping", later["B"][1])
+        self.assertNotIn("restarts it", later["B"][1])
         self.engines["A"].release.set()
         t.join(10)
+
+    def test_a_stop_ends_the_running_request_with_the_stopping_error(self):
+        out, t = self.run_with_a_running_request()
+        self.router.stop()
+        self.engines["A"].quit.set()
+        t.join(10)
+        status, body = out["first"]
+        self.assertEqual(status, 503)
+        self.assertIn("the server is stopping", body)
+        self.assertNotIn("restarts it", body)
+
+    def test_a_stop_ends_a_running_stream_with_the_stopping_error(self):
+        self.assertEqual(self.chat("A")[0], 200)
+        self.engines["A"].release.clear()
+        out = {}
+        body = {**ROUTES["/v1/chat/completions"], "model": "A", "stream": True}
+        t = threading.Thread(target=lambda: out.update(r=self.post("/v1/chat/completions", body)), daemon=True)
+        t.start()
+        self.wait_until(lambda: self.engines["A"].generating == 1)
+        self.router.stop()
+        self.engines["A"].quit.set()
+        t.join(10)
+        text = out["r"][1]
+        self.assertIn("the server is stopping", text)
+        self.assertNotIn('"finish_reason": "length"', text)
+
+    def test_a_reply_that_reaches_its_cap_during_a_stop_keeps_length(self):
+        self.assertEqual(self.chat("A")[0], 200)
+        self.engines["A"].release.clear()
+        out = {}
+        body = {**ROUTES["/v1/chat/completions"], "model": "A", "max_tokens": 5}
+        t = threading.Thread(target=lambda: out.update(r=self.post("/v1/chat/completions", body)), daemon=True)
+        t.start()
+        self.wait_until(lambda: self.engines["A"].generating == 1)
+        self.svcs["A"].stop()                           # the stop has begun; the engine still answers up to the cap
+        self.engines["A"].release.set()
+        t.join(10)
+        self.assertEqual(out["r"][0], 200)
+        self.assertIn('"finish_reason": "length"', out["r"][1])
 
 
 class FailedLoad(Base):
