@@ -72,9 +72,24 @@ std::string cpu_label(const std::string& raw_name, int physical_cores) {
 }
 
 std::string pack_quant_label(const std::string& name) {
-    std::string q = name.substr(name.rfind(' ') == std::string::npos ? 0 : name.rfind(' ') + 1);
-    for (const char* pre : {"NVIDIA-", "UD-"})
-        if (q.rfind(pre, 0) == 0) q.erase(0, std::strlen(pre));
+    size_t b = 0, e = name.size();
+    while (b < e && std::isspace((unsigned char) name[b])) ++b;
+    while (e > b && std::isspace((unsigned char) name[e - 1])) --e;
+    const std::string t = name.substr(b, e - b);
+    const size_t sp = t.rfind(' ');
+    if (sp == std::string::npos) return "unknown";   // a name without a space carries no quant label
+    std::string q = t.substr(sp + 1);
+    const auto strip = [&q](const char* pre) {   // the prefix in any case, the rest of the label as it is written
+        const size_t n = std::strlen(pre);
+        if (q.size() < n) return;
+        for (size_t i = 0; i < n; ++i)
+            if (std::tolower((unsigned char) q[i]) != std::tolower((unsigned char) pre[i])) return;
+        q.erase(0, n);
+    };
+    for (size_t before = 0; q.size() != before;) {   // repeatedly, in any order, until neither prefix matches
+        before = q.size();
+        for (const char* pre : {"NVIDIA-", "UD-"}) strip(pre);
+    }
     return q.empty() ? "unknown" : q;
 }
 

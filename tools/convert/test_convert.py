@@ -670,5 +670,69 @@ class Q6KRequantTest(unittest.TestCase):
             self.assertLess(np.sqrt(((deq - a) ** 2).mean()), 0.03 * a.std())
 
 
+class Qwen4ExpDefaultNameTest(unittest.TestCase):
+    """Qwen4Exp.default_name takes the pack name and its quant from the GGUF file name (both the plain and the
+    --sections-from path); an unrecognised name carries no quant rather than a guessed one."""
+
+    def setUp(self):
+        self.arch = convert.A.for_architecture("qwen4exp")
+
+    def name(self, gguf, sections_from=False):
+        return self.arch.default_name(gguf, {}, sections_from)
+
+    def test_shard_quant_names_both_paths(self):
+        gguf = "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        self.assertEqual(self.name(gguf), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+        self.assertEqual(self.name(gguf, sections_from=True), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_iq3_shard_plain_name_matches_the_sections_from_name(self):
+        gguf = "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf"
+        self.assertEqual(self.name(gguf), "Qwen3.8-Flash-Next UD-IQ3_XXS")
+        self.assertEqual(self.name(gguf, sections_from=True), "Qwen3.8-Flash-Next UD-IQ3_XXS")
+
+    def test_single_file_quant(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-Q8_0.gguf"), "Qwen3.8-Flash-Next Q8_0")
+
+    def test_sections_from_single_file_quant(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-Q8_0.gguf", sections_from=True), "Qwen3.8-Flash-Next Q8_0")
+
+    def test_dot_separated_tag(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next.Q4_K_M.gguf"), "Qwen3.8-Flash-Next Q4_K_M")
+
+    def test_lowercase_name_keeps_the_tag_case(self):
+        self.assertEqual(self.name("qwen3.8-flash-next-q4_k_m.gguf"), "Qwen3.8-Flash-Next q4_k_m")
+
+    def test_uppercase_extension_and_shard(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.GGUF"), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_shard_suffix_of_any_digit_count(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-UD-Q4_K_XL-1-of-4.gguf"), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_shard_suffix_uppercase_of(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-OF-00004.gguf"), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_unrelated_name_has_no_quant(self):
+        self.assertEqual(self.name("model.gguf"), "Qwen3.8-Flash-Next")
+        self.assertEqual(self.name("model.gguf", sections_from=True), "Qwen3.8-Flash-Next")
+
+    def test_only_the_file_name_is_used(self):
+        gguf = "/models/unsloth/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        self.assertEqual(self.name(gguf), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+
+class GgufStemTest(unittest.TestCase):
+    """arch.gguf_stem: the file name alone, a trailing `.gguf` (any case) and a shard suffix (any case) of any digit
+    count stripped."""
+
+    def test_stems(self):
+        self.assertEqual(convert.A.gguf_stem("/models/unsloth/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.GGUF"),
+                         "Qwen3.8-Flash-Next-UD-Q4_K_XL")
+        self.assertEqual(convert.A.gguf_stem("Qwen3.8-Flash-Next-UD-Q4_K_XL-1-of-4.gguf"), "Qwen3.8-Flash-Next-UD-Q4_K_XL")
+        self.assertEqual(convert.A.gguf_stem("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-OF-00004.gguf"),
+                         "Qwen3.8-Flash-Next-UD-Q4_K_XL")
+        self.assertEqual(convert.A.gguf_stem("model.gguf"), "model")
+        self.assertEqual(convert.A.gguf_stem("model"), "model")
+
+
 if __name__ == "__main__":
     unittest.main()
