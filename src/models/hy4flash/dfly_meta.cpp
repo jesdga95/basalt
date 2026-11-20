@@ -146,11 +146,14 @@ bool dfly_check_shapes(const std::map<std::string, DflyTensor>& tensors, DflyDim
     return true;
 }
 
-bool dfly_draft_loop(int n, int32_t anchor, const std::function<bool(int, int32_t, int32_t&, float&)>& step, int32_t* ids, float* conf) {
+bool dfly_draft_loop(int n, int32_t anchor, const std::function<bool(int, int32_t, int32_t&, float&, bool&)>& step, int32_t* ids,
+                     float* conf, int& made) {
     int32_t prev = anchor;
-    for (int j = 0; j < n; ++j) {
-        if (!step(j, prev, ids[j], conf[j])) return false;
-        prev = ids[j];
+    for (made = 0; made < n; ++made) {
+        bool go = true;
+        if (!step(made, prev, ids[made], conf[made], go)) return false;
+        if (!go) break;
+        prev = ids[made];
     }
     return true;
 }

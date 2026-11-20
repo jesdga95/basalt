@@ -185,11 +185,14 @@ public:
     /// rotary position of cell `pos` (< 0: `pos`); after a picture the text runs behind the cells (vision.hpp).
     bool begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const void* const* cache, void* stream,
                std::string& err, int64_t rope_pos = -1);
-    /// Runs the heads over the block begin() made, in order, each with the token before it: the `n` drafts and each one's
-    /// estimated chance of acceptance. `on_row(j, token)`, when set, is called in head step j >= 1 once the step is queued on
-    /// the card, with window row j's token (draft j - 1): host work there runs while the card computes the step.
-    bool finish(int32_t* ids, float* conf, void* stream, std::string& err,
-                const std::function<void(int, int32_t)>& on_row = nullptr);
+    /// Runs the heads over the block begin() made, in order, each with the token before it: the `made` drafts (the
+    /// block's n, or fewer with `need`) and each one's estimated chance of acceptance. `on_row(j, token)`, when set, is
+    /// called in head step j >= 1 once the step is queued on the card, with window row j's token (draft j - 1): host work
+    /// there runs while the card computes the step. `need(conf, j)`, when set, is asked with draft j's chance before its
+    /// head runs: false ends the block before draft j.
+    bool finish(int32_t* ids, float* conf, int& made, void* stream, std::string& err,
+                const std::function<void(int, int32_t)>& on_row = nullptr,
+                const std::function<bool(const float*, int)>& need = nullptr);
     /// The block's outputs after the final norm, `rows` rows of E floats, to the host (for the tests against a reference).
     void copy_block(float* host, int rows, void* stream) const;
 
@@ -226,7 +229,7 @@ public:
     /// as DflyRunner::begin.
     model::Result draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint8_t*>& cache, void* stream,
                               int64_t rope_pos = -1);
-    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream);
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream, const model::ModelSession::DraftNeed& need);
     /// Called in the heads with each draft row's token as it is known (DflyRunner::finish's on_row).
     void on_row(std::function<void(int, int32_t)> f) { on_row_ = std::move(f); }
 
@@ -244,10 +247,12 @@ private:
     bool fp8_ = false;
 };
 
-/// The drafts of a block in order, `step(j, previous)` giving draft j after the token before it (the anchor first). The
-/// loop DflyRunner::finish runs, apart from the device, so a test can run it over fake logits.
-bool dfly_draft_loop(int n, int32_t anchor, const std::function<bool(int j, int32_t previous, int32_t& token, float& conf)>& step,
-                     int32_t* ids, float* conf);
+/// The drafts of a block in order, `step(j, previous)` giving draft j after the token before it (the anchor first), or
+/// ending the block before it (`go` false): `made` drafts. The loop DflyRunner::finish runs, apart from the device, so a
+/// test can run it over fake logits. False when a step fails.
+bool dfly_draft_loop(int n, int32_t anchor,
+                     const std::function<bool(int j, int32_t previous, int32_t& token, float& conf, bool& go)>& step,
+                     int32_t* ids, float* conf, int& made);
 
 /// The flags a Hy4-flash start takes for speculative decoding, as DeepSeek's: --spec N, --spec-oracle FILE, --diag-teacher,
 /// --draft-log FILE. False when `a` is none of them.

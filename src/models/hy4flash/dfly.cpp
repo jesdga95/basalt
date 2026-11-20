@@ -401,8 +401,10 @@ void DflyRunner::copy_block(float* host, int rows, void* stream) const {
     cudaStreamSynchronize((cudaStream_t) stream);
 }
 
-bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& err, const std::function<void(int, int32_t)>& on_row) {
+bool DflyRunner::finish(int32_t* ids, float* conf, int& made, void* stream, std::string& err,
+                        const std::function<void(int, int32_t)>& on_row, const std::function<bool(const float*, int)>& need) {
     Impl& p = *p_;
+    made = 0;
     if (!p.pending) {
         err = "dfly: no block was begun";
         return false;
@@ -416,7 +418,14 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
     sp.greedy = true;
     sp.temperature = 0.f;
     std::string why;
-    const auto step = [&](int j, int32_t prev, int32_t& tok, float& chance) {
+    const auto synced = [&] {
+        if (cudaStreamSynchronize(st) == cudaSuccess) return true;
+        why = std::string("dfly: CUDA: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    };
+    // a draft's chance comes before its head: with `need`, the head (the whole vocabulary's rows) runs only for a draft
+    // a window can hold
+    const auto step = [&](int j, int32_t prev, int32_t& tok, float& chance, bool& go) {
         try {
             if (!p.env.embed(prev, p.h_pe)) {
                 why = "dfly: a draft token has no embedding row";
@@ -432,16 +441,22 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
             bk::swiglu_scaled(p.hg, p.hu, nullptr, nullptr, p.hh, 1, d.hc_ffn, d.hc_ffn, st);
             p.mm(w.hc_down, p.hh, d.hc_ffn, p.hd, E, d.hc_ffn, E, 1, st);
             add_vectors(zrow, p.hd, p.hcout, E, st);
+            f32_gemm_rows(p.hcout, w.conf_w, 1, E, 1.0f, 1, p.craw, st);
+            cudaMemcpyAsync(p.h_conf, p.craw, 4, cudaMemcpyDeviceToHost, st);
+            if (need) {
+                if (!synced()) return false;
+                chance = 1.0f / (1.0f + std::exp(-(*p.h_conf + p.bias)));   // conf[j]: the chances so far
+                if (!need(conf, j)) {
+                    if (on_row && j > 0) on_row(j, prev);   // the token before it may still be in the window
+                    go = false;
+                    return true;
+                }
+            }
             p.mm(w.head_q8, p.hcout, E, p.logits, d.vocab, E, d.vocab, 1, st);
             bk::sample_tokens(p.logits, 1, d.vocab, nullptr, 0, sp, p.pick, st);
-            f32_gemm_rows(p.hcout, w.conf_w, 1, E, 1.0f, 1, p.craw, st);
             cudaMemcpyAsync(p.h_tok, p.pick, 4, cudaMemcpyDeviceToHost, st);
-            cudaMemcpyAsync(p.h_conf, p.craw, 4, cudaMemcpyDeviceToHost, st);
             if (on_row && j > 0) on_row(j, prev);
-            if (cudaStreamSynchronize(st) != cudaSuccess) {
-                why = std::string("dfly: CUDA: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
-            }
+            if (!synced()) return false;
         } catch (const std::exception& e) {
             why = std::string("dfly: ") + e.what();
             return false;
@@ -450,7 +465,7 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
         chance = 1.0f / (1.0f + std::exp(-(*p.h_conf + p.bias)));
         return true;
     };
-    if (!dfly_draft_loop(p.n, p.anchor, step, ids, conf)) {
+    if (!dfly_draft_loop(p.n, p.anchor, step, ids, conf, made)) {
         err = why.empty() ? "dfly: the heads failed" : why;
         return false;
     }
@@ -514,19 +529,23 @@ model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const st
     return {};
 }
 
-model::Result DflyHook::draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream) {
+model::Result DflyHook::draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream,
+                                  const model::ModelSession::DraftNeed& need) {
     if (!runner_) return {model::Status::NotImplemented, "hy4flash: the pack has no drafter, or --spec is 0"};
     n = 0;
     if (pending_ == 0) return {};
     std::string err;
     int32_t tok[kDflyDrafts];
     float ch[kDflyDrafts];
-    const int made = pending_;
+    const int block = pending_, most = std::min(max_n, block);
     pending_ = 0;
-    if (!runner_->finish(tok, ch, stream, err, on_row_)) return {model::Status::Error, "hy4flash: " + err};
+    int made = 0;
+    std::function<bool(const float*, int)> wanted;
+    if (need) wanted = [&](const float* c, int j) { return j < most && need(c, j, most); };
+    if (!runner_->finish(tok, ch, made, stream, err, on_row_, wanted)) return {model::Status::Error, "hy4flash: " + err};
     if (dump_pos_ >= 0 && !dump_.empty()) {   // --diag-dump: what the block computed
-        std::vector<float> z((size_t) (made + 1) * w_->dims.E), a(w_->dims.E), m(w_->dims.E);
-        runner_->copy_block(z.data(), made + 1, stream);
+        std::vector<float> z((size_t) (block + 1) * w_->dims.E), a(w_->dims.E), m(w_->dims.E);
+        runner_->copy_block(z.data(), block + 1, stream);
         embed_(dump_anchor_, a.data());
         embed_(w_->dims.mask_id, m.data());
         const std::string base = dump_ + "/dfly_" + std::to_string(dump_pos_) + "_out_";

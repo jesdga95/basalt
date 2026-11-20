@@ -411,7 +411,23 @@ void test_block() {
         CHECK(began);
         int32_t ids[5];
         float conf[5];
-        CHECK(run->finish(ids, conf, st, err));
+        int made = 0;
+        CHECK(run->finish(ids, conf, made, st, err) && made == n);
+        // the same block, ended before draft n - 1 by `need` (asked with each draft's chance before its head): the drafts
+        // before it and every chance asked are the same bits
+        if (n > 1) {
+            CHECK(run->begin(anchor, pos, n, *tap, 0, caches.data(), st, err));
+            int32_t ids2[5];
+            float conf2[5];
+            int asked = 0, made2 = 0;
+            const auto need = [&](const float* c, int j) {
+                CHECK(c == conf2 && j == asked);
+                ++asked;
+                return j < n - 1;
+            };
+            CHECK(run->finish(ids2, conf2, made2, st, err, nullptr, need) && made2 == n - 1 && asked == n);
+            CHECK(std::equal(ids, ids + n - 1, ids2) && std::memcmp(conf, conf2, sizeof(float) * (size_t) n) == 0);
+        }
 
         // the reference: the same equations in double
         const int R = n + 1;

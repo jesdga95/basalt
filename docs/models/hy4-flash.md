@@ -86,8 +86,9 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
 
 On when the pack has the DFly2 drafter. One block pass drafts up to 5 tokens and states each one's chance of acceptance, and the
 draft policy picks the window by expected tokens per millisecond, as for DeepSeek
-(`include/basalt/spec/draft_policy.hpp`). `--spec N` caps the window (default 6: the last accepted token plus the whole block);
-`--spec 0` turns it off.
+(`include/basalt/spec/draft_policy.hpp`). The heads run one draft at a time, each draft's chance before its pass over the
+vocabulary's rows, and stop at the first draft no window could hold. `--spec N` caps the window (default 6: the last accepted
+token plus the whole block); `--spec 0` turns it off.
 
 The drafter is five dense MLA layers that read target layers 25, 29, 33, 37 and 41: each attends the positions that target layer's
 indexer selected, in that layer's cache, so its cost does not grow with the context. It keeps no cache of its own, and
