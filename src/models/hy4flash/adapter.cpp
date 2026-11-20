@@ -15,7 +15,7 @@
 namespace basalt::models::hy4flash {
 namespace {
 
-constexpr float kRoutePriorBare = 0.1f;   // --route-prior alone: on the biased score (a sigmoid plus its bias)
+constexpr float kRoutePriorBare = 0.01f;   // --route-prior alone: on the biased score (a sigmoid plus its bias)
 
 class Adapter final : public model::ModelAdapter {
 public:

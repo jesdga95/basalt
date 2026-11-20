@@ -90,7 +90,7 @@ int main() {
     }
     // the routing flags of every mixture-of-experts model: the bare prior is the model's own; the tail skip needs the pack's
     // experts per token, so without a pack it is refused
-    for (const auto& [arch, bare] : {std::pair<const char*, const char*>{"deepseek41", "0.1"}, {"hy4flash", "0.1"}}) {
+    for (const auto& [arch, bare] : {std::pair<const char*, const char*>{"deepseek41", "0.1"}, {"hy4flash", "0.01"}}) {
         const model::ModelAdapter* m = model::find_adapter(arch);
         if (m == nullptr) continue;
         const auto p = lossy_of(*m, {"--route-prior"});
