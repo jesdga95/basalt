@@ -5,7 +5,7 @@
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "head_proxy.cuh"
+#include "basalt/kernels/head_proxy.cuh"
 #include "smem_opt_in.cuh"
 
 #include <cuda_fp16.h>
@@ -443,6 +443,16 @@ void q5k_head_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, 
 
 namespace {
 
+constexpr int kProxyIn = 2560;   // the copy's row width
+
+// The approximate pass over the 2-bit copy, a tile of 32 rows a block (head_proxy.cuh).
+__global__ void __launch_bounds__(128) proxy_score_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
+                                                         const px::X81* __restrict__ x, int n_rows,
+                                                         const int32_t* __restrict__ map, float2* __restrict__ cand,
+                                                         float2* __restrict__ part) {
+    px::score_tile<kProxyIn>((int) blockIdx.x, wq, sc, x, n_rows, map, cand, part);
+}
+
 // One thread per 32-weight group: the group's dequantized Q5_K values to the 2-bit copy.
 __global__ void q5k_proxy_pack_kernel(const uint8_t* __restrict__ q5, int64_t row0, int64_t n,
                                       uint4* __restrict__ wq, uint16_t* __restrict__ sc) {
@@ -466,7 +476,7 @@ __global__ void q5k_proxy_pack_kernel(const uint8_t* __restrict__ q5, int64_t ro
         const int q = nib | (((b->qh[l] >> j) & 1) << 4);
         w[l] = d * (float) q - mn;
     }
-    px::pack_group<true>(w, row, g, wq, sc);
+    px::pack_group<kProxyIn, true>(w, row, g, wq, sc);
 }
 
 // One block: the rows near the best approximate score are scored exactly (a warp per row), the exact best is the pick.
@@ -505,7 +515,7 @@ __global__ void __launch_bounds__(512) q5k_proxy_final_kernel(const Q5KBlock* __
 
 }  // namespace
 
-size_t q5k_proxy_bytes(int64_t n_cap) { return px::bytes(n_cap); }
+size_t q5k_proxy_bytes(int64_t n_cap) { return px::bytes(n_cap, kProxyIn); }
 
 size_t q5k_proxy_scratch_bytes(int64_t n_cap) { return px::scratch_bytes(n_cap); }
 
@@ -513,7 +523,7 @@ void q5k_proxy_pack(const void* q5k_rows, int64_t row0, int64_t n, void* proxy, 
     if (n <= 0) return;
     const int64_t total = n * 80;
     q5k_proxy_pack_kernel<<<(unsigned) ((total + 127) / 128), 128, 0, (cudaStream_t) stream>>>(
-        (const uint8_t*) q5k_rows, row0, n, (uint4*) proxy, px::scales(proxy, n_cap));
+        (const uint8_t*) q5k_rows, row0, n, (uint4*) proxy, px::scales(proxy, n_cap, kProxyIn));
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         basalt::log::error("basalt", "q5k_proxy_pack: %s", cudaGetErrorString(e));
@@ -527,10 +537,10 @@ bool q5k_proxy_top1(const void* proxy, const void* q5k_rows, const void* x_q8_1,
         return false;
     const int tiles = (int) px::tiles(n_rows);
     const uint4* wq = (const uint4*) proxy;
-    const uint32_t* sc = (const uint32_t*) px::scales(const_cast<void*>(proxy), n_cap);
+    const uint32_t* sc = (const uint32_t*) px::scales(const_cast<void*>(proxy), n_cap, kProxyIn);
     float2* cand = (float2*) scratch;
     float2* part = cand + (size_t) px::tiles(n_cap) * px::kPer;
-    launch_pdl(px::score_kernel, dim3((unsigned) tiles), dim3(128), 0, (cudaStream_t) stream, wq, sc,
+    launch_pdl(proxy_score_kernel, dim3((unsigned) tiles), dim3(128), 0, (cudaStream_t) stream, wq, sc,
                (const px::X81*) x_q8_1, n_rows, map, cand, part);
     launch_pdl(q5k_proxy_final_kernel, dim3(1), dim3(512), 0, (cudaStream_t) stream, (const Q5KBlock*) q5k_rows,
                (const Q81Block*) x_q8_1, tiles, map, (const float2*) cand, (const float2*) part, out_id, out_prob);
