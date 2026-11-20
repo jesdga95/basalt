@@ -148,12 +148,15 @@ int main(int argc, char** argv) {
         } else cudaMemcpy(w.slot(s.name), raw.data(), raw.size(), cudaMemcpyHostToDevice);
     }
     const DflyTensor& hw = dense.t.at("lm_head.weight");
-    uint16_t* head = nullptr;
-    cudaMalloc(&head, hw.bytes);
+    void* head = nullptr;   // the head as the engine loads it: BF16 rounded to Q8_0
     {
         const std::vector<uint8_t> raw = read_at(dense_path, hw.offset, hw.bytes);
-        cudaMemcpy(head, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+        std::vector<uint8_t> q(raw.size() / 2 / 32 * 34);
+        basalt::core::quantize_bf16_q8_0((const uint16_t*) raw.data(), raw.size() / 2, q.data());
+        cudaMalloc(&head, q.size());
+        cudaMemcpy(head, q.data(), q.size(), cudaMemcpyHostToDevice);
     }
+    w.head_q8 = head;
     const DflyTensor& ew = dense.t.at("model.embed_tokens.weight");
     const int E = d.E;
 
@@ -187,7 +190,6 @@ int main(int argc, char** argv) {
     }
     DflyRunner::Env env;
     env.w = &w;
-    env.head = head;
     env.embed = [&](int32_t t, float* o) {
         const std::vector<uint8_t> raw = read_at(dense_path, ew.offset + (uint64_t) t * E * 2, (uint64_t) E * 2);
         for (int i = 0; i < E; ++i) o[i] = bf(((const uint16_t*) raw.data())[i]);
