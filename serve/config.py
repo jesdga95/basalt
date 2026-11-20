@@ -356,6 +356,13 @@ def slot_share(total: int, parallel: int) -> int:
     return max(MIN_SLOT_CONTEXT, total // parallel)
 
 
+def slots_text(parallel: int, per_slot: int, shared: int | None) -> str:
+    """The startup slot line: the slots and the context each really gets; a shared --max-context also names the
+    whole-context option."""
+    text = f"slots {parallel} \u00d7 {per_slot} ctx"
+    return text + (f" (slot-full-context: {shared} each)" if shared else "")
+
+
 def with_spec(items: list[str], spec) -> list[str]:
     """A model's items with `spec=N` the window the engine will run (its --gpu-plan answer), not the flag as given."""
     return items if not isinstance(spec, int) else [x for x in items if not x.startswith("spec=")] + [f"spec={spec}"]

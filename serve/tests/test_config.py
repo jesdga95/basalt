@@ -451,6 +451,13 @@ class SlotContext(unittest.TestCase):
         self.assertEqual(slot_share(8192, 4), 2048)
         self.assertEqual(slot_share(512, 4), 256)                                     # never under the least slot
 
+    def test_the_slot_line_shows_each_slots_context(self):
+        from serve.config import slots_text
+        a, *_ = parse(["--parallel", "8", "--max-context", "262144"])
+        self.assertEqual(slots_text(8, 32768, a.shared_context), "slots 8 \u00d7 32768 ctx (slot-full-context: 262144 each)")
+        a, *_ = parse(["--parallel", "8", "--max-context", "262144", "--slot-full-context"])
+        self.assertEqual(slots_text(8, 262144, getattr(a, "shared_context", None)), "slots 8 \u00d7 262144 ctx")
+
     def test_parallel_conflicts_with_batch_and_slots(self):
         for flag in ("--batch", "--slots"):
             with self.assertRaisesRegex(ValueError, f"parallel and engine {flag} both set"):
