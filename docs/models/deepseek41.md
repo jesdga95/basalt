@@ -101,8 +101,10 @@ alone in its slot gives the same greedy tokens as with `--parallel 1` (tiers pin
 
 ## Lossy flags
 
-None. Output depends on which experts are resident, so a different RAM tier size can change the text
-([precision](../precision/deepseek41.md#experts-and-placement)).
+Off by default. `--route-prior` and `--route-tail-skip` change output, and each is named in one start warning. What they do on
+every MoE model: [quality](../precision/quality.md#lossy-routing-flags); what they cost and gain here:
+[precision](../precision/deepseek41.md#lossy-routing-flags). Without them, output still depends on which experts are resident, so a
+different RAM tier size can change the text ([precision](../precision/deepseek41.md#experts-and-placement)).
 
 ## Limits
 

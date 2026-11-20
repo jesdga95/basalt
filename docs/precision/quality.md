@@ -42,6 +42,28 @@ Q8_0 base than against BF16 (see [Flash-Next](qwen38-flash-next.md#summary)).
 
 Numerics changes: report PPL, mean KLD and top-1 next to the previous build. Bitwise-neutral changes: show greedy identity.
 
+## Lossy routing flags
+
+Two opt-in flags on every mixture-of-experts model trade accuracy for fewer experts that no GPU holds. Each one given is named in
+the start's one lossy warning, `--serve` reports it (`INFO lossy=`), `basalt-bench` marks the run LOSSY and `--community`
+refuses it.
+
+- `--route-tail-skip [R]`: in a decode window, an expert no GPU holds is neither copied nor computed when every entry of the window
+  that names it ranks R or lower by router weight (0-based of the model's k routed experts). Its entries get weight 0; the other
+  weights stay as the router gave them (no renormalisation). R is 1 to k-1, lower drops more; the flag alone is k-1.
+- `--route-prior [LAMBDA]`: a decode window picks its top k as if every expert a GPU holds had LAMBDA added to the score the
+  router ranks by: the log probability for a softmax router (Flash-Next), the biased score `s + bias` for a sqrt-softplus or
+  sigmoid one (DeepSeek, Hy4). The weights stay the router's own scores of the picked experts, normalised over the picks as the
+  model normalises them. LAMBDA is in (0, 16]; the flag alone is each model's own default (0.5 on Flash-Next, 0.1 on
+  DeepSeek, 0.01 on Hy4), since the scores' scales differ.
+
+"Held" means a main-card slot or a second card's. Both flags are off for prompts and for the drafters' own routing, and off when
+every expert is held by a GPU (nothing to skip). DeepSeek and Hy4 read which experts are held at the start of each decode window,
+so a copy that lands during a window counts from the next one. Routing then follows placement, and placement follows history, so
+the same prompt can give different text on different runs. Their final `TIER` lines count what `--route-tail-skip` dropped.
+Each model's page has the measured cost and speed: [Flash-Next](qwen38-flash-next.md#lossy-routing-flags),
+[DeepSeek](deepseek41.md#lossy-routing-flags), [Hy4-flash](hy4-flash.md#lossy-routing-flags).
+
 ## Greedy identity
 
 Pin the placement first, or experts moving between the CPU pool and the GPUs will round differently: `--adapt-swaps 0 --peer-adapt-swaps 0`,
