@@ -1,6 +1,7 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "basalt/core/elastic_kv.hpp"
 #include "context.hpp"
+#include "../cli/kv_batch.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -269,6 +270,13 @@ int sessions(Context& context) {
             basalt::log::warn("basalt generate", "--batch %d: a batch window holds at most %d rows, so %d "
                                  "slots", o.batch, cap, cap);
             o.batch = cap;
+        }
+    }
+    if (o.batch > 0) {
+        const std::string why = cli::kv_batch_refusal(o.kv, o.batch);
+        if (!why.empty()) {
+            basalt::log::error("basalt generate", "%s", why.c_str());
+            return 1;
         }
     }
     if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {

@@ -193,6 +193,13 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
 target_include_directories(model_qwen4exp PRIVATE ${_gpu_include_directories})
 target_include_directories(model_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_qwen4exp_engine engine_session grammar model_qwen4exp_prefill spec ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  # which --kv formats run with batch slots, and the refusal for the rest (host only)
+  add_executable(qwen4exp_kv_batch_test tests/models/qwen4exp/cli/kv_batch_test.cpp)
+  target_include_directories(qwen4exp_kv_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(qwen4exp_kv_batch_test PRIVATE warnings)
+  basalt_cpu_test(NAME qwen4exp_kv_batch_test COMMAND qwen4exp_kv_batch_test)
+endif()
 endif()
 
 if(BASALT_MODEL_HY4FLASH)
