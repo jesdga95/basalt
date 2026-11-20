@@ -1784,14 +1784,14 @@ class LoadProgress(unittest.TestCase):
         bars.set_into("ram")                                            # then RAM, on the same bar, which stays put
         self.assertEqual(bars.lines(), ["[server] loading model weights: ram   [" + "=" * 12 + ">" + " " * 11 + "]   2.0/4.0 GiB"])
         self.assertTrue(out.getvalue().splitlines()[-1].endswith("ram   [" + "=" * 12 + ">" + " " * 11 + "]   2.0/4.0 GiB"))
-        log = io.StringIO()                                             # off a terminal: one line at each change
-        bars = LoadBars(log)
+        log = io.StringIO()                                             # off a terminal: a change prints nothing,
+        bars = LoadBars(log)                                            # a sample of the whole load is no stage's
         bars.set_total(4 << 30)
-        bars.set_into("cuda0")                                          # before the first bytes: nothing to show yet
+        bars.set_into("cuda0")
         bars.update("weights", 3 << 30, 4 << 30)
         bars.set_into("ram")
-        self.assertEqual(log.getvalue().splitlines(),
-                         ["[server] loading model weights: ram   [" + "=" * 18 + ">" + " " * 5 + "]   3.0/4.0 GiB"])
+        self.assertEqual(log.getvalue(), "")
+        self.assertEqual(bars.lines(), ["[server] loading model weights [" + "=" * 18 + ">" + " " * 5 + "]   3.0/4.0 GiB"])
 
     def test_four_cards_then_ram_on_one_bar_that_never_shifts(self):
         from serve.engine.progress import LoadBars, load_stages
@@ -1812,6 +1812,99 @@ class LoadProgress(unittest.TestCase):
                                  "[server] loading model weights: ram   "])
         self.assertEqual(len({line.index("[", 9) for line in seen}), 1)   # the bar starts in one column throughout
         self.assertTrue(seen[-1].endswith("]   9.0/10.0 GiB"))
+
+    G = 1 << 30
+
+    def _start(self, out, gpus, shares, overlap=False):
+        """A start as the engine reads it out: the total, each destination's share at 0, then the cards in turn and
+        RAM, each share line beside the weights line of its stage. `overlap`: RAM reads land during the card sweep.
+        Returns the weights rows drawn per stage."""
+        from serve.engine.progress import LoadBars
+        bars = LoadBars(out, gpus=gpus)
+        total = sum(b for _, b in shares)
+        bars.set_total(total)
+        bars.update("weights", 0, total)
+        for t, b in shares:
+            bars.set_share(t, 0, b)
+        bars.set_stages([t for t, _ in shares])
+        have = {t: 0 for t, _ in shares}
+        seen = {}
+        for t, b in shares:
+            bars.set_into(t)
+            for k in (1, 2):
+                if overlap and t != "ram" and k == 1:          # a RAM read lands beside the card read
+                    have["ram"] += self.G // 4
+                    bars.set_share("ram", have["ram"], dict(shares)["ram"])
+                have[t] = max(have[t], b * k // 2)
+                bars.set_share(t, have[t], b)
+                bars.update("weights", sum(have.values()), total)
+                seen.setdefault(t, []).append(bars.lines()[0])
+        bars.update("weights", total, total)
+        bars.finish()
+        return seen
+
+    def test_one_card_the_label_carries_the_stages_own_part_and_the_result_splits_the_total(self):
+        out = Tty()
+        seen = self._start(out, [0], [("cuda0", int(12.5 * self.G)), ("ram", int(64.3 * self.G))])
+        self.assertTrue(seen["cuda0"][0].startswith("[server] loading model weights: cuda0  6.2/12.5 ["), seen)
+        self.assertTrue(seen["cuda0"][1].startswith("[server] loading model weights: cuda0 12.5/12.5 ["), seen)
+        self.assertTrue(seen["ram"][1].startswith("[server] loading model weights: ram   64.3/64.3 ["), seen)
+        rows = [r for rs in seen.values() for r in rs]
+        self.assertEqual(len({r.index(" [") for r in rows}), 1, rows)   # the bar starts in one column throughout
+        loaded = [x.split("\x1b[2K")[-1] for x in out.getvalue().splitlines() if "[server] loaded" in x]
+        self.assertEqual(len(loaded), 1)
+        self.assertRegex(loaded[0], r"^\[server\] loaded   76\.8GiB \d+\.\ds  cuda0=12\.5GiB ram=64\.3GiB$")
+
+    def test_two_cards_the_result_names_each_card_as_nvidia_smi_numbers_it(self):
+        out = Tty()
+        self._start(out, [2, 3], [("cuda0", 23 * self.G), ("cuda1", 9 * self.G), ("ram", 40 * self.G)], overlap=True)
+        loaded, = [x.split("\x1b[2K")[-1] for x in out.getvalue().splitlines() if "[server] loaded" in x]
+        self.assertTrue(loaded.endswith("  cuda2=23.0GiB cuda3=9.0GiB ram=40.0GiB"), loaded)
+        self.assertNotIn("placed", out.getvalue())                       # a terminal keeps its one bar
+
+    def test_four_cards_and_ram_keep_one_bar_column_and_a_zero_card_prints_zero(self):
+        out = Tty()
+        shares = [("cuda0", 30 * self.G), ("cuda1", 14 * self.G), ("cuda2", 0), ("cuda3", 7 * self.G), ("ram", 101 * self.G)]
+        seen = self._start(out, [3, 10, 1, 0], shares)
+        rows = [r for rs in seen.values() for r in rs]
+        self.assertEqual(len({r.index(" [") for r in rows}), 1, rows)
+        self.assertTrue(seen["cuda1"][0].startswith("[server] loading model weights: cuda10    7.0/14.0 ["), seen)
+        loaded, = [x.split("\x1b[2K")[-1] for x in out.getvalue().splitlines() if "[server] loaded" in x]
+        self.assertTrue(loaded.endswith("  cuda3=30.0GiB cuda10=14.0GiB cuda1=0.0GiB cuda0=7.0GiB ram=101.0GiB"), loaded)
+
+    def test_off_a_terminal_each_stage_prints_once_with_its_own_total(self):
+        out = io.StringIO()
+        self._start(out, [0, 1], [("cuda0", int(23.25 * self.G)), ("cuda1", 0), ("ram", int(55.6 * self.G))], overlap=True)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 3, lines)                            # no sample of the whole load reads as a stage
+        self.assertRegex(lines[0], r"^\[server\] placed   cuda0 23\.2GiB \d+\.\ds$")
+        self.assertRegex(lines[1], r"^\[server\] placed   ram 55\.6GiB \d+\.\ds$")
+        self.assertRegex(lines[2], r"^\[server\] loaded   78\.8GiB \d+\.\ds  cuda0=23\.2GiB cuda1=0\.0GiB ram=55\.6GiB$")
+        self.assertNotIn("\x1b", out.getvalue())
+
+    def test_the_result_parts_add_up_to_the_total_as_printed(self):
+        from serve.engine.progress import LoadBars
+        for parts in ([1.25, 1.25, 1.25], [12.45, 64.45], [0.04, 0.04, 0.04, 9.88], [3.0, 0.0, 5.0]):
+            bars = LoadBars(io.StringIO())
+            sizes = [int(p * self.G) for p in parts]
+            for i, b in enumerate(sizes):
+                bars.set_share(f"cuda{i}", 0, b)
+            split = bars.split(sum(sizes))
+            got = [float(x.split("=")[1][:-3]) for x in split.split()]
+            self.assertEqual(len(got), len(parts), split)
+            self.assertAlmostEqual(sum(got), float(f"{sum(sizes) / 2**30:.1f}"), places=6, msg=split)
+            for g, p in zip(got, parts):
+                self.assertLessEqual(abs(g - p), 0.1 + 1e-9, split)
+        self.assertEqual(LoadBars(io.StringIO()).split(10), "")            # an engine that announced no split
+
+    def test_parse_share(self):
+        from serve.engine.progress import load_progress, load_share
+        self.assertEqual(load_share("basalt load: share cuda0 0 13421772800"), ("cuda0", 0, 13421772800))
+        self.assertEqual(load_share("basalt load: share ram 5 9"), ("ram", 5, 9))
+        self.assertIsNone(load_share("basalt load: share disk 5 9"))
+        self.assertIsNone(load_share("basalt load: share cuda0 x 9"))
+        self.assertIsNone(load_share("basalt load: share cuda0 9"))
+        self.assertIsNone(load_progress("basalt load: share cuda0 0 9"))
 
     def test_a_total_that_grows_or_shrinks_moves_the_bar(self):
         from serve.engine.progress import LoadBars
@@ -1896,8 +1989,9 @@ class LoadProgress(unittest.TestCase):
         out = io.StringIO()
         self._ple_ram_start(out, True)
         lines = out.getvalue().splitlines()
-        self.assertEqual(len(lines), 2, lines)
-        self.assertTrue(lines[0].startswith("[server] auto ") and lines[1].startswith("[server] loaded   40.0GiB"))
+        self.assertEqual(len(lines), 3, lines)
+        self.assertTrue(lines[0].startswith("[server] placed   n-gram table 18.0GiB "), lines)
+        self.assertTrue(lines[1].startswith("[server] auto ") and lines[2].startswith("[server] loaded   40.0GiB"))
         self.assertNotIn("\x1b", out.getvalue())
 
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
