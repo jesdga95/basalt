@@ -157,7 +157,7 @@ void QfnRuntime::enc_command(const std::string& cmd) {
         }
         const int64_t floor = basalt::program::image_lend_floor(host_res, in_ram, p.cache->slots());
         int64_t r = p.cache->slots() - std::min<int64_t>(floor, p.first);
-        if (batch_on()) r = std::min<int64_t>(r, kLendCapDecoding);
+        if (batch_on()) r = std::min<int64_t>(r, live_lend_cap());
         return r;
     };
     int64_t room = lendable();

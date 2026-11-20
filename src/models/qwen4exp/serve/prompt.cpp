@@ -133,7 +133,7 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     if (runtime_.pf_parts.empty()) return true;                     // its own buffers: nothing to lend
     // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
     // the full depth is restored on the way out for the sizing done elsewhere
-    basalt::prefill::Prefill::set_ring_depth(beside_ ? runtime_.kRingDecoding : kFullRing);
+    basalt::prefill::Prefill::set_ring_depth(beside_ ? runtime_.live_ring_depth() : kFullRing);
     struct RingReset { ~RingReset() { basalt::prefill::Prefill::set_ring_depth(kFullRing); } } ring_reset;
     // what this segment needs, capped by the configured chunk: a request lends only what its own
     // prompt needs, so a large chunk costs a short prompt nothing
@@ -143,8 +143,9 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     // `auto:N` and a fixed N keep the operator's number.  (Chunking changes the GEMM tiles and so the rounding of
     // a prompt's K/V; the answers can differ from another chunking by greedy near-ties.)
     int64_t cap = runtime_.read_cap();
-    // Loan limits beside decoding slots: the loan stays within kLendCapDecoding slots (they keep their experts in
-    // the cache) and takes only slots whose expert has a RAM copy (a lent slot is refilled from RAM, never read
+    // Loan limits beside decoding slots: the loan stays within the run's cap (kLendCapDecoding unless the run
+    // raised it with --live-read-slots), so the slots' experts stay in the cache, and it takes only slots whose
+    // expert has a RAM copy (a lent slot is refilled from RAM, never read
     // from the file, while the slots decode).  A read that runs alone, on an idle engine or while the slots wait
     // for it, lends as an idle engine does and may refill lent slots from the file: a chunk cut to the RAM copies
     // (few when RAM is short or the KV has taken the cache's tail) would stream the experts again every few
@@ -152,7 +153,7 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     // sharing the card for: the part reads alone, below.
     int64_t loan_lim = std::numeric_limits<int64_t>::max();
     if (beside_) {
-        loan_lim = runtime_.kLendCapDecoding;
+        loan_lim = runtime_.live_lend_cap();
         // the RAM-backed slots are the cache's last ones: those still live after the KV took its share
         if (runtime_.src.complement_ready())
             loan_lim = std::min<int64_t>(loan_lim, std::max<int64_t>(0, runtime_.src.resident_lent_slots() -
@@ -421,6 +422,9 @@ int QfnRuntime::init_prompt() {
     } else {
         basalt::log::info("basalt serve", "the prompt path allocates its own buffers (too few cache slots to borrow)");
     }
+    if (o.live_read_slots > 0 || o.live_read_ring > 0)
+        basalt::log::info("basalt serve", "a prompt read beside decoding slots lends %lld cache slots with a "
+                                          "%d-slot ring", (long long) live_lend_cap(), live_ring_depth());
 
     {
         // First by arithmetic: a prompt path without a loan allocates its buffers, so the chunk must leave headroom

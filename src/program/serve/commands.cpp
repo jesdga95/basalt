@@ -33,7 +33,13 @@ std::vector<ImgKey> Runtime::imgs_below(const std::vector<ImgKey>& all, int64_t 
     return v;
 }
 
-bool Runtime::batch_on() { for (const BSlot& b : bs) if (b.active) return true; return false; }
+bool Runtime::batch_on() const { for (const BSlot& b : bs) if (b.active) return true; return false; }
+
+bool Runtime::slots_busy(int apart) const {
+    for (int i = 0; i < (int) bs.size(); ++i)
+        if (i != apart && bs[(size_t) i].active && !bs[(size_t) i].reading) return true;
+    return false;
+}
 
 Flow Runtime::dispatch() {
     if (batch_on() || windows_in_flight()) {

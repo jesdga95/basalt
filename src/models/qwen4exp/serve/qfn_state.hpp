@@ -204,6 +204,9 @@ private:
     // cache, and its streamed ring is this deep (the loan shrinks with it); otherwise the ring is full depth.
     static constexpr int64_t kLendCapDecoding = 1216;
     static constexpr int kRingDecoding = 64;
+    // the same two, as the run asked for them: --live-read-slots / --live-read-ring, 0 for the limits above
+    int64_t live_lend_cap() const { return o.live_read_slots > 0 ? o.live_read_slots : kLendCapDecoding; }
+    int live_ring_depth() const { return o.live_read_ring > 0 ? o.live_read_ring : kRingDecoding; }
     // A read of at most this many tokens runs alone even while slots decode: they wait for it (a few seconds at
     // most) and it lends and reads as on an idle engine.  A longer read goes beside them, within the limits above,
     // and so does the rest of one that gave way to a shorter request (in its chunk).

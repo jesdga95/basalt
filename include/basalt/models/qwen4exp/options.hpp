@@ -102,6 +102,10 @@ struct Options : CommonOptions {
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
+    /// --serve, --batch: a prompt read beside decoding slots lends at most this many of the main card's cache
+    /// slots and streams with a ring this deep; 0 keeps the engine's own limits (A/B: --live-read-slots, --live-read-ring)
+    int64_t live_read_slots = 0;
+    int live_read_ring = 0;
     /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
     /// from each GPU's free VRAM); empty = one GPU
     std::string layer_split;
