@@ -106,6 +106,11 @@ class Service:
         self.grammar_engine = grammar_engine          # the engine understands the request key
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
+        self.vram_cv = threading.Condition()            # guards the queued resize; new requests wait while one is queued
+        self.vram_queued: dict | None = None            # POST /v1/vram not yet applied: {"reserve_mib": N | None}
+        self.vram_applied: dict | None = None           # the last one applied: {"reserve_mib": ..., "at": ...}
+        self.vram_error: str | None = None              # why the last queued one was refused by the engine
+        self.vram_worker: threading.Thread | None = None
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
         self.embeddings = threading.local()           # this request's image embeddings file
         self.api_key = ""                              # when set, /v1/* requires it
@@ -326,35 +331,111 @@ class Service:
             except (ValueError, EngineDied) as e:
                 print(f"[server] warning: VRAM reserve of {self.vram_reserve} MiB not applied ({e})", flush=True)
 
-    vram_wait_s = 300.0                                  # POST /v1/vram wait for a running request
-
     def vram(self, reserve_mib: int | None) -> dict:
-        """POST /v1/vram: keep `reserve_mib` of VRAM free (None: the starting reserve), applied between requests.
-        Needs --vram-elastic; an unloaded engine applies it on load."""
+        """POST /v1/vram: keep `reserve_mib` of VRAM free (None: the starting reserve). Applied now when no request
+        runs; otherwise queued ({"status": "pending"}), replacing an earlier queued one, and applied when the running
+        requests have finished: requests arriving meanwhile wait, so a steady load cannot hold it off. Needs
+        --vram-elastic; an unloaded engine applies it on load."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
-        if not self.fifo.acquire(timeout=self.vram_wait_s):
-            raise ModelBusy("a request is still running; try again when it has finished")
-        # parallel requests do not hold the fifo, so take the control lines too: no resize while a slot decodes
+        with self.vram_cv:
+            replaced = self.vram_queued is not None
+            self.vram_queued = {"reserve_mib": reserve_mib}
+        out = self._apply_vram(0)
+        if out is not None:
+            return out
+        with self.vram_cv:
+            if self.vram_queued is None:                # the worker got there first
+                return {"status": "ok", **(self.vram_applied or {})}
+            if self.vram_worker is None:
+                self.vram_worker = threading.Thread(target=self._vram_worker, daemon=True)
+                self.vram_worker.start()
+            return {"status": "pending", "reserve_mib": self.vram_queued["reserve_mib"], "replaced": replaced}
+
+    def _apply_vram(self, wait: float) -> dict | None:
+        """Apply the queued resize if the turn and the control lines come free within `wait` seconds and no request
+        runs; None otherwise. ValueError carries the engine's refusal."""
+        def take(lock):
+            return lock.acquire(timeout=wait) if wait else lock.acquire(blocking=False)
+        if not take(self.fifo):
+            return None
+        # parallel requests do not hold the fifo, so take the control lines too: none is admitted meanwhile
         ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
-        if ctl is not None and not ctl.acquire(timeout=self.vram_wait_s):
+        if ctl is not None and not take(ctl):
             self.fifo.release()
-            raise ModelBusy("a request is still running; try again when it has finished")
+            return None
+        job = None
         try:
+            if self.live_reqs:
+                return None
+            with self.vram_cv:
+                job = self.vram_queued
+            if job is None:
+                return None
+            reserve_mib = job["reserve_mib"]
             if not self.loaded():
                 self.vram_reserve = reserve_mib
-                return {"status": "not loaded", "reserve_mib": reserve_mib,
-                        "note": "applied when the model loads"}
-            out = self.engine.vram(reserve_mib)
-            self.vram_reserve = reserve_mib
-            cache = f"expert cache {out['expert_cache_mib']} of {out.get('expert_cache_full_mib')} MiB " \
-                if out.get("expert_cache_mib") is not None else ""
-            print(f"[server] vram: {out.get('vram_free_mib')} MiB free, {cache}({out.get('expert_slots')} experts)", flush=True)
-            return {"status": "ok", **out}
+                out = {"status": "not loaded", "reserve_mib": reserve_mib, "note": "applied when the model loads"}
+            else:
+                got = self.engine.vram(reserve_mib)
+                self.vram_reserve = reserve_mib
+                cache = f"expert cache {got['expert_cache_mib']} of {got.get('expert_cache_full_mib')} MiB " \
+                    if got.get("expert_cache_mib") is not None else ""
+                print(f"[server] vram: {got.get('vram_free_mib')} MiB free, {cache}({got.get('expert_slots')} experts)",
+                      flush=True)
+                out = {"status": "ok", **got}
+            self.vram_applied = {"reserve_mib": reserve_mib, "at": int(time.time())}
+            self.vram_error = None
+            return out
         finally:
             if ctl is not None:
                 ctl.release()
             self.fifo.release()
+            if job is not None:
+                with self.vram_cv:
+                    if self.vram_queued is job:         # a newer one stays queued
+                        self.vram_queued = None
+                    self.vram_cv.notify_all()
+
+    def _vram_worker(self) -> None:
+        """Apply queued resizes at the first gap: the running requests finish, new ones wait (see `_vram_gate`)."""
+        try:
+            while not self.stopping.is_set():
+                with self.vram_cv:
+                    if self.vram_queued is None:
+                        self.vram_worker = None
+                        return
+                try:
+                    if self._apply_vram(0.2) is None:
+                        time.sleep(0.05)
+                except (ValueError, EngineDied) as e:
+                    self.vram_error = str(e)
+                    print(f"[server] warning: queued VRAM reserve not applied ({e})", flush=True)
+        finally:
+            with self.vram_cv:
+                self.vram_worker = None
+                if self.stopping.is_set():
+                    self.vram_queued = None
+                self.vram_cv.notify_all()
+
+    def _vram_gate(self, cancel):
+        """A request waits here while a resize is queued, with keep-alives; False when it was cancelled."""
+        while True:
+            with self.vram_cv:
+                if self.vram_queued is None:
+                    return True
+                self.vram_cv.wait(timeout=QUEUE_BEAT_S)
+                if self.vram_queued is None:
+                    return True
+            if cancel.is_set():
+                return False
+            yield "ping", None
+
+    def vram_state(self) -> dict:
+        """The queued and the last applied resize, for /v1/status."""
+        with self.vram_cv:
+            return {"pending": dict(self.vram_queued) if self.vram_queued is not None else None,
+                    "applied": dict(self.vram_applied) if self.vram_applied else None, "error": self.vram_error}
 
     def _say_died(self, e: Exception) -> None:
         """Print the server-window line for an engine that ended mid-request."""
@@ -812,7 +893,8 @@ class Service:
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
             "vram": dict((getattr(self.engine, "info", {}) or {}).get("vram") or {},
-                         elastic=bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic"))),
+                         elastic=bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic")),
+                         **self.vram_state()),
             "machine": {
                 "at": int(time.time()),
                 "gpu": {"name": name, "used_mib": scaled(hw.get("mem_used"), 2 ** 20),
@@ -1219,6 +1301,20 @@ class Service:
                                               "model": getattr(self.request_ctx, "model", None) or self.model,
                                               "prompt_tokens": len(ids), "started": time.time()}
         try:
+            try:
+                open_gate = yield from self._vram_gate(cancel)   # a queued VRAM resize goes first
+            except BaseException:                        # the consumer closed us at a ping: no longer queued
+                with self.status_lock:
+                    self.status["queued"] -= 1
+                    self.waiting.pop(id(wait_key), None)
+                raise
+            if not open_gate:                            # cancelled while queued
+                with self.status_lock:
+                    self.status["queued"] -= 1
+                    self.waiting.pop(id(wait_key), None)
+                yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
+                               "reasoning_tokens": 0}
+                return
             # batch slots run requests concurrently, so no fifo
             turn = contextlib.ExitStack()
             if not getattr(self.engine, "batch", 0):
