@@ -523,7 +523,10 @@ public:
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
         dfly_.invalidate();   // DFLY HOOK
-        if (!big_.rows) turn_report();
+        if (!big_.rows) {   // a prompt starts
+            turn_report();
+            if (tier_) tier_->forget_use();
+        }
         if (!big_.rows && elastic()) {   // a prompt starts: its positions against what the caches back and can back
             const int64_t need = std::min<int64_t>(m_.context(), r.pos + std::max(r.total_tokens, r.n_tokens));
             const int64_t keep = std::max(kv_base(), std::min<int64_t>(m_.context(), (need + kGrowPositions - 1) / kGrowPositions * kGrowPositions));

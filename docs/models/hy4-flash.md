@@ -42,6 +42,10 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
   experts by the shipped routing profile `data/profiles/hy4flash-42x512.prof`, so the first request after a start finds the
   most routed ones resident. The early layers route more widely and get more of the main card's copies (layers 0 to 3 about
   1.4 times the mean, the quietest 0.73), the same total.
+- **Copies give way by use:** an expert that earns a main card slot takes the one whose expert was looked up least lately (every
+  lookup counts, up to 15; the counts halve every 256 tokens and start again with each prompt), the one used longest ago among
+  equals. An expert that recurs every few tokens keeps its copy through runs of experts that come once, and the experts of an
+  earlier topic do not hold the card through the next one. DeepSeek's slots give way by age alone.
 - **Cards:** the main card holds the dense weights (6.76 GiB with the Q8_0 head), the caches and the drafter (0.87 GiB). Up to three more cards
   (`--gpu 0,1,2,3`) each hold the experts of one block of layers; later cards idle.
 - **Engram table:** read by row from the pack, so it takes no RAM of its own; the OS file cache keeps the hot rows.
