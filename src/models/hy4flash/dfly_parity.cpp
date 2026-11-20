@@ -1,7 +1,7 @@
 // src/models/hy4flash/dfly_parity.cpp - GPU parity of the DFly2 drafter against a double-precision CPU reference written
 // from the equations in dfly.hpp: the four kernels, the tap, and the whole block pass with the sequential heads on small
-// random weights (E = 256, two layers, two heads, a 300-token vocabulary) over random "target" caches and selections.
-// Synthetic: no model, no checkpoint.
+// random weights (the real width E = 3072, the head screen's, with two layers, eight heads and a 300-token vocabulary) over
+// random "target" caches and selections. Synthetic: no model, no checkpoint.
 #include "basalt/core/loader.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
@@ -334,7 +334,7 @@ struct Ref {
 
 void test_block() {
     DflyDims d;
-    d.layers = 2; d.E = 256; d.q_lora = 128; d.heads = 8; d.ffn = 192; d.hc_ffn = 96; d.vocab = 300; d.mask_id = 299;
+    d.layers = 2; d.E = 3072; d.q_lora = 128; d.heads = 8; d.ffn = 192; d.hc_ffn = 96; d.vocab = 300; d.mask_id = 299;
     d.topk = 64; d.rms_eps = 1e-5f; d.rope_base = 1e7f;
     d.kv_layers = {4, 6};
     d.idx_layers = {4, 6};
@@ -370,6 +370,7 @@ void test_block() {
     basalt::core::quantize_bf16_q8_0(head.bits.data(), head.bits.size(), head.q8.data());
     void* dhead_q8 = upload(head.q8);
     w.head_q8 = dhead_q8;
+    CHECK(w.pack_screen(nullptr, err));
     std::vector<float> embed((size_t) d.vocab * E);
     for (float& x : embed) x = gauss(1.f);
     Ref r2{d, std::move(rm), std::move(rf), embed, head};

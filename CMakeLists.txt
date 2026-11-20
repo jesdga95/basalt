@@ -481,6 +481,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/bf16_gemv.cu
                         src/kernels/cuda/native_mmvq.cu
+                        src/kernels/cuda/q80_screen.cu
                         src/kernels/cuda/native_bf16.cu
                         src/kernels/cuda/dequant_bf16.cu
                         src/kernels/cuda/wait_abort.cu
@@ -519,6 +520,7 @@ endif()
 endif()
 # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
 set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
+    src/kernels/cuda/q80_screen.cu
     src/models/qwen4exp/kernels/native_gr_norm.cu
     src/models/qwen4exp/kernels/native_moe.cu
     src/models/qwen4exp/kernels/native_gdn.cu
@@ -1003,6 +1005,12 @@ add_executable(mmvq_multi_parity tests/kernels/mmvq_multi_parity.cpp)
 target_include_directories(mmvq_multi_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(mmvq_multi_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME mmvq_multi_parity COMMAND mmvq_multi_parity)
+# the draft head screen (q80_screen) against native_mmvq's one-column logits and their argmax, and against a CPU reference
+# (synthetic at the real width, GPU, no model; --bench adds the microbench)
+add_executable(q80_screen_parity tests/kernels/q80_screen_parity.cpp)
+target_include_directories(q80_screen_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(q80_screen_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME q80_screen_parity COMMAND q80_screen_parity)
 if(BASALT_MODEL_QWEN4EXP)
 # the decode GDN block against the per-stage verify kernels, bitwise (synthetic, GPU, no model; --bench)
 add_executable(dec_gdn_parity tests/models/qwen4exp/kernels/dec_gdn_parity.cpp)

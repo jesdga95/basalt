@@ -4,7 +4,7 @@
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
-#include "basalt/kernels/sampler.hpp"
+#include "basalt/kernels/q80_screen.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
@@ -28,10 +28,21 @@ namespace bk = basalt::kernels;
 DflyWeights::~DflyWeights() {
     for (auto& [name, p] : slots_)
         if (p) cudaFree(p);
+    if (head_screen) cudaFree(head_screen);
 }
 
 bool DflyWeights::allocate(const DflyDims& d, std::string& err) {
     dims = d;
+    if (!bk::q80_screen_supported(d.E)) {
+        err = "no draft head screen for a width of " + std::to_string(d.E);
+        return false;
+    }
+    const size_t screen = bk::q80_screen_bytes(d.E, d.vocab);
+    if (cudaMalloc(&head_screen, screen) != cudaSuccess) {
+        err = "out of device memory for the drafter's head screen";
+        return false;
+    }
+    bytes_ += screen;
     for (const DflySpec& s : dfly_specs(d)) {
         if (s.q8 && (s.shape.size() != 2 || s.shape[1] % 32 != 0)) {
             err = "the drafter's " + s.name + " rows are not whole Q8_0 blocks";
@@ -88,6 +99,19 @@ bool DflyWeights::allocate(const DflyDims& d, std::string& err) {
 void* DflyWeights::slot(const std::string& name) const {
     auto it = slots_.find(name);
     return it == slots_.end() ? nullptr : it->second;
+}
+
+bool DflyWeights::pack_screen(void* stream, std::string& err) {
+    if (!head_q8 || !head_screen) {
+        err = "the drafter has no head to screen";
+        return false;
+    }
+    bk::q80_screen_pack(head_q8, dims.E, dims.vocab, head_screen, stream);
+    if (cudaStreamSynchronize((cudaStream_t) stream) != cudaSuccess) {
+        err = std::string("packing the drafter's head screen: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
 }
 
 model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<DflyWeights>& out) {
@@ -196,7 +220,8 @@ struct DflyRunner::Impl {
     int32_t *meta_d = nullptr, *meta_h = nullptr;   ///< per layer, the rows' first cells (0) and counts
     void* attw = nullptr;                           ///< the attention's workspace (zeroed once)
     float *cat = nullptr, *fused = nullptr, *emb0 = nullptr, *pe = nullptr, *hg = nullptr, *hu = nullptr, *hh = nullptr,
-          *hd = nullptr, *hcout = nullptr, *logits = nullptr, *craw = nullptr;
+          *hd = nullptr, *hcout = nullptr, *craw = nullptr;
+    void* screen = nullptr;   ///< the head screen's scratch
     int32_t* pick = nullptr;
     float *h_emb = nullptr, *h_pe = nullptr, *h_conf = nullptr;
     int32_t* h_tok = nullptr;
@@ -263,7 +288,8 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
     if (ok) cudaMemset(p.attw, 0, attw);
     p.cat = p.dev(2 * E, ok); p.fused = p.dev(E, ok); p.emb0 = p.dev(E, ok); p.pe = p.dev(E, ok);
     p.hg = p.dev(d.hc_ffn, ok); p.hu = p.dev(d.hc_ffn, ok); p.hh = p.dev(d.hc_ffn, ok); p.hd = p.dev(E, ok); p.hcout = p.dev(E, ok);
-    p.logits = p.dev(d.vocab, ok); p.craw = p.dev(1, ok);
+    p.craw = p.dev(1, ok);
+    p.screen = p.dev(bk::q80_screen_scratch_bytes(d.vocab) / 4 + 1, ok);
     const int widest_in = std::max({2 * d.E, d.q_lora, d.heads * (int) kDflyV, d.ffn, d.hc_ffn});
     p.act_q8 = p.dev(bk::native_q8_1_bytes(widest_in, kDflyBlock) / 4 + 1, ok);
     p.pick = (int32_t*) p.dev(1, ok);
@@ -414,9 +440,6 @@ bool DflyRunner::finish(int32_t* ids, float* conf, int& made, void* stream, std:
     const DflyWeights& w = *p.w;
     cudaStream_t st = (cudaStream_t) stream;
     const int E = d.E;
-    bk::SamplerParams sp;
-    sp.greedy = true;
-    sp.temperature = 0.f;
     std::string why;
     const auto synced = [&] {
         if (cudaStreamSynchronize(st) == cudaSuccess) return true;
@@ -452,8 +475,8 @@ bool DflyRunner::finish(int32_t* ids, float* conf, int& made, void* stream, std:
                     return true;
                 }
             }
-            p.mm(w.head_q8, p.hcout, E, p.logits, d.vocab, E, d.vocab, 1, st);
-            bk::sample_tokens(p.logits, 1, d.vocab, nullptr, 0, sp, p.pick, st);
+            bk::native_quantize_q8_1(p.hcout, p.act_q8, E, 1, st);
+            bk::q80_screen_top1(w.head_screen, w.head_q8, p.act_q8, E, d.vocab, p.screen, p.pick, st);
             cudaMemcpyAsync(p.h_tok, p.pick, 4, cudaMemcpyDeviceToHost, st);
             if (on_row && j > 0) on_row(j, prev);
             if (!synced()) return false;

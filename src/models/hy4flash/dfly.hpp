@@ -27,7 +27,9 @@
 //      the target's cache.
 //   4. Hidden-Correction, in order, draft j = 0..n-1 from row j + 1 and the token before it (a, then draft j - 1):
 //      c = hidden_norm(z[j+1]) :: embed_norm(e(prev)), h' = z[j+1] + down(silu(gate(c)) * up(c)).
-//   5. Head: the target's output head over h', argmax. Row 0's output is not used; its K/V feed the later rows.
+//   5. Head: the target's output head over h', argmax, screened by a 2-bit copy of the head's rows: the rows near the copy's
+//      best are scored exactly as the target scores them (kernels/q80_screen.hpp). Row 0's output is not used; its K/V feed
+//      the later rows.
 // Assumptions the reference leaves open: the confidence is sigmoid(confidence_head(h')) (vLLM does not load the head; it only
 // steers the draft policy's window choice); rope positions are text positions, so after a picture the block turns by the
 // text's rotary position; the draft layers read sparse target layers (checked at load); a pack with a context local window
@@ -103,14 +105,17 @@ struct DflyLayer {
 };
 
 /// The drafter's weights on the main card: the block pass's projections in Q8_0 (rounded as they load, so the expert tier is
-/// sized after the smaller drafter), kv_b in BF16 as stored, FP32 vectors.
+/// sized after the smaller drafter), kv_b in BF16 as stored, FP32 vectors, and the 2-bit copy of the target's head that
+/// screens the drafts.
 class DflyWeights {
 public:
     ~DflyWeights();
-    /// Device memory for every tensor of `dims` on the current device; `slot` then says where each goes.
+    /// Device memory for every tensor of `dims` and the head's copy on the current device; `slot` then says where each goes.
     bool allocate(const DflyDims& dims, std::string& err);
     void* slot(const std::string& name) const;   ///< null for an unknown name
     uint64_t bytes() const { return bytes_; }
+    /// Packs the head's copy from head_q8 (once its bytes are on the card).
+    bool pack_screen(void* stream, std::string& err);
 
     DflyDims dims;
     std::vector<DflyLayer> layer;
@@ -118,6 +123,7 @@ public:
     const float *enorm = nullptr, *hnorm = nullptr, *fuse_gate = nullptr, *hc_hidden_norm = nullptr, *hc_embed_norm = nullptr,
                 *final_norm = nullptr, *conf_w = nullptr, *conf_b = nullptr;
     const void* head_q8 = nullptr;   ///< the target's Q8_0 head (the model's tensor): the drafts read it as the target does
+    void* head_screen = nullptr;     ///< its 2-bit copy (kernels/q80_screen.hpp)
 
 private:
     std::map<std::string, void*> slots_;

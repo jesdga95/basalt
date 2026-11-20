@@ -24,7 +24,7 @@ deterministic and runs once in the converter; `convert.py --verify` repeats it a
 | Norms, hyper-connections, router, biases | F32 | as stored |
 | Engram table | E4M3 codes, no scale | each BF16 value to the nearest code, ties to even; few of the values are E4M3 already (9% exact, 2.7% RMS error) |
 | Vision encoder and projector | BF16 (convolutions and position table F32) | as stored |
-| DFly2 drafter | BF16 in the file; projections rounded to Q8_0 as they load (`kv_b` stays BF16), vectors widened to FP32; the drafts read the target's Q8_0 head | drafting only: cannot change output |
+| DFly2 drafter | BF16 in the file; projections rounded to Q8_0 as they load (`kv_b` stays BF16), vectors widened to FP32; the drafts pick from the target's Q8_0 head through a 2-bit copy of its rows, the rows near the copy's best scored exactly | drafting only: cannot change output |
 
 The routed experts' weight RMS error is 0.081 in NVFP4 (the Q4_K_M test pack: 0.071 gate and up, 0.077 Q4_K down, 0.018 Q6_K
 down on 19 layers).
@@ -85,8 +85,8 @@ in one chunk against 1,024-row chunks gives last-row KL 0.0032.
 `--spec` verifies up to 6 rows at once (the default). Each verify row equals plain decode's, including the indexer's pooled keys,
 which are built from the same raw rows whichever window completes a group. The drafter reads the target's caches without writing
 them and keeps its block's rows in scratch, so a rejected block leaves nothing behind. With the tiers pinned, drafted output is
-plain decoding's token for token. The drafter's own rounding (Q8_0 projections, FP8 block rows with `--kv fp8`) changes only
-which drafts are accepted.
+plain decoding's token for token. The drafter's own rounding (Q8_0 projections, the head's 2-bit screen, FP8 block rows with
+`--kv fp8`) changes only which drafts are accepted.
 
 ## Against the BF16 reference
 
