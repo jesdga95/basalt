@@ -1417,7 +1417,7 @@ template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1 split; the per-expe
 };
 
 // Down formats whose row is K = 40 calls (n_ff 640): IQ4_NL, Q5_1 and Q5_0 (32-value blocks, two calls) and
-// NVFP4 (64-value blocks, four): eight lanes a row.  MXFP4 keeps the generic path: no pack carries it at n_ff 640.
+// NVFP4 (64-value blocks, four): eight lanes a row.  MXFP4 takes the generic down path.
 template<int TD> inline constexpr bool kDown40 = TD == 20 || TD == 40 || TD == 7 || TD == 6;
 __host__ __device__ constexpr bool kDown40Type(int t) { return t == 20 || t == 40 || t == 7 || t == 6; }
 
