@@ -515,7 +515,7 @@ class EveryOption(unittest.TestCase):
         ap = build_parser()
         for name, act in server_options(ap).items():
             # grammar is on by default: its no- form differs (test_grammar)
-            if name in ("api-key", "engine-bin", "grammar"):
+            if name in ("api-key", "api-key-file", "engine-bin", "grammar"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):
@@ -616,6 +616,17 @@ class Startup(unittest.TestCase):
         code, err = self.run_server({"models": [entry], "server": {"api-key": "k"}})
         self.assertEqual(code, 2)
         self.assertIn("api-key can't be set in a config file", err)
+        code, err = self.run_server({"models": [entry], "server": {"api-key-file": "k.txt"}})
+        self.assertEqual(code, 2)
+        self.assertIn("api-key can't be set in a config file", err)
+        key_file = Path(TMP.name) / "key.txt"
+        key_file.write_text("s3cret\n", encoding="utf-8")
+        code, err = self.run_server({"models": [entry]}, "--mock-engine", "--api-key", "k", "--api-key-file", str(key_file))
+        self.assertEqual(code, 2)
+        self.assertIn("give --api-key or --api-key-file, not both", err)
+        code, err = self.run_server({"models": [entry]}, "--mock-engine", "--api-key-file", str(key_file) + ".missing")
+        self.assertEqual(code, 2)
+        self.assertIn("--api-key-file", err)
         code, err = self.run_server({"models": [entry], "server": {"nope": 1}})
         self.assertIn("not a server option", err)
         code, err = self.run_server({"models": [entry], "server": {"port": "abc"}})
