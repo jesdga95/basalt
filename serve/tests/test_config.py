@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.config import (  # noqa: E402
     CONFIG_VERSION,
+    ENGINE_VALUE_FORMS,
     ENTRY_OPTIONS,
     MODEL_OPTIONS,
     SAMPLING_KEYS,
