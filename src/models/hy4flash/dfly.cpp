@@ -260,9 +260,15 @@ struct DflyRunner::Impl {
     void mm(const void* wt, const float* x, int ldx, float* y, int ldy, int n_in, int n_out, int rows, void* st, bool q4 = false) {
         if (ldx != n_in || ldy != n_out || rows > kDflyBlock) throw std::logic_error("dfly: a projection's rows are not packed");
         bk::native_quantize_q8_1(x, act_q8, n_in, rows, st);
-        bk::native_mmvq(q4 ? 2 : 8, wt, act_q8, y, n_in, n_out, rows, st);   // GGUF type ids: Q4_0, Q8_0
+        mmq(wt, act_q8, y, n_in, n_out, rows, st, q4);
+    }
+    // the MMVQ alone, over rows already in q8_1
+    void mmq(const void* wt, const void* xq, float* y, int n_in, int n_out, int rows, void* st, bool q4 = false) {
+        if (rows > kDflyBlock) throw std::logic_error("dfly: a projection's rows are not packed");
+        bk::native_mmvq(q4 ? 2 : 8, wt, xq, y, n_in, n_out, rows, st);   // GGUF type ids: Q4_0, Q8_0
     }
     void* act_q8 = nullptr;   // a projection's input rows in q8_1
+    void* in_q8 = nullptr;    // rows that several projections read, in q8_1 once
 };
 
 std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err) {
@@ -293,6 +299,7 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
     p.screen = p.dev(bk::q80_screen_scratch_bytes(d.vocab) / 4 + 1, ok);
     const int widest_in = std::max({2 * d.E, d.q_lora, d.heads * (int) kDflyV, d.ffn, d.hc_ffn});
     p.act_q8 = p.dev(bk::native_q8_1_bytes(widest_in, kDflyBlock) / 4 + 1, ok);
+    p.in_q8 = p.dev(bk::native_q8_1_bytes(widest_in, kDflyBlock) / 4 + 1, ok);
     p.pick = (int32_t*) p.dev(1, ok);
     p.h_emb = p.host(R * E, ok); p.h_pe = p.host(E, ok); p.h_conf = p.host(1, ok);
     p.h_tok = (int32_t*) p.host(1, ok);
@@ -376,10 +383,11 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             else dfly_gather_rows((const uint16_t*) cache[i], cells, nctx, kDflyRowWidth, p.ctx, st);
 
             bk::rms_norm_rows(p.X, L.in_ln, p.xn, R, E, d.rms_eps, st);
-            p.mm(L.q_a, p.xn, E, p.qa, d.q_lora, E, d.q_lora, R, st);
+            bk::native_quantize_q8_1(p.xn, p.in_q8, E, R, st);   // q_a, kv_a and the gate read it
+            p.mmq(L.q_a, p.in_q8, p.qa, E, d.q_lora, R, st);
             bk::rms_norm_rows(p.qa, L.q_a_ln, p.qan, R, d.q_lora, d.rms_eps, st);
             p.mm(L.q_b, p.qan, d.q_lora, p.q, H * QW, d.q_lora, H * QW, R, st);
-            p.mm(L.kv_a, p.xn, E, p.kvraw, kDflyRowWidth, E, kDflyRowWidth, R, st);
+            p.mmq(L.kv_a, p.in_q8, p.kvraw, E, kDflyRowWidth, R, st);
             dfly_absorb_k(L.kv_b, p.q, H * QW, QW, R, H, p.qabs, st);
             // the block's rows land after the selected ones, turned by their rotary positions: position rp + r of this base is
             // row nctx + r of ctx
@@ -395,14 +403,15 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             rs.counts = p.meta_d + i * 16 + 8;
             mla_attend(p.qcur, p.ctx, rs, R, L.sink, a, 0, p.env.sel_cap + kDflyBlock, p.attw, p.olat, st);
             dfly_expand_v(L.kv_b, p.olat, R, H, p.vout, st);
-            p.mm(L.gate, p.xn, E, p.gate, H * kDflyV, E, H * kDflyV, R, st, true);
+            p.mmq(L.gate, p.in_q8, p.gate, E, H * kDflyV, R, st, true);
             mul_sigmoid(p.gate, p.vout, R * H * kDflyV, st);
             p.mm(L.o, p.vout, H * kDflyV, p.o, E, H * kDflyV, E, R, st, true);
             bk::rms_norm_rows(p.o, L.post_proj_ln, p.o2, R, E, d.rms_eps, st);
             add_vectors(p.X, p.o2, p.X1, R * E, st);
             bk::rms_norm_rows(p.X1, L.post_attn_ln, p.xn, R, E, d.rms_eps, st);
-            p.mm(L.mlp_gate, p.xn, E, p.g, d.ffn, E, d.ffn, R, st, true);
-            p.mm(L.mlp_up, p.xn, E, p.u, d.ffn, E, d.ffn, R, st, true);
+            bk::native_quantize_q8_1(p.xn, p.in_q8, E, R, st);   // the MLP's gate and up read it
+            p.mmq(L.mlp_gate, p.in_q8, p.g, E, d.ffn, R, st, true);
+            p.mmq(L.mlp_up, p.in_q8, p.u, E, d.ffn, R, st, true);
             bk::swiglu_scaled(p.g, p.u, nullptr, nullptr, p.h, R, d.ffn, d.ffn, st);
             p.mm(L.mlp_down, p.h, d.ffn, p.mlp, E, d.ffn, E, R, st, true);
             add_vectors(p.X1, p.mlp, p.X, R * E, st);
@@ -460,8 +469,9 @@ bool DflyRunner::finish(int32_t* ids, float* conf, int& made, void* stream, std:
             const float* zrow = p.z + (size_t) (j + 1) * E;
             bk::rms_norm_rows(zrow, w.hc_hidden_norm, p.cat, 1, E, d.rms_eps, st, 2 * E);
             bk::rms_norm_rows(p.pe, w.hc_embed_norm, p.cat + E, 1, E, d.rms_eps, st, 2 * E);
-            p.mm(w.hc_gate, p.cat, 2 * E, p.hg, d.hc_ffn, 2 * E, d.hc_ffn, 1, st);
-            p.mm(w.hc_up, p.cat, 2 * E, p.hu, d.hc_ffn, 2 * E, d.hc_ffn, 1, st);
+            bk::native_quantize_q8_1(p.cat, p.in_q8, 2 * E, 1, st);   // the gate and up read it
+            p.mmq(w.hc_gate, p.in_q8, p.hg, 2 * E, d.hc_ffn, 1, st);
+            p.mmq(w.hc_up, p.in_q8, p.hu, 2 * E, d.hc_ffn, 1, st);
             bk::swiglu_scaled(p.hg, p.hu, nullptr, nullptr, p.hh, 1, d.hc_ffn, d.hc_ffn, st);
             p.mm(w.hc_down, p.hh, d.hc_ffn, p.hd, E, d.hc_ffn, E, 1, st);
             add_vectors(zrow, p.hd, p.hcout, E, st);
