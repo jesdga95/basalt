@@ -2110,11 +2110,12 @@ private:
                     uniq[nu++] = e;
                     use[u] = core::ExpertTier::Use{};
                 }
+                uidx[t * K + k] = u;
+                if (e == -1) continue;   // --route-tail-skip dropped it: no rows (a token may drop several)
                 core::ExpertTier::Use& us = use[u];
                 us.tok[us.nt] = t;
                 us.row[us.nt] = t * K + k;
                 ++us.nt;
-                uidx[t * K + k] = u;
             }
         core::ExpertTier::Lookup& lk = pd.lk;
         if (!tier_->lookup(tl, uniq, nu, lk, err)) return false;
