@@ -22,7 +22,10 @@ void note_fallback(const char* what, int a, int b) {
 // a dense projection of the window: dense_tc where dense_tc_mask has the projection's bit and the type, else
 // native_mmvq (either one for every window width, so a column's value never depends on T)
 void dense_proj(int bit, int type, const void* w, const void* xq, float* y, int n_in, int n_out, int n, void* s) {
-    if ((kernels::dense_tc_mask() & bit) && kernels::dense_tc_supported(type, n_in, n_out, w) &&
+    // the QSA k/v projection fits the tensor-core path when its weights are Q6_K; other k/v types keep the SIMD
+    // kernel, which is faster for them at a one-token window. Selected by type, not by pack.
+    const bool kv_q6k = bit == 32 && type == 14;
+    if (((kernels::dense_tc_mask() & bit) || kv_q6k) && kernels::dense_tc_supported(type, n_in, n_out, w) &&
         kernels::dense_tc_type_on(type))
         kernels::dense_tc(type, w, xq, y, n_in, n_out, n, s);
     else {

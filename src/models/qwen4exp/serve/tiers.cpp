@@ -615,9 +615,9 @@ int QfnRuntime::init_tiers() {
     // does not, and where an expert runs depends only on the window count, as with the plain rounds.
     adapt_fast = !multi_gpu;
     // Its rounds come every --adapt-every windows, so the counts decay less per round than the plain default
-    // (--adapt-decay when given, else 0.85): the routing counts stay large enough for the thresholds and the peer
+    // (--adapt-decay when given, else 0.95): the routing counts stay large enough for the thresholds and the peer
     // margin.
-    fast_decay = o.adapt_decay_set ? o.adapt_decay : 0.85f;   // PROBE adapt sets it
+    fast_decay = o.adapt_decay_set ? o.adapt_decay : 0.95f;   // PROBE adapt sets it
 
     peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
     // the rounds rank over all layers when at most one peer tier holds experts (not exclusively) and every layer's

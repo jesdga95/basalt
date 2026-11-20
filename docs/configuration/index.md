@@ -118,7 +118,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `adapt-every` | engine | windows | 1 on a server, 4 with a layer split (`0` = off) | Flash-Next only. An adaptive round every N windows. [adaptive](adaptive.md) |
 | `adapt-swaps` | engine | integer | 96 (`0` = off) | Flash-Next only. Most experts one round swaps into the main GPU. [adaptive](adaptive.md) |
 | `peer-adapt-swaps` | engine | integer | `adapt-swaps` | Flash-Next only. Most experts one round swaps into the peer card. |
-| `adapt-decay` | engine | number | 0.85 (0.7 with a layer split) | Flash-Next only. Factor applied to routing counts after each round. [adaptive](adaptive.md) |
+| `adapt-decay` | engine | number | 0.95 (0.7 with a layer split) | Flash-Next only. Factor applied to routing counts after each round. [adaptive](adaptive.md) |
 
 ## Prompt processing
 

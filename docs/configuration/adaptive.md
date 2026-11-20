@@ -19,7 +19,7 @@ slots still depend on when each arrives.
 | `adapt-every` | 1 on a server, 4 with a layer split | Fewer, later rounds cost less link, but a topic change or a fresh engine waits N windows. |
 | `adapt-swaps` | 96 | Bigger rounds catch up faster and move more bytes (about 2.6 MiB per NVFP4 expert each way). The RAM copy keeps four times N free places. |
 | `peer-adapt-swaps` | `adapt-swaps` | Same, on the peer's link. `0` freezes the peer tier. |
-| `adapt-decay` | 0.85 (0.7 with a layer split) | Lower follows topic changes sooner. Higher keeps a long-run placement. |
+| `adapt-decay` | 0.95 (0.7 with a layer split) | Lower follows topic changes sooner. Higher keeps a long-run placement. |
 | `expert-profile-save` | off | Saves the placement; a continuing workload starts on it, a different one starts wrong. |
 
 `hit=` in the `done` line counts only the main card's VRAM lookups, so a higher `hit` is not always faster. Compare `tg`.
@@ -43,5 +43,8 @@ chat requests. Decode tok/s, one run per arm:
 
 A long cadence is what hurts: the first round of a fresh engine and every topic change wait for it. Single-knob tests on two cards:
 `adapt-swaps 256` alone and `adapt-decay 0.7` alone stay within noise of the defaults.
+
+On the QAD pack, one RTX 5090 at 475 W, structured decode, ABBA over four runs: decay 0.95 against 0.85 gave 448 to 464 tok/s
+and 17.28 to 16.72 ms/window. The same comparison on the plain NVFP4 pack stayed within noise.
 
 Smaller rounds can win where the card is small, since each round moves fewer experts over the link. [basalt-probe](../probe.md) tries these values on your machine, small rounds included.
