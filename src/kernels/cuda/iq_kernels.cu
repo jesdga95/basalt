@@ -3247,13 +3247,32 @@ __global__ void __launch_bounds__(256) swiglu_clamp_q8_1_entries_kernel(const fl
     }
 }
 
-// native_expert_grouped's body; CLAMP selects the limited SwiGLU at compile time, so the unclamped instantiation is
-// the original launch sequence.
-template<bool CLAMP>
+// The softcapped SwiGLU, then the q8_1 blocks (the same pass as swiglu_q8_1_entries_kernel): h = cg tanh(g / cg) sigmoid(g)
+// cu tanh(u / cu), in fp32.
+__global__ void __launch_bounds__(256) swiglu_softcap_q8_1_entries_kernel(const float* __restrict__ gate,
+                                                                          const float* __restrict__ up,
+                                                                          const int32_t* __restrict__ grp_start,
+                                                                          const int32_t* __restrict__ n_groups, int n_ff,
+                                                                          float cg, float cu, block_q8_1* __restrict__ hq) {
+    const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
+    for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
+         i += (long long) gridDim.x * blockDim.x) {
+        const float g = gate[i], u = up[i];
+        const float h = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu));
+        q8_1_store(h, hq, i);
+    }
+}
+
+enum class Act { Plain, Clamp, Softcap };
+
+// native_expert_grouped's body; ACT selects the activation at compile time, so the plain instantiation is the original
+// launch sequence.
+template<Act ACT>
 void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                   const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                   int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                   int64_t grid_groups, [[maybe_unused]] float limit) {
+    constexpr bool CLAMP = ACT == Act::Clamp;
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.n_ff % 32 != 0) { basalt::log::error("basalt", "native_expert_grouped: n_ff %lld", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
@@ -3293,7 +3312,10 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
     const bool sw_v1 = v1;
-    if constexpr (CLAMP) {
+    if constexpr (ACT == Act::Softcap) {
+        swiglu_softcap_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(
+            gate, up, grp_start, n_groups, (int) L.n_ff, L.gate_softcap, L.up_softcap, hq);
+    } else if constexpr (CLAMP) {
         if (chain)
             launch_dependent(swiglu_clamp_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s,
                              (const float*) gate, (const float*) up, grp_start, n_groups, (int) L.n_ff, limit, hq);
@@ -3330,20 +3352,23 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups) {
-    if (L.swiglu_limit > 0.0f)
-        grouped_impl<true>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
-                           out, stream, grid_groups, L.swiglu_limit);
+    if (L.gate_softcap > 0.0f)
+        grouped_impl<Act::Softcap>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1,
+                                   scratch, out, stream, grid_groups, 0.0f);
+    else if (L.swiglu_limit > 0.0f)
+        grouped_impl<Act::Clamp>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                                 out, stream, grid_groups, L.swiglu_limit);
     else
-        grouped_impl<false>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
-                            out, stream, grid_groups, 0.0f);
+        grouped_impl<Act::Plain>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                                 out, stream, grid_groups, 0.0f);
 }
 
 void native_expert_grouped_clamped(const NativeExpertLayout& L, float swiglu_limit, const unsigned long long* grp_ptr,
                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                    const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
                                    void* scratch, float* out, void* stream, int64_t grid_groups) {
-    grouped_impl<true>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
-                       out, stream, grid_groups, swiglu_limit);
+    grouped_impl<Act::Clamp>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                             out, stream, grid_groups, swiglu_limit);
 }
 
 namespace {
@@ -3379,7 +3404,7 @@ void gated_mlp_clamped(const NativeExpertLayout& L, float swiglu_limit, const vo
     auto* tok = dst + cap_tok;
     gated_mlp_plan_kernel<<<1, 128, 0, s>>>(blob, n_tok, ptr, start, ng, dst, tok);
     check("gated_mlp_clamped/plan");
-    grouped_impl<true>(L, ptr, start, ng, dst, tok, 1, n_tok, x_q8_1, scratch, out, stream, 0, swiglu_limit);
+    grouped_impl<Act::Clamp>(L, ptr, start, ng, dst, tok, 1, n_tok, x_q8_1, scratch, out, stream, 0, swiglu_limit);
 }
 
 #endif  // IQ_DEV_ONLY

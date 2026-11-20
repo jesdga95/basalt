@@ -56,6 +56,11 @@ int main() {
 #else
     expect("hy4flash", false);
 #endif
+#ifdef BASALT_MODEL_INKLING2
+    expect("inkling2", true);
+#else
+    expect("inkling2", false);
+#endif
     check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
         model::Started started;

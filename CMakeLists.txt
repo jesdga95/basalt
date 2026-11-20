@@ -251,6 +251,26 @@ if(BUILD_TESTING)
 endif()
 endif()
 
+if(BASALT_MODEL_INKLING2)
+add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/models/inkling2/kernels/attn.cu)
+target_include_directories(inkling2_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(inkling2_kernels PUBLIC ${_gpu_runtime_target})
+add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/inkling2/pretok_inkling2.cpp
+  src/models/inkling2/pack.cpp src/models/inkling2/model.cpp src/models/inkling2/session.cpp)
+target_include_directories(model_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
+target_link_libraries(model_inkling2 PUBLIC model tokenizer inkling2_kernels kernels core ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  add_executable(inkling2_kernels_parity src/models/inkling2/kernels/kernels_parity.cpp)
+  target_include_directories(inkling2_kernels_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(inkling2_kernels_parity PRIVATE inkling2_kernels kernels ggml_quants ${_gpu_runtime_target})
+  basalt_gpu_test(NAME inkling2_kernels_parity COMMAND inkling2_kernels_parity)
+  add_executable(inkling2_pretok_test src/models/inkling2/pretok_test.cpp src/models/inkling2/pretok_inkling2.cpp)
+  target_include_directories(inkling2_pretok_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
+  target_link_libraries(inkling2_pretok_test PRIVATE tokenizer)
+  basalt_cpu_test(NAME inkling2_pretok_test COMMAND inkling2_pretok_test)
+endif()
+endif()
+
 if(BASALT_MODEL_DEEPSEEK41)
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
