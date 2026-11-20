@@ -143,6 +143,17 @@ int main(int argc, char** argv) {
     check(cpu_label("Intel(R) Xeon(R) Gold 6130 CPU @ 2.10GHz", 1) == "Intel Xeon Gold 6130, 1 core", "cpu_label: clock and CPU");
     check(pack_quant_label("Qwen3.8-Flash-Next NVIDIA-NVFP4") == "NVFP4" && pack_quant_label("DeepSeek-V4.1-Flash-1017 UD-IQ1_M") == "IQ1_M" &&
               pack_quant_label("") == "unknown", "pack_quant_label");
+    check(pack_quant_label("Qwen3.8-Flash-Next") == "unknown" && pack_quant_label("Qwen3.8-Flash-Next UD-Q4_K_XL") == "Q4_K_XL" &&
+              pack_quant_label("Qwen3.8-Flash-Next UD-IQ3_XXS") == "IQ3_XXS", "pack_quant_label: a name without a space is unknown");
+    check(pack_quant_label("Qwen3.8-Flash-Next ud-q4_k_m") == "q4_k_m" &&
+              pack_quant_label("Qwen3.8-Flash-Next Q4_K_M ") == "Q4_K_M" &&
+              pack_quant_label("Qwen3.8-Flash-Next nvidia-NVFP4-DQ8") == "NVFP4-DQ8" &&
+              pack_quant_label(" Qwen3.8-Flash-Next Huihui-Abliterated-V2\t") == "Huihui-Abliterated-V2" &&
+              pack_quant_label("  Qwen3.8-Flash-Next  ") == "unknown",
+          "pack_quant_label: edge spaces trimmed, prefixes stripped in any case, the label keeps its own case");
+    check(pack_quant_label("Qwen3.8-Flash-Next UD-NVIDIA-Q4_K_XL") == "Q4_K_XL" &&
+              pack_quant_label("Qwen3.8-Flash-Next UD-UD-Q4") == "Q4",
+          "pack_quant_label: prefixes stripped repeatedly in any order");
     check(cpu_label("", 8).empty() && cpu_label("X", 0) == "X", "cpu_label: empty name, unknown cores");
 
     const auto links = parse_link_rates("noise\npcie_h2d 0000:01:00.0 55.3\npcie_h2d 0000:02:00.0 bad\npcie_h2d 0000:03:00.0 27.9\n");
