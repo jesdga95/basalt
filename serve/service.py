@@ -746,6 +746,11 @@ class Service:
         reading = [i for i, (st, _) in by_slot.items() if st.get("first_token") is None]
         progress = getattr(self.engine, "progress", None)
         console = getattr(self.engine, "console", None)
+        with self.status_lock:      # each slot's last request's start, for an idle slot's console figures
+            last_start = {}
+            for r in self.history:
+                if r.get("slot") is not None:
+                    last_start[r["slot"]] = r["time"]
         rows = []
         for i in range(total):
             held = dict(last.get(i, {}))
@@ -759,7 +764,8 @@ class Service:
                    "drafts_accepted": held.get("accepted"),       # draft counts are the slot's last finished request's
                    "started": None, "path": None, "prompt_ms": None,
                    # the engine's own figures of the slot's current or last request (STATS)
-                   **(console.slot(i) if console is not None else {"accept_pos": None, "accept_hist": None, "hit": None})}
+                   **(console.slot(i, by_slot[i][0].get("started") if i in by_slot else last_start.get(i))
+                      if console is not None else {"accept_pos": None, "accept_hist": None, "hit": None})}
             if view:
                 row["ctx_used"] = view[i]["held"]
             if i in by_slot:
