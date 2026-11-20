@@ -222,10 +222,9 @@ becomes per-group `<t seconds>` text and pads, as the processor at the model's r
 
 ## Lossy routing flags
 
-Off by default, never picked automatically, and the two flags need the device-planned MoE tail. Both apply to experts held by any GPU tier.
-
-- `--route-prior LAMBDA` (bare 0.5): picks experts as if held experts had LAMBDA added to their router logit.
-- `--route-tail-skip R` (bare 9): skips an expert no GPU holds when every entry naming it ranks R or lower by weight.
+What the two flags do, on every MoE model: [quality](quality.md#lossy-routing-flags). On Flash-Next they need the device-planned
+MoE tail, and `--route-prior` adds LAMBDA to the router logit (the log probability of its softmax; bare 0.5).
+`--route-tail-skip` alone is R 9 (k = 10).
 
 Quality gate (100 chunks, 400 W + 180 W, int8 KV, both flags together) and prose decode:
 

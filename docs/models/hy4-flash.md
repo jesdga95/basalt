@@ -119,8 +119,10 @@ positions are masked.
 
 ## Lossy flags
 
-None. Output depends on which experts are resident, so a different tier size can change the text
-([precision](../precision/hy4-flash.md#experts-and-placement)).
+Off by default. `--route-prior` and `--route-tail-skip` change output, and each is named in one start warning. What they do on
+every MoE model: [quality](../precision/quality.md#lossy-routing-flags); what they cost and gain here:
+[precision](../precision/hy4-flash.md#lossy-routing-flags). Without them, output still depends on which experts are resident, so a
+different tier size can change the text ([precision](../precision/hy4-flash.md#experts-and-placement)).
 
 ## Limits
 

@@ -110,3 +110,29 @@ a layer). Measured through the gate above (T 1, tiers frozen), against the same 
 
 At one placement the head moves mean KLD by +0.00001 and top-1 by 0.03 points (the largest change of one row's NLL 0.077). Placement
 alone moves more: the same 50 chunks with the BF16 head score 0.21549 at 133 copies against 0.21232 at 130.
+
+## Lossy routing flags
+
+What the flags do: [quality](quality.md#lossy-routing-flags). Here k is 16, so `--route-tail-skip` takes R 1 to 15 (bare 15), and
+`--route-prior` adds LAMBDA to the sigmoid score plus its bias, which the top 16 is taken from (bare 0.01).
+
+Two cards (400 W + 180 W), the default placement. Speed: `basalt-bench -t conv,struct,prose --seed 1`, one cold run each (off twice,
+before and after the rest); ms a window is the step time. CPU and bus picks: the run's `TIER final` line. Quality: the gate at 50
+chunks against the BF16 base (12,750 rows; this subset's off row reads 0.2069, the 100-chunk one 0.201).
+
+| Flags | CPU / bus picks | conv tok/s, ms/w | struct tok/s, ms/w | prose tok/s, ms/w | KLD | Same top-1 |
+|---|---:|---:|---:|---:|---:|---:|
+| off | 6.9% / 2.7% | 86.2, 24.79 | 173.8, 33.48 | 85.4, 20.22 | 0.2069 | 86.10% |
+| `--route-tail-skip 15` | 6.0% / 2.2% | 97.8, 23.77 | 180.7, 32.04 | 86.9, 19.36 | 0.2056 | 86.07% |
+| `--route-tail-skip 12` | 4.2% / 1.2% | 110.8, 20.50 | 208.4, 28.37 | 102.8, 17.40 | 0.2373 | 85.57% |
+| `--route-tail-skip 8` | 2.2% / 0.4% | 126.1, 17.64 | 228.6, 25.86 | 111.2, 15.93 | 0.2826 | 83.94% |
+| `--route-prior 0.01` | 4.4% / 1.4% | 108.1, 21.84 | 200.5, 29.27 | 98.9, 18.33 | 0.2212 | 85.70% |
+| `--route-prior 0.03` | 2.6% / 0.7% | 116.5, 19.43 | 219.1, 26.76 | 108.4, 16.60 | 0.2465 | 85.33% |
+| `--route-prior 0.1` | 1.0% / 0.2% | 129.9, 18.65 | 224.2, 26.42 | 115.6, 15.85 | 0.2941 | 83.82% |
+| both (0.1, 12) | 1.0% / 0.2% | 130.6, 18.50 | 224.6, 26.37 | 110.0, 16.08 | 0.2965 | 83.83% |
+
+Decode here waits on the CPU's experts and the bus copies, so dropping them pays directly: `--route-tail-skip 15` (12% of the misses
+dropped) costs nothing the gate sees for 4% of conv's window, 12 (44% dropped) cuts it by 17% for +0.030 KLD, 8 (76%) by 29% for
++0.076. `--route-prior 0.01` cuts 12% for +0.014; 0.1 empties the CPU's share but costs +0.087 and 2.3 points of top-1. With the prior
+on, few misses are left for the tail skip. The gate's PPL falls as the error grows (14.85 off, 13.77 at R 8), so it is no measure of
+closeness here; KLD and top-1 are.
