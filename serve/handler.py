@@ -509,7 +509,8 @@ def make_handler(target: Service | Router):
                     if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
                         raise ValueError("reserve_mib: a whole number of MiB (0 or more), or null for the start's")
                     try:
-                        self._json(200, router.vram(r))
+                        out = router.vram(r)
+                        self._json(202 if out.get("status") == "pending" else 200, out)
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return

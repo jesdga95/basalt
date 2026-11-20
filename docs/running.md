@@ -85,6 +85,15 @@ After the given seconds without requests, the engine frees its VRAM (the driver 
 RAM copy of the experts stay (a dense model has no cache to give back first: the driver moves all its GPU state, both cards' on two cards). The next request wakes it in seconds. Linux only. The server stays awake when the GPU state would not fit in
 free RAM with 8 GiB to spare. `--idle-unload` ends the process instead.
 
+## Lending VRAM: `POST /v1/vram`
+
+With `--vram-elastic`, `POST /v1/vram` with `{"reserve_mib": N}` resizes the expert cache to keep N MiB free (`null`: the start's reserve).
+A resize needs a gap between requests. Idle, it applies at once and answers `200` with the new figures. While a request runs it is
+queued and answered `202 {"status": "pending"}`: it applies when the running requests have finished, and requests that arrive meanwhile
+wait for it, so steady traffic cannot hold it off. A later POST replaces a queued one (`"replaced": true`). A malformed body is a
+`400`. `GET /v1/status` shows `vram.pending` (the queued reserve, or `null`), `vram.applied` and `vram.error` (the engine refused
+the queued one).
+
 ## Memory floors
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
