@@ -112,24 +112,36 @@ def _bf16(raw: bytes, kind: int, rows: int, cols: int, name: str) -> np.ndarray:
     return a.reshape(rows, cols)
 
 
-def section(read, dense_index: bytes, mtp_index: bytes | None) -> bytes:
-    """The `hc8` section of a pack: `read(section, offset, size)` reads the pack's `dense` and `mtp/dense` bytes."""
-    copies = []
+def _matrices(dense_index: bytes, mtp_index: bytes | None):
+    """(copy name, section, offset, bytes, dense index kind, rows, cols) of each matrix the section copies, in its order."""
     rows = _dense_rows(dense_index.decode("utf-8"))
     for name in _main_names(rows):
         f = rows[name]
-        kind, off, nb, ne0, ne1 = int(f[2]), int(f[3]), int(f[4]), int(f[7]), int(f[8])
         if f[1] != "0":
             raise Hc8Error(f"{name} is not in the dense section")
-        w = _bf16(read("dense", off, nb), kind, ne1, ne0, name)
-        copies.append((name, ne1, ne0, quantize(w)))
+        yield name, "dense", int(f[3]), int(f[4]), int(f[2]), int(f[8]), int(f[7])
     for line in (mtp_index or b"").decode("utf-8").splitlines():
         f = line.split()
         if len(f) != 6 or f[1] != "bf16" or not MTP_HC.match(f[0]):
             continue
         r, c, off, nb = int(f[2]), int(f[3]), int(f[4]), int(f[5])
-        if r * c * 2 != nb:
-            continue
-        w = _bf16(read("mtp/dense", off, nb), 4, r, c, f[0])
-        copies.append(("mtp." + f[0], r, c, quantize(w)))
-    return table(copies)
+        if r * c * 2 == nb:
+            yield "mtp." + f[0], "mtp/dense", off, nb, 4, r, c
+
+
+def section(read, dense_index: bytes, mtp_index: bytes | None) -> bytes:
+    """The `hc8` section of a pack: `read(section, offset, size)` reads the pack's `dense` and `mtp/dense` bytes."""
+    return table([(name, r, c, quantize(_bf16(read(sec, off, nb), kind, r, c, name)))
+                  for name, sec, off, nb, kind, r, c in _matrices(dense_index, mtp_index)])
+
+
+def size(dense_index: bytes, mtp_index: bytes | None) -> int:
+    """The byte count `section` returns for these indexes, without reading a matrix."""
+    shapes = [(r, c) for _, _, _, _, _, r, c in _matrices(dense_index, mtp_index)]
+    end = at = (HEADER.size + len(shapes) * ENTRY.size + DATA_ALIGN - 1) // DATA_ALIGN * DATA_ALIGN
+    for r, c in shapes:
+        if c % G8:
+            raise Hc8Error(f"{c} columns are not whole groups of {G8}")
+        end = at + r * c + r * srow_of(c) * 2
+        at = (end + DATA_ALIGN - 1) // DATA_ALIGN * DATA_ALIGN
+    return end if shapes else HEADER.size
