@@ -210,7 +210,12 @@ class ConfigFile(unittest.TestCase):
                          ({"models": [entry], "engine": {"model": "x"}}, "in a model entry"),
                          ({"models": [entry], "engine": {"spec": None}}, "expected a string or number"),
                          ({"models": [entry], "engine": {"spec": ""}}, "expected a string or number"),
-                         ({"models": [entry], "engine": {"control-vector-layer-range": []}}, "empty list"),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": []}}, "must be a list \\[start, end\\], got \\[\\]"),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": "4 44"}},
+                          'control-vector-layer-range must be a list \\[start, end\\], got "4 44"'),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": [4]}}, "must be a list"),
+                         ({"models": [entry], "engine": {"kv": ["int8", "x"]}}, 'kv takes one value, got \\["int8", "x"\\]'),
+                         ({"models": [entry, {"model": "b", "control-vector-layer-range": 4}]}, "must be a list"),
                          ({"models": [entry], "engine": {"control-vector-layer-range": [4, [44]]}}, "expected a string or number"),
                          ({"models": [entry], "engine": {"control-vector-layer-range": [4, True]}}, "expected a string or number"),
                          ({"models": [entry], "engine": {"kv": {"a": 1}}}, "expected a string or number"),
@@ -236,10 +241,9 @@ class ConfigFile(unittest.TestCase):
 
     def test_list_values_become_words(self):
         engine = load_config_file(conf({"models": [{"model": "m"}], "engine": {
-            "control-vector-layer-range": [4, 44], "kv": "int8", "resident_experts": True, "no-x": False, "rate": 0.5,
-            "offset": ["-1", -2]}}), build_parser()).models[0].shared_words
+            "control-vector-layer-range": [4, 44], "kv": "int8", "resident_experts": True, "no-x": False, "rate": 0.5}}), build_parser()).models[0].shared_words
         self.assertEqual(engine, ["--control-vector-layer-range", "4", "44", "--kv", "int8", "--resident-experts",
-                                  "--rate", "0.5", "--offset", "-1", "-2"])
+                                  "--rate", "0.5"])
 
 
 class Precedence(unittest.TestCase):
@@ -545,6 +549,8 @@ class EveryOption(unittest.TestCase):
             if flag[2:] in server:                         # the server's own: --model, --vision, ...
                 with self.assertRaises(ValueError, msg=flag):
                     load_config_file(conf({"engine": {flag: 1}}), build_parser())
+                continue
+            if flag[2:] in ENGINE_VALUE_FORMS:             # the flags that take several values
                 continue
             cli = [flag, "5"] if takes_value else [flag]
             cfgv = 5 if takes_value else True
