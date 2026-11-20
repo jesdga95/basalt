@@ -9,7 +9,9 @@
 //     Tolerance: RMS 1e-5, worst row 1e-4.  After the down product an H value whose x/d lands within fp32 rounding
 //     of a .5 tie takes the neighbouring int8 code, so the tolerance there is RMS 2e-4, worst row 1e-2.
 //   - `double`: the unrounded activations - the int8 activation rounding every MMQ format has.  Tolerance: RMS 2.5e-2.
-// The per-expert gather and the grouped gather must give bitwise equal outputs.  An all-zero token stays exactly 0.
+// The per-expert gather and the grouped gather must give bitwise equal outputs, and a token's output rows must be
+// bitwise equal when run in a half-width chunk with the tokens at different positions.  An all-zero token stays
+// exactly 0.  Every error line reports the max absolute error next to the rms and the worst-row relative error.
 // Then a microbench line: one layer at a 512-token chunk (128 experts, top 6) - gathers plus products - in us and
 // TFLOP/s.  --no-bench.  Exit 77 without a CUDA device.
 #include "basalt/prefill/moe_mmq.hpp"
@@ -94,7 +96,7 @@ void q8_round(const float* x, float* y, int n) {
 }
 
 struct Err {
-    double rms = 0, worst = 0;
+    double rms = 0, worst = 0, maxabs = 0;
 };
 Err compare(const std::vector<float>& a, const std::vector<float>& ref, size_t rows) {
     double e2 = 0, r2 = 0;
@@ -112,6 +114,7 @@ Err compare(const std::vector<float>& a, const std::vector<float>& ref, size_t r
         }
         if (mr > 0) out.worst = std::max(out.worst, me / mr);
         else if (me > 0) out.worst = 1e30;
+        out.maxabs = std::max(out.maxabs, me);
     }
     out.rms = r2 > 0 ? std::sqrt(e2 / r2) : 0;
     return out;
@@ -119,23 +122,12 @@ Err compare(const std::vector<float>& a, const std::vector<float>& ref, size_t r
 
 struct Layer {
     int T, E;
+    std::vector<int32_t> ids;                    // token x top-k expert id
     std::vector<int32_t> cnt, off, src, order;   // per expert; sorted row -> token; experts with rows
     std::vector<int32_t> bh;                     // bounds: absolute per expert in order, then per group relative
 };
-Layer route(int T, int E, std::mt19937& rng, int hot) {
-    Layer L{T, E, {}, {}, {}, {}, {}};
-    std::vector<int32_t> ids((size_t) T * K);
-    for (int t = 0; t < T; ++t)
-        for (int k = 0; k < K; ++k) {
-            int e;
-            bool dup;
-            do {
-                e = (hot > 0 && k < 2 && rng() % 4 != 0) ? (int) (rng() % (unsigned) hot) : (int) (rng() % (unsigned) E);
-                dup = false;
-                for (int j = 0; j < k; ++j) dup |= ids[(size_t) t * K + j] == e;
-            } while (dup);
-            ids[(size_t) t * K + k] = e;
-        }
+Layer route_ids(int T, int E, const std::vector<int32_t>& ids) {
+    Layer L{T, E, ids, {}, {}, {}, {}, {}};
     L.cnt.assign((size_t) E, 0);
     for (int32_t e : ids) ++L.cnt[(size_t) e];
     L.off.assign((size_t) E + 1, 0);
@@ -152,6 +144,27 @@ Layer route(int T, int E, std::mt19937& rng, int hot) {
         for (size_t i = 0; i <= GROUP; ++i)
             L.bh[n + 1 + g * (GROUP + 1) + i] = L.bh[std::min(n, g * GROUP + i)] - L.bh[g * GROUP];
     return L;
+}
+Layer route(int T, int E, std::mt19937& rng, int hot) {
+    std::vector<int32_t> ids((size_t) T * K);
+    for (int t = 0; t < T; ++t)
+        for (int k = 0; k < K; ++k) {
+            int e;
+            bool dup;
+            do {
+                e = (hot > 0 && k < 2 && rng() % 4 != 0) ? (int) (rng() % (unsigned) hot) : (int) (rng() % (unsigned) E);
+                dup = false;
+                for (int j = 0; j < k; ++j) dup |= ids[(size_t) t * K + j] == e;
+            } while (dup);
+            ids[(size_t) t * K + k] = e;
+        }
+    return route_ids(T, E, ids);
+}
+// row of every assignment index (token x k) in a layer: rows fill each expert block in ascending assignment order
+std::vector<int32_t> assign_rows(const Layer& L) {
+    std::vector<int32_t> fill(L.off.begin(), L.off.end() - 1), r(L.ids.size());
+    for (size_t i = 0; i < L.ids.size(); ++i) r[i] = fill[(size_t) L.ids[i]]++;
+    return r;
 }
 
 struct Bufs {
@@ -253,6 +266,31 @@ int parity(cudaStream_t s, const Gate& gate) {
     const std::vector<float> y = download(b.dm, (size_t) rows * N), ygu = download(b.gu, (size_t) rows * 2 * FF);
     const bool same_gather = std::memcmp(y.data(), y1.data(), y.size() * 4) == 0;
 
+    // batch-width and position invariance: the last half of the tokens as a half-width chunk, every token now at
+    // new row positions; each token's rows must come out bitwise identical to the full run
+    constexpr int T2 = T / 2;
+    std::vector<int32_t> ids2((size_t) T2 * K);
+    for (int t = 0; t < T2; ++t)
+        for (int k = 0; k < K; ++k) ids2[(size_t) t * K + k] = L.ids[(size_t) (T - T2 + t) * K + k];
+    const Layer L2 = route_ids(T2, E, ids2);
+    const int64_t rows2 = (int64_t) T2 * K;
+    Dev x2_dev((size_t) T2 * N * 4), src2_dev((size_t) rows2 * 4);
+    ck(cudaMemcpy(x2_dev.p, x.data() + (size_t) (T - T2) * N, (size_t) T2 * N * 4, cudaMemcpyHostToDevice), "x2");
+    ck(cudaMemcpy(src2_dev.p, L2.src.data(), L2.src.size() * 4, cudaMemcpyHostToDevice), "src2");
+    ck(cudaDeviceSynchronize(), "uploads2");
+    Bufs b2(rows2, L2.bh.size(), gate);
+    run_mmq(ctx, b2, gate, L2, x2_dev.as<float>(), src2_dev.as<int32_t>(), blob, true, s);
+    ck(cudaStreamSynchronize(s), "sync2");
+    const std::vector<float> y2 = download(b2.dm, (size_t) rows2 * N);
+    const std::vector<int32_t> pos = assign_rows(L), pos2 = assign_rows(L2);
+    bool width_ok = true;
+    for (int t = T - T2; t < T && width_ok; ++t)
+        for (int k = 0; k < K; ++k) {
+            const size_t ia = (size_t) t * K + k, ib = (size_t) (t - (T - T2)) * K + k;
+            width_ok &= std::memcmp(y.data() + (size_t) pos[ia] * N, y2.data() + (size_t) pos2[ib] * N,
+                                    (size_t) N * 4) == 0;
+        }
+
     // the references, an expert at a time on all cores
     std::vector<float> r_same((size_t) rows * N), r_dbl((size_t) rows * N), r_gu((size_t) rows * 2 * FF);
     const auto* tr_gu = ggml_get_type_traits((ggml_type) gate.type);
@@ -300,7 +338,7 @@ int parity(cudaStream_t s, const Gate& gate) {
         }
     });
     const Err es = compare(y, r_same, (size_t) rows), ed = compare(y, r_dbl, (size_t) rows);
-    double ge2 = 0, gr2 = 0, gworst = 0;
+    double ge2 = 0, gr2 = 0, gworst = 0, gmax = 0;
     for (int64_t p = 0; p < rows; ++p) {
         double me = 0, mr = 0;
         for (int c = 0; c < 2 * FF; ++c) {
@@ -311,19 +349,24 @@ int parity(cudaStream_t s, const Gate& gate) {
             mr = std::max(mr, (double) std::fabs(r_gu[(size_t) p * 2 * FF + c]));
         }
         if (mr > 0) gworst = std::max(gworst, me / mr);
+        gmax = std::max(gmax, me);
     }
     const double grms = gr2 > 0 ? std::sqrt(ge2 / gr2) : 0;
     bool zero_ok = true;
     for (int64_t p = 0; p < rows; ++p)
         if (L.src[(size_t) p] == ZERO)
             for (int o = 0; o < N; ++o) zero_ok &= y[(size_t) p * N + o] == 0.0f;
-    std::printf("  gate/up vs same-rounding reference: rms %.3e  worst row %.3e   (tol 1e-5, 1e-4)\n", grms, gworst);
-    std::printf("  MMQ vs same-rounding reference: rms %.3e  worst row %.3e   (tol 2e-4, 1e-2)\n", es.rms, es.worst);
-    std::printf("  MMQ vs double reference:        rms %.3e  worst row %.3e   (tol rms 2.5e-2)\n", ed.rms, ed.worst);
+    std::printf("  gate/up vs same-rounding reference: max abs %.3e  rms %.3e  worst row %.3e   (tol 1e-5, 1e-4)\n",
+                gmax, grms, gworst);
+    std::printf("  MMQ vs same-rounding reference: max abs %.3e  rms %.3e  worst row %.3e   (tol 2e-4, 1e-2)\n",
+                es.maxabs, es.rms, es.worst);
+    std::printf("  MMQ vs double reference:        max abs %.3e  rms %.3e  worst row %.3e   (tol rms 2.5e-2)\n",
+                ed.maxabs, ed.rms, ed.worst);
     std::printf("  grouped gather == per-expert gather (bitwise): %s; zero token exactly 0: %s\n",
                 same_gather ? "yes" : "NO", zero_ok ? "yes" : "NO");
+    std::printf("  width/position invariance (bitwise): %s\n", width_ok ? "yes" : "NO");
     const bool ok = grms <= 1e-5 && gworst <= 1e-4 && es.rms <= 2e-4 && es.worst <= 1e-2 && ed.rms <= 2.5e-2 &&
-                    same_gather && zero_ok;
+                    same_gather && zero_ok && width_ok;
     std::printf("parity (%s): %s\n", gate.name(), ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
