@@ -129,7 +129,7 @@ bool QfnRequest::refill(std::string& e) {
 bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) {
     // whether the slots decode while this part is read: it decides the layout, and read_part() reads the part alone
     // when it is false
-    beside_ = runtime_.batch_on() && (tokens > runtime_.kReadAlone || resumed_chunk > 0);
+    beside_ = runtime_.live_read(slot_b) && (tokens > runtime_.kReadAlone || resumed_chunk > 0);
     if (runtime_.pf_parts.empty()) return true;                     // its own buffers: nothing to lend
     // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
     // the full depth is restored on the way out for the sizing done elsewhere
@@ -425,6 +425,12 @@ int QfnRuntime::init_prompt() {
     if (o.live_read_slots > 0 || o.live_read_ring > 0)
         basalt::log::info("basalt serve", "a prompt read beside decoding slots lends %lld cache slots with a "
                                           "%d-slot ring", (long long) live_lend_cap(), live_ring_depth());
+    if (o.live_read_split == 1)
+        basalt::log::info("basalt serve", "a prompt read whose other batch slots are only reading their prompts "
+                                          "splits and lends as if alone");
+    if (o.live_read_split >= 2)
+        basalt::log::info("basalt serve", "a prompt read is never beside decoding slots: it splits and lends "
+                                          "as if alone");
 
     {
         // First by arithmetic: a prompt path without a loan allocates its buffers, so the chunk must leave headroom

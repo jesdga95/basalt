@@ -207,6 +207,12 @@ private:
     // the same two, as the run asked for them: --live-read-slots / --live-read-ring, 0 for the limits above
     int64_t live_lend_cap() const { return o.live_read_slots > 0 ? o.live_read_slots : kLendCapDecoding; }
     int live_ring_depth() const { return o.live_read_ring > 0 ? o.live_read_ring : kRingDecoding; }
+    /// a prompt read of the request in slot `apart`: is it beside slots decoding a reply. With
+    /// --live-read-split=1 a slot reading its own prompt does not count; with =2 a read is never beside -
+    /// it splits and lends as if it ran alone
+    bool live_read(int apart) const {
+        return o.live_read_split >= 2 ? false : o.live_read_split == 1 ? slots_busy(apart) : batch_on();
+    }
     // A read of at most this many tokens runs alone even while slots decode: they wait for it (a few seconds at
     // most) and it lends and reads as on an idle engine.  A longer read goes beside them, within the limits above,
     // and so does the rest of one that gave way to a shorter request (in its chunk).

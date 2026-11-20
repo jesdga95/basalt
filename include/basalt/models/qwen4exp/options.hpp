@@ -106,6 +106,10 @@ struct Options : CommonOptions {
     /// slots and streams with a ring this deep; 0 keeps the engine's own limits (A/B: --live-read-slots, --live-read-ring)
     int64_t live_read_slots = 0;
     int live_read_ring = 0;
+    /// --serve, --batch: how a prompt read decides whether it is beside decoding slots - 1: it is, unless the
+    /// other slots are only reading their own prompts too; 2: never, the read splits and lends as if alone
+    /// (A/B: --live-read-split[=N], 0 = as without the flag)
+    int live_read_split = 0;
     /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
     /// from each GPU's free VRAM); empty = one GPU
     std::string layer_split;
