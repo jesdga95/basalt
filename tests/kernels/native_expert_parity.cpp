@@ -46,6 +46,12 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
     return n / (d + 1e-30);
 }
 
+static double maxabs(const std::vector<float>& a, const std::vector<float>& b) {
+    double m = 0;
+    for (size_t i = 0; i < a.size(); ++i) m = std::max(m, std::fabs((double) a[i] - b[i]));
+    return m;
+}
+
 
 namespace {
 constexpr int NT = 3, E = 7;
@@ -1361,7 +1367,7 @@ int check_mxfp4(int gu, int seed) {
         constexpr int kRows = 8;
         for (int i = 0; i < 2; ++i) {
             if (isa[i] == nullptr) { std::printf("mxfp4 %-6s dot: not on this CPU\n", isan[i]); continue; }
-            double worst_dbl = 0.0;
+            double worst_dbl = 0.0, worst_dbl_abs = 0.0;
             std::vector<float> gots, refs_v;
             for (int nb : {1, 2, 3, 5, 17, 72}) {   // odd counts end in the scalar tail of the last block
                 const int n = nb * 32;
@@ -1389,15 +1395,16 @@ int check_mxfp4(int gu, int seed) {
                         mag += std::fabs(t);
                     }
                     worst_dbl = std::max(worst_dbl, std::fabs((double) got - want) / (mag + 1e-30));
+                    worst_dbl_abs = std::max(worst_dbl_abs, std::fabs((double) got - want));
                     gots.push_back(got);
                     refs_v.push_back(refs);
                 }
             }
             const double e_ref = rel(gots, refs_v);   // float order only: the SIMD keeps its block sums in lanes
             const bool ok = e_ref < 1e-6 && worst_dbl < 1e-5;
-            std::printf("mxfp4 %-6s dot, %zu dots at 1..72 blocks: vs ggml's scalar fallback %.2e, vs double on the "
-                        "dequantized row and Q8_0 act %.2e  %s\n", isan[i], gots.size(), e_ref, worst_dbl,
-                        ok ? "ok" : "FAIL");
+            std::printf("mxfp4 %-6s dot, %zu dots at 1..72 blocks: vs ggml's scalar fallback rel %.2e max abs %.2e, "
+                        "vs double on the dequantized row and Q8_0 act rel %.2e max abs %.2e  %s\n", isan[i],
+                        gots.size(), e_ref, maxabs(gots, refs_v), worst_dbl, worst_dbl_abs, ok ? "ok" : "FAIL");
             if (!ok) ++failures;
         }
     }
@@ -1472,8 +1479,10 @@ int check_mxfp4(int gu, int seed) {
         }
         const double e = rel(got, ref), eq = rel(got, ref_q);
         const bool ok = e < 3e-2 && eq < 1e-5 && std::isfinite(e);
-        std::printf("%s/mxfp4 at %lld x %lld blob %8zu  cpu rel %.2e (down vs its own q8_0 h: %.2e)  %s\n",
-                    ggml_type_name((ggml_type) gu), (long long) HD, (long long) FD, f.bytes, e, eq, ok ? "ok" : "FAIL");
+        std::printf("%s/mxfp4 at %lld x %lld blob %8zu  cpu rel %.2e max abs %.2e (down vs its own q8_0 h: "
+                    "rel %.2e max abs %.2e)  %s\n",
+                    ggml_type_name((ggml_type) gu), (long long) HD, (long long) FD, f.bytes, e, maxabs(got, ref),
+                    eq, maxabs(got, ref_q), ok ? "ok" : "FAIL");
         if (!ok) ++failures;
     }
     return failures;

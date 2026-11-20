@@ -408,12 +408,13 @@ void check_grouped(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::m
 }
 
 // A double-precision reference of the whole grouped expert, for the down formats the real files carry (MXFP4,
-// IQ3_S) at their real shape: gate/up and down dequantized (the GPU dequantizer, MXFP4 through its host port), the
-// same q8_1-rounded input activations the kernel quantized, the SwiGLU product and its q8_1 rounding (q8_1_store's
-// formula, as check_q8_1_finite pins it) redone on the host, all three dots accumulated in double.  Against the
-// old kernels it must still be bitwise equal.  The printed rel is the check_mmvq one, sum |err| / sum |ref|: a
-// per-output relative error explodes where a reference output cancels to zero, so this sum form carries the
-// 1e-2 tolerance, same as check_mmvq's (max rel is printed too, as a diagnostic).
+// IQ3_S) at their real shape: gate/up and IQ3_S down dequantized with the GPU dequantizer, MXFP4 down with its
+// host port (basalt::dequantize_mxfp4), the GPU MXFP4 dequantizer checked bitwise against it, the same
+// q8_1-rounded input activations the kernel quantized, the SwiGLU product and its q8_1 rounding (q8_1_store's
+// formula, as check_q8_1_finite pins it) redone on the host, all three dots accumulated in double.  Against
+// the old kernels it must still be bitwise equal.  The printed rel is the check_mmvq one, sum |err| /
+// sum |ref|: a per-output relative error explodes where a reference output cancels to zero, so this sum form
+// carries the 1e-2 tolerance, same as check_mmvq's (max rel is printed too, as a diagnostic).
 void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
     // one entry, a partial and a full pass of GRP_NC, a group past one pass, and an empty group
     Grouped G(gu, dt, H, FF, {1, 5, 0, 11}, 8, rng);
@@ -429,7 +430,8 @@ void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, st
     std::vector<float> wg((size_t) FF * H), wu((size_t) FF * H), wd;
     std::vector<float> hf((size_t) FF);
     std::vector<double> hq((size_t) FF);
-    double o_abs = 0, o_num = 0, o_den = 0, o_mrel = 0, r_abs = 0, r_num = 0, r_den = 0, r_mrel = 0;
+    double o_abs = 0, o_num = 0, o_den = 0, o_mrel = 0, r_abs = 0, r_num = 0, r_den = 0, r_mrel = 0, r_maxref = 0;
+    size_t dq_diff = 0;
     const auto mrel = [](double err, double ref) {
         return ref == 0.0 ? (err == 0.0 ? 0.0 : 1e300) : err / std::fabs(ref);
     };
@@ -443,6 +445,10 @@ void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, st
             std::vector<uint8_t> dw((size_t) H * G.L.d_row);
             ck(cudaMemcpy(dw.data(), blob + G.L.down_off, dw.size(), cudaMemcpyDeviceToHost), "down");
             wd = mxfp4_dequant_host(dw.data(), H, FF);
+            k::iq_dequant_f32(dt, blob + G.L.down_off, H * FF, df, s);
+            std::vector<float> wgpu((size_t) FF * H);
+            ck(cudaMemcpy(wgpu.data(), df, wgpu.size() * 4, cudaMemcpyDeviceToHost), "down gpu");
+            for (size_t i = 0; i < wgpu.size(); ++i) dq_diff += std::memcmp(&wgpu[i], &wd[i], 4) != 0;
         } else {
             wd.assign((size_t) FF * H, 0.0f);
             k::iq_dequant_f32(dt, blob + G.L.down_off, H * FF, df, s);
@@ -483,6 +489,7 @@ void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, st
                 o_mrel = std::max(o_mrel, mrel(eo, (double) a[o]));
                 const double er = std::fabs((double) b[o] - acc);
                 r_abs = std::max(r_abs, er); r_num += er; r_den += std::fabs(acc);
+                r_maxref = std::max(r_maxref, std::fabs(acc));
                 r_mrel = std::max(r_mrel, mrel(er, acc));
             }
         }
@@ -493,7 +500,12 @@ void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, st
                 (long long) H, (long long) FF, G.n_groups, G.n_ent,
                 ok ? "bitwise equal to the old kernels, within 1e-2 of the reference" : "FAIL");
     std::printf("  old kernel: max abs %.2e, rel %.2e, max rel %.2e   double reference: max abs %.2e, rel %.2e, "
-                "max rel %.2e\n", o_abs, rel_o, o_mrel, r_abs, rel_r, r_mrel);
+                "max rel %.2e, max |ref| %.2e\n", o_abs, rel_o, o_mrel, r_abs, rel_r, r_mrel, r_maxref);
+    if (dt == 39) {
+        std::printf("  MXFP4 down GPU dequantizer vs host port: %zu of %zu values differ\n", dq_diff,
+                    (size_t) G.n_groups * FF * H);
+        if (dq_diff != 0) ++g_fail;
+    }
     if (!ok) ++g_fail;
     cudaFree(df);
 }

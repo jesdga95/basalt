@@ -11,7 +11,8 @@
 //   - `double`: the unrounded activations - the int8 activation rounding every MMQ format has.  Tolerance: RMS 2.5e-2.
 // The per-expert gather and the grouped gather must give bitwise equal outputs, and a token's output rows must be
 // bitwise equal when run in a half-width chunk with the tokens at different positions.  An all-zero token stays
-// exactly 0.  Every error line reports the max absolute error next to the rms and the worst-row relative error.
+// exactly 0.  Every error line reports the max absolute error and the max absolute reference next to the rms and
+// the worst-row relative error.
 // Then a microbench line: one layer at a 512-token chunk (128 experts, top 6) - gathers plus products - in us and
 // TFLOP/s.  --no-bench.  Exit 77 without a CUDA device.
 #include "basalt/prefill/moe_mmq.hpp"
@@ -96,7 +97,7 @@ void q8_round(const float* x, float* y, int n) {
 }
 
 struct Err {
-    double rms = 0, worst = 0, maxabs = 0;
+    double rms = 0, worst = 0, maxabs = 0, maxref = 0;
 };
 Err compare(const std::vector<float>& a, const std::vector<float>& ref, size_t rows) {
     double e2 = 0, r2 = 0;
@@ -115,6 +116,7 @@ Err compare(const std::vector<float>& a, const std::vector<float>& ref, size_t r
         if (mr > 0) out.worst = std::max(out.worst, me / mr);
         else if (me > 0) out.worst = 1e30;
         out.maxabs = std::max(out.maxabs, me);
+        out.maxref = std::max(out.maxref, mr);
     }
     out.rms = r2 > 0 ? std::sqrt(e2 / r2) : 0;
     return out;
@@ -225,7 +227,7 @@ void run_mmq(mmq::Context& ctx, Bufs& b, const Gate& gate, const Layer& L, const
 
 std::vector<float> download(const Dev& d, size_t n) {
     std::vector<float> h(n);
-    ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyHostToDevice), "download");
+    ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyDeviceToHost), "download");
     return h;
 }
 
@@ -338,7 +340,7 @@ int parity(cudaStream_t s, const Gate& gate) {
         }
     });
     const Err es = compare(y, r_same, (size_t) rows), ed = compare(y, r_dbl, (size_t) rows);
-    double ge2 = 0, gr2 = 0, gworst = 0, gmax = 0;
+    double ge2 = 0, gr2 = 0, gworst = 0, gmax = 0, gmaxref = 0;
     for (int64_t p = 0; p < rows; ++p) {
         double me = 0, mr = 0;
         for (int c = 0; c < 2 * FF; ++c) {
@@ -350,18 +352,22 @@ int parity(cudaStream_t s, const Gate& gate) {
         }
         if (mr > 0) gworst = std::max(gworst, me / mr);
         gmax = std::max(gmax, me);
+        gmaxref = std::max(gmaxref, mr);
     }
     const double grms = gr2 > 0 ? std::sqrt(ge2 / gr2) : 0;
     bool zero_ok = true;
     for (int64_t p = 0; p < rows; ++p)
         if (L.src[(size_t) p] == ZERO)
             for (int o = 0; o < N; ++o) zero_ok &= y[(size_t) p * N + o] == 0.0f;
-    std::printf("  gate/up vs same-rounding reference: max abs %.3e  rms %.3e  worst row %.3e   (tol 1e-5, 1e-4)\n",
-                gmax, grms, gworst);
-    std::printf("  MMQ vs same-rounding reference: max abs %.3e  rms %.3e  worst row %.3e   (tol 2e-4, 1e-2)\n",
-                es.maxabs, es.rms, es.worst);
-    std::printf("  MMQ vs double reference:        max abs %.3e  rms %.3e  worst row %.3e   (tol rms 2.5e-2)\n",
-                ed.maxabs, ed.rms, ed.worst);
+    std::printf("  gate/up vs same-rounding reference: max abs %.3e (max |ref| %.3e)  "
+                "rms %.3e  worst row %.3e   (tol 1e-5, 1e-4)\n",
+                gmax, gmaxref, grms, gworst);
+    std::printf("  MMQ vs same-rounding reference: max abs %.3e (max |ref| %.3e)  "
+                "rms %.3e  worst row %.3e   (tol 2e-4, 1e-2)\n",
+                es.maxabs, es.maxref, es.rms, es.worst);
+    std::printf("  MMQ vs double reference:        max abs %.3e (max |ref| %.3e)  "
+                "rms %.3e  worst row %.3e   (tol rms 2.5e-2)\n",
+                ed.maxabs, ed.maxref, ed.rms, ed.worst);
     std::printf("  grouped gather == per-expert gather (bitwise): %s; zero token exactly 0: %s\n",
                 same_gather ? "yes" : "NO", zero_ok ? "yes" : "NO");
     std::printf("  width/position invariance (bitwise): %s\n", width_ok ? "yes" : "NO");
