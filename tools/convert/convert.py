@@ -283,6 +283,7 @@ class Job:
         self.rows: list[tuple[str, int]] = []
         self.t0 = time.time()
         self.dry = isinstance(writer, DryWriter)
+        self.index: dict[str, bytes] = {}        # a dry run's dense indexes: the hc8 section's size comes from them
 
     def _report(self, name, nbytes, secs):
         mbs = nbytes / (1 << 20) / secs if secs > 0 else float("inf")
@@ -292,6 +293,8 @@ class Job:
     def bytes(self, name, data: bytes):
         t = time.time()
         self.w.add_bytes(name, data)
+        if self.dry and name in ("dense.index", "mtp/dense.index"):
+            self.index[name] = data
         self._report(name, len(data), time.time() - t)
 
     def file(self, name, src, offset=0, size=None):
@@ -307,6 +310,13 @@ class Job:
     def hc8(self):
         """The `hc8` section, from the `dense` and `mtp/dense` sections already written."""
         t = time.time()
+        if self.dry:
+            try:
+                n = self.w.add_size("hc8", H.size(self.index["dense.index"], self.index.get("mtp/dense.index")))
+            except H.Hc8Error as e:
+                raise S.ConvertError(f"hc8: {e}")
+            self._report("hc8", n, time.time() - t)
+            return
         self.w.f.flush()
         at = {e[0]: (e[1], e[2]) for e in self.w.entries}
         with open(self.w.path, "rb") as f:

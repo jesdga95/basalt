@@ -1,8 +1,11 @@
 """Tests for convert.py and model_sections.py on a tiny synthetic model, drafter and side files.
 
     python3 -m unittest discover -s tools/convert -p 'test_convert.py'"""
+import contextlib
 import hashlib
+import io
 import json
+import re
 import struct
 import subprocess
 import sys
@@ -96,6 +99,13 @@ class ConvertTest(unittest.TestCase):
 
     def model(self):
         return ModelFile(str(self.t / "out.basalt"))
+
+    def planned(self, **kw):
+        """Section name -> size, from the listing a --dry-run prints."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            convert.convert(self.args(dry_run=True, **kw))
+        return {m.group(1): int(m.group(3)) for m in re.finditer(r"^ {9}(\S+) +(\d+) +(\d+)$", out.getvalue(), re.M)}
 
     # ---------------------------------------------------------------- sections
     def test_sections(self):
@@ -202,6 +212,13 @@ class ConvertTest(unittest.TestCase):
             u16 = (a.view(np.uint32) >> 16).astype(np.uint16).reshape(rows, cols)
             self.assertEqual(t[name][:2], (rows, cols))
             self.assertEqual(t[name][3], H.quantize(u16), name)
+
+    def test_a_dry_run_plans_the_sections_a_build_writes(self):
+        planned = self.planned()
+        self.assertFalse((self.t / "out.basalt").exists() or (self.t / "out.basalt.partial").exists())
+        convert.convert(self.args())
+        m = self.model()
+        self.assertEqual(planned, {k: m.sections[k][1] for k in m.names()})
 
     # ---------------------------------------------------------------- refusals and options
     def test_no_vision_and_overwrite(self):
@@ -437,6 +454,8 @@ class DrafterTest(unittest.TestCase):
                              {"mtp/dense", "mtp/dense.index", "mtp/experts", "mtp/draft_vocab"})
             self.assertEqual(len(m.read("mtp/experts")), self.NE * 3 * (self.H * self.FF * 18 // 64))
             self.assertEqual(m.read("mtp/draft_vocab"), (t.t / "dv.bin").read_bytes())
+            self.assertEqual(t.planned(mtp_source=str(self.src), draft_vocab=str(t.t / "dv.bin"), force=True),
+                             {k: m.sections[k][1] for k in m.names()})
             (t.t / "dv.bin").write_bytes(np.array([0, 6], dtype="<i4").tobytes())      # 6 is outside the 6 tokens
             with self.assertRaises(SystemExit):
                 convert.convert(t.args(mtp_source=str(self.src), draft_vocab=str(t.t / "dv.bin"), force=True))
