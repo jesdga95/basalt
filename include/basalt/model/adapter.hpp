@@ -184,8 +184,13 @@ public:
             if (Result r = peers[i]->draft_begin(anchors[i], pos[i], n[i]); !r.ok()) return r;
         return {};
     }
-    /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`.
-    virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n) { (void) ids; (void) conf; (void) max_n; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
+    /// Whether draft `j` (from 0) of `n` can be in the next window, from the chances of drafts 0..j (the later ones not
+    /// known yet).
+    using DraftNeed = std::function<bool(const float* chance, int j, int n)>;
+    /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`. A
+    /// session that makes its drafts in turn may stop before the first draft `need` rules out (when set): no window
+    /// would verify it, so only its time is at stake.
+    virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) { (void) ids; (void) conf; (void) max_n; (void) n; (void) need; return {Status::NotImplemented, "this model has no drafter"}; }
     /// Rows row0..row0+n of the last decoded window: picks[t]'s log probability and the row's `top` likeliest tokens,
     /// kernels::kLogprobStride floats a row to the host `out` (basalt/kernels/logprobs.hpp).
     virtual Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) { (void) row0; (void) n; (void) picks; (void) top; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }

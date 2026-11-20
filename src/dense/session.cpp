@@ -289,7 +289,7 @@ public:
         return {};
     }
 
-    Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
+    Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
         if (block_) {
             n = std::min(n_draft_, max_n);
             if (cudaMemcpyAsync(ids, st_.dids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||

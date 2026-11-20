@@ -210,7 +210,7 @@ public:
         return {};
     }
 
-    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
         std::string err;
         DsparkDraft d;
