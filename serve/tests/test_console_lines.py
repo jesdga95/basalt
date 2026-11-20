@@ -62,6 +62,23 @@ class Lines(unittest.TestCase):
         self.assertEqual(v["accept_pos"], [1.0])
         self.assertIsNone(v["hit"])                                           # no lookups: a dense model
 
+    def test_a_request_in_several_engine_runs_adds_them_up(self):
+        clk = Clock()
+        c = ConsoleLines(clock=clk)
+        c.feed("XSLOT 0 9 9 9 10 0 0 4/8")                                    # the previous request
+        clk.t += 10
+        started = clk.t
+        clk.t += 0.1
+        c.feed("XSLOT 0 0 0 0 0 0 0 -")
+        c.feed("XSLOT 0 10 30 60 90 10 0 8/10,4/8")                           # its first run
+        clk.t += 0.5
+        c.feed("XSLOT 0 0 0 0 0 0 0 -")                                       # the next pass, a run of its own
+        c.feed("XSLOT 0 5 10 30 40 0 0 2/4")
+        v = c.slot(0, since=started)
+        self.assertEqual(v["accept_pos"], [round(10 / 14, 3), 0.5])
+        self.assertEqual((v["hit"]["vram"], v["hit"]["cpu"]), (round(90 / 140, 3), round(40 / 140, 3)))
+        self.assertEqual(c.slot(0)["accept_pos"], [0.5])                     # no start given: the last run
+
     def test_the_expert_map_fades(self):
         clk = Clock()
         c = ConsoleLines(clock=clk)
@@ -72,7 +89,7 @@ class Lines(unittest.TestCase):
         clk.t += 0.5
         c.feed("XMAP 8 0123 1,0,0,0")
         m = c.expert_map()
-        self.assertEqual(m["routed"], [2.0, 0, 0, 0])                         # lookups a second
+        self.assertEqual(m["routed"], [2.0, 0, 0, 2.67])                      # a second over this line and the one before
         self.assertAlmostEqual(m["recent"][0], 2 * 0.85 ** 0.5 + 1, places=2)
         clk.t += 10                                                           # nothing since: no lookups now, faded
         m = c.expert_map()
