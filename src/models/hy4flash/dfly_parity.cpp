@@ -56,6 +56,7 @@ struct Mat {
     std::vector<float> v;   // the rounded values
     uint64_t rows = 0, cols = 0;
     std::vector<uint8_t> q8;   // a projection the drafter keeps in Q8_0: its blocks (the reference's product is then MMVQ's)
+    std::vector<uint8_t> q4;   // one it keeps in Q4_0
 };
 Mat rand_mat(uint64_t rows, uint64_t cols, float sd) {
     Mat m;
@@ -278,6 +279,7 @@ struct Ref {
 
     std::vector<double> mv(const Mat& w, const std::vector<double>& x) const {
         if (!w.q8.empty()) return mvq(w, x);
+        if (!w.q4.empty()) return mvq4(w, x);
         std::vector<double> y(w.rows);
         for (uint64_t r = 0; r < w.rows; ++r) {
             double s = 0;
@@ -309,6 +311,39 @@ struct Ref {
                 int dot = 0;
                 for (int i = 0; i < 32; ++i) dot += (int) (int8_t) blk[2 + i] * qx[b * 32 + i];
                 s += (double) basalt::kernels::f32_from_f16(dh) * dx[b] * dot;
+            }
+            y[r] = s;
+        }
+        return y;
+    }
+    // a Q4_0 product as MMVQ makes it: x in q8_1 blocks as above, per block d4 (d8 sum(nibble q) - 8 s), s the block's sum
+    // of x kept as fp16 (q8_1's second half)
+    std::vector<double> mvq4(const Mat& w, const std::vector<double>& x) const {
+        const uint64_t nb = w.cols / 32;
+        std::vector<int> qx(w.cols);
+        std::vector<double> dx(nb), sx(nb);
+        for (uint64_t b = 0; b < nb; ++b) {
+            float amax = 0.f;
+            double sum = 0;
+            for (int i = 0; i < 32; ++i) {
+                amax = std::max(amax, std::fabs((float) x[b * 32 + i]));
+                sum += x[b * 32 + i];
+            }
+            const float d = amax / 127.f;
+            for (int i = 0; i < 32; ++i) qx[b * 32 + i] = amax == 0.f ? 0 : (int) std::round((float) x[b * 32 + i] / d);
+            dx[b] = basalt::kernels::f32_from_f16(basalt::kernels::f16_from_f32(d));
+            sx[b] = basalt::kernels::f32_from_f16(basalt::kernels::f16_from_f32((float) sum));
+        }
+        std::vector<double> y(w.rows);
+        for (uint64_t r = 0; r < w.rows; ++r) {
+            double s = 0;
+            for (uint64_t b = 0; b < nb; ++b) {
+                const uint8_t* blk = w.q4.data() + (r * nb + b) * 18;
+                uint16_t dh;
+                std::memcpy(&dh, blk, 2);
+                int dot = 0;
+                for (int i = 0; i < 16; ++i) dot += (blk[2 + i] & 15) * qx[b * 32 + i] + (blk[2 + i] >> 4) * qx[b * 32 + 16 + i];
+                s += (double) basalt::kernels::f32_from_f16(dh) * (dx[b] * dot - 8.0 * sx[b]);
             }
             y[r] = s;
         }
@@ -359,6 +394,10 @@ void test_block() {
                 mat.q8.resize(s.bytes());
                 basalt::core::quantize_bf16_q8_0(mat.bits.data(), mat.bits.size(), mat.q8.data());
                 cudaMemcpy(w.slot(s.name), mat.q8.data(), mat.q8.size(), cudaMemcpyHostToDevice);
+            } else if (s.q4) {   // core::Conv::Bf16ToQ4_0
+                mat.q4.resize(s.bytes());
+                basalt::core::quantize_bf16_q4_0(mat.bits.data(), mat.bits.size(), mat.q4.data());
+                cudaMemcpy(w.slot(s.name), mat.q4.data(), mat.q4.size(), cudaMemcpyHostToDevice);
             } else {
                 cudaMemcpy(w.slot(s.name), mat.bits.data(), mat.bits.size() * 2, cudaMemcpyHostToDevice);
             }
