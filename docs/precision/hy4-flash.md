@@ -116,8 +116,8 @@ alone moves more: the same 50 chunks with the BF16 head score 0.21549 at 133 cop
 What the flags do: [quality](quality.md#lossy-routing-flags). Here k is 16, so `--route-tail-skip` takes R 1 to 15 (bare 15), and
 `--route-prior` adds LAMBDA to the sigmoid score plus its bias, which the top 16 is taken from (bare 0.01).
 
-Two cards (400 W + 180 W), the default placement. Speed: `basalt-bench -t conv,struct,prose --seed 1`, one cold run each (off twice,
-before and after the rest); ms a window is the step time. CPU and bus picks: the run's `TIER final` line. Quality: the gate at 50
+Two cards (400 W + 180 W), the default placement, the 0.5.0 engine's BF16 head. Speed: `basalt-bench -t conv,struct,prose
+--seed 1`, one cold run each (off twice, before and after the rest); ms a window is the step time. CPU and bus picks: the run's `TIER final` line. Quality: the gate at 50
 chunks against the BF16 base (12,750 rows; this subset's off row reads 0.2069, the 100-chunk one 0.201).
 
 | Flags | CPU / bus picks | conv tok/s, ms/w | struct tok/s, ms/w | prose tok/s, ms/w | KLD | Same top-1 |
@@ -134,5 +134,8 @@ chunks against the BF16 base (12,750 rows; this subset's off row reads 0.2069, t
 Decode here waits on the CPU's experts and the bus copies, so dropping them pays directly: `--route-tail-skip 15` (12% of the misses
 dropped) costs nothing the gate sees for 4% of conv's window, 12 (44% dropped) cuts it by 17% for +0.030 KLD, 8 (76%) by 29% for
 +0.076. `--route-prior 0.01` cuts 12% for +0.014; 0.1 empties the CPU's share but costs +0.087 and 2.3 points of top-1. With the prior
-on, few misses are left for the tail skip. The gate's PPL falls as the error grows (14.85 off, 13.77 at R 8), so it is no measure of
-closeness here; KLD and top-1 are.
+on, few misses are left for the tail skip. The gate's PPL falls as the error grows (14.85 off, 13.77 at R 8), so it is no measure
+of closeness here; KLD and top-1 are.
+
+With the Q8_0 head the same steps hold: off 24.0 ms a conv window (two runs, 22.5 and 25.6) and KLD 0.2060; R 15 23.1 ms and
+0.2091; R 12 20.6 ms and 0.2402; LAMBDA 0.01 21.5 ms and 0.2295. A KLD step under about 0.005 is placement noise.
