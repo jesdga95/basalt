@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
         cudaMemcpy(head, q.data(), q.size(), cudaMemcpyHostToDevice);
     }
     w.head_q8 = head;
-    if (!w.pack_screen(nullptr, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    if (!w.pack_screen(nullptr, err)) { std::printf("%s\n", err.c_str()); return 1; }
     const DflyTensor& ew = dense.t.at("model.embed_tokens.weight");
     const int E = d.E;
 
