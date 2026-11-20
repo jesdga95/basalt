@@ -186,8 +186,10 @@ public:
     bool begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const void* const* cache, void* stream,
                std::string& err, int64_t rope_pos = -1);
     /// Runs the heads over the block begin() made, in order, each with the token before it: the `n` drafts and each one's
-    /// estimated chance of acceptance.
-    bool finish(int32_t* ids, float* conf, void* stream, std::string& err);
+    /// estimated chance of acceptance. `on_row(j, token)`, when set, is called in head step j >= 1 once the step is queued on
+    /// the card, with window row j's token (draft j - 1): host work there runs while the card computes the step.
+    bool finish(int32_t* ids, float* conf, void* stream, std::string& err,
+                const std::function<void(int, int32_t)>& on_row = nullptr);
     /// The block's outputs after the final norm, `rows` rows of E floats, to the host (for the tests against a reference).
     void copy_block(float* host, int rows, void* stream) const;
 
@@ -225,6 +227,8 @@ public:
     model::Result draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint8_t*>& cache, void* stream,
                               int64_t rope_pos = -1);
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream);
+    /// Called in the heads with each draft row's token as it is known (DflyRunner::finish's on_row).
+    void on_row(std::function<void(int, int32_t)> f) { on_row_ = std::move(f); }
 
 private:
     std::unique_ptr<DflyTap> tap_;
@@ -234,6 +238,7 @@ private:
     int64_t dump_pos_ = -1;
     int32_t dump_anchor_ = 0;
     std::function<bool(int32_t, float*)> embed_;
+    std::function<void(int, int32_t)> on_row_;
     std::string dump_;
     int64_t ctx_ = 0;
     bool fp8_ = false;

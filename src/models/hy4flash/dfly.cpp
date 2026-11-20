@@ -401,7 +401,7 @@ void DflyRunner::copy_block(float* host, int rows, void* stream) const {
     cudaStreamSynchronize((cudaStream_t) stream);
 }
 
-bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& err) {
+bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& err, const std::function<void(int, int32_t)>& on_row) {
     Impl& p = *p_;
     if (!p.pending) {
         err = "dfly: no block was begun";
@@ -437,6 +437,7 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
             f32_gemm_rows(p.hcout, w.conf_w, 1, E, 1.0f, 1, p.craw, st);
             cudaMemcpyAsync(p.h_tok, p.pick, 4, cudaMemcpyDeviceToHost, st);
             cudaMemcpyAsync(p.h_conf, p.craw, 4, cudaMemcpyDeviceToHost, st);
+            if (on_row && j > 0) on_row(j, prev);
             if (cudaStreamSynchronize(st) != cudaSuccess) {
                 why = std::string("dfly: CUDA: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
@@ -522,7 +523,7 @@ model::Result DflyHook::draft_end(int32_t* ids, float* conf, int max_n, int& n, 
     float ch[kDflyDrafts];
     const int made = pending_;
     pending_ = 0;
-    if (!runner_->finish(tok, ch, stream, err)) return {model::Status::Error, "hy4flash: " + err};
+    if (!runner_->finish(tok, ch, stream, err, on_row_)) return {model::Status::Error, "hy4flash: " + err};
     if (dump_pos_ >= 0 && !dump_.empty()) {   // --diag-dump: what the block computed
         std::vector<float> z((size_t) (made + 1) * w_->dims.E), a(w_->dims.E), m(w_->dims.E);
         runner_->copy_block(z.data(), made + 1, stream);
