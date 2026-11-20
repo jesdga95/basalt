@@ -26,8 +26,9 @@ struct MlaArgs {
 };
 
 /// A product per head over Q8_0 rows, for n_tok tokens: y[t][h][r] = w[h * rows + r] . x[t][h] for h < heads, r < rows, over `k`
-/// values (k % 32 == 0); x of token t and head h starts at x + t * x_tok_stride + h * x_head_stride. `w` is the tensor's bytes
-/// (34 bytes per 32 values, rows of k / 32 blocks), 16-byte aligned.
+/// values (the model's two: 512, v_b over the latent, and 192, k_b over the query's nope part); x of token t and head h starts
+/// at x + t * x_tok_stride + h * x_head_stride. `w` is the tensor's bytes (34 bytes per 32 values, rows of k / 32 blocks),
+/// 16-byte aligned.
 void q8_0_heads_gemv(const void* w, const float* x, int x_head_stride, int x_tok_stride, int heads, int rows, int k, int n_tok,
                      float* y, void* stream);
 

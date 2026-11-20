@@ -998,7 +998,7 @@ void bench_mla() {
         int32_t* dpos = dev(pos);
         uint16_t* cache = nullptr;
         cudaMalloc(&cache, (size_t) 4096 * W * 2);
-        for (int T : {1, 6}) {
+        for (int T : {1, 2, 6}) {
             const double uq = timed(200, [&](int i) { mla_query(wp + (size_t) (i % nkb) * kb, dq, dkv, dn, a, dpos, T, 0, qc, cache, st); });
             const double uv = timed(200, [&](int i) { q8_0_heads_gemv(wp + (size_t) (i % nvb) * vb, lat, a.rank, heads * a.rank, heads, 256, a.rank, T, vo, st); });
             std::printf("bench: %d heads, %d rows: mla_query %.1f us (%.0f GB/s of k_b), v_b %.1f us (%.0f GB/s)\n", heads, T, uq, kb / uq / 1e3, uv,
@@ -1030,7 +1030,7 @@ void bench_mla() {
             rs.cells = dl;
             rs.cells_stride = stride;
         }
-        for (int T : {1, 6}) {
+        for (int T : {1, 2, 6}) {
             const double u = timed(200, [&](int i) {
                 mla_attend(qc, (const uint16_t*) (wp + (size_t) (i % ncopies) * cap * W * 2), rs, T, sk, a, ring, maxc, work, lat, st);
             });
