@@ -186,6 +186,50 @@ void test_hc() {
     }
 }
 
+// add_norm_hc_post at a window's row counts (4 blocks a row) and a chunk's (a block a row): against add_vectors, rms_norm_rows and
+// hc_post bit for bit, a row alone as it is among 12, and its time at 2 rows
+void test_add_norm_rows() {
+    const int E = 3072, stride = 24, T = 12;
+    std::vector<float> ra = randn((size_t) T * E), rb = randn((size_t) T * E, 0.3f), w = randn(E, 0.2f), x = randn((size_t) T * 4 * E),
+                       cf = randn((size_t) T * stride, 0.5f);
+    for (float& v : w) v += 1.0f;
+    float *da = dev(ra), *db = dev(rb), *dw = dev(w), *dx = dev(x), *dc = dev(cf), *dsum = devf((size_t) T * E), *dn = devf((size_t) T * E);
+    float *d3 = devf((size_t) T * 4 * E), *d1 = devf((size_t) T * 4 * E);
+    cudaStream_t st;
+    cudaStreamCreate(&st);
+    bool same = true;
+    for (const float* b : {(const float*) db, (const float*) nullptr}) {
+        if (b) add_vectors(da, db, dsum, T * E, st);
+        bk::rms_norm_rows(b ? dsum : da, dw, dn, T, E, 1e-6f, st);
+        bk::hc_post(dn, dx, dc, stride, T, E, d3, st);
+        const std::vector<float> want = host(d3, (size_t) T * 4 * E);
+        for (int rows : {1, 2, 8, 12}) {
+            cudaMemset(d1, 0, (size_t) T * 4 * E * 4);
+            add_norm_hc_post(da, b, dw, 1e-6f, dx, dc, stride, rows, E, d1, st);
+            cudaStreamSynchronize(st);
+            same = same && std::memcmp(host(d1, (size_t) rows * 4 * E).data(), want.data(), (size_t) rows * 4 * E * 4) == 0;
+        }
+        // row 5 alone (4 blocks) against row 5 of the 12-row call (one block)
+        add_norm_hc_post(da + 5 * E, b ? db + 5 * E : nullptr, dw, 1e-6f, dx + 5 * 4 * E, dc + 5 * stride, stride, 1, E, d1, st);
+        cudaStreamSynchronize(st);
+        same = same && std::memcmp(host(d1, (size_t) 4 * E).data(), want.data() + (size_t) 5 * 4 * E, (size_t) 4 * E * 4) == 0;
+    }
+    std::printf("%-30s %s\n", "add_norm_hc_post 1/2/8/12 rows", same ? "bitwise" : "FAIL");
+    failures += !same;
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    add_norm_hc_post(da, db, dw, 1e-6f, dx, dc, stride, 2, E, d1, st);
+    cudaEventRecord(e0, st);
+    for (int i = 0; i < 200; ++i) add_norm_hc_post(da, db, dw, 1e-6f, dx, dc, stride, 2, E, d1, st);
+    cudaEventRecord(e1, st);
+    cudaEventSynchronize(e1);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, e0, e1);
+    std::printf("bench: add_norm_hc_post 2 rows %.2f us a launch (back to back)\n", 1000.0 * ms / 200);
+    cudaStreamDestroy(st);
+}
+
 void test_router() {
     const int NE = 512, E = 3072, K = 16;
     std::vector<float> x = randn(E), gate = randn((size_t) NE * E, 0.05f), bias = randn(NE, 0.3f);
@@ -1428,6 +1472,7 @@ int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) return 77;
     test_hc();
+    test_add_norm_rows();
     test_gemv();
     test_mla();
     test_router();
