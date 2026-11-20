@@ -77,6 +77,7 @@ class Lines(unittest.TestCase):
         v = c.slot(0, since=started)
         self.assertEqual(v["accept_pos"], [round(10 / 14, 3), 0.5])
         self.assertEqual((v["hit"]["vram"], v["hit"]["cpu"]), (round(90 / 140, 3), round(40 / 140, 3)))
+        self.assertEqual((v["drafts_accepted"], v["drafts_offered"]), (14, 22))   # every run's drafts
         self.assertEqual(c.slot(0)["accept_pos"], [0.5])                     # no start given: the last run
 
     def test_the_expert_map_fades(self):
@@ -141,7 +142,7 @@ class Served(unittest.TestCase):
 
         class Peek(MockEngine):
             def prompt_progress(self):
-                return {"read": 5, "total": 5, "ms": 31.5}
+                return {"read": 5, "total": 5, "ms": 31.5, "cache": 0}
 
             def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
                 for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
@@ -154,6 +155,7 @@ class Served(unittest.TestCase):
             pass
         row = seen[0]
         self.assertEqual((row["path"], row["prompt_ms"]), ("/v1/messages", 31.5))
+        self.assertEqual(row["reused"], 0)                                   # RESUME 0: nothing cached, a 0% hit
         self.assertIsNotNone(row["started"])
 
 if __name__ == "__main__":

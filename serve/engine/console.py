@@ -131,8 +131,12 @@ class ConsoleLines:
         by_sec = {s: t / w for s, t, w in per_s if w > 0}
         last = int(now)
         hist = [round(by_sec[s], 2) if s in by_sec else None for s in range(last - HISTORY + 1, last + 1)]
-        return {"accept_pos": accept, "accept_hist": hist if any(v is not None for v in hist) else None,
-                "hit": self._hit(c, deltas, now)}
+        out = {"accept_pos": accept, "accept_hist": hist if any(v is not None for v in hist) else None,
+               "hit": self._hit(c, deltas, now)}
+        if c["accept"]:     # the drafts a window offers count at each position they reach: their sum is all of them
+            out["drafts_accepted"] = sum(a for a, _ in c["accept"])
+            out["drafts_offered"] = sum(o for _, o in c["accept"])
+        return out
 
     @staticmethod
     def _hit(c: dict, deltas: list, now: float) -> dict | None:
