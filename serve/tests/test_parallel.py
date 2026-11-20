@@ -149,6 +149,8 @@ while True:
         break
     if line.startswith("BYIELD "):
         continue                              # too late: the read it was for has ended
+    if line == "STATS":
+        continue                              # the console's figures: this stub sends none
     if line.startswith("BSTOP "):
         b = int(line.split()[1])
         if b in active:

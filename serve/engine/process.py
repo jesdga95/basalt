@@ -48,6 +48,7 @@ from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, engine_key as logprobs_key, parse_line as logprob_line, \
     token as logprob_token
 from serve.engine import lifeline, suspend
+from serve.engine.console import LINES as CONSOLE_LINES, ConsoleLines
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, WakeBlocked, split_err
 from serve.engine.slots import AdmissionQueue
@@ -121,7 +122,7 @@ def relay_auto_flags(line: str) -> bool:
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
 PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
-                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ")
+                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ") + CONSOLE_LINES
 
 
 def log_unparsed(line: str, log) -> None:
@@ -420,8 +421,15 @@ class ProcessEngine:
         self._yielded = None                            # (slot, tokens read) of a read that gave way
         self._ctl_erred = False                         # the control lines ended on an ERR
         self.wlock = threading.Lock()                   # serializes stdin writes
+        self.console = ConsoleLines()                   # this process's XSLOT and XMAP figures
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+        with self.wlock:                                # the console's figures from now on
+            try:
+                self.proc.stdin.write("STATS\n")
+                self.proc.stdin.flush()
+            except OSError:
+                pass
 
     def _note_load(self, status: dict) -> None:
         self.load_status = status
@@ -456,6 +464,10 @@ class ProcessEngine:
             if line.startswith("INFO "):                # a fact the engine updates as it runs; never a reply line
                 if self.proc is proc:
                     self.info.update(info_facts(line))
+                continue
+            if line.startswith(CONSOLE_LINES):          # the console's figures (STATS); never a reply line
+                if self.proc is proc:
+                    self.console.feed(line)
                 continue
             if line.startswith("CONV "):                # the conversation cache's figures; never a reply line
                 if self.proc is proc:

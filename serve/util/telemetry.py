@@ -56,8 +56,40 @@ class _Nvml:
         except (AttributeError, OSError):
             self.lib = None
 
+    class Pci(ctypes.Structure):
+        _fields_ = [("bus_id_legacy", ctypes.c_char * 16), ("domain", ctypes.c_uint), ("bus", ctypes.c_uint),
+                    ("device", ctypes.c_uint), ("pci_device_id", ctypes.c_uint), ("pci_subsystem_id", ctypes.c_uint),
+                    ("bus_id", ctypes.c_char * 32)]
+
     def ok(self):
         return self.lib is not None and self.dev is not None
+
+    def bus_id(self):
+        """The card's PCI address as "domain:bus:device.0" in hex, what the engine's facts name it by."""
+        p = self.Pci()
+        try:
+            fn = getattr(self.lib, "nvmlDeviceGetPciInfo_v3", None) or self.lib.nvmlDeviceGetPciInfo
+            if fn(self.dev, ctypes.byref(p)) == 0:
+                return f"{p.domain:04x}:{p.bus:02x}:{p.device:02x}.0"
+        except (AttributeError, OSError):
+            pass
+        return None
+
+    def _ull(self, fn, *args):
+        v = ctypes.c_ulonglong()
+        try:
+            return v.value if getattr(self.lib, fn)(self.dev, *args, ctypes.byref(v)) == 0 else None
+        except (AttributeError, OSError):
+            return None
+
+    def throttle(self):
+        """Why the clocks are held down now, in words ("" when nothing holds them; None when NVML cannot say)."""
+        bits = self._ull("nvmlDeviceGetCurrentClocksEventReasons")
+        if bits is None:
+            bits = self._ull("nvmlDeviceGetCurrentClocksThrottleReasons")
+        if bits is None:
+            return None
+        return ", ".join(name for bit, name in THROTTLE_REASONS if bits & bit)
 
     def _uint(self, fn, *args):
         v = ctypes.c_uint()
@@ -121,7 +153,15 @@ class _Nvml:
         tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
         out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
         out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
+        out["sm_clock"] = self._uint("nvmlDeviceGetClockInfo", ctypes.c_uint(1))           # NVML_CLOCK_SM, MHz
+        out["mem_clock"] = self._uint("nvmlDeviceGetClockInfo", ctypes.c_uint(2))          # NVML_CLOCK_MEM
+        out["throttle"] = self.throttle()
         return out
+
+
+# NVML's clock event reasons that hold the clocks down (an idle card's low clocks and a set application clock are not)
+THROTTLE_REASONS = ((0x4, "power cap"), (0x8, "hardware slowdown"), (0x10, "sync boost"), (0x20, "thermal"),
+                    (0x40, "hardware thermal"), (0x80, "power brake"))
 
 
 def gpu_reader(index=0):
@@ -171,8 +211,8 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 GPU_KEYS = ("util", "mem_used", "mem_total", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
-            "pcie_rx_mb", "pcie_tx_mb")
-SERIES = ("tok_s", "prefill_tok_s_mean")      # series kept as history
+            "pcie_rx_mb", "pcie_tx_mb", "sm_clock", "mem_clock", "throttle")
+SERIES = ("tok_s", "prefill_tok_s_mean", "disk_read_mb")      # series kept as history
 GPU_SERIES = ("util", "power", "temp")         # per-card series kept as history
 
 
@@ -187,7 +227,8 @@ class Telemetry:
         driver_version(), cuda_version()."""
         self.extra = extra
         self.lock = threading.Lock()
-        self.now: dict = {"gpus": [], "cpu": None, "ram_used": None, "ram_total": None, "disk_read_mb": None}
+        self.now: dict = {"gpus": [], "cpu": None, "cpu_cores": None, "ram_used": None, "ram_total": None, "ram_cached": None,
+                          "disk_read_mb": None}       # a sample's keys, before the first sample
         self.hist = {k: collections.deque(maxlen=HISTORY) for k in SERIES}
         self.slot_hist = collections.deque(maxlen=HISTORY)     # per sample: each slot's tok/s
         self.gpus = [(i, g) for i, g in ((i, gpu_factory(i)) for i in dict.fromkeys(gpu_indices or [0])) if g.ok()]
@@ -200,7 +241,8 @@ class Telemetry:
         self.fallback = _CpuRamFallback()
         first = self.gpus[0][1] if self.gpus else None
         self.static = {
-            "gpus": [{"index": i, "name": g.name()} for i, g in self.gpus],
+            "gpus": [{"index": i, "name": g.name(), "bus": g.bus_id() if hasattr(g, "bus_id") else None}
+                     for i, g in self.gpus],
             "cpu_name": _cpu_name(),
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),
@@ -241,11 +283,14 @@ class Telemetry:
                 r = {}
             s["gpus"].append({"index": i, **{k: r.get(k) for k in GPU_KEYS}})
         s["cpu"] = s["ram_used"] = s["ram_total"] = None
+        s["cpu_cores"] = s["ram_cached"] = None
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)
+                s["cpu_cores"] = self.ps.cpu_percent(interval=None, percpu=True)    # by logical processor
                 vm = self.ps.virtual_memory()
                 s["ram_used"], s["ram_total"] = vm.total - vm.available, vm.total
+                s["ram_cached"] = getattr(vm, "cached", None)                         # the page cache (Linux)
             except (OSError, RuntimeError):
                 pass
         else:
@@ -281,7 +326,9 @@ class Telemetry:
     def snapshot(self):
         with self.lock:
             now = {k: v for k, v in self.now.items() if k not in SERIES and k != "slot_tok_s"}
+            now["disk_read_mb"] = self.now.get("disk_read_mb")
             hist = {k: list(v) for k, v in self.hist.items()}
+            now["disk_hist"] = hist.pop("disk_read_mb")             # the read rate's last 60 s, beside its reading
             # one series per slot, oldest first; a sample from before a slot existed is None
             n = max((len(x) for x in self.slot_hist), default=0)
             hist["slot_tok_s"] = [[x[j] if j < len(x) else None for x in self.slot_hist] for j in range(n)]
