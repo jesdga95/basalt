@@ -127,8 +127,9 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-/// The one pass of a start: announces the bytes `plan` counts as the start's total, then places them with `loader`, whose
-/// staging is freed after it (a start that serves keeps its loader, not its pinned staging).
+/// The one pass of a start: announces the bytes `plan` counts as the start's total and each destination's share of it,
+/// then places them with `loader`, whose staging is freed after it (a start that serves keeps its loader, not its pinned
+/// staging).
 bool place_start(Loader& loader, const LoadPlan& plan, std::string& err);
 
 }  // namespace basalt::core

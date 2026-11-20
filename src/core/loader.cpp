@@ -540,11 +540,10 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
         for (auto& [c, left] : card_left)
             if (c == d && --left == 0) card_label();
     };
-    // each item's destination among the start's shares: what it counts, it counts there
+    // each item's destination among the start's shares (place_start announces them): what it counts, it counts there
     std::vector<int> share_of(items.size(), -1);
     {
         const auto shares = plan.counted_by_target(main_card);
-        LoadProgress::shares(shares);
         for (size_t i = 0; i < items.size(); ++i) {
             const std::string target = items[i].dev != nullptr ? LoadProgress::cuda(items[i].device) : "ram";
             for (size_t s = 0; s < shares.size(); ++s)
@@ -715,6 +714,9 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
 
 bool place_start(Loader& loader, const LoadPlan& plan, std::string& err) {
     LoadProgress::announce_total(plan.counted());
+    int main_card = 0;
+    if (cudaGetDevice(&main_card) != cudaSuccess) main_card = 0;
+    LoadProgress::shares(plan.counted_by_target(main_card));
     const bool ok = loader.run(plan, err);
     loader.release_staging();
     return ok;
