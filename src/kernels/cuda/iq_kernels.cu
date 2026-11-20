@@ -6,6 +6,7 @@
 // THIRD_PARTY_LICENSES).  The block structs and codebook grids are basalt/ggml/ggml_common.h.
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/mxfp4_scale.hpp"
 #include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -307,12 +308,6 @@ __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(const void* __restrict__ vb
     return d * sumi;
 }
 
-// MXFP4's E8M0 scale as ggml decodes it (half the value, kvalues_mxfp4 being doubled; the byte is the fp32
-// exponent): the same float as the CPU tier's GGML_E8M0_TO_FP32_HALF, built from its bits.
-__device__ __forceinline__ float mxfp4_scale_dev(uint8_t e) {
-    const uint32_t bits = e < 2 ? (uint32_t) 0x00200000 << e : (uint32_t) (e - 1) << 23;
-    return __uint_as_float(bits);
-}
 // MXFP4: 32 values with one E8M0 scale, one call per block (llama.cpp's vec_dot_mxfp4_q8_1, VDR 2).  Byte j of qs
 // holds value j (low nibble) and value j + 16 (high nibble) like IQ4_NL, but the blocks are 17 bytes: the weight
 // words go through get_int_b1, the activation words are aligned.
@@ -328,7 +323,7 @@ __device__ __forceinline__ float vec_dot_mxfp4_q8_1(const void* __restrict__ vbq
         sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
     }
-    const float d = mxfp4_scale_dev(bq4->e) * __low2float(bq8_1->ds);
+    const float d = mxfp4_scale(bq4->e) * __low2float(bq8_1->ds);
     return d * sumi;
 }
 
@@ -1077,7 +1072,7 @@ template<> struct Split<39> {   // MXFP4
         W r;
 #pragma unroll
         for (int l = 0; l < 2; ++l) r.v[l] = get_int_from_table_16(get_int_b1(bq4->qs, iqs + l), kvalues_mxfp4);
-        r.dw = mxfp4_scale_dev(bq4->e);
+        r.dw = mxfp4_scale(bq4->e);
         return r;
     }
     __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
@@ -2683,7 +2678,7 @@ __device__ void dq_mxfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const int64_t il = tid / 8, ib = tid % 8;
     dst_t* y = yy + 32 * ib + 4 * il;
     const uint8_t* q4 = x[ib].qs + 4 * il;
-    const float d = mxfp4_scale_dev(x[ib].e);
+    const float d = mxfp4_scale(x[ib].e);
     for (int j = 0; j < 4; ++j) {
         y[j + 0] = cvt<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]);
         y[j + 16] = cvt<dst_t>(d * kvalues_mxfp4[q4[j] >> 4]);

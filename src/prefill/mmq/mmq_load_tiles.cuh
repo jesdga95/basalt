@@ -8,6 +8,8 @@
 
 #include "mmq.cuh"
 
+#include "basalt/kernels/mxfp4_scale.hpp"
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q2_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
@@ -575,13 +577,6 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-// MXFP4 (Basalt): the E8M0 scale as ggml decodes it (half the value, kvalues_mxfp4 being doubled; the byte is the
-// fp32 exponent): the same float as the decode kernels' mxfp4_scale_dev and the CPU tier's GGML_E8M0_TO_FP32_HALF.
-static __device__ __forceinline__ float ggml_cuda_mmq_mxfp4_scale(const uint8_t e) {
-    const uint32_t bits = e < 2 ? (uint32_t) 0x00200000 << e : (uint32_t) (e - 1) << 23;
-    return __uint_as_float(bits);
-}
-
 // MXFP4 (Basalt): the IQ4_NL tile layout and dot (one float scale per 32-value block) - same traits (QK 32, QI 4),
 // same nibble layout.  The blocks are 17 bytes, so their qs is unaligned and goes through get_int_b1.
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4(
@@ -632,7 +627,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbxd;
 
-        x_df[i*sram_stride                       + kbxd] = ggml_cuda_mmq_mxfp4_scale(bxi->e);
+        x_df[i*sram_stride                       + kbxd] = mxfp4_scale(bxi->e);
     }
 }
 
