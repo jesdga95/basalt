@@ -495,8 +495,8 @@ public:
         early_window(anchor, pos);   // while the card runs the block
         return r;
     }
-    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
-        return dfly_.draft_end(ids, conf, max_n, n, stream_);
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
+        return dfly_.draft_end(ids, conf, max_n, n, stream_, need);
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {

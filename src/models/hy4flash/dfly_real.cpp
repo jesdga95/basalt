@@ -207,7 +207,8 @@ int main(int argc, char** argv) {
         const auto t1 = std::chrono::steady_clock::now();
         int32_t tok[8];
         float conf[8];
-        if (!run->finish(tok, conf, st, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        int made = 0;
+        if (!run->finish(tok, conf, made, st, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         const auto t2 = std::chrono::steady_clock::now();
         if (rep < 2) continue;
         std::printf("block %.2f ms (enqueue), heads %.2f ms\n", std::chrono::duration<double, std::milli>(t1 - t0).count(),
