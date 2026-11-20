@@ -757,6 +757,8 @@ class Service:
             bd = (getattr(self.engine, "slot_drafts", None) or {}).get(i)
             if bd and bd[2] >= held.get("at", 0):      # a batch slot's own counts, when newer than a solo request's
                 held.update(accepted=bd[0], offered=bd[1])
+            cons = console.slot(i, by_slot[i][0].get("started") if i in by_slot else last_start.get(i)) \
+                if console is not None else {"accept_pos": None, "accept_hist": None, "hit": None}
             row = {"id": i, "n_ctx": self.engine.max_context, "is_processing": i in by_slot, "state": "idle",
                    "api": None, "model": None, "tok_s": 0.0, "generated": 0, "max_tokens": None, "prompt_tokens": 0,
                    "prefill_done": 0, "reused": None, "ttft_s": None, "draft_len": None,
@@ -764,8 +766,7 @@ class Service:
                    "drafts_accepted": held.get("accepted"),       # draft counts are the slot's last finished request's
                    "started": None, "path": None, "prompt_ms": None,
                    # the engine's own figures of the slot's current or last request (STATS)
-                   **(console.slot(i, by_slot[i][0].get("started") if i in by_slot else last_start.get(i))
-                      if console is not None else {"accept_pos": None, "accept_hist": None, "hit": None})}
+                   **cons}
             if view:
                 row["ctx_used"] = view[i]["held"]
             if i in by_slot:
@@ -782,7 +783,10 @@ class Service:
                            ttft_s=round(st["first_token"] - st["started"], 2) if decoding and st.get("started")
                            else None,
                            draft_len=round(win_tokens / windows, 2) if windows else None,
-                           started=st.get("started"), path=st.get("path"), prompt_ms=st.get("prompt_ms"))
+                           started=st.get("started"), path=st.get("path"), prompt_ms=st.get("prompt_ms"),
+                           # a running request's own drafts (the engine's XSLOT counts), none before its first window
+                           drafts_offered=row.get("drafts_offered") if console is None or "drafts_offered" in cons else None,
+                           drafts_accepted=row.get("drafts_accepted") if console is None or "drafts_accepted" in cons else None)
             rows.append(row)
         return rows, queue
 

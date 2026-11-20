@@ -79,6 +79,8 @@ class Lines(unittest.TestCase):
         self.assertEqual((v["hit"]["vram"], v["hit"]["cpu"]), (round(90 / 140, 3), round(40 / 140, 3)))
         self.assertEqual((v["drafts_accepted"], v["drafts_offered"]), (14, 22))   # every run's drafts
         self.assertEqual(c.slot(0)["accept_pos"], [0.5])                     # no start given: the last run
+        clk.t += 5
+        self.assertEqual(c.slot(0, since=clk.t - 1), {"accept_pos": None, "accept_hist": None, "hit": None})   # still reading
 
     def test_the_expert_map_fades(self):
         clk = Clock()
@@ -157,6 +159,25 @@ class Served(unittest.TestCase):
         self.assertEqual((row["path"], row["prompt_ms"]), ("/v1/messages", 31.5))
         self.assertEqual(row["reused"], 0)                                   # RESUME 0: nothing cached, a 0% hit
         self.assertIsNotNone(row["started"])
+
+    def test_a_running_request_shows_only_its_own_drafts(self):
+        tok = ByteTokenizer()
+        seen = []
+
+        class Peek(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+                for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
+                    if i == 2:
+                        seen.append(svc.slot_table()[0][0])
+                    yield t
+        eng = Peek(tok, "Hello there, friend.")
+        eng.console = ConsoleLines()
+        eng.console.feed("XSLOT 0 9 20 0 0 0 0 7/9")                      # the slot's last request, before this one
+        svc = Service(eng, tok, ChatTemplate.from_file(TEMPLATE))
+        svc.slot_last[0] = {"ctx": 5, "offered": 9, "accepted": 7, "at": 0}
+        for _ in svc.run(tok.encode("hi"), False, None, 16, {}, threading.Event()):
+            pass
+        self.assertEqual((seen[0]["drafts_offered"], seen[0]["accept_pos"]), (None, None))   # no window of its own yet
 
 if __name__ == "__main__":
     unittest.main()

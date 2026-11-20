@@ -121,7 +121,8 @@ class ConsoleLines:
             runs = list(self.runs.get(b) or [])
             deltas = list(self.deltas.get(b) or [])
             per_s = list(self.per_s.get(b) or [])
-        mine = [r for t, r in runs if since is not None and t >= since] or [r for _, r in runs[-1:]]
+        # a request with no run of its own yet (still waiting or reading) has no figures: not the slot's last request's
+        mine = [r for t, r in runs if t >= since] if since is not None else [r for _, r in runs[-1:]]
         if not mine:
             return {"accept_pos": None, "accept_hist": None, "hit": None}
         c = {k: sum(r[k] for r in mine) for k in COUNTS}
