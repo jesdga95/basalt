@@ -738,9 +738,9 @@ __device__ __forceinline__ void tail_scale(float (&s)[NC], float sc) {
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
-#define GU_FMTS(X) X(16) X(17) X(18) X(19) X(21) X(22) X(23) X(29) X(42) X(10) X(11) X(12) X(13) X(14) X(6) X(8) X(39) X(40)
+#define GU_FMTS(X) X(16) X(17) X(18) X(19) X(21) X(22) X(23) X(29) X(42) X(10) X(11) X(12) X(13) X(14) X(6) X(8) X(40)
 #define D_FMTS(X) X(10) X(11) X(12) X(14) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42) X(7) X(6) X(8) X(39) X(40)
-#define MMVQ_FMTS(X) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42) X(10) X(11) X(12) X(13) X(7) X(6) X(8) X(39) X(40)
+#define MMVQ_FMTS(X) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42) X(10) X(11) X(12) X(13) X(7) X(6) X(8) X(40)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -1416,10 +1416,10 @@ template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1 split; the per-expe
     }
 };
 
-// Down formats whose row is K = 40 calls (n_ff 640): IQ4_NL, MXFP4, Q5_1 and Q5_0 (32-value blocks, two calls) and
-// NVFP4 (64-value blocks, four): eight lanes a row.
-template<int TD> inline constexpr bool kDown40 = TD == 20 || TD == 40 || TD == 7 || TD == 6 || TD == 39;
-__host__ __device__ constexpr bool kDown40Type(int t) { return t == 20 || t == 40 || t == 7 || t == 6 || t == 39; }
+// Down formats whose row is K = 40 calls (n_ff 640): IQ4_NL, Q5_1 and Q5_0 (32-value blocks, two calls) and
+// NVFP4 (64-value blocks, four): eight lanes a row.  MXFP4 keeps the generic path: no pack carries it at n_ff 640.
+template<int TD> inline constexpr bool kDown40 = TD == 20 || TD == 40 || TD == 7 || TD == 6;
+__host__ __device__ constexpr bool kDown40Type(int t) { return t == 20 || t == 40 || t == 7 || t == 6; }
 
 // One row against the n <= NC activations x + off[0..n) (n >= 1, warp-uniform; offsets in q8_1 blocks, 32-bit to
 // spare registers), the whole warp.  Per activation this is row_dot: the same calls k, lane-strided the same way,
@@ -2929,7 +2929,8 @@ __global__ void dequant_gu_kernel(int ty, int ty_u, const void* __restrict__ gat
                         scale ? scale[parity] : 1.0f);
 }
 
-// the types dq_dispatch dequantizes
+// the types dq_dispatch dequantizes; every host entry point accepts them for every role, and a down-only format
+// (MXFP4) is refused as gate/up by native_expert_supported's gu_qk, not here
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 19 || t == 22 || t == 23 || t == 29 || t == 42 || t == 10 || t == 11 ||
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 8 || t == 39 || t == 40;
