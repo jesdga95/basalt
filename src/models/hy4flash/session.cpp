@@ -114,6 +114,7 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
+        settle_early();
         dec_.release();
         big_.release();
         platform::free_aligned(cpu_act_);
@@ -254,6 +255,7 @@ public:
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
         if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
             return false;
+        dfly_.on_row([this](int j, int32_t tok) { early_draft_row(j, tok); });
         return true;
     }
 
@@ -482,7 +484,9 @@ public:
     // DFLY HOOK: --spec sets the window (DeepSeek's rule: 0 or 1 is plain decode), and the drafter's calls (dfly.hpp)
     int max_window() const override { return std::clamp(m_.spec(), 1, kMaxWindow); }
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
-        return dfly_.draft_begin(anchor, pos, n, cache_, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
+        const model::Result r = dfly_.draft_begin(anchor, pos, n, cache_, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
+        early_window(anchor, pos);   // while the card runs the block
+        return r;
     }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override { return dfly_.draft_end(ids, conf, max_n, n, stream_); }
 
@@ -1170,11 +1174,27 @@ private:
     // asked for before the first layer runs, so the SSD works while the GPU does the layers in between.
     struct Prefetch {
         std::vector<float> valid;
-        std::vector<uint8_t> raw;
+        std::vector<uint8_t> raw;    // the rows read here, in order
+        std::vector<int> at;         // [row] its place in raw, or -1 for a row asked for early
         ngram::PleReader::Ticket tk;
         bool issued = false, collected = false;
     };
     std::vector<Prefetch> pf_;
+    // A decode window's rows are known before it runs: the anchor's when the drafter starts, each draft's as the heads make it.
+    // Their Engram rows are asked for then (every Engram layer's rows of a window row in one ticket), so they land during the
+    // draft instead of during layer 0; the window takes a row whose position, token and two tokens before match.
+    struct EarlyRow {
+        int64_t pos = 0;
+        int32_t tok = 0, p1 = 0, p2 = 0;
+        float valid = 1.f;
+        std::vector<uint8_t> raw;    // [Engram layer][column][row bytes]
+        ngram::PleReader::Ticket tk;
+        bool collected = false;
+    };
+    std::vector<EarlyRow> early_;
+    std::vector<int> early_of_;      // [window row] its early row, or -1
+    int64_t early_pos_ = -1;         // the window the drafter is making
+    int32_t early_tok_[kMaxWindow] = {};
 
     // A prompt chunk of kRingRows rows or more routes to every expert of every layer, so the next layer's experts do not wait for
     // its router: all of a layer's experts are copied into one of two slots of the ring while the layer before it computes.
@@ -1503,17 +1523,34 @@ private:
     void prefetch_engram(int64_t pos0, int R) {
         const EngramInfo& en = m_.pack().engram;
         const int n_cols = en.n_cols(), W = en.row_values;
+        early_of_.assign((size_t) R, -1);
+        std::vector<int> own;   // the rows not asked for early
+        for (int t = 0; t < R; ++t) {
+            const int64_t pos = pos0 + t;
+            const int32_t tok = hist_[(size_t) pos], p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
+            for (size_t k = 0; k < early_.size() && early_of_[(size_t) t] < 0; ++k) {
+                const EarlyRow& er = early_[k];
+                if (er.pos == pos && er.tok == tok && er.p1 == p1 && er.p2 == p2) early_of_[(size_t) t] = (int) k;
+            }
+            if (early_of_[(size_t) t] < 0) own.push_back(t);
+        }
         pf_.assign(en.layers.size(), Prefetch());
         for (size_t e = 0; e < en.layers.size(); ++e) {
             Prefetch& p = pf_[e];
-            std::vector<uint32_t> ids((size_t) R * n_cols);
+            std::vector<uint32_t> ids(own.size() * n_cols);
             p.valid.assign((size_t) R, 1.f);
-            for (int t = 0; t < R; ++t) {
+            p.at.assign((size_t) R, -1);
+            for (int t = 0; t < R; ++t)
+                if (early_of_[(size_t) t] >= 0) p.valid[(size_t) t] = early_[(size_t) early_of_[(size_t) t]].valid;
+            for (size_t i = 0; i < own.size(); ++i) {
+                const int t = own[i];
                 const int64_t pos = pos0 + t;
                 const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
-                engram_ids(en, (int) e, hist_[(size_t) pos], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, p.valid[(size_t) t]);
+                engram_ids(en, (int) e, hist_[(size_t) pos], p1, p2, pos, false, ids.data() + i * n_cols, p.valid[(size_t) t]);
+                p.at[(size_t) t] = (int) i;
             }
-            p.raw.resize((size_t) R * n_cols * W);
+            if (own.empty()) continue;
+            p.raw.resize(own.size() * n_cols * W);
             p.tk = m_.engram_reader().issue(ids.data(), ids.size(), p.raw.data());
             p.issued = true;
         }
@@ -1524,6 +1561,47 @@ private:
         for (Prefetch& p : pf_)
             if (p.issued && !p.collected) m_.engram_reader().collect(p.tk, ignore);
         pf_.clear();
+        settle_early();
+    }
+    // Every Engram layer's rows of window row (pos, tok) after p1 and p2, in one ticket.
+    void issue_early(int64_t pos, int32_t tok, int32_t p1, int32_t p2) {
+        const EngramInfo& en = m_.pack().engram;
+        if (en.layers.empty() || early_.size() >= (size_t) kMaxWindow) return;
+        const int n_cols = en.n_cols(), W = en.row_values, ne = (int) en.layers.size();
+        EarlyRow r;
+        r.pos = pos;
+        r.tok = tok;
+        r.p1 = p1;
+        r.p2 = p2;
+        std::vector<uint32_t> ids((size_t) ne * n_cols);
+        for (int e = 0; e < ne; ++e) engram_ids(en, e, tok, p1, p2, pos, false, ids.data() + (size_t) e * n_cols, r.valid);
+        r.raw.resize((size_t) ne * n_cols * W);
+        r.tk = m_.engram_reader().issue(ids.data(), ids.size(), r.raw.data());
+        early_.push_back(std::move(r));
+    }
+    // The drafter starts the window at `pos`: its first row, the anchor, has all it needs.
+    void early_window(int32_t anchor, int64_t pos) {
+        settle_early();
+        if (pos > (int64_t) hist_.size()) return;
+        early_pos_ = pos;
+        early_tok_[0] = anchor;
+        issue_early(pos, anchor, pos >= 1 ? hist_[(size_t) pos - 1] : -1, pos >= 2 ? hist_[(size_t) pos - 2] : -1);
+    }
+    // The heads made draft j - 1, window row j's token (DflyRunner::finish's on_row: the card runs the next head meanwhile).
+    void early_draft_row(int j, int32_t tok) {
+        if (early_pos_ < 0 || j < 1 || j >= kMaxWindow) return;
+        early_tok_[j] = tok;
+        const int64_t pos = early_pos_ + j;
+        const int32_t p2 = j >= 2 ? early_tok_[j - 2] : early_pos_ >= 1 ? hist_[(size_t) early_pos_ - 1] : -1;
+        issue_early(pos, tok, early_tok_[j - 1], p2);
+    }
+    // The early rows' reads land (their buffers are ours) and are dropped.
+    void settle_early() {
+        std::string ignore;
+        for (EarlyRow& r : early_)
+            if (!r.collected) m_.engram_reader().collect(r.tk, ignore);
+        early_.clear();
+        early_pos_ = -1;
     }
 
     bool engram_step(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err, int off = 0) {
@@ -1550,16 +1628,22 @@ private:
             return t;
         }();
         if (eng_ev_) cudaEventSynchronize(eng_ev_);   // the last Engram layer's copies out of these host rows have landed
-        Prefetch* pf = (size_t) e < pf_.size() && pf_[(size_t) e].issued ? &pf_[(size_t) e] : nullptr;
+        Prefetch* pf = (size_t) e < pf_.size() ? &pf_[(size_t) e] : nullptr;
         std::vector<uint8_t> own_raw;
         const uint8_t* raw = nullptr;
         if (pf) {
-            if (!pf->collected) {
+            if (pf->issued && !pf->collected) {
                 if (!collect(pf->tk)) return false;
                 pf->collected = true;
             }
-            for (int t = 0; t < R; ++t) h_evalid_[t] = pf->valid[(size_t) (off + t)];
-            raw = pf->raw.data() + (size_t) off * n_cols * W;
+            for (int t = 0; t < R; ++t) {
+                const int k = early_of_[(size_t) (off + t)];
+                if (k >= 0 && !early_[(size_t) k].collected) {
+                    if (!collect(early_[(size_t) k].tk)) return false;
+                    early_[(size_t) k].collected = true;
+                }
+                h_evalid_[t] = pf->valid[(size_t) (off + t)];
+            }
         } else {
             std::vector<uint32_t> ids((size_t) R * n_cols);
             for (int t = 0; t < R; ++t) {
@@ -1582,12 +1666,19 @@ private:
             cudaMemcpy(nrm, T(l, "engram_lookup_norm.weight")->ptr, (size_t) n_cols * W * 4, cudaMemcpyDeviceToHost);
             lookup_loaded_[(size_t) e] = true;
         }
+        // row t's n_cols rows: from the window's own reads or from its early ones
+        const auto rows_of = [&](int t) -> const uint8_t* {
+            if (!pf) return raw + (size_t) t * n_cols * W;
+            const int k = early_of_[(size_t) (off + t)];
+            return k >= 0 ? early_[(size_t) k].raw.data() + (size_t) e * n_cols * W : pf->raw.data() + (size_t) pf->at[(size_t) (off + t)] * n_cols * W;
+        };
         const double norm_start = time_prompt ? now_ms() : 0;
         for (int t = 0; t < R; ++t) {
             const float valid = h_evalid_[t];
+            const uint8_t* trow = rows_of(t);
             for (int c = 0; c < n_cols; ++c) {
                 float* row = h_erows_ + ((size_t) t * n_cols + c) * W;
-                const uint8_t* src = raw + ((size_t) t * n_cols + c) * W;
+                const uint8_t* src = trow + (size_t) c * W;
                 float ss = 0.f;
                 for (int d = 0; d < W; ++d) {
                     row[d] = lut[src[d]];
