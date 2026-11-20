@@ -368,6 +368,7 @@ bool QfnRuntime::batch_step() {
     }
     std::fflush(stdout);
     stats_lookups_end();
+    stats_tick();   // also when a prompt read runs these windows beside it, outside the command loop
     const Clock::time_point w3 = Clock::now();
     bt_emit += msd(w2, w3);
     if (real) {
