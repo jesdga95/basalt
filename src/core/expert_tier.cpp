@@ -201,6 +201,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     if (!open_base(per_layer_, err)) return false;
     res_.assign((size_t) n_layers_ * n_expert_, -1);
     stamp_.assign((size_t) n_layers_ * n_expert_, 0);
+    if (s_.victim_half_life > 0) looks_.assign((size_t) n_layers_ * n_expert_, 0);
     owner_.assign((size_t) base_slots(), -1);
     busy_.assign((size_t) base_slots(), 0);
     int lo_prio = 0, hi_prio = 0;
@@ -780,10 +781,14 @@ void ExpertTier::settle() {
 void ExpertTier::begin_token(int n_tokens) {
     if (!uses_.empty() && core::policy::use_half_life(token_, (uint64_t) n_tokens))
         for (uint16_t& u : uses_) u >>= 1;
+    if (!looks_.empty() && core::policy::crosses(token_, (uint64_t) n_tokens, (uint64_t) s_.victim_half_life))
+        for (uint16_t& u : looks_) u >>= 1;
     token_ += (uint64_t) n_tokens;
     claims_ = 0;
     claim_cap_ = s_.claims_per_row > 0 ? s_.claims_per_row * std::max(n_tokens, 1) : (int) kMaxPending;
 }
+
+void ExpertTier::forget_use() { std::fill(looks_.begin(), looks_.end(), (uint16_t) 0); }
 
 bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err) {
     land(layer);
@@ -806,6 +811,7 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         }
         const size_t idx = (size_t) layer * n_expert_ + e;
         stamp_[idx] = now;
+        if (!looks_.empty()) core::policy::count_look(looks_[idx]);
         const int32_t s = res_[idx];
         lk.peer[i] = nullptr;
         if (s >= 0) {
@@ -887,11 +893,23 @@ void ExpertTier::finish_cpu() { pool_->finish_split_multi_native(); }
 int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const {
     int32_t slot = -1;
     best = ~0ull;
+    uint16_t best_looks = 0;
+    const size_t base = (size_t) layer * n_expert_;
     auto scan = [&](int64_t lo, int64_t n) {
         for (int64_t s = lo; s < lo + n; ++s) {
             if (busy_[(size_t) s]) continue;
             const int32_t o = owner_[(size_t) s];
-            const uint64_t st = o < 0 ? 0 : stamp_[(size_t) layer * n_expert_ + o];
+            const uint64_t st = o < 0 ? 0 : stamp_[base + o];
+            if (!looks_.empty()) {   // by use: an empty slot first, and an expert this very lookup uses stays
+                if (o >= 0 && st == tick_) continue;
+                const uint16_t lk = o < 0 ? 0 : looks_[base + o];
+                if (slot < 0 || core::policy::yields_before(lk, st, best_looks, best)) {
+                    best = st;
+                    best_looks = lk;
+                    slot = (int32_t) s;
+                }
+                continue;
+            }
             if (st < best) {
                 best = st;
                 slot = (int32_t) s;
@@ -901,6 +919,7 @@ int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const
     if (homes_.main == 0 || (homes_too && spare_[(size_t) layer] >= 0))
         scan(base_lo_[(size_t) layer], live_n(layer));
     if (ext_per_layer_) scan(base_slots() + (int64_t) layer * ext_per_layer_, ext_per_layer_);
+    if (slot < 0 && !looks_.empty()) best = tick_;
     return slot;
 }
 
