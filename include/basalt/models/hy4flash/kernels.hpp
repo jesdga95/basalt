@@ -148,6 +148,20 @@ void put_words(const void* src, void* dst, int n_words, void* stream);
 /// device or mapped host memory).
 void weighted_sum_window(const float* const* rows, const float* w, int n_tok, int K, int n, float* out, void* stream);
 
+/// Holds the stream until *word (mapped host memory the host writes) equals `value`, fences, then stores `value` in mark[0]
+/// (device memory), which an l2_read_ahead on another stream stops at.
+void wait_word_mark(const uint32_t* word, uint32_t value, uint32_t* mark, void* stream);
+/// Byte ranges of device memory (16-byte aligned, 16-byte multiples) in the order the kernels after a wait read them; empty
+/// ones last.
+constexpr int kL2Ranges = 4;
+struct L2Ranges {
+    const void* p[kL2Ranges] = {};
+    uint64_t n[kL2Ranges] = {};
+};
+/// Requests the ranges into L2, in order, until mark[0] equals `value` (mark: 2 words of device memory; mark[1] is scratch
+/// the kernel never writes in practice). Reads only: nothing queued after it waits for it.
+void l2_read_ahead(const L2Ranges& r, uint32_t* mark, uint32_t value, void* stream);
+
 /// h[r][k] = silu(min(gu[r][k], limit)) * clamp(gu[r][n_ff + k], -limit, limit) for rows of 2 * n_ff values (the gate rows' products
 /// then the up rows').
 /// The per-expert FP32 scales an NVFP4 blob ends with ({s_gate, s_up, s_down, 0} at blob + tail_off), for the rows of n experts
