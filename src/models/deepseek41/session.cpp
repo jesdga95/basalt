@@ -397,7 +397,7 @@ public:
         std::string e;
         core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         const std::string kv = m_.cache_format() == CacheFormat::Fp8 ? "kv=fp8+fp4" : "kv=fp16";
-        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->gpu_slots()) + " ram_experts_mib=" + std::to_string(t->ram_bytes() >> 20) + " " + kv + " " + program::spill_words(t->spill());
+        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->gpu_slots()) + " expert_slots_primary=" + std::to_string(t->slots()) + " ram_experts_mib=" + std::to_string(t->ram_bytes() >> 20) + " " + kv + " " + program::spill_words(t->spill());
     }
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }

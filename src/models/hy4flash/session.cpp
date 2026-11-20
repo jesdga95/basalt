@@ -692,7 +692,7 @@ public:
         return true;
     }
 
-    std::string info_words() const override { return tier_ ? "expert_slots=" + std::to_string(tier_->gpu_slots()) + " ram_experts_mib=" + std::to_string(tier_->ram_bytes() >> 20)
+    std::string info_words() const override { return tier_ ? "expert_slots=" + std::to_string(tier_->gpu_slots()) + " expert_slots_primary=" + std::to_string(tier_->slots()) + " ram_experts_mib=" + std::to_string(tier_->ram_bytes() >> 20)
                                      : std::string(); }
 
     // SLEEP / WAKE: the tier's card slots go back to the card (every expert keeps its RAM copy and its slot is remembered), and
