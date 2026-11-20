@@ -48,6 +48,9 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
   earlier topic do not hold the card through the next one. DeepSeek's slots give way by age alone.
 - **Cards:** the main card holds the dense weights (6.76 GiB with the Q8_0 head), the caches and the drafter (0.87 GiB). Up to three more cards
   (`--gpu 0,1,2,3`) each hold the experts of one block of layers; later cards idle.
+- **Waits:** while a decode layer's expert sum waits for the CPU's and the second card's rows, the main card's memory is idle
+  once its own experts are done. It then reads the next layer's attention gate and output products (the head after the last
+  layer) into its L2, up to 56 MB, and stops when the rows are in; those products then read L2 instead of memory.
 - **Engram table:** read by row from the pack, so it takes no RAM of its own; the OS file cache keeps the hot rows.
 - **Context:** `--max-context` from 1,024 up to 1,048,576, default 8,192. The 12 sparse layers keep a row of every position;
   the window layers' rings do not grow.

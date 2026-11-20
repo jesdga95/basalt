@@ -130,16 +130,21 @@ public:
             jcv_.notify_one();
             joiner_.join();
         }
+        if (ra_st_) cudaStreamSynchronize(ra_st_);
         for (void* p : bufs_) cudaFree(p);
         if (d_hist_) cudaFree(d_hist_);
         for (void* p : pinned_) cudaFreeHost(p);
         if (ev_) cudaEventDestroy(ev_);
+        if (ra_ev_) cudaEventDestroy(ra_ev_);
+        if (ra_st_) cudaStreamDestroy(ra_st_);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
     bool init(std::string& err) {
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaEventCreateWithFlags(&ev_, cudaEventDisableTiming) != cudaSuccess) {
+            cudaEventCreateWithFlags(&ev_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&ra_st_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ra_ev_, cudaEventDisableTiming) != cudaSuccess) {
             err = "cannot create a stream";
             return false;
         }
@@ -162,6 +167,8 @@ public:
         pos_d_ = (int32_t*) alloc(16, ok);
         if (ok && cudaMallocHost((void**) &pos_h_, 16) == cudaSuccess) pinned_.push_back(pos_h_);
         else ok = false;
+        ra_mark_ = (uint32_t*) alloc(8, ok);
+        if (ok) cudaMemset(ra_mark_, 0, 8);
         cells_stride_ = g_.idx_top_k + 2 * g_.idx_pool;
         max_heads_ = max_heads;
         size_t attw = 0;   // the chunked attention's workspace: the largest a layer needs; zero from the start
@@ -2164,6 +2171,38 @@ private:
         return false;
     }
 
+    // While a layer's weighted sum waits for the CPU's and the second card's rows, the card's memory idles once its own experts
+    // are done: the next layer's two largest products, its attention gate and output (the head after the last layer), are read
+    // into L2 meanwhile, up to kReadAheadBytes, so those products read L2 instead of memory. The requests start behind the
+    // card's experts and stop once the wait is over; they change no result.
+    static constexpr uint64_t kReadAheadBytes = 56ull << 20;
+    void read_ahead(int l, uint32_t word, cudaStream_t st) {
+        if (ra_.empty()) {   // every layer's ranges, once
+            ra_.resize((size_t) g_.n_layers);
+            for (int k = 0; k < g_.n_layers; ++k) {
+                L2Ranges& r = ra_[(size_t) k];
+                uint64_t left = kReadAheadBytes;
+                int n = 0;
+                const auto add = [&](const DevTensor* t) {
+                    if (t == nullptr || n == kL2Ranges || ((uintptr_t) t->ptr & 15) != 0) return;
+                    r.p[n] = t->ptr;
+                    r.n[n] = std::min<uint64_t>(t->bytes, left) & ~15ull;
+                    left -= r.n[n];
+                    n += r.n[n] > 0;
+                };
+                if (k + 1 < g_.n_layers) {
+                    add(T(k + 1, "attn_gate.weight"));
+                    add(T(k + 1, "attn_output.weight"));
+                } else {
+                    add(m_.tensor("output.weight"));
+                }
+            }
+        }
+        cudaEventRecord(ra_ev_, st);
+        cudaStreamWaitEvent(ra_st_, ra_ev_, 0);
+        l2_read_ahead(ra_[(size_t) l], ra_mark_, word, ra_st_);
+    }
+
     // The routed experts of rows g0..g0+G of a layer, as DeepSeek's decode places them: the tier is asked once per distinct
     // expert of the group; the second card's share is raised first, then the CPU pool starts on the RAM experts, the card
     // runs its slot hits and then the bus fetches, and the weighted sum is queued behind a word the host writes once the
@@ -2227,6 +2266,7 @@ private:
             pd.reading = pd.reading || lk.reading[i];
             on_peer = on_peer || lk.peer[i];
         }
+        if (pd.cpu || pd.reading || on_peer) pd.word = ++join_seq_;   // the weighted sum waits for the host's rows
         // a promotion only queues its copies (they go out at a later pump), so it is decided now and the copies start behind
         // this layer's sum; experts still being read from the file are decided once they landed
         if (pd.cpu && !pd.reading) tier_->promote(tl, lk);
@@ -2266,6 +2306,7 @@ private:
                                                                       : d_rows_ + (size_t) r * L);
         put_words(&put, ex_plan_, (int) ((offsetof(WindowPut, rows) + (size_t) G * K * 8) / 4), st);
         if (nhits) launch(ex_plan_, nhits, ne);
+        if (pd.word) read_ahead(l, pd.word, st);
         if (n_fetched) {
             WindowPlan p2;
             const int ng = make_plan(p2, true, ne);
@@ -2275,10 +2316,7 @@ private:
         }
         // the second card's fetched experts run once their copies land, long after these launches
         if (peer && !peer->run_fetched(err)) return false;
-        if (pd.cpu || pd.reading || on_peer) {
-            pd.word = ++join_seq_;
-            kernels::wait_word(d_words_ + 1, pd.word, st);
-        }
+        if (pd.word) wait_word_mark(d_words_ + 1, pd.word, ra_mark_, st);
         const float* const* rows = (const float* const*) ((uint8_t*) ex_plan_ + offsetof(WindowPut, rows));
         weighted_sum_window(rows, rw_ + (size_t) g0 * K, G, K, L, lat_out_ + (size_t) g0 * L, st);
         if (pd.cpu && !pd.reading) tier_->mark_gap(st);   // the promotions' copies start behind the sum
@@ -2643,6 +2681,12 @@ private:
     int32_t *h_ids_ = nullptr, *d_ids_ = nullptr;
     uint32_t *h_words_ = nullptr, *d_words_ = nullptr;   // mapped: [0] the ids' sequence word, [1] the word a weighted sum waits for
     uint32_t seq_want_ = 0, join_seq_ = 0;
+    // the L2 read-ahead during a MoE layer's wait (read_ahead): its stream, the event it starts behind, the mark it stops at
+    // (device: the last word the weighted sum's wait saw) and each layer's ranges
+    cudaStream_t ra_st_ = nullptr;
+    cudaEvent_t ra_ev_ = nullptr;
+    uint32_t* ra_mark_ = nullptr;
+    std::vector<L2Ranges> ra_;
     // the joiner thread (moe_group hands it a group's CPU and second-card share; join_moe waits for its result)
     bool use_joiner_ = true;
     bool use_graphs_ = true;

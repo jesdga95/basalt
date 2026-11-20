@@ -1043,6 +1043,91 @@ void bench_mla() {
     cudaStreamDestroy(st);
 }
 
+// The wait with a mark and the L2 read-ahead: the wait holds its stream until the host's word and then marks; the read-ahead
+// stops at the mark and writes nothing; and the gate product's time (2 rows, 64 heads) with its rows in memory and read ahead.
+void test_read_ahead() {
+    cudaStream_t st;
+    cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    uint32_t *h_word = nullptr, *d_word = nullptr, *mark = nullptr;
+    cudaHostAlloc((void**) &h_word, 64, cudaHostAllocMapped);
+    cudaHostGetDevicePointer((void**) &d_word, h_word, 0);
+    *(volatile uint32_t*) h_word = 0;
+    cudaMalloc(&mark, 8);
+    cudaMemset(mark, 0, 8);
+    wait_word_mark(d_word, 7, mark, st);
+    std::vector<uint32_t> m0(2);
+    cudaMemcpy(m0.data(), mark, 8, cudaMemcpyDeviceToHost);   // another stream: the wait is still holding its own
+    const bool held = cudaStreamQuery(st) == cudaErrorNotReady && m0[0] == 0;
+    *(volatile uint32_t*) h_word = 7;
+    cudaStreamSynchronize(st);
+    std::vector<uint32_t> m1 = host(mark, 2);
+    const bool marked = m1[0] == 7 && m1[1] == 0;
+    std::printf("%-30s held %s, marked %s  %s\n", "wait_word_mark", held ? "yes" : "no", marked ? "yes" : "no", held && marked ? "ok" : "FAIL");
+    failures += !(held && marked);
+    // a gate product's rows (3072 -> 16384) as two ranges, and a buffer past L2's size that evicts them
+    const int n_in = 3072, n_out = 16384, R = 2;
+    const size_t wb = (size_t) n_out * (n_in / 32) * 34, flush_b = (size_t) 256 << 20;
+    const Q8 q = make_q8(256, n_in);
+    std::vector<uint8_t> wbytes(wb);
+    for (size_t i = 0; i < wb; ++i) wbytes[i] = q.bytes[i % q.bytes.size()];
+    uint8_t *w = dev(wbytes), *flush = nullptr;
+    cudaMalloc(&flush, flush_b);
+    cudaMemset(flush, 0, flush_b);
+    L2Ranges r, rf;
+    r.p[0] = w;
+    r.n[0] = (wb / 2) & ~15ull;
+    r.p[1] = w + r.n[0];
+    r.n[1] = (wb - r.n[0]) & ~15ull;
+    rf.p[0] = flush;
+    rf.n[0] = flush_b;
+    auto timed = [&](auto&& before, auto&& fn) {
+        double us = 0;
+        for (int i = 0; i < 20; ++i) {
+            before();
+            cudaEventRecord(e0, st);
+            fn();
+            cudaEventRecord(e1, st);
+            cudaEventSynchronize(e1);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, e0, e1);
+            us += 1000.0 * ms / 20;
+        }
+        return us;
+    };
+    const uint32_t never = 0xffffffffu;   // a mark the wait never writes: the read-ahead goes through its ranges
+    const auto cold = [&] { l2_read_ahead(rf, mark, never, st); };
+    const double stopped = timed(cold, [&] { l2_read_ahead(r, mark, 7, st); });   // the mark is already 7
+    const double ra = timed(cold, [&] { l2_read_ahead(r, mark, 8, st); });
+    const bool kept = host(mark, 2)[1] == 0 && fnv(std::vector<float>((const float*) wbytes.data(), (const float*) wbytes.data() + wb / 4)) ==
+                                                   fnv(host((const float*) w, wb / 4));
+    std::printf("%-30s at the mark %.1f us, through %.1f MB %.1f us (%.0f GB/s), reads only %s  %s\n", "l2_read_ahead", stopped, wb / 1e6, ra,
+                wb / ra / 1e3, kept ? "yes" : "no", kept && stopped < 0.5 * ra ? "ok" : "FAIL");
+    failures += !(kept && stopped < 0.5 * ra);
+    float *x = dev(randn((size_t) R * n_in)), *y = devf((size_t) R * n_out);
+    void* xq = nullptr;
+    cudaMalloc(&xq, bk::native_q8_1_bytes(n_in, R));
+    bk::native_quantize_q8_1(x, xq, n_in, R, st);
+    const auto product = [&] { bk::native_mmvq(8, w, xq, y, n_in, n_out, R, st); };
+    const double u_cold = timed(cold, product);
+    const std::vector<float> y_cold = host(y, (size_t) R * n_out);
+    const double u_ahead = timed([&] { cold(); l2_read_ahead(r, mark, never, st); }, product);
+    const bool same = fnv(host(y, (size_t) R * n_out)) == fnv(y_cold);
+    std::printf("bench: gate product %d -> %d, %d rows: %.1f us from memory (%.0f GB/s), %.1f us read ahead (%.0f GB/s), same bits %s\n", n_in, n_out,
+                R, u_cold, wb / u_cold / 1e3, u_ahead, wb / u_ahead / 1e3, same ? "yes" : "NO");
+    failures += !same;
+    cudaFree(w);
+    cudaFree(flush);
+    cudaFree(x);
+    cudaFree(y);
+    cudaFree(xq);
+    cudaFree(mark);
+    cudaFreeHost(h_word);
+    cudaStreamDestroy(st);
+}
+
 // A chunk of rows (the tensor-core kernel) over FP8 rows: against the plain reference over the decoded rows, against the window
 // kernel row by row, and a row's output alone among 9 rows.
 void test_fp8_chunk() {
@@ -1358,6 +1443,7 @@ int main() {
     test_mmq_expert(12, "mmq experts Q4_K");
     test_mmq_expert(14, "mmq experts Q6_K");
     test_prompt_vs_decode_nvfp4();
+    test_read_ahead();
     bench_mla();
     std::printf(failures ? "FAILED\n" : "all ok\n");
     return failures ? 1 : 0;
