@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/model/control_vectors.hpp"
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/platform/memory.hpp"
 
@@ -52,6 +53,9 @@ struct CommonOptions {
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
     /// --rope-scaling, --rope-scale, --yarn-* ...: taken by the models that extend their context (basalt/model/rope_flags.hpp)
     basalt::model::RopeFlags rope;
+    /// --control-vector*, --cvec-*: a control vector on the residual stream, taken by the models that have one
+    /// (basalt/model/control_vectors.hpp).  None by default; --serve switches a loaded one per request.
+    basalt::model::CvecFlags cvec;
     /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
     /// VRAM), for the models that take it
     int64_t kv_resident = 0;

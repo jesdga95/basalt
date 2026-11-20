@@ -15,10 +15,11 @@ file and picks the chat format, tool syntax and thinking switch. Several models 
 | Images | `--vision dynamic`, a GPU number or `cpu` | `--vision dynamic` only | `--vision dynamic` | `--vision dynamic` only |
 | Video | with images, and FFmpeg on the machine ([video](../running.md#video)) | no | with images, and FFmpeg on the machine | no |
 | `--kv` | fp16 (default), int8, q4_0, k8v4 | fp8 (default: FP8 window, FP4 compressed rows), fp16 | fp16 (default), int8 | fp16 (default), fp8 |
-| Cards | main card plus up to three expert-tier cards | main card plus one expert-tier card | main card only | main card plus up to three expert-tier cards |
-| Layer split | yes, matched cards, priced at start | no | no | no |
+| Cards | main card plus up to three expert-tier cards | main card plus one expert-tier card | main card; a second Blackwell card as a layer stage when it does not fit one | main card plus up to three expert-tier cards |
+| Layer split | yes, matched cards, priced at start | no | yes, any two Blackwell cards, the cut priced at start ([two cards](qwen38-27b.md#two-cards-when-it-does-not-fit-one)) | no |
 | Parallel slots | yes; each slot drafts | yes; each slot drafts | yes; each slot drafts | not measured |
 | Lossy flags | `--relaxed-drafting`, `--route-prior`, `--route-tail-skip` (off) | none | none | none |
+| Control vectors | yes, a model-specific vector ([control vectors](../configuration/index.md#control-vectors)) | no | yes, a model-specific vector | no |
 | Prompt skip | no | yes (`--no-prompt-skip` turns it off) | no | no |
 | Idle sleep, wake | yes (Linux) | yes (Linux); a second-card sleep may be refused | no | yes (Linux) |
 | `basalt-bench --quality` | yes | yes, one row per window | yes | yes |

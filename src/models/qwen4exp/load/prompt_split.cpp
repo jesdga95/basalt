@@ -2,7 +2,7 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
-#include "basalt/models/qwen4exp/kernels/cvec.hpp"
+#include "basalt/kernels/cvec.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 

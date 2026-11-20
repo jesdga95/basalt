@@ -26,7 +26,7 @@
 #include "basalt/models/qwen4exp/kernels/mrope.hpp"
 #include "basalt/models/qwen4exp/kernels/native_rope.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
-#include "basalt/models/qwen4exp/kernels/cvec.hpp"
+#include "basalt/kernels/cvec.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_decode_attn.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gdn.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
