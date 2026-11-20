@@ -241,6 +241,10 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
 model::Result Hy4Model::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>&) {
     std::string err;
     if (shared_tier_.tier && !shared_tier_.tier->attach(err)) return {model::Status::Error, "hy4flash: " + err};
+    if (dfly_) {   // the drafts' head screen, made from the head the reads placed
+        cudaSetDevice(device_);
+        if (!dfly_->pack_screen(nullptr, err)) return {model::Status::Error, "hy4flash: " + err};
+    }
     return {};
 }
 
