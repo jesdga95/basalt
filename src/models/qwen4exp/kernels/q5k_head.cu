@@ -450,7 +450,8 @@ __global__ void __launch_bounds__(128) proxy_score_kernel(const uint4* __restric
                                                          const px::X81* __restrict__ x, int n_rows,
                                                          const int32_t* __restrict__ map, float2* __restrict__ cand,
                                                          float2* __restrict__ part) {
-    px::score_tile<kProxyIn>((int) blockIdx.x, wq, sc, x, n_rows, map, cand, part);
+    __shared__ px::ScoreShared<kProxyIn> sh;
+    px::score_tile<kProxyIn, true>(sh, (int) blockIdx.x, wq, sc, x, n_rows, map, cand, part);
 }
 
 // One thread per 32-weight group: the group's dequantized Q5_K values to the 2-bit copy.
@@ -500,7 +501,7 @@ __global__ void __launch_bounds__(512) q5k_proxy_final_kernel(const Q5KBlock* __
         const float d8 = __low2float(*reinterpret_cast<const half2*>(&dsb));
         xe[xslot(b) + pos] = make_int4(u0, u1, DP4A(0x01010101, u0, DP4A(0x01010101, u1, 0)), __float_as_int(d8));
     }
-    const int n = px::collect(f, n_tiles, map, cand, out_id, out_prob);
+    const int n = px::collect<true, true>(f, n_tiles, map, cand, out_id, out_prob);
     if (n == 0) return;
     const XCol xc[1] = {XCol{xe}};
     for (int c = warp; c < n; c += 16) {
@@ -510,7 +511,7 @@ __global__ void __launch_bounds__(512) q5k_proxy_final_kernel(const Q5KBlock* __
     }
     __syncthreads();
     if (warp != 0) return;
-    px::pick(f, n, n_tiles, map, part, out_id, out_prob);
+    px::pick<true, true>(f, n, n_tiles, map, part, out_id, out_prob);
 }
 
 }  // namespace

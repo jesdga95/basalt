@@ -1,8 +1,8 @@
 // include/basalt/kernels/head_proxy.cuh - the 2-bit copy of a draft head's rows (n_in values each, a multiple of 256) that
 // screens its argmax: the copy's layout, the fit and packing of one 32-weight group, the approximate scoring of a tile of
 // rows (a block's stage), and the pick among the rows the head's own arithmetic rescored exactly.  Device code only: each
-// head's .cu wraps the stages in its kernels.  `map` names the token of each copy row (a subset head); null: row r is
-// token r.
+// head's .cu wraps the stages in its kernels.  MAPPED: `map` names the token of each copy row (a subset head); else row r
+// is token r.  PROB: the pick's probability is made too.
 #pragma once
 
 #include "basalt/kernels/dp4a.hpp"
@@ -89,17 +89,27 @@ __device__ __forceinline__ void pack_group(const float* w, int64_t row, int g, u
     sc[(((size_t) tile * kNw4 + w4) * 32 + lane) * 2 + h] = __half_as_ushort(hs);
 }
 
+// The scoring stage's shared state (a kernel declares it __shared__): the activation's codes, its blocks' scales and
+// scaled sums, the warps' partial scores.
+template <int N_IN>
+struct alignas(16) ScoreShared {
+    int xi[N_IN / 4];
+    float xs[N_IN / 32], xdd[N_IN / 32];
+    float red[4][32];
+};
+
 // Tile `tile` (32 rows) by a block of 128 threads: four warps split the row length, lane = row.  Writes the tile's best
 // kPer approximate scores and the tile's softmax partial (max, sum of exp(score - max)).
-template <int N_IN>
-__device__ __forceinline__ void score_tile(int tile, const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
-                                           const X81* __restrict__ x, int n_rows, const int32_t* __restrict__ map,
-                                           float2* __restrict__ cand, float2* __restrict__ part) {
+template <int N_IN, bool MAPPED>
+__device__ __forceinline__ void score_tile(ScoreShared<N_IN>& sh, int tile, const uint4* __restrict__ wq,
+                                           const uint32_t* __restrict__ sc, const X81* __restrict__ x, int n_rows,
+                                           const int32_t* __restrict__ map, float2* __restrict__ cand,
+                                           float2* __restrict__ part) {
     constexpr int kNw4 = nw4(N_IN), NW = kNw4 / 4, NB = N_IN / 32;
     static_assert(N_IN % 256 == 0 && NB <= 128, "rows of whole uint4 quarters, one q8_1 block a thread");
-    __shared__ __align__(16) int xi[N_IN / 4];
-    __shared__ float xs[NB], xdd[NB];
-    __shared__ float red[4][32];
+    int* xi = sh.xi;
+    float *xs = sh.xs, *xdd = sh.xdd;
+    float (*red)[32] = sh.red;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const size_t base = ((size_t) tile * kNw4 + warp * NW) * 32 + lane;
     uint4 w[NW];
@@ -110,7 +120,7 @@ __device__ __forceinline__ void score_tile(int tile, const uint4* __restrict__ w
         s[j] = __ldcs(sc + base + (size_t) j * 32);
     }
     const int row = tile * 32 + lane;
-    const int32_t id = (warp == 0 && row < n_rows) ? (map ? __ldg(map + row) : row) : 0;
+    const int32_t id = (MAPPED && warp == 0 && row < n_rows) ? __ldg(map + row) : 0;
     pdl_wait();
     for (int i = tid; i < N_IN / 4; i += 128) xi[i] = reinterpret_cast<const int*>(x[i / 8].qs)[i % 8];
     if (tid < NB) {
@@ -234,7 +244,8 @@ __device__ __forceinline__ unsigned long long kth_key(Final& f, int nc, const fl
 // After pdl_wait, with f.cnt zeroed by thread 0: the best approximate score, then the rows within kDelta of it into
 // f.list in ascending row order; when more than kMaxCand qualify, the kMaxCand best by approximate score (the lower row
 // on a tie).  The list depends on the scores alone, never on the order threads arrive in.  Returns the number listed;
-// 0 when every row is masked (the pick, and its probability when out_prob is given, are then written here).
+// 0 when every row is masked (the pick, and with PROB its probability, are then written here).
+template <bool MAPPED, bool PROB>
 __device__ __forceinline__ int collect(Final& f, int n_tiles, const int32_t* __restrict__ map,
                                        const float2* __restrict__ cand, int* __restrict__ out_id,
                                        float* __restrict__ out_prob) {
@@ -251,8 +262,9 @@ __device__ __forceinline__ int collect(Final& f, int n_tiles, const int32_t* __r
     const float ninf = __int_as_float(0xff800000);
     if (m == ninf) {   // every row is masked
         if (tid == 0) {
-            *out_id = map ? (map[0] < 0 ? 0 : map[0]) : 0;
-            if (out_prob) *out_prob = 1.0f;
+            if constexpr (MAPPED) *out_id = map[0] < 0 ? 0 : map[0];
+            else *out_id = 0;
+            if constexpr (PROB) *out_prob = 1.0f;
         }
         return 0;
     }
@@ -293,8 +305,9 @@ __device__ __forceinline__ int collect(Final& f, int n_tiles, const int32_t* __r
 }
 
 // Warp 0, after f.ex holds the n listed rows' exact scores: the largest exact score (the lowest row on a tie) is the
-// pick; its probability, when out_prob is given, is the tiles' softmax sums with the rescored rows' approximate terms
-// swapped for exact ones.
+// pick; with PROB its probability is the tiles' softmax sums with the rescored rows' approximate terms swapped for exact
+// ones.
+template <bool MAPPED, bool PROB>
 __device__ __forceinline__ void pick(const Final& f, int n, int n_tiles, const int32_t* __restrict__ map,
                                      const float2* __restrict__ part, int* __restrict__ out_id,
                                      float* __restrict__ out_prob) {
@@ -310,9 +323,8 @@ __device__ __forceinline__ void pick(const Final& f, int n, int n_tiles, const i
         const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
         if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
     }
-    const int row = bi < 0x7fffffff ? bi : 0;
-    if (!out_prob) {
-        if (lane == 0) *out_id = map ? map[row] : row;
+    if constexpr (!PROB) {
+        if (lane == 0) *out_id = bi < 0x7fffffff ? (MAPPED ? map[bi] : bi) : (MAPPED ? map[0] : 0);
         return;
     }
     float sum = 0.0f;
@@ -327,7 +339,8 @@ __device__ __forceinline__ void pick(const Final& f, int n, int n_tiles, const i
         float one = 0.0f;   // the pick's own term is exactly 1
         for (int c = 0; c < n; ++c) if (f.list[c] == bi) one = 1.0f;
         sum = fmaxf(sum, one);
-        *out_id = map ? map[row] : row;
+        if constexpr (MAPPED) *out_id = map[bi < 0x7fffffff ? bi : 0];
+        else *out_id = bi < 0x7fffffff ? bi : 0;
         *out_prob = 1.0f / sum;
     }
 }
