@@ -86,7 +86,8 @@ bool parse_depth(const std::string& s, long long& tokens);
 void set_arg(std::vector<std::string>& args, const std::string& flag, const std::string& value);
 bool has_arg(const std::vector<std::string>& args, const std::string& flag);
 std::string arg_value(const std::vector<std::string>& args, const std::string& flag);
-/// FLAG [VALUE] words added to `args`: a flag already there takes the new value, else both are appended.
+/// FLAG [VALUE] words added to `args`: a flag already there takes the new value, else both are appended; a flag whose
+/// every value the engine keeps (`--exp`, `--control-vector`, `--image`, ...) is appended each time.
 void merge_args(std::vector<std::string>& args, const std::vector<std::string>& add);
 
 /// The engine's own error lines from its log, else the last few lines.
