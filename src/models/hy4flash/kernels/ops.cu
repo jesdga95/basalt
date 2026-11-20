@@ -203,38 +203,39 @@ __global__ void add_kernel(const float* __restrict__ a, const float* __restrict_
     if (i < n) out[i] = a[i] + b[i];
 }
 
-// one row a block of 512: f = a + b, its RMS over the row exactly as rms_norm_rows takes it (same threads, same sums), then
-// hc_post's four streams from f * inv * w, each value computed as the three kernels compute it, so the result is theirs bit
-// for bit
-__global__ void add_norm_hc_post_kernel(const float* __restrict__ a, const float* __restrict__ b, const float* __restrict__ w,
-                                        float eps, const float* __restrict__ x, const float* __restrict__ coef, int coef_stride,
-                                        int E, float* __restrict__ out) {
-    __shared__ float red[32];
+// row blockIdx.x by blocks of 512, blockIdx.y the slice of the row's float4 groups this block writes: every block takes
+// f = a + b and its RMS over the whole row exactly as rms_norm_rows takes it (same threads, same sums, so every block has the
+// same bits), then hc_post's four streams of its slice from f * inv * w, each value computed as the three kernels compute it,
+// so the result is theirs bit for bit
+template <int E>
+__global__ void __launch_bounds__(512) add_norm_hc_post_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                                                               const float* __restrict__ w, float eps, const float* __restrict__ x,
+                                                               const float* __restrict__ coef, int coef_stride, float* __restrict__ out) {
+    static_assert(E % 512 == 0, "each of the 512 threads takes whole values");
+    constexpr int kPer = E / 512, n4 = E / 4;
+    __shared__ float red[16];
     const int t = blockIdx.x;
     const float* ar = a + (size_t) t * E;
     const float* br = b ? b + (size_t) t * E : nullptr;
-    float ss = 0.0f;
-    for (int c = threadIdx.x; c < E; c += blockDim.x) {
-        const float f = br ? ar[c] + br[c] : ar[c];
-        ss = fmaf(f, f, ss);
-    }
-    {   // block_sum of rms_norm_rows
-        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    float f[kPer];   // all of a thread's values in flight at once, summed in rms_norm_rows' order below
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-        __syncthreads();
-        if (lane == 0) red[warp] = ss;
-        __syncthreads();
-        float s = 0.0f;
-        for (int i = 0; i < nw; ++i) s += red[i];
-        ss = s;
-    }
+    for (int j = 0; j < kPer; ++j) f[j] = br ? ar[threadIdx.x + 512 * j] + br[threadIdx.x + 512 * j] : ar[threadIdx.x + 512 * j];
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) ss = fmaf(f[j], f[j], ss);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);   // block_sum of rms_norm_rows
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    ss = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) ss += red[i];
     const float inv = rsqrtf(ss / (float) E + eps);
     const float* cf = coef + (size_t) t * coef_stride;
     const float* xr = x + (size_t) t * 4 * E;
     float* orow = out + (size_t) t * 4 * E;
-    const int n4 = E >> 2;
-    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+    const int chunk = (n4 + (int) gridDim.y - 1) / (int) gridDim.y, i1 = min(n4, ((int) blockIdx.y + 1) * chunk);
+    for (int i = (int) blockIdx.y * chunk + threadIdx.x; i < i1; i += 512) {
         const int c = 4 * i;
         float4 f4 = make_float4(ar[c], ar[c + 1], ar[c + 2], ar[c + 3]);
         if (br) f4 = make_float4(f4.x + br[c], f4.y + br[c + 1], f4.z + br[c + 2], f4.w + br[c + 3]);
@@ -259,7 +260,11 @@ __global__ void add_norm_hc_post_kernel(const float* __restrict__ a, const float
 
 void add_norm_hc_post(const float* a, const float* b, const float* w, float eps, const float* x, const float* coef, int coef_stride,
                       int n_tokens, int E, float* out, void* stream) {
-    add_norm_hc_post_kernel<<<n_tokens, 512, 0, (cudaStream_t) stream>>>(a, b, w, eps, x, coef, coef_stride, E, out);
+    if (E != 3072) throw std::invalid_argument("add_norm_hc_post: the model's width is 3072");
+    // a decode window's few rows spread over 4 blocks each (one round of loads a thread, on 4x the SMs); a prompt chunk's rows
+    // fill the card already, so a block takes a whole row and the norm is read once a row
+    const unsigned slices = n_tokens <= 8 ? 4 : 1;
+    add_norm_hc_post_kernel<3072><<<dim3((unsigned) n_tokens, slices), 512, 0, (cudaStream_t) stream>>>(a, b, w, eps, x, coef, coef_stride, out);
 }
 
 // a sliding-window layer's row spans from the window's first position, read on the card (so a captured graph replays them for any

@@ -130,8 +130,8 @@ void add_vectors(const float* a, const float* b, float* out, int n, void* stream
 /// them: meta[t] = max(0, pos + 1 - window), meta[arows + t] = pos + 1 - first, meta[2 arows + t] = 0, meta[3 arows + t] = pos.
 void swa_meta(const int32_t* pos0, int R, int window, int arows, int32_t* meta, void* stream);
 /// A sublayer's end in one launch: f = a + b (the MoE's routed and shared outputs; b null: f = a, the attention's output), its
-/// rms_norm_rows by `w`, then hc_post of f into the four streams of `x` by `coef` (n_tokens rows of E, E a multiple of 4):
-/// add_vectors, rms_norm_rows and hc_post bit for bit.
+/// rms_norm_rows by `w`, then hc_post of f into the four streams of `x` by `coef` (n_tokens rows of E = 3072, the model's width):
+/// add_vectors, rms_norm_rows and hc_post bit for bit, whatever n_tokens.
 void add_norm_hc_post(const float* a, const float* b, const float* w, float eps, const float* x, const float* coef, int coef_stride,
                       int n_tokens, int E, float* out, void* stream);
 
