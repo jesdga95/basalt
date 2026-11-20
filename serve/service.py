@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterator
 
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy, WakeBlocked
+from serve.engine.console import engine_facts, hardware_view
 from serve.engine.mock import Engine
 from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util import vram
@@ -744,6 +745,7 @@ class Service:
             last = {k: dict(v) for k, v in self.slot_last.items()}
         reading = [i for i, (st, _) in by_slot.items() if st.get("first_token") is None]
         progress = getattr(self.engine, "progress", None)
+        console = getattr(self.engine, "console", None)
         rows = []
         for i in range(total):
             held = dict(last.get(i, {}))
@@ -754,7 +756,10 @@ class Service:
                    "api": None, "model": None, "tok_s": 0.0, "generated": 0, "max_tokens": None, "prompt_tokens": 0,
                    "prefill_done": 0, "reused": None, "ttft_s": None, "draft_len": None,
                    "ctx_used": held.get("ctx", 0), "drafts_offered": held.get("offered"),
-                   "drafts_accepted": held.get("accepted")}       # draft counts are the slot's last finished request's
+                   "drafts_accepted": held.get("accepted"),       # draft counts are the slot's last finished request's
+                   "started": None, "path": None, "prompt_ms": None,
+                   # the engine's own figures of the slot's current or last request (STATS)
+                   **(console.slot(i) if console is not None else {"accept_pos": None, "accept_hist": None, "hit": None})}
             if view:
                 row["ctx_used"] = view[i]["held"]
             if i in by_slot:
@@ -770,7 +775,8 @@ class Service:
                            prompt_tokens=prompt, prefill_done=done, ctx_used=prompt + gen, reused=st.get("reused"),
                            ttft_s=round(st["first_token"] - st["started"], 2) if decoding and st.get("started")
                            else None,
-                           draft_len=round(win_tokens / windows, 2) if windows else None)
+                           draft_len=round(win_tokens / windows, 2) if windows else None,
+                           started=st.get("started"), path=st.get("path"), prompt_ms=st.get("prompt_ms"))
             rows.append(row)
         return rows, queue
 
@@ -823,6 +829,7 @@ class Service:
         info = dict(getattr(self.engine, "info", {}) or {})
         experts_total = info.get("spill_total")          # every routed (layer, expert) pair, on the SSD or not
         spill = spill_of(info)
+        cards, l3 = engine_facts(info)
         # a start under way reads 0; the last READY's context stands in until the new one arrives
         engine = {"model": self.model, "max_context": self.engine.max_context or getattr(self.engine, "known_ctx", 0), **info,
                   "spill": spill, "expert_total": experts_total if isinstance(experts_total, int) else None}
@@ -831,9 +838,12 @@ class Service:
         with self.status_lock:
             self._drop_stale_best()
             best = {k: dict(v) for k, v in self.best.items()}
+        console = getattr(self.engine, "console", None)
         return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
+                "experts_map": console.expert_map() if console is not None else None,
                 "totals": totals, "conversation": dict(getattr(self.engine, "conversation", None) or {}),
-                "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+                "hardware": hardware_view(tel["now"], tel["static"], info, cards, l3), "hardware_static": tel["static"],
+                "history": tel["history"]}
 
     def _drop_stale_best(self) -> None:
         """A best is a fact about the engine that produced it: a restarted engine (another model, other flags, a
@@ -1165,6 +1175,10 @@ class Service:
                 s["run_windows"], s["run_tokens"] = run_windows()
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
+                # the read time as the engine's last progress line has it; its DONE line gives the exact one later
+                progress = getattr(self.engine, "prompt_progress", None)
+                ms = (progress() or {}).get("ms") if callable(progress) else None
+                s["prompt_ms"] = round(ms, 1) if isinstance(ms, (int, float)) else s.get("prompt_ms")
             (self.rate if rate is None else rate).append((time.time(), n))   # live rate window
             for ev in evs:
                 if ev.kind == "reasoning":
@@ -1353,6 +1367,7 @@ class Service:
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
+                                  path=path, prompt_ms=None,
                                   max_tokens=max_new, slot=None, reused=None, thread=threading.get_ident(),
                                   api="anthropic" if path == "/v1/messages" else "openai",
                                   model=getattr(self.request_ctx, "model", None) or self.model)
@@ -1527,6 +1542,9 @@ class Service:
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
                             prompt_ms0 = run_last.get("prompt_ms")    # the prompt is read in that run only
+                            if prompt_ms0 is not None:
+                                with self.status_lock:
+                                    st["prompt_ms"] = prompt_ms0
                         if drained and capped and not wrap and n - n_pass0 >= cap and n < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and thought >= budget and not parser.buf and not detok.pending():
                                 wrap = True             # the budget's last token: close the thinking
