@@ -1484,6 +1484,41 @@ int check_mxfp4(int gu, int seed) {
                     ggml_type_name((ggml_type) gu), (long long) HD, (long long) FD, f.bytes, e, maxabs(got, ref),
                     eq, maxabs(got, ref_q), ok ? "ok" : "FAIL");
         if (!ok) ++failures;
+        // microbench (informational, pass/fail stands on its own): the down rows at this shape, the same Q8_0 h,
+        // one thread, 50 calls of the whole product: ggml's scalar fallback timed once, each SIMD build of the dot
+        // against that one number.
+        {
+            const ggml_vec_dot_t simd[2] = {cpu::cpu_avx2_ok() ? ggml_get_type_traits_cpu_avx2(GGML_TYPE_MXFP4)->vec_dot
+                                                                : nullptr,
+                                            cpu::cpu_avx512_ok() ? ggml_get_type_traits_cpu_avx512(GGML_TYPE_MXFP4)
+                                                                            ->vec_dot
+                                                                         : nullptr};
+            const char* simd_n[2] = {"avx2", "avx512"};
+            const double dbytes = (double) (f.bytes - f.down_off);
+            float sink = 0.0f;
+            const int it = 50;
+            const auto g0 = std::chrono::steady_clock::now();
+            for (int t = 0; t < it; ++t)
+                for (int64_t r = 0; r < HD; ++r) {
+                    const uint8_t* dr = blob.data() + f.down_off + (size_t) r * f.d_row;
+                    for (int k = 0; k < NT2; ++k) ggml_vec_dot_mxfp4_q8_0_ref((int) FD, &sink, dr, hp[k]);
+                }
+            const auto g1 = std::chrono::steady_clock::now();
+            const double usg = std::chrono::duration<double, std::micro>(g1 - g0).count() / it;
+            for (int i = 0; i < 2; ++i) {
+                if (simd[i] == nullptr) continue;
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int t = 0; t < it; ++t)
+                    for (int64_t r = 0; r < HD; ++r) {
+                        const uint8_t* dr = blob.data() + f.down_off + (size_t) r * f.d_row;
+                        for (int k = 0; k < NT2; ++k) simd[i]((int) FD, &sink, 0, dr, 0, hp[k], 0, 1);
+                    }
+                const auto t1 = std::chrono::steady_clock::now();
+                const double usn = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
+                std::printf("down %d tokens one thread: %s %.0f us (%.2f GB/s) vs ggml %.0f us (%.2f GB/s)\n",
+                            NT2, simd_n[i], usn, dbytes / usn / 1e3, usg, dbytes / usg / 1e3);
+            }
+        }
     }
     return failures;
 }

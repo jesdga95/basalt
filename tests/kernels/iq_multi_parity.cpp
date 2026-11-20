@@ -20,7 +20,8 @@
 // bytes 0x7F, 0xFF, bit 7 set, 0 and subnormals), all of which every path must decode alike.
 //
 // MXFP4 is checked as a down format only: its blocks take E8M0 scale bytes in the packs' range (118..123), and
-// the double reference dequantizes its down weights with basalt::dequantize_mxfp4.
+// the double reference dequantizes its down weights with basalt::dequantize_mxfp4.  Its GPU dequantizer is also
+// checked bitwise against that host port at the E8M0 exponent edges.
 //
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
@@ -161,6 +162,36 @@ std::vector<float> mxfp4_dequant_host(const uint8_t* w, int64_t rows, int64_t n)
     for (int64_t b = 0; b < rows * (n / 32); ++b)
         basalt::dequantize_mxfp4(w + (size_t) b * 17, v.data() + (size_t) b * 32);
     return v;
+}
+
+// The GPU MXFP4 dequantizer against the host port at the E8M0 exponent edges: blocks whose scale byte takes each
+// of 0, 1, 2, 3, 127, 128, 253, 254, 255 (the denormal codes, the unit scale and the top of the range, where 255
+// decodes to the largest finite fp32, 2^127, in both), several blocks each with random 4-bit codes, compared bitwise.
+void check_mxfp4_edge_scales(cudaStream_t s, std::mt19937& rng) {
+    const uint8_t exps[] = {0, 1, 2, 3, 127, 128, 253, 254, 255};
+    const int per = 8, n_blocks = (int) (sizeof exps / sizeof *exps) * per;
+    std::vector<uint8_t> w((size_t) n_blocks * 17);
+    std::uniform_int_distribution<int> byte(0, 255);
+    for (int b = 0; b < n_blocks; ++b) {
+        w[(size_t) b * 17] = exps[b / per];
+        for (int j = 1; j < 17; ++j) w[(size_t) b * 17 + j] = (uint8_t) byte(rng);
+    }
+    const int64_t n = (int64_t) n_blocks * 32;
+    uint8_t* dw = dalloc<uint8_t>(w.size());
+    ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "edge w");
+    float* dwf = dalloc<float>((size_t) n);
+    k::iq_dequant_f32(39, dw, n, dwf, s);
+    ck(cudaStreamSynchronize(s), "edge dequant");
+    std::vector<float> got((size_t) n);
+    ck(cudaMemcpy(got.data(), dwf, got.size() * 4, cudaMemcpyDeviceToHost), "edge got");
+    const auto want = mxfp4_dequant_host(w.data(), 1, n);
+    size_t diff = 0;
+    for (size_t i = 0; i < got.size(); ++i) diff += std::memcmp(&got[i], &want[i], 4) != 0;
+    std::printf("MXFP4    E8M0 edge exponents 0,1,2,3,127,128,253,254,255: GPU dequantizer vs host port: %zu of %zu "
+                "values differ\n", diff, got.size());
+    if (diff != 0) ++g_fail;
+    cudaFree(dw);
+    cudaFree(dwf);
 }
 
 // q8_1 blocks (fp16 scale, fp16 sum, 32 int8) back to floats
@@ -430,7 +461,8 @@ void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, st
     std::vector<float> wg((size_t) FF * H), wu((size_t) FF * H), wd;
     std::vector<float> hf((size_t) FF);
     std::vector<double> hq((size_t) FF);
-    double o_abs = 0, o_num = 0, o_den = 0, o_mrel = 0, r_abs = 0, r_num = 0, r_den = 0, r_mrel = 0, r_maxref = 0;
+    double o_abs = 0, o_num = 0, o_den = 0, o_mrel = 0, r_abs = 0, r_num = 0, r_den = 0, r_mrel = 0, r_maxref = 0,
+           r_entrel = 0;
     size_t dq_diff = 0;
     const auto mrel = [](double err, double ref) {
         return ref == 0.0 ? (err == 0.0 ? 0.0 : 1e300) : err / std::fabs(ref);
@@ -478,6 +510,7 @@ void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, st
                     hq[(size_t) b32 * 32 + j] = ds * q;
                 }
             }
+            double ent_err = 0, ent_ref = 0;   // the entry's max |err| and max |ref| over its H outputs, for the per-entry bound
             for (int64_t r = 0; r < H; ++r) {
                 const float* wr = wd.data() + (size_t) r * FF;
                 double acc = 0;
@@ -491,16 +524,19 @@ void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, st
                 r_abs = std::max(r_abs, er); r_num += er; r_den += std::fabs(acc);
                 r_maxref = std::max(r_maxref, std::fabs(acc));
                 r_mrel = std::max(r_mrel, mrel(er, acc));
+                ent_err = std::max(ent_err, er); ent_ref = std::max(ent_ref, std::fabs(acc));
             }
+            r_entrel = std::max(r_entrel, mrel(ent_err, ent_ref));
         }
     }
     const double rel_o = o_num / (o_den + 1e-30), rel_r = r_num / (r_den + 1e-30);
-    const bool ok = diff == 0 && finite && !(rel_r >= 1e-2);
+    const bool ok = diff == 0 && finite && !(rel_r >= 1e-2) && r_entrel <= 1e-2;
     std::printf("%-8s/%-7s %5lld x %4lld  grouped vs double, %d groups, %d entries: %s\n", name_of(gu), name_of(dt),
                 (long long) H, (long long) FF, G.n_groups, G.n_ent,
                 ok ? "bitwise equal to the old kernels, within 1e-2 of the reference" : "FAIL");
     std::printf("  old kernel: max abs %.2e, rel %.2e, max rel %.2e   double reference: max abs %.2e, rel %.2e, "
-                "max rel %.2e, max |ref| %.2e\n", o_abs, rel_o, o_mrel, r_abs, rel_r, r_mrel, r_maxref);
+                "max rel %.2e, max |ref| %.2e, worst entry rel %.2e\n", o_abs, rel_o, o_mrel, r_abs, rel_r, r_mrel,
+                r_maxref, r_entrel);
     if (dt == 39) {
         std::printf("  MXFP4 down GPU dequantizer vs host port: %zu of %zu values differ\n", dq_diff,
                     (size_t) G.n_groups * FF * H);
@@ -707,6 +743,7 @@ int main(int argc, char** argv) {
     // the UD file's real pairs at its real expert shape: bitwise, and against the double reference
     for (auto [gu, dt] : {std::pair<int, int>{16, 39}, {17, 39}, {22, 39}, {18, 21}, {22, 21}})
         check_grouped_ref(gu, dt, 5120, 2304, s, rng);
+    check_mxfp4_edge_scales(s, rng);   // the MXFP4 dequantizer at the E8M0 exponent edges
     check_mmvq(21, 2304, 67, s, rng);                                       // IQ3_S rows at the down row length
     check_mmvq_mma(s, rng);
     check_q8_1_finite(s, rng);
