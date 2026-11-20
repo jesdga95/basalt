@@ -4,7 +4,8 @@
 // each say "these bytes of the file land there", with an optional elementwise conversion on the way.  The Loader moves
 // the bytes: unbuffered reads on a pool of threads, straight into host memory where the destination allows it and
 // through pinned staging with asynchronous copies on per-device streams where it is device memory, so the drive, the
-// bus and the conversion overlap.  Every byte placed adds to the one progress counter (load_progress.hpp).
+// bus and the conversion overlap.  Every byte placed adds to the one progress counter and to its destination's share
+// (load_progress.hpp).
 //
 // An item may instead copy bytes the same plan places (a second home of an expert, a stage's image of weights already on
 // a card): the loader runs those after every file read of the plan is complete, so one run is one pass over the file.
@@ -19,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace basalt::core {
@@ -87,6 +89,10 @@ public:
     bool empty() const { return items_.empty() && steps_.empty(); }
     /// The bytes the bar counts for the whole plan.
     uint64_t counted() const;
+    /// The bytes the bar counts per destination, in the order a start places them: each card the plan writes
+    /// (`cuda<N>`, `main_card` first, then the others by ordinal), then `ram` when it writes host memory.  A destination
+    /// the plan writes is listed even when it counts nothing; the bytes sum to counted().
+    std::vector<std::pair<std::string, uint64_t>> counted_by_target(int main_card) const;
 
 private:
     std::vector<File> files_;
