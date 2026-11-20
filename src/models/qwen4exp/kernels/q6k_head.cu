@@ -282,7 +282,8 @@ __global__ void __launch_bounds__(128) proxy_score_kernel(const uint4* __restric
                                                          const px::X81* __restrict__ x, int n_rows,
                                                          const int32_t* __restrict__ map, float2* __restrict__ cand,
                                                          float2* __restrict__ part) {
-    px::score_tile<kProxyIn>((int) blockIdx.x, wq, sc, x, n_rows, map, cand, part);
+    __shared__ px::ScoreShared<kProxyIn> sh;
+    px::score_tile<kProxyIn, true>(sh, (int) blockIdx.x, wq, sc, x, n_rows, map, cand, part);
 }
 
 // One row's logit by one warp, in q6k_rows' order (the same bits as its one-column result).
@@ -340,7 +341,7 @@ __global__ void __launch_bounds__(512) q6k_proxy_final_kernel(const Q6KBlock* __
         xe[i] = make_int2(__ldg(reinterpret_cast<const int*>(blk->qs) + pos),
                           __float_as_int(__low2float(*reinterpret_cast<const half2*>(&dsb))));
     }
-    const int n = px::collect(f, n_tiles, map, cand, out_id, out_prob);
+    const int n = px::collect<true, true>(f, n_tiles, map, cand, out_id, out_prob);
     if (n == 0) return;
     for (int c = warp; c < n; c += 16) {
         const int r = f.list[c];
@@ -349,7 +350,7 @@ __global__ void __launch_bounds__(512) q6k_proxy_final_kernel(const Q6KBlock* __
     }
     __syncthreads();
     if (warp != 0) return;
-    px::pick(f, n, n_tiles, map, part, out_id, out_prob);
+    px::pick<true, true>(f, n, n_tiles, map, part, out_id, out_prob);
 }
 
 // ---- the verify head: a 2-bit copy of every row scored on the tensor cores, then exact rescoring near the top

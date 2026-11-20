@@ -41,7 +41,8 @@ __global__ void __launch_bounds__(128) proxy_score_kernel(const uint4* __restric
                                                          const px::X81* __restrict__ x, int n_rows,
                                                          const int32_t* __restrict__ map, float2* __restrict__ cand,
                                                          float2* __restrict__ part) {
-    px::score_tile<kProxyIn>((int) blockIdx.x, wq, sc, x, n_rows, map, cand, part);
+    __shared__ px::ScoreShared<kProxyIn> sh;
+    px::score_tile<kProxyIn, true>(sh, (int) blockIdx.x, wq, sc, x, n_rows, map, cand, part);
 }
 
 // One thread per 32-weight group: the group's Q8_0 values fitted into the copy (head_proxy.cuh).
@@ -122,7 +123,7 @@ __global__ void __launch_bounds__(512) q80_proxy_final_kernel(const uint8_t* __r
     pdl_wait();
     if (tid == 0) f.cnt = 0;
     load_xe(x, xe);
-    const int n = px::collect(f, n_tiles, map, cand, out_id, out_prob);
+    const int n = px::collect<true, true>(f, n_tiles, map, cand, out_id, out_prob);
     if (n == 0) return;
     auto row_of = [&](int c) { const int r = f.list[c]; return w + (size_t) (by_map ? __ldg(map + r) : r) * RB; };
     q80p::Quarter cur[kNch], nxt[kNch];
@@ -136,7 +137,7 @@ __global__ void __launch_bounds__(512) q80_proxy_final_kernel(const uint8_t* __r
     }
     __syncthreads();
     if (warp != 0) return;
-    px::pick(f, n, n_tiles, map, part, out_id, out_prob);
+    px::pick<true, true>(f, n, n_tiles, map, part, out_id, out_prob);
 }
 
 // ---- every row of a subset through a row map
