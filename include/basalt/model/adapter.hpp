@@ -230,6 +230,17 @@ public:
     /// read from the file.
     struct ExpertCounts { int64_t hits = 0, lookups = 0, offloaded = 0, files = 0; };
     virtual ExpertCounts expert_counts() const { return {}; }
+    /// The experts each GPU holds now (CUDA ordinal, slots, their VRAM bytes); empty without routed experts.
+    struct CardExperts { int device = 0; int64_t slots = 0; uint64_t bytes = 0; };
+    virtual std::vector<CardExperts> experts_by_card() const { return {}; }
+    /// The VRAM the session's KV cache takes on its card now; -1 when the session does not say.
+    virtual int64_t kv_bytes() const { return -1; }
+    /// The server's expert map (core/expert_map.hpp): the sample's pairs of `total`, each one's home (core::ExpertHome) and its
+    /// decode lookups since the last call; the first call starts the counting. False without routed experts.
+    virtual bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+        (void) total; (void) homes; (void) routed;
+        return false;
+    }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
     /// An elastic KV's ceiling (core/elastic_kv.hpp): the positions the session can back before the expert cache would go below

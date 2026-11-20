@@ -237,6 +237,23 @@ public:
         std::printf("INFO elastic_kv_ceiling=%lld\n", (long long) n);
         std::fflush(stdout);
     }
+    LookupCounts lookup_counts() override {
+        const basalt::model::ModelSession::ExpertCounts c = sessions_[0]->expert_counts();
+        return {c.hits, c.lookups, c.offloaded, c.files};
+    }
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        return sessions_[0]->expert_map(total, homes, routed);
+    }
+    std::vector<CardFacts> card_facts() override {
+        std::vector<CardFacts> out;
+        for (const basalt::model::ModelSession::CardExperts& c : sessions_[0]->experts_by_card())
+            out.push_back({c.device, c.slots, 0.0, c.bytes, out.empty() ? -1 : 0});
+        // every session's KV is on the main card; a second card holds experts only
+        int64_t kv = 0;
+        for (const auto& s : sessions_) kv = kv < 0 || s->kv_bytes() < 0 ? -1 : kv + s->kv_bytes();
+        if (!out.empty()) out[0].kv_bytes = kv;
+        return out;
+    }
     bool capture_admit(uint64_t need, uint64_t floor) override {
         return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
                basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
@@ -767,6 +784,7 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
     ++sl.windows;
     std::string line = "BT " + std::to_string(b);
     const char* fin = nullptr;
+    const int64_t sent0 = sl.produced;
     if (sl.lp_top >= 0) {   // the kept rows' logprobs, read before the drafts touch the head
         lp_rows.resize((size_t) (a + 1) * basalt::kernels::kLogprobStride);
         if (const basalt::model::Result r = session().row_logprobs(0, a + 1, out_.data(), sl.lp_top, lp_rows.data()); !r.ok())
@@ -787,6 +805,7 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
         fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
     }
     if (grammar_dead) fin = "error";
+    stats_window(b, T - 1, a, (int) (sl.produced - sent0));
     sl.n_dr = 0;
     w.a = a;
     w.line = line;
@@ -851,8 +870,10 @@ bool SessionRuntime::next_batch_window() {
             set_active(b);
             w.round0 = Clock::now();
             slot_window_begin(b, w, 1 << 20);
+            stats_lookups_begin();
             if (const basalt::model::Result r = session().decode_window(w.d); !r.ok()) return failed(r.message);
             if (!slot_window_finish(b, w)) return false;
+            stats_lookups_end();
         }
         set_active(0);
         return true;
@@ -867,6 +888,7 @@ bool SessionRuntime::next_batch_window() {
     }
     for (const std::vector<size_t>& group : batch_groups(rows, cap)) {
         const Clock::time_point t0 = Clock::now();
+        stats_lookups_begin();
         if (group.size() == 1) {
             if (const basalt::model::Result r = sessions_[(size_t) act[group[0]]]->decode_window(wins[group[0]].d); !r.ok()) return failed(r.message);
         } else {
@@ -899,6 +921,7 @@ bool SessionRuntime::next_batch_window() {
             if (!r.ok() && r.status != basalt::model::Status::NotImplemented) return failed(r.message);
             for (const size_t i : group) wins[i].drafting = r.ok() && wins[i].want > 0;
         }
+        stats_lookups_end();
         for (const size_t i : group)
             if (!slot_window_end(act[i], wins[i])) return false;
     }

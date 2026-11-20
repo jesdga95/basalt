@@ -11,6 +11,7 @@
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/expert_map.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/ram_load.hpp"
@@ -245,6 +246,13 @@ public:
 
     /// The VRAM slots open now, every layer's.
     int64_t slots() const { return live_base() + (int64_t) n_layers_ * ext_per_layer_; }
+    /// The experts the GPUs hold now: the main card's (the caller's device) and each second card's slots and the VRAM their
+    /// slots take; and the slots' sum, what the engine reports as its expert slots.
+    struct CardSlots { int device = 0; int64_t slots = 0; uint64_t bytes = 0; };
+    std::vector<CardSlots> slots_by_card() const;
+    int64_t gpu_slots() const;
+    /// The bytes of the pinned RAM tier's places, every layer's.
+    uint64_t ram_bytes() const;
 
     /// The lossy routing flags (ExpertTierSpec::route_*) this tier applies: 0 when off, or when every expert is held by a
     /// GPU (attach switches them off then, as nothing would be skipped and a bonus for every expert changes a biased choice).
@@ -271,6 +279,9 @@ public:
     int64_t file_lookups() const { return file_hits_; }
     /// The experts only the file holds.
     program::ExpertSpill spill() const;
+    /// The server's expert map: the sample's pairs of all, each one's home and its lookups since the last call (the first
+    /// call starts counting them).
+    void expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed);
     /// What `PROBE rates` measures: this tier's pool, RAM blobs, formats and second card.
     void probe_env(program::ProbeEnv& env);
 
@@ -436,6 +447,7 @@ private:
     unsigned long long* route_counts_ = nullptr;
     float* zero_row_ = nullptr;
 
+    core::ExpertMapTally map_;              ///< the expert map's sample, counted from the first expert_map()
     int64_t hits_ = 0, cpu_ = 0, ram_hits_ = 0, promoted_ = 0, fetched_ = 0, dropped_ = 0, peer_hits_ = 0, file_hits_ = 0;
 };
 

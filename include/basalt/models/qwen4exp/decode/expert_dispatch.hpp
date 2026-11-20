@@ -1,6 +1,7 @@
 // basalt/models/qwen4exp/decode/expert_dispatch.hpp - the pool's side of a layer: its state and its entry points.
 #pragma once
 
+#include "basalt/core/expert_map.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
@@ -121,6 +122,8 @@ struct ExpertDispatch {
     /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).
     PeerExperts* peer = nullptr;
     int64_t peer_entries = 0;      ///< routed entries the peer served in verify windows
+    /// The server's expert map: the sample's routed entries in verify windows (counted once the server asks for it).
+    ExpertMapTally map;
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
     /// where a source failure surfaces: the driver checks it after `session_loop` returns rather than the
     /// engine computing from a half-filled `parts`.

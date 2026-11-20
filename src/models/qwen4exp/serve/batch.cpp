@@ -234,6 +234,7 @@ bool QfnRuntime::batch_step() {
         bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
     }
     const Clock::time_point w0 = Clock::now();
+    stats_lookups_begin();
     if (!ver.run_slot_segs(rows, lens, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
         std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
         return false;
@@ -344,6 +345,7 @@ bool QfnRuntime::batch_step() {
             p0s[sg] = sl.p;
         }
         ++sl.windows;
+        stats_window(b, real ? lens[sg] - 1 : 0, real ? k - 1 : 0, k);
         if (bdigest) {
             uint64_t part[10] = {};
             slot_digest(b, sl.p + k, part);
@@ -365,6 +367,7 @@ bool QfnRuntime::batch_step() {
         }
     }
     std::fflush(stdout);
+    stats_lookups_end();
     const Clock::time_point w3 = Clock::now();
     bt_emit += msd(w2, w3);
     if (real) {

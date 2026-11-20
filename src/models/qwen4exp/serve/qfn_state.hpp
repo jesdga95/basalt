@@ -156,6 +156,11 @@ public:
     int init_after_input() override;
     void after_input_start() override;
     void print_info() override;
+    /// The experts every card's cache and tier hold now: the engine's expert slots.
+    int64_t gpu_slots() const;
+    basalt::program::serve::LookupCounts lookup_counts() override;
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override;
+    std::vector<CardFacts> card_facts() override;
     void at_exit() override;
     bool windows_in_flight() override;
     bool next_batch_window() override;
