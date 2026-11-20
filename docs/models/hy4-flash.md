@@ -10,7 +10,8 @@ projector and the DFly2 drafter:
 
 - Routed experts: NVFP4, rounded once from BF16 (83.6 GB).
 - Attention, latent, shared-expert, dense-FFN, Engram and indexer projections and the token embedding: Q8_0 of the BF16 values.
-- Output head: BF16, as stored. Norms, hyper-connections, router and biases: F32, as stored.
+- Output head: BF16 in the file; the engine rounds it to Q8_0 as it loads. Norms, hyper-connections, router and biases: F32,
+  as stored.
 - Engram table: E4M3 codes, one byte per value, rounded once from BF16 (63.4 GB). It stays in the file and is read by row.
 - Vision projector (BF16, 1.0 GB) and the drafter (BF16 in the file, 1.7 GB), whole.
 
@@ -41,7 +42,7 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
   experts by the shipped routing profile `data/profiles/hy4flash-42x512.prof`, so the first request after a start finds the
   most routed ones resident. The early layers route more widely and get more of the main card's copies (layers 0 to 3 about
   1.4 times the mean, the quietest 0.73), the same total.
-- **Cards:** the main card holds the dense weights, the caches and the drafter (1.24 GiB). Up to three more cards
+- **Cards:** the main card holds the dense weights (6.76 GiB with the Q8_0 head), the caches and the drafter (0.87 GiB). Up to three more cards
   (`--gpu 0,1,2,3`) each hold the experts of one block of layers; later cards idle.
 - **Engram table:** read by row from the pack, so it takes no RAM of its own; the OS file cache keeps the hot rows.
 - **Context:** `--max-context` from 1,024 up to 1,048,576, default 8,192. The 12 sparse layers keep a row of every position;
@@ -84,11 +85,10 @@ draft policy picks the window by expected tokens per millisecond, as for DeepSee
 The drafter is five dense MLA layers that read target layers 25, 29, 33, 37 and 41: each attends the positions that target layer's
 indexer selected, in that layer's cache, so its cost does not grow with the context. It keeps no cache of its own, and
 the target checks every draft: output is plain decoding's ([precision](../precision/hy4-flash.md#drafting)). Its projections
-are rounded to Q8_0 as they load, and its drafts read a Q8_0 copy of the target's head
-(the target's own head stays BF16). It works with either `--kv`. The start line:
+are rounded to Q8_0 as they load, and its drafts read the target's own Q8_0 head. It works with either `--kv`. The start line:
 
 ```
-basalt hy4flash: drafter: 5 layers reading target layers 25..41, 1.24 GiB on the GPU (Q8_0 projections and the drafts' head)
+basalt hy4flash: drafter: 5 layers reading target layers 25..41, 0.87 GiB on the GPU (Q8_0 projections)
 ```
 
 ## Parallel slots

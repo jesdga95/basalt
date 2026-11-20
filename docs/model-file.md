@@ -177,8 +177,8 @@ python3 tools/convert/convert.py --verify Hy4-flash-NVFP4.basalt --gguf Hy4-flas
   bytes each; per matrix the tensor scale amax / (6 x 448), per 16 values the UE4M3 scale with the least squared error among half
   to four times amax / 6 (the 27B pack's rounding).
 - The BF16 projections (attention, latent, shared expert, dense FFN, Engram key/value, indexer, embedding) Q8_0 in ggml's reference
-  rounding; `--dense-q6k` makes the projections with whole 256-value rows Q6_K. The head stays BF16; norms, hc, router and biases
-  F32 as stored.
+  rounding; `--dense-q6k` makes the projections with whole 256-value rows Q6_K. The head stays BF16 (the engine rounds it to Q8_0 as it
+  loads); norms, hc, router and biases F32 as stored.
 - The Engram table: E4M3 codes (type 43), to nearest with ties to even, no scale; the exact fraction and RMS error go to
   `meta.quantized_from.engram`.
 - Tokenizer and chat template are the GGUF's, refused unless they equal `--hf-dir`'s. `vision/mmproj` and `dfly` hold the side files

@@ -252,8 +252,7 @@ public:
         if (!make_bufs(dec_, kMaxWindow, err)) return false;
         use(dec_);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
-        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, m_.dfly() ? (const uint16_t*) m_.tensor("output.weight")->ptr : nullptr,
-                        [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
+        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
             return false;
         return true;
     }
@@ -2332,7 +2331,7 @@ private:
             bk::rms_norm_rows(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, fin_, head_rows, E, g_.rms_eps, stream_);
             dfly_.hidden(R - head_rows, head_rows, fin_, stream_);   // DFLY HOOK
             const DevTensor* head = m_.tensor("output.weight");
-            bk::bf16_gemv_fp32_mmvf_multi(fin_, E, (const uint16_t*) head->ptr, logits_, g_.n_vocab, E, g_.n_vocab, head_rows, stream_);
+            gemm(head, fin_, logits_, E, g_.n_vocab, head_rows);
             if (!m_.diag_dump().empty()) {
                 dump("result_norm", fin_, (int64_t) head_rows * E);
                 dump("result_output", logits_, (int64_t) head_rows * g_.n_vocab);

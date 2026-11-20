@@ -20,6 +20,7 @@ namespace basalt::models::hy4flash {
 namespace {
 constexpr uint64_t kGiB = 1ull << 30;
 constexpr int kTypeQ8_0 = 8;
+constexpr int kTypeBF16 = 30;   // ggml's BF16
 // CPU uses of a missed expert that earn it a slot on the card
 constexpr int kAdmitUses = 2;
 // copies a decode window may claim per row (a window's rows route to mostly different experts)
@@ -155,6 +156,14 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         d.type = t.type;
         d.bytes = t.bytes;
         d.shape = t.shape;
+        // the output head: the pack's BF16 rows rounded to Q8_0 as they load, read by the target and the drafts alike
+        const bool head_q8 = name == "output.weight";
+        if (head_q8) {
+            if (t.type != kTypeBF16 || t.shape.size() != 2 || t.shape[0] % 32 != 0)
+                return {model::Status::Error, "hy4flash: output.weight is not BF16 rows of whole Q8_0 blocks"};
+            d.type = kTypeQ8_0;
+            d.bytes = t.shape[0] * t.shape[1] / 32 * 34;
+        }
         if (cudaMalloc(&d.ptr, d.bytes) != cudaSuccess) return {model::Status::Error, "hy4flash: out of device memory loading " + name};
         core::LoadItem it;
         it.file = file;
@@ -162,6 +171,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         it.bytes = t.bytes;
         it.dev = d.ptr;
         it.device = device_;
+        if (head_q8) it.conv = core::Conv::Bf16ToQ8_0;
         reads.add(it);
         dense += d.bytes;
         dev_.emplace(name, std::move(d));
@@ -173,6 +183,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     spec_ = req.spec;
     if (req.draft)
         if (model::Result r = dfly_plan(pack_, reads, file, device_, dfly_); !r.ok()) return r;
+    if (dfly_) dfly_->head_q8 = dev_.at("output.weight").ptr;   // the drafts read the target's own Q8_0 head
     // [vision] the image encoder staged before the context and the tier are sized: it holds no VRAM afterwards
     if (req.vision) {
         if (!vis_.stage(pack_.vision, g.n_embd, err)) return {model::Status::Error, "hy4flash: vision: " + err};

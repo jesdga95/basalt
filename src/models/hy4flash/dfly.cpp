@@ -21,7 +21,6 @@
 namespace basalt::models::hy4flash {
 namespace {
 namespace bk = basalt::kernels;
-constexpr int kTypeBF16 = 30;   // ggml's BF16
 }  // namespace
 
 // ---- weights ------------------------------------------------------------------------------------------------------------
@@ -86,23 +85,6 @@ bool DflyWeights::allocate(const DflyDims& d, std::string& err) {
     return true;
 }
 
-bool DflyWeights::allocate_head(int64_t vocab, int64_t E, std::string& err) {
-    if (E % 32 != 0) {
-        err = "the head's rows are not whole Q8_0 blocks";
-        return false;
-    }
-    const uint64_t b = (uint64_t) vocab * (uint64_t) E / 32 * 34;
-    void* p = nullptr;
-    if (cudaMalloc(&p, b) != cudaSuccess) {
-        err = "out of device memory for the drafts' head";
-        return false;
-    }
-    slots_["draft_head"] = p;
-    bytes_ += b;
-    head_q8 = p;
-    return true;
-}
-
 void* DflyWeights::slot(const std::string& name) const {
     auto it = slots_.find(name);
     return it == slots_.end() ? nullptr : it->second;
@@ -144,24 +126,7 @@ model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int d
         it.conv = s.f32 ? core::Conv::Bf16ToF32 : s.q8 ? core::Conv::Bf16ToQ8_0 : core::Conv::Copy;
         reads.add(it);
     }
-    // the drafts' head: the target's BF16 head rounded to Q8_0 as it loads (half the bytes a draft reads); the target
-    // verifies with the BF16 head, so a draft that rounds differently is only rejected, the output stays the same
-    const TensorRef* head = pack.find("output.weight");
-    if (!head || head->type != kTypeBF16 || head->shape.size() != 2 || head->shape[0] != (uint64_t) g.n_embd ||
-        head->shape[1] != (uint64_t) g.n_vocab)
-        return {model::Status::Error, "hy4flash: output.weight is not BF16 [n_embd][vocab]"};
-    if (!w->allocate_head(g.n_vocab, g.n_embd, err)) return {model::Status::Error, "hy4flash: " + err};
-    {
-        core::LoadItem it;
-        it.file = file;
-        it.off = head->offset;
-        it.bytes = head->bytes;
-        it.dev = const_cast<void*>(w->head_q8);
-        it.device = device;
-        it.conv = core::Conv::Bf16ToQ8_0;
-        reads.add(it);
-    }
-    basalt::log::info("basalt hy4flash", "drafter: %d layers reading target layers %d..%d, %.2f GiB on the GPU (Q8_0 projections and the drafts' head)", d.layers,
+    basalt::log::info("basalt hy4flash", "drafter: %d layers reading target layers %d..%d, %.2f GiB on the GPU (Q8_0 projections)", d.layers,
                       d.kv_layers.front(), d.kv_layers.back(), (double) w->bytes() / (double) (1ull << 30));
     out = std::move(w);
     return {};
@@ -495,12 +460,11 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
 
 DflyHook::~DflyHook() = default;
 
-bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16_t* head, std::function<bool(int32_t, float*)> embed,
+bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, std::function<bool(int32_t, float*)> embed,
                     const std::string& dump, bool fp8, std::string& err) {
     if (!w) return true;
     fp8_ = fp8;
     dump_ = dump;
-    head_ = head;
     embed_ = embed;
     w_ = w;
     ctx_ = ctx;
@@ -508,7 +472,6 @@ bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16
     if (!tap_) return false;
     DflyRunner::Env env;
     env.w = w;
-    env.head = head;
     env.embed = std::move(embed);
     env.sel_cap = sel_cap;
     env.fp8 = fp8;
@@ -573,9 +536,6 @@ model::Result DflyHook::draft_end(int32_t* ids, float* conf, int max_n, int& n, 
         wr("anchor_emb.f32", a.data(), a.size() * 4);
         wr("mask_emb.f32", m.data(), m.size() * 4);
         wr("tok.i32", tok, (size_t) made * 4);
-        std::vector<uint16_t> row((size_t) w_->dims.E);
-        cudaMemcpy(row.data(), head_ + (size_t) tok[0] * w_->dims.E, (size_t) w_->dims.E * 2, cudaMemcpyDeviceToHost);
-        wr("head_row0.bf16", row.data(), row.size() * 2);
         dump_pos_ = -1;
     }
     n = std::min(max_n, made);
