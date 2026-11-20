@@ -343,7 +343,7 @@ public:
             if (!t->reclaim(e)) return {model::Status::Error, e};
             t->grow();
         }
-        expert_slots = t->slots();
+        expert_slots = t->gpu_slots();
         return {};
     }
 
@@ -354,7 +354,7 @@ public:
         cudaStreamSynchronize(stream_);
         release_short_prompt();
         if (!t->replan(mib, e)) return {model::Status::Error, e};
-        expert_slots = t->slots();
+        expert_slots = t->gpu_slots();
         return {};
     }
 
@@ -376,11 +376,28 @@ public:
         return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
     }
 
+    std::vector<CardExperts> experts_by_card() const override {
+        std::string e;
+        const core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        std::vector<CardExperts> out;
+        if (t != nullptr)
+            for (const core::ExpertTier::CardSlots& c : t->slots_by_card()) out.push_back({c.device, c.slots, c.bytes});
+        return out;
+    }
+
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        std::string e;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        if (t == nullptr) return false;
+        t->expert_map(total, homes, routed);
+        return true;
+    }
+
     std::string info_words() const override {
         std::string e;
         core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         const std::string kv = m_.cache_format() == CacheFormat::Fp8 ? "kv=fp8+fp4" : "kv=fp16";
-        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill());
+        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->gpu_slots()) + " ram_experts_mib=" + std::to_string(t->ram_bytes() >> 20) + " " + kv + " " + program::spill_words(t->spill());
     }
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }

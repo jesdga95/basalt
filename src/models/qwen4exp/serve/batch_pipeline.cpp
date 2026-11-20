@@ -41,6 +41,7 @@ bool QfnRuntime::pump(bool may_start) {
             basalt::protocol::emit("BT %d %d\n", gi * GS + t, (int) y);
             ++sl.produced;
             ++sl.windows;   // a pipelined slot takes one row a window
+            stats_window(gi * GS + t, 0, 0, 1);   // (its lookups are its stages', not counted per slot)
             ++bt_rows;
             const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
             const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"

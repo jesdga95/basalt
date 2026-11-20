@@ -811,6 +811,7 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         }
         const size_t idx = (size_t) layer * n_expert_ + e;
         stamp_[idx] = now;
+        map_.note(layer, e);
         if (!looks_.empty()) core::policy::count_look(looks_[idx]);
         const int32_t s = res_[idx];
         lk.peer[i] = nullptr;
@@ -833,6 +834,40 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         }
     }
     return true;
+}
+
+std::vector<ExpertTier::CardSlots> ExpertTier::slots_by_card() const {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+    std::vector<CardSlots> out{{dev, slots(), (uint64_t) (cache_.mapped_bytes() + ext_.mapped_bytes())}};
+    for (const auto& p : peers_)
+        if (p) out.push_back({p->device(), p->cache().slots(), (uint64_t) p->cache().mapped_bytes()});
+    return out;
+}
+
+uint64_t ExpertTier::ram_bytes() const {
+    if (ram_.empty()) return 0;
+    uint64_t n = 0;
+    for (const ExpertTierSpec::Layer& l : s_.layers) n += (uint64_t) (cover_ + 1) * l.blob_bytes;
+    return n;
+}
+
+int64_t ExpertTier::gpu_slots() const {
+    int64_t n = slots();
+    for (const auto& p : peers_)
+        if (p) n += p->cache().slots();
+    return n;
+}
+
+void ExpertTier::expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+    if (!map_.is_open()) map_.open(n_layers_, n_expert_);
+    total = map_.total();
+    homes.clear();
+    for (const int32_t p : map_.pairs()) {
+        const Source s = locate(p / n_expert_, p % n_expert_);
+        homes.push_back((uint8_t) (s.dev ? ExpertHome::Vram : s.peer ? ExpertHome::Peer : s.pinned ? ExpertHome::Ram : ExpertHome::File));
+    }
+    map_.take(routed);
 }
 
 ExpertTier::Source ExpertTier::locate(int layer, int e) const {

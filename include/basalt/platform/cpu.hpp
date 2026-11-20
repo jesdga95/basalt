@@ -38,4 +38,8 @@ struct CpuInfo {
 };
 CpuInfo cpu_info();
 
+/// The logical processors that share each last-level (L3) cache, one group per cache in the OS's order: an AMD CCD, or an
+/// Intel die. Processors are named as above. Empty when the OS does not say.
+std::vector<std::vector<int>> cpu_l3_groups();
+
 }  // namespace basalt::platform

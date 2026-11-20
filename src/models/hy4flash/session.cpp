@@ -677,7 +677,23 @@ public:
         return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
     }
 
-    std::string info_words() const override { return tier_ ? "expert_slots=" + std::to_string(tier_->slots()) : std::string(); }
+    std::vector<CardExperts> experts_by_card() const override {
+        std::vector<CardExperts> out;
+        if (tier_)
+            for (const core::ExpertTier::CardSlots& c : tier_->slots_by_card()) out.push_back({c.device, c.slots, c.bytes});
+        return out;
+    }
+    // the sparse layers' caches as backed now (the elastic KV)
+    int64_t kv_bytes() const override { return backed_ * (int64_t) cell_bytes(); }
+
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        if (!tier_) return false;
+        tier_->expert_map(total, homes, routed);
+        return true;
+    }
+
+    std::string info_words() const override { return tier_ ? "expert_slots=" + std::to_string(tier_->gpu_slots()) + " ram_experts_mib=" + std::to_string(tier_->ram_bytes() >> 20)
+                                     : std::string(); }
 
     // SLEEP / WAKE: the tier's card slots go back to the card (every expert keeps its RAM copy and its slot is remembered), and
     // return at the wake. The latent caches, the rings and the drafter's rows are conversation state and stay.
@@ -691,7 +707,7 @@ public:
             if (!tier_->reclaim(e, /*restore=*/true)) return {model::Status::Error, "hy4flash: " + e};
             tier_->grow();
         }
-        expert_slots = tier_->slots();
+        expert_slots = tier_->gpu_slots();
         return {};
     }
 
@@ -700,7 +716,7 @@ public:
         if (!tier_) return {model::Status::Error, "hy4flash: the expert tier is not open"};
         cudaStreamSynchronize(stream_);
         if (!tier_->replan(mib, e)) return {model::Status::Error, "hy4flash: " + e};
-        expert_slots = tier_->slots();
+        expert_slots = tier_->gpu_slots();
         return {};
     }
 

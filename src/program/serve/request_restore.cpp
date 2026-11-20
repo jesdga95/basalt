@@ -72,6 +72,10 @@ Flow Request::restore() {
     slot_b = runtime_.solo_slot >= 0 ? runtime_.solo_slot : runtime_.admit_slot;
     in_slot = runtime_.slot0_solo() && slot_b > 0;
     solo_req = in_slot && runtime_.solo_slot > 0;   // decoded here, solo-style, on the slot's own state
+    if (runtime_.stats.on) {   // the slot's console figures are this request's from here
+        runtime_.stats.start(slot_b);
+        runtime_.stats_tick(true);
+    }
     select_view();
 
     solo_moved = false;   // the solo session gave its cells to this request (hold_slot): it holds nothing after
