@@ -528,8 +528,10 @@ public:
             return false;
         }
         after_launch();
-        // room for every draft the session makes (a block drafter may make more than asked, the policy picks)
-        if (basalt::model::Result r = rt_.session().draft_end(drafts_.data(), conf_.data(), max_window() - 1, n_draft_); !r.ok()) {
+        // room for every draft the session makes (a block drafter may make more than asked, the policy picks); a draft
+        // no window can hold need not be made, but a lookup proposal is matched against the first
+        const auto need = [this](const float* c, int j, int m) { return (j == 0 && rt_.sfx) || rt_.policy->may_verify(c, j, m); };
+        if (basalt::model::Result r = rt_.session().draft_end(drafts_.data(), conf_.data(), max_window() - 1, n_draft_, need); !r.ok()) {
             runtime_.err = r.message;
             return false;
         }
@@ -809,7 +811,8 @@ bool SessionRuntime::slot_window_end(int b, SlotWin& w) {
     basalt::core::progress_beat();
     if (w.drafting) {
         const int max_n = std::min(session().max_window() - 1, (int) std::size(sl.dr));
-        if (const basalt::model::Result r = session().draft_end(sl.dr, sl.dprob, max_n, sl.n_dr); !r.ok()) return failed(r.message);
+        const auto need = [&](const float* c, int j, int m) { return (j == 0 && sl.sfx) || bpolicy->may_verify(c, j, m); };
+        if (const basalt::model::Result r = session().draft_end(sl.dr, sl.dprob, max_n, sl.n_dr, need); !r.ok()) return failed(r.message);
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
         if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
         else bpolicy->observe_window(w.chance, T, a, ms);
