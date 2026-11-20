@@ -68,19 +68,28 @@ def split_engine_extras(extras: list[str]) -> list[str]:
     return out
 
 
+# engine flags that take several values, with their form; every other engine flag takes one
+ENGINE_VALUE_FORMS = {"control-vector-layer-range": ["start", "end"]}
+
+
 def engine_words(key: str, value) -> list[str]:
     """The engine words for one config entry: a switch is true (the flag) or false (nothing), a string or number is
-    one value, and a list gives one word per item (a flag that takes several values). ValueError otherwise."""
-    flag = "--" + str(key).strip().lower().replace("_", "-").removeprefix("--")
+    one value, and a flag that takes several values (`ENGINE_VALUE_FORMS`) is a list of exactly that many. ValueError
+    otherwise."""
+    name = str(key).strip().lower().replace("_", "-").removeprefix("--")
+    flag = "--" + name
     if isinstance(value, bool):
         return [flag] if value else []
+    form = ENGINE_VALUE_FORMS.get(name)
+    if form:
+        if not isinstance(value, list) or len(value) != len(form):
+            raise ValueError(f"{name} must be a list [{', '.join(form)}], got {json.dumps(value)}")
+    elif isinstance(value, list):
+        raise ValueError(f"{name} takes one value, got {json.dumps(value)}")
     items = value if isinstance(value, list) else [value]
     for item in items:
         if isinstance(item, bool) or not isinstance(item, (str, int, float)) or str(item).strip() == "":
-            raise ValueError(f"engine.{key}: expected a string or number, a list of them for several values, "
-                             f"or true/false for a switch, not {value!r}")
-    if not items:
-        raise ValueError(f"engine.{key}: an empty list gives the flag no value")
+            raise ValueError(f"engine.{key}: expected a string or number, or true/false for a switch, not {value!r}")
     return [flag, *(str(item) for item in items)]
 
 
