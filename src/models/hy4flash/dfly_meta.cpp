@@ -83,21 +83,22 @@ std::vector<DflySpec> dfly_specs(const DflyDims& d) {
     std::vector<DflySpec> v;
     auto add = [&](std::string n, std::vector<uint64_t> s, bool f32 = false) { v.push_back({std::move(n), std::move(s), f32, false}); };
     auto q8 = [&](std::string n, std::vector<uint64_t> s) { v.push_back({std::move(n), std::move(s), false, true}); };
+    auto q4 = [&](std::string n, std::vector<uint64_t> s) { v.push_back({std::move(n), std::move(s), false, false, true}); };
     for (int i = 0; i < d.layers; ++i) {
         const std::string p = std::to_string(i) + ".";
         add(p + "input_layernorm.weight", {E}, true);
         add(p + "post_attention_layernorm.weight", {E}, true);
-        q8(p + "mlp.gate_proj.weight", {F, E});
-        q8(p + "mlp.up_proj.weight", {F, E});
-        q8(p + "mlp.down_proj.weight", {E, F});
+        q4(p + "mlp.gate_proj.weight", {F, E});
+        q4(p + "mlp.up_proj.weight", {F, E});
+        q4(p + "mlp.down_proj.weight", {E, F});
         q8(p + "self_attn.q_a_proj.weight", {Q, E});
         add(p + "self_attn.q_a_layernorm.weight", {Q}, true);
         q8(p + "self_attn.q_b_proj.weight", {H * 256, Q});
         q8(p + "self_attn.kv_a_proj_with_mqa.weight", {576, E});
         add(p + "self_attn.kv_a_layernorm.weight", {512}, true);
         add(p + "self_attn.kv_b_proj.weight", {H * 448, 512});
-        q8(p + "self_attn.linear_gate.weight", {H * 256, E});
-        q8(p + "self_attn.o_proj.weight", {E, H * 256});
+        q4(p + "self_attn.linear_gate.weight", {H * 256, E});
+        q4(p + "self_attn.o_proj.weight", {E, H * 256});
         add(p + "self_attn.post_proj_norm.weight", {E}, true);
         add(p + "self_attn.learnable_sink_param", {H}, true);
     }

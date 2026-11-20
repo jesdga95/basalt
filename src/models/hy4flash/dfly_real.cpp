@@ -141,9 +141,10 @@ int main(int argc, char** argv) {
             std::vector<float> v(raw.size() / 2);
             for (size_t i = 0; i < v.size(); ++i) v[i] = bf(((const uint16_t*) raw.data())[i]);
             cudaMemcpy(w.slot(s.name), v.data(), v.size() * 4, cudaMemcpyHostToDevice);
-        } else if (s.q8) {
+        } else if (s.q8 || s.q4) {
             std::vector<uint8_t> q(s.bytes());
-            basalt::core::quantize_bf16_q8_0((const uint16_t*) raw.data(), s.elems(), q.data());
+            if (s.q4) basalt::core::quantize_bf16_q4_0((const uint16_t*) raw.data(), s.elems(), q.data());
+            else basalt::core::quantize_bf16_q8_0((const uint16_t*) raw.data(), s.elems(), q.data());
             cudaMemcpy(w.slot(s.name), q.data(), q.size(), cudaMemcpyHostToDevice);
         } else cudaMemcpy(w.slot(s.name), raw.data(), raw.size(), cudaMemcpyHostToDevice);
     }

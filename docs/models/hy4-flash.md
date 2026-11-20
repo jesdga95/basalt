@@ -93,11 +93,12 @@ token plus the whole block); `--spec 0` turns it off.
 The drafter is five dense MLA layers that read target layers 25, 29, 33, 37 and 41: each attends the positions that target layer's
 indexer selected, in that layer's cache, so its cost does not grow with the context. It keeps no cache of its own, and
 the target checks every draft: output is plain decoding's ([precision](../precision/hy4-flash.md#drafting)). Its projections
-are rounded to Q8_0 as they load. Its drafts pick from the target's own Q8_0 head through a 2-bit copy of every row (116 MB): the
-rows near the copy's best are scored exactly, as the target scores them. It works with either `--kv`. The start line:
+are rounded as they load, the attention's gate and output and the MLP to Q4_0 and the rest to Q8_0. Its drafts pick from the
+target's own Q8_0 head through a 2-bit copy of every row (116 MB): the rows near the copy's best are scored exactly, as the
+target scores them. It works with either `--kv`. The start line:
 
 ```
-basalt hy4flash: drafter: 5 layers reading target layers 25..41, 0.98 GiB on the GPU (Q8_0 projections)
+basalt hy4flash: drafter: 5 layers reading target layers 25..41, 0.66 GiB on the GPU (Q8_0 and Q4_0 projections)
 ```
 
 ## Parallel slots

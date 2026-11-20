@@ -44,8 +44,8 @@ bool DflyWeights::allocate(const DflyDims& d, std::string& err) {
     }
     bytes_ += screen;
     for (const DflySpec& s : dfly_specs(d)) {
-        if (s.q8 && (s.shape.size() != 2 || s.shape[1] % 32 != 0)) {
-            err = "the drafter's " + s.name + " rows are not whole Q8_0 blocks";
+        if ((s.q8 || s.q4) && (s.shape.size() != 2 || s.shape[1] % 32 != 0)) {
+            err = "the drafter's " + s.name + " rows are not whole blocks of 32";
             return false;
         }
         const uint64_t b = s.bytes();
@@ -147,10 +147,10 @@ model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int d
         it.bytes = t.bytes;
         it.dev = w->slot(s.name);
         it.device = device;
-        it.conv = s.f32 ? core::Conv::Bf16ToF32 : s.q8 ? core::Conv::Bf16ToQ8_0 : core::Conv::Copy;
+        it.conv = s.f32 ? core::Conv::Bf16ToF32 : s.q4 ? core::Conv::Bf16ToQ4_0 : s.q8 ? core::Conv::Bf16ToQ8_0 : core::Conv::Copy;
         reads.add(it);
     }
-    basalt::log::info("basalt hy4flash", "drafter: %d layers reading target layers %d..%d, %.2f GiB on the GPU (Q8_0 projections)", d.layers,
+    basalt::log::info("basalt hy4flash", "drafter: %d layers reading target layers %d..%d, %.2f GiB on the GPU (Q8_0 and Q4_0 projections)", d.layers,
                       d.kv_layers.front(), d.kv_layers.back(), (double) w->bytes() / (double) (1ull << 30));
     out = std::move(w);
     return {};
@@ -255,11 +255,12 @@ struct DflyRunner::Impl {
         return (float*) p;
     }
 
-    // y[r] = W x[r] for `rows` (at most a block's) packed rows, W Q8_0 [n_out][n_in]: the rows in q8_1, then MMVQ
-    void mm(const void* wt, const float* x, int ldx, float* y, int ldy, int n_in, int n_out, int rows, void* st) {
+    // y[r] = W x[r] for `rows` (at most a block's) packed rows, W [n_out][n_in] in Q8_0 (or Q4_0 with q4): the rows in q8_1,
+    // then MMVQ
+    void mm(const void* wt, const float* x, int ldx, float* y, int ldy, int n_in, int n_out, int rows, void* st, bool q4 = false) {
         if (ldx != n_in || ldy != n_out || rows > kDflyBlock) throw std::logic_error("dfly: a projection's rows are not packed");
         bk::native_quantize_q8_1(x, act_q8, n_in, rows, st);
-        bk::native_mmvq(8, wt, act_q8, y, n_in, n_out, rows, st);
+        bk::native_mmvq(q4 ? 2 : 8, wt, act_q8, y, n_in, n_out, rows, st);   // GGUF type ids: Q4_0, Q8_0
     }
     void* act_q8 = nullptr;   // a projection's input rows in q8_1
 };
@@ -394,16 +395,16 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             rs.counts = p.meta_d + i * 16 + 8;
             mla_attend(p.qcur, p.ctx, rs, R, L.sink, a, 0, p.env.sel_cap + kDflyBlock, p.attw, p.olat, st);
             dfly_expand_v(L.kv_b, p.olat, R, H, p.vout, st);
-            p.mm(L.gate, p.xn, E, p.gate, H * kDflyV, E, H * kDflyV, R, st);
+            p.mm(L.gate, p.xn, E, p.gate, H * kDflyV, E, H * kDflyV, R, st, true);
             mul_sigmoid(p.gate, p.vout, R * H * kDflyV, st);
-            p.mm(L.o, p.vout, H * kDflyV, p.o, E, H * kDflyV, E, R, st);
+            p.mm(L.o, p.vout, H * kDflyV, p.o, E, H * kDflyV, E, R, st, true);
             bk::rms_norm_rows(p.o, L.post_proj_ln, p.o2, R, E, d.rms_eps, st);
             add_vectors(p.X, p.o2, p.X1, R * E, st);
             bk::rms_norm_rows(p.X1, L.post_attn_ln, p.xn, R, E, d.rms_eps, st);
-            p.mm(L.mlp_gate, p.xn, E, p.g, d.ffn, E, d.ffn, R, st);
-            p.mm(L.mlp_up, p.xn, E, p.u, d.ffn, E, d.ffn, R, st);
+            p.mm(L.mlp_gate, p.xn, E, p.g, d.ffn, E, d.ffn, R, st, true);
+            p.mm(L.mlp_up, p.xn, E, p.u, d.ffn, E, d.ffn, R, st, true);
             bk::swiglu_scaled(p.g, p.u, nullptr, nullptr, p.h, R, d.ffn, d.ffn, st);
-            p.mm(L.mlp_down, p.h, d.ffn, p.mlp, E, d.ffn, E, R, st);
+            p.mm(L.mlp_down, p.h, d.ffn, p.mlp, E, d.ffn, E, R, st, true);
             add_vectors(p.X1, p.mlp, p.X, R * E, st);
         }
         bk::rms_norm_rows(p.X, w.final_norm, p.z, R, E, d.rms_eps, st);
