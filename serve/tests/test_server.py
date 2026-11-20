@@ -2860,6 +2860,19 @@ class CachingThinkingEngine(ThinkingEngine):
                          "finish": "stop", "reused": min(reused, len(ids)), "hits": 9, "lookups": 10}
 
 
+class TimedThinkingEngine(CachingThinkingEngine):
+    """CachingThinkingEngine with the engine's read times: the first pass reads the prompt (READ ms), a later pass
+    only the few tokens that continue the reply (CONTINUE ms)."""
+    READ, CONTINUE = 1000.0, 5.0
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+        first = not self.prompts
+        try:
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+        finally:
+            self.last = dict(self.last, prompt_ms=self.READ if first else self.CONTINUE)
+
+
 class ThinkingBudget(unittest.TestCase):
     """reasoning_budget_tokens: at the budget the thinking is wrapped up and the model answers."""
 
@@ -2915,6 +2928,19 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["usage"]["prompt_tokens_details"]["cached_tokens"], CachingThinkingEngine.FIRST)
         self.assertEqual(b["timings"]["cache_n"], CachingThinkingEngine.FIRST)
         self.assertEqual(b["timings"]["prompt_n"] + b["timings"]["cache_n"], b["usage"]["prompt_tokens"])
+
+    def test_prompt_time_of_a_wrapped_up_request_comes_from_its_first_pass(self):
+        """The prompt is read in the first pass; a later pass's read time, beside the whole prompt, gave a rate
+        hundreds of times too high."""
+        self.engine = TimedThinkingEngine(self.tok)
+        self.svc.engine = self.engine
+        code, b = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 2)
+        t = b["timings"]
+        self.assertEqual(t["prompt_ms"], TimedThinkingEngine.READ)
+        self.assertAlmostEqual(t["prompt_per_second"], t["prompt_n"] / (TimedThinkingEngine.READ / 1000), places=1)
+        self.assertEqual(self.svc.history[-1]["prompt_ms"], TimedThinkingEngine.READ)
 
     def test_the_budget_wraps_up_the_thinking(self):
         from serve.service import REASONING_CLOSE
