@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import closing
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -721,20 +722,23 @@ def make_handler(target: Service | Router):
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
-                                            session=self._session_id(req), live=self.live):
-                    if kind == "ping":
-                        yield None
-                    elif kind == "event":
-                        yield from asm.feed(x)
-                    elif kind == "logprobs":
-                        asm.logprob(*x)
-                    elif kind == "done":
-                        done = x
+                with closing(self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                          session=self._session_id(req), live=self.live)) as inference:
+                    for kind, x in inference:
+                        if kind == "ping":
+                            yield None
+                        elif kind == "event":
+                            yield from asm.feed(x)
+                        elif kind == "logprobs":
+                            asm.logprob(*x)
+                        elif kind == "done":
+                            done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     yield from asm.finish(done)
+
+            generation = events()
             try:
-                items = primed(events(), ids)
+                items = primed(generation, ids)
             except EngineError:
                 raise
             except ValueError as e:                          # too long for the context: found when the engine counted
@@ -752,7 +756,6 @@ def make_handler(target: Service | Router):
                     err = ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None)
                     return self._json(err.status, err.body())
                 return self._json(200, result)
-            self._sse()
             last = time.monotonic()
 
             def send(e):
@@ -760,6 +763,7 @@ def make_handler(target: Service | Router):
                                  json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
 
             try:
+                self._sse()
                 for e in items:
                     if e is None:
                         # clients' idle timers count events, not SSE comments: send in_progress every 15 s
@@ -774,11 +778,16 @@ def make_handler(target: Service | Router):
                     self.wfile.flush()
             except OSError:
                 cancel.set()                                 # client left: stop the engine
-                items.close()
             except EngineDied as e:                          # mid-stream: response.failed
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except ValueError as e:                          # engine ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
+            finally:
+                try:
+                    items.close()
+                finally:
+                    # A primed replay may never have started if writing the headers failed.
+                    generation.close()
 
         def _responses_failed(self, asm, message, code, send):
             e = asm.failed(message, code)
