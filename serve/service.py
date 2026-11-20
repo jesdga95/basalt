@@ -1312,6 +1312,7 @@ class Service:
         # identity token: only a DONE line replaces engine.last, so a request without one records no stale figures
         engine_last0 = getattr(self.engine, "last", None)
         counted_last = engine_last0                     # the `last` whose windows are in st: a pass without a DONE adds none
+        timed_last = engine_last0                       # the `last` whose decode time is in st
         path = getattr(self.request_ctx, "path", None)   # the API path serving this request
         # parallel requests keep their own status and rate window; otherwise self.status / self.rate
         par = bool(getattr(self.engine, "batch", 0))
@@ -1377,7 +1378,8 @@ class Service:
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  path=path, prompt_ms=None,
+                                  path=path, prompt_ms=None, decode_ms=None, decoded=None, passes=None, windows=None,
+                                  window_tokens=None,
                                   max_tokens=max_new, slot=None, reused=None, thread=threading.get_ident(),
                                   api="anthropic" if path == "/v1/messages" else "openai",
                                   model=getattr(self.request_ctx, "model", None) or self.model)
@@ -1543,6 +1545,13 @@ class Service:
                                 st["windows"] = (st.get("windows") or 0) + run_last["windows"]
                                 st["window_tokens"] = (st.get("window_tokens") or 0) + n - n_pass0
                                 counted_last = run_last
+                            if isinstance(run_last, dict) and run_last is not timed_last and run_last.get("decode_ms"):
+                                # a request that took several passes (a thinking budget closed, answer now) decoded in all
+                                # of them: its rate is every pass's tokens over every pass's time, not the last pass's
+                                st["decode_ms"] = (st.get("decode_ms") or 0.0) + float(run_last["decode_ms"])
+                                st["decoded"] = (st.get("decoded") or 0) + int(run_last.get("generated") or 0)
+                                st["passes"] = (st.get("passes") or 0) + 1
+                                timed_last = run_last
                         if isinstance(run_last, dict) and run_last is not engine_last0 and run_last.get("finish") == "error":
                             finish = "error"          # the engine ended the request itself: the grammar allowed no token
                             err = "the grammar allowed no token to continue the reply; the engine log has the state"
@@ -1632,6 +1641,8 @@ class Service:
                             # same object as before: no DONE arrived
                             last = dict(getattr(self.engine, "last", {}) or {}) \
                                 if getattr(self.engine, "last", None) is not engine_last0 else {}
+                            if (st.get("passes") or 0) > 1 and last.get("decode_ms") is not None:
+                                last["decode_ms"], last["generated"] = st["decode_ms"], st["decoded"]
                             if reused0 is not None and last.get("reused") is not None:
                                 last["reused"] = reused0
                                 if prompt_ms0 is not None:
