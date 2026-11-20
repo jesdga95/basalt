@@ -205,6 +205,23 @@ uint64_t LoadPlan::counted() const {
     return n;
 }
 
+std::vector<std::pair<std::string, uint64_t>> LoadPlan::counted_by_target(int main_card) const {
+    std::map<int, uint64_t> cards;   // by rank: the main card first, then the others by ordinal
+    uint64_t ram = 0;
+    bool any_ram = false;
+    for (const LoadItem& it : items_) {
+        if (it.dev != nullptr) cards[it.device == main_card ? -1 : it.device] += it.count;
+        else if (it.host != nullptr) {
+            ram += it.count;
+            any_ram = true;
+        }
+    }
+    std::vector<std::pair<std::string, uint64_t>> out;
+    for (const auto& [rank, bytes] : cards) out.emplace_back(LoadProgress::cuda(rank < 0 ? main_card : rank), bytes);
+    if (any_ram) out.emplace_back("ram", ram);
+    return out;
+}
+
 namespace {
 
 struct FileHandle {
@@ -523,6 +540,17 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
         for (auto& [c, left] : card_left)
             if (c == d && --left == 0) card_label();
     };
+    // each item's destination among the start's shares: what it counts, it counts there
+    std::vector<int> share_of(items.size(), -1);
+    {
+        const auto shares = plan.counted_by_target(main_card);
+        LoadProgress::shares(shares);
+        for (size_t i = 0; i < items.size(); ++i) {
+            const std::string target = items[i].dev != nullptr ? LoadProgress::cuda(items[i].device) : "ram";
+            for (size_t s = 0; s < shares.size(); ++s)
+                if (shares[s].first == target) share_of[i] = (int) s;
+        }
+    }
     {
         std::vector<std::string> stages;
         for (const auto& [d, left] : card_left) stages.push_back(LoadProgress::cuda(d));
@@ -647,7 +675,8 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
                 pending[s] = true;
                 pending_dev[s] = it.device;
             }
-            LoadProgress::placed(scaled(it.count, t.off + t.len, it.bytes) - scaled(it.count, t.off, it.bytes));
+            LoadProgress::placed(scaled(it.count, t.off + t.len, it.bytes) - scaled(it.count, t.off, it.bytes),
+                                 share_of[t.item]);
             if (&tasks == &rounds[0] && ti < device_tasks) {
                 card_placed(it.device);
                 if (device_left.fetch_sub(1) == 1) device_done();

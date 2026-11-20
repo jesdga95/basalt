@@ -110,6 +110,48 @@ void coalescing(const TestFile& f) {
     check(std::memcmp(dst.data(), f.bytes.data() + 4096, 8000) == 0, "coalesced bytes");
 }
 
+// The bar's share per destination comes from the plan: what each item counts, summed where it lands, the main card
+// first, the other cards by ordinal, then RAM; a card the plan writes is listed though it counts nothing.  No device
+// is touched: the plan is only described.
+void shares_by_target() {
+    LoadPlan plan;
+    const int file = plan.file("unused.bin");
+    std::vector<uint8_t> host(1 << 16);
+    alignas(16) static uint8_t fake_dev[4][256];   // destinations the plan names, never written
+    const auto add = [&](void* dev, int device, uint8_t* h, uint64_t off, uint64_t bytes, uint64_t count, Conv conv) {
+        LoadItem it;
+        it.file = file;
+        it.off = off;
+        it.bytes = bytes;
+        it.dev = dev;
+        it.device = device;
+        it.host = h;
+        it.conv = conv;
+        it.count = count;
+        plan.add(it);
+    };
+    add(nullptr, 0, host.data(), 0, 1000, LoadItem::kOut, Conv::Copy);           // RAM first in the plan
+    add(fake_dev[0], 2, nullptr, 4096, 200, LoadItem::kOut, Conv::Copy);         // a second card
+    add(fake_dev[1], 1, nullptr, 8192, 400, LoadItem::kOut, Conv::Bf16High);     // the main card: 200 bytes land
+    add(fake_dev[2], 3, nullptr, 9000, 64, 0, Conv::Copy);                       // a card that counts nothing
+    add(nullptr, 0, host.data() + 2000, 20000, 500, 0, Conv::Copy);              // a RAM image counted elsewhere
+    add(fake_dev[3], 1, nullptr, 30000, 100, LoadItem::kOut, Conv::Copy);
+    const auto got = plan.counted_by_target(1);
+    const std::vector<std::pair<std::string, uint64_t>> want = {{"cuda1", 300}, {"cuda2", 200}, {"cuda3", 0}, {"ram", 1000}};
+    check(got == want, "shares: per destination, the main card first, then by ordinal, then ram");
+    uint64_t sum = 0;
+    for (const auto& [t, b] : got) sum += b;
+    check(sum == plan.counted(), "shares: they sum to the plan's count");
+    LoadPlan cards_only;
+    LoadItem it;
+    it.file = cards_only.file("unused.bin");
+    it.bytes = 10;
+    it.dev = fake_dev[0];
+    cards_only.add(it);
+    check(cards_only.counted_by_target(0) == std::vector<std::pair<std::string, uint64_t>>{{"cuda0", 10}},
+          "shares: no ram share when the plan writes no host memory");
+}
+
 void conversions(const TestFile& f) {
     const uint64_t n = 4096 * 5 + 8;   // elements: whole, at an odd file offset
     const uint64_t off = 4099;
@@ -694,16 +736,21 @@ void cards_first(const TestFile& f) {
           "cards first: bytes");
     std::ifstream in(path);
     std::vector<std::string> seq;   // "cuda0", "ram" and the weights counts, in order
+    std::vector<std::string> shares;   // the share lines, as printed
     for (std::string l; std::getline(in, l);) {
         unsigned long long a = 0, b = 0;
         char into[32] = {};
-        if (l == "basalt load: stages cuda0 ram") seq.push_back("stages");
+        if (l.rfind("basalt load: share ", 0) == 0) shares.push_back(l.substr(19));
+        else if (l == "basalt load: stages cuda0 ram") seq.push_back("stages");
         else if (std::sscanf(l.c_str(), "basalt load: into %31s", into) == 1) seq.push_back(into);
         else if (std::sscanf(l.c_str(), "basalt load: weights %llu %llu", &a, &b) == 2) seq.push_back(std::to_string(a));
     }
     in.close();
     const std::vector<std::string> want = {"0", "stages", "cuda0", std::to_string(kLen), "ram", std::to_string(2 * kLen)};
     check(seq == want, "cards first: the card's bytes land first, then the bar reads ram");
+    const std::string k = std::to_string(kLen);
+    check(shares == std::vector<std::string>{"cuda0 0 " + k, "ram 0 " + k, "cuda0 " + k + " " + k, "ram " + k + " " + k},
+          "cards first: each share announced at 0, then once at its own total");
     std::error_code ec;
     std::filesystem::remove(path, ec);
     std::filesystem::remove(after, ec);
@@ -718,6 +765,7 @@ int main() {
     host_ranges(f, 1);
     host_ranges(f, 8);
     coalescing(f);
+    shares_by_target();
     conversions(f);
     q8_0_blocks();
     errors(f);
