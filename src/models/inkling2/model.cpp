@@ -2,6 +2,7 @@
 // memory, then the context sized from what the weights leave.
 #include "models/inkling2/model.hpp"
 
+#include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/vmm.hpp"
@@ -70,6 +71,8 @@ InklingModel::InklingModel() = default;
 
 InklingModel::~InklingModel() {
     for (void* p : dev_) cudaFree(p);
+    for (void* p : copy_)
+        if (p) cudaFree(p);
     for (const Range& r : ranges_) {
         if (r.handle) core::vmm::unmap(r.va, r.own, r.handle);
         core::vmm::unmap_only(r.va + r.own, r.bytes - r.own);
@@ -326,6 +329,15 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 }
                 if (!plan_spill(g.n_layers, g.n_expert, stride, core::vmm::granularity(), rank, short_b, keep, spill_, err))
                     return fail(err + " (--max-context " + std::to_string(want) + ")");
+                // the RAM experts, the most routed first (the profile's order; without one, layer by layer)
+                for (const auto& [l, e] : rank)
+                    if (!spill_.slot[(size_t) l].empty() && spill_.slot[(size_t) l][(size_t) e] >= g.n_expert - spill_.n_spill[(size_t) l])
+                        spill_order_.emplace_back(l, e);
+                if (rank.empty())
+                    for (int l = 0; l < g.n_layers; ++l)
+                        for (int e = 0; e < g.n_expert; ++e)
+                            if (!on_card(l, e)) spill_order_.emplace_back(l, e);
+                elastic_ = keep < 0 && want > core::kElasticKvBase;
                 uint64_t ram = 0;
                 for (int l = 0; l < g.n_layers; ++l) ram += (uint64_t) spill_.n_spill[(size_t) l] * stride[(size_t) l];
                 basalt::log::info("basalt inkling2",
@@ -373,6 +385,10 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
         return static_cast<uint8_t*>(p);
     };
     const uint64_t gran = spill_.any() ? core::vmm::granularity() : 0;
+    if (spill_.any()) {
+        copy_.assign((size_t) g.n_layers * g.n_expert, nullptr);
+        host_addr_.assign((size_t) g.n_layers * g.n_expert, 0);
+    }
     // the RAM copies, every spilled layer's in slot order, and the staging their ranges share
     std::vector<uint64_t> host_at((size_t) g.n_layers, 0);
     if (spill_.any()) {
@@ -460,6 +476,7 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
                 } else {
                     it.host = host + (uint64_t) (s - keep) * w.expert_stride;
                     table[(size_t) e] = host_dev + (uint64_t) (s - keep) * w.expert_stride;
+                    host_addr_[(size_t) l * g.n_expert + e] = table[(size_t) e];
                 }
                 reads.add(it);
             }
@@ -482,7 +499,64 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
         if (model::Result r = dspark_->finish(head_, embd_dev_, embed_norm_, nullptr); !r.ok()) return r;
     for (auto& s : sessions)
         if (model::Result r = s->prepare(); !r.ok()) return r;
+    if (elastic_) {   // the caches back only their base yet: the RAM experts come back while the card has room
+        const uint64_t moved = promote(kCardSpare);
+        basalt::log::info("basalt inkling2", "elastic spill: %lld of %lld RAM experts copied back to the card (%.2f GiB); they go back "
+                          "to RAM, the least routed first, as a conversation's caches grow",
+                          (long long) n_copy_, (long long) spill_.spilled, (double) moved / (double) kGiB);
+    }
     return {};
+}
+
+uint64_t InklingModel::promote(uint64_t keep_free) {
+    const int ne = geo().n_expert;
+    uint64_t moved = 0;
+    for (const auto& [l, e] : spill_order_) {
+        const size_t i = (size_t) l * ne + e;
+        if (copy_[i]) continue;
+        const LayerWeights& w = layers_[(size_t) l];
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        if (free_b < keep_free + w.expert_stride) break;
+        void* p = nullptr;
+        if (cudaMalloc(&p, w.expert_stride) != cudaSuccess) {
+            cudaGetLastError();
+            break;
+        }
+        const int keep = ne - w.n_spill;
+        const uint8_t* src = w.spill_host + (uint64_t) (spill_.slot[(size_t) l][(size_t) e] - keep) * w.expert_stride;
+        const unsigned long long at = (unsigned long long) p;
+        if (cudaMemcpy(p, src, w.expert_stride, cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(w.blob_table + e, &at, 8, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaFree(p);
+            break;
+        }
+        copy_[i] = p;
+        ++n_copy_;
+        moved += w.expert_stride;
+    }
+    return moved;
+}
+
+uint64_t InklingModel::demote(uint64_t bytes, void* stream) {
+    const int ne = geo().n_expert;
+    std::vector<size_t> out;
+    uint64_t freed = 0;
+    for (auto it = spill_order_.rbegin(); it != spill_order_.rend() && freed < bytes; ++it) {
+        const size_t i = (size_t) it->first * ne + it->second;
+        if (!copy_[i]) continue;
+        cudaMemcpyAsync(layers_[(size_t) it->first].blob_table + it->second, &host_addr_[i], 8, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+        out.push_back(i);
+        freed += layers_[(size_t) it->first].expert_stride;
+    }
+    if (out.empty()) return 0;
+    cudaStreamSynchronize((cudaStream_t) stream);
+    for (size_t i : out) {
+        cudaFree(copy_[i]);
+        copy_[i] = nullptr;
+        --n_copy_;
+    }
+    return freed;
 }
 
 }  // namespace basalt::models::inkling2
