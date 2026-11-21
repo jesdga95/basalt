@@ -19,6 +19,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import checkpoint_inkling2 as I  # noqa: E402
 import model_sections as S  # noqa: E402
+from gguf_reader import GGUFFile  # noqa: E402
 from model_file import ModelFile  # noqa: E402
 from test_checkpoint import basalt_values, modelopt_values, write_safetensors  # noqa: E402
 
@@ -305,6 +306,46 @@ class ConvertTest(unittest.TestCase):
         self.assertEqual(t["type"], "BF16")
         got = (np.frombuffer(raw, "<u2").astype(np.uint32) << 16).view(np.float32).reshape(NKV * HD, MH)
         np.testing.assert_array_equal(got, self.fx.v["mtp.layers.0.self_attn.k_proj_ctx.weight"])
+
+    def test_the_vision_tower_is_llama_cpps_mmproj(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "mmproj.gguf"
+            p.write_bytes(self.mf.read("vision/mmproj"))
+            g = GGUFFile(p)
+            raw = p.read_bytes()
+        md = g.metadata
+        self.assertEqual((md["general.architecture"], md["clip.vision.projector_type"]), ("clip", "inkling2v"))
+        self.assertEqual([md["clip.vision." + k] for k in ("patch_size", "embedding_length", "feed_forward_length", "block_count",
+                                                           "spatial_merge_size", "projection_dim", "image_size")],
+                         [VPATCH, VH, 2 * VH, 1, 2, H, VGRID * VPATCH])
+        self.assertEqual(md["clip.vision.image_mean"], [0.5] * 3)
+        t = {x.name: x for x in g.tensors}
+        self.assertEqual(len(t), 6 + 18 + 2)        # the embeddings and the pre-norm, one block, the two projector products
+
+        def values(name):
+            x = t[name]
+            at = g.data_start + x.offset
+            if x.type_name == "F32":
+                return np.frombuffer(raw[at:at + 4 * x.elements], "<f4")
+            return (np.frombuffer(raw[at:at + 2 * x.elements], "<u2").astype(np.uint32) << 16).view(np.float32)
+
+        # the linear patch embedding [out][(row, column, channel)] as llama.cpp's convolution [out][channel][row][column]
+        pw = self.fx.v["model.visual.backbone.embeddings.patch_embedding.weight"].reshape(VH, VPATCH, VPATCH, 3).transpose(0, 3, 1, 2)
+        self.assertEqual((t["v.patch_embd.weight"].type_name, t["v.patch_embd.weight"].shape), ("F32", [VPATCH, VPATCH, 3, VH]))
+        np.testing.assert_array_equal(values("v.patch_embd.weight"), pw.reshape(-1))
+        V, B = "model.visual.backbone.", "model.visual.backbone.layers.0."
+        for name, src, ty in (("v.class_embd", V + "embeddings.class_embedding", "F32"),
+                              ("v.class_position_embd.weight", V + "embeddings.cls_position_embedding", "F32"),
+                              ("v.position_embd.weight", V + "embeddings.position_embedding", "F32"),
+                              ("v.pre_ln.bias", V + "ln_pre.bias", "F32"), ("v.blk.0.ls1.weight", B + "ls_1.gamma", "F32"),
+                              ("v.blk.0.ls2.weight", B + "ls_2.gamma", "F32"), ("v.blk.0.attn_q.weight", B + "self_attn.q_proj.weight", "BF16"),
+                              ("v.blk.0.attn_out.bias", B + "self_attn.out_proj.bias", "F32"), ("v.blk.0.ffn_up.weight", B + "mlp.c_fc.weight", "BF16"),
+                              ("v.blk.0.ffn_down.weight", B + "mlp.c_proj.weight", "BF16"), ("mm.1.weight", "model.visual.proj_in.weight", "BF16"),
+                              ("mm.2.weight", "model.visual.proj_out.weight", "BF16")):
+            with self.subTest(tensor=name):
+                self.assertEqual(t[name].type_name, ty)
+                np.testing.assert_array_equal(values(name), self.fx.v[src].reshape(-1))
+        self.assertEqual(t["mm.2.weight"].shape, [128, H])   # [in, out] in ggml's order: the text width out
 
 
 if __name__ == "__main__":
