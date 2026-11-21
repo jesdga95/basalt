@@ -20,6 +20,11 @@ bool supported(int ggml_type);
 bool fits(int ggml_type, int64_t w_rows);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
+/// Bytes MMQ reads past the end of a matrix of `cols` columns in `ggml_type`: its tile loads step along a row 256 values
+/// at a time, so the last row of a matrix whose rows are not a multiple of 256 values is read on to the next multiple
+/// (the activations there are zeros, so the products are unchanged).  A buffer MMQ reads a matrix from in place needs
+/// this many readable bytes after it, zeroed (a stray scale there could be a NaN, and NaN times zero is NaN).
+size_t read_past_bytes(int ggml_type, int64_t cols);
 /// A group buffer's slot for one expert's gate and up rows ([n_ff, n_embd] of `gate_type`, then of `up_type`):
 /// matrix_bytes of the [2 n_ff, n_embd] matrix when the types agree; otherwise rounded up to whole blocks of both
 /// types and 16 bytes, so the gate product and the up product each step from expert to expert in whole blocks.

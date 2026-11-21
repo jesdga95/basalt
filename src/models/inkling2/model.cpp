@@ -6,6 +6,7 @@
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "models/inkling2/prompt.hpp"
 
 #include <cuda_runtime.h>
@@ -267,7 +268,12 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         w.blob_bytes = el.blob_bytes;
         w.expert_stride = expert_stride(el.gu_type, el.blob_bytes);
         const uint64_t eb = (uint64_t) g.n_expert * w.expert_stride;
-        if (!(w.experts = device_buf(eb))) return fail("out of device memory loading layer " + std::to_string(l) + "'s experts");
+        // the prompt path reads the last expert's down rows (n_ff 1152 columns) on to a multiple of 256 values: zeros there
+        const uint64_t past = std::max(prefill::mmq::read_past_bytes(el.gu_type, g.n_embd),
+                                       prefill::mmq::read_past_bytes(el.d_type, g.n_ff_exp));
+        if (!(w.experts = device_buf(eb + past)))
+            return fail("out of device memory loading layer " + std::to_string(l) + "'s experts");
+        if (past) cudaMemset(w.experts + eb, 0, past);
         if (w.expert_stride == el.blob_bytes) {
             core::LoadItem it;
             it.file = file;
