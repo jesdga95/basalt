@@ -13,6 +13,7 @@
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/nvfp4_planes.hpp"
+#include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/row_norm.hpp"
@@ -468,6 +469,7 @@ void DsparkHook::note(int64_t pos0, int rows) {
 // (k < layers) or the final norm and the head's `n` drafts (k = layers). Everything a stage reads of the block's anchor and
 // position is on the device (meta_d_), so a stage is captured once and replayed.
 void DsparkHook::stage(int k, int n, void* stream) {
+    bk::PdlScope pdl(true);   // each kernel may start while the one before it finishes: a product stages its first weights
     const DsparkWeights& w = *w_;
     const DsparkGeometry& d = w.geo;
     if (k == 0) dspark_block_inputs(w.embedding, meta_d_, w.embed_norm, d.rms_eps, w.mask, kDsBlock, x_, pos3b_, prev_, state_, fr_,
