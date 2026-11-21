@@ -209,9 +209,11 @@ __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
 constexpr int kDownWarps = 8;
 constexpr int kSlice = 2 * kWidth / kDownWarps;   // 576 inputs a warp
 static_assert(kWidth % (kSlice / 2) == 0 && kSlice % 64 == 0, "a slice is whole pairs of every lane, inside one half");
-template<int O>
+// RMAX: the rows a launch takes at most (kDecodeRows, or 2 for the one-output blocks of a window of 1 or 2 rows, whose
+// lanes then load all of their input pairs before the first sum).
+template<int O, int RMAX>
 __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, int rows) {
-    __shared__ float part[kDownWarps][O][kDecodeRows][2];
+    __shared__ float part[kDownWarps][O][RMAX][2];
     const int o0 = blockIdx.x * O, s = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const bool second = w >= kDownWarps / 2;
     const int c0 = (w % (kDownWarps / 2)) * kSlice;   // the slice's first channel in its half
@@ -220,7 +222,7 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
     // kIn of a lane's input pairs of every row are loaded before their sums, so the loads overlap instead of each waiting
     // for the one before it (a window's 8 rows were 72 loads in a row); the sums are added in the same order as one at a
     // time. The lane's weights are all read before pdl_wait, while the kernel before finishes.
-    constexpr int kIn = 3;
+    constexpr int kIn = RMAX <= 2 ? 9 : 3;
     constexpr int kIters = kSlice / 2 / (32 * kIn);
     static_assert((kSlice / 2) % (32 * kIn) == 0, "a lane's pairs split into whole batches");
     uint32_t wu[kIters][kIn][O];
@@ -232,9 +234,9 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
             for (int j = 0; j < O; ++j) wu[it][b][j] = wr[(size_t) j * kWidth + lane + 32 * (it * kIn + b)];   // output o0 + j: 2 kWidth bf16, kWidth words
     bk::pdl_wait();
     bk::pdl_launch_dependents();
-    float dot[O][kDecodeRows], sq[kDecodeRows];
+    float dot[O][RMAX], sq[RMAX];
 #pragma unroll
-    for (int t = 0; t < kDecodeRows; ++t) {
+    for (int t = 0; t < RMAX; ++t) {
         sq[t] = 0.f;
 #pragma unroll
         for (int j = 0; j < O; ++j) dot[j][t] = 0.f;
@@ -242,7 +244,7 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
 #pragma unroll
     for (int it = 0; it < kIters; ++it) {
         const int i0 = lane + it * 32 * kIn;
-        float2 x[kIn][kDecodeRows];
+        float2 x[kIn][RMAX];
         float w0[kIn][O], w1[kIn][O];
 #pragma unroll
         for (int b = 0; b < kIn; ++b) {
@@ -254,13 +256,13 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
                 w1[b][j] = __uint_as_float(u & 0xffff0000u);
             }
 #pragma unroll
-            for (int t = 0; t < kDecodeRows; ++t)
+            for (int t = 0; t < RMAX; ++t)
                 if (t < rows) x[b][t] = reinterpret_cast<const float2*>(in + (size_t) t * kWidth + c0)[i];
         }
 #pragma unroll
         for (int b = 0; b < kIn; ++b) {
 #pragma unroll
-            for (int t = 0; t < kDecodeRows; ++t) {
+            for (int t = 0; t < RMAX; ++t) {
                 if (t < rows) {
 #pragma unroll
                     for (int j = 0; j < O; ++j) dot[j][t] = fmaf(w1[b][j], x[b][t].y, fmaf(w0[b][j], x[b][t].x, dot[j][t]));
@@ -270,7 +272,7 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
         }
     }
 #pragma unroll
-    for (int t = 0; t < kDecodeRows; ++t) {
+    for (int t = 0; t < RMAX; ++t) {
         if (t >= rows) break;
         const float q = warp_sum(sq[t]);
 #pragma unroll
@@ -520,8 +522,8 @@ void controllers(const CtrlArgs& a, int streams, int rows, void* stream) {
     if (streams < 1 || streams > kMaxStreams || a.rank <= 0 || a.rank % 16) throw std::runtime_error("inkling2 controllers: streams or rank");
     cudaStream_t s = (cudaStream_t) stream;
     // a window of 3+ rows reads its inputs once for 4 outputs (they are 8 rows x 18 KB), a lone row keeps rank blocks
-    if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4>, dim3((unsigned) a.rank / 4, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
-    else bk::launch_pdl(ctrl_down_kernel<1>, dim3((unsigned) a.rank, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
+    if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4, kDecodeRows>, dim3((unsigned) a.rank / 4, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
+    else bk::launch_pdl(ctrl_down_kernel<1, 2>, dim3((unsigned) a.rank, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
     check("controllers/down");
     bk::launch_pdl(ctrl_up_kernel, dim3((unsigned) (2 * kWidth / 32), (unsigned) streams), dim3(256), (size_t) rows * a.rank * 4, s, a, rows);
     check("controllers/up");
