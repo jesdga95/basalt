@@ -10,6 +10,21 @@
 
 namespace basalt::models::inkling2 {
 
+/// The card's running counts split by where each pair is served: `all` every lookup, `card` those of the experts on the card
+/// (`on_card(layer, expert)`); the rest were read from RAM. The end-of-session line and the server's hit rate both come from this.
+struct CardShare {
+    uint64_t card = 0, all = 0;
+};
+template <class OnCard>
+CardShare card_share(const std::vector<uint32_t>& counts, int n_expert, OnCard on_card) {
+    CardShare s;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        s.all += counts[i];
+        if (on_card((int) (i / (size_t) n_expert), (int) (i % (size_t) n_expert))) s.card += counts[i];
+    }
+    return s;
+}
+
 class ResidentExpertMap {
 public:
     /// The map from `counts` (the card's running counts, [layer * n_expert + e]): the sample of all `counts.size()`
