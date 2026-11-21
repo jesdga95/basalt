@@ -209,8 +209,8 @@ __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
 constexpr int kDownWarps = 8;
 constexpr int kSlice = 2 * kWidth / kDownWarps;   // 576 inputs a warp
 static_assert(kWidth % (kSlice / 2) == 0 && kSlice % 64 == 0, "a slice is whole pairs of every lane, inside one half");
-// RMAX: the rows a launch takes at most (2, 4 or kDecodeRows). Up to 4 rows a lane loads all of its input pairs before the
-// first sum; 8 rows load them in three batches (registers).
+// RMAX: the rows a launch takes at most (2, 4 or kDecodeRows). A lane loads all of its input pairs of up to 4 rows before
+// their first sum; 8 rows take two such passes (registers).
 template<int O, int RMAX>
 __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, int rows) {
     __shared__ float part[kDownWarps][O][RMAX][2];
@@ -222,7 +222,8 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
     // kIn of a lane's input pairs of every row are loaded before their sums, so the loads overlap instead of each waiting
     // for the one before it (a window's 8 rows were 72 loads in a row); the sums are added in the same order as one at a
     // time. The lane's weights are all read before pdl_wait, while the kernel before finishes.
-    constexpr int kIn = RMAX <= 4 ? 9 : 3;
+    constexpr int kIn = 9;
+    constexpr int kPass = RMAX < 4 ? RMAX : 4;   // rows whose inputs are loaded together
     constexpr int kIters = kSlice / 2 / (32 * kIn);
     static_assert((kSlice / 2) % (32 * kIn) == 0, "a lane's pairs split into whole batches");
     uint32_t wu[kIters][kIn][O];
@@ -244,29 +245,30 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
 #pragma unroll
     for (int it = 0; it < kIters; ++it) {
         const int i0 = lane + it * 32 * kIn;
-        float2 x[kIn][RMAX];
-        float w0[kIn][O], w1[kIn][O];
 #pragma unroll
-        for (int b = 0; b < kIn; ++b) {
-            const int i = i0 + 32 * b;
+        for (int h = 0; h < RMAX; h += kPass) {   // rows h.. h + kPass: their batch of inputs loaded, then summed
+            float2 x[kIn][kPass];
 #pragma unroll
-            for (int j = 0; j < O; ++j) {
-                const uint32_t u = wu[it][b][j];
-                w0[b][j] = __uint_as_float(u << 16);
-                w1[b][j] = __uint_as_float(u & 0xffff0000u);
-            }
+            for (int b = 0; b < kIn; ++b)
 #pragma unroll
-            for (int t = 0; t < RMAX; ++t)
-                if (t < rows) x[b][t] = reinterpret_cast<const float2*>(in + (size_t) t * kWidth + c0)[i];
-        }
+                for (int t = 0; t < kPass; ++t)
+                    if (h + t < rows) x[b][t] = reinterpret_cast<const float2*>(in + (size_t) (h + t) * kWidth + c0)[i0 + 32 * b];
 #pragma unroll
-        for (int b = 0; b < kIn; ++b) {
+            for (int b = 0; b < kIn; ++b) {
+                float w0[O], w1[O];
 #pragma unroll
-            for (int t = 0; t < RMAX; ++t) {
-                if (t < rows) {
+                for (int j = 0; j < O; ++j) {
+                    const uint32_t u = wu[it][b][j];
+                    w0[j] = __uint_as_float(u << 16);
+                    w1[j] = __uint_as_float(u & 0xffff0000u);
+                }
 #pragma unroll
-                    for (int j = 0; j < O; ++j) dot[j][t] = fmaf(w1[b][j], x[b][t].y, fmaf(w0[b][j], x[b][t].x, dot[j][t]));
-                    sq[t] = fmaf(x[b][t].y, x[b][t].y, fmaf(x[b][t].x, x[b][t].x, sq[t]));
+                for (int t = 0; t < kPass; ++t) {
+                    if (h + t < rows) {
+#pragma unroll
+                        for (int j = 0; j < O; ++j) dot[j][h + t] = fmaf(w1[j], x[b][t].y, fmaf(w0[j], x[b][t].x, dot[j][h + t]));
+                        sq[h + t] = fmaf(x[b][t].y, x[b][t].y, fmaf(x[b][t].x, x[b][t].x, sq[h + t]));
+                    }
                 }
             }
         }
