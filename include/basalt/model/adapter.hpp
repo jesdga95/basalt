@@ -339,6 +339,8 @@ public:
     virtual const char* model_name() const { return ""; }
     /// The KV cache format a community benchmark row runs this model with when it takes no int8; empty: its default.
     virtual const char* community_kv() const { return ""; }
+    /// The quant label of a community row when the pack's name carries none (its name ends in no format word); empty: "unknown".
+    virtual const char* community_quant() const { return ""; }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
     virtual int quality_window() const { return 1; }
     /// The cards that may hold experts beside the main one.

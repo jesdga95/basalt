@@ -35,6 +35,7 @@ public:
     PreTokenizer pretokenizer() const override { return {"inkling2", pretok_inkling2}; }
     int max_expert_cards() const override { return 0; }
     const char* model_name() const override { return "Inkling-2-Mini"; }
+    const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, Q8_0 dense
 
     // --kv: the attention caches as fp16 (the default) or fp8; --spec, --draft-log: the drafter's windows
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
