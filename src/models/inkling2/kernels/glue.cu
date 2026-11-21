@@ -628,8 +628,9 @@ void controllers(const CtrlArgs& a, int streams, int rows, void* stream) {
     check_rows(rows, "controllers");
     if (streams < 1 || streams > kMaxStreams || a.rank <= 0 || a.rank % 16) throw std::runtime_error("inkling2 controllers: streams or rank");
     cudaStream_t s = (cudaStream_t) stream;
-    // a window of 3+ rows reads its inputs once for 4 outputs (they are 8 rows x 18 KB), a lone row keeps rank blocks
-    if (rows >= 5) bk::launch_pdl(ctrl_down_kernel<4, kDecodeRows>, dim3((unsigned) a.rank / 4, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
+    // 3-4 rows read their inputs once for 4 outputs (they are 8 rows x 18 KB), 5-8 rows once for 2 (twice the blocks, half
+    // the dots and sums on each one's chain), a lone row keeps rank blocks
+    if (rows >= 5) bk::launch_pdl(ctrl_down_kernel<2, kDecodeRows>, dim3((unsigned) a.rank / 2, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
     else if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4, 4>, dim3((unsigned) a.rank / 4, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
     else bk::launch_pdl(ctrl_down_kernel<1, 2>, dim3((unsigned) a.rank, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
     check("controllers/down");
