@@ -60,6 +60,22 @@ bk::RopeSpec rope_of(const DsparkGeometry& d) {
 
 DsparkWeights::~DsparkWeights() {
     for (void* p : allocs_) cudaFree(p);
+    for (void* p : pinned_) cudaFreeHost(p);
+}
+
+void* DsparkWeights::mapped(size_t bytes, bool& ok) {
+    void* h = nullptr;
+    void* d = nullptr;
+    if (!ok || cudaHostAlloc(&h, std::max<size_t>(bytes, 16), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        ok = false;
+        return nullptr;
+    }
+    pinned_.push_back(h);
+    if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+        ok = false;
+        return nullptr;
+    }
+    return d;
 }
 
 void* DsparkWeights::dev(size_t bytes, bool& ok) {
@@ -98,7 +114,7 @@ model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int
     bool ok = true;
     std::string err;
     // a tensor of the pack to the card: its type and size checked, read as it is or rounded as it loads
-    auto load = [&](const std::string& name, int type, uint64_t values, core::Conv conv, uint64_t dst_bytes) -> void* {
+    auto load = [&](const std::string& name, int type, uint64_t values, core::Conv conv, uint64_t dst_bytes, bool host = false) -> void* {
         if (!ok) return nullptr;
         const TensorRef* t = pack.find(name);
         const uint64_t want = values * (type == kTypeF32 ? 4 : 2);
@@ -107,16 +123,17 @@ model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int
             ok = false;
             return nullptr;
         }
-        void* p = w->dev(dst_bytes, ok);
+        void* p = host ? w->mapped(dst_bytes, ok) : w->dev(dst_bytes, ok);
         if (!ok) {
-            err = "out of device memory for " + name;
+            err = std::string("out of ") + (host ? "pinned host" : "device") + " memory for " + name;
             return nullptr;
         }
         core::LoadItem it;
         it.file = file;
         it.off = t->offset;
         it.bytes = t->bytes;
-        it.dev = p;
+        if (host) it.host = (uint8_t*) w->pinned_.back();
+        else it.dev = p;
         it.device = device;
         it.conv = conv;
         reads.add(it);
@@ -152,7 +169,10 @@ model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int
     w->mask = f32("dspark.mask_embed", kE);
     w->norm = f32("dspark.norm.weight", kE);
     w->markov_norm = f32("dspark.markov.dflare_norm.weight", kE);
-    w->w1 = bf16("dspark.markov.w1.weight", (uint64_t) g.n_vocab * kDsRank);
+    {   // the Markov head's token rows in mapped host memory: a step reads the previous draft's row
+        const uint64_t n = (uint64_t) g.n_vocab * kDsRank;
+        w->w1 = (uint16_t*) load("dspark.markov.w1.weight", kTypeBF16, n, core::Conv::Copy, n * 2, true);
+    }
     w->rnn_w = bf16("dspark.markov.rnn.weight", (uint64_t) kDsRnn * (2 * kDsRank + 2 * kE));
     w->rnn_b = f32("dspark.markov.rnn.bias", kDsRnn);
     w->out_w = bf16("dspark.markov.out.weight", (uint64_t) kE * kDsRank);
@@ -163,9 +183,14 @@ model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int
     w->w_f = (uint16_t*) w->dev((size_t) kDsRnn * kE * 2, ok);
     w->fold = w->dev(q8_bytes((uint64_t) g.n_vocab, kDsRank), ok);
     w->fold_b = (float*) w->dev((size_t) g.n_vocab * 4, ok);
+    w->fold_bp = (float*) w->dev((size_t) dspark_screen_rows(g.n_vocab) * 4, ok);
+    w->head_sc = w->dev(dspark_screen_bytes(kE, g.n_vocab), ok);
+    w->fold_sc = w->dev(dspark_screen_bytes(kDsRank, g.n_vocab), ok);
     if (!ok) return fail("out of device memory");
-    basalt::log::info("basalt inkling2", "drafter: DSpark, %d layers reading target visits %d, %d, %d, %.2f GiB on the GPU (Q8_0 projections)",
-                      d.n_layers, d.targets[0], d.targets[1], d.targets[2], (double) w->bytes() / (double) (1ull << 30));
+    basalt::log::info("basalt inkling2", "drafter: DSpark, %d layers reading target visits %d, %d, %d, %.2f GiB on the GPU (Q8_0 projections, the screen's copies), "
+                      "%.0f MB of token rows in host memory",
+                      d.n_layers, d.targets[0], d.targets[1], d.targets[2], (double) w->bytes() / (double) (1ull << 30),
+                      (double) g.n_vocab * kDsRank * 2 / 1e6);
     out = std::move(w);
     return {};
 }
@@ -189,12 +214,33 @@ model::Result DsparkWeights::finish(const void* head_q8, const uint16_t* emb, co
     try {
         dspark_split_rnn(rnn_w, w_sp, w_h, w_f, s);
         dspark_fold(head, n_vocab, out_w, out_b, fold, fold_b, s);
+        dspark_screen_pack(head, kE, n_vocab, head_sc, s);
+        dspark_screen_pack(fold, kDsRank, n_vocab, fold_sc, s);
+        dspark_screen_order(fold_b, n_vocab, fold_bp, s);
     } catch (const std::exception& e) {
         return {model::Status::Error, std::string("inkling2: the drafter: ") + e.what()};
     }
     if (cudaStreamSynchronize(s) != cudaSuccess) return {model::Status::Error, "inkling2: the drafter's folds failed"};
+    // the projection as loaded is no longer read: its split columns are
+    allocs_.erase(std::find(allocs_.begin(), allocs_.end(), (void*) rnn_w));
+    cudaFree(rnn_w);
+    bytes_ -= (uint64_t) kDsRnn * (2 * kDsRank + 2 * kE) * 2;
+    rnn_w = nullptr;
     finished_ = true;
     return {};
+}
+
+DsHead DsparkWeights::head_args() const {
+    DsHead h;
+    h.head = head;
+    h.fold = fold;
+    h.fold_b = fold_b;
+    h.fold_bp = fold_bp;
+    h.head_sc = head_sc;
+    h.fold_sc = fold_sc;
+    h.n_vocab = n_vocab;
+    h.cap = logit_softcap;
+    return h;
 }
 
 uint64_t dspark_session_bytes(const Pack& pack, int64_t context, int tap_rows) {
@@ -208,15 +254,23 @@ uint64_t dspark_session_bytes(const Pack& pack, int64_t context, int tap_rows) {
         n += 2ull * (uint64_t) (d.swa[(size_t) l] ? ring_cells(d) : full_cells(context)) * kKV * 2;
     n += (3 * R * E + 3 * R * kQ + 2 * R * ff) * 4;                                // the block's rows
     n += bk::gqa_decode_scratch_floats(std::max(ring_cells(d), full_cells(context)), kDsBlock, kHeads, kHeadDim) * 4;
-    n += ((uint64_t) kDsDrafts * V + V + (uint64_t) kDsDrafts * kDsRnn + kDsRnn + 3 * kDsRank) * 4;   // the head's
-    n += bk::native_q8_1_bytes(kDsRank, 1) + dspark_pick_scratch_bytes((int) V) + 1024;
+    n += ((uint64_t) kDsDrafts * dspark_screen_rows((int64_t) V) + (uint64_t) kDsDrafts * kDsRnn + kDsRnn + 3 * kDsRank) * 4;   // the head's
+    n += bk::native_q8_1_bytes(kE, kDsDrafts) + bk::native_q8_1_bytes(kDsRank, kDsDrafts) + dspark_head_scratch_bytes((int64_t) V) + 1024;
     return n;
 }
 
 // ---- the session's hook ---------------------------------------------------------------------------------------------------
 
 DsparkHook::~DsparkHook() {
-    if (dump_) std::fclose(dump_);
+    for (cudaGraphExec_t g : g_stage_)
+        if (g) cudaGraphExecDestroy(g);
+    for (cudaGraphExec_t g : g_head_)
+        if (g) cudaGraphExecDestroy(g);
+    if (dump_) {
+        basalt::log::info("basalt inkling2", "--diag-dump: %lld drafts, %lld screened picks differ from the exact head's",
+                          (long long) dump_drafts_, (long long) dump_differ_);
+        std::fclose(dump_);
+    }
     for (void* p : allocs_) cudaFree(p);
     for (void* p : pinned_) cudaFreeHost(p);
 }
@@ -270,24 +324,28 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     pos3b_ = (int32_t*) dev(R * 3 * 4, ok);
     att_cells_ = std::max(ring_cells(d), full_cells(context));
     att_scr_ = f(bk::gqa_decode_scratch_floats(att_cells_, kDsBlock, kHeads, kHeadDim));
-    base_ = f((size_t) kDsDrafts * V);
-    bias_ = f(V);
+    approx_ = f((size_t) kDsDrafts * dspark_screen_rows((int64_t) V));
+    hq_ = dev(bk::native_q8_1_bytes(kE, kDsDrafts), ok);
     ctx_h_ = f((size_t) kDsDrafts * kDsRnn);
     ctx_f_ = f(kDsRnn);
     state_ = f(2 * kDsRank);
     latent_ = f(kDsRank);
-    lat_q_ = dev(bk::native_q8_1_bytes(kDsRank, 1), ok);
-    pick_scr_ = dev(dspark_pick_scratch_bytes((int) V), ok);
+    lat_q_ = dev(bk::native_q8_1_bytes(kDsRank, kDsDrafts), ok);
+    head_scr_ = dev(dspark_head_scratch_bytes((int64_t) V), ok);
     prev_ = (int32_t*) dev(4, ok);
     ids_d_ = (int32_t*) dev(kDsBlock * 4, ok);
     conf_d_ = f(kDsBlock);
+    frc_ = f(E);
+    meta_d_ = (int32_t*) dev(2 * 4, ok);
+    if (ok && cudaMallocHost((void**) &meta_h_, 2 * 4) != cudaSuccess) ok = false;
+    if (meta_h_) pinned_.push_back(meta_h_);
     if (ok && (cudaMallocHost((void**) &ids_h_, kDsBlock * 4) != cudaSuccess ||
                cudaMallocHost((void**) &conf_h_, kDsBlock * 4) != cudaSuccess))
         ok = false;
     if (ids_h_) pinned_.push_back(ids_h_);
     if (conf_h_) pinned_.push_back(conf_h_);
     if (!dump.empty()) {
-        dump_bias_ = f((size_t) kDsDrafts * V);
+        dump_logits_ = f((size_t) kDsDrafts * V);
         const std::string path = dump + "/dspark.bin";
         dump_ = std::fopen(path.c_str(), "wb");
         if (!dump_) basalt::log::warn("basalt inkling2", "--diag-dump: cannot write %s", path.c_str());
@@ -350,6 +408,84 @@ void DsparkHook::note(int64_t pos0, int rows) {
     }
 }
 
+// The block's stage k (0 .. layers): the post-attention half of layer k - 1 (k > 0), then the pre-attention half of layer k
+// (k < layers) or the final norm and the head's `n` drafts (k = layers). Everything a stage reads of the block's anchor and
+// position is on the device (meta_d_), so a stage is captured once and replayed.
+void DsparkHook::stage(int k, int n, void* stream) {
+    const DsparkWeights& w = *w_;
+    const DsparkGeometry& d = w.geo;
+    if (k == 0) dspark_block_inputs(w.embedding, meta_d_, w.embed_norm, d.rms_eps, w.mask, kDsBlock, x_, pos3b_, prev_, state_, fr_,
+                                    kFrRing, frc_, stream);
+    if (k > 0) {
+        const DsparkLayer& L = w.layer[(size_t) k - 1];
+        bk::native_quantize_q8_1(attn_, act_, kQ, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.wo, act_, o_, kQ, kE, kDsBlock, stream);
+        bk::add_scaled(x_, o_, nullptr, (int64_t) kDsBlock * kE, stream);
+        bk::rms_norm_rows(x_, L.post_norm, kDsBlock, kE, d.rms_eps, xn_, stream);
+        bk::native_quantize_q8_1(xn_, act_, kE, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.gate, act_, g_, kE, d.n_ff, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.up, act_, u_, kE, d.n_ff, kDsBlock, stream);
+        bk::native_swiglu_quantize_q8_1(g_, u_, act_, d.n_ff, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.down, act_, o_, d.n_ff, kE, kDsBlock, stream);
+        bk::add_scaled(x_, o_, nullptr, (int64_t) kDsBlock * kE, stream);
+    }
+    if (k < d.n_layers) {
+        const DsparkLayer& L = w.layer[(size_t) k];
+        const Cache& c = cache_[(size_t) k];
+        bk::rms_norm_rows(x_, L.attn_norm, kDsBlock, kE, d.rms_eps, xn_, stream);
+        bk::native_quantize_q8_1(xn_, act_, kE, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.wq, act_, q_, kE, kQ, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.wk, act_, kb_, kE, kKV, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.wv, act_, vb_, kE, kKV, kDsBlock, stream);
+        bk::attn_qk_prepare(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, rope_of(d), pos3b_, kDsBlock, kHeads, kKvHeads, qr_, c.k, c.v,
+                            0, stream, kHeadDim, false, c.cap, meta_d_ + 1);
+        return;
+    }
+    bk::rms_norm_rows(x_, w.norm, kDsBlock, kE, d.rms_eps, h_, stream);
+    // the head: the screen's head term of the draft rows (block rows 1..n), the recurrence's hidden and context terms
+    const float* hd = h_ + kE;
+    const DsHead head = w.head_args();
+    bk::native_quantize_q8_1(hd, hq_, kE, n, stream);
+    dspark_head_base(head, hq_, n, approx_, stream);
+    bk::bf16_gemv_fp32_mmvf_multi(hd, kE, w.w_h, ctx_h_, kDsRnn, kE, kDsRnn, n, stream);
+    bk::bf16_gemv_fp32_mmvf_multi(frc_, kE, w.w_f, ctx_f_, kDsRnn, kE, kDsRnn, 1, stream);
+    for (int i = 0; i < n; ++i) {
+        dspark_markov_step(ctx_h_ + (size_t) i * kDsRnn, ctx_f_, w.rnn_b, w.w_sp, w.w1, prev_, state_ + (i & 1) * kDsRank,
+                           state_ + ((i + 1) & 1) * kDsRank, latent_, stream);
+        void* lq = static_cast<char*>(lat_q_) + (size_t) i * bk::native_q8_1_bytes(kDsRank, 1);
+        bk::native_quantize_q8_1(latent_, lq, kDsRank, 1, stream);
+        if (dump_ && dumped_ < kDumpBlocks) dspark_head_exact(head, hq_, lq, i, dump_logits_ + (size_t) i * w.n_vocab, stream);
+        dspark_head_pick(head, hq_, lq, approx_, i, head_scr_, prev_, ids_d_, conf_d_, stream);
+    }
+    cudaMemcpyAsync(ids_h_, ids_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
+    cudaMemcpyAsync(conf_h_, conf_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
+}
+
+// Stage k as a graph: captured the first time, then launched. False when the stream cannot capture (the stage then ran
+// directly, and every later block runs its stages directly).
+bool DsparkHook::stage_graph(int k, int n, void* stream) {
+    cudaGraphExec_t& g = k < w_->geo.n_layers ? g_stage_[k] : g_head_[n];
+    const cudaStream_t st = (cudaStream_t) stream;
+    if (!g) {
+        cudaGraph_t graph = nullptr;
+        if (cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        stage(k, n, stream);
+        const cudaError_t ce = cudaStreamEndCapture(st, &graph);
+        const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&g, graph, 0) : ce;
+        if (graph) cudaGraphDestroy(graph);
+        if (ci != cudaSuccess) {
+            (void) cudaGetLastError();
+            g = nullptr;
+            basalt::log::warn("basalt inkling2", "drafter: a graph of its block failed (%s); it runs without graphs", cudaGetErrorString(ci));
+            return false;
+        }
+    }
+    return cudaGraphLaunch(g, st) == cudaSuccess;
+}
+
 model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* stream) {
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     pending_ = 0;
@@ -357,55 +493,27 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
     // the Markov head's context is the row before the anchor's: kept for the last kFrRing positions run
     if (n < 1 || pos < 1 || pos - 1 >= hi_ || pos - 1 < std::max(lo_, hi_ - kFrRing) || pos + kDsBlock > full_cells(context_))
         return {};
-    const DsparkWeights& w = *w_;
-    const DsparkGeometry& d = w.geo;
-    const int V = w.n_vocab;
-    const bk::RopeSpec rope = rope_of(d);
+    const DsparkGeometry& d = w_->geo;
+    meta_h_[0] = anchor;
+    meta_h_[1] = (int32_t) pos;
+    cudaMemcpyAsync(meta_d_, meta_h_, 2 * sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) stream);
+    // the stages captured as graphs (not with --diag-dump, whose head writes more); the attention between them runs
+    // directly: its window follows the position
+    if (dump_ || !stream) graphs_ = false;
     try {
-        dspark_block_inputs(w.embedding, anchor, w.embed_norm, d.rms_eps, w.mask, kDsBlock, pos, x_, pos3b_, prev_, state_, stream);
-        for (int l = 0; l < d.n_layers; ++l) {
-            const DsparkLayer& L = w.layer[(size_t) l];
-            const Cache& c = cache_[(size_t) l];
-            bk::rms_norm_rows(x_, L.attn_norm, kDsBlock, kE, d.rms_eps, xn_, stream);
-            bk::native_quantize_q8_1(xn_, act_, kE, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.wq, act_, q_, kE, kQ, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.wk, act_, kb_, kE, kKV, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.wv, act_, vb_, kE, kKV, kDsBlock, stream);
-            bk::attn_qk_prepare(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, rope, pos3b_, kDsBlock, kHeads, kKvHeads, qr_, c.k, c.v,
-                                pos, stream, kHeadDim, false, c.cap);
-            // a sliding-window layer sees its window before the block, the full one every position, and both the block
-            const int64_t window = c.ring ? (int64_t) d.window + 1 : pos + kDsBlock;
-            bk::gqa_window_attn(qr_, c.k, c.v, kHeads, kKvHeads, kHeadDim, pos, kDsBlock, pos + kDsBlock, window, c.cap, att_scr_,
-                                att_cells_, attn_, stream, true);
-            bk::native_quantize_q8_1(attn_, act_, kQ, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.wo, act_, o_, kQ, kE, kDsBlock, stream);
-            bk::add_scaled(x_, o_, nullptr, (int64_t) kDsBlock * kE, stream);
-            bk::rms_norm_rows(x_, L.post_norm, kDsBlock, kE, d.rms_eps, xn_, stream);
-            bk::native_quantize_q8_1(xn_, act_, kE, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.gate, act_, g_, kE, d.n_ff, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.up, act_, u_, kE, d.n_ff, kDsBlock, stream);
-            bk::native_swiglu_quantize_q8_1(g_, u_, act_, d.n_ff, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.down, act_, o_, d.n_ff, kE, kDsBlock, stream);
-            bk::add_scaled(x_, o_, nullptr, (int64_t) kDsBlock * kE, stream);
+        for (int k = 0; k <= d.n_layers; ++k) {
+            if (k > 0) {
+                const Cache& c = cache_[(size_t) k - 1];
+                // a sliding-window layer sees its window before the block, the full one every position, and both the block
+                const int64_t window = c.ring ? (int64_t) d.window + 1 : pos + kDsBlock;
+                bk::gqa_window_attn(qr_, c.k, c.v, kHeads, kKvHeads, kHeadDim, pos, kDsBlock, pos + kDsBlock, window, c.cap, att_scr_,
+                                    att_cells_, attn_, stream, true);
+            }
+            if (!graphs_ || !stage_graph(k, n, stream)) {
+                graphs_ = false;
+                stage(k, n, stream);
+            }
         }
-        bk::rms_norm_rows(x_, w.norm, kDsBlock, kE, d.rms_eps, h_, stream);
-        // the head: the base logits of the draft rows (block rows 1..n), the recurrence's hidden and context terms
-        const float* hd = h_ + kE;
-        bk::native_quantize_q8_1(hd, act_, kE, n, stream);
-        bk::native_q8_0_mmvq(w.head, act_, base_, kE, V, n, stream);
-        bk::bf16_gemv_fp32_mmvf_multi(hd, kE, w.w_h, ctx_h_, kDsRnn, kE, kDsRnn, n, stream);
-        bk::bf16_gemv_fp32_mmvf_multi(fr_ + (size_t) ((pos - 1) % kFrRing) * kE, kE, w.w_f, ctx_f_, kDsRnn, kE, kDsRnn, 1, stream);
-        for (int i = 0; i < n; ++i) {
-            dspark_markov_step(ctx_h_ + (size_t) i * kDsRnn, ctx_f_, w.rnn_b, w.w_sp, w.w1, prev_, state_ + (i & 1) * kDsRank,
-                               state_ + ((i + 1) & 1) * kDsRank, latent_, stream);
-            bk::native_quantize_q8_1(latent_, lat_q_, kDsRank, 1, stream);
-            bk::native_q8_0_mmvq(w.fold, lat_q_, bias_, kDsRank, V, 1, stream);
-            if (dump_ && dumped_ < kDumpBlocks)
-                cudaMemcpyAsync(dump_bias_ + (size_t) i * V, bias_, (size_t) V * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
-            dspark_pick(base_ + (size_t) i * V, bias_, w.fold_b, V, w.logit_softcap, pick_scr_, prev_, ids_d_, conf_d_, i, stream);
-        }
-        cudaMemcpyAsync(ids_h_, ids_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
-        cudaMemcpyAsync(conf_h_, conf_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
     } catch (const std::exception& e) {
         return {model::Status::Error, std::string("inkling2: the drafter: ") + e.what()};
     }
@@ -430,13 +538,20 @@ model::Result DsparkHook::draft_end(int32_t* ids, float* conf, int max_n, int& n
     if (dump_ && dumped_ < kDumpBlocks) {   // 'B', pos, anchor, drafts, the block's final rows, each draft's logits, the drafts and chances
         const size_t V = (size_t) w_->n_vocab;
         const int32_t m = pending_;
-        std::vector<float> hf((size_t) kDsBlock * kE), base((size_t) m * V), bias((size_t) m * V), fb(V);
+        std::vector<float> hf((size_t) kDsBlock * kE), base((size_t) m * V);
         cudaMemcpy(hf.data(), h_, hf.size() * 4, cudaMemcpyDeviceToHost);
-        cudaMemcpy(base.data(), base_, base.size() * 4, cudaMemcpyDeviceToHost);
-        cudaMemcpy(bias.data(), dump_bias_, bias.size() * 4, cudaMemcpyDeviceToHost);
-        cudaMemcpy(fb.data(), w_->fold_b, V * 4, cudaMemcpyDeviceToHost);
-        const float cap = w_->logit_softcap;
-        for (size_t i = 0; i < base.size(); ++i) base[i] = cap * std::tanh((base[i] + bias[i] + fb[i % V]) / cap);
+        cudaMemcpy(base.data(), dump_logits_, base.size() * 4, cudaMemcpyDeviceToHost);
+        for (int i = 0; i < m; ++i) {   // the screened pick against the exact head's first argmax
+            const float* l = base.data() + (size_t) i * V;
+            const size_t best = (size_t) (std::max_element(l, l + V) - l);
+            ++dump_drafts_;
+            if ((int32_t) best == ids_h_[i]) continue;
+            ++dump_differ_;
+            double z = 0;
+            for (size_t v = 0; v < V; ++v) z += std::exp((double) l[v] - l[best]);
+            basalt::log::info("basalt inkling2", "--diag-dump: block at %lld draft %d: screened %d (logit %.4f), exact %zu (logit %.4f, p %.3f)",
+                              (long long) block_pos_, i, ids_h_[i], l[ids_h_[i]], best, l[best], 1.0 / z);
+        }
         std::fputc('B', dump_);
         std::fwrite(&block_pos_, 8, 1, dump_);
         std::fwrite(&block_anchor_, 4, 1, dump_);

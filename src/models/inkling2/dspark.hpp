@@ -21,6 +21,8 @@
 //             state = gate * state + (1 - gate) * tanh(raw[256:512]), latent = tanh(raw[512:768]);
 //             logits = softcap30(head(h_{i+1}) + fold latent + fold_b), fold = head x hidden_out and fold_b = head x
 //             hidden_out's bias made once at load; the draft is the first argmax and its chance the softmax probability.
+//             The argmax is screened by 2-bit copies of the head and the fold (dspark_head_pick): the head term of all
+//             the drafts in one pass over its copy, the fold term per draft, the rows near the best rescored exactly.
 //
 // Numerics: the projections are the pack's BF16 rounded to Q8_0 as they load and read over q8_1 rows, the head is the
 // target's own Q8_0 head, the recurrence's small products stay BF16 with fp32 activations, and the rest is fp32. The
@@ -36,6 +38,8 @@
 #include "basalt/program/options.hpp"
 #include "models/inkling2/pack.hpp"
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -44,8 +48,6 @@
 
 namespace basalt::models::inkling2 {
 
-constexpr int kDsBlock = 8;          ///< rows of a block: the anchor and seven masks
-constexpr int kDsDrafts = kDsBlock - 1;
 constexpr int kDsMaxLayers = 4;
 
 struct DsparkLayer {
@@ -65,6 +67,7 @@ public:
     /// Q8_0 head (`head`, n_vocab rows), and the target's embedding (BF16 rows, device-readable) and embedding norm noted.
     model::Result finish(const void* head, const uint16_t* embedding, const float* embed_norm, void* stream);
     uint64_t bytes() const { return bytes_; }
+    DsHead head_args() const;
 
     DsparkGeometry geo;
     int n_vocab = 0;
@@ -72,12 +75,14 @@ public:
     std::vector<DsparkLayer> layer;
     float *norm = nullptr, *mask = nullptr, *markov_norm = nullptr, *rnn_b = nullptr, *out_b = nullptr;
     float* alpha = nullptr;              ///< softmax(fuse_weight) [kDsMixes][kDsTargets]
-    uint16_t* w1 = nullptr;              ///< BF16 [n_vocab][rank]
-    uint16_t* rnn_w = nullptr;           ///< BF16 [3 rank][2 rank + 2 width], as loaded
+    uint16_t* w1 = nullptr;              ///< BF16 [n_vocab][rank], mapped host memory (a step reads one row)
+    uint16_t* rnn_w = nullptr;           ///< BF16 [3 rank][2 rank + 2 width], as loaded; freed by finish()
     uint16_t *w_sp = nullptr, *w_h = nullptr, *w_f = nullptr;   ///< its columns, split by finish()
     uint16_t* out_w = nullptr;           ///< BF16 [width][rank]
     void* fold = nullptr;                ///< Q8_0 [n_vocab][rank]
     float* fold_b = nullptr;             ///< [n_vocab]
+    float* fold_bp = nullptr;            ///< fold_b in the screen's row order
+    void *head_sc = nullptr, *fold_sc = nullptr;   ///< the head's and the fold's 2-bit copies (the draft head's screen)
     const void* head = nullptr;          ///< the target's Q8_0 head [n_vocab][width]
     const uint16_t* embedding = nullptr; ///< the target's BF16 embedding rows
     const float* embed_norm = nullptr;
@@ -85,7 +90,8 @@ public:
 private:
     friend model::Result dspark_plan(const Pack&, core::LoadPlan&, int, int, std::unique_ptr<DsparkWeights>&);
     void* dev(size_t bytes, bool& ok);
-    std::vector<void*> allocs_;
+    void* mapped(size_t bytes, bool& ok);   ///< mapped host memory; the device's pointer to it
+    std::vector<void*> allocs_, pinned_;
     uint64_t bytes_ = 0;
     bool finished_ = false;
 };
@@ -133,6 +139,8 @@ private:
         bool ring = false;
     };
     void* dev(size_t bytes, bool& ok);
+    void stage(int k, int n, void* stream);
+    bool stage_graph(int k, int n, void* stream);
     const DsparkWeights* w_ = nullptr;
     std::vector<void*> allocs_, pinned_;
     std::vector<Cache> cache_;
@@ -152,11 +160,17 @@ private:
     int32_t* pos3b_ = nullptr;
     int64_t att_cells_ = 0;
     // head
-    float *base_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr, *bias_ = nullptr;
-    void *lat_q_ = nullptr, *pick_scr_ = nullptr;
+    float *approx_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
+    void *hq_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;   ///< q8_1 draft rows and latents [kDsDrafts], the screen's scratch
     int32_t *prev_ = nullptr, *ids_d_ = nullptr;
     float* conf_d_ = nullptr;
     int32_t* ids_h_ = nullptr;
+    // the block's stages as graphs: the layers' (by layer), the last with the head (by drafts)
+    int32_t *meta_h_ = nullptr, *meta_d_ = nullptr;   ///< {anchor, position} of the block, pinned and on the device
+    float* frc_ = nullptr;                  ///< the Markov head's context of the block (block inputs copy it)
+    cudaGraphExec_t g_stage_[kDsMaxLayers] = {};
+    cudaGraphExec_t g_head_[kDsBlock] = {};
+    bool graphs_ = true;
     float* conf_h_ = nullptr;
     // the host's record: positions [lo_, hi_) have their context in the caches; a block is in flight
     int64_t lo_ = 0, hi_ = 0;
@@ -164,7 +178,8 @@ private:
     // --diag-dump
     std::FILE* dump_ = nullptr;
     int dumped_ = 0;
-    float* dump_bias_ = nullptr;            ///< [kDsDrafts][n_vocab]: each step's fold product
+    float* dump_logits_ = nullptr;          ///< [kDsDrafts][n_vocab]: each draft's exact logits (dspark_head_exact)
+    int64_t dump_drafts_ = 0, dump_differ_ = 0;   ///< drafts dumped, and those whose pick is not the exact head's
     int64_t block_pos_ = 0;
     int32_t block_anchor_ = 0;
 };
