@@ -74,7 +74,8 @@ int split_plan(Context& context) {
                   basalt::core::NativeDense::plan_bytes_by_layer(o.native_shards, true, g.n_layers, nat_l, nat_sh, err);
         uint64_t widest = pool_sh + nat_sh;
         for (int64_t l = 2; ok && l < g.n_layers; ++l) widest += pool_l[(size_t) l] + nat_l[(size_t) l];
-        const int64_t rows = o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, kMaxAutoChunk) : o.prefill_chunk;
+        const int64_t chunk = o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, kMaxAutoChunk) : o.prefill_chunk;
+        const int64_t rows = basalt::program::prompt_split_hand_rows(chunk, o.prompt_split_finite_draft_rows());
         for (size_t j = 0; ok && j < pstages.size(); ++j) {
             ok = basalt::core::host_plan((size_t) widest) && basalt::core::host_plan(256u << 20);
             for (int b = 0; ok && b < 2; ++b) ok = basalt::core::host_plan((size_t) rows * (size_t) (g.hc * g.n_embd) * sizeof(float));
@@ -133,8 +134,9 @@ int prompt_split(Context& context) {
     auto read_cap = [&]() -> int64_t {
         return o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, kMaxAutoChunk) : o.prefill_chunk;
     };
-    // the cells before a prompt's end the draft layer attends to (all of them without a window: no split then)
-    const int64_t draft_window = o.mtp.empty() ? 0 : o.mtp_window > 0 ? o.mtp_window + 64 : INT64_MAX / 4;
+    // the cells before a prompt's end the draft layer attends to (all of them without a finite window)
+    const int64_t finite_draft_rows = o.prompt_split_finite_draft_rows();
+    const int64_t draft_window = o.mtp.empty() ? 0 : finite_draft_rows > 0 ? finite_draft_rows : INT64_MAX / 4;
     constexpr int64_t kSplitRefCells = 131072;   // the longest prompt the start prices the split for
     // the main card with a loan for chunks of `chunk`: every expert of a layer not in its slots below the loan streams
     auto split_main_side = [&](int64_t chunk) {
@@ -208,8 +210,9 @@ int prompt_split(Context& context) {
         part.draft_rows = draft_window > 0 ? std::max<int64_t>(0, c_last - std::max(a0, prompt_end - draft_window)) : 0;
         // the draft layer's rows before the kept chunk come back in the hand-off buffers: the last two chunks handed on
         // in place, earlier ones past `chunk` rows in either buffer (see read_split)
-        const int64_t kept_rows =
-            basalt::program::prompt_split_draft_room(part.split_chunks, schunk, std::max(split_hand_rows, schunk));
+        const int64_t hand_rows = split_hand_rows > 0 ? split_hand_rows
+            : basalt::program::prompt_split_hand_rows(schunk, finite_draft_rows);
+        const int64_t kept_rows = basalt::program::prompt_split_draft_room(part.split_chunks, schunk, hand_rows);
         if (part.draft_rows > kept_rows) {
             if (draft_window >= INT64_MAX / 4)
                 std::snprintf(why, sizeof why, "the draft layer attends to every cell");
@@ -330,8 +333,9 @@ int prompt_split(Context& context) {
                 // its pinned RAM (the weights' images, the two hand-off buffers of each card that hands chunks on, the
                 // staging rings) takes the RAM held for it before the RAM copy and leaves the reserve free: without the
                 // room the split is off
+                const int64_t hand_rows = basalt::program::prompt_split_hand_rows(read_cap(), finite_draft_rows);
                 const uint64_t need = images + (uint64_t) pstages.size() * (256ull << 20) +
-                                      2ull * (uint64_t) pstages.size() * (uint64_t) read_cap() * (uint64_t) (g.hc * g.n_embd) *
+                                      2ull * (uint64_t) pstages.size() * (uint64_t) hand_rows * (uint64_t) (g.hc * g.n_embd) *
                                           sizeof(float);
                 const uint64_t keep = basalt::platform::ram_reserve();
                 const uint64_t avail = basalt::platform::available_memory() + basalt::core::host_plan_bytes();

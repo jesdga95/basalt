@@ -91,6 +91,10 @@ struct Options : CommonOptions {
     /// Names the model's draft layer when it has one (the file); empty means no drafter.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
+    /// The finite draft window with the prompt split's 64-cell slack; zero when there is no finite window.
+    int64_t prompt_split_finite_draft_rows() const {
+        return !mtp.empty() && mtp_window > 0 ? mtp_window + 64 : 0;
+    }
     /// The share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the pinned arena while the
     /// CPU computes the rest (host-planned verify windows).  Set from the startup link probe.
     double pcie_frac = -1.0;

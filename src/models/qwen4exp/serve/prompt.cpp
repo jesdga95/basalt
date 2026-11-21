@@ -532,6 +532,8 @@ int QfnRuntime::init_prompt() {
         }
         split_chunk_cap = split_chunk_max;
     }
+    const int64_t hand_rows = basalt::program::prompt_split_hand_rows(
+        split_chunk_max, o.prompt_split_finite_draft_rows());
     for (size_t j = 0; split_ready && j < pstages.size(); ++j) {
         PromptStage& st = *pstages[j];
         const basalt::core::OnDevice on(st.dev);
@@ -550,9 +552,8 @@ int QfnRuntime::init_prompt() {
             ok = st.sp.init(st.wt, g, st.ss, srcp, &st.tier->cache(), st.res.data(), split_chunk_max,
                             (void*) st.stream, err, b_at, (uint64_t) (s_at - b_at));
         }
-        // a stage that may hand its chunks on (every card but the one that reads the last layers) holds two pinned
-        // buffers of the stage's chunk, as the main card does
-        ok = ok && (j == 0 || st.sp.reserve_hand_off(split_chunk_max, err));
+        // Intermediate stages retain the draft window in the same two pinned buffers as the main card.
+        ok = ok && (j == 0 || st.sp.reserve_hand_off(hand_rows, err));
         // a read's kernels and small buffers load on the card outside the lent slots: a card without room for them
         // beside its stage declines here, before a read could fail on them
         constexpr size_t kStageFreeMin = 256ull << 20;
@@ -576,9 +577,9 @@ int QfnRuntime::init_prompt() {
             split_ready = false;
         }
     }
-    // the main card hands its chunks on through two pinned buffers of the stage's chunk
-    if (split_ready) split_hand_rows = split_chunk_max;
-    if (split_ready && !sp.reserve_hand_off(split_chunk_max, err)) {
+    // Both buffers also retain rows needed by the draft layer when its window spans more than two chunks.
+    if (split_ready) split_hand_rows = hand_rows;
+    if (split_ready && !sp.reserve_hand_off(hand_rows, err)) {
         basalt::log::warn("basalt serve", "prompt split: off (%s)", err.c_str());
         err.clear();
         split_ready = false;

@@ -109,6 +109,9 @@ std::vector<std::pair<int, int>> prompt_split_windows(const PsPrice& ref, size_t
 /// buffer of `hand_rows` rows, which no chunk writes.  `chunks`: the part's chunk sizes, the kept last one included.
 int64_t prompt_split_draft_room(const std::vector<int64_t>& chunks, int64_t chunk, int64_t hand_rows);
 
+/// Rows per hand-off buffer to retain a finite draft window across two buffers; zero means no finite window.
+int64_t prompt_split_hand_rows(int64_t chunk, int64_t draft_window);
+
 /// How one card reads a part of `tokens` in chunks of at most `cap`: equal chunks on the 256-token grid for the fewest
 /// chunks, and with `head_ok` a long part starts with a chunk of `head_chunk`.  The chunk, and the head chunk (0: none;
 /// never one the chunk does not exceed, as the prompt path reads no first chunk longer than the rest).
