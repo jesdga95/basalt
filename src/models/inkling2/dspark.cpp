@@ -390,6 +390,7 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     lat_q_ = dev(bk::native_q8_1_bytes(kDsRank, kDsDrafts), ok);
     head_scr_ = dev(dspark_head_scratch_bytes((int64_t) V), ok);
     prev_ = (int32_t*) dev(4, ok);
+    w1_row_ = (uint16_t*) dev(kDsRank * 2, ok);
     ids_d_ = (int32_t*) dev(kDsBlock * 4, ok);
     conf_d_ = f(kDsBlock);
     frc_ = f(E);
@@ -473,7 +474,7 @@ void DsparkHook::stage(int k, int n, void* stream) {
     const DsparkWeights& w = *w_;
     const DsparkGeometry& d = w.geo;
     if (k == 0) dspark_block_inputs(w.embedding, meta_d_, w.embed_norm, d.rms_eps, w.mask, kDsBlock, x_, pos3b_, prev_, state_, fr_,
-                                    kFrRing, frc_, stream);
+                                    kFrRing, frc_, w.w1, w1_row_, stream);
     namespace wg = bk::wgemm;
     const auto mat = [](const void* p, int64_t rows, const float* scale, float* y, int64_t ld_y) {
         return wg::Matrix{(const uint8_t*) p, rows, scale, y, ld_y};
@@ -531,12 +532,12 @@ void DsparkHook::stage(int k, int n, void* stream) {
     bk::bf16_gemv_fp32_mmvf_multi(hd, kE, w.w_h, ctx_h_, kDsRnn, kE, kDsRnn, n, stream);
     bk::bf16_gemv_fp32_mmvf_multi(frc_, kE, w.w_f, ctx_f_, kDsRnn, kE, kDsRnn, 1, stream);
     for (int i = 0; i < n; ++i) {
-        dspark_markov_step(ctx_h_ + (size_t) i * kDsRnn, ctx_f_, w.rnn_b, w.w_sp, w.w1, prev_, state_ + (i & 1) * kDsRank,
+        dspark_markov_step(ctx_h_ + (size_t) i * kDsRnn, ctx_f_, w.rnn_b, w.w_sp, w1_row_, state_ + (i & 1) * kDsRank,
                            state_ + ((i + 1) & 1) * kDsRank, latent_, stream);
         void* lq = static_cast<char*>(lat_q_) + (size_t) i * bk::native_q8_1_bytes(kDsRank, 1);
         bk::native_quantize_q8_1(latent_, lq, kDsRank, 1, stream);
         if (dump_ && dumped_ < kDumpBlocks) dspark_head_exact(head, hq_, lq, i, dump_logits_ + (size_t) i * w.n_vocab, stream);
-        dspark_head_pick(head, hq_, lq, approx_, i, head_scr_, prev_, ids_d_, conf_d_, stream);
+        dspark_head_pick(head, hq_, lq, approx_, i, head_scr_, prev_, ids_d_, conf_d_, w.w1, w1_row_, stream);
     }
     cudaMemcpyAsync(ids_h_, ids_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
     cudaMemcpyAsync(conf_h_, conf_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);

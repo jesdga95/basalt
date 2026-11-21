@@ -105,13 +105,16 @@ __device__ __forceinline__ void block_inputs_stage(int t, const uint16_t* __rest
                                                    const float* __restrict__ norm, float eps, const float* __restrict__ mask,
                                                    float* __restrict__ x, int32_t* __restrict__ pos3, int32_t* __restrict__ prev,
                                                    float* __restrict__ state, const float* __restrict__ fr, int fr_cap,
-                                                   float* __restrict__ fr_out, float* red) {
+                                                   float* __restrict__ fr_out, const uint16_t* __restrict__ w1,
+                                                   uint16_t* __restrict__ w1_row, float* red) {
     const int32_t anchor = meta[0], pos0 = meta[1];
     float* row = x + (int64_t) t * kWidth;
     if (threadIdx.x < 3) pos3[t * 3 + threadIdx.x] = pos0 + t;
     if (t == 1) {   // the Markov head's start
         if (threadIdx.x == 0) *prev = anchor;
         for (int i = threadIdx.x; i < kDsRank; i += kThreads) state[i] = 0.f;
+        if (threadIdx.x < kDsRank / 8)
+            reinterpret_cast<uint4*>(w1_row)[threadIdx.x] = reinterpret_cast<const uint4*>(w1 + (int64_t) anchor * kDsRank)[threadIdx.x];
     }
     if (t == 2) {
         const float* src = fr + (int64_t) ((pos0 - 1) % fr_cap) * kWidth;
@@ -144,9 +147,10 @@ __global__ void __launch_bounds__(kThreads) block_inputs_kernel(const uint16_t* 
                                                                 const float* __restrict__ mask, float* __restrict__ x,
                                                                 int32_t* __restrict__ pos3, int32_t* __restrict__ prev,
                                                                 float* __restrict__ state, const float* __restrict__ fr, int fr_cap,
-                                                                float* __restrict__ fr_out) {
+                                                                float* __restrict__ fr_out, const uint16_t* __restrict__ w1,
+                                                                uint16_t* __restrict__ w1_row) {
     __shared__ float red[kThreads / 32];
-    block_inputs_stage((int) blockIdx.x, emb, meta, norm, eps, mask, x, pos3, prev, state, fr, fr_cap, fr_out, red);
+    block_inputs_stage((int) blockIdx.x, emb, meta, norm, eps, mask, x, pos3, prev, state, fr, fr_cap, fr_out, w1, w1_row, red);
 }
 
 // ---- the Markov head's recurrence ---------------------------------------------------------------------------------------
@@ -157,12 +161,10 @@ constexpr int kStepBlocks = kDsRank / kStepWarps;  // 8
 // Block b: recurrence indices 32 b .. 32 b + 31, each with its gate, candidate and latent rows.
 __device__ __forceinline__ void markov_step_stage(int b, const float* __restrict__ ctx_h, const float* __restrict__ ctx_f,
                                                   const float* __restrict__ bias, const uint16_t* __restrict__ w_sp,
-                                                  const uint16_t* __restrict__ w1, const int32_t* __restrict__ prev,
-                                                  const float* __restrict__ state_in, float* __restrict__ state_out,
-                                                  float* __restrict__ latent, float* xs) {
-    const int tok = *prev;
+                                                  const uint16_t* __restrict__ w1_row, const float* __restrict__ state_in,
+                                                  float* __restrict__ state_out, float* __restrict__ latent, float* xs) {
     for (int i = threadIdx.x; i < 2 * kDsRank; i += kStepWarps * 32)
-        xs[i] = i < kDsRank ? state_in[i] : bf16f(w1[(int64_t) tok * kDsRank + i - kDsRank]);
+        xs[i] = i < kDsRank ? state_in[i] : bf16f(w1_row[i - kDsRank]);
     __syncthreads();
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int j = b * kStepWarps + w;
@@ -188,11 +190,11 @@ __device__ __forceinline__ void markov_step_stage(int b, const float* __restrict
 
 __global__ void __launch_bounds__(kStepWarps * 32) markov_step_kernel(const float* __restrict__ ctx_h, const float* __restrict__ ctx_f,
                                                                       const float* __restrict__ bias, const uint16_t* __restrict__ w_sp,
-                                                                      const uint16_t* __restrict__ w1, const int32_t* __restrict__ prev,
+                                                                      const uint16_t* __restrict__ w1_row,
                                                                       const float* __restrict__ state_in, float* __restrict__ state_out,
                                                                       float* __restrict__ latent) {
     __shared__ float xs[2 * kDsRank];
-    markov_step_stage((int) blockIdx.x, ctx_h, ctx_f, bias, w_sp, w1, prev, state_in, state_out, latent, xs);
+    markov_step_stage((int) blockIdx.x, ctx_h, ctx_f, bias, w_sp, w1_row, state_in, state_out, latent, xs);
 }
 
 // ---- the head, screened ------------------------------------------------------------------------------------------------
@@ -408,13 +410,18 @@ __device__ __forceinline__ void exact_x(const Q81* __restrict__ xh_g, const Q81*
 }
 
 // One block: the rows near the best approximate logit scored exactly (a warp per row); the exact best is draft i:
-// *prev = ids[i] = it, conf[i] = its probability (the tiles' softmax sums with the rescored rows made exact).
+// *prev = ids[i] = it, conf[i] = its probability (the tiles' softmax sums with the rescored rows made exact), w1_row = its
+// row of w1: each rescored row's is read (host memory) while the row is scored, the pick's then copied out.
+constexpr int kW1Words = kDsRank * 2 / 16;   // uint4 of a w1 row: a lane each
+static_assert(kW1Words == 32, "a w1 row is a warp's uint4");
 __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __restrict__ xh_g, const Q81* __restrict__ xl_g,
                                                          int n_tiles, const float2* __restrict__ cand, const float2* __restrict__ part,
                                                          int32_t* __restrict__ prev, int32_t* __restrict__ ids,
-                                                         float* __restrict__ conf, int i) {
+                                                         float* __restrict__ conf, int i, const uint16_t* __restrict__ w1,
+                                                         uint16_t* __restrict__ w1_row) {
     __shared__ Q81 xh[kHeadNb], xl[kFoldNb];
     __shared__ px::Final f;
+    __shared__ uint4 wr[px::kMaxCand][kW1Words];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     pdl_wait();
     if (tid == 0) f.cnt = 0;
@@ -422,10 +429,12 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
     const int n = px::collect<false, true>(f, n_tiles, nullptr, cand, prev, conf + i);
     if (n == 0) {   // never: the vocabulary has rows
         if (tid == 0) ids[i] = *prev;
+        if (warp == 0) reinterpret_cast<uint4*>(w1_row)[lane] = reinterpret_cast<const uint4*>(w1 + (int64_t) *prev * kDsRank)[lane];
         return;
     }
     for (int c = warp; c < n; c += 16) {   // by token from here: the pick's tie goes to the lower token
         const int64_t tok = token_of(f.list[c], n_tiles);
+        wr[c][lane] = reinterpret_cast<const uint4*>(w1 + tok * kDsRank)[lane];
         const float y = exact_logit(h, tok, xh, xl, lane);
         if (lane == 0) {
             f.ex[c] = y;
@@ -434,7 +443,11 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
     }
     __syncthreads();
     px::pick_block<false>(f, n, n_tiles, nullptr, part, prev, conf + i);
-    if (tid == 0) ids[i] = *prev;
+    __syncthreads();
+    const int pick = *prev;
+    if (tid == 0) ids[i] = pick;
+    for (int c = warp; c < n; c += 16)
+        if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_row)[lane] = wr[c][lane];
 }
 
 // by_row[r] = by_token[token_of(r)] (0 past the vocabulary).
@@ -556,16 +569,16 @@ void dspark_mix(const float* tap, int64_t tap_stride, int rows, const DsMixArgs&
 
 void dspark_block_inputs(const uint16_t* embedding, const int32_t* meta, const float* embed_norm, float eps, const float* mask,
                          int block, float* x, int32_t* pos3, int32_t* prev, float* state, const float* fr, int fr_cap, float* fr_out,
-                         void* stream) {
+                         const uint16_t* w1, uint16_t* w1_row, void* stream) {
     if (block < 3) throw std::runtime_error("inkling2 dspark block inputs: a block of at least three rows");
     block_inputs_kernel<<<(unsigned) block, kThreads, 0, (cudaStream_t) stream>>>(embedding, meta, embed_norm, eps, mask, x, pos3, prev,
-                                                                                    state, fr, fr_cap, fr_out);
+                                                                                    state, fr, fr_cap, fr_out, w1, w1_row);
     check("block inputs");
 }
 
-void dspark_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp, const uint16_t* w1,
-                        const int32_t* prev, const float* state_in, float* state_out, float* latent, void* stream) {
-    markov_step_kernel<<<kStepBlocks, kStepWarps * 32, 0, (cudaStream_t) stream>>>(ctx_h, ctx_f, bias, w_sp, w1, prev, state_in,
+void dspark_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp, const uint16_t* w1_row,
+                        const float* state_in, float* state_out, float* latent, void* stream) {
+    markov_step_kernel<<<kStepBlocks, kStepWarps * 32, 0, (cudaStream_t) stream>>>(ctx_h, ctx_f, bias, w_sp, w1_row, state_in,
                                                                                     state_out, latent);
     check("Markov step");
 }
@@ -606,7 +619,7 @@ void dspark_head_base(const DsHead& h, const void* hq, int rows, float* approx, 
 }
 
 void dspark_head_pick(const DsHead& h, const void* hq, const void* latq, const float* approx, int i, void* scratch, int32_t* prev,
-                      int32_t* ids, float* conf, void* stream) {
+                      int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream) {
     const cudaStream_t s = (cudaStream_t) stream;
     const int tiles = (int) px::tiles(h.n_vocab);
     float2* cand = (float2*) scratch;
@@ -616,7 +629,7 @@ void dspark_head_pick(const DsHead& h, const void* hq, const void* latq, const f
                (const Q81*) latq, approx + (size_t) i * dspark_screen_rows(h.n_vocab), h.fold_bp, h.cap, h.n_vocab, tiles, cand,
                part);
     launch_pdl(head_final_kernel, dim3(1), dim3(512), 0, s, h, (const Q81*) hq + (size_t) i * kHeadNb, (const Q81*) latq, tiles,
-               (const float2*) cand, (const float2*) part, prev, ids, conf, i);
+               (const float2*) cand, (const float2*) part, prev, ids, conf, i, w1, w1_row);
     check("head pick");
 }
 
