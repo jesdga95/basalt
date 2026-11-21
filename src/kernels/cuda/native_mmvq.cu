@@ -1855,8 +1855,8 @@ __global__ void __launch_bounds__(256) native_q80_mma_seg_kernel(const Q80Block*
 }
 
 bool launch_q80_mma(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
-    // a head-sized product (many blocks of 16 rows) from 4 columns, others from 7 (measured on the RTX 5090 at Inkling's
-    // shapes: the 2304-wide dense products lose at 4-6 columns, where 16-row blocks at two a SM hide less latency)
+    // a head-sized product (many blocks of 16 rows) from 4 columns, others from 7 (narrow dense products lose at 4-6
+    // columns, where 16-row blocks at two a SM hide less latency)
     if (mmvq_mma_sms() == 0 || ncols < (n_out >= 65536 ? 4 : 7)) return false;
     launch_pdl(native_q80_mma_kernel, dim3(unsigned((n_out + 15) / 16)), dim3(256), 0, s,
                static_cast<const Q80Block*>(weights), static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out, ncols);

@@ -3067,7 +3067,7 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
 template<int TD>
 bool down_sub8(const NativeExpertLayout& L) {
     if constexpr (TD == 40) return L.n_ff == 1152;
-    else if constexpr (TD == 8) return L.n_ff == 1152 && L.n_embd == 2304;   // Inkling's Q8_0 layers: 144 calls
+    else if constexpr (TD == 8) return L.n_ff == 1152 && L.n_embd == 2304;   // Q8_0 at 1152 x 2304: 144 calls
     else if constexpr (kDown40<TD> || TD == 42) return false;
     else return L.n_ff % Fmt<TD>::qk == 0 && (L.n_ff / Fmt<TD>::qk) * Fmt<TD>::ipb == kDownSub8Calls;
 }
