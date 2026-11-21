@@ -29,6 +29,30 @@ void ck(cudaError_t e, const char* w) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e)); std::exit(2); }
 }
 
+// Independent CPU selection: rank blocks by score, prefer the lower ID on ties, then emit cells in index order.
+std::vector<int32_t> cpu_cells(const float* scores, const int32_t* step, int64_t block_size) {
+    const int32_t n_cells = step[k::kStepNKv], width = step[k::kStepWidth];
+    const int32_t n_blocks = (int32_t) ((n_cells + block_size - 1) / block_size);
+    std::vector<int32_t> blocks((size_t) n_blocks);
+    for (int32_t i = 0; i < n_blocks; ++i) blocks[(size_t) i] = i;
+    if (n_cells > width) {
+        std::sort(blocks.begin(), blocks.end(), [&](int32_t a, int32_t b) {
+            if (scores[a] == scores[b]) return a < b;
+            return scores[a] > scores[b];
+        });
+    }
+    std::vector<int32_t> selected;
+    selected.reserve((size_t) width);
+    for (const int32_t block : blocks) {
+        const int64_t first = block * block_size;
+        for (int64_t at = first; at < std::min<int64_t>(n_cells, first + block_size) && selected.size() < (size_t) width; ++at)
+            selected.push_back((int32_t) at);
+        if (selected.size() == (size_t) width) break;
+    }
+    std::sort(selected.begin(), selected.end());
+    return selected;
+}
+
 bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted) {
     const k::QsaShapes s = k::qsa_real_shapes();
     const int64_t max_blocks = capacity / s.idx_block + 2, cap = k::qsa_selection_width(k::kTopkMaxCells, s);
@@ -73,8 +97,28 @@ bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted)
         ck(cudaMemcpy(b.data(), ids_new, b.size() * 4, cudaMemcpyDeviceToHost), "down");
         int64_t n = 0;
         for (int64_t i = 0; i < nq; ++i) {
-            const int64_t w = steps[(size_t) (i * k::kStepCount + k::kStepWidth)];
+            const int32_t* step = steps.data() + i * k::kStepCount;
+            const int64_t w = step[k::kStepWidth];
             n += std::equal(a.begin() + i * cap, a.begin() + i * cap + w, b.begin() + i * cap);
+            if (i == 0 || i == nq / 2 || i == nq - 1) {
+                const auto expected = cpu_cells(sc.data() + i * max_blocks, step, s.idx_block);
+                if (expected.size() != (size_t) w || !std::equal(expected.begin(), expected.end(), b.begin() + i * cap)) {
+                    std::fprintf(stderr, "CPU Top-k mismatch: context %lld, query %lld\n", (long long) ctx, (long long) i);
+                    return -1;
+                }
+            }
+        }
+        const int64_t middle = nq / 2;
+        const int32_t* middle_step = steps.data() + middle * k::kStepCount;
+        const int64_t width = middle_step[k::kStepWidth];
+        const int64_t one_active = counted ? middle_step[k::kStepNBid] + 1 : -1;
+        k::qsa_block_topk(d_scores + middle * max_blocks, d_steps + middle * k::kStepCount,
+                          1, max_blocks, cap, s, ids_new, nullptr, one_active);
+        std::vector<int32_t> single((size_t) width);
+        ck(cudaMemcpy(single.data(), ids_new, single.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "download single");
+        if (!std::equal(single.begin(), single.end(), b.begin() + middle * cap)) {
+            std::fprintf(stderr, "Top-k changed with batch width or position: context %lld\n", (long long) ctx);
+            return -1;
         }
         return n;
     };
