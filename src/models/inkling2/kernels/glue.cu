@@ -86,10 +86,11 @@ __device__ __forceinline__ void q8_store(float x, Q81* row, int c) {
     if ((c & 31) == 0) b.ds = bk::q8_1_ds(d, sum);
 }
 
-// The block-residual mix of the n states v[i] (thread-held values) scored by NQ queries: scores q . s / sqrt(kWidth) over
-// the RMS-normed states (eps 1e-6), softmax, the weighted sum of the normed states.
+// The block-residual mix of the n states v[i] (thread-held values) scored by NQ queries (thread-held values qv, loaded
+// before the kernel's pdl_wait): scores q . s / sqrt(kWidth) over the RMS-normed states (eps 1e-6), softmax, the weighted
+// sum of the normed states.
 template <int NQ>
-__device__ __forceinline__ void mix_rows(const float (&v)[kMaxMix][kPer], int n, const float* __restrict__ queries,
+__device__ __forceinline__ void mix_rows(const float (&v)[kMaxMix][kPer], int n, const float (&qv)[NQ][kPer],
                                          float (&mixed)[NQ][kPer], float* red) {
     float part[kMaxMix * (NQ + 1)];
 #pragma unroll
@@ -99,11 +100,10 @@ __device__ __forceinline__ void mix_rows(const float (&v)[kMaxMix][kPer], int n,
         if (i >= n) break;
 #pragma unroll
         for (int j = 0; j < kPer; ++j) {
-            const int c = threadIdx.x + j * kThreads;
             const float x = v[i][j];
             part[i * (NQ + 1)] = fmaf(x, x, part[i * (NQ + 1)]);
 #pragma unroll
-            for (int q = 0; q < NQ; ++q) part[i * (NQ + 1) + 1 + q] = fmaf(queries[q * kWidth + c], x, part[i * (NQ + 1) + 1 + q]);
+            for (int q = 0; q < NQ; ++q) part[i * (NQ + 1) + 1 + q] = fmaf(qv[q][j], x, part[i * (NQ + 1) + 1 + q]);
         }
     }
     block_sums<kMaxMix * (NQ + 1)>(part, red);
@@ -136,8 +136,14 @@ __device__ __forceinline__ void mix_rows(const float (&v)[kMaxMix][kPer], int n,
     }
 }
 
-// RMS norm of the thread-held row x with weights w, into q8_1 (and fp32 when `f32` is set).
-__device__ __forceinline__ void norm_q8(const float (&x)[kPer], const float* __restrict__ w, float eps, void* q8, float* f32,
+// Thread t's kPer values of a kWidth vector (t, t + 768, t + 1536): a kernel loads its weights so before its pdl_wait.
+__device__ __forceinline__ void load_row(const float* __restrict__ p, float (&x)[kPer]) {
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) x[j] = p[threadIdx.x + j * kThreads];
+}
+
+// RMS norm of the thread-held row x with the thread-held weights w, into q8_1 (and fp32 when `f32` is set).
+__device__ __forceinline__ void norm_q8(const float (&x)[kPer], const float (&w)[kPer], float eps, void* q8, float* f32,
                                         int r, float* red) {
     float ss[1] = {0.f};
 #pragma unroll
@@ -148,7 +154,7 @@ __device__ __forceinline__ void norm_q8(const float (&x)[kPer], const float* __r
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
         const int c = threadIdx.x + j * kThreads;
-        const float y = x[j] * inv * w[c];
+        const float y = x[j] * inv * w[j];
         if (f32) f32[(size_t) r * kWidth + c] = y;
         q8_store(y, row, c);
     }
@@ -168,10 +174,13 @@ __device__ __forceinline__ float conv_in(const float* __restrict__ y, int64_t ld
 
 // Block (row, output q): the mix scored by query q (or the last state), then its norm into q8_1, or the mix as it is.
 __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
+    const int r = blockIdx.x, q = blockIdx.y, n = a.st.n;
+    float qv[1][kPer], nw[kPer];   // the weights, read while the kernel before finishes
+    if (a.queries) load_row(a.queries + (size_t) q * kWidth, qv[0]);
+    if (!a.mix_out) load_row(a.norm[q], nw);
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     __shared__ float red[kMaxMix * 2 * (kWarpsB + 1)];
-    const int r = blockIdx.x, q = blockIdx.y, n = a.st.n;
     float v[kMaxMix][kPer];
 #pragma unroll
     for (int i = 0; i < kMaxMix; ++i) {
@@ -187,7 +196,7 @@ __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
 #pragma unroll
                 for (int j = 0; j < kPer; ++j) mixed[0][j] = v[i][j];
     } else {
-        mix_rows<1>(v, n, a.queries + (size_t) q * kWidth, mixed, red);
+        mix_rows<1>(v, n, qv, mixed, red);
     }
     if (a.mix_out) {
 #pragma unroll
@@ -195,7 +204,7 @@ __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
             a.mix_out[(size_t) q * a.out_stride + (size_t) r * kWidth + threadIdx.x + j * kThreads] = mixed[0][j];
         return;
     }
-    norm_q8(mixed[0], a.norm[q], a.eps, a.q8[q], q == 0 ? a.norm_out : nullptr, r, red);
+    norm_q8(mixed[0], nw, a.eps, a.q8[q], q == 0 ? a.norm_out : nullptr, r, red);
 }
 
 // ---- loop controllers --------------------------------------------------------------------------------------------------
@@ -209,14 +218,27 @@ constexpr int kSlice = 2 * kWidth / kDownWarps;   // 576 inputs a warp
 static_assert(kWidth % (kSlice / 2) == 0 && kSlice % 64 == 0, "a slice is whole pairs of every lane, inside one half");
 template<int O>
 __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, int rows) {
-    bk::pdl_wait();
-    bk::pdl_launch_dependents();
     __shared__ float part[kDownWarps][O][kDecodeRows][2];
     const int o0 = blockIdx.x * O, s = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const bool second = w >= kDownWarps / 2;
     const int c0 = (w % (kDownWarps / 2)) * kSlice;   // the slice's first channel in its half
     const float* in = second ? a.msg[s] : a.dest[s];
     const uint32_t* wr = reinterpret_cast<const uint32_t*>(a.down[s] + (size_t) o0 * 2 * kWidth + (second ? kWidth : 0) + c0);
+    // kIn of a lane's input pairs of every row are loaded before their sums, so the loads overlap instead of each waiting
+    // for the one before it (a window's 8 rows were 72 loads in a row); the sums are added in the same order as one at a
+    // time. The lane's weights are all read before pdl_wait, while the kernel before finishes.
+    constexpr int kIn = 3;
+    constexpr int kIters = kSlice / 2 / (32 * kIn);
+    static_assert((kSlice / 2) % (32 * kIn) == 0, "a lane's pairs split into whole batches");
+    uint32_t wu[kIters][kIn][O];
+#pragma unroll
+    for (int it = 0; it < kIters; ++it)
+#pragma unroll
+        for (int b = 0; b < kIn; ++b)
+#pragma unroll
+            for (int j = 0; j < O; ++j) wu[it][b][j] = wr[(size_t) j * kWidth + lane + 32 * (it * kIn + b)];   // output o0 + j: 2 kWidth bf16, kWidth words
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
     float dot[O][kDecodeRows], sq[kDecodeRows];
 #pragma unroll
     for (int t = 0; t < kDecodeRows; ++t) {
@@ -224,12 +246,9 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
 #pragma unroll
         for (int j = 0; j < O; ++j) dot[j][t] = 0.f;
     }
-    // kIn of a lane's input pairs of every row are loaded before their sums, so the loads overlap instead of each waiting
-    // for the one before it (a window's 8 rows were 72 loads in a row); the sums are added in the same order as one at a
-    // time
-    constexpr int kIn = 3;
-    static_assert((kSlice / 2) % (32 * kIn) == 0, "a lane's pairs split into whole batches");
-    for (int i0 = lane; i0 < kSlice / 2; i0 += 32 * kIn) {
+#pragma unroll
+    for (int it = 0; it < kIters; ++it) {
+        const int i0 = lane + it * 32 * kIn;
         float2 x[kIn][kDecodeRows];
         float w0[kIn][O], w1[kIn][O];
 #pragma unroll
@@ -237,7 +256,7 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
             const int i = i0 + 32 * b;
 #pragma unroll
             for (int j = 0; j < O; ++j) {
-                const uint32_t u = wr[(size_t) j * kWidth + i];   // output o0 + j: 2 kWidth bf16, kWidth words
+                const uint32_t u = wu[it][b][j];
                 w0[b][j] = __uint_as_float(u << 16);
                 w1[b][j] = __uint_as_float(u & 0xffff0000u);
             }
@@ -288,22 +307,38 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
 
 // gf[s][r][i] = up_s[i] . hid[s][r] for the 2 kWidth rows of up_s: eight lanes a row (rank / 8 values each), 32 rows a
 // block.
+constexpr int kUpWords = 8;   // a lane's first weight words, read before pdl_wait (all of them up to rank 128)
 __global__ void __launch_bounds__(256) ctrl_up_kernel(CtrlArgs a, int rows) {
-    bk::pdl_wait();
-    bk::pdl_launch_dependents();
     extern __shared__ float hs[];   // [rows][rank]
     const int s = blockIdx.y;
+    const int row = blockIdx.x * 32 + (threadIdx.x >> 3), part = threadIdx.x & 7;
+    const int per = a.rank / 8;
+    const uint32_t* ur = reinterpret_cast<const uint32_t*>(a.up[s] + (size_t) row * a.rank + part * per);
+    uint32_t u0w[kUpWords];
+#pragma unroll
+    for (int k = 0; k < kUpWords; ++k) u0w[k] = row < 2 * kWidth && k < per / 2 ? ur[k] : 0u;
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
     const float* hid = a.scratch + (size_t) s * kDecodeRows * a.rank;
     for (int i = threadIdx.x; i < rows * a.rank; i += blockDim.x) hs[i] = hid[i];
     __syncthreads();
-    const int row = blockIdx.x * 32 + (threadIdx.x >> 3), part = threadIdx.x & 7;
-    const int per = a.rank / 8;
     float acc[kDecodeRows];
 #pragma unroll
     for (int t = 0; t < kDecodeRows; ++t) acc[t] = 0.f;
     if (row < 2 * kWidth) {
-        const uint32_t* ur = reinterpret_cast<const uint32_t*>(a.up[s] + (size_t) row * a.rank + part * per);
-        for (int k = 0; k < per / 2; ++k) {
+#pragma unroll
+        for (int k = 0; k < kUpWords; ++k) {
+            if (k >= per / 2) break;
+            const uint32_t u = u0w[k];
+            const float u0 = __uint_as_float(u << 16), u1 = __uint_as_float(u & 0xffff0000u);
+            const int kk = part * per + 2 * k;
+#pragma unroll
+            for (int t = 0; t < kDecodeRows; ++t) {
+                if (t >= rows) break;
+                acc[t] = fmaf(u1, hs[t * a.rank + kk + 1], fmaf(u0, hs[t * a.rank + kk], acc[t]));
+            }
+        }
+        for (int k = kUpWords; k < per / 2; ++k) {
             const uint32_t u = ur[k];
             const float u0 = __uint_as_float(u << 16), u1 = __uint_as_float(u & 0xffff0000u);
             const int kk = part * per + 2 * k;
@@ -328,10 +363,12 @@ __global__ void __launch_bounds__(256) ctrl_up_kernel(CtrlArgs a, int rows) {
 
 // The blend of stream s and row r, then its norm into q8_1.
 __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
+    const int r = blockIdx.x, s = blockIdx.y;
+    float nw[kPer];
+    load_row(a.norm[s], nw);
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     __shared__ float red[kWarpsB + 1];
-    const int r = blockIdx.x, s = blockIdx.y;
     const float* gf = a.scratch + (size_t) kMaxStreams * kDecodeRows * a.rank + ((size_t) s * kDecodeRows + r) * 2 * kWidth;
     float y[kPer];
 #pragma unroll
@@ -340,7 +377,7 @@ __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
         const float g = tanhf(gf[c]), f = tanhf(gf[kWidth + c]);
         y[j] = (1.f - f) * a.dest[s][(size_t) r * kWidth + c] + g * a.msg[s][(size_t) r * kWidth + c];
     }
-    norm_q8(y, a.norm[s], a.eps, a.q8[s], s == 0 ? a.norm_out : nullptr, r, red);
+    norm_q8(y, nw, a.eps, a.q8[s], s == 0 ? a.norm_out : nullptr, r, red);
 }
 
 // ---- attention preparation ---------------------------------------------------------------------------------------------
@@ -361,15 +398,34 @@ __device__ __forceinline__ void store_kv(void* cache, bool fp8, size_t idx, floa
 // Block (row, key/value head g), four warps: warp 0 the head's keys (convolved, clipped, cached; the raw inputs into the
 // ring), warp 1 its values (normed), warps 2 and 3 its three query heads, their relative states and sinks.
 __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
+    const int r = blockIdx.x, g = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    // the weights, read while the kernel before finishes: warps 0 and 1 their channels' taps, warps 2 and 3 their heads'
+    // clip scales
+    float wt[4][kConv];
+    if (w < 2) {
+        const float* taps = w ? a.v_conv : a.k_conv;
+#pragma unroll
+        for (int u = 0; u < 4; ++u)
+#pragma unroll
+            for (int j = 0; j < kConv; ++j) wt[u][j] = taps[(g * kHeadDim + lane * 4 + u) * kConv + (kConv - 1 - j)];
+    } else {
+        const int h0 = g * 3 + (w == 2 ? 0 : 2);
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            wt[u][0] = a.q_scale[h0 * kHeadDim + lane * 4 + u];
+            wt[u][1] = w == 2 ? a.q_scale[(h0 + 1) * kHeadDim + lane * 4 + u] : 0.f;
+        }
+        if (w == 3)
+#pragma unroll
+            for (int k = 0; k < 3; ++k) wt[k][2] = lane < kRel ? a.r_scale[(g * 3 + k) * kRel + lane] : 0.f;
+    }
     bk::pdl_wait();
     bk::pdl_launch_dependents();
-    const int r = blockIdx.x, g = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int p = a.pos[r];
     if (w < 2) {
         const float* yall = w ? a.yv : a.yk;
         const int64_t ld = w ? a.ldv : a.ldk;
         const float* y = yall + (size_t) r * ld;
-        const float* taps = w ? a.v_conv : a.k_conv;
         float* ring = w ? a.v_ring : a.k_ring;
         const float inv_k = a.full ? (1.f / 3.f) : rsqrtf((float) kConv + 1.f);
         float val[4], raw[4], ss = 0.f;
@@ -382,7 +438,7 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
             for (int j = 0; j < kConv; ++j) {
                 const float x = conv_in(yall, ld, ring, kKvHeads * kHeadDim, a.pos, r, j, c);
                 if (j == 0) raw[u] = x;
-                float t = taps[c * kConv + (kConv - 1 - j)];
+                float t = wt[u][j];
                 if (a.full) t += y[kOffTaps + g * kConv + j];
                 acc = fmaf(t, x, acc);
             }
@@ -408,7 +464,7 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
             const int i = lane * 4 + u;
-            q[u] = yq[kOffQ + h * kHeadDim + i] * a.q_scale[h * kHeadDim + i];
+            q[u] = yq[kOffQ + h * kHeadDim + i] * (h == h0 ? wt[u][0] : wt[u][1]);
             ss = fmaf(q[u], q[u], ss);
         }
         ss = warp_sum(ss);
@@ -418,7 +474,8 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
     }
     if (w == 3) {
         for (int h = g * 3; h < g * 3 + 3; ++h) {
-            const float rv = lane < kRel ? yq[kOffR + h * kRel + lane] * a.r_scale[h * kRel + lane] : 0.f;
+            const int k = h - g * 3;
+            const float rv = lane < kRel ? yq[kOffR + h * kRel + lane] * (k == 0 ? wt[0][2] : k == 1 ? wt[1][2] : wt[2][2]) : 0.f;
             const float rs = warp_sum(rv * rv);
             const float fr = fminf(a.rel_clip / (sqrtf(rs) + 1e-6f), 1.f) * tau;
             if (lane < kRel) a.r[((size_t) r * kHeads + h) * kRel + lane] = rv * fr;
@@ -430,6 +487,13 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
 // ---- after the attention -----------------------------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
+    float taps[kPer][kConv], qv[1][kPer], nw[kPer];   // the weights, read while the kernel before finishes
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+#pragma unroll
+        for (int k = 0; k < kConv; ++k) taps[j][k] = a.taps[(threadIdx.x + j * kThreads) * kConv + (kConv - 1 - k)];
+    load_row(a.query, qv[0]);
+    if (!a.mix_out) load_row(a.norm, nw);
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     __shared__ float red[kMaxMix * 2 * (kWarpsB + 1)];
@@ -443,22 +507,28 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
 #pragma unroll
         for (int j = 0; j < kPer; ++j) v[i][j] = s[(size_t) r * kWidth + threadIdx.x + j * kThreads];
     }
-    // the convolution of the output projection's rows, the residual, the ring slot of this row
+    // the convolution of the output projection's rows, the residual, the ring slot of this row: every input is read
+    // before the first store (the ring is one of them)
+    float xin[kPer][kConv], hres[kPer];
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        const int c = threadIdx.x + j * kThreads;
+#pragma unroll
+        for (int k = 0; k < kConv; ++k) xin[j][k] = conv_in(a.o, kWidth, a.ring, kWidth, a.pos, r, k, c);
+        hres[j] = a.boundary ? 0.f : a.hid[(size_t) r * kWidth + c];
+    }
+    const int slot = a.pos[r] % kConvRing;
     float res[kPer];
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
         const int c = threadIdx.x + j * kThreads;
-        float acc = 0.f, x0 = 0.f;
+        float acc = 0.f;
 #pragma unroll
-        for (int k = 0; k < kConv; ++k) {
-            const float x = conv_in(a.o, kWidth, a.ring, kWidth, a.pos, r, k, c);
-            if (k == 0) x0 = x;
-            acc = fmaf(a.taps[c * kConv + (kConv - 1 - k)], x, acc);
-        }
-        const float conv = __fmul_rn(acc + x0, rsqrtf((float) kConv + 1.f));
-        res[j] = a.boundary ? conv : conv + a.hid[(size_t) r * kWidth + c];
+        for (int k = 0; k < kConv; ++k) acc = fmaf(taps[j][k], xin[j][k], acc);
+        const float conv = __fmul_rn(acc + xin[j][0], rsqrtf((float) kConv + 1.f));
+        res[j] = a.boundary ? conv : conv + hres[j];
         a.resid[(size_t) r * kWidth + c] = res[j];
-        a.ring[(size_t) (a.pos[r] % kConvRing) * kWidth + c] = x0;
+        a.ring[(size_t) slot * kWidth + c] = xin[j][0];
     }
 #pragma unroll
     for (int i = 0; i < kMaxMix; ++i)
@@ -466,13 +536,13 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
 #pragma unroll
             for (int j = 0; j < kPer; ++j) v[i][j] = res[j];
     float mixed[1][kPer];
-    mix_rows<1>(v, n, a.query, mixed, red);
+    mix_rows<1>(v, n, qv, mixed, red);
     if (a.mix_out) {
 #pragma unroll
         for (int j = 0; j < kPer; ++j) a.mix_out[(size_t) r * kWidth + threadIdx.x + j * kThreads] = mixed[0][j];
         return;
     }
-    norm_q8(mixed[0], a.norm, a.eps, a.q8, a.norm_out, r, red);
+    norm_q8(mixed[0], nw, a.eps, a.q8, a.norm_out, r, red);
 }
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
@@ -481,11 +551,14 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
 // window that its convolution reads, the ring for the positions before the window, plus the residual; the ring takes this
 // row's sum.
 __global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
+    const int r = blockIdx.x;
+    const int c = blockIdx.y * 256 + threadIdx.x;
+    float taps[kConv];   // read while the kernel before finishes
+#pragma unroll
+    for (int j = 0; j < kConv; ++j) taps[j] = a.taps[c * kConv + (kConv - 1 - j)];
     bk::pdl_wait();
     bk::pdl_launch_dependents();
-    const int r = blockIdx.x;
     {
-        const int c = blockIdx.y * 256 + threadIdx.x;
         float acc = 0.f, x0 = 0.f;
 #pragma unroll
         for (int j = 0; j < kConv; ++j) {
@@ -498,7 +571,7 @@ __global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
                 x = p < 0 ? 0.f : a.ring[(size_t) (p % kConvRing) * kWidth + c];
             }
             if (j == 0) x0 = x;
-            acc = fmaf(a.taps[c * kConv + (kConv - 1 - j)], x, acc);
+            acc = fmaf(taps[j], x, acc);
         }
         const size_t i = (size_t) r * kWidth + c;
         a.out[i] = __fmul_rn(acc + x0, rsqrtf((float) kConv + 1.f)) + a.resid[i];

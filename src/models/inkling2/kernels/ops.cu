@@ -271,19 +271,23 @@ __global__ void post_conv_kernel(const float* __restrict__ x, const int32_t* __r
 
 // One block: the (row, slot) pairs counted by expert (the experts on the card); a warp scans the counts into each used
 // expert's group and first entry; each pair then takes its place in its group from the pairs before it that chose the same
-// expert (the rows' order).
+// expert (the rows' order). The blob table (constant) is staged in shared memory before pdl_wait.
 __global__ void moe_plan_kernel(const int32_t* __restrict__ ids, int n, int n_expert, const unsigned long long* __restrict__ blobs,
                                 unsigned long long* __restrict__ ptr, int32_t* __restrict__ start, int32_t* __restrict__ n_groups,
                                 int32_t* __restrict__ dst, int32_t* __restrict__ tok, int k, uint32_t* __restrict__ tally) {
+    extern __shared__ unsigned long long smb[];
+    unsigned long long* blob = smb;                                // [n_expert]
+    int32_t* count = reinterpret_cast<int32_t*>(smb + n_expert);   // [n_expert]
+    int32_t* first = count + n_expert;                             // [n_expert]: the expert's first entry
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+        blob[e] = blobs[e];
+        count[e] = 0;
+    }
     bk::pdl_wait();
     bk::pdl_launch_dependents();
-    extern __shared__ int32_t sm[];
-    int32_t* count = sm;              // [n_expert]
-    int32_t* first = sm + n_expert;   // [n_expert]: the expert's first entry
-    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) count[e] = 0;
     __syncthreads();
     for (int i = threadIdx.x; i < n; i += blockDim.x)
-        if (blobs[ids[i]]) atomicAdd(&count[ids[i]], 1);
+        if (blob[ids[i]]) atomicAdd(&count[ids[i]], 1);
     __syncthreads();
     if (threadIdx.x < 32) {
         const int lane = threadIdx.x;
@@ -302,7 +306,7 @@ __global__ void moe_plan_kernel(const int32_t* __restrict__ ids, int n, int n_ex
             }
             if (e < n_expert) first[e] = at + s - c;
             if (c > 0) {
-                ptr[g + used - 1] = blobs[e];
+                ptr[g + used - 1] = blob[e];
                 start[g + used - 1] = at + s - c;
             }
             at += __shfl_sync(0xffffffffu, s, 31);
@@ -320,7 +324,7 @@ __global__ void moe_plan_kernel(const int32_t* __restrict__ ids, int n, int n_ex
             if (count[e]) atomicAdd(&tally[e], (uint32_t) count[e]);
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const int e = ids[i];
-        if (!blobs[e]) continue;
+        if (!blob[e]) continue;
         int before = 0;
         for (int j = 0; j < i; ++j) before += ids[j] == e;
         const int at = first[e] + before;
@@ -409,7 +413,8 @@ void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned 
     const int n = rows * k;
     if (n <= 0) return;
     if (n > 1024) throw std::runtime_error("inkling2 moe_plan: more than 1024 pairs");
-    bk::launch_pdl(moe_plan_kernel, dim3(1), dim3(256), (size_t) 2 * n_expert * sizeof(int32_t), (cudaStream_t) stream, ids, n,
+    bk::launch_pdl(moe_plan_kernel, dim3(1), dim3(256), (size_t) n_expert * (sizeof(unsigned long long) + 2 * sizeof(int32_t)),
+                   (cudaStream_t) stream, ids, n,
                    n_expert, blobs, ptr, start, n_groups, dst, tok, k, tally);
     check("moe_plan");
 }
