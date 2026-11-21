@@ -66,6 +66,8 @@ mask rows, reading keys and values made from the target's visits 5, 23 and 41 an
 head over the target's head (screened through 2-bit copies of its rows). The draft policy picks each window by expected
 tokens per millisecond (`include/basalt/spec/draft_policy.hpp`). `--spec N` caps the window (default 8: the last accepted token
 plus the block); `--spec 1` turns it off. The target checks every draft: output is plain decoding's.
+A window also takes a draft copied from an earlier repeat of the context (`--suffix-draft`, default 3) when the policy expects
+more from it than from the block: a 2,405-token copy prompt decodes 13 % faster.
 
 ## Parallel slots
 
@@ -101,11 +103,11 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
 
 | | Inkling 2 Mini | llama.cpp, IQ4_NL GGUF | Qwen3.8-27B (Basalt) |
 | --- | ---: | ---: | ---: |
-| Decode: conversation | 338 tok/s | 94.5 | 261 |
-| Decode: struct | 613 tok/s | 92.5 | 768 |
-| Decode: prose | 287 tok/s | 94.5 | 192 |
-| Prompt read | 12,240 tok/s (16K) | 3,093 (`llama-bench` pp512) | 10,757 (16K) |
+| Decode: conversation | 347 tok/s | 94.5 | 261 |
+| Decode: struct | 628 tok/s | 92.5 | 768 |
+| Decode: prose | 296 tok/s | 94.5 | 192 |
+| Prompt read | 12,310 tok/s (16K) | 3,093 (`llama-bench` pp512) | 10,757 (16K) |
 
-Drafts accepted: conversation 68.0 %, struct 97.6 %, prose 51.3 %. llama.cpp (29b52d398, `-fa 1`, full offload, no drafting)
+Drafts accepted: conversation 68.0 %, struct 97.5 %, prose 50.7 %. llama.cpp (29b52d398, `-fa 1`, full offload, no drafting)
 ran the same token ids through `llama-server` with the same lengths and temperatures; `llama-bench` tg128 reads 96.3 tok/s.
 The struct fixture runs to its 8,192-token cap on both engines.

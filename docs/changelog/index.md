@@ -4,6 +4,7 @@ Releases, newest first. Versions are 0.x: a minor release adds a model or anothe
 
 | Release | Date | Summary |
 | --- | --- | --- |
+| [0.5.6](0.5.6.md) | 2026-11-21 | Inkling 2 Mini decodes 2 to 3 % faster (bitwise the same output), and drafts from an earlier repeat of the context where a prompt copies. |
 | [0.5.5](0.5.5.md) | 2026-11-21 | Inkling 2 Mini: a looped mixture of experts on one card, with images, the DSpark drafter and up to 1M tokens of context where the card has room. |
 | [0.5.0](0.5.0.md) | 2026-11-19 | Hy4-flash: a mixture of experts with a 1M-token context (elastic fp16 or FP8 caches), images, the DFly2 drafter and a shipped expert profile; per-layer expert copies, a bounded lend and partial reclaim in the shared expert tier. |
 | [0.4.1](0.4.1.md) | 2026-11-16 | Qwen3.8-27B on two cards (prompt line, layer split), YaRN past 262,144 and K/V streaming; Flash-Next's RAM plan leaves room again on 64 GB boxes; `--parallel` prompts tokenized in the engine; DeepSeek tiers on up to four cards. |
