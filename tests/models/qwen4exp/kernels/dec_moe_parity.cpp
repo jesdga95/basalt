@@ -3,7 +3,8 @@
 //     build/dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N]
 //     build/dec_moe_parity --nvfp4 [--bench | --stress N]   (synthetic NVFP4 experts with their scale tail, no GGUF)
 //     build/dec_moe_parity --kq [--bench]        (synthetic Q4_K / Q5_K / Q6_K gate/up with Q5_1 / Q8_0 down, and
-//                                                 IQ2_XXS / IQ2_S / IQ3_XXS / IQ4_XS gate/up with Q5_0 down, no GGUF)
+//                                                 IQ2_XXS / IQ2_S / IQ3_XXS / IQ4_XS gate/up with Q5_0 down, and
+//                                                 IQ2_S / IQ3_XXS / IQ3_S gate/up with Q5_1 down, no GGUF)
 //
 // Per layer (default: one of each gate/up + down format pair):
 //   peer math   the persistent kernel's work items (dec_moe_peer_math_test) vs native_expert_grouped, every card
@@ -16,10 +17,12 @@
 //   staged      (no peers) the share of CPU misses copied from host RAM into staging: the route's, the ring's, the
 //               glue's and the stage kernel's kinds vs a CPU reference of the split, the staged lists and bytes, and the
 //               tail against the same window with those experts resident in VRAM
-// All bitwise.  --bench adds: the VRAM share's grouped call (us, GB/s of expert bytes), and per ring on CUDA0 the
-// route + wait with and without peer entries, alone and behind the VRAM call (what CUDA0 waits for the peer), and the
-// staged share's copy (us, GB/s over the link).
+// All bitwise. The mixed i-quant / Q5_1 pairs also check group width and a dequantized CPU reference.
+// --bench adds: the VRAM share's grouped call (us, GB/s of expert bytes), and per ring on CUDA0 the route + wait
+// with and without peer entries, alone and behind the VRAM call (what CUDA0 waits for the peer), and the staged
+// share's copy (us, GB/s over the link).
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/ggml/ggml.h"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -174,6 +177,56 @@ struct Groups {   // a grouped call's lists on one device
         ck(cudaMemcpy(d_tok, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice), "up");
     }
 };
+
+// Compare the persistent kernel against a double-precision expert on the same encoded weights and q8_1 input.
+void check_iq_q5_reference(const K::NativeExpertLayout& layout, const std::vector<uint8_t>& blobs,
+                           const std::vector<uint8_t>& xq, const Groups& groups, const std::vector<float>& got,
+                           int layer, const uint8_t* device_blobs) {
+    const auto* gate_type = ggml_get_type_traits((ggml_type) layout.gu_type);
+    const auto* down_type = ggml_get_type_traits((ggml_type) layout.d_type);
+    std::vector<float> row(H);
+    auto dot = [&](const ggml_type_traits* type, const uint8_t* weights, const double* activation, int64_t count) {
+        type->to_float(weights, row.data(), count);
+        double sum = 0;
+        for (int64_t i = 0; i < count; ++i) sum += (double) row[i] * activation[i];
+        return sum;
+    };
+    double max_abs = 0, max_rel = 0;
+    bool finite = true;
+    for (size_t group = 0; group < groups.ptr.size(); ++group) {
+        const uint8_t* blob = blobs.data() + (groups.ptr[group] - reinterpret_cast<uintptr_t>(device_blobs));
+        const int entry = groups.start[group];
+        const uint8_t* encoded = xq.data() + (size_t) groups.tok[entry] * (H / 32 * 36);
+        std::vector<double> activation(H), hidden(FF);
+        for (int64_t block = 0; block < H / 32; ++block) {
+            ggml_fp16_t scale;
+            std::memcpy(&scale, encoded + block * 36, sizeof scale);
+            const double d = ggml_fp16_to_fp32(scale);
+            for (int i = 0; i < 32; ++i) activation[block * 32 + i] = d * (int8_t) encoded[block * 36 + 4 + i];
+        }
+        for (int64_t i = 0; i < FF; ++i) {
+            const double gate = dot(gate_type, blob + i * layout.gu_row, activation.data(), H);
+            const double up = dot(gate_type, blob + layout.up_off + i * layout.up_row, activation.data(), H);
+            hidden[i] = gate / (1.0 + std::exp(-gate)) * up;
+        }
+        double row_error = 0, row_peak = 0;
+        for (int64_t i = 0; i < H; ++i) {
+            const double ref = dot(down_type, blob + layout.down_off + i * layout.d_row, hidden.data(), FF);
+            const double error = std::fabs(got[(size_t) groups.dst[entry] * H + i] - ref);
+            finite = finite && std::isfinite(error);
+            row_error = std::max(row_error, error);
+            row_peak = std::max(row_peak, std::fabs(ref));
+        }
+        finite = finite && row_peak > 0;
+        max_abs = std::max(max_abs, row_error);
+        if (row_peak > 0) max_rel = std::max(max_rel, row_error / row_peak);
+    }
+    // The device quantizes the SwiGLU result for the down projection; the reference retains it in double.
+    const bool ok = finite && max_rel < 3e-2;
+    std::printf("  peer math vs CPU double layer %2d: max abs %.3e, worst row rel %.3e %s\n",
+                layer, max_abs, max_rel, ok ? "ok" : "FAIL");
+    if (!ok) ++g_fail;
+}
 
 double time_us(cudaStream_t s, int iters, const std::function<void()>& f) {
     cudaEvent_t e0, e1;
@@ -545,7 +598,8 @@ int main(int argc, char** argv) {
         fmt[0] = {12, 7}; fmt[1] = {12, 8}; fmt[2] = {13, 8}; fmt[3] = {8, 8}; fmt[4] = {14, 8};
         fmt[5] = {16, 6}; fmt[6] = {22, 6}; fmt[7] = {18, 6}; fmt[8] = {23, 6};
         fmt[9] = {21, 8}; fmt[10] = {23, 8};
-        auto_layers = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}; stress_n = 0;
+        fmt[11] = {22, 7}; fmt[12] = {18, 7}; fmt[13] = {21, 7};
+        auto_layers = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}; stress_n = 0;
     }
     for (int l = 0; !synth && l < 64; ++l) {
         const basalt::GgufFile& gguf = *gguf_p;
@@ -657,6 +711,31 @@ int main(int argc, char** argv) {
             ck(cudaStreamSynchronize(s), "peer math");
             const auto a = down(dv[d].out, (size_t) K::kDmCap * H), b = down(dv[d].out2, (size_t) K::kDmCap * H);
             report(d ? "peer math (device 1)" : "peer math (device 0)", l, ndiff_rows(a, b, rows), rows.size() * H);
+            if (d == 0 && kq && dt == GGML_TYPE_Q5_1 &&
+                (gt == GGML_TYPE_IQ2_S || gt == GGML_TYPE_IQ3_XXS || gt == GGML_TYPE_IQ3_S)) {
+                const auto xq = down(static_cast<const uint8_t*>(dv[d].xq), (size_t) MT * H / 32 * 36);
+                check_iq_q5_reference(L, blobs, xq, G, b, l, dv[d].blob);
+
+                // Compute the same entries as singleton groups, preserving their activations and destinations.
+                std::vector<unsigned long long> singleton_ptrs(e);
+                std::vector<int32_t> singleton_starts(e + 1);
+                for (size_t group = 0; group < G.ptr.size(); ++group) {
+                    for (int i = G.start[group]; i < G.start[group + 1]; ++i) {
+                        singleton_ptrs[i] = G.ptr[group];
+                        singleton_starts[i] = i;
+                    }
+                }
+                singleton_starts[e] = e;
+                ck(cudaMemcpy(G.d_ptr, singleton_ptrs.data(), singleton_ptrs.size() * sizeof(singleton_ptrs[0]),
+                              cudaMemcpyHostToDevice), "singleton pointers");
+                ck(cudaMemcpy(G.d_start, singleton_starts.data(), singleton_starts.size() * sizeof(singleton_starts[0]),
+                              cudaMemcpyHostToDevice), "singleton starts");
+                ck(cudaMemsetAsync(dv[d].out2, 0xff, (size_t) K::kDmCap * H * 4, s), "memset");
+                K::dec_moe_peer_math_test(L, G.d_ptr, G.d_start, e, G.d_tok, G.d_dst, dv[d].xq, dv[d].scr2, dv[d].out2, s);
+                ck(cudaStreamSynchronize(s), "singleton peer math");
+                const auto singleton = down(dv[d].out2, (size_t) K::kDmCap * H);
+                report("peer math (alone vs group)", l, ndiff_rows(b, singleton, rows), rows.size() * H);
+            }
         }
         ck(cudaSetDevice(0), "dev0");
 

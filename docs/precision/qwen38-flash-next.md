@@ -127,6 +127,10 @@ The Q5_0 rows: KLD 0.0943 against 0.0948 on UD-Q3_K_XL, 0.1520 against 0.1517 on
 device-planned tail runs only when every layer's expert formats are in it, so on these packs the decode rounding moves as well as
 the prompt's.
 
+IQ2_S, IQ3_XXS and IQ3_S gate/up with Q5_1 down can use the device-planned tail. On the mixed IQ3_S-Q4 pack, enabling
+these pairs changes the decode path. With tiers pinned, the BF16 gate (100 chunks, T 3, INT8 KV) measured PPL 3.23857 to
+3.24341, mean KLD 0.0954673 to 0.0954654, and top-1 agreement 89.8314% to 89.8471%.
+
 ## 6-bit dense projections
 
 The NVFP4 pack's default `DQ6_K` stores attention q/k/v/o, GDN qkv/z/out and the shared experts' gate/up as Q6_K. The `DQ8` variant
