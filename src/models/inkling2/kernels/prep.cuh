@@ -20,14 +20,23 @@ __device__ __forceinline__ float tau_of(int p, float floor_, float alpha) {
     return 1.f + alpha * logf(fmaxf((float) (p + 1) / floor_, 1.f));
 }
 
-// The convolution input of channel c at position pos[r] - j: a row of the window (stride ld), the ring, or zero before
-// position 0.
+// The convolution input of channel c at position p from the ring, zero before position 0.
+__device__ __forceinline__ float conv_ring(const float* __restrict__ ring, int ring_w, int p, int c) {
+    if (p < 0) return 0.f;
+    return ring[(size_t) (p % kConvRing) * ring_w + c];
+}
+
+// The convolution input of channel c at position pos[r] - j: a row of the window (stride ld), else the ring.
 __device__ __forceinline__ float conv_in(const float* __restrict__ y, int64_t ld, const float* __restrict__ ring, int ring_w,
                                          const int32_t* __restrict__ pos, int r, int j, int c) {
     if (r - j >= 0) return y[(size_t) (r - j) * ld + c];
-    const int p = pos[r] - j;
-    if (p < 0) return 0.f;
-    return ring[(size_t) (p % kConvRing) * ring_w + c];
+    return conv_ring(ring, ring_w, pos[r] - j, c);
+}
+// conv_in with row r's position pr in hand (read before the kernel's wait: the positions are staged before the window).
+__device__ __forceinline__ float conv_in_at(const float* __restrict__ y, int64_t ld, const float* __restrict__ ring, int ring_w,
+                                            int pr, int r, int j, int c) {
+    if (r - j >= 0) return y[(size_t) (r - j) * ld + c];
+    return conv_ring(ring, ring_w, pr - j, c);
 }
 
 // The weights warp w reads before its kernel's pdl_wait: warps 0 and 1 their channels' taps (tap kConv-1 first), warps 2
@@ -52,10 +61,10 @@ __device__ __forceinline__ void load_weights(const AttnPrep& a, int g, int w, in
     }
 }
 
-// Warp 0 (keys) or 1 (values) of head g for row r: channels g * kHeadDim + lane * 4.. of the convolved row, `raw` their
-// convolution inputs at the row's own position, and the factor the cache takes them scaled by (the key clip, the value
-// norm).
-__device__ __forceinline__ void kv_row(const AttnPrep& a, int r, int g, int w, int lane, const float (&wt)[4][kConv],
+// Warp 0 (keys) or 1 (values) of head g for row r at position pr: channels g * kHeadDim + lane * 4.. of the convolved
+// row, `raw` their convolution inputs at the row's own position, and the factor the cache takes them scaled by (the key
+// clip, the value norm).
+__device__ __forceinline__ void kv_row(const AttnPrep& a, int r, int pr, int g, int w, int lane, const float (&wt)[4][kConv],
                                        float (&val)[4], float (&raw)[4], float& f) {
     const float* yall = w ? a.yv : a.yk;
     const int64_t ld = w ? a.ldv : a.ldk;
@@ -70,7 +79,7 @@ __device__ __forceinline__ void kv_row(const AttnPrep& a, int r, int g, int w, i
         raw[u] = 0.f;
 #pragma unroll
         for (int j = 0; j < kConv; ++j) {
-            const float x = conv_in(yall, ld, ring, kKvHeads * kHeadDim, a.pos, r, j, c);
+            const float x = conv_in_at(yall, ld, ring, kKvHeads * kHeadDim, pr, r, j, c);
             if (j == 0) raw[u] = x;
             float t = wt[u][j];
             if (a.full) t += y[kOffTaps + g * kConv + j];
@@ -93,19 +102,33 @@ __device__ __forceinline__ void store_kv(void* cache, bool fp8, size_t idx, floa
 }
 
 // Warps 2 and 3 of head g for row r at position p: the clipped (and scaled) queries of heads 3g..3g+2 into q3
-// [3][kHeadDim], warp 3 also their relative states into r3 [3][kRel] and their sinks into s3 [3].
+// [3][kHeadDim], warp 3 also their relative states into r3 [3][kRel] and their sinks into s3 [3]. Every projection value a
+// warp takes is loaded before its first sum, so the warp waits for one memory trip, not one a head.
 __device__ __forceinline__ void q_heads(const AttnPrep& a, int r, int p, int g, int w, int lane, const float (&wt)[4][kConv],
                                         float* q3, float* r3, float* s3) {
     const float* yq = a.yq + (size_t) r * a.ldq;
     const float tau = a.full ? tau_of(p, a.log_floor, a.log_alpha) : 1.f;
     // warp 2: heads 3g and 3g + 1; warp 3: head 3g + 2, then the three relative states and sinks
-    const int h0 = g * 3 + (w == 2 ? 0 : 2), h1 = w == 2 ? h0 + 2 : h0 + 1;
-    for (int h = h0; h < h1; ++h) {
+    const int h0 = g * 3 + (w == 2 ? 0 : 2), nh = w == 2 ? 2 : 1;
+    float y[2][4], yr[3], ys[3];
+#pragma unroll
+    for (int k = 0; k < 2; ++k)
+#pragma unroll
+        for (int u = 0; u < 4; ++u) y[k][u] = k < nh ? yq[kOffQ + (h0 + k) * kHeadDim + lane * 4 + u] : 0.f;
+    if (w == 3)
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            yr[k] = lane < kRel ? yq[kOffR + (g * 3 + k) * kRel + lane] : 0.f;
+            ys[k] = yq[kOffSink + g * 3 + k];
+        }
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        if (k >= nh) break;
+        const int h = h0 + k;
         float q[4], ss = 0.f;
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
-            const int i = lane * 4 + u;
-            q[u] = yq[kOffQ + h * kHeadDim + i] * (h == h0 ? wt[u][0] : wt[u][1]);
+            q[u] = y[k][u] * (k == 0 ? wt[u][0] : wt[u][1]);
             ss = fmaf(q[u], q[u], ss);
         }
         ss = warp_sum(ss);
@@ -113,13 +136,13 @@ __device__ __forceinline__ void q_heads(const AttnPrep& a, int r, int p, int g, 
         *reinterpret_cast<float4*>(q3 + (h - g * 3) * kHeadDim + lane * 4) = make_float4(q[0] * f, q[1] * f, q[2] * f, q[3] * f);
     }
     if (w == 3) {
-        for (int h = g * 3; h < g * 3 + 3; ++h) {
-            const int k = h - g * 3;
-            const float rv = lane < kRel ? yq[kOffR + h * kRel + lane] * (k == 0 ? wt[0][2] : k == 1 ? wt[1][2] : wt[2][2]) : 0.f;
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const float rv = lane < kRel ? yr[k] * (k == 0 ? wt[0][2] : k == 1 ? wt[1][2] : wt[2][2]) : 0.f;
             const float rs = warp_sum(rv * rv);
             const float fr = fminf(a.rel_clip / (sqrtf(rs) + 1e-6f), 1.f) * tau;
             if (lane < kRel) r3[k * kRel + lane] = rv * fr;
-            if (lane == 0) s3[k] = yq[kOffSink + h];
+            if (lane == 0) s3[k] = ys[k];
         }
     }
 }
