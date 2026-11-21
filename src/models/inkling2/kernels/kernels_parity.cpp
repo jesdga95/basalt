@@ -977,6 +977,13 @@ void test_moe_finish() {
     const std::vector<float> got = host(a.out, (size_t) R * E);
     same_bits("moe_finish = moe_combine + post_conv", got.data(), host(out2, (size_t) R * E).data(), (size_t) R * E * 4);
     same_bits("  the ring", host(a.ring, (size_t) kConvRing * E).data(), host(ring2, (size_t) kConvRing * E).data(), (size_t) kConvRing * E * 4);
+    MoeFinish t = a;   // with the drafter's tap: the same rows in both outputs
+    t.ring = dev(ring);
+    t.out = zeros<float>((size_t) R * E);
+    t.tap = zeros<float>((size_t) R * E);
+    moe_finish(t, R, nullptr);
+    same_bits("  with a tap: the output", host(t.out, (size_t) R * E).data(), got.data(), (size_t) R * E * 4);
+    same_bits("  with a tap: the tap", host(t.tap, (size_t) R * E).data(), got.data(), (size_t) R * E * 4);
     MoeFinish one = a;
     one.rows = a.rows + (size_t) 3 * K * E; one.w = a.w + 3 * K; one.pos = a.pos + 3; one.resid = a.resid + 3 * E; one.out = zeros<float>(E);
     std::printf("  %.1f us a call (1 row)\n", time_us([&] { moe_finish(one, 1, nullptr); }));
