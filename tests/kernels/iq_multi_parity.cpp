@@ -10,15 +10,22 @@
 //     guard, not the contract.
 // (2) native_expert_grouped, every gate/up format with the down formats: groups of 0..11 entries (more than a pass
 //     of GRP_NC), unused grid rows (cap_groups > groups), scattered destinations; bitwise, new vs old, the rows it
-//     must not write included.
+//     must not write included.  The UD file's down formats (MXFP4, IQ3_S) at its real 5120 x 2304 also run
+//     against a double reference of the whole expert: dequantized weights, the kernel's own q8_1-rounded
+//     activations, SwiGLU and its q8_1 rounding redone on the host.
 // (3) iq_mmvq's IQ3_S columns on the tensor-core kernel (MMVQ_MMA, turned on here where the device has it)
 //     against the old kernel, bitwise; with MMVQ_MMA=1 in the environment (1) takes it as well.
 //
 // NVFP4 blocks come in three scale profiles (narrow; pack-like block values with 2e-5..2e-4 tails; pack-like with scale
 // bytes 0x7F, 0xFF, bit 7 set, 0 and subnormals), all of which every path must decode alike.
 //
+// MXFP4 is checked as a down format only: its blocks take E8M0 scale bytes in the packs' range (118..123), and
+// the double reference dequantizes its down weights with basalt::dequantize_mxfp4.  Its GPU dequantizer is also
+// checked bitwise against that host port at the E8M0 exponent edges.
+//
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
+#include "basalt/artifact/dequant.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -68,6 +75,7 @@ const char* name_of(int t) {
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
         case 40: return "NVFP4";
+        case 39: return "MXFP4";
         case 12: return "Q4_K";
         case 13: return "Q5_K";
         case 7: return "Q5_1";
@@ -75,7 +83,7 @@ const char* name_of(int t) {
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 7 || t == 8 || t == 39 ? 32 : t == 42 || t == 40 ? 64 : 256; }
 // A UE4M3 sub-block scale byte.  Profile 0: exponent 1..4 (small blocks).  Profile 1: exponent 6..14, block values in
 // the hundreds as the packs' are (their tails are 1e-5..1e-4).  Profile 2: profile 1 with the odd bytes mixed in: 0x7F
 // (the NaN code, decoded as 0), the sign bit set (ignored), zero and subnormals.
@@ -115,7 +123,9 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     std::uniform_int_distribution<int> byte(0, 255), ex(2, 8), man(0, 1023), sgn(0, 3);
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {
-        if (t == 40) {
+        if (t == 39) {
+            w[o] = (uint8_t) (118 + rng() % 6);   // MXFP4: an E8M0 scale byte, 2^-10 .. 2^-5 like the packs'
+        } else if (t == 40) {
             // NVFP4: four UE4M3 sub-block scales (profiles in nvfp4_scale_byte)
             const int prof = g_nv_profile >= 0 ? g_nv_profile : (int) (rng() % 3);
             for (int j = 0; j < 4; ++j) w[o + j] = nvfp4_scale_byte(prof, rng);
@@ -143,6 +153,45 @@ std::vector<float> random_x(size_t n, std::mt19937& rng) {
     std::vector<float> x(n);
     for (auto& v : x) v = nd(rng);
     return x;
+}
+
+// The MXFP4 down rows' weights for the double reference: basalt::dequantize_mxfp4 (the host port of ggml's
+// dequantize_row_mxfp4 the CPU tier uses), one 17-byte block at a time
+std::vector<float> mxfp4_dequant_host(const uint8_t* w, int64_t rows, int64_t n) {
+    std::vector<float> v((size_t) rows * n);
+    for (int64_t b = 0; b < rows * (n / 32); ++b)
+        basalt::dequantize_mxfp4(w + (size_t) b * 17, v.data() + (size_t) b * 32);
+    return v;
+}
+
+// The GPU MXFP4 dequantizer against the host port at the E8M0 exponent edges: blocks whose scale byte takes each
+// of 0, 1, 2, 3, 127, 128, 253, 254, 255 (the denormal codes, the unit scale and the top of the range, where 255
+// decodes to the largest finite fp32, 2^127, in both), several blocks each with random 4-bit codes, compared bitwise.
+void check_mxfp4_edge_scales(cudaStream_t s, std::mt19937& rng) {
+    const uint8_t exps[] = {0, 1, 2, 3, 127, 128, 253, 254, 255};
+    const int per = 8, n_blocks = (int) (sizeof exps / sizeof *exps) * per;
+    std::vector<uint8_t> w((size_t) n_blocks * 17);
+    std::uniform_int_distribution<int> byte(0, 255);
+    for (int b = 0; b < n_blocks; ++b) {
+        w[(size_t) b * 17] = exps[b / per];
+        for (int j = 1; j < 17; ++j) w[(size_t) b * 17 + j] = (uint8_t) byte(rng);
+    }
+    const int64_t n = (int64_t) n_blocks * 32;
+    uint8_t* dw = dalloc<uint8_t>(w.size());
+    ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "edge w");
+    float* dwf = dalloc<float>((size_t) n);
+    k::iq_dequant_f32(39, dw, n, dwf, s);
+    ck(cudaStreamSynchronize(s), "edge dequant");
+    std::vector<float> got((size_t) n);
+    ck(cudaMemcpy(got.data(), dwf, got.size() * 4, cudaMemcpyDeviceToHost), "edge got");
+    const auto want = mxfp4_dequant_host(w.data(), 1, n);
+    size_t diff = 0;
+    for (size_t i = 0; i < got.size(); ++i) diff += std::memcmp(&got[i], &want[i], 4) != 0;
+    std::printf("MXFP4    E8M0 edge exponents 0,1,2,3,127,128,253,254,255: GPU dequantizer vs host port: %zu of %zu "
+                "values differ\n", diff, got.size());
+    if (diff != 0) ++g_fail;
+    cudaFree(dw);
+    cudaFree(dwf);
 }
 
 // q8_1 blocks (fp16 scale, fp16 sum, 32 int8) back to floats
@@ -289,6 +338,7 @@ void check_mmvq_mma(cudaStream_t s, std::mt19937& rng) {
 struct Grouped {
     k::NativeExpertLayout L;
     int n_groups = 0, n_ent = 0, cap_groups = 0, cap_ent = 0, n_tok = 0;
+    std::vector<int32_t> start, tok, dst;   // the plan, for a host-side reference to retrace
     std::vector<uint8_t*> blobs;
     unsigned long long* dptr = nullptr;
     int32_t *dstart = nullptr, *dn = nullptr, *ddst = nullptr, *dtok = nullptr;
@@ -302,7 +352,7 @@ struct Grouped {
         n_groups = (int) counts.size();
         cap_groups = n_groups + 2;              // the extra grid rows must exit
         n_tok = tokens;
-        std::vector<int32_t> start(1, 0), tok, dst;
+        start = std::vector<int32_t>(1, 0);
         for (int c : counts) start.push_back(start.back() + c);
         n_ent = start.back();
         cap_ent = n_ent + 3;
@@ -388,6 +438,114 @@ void check_grouped(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::m
     }
 }
 
+// A double-precision reference of the whole grouped expert, for the down formats the real files carry (MXFP4,
+// IQ3_S) at their real shape: gate/up and IQ3_S down dequantized with the GPU dequantizer, MXFP4 down with its
+// host port (basalt::dequantize_mxfp4), the GPU MXFP4 dequantizer checked bitwise against it, the same
+// q8_1-rounded input activations the kernel quantized, the SwiGLU product and its q8_1 rounding (q8_1_store's
+// formula, as check_q8_1_finite pins it) redone on the host, all three dots accumulated in double.  Against
+// the old kernels it must still be bitwise equal.  The printed rel is the check_mmvq one, sum |err| /
+// sum |ref|: a per-output relative error explodes where a reference output cancels to zero, so this sum form
+// carries the 1e-2 tolerance, same as check_mmvq's (max rel is printed too, as a diagnostic).
+void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
+    // one entry, a partial and a full pass of GRP_NC, a group past one pass, and an empty group
+    Grouped G(gu, dt, H, FF, {1, 5, 0, 11}, 8, rng);
+    const auto a = G.result(true, s), b = G.result(false, s);
+    size_t diff = 0;
+    bool finite = true;
+    for (size_t i = 0; i < a.size(); ++i) diff += std::memcmp(&a[i], &b[i], 4) != 0;
+    const size_t xq_bytes = (size_t) G.n_tok * (H / 32) * 36;
+    std::vector<uint8_t> xq(xq_bytes);
+    ck(cudaMemcpy(xq.data(), G.dxq, xq_bytes, cudaMemcpyDeviceToHost), "xq");
+    const auto xd = dequant_q8_1(xq, (size_t) G.n_tok * H);
+    float* df = dalloc<float>((size_t) FF * H);   // one role matrix dequantized at a time
+    std::vector<float> wg((size_t) FF * H), wu((size_t) FF * H), wd;
+    std::vector<float> hf((size_t) FF);
+    std::vector<double> hq((size_t) FF);
+    double o_abs = 0, o_num = 0, o_den = 0, o_mrel = 0, r_abs = 0, r_num = 0, r_den = 0, r_mrel = 0, r_maxref = 0,
+           r_entrel = 0;
+    size_t dq_diff = 0;
+    const auto mrel = [](double err, double ref) {
+        return ref == 0.0 ? (err == 0.0 ? 0.0 : 1e300) : err / std::fabs(ref);
+    };
+    for (int g = 0; g < G.n_groups; ++g) {
+        const uint8_t* blob = G.blobs[g];
+        k::iq_dequant_f32(gu, blob, FF * H, df, s);
+        ck(cudaMemcpy(wg.data(), df, wg.size() * 4, cudaMemcpyDeviceToHost), "gate");
+        k::iq_dequant_f32(gu, blob + G.L.up_off, FF * H, df, s);
+        ck(cudaMemcpy(wu.data(), df, wu.size() * 4, cudaMemcpyDeviceToHost), "up");
+        if (dt == 39) {
+            std::vector<uint8_t> dw((size_t) H * G.L.d_row);
+            ck(cudaMemcpy(dw.data(), blob + G.L.down_off, dw.size(), cudaMemcpyDeviceToHost), "down");
+            wd = mxfp4_dequant_host(dw.data(), H, FF);
+            k::iq_dequant_f32(dt, blob + G.L.down_off, H * FF, df, s);
+            std::vector<float> wgpu((size_t) FF * H);
+            ck(cudaMemcpy(wgpu.data(), df, wgpu.size() * 4, cudaMemcpyDeviceToHost), "down gpu");
+            for (size_t i = 0; i < wgpu.size(); ++i) dq_diff += std::memcmp(&wgpu[i], &wd[i], 4) != 0;
+        } else {
+            wd.assign((size_t) FF * H, 0.0f);
+            k::iq_dequant_f32(dt, blob + G.L.down_off, H * FF, df, s);
+            ck(cudaMemcpy(wd.data(), df, wd.size() * 4, cudaMemcpyDeviceToHost), "down");
+        }
+        ck(cudaStreamSynchronize(s), "dequant");
+        for (int e = G.start[g]; e < G.start[g + 1]; ++e) {
+            const double* xv = xd.data() + (size_t) G.tok[e] * H;
+            for (int64_t j = 0; j < FF; ++j) {
+                const float* gr = wg.data() + (size_t) j * H;
+                const float* ur = wu.data() + (size_t) j * H;
+                double gs = 0, us = 0;
+                for (int64_t i = 0; i < H; ++i) { gs += xv[i] * gr[i]; us += xv[i] * ur[i]; }
+                const float gf = (float) gs, uf = (float) us;
+                hf[j] = (gf / (1.0f + (float) std::exp(-(double) gf))) * uf;
+            }
+            for (int64_t b32 = 0; b32 < FF / 32; ++b32) {   // the q8_1 block the down dot reads
+                float amax = 0.0f;
+                for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(hf[(size_t) b32 * 32 + j]));
+                float d = amax == 0.0f ? 0.0f : amax / 127.0f;
+                if (std::fabs(d) > 65504.0f) d = std::copysign(65504.0f, d);
+                const double ds = amax == 0.0f ? 0.0 : k::f32_from_f16(k::f16_from_f32(d));
+                for (int j = 0; j < 32; ++j) {
+                    const float v = hf[(size_t) b32 * 32 + j];
+                    double q = 0.0;
+                    if (amax != 0.0f) q = std::max(-127.0, std::min(127.0, std::round((double) (v / d))));
+                    hq[(size_t) b32 * 32 + j] = ds * q;
+                }
+            }
+            double ent_err = 0, ent_ref = 0;   // the entry's max |err| and max |ref| over its H outputs, for the per-entry bound
+            for (int64_t r = 0; r < H; ++r) {
+                const float* wr = wd.data() + (size_t) r * FF;
+                double acc = 0;
+                for (int64_t j = 0; j < FF; ++j) acc += hq[j] * (double) wr[j];
+                const size_t o = (size_t) G.dst[e] * H + r;
+                finite = finite && std::isfinite(b[o]);
+                const double eo = std::fabs((double) b[o] - (double) a[o]);
+                o_abs = std::max(o_abs, eo); o_num += eo; o_den += std::fabs((double) a[o]);
+                o_mrel = std::max(o_mrel, mrel(eo, (double) a[o]));
+                const double er = std::fabs((double) b[o] - acc);
+                r_abs = std::max(r_abs, er); r_num += er; r_den += std::fabs(acc);
+                r_maxref = std::max(r_maxref, std::fabs(acc));
+                r_mrel = std::max(r_mrel, mrel(er, acc));
+                ent_err = std::max(ent_err, er); ent_ref = std::max(ent_ref, std::fabs(acc));
+            }
+            r_entrel = std::max(r_entrel, mrel(ent_err, ent_ref));
+        }
+    }
+    const double rel_o = o_num / (o_den + 1e-30), rel_r = r_num / (r_den + 1e-30);
+    const bool ok = diff == 0 && finite && !(rel_r >= 1e-2) && r_entrel <= 1e-2;
+    std::printf("%-8s/%-7s %5lld x %4lld  grouped vs double, %d groups, %d entries: %s\n", name_of(gu), name_of(dt),
+                (long long) H, (long long) FF, G.n_groups, G.n_ent,
+                ok ? "bitwise equal to the old kernels, within 1e-2 of the reference" : "FAIL");
+    std::printf("  old kernel: max abs %.2e, rel %.2e, max rel %.2e   double reference: max abs %.2e, rel %.2e, "
+                "max rel %.2e, max |ref| %.2e, worst entry rel %.2e\n", o_abs, rel_o, o_mrel, r_abs, rel_r, r_mrel,
+                r_maxref, r_entrel);
+    if (dt == 39) {
+        std::printf("  MXFP4 down GPU dequantizer vs host port: %zu of %zu values differ\n", dq_diff,
+                    (size_t) G.n_groups * FF * H);
+        if (dq_diff != 0) ++g_fail;
+    }
+    if (!ok) ++g_fail;
+    cudaFree(df);
+}
+
 // ------------------------------------------------------------------------------------------------ --bench
 float time_ms(cudaStream_t s, int it, const auto& fn) {
     cudaEvent_t e0, e1;
@@ -459,11 +617,27 @@ void bench(cudaStream_t s, std::mt19937& rng) {
     // the verify window's shape: 2560 x 640 experts, 16 groups of m entries each
     // (GB/s: the 16 experts' bytes once per call, at the new kernel's time)
     for (auto [gu, dt] : {std::pair<int, int>{16, 42}, {17, 42}, {18, 42}, {21, 42}, {22, 42}, {29, 42}, {40, 40},
-                          {12, 7}, {12, 8}, {13, 8}, {8, 8}, {21, 8}, {23, 8}}) {   // NVFP4, Q4_K_XL, Q8_0, i-quant pairs
+                          {12, 7}, {12, 8}, {13, 8}, {8, 8}, {21, 8}, {23, 8}}) {   // NVFP4, Q4_K_XL and Q8_0 pairs
         std::printf("%-8s/%-5s grouped, 16 groups of m entries:", name_of(gu), name_of(dt));
         std::string gbs;
         for (int m : {1, 2, 3, 4, 8}) {
             Grouped G(gu, dt, 2560, 640, std::vector<int>(16, m), 8, rng);
+            float us[2];
+            for (int old = 1; old >= 0; --old)
+                us[old] = 1e3f * time_ms(s, 50, [&] { G.run(old != 0, s); });
+            std::printf("  m=%d: %.1f/%.1f", m, us[1], us[0]);
+            char b[32];
+            std::snprintf(b, sizeof b, " %.0f", 16.0 * (double) G.L.bytes / (us[0] * 1e3));
+            gbs += b;
+        }
+        std::printf("   GB/s (new):%s\n", gbs.c_str());
+    }
+    // the UD file's real expert pairs at its real shape 5120 x 2304 (GB/s as in the loop above)
+    for (auto [gu, dt] : {std::pair<int, int>{16, 39}, {17, 39}, {22, 39}, {18, 21}}) {
+        std::printf("%-8s/%-5s grouped, 16 groups of m entries, 5120 x 2304:", name_of(gu), name_of(dt));
+        std::string gbs;
+        for (int m : {1, 2, 3, 4, 8}) {
+            Grouped G(gu, dt, 5120, 2304, std::vector<int>(16, m), 8, rng);
             float us[2];
             for (int old = 1; old >= 0; --old)
                 us[old] = 1e3f * time_ms(s, 50, [&] { G.run(old != 0, s); });
@@ -563,6 +737,14 @@ int main(int argc, char** argv) {
     }
     check_grouped(40, 40, 2560, 640, s, rng);                               // NVFP4: its own pair, with the scale tail
     check_grouped(40, 40, 1024, 512, s, rng);
+    for (int gu : {16, 18}) check_grouped(gu, 39, 2560, 640, s, rng);       // MXFP4 down at the small n_ff
+    check_grouped(18, 39, 1024, 512, s, rng);                               // and the generic down path
+    check_grouped(18, 39, 5120, 2304, s, rng);
+    // the UD file's real pairs at its real expert shape: bitwise, and against the double reference
+    for (auto [gu, dt] : {std::pair<int, int>{16, 39}, {17, 39}, {22, 39}, {18, 21}, {22, 21}})
+        check_grouped_ref(gu, dt, 5120, 2304, s, rng);
+    check_mxfp4_edge_scales(s, rng);   // the MXFP4 dequantizer at the E8M0 exponent edges
+    check_mmvq(21, 2304, 67, s, rng);                                       // IQ3_S rows at the down row length
     check_mmvq_mma(s, rng);
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);

@@ -79,9 +79,9 @@ bool check_rows(ng::PleReader& rd, const std::vector<uint32_t>& rows, uint32_t n
     return true;
 }
 
-// row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (Q5_0), 170 (Q8_0) and 320 (BF16) are
-// run too, through the exact same generic row_bytes path -- nothing here is IQ4_NL-specific, so a second row
-// size is the correctness evidence for the generic path.
+// row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (Q5_0), 170 (Q8_0), 320 (BF16) and 176 (a Q5_K
+// deepseek41 Engram row) are run too, through the exact same generic row_bytes path -- nothing here is IQ4_NL-specific,
+// so a second row size is the correctness evidence for the generic path.
 int selftest(const std::string& dir, uint32_t rb) {
     const uint32_t N = 500000;                          // 45 MB: large enough for thousands of distinct pages
     const std::string path = dir + "/ple_reader_selftest_" + std::to_string(rb) + ".bin";
@@ -469,17 +469,18 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F] [--stress SECS]\n"); return 2; }
     }
     if (self) {
-        // ng::ROW_BYTES (90, IQ4_NL, production default), 110 (Q5_0), 170 (Q8_0) and 320 (BF16) rows
-        // through the same generic row_bytes path -- see the comment on selftest().
+        // ng::ROW_BYTES (90, IQ4_NL, production default), 110 (Q5_0), 170 (Q8_0), 320 (BF16) and 176 (a Q5_K
+        // deepseek41 Engram row) through the same generic row_bytes path -- see the comment on selftest().
         const int r90 = selftest(dir, ng::ROW_BYTES);
         const int r110 = selftest(dir, k::PLE_ROW_BYTES_Q5_0);
         const int r170 = selftest(dir, k::PLE_ROW_BYTES_Q8_0);
         const int r320 = selftest(dir, k::PLE_ROW_BYTES_BF16);
+        const int r176 = selftest(dir, 176);
         const int q8 = q8_decode_check();
         const int bf16 = bf16_decode_check();
         const int warm = warm_rows_check(dir);
-        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : r320 != 0 ? r320 : q8 != 0 ? q8
-               : bf16 != 0 ? bf16 : warm;
+        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : r320 != 0 ? r320 : r176 != 0 ? r176
+               : q8 != 0 ? q8 : bf16 != 0 ? bf16 : warm;
     }
     if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, stress_secs);
     std::fprintf(stderr, "nothing to do\n");

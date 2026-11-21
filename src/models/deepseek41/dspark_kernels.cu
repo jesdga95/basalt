@@ -1,6 +1,8 @@
 // src/models/deepseek41/dspark_kernels.cu - device kernels of the DSpark drafter (see dspark_kernels.hpp).
 #include "models/deepseek41/dspark_kernels.hpp"
 
+#include "basalt/kernels/mxfp4_scale.hpp"
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -64,11 +66,6 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
-// 2^(e-128) including the two denormal codes.
-__device__ __forceinline__ float e8m0_half(uint32_t e) {
-    return __uint_as_float(e < 2 ? (0x00200000u << e) : ((e - 1) << 23));
-}
-
 // The words of one MXFP4 row in global memory (4-byte aligned, `nb` blocks of 17 bytes) a lane needs: blocks lane,
 // lane + 32, ... A block starts at byte 17 * b, so its misalignment is b & 3. The caller pads the matrix by 16 bytes:
 // the last block reads up to three bytes past its end.
@@ -95,7 +92,7 @@ __device__ __forceinline__ float row_dot(const uint32_t (&w)[ITERS][5], const XB
         const int b = lane + 32 * it;
         if (b >= nb) continue;
         const int sh = (b & 3) * 8;
-        const float scale = e8m0_half((w[it][0] >> sh) & 0xff);
+        const float scale = mxfp4_scale((uint8_t) ((w[it][0] >> sh) & 0xff));
         const int4 lo = xs[b].lo, hi = xs[b].hi;
         const int xw[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
         int s = 0;

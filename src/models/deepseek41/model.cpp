@@ -8,6 +8,7 @@
 
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/ggml/ggml.h"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "models/deepseek41/attn_batch.hpp"
@@ -42,7 +43,15 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& e
     desc_.n_ff_exp = g.n_ff_exp;
     desc_.n_expert_shared = g.n_shared;
     desc_.context_length = g.context_length;
-    for (const ExpertLayer& e : pack_.experts) {
+    // the grouped kernels take every layer's routed pair: refuse an unsupported pack at load, not at the first token
+    for (int l = 0; l < g.n_layers; ++l) {
+        const ExpertLayer& e = pack_.experts[(size_t) l];
+        if (!basalt::kernels::native_expert_supported(e.gu_type, e.d_type, g.n_embd, g.n_ff_exp)) {
+            err = "layer " + std::to_string(l) + ": no grouped expert kernels for gate/up " +
+                  std::string(basalt::ggml_type_name((uint32_t) e.gu_type)) + " (" + std::to_string(e.gu_type) +
+                  "), down " + std::string(basalt::ggml_type_name((uint32_t) e.d_type)) + " (" + std::to_string(e.d_type) + ")";
+            return false;
+        }
         desc_.expert_gate_up_type.push_back(e.gu_type);
         desc_.expert_down_type.push_back(e.d_type);
     }

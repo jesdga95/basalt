@@ -8,6 +8,14 @@ quality: [precision](../precision/deepseek41.md).
 Packs on [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt), built from Unsloth's GGUFs:
 `DeepSeek-V4.1-Flash-1017-UD-IQ1_M` (about 260 GB) and `-UD-IQ2_XXS` (about 285 GB, closer to BF16, slower when experts spill to disk). Its layout and the DSpark section: [model file](../model-file.md#deepseek-pack).
 
+Unsloth's `-UD-Q2_K_XL` (about 343 GB, MXFP4 and IQ3_S down experts, a Q5_K Engram table) has no published pack; it converts
+from the GGUF and is the closest of the three to BF16 ([precision](../precision/deepseek41.md#against-the-bf16-reference)):
+
+```sh
+python3 tools/convert/convert.py --gguf DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf --dspark DRAFTER.gguf \
+    --out DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL.basalt
+```
+
 An NVFP4 pack, `DeepSeek-V4.1-Flash-1017-NVFP4` (about 428 GB), is built from NVIDIA's NVFP4 checkpoint: NVFP4 routed
 experts, the FP8 projections as Q8_0, the MXFP4 Engram table ([how](../model-file.md#deepseek-nvfp4-pack)). It is meant for
 machines whose RAM holds most of its experts (about 320 GB or more); with less, most experts are read from the SSD and decode
