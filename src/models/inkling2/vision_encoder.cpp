@@ -19,6 +19,7 @@ ImageEncoder::~ImageEncoder() { release(); }
 
 size_t ImageEncoder::weights_bytes() const { return enc_ ? enc_->weights_bytes() : 0; }
 size_t ImageEncoder::region_bytes() const { return enc_ ? enc_->arena_bytes(kMaxCells) : 0; }
+size_t ImageEncoder::device_bytes() const { return region_ ? enc_->device_bytes() : 0; }
 
 bool ImageEncoder::stage(const core::FileRange& section, int n_embd, std::string& err) {
     if (section.empty() || section.bytes == 0) { err = "--vision needs the pack's vision/mmproj section"; return false; }

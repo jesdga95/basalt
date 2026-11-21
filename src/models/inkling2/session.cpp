@@ -239,6 +239,18 @@ public:
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid& grid) override {
         ImageEncoder& enc = m_.encoder();
         if (!enc.staged()) return {model::Status::NotImplemented, "inkling2: started without --vision"};
+        if (m_.elastic()) {
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess)
+                return {model::Status::Error, "inkling2: cannot query room for the image encoder"};
+            const uint64_t need = enc.region_bytes() + kElasticKeep;
+            const uint64_t available = free_b + enc.device_bytes();
+            if (available < need) {
+                const uint64_t freed = m_.demote(need - available, stream_);
+                basalt::log::info("basalt inkling2", "elastic spill: image encoder reclaims %.2f GiB of expert copies",
+                                  (double) freed / (double) (1ull << 30));
+            }
+        }
         std::string err;
         if (!enc.encode(data, bytes, rows, n_rows, grid, err)) return {model::Status::Error, "inkling2: " + err};
         if (n_rows <= 0 || rows.size() != (size_t) n_rows * (size_t) g_.n_embd)

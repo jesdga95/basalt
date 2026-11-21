@@ -82,6 +82,8 @@ Not measured. `--parallel N` starts N sessions, each with its own caches and dra
 multiples of 40 pixels, one token per 40 x 40 cell: a 640 x 488 picture takes 208 tokens. A picture of more than 10,609 cells
 (about 4,120 x 4,120) is scaled down to fit (bicubic). Transparent pixels are laid over the reference processor's grey
 checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the model tends to call such a background black.
+With elastic experts, an image request reclaims temporary expert copies when its encoder needs the space; the weights
+remain in RAM and may be promoted again after the encoder releases its region.
 
 ## Chat, thinking and tools
 
@@ -96,8 +98,8 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
 
 - One card: no second card and no layer split. Experts read from RAM cost a bus read each, so a spilled card decodes slower
   (an RTX 5060 Ti with about 740 experts in RAM: 53 to 67 tok/s).
-- The server's `decode expert cache hit rate` line reads 100 % on a spilled load; the engine's `experts: ... on the card`
-  line at the end of a session is the real share.
+- The decode expert cache hit rate is the share of routed experts whose weights are on the card; elastic copies count
+  as resident while they remain there.
 - No video.
 
 ## Speed

@@ -16,7 +16,7 @@ namespace basalt::models::inkling2 {
 
 /// --vision (dynamic): the projector of the pack's `vision/mmproj` section staged once in page-locked RAM. It holds no VRAM
 /// at rest: a request's pictures get a device region (the weights and the work buffers), and `release` gives it back. The
-/// model keeps region_bytes() free beside its caches, so a region always fits.
+/// model plans room beside its caches and can reclaim elastic expert copies before opening a region.
 class ImageEncoder {
 public:
     ImageEncoder();
@@ -31,6 +31,8 @@ public:
     size_t weights_bytes() const;
     /// The device bytes of the region for the largest picture (kMaxCells).
     size_t region_bytes() const;
+    /// The currently attached region, zero between requests.
+    size_t device_bytes() const;
 
     /// A picture file's rows [cells][n_embd] and its grid (cells across and down); opens the region when the open one is too
     /// small.
