@@ -260,6 +260,9 @@ public:
     /// Work queued on `s` after this call starts only once the window stream has run everything queued on it so far (the
     /// residency uploads of dm_presync), so a large copy on `s` cannot hold the small uploads back in the copy queue.
     bool dm_fence(cudaStream_t s);
+    /// Queued on `s` (the adapt stream): whether an adaptive round's copies into VRAM run from here on.  A window that
+    /// starts while they do stages none of its CPU misses, so the two do not share the link.
+    void dm_link_busy(cudaStream_t s, bool busy);
     /// The adaptive tier's landed words (DmGlueArgs::landed): device, one per layer, null without the device-planned
     /// tail.  A round's copies into the slots write the round's number into a layer's word once that layer's are in.
     unsigned int* landed_words() const;
@@ -418,7 +421,7 @@ private:
     bool gs_move(bool to_peer, std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
     bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
-    bool dm_stage_places(std::string& err);            ///< the staged share's RAM addresses, read again when they moved
+    bool dm_stage_places(std::string& err, int sequences = 1);   ///< staged addresses and this window's copy policy
     bool dm_end(std::string& err);         ///< the peer window's end
     void dm_free();
     std::string peer_released();           ///< after a release: whether the peer window ended (see dm_note)

@@ -125,10 +125,19 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
 
 // The staged share's RAM addresses (a mapped, 16-byte aligned copy or 0), read again when the source's places moved
 // since: between windows, on the window's stream ahead of it.  The last window synchronized its stream, so the host
-// copy is free to rewrite.
-bool Verifier::dm_stage_places(std::string& err) {
+// copy is free to rewrite.  The window also takes the adaptive copies' word as it starts.
+bool Verifier::dm_stage_places(std::string& err, int sequences) {
     DecMoe* d = dm_;
     if (d == nullptr || d->stage_src == nullptr) return true;
+    if (d->stage_link != nullptr) {
+        const bool stage_off = sequences > 1 || (peer_ != nullptr && peer_->has_pending());
+        const cudaError_t link = stage_off ? cudaMemsetAsync(d->stage_link + 1, 1, 4, cs_)
+            : cudaMemcpyAsync(d->stage_link + 1, d->stage_link, 4, cudaMemcpyDeviceToDevice, cs_);
+        if (link != cudaSuccess) {
+            err = std::string("verify: the staged share's link word: ") + cudaGetErrorString(link);
+            return false;
+        }
+    }
     const uint64_t gen = warm_src_->places_generation();
     if (gen == d->stage_gen) return true;
     const ModelGeometry& g = *g_;
@@ -159,7 +168,7 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     const int R = last_t_;   // the window's rows
     const bool dm = dm_ != nullptr && batch_dm_;
     if (dm && !dm_begin(err, nullptr)) return false;
-    if (dm && !dm_stage_places(err)) return false;
+    if (dm && !dm_stage_places(err, S)) return false;
     order_after_commit();
     set_head_keep(0);   // the slots sample with their own parameters: every row exact
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
