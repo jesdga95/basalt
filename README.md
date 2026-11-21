@@ -8,6 +8,12 @@ in system RAM, and optionally on more GPUs. The server speaks the OpenAI and Ant
 
 **Help wanted:** spare Blackwell compute for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
 
+<p align="center">
+  <a href="https://github.com/sponsors/jesdga95"><img src="https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub"></a>
+  <a href="https://ko-fi.com/jesdga"><img src="https://img.shields.io/badge/Ko--fi-Support-ff5e5b?logo=kofi&logoColor=white" alt="Support on Ko-fi"></a>
+  <a href="https://paypal.me/jesdga"><img src="https://img.shields.io/badge/PayPal-Donate-003087?logo=paypal&logoColor=white" alt="Donate with PayPal"></a>
+</p>
+
 ## Requirements
 
 - Linux x86-64 with AVX2, or Windows 10 1903+ x64 ([platforms](docs/platforms.md)).
