@@ -505,6 +505,12 @@ private:
         mn.st.s[mn.st.n++] = hid;
         mn.queries = w.attn_query;
         mn.eps = g_.rms_eps;
+        mn.kv_pos = pos_d_;   // the attention's older cells into L2 while this mix and the projections run
+        mn.kv_k = c.k;
+        mn.kv_v = c.v;
+        mn.kv_cap = c.cap;
+        mn.kv_window = c.ring ? g_.window : 0;
+        mn.kv_cell = (int) cell_bytes();
         if (!msgs) {
             for (int j = 0; j < n_in; ++j) {
                 mn.norm[j] = norms[j];
