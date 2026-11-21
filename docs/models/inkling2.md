@@ -1,0 +1,99 @@
+# Inkling 2 Mini
+
+Thinking Machines Lab's Inkling 2 Mini (Apache-2.0). Runs with the same command as any model: `basalt serve PACK`. What it
+supports next to the others: [models](index.md). Rounding and quality: [precision](../precision/inkling2.md).
+
+## Pack
+
+One file, `Inkling-2-Mini-NVFP4-q8.basalt` (19.7 GB), built from the official release with its vision encoder and DSpark
+drafter:
+
+- Routed experts, layers 0 to 19: the release's NVFP4 codes and scales, bit for bit (14.7 GiB for all 24 layers).
+- Routed experts, layers 20 to 23: the release's MXFP8 values as Q8_0.
+- Attention, gate, short-convolution and output projections: Q8_0 of the BF16 values.
+- Output head: BF16 in the file; the engine rounds it to Q8_0 as it loads. Token embedding BF16. Norms, router, biases and the
+  loop's small tensors F32; loop controllers BF16.
+- Vision encoder and projector (BF16, 0.6 GB) and the DSpark drafter (BF16, 0.6 GB), whole.
+
+Build it from the release directory: `tools/convert/convert.py --checkpoint DIR` reads both safetensors files, the quant config,
+the tokenizer and the template.
+
+## Architecture
+
+The `inkling2` architecture (code in `src/models/inkling2`): 24 physical layers, 2,304 wide, no rotary positions anywhere in
+the text model.
+
+- **Loop:** a prelude (layers 0 to 5), a core (6 to 17) run three times, and a coda (18 to 23): 48 layer visits a token, each
+  with its own cache and short-convolution state. Passes 2 and 3 start again from the prelude's output and mix in messages from
+  the pass before through learned controllers.
+- **Attention residuals:** a layer's input is a softmax mix over the finished blocks of 6 layers and the current one, not a
+  plain residual stream.
+- **Attention:** 24 query heads, 8 key/value heads of 128. Layers 5, 11, 17 and 23 attend every position (8 visits a token);
+  the other 20 attend a window of 1,024. Keys and values pass a causal short convolution; a learned relative bias over the last
+  1,024 positions, a sink per head and an output gate.
+- **MoE:** 128 routed experts per layer, top 8 by sigmoid, 1,152 wide, with a softcapped SwiGLU; no shared expert.
+- **Vision:** a 23-layer ViT reads a picture at its own size, padded to multiples of 40 pixels; one token per 40 x 40 cell.
+
+## Memory
+
+- **One card.** Every weight sits on the main card: 1.10 GiB dense, 14.71 GiB experts, the drafter 0.48 GiB. The token
+  embedding (0.86 GiB) stays in page-locked RAM and the card gathers its rows. No expert tier and no second card.
+- **Context:** `--max-context` from 1,024 to 1,048,576, default 8,192. The caches are sized at start from what the weights
+  leave; a context that does not fit is refused with the positions that would.
+- **Per position:** the 8 full-attention visits keep every position, 32 KiB with `--kv fp16`, 16 KiB with `--kv fp8`, plus the
+  drafter's full layer; the window layers' rings do not grow. 262,144 positions fit an RTX 5090 with `--kv fp16`; 1,048,576 does
+  not fit a 32 GB card beside the weights, and the start's refusal says how many positions would.
+
+## Long prompts
+
+Prompts of more than 16 tokens read in chunks of up to 2,048 rows on the tensor cores (MMQ for the products). The drafter sees
+every chunk. Needles at 10, 50 and 90 % of 31,943 and 127,958-token prompts are found through the server (`--max-context 262144`); the
+prompts read at about 7,400 and 5,500 tok/s on an RTX 5090 at 400 W.
+
+## Drafting
+
+On when the pack has the DSpark drafter. One block pass drafts up to seven tokens: three dense layers over the anchor and seven
+mask rows, reading keys and values made from the target's visits 5, 23 and 41 and its final state, then a recurrent Markov
+head over the target's head (screened through 2-bit copies of its rows). The draft policy picks each window by expected
+tokens per millisecond (`include/basalt/spec/draft_policy.hpp`). `--spec N` caps the window (default 8: the last accepted token
+plus the block); `--spec 1` turns it off. The target checks every draft: output is plain decoding's.
+
+## Parallel slots
+
+Not measured. `--parallel N` starts N sessions, each with its own caches and drafter scratch, the context split between them.
+
+## Images
+
+`--vision dynamic` ([vision](../running.md#vision---vision)). The engine's own encoder reads a picture at its size, padded to
+multiples of 40 pixels, one token per 40 x 40 cell: a 640 x 488 picture takes 208 tokens. A picture of more than 10,609 cells
+(about 4,120 x 4,120) is scaled down to fit (bicubic). Transparent pixels are laid over the reference processor's grey
+checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the model tends to call such a background black.
+
+## Chat, thinking and tools
+
+- **Template:** the release's Jinja template, with `<|message_*|>` roles and content blocks.
+- **Thinking:** the template writes an effort level into a system message: `reasoning_effort` `none` (0), `minimal` (0.1),
+  `low` (0.2), `medium` (0.7), `high` (0.9, the template's default), `xhigh` and `max` (0.99), or a number from 1 to 100 as
+  hundredths (at most 0.99). There is no hard switch: at `none` the model still writes a short thinking block (a few hundred
+  tokens), so leave room in `max_tokens`.
+- **Tools:** the model writes `<|content_invoke_tool_json|>{"name": ..., "args": {...}}`; several calls per turn are supported.
+
+## Limits
+
+- One card: no expert tier, no layer split, so a card needs room for the whole 16.3 GiB of weights.
+- No video.
+
+## Speed
+
+`basalt-bench` (seeded, `-r 2`), RTX 5090 alone at 400 W, the pack above, drafting on:
+
+| | Inkling 2 Mini | llama.cpp, IQ4_NL GGUF | Qwen3.8-27B (Basalt) |
+| --- | ---: | ---: | ---: |
+| Decode: conversation | 299 tok/s | 94.5 | 261 |
+| Decode: struct | 555 tok/s | 92.5 | 768 |
+| Decode: prose | 249 tok/s | 94.5 | 192 |
+| Prompt read | 7,492 tok/s (16K) | 3,093 (`llama-bench` pp512) | 10,757 (16K) |
+
+Drafts accepted: conversation 60.5 %, struct 95.0 %, prose 45.3 %. llama.cpp (29b52d398, `-fa 1`, full offload, no drafting)
+ran the same token ids through `llama-server` with the same lengths and temperatures; `llama-bench` tg128 reads 96.3 tok/s.
+The struct fixture runs to its 8,192-token cap on both engines.

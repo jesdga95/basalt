@@ -17,6 +17,18 @@ Start with `bin/basalt serve --config basalt_config.json`. Model paths are relat
 
 Like the first, with `"gpu": "0,1"` and `"vision": 1`, which runs the image encoder on the second card too.
 
+## Inkling 2 Mini on one card
+
+The whole model sits on the card; the context takes what the weights leave ([guide](../models/inkling2.md#memory)).
+
+```json
+{
+  "version": 2,
+  "models": [{ "model": "Inkling-2-Mini-NVFP4-q8.basalt", "gpu": "0", "max-context": 262144, "vision": "dynamic" }],
+  "server": { "host": "127.0.0.1", "port": 8080 }
+}
+```
+
 ## A low-VRAM card
 
 Like the first, with `"max-context": 65536`, `"kv": "q4_0"` and `"vram-reserve-mib": 1024`.
