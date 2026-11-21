@@ -116,8 +116,8 @@ public:
     /// room. False when even no copy at all leaves that much.
     bool resize_reserve(uint64_t free_bytes, void* stream);
     void lend(bool low, void* stream);
-    /// A prompt chunk's staging of layer l's RAM experts from their card copies, when every one has a copy (false: none
-    /// issued; the caller copies them from RAM).
+    /// A prompt chunk's staging of layer l's RAM experts: each from its card copy when the elastic spill still holds one,
+    /// from its RAM copy otherwise (false: none has a copy, the caller copies the layer's from RAM).
     bool stage_from_card(int l, void* stream) const;
     const SpillPlan& spill() const { return spill_; }
     /// Expert e of layer l's blob in RAM when the CPU computes it (it spilled and has no card copy; its blob table entry is

@@ -778,12 +778,20 @@ uint64_t InklingModel::cpu_layers() const {
 
 bool InklingModel::stage_from_card(int l, void* stream) const {
     const LayerWeights& w = layers_[(size_t) l];
-    if (copy_.empty() || w.n_spill == 0 || layer_copies_[(size_t) l] < w.n_spill) return false;
+    if (copy_.empty() || w.n_spill == 0) return false;
     const int ne = geo().n_expert;
-    for (int e = 0; e < ne; ++e)
-        if (const void* c = copy_[(size_t) l * ne + e])
-            cudaMemcpyAsync(w.experts + (uint64_t) spill_.slot[(size_t) l][(size_t) e] * w.expert_stride, c, w.expert_stride,
-                            cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
+    const uint64_t keep = (uint64_t) (ne - w.n_spill);
+    for (int e = 0; e < ne; ++e) {
+        const size_t s = (size_t) spill_.slot[(size_t) l][(size_t) e];
+        if (s < keep) continue;   // a kept expert: its own memory, already in place
+        const size_t i = (size_t) l * ne + (size_t) e;
+        void* dst = w.experts + (uint64_t) s * w.expert_stride;
+        if (const void* c = copy_[i])
+            cudaMemcpyAsync(dst, c, w.expert_stride, cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
+        else   // a demoted one: its RAM copy, the elastic spill's least routed first
+            cudaMemcpyAsync(dst, w.spill_host + (s - keep) * w.expert_stride, w.expert_stride, cudaMemcpyHostToDevice,
+                            (cudaStream_t) stream);
+    }
     return true;
 }
 
