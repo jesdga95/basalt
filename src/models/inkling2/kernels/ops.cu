@@ -371,9 +371,18 @@ __global__ void __launch_bounds__(kPrefetchThreads) expert_prefetch_kernel(const
                                                                             const unsigned long long* __restrict__ blobs, uint64_t bytes,
                                                                             uint32_t* __restrict__ sink) {
     __shared__ unsigned long long addr[kPrefetchMax];
-    if (threadIdx.x < n) addr[threadIdx.x] = blobs[ids[threadIdx.x]];
+    __shared__ int nu;
+    if (threadIdx.x == 0) {   // the distinct experts
+        int m = 0;
+        for (int i = 0; i < n; ++i) {
+            bool seen = false;
+            for (int j = 0; j < i; ++j) seen |= ids[j] == ids[i];
+            if (!seen) addr[m++] = blobs[ids[i]];
+        }
+        nu = m;
+    }
     __syncthreads();
-    const uint64_t n16 = bytes / 16, total = (uint64_t) n * n16, T = (uint64_t) gridDim.x * blockDim.x;
+    const uint64_t n16 = bytes / 16, total = (uint64_t) nu * n16, T = (uint64_t) gridDim.x * blockDim.x;
     uint32_t acc = 0;
     for (uint64_t c = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; c < total; c += 4 * T) {
         uint4 v[4];
