@@ -188,7 +188,12 @@ void test_block_inputs() {
     float* d_fr = dev(fr);
     float* d_frc = zeros<float>(E);
     int32_t* d_meta = dev(std::vector<int32_t>{anchor, (int32_t) pos0});
-    auto run = [&] { dspark_block_inputs(d_emb, d_meta, d_norm, 1e-6f, d_mask, kBlock, d_x, d_pos3, d_prev, d_state, d_fr, 16, d_frc, nullptr); };
+    const auto w1 = bf16s(randn((size_t) V * kDsRank, 0.5f));
+    uint16_t* d_w1 = dev(w1);
+    uint16_t* d_w1r = zeros<uint16_t>(kDsRank);
+    auto run = [&] {
+        dspark_block_inputs(d_emb, d_meta, d_norm, 1e-6f, d_mask, kBlock, d_x, d_pos3, d_prev, d_state, d_fr, 16, d_frc, d_w1, d_w1r, nullptr);
+    };
     run();
     const auto x = host(d_x, (size_t) kBlock * E);
     std::vector<float> got;
@@ -209,6 +214,7 @@ void test_block_inputs() {
     ok = ok && prev[0] == anchor;
     for (float s : state) ok = ok && s == 0.f;
     ok = ok && std::memcmp(host(d_frc, E).data(), fr.data() + (size_t) ((pos0 - 1) % 16) * E, E * 4) == 0;
+    ok = ok && std::memcmp(host(d_w1r, kDsRank).data(), w1.data() + (size_t) anchor * kDsRank, kDsRank * 2) == 0;
     check("block inputs (masks, positions, start)", ok);
     const double us = time_us(run);
     timing("block inputs", us, (double) kBlock * E * 4 + E * 6);
@@ -226,7 +232,7 @@ void test_markov_step() {
     int32_t* d_prev = dev(std::vector<int32_t>{prev});
     float* d_out = zeros<float>(kDsRank);
     float* d_lat = zeros<float>(kDsRank);
-    dspark_markov_step(d_ch, d_cf, d_b, d_wsp, d_w1, d_prev, d_state, d_out, d_lat, nullptr);
+    dspark_markov_step(d_ch, d_cf, d_b, d_wsp, d_w1 + (size_t) prev * kDsRank, d_state, d_out, d_lat, nullptr);
     const auto out = host(d_out, kDsRank), lat = host(d_lat, kDsRank);
     std::vector<double> x(2 * kDsRank);
     for (int i = 0; i < kDsRank; ++i) {
@@ -247,7 +253,7 @@ void test_markov_step() {
     }
     report("Markov step (state)", out, ref_s, 2e-5);
     report("Markov step (latent)", lat, ref_l, 2e-5);
-    const double us = time_us([&] { dspark_markov_step(d_ch, d_cf, d_b, d_wsp, d_w1, d_prev, d_state, d_out, d_lat, nullptr); });
+    const double us = time_us([&] { dspark_markov_step(d_ch, d_cf, d_b, d_wsp, d_w1 + (size_t) prev * kDsRank, d_state, d_out, d_lat, nullptr); });
     timing("Markov step", us, (double) kDsRnn * 2 * kDsRank * 2 + 3.0 * kDsRnn * 4);
 }
 
@@ -321,6 +327,11 @@ void test_head() {
     int32_t* d_prev = zeros<int32_t>(1);
     int32_t* d_ids = zeros<int32_t>(8);
     float* d_conf = zeros<float>(8);
+    std::vector<uint16_t> w1((size_t) V * kDsRank);   // the Markov head's token rows: a pattern that names its row
+    for (size_t k = 0; k < w1.size(); ++k) w1[k] = (uint16_t) ((k / kDsRank) * 131 + k % kDsRank);
+    uint16_t* d_w1 = dev(w1);
+    uint16_t* d_w1r = zeros<uint16_t>(kDsRank);
+    bool rows_ok = true;
     const size_t hrow = (size_t) E / 32 * 36, lrow = (size_t) kDsRank / 32 * 36;
     std::uniform_int_distribution<int64_t> pick_row(0, V - 1);
     std::uniform_real_distribution<float> lean(0.f, 1.f);
@@ -355,8 +366,9 @@ void test_head() {
         }
         uint8_t *d_hq = dev(hq), *d_lq = dev(lq);
         dspark_head_base(h, d_hq, R, d_approx, nullptr);
-        for (int i = 0; i < R; ++i) dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, nullptr);
+        for (int i = 0; i < R; ++i) dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, d_w1, d_w1r, nullptr);
         const auto ids = host(d_ids, 8);
+        rows_ok = rows_ok && std::memcmp(host(d_w1r, kDsRank).data(), w1.data() + (size_t) ids[R - 1] * kDsRank, kDsRank * 2) == 0;
         const auto cf = host(d_conf, 8);
         for (int i = 0; i < R; ++i) {
             dspark_head_exact(h, d_hq, d_lq + i * lrow, i, d_logits, nullptr);
@@ -440,6 +452,7 @@ void test_head() {
     differ = drafts = 0;
     for (int t = 0; t < 4; ++t) block({}, 0.f, false);
     std::printf("%-34s %d of %d picks differ from the exact head (flat logits, the overflow path)\n", "head: unplanted", differ, drafts);
+    check("head: the pick's w1 row copied out", rows_ok);
     // timing: the head term of seven rows once, then a draft's pick, on flat and on planted rows
     std::vector<float> xp = randn((size_t) E * R, 5.f);
     for (int i = 0; i < R; ++i) {
@@ -452,15 +465,15 @@ void test_head() {
     uint8_t *d_hq = dev(hq), *d_hp = dev(hp), *d_lq = dev(lq);
     double us = time_us([&] { dspark_head_base(h, d_hq, R, d_approx, nullptr); });
     timing("head base, 7 rows", us, (double) dspark_screen_bytes(E, V) + (double) R * V * 4);
-    us = time_us([&] { dspark_head_pick(h, d_hq, d_lq, d_approx, 0, scr, d_prev, d_ids, d_conf, nullptr); });
+    us = time_us([&] { dspark_head_pick(h, d_hq, d_lq, d_approx, 0, scr, d_prev, d_ids, d_conf, d_w1, d_w1r, nullptr); });
     timing("head pick, one draft (flat)", us, (double) dspark_screen_bytes(kDsRank, V) + 2.0 * V * 4);
     dspark_head_base(h, d_hp, R, d_approx, nullptr);
-    us = time_us([&] { dspark_head_pick(h, d_hp, d_lq, d_approx, 0, scr, d_prev, d_ids, d_conf, nullptr); });
+    us = time_us([&] { dspark_head_pick(h, d_hp, d_lq, d_approx, 0, scr, d_prev, d_ids, d_conf, d_w1, d_w1r, nullptr); });
     timing("head pick, one draft (planted)", us, (double) dspark_screen_bytes(kDsRank, V) + 2.0 * V * 4);
     d_hq = d_hp;
     us = time_us([&] {
         dspark_head_base(h, d_hq, R, d_approx, nullptr);
-        for (int i = 0; i < R; ++i) dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, nullptr);
+        for (int i = 0; i < R; ++i) dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, d_w1, d_w1r, nullptr);
     });
     timing("head, a block of 7 drafts", us, (double) dspark_screen_bytes(E, V) + R * (double) dspark_screen_bytes(kDsRank, V));
 }

@@ -24,7 +24,9 @@
 //             The argmax is screened by 2-bit copies of the head and the fold (dspark_head_pick): the head term of all
 //             the drafts in one pass over its copy, the fold term per draft, the rows near the best rescored exactly.
 //
-// Numerics: the projections are the pack's BF16 rounded to Q8_0 as they load and read over q8_1 rows, the head is the
+// Numerics: the projections are the pack's BF16 rounded to Q8_0 as they load; the block's (q, k, v, o, gate, up, down) are
+// then rounded on to NVFP4 planes and run on the window gemm over bf16 rows (fused: q, k and v one call, gate and up one
+// with SwiGLU, o and down adding into the residual), the context's k and v stay Q8_0 over q8_1 rows; the head is the
 // target's own Q8_0 head, the recurrence's small products stay BF16 with fp32 activations, and the rest is fp32. The
 // reference rounds to bf16 at every step; a draft only changes the speed (the target verifies every row).
 #pragma once
@@ -35,6 +37,7 @@
 #include "basalt/model/adapter.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/kernels/window_gemm.hpp"
 #include "basalt/program/options.hpp"
 #include "models/inkling2/pack.hpp"
 
@@ -51,8 +54,9 @@ namespace basalt::models::inkling2 {
 constexpr int kDsMaxLayers = 4;
 
 struct DsparkLayer {
-    void *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;            ///< Q8_0
-    void *gate = nullptr, *up = nullptr, *down = nullptr;                        ///< Q8_0
+    void *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;            ///< NVFP4 planes (Q8_0 until finish())
+    void *gate = nullptr, *up = nullptr, *down = nullptr;                        ///< NVFP4 planes (Q8_0 until finish())
+    float* fp4_scale = nullptr;                                                  ///< the planes' FP32 scales [7]: q k v o gate up down
     void *k_ctx = nullptr, *v_ctx = nullptr;                                     ///< Q8_0
     float *attn_norm = nullptr, *post_norm = nullptr, *dflare_norm = nullptr;    ///< [width]
     float *q_norm = nullptr, *k_norm = nullptr, *k_ctx_norm = nullptr;           ///< [head width]
@@ -155,14 +159,16 @@ private:
     float *kb_ = nullptr, *vb_ = nullptr;   ///< [8][1024]
     void* act_ = nullptr;                   ///< q8_1 rows
     // block
-    float *x_ = nullptr, *xn_ = nullptr, *q_ = nullptr, *qr_ = nullptr, *attn_ = nullptr, *o_ = nullptr, *g_ = nullptr,
-          *u_ = nullptr, *h_ = nullptr, *att_scr_ = nullptr;
+    float *x_ = nullptr, *q_ = nullptr, *qr_ = nullptr, *attn_ = nullptr, *h_ = nullptr, *att_scr_ = nullptr;
+    void *act_a_ = nullptr, *act_h_ = nullptr;   ///< the window gemm's bf16 rows: a product's input, SwiGLU's output
+    basalt::kernels::wgemm::Workspace ws_;
     int32_t* pos3b_ = nullptr;
     int64_t att_cells_ = 0;
     // head
     float *approx_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
     void *hq_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;   ///< q8_1 draft rows and latents [kDsDrafts], the screen's scratch
     int32_t *prev_ = nullptr, *ids_d_ = nullptr;
+    uint16_t* w1_row_ = nullptr;            ///< the previous draft's row of the Markov head's w1 (host memory), on the card
     float* conf_d_ = nullptr;
     int32_t* ids_h_ = nullptr;
     // the block's stages as graphs: the layers' (by layer), the last with the head (by drafts)
