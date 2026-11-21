@@ -115,6 +115,16 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--expert-profile-save-every")
         o.expert_profile_save_min = std::atof(args.next("--expert-profile-save-every"));
     else if (a == "--gpu-stages") o.gpu_stages = true;
+    // --layer-split K1,K2,..: the FIRST LAYER of each later stage ("8,20,34" for 4 stages of 8/12/14/14).  Without
+    // it the cut is even, which leaves the last stage carrying its layers PLUS the output head and every earlier
+    // stage waiting on it.  `auto` keeps the search.
+    else if (a == "--layer-split") { o.layer_split = args.next("--layer-split"); o.split_forced = true; }
+    else if (a == "--layer-split-forced") o.split_forced = true;
+    // --split-device D0[,D1..]: which card runs each stage, in stage order.  The loader has always read this field
+    // and honoured the order (validating distinct cards and 1..n_dev); the parser case was dropped with the other
+    // stage options and never restored, which left the field settable only from a caller.  It is the only way to put
+    // a particular card on a particular stage -- e.g. the fastest one on the stage that measures the most GPU work.
+    else if (a == "--split-device") { o.split_device = args.next("--split-device"); o.split_forced = true; }
     else if (a == "--mmap-experts") o.mmap_experts = true;
     else if (a == "--shared-expert-arena") o.shared_expert_arena = args.next("--shared-expert-arena");
     else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
