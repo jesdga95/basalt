@@ -36,18 +36,24 @@ the text model.
 
 ## Memory
 
-- **One card.** Every weight sits on the main card: 1.10 GiB dense, 14.71 GiB experts, the drafter 0.48 GiB. The token
-  embedding (0.86 GiB) stays in page-locked RAM and the card gathers its rows. No expert tier and no second card.
-- **Context:** `--max-context` from 1,024 to 1,048,576, default 8,192. The caches are sized at start from what the weights
-  leave; a context that does not fit is refused with the positions that would.
+- **One card.** The main card holds the weights: 1.10 GiB dense, 14.71 GiB experts, the drafter 0.48 GiB. The token
+  embedding (0.86 GiB) stays in page-locked RAM and the card gathers its rows. No second card.
+- **Context:** `--max-context` from 1,024 to 1,048,576, default 8,192.
 - **Per position:** the 8 full-attention visits keep every position, 32 KiB with `--kv fp16`, 16 KiB with `--kv fp8`, plus the
-  drafter's full layer; the window layers' rings do not grow. 262,144 positions fit an RTX 5090 with `--kv fp16`; 1,048,576 does
-  not fit a 32 GB card beside the weights, and the start's refusal says how many positions would.
+  drafter's full layer; the window layers' rings do not grow.
+- **Experts in RAM when the context needs the room:** when the asked context does not fit beside every expert, the least
+  routed experts (by the shipped profile `data/profiles/inkling2-24x128.prof`) are planned into page-locked RAM, just enough,
+  and decode reads them there over the bus. The full visits' caches then back their first 32,768 positions and grow as prompts
+  need them, and the experts planned into RAM are copied back to the card while the caches leave room, the least routed
+  giving way first when they grow. A short chat at `--max-context 1048576 --kv fp8` keeps every expert on the card. On a
+  smaller card the spill is static: what does not fit stays in RAM. Nothing changes when everything fits.
 
 ## Long prompts
 
 Prompts of more than 16 tokens read in chunks of up to 2,048 rows on the tensor cores (MMQ for the products). The drafter sees
-every chunk. Needles at 10, 50 and 90 % of 31,943 and 127,958-token prompts are found through the server (`--max-context 262144`); the
+every chunk. With experts in RAM a chunk stages each spilled layer's experts on the card, from their card copies when it has
+them all. At `--max-context 1048576 --kv fp8` on an RTX 5090, needles at 131K and 400K are found; decode runs at 205 tok/s
+on a short chat, 155 at 131K and 103 at 400K (plain decoding), and a 400K prompt reads at about 3,360 tok/s. Needles at 10, 50 and 90 % of 31,943 and 127,958-token prompts are found through the server (`--max-context 262144`); the
 prompts read at about 7,400 and 5,500 tok/s on an RTX 5090 at 400 W.
 
 ## Drafting
@@ -80,7 +86,10 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
 
 ## Limits
 
-- One card: no expert tier, no layer split, so a card needs room for the whole 16.3 GiB of weights.
+- One card: no second card and no layer split. Experts read from RAM cost a bus read each, so a spilled card decodes slower
+  (an RTX 5060 Ti with about 740 experts in RAM: 53 to 67 tok/s).
+- The server's `decode expert cache hit rate` line reads 100 % on a spilled load; the engine's `experts: ... on the card`
+  line at the end of a session is the real share.
 - No video.
 
 ## Speed
