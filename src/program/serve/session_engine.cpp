@@ -105,8 +105,9 @@ public:
             std::string bus;
             if (basalt::core::device_pci_bus_id(d, bus)) ids += (ids.empty() ? "" : ",") + bus;
         }
-        return "quant=" + basalt::program::pack_quant_label(nm != nullptr && nm->is_string() ? nm->s : std::string()) +
-               " gpus=" + ids + " ";
+        std::string quant = basalt::program::pack_quant_label(nm != nullptr && nm->is_string() ? nm->s : std::string());
+        if (quant == "unknown" && !o.community_quant.empty()) quant = o.community_quant;   // the model names it when the pack's name does not
+        return "quant=" + quant + " gpus=" + ids + " ";
     }
     int init_after_input() override {
         reserve_checkpoints();

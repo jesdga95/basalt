@@ -90,7 +90,9 @@ std::string pack_quant_label(const std::string& name) {
         before = q.size();
         for (const char* pre : {"NVIDIA-", "UD-"}) strip(pre);
     }
-    return q.empty() ? "unknown" : q;
+    // a quant label carries a digit (NVFP4, Q4_K_M, IQ1_M, BF16); a last word without one ("Mini") is part of the model's name
+    const bool digit = std::any_of(q.begin(), q.end(), [](char c) { return std::isdigit((unsigned char) c) != 0; });
+    return digit ? q : "unknown";
 }
 
 std::string community_row_text(const CommunityRow& r) {
