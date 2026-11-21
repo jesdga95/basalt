@@ -107,6 +107,7 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     if (adapter != nullptr) {
         o.arch = adapter->arch();
         o.model_name = adapter->model_name();
+        o.community_kv = adapter->community_kv();
         o.quality_flags = adapter->quality_flags();
         o.quality_window = adapter->quality_window();
     }

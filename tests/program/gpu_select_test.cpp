@@ -96,7 +96,7 @@ int main() {
                   "{\"devices\":\"1,0\",\"cards\":[{\"visible\":1,\"token\":\"1\",\"smi\":1,\"name\":\"RTX 5060 Ti\"},"
                   "{\"visible\":0,\"token\":\"0\",\"smi\":0,\"name\":\"RTX 5090\"}],\"notes\":[],\"warning\":\"\",\"error\":\"\"}");
         CHECK_STR(gpu_plan_json({}, GpuChoice{}, "qwen4exp", "", 0, 8, 8192, "Qwen3.8-Flash-Next", "--route-tail-skip"),
-                  "{\"arch\":\"qwen4exp\",\"model\":\"Qwen3.8-Flash-Next\",\"quality_flags\":\"\",\"quality_window\":\"0\","
+                  "{\"arch\":\"qwen4exp\",\"model\":\"Qwen3.8-Flash-Next\",\"community_kv\":\"\",\"quality_flags\":\"\",\"quality_window\":\"0\","
                   "\"lossy\":\"--route-tail-skip\",\"spec\":8,\"max_context\":8192,\"devices\":\"\",\"cards\":[],\"notes\":[],"
                   "\"warning\":\"\",\"error\":\"\"}");
     }
