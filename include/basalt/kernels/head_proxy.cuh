@@ -345,5 +345,51 @@ __device__ __forceinline__ void pick(const Final& f, int n, int n_tiles, const i
     }
 }
 
+// pick<MAPPED, true> on the whole block (every thread calls it, after f.ex holds the n listed rows' exact scores): the same
+// pick, its probability's sum over the tiles spread over the block's 512 threads (a different order of addition).
+template <bool MAPPED>
+__device__ __forceinline__ void pick_block(Final& f, int n, int n_tiles, const int32_t* __restrict__ map,
+                                           const float2* __restrict__ part, int* __restrict__ out_id, float* __restrict__ out_prob) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float ninf = __int_as_float(0xff800000);
+    if (warp == 0) {
+        float bv = ninf;
+        int bi = 0x7fffffff;
+        for (int c = lane; c < n; c += 32)
+            if (f.ex[c] > bv || (f.ex[c] == bv && f.list[c] < bi)) { bv = f.ex[c]; bi = f.list[c]; }
+#pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { f.wmax[0] = bv; f.cnt = bi; }
+    }
+    __syncthreads();
+    const float bv = f.wmax[0];
+    const int bi = f.cnt;
+    float sum = 0.0f;
+    for (int t = tid; t < n_tiles; t += 512) {
+        const float2 p = __ldcg(&part[t]);
+        if (p.y > 0.0f) sum += p.y * __expf(p.x - bv);
+    }
+    for (int c = tid; c < n; c += 512) sum += __expf(f.ex[c] - bv) - __expf(f.lp[c] - bv);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    __syncthreads();   // f.wmax is free again
+    if (lane == 0) f.wmax[warp] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        sum = 0.0f;
+        for (int w = 0; w < 16; ++w) sum += f.wmax[w];
+        float one = 0.0f;   // the pick's own term is exactly 1
+        for (int c = 0; c < n; ++c) if (f.list[c] == bi) one = 1.0f;
+        sum = fmaxf(sum, one);
+        if constexpr (MAPPED) *out_id = map[bi < 0x7fffffff ? bi : 0];
+        else *out_id = bi < 0x7fffffff ? bi : 0;
+        *out_prob = 1.0f / sum;
+    }
+}
+
 }  // namespace
 }  // namespace basalt::kernels::px
