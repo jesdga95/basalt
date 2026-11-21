@@ -145,7 +145,7 @@ bool Mmproj::open(const core::FileRange& range, std::string& err, const char* pr
         if (t == 8) {
             const std::string s = c.str();
             if (key == "general.architecture") arch = s;
-            else if (key == "clip.projector_type") proj_type = s;
+            else if (key == "clip.projector_type" || key == "clip.vision.projector_type") proj_type = s;
             continue;
         }
         kv[key] = read_value(c, t);
@@ -171,6 +171,7 @@ bool Mmproj::open(const core::FileRange& range, std::string& err, const char* pr
     hp_.heads = (int) num("clip.vision.attention.head_count", 0);
     hp_.merge = (int) num("clip.vision.spatial_merge_size", kv.count("clip.vision.projector.scale_factor") ? num("clip.vision.projector.scale_factor", 2, false) : 2, false);
     hp_.min_pixels = (int) num("clip.vision.image_min_pixels", 0, false);
+    projector_ = projector;
     hp_.proj = (int) num("clip.vision.projection_dim", 0);
     hp_.eps = (float) num("clip.vision.attention.layer_norm_epsilon", 1e-6, false);
     if (!err.empty()) return false;

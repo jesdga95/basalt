@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.config import (  # noqa: E402
     CONFIG_VERSION,
+    ENGINE_VALUE_FORMS,
     ENTRY_OPTIONS,
     MODEL_OPTIONS,
     SAMPLING_KEYS,
@@ -210,7 +211,12 @@ class ConfigFile(unittest.TestCase):
                          ({"models": [entry], "engine": {"model": "x"}}, "in a model entry"),
                          ({"models": [entry], "engine": {"spec": None}}, "expected a string or number"),
                          ({"models": [entry], "engine": {"spec": ""}}, "expected a string or number"),
-                         ({"models": [entry], "engine": {"control-vector-layer-range": []}}, "empty list"),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": []}}, "must be a list \\[start, end\\], got \\[\\]"),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": "4 44"}},
+                          'control-vector-layer-range must be a list \\[start, end\\], got "4 44"'),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": [4]}}, "must be a list"),
+                         ({"models": [entry], "engine": {"kv": ["int8", "x"]}}, 'kv takes one value, got \\["int8", "x"\\]'),
+                         ({"models": [entry, {"model": "b", "control-vector-layer-range": 4}]}, "must be a list"),
                          ({"models": [entry], "engine": {"control-vector-layer-range": [4, [44]]}}, "expected a string or number"),
                          ({"models": [entry], "engine": {"control-vector-layer-range": [4, True]}}, "expected a string or number"),
                          ({"models": [entry], "engine": {"kv": {"a": 1}}}, "expected a string or number"),
@@ -236,10 +242,9 @@ class ConfigFile(unittest.TestCase):
 
     def test_list_values_become_words(self):
         engine = load_config_file(conf({"models": [{"model": "m"}], "engine": {
-            "control-vector-layer-range": [4, 44], "kv": "int8", "resident_experts": True, "no-x": False, "rate": 0.5,
-            "offset": ["-1", -2]}}), build_parser()).models[0].shared_words
+            "control-vector-layer-range": [4, 44], "kv": "int8", "resident_experts": True, "no-x": False, "rate": 0.5}}), build_parser()).models[0].shared_words
         self.assertEqual(engine, ["--control-vector-layer-range", "4", "44", "--kv", "int8", "--resident-experts",
-                                  "--rate", "0.5", "--offset", "-1", "-2"])
+                                  "--rate", "0.5"])
 
 
 class Precedence(unittest.TestCase):
@@ -446,6 +451,13 @@ class SlotContext(unittest.TestCase):
         self.assertEqual(slot_share(8192, 4), 2048)
         self.assertEqual(slot_share(512, 4), 256)                                     # never under the least slot
 
+    def test_the_slot_line_shows_each_slots_context(self):
+        from serve.config import slots_text
+        a, *_ = parse(["--parallel", "8", "--max-context", "262144"])
+        self.assertEqual(slots_text(8, 32768, a.shared_context), "slots 8 \u00d7 32768 ctx (slot-full-context: 262144 each)")
+        a, *_ = parse(["--parallel", "8", "--max-context", "262144", "--slot-full-context"])
+        self.assertEqual(slots_text(8, 262144, getattr(a, "shared_context", None)), "slots 8 \u00d7 262144 ctx")
+
     def test_parallel_conflicts_with_batch_and_slots(self):
         for flag in ("--batch", "--slots"):
             with self.assertRaisesRegex(ValueError, f"parallel and engine {flag} both set"):
@@ -515,7 +527,7 @@ class EveryOption(unittest.TestCase):
         ap = build_parser()
         for name, act in server_options(ap).items():
             # grammar is on by default: its no- form differs (test_grammar)
-            if name in ("api-key", "engine-bin", "grammar"):
+            if name in ("api-key", "api-key-file", "engine-bin", "grammar"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):
@@ -545,6 +557,8 @@ class EveryOption(unittest.TestCase):
             if flag[2:] in server:                         # the server's own: --model, --vision, ...
                 with self.assertRaises(ValueError, msg=flag):
                     load_config_file(conf({"engine": {flag: 1}}), build_parser())
+                continue
+            if flag[2:] in ENGINE_VALUE_FORMS:             # the flags that take several values
                 continue
             cli = [flag, "5"] if takes_value else [flag]
             cfgv = 5 if takes_value else True
@@ -616,6 +630,17 @@ class Startup(unittest.TestCase):
         code, err = self.run_server({"models": [entry], "server": {"api-key": "k"}})
         self.assertEqual(code, 2)
         self.assertIn("api-key can't be set in a config file", err)
+        code, err = self.run_server({"models": [entry], "server": {"api-key-file": "k.txt"}})
+        self.assertEqual(code, 2)
+        self.assertIn("api-key can't be set in a config file", err)
+        key_file = Path(TMP.name) / "key.txt"
+        key_file.write_text("s3cret\n", encoding="utf-8")
+        code, err = self.run_server({"models": [entry]}, "--mock-engine", "--api-key", "k", "--api-key-file", str(key_file))
+        self.assertEqual(code, 2)
+        self.assertIn("give --api-key or --api-key-file, not both", err)
+        code, err = self.run_server({"models": [entry]}, "--mock-engine", "--api-key-file", str(key_file) + ".missing")
+        self.assertEqual(code, 2)
+        self.assertIn("--api-key-file", err)
         code, err = self.run_server({"models": [entry], "server": {"nope": 1}})
         self.assertIn("not a server option", err)
         code, err = self.run_server({"models": [entry], "server": {"port": "abc"}})

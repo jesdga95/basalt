@@ -1,4 +1,5 @@
 // src/program/serve/request_restore.cpp - request restore operations.
+#include "prefix_anchor.hpp"
 #include "request.hpp"
 
 namespace basalt::program::serve {
@@ -12,7 +13,49 @@ bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<Img
     return runtime_.imgs_below(runtime_.req_imgs, L) == pre_imgs;
 }
 
+// ---- a reply the model wrote in other pieces than the tokenizer cuts it into: the client sends it back unchanged,
+// the prompt is tokenized canonically, and the ids stop matching inside the reply. Where a conversation this request
+// can continue (the live one, or an idle slot's) holds ids that spell exactly the bytes of the prompt's next tokens,
+// ending on a prompt token boundary, the held ids stand for those tokens: the request continues them instead of
+// reading the reply again from a checkpoint (and leaving a copy of the conversation behind in another slot).
+// Not with pictures, when a token has no bytes, or when the longer prompt would leave no room for max_new.
+void Request::respell_prompt() {
+    if (geni || !runtime_.req_imgs.empty() || !runtime_.text_tokenizer_note.empty()) return;
+    const auto bytes = [this](int32_t id) { return runtime_.token_bytes(id); };
+    const std::vector<int32_t>* best = nullptr;
+    HeldMeet meet;
+    int from_slot = -1;
+    const auto offer = [&](const std::vector<int32_t>& held, int slot) {
+        if ((int64_t) held.size() <= meet.held) return;
+        const HeldMeet m = meet_held(ids32.data(), n, held.data(), (int64_t) held.size(), true, bytes);
+        if (m.held > 0) {
+            best = &held;
+            meet = m;
+            from_slot = slot;
+        }
+    };
+    if (runtime_.live_ok && runtime_.live_imgs.empty()) offer(runtime_.live, own_slot);
+    if (!in_slot && runtime_.slots_share_cells())
+        for (int b = 0; b < (int) runtime_.bs.size(); ++b) {
+            const BSlot& sl = runtime_.bs[(size_t) b];
+            if (b != own_slot && !sl.active && sl.cached && sl.cvec == want_cvec && sl.imgs.empty()) offer(sl.ids, b);
+        }
+    if (best == nullptr || !meet.respelled()) return;
+    const int64_t grown = meet.held + n - meet.resume;
+    const int64_t ctx = runtime_.admit_slot >= 0 ? runtime_.slot_context(runtime_.admit_slot) : runtime_.o.max_context;
+    if (!respell_fits(grown, n, runtime_.admit_slot >= 0 ? runtime_.admit_max_new : (long long) max_new, ctx)) return;
+    const int64_t from = std::mismatch(best->begin(), best->begin() + std::min<int64_t>((int64_t) best->size(), n), ids32.begin()).first - best->begin();
+    splice_held(best->data(), meet, ids32.data(), n, ids);
+    ids32 = std::vector<int32_t>(ids.begin(), ids.end());
+    runtime_.cur = ids;
+    basalt::log::info("basalt serve", "prompt kept the ids of %s from token %lld on: the same bytes in other pieces "
+                      "(%+lld tokens)", from_slot < 0 ? "the live conversation" : ("slot " + std::to_string(from_slot)).c_str(),
+                      (long long) from, (long long) (grown - n));
+    n = grown;
+}
+
 Flow Request::restore() {
+    runtime_.ckd_finish();   // a save that a request left behind (an error, a cancel) lands before anything moves
     runtime_.cur = ids;
     // The conversation cache's keys are int32: one narrow view per request, so a parked entry or a checkpoint
     // is matched by one bulk compare over the slice instead of a per-token scan.
@@ -29,6 +72,10 @@ Flow Request::restore() {
     slot_b = runtime_.solo_slot >= 0 ? runtime_.solo_slot : runtime_.admit_slot;
     in_slot = runtime_.slot0_solo() && slot_b > 0;
     solo_req = in_slot && runtime_.solo_slot > 0;   // decoded here, solo-style, on the slot's own state
+    if (runtime_.stats.on) {   // the slot's console figures are this request's from here
+        runtime_.stats.start(slot_b);
+        runtime_.stats_tick(true);
+    }
     select_view();
 
     solo_moved = false;   // the solo session gave its cells to this request (hold_slot): it holds nothing after
@@ -76,6 +123,9 @@ Flow Request::restore() {
     }
     resume = 0;
     from_live = false;
+    // the slot this request reads into: its own conversation is `live` already
+    own_slot = in_slot ? slot_b : runtime_.slot0_solo() ? 0 : -1;
+    if (runtime_.o.prompt_cache > 0 && want_cvec == runtime_.cvec_cached) respell_prompt();
     if (runtime_.o.prompt_cache > 0 && want_cvec == runtime_.cvec_cached) {
         if (runtime_.live_ok && starts_with(runtime_.live, runtime_.live_imgs)) { resume = (int64_t) runtime_.live.size(); from_live = true; }
         for (const ConvCheckpoint& c : runtime_.checks)
@@ -91,8 +141,6 @@ Flow Request::restore() {
     resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
     resumed_chunk = 0;    // its chunk, if it was read beside decoding slots: its first part's plan
     slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
-    // the slot this request reads into: its own conversation is `live` already
-    own_slot = in_slot ? slot_b : runtime_.slot0_solo() ? 0 : -1;
     // A decoding slot's checkpoints are sources too: the K/V before a checkpoint never changes, so requests that
     // share a start (a system prompt) read it once, whichever slot holds it.
     if (runtime_.o.prompt_cache > 0 && runtime_.slots_share_cells())
@@ -164,7 +212,7 @@ Flow Request::restore() {
                 basalt::log::info("basalt serve", "prompt %lld tokens = 0 reused + 0 of %lld read in 0 ms "
                                   "(0.0 tok/s), 0 generated in 0 ms (0.0 tok/s), drafts accepted 0 of 0, %zu "
                                   "checkpoints (cancelled)", (long long) n, (long long) n, runtime_.checks.size());
-                std::printf("DONE 0 %lld 0.0 0.0 cancel 0 0 0 0 0 0 0 0.0 0 0\n", (long long) n);
+                std::printf("DONE 0 %lld 0.0 0.0 cancel 0 0 0 0 0 0 0 0.0 0 0 0\n", (long long) n);
                 std::fflush(stdout);
                 return Flow::next;
             }

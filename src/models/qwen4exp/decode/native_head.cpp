@@ -1,7 +1,7 @@
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
-#include "basalt/core/direct_upload.hpp"
+#include "basalt/core/loader.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -43,7 +43,7 @@ bool NativeHead::plan_bytes(const std::vector<std::string>& shards, uint64_t& ou
     }
 }
 
-bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
+bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, LoadPlan& reads, std::string& err) {
     if (loaded()) { err = "native head is already loaded"; return false; }
     if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
         err = "native head requires positive int32 dimensions and whole 256-value rows";
@@ -71,48 +71,33 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         }
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
-        LoadProgress progress(LoadProgress::cuda(dev), bytes);
         void* weights = nullptr;
         void* scratch = nullptr;
         cudaError_t status = cudaMalloc(&weights, bytes);
         if (status == cudaSuccess)
             status = cudaMalloc(&scratch, basalt::kernels::native_q8_1_bytes((int) n_in, 1));
-        std::string upload_err;
-        if (status != cudaSuccess || !DirectUploader().upload(gguf.path(), gguf.data_start() + tensor->offset, bytes, weights, upload_err)) {
+        if (status != cudaSuccess) {
             if (scratch) cudaFree(scratch);
             if (weights) cudaFree(weights);
-            err = std::string("native head upload: ") + (status != cudaSuccess ? cudaGetErrorString(status) : upload_err);
+            err = std::string("native head upload: ") + cudaGetErrorString(status);
             return false;
         }
-        progress.add(bytes);
-        progress.finish();
+        LoadItem it;   // read in the caller's pass; finish() rewrites the rows once they have landed
+        it.file = reads.file(gguf.path());
+        it.off = gguf.data_start() + tensor->offset;
+        it.bytes = bytes;
+        it.dev = weights;
+        it.device = dev;
+        reads.add(it);
         weights_ = weights;
         scratch_ = scratch;
         bytes_ = bytes;
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
-        // a Q8_0 head in bit planes, rewritten in place: the same bytes per row, read by every kernel of this head
-        if (type_ == 8 && basalt::kernels::q80p_supported((int) n_in, 1)) {
-            basalt::kernels::q80p_pack(weights_, n_out, nullptr);
-            if (cudaDeviceSynchronize() != cudaSuccess) {
-                err = "native head: the bit planes failed";
-                return false;
-            }
-            planes_ = true;
-        }
-        // the verify head's 2-bit copy, packed once from the uploaded rows (without it the exact head runs)
+        // the verify head's 2-bit copy (packed by finish(); without it the exact head runs), held now with the rows
         if (type_ == 14 && basalt::kernels::q6k_vhead_supported((int) n_in, (int) n_out, 1)) {
-            const size_t pb = basalt::kernels::q6k_vproxy_bytes(n_out);
-            if (cudaMalloc(&vproxy_, pb) == cudaSuccess) {
-                basalt::kernels::q6k_vproxy_pack(weights_, n_out, vproxy_, nullptr);
-                if (cudaDeviceSynchronize() != cudaSuccess) {
-                    cudaFree(vproxy_);
-                    vproxy_ = nullptr;
-                }
-            } else {
-                vproxy_ = nullptr;
-            }
+            if (cudaMalloc(&vproxy_, basalt::kernels::q6k_vproxy_bytes(n_out)) != cudaSuccess) vproxy_ = nullptr;
             cudaGetLastError();
         }
         return true;
@@ -120,6 +105,28 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         err = std::string("native head: ") + error.what();
         return false;
     }
+}
+
+bool NativeHead::finish(std::string& err) {
+    if (!loaded()) return true;
+    // a Q8_0 head in bit planes, rewritten in place: the same bytes per row, read by every kernel of this head
+    if (type_ == 8 && basalt::kernels::q80p_supported(n_in_, 1)) {
+        basalt::kernels::q80p_pack(weights_, n_out_, nullptr);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            err = "native head: the bit planes failed";
+            return false;
+        }
+        planes_ = true;
+    }
+    if (vproxy_ != nullptr) {   // packed once from the landed rows
+        basalt::kernels::q6k_vproxy_pack(weights_, n_out_, vproxy_, nullptr);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            cudaFree(vproxy_);
+            vproxy_ = nullptr;
+        }
+        cudaGetLastError();
+    }
+    return true;
 }
 
 bool NativeHead::run(const float* mixed, float* logits, void* stream, std::string& err) const {
@@ -163,7 +170,7 @@ NativeEmbed::~NativeEmbed() {
     else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
 }
 
-bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err) {
+bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, LoadPlan& reads, std::string& err) {
     try {
         const basalt::GgufModel model(shards);
         err = basalt::model::check_architecture(model.meta());
@@ -186,7 +193,10 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             bytes_ = 0;
             return false;
         }
-        basalt::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
+        LoadItem it;   // the table, read in the caller's pass
+        it.file = reads.file(gguf.path());
+        it.off = gguf.data_start() + t->offset;
+        it.bytes = bytes_;
         if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
             // themselves (three cards). The table is only gathered from, so keep it in the current device's VRAM
@@ -194,18 +204,20 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             cudaGetLastError();
             host_ = nullptr;
             void* d = nullptr;
-            if (cudaMalloc(&d, bytes_) != cudaSuccess ||
-                cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
-                if (d) cudaFree(d);
+            if (cudaMalloc(&d, bytes_) != cudaSuccess) {
                 cudaGetLastError();
                 err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB, nor place it in VRAM";
                 return false;
             }
+            it.dev = d;
+            cudaGetDevice(&it.device);
+            reads.add(it);
             basalt::log::warn("basalt", "native embedding: cannot pin %llu MiB, kept in VRAM instead",
                          (unsigned long long) (bytes_ >> 20));
             dev_ = d;
         } else {
-            std::memcpy(host_, gguf.tensor_data(*t), bytes_);
+            it.host = (uint8_t*) host_;
+            reads.add(it);
             void* d = nullptr;
             if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess) {
                 err = "native embedding: no device alias for the mapped table";
@@ -214,10 +226,16 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             dev_ = d;
             // the hot rows: without the VRAM for them every row stays on the mapped path
             const int64_t n_hot = kHotRows < n_vocab ? kHotRows : n_vocab;
-            if (cudaMalloc(&hot_, (size_t) n_hot * row_) == cudaSuccess &&
-                cudaMemcpy(hot_, host_, (size_t) n_hot * row_, cudaMemcpyHostToDevice) == cudaSuccess) {
+            if (cudaMalloc(&hot_, (size_t) n_hot * row_) == cudaSuccess) {
                 n_hot_ = n_hot;
                 cudaGetDevice(&hot_device_);
+                LoadItem hot;   // copied from the table once it has landed
+                hot.from = (const uint8_t*) host_;
+                hot.bytes = (uint64_t) n_hot * row_;
+                hot.dev = hot_;
+                hot.device = hot_device_;
+                hot.count = 0;
+                reads.add(hot);
             } else {
                 if (hot_) cudaFree(hot_);
                 hot_ = nullptr;

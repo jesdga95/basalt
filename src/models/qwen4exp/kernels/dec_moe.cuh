@@ -1306,14 +1306,14 @@ template<int TY>
 __device__ __forceinline__ void dm_mix_rows_t(const uint8_t* w, size_t rb, int rows, int n_in, const block_q8_1* x, int xs,
                                               int nt, float* out, int ld, int gw, int nw, int lane) {
     const int nbk = n_in / Fmt<TY>::qk;
-    int off[kDecMaxT];
+    int off[kVerifyMaxT];
 #pragma unroll
-    for (int c = 0; c < kDecMaxT; ++c) off[c] = min(c, nt - 1) * xs;
+    for (int c = 0; c < kVerifyMaxT; ++c) off[c] = min(c, nt - 1) * xs;
     for (int r = gw; r < rows; r += nw) {
-        float s[kDecMaxT];
-        row_dot_multi<TY, kDecMaxT>(w + (size_t) r * rb, x, off, nt, nbk, lane, s);
+        float s[kVerifyMaxT];
+        row_dot_multi<TY, kVerifyMaxT>(w + (size_t) r * rb, x, off, nt, nbk, lane, s);
 #pragma unroll
-        for (int c = 0; c < kDecMaxT; ++c)
+        for (int c = 0; c < kVerifyMaxT; ++c)
             if (c < nt && lane == c) out[(size_t) c * ld + r] = s[c];
     }
 }
@@ -1337,16 +1337,16 @@ __device__ __forceinline__ void dm_mix_rows_m_t(const uint8_t* w, size_t rb, int
                                                 int xs, int nt, float* out, int ld, float (*sp)[kDmThreads / 32]) {
     constexpr int WB = kDmThreads / 32;
     const int nbk = n_in / Fmt<TY>::qk, lane = threadIdx.x & 31, wi = threadIdx.x / 32;
-    int off[kDecMaxT];
+    int off[kVerifyMaxT];
 #pragma unroll
-    for (int c = 0; c < kDecMaxT; ++c) off[c] = min(c, nt - 1) * xs;
+    for (int c = 0; c < kVerifyMaxT; ++c) off[c] = min(c, nt - 1) * xs;
     for (int r0 = blockIdx.x * WB; r0 < rows; r0 += gridDim.x * WB) {
         const int r = r0 + wi;
         if (r < rows) {
-            float s[kDecMaxT];
-            row_dot_multi<TY, kDecMaxT>(w + (size_t) r * rb, x, off, nt, nbk, lane, s);
+            float s[kVerifyMaxT];
+            row_dot_multi<TY, kVerifyMaxT>(w + (size_t) r * rb, x, off, nt, nbk, lane, s);
 #pragma unroll
-            for (int c = 0; c < kDecMaxT; ++c)
+            for (int c = 0; c < kVerifyMaxT; ++c)
                 if (c < nt && lane == c) sp[c][wi] = s[c];
         }
         __syncthreads();
@@ -1397,6 +1397,10 @@ __global__ void __launch_bounds__(kDmThreads) dm_vram_kernel(const DmPlan* __res
 // dots (the same bits).  A down item waits for its group's gate/up items (counters, as dm_experts).
 constexpr int kTmaStages = 3;
 constexpr int kTmaStage = 11776;          // bytes: the largest item (32 IQ4_NL down rows, 8 IQ4_XS gate/up rows)
+// The TMA bulk-copy pipeline (mbarrier + cp.async.bulk + the cluster fence) needs sm_90: a build for an
+// older peer card compiles none of it, and the host side must not choose kind 1 there (the plain kernel
+// path below covers the same formats).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
 constexpr int kTmaGuRows = 8, kTmaDownRows = 32;
 
 struct DmTmaShared {
@@ -1529,6 +1533,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_vram_tma_kernel(const DmPlan* _
     dm_experts_tma<TG, TD>(sm, ng, xq, L, gate, up, out, sync + 1, blockIdx.x, gridDim.x, 0);
     if (dm_arrive(sync, gridDim.x, sync + 1, ng)) sync[0] = 0u;
 }
+#endif  // sm_90+ (the TMA pipeline)
 
 // ---------------------------------------------------------------- the VRAM share as three launches, NR rows a warp
 // row_dot_multi over NR rows at once: each row's sums are row_dot_multi's (the same calls, k lane-strided, added in the
@@ -1651,6 +1656,7 @@ __global__ void __launch_bounds__(256) dm_gu_kernel(const DmPlan* __restrict__ p
     }
 }
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900  // the TMA kernel exists on this build
 template<int TG, int TD>
 int dm_vram_tma_blocks() {
     static int known[64] = {};
@@ -1667,6 +1673,7 @@ int dm_vram_tma_blocks() {
     }
     return known[dev];
 }
+#endif  // the TMA kernel exists on this build
 
 template<int TG, int TD>
 int dm_vram_blocks() {

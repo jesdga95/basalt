@@ -24,7 +24,7 @@ CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the confi
 ENTRY_OPTIONS = frozenset({"model", "alias"})
 MODEL_OPTIONS = frozenset({
     "gpu", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
-    "grammar", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
+    "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
     "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
 
@@ -68,19 +68,28 @@ def split_engine_extras(extras: list[str]) -> list[str]:
     return out
 
 
+# engine flags that take several values, with their form; every other engine flag takes one
+ENGINE_VALUE_FORMS = {"control-vector-layer-range": ["start", "end"]}
+
+
 def engine_words(key: str, value) -> list[str]:
     """The engine words for one config entry: a switch is true (the flag) or false (nothing), a string or number is
-    one value, and a list gives one word per item (a flag that takes several values). ValueError otherwise."""
-    flag = "--" + str(key).strip().lower().replace("_", "-").removeprefix("--")
+    one value, and a flag that takes several values (`ENGINE_VALUE_FORMS`) is a list of exactly that many. ValueError
+    otherwise."""
+    name = str(key).strip().lower().replace("_", "-").removeprefix("--")
+    flag = "--" + name
     if isinstance(value, bool):
         return [flag] if value else []
+    form = ENGINE_VALUE_FORMS.get(name)
+    if form:
+        if not isinstance(value, list) or len(value) != len(form):
+            raise ValueError(f"{name} must be a list [{', '.join(form)}], got {json.dumps(value)}")
+    elif isinstance(value, list):
+        raise ValueError(f"{name} takes one value, got {json.dumps(value)}")
     items = value if isinstance(value, list) else [value]
     for item in items:
         if isinstance(item, bool) or not isinstance(item, (str, int, float)) or str(item).strip() == "":
-            raise ValueError(f"engine.{key}: expected a string or number, a list of them for several values, "
-                             f"or true/false for a switch, not {value!r}")
-    if not items:
-        raise ValueError(f"engine.{key}: an empty list gives the flag no value")
+            raise ValueError(f"engine.{key}: expected a string or number, or true/false for a switch, not {value!r}")
     return [flag, *(str(item) for item in items)]
 
 
@@ -347,6 +356,13 @@ def slot_share(total: int, parallel: int) -> int:
     return max(MIN_SLOT_CONTEXT, total // parallel)
 
 
+def slots_text(parallel: int, per_slot: int, shared: int | None) -> str:
+    """The startup slot line: the slots and the context each really gets; a shared --max-context also names the
+    whole-context option."""
+    text = f"slots {parallel} \u00d7 {per_slot} ctx"
+    return text + (f" (slot-full-context: {shared} each)" if shared else "")
+
+
 def with_spec(items: list[str], spec) -> list[str]:
     """A model's items with `spec=N` the window the engine will run (its --gpu-plan answer), not the flag as given."""
     return items if not isinstance(spec, int) else [x for x in items if not x.startswith("spec=")] + [f"spec={spec}"]
@@ -573,6 +589,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--api-key", default="",
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); command line only, "
                          "not allowed in a --config file")
+    ap.add_argument("--api-key-file", default="", metavar="FILE",
+                    help="read that key from the first line of FILE, which keeps it out of the process list; command "
+                         "line only")
     ap.add_argument("--allowed-host", action="append", default=[], metavar="NAME",
                     help="also answer to this Host name (repeatable; \"*\" turns the check off)")
     ap.add_argument("--cors-origin", action="append", default=[], metavar="ORIGIN",
@@ -604,6 +623,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"default {key.replace('-', '_')} for requests that leave it out, over the model file's: {text}")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
                     help="load an unloaded model only when this much VRAM is free, else answer 503")
+    ap.add_argument("--reasoning-effort", type=str.lower, choices=("none", "low", "medium", "high", "xhigh", "max"),
+                    default=None, help="default reasoning effort for requests that name none (no effort, thinking "
+                                       "switch or budget); unset, the model's template decides")
     ap.add_argument("--reasoning-budget-tokens", type=budget_count, default=None, metavar="N",
                     help="default thinking budget for requests that leave reasoning_budget_tokens out (0 = none): at "
                          "the budget the thinking is closed and the answer starts, so set it below the request's "

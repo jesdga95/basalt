@@ -46,6 +46,8 @@ public:
     void release();
 
     const Hparams& hp() const { return hp_; }
+    /// The `projector` the file was opened as (the name its model asked for).
+    const std::string& projector() const { return projector_; }
     /// A tensor by name; null when absent.
     const TensorRef* find(const std::string& name) const;
     /// A required tensor of the given type and element count (ne product); null with `err` set otherwise.
@@ -57,6 +59,7 @@ private:
     bool mapped_ = false;   ///< `map_` is a file mapping (else allocated memory the file was read into)
     size_t size_ = 0;
     Hparams hp_;
+    std::string projector_;
     std::map<std::string, TensorRef> tensors_;
 };
 

@@ -32,6 +32,7 @@
 #include <vector>
 
 namespace basalt::core {
+class LoadPlan;
 
 class NativeHead;
 struct ConversationKv;
@@ -60,9 +61,9 @@ public:
     MtpDrafter(const MtpDrafter&) = delete;
     MtpDrafter& operator=(const MtpDrafter&) = delete;
 
-    /// Loads the draft layer's files and allocates its K/V and buffers for up to `max_t` rows.
-    /// Call before the VRAM expert tier is sized.
-    bool load(const MtpFiles& files, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
+    /// Allocates the draft layer's weights (their reads queued in `reads`, the caller's pass places them), its K/V and
+    /// buffers for up to `max_t` rows.  Call before the VRAM expert tier is sized.
+    bool load(const MtpFiles& files, const ModelGeometry& g, SessionState& ss, int max_t, LoadPlan& reads, std::string& err,
               int64_t window = 32768);
     /// The bytes `load` places on the device (the dense weights and the experts; the K/V and buffers are working
     /// memory), from the section sizes and the dense index.

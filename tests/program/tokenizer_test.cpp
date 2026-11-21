@@ -12,13 +12,11 @@
 #include "basalt/program/tokenizer.hpp"
 #include "unicode_flags.hpp"
 
-// The pre-tokenizers of the models this build contains (BASALT_MODELS).
+// The Qwen pre-tokenizer is shared (the tokenizer library); the others belong to the models this build contains.
 #ifdef BASALT_MODEL_DEEPSEEK41
 #include "models/deepseek41/adapter.hpp"
 #endif
-#ifdef BASALT_MODEL_QWEN4EXP
-namespace basalt::models::qwen4exp::tokenizer { void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends); }
-#endif
+namespace basalt::program::tokenizer { void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends); }
 
 using basalt::program::Tokenizer;
 
@@ -29,17 +27,7 @@ constexpr PreTok kJoyai = basalt::models::deepseek41::pretok_joyai;
 #else
 constexpr PreTok kJoyai = nullptr;
 #endif
-#ifdef BASALT_MODEL_QWEN4EXP
-constexpr PreTok kQwen35 = basalt::models::qwen4exp::tokenizer::pretok_qwen35;
-#else
-constexpr PreTok kQwen35 = nullptr;
-#endif
-// the synthetic vocab below runs under whichever pre-tokenizer this build has, Qwen first
-#ifdef BASALT_MODEL_QWEN4EXP
-constexpr PreTok kAny = kQwen35;
-#else
-constexpr PreTok kAny = kJoyai;
-#endif
+constexpr PreTok kQwen35 = basalt::program::tokenizer::pretok_qwen35;
 }  // namespace
 
 namespace {
@@ -90,7 +78,7 @@ void synthetic() {
     merges = "b c\na b\nab c\na a\naa a";   // ranks: bc 0, ab 1, abc 2, aa 3, aaa 4
     Tokenizer t;
     std::string err;
-    t.set_pretokenize(kAny);
+    t.set_pretokenize(kQwen35);
     CHECK(t.load(vocab, merges, types, err));
     std::vector<int32_t> ids;
     CHECK(t.encode("abc", false, {}, ids, err));

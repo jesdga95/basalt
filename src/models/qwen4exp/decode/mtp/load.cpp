@@ -24,7 +24,7 @@ bool mapped(size_t bytes, void** h, void** d) {
 
 }  // namespace
 
-bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
+bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionState& ss, int max_t, LoadPlan& plan, std::string& err,
                       int64_t window) {
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
     g_ = &g;
@@ -36,47 +36,66 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     // the two reads below are the whole "drafter files" cost; reported apart from the rest of the stage
     const auto t_files = std::chrono::steady_clock::now();
     // the draft layer's dense weights and experts, as one load phase
-    std::optional<LoadProgress> progress;
     // ---- the index and the dense weights
     {
         if (!parse_index(files.index, tensors_, err)) return false;
-        std::vector<uint8_t> blob;
-        if (!read_file(files.dense, blob)) { err = "mtp: cannot read " + files.dense.path; return false; }
+        if (files.dense.empty() || !files.dense.exists()) { err = "mtp: cannot read " + files.dense.path; return false; }
+        const int dense_file = plan.file(files.dense.path);
+        const uint64_t dense_in = files.dense.size();
+        uint64_t dense_size = dense_in;
+        std::vector<uint64_t> from;   // each tensor's offset in the file's dense section, before it is re-placed
         if (basalt::kernels::hc8_only()) {   // the hyper-connection matrices as 8-bit copies only: out of the blob
-            std::vector<uint8_t> kept;
-            size_t staged = 0;
+            uint64_t kept = 0, staged = 0;
             for (Tensor& t : tensors_) {
-                if (t.off + t.bytes > blob.size()) { err = "mtp: the dense index names bytes past the dense section: " + t.name; return false; }
+                if (t.off + t.bytes > dense_in) { err = "mtp: the dense index names bytes past the dense section: " + t.name; return false; }
+                from.push_back(t.off);
                 const bool hc = is_hc8_matrix(t);
                 if (hc) {   // the 8-bit copy from the model file's table
-                    t.dev = hc8_table_adopt("mtp." + t.name, nullptr, (int) t.rows, (int) t.cols);
+                    t.dev = hc8_table_adopt("mtp." + t.name, nullptr, (int) t.rows, (int) t.cols, plan);
                     if (t.dev == nullptr) { err = "mtp: no 8-bit copy of " + t.name; return false; }
                     staged += t.bytes;
                     continue;
                 }
-                const size_t off = (kept.size() + 255) & ~(size_t) 255;
-                kept.resize(off + t.bytes);
-                std::memcpy(kept.data() + off, blob.data() + t.off, t.bytes);
+                const uint64_t off = (kept + 255) & ~(uint64_t) 255;
+                kept = off + t.bytes;
                 t.off = off;
             }
-            blob.swap(kept);
+            dense_size = kept;
             basalt::log::info("basalt hc8", "the draft layer's hyper-connection matrices as 8-bit copies only (%.1f MiB "
                                  "of bf16 left out)", (double) staged / 1048576.0);
         }
-        const cudaError_t alloc = cudaMalloc((void**) &dense_, blob.size());
+        const cudaError_t alloc = cudaMalloc((void**) &dense_, dense_size);
         if (alloc != cudaSuccess) {
             size_t free_bytes = 0, total_bytes = 0;
             const cudaError_t info = cudaMemGetInfo(&free_bytes, &total_bytes);
             err = "mtp: dense weights allocation failed (" + std::string(cudaGetErrorString(alloc)) +
-                  "), requested " + std::to_string(blob.size() >> 20) + " MiB, CUDA0 free " +
+                  "), requested " + std::to_string(dense_size >> 20) + " MiB, CUDA0 free " +
                   (info == cudaSuccess ? std::to_string(free_bytes >> 20) + " MiB" : "unknown");
             return false;
         }
-        progress.emplace(LoadProgress::cuda(device_), blob.size() + (uint64_t) g.n_expert * basalt::kernels::cpu::BLOB);
-        cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
-        progress->add(blob.size());
-        vram_ += blob.size();
-        dense_bytes_ = blob.size();
+        if (basalt::kernels::hc8_only()) {
+            (void) cudaMemset(dense_, 0, (size_t) dense_size);   // the gaps between the matrices read as zero
+            for (size_t i = 0; i < tensors_.size(); ++i) {
+                if (is_hc8_matrix(tensors_[i])) continue;
+                LoadItem it;
+                it.file = dense_file;
+                it.off = files.dense.offset + from[i];
+                it.bytes = tensors_[i].bytes;
+                it.dev = (uint8_t*) dense_ + tensors_[i].off;
+                it.device = device_;
+                plan.add(it);
+            }
+        } else {
+            LoadItem it;
+            it.file = dense_file;
+            it.off = files.dense.offset;
+            it.bytes = dense_size;
+            it.dev = dense_;
+            it.device = device_;
+            plan.add(it);
+        }
+        vram_ += dense_size;
+        dense_bytes_ = dense_size;
     }
     // ---- the 512 routed experts, one blob each
     {
@@ -86,13 +105,13 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             return false;
         }
         if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
-        std::string upload_err;
-        if (!DirectUploader().upload(files.experts.path, files.experts.offset, bytes, experts_, upload_err)) {
-            err = "mtp: cannot read the experts section: " + upload_err;
-            return false;
-        }
-        progress->add(bytes);
-        progress->finish();
+        LoadItem it;
+        it.file = plan.file(files.experts.path);
+        it.off = files.experts.offset;
+        it.bytes = bytes;
+        it.dev = experts_;
+        it.device = device_;
+        plan.add(it);
         vram_ += bytes;
     }
     const char* required[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",
@@ -275,7 +294,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
                 // the copies of the matrices the blob still holds in bf16, from the model file's table
                 auto prepare = [&](const std::string& n, int rows, int cols) {
                     const uint16_t* w = bf16(n.c_str());
-                    if (w == nullptr || hc8_table_adopt("mtp." + n, w, rows, cols) != nullptr) return true;
+                    if (w == nullptr || hc8_table_adopt("mtp." + n, w, rows, cols, plan) != nullptr) return true;
                     err = "mtp: no 8-bit copy of " + n;
                     return false;
                 };

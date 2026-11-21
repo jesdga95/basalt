@@ -51,7 +51,20 @@ JOYAI_PATTERNS = [
     r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 ]
-PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS}
+# `hy_v4` (Hy4-flash) is the same three regexes (LLAMA_VOCAB_PRE_TYPE_HY_V4 shares the JOYAI_LLM case).
+# `inkling2` (Inkling 2): OpenAI's o200k split, the one regex of the checkpoint's tokenizer.json (llama.cpp maps it to
+# LLAMA_VOCAB_PRE_TYPE_GPT4O).
+INKLING2_PATTERNS = [
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+",
+]
+PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS, "hy_v4": JOYAI_PATTERNS, "inkling2": INKLING2_PATTERNS}
+PRE_SOURCES = {"joyai-llm": "JOYAI_LLM", "hy_v4": "HY_V4", "inkling2": "GPT4O"}
 
 
 class Tokenizer:
@@ -288,7 +301,8 @@ def extract_metadata(md: dict, out_dir) -> dict:
     }
     if tk.pre in PRE_PATTERNS:
         cfg["pre_patterns"] = PRE_PATTERNS[tk.pre]
-        cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM), applied in order"
+        cfg["pre_pattern_source"] = ("llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_%s), applied in order"
+                                     % PRE_SOURCES[tk.pre])
     else:
         cfg["pre_pattern"] = QWEN35_PATTERN
         cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)"

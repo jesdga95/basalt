@@ -44,7 +44,7 @@ int main() {
     check(available_memory() > 0, "available_memory reads");
 
     const ProcessMemory pm = process_memory();
-    if (!mi.empty()) check(pm.rss_mib > 0 && pm.avail_mib > 0, "process_memory reads this process's resident set");
+    check(pm.rss_mib > 0 && pm.avail_mib > 0, "process_memory reads this process's resident set");
 
     std::string dev;
     const int rot = disk_rotational(temp_dir(), dev);

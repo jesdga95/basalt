@@ -2,7 +2,7 @@
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
-#include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
 
 namespace basalt::prefill {
 using namespace detail;

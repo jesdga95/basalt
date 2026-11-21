@@ -85,14 +85,14 @@ bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, s
 
 bool Guard::begin(const std::string& grammar_json, const int64_t* prompt, size_t n_prompt, std::string& err) {
     on_ = false;
-    windows_ = misses_ = ns_ = 0;
+    windows_ = misses_ = fallbacks_ = ns_ = 0;
     RequestGrammar rg = grammar_from_request(grammar_json, err);
     if (!err.empty()) return false;
     if (!rg.grammar) return true;
     st_ = GrammarState(rg.grammar, rg.triggers);
     // generation starts inside a thinking block when the prompt's last think tag opens one
     thinking_ = false;
-    for (size_t i = n_prompt, seen = 0; i-- > 0 && seen < 16; ++seen) {
+    for (size_t i = n_prompt; i-- > 0;) {
         const int64_t t = prompt[i];
         if (t == pv_.think_close) break;
         if (t == pv_.think_open) { thinking_ = true; break; }
@@ -114,10 +114,10 @@ bool Guard::feed(int32_t token) {
     return st_.accept(b, token);
 }
 
-int Guard::scan(const int32_t* out, int rows) {
+int Guard::scan(const int32_t* out, int rows, int first) {
     const auto t0 = std::chrono::steady_clock::now();
     int miss = -1;
-    for (int t = 0; t < rows; ++t)
+    for (int t = first; t < rows; ++t)
         if (!feed(out[t])) { miss = t; break; }
     ++windows_;
     if (miss >= 0) ++misses_;
@@ -125,25 +125,66 @@ int Guard::scan(const int32_t* out, int rows) {
     return miss;
 }
 
-void Guard::mask_bias(const std::vector<float>& user_bias, std::vector<float>& bias) {
-    const auto t0 = std::chrono::steady_clock::now();
-    st_.fill_mask(*pv_.vocab, mask_);
+void Guard::mask_bias(const std::vector<float>& user_bias, bool use_cache, std::vector<float>& bias) {
+    st_.fill_mask(*pv_.vocab, mask_, use_cache);
     const size_t n = mask_.size();
     bias.resize(n);
     const bool u = user_bias.size() == n;
     for (size_t i = 0; i < n; ++i) bias[i] = mask_[i] ? (u ? user_bias[i] : 0.0f) : -INFINITY;
-    ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
-bool Guard::take(int32_t token) {
+std::string Guard::describe() const {
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "%zu live stacks, %s, %s", st_.stack_elements().size(),
+                  st_.accepting() ? "complete" : "incomplete", st_.dead() ? "dead end" : "open");
+    return buf;
+}
+
+Redraw Guard::redraw(const std::vector<float>& user_bias, const DrawFn& draw, const LogitsFn& logits, int32_t& token) {
     const auto t0 = std::chrono::steady_clock::now();
-    const bool ok = feed(token);
-    if (!ok) {
-        basalt::log::warn("basalt grammar", "a masked draw was refused by the grammar; enforcement is off for this request");
+    const auto done = [&](Redraw r) {
+        ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        return r;
+    };
+    const auto allowed = [](const std::vector<float>& b) {
+        return std::any_of(b.begin(), b.end(), [](float v) { return v > -INFINITY; });
+    };
+    const auto dead = [&] {
+        basalt::log::error("basalt grammar", "no token is allowed here (%s); the reply ends", describe().c_str());
         on_ = false;
+        return done(Redraw::dead);
+    };
+    std::vector<float> bias;
+    mask_bias(user_bias, true, bias);
+    if (!allowed(bias)) return dead();
+    int32_t t = 0;
+    if (!draw(bias, t)) return done(Redraw::failed);
+    if (feed(t)) { token = t; return done(Redraw::drawn); }
+    basalt::log::warn("basalt grammar", "a masked draw was refused by the grammar (token %d, %s); drawing again", (int) t,
+                      describe().c_str());
+    mask_bias(user_bias, false, bias);
+    if (!allowed(bias)) return dead();
+    if (!draw(bias, t)) return done(Redraw::failed);
+    if (feed(t)) { token = t; return done(Redraw::drawn); }
+    // still refused: the likeliest token the grammar accepts, tried best first (a few, in case the mask and accept differ)
+    std::vector<float> lg;
+    if (!logits(lg) || lg.size() != bias.size()) return done(Redraw::failed);
+    std::vector<uint32_t> cand;
+    for (size_t i = 0; i < bias.size(); ++i) {
+        lg[i] += bias[i];
+        if (lg[i] > -INFINITY && lg[i] < INFINITY) cand.push_back((uint32_t) i);   // not -inf, not nan
     }
-    ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
-    return ok;
+    const size_t k = std::min<size_t>(cand.size(), 8);
+    std::partial_sort(cand.begin(), cand.begin() + (std::ptrdiff_t) k, cand.end(),
+                      [&](uint32_t a, uint32_t b) { return lg[a] > lg[b] || (lg[a] == lg[b] && a < b); });
+    for (size_t i = 0; i < k; ++i) {
+        if (!feed((int32_t) cand[i])) continue;
+        token = (int32_t) cand[i];
+        ++fallbacks_;
+        basalt::log::warn("basalt grammar", "the draw was refused again; token %d is the likeliest the grammar accepts", (int) token);
+        return done(Redraw::fallback);
+    }
+    return dead();
 }
 
 }  // namespace basalt::program::grammar

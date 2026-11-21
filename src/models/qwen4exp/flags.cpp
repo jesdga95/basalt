@@ -4,6 +4,8 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
+#include "basalt/model/rope_flags.hpp"
+#include "basalt/model/route_flags.hpp"
 #include "basalt/models/qwen4exp/options.hpp"
 
 #include <algorithm>
@@ -15,20 +17,13 @@
 namespace basalt::models::qwen4exp {
 namespace {
 constexpr float kRelaxedDraftingDefault = 0.5f;
-constexpr int kRouteTailSkipDefault = 9;
-constexpr float kRoutePriorDefault = 0.5f;
+constexpr int kTopK = 10;                // the routed experts per token
+constexpr float kRoutePriorBare = 0.5f;  // --route-prior alone: on the log probability
 }  // namespace
 
 bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& code) {
-    if (a == "--rope-scaling") o.rope_scaling = args.next("--rope-scaling");
-    else if (a == "--rope-scale") o.rope_scale = std::atof(args.next("--rope-scale"));
-    else if (a == "--rope-freq-base") o.rope_freq_base = std::atof(args.next("--rope-freq-base"));
-    else if (a == "--rope-freq-scale") o.rope_freq_scale = std::atof(args.next("--rope-freq-scale"));
-    else if (a == "--yarn-orig-ctx") o.yarn_orig_ctx = std::atof(args.next("--yarn-orig-ctx"));
-    else if (a == "--yarn-ext-factor") o.yarn_ext_factor = std::atof(args.next("--yarn-ext-factor"));
-    else if (a == "--yarn-attn-factor") o.yarn_attn_factor = std::atof(args.next("--yarn-attn-factor"));
-    else if (a == "--yarn-beta-fast") o.yarn_beta_fast = std::atof(args.next("--yarn-beta-fast"));
-    else if (a == "--yarn-beta-slow") o.yarn_beta_slow = std::atof(args.next("--yarn-beta-slow"));
+    if (model::parse_rope_flag(a, args, o.rope)) {}
+    else if (model::parse_route_flag(a, args, o.route, code)) {}
     else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(args.next("--prompt-cache-every")));
     else if (a == "--dump-residual") o.dump_residual = args.next("--dump-residual");
     else if (a == "--dump-mixed") o.dump_mixed = args.next("--dump-mixed");
@@ -75,30 +70,6 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
                 args.take();
                 if (!(v > 0.0f && v <= 1.0f)) { basalt::log::error("basalt", "--relaxed-drafting: P must be in (0, 1]"); { code = 2; return true; } }
                 o.relaxed_drafting = v;
-            }
-        }
-    }
-    else if (a == "--route-tail-skip") {   // the value is optional: an integer 1..9 when one follows
-        o.route_tail_skip = kRouteTailSkipDefault;
-        if (args.peek() != nullptr) {
-            char* e = nullptr;
-            const long v = std::strtol(args.peek(), &e, 10);
-            if (e != args.peek() && *e == '\0') {
-                args.take();
-                if (v < 1 || v > 9) { basalt::log::error("basalt", "--route-tail-skip: R must be 1..9"); { code = 2; return true; } }
-                o.route_tail_skip = (int) v;
-            }
-        }
-    }
-    else if (a == "--route-prior") {   // the value is optional: a number in (0, 16] when one follows
-        o.route_prior = kRoutePriorDefault;
-        if (args.peek() != nullptr) {
-            char* e = nullptr;
-            const float v = std::strtof(args.peek(), &e);
-            if (e != args.peek() && *e == '\0') {
-                args.take();
-                if (!(v > 0.0f && v <= 16.0f)) { basalt::log::error("basalt", "--route-prior: LAMBDA must be in (0, 16]"); { code = 2; return true; } }
-                o.route_prior = v;
             }
         }
     }
@@ -184,15 +155,7 @@ std::optional<int> finish_flags(Options& o) {
         std::snprintf(effect, sizeof effect, "--relaxed-drafting %g accepts draft tokens the model would not pick", (double) o.relaxed_drafting);
         o.lossy.push_back({"--relaxed-drafting", effect});
     }
-    if (o.route_prior > 0.0f) {
-        std::snprintf(effect, sizeof effect, "--route-prior %g changes expert routing", (double) o.route_prior);
-        o.lossy.push_back({"--route-prior", effect});
-    }
-    if (o.route_tail_skip > 0) {
-        std::snprintf(effect, sizeof effect, "--route-tail-skip %d drops low-ranked missed experts", o.route_tail_skip);
-        o.lossy.push_back({"--route-tail-skip", effect});
-    }
-    return std::nullopt;
+    return model::finish_route_flags(o, kTopK, kRoutePriorBare, "basalt");
 }
 
 }  // namespace basalt::models::qwen4exp

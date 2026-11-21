@@ -1,13 +1,10 @@
 # DeepSeek-V4.1 kernels: the library and its parity tests. Included from the top-level CMakeLists.txt.
 add_library(deepseek41_kernels STATIC
-  src/models/deepseek41/kernels/router.cu
-  src/models/deepseek41/kernels/mhc.cu
-  src/models/deepseek41/kernels/norm.cu
   src/models/deepseek41/kernels/engram.cu
   src/models/deepseek41/kernels/attn_index.cu
   src/models/deepseek41/kernels/engram_hash.cpp)
 target_include_directories(deepseek41_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(deepseek41_kernels PUBLIC ${_gpu_runtime_target})
+target_link_libraries(deepseek41_kernels PUBLIC kernels ${_gpu_runtime_target})
 
 foreach(_t router_parity norm_parity hc_parity engram_parity attn_index_parity prefill_index_parity)
   if(BUILD_TESTING AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/models/deepseek41/kernels/${_t}.cpp)

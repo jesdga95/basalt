@@ -156,6 +156,11 @@ public:
     int init_after_input() override;
     void after_input_start() override;
     void print_info() override;
+    /// The experts every card's cache and tier hold now: the engine's expert slots.
+    int64_t gpu_slots() const;
+    basalt::program::serve::LookupCounts lookup_counts() override;
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override;
+    std::vector<CardFacts> card_facts() override;
     void at_exit() override;
     bool windows_in_flight() override;
     bool next_batch_window() override;
@@ -208,6 +213,10 @@ private:
     // most) and it lends and reads as on an idle engine.  A longer read goes beside them, within the limits above,
     // and so does the rest of one that gave way to a shorter request (in its chunk).
     static constexpr int64_t kReadAlone = 16384;
+    // A read beside the slots whose loan holds fewer tokens than this streams a chunk's experts again for too few
+    // tokens, slower than the slots' own windows: it runs alone instead, in the full ring, and they wait for the
+    // whole part.
+    static constexpr int64_t kBesideChunkFloor = 4096;
     bool any_loan{};
     static constexpr int64_t kStepChunks[] = {6144, 4096, 3072, 2048, 1536, 1024, 512};
     int64_t split_chunk_max{};
@@ -235,9 +244,6 @@ private:
     bool pipe_on{};
     basalt::core::PoolMultiFn win_pool_fn{};
     void* win_pool_user{};
-    // A turn-boundary checkpoint's GDN bytes reach the host after the first token (see the deferral class); this
-    // is declared after `checks` so it is destroyed, and its copy finished, before the checkpoints are.
-    basalt::core::ConversationCheckpointDeferral ckd{};
     std::vector<basalt::core::SessionState> rviews{};
     basalt::core::SessionState* rsp{};
     // --kv-pool: the conversations switched away from, in VRAM; with the live one within --max-context's bytes
@@ -392,7 +398,6 @@ private:
     basalt::core::Verifier& stage_ver(int st);
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
-    void ckd_finish() override;
     bool capture_admit(uint64_t need, uint64_t floor) override;
     bool park_current(size_t held, int64_t kept) override;
     bool gpu_sync_ok();

@@ -13,11 +13,13 @@ pays no indirect call. `Flow::next` returns to command dispatch; `Flow::error` e
 | Request order | `request.cpp` |
 | Request keys, token ids and grammar | `request_parse.cpp` |
 | Prompt limits | `request_image.cpp` |
-| Which source holds the prompt's start | `request_restore.cpp` |
+| Which source holds the prompt's start, and the model's own pieces for the same bytes | `request_restore.cpp`, `prefix_anchor.hpp` |
+| Prompts held by handle and what each slot holds of them | `prompt_handles.cpp` |
 | Sampling setup, turn and root parts | `request_prefill.cpp` |
 | The window's order | `decode_loop.hpp`, `reply_rows.hpp` |
 | Completion, slot admission and reports | `request_finish.cpp` |
 | A model that offers only sessions | `session_engine.cpp` |
+| The console's figures once the server sends `STATS` (XSLOT, XMAP, INFO cards=) | `console_stats.hpp`, `commands.cpp` |
 
 A model with its own serving derives from both classes in its own folder; see `src/models/qwen4exp/serve/`.
 

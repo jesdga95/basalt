@@ -15,7 +15,9 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 - **Closer to BF16 than llama.cpp.** Same Q8_0 weights, against the BF16 reference: llama.cpp scores KLD 0.0325, top-1 93.98%;
   the Basalt Q8_0 pack scores KLD 0.0200, top-1 95.34%.
 - **Quantized once.** GGUF packs keep their blocks. The NVIDIA NVFP4 pack keeps NVIDIA's expert codes and scales bit for bit and
-  quantizes each dense tensor once from BF16.
+  quantizes each dense tensor once from BF16. A pack from an FP4-Local checkpoint keeps its expert codes and scales the same way
+  (the CSF scale streams decode bit for bit), quantizes each MXFP8 projection once after an exact widening to f32, and stores the
+  NVFP4 n-gram table as Q8_0.
 - **Only one rounding costs measurable quality by default:** the Q6_K dense projections, about 0.006 KLD and 0.3 to 0.6 points of
   top-1 against NVIDIA's precision. Everything else costs about 0.001 or less.
 
@@ -53,7 +55,7 @@ scores the decode path.
 | Routed experts, MMQ | q8_1 activations, int8 mma | int8 activation rounding (every MMQ format) |
 | Routed experts, FP4 tensor cores (NVFP4, chunks of 1,024 or more) | E2M1 activations with a UE4M3 scale per 16 values and one fp32 scale per token; `mma kind::mxf4nvf4` | W4A4; numerics change against MMQ |
 | Routed experts, CPU pool (chunks under 6,144 tokens) | ggml dot products, the same as decode's RAM tier | the CPU rounding above |
-| Attention | int8 KV: q and p in fp16, one fp16 mma, fp32 accumulate | output within 1.5e-3 of an FP64 reference |
+| Attention | int8 and fp16 KV: q and p in fp16, one fp16 mma, fp32 accumulate (q4_0 KV: hi + lo fp16 parts) | output within 1.5e-3 of an FP64 reference |
 | GDN | chunked delta rule, 16 tokens per chunk; state and gates fp32; BF16 and TF32 tensor cores | output depends on where the 16-token grid falls (about 1e-3 relative) |
 
 Rounding moves with the chunking: `--prefill auto` reads at most 16,384 tokens per chunk (32,768 for NVFP4), and the K/V rounding follows
@@ -69,6 +71,22 @@ Measured prefill numbers (NVIDIA-checkpoint NVFP4 pack, 400 W + 180 W, T 3, int8
 | FP4 vs MMQ speed, 400 W + 180 W, cold | MMQ 17 to 19% slower: 16K 6,456 against 7,807 tok/s; 64K 8,201 against 10,126 tok/s |
 | CPU share 0 (all GPU) against 1 (all CPU), NVFP4 DQ6_K, 20 chunks | PPL 2.3046 / 2.3068, KLD 0.07337 / 0.07085, top-1 93.04% / 93.12%; paired +0.0025 [-0.0005, +0.0055] |
 | K-quant MMQ against the FP16 path | rel RMS 1.08e-2 against 5e-4 (MMQ carries int8 activation rounding); 100-chunk gate within run noise |
+
+## QAD checkpoint
+
+The [QAD pack](../model-file.md#flash-next-qad-pack) keeps the routed experts bit for bit and re-quantizes the checkpoint's
+MXFP8 projections and NVFP4 shared experts to Q6_K. Gate: 100 chunks, 400 W + 180 W, tiers pinned, int8 KV; decode is
+`basalt-bench` on two cards, int8 KV.
+
+| Pack | PPL | KLD mean | same top-1 | decode |
+| --- | --- | --- | --- | --- |
+| NVFP4 | 3.3076 | 0.0628 | 91.55% | 484 tok/s |
+| QAD | 3.1516 | 0.0833 | 90.49% | 470 tok/s |
+| QAD, Q8_0 dense | 3.1552 | 0.0794 | 90.78% | 469 tok/s |
+
+QAD against NVFP4, paired: dKLD +0.0205 [+0.0175, +0.0236], dNLL -0.048 [-0.055, -0.041]. The Q6_K re-quantization is
++0.0039 [+0.0025, +0.0053] of that KLD; the rest is the checkpoint, which the distillation made sharper on wikitext and
+further from the BF16 model. On one RTX 5090 decode is the same (355 against 357 tok/s).
 
 ## Measured costs
 
@@ -88,6 +106,7 @@ means it excludes 0.
 | int8 activations into routed experts (W4A8) | +0.0002 [-0.0008, +0.0012] | -0.15 | lossless |
 | fast math and approximate intrinsics | -0.0003 [-0.0012, +0.0006] | +0.11 | lossless |
 | int8 KV against fp16 KV | +0.0000 [-0.0010, +0.0010] | +0.15 | lossless |
+| fp16 KV prompt attention, one fp16 mma against hi + lo parts | -0.0003 [-0.0012, +0.0006] | -0.09 | lossless |
 | k8v4 KV | +0.0056 [+0.0038, +0.0073] | -0.20 | measurable |
 | q4_0 KV | +0.0093 [+0.0074, +0.0112] | -0.38 | measurable |
 | CPU tier against GPU tiers (98.8% of rows on the CPU) | -0.0005 [-0.0015, +0.0005] | +0.28 | lossless |
@@ -203,10 +222,9 @@ becomes per-group `<t seconds>` text and pads, as the processor at the model's r
 
 ## Lossy routing flags
 
-Off by default, never picked automatically, and the two flags need the device-planned MoE tail. Both apply to experts held by any GPU tier.
-
-- `--route-prior LAMBDA` (bare 0.5): picks experts as if held experts had LAMBDA added to their router logit.
-- `--route-tail-skip R` (bare 9): skips an expert no GPU holds when every entry naming it ranks R or lower by weight.
+What the two flags do, on every MoE model: [quality](quality.md#lossy-routing-flags). On Flash-Next they need the device-planned
+MoE tail, and `--route-prior` adds LAMBDA to the router logit (the log probability of its softmax; bare 0.5).
+`--route-tail-skip` alone is R 9 (k = 10).
 
 Quality gate (100 chunks, 400 W + 180 W, int8 KV, both flags together) and prose decode:
 

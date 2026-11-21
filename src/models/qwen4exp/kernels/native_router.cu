@@ -125,8 +125,7 @@ __global__ void route_prior(const float* __restrict__ logits, ResidentTabs held,
     for (int i = 0; i < 16; ++i) {
         values[i] *= reciprocal;
         if (__isnanf(values[i])) values[i] = -FLT_MAX;
-        bool in = false;
-        for (int q = 0; q < held.n; ++q) in |= held.t[q][lane + i * 32] >= 0;
+        const bool in = held.held(lane + i * 32);
         resident |= (uint32_t) in << i;
         score[i] = in ? values[i] * boost : values[i];
     }

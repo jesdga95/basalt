@@ -51,10 +51,12 @@ static std::string cards(const GpuChoice& c) {
     return s;
 }
 
-static std::string roles(const std::vector<GpuCard>& v, const GpuChoice& c, int tiers) {
+static std::string roles(const std::vector<GpuCard>& v, const GpuChoice& c, int tiers, bool prompt_split = false, bool layer_stage = false) {
     RoleInputs in;
     for (int i : c.cards) in.cards.push_back(v[(size_t) i]);
     in.max_expert_tiers = tiers;
+    in.prompt_split = prompt_split;
+    in.layer_stage = layer_stage;
     std::string s;
     for (GpuRole r : choose_roles(in)) s += (s.empty() ? "" : ",") + std::string(gpu_role_name(r));
     return s;
@@ -122,11 +124,28 @@ int main() {
         if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 3090) skipped, not sm_120");
         CHECK_STR(roles(v, c, 1), "main,expert tier,idle");
         CHECK_STR(roles(v, c, 3), "main,expert tier,expert tier");
+        CHECK_STR(roles(v, c, 1, true), "main,prompt split,idle");
+        CHECK_STR(roles(v, c, 1, true, true), "main,layer stage,idle");
         c = pick("", v);
         CHECK_STR(cards(c), "0");
         CHECK_STR(c.warning, "GPU 2 (RTX 5090), GPU 3 (RTX 5060 Ti) unused; use gpu 0,2,3 or gpu auto");
         CHECK_STR(pick("1", v).error, "gpu: GPU 1 (RTX 3090) is sm_86, not sm_120");
         CHECK_STR(cards(pick("3,2,0", v)), "3,2,0");
+    }
+    // An Ada (sm_89) card: never the main card; a second card only in a -DPEER_ADA=ON build
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 5080", 12, 0, 960, 16), card(1, "RTX 4060 Ti", 8, 9, 288, 16)};
+        CHECK_STR(pick("1,0", v).error, "gpu: GPU 1 (RTX 4060 Ti) is sm_89, not sm_120");
+#if defined(BASALT_PEER_ADA)
+        CHECK_STR(cards(pick("0,1", v)), "0,1");
+        CHECK_STR(cards(pick("auto", v)), "0,1");
+#else
+        CHECK_STR(pick("0,1", v).error, "gpu: GPU 1 (RTX 4060 Ti) is sm_89 (rebuild with -DPEER_ADA=ON to enable sm_89 peer support)");
+        GpuChoice c = pick("auto", v);
+        CHECK_STR(cards(c), "0");
+        CHECK(c.notes.size() == 1);
+        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 4060 Ti) skipped, not sm_120");
+#endif
     }
     // A laptop's own card beside a desktop card in an enclosure: the desktop card's bandwidth makes it main; the
     // laptop card is the first visible, so it runs alone when nothing is set.
@@ -143,7 +162,11 @@ int main() {
     {
         const std::vector<GpuCard> v = {card(0, "RTX 4090", 8, 9, 1008, 24), card(1, "RTX 5090", 12, 0, 1792, 32)};
         CHECK(!pick("", v).error.empty());
+#if defined(BASALT_PEER_ADA)
+        CHECK_STR(cards(pick("auto", v)), "1,0");   // the sm_89 card is a second card in a -DPEER_ADA=ON build
+#else
         CHECK_STR(cards(pick("auto", v)), "1");
+#endif
         CHECK(pick("auto", v).notes.size() == 1);
     }
     // No card list (no management library, no CUDA_VISIBLE_DEVICES): numbers pass, auto cannot run.
@@ -195,6 +218,20 @@ int main() {
         const std::vector<int> o4 = spread_experts(mixed, {{16, 448}, {16, 448}, {16, 448}, {200, 1792}});
         CHECK_STR(owners(o4), "012333333333");
         CHECK_STR(owners(spread_experts(eq, {{0, 1}, {0, 1}, {0, 1}})), "--------");
+        // the tiers that hold something: none when no expert is outside the main card or no tier has room, and a tier
+        // without room is left out beside tiers that have it
+        auto holding = [](const std::vector<size_t>& v) {
+            std::string s;
+            for (size_t x : v) s += std::to_string(x);
+            return s.empty() ? std::string("-") : s;
+        };
+        CHECK_STR(holding(tiers_holding({}, {{40, 448}})), "-");
+        CHECK_STR(holding(tiers_holding({}, {{40, 448}, {40, 448}, {40, 448}})), "-");
+        CHECK_STR(holding(tiers_holding(eq, {{5, 448}})), "-");
+        CHECK_STR(holding(tiers_holding(eq, {{40, 448}})), "0");
+        CHECK_STR(holding(tiers_holding(eq, {{40, 448}, {0, 448}, {40, 448}})), "02");
+        CHECK_STR(holding(tiers_holding(eq, {{0, 448}, {0, 448}})), "-");
+        CHECK_STR(holding(tiers_holding(eq, {{10, 448}, {40, 448}})), "01");
     }
     if (g_fail) { std::printf("gpu_select_test: %d failures\n", g_fail); return 1; }
     std::printf("gpu_select_test: ok\n");

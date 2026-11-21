@@ -11,7 +11,7 @@ from serve.engine.mock import MockEngine
 from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages
 from serve.handler import serve
 from serve.models.deepseek41 import DeepSeek41, DeepseekTemplate
-from serve.models.qwen4exp import Qwen4Exp
+from serve.models.qwen import Qwen
 from serve.router import Router
 from serve.service import Service
 from serve.util.text import ByteTokenizer
@@ -29,7 +29,7 @@ HISTORY = [{"role": "user", "content": "first"},
 def qwen_service():
     tok = ByteTokenizer()
     return Service(MockEngine(tok, "</think>ok", max_context=4096), tok, ChatTemplate.from_file(TEMPLATE),
-                   model_name="qwen", dialect=Qwen4Exp())
+                   model_name="qwen", dialect=Qwen())
 
 
 def deepseek_service():
@@ -60,7 +60,7 @@ def harness_body(effort, caps=None, preserve=False):
 
 class Caps(unittest.TestCase):
     def test_each_dialect_names_every_capability(self):
-        for dialect in (Qwen4Exp(), DeepSeek41()):
+        for dialect in (Qwen(), DeepSeek41()):
             self.assertEqual(set(dialect.caps), set(CAP_NAMES), dialect.name)
             self.assertTrue(all(isinstance(v, bool) for v in dialect.caps.values()))
 
@@ -68,7 +68,7 @@ class Caps(unittest.TestCase):
         source = TEMPLATE.read_text()
         for needle in ("<tool_call>", "reasoning_effort", "preserve_thinking", "message.role == \"system\""):
             self.assertIn(needle, source)
-        self.assertTrue(all(Qwen4Exp.caps.values()))
+        self.assertTrue(all(Qwen.caps.values()))
 
     def test_deepseek_caps_are_what_its_encoder_has(self):
         from serve.models import deepseek41_encoding as enc
@@ -89,9 +89,9 @@ class Caps(unittest.TestCase):
                     return r.status, json.loads(r.read())
                 finally:
                     c.close()
-            self.assertEqual(props("/props?model=qwen")[1]["chat_template_caps"], Qwen4Exp.caps)
+            self.assertEqual(props("/props?model=qwen")[1]["chat_template_caps"], Qwen.caps)
             self.assertEqual(props("/props?model=ds")[1]["chat_template_caps"], DeepSeek41.caps)
-            self.assertEqual(props("/props")[1]["chat_template_caps"], Qwen4Exp.caps)
+            self.assertEqual(props("/props")[1]["chat_template_caps"], Qwen.caps)
             self.assertEqual(props("/props?model=nope")[0], 404)
         finally:
             router.stop()
@@ -156,6 +156,32 @@ class Budget(unittest.TestCase):
                 for cap in (200, 700, 8192):
                     with self.subTest(room=room, req=req, cap=cap):
                         self.assertIsNone(svc.answer_budget(req, cap, None))
+
+    def test_server_default_effort(self):
+        svc = qwen_service()
+        msgs = [{"role": "user", "content": "hi"}]
+        def ids(**req):
+            m, tools, kw = openai_to_messages({"messages": msgs, **req})
+            return svc.encode_prompt(m, tools, kw)
+        unset, medium, high, off = ids(), ids(reasoning_effort="medium"), ids(reasoning_effort="high"), \
+            ids(chat_template_kwargs={"enable_thinking": False})
+        self.assertNotEqual(unset, medium)
+        svc.reasoning_effort = "medium"
+        self.assertEqual(ids(), medium)                                   # a request that names none gets the default
+        self.assertEqual(ids(reasoning_effort="high"), high)              # a named effort, or thinking off, wins
+        self.assertEqual(ids(chat_template_kwargs={"enable_thinking": False}), off)
+        self.assertEqual(ids(reasoning_budget=-1), ids(reasoning_effort="max"))    # a budget names its own level
+        svc.reasoning_effort = "none"
+        self.assertEqual(ids(), off)
+        self.assertFalse(svc.prepare(msgs, None, {})[1])                  # and the reply is not a thinking one
+
+    def test_server_default_effort_flag(self):
+        from serve.config import build_parser
+        ap = build_parser()
+        self.assertIsNone(ap.parse_args([]).reasoning_effort)
+        self.assertEqual(ap.parse_args(["--reasoning-effort", "Medium"]).reasoning_effort, "medium")
+        with self.assertRaises(SystemExit):
+            ap.parse_args(["--reasoning-effort", "lots"])
 
     def test_token_budget_fields(self):
         svc = qwen_service()

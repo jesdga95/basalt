@@ -304,6 +304,26 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
             for (const JsonValue& n : r->items) if (n.is(Type::String)) required.insert(n.s);
         }
         std::string fn_id = "fn" + std::to_string(ti);
+        if (form.json_args) {   // one JSON object of the parameter schema (any object when the tool declares none)
+            JsonValue any;
+            any.type = Type::Object;
+            any.set("type", json_string("object"));
+            const JsonValue* schema = params && params->is(Type::Object) ? params : &any;
+            std::string args;
+            try {
+                SchemaDocument d = build_schema_document(*schema);
+                args = c.add_schema(fn_id + "-args", *d.root);
+            } catch (const std::exception& e) {
+                err = "tools: " + nm->s + ": " + e.what();
+                return "";
+            }
+            std::string mid = form.fn_mid;
+            const std::string quoted = json_string(nm->s).dump();
+            for (size_t p = mid.find("{name}"); p != std::string::npos; p = mid.find("{name}", p + quoted.size()))
+                mid.replace(p, 6, quoted);
+            fns.push_back(c.add_rule(fn_id, literal(form.fn_open + nm->s + mid) + " " + args + " " + literal(form.fn_close)));
+            continue;
+        }
         std::vector<std::string> req_items, opt_items;
         if (props && props->is(Type::Object)) {
             for (const auto& m : props->members) {
@@ -468,7 +488,8 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
             }
         }
         gbnf = tool_call_gbnf(list.dump(), ToolGrammarOptions{}, err);
-        out.triggers.words = {tool_form().trigger};
+        if (!tool_form().trigger_pattern.empty()) out.triggers.patterns = {tool_form().trigger_pattern};
+        else out.triggers.words = {tool_form().trigger};
     } else {
         err = "grammar: unknown kind '" + kind->s + "'";
         return out;

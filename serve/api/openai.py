@@ -10,6 +10,15 @@ from serve.frontend import Event
 from serve.service import Service
 
 
+def checked_return_progress(req: dict) -> bool:
+    """llama.cpp's `return_progress`: true sends `prompt_progress` with the chunks of the prompt read; ValueError
+    (a 400 before streaming) for anything but a boolean."""
+    value = req.get("return_progress")
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(f"return_progress: expected a boolean, not {value!r}")
+    return bool(value) and bool(req.get("stream"))
+
+
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, session=None, live=None):
     cid, created = live.id if live else "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     model = svc.model
@@ -31,12 +40,40 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [choice]}
 
+    progress = checked_return_progress(req)
+    sent = None                                    # the last prompt_progress sent
+
+    def progress_chunk(final=False):
+        """llama.cpp's way: a chunk with an empty assistant delta that carries `prompt_progress`; None when it says
+        nothing new.  `final`: the read is over, so processed is the whole prompt."""
+        nonlocal sent
+        p = svc.prompt_progress(None if ids is None else len(ids))
+        if p is None or (final and p["processed"] == p["total"] and sent == p):
+            return None
+        if final:
+            p = {**p, "processed": p["total"]}
+        if p == sent:
+            return None
+        sent = p
+        c = chunk({"role": "assistant", "content": None})
+        c["prompt_progress"] = p
+        return c
+
     yield chunk({"role": "assistant", "content": ""})
+    reading = progress                             # the prompt is still being read
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came
     for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, session=session, live=live):
+        if reading and kind != "ping":
+            reading = False                        # the first answer: the read is over
+            c = progress_chunk(final=True)
+            if c is not None:
+                yield c
         if kind == "ping":
+            c = progress_chunk() if reading else None
+            if c is not None:
+                yield c
             yield None
         elif kind == "logprobs":
             channel, entry, index = x

@@ -57,15 +57,27 @@ void pack_tokens(const model::ModelAdapter& adapter, CommonOptions& o) {
         basalt::log::warn("basalt", "the pack's vocabulary cannot be read (%s): no end-of-turn or turn token", err.c_str());
         return;
     }
+    // a name with one `*` matches the first token whose text has that start and end (a model whose special tokens carry a suffix
+    // that differs between its files)
     auto id_of = [&](const std::string& name) -> int64_t {
-        const basalt::core::Json* v = vocab.get(name);
-        return v != nullptr ? (int64_t) v->u64() : -1;
+        const size_t star = name.find('*');
+        if (star == std::string::npos) {
+            const basalt::core::Json* v = vocab.get(name);
+            return v != nullptr ? (int64_t) v->u64() : -1;
+        }
+        const std::string head = name.substr(0, star), tail = name.substr(star + 1);
+        for (const auto& [text, v] : vocab.members)
+            if (text.size() >= head.size() + tail.size() && text.compare(0, head.size(), head) == 0 &&
+                text.compare(text.size() - tail.size(), tail.size(), tail) == 0)
+                return (int64_t) v.u64();
+        return -1;
     };
     const model::TokenNames names = adapter.token_names();
     if (o.eos_ids.empty())
         for (const std::string& name : names.eos)
             if (const int64_t id = id_of(name); id >= 0) o.eos_ids.push_back(id);
     if (!o.turn_token_given) o.turn_token = id_of(names.turn);
+    if (!names.reply_role.empty()) o.reply_role_token = id_of(names.reply_role);
     if (!o.image_pad_given) o.image_pad_id = id_of(names.image_pad);
     if (!names.video_pad.empty()) o.video_pad_id = id_of(names.video_pad);
 }
@@ -78,6 +90,7 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
+    basalt::platform::install_crash_handler();
     // if memory runs out the kernel ends this process first, not the rest of the machine
     basalt::platform::prefer_oom_victim();
     // the CPU expert pool keeps its speed while the window is in the background

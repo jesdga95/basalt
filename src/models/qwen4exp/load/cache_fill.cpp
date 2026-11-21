@@ -18,7 +18,6 @@ int cache_fill(Context& context) {
     auto& stages = *context.stages;
     auto& n_vocab = *context.n_vocab;
     auto& native_head = *context.native_head;
-    auto& src = *context.src;
     auto& srcp = *context.srcp;
     auto& peer_prompt_bytes = context.peer_prompt_bytes;
     auto& xcache = *context.xcache;
@@ -45,6 +44,17 @@ int cache_fill(Context& context) {
                                                     std::max({o.spec, o.batch, 2}), dev0, o.peer_device) : 0;
         return hs + gs;
     };
+    // what one peer card can hold of experts: its free memory less its buffers (one set per tier it holds) and reserve
+    auto card_room = [&](int dev, int cur) -> uint64_t {
+        size_t pfree = 0, ptotal = 0;
+        if (cudaSetDevice(dev) != cudaSuccess || cudaMemGetInfo(&pfree, &ptotal) != cudaSuccess) return 0;
+        const uint64_t tiers = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
+        const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
+                                 (dev == o.peer_device ? peer_prompt_bytes() : 0) +
+                                 tiers * basalt::core::PeerExperts::device_overhead_bytes(g.n_embd, g.n_ff) +
+                                 (dev == o.peer_device ? (uint64_t) peer_split_bytes(cur) : 0);
+        return (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
+    };
     auto peer_expert_room = [&]() -> uint64_t {
         uint64_t room = 0;
         if (o.peer_device < 1) return 0;
@@ -57,19 +67,29 @@ int cache_fill(Context& context) {
         for (int dev : o.peer_devices) {
             if (dev >= count || std::find(seen.begin(), seen.end(), dev) != seen.end()) continue;
             seen.push_back(dev);
-            const uint64_t tiers = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
-            size_t pfree = 0, ptotal = 0;
-            if (cudaSetDevice(dev) == cudaSuccess && cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
-                const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
-                                         (dev == o.peer_device ? peer_prompt_bytes() : 0) +
-                                         tiers * basalt::core::PeerExperts::device_overhead_bytes(g.n_embd, g.n_ff) +
-                                         (dev == o.peer_device ? (uint64_t) peer_split_bytes(cur) : 0);
-                room += (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
-            }
+            room += card_room(dev, cur);
         }
         (void) cudaSetDevice(cur);
         (void) cudaGetLastError();
         return room;
+    };
+    // each tier's room for experts: its card's, shared by the tiers the card holds
+    auto peer_tier_rooms = [&]() -> std::vector<basalt::program::TierRoom> {
+        std::vector<basalt::program::TierRoom> rooms(o.peer_devices.size());
+        int cur = 0, count = 0;
+        if (cudaGetDevice(&cur) != cudaSuccess || cudaGetDeviceCount(&count) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return rooms;
+        }
+        for (size_t i = 0; i < rooms.size(); ++i) {
+            const int dev = o.peer_devices[i];
+            const uint64_t share = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
+            rooms[i].bytes = dev < count ? card_room(dev, cur) / share : 0;
+            rooms[i].gbps = i < o.peer_gbps.size() ? o.peer_gbps[i] : 0;
+        }
+        (void) cudaSetDevice(cur);
+        (void) cudaGetLastError();
+        return rooms;
     };
     if (model_bytes > 0 && o.mmap_experts) {
         const auto free_ram = basalt::core::conversation_available_memory();
@@ -86,7 +106,7 @@ int cache_fill(Context& context) {
             const uint64_t vram = cuda0_fixed_bytes + cache_bytes_now;
             uint64_t outside = expert_total_bytes - cache_bytes_now;   // the experts no cache on the primary holds
             uint64_t ram = basalt::core::ram_tier_room(
-                *free_ram, std::max(o.resident_headroom, basalt::platform::ram_reserve()), o.resident_pin);
+                *free_ram, std::max(o.resident_headroom, basalt::core::plan_reserve(basalt::platform::ram_reserve())), o.resident_pin);
             if (o.resident_cpu_experts && (o.resident_budget > 0 || o.resident_soft)) {
                 const uint64_t margin = 256ull << 20;
                 ram = ram > margin ? ram - margin : 0;
@@ -112,21 +132,11 @@ int cache_fill(Context& context) {
         const bool per_layer = xcache.per_layer_admission();
         const int64_t want = per_layer ? (int64_t) profile.size()
                                        : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
-        const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
         uint64_t fill_total = 0;
         for (int64_t i = 0; i < want; ++i)
             fill_total += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
         cache_fill_bytes = fill_total;
-        if (model_bytes > 0) {
-            if (srcp == &src) {
-                basalt::core::LoadProgress::plan("cuda0", cuda0_fixed_bytes + fill_total);
-                basalt::core::LoadProgress::plan("ram", expert_total_bytes - fill_total);
-            } else {
-                basalt::core::LoadProgress::plan("cuda0", fill_total, true);
-            }
-        }
-        basalt::core::LoadProgress fill_progress(basalt::core::LoadProgress::cuda(0), fill_total, srcp != &src);
         // the slots are handed out in profile order, then the blobs are read and copied together
         std::vector<std::pair<int32_t, int32_t>> fill_pairs;
         std::vector<int32_t> fill_slots;
@@ -140,27 +150,25 @@ int cache_fill(Context& context) {
             fill_slots.push_back(slot);
             fill_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
         }
-        if (!basalt::core::fill_cache_slots(*srcp, xcache, 0, fill_pairs.data(), fill_slots.data(),
-                                            (int64_t) fill_pairs.size(),
-                                            [&](uint64_t bytes) { fill_progress.add(bytes); }, err)) {
+        if (!basalt::core::plan_cache_slots(*context.reads, *srcp, xcache, 0, fill_pairs.data(), fill_slots.data(),
+                                            (int64_t) fill_pairs.size(), err)) {
             basalt::log::error("basalt generate", "the profile fill failed: %s", err.c_str());
             return 1;
         }
         prefilled += (int64_t) fill_pairs.size();
-        fill_progress.finish();
-        const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
-        // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
-        // about bytes produces a plausible token, which is this project's most expensive failure mode; the
-        // cache's own `verify_slot` is the check and it costs one blob-sized D2H at startup.
-        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                srcp->blob(profile[0].first, profile[0].second), err,
-                                (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
-            return fatal_start_error(err);
-        }
-        basalt::log::info("basalt generate", "pre-filled %lld of %lld slots from the profile in %.1f s (%.0f MB/s); "
-                             "slot 0 verified",
-                     (long long) prefilled, (long long) (per_layer ? xcache.slots() : want), fill_s,
-                     fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0);
+        // **AND ONE SLOT IS READ BACK AND COMPARED** once the pass has filled it.  A residency table that is right about
+        // indices and wrong about bytes produces a plausible token, which is this project's most expensive failure mode;
+        // the cache's own `verify_slot` is the check and it costs one blob-sized D2H at startup.
+        if (prefilled > 0)
+            context.after->push_back([&xcache, &profile, srcp](std::string& e) {
+                const basalt::core::OnDevice on(0);
+                return xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
+                                          srcp->blob(profile[0].first, profile[0].second), e,
+                                          (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[0].first));
+            });
+        basalt::log::info("basalt generate", "pre-filled %lld of %lld slots from the profile (%.0f MB, read in the start's "
+                             "pass; slot 0 verified after it)",
+                     (long long) prefilled, (long long) (per_layer ? xcache.slots() : want), (double) fill_bytes / 1e6);
     }
 
     for (auto& stp : stages) {
@@ -191,10 +199,6 @@ int cache_fill(Context& context) {
             return 1;
         }
         int64_t filled = 0;
-        uint64_t stage_fill_total = 0;
-        for (size_t i = 0; i < st.profile.size() && (int64_t) i < st.cache.slots(); ++i)
-            stage_fill_total += lay.blob_bytes(st.profile[i].first);
-        basalt::core::LoadProgress stage_progress(basalt::core::LoadProgress::cuda(st.dev), stage_fill_total);
         std::vector<std::pair<int32_t, int32_t>> stage_pairs;
         std::vector<int32_t> stage_slots;
         for (const auto& pr : st.profile) {
@@ -205,20 +209,24 @@ int cache_fill(Context& context) {
             stage_slots.push_back(slot);
             ++filled;
         }
-        if (!basalt::core::fill_cache_slots(*srcp, st.cache, st.dev, stage_pairs.data(), stage_slots.data(),
-                                            (int64_t) stage_pairs.size(),
-                                            [&](uint64_t bytes) { stage_progress.add(bytes); }, err)) {
+        if (!basalt::core::plan_cache_slots(*context.reads, *srcp, st.cache, st.dev, stage_pairs.data(), stage_slots.data(),
+                                            (int64_t) stage_pairs.size(), err)) {
             basalt::log::error("basalt generate", "layer split, CUDA%d profile fill failed: %s", st.dev, err.c_str());
             return 1;
         }
-        stage_progress.finish();
-        if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
-                                                 srcp->blob(st.profile[0].first, st.profile[0].second), err,
-                                                 (int64_t) lay.blob_bytes(st.profile[0].first))) {
-            basalt::log::error("basalt generate", "layer split, CUDA%d expert cache: %s", st.dev,
-                         filled == 0 ? "nothing filled" : err.c_str());
+        if (filled == 0) {
+            basalt::log::error("basalt generate", "layer split, CUDA%d expert cache: nothing filled", st.dev);
             return 1;
         }
+        context.after->push_back([&st, srcp](std::string& e) {
+            const basalt::core::OnDevice on(st.dev);
+            if (st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
+                                     srcp->blob(st.profile[0].first, st.profile[0].second), e,
+                                     (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(st.profile[0].first)))
+                return true;
+            e = "layer split, CUDA" + std::to_string(st.dev) + " expert cache: " + e;
+            return false;
+        });
         basalt::log::info("basalt generate", "layer split: CUDA%d runs layers %lld-%lld, expert cache %lld slots "
                              "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified",
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
@@ -235,6 +243,7 @@ int cache_fill(Context& context) {
     context.cache_fill_bytes = &cache_fill_bytes;
     context.peer_split_bytes = peer_split_bytes;
     context.peer_expert_room = peer_expert_room;
+    context.peer_tier_rooms = peer_tier_rooms;
     return token_path(context);
 }
 

@@ -60,7 +60,8 @@ struct AutoPlan {
     AutoSource pool_workers_src = AutoSource::Auto;
 };
 
-/// The pool size used when no worker count is given.
+/// The pool size used when no worker count is given (kernels::cpu::auto_pool_workers, the rule both the tier's default and
+/// this plan apply).
 int auto_pool_workers(const AutoInputs& in, AutoAffinity affinity);
 
 AutoPlan choose_auto(const AutoInputs& in);

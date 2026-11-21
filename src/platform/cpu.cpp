@@ -159,8 +159,67 @@ CpuInfo cpu_info() {
     return info;
 }
 
+std::vector<std::vector<int>> cpu_l3_groups() {
+    std::vector<std::vector<int>> groups;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, nullptr, &len);
+    if (len == 0) return groups;
+    std::vector<char> buf(len);
+    if (!GetLogicalProcessorInformationEx(RelationCache, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len))
+        return groups;
+    for (DWORD off = 0; off < len;) {
+        const auto* info = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) (buf.data() + off);
+        if (info->Relationship == RelationCache && info->Cache.Level == 3 &&
+            (info->Cache.Type == CacheUnified || info->Cache.Type == CacheData)) {
+            const GROUP_AFFINITY& a = info->Cache.GroupMask;
+            std::vector<int> g;
+            for (int i = 0; i < 64; ++i)
+                if (a.Mask & ((KAFFINITY) 1 << i)) g.push_back((int) a.Group * 64 + i);
+            if (!g.empty()) groups.push_back(std::move(g));
+        }
+        off += info->Size;
+    }
+    return groups;
+}
+
 #else
 // --------------------------------------------------------------------------------------------- Linux
+
+namespace {
+// A kernel CPU list file ("0-7", "0-3,8-11", "5"): mark[cpu] = 1 for each CPU it names. False when the file is
+// missing, empty or not a list.
+bool read_cpu_list(const char* path, std::vector<char>& mark) {
+    mark.clear();
+    std::FILE* f = std::fopen(path, "r");
+    if (!f) return false;
+    char buf[1024];
+    const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    buf[n] = 0;
+    const char* s = buf;
+    bool any = false;
+    while (*s) {
+        char* end = nullptr;
+        const long lo = std::strtol(s, &end, 10);
+        if (end == s || lo < 0) return false;
+        long hi = lo;
+        s = end;
+        if (*s == '-') {
+            hi = std::strtol(s + 1, &end, 10);
+            if (end == s + 1 || hi < lo) return false;
+            s = end;
+        }
+        if (hi >= 1 << 20) return false;
+        if ((size_t) hi >= mark.size()) mark.resize((size_t) hi + 1, 0);
+        for (long c = lo; c <= hi; ++c) mark[(size_t) c] = 1;
+        any = true;
+        if (*s == ',') ++s;
+        else if (*s == '\n' || *s == 0) break;
+        else return false;
+    }
+    return any;
+}
+}  // namespace
 
 CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
     CpuTopology topo;
@@ -225,6 +284,27 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
             }
         }
         all_cpus.push_back(cl);
+    }
+
+    // x86 kernels publish no cpu_capacity (the file comes from the arch_topology driver, which x86 does not build), so
+    // a hybrid Intel processor read as one class of cores. Its classes are the CPU lists of the kernel's two hybrid
+    // PMUs instead (Linux 5.13 and later): cpu_core names the performance cores' CPUs, cpu_atom the efficient ones.
+    // They stand in as two capacities for the rule below. A CPU in neither list keeps none and counts as efficient.
+    if (max_cap == 0) {
+        std::vector<char> in_core, in_atom;
+        if (read_cpu_list("/sys/devices/cpu_core/cpus", in_core) && read_cpu_list("/sys/devices/cpu_atom/cpus", in_atom)) {
+            const auto has = [](const std::vector<char>& mark, int cpu) {
+                return cpu >= 0 && (size_t) cpu < mark.size() && mark[(size_t) cpu] != 0;
+            };
+            for (auto& cl : all_cpus) {
+                if (has(in_core, cl.cpu)) cl.cap = 1024;
+                else if (has(in_atom, cl.cpu)) cl.cap = 512;
+                if (cl.cap > 0) {
+                    max_cap = (std::max)(max_cap, cl.cap);
+                    min_cap = (std::min)(min_cap, cl.cap);
+                }
+            }
+        }
     }
 
     // A core class is a capacity band, not one value: cores of one class report different capacities.
@@ -314,6 +394,30 @@ CpuInfo cpu_info() {
     info.physical_cores = (int) cores.size();
     if (info.physical_cores == 0) info.physical_cores = (int) detect_cpu_topology(false).worker_cores.size();
     return info;
+}
+
+std::vector<std::vector<int>> cpu_l3_groups() {
+    std::vector<std::vector<int>> groups;
+    std::set<std::vector<int>> seen;
+    std::vector<char> online, mark;
+    if (!read_cpu_list("/sys/devices/system/cpu/online", online)) return groups;
+    for (size_t c = 0; c < online.size(); ++c) {
+        if (!online[c]) continue;
+        // the cache whose level is 3 among the CPU's index<N> entries
+        for (int idx = 0; idx < 8; ++idx) {
+            const std::string dir = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cache/index" + std::to_string(idx);
+            std::ifstream lv(dir + "/level");
+            int level = 0;
+            if (!(lv >> level)) break;
+            if (level != 3 || !read_cpu_list((dir + "/shared_cpu_list").c_str(), mark)) continue;
+            std::vector<int> g;
+            for (size_t k = 0; k < mark.size(); ++k)
+                if (mark[k]) g.push_back((int) k);
+            if (seen.insert(g).second) groups.push_back(std::move(g));
+            break;
+        }
+    }
+    return groups;
 }
 
 #endif

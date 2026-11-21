@@ -86,6 +86,7 @@ constexpr ULONG_PTR NUDGE_KEY = 2;
 
 struct DirectFile::Impl {
     HANDLE file = INVALID_HANDLE_VALUE;
+    bool no_buffering = false;          // opened with FILE_FLAG_NO_BUFFERING
     HANDLE port = nullptr;
     uint64_t size = 0;
     std::mutex mu;                      // guards everything below
@@ -205,6 +206,7 @@ bool DirectFile::open(const std::string& path, std::string& err, int workers, bo
     // at a time, and its cached reads still run side by side.
     // RANDOM_ACCESS: no read-ahead. OVERLAPPED: many reads in flight, completed through the port below.
     const DWORD buffering = mapped_elsewhere ? 0 : FILE_FLAG_NO_BUFFERING;
+    impl_->no_buffering = buffering != 0;
     impl_->file = CreateFileW(to_wide_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                               buffering | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
     if (impl_->file == INVALID_HANDLE_VALUE) {
@@ -255,6 +257,7 @@ void DirectFile::close() {
 }
 
 bool DirectFile::is_open() const { return impl_->file != INVALID_HANDLE_VALUE; }
+bool DirectFile::bypasses_cache() const { return is_open() && impl_->no_buffering; }
 uint64_t DirectFile::size() const { return impl_->size; }
 
 bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {
@@ -413,6 +416,7 @@ void DirectFile::close() {
 }
 
 bool DirectFile::is_open() const { return impl_->fd >= 0; }
+bool DirectFile::bypasses_cache() const { return is_open(); }
 uint64_t DirectFile::size() const { return impl_->size; }
 
 bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {

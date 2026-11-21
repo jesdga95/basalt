@@ -2,7 +2,7 @@
 
 `PromptText` stands where the id list used to: `len()` is the token count once the engine has said `PT` (before that
 an estimate, good for a status line only), `ids()` tokenizes in Python for the paths that need the ids (a second
-reply segment, engines that take ids, batch slots), and `+` gives the id list those paths extend.
+reply segment, engines that take ids), and `+` gives the id list those paths extend.
 """
 from __future__ import annotations
 
@@ -65,18 +65,23 @@ class PromptText:
     def set_counted(self, n: int, max_new: int) -> None:
         self.n, self.max_new = n, max_new
 
+    def settle(self, n: int, max_new: int, ctx: int) -> int:
+        """The answer cap for a prompt of `n` tokens counted by the engine, as the engine itself settles a text prompt:
+        cut to the room the context leaves when clipping, else a ValueError when it does not fit."""
+        room = ctx - CTX_SLACK - n
+        if self.clip:
+            if room < 1:
+                raise room_error(n, ctx)
+            max_new = min(max_new, room)
+        elif max_new > room:
+            raise overflow_error(n, max_new, ctx)
+        self.set_counted(n, max_new)
+        return max_new
+
     def resolve(self, max_new: int, ctx: int) -> tuple[list[int], int]:
         """(ids, max_new) for an engine that takes ids: the answer cap the engine would have settled on."""
         ids = self.ids()
-        room = ctx - CTX_SLACK - len(ids)
-        if self.clip:
-            if room < 1:
-                raise room_error(len(ids), ctx)
-            max_new = min(max_new, room)
-        elif max_new > room:
-            raise overflow_error(len(ids), max_new, ctx)
-        self.max_new = max_new
-        return ids, max_new
+        return ids, self.settle(len(ids), max_new, ctx)
 
     def explain(self, err: str) -> str:
         """The engine's ERR text in the server's words, as the id path would have raised it: a coded context error

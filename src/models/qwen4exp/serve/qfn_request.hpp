@@ -119,6 +119,7 @@ private:
     // slots' windows then see the cache without the slots this prompt borrowed (marked missing: those experts
     // run on the CPU), never a prompt buffer.
     static constexpr double decode_share = 0.5;
+    bool beside_{};   ///< this part is read beside the decoding slots: lend() found a chunk worth sharing the card
     bool batch_fatal{};
     int64_t il_parts{};
     double il_ms{};

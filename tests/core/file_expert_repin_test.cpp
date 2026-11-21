@@ -1,9 +1,11 @@
-// The resident expert copy's registration around a sleep: dropped (`unpin_complement`), registered again at the same
+// The resident expert copy's registration: made once the start's pass has read the copy (nothing is pinned before), then
+// around a sleep: dropped (`unpin_complement`), registered again at the same
 // addresses (`repin_start` / `repin_wait` / `repin_finish`), twice, with the device alias still mapping the
 // same bytes and the bytes unchanged; then a copy out of it into the GPU cache and back.  A synthetic expert file and a
 // small GPU expert cache; needs a CUDA device (exits 77 without one).
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/expert_source.hpp"
+#include "basalt/core/loader.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
@@ -91,7 +93,15 @@ int run() {
             const int32_t slot = cache.admit(l, e);
             require(slot >= 0 && cache.fill_slot_blocking(slot, src.blob(l, e), err, (int64_t) blob), "cache fill " + err);
         }
-    require(src.pin_cache_complement(cache, err, true, {}, -1, 0), err);
+    // planned, the copy holds no pinned or locked page: it takes its RAM as the pass reads into it, and is pinned after
+    LoadPlan reads;
+    require(src.plan_cache_complement(reads, cache, err, true, {}, -1, 0), err);
+    require(src.pinned_bytes() == 0 && src.locked_bytes() == 0 && !registered(src.blob(0, held)), "pinned before its reads");
+    require(src.complement_allocation_pinned() || src.pin_pending() > 0, "the registration after the reads is pending");
+    Loader loader;
+    require(loader.run(reads, err), err);
+    require(src.finish_complement(loader.unbuffered(), err), err);
+    require(src.pin_pending() == 0, "nothing is pending after the reads");
     if (!src.complement_pinned()) {
         std::puts("the driver did not register the copy: skipped");
         return 77;

@@ -33,6 +33,20 @@ struct SamplerParams {
     const float* logit_bias = nullptr;   // optional device array [n_vocab] added to the logits first; -inf bans
     int* top_ids = nullptr;      // optional device array [n_tokens][n_top]: the sampled path's kept list, best first,
     int n_top = 0;               // -1 after it (0..32 ids per row; the greedy path leaves it unwritten)
+    // Drawn drafts (speculative sampling), device arrays: rows t < n_drawn carry the draft drafts[t] (the token after
+    // row t), drawn from the proposal q_p[t][j] over the ids q_ids[t][j], j < q_n.  Such a row keeps its draft with
+    // probability min(1, p(d) / q(d)) and otherwise draws from max(p - q, 0) renormalized: its token has the row's
+    // distribution p exactly and is the draft whenever the draft is kept.  The sampled path's narrow lists only (64 or
+    // fewer); the greedy path ignores them.
+    // The request lets its drafter draw drafts for the rows above.  The reply then has the model's distribution, but which
+    // tokens come out depends on the windows the draft policy picked, so a request that fixes its seed (a reproducible
+    // reply) leaves this off and its drafts are kept only where the row's own draw is the draft.
+    bool draw_drafts = false;
+    const int* drafts = nullptr;
+    const int* q_ids = nullptr;
+    const float* q_p = nullptr;
+    int q_n = 0;
+    int n_drawn = 0;
 };
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.

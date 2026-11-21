@@ -97,6 +97,20 @@ for key, bad in (("model", "Qwen"), ("kv", "int4"), ("model", None), ("kv", None
     ok = r.returncode == 1 and key in r.stdout
     print(f"community_row_fix bad {key}={bad}: " + ("ok" if ok else "FAILED"))
     failed |= not ok
+# every model the engine names is accepted, with the cache formats it reports (Hy4-flash and Inkling 2 Mini report fp16 or fp8)
+for model, kv in (("Qwen3.8-Flash-Next", "int8"), ("Qwen3.8-27B", "int8"), ("DeepSeek-V4.1-Flash", "fp8+fp4"),
+                  ("Hy4-flash", "fp16"), ("Hy4-flash", "fp8"), ("Inkling-2-Mini", "fp16"), ("Inkling-2-Mini", "fp8")):
+    data = load(real)
+    data["runs"][0]["model"], data["runs"][0]["kv"] = model, kv
+    p = os.path.join(tempfile.gettempdir(), "cb_good_row.json")
+    write(p, json.dumps(data, indent=2, ensure_ascii=False))
+    r = subprocess.run([sys.executable, checker, "--fix", p], capture_output=True, text=True)
+    os.remove(p)
+    ok = r.returncode == 0
+    print(f"community_row_fix good {model}/{kv}: " + ("ok" if ok else "FAILED"))
+    if not ok:
+        print(r.stdout)
+    failed |= not ok
 
 
 # the per-test fields are optional and type-checked; rows without them (every old row) are valid

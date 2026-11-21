@@ -8,12 +8,18 @@
 #include "basalt/models/deepseek41/vision.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "models/deepseek41/pack.hpp"
+#include "models/deepseek41/prompt_host.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
 
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
+
+namespace basalt::core {
+class ExpertTier;
+struct ExpertTierSpec;
+}
 
 namespace basalt::models::deepseek41 {
 
@@ -31,24 +37,31 @@ inline void dense_f32(const DevTensor& w, const float* x, void* scratch_q8_1, fl
     kernels::native_mmvq(w.type, w.ptr, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
-class ExpertTier;
 class DsparkDrafter;
+
+/// The second cards whose expert tiers a start uses; later cards idle.
+constexpr int kMaxSecondCards = 4;
 
 class DsModel final : public model::LoadedModel {
 public:
     ~DsModel() override;
-    /// Reads the pack and uploads every dense tensor except the token embedding (read per token from the file).
-    bool load(const std::string& path, std::string& err);
+    /// The dense tensors (every one but the token embedding, read per token from the file), the context, the sessions and
+    /// then the expert tier, sized from what they leave; every read queued in `reads`.
+    model::Result plan(const model::LoadRequest& req, core::LoadPlan& reads,
+                       std::vector<std::unique_ptr<model::ModelSession>>& sessions) override;
+    /// The expert tier, its experts landed: pinned, its copies seeded and grown.
+    model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override;
+    /// The start's reads while it plans (null after): what the sessions' shared parts (the tier, the drafter) queue into.
+    core::LoadPlan* planning() const { return planning_; }
 
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_ ? ctx_ : ctxp_default(); }
-    /// Fixes the context from --max-context (`set`) or the model's maximum, bounded by the free device memory. Call
-    /// once after load(), before a session is made. False with `err` when the request cannot be honoured.
+    /// Fixes the context from --max-context (`set`) or the model's maximum, bounded by the free device memory. Called
+    /// once the dense tensors are allocated, before a session is made. False with `err` when the request cannot be honoured.
     bool resolve_context(int64_t requested, std::string& err);
     /// The caches' format (--kv); set before resolve_context.
     CacheFormat cache_format() const { return cache_format_; }
     void set_cache_format(CacheFormat f) { cache_format_ = f; }
-    model::Result make_session(std::unique_ptr<model::ModelSession>& out) override;
 
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }
@@ -72,7 +85,7 @@ public:
     void set_diag_tier(int ram, int vram) { diag_tier_ram_ = ram; diag_tier_vram_ = vram; }
     /// The expert tier and the pinned rows it shares with a second card: one per model, whatever the sessions.
     struct SharedTier {
-        std::shared_ptr<ExpertTier> tier;
+        std::shared_ptr<core::ExpertTier> tier;
         float* h_x = nullptr;
         float* h_rows = nullptr;
     };
@@ -84,9 +97,11 @@ public:
     /// What the flags ask of the expert tiers.
     const model::LoadRequest& tiers() const { return tiers_; }
     void set_tiers(const model::LoadRequest& req) { tiers_ = req; }
-    /// The CUDA device of the second card's expert tier, or -1.
-    int peer_device() const { return peer_device_; }
-    void set_peer_device(int d) { peer_device_ = d; }
+    /// The CUDA devices of the second cards' expert tiers (each holds a block of layers), in order; empty without any.
+    const std::vector<int>& peer_devices() const { return peer_devices_; }
+    void set_peer_devices(std::vector<int> d) { peer_devices_ = std::move(d); }
+    /// The first second card, or -1.
+    int peer_device() const { return peer_devices_.empty() ? -1 : peer_devices_[0]; }
     /// The CUDA device the dense tensors live on.
     int device() const { return device_; }
     /// The sizes the prompt path's workspaces depend on.
@@ -98,19 +113,28 @@ public:
     /// Opens the image projector: the diagnostic standalone file when set, else the pack's vision section.
     /// False with `err` set when neither exists.
     bool open_mmproj(vision::Mmproj& mp, std::string& err) const;
+    /// What the expert tier is told of this model's experts and flags (its host buffers are `prompt_host()`).
+    core::ExpertTierSpec tier_spec() const;
+    /// The prompt path's and the images' host buffers, allocated before the RAM tier is sized.
+    PromptHost& prompt_host() const { return prompt_host_; }
     /// The image encoders' cuBLAS handle, opened by the expert tier at load when images are on.
     VisionBlas& vision_blas() const { return vision_blas_; }
 
 private:
+    /// Opens the pack and allocates every dense tensor, their reads queued in `reads`.
+    bool load(const std::string& path, core::LoadPlan& reads, std::string& err);
+
+    core::LoadPlan* planning_ = nullptr;
     CacheFormat cache_format_ = CacheFormat::Fp8;
     Pack pack_;
     model::ModelDesc desc_;
     std::map<std::string, DevTensor> dev_;
     std::string diag_dump_, path_;
     int diag_tier_ram_ = -1, diag_tier_vram_ = -1;
-    int peer_device_ = -1;
+    std::vector<int> peer_devices_;
     int device_ = 0;
     model::LoadRequest tiers_;
+    mutable PromptHost prompt_host_;   // before the tier: the tier goes first
     mutable SharedTier shared_tier_;
     mutable std::weak_ptr<DsparkDrafter> shared_drafter_;
     mutable VisionBlas vision_blas_;

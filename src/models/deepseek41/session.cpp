@@ -20,7 +20,7 @@
 #include "models/deepseek41/ops.hpp"
 #include "models/deepseek41/prefill.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
-#include "models/deepseek41/tier.hpp"
+#include "basalt/core/expert_tier.hpp"
 #include "basalt/models/deepseek41/vision.hpp"
 
 #include <cuda_runtime.h>
@@ -38,7 +38,7 @@
 namespace basalt::models::deepseek41 {
 namespace {
 constexpr int kLendTierTokens = 4096;   // a prompt this long reads without the VRAM tier, in larger chunks
-constexpr int kStepTailTokens = 256;     // a tail this short may read one decode step at a time when no workspaces fit
+constexpr int kStepTailTokens = 16;     // a tail shorter than this reads one decode step at a time when no workspaces fit
 
 #define DS_CUDA(call)                                                                                   \
     do {                                                                                                \
@@ -93,7 +93,7 @@ public:
                 return false;
             }
         const size_t n = (size_t) g_.n_embd;
-        head_g_.assign((size_t) g_.n_layers * 2 * kMaxWindow, nullptr);   // [T - 1][layer][with previous tail]
+        head_g_.assign((size_t) g_.n_layers * 2 * kMaxWindow * 2, nullptr);   // [lossy][T - 1][layer][with previous tail]
         tail_g_.assign((size_t) g_.n_layers * kMaxWindow, nullptr);
         constexpr int W = kMaxWindow;
         auto buf = [&](float*& p, size_t floats) {
@@ -210,7 +210,7 @@ public:
         return {};
     }
 
-    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
         std::string err;
         DsparkDraft d;
@@ -222,6 +222,16 @@ public:
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
+        // the lossy routing flags apply to decode windows only: prompts route as the model does
+        struct Lossy {
+            core::ExpertTier*& t;
+            ~Lossy() { t = nullptr; }
+        } lossy{lossy_};
+        {
+            std::string e;
+            core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+            lossy_ = t && t->route_lossy() ? t : nullptr;
+        }
         if (r.row_tokens) {
             if (r.n_tokens > kMaxWindow) return {model::Status::Error, "deepseek41: the decode window is too long"};
             std::string err;
@@ -256,13 +266,13 @@ public:
                 open_prompt_path(plan_tokens);
                 if (plan_tokens >= kLendTierTokens) {
                     std::string te;
-                    if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
+                    if (core::ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
                 }
                 // the caches take their memory before the prompt workspaces do
                 if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
                 if (!prefill_ && !make_prefill_fit(plan_tokens, err)) {
-                    // a long context's caches left no room: a short tail takes the decode path, a longer read the tier's memory
-                    if (r.n_tokens <= kStepTailTokens) {
+                    // a long context's caches left no room: a short tail (< 16 tokens) takes the decode path, a longer read the tier's memory
+                    if (r.n_tokens < kStepTailTokens) {
                         close_prompt_path();
                         for (int i = 0; i < r.n_tokens; ++i)
                             if (!step(r.tokens + i, 1, r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
@@ -271,7 +281,7 @@ public:
                     std::string te;
                     err.clear();
                     short_prompt_ = false;
-                    if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
+                    if (core::ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
                     if (!make_prefill_fit(plan_tokens, err)) return prompt_failed(err);
                 }
                 prefill_->progress = r.progress;
@@ -299,17 +309,20 @@ public:
 
     size_t running_bytes() const override { return ops_ ? ops_->turn_bytes() : 0; }
 
-    model::Result save_running(uint8_t* host, int64_t pos) override {
-        if (!prefillp::may_save(pos, whole_from_)) return {model::Status::Error, kSkippedRows};
-        sync_rewind(pos);
+    model::Result running_state(int64_t pos, bool save, core::RunningState& s) override {
         if (!ops_) return {model::Status::NotImplemented, "no state yet"};
-        ops_->save_turn(stream_, host);
+        if (save) {
+            if (!prefillp::may_save(pos, whole_from_)) return {model::Status::Error, kSkippedRows};
+            sync_rewind(pos);
+        }
+        ops_->turn_regions(s.regions);
+        s.stream = stream_;
         return {};
     }
 
-    model::Result restore_running(const uint8_t* host, int64_t pos) override {
+    model::Result running_restored(int64_t pos, const uint8_t*) override {
         if (!ops_) return {model::Status::Error, "no state yet"};
-        ops_->restore_turn(stream_, host);
+        ops_->turn_restored();
         whole_from_ = 0;
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         feat_n_ = 0;
@@ -320,7 +333,7 @@ public:
 
     model::Result set_low_memory(bool low, int64_t& expert_slots) override {
         std::string e;
-        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
         cudaStreamSynchronize(stream_);
         release_short_prompt();
@@ -330,27 +343,24 @@ public:
             if (!t->reclaim(e)) return {model::Status::Error, e};
             t->grow();
         }
-        expert_slots = t->slots();
+        expert_slots = t->gpu_slots();
         return {};
     }
 
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
         std::string e;
-        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
         cudaStreamSynchronize(stream_);
         release_short_prompt();
-        t->set_free_floor(mib);
-        t->lend_all();
-        if (!t->reclaim(e)) return {model::Status::Error, e};
-        t->grow();
-        expert_slots = t->slots();
+        if (!t->replan(mib, e)) return {model::Status::Error, e};
+        expert_slots = t->gpu_slots();
         return {};
     }
 
     model::Result probe_env(program::ProbeEnv& env) override {
         std::string e;
-        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
         cudaStreamSynchronize(stream_);
         t->probe_env(env);
@@ -362,15 +372,32 @@ public:
 
     ExpertCounts expert_counts() const override {
         std::string e;
-        const ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        const core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
+    }
+
+    std::vector<CardExperts> experts_by_card() const override {
+        std::string e;
+        const core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        std::vector<CardExperts> out;
+        if (t != nullptr)
+            for (const core::ExpertTier::CardSlots& c : t->slots_by_card()) out.push_back({c.device, c.slots, c.bytes});
+        return out;
+    }
+
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        std::string e;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        if (t == nullptr) return false;
+        t->expert_map(total, homes, routed);
+        return true;
     }
 
     std::string info_words() const override {
         std::string e;
-        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         const std::string kv = m_.cache_format() == CacheFormat::Fp8 ? "kv=fp8+fp4" : "kv=fp16";
-        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill());
+        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->gpu_slots()) + " expert_slots_primary=" + std::to_string(t->slots()) + " ram_experts_mib=" + std::to_string(t->ram_bytes() >> 20) + " " + kv + " " + program::spill_words(t->spill());
     }
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }
@@ -445,11 +472,11 @@ public:
         return {};
     }
 
-    model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) override {
+    model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid&) override {
         std::string err;
         if (!image_) {   // this slot's image buffers, allocated with the tier
-            ExpertTier* tier = ops_ ? ops_->expert_tier(err) : nullptr;
-            image_ = tier ? tier->host().take_image() : nullptr;
+            core::ExpertTier* tier = ops_ ? ops_->expert_tier(err) : nullptr;
+            image_ = tier ? m_.prompt_host().take_image() : nullptr;
             if (!image_) return {model::Status::Error, err.empty() ? "deepseek41: no image buffers for this slot" : err};
         }
         vision::Image& img = image_->picture;
@@ -459,7 +486,7 @@ public:
             // the encoder takes the memory of the tier's extra copies, and of all its copies when that is short;
             // images_done gives it back
             std::string te;
-            ExpertTier* t = ops_->expert_tier(te);
+            core::ExpertTier* t = ops_->expert_tier(te);
             cudaStreamSynchronize(stream_);
             vis_borrowed_ = true;
             if (t) t->shrink();
@@ -500,13 +527,13 @@ public:
         cudaStreamSynchronize(stream_);
         vis_.reset();
         std::string e;
-        if (ExpertTier* t = ops_->expert_tier(e)) {
+        if (core::ExpertTier* t = ops_->expert_tier(e)) {
             if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
             t->grow();
         }
     }
 
-    model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) override {
+    model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
         if (!prefillp::may_resume(pos, (int64_t) hist_.size(), whole_from_)) return {model::Status::Error, kSkippedRows};
         sync_rewind(pos);
         settle_tier();
@@ -518,7 +545,7 @@ public:
             std::string te;
             err.clear();
             short_prompt_ = false;
-            if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
+            if (core::ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
             if (!make_prefill_fit(n_rows, err)) return prompt_failed(err);
         }
         tap_features();
@@ -543,7 +570,7 @@ private:
         }
         // the reserve stays free through the read: the chunk halves to fit above it
         std::string te;
-        const ExpertTier* tier = ops_->expert_tier(te);
+        const core::ExpertTier* tier = ops_->expert_tier(te);
         const bool beside = short_prompt_;
         const uint64_t margin = std::max(beside ? prefillp::kShortMargin : prefillp::kMargin, tier ? tier->free_floor() : 0);
         if (beside) tokens = prefillp::kShortChunk;   // these workspaces stay for the next short read, whatever its size
@@ -574,7 +601,7 @@ private:
         prefill_.reset();
         short_prompt_ = false;
         std::string e;
-        if (ExpertTier* t = ops_->expert_tier(e)) {
+        if (core::ExpertTier* t = ops_->expert_tier(e)) {
             if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
             t->grow();
         }
@@ -584,14 +611,14 @@ private:
     void open_prompt_path(int n_tokens) {
         std::string e;
         // the tier opens at its normal size before anything else takes the card; the workspaces size to what is left
-        ExpertTier* t = ops_->expert_tier(e);
+        core::ExpertTier* t = ops_->expert_tier(e);
         if (!t || prefill_) return;
         short_prompt_ = n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
         if (!short_prompt_) t->shrink();
     }
     void settle_tier() {
         std::string e;
-        if (ExpertTier* t = ops_->expert_tier(e)) t->settle();
+        if (core::ExpertTier* t = ops_->expert_tier(e)) t->settle();
     }
     void release_short_prompt() {
         if (!short_prompt_) return;
@@ -602,7 +629,7 @@ private:
     // A short read's workspaces stay for the next one: the tier planned for them.
     void close_prompt_path() {
         std::string e;
-        ExpertTier* t = ops_->expert_tier(e);
+        core::ExpertTier* t = ops_->expert_tier(e);
         if (!t) return;
         if (short_prompt_) return;
         cudaStreamSynchronize(stream_);
@@ -658,7 +685,8 @@ private:
             allocs_.push_back(v);
             dev = (float*) v;
         }
-        if (cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
+        // on the sampling stream, so the draw that reads it is ordered after the upload
+        if (cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, stream_) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
         return true;
     }
 
@@ -829,6 +857,10 @@ private:
         ra.n_embd = (int) n;
         ra.k = g_.n_used;
         ra.weight_scale = g_.weight_scale;
+        if (lossy_) {   // a decode window with the lossy routing flags: the experts the GPUs hold
+            ra.held = lossy_->held_tabs(il);
+            ra.prior = lossy_->route_prior();
+        }
 
         // each sublayer's mixes run beside its collapse: only its expansion reads them (captured after the collapse, so a
         // graph launch starts the collapse's branch first)
@@ -868,6 +900,9 @@ private:
         ops_->stage_rows(T, normed_, row_st_);
         DS_CUDA(cudaEventRecord(row_ev_[1], row_st_));
         router(normed_, wf(il, "ffn_gate_inp.weight"), wf(il, "exp_probs_b.bias"), T, ra, rlogits_, ids_, rw_, st);
+        if (lossy_ && lossy_->route_tail_skip() > 0)
+            kernels::route_tail_skip(ids_, rw_, ra.held, T * g_.n_used, g_.n_used, lossy_->route_tail_skip(), g_.n_expert,
+                                     lossy_->route_counts(), st);
         dump("ffn_moe_logits", il, pos, rlogits_, (size_t) g_.n_expert * sizeof(float));
         dump("ffn_moe_topk", il, pos, ids_, (size_t) g_.n_used * sizeof(int32_t));
         dump("ffn_moe_weights_scaled", il, pos, rw_, (size_t) g_.n_used * sizeof(float));
@@ -918,7 +953,8 @@ private:
     int graph_row(int T) const { return T - 1; }
 
     bool run_head(int il, int64_t pos, int32_t token, bool with_prev_tail, int T = 1) {
-        return run_graph(head_g_[(((size_t) graph_row(T) * g_.n_layers) + il) * 2 + (with_prev_tail ? 1 : 0)],
+        const size_t lossy = lossy_ ? (size_t) g_.n_layers * 2 * kMaxWindow : 0;
+        return run_graph(head_g_[lossy + (((size_t) graph_row(T) * g_.n_layers) + il) * 2 + (with_prev_tail ? 1 : 0)],
                          [&]() { return enqueue_head(il, pos, token, stream_, with_prev_tail, T); });
     }
     bool run_tail(int il, int64_t pos, int T = 1) {
@@ -967,6 +1003,7 @@ private:
             std::string se;
             if (!ops_->stage_token(pos, T, st, se)) return fail(se);
         }
+        if (lossy_) lossy_->publish_held(stream_);   // ahead of the window's first router
         const bool graphs = dump_dir_.empty() && ops_->graph_capable();
         fused_ = graphs;
 
@@ -1124,6 +1161,7 @@ private:
     DsModel& m_;
     const Geometry& g_;
     std::vector<cudaGraphExec_t> head_g_, tail_g_;
+    core::ExpertTier* lossy_ = nullptr;   ///< in a decode window with --route-tail-skip / --route-prior on: the tier
     static constexpr int kHistoryCap = 4096;
     kernels::SamplerParams sampling_{};
     bool draw_kernel_ = false, bias_on_ = false;

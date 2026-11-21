@@ -1,6 +1,8 @@
 // src/program/serve/protocol.cpp - protocol operations for the persistent engine.
 #include "basalt/protocol.hpp"
 #include "state.hpp"
+#include "basalt_git.h"
+#include "basalt/platform/cpu.hpp"
 
 namespace basalt::program::serve {
 
@@ -177,6 +179,8 @@ int Runtime::init_protocol() {
             buf.erase(0, n);
             return true;
         };
+        // PROMPT <nbytes> [plain=a:b,...] + nbytes of text: the same, held by handle and answered at once "PROMPT
+        // <handle> <n>" (or "PROMPT ERR <why>"); the main loop never sees it.  PROMPTI [img] <ids> likewise.
         // GENT/SGENT/BGENT <...> <max_new> [k=v ...] <nbytes> [plain=a:b,...] + nbytes of UTF-8: tokenize here and hand
         // the main loop the matching GEN/SGEN/BGEN line, with "@<seq>" where the ids would be.  False: the input ends
         // inside the payload.
@@ -186,8 +190,8 @@ int Runtime::init_protocol() {
                 std::istringstream is(head_line);
                 for (std::string w; is >> w;) tk.push_back(w);
             }
-            const size_t lead = tk[0] == "GENT" ? 2 : 3;   // the command, [the slot,] max_new
-            std::string head = tk[0].substr(0, tk[0].size() - 1);
+            const size_t lead = tk[0] == "PROMPT" ? 1 : tk[0] == "GENT" ? 2 : 3;   // the command, [the slot,] max_new
+            std::string head = tk[0] == "PROMPT" ? tk[0] : tk[0].substr(0, tk[0].size() - 1);
             long long nbytes = -1;
             std::string plain_text;
             for (size_t i = 1; i < tk.size(); ++i) {
@@ -217,6 +221,14 @@ int Runtime::init_protocol() {
             std::vector<int32_t> tids;
             std::string terr;
             if (!text_tokenizer.encode(payload, true, spans, tids, terr)) { line_out = "ERR_GENT tokenizer: " + terr; return true; }
+            if (tk[0] == "PROMPT") {
+                const size_t n = tids.size();
+                const uint64_t handle = hold_prompt({std::move(tids), false});
+                std::printf("PROMPT %llu %zu\n", (unsigned long long) handle, n);
+                std::fflush(stdout);
+                line_out.clear();
+                return true;
+            }
             std::lock_guard<std::mutex> lk(gent_mu);
             const uint64_t seq = ++gent_seq;
             gent_ids[seq] = std::move(tids);
@@ -227,9 +239,24 @@ int Runtime::init_protocol() {
         while (getline_fd(l)) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
             if (l == "STOP") { stop_req.store(true); continue; }
-            if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0) {
+            if (l.rfind("PROMPTI", 0) == 0) {
+                take_prompt_ids(l);
+                continue;
+            }
+            if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0 ||
+                l.rfind("PROMPT ", 0) == 0) {
+                const bool prompt = l.rfind("PROMPT ", 0) == 0;
                 std::string rewritten;
                 const bool framed = take_text(l, rewritten);
+                if (prompt && !rewritten.empty()) {   // refused: said at once, like the answer
+                    std::printf("PROMPT ERR %s\n", rewritten.rfind("ERR_GENT ", 0) == 0 ? rewritten.c_str() + 9 : rewritten.c_str());
+                    std::fflush(stdout);
+                    rewritten.clear();
+                }
+                if (prompt) {
+                    if (!framed) break;
+                    continue;
+                }
                 l = rewritten;
                 if (!framed) {   // the input ended inside the payload: report it
                     std::lock_guard<std::mutex> lk(in_mu);
@@ -278,6 +305,21 @@ int Runtime::announce() {
         std::printf("INFO eos_ids=%s\n", ends.c_str());
     }
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
+    {   // the build's commit, and the processors that share each L3 cache (the console's load per CCD)
+        std::string l3;
+        for (const std::vector<int>& g : basalt::platform::cpu_l3_groups()) {
+            std::string part;
+            for (size_t i = 0; i < g.size(); ++i) {
+                size_t j = i;
+                while (j + 1 < g.size() && g[j + 1] == g[j] + 1) ++j;
+                part += (part.empty() ? "" : ",") + std::to_string(g[i]) + (j > i ? "-" + std::to_string(g[j]) : "");
+                i = j;
+            }
+            l3 += (l3.empty() ? "" : ";") + part;
+        }
+        std::printf("INFO commit=%s%s%s%s\n", BASALT_BENCH_GIT, BASALT_BENCH_DIRTY ? "-dirty" : "",
+                    l3.empty() ? "" : " cpu_l3=", l3.c_str());
+    }
     if (!o.lossy.empty()) {   // the flags that change the output, for a client that labels what it measures
         std::string flags;
         for (const auto& f : o.lossy) flags += (flags.empty() ? "" : ",") + f.flag;

@@ -190,7 +190,10 @@ Flow QfnRequest::restore_image() {
                 failed_stage = runtime_.stages[i]->dev;
                 break;
             }
-            if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return Flow::error; }
+            if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess) {
+                std::printf("ERR stage sync (%s)\n", cudaGetErrorString(se));
+                return Flow::error;
+            }
         }
         if (!restored) {
             basalt::log::warn("basalt serve", "conversation cache: restoring a parked conversation failed%s "
@@ -198,7 +201,10 @@ Flow QfnRequest::restore_image() {
                          failed_stage >= 0 ? (" on CUDA" + std::to_string(failed_stage)).c_str() : "",
                          runtime_.err.c_str());
             (void) cudaGetLastError();
-            if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR restore sync\n"); return Flow::error; }
+            if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess) {
+                std::printf("ERR restore sync (%s)\n", cudaGetErrorString(se));
+                return Flow::error;
+            }
             runtime_.err.clear();
             incoming.reset();
             runtime_.live.clear();

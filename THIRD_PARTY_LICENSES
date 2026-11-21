@@ -146,11 +146,34 @@ Infernix (https://github.com/Wallawalla47/Infernix), Apache License 2.0
 By Ian Ranson and the Infernix contributors.
 ================================================================================
 
-The grouped NVFP4 expert GEMM in src/prefill/fp4/moe_fp4.cu adapts code from Infernix.
+The grouped NVFP4 expert GEMM in src/prefill/moe_fp4.cu adapts code from Infernix.
+The dense W4A4 product in src/prefill/fp4_dense.cu adapts Infernix's TMA NVFP4 GEMM (src/ops/linear/nvfp4/nvfp4_a4_tma.cuh,
+nvfp4_schedule.cuh; src/ops/common/mbarrier.cuh, mma.cuh): the mbarrier full/empty tensor-load pipeline, the producer warpgroup
+beside eight consumer warps, the 128 x 256 x 128 block-scaled MMA tile and the tiled activation-scale layout.
+
+The FP8 E4M3 prompt-chunk product in src/prefill/fp8_gemm.cu adapts Infernix's fp8_a8_tma_mma_kernel
+(src/ops/linear/fp8/fp8_a8_tma_mma.cuh, fp8_a8_mma_common.cuh, src/ops/common/mbarrier.cuh, mma.cuh): the TMA and
+mbarrier producer/consumer pipeline, the 128x256x128 tile with its warp layout and ping-ponged fragments, the
+block-scaled mma used as the full-rate e4m3 product, and the segmented outputs.
 
 The int8 prompt-attention kernel adapts ideas and code from Infernix (src/ops/qsa/qsa_prompt.cu): the
 per-warp 16-cell tiles with one merge, the k-step query ordering, and the exact int8 widening to FP16.
-The chunked gated delta rule in src/prefill/gdn_chunked.cu adapts the Infernix chunked formulation.
+The chunked gated delta rule in src/kernels/cuda/gdn_prompt.cu adapts the Infernix chunked formulation.
+The GDN a/b projection with fused gating in src/kernels/cuda/dense_ops.cu (gdn_gating_proj) adapts Infernix's
+bf16_gdn_gating_proj_gemm_mma (src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh, bf16_gdn_gating_proj_kernels.cu):
+the a and b rows of one head held together so the gates apply in the epilogue, BF16 mma with a split K reduced before the gates.
+The int8-cache prompt attention in src/kernels/cuda/gqa_attn.cu adapts Infernix's fast int8 prompt kernel
+(src/ops/softmax_attention/dense/causal_cache/int8/fast_tiled_mma.cuh, fast_tiled_plan.h, ../fast_prompt_common.cuh):
+warps owning 16 query rows of one head for the whole sweep, raw int8 K/V tiles with V decoded in registers, the FP16
+partial guard, longest-first issue, and the block-shape and key-split plan with its merge.
+The decode-window products in src/kernels/cuda/window_gemm*.cu adapt the launch protocol of Infernix's decode products
+(src/core/pdl.cuh, src/ops/linear/nvfp4/nvfp4_a16_gemv.cuh): weights staged before the programmatic-launch wait,
+dependents started once the weights are read, and the slice-ordered split-K reduction; Basalt fixes the split by the
+matrix shape so a row's bits do not depend on the window.
+The FP8 decode-window product in src/kernels/cuda/window_gemm_sliced.cuh adapts the layout of Infernix's
+fp8_a16_sliced_k_mma (src/ops/linear/fp8/fp8_a16_sliced_k_mma.cuh, fp8_schedule.cuh): a 16-row block over the whole K,
+its warps on fixed K slices, the activations staged in shared memory beside the weights, and the slices reduced in the
+block in a fixed order.
 
 Licensed under the Apache License, Version 2.0, reproduced below.
 
@@ -365,6 +388,13 @@ The video input adapts ideas from ninfer, not its code: the decode guards (encod
 length, source frames, decoded pixels) and their limits, the frame count from the container,
 then the length, then a counting pass, and per-group timestamps with image positions per group
 (src/vision/video.cpp, serve/). Licensed under the Apache License, Version 2.0, reproduced above.
+
+The dense stack and the Qwen3.8-27B model (src/dense/, src/models/qwen35/, src/kernels/cuda/dense_ops.cu,
+src/kernels/cuda/gqa_attn.cu) follow ninfer's Qwen3.5 dense execution (commit 13ebb92f6f) as the reference
+design, not its code: the DFlash 2 block drafter's flow (target-layer feature taps, the projected context K/V
+window, the non-causal draft block, top-k candidates and the candidate-path selection that picks the
+proposed tokens), the gated attention and the GDN output gate. Licensed under the Apache License, Version 2.0,
+reproduced above.
 
 ================================================================================
 DeepSeek-V4.1 chat encoding (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), in

@@ -2,6 +2,8 @@
 #pragma once
 
 #include "../cli/tokens.hpp"
+#include "console_stats.hpp"
+#include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/conversation_store.hpp"
@@ -22,6 +24,7 @@
 #include "basalt/program/options.hpp"
 #include "basalt/program/ppl_gate.hpp"
 #include "basalt/program/tokenizer.hpp"
+#include "basalt/spec/draft_policy.hpp"
 #include "basalt/spec/suffix_drafter.hpp"
 
 #include <cuda_runtime.h>
@@ -113,7 +116,9 @@ public:
     virtual bool capture_admit(uint64_t need, uint64_t floor) = 0;
     virtual bool park_current(size_t held, int64_t kept) = 0;
     virtual bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) = 0;
-    virtual void ckd_finish() {}
+    /// Waits for the checkpoint save still on its way to the host, if any; a save that failed drops its checkpoint.  Every
+    /// reader of a checkpoint's bytes (a restore, a copy, a park) calls it first.
+    void ckd_finish();
     /// Writes the `CONV` line with the RAM tier's figures (a restore adds the tokens it returned and its ms), for
     /// every model after it parks or restores a conversation.
     void report_conversations(long long restored = -1, double restored_ms = 0);
@@ -133,6 +138,36 @@ public:
     virtual size_t spill_to_disk(bool at_exit, size_t limit) = 0;
     virtual bool park_idle_engine(std::string& e) = 0;
     virtual void kv_ceiling_note() {}   // a model with an elastic KV sends its ceiling again when it moves
+    // ---- the console's figures (console_stats.hpp), once the server sends STATS
+    ConsoleStats stats{};
+    /// The model's expert counts so far (none for a dense model).
+    virtual LookupCounts lookup_counts() { return {}; }
+    /// The expert map's sample: the pairs of all, each one's home and its lookups since the last call. False for a model
+    /// without routed experts. The first call starts the counting.
+    virtual bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+        (void) total; (void) homes; (void) routed;
+        return false;
+    }
+    /// Per card (CUDA ordinal): the experts it holds and the VRAM their slots take, the KV cache's VRAM (-1: not known), and
+    /// the host-to-device bandwidth as the start measured it (0: not measured). Sent as
+    /// `INFO cards=<bus id>/<expert slots>/<GB/s or ->/<expert MiB>/<KV MiB or ->;...` whenever it changes.
+    struct CardFacts {
+        int device = 0;
+        int64_t expert_slots = 0;
+        double h2d_gbps = 0;
+        uint64_t expert_bytes = 0;
+        int64_t kv_bytes = -1;
+    };
+    virtual std::vector<CardFacts> card_facts() { return {}; }
+    std::string cards_sent_{};
+    /// A decode window of `slot` (see ConsoleStats::window); around a window or a batch round, its lookups.
+    void stats_window(int slot, int offered, int accepted, int tokens) {
+        if (stats.on) stats.window(slot, offered, accepted, tokens);
+    }
+    void stats_lookups_begin() { if (stats.on) stats.lookups_begin(lookup_counts()); }
+    void stats_lookups_end() { if (stats.on) stats.lookups_end(lookup_counts()); }
+    /// Writes the XSLOT and XMAP lines when due (`force`: now, as a request ends).
+    void stats_tick(bool force = false);
     basalt::program::CommonOptions& o;
     basalt::core::ModelFile& model_file;
     std::string& err;
@@ -150,6 +185,15 @@ public:
     std::vector<ImgKey> req_imgs{};
     bool live_ok{};
     std::vector<ConvCheckpoint> checks{};
+    /// The checkpoint save in flight (see ckd_finish).  Declared after `checks`: its wait runs before their bytes are freed.
+    basalt::core::CheckpointDeferral ckd{};
+    /// A model split across two cards: the second card's part of that save, on its device.
+    basalt::core::CheckpointDeferral ckd_peer{};
+    int ckd_peer_dev = -1;
+    /// A checkpoint of `to` tokens already in the chain is used again (and keeps the higher `source`): true.
+    bool touch_check(int64_t to, ConvCheckpoint::Source source);
+    /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache.
+    void keep_check(ConvCheckpoint&& c);
     uint64_t check_clock{};
     bool cvec_cached{};
     std::optional<basalt::core::ConversationCache> conversations;
@@ -173,9 +217,37 @@ public:
     // GENT: the request text arrives as bytes and the reader thread turns it into ids, from the pack's tokenizer tables
     basalt::program::Tokenizer text_tokenizer{};
     std::string text_tokenizer_note{};
+    /// The raw bytes a token stands for; empty when the pack's tokenizer tables are not loaded or the id has none.
+    std::string_view token_bytes(int32_t id) const {
+        return !text_tokenizer_note.empty() || id < 0 || (size_t) id >= text_tokenizer.vocab_size()
+                   ? std::string_view() : std::string_view(text_tokenizer.token_bytes(id));
+    }
     std::mutex gent_mu{};
     std::map<uint64_t, std::vector<int32_t>> gent_ids{};   // tokenized prompts waiting for their request line, by sequence
     uint64_t gent_seq{};
+    // ---- --batch: a prompt the server sends once (`PROMPT`: text the engine tokenizes, `PROMPTI`: ids) and then names by
+    // handle (`#<handle>[+<id>,...]` where a GEN line has its ids), so a request that runs in several engine runs or
+    // waits for a slot does not send or tokenize it again.  The input thread takes it in and answers `PROMPT <handle>
+    // <n>` at once, even while a request runs; `PMATCH <handle>` then says what each idle slot holds of it.  Guarded by gent_mu.
+    struct HeldPrompt {
+        std::vector<int32_t> ids;
+        bool media = false;   ///< its pictures are placed by the request that reads it: a held conversation meets it only as an exact prefix
+    };
+    std::map<uint64_t, HeldPrompt> prompts{};
+    static constexpr size_t kPromptsMax = 64;
+    /// The tokens an idle slot's conversation holds for its next turn; null when it holds none (or is decoding).
+    const std::vector<int32_t>* idle_ids(int b) const;
+    struct SlotMeet {
+        int64_t match = 0;   ///< the tokens of the prompt the slot's conversation covers, the same ones the request would reuse from it
+        int64_t held = 0;    ///< the tokens it holds
+    };
+    std::vector<SlotMeet> slot_meets(const std::vector<int32_t>& prompt, bool media) const;
+    /// Holds a prompt and returns its handle.
+    uint64_t hold_prompt(HeldPrompt&& p);
+    /// PROMPTI [img] <id,id,...>, from the input thread: held and answered.
+    void take_prompt_ids(const std::string& line);
+    /// PMATCH <handle> | PFREE <handle>, from the main loop.
+    void prompt_command(const std::string& line);
     std::atomic<bool> stop_req{};
     std::atomic<bool> stdin_lost{};
     std::thread reader_{};
@@ -226,18 +298,18 @@ public:
         // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
         // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
         // history and last proposal
-        int32_t dr[16] = {};
-        float dprob[16] = {};
+        int32_t dr[basalt::spec::DraftPolicy::kMaxT] = {};
+        float dprob[basalt::spec::DraftPolicy::kMaxT] = {};
         int n_dr = 0;
         basalt::core::DraftCumAdapt cum;
         std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
-        int32_t sbuf[16] = {};
+        int32_t sbuf[basalt::spec::DraftPolicy::kMaxT] = {};
         int sk = 0, smatch = 0;
         int pen_n = 0;                 ///< the request's penalty window (penalty_last_n; 0: no penalties)
         bool from_sfx = false;
         double acc = 0.6;          ///< drafts accepted per offered, smoothed: who gets the free rows
         int64_t since_draft = 0;   ///< windows since the slot last drafted
-        int64_t windows = 0;
+        int64_t windows = 0;   ///< the request's windows in this slot, for BDONE
         int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
     };
     std::vector<BSlot> bs{};

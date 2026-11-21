@@ -28,7 +28,7 @@ int cache_size(Context& context) {
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
-    if (!basalt::core::Verifier::prepare_hc8(wt, g, err)) {   // before the cache sizes itself
+    if (!basalt::core::Verifier::prepare_hc8(wt, g, *context.reads, err)) {   // before the cache sizes itself
         basalt::log::error("basalt generate", "%s", err.c_str());
         return 1;
     }
@@ -235,15 +235,19 @@ int cache_size(Context& context) {
         cudaMemGetInfo(&free_b, &total_b);
         const auto& lay = basalt::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * cache_slot_bytes;   // what the uniform sizing granted
-        uint64_t used = 0;
-        size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
-        const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
-        for (const auto& pr : profile) {
-            const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
-            if (used + b > cap) break;
-            used += b;
-            sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
+        const size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
+        std::vector<int64_t> blobs;
+        blobs.reserve(profile.size());
+        for (const auto& pr : profile) blobs.push_back((int64_t) lay.blob_bytes(pr.first));
+        const int64_t n_sized = basalt::core::blobs_within(blobs, std::min<uint64_t>(budget, (uint64_t) free_room));
+        // An exact count is never trimmed to the room: it is honoured, or the start stops. (A count above the
+        // profile's size is clamped to it.)
+        const int64_t asked = std::min<int64_t>(o.expert_cache, (int64_t) profile.size());
+        if (!auto_cache && n_sized < asked) {
+            return fatal_start_error(basalt::core::exact_slots_refusal(
+                o.expert_cache, basalt::core::blobs_within(blobs, (uint64_t) free_room), "", free_b, o.vram_reserve_mib));
         }
+        sized_slots.assign(blobs.begin(), blobs.begin() + n_sized);
         o.expert_cache = (int) sized_slots.size();
     }
     // --vram-elastic: the cache in physical segments (the VRAM command resizes it between requests).  One GPU, serve

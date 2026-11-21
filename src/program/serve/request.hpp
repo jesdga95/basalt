@@ -46,7 +46,7 @@ protected:
     bool from_text{};
     int64_t n{};
     std::unique_ptr<basalt::program::grammar::Guard> gguard{};
-    std::vector<float> grammar_bias{};
+    bool grammar_dead{};   // the grammar allowed no token: the reply ends as an error
     int64_t grammar_resamples{};
     basalt::program::PplGate* ppl{};
     bool bad{};
@@ -95,6 +95,7 @@ protected:
     int64_t produced_n{};
     int64_t draft_offered{};
     int64_t draft_accepted{};
+    int64_t windows{};   ///< the decode windows this run took, for DONE (the server's tokens per window)
     double decode_ms{};
     Clock::time_point d0{};
     int64_t fresh{};
@@ -115,6 +116,8 @@ protected:
     int64_t fold_p0{};
     double prompt_ms{};
     bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
+    /// The prompt, with the ids a held conversation wrote standing for the tokens that spell the same bytes.
+    void respell_prompt();
     Flow restore();
     Flow parse();
     Flow prepare_prompt();

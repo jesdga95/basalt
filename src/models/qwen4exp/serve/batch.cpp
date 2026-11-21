@@ -53,9 +53,9 @@ bool QfnRuntime::batch_step() {
             if (!ke.empty() && kv_short) {   // the expert cache's floor: this slot's reply ends here
                 BSlot& sl = bs[(size_t) b];
                 basalt::log::warn("basalt batch", "slot %d stopped at %lld cells: %s", b, (long long) at, ke.c_str());
-                std::printf("BDONE %d %lld length %.1f %lld %lld\n", b, (long long) sl.produced,
+                std::printf("BDONE %d %lld length %.1f %lld %lld %lld\n", b, (long long) sl.produced,
                             std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
-                            (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+                            (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
                 sl.active = false;
                 sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids
                 sl.idle_busy = busy_now();
@@ -234,6 +234,7 @@ bool QfnRuntime::batch_step() {
         bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
     }
     const Clock::time_point w0 = Clock::now();
+    stats_lookups_begin();
     if (!ver.run_slot_segs(rows, lens, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
         std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
         return false;
@@ -257,23 +258,32 @@ bool QfnRuntime::batch_step() {
         n_keep[sg] = k;
     }
     // grammar: a slot with a guard scans its kept picks; the first one the grammar refuses is drawn again
-    // under the mask (the solo rule) and the segment ends at that row, which stays committed
-    std::vector<float> grammar_bias;
+    // under the mask (the solo rule) and the segment ends at that row, which stays committed; with no token allowed
+    // at all the request ends there as an error
     for (int sg = 0; sg < S; ++sg) {
         BSlot& sl = bs[(size_t) rows[sg]];
         if (sl.guard == nullptr || !sl.guard->on()) continue;
-        const int miss = sl.guard->scan(outb + r0s[sg], n_keep[sg]);
-            if (miss < 0) continue;
-        sl.guard->mask_bias({}, grammar_bias);
+        const int miss = sl.guard->scan(outb + r0s[sg], n_keep[sg], 0);
+        if (miss < 0) continue;
         int32_t gtok = 0;
-        if (!ver.resample_row(r0s[sg] + miss, p0s[sg], grammar_bias, gtok, err)) {
-            std::printf("ERR %s\n", err.c_str());
+        const basalt::program::grammar::Redraw verdict = sl.guard->redraw(
+            {},
+            [&](const std::vector<float>& bias, int32_t& t) { return ver.resample_row(r0s[sg] + miss, p0s[sg], bias, t, err); },
+            [&](std::vector<float>& lg) {
+                lg.resize((size_t) n_vocab);
+                return ver.copy_logits(r0s[sg] + miss, lg.data());
+            },
+            gtok);
+        if (verdict == basalt::program::grammar::Redraw::failed) {
+            std::printf("ERR %s\n", err.empty() ? "the masked draw failed" : err.c_str());
             return false;
         }
-        outb[r0s[sg] + miss] = gtok;
-        if (!sl.guard->take(gtok))
-            basalt::log::info("basalt grammar", "slot %d: the masked draw at row %d was token %d", rows[sg], miss, (int) gtok);
         n_keep[sg] = miss + 1;
+        if (verdict == basalt::program::grammar::Redraw::dead) {
+            fin_of[sg] = "error";
+            continue;
+        }
+        outb[r0s[sg] + miss] = gtok;
         fin_of[sg] = fin_at(sl, rows[sg], gtok, miss);
     }
     // logprobs: a slot that asked gets a BP line per kept pick, read before the commit and the drafts touch the head
@@ -328,13 +338,14 @@ bool QfnRuntime::batch_step() {
             if (sl.sfx) for (int e = 0; e < k; ++e) sl.sfx->append(outb[r0s[sg] + e]);
             if (sl.windows > 0 && fin_of[sg] == nullptr)
                 bpolicy->observe(sl.from_sfx, Tw, a, sl.smatch, (msd(w0, w2) + bt_draft_last) * (double) Tw / (double) R);
-            ++sl.windows;
             bt_slotwin += 1;
             bt_tokens += k;
             bt_dr_off += Tw - 1;
             bt_dr_acc += a;
             p0s[sg] = sl.p;
         }
+        ++sl.windows;
+        stats_window(b, real ? lens[sg] - 1 : 0, real ? k - 1 : 0, k);
         if (bdigest) {
             uint64_t part[10] = {};
             slot_digest(b, sl.p + k, part);
@@ -344,8 +355,8 @@ bool QfnRuntime::batch_step() {
         }
         if (fin_of[sg] != nullptr) {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-            std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin_of[sg], ms,
-                        (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+            std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin_of[sg], ms,
+                        (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
             sl.active = false;
             sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids for the next turn
             sl.idle_busy = busy_now();
@@ -356,6 +367,8 @@ bool QfnRuntime::batch_step() {
         }
     }
     std::fflush(stdout);
+    stats_lookups_end();
+    stats_tick();   // also when a prompt read runs these windows beside it, outside the command loop
     const Clock::time_point w3 = Clock::now();
     bt_emit += msd(w2, w3);
     if (real) {
@@ -454,7 +467,7 @@ int QfnRuntime::init_batch() {
     // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
     batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
     S_all = S;
-    bpolicy.emplace(S);   // the lookup-or-MTP choice, costs per row
+    bpolicy.emplace(S, 0.03, false);   // the lookup-or-MTP choice, costs per row
     bt_draft = 0;
     bt_draft_last = 0;
     bt_slotwin = 0;

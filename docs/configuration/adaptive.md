@@ -7,8 +7,10 @@ used experts into VRAM. The defaults are the fastest measured here.
 
 Routing counts rank the experts not in VRAM. A round swaps the most-routed ones in for the least-routed resident ones. A server round
 takes three windows: copy out, copy in on a side stream, then use. Counts decay after each round. On the main card every layer ranks
-together; on a peer card the main card takes its share first. Moving experts changes rounding, so output with adaptation on is not
-bit-identical run to run.
+together; on a peer card the main card takes its share first. Moving experts changes rounding, so a token's output depends on where the experts were when it ran. Rounds count windows and the window sizes follow the
+drafts' outcomes, never the clock, so greedy output is the same run to run for the same session history (the same requests in the same order). A
+different history, or a different `adapt-every`, places the experts differently and can change it. Requests running at the same time in `parallel`
+slots still depend on when each arrives.
 
 ## Settings
 

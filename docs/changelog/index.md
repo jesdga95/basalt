@@ -4,6 +4,11 @@ Releases, newest first. Versions are 0.x: a minor release adds a model or anothe
 
 | Release | Date | Summary |
 | --- | --- | --- |
+| [0.5.6](0.5.6.md) | 2026-11-21 | Inkling 2 Mini decodes 2 to 3 % faster (bitwise the same output), and drafts from an earlier repeat of the context where a prompt copies. |
+| [0.5.5](0.5.5.md) | 2026-11-21 | Inkling 2 Mini: a looped mixture of experts on one card, with images, the DSpark drafter and up to 1M tokens of context where the card has room. |
+| [0.5.0](0.5.0.md) | 2026-11-19 | Hy4-flash: a mixture of experts with a 1M-token context (elastic fp16 or FP8 caches), images, the DFly2 drafter and a shipped expert profile; per-layer expert copies, a bounded lend and partial reclaim in the shared expert tier. |
+| [0.4.1](0.4.1.md) | 2026-11-16 | Qwen3.8-27B on two cards (prompt line, layer split), YaRN past 262,144 and K/V streaming; Flash-Next's RAM plan leaves room again on 64 GB boxes; `--parallel` prompts tokenized in the engine; DeepSeek tiers on up to four cards. |
+| [0.4.0](0.4.0.md) | 2026-11-14 | Qwen3.8-27B, the first dense model: QUASAR's NVFP4 checkpoint with an FP8 head, the DFlash 2 drafter in windows of up to 16 with exact speculative sampling, batched slots; one checkpoint transfer for every model. |
 | [0.3.3](0.3.3.md) | 2026-11-12 | Answer now, logprobs, documents and video in messages, session-affinity slots, faster Flash-Next long prompts on one card, a DeepSeek NVFP4 pack, a container image, `--no-answer-room` becomes `--answer-room 0`. |
 | [0.3.2](0.3.2.md) | 2026-11-08 | Faster DeepSeek decode on two cards, release archives for Linux and Windows x64, an install that finds its files beside `bin/`. |
 | [0.3.1](0.3.1.md) | 2026-11-08 | DeepSeek FP8/FP4 attention caches, drafting in every slot, a shared peer-card prompt path, faster decode kernels, new packs, one RAM reserve for every model (`--ram-reserve-mib`). |

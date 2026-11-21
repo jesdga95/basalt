@@ -9,7 +9,8 @@ namespace {
 // The shape of a round's cost by window size, relative to one token, used only below the smallest measured size or
 // while a single size is measured (two measured sizes give the cost of a row; measured round times replace both). It
 // sits between the measured curves: steeper with every missed expert on the CPU, flatter with the default CPU/DMA split.
-constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6};
+constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6,
+                                                    3.95, 4.3, 4.65, 5.0, 5.35, 5.7, 6.05, 6.4};
 // A round's cost is scale x base(size): the scale follows every round fast (the context grows, the tiers move, a
 // request's first windows run cold), each size's base follows its own rounds slowly, so the costs of sizes not taken
 // lately move with the ones taken
@@ -37,8 +38,8 @@ constexpr double kProbeChance = 0.85;   // the joint chance at which a drafter w
 
 }  // namespace
 
-DraftPolicy::DraftPolicy(int max_t, double margin)
-    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {}
+DraftPolicy::DraftPolicy(int max_t, double margin, bool timed)
+    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin), timed_(timed) {}
 
 int DraftPolicy::bucket(int match) {
     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
@@ -57,6 +58,16 @@ double DraftPolicy::chance_rate(float chance) const {
     const int b = chance_bin(chance);
     const double c = std::clamp((double) chance, 0.0, 1.0);
     return (c_ok_[b] + kChancePriorN * c) / (c_n_[b] + kChancePriorN);
+}
+
+// each bin's rate at its top edge (a chance of 1 in the last bin): no stated chance gets more
+double DraftPolicy::best_rate() const {
+    double hi = 0.0;
+    for (int b = 0; b < kChanceBins; ++b) {
+        const double top = b < kChanceBins - 1 ? (double) kChanceEdge[b] : 1.0;
+        hi = std::max(hi, (c_ok_[b] + kChancePriorN * top) / (c_n_[b] + kChancePriorN));
+    }
+    return hi;
 }
 
 double DraftPolicy::lookup_rate(int match) const {
@@ -105,10 +116,35 @@ double DraftPolicy::mtp_tokens(int t) const {
 }
 
 DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const {
+    const int t = std::clamp(t_mtp, 1, max_t_);
+    if (lookup_k <= 0) {
+        Pick p;
+        p.t = t;
+        return p;
+    }
+    return lookup_over(t, mtp_tokens(t) / cost_ms(t), lookup_k, match);
+}
+
+DraftPolicy::Pick DraftPolicy::choose_window(const float* chance, int n, int lookup_k, int match) const {
     Pick p;
-    p.t = std::clamp(t_mtp, 1, max_t_);
+    p.t = window(chance, n);
     if (lookup_k <= 0) return p;
-    const double base = mtp_tokens(p.t) / cost_ms(p.t);
+    return lookup_over(p.t, drafter_tokens(chance, p.t) / cost_ms(p.t), lookup_k, match);
+}
+
+double DraftPolicy::drafter_tokens(const float* chance, int t) const {
+    double e = 1.0, all = 1.0;
+    for (int i = 0; i + 1 < t; ++i) {
+        all *= chance_rate(chance[i]);
+        e += all;
+    }
+    return e;
+}
+
+// `base`: the expected tokens per ms of the window of t the drafter would run
+DraftPolicy::Pick DraftPolicy::lookup_over(int t, double base, int lookup_k, int match) const {
+    Pick p;
+    p.t = t;
     const double q = lookup_rate(match);
     double e = 1.0, qi = 1.0, best = 0.0;
     int best_t = 0;
@@ -154,6 +190,29 @@ int DraftPolicy::window(const float* chance, int n) const {
     return best_t;
 }
 
+// window()'s choice with draft j's chance known and the later ones at best_rate(): the windows without draft j are
+// priced exactly; one with it wins only above them (E grows with every chance), or by the probe one row past t = j + 1
+bool DraftPolicy::may_verify(const float* chance, int j, int n) const {
+    const int most = std::clamp(n + 1, 1, max_t_);
+    if (j < 0 || j + 2 > most) return false;
+    double e = 1.0, all = 1.0, best = 1.0 / cost_ms(1);
+    int best_t = 1;
+    for (int t = 2; t <= j + 1; ++t) {
+        all *= chance_rate(chance[t - 2]);
+        e += all;
+        const double r = e / cost_ms(t);
+        if (r > best) { best = r; best_t = t; }
+    }
+    const double hi = best_rate();
+    double joint = all * chance_rate(chance[j]);
+    for (int t = j + 2; t <= most; ++t) {
+        all *= t == j + 2 ? chance_rate(chance[j]) : hi;
+        e += all;
+        if (e / cost_ms(t) > best) return true;
+    }
+    return best_t == j + 1 && unmeasured(j + 2) && joint >= kProbeChance;
+}
+
 void DraftPolicy::observe_window(const float* chance, int t, int accepted, double round_ms) {
     // drafts 0..accepted-1 were accepted given their prefix and draft `accepted` (if the window had it) was not; the
     // drafts after it were never tested
@@ -169,6 +228,7 @@ void DraftPolicy::observe_window(const float* chance, int t, int accepted, doubl
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
     ++round_;
+    if (!timed_) round_ms = kShape[t];
     if (round_ms > 0) {
         if (scale_ <= 0) scale_ = round_ms / kShape[t];          // the first round sets the scale
         if (!recent(t)) {                                        // new, or measured too long ago: start over from
