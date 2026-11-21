@@ -262,6 +262,10 @@ uint64_t dspark_session_bytes(const Pack& pack, int64_t context, int tap_rows) {
 // ---- the session's hook ---------------------------------------------------------------------------------------------------
 
 DsparkHook::~DsparkHook() {
+    for (cudaGraphExec_t g : g_stage_)
+        if (g) cudaGraphExecDestroy(g);
+    for (cudaGraphExec_t g : g_head_)
+        if (g) cudaGraphExecDestroy(g);
     if (dump_) {
         basalt::log::info("basalt inkling2", "--diag-dump: %lld drafts, %lld screened picks differ from the exact head's",
                           (long long) dump_drafts_, (long long) dump_differ_);
@@ -331,6 +335,10 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     prev_ = (int32_t*) dev(4, ok);
     ids_d_ = (int32_t*) dev(kDsBlock * 4, ok);
     conf_d_ = f(kDsBlock);
+    frc_ = f(E);
+    meta_d_ = (int32_t*) dev(2 * 4, ok);
+    if (ok && cudaMallocHost((void**) &meta_h_, 2 * 4) != cudaSuccess) ok = false;
+    if (meta_h_) pinned_.push_back(meta_h_);
     if (ok && (cudaMallocHost((void**) &ids_h_, kDsBlock * 4) != cudaSuccess ||
                cudaMallocHost((void**) &conf_h_, kDsBlock * 4) != cudaSuccess))
         ok = false;
@@ -400,6 +408,84 @@ void DsparkHook::note(int64_t pos0, int rows) {
     }
 }
 
+// The block's stage k (0 .. layers): the post-attention half of layer k - 1 (k > 0), then the pre-attention half of layer k
+// (k < layers) or the final norm and the head's `n` drafts (k = layers). Everything a stage reads of the block's anchor and
+// position is on the device (meta_d_), so a stage is captured once and replayed.
+void DsparkHook::stage(int k, int n, void* stream) {
+    const DsparkWeights& w = *w_;
+    const DsparkGeometry& d = w.geo;
+    if (k == 0) dspark_block_inputs(w.embedding, meta_d_, w.embed_norm, d.rms_eps, w.mask, kDsBlock, x_, pos3b_, prev_, state_, fr_,
+                                    kFrRing, frc_, stream);
+    if (k > 0) {
+        const DsparkLayer& L = w.layer[(size_t) k - 1];
+        bk::native_quantize_q8_1(attn_, act_, kQ, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.wo, act_, o_, kQ, kE, kDsBlock, stream);
+        bk::add_scaled(x_, o_, nullptr, (int64_t) kDsBlock * kE, stream);
+        bk::rms_norm_rows(x_, L.post_norm, kDsBlock, kE, d.rms_eps, xn_, stream);
+        bk::native_quantize_q8_1(xn_, act_, kE, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.gate, act_, g_, kE, d.n_ff, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.up, act_, u_, kE, d.n_ff, kDsBlock, stream);
+        bk::native_swiglu_quantize_q8_1(g_, u_, act_, d.n_ff, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.down, act_, o_, d.n_ff, kE, kDsBlock, stream);
+        bk::add_scaled(x_, o_, nullptr, (int64_t) kDsBlock * kE, stream);
+    }
+    if (k < d.n_layers) {
+        const DsparkLayer& L = w.layer[(size_t) k];
+        const Cache& c = cache_[(size_t) k];
+        bk::rms_norm_rows(x_, L.attn_norm, kDsBlock, kE, d.rms_eps, xn_, stream);
+        bk::native_quantize_q8_1(xn_, act_, kE, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.wq, act_, q_, kE, kQ, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.wk, act_, kb_, kE, kKV, kDsBlock, stream);
+        bk::native_q8_0_mmvq(L.wv, act_, vb_, kE, kKV, kDsBlock, stream);
+        bk::attn_qk_prepare(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, rope_of(d), pos3b_, kDsBlock, kHeads, kKvHeads, qr_, c.k, c.v,
+                            0, stream, kHeadDim, false, c.cap, meta_d_ + 1);
+        return;
+    }
+    bk::rms_norm_rows(x_, w.norm, kDsBlock, kE, d.rms_eps, h_, stream);
+    // the head: the screen's head term of the draft rows (block rows 1..n), the recurrence's hidden and context terms
+    const float* hd = h_ + kE;
+    const DsHead head = w.head_args();
+    bk::native_quantize_q8_1(hd, hq_, kE, n, stream);
+    dspark_head_base(head, hq_, n, approx_, stream);
+    bk::bf16_gemv_fp32_mmvf_multi(hd, kE, w.w_h, ctx_h_, kDsRnn, kE, kDsRnn, n, stream);
+    bk::bf16_gemv_fp32_mmvf_multi(frc_, kE, w.w_f, ctx_f_, kDsRnn, kE, kDsRnn, 1, stream);
+    for (int i = 0; i < n; ++i) {
+        dspark_markov_step(ctx_h_ + (size_t) i * kDsRnn, ctx_f_, w.rnn_b, w.w_sp, w.w1, prev_, state_ + (i & 1) * kDsRank,
+                           state_ + ((i + 1) & 1) * kDsRank, latent_, stream);
+        void* lq = static_cast<char*>(lat_q_) + (size_t) i * bk::native_q8_1_bytes(kDsRank, 1);
+        bk::native_quantize_q8_1(latent_, lq, kDsRank, 1, stream);
+        if (dump_ && dumped_ < kDumpBlocks) dspark_head_exact(head, hq_, lq, i, dump_logits_ + (size_t) i * w.n_vocab, stream);
+        dspark_head_pick(head, hq_, lq, approx_, i, head_scr_, prev_, ids_d_, conf_d_, stream);
+    }
+    cudaMemcpyAsync(ids_h_, ids_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
+    cudaMemcpyAsync(conf_h_, conf_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
+}
+
+// Stage k as a graph: captured the first time, then launched. False when the stream cannot capture (the stage then ran
+// directly, and every later block runs its stages directly).
+bool DsparkHook::stage_graph(int k, int n, void* stream) {
+    cudaGraphExec_t& g = k < w_->geo.n_layers ? g_stage_[k] : g_head_[n];
+    const cudaStream_t st = (cudaStream_t) stream;
+    if (!g) {
+        cudaGraph_t graph = nullptr;
+        if (cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        stage(k, n, stream);
+        const cudaError_t ce = cudaStreamEndCapture(st, &graph);
+        const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&g, graph, 0) : ce;
+        if (graph) cudaGraphDestroy(graph);
+        if (ci != cudaSuccess) {
+            (void) cudaGetLastError();
+            g = nullptr;
+            basalt::log::warn("basalt inkling2", "drafter: a graph of its block failed (%s); it runs without graphs", cudaGetErrorString(ci));
+            return false;
+        }
+    }
+    return cudaGraphLaunch(g, st) == cudaSuccess;
+}
+
 model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* stream) {
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     pending_ = 0;
@@ -407,55 +493,27 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
     // the Markov head's context is the row before the anchor's: kept for the last kFrRing positions run
     if (n < 1 || pos < 1 || pos - 1 >= hi_ || pos - 1 < std::max(lo_, hi_ - kFrRing) || pos + kDsBlock > full_cells(context_))
         return {};
-    const DsparkWeights& w = *w_;
-    const DsparkGeometry& d = w.geo;
-    const int V = w.n_vocab;
-    const bk::RopeSpec rope = rope_of(d);
+    const DsparkGeometry& d = w_->geo;
+    meta_h_[0] = anchor;
+    meta_h_[1] = (int32_t) pos;
+    cudaMemcpyAsync(meta_d_, meta_h_, 2 * sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) stream);
+    // the stages captured as graphs (not with --diag-dump, whose head writes more); the attention between them runs
+    // directly: its window follows the position
+    if (dump_ || !stream) graphs_ = false;
     try {
-        dspark_block_inputs(w.embedding, anchor, w.embed_norm, d.rms_eps, w.mask, kDsBlock, pos, x_, pos3b_, prev_, state_, stream);
-        for (int l = 0; l < d.n_layers; ++l) {
-            const DsparkLayer& L = w.layer[(size_t) l];
-            const Cache& c = cache_[(size_t) l];
-            bk::rms_norm_rows(x_, L.attn_norm, kDsBlock, kE, d.rms_eps, xn_, stream);
-            bk::native_quantize_q8_1(xn_, act_, kE, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.wq, act_, q_, kE, kQ, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.wk, act_, kb_, kE, kKV, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.wv, act_, vb_, kE, kKV, kDsBlock, stream);
-            bk::attn_qk_prepare(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, rope, pos3b_, kDsBlock, kHeads, kKvHeads, qr_, c.k, c.v,
-                                pos, stream, kHeadDim, false, c.cap);
-            // a sliding-window layer sees its window before the block, the full one every position, and both the block
-            const int64_t window = c.ring ? (int64_t) d.window + 1 : pos + kDsBlock;
-            bk::gqa_window_attn(qr_, c.k, c.v, kHeads, kKvHeads, kHeadDim, pos, kDsBlock, pos + kDsBlock, window, c.cap, att_scr_,
-                                att_cells_, attn_, stream, true);
-            bk::native_quantize_q8_1(attn_, act_, kQ, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.wo, act_, o_, kQ, kE, kDsBlock, stream);
-            bk::add_scaled(x_, o_, nullptr, (int64_t) kDsBlock * kE, stream);
-            bk::rms_norm_rows(x_, L.post_norm, kDsBlock, kE, d.rms_eps, xn_, stream);
-            bk::native_quantize_q8_1(xn_, act_, kE, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.gate, act_, g_, kE, d.n_ff, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.up, act_, u_, kE, d.n_ff, kDsBlock, stream);
-            bk::native_swiglu_quantize_q8_1(g_, u_, act_, d.n_ff, kDsBlock, stream);
-            bk::native_q8_0_mmvq(L.down, act_, o_, d.n_ff, kE, kDsBlock, stream);
-            bk::add_scaled(x_, o_, nullptr, (int64_t) kDsBlock * kE, stream);
+        for (int k = 0; k <= d.n_layers; ++k) {
+            if (k > 0) {
+                const Cache& c = cache_[(size_t) k - 1];
+                // a sliding-window layer sees its window before the block, the full one every position, and both the block
+                const int64_t window = c.ring ? (int64_t) d.window + 1 : pos + kDsBlock;
+                bk::gqa_window_attn(qr_, c.k, c.v, kHeads, kKvHeads, kHeadDim, pos, kDsBlock, pos + kDsBlock, window, c.cap, att_scr_,
+                                    att_cells_, attn_, stream, true);
+            }
+            if (!graphs_ || !stage_graph(k, n, stream)) {
+                graphs_ = false;
+                stage(k, n, stream);
+            }
         }
-        bk::rms_norm_rows(x_, w.norm, kDsBlock, kE, d.rms_eps, h_, stream);
-        // the head: the screen's head term of the draft rows (block rows 1..n), the recurrence's hidden and context terms
-        const float* hd = h_ + kE;
-        const DsHead head = w.head_args();
-        bk::native_quantize_q8_1(hd, hq_, kE, n, stream);
-        dspark_head_base(head, hq_, n, approx_, stream);
-        bk::bf16_gemv_fp32_mmvf_multi(hd, kE, w.w_h, ctx_h_, kDsRnn, kE, kDsRnn, n, stream);
-        bk::bf16_gemv_fp32_mmvf_multi(fr_ + (size_t) ((pos - 1) % kFrRing) * kE, kE, w.w_f, ctx_f_, kDsRnn, kE, kDsRnn, 1, stream);
-        for (int i = 0; i < n; ++i) {
-            dspark_markov_step(ctx_h_ + (size_t) i * kDsRnn, ctx_f_, w.rnn_b, w.w_sp, w.w1, prev_, state_ + (i & 1) * kDsRank,
-                               state_ + ((i + 1) & 1) * kDsRank, latent_, stream);
-            void* lq = static_cast<char*>(lat_q_) + (size_t) i * bk::native_q8_1_bytes(kDsRank, 1);
-            bk::native_quantize_q8_1(latent_, lq, kDsRank, 1, stream);
-            if (dump_ && dumped_ < kDumpBlocks) dspark_head_exact(head, hq_, lq, i, dump_logits_ + (size_t) i * V, stream);
-            dspark_head_pick(head, hq_, lq, approx_, i, head_scr_, prev_, ids_d_, conf_d_, stream);
-        }
-        cudaMemcpyAsync(ids_h_, ids_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
-        cudaMemcpyAsync(conf_h_, conf_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
     } catch (const std::exception& e) {
         return {model::Status::Error, std::string("inkling2: the drafter: ") + e.what()};
     }
