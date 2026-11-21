@@ -1599,8 +1599,9 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 // so 6 takes such windows in one pass; 8 would take ~64-80 registers.
 constexpr int GRP_NC = 6;
 
-// KC > 0: rows of KC calls (row_dot_multi's KC), and the dependents (the SwiGLU, then down) are let in at the start, so
-// their launches and down's weight prefetch overlap the last wave.
+// KC > 0: rows of KC calls (row_dot_multi's KC), and when every group has its own block row (no group stride) the
+// dependents (the SwiGLU, then down) are let in at the start, so their launches and down's weight prefetch overlap the
+// last wave; with the stride the waiting blocks would hold their slots through several waves.
 template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, int KC = 0>
 __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
@@ -1608,8 +1609,10 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
                                                               const int32_t* __restrict__ ent_tok,
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                               float* __restrict__ gate, float* __restrict__ up) {
-    if constexpr (KC > 0) pdl_launch_dependents();
     const int ng = *n_groups;
+    if constexpr (KC > 0) {
+        if (ng <= (int) gridDim.y) pdl_launch_dependents();   // one pass of groups: the dependents wait out one wave
+    }
     if (blockIdx.y >= ng) return;
     __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TG, STAGE_GRID>::value];
     const uint32_t* s_grid = stage_iq_grid<TG, STAGE_GRID>(s_grid_buf, threadIdx.x, 256);
