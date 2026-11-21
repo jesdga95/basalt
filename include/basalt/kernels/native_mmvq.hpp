@@ -52,6 +52,19 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream);
 
+// Up to three row ranges of one Q8_0 matrix in one launch, each with its own input and output: segment i is rows
+// [row0[i], row0[i] + n_out[i]) of `weights` times x[i] (ncols columns), written to y[i] as native_q8_0_mmvq(that range,
+// x[i], y[i], n_in, n_out[i], ncols) writes it, the same bits. Shapes whose own calls would take different kernels run
+// as those calls.
+struct Q80Segments {
+    int n = 0;
+    int row0[3] = {};
+    int n_out[3] = {};
+    const void* x[3] = {};
+    float* y[3] = {};
+};
+void native_q8_0_mmvq_segments(const void* weights, const Q80Segments& seg, int n_in, int ncols, void* stream);
+
 // native_q8_0_mmvq at one column with the weights read cache-streaming (first in line for L2 eviction): for a
 // matrix read once per use, so it does not push out what the kernels around it read again. The same bits.
 void native_q8_0_mmvq_stream(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, void* stream);
