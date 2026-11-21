@@ -130,8 +130,9 @@ public:
     /// room. False when even no copy at all leaves that much.
     bool resize_reserve(uint64_t free_bytes, void* stream);
     void lend(bool low, void* stream);
-    /// A prompt chunk's staging of layer l's RAM experts from their card copies, when every one has a copy (false: none
-    /// issued; the caller copies them from RAM). `with_peer`: the second card's experts too (all_copied).
+    /// A prompt chunk's staging of layer l's RAM experts: each from its card copy when the elastic spill still holds one,
+    /// from its RAM copy otherwise (false: none has a copy, the caller copies the layer's from RAM). `with_peer`: the second
+    /// card's experts too (all_copied).
     bool stage_from_card(int l, void* stream, bool with_peer) const;
     /// Every expert of layer l that left the card has a copy on it again (the elastic spill): the layer runs on the main card alone.
     bool all_copied(int l) const { return !layer_copies_.empty() && layers_[(size_t) l].n_spill > 0 && layer_copies_[(size_t) l] >= layers_[(size_t) l].n_spill; }
@@ -230,7 +231,6 @@ private:
     std::vector<void*> copy_;
     int64_t n_copy_ = 0;
     std::vector<int> layer_copies_;   ///< [layer] RAM experts with a card copy
-    std::vector<int> layer_ram_copies_;   ///< [layer] those the second card does not hold (a prompt chunk stages the others' copies)
     // [vision] the experts' memory lent to the image encoder: each lent range's bytes, in RAM until refill
     struct LentRange {
         size_t range = 0;
