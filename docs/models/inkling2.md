@@ -57,7 +57,7 @@ from their card copies when it has them all. At `--max-context 1048576 --kv fp8`
 found; decode runs at 264 tok/s on a short chat, 173 at 131K and 108 at 400K (plain decoding), and a 400K prompt reads at about
 4,110 tok/s. Needles at 10, 50 and 90 % of 31,943 and 127,958-token prompts are found through the server
 (`--max-context 262144`). On an RTX 5090 at 400 W with every expert on the card, prompts of 2K, 16K, 32K and 128K tokens read at
-about 13,800, 13,000, 11,900 and 8,350 tok/s.
+about 14,100, 13,300, 12,200 and 8,900 tok/s.
 
 ## Drafting
 
@@ -102,10 +102,10 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
 | | Inkling 2 Mini | llama.cpp, IQ4_NL GGUF | Qwen3.8-27B (Basalt) |
 | --- | ---: | ---: | ---: |
 | Decode: conversation | 338 tok/s | 94.5 | 261 |
-| Decode: struct | 621 tok/s | 92.5 | 768 |
-| Decode: prose | 286 tok/s | 94.5 | 192 |
-| Prompt read | 12,256 tok/s (16K) | 3,093 (`llama-bench` pp512) | 10,757 (16K) |
+| Decode: struct | 613 tok/s | 92.5 | 768 |
+| Decode: prose | 287 tok/s | 94.5 | 192 |
+| Prompt read | 12,240 tok/s (16K) | 3,093 (`llama-bench` pp512) | 10,757 (16K) |
 
-Drafts accepted: conversation 66.4 %, struct 97.3 %, prose 50.6 %. llama.cpp (29b52d398, `-fa 1`, full offload, no drafting)
+Drafts accepted: conversation 68.0 %, struct 97.6 %, prose 51.3 %. llama.cpp (29b52d398, `-fa 1`, full offload, no drafting)
 ran the same token ids through `llama-server` with the same lengths and temperatures; `llama-bench` tg128 reads 96.3 tok/s.
 The struct fixture runs to its 8,192-token cap on both engines.
