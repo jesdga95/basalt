@@ -550,7 +550,7 @@ private:
             ap.ldq = kProjQ;
             ap.ldk = ap.ldv = kProjKV;
         }
-        // convolutions, clips, caches
+        // convolutions, clips, caches (the attention prepares them)
         ap.pos = pos_d_;
         ap.full = full;
         ap.k_conv = w.k_conv;
@@ -571,7 +571,6 @@ private:
         ap.q = q_;
         ap.r = r_;
         ap.sink = sink_;
-        decode_prepare(ap, rows, stream_);
         // the attention, gated by its row's gate projection and rounded for the output projection
         AttnArgs aa;
         aa.q = q_;
@@ -588,7 +587,7 @@ private:
         aa.gate = ap.yq + kOffGate;
         aa.gate_ld = ap.ldq;
         aa.q8 = xo_;
-        attention_decode(aa, rows, c.ring ? (int64_t) g_.window : full_keys, att_scr_, nullptr, stream_);
+        attention_window(ap, aa, rows, c.ring ? (int64_t) g_.window : full_keys, att_scr_, stream_);
         bk::native_q8_0_mmvq(w.out, xo_, o_, kOutRows, E, rows, stream_);
         // the attention's convolution and the residual (a block's first layer starts a new sum), then the MLP's input
         PostAttn pa;
