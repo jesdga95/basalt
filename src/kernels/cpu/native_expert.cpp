@@ -38,6 +38,8 @@ void gu_rows_ggml(const NativeFmt& f, const uint8_t* blob, const void* const* ac
                 g *= sg;
                 u *= su;
             }
+            if (f.gate_softcap > 0.f) g = f.gate_softcap * std::tanh(g / f.gate_softcap);
+            if (f.up_softcap > 0.f) u = f.up_softcap * std::tanh(u / f.up_softcap);
             if constexpr (LIMITED) {
                 g = std::fmin(g, f.swiglu_limit);
                 u = std::fmax(std::fmin(u, f.swiglu_limit), -f.swiglu_limit);
@@ -154,6 +156,16 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (f.gate_softcap > 0.f || f.up_softcap > 0.f) {
+        float sg = 1.f, su = 1.f;
+        if (f.tail) {
+            std::memcpy(&sg, blob + f.bytes - f.tail, 4);
+            std::memcpy(&su, blob + f.bytes - f.tail + 4, 4);
+        }
+        if (f.swiglu_limit > 0.f) gu_rows_ggml<true>(f, blob, act, nt, ff, r0, r1, sg, su);
+        else gu_rows_ggml<false>(f, blob, act, nt, ff, r0, r1, sg, su);
+        return;
+    }
     // The multi-token kernels decode the weights once for all tokens; the single-token ggml dot below serves the
     // formats without one.  A token's rows round the same alone as in a group, so greedy output does not depend on
     // the number of drafts in a window.  A format with only an AVX-2 kernel (IQ4_XS) takes it on AVX-2 CPUs

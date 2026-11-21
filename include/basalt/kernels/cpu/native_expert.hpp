@@ -34,6 +34,7 @@ struct NativeFmt {
     size_t tail = 0;                    ///< NVFP4: the blob's last 16 bytes, FP32 {s_gate, s_up, s_down, 0}
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
     float swiglu_limit = 0.f;           ///< > 0: gate capped at it and up clamped to +-it before the product
+    float gate_softcap = 0.f, up_softcap = 0.f; ///< > 0: c * tanh(x / c), before SwiGLU
 };
 
 /// Fills `f` for a layer (`swiglu_limit`: the model's SwiGLU limit, 0 for none; `up_type`: the up rows' type, -1 for
