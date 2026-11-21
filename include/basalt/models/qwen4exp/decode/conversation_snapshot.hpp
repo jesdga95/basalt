@@ -2,11 +2,15 @@
 
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/conversation_stream.hpp"
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/models/qwen4exp/decode/session.hpp"
 
+#include <array>
+#include <cstdint>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace basalt::core {
 
@@ -24,8 +28,30 @@ bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& 
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);
+// The same with the payload's sizes (k, v, k scales, v scales, pooled rows) given apart: an image whose K/V was left
+// where a disk read found it carries the shapes only.
+bool conversation_kv_validate(const ConversationKv& image, const std::array<uint64_t, 5>& payload,
+                              const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                              std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
+// The K/V a save would copy, as readers of the state's own buffers (no copy now).  Caller synchronizes the device; the
+// state stays unchanged while `out` is read, on the thread and device of this call.
+bool conversation_kv_source(ConversationKvSource& out, const QsaState& state, const ModelGeometry& g, int64_t upto,
+                            bool include_index, std::string& error);
+// `base` with the bytes of its pages [first, last), `page_bytes` each, read from a ring that keeps them apart: page p
+// at `ring + (p % ring_pages) * page_bytes`, device memory copied out on the calling thread.
+ConversationBytes conversation_bytes_over_ring(ConversationBytes base, const void* ring, uint64_t page_bytes,
+                                               int64_t ring_pages, int64_t first, int64_t last);
+// A restore of every layer at once from K/V left where a disk read found it: layer j of `kv` goes into
+// `targets[j]`, each piece copied as it arrives.  Caller synchronizes the device before; a failure may leave the
+// states partly written.
+struct ConversationKvTarget {
+    const QsaState* state = nullptr;
+    bool include_index = true;
+};
+bool conversation_kv_restore(ConversationKvRead& kv, const std::vector<ConversationKvTarget>& targets,
+                             const ModelGeometry& g, int64_t upto, std::string& error);
 // The K/V up to `upto` of `from` into `to` (the same layout) without a host copy: what a save of `from` and a
 // restore of it into `to` leave there.
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto,
@@ -105,9 +131,19 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+// With `kv`, the image's K/V was left where a disk read found it (ConversationStore::load): validate checks its
+// sizes and restore reads it into the session's buffers.  A failed read is a transfer failure.
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
-                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
+                                    const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                    const ConversationKvRead* kv = nullptr);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   ConversationKvRead* kv = nullptr);
+// What a save would capture, left where it is: the tokens, pictures and checkpoints by reference (what `view` refers
+// to outlives `out`), the running state and the K/V as readers of the session's buffers, for a write to the disk tier
+// a buffer at a time.  Synchronizes the device; the session's state stays unchanged while `out` is read, on the
+// thread and device of this call.
+bool conversation_snapshot_source(ConversationSource& out, const ConversationView& view, const SessionState& session,
+                                  const ModelGeometry& g, const QsaState* draft, std::string& error);
 
 } // namespace basalt::core

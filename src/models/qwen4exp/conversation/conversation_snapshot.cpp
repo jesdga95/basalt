@@ -1,4 +1,5 @@
 #include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
+#include "basalt/core/progress.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
 #include "conversation_checked.hpp"
@@ -187,23 +188,74 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
 
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                               int64_t upto, bool index, std::string& error) {
+    return conversation_kv_validate(image, {image.k.size(), image.v.size(), image.k_scale.size(), image.v_scale.size(),
+                                            image.pooled.size()}, st, g, upto, index, error);
+}
+
+bool conversation_kv_validate(const ConversationKv& image, const std::array<uint64_t, 5>& payload, const QsaState& st,
+                              const ModelGeometry& g, int64_t upto, bool index, std::string& error) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
-    const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     if (image.format != l.format || image.cells != l.cells || image.heads != g.n_head_kv ||
         image.head_dim != g.head_dim || image.page_size != l.page_size || image.pooled_rows != l.pooled_rows ||
         image.idx_dim != g.idx_key_dim) {
         error = "conversation snapshot: incompatible K/V geometry";
         return false;
     }
-    for (size_t i = 0; i < src.size(); ++i)
-        if (src[i]->size() != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (payload[i] != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
     const auto dst = pools(st);
-    for (size_t i = 0; i < src.size(); ++i)
+    for (size_t i = 0; i < sizes.size(); ++i)
         if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
     return true;
+}
+
+bool conversation_kv_source(ConversationKvSource& out, const QsaState& st, const ModelGeometry& g, int64_t upto,
+                            bool index, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error) || !backed(st, l, error)) return false;
+    out.format = l.format;
+    out.cells = l.cells;
+    out.heads = g.n_head_kv;
+    out.head_dim = g.head_dim;
+    out.page_size = l.page_size;
+    out.pooled_rows = l.pooled_rows;
+    out.idx_dim = g.idx_key_dim;
+    const auto src = pools(st);
+    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (sizes[i] && !src[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+        const uint8_t* p = static_cast<const uint8_t*>(src[i]);
+        out.parts[i].size = sizes[i];
+        out.parts[i].view = nullptr;
+        out.parts[i].read = [p](uint64_t o, uint8_t* d, uint64_t n) {
+            return cudaMemcpy(d, p + o, n, cudaMemcpyDefault) == cudaSuccess;
+        };
+    }
+    return true;
+}
+
+ConversationBytes conversation_bytes_over_ring(ConversationBytes base, const void* ring, uint64_t page_bytes,
+                                               int64_t ring_pages, int64_t first, int64_t last) {
+    const uint8_t* r = static_cast<const uint8_t*>(ring);
+    const uint64_t lo = (uint64_t) std::max<int64_t>(first, 0) * page_bytes;
+    const uint64_t hi = std::min<uint64_t>((uint64_t) std::max<int64_t>(last, 0) * page_bytes, base.size);
+    const uint64_t span = (uint64_t) ring_pages * page_bytes;
+    if (r == nullptr || span == 0 || lo >= hi) return base;
+    ConversationBytes b;
+    b.size = base.size;
+    b.read = [read = std::move(base.read), r, lo, hi, span](uint64_t o, uint8_t* d, uint64_t n) {
+        if ((o < lo || o + n > hi) && !read(o, d, n)) return false;   // what the ring does not cover
+        for (uint64_t at = std::max(o, lo), end = std::min(o + n, hi); at < end;) {
+            const uint64_t in = at % span, c = std::min(end - at, span - in);
+            if (cudaMemcpy(d + (at - o), r + in, c, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+            at += c;
+        }
+        return true;
+    };
+    return b;
 }
 
 namespace {
@@ -238,6 +290,53 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
     return settle_resident(st, g, upto, error);
+}
+
+bool conversation_kv_restore(ConversationKvRead& kv, const std::vector<ConversationKvTarget>& targets,
+                             const ModelGeometry& g, int64_t upto, std::string& error) {
+    const size_t n = targets.size();
+    if (kv.layers() != n) { error = "conversation snapshot: invalid K/V layer count"; return false; }
+    std::vector<std::array<void*, 5>> dst(n);
+    std::vector<std::array<size_t, 5>> sizes(n);
+    for (size_t j = 0; j < n; ++j) {
+        const QsaState& st = *targets[j].state;
+        Layout l{};
+        if (!layout(st, g, upto, targets[j].include_index, l, error) || !valid(st, l, upto, error) ||
+            !backed(st, l, error))
+            return false;
+        dst[j] = pools(st);
+        sizes[j] = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+        for (size_t i = 0; i < sizes[j].size(); ++i) {
+            if (kv.bytes(j, (int) i) != sizes[j][i]) {
+                error = "conversation snapshot: invalid K/V payload size";
+                return false;
+            }
+            if (sizes[j][i] && !dst[j][i]) {
+                error = "conversation snapshot: missing target state buffer";
+                return false;
+            }
+        }
+    }
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) { error = "conversation snapshot: no current device"; return false; }
+    const ConversationKvSink sink = [&](size_t layer, int part, uint64_t offset, const uint8_t* src, uint64_t bytes) {
+        if (layer >= n || part < 0 || part >= 5) return false;
+        const size_t size = sizes[layer][(size_t) part];
+        if (offset > size || bytes > size - offset) return false;
+        progress_beat();   // the serve watchdog: a long conversation's K/V is still arriving
+        // the read's threads copy into this device's buffers
+        return cudaSetDevice(device) == cudaSuccess &&
+               cudaMemcpy(static_cast<uint8_t*>(dst[layer][(size_t) part]) + offset, src, bytes, cudaMemcpyDefault) ==
+                   cudaSuccess;
+    };
+    if (!kv.read(sink, error)) return false;
+    if (const cudaError_t e = cudaDeviceSynchronize(); e != cudaSuccess) {
+        error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
+        return false;
+    }
+    for (size_t j = 0; j < n; ++j)
+        if (!settle_resident(*targets[j].state, g, upto, error)) return false;
+    return true;
 }
 
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto, bool index,

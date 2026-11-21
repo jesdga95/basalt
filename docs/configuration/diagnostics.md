@@ -86,3 +86,6 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 - `concur5_digest=1`: batch slots print a state digest per window.
 - `spec_log=1`: with `--draft-log`, also write each row's target distribution.
 - `host_ev=1`: print GPU time per window's verify, commit and draft, and the idle gap.
+- `disk_stream=0`: the disk tier of the conversation cache writes and reads whole images only, none from the session
+  or into it a buffer at a time; `2`: every read leaves the K/V in its files until the restore.
+- `conv_ram_mib=N`: a conversation's RAM admission sees at most N MiB free above its floor.

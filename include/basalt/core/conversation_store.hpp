@@ -12,17 +12,24 @@
 // are removed.  Every name carries the identity it was written under (the model file and every setting
 // that changes the state's bytes).  Reads are fail-closed: header, section table and every 1 MiB block of payload carry
 // hashes, a shared file must match its name, and any mismatch drops the conversation.  The directory keeps to a byte
-// budget, least recently used conversations first.
+// budget, least recently used conversations first.  A read can leave the K/V in its files until it is copied to where
+// it is used (load() with a ConversationKvRead); such a read checks each block as it copies it, so a bad block is
+// found after part of the K/V was delivered.  A file such a read holds open is removed once the read has closed it.
+// A conversation can also be written where it is, a write buffer at a time, with no image of it in RAM (write()): the
+// same files, a new block's bytes copied out twice (once to name its file by their hashes, once to write it).
 #pragma once
 
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/conversation_stream.hpp"
 
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,28 +66,44 @@ public:
     /// identity's files count).  False with `error` when the directory cannot be used.
     bool open(const std::string& dir, uint64_t identity, uint64_t budget, std::string& error);
     bool enabled() const { return open_; }
+    uint64_t budget() const { return budget_; }
 
     /// The longest stored prefix of `prompt` (live tokens or a checkpoint, with the same pictures and control-vector
     /// state), at most prompt.size() - 1 tokens; tokens == 0 when there is none.
     Match best(const int32_t* prompt, size_t n, const std::vector<ConversationImageKey>& images, bool cvec) const;
 
-    /// Bytes `load` allocates for `m` (the RAM admission's figure).
-    uint64_t load_bytes(const Match& m) const;
+    /// Bytes `load` allocates for `m` (the RAM admission's figure); with `kv` false, those of a load that leaves the
+    /// K/V in its files.
+    uint64_t load_bytes(const Match& m, bool kv = true) const;
 
     /// The image of `m` cut at m.tokens: `out.live` is the state there, `out.kv` the K/V up to it, `out.checkpoints`
     /// the chain's root (its shortest checkpoint) and that state once more when it is a checkpoint.  A file that fails
     /// any check is deleted and false returned with `error`; the file stays otherwise (a later prompt may match it).
-    bool load(const Match& m, SavedConversation& out, std::string& error);
+    /// With `kv`, the K/V is not copied: `out.kv` holds the layers' shapes with empty buffers and `*kv` reads their
+    /// bytes later (the store outlives it; one load or K/V read runs at a time).
+    bool load(const Match& m, SavedConversation& out, std::string& error,
+              std::unique_ptr<ConversationKvRead>* kv = nullptr);
 
     /// Queues `image` for writing; the writer thread owns it from here.  Files it supersedes (the same conversation
     /// a turn back) are dropped.  False when the queue is over its byte cap (nothing queued).
     bool put(SavedConversation&& image, uint64_t queue_cap);
 
+    /// Writes `src` now, on the caller's thread, a write buffer at a time, after a write in progress on the writer
+    /// thread and before the queued ones: the files put() writes of its image.  Until it has succeeded the index and
+    /// the files it names stay as they were; an entry indexed or dropped during the write refuses it too.  False with
+    /// `error` when the conversation is not stored once this returns: not written (one larger than the budget is not
+    /// begun), or evicted by the budget at once.  `progress` is called while it waits for the writer thread, about
+    /// once a second, and for every piece it copies from `src`.
+    bool write(const ConversationSource& src, std::string& error, const std::function<void()>& progress = {});
+    /// The RAM a write() of `tokens` tokens takes beside its source.
+    static uint64_t write_bytes(size_t tokens);
+
     /// Whether an image with these live tokens is stored or queued.
     bool holds(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const;
 
-    /// Waits until every queued image is written.
-    void flush();
+    /// Waits until every queued image is written and its RAM given back; `waiting` is called about once a second
+    /// meanwhile.
+    void flush(const std::function<void()>& waiting = {});
 
     Stats stats() const;
     uint64_t queued_bytes() const;
@@ -93,10 +116,18 @@ private:
         int refs = 0;
         int64_t mtime = 0;
     };
+    class KvFileRead;
+    class KvQueuedRead;
     void writer();
-    bool write_job(Job& job, uint64_t& wrote, uint64_t& whole, std::string& error);
+    Entry& index_locked(const ConversationSource& c, uint64_t bytes, bool own_file);
+    bool write_now(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole, std::string& why,
+                   std::string* staged);
+    bool write_job(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole, std::string& error,
+                   std::string* staged);
     void evict_locked();
-    void drop_locked(size_t index);
+    void drop_locked(size_t index, bool keep_file = false);
+    void drop_read(const std::string& name, uint64_t generation, const std::string& part, std::string& error);
+    void unlink_unread_locked();             ///< removes the dropped files no read holds open any more
     void release_locked(const std::vector<std::string>& refs);
     void gc_locked(int64_t min_age);         ///< removes unused block and state files at least `min_age` s old
 
@@ -104,17 +135,39 @@ private:
     uint64_t identity_ = 0, budget_ = 0;
     bool open_ = false;
     mutable std::mutex mu_;
+    std::shared_mutex publish_mu_;            ///< shared by a load opening its files, held by a write() to publish
+    std::timed_mutex write_mu_;               ///< held while a conversation's files are written
+    int direct_waiting_ = 0;                  ///< write() calls waiting for write_mu_
     std::condition_variable cv_, idle_;
+    std::map<std::string, int> reading_;      ///< files a ConversationKvRead holds open: removed once it closed them
+    std::vector<std::string> unlinked_;       ///< conversation files dropped while open for such a read
     std::vector<std::unique_ptr<Entry>> entries_;
     std::map<std::string, PartFile> parts_;   ///< block and state files of this identity, by name
     std::deque<std::shared_ptr<Job>> queue_;
-    uint64_t queue_bytes_ = 0, clock_ = 0;
+    uint64_t queue_bytes_ = 0, clock_ = 0, generation_ = 0;
+    uint64_t revision_ = 0;                   ///< counts the entries indexed and dropped
     bool stop_ = false, busy_ = false;
     Stats stats_;
     std::vector<std::unique_ptr<ConversationStoreBuffer>> read_bufs_;   ///< the loads' aligned read buffers, kept
     std::thread thread_;
     int64_t row_cells_ = 1;
 };
+
+/// What conversation_cache_to_store moved: the conversations that left the cache and their bytes, those of them it
+/// wrote, and whether the caller's condition held at the end.
+struct ConversationsToStore {
+    size_t left = 0, bytes = 0, written = 0;
+    bool admitted = false;
+};
+
+/// Conversations parked in `cache` leave for `store`, the longest parked first, until `admitted()` holds or none is
+/// left to go.  One that `stored` says the store holds already only leaves the cache; the others are written first
+/// and waited for (`waiting`, as for flush): an image's RAM is free once it is written.  One shorter than `shortest`
+/// tokens or larger than the store's budget stays parked, and once the store did not write one, no more are given up.
+ConversationsToStore conversation_cache_to_store(ConversationCache& cache, ConversationStore& store, int64_t shortest,
+                                                 const std::function<bool(const SavedConversation&)>& stored,
+                                                 const std::function<bool()>& admitted,
+                                                 const std::function<void()>& waiting = {});
 
 /// The 64-bit hash the store's identity and file checks use (XXH64's rounds).
 uint64_t conversation_store_hash(const void* data, size_t n, uint64_t seed);

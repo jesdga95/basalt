@@ -72,6 +72,17 @@ protected:
     int own_slot{};
     basalt::core::ConversationCache::Match parked{};
     std::optional<basalt::core::SavedConversation> incoming{};
+    /// The incoming image's K/V while a disk read has left it in its files (see disk_kv_in_files).
+    std::unique_ptr<basalt::core::ConversationKvRead> incoming_kv{};
+    /// The incoming image goes, with what holds its K/V.
+    void drop_incoming() {
+        incoming.reset();
+        incoming_kv.reset();
+    }
+    /// The incoming image came out of the RAM tier, which takes it back when the request ends before restoring it.
+    bool incoming_parked{};
+    /// Puts such an image back where it was parked; true when the RAM tier holds it again.
+    bool repark_incoming();
     int64_t in_tokens{};
     bool in_live{};
     basalt::core::ConversationStore::Match on_disk{};
@@ -166,6 +177,9 @@ protected:
     virtual void validate_incoming() {}
     virtual Flow make_room() { return Flow::proceed; }
     virtual Flow restore_image() { return Flow::proceed; }
+    /// Whether a conversation on disk is read with its K/V left in its files, for restore_image to copy into the
+    /// session from there (incoming_kv); asked with whether RAM admits its whole image.
+    virtual bool disk_kv_in_files(bool) const { return false; }
     virtual void adopt_checkpoints() {}
     virtual void retain_image() {}
     virtual bool session_reset() { return true; }

@@ -43,6 +43,35 @@ void Runtime::shed_if_low() {
                       (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
 }
 
+bool Runtime::admit_streamed(uint64_t need, uint64_t floor) {
+    if (capture_admit(need, floor)) return true;
+    if (!disk.enabled() || !conversations) return false;
+    const auto t0 = Clock::now();
+    const auto beat = [] { basalt::core::progress_beat(); };
+    // what holds RAM beside the parked conversations: the K/V kept for the next park, the images on their way to disk
+    (void) conversations->take_reuse();
+    for (auto& sc : conversations->take_spilled())
+        if (!disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec)) disk.put(std::move(sc), kDiskQueueCap);
+    disk.flush(beat);
+    const auto moved = basalt::core::conversation_cache_to_store(
+        *conversations, disk, std::max<int64_t>(disk_min_tokens(), o.conversation_cache_min_tokens),
+        [&](const basalt::core::SavedConversation& c) {
+            return disk_has(c.live.ids, c.live.imgs, c.checkpoints, c.cvec);
+        },
+        [&] {   // with what was just given up back at the OS
+            (void) basalt::core::CheckpointBytes::allocator_type::release_pooled();
+            basalt::platform::release_free_heap();
+            return capture_admit(need, floor);
+        },
+        beat);
+    if (moved.left > 0)
+        basalt::log::info("basalt serve", "conversation cache: %zu parked conversations (%zu MiB) leave RAM to admit "
+                          "%llu MiB above the %llu MiB floor, %zu of them written to disk in %.0f ms", moved.left,
+                          moved.bytes >> 20, (unsigned long long) (need >> 20), (unsigned long long) (floor >> 20),
+                          moved.written, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    return moved.admitted;
+}
+
 void Runtime::ckd_finish() {
     const void* dst = ckd.pending();
     if (dst == nullptr) return;

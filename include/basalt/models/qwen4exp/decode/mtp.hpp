@@ -36,6 +36,7 @@ class LoadPlan;
 
 class NativeHead;
 struct ConversationKv;
+struct ConversationKvSource;
 
 /// The longest draft chain (the drafter's `max_t`): a verify window holds at most kVerifyMaxT rows, a chain may run on
 /// past it so a window launched ahead has drafts.
@@ -147,6 +148,9 @@ public:
     /// keeps; the others are the working state's bytes), leaving the working state on the sequence it holds.
     /// The device is idle.
     bool save_store(int id, int64_t cells, ConversationKv& out, std::string& err);
+    /// The same image as readers of the K/V where it is (no copy now), for a write a buffer at a time.  The drafter
+    /// stays as this leaves it while `out` is read.
+    bool store_source(int id, int64_t cells, ConversationKvSource& out, std::string& err);
     /// Before a conversation snapshot reads `kv_state()` as the main sequence's draft K/V: with KV streaming beside
     /// stores, the main sequence in the working state and its pages from the ring over the host copy the snapshot
     /// reads.  A no-op otherwise.
