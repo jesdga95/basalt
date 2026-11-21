@@ -280,6 +280,12 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             }
         }
         experts += eb;
+        // the experts' addresses, for the plan
+        std::vector<unsigned long long> table((size_t) g.n_expert);
+        for (int e = 0; e < g.n_expert; ++e) table[(size_t) e] = (unsigned long long) (w.experts + (uint64_t) e * w.expert_stride);
+        if (!(w.blob_table = reinterpret_cast<unsigned long long*>(device_buf(table.size() * 8))) ||
+            cudaMemcpy(w.blob_table, table.data(), table.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess)
+            return fail("out of device memory loading layer " + std::to_string(l) + "'s expert table");
     }
     fp8_ = req.kv == "fp8";
 

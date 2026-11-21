@@ -34,6 +34,7 @@ struct LayerWeights {
     int gu_type = 0, d_type = 0;
     size_t blob_bytes = 0;
     size_t expert_stride = 0;                ///< blob_bytes rounded up to whole blocks of its type and 16 bytes
+    unsigned long long* blob_table = nullptr;   ///< device [n_expert]: each expert's blob address on the card (0: not on it)
     const float* msg_query = nullptr;        ///< core layers: [kStreams][n_embd]
     const uint16_t* ctrl_down[kStreams] = {};   ///< BF16 [gate_rank][2 n_embd]
     const uint16_t* ctrl_gf[kStreams] = {};     ///< BF16 [2 n_embd][gate_rank]: the gain rows, then the forget rows
