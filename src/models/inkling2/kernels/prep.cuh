@@ -92,6 +92,53 @@ __device__ __forceinline__ void kv_row(const AttnPrep& a, int r, int pr, int g, 
     f = w == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
 }
 
+// kv_row for the n (1 or 2) consecutive rows r0, r0 + 1 at positions pr0, pr0 + 1, every input loaded before the first
+// sum (the second row's older inputs are the first row's): each row's val, raw and f are kv_row's bits.
+__device__ __forceinline__ void kv_rows2(const AttnPrep& a, int r0, int n, int pr0, int g, int w, int lane,
+                                         const float (&wt)[4][kConv], float (&val)[2][4], float (&raw)[2][4], float (&f)[2]) {
+    const float* yall = w ? a.yv : a.yk;
+    const int64_t ld = w ? a.ldv : a.ldk;
+    const float* ring = w ? a.v_ring : a.k_ring;
+    const float inv_k = a.full ? (1.f / 3.f) : rsqrtf((float) kConv + 1.f);
+    // x[i]: the convolution input at position pr0 + 1 - i (row r0 + 1 - i of the window, else the ring); x[0] only
+    // for a second row. Row r0 + k takes x[1 - k + j] as kv_row's tap j.
+    float x[kConv + 1][4], tp[2][kConv];
+#pragma unroll
+    for (int i = 0; i <= kConv; ++i) {
+        const int rq = r0 + 1 - i;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int c = g * kHeadDim + lane * 4 + u;
+            x[i][u] = i == 0 && n < 2 ? 0.f : rq >= 0 ? yall[(size_t) rq * ld + c] : conv_ring(ring, kKvHeads * kHeadDim, pr0 + 1 - i, c);
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < 2; ++k)
+#pragma unroll
+        for (int j = 0; j < kConv; ++j)
+            tp[k][j] = a.full && k < n ? yall[(size_t) (r0 + k) * ld + kOffTaps + g * kConv + j] : 0.f;
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        if (k >= n) break;
+        float ss = 0.f;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            float acc = 0.f;
+            raw[k][u] = x[1 - k][u];
+#pragma unroll
+            for (int j = 0; j < kConv; ++j) {
+                float t = wt[u][j];
+                if (a.full) t += tp[k][j];
+                acc = fmaf(t, x[1 - k + j][u], acc);
+            }
+            val[k][u] = (acc + raw[k][u]) * inv_k;
+            ss = fmaf(val[k][u], val[k][u], ss);
+        }
+        ss = warp_sum(ss);
+        f[k] = w == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
+    }
+}
+
 __device__ __forceinline__ void store_kv(void* cache, bool fp8, size_t idx, float v) {
     if (fp8) {
         __nv_fp8_e4m3 q(v);
