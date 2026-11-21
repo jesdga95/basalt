@@ -372,20 +372,27 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
             float s3[kGroup];
             prep::q_heads(pa, r, p, g, w, lane, wt, &sm.q[0][0], &sm.rs[0][0], s3);
         } else {
-            for (int rr = max(0, s_lo - p0); rr <= r && p0 + rr < s_hi; ++rr) {
-                float val[4], raw[4], f;
-                prep::kv_row(pa, rr, p0 + rr, g, w, lane, wt, val, raw, f);
-                uint8_t* row = w ? fs.vw[rr] : fs.kw[rr];
+            // the window's rows of this slice up to the block's own: both prepared from one round of loads
+            const int rr0 = max(0, s_lo - p0), nr = min(r, s_hi - 1 - p0) - rr0 + 1;
+            if (nr > 0) {
+                float val[2][4], raw[2][4], f[2];
+                prep::kv_rows2(pa, rr0, nr, p0 + rr0, g, w, lane, wt, val, raw, f);
 #pragma unroll
-                for (int u = 0; u < 4; ++u) prep::store_kv(row, FP8, (size_t) lane * 4 + u, val[u] * f);
-                if (rr == r) {   // the block's own row: into the cache and the ring
-                    void* cache = w ? pa.v_cache : pa.k_cache;
-                    const size_t cell = ((size_t) (p % pa.cap) * kKvHeads + g) * kHeadDim + lane * 4;
+                for (int k = 0; k < 2; ++k) {
+                    if (k >= nr) break;
+                    const int rr = rr0 + k;
+                    uint8_t* row = w ? fs.vw[rr] : fs.kw[rr];
 #pragma unroll
-                    for (int u = 0; u < 4; ++u) prep::store_kv(cache, FP8, cell + u, val[u] * f);
-                    float* ring = w ? pa.v_ring : pa.k_ring;
-                    *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
-                        make_float4(raw[0], raw[1], raw[2], raw[3]);
+                    for (int u = 0; u < 4; ++u) prep::store_kv(row, FP8, (size_t) lane * 4 + u, val[k][u] * f[k]);
+                    if (rr == r) {   // the block's own row: into the cache and the ring
+                        void* cache = w ? pa.v_cache : pa.k_cache;
+                        const size_t cell = ((size_t) (p % pa.cap) * kKvHeads + g) * kHeadDim + lane * 4;
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) prep::store_kv(cache, FP8, cell + u, val[k][u] * f[k]);
+                        float* ring = w ? pa.v_ring : pa.k_ring;
+                        *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
+                            make_float4(raw[k][0], raw[k][1], raw[k][2], raw[k][3]);
+                    }
                 }
             }
         }
