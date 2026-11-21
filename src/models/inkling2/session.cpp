@@ -511,6 +511,9 @@ private:
         mn.kv_cap = c.cap;
         mn.kv_window = c.ring ? g_.window : 0;
         mn.kv_cell = (int) cell_bytes();
+        mn.ring_k = c.k_ring;
+        mn.ring_v = c.v_ring;
+        mn.ring_a = c.a_ring;
         if (!msgs) {
             for (int j = 0; j < n_in; ++j) {
                 mn.norm[j] = norms[j];
