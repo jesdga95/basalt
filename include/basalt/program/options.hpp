@@ -113,6 +113,7 @@ struct CommonOptions {
     int diag_tier_ram = -1, diag_tier_vram = -1;   ///< --diag-tier-ram / --diag-tier-vram: fixed expert-tier sizes
     bool diag_serial_prompt = false;       ///< --diag-serial-prompt: an adapter model reads its prompt one decode step at a time
     std::string diag_logits;               ///< --diag-logits FILE: an adapter model writes the logits of each decoded row
+    bool diag_batch_check = false;         ///< --diag-batch-check: the batch conformance check over --batch N sessions (model/batch_check.hpp)
     std::vector<std::string> images;       ///< --image FILE ... with --image-at N: the picture's block goes before token N
     std::vector<int64_t> image_at;
     bool image_pad_given = false;
