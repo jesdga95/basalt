@@ -26,6 +26,7 @@
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/prefill/cpu_split.hpp"
+#include "basalt/program/expert_spill.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/compiler.hpp"
@@ -694,8 +695,8 @@ public:
 
     std::string info_words() const override {
         const std::string kv = m_.cache_fp8() ? "kv=fp8" : "kv=fp16";   // what a community row records
-        return tier_ ? "expert_slots=" + std::to_string(tier_->gpu_slots()) + " expert_slots_primary=" + std::to_string(tier_->slots()) + " ram_experts_mib=" + std::to_string(tier_->ram_bytes() >> 20) + " " + kv
-                     : kv;
+        return tier_ ? "expert_slots=" + std::to_string(tier_->gpu_slots()) + " expert_slots_primary=" + std::to_string(tier_->slots()) + " ram_experts_mib=" + std::to_string(tier_->ram_bytes() >> 20) + " " + kv + " " + program::spill_words(tier_->spill())
+                     : kv + " " + program::spill_words({});   // no tier: every expert is on the card, none read from the file
     }
 
     // SLEEP / WAKE: the tier's card slots go back to the card (every expert keeps its RAM copy and its slot is remembered), and
