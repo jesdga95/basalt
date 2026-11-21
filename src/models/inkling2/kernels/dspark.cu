@@ -409,6 +409,71 @@ __device__ __forceinline__ void exact_x(const Q81* __restrict__ xh_g, const Q81*
     }
 }
 
+// px::collect<false, true> from the tiles' maxima: a tile's softmax partial holds its best score (part[t].x, the score
+// of its first candidate), so the best is the tiles' best and only a tile whose best is within kDelta of it can hold a
+// listed candidate; the list is the same, read from a quarter of the scores. More than kMaxCand: px::collect's radix
+// select over every candidate.
+__device__ __forceinline__ int collect_tiles(px::Final& f, int n_tiles, const float2* __restrict__ cand,
+                                             const float2* __restrict__ part, int* __restrict__ out_id,
+                                             float* __restrict__ out_prob) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float ninf = __int_as_float(0xff800000);
+    float m = ninf;
+    for (int t = tid; t < n_tiles; t += 512) m = fmaxf(m, __ldcg(&part[t].x));
+#pragma unroll
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (lane == 0) f.wmax[warp] = m;
+    __syncthreads();
+    m = f.wmax[0];
+    for (int w = 1; w < 16; ++w) m = fmaxf(m, f.wmax[w]);
+    if (m == ninf) {   // every row is masked
+        if (tid == 0) {
+            *out_id = 0;
+            *out_prob = 1.0f;
+        }
+        return 0;
+    }
+    for (int t = tid; t < n_tiles; t += 512) {
+        const float tm = __ldcg(&part[t].x);
+        if (!(tm > ninf && tm >= m - px::kDelta)) continue;
+        for (int k = 0; k < px::kPer; ++k) {
+            const float2 c = __ldcg(&cand[t * px::kPer + k]);
+            if (c.x > ninf && c.x >= m - px::kDelta) {
+                const int p = atomicAdd(&f.cnt, 1);
+                if (p < px::kMaxCand) { f.list[p] = __float_as_int(c.y); f.lp[p] = c.x; }
+            }
+        }
+    }
+    __syncthreads();
+    const int total = f.cnt;
+    if (total > px::kMaxCand) {
+        const int nc = n_tiles * px::kPer;
+        const unsigned long long kth = px::kth_key(f, nc, cand, m);
+        if (tid == 0) f.cnt = 0;
+        __syncthreads();
+        for (int i = tid; i < nc; i += 512) {
+            const float2 c = __ldcg(&cand[i]);
+            if (c.x > ninf && c.x >= m - px::kDelta && px::cand_key(c) >= kth) {
+                const int p = atomicAdd(&f.cnt, 1);
+                if (p < px::kMaxCand) { f.list[p] = __float_as_int(c.y); f.lp[p] = c.x; }
+            }
+        }
+        __syncthreads();
+    }
+    const int n = total < px::kMaxCand ? total : px::kMaxCand;
+    int row = 0, rank = 0;
+    float lp = 0.0f;
+    if (tid < n) {
+        row = f.list[tid];
+        lp = f.lp[tid];
+        for (int j = 0; j < n; ++j) rank += f.list[j] < row;
+    }
+    __syncthreads();
+    if (tid < n) { f.list[rank] = row; f.lp[rank] = lp; }
+    __syncthreads();
+    return n;
+}
+
 // One block: the rows near the best approximate logit scored exactly (a warp per row); the exact best is draft i:
 // *prev = ids[i] = it, conf[i] = its probability (the tiles' softmax sums with the rescored rows made exact), w1_row = its
 // row of w1: each rescored row's is read (host memory) while the row is scored, the pick's then copied out.
@@ -426,7 +491,7 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
     pdl_wait();
     if (tid == 0) f.cnt = 0;
     exact_x(xh_g, xl_g, xh, xl, tid, 512);
-    const int n = px::collect<false, true>(f, n_tiles, nullptr, cand, prev, conf + i);
+    const int n = collect_tiles(f, n_tiles, cand, part, prev, conf + i);
     if (n == 0) {   // never: the vocabulary has rows
         if (tid == 0) ids[i] = *prev;
         if (warp == 0) reinterpret_cast<uint4*>(w1_row)[lane] = reinterpret_cast<const uint4*>(w1 + (int64_t) *prev * kDsRank)[lane];
