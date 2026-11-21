@@ -134,6 +134,19 @@ void moe_sort(const int32_t* ids, int rows, int k, int n_expert, void* scratch, 
     check("moe_sort/scatter");
 }
 
+namespace {
+__global__ void remap_ids_kernel(int32_t* __restrict__ ids, int n, const int32_t* __restrict__ map) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) ids[i] = map[ids[i]];
+}
+}  // namespace
+
+void remap_ids(int32_t* ids, int n, const int32_t* map, void* stream) {
+    if (n <= 0) return;
+    remap_ids_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(ids, n, map);
+    check("remap_ids");
+}
+
 void stage_to_ring(const void* k_stage, const void* v_stage, int64_t stage_cap, void* k_ring, void* v_ring, int64_t ring_cap,
                    int64_t pos0, int rows, int keep, int elem, void* stream) {
     const int64_t end = pos0 + rows, first = end - keep > pos0 ? end - keep : pos0;
