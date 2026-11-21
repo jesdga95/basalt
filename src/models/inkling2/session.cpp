@@ -548,7 +548,6 @@ private:
             controllers(ca, 3, rows, stream_);
         }
         // the projections: one product over every row of the fused matrix when the three inputs are one
-        const size_t row_bytes = (size_t) E / 32 * 34;
         AttnPrep ap;
         if (!full && !msgs) {
             bk::native_q8_0_mmvq(w.proj, xq_[0], y_, E, kProj, rows, stream_);
