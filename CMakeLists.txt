@@ -256,7 +256,8 @@ add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/model
 target_include_directories(inkling2_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(inkling2_kernels PUBLIC ${_gpu_runtime_target})
 add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/inkling2/pretok_inkling2.cpp
-  src/models/inkling2/pack.cpp src/models/inkling2/model.cpp src/models/inkling2/session.cpp)
+  src/models/inkling2/pack.cpp src/models/inkling2/model.cpp src/models/inkling2/session.cpp src/models/inkling2/walk.cpp
+  src/models/inkling2/prompt.cpp)
 target_include_directories(model_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_inkling2 PUBLIC model tokenizer inkling2_kernels kernels core ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -268,6 +269,10 @@ if(BUILD_TESTING)
   target_include_directories(inkling2_pretok_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
   target_link_libraries(inkling2_pretok_test PRIVATE tokenizer)
   basalt_cpu_test(NAME inkling2_pretok_test COMMAND inkling2_pretok_test)
+  add_executable(inkling2_walk_test src/models/inkling2/walk_test.cpp src/models/inkling2/walk.cpp src/models/inkling2/pack.cpp)
+  target_include_directories(inkling2_walk_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(inkling2_walk_test PRIVATE core)
+  basalt_cpu_test(NAME inkling2_walk_test COMMAND inkling2_walk_test)
 endif()
 endif()
 

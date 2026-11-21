@@ -6,6 +6,7 @@
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/platform/file.hpp"
+#include "models/inkling2/prompt.hpp"
 
 #include <cuda_runtime.h>
 
@@ -18,6 +19,7 @@ constexpr uint64_t kMiB = 1ull << 20;
 constexpr int kTypeF32 = 0;
 constexpr int kTypeQ8_0 = 8;
 constexpr int kTypeBF16 = 30;
+constexpr int kTypeNvfp4 = 40;
 constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 row of the hidden width
 // what a session needs beside its caches (its row buffers, the expert scratch, the head's logits) and what the card keeps
 // free for the kernels' modules and the driver
@@ -37,6 +39,20 @@ constexpr ProjPart kProjParts[] = {
     {"attn_v.weight", kRowV, 1024, false},       {"attn_v_conv_proj.weight", kRowV + kOffTaps, 32, true},
 };
 const char* const kStreamNames[kStreams] = {"q", "k", "v", "ffn"};
+constexpr int kDecodeRows = 8;   // the rows of a decode window's forward: a sliding-window ring keeps the window and them
+
+// A blob's stride on the card: whole blocks of its type and 16 bytes, so a kernel can read each expert's blocks in place.
+uint64_t expert_stride(int type, uint64_t blob) {
+    const uint64_t block = type == kTypeQ8_0 ? 34 : type == kTypeNvfp4 ? 36 : 1;
+    uint64_t a = block, b = 16;
+    while (b) {
+        const uint64_t t = a % b;
+        a = b;
+        b = t;
+    }
+    const uint64_t unit = block / a * 16;
+    return (blob + unit - 1) / unit * unit;
+}
 }  // namespace
 
 uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8) {
@@ -44,8 +60,9 @@ uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8) {
     for (const Visit& v : g.visits) (g.swa[(size_t) v.layer] ? swa : global) += 1;
     const uint64_t elem = fp8 ? 1 : 2;
     const uint64_t per_pos = 2ull * kKvHeads * kHeadDim * elem;
-    const uint64_t ring = (uint64_t) g.window + 1024;   // the window and a prompt step's rows
-    return (uint64_t) global * per_pos * (uint64_t) context + (uint64_t) swa * per_pos * ring + kSessionFixed;
+    const uint64_t ring = (uint64_t) g.window + kDecodeRows;
+    return (uint64_t) global * per_pos * (uint64_t) context + (uint64_t) swa * per_pos * ring + kSessionFixed +
+           prompt_bytes(g);   // PROMPT HOOK
 }
 
 InklingModel::InklingModel() = default;
@@ -236,20 +253,34 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 w.ctrl_gf[s] = gf;
             }
         }
-        // the experts: the layer's blobs in one run
+        // the experts: the layer's blobs in one run, each at a stride of whole blocks
         const ExpertLayer& el = pack_.experts[(size_t) l];
         w.gu_type = el.gu_type;
         w.d_type = el.d_type;
         w.blob_bytes = el.blob_bytes;
-        const uint64_t eb = (uint64_t) g.n_expert * el.blob_bytes;
+        w.expert_stride = expert_stride(el.gu_type, el.blob_bytes);
+        const uint64_t eb = (uint64_t) g.n_expert * w.expert_stride;
         if (!(w.experts = device_buf(eb))) return fail("out of device memory loading layer " + std::to_string(l) + "'s experts");
-        core::LoadItem it;
-        it.file = file;
-        it.off = pack_.experts_range.offset + el.offset;
-        it.bytes = eb;
-        it.dev = w.experts;
-        it.device = device_;
-        reads.add(it);
+        if (w.expert_stride == el.blob_bytes) {
+            core::LoadItem it;
+            it.file = file;
+            it.off = pack_.experts_range.offset + el.offset;
+            it.bytes = eb;
+            it.dev = w.experts;
+            it.device = device_;
+            reads.add(it);
+        } else {
+            cudaMemset(w.experts, 0, eb);
+            for (int e = 0; e < g.n_expert; ++e) {
+                core::LoadItem it;
+                it.file = file;
+                it.off = pack_.experts_range.offset + el.offset + (uint64_t) e * el.blob_bytes;
+                it.bytes = el.blob_bytes;
+                it.dev = w.experts + (uint64_t) e * w.expert_stride;
+                it.device = device_;
+                reads.add(it);
+            }
+        }
         experts += eb;
     }
     fp8_ = req.kv == "fp8";
