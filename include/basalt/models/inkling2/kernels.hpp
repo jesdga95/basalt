@@ -7,6 +7,8 @@
 // depends on how many rows share its call or where it sits among them. `stream` may be null (the call then synchronises).
 #pragma once
 
+#include "basalt/kernels/window_segs.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -52,6 +54,25 @@ void ctrl_pair_norm(const float* dest, const float* msg, int rows, float* pair, 
 /// out[r] = (1 - tanh(f[r])) dest[r] + tanh(g[r]) msg[r], with gf[r] = [g | f] (2 kWidth). `out` may be `dest`.
 void ctrl_blend(const float* dest, const float* msg, const float* gf, int rows, float* out, void* stream);
 
+// ---- batch windows ----------------------------------------------------------------------------------------------------
+
+/// One conversation's caches of a visit in a batch window: what its rows read and write in place of the arguments' own.
+struct SegCaches {
+    void* k = nullptr;
+    void* v = nullptr;
+    float* k_ring = nullptr;
+    float* v_ring = nullptr;
+    float* a_ring = nullptr;
+    float* m_ring = nullptr;
+};
+/// A decode window of several conversations (docs/design/batching.md): segment i's rows (at.row0[i]..) take c[i]'s caches,
+/// and a row's convolutions read only the rows of its own segment before it. at.n = 0 (the default): one conversation, the
+/// arguments' own caches. Every row gives the bits it gives in its conversation's own call.
+struct Segments {
+    basalt::kernels::WindowSegs at;
+    SegCaches c[kDecodeRows];
+};
+
 // ---- attention ---------------------------------------------------------------------------------------------------------
 
 /// What a visit's attention preparation reads and writes.
@@ -77,6 +98,7 @@ struct AttnPrep {
     float* q = nullptr;                ///< out: the clipped (and scaled) queries [rows][kHeads][kHeadDim]
     float* r = nullptr;                ///< out: the relative states [rows][kHeads][kRel]
     float* sink = nullptr;             ///< out: [rows][kHeads]
+    Segments seg;                      ///< a batch window's (decode_prepare only): each segment's caches and rings
 };
 /// Convolves the window's keys and values (positions before the window read from the rings, below position 0 zero),
 /// clips the keys, norms the values, writes both to the cache, and prepares q, r and the sinks. Then the rings take the
@@ -99,6 +121,7 @@ struct AttnArgs {
     const float* gate = nullptr;       ///< set: the output is gated by sigmoid(gate[r * gate_ld + h * kHeadDim + d])
     int64_t gate_ld = 0;
     void* q8 = nullptr;                ///< set: the (gated) output also as q8_1 blocks, [rows][kHeads * kHeadDim / 32]
+    Segments seg;                      ///< a batch window's: each segment's caches
 };
 /// Bytes of scratch attention_decode needs for `rows` rows over at most `max_keys` keys.
 size_t attention_decode_scratch(int rows, int64_t max_keys);
@@ -200,7 +223,8 @@ void decode_prepare(const AttnPrep& a, int rows, void* stream);
 
 /// A decode window's attention from its projections: decode_prepare(pa) then attention_decode(a) into a.q8 (which must be
 /// set; a's q, r and sink are pa's outputs), the same bits. A window of up to 3 rows whose keys split in at most 8 slices
-/// (max_keys up to 1024) runs as one kernel: a cluster of blocks a row and key/value head prepares, attends and merges.
+/// (max_keys up to 1024) runs as one kernel: a cluster of blocks a row and key/value head prepares, attends and merges. A
+/// batch window (pa.seg and a.seg set alike) keeps the two calls.
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream);
 
 /// After the attention's output projection: its convolution over `o` (the ring for the positions before the window) plus
@@ -223,6 +247,7 @@ struct PostAttn {
     void* q8 = nullptr;
     float* norm_out = nullptr;
     float* mix_out = nullptr;
+    Segments seg;                      ///< a batch window's: each segment's ring (a_ring)
 };
 void post_attn(const PostAttn& a, int rows, void* stream);
 
@@ -238,6 +263,7 @@ struct MoeFinish {
     const float* resid = nullptr;
     float* out = nullptr;
     float* tap = nullptr;              ///< set: the output rows also here (the drafter's copy of the next visit's input)
+    Segments seg;                      ///< a batch window's: each segment's ring (m_ring)
 };
 void moe_finish(const MoeFinish& a, int rows, void* stream);
 

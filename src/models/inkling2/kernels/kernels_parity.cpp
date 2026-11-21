@@ -1007,6 +1007,172 @@ void test_moe_finish() {
     std::printf("  %.1f us a call (1 row)\n", time_us([&] { moe_finish(one, 1, nullptr); }));
 }
 
+// A batch window (several conversations' rows in one call, docs/design/batching.md) against each conversation's own call:
+// the attention's q8_1 output, caches and rings, post_attn's and moe_finish's outputs and rings, bitwise. Three segments
+// of 3, 1 and 2 rows (one at position 1, one past the window ring's wrap), over a window ring and a full cache, fp16 and E4M3.
+void test_batch_window() {
+    struct Seg { int p0, T; };
+    const Seg segs[3] = {{300, 3}, {1, 1}, {2900, 2}};
+    const int S = 3, R = 6, row0[S + 1] = {0, 3, 4, 6};
+    Segments sg;
+    sg.at.n = S;
+    for (int i = 0; i <= S; ++i) sg.at.row0[i] = row0[i];
+    std::vector<int> pos(R);
+    for (int i = 0; i < S; ++i)
+        for (int t = 0; t < segs[i].T; ++t) pos[row0[i] + t] = segs[i].p0 + t;
+    int* dpos = dev(pos);
+    const size_t q8_row = (size_t) kHeads * kHeadDim / 32 * 36;
+    for (bool fp8 : {false, true})
+        for (bool window : {true, false}) {
+            const int64_t cap = window ? kExtent + 8 : 4096;
+            const size_t n_kv = (size_t) kKvHeads * cap * kHeadDim, elem = fp8 ? 1 : 2, kvb = n_kv * elem, ringb = (size_t) kConvRing * 1024;
+            std::vector<std::vector<uint8_t>> kc(S, std::vector<uint8_t>(kvb)), vc(S, std::vector<uint8_t>(kvb));
+            std::vector<std::vector<float>> kr(S), vr(S);
+            for (int i = 0; i < S; ++i) {
+                for (size_t j = 0; j < n_kv; ++j) {
+                    const float kf = randn(1, 0.6f)[0], vf = randn(1, 1.0f)[0];
+                    if (fp8) {
+                        kc[i][j] = __nv_fp8_e4m3(kf).__x;
+                        vc[i][j] = __nv_fp8_e4m3(vf).__x;
+                    } else {
+                        const uint16_t a = f2h(kf), b = f2h(vf);
+                        std::memcpy(&kc[i][2 * j], &a, 2);
+                        std::memcpy(&vc[i][2 * j], &b, 2);
+                    }
+                }
+                kr[i] = randn(ringb, 2.0f);
+                vr[i] = randn(ringb, 0.6f);
+            }
+            const std::vector<float> y = randn((size_t) R * kProj, 1.5f);
+            const std::vector<float> tk = randn(1024 * kConv, 0.3f), tv = randn(1024 * kConv, 0.3f);
+            const std::vector<float> qs = randn(kHeads * kHeadDim, 0.2f, 1.f), rsc = randn(kHeads * kRel, 0.2f, 1.f);
+            const std::vector<float> table = randn((size_t) kRel * kExtent, 0.3f);
+            float* dy = dev(y);
+            const auto prep_of = [&](int r0, int rows, const int* p) {
+                AttnPrep a;
+                a.yq = dy + (size_t) r0 * kProj; a.yk = a.yq + kProjQ; a.yv = a.yq + kProjQ + kProjKV; a.ldq = a.ldk = a.ldv = kProj;
+                a.pos = p; a.full = !window; a.k_conv = dev(tk); a.v_conv = dev(tv); a.q_scale = dev(qs); a.r_scale = dev(rsc);
+                a.cap = cap; a.fp8 = fp8;
+                a.q = zeros<float>((size_t) rows * kHeads * kHeadDim); a.r = zeros<float>((size_t) rows * kHeads * kRel);
+                a.sink = zeros<float>((size_t) rows * kHeads);
+                return a;
+            };
+            const auto args_of = [&](const AttnPrep& p, int rows) {
+                AttnArgs a;
+                a.q = p.q; a.r = p.r; a.sink = p.sink; a.rel_table = dev(table); a.pos = p.pos; a.k_cache = p.k_cache; a.v_cache = p.v_cache;
+                a.cap = cap; a.fp8 = fp8; a.window = window ? kExtent : 0; a.gate = p.yq + kOffGate; a.gate_ld = kProj;
+                a.q8 = zeros<uint8_t>((size_t) rows * q8_row);
+                return a;
+            };
+            const auto keys_of = [&](int64_t last) {
+                int64_t mk = 1024;
+                while (mk < last + 1) mk <<= 1;
+                return window ? (int64_t) kExtent : mk;
+            };
+            // each conversation alone (its own call: the fused kernel for these rows), then all of them in one call
+            std::vector<AttnPrep> ps(S);
+            std::vector<AttnArgs> as(S);
+            for (int i = 0; i < S; ++i) {
+                ps[i] = prep_of(row0[i], segs[i].T, dpos + row0[i]);
+                ps[i].k_ring = dev(kr[i]); ps[i].v_ring = dev(vr[i]); ps[i].k_cache = dev(kc[i]); ps[i].v_cache = dev(vc[i]);
+                as[i] = args_of(ps[i], segs[i].T);
+                const int64_t mk = keys_of(segs[i].p0 + segs[i].T - 1);
+                attention_window(ps[i], as[i], segs[i].T, mk, zeros<uint8_t>(attention_decode_scratch(segs[i].T, mk)), nullptr);
+            }
+            AttnPrep pb = prep_of(0, R, dpos);
+            pb.seg = sg;
+            for (int i = 0; i < S; ++i) {
+                SegCaches& c = pb.seg.c[i];
+                c.k = dev(kc[i]); c.v = dev(vc[i]); c.k_ring = dev(kr[i]); c.v_ring = dev(vr[i]);
+            }
+            pb.k_cache = pb.seg.c[0].k; pb.v_cache = pb.seg.c[0].v; pb.k_ring = pb.seg.c[0].k_ring; pb.v_ring = pb.seg.c[0].v_ring;
+            AttnArgs ab = args_of(pb, R);
+            ab.seg = pb.seg;
+            const int64_t mkb = keys_of(2901);
+            attention_window(pb, ab, R, mkb, zeros<uint8_t>(attention_decode_scratch(R, mkb)), nullptr);
+            cudaDeviceSynchronize();
+            bool same = true;
+            const std::vector<uint8_t> q8b = host((uint8_t*) ab.q8, (size_t) R * q8_row);
+            for (int i = 0; i < S; ++i) {
+                const std::vector<uint8_t> q8s = host((uint8_t*) as[i].q8, (size_t) segs[i].T * q8_row);
+                same = same && !std::memcmp(q8s.data(), q8b.data() + (size_t) row0[i] * q8_row, q8s.size()) &&
+                       host((uint8_t*) ps[i].k_cache, kvb) == host((uint8_t*) pb.seg.c[i].k, kvb) &&
+                       host((uint8_t*) ps[i].v_cache, kvb) == host((uint8_t*) pb.seg.c[i].v, kvb) &&
+                       host(ps[i].k_ring, ringb) == host(pb.seg.c[i].k_ring, ringb) && host(ps[i].v_ring, ringb) == host(pb.seg.c[i].v_ring, ringb);
+            }
+            char tag[96];
+            std::snprintf(tag, sizeof tag, "batch window: attention (%s%s)", window ? "window" : "full", fp8 ? ", E4M3" : "");
+            std::printf("%-46s %s\n", tag, same ? "bitwise = each conversation alone" : "FAIL");
+            failures += !same;
+        }
+    // post_attn and moe_finish: each conversation's ring and its own rows before it
+    const int nb = 2, K = 8;
+    const std::vector<float> o = randn((size_t) R * E, 0.4f), taps = randn((size_t) E * kConv, 0.3f), hid = randn((size_t) R * E, 1.0f),
+                             q = randn(E, 0.05f), w = randn(E, 0.1f, 1.f), xr = randn((size_t) R * K * E, 0.3f), xw = randn((size_t) R * K, 0.3f, 1.f),
+                             mt = randn((size_t) E * kConv, 0.3f), mres = randn((size_t) R * E, 1.0f);
+    std::vector<std::vector<float>> blocks(nb), ar(S), mr(S);
+    for (int i = 0; i < nb; ++i) blocks[i] = randn((size_t) R * E, 0.7f + 0.5f * i);
+    for (int i = 0; i < S; ++i) {
+        ar[i] = randn((size_t) kConvRing * E, 0.4f);
+        mr[i] = randn((size_t) kConvRing * E, 0.4f);
+    }
+    float *d_o = dev(o), *d_hid = dev(hid), *d_xr = dev(xr), *d_xw = dev(xw), *d_mres = dev(mres);
+    std::vector<float*> d_blocks;
+    for (auto& b : blocks) d_blocks.push_back(dev(b));
+    const auto post_of = [&](int r0, int rows) {
+        PostAttn a;
+        for (int i = 0; i < nb; ++i) a.blocks[a.n_blocks++] = d_blocks[i] + (size_t) r0 * E;
+        a.o = d_o + (size_t) r0 * E; a.pos = dpos + r0; a.taps = dev(taps); a.hid = d_hid + (size_t) r0 * E;
+        a.resid = zeros<float>((size_t) rows * E); a.query = dev(q); a.norm = dev(w);
+        a.q8 = zeros<uint8_t>((size_t) rows * E / 32 * 36); a.norm_out = zeros<float>((size_t) rows * E);
+        return a;
+    };
+    const auto moe_of = [&](int r0, int rows) {
+        MoeFinish a;
+        a.rows = d_xr + (size_t) r0 * K * E; a.w = d_xw + (size_t) r0 * K; a.k = K; a.pos = dpos + r0; a.taps = dev(mt);
+        a.resid = d_mres + (size_t) r0 * E; a.out = zeros<float>((size_t) rows * E);
+        return a;
+    };
+    std::vector<PostAttn> pa(S);
+    std::vector<MoeFinish> ma(S);
+    for (int i = 0; i < S; ++i) {
+        pa[i] = post_of(row0[i], segs[i].T);
+        pa[i].ring = dev(ar[i]);
+        post_attn(pa[i], segs[i].T, nullptr);
+        ma[i] = moe_of(row0[i], segs[i].T);
+        ma[i].ring = dev(mr[i]);
+        moe_finish(ma[i], segs[i].T, nullptr);
+    }
+    PostAttn pb = post_of(0, R);
+    MoeFinish mb = moe_of(0, R);
+    pb.seg = mb.seg = sg;
+    for (int i = 0; i < S; ++i) {
+        pb.seg.c[i].a_ring = dev(ar[i]);
+        mb.seg.c[i].m_ring = dev(mr[i]);
+    }
+    pb.ring = pb.seg.c[0].a_ring;
+    mb.ring = mb.seg.c[0].m_ring;
+    post_attn(pb, R, nullptr);
+    moe_finish(mb, R, nullptr);
+    cudaDeviceSynchronize();
+    bool post_same = true, moe_same = true;
+    const size_t ring_e = (size_t) kConvRing * E;
+    const std::vector<float> nb_all = host(pb.norm_out, (size_t) R * E), res_all = host(pb.resid, (size_t) R * E), out_all = host(mb.out, (size_t) R * E);
+    const std::vector<uint8_t> q8_all = host((uint8_t*) pb.q8, (size_t) R * E / 32 * 36);
+    for (int i = 0; i < S; ++i) {
+        const size_t n = (size_t) segs[i].T * E, at = (size_t) row0[i] * E;
+        post_same = post_same && !std::memcmp(host(pa[i].norm_out, n).data(), nb_all.data() + at, n * 4) &&
+                    !std::memcmp(host(pa[i].resid, n).data(), res_all.data() + at, n * 4) &&
+                    !std::memcmp(host((uint8_t*) pa[i].q8, n / 32 * 36).data(), q8_all.data() + at / 32 * 36, n / 32 * 36) &&
+                    host(pa[i].ring, ring_e) == host(pb.seg.c[i].a_ring, ring_e);
+        moe_same = moe_same && !std::memcmp(host(ma[i].out, n).data(), out_all.data() + at, n * 4) &&
+                   host(ma[i].ring, ring_e) == host(mb.seg.c[i].m_ring, ring_e);
+    }
+    std::printf("%-46s %s\n", "batch window: post_attn", post_same ? "bitwise = each conversation alone" : "FAIL");
+    std::printf("%-46s %s\n", "batch window: moe_finish", moe_same ? "bitwise = each conversation alone" : "FAIL");
+    failures += !post_same + !moe_same;
+}
+
 }  // namespace
 
 int main() {
@@ -1029,6 +1195,7 @@ int main() {
     test_post_attn();
     test_expert_prefetch();
     test_moe_finish();
+    test_batch_window();
     std::printf("inkling2_kernels_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }
