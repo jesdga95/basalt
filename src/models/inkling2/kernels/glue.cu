@@ -136,27 +136,25 @@ __device__ __forceinline__ void mix_rows(const float (&v)[kMaxMix][kPer], int n,
 #pragma unroll
             for (int j = 0; j < kWarpsB; ++j) s += red[lane * kWarpsB + j];
         const float inv_l = rsqrtf(s / (float) kWidth + 1e-6f);
-        const float scale = rsqrtf((float) kWidth);
-        float inv[kMaxMix], sc[kMaxMix], m = -INFINITY;
+        // lane i (< n) takes state i: its norm and score, then the softmax over the lanes (the maximum is exact in any
+        // order; the sum in state order)
+        const int i2 = 2 * (lane % kMaxMix);
+        const float ii = __shfl_sync(0xffffffffu, inv_l, i2), dot = __shfl_sync(0xffffffffu, s, i2 + 1);
+        const bool mine = lane < n;
+        const float inv = mine ? ii : 0.f;
+        const float sc = mine ? dot * inv * rsqrtf((float) kWidth) : -INFINITY;
+        float m = sc;
 #pragma unroll
-        for (int i = 0; i < kMaxMix; ++i) {
-            const float ii = __shfl_sync(0xffffffffu, inv_l, 2 * i), dot = __shfl_sync(0xffffffffu, s, 2 * i + 1);
-            inv[i] = i < n ? ii : 0.f;
-            sc[i] = i < n ? dot * inv[i] * scale : -INFINITY;
-            m = fmaxf(m, sc[i]);
-        }
+        for (int o = 4; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));   // lanes 0..7: states, then -inf
+        m = __shfl_sync(0xffffffffu, m, 0);
+        const float e = mine ? expf(sc - m) : 0.f;
         float den = 0.f;
 #pragma unroll
-        for (int i = 0; i < kMaxMix; ++i) {
-            sc[i] = i < n ? expf(sc[i] - m) : 0.f;
-            den += sc[i];
+        for (int i = 0; i < kMaxMix; ++i) den += __shfl_sync(0xffffffffu, e, i);
+        if (lane < kMaxMix) {
+            hand[lane] = e / den;
+            hand[kMaxMix + lane] = inv;
         }
-#pragma unroll
-        for (int i = 0; i < kMaxMix; ++i)
-            if (lane == i) {
-                hand[i] = sc[i] / den;
-                hand[kMaxMix + i] = inv[i];
-            }
     }
     __syncthreads();
 #pragma unroll
