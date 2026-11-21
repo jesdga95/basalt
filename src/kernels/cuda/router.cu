@@ -242,6 +242,14 @@ void router(const float* x, const float* gate, const float* bias, int n_tokens, 
         router_logits_kernel<<<dim3(a.n_expert, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
             x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
     }
+    router_select(logits, bias, n_tokens, a, ids, weights, stream);
+}
+
+void router_select(const float* logits, const float* bias, int n_tokens, const RouterArgs& a, int32_t* ids, float* weights,
+                   void* stream) {
+    if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.k < 1 || a.k > 16 || a.k > a.n_expert)
+        throw std::invalid_argument("router_select: unsupported geometry");
+    cudaStream_t st = (cudaStream_t) stream;
     if (a.prior > 0.0f && a.held.n > 0)
         router_select_kernel<true><<<n_tokens, a.n_expert, 0, st>>>(logits, bias, a.n_expert, a.k, a.weight_scale, (int) a.gate, ids,
                                                                     weights, a.held, a.prior);

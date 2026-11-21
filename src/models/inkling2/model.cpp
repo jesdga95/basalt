@@ -320,7 +320,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t spare = kCardSpare + vision_room;   // [vision]
         const uint64_t avail = free_b > spare ? (free_b - spare) / (uint64_t) std::max(req.sessions, 1) : 0;
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c, kDecodeRows) : 0);
+            return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c, std::max(kDecodeRows, kPromptChunk)) : 0);
         };
         const uint64_t need = bytes_at(want);
         if (need > avail) {

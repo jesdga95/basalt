@@ -153,6 +153,57 @@ __global__ void __launch_bounds__(32) bf16_rows_dot_kernel(const float* __restri
         }
 }
 
+// y[t][n] = sum_k x[t][k] w[n][k] in fp32: a block of 128 threads per 32 rows x 64 outputs, K in steps of 16 through shared
+// memory (both tiles k-major), each thread 4 rows x 4 outputs. Every output sums its products in k order, so a row's result
+// does not depend on the rows beside it.
+constexpr int FD_T = 32, FD_N = 64, FD_K = 16;
+__global__ void __launch_bounds__(128) f32_rows_dot_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                                           float* __restrict__ y, int64_t T, int64_t N, int64_t K) {
+    __shared__ __align__(16) float xs[FD_K][FD_T + 4];
+    __shared__ __align__(16) float ws[FD_K][FD_N + 4];
+    const int tid = threadIdx.x, tr = tid / (FD_N / 4), tc = tid % (FD_N / 4);
+    const int64_t t0 = (int64_t) blockIdx.x * FD_T, n0 = (int64_t) blockIdx.y * FD_N;
+    float acc[4][4] = {};
+    for (int64_t k0 = 0; k0 < K; k0 += FD_K) {
+        {
+            const int r = tid / 4, kq = (tid % 4) * 4;
+            const float4 v = *reinterpret_cast<const float4*>(x + min(t0 + r, T - 1) * K + k0 + kq);
+            xs[kq][r] = v.x;
+            xs[kq + 1][r] = v.y;
+            xs[kq + 2][r] = v.z;
+            xs[kq + 3][r] = v.w;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int n = r + h * FD_T;
+                const float4 u = *reinterpret_cast<const float4*>(w + min(n0 + n, N - 1) * K + k0 + kq);
+                ws[kq][n] = u.x;
+                ws[kq + 1][n] = u.y;
+                ws[kq + 2][n] = u.z;
+                ws[kq + 3][n] = u.w;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < FD_K; ++k) {
+            const float4 a = *reinterpret_cast<const float4*>(&xs[k][tr * 4]);
+            const float4 b = *reinterpret_cast<const float4*>(&ws[k][tc * 4]);
+            const float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int64_t t = t0 + tr * 4 + i, n = n0 + tc * 4 + j;
+            if (t < T && n < N) y[t * N + n] = acc[i][j];
+        }
+}
+
 // The GDN a/b projections of a prompt chunk with the gates fused: a and b are the first and last HV (= 48) rows of w
 // [2 HV][K] (BF16), gate[t][h] = softplus(a + dt[h]) * ssm_a[h], beta[t][h] = sigmoid(b) - the expressions of gdn_gates.
 // The product runs on BF16 tensor cores (m16n8k16): x is split into two BF16 terms (hi + lo, about 17 bits of x; the BF16
@@ -573,6 +624,14 @@ void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64
     bf16_rows_dot_kernel<<<dim3((unsigned) ((T + RD_T - 1) / RD_T), (unsigned) ((N + RD_N - 1) / RD_N)), 32, 0,
                            (cudaStream_t) stream>>>(x, w, y, T, N, K);
     check("bf16_rows_dot");
+}
+
+void f32_rows_dot(const float* x, const float* w, float* y, int64_t T, int64_t N, int64_t K, void* stream) {
+    if (T <= 0) return;
+    if (K % FD_K != 0) { basalt::log::error("basalt", "f32_rows_dot: K %lld", (long long) K); std::exit(1); }
+    f32_rows_dot_kernel<<<dim3((unsigned) ((T + FD_T - 1) / FD_T), (unsigned) ((N + FD_N - 1) / FD_N)), 128, 0,
+                          (cudaStream_t) stream>>>(x, w, y, T, N, K);
+    check("f32_rows_dot");
 }
 
 void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,

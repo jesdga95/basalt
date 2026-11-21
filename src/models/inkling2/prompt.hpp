@@ -13,6 +13,11 @@
 
 namespace basalt::models::inkling2 {
 
+class DsparkHook;
+
+/// The most rows one prompt chunk runs (the drafter's tap holds as many).
+constexpr int kPromptChunk = 2048;
+
 class PromptRunner {
 public:
     virtual ~PromptRunner() = default;
@@ -24,9 +29,10 @@ public:
 };
 
 /// The prompt path over a session's caches and stream; null when the build has none (the session then reads prompts a
-/// decode window at a time).
-std::unique_ptr<PromptRunner> make_prompt(InklingModel& m, const std::vector<VisitCache>& caches, void* stream,
-                                          std::string& err);
+/// decode window at a time). With the drafter on, a chunk fills its tap (up to kPromptChunk rows) and commits its rows'
+/// context, as a decode window does.
+std::unique_ptr<PromptRunner> make_prompt(InklingModel& m, const std::vector<VisitCache>& caches, DsparkHook& dspark,
+                                          void* stream, std::string& err);
 
 /// The device bytes the prompt path adds to a session.
 uint64_t prompt_bytes(const Geometry& g);
