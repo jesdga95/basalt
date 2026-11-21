@@ -44,8 +44,8 @@ row counts. A model captures one graph per composition and keeps the most recent
 ### Scheduling slots x draft rows
 
 The shared engine schedules; a model only states its cap. Each round, every busy slot drafts its next window. With no more
-slots than rows each slot takes its share of the cap (`batch_share`: `cap / n`, the first `cap % n` one more), so one pass
-serves every slot: at a cap of 8, two slots verify 4 rows each, four slots 2 each, eight slots decode one row each. With more
+slots than rows one pass serves every slot (`batch_shares`): each takes one row, then each further row goes to the slot whose
+next draft is likeliest kept (the joint of its drafts' calibrated chances), and rows no draft wants go round the slots. With more
 slots than rows each may take the cap and the windows are packed first fit into passes of at most `cap` rows
 (`batch_groups`). A lone window runs as `decode_window`, the solo path. The engine keeps one draft policy for solo windows and
 one for batch windows, whose rounds cost differently.
@@ -54,32 +54,48 @@ one for batch windows, whose rounds cost differently.
 
 Shared code never names a model (`tools/check_model_layering.sh`).
 
-Shared, in `include/basalt` and `src/program`:
-
 | Piece | Where |
 | --- | --- |
 | The session interface: `batch_rows`, `decode_batch`, `draft_batch` | `model/adapter.hpp` |
-| Slot admission, rounds, row shares, groups, per-slot accept and output | `src/program/serve/session_engine.cpp`, `batch_plan.hpp` |
-| A batch window's segments from the requests (rows, per-row positions and tokens, checks) and the graph cache keyed by composition | `model/batch_window.hpp` |
+| Slot admission, rounds, row shares by the drafts' chances, groups, per-slot accept and output | `src/program/serve/session_engine.cpp`, `batch_plan.hpp` |
+| The driver: `decode_batch` for any model (checks, segments, head rows, graph per composition, stream order, one sync, picks) | `model/batch_driver.hpp` (`BatchSession`) |
+| A batch window's segments (rows, per-row positions and tokens) and the graph cache keyed by composition | `model/batch_window.hpp` |
 | The device form of the segment table and a row's segment lookup, for any model's kernels | `kernels/window_segs.hpp` |
 | Segment-aware shared kernels: attention (`gqa_decode_attn_segs`), GDN recurrence (`dec_gdn_rec_seg`) | `kernels/gqa_attn.hpp`, `kernels/gdn_window.hpp` |
-| Identity and throughput check across slot counts | `tools/batch_identity.py` |
+| The conformance check: solo windows against the same windows batched, bitwise | `model/batch_check.hpp`, `--diag-batch-check` |
+| Serve identity and throughput across slot counts against one slot | `tools/batch_identity.py` |
 
-A model provides:
+### Per-slot state and shared scratch
 
-- its per-slot state, allocated per session;
-- segment-aware forms of its stateful kernels: attention over per-segment caches, convolutions that stop at their segment's
-  first row, recurrences that start each segment from its own state;
-- `decode_batch`: stage the window on one session's scratch (the leader, the group's first), run the pass, then hand each
-  session its rows: logits, picks, drafter features;
-- `batch_rows`: the cap its kernels allow (the widest window its row-invariant products take).
+A session holds only its conversation: caches, rings, recurrent state, the drafter's context, its sampler and its last
+logits. Everything one forward call needs and drops when it ends (row buffers, activations, expert staging, attention and
+product workspaces, the prompt path's chunk buffers, a drafter's tap) is the model's shared scratch, allocated once for every
+session. That is safe because the engine runs one call at a time: each session call syncs its stream before it returns, and
+the driver syncs every session's stream before a batch runs on the leader's. A model sizes its memory as per-session state
+times the slots plus the shared scratch once, so more slots cost only their caches.
+
+### Adding batching to a model
+
+1. Split the session's allocations: per-slot state in the session, the forward scratch in one object the sessions share.
+2. Make each stateful kernel take a `kernels::WindowSegs` beside each segment's state: attention over that segment's cache,
+   convolutions that stop at the segment's first row, recurrences from the segment's own state. Prove each with a kernel
+   parity test: several conversations in one call bitwise equal to each alone.
+3. Derive the session from `model::BatchSession` and write its hooks: `batch_rows` (the widest row-invariant window),
+   `batch_name`, `batch_context`, `batch_shared`, `batch_stream`, `batch_reserve` (room for positions), `batch_stage` (rows'
+   tokens and positions to the card, the launch bounds into the graph key), `batch_forward` (launches only: the layers over
+   the segments and the head), `batch_take` (a segment's logits rows into its session, its history) and `batch_draw` (its
+   draws, queued).
+4. Run the checks: `basalt --model FILE --batch 4 --tokens-file PROMPT --diag-batch-check` (every row of every composition
+   bitwise its solo window), then `tools/batch_identity.py ENGINE --model FILE --slots 1,2,4,8` (every slot's tokens, alone
+   and together, equal to a one-slot engine's).
 
 ## Flash-Next and 27B
 
-- **Qwen3.8-27B** (the dense stack, `src/dense`) is on this interface: `decode_batch` packs segments (`BatchSeg`) into one
-  window of up to 16 rows, attention through `gqa_decode_attn_segs`, GDN through `dec_gdn_rec_seg_split`, one graph per
-  composition (`Model::batch_graphs`, least recently used out at 64). Its graph cache moves onto `model/batch_window.hpp`
-  when next touched; nothing else changes.
+- **Qwen3.8-27B** (the dense stack, `src/dense`) has its own `decode_batch`: it packs segments (`BatchSeg`) into one window
+  of up to 16 rows, attention through `gqa_decode_attn_segs`, GDN through `dec_gdn_rec_seg_split`, one graph per composition
+  (`Model::batch_graphs`). On the driver its `BatchSeg` packing becomes `batch_stage`, the layer walk `batch_forward` (its
+  kernels already read segments), the logits and MTP or DFlash taps per segment `batch_take`, its sampler `batch_draw`;
+  `Model::batch_graphs` goes for `BatchShared`. Its sessions already share the stack's buffers.
 - **Qwen3.8-Flash-Next** (`src/models/qwen4exp`) has its own runtime (`serve::Runtime`) and verifier: `Verifier::stage_batch`
   takes per-row slot ids and lengths over its elastic KV arena. It is the most tuned path in the engine and already batches
   slots x drafts in one pass. It does not migrate: a rewrite onto the shared runtime gains nothing measurable and risks its
@@ -99,12 +115,14 @@ Every model below runs `--parallel N` today as N sessions whose windows run one 
   itself, `post_attn` (the attention output's convolution), `moe_finish` (the experts' sum's convolution), and `mix_norm`'s
   L2 read-ahead of older cells. Each takes a segment table (`Segments` in its args: per segment its first row and its caches);
   without one (n = 0) the call is one conversation's, as today.
-- **The fused small-window attention** (1 to 3 rows, one cluster kernel) stays solo-only at first; a batch takes the
-  prepare, split and combine kernels, which give the same bits. A segment-aware fused kernel is the follow-up.
+- **The fused small-window attention** (1 to 3 rows, one cluster kernel) stays solo-only; a batch takes the prepare, split
+  and combine kernels, which give the same bits.
 - **Cap:** 8 rows, the products' column limit (`kDecodeRows`).
-- **decode_batch:** the leader stages every row's token and position, runs the visits with each segment's caches, copies
-  each segment's logits rows and drafter taps into its own session, commits each session's drafter context at its positions,
-  and samples each session with its own sampler.
+- **On the driver:** `batch_stage` stages every row's token and position, `batch_forward` runs the visits with each
+  segment's caches, then the head over every row into the shared batch logits, and commits each session's drafter context
+  from its rows of the shared tap; `batch_take` copies a segment's head rows into its session's logits; `batch_draw` samples
+  with the session's own sampler into its pinned picks.
+- **Shared:** the forward's row buffers and expert scratch, the prompt path (its chunk buffers) and the drafter's tap.
 
 ### Hy4-flash
 
@@ -158,10 +176,14 @@ rows.
 
 - **Kernel parity:** each segment-aware kernel against the same segments run one call each, bitwise
   (`<model>_kernels_parity`).
+- **Batch check** (`--diag-batch-check`, `model/batch_check.hpp`): through the session interface only, windows of 1 to 3
+  rows of several sessions alone, then batched in order, in reverse order and in pairs; every row's pick and each window's
+  last logits bitwise the solo window's.
 - **CLI identity:** greedy tokens of the branch against main, plain and drafted (`--spec 1` and default), short and 16K
   prompts: `--parallel 1` is unchanged.
-- **Serve identity** (`tools/batch_identity.py`): the engine with `--batch N`; each prompt runs alone in slot 0, then all
-  run together, one per slot; every slot's tokens must equal its alone run, greedy, at 2, 4 and 8 slots.
+- **Serve identity** (`tools/batch_identity.py`): each prompt first in a one-slot engine (`--batch 1`), then in an engine
+  with `--batch N` alone in slot 0 and all together, one per slot; every slot's tokens must equal the one-slot run's, greedy,
+  at 2, 4 and 8 slots.
 - **Throughput:** the same tool's aggregate tokens per second (every slot's tokens over the wall time from the first slot's
   start to the last one's end) at 1, 2, 4 and 8 slots, drafting on and with `--spec 1`, main against the branch, the bench
   fixtures (conv, struct, prose). Labelled with the cards and power (400 W RTX 5090, 180 W RTX 5060 Ti). Main's numbers are
