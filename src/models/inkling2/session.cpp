@@ -51,6 +51,7 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(InklingModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
+        prompt_.reset();   // it runs on stream_ and syncs it as it goes
         if (stream_) cudaStreamSynchronize(stream_);
         for (void* p : bufs_) cudaFree(p);
         for (void* p : pinned_) cudaFreeHost(p);
