@@ -21,6 +21,7 @@
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
+#include "basalt/model/batch_window.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/program/expert_spill.hpp"
 #include "models/inkling2/caches.hpp"
@@ -203,6 +204,66 @@ public:
                 cudaMemcpyAsync(r.logits, logits_ + (size_t) (head - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the window failed"};
+        return {};
+    }
+
+    // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
+    // session's scratch and stream. Each conversation keeps its caches and rings (the kernels take them per segment), its
+    // drafter's context, its logits and its draws; a row gives the bits it gives in its own window.
+    int batch_rows() const override { return kMaxRows; }
+
+    model::Result decode_batch(model::ModelSession* const* peers, const model::DecodeRequest* reqs, int n) override {
+        if (n == 1) return peers[0]->decode_window(reqs[0]);
+        Batch b;
+        std::string err;
+        for (int i = 0; i < n; ++i) {
+            Session* s = dynamic_cast<Session*>(peers[i]);
+            if (s == nullptr || &s->m_ != &m_ || std::find(b.ss.begin(), b.ss.end(), s) != b.ss.end())
+                return {model::Status::Error, "inkling2: a batch of sessions that are not distinct sessions of this model"};
+            b.ss.push_back(s);
+        }
+        if (b.ss[0] != this) return {model::Status::Error, "inkling2: a batch runs on its first session"};
+        if (!b.w.build(reqs, n, kMaxRows, m_.context(), err)) return {model::Status::Error, "inkling2: " + err};
+        for (int i = 0; i < n; ++i) {
+            Session& se = *b.ss[(size_t) i];
+            if (!se.ensure_positions(reqs[i].pos + reqs[i].n_tokens, err)) return {model::Status::Refused, "inkling2: " + err};
+            if (&se != this && cudaStreamSynchronize(se.stream_) != cudaSuccess)   // this stream writes its caches now
+                return {model::Status::Error, "inkling2: a session's stream failed"};
+        }
+        batch_ = &b;
+        const bool ok = forward(b.w.tokens.data(), nullptr, b.w.rows, 0, b.w.rows, err, b.w.positions.data());
+        batch_ = nullptr;
+        if (!ok) return {model::Status::Error, "inkling2: " + err};
+        // each session its rows: its history and drafter record, then its logits (this session's own last, as the batch's
+        // logits are in its buffer) and its draws
+        const int64_t V = g_.n_vocab;
+        std::vector<int> head((size_t) n, 0);
+        for (int i = n - 1; i >= 0; --i) {
+            Session& se = *b.ss[(size_t) i];
+            const model::DecodeRequest& r = reqs[i];
+            const model::BatchWindow::Seg& sg = b.w.segs[(size_t) i];
+            se.hist_.resize((size_t) r.pos);
+            se.hist_.insert(se.hist_.end(), r.tokens, r.tokens + r.n_tokens);
+            se.dspark_.note(r.pos, r.n_tokens);
+            se.lookups_ += (int64_t) r.n_tokens * g_.n_used * (int64_t) g_.visits.size();
+            const bool want = r.row_tokens || r.next_token || r.logits;
+            head[(size_t) i] = !want ? 0 : r.row_tokens ? sg.rows : 1;
+            se.head_rows_ = head[(size_t) i];
+            const float* src = logits_ + (size_t) (sg.row0 + sg.rows - head[(size_t) i]) * V;
+            if (head[(size_t) i] > 0 && src != se.logits_)
+                cudaMemcpyAsync(se.logits_, src, (size_t) head[(size_t) i] * V * 4, cudaMemcpyDeviceToDevice, stream_);
+        }
+        for (int i = 0; i < n; ++i) {
+            Session& se = *b.ss[(size_t) i];
+            const model::DecodeRequest& r = reqs[i];
+            const int h = head[(size_t) i];
+            if (h == 0) continue;
+            if (!se.pick(r, 0, h, err, stream_)) return {model::Status::Error, "inkling2: " + err};
+            if (r.row_tokens) std::copy(se.picks_.begin(), se.picks_.begin() + h, r.row_tokens);
+            if (r.next_token) *r.next_token = se.picks_[(size_t) h - 1];
+            if (r.logits) cudaMemcpyAsync(r.logits, se.logits_ + (size_t) (h - 1) * V, (size_t) V * 4, cudaMemcpyDeviceToHost, stream_);
+        }
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the batch window failed"};
         return {};
     }
 
@@ -525,8 +586,8 @@ private:
         mn.st.s[mn.st.n++] = hid;
         mn.queries = w.attn_query;
         mn.eps = g_.rms_eps;
-        mn.kv_pos = pos_d_;   // the attention's older cells into L2 while this mix and the projections run
-        mn.kv_k = c.k;
+        mn.kv_pos = batch_ ? nullptr : pos_d_;   // the attention's older cells into L2 while this mix and the projections run
+        mn.kv_k = batch_ ? nullptr : c.k;        // (one conversation's window only)
         mn.kv_v = c.v;
         mn.kv_cap = c.cap;
         mn.kv_window = c.ring ? g_.window : 0;
@@ -634,6 +695,8 @@ private:
         aa.gate = ap.yq + kOffGate;
         aa.gate_ld = ap.ldq;
         aa.q8 = xo_;
+        const Segments seg = segments(v.slot);   // a batch window's: each conversation's caches of this visit
+        ap.seg = aa.seg = seg;
         attention_window(ap, aa, rows, c.ring ? (int64_t) g_.window : full_keys, att_scr_, stream_);
         bk::native_q8_0_mmvq(w.out, xo_, o_, kOutRows, E, rows, stream_);
         // a wider window: the experts this visit took in the window before into L2 on the side stream, while the glue
@@ -651,6 +714,7 @@ private:
         pa.pos = pos_d_;
         pa.taps = w.attn_post_conv;
         pa.ring = c.a_ring;
+        pa.seg = seg;
         pa.hid = hid;
         pa.boundary = g_.boundary(l);
         pa.resid = resid_;
@@ -711,6 +775,7 @@ private:
         mf.pos = pos_d_;
         mf.taps = w.ffn_post_conv;
         mf.ring = c.m_ring;
+        mf.seg = seg;
         mf.resid = resid_;
         mf.out = out;
         mf.tap = tap;
@@ -719,18 +784,39 @@ private:
 
     float* buf(Buf b) const { return role_[(int) b]; }
 
+    // A batch window in flight on this session (decode_batch): its sessions, this one first, and its segments.
+    struct Batch {
+        std::vector<Session*> ss;
+        model::BatchWindow w;
+    };
+    // The kernels' segment table of visit cache `slot` in the batch window in flight (none outside one).
+    Segments segments(int slot) const {
+        Segments s;
+        if (!batch_) return s;
+        s.at = batch_->w.device_segs();
+        for (size_t i = 0; i < batch_->ss.size(); ++i) {
+            const VisitCache& c = batch_->ss[i]->vc_[(size_t) slot];
+            s.c[i] = {c.k, c.v, c.k_ring, c.v_ring, c.a_ring, c.m_ring};
+        }
+        return s;
+    }
+
     // The forward of `rows` rows at positions pos0.. (tokens, or host embedding rows when `emb` is set, which must stay
-    // as they are until the window's sync); then the head over the last `head` rows (0: none).
-    bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err) {
+    // as they are until the window's sync); then the head over the last `head` rows (0: none). A batch window (batch_
+    // set) passes every row's position in `positions` and leaves the drafter's records to decode_batch.
+    bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err,
+                 const int32_t* positions = nullptr) {
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
         // the tokens and positions through a ring of pinned slots: a slot is written again once its copy has run
         const int slot = (int) (stage_n_++ % kStage);
         cudaEventSynchronize(stage_ev_[slot]);
         int32_t* io = io_h_ + (size_t) slot * 2 * kMaxRows;
+        int64_t last = 0;
         for (int i = 0; i < rows; ++i) {
             io[i] = tokens ? tokens[i] : 0;
-            io[kMaxRows + i] = (int32_t) (pos0 + i);
+            io[kMaxRows + i] = positions ? positions[i] : (int32_t) (pos0 + i);
+            last = std::max<int64_t>(last, io[kMaxRows + i]);
         }
         cudaMemcpyAsync(io_d_, io, (size_t) 2 * kMaxRows * 4, cudaMemcpyHostToDevice, stream_);
         cudaEventRecord(stage_ev_[slot], stream_);
@@ -743,15 +829,30 @@ private:
         }
         // the full-attention visits' launch bound: the window's keys rounded up to a power of two
         int64_t full_keys = 1024;
-        while (full_keys < pos0 + rows) full_keys <<= 1;
+        while (full_keys < last + 1) full_keys <<= 1;
         if (!layers(rows, head, full_keys, err) || !check(err)) return false;
-        dspark_.note(pos0, rows);   // DSPARK HOOK: the host's record of the rows the drafter took
+        if (!batch_) dspark_.note(pos0, rows);   // DSPARK HOOK: the host's record of the rows the drafter took
         return true;
     }
 
     // The layers and the head of a window of `rows` rows: replayed from its shape's graph, captured on the shape's second
-    // window (its first runs direct, outside a capture).
+    // window (its first runs direct, outside a capture). A batch window's graphs are keyed by its composition too.
     bool layers(int rows, int head, int64_t full_keys, std::string& err) {
+        if (batch_) {
+            model::GraphLru<core::CapturedGraph>::Key key = {(uint64_t) full_keys, (uint64_t) head};
+            for (size_t i = 0; i < batch_->ss.size(); ++i)
+                key.insert(key.end(), {(uint64_t) (uintptr_t) batch_->ss[i], (uint64_t) batch_->w.segs[i].rows});
+            if (core::CapturedGraph* g = batch_graphs_.find(key)) return g->launch(stream_, err);
+            if (batch_direct_.insert(key).second) {
+                body(rows, head, full_keys);
+                return true;
+            }
+            core::CapturedGraph g;
+            if (!g.begin(stream_, err)) return false;
+            body(rows, head, full_keys);
+            if (!g.end(stream_, err)) return false;
+            return batch_graphs_.insert(std::move(key), std::move(g)).launch(stream_, err);
+        }
         const uint64_t key = ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows;
         auto it = graphs_.find(key);
         if (it != graphs_.end()) return it->second.launch(stream_, err);
@@ -829,7 +930,17 @@ private:
         hn.norm_out = tapped ? dspark_.tap(kDsTargets - 1) : fin_;
         hn.eps = g_.rms_eps;
         mix_norm(hn, 1, n_fin, stream_);
-        if (tapped) dspark_.commit(pos_d_, rows, stream_);   // DSPARK HOOK: the rows' context for the drafter
+        if (tapped && !batch_) dspark_.commit(pos_d_, rows, stream_);   // DSPARK HOOK: the rows' context for the drafter
+        if (tapped && batch_)   // a batch window's: each conversation's rows of the taps into its own drafter, then its context
+            for (size_t i = 0; i < batch_->ss.size(); ++i) {
+                Session& se = *batch_->ss[i];
+                const model::BatchWindow::Seg& sg = batch_->w.segs[i];
+                if (&se != this)
+                    for (int k = 0; k < kDsTargets; ++k)
+                        cudaMemcpyAsync(se.dspark_.tap(k), dspark_.tap(k) + (size_t) sg.row0 * E, (size_t) sg.rows * E * 4,
+                                        cudaMemcpyDeviceToDevice, stream_);
+                se.dspark_.commit(pos_d_ + sg.row0, sg.rows, stream_);
+            }
         if (head <= 0) return;
         const size_t q8_row = (size_t) E / 32 * 36;   // the head's rows' q8_1 blocks follow the rows before them
         bk::native_q8_0_mmvq(m_.head(), (const uint8_t*) xq_[0] + (size_t) (rows - head - first) * q8_row, logits_, E, g_.n_vocab, head,
@@ -864,7 +975,9 @@ private:
         return true;
     }
 
-    bool pick(const model::DecodeRequest& r, int t0, int rows, std::string& err) {
+    // The draws of the `rows` rows of logits_ (on `on`, the session's stream by default: a batch window's leader's).
+    bool pick(const model::DecodeRequest& r, int t0, int rows, std::string& err, cudaStream_t on = nullptr) {
+        const cudaStream_t st = on ? on : stream_;
         bk::SamplerParams sp;
         if (r.sampling) sp = *r.sampling;
         else sp.greedy = true;
@@ -884,13 +997,13 @@ private:
                 }
                 d_hist_len_ = n;
             }
-            cudaMemcpyAsync(d_hist_, r.history + (size_t) t0 * history_len_, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, stream_);
+            cudaMemcpyAsync(d_hist_, r.history + (size_t) t0 * history_len_, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, st);
         }
         sampling_ = sp;
-        bk::sample_tokens(logits_, rows, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, pick_, stream_);
+        bk::sample_tokens(logits_, rows, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, pick_, st);
         picks_.assign((size_t) rows, 0);
-        if (cudaMemcpyAsync(picks_.data(), pick_, (size_t) rows * 4, cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
-            cudaStreamSynchronize(stream_) != cudaSuccess) {
+        if (cudaMemcpyAsync(picks_.data(), pick_, (size_t) rows * 4, cudaMemcpyDeviceToHost, st) != cudaSuccess ||
+            cudaStreamSynchronize(st) != cudaSuccess) {
             err = "the pick failed";
             return false;
         }
@@ -907,6 +1020,10 @@ private:
     Walk walk_;
     std::map<uint64_t, core::CapturedGraph> graphs_;   // by window shape: rows, head rows, the full visits' launch bound
     std::set<uint64_t> direct_;                        // the shapes whose first window has run
+    const Batch* batch_ = nullptr;                     // the batch window in flight, while decode_batch runs it
+    static constexpr size_t kBatchGraphs = 64;
+    model::GraphLru<core::CapturedGraph> batch_graphs_{kBatchGraphs};   // by composition: sessions, rows, bounds
+    std::set<std::vector<uint64_t>> batch_direct_;     // the compositions whose first window has run
     float* role_[kBufs] = {};
     float* emb_ = nullptr;
     float *mix_ = nullptr, *msg_ = nullptr, *ctrl_scr_ = nullptr, *nrm_ = nullptr, *y_ = nullptr;
