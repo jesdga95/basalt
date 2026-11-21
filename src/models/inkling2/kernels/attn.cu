@@ -360,7 +360,6 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     float wt[4][kConv];
     prep::load_weights(pa, g, w, lane, wt);
     bk::pdl_wait();
-    bk::pdl_launch_dependents();
     // the merging blocks' sink and gate, read early
     float sink = 0.f, gate = 0.f;
     if (s < kGroup) {
@@ -392,6 +391,9 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
         }
     }
     __syncthreads();
+    // the dependents in only now: post_attn and the output projection read their weights before their waits, and
+    // started at the wait they put those reads in front of the preparation's (2-3x its time in the window)
+    bk::pdl_launch_dependents();
     if (active) {
         if (valid && key >= p0) {   // a row of this window, as prepared above
             const uint4* kp = reinterpret_cast<const uint4*>(fs.kw[key - p0]);
@@ -534,7 +536,10 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
         b.qs[c % 32] = bk::q8_1_quant(o, dq, amax);
         if ((c & 31) == 0) b.ds = bk::q8_1_ds(dq, sum);
     }
-    cluster.sync();   // no block leaves while the merging blocks still read its slice
+    // no block leaves while the merging blocks still read its slice: an arrival without release semantics (a release
+    // here is a GPU-scope fence that waits for the q8_1 stores to be acknowledged); the merging blocks' remote loads
+    // are complete, their values are in the stores above
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.aligned;" ::: "memory");
 }
 
 int launch_splits(int64_t max_keys) {
