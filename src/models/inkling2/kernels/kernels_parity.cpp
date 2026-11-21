@@ -827,7 +827,8 @@ void test_decode_prepare() {
 void test_attention_window() {
     struct Case { bool window; int p0, R; int64_t cap; };
     const Case cases[] = {{true, 0, 1, kExtent + 8}, {true, 300, 3, kExtent + 8}, {true, 2900, 8, kExtent + 8},
-                          {false, 700, 8, 4096}, {false, 120, 2, 4096}, {false, 2000, 2, 4096}};
+                          {false, 700, 8, 4096}, {false, 120, 2, 4096}, {false, 2000, 2, 4096},
+                          {true, 0, 2, kExtent + 8}, {true, 127, 2, kExtent + 8}, {false, 1, 2, 4096}};   // 2 rows: one slice, a slice each, the ring before position 0
     for (bool fp8 : {false, true})
         for (const Case& k : cases) {
             const int R = k.R;
