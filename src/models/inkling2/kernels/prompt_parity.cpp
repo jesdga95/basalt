@@ -2,7 +2,8 @@
 // a plain CPU reference (double accumulation) and against the decode kernel it stands in for: the prompt attention (window
 // ring with a staged chunk, full cache; fp16 and E4M3), the router's scores as one product with the shared selection, the
 // experts' sort by expert, the softcapped SwiGLU of the MMQ path, and the routed experts as MMQ products (NVFP4 and Q8_0)
-// against native_expert_grouped. Rows are checked for not depending on the chunk's width or their place in it, and timed.
+// against native_expert_grouped, and the NVFP4 experts on the FP4 tensor cores (moe_fp4, activations as two FP4 terms)
+// against a CPU reference that rounds the activations the same way. Rows are checked for not depending on the chunk's width or their place in it, and timed.
 // Exit 77 without a GPU.
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/bf16_gemv.hpp"
@@ -12,6 +13,7 @@
 #include "basalt/kernels/router.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/models/inkling2/prompt_kernels.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
 #include <cuda_fp16.h>
@@ -32,6 +34,7 @@
 using namespace basalt::models::inkling2;
 namespace bk = basalt::kernels;
 namespace mmq = basalt::prefill::mmq;
+namespace fp4 = basalt::prefill::fp4;
 
 namespace {
 
@@ -674,6 +677,177 @@ void test_experts(int type) {
     cudaFree(y2);
 }
 
+// ---- the NVFP4 experts on the FP4 tensor cores (moe_fp4) ------------------------------------------------------------------------------------
+
+float e4m3_round(float v) {
+    const __nv_fp8_storage_t b = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+    return __half2float(__half(__nv_cvt_fp8_to_halfraw(b, __NV_E4M3)));
+}
+// x to the E2M1 grid, nearest, ties to the even code, saturating at 6
+float e2m1_round(float x) {
+    static const float grid[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    const float a = std::fabs(x);
+    int best = 7;
+    for (int i = 0; i < 7; ++i) {
+        const float mid = 0.5f * (grid[i] + grid[i + 1]);
+        if (a < mid || (a == mid && (i % 2) == 0)) { best = i; break; }
+    }
+    return std::copysign(grid[best], x);
+}
+// a row as the FP4 experts round it, dequantized: token scale amax / (6 * 448), per 16 values an E4M3 scale of their
+// largest |value| / 6, then the same for what the first term leaves (two terms)
+std::vector<float> fp4_two_round(const float* x, int cols) {
+    float amax = 0.f;
+    for (int i = 0; i < cols; ++i) amax = std::max(amax, std::fabs(x[i]));
+    const float g = amax * (1.0f / (6.0f * 448.0f)), inv_g = amax > 0.f ? 1.0f / g : 0.f;
+    std::vector<float> out((size_t) cols);
+    for (int b = 0; b < cols / 16; ++b) {
+        float v[16];
+        std::memcpy(v, x + 16 * b, sizeof v);
+        for (int term = 0; term < 2; ++term) {
+            float bm = 0.f;
+            for (int i = 0; i < 16; ++i) bm = std::max(bm, std::fabs(v[i]));
+            const float sd = e4m3_round(bm * inv_g * (1.0f / 6.0f));
+            const float inv = sd > 0.f ? 1.0f / (sd * g) : 0.f;
+            for (int i = 0; i < 16; ++i) {
+                const float q = e2m1_round(v[i] * inv) * (sd * g);
+                out[(size_t) 16 * b + i] = term == 0 ? q : out[(size_t) 16 * b + i] + q;
+                v[i] -= q;
+            }
+        }
+    }
+    return out;
+}
+
+void test_experts_fp4() {
+    const int NE = 128, K = 8, F = 1152, R = 256, P = R * K;
+    Experts ex;
+    ex.make(40, NE, F);
+    std::vector<int32_t> ids((size_t) P);
+    std::vector<int> perm(NE);
+    std::iota(perm.begin(), perm.end(), 0);
+    for (int r = 0; r < R; ++r) {
+        std::shuffle(perm.begin(), perm.end(), rng);
+        for (int s = 0; s < K; ++s) ids[(size_t) r * K + s] = perm[s];
+    }
+    const std::vector<float> w = randn((size_t) P, 0.5f, 1.f), x = randn((size_t) R * E, 1.0f);
+    uint8_t* blobs = dev(ex.blobs);
+    int32_t* dids = dev(ids);
+    float *dw = dev(w), *dx = dev(x);
+    const int RMAX = 2048, PMAX = RMAX * K;
+    int32_t *bounds = zeros<int32_t>(NE + 1), *tok = zeros<int32_t>(PMAX), *dst = zeros<int32_t>(PMAX), *rexp = zeros<int32_t>(PMAX);
+    int32_t *toff = zeros<int32_t>(NE + 1), *boff = zeros<int32_t>(NE + 1);
+    void* scr = zeros<uint8_t>(moe_sort_scratch(PMAX, NE));
+    void* a4x = zeros<uint8_t>(fp4::token_bytes(RMAX, 2 * E));   // two terms a row
+    void* a4h = zeros<uint8_t>(fp4::a4_bytes(PMAX, 2 * F, NE));
+    float *gsx = zeros<float>(RMAX), *gsh = zeros<float>(fp4::scale_count(PMAX, NE));
+    float *h = zeros<float>((size_t) PMAX * F), *o = zeros<float>((size_t) PMAX * E), *y = zeros<float>((size_t) R * E);
+    const auto run = [&](int rows, const int32_t* ids_r, const float* x_r, const float* w_r, float* y_r, bool combine) {
+        const int pairs = rows * K;
+        moe_sort(ids_r, rows, K, NE, scr, bounds, tok, dst, rexp, S);
+        fp4::plan_blocks(bounds, NE, toff, boff, S);
+        fp4::quantize_tokens(x_r, rows, E, E, a4x, gsx, S, true);
+        fp4::Product gu;
+        gu.base = blobs;
+        gu.stride = ex.stride;
+        gu.blk_off = boff;
+        gu.blocks = fp4::max_blocks(pairs, NE);
+        gu.n = NE;
+        gu.w_rows = 2 * F;
+        gu.w_cols = E;
+        gu.a4 = a4x;
+        gu.gs = gsx;
+        gu.bounds = bounds;
+        gu.ids = tok;
+        gu.tokens = rows;
+        gu.swiglu = true;
+        gu.tail_off = ex.L.bytes - 16;
+        gu.gate_softcap = 4.f;
+        gu.up_softcap = 25.f;
+        gu.dst = h;
+        gu.ld_dst = F;
+        gu.two = true;
+        fp4::run(gu, S);
+        fp4::quantize(h, nullptr, bounds, toff, NE, a4h, gsh, F, F, pairs, S, true);
+        fp4::Product d = gu;
+        d.swiglu = false;
+        d.ids = nullptr;
+        d.w_off = ex.L.down_off;
+        d.w_rows = E;
+        d.w_cols = F;
+        d.a4 = a4h;
+        d.gs = gsh;
+        d.tile_off = toff;
+        d.dst = o;
+        d.dst_ids = dst;
+        d.ld_dst = E;
+        fp4::run(d, S);
+        if (combine) moe_combine(o, w_r, rows, K, y_r, S);
+    };
+    run(R, dids, dx, dw, y, true);
+    const std::vector<float> got = host(y, (size_t) R * E);
+    // the CPU reference on the first 8 rows: exact weights, x and H rounded to two FP4 terms
+    std::vector<double> ref((size_t) 8 * E, 0.0);
+    for (int r = 0; r < 8; ++r) {
+        const std::vector<float> xq = fp4_two_round(&x[(size_t) r * E], E);
+        for (int s = 0; s < K; ++s) {
+            const int e = ids[(size_t) r * K + s];
+            const float* t = &ex.tail[(size_t) e * 4];
+            std::vector<float> hh(F);
+            for (int f = 0; f < F; ++f) {
+                double g = 0, u = 0;
+                for (int c = 0; c < E; ++c) {
+                    g += (double) ex.wg[e][(size_t) f * E + c] * xq[(size_t) c];
+                    u += (double) ex.wu[e][(size_t) f * E + c] * xq[(size_t) c];
+                }
+                g *= t[0];
+                u *= t[1];
+                hh[f] = (float) (4.0 * std::tanh(g / 4.0) * sig(g) * 25.0 * std::tanh(u / 25.0) * t[2]);
+            }
+            const std::vector<float> hq = fp4_two_round(hh.data(), F);
+            for (int c = 0; c < E; ++c) {
+                double ov = 0;
+                for (int f = 0; f < F; ++f) ov += (double) ex.wd[e][(size_t) c * F + f] * hq[(size_t) f];
+                ref[(size_t) r * E + c] += (double) w[(size_t) r * K + s] * ov;
+            }
+        }
+    }
+    // a value of H on a rounding edge can take the other code, so the tolerance is a few FP4 steps of one value
+    report("experts FP4 (NVFP4, two terms) vs CPU, 8 rows", std::vector<float>(got.begin(), got.begin() + 8 * E), ref, 2e-2);
+    double se = 0, sr = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        se += (got[i] - ref[i]) * (got[i] - ref[i]);
+        sr += ref[i] * ref[i];
+    }
+    const double rms = std::sqrt(se / std::max(sr, 1e-30));
+    std::printf("%-44s %.3e %s\n", "  relative rms vs CPU", rms, rms < 3e-3 ? "ok" : "FAIL");
+    failures += rms >= 3e-3;
+    // the first 100 rows as a chunk of their own: every row's codes, chain over K and H are its own
+    float* y2 = zeros<float>((size_t) 100 * E);
+    run(100, dids, dx, dw, y2, true);
+    const std::vector<float> g2 = host(y2, (size_t) 100 * E);
+    same_bits("  rows 0..99 as a chunk of their own", g2.data(), got.data(), g2.size() * 4);
+    // timing at a 2,048-row chunk's shape: 16,384 pairs over the 128 experts
+    {
+        std::vector<int32_t> big((size_t) PMAX);
+        for (int r = 0; r < RMAX; ++r) {
+            std::shuffle(perm.begin(), perm.end(), rng);
+            for (int s = 0; s < K; ++s) big[(size_t) r * K + s] = perm[s];
+        }
+        int32_t* bids = dev(big);
+        float *bx = dev(randn((size_t) RMAX * E, 1.f)), *bw = dev(randn((size_t) PMAX, 0.5f, 1.f)), *by = zeros<float>((size_t) RMAX * E);
+        const double us = time_us([&] { run(RMAX, bids, bx, bw, by, true); }, 10);
+        const double fl = 2.0 * PMAX * 3 * F * E;
+        std::printf("  FP4 experts, 2,048 rows: sort + quantize + gate/up + H + down + sum %.0f us (%.0f TOP/s)\n", us, fl / us / 1e6);
+        cudaFree(bids);
+        cudaFree(bx);
+        cudaFree(bw);
+        cudaFree(by);
+    }
+    for (void* p : {(void*) blobs, (void*) dids, (void*) dw, (void*) dx, (void*) bounds, (void*) tok, (void*) dst, (void*) rexp,
+                    (void*) toff, (void*) boff, scr, a4x, a4h, (void*) gsx, (void*) gsh, (void*) h, (void*) o, (void*) y, (void*) y2})
+        cudaFree(p);
+}
 
 // ---- the dense products ------------------------------------------------------------------------------------------------------
 
@@ -805,6 +979,7 @@ int main() {
     test_sort();
     test_swiglu();
     test_experts(40);
+    test_experts_fp4();
     test_experts(8);
     std::printf("inkling2_prompt_parity: %d failures\n", failures);
     return failures ? 1 : 0;
