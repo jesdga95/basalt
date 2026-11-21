@@ -44,7 +44,9 @@ CSF_FIXED, CSF_EXC = ".nvfp4_csf_fixed", ".nvfp4_csf_exceptions"
 class Checkpoint:
     """The safetensors files of a checkpoint directory: name -> (path, absolute offset, dtype, shape, bytes)."""
 
-    def __init__(self, d):
+    def __init__(self, d, side: dict[str, str] | None = None):
+        """`side`: files beside the shards whose tensor names carry no prefix of their own, each mapped to the prefix
+        its names get here (Inkling's `mtp.safetensors` -> `mtp.`)."""
         self.dir = pathlib.Path(d)
         cfg = self.dir / "config.json"
         if not cfg.is_file():
@@ -55,10 +57,11 @@ class Checkpoint:
         self.shards = [p for p in self.files if re.fullmatch(r"model-\d+-of-\d+\.safetensors", p.name)]
         if not self.shards:
             raise S.ConvertError(f"{self.dir}: no model-NNNNN-of-NNNNN.safetensors shards")
+        side = side or {}
         self.t, self.order = {}, []
         for p in self.files:
             head, base = S.read_safetensors_header(p)
-            items = sorted(((k, v) for k, v in head.items() if k != "__metadata__"),
+            items = sorted(((side.get(p.name, "") + k, v) for k, v in head.items() if k != "__metadata__"),
                            key=lambda kv: kv[1]["data_offsets"][0])
             for k, v in items:
                 if k in self.t:
@@ -593,9 +596,12 @@ def f32(v) -> float:
     return float(np.float32(v))
 
 
-def tokenizer_kv(ck: Checkpoint) -> dict:
+def tokenizer_kv(ck: Checkpoint, pre_name: str = "qwen35", split: str = QWEN35_HF_SPLIT,
+                 n_vocab: int | None = None) -> dict:
     """The tokenizer as GGUF metadata (llama.cpp's gpt2 conversion): ids without a token become `[PADn]` (unused),
-    added tokens are control tokens when marked special or written `<|...|>`, other added tokens user-defined."""
+    added tokens are control tokens when marked special or written `<|...|>`, other added tokens user-defined.
+    `pre_name` is the pre-tokenizer the engine runs, `split` the one regex the checkpoint's tokenizer.json must carry
+    for it; `n_vocab` the ids kept (default the config's vocab_size)."""
     d = ck.dir
     tj = json.loads((d / "tokenizer.json").read_text(encoding="utf-8"))
     tcfg = json.loads((d / "tokenizer_config.json").read_text(encoding="utf-8"))
@@ -604,9 +610,9 @@ def tokenizer_kv(ck: Checkpoint) -> dict:
         raise S.ConvertError(f"tokenizer.json: a {model.get('type')} model; only byte-level BPE is converted")
     pre = tj.get("pre_tokenizer") or {}
     splits = [p.get("pattern", {}).get("Regex") for p in pre.get("pretokenizers", []) if p.get("type") == "Split"]
-    if splits != [QWEN35_HF_SPLIT]:
-        raise S.ConvertError("tokenizer.json: the pre-tokenizer is not the qwen35 split")
-    n_vocab = int(ck.text["vocab_size"])
+    if splits != [split]:
+        raise S.ConvertError(f"tokenizer.json: the pre-tokenizer is not the {pre_name} split")
+    n_vocab = int(ck.text["vocab_size"]) if n_vocab is None else int(n_vocab)
     rev = {int(i): t for t, i in model["vocab"].items()}
     added = {int(a["id"]): a for a in tj.get("added_tokens", [])}
     for i, a in added.items():
@@ -635,7 +641,7 @@ def tokenizer_kv(ck: Checkpoint) -> dict:
         return ids.get(v) if v else None
 
     gen = json.loads((d / "generation_config.json").read_text(encoding="utf-8")) if (d / "generation_config.json").is_file() else {}
-    kv = {"tokenizer.ggml.model": "gpt2", "tokenizer.ggml.pre": "qwen35", "tokenizer.ggml.tokens": tokens,
+    kv = {"tokenizer.ggml.model": "gpt2", "tokenizer.ggml.pre": pre_name, "tokenizer.ggml.tokens": tokens,
           "tokenizer.ggml.token_type": types, "tokenizer.ggml.merges": merges}
     eos, pad = token_id("eos_token"), token_id("pad_token")
     bos = token_id("bos_token")

@@ -36,12 +36,12 @@ __device__ __forceinline__ float warp_sum(float v) {
 
 // ---------------------------------------------------------------- decode
 // Row t of a window sees positions [lo_t, hi_t): hi_t = pos0 + t + 1 (causal) or `hi`, lo_t = pos0 + t - window + 1 (a
-// sliding window, else 0); position p sits in cache cell p % cap.  Cells are split in CHUNK-position chunks from chunk
+// sliding window; pos0 - window + 1 for every row of a block's shared window; else 0); position p sits in cache cell p % cap.  Cells are split in CHUNK-position chunks from chunk
 // `base`; block b of a row takes chunks b, b + gx, ... (gx from the capacity alone) and folds them in order, so a row's
 // sums depend on its own range only, never on the window's rows or where the first cell is read from.
 struct Range {
     int64_t pos0 = 0, hi = 0, window = 0, cap = 0;
-    int causal = 1, base = 0;
+    int causal = 1, base = 0, block = 0;
     const int32_t* pos_dev = nullptr;   // pos0 read from the device (a captured window)
 };
 __device__ __forceinline__ int64_t row_pos0(const Range& r) { return r.pos_dev ? (int64_t) *r.pos_dev : r.pos0; }
@@ -73,7 +73,7 @@ __device__ __forceinline__ int seg_of(const int* first, int n, int i) {
 }
 __device__ __forceinline__ int64_t row_hi(const Range& r, int t) { return r.causal ? row_pos0(r) + t + 1 : r.hi; }
 __device__ __forceinline__ int64_t row_lo(const Range& r, int t) {
-    return r.window > 0 ? max((int64_t) 0, row_pos0(r) + t - r.window + 1) : 0;
+    return r.window > 0 ? max((int64_t) 0, row_pos0(r) + (r.block ? 0 : t) - r.window + 1) : 0;
 }
 
 // Block (query head, row t), one thread per dim: the row's splits merged in order.  Splits past the row's last chunk
@@ -1078,7 +1078,7 @@ void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* se
 
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
                      int64_t pos0, int T, int64_t hi, int64_t window, int64_t cap, float* scratch, int64_t scratch_cells,
-                     float* out, void* stream) {
+                     float* out, void* stream, bool block) {
     if (T < 1 || T > kGqaMaxWindow || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX || window <= 0 ||
         (head_dim != 128 && head_dim != 256) || hi < pos0 + T) {
         basalt::log::error("basalt", "gqa_window_attn: invalid arguments");
@@ -1090,6 +1090,7 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
     r.window = window;
     r.cap = cap;
     r.causal = 0;
+    r.block = block ? 1 : 0;
     const int64_t lo = std::max<int64_t>(0, pos0 - window + 1);
     r.base = (int) (lo / CHUNK);
     const int used = (int) ((hi + CHUNK - 1) / CHUNK) - r.base;

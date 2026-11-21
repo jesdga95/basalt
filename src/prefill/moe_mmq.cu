@@ -92,24 +92,30 @@ __global__ void q2_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict
     for (int k = 0; k < 8; ++k) out[1 + k] = qh[k];
 }
 
+template <bool CAP>
 __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
-                              bool interleaved, const float4* __restrict__ tail, const int32_t* __restrict__ bounds, int n) {
+                              bool interleaved, const float4* __restrict__ tail, const int32_t* __restrict__ bounds, int n,
+                              float cg, float cu, const int32_t* __restrict__ row_expert, size_t tail_stride) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * n_ff) return;
     const int64_t r = i / n_ff, k = i % n_ff;
     const float* row = gu + r * 2 * n_ff;
     float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
     if (tail == nullptr) {
-        h[i] = g / (1.0f + __expf(-g)) * u;
+        if constexpr (CAP) h[i] = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu));
+        else h[i] = g / (1.0f + __expf(-g)) * u;
         return;
     }
-    // the row's expert: the last q with bounds[q] <= r
+    // the row's expert: given, or the last q with bounds[q] <= r
     int q = 0;
-    while (q + 1 < n && bounds[q + 1] <= r) ++q;
-    const float4 s = tail[q];   // {s_gate, s_up, s_down, -}
+    if (row_expert != nullptr) q = row_expert[r];
+    else
+        while (q + 1 < n && bounds[q + 1] <= r) ++q;
+    const float4 s = *(const float4*) ((const uint8_t*) tail + (size_t) q * tail_stride);   // {s_gate, s_up, s_down, -}
     g *= s.x;
     u *= s.y;
-    h[i] = g / (1.0f + __expf(-g)) * u * s.z;
+    if constexpr (CAP) h[i] = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu)) * s.z;
+    else h[i] = g / (1.0f + __expf(-g)) * u * s.z;
 }
 
 __global__ void iota_kernel(int32_t* dst, int64_t n) {
@@ -213,6 +219,11 @@ bool fits(int t, int64_t w_rows) {
 
 size_t matrix_bytes(int t, int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) (cols / ggml_blck_size((ggml_type) t)) * ggml_type_size((ggml_type) t);
+}
+
+size_t read_past_bytes(int t, int64_t cols) {
+    const int64_t qk = ggml_blck_size((ggml_type) t), per = MMQ_ITER_K / qk, blocks = cols / qk;
+    return per > 1 ? (size_t) ((per - blocks % per) % per) * ggml_type_size((ggml_type) t) : 0;
 }
 
 size_t gu_slot_bytes(int gate_type, int up_type, int64_t n_ff, int64_t n_embd) {
@@ -319,11 +330,17 @@ void gather_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
 }
 
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream, const float* tail,
-            const int32_t* bounds, int n) {
+            const int32_t* bounds, int n, const SwigluForm& form) {
     if (rows <= 0) return;
-    if (bounds == nullptr || n <= 0) tail = nullptr;
-    swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved,
-                                                                           (const float4*) tail, bounds, n);
+    if (form.row_expert == nullptr && (bounds == nullptr || n <= 0)) tail = nullptr;
+    const cudaStream_t s = (cudaStream_t) stream;
+    const size_t ts = form.tail_stride ? form.tail_stride : sizeof(float4);
+    if (form.gate_softcap > 0.0f)
+        swiglu_kernel<true><<<blocks(rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, interleaved, (const float4*) tail, bounds, n,
+                                                                form.gate_softcap, form.up_softcap, form.row_expert, ts);
+    else
+        swiglu_kernel<false><<<blocks(rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, interleaved, (const float4*) tail, bounds, n,
+                                                                 0.0f, 0.0f, form.row_expert, ts);
     ck(cudaGetLastError(), "swiglu");
 }
 
