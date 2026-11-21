@@ -1,7 +1,7 @@
 // src/models/inkling2/kernels/dspark_parity.cpp - the DSpark drafter's kernels against plain CPU references (double
 // accumulation) at the drafter's geometry: the target features' mixes (and a row's bits alone), the block's inputs, the
-// Markov recurrence, the pick over the whole vocabulary (its tie rule, and again on the same scratch), the head folds and the
-// recurrence's split. Each is timed. Exit 77 without a GPU.
+// Markov recurrence, the screened head over the whole vocabulary (against its exact rows, its tie rule), the head folds and
+// the recurrence's split. Each is timed. Exit 77 without a GPU.
 #include "basalt/models/inkling2/dspark_kernels.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 
@@ -184,7 +184,12 @@ void test_block_inputs() {
     int32_t* d_pos3 = zeros<int32_t>(kBlock * 3);
     int32_t* d_prev = zeros<int32_t>(1);
     float* d_state = dev(randn(kDsRank));
-    dspark_block_inputs(d_emb, anchor, d_norm, 1e-6f, d_mask, kBlock, pos0, d_x, d_pos3, d_prev, d_state, nullptr);
+    const auto fr = randn((size_t) 16 * E);
+    float* d_fr = dev(fr);
+    float* d_frc = zeros<float>(E);
+    int32_t* d_meta = dev(std::vector<int32_t>{anchor, (int32_t) pos0});
+    auto run = [&] { dspark_block_inputs(d_emb, d_meta, d_norm, 1e-6f, d_mask, kBlock, d_x, d_pos3, d_prev, d_state, d_fr, 16, d_frc, nullptr); };
+    run();
     const auto x = host(d_x, (size_t) kBlock * E);
     std::vector<float> got;
     std::vector<double> ref;
@@ -203,8 +208,9 @@ void test_block_inputs() {
     const auto state = host(d_state, kDsRank);
     ok = ok && prev[0] == anchor;
     for (float s : state) ok = ok && s == 0.f;
+    ok = ok && std::memcmp(host(d_frc, E).data(), fr.data() + (size_t) ((pos0 - 1) % 16) * E, E * 4) == 0;
     check("block inputs (masks, positions, start)", ok);
-    const double us = time_us([&] { dspark_block_inputs(d_emb, anchor, d_norm, 1e-6f, d_mask, kBlock, pos0, d_x, d_pos3, d_prev, d_state, nullptr); });
+    const double us = time_us(run);
     timing("block inputs", us, (double) kBlock * E * 4 + E * 6);
 }
 
@@ -245,53 +251,218 @@ void test_markov_step() {
     timing("Markov step", us, (double) kDsRnn * 2 * kDsRank * 2 + 3.0 * kDsRnn * 4);
 }
 
-void test_pick() {
-    const int V = kVocab;
-    const float cap = 30.f;
-    auto base = randn(V, 6.f), bias = randn(V, 1.f), fb = randn(V, 0.5f);
-    float *d_base = dev(base), *d_bias = dev(bias), *d_fb = dev(fb);
-    void* scr = zeros<uint8_t>(dspark_pick_scratch_bytes(V));
+// q8_1 blocks of a row (ggml's quantize_row_q8_1: d = amax / 127, the codes rounded, then d and d * sum of the codes)
+std::vector<uint8_t> q8_1(const std::vector<float>& x) {
+    std::vector<uint8_t> o(x.size() / 32 * 36);
+    for (size_t b = 0; b < x.size() / 32; ++b) {
+        float amax = 0;
+        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[b * 32 + i]));
+        const float d = amax / 127.f, id = d ? 1.f / d : 0.f;
+        int sum = 0;
+        for (int i = 0; i < 32; ++i) {
+            const int q = (int) std::lround(x[b * 32 + i] * id);
+            o[b * 36 + 4 + i] = (uint8_t) (int8_t) q;
+            sum += q;
+        }
+        const __half hd = __float2half(d), hs = __float2half(d * (float) sum);
+        std::memcpy(&o[b * 36], &hd, 2);
+        std::memcpy(&o[b * 36 + 2], &hs, 2);
+    }
+    return o;
+}
+double q8_1_value(const uint8_t* x, int i) {
+    __half hd;
+    std::memcpy(&hd, x + (i / 32) * 36, 2);
+    return (double) __half2float(hd) * (double) (int8_t) x[(i / 32) * 36 + 4 + i % 32];
+}
+// Q8_0 rows with random codes and scales of `scale` (1 to 2 times)
+std::vector<uint8_t> q8_0_rows(int64_t rows, int n, float scale, uint32_t seed) {
+    std::vector<uint8_t> w((size_t) rows * (n / 32) * 34);
+    uint32_t s = seed;
+    for (size_t blk = 0; blk < w.size() / 34; ++blk) {
+        const __half hd = __float2half(scale * (1.f + (float) (blk % 13) / 13.f));
+        std::memcpy(&w[blk * 34], &hd, 2);
+        for (int i = 0; i < 32; ++i) {
+            s = s * 1664525u + 1013904223u;
+            w[blk * 34 + 2 + i] = (uint8_t) (s >> 24);
+        }
+    }
+    return w;
+}
+
+// The screened head over the real vocabulary: planted drafts (the activation leans toward a chosen row, so the best leads by a
+// few units, as a confident draft's does) against the exact head's first argmax (dspark_head_exact, itself checked against a
+// CPU reference), the pick's probability against the exact softmax, a tie, and unplanted (flat) drafts counted.
+void test_head() {
+    const int64_t V = kVocab;
+    const int R = kDsDrafts;
+    const auto head = q8_0_rows(V, E, 1.5e-4f, 777u), fold = q8_0_rows(V, kDsRank, 2e-3f, 4242u);
+    const auto fb = randn((size_t) V, 0.5f);
+    uint8_t *d_head = dev(head), *d_fold = dev(fold);
+    float* d_fb = dev(fb);
+    void* d_hsc = zeros<uint8_t>(dspark_screen_bytes(E, V));
+    void* d_fsc = zeros<uint8_t>(dspark_screen_bytes(kDsRank, V));
+    dspark_screen_pack(d_head, E, V, d_hsc, nullptr);
+    dspark_screen_pack(d_fold, kDsRank, V, d_fsc, nullptr);
+    DsHead h;
+    h.head = d_head;
+    h.fold = d_fold;
+    h.fold_b = d_fb;
+    h.head_sc = d_hsc;
+    h.fold_sc = d_fsc;
+    h.n_vocab = V;
+    h.cap = 30.f;
+    float* d_approx = zeros<float>((size_t) R * dspark_screen_rows(V));
+    float* d_fbp = zeros<float>((size_t) dspark_screen_rows(V));
+    dspark_screen_order(d_fb, V, d_fbp, nullptr);
+    h.fold_bp = d_fbp;
+    float* d_logits = zeros<float>((size_t) V);
+    void* scr = zeros<uint8_t>(dspark_head_scratch_bytes(V));
     int32_t* d_prev = zeros<int32_t>(1);
     int32_t* d_ids = zeros<int32_t>(8);
     float* d_conf = zeros<float>(8);
-    auto run = [&](int at) { dspark_pick(d_base, d_bias, d_fb, V, cap, scr, d_prev, d_ids, d_conf, at, nullptr); };
-    auto ref = [&](int& id, double& conf) {
-        std::vector<double> l(V);
-        double m = -1e300;
-        id = 0;
-        for (int v = 0; v < V; ++v) {
-            l[v] = cap * std::tanh(((double) base[v] + bias[v] + fb[v]) / cap);
-            if (l[v] > m) { m = l[v]; id = v; }
+    const size_t hrow = (size_t) E / 32 * 36, lrow = (size_t) kDsRank / 32 * 36;
+    std::uniform_int_distribution<int64_t> pick_row(0, V - 1);
+    std::uniform_real_distribution<float> lean(0.f, 1.f);
+    // one block of R drafts: the rows (planted toward plant[i] when given), the latents; the screened picks and the exact
+    // head's argmax and probability for each
+    int differ = 0, prob_bad = 0, drafts = 0;
+    double worst_prob = 0;
+    const int64_t cluster[6] = {8, 11, 12, 13, 25, 30};
+    auto block = [&](const std::vector<int64_t>& plant, float strength, bool count_probs, bool clustered = false) {
+        std::vector<uint8_t> hq, lq;
+        for (int i = 0; i < R; ++i) {
+            auto x = randn(E, 5.f);
+            if (clustered) {   // six rows of one tile in token order lead the rest, within a unit of each other
+                for (int k = 0; k < 6; ++k) {
+                    const int64_t t = cluster[k];
+                    double n2 = 0;
+                    for (int e = 0; e < E; ++e) n2 += q8_value(head.data(), E, t, e) * q8_value(head.data(), E, t, e);
+                    const float a = strength * (1.f - 0.04f * lean(rng));
+                    for (int e = 0; e < E; ++e) x[e] += (float) (a * q8_value(head.data(), E, t, e) / n2);
+                }
+            } else if (!plant.empty()) {
+                double n2 = 0;
+                for (int e = 0; e < E; ++e) n2 += q8_value(head.data(), E, plant[(size_t) i], e) * q8_value(head.data(), E, plant[(size_t) i], e);
+                for (int e = 0; e < E; ++e) x[e] += (float) (strength * q8_value(head.data(), E, plant[(size_t) i], e) / n2);
+            }
+            const auto q = q8_1(x);
+            hq.insert(hq.end(), q.begin(), q.end());
+            auto lat = randn(kDsRank, 0.5f);
+            for (auto& v : lat) v = std::tanh(v);
+            const auto ql = q8_1(lat);
+            lq.insert(lq.end(), ql.begin(), ql.end());
         }
-        double z = 0;
-        for (int v = 0; v < V; ++v) z += std::exp(l[v] - m);
-        conf = 1.0 / z;
+        uint8_t *d_hq = dev(hq), *d_lq = dev(lq);
+        dspark_head_base(h, d_hq, R, d_approx, nullptr);
+        for (int i = 0; i < R; ++i) dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, nullptr);
+        const auto ids = host(d_ids, 8);
+        const auto cf = host(d_conf, 8);
+        for (int i = 0; i < R; ++i) {
+            dspark_head_exact(h, d_hq, d_lq + i * lrow, i, d_logits, nullptr);
+            const auto l = host(d_logits, (size_t) V);
+            const int64_t best = std::max_element(l.begin(), l.end()) - l.begin();
+            double z = 0;
+            for (int64_t v = 0; v < V; ++v) z += std::exp((double) l[v] - l[best]);
+            ++drafts;
+            differ += best != ids[i];
+            if (count_probs) {
+                const double rel = std::fabs(cf[i] - 1.0 / z) / (1.0 / z);
+                worst_prob = std::max(worst_prob, std::fabs(cf[i] - 1.0 / z));
+                prob_bad += std::fabs(cf[i] - 1.0 / z) > 0.05 && rel > 0.1;
+            }
+        }
+        cudaFree(d_hq);
+        cudaFree(d_lq);
+        return ids;
     };
-    run(2);
-    int id = 0;
-    double conf = 0;
-    ref(id, conf);
-    auto ids = host(d_ids, 8);
-    auto prev = host(d_prev, 1);
-    auto cf = host(d_conf, 8);
-    check("pick: the argmax", ids[2] == id && prev[0] == id);
-    report("pick: its probability", {cf[2]}, {conf}, 1e-4);
-    // a tie between two rows: the lower one
-    base[777] = base[150000] = 200.f;
-    bias[777] = bias[150000] = 0.f;
-    fb[777] = fb[150000] = 0.f;
-    cudaMemcpy(d_base, base.data(), V * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_bias, bias.data(), V * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fb, fb.data(), V * 4, cudaMemcpyHostToDevice);
-    run(5);
-    run(6);   // the scratch's counter is back to zero after a pick
-    ref(id, conf);
-    ids = host(d_ids, 8);
-    cf = host(d_conf, 8);
-    check("pick: a tie takes the lower row", id == 777 && ids[5] == 777 && ids[6] == 777);
-    report("pick: the tie's probability", {cf[5], cf[6]}, {conf, conf}, 1e-4);
-    const double us = time_us([&] { run(0); });
-    timing("pick, 200,058 logits", us, 3.0 * V * 4);
+    // the exact logits against a CPU reference on a few rows
+    {
+        std::vector<int64_t> plant(R);
+        for (auto& p : plant) p = pick_row(rng);
+        std::vector<uint8_t> hq = q8_1(randn((size_t) E * R, 5.f)), lq = q8_1(randn((size_t) kDsRank * R, 0.5f));
+        uint8_t *d_hq = dev(hq), *d_lq = dev(lq);
+        dspark_head_exact(h, d_hq, d_lq + 3 * lrow, 3, d_logits, nullptr);
+        const auto l = host(d_logits, (size_t) V);
+        std::vector<float> got;
+        std::vector<double> ref;
+        for (int k = 0; k < 64; ++k) {
+            const int64_t v = k * (V - 1) / 63;
+            double a = 0, b = 0;
+            for (int e = 0; e < E; ++e) a += q8_value(head.data(), E, v, e) * q8_1_value(hq.data() + 3 * hrow, e);
+            for (int e = 0; e < kDsRank; ++e) b += q8_value(fold.data(), kDsRank, v, e) * q8_1_value(lq.data() + 3 * lrow, e);
+            got.push_back(l[(size_t) v]);
+            ref.push_back(30.0 * std::tanh((a + b + fb[(size_t) v]) / 30.0));
+        }
+        report("head: exact logits", got, ref, 1e-5);
+        cudaFree(d_hq);
+        cudaFree(d_lq);
+    }
+    for (int t = 0; t < 12; ++t) {
+        std::vector<int64_t> plant(R);
+        for (auto& p : plant) p = pick_row(rng);
+        block(plant, 22.f + 12.f * lean(rng), true);
+    }
+    std::printf("%-34s %d of %d picks differ from the exact head; probability worst abs error %.3e\n", "head: planted", differ,
+                drafts, worst_prob);
+    check("head: planted picks are the exact head's", differ == 0);
+    check("head: planted probabilities", prob_bad == 0);
+    differ = drafts = 0;
+    for (int t = 0; t < 6; ++t) block({}, 26.f, false, true);
+    std::printf("%-34s %d of %d picks differ from the exact head\n", "head: six near-best rows together", differ, drafts);
+    check("head: near-best rows of one token tile", differ == 0);
+    // a tie: row 150000 copied to row 777 (head, fold and bias), the drafts planted at 150000 take 777
+    {
+        std::vector<uint8_t> h2 = head, f2 = fold;
+        std::vector<float> fb2 = fb;
+        std::memcpy(&h2[(size_t) 777 * (E / 32) * 34], &head[(size_t) 150000 * (E / 32) * 34], (size_t) (E / 32) * 34);
+        std::memcpy(&f2[(size_t) 777 * (kDsRank / 32) * 34], &fold[(size_t) 150000 * (kDsRank / 32) * 34], (size_t) (kDsRank / 32) * 34);
+        fb2[777] = fb[150000];
+        cudaMemcpy(d_head, h2.data(), h2.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_fold, f2.data(), f2.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_fb, fb2.data(), fb2.size() * 4, cudaMemcpyHostToDevice);
+        dspark_screen_pack(d_head, E, V, d_hsc, nullptr);
+        dspark_screen_pack(d_fold, kDsRank, V, d_fsc, nullptr);
+        dspark_screen_order(d_fb, V, d_fbp, nullptr);
+        differ = drafts = 0;
+        const auto ids = block(std::vector<int64_t>(R, 150000), 30.f, false);
+        bool ok = differ == 0;
+        for (int i = 0; i < R; ++i) ok = ok && ids[i] == 777;
+        check("head: a tie takes the lower row", ok);
+        cudaMemcpy(d_head, head.data(), head.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_fold, fold.data(), fold.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_fb, fb.data(), fb.size() * 4, cudaMemcpyHostToDevice);
+        dspark_screen_pack(d_head, E, V, d_hsc, nullptr);
+        dspark_screen_pack(d_fold, kDsRank, V, d_fsc, nullptr);
+        dspark_screen_order(d_fb, V, d_fbp, nullptr);
+    }
+    // flat logits (no plant): every tile near the best, the overflow path; counted, not failed
+    differ = drafts = 0;
+    for (int t = 0; t < 4; ++t) block({}, 0.f, false);
+    std::printf("%-34s %d of %d picks differ from the exact head (flat logits, the overflow path)\n", "head: unplanted", differ, drafts);
+    // timing: the head term of seven rows once, then a draft's pick, on flat and on planted rows
+    std::vector<float> xp = randn((size_t) E * R, 5.f);
+    for (int i = 0; i < R; ++i) {
+        const int64_t t = pick_row(rng);
+        double n2 = 0;
+        for (int e = 0; e < E; ++e) n2 += q8_value(head.data(), E, t, e) * q8_value(head.data(), E, t, e);
+        for (int e = 0; e < E; ++e) xp[(size_t) i * E + e] += (float) (28.0 * q8_value(head.data(), E, t, e) / n2);
+    }
+    std::vector<uint8_t> hq = q8_1(randn((size_t) E * R, 5.f)), hp = q8_1(xp), lq = q8_1(randn((size_t) kDsRank * R, 0.5f));
+    uint8_t *d_hq = dev(hq), *d_hp = dev(hp), *d_lq = dev(lq);
+    double us = time_us([&] { dspark_head_base(h, d_hq, R, d_approx, nullptr); });
+    timing("head base, 7 rows", us, (double) dspark_screen_bytes(E, V) + (double) R * V * 4);
+    us = time_us([&] { dspark_head_pick(h, d_hq, d_lq, d_approx, 0, scr, d_prev, d_ids, d_conf, nullptr); });
+    timing("head pick, one draft (flat)", us, (double) dspark_screen_bytes(kDsRank, V) + 2.0 * V * 4);
+    dspark_head_base(h, d_hp, R, d_approx, nullptr);
+    us = time_us([&] { dspark_head_pick(h, d_hp, d_lq, d_approx, 0, scr, d_prev, d_ids, d_conf, nullptr); });
+    timing("head pick, one draft (planted)", us, (double) dspark_screen_bytes(kDsRank, V) + 2.0 * V * 4);
+    d_hq = d_hp;
+    us = time_us([&] {
+        dspark_head_base(h, d_hq, R, d_approx, nullptr);
+        for (int i = 0; i < R; ++i) dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, nullptr);
+    });
+    timing("head, a block of 7 drafts", us, (double) dspark_screen_bytes(E, V) + R * (double) dspark_screen_bytes(kDsRank, V));
 }
 
 void test_fold() {
@@ -378,7 +549,7 @@ int main() {
     test_mix();
     test_block_inputs();
     test_markov_step();
-    test_pick();
+    test_head();
     test_fold();
     test_split();
     std::printf("inkling2_dspark_parity: %d failures\n", failures);
