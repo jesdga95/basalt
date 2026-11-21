@@ -40,6 +40,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--spec-oracle FILE` | CLI | With `--spec N` on a pack without a drafter: draft from an expected continuation. The verify exactness test. |
 | `--prefill-until P` | CLI | Batch the first P prompt positions; run the rest teacher-forced. |
 | `--spec-corrupt N` | CLI | Replace every Nth draft with a wrong token, to test rejection. |
+| `--diag-batch-check` | CLI | With `--batch N` (2 or more) and a prompt: every session's windows alone against the same windows batched, bitwise ([batched decoding](../design/batching.md)). |
 | `--diag-teacher` | CLI | DeepSeek with `--spec-oracle`: teacher-forces the file's tokens and counts differing picks. |
 | `--diag-tier-frozen` | CLI, serve | DeepSeek: fixed placement (no copies or promotion). |
 | `--diag-drafter-gpu DEV` | CLI, serve | DeepSeek: the card the drafter runs on. |
