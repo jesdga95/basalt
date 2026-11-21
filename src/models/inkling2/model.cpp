@@ -425,7 +425,7 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
             // the kept experts in their own backing, the RAM ones' slots over the shared staging; their blobs in pinned RAM
             const int keep = g.n_expert - spill_.n_spill[(size_t) l];
             Range r;
-            r.bytes = (eb + gran - 1) / gran * gran;
+            r.bytes = (eb + kSlotGuard + gran - 1) / gran * gran;
             r.own = ((uint64_t) keep * w.expert_stride + gran - 1) / gran * gran;
             if (!(r.va = core::vmm::reserve(r.bytes))) return fail("cannot reserve the address range of layer " + std::to_string(l) + "'s experts");
             if (r.own && !(r.handle = core::vmm::map(r.va, r.own))) {

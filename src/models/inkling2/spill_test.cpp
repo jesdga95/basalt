@@ -50,6 +50,9 @@ int main() {
         // the spilled ones are the highest experts (the coldest by this profile) and take the last slots
         const int keep = E - p.n_spill[(size_t) l];
         for (int e = 0; e < E; ++e) expect((p.slot[(size_t) l][(size_t) e] >= keep) == (e >= keep), "kept experts first, RAM ones last");
+        // the layer's own backing and the staging cover its slots and the zeroed guard after them
+        const uint64_t own = ((uint64_t) keep * stride[(size_t) l] + gran - 1) / gran * gran;
+        expect(own + p.staging >= (uint64_t) E * stride[(size_t) l] + kSlotGuard, "the staging covers the RAM slots and the guard");
     }
     // the diagnostic cap: at most `keep` experts stay
     expect(plan_spill(L, E, stride, gran, rank, 0, 40, p, err) && L * E - p.spilled <= 40, "the keep cap");
