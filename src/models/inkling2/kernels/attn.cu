@@ -518,21 +518,36 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
             }
         }
     }
-    cg::cluster_group cluster = cg::this_cluster();
-    cluster.sync();
+    // the slices' shared memory to the merging blocks: a release and an acquire of shared memory only (a cluster-wide
+    // release of every state space is a GPU-scope fence that waits for the cache and ring stores; no block of the cluster
+    // reads those)
+    asm volatile("fence.release.sync_restrict::shared::cta.cluster;\n\tbarrier.cluster.arrive.relaxed.aligned;\n\t"
+                 "barrier.cluster.wait.aligned;\n\tfence.acquire.sync_restrict::shared::cluster.cluster;" ::: "memory");
     if (s < kGroup) {   // head g * 3 + s: the row's slices merged with the sink, gated, rounded to q8_1 (a warp a block of 32)
         const int h = s, d = threadIdx.x;
-        const FusedSmem* part[kClusterSplits];
+        cg::cluster_group cluster = cg::this_cluster();
+        // every slice's maximum, sum and value read at once, then merged in slice order
+        float pm[kClusterSplits], pl[kClusterSplits], pv[kClusterSplits];
 #pragma unroll
-        for (int q = 0; q < kClusterSplits; ++q) part[q] = cluster.map_shared_rank(&fs, q);
+        for (int q = 0; q < kClusterSplits; ++q)
+            if (q < splits) {
+                const FusedSmem* part = cluster.map_shared_rank(&fs, q);
+                pm[q] = part->pm[h];
+                pl[q] = part->pl[h];
+                pv[q] = part->pacc[h][d];
+            }
         float mm = sink;
-        for (int q = 0; q < splits; ++q) mm = fmaxf(mm, part[q]->pm[h]);
+#pragma unroll
+        for (int q = 0; q < kClusterSplits; ++q)
+            if (q < splits) mm = fmaxf(mm, pm[q]);
         float ll = expf(sink - mm), aa = 0.f;
-        for (int q = 0; q < splits; ++q) {
-            const float f = expf(part[q]->pm[h] - mm);
-            ll = fmaf(part[q]->pl[h], f, ll);
-            aa = fmaf(part[q]->pacc[h][d], f, aa);
-        }
+#pragma unroll
+        for (int q = 0; q < kClusterSplits; ++q)
+            if (q < splits) {
+                const float f = expf(pm[q] - mm);
+                ll = fmaf(pl[q], f, ll);
+                aa = fmaf(pv[q], f, aa);
+            }
         float o = aa / ll;
         const int c = (g * kGroup + h) * kHeadDim + d;
         if (a.gate) o *= 1.f / (1.f + expf(-gate));
