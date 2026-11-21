@@ -84,6 +84,16 @@ Flow QfnRequest::read_to(int64_t to) {
     const auto source_at = [&](int64_t t) {
         return t == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd;
     };
+    // --live-read-split=1: this slot asks for no windows while it reads its prompt, so another read sees
+    // the slot as reading, not as decoding, and may split and lend as if alone
+    struct ReadPhase {
+        QfnRuntime& rt;
+        int b;
+        explicit ReadPhase(QfnRuntime& r, int bb) : rt(r), b(bb) {
+            if (rt.o.live_read_split == 1 && b >= 0 && b < (int) rt.bs.size()) rt.bs[(size_t) b].reading = true;
+        }
+        ~ReadPhase() { if (b >= 0 && b < (int) rt.bs.size()) rt.bs[(size_t) b].reading = false; }
+    } read_phase(runtime_, slot_b);
     runtime_.err.clear();
     const bool win = windows_ok(at, to);
     int64_t rto = to;

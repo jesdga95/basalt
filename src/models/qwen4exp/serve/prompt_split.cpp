@@ -12,7 +12,9 @@ QfnRequest::SplitPlan QfnRequest::split_plan(int64_t a0, int64_t b0, const char*
         basalt::log::info("basalt serve", "prompt split: %lld tokens read on CUDA0 (%s)", (long long) (b0 - a0),
                           why.c_str());
     };
-    const char* skip = no_split != nullptr ? no_split : runtime_.batch_on() ? "slots are decoding" : !runtime_.req_imgs.empty() ? "the prompt has images" : nullptr;
+    // live_read() answers for all three modes of --live-read-split, batch_on() is its mode-0 form
+    const char* skip = no_split != nullptr ? no_split : runtime_.live_read(slot_b) ? "slots are decoding"
+                       : !runtime_.req_imgs.empty() ? "the prompt has images" : nullptr;
     if (skip != nullptr) {
         if (b0 - a0 > runtime_.read_cap()) decline(skip);
         return plan;

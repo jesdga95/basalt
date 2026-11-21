@@ -60,6 +60,20 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--adapt-every") { o.adapt_every = std::atoi(args.next("--adapt-every")); o.adapt_every_given = true; }
     else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(args.next("--adapt-decay")); o.adapt_decay_set = true; }
     else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(args.next("--prefill-cpu-share"));
+    else if (a == "--live-read-slots") o.live_read_slots = std::max(0LL, std::atoll(args.next("--live-read-slots")));
+    else if (a == "--live-read-ring") o.live_read_ring = std::max(0, std::atoi(args.next("--live-read-ring")));
+    else if (a == "--live-read-split") {   // the value is optional: 1 (only readers aside) or 2 (never beside)
+        o.live_read_split = 1;
+        if (args.peek() != nullptr) {
+            char* e = nullptr;
+            const long v = std::strtol(args.peek(), &e, 10);
+            if (e != args.peek() && *e == '\0') {
+                args.take();
+                if (v < 0 || v > 2) { basalt::log::error("basalt", "--live-read-split: N must be 0, 1 or 2"); { code = 2; return true; } }
+                o.live_read_split = (int) v;
+            }
+        }
+    }
     else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
         o.relaxed_drafting = kRelaxedDraftingDefault;
         if (args.peek() != nullptr) {
