@@ -31,4 +31,9 @@ struct RouterArgs {
 void router(const float* x, const float* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
             int32_t* ids, float* weights, void* stream);
 
+/// router's choice from logits computed another way (a prompt chunk's scores as one product): the same selection and
+/// weights `router` makes from the same logits.
+void router_select(const float* logits, const float* bias, int n_tokens, const RouterArgs& a, int32_t* ids, float* weights,
+                   void* stream);
+
 }  // namespace basalt::kernels

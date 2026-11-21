@@ -126,8 +126,9 @@ public:
             cudaMemsetAsync(c.m_ring, 0, (size_t) kConvRing * E * 4, stream_);
         }
         cudaStreamSynchronize(stream_);
-        if (!dspark_.init(m_.dspark(), g_, m_.context(), kMaxRows, m_.flags().diag_dump, err)) return false;   // DSPARK HOOK
-        prompt_ = make_prompt(m_, vc_, stream_, err);   // PROMPT HOOK
+        if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(kMaxRows, kPromptChunk), m_.flags().diag_dump, err))   // DSPARK HOOK
+            return false;
+        prompt_ = make_prompt(m_, vc_, dspark_, stream_, err);   // PROMPT HOOK
         return prompt_ != nullptr || err.empty();
     }
 

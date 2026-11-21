@@ -104,8 +104,17 @@ void gather_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
 /// group's {s_gate, s_up, s_down, 0} per expert and `bounds` its n + 1 row bounds (relative to these rows); then
 /// h = silu(s_gate g) * (s_up u) * s_down, so the down product's output carries s_down (q8_1 keeps an fp32 scale
 /// per 32 values, so the scaled H rounds to the same codes up to fp32 rounding of that scale).
+/// `form`: the softcapped SwiGLU of NativeExpertLayout (gate_softcap and up_softcap > 0: h = gate_softcap tanh(g /
+/// gate_softcap) sigmoid(g) up_softcap tanh(u / up_softcap) of the tail-scaled g and u, the native kernels' expression,
+/// then the s_down factor), each row's expert for the tail (`row_expert`, in place of a search of `bounds`), and the
+/// bytes from one expert's tail to the next (`tail_stride`, 0: 16, packed), so the tails can be read in the blobs.
+struct SwigluForm {
+    float gate_softcap = 0.0f, up_softcap = 0.0f;
+    const int32_t* row_expert = nullptr;
+    size_t tail_stride = 0;
+};
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream,
-            const float* tail = nullptr, const int32_t* bounds = nullptr, int n = 0);
+            const float* tail = nullptr, const int32_t* bounds = nullptr, int n = 0, const SwigluForm& form = {});
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
