@@ -72,6 +72,8 @@ public:
     bool cache_fp8() const { return fp8_; }
     /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests.
     ImageEncoder& encoder() const { return vis_; }
+    /// What the sessions share (session.cpp's Shared): made by the first, gone with the last.
+    std::weak_ptr<void>& shared() { return shared_; }
     const DsparkWeights* dspark() const { return dspark_.get(); }   // DSPARK HOOK: null without a drafter or with --spec 1
     /// Whether expert e of layer l is on the card (every one, unless the context asked for made some spill to RAM).
     bool on_card(int l, int e) const {
@@ -120,6 +122,7 @@ private:
     int64_t ctx_ = kDefaultContext;
     mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DsparkWeights> dspark_;   // DSPARK HOOK
+    std::weak_ptr<void> shared_;
     // the spill (spill.hpp): each spilled layer's reserved range and its own backing, the staging they share, the RAM copies
     struct Range {
         uint8_t* va = nullptr;
@@ -142,7 +145,9 @@ private:
 /// A session over `model`; null with `err` set.
 std::unique_ptr<model::ModelSession> make_session(InklingModel& model, std::string& err);
 
-/// The device bytes a session takes for `context` positions (fp8: one byte a cached value).
+/// The device bytes a session takes for `context` positions (fp8: one byte a cached value), its drafter aside.
 uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8);
+/// The device bytes every session shares once: the forward's scratch, the prompt path, the drafter's tap.
+uint64_t shared_bytes(const Geometry& g, bool drafter);
 
 }  // namespace basalt::models::inkling2
