@@ -3034,10 +3034,11 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
 }
 
 // The rows native_down_sub8_kernel takes: kDownSub8Calls calls of a split format that native_down_multi_kernel runs
-// through its generic path (not the n_ff 640 paths).
+// through its generic path (not the n_ff 640 paths): n_ff 2304 of 256-value blocks, or NVFP4 at n_ff 1152 (Inkling 2).
 template<int TD>
 bool down_sub8(const NativeExpertLayout& L) {
-    if constexpr (kDown40<TD> || TD == 42) return false;
+    if constexpr (TD == 40) return L.n_ff == 1152;
+    else if constexpr (kDown40<TD> || TD == 42) return false;
     else return L.n_ff % Fmt<TD>::qk == 0 && (L.n_ff / Fmt<TD>::qk) * Fmt<TD>::ipb == kDownSub8Calls;
 }
 
