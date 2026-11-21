@@ -32,7 +32,7 @@ int main() {
                 weights->from_float_ref(raw.data(), blob.data() + offset, raw.size());
             }
             if (f.tail) {
-                const float scales[4] = {1.f, 1.f, 1.f, 0.f};
+                const float scales[4] = {1.25f, 0.75f, 1.f, 0.f};
                 std::memcpy(blob.data() + f.bytes - f.tail, scales, sizeof(scales));
             }
             std::vector<std::vector<uint8_t>> quant(8, std::vector<uint8_t>(f.act_bytes));
@@ -50,6 +50,15 @@ int main() {
                 output[t] = single[t].data();
                 native_gu_rows(f, blob.data(), act + t, 1, output + t, 0, hidden);
                 for (int r = 0; r < hidden; ++r) {
+                    float old_g = 0, old_u = 0;
+                    const auto dot = ggml_get_type_traits_cpu((ggml_type) type)->vec_dot;
+                    dot(width, &old_g, 0, blob.data() + (size_t) r * f.gu_row, 0, act[t], 0, 1);
+                    dot(width, &old_u, 0, blob.data() + f.up_off + (size_t) r * f.up_row, 0, act[t], 0, 1);
+                    if (f.tail) { old_g *= 1.25f; old_u *= 0.75f; }
+                    old_g = f.gate_softcap * std::tanh(old_g / f.gate_softcap);
+                    old_u = f.up_softcap * std::tanh(old_u / f.up_softcap);
+                    const float previous = (old_g / (1.f + std::exp(-old_g))) * old_u;
+                    if (std::memcmp(&previous, &single[t][r], sizeof(float))) ++failures;
                     weights->to_float(blob.data() + (size_t) r * f.gu_row, gw.data(), width);
                     weights->to_float(blob.data() + f.up_off + (size_t) r * f.up_row, uw.data(), width);
                     double g = 0, u = 0;
@@ -57,6 +66,7 @@ int main() {
                         g += (double) gw[c] * input[t][c];
                         u += (double) uw[c] * input[t][c];
                     }
+                    if (f.tail) { g *= 1.25; u *= 0.75; }
                     g = f.gate_softcap * std::tanh(g / f.gate_softcap);
                     u = f.up_softcap * std::tanh(u / f.up_softcap);
                     const double ref = g / (1. + std::exp(-g)) * u;
@@ -71,6 +81,12 @@ int main() {
                 native_gu_rows(f, blob.data(), act, n, output, 0, hidden);
                 for (int t = 0; t < n; ++t)
                     if (std::memcmp(grouped[t].data(), single[t].data(), hidden * sizeof(float))) ++failures;
+                const void* reversed[8];
+                for (int t = 0; t < n; ++t) reversed[t] = act[7 - t];
+                native_gu_rows(f, blob.data(), reversed, n, output, 0, hidden / 2);
+                native_gu_rows(f, blob.data(), reversed, n, output, hidden / 2, hidden);
+                for (int t = 0; t < n; ++t)
+                    if (std::memcmp(grouped[t].data(), single[7 - t].data(), hidden * sizeof(float))) ++failures;
             }
             std::printf("softcap type=%d width=%d: max_abs=%g max_rel=%g\n", type, width, max_abs, max_rel);
             // The reference accumulates in double; the vector dot accumulates 2,304 values in float.

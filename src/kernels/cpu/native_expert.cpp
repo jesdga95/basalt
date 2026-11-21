@@ -113,6 +113,7 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.n_embd = n_embd;
     f.n_ff = n_ff;
     f.swiglu_limit = swiglu_limit;
+    f.gate_softcap = f.up_softcap = 0.f;
     f.up_type = up_type;
     f.gu_row = ggml_row_size((ggml_type) gu_type, n_embd);
     f.up_row = ggml_row_size((ggml_type) up_type, n_embd);
@@ -161,6 +162,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         if (f.tail) {
             std::memcpy(&sg, blob + f.bytes - f.tail, 4);
             std::memcpy(&su, blob + f.bytes - f.tail + 4, 4);
+        }
+        if (!cpu_avx512_ok() && cpu_avx2_ok() && f.gu_type == GGML_TYPE_NVFP4 &&
+            nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {
+            nvfp4_256_gu_rows(blob, f.gu_row, f.up_off, (int) f.n_embd, sg, su, f.swiglu_limit,
+                              act, nt, ff, r0, r1, f.gate_softcap, f.up_softcap);
+            return;
         }
         if (f.swiglu_limit > 0.f) gu_rows_ggml<true>(f, blob, act, nt, ff, r0, r1, sg, su);
         else gu_rows_ggml<false>(f, blob, act, nt, ff, r0, r1, sg, su);
