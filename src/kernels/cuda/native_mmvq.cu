@@ -853,11 +853,15 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
 // The Q8_0 one-column kernel: the same per-row arithmetic as native_small_mmvq_kernel, with the first weight blocks
 // loaded before pdl_wait (weights are constant) and the dependents let in at the start, so the launch overlaps the
 // previous kernel's tail. Plain launches run it unchanged. Stream: the weights are read cache-streaming.
-template<bool SmallK, bool Stream = false>
-__launch_bounds__(WARPS * WARP, 1)
+// NCOLS > 1 (not SmallK): columns j read x + j * (n_in / 32) and write y + j * n_out, each weight block loaded once
+// for all of them; each column's sums are the one-column kernel's in the same order, so it is BITWISE a one-column
+// call on that column, like native_mmvq_multi_kernel's exact layout (which this replaces for Q8_0).
+template<bool SmallK, bool Stream = false, int NCOLS = 1>
+__launch_bounds__(WARPS * WARP, NCOLS > 1 ? 8 : 1)
 __global__ void native_small_q80_kernel(const Q80Block* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
+    static_assert(NCOLS == 1 || !SmallK, "columns take the one-row layout");
     constexpr int Qi = 8;
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
@@ -865,6 +869,7 @@ __global__ void native_small_q80_kernel(const Q80Block* __restrict__ w,
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * int(blockIdx.x);
     const int blocks_per_row = n_in / 32;
+    const int x_stride = n_in / 32;
     const int kbx0 = tid / (Qi / 2);
     const int kqs = 2 * (tid % (Qi / 2));
     float d0[ROWS][NPRE];
@@ -884,20 +889,24 @@ __global__ void native_small_q80_kernel(const Q80Block* __restrict__ w,
     }
     pdl_launch_dependents();
     pdl_wait();
-    float tmp[ROWS] = {};
+    float tmp[NCOLS][ROWS] = {};
 #pragma unroll
     for (int p = 0; p < NPRE; ++p) {
         const int kbx = kbx0 + p * BLOCKS_PER_ITER;
         if (kbx < blocks_per_row) {
-            const int* u = reinterpret_cast<const int*>(x[kbx].qs);
-            const float d1 = __low2float(x[kbx].ds);
 #pragma unroll
-            for (int i = 0; i < ROWS; ++i) {
-                if (row0 + i < n_out) {
-                    int sumi = 0;
-                    sumi = DP4A(v0[i][p], u[kqs], sumi);
-                    sumi = DP4A(v1[i][p], u[kqs + 1], sumi);
-                    tmp[i] += d0[i][p] * d1 * float(sumi);
+            for (int j = 0; j < NCOLS; ++j) {
+                const Q81Block* xj = x + std::size_t(j) * x_stride + kbx;
+                const int* u = reinterpret_cast<const int*>(xj->qs);
+                const float d1 = __low2float(xj->ds);
+#pragma unroll
+                for (int i = 0; i < ROWS; ++i) {
+                    if (row0 + i < n_out) {
+                        int sumi = 0;
+                        sumi = DP4A(v0[i][p], u[kqs], sumi);
+                        sumi = DP4A(v1[i][p], u[kqs + 1], sumi);
+                        tmp[j][i] += d0[i][p] * d1 * float(sumi);
+                    }
                 }
             }
         }
@@ -907,23 +916,42 @@ __global__ void native_small_q80_kernel(const Q80Block* __restrict__ w,
         for (int i = 0; i < ROWS; ++i) {
             if (row0 + i < n_out) {
                 const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
-                tmp[i] += small_q8_dot_s<Stream>(w + block, x + kbx, kqs);
+                if constexpr (NCOLS == 1) {
+                    tmp[0][i] += small_q8_dot_s<Stream>(w + block, x + kbx, kqs);
+                } else {
+                    const int a0 = q80_word<Stream>(w[block].qs, kqs), a1 = q80_word<Stream>(w[block].qs, kqs + 1);
+                    const float d = q80_scale<Stream>(w + block);
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j) {
+                        const Q81Block* xj = x + std::size_t(j) * x_stride + kbx;
+                        const int* u = reinterpret_cast<const int*>(xj->qs);
+                        int sumi = 0;
+                        sumi = DP4A(a0, u[kqs], sumi);
+                        sumi = DP4A(a1, u[kqs + 1], sumi);
+                        tmp[j][i] += d * __low2float(xj->ds) * float(sumi);
+                    }
+                }
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][NCOLS][ROWS][WARP];
     if (threadIdx.y > 0) {
 #pragma unroll
-        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
     }
     __syncthreads();
     if (threadIdx.y > 0) return;
 #pragma unroll
-    for (int i = 0; i < ROWS; ++i) {
+    for (int j = 0; j < NCOLS; ++j) {
 #pragma unroll
-        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
-        tmp[i] = warp_sum(tmp[i]);
-        if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < WARPS - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
     }
 }
 
@@ -1335,6 +1363,15 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         if (launch_q6_k_staged<NCOLS>(weights, x_q8_1, y, n_in, n_out, s)) return;
     }
     const dim3 threads(WARP, WARPS);
+    // Q8_0 at 2-3 columns in the one-row layout: the weights loaded before the wait, as at one column (4+ columns
+    // measured slower: the preloaded words cost occupancy where the activation loads bind)
+    if constexpr (std::is_same_v<F, SmallTraits<Q80Block, 8>> && NCOLS <= 3) {
+        if (n_in / F::DIV >= F::BPI) {
+            launch_pdl(native_small_q80_kernel<false, false, NCOLS>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in,
+                       n_out);
+            return;
+        }
+    }
     if (n_in / F::DIV < F::BPI) {
         constexpr int ROWS = 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
