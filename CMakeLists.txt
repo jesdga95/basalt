@@ -262,7 +262,7 @@ add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/ink
   src/models/inkling2/prompt.cpp src/models/inkling2/vision.cpp src/models/inkling2/vision_encoder.cpp
   src/models/inkling2/dspark.cpp src/models/inkling2/spill.cpp)
 target_include_directories(model_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(model_inkling2 PUBLIC model tokenizer inkling2_kernels tiers kernels mmq core vision_cuda ${_gpu_runtime_target})
+target_link_libraries(model_inkling2 PUBLIC model tokenizer inkling2_kernels tiers kernels window_gemm mmq core vision_cuda ${_gpu_runtime_target})
 if(BUILD_TESTING)
   add_executable(inkling2_kernels_parity src/models/inkling2/kernels/kernels_parity.cpp)
   target_include_directories(inkling2_kernels_parity PRIVATE ${_gpu_include_directories})
