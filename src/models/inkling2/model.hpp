@@ -1,6 +1,6 @@
 // src/models/inkling2/model.hpp - a loaded Inkling 2 pack: every weight on the main card (the projections of a layer fused
-// into one Q8_0 matrix, the experts of a layer in one contiguous run of blobs, the head rounded to Q8_0 as it loads), the
-// token embedding in mapped host memory.
+// into one Q8_0 matrix, the experts of a layer in one run of blobs at a stride of whole blocks, the head rounded to Q8_0 as
+// it loads), the token embedding in mapped host memory.
 #pragma once
 
 #include "basalt/model/adapter.hpp"
@@ -30,9 +30,10 @@ struct LayerWeights {
     const float* ffn_norm = nullptr;
     const float* router = nullptr;           ///< F32 [n_expert][n_embd]
     const float* router_bias = nullptr;
-    uint8_t* experts = nullptr;              ///< n_expert blobs of blob_bytes
+    uint8_t* experts = nullptr;              ///< n_expert blobs, expert e's at experts + e * expert_stride
     int gu_type = 0, d_type = 0;
     size_t blob_bytes = 0;
+    size_t expert_stride = 0;                ///< blob_bytes rounded up to whole blocks of its type and 16 bytes
     const float* msg_query = nullptr;        ///< core layers: [kStreams][n_embd]
     const uint16_t* ctrl_down[kStreams] = {};   ///< BF16 [gate_rank][2 n_embd]
     const uint16_t* ctrl_gf[kStreams] = {};     ///< BF16 [2 n_embd][gate_rank]: the gain rows, then the forget rows

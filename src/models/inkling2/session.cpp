@@ -17,7 +17,10 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "models/inkling2/caches.hpp"
 #include "models/inkling2/model.hpp"
+#include "models/inkling2/prompt.hpp"
+#include "models/inkling2/walk.hpp"
 
 #include <cuda_runtime.h>
 
@@ -34,17 +37,7 @@ namespace bk = basalt::kernels;
 constexpr int kMaxRows = 8;              // rows of one forward call (a decode window, a step of a prompt)
 constexpr int kTypeBF16 = 30;
 constexpr int kOutRows = 3072;           // the attention output's width (heads x head width)
-
-struct VisitCache {
-    void* k = nullptr;                   // [kKvHeads][cap][kHeadDim]
-    void* v = nullptr;
-    int64_t cap = 0;
-    bool ring = false;                   // a sliding-window visit: cells are positions modulo cap
-    float* k_ring = nullptr;             // the convolutions' inputs of the last kConvRing positions
-    float* v_ring = nullptr;
-    float* a_ring = nullptr;             // the attention output's (before its convolution)
-    float* m_ring = nullptr;             // the experts' sum's
-};
+constexpr int kStage = 64;               // windows whose tokens and positions are in flight from the pinned ring at once
 
 class Session final : public model::ModelSession {
 public:
@@ -53,6 +46,8 @@ public:
         if (stream_) cudaStreamSynchronize(stream_);
         for (void* p : bufs_) cudaFree(p);
         for (void* p : pinned_) cudaFreeHost(p);
+        for (cudaEvent_t e : stage_ev_)
+            if (e) cudaEventDestroy(e);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
@@ -61,6 +56,7 @@ public:
             err = "cannot create a stream";
             return false;
         }
+        if (!walk(g_, walk_, err)) return false;
         bool ok = true;
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
         const int64_t E = g_.n_embd, R = kMaxRows;
@@ -81,9 +77,8 @@ public:
             c.a_ring = f((int64_t) kConvRing * E);
             c.m_ring = f((int64_t) kConvRing * E);
         }
-        // the row buffers of one call
-        x0_ = f(R * E); pre_ = f(R * E); i12_[0] = f(R * E); i12_[1] = f(R * E); bank_out_ = f(R * E); i18_ = f(R * E);
-        h_[0] = f(R * E); h_[1] = f(R * E);
+        // the row buffers of one call, by their roles in the walk
+        for (float*& b : role_) b = f(R * E);
         emb_ = f(R * E);
         mix_ = f(3 * R * E);
         msg_ = f(kStreams * R * E);
@@ -111,14 +106,13 @@ public:
         logits_ = f(R * (int64_t) g_.n_vocab);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxRows, g_.n_vocab) + R * (bk::kLogprobStride + 1));
         pick_ = (int32_t*) alloc(4 * 32, ok);
-        tok_d_ = (int32_t*) alloc((size_t) R * 4, ok);
-        pos_d_ = (int32_t*) alloc((size_t) R * 4, ok);
-        if (ok && (cudaMallocHost((void**) &tok_h_, (size_t) R * 4) != cudaSuccess || cudaMallocHost((void**) &pos_h_, (size_t) R * 4) != cudaSuccess))
-            ok = false;
-        else if (ok) {
-            pinned_.push_back(tok_h_);
-            pinned_.push_back(pos_h_);
-        }
+        io_d_ = (int32_t*) alloc((size_t) 2 * R * 4, ok);   // a window's tokens, then its positions
+        tok_d_ = io_d_;
+        pos_d_ = io_d_ + R;
+        if (ok && cudaMallocHost((void**) &io_h_, (size_t) kStage * 2 * R * 4) != cudaSuccess) ok = false;
+        else if (ok) pinned_.push_back(io_h_);
+        for (cudaEvent_t& e : stage_ev_)
+            if (ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) ok = false;
         if (!ok) {
             err = "out of device memory for the session";
             return false;
@@ -130,7 +124,8 @@ public:
             cudaMemsetAsync(c.m_ring, 0, (size_t) kConvRing * E * 4, stream_);
         }
         cudaStreamSynchronize(stream_);
-        return true;
+        prompt_ = make_prompt(m_, vc_, stream_, err);   // PROMPT HOOK
+        return prompt_ != nullptr || err.empty();
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
@@ -160,8 +155,9 @@ public:
 
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
-        std::string err;
         hist_.resize((size_t) r.pos);
+        if (prompt_ && r.n_tokens > 16) return prompt_->read(r, hist_);   // PROMPT HOOK
+        std::string err;
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
             if (r.stop && r.stop()) break;
             const int n = std::min(kMaxRows, r.n_tokens - t0);
@@ -370,7 +366,7 @@ private:
 
     // Layer `l` (visit `v`) over `rows` rows: `hid` its input, `blocks` the finished blocks before it, `msgs` (or null)
     // the previous pass's messages [kStreams][rows][E]. Writes its output to `out` (not `hid`).
-    void run_layer(const Visit& v, const float* hid, const std::vector<const float*>& blocks, const float* msgs, int rows,
+    void run_layer(const Visit& v, const float* hid, const float* const* blocks, int n_blocks, const float* msgs, int rows,
                    float* out) {
         const int l = v.layer;
         const LayerWeights& w = m_.layer(l);
@@ -382,7 +378,7 @@ private:
         const float* in[3] = {hid, hid, hid};
         if (w.attn_query) {
             MixStates st;
-            for (const float* b : blocks) st.s[st.n++] = b;
+            for (int i = 0; i < n_blocks; ++i) st.s[st.n++] = blocks[i];
             st.s[st.n++] = hid;
             const int nq = full ? 3 : 1;
             attnres_mix(st, w.attn_query, nq, rows, 1e-6f, mix_, (int64_t) RE, stream_);
@@ -455,7 +451,7 @@ private:
         post_conv(o_, pos_d_, w.attn_post_conv, c.a_ring, boundary ? nullptr : hid, rows, resid_, stream_);
         // the MLP's input
         MixStates st;
-        for (const float* b : blocks) st.s[st.n++] = b;
+        for (int i = 0; i < n_blocks; ++i) st.s[st.n++] = blocks[i];
         if (boundary) st.s[st.n++] = hid;
         st.s[st.n++] = resid_;
         attnres_mix(st, w.ffn_query, 1, rows, 1e-6f, mix_, (int64_t) RE, stream_);
@@ -473,7 +469,7 @@ private:
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
         bk::router(nrm_, w.router, w.router_bias, rows, ra, rlog_, ids_, rw_, stream_);
-        moe_plan(ids_, rows, g_.n_used, g_.n_expert, w.experts, w.blob_bytes, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, stream_);
+        moe_plan(ids_, rows, g_.n_used, g_.n_expert, w.experts, w.expert_stride, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, stream_);
         bk::native_quantize_q8_1(nrm_, xq_, E, rows, stream_);
         bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
         L.gate_softcap = g_.gate_softcap;
@@ -485,80 +481,51 @@ private:
         post_conv(moe_, pos_d_, w.ffn_post_conv, c.m_ring, resid_, rows, out, stream_);
     }
 
-    // The forward of `rows` rows at positions pos0.. (tokens, or embedding rows when `emb` is set); then the head over
-    // the last `head` rows (0: none).
+    float* buf(Buf b) const { return role_[(int) b]; }
+
+    // The forward of `rows` rows at positions pos0.. (tokens, or host embedding rows when `emb` is set, which must stay
+    // as they are until the window's sync); then the head over the last `head` rows (0: none).
     bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err) {
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
         max_pos_ = pos0 + rows - 1;
-        for (int i = 0; i < rows; ++i) pos_h_[i] = (int32_t) (pos0 + i);
-        cudaMemcpyAsync(pos_d_, pos_h_, (size_t) rows * 4, cudaMemcpyHostToDevice, stream_);
-        if (emb) {
-            cudaMemcpyAsync(x0_, emb, RE * 4, cudaMemcpyHostToDevice, stream_);
-        } else {
-            for (int i = 0; i < rows; ++i) tok_h_[i] = tokens[i];
-            cudaMemcpyAsync(tok_d_, tok_h_, (size_t) rows * 4, cudaMemcpyHostToDevice, stream_);
-            bk::iq_embed_rows(kTypeBF16, m_.embedding(), (size_t) E * 2, tok_d_, rows, E, emb_, stream_);
-            bk::rms_norm_rows(emb_, m_.embed_norm(), rows, E, g_.rms_eps, x0_, stream_);
+        // the tokens and positions through a ring of pinned slots: a slot is written again once its copy has run
+        const int slot = (int) (stage_n_++ % kStage);
+        cudaEventSynchronize(stage_ev_[slot]);
+        int32_t* io = io_h_ + (size_t) slot * 2 * kMaxRows;
+        for (int i = 0; i < rows; ++i) {
+            io[i] = tokens ? tokens[i] : 0;
+            io[kMaxRows + i] = (int32_t) (pos0 + i);
         }
-        std::vector<const float*> blocks, pre_blocks;
-        const float* hid = x0_;
-        int hb = 0;   // the ping-pong buffer the next layer writes
-        const float* bank = nullptr;
-        int pass_now = -1;
-        const int core_n = g_.loop_end - g_.loop_start;
-        (void) core_n;
-        for (size_t vi = 0; vi < g_.visits.size(); ++vi) {
-            const Visit& v = g_.visits[vi];
-            const int l = v.layer;
-            if (l == g_.loop_start) {
-                if (v.pass == 0) {
-                    cudaMemcpyAsync(pre_, hid, RE * 4, cudaMemcpyDeviceToDevice, stream_);
-                    pre_blocks = blocks;
-                } else {
-                    // the bank: the previous pass's blocks after its first, and its output
-                    cudaMemcpyAsync(bank_out_, hid, RE * 4, cudaMemcpyDeviceToDevice, stream_);
-                    bank = i12_[(v.pass - 1) % 2];
-                    blocks = pre_blocks;
-                }
-                hid = pre_;
-                pass_now = v.pass;
-            }
+        cudaMemcpyAsync(io_d_, io, (size_t) 2 * kMaxRows * 4, cudaMemcpyHostToDevice, stream_);
+        cudaEventRecord(stage_ev_[slot], stream_);
+        float* x0 = buf(Buf::X0);
+        if (emb) {
+            cudaMemcpyAsync(x0, emb, RE * 4, cudaMemcpyHostToDevice, stream_);
+        } else {
+            bk::iq_embed_rows(kTypeBF16, m_.embedding(), (size_t) E * 2, tok_d_, rows, E, emb_, stream_);
+            bk::rms_norm_rows(emb_, m_.embed_norm(), rows, E, g_.rms_eps, x0, stream_);
+        }
+        const float* blocks[kMaxMix];
+        for (const Step& s : walk_.steps) {
+            const Visit& v = g_.visits[(size_t) s.visit];
             const float* msgs = nullptr;
-            if (v.pass > 0) {
+            if (s.msgs) {
                 MixStates st;
-                st.s[st.n++] = bank;
-                st.s[st.n++] = bank_out_;
-                attnres_mix(st, m_.layer(l).msg_query, kStreams, rows, 1e-6f, msg_, (int64_t) RE, stream_);
+                st.s[st.n++] = buf(s.bank[0]);
+                st.s[st.n++] = buf(s.bank[1]);
+                attnres_mix(st, m_.layer(v.layer).msg_query, kStreams, rows, 1e-6f, msg_, (int64_t) RE, stream_);
                 msgs = msg_;
             }
-            float* out = h_[hb];
-            if (out == hid) out = h_[hb ^= 1];
-            run_layer(v, hid, blocks, msgs, rows, out);
-            if (g_.boundary(l)) {
-                // the layer's input joins the finished blocks
-                const float* keep = hid;
-                if (l == g_.loop_start) {
-                    keep = pre_;
-                } else if (g_.looped(l)) {
-                    cudaMemcpyAsync(i12_[v.pass % 2], hid, RE * 4, cudaMemcpyDeviceToDevice, stream_);
-                    keep = i12_[v.pass % 2];
-                } else if (l > 0) {
-                    cudaMemcpyAsync(i18_, hid, RE * 4, cudaMemcpyDeviceToDevice, stream_);
-                    keep = i18_;
-                }
-                blocks.push_back(keep);
-            }
-            hid = out;
-            hb ^= 1;
+            for (int i = 0; i < s.n_blocks; ++i) blocks[i] = buf(s.blocks[i]);
+            run_layer(v, buf(s.hid), blocks, s.n_blocks, msgs, rows, buf(s.out));
         }
-        (void) pass_now;
         if (head <= 0) return check(err);
         // the head over the last `head` rows
         const int first = rows - head;
         MixStates st;
-        for (const float* b : blocks) st.s[st.n++] = b + (size_t) first * E;
-        st.s[st.n++] = hid + (size_t) first * E;
+        for (int i = 0; i < walk_.n_blocks; ++i) st.s[st.n++] = buf(walk_.blocks[i]) + (size_t) first * E;
+        st.s[st.n++] = buf(walk_.final_hid) + (size_t) first * E;
         attnres_mix(st, m_.output_query(), 1, head, 1e-6f, mix_, (int64_t) head * E, stream_);
         bk::rms_norm_rows(mix_, m_.output_norm(), head, E, g_.rms_eps, fin_, stream_);
         gemv_q8(m_.head(), fin_, E, g_.n_vocab, head, logits_);
@@ -631,7 +598,10 @@ private:
     cudaStream_t stream_ = nullptr;
     std::vector<void*> bufs_, pinned_;
     std::vector<VisitCache> vc_;
-    float *x0_ = nullptr, *pre_ = nullptr, *i12_[2] = {}, *bank_out_ = nullptr, *i18_ = nullptr, *h_[2] = {}, *emb_ = nullptr;
+    std::unique_ptr<PromptRunner> prompt_;   // PROMPT HOOK
+    Walk walk_;
+    float* role_[kBufs] = {};
+    float* emb_ = nullptr;
     float *mix_ = nullptr, *msg_ = nullptr, *ctrl_pair_ = nullptr, *ctrl_hid_ = nullptr, *ctrl_gf_ = nullptr, *ctrl_out_ = nullptr;
     float *nrm_ = nullptr, *yq_ = nullptr, *yk_ = nullptr, *yv_ = nullptr, *q_ = nullptr, *r_ = nullptr, *sink_ = nullptr;
     float *attn_ = nullptr, *gated_ = nullptr, *o_ = nullptr, *resid_ = nullptr, *fin_ = nullptr;
@@ -643,7 +613,9 @@ private:
     int32_t *ex_start_ = nullptr, *ex_ng_ = nullptr, *ex_dst_ = nullptr, *ex_tok_ = nullptr;
     void* ex_scr_ = nullptr;
     float *ex_rows_ = nullptr, *moe_ = nullptr, *logits_ = nullptr;
-    int32_t *pick_ = nullptr, *tok_d_ = nullptr, *pos_d_ = nullptr, *tok_h_ = nullptr, *pos_h_ = nullptr;
+    int32_t *pick_ = nullptr, *io_d_ = nullptr, *tok_d_ = nullptr, *pos_d_ = nullptr, *io_h_ = nullptr;
+    cudaEvent_t stage_ev_[kStage] = {};
+    uint64_t stage_n_ = 0;
     std::vector<int32_t> picks_;
     std::vector<int32_t> hist_;
     float *d_bias_ = nullptr, *d_mask_ = nullptr, *lp_ = nullptr;
