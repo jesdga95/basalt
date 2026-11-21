@@ -2431,7 +2431,7 @@ __global__ void __launch_bounds__(256) native_down_sub8_kernel(const unsigned lo
     const int r = blockIdx.x * kDownSub8Rows + (threadIdx.x >> 3), t = threadIdx.x & 7;
     if (r >= L.n_embd) return;   // whole 8-lane groups leave together: the shuffles stay within the group
     const int K = (int) (L.n_ff / Fmt<TD>::qk) * Fmt<TD>::ipb, hb = (int) (L.n_ff / 32);
-    constexpr int kSub8Kc = TD == 40 ? kDownSub8Calls : 0;   // NVFP4 (n_ff 1152): the unrolled row
+    constexpr int kSub8Kc = TD == 40 ? kDownSub8Calls : TD == 8 ? 144 : 0;   // n_ff 1152 (NVFP4, Q8_0): the unrolled row
     const size_t w_off = L.down_off + (size_t) r * L.d_row;
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
@@ -3034,9 +3034,10 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
             return;
         }
     }
-    if constexpr (TG == 40) {   // NVFP4 rows of 144 calls (n_embd 2304): the unrolled row
-        if (!g_old_kernels && L.n_embd == 144 * Fmt<40>::qk / Fmt<40>::ipb) {
-            native_gu_multi_kernel<40, false, 144><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    if constexpr (TG == 40 || TG == 8) {   // n_embd 2304 (NVFP4 rows of 144 calls, Q8_0 of 288): the unrolled row
+        constexpr int kc = TG == 40 ? 144 : 288;
+        if (!g_old_kernels && L.n_embd == 2304) {
+            native_gu_multi_kernel<TG, false, kc><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
             return;
         }
     }
@@ -3066,6 +3067,7 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
 template<int TD>
 bool down_sub8(const NativeExpertLayout& L) {
     if constexpr (TD == 40) return L.n_ff == 1152;
+    else if constexpr (TD == 8) return L.n_ff == 1152 && L.n_embd == 2304;   // Inkling's Q8_0 layers: 144 calls
     else if constexpr (kDown40<TD> || TD == 42) return false;
     else return L.n_ff % Fmt<TD>::qk == 0 && (L.n_ff / Fmt<TD>::qk) * Fmt<TD>::ipb == kDownSub8Calls;
 }
