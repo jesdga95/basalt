@@ -772,6 +772,7 @@ void test_controllers() {
     controllers(one, S, 1, nullptr);
     same_bits("  a row alone", host(one.norm_out, E).data(), &got[E], (size_t) E * 4);
     std::printf("  %.1f us a call (1 row, 3 streams)\n", time_us([&] { controllers(one, S, 1, nullptr); }));
+    std::printf("  %.1f us a call (%d rows, 3 streams)\n", time_us([&] { controllers(a, S, R, nullptr); }), R);
 }
 
 void test_decode_prepare() {
