@@ -50,10 +50,19 @@ std::string cpu_label(const std::string& raw_name, int physical_cores) {
     };
     for (const char* m : {"(R)", "(TM)", "(r)", "(tm)", " with Radeon Graphics", " Processor"}) erase_all(m);
     if (const size_t at = n.find(" @ "); at != std::string::npos) n.erase(at);   // the clock
+    const auto word_ends = [&n](size_t i) { return i == n.size() || !std::isalnum((unsigned char) n[i]); };
     for (size_t p = 0; (p = n.find("-Core", p)) != std::string::npos;) {   // "16-Core"
-        size_t b = p;
+        size_t b = p, e = p + 5;
         while (b > 0 && std::isdigit((unsigned char) n[b - 1])) --b;
-        n.erase(b, p + 5 - b);
+        if (b < p) {   // a count tag is erased only when it ends the word, a plural "16-Cores" too
+            if (e < n.size() && n[e] == 's' && word_ends(e + 1)) {
+                ++e;
+            } else if (!word_ends(e)) {
+                p = e;
+                continue;
+            }
+        }
+        n.erase(b, e - b);
         p = b;
     }
     if (n.size() >= 4 && n.compare(n.size() - 4, 4, " CPU") == 0) n.erase(n.size() - 4);
