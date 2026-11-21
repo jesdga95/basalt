@@ -209,8 +209,9 @@ using prep::conv_in;
 // ---- mixes -------------------------------------------------------------------------------------------------------------
 
 // Block (row, output q): the mix scored by query q (or the last state), then its norm into q8_1, or the mix as it is.
-// The older key/value cells of a visit's attention into L2 (MixNorm's kv_*): the block's threads request 32 KiB pieces of
-// the one or two runs (the ring may wrap) of the keys and of the values. Up to kKvAheadCells positions: a longer run does
+// The older key/value cells of a visit's attention into L2 (MixNorm's kv_*), by a block of its own after the rows' that
+// exits before the wait (so the rows' blocks reach their wait at once): its threads request 32 KiB pieces of the one or
+// two runs (the ring may wrap) of the keys and of the values. Up to kKvAheadCells positions: a longer run does
 // not stay in L2 through the projections and is read twice.
 constexpr int kKvAheadCells = 256;
 __device__ __forceinline__ void kv_read_ahead(const MixNorm& a) {
@@ -244,10 +245,13 @@ __device__ __forceinline__ void kv_read_ahead(const MixNorm& a) {
 
 __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
     const int r = blockIdx.x, q = blockIdx.y, n = a.st.n;
+    if (a.kv_k && r == (int) gridDim.x - 1) {   // the read-ahead's block: constant through the window, no wait
+        if (q == 0) kv_read_ahead(a);
+        return;
+    }
     float qv[kPer], nw[kPer];   // the weights, read while the kernel before finishes
     if (a.queries) load_row(a.queries + (size_t) q * kWidth, qv);
     if (!a.mix_out) load_row(a.norm[q], nw);
-    if (a.kv_k && r == 0 && q == 0) kv_read_ahead(a);   // constant through the window: before the wait
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     __shared__ float red[kMaxMix * 2 * (kWarpsB + 1)];
@@ -595,7 +599,8 @@ void mix_norm(const MixNorm& a, int n_out, int rows, void* stream) {
     check_rows(rows, "mix_norm");
     if (a.st.n < 1 || a.st.n > kMaxMix || n_out < 1 || (!a.mix_out && n_out > 3))
         throw std::runtime_error("inkling2 mix_norm: states or outputs");
-    bk::launch_pdl(mix_norm_kernel, dim3((unsigned) rows, (unsigned) n_out), dim3(kThreads), 0, (cudaStream_t) stream, a);
+    bk::launch_pdl(mix_norm_kernel, dim3((unsigned) (rows + (a.kv_k ? 1 : 0)), (unsigned) n_out), dim3(kThreads), 0, (cudaStream_t) stream,
+                   a);
     check("mix_norm");
 }
 
