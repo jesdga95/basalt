@@ -157,6 +157,12 @@ struct MixNorm {
     int64_t kv_cap = 0;
     int kv_window = 0;
     int kv_cell = 0;                   ///< bytes of a cell (every key/value head)
+    /// set with kv_pos: the convolution rings' entries of the three positions before the window (the attention's key and
+    /// value rings, [kConvRing][1024], and the attention output's, [kConvRing][kWidth]) into L2 the same way, whatever
+    /// the context
+    const float* ring_k = nullptr;
+    const float* ring_v = nullptr;
+    const float* ring_a = nullptr;
 };
 /// n_out: 1 to 3, or any number with mix_out (the messages of a whole pass).
 void mix_norm(const MixNorm& a, int n_out, int rows, void* stream);
