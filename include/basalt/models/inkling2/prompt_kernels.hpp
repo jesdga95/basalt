@@ -44,6 +44,9 @@ size_t moe_sort_scratch(int pairs, int n_expert);
 void moe_sort(const int32_t* ids, int rows, int k, int n_expert, void* scratch, int32_t* bounds, int32_t* tok, int32_t* dst,
               int32_t* exp, void* stream);
 
+/// ids[i] = map[ids[i]] for `n` entries: a spilled layer's experts by their slot (spill.hpp).
+void remap_ids(int32_t* ids, int n, const int32_t* map, void* stream);
+
 /// pos[i] = pos0 + i for a chunk's `rows` rows, and bounds = {0, rows} (the one-matrix products' row bounds).
 void prompt_rows(int32_t* pos, int64_t pos0, int rows, int32_t* bounds, void* stream);
 

@@ -10,6 +10,8 @@
 // slot) entry. Nothing in a window's forward after its inputs are staged depends on the host: the positions and tokens
 // are read on the card, and the attention's launch bound (a power of two of keys) only sizes its grid.
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/elastic_array.hpp"
+#include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/graph.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
@@ -33,6 +35,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -51,8 +54,23 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(InklingModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
-        prompt_.reset();   // it runs on stream_ and syncs it as it goes
         if (stream_) cudaStreamSynchronize(stream_);
+        prompt_.reset();   // it synchronizes the session's stream as it goes, so before that stream is destroyed
+        if (m_.spill().any() && ex_tally_) {   // how decode's lookups fell between the card and RAM
+            std::vector<uint32_t> t((size_t) expert_pairs());
+            if (cudaMemcpy(t.data(), ex_tally_, t.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                uint64_t all = 0, card = 0;
+                for (int l = 0; l < g_.n_layers; ++l)
+                    for (int e = 0; e < g_.n_expert; ++e) {
+                        const uint32_t n = t[(size_t) l * g_.n_expert + e];
+                        all += n;
+                        if (m_.on_card(l, e)) card += n;
+                    }
+                basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu read from RAM",
+                                  (unsigned long long) all, all ? 100.0 * (double) card / (double) all : 100.0,
+                                  (unsigned long long) (all - card));
+            }
+        }
         for (void* p : bufs_) cudaFree(p);
         for (void* p : pinned_) cudaFreeHost(p);
         for (cudaEvent_t e : stage_ev_)
@@ -79,8 +97,18 @@ public:
             c.ring = g_.swa[(size_t) v.layer];
             c.cap = c.ring ? (int64_t) g_.window + kMaxRows : ctx;
             const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * kHeadDim * elem;
-            c.k = alloc(bytes, ok);
-            c.v = alloc(bytes, ok);
+            if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
+                for (int j = 0; j < 2; ++j) {
+                    auto a = std::make_unique<core::ElasticArray>();
+                    if (ok && (!a->open(bytes, err) || !a->ensure(cell_bytes() * (uint64_t) core::kElasticKvBase, 0, err))) ok = false;
+                    (j ? c.v : c.k) = a->data();
+                    elastic_.push_back(std::move(a));
+                }
+                backed_ = core::kElasticKvBase;
+            } else {
+                c.k = alloc(bytes, ok);
+                c.v = alloc(bytes, ok);
+            }
             c.k_ring = f((int64_t) kConvRing * kKvHeads * kHeadDim);
             c.v_ring = f((int64_t) kConvRing * kKvHeads * kHeadDim);
             c.a_ring = f((int64_t) kConvRing * E);
@@ -141,6 +169,7 @@ public:
         if (r.n_tokens < 1) return {model::Status::Error, "inkling2: an empty window"};
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the window runs past the context"};
         std::string err;
+        if (!ensure_positions(r.pos + r.n_tokens, err)) return {model::Status::Refused, "inkling2: " + err};
         hist_.resize((size_t) r.pos);
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
             const int n = std::min(kMaxRows, r.n_tokens - t0);
@@ -165,6 +194,8 @@ public:
 
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
+        if (r.pos == 0) restart_positions(r.n_tokens);
+        if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) r.pos);
         if (prompt_ && r.n_tokens > 16) return prompt_->read(r, hist_);   // PROMPT HOOK
         std::string err;
@@ -196,6 +227,7 @@ public:
     void images_done() override { m_.encoder().release(); }
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
         if (pos + n_rows > m_.context()) return {model::Status::Refused, "inkling2: the picture runs past the context"};
+        if (std::string e; !ensure_positions(pos + n_rows, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) pos);
         if (prompt_ && n_rows > 16) return prompt_->read_rows(rows, n_rows, pos, g_.image_token, hist_);
         std::string err;
@@ -269,6 +301,48 @@ public:
     // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kMaxRows
     // rows past it.
     size_t elem() const { return m_.cache_fp8() ? 1 : 2; }
+    uint64_t cell_bytes() const { return (uint64_t) kKvHeads * kHeadDim * elem(); }
+
+    // The elastic KV: before a run reaches `positions`, the full visits' caches back them (in steps of kElasticKvStep cells),
+    // and when the card has no room the RAM experts' card copies go back to RAM first, the least routed first. False when
+    // even without any copy there is no room.
+    static constexpr int64_t kElasticKvStep = 8192;
+    static constexpr uint64_t kElasticKeep = 512ull << 20;   // free bytes a grow leaves (the driver, the graphs)
+    bool ensure_positions(int64_t positions, std::string& err) {
+        if (elastic_.empty() || positions <= backed_) return true;
+        const int64_t target = std::min<int64_t>(m_.context(), (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
+        const uint64_t bytes = cell_bytes() * (uint64_t) target;
+        const uint64_t grow = (uint64_t) elastic_.size() * (bytes - std::min<uint64_t>(bytes, elastic_[0]->backed())) + (64ull << 20);
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        if (free_b < grow + kElasticKeep) {
+            const uint64_t freed = m_.demote(grow + kElasticKeep - free_b, stream_);
+            basalt::log::info("basalt inkling2", "elastic spill: the caches grow to %lld positions; %.2f GiB of expert copies go back to RAM "
+                              "(%lld stay on the card)", (long long) target, (double) freed / (double) (1ull << 30), (long long) m_.promoted());
+        }
+        for (auto& a : elastic_)
+            if (!a->ensure(bytes, 0, err)) {
+                err = "the caches cannot grow to " + std::to_string(target) + " positions: " + err;
+                return false;
+            }
+        backed_ = target;
+        return true;
+    }
+    // A conversation starts over (a prompt at position 0): the caches give back the cells past what it needs (never below
+    // the base), and the RAM experts come back to the card while it has room.
+    void restart_positions(int64_t positions) {
+        if (elastic_.empty()) return;
+        const int64_t keep = std::max<int64_t>(core::kElasticKvBase, (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
+        if (keep < backed_) {
+            cudaStreamSynchronize(stream_);
+            for (auto& a : elastic_) a->trim(cell_bytes() * (uint64_t) keep);
+            backed_ = std::min<int64_t>(backed_, (int64_t) (elastic_[0]->backed() / cell_bytes()));
+        }
+        if (m_.promoted() < m_.spill().spilled) {
+            cudaStreamSynchronize(stream_);
+            m_.promote(kElasticKeep + (uint64_t) elastic_.size() * cell_bytes() * (uint64_t) std::max<int64_t>(0, keep - backed_));
+        }
+    }
     size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * kHeadDim * elem(); }
     size_t conv_ring_bytes() const { return (size_t) kConvRing * (2 * kKvHeads * kHeadDim + 2 * (size_t) g_.n_embd) * 4; }
 
@@ -342,6 +416,7 @@ public:
 
     model::Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
+        if (std::string e; !ensure_positions(positions, e)) return {model::Status::Refused, "inkling2: " + e};
         cudaStreamSynchronize(stream_);
         const size_t run = (size_t) positions * kKvHeads * kHeadDim * elem();
         size_t i = 0;
@@ -374,8 +449,8 @@ public:
     ExpertCounts expert_counts() const override { return {lookups_, lookups_, 0, 0}; }
     std::vector<CardExperts> experts_by_card() const override {
         uint64_t bytes = 0;
-        for (int l = 0; l < g_.n_layers; ++l) bytes += (uint64_t) g_.n_expert * m_.layer(l).expert_stride;
-        return {{m_.device(), expert_pairs(), bytes}};
+        for (int l = 0; l < g_.n_layers; ++l) bytes += (uint64_t) (g_.n_expert - m_.layer(l).n_spill) * m_.layer(l).expert_stride;
+        return {{m_.device(), expert_pairs() - m_.spill().spilled, bytes}};
     }
     bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
         tally_h_.resize((size_t) expert_pairs());
@@ -386,8 +461,11 @@ public:
         return true;
     }
     std::string info_words() const override {
-        const std::string n = std::to_string(expert_pairs());
-        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=0 " + program::spill_words({0, expert_pairs(), 0});
+        const std::string n = std::to_string(expert_pairs() - m_.spill().spilled);
+        uint64_t ram = 0;
+        for (int l = 0; l < g_.n_layers; ++l) ram += (uint64_t) m_.layer(l).n_spill * m_.layer(l).expert_stride;
+        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=" + std::to_string(ram >> 20) + " " +
+               program::spill_words({0, expert_pairs(), 0});
     }
 
 private:
@@ -752,6 +830,9 @@ private:
     std::vector<uint32_t> tally_h_;
     ResidentExpertMap map_;
     int64_t lookups_ = 0;                    // decode's routed lookups so far
+    // the elastic KV (model.hpp elastic()): the full visits' caches back their first backed_ cells
+    std::vector<std::unique_ptr<core::ElasticArray>> elastic_;
+    int64_t backed_ = 0;
     int32_t *pick_ = nullptr, *io_d_ = nullptr, *tok_d_ = nullptr, *pos_d_ = nullptr, *io_h_ = nullptr;
     cudaEvent_t stage_ev_[kStage] = {};
     uint64_t stage_n_ = 0;
