@@ -48,6 +48,18 @@ int main() {
     zero = true;
     for (uint32_t r : routed) zero = zero && r == 0;
     expect(zero, "no lookups since the last take");
+    // the card's share of the lookups: the experts a spill sent to RAM are in the lookups but no hits
+    {
+        std::vector<uint32_t> c((size_t) n_layers * n_expert, 1u);
+        auto spilled = [&](int l, int e) { return l >= 20 && e >= 96; };   // layers 20-23 lose their top 32 experts
+        const CardShare s = card_share(c, n_expert, [&](int l, int e) { return !spilled(l, e); });
+        expect(s.all == 3072 && s.card == 3072 - 4 * 32, "a spill's lookups count, its RAM experts are no hits");
+        const CardShare r = card_share(c, n_expert, [](int, int) { return true; });
+        expect(r.card == r.all && r.all == 3072, "every expert on the card: every lookup a hit");
+        c[(size_t) 21 * n_expert + 100] = 1001u;   // a hot RAM expert drags the share down
+        const CardShare h = card_share(c, n_expert, [&](int l, int e) { return !spilled(l, e); });
+        expect(h.all == 4072 && h.card == 2944 && h.card * 100 / h.all == 72, "the share follows where the lookups went");
+    }
     if (failures) return 1;
     std::printf("inkling2 expert map: ok\n");
     return 0;
