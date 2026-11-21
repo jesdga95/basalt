@@ -33,7 +33,7 @@ bool QfnRequest::restore_begin() {
     if (!runtime_.ver.wait_commit(runtime_.err)) {
         return false;
     }
-    return true;
+    return runtime_.kv_pool_swap_in(ids32, cvec_wanted());
 }
 
 void QfnRequest::slot_draft_out() {
