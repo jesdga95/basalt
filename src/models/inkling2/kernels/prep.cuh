@@ -32,10 +32,11 @@ __device__ __forceinline__ float conv_in(const float* __restrict__ y, int64_t ld
     if (r - j >= 0) return y[(size_t) (r - j) * ld + c];
     return conv_ring(ring, ring_w, pos[r] - j, c);
 }
-// conv_in with row r's position pr in hand (read before the kernel's wait: the positions are staged before the window).
+// conv_in with row r's position pr in hand (read before the kernel's wait: the positions are staged before the window);
+// the window's rows of r's conversation start at row `first` (a batch window's segment, else 0).
 __device__ __forceinline__ float conv_in_at(const float* __restrict__ y, int64_t ld, const float* __restrict__ ring, int ring_w,
-                                            int pr, int r, int j, int c) {
-    if (r - j >= 0) return y[(size_t) (r - j) * ld + c];
+                                            int pr, int r, int j, int c, int first = 0) {
+    if (r - j >= first) return y[(size_t) (r - j) * ld + c];
     return conv_ring(ring, ring_w, pr - j, c);
 }
 
@@ -63,13 +64,12 @@ __device__ __forceinline__ void load_weights(const AttnPrep& a, int g, int w, in
 
 // Warp 0 (keys) or 1 (values) of head g for row r at position pr: channels g * kHeadDim + lane * 4.. of the convolved
 // row, `raw` their convolution inputs at the row's own position, and the factor the cache takes them scaled by (the key
-// clip, the value norm).
+// clip, the value norm). `ring`: the warp's ring of r's conversation; its rows of the window start at `first`.
 __device__ __forceinline__ void kv_row(const AttnPrep& a, int r, int pr, int g, int w, int lane, const float (&wt)[4][kConv],
-                                       float (&val)[4], float (&raw)[4], float& f) {
+                                       float (&val)[4], float (&raw)[4], float& f, const float* ring, int first) {
     const float* yall = w ? a.yv : a.yk;
     const int64_t ld = w ? a.ldv : a.ldk;
     const float* y = yall + (size_t) r * ld;
-    const float* ring = w ? a.v_ring : a.k_ring;
     const float inv_k = a.full ? (1.f / 3.f) : rsqrtf((float) kConv + 1.f);
     float ss = 0.f;
 #pragma unroll
@@ -79,7 +79,7 @@ __device__ __forceinline__ void kv_row(const AttnPrep& a, int r, int pr, int g, 
         raw[u] = 0.f;
 #pragma unroll
         for (int j = 0; j < kConv; ++j) {
-            const float x = conv_in_at(yall, ld, ring, kKvHeads * kHeadDim, pr, r, j, c);
+            const float x = conv_in_at(yall, ld, ring, kKvHeads * kHeadDim, pr, r, j, c, first);
             if (j == 0) raw[u] = x;
             float t = wt[u][j];
             if (a.full) t += y[kOffTaps + g * kConv + j];
