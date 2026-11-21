@@ -21,6 +21,7 @@
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "models/inkling2/caches.hpp"
+#include "models/inkling2/dspark.hpp"   // DSPARK HOOK
 #include "models/inkling2/model.hpp"
 #include "models/inkling2/prompt.hpp"
 #include "models/inkling2/walk.hpp"
@@ -125,6 +126,7 @@ public:
             cudaMemsetAsync(c.m_ring, 0, (size_t) kConvRing * E * 4, stream_);
         }
         cudaStreamSynchronize(stream_);
+        if (!dspark_.init(m_.dspark(), g_, m_.context(), kMaxRows, m_.flags().diag_dump, err)) return false;   // DSPARK HOOK
         prompt_ = make_prompt(m_, vc_, stream_, err);   // PROMPT HOOK
         return prompt_ != nullptr || err.empty();
     }
@@ -248,6 +250,13 @@ public:
         return {};
     }
 
+    // DSPARK HOOK: the drafter's windows (the anchor and up to seven drafts) and blocks
+    int max_window() const override { return dspark_.on() ? std::clamp(m_.flags().spec, 1, kMaxRows) : 1; }
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override { return dspark_.draft_begin(anchor, pos, n, stream_); }
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
+        return dspark_.draft_end(ids, conf, max_n, n, need, stream_);
+    }
+
     // ---- conversations: the full-attention visits' cells by position (save_cells / restore_cells), the window rings and
     // the convolutions' rings by checkpoint (running_state). A window ring holds window + kMaxRows positions and a
     // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kMaxRows
@@ -259,7 +268,7 @@ public:
     size_t running_bytes() const override {
         size_t n = 0;
         for (const VisitCache& c : vc_) n += (c.ring ? 2 * kv_bytes_of(c) : 0) + conv_ring_bytes();
-        return n;
+        return n + dspark_.running_bytes();   // DSPARK HOOK
     }
 
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
@@ -277,6 +286,7 @@ public:
             st.regions.push_back({c.a_ring, e_ring});
             st.regions.push_back({c.m_ring, e_ring});
         }
+        dspark_.running_regions(st);   // DSPARK HOOK
         st.stream = stream_;
         return {};
     }
@@ -292,7 +302,7 @@ public:
         size_t n = 0;
         for (const VisitCache& c : vc_)
             if (!c.ring) n += 2 * (size_t) positions * kKvHeads * kHeadDim * elem();
-        return n;
+        return n + dspark_.cells_bytes(positions);   // DSPARK HOOK
     }
 
     // A full-attention visit's cache is cell-major ([cell][head][dim]): its first `positions` cells are one run.
@@ -319,6 +329,7 @@ public:
             if (!down(c.k, k.k) || !down(c.v, k.v)) return {model::Status::Error, "inkling2: reading a cache back failed"};
             kv.push_back(std::move(k));
         }
+        if (!dspark_.save_cells(kv, positions, stream_)) return {model::Status::Error, "inkling2: reading the drafter's cache back failed"};   // DSPARK HOOK
         return {};
     }
 
@@ -340,6 +351,8 @@ public:
             if (!up(c.k, kv[i].k) || !up(c.v, kv[i].v)) return {model::Status::Error, "inkling2: writing a cache back failed"};
             ++i;
         }
+        if (dspark_.on() && !dspark_.restore_cells(kv, i, positions, stream_))   // DSPARK HOOK
+            return {model::Status::Error, "inkling2: a parked conversation has no drafter cells"};
         return {};
     }
 
@@ -550,7 +563,9 @@ private:
         // the full-attention visits' launch bound: the window's keys rounded up to a power of two
         int64_t full_keys = 1024;
         while (full_keys < pos0 + rows) full_keys <<= 1;
-        return layers(rows, head, full_keys, err) && check(err);
+        if (!layers(rows, head, full_keys, err) || !check(err)) return false;
+        dspark_.note(pos0, rows);   // DSPARK HOOK: the host's record of the rows the drafter took
+        return true;
     }
 
     // The layers and the head of a window of `rows` rows: replayed from its shape's graph, captured on the shape's second
@@ -594,20 +609,28 @@ private:
                 msgs = msg_ + (size_t) (v.layer - g_.loop_start) * kStreams * RE;
             }
             for (int i = 0; i < s.n_blocks; ++i) blocks[i] = buf(s.blocks[i]);
+            if (int k = dspark_.slot_of_visit(s.visit); k >= 0)   // DSPARK HOOK: the visit's input rows
+                cudaMemcpyAsync(dspark_.tap(k), buf(s.hid), RE * 4, cudaMemcpyDeviceToDevice, stream_);
             run_layer(v, buf(s.hid), blocks, s.n_blocks, msgs, rows, full_keys, buf(s.out));
         }
-        if (head <= 0) return;
-        const int first = rows - head;
+        const bool tapped = dspark_.on();   // DSPARK HOOK: the drafter reads every row's final normed state
+        if (head <= 0 && !tapped) return;
+        // the final normed state over the last `head` rows (every row for the drafter), then the head over the last `head`
+        const int first = tapped ? 0 : rows - head, n_fin = rows - first;
         MixNorm hn;
         for (int i = 0; i < walk_.n_blocks; ++i) hn.st.s[hn.st.n++] = buf(walk_.blocks[i]) + (size_t) first * E;
         hn.st.s[hn.st.n++] = buf(walk_.final_hid) + (size_t) first * E;
         hn.queries = m_.output_query();
         hn.norm[0] = m_.output_norm();
         hn.q8[0] = xq_[0];
-        hn.norm_out = fin_;
+        hn.norm_out = tapped ? dspark_.tap(kDsTargets - 1) : fin_;
         hn.eps = g_.rms_eps;
-        mix_norm(hn, 1, head, stream_);
-        bk::native_q8_0_mmvq(m_.head(), xq_[0], logits_, E, g_.n_vocab, head, stream_);
+        mix_norm(hn, 1, n_fin, stream_);
+        if (tapped) dspark_.commit(pos_d_, rows, stream_);   // DSPARK HOOK: the rows' context for the drafter
+        if (head <= 0) return;
+        const size_t q8_row = (size_t) E / 32 * 36;   // the head's rows' q8_1 blocks follow the rows before them
+        bk::native_q8_0_mmvq(m_.head(), (const uint8_t*) xq_[0] + (size_t) (rows - head - first) * q8_row, logits_, E, g_.n_vocab, head,
+                             stream_);
         softcap(logits_, head, g_.n_vocab, g_.n_vocab, g_.logit_softcap, stream_);
     }
 
@@ -677,6 +700,7 @@ private:
     std::vector<void*> bufs_, pinned_;
     std::vector<VisitCache> vc_;
     std::unique_ptr<PromptRunner> prompt_;   // PROMPT HOOK
+    DsparkHook dspark_;                      // DSPARK HOOK
     Walk walk_;
     std::map<uint64_t, core::CapturedGraph> graphs_;   // by window shape: rows, head rows, the full visits' launch bound
     std::set<uint64_t> direct_;                        // the shapes whose first window has run

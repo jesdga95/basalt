@@ -4,6 +4,7 @@
 #pragma once
 
 #include "basalt/model/adapter.hpp"
+#include "models/inkling2/dspark.hpp"   // DSPARK HOOK
 #include "models/inkling2/pack.hpp"
 #include "models/inkling2/vision_encoder.hpp"   // [vision]
 
@@ -67,6 +68,7 @@ public:
     bool cache_fp8() const { return fp8_; }
     /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests.
     ImageEncoder& encoder() const { return vis_; }
+    const DsparkWeights* dspark() const { return dspark_.get(); }   // DSPARK HOOK: null without a drafter or with --spec 1
 
 private:
     float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err,
@@ -90,6 +92,7 @@ private:
     bool fp8_ = false;
     int64_t ctx_ = kDefaultContext;
     mutable ImageEncoder vis_;   // [vision]
+    std::unique_ptr<DsparkWeights> dspark_;   // DSPARK HOOK
 };
 
 /// A session over `model`; null with `err` set.
