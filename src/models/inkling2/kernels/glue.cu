@@ -167,12 +167,14 @@ using prep::conv_in;
 
 // Block (row, output q): the mix scored by query q (or the last state), then its norm into q8_1, or the mix as it is.
 // The older key/value cells of a visit's attention into L2 (MixNorm's kv_*): the block's threads request 32 KiB pieces of
-// the one or two runs (the ring may wrap) of the keys and of the values.
+// the one or two runs (the ring may wrap) of the keys and of the values. Up to kKvAheadCells positions: a longer run does
+// not stay in L2 through the projections and is read twice.
+constexpr int kKvAheadCells = 256;
 __device__ __forceinline__ void kv_read_ahead(const MixNorm& a) {
     const int p0 = a.kv_pos[0];
     const int lo = a.kv_window > 0 ? max(0, p0 - a.kv_window + 1) : 0;
     const int n = p0 - lo;
-    if (n <= 0 || n > 1024) return;
+    if (n <= 0 || n > kKvAheadCells) return;
     const int64_t c0 = lo % a.kv_cap, run1 = min((int64_t) n, a.kv_cap - c0), run2 = n - run1;
     const uint64_t b1 = (uint64_t) run1 * a.kv_cell, b2 = (uint64_t) run2 * a.kv_cell;
     constexpr uint64_t kPiece = 32768;
