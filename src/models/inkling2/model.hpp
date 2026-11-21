@@ -90,6 +90,9 @@ public:
     /// `stream`, which is waited for before the copies are freed). Bytes freed.
     uint64_t demote(uint64_t bytes, void* stream);
     int64_t promoted() const { return n_copy_; }
+    /// A prompt chunk's staging of layer l's RAM experts from their card copies, when every one has a copy (false: none
+    /// issued; the caller copies them from RAM).
+    bool stage_from_card(int l, void* stream) const;
     const SpillPlan& spill() const { return spill_; }
 
 private:
@@ -133,6 +136,7 @@ private:
     std::vector<void*> copy_;
     std::vector<unsigned long long> host_addr_;
     int64_t n_copy_ = 0;
+    std::vector<int> layer_copies_;   ///< [layer] RAM experts with a card copy
 };
 
 /// A session over `model`; null with `err` set.

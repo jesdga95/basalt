@@ -383,13 +383,13 @@ private:
             controller(w, 3, b_.mix, b_.msg, rows, b_.mix);
         }
         bk::rms_norm_rows(b_.mix, w.ffn_norm, rows, E, g_.rms_eps, b_.nrm, stream_);
-        experts(w, rows);
+        experts(w, l, rows);
         post_conv(b_.moe, b_.pos, w.ffn_post_conv, c.m_ring, b_.resid, rows, out, stream_);
     }
 
     // The routed experts of the chunk's normed MLP inputs (nrm) into moe: the router's scores as one product, the pairs
     // sorted by expert, the gate/up and down products per expert in two MMQ launches over the experts in place.
-    void experts(const LayerWeights& w, int rows) {
+    void experts(const LayerWeights& w, int l, int rows) {
         const int E = g_.n_embd, F = g_.n_ff_exp, k = g_.n_used, pairs = rows * k;
         bk::f32_rows_dot(b_.nrm, w.router, b_.rlog, rows, g_.n_expert, E, stream_);
         bk::RouterArgs ra;
@@ -402,7 +402,8 @@ private:
         if (w.slot_map) {   // a layer with experts in RAM (spill.hpp): its pairs by slot, its RAM experts copied into the staging
             remap_ids(b_.ids, pairs, w.slot_map, stream_);
             const uint64_t kept = (uint64_t) (g_.n_expert - w.n_spill) * w.expert_stride;
-            cudaMemcpyAsync(w.experts + kept, w.spill_host, (size_t) w.n_spill * w.expert_stride, cudaMemcpyHostToDevice, stream_);
+            if (!m_.stage_from_card(l, stream_))   // the elastic spill's card copies when the layer has them all
+                cudaMemcpyAsync(w.experts + kept, w.spill_host, (size_t) w.n_spill * w.expert_stride, cudaMemcpyHostToDevice, stream_);
             cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, stream_);   // spill.hpp
         }
         moe_sort(b_.ids, rows, k, g_.n_expert, b_.sort_scr, b_.bounds, b_.tok, b_.dst, b_.exp, stream_);
