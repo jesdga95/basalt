@@ -52,6 +52,21 @@ public:
     explicit Session(InklingModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
         if (stream_) cudaStreamSynchronize(stream_);
+        if (m_.spill().any() && ex_tally_) {   // how decode's lookups fell between the card and RAM
+            std::vector<uint32_t> t((size_t) expert_pairs());
+            if (cudaMemcpy(t.data(), ex_tally_, t.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                uint64_t all = 0, card = 0;
+                for (int l = 0; l < g_.n_layers; ++l)
+                    for (int e = 0; e < g_.n_expert; ++e) {
+                        const uint32_t n = t[(size_t) l * g_.n_expert + e];
+                        all += n;
+                        if (m_.on_card(l, e)) card += n;
+                    }
+                basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu read from RAM",
+                                  (unsigned long long) all, all ? 100.0 * (double) card / (double) all : 100.0,
+                                  (unsigned long long) (all - card));
+            }
+        }
         for (void* p : bufs_) cudaFree(p);
         for (void* p : pinned_) cudaFreeHost(p);
         for (cudaEvent_t e : stage_ev_)
@@ -373,8 +388,8 @@ public:
     ExpertCounts expert_counts() const override { return {lookups_, lookups_, 0, 0}; }
     std::vector<CardExperts> experts_by_card() const override {
         uint64_t bytes = 0;
-        for (int l = 0; l < g_.n_layers; ++l) bytes += (uint64_t) g_.n_expert * m_.layer(l).expert_stride;
-        return {{m_.device(), expert_pairs(), bytes}};
+        for (int l = 0; l < g_.n_layers; ++l) bytes += (uint64_t) (g_.n_expert - m_.layer(l).n_spill) * m_.layer(l).expert_stride;
+        return {{m_.device(), expert_pairs() - m_.spill().spilled, bytes}};
     }
     bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
         tally_h_.resize((size_t) expert_pairs());
@@ -385,8 +400,11 @@ public:
         return true;
     }
     std::string info_words() const override {
-        const std::string n = std::to_string(expert_pairs());
-        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=0 " + program::spill_words({0, expert_pairs(), 0});
+        const std::string n = std::to_string(expert_pairs() - m_.spill().spilled);
+        uint64_t ram = 0;
+        for (int l = 0; l < g_.n_layers; ++l) ram += (uint64_t) m_.layer(l).n_spill * m_.layer(l).expert_stride;
+        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=" + std::to_string(ram >> 20) + " " +
+               program::spill_words({0, expert_pairs(), 0});
     }
 
 private:
