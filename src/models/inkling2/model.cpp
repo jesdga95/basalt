@@ -387,6 +387,7 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
     const uint64_t gran = spill_.any() ? core::vmm::granularity() : 0;
     if (spill_.any()) {
         copy_.assign((size_t) g.n_layers * g.n_expert, nullptr);
+        layer_copies_.assign((size_t) g.n_layers, 0);
         host_addr_.assign((size_t) g.n_layers * g.n_expert, 0);
     }
     // the RAM copies, every spilled layer's in slot order, and the staging their ranges share
@@ -533,9 +534,21 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
         }
         copy_[i] = p;
         ++n_copy_;
+        ++layer_copies_[(size_t) l];
         moved += w.expert_stride;
     }
     return moved;
+}
+
+bool InklingModel::stage_from_card(int l, void* stream) const {
+    const LayerWeights& w = layers_[(size_t) l];
+    if (copy_.empty() || w.n_spill == 0 || layer_copies_[(size_t) l] < w.n_spill) return false;
+    const int ne = geo().n_expert;
+    for (int e = 0; e < ne; ++e)
+        if (const void* c = copy_[(size_t) l * ne + e])
+            cudaMemcpyAsync(w.experts + (uint64_t) spill_.slot[(size_t) l][(size_t) e] * w.expert_stride, c, w.expert_stride,
+                            cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
+    return true;
 }
 
 uint64_t InklingModel::demote(uint64_t bytes, void* stream) {
@@ -555,6 +568,7 @@ uint64_t InklingModel::demote(uint64_t bytes, void* stream) {
         cudaFree(copy_[i]);
         copy_[i] = nullptr;
         --n_copy_;
+        --layer_copies_[i / (size_t) ne];
     }
     return freed;
 }
