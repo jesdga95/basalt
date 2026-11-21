@@ -58,13 +58,16 @@ public:
     const float* embed_norm() const { return embed_norm_; }
     const float* output_norm() const { return output_norm_; }
     const float* output_query() const { return output_query_; }
+    /// [core layers][kStreams][n_embd]: every core layer's message queries, layer loop_start first
+    const float* msg_queries() const { return msg_queries_; }
     int device() const { return device_; }
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     const model::LoadRequest& flags() const { return flags_; }
     bool cache_fp8() const { return fp8_; }
 
 private:
-    float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err);
+    float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err,
+                 float* dst = nullptr);
     uint16_t* small_bf16(const std::string& name, uint64_t values, core::LoadPlan& reads, int file, std::string& err,
                          uint16_t* dst = nullptr);
 
@@ -78,6 +81,7 @@ private:
     const float* embed_norm_ = nullptr;
     const float* output_norm_ = nullptr;
     const float* output_query_ = nullptr;
+    float* msg_queries_ = nullptr;
     model::LoadRequest flags_;
     int device_ = 0, fd_ = -1;
     bool fp8_ = false;

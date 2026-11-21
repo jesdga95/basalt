@@ -149,7 +149,7 @@ struct MixNorm {
     float* mix_out = nullptr;
     int64_t out_stride = 0;
 };
-/// n_out: 1 or 3 (or 4 with mix_out, the message bank's four queries).
+/// n_out: 1 to 3, or any number with mix_out (the messages of a whole pass).
 void mix_norm(const MixNorm& a, int n_out, int rows, void* stream);
 
 /// Up to kMaxStreams loop controllers over the same rows: stream s blends dest[s] with msg[s] (rows at r * kWidth),

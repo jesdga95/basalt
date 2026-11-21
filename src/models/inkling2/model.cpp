@@ -71,18 +71,21 @@ InklingModel::~InklingModel() {
     if (fd_ >= 0) platform::close_fd(fd_);
 }
 
-float* InklingModel::small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err) {
+float* InklingModel::small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err,
+                           float* dst) {
     const TensorRef* t = pack_.find(name);
     if (!t || t->type != kTypeF32 || t->bytes != floats * 4) {
         err = name + (t ? " is not F32 of the expected size" : " is missing");
         return nullptr;
     }
-    void* p = nullptr;
-    if (cudaMalloc(&p, t->bytes) != cudaSuccess) {
-        err = "out of device memory loading " + name;
-        return nullptr;
+    void* p = dst;
+    if (!p) {
+        if (cudaMalloc(&p, t->bytes) != cudaSuccess) {
+            err = "out of device memory loading " + name;
+            return nullptr;
+        }
+        dev_.push_back(p);
     }
-    dev_.push_back(p);
     core::LoadItem it;
     it.file = file;
     it.off = t->offset;
@@ -186,6 +189,10 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
 
     uint64_t dense = n_vocab * kQ8Row, experts = 0;
     layers_.assign((size_t) g.n_layers, LayerWeights{});
+    // the loop's message queries of every core layer in one array: a pass's messages are one launch
+    const uint64_t msg_floats = (uint64_t) kStreams * n_embd;
+    if (!(msg_queries_ = reinterpret_cast<float*>(device_buf((uint64_t) (g.loop_end - g.loop_start) * msg_floats * 4))))
+        return fail("out of device memory loading the loop's message queries");
     for (int l = 0; l < g.n_layers; ++l) {
         LayerWeights& w = layers_[(size_t) l];
         const bool full = !g.swa[(size_t) l];
@@ -238,7 +245,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             return fail(err);
         if (l > 0 && !(w.attn_query = S("attn_res_query.weight", (full ? 3 : 1) * n_embd))) return fail(err);
         if (g.looped(l)) {
-            if (!(w.msg_query = S("loop_msg_query.weight", kStreams * n_embd))) return fail(err);
+            if (!(w.msg_query = small(b + "loop_msg_query.weight", msg_floats, reads, file, err,
+                                      msg_queries_ + (uint64_t) (l - g.loop_start) * msg_floats)))
+                return fail(err);
             const uint64_t rank = (uint64_t) g.gate_rank;
             for (int s = 0; s < kStreams; ++s) {
                 const std::string c = b + "loop_" + kStreamNames[s] + "_ctrl_";

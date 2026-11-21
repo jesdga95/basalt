@@ -86,7 +86,7 @@ public:
         for (float*& b : role_) b = f(R * E);
         emb_ = f(R * E);
         mix_ = f(3 * R * E);
-        msg_ = f(kStreams * R * E);
+        msg_ = f((int64_t) (g_.loop_end - g_.loop_start) * kStreams * R * E);
         ctrl_scr_ = f((int64_t) ctrl_scratch_floats(g_.gate_rank));
         nrm_ = f(R * E);
         y_ = f(R * kProj);
@@ -554,15 +554,18 @@ private:
         for (const Step& s : walk_.steps) {
             const Visit& v = g_.visits[(size_t) s.visit];
             const float* msgs = nullptr;
-            if (s.msgs) {   // the four streams' messages from the bank
-                MixNorm mm;
-                mm.st.s[mm.st.n++] = buf(s.bank[0]);
-                mm.st.s[mm.st.n++] = buf(s.bank[1]);
-                mm.queries = m_.layer(v.layer).msg_query;
-                mm.mix_out = msg_;
-                mm.out_stride = (int64_t) RE;
-                mix_norm(mm, kStreams, rows, stream_);
-                msgs = msg_;
+            if (s.msgs) {
+                const int core = g_.loop_end - g_.loop_start;
+                if (v.layer == g_.loop_start) {   // a pass's messages, every core layer's four streams, from its bank
+                    MixNorm mm;
+                    mm.st.s[mm.st.n++] = buf(s.bank[0]);
+                    mm.st.s[mm.st.n++] = buf(s.bank[1]);
+                    mm.queries = m_.msg_queries();
+                    mm.mix_out = msg_;
+                    mm.out_stride = (int64_t) RE;
+                    mix_norm(mm, core * kStreams, rows, stream_);
+                }
+                msgs = msg_ + (size_t) (v.layer - g_.loop_start) * kStreams * RE;
             }
             for (int i = 0; i < s.n_blocks; ++i) blocks[i] = buf(s.blocks[i]);
             run_layer(v, buf(s.hid), blocks, s.n_blocks, msgs, rows, full_keys, buf(s.out));

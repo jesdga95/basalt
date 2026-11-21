@@ -484,9 +484,8 @@ void check_rows(int rows, const char* what) {
 void mix_norm(const MixNorm& a, int n_out, int rows, void* stream) {
     if (rows <= 0) return;
     check_rows(rows, "mix_norm");
-    if (a.st.n < 1 || a.st.n > kMaxMix || (n_out == 4 && !a.mix_out))
+    if (a.st.n < 1 || a.st.n > kMaxMix || n_out < 1 || (!a.mix_out && n_out > 3))
         throw std::runtime_error("inkling2 mix_norm: states or outputs");
-    if (n_out != 1 && n_out != 3 && n_out != 4) throw std::runtime_error("inkling2 mix_norm: outputs");
     bk::launch_pdl(mix_norm_kernel, dim3((unsigned) rows, (unsigned) n_out), dim3(kThreads), 0, (cudaStream_t) stream, a);
     check("mix_norm");
 }
