@@ -16,7 +16,42 @@
 namespace basalt::prefill {
 using namespace detail;
 
+bool Prefill::Run::Chunk::publish_route(int64_t layer) {
+    if (!route_snapshot.counts) return true;
+    const size_t stride = (size_t) g.n_expert, offset = (size_t) layer * stride;
+    if (cudaMemcpyAsync(route_snapshot.counts + offset, m.hist + offset, stride * sizeof(uint32_t),
+                        cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+        err = "prefill: could not read routing counts";
+        return false;
+    }
+    if (cudaEventRecord(route_snapshot.ready[(size_t) layer], cs) != cudaSuccess) {
+        cudaStreamSynchronize(cs);  // the copy still owns the host row until it finishes
+        err = "prefill: could not record routing readiness";
+        return false;
+    }
+    route_snapshot.recorded.store(layer, std::memory_order_release);
+    return true;
+}
+
 bool Prefill::Run::Chunk::start_stream() {
+    if (stream_all && first_stage && single_chunk && LB == 0 && LE == g.n_layers && !ppc && m.hist_on) {
+        const size_t bytes = (size_t) g.n_layers * g.n_expert * sizeof(uint32_t);
+        route_snapshot.stream = cs;
+        uint32_t* counts = nullptr;
+        if (cudaMallocHost((void**) &counts, bytes) == cudaSuccess) {
+            route_snapshot.ready.resize((size_t) g.n_layers, nullptr);
+            bool ready = true;
+            for (cudaEvent_t& event : route_snapshot.ready) {
+                if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+                    ready = false;
+                    break;
+                }
+            }
+            // A missing hint leaves the original streaming path available.
+            if (ready) route_snapshot.counts = counts;
+            else cudaFreeHost(counts);
+        }
+    }
     if (stream_all) {
         seq_start.assign((size_t) g.n_layers + 1, 0);
         std::vector<Stager::Job> js;
@@ -56,6 +91,8 @@ bool Prefill::Run::Chunk::start_stream() {
     if (threaded_issue) {
         issuer = std::thread([this] {
             const core::OnDevice od(m.device);
+            int32_t layer = -1;
+            const uint32_t* counts = nullptr;
             for (size_t idx = 0; idx < seq.size(); ++idx) {
                 while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
                     if (a_stop.load(std::memory_order_acquire)) return;
@@ -71,24 +108,40 @@ bool Prefill::Run::Chunk::start_stream() {
                 const StreamEntry& en = seq[idx];
                 const int sl = (int) (idx % (size_t) m.ring);
                 const auto th = Clock::now();
+                const bool can_skip_copy = route_snapshot.counts && en.job < 0 && en.pdev == nullptr;
+                if (can_skip_copy) {
+                    if (layer != en.l) { layer = en.l; counts = nullptr; }
+                    // This copy already depends on the slot's previous consumer. Wait here only when
+                    // the completed routing counts could make the copy unnecessary.
+                    if (!counts && m.stage_live[sl])
+                        cudaEventSynchronize(m.used[m.used_of[sl]]);
+                    if (!counts &&
+                        layer <= route_snapshot.recorded.load(std::memory_order_acquire) &&
+                        cudaEventQuery(route_snapshot.ready[(size_t) layer]) == cudaSuccess)
+                        counts = route_snapshot.counts + (size_t) layer * g.n_expert;
+                }
+                const bool skip = can_skip_copy && counts && counts[(size_t) en.e] == 0;
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                if (en.pdev != nullptr) {
-                    if (peer_async) m.peer_stage.copy(m.stage_dev[sl], en.pdev, bytes, m.copy);
-                    else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, en.pdev, remote_device, bytes, m.copy);
-                    ++iss_dma;
-                } else if (en.job < 0) {
-                    cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
-                    ++iss_dma;
-                } else {
-                    const uint8_t* hb = m.stager->wait(en.job);
-                    cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
-                    m.stager->issued_one(en.job, m.copy);
+                if (!skip) {
+                    if (en.pdev != nullptr) {
+                        if (peer_async) m.peer_stage.copy(m.stage_dev[sl], en.pdev, bytes, m.copy);
+                        else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, en.pdev, remote_device, bytes, m.copy);
+                        ++iss_dma;
+                    } else if (en.job < 0) {
+                        cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                        ++iss_dma;
+                    } else {
+                        const uint8_t* hb = m.stager->wait(en.job);
+                        cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
+                        m.stager->issued_one(en.job, m.copy);
+                    }
                 }
+                // Preserve the ring dependency even when routing proves the copy is unnecessary.
                 cudaEventRecord(m.copied[sl], m.copy);
                 m.stage_live[sl] = true;
                 iss_ms += ms_since(th);
-                ++iss_streamed;
+                if (!skip) ++iss_streamed;
                 a_issued.store(idx + 1, std::memory_order_release);
             }
         });
