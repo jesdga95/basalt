@@ -114,6 +114,29 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     const int span = span_of(n);
     if (s * span >= n) return;   // past this row's slices
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
+    constexpr int kRowBytes = FP8 ? kHeadDim : kHeadDim * 2;
+    constexpr int kLoads = kRowBytes / 16;
+    const uint8_t* kbase = static_cast<const uint8_t*>(a.k_cache) + (size_t) g * kRowBytes;
+    const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kRowBytes;
+    // a tile's key and value rows, the lane's key's (zero past the slice); the warp's first tile is loaded with the queries
+    const auto load_tile = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kLoads]) {
+        const int key = t0 + lane;
+        if (key < s_hi) {
+            const size_t cell = (size_t) (key % a.cap) * kKvHeads * kRowBytes;
+            const uint4* kp = reinterpret_cast<const uint4*>(kbase + cell);
+            const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
+#pragma unroll
+            for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
+#pragma unroll
+            for (int i = 0; i < kLoads; ++i) vr[i] = vp[i];
+        } else {
+#pragma unroll
+            for (int i = 0; i < kLoads; ++i) kr[i] = vr[i] = make_uint4(0, 0, 0, 0);
+        }
+    };
+    const int t_first = s_lo + w * kTile;
+    uint4 kr[kLoads], vr[kLoads];
+    if (t_first < s_hi) load_tile(t_first, kr, vr);
     for (int i = threadIdx.x; i < kGroup * kHeadDim; i += blockDim.x)
         sm.q[i / kHeadDim][i % kHeadDim] = a.q[((size_t) r * kHeads + g * kGroup) * kHeadDim + i];
     for (int i = threadIdx.x; i < kGroup * kRel; i += blockDim.x)
@@ -127,26 +150,10 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
 #pragma unroll
         for (int u = 0; u < 4; ++u) acc[h][u] = 0.f;
     }
-    constexpr int kRowBytes = FP8 ? kHeadDim : kHeadDim * 2;
-    constexpr int kLoads = kRowBytes / 16;
-    const uint8_t* kbase = static_cast<const uint8_t*>(a.k_cache) + (size_t) g * kRowBytes;
-    const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kRowBytes;
-    for (int t0 = s_lo + w * kTile; t0 < s_hi; t0 += kUnit) {
+    for (int t0 = t_first; t0 < s_hi; t0 += kUnit) {
         const int key = t0 + lane;
         const bool valid = key < s_hi;
-        uint4 kr[kLoads], vr[kLoads];
-        if (valid) {
-            const size_t cell = (size_t) (key % a.cap) * kKvHeads * kRowBytes;
-            const uint4* kp = reinterpret_cast<const uint4*>(kbase + cell);
-            const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
-#pragma unroll
-            for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
-#pragma unroll
-            for (int i = 0; i < kLoads; ++i) vr[i] = vp[i];
-        } else {
-#pragma unroll
-            for (int i = 0; i < kLoads; ++i) kr[i] = vr[i] = make_uint4(0, 0, 0, 0);
-        }
+        if (t0 != t_first) load_tile(t0, kr, vr);
         // the lane's key scored for the three heads
         float sc[kGroup] = {0.f, 0.f, 0.f};
 #pragma unroll
@@ -368,7 +375,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
         } else {
             for (int rr = max(0, s_lo - p0); rr <= r && p0 + rr < s_hi; ++rr) {
                 float val[4], raw[4], f;
-                prep::kv_row(pa, rr, g, w, lane, wt, val, raw, f);
+                prep::kv_row(pa, rr, p0 + rr, g, w, lane, wt, val, raw, f);
                 uint8_t* row = w ? fs.vw[rr] : fs.kw[rr];
 #pragma unroll
                 for (int u = 0; u < 4; ++u) prep::store_kv(row, FP8, (size_t) lane * 4 + u, val[u] * f);

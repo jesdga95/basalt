@@ -386,7 +386,7 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
     const int p = a.pos[r];
     if (w < 2) {
         float val[4], raw[4], f;
-        prep::kv_row(a, r, g, w, lane, wt, val, raw, f);
+        prep::kv_row(a, r, p, g, w, lane, wt, val, raw, f);
         void* cache = w ? a.v_cache : a.k_cache;
         const size_t cell = ((size_t) (p % a.cap) * kKvHeads + g) * kHeadDim + lane * 4;
 #pragma unroll
