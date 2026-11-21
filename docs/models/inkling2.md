@@ -71,7 +71,10 @@ more from it than from the block: a 2,405-token copy prompt decodes 13 % faster.
 
 ## Parallel slots
 
-Not measured. `--parallel N` starts N sessions, each with its own caches and drafter scratch, the context split between them.
+`--parallel N` starts N sessions, each with its own caches, rings and drafter context. The busy slots decode together, one pass
+through the weights of up to 8 rows ([batched decoding](../design/batching.md)): two slots verify 4 rows each, four 2 each, eight
+one each. A request alone in its slot gives the same greedy tokens as with `--parallel 1`, and requests decoding together each
+give the tokens they give alone. Every session holds its own scratch, so eight slots leave experts in RAM even at a short context.
 
 ## Images
 
