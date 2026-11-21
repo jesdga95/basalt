@@ -433,9 +433,8 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
         }
     }
     __syncthreads();
-    if (warp != 0) return;
-    px::pick<false, true>(f, n, n_tiles, nullptr, part, prev, conf + i);
-    if (lane == 0) ids[i] = *prev;
+    px::pick_block<false>(f, n, n_tiles, nullptr, part, prev, conf + i);
+    if (tid == 0) ids[i] = *prev;
 }
 
 // by_row[r] = by_token[token_of(r)] (0 past the vocabulary).
