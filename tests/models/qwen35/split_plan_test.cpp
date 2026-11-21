@@ -99,6 +99,28 @@ int main() {
     expect_error("forced at 64 (no layer left for the second card)", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060, 64));
     check(basalt::dense::split_cards_alike({0, 896}, {0, 960}) && !basalt::dense::split_cards_alike({0, 1792}, {0, 448}),
           "cards within 10% of each other's bandwidth are alike");
+    // three cards: the same bytes, a cut on each boundary, every card inside its free memory
+    {
+        constexpr uint64_t stage_bytes = 256ull << 20;
+        const SplitInputs in = inputs(int8_262k, 1, kMainFixed, r5070, r5070);
+        const basalt::dense::StageSplit s = basalt::dense::plan_stage_split(in, {r5070, r5070, r5070}, stage_bytes);
+        const bool spans = s.error.empty() && s.bounds.size() == 4 && s.bounds[0] == 0 && s.bounds[3] == 64 && s.bytes.size() == 3 &&
+                           s.bounds[1] > s.bounds[0] && s.bounds[2] > s.bounds[1];
+        bool fit = spans;
+        for (int c = 0; fit && c < 3; ++c) fit = s.bytes[(size_t) c] <= r5070.free;
+        const int a = spans ? s.bounds[1] - s.bounds[0] : 0, b = spans ? s.bounds[2] - s.bounds[1] : 0, c = spans ? s.bounds[3] - s.bounds[2] : 0;
+        check(fit && a >= 16 && a <= 28 && b >= 16 && b <= 28 && c >= 16 && c <= 28,
+              "3x16, 262K int8: cuts " + std::to_string(a) + "/" + std::to_string(b) + "/" + std::to_string(c) +
+                  (s.error.empty() ? "" : " (" + s.error + ")"));
+        const SplitCard slow = card(k5090, 50), fast = card(k5090, 500);
+        const basalt::dense::StageSplit u = basalt::dense::plan_stage_split(inputs(fp16_8k, 1, kMainFixed8K, fast, fast), {fast, fast, slow}, stage_bytes);
+        const int last = u.bounds.size() == 4 ? u.bounds[3] - u.bounds[2] : 64;
+        const int first = u.bounds.size() == 4 ? u.bounds[1] : 0;
+        check(u.error.empty() && last < first, "a slower third card keeps fewer layers: " + std::to_string(first) + " then " + std::to_string(last));
+        const SplitCard tiny{64ull << 20, 448};
+        const basalt::dense::StageSplit no = basalt::dense::plan_stage_split(in, {tiny, tiny, tiny}, stage_bytes);
+        check(!no.error.empty() && no.bounds.empty(), "3 tiny cards refuse (" + no.error + ")");
+    }
     std::printf("%s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;
 }

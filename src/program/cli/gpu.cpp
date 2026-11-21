@@ -50,6 +50,8 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     ri.max_expert_tiers = max_expert_tiers;   // the device-planned tail's peer windows
     ri.prompt_split = prompt_split;
     ri.layer_stage = prompt_split && ri.cards.size() > 1 && layer_stage && layer_stage(ri.cards[0].mem_gbps, ri.cards[1].mem_gbps);
+    // A dense layer split runs on every listed card. Expert tiers stay capped: this only fires for the dense path.
+    if (ri.layer_stage) ri.max_expert_tiers = std::max(ri.max_expert_tiers, (int) ri.cards.size() - 1);
     const std::vector<bp::GpuRole> roles = bp::choose_roles(ri);
     std::string line;
     for (size_t d = 0; d < roles.size(); ++d) {

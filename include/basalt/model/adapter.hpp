@@ -107,6 +107,7 @@ struct LoadRequest {
     std::vector<double> card_gbps;    ///< memory bandwidth of the main card, then of each peer device (GB/s, 0: unknown)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
     int diag_split_at = 0;            ///< diagnostic: a dense model's layers split at this one across two cards (0: off)
+    bool diag_mtp_drafter = false;    ///< diagnostic: a dense pack's MTP layer drafts even where it also has a block drafter
 };
 
 struct DecodeRequest {

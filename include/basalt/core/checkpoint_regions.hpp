@@ -36,6 +36,7 @@ using RestoreSegment = Segment<const uint8_t>;
 /// host (a position offset, a count): the engine stores it first in the checkpoint's bytes, the regions after it, and
 /// gives it back on a restore (a save fills it; a restore's call needs only its size).  A model split across two cards lists
 /// the second card's pieces in `peer_regions` with that card's stream and device: they follow the others in the bytes.
+/// Each card after the second is one `LaterCard`, on its own device, and its bytes follow `peer_regions`.
 struct RunningState {
     std::vector<uint8_t> head;
     std::vector<DeviceRegion> regions;
@@ -43,13 +44,23 @@ struct RunningState {
     std::vector<DeviceRegion> peer_regions;
     void* peer_stream = nullptr;
     int peer_device = -1;
+    struct LaterCard {
+        std::vector<DeviceRegion> regions;
+        void* stream = nullptr;
+        int device = -1;
+    };
+    std::vector<LaterCard> further;
     static size_t sum(const std::vector<DeviceRegion>& rs) {
         size_t n = 0;
         for (const DeviceRegion& r : rs) n += r.bytes;
         return n;
     }
     size_t regions_bytes() const { return sum(regions); }
-    size_t bytes() const { return head.size() + regions_bytes() + sum(peer_regions); }
+    size_t bytes() const {
+        size_t n = head.size() + regions_bytes() + sum(peer_regions);
+        for (const LaterCard& c : further) n += sum(c.regions);
+        return n;
+    }
 };
 
 }  // namespace basalt::core

@@ -37,4 +37,16 @@ bool split_cards_alike(const SplitCard& a, const SplitCard& b);
 /// (the main card when its bandwidth is not lower), on alike cards the cut nearest half the layers' bytes that fits both.
 SplitPlan plan_split(const SplitInputs& in);
 
+/// A layer split across `cards` (the main card first). `bounds` has one more entry than `cards`: layers [bounds[i], bounds[i + 1])
+/// run on card i. The main card's fixed cost is `in.main_fixed` (it already holds one outgoing hand-off). The last card's is
+/// `in.peer_fixed`. A card between them is `in.peer_fixed` plus `stage_bytes` (its own outgoing hand-off). Among the cuts that
+/// fit, the one whose heaviest card (layer bytes over memory bandwidth) is the lightest.
+struct StageSplit {
+    std::vector<int> bounds;
+    std::vector<uint64_t> bytes;
+    std::string error;
+};
+
+StageSplit plan_stage_split(const SplitInputs& in, const std::vector<SplitCard>& cards, uint64_t stage_bytes);
+
 }  // namespace basalt::dense
