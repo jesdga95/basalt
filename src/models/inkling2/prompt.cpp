@@ -130,10 +130,8 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
 
 class Prompt final : public PromptRunner {
 public:
-    Prompt(InklingModel& m, const std::vector<VisitCache>& vc, DsparkHook& ds, cudaStream_t s)
-        : m_(m), g_(m.geo()), vc_(vc), ds_(ds), stream_(s) {}
-    ~Prompt() override {
-        if (stream_) cudaStreamSynchronize(stream_);
+    Prompt(InklingModel& m, cudaStream_t s) : m_(m), g_(m.geo()), stream_(s) {}
+    ~Prompt() override {   // every read synced its stream before it returned
         for (cudaEvent_t& e : done_)
             if (e) cudaEventDestroy(e);
         if (mem_) cudaFree(mem_);
@@ -179,11 +177,15 @@ public:
         return true;
     }
 
-    model::Result read(const model::PrefillRequest& r, std::vector<int32_t>& hist) override {
+    model::Result read(const model::PrefillRequest& r, std::vector<int32_t>& hist, const std::vector<VisitCache>& caches,
+                       DsparkHook& dspark, void* stream) override {
+        bind(caches, dspark, stream);
         return run(r.tokens, nullptr, r.n_tokens, r.pos, r, hist, 0);
     }
 
-    model::Result read_rows(const float* rows, int n, int64_t pos, int32_t pad, std::vector<int32_t>& hist) override {
+    model::Result read_rows(const float* rows, int n, int64_t pos, int32_t pad, std::vector<int32_t>& hist,
+                            const std::vector<VisitCache>& caches, DsparkHook& dspark, void* stream) override {
+        bind(caches, dspark, stream);
         model::PrefillRequest r;
         r.n_tokens = n;
         r.pos = pos;
@@ -192,6 +194,11 @@ public:
 
 private:
     float* buf(Buf x) const { return b_.role[(int) x]; }
+    void bind(const std::vector<VisitCache>& caches, DsparkHook& dspark, void* stream) {
+        vc_ = &caches;
+        ds_ = &dspark;
+        stream_ = (cudaStream_t) stream;
+    }
 
     // `n` rows (tokens, or host embedding rows) in chunks of about equal size; one chunk stays queued ahead of the host,
     // which reports a chunk once the card has run it.
@@ -206,7 +213,7 @@ private:
             const int rows = std::min(per, n - t0);
             if (!chunk(tokens ? tokens + t0 : nullptr, emb ? emb + (size_t) t0 * g_.n_embd : nullptr, rows, pos + t0, err))
                 return {model::Status::Error, "inkling2: " + err};
-            ds_.note(pos + t0, rows);
+            ds_->note(pos + t0, rows);
             if (tokens) hist.insert(hist.end(), tokens + t0, tokens + t0 + rows);
             else hist.insert(hist.end(), (size_t) rows, pad);
             cudaEventRecord(done_[k % 2], stream_);
@@ -234,17 +241,17 @@ private:
             bk::rms_norm_rows(b_.mix, m_.embed_norm(), rows, E, g_.rms_eps, x0, stream_);
         }
         for (const Step& s : walk_.steps) {
-            if (const int k = ds_.slot_of_visit(s.visit); k >= 0)   // the drafter's features: the visit's input rows
-                cudaMemcpyAsync(ds_.tap(k), buf(s.hid), (size_t) rows * E * 4, cudaMemcpyDeviceToDevice, stream_);
+            if (const int k = ds_->slot_of_visit(s.visit); k >= 0)   // the drafter's features: the visit's input rows
+                cudaMemcpyAsync(ds_->tap(k), buf(s.hid), (size_t) rows * E * 4, cudaMemcpyDeviceToDevice, stream_);
             layer(s, rows, pos0);
         }
-        if (ds_.on()) {   // and every row's final normed state, then the rows' context keys and values
+        if (ds_->on()) {   // and every row's final normed state, then the rows' context keys and values
             MixStates st;
             for (int i = 0; i < walk_.n_blocks; ++i) st.s[st.n++] = buf(walk_.blocks[i]);
             st.s[st.n++] = buf(walk_.final_hid);
             attnres_mix(st, m_.output_query(), 1, rows, 1e-6f, b_.mix, (int64_t) rows * E, stream_);
-            bk::rms_norm_rows(b_.mix, m_.output_norm(), rows, E, g_.rms_eps, ds_.tap(kDsTargets - 1), stream_);
-            ds_.commit(b_.pos, rows, stream_);
+            bk::rms_norm_rows(b_.mix, m_.output_norm(), rows, E, g_.rms_eps, ds_->tap(kDsTargets - 1), stream_);
+            ds_->commit(b_.pos, rows, stream_);
         }
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) {
@@ -299,7 +306,7 @@ private:
         const bool full = !g_.swa[(size_t) l];
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
-        const VisitCache& c = vc_[(size_t) v.slot];
+        const VisitCache& c = (*vc_)[(size_t) v.slot];
         const float* hid = buf(s.hid);
         float* out = buf(s.out);
         const float* blocks[kMaxMix];
@@ -516,8 +523,8 @@ private:
 
     InklingModel& m_;
     const Geometry& g_;
-    const std::vector<VisitCache>& vc_;
-    DsparkHook& ds_;
+    const std::vector<VisitCache>* vc_ = nullptr;   // the reading session's caches, drafter and stream
+    DsparkHook* ds_ = nullptr;
     cudaStream_t stream_ = nullptr;
     Walk walk_;
     Bufs b_;
@@ -528,9 +535,8 @@ private:
 
 }  // namespace
 
-std::unique_ptr<PromptRunner> make_prompt(InklingModel& m, const std::vector<VisitCache>& caches, DsparkHook& dspark, void* stream,
-                                          std::string& err) {
-    auto p = std::make_unique<Prompt>(m, caches, dspark, (cudaStream_t) stream);
+std::unique_ptr<PromptRunner> make_prompt(InklingModel& m, void* stream, std::string& err) {
+    auto p = std::make_unique<Prompt>(m, (cudaStream_t) stream);
     if (!p->init(err)) return nullptr;
     return p;
 }

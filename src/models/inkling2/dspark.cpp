@@ -293,12 +293,13 @@ DsHead DsparkWeights::head_args() const {
     return h;
 }
 
-uint64_t dspark_session_bytes(const Pack& pack, int64_t context, int tap_rows) {
+uint64_t dspark_tap_bytes(int tap_rows) { return 4ull * (uint64_t) std::max(tap_rows, kSlice) * kE * 4; }
+
+uint64_t dspark_session_bytes(const Pack& pack, int64_t context) {
     const DsparkGeometry& d = pack.dspark;
     if (!d.present) return 0;
     const uint64_t E = kE, V = (uint64_t) pack.geo.n_vocab, ff = (uint64_t) d.n_ff, R = kDsBlock;
-    uint64_t n = 4ull * (uint64_t) tap_rows * E * 4;                              // the tap
-    n += 3 * kSlice * E * 4 + kFrRing * E * 4 + 2 * kSlice * kKV * 4 + 64;        // a commit step's rows
+    uint64_t n = 3 * kSlice * E * 4 + kFrRing * E * 4 + 2 * kSlice * kKV * 4 + 64;        // a commit step's rows
     n += bk::native_q8_1_bytes(kE, kSlice);
     for (int l = 0; l < d.n_layers; ++l)                                           // the caches, fp16 K and V
         n += 2ull * (uint64_t) (d.swa[(size_t) l] ? ring_cells(d) : full_cells(context)) * kKV * 2;
@@ -337,7 +338,7 @@ void* DsparkHook::dev(size_t bytes, bool& ok) {
     return p;
 }
 
-bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, const std::string& dump,
+bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
                       std::string& err) {
     if (!w) return true;
     const DsparkGeometry& d = w->geo;
@@ -348,7 +349,7 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     context_ = context;
     slot_.assign(g.visits.size(), -1);
     for (int k = 0; k + 1 < kDsTargets; ++k) slot_[(size_t) d.targets[(size_t) k]] = k;
-    tap_ = f(4 * (size_t) tap_rows_ * E);
+    tap_ = tap;
     mix_ = f(3 * kSlice * E);
     fr_ = f(kFrRing * E);
     pos3_ = (int32_t*) dev(kSlice * 3 * 4, ok);
@@ -420,7 +421,7 @@ int DsparkHook::slot_of_visit(int visit) const {
     return w_ && visit >= 0 && visit < (int) slot_.size() ? slot_[(size_t) visit] : -1;
 }
 
-void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream) {
+void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream, int row0) {
     if (!w_ || rows <= 0) return;
     const DsparkGeometry& d = w_->geo;
     DsMixArgs ma;
@@ -431,7 +432,7 @@ void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream) {
     const bk::RopeSpec rope = rope_of(d);
     for (int r0 = 0; r0 < rows; r0 += kSlice) {
         const int n = std::min(kSlice, rows - r0);
-        dspark_mix(tap_ + (size_t) r0 * kE, (int64_t) tap_rows_ * kE, n, ma, mix_, (int64_t) kSlice * kE, pos_d + r0, fr_, kFrRing,
+        dspark_mix(tap_ + (size_t) (row0 + r0) * kE, (int64_t) tap_rows_ * kE, n, ma, mix_, (int64_t) kSlice * kE, pos_d + r0, fr_, kFrRing,
                    pos3_, stream);
         for (int l = 0; l < d.n_layers; ++l) {
             const DsparkLayer& L = w_->layer[(size_t) l];

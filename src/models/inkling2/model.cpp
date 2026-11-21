@@ -26,9 +26,11 @@ constexpr int kTypeQ8_0 = 8;
 constexpr int kTypeBF16 = 30;
 constexpr int kTypeNvfp4 = 40;
 constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 row of the hidden width
-// what a session needs beside its caches (its row buffers, the expert scratch, the head's logits) and what the card keeps
-// free for the kernels' modules and the driver
-constexpr uint64_t kSessionFixed = 768 * kMiB;
+// what the sessions share once (the forward's row buffers and expert scratch, the batch windows' logits), what each one
+// needs beside its caches (its logits, its windows' graphs) and what the card keeps free for the kernels' modules and the
+// driver
+constexpr uint64_t kSharedFixed = 768 * kMiB;
+constexpr uint64_t kSessionFixed = 96 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
 
 // The fused projection rows of a layer: tensor suffix, first row, rows, needed on a full layer only.
@@ -65,7 +67,11 @@ uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8) {
     const uint64_t per_pos = 2ull * kKvHeads * kHeadDim * elem;
     const uint64_t ring = (uint64_t) g.window + kDecodeRows;
     return (uint64_t) global * per_pos * (uint64_t) context + (uint64_t) swa * per_pos * ring + kSessionFixed +
-           prompt_bytes(g);   // PROMPT HOOK
+           (uint64_t) kDecodeRows * (uint64_t) g.n_vocab * 4;
+}
+
+uint64_t shared_bytes(const Geometry& g, bool drafter) {
+    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kDecodeRows, kPromptChunk)) : 0);   // PROMPT, DSPARK HOOKS
 }
 
 InklingModel::InklingModel() = default;
@@ -303,8 +309,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t spare = kCardSpare + vision_room;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c, std::max(kDecodeRows, kPromptChunk)) : 0);
+            return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
         };
+        const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
         // the experts: all on the card when they fit beside the asked context; else the least routed go to RAM, just enough
         // (spill.hpp). --expert-cache N keeps at most N on the card (a diagnostic).
         {
@@ -314,7 +321,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             for (const LayerWeights& w : layers_) stride.push_back(w.expert_stride);
             uint64_t full = 0;
             for (uint64_t st : stride) full += st * (uint64_t) g.n_expert;
-            const uint64_t want_b = full + bytes_at(want) * n_sess + spare;
+            const uint64_t want_b = full + bytes_at(want) * n_sess + shared + spare;
             // when some must go: a margin for the tables and maps allocated after the plan and the driver's own rounding
             const uint64_t short_b = want_b > free_b ? want_b - free_b + 128 * kMiB : 0;
             const int64_t keep = req.expert_cache > 0 ? req.expert_cache : -1;
@@ -352,7 +359,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         }
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const uint64_t avail = free_b > spare ? (free_b - spare) / n_sess : 0;
+        const uint64_t avail = free_b > spare + shared ? (free_b - spare - shared) / n_sess : 0;
         const uint64_t need = bytes_at(want);
         if (need > avail) {
             const uint64_t per = bytes_at(2) - bytes_at(1);
