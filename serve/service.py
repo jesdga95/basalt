@@ -1400,12 +1400,11 @@ class Service:
                     # answer now stops an engine that takes `stop_soon` at its own pace (see the pass below)
                     soft_stops = live is not None and "stop_soon" in inspect.signature(self.engine.generate).parameters
                     closed_early = False                # the thinking was already closed once
+                    pt_settled = False                  # the engine's PT line was applied to the total cap
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
                     for ev in opening:
                         yield "event", ev
                     while True:
-                        if isinstance(ids, PromptText) and ids.max_new:
-                            max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
                         # answer now stops the engine at its own pace: the tokens it still writes are kept, so the
                         # next pass extends exactly what it holds and reads only the close
                         soft = threading.Event() if soft_stops else None
@@ -1435,16 +1434,21 @@ class Service:
                             # a held-back tool argument can leave the stream silent for long: ping after a quiet spell
                             last_out = time.monotonic()
                             for t in gen:
-                                # The engine settles a text prompt's output cap before its first token.
-                                if isinstance(ids, PromptText) and ids.max_new:
-                                    max_new = ids.max_new
+                                # The engine settles a text prompt's output cap before its first token. It answers
+                                # with the cap of this pass: only a number below what the pass asked for is a clip
+                                # (the context's room), and it lowers the total. A pass capped by the thinking budget
+                                # comes back as the budget and must not replace the client's cap.
+                                if isinstance(ids, PromptText) and ids.n is not None and not pt_settled:
+                                    pt_settled = True
+                                    if ids.max_new and ids.max_new < cap:
+                                        max_new = min(max_new, n_pass0 + ids.max_new)
                                 if thinking and not budget_ready and (not isinstance(ids, PromptText) or ids.n is not None):
                                     budget = self.answer_budget(budget_req, max_new, budget)
                                     budget_ready = True
                                 if t is None:               # heartbeat
                                     if isinstance(ids, PromptText) and ids.n is not None and st.get("prompt_tokens") != ids.n:
                                         with self.status_lock:  # the engine has counted the prompt
-                                            st.update(prompt_tokens=ids.n, max_tokens=ids.max_new or max_new)
+                                            st.update(prompt_tokens=ids.n, max_tokens=max_new)
                                     last_print = self._progress(last_print, st=st)
                                     last_out = time.monotonic()
                                     yield "ping", None
