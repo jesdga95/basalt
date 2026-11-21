@@ -546,6 +546,21 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
     return moved;
 }
 
+const uint8_t* InklingModel::host_blob(int l, int e) const {
+    const auto& w = layer(l);
+    if (!w.n_spill) return nullptr;
+    const int slot = spill_.slot[(size_t) l][(size_t) e] - (geo().n_expert - w.n_spill);
+    return slot < 0 ? nullptr : w.spill_host + (uint64_t) slot * w.expert_stride;
+}
+
+const uint8_t* InklingModel::resident_blob(int l, int e) const {
+    const size_t i = (size_t) l * geo().n_expert + e;
+    if (!copy_.empty() && copy_[i]) return static_cast<const uint8_t*>(copy_[i]);
+    const auto& w = layer(l);
+    const int slot = w.n_spill ? spill_.slot[(size_t) l][(size_t) e] : e;
+    return slot < geo().n_expert - w.n_spill ? w.experts + (uint64_t) slot * w.expert_stride : nullptr;
+}
+
 bool InklingModel::stage_from_card(int l, void* stream) const {
     const LayerWeights& w = layers_[(size_t) l];
     if (copy_.empty() || w.n_spill == 0 || layer_copies_[(size_t) l] < w.n_spill) return false;

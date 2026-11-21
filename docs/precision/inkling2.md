@@ -72,6 +72,22 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 
 RTX 5090 at 400 W, the whole model on the card.
 
+## Experts in RAM
+
+On narrow host links the RAM tier uses the shared native CPU pool ([selection](../models/inkling2.md#memory)).
+It keeps the pack's expert weights and uses Q8_0 activations for both products, with FP32 sums and the same
+softcapped SwiGLU. Resident experts and prompt chunks keep their GPU arithmetic. CPU rows match their single-token
+dot products bit for bit across window widths, token positions and row slices; CPU and GPU rounding differ.
+
+The 20-chunk decode gate, RTX 5060 Ti at 180 W, Core Ultra 9 285HX, 12 CPU workers, 64K FP16 context and the same
+1,612 resident experts in both runs. A fresh CPU reference from the same llama.cpp commit above scores PPL 7.6520
+over the 5,100 scored rows:
+
+| RAM expert execution | Mean KLD | Top-1 | PPL |
+| --- | ---: | ---: | ---: |
+| GPU mapped reads | 0.00265 | 97.76% | 7.6551 |
+| CPU pool | 0.00338 | 97.39% | 7.6571 |
+
 ## Drafting
 
 The DSpark drafter only proposes; the target checks every draft, and a decode row rounds the same in any window. Greedy output

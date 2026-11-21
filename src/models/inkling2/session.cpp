@@ -7,8 +7,8 @@
 // partial sum; in the loop's later passes they also take a message read from the previous pass through gated controllers.
 // A row's result does not depend on the other rows of its call: the products take 8 rows at most per launch with the
 // single-row reduction order, the attention and the glue run a block per row (or row and head), the experts per (row,
-// slot) entry. Nothing in a window's forward after its inputs are staged depends on the host: the positions and tokens
-// are read on the card, and the attention's launch bound (a power of two of keys) only sizes its grid.
+// slot) entry. Resident windows stay on the card; RAM experts on narrow host links share the window with the CPU pool.
+// Positions and tokens are read on the card, and the attention's launch bound only sizes its grid.
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/elastic_array.hpp"
 #include "basalt/core/elastic_kv.hpp"
@@ -28,6 +28,7 @@
 #include "models/inkling2/expert_map.hpp"
 #include "models/inkling2/model.hpp"
 #include "models/inkling2/prompt.hpp"
+#include "models/inkling2/cpu_spill.hpp"
 #include "models/inkling2/walk.hpp"
 
 #include <cuda_runtime.h>
@@ -55,6 +56,8 @@ public:
     explicit Session(InklingModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
         if (stream_) cudaStreamSynchronize(stream_);
+        graphs_.clear();
+        cpu_.reset();
         prompt_.reset();   // it synchronizes the session's stream as it goes, so before that stream is destroyed
         if (m_.spill().any() && ex_tally_) {   // how decode's lookups fell between the card and RAM
             std::vector<uint32_t> t((size_t) expert_pairs());
@@ -176,7 +179,9 @@ public:
         if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(kMaxRows, kPromptChunk), m_.flags().diag_dump, err))   // DSPARK HOOK
             return false;
         prompt_ = make_prompt(m_, vc_, dspark_, stream_, err);   // PROMPT HOOK
-        return prompt_ != nullptr || err.empty();
+        if (!prompt_ && !err.empty()) return false;
+        cpu_ = CpuSpill::make(m_, err);
+        return err.empty();
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
@@ -203,6 +208,7 @@ public:
                 cudaMemcpyAsync(r.logits, logits_ + (size_t) (head - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the window failed"};
+        if (cpu_ && !cpu_->ok(err)) return {model::Status::Error, err};
         return {};
     }
 
@@ -224,6 +230,7 @@ public:
             }
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the prompt failed"};
+        if (cpu_ && !cpu_->ok(err)) return {model::Status::Error, err};
         return {};
     }
 
@@ -251,6 +258,7 @@ public:
             for (int i = 0; i < n; ++i) hist_.push_back(g_.image_token);
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the image rows failed"};
+        if (cpu_ && !cpu_->ok(err)) return {model::Status::Error, err};
         return {};
     }
 
@@ -593,7 +601,7 @@ private:
             cudaEventRecord(pf_ev_, stream_);
             cudaStreamWaitEvent(pf_st_, pf_ev_, 0);
             cudaStreamWaitEvent(pf_st_, gs_ev_, 0);
-            expert_prefetch(gs_ids_ + (size_t) vi * kGuessExperts, kGuessExperts / rows * rows, w.blob_table, (uint64_t) Lx.down_off & ~(uint64_t) 15,
+            expert_prefetch(gs_ids_ + (size_t) vi * kGuessExperts, kGuessExperts / rows * rows, expert_blobs(g_.visits[(size_t) vi].layer), (uint64_t) Lx.down_off & ~(uint64_t) 15,
                             pf_sink_, pf_st_);
             pf_on_ = true;
         }
@@ -696,14 +704,16 @@ private:
             cudaEventRecord(gs_ev_, ra_st_);
             ra_on_ = true;
         }
-        moe_plan(ids_, rows, g_.n_used, g_.n_expert, w.blob_table, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, stream_,
+        moe_plan(ids_, rows, g_.n_used, g_.n_expert, expert_blobs(l), ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, stream_,
                  ex_tally_ + (size_t) l * g_.n_expert, rec_blobs_ + (size_t) vi * kAheadExperts, rec_n_ + vi);
+        if (cpu_active_) cpu_->start(l, rows, nrm, ids_, stream_);
         bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
         L.gate_softcap = g_.gate_softcap;
         L.up_softcap = g_.up_softcap;
         const int pairs = rows * g_.n_used;
         bk::native_expert_grouped(L, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, std::min(pairs, g_.n_expert), pairs, xq_[0], ex_scr_,
                                   ex_rows_, stream_);
+        if (cpu_active_) cpu_->finish(l, rows, ids_, ex_rows_, ex_tally_ + (size_t) l * g_.n_expert, stream_);
         MoeFinish mf;
         mf.rows = ex_rows_;
         mf.w = rw_;
@@ -718,10 +728,14 @@ private:
     }
 
     float* buf(Buf b) const { return role_[(int) b]; }
+    const unsigned long long* expert_blobs(int layer) const {
+        return cpu_active_ ? cpu_->blobs(layer) : m_.layer(layer).blob_table;
+    }
 
     // The forward of `rows` rows at positions pos0.. (tokens, or host embedding rows when `emb` is set, which must stay
     // as they are until the window's sync); then the head over the last `head` rows (0: none).
     bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err) {
+        cpu_active_ = cpu_ && cpu_->refresh(stream_);
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
         // the tokens and positions through a ring of pinned slots: a slot is written again once its copy has run
@@ -752,7 +766,7 @@ private:
     // The layers and the head of a window of `rows` rows: replayed from its shape's graph, captured on the shape's second
     // window (its first runs direct, outside a capture).
     bool layers(int rows, int head, int64_t full_keys, std::string& err) {
-        const uint64_t key = ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows;
+        const uint64_t key = ((uint64_t) cpu_active_ << 63) | ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows;
         auto it = graphs_.find(key);
         if (it != graphs_.end()) return it->second.launch(stream_, err);
         if (direct_.insert(key).second) {
@@ -760,6 +774,10 @@ private:
             return true;
         }
         core::CapturedGraph g;
+        if (cpu_active_ && cudaStreamSynchronize(stream_) != cudaSuccess) {
+            err = "cannot finish the CPU spill window before capture";
+            return false;
+        }
         if (!g.begin(stream_, err)) return false;
         body(rows, head, full_keys);
         if (!g.end(stream_, err)) return false;
@@ -898,6 +916,8 @@ private:
     }
 
     InklingModel& m_;
+    std::unique_ptr<CpuSpill> cpu_;
+    bool cpu_active_ = false;
     const Geometry& g_;
     cudaStream_t stream_ = nullptr;
     std::vector<void*> bufs_, pinned_;

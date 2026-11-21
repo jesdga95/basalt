@@ -94,6 +94,8 @@ public:
     /// issued; the caller copies them from RAM).
     bool stage_from_card(int l, void* stream) const;
     const SpillPlan& spill() const { return spill_; }
+    const uint8_t* host_blob(int layer, int expert) const;
+    const uint8_t* resident_blob(int layer, int expert) const;
 
 private:
     float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err,

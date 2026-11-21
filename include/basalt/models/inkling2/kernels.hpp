@@ -120,6 +120,10 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
 
+// Complete only RAM-resident rows after the CPU pool has written them, retaining the card's rows and route counts.
+void moe_cpu_merge(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* cpu,
+                   float* output, uint32_t* tally, void* stream);
+
 /// The grouped expert kernel's plan from the router's choices: group g is an expert on the card (its blob at blobs[e], a
 /// device address; 0 when it is not on the card) and its entries are the (row, slot) pairs that chose it, in row order;
 /// an entry writes row r * k + slot of the output. A pair whose expert is not on the card is left out (the caller

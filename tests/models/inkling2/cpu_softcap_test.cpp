@@ -1,4 +1,5 @@
 #include "basalt/kernels/cpu/native_expert.hpp"
+#include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/ggml/ggml.h"
 
 #include <algorithm>
@@ -31,6 +32,8 @@ int main() {
                 for (float& v : raw) v = normal(rng);
                 weights->from_float_ref(raw.data(), blob.data() + offset, raw.size());
             }
+            for (float& v : raw) v = normal(rng);
+            weights->from_float_ref(raw.data(), blob.data() + f.down_off, raw.size());
             if (f.tail) {
                 const float scales[4] = {1.25f, 0.75f, 1.f, 0.f};
                 std::memcpy(blob.data() + f.bytes - f.tail, scales, sizeof(scales));
@@ -75,7 +78,7 @@ int main() {
                     max_rel = std::max(max_rel, delta / std::max(1., std::abs(ref)));
                 }
             }
-            for (int n : {2, 4, 8}) {
+            for (int n : {2, 3, 4, 8}) {
                 std::vector<std::vector<float>> grouped(n, std::vector<float>(hidden));
                 for (int t = 0; t < n; ++t) output[t] = grouped[t].data();
                 native_gu_rows(f, blob.data(), act, n, output, 0, hidden);
@@ -87,6 +90,33 @@ int main() {
                 native_gu_rows(f, blob.data(), reversed, n, output, hidden / 2, hidden);
                 for (int t = 0; t < n; ++t)
                     if (std::memcmp(grouped[t].data(), single[7 - t].data(), hidden * sizeof(float))) ++failures;
+            }
+            std::vector<std::vector<float>> serial(8, std::vector<float>(width));
+            std::vector<uint8_t> hq(f.h_bytes);
+            for (int t = 0; t < 8; ++t) {
+                native_quant_h(f, single[t].data(), hq.data());
+                const void* a[] = {hq.data()};
+                float* y[] = {serial[t].data()};
+                native_down_rows(f, blob.data(), a, 1, y, 0, width);
+            }
+            for (int workers : {3, 12}) {
+                ExpertPool pool(workers);
+                for (int count : {1, 8, 32}) {
+                    std::vector<ExpertJobMulti> jobs(count);
+                    std::vector<std::vector<float>> result(count * 8, std::vector<float>(width));
+                    for (int e = 0; e < count; ++e) {
+                        jobs[e].blob = blob.data();
+                        jobs[e].nt = 1 + e % 8;
+                        for (int t = 0; t < jobs[e].nt; ++t) {
+                            jobs[e].nact[t] = quant[(e + t) % 8].data();
+                            jobs[e].out[t] = result[e * 8 + t].data();
+                        }
+                    }
+                    pool.run_split_multi_native(f, jobs.data(), count);
+                    for (int e = 0; e < count; ++e)
+                        for (int t = 0; t < jobs[e].nt; ++t)
+                            if (std::memcmp(result[e * 8 + t].data(), serial[(e + t) % 8].data(), width * sizeof(float))) ++failures;
+                }
             }
             std::printf("softcap type=%d width=%d: max_abs=%g max_rel=%g\n", type, width, max_abs, max_rel);
             // The reference accumulates in double; the vector dot accumulates 2,304 values in float.
