@@ -22,13 +22,13 @@
 namespace basalt::models::inkling2 {
 namespace {
 
-constexpr int kPos = 32;                  // positions a block
+constexpr int kPos = 64;                  // positions a block
 constexpr int kWarpsPerHead = kPos / 16;  // 16 positions a warp
 constexpr int kWarps = 3 * kWarpsPerHead;
 constexpr int kThreads = kWarps * 32;
 constexpr int kKeys = 32;                 // keys a tile
 constexpr int kLd = kHeadDim + 8;         // padded fp16 row of a key tile (halves): ldmatrix without bank conflicts
-constexpr int kBand = 64;                 // band rows: the distances a tile spans for the block (kPos + kKeys - 1)
+constexpr int kBand = 96;                 // band rows: the distances a tile spans for the block (kPos + kKeys - 1)
 constexpr int kBandLd = kRel + 8;         // padded band row (halves)
 constexpr int kGCols = 48;                // distances a warp's rows span against a tile (16 + kKeys - 1), whole n-tiles
 constexpr int kGLd = 55;                  // padded row of the exchanged bias (floats): two-way bank conflicts at most
@@ -143,7 +143,7 @@ __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, i
 }
 
 template <bool FP8>
-__global__ void __launch_bounds__(kThreads, 2) attn_prompt_kernel(const AttnPromptArgs a, const int rows, float* __restrict__ out) {
+__global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnPromptArgs a, const int rows, float* __restrict__ out) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
@@ -355,6 +355,12 @@ void attention_prompt(const AttnPromptArgs& a, int rows, float* out, void* strea
     if (rows <= 0) return;
     const dim3 grid((unsigned) ((rows + kPos - 1) / kPos), kKvHeads);
     cudaStream_t s = (cudaStream_t) stream;
+    static const bool sized = [] {
+        cudaFuncSetAttribute(attn_prompt_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_prompt_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        return true;
+    }();
+    (void) sized;
     if (a.fp8) attn_prompt_kernel<true><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
     else attn_prompt_kernel<false><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
     check("attention_prompt");
