@@ -3,18 +3,20 @@
     python3 tools/batch_identity.py ENGINE --model FILE.basalt [--slots 2,4,8] [--tokens N] [--fixtures DIR]
                                     [--out FILE.json] [-- ENGINE ARGS...]
 
-For each slot count N the engine runs as `--serve --batch N` (docs/design/batching.md). Each of N prompts (the bench
-fixtures conv, struct, prose in turn) runs alone in slot 0, then all N run together, one per slot, at temperature 0. Every
-slot's tokens must equal its alone run. A slot count of 1 runs the prompts one after another in slot 0: the in-turn rate.
+The serve-level batch check of any model (docs/design/batching.md). First each prompt (the bench fixtures conv, struct,
+prose) runs in an engine of one slot (`--serve --batch 1`, the same code as `--parallel 1`): the reference. Then for each
+slot count N the engine runs as `--serve --batch N`: each of N prompts (the fixtures in turn) runs alone in slot 0, then
+all N run together, one per slot, at temperature 0. Every slot's tokens, alone and together, must equal the reference.
 
 Prints per slot count the aggregate tokens per second of the together run (every slot's tokens over the wall time from the
-first request to the last one's end) and IDENTICAL or DIFFERS per slot; `--out` keeps every token, so two builds' runs can
-be compared. Exit 1 when any slot differs, 2 when the engine fails.
+first request to the last one's end), the experts the engine put in RAM, and IDENTICAL or DIFFERS per slot; `--out` keeps
+every token, so two builds' runs can be compared. Exit 1 when any slot differs, 2 when the engine fails.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
@@ -55,6 +57,12 @@ class Engine:
             self.p.wait(timeout=60)
         except Exception:
             self.p.kill()
+
+
+def ram_experts(log: Path) -> int:
+    """The experts the engine's start put in RAM (its "experts: N of M in RAM" line; none: every one on the card)."""
+    m = re.search(r"experts: (\d+) of \d+ in RAM", log.read_text(errors="replace"))
+    return int(m.group(1)) if m else 0
 
 
 def run_slots(eng: Engine, jobs: list[tuple[int, str]], max_new: int) -> tuple[dict[int, list[int]], float]:
@@ -108,6 +116,16 @@ def main() -> int:
     fixtures = Path(a.fixtures) if a.fixtures else HERE.parent / "data" / "bench"
     report: dict = {"slots": {}}
     differs = False
+    # the reference: each prompt in an engine of one slot
+    log = Path(a.log_dir) / "batch_identity.ref.log"
+    try:
+        eng = Engine([a.engine, "--model", a.model, "--serve", "--batch", "1", "--prompt-cache", "0"] + extra, log)
+        ref = {name: run_slots(eng, [(0, fixture_ids(fixtures, name))], a.tokens)[0][0] for name in PROMPTS}
+        eng.stop()
+    except RuntimeError as e:
+        print(f"one slot: {e} (see {log})")
+        return 2
+    report["reference"] = ref
     for n in [int(s) for s in a.slots.split(",")]:
         ids = [fixture_ids(fixtures, PROMPTS[j % len(PROMPTS)]) for j in range(n)]
         log = Path(a.log_dir) / f"batch_identity.{n}.log"
@@ -129,12 +147,13 @@ def main() -> int:
             return 2
         eng.stop()
         total = sum(len(t) for t in together.values())
-        same = [together[b] == alone[b] for b in range(n)]
+        same = [together[b] == alone[b] == ref[PROMPTS[b % len(PROMPTS)]] for b in range(n)]
         differs |= not all(same)
         rate = total / wall if wall > 0 else 0.0
-        print(f"{n} slots: {total} tokens in {wall:.2f} s = {rate:.1f} tok/s together; " +
+        ram = ram_experts(log)
+        print(f"{n} slots: {total} tokens in {wall:.2f} s = {rate:.1f} tok/s together, {ram} experts in RAM; " +
               ", ".join(f"slot {b} {PROMPTS[b % len(PROMPTS)]} {'IDENTICAL' if s else 'DIFFERS'}" for b, s in enumerate(same)))
-        report["slots"][str(n)] = {"tok_s": rate, "tokens": total, "wall_s": wall,
+        report["slots"][str(n)] = {"tok_s": rate, "tokens": total, "wall_s": wall, "ram_experts": ram,
                                    "alone": alone, "together": [together[b] for b in range(n)]}
     if a.out:
         Path(a.out).write_text(json.dumps(report))
