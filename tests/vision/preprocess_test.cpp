@@ -62,6 +62,29 @@ int main() {
         ++failures;
     }
 
+    // a picture at the top left of whole merge groups (4-pixel patches, 8-pixel groups: 11 x 5 on 16 x 8), -1 past it on the
+    // 0-255 scale, each value (v - 255 mean) / (255 std); rows in merge order, each channel, row, column
+    {
+        Image pic{11, 5, std::vector<uint8_t>(11 * 5 * 3)};
+        for (size_t i = 0; i < pic.rgb.size(); ++i) pic.rgb[i] = (uint8_t) ((i * 37) % 256);
+        const Geometry pg{4, 2, 1, 4096};
+        const float mean[3] = {0.5f, 0.25f, 0.5f}, sd[3] = {0.5f, 0.5f, 0.25f};
+        std::vector<float> rows;
+        patchify_padded(pic, pg, mean, sd, rows);
+        const Size c = padded_canvas(pic.w, pic.h, pg);
+        auto value = [&](int x, int y, int ch) {   // where pixel (x, y) of channel ch sits in the rows
+            const int px = x / 4, py = y / 4, grp = (py / 2) * 2 + px / 2, n = grp * 4 + (py % 2) * 2 + px % 2;
+            return rows[(size_t) n * 48 + (size_t) (ch * 4 + y % 4) * 4 + x % 4];
+        };
+        const float in = ((float) pic.rgb[((size_t) 1 * 11 + 5) * 3 + 2] - 127.5f) / 63.75f;   // pixel (5, 1), channel 2
+        if (c.w != 16 || c.h != 8 || rows.size() != (size_t) 8 * 48 || value(5, 1, 2) != in ||
+            value(12, 1, 0) != (-1.0f - 127.5f) / 127.5f || value(3, 6, 1) != (-1.0f - 63.75f) / 127.5f ||
+            value(15, 7, 2) != (-1.0f - 127.5f) / 63.75f) {
+            std::fprintf(stderr, "FAIL patchify_padded 11x5 on 16x8: the canvas, a pixel or the padding\n");
+            ++failures;
+        }
+    }
+
     if (failures) {
         std::fprintf(stderr, "preprocess_test: %d failures\n", failures);
         return 1;
