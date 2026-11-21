@@ -233,6 +233,7 @@ struct MoeFinish {
     float* ring = nullptr;
     const float* resid = nullptr;
     float* out = nullptr;
+    float* tap = nullptr;              ///< set: the output rows also here (the drafter's copy of the next visit's input)
 };
 void moe_finish(const MoeFinish& a, int rows, void* stream);
 

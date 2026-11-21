@@ -496,9 +496,9 @@ private:
 
     // Layer `l` (visit `v`) over `rows` rows: `hid` its input, `blocks` the finished blocks before it, `msgs` (or null)
     // the previous pass's messages [kStreams][rows][E]; `full_keys` bounds a full-attention visit's keys. Writes its
-    // output to `out` (not `hid`).
+    // output to `out` (not `hid`), and to `tap` too when set.
     void run_layer(const Visit& v, const float* hid, const float* const* blocks, int n_blocks, const float* msgs, int rows,
-                   int64_t full_keys, float* out) {
+                   int64_t full_keys, float* out, float* tap) {
         const int l = v.layer;
         const LayerWeights& w = m_.layer(l);
         const bool full = !g_.swa[(size_t) l];
@@ -678,6 +678,7 @@ private:
         mf.ring = c.m_ring;
         mf.resid = resid_;
         mf.out = out;
+        mf.tap = tap;
         moe_finish(mf, rows, stream_);
     }
 
@@ -746,7 +747,9 @@ private:
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
         const float* blocks[kMaxMix];
-        for (const Step& s : walk_.steps) {
+        bool tapped_in = false;   // the visit's input rows were written to its drafter tap by the visit before
+        for (size_t si = 0; si < walk_.steps.size(); ++si) {
+            const Step& s = walk_.steps[si];
             const Visit& v = g_.visits[(size_t) s.visit];
             const float* msgs = nullptr;
             if (s.msgs) {
@@ -763,9 +766,16 @@ private:
                 msgs = msg_ + (size_t) (v.layer - g_.loop_start) * kStreams * RE;
             }
             for (int i = 0; i < s.n_blocks; ++i) blocks[i] = buf(s.blocks[i]);
-            if (int k = dspark_.slot_of_visit(s.visit); k >= 0)   // DSPARK HOOK: the visit's input rows
+            if (int k = dspark_.slot_of_visit(s.visit); k >= 0 && !tapped_in)   // DSPARK HOOK: the visit's input rows
                 cudaMemcpyAsync(dspark_.tap(k), buf(s.hid), RE * 4, cudaMemcpyDeviceToDevice, stream_);
-            run_layer(v, buf(s.hid), blocks, s.n_blocks, msgs, rows, full_keys, buf(s.out));
+            // the next visit's tap, when its input is this visit's output, is written by this visit's last kernel
+            float* tap = nullptr;
+            if (si + 1 < walk_.steps.size()) {
+                const Step& nx = walk_.steps[si + 1];
+                if (int k = dspark_.slot_of_visit(nx.visit); k >= 0 && nx.hid == s.out) tap = dspark_.tap(k);
+            }
+            tapped_in = tap != nullptr;
+            run_layer(v, buf(s.hid), blocks, s.n_blocks, msgs, rows, full_keys, buf(s.out), tap);
         }
         const bool tapped = dspark_.on();   // DSPARK HOOK: the drafter reads every row's final normed state
         if (head <= 0 && !tapped) return;

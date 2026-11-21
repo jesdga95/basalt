@@ -534,7 +534,9 @@ __global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
             acc = fmaf(taps[j], x, acc);
         }
         const size_t i = (size_t) r * kWidth + c;
-        a.out[i] = __fmul_rn(acc + x0, rsqrtf((float) kConv + 1.f)) + a.resid[i];
+        const float y = __fmul_rn(acc + x0, rsqrtf((float) kConv + 1.f)) + a.resid[i];
+        a.out[i] = y;
+        if (a.tap) a.tap[i] = y;
         a.ring[(size_t) (a.pos[r] % kConvRing) * kWidth + c] = x0;
     }
 }
