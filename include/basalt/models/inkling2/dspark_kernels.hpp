@@ -1,0 +1,60 @@
+// include/basalt/models/inkling2/dspark_kernels.hpp - the kernels of Inkling 2's DSpark drafter that the shared ones do not
+// cover: the mixes of the target's features, the block's input rows, the Markov head's recurrence and pick, and the head
+// folds made once at load.
+//
+// Rows are kWidth (2304) fp32 values, row-major; every pointer is device memory. A row's result never depends on how many
+// rows share its call. `stream` may be null (the call then synchronises).
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+namespace basalt::models::inkling2 {
+
+constexpr int kDsTargets = 4;         ///< target features a position carries: visits 5, 23, 41 and the final normed state
+constexpr int kDsMixes = 4;           ///< mixes of them: one per draft layer, then the Markov head's context
+constexpr int kDsRank = 256;          ///< the Markov head's rank
+constexpr int kDsRnn = 3 * kDsRank;   ///< its recurrence's rows: the gate, the candidate and the latent
+
+/// The mixes' weights: alpha [kDsMixes][kDsTargets] (each row softmaxed over the targets), norm[j] mix j's RMS norm weights.
+struct DsMixArgs {
+    const float* alpha = nullptr;
+    const float* norm[kDsMixes] = {};
+    float eps = 1e-6f;
+};
+
+/// For each of `rows` rows: mix j = rms(sum_k alpha[j][k] f_k) * norm[j], the targets summed in order in fp32, f_k = the
+/// row of target slot k at tap + k * tap_stride + r * kWidth. Mixes 0..2 go to out + j * out_stride + r * kWidth; mix 3
+/// (the Markov head's context) to the ring row of the row's position, fr + (pos[r] % fr_cap) * kWidth. pos3[r] gets
+/// {pos[r], pos[r], pos[r]}, the rotary positions attn_qk_prepare reads.
+void dspark_mix(const float* tap, int64_t tap_stride, int rows, const DsMixArgs& a, float* out, int64_t out_stride,
+                const int32_t* pos, float* fr, int fr_cap, int32_t* pos3, void* stream);
+
+/// A block's input rows: row 0 = rms(embedding row `anchor`) * embed_norm (BF16 rows, device-readable), rows 1..block-1 =
+/// `mask`; pos3[t] = {pos0 + t} x 3. The Markov head starts from them: *prev = anchor, state[0..kDsRank) = 0.
+void dspark_block_inputs(const uint16_t* embedding, int32_t anchor, const float* embed_norm, float eps, const float* mask,
+                         int block, int64_t pos0, float* x, int32_t* pos3, int32_t* prev, float* state, void* stream);
+
+/// One step of the Markov head's recurrence. raw = ctx_h + ctx_f + bias + w_sp [state_in ; w1 row *prev] (w_sp BF16
+/// [kDsRnn][2 kDsRank], w1 BF16 [vocab][kDsRank]); gate = sigmoid(raw[0:r]); state_out = gate * state_in + (1 - gate) *
+/// tanh(raw[r:2r]); latent = tanh(raw[2r:3r]) into `latent` (fp32 [kDsRank]).
+void dspark_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp, const uint16_t* w1,
+                        const int32_t* prev, const float* state_in, float* state_out, float* latent, void* stream);
+
+/// Scratch bytes dspark_pick needs over `n_vocab` logits.
+size_t dspark_pick_scratch_bytes(int n_vocab);
+/// Draft `i`'s pick: l[v] = cap * tanh((base[v] + bias[v] + fold_b[v]) / cap) over v < n_vocab; ids[i] = the first argmax,
+/// *prev = the same, conf[i] = its softmax probability.
+void dspark_pick(const float* base, const float* bias, const float* fold_b, int n_vocab, float cap, void* scratch,
+                 int32_t* prev, int32_t* ids, float* conf, int i, void* stream);
+
+/// The folds of the hidden_out projection into the head, made once: fold (Q8_0 [n_rows][kDsRank], ggml's reference
+/// rounding) = head (Q8_0 [n_rows][kWidth]) times w (BF16 [kWidth][kDsRank]) in fp32, and fold_b[v] = head[v] . b.
+void dspark_fold(const void* head_q8_0, int64_t n_rows, const uint16_t* w, const float* b, void* fold_q8_0, float* fold_b,
+                 void* stream);
+
+/// The recurrence's projection (BF16 [kDsRnn][2 kDsRank + 2 kWidth]: state, previous token, hidden, context columns) split
+/// into w_sp [kDsRnn][2 kDsRank], w_h and w_f [kDsRnn][kWidth].
+void dspark_split_rnn(const uint16_t* w, uint16_t* w_sp, uint16_t* w_h, uint16_t* w_f, void* stream);
+
+}  // namespace basalt::models::inkling2

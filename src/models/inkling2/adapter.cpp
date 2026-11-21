@@ -6,6 +6,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/program/options.hpp"
+#include "models/inkling2/dspark.hpp"   // DSPARK HOOK
 #include "models/inkling2/meta.hpp"
 #include "models/inkling2/model.hpp"
 
@@ -35,13 +36,13 @@ public:
     int max_expert_cards() const override { return 0; }
     const char* model_name() const override { return "Inkling-2-Mini"; }
 
-    // --kv: the attention caches as fp16 (the default) or fp8
+    // --kv: the attention caches as fp16 (the default) or fp8; --spec, --draft-log: the drafter's windows
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
         if (a == "--kv") {
             o.kv = args.next("--kv");
             return true;
         }
-        return false;
+        return dspark_parse_flag(a, args, o);   // DSPARK HOOK
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
@@ -49,6 +50,7 @@ public:
             basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default) or fp8", o.kv.c_str());
             return 2;
         }
+        dspark_finish_flags(o);   // DSPARK HOOK
         return std::nullopt;
     }
 

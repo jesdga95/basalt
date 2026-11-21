@@ -297,6 +297,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             return fail("out of device memory loading layer " + std::to_string(l) + "'s expert table");
     }
     fp8_ = req.kv == "fp8";
+    // DSPARK HOOK: the drafter's weights (none with --spec 1), before the context is sized from what the weights leave
+    if (req.spec >= 2)
+        if (model::Result r = dspark_plan(pack_, reads, file, device_, dspark_); !r.ok()) return r;
 
     // [vision] the image encoder staged before the context is sized, the room of its largest region kept free
     uint64_t vision_room = 0;
@@ -316,10 +319,13 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             return fail("--max-context " + std::to_string(want) + " is outside 1,024 .. " + std::to_string(g.context_length));
         const uint64_t spare = kCardSpare + vision_room;   // [vision]
         const uint64_t avail = free_b > spare ? (free_b - spare) / (uint64_t) std::max(req.sessions, 1) : 0;
-        const uint64_t need = session_bytes(g, want, fp8_);
+        const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
+            return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c, kDecodeRows) : 0);
+        };
+        const uint64_t need = bytes_at(want);
         if (need > avail) {
-            const uint64_t per = session_bytes(g, 2, fp8_) - session_bytes(g, 1, fp8_);
-            const uint64_t base = session_bytes(g, 0, fp8_);
+            const uint64_t per = bytes_at(2) - bytes_at(1);
+            const uint64_t base = bytes_at(0);
             const int64_t fits = avail > base ? (int64_t) ((avail - base) / per) : 0;
             return {model::Status::Error, "inkling2: --max-context " + std::to_string(want) + " needs " +
                                               std::to_string(need / kMiB) + " MiB a session; about " + std::to_string(fits) +
@@ -340,6 +346,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
 }
 
 model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
+    if (dspark_)   // DSPARK HOOK: the drafter's head folds, once the reads have landed
+        if (model::Result r = dspark_->finish(head_, embd_dev_, embed_norm_, nullptr); !r.ok()) return r;
     for (auto& s : sessions)
         if (model::Result r = s->prepare(); !r.ok()) return r;
     return {};
