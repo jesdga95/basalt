@@ -481,39 +481,49 @@ public:
         }
         vision::Image& img = image_->picture;
         if (!vision::decode_image(data, bytes, img, err)) return {model::Status::Error, err};
+        // The encoder's weights and this picture's work buffers go above the VRAM reserve: in what the tier's extra copies
+        // leave, else in the room of all its copies; images_done gives it back.
+        std::string te;
+        core::ExpertTier* t = ops_->expert_tier(te);
+        const auto above_floor = [&] {
+            size_t free_b = 0, total_b = 0;
+            return !t || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
+        };
+        const auto lend = [&] {
+            if (!t) return false;
+            cudaStreamSynchronize(stream_);
+            t->lend_all();
+            return true;
+        };
         if (!vis_) {
             release_short_prompt();
-            // the encoder takes the memory of the tier's extra copies, and of all its copies when that is short;
-            // images_done gives it back
-            std::string te;
-            core::ExpertTier* t = ops_->expert_tier(te);
             cudaStreamSynchronize(stream_);
             vis_borrowed_ = true;
             if (t) t->shrink();
             vision::Mmproj mp;
             if (!m_.open_mmproj(mp, err)) { images_done(); return {model::Status::Error, err}; }
-            const VisionPlan pl = plan_image(img.w, img.h, mp.hp().merge, mp.hp().min_pixels);
             vis_ = std::make_unique<VisionEncoder>();
-            const auto above_floor = [&] {
-                size_t free_b = 0, total_b = 0;
-                return !t || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
-            };
-            bool opened = vis_->init(mp, std::max(pl.n_patches(), 4096), m_.vision_blas(), err) && above_floor();
-            if (!opened && t) {
+            bool loaded = vis_->init(mp, m_.vision_blas(), err);
+            if (!loaded && lend()) {
                 vis_ = std::make_unique<VisionEncoder>();
-                t->lend_all();
                 err.clear();
-                opened = vis_->init(mp, std::max(pl.n_patches(), 4096), m_.vision_blas(), err);
-                if (opened && !above_floor()) {
-                    opened = false;
-                    err = "not enough free device memory for the image encoder above the VRAM reserve";
-                }
+                loaded = vis_->init(mp, m_.vision_blas(), err);
             }
-            if (!opened) { images_done(); return {model::Status::Error, err}; }
+            if (!loaded) { images_done(); return {model::Status::Error, err}; }
             vis_merge_ = mp.hp().merge;
             vis_min_pixels_ = mp.hp().min_pixels;
         }
         const VisionPlan pl = plan_image(img.w, img.h, vis_merge_, vis_min_pixels_);
+        bool room = vis_->reserve(pl, err) && above_floor();
+        if (!room && lend()) {
+            err.clear();
+            room = vis_->reserve(pl, err) && above_floor();
+        }
+        if (!room) {
+            if (err.empty()) err = "not enough free device memory for the image encoder above the VRAM reserve";
+            images_done();
+            return {model::Status::Error, err};
+        }
         std::vector<float>& patches = image_->patches;
         image_patches(img, pl, patches);
         if (!vis_->encode(patches, pl, rows, err)) { images_done(); return {model::Status::Error, err}; }

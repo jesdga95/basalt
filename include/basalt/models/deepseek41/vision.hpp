@@ -62,10 +62,13 @@ public:
     VisionEncoder(const VisionEncoder&) = delete;
     VisionEncoder& operator=(const VisionEncoder&) = delete;
 
-    /// Uploads the projector `mp` (a deepseek41v file) to the current device; buffers grow on demand up to `max_patches`.
-    /// `blas` is opened here when it is not yet, and must outlive the encoder.
-    bool init(const basalt::vision::Mmproj& mp, int max_patches, VisionBlas& blas, std::string& err);
-    /// `out` = [plan.n_tokens()][width] floats, the embedding block.
+    /// Uploads the projector `mp` (a deepseek41v file) to the current device. `blas` is opened here when it is not yet, and
+    /// must outlive the encoder. False when the card has no room for the weights; no CUDA error is left behind.
+    bool init(const basalt::vision::Mmproj& mp, VisionBlas& blas, std::string& err);
+    /// Sizes the work buffers for `plan` (they only grow); false with `err` when the card has no room for them, and the
+    /// caller makes room. No CUDA error is left behind.
+    bool reserve(const VisionPlan& plan, std::string& err);
+    /// `out` = [plan.n_tokens()][width] floats, the embedding block; reserves for `plan` first.
     bool encode(const std::vector<float>& rows, const VisionPlan& plan, std::vector<float>& out, std::string& err);
     int width() const;
 
