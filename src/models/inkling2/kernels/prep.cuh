@@ -1,0 +1,127 @@
+// src/models/inkling2/kernels/prep.cuh - the decode attention preparation's stages, shared by glue.cu's prepare kernel and
+// attn.cu's fused attention so both make the same bits: a key/value head's convolved, clipped keys and normed values of a
+// row (warps 0 and 1), and its three query heads' clipped queries, relative states and sinks (warps 2 and 3).
+#pragma once
+
+#include "basalt/models/inkling2/kernels.hpp"
+
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+
+namespace basalt::models::inkling2::prep {
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int m = 16; m; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+    return v;
+}
+
+__device__ __forceinline__ float tau_of(int p, float floor_, float alpha) {
+    return 1.f + alpha * logf(fmaxf((float) (p + 1) / floor_, 1.f));
+}
+
+// The convolution input of channel c at position pos[r] - j: a row of the window (stride ld), the ring, or zero before
+// position 0.
+__device__ __forceinline__ float conv_in(const float* __restrict__ y, int64_t ld, const float* __restrict__ ring, int ring_w,
+                                         const int32_t* __restrict__ pos, int r, int j, int c) {
+    if (r - j >= 0) return y[(size_t) (r - j) * ld + c];
+    const int p = pos[r] - j;
+    if (p < 0) return 0.f;
+    return ring[(size_t) (p % kConvRing) * ring_w + c];
+}
+
+// The weights warp w reads before its kernel's pdl_wait: warps 0 and 1 their channels' taps (tap kConv-1 first), warps 2
+// and 3 their heads' clip scales.
+__device__ __forceinline__ void load_weights(const AttnPrep& a, int g, int w, int lane, float (&wt)[4][kConv]) {
+    if (w < 2) {
+        const float* taps = w ? a.v_conv : a.k_conv;
+#pragma unroll
+        for (int u = 0; u < 4; ++u)
+#pragma unroll
+            for (int j = 0; j < kConv; ++j) wt[u][j] = taps[(g * kHeadDim + lane * 4 + u) * kConv + (kConv - 1 - j)];
+    } else {
+        const int h0 = g * 3 + (w == 2 ? 0 : 2);
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            wt[u][0] = a.q_scale[h0 * kHeadDim + lane * 4 + u];
+            wt[u][1] = w == 2 ? a.q_scale[(h0 + 1) * kHeadDim + lane * 4 + u] : 0.f;
+        }
+        if (w == 3)
+#pragma unroll
+            for (int k = 0; k < 3; ++k) wt[k][2] = lane < kRel ? a.r_scale[(g * 3 + k) * kRel + lane] : 0.f;
+    }
+}
+
+// Warp 0 (keys) or 1 (values) of head g for row r: channels g * kHeadDim + lane * 4.. of the convolved row, `raw` their
+// convolution inputs at the row's own position, and the factor the cache takes them scaled by (the key clip, the value
+// norm).
+__device__ __forceinline__ void kv_row(const AttnPrep& a, int r, int g, int w, int lane, const float (&wt)[4][kConv],
+                                       float (&val)[4], float (&raw)[4], float& f) {
+    const float* yall = w ? a.yv : a.yk;
+    const int64_t ld = w ? a.ldv : a.ldk;
+    const float* y = yall + (size_t) r * ld;
+    const float* ring = w ? a.v_ring : a.k_ring;
+    const float inv_k = a.full ? (1.f / 3.f) : rsqrtf((float) kConv + 1.f);
+    float ss = 0.f;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        const int c = g * kHeadDim + lane * 4 + u;
+        float acc = 0.f;
+        raw[u] = 0.f;
+#pragma unroll
+        for (int j = 0; j < kConv; ++j) {
+            const float x = conv_in(yall, ld, ring, kKvHeads * kHeadDim, a.pos, r, j, c);
+            if (j == 0) raw[u] = x;
+            float t = wt[u][j];
+            if (a.full) t += y[kOffTaps + g * kConv + j];
+            acc = fmaf(t, x, acc);
+        }
+        val[u] = (acc + raw[u]) * inv_k;
+        ss = fmaf(val[u], val[u], ss);
+    }
+    ss = warp_sum(ss);
+    f = w == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
+}
+
+__device__ __forceinline__ void store_kv(void* cache, bool fp8, size_t idx, float v) {
+    if (fp8) {
+        __nv_fp8_e4m3 q(v);
+        static_cast<uint8_t*>(cache)[idx] = *reinterpret_cast<uint8_t*>(&q);
+    } else {
+        static_cast<__half*>(cache)[idx] = __float2half_rn(v);
+    }
+}
+
+// Warps 2 and 3 of head g for row r at position p: the clipped (and scaled) queries of heads 3g..3g+2 into q3
+// [3][kHeadDim], warp 3 also their relative states into r3 [3][kRel] and their sinks into s3 [3].
+__device__ __forceinline__ void q_heads(const AttnPrep& a, int r, int p, int g, int w, int lane, const float (&wt)[4][kConv],
+                                        float* q3, float* r3, float* s3) {
+    const float* yq = a.yq + (size_t) r * a.ldq;
+    const float tau = a.full ? tau_of(p, a.log_floor, a.log_alpha) : 1.f;
+    // warp 2: heads 3g and 3g + 1; warp 3: head 3g + 2, then the three relative states and sinks
+    const int h0 = g * 3 + (w == 2 ? 0 : 2), h1 = w == 2 ? h0 + 2 : h0 + 1;
+    for (int h = h0; h < h1; ++h) {
+        float q[4], ss = 0.f;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int i = lane * 4 + u;
+            q[u] = yq[kOffQ + h * kHeadDim + i] * (h == h0 ? wt[u][0] : wt[u][1]);
+            ss = fmaf(q[u], q[u], ss);
+        }
+        ss = warp_sum(ss);
+        const float f = fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) * tau;
+        *reinterpret_cast<float4*>(q3 + (h - g * 3) * kHeadDim + lane * 4) = make_float4(q[0] * f, q[1] * f, q[2] * f, q[3] * f);
+    }
+    if (w == 3) {
+        for (int h = g * 3; h < g * 3 + 3; ++h) {
+            const int k = h - g * 3;
+            const float rv = lane < kRel ? yq[kOffR + h * kRel + lane] * (k == 0 ? wt[0][2] : k == 1 ? wt[1][2] : wt[2][2]) : 0.f;
+            const float rs = warp_sum(rv * rv);
+            const float fr = fminf(a.rel_clip / (sqrtf(rs) + 1e-6f), 1.f) * tau;
+            if (lane < kRel) r3[k * kRel + lane] = rv * fr;
+            if (lane == 0) s3[k] = yq[kOffSink + h];
+        }
+    }
+}
+
+}  // namespace basalt::models::inkling2::prep
