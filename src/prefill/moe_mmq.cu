@@ -221,6 +221,11 @@ size_t matrix_bytes(int t, int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) (cols / ggml_blck_size((ggml_type) t)) * ggml_type_size((ggml_type) t);
 }
 
+size_t read_past_bytes(int t, int64_t cols) {
+    const int64_t qk = ggml_blck_size((ggml_type) t), per = MMQ_ITER_K / qk, blocks = cols / qk;
+    return per > 1 ? (size_t) ((per - blocks % per) % per) * ggml_type_size((ggml_type) t) : 0;
+}
+
 size_t gu_slot_bytes(int gate_type, int up_type, int64_t n_ff, int64_t n_embd) {
     if (up_type == gate_type) return matrix_bytes(gate_type, 2 * n_ff, n_embd);
     const size_t a = ggml_type_size((ggml_type) gate_type), b = ggml_type_size((ggml_type) up_type);
