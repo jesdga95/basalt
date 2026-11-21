@@ -160,9 +160,11 @@ struct DeviceConversation {
 size_t conversation_device_bytes(const SessionState& session, const ModelGeometry& g, const QsaState* draft,
                                  int64_t tokens);
 /// Allocates `image` and copies the session's state for the view's tokens into it (the view's checkpoints are
-/// checked, not copied: the caller moves them in).  The session is not changed.
+/// checked, not copied: the caller moves them in).  The session is not changed.  `no_memory`: set when the
+/// allocation was what failed.
 bool conversation_device_save(DeviceConversation& image, const ConversationView& view, const SessionState& session,
-                              const ModelGeometry& g, const QsaState* draft, std::string& error);
+                              const ModelGeometry& g, const QsaState* draft, std::string& error,
+                              bool* no_memory = nullptr);
 ConversationRestore conversation_device_restore(const DeviceConversation& image, SessionState& session,
                                                 const ModelGeometry& g, const QsaState* draft, std::string& error);
 

@@ -89,6 +89,7 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
     const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
     const long long reserve = bare ? (long long) o.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
     if (!bare && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
+    kv_pool_no_fit = 0;   // the VRAM changes hands: the pool tries again (SLEEP and wake come through here too)
     if (reserve < vram_floor_mib() && !for_sleep) {
         e = "VRAM: a reserve below " + std::to_string(vram_floor_mib()) + " MiB is too small for what is allocated "
             "after loading; the smallest safe value is " + std::to_string(vram_floor_mib());

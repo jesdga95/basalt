@@ -363,6 +363,20 @@ public:
             if (!evict_oldest(false)) break;
         return true;
     }
+    /// What make_room(incoming, held) would evict, in the entries' bytes (the retained buffers aside), without
+    /// evicting: SIZE_MAX when it would refuse.
+    size_t room_frees(size_t incoming, size_t held = 0) const {
+        if (!enabled() || held > budget_ || incoming > budget_ - held) return SIZE_MAX;
+        size_t count = entries_.size() - slot_count_, bytes = bytes_ - slot_bytes_, freed = 0;
+        for (size_t i = 0; i < entries_.size() && (count >= slots_ || bytes > budget_ - held - incoming); ++i) {
+            if (entries_[i].from_slot) continue;
+            const size_t n = entries_[i].bytes();
+            freed += n;
+            bytes -= n;
+            --count;
+        }
+        return freed;
+    }
 
     /// An idle batch slot's conversation, out of VRAM: kept whatever the byte budget (the caller has admitted its
     /// RAM), at most `keep` of them; the longest parked leaves first (to the tier below when spilling).

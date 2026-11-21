@@ -41,6 +41,9 @@ int main() {
         check(pool.put(pooled({1, 2, 3}, 50), 50) && pool.put(pooled({4, 5, 6}, 50), 50) &&
               pool.put(pooled({7, 8, 9}, 50), 50), "A, B, C fit beside the live conversation");
         check(pool.size() == 3 && pool.bytes() == 150 && pool.evictions() == 0, "nothing evicted below the cap");
+        check(pool.room_frees(50, 0) == 0 && pool.room_frees(50, 50) == 50 && pool.room_frees(80, 0) == 50 && pool.room_frees(80, 100) == 150 &&
+              pool.room_frees(150, 51) == SIZE_MAX && pool.size() == 3 && pool.evictions() == 0,
+              "room_frees counts what make_room would evict, evicting nothing");
         check(pool.put(pooled({10, 11, 12}, 80), 0), "D needs room");
         check(pool.size() == 3 && pool.evictions() == 1 && pool.best(std::vector<int32_t>{1, 2, 3, 4}, {}, true).tokens == 0 &&
               pool.best(std::vector<int32_t>{4, 5, 6, 7}, {}, true).tokens == 3, "D evicts the oldest (A) only");

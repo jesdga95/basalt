@@ -243,6 +243,10 @@ private:
     // --kv-pool: the conversations switched away from, in VRAM; with the live one within --max-context's bytes
     std::optional<basalt::core::BasicConversationCache<basalt::core::DeviceConversation>> kv_pool{};
     size_t kv_pool_cap{};
+    // the last image the pool could not allocate, and the cells the live session backed then: an image as large
+    // under as much pressure goes to the RAM path at once (cleared by SLEEP and VRAM)
+    size_t kv_pool_no_fit{};
+    int64_t kv_pool_no_fit_cells{};
     // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
     // the next, so each stage saves its own part when it reaches a checkpoint position (the same rule as the main card's:
     // every `prompt_cache_every` tokens from where the request resumed), and the last stage puts them together.
@@ -420,6 +424,7 @@ private:
     bool peer_take(const std::vector<int32_t>& off, std::string& e);
     void peer_due_lent(std::vector<std::pair<int32_t, int32_t>>& lent);
     bool peer_due_apply(std::string& e);
+    int64_t cache_yield_keep(int64_t add, int64_t room);
     bool cache_yield(int64_t add, int64_t room, std::vector<int32_t>& off, std::string& e);
     bool kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true, int64_t min_cells = -1);
     size_t kv_pool_held(int64_t tokens);

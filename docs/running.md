@@ -80,7 +80,7 @@ Off by default. Qwen3.8-Flash-Next on one card, with elastic KV and without `--p
 stays in VRAM, beside the live one, until their tokens together would pass `--max-context` (each pooled one also counts its running state,
 about 124 MiB): then the oldest leaves first. A prompt that continues a pooled conversation goes on from where it ended, without reading it
 again, and needs no free RAM. The pool takes its VRAM from the expert cache, never below the slots a prompt chunk needs, and gives way when
-the live conversation grows. Each pooled conversation keeps its deepest checkpoint in RAM (the system prompt's stays with the session). `SLEEP` drops the
+the live conversation grows. A conversation the pool cannot take (past the budget beside the live one, or no VRAM above that floor) is parked as without the pool, before anything is evicted or the cache shrinks; after an image fails to allocate, one as large goes the same way until `VRAM` or `SLEEP`. Each pooled conversation keeps its deepest checkpoint in RAM (the system prompt's stays with the session). `SLEEP` drops the
 pool. The log lines start with `kv pool:`.
 
 ## Sleep: `--idle-sleep`

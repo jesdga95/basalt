@@ -533,6 +533,9 @@ int64_t QfnRuntime::kv_pool_evict(int64_t need) {
 
 // The outgoing conversation into the pool, when it fits beside `held` (the live conversation's bytes) within the
 // cap after the oldest leave, and the expert cache can give the VRAM above its floor.  False: the RAM path parks it.
+// Every test that can refuse runs before anything is evicted or the cache shrinks, so a conversation the pool cannot
+// take costs the switch nothing; an allocation that fails anyway is remembered, and an image as large under as much
+// pressure goes to the RAM path at once after it.
 // Not when the request goes on from the chain's deepest checkpoint (the same conversation's next turn).  Its deepest
 // checkpoint goes with it: moved when the request does not start with it, else copied when RAM admits it (the
 // session's chain keeps the shared ones, the system prompt's root).
@@ -543,32 +546,61 @@ bool QfnRuntime::kv_pool_park(size_t held, int64_t kept) {
     if (kept > 0 && kept >= deepest_at) return false;
     const auto t0 = Clock::now();
     const size_t need = kv_pool_held((int64_t) live.size());
-    kv_pool->drop_superseded(live, live_imgs, checks, cvec_cached);
+    auto refuse = [&](const char* why) {
+        basalt::log::info("basalt serve", "kv pool: %zu tokens not parked (%s)", live.size(), why);
+        return false;
+    };
+    if (need == 0 || held > kv_pool_cap || need > kv_pool_cap - held)
+        return refuse("larger than --max-context beside the live one");
+    const int64_t cells = basalt::core::session_kv_cells(ss);
+    if (kv_pool_no_fit > 0 && need >= kv_pool_no_fit && cells >= kv_pool_no_fit_cells)
+        return refuse("an image this large did not fit in VRAM");
+    kv_pool->drop_superseded(live, live_imgs, checks, cvec_cached);   // stale either way
     const size_t evicted = kv_pool->evictions();
     std::string e;
     if (!kv_drain(e)) {
         basalt::log::warn("basalt serve", "kv pool: %zu tokens not parked (%s)", live.size(), e.c_str());
         return false;
     }
+    // the VRAM: free above the reserve, what the entries make_room evicts give back, then the expert cache's tail
+    const int64_t slack = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);   // the allocation's rounding
+    auto room_now = [&] {
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        return std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+    };
+    const size_t frees = kv_pool->room_frees(need, held);
+    if (frees == SIZE_MAX) return refuse("larger than --max-context beside the live one");
+    if (cache_yield_keep((int64_t) need + slack, room_now() + (int64_t) frees) < 0)
+        return refuse("the expert cache is at its floor");
+    // committed: from here a refusal gives the expert cache back what it gave
     auto skip = [&](const char* why) {
-        basalt::log::info("basalt serve", "kv pool: %zu tokens not parked (%s)", live.size(), why);
+        refuse(why);
         if (!e.empty()) basalt::log::warn("basalt serve", "kv pool: %s", e.c_str());
         std::string ge;
         if (!cache_regrow(ge)) basalt::log::warn("basalt serve", "kv pool: %s", ge.c_str());
         return false;
     };
-    if (need == 0 || !kv_pool->make_room(need, held)) return skip("larger than --max-context beside the live one");
-    size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
-    const int64_t room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+    if (!kv_pool->make_room(need, held)) return skip("larger than --max-context beside the live one");
+    const int64_t room = room_now();
     std::vector<int32_t> off;
-    const int64_t slack = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);   // the allocation's rounding
     if (!cache_yield((int64_t) need + slack, room, off, e)) return skip("the expert cache is at its floor");
     if (!peer_take(off, e)) return skip("the peer tier");
     if (mtp_kv != nullptr && !mtp.snapshot_main(e)) return skip("the draft ring");
     basalt::core::DeviceConversation image;
     const basalt::core::ConversationView view{live, live_imgs, checks, cvec_cached};
-    if (!basalt::core::conversation_device_save(image, view, ss, g, mtp_kv, e)) return skip("the copy failed");
+    bool no_memory = false;
+    if (!basalt::core::conversation_device_save(image, view, ss, g, mtp_kv, e, &no_memory)) {
+        if (!no_memory) return skip("the copy failed");
+        (void) cudaGetLastError();
+        kv_pool_no_fit = need;
+        kv_pool_no_fit_cells = cells;
+        basalt::log::warn("basalt serve", "kv pool: %.0f MiB not allocated with %.0f MiB free above the reserve; "
+                          "images this large go to the RAM path while the live KV backs %lld cells or more",
+                          (double) need / 1048576.0, (double) room_now() / 1048576.0, (long long) cells);
+        e.clear();
+        return skip("no VRAM for the image");
+    }
     auto deepest = checks.end();
     for (auto it = checks.begin(); it != checks.end(); ++it)
         if (deepest == checks.end() || it->ids.size() > deepest->ids.size()) deepest = it;

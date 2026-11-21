@@ -263,16 +263,23 @@ bool QfnRuntime::peer_due_apply(std::string& e) {
     return true;
 }
 
+// The bytes the expert cache keeps when its tail pays for `add` above `room` (whole segments: everything from the
+// first one at or past it goes); -1 when that takes it below its floor, or it cannot shrink.
+int64_t QfnRuntime::cache_yield_keep(int64_t add, int64_t room) {
+    if (add <= room) return xcache.mapped_bytes();
+    if (!xcache.segmented()) return -1;
+    const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
+    const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
+    return xcache.slots_after_shrink(keep) < cache_floor_slots() ? -1 : keep;
+}
+
 // `add` bytes above the VRAM reserve, `room` of them free now: the expert cache's tail gives up whole segments for
 // the rest, unless that takes it below its floor (false, `e` empty).  `off`: the experts that left VRAM.  The device
 // is idle.
 bool QfnRuntime::cache_yield(int64_t add, int64_t room, std::vector<int32_t>& off, std::string& e) {
     if (add <= room) return true;
-    if (!xcache.segmented()) { e.clear(); return false; }
-    // whole tail segments: everything from the first one at or past `keep` goes
-    const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
-    const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
-    if (xcache.slots_after_shrink(keep) < cache_floor_slots()) { e.clear(); return false; }
+    const int64_t keep = cache_yield_keep(add, room);
+    if (keep < 0) { e.clear(); return false; }
     if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
     if (!xcache.shrink(keep, e)) return false;
     const int64_t live = xcache.slots();

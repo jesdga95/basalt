@@ -452,7 +452,8 @@ size_t conversation_device_bytes(const SessionState& ss, const ModelGeometry& g,
 }
 
 bool conversation_device_save(DeviceConversation& image, const ConversationView& view, const SessionState& ss,
-                              const ModelGeometry& g, const QsaState* draft, std::string& error) {
+                              const ModelGeometry& g, const QsaState* draft, std::string& error, bool* no_memory) {
+    if (no_memory) *no_memory = false;
     std::vector<std::pair<void*, size_t>> r;
     if (!view_validate(view, ss, g, error) ||
         !device_regions(ss, g, draft, (int64_t) view.ids.size(), true, r, error) || !sync(error))
@@ -465,6 +466,7 @@ bool conversation_device_save(DeviceConversation& image, const ConversationView&
     if (cudaMalloc(&out.mem, out.mem_bytes) != cudaSuccess) {
         cudaGetLastError();
         out.mem = nullptr;
+        if (no_memory) *no_memory = true;
         return fail(error, "cannot allocate the device image");
     }
     size_t at = 0;
