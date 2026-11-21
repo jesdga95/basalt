@@ -298,6 +298,15 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     }
     fp8_ = req.kv == "fp8";
 
+    // [vision] the image encoder staged before the context is sized, the room of its largest region kept free
+    uint64_t vision_room = 0;
+    if (req.vision) {
+        if (!vis_.stage(pack_.vision, g.n_embd, err)) return fail("vision: " + err);
+        vision_room = vis_.region_bytes();
+        basalt::log::info("basalt inkling2", "image encoder: %.2f GiB staged in page-locked RAM, %.2f GiB of the card kept for it",
+                          (double) vis_.weights_bytes() / (double) kGiB, (double) vision_room / (double) kGiB);
+    }
+
     // the context: what the weights leave, less the card's spare
     {
         size_t free_b = 0, total_b = 0;
@@ -305,7 +314,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
         if (want < 1024 || (g.context_length > 0 && want > g.context_length))
             return fail("--max-context " + std::to_string(want) + " is outside 1,024 .. " + std::to_string(g.context_length));
-        const uint64_t avail = free_b > kCardSpare ? (free_b - kCardSpare) / (uint64_t) std::max(req.sessions, 1) : 0;
+        const uint64_t spare = kCardSpare + vision_room;   // [vision]
+        const uint64_t avail = free_b > spare ? (free_b - spare) / (uint64_t) std::max(req.sessions, 1) : 0;
         const uint64_t need = session_bytes(g, want, fp8_);
         if (need > avail) {
             const uint64_t per = session_bytes(g, 2, fp8_) - session_bytes(g, 1, fp8_);
