@@ -38,6 +38,8 @@ public:
     /// As CpuEncoder::encode (a picture's 768-wide rows or a video group's 1536-wide ones); the taps copy to the host
     /// and are for parity runs only.
     bool encode(const std::vector<float>& patches, Size canvas, std::vector<float>& out, const TapFn& tap = {});
+    /// As CpuEncoder::encode_padded (the class-token tower): the picture's bytes go to the device, which cuts the patch rows.
+    bool encode_padded(const Image& img, std::vector<float>& out, const TapFn& tap = {});
 
     /// Device bytes held by the weights and the work buffers.
     size_t device_bytes() const;
