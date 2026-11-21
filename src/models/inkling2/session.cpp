@@ -52,6 +52,7 @@ public:
     explicit Session(InklingModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
         if (stream_) cudaStreamSynchronize(stream_);
+        prompt_.reset();   // it synchronizes the session's stream as it goes, so before that stream is destroyed
         if (m_.spill().any() && ex_tally_) {   // how decode's lookups fell between the card and RAM
             std::vector<uint32_t> t((size_t) expert_pairs());
             if (cudaMemcpy(t.data(), ex_tally_, t.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
