@@ -132,8 +132,8 @@ constexpr int kAheadExperts = 8;   ///< the groups of a visit moe_plan records (
 /// Requests into L2 the first `bytes` of each of the *n blobs (moe_plan's record of a visit), 32 blocks each keeping one
 /// 128 KiB step in flight: run on a side stream while the glue before the experts runs; reads only.
 void expert_read_ahead(const unsigned long long* blobs, const int32_t* n, uint64_t bytes, void* stream);
-/// Requests into L2 the first `bytes` of the blobs of the experts ids[0..n) (blobs[e]: expert e's device address; a
-/// guess at a visit's experts), by 16-byte loads over every block: run on a side stream while the attention and the glue
+/// Requests into L2 the first `bytes` of the blobs of the distinct experts among ids[0..n) (blobs[e]: expert e's device
+/// address; a guess at a visit's experts), by 16-byte loads over every block: run on a side stream while the attention and the glue
 /// before the experts run. Reads only; `sink` (4 bytes) is written on a 2^-32 chance so the loads are kept.
 void expert_prefetch(const int32_t* ids, int n, const unsigned long long* blobs, uint64_t bytes, uint32_t* sink, void* stream);
 /// y[r] = sum_slot w[r][slot] * out[r * k + slot] in slot order (fp32).

@@ -145,9 +145,9 @@ public:
         ex_tally_ = (uint32_t*) alloc((size_t) expert_pairs() * 4, ok);
         rec_blobs_ = (unsigned long long*) alloc((size_t) g_.visits.size() * kAheadExperts * 8, ok);
         rec_n_ = (int32_t*) alloc((size_t) g_.visits.size() * 4, ok);
-        nrm1_ = f((int64_t) g_.visits.size() * E);
+        nrm1_ = f((int64_t) g_.visits.size() * kGuessRows * E);
         gs_ids_ = (int32_t*) alloc((size_t) g_.visits.size() * kGuessExperts * 4, ok);
-        gs_log_ = f(g_.n_expert);
+        gs_log_ = f((int64_t) kGuessRows * g_.n_expert);
         gs_w_ = f(kGuessExperts);
         pf_sink_ = (uint32_t*) alloc(4, ok);
         logits_ = f(R * (int64_t) g_.n_vocab);
@@ -582,16 +582,17 @@ private:
             ap.ldq = kProjQ;
             ap.ldk = ap.ldv = kProjKV;
         }
-        // a 1-row window: the experts guessed for this visit beside the visit before's router into L2 on the other side
-        // stream, while the attention and the glue before the experts run (it starts once the projections are done)
+        // a window of up to kGuessRows rows: the experts guessed for this visit beside the visit before's router (each row's
+        // kGuessExperts / rows best) into L2 on the other side stream, while the attention and the glue before the experts
+        // run (it starts once the projections are done)
         const int vi = (int) (&v - g_.visits.data());
-        const bool guess = rows == 1;
+        const bool guess = rows <= kGuessRows;
         if (guess && vi > 0) {
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(pf_ev_, stream_);
             cudaStreamWaitEvent(pf_st_, pf_ev_, 0);
             cudaStreamWaitEvent(pf_st_, gs_ev_, 0);
-            expert_prefetch(gs_ids_ + (size_t) vi * kGuessExperts, kGuessExperts, w.blob_table, (uint64_t) Lx.down_off & ~(uint64_t) 15,
+            expert_prefetch(gs_ids_ + (size_t) vi * kGuessExperts, kGuessExperts / rows * rows, w.blob_table, (uint64_t) Lx.down_off & ~(uint64_t) 15,
                             pf_sink_, pf_st_);
             pf_on_ = true;
         }
@@ -634,7 +635,7 @@ private:
         aa.q8 = xo_;
         attention_window(ap, aa, rows, c.ring ? (int64_t) g_.window : full_keys, att_scr_, stream_);
         bk::native_q8_0_mmvq(w.out, xo_, o_, kOutRows, E, rows, stream_);
-        // a window of 2+ rows: the experts this visit took in the window before into L2 on the side stream, while the glue
+        // a wider window: the experts this visit took in the window before into L2 on the side stream, while the glue
         // before the experts runs (it starts once the output projection is done)
         if (!guess) {
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
@@ -657,7 +658,7 @@ private:
         pa.norm = w.ffn_norm;
         pa.eps = g_.rms_eps;
         pa.q8 = xq_[0];
-        float* nrm = guess ? nrm1_ + (size_t) vi * E : nrm_;   // a visit's own row: the next visit's guess reads it later
+        float* nrm = guess ? nrm1_ + (size_t) vi * kGuessRows * E : nrm_;   // a visit's own rows: the next visit's guess reads them later
         pa.norm_out = nrm;
         if (msgs) pa.mix_out = mix_;
         post_attn(pa, rows, stream_);
@@ -688,9 +689,9 @@ private:
         if (guess_next) {   // the next visit's experts: its router on this visit's MLP input, beside this visit's router
             const LayerWeights& nw = m_.layer(g_.visits[(size_t) vi + 1].layer);
             bk::RouterArgs ga = ra;
-            ga.k = kGuessExperts;
+            ga.k = kGuessExperts / rows;
             cudaStreamWaitEvent(ra_st_, ra_ev_, 0);
-            bk::router(nrm, nw.router, nw.router_bias, 1, ga, gs_log_, gs_ids_ + (size_t) (vi + 1) * kGuessExperts, gs_w_, ra_st_);
+            bk::router(nrm, nw.router, nw.router_bias, rows, ga, gs_log_, gs_ids_ + (size_t) (vi + 1) * kGuessExperts, gs_w_, ra_st_);
             cudaEventRecord(gs_ev_, ra_st_);
             ra_on_ = true;
         }
@@ -924,8 +925,9 @@ private:
     cudaStream_t ra_st_ = nullptr;              // the side stream (the read-ahead, the guesses), its fork and join events
     cudaEvent_t ra_ev_ = nullptr, ra_join_ = nullptr, gs_ev_ = nullptr;   // gs_ev_: a guess is in
     bool ra_on_ = false;
-    static constexpr int kGuessExperts = 8;     // the experts a 1-row window's guess requests a visit
-    float* nrm1_ = nullptr;                     // [visit][E] a 1-row window's MLP inputs, a visit each
+    static constexpr int kGuessExperts = 8;     // the experts a window's guess requests a visit (rows x kGuessExperts / rows)
+    static constexpr int kGuessRows = 2;        // the widest window guessed (wider ones keep the read-ahead)
+    float* nrm1_ = nullptr;                     // [visit][kGuessRows][E] a guessed window's MLP inputs, a visit each
     int32_t* gs_ids_ = nullptr;                 // [visit][kGuessExperts] the guessed experts
     float *gs_log_ = nullptr, *gs_w_ = nullptr; // the guess's router scratch
     uint32_t* pf_sink_ = nullptr;               // the prefetch's keep-alive word
