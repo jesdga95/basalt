@@ -365,6 +365,29 @@ __global__ void __launch_bounds__(32) expert_read_ahead_kernel(const unsigned lo
     if (acc == 0x9e3779b9u && total == 1) asm volatile("" ::"r"(acc));   // keeps the reads
 }
 
+// Every block loads its share of the experts' first `bytes`, 16 bytes a thread at a time, four loads in flight.
+constexpr int kPrefetchBlocks = 170, kPrefetchThreads = 256, kPrefetchMax = 16;
+__global__ void __launch_bounds__(kPrefetchThreads) expert_prefetch_kernel(const int32_t* __restrict__ ids, int n,
+                                                                            const unsigned long long* __restrict__ blobs, uint64_t bytes,
+                                                                            uint32_t* __restrict__ sink) {
+    __shared__ unsigned long long addr[kPrefetchMax];
+    if (threadIdx.x < n) addr[threadIdx.x] = blobs[ids[threadIdx.x]];
+    __syncthreads();
+    const uint64_t n16 = bytes / 16, total = (uint64_t) n * n16, T = (uint64_t) gridDim.x * blockDim.x;
+    uint32_t acc = 0;
+    for (uint64_t c = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; c < total; c += 4 * T) {
+        uint4 v[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const uint64_t i = c + u * T;
+            v[u] = i < total ? __ldcg(reinterpret_cast<const uint4*>((const char*) addr[i / n16] + (i % n16) * 16)) : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) acc ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
+    }
+    if (acc == 0x9e3779b9u) *sink = acc;   // so the loads are not dropped as unused
+}
+
 __global__ void moe_combine_kernel(const float* __restrict__ out, const float* __restrict__ w, int k, float* __restrict__ y) {
     const int r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= kWidth) return;
@@ -444,6 +467,13 @@ void expert_read_ahead(const unsigned long long* blobs, const int32_t* n, uint64
     if (bytes == 0 || bytes % 16) throw std::runtime_error("inkling2 expert_read_ahead: bytes");
     expert_read_ahead_kernel<<<kAheadBlocks, 32, 0, (cudaStream_t) stream>>>(blobs, n, bytes);
     check("expert_read_ahead");
+}
+
+void expert_prefetch(const int32_t* ids, int n, const unsigned long long* blobs, uint64_t bytes, uint32_t* sink, void* stream) {
+    if (n <= 0) return;
+    if (n > kPrefetchMax || bytes == 0 || bytes % 16) throw std::runtime_error("inkling2 expert_prefetch: experts or bytes");
+    expert_prefetch_kernel<<<kPrefetchBlocks, kPrefetchThreads, 0, (cudaStream_t) stream>>>(ids, n, blobs, bytes, sink);
+    check("expert_prefetch");
 }
 
 void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* blobs, unsigned long long* ptr,
