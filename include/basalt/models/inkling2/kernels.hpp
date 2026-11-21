@@ -175,6 +175,11 @@ void controllers(const CtrlArgs& a, int streams, int rows, void* stream);
 /// attn_prepare for a decode window: a block per row and key/value head.
 void decode_prepare(const AttnPrep& a, int rows, void* stream);
 
+/// A decode window's attention from its projections: decode_prepare(pa) then attention_decode(a) into a.q8 (which must be
+/// set; a's q, r and sink are pa's outputs), the same bits. A window of up to 2 rows whose keys split in at most 8 slices
+/// (max_keys up to 1024) runs as one kernel: a cluster of blocks a row and key/value head prepares, attends and merges.
+void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream);
+
 /// After the attention's output projection: its convolution over `o` (the ring for the positions before the window) plus
 /// the residual (the layer's input `hid`, unless the layer starts a block) into `resid`; then the MLP's input, the mix of
 /// the finished blocks (and `hid` when the layer starts a block) and `resid` scored by `query`, normed with `norm` (eps)

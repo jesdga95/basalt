@@ -10,6 +10,7 @@
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "prep.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -160,15 +161,7 @@ __device__ __forceinline__ void norm_q8(const float (&x)[kPer], const float (&w)
     }
 }
 
-// The convolution input of channel c at position pos[r] - j: a row of the window (stride ld), the ring, or zero before
-// position 0.
-__device__ __forceinline__ float conv_in(const float* __restrict__ y, int64_t ld, const float* __restrict__ ring, int ring_w,
-                                         const int32_t* __restrict__ pos, int r, int j, int c) {
-    if (r - j >= 0) return y[(size_t) (r - j) * ld + c];
-    const int p = pos[r] - j;
-    if (p < 0) return 0.f;
-    return ring[(size_t) (p % kConvRing) * ring_w + c];
-}
+using prep::conv_in;
 
 // ---- mixes -------------------------------------------------------------------------------------------------------------
 
@@ -382,106 +375,29 @@ __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
 
 // ---- attention preparation ---------------------------------------------------------------------------------------------
 
-__device__ __forceinline__ float tau_of(int p, float floor_, float alpha) {
-    return 1.f + alpha * logf(fmaxf((float) (p + 1) / floor_, 1.f));
-}
-
-__device__ __forceinline__ void store_kv(void* cache, bool fp8, size_t idx, float v) {
-    if (fp8) {
-        __nv_fp8_e4m3 q(v);
-        static_cast<uint8_t*>(cache)[idx] = *reinterpret_cast<uint8_t*>(&q);
-    } else {
-        static_cast<__half*>(cache)[idx] = __float2half_rn(v);
-    }
-}
-
 // Block (row, key/value head g), four warps: warp 0 the head's keys (convolved, clipped, cached; the raw inputs into the
-// ring), warp 1 its values (normed), warps 2 and 3 its three query heads, their relative states and sinks.
+// ring), warp 1 its values (normed), warps 2 and 3 its three query heads, their relative states and sinks (prep.cuh).
 __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
     const int r = blockIdx.x, g = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    // the weights, read while the kernel before finishes: warps 0 and 1 their channels' taps, warps 2 and 3 their heads'
-    // clip scales
-    float wt[4][kConv];
-    if (w < 2) {
-        const float* taps = w ? a.v_conv : a.k_conv;
-#pragma unroll
-        for (int u = 0; u < 4; ++u)
-#pragma unroll
-            for (int j = 0; j < kConv; ++j) wt[u][j] = taps[(g * kHeadDim + lane * 4 + u) * kConv + (kConv - 1 - j)];
-    } else {
-        const int h0 = g * 3 + (w == 2 ? 0 : 2);
-#pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            wt[u][0] = a.q_scale[h0 * kHeadDim + lane * 4 + u];
-            wt[u][1] = w == 2 ? a.q_scale[(h0 + 1) * kHeadDim + lane * 4 + u] : 0.f;
-        }
-        if (w == 3)
-#pragma unroll
-            for (int k = 0; k < 3; ++k) wt[k][2] = lane < kRel ? a.r_scale[(g * 3 + k) * kRel + lane] : 0.f;
-    }
+    float wt[4][kConv];   // the weights, read while the kernel before finishes
+    prep::load_weights(a, g, w, lane, wt);
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     const int p = a.pos[r];
     if (w < 2) {
-        const float* yall = w ? a.yv : a.yk;
-        const int64_t ld = w ? a.ldv : a.ldk;
-        const float* y = yall + (size_t) r * ld;
-        float* ring = w ? a.v_ring : a.k_ring;
-        const float inv_k = a.full ? (1.f / 3.f) : rsqrtf((float) kConv + 1.f);
-        float val[4], raw[4], ss = 0.f;
-#pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            const int c = g * kHeadDim + lane * 4 + u;
-            float acc = 0.f;
-            raw[u] = 0.f;
-#pragma unroll
-            for (int j = 0; j < kConv; ++j) {
-                const float x = conv_in(yall, ld, ring, kKvHeads * kHeadDim, a.pos, r, j, c);
-                if (j == 0) raw[u] = x;
-                float t = wt[u][j];
-                if (a.full) t += y[kOffTaps + g * kConv + j];
-                acc = fmaf(t, x, acc);
-            }
-            val[u] = (acc + raw[u]) * inv_k;
-            ss = fmaf(val[u], val[u], ss);
-        }
-        ss = warp_sum(ss);
-        const float f = w == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
+        float val[4], raw[4], f;
+        prep::kv_row(a, r, g, w, lane, wt, val, raw, f);
         void* cache = w ? a.v_cache : a.k_cache;
         const size_t cell = ((size_t) (p % a.cap) * kKvHeads + g) * kHeadDim + lane * 4;
 #pragma unroll
-        for (int u = 0; u < 4; ++u) store_kv(cache, a.fp8, cell + u, val[u] * f);
+        for (int u = 0; u < 4; ++u) prep::store_kv(cache, a.fp8, cell + u, val[u] * f);
+        float* ring = w ? a.v_ring : a.k_ring;
         *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
             make_float4(raw[0], raw[1], raw[2], raw[3]);
         return;
     }
-    const float* yq = a.yq + (size_t) r * a.ldq;
-    const float tau = a.full ? tau_of(p, a.log_floor, a.log_alpha) : 1.f;
-    // warp 2: heads 3g and 3g + 1; warp 3: head 3g + 2, then the three relative states and sinks
-    const int h0 = g * 3 + (w == 2 ? 0 : 2), h1 = w == 2 ? h0 + 2 : h0 + 1;
-    for (int h = h0; h < h1; ++h) {
-        float q[4], ss = 0.f;
-#pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            const int i = lane * 4 + u;
-            q[u] = yq[kOffQ + h * kHeadDim + i] * (h == h0 ? wt[u][0] : wt[u][1]);
-            ss = fmaf(q[u], q[u], ss);
-        }
-        ss = warp_sum(ss);
-        const float f = fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) * tau;
-        *reinterpret_cast<float4*>(a.q + ((size_t) r * kHeads + h) * kHeadDim + lane * 4) =
-            make_float4(q[0] * f, q[1] * f, q[2] * f, q[3] * f);
-    }
-    if (w == 3) {
-        for (int h = g * 3; h < g * 3 + 3; ++h) {
-            const int k = h - g * 3;
-            const float rv = lane < kRel ? yq[kOffR + h * kRel + lane] * (k == 0 ? wt[0][2] : k == 1 ? wt[1][2] : wt[2][2]) : 0.f;
-            const float rs = warp_sum(rv * rv);
-            const float fr = fminf(a.rel_clip / (sqrtf(rs) + 1e-6f), 1.f) * tau;
-            if (lane < kRel) a.r[((size_t) r * kHeads + h) * kRel + lane] = rv * fr;
-            if (lane == 0) a.sink[(size_t) r * kHeads + h] = yq[kOffSink + h];
-        }
-    }
+    prep::q_heads(a, r, p, g, w, lane, wt, a.q + ((size_t) r * kHeads + g * 3) * kHeadDim, a.r + ((size_t) r * kHeads + g * 3) * kRel,
+                  a.sink + (size_t) r * kHeads + g * 3);
 }
 
 // ---- after the attention -----------------------------------------------------------------------------------------------
