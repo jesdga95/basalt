@@ -510,6 +510,12 @@ __global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
     float taps[kConv];   // read while the kernel before finishes
 #pragma unroll
     for (int j = 0; j < kConv; ++j) taps[j] = a.taps[c * kConv + (kConv - 1 - j)];
+    if (threadIdx.x < kConv - 1) {   // the block's ring entries of the three positions before this row into L2
+        const int pj = a.pos[r] - 1 - (int) threadIdx.x;
+        if (pj >= 0)
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(a.ring + (size_t) (pj % kConvRing) * kWidth + blockIdx.y * 256),
+                         "r"(256u * 4u) : "memory");
+    }
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     {
