@@ -2,7 +2,7 @@
 // flash style on the tensor cores, with each query's relative bias over the last kExtent positions and its sink.
 //
 // A block takes kPos positions of the chunk and one key/value head. Its rows are the group's three query heads over those
-// positions, head-major: warp w owns query head w / 2 of the group at 16 consecutive positions. Keys stream through shared
+// positions, head-major: warp w owns query head w / kWarpsPerHead of the group at 16 consecutive positions. Keys stream through shared
 // memory in tiles of kKeys. S = Q K^T runs on fp16 tensor cores with fp32 accumulation. The relative bias of a warp's rows
 // against a tile is one more product, R (the rows' relative states) times the band of the bias table the tile's distances
 // span, moved through shared memory into the scores' layout. The softmax is online in fp32 (base 2), O += P V runs on fp16
