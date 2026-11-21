@@ -12,6 +12,9 @@
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/nvfp4_planes.hpp"
+#include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/window_gemm.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/log.hpp"
@@ -25,6 +28,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 
 namespace basalt::models::inkling2 {
 namespace {
@@ -40,6 +44,7 @@ constexpr int kFrRing = 16;                // positions whose Markov context the
 constexpr int kSlice = 8;                  // rows of one commit step (MMVQ's widest)
 constexpr int kRingExtra = 64;             // a sliding-window layer's ring: its window, a block and a window's rows past it
 constexpr int kDumpBlocks = 24;            // blocks --diag-dump writes
+constexpr int kFp4Mats = 7;                // a layer's block products in NVFP4 planes: q, k, v, o, gate, up, down
 
 uint64_t q8_bytes(uint64_t rows, uint64_t n_in) { return rows * (n_in / 32) * 34; }
 
@@ -52,6 +57,34 @@ bk::RopeSpec rope_of(const DsparkGeometry& d) {
     r.theta = d.rope_base;
     r.scaling.freq_base = d.rope_base;
     return r;
+}
+
+// The window gemm's split-K scratch for the block's products: q + k + v, o, gate + up, down
+void ws_need(const DsparkGeometry& d, size_t& partial, size_t& tickets) {
+    namespace wg = bk::wgemm;
+    partial = tickets = 0;
+    const auto need = [&](int64_t K, std::initializer_list<int64_t> rows, wg::Epilogue epi) {
+        wg::Call c;
+        c.fmt = wg::Format::Nvfp4;
+        c.K = K;
+        c.epi = epi;
+        c.n = 0;
+        for (int64_t r : rows) c.m[c.n++].rows = r;
+        size_t p = 0, t = 0;
+        wg::workspace_need(c, p, t);
+        partial = std::max(partial, p);
+        tickets = std::max(tickets, t);
+    };
+    need(kE, {kQ, kKV, kKV}, wg::Epilogue::Store);
+    need(kQ, {kE}, wg::Epilogue::Add);
+    need(kE, {d.n_ff, d.n_ff}, wg::Epilogue::SwiGLU);
+    need(d.n_ff, {kE}, wg::Epilogue::Add);
+}
+
+uint64_t dspark_ws_bytes(const DsparkGeometry& d) {
+    size_t p = 0, t = 0;
+    ws_need(d, p, t);
+    return (uint64_t) (std::max<size_t>(p, 1) + std::max<size_t>(t, 1)) * 4;
 }
 
 }  // namespace
@@ -164,6 +197,7 @@ model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int
         L.q_norm = f32(b + "attn_q_norm.weight", kHeadDim);
         L.k_norm = f32(b + "attn_k_norm.weight", kHeadDim);
         L.k_ctx_norm = f32(b + "attn_k_ctx_norm.weight", kHeadDim);
+        L.fp4_scale = (float*) w->dev(kFp4Mats * 4, ok);
     }
     w->alpha = f32("dspark.fuse_weight", kDsMixes * kDsTargets);   // the raw weights; finish() softmaxes them in place
     w->mask = f32("dspark.mask_embed", kE);
@@ -187,7 +221,7 @@ model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int
     w->head_sc = w->dev(dspark_screen_bytes(kE, g.n_vocab), ok);
     w->fold_sc = w->dev(dspark_screen_bytes(kDsRank, g.n_vocab), ok);
     if (!ok) return fail("out of device memory");
-    basalt::log::info("basalt inkling2", "drafter: DSpark, %d layers reading target visits %d, %d, %d, %.2f GiB on the GPU (Q8_0 projections, the screen's copies), "
+    basalt::log::info("basalt inkling2", "drafter: DSpark, %d layers reading target visits %d, %d, %d, %.2f GiB on the GPU (NVFP4 block products, Q8_0 context projections, the screen's copies), "
                       "%.0f MB of token rows in host memory",
                       d.n_layers, d.targets[0], d.targets[1], d.targets[2], (double) w->bytes() / (double) (1ull << 30),
                       (double) g.n_vocab * kDsRank * 2 / 1e6);
@@ -217,6 +251,22 @@ model::Result DsparkWeights::finish(const void* head_q8, const uint16_t* emb, co
         dspark_screen_pack(head, kE, n_vocab, head_sc, s);
         dspark_screen_pack(fold, kDsRank, n_vocab, fold_sc, s);
         dspark_screen_order(fold_b, n_vocab, fold_bp, s);
+        // the block's products rounded from their Q8_0 to NVFP4 planes in place (the planes are shorter), through a copy of
+        // each: the drafts' precision only, every draft is verified exactly; about half the bytes a block reads
+        const uint64_t ff = (uint64_t) geo.n_ff;
+        void* tmp = nullptr;
+        if (cudaMalloc(&tmp, q8_bytes(ff, kE)) != cudaSuccess) throw std::runtime_error("out of device memory rounding its products");
+        for (DsparkLayer& L : layer) {
+            const struct { void* w; uint64_t rows, K; } m[kFp4Mats] = {
+                {L.wq, kQ, kE}, {L.wk, kKV, kE}, {L.wv, kKV, kE}, {L.wo, kE, kQ}, {L.gate, ff, kE}, {L.up, ff, kE}, {L.down, kE, ff}};
+            for (int i = 0; i < kFp4Mats; ++i) {
+                cudaMemcpyAsync(tmp, m[i].w, q8_bytes(m[i].rows, m[i].K), cudaMemcpyDeviceToDevice, s);
+                bk::nvfp4p::from_q8(tmp, (int64_t) m[i].rows, (int64_t) m[i].K, m[i].w, L.fp4_scale + i, s);
+            }
+        }
+        const cudaError_t e = cudaStreamSynchronize(s);
+        cudaFree(tmp);
+        if (e != cudaSuccess) throw std::runtime_error("rounding its products failed");
     } catch (const std::exception& e) {
         return {model::Status::Error, std::string("inkling2: the drafter: ") + e.what()};
     }
@@ -249,10 +299,11 @@ uint64_t dspark_session_bytes(const Pack& pack, int64_t context, int tap_rows) {
     const uint64_t E = kE, V = (uint64_t) pack.geo.n_vocab, ff = (uint64_t) d.n_ff, R = kDsBlock;
     uint64_t n = 4ull * (uint64_t) tap_rows * E * 4;                              // the tap
     n += 3 * kSlice * E * 4 + kFrRing * E * 4 + 2 * kSlice * kKV * 4 + 64;        // a commit step's rows
-    n += bk::native_q8_1_bytes((int) std::max<uint64_t>(ff, kQ), kDsBlock);
+    n += bk::native_q8_1_bytes(kE, kSlice);
     for (int l = 0; l < d.n_layers; ++l)                                           // the caches, fp16 K and V
         n += 2ull * (uint64_t) (d.swa[(size_t) l] ? ring_cells(d) : full_cells(context)) * kKV * 2;
-    n += (3 * R * E + 3 * R * kQ + 2 * R * ff) * 4;                                // the block's rows
+    n += (2 * R * E + 3 * R * kQ) * 4;                                             // the block's rows
+    n += 2 * bk::wgemm::act_bytes((int64_t) std::max<uint64_t>(ff, kQ)) + dspark_ws_bytes(d) + 1024;   // the window gemm's
     n += bk::gqa_decode_scratch_floats(std::max(ring_cells(d), full_cells(context)), kDsBlock, kHeads, kHeadDim) * 4;
     n += ((uint64_t) kDsDrafts * dspark_screen_rows((int64_t) V) + (uint64_t) kDsDrafts * kDsRnn + kDsRnn + 3 * kDsRank) * 4;   // the head's
     n += bk::native_q8_1_bytes(kE, kDsDrafts) + bk::native_q8_1_bytes(kDsRank, kDsDrafts) + dspark_head_scratch_bytes((int64_t) V) + 1024;
@@ -303,7 +354,7 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     pos3_ = (int32_t*) dev(kSlice * 3 * 4, ok);
     kb_ = f(kSlice * kKV);
     vb_ = f(kSlice * kKV);
-    act_ = dev(bk::native_q8_1_bytes((int) std::max<size_t>(ff, kQ), kDsBlock), ok);
+    act_ = dev(bk::native_q8_1_bytes(kE, kSlice), ok);
     cache_.assign((size_t) d.n_layers, Cache{});
     for (int l = 0; l < d.n_layers; ++l) {
         Cache& c = cache_[(size_t) l];
@@ -313,14 +364,20 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
         c.v = (uint16_t*) dev((size_t) c.cap * kKV * 2, ok);
     }
     x_ = f(R * E);
-    xn_ = f(R * E);
     h_ = f(R * E);
-    o_ = f(R * E);
     q_ = f(R * kQ);
     qr_ = f(R * kQ);
     attn_ = f(R * kQ);
-    g_ = f(R * ff);
-    u_ = f(R * ff);
+    act_a_ = dev(bk::wgemm::act_bytes(kQ), ok);
+    act_h_ = dev(bk::wgemm::act_bytes((int64_t) ff), ok);
+    {
+        size_t pf = 0, tk = 0;
+        ws_need(d, pf, tk);
+        ws_.partial = f(std::max<size_t>(pf, 1));
+        ws_.tickets = (int32_t*) dev(std::max<size_t>(tk, 1) * 4, ok);   // zeroed by dev()
+        ws_.partial_floats = pf;
+        ws_.tickets_n = tk;
+    }
     pos3b_ = (int32_t*) dev(R * 3 * 4, ok);
     att_cells_ = std::max(ring_cells(d), full_cells(context));
     att_scr_ = f(bk::gqa_decode_scratch_floats(att_cells_, kDsBlock, kHeads, kHeadDim));
@@ -333,6 +390,7 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     lat_q_ = dev(bk::native_q8_1_bytes(kDsRank, kDsDrafts), ok);
     head_scr_ = dev(dspark_head_scratch_bytes((int64_t) V), ok);
     prev_ = (int32_t*) dev(4, ok);
+    w1_row_ = (uint16_t*) dev(kDsRank * 2, ok);
     ids_d_ = (int32_t*) dev(kDsBlock * 4, ok);
     conf_d_ = f(kDsBlock);
     frc_ = f(E);
@@ -412,31 +470,55 @@ void DsparkHook::note(int64_t pos0, int rows) {
 // (k < layers) or the final norm and the head's `n` drafts (k = layers). Everything a stage reads of the block's anchor and
 // position is on the device (meta_d_), so a stage is captured once and replayed.
 void DsparkHook::stage(int k, int n, void* stream) {
+    bk::PdlScope pdl(true);   // each kernel may start while the one before it finishes: a product stages its first weights
     const DsparkWeights& w = *w_;
     const DsparkGeometry& d = w.geo;
     if (k == 0) dspark_block_inputs(w.embedding, meta_d_, w.embed_norm, d.rms_eps, w.mask, kDsBlock, x_, pos3b_, prev_, state_, fr_,
-                                    kFrRing, frc_, stream);
-    if (k > 0) {
+                                    kFrRing, frc_, w.w1, w1_row_, stream);
+    namespace wg = bk::wgemm;
+    const auto mat = [](const void* p, int64_t rows, const float* scale, float* y, int64_t ld_y) {
+        return wg::Matrix{(const uint8_t*) p, rows, scale, y, ld_y};
+    };
+    if (k > 0) {   // x += o attn; x += down(silu(gate z) * up z), z = post_norm(x)
         const DsparkLayer& L = w.layer[(size_t) k - 1];
-        bk::native_quantize_q8_1(attn_, act_, kQ, kDsBlock, stream);
-        bk::native_q8_0_mmvq(L.wo, act_, o_, kQ, kE, kDsBlock, stream);
-        bk::add_scaled(x_, o_, nullptr, (int64_t) kDsBlock * kE, stream);
-        bk::rms_norm_rows(x_, L.post_norm, kDsBlock, kE, d.rms_eps, xn_, stream);
-        bk::native_quantize_q8_1(xn_, act_, kE, kDsBlock, stream);
-        bk::native_q8_0_mmvq(L.gate, act_, g_, kE, d.n_ff, kDsBlock, stream);
-        bk::native_q8_0_mmvq(L.up, act_, u_, kE, d.n_ff, kDsBlock, stream);
-        bk::native_swiglu_quantize_q8_1(g_, u_, act_, d.n_ff, kDsBlock, stream);
-        bk::native_q8_0_mmvq(L.down, act_, o_, d.n_ff, kE, kDsBlock, stream);
-        bk::add_scaled(x_, o_, nullptr, (int64_t) kDsBlock * kE, stream);
+        const float* sc = L.fp4_scale;
+        wg::pack(attn_, kQ, kQ, kDsBlock, act_a_, stream);
+        wg::Call o;
+        o.fmt = wg::Format::Nvfp4;
+        o.K = kQ;
+        o.epi = wg::Epilogue::Add;
+        o.m[0] = mat(L.wo, kE, sc + 3, x_, kE);
+        wg::gemm(o, act_a_, kDsBlock, ws_, stream);
+        wg::norm_pack(x_, L.post_norm, d.rms_eps, kE, kDsBlock, act_a_, nullptr, stream);
+        wg::Call gu;
+        gu.fmt = wg::Format::Nvfp4;
+        gu.K = kE;
+        gu.n = 2;
+        gu.epi = wg::Epilogue::SwiGLU;
+        gu.m[0] = mat(L.gate, d.n_ff, sc + 4, nullptr, d.n_ff);
+        gu.m[1] = mat(L.up, d.n_ff, sc + 5, nullptr, d.n_ff);
+        gu.act_out = act_h_;
+        wg::gemm(gu, act_a_, kDsBlock, ws_, stream);
+        wg::Call dn;
+        dn.fmt = wg::Format::Nvfp4;
+        dn.K = d.n_ff;
+        dn.epi = wg::Epilogue::Add;
+        dn.m[0] = mat(L.down, kE, sc + 6, x_, kE);
+        wg::gemm(dn, act_h_, kDsBlock, ws_, stream);
     }
     if (k < d.n_layers) {
         const DsparkLayer& L = w.layer[(size_t) k];
         const Cache& c = cache_[(size_t) k];
-        bk::rms_norm_rows(x_, L.attn_norm, kDsBlock, kE, d.rms_eps, xn_, stream);
-        bk::native_quantize_q8_1(xn_, act_, kE, kDsBlock, stream);
-        bk::native_q8_0_mmvq(L.wq, act_, q_, kE, kQ, kDsBlock, stream);
-        bk::native_q8_0_mmvq(L.wk, act_, kb_, kE, kKV, kDsBlock, stream);
-        bk::native_q8_0_mmvq(L.wv, act_, vb_, kE, kKV, kDsBlock, stream);
+        const float* sc = L.fp4_scale;
+        wg::norm_pack(x_, L.attn_norm, d.rms_eps, kE, kDsBlock, act_a_, nullptr, stream);
+        wg::Call qkv;
+        qkv.fmt = wg::Format::Nvfp4;
+        qkv.K = kE;
+        qkv.n = 3;
+        qkv.m[0] = mat(L.wq, kQ, sc + 0, q_, kQ);
+        qkv.m[1] = mat(L.wk, kKV, sc + 1, kb_, kKV);
+        qkv.m[2] = mat(L.wv, kKV, sc + 2, vb_, kKV);
+        wg::gemm(qkv, act_a_, kDsBlock, ws_, stream);
         bk::attn_qk_prepare(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, rope_of(d), pos3b_, kDsBlock, kHeads, kKvHeads, qr_, c.k, c.v,
                             0, stream, kHeadDim, false, c.cap, meta_d_ + 1);
         return;
@@ -450,12 +532,12 @@ void DsparkHook::stage(int k, int n, void* stream) {
     bk::bf16_gemv_fp32_mmvf_multi(hd, kE, w.w_h, ctx_h_, kDsRnn, kE, kDsRnn, n, stream);
     bk::bf16_gemv_fp32_mmvf_multi(frc_, kE, w.w_f, ctx_f_, kDsRnn, kE, kDsRnn, 1, stream);
     for (int i = 0; i < n; ++i) {
-        dspark_markov_step(ctx_h_ + (size_t) i * kDsRnn, ctx_f_, w.rnn_b, w.w_sp, w.w1, prev_, state_ + (i & 1) * kDsRank,
+        dspark_markov_step(ctx_h_ + (size_t) i * kDsRnn, ctx_f_, w.rnn_b, w.w_sp, w1_row_, state_ + (i & 1) * kDsRank,
                            state_ + ((i + 1) & 1) * kDsRank, latent_, stream);
         void* lq = static_cast<char*>(lat_q_) + (size_t) i * bk::native_q8_1_bytes(kDsRank, 1);
         bk::native_quantize_q8_1(latent_, lq, kDsRank, 1, stream);
         if (dump_ && dumped_ < kDumpBlocks) dspark_head_exact(head, hq_, lq, i, dump_logits_ + (size_t) i * w.n_vocab, stream);
-        dspark_head_pick(head, hq_, lq, approx_, i, head_scr_, prev_, ids_d_, conf_d_, stream);
+        dspark_head_pick(head, hq_, lq, approx_, i, head_scr_, prev_, ids_d_, conf_d_, w.w1, w1_row_, stream);
     }
     cudaMemcpyAsync(ids_h_, ids_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
     cudaMemcpyAsync(conf_h_, conf_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
@@ -506,8 +588,11 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
                 const Cache& c = cache_[(size_t) k - 1];
                 // a sliding-window layer sees its window before the block, the full one every position, and both the block
                 const int64_t window = c.ring ? (int64_t) d.window + 1 : pos + kDsBlock;
+                // the splits from the cells the block reads, not from the scratch's capacity (this call is not captured): a
+                // short context runs few splits; the drafts only shape the speed
+                const int64_t cells = pos + kDsBlock - std::max<int64_t>(0, pos - window + 1) + 64;
                 bk::gqa_window_attn(qr_, c.k, c.v, kHeads, kKvHeads, kHeadDim, pos, kDsBlock, pos + kDsBlock, window, c.cap, att_scr_,
-                                    att_cells_, attn_, stream, true);
+                                    std::min(att_cells_, cells), attn_, stream, true);
             }
             if (!graphs_ || !stage_graph(k, n, stream)) {
                 graphs_ = false;
