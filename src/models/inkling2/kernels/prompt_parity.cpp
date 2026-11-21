@@ -219,6 +219,12 @@ void test_attention_prompt() {
             char name[96];
             std::snprintf(name, sizeof name, "attention_prompt %s %s vs CPU", window ? "window" : "full", fp8 ? "e4m3" : "fp16");
             report(name, gsub, ref, 4e-3);
+            {   // the output's hash: a change meant to keep the bits keeps it
+                uint64_t h = 1469598103934665603ull;
+                const uint8_t* b = reinterpret_cast<const uint8_t*>(got.data());
+                for (size_t i = 0; i < got.size() * 4; ++i) h = (h ^ b[i]) * 1099511628211ull;
+                std::printf("  output hash %016llx\n", (unsigned long long) h);
+            }
             // the decode kernel on the same rows, over one cache that holds every position
             {
                 const int64_t cap = window ? kExtent + R + 8 : full_cap;
