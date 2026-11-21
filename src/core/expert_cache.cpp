@@ -225,6 +225,15 @@ int64_t ExpertCache::slots_after_shrink(int64_t keep_bytes) const {
     return slots_within(kept);
 }
 
+int64_t ExpertCache::segment_floor(int64_t bytes) const {
+    const int64_t mapped = mapped_bytes();
+    if (bytes >= mapped) return mapped;
+    if (bytes <= 0 || segs_.empty()) return 0;
+    // the last segment starting at or below `bytes`
+    const auto it = std::upper_bound(seg_off_.begin(), seg_off_.begin() + mapped_segs_, bytes);
+    return it == seg_off_.begin() ? 0 : *(it - 1);
+}
+
 bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     if (segs_.empty()) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";

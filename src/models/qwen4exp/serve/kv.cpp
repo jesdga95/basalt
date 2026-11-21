@@ -27,7 +27,7 @@ int64_t QfnRuntime::kv_ceiling() {
         const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
         spare += gran * basalt::program::kv_cache_spare_granules(
                             xcache.mapped_bytes(), gran, cache_floor_slots(),
-                            [&](int64_t keep) { return xcache.slots_after_shrink(keep); });
+                            [&](int64_t keep) { return xcache.slots_after_shrink(xcache.segment_floor(keep)); });
     }
     std::vector<basalt::core::SessionState*> sess = {&ss};
     for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size(); ++b)
@@ -263,13 +263,13 @@ bool QfnRuntime::peer_due_apply(std::string& e) {
     return true;
 }
 
-// The bytes the expert cache keeps when its tail pays for `add` above `room` (whole segments: everything from the
-// first one at or past it goes); -1 when that takes it below its floor, or it cannot shrink.
+// The bytes the expert cache keeps when its tail pays for `add` above `room`: down to the segment boundary below,
+// so a keep inside a large segment frees all of it (rounded up, it would free a segment less and the allocation
+// after it fail); -1 when that takes it below its floor, or it cannot shrink.
 int64_t QfnRuntime::cache_yield_keep(int64_t add, int64_t room) {
     if (add <= room) return xcache.mapped_bytes();
     if (!xcache.segmented()) return -1;
-    const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
-    const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
+    const int64_t keep = xcache.segment_floor(xcache.mapped_bytes() - (add - room));
     return xcache.slots_after_shrink(keep) < cache_floor_slots() ? -1 : keep;
 }
 
@@ -338,14 +338,9 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
     };
     if (!park(false)) return false;
     if (add > room && xcache.segmented()) {
-        const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
-        auto keep_for = [&](int64_t a) {
-            return std::max<int64_t>(0, (xcache.mapped_bytes() - (a - room)) / gran * gran);
-        };
         const int64_t floor = cache_floor_slots();
         auto leaves_floor = [&](int64_t c) {
-            const int64_t a = (int64_t) basalt::core::session_kv_grow_bytes(s, c);
-            return a <= room || xcache.slots_after_shrink(keep_for(a)) >= floor;
+            return cache_yield_keep((int64_t) basalt::core::session_kv_grow_bytes(s, c), room) >= 0;
         };
         if (!leaves_floor(cells) && !park(true)) return false;
         if (!leaves_floor(cells)) {

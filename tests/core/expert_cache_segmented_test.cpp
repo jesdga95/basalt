@@ -68,6 +68,10 @@ int main() {
         uint8_t* const first = c.device_slot(0);
         if (!fill(c, 0, kSlots, kBlob)) return fail("fill");
         const size_t before = free_vram();
+        // segment_floor: the boundary at or below, so a shrink to it keeps no more than asked
+        if (c.segment_floor(30ll << 20) != 24ll << 20 || c.segment_floor(32ll << 20) != 32ll << 20 ||
+            c.segment_floor(0) != 0 || c.segment_floor(1ll << 40) != c.mapped_bytes())
+            return fail("segment_floor");
         // keep 30 MiB: rounded up to whole 8 MiB segments = 32 MiB = 32 slots
         if (!c.shrink(30ll << 20, err)) return fail("shrink", err);
         if (c.slots() != 32 || c.mapped_bytes() != 32ll << 20 || c.bytes() != 32ll << 20)
@@ -107,6 +111,13 @@ int main() {
         if (c.slots() != c.slots_within(c.mapped_bytes()) || !check(c, c.slots(), kBlob)) return fail("tail kept");
         if (!c.grow(c.full_bytes(), err) || c.slots() != kSlots || c.device_slot(0) != first) return fail("tail grow", err);
         if (!check(c, keep / kBlob, kBlob)) return fail("tail head after grow");
+        // a keep inside the head segment: segment_floor goes to its start, and a shrink there frees all of it (the
+        // keep itself, rounded up, would keep the whole head and free only the tail)
+        const int64_t head = c.full_bytes() - c.elastic_bytes(), inside = head - (1ll << 20);
+        if (c.segment_floor(inside) != 0 || c.slots_after_shrink(inside) != c.slots_within(head))
+            return fail("segment_floor in the head");
+        if (!c.shrink(c.segment_floor(inside), err) || c.mapped_bytes() > inside) return fail("head shrink", err);
+        if (!c.grow(c.full_bytes(), err) || c.slots() != kSlots) return fail("head grow", err);
     }
     // the default (no segment size): one allocation, shrink refused
     basalt::core::ExpertCache d;

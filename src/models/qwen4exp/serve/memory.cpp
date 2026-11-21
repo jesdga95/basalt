@@ -121,7 +121,8 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
     std::string note;
     if ((int64_t) free_b < want_free) {
         const int64_t floor_b = xcache.bytes_of(floor_slots);
-        int64_t keep = mapped - (want_free - (int64_t) free_b);
+        // to a segment boundary: inside a large segment the shrink would keep all of it
+        int64_t keep = xcache.segment_floor(mapped - (want_free - (int64_t) free_b));
         if (keep < floor_b) {
             keep = floor_b;
             note = " (the cache keeps its smallest size: the prompt path's buffers)";
