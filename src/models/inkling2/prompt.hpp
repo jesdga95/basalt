@@ -16,7 +16,7 @@ namespace basalt::models::inkling2 {
 class DsparkHook;
 
 /// The most rows one prompt chunk runs (the drafter's tap holds as many).
-constexpr int kPromptChunk = 2048;
+constexpr int kPromptChunk = 4096;
 
 class PromptRunner {
 public:
