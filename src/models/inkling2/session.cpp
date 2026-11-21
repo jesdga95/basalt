@@ -559,9 +559,14 @@ private:
         } else {
             float* yk = y_ + (size_t) rows * kProjQ;
             float* yv = yk + (size_t) rows * kProjKV;
-            bk::native_q8_0_mmvq(w.proj, xq_[0], y_, E, kProjQ, rows, stream_);
-            bk::native_q8_0_mmvq(w.proj + (size_t) kRowK * row_bytes, xq_[1], yk, E, kProjKV, rows, stream_);
-            bk::native_q8_0_mmvq(w.proj + (size_t) kRowV * row_bytes, xq_[2], yv, E, kProjKV, rows, stream_);
+            // the three products in one launch, each row range with its own input (the same bits as three calls)
+            bk::Q80Segments sg;
+            sg.n = 3;
+            sg.row0[0] = 0, sg.row0[1] = kRowK, sg.row0[2] = kRowV;
+            sg.n_out[0] = kProjQ, sg.n_out[1] = sg.n_out[2] = kProjKV;
+            sg.x[0] = xq_[0], sg.x[1] = xq_[1], sg.x[2] = xq_[2];
+            sg.y[0] = y_, sg.y[1] = yk, sg.y[2] = yv;
+            bk::native_q8_0_mmvq_segments(w.proj, sg, E, rows, stream_);
             ap.yq = y_;
             ap.yk = yk;
             ap.yv = yv;
