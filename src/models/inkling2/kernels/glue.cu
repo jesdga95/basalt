@@ -172,6 +172,16 @@ using prep::conv_in;
 constexpr int kKvAheadCells = 256;
 __device__ __forceinline__ void kv_read_ahead(const MixNorm& a) {
     const int p0 = a.kv_pos[0];
+    if (a.ring_k && threadIdx.x < 3 * 3) {   // ring entry j = 1..3 positions back of the key, value and output rings
+        const int j = threadIdx.x % 3 + 1, which = threadIdx.x / 3;
+        const int pj = p0 - j;
+        if (pj >= 0) {
+            const int w = which == 2 ? kWidth : kKvHeads * kHeadDim;
+            const float* ring = which == 0 ? a.ring_k : which == 1 ? a.ring_v : a.ring_a;
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(ring + (size_t) (pj % kConvRing) * w), "r"((unsigned) (w * 4))
+                         : "memory");
+        }
+    }
     const int lo = a.kv_window > 0 ? max(0, p0 - a.kv_window + 1) : 0;
     const int n = p0 - lo;
     if (n <= 0 || n > kKvAheadCells) return;
