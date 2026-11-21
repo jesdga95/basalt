@@ -4010,6 +4010,78 @@
       "draft_len_struct": 7.0,
       "draft_len_prose": 2.0,
       "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+    },
+    {
+      "submitter": "pro4000-rig",
+      "date": "2026-11-21",
+      "commit": "a365240249",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.3
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen Threadripper 7970X s, 32 cores",
+      "ram_gbps": 136.8,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 4334.2,
+      "prefill_64k_tps": 4344.2,
+      "decode_tps": 226.3,
+      "decode_conv_tps": 163.2,
+      "decode_struct_tps": 270.8,
+      "decode_prose_tps": 141.1,
+      "accept_conv_pct": 76.4,
+      "accept_struct_pct": 98.6,
+      "accept_prose_pct": 68.3,
+      "draft_len_conv": 2.4,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.9,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+      "notes": "official HF pack (Qwen3.8-FN-NVFP4-DQ6_K), single RTX PRO 4000 Blackwell, Threadripper 7970X, weights on NVMe"
+    },
+    {
+      "submitter": "pro4000-rig",
+      "date": "2026-11-21",
+      "commit": "a365240249",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.1
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen Threadripper 7970X s, 32 cores",
+      "ram_gbps": 137.1,
+      "os": "Linux",
+      "quant": "NVFP4-DQ8",
+      "kv": "int8",
+      "prefill_16k_tps": 4259.5,
+      "prefill_64k_tps": 4317.1,
+      "decode_tps": 215.0,
+      "decode_conv_tps": 154.1,
+      "decode_struct_tps": 260.7,
+      "decode_prose_tps": 129.4,
+      "accept_conv_pct": 75.9,
+      "accept_struct_pct": 98.7,
+      "accept_prose_pct": 68.9,
+      "draft_len_conv": 2.6,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+      "notes": "official HF pack (Qwen3.8-FN-NVFP4-DQ8), single RTX PRO 4000 Blackwell, Threadripper 7970X, weights on NVMe"
     }
   ]
 }
