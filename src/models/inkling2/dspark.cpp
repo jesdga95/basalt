@@ -587,8 +587,11 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
                 const Cache& c = cache_[(size_t) k - 1];
                 // a sliding-window layer sees its window before the block, the full one every position, and both the block
                 const int64_t window = c.ring ? (int64_t) d.window + 1 : pos + kDsBlock;
+                // the splits from the cells the block reads, not from the scratch's capacity (this call is not captured): a
+                // short context runs few splits; the drafts only shape the speed
+                const int64_t cells = pos + kDsBlock - std::max<int64_t>(0, pos - window + 1) + 64;
                 bk::gqa_window_attn(qr_, c.k, c.v, kHeads, kKvHeads, kHeadDim, pos, kDsBlock, pos + kDsBlock, window, c.cap, att_scr_,
-                                    att_cells_, attn_, stream, true);
+                                    std::min(att_cells_, cells), attn_, stream, true);
             }
             if (!graphs_ || !stage_graph(k, n, stream)) {
                 graphs_ = false;
