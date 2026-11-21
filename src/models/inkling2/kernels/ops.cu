@@ -315,9 +315,9 @@ __global__ void moe_plan_kernel(const int32_t* __restrict__ ids, int n, int n_ex
         }
     }
     __syncthreads();
-    if (tally)   // one block, and the plans of a stream run one after another: a plain add
+    if (tally)   // a reduction (its result unused), so no thread waits on the load a plain add would make
         for (int e = threadIdx.x; e < n_expert; e += blockDim.x)
-            if (count[e]) tally[e] += (uint32_t) count[e];
+            if (count[e]) atomicAdd(&tally[e], (uint32_t) count[e]);
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const int e = ids[i];
         if (!blobs[e]) continue;
