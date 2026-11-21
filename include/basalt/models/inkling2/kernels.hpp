@@ -123,9 +123,10 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 /// The grouped expert kernel's plan from the router's choices: group g is an expert on the card (its blob at blobs[e], a
 /// device address; 0 when it is not on the card) and its entries are the (row, slot) pairs that chose it, in row order;
 /// an entry writes row r * k + slot of the output. A pair whose expert is not on the card is left out (the caller
-/// supplies its row). ptr [k rows], start [k rows + 2], n_groups [1], dst and tok [k rows]. rows * k <= 1024.
+/// supplies its row). ptr [k rows], start [k rows + 2], n_groups [1], dst and tok [k rows]. rows * k <= 1024. With
+/// `tally` [n_expert], each expert on the card adds its pairs to its entry (the console's expert map).
 void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* blobs, unsigned long long* ptr,
-              int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream);
+              int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream, uint32_t* tally = nullptr);
 /// y[r] = sum_slot w[r][slot] * out[r * k + slot] in slot order (fp32).
 void moe_combine(const float* out, const float* w, int rows, int k, float* y, void* stream);
 

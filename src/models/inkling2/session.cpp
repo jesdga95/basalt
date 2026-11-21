@@ -20,8 +20,10 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/program/expert_spill.hpp"
 #include "models/inkling2/caches.hpp"
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
+#include "models/inkling2/expert_map.hpp"
 #include "models/inkling2/model.hpp"
 #include "models/inkling2/prompt.hpp"
 #include "models/inkling2/walk.hpp"
@@ -105,6 +107,7 @@ public:
         ex_tok_ = (int32_t*) alloc((size_t) pairs * 4, ok);
         ex_scr_ = alloc(bk::native_expert_scratch_bytes(pairs, g_.n_ff_exp), ok);
         ex_rows_ = f(pairs * E);
+        ex_tally_ = (uint32_t*) alloc((size_t) expert_pairs() * 4, ok);
         logits_ = f(R * (int64_t) g_.n_vocab);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxRows, g_.n_vocab) + R * (bk::kLogprobStride + 1));
         pick_ = (int32_t*) alloc(4 * 32, ok);
@@ -125,6 +128,7 @@ public:
             cudaMemsetAsync(c.a_ring, 0, (size_t) kConvRing * E * 4, stream_);
             cudaMemsetAsync(c.m_ring, 0, (size_t) kConvRing * E * 4, stream_);
         }
+        if (ok) cudaMemsetAsync(ex_tally_, 0, (size_t) expert_pairs() * 4, stream_);
         cudaStreamSynchronize(stream_);
         if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(kMaxRows, kPromptChunk), m_.flags().diag_dump, err))   // DSPARK HOOK
             return false;
@@ -143,6 +147,7 @@ public:
             const bool want = r.row_tokens || (last && (r.next_token || r.logits));
             const int head = !want ? 0 : r.row_tokens ? n : 1;
             if (!forward(r.tokens + t0, nullptr, n, r.pos + t0, head, err)) return {model::Status::Error, "inkling2: " + err};
+            lookups_ += (int64_t) n * g_.n_used * (int64_t) g_.visits.size();
             for (int i = 0; i < n; ++i) hist_.push_back(r.tokens[t0 + i]);
             head_rows_ = head;
             if (!want) continue;
@@ -363,7 +368,30 @@ public:
         return n;
     }
 
+    // ---- the console's experts: every routed expert is on the card, so every lookup is a hit; decode's lookups are each
+    // window's rows times the experts a row takes at each of its visits, the map's are the card's running counts
+    ExpertCounts expert_counts() const override { return {lookups_, lookups_, 0, 0}; }
+    std::vector<CardExperts> experts_by_card() const override {
+        uint64_t bytes = 0;
+        for (int l = 0; l < g_.n_layers; ++l) bytes += (uint64_t) g_.n_expert * m_.layer(l).expert_stride;
+        return {{m_.device(), expert_pairs(), bytes}};
+    }
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        tally_h_.resize((size_t) expert_pairs());
+        if (cudaMemcpyAsync(tally_h_.data(), ex_tally_, tally_h_.size() * 4, cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
+            cudaStreamSynchronize(stream_) != cudaSuccess)
+            return false;
+        map_.take(tally_h_, total, homes, routed);
+        return true;
+    }
+    std::string info_words() const override {
+        const std::string n = std::to_string(expert_pairs());
+        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=0 " + program::spill_words({0, expert_pairs(), 0});
+    }
+
 private:
+    int64_t expert_pairs() const { return (int64_t) g_.n_layers * g_.n_expert; }
+
     void* alloc(size_t bytes, bool& ok) {
         void* p = nullptr;
         if (!ok || cudaMalloc(&p, std::max<size_t>(bytes, 16)) != cudaSuccess) {
@@ -518,7 +546,8 @@ private:
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
         bk::router(nrm_, w.router, w.router_bias, rows, ra, rlog_, ids_, rw_, stream_);
-        moe_plan(ids_, rows, g_.n_used, g_.n_expert, w.blob_table, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, stream_);
+        moe_plan(ids_, rows, g_.n_used, g_.n_expert, w.blob_table, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, stream_,
+                 ex_tally_ + (size_t) l * g_.n_expert);
         bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
         L.gate_softcap = g_.gate_softcap;
         L.up_softcap = g_.up_softcap;
@@ -718,6 +747,10 @@ private:
     int32_t *ex_start_ = nullptr, *ex_ng_ = nullptr, *ex_dst_ = nullptr, *ex_tok_ = nullptr;
     void* ex_scr_ = nullptr;
     float *ex_rows_ = nullptr, *logits_ = nullptr;
+    uint32_t* ex_tally_ = nullptr;           // [layer][expert] the card's running count of each expert's lookups
+    std::vector<uint32_t> tally_h_;
+    ResidentExpertMap map_;
+    int64_t lookups_ = 0;                    // decode's routed lookups so far
     int32_t *pick_ = nullptr, *io_d_ = nullptr, *tok_d_ = nullptr, *pos_d_ = nullptr, *io_h_ = nullptr;
     cudaEvent_t stage_ev_[kStage] = {};
     uint64_t stage_n_ = 0;
