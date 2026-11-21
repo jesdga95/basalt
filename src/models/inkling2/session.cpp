@@ -173,6 +173,32 @@ public:
         return {};
     }
 
+    // ---- [vision] images (vision.hpp, vision_encoder.hpp): a picture's rows stand in for its pad tokens' embeddings, taken
+    // as they are (no embedding norm); the history holds the pad token at their positions.
+    model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid& grid) override {
+        ImageEncoder& enc = m_.encoder();
+        if (!enc.staged()) return {model::Status::NotImplemented, "inkling2: started without --vision"};
+        std::string err;
+        if (!enc.encode(data, bytes, rows, n_rows, grid, err)) return {model::Status::Error, "inkling2: " + err};
+        if (n_rows <= 0 || rows.size() != (size_t) n_rows * (size_t) g_.n_embd)
+            return {model::Status::Error, "inkling2: the projector's rows are not the model's width"};
+        return {};
+    }
+    void images_done() override { m_.encoder().release(); }
+    model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
+        if (pos + n_rows > m_.context()) return {model::Status::Refused, "inkling2: the picture runs past the context"};
+        hist_.resize((size_t) pos);
+        if (prompt_ && n_rows > 16) return prompt_->read_rows(rows, n_rows, pos, g_.image_token, hist_);
+        std::string err;
+        for (int at = 0; at < n_rows; at += kMaxRows) {
+            const int n = std::min(kMaxRows, n_rows - at);
+            if (!forward(nullptr, rows + (size_t) at * g_.n_embd, n, pos + at, 0, err)) return {model::Status::Error, "inkling2: " + err};
+            for (int i = 0; i < n; ++i) hist_.push_back(g_.image_token);
+        }
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the image rows failed"};
+        return {};
+    }
+
     model::Result set_logit_bias(const float* bias) override {
         bias_on_ = bias != nullptr;
         if (!bias_on_) return {};

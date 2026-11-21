@@ -258,9 +258,9 @@ target_include_directories(inkling2_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/i
 target_link_libraries(inkling2_kernels PUBLIC ${_gpu_runtime_target})
 add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/inkling2/pretok_inkling2.cpp
   src/models/inkling2/pack.cpp src/models/inkling2/model.cpp src/models/inkling2/session.cpp src/models/inkling2/walk.cpp
-  src/models/inkling2/prompt.cpp)
+  src/models/inkling2/prompt.cpp src/models/inkling2/vision.cpp src/models/inkling2/vision_encoder.cpp)
 target_include_directories(model_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(model_inkling2 PUBLIC model tokenizer inkling2_kernels kernels core ${_gpu_runtime_target})
+target_link_libraries(model_inkling2 PUBLIC model tokenizer inkling2_kernels kernels core vision_cuda ${_gpu_runtime_target})
 if(BUILD_TESTING)
   add_executable(inkling2_kernels_parity src/models/inkling2/kernels/kernels_parity.cpp)
   target_include_directories(inkling2_kernels_parity PRIVATE ${_gpu_include_directories})
@@ -274,6 +274,15 @@ if(BUILD_TESTING)
   target_include_directories(inkling2_walk_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(inkling2_walk_test PRIVATE core)
   basalt_cpu_test(NAME inkling2_walk_test COMMAND inkling2_walk_test)
+  add_executable(inkling2_vision_test src/models/inkling2/vision_test.cpp src/models/inkling2/vision.cpp)
+  target_include_directories(inkling2_vision_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(inkling2_vision_test PRIVATE vision_core warnings)
+  basalt_cpu_test(NAME inkling2_vision_test COMMAND inkling2_vision_test ${CMAKE_CURRENT_SOURCE_DIR}/assets/basalt-lockup-light.png
+                  ${CMAKE_CURRENT_SOURCE_DIR}/docs/assets/basalt-format.png)
+  # the image encoder on the real projector: CUDA against CPU per stage, the encode time, rows for an outside reference
+  add_executable(inkling2_vision_parity src/models/inkling2/vision_parity.cpp src/models/inkling2/vision.cpp)
+  target_include_directories(inkling2_vision_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(inkling2_vision_parity PRIVATE vision_cuda)
 endif()
 endif()
 

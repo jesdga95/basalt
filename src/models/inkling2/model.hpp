@@ -5,6 +5,7 @@
 
 #include "basalt/model/adapter.hpp"
 #include "models/inkling2/pack.hpp"
+#include "models/inkling2/vision_encoder.hpp"   // [vision]
 
 #include <cstdint>
 #include <memory>
@@ -64,6 +65,8 @@ public:
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     const model::LoadRequest& flags() const { return flags_; }
     bool cache_fp8() const { return fp8_; }
+    /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests.
+    ImageEncoder& encoder() const { return vis_; }
 
 private:
     float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err,
@@ -86,6 +89,7 @@ private:
     int device_ = 0, fd_ = -1;
     bool fp8_ = false;
     int64_t ctx_ = kDefaultContext;
+    mutable ImageEncoder vis_;   // [vision]
 };
 
 /// A session over `model`; null with `err` set.
