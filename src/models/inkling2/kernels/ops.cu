@@ -274,7 +274,7 @@ __global__ void post_conv_kernel(const float* __restrict__ x, const int32_t* __r
 // expert (the rows' order).
 __global__ void moe_plan_kernel(const int32_t* __restrict__ ids, int n, int n_expert, const unsigned long long* __restrict__ blobs,
                                 unsigned long long* __restrict__ ptr, int32_t* __restrict__ start, int32_t* __restrict__ n_groups,
-                                int32_t* __restrict__ dst, int32_t* __restrict__ tok, int k) {
+                                int32_t* __restrict__ dst, int32_t* __restrict__ tok, int k, uint32_t* __restrict__ tally) {
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     extern __shared__ int32_t sm[];
@@ -315,6 +315,9 @@ __global__ void moe_plan_kernel(const int32_t* __restrict__ ids, int n, int n_ex
         }
     }
     __syncthreads();
+    if (tally)   // one block, and the plans of a stream run one after another: a plain add
+        for (int e = threadIdx.x; e < n_expert; e += blockDim.x)
+            if (count[e]) tally[e] += (uint32_t) count[e];
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const int e = ids[i];
         if (!blobs[e]) continue;
@@ -402,12 +405,12 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 }
 
 void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* blobs, unsigned long long* ptr,
-              int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream) {
+              int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream, uint32_t* tally) {
     const int n = rows * k;
     if (n <= 0) return;
     if (n > 1024) throw std::runtime_error("inkling2 moe_plan: more than 1024 pairs");
     bk::launch_pdl(moe_plan_kernel, dim3(1), dim3(256), (size_t) 2 * n_expert * sizeof(int32_t), (cudaStream_t) stream, ids, n,
-                   n_expert, blobs, ptr, start, n_groups, dst, tok, k);
+                   n_expert, blobs, ptr, start, n_groups, dst, tok, k, tally);
     check("moe_plan");
 }
 

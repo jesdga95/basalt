@@ -563,6 +563,20 @@ void test_experts() {
     for (int gi = 0; plan_ok && gi < n_g; ++gi) plan_ok = hp[(size_t) gi] != 0 && hp[(size_t) gi] != table[2];
     std::printf("%-34s %s\n", "  an expert off the card", plan_ok ? "left out" : "FAIL");
     failures += !plan_ok;
+    // the console's tally: two plans add each expert's pairs on the card to its entry, the expert off it stays at zero
+    uint32_t* tally = zeros<uint32_t>(NE);
+    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
+    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
+    cudaStreamSynchronize(st);
+    const std::vector<uint32_t> ht = host(tally, NE);
+    bool tally_ok = true;
+    for (int e = 0; e < NE; ++e) {
+        uint32_t n = 0;
+        for (int32_t i : ids) n += i == e && e != 2 ? 2u : 0u;
+        tally_ok = tally_ok && ht[(size_t) e] == n;
+    }
+    std::printf("%-34s %s\n", "  the experts' tally", tally_ok ? "counted" : "FAIL");
+    failures += !tally_ok;
 }
 
 void test_softcap() {
