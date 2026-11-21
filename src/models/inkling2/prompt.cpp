@@ -416,7 +416,7 @@ private:
         if (w.slot_map) {   // a layer with experts in RAM (spill.hpp): its pairs by slot, its RAM experts copied into the staging
             remap_ids(b_.ids, pairs, w.slot_map, stream_);
             const uint64_t kept = (uint64_t) (g_.n_expert - w.n_spill) * w.expert_stride;
-            if (!m_.stage_from_card(l, stream_))   // the elastic spill's card copies when the layer has them all
+            if (!m_.stage_from_card(l, stream_))   // the spill's card copies where it still holds them; a demoted one from RAM
                 cudaMemcpyAsync(w.experts + kept, w.spill_host, (size_t) w.n_spill * w.expert_stride, cudaMemcpyHostToDevice, stream_);
             cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, stream_);   // spill.hpp
         }
