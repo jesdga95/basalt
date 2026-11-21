@@ -502,6 +502,9 @@ void test_experts() {
     std::vector<int32_t> ids = {0, 2, 5, 1, 2, 3, 4, 0, 5, 1, 0, 3};   // [R][K]
     const std::vector<float> w = randn((size_t) R * K, 0.5f, 1.f), x = randn((size_t) R * H, 1.0f);
     uint8_t* dblobs = dev(blobs);
+    std::vector<unsigned long long> table(NE);
+    for (int e = 0; e < NE; ++e) table[(size_t) e] = (unsigned long long) (dblobs + (size_t) e * L.bytes);
+    unsigned long long* dtable = dev(table);
     int32_t *dids = dev(ids), *start = zeros<int32_t>(R * K + 2), *ng = zeros<int32_t>(4), *dst = zeros<int32_t>(R * K), *tok = zeros<int32_t>(R * K);
     unsigned long long* ptr = zeros<unsigned long long>(R * K);
     float *dw = dev(w), *dx = dev(x), *rows = zeros<float>((size_t) R * K * H), *y = zeros<float>((size_t) R * H);
@@ -509,7 +512,7 @@ void test_experts() {
     void* scr = zeros<uint8_t>(bk::native_expert_scratch_bytes(R * K, FF));
     cudaStream_t st;
     cudaStreamCreate(&st);
-    moe_plan(dids, R, K, NE, dblobs, L.bytes, ptr, start, ng, dst, tok, st);
+    moe_plan(dids, R, K, NE, dtable, ptr, start, ng, dst, tok, st);
     bk::native_quantize_q8_1(dx, xq, H, R, st);
     bk::native_expert_grouped(L, ptr, start, ng, dst, tok, NE, R * K, xq, scr, rows, st);
     moe_combine(rows, dw, R, K, y, st);
@@ -536,7 +539,7 @@ void test_experts() {
         }
     report("experts (NVFP4, softcapped SwiGLU)", got, ref, 2e-2);   // q8_1 activations
     // the plan of row 1 alone gives that row's bits
-    moe_plan(dids + K, 1, K, NE, dblobs, L.bytes, ptr, start, ng, dst, tok, st);
+    moe_plan(dids + K, 1, K, NE, dtable, ptr, start, ng, dst, tok, st);
     bk::native_quantize_q8_1(dx + H, xq, H, 1, st);
     bk::native_expert_grouped(L, ptr, start, ng, dst, tok, K, K, xq, scr, rows, st);
     float* y1 = zeros<float>(H);
@@ -544,6 +547,22 @@ void test_experts() {
     cudaStreamSynchronize(st);
     const std::vector<float> g1 = host(y1, H);
     same_bits("  a row alone", g1.data(), &got[H], (size_t) H * 4);
+    // an expert off the card: its pairs are left out of the plan, the others planned as before
+    std::vector<unsigned long long> off = table;
+    off[2] = 0;
+    unsigned long long* doff = dev(off);
+    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st);
+    cudaStreamSynchronize(st);
+    const int n_g = host(ng, 1)[0];
+    const std::vector<int32_t> hs = host(start, (size_t) R * K + 2), hd = host(dst, (size_t) R * K);
+    const std::vector<unsigned long long> hp = host(ptr, (size_t) R * K);
+    int want = 0;
+    for (int32_t e : ids) want += e != 2;
+    bool plan_ok = n_g == NE - 1 && hs[(size_t) n_g] == want;
+    for (int i = 0; plan_ok && i < want; ++i) plan_ok = ids[(size_t) hd[(size_t) i]] != 2;
+    for (int gi = 0; plan_ok && gi < n_g; ++gi) plan_ok = hp[(size_t) gi] != 0 && hp[(size_t) gi] != table[2];
+    std::printf("%-34s %s\n", "  an expert off the card", plan_ok ? "left out" : "FAIL");
+    failures += !plan_ok;
 }
 
 void test_softcap() {

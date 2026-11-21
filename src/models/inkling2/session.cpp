@@ -478,7 +478,7 @@ private:
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
         bk::router(nrm_, w.router, w.router_bias, rows, ra, rlog_, ids_, rw_, stream_);
-        moe_plan(ids_, rows, g_.n_used, g_.n_expert, w.experts, w.expert_stride, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, stream_);
+        moe_plan(ids_, rows, g_.n_used, g_.n_expert, w.blob_table, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, stream_);
         bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
         L.gate_softcap = g_.gate_softcap;
         L.up_softcap = g_.up_softcap;

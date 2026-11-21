@@ -19,7 +19,18 @@ public:
     model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
     std::unique_ptr<model::LoadedModel> make_model() const override { return std::make_unique<InklingModel>(); }
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "inkling2"}; }
-    program::grammar::ToolForm tool_form() const override { return {}; }
+    // A call is its own block: <|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}<|end_message|>.
+    // A block that opens with a name, not a content tag, starts a call.
+    program::grammar::ToolForm tool_form() const override {
+        program::grammar::ToolForm f;
+        f.call_open = "<|message_model|>";
+        f.fn_mid = "<|content_invoke_tool_json|>{\"name\":{name},\"args\":";
+        f.fn_close = "}";
+        f.call_close = "<|end_message|>";
+        f.json_args = true;
+        f.trigger_pattern = "<\\|message_model\\|>[^<]";
+        return f;
+    }
     PreTokenizer pretokenizer() const override { return {"inkling2", pretok_inkling2}; }
     int max_expert_cards() const override { return 0; }
     const char* model_name() const override { return "Inkling-2-Mini"; }
