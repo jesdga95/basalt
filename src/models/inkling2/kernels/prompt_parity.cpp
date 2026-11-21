@@ -771,6 +771,16 @@ void test_dense() {
         }
         report("controller down: bf16_rows_dot vs mmvf_multi", host(h1, (size_t) R * rank), host(h2, (size_t) R * rank), 5e-5);   // x as two tf32 terms
         report("controller up: bf16_rows_dot vs mmvf_multi", host(o1, (size_t) R * K2), host(o2, (size_t) R * K2), 1e-5);
+        {   // the 8-output tiles against the one-warp form: the same chain per output
+            float* h3 = zeros<float>((size_t) R * rank);
+            bk::bf16_rows_dot(dx, ddn, h3, R, rank, K2, S, false);
+            const std::vector<float> a = host(h1, (size_t) R * rank), b = host(h3, (size_t) R * rank);
+            same_bits("controller down: tiles vs one warp", a.data(), b.data(), a.size() * 4);
+            const double t_tiles = time_us([&] { bk::bf16_rows_dot(dx, ddn, h1, R, rank, K2, S); });
+            const double t_warp = time_us([&] { bk::bf16_rows_dot(dx, ddn, h3, R, rank, K2, S, false); });
+            std::printf("  controller down at %d rows: tiles %.1f us, one warp %.1f us\n", R, t_tiles, t_warp);
+            cudaFree(h3);
+        }
         cudaFree(ddn);
         cudaFree(dup);
         cudaFree(dx);

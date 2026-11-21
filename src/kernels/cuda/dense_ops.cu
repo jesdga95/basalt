@@ -153,6 +153,51 @@ __global__ void __launch_bounds__(32) bf16_rows_dot_kernel(const float* __restri
         }
 }
 
+// bf16_rows_dot for few outputs over a long K (a loop controller's down product: 64 outputs, K 4608), where the kernel above
+// gives too few warps: a block of RT_W warps takes 16 rows, each warp one 8-output tile, the rows' x staged once in shared
+// memory for all of them. Each output runs the kernel above's chain (the same tf32 terms and mma steps in k order), so the
+// results are the same bits.
+constexpr int RT_W = 4, RT_KC = 128;
+__global__ void __launch_bounds__(32 * RT_W) bf16_rows_dot_tiles_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+                                                                        float* __restrict__ y, int64_t T, int64_t N, int64_t K) {
+    __shared__ __align__(16) float xs[RD_T][RT_KC + 8];
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
+    const int64_t t0 = (int64_t) blockIdx.x * RD_T, n0 = ((int64_t) blockIdx.y * RT_W + wid) * 8;
+    const bool live = n0 < N;
+    const uint16_t* wr = w + min(n0 + g, N - 1) * K + 2 * c;
+    float acc[4] = {};
+    for (int64_t kc = 0; kc < K; kc += RT_KC) {
+        const int kn = (int) min((int64_t) RT_KC, K - kc);
+        __syncthreads();
+        for (int q = threadIdx.x; q < RD_T * (kn / 4); q += 32 * RT_W) {
+            const int r = q / (kn / 4), k4 = (q % (kn / 4)) * 4;
+            *reinterpret_cast<float4*>(&xs[r][k4]) = *reinterpret_cast<const float4*>(x + min(t0 + r, T - 1) * K + kc + k4);
+        }
+        __syncthreads();
+        if (!live) continue;
+#pragma unroll 4
+        for (int k = 0; k < kn; k += 8) {
+            const float2 fa = *reinterpret_cast<const float2*>(&xs[g][k + 2 * c]), fb = *reinterpret_cast<const float2*>(&xs[g + 8][k + 2 * c]);
+            const unsigned wv = *reinterpret_cast<const unsigned*>(wr + kc + k);
+            const unsigned a0 = tf32_of(fa.x), a1 = tf32_of(fb.x), a2 = tf32_of(fa.y), a3 = tf32_of(fb.y);
+            const unsigned l0 = tf32_of(fa.x - __uint_as_float(a0)), l1 = tf32_of(fb.x - __uint_as_float(a1));
+            const unsigned l2 = tf32_of(fa.y - __uint_as_float(a2)), l3 = tf32_of(fb.y - __uint_as_float(a3));
+            asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                         : "r"(l0), "r"(l1), "r"(l2), "r"(l3), "r"(wv << 16), "r"(wv & 0xFFFF0000u));
+            asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(wv << 16), "r"(wv & 0xFFFF0000u));
+        }
+    }
+    if (!live) return;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int64_t t = t0 + g + (i >> 1) * 8, n = n0 + 2 * c + (i & 1);
+        if (t < T && n < N) y[t * N + n] = acc[i];
+    }
+}
+
 // y[t][n] = sum_k x[t][k] w[n][k] in fp32: a block of 128 threads per 32 rows x 64 outputs, K in steps of 16 through shared
 // memory (both tiles k-major), each thread 4 rows x 4 outputs. Every output sums its products in k order, so a row's result
 // does not depend on the rows beside it.
@@ -618,9 +663,15 @@ void swiglu_scaled(const float* g, const float* u, const float* sg, const float*
     check("swiglu_scaled");
 }
 
-void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64_t N, int64_t K, void* stream) {
+void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64_t N, int64_t K, void* stream, bool tiles) {
     if (T <= 0) return;
     if (K % 8 != 0) { basalt::log::error("basalt", "bf16_rows_dot: K %lld", (long long) K); std::exit(1); }
+    if (tiles && N <= 64 && K >= 1024 && K % 4 == 0) {   // few outputs over a long K: a warp per 8 outputs, x staged once
+        bf16_rows_dot_tiles_kernel<<<dim3((unsigned) ((T + RD_T - 1) / RD_T), (unsigned) ((N + 8 * RT_W - 1) / (8 * RT_W))), 32 * RT_W, 0,
+                                     (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        check("bf16_rows_dot");
+        return;
+    }
     bf16_rows_dot_kernel<<<dim3((unsigned) ((T + RD_T - 1) / RD_T), (unsigned) ((N + RD_N - 1) / RD_N)), 32, 0,
                            (cudaStream_t) stream>>>(x, w, y, T, N, K);
     check("bf16_rows_dot");
