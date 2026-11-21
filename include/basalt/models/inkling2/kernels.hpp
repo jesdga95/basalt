@@ -149,6 +149,14 @@ struct MixNorm {
     float eps = 1e-6f;
     float* mix_out = nullptr;
     int64_t out_stride = 0;
+    /// set: the attention's older cells (positions lo..kv_pos[0]-1, lo = kv_pos[0] - kv_window + 1 or 0, at most 1024 of
+    /// them) are requested into L2 before the wait, so the attention after the projections reads them from L2
+    const int32_t* kv_pos = nullptr;
+    const void* kv_k = nullptr;
+    const void* kv_v = nullptr;
+    int64_t kv_cap = 0;
+    int kv_window = 0;
+    int kv_cell = 0;                   ///< bytes of a cell (every key/value head)
 };
 /// n_out: 1 to 3, or any number with mix_out (the messages of a whole pass).
 void mix_norm(const MixNorm& a, int n_out, int rows, void* stream);
