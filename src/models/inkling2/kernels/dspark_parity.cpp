@@ -184,7 +184,12 @@ void test_block_inputs() {
     int32_t* d_pos3 = zeros<int32_t>(kBlock * 3);
     int32_t* d_prev = zeros<int32_t>(1);
     float* d_state = dev(randn(kDsRank));
-    dspark_block_inputs(d_emb, anchor, d_norm, 1e-6f, d_mask, kBlock, pos0, d_x, d_pos3, d_prev, d_state, nullptr);
+    const auto fr = randn((size_t) 16 * E);
+    float* d_fr = dev(fr);
+    float* d_frc = zeros<float>(E);
+    int32_t* d_meta = dev(std::vector<int32_t>{anchor, (int32_t) pos0});
+    auto run = [&] { dspark_block_inputs(d_emb, d_meta, d_norm, 1e-6f, d_mask, kBlock, d_x, d_pos3, d_prev, d_state, d_fr, 16, d_frc, nullptr); };
+    run();
     const auto x = host(d_x, (size_t) kBlock * E);
     std::vector<float> got;
     std::vector<double> ref;
@@ -203,8 +208,9 @@ void test_block_inputs() {
     const auto state = host(d_state, kDsRank);
     ok = ok && prev[0] == anchor;
     for (float s : state) ok = ok && s == 0.f;
+    ok = ok && std::memcmp(host(d_frc, E).data(), fr.data() + (size_t) ((pos0 - 1) % 16) * E, E * 4) == 0;
     check("block inputs (masks, positions, start)", ok);
-    const double us = time_us([&] { dspark_block_inputs(d_emb, anchor, d_norm, 1e-6f, d_mask, kBlock, pos0, d_x, d_pos3, d_prev, d_state, nullptr); });
+    const double us = time_us(run);
     timing("block inputs", us, (double) kBlock * E * 4 + E * 6);
 }
 

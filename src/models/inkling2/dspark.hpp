@@ -38,6 +38,8 @@
 #include "basalt/program/options.hpp"
 #include "models/inkling2/pack.hpp"
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -137,6 +139,8 @@ private:
         bool ring = false;
     };
     void* dev(size_t bytes, bool& ok);
+    void stage(int k, int n, void* stream);
+    bool stage_graph(int k, int n, void* stream);
     const DsparkWeights* w_ = nullptr;
     std::vector<void*> allocs_, pinned_;
     std::vector<Cache> cache_;
@@ -161,6 +165,12 @@ private:
     int32_t *prev_ = nullptr, *ids_d_ = nullptr;
     float* conf_d_ = nullptr;
     int32_t* ids_h_ = nullptr;
+    // the block's stages as graphs: the layers' (by layer), the last with the head (by drafts)
+    int32_t *meta_h_ = nullptr, *meta_d_ = nullptr;   ///< {anchor, position} of the block, pinned and on the device
+    float* frc_ = nullptr;                  ///< the Markov head's context of the block (block inputs copy it)
+    cudaGraphExec_t g_stage_[kDsMaxLayers] = {};
+    cudaGraphExec_t g_head_[kDsBlock] = {};
+    bool graphs_ = true;
     float* conf_h_ = nullptr;
     // the host's record: positions [lo_, hi_) have their context in the caches; a block is in flight
     int64_t lo_ = 0, hi_ = 0;

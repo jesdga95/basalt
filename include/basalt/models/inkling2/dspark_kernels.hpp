@@ -32,10 +32,13 @@ struct DsMixArgs {
 void dspark_mix(const float* tap, int64_t tap_stride, int rows, const DsMixArgs& a, float* out, int64_t out_stride,
                 const int32_t* pos, float* fr, int fr_cap, int32_t* pos3, void* stream);
 
-/// A block's input rows: row 0 = rms(embedding row `anchor`) * embed_norm (BF16 rows, device-readable), rows 1..block-1 =
-/// `mask`; pos3[t] = {pos0 + t} x 3. The Markov head starts from them: *prev = anchor, state[0..kDsRank) = 0.
-void dspark_block_inputs(const uint16_t* embedding, int32_t anchor, const float* embed_norm, float eps, const float* mask,
-                         int block, int64_t pos0, float* x, int32_t* pos3, int32_t* prev, float* state, void* stream);
+/// A block's input rows, its anchor and position read from the device (meta = {anchor, pos0}, so a captured block takes any):
+/// row 0 = rms(embedding row anchor) * embed_norm (BF16 rows, device-readable), rows 1..block-1 = `mask`; pos3[t] =
+/// {pos0 + t} x 3. The Markov head starts from them: *prev = anchor, state[0..kDsRank) = 0, fr_out = its context of position
+/// pos0 - 1, ring row (pos0 - 1) % fr_cap of fr.
+void dspark_block_inputs(const uint16_t* embedding, const int32_t* meta, const float* embed_norm, float eps, const float* mask,
+                         int block, float* x, int32_t* pos3, int32_t* prev, float* state, const float* fr, int fr_cap, float* fr_out,
+                         void* stream);
 
 /// One step of the Markov head's recurrence. raw = ctx_h + ctx_f + bias + w_sp [state_in ; w1 row *prev] (w_sp BF16
 /// [kDsRnn][2 kDsRank], w1 BF16 [vocab][kDsRank]); gate = sigmoid(raw[0:r]); state_out = gate * state_in + (1 - gate) *
