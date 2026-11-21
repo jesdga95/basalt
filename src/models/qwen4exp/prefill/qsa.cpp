@@ -118,26 +118,24 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
         basalt::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                         m.sel_ids + t0 * m.cap, m.cs, active);
         if (tp_call && tp_check) {
-            static float* ref_sc = nullptr;
-            static int32_t* ref_ids = nullptr;
-            static size_t n_sc = 0, n_ids = 0;
-            const size_t want_sc = (size_t) m.sel_batch * (size_t) m.max_blocks;
-            const size_t want_ids = (size_t) m.sel_batch * (size_t) m.cap;
-            if (want_sc > n_sc || want_ids > n_ids) {
-                cudaStreamSynchronize(m.cs);
-                cudaFree(ref_sc);
-                cudaFree(ref_ids);
-                ref_sc = nullptr;
-                ref_ids = nullptr;
-                n_sc = n_ids = 0;
-                if (cudaMalloc((void**) &ref_sc, want_sc * sizeof(float)) != cudaSuccess ||
-                    cudaMalloc((void**) &ref_ids, want_ids * sizeof(int32_t)) != cudaSuccess) {
+            // this stage's own buffers, on its own card (a layer split runs one Prefill per card), freed with m.owned
+            if (m.tp_ref_sc == nullptr) {
+                float* sc = nullptr;
+                int32_t* ids = nullptr;
+                const bool ok =
+                    cudaMalloc((void**) &sc, (size_t) m.sel_batch * (size_t) m.max_blocks * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc((void**) &ids, (size_t) m.sel_batch * (size_t) m.cap * sizeof(int32_t)) == cudaSuccess;
+                if (sc) m.owned.push_back(sc);
+                if (ids) m.owned.push_back(ids);
+                if (!ok) {
                     err = "qsa_two_pass_check: no room for its buffers";
                     return false;
                 }
-                n_sc = want_sc;
-                n_ids = want_ids;
+                m.tp_ref_sc = sc;
+                m.tp_ref_ids = ids;
             }
+            float* const ref_sc = m.tp_ref_sc;
+            int32_t* const ref_ids = m.tp_ref_ids;
             if (!basalt::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                       m.max_blocks, s, ref_sc, m.cs, active)) {
                 err = "qsa_two_pass_check: the tensor-core scorer did not run";
