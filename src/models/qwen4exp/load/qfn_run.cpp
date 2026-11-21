@@ -83,8 +83,17 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
     // the prompt-time layer split over the expert tier cards (PromptStage), and the most stages it may use, the main
     // card's included: every card on two cards or on three or more alike ones, none on three or more unlike cards
-    // until measured on such a set.  With --batch a read splits only while no slot decodes.
+    // until measured on such a set.  With --batch a read splits only while no slot decodes.  A stage runs whole layers,
+    // whose kernels (kv_stream.cu, gdn.cu and the dense prefill's) are built for the main card's architecture: a peer
+    // of another one takes a chunk's expert rows through the mmq kernels, never a stage's layers.
     bool split_want = o.serve && o.peer_device >= 1;
+    for (size_t i = 1; split_want && i < chosen_cards.size(); ++i) {
+        if (chosen_cards[i].cc_major != chosen_cards[0].cc_major || chosen_cards[i].cc_minor != chosen_cards[0].cc_minor) {
+            basalt::log::info("basalt generate", "prompt split: off (%s is not the main card's architecture): the tier "
+                              "cards keep their chunks' expert rows", chosen_cards[i].name.c_str());
+            split_want = false;
+        }
+    }
     bool split_alike = true;
     for (size_t i = 1; i < chosen_cards.size(); ++i)
         split_alike = split_alike && basalt::program::cards_alike(chosen_cards[0], chosen_cards[i]);
