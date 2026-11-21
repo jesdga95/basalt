@@ -601,6 +601,11 @@ bool QfnRuntime::kv_pool_park(size_t held, int64_t kept) {
         e.clear();
         return skip("no VRAM for the image");
     }
+    // the RAM tier's copies of this conversation a turn back hold nothing the pooled one does not (as the RAM path
+    // drops them before it parks)
+    if (const size_t dropped = conversations->drop_superseded(live, live_imgs, checks, cvec_cached))
+        basalt::log::info("basalt serve", "conversation cache: dropped %zu superseded cop%s of the pooled "
+                          "conversation; parked=%zu", dropped, dropped == 1 ? "y" : "ies", conversations->size());
     auto deepest = checks.end();
     for (auto it = checks.begin(); it != checks.end(); ++it)
         if (deepest == checks.end() || it->ids.size() > deepest->ids.size()) deepest = it;
@@ -689,6 +694,22 @@ bool QfnRuntime::kv_pool_swap_in(const std::vector<int32_t>& ids, bool cvec) {
                               imgs_below(req_imgs, (int64_t) c.ids.size()) == c.imgs);
                  }), checks.end());
     for (ConvCheckpoint& c : image.checkpoints) checks.push_back(std::move(c));
+    // matched by a checkpoint: mounted here, as the RAM tier's restore does, so the request goes on from it and the
+    // tail past it (a reply the prompt does not repeat) is not parked to RAM on the way
+    if (!m.live) {
+        auto c = std::find_if(checks.begin(), checks.end(),
+                              [&](const ConvCheckpoint& k) {
+                                  return (int64_t) k.ids.size() == m.tokens &&
+                                         basalt::core::conversation_ids_equal(k.ids.data(), k.ids.size(), ids.data());
+                              });
+        if (c == checks.end() || !checkpoint_restore(*c, ss, g)) {
+            err = "kv pool: mounting the checkpoint of a restored conversation failed";
+            return false;
+        }
+        c->used = ++check_clock;
+        live = c->ids;
+        live_imgs = c->imgs;
+    }
     cvec_cached = image.cvec;
     live_ok = true;
     conversations->limit_reuse(0);   // the retained buffers hold another conversation's K/V
