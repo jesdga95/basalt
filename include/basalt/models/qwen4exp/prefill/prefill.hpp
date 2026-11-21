@@ -134,8 +134,8 @@ public:
     /// crossing through host memory.
     bool set_peer(core::PeerExperts* peer, bool streamed_share, std::string& err);
     /// The bytes `set_peer` takes on the peer card for chunks of up to `chunk` tokens (0: no peer share); the peer tier
-    /// leaves them free when it sizes itself.
-    static uint64_t peer_bytes(int64_t chunk, bool streamed_share);
+    /// leaves them free when it sizes itself.  `peer_dev` is that card: an older one takes no FP4 share.
+    static uint64_t peer_bytes(int64_t chunk, bool streamed_share, int peer_dev);
     /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path copies them from its memory
     /// through host staging into the ring.  Independent of set_peer.
     void set_ring_peer(core::PeerExperts* peer);
