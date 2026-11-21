@@ -1,0 +1,135 @@
+// include/basalt/model/batch_driver.hpp - decode_batch for any model (docs/design/batching.md). A model's session derives
+// BatchSession and writes the hooks below: its rows' inputs to the card, the forward of a window of segments, each session's
+// logits back and its draws. The driver does the rest: the checks, the segments, each session's head rows, the graph of each
+// composition (direct on its first window, captured on its second, the most recently used kept), the order of the streams
+// and one sync for the whole batch.
+#pragma once
+
+#include "basalt/core/graph.hpp"
+#include "basalt/model/adapter.hpp"
+#include "basalt/model/batch_window.hpp"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace basalt::model {
+
+class BatchSession;
+
+/// A batch window in flight: its segments, its sessions (the leader, whose scratch and stream it runs on, first), their
+/// requests and each one's head rows (the last `head[i]` rows of segment i take the head: every row for row_tokens, the
+/// last for next_token or logits, none otherwise).
+struct BatchView {
+    const BatchWindow& w;
+    BatchSession* const* ss;
+    const DecodeRequest* reqs;
+    const int* head;
+    int n;
+    cudaStream_t stream;
+};
+
+/// What every session of one model shares for its batch windows: the graphs by composition. A model keeps one beside its
+/// shared forward scratch; sessions that return the same one batch together.
+struct BatchShared {
+    static constexpr size_t kGraphs = 64;
+    GraphLru<core::CapturedGraph> graphs{kGraphs};
+    std::set<GraphLru<core::CapturedGraph>::Key> direct;   ///< the compositions whose first window has run
+};
+
+class BatchSession : public ModelSession {
+public:
+    Result decode_batch(ModelSession* const* peers, const DecodeRequest* reqs, int n) final {
+        if (n == 1) return peers[0]->decode_window(reqs[0]);
+        const std::string who = batch_name();
+        std::vector<BatchSession*> ss;
+        for (int i = 0; i < n; ++i) {
+            BatchSession* s = dynamic_cast<BatchSession*>(peers[i]);
+            if (s == nullptr || &s->batch_shared() != &batch_shared() || std::find(ss.begin(), ss.end(), s) != ss.end())
+                return {Status::Error, who + ": a batch of sessions that are not distinct sessions of this model"};
+            ss.push_back(s);
+        }
+        if (ss[0] != this) return {Status::Error, who + ": a batch runs on its first session"};
+        BatchWindow w;
+        std::string err;
+        if (!w.build(reqs, n, batch_rows(), batch_context(), err)) return {Status::Error, who + ": " + err};
+        const cudaStream_t st = batch_stream();
+        for (int i = 0; i < n; ++i) {
+            if (!ss[(size_t) i]->batch_reserve(reqs[i], err)) return {Status::Refused, who + ": " + err};
+            // the shared scratch and the caches are this stream's now: whatever another session queued has run
+            if (ss[(size_t) i] != this && cudaStreamSynchronize(ss[(size_t) i]->batch_stream()) != cudaSuccess)
+                return {Status::Error, who + ": a session's stream failed"};
+        }
+        std::vector<int> head((size_t) n, 0);
+        for (int i = 0; i < n; ++i) {
+            const DecodeRequest& r = reqs[i];
+            head[(size_t) i] = r.row_tokens ? r.n_tokens : (r.next_token || r.logits) ? 1 : 0;
+        }
+        const BatchView v{w, ss.data(), reqs, head.data(), n, st};
+        GraphLru<core::CapturedGraph>::Key key;
+        if (!batch_stage(v, key, err)) return {Status::Error, who + ": " + err};
+        for (int i = 0; i < n; ++i)
+            key.insert(key.end(), {(uint64_t) (uintptr_t) ss[(size_t) i], (uint64_t) w.segs[(size_t) i].rows, (uint64_t) head[(size_t) i]});
+        BatchShared& sh = batch_shared();
+        if (core::CapturedGraph* g = sh.graphs.find(key)) {
+            if (!g->launch(st, err)) return {Status::Error, who + ": " + err};
+        } else if (sh.direct.insert(key).second) {
+            batch_forward(v);
+        } else {
+            core::CapturedGraph g;
+            if (!g.begin(st, err)) return {Status::Error, who + ": " + err};
+            batch_forward(v);
+            if (!g.end(st, err) || !sh.graphs.insert(std::move(key), std::move(g)).launch(st, err)) return {Status::Error, who + ": " + err};
+        }
+        if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) return {Status::Error, who + ": CUDA: " + cudaGetErrorString(e)};
+        // each session its rows back, then its draws, all queued; one sync, then the picks
+        std::vector<const int32_t*> picks((size_t) n, nullptr);
+        for (int i = 0; i < n; ++i) {
+            ss[(size_t) i]->batch_take(v, i);
+            if (head[(size_t) i] > 0 && (picks[(size_t) i] = ss[(size_t) i]->batch_draw(v, i, err)) == nullptr)
+                return {Status::Error, who + ": " + err};
+        }
+        if (cudaStreamSynchronize(st) != cudaSuccess) return {Status::Error, who + ": the batch window failed"};
+        for (int i = 0; i < n; ++i) {
+            const DecodeRequest& r = reqs[i];
+            const int h = head[(size_t) i];
+            if (h == 0) continue;
+            if (r.row_tokens) std::copy(picks[(size_t) i], picks[(size_t) i] + h, r.row_tokens);
+            if (r.next_token) *r.next_token = picks[(size_t) i][h - 1];
+        }
+        return {};
+    }
+
+protected:
+    // ---- the hooks a model writes (docs/design/batching.md, "Adding batching to a model")
+
+    /// The error messages' prefix: the model's name.
+    virtual const char* batch_name() const = 0;
+    /// The positions a session holds.
+    virtual int64_t batch_context() const = 0;
+    /// The model's shared batch state (the same object for every session of one model).
+    virtual BatchShared& batch_shared() = 0;
+    /// The stream this session's work runs on; a batch runs on its leader's.
+    virtual cudaStream_t batch_stream() const = 0;
+    /// Room for the request's positions in this session's caches (false: the batch is refused, nothing ran).
+    virtual bool batch_reserve(const DecodeRequest& r, std::string& err) = 0;
+    /// On the leader: every row's token and position to the card, outside the graph (v.w.tokens, v.w.positions). `key`
+    /// takes whatever else the forward's launches depend on (a launch bound); the driver adds the composition.
+    virtual bool batch_stage(const BatchView& v, GraphLru<core::CapturedGraph>::Key& key, std::string& err) = 0;
+    /// On the leader, launches only (it may be captured): every row through the layers on the shared scratch, each
+    /// segment's stateful kernels reading and writing v.ss[i]'s state, then the head over at least each segment's head
+    /// rows, and whatever per-segment state the window leaves (a drafter's context).
+    virtual void batch_forward(const BatchView& v) = 0;
+    /// On session i, queued on v.stream: segment i's head rows into its own logits (what row_logprobs, copy_logits and
+    /// resample_row read next), its r.logits, and its host bookkeeping (history).
+    virtual void batch_take(const BatchView& v, int i) = 0;
+    /// On session i, queued on v.stream: its draws of its head rows with its own sampler; the host array of the picks it
+    /// returns is read after the batch's sync (null with `err`: the draw failed).
+    virtual const int32_t* batch_draw(const BatchView& v, int i, std::string& err) = 0;
+};
+
+}  // namespace basalt::model
