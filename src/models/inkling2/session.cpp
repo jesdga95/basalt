@@ -305,6 +305,7 @@ public:
 
     // DSPARK HOOK: the drafter's windows (the anchor and up to seven drafts) and blocks
     int max_window() const override { return dspark_.on() ? std::clamp(m_.flags().spec, 1, kMaxRows) : 1; }
+    bool copy_drafts() const override { return max_window() > 1; }   // prompt lookup: any window's rows verify alike
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override { return dspark_.draft_begin(anchor, pos, n, stream_); }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
         return dspark_.draft_end(ids, conf, max_n, n, need, stream_);
