@@ -2,7 +2,10 @@
 // memory, then the context sized from what the weights leave.
 #include "models/inkling2/model.hpp"
 
+#include "basalt/core/elastic_kv.hpp"
+#include "basalt/core/expert_cache.hpp"
 #include "basalt/core/loader.hpp"
+#include "basalt/core/vmm.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/platform/file.hpp"
@@ -12,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstring>
 
 namespace basalt::models::inkling2 {
 namespace {
@@ -68,6 +72,15 @@ InklingModel::InklingModel() = default;
 
 InklingModel::~InklingModel() {
     for (void* p : dev_) cudaFree(p);
+    for (void* p : copy_)
+        if (p) cudaFree(p);
+    for (const Range& r : ranges_) {
+        if (r.handle) core::vmm::unmap(r.va, r.own, r.handle);
+        core::vmm::unmap_only(r.va + r.own, r.bytes - r.own);
+        core::vmm::release_range(r.va, r.bytes);
+    }
+    for (unsigned long long h : staging_) core::vmm::release(h);
+    if (spill_host_) cudaFreeHost(spill_host_);
     if (embd_host_) cudaFreeHost(embd_host_);
     if (fd_ >= 0) platform::close_fd(fd_);
 }
@@ -261,46 +274,12 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 w.ctrl_gf[s] = gf;
             }
         }
-        // the experts: the layer's blobs in one run, each at a stride of whole blocks
+        // the experts' layout; they load once the context has said how many stay on the card
         const ExpertLayer& el = pack_.experts[(size_t) l];
         w.gu_type = el.gu_type;
         w.d_type = el.d_type;
         w.blob_bytes = el.blob_bytes;
         w.expert_stride = expert_stride(el.gu_type, el.blob_bytes);
-        const uint64_t eb = (uint64_t) g.n_expert * w.expert_stride;
-        // the prompt path reads the last expert's down rows (n_ff 1152 columns) on to a multiple of 256 values: zeros there
-        const uint64_t past = std::max(prefill::mmq::read_past_bytes(el.gu_type, g.n_embd),
-                                       prefill::mmq::read_past_bytes(el.d_type, g.n_ff_exp));
-        if (!(w.experts = device_buf(eb + past)))
-            return fail("out of device memory loading layer " + std::to_string(l) + "'s experts");
-        if (past) cudaMemset(w.experts + eb, 0, past);
-        if (w.expert_stride == el.blob_bytes) {
-            core::LoadItem it;
-            it.file = file;
-            it.off = pack_.experts_range.offset + el.offset;
-            it.bytes = eb;
-            it.dev = w.experts;
-            it.device = device_;
-            reads.add(it);
-        } else {
-            cudaMemset(w.experts, 0, eb);
-            for (int e = 0; e < g.n_expert; ++e) {
-                core::LoadItem it;
-                it.file = file;
-                it.off = pack_.experts_range.offset + el.offset + (uint64_t) e * el.blob_bytes;
-                it.bytes = el.blob_bytes;
-                it.dev = w.experts + (uint64_t) e * w.expert_stride;
-                it.device = device_;
-                reads.add(it);
-            }
-        }
-        experts += eb;
-        // the experts' addresses, for the plan
-        std::vector<unsigned long long> table((size_t) g.n_expert);
-        for (int e = 0; e < g.n_expert; ++e) table[(size_t) e] = (unsigned long long) (w.experts + (uint64_t) e * w.expert_stride);
-        if (!(w.blob_table = reinterpret_cast<unsigned long long*>(device_buf(table.size() * 8))) ||
-            cudaMemcpy(w.blob_table, table.data(), table.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess)
-            return fail("out of device memory loading layer " + std::to_string(l) + "'s expert table");
     }
     fp8_ = req.kv == "fp8";
     // DSPARK HOOK: the drafter's weights (none with --spec 1), before the context is sized from what the weights leave
@@ -318,16 +297,62 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
 
     // the context: what the weights leave, less the card's spare
     {
-        size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
         const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
         if (want < 1024 || (g.context_length > 0 && want > g.context_length))
             return fail("--max-context " + std::to_string(want) + " is outside 1,024 .. " + std::to_string(g.context_length));
         const uint64_t spare = kCardSpare + vision_room;   // [vision]
-        const uint64_t avail = free_b > spare ? (free_b - spare) / (uint64_t) std::max(req.sessions, 1) : 0;
+        const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
             return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c, std::max(kDecodeRows, kPromptChunk)) : 0);
         };
+        // the experts: all on the card when they fit beside the asked context; else the least routed go to RAM, just enough
+        // (spill.hpp). --expert-cache N keeps at most N on the card (a diagnostic).
+        {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            std::vector<uint64_t> stride;
+            for (const LayerWeights& w : layers_) stride.push_back(w.expert_stride);
+            uint64_t full = 0;
+            for (uint64_t st : stride) full += st * (uint64_t) g.n_expert;
+            const uint64_t want_b = full + bytes_at(want) * n_sess + spare;
+            // when some must go: a margin for the tables and maps allocated after the plan and the driver's own rounding
+            const uint64_t short_b = want_b > free_b ? want_b - free_b + 128 * kMiB : 0;
+            const int64_t keep = req.expert_cache > 0 ? req.expert_cache : -1;
+            if (short_b > 0 || keep >= 0) {
+                if (!core::vmm::supported()) return fail("the experts do not fit beside the context and this card has no virtual memory management");
+                std::vector<std::pair<int32_t, int32_t>> rank;
+                if (!req.expert_profile.empty()) {
+                    uint64_t pb = 0;
+                    int64_t slots = 0;
+                    if (!platform::file_size(req.expert_profile, pb) ||
+                        !core::read_expert_profile(core::FileRange{req.expert_profile, 0, pb}, g.n_layers, g.n_expert, rank, slots, err))
+                        return fail("expert profile " + req.expert_profile + ": " + err);
+                }
+                if (!plan_spill(g.n_layers, g.n_expert, stride, core::vmm::granularity(), rank, short_b, keep, spill_, err))
+                    return fail(err + " (--max-context " + std::to_string(want) + ")");
+                // the RAM experts, the most routed first (the profile's order; without one, layer by layer)
+                for (const auto& [l, e] : rank)
+                    if (!spill_.slot[(size_t) l].empty() && spill_.slot[(size_t) l][(size_t) e] >= g.n_expert - spill_.n_spill[(size_t) l])
+                        spill_order_.emplace_back(l, e);
+                if (rank.empty())
+                    for (int l = 0; l < g.n_layers; ++l)
+                        for (int e = 0; e < g.n_expert; ++e)
+                            if (!on_card(l, e)) spill_order_.emplace_back(l, e);
+                elastic_ = keep < 0 && want > core::kElasticKvBase;
+                uint64_t ram = 0;
+                for (int l = 0; l < g.n_layers; ++l) ram += (uint64_t) spill_.n_spill[(size_t) l] * stride[(size_t) l];
+                basalt::log::info("basalt inkling2",
+                                  "experts: %lld of %lld in RAM (%.2f GiB, the least routed%s), %.2f GiB on the card with %.0f MiB of "
+                                  "prompt staging, so --max-context %lld fits",
+                                  (long long) spill_.spilled, (long long) g.n_layers * g.n_expert, (double) ram / (double) kGiB,
+                                  rank.empty() ? ", no profile" : " by the profile", (double) spill_.device / (double) kGiB,
+                                  (double) spill_.staging / (double) kMiB, (long long) want);
+            }
+            if (model::Result r = load_experts(reads, file, experts); !r.ok()) return r;
+        }
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const uint64_t avail = free_b > spare ? (free_b - spare) / n_sess : 0;
         const uint64_t need = bytes_at(want);
         if (need > avail) {
             const uint64_t per = bytes_at(2) - bytes_at(1);
@@ -351,12 +376,207 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     return r;
 }
 
+model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64_t& experts) {
+    const Geometry& g = pack_.geo;
+    auto fail = [&](const std::string& e) { return model::Result{model::Status::Error, "inkling2: " + e}; };
+    auto device_buf = [&](uint64_t bytes) -> uint8_t* {
+        void* p = nullptr;
+        if (cudaMalloc(&p, bytes) != cudaSuccess) return nullptr;
+        dev_.push_back(p);
+        return static_cast<uint8_t*>(p);
+    };
+    const uint64_t gran = spill_.any() ? core::vmm::granularity() : 0;
+    if (spill_.any()) {
+        copy_.assign((size_t) g.n_layers * g.n_expert, nullptr);
+        layer_copies_.assign((size_t) g.n_layers, 0);
+        host_addr_.assign((size_t) g.n_layers * g.n_expert, 0);
+    }
+    // the RAM copies, every spilled layer's in slot order, and the staging their ranges share
+    std::vector<uint64_t> host_at((size_t) g.n_layers, 0);
+    if (spill_.any()) {
+        uint64_t host = 0;
+        for (int l = 0; l < g.n_layers; ++l) {
+            host_at[(size_t) l] = host;
+            host += (uint64_t) spill_.n_spill[(size_t) l] * layers_[(size_t) l].expert_stride;
+        }
+        if (cudaHostAlloc((void**) &spill_host_, host, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess)
+            return fail("cannot pin " + std::to_string(host >> 20) + " MiB of RAM for the experts that leave the card");
+        std::memset(spill_host_, 0, host);
+        for (uint64_t at = 0; at < spill_.staging; at += gran) {
+            const unsigned long long h = core::vmm::create(gran);
+            if (!h) return fail("out of device memory for the experts' prompt staging");
+            staging_.push_back(h);
+        }
+    }
+    for (int l = 0; l < g.n_layers; ++l) {
+        LayerWeights& w = layers_[(size_t) l];
+        const ExpertLayer& el = pack_.experts[(size_t) l];
+        const uint64_t eb = (uint64_t) g.n_expert * w.expert_stride;
+        std::vector<unsigned long long> table((size_t) g.n_expert);
+        const std::vector<int32_t>& slot = spill_.slot.empty() ? std::vector<int32_t>() : spill_.slot[(size_t) l];
+        if (slot.empty()) {
+            // the prompt path reads the last expert's down rows (n_ff 1152 columns) on to a multiple of 256 values: zeros there
+            const uint64_t past = std::max(prefill::mmq::read_past_bytes(el.gu_type, g.n_embd),
+                                           prefill::mmq::read_past_bytes(el.d_type, g.n_ff_exp));
+            if (!(w.experts = device_buf(eb + past)))
+                return fail("out of device memory loading layer " + std::to_string(l) + "'s experts");
+            if (past) cudaMemset(w.experts + eb, 0, past);
+            if (w.expert_stride == el.blob_bytes) {
+                core::LoadItem it;
+                it.file = file;
+                it.off = pack_.experts_range.offset + el.offset;
+                it.bytes = eb;
+                it.dev = w.experts;
+                it.device = device_;
+                reads.add(it);
+            } else {
+                cudaMemset(w.experts, 0, eb);
+                for (int e = 0; e < g.n_expert; ++e) {
+                    core::LoadItem it;
+                    it.file = file;
+                    it.off = pack_.experts_range.offset + el.offset + (uint64_t) e * el.blob_bytes;
+                    it.bytes = el.blob_bytes;
+                    it.dev = w.experts + (uint64_t) e * w.expert_stride;
+                    it.device = device_;
+                    reads.add(it);
+                }
+            }
+            experts += eb;
+            // the experts' addresses, for the plan
+            for (int e = 0; e < g.n_expert; ++e) table[(size_t) e] = (unsigned long long) (w.experts + (uint64_t) e * w.expert_stride);
+        } else {
+            // the kept experts in their own backing, the RAM ones' slots over the shared staging; their blobs in pinned RAM
+            const int keep = g.n_expert - spill_.n_spill[(size_t) l];
+            Range r;
+            r.bytes = (eb + kSlotGuard + gran - 1) / gran * gran;
+            r.own = ((uint64_t) keep * w.expert_stride + gran - 1) / gran * gran;
+            if (!(r.va = core::vmm::reserve(r.bytes))) return fail("cannot reserve the address range of layer " + std::to_string(l) + "'s experts");
+            if (r.own && !(r.handle = core::vmm::map(r.va, r.own))) {
+                core::vmm::release_range(r.va, r.bytes);
+                return fail("out of device memory loading layer " + std::to_string(l) + "'s experts");
+            }
+            for (uint64_t at = r.own; at < r.bytes; at += gran) {
+                if (core::vmm::map_handle(r.va + at, gran, staging_[(size_t) ((at - r.own) / gran)])) continue;
+                core::vmm::unmap_only(r.va + r.own, at - r.own);
+                if (r.handle) core::vmm::unmap(r.va, r.own, r.handle);
+                core::vmm::release_range(r.va, r.bytes);
+                return fail("cannot map the prompt staging under layer " + std::to_string(l) + "'s experts");
+            }
+            ranges_.push_back(r);
+            w.experts = r.va;
+            w.n_spill = spill_.n_spill[(size_t) l];
+            uint8_t* host = spill_host_ + host_at[(size_t) l];
+            w.spill_host = host;
+            unsigned long long host_dev = 0;
+            if (cudaHostGetDevicePointer((void**) &host_dev, host, 0) != cudaSuccess) return fail("cannot map the experts' RAM copies");
+            if (w.expert_stride != el.blob_bytes && r.own) cudaMemset(w.experts, 0, r.own);
+            for (int e = 0; e < g.n_expert; ++e) {
+                const int s = slot[(size_t) e];
+                core::LoadItem it;
+                it.file = file;
+                it.off = pack_.experts_range.offset + el.offset + (uint64_t) e * el.blob_bytes;
+                it.bytes = el.blob_bytes;
+                if (s < keep) {
+                    it.dev = w.experts + (uint64_t) s * w.expert_stride;
+                    it.device = device_;
+                    table[(size_t) e] = (unsigned long long) it.dev;
+                } else {
+                    it.host = host + (uint64_t) (s - keep) * w.expert_stride;
+                    table[(size_t) e] = host_dev + (uint64_t) (s - keep) * w.expert_stride;
+                    host_addr_[(size_t) l * g.n_expert + e] = table[(size_t) e];
+                }
+                reads.add(it);
+            }
+            experts += (uint64_t) keep * w.expert_stride;
+            int32_t* map = reinterpret_cast<int32_t*>(device_buf((uint64_t) g.n_expert * 4));
+            if (!map || cudaMemcpy(map, slot.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+                return fail("out of device memory loading layer " + std::to_string(l) + "'s expert slots");
+            w.slot_map = map;
+        }
+        if (!(w.blob_table = reinterpret_cast<unsigned long long*>(device_buf(table.size() * 8))) ||
+            cudaMemcpy(w.blob_table, table.data(), table.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess)
+            return fail("out of device memory loading layer " + std::to_string(l) + "'s expert table");
+    }
+    return {};
+}
+
+
 model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
     if (dspark_)   // DSPARK HOOK: the drafter's head folds, once the reads have landed
         if (model::Result r = dspark_->finish(head_, embd_dev_, embed_norm_, nullptr); !r.ok()) return r;
     for (auto& s : sessions)
         if (model::Result r = s->prepare(); !r.ok()) return r;
+    if (elastic_) {   // the caches back only their base yet: the RAM experts come back while the card has room
+        const uint64_t moved = promote(kCardSpare);
+        basalt::log::info("basalt inkling2", "elastic spill: %lld of %lld RAM experts copied back to the card (%.2f GiB); they go back "
+                          "to RAM, the least routed first, as a conversation's caches grow",
+                          (long long) n_copy_, (long long) spill_.spilled, (double) moved / (double) kGiB);
+    }
     return {};
+}
+
+uint64_t InklingModel::promote(uint64_t keep_free) {
+    const int ne = geo().n_expert;
+    uint64_t moved = 0;
+    for (const auto& [l, e] : spill_order_) {
+        const size_t i = (size_t) l * ne + e;
+        if (copy_[i]) continue;
+        const LayerWeights& w = layers_[(size_t) l];
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        if (free_b < keep_free + w.expert_stride) break;
+        void* p = nullptr;
+        if (cudaMalloc(&p, w.expert_stride) != cudaSuccess) {
+            cudaGetLastError();
+            break;
+        }
+        const int keep = ne - w.n_spill;
+        const uint8_t* src = w.spill_host + (uint64_t) (spill_.slot[(size_t) l][(size_t) e] - keep) * w.expert_stride;
+        const unsigned long long at = (unsigned long long) p;
+        if (cudaMemcpy(p, src, w.expert_stride, cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(w.blob_table + e, &at, 8, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaFree(p);
+            break;
+        }
+        copy_[i] = p;
+        ++n_copy_;
+        ++layer_copies_[(size_t) l];
+        moved += w.expert_stride;
+    }
+    return moved;
+}
+
+bool InklingModel::stage_from_card(int l, void* stream) const {
+    const LayerWeights& w = layers_[(size_t) l];
+    if (copy_.empty() || w.n_spill == 0 || layer_copies_[(size_t) l] < w.n_spill) return false;
+    const int ne = geo().n_expert;
+    for (int e = 0; e < ne; ++e)
+        if (const void* c = copy_[(size_t) l * ne + e])
+            cudaMemcpyAsync(w.experts + (uint64_t) spill_.slot[(size_t) l][(size_t) e] * w.expert_stride, c, w.expert_stride,
+                            cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
+    return true;
+}
+
+uint64_t InklingModel::demote(uint64_t bytes, void* stream) {
+    const int ne = geo().n_expert;
+    std::vector<size_t> out;
+    uint64_t freed = 0;
+    for (auto it = spill_order_.rbegin(); it != spill_order_.rend() && freed < bytes; ++it) {
+        const size_t i = (size_t) it->first * ne + it->second;
+        if (!copy_[i]) continue;
+        cudaMemcpyAsync(layers_[(size_t) it->first].blob_table + it->second, &host_addr_[i], 8, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+        out.push_back(i);
+        freed += layers_[(size_t) it->first].expert_stride;
+    }
+    if (out.empty()) return 0;
+    cudaStreamSynchronize((cudaStream_t) stream);
+    for (size_t i : out) {
+        cudaFree(copy_[i]);
+        copy_[i] = nullptr;
+        --n_copy_;
+        --layer_copies_[i / (size_t) ne];
+    }
+    return freed;
 }
 
 }  // namespace basalt::models::inkling2
