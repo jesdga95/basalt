@@ -76,8 +76,20 @@ public:
     /// Whether expert e of layer l is on the card (every one, unless the context asked for made some spill to RAM).
     bool on_card(int l, int e) const {
         return spill_.slot.empty() || spill_.slot[(size_t) l].empty() ||
-               spill_.slot[(size_t) l][(size_t) e] < geo().n_expert - spill_.n_spill[(size_t) l];
+               spill_.slot[(size_t) l][(size_t) e] < geo().n_expert - spill_.n_spill[(size_t) l] ||
+               (!copy_.empty() && copy_[(size_t) l * geo().n_expert + e]);
     }
+    /// The elastic spill: the experts the asked context sent to RAM come back to the card as copies while its caches back
+    /// only the positions in use. On with a spill the context made (not --expert-cache) and a context above the elastic
+    /// KV's base (core/elastic_kv.hpp).
+    bool elastic() const { return elastic_; }
+    /// Copies RAM experts to the card, the most routed first, while `keep_free` bytes stay free; their blob table entries
+    /// point at the copies (decode reads them there; a prompt chunk's staging is unchanged). Bytes copied.
+    uint64_t promote(uint64_t keep_free);
+    /// Sends copies back, the least routed first, until at least `bytes` are freed: their entries point at RAM again (on
+    /// `stream`, which is waited for before the copies are freed). Bytes freed.
+    uint64_t demote(uint64_t bytes, void* stream);
+    int64_t promoted() const { return n_copy_; }
     const SpillPlan& spill() const { return spill_; }
 
 private:
@@ -115,6 +127,12 @@ private:
     std::vector<Range> ranges_;
     std::vector<unsigned long long> staging_;   ///< granule-sized pieces (the driver maps whole allocations only)
     uint8_t* spill_host_ = nullptr;
+    // the elastic spill: the RAM experts the most routed first, each one's card copy (null: none) and mapped RAM address
+    bool elastic_ = false;
+    std::vector<std::pair<int32_t, int32_t>> spill_order_;
+    std::vector<void*> copy_;
+    std::vector<unsigned long long> host_addr_;
+    int64_t n_copy_ = 0;
 };
 
 /// A session over `model`; null with `err` set.
