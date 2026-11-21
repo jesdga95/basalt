@@ -13,6 +13,12 @@
 
 using namespace basalt::kernels::cpu;
 
+static uint64_t output_hash(uint64_t hash, const float& value) {
+    const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
+    for (size_t i = 0; i < sizeof(value); ++i) hash = (hash ^ bytes[i]) * 1099511628211ull;
+    return hash;
+}
+
 int main() {
     std::mt19937 rng(29);
     std::normal_distribution<float> normal(0.f, 0.5f);
@@ -44,7 +50,8 @@ int main() {
             std::vector<float> gw(width), uw(width);
             const void* act[8];
             float* output[8];
-            double max_abs = 0, max_rel = 0;
+            double max_abs = 0, max_rel = 0, max_scaled = 0, previous_abs = 0, previous_rel = 0;
+            uint64_t actual_hash = 14695981039346656037ull, previous_hash = actual_hash;
             for (int t = 0; t < 8; ++t) {
                 for (float& v : input[t]) v = normal(rng);
                 native_quant_act(f, input[t].data(), quant[t].data());
@@ -61,6 +68,11 @@ int main() {
                     old_g = f.gate_softcap * std::tanh(old_g / f.gate_softcap);
                     old_u = f.up_softcap * std::tanh(old_u / f.up_softcap);
                     const float previous = (old_g / (1.f + std::exp(-old_g))) * old_u;
+                    const double previous_delta = std::abs((double) previous - single[t][r]);
+                    previous_abs = std::max(previous_abs, previous_delta);
+                    previous_rel = std::max(previous_rel, previous_delta / std::max(1e-8, std::abs((double) previous)));
+                    actual_hash = output_hash(actual_hash, single[t][r]);
+                    previous_hash = output_hash(previous_hash, previous);
                     if (std::memcmp(&previous, &single[t][r], sizeof(float))) ++failures;
                     weights->to_float(blob.data() + (size_t) r * f.gu_row, gw.data(), width);
                     weights->to_float(blob.data() + f.up_off + (size_t) r * f.up_row, uw.data(), width);
@@ -75,10 +87,11 @@ int main() {
                     const double ref = g / (1. + std::exp(-g)) * u;
                     const double delta = std::abs(ref - single[t][r]);
                     max_abs = std::max(max_abs, delta);
-                    max_rel = std::max(max_rel, delta / std::max(1., std::abs(ref)));
+                    max_rel = std::max(max_rel, delta / std::max(1e-8, std::abs(ref)));
+                    max_scaled = std::max(max_scaled, delta / std::max(1., std::abs(ref)));
                 }
             }
-            for (int n : {2, 3, 4, 8}) {
+            for (int n = 1; n <= 8; ++n) {
                 std::vector<std::vector<float>> grouped(n, std::vector<float>(hidden));
                 for (int t = 0; t < n; ++t) output[t] = grouped[t].data();
                 native_gu_rows(f, blob.data(), act, n, output, 0, hidden);
@@ -118,9 +131,12 @@ int main() {
                             if (std::memcmp(result[e * 8 + t].data(), serial[(e + t) % 8].data(), width * sizeof(float))) ++failures;
                 }
             }
-            std::printf("softcap type=%d width=%d: max_abs=%g max_rel=%g\n", type, width, max_abs, max_rel);
+            std::printf("softcap type=%d width=%d: double max_abs=%g max_rel=%g max_scaled=%g; previous max_abs=%g max_rel=%g\n",
+                        type, width, max_abs, max_rel, max_scaled, previous_abs, previous_rel);
+            std::printf("  output hashes: actual=%016llx previous=%016llx\n",
+                        (unsigned long long) actual_hash, (unsigned long long) previous_hash);
             // The reference accumulates in double; the vector dot accumulates 2,304 values in float.
-            if (max_abs > 3e-4 || max_rel > 5e-5) ++failures;
+            if (max_abs > 3e-4 || max_scaled > 5e-5 || actual_hash != previous_hash) ++failures;
             for (int t = 0; t < 8; ++t) output[t] = single[t].data();
             const auto start = std::chrono::steady_clock::now();
             for (int i = 0; i < 8; ++i) native_gu_rows(f, blob.data(), act, 4, output, 0, hidden);

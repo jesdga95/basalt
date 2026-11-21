@@ -1026,7 +1026,7 @@ void test_cpu_merge() {
             for (size_t i = 0; i < f.size; ++i) f.data[i] = f.original[i] + f.replay * 0.125f;
         }
     };
-    for (int rows : {1, 4, 8}) for (int mode : {0, 1, 2}) {
+    for (int rows = 1; rows <= 8; ++rows) for (int mode : {0, 1, 2}) {
         const int pairs = rows * 8;
         std::vector<int32_t> ids(pairs);
         for (int p = 0; p < pairs; ++p) ids[p] = (p % 8 * 7 + p / 8) % 128;
@@ -1053,6 +1053,7 @@ void test_cpu_merge() {
         cudaStreamEndCapture(stream, &graph);
         cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
         bool ok = true;
+        double max_abs = 0, max_rel = 0;
         for (int replay = 1; replay <= 2; ++replay) {
             fill.replay = replay;
             cudaGraphLaunch(exec, stream);
@@ -1065,12 +1066,16 @@ void test_cpu_merge() {
                 for (int c = 0; c < E; ++c) {
                     const size_t i = (size_t) p * E + c;
                     const float ref = blobs[ids[p]] ? -17.f : original[i] + replay * 0.125f;
-                    if (y[i] != ref) ok = false;
+                    if (std::memcmp(&y[i], &ref, sizeof(float))) ok = false;
+                    const double delta = std::abs((double) y[i] - ref);
+                    max_abs = std::max(max_abs, delta);
+                    max_rel = std::max(max_rel, delta / std::max(1e-8, std::abs((double) ref)));
                 }
             }
             if (counts != expected) ok = false;
         }
-        std::printf("CPU merge mapped graph rows=%d mask=%d: %s\n", rows, mode, ok ? "bitwise" : "FAIL");
+        std::printf("CPU merge mapped graph rows=%d mask=%d: %s max_abs=%g max_rel=%g\n",
+                    rows, mode, ok ? "bitwise" : "FAIL", max_abs, max_rel);
         if (!ok) ++failures;
         if (mode == 1) {
             const double us = time_us([&] { moe_cpu_merge(di, rows, 8, db, mapped, dy, dt, nullptr); });
