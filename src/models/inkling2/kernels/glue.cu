@@ -252,16 +252,22 @@ __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
     float qv[kPer], nw[kPer];   // the weights, read while the kernel before finishes
     if (a.queries) load_row(a.queries + (size_t) q * kWidth, qv);
     if (!a.mix_out) load_row(a.norm[q], nw);
-    bk::pdl_wait();
-    bk::pdl_launch_dependents();
-    __shared__ float red[kMaxMix * 2 * (kWarpsB + 1)];
+    // and every state but the last: only the last one may be the kernel before's
     float v[kMaxMix][kPer];
 #pragma unroll
     for (int i = 0; i < kMaxMix; ++i) {
-        if (i >= n) break;
+        if (i >= n - 1) break;
 #pragma unroll
         for (int j = 0; j < kPer; ++j) v[i][j] = a.st.s[i][(size_t) r * kWidth + threadIdx.x + j * kThreads];
     }
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    __shared__ float red[kMaxMix * 2 * (kWarpsB + 1)];
+#pragma unroll
+    for (int i = 0; i < kMaxMix; ++i)
+        if (i == n - 1)
+#pragma unroll
+            for (int j = 0; j < kPer; ++j) v[i][j] = a.st.s[i][(size_t) r * kWidth + threadIdx.x + j * kThreads];
     float mixed[kPer];
     if (a.queries == nullptr) {   // the last state as it is (one output)
 #pragma unroll
@@ -442,8 +448,11 @@ __global__ void __launch_bounds__(256) ctrl_up_kernel(CtrlArgs a, int rows) {
 // The blend of stream s and row r, then its norm into q8_1.
 __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
     const int r = blockIdx.x, s = blockIdx.y;
-    float nw[kPer];
+    float nw[kPer], de[kPer], ms[kPer];
     load_row(a.norm[s], nw);
+    // and the blend's states: written before the controllers' first kernel, which has finished before this one starts
+    load_row(a.dest[s] + (size_t) r * kWidth, de);
+    load_row(a.msg[s] + (size_t) r * kWidth, ms);
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     __shared__ float red[kWarpsB + 1];
@@ -453,7 +462,7 @@ __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
     for (int j = 0; j < kPer; ++j) {
         const int c = threadIdx.x + j * kThreads;
         const float g = tanhf(gf[c]), f = tanhf(gf[kWidth + c]);
-        y[j] = (1.f - f) * a.dest[s][(size_t) r * kWidth + c] + g * a.msg[s][(size_t) r * kWidth + c];
+        y[j] = (1.f - f) * de[j] + g * ms[j];
     }
     norm_q8(y, nw, a.eps, a.q8[s], s == 0 ? a.norm_out : nullptr, r, red);
 }
@@ -495,10 +504,10 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
         for (int k = 0; k < kConv; ++k) taps[j][k] = a.taps[(threadIdx.x + j * kThreads) * kConv + (kConv - 1 - k)];
     load_row(a.query, qv);
     if (!a.mix_out) load_row(a.norm, nw);
-    bk::pdl_wait();
-    bk::pdl_launch_dependents();
-    __shared__ float red[kMaxMix * 2 * (kWarpsB + 1)];
-    const int r = blockIdx.x;
+    // also before the wait, what no kernel since the attention's projections writes (the kernels since have passed their
+    // waits before this one starts): the finished blocks, the layer's input, the ring's entries of the positions before
+    // the window; every input is read before the first store (the ring is one of them)
+    const int r = blockIdx.x, pr = a.pos[r];
     float v[kMaxMix][kPer];
     const int nb = a.n_blocks + (a.boundary ? 1 : 0), n = nb + 1;
 #pragma unroll
@@ -508,17 +517,25 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
 #pragma unroll
         for (int j = 0; j < kPer; ++j) v[i][j] = s[(size_t) r * kWidth + threadIdx.x + j * kThreads];
     }
-    // the convolution of the output projection's rows, the residual, the ring slot of this row: every input is read
-    // before the first store (the ring is one of them)
     float xin[kPer][kConv], hres[kPer];
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
         const int c = threadIdx.x + j * kThreads;
 #pragma unroll
-        for (int k = 0; k < kConv; ++k) xin[j][k] = conv_in(a.o, kWidth, a.ring, kWidth, a.pos, r, k, c);
+        for (int k = 1; k < kConv; ++k)
+            if (r - k < 0) xin[j][k] = prep::conv_ring(a.ring, kWidth, pr - k, c);
         hres[j] = a.boundary ? 0.f : a.hid[(size_t) r * kWidth + c];
     }
-    const int slot = a.pos[r] % kConvRing;
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    __shared__ float red[kMaxMix * 2 * (kWarpsB + 1)];
+    // the convolution's rows of the output projection: this row's and the window's rows before it
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+#pragma unroll
+        for (int k = 0; k < kConv; ++k)
+            if (r - k >= 0) xin[j][k] = a.o[(size_t) (r - k) * kWidth + threadIdx.x + j * kThreads];
+    const int slot = pr % kConvRing;
     float res[kPer];
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
