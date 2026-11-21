@@ -961,6 +961,24 @@ void test_post_attn() {
     }
 }
 
+// The guessed experts' prefetch over a stand-in blob table runs and reads only.
+void test_expert_prefetch() {
+    const int NE = 128;
+    const size_t blob = 65536;
+    uint8_t* blobs = zeros<uint8_t>((size_t) NE * blob);
+    std::vector<unsigned long long> tab(NE);
+    for (int e = 0; e < NE; ++e) tab[e] = (unsigned long long) (blobs + (size_t) e * blob);
+    const std::vector<int32_t> ids = {3, 17, 64, 127, 0, 90, 41, 8};
+    unsigned long long* dtab = dev(tab);
+    int32_t* dids = dev(ids);
+    uint32_t* sink = zeros<uint32_t>(1);
+    expert_prefetch(dids, (int) ids.size(), dtab, blob, sink, nullptr);
+    const bool ok = cudaDeviceSynchronize() == cudaSuccess;
+    std::printf("%-34s %s\n", "expert_prefetch: runs", ok ? "ok" : "FAIL");
+    failures += !ok;
+    std::printf("  %.1f us a call (8 blobs of 64 KiB)\n", time_us([&] { expert_prefetch(dids, (int) ids.size(), dtab, blob, sink, nullptr); }));
+}
+
 void test_moe_finish() {
     const int R = 4, K = 8;
     std::vector<int> pos = {130, 131, 132, 133};
@@ -1009,6 +1027,7 @@ int main() {
     test_decode_prepare();
     test_attention_window();
     test_post_attn();
+    test_expert_prefetch();
     test_moe_finish();
     std::printf("inkling2_kernels_parity: %d failures\n", failures);
     return failures ? 1 : 0;
