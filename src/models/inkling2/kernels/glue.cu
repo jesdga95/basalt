@@ -209,8 +209,8 @@ __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
 constexpr int kDownWarps = 8;
 constexpr int kSlice = 2 * kWidth / kDownWarps;   // 576 inputs a warp
 static_assert(kWidth % (kSlice / 2) == 0 && kSlice % 64 == 0, "a slice is whole pairs of every lane, inside one half");
-// RMAX: the rows a launch takes at most (kDecodeRows, or 2 for the one-output blocks of a window of 1 or 2 rows, whose
-// lanes then load all of their input pairs before the first sum).
+// RMAX: the rows a launch takes at most (2, 4 or kDecodeRows). Up to 4 rows a lane loads all of its input pairs before the
+// first sum; 8 rows load them in three batches (registers).
 template<int O, int RMAX>
 __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, int rows) {
     __shared__ float part[kDownWarps][O][RMAX][2];
@@ -222,7 +222,7 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
     // kIn of a lane's input pairs of every row are loaded before their sums, so the loads overlap instead of each waiting
     // for the one before it (a window's 8 rows were 72 loads in a row); the sums are added in the same order as one at a
     // time. The lane's weights are all read before pdl_wait, while the kernel before finishes.
-    constexpr int kIn = RMAX <= 2 ? 9 : 3;
+    constexpr int kIn = RMAX <= 4 ? 9 : 3;
     constexpr int kIters = kSlice / 2 / (32 * kIn);
     static_assert((kSlice / 2) % (32 * kIn) == 0, "a lane's pairs split into whole batches");
     uint32_t wu[kIters][kIn][O];
@@ -522,7 +522,8 @@ void controllers(const CtrlArgs& a, int streams, int rows, void* stream) {
     if (streams < 1 || streams > kMaxStreams || a.rank <= 0 || a.rank % 16) throw std::runtime_error("inkling2 controllers: streams or rank");
     cudaStream_t s = (cudaStream_t) stream;
     // a window of 3+ rows reads its inputs once for 4 outputs (they are 8 rows x 18 KB), a lone row keeps rank blocks
-    if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4, kDecodeRows>, dim3((unsigned) a.rank / 4, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
+    if (rows >= 5) bk::launch_pdl(ctrl_down_kernel<4, kDecodeRows>, dim3((unsigned) a.rank / 4, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
+    else if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4, 4>, dim3((unsigned) a.rank / 4, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
     else bk::launch_pdl(ctrl_down_kernel<1, 2>, dim3((unsigned) a.rank, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
     check("controllers/down");
     bk::launch_pdl(ctrl_up_kernel, dim3((unsigned) (2 * kWidth / 32), (unsigned) streams), dim3(256), (size_t) rows * a.rank * 4, s, a, rows);
