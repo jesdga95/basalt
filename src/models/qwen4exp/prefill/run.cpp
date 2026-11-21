@@ -4,6 +4,7 @@
 #include "basalt/core/progress.hpp"
 #include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/core/diag.hpp"
 #include <algorithm>
 #include <string>
 
@@ -54,6 +55,9 @@ bool Prefill::Run::finish() {
         err = std::string("prefill: expert copy stream: ") + cudaGetErrorString(cst);
         return false;
     }
+    static const bool tp_check = basalt::core::exp_flag("qsa_two_pass_check", 0) != 0 &&
+                                 basalt::core::exp_flag("qsa_select_3x", 0) == 0;
+    if (tp_check) log_two_pass_counts(m.cs);
     owner.stats_.ms_total += ms_since(t_start);
     return true;
 }
