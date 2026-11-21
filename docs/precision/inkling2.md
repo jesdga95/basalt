@@ -4,7 +4,7 @@ Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quali
 
 ## Summary
 
-- **Against the reference:** the pack scores mean KLD 0.00295 and top-1 97.73% over 100 chunks
+- **Against the reference:** the pack scores mean KLD 0.00305 and top-1 97.76% over 100 chunks
   ([below](#against-the-reference)).
 - **The reference is not a true BF16 model.** No BF16 checkpoint exists: the release ships its routed experts in NVFP4 and
   MXFP8. The base is the official release with its experts dequantized to BF16, so its KLD is not comparable with the other
@@ -39,7 +39,7 @@ BF16 instead of Q8_0 scored 0.00218 for 1.2 GB more reads a token; it was not ta
 
 | Stage | Format | Arithmetic |
 | --- | --- | --- |
-| Routed experts | NVFP4, Q8_0 | q8_1 activations, fp32 sums; prompt chunks MMQ (int8 mma) with each matrix's FP32 scale applied after |
+| Routed experts | NVFP4, Q8_0 | decode: q8_1 activations, fp32 sums; prompt chunks: NVFP4 layers on the FP4 block-scaled tensor cores, each activation row as two FP4 terms under one per-row scale (its rounding and the rounding of what that leaves, about 8 bits), fp32 accumulation; Q8_0 layers MMQ (int8 mma); each matrix's FP32 scale applied after |
 | Q8_0 projections, head | Q8_0 | q8_1 activations (decode); MMQ (prompt); fp32 logits, softcap 30 |
 | Router | F32 | fp32 sigmoid, top 8 |
 | Attention-residual mixes, controllers, norms | F32, BF16 weights | fp32 |
@@ -47,6 +47,10 @@ BF16 instead of Q8_0 scored 0.00218 for 1.2 GB more reads a token; it was not ta
 | Short-convolution state | fp32 | fp32 |
 
 A decode row's arithmetic does not depend on how many rows share its window. Prompt chunks round differently from decoded rows.
+
+The prompt path's NVFP4 experts, measured over 20 chunks: one FP4 term per activation (the release's W4A4) 0.00407 KLD, two
+terms 0.00264; the same chunks through MMQ (q8_1 activations) 0.00252. Two terms were taken: the prompt reads about 1.5 times
+as fast as through MMQ.
 
 ## Attention caches
 
@@ -63,12 +67,13 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 
 | Run | Mean KLD | Top-1 | PPL |
 | --- | ---: | ---: | ---: |
-| 100 chunks, `--kv fp16` | 0.00295 | 97.73% | 7.0741 (base 7.0633 over the scored rows) |
-| 20 chunks (the quick gate) | 0.00252 | 98.00% | 7.6628 (base 7.6534) |
+| 100 chunks, `--kv fp16` | 0.00305 | 97.76% | 7.0695 (base 7.0633 over the scored rows) |
+| 20 chunks (the quick gate) | 0.00264 | 97.80% | 7.6642 (base 7.6534) |
 
 RTX 5090 at 400 W, the whole model on the card.
 
 ## Drafting
 
 The DSpark drafter only proposes; the target checks every draft, and a decode row rounds the same in any window. Greedy output
-with drafting equals plain greedy output (prose, struct, conversation and a 2,405-token prompt checked).
+with drafting equals plain greedy output (prose, struct and conversation, after short and 16K-token prompts, and a
+2,405-token prompt checked).

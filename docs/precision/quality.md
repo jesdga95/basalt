@@ -15,8 +15,9 @@ models use this method. Their numbers: [Qwen3.8-Flash-Next](qwen38-flash-next.md
   below are skipped, a tiny underestimate.
 - **Reported:** PPL, mean KLD (the tables also give median and p99) and top-1 agreement.
 - **Length:** 20 chunks for a quick check. A change to numerics needs 100.
-- **Coverage:** the 256-token prefill halves run the MMQ prompt path. The gate does not reach the FP4 prompt path (used from 1,024-token
-  chunks) or the split prompt across cards; those are measured separately ([Flash-Next prefill](qwen38-flash-next.md#prefill)).
+- **Coverage:** the 256-token prefill halves run each model's prompt path for that length: MMQ for Flash-Next, whose FP4 prompt path
+  (used from 1,024-token chunks) and split prompt across cards the gate does not reach; those are measured separately
+  ([Flash-Next prefill](qwen38-flash-next.md#prefill)). Inkling 2 Mini's halves run its FP4 experts.
 - **Determinism:** two runs of one build match row for row, with the tiers pinned (see [greedy identity](#greedy-identity)).
 
 ## The BF16 reference
