@@ -168,6 +168,7 @@ private:
     float *approx_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
     void *hq_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;   ///< q8_1 draft rows and latents [kDsDrafts], the screen's scratch
     int32_t *prev_ = nullptr, *ids_d_ = nullptr;
+    uint16_t* w1_row_ = nullptr;            ///< the previous draft's row of the Markov head's w1 (host memory), on the card
     float* conf_d_ = nullptr;
     int32_t* ids_h_ = nullptr;
     // the block's stages as graphs: the layers' (by layer), the last with the head (by drafts)

@@ -35,16 +35,16 @@ void dspark_mix(const float* tap, int64_t tap_stride, int rows, const DsMixArgs&
 /// A block's input rows, its anchor and position read from the device (meta = {anchor, pos0}, so a captured block takes any):
 /// row 0 = rms(embedding row anchor) * embed_norm (BF16 rows, device-readable), rows 1..block-1 = `mask`; pos3[t] =
 /// {pos0 + t} x 3. The Markov head starts from them: *prev = anchor, state[0..kDsRank) = 0, fr_out = its context of position
-/// pos0 - 1, ring row (pos0 - 1) % fr_cap of fr.
+/// pos0 - 1, ring row (pos0 - 1) % fr_cap of fr, w1_row = the anchor's row of w1 (BF16 [vocab][kDsRank], device-readable).
 void dspark_block_inputs(const uint16_t* embedding, const int32_t* meta, const float* embed_norm, float eps, const float* mask,
                          int block, float* x, int32_t* pos3, int32_t* prev, float* state, const float* fr, int fr_cap, float* fr_out,
-                         void* stream);
+                         const uint16_t* w1, uint16_t* w1_row, void* stream);
 
-/// One step of the Markov head's recurrence. raw = ctx_h + ctx_f + bias + w_sp [state_in ; w1 row *prev] (w_sp BF16
-/// [kDsRnn][2 kDsRank], w1 BF16 [vocab][kDsRank]); gate = sigmoid(raw[0:r]); state_out = gate * state_in + (1 - gate) *
+/// One step of the Markov head's recurrence. raw = ctx_h + ctx_f + bias + w_sp [state_in ; w1_row] (w_sp BF16
+/// [kDsRnn][2 kDsRank], w1_row the previous token's row of w1, BF16 [kDsRank] on the device); gate = sigmoid(raw[0:r]); state_out = gate * state_in + (1 - gate) *
 /// tanh(raw[r:2r]); latent = tanh(raw[2r:3r]) into `latent` (fp32 [kDsRank]).
-void dspark_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp, const uint16_t* w1,
-                        const int32_t* prev, const float* state_in, float* state_out, float* latent, void* stream);
+void dspark_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp, const uint16_t* w1_row,
+                        const float* state_in, float* state_out, float* latent, void* stream);
 
 /// The draft head: draft i's logits l[v] = cap tanh((head_v . h + fold_v . lat + fold_b[v]) / cap) over v < n_vocab, h = block
 /// row i + 1 (q8_1, kWidth) and lat its latent (q8_1, kDsRank). Its argmax is screened (basalt/kernels/head_proxy.cuh) by
@@ -75,9 +75,10 @@ size_t dspark_head_scratch_bytes(int64_t n_vocab);
 /// hq (approx: kDsDrafts x dspark_screen_rows floats).
 void dspark_head_base(const DsHead& h, const void* hq, int rows, float* approx, void* stream);
 /// Draft i (from 0): over hq's row i, the latent `latq` and approx (dspark_head_base's): ids[i] = *prev = the pick (the lowest
-/// row on a tie), conf[i] = its softmax probability (the rows not rescored at their approximate logits).
+/// row on a tie), conf[i] = its softmax probability (the rows not rescored at their approximate logits), w1_row = the pick's
+/// row of w1 (the rescored rows' are read while they are scored, so the next step reads the card, not w1's host memory).
 void dspark_head_pick(const DsHead& h, const void* hq, const void* latq, const float* approx, int i, void* scratch, int32_t* prev,
-                      int32_t* ids, float* conf, void* stream);
+                      int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream);
 /// The reference: every row's exact logit (the arithmetic the pick rescores with) into logits[n_vocab].
 void dspark_head_exact(const DsHead& h, const void* hq, const void* latq, int i, float* logits, void* stream);
 
