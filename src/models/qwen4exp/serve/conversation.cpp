@@ -748,7 +748,7 @@ int QfnRuntime::init_conversations() {
     if (o.kv_pool) {
         const char* why = o.batch > 1 ? "--batch" : !stages.empty() ? "a layer split" : o.prompt_cache <= 0 ?
                           "--prompt-cache 0" : kv_floor <= 0 || !xcache.segmented() ?
-                          "no elastic KV (--kv-resident or --vram-elastic)" : nullptr;
+                          "no elastic KV (any --kv-resident or --vram-elastic turns it off)" : nullptr;
         kv_pool_cap = why ? 0 : basalt::core::conversation_device_bytes(ss, g, mtp_kv, ss.max_cells);
         if (!why && kv_pool_cap == 0) why = "its size is unknown";
         if (why) {
