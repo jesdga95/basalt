@@ -206,4 +206,36 @@ bool unmap(uint8_t* va, uint64_t bytes, unsigned long long handle) {
     return a && b;
 }
 
+unsigned long long create(uint64_t bytes) {
+    const Fns& v = fns();
+    if (!v.ok) return 0;
+    const CUmemAllocationProp prop = device_prop(current_device());
+    CUmemGenericAllocationHandle h = 0;
+    return v.create(&h, (size_t) bytes, &prop, 0) == CUDA_SUCCESS ? (unsigned long long) h : 0;
+}
+
+bool map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle) {
+    const Fns& v = fns();
+    if (!v.ok || handle == 0) return false;
+    const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
+    if (v.map(p, (size_t) bytes, 0, (CUmemGenericAllocationHandle) handle, 0) != CUDA_SUCCESS) return false;
+    CUmemAccessDesc access{};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = current_device();
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (v.set_access(p, (size_t) bytes, &access, 1) == CUDA_SUCCESS) return true;
+    v.unmap(p, (size_t) bytes);
+    return false;
+}
+
+void unmap_only(uint8_t* va, uint64_t bytes) {
+    const Fns& v = fns();
+    if (v.ok && va != nullptr && bytes > 0) v.unmap(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes);
+}
+
+void release(unsigned long long handle) {
+    const Fns& v = fns();
+    if (v.ok && handle != 0) v.release((CUmemGenericAllocationHandle) handle);
+}
+
 }  // namespace basalt::core::vmm

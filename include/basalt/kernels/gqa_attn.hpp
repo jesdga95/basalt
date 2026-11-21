@@ -69,10 +69,11 @@ void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* se
                           int64_t max_cells, float* out, void* stream, const float* gate_q = nullptr,
                           uint16_t* gated16 = nullptr);
 /// gqa_decode_attn for a block drafter's rows: head width 128 or 256, row t at position pos0 + t sees positions
-/// [pos0 + t - window + 1, hi) (not causal), position p in cache cell p % cap.
+/// [pos0 + t - window + 1, hi) (not causal), position p in cache cell p % cap. `block`: every row sees the first row's
+/// window, [pos0 - window + 1, hi) (a drafter whose block shares its anchor's window).
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
                      int64_t pos0, int T, int64_t hi, int64_t window, int64_t cap, float* scratch, int64_t scratch_cells,
-                     float* out, void* stream);
+                     float* out, void* stream, bool block = false);
 /// The device whose SM count plans the int8 prompt attention's launch (its key splits, so its rounding); -1 (the default):
 /// the current one.  A card that reads some of the main card's layers plans as the main card, so its rows are the main card's.
 void gqa_prompt_plan_device(int device);

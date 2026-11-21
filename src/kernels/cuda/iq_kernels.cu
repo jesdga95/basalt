@@ -1364,19 +1364,27 @@ __host__ __device__ constexpr bool kDown40Type(int t) { return t == 20 || t == 4
 // One row against the n <= NC activations x + off[0..n) (n >= 1, warp-uniform; offsets in q8_1 blocks, 32-bit to
 // spare registers), the whole warp.  Per activation this is row_dot: the same calls k, lane-strided the same way,
 // summed in the same order, then the same warp_sum.  Only the weight side moves out of the per-activation loop.
-template<int TY, int NC, bool EXACT_N = false, bool STAGE_GRID = false>
+// KC > 0: the row is KC calls (nb * ipb == KC), known at compile time, so the loop unrolls and every weight load of the
+// lane is issued before its first dot (the same calls in the same order: the same bits).
+template<int TY, int NC, bool EXACT_N = false, bool STAGE_GRID = false, int KC = 0>
 __device__ __forceinline__ void row_dot_multi(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
                                               int nb, int lane, float (&s)[NC], const uint32_t* __restrict__ s_grid = nullptr) {
     using F = Fmt<TY>;
     using S = Split<TY>;
 #pragma unroll
     for (int c = 0; c < NC; ++c) s[c] = 0.0f;
-    for (int k = lane; k < nb * F::ipb; k += 32) {
+    const auto call = [&](int k) {
         const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
         const typename S::W w = S::template load<STAGE_GRID>(row, kbx, iqs, s_grid);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
+    };
+    if constexpr (KC > 0) {
+#pragma unroll
+        for (int k = lane; k < KC; k += 32) call(k);
+    } else {
+        for (int k = lane; k < nb * F::ipb; k += 32) call(k);
     }
 #pragma unroll
     for (int c = 0; c < NC; ++c)
@@ -1591,7 +1599,10 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 // so 6 takes such windows in one pass; 8 would take ~64-80 registers.
 constexpr int GRP_NC = 6;
 
-template<int TG, bool STAGE_GRID = kStageIqGrid<TG>>
+// KC > 0: rows of KC calls (row_dot_multi's KC), and when every group has its own block row (no group stride) the
+// dependents (the SwiGLU, then down) are let in at the start, so their launches and down's weight prefetch overlap the
+// last wave; with the stride the waiting blocks would hold their slots through several waves.
+template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, int KC = 0>
 __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
                                                               const int32_t* __restrict__ n_groups,
@@ -1599,6 +1610,9 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                               float* __restrict__ gate, float* __restrict__ up) {
     const int ng = *n_groups;
+    if constexpr (KC > 0) {
+        if (ng <= (int) gridDim.y) pdl_launch_dependents();   // one pass of groups: the dependents wait out one wave
+    }
     if (blockIdx.y >= ng) return;
     __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TG, STAGE_GRID>::value];
     const uint32_t* s_grid = stage_iq_grid<TG, STAGE_GRID>(s_grid_buf, threadIdx.x, 256);
@@ -1619,13 +1633,13 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
             if (n == 1) {
                 const int off1[1] = { ent_tok[e] * xb };
                 float s1[1];
-                row_dot_multi<TG, 1, true, STAGE_GRID>(wr, xq, off1, 1, nb, lane, s1, s_grid);
+                row_dot_multi<TG, 1, true, STAGE_GRID, KC>(wr, xq, off1, 1, nb, lane, s1, s_grid);
                 tail_scale<TG>(s1, sc);
                 if (lane == 0) dst[(size_t) e * L.n_ff + r] = s1[0];
             } else if (n == 2) {
                 const int off2[2] = { ent_tok[e] * xb, ent_tok[e + 1] * xb };
                 float s2[2];
-                row_dot_multi<TG, 2, true, STAGE_GRID>(wr, xq, off2, 2, nb, lane, s2, s_grid);
+                row_dot_multi<TG, 2, true, STAGE_GRID, KC>(wr, xq, off2, 2, nb, lane, s2, s_grid);
                 tail_scale<TG>(s2, sc);
                 if (lane < 2) dst[(size_t) (e + lane) * L.n_ff + r] = s2[lane];
             } else {
@@ -1633,7 +1647,7 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * xb;
                 float s[GRP_NC];
-                row_dot_multi<TG, GRP_NC, false, STAGE_GRID>(wr, xq, off, n, nb, lane, s, s_grid);
+                row_dot_multi<TG, GRP_NC, false, STAGE_GRID, KC>(wr, xq, off, n, nb, lane, s, s_grid);
                 tail_scale<TG>(s, sc);
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c)
@@ -2357,7 +2371,8 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
 // and t + 24 of row_dot_multi, each one's calls lane-strided by 32 and summed in the same order, then warp_sum's tree:
 // the xor-16 and xor-8 steps inside the lane, the last three across the eight.  The same bits as row_dot_multi with
 // every lane busy (a K of 72, n_ff 2304, leaves 24 of 32 lanes idle in row_dot_multi's third pass).
-template<int TY, int NC, bool EXACT_N = false>
+// KC > 0: K == KC at compile time (unrolled, as row_dot_multi's KC).
+template<int TY, int NC, bool EXACT_N = false, int KC = 0>
 __device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
                                              int K, int t, float (&s)[NC]) {
     using F = Fmt<TY>;
@@ -2367,12 +2382,18 @@ __device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_
     for (int i = 0; i < 4; ++i) {
 #pragma unroll
         for (int c = 0; c < NC; ++c) a[i][c] = 0.0f;
-        for (int k = t + 8 * i; k < K; k += 32) {
+        const auto call = [&](int k) {
             const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
             const typename S::W w = S::load(row, kbx, iqs);
 #pragma unroll
             for (int c = 0; c < NC; ++c)
                 if (EXACT_N || c < n) a[i][c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
+        };
+        if constexpr (KC > 0) {
+#pragma unroll
+            for (int k = t + 8 * i; k < KC; k += 32) call(k);
+        } else {
+            for (int k = t + 8 * i; k < K; k += 32) call(k);
         }
     }
 #pragma unroll
@@ -2410,6 +2431,7 @@ __global__ void __launch_bounds__(256) native_down_sub8_kernel(const unsigned lo
     const int r = blockIdx.x * kDownSub8Rows + (threadIdx.x >> 3), t = threadIdx.x & 7;
     if (r >= L.n_embd) return;   // whole 8-lane groups leave together: the shuffles stay within the group
     const int K = (int) (L.n_ff / Fmt<TD>::qk) * Fmt<TD>::ipb, hb = (int) (L.n_ff / 32);
+    constexpr int kSub8Kc = TD == 40 ? kDownSub8Calls : TD == 8 ? 144 : 0;   // n_ff 1152 (NVFP4, Q8_0): the unrolled row
     const size_t w_off = L.down_off + (size_t) r * L.d_row;
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
@@ -2420,13 +2442,13 @@ __global__ void __launch_bounds__(256) native_down_sub8_kernel(const unsigned lo
             if (n == 1) {
                 const int off1[1] = { e * hb };
                 float s1[1];
-                row_dot_sub8<TD, 1, true>(wr, hq, off1, 1, K, t, s1);
+                row_dot_sub8<TD, 1, true, kSub8Kc>(wr, hq, off1, 1, K, t, s1);
                 tail_scale<TD>(s1, sc);
                 if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0];
             } else if (n == 2) {
                 const int off2[2] = { e * hb, (e + 1) * hb };
                 float s2[2];
-                row_dot_sub8<TD, 2, true>(wr, hq, off2, 2, K, t, s2);
+                row_dot_sub8<TD, 2, true, kSub8Kc>(wr, hq, off2, 2, K, t, s2);
                 tail_scale<TD>(s2, sc);
                 if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = t == 0 ? s2[0] : s2[1];
             } else {
@@ -2434,7 +2456,7 @@ __global__ void __launch_bounds__(256) native_down_sub8_kernel(const unsigned lo
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c) off[c] = (e + min(c, n - 1)) * hb;
                 float s[GRP_NC];
-                row_dot_sub8<TD, GRP_NC>(wr, hq, off, n, K, t, s);
+                row_dot_sub8<TD, GRP_NC, false, kSub8Kc>(wr, hq, off, n, K, t, s);
                 tail_scale<TD>(s, sc);
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c)
@@ -3012,6 +3034,13 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
             return;
         }
     }
+    if constexpr (TG == 40 || TG == 8) {   // n_embd 2304 (NVFP4 rows of 144 calls, Q8_0 of 288): the unrolled row
+        constexpr int kc = TG == 40 ? 144 : 288;
+        if (!g_old_kernels && L.n_embd == 2304) {
+            native_gu_multi_kernel<TG, false, kc><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            return;
+        }
+    }
     const size_t sx_bytes = (size_t) kGuStageT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
     if constexpr (!kSplit<TG>) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     else if (g_old_kernels) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
@@ -3034,10 +3063,12 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
 }
 
 // The rows native_down_sub8_kernel takes: kDownSub8Calls calls of a split format that native_down_multi_kernel runs
-// through its generic path (not the n_ff 640 paths).
+// through its generic path (not the n_ff 640 paths): n_ff 2304 of 256-value blocks, or NVFP4 at n_ff 1152.
 template<int TD>
 bool down_sub8(const NativeExpertLayout& L) {
-    if constexpr (kDown40<TD> || TD == 42) return false;
+    if constexpr (TD == 40) return L.n_ff == 1152;
+    else if constexpr (TD == 8) return L.n_ff == 1152 && L.n_embd == 2304;   // Q8_0 at 1152 x 2304: 144 calls
+    else if constexpr (kDown40<TD> || TD == 42) return false;
     else return L.n_ff % Fmt<TD>::qk == 0 && (L.n_ff / Fmt<TD>::qk) * Fmt<TD>::ipb == kDownSub8Calls;
 }
 
@@ -3247,13 +3278,35 @@ __global__ void __launch_bounds__(256) swiglu_clamp_q8_1_entries_kernel(const fl
     }
 }
 
-// native_expert_grouped's body; CLAMP selects the limited SwiGLU at compile time, so the unclamped instantiation is
-// the original launch sequence.
-template<bool CLAMP>
+// The softcapped SwiGLU, then the q8_1 blocks (the same pass as swiglu_q8_1_entries_kernel): h = cg tanh(g / cg) sigmoid(g)
+// cu tanh(u / cu), in fp32.
+template<bool PDL>
+__global__ void __launch_bounds__(256) swiglu_softcap_q8_1_entries_kernel(const float* __restrict__ gate,
+                                                                          const float* __restrict__ up,
+                                                                          const int32_t* __restrict__ grp_start,
+                                                                          const int32_t* __restrict__ n_groups, int n_ff,
+                                                                          float cg, float cu, block_q8_1* __restrict__ hq) {
+    if constexpr (PDL) pdl_trigger();
+    const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
+    if constexpr (PDL) pdl_wait();
+    for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
+         i += (long long) gridDim.x * blockDim.x) {
+        const float g = gate[i], u = up[i];
+        const float h = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu));
+        q8_1_store(h, hq, i);
+    }
+}
+
+enum class Act { Plain, Clamp, Softcap };
+
+// native_expert_grouped's body; ACT selects the activation at compile time, so the plain instantiation is the original
+// launch sequence.
+template<Act ACT>
 void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                   const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                   int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                   int64_t grid_groups, [[maybe_unused]] float limit) {
+    constexpr bool CLAMP = ACT == Act::Clamp;
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.n_ff % 32 != 0) { basalt::log::error("basalt", "native_expert_grouped: n_ff %lld", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
@@ -3293,7 +3346,15 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
     const bool sw_v1 = v1;
-    if constexpr (CLAMP) {
+    if constexpr (ACT == Act::Softcap) {
+        if (chain)
+            launch_dependent(swiglu_softcap_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s,
+                             (const float*) gate, (const float*) up, grp_start, n_groups, (int) L.n_ff, L.gate_softcap,
+                             L.up_softcap, hq);
+        else
+            swiglu_softcap_q8_1_entries_kernel<false><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(
+                gate, up, grp_start, n_groups, (int) L.n_ff, L.gate_softcap, L.up_softcap, hq);
+    } else if constexpr (CLAMP) {
         if (chain)
             launch_dependent(swiglu_clamp_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s,
                              (const float*) gate, (const float*) up, grp_start, n_groups, (int) L.n_ff, limit, hq);
@@ -3330,20 +3391,23 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups) {
-    if (L.swiglu_limit > 0.0f)
-        grouped_impl<true>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
-                           out, stream, grid_groups, L.swiglu_limit);
+    if (L.gate_softcap > 0.0f)
+        grouped_impl<Act::Softcap>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1,
+                                   scratch, out, stream, grid_groups, 0.0f);
+    else if (L.swiglu_limit > 0.0f)
+        grouped_impl<Act::Clamp>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                                 out, stream, grid_groups, L.swiglu_limit);
     else
-        grouped_impl<false>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
-                            out, stream, grid_groups, 0.0f);
+        grouped_impl<Act::Plain>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                                 out, stream, grid_groups, 0.0f);
 }
 
 void native_expert_grouped_clamped(const NativeExpertLayout& L, float swiglu_limit, const unsigned long long* grp_ptr,
                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                    const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
                                    void* scratch, float* out, void* stream, int64_t grid_groups) {
-    grouped_impl<true>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
-                       out, stream, grid_groups, swiglu_limit);
+    grouped_impl<Act::Clamp>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                             out, stream, grid_groups, swiglu_limit);
 }
 
 namespace {
@@ -3379,7 +3443,7 @@ void gated_mlp_clamped(const NativeExpertLayout& L, float swiglu_limit, const vo
     auto* tok = dst + cap_tok;
     gated_mlp_plan_kernel<<<1, 128, 0, s>>>(blob, n_tok, ptr, start, ng, dst, tok);
     check("gated_mlp_clamped/plan");
-    grouped_impl<true>(L, ptr, start, ng, dst, tok, 1, n_tok, x_q8_1, scratch, out, stream, 0, swiglu_limit);
+    grouped_impl<Act::Clamp>(L, ptr, start, ng, dst, tok, 1, n_tok, x_q8_1, scratch, out, stream, 0, swiglu_limit);
 }
 
 #endif  // IQ_DEV_ONLY

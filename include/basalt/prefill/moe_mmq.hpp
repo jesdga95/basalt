@@ -20,6 +20,11 @@ bool supported(int ggml_type);
 bool fits(int ggml_type, int64_t w_rows);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
+/// Bytes MMQ reads past the end of a matrix of `cols` columns in `ggml_type`: its tile loads step along a row 256 values
+/// at a time, so the last row of a matrix whose rows are not a multiple of 256 values is read on to the next multiple
+/// (the activations there are zeros, so the products are unchanged).  A buffer MMQ reads a matrix from in place needs
+/// this many readable bytes after it, zeroed (a stray scale there could be a NaN, and NaN times zero is NaN).
+size_t read_past_bytes(int ggml_type, int64_t cols);
 /// A group buffer's slot for one expert's gate and up rows ([n_ff, n_embd] of `gate_type`, then of `up_type`):
 /// matrix_bytes of the [2 n_ff, n_embd] matrix when the types agree; otherwise rounded up to whole blocks of both
 /// types and 16 bytes, so the gate product and the up product each step from expert to expert in whole blocks.
@@ -104,8 +109,17 @@ void gather_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
 /// group's {s_gate, s_up, s_down, 0} per expert and `bounds` its n + 1 row bounds (relative to these rows); then
 /// h = silu(s_gate g) * (s_up u) * s_down, so the down product's output carries s_down (q8_1 keeps an fp32 scale
 /// per 32 values, so the scaled H rounds to the same codes up to fp32 rounding of that scale).
+/// `form`: the softcapped SwiGLU of NativeExpertLayout (gate_softcap and up_softcap > 0: h = gate_softcap tanh(g /
+/// gate_softcap) sigmoid(g) up_softcap tanh(u / up_softcap) of the tail-scaled g and u, the native kernels' expression,
+/// then the s_down factor), each row's expert for the tail (`row_expert`, in place of a search of `bounds`), and the
+/// bytes from one expert's tail to the next (`tail_stride`, 0: 16, packed), so the tails can be read in the blobs.
+struct SwigluForm {
+    float gate_softcap = 0.0f, up_softcap = 0.0f;
+    const int32_t* row_expert = nullptr;
+    size_t tail_stride = 0;
+};
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream,
-            const float* tail = nullptr, const int32_t* bounds = nullptr, int n = 0);
+            const float* tail = nullptr, const int32_t* bounds = nullptr, int n = 0, const SwigluForm& form = {});
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);

@@ -15,8 +15,9 @@ models use this method. Their numbers: [Qwen3.8-Flash-Next](qwen38-flash-next.md
   below are skipped, a tiny underestimate.
 - **Reported:** PPL, mean KLD (the tables also give median and p99) and top-1 agreement.
 - **Length:** 20 chunks for a quick check. A change to numerics needs 100.
-- **Coverage:** the 256-token prefill halves run the MMQ prompt path. The gate does not reach the FP4 prompt path (used from 1,024-token
-  chunks) or the split prompt across cards; those are measured separately ([Flash-Next prefill](qwen38-flash-next.md#prefill)).
+- **Coverage:** the 256-token prefill halves run each model's prompt path for that length: MMQ for Flash-Next, whose FP4 prompt path
+  (used from 1,024-token chunks) and split prompt across cards the gate does not reach; those are measured separately
+  ([Flash-Next prefill](qwen38-flash-next.md#prefill)). Inkling 2 Mini's halves run its FP4 experts.
 - **Determinism:** two runs of one build match row for row, with the tiers pinned (see [greedy identity](#greedy-identity)).
 
 ## The BF16 reference
@@ -29,6 +30,7 @@ Every score is against the original model in BF16:
 | DeepSeek-V4.1-Flash | a BF16 GGUF by @giveen, made with `convert_hf_to_gguf --outtype bf16` (llama.cpp 330f0189), wikitext-2, 100 chunks of 512 | 2.7394 (2.7314 from the stored rows) |
 | Qwen3.8-27B | unsloth's BF16 GGUF through `llama-perplexity` (llama.cpp 5676dfbe), wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192` | 6.7437 (6.7411 on the scored rows) |
 | Hy4-flash | Tencent's BF16 checkpoint converted to a BF16 GGUF (llama.cpp 0a054d0b0), through `llama-perplexity` with the llama.cpp port's Engram key/query norm epsilon set to vLLM's and `add_bos_token=true`, wikitext-2, 100 chunks of 512; `hy4flash-bf16-base.kld` | 18.572 (over the 25,500 scored rows) |
+| Inkling 2 Mini | the official release with its experts dequantized to BF16 (no BF16 checkpoint exists; the release ships NVFP4 and MXFP8 experts): a BF16 GGUF from `convert_hf_to_gguf --outtype bf16` (llama.cpp 29b52d398), through `llama-perplexity`, wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192`; `inkling2-bf16-base.kld`. Not comparable with the other models' true-BF16 bases | 7.0714 |
 
 The official Flash-Next packs are scored against the first base on their
 [Hugging Face card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt#quality). That gate is 100 chunks, T 3, int8 KV, resident
