@@ -403,6 +403,7 @@ private:
             remap_ids(b_.ids, pairs, w.slot_map, stream_);
             const uint64_t kept = (uint64_t) (g_.n_expert - w.n_spill) * w.expert_stride;
             cudaMemcpyAsync(w.experts + kept, w.spill_host, (size_t) w.n_spill * w.expert_stride, cudaMemcpyHostToDevice, stream_);
+            cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, stream_);   // spill.hpp
         }
         moe_sort(b_.ids, rows, k, g_.n_expert, b_.sort_scr, b_.bounds, b_.tok, b_.dst, b_.exp, stream_);
         mmq::quantize(b_.nrm, b_.tok, b_.xq, w.gu_type, E, E, pairs, stream_);

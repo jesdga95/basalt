@@ -37,7 +37,7 @@ bool plan_spill(int n_layers, int n_expert, const std::vector<uint64_t>& stride,
     std::vector<std::vector<uint8_t>> away((size_t) n_layers, std::vector<uint8_t>((size_t) n_expert, 0));
     // a spilled layer's device bytes: its kept slots, rounded up; the rest of its range is the shared staging
     const auto own = [&](int l) { return round_up((uint64_t) (n_expert - out.n_spill[(size_t) l]) * stride[(size_t) l], gran); };
-    const auto tail = [&](int l) { return round_up((uint64_t) n_expert * stride[(size_t) l], gran) - own(l); };
+    const auto tail = [&](int l) { return round_up((uint64_t) n_expert * stride[(size_t) l] + kSlotGuard, gran) - own(l); };
     const auto device = [&](uint64_t& staging) {
         uint64_t d = 0;
         staging = 0;

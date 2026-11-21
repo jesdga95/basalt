@@ -14,6 +14,12 @@
 
 namespace basalt::models::inkling2 {
 
+/// Zeroed bytes after a spilled layer's last slot: the prompt path's products read past the end of a weight matrix (a
+/// tile's last K step runs over a down matrix whose rows are not a whole number of steps) and multiply what they find by
+/// zero activations, so those bytes must hold finite values. A resident layer's are its allocation's neighbours; a
+/// spilled layer's would be the shared staging, which holds whatever layer copied there last.
+constexpr uint64_t kSlotGuard = 64 << 10;
+
 struct SpillPlan {
     /// [layer][expert] the expert's slot: the kept ones first in expert order, then the ones in RAM in expert order.
     /// Empty for a layer that keeps every expert.
