@@ -879,12 +879,20 @@ bool SessionRuntime::next_batch_window() {
         set_active(0);
         return true;
     }
-    // the windows of a round share the batch's rows: with no more slots than rows each takes its share, so one pass serves all
+    // the windows of a round share the batch's rows: with no more slots than rows one pass serves all, the rows going to
+    // the drafts likeliest kept
     const int n_act = (int) act.size();
     std::vector<SlotWin> wins(act.size());
     std::vector<int> rows(act.size());
+    std::vector<std::vector<double>> joint(act.size());
     for (int i = 0; i < n_act; ++i) {
-        slot_window_begin(act[(size_t) i], wins[(size_t) i], batch_share(i, n_act, cap));
+        const BSlot& sl = bs[(size_t) act[(size_t) i]];
+        double all = 1.0;
+        for (int k = 0; k < sl.n_dr; ++k) joint[(size_t) i].push_back(all *= bpolicy->chance_rate(sl.dprob[k]));
+    }
+    const std::vector<int> share = batch_shares(joint, cap);
+    for (int i = 0; i < n_act; ++i) {
+        slot_window_begin(act[(size_t) i], wins[(size_t) i], share[(size_t) i]);
         rows[(size_t) i] = wins[(size_t) i].T;
     }
     for (const std::vector<size_t>& group : batch_groups(rows, cap)) {
