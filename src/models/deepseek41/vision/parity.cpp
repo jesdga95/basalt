@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
     std::printf("image %dx%d -> canvas %dx%d, %d patches, %d block rows\n", img.w, img.h, pl.width, pl.height, pl.n_patches(), pl.n_tokens());
     VisionBlas blas;
     VisionEncoder enc;
-    if (!enc.init(mp, pl.n_patches(), blas, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    if (!enc.init(mp, blas, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     std::vector<float> out;
     for (int rep = 0; rep < 2; ++rep) {
         const auto t0 = std::chrono::steady_clock::now();
