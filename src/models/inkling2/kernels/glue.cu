@@ -48,76 +48,101 @@ __device__ __forceinline__ float warp_sum(float v) {
     for (int m = 16; m; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
     return v;
 }
-__device__ __forceinline__ float warp_max(float v) {
+
+// The warp's totals of the 12 values each lane holds, each summed by warp_sum's tree (lanes 16, 8, 4, 2, then 1 apart
+// added pairwise): at each step a lane adds, from its partner, only the values its side of the pair goes on with, so the
+// warp shuffles 13 times for the 12 totals. Every lane ends with the total of value 6 b4 + 3 b3 + (b2 ? 2 : b1), b the bits of
+// its lane index; every lane holding a value holds warp_sum's bits of it.
+__device__ __forceinline__ float warp_totals12(const float (&p)[12], int lane) {
+    const bool b4 = lane & 16, b3 = lane & 8, b2 = lane & 4, b1 = lane & 2;
+    float q[6], r[3];
 #pragma unroll
-    for (int m = 16; m; m >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, m));
-    return v;
+    for (int k = 0; k < 6; ++k) q[k] = (b4 ? p[6 + k] : p[k]) + __shfl_xor_sync(0xffffffffu, b4 ? p[k] : p[6 + k], 16);
+#pragma unroll
+    for (int k = 0; k < 3; ++k) r[k] = (b3 ? q[3 + k] : q[k]) + __shfl_xor_sync(0xffffffffu, b3 ? q[k] : q[3 + k], 8);
+    // lanes 4 apart: the side with b2 clear goes on with values 0 and 1 of its three, the other side with value 2
+    const float g1 = __shfl_xor_sync(0xffffffffu, b2 ? r[0] : r[2], 4), g2 = __shfl_xor_sync(0xffffffffu, r[1], 4);
+    const float t0 = (b2 ? r[2] : r[0]) + g1, t1 = r[1] + g2;
+    // lanes 2 apart: with b2 clear each side goes on with value b1 of its two
+    const float u = (b2 || !b1 ? t0 : t1) + __shfl_xor_sync(0xffffffffu, b2 || b1 ? t0 : t1, 2);
+    return u + __shfl_xor_sync(0xffffffffu, u, 1);
 }
 
-// Sums of N values per thread over the block, in a fixed order (each warp's, then the warps' in order); every thread gets
-// the N results. `red` holds N * (kWarpsB + 1) floats.
-template <int N>
-__device__ __forceinline__ void block_sums(float (&v)[N], float* red) {
+// The q8_1 blocks w, w + 24 and w + 48 of a row (warp w: lane l holds value l of each, y[k] for block w + 24 k): each
+// block's amax and sum reduced together across the warp as warp_totals12 does (the lanes with b4 set take the maxima,
+// exact in any order; the others the sums, by warp_sum's tree), 8 shuffles, then the maxima handed to every lane (3); d =
+// amax / 127, the sum stored by the lane that holds it.
+__device__ __forceinline__ void q8_store3(const float (&y)[kPer], Q81* row, int w, int lane) {
+    static_assert(kPer == 3, "a lane holds one value of each of three blocks");
+    const bool b4 = lane & 16, b3 = lane & 8, b2 = lane & 4;
+    float a[3];
 #pragma unroll
-    for (int i = 0; i < N; ++i) v[i] = warp_sum(v[i]);
-    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if (lane == 0)
-#pragma unroll
-        for (int i = 0; i < N; ++i) red[i * kWarpsB + w] = v[i];
-    __syncthreads();
-    if (threadIdx.x < N) {
-        float s = 0.f;
-#pragma unroll
-        for (int j = 0; j < kWarpsB; ++j) s += red[threadIdx.x * kWarpsB + j];
-        red[N * kWarpsB + threadIdx.x] = s;
+    for (int k = 0; k < 3; ++k) {
+        const float o = __shfl_xor_sync(0xffffffffu, b4 ? y[k] : fabsf(y[k]), 16);
+        a[k] = b4 ? fmaxf(fabsf(y[k]), o) : y[k] + o;
     }
-    __syncthreads();
+    // lanes 8 apart: the side with b3 clear goes on with blocks 0 and 1, the other side with block 2
+    const float g1 = __shfl_xor_sync(0xffffffffu, b3 ? a[0] : a[2], 8), g2 = __shfl_xor_sync(0xffffffffu, a[1], 8);
+    const float s0 = b3 ? a[2] : a[0];
+    const float t0 = b4 ? fmaxf(s0, g1) : s0 + g1, t1 = b4 ? fmaxf(a[1], g2) : a[1] + g2;
+    // lanes 4 apart: with b3 clear each side goes on with block b2 of its two
+    const float k3 = b3 || !b2 ? t0 : t1, o3 = __shfl_xor_sync(0xffffffffu, b3 || b2 ? t0 : t1, 4);
+    float u = b4 ? fmaxf(k3, o3) : k3 + o3;
+    const float o4 = __shfl_xor_sync(0xffffffffu, u, 2);
+    u = b4 ? fmaxf(u, o4) : u + o4;
+    const float o5 = __shfl_xor_sync(0xffffffffu, u, 1);
+    u = b4 ? fmaxf(u, o5) : u + o5;
+    // block k's amax at lane 16 + 4 k (k < 2) or 24, its sum at lane 4 k or 8
+    const float amax[3] = {__shfl_sync(0xffffffffu, u, 16), __shfl_sync(0xffffffffu, u, 20), __shfl_sync(0xffffffffu, u, 24)};
 #pragma unroll
-    for (int i = 0; i < N; ++i) v[i] = red[N * kWarpsB + i];
-    __syncthreads();
+    for (int k = 0; k < 3; ++k) {
+        const float d = bk::q8_1_finite(amax[k] / 127.0f);
+        Q81& b = row[w + kWarpsB * k];
+        b.qs[lane] = bk::q8_1_quant(y[k], d, amax[k]);
+        if (lane == (k < 2 ? 4 * k : 8)) b.ds = bk::q8_1_ds(d, u);
+    }
 }
 
-// Value c of a q8_1 row, from the warp that holds the block's 32 values (one a lane, c % 32 the lane): d = amax / 127.
-__device__ __forceinline__ void q8_store(float x, Q81* row, int c) {
-    const float amax = warp_max(fabsf(x));
-    const float sum = warp_sum(x);
-    const float d = bk::q8_1_finite(amax / 127.0f);
-    Q81& b = row[c / 32];
-    b.qs[c % 32] = bk::q8_1_quant(x, d, amax);
-    if ((c & 31) == 0) b.ds = bk::q8_1_ds(d, sum);
-}
-
-// The block-residual mix of the n states v[i] (thread-held values) scored by NQ queries (thread-held values qv, loaded
+// The block-residual mix of the n states v[i] (thread-held values) scored by the query qv (thread-held values, loaded
 // before the kernel's pdl_wait): scores q . s / sqrt(kWidth) over the RMS-normed states (eps 1e-6), softmax, the weighted
-// sum of the normed states.
-template <int NQ>
-__device__ __forceinline__ void mix_rows(const float (&v)[kMaxMix][kPer], int n, const float (&qv)[NQ][kPer],
-                                         float (&mixed)[NQ][kPer], float* red) {
-    float part[kMaxMix * (NQ + 1)];
+// sum of the normed states. A state's sum of squares and score are each warp's total, then the warps' added in warp order
+// by warp 0, which takes the norms and the softmax once for the block and hands them over in shared memory (`red`:
+// 2 kMaxMix (kWarpsB + 1) floats).
+__device__ __forceinline__ void mix_rows(const float (&v)[kMaxMix][kPer], int n, const float (&qv)[kPer], float (&mixed)[kPer],
+                                         float* red) {
+    static_assert(2 * kMaxMix == 12, "a state's two sums, every state's in one warp_totals12");
+    float part[2 * kMaxMix];
 #pragma unroll
-    for (int i = 0; i < kMaxMix * (NQ + 1); ++i) part[i] = 0.f;
+    for (int i = 0; i < 2 * kMaxMix; ++i) part[i] = 0.f;
 #pragma unroll
     for (int i = 0; i < kMaxMix; ++i) {
         if (i >= n) break;
 #pragma unroll
         for (int j = 0; j < kPer; ++j) {
             const float x = v[i][j];
-            part[i * (NQ + 1)] = fmaf(x, x, part[i * (NQ + 1)]);
-#pragma unroll
-            for (int q = 0; q < NQ; ++q) part[i * (NQ + 1) + 1 + q] = fmaf(qv[q][j], x, part[i * (NQ + 1) + 1 + q]);
+            part[2 * i] = fmaf(x, x, part[2 * i]);
+            part[2 * i + 1] = fmaf(qv[j], x, part[2 * i + 1]);
         }
     }
-    block_sums<kMaxMix * (NQ + 1)>(part, red);
-    float inv[kMaxMix];
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const float tot = warp_totals12(part, lane);
+    if (!(lane & 1) && (!(lane & 4) || !(lane & 2)))   // one lane of each value
+        red[(6 * ((lane >> 4) & 1) + 3 * ((lane >> 3) & 1) + ((lane & 4) ? 2 : (lane >> 1) & 1)) * kWarpsB + w] = tot;
+    __syncthreads();
+    float* hand = red + 2 * kMaxMix * kWarpsB;   // [kMaxMix] the softmax weights, then [kMaxMix] the norms
+    if (w == 0) {
+        float s = 0.f;   // lane 2 i: state i's sum of squares, lane 2 i + 1: its score
+        if (lane < 2 * kMaxMix)
 #pragma unroll
-    for (int i = 0; i < kMaxMix; ++i) inv[i] = i < n ? rsqrtf(part[i * (NQ + 1)] / (float) kWidth + 1e-6f) : 0.f;
-    const float scale = rsqrtf((float) kWidth);
-#pragma unroll
-    for (int q = 0; q < NQ; ++q) {
-        float sc[kMaxMix], m = -INFINITY;
+            for (int j = 0; j < kWarpsB; ++j) s += red[lane * kWarpsB + j];
+        const float inv_l = rsqrtf(s / (float) kWidth + 1e-6f);
+        const float scale = rsqrtf((float) kWidth);
+        float inv[kMaxMix], sc[kMaxMix], m = -INFINITY;
 #pragma unroll
         for (int i = 0; i < kMaxMix; ++i) {
-            sc[i] = i < n ? part[i * (NQ + 1) + 1 + q] * inv[i] * scale : -INFINITY;
+            const float ii = __shfl_sync(0xffffffffu, inv_l, 2 * i), dot = __shfl_sync(0xffffffffu, s, 2 * i + 1);
+            inv[i] = i < n ? ii : 0.f;
+            sc[i] = i < n ? dot * inv[i] * scale : -INFINITY;
             m = fmaxf(m, sc[i]);
         }
         float den = 0.f;
@@ -127,13 +152,20 @@ __device__ __forceinline__ void mix_rows(const float (&v)[kMaxMix][kPer], int n,
             den += sc[i];
         }
 #pragma unroll
-        for (int j = 0; j < kPer; ++j) {
-            float acc = 0.f;
+        for (int i = 0; i < kMaxMix; ++i)
+            if (lane == i) {
+                hand[i] = sc[i] / den;
+                hand[kMaxMix + i] = inv[i];
+            }
+    }
+    __syncthreads();
 #pragma unroll
-            for (int i = 0; i < kMaxMix; ++i)
-                if (i < n) acc = fmaf(sc[i] / den, v[i][j] * inv[i], acc);
-            mixed[q][j] = acc;
-        }
+    for (int j = 0; j < kPer; ++j) {
+        float acc = 0.f;
+#pragma unroll
+        for (int i = 0; i < kMaxMix; ++i)
+            if (i < n) acc = fmaf(hand[i], v[i][j] * hand[kMaxMix + i], acc);
+        mixed[j] = acc;
     }
 }
 
@@ -143,22 +175,33 @@ __device__ __forceinline__ void load_row(const float* __restrict__ p, float (&x)
     for (int j = 0; j < kPer; ++j) x[j] = p[threadIdx.x + j * kThreads];
 }
 
-// RMS norm of the thread-held row x with the thread-held weights w, into q8_1 (and fp32 when `f32` is set).
+// RMS norm of the thread-held row x with the thread-held weights w, into q8_1 (and fp32 when `f32` is set): the sum of
+// squares each warp's, then the warps' in warp order. The kernel's last use of `red` (kWarpsB + 1 floats).
 __device__ __forceinline__ void norm_q8(const float (&x)[kPer], const float (&w)[kPer], float eps, void* q8, float* f32,
                                         int r, float* red) {
-    float ss[1] = {0.f};
+    float ss = 0.f;
 #pragma unroll
-    for (int j = 0; j < kPer; ++j) ss[0] = fmaf(x[j], x[j], ss[0]);
-    block_sums<1>(ss, red);
-    const float inv = rsqrtf(ss[0] / (float) kWidth + eps);
+    for (int j = 0; j < kPer; ++j) ss = fmaf(x[j], x[j], ss);
+    ss = warp_sum(ss);
+    const int wp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (lane == 0) red[wp] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.f;
+#pragma unroll
+        for (int j = 0; j < kWarpsB; ++j) s += red[j];
+        red[kWarpsB] = s;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(red[kWarpsB] / (float) kWidth + eps);
     Q81* row = reinterpret_cast<Q81*>(q8) + (size_t) r * (kWidth / 32);
+    float y[kPer];
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
-        const int c = threadIdx.x + j * kThreads;
-        const float y = x[j] * inv * w[j];
-        if (f32) f32[(size_t) r * kWidth + c] = y;
-        q8_store(y, row, c);
+        y[j] = x[j] * inv * w[j];
+        if (f32) f32[(size_t) r * kWidth + threadIdx.x + j * kThreads] = y[j];
     }
+    q8_store3(y, row, wp, lane);
 }
 
 using prep::conv_in;
@@ -201,8 +244,8 @@ __device__ __forceinline__ void kv_read_ahead(const MixNorm& a) {
 
 __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
     const int r = blockIdx.x, q = blockIdx.y, n = a.st.n;
-    float qv[1][kPer], nw[kPer];   // the weights, read while the kernel before finishes
-    if (a.queries) load_row(a.queries + (size_t) q * kWidth, qv[0]);
+    float qv[kPer], nw[kPer];   // the weights, read while the kernel before finishes
+    if (a.queries) load_row(a.queries + (size_t) q * kWidth, qv);
     if (!a.mix_out) load_row(a.norm[q], nw);
     if (a.kv_k && r == 0 && q == 0) kv_read_ahead(a);   // constant through the window: before the wait
     bk::pdl_wait();
@@ -215,23 +258,23 @@ __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
 #pragma unroll
         for (int j = 0; j < kPer; ++j) v[i][j] = a.st.s[i][(size_t) r * kWidth + threadIdx.x + j * kThreads];
     }
-    float mixed[1][kPer];
+    float mixed[kPer];
     if (a.queries == nullptr) {   // the last state as it is (one output)
 #pragma unroll
         for (int i = 0; i < kMaxMix; ++i)
             if (i == n - 1)
 #pragma unroll
-                for (int j = 0; j < kPer; ++j) mixed[0][j] = v[i][j];
+                for (int j = 0; j < kPer; ++j) mixed[j] = v[i][j];
     } else {
-        mix_rows<1>(v, n, qv, mixed, red);
+        mix_rows(v, n, qv, mixed, red);
     }
     if (a.mix_out) {
 #pragma unroll
         for (int j = 0; j < kPer; ++j)
-            a.mix_out[(size_t) q * a.out_stride + (size_t) r * kWidth + threadIdx.x + j * kThreads] = mixed[0][j];
+            a.mix_out[(size_t) q * a.out_stride + (size_t) r * kWidth + threadIdx.x + j * kThreads] = mixed[j];
         return;
     }
-    norm_q8(mixed[0], nw, a.eps, a.q8[q], q == 0 ? a.norm_out : nullptr, r, red);
+    norm_q8(mixed, nw, a.eps, a.q8[q], q == 0 ? a.norm_out : nullptr, r, red);
 }
 
 // ---- loop controllers --------------------------------------------------------------------------------------------------
@@ -441,12 +484,12 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
 // ---- after the attention -----------------------------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
-    float taps[kPer][kConv], qv[1][kPer], nw[kPer];   // the weights, read while the kernel before finishes
+    float taps[kPer][kConv], qv[kPer], nw[kPer];   // the weights, read while the kernel before finishes
 #pragma unroll
     for (int j = 0; j < kPer; ++j)
 #pragma unroll
         for (int k = 0; k < kConv; ++k) taps[j][k] = a.taps[(threadIdx.x + j * kThreads) * kConv + (kConv - 1 - k)];
-    load_row(a.query, qv[0]);
+    load_row(a.query, qv);
     if (!a.mix_out) load_row(a.norm, nw);
     bk::pdl_wait();
     bk::pdl_launch_dependents();
@@ -489,14 +532,14 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
         if (i == nb)
 #pragma unroll
             for (int j = 0; j < kPer; ++j) v[i][j] = res[j];
-    float mixed[1][kPer];
-    mix_rows<1>(v, n, qv, mixed, red);
+    float mixed[kPer];
+    mix_rows(v, n, qv, mixed, red);
     if (a.mix_out) {
 #pragma unroll
-        for (int j = 0; j < kPer; ++j) a.mix_out[(size_t) r * kWidth + threadIdx.x + j * kThreads] = mixed[0][j];
+        for (int j = 0; j < kPer; ++j) a.mix_out[(size_t) r * kWidth + threadIdx.x + j * kThreads] = mixed[j];
         return;
     }
-    norm_q8(mixed[0], nw, a.eps, a.q8, a.norm_out, r, red);
+    norm_q8(mixed, nw, a.eps, a.q8, a.norm_out, r, red);
 }
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
