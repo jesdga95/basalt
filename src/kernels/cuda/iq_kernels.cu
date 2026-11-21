@@ -3249,12 +3249,15 @@ __global__ void __launch_bounds__(256) swiglu_clamp_q8_1_entries_kernel(const fl
 
 // The softcapped SwiGLU, then the q8_1 blocks (the same pass as swiglu_q8_1_entries_kernel): h = cg tanh(g / cg) sigmoid(g)
 // cu tanh(u / cu), in fp32.
+template<bool PDL>
 __global__ void __launch_bounds__(256) swiglu_softcap_q8_1_entries_kernel(const float* __restrict__ gate,
                                                                           const float* __restrict__ up,
                                                                           const int32_t* __restrict__ grp_start,
                                                                           const int32_t* __restrict__ n_groups, int n_ff,
                                                                           float cg, float cu, block_q8_1* __restrict__ hq) {
+    if constexpr (PDL) pdl_trigger();
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
+    if constexpr (PDL) pdl_wait();
     for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
          i += (long long) gridDim.x * blockDim.x) {
         const float g = gate[i], u = up[i];
@@ -3313,8 +3316,13 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     const long long nh = (long long) cap_entries * L.n_ff;
     const bool sw_v1 = v1;
     if constexpr (ACT == Act::Softcap) {
-        swiglu_softcap_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(
-            gate, up, grp_start, n_groups, (int) L.n_ff, L.gate_softcap, L.up_softcap, hq);
+        if (chain)
+            launch_dependent(swiglu_softcap_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s,
+                             (const float*) gate, (const float*) up, grp_start, n_groups, (int) L.n_ff, L.gate_softcap,
+                             L.up_softcap, hq);
+        else
+            swiglu_softcap_q8_1_entries_kernel<false><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(
+                gate, up, grp_start, n_groups, (int) L.n_ff, L.gate_softcap, L.up_softcap, hq);
     } else if constexpr (CLAMP) {
         if (chain)
             launch_dependent(swiglu_clamp_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s,

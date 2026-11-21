@@ -1,6 +1,7 @@
 // include/basalt/models/inkling2/kernels.hpp - the Inkling 2 kernels: the block-residual mixes, the loop controllers'
 // glue, the attention's short convolutions, clips and caches, attention with a per-query relative bias and sink, the
-// post-sublayer convolutions, the experts' plan and sum, and the logit softcap.
+// post-sublayer convolutions, the experts' plan and sum, and the logit softcap; and the decode window's fused forms of
+// them (kernels/glue.cu), which hand the products their inputs as q8_1 blocks.
 //
 // All activations are fp32 rows ([rows][width], row-major) and every pointer is device memory. A row's result never
 // depends on how many rows share its call or where it sits among them. `stream` may be null (the call then synchronises).
@@ -20,6 +21,8 @@ constexpr int kExtent = 1024;       ///< distances the relative bias covers (als
 constexpr int kConv = 4;            ///< short convolution taps
 constexpr int kConvRing = 16;       ///< positions a convolution ring keeps: a window of up to 8 rows and the 3 before it
 constexpr int kMaxMix = 6;          ///< states one mix reads: the finished blocks and the partial
+constexpr int kDecodeRows = 8;      ///< rows of a decode window's fused kernels (the products take 8 columns at most)
+constexpr int kMaxStreams = 4;      ///< loop controllers one call runs side by side
 
 /// A layer's fused projection rows, in this order: q, r, gate, sink (read from the query input), k and the key
 /// convolution's per-token taps (from the key input), v and its taps (from the value input). A sliding-window layer has no
@@ -53,9 +56,10 @@ void ctrl_blend(const float* dest, const float* msg, const float* gf, int rows, 
 
 /// What a visit's attention preparation reads and writes.
 struct AttnPrep {
-    const float* yq = nullptr;         ///< the projection outputs [rows][kProjQ], [rows][kProjKV], [rows][kProjKV]
+    const float* yq = nullptr;         ///< the projection outputs: row r's at yq + r * ldq, yk + r * ldk, yv + r * ldv
     const float* yk = nullptr;
     const float* yv = nullptr;
+    int64_t ldq = kProjQ, ldk = kProjKV, ldv = kProjKV;
     const int32_t* pos = nullptr;      ///< position of each row [rows]
     bool full = false;                 ///< a full-attention layer: per-token taps, log-scaled q and r
     const float* k_conv = nullptr;     ///< the key convolution's static taps [1024][kConv], tap kConv-1 the current token
@@ -66,7 +70,7 @@ struct AttnPrep {
     float log_floor = 8192.f, log_alpha = 0.1f;
     float* k_ring = nullptr;           ///< the convolution inputs of the last kConvRing positions [kConvRing][1024], slot pos % kConvRing
     float* v_ring = nullptr;
-    void* k_cache = nullptr;           ///< [kKvHeads][cap][kHeadDim], position p at p % cap; fp16 or E4M3 (fp8 set)
+    void* k_cache = nullptr;           ///< [cap][kKvHeads][kHeadDim], position p in cell p % cap; fp16 or E4M3 (fp8 set)
     void* v_cache = nullptr;
     int64_t cap = 0;
     bool fp8 = false;                  ///< unit-scale E4M3 codes (keys are clipped and values normed, so they fit)
@@ -92,11 +96,15 @@ struct AttnArgs {
     bool fp8 = false;
     int window = 0;                    ///< > 0: keys at distance < window only (the cache is then a ring of cap >= window + rows)
     float scale = 0.08838834764831845f;
+    const float* gate = nullptr;       ///< set: the output is gated by sigmoid(gate[r * gate_ld + h * kHeadDim + d])
+    int64_t gate_ld = 0;
+    void* q8 = nullptr;                ///< set: the (gated) output also as q8_1 blocks, [rows][kHeads * kHeadDim / 32]
 };
 /// Bytes of scratch attention_decode needs for `rows` rows over at most `max_keys` keys.
 size_t attention_decode_scratch(int rows, int64_t max_keys);
 /// out[r][h] = sum_j softmax_j(scale q.k_j + bias(pos_r - pos_j)) v_j over the keys at positions <= pos_r (and within the
-/// window), with exp(sink[r][h]) beside them in the softmax's denominator. `max_keys` bounds the keys any row reads.
+/// window), with exp(sink[r][h]) beside them in the softmax's denominator. `max_keys` bounds the keys any row reads (it
+/// sizes the launch only: a row's keys split in slices fixed by its own key count). `out` may be null when q8 is set.
 void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream);
 
 /// out[r] = attn[r] * sigmoid(yq[r][kOffGate..]), the attention output gated by its own row's gate projection.
@@ -112,13 +120,95 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
 
-/// The grouped expert kernel's plan from the router's choices: group g is an expert (blob at base + e * blob_bytes) and its
-/// entries are the (row, slot) pairs that chose it, in row order; entry e of the pairs writes row r * k + slot of the
-/// output. ptr [k rows], start [k rows + 2], n_groups [1], dst and tok [k rows]. rows * k <= 1024.
+/// The grouped expert kernel's plan from the router's choices: group g is an expert (blob at base + e * blob_bytes, the
+/// experts' stride) and its entries are the (row, slot) pairs that chose it, in row order; entry e of the pairs writes row
+/// r * k + slot of the output. ptr [k rows], start [k rows + 2], n_groups [1], dst and tok [k rows]. rows * k <= 1024.
 void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const uint8_t* base, size_t blob_bytes,
               unsigned long long* ptr, int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream);
 /// y[r] = sum_slot w[r][slot] * out[r * k + slot] in slot order (fp32).
 void moe_combine(const float* out, const float* w, int rows, int k, float* y, void* stream);
+
+// ---- a decode window's fused glue (kernels/glue.cu): at most kDecodeRows rows --------------------------------------------
+//
+// A window's rows sit at consecutive positions. Each row's convolutions read the rows before it in the window and the rings
+// for the positions before the window, and write the row's own ring slot. The products' inputs come out as q8_1 blocks
+// (row r at r * width / 32 blocks of 36 bytes: an fp16 scale and sum, 32 int8).
+
+/// Mixes, then norms: output j is the mix of `st` scored by query j (queries + j * kWidth), or the last state as it is
+/// when `queries` is null; then its RMS norm with norm[j] (eps) rounded to q8_1 at q8[j], and output 0's
+/// normed rows in fp32 at norm_out when set. With `mix_out` set the mixes are written there instead (output j's row r at
+/// mix_out + j * out_stride + r * kWidth) and nothing is normed.
+struct MixNorm {
+    MixStates st;
+    const float* queries = nullptr;
+    const float* norm[3] = {};
+    void* q8[3] = {};
+    float* norm_out = nullptr;
+    float eps = 1e-6f;
+    float* mix_out = nullptr;
+    int64_t out_stride = 0;
+};
+/// n_out: 1 or 3 (or 4 with mix_out, the message bank's four queries).
+void mix_norm(const MixNorm& a, int n_out, int rows, void* stream);
+
+/// Up to kMaxStreams loop controllers over the same rows: stream s blends dest[s] with msg[s] (rows at r * kWidth),
+/// out = (1 - tanh f) dest + tanh g msg with [g | f] = up_s . (down_s . [rms(dest) | rms(msg)]), then norms the blend with
+/// norm[s] (eps) into q8_1 at q8[s]; stream 0's normed rows also in fp32 at norm_out when set. down_s is BF16
+/// [rank][2 kWidth], up_s BF16 [2 kWidth][rank] (the gain rows, then the forget rows). `scratch`: ctrl_scratch_floats.
+struct CtrlArgs {
+    const float* dest[kMaxStreams] = {};
+    const float* msg[kMaxStreams] = {};
+    const uint16_t* down[kMaxStreams] = {};
+    const uint16_t* up[kMaxStreams] = {};
+    const float* norm[kMaxStreams] = {};
+    void* q8[kMaxStreams] = {};
+    float* norm_out = nullptr;
+    float* scratch = nullptr;
+    int rank = 0;
+    float eps = 1e-6f;
+};
+size_t ctrl_scratch_floats(int rank);
+void controllers(const CtrlArgs& a, int streams, int rows, void* stream);
+
+/// attn_prepare for a decode window: a block per row and key/value head.
+void decode_prepare(const AttnPrep& a, int rows, void* stream);
+
+/// After the attention's output projection: its convolution over `o` (the ring for the positions before the window) plus
+/// the residual (the layer's input `hid`, unless the layer starts a block) into `resid`; then the MLP's input, the mix of
+/// the finished blocks (and `hid` when the layer starts a block) and `resid` scored by `query`, normed with `norm` (eps)
+/// into q8_1 at `q8` and fp32 at `norm_out`, or the mix as it is at `mix_out` when set (for a loop controller).
+struct PostAttn {
+    const float* o = nullptr;
+    const int32_t* pos = nullptr;
+    const float* taps = nullptr;       ///< [kWidth][kConv], tap kConv-1 the current token
+    float* ring = nullptr;             ///< the convolution's inputs [kConvRing][kWidth]
+    const float* hid = nullptr;
+    bool boundary = false;
+    float* resid = nullptr;
+    const float* blocks[kMaxMix] = {};
+    int n_blocks = 0;
+    const float* query = nullptr;
+    const float* norm = nullptr;
+    float eps = 1e-6f;
+    void* q8 = nullptr;
+    float* norm_out = nullptr;
+    float* mix_out = nullptr;
+};
+void post_attn(const PostAttn& a, int rows, void* stream);
+
+/// The experts' sum of each row (w[r][slot] * rows[r * k + slot], slot order), its convolution (the ring for the positions
+/// before the window) plus `resid` into `out`.
+struct MoeFinish {
+    const float* rows = nullptr;       ///< [rows][k][kWidth]
+    const float* w = nullptr;          ///< [rows][k]
+    int k = 0;
+    const int32_t* pos = nullptr;
+    const float* taps = nullptr;
+    float* ring = nullptr;
+    const float* resid = nullptr;
+    float* out = nullptr;
+};
+void moe_finish(const MoeFinish& a, int rows, void* stream);
 
 // ---- head --------------------------------------------------------------------------------------------------------------
 

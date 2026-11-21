@@ -8,7 +8,7 @@
 namespace basalt::models::inkling2 {
 
 struct VisitCache {
-    void* k = nullptr;                   ///< [kKvHeads][cap][kHeadDim], position p at p % cap; fp16 or unit-scale E4M3
+    void* k = nullptr;                   ///< [cap][kKvHeads][kHeadDim], position p in cell p % cap; fp16 or unit-scale E4M3
     void* v = nullptr;
     int64_t cap = 0;
     bool ring = false;                   ///< a sliding-window visit: cells are positions modulo cap

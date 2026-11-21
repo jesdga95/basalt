@@ -1,5 +1,6 @@
 // src/models/inkling2/kernels/ops.cu - Inkling 2's block-residual mixes, loop-controller glue, attention preparation
 // (short convolutions, clips, cache writes), output gate, post-sublayer convolutions, expert plan and sum, and softcap.
+#include "basalt/kernels/pdl.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -11,6 +12,8 @@
 
 namespace basalt::models::inkling2 {
 namespace {
+
+namespace bk = basalt::kernels;
 
 constexpr int kThreads = 256;
 constexpr int kPerThread = kWidth / kThreads;   // 9
@@ -167,7 +170,7 @@ __device__ __forceinline__ void store_kv(void* cache, bool fp8, size_t idx, floa
 // relative states.
 __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
     const int r = blockIdx.x, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const float* yq = a.yq + (size_t) r * kProjQ;
+    const float* yq = a.yq + (size_t) r * a.ldq;
     const int p = a.pos[r];
     const float inv_k = a.full ? (1.f / 3.f) : rsqrtf((float) kConv + 1.f);
     const float tau = a.full ? tau_of(p, a.log_floor, a.log_alpha) : 1.f;
@@ -175,7 +178,8 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
 #pragma unroll
     for (int which = 0; which < 2; ++which) {
         const float* yall = which ? a.yv : a.yk;
-        const float* y = yall + (size_t) r * kProjKV;
+        const int64_t ld = which ? a.ldv : a.ldk;
+        const float* y = yall + (size_t) r * ld;
         const float* taps = which ? a.v_conv : a.k_conv;
         const float* ring = which ? a.v_ring : a.k_ring;
         float val[4], ss = 0.f;
@@ -185,7 +189,7 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
             float acc = 0.f, x0 = 0.f;
 #pragma unroll
             for (int j = 0; j < kConv; ++j) {
-                const float x = conv_in(yall, kProjKV, 0, ring, kKvHeads * kHeadDim, a.pos, r, j, c);
+                const float x = conv_in(yall, (int) ld, 0, ring, kKvHeads * kHeadDim, a.pos, r, j, c);
                 if (j == 0) x0 = x;
                 float t = taps[c * kConv + (kConv - 1 - j)];
                 if (a.full) t += y[kOffTaps + w * kConv + j];
@@ -200,7 +204,7 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         void* cache = which ? a.v_cache : a.k_cache;
 #pragma unroll
         for (int u = 0; u < 4; ++u)
-            store_kv(cache, a.fp8, ((size_t) w * a.cap + cell) * kHeadDim + lane * 4 + u, val[u] * f);
+            store_kv(cache, a.fp8, ((size_t) cell * kKvHeads + w) * kHeadDim + lane * 4 + u, val[u] * f);
     }
     // queries: warp w takes heads 3w .. 3w + 2
     for (int h = w * 3; h < w * 3 + 3; ++h) {
@@ -265,41 +269,57 @@ __global__ void post_conv_kernel(const float* __restrict__ x, const int32_t* __r
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
 
-// One block: the (row, slot) pairs counted by expert, then placed group by group in pair order (a single thread walks the
-// pairs, so the order within a group is the rows').
+// One block: the (row, slot) pairs counted by expert; a warp scans the counts into each used expert's group and first entry;
+// each pair then takes its place in its group from the pairs before it that chose the same expert (the rows' order).
 __global__ void moe_plan_kernel(const int32_t* __restrict__ ids, int n, int n_expert, const uint8_t* base, size_t blob,
                                 unsigned long long* __restrict__ ptr, int32_t* __restrict__ start, int32_t* __restrict__ n_groups,
                                 int32_t* __restrict__ dst, int32_t* __restrict__ tok, int k) {
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
     extern __shared__ int32_t sm[];
-    int32_t* count = sm;                 // [n_expert]
-    int32_t* group = sm + n_expert;      // [n_expert]: the expert's group, or -1
-    int32_t* fill = group + n_expert;    // [n_expert]: the next free entry of its group
+    int32_t* count = sm;              // [n_expert]
+    int32_t* first = sm + n_expert;   // [n_expert]: the expert's first entry
     for (int e = threadIdx.x; e < n_expert; e += blockDim.x) count[e] = 0;
     __syncthreads();
     for (int i = threadIdx.x; i < n; i += blockDim.x) atomicAdd(&count[ids[i]], 1);
     __syncthreads();
-    if (threadIdx.x == 0) {
-        int g = 0, at = 0;
-        for (int e = 0; e < n_expert; ++e) {
-            if (count[e] == 0) {
-                group[e] = -1;
-                continue;
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
+        int at = 0, g = 0;
+        for (int e0 = 0; e0 < n_expert; e0 += 32) {
+            const int e = e0 + lane;
+            const int c = e < n_expert ? count[e] : 0;
+            int s = c, used = c > 0;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int t = __shfl_up_sync(0xffffffffu, s, o), u = __shfl_up_sync(0xffffffffu, used, o);
+                if (lane >= o) {
+                    s += t;
+                    used += u;
+                }
             }
-            group[e] = g;
-            ptr[g] = (unsigned long long) (base + (size_t) e * blob);
+            if (e < n_expert) first[e] = at + s - c;
+            if (c > 0) {
+                ptr[g + used - 1] = (unsigned long long) (base + (size_t) e * blob);
+                start[g + used - 1] = at + s - c;
+            }
+            at += __shfl_sync(0xffffffffu, s, 31);
+            g += __shfl_sync(0xffffffffu, used, 31);
+        }
+        if (lane == 0) {
             start[g] = at;
-            fill[e] = at;
-            at += count[e];
-            ++g;
+            start[g + 1] = at;
+            *n_groups = g;
         }
-        start[g] = at;
-        start[g + 1] = at;
-        *n_groups = g;
-        for (int i = 0; i < n; ++i) {
-            const int at_i = fill[ids[i]]++;
-            dst[at_i] = i;
-            tok[at_i] = i / k;
-        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int e = ids[i];
+        int before = 0;
+        for (int j = 0; j < i; ++j) before += ids[j] == e;
+        const int at = first[e] + before;
+        dst[at] = i;
+        tok[at] = i / k;
     }
 }
 
@@ -312,6 +332,8 @@ __global__ void moe_combine_kernel(const float* __restrict__ out, const float* _
 }
 
 __global__ void softcap_kernel(float* __restrict__ x, int n, int64_t ld, float cap) {
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
     const int r = blockIdx.y;
     const float inv = 1.f / cap;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
@@ -354,8 +376,8 @@ void attn_prepare(const AttnPrep& a, int rows, void* stream) {
     cudaStream_t s = (cudaStream_t) stream;
     attn_prepare_kernel<<<rows, kThreads, 0, s>>>(a);
     check("attn_prepare");
-    ring_store(a.yk, kProjKV, 0, kKvHeads * kHeadDim, a.pos, rows, a.k_ring, s);
-    ring_store(a.yv, kProjKV, 0, kKvHeads * kHeadDim, a.pos, rows, a.v_ring, s);
+    ring_store(a.yk, (int) a.ldk, 0, kKvHeads * kHeadDim, a.pos, rows, a.k_ring, s);
+    ring_store(a.yv, (int) a.ldv, 0, kKvHeads * kHeadDim, a.pos, rows, a.v_ring, s);
     check("attn_prepare/rings");
 }
 
@@ -381,8 +403,8 @@ void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const uint8_t* 
     const int n = rows * k;
     if (n <= 0) return;
     if (n > 1024) throw std::runtime_error("inkling2 moe_plan: more than 1024 pairs");
-    moe_plan_kernel<<<1, 256, (size_t) 3 * n_expert * sizeof(int32_t), (cudaStream_t) stream>>>(
-        ids, n, n_expert, base, blob_bytes, ptr, start, n_groups, dst, tok, k);
+    bk::launch_pdl(moe_plan_kernel, dim3(1), dim3(256), (size_t) 2 * n_expert * sizeof(int32_t), (cudaStream_t) stream, ids, n,
+                   n_expert, base, blob_bytes, ptr, start, n_groups, dst, tok, k);
     check("moe_plan");
 }
 
@@ -394,7 +416,7 @@ void moe_combine(const float* out, const float* w, int rows, int k, float* y, vo
 
 void softcap(float* x, int rows, int n, int64_t ld, float cap, void* stream) {
     if (rows <= 0 || n <= 0) return;
-    softcap_kernel<<<dim3(256, (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(x, n, ld, cap);
+    bk::launch_pdl(softcap_kernel, dim3(256, (unsigned) rows), dim3(256), 0, (cudaStream_t) stream, x, n, ld, cap);
     check("softcap");
 }
 
