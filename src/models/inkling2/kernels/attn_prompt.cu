@@ -35,12 +35,21 @@ constexpr int kGLd = 55;                  // padded row of the exchanged bias (f
 constexpr float kLog2e = 1.4426950408889634f;
 static_assert(kBand >= kPos + kKeys - 1 && kGCols >= 16 + kKeys - 1 && kGCols % 8 == 0 && kGLd >= kGCols, "band sizes");
 
-struct Smem {
+struct KvTile {
     __half k[kKeys][kLd];
     __half v[kKeys][kLd];
-    __half band[kBand][kBandLd];
-    float gx[kWarps][16][kGLd];
 };
+// A tile beyond the bias's reach needs neither the band nor the exchange, so the next such tile streams into the
+// exchange's room while the block works on the current one.
+struct Smem {
+    KvTile t0;
+    __half band[kBand][kBandLd];
+    union {
+        KvTile t1;
+        float gx[kWarps][16][kGLd];
+    } u;
+};
+static_assert(sizeof(KvTile) <= sizeof(float) * kWarps * 16 * kGLd, "the second tile fits in the exchange");
 
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
@@ -86,9 +95,10 @@ __device__ __forceinline__ uint32_t e4m3x2_to_h2(uint16_t u) {
     return (uint32_t) h.x | ((uint32_t) h.y << 16);
 }
 
-// One tile of keys and values into shared memory: key k0 + j at row j, zero outside [lo, hi].
+// One tile of keys and values into shared memory: key k0 + j at row j, zero outside [lo, hi].  fp16 tiles are requested
+// (cp.async, the caller commits and waits), E4M3 tiles converted and stored before the return.
 template <bool FP8>
-__device__ __forceinline__ void load_tile(const AttnPromptArgs& a, Smem& sm, int kvh, int64_t k0, int64_t lo, int64_t hi, int tid) {
+__device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, int kvh, int64_t k0, int64_t lo, int64_t hi, int tid) {
     if constexpr (!FP8) {
         constexpr int kPieces = kKeys * kHeadDim / 8;   // 16-byte pieces of one tile
         for (int c = tid; c < 2 * kPieces; c += kThreads) {
@@ -103,7 +113,6 @@ __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, Smem& sm, int
             const __half* src = base + ((size_t) (ok ? key % cap : 0) * kKvHeads + kvh) * kHeadDim + col;
             cp16(isv ? &sm.v[j][col] : &sm.k[j][col], src, ok);
         }
-        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
     } else {
         constexpr int kPieces = kKeys * kHeadDim / 16;  // 16 codes a piece
         for (int c = tid; c < 2 * kPieces; c += kThreads) {
@@ -179,17 +188,37 @@ __global__ void __launch_bounds__(kThreads, 2) attn_prompt_kernel(const AttnProm
     for (int n = 0; n < kHeadDim / 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
     float m_a = -INFINITY, m_b = -INFINITY, l_a = 0.f, l_b = 0.f;
     const float scale2 = a.scale * kLog2e;
-    float (*gx)[kGLd] = sm.gx[w];
+    float (*gx)[kGLd] = sm.u.gx[w];
 
+    // a tile is far when no distance of the block's rows to its keys reaches below kExtent: no bias, no band, no exchange
+    const auto far = [&](int64_t k0) { return q0 - k0 - (kKeys - 1) >= kExtent; };
+    int cur = 0;          // the room the current tile is in (1: the exchange's)
+    bool ready = false;   // the current tile was requested during the tile before
     for (int64_t k0 = lo / kKeys * kKeys; k0 <= hi; k0 += kKeys) {
         __syncthreads();   // every warp is done with the previous tile
-        load_tile<FP8>(a, sm, kvh, k0, lo, hi, tid);
-        // the bias band: row b holds the table's column d = q0 - k0 - (kKeys - 1) + b, zero outside [0, kExtent)
-        for (int idx = tid; idx < kBand * kRel; idx += kThreads) {
-            const int t = idx / kBand, b = idx % kBand;
-            const int64_t d = q0 - k0 - (kKeys - 1) + b;
-            sm.band[b][t] = __float2half_rn(d >= 0 && d < kExtent ? a.rel_table[(size_t) t * kExtent + d] : 0.f);
+        if (!ready) {
+            cur = 0;
+            load_tile<FP8>(a, sm.t0, kvh, k0, lo, hi, tid);
+            asm volatile("cp.async.commit_group;\n" ::: "memory");
         }
+        // a far tile followed by a far tile: the next one is requested into the other room before this one is used
+        const bool next = !FP8 && far(k0) && k0 + kKeys <= hi && far(k0 + kKeys);
+        if (next) {
+            load_tile<FP8>(a, cur ? sm.t0 : sm.u.t1, kvh, k0 + kKeys, lo, hi, tid);
+            asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;\n" ::: "memory");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        }
+        const KvTile& kt = cur ? sm.u.t1 : sm.t0;
+        ready = next;
+        if (next) cur ^= 1;
+        // the bias band: row b holds the table's column d = q0 - k0 - (kKeys - 1) + b, zero outside [0, kExtent)
+        if (!far(k0))
+            for (int idx = tid; idx < kBand * kRel; idx += kThreads) {
+                const int t = idx / kBand, b = idx % kBand;
+                const int64_t d = q0 - k0 - (kKeys - 1) + b;
+                sm.band[b][t] = __float2half_rn(d >= 0 && d < kExtent ? a.rel_table[(size_t) t * kExtent + d] : 0.f);
+            }
         __syncthreads();
 
         // a warp none of whose rows sees a key of the tile skips it; one whose rows see every key needs no mask
@@ -206,7 +235,7 @@ __global__ void __launch_bounds__(kThreads, 2) attn_prompt_kernel(const AttnProm
 #pragma unroll
             for (int n = 0; n < kKeys / 8; n += 2) {
                 unsigned b0, b1, b2, b3;
-                ldsm_x4(b0, b1, b2, b3, &sm.k[n * 8 + (lane & 7) + ((lane >> 4) << 3)][kk * 16 + ((lane >> 3) & 1) * 8]);
+                ldsm_x4(b0, b1, b2, b3, &kt.k[n * 8 + (lane & 7) + ((lane >> 4) << 3)][kk * 16 + ((lane >> 3) & 1) * 8]);
                 mma16816(s[n], qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], b0, b1);
                 mma16816(s[n + 1], qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], b2, b3);
             }
@@ -298,7 +327,7 @@ __global__ void __launch_bounds__(kThreads, 2) attn_prompt_kernel(const AttnProm
 #pragma unroll
             for (int j = 0; j < kKeys / 16; ++j) {
                 unsigned b0, b1, b2, b3;
-                ldsm_x4_t(b0, b1, b2, b3, &sm.v[j * 16 + (lane & 15)][n * 8 + (lane >> 4) * 8]);
+                ldsm_x4_t(b0, b1, b2, b3, &kt.v[j * 16 + (lane & 15)][n * 8 + (lane >> 4) * 8]);
                 mma16816(o[n], pf[j][0], pf[j][1], pf[j][2], pf[j][3], b0, b1);
                 mma16816(o[n + 1], pf[j][0], pf[j][1], pf[j][2], pf[j][3], b2, b3);
             }
