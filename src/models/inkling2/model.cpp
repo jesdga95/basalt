@@ -39,8 +39,6 @@ constexpr ProjPart kProjParts[] = {
     {"attn_v.weight", kRowV, 1024, false},       {"attn_v_conv_proj.weight", kRowV + kOffTaps, 32, true},
 };
 const char* const kStreamNames[kStreams] = {"q", "k", "v", "ffn"};
-constexpr int kDecodeRows = 8;   // the rows of a decode window's forward: a sliding-window ring keeps the window and them
-
 // A blob's stride on the card: whole blocks of its type and 16 bytes, so a kernel can read each expert's blocks in place.
 uint64_t expert_stride(int type, uint64_t blob) {
     const uint64_t block = type == kTypeQ8_0 ? 34 : type == kTypeNvfp4 ? 36 : 1;

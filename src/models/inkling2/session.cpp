@@ -1,17 +1,20 @@
 // src/models/inkling2/session.cpp - one conversation of Inkling 2: its caches (a window ring per sliding-window visit, a
-// position per cell for the full-attention visits, the short convolutions' rings) and the forward of a run of rows that
-// every decode window and every prompt chunk goes through.
+// position per cell for the full-attention visits, the short convolutions' rings) and the forward of a decode window,
+// replayed from a CUDA graph per window shape.
 //
 // A token visits 48 layer applications: the prelude (layers 0..5), the loop's core (6..17) three times, the coda
 // (18..23). Each visit has its own caches. A layer's inputs are block-attention mixes of the finished blocks and the
 // partial sum; in the loop's later passes they also take a message read from the previous pass through gated controllers.
 // A row's result does not depend on the other rows of its call: the products take 8 rows at most per launch with the
-// single-row reduction order, the attention and the mixes run a block per row, the experts per (row, slot) entry.
+// single-row reduction order, the attention and the glue run a block per row (or row and head), the experts per (row,
+// slot) entry. Nothing in a window's forward after its inputs are staged depends on the host: the positions and tokens
+// are read on the card, and the attention's launch bound (a power of two of keys) only sizes its grid.
 #include "basalt/core/conversation_cache.hpp"
-#include "basalt/kernels/bf16_gemv.hpp"
+#include "basalt/core/graph.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/sampler.hpp"
@@ -26,6 +29,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -34,7 +39,7 @@ namespace {
 
 namespace bk = basalt::kernels;
 
-constexpr int kMaxRows = 8;              // rows of one forward call (a decode window, a step of a prompt)
+constexpr int kMaxRows = kDecodeRows;    // rows of one forward call (a decode window, a step of a prompt)
 constexpr int kTypeBF16 = 30;
 constexpr int kOutRows = 3072;           // the attention output's width (heads x head width)
 constexpr int kStage = 64;               // windows whose tokens and positions are in flight from the pinned ring at once
@@ -82,17 +87,14 @@ public:
         emb_ = f(R * E);
         mix_ = f(3 * R * E);
         msg_ = f(kStreams * R * E);
-        ctrl_pair_ = f(R * 2 * E);
-        ctrl_hid_ = f(R * g_.gate_rank);
-        ctrl_gf_ = f(R * 2 * E);
-        ctrl_out_ = f(3 * R * E);
-        nrm_ = f(3 * R * E);
-        yq_ = f(R * kProjQ); yk_ = f(R * kProjKV); yv_ = f(R * kProjKV);
+        ctrl_scr_ = f((int64_t) ctrl_scratch_floats(g_.gate_rank));
+        nrm_ = f(R * E);
+        y_ = f(R * kProj);
         q_ = f(R * kHeads * kHeadDim); r_ = f(R * kHeads * kRel); sink_ = f(R * kHeads);
-        attn_ = f(R * kOutRows); gated_ = f(R * kOutRows);
         o_ = f(R * E); resid_ = f(R * E); fin_ = f(R * E);
         att_scr_ = alloc(attention_decode_scratch(kMaxRows, std::max<int64_t>(ctx, g_.window)), ok);
-        xq_ = alloc(bk::native_q8_1_bytes(std::max<int>(kOutRows, 2 * (int) E), kMaxRows), ok);
+        for (void*& x : xq_) x = alloc(bk::native_q8_1_bytes((int) E, kMaxRows), ok);
+        xo_ = alloc(bk::native_q8_1_bytes(kOutRows, kMaxRows), ok);
         rlog_ = f(R * g_.n_expert); rw_ = f(R * g_.n_used); ids_ = (int32_t*) alloc((size_t) R * g_.n_used * 4, ok);
         const int64_t pairs = R * g_.n_used;
         ex_ptr_ = (unsigned long long*) alloc((size_t) pairs * 8, ok);
@@ -102,7 +104,6 @@ public:
         ex_tok_ = (int32_t*) alloc((size_t) pairs * 4, ok);
         ex_scr_ = alloc(bk::native_expert_scratch_bytes(pairs, g_.n_ff_exp), ok);
         ex_rows_ = f(pairs * E);
-        moe_ = f(R * E);
         logits_ = f(R * (int64_t) g_.n_vocab);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxRows, g_.n_vocab) + R * (bk::kLogprobStride + 1));
         pick_ = (int32_t*) alloc(4 * 32, ok);
@@ -268,11 +269,12 @@ public:
         return n;
     }
 
+    // A full-attention visit's cache is cell-major ([cell][head][dim]): its first `positions` cells are one run.
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         cudaStreamSynchronize(stream_);
         kv.clear();
-        const size_t row = (size_t) kHeadDim * elem(), head = (size_t) positions * row;
+        const size_t run = (size_t) positions * kKvHeads * kHeadDim * elem();
         for (const VisitCache& c : vc_) {
             if (c.ring) continue;
             core::ConversationKv k;
@@ -281,20 +283,11 @@ public:
             k.cells = positions;
             k.heads = kKvHeads;
             k.head_dim = kHeadDim;
-            k.k.resize_for_overwrite(kKvHeads * head);
-            k.v.resize_for_overwrite(kKvHeads * head);
-            // the cache is [head][cell][dim]: each head's first `positions` cells are one run
-            const auto down = [&](const void* dev, core::ConversationBuffer& to) {
+            k.k.resize_for_overwrite(run);
+            k.v.resize_for_overwrite(run);
+            const auto down = [](const void* dev, core::ConversationBuffer& to) {
                 return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
-                    while (n > 0) {
-                        const size_t h = at / head, off = at % head, take = std::min(n, head - off);
-                        const uint8_t* src = (const uint8_t*) dev + h * (size_t) c.cap * row + off;
-                        if (cudaMemcpy(p, src, take, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-                        p += take;
-                        at += take;
-                        n -= take;
-                    }
-                    return true;
+                    return cudaMemcpy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
                 });
             };
             if (!down(c.k, k.k) || !down(c.v, k.v)) return {model::Status::Error, "inkling2: reading a cache back failed"};
@@ -306,23 +299,16 @@ public:
     model::Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         cudaStreamSynchronize(stream_);
-        const size_t row = (size_t) kHeadDim * elem(), head = (size_t) positions * row;
+        const size_t run = (size_t) positions * kKvHeads * kHeadDim * elem();
         size_t i = 0;
         for (const VisitCache& c : vc_) {
             if (c.ring) continue;
-            if (i >= kv.size() || kv[i].format != cell_format() || kv[i].cells != positions || kv[i].heads != kKvHeads)
+            if (i >= kv.size() || kv[i].format != cell_format() || kv[i].cells != positions || kv[i].heads != kKvHeads ||
+                kv[i].k.size() < run || kv[i].v.size() < run)
                 return {model::Status::Error, "inkling2: a parked conversation has other caches"};
             const auto up = [&](void* dev, const core::ConversationBuffer& from) {
-                return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t at) {
-                    while (n > 0) {
-                        const size_t h = at / head, off = at % head, take = std::min(n, head - off);
-                        uint8_t* dst = (uint8_t*) dev + h * (size_t) c.cap * row + off;
-                        if (cudaMemcpy(dst, p, take, cudaMemcpyHostToDevice) != cudaSuccess) return false;
-                        p += take;
-                        at += take;
-                        n -= take;
-                    }
-                    return true;
+                return from.visit(0, run, [&](const uint8_t* p, size_t n, size_t at) {
+                    return cudaMemcpy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
                 });
             };
             if (!up(c.k, kv[i].k) || !up(c.v, kv[i].v)) return {model::Status::Error, "inkling2: writing a cache back failed"};
@@ -348,67 +334,72 @@ private:
         return p;
     }
 
-    // q8_1 of `rows` rows of `n` floats into the shared activation buffer, then W [n_out][n] (Q8_0) times them: y[r][n_out]
-    void gemv_q8(const uint8_t* w, const float* x, int n, int n_out, int rows, float* y) {
-        bk::native_quantize_q8_1(x, xq_, n, rows, stream_);
-        bk::native_q8_0_mmvq(w, xq_, y, n, n_out, rows, stream_);
-    }
-
-
-    // One loop controller over `rows` rows: out = blend(dest, msg) of core layer `w`'s stream `s`.
-    void controller(const LayerWeights& w, int s, const float* dest, const float* msg, int rows, float* out) {
-        const int E = g_.n_embd, rank = g_.gate_rank;
-        ctrl_pair_norm(dest, msg, rows, ctrl_pair_, stream_);
-        bk::bf16_gemv_fp32_mmvf_multi(ctrl_pair_, 2 * E, w.ctrl_down[s], ctrl_hid_, rank, 2 * E, rank, rows, stream_);
-        bk::bf16_gemv_fp32_mmvf_multi(ctrl_hid_, rank, w.ctrl_gf[s], ctrl_gf_, 2 * E, rank, 2 * E, rows, stream_);
-        ctrl_blend(dest, msg, ctrl_gf_, rows, out, stream_);
-    }
-
     // Layer `l` (visit `v`) over `rows` rows: `hid` its input, `blocks` the finished blocks before it, `msgs` (or null)
-    // the previous pass's messages [kStreams][rows][E]. Writes its output to `out` (not `hid`).
+    // the previous pass's messages [kStreams][rows][E]; `full_keys` bounds a full-attention visit's keys. Writes its
+    // output to `out` (not `hid`).
     void run_layer(const Visit& v, const float* hid, const float* const* blocks, int n_blocks, const float* msgs, int rows,
-                   float* out) {
+                   int64_t full_keys, float* out) {
         const int l = v.layer;
         const LayerWeights& w = m_.layer(l);
         const bool full = !g_.swa[(size_t) l];
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
         VisitCache& c = vc_[(size_t) v.slot];
-        // the attention's inputs
-        const float* in[3] = {hid, hid, hid};
-        if (w.attn_query) {
-            MixStates st;
-            for (int i = 0; i < n_blocks; ++i) st.s[st.n++] = blocks[i];
-            st.s[st.n++] = hid;
-            const int nq = full ? 3 : 1;
-            attnres_mix(st, w.attn_query, nq, rows, 1e-6f, mix_, (int64_t) RE, stream_);
-            for (int j = 0; j < 3; ++j) in[j] = mix_ + (full ? j : 0) * RE;
-        }
-        if (msgs) {
-            for (int j = 0; j < 3; ++j) controller(w, j, in[j], msgs + j * RE, rows, ctrl_out_ + j * RE);
-            for (int j = 0; j < 3; ++j) in[j] = ctrl_out_ + j * RE;
-        }
-        const float* nq_ = nullptr, *nk = nullptr, *nv = nullptr;
-        if (!full && in[0] == in[1] && in[1] == in[2]) {
-            bk::rms_norm_rows(in[0], w.attn_norm, rows, E, g_.rms_eps, nrm_, stream_);
-            nq_ = nk = nv = nrm_;
+        const float* norms[3] = {full ? w.q_norm : w.attn_norm, full ? w.k_norm : w.attn_norm, full ? w.v_norm : w.attn_norm};
+        const int n_in = full ? 3 : 1;   // the attention's distinct inputs before the controllers
+        // the attention's inputs: the mixes (layer 0's input as it is), normed into q8_1; in the loop's later passes each
+        // first takes its message through its controller
+        MixNorm mn;
+        for (int i = 0; i < n_blocks; ++i) mn.st.s[mn.st.n++] = blocks[i];
+        mn.st.s[mn.st.n++] = hid;
+        mn.queries = w.attn_query;
+        mn.eps = g_.rms_eps;
+        if (!msgs) {
+            for (int j = 0; j < n_in; ++j) {
+                mn.norm[j] = norms[j];
+                mn.q8[j] = xq_[j];
+            }
+            mix_norm(mn, n_in, rows, stream_);
         } else {
-            const float* wn[3] = {full ? w.q_norm : w.attn_norm, full ? w.k_norm : w.attn_norm, full ? w.v_norm : w.attn_norm};
-            for (int j = 0; j < 3; ++j) bk::rms_norm_rows(in[j], wn[j], rows, E, g_.rms_eps, nrm_ + j * RE, stream_);
-            nq_ = nrm_;
-            nk = nrm_ + RE;
-            nv = nrm_ + 2 * RE;
+            mn.mix_out = mix_;
+            mn.out_stride = (int64_t) RE;
+            mix_norm(mn, n_in, rows, stream_);
+            CtrlArgs ca;
+            for (int s = 0; s < 3; ++s) {
+                ca.dest[s] = mix_ + (full ? s : 0) * RE;
+                ca.msg[s] = msgs + s * RE;
+                ca.down[s] = w.ctrl_down[s];
+                ca.up[s] = w.ctrl_gf[s];
+                ca.norm[s] = norms[s];
+                ca.q8[s] = xq_[s];
+            }
+            ca.scratch = ctrl_scr_;
+            ca.rank = g_.gate_rank;
+            ca.eps = g_.rms_eps;
+            controllers(ca, 3, rows, stream_);
         }
-        // the projections: the query input's rows, then the key's, then the value's
+        // the projections: one product over every row of the fused matrix when the three inputs are one
         const size_t row_bytes = (size_t) E / 32 * 34;
-        gemv_q8(w.proj, nq_, E, kProjQ, rows, yq_);
-        gemv_q8(w.proj + (size_t) kRowK * row_bytes, nk, E, kProjKV, rows, yk_);
-        gemv_q8(w.proj + (size_t) kRowV * row_bytes, nv, E, kProjKV, rows, yv_);
-        // convolutions, clips, caches
         AttnPrep ap;
-        ap.yq = yq_;
-        ap.yk = yk_;
-        ap.yv = yv_;
+        if (!full && !msgs) {
+            bk::native_q8_0_mmvq(w.proj, xq_[0], y_, E, kProj, rows, stream_);
+            ap.yq = y_;
+            ap.yk = y_ + kProjQ;
+            ap.yv = y_ + kProjQ + kProjKV;
+            ap.ldq = ap.ldk = ap.ldv = kProj;
+        } else {
+            float* yk = y_ + (size_t) rows * kProjQ;
+            float* yv = yk + (size_t) rows * kProjKV;
+            bk::native_q8_0_mmvq(w.proj, xq_[0], y_, E, kProjQ, rows, stream_);
+            bk::native_q8_0_mmvq(w.proj + (size_t) kRowK * row_bytes, xq_[1], yk, E, kProjKV, rows, stream_);
+            bk::native_q8_0_mmvq(w.proj + (size_t) kRowV * row_bytes, xq_[2], yv, E, kProjKV, rows, stream_);
+            ap.yq = y_;
+            ap.yk = yk;
+            ap.yv = yv;
+            ap.ldq = kProjQ;
+            ap.ldk = ap.ldv = kProjKV;
+        }
+        // convolutions, clips, caches
         ap.pos = pos_d_;
         ap.full = full;
         ap.k_conv = w.k_conv;
@@ -429,7 +420,8 @@ private:
         ap.q = q_;
         ap.r = r_;
         ap.sink = sink_;
-        attn_prepare(ap, rows, stream_);
+        decode_prepare(ap, rows, stream_);
+        // the attention, gated by its row's gate projection and rounded for the output projection
         AttnArgs aa;
         aa.q = q_;
         aa.r = r_;
@@ -442,25 +434,42 @@ private:
         aa.fp8 = m_.cache_fp8();
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
-        const int64_t max_keys = c.ring ? g_.window : max_pos_ + 1;
-        attention_decode(aa, rows, max_keys, att_scr_, attn_, stream_);
-        attn_gate(attn_, yq_, rows, gated_, stream_);
-        gemv_q8(w.out, gated_, kOutRows, E, rows, o_);
-        // the attention's convolution and the residual: a block's first layer starts a new sum
-        const bool boundary = g_.boundary(l);
-        post_conv(o_, pos_d_, w.attn_post_conv, c.a_ring, boundary ? nullptr : hid, rows, resid_, stream_);
-        // the MLP's input
-        MixStates st;
-        for (int i = 0; i < n_blocks; ++i) st.s[st.n++] = blocks[i];
-        if (boundary) st.s[st.n++] = hid;
-        st.s[st.n++] = resid_;
-        attnres_mix(st, w.ffn_query, 1, rows, 1e-6f, mix_, (int64_t) RE, stream_);
-        const float* mlp_in = mix_;
+        aa.gate = ap.yq + kOffGate;
+        aa.gate_ld = ap.ldq;
+        aa.q8 = xo_;
+        attention_decode(aa, rows, c.ring ? (int64_t) g_.window : full_keys, att_scr_, nullptr, stream_);
+        bk::native_q8_0_mmvq(w.out, xo_, o_, kOutRows, E, rows, stream_);
+        // the attention's convolution and the residual (a block's first layer starts a new sum), then the MLP's input
+        PostAttn pa;
+        pa.o = o_;
+        pa.pos = pos_d_;
+        pa.taps = w.attn_post_conv;
+        pa.ring = c.a_ring;
+        pa.hid = hid;
+        pa.boundary = g_.boundary(l);
+        pa.resid = resid_;
+        for (int i = 0; i < n_blocks; ++i) pa.blocks[pa.n_blocks++] = blocks[i];
+        pa.query = w.ffn_query;
+        pa.norm = w.ffn_norm;
+        pa.eps = g_.rms_eps;
+        pa.q8 = xq_[0];
+        pa.norm_out = nrm_;
+        if (msgs) pa.mix_out = mix_;
+        post_attn(pa, rows, stream_);
         if (msgs) {
-            controller(w, 3, mix_, msgs + 3 * RE, rows, ctrl_out_);
-            mlp_in = ctrl_out_;
+            CtrlArgs ca;
+            ca.dest[0] = mix_;
+            ca.msg[0] = msgs + 3 * RE;
+            ca.down[0] = w.ctrl_down[3];
+            ca.up[0] = w.ctrl_gf[3];
+            ca.norm[0] = w.ffn_norm;
+            ca.q8[0] = xq_[0];
+            ca.norm_out = nrm_;
+            ca.scratch = ctrl_scr_;
+            ca.rank = g_.gate_rank;
+            ca.eps = g_.rms_eps;
+            controllers(ca, 1, rows, stream_);
         }
-        bk::rms_norm_rows(mlp_in, w.ffn_norm, rows, E, g_.rms_eps, nrm_, stream_);
         // the experts
         bk::RouterArgs ra;
         ra.n_expert = g_.n_expert;
@@ -470,15 +479,22 @@ private:
         ra.gate = bk::RouterGate::Sigmoid;
         bk::router(nrm_, w.router, w.router_bias, rows, ra, rlog_, ids_, rw_, stream_);
         moe_plan(ids_, rows, g_.n_used, g_.n_expert, w.experts, w.expert_stride, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, stream_);
-        bk::native_quantize_q8_1(nrm_, xq_, E, rows, stream_);
         bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
         L.gate_softcap = g_.gate_softcap;
         L.up_softcap = g_.up_softcap;
         const int pairs = rows * g_.n_used;
-        bk::native_expert_grouped(L, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, std::min(pairs, g_.n_expert), pairs, xq_, ex_scr_,
+        bk::native_expert_grouped(L, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, std::min(pairs, g_.n_expert), pairs, xq_[0], ex_scr_,
                                   ex_rows_, stream_);
-        moe_combine(ex_rows_, rw_, rows, g_.n_used, moe_, stream_);
-        post_conv(moe_, pos_d_, w.ffn_post_conv, c.m_ring, resid_, rows, out, stream_);
+        MoeFinish mf;
+        mf.rows = ex_rows_;
+        mf.w = rw_;
+        mf.k = g_.n_used;
+        mf.pos = pos_d_;
+        mf.taps = w.ffn_post_conv;
+        mf.ring = c.m_ring;
+        mf.resid = resid_;
+        mf.out = out;
+        moe_finish(mf, rows, stream_);
     }
 
     float* buf(Buf b) const { return role_[(int) b]; }
@@ -488,7 +504,6 @@ private:
     bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err) {
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
-        max_pos_ = pos0 + rows - 1;
         // the tokens and positions through a ring of pinned slots: a slot is written again once its copy has run
         const int slot = (int) (stage_n_++ % kStage);
         cudaEventSynchronize(stage_ev_[slot]);
@@ -506,31 +521,65 @@ private:
             bk::iq_embed_rows(kTypeBF16, m_.embedding(), (size_t) E * 2, tok_d_, rows, E, emb_, stream_);
             bk::rms_norm_rows(emb_, m_.embed_norm(), rows, E, g_.rms_eps, x0, stream_);
         }
+        // the full-attention visits' launch bound: the window's keys rounded up to a power of two
+        int64_t full_keys = 1024;
+        while (full_keys < pos0 + rows) full_keys <<= 1;
+        return layers(rows, head, full_keys, err) && check(err);
+    }
+
+    // The layers and the head of a window of `rows` rows: replayed from its shape's graph, captured on the shape's second
+    // window (its first runs direct, outside a capture).
+    bool layers(int rows, int head, int64_t full_keys, std::string& err) {
+        const uint64_t key = ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows;
+        auto it = graphs_.find(key);
+        if (it != graphs_.end()) return it->second.launch(stream_, err);
+        if (direct_.insert(key).second) {
+            body(rows, head, full_keys);
+            return true;
+        }
+        core::CapturedGraph g;
+        if (!g.begin(stream_, err)) return false;
+        body(rows, head, full_keys);
+        if (!g.end(stream_, err)) return false;
+        return graphs_.emplace(key, std::move(g)).first->second.launch(stream_, err);
+    }
+
+    // Launches only: the visits, then the head. Each kernel may start while the one before it finishes (it waits for it
+    // before reading what it wrote), so a product streams its first weights during the glue before it.
+    void body(int rows, int head, int64_t full_keys) {
+        bk::PdlScope pdl(true);
+        const int E = g_.n_embd;
+        const size_t RE = (size_t) rows * E;
         const float* blocks[kMaxMix];
         for (const Step& s : walk_.steps) {
             const Visit& v = g_.visits[(size_t) s.visit];
             const float* msgs = nullptr;
-            if (s.msgs) {
-                MixStates st;
-                st.s[st.n++] = buf(s.bank[0]);
-                st.s[st.n++] = buf(s.bank[1]);
-                attnres_mix(st, m_.layer(v.layer).msg_query, kStreams, rows, 1e-6f, msg_, (int64_t) RE, stream_);
+            if (s.msgs) {   // the four streams' messages from the bank
+                MixNorm mm;
+                mm.st.s[mm.st.n++] = buf(s.bank[0]);
+                mm.st.s[mm.st.n++] = buf(s.bank[1]);
+                mm.queries = m_.layer(v.layer).msg_query;
+                mm.mix_out = msg_;
+                mm.out_stride = (int64_t) RE;
+                mix_norm(mm, kStreams, rows, stream_);
                 msgs = msg_;
             }
             for (int i = 0; i < s.n_blocks; ++i) blocks[i] = buf(s.blocks[i]);
-            run_layer(v, buf(s.hid), blocks, s.n_blocks, msgs, rows, buf(s.out));
+            run_layer(v, buf(s.hid), blocks, s.n_blocks, msgs, rows, full_keys, buf(s.out));
         }
-        if (head <= 0) return check(err);
-        // the head over the last `head` rows
+        if (head <= 0) return;
         const int first = rows - head;
-        MixStates st;
-        for (int i = 0; i < walk_.n_blocks; ++i) st.s[st.n++] = buf(walk_.blocks[i]) + (size_t) first * E;
-        st.s[st.n++] = buf(walk_.final_hid) + (size_t) first * E;
-        attnres_mix(st, m_.output_query(), 1, head, 1e-6f, mix_, (int64_t) head * E, stream_);
-        bk::rms_norm_rows(mix_, m_.output_norm(), head, E, g_.rms_eps, fin_, stream_);
-        gemv_q8(m_.head(), fin_, E, g_.n_vocab, head, logits_);
+        MixNorm hn;
+        for (int i = 0; i < walk_.n_blocks; ++i) hn.st.s[hn.st.n++] = buf(walk_.blocks[i]) + (size_t) first * E;
+        hn.st.s[hn.st.n++] = buf(walk_.final_hid) + (size_t) first * E;
+        hn.queries = m_.output_query();
+        hn.norm[0] = m_.output_norm();
+        hn.q8[0] = xq_[0];
+        hn.norm_out = fin_;
+        hn.eps = g_.rms_eps;
+        mix_norm(hn, 1, head, stream_);
+        bk::native_q8_0_mmvq(m_.head(), xq_[0], logits_, E, g_.n_vocab, head, stream_);
         softcap(logits_, head, g_.n_vocab, g_.n_vocab, g_.logit_softcap, stream_);
-        return check(err);
     }
 
     bool check(std::string& err) {
@@ -600,19 +649,21 @@ private:
     std::vector<VisitCache> vc_;
     std::unique_ptr<PromptRunner> prompt_;   // PROMPT HOOK
     Walk walk_;
+    std::map<uint64_t, core::CapturedGraph> graphs_;   // by window shape: rows, head rows, the full visits' launch bound
+    std::set<uint64_t> direct_;                        // the shapes whose first window has run
     float* role_[kBufs] = {};
     float* emb_ = nullptr;
-    float *mix_ = nullptr, *msg_ = nullptr, *ctrl_pair_ = nullptr, *ctrl_hid_ = nullptr, *ctrl_gf_ = nullptr, *ctrl_out_ = nullptr;
-    float *nrm_ = nullptr, *yq_ = nullptr, *yk_ = nullptr, *yv_ = nullptr, *q_ = nullptr, *r_ = nullptr, *sink_ = nullptr;
-    float *attn_ = nullptr, *gated_ = nullptr, *o_ = nullptr, *resid_ = nullptr, *fin_ = nullptr;
+    float *mix_ = nullptr, *msg_ = nullptr, *ctrl_scr_ = nullptr, *nrm_ = nullptr, *y_ = nullptr;
+    float *q_ = nullptr, *r_ = nullptr, *sink_ = nullptr, *o_ = nullptr, *resid_ = nullptr, *fin_ = nullptr;
     void* att_scr_ = nullptr;
-    void* xq_ = nullptr;
+    void* xq_[3] = {};                       // the products' q8_1 inputs of the hidden width
+    void* xo_ = nullptr;                     // the output projection's
     float *rlog_ = nullptr, *rw_ = nullptr;
     int32_t* ids_ = nullptr;
     unsigned long long* ex_ptr_ = nullptr;
     int32_t *ex_start_ = nullptr, *ex_ng_ = nullptr, *ex_dst_ = nullptr, *ex_tok_ = nullptr;
     void* ex_scr_ = nullptr;
-    float *ex_rows_ = nullptr, *moe_ = nullptr, *logits_ = nullptr;
+    float *ex_rows_ = nullptr, *logits_ = nullptr;
     int32_t *pick_ = nullptr, *io_d_ = nullptr, *tok_d_ = nullptr, *pos_d_ = nullptr, *io_h_ = nullptr;
     cudaEvent_t stage_ev_[kStage] = {};
     uint64_t stage_n_ = 0;
@@ -625,7 +676,6 @@ private:
     int history_len_ = 0;
     bk::SamplerParams sampling_;
     int head_rows_ = 0;
-    int64_t max_pos_ = 0;
 };
 
 }  // namespace

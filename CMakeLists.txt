@@ -252,7 +252,8 @@ endif()
 endif()
 
 if(BASALT_MODEL_INKLING2)
-add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/models/inkling2/kernels/attn.cu)
+add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/models/inkling2/kernels/attn.cu
+  src/models/inkling2/kernels/glue.cu)
 target_include_directories(inkling2_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(inkling2_kernels PUBLIC ${_gpu_runtime_target})
 add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/inkling2/pretok_inkling2.cpp

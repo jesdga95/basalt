@@ -1,14 +1,17 @@
 // src/models/inkling2/kernels/kernels_parity.cpp - the Inkling 2 kernels against plain CPU references (double accumulation)
 // at the model's geometry: the block-residual mixes, the loop controllers' norm and blend, the attention preparation
 // (short convolutions, clips, cache writes), the attention with its relative bias and sink over a window ring and a full
-// cache, the post-sublayer convolutions, the experts with the softcapped SwiGLU and their weighted sum, and the softcap.
-// Every kernel is checked for a row's bits not depending on the rows beside it, and timed. Exit 77 without a GPU.
+// cache, the post-sublayer convolutions, the experts with the softcapped SwiGLU and their weighted sum, and the softcap;
+// and the decode window's fused kernels against the references and the kernels they replace, their q8_1 blocks against a
+// CPU rounding of their own fp32 rows. Every kernel is checked for a row's bits not depending on the rows beside it, and
+// timed. Exit 77 without a GPU.
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -87,6 +90,65 @@ double h2d(uint16_t h) {
 uint16_t f2h(float f) { return __half_raw(__float2half(f)).x; }
 double tanhd(double x) { return std::tanh(x); }
 double sig(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+
+// The block-residual mix of row r of `st` (each [rows][E]) scored by the query q[0..E).
+std::vector<double> mix_ref(const std::vector<const std::vector<float>*>& st, const float* q, int r) {
+    const size_t n = st.size();
+    std::vector<double> inv(n), sc(n);
+    double m = -1e300;
+    for (size_t i = 0; i < n; ++i) {
+        double ss = 0, d = 0;
+        for (int c = 0; c < E; ++c) {
+            const double x = (*st[i])[(size_t) r * E + c];
+            ss += x * x;
+            d += (double) q[c] * x;
+        }
+        inv[i] = 1.0 / std::sqrt(ss / E + 1e-6);
+        sc[i] = d * inv[i] / std::sqrt((double) E);
+        m = std::max(m, sc[i]);
+    }
+    double den = 0;
+    for (double& v : sc) den += (v = std::exp(v - m));
+    std::vector<double> out(E, 0.0);
+    for (int c = 0; c < E; ++c)
+        for (size_t i = 0; i < n; ++i) out[c] += sc[i] / den * (*st[i])[(size_t) r * E + c] * inv[i];
+    return out;
+}
+std::vector<double> norm_ref(const std::vector<double>& x, const std::vector<float>& w, double eps = 1e-6) {
+    double ss = 0;
+    for (double v : x) ss += v * v;
+    const double inv = 1.0 / std::sqrt(ss / (double) x.size() + eps);
+    std::vector<double> y(x.size());
+    for (size_t c = 0; c < x.size(); ++c) y[c] = x[c] * inv * w[c];
+    return y;
+}
+
+// The q8_1 blocks of `rows` rows of `width` against a CPU rounding of the kernel's own fp32 rows `x`: the int8 values and
+// the scale exactly, the sum to its fp16 rounding.
+void check_q8(const char* what, const void* dq8, const std::vector<float>& x, int rows, int width) {
+    const size_t nb = (size_t) rows * width / 32;
+    std::vector<uint8_t> q = host(static_cast<const uint8_t*>(dq8), nb * 36);
+    bool ok = true;
+    for (size_t b = 0; b < nb && ok; ++b) {
+        const float* v = &x[b * 32];
+        float amax = 0.f, sum = 0.f;
+        for (int i = 0; i < 32; ++i) {
+            amax = std::max(amax, std::fabs(v[i]));
+            sum += v[i];
+        }
+        const float d = amax / 127.0f;
+        uint16_t dh, sh;
+        std::memcpy(&dh, &q[b * 36], 2);
+        std::memcpy(&sh, &q[b * 36 + 2], 2);
+        ok = dh == f2h(d) && std::fabs(h2d(sh) - (double) sum) <= 1e-3 * std::max(1.0, std::fabs((double) sum));
+        for (int i = 0; i < 32 && ok; ++i) {
+            const float t = amax == 0.f ? 0.f : std::max(-127.f, std::min(127.f, std::round(v[i] / d)));
+            ok = (int8_t) q[b * 36 + 4 + i] == (int8_t) t;
+        }
+    }
+    std::printf("%-34s %s\n", what, ok ? "ok" : "FAIL");
+    failures += !ok;
+}
 
 // ---- block residuals ---------------------------------------------------------------------------------------------------
 
@@ -233,7 +295,7 @@ void test_prepare() {
                     }
                     const double f = which == 0 ? std::min(22.627417 / (std::sqrt(ss) + 1e-6), 1.0) : 1.0 / std::sqrt(ss / kHeadDim + 1e-6);
                     for (int d = 0; d < kHeadDim; ++d) {
-                        const size_t at = ((size_t) h * cap + pos[r] % cap) * kHeadDim + d;
+                        const size_t at = ((size_t) (pos[r] % cap) * kKvHeads + h) * kHeadDim + d;
                         (which ? gv : gk).push_back((float) h2d((which ? hv : hk)[at]));
                         (which ? rv : rk).push_back(val[d] * f);
                     }
@@ -283,25 +345,44 @@ void test_prepare() {
 // ---- attention ---------------------------------------------------------------------------------------------------------
 
 void test_attention() {
-    for (bool window : {true, false}) {
+    for (int mode = 0; mode < 3; ++mode) {   // a window ring, a full cache, a full cache of E4M3 codes
+        const bool window = mode == 0, fp8 = mode == 2;
         const int R = 4;
         const int p0 = window ? 2900 : 2995;
         const int64_t cap = window ? kExtent + 8 : 3000;
         std::vector<int> pos(R);
         for (int r = 0; r < R; ++r) pos[r] = p0 + r;
-        std::vector<uint16_t> kh((size_t) kKvHeads * cap * kHeadDim), vh(kh.size());
-        for (auto& x : kh) x = f2h(randn(1, 0.6f)[0]);
-        for (auto& x : vh) x = f2h(randn(1, 1.0f)[0]);
+        std::vector<double> kd((size_t) kKvHeads * cap * kHeadDim), vd(kd.size());   // the cached values as the kernel reads them
+        std::vector<uint16_t> kh(kd.size()), vh(kd.size());
+        std::vector<uint8_t> k8(kd.size()), v8(kd.size());
+        for (size_t i = 0; i < kd.size(); ++i) {
+            const float kf = randn(1, 0.6f)[0], vf = randn(1, 1.0f)[0];
+            if (fp8) {
+                const __nv_fp8_e4m3 a(kf), b(vf);
+                k8[i] = a.__x;
+                v8[i] = b.__x;
+                kd[i] = (double) (float) a;
+                vd[i] = (double) (float) b;
+            } else {
+                kh[i] = f2h(kf);
+                vh[i] = f2h(vf);
+                kd[i] = h2d(kh[i]);
+                vd[i] = h2d(vh[i]);
+            }
+        }
         const std::vector<float> q = randn((size_t) R * kHeads * kHeadDim, 0.8f), rs = randn((size_t) R * kHeads * kRel, 1.0f);
         const std::vector<float> sink = randn((size_t) R * kHeads, 2.0f), table = randn((size_t) kRel * kExtent, 0.3f);
-        uint16_t *dk = dev(kh), *dv = dev(vh);
+        const std::vector<float> gate = randn((size_t) R * kProjQ, 1.5f);
+        void* dk = fp8 ? (void*) dev(k8) : (void*) dev(kh);
+        void* dv = fp8 ? (void*) dev(v8) : (void*) dev(vh);
         float *dq = dev(q), *drs = dev(rs), *dsink = dev(sink), *dt = dev(table), *out = zeros<float>((size_t) R * kHeads * kHeadDim);
+        float* dgate = dev(gate);
         int* dpos = dev(pos);
         AttnArgs a;
-        a.q = dq; a.r = drs; a.sink = dsink; a.rel_table = dt; a.pos = dpos; a.k_cache = dk; a.v_cache = dv; a.cap = cap;
+        a.q = dq; a.r = drs; a.sink = dsink; a.rel_table = dt; a.pos = dpos; a.k_cache = dk; a.v_cache = dv; a.cap = cap; a.fp8 = fp8;
         a.window = window ? kExtent : 0;
         const int64_t max_keys = window ? kExtent : p0 + R;
-        void* scr = zeros<uint8_t>(attention_decode_scratch(R, max_keys));
+        void* scr = zeros<uint8_t>(attention_decode_scratch(R, 1 << 20));
         attention_decode(a, R, max_keys, scr, out, nullptr);
         const std::vector<float> got = host(out, (size_t) R * kHeads * kHeadDim);
         std::vector<double> ref(got.size());
@@ -313,8 +394,7 @@ void test_attention() {
                 double m = sink[(size_t) r * kHeads + h];
                 for (int k = lo; k <= pos[r]; ++k) {
                     double d = 0;
-                    for (int i = 0; i < kHeadDim; ++i)
-                        d += (double) q[((size_t) r * kHeads + h) * kHeadDim + i] * h2d(kh[((size_t) g * cap + k % cap) * kHeadDim + i]);
+                    for (int i = 0; i < kHeadDim; ++i) d += (double) q[((size_t) r * kHeads + h) * kHeadDim + i] * kd[((size_t) (k % cap) * kKvHeads + g) * kHeadDim + i];
                     d *= a.scale;
                     const int dist = pos[r] - k;
                     if (dist < kExtent)
@@ -326,21 +406,49 @@ void test_attention() {
                 for (double& s : sc) den += (s = std::exp(s - m));
                 for (int i = 0; i < kHeadDim; ++i) {
                     double acc = 0;
-                    for (int k = lo; k <= pos[r]; ++k) acc += sc[(size_t) (k - lo)] * h2d(vh[((size_t) g * cap + k % cap) * kHeadDim + i]);
+                    for (int k = lo; k <= pos[r]; ++k) acc += sc[(size_t) (k - lo)] * vd[((size_t) (k % cap) * kKvHeads + g) * kHeadDim + i];
                     ref[((size_t) r * kHeads + h) * kHeadDim + i] = acc / den;
                 }
             }
-        report(window ? "attention (window ring)" : "attention (full, 3k keys)", got, ref, 2e-3);
-        // row 2 alone
+        report(window ? "attention (window ring)" : fp8 ? "attention (full, 3k keys, E4M3)" : "attention (full, 3k keys)", got, ref, 2e-3);
+        // row 2 alone, and under a launch bound of a million keys
         AttnArgs one = a;
         one.q = dq + 2 * kHeads * kHeadDim; one.r = drs + 2 * kHeads * kRel; one.sink = dsink + 2 * kHeads; one.pos = dpos + 2;
         float* out1 = zeros<float>((size_t) kHeads * kHeadDim);
         attention_decode(one, 1, max_keys, scr, out1, nullptr);
-        const std::vector<float> g1 = host(out1, (size_t) kHeads * kHeadDim);
+        std::vector<float> g1 = host(out1, (size_t) kHeads * kHeadDim);
         same_bits("  a row alone", g1.data(), &got[(size_t) 2 * kHeads * kHeadDim], g1.size() * 4);
+        attention_decode(one, 1, 1 << 20, scr, out1, nullptr);
+        g1 = host(out1, (size_t) kHeads * kHeadDim);
+        same_bits("  any launch bound", g1.data(), &got[(size_t) 2 * kHeads * kHeadDim], g1.size() * 4);
+        // gated, and as q8_1 blocks
+        AttnArgs gq = a;
+        gq.gate = dgate + kOffGate;
+        gq.gate_ld = kProjQ;
+        gq.q8 = zeros<uint8_t>((size_t) R * kHeads * kHeadDim / 32 * 36);
+        float* outg = zeros<float>((size_t) R * kHeads * kHeadDim);
+        attention_decode(gq, R, max_keys, scr, outg, nullptr);
+        const std::vector<float> gg = host(outg, (size_t) R * kHeads * kHeadDim);
+        std::vector<float> want(gg.size());
+        for (int r = 0; r < R; ++r)
+            for (int c = 0; c < kHeads * kHeadDim; ++c) {
+                const size_t i = (size_t) r * kHeads * kHeadDim + c;
+                want[i] = got[i] * (1.f / (1.f + std::exp(-gate[(size_t) r * kProjQ + kOffGate + c])));
+            }
+        std::vector<double> wd(want.begin(), want.end());
+        report("  gated", gg, wd, 1e-6);
+        check_q8("  gated, its q8_1 blocks", gq.q8, gg, R, kHeads * kHeadDim);
         const double us = time_us([&] { attention_decode(one, 1, max_keys, scr, out1, nullptr); });
         const double keys = window ? kExtent : p0 + 3;
-        std::printf("  %.1f us a call (1 row, %.0f keys: %.0f GB/s of K and V)\n", us, keys, keys * kKvHeads * kHeadDim * 2 * 2 / us / 1e3);
+        std::printf("  %.1f us a call (1 row, %.0f keys: %.0f GB/s of K and V)\n", us, keys,
+                    keys * kKvHeads * kHeadDim * (fp8 ? 1 : 2) * 2 / us / 1e3);
+        if (mode == 1) {   // a short context: the latency a decode token sees early on
+            std::vector<int> p1 = {40};
+            int* dp1 = dev(p1);
+            AttnArgs s1 = one;
+            s1.pos = dp1;
+            std::printf("  %.1f us a call (1 row, 41 keys)\n", time_us([&] { attention_decode(s1, 1, 1024, scr, out1, nullptr); }));
+        }
     }
 }
 
@@ -448,6 +556,316 @@ void test_softcap() {
     report("softcap", got, ref, 2e-6);
 }
 
+// ---- a decode window's fused glue ---------------------------------------------------------------------------------------
+
+void test_mix_norm() {
+    const int R = 5;
+    for (int n_out : {1, 3}) {
+        const int n = 4;
+        std::vector<std::vector<float>> st(n);
+        std::vector<const std::vector<float>*> sp;
+        MixStates ms;
+        for (int i = 0; i < n; ++i) {
+            st[i] = randn((size_t) R * E, 0.5f + 0.4f * i);
+            ms.s[ms.n++] = dev(st[i]);
+            sp.push_back(&st[i]);
+        }
+        const std::vector<float> q = randn((size_t) n_out * E, 0.05f);
+        std::vector<std::vector<float>> w(3);
+        MixNorm a;
+        a.st = ms;
+        a.queries = dev(q);
+        for (int j = 0; j < n_out; ++j) {
+            w[j] = randn(E, 0.1f, 1.f);
+            a.norm[j] = dev(w[j]);
+            a.q8[j] = zeros<uint8_t>((size_t) R * E / 32 * 36);
+        }
+        a.norm_out = zeros<float>((size_t) R * E);
+        mix_norm(a, n_out, R, nullptr);
+        const std::vector<float> got = host(a.norm_out, (size_t) R * E);
+        std::vector<double> ref(got.size());
+        for (int r = 0; r < R; ++r) {
+            const std::vector<double> y = norm_ref(mix_ref(sp, q.data(), r), w[0]);
+            std::copy(y.begin(), y.end(), ref.begin() + (size_t) r * E);
+        }
+        char name[64];
+        std::snprintf(name, sizeof name, "mix_norm (%d outputs): output 0", n_out);
+        report(name, got, ref, 4e-6);
+        check_q8("  its q8_1 blocks", a.q8[0], got, R, E);
+        if (n_out == 3) {   // output 2 against the reference, through its q8_1 blocks
+            const std::vector<uint8_t> q2 = host(static_cast<uint8_t*>(a.q8[2]), (size_t) R * E / 32 * 36);
+            std::vector<float> deq((size_t) R * E);
+            std::vector<double> r2(deq.size());
+            for (int r = 0; r < R; ++r) {
+                const std::vector<double> y = norm_ref(mix_ref(sp, q.data() + 2 * E, r), w[2]);
+                std::copy(y.begin(), y.end(), r2.begin() + (size_t) r * E);
+            }
+            for (size_t b = 0; b < deq.size() / 32; ++b) {
+                uint16_t dh;
+                std::memcpy(&dh, &q2[b * 36], 2);
+                for (int i = 0; i < 32; ++i) deq[b * 32 + i] = (float) (h2d(dh) * (int8_t) q2[b * 36 + 4 + i]);
+            }
+            report("  output 2 through q8_1", deq, r2, 1.5e-2);
+        }
+        // the mixes as they are: the same bits as attnres_mix
+        MixNorm m2 = a;
+        m2.mix_out = zeros<float>((size_t) n_out * R * E);
+        m2.out_stride = (int64_t) R * E;
+        mix_norm(m2, n_out, R, nullptr);
+        float* old = zeros<float>((size_t) n_out * R * E);
+        attnres_mix(ms, a.queries, n_out, R, 1e-6f, old, (int64_t) R * E, nullptr);
+        {
+            const std::vector<float> mg = host(m2.mix_out, (size_t) n_out * R * E), mo = host(old, (size_t) n_out * R * E);
+            report("  the mixes against attnres_mix", mg, std::vector<double>(mo.begin(), mo.end()), 1e-6);
+        }
+        // row 3 alone
+        MixNorm one = a;
+        for (int i = 0; i < n; ++i) one.st.s[i] = ms.s[i] + 3 * E;
+        float* nrm1 = zeros<float>(E);
+        void* q81 = zeros<uint8_t>(E / 32 * 36);
+        one.norm_out = nrm1;
+        one.q8[0] = q81;
+        mix_norm(one, n_out, 1, nullptr);
+        same_bits("  a row alone", host(nrm1, E).data(), &got[(size_t) 3 * E], (size_t) E * 4);
+        same_bits("  a row alone (q8_1)", host(static_cast<uint8_t*>(q81), E / 32 * 36).data(),
+                  host(static_cast<uint8_t*>(a.q8[0]) + (size_t) 3 * E / 32 * 36, E / 32 * 36).data(), E / 32 * 36);
+        std::printf("  %.1f us a call (1 row, %d states, %d outputs)\n", time_us([&] { mix_norm(one, n_out, 1, nullptr); }), n, n_out);
+    }
+    {   // no query: the last state normed
+        const int R2 = 2;
+        const std::vector<float> x = randn((size_t) R2 * E, 1.3f), w = randn(E, 0.1f, 1.f);
+        MixNorm a;
+        a.st.s[a.st.n++] = dev(x);
+        a.norm[0] = dev(w);
+        a.q8[0] = zeros<uint8_t>((size_t) R2 * E / 32 * 36);
+        a.norm_out = zeros<float>((size_t) R2 * E);
+        mix_norm(a, 1, R2, nullptr);
+        const std::vector<float> got = host(a.norm_out, (size_t) R2 * E);
+        std::vector<double> ref(got.size());
+        for (int r = 0; r < R2; ++r) {
+            const std::vector<double> y = norm_ref(std::vector<double>(x.begin() + (size_t) r * E, x.begin() + (size_t) (r + 1) * E), w);
+            std::copy(y.begin(), y.end(), ref.begin() + (size_t) r * E);
+        }
+        report("mix_norm (no query)", got, ref, 2e-6);
+    }
+}
+
+void test_controllers() {
+    const int R = 3, S = 3, rank = 64;
+    std::vector<std::vector<float>> dest(S), msg(S), nw(S);
+    std::vector<std::vector<uint16_t>> down(S), up(S);
+    CtrlArgs a;
+    a.rank = rank;
+    a.scratch = zeros<float>(ctrl_scratch_floats(rank));
+    auto bf16 = [](float f) {
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        return (uint16_t) ((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+    };
+    auto bf2d = [](uint16_t h) {
+        const uint32_t u = (uint32_t) h << 16;
+        float f;
+        std::memcpy(&f, &u, 4);
+        return (double) f;
+    };
+    for (int s = 0; s < S; ++s) {
+        dest[s] = randn((size_t) R * E, 0.8f + 0.2f * s);
+        msg[s] = randn((size_t) R * E, 1.2f);
+        nw[s] = randn(E, 0.1f, 1.f);
+        const std::vector<float> d = randn((size_t) rank * 2 * E, 0.02f), u = randn((size_t) 2 * E * rank, 0.3f);
+        for (float f : d) down[s].push_back(bf16(f));
+        for (float f : u) up[s].push_back(bf16(f));
+        a.dest[s] = dev(dest[s]);
+        a.msg[s] = dev(msg[s]);
+        a.down[s] = dev(down[s]);
+        a.up[s] = dev(up[s]);
+        a.norm[s] = dev(nw[s]);
+        a.q8[s] = zeros<uint8_t>((size_t) R * E / 32 * 36);
+    }
+    a.norm_out = zeros<float>((size_t) R * E);
+    controllers(a, S, R, nullptr);
+    const std::vector<float> got = host(a.norm_out, (size_t) R * E);
+    auto ref_of = [&](int s, int r) {
+        double sa = 0, sb = 0;
+        for (int c = 0; c < E; ++c) {
+            sa += (double) dest[s][(size_t) r * E + c] * dest[s][(size_t) r * E + c];
+            sb += (double) msg[s][(size_t) r * E + c] * msg[s][(size_t) r * E + c];
+        }
+        const double ia = 1 / std::sqrt(sa / E + 1e-6), ib = 1 / std::sqrt(sb / E + 1e-6);
+        std::vector<double> hid(rank, 0.0), y(E);
+        for (int o = 0; o < rank; ++o)
+            for (int c = 0; c < E; ++c)
+                hid[o] += bf2d(down[s][(size_t) o * 2 * E + c]) * dest[s][(size_t) r * E + c] * ia +
+                          bf2d(down[s][(size_t) o * 2 * E + E + c]) * msg[s][(size_t) r * E + c] * ib;
+        for (int c = 0; c < E; ++c) {
+            double g = 0, f = 0;
+            for (int k = 0; k < rank; ++k) {
+                g += bf2d(up[s][(size_t) c * rank + k]) * hid[k];
+                f += bf2d(up[s][(size_t) (E + c) * rank + k]) * hid[k];
+            }
+            y[c] = (1 - std::tanh(f)) * dest[s][(size_t) r * E + c] + std::tanh(g) * msg[s][(size_t) r * E + c];
+        }
+        return norm_ref(y, nw[s]);
+    };
+    std::vector<double> ref(got.size());
+    for (int r = 0; r < R; ++r) {
+        const std::vector<double> y = ref_of(0, r);
+        std::copy(y.begin(), y.end(), ref.begin() + (size_t) r * E);
+    }
+    report("controllers: stream 0", got, ref, 2e-5);
+    check_q8("  its q8_1 blocks", a.q8[0], got, R, E);
+    {   // stream 2 through its q8_1 blocks
+        const std::vector<uint8_t> q2 = host(static_cast<uint8_t*>(a.q8[2]), (size_t) R * E / 32 * 36);
+        std::vector<float> deq((size_t) R * E);
+        std::vector<double> r2(deq.size());
+        for (int r = 0; r < R; ++r) {
+            const std::vector<double> y = ref_of(2, r);
+            std::copy(y.begin(), y.end(), r2.begin() + (size_t) r * E);
+        }
+        for (size_t b = 0; b < deq.size() / 32; ++b) {
+            uint16_t dh;
+            std::memcpy(&dh, &q2[b * 36], 2);
+            for (int i = 0; i < 32; ++i) deq[b * 32 + i] = (float) (h2d(dh) * (int8_t) q2[b * 36 + 4 + i]);
+        }
+        report("  stream 2 through q8_1", deq, r2, 1.5e-2);
+    }
+    CtrlArgs one = a;   // row 1 alone
+    for (int s = 0; s < S; ++s) {
+        one.dest[s] = a.dest[s] + E;
+        one.msg[s] = a.msg[s] + E;
+        one.q8[s] = zeros<uint8_t>(E / 32 * 36);
+    }
+    one.norm_out = zeros<float>(E);
+    controllers(one, S, 1, nullptr);
+    same_bits("  a row alone", host(one.norm_out, E).data(), &got[E], (size_t) E * 4);
+    std::printf("  %.1f us a call (1 row, 3 streams)\n", time_us([&] { controllers(one, S, 1, nullptr); }));
+}
+
+void test_decode_prepare() {
+    for (bool full : {false, true}) {
+        const int R = 4, p0 = full ? 9000 : 1;
+        const int64_t cap = full ? 9100 : kExtent + 8;
+        std::vector<int> pos(R);
+        for (int r = 0; r < R; ++r) pos[r] = p0 + r;
+        // the projections as one [rows][kProj] array (the stride of a single product over all rows)
+        const std::vector<float> y = randn((size_t) R * kProj, 1.5f);
+        const std::vector<float> kc = randn(1024 * kConv, 0.3f), vc = randn(1024 * kConv, 0.3f);
+        const std::vector<float> qs = randn(kHeads * kHeadDim, 0.2f, 1.f), rs = randn(kHeads * kRel, 0.2f, 1.f);
+        const std::vector<float> kr = randn((size_t) kConvRing * 1024, 2.0f), vr = randn((size_t) kConvRing * 1024, 0.6f);
+        float* dy = dev(y);
+        int* dpos = dev(pos);
+        AttnPrep a;
+        a.yq = dy; a.yk = dy + kProjQ; a.yv = dy + kProjQ + kProjKV; a.ldq = a.ldk = a.ldv = kProj;
+        a.pos = dpos; a.full = full; a.k_conv = dev(kc); a.v_conv = dev(vc); a.q_scale = dev(qs); a.r_scale = dev(rs);
+        a.cap = cap;
+        AttnPrep b = a;
+        for (AttnPrep* x : {&a, &b}) {
+            x->k_ring = dev(kr); x->v_ring = dev(vr);
+            x->k_cache = zeros<uint16_t>((size_t) kKvHeads * cap * kHeadDim); x->v_cache = zeros<uint16_t>((size_t) kKvHeads * cap * kHeadDim);
+            x->q = zeros<float>((size_t) R * kHeads * kHeadDim); x->r = zeros<float>((size_t) R * kHeads * kRel); x->sink = zeros<float>((size_t) R * kHeads);
+        }
+        decode_prepare(a, R, nullptr);
+        attn_prepare(b, R, nullptr);
+        cudaDeviceSynchronize();
+        const size_t kvb = (size_t) kKvHeads * cap * kHeadDim * 2;
+        const char* tag = full ? "decode_prepare (full)" : "decode_prepare (window)";
+        bool same = !std::memcmp(host((uint8_t*) a.k_cache, kvb).data(), host((uint8_t*) b.k_cache, kvb).data(), kvb) &&
+                    !std::memcmp(host((uint8_t*) a.v_cache, kvb).data(), host((uint8_t*) b.v_cache, kvb).data(), kvb) &&
+                    host(a.q, (size_t) R * kHeads * kHeadDim) == host(b.q, (size_t) R * kHeads * kHeadDim) &&
+                    host(a.r, (size_t) R * kHeads * kRel) == host(b.r, (size_t) R * kHeads * kRel) &&
+                    host(a.sink, (size_t) R * kHeads) == host(b.sink, (size_t) R * kHeads) &&
+                    host(a.k_ring, (size_t) kConvRing * 1024) == host(b.k_ring, (size_t) kConvRing * 1024) &&
+                    host(a.v_ring, (size_t) kConvRing * 1024) == host(b.v_ring, (size_t) kConvRing * 1024);
+        std::printf("%-34s %s\n", tag, same ? "bitwise = attn_prepare" : "FAIL");
+        failures += !same;
+        if (!full) std::printf("  %.1f us a call (1 row)\n", time_us([&] { decode_prepare(a, 1, nullptr); }));
+    }
+}
+
+void test_post_attn() {
+    for (bool boundary : {false, true}) {
+        for (bool mix_only : {false, true}) {
+            const int R = 4, nb = 2;
+            std::vector<int> pos = {70, 71, 72, 73};
+            const std::vector<float> o = randn((size_t) R * E, 0.4f), taps = randn((size_t) E * kConv, 0.3f),
+                                     ring = randn((size_t) kConvRing * E, 0.4f), hid = randn((size_t) R * E, 1.0f), q = randn(E, 0.05f),
+                                     w = randn(E, 0.1f, 1.f);
+            std::vector<std::vector<float>> blocks(nb);
+            PostAttn a;
+            for (int i = 0; i < nb; ++i) {
+                blocks[i] = randn((size_t) R * E, 0.7f + 0.5f * i);
+                a.blocks[a.n_blocks++] = dev(blocks[i]);
+            }
+            a.o = dev(o); a.pos = dev(pos); a.taps = dev(taps); a.ring = dev(ring); a.hid = dev(hid); a.boundary = boundary;
+            a.resid = zeros<float>((size_t) R * E); a.query = dev(q); a.norm = dev(w);
+            a.q8 = zeros<uint8_t>((size_t) R * E / 32 * 36); a.norm_out = zeros<float>((size_t) R * E);
+            if (mix_only) a.mix_out = zeros<float>((size_t) R * E);
+            post_attn(a, R, nullptr);
+            const std::vector<float> res = host(a.resid, (size_t) R * E);
+            std::vector<double> rres(res.size());
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < E; ++c) {
+                    double acc = 0;
+                    for (int j = 0; j < kConv; ++j) acc += (double) taps[(size_t) c * kConv + (kConv - 1 - j)] * conv_input(o, E, ring, E, pos, r, j, c);
+                    rres[(size_t) r * E + c] = (acc + o[(size_t) r * E + c]) / std::sqrt(5.0) + (boundary ? 0.0 : hid[(size_t) r * E + c]);
+                }
+            char name[80];
+            std::snprintf(name, sizeof name, "post_attn%s%s: residual", boundary ? " (boundary)" : "", mix_only ? " (mix)" : "");
+            report(name, res, rres, 2e-6);
+            std::vector<const std::vector<float>*> sp;
+            for (auto& b : blocks) sp.push_back(&b);
+            if (boundary) sp.push_back(&hid);
+            sp.push_back(&res);
+            std::vector<double> ref((size_t) R * E);
+            for (int r = 0; r < R; ++r) {
+                std::vector<double> y = mix_ref(sp, q.data(), r);
+                if (!mix_only) y = norm_ref(y, w);
+                std::copy(y.begin(), y.end(), ref.begin() + (size_t) r * E);
+            }
+            const std::vector<float> got = host(mix_only ? a.mix_out : a.norm_out, (size_t) R * E);
+            report(mix_only ? "  the MLP's mix" : "  the MLP's normed input", got, ref, 4e-6);
+            if (!mix_only) check_q8("  its q8_1 blocks", a.q8, got, R, E);
+            const std::vector<float> nr = host(a.ring, (size_t) kConvRing * E);
+            bool ring_ok = true;
+            for (int r = 0; r < R; ++r) ring_ok = ring_ok && !std::memcmp(&nr[(size_t) (pos[r] % kConvRing) * E], &o[(size_t) r * E], E * 4);
+            std::printf("%-34s %s\n", "  the ring", ring_ok ? "ok" : "FAIL");
+            failures += !ring_ok;
+            if (!boundary && !mix_only) {   // row 2 alone (its window rows before it read from a ring holding them)
+                std::vector<float> ring2 = ring;
+                for (int r = 0; r < 2; ++r) std::memcpy(&ring2[(size_t) (pos[r] % kConvRing) * E], &o[(size_t) r * E], E * 4);
+                PostAttn one = a;
+                one.o = a.o + 2 * E; one.pos = a.pos + 2; one.ring = dev(ring2); one.hid = a.hid + 2 * E;
+                for (int i = 0; i < nb; ++i) one.blocks[i] = a.blocks[i] + 2 * E;
+                one.resid = zeros<float>(E); one.norm_out = zeros<float>(E); one.q8 = zeros<uint8_t>(E / 32 * 36);
+                post_attn(one, 1, nullptr);
+                same_bits("  a row alone", host(one.norm_out, E).data(), &got[(size_t) 2 * E], (size_t) E * 4);
+                std::printf("  %.1f us a call (1 row, %d blocks)\n", time_us([&] { post_attn(one, 1, nullptr); }), nb);
+            }
+        }
+    }
+}
+
+void test_moe_finish() {
+    const int R = 4, K = 8;
+    std::vector<int> pos = {130, 131, 132, 133};
+    const std::vector<float> rows = randn((size_t) R * K * E, 0.3f), w = randn((size_t) R * K, 0.3f, 1.f), taps = randn((size_t) E * kConv, 0.3f),
+                             ring = randn((size_t) kConvRing * E, 0.4f), resid = randn((size_t) R * E, 1.0f);
+    MoeFinish a;
+    a.rows = dev(rows); a.w = dev(w); a.k = K; a.pos = dev(pos); a.taps = dev(taps); a.ring = dev(ring); a.resid = dev(resid);
+    a.out = zeros<float>((size_t) R * E);
+    moe_finish(a, R, nullptr);
+    // the kernels it replaces: moe_combine, then post_conv with the residual
+    float *y = zeros<float>((size_t) R * E), *out2 = zeros<float>((size_t) R * E), *ring2 = dev(ring);
+    moe_combine(a.rows, a.w, R, K, y, nullptr);
+    post_conv(y, a.pos, a.taps, ring2, a.resid, R, out2, nullptr);
+    const std::vector<float> got = host(a.out, (size_t) R * E);
+    same_bits("moe_finish = moe_combine + post_conv", got.data(), host(out2, (size_t) R * E).data(), (size_t) R * E * 4);
+    same_bits("  the ring", host(a.ring, (size_t) kConvRing * E).data(), host(ring2, (size_t) kConvRing * E).data(), (size_t) kConvRing * E * 4);
+    MoeFinish one = a;
+    one.rows = a.rows + (size_t) 3 * K * E; one.w = a.w + 3 * K; one.pos = a.pos + 3; one.resid = a.resid + 3 * E; one.out = zeros<float>(E);
+    std::printf("  %.1f us a call (1 row)\n", time_us([&] { moe_finish(one, 1, nullptr); }));
+}
+
 }  // namespace
 
 int main() {
@@ -463,6 +881,11 @@ int main() {
     test_post_conv();
     test_experts();
     test_softcap();
+    test_mix_norm();
+    test_controllers();
+    test_decode_prepare();
+    test_post_attn();
+    test_moe_finish();
     std::printf("inkling2_kernels_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }
