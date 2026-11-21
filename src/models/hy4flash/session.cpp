@@ -692,8 +692,11 @@ public:
         return true;
     }
 
-    std::string info_words() const override { return tier_ ? "expert_slots=" + std::to_string(tier_->gpu_slots()) + " expert_slots_primary=" + std::to_string(tier_->slots()) + " ram_experts_mib=" + std::to_string(tier_->ram_bytes() >> 20)
-                                     : std::string(); }
+    std::string info_words() const override {
+        const std::string kv = m_.cache_fp8() ? "kv=fp8" : "kv=fp16";   // what a community row records
+        return tier_ ? "expert_slots=" + std::to_string(tier_->gpu_slots()) + " expert_slots_primary=" + std::to_string(tier_->slots()) + " ram_experts_mib=" + std::to_string(tier_->ram_bytes() >> 20) + " " + kv
+                     : kv;
+    }
 
     // SLEEP / WAKE: the tier's card slots go back to the card (every expert keeps its RAM copy and its slot is remembered), and
     // return at the wake. The latent caches, the rings and the drafter's rows are conversation state and stay.
