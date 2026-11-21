@@ -166,11 +166,33 @@ using prep::conv_in;
 // ---- mixes -------------------------------------------------------------------------------------------------------------
 
 // Block (row, output q): the mix scored by query q (or the last state), then its norm into q8_1, or the mix as it is.
+// The older key/value cells of a visit's attention into L2 (MixNorm's kv_*): the block's threads request 32 KiB pieces of
+// the one or two runs (the ring may wrap) of the keys and of the values.
+__device__ __forceinline__ void kv_read_ahead(const MixNorm& a) {
+    const int p0 = a.kv_pos[0];
+    const int lo = a.kv_window > 0 ? max(0, p0 - a.kv_window + 1) : 0;
+    const int n = p0 - lo;
+    if (n <= 0 || n > 1024) return;
+    const int64_t c0 = lo % a.kv_cap, run1 = min((int64_t) n, a.kv_cap - c0), run2 = n - run1;
+    const uint64_t b1 = (uint64_t) run1 * a.kv_cell, b2 = (uint64_t) run2 * a.kv_cell;
+    constexpr uint64_t kPiece = 32768;
+    const uint64_t n1 = (b1 + kPiece - 1) / kPiece, n2 = (b2 + kPiece - 1) / kPiece;
+    for (uint64_t j = threadIdx.x; j < 2 * (n1 + n2); j += blockDim.x) {
+        const char* base = (const char*) (j < n1 + n2 ? a.kv_k : a.kv_v);
+        const uint64_t i = j % (n1 + n2);
+        const uint64_t start = i < n1 ? (uint64_t) c0 * a.kv_cell + i * kPiece : (i - n1) * kPiece;
+        const uint64_t end = i < n1 ? (uint64_t) c0 * a.kv_cell + b1 : b2;
+        const uint64_t take = min(kPiece, end - start);
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(base + start), "r"((unsigned) take) : "memory");
+    }
+}
+
 __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
     const int r = blockIdx.x, q = blockIdx.y, n = a.st.n;
     float qv[1][kPer], nw[kPer];   // the weights, read while the kernel before finishes
     if (a.queries) load_row(a.queries + (size_t) q * kWidth, qv[0]);
     if (!a.mix_out) load_row(a.norm[q], nw);
+    if (a.kv_k && r == 0 && q == 0) kv_read_ahead(a);   // constant through the window: before the wait
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     __shared__ float red[kMaxMix * 2 * (kWarpsB + 1)];
