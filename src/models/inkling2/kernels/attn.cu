@@ -587,16 +587,23 @@ void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t m
         attention_decode(a, rows, max_keys, scratch, nullptr, stream);
         return;
     }
-    static bool attr = false;
-    if (!attr) {
-        cudaFuncSetAttribute(attn_fused_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem));
-        cudaFuncSetAttribute(attn_fused_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem));
-        attr = true;
+    // a block an SM: each block asks for more than half of an SM's shared memory (it uses sizeof(FusedSmem)), so a
+    // cluster's blocks spread over as many SMs instead of sharing them two by two through the preparation and the tile,
+    // while the products' small blocks still fit beside one
+    static size_t smem = 0;
+    if (!smem) {
+        int dev = 0, per_sm = 0, reserved = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
+        cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev);
+        smem = std::max(sizeof(FusedSmem), (size_t) std::max(0, per_sm / 2 - reserved + 128));
+        cudaFuncSetAttribute(attn_fused_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
     }
     const dim3 grid((unsigned) rows, kKvHeads, kClusterSplits);
     cudaStream_t s = (cudaStream_t) stream;
-    if (a.fp8) bk::launch_pdl(attn_fused_kernel<true>, grid, dim3(kWarps * 32), sizeof(FusedSmem), s, pa, a);
-    else bk::launch_pdl(attn_fused_kernel<false>, grid, dim3(kWarps * 32), sizeof(FusedSmem), s, pa, a);
+    if (a.fp8) bk::launch_pdl(attn_fused_kernel<true>, grid, dim3(kWarps * 32), smem, s, pa, a);
+    else bk::launch_pdl(attn_fused_kernel<false>, grid, dim3(kWarps * 32), smem, s, pa, a);
     check("attention_window");
 }
 
