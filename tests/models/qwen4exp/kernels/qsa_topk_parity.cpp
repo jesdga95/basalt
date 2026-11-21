@@ -29,7 +29,7 @@ void ck(cudaError_t e, const char* w) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e)); std::exit(2); }
 }
 
-bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted) {
+bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted, bool require_cluster = false) {
     const k::QsaShapes s = k::qsa_real_shapes();
     const int64_t max_blocks = capacity / s.idx_block + 2, cap = k::qsa_selection_width(k::kTopkMaxCells, s);
     std::vector<int32_t> steps((size_t) (nq * k::kStepCount));
@@ -67,7 +67,14 @@ bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted)
         ck(cudaMemset(ids_ref, 0xff, a.size() * 4), "memset");
         ck(cudaMemset(ids_new, 0xff, a.size() * 4), "memset");
         k::qsa_block_topk_ref(d_scores, d_steps, nq, max_blocks, cap, s, ids_ref, nullptr);
-        k::qsa_block_topk(d_scores, d_steps, nq, max_blocks, cap, s, ids_new, nullptr, active);
+        if (require_cluster) {
+            if (!k::qsa_block_topk_cluster(d_scores, d_steps, nq, max_blocks, cap, s, ids_new, nullptr)) {
+                std::fprintf(stderr, "cluster refused the requested score capacity\n");
+                return -1;
+            }
+        } else {
+            k::qsa_block_topk(d_scores, d_steps, nq, max_blocks, cap, s, ids_new, nullptr, active);
+        }
         ck(cudaDeviceSynchronize(), "sync");
         ck(cudaMemcpy(a.data(), ids_ref, a.size() * 4, cudaMemcpyDeviceToHost), "down");
         ck(cudaMemcpy(b.data(), ids_new, b.size() * 4, cudaMemcpyDeviceToHost), "down");
@@ -107,6 +114,13 @@ bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted)
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--cluster-512k") == 0) {
+        bool ok = true;
+        for (const int64_t context : {9000, 262144, 524288}) {
+            ok = run_case(context, 8, 24, 524288, false, true) && ok;
+        }
+        return ok ? 0 : 1;
+    }
     if (argc > 1 && std::strcmp(argv[1], "--selftest") == 0) {
         // {context, capacity}: both sides of the register kernel's reach (33,792 blocks = 135,168 cells), short
         // contexts under a long capacity (fewer blocks than the kernel's threads; a prompt batch below the dispatch's
