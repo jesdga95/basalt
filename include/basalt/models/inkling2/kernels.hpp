@@ -126,7 +126,12 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 /// supplies its row). ptr [k rows], start [k rows + 2], n_groups [1], dst and tok [k rows]. rows * k <= 1024. With
 /// `tally` [n_expert], each expert on the card adds its pairs to its entry (the console's expert map).
 void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* blobs, unsigned long long* ptr,
-              int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream, uint32_t* tally = nullptr);
+              int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream, uint32_t* tally = nullptr,
+              unsigned long long* rec_blobs = nullptr, int32_t* rec_n = nullptr);
+constexpr int kAheadExperts = 8;   ///< the groups of a visit moe_plan records (rec_blobs, rec_n) for the next window
+/// Requests into L2 the first `bytes` of each of the *n blobs (moe_plan's record of a visit), 32 blocks each keeping one
+/// 128 KiB step in flight: run on a side stream while the glue before the experts runs; reads only.
+void expert_read_ahead(const unsigned long long* blobs, const int32_t* n, uint64_t bytes, void* stream);
 /// y[r] = sum_slot w[r][slot] * out[r * k + slot] in slot order (fp32).
 void moe_combine(const float* out, const float* w, int rows, int k, float* y, void* stream);
 

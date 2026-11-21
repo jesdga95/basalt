@@ -70,11 +70,17 @@ public:
         for (void* p : pinned_) cudaFreeHost(p);
         for (cudaEvent_t e : stage_ev_)
             if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : {ra_ev_, ra_join_})
+            if (e) cudaEventDestroy(e);
+        if (ra_st_) cudaStreamDestroy(ra_st_);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
     bool init(std::string& err) {
-        if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
+        if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&ra_st_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ra_ev_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ra_join_, cudaEventDisableTiming) != cudaSuccess) {
             err = "cannot create a stream";
             return false;
         }
@@ -132,6 +138,8 @@ public:
         ex_scr_ = alloc(bk::native_expert_scratch_bytes(pairs, g_.n_ff_exp), ok);
         ex_rows_ = f(pairs * E);
         ex_tally_ = (uint32_t*) alloc((size_t) expert_pairs() * 4, ok);
+        rec_blobs_ = (unsigned long long*) alloc((size_t) g_.visits.size() * kAheadExperts * 8, ok);
+        rec_n_ = (int32_t*) alloc((size_t) g_.visits.size() * 4, ok);
         logits_ = f(R * (int64_t) g_.n_vocab);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxRows, g_.n_vocab) + R * (bk::kLogprobStride + 1));
         pick_ = (int32_t*) alloc(4 * 32, ok);
@@ -153,6 +161,7 @@ public:
             cudaMemsetAsync(c.m_ring, 0, (size_t) kConvRing * E * 4, stream_);
         }
         if (ok) cudaMemsetAsync(ex_tally_, 0, (size_t) expert_pairs() * 4, stream_);
+        if (ok) cudaMemsetAsync(rec_n_, 0, (size_t) g_.visits.size() * 4, stream_);
         cudaStreamSynchronize(stream_);
         if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(kMaxRows, kPromptChunk), m_.flags().diag_dump, err))   // DSPARK HOOK
             return false;
@@ -598,6 +607,16 @@ private:
         aa.q8 = xo_;
         attention_window(ap, aa, rows, c.ring ? (int64_t) g_.window : full_keys, att_scr_, stream_);
         bk::native_q8_0_mmvq(w.out, xo_, o_, kOutRows, E, rows, stream_);
+        // the experts this visit took in the window before into L2 on the side stream, while the glue before the experts
+        // runs (it starts once the output projection is done)
+        const int vi = (int) (&v - g_.visits.data());
+        {
+            const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
+            cudaEventRecord(ra_ev_, stream_);
+            cudaStreamWaitEvent(ra_st_, ra_ev_, 0);
+            expert_read_ahead(rec_blobs_ + (size_t) vi * kAheadExperts, rec_n_ + vi, (uint64_t) Lx.down_off & ~(uint64_t) 15, ra_st_);
+            ra_on_ = true;
+        }
         // the attention's convolution and the residual (a block's first layer starts a new sum), then the MLP's input
         PostAttn pa;
         pa.o = o_;
@@ -638,7 +657,7 @@ private:
         ra.gate = bk::RouterGate::Sigmoid;
         bk::router(nrm_, w.router, w.router_bias, rows, ra, rlog_, ids_, rw_, stream_);
         moe_plan(ids_, rows, g_.n_used, g_.n_expert, w.blob_table, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, stream_,
-                 ex_tally_ + (size_t) l * g_.n_expert);
+                 ex_tally_ + (size_t) l * g_.n_expert, rec_blobs_ + (size_t) vi * kAheadExperts, rec_n_ + vi);
         bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
         L.gate_softcap = g_.gate_softcap;
         L.up_softcap = g_.up_softcap;
@@ -709,6 +728,15 @@ private:
     // Launches only: the visits, then the head. Each kernel may start while the one before it finishes (it waits for it
     // before reading what it wrote), so a product streams its first weights during the glue before it.
     void body(int rows, int head, int64_t full_keys) {
+        ra_on_ = false;
+        visits_and_head(rows, head, full_keys);
+        if (ra_on_) {   // the read-ahead stream joins the window's
+            cudaEventRecord(ra_join_, ra_st_);
+            cudaStreamWaitEvent(stream_, ra_join_, 0);
+        }
+    }
+
+    void visits_and_head(int rows, int head, int64_t full_keys) {
         bk::PdlScope pdl(true);
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
@@ -839,6 +867,11 @@ private:
     void* ex_scr_ = nullptr;
     float *ex_rows_ = nullptr, *logits_ = nullptr;
     uint32_t* ex_tally_ = nullptr;           // [layer][expert] the card's running count of each expert's lookups
+    unsigned long long* rec_blobs_ = nullptr;   // [visit][kAheadExperts] the experts each visit took in the last window
+    int32_t* rec_n_ = nullptr;                  // [visit] how many
+    cudaStream_t ra_st_ = nullptr;              // the experts' read-ahead stream, its fork and join events
+    cudaEvent_t ra_ev_ = nullptr, ra_join_ = nullptr;
+    bool ra_on_ = false;
     std::vector<uint32_t> tally_h_;
     ResidentExpertMap map_;
     int64_t lookups_ = 0;                    // decode's routed lookups so far

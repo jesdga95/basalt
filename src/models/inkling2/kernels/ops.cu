@@ -274,7 +274,8 @@ __global__ void post_conv_kernel(const float* __restrict__ x, const int32_t* __r
 // expert (the rows' order). The blob table (constant) is staged in shared memory before pdl_wait.
 __global__ void moe_plan_kernel(const int32_t* __restrict__ ids, int n, int n_expert, const unsigned long long* __restrict__ blobs,
                                 unsigned long long* __restrict__ ptr, int32_t* __restrict__ start, int32_t* __restrict__ n_groups,
-                                int32_t* __restrict__ dst, int32_t* __restrict__ tok, int k, uint32_t* __restrict__ tally) {
+                                int32_t* __restrict__ dst, int32_t* __restrict__ tok, int k, uint32_t* __restrict__ tally,
+                                unsigned long long* __restrict__ rec_blobs, int32_t* __restrict__ rec_n) {
     extern __shared__ unsigned long long smb[];
     unsigned long long* blob = smb;                                // [n_expert]
     int32_t* count = reinterpret_cast<int32_t*>(smb + n_expert);   // [n_expert]
@@ -319,6 +320,11 @@ __global__ void moe_plan_kernel(const int32_t* __restrict__ ids, int n, int n_ex
         }
     }
     __syncthreads();
+    if (rec_blobs && threadIdx.x < kAheadExperts) {   // the window's first groups, for the next window's read-ahead
+        const int ng = *n_groups;
+        rec_blobs[threadIdx.x] = (int) threadIdx.x < ng ? ptr[threadIdx.x] : 0ull;
+        if (threadIdx.x == 0) *rec_n = ng < kAheadExperts ? ng : kAheadExperts;
+    }
     if (tally)   // a reduction (its result unused), so no thread waits on the load a plain add would make
         for (int e = threadIdx.x; e < n_expert; e += blockDim.x)
             if (count[e]) atomicAdd(&tally[e], (uint32_t) count[e]);
@@ -331,6 +337,32 @@ __global__ void moe_plan_kernel(const int32_t* __restrict__ ids, int n, int n_ex
         dst[at] = i;
         tok[at] = i / k;
     }
+}
+
+constexpr int kAheadBlocks = 32;
+constexpr uint64_t kAheadStep = 128 << 10;
+// Block b requests steps b, b + blocks, ... of the blobs' first `bytes` laid end to end, 32 KiB at a time, then reads the
+// step's last 16 bytes, so each block keeps one step in flight.
+__global__ void __launch_bounds__(32) expert_read_ahead_kernel(const unsigned long long* __restrict__ blobs, const int32_t* __restrict__ n,
+                                                               uint64_t bytes) {
+    if (threadIdx.x != 0) return;
+    const uint64_t total = (uint64_t) *n * bytes;
+    uint32_t acc = 0;
+    for (uint64_t o0 = (uint64_t) blockIdx.x * kAheadStep; o0 < total; o0 += (uint64_t) gridDim.x * kAheadStep) {
+        const uint64_t o1 = min(o0 + kAheadStep, total);
+        const char* last = nullptr;
+        for (uint64_t o = o0; o < o1;) {
+            const uint64_t i = o / bytes, ro = o - i * bytes;
+            const uint64_t take = min(min(o1 - o, bytes - ro), (uint64_t) 32768);
+            const char* src = (const char*) blobs[i] + ro;
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"((unsigned) take) : "memory");
+            last = src + take - 16;
+            o += take;
+        }
+        const uint4 w = __ldcg((const uint4*) last);
+        acc ^= w.x ^ w.y ^ w.z ^ w.w;
+    }
+    if (acc == 0x9e3779b9u && total == 1) asm volatile("" ::"r"(acc));   // keeps the reads
 }
 
 __global__ void moe_combine_kernel(const float* __restrict__ out, const float* __restrict__ w, int k, float* __restrict__ y) {
@@ -408,14 +440,21 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
     check("post_conv/ring");
 }
 
+void expert_read_ahead(const unsigned long long* blobs, const int32_t* n, uint64_t bytes, void* stream) {
+    if (bytes == 0 || bytes % 16) throw std::runtime_error("inkling2 expert_read_ahead: bytes");
+    expert_read_ahead_kernel<<<kAheadBlocks, 32, 0, (cudaStream_t) stream>>>(blobs, n, bytes);
+    check("expert_read_ahead");
+}
+
 void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* blobs, unsigned long long* ptr,
-              int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream, uint32_t* tally) {
+              int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream, uint32_t* tally,
+              unsigned long long* rec_blobs, int32_t* rec_n) {
     const int n = rows * k;
     if (n <= 0) return;
     if (n > 1024) throw std::runtime_error("inkling2 moe_plan: more than 1024 pairs");
     bk::launch_pdl(moe_plan_kernel, dim3(1), dim3(256), (size_t) n_expert * (sizeof(unsigned long long) + 2 * sizeof(int32_t)),
                    (cudaStream_t) stream, ids, n,
-                   n_expert, blobs, ptr, start, n_groups, dst, tok, k, tally);
+                   n_expert, blobs, ptr, start, n_groups, dst, tok, k, tally, rec_blobs, rec_n);
     check("moe_plan");
 }
 
