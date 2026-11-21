@@ -310,21 +310,23 @@ __global__ void __launch_bounds__(kHeadDim) attn_combine_kernel(AttnArgs a, int 
 // attn_combine_kernel does: the same arithmetic in the same order as the three kernels. A longer window keeps the three:
 // each block would prepare up to all of its rows, and a cluster holds its idle slices' blocks.
 constexpr int kClusterSplits = 8;
-constexpr int kFusedRows = 2;
+constexpr int kFusedRows = 3;
 
+// ROWS: the window rows a block may prepare (2 for windows of 1-2 rows, 3 for 3)
+template <int ROWS>
 struct FusedSmem {
     Smem s;
-    alignas(16) uint8_t kw[kFusedRows][kHeadDim * 2];   // the window's rows' keys in the cache's format (fp16 or E4M3)
-    alignas(16) uint8_t vw[kFusedRows][kHeadDim * 2];
-    float pm[kGroup], pl[kGroup];                      // the slice's merged maximum and sum of each head
+    alignas(16) uint8_t kw[ROWS][kHeadDim * 2];   // the window's rows' keys in the cache's format (fp16 or E4M3)
+    alignas(16) uint8_t vw[ROWS][kHeadDim * 2];
+    float pm[kGroup], pl[kGroup];                 // the slice's merged maximum and sum of each head
     float pacc[kGroup][kHeadDim];
 };
 
-template <bool FP8>
+template <bool FP8, int ROWS>
 __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps * 32) attn_fused_kernel(AttnPrep pa, AttnArgs a) {
     namespace cg = cooperative_groups;
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    FusedSmem& fs = *reinterpret_cast<FusedSmem*>(smem_raw);
+    FusedSmem<ROWS>& fs = *reinterpret_cast<FusedSmem<ROWS>*>(smem_raw);
     Smem& sm = fs.s;
     const int r = blockIdx.x, g = blockIdx.y, s = blockIdx.z;
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -375,10 +377,10 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
             // the window's rows of this slice up to the block's own: both prepared from one round of loads
             const int rr0 = max(0, s_lo - p0), nr = min(r, s_hi - 1 - p0) - rr0 + 1;
             if (nr > 0) {
-                float val[2][4], raw[2][4], f[2];
-                prep::kv_rows2(pa, rr0, nr, p0 + rr0, g, w, lane, wt, val, raw, f);
+                float val[ROWS][4], raw[ROWS][4], f[ROWS];
+                prep::kv_rows<ROWS>(pa, rr0, nr, p0 + rr0, g, w, lane, wt, val, raw, f);
 #pragma unroll
-                for (int k = 0; k < 2; ++k) {
+                for (int k = 0; k < ROWS; ++k) {
                     if (k >= nr) break;
                     const int rr = rr0 + k;
                     uint8_t* row = w ? fs.vw[rr] : fs.kw[rr];
@@ -531,7 +533,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
 #pragma unroll
         for (int q = 0; q < kClusterSplits; ++q)
             if (q < splits) {
-                const FusedSmem* part = cluster.map_shared_rank(&fs, q);
+                const FusedSmem<ROWS>* part = cluster.map_shared_rank(&fs, q);
                 pm[q] = part->pm[h];
                 pl[q] = part->pl[h];
                 pv[q] = part->pacc[h][d];
@@ -602,23 +604,30 @@ void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t m
         attention_decode(a, rows, max_keys, scratch, nullptr, stream);
         return;
     }
-    // a block an SM: each block asks for more than half of an SM's shared memory (it uses sizeof(FusedSmem)), so a
-    // cluster's blocks spread over as many SMs instead of sharing them two by two through the preparation and the tile,
-    // while the products' small blocks still fit beside one
+    // 1-2 rows, a block an SM: each block asks for more than half of an SM's shared memory (it uses sizeof(FusedSmem)), so
+    // a cluster's blocks spread over as many SMs instead of sharing them two by two through the preparation and the tile,
+    // while the products' small blocks still fit beside one; 3 rows, two blocks an SM, so the 3 x 8 x 8 blocks take one wave
     static size_t smem = 0;
     if (!smem) {
         int dev = 0, per_sm = 0, reserved = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
         cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev);
-        smem = std::max(sizeof(FusedSmem), (size_t) std::max(0, per_sm / 2 - reserved + 128));
-        cudaFuncSetAttribute(attn_fused_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        cudaFuncSetAttribute(attn_fused_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        smem = std::max(sizeof(FusedSmem<2>), (size_t) std::max(0, per_sm / 2 - reserved + 128));
+        cudaFuncSetAttribute(attn_fused_kernel<false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
+        cudaFuncSetAttribute(attn_fused_kernel<true, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
     }
     const dim3 grid((unsigned) rows, kKvHeads, kClusterSplits);
     cudaStream_t s = (cudaStream_t) stream;
-    if (a.fp8) bk::launch_pdl(attn_fused_kernel<true>, grid, dim3(kWarps * 32), smem, s, pa, a);
-    else bk::launch_pdl(attn_fused_kernel<false>, grid, dim3(kWarps * 32), smem, s, pa, a);
+    if (rows <= 2) {
+        if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        else bk::launch_pdl(attn_fused_kernel<false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+    } else {
+        if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+        else bk::launch_pdl(attn_fused_kernel<false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+    }
     check("attention_window");
 }
 
