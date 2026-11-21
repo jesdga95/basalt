@@ -28,16 +28,25 @@ void plan(const int32_t* bounds, int n, int32_t* tile_off, void* stream);
 void rebase(const int32_t* bounds, int n, int32_t* out, void* stream);
 
 /// Rounds rows to FP4: row i of the segments is row ids[i] of x (or i), `ld` floats per row.  `bounds`/`tile_off` as
-/// planned; writes the planes `a4` and the token scales `gs`.
+/// planned; writes the planes `a4` and the token scales `gs`.  With `two`, each row is two FP4 terms under its one token
+/// scale, its rounding and the rounding of what that leaves (about 8 bits); the planes then hold 2 * cols values a row
+/// (size them as for 2 * cols), the k-tiles alternating the two terms of the same 128 columns.
 void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const int32_t* tile_off, int n, void* a4,
-              float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream);
+              float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream, bool two = false);
+
+/// The plan of a layer's experts all at once (n <= 1024, rows grouped by expert, bounds on the device): tile_off as
+/// plan() gives it, and blk_off[0..n] the first GEMM block (two tiles, 128 rows) of each expert and the total.
+void plan_blocks(const int32_t* bounds, int n, int32_t* tile_off, int32_t* blk_off, void* stream);
+/// The most GEMM blocks plan_blocks can give for `rows` rows over n experts.
+inline int64_t max_blocks(int64_t rows, int n) { return (rows + 2 * kTileTokens - 1) / (2 * kTileTokens) + n; }
 
 /// Bytes of the token planes of `tokens` rows of `cols` values: the codes [tokens][cols / 2] (each 16 values' 8 bytes
 /// in order), then the UE4M3 scales [tokens][cols / 16].
 size_t token_bytes(int64_t tokens, int64_t cols);
 /// Rounds each of `tokens` rows of x (`ld` floats apart) to FP4 once, into the token planes `a4` and the token scales
 /// gs[tokens]: the same codes and scales quantize() gives every row that reads that token.
-void quantize_tokens(const float* x, int64_t tokens, int64_t cols, int64_t ld, void* a4, float* gs, void* stream);
+void quantize_tokens(const float* x, int64_t tokens, int64_t cols, int64_t ld, void* a4, float* gs, void* stream,
+                     bool two = false);
 
 /// n experts' products: expert j's matrix [w_rows, w_cols] of NVFP4 blocks starts at blob[j] + w_off; its rows
 /// [bounds[j], bounds[j+1]) of the planes go to dst rows of the same indices (dst + row * ld_dst).  The result is the
@@ -61,6 +70,16 @@ struct Product {
     const int32_t* ids = nullptr;
     int64_t tokens = 0;
     size_t tail_off = 0;
+    /// A layer's experts in one launch (any n): expert j's blob at base + j * stride (blob[] unused), its GEMM blocks
+    /// from blk_off (plan_blocks; the grid covers `blocks`, max_blocks()); output row r goes to dst row dst_ids[r]
+    /// (null: r); the SwiGLU, with gate_softcap > 0, is mmq::swiglu's softcapped form.
+    const uint8_t* base = nullptr;
+    size_t stride = 0;
+    const int32_t* blk_off = nullptr;
+    int64_t blocks = 0;
+    const int32_t* dst_ids = nullptr;
+    float gate_softcap = 0.0f, up_softcap = 0.0f;
+    bool two = false;   ///< the activations as two FP4 terms (quantize's `two`: planes of 2 * w_cols values a row)
 };
 void run(const Product& p, void* stream);
 /// The 16-byte scale tail at `tail_off` of each of p's n blobs to dst[4 j .. 4 j + 3] (the tail swiglu reads).
