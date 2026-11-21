@@ -684,7 +684,7 @@ void test_mix_norm() {
 }
 
 void test_controllers() {
-    const int R = 3, S = 3, rank = 64;
+    const int R = 8, S = 3, rank = 64;
     std::vector<std::vector<float>> dest(S), msg(S), nw(S);
     std::vector<std::vector<uint16_t>> down(S), up(S);
     CtrlArgs a;
@@ -771,6 +771,11 @@ void test_controllers() {
     one.norm_out = zeros<float>(E);
     controllers(one, S, 1, nullptr);
     same_bits("  a row alone", host(one.norm_out, E).data(), &got[E], (size_t) E * 4);
+    CtrlArgs three = a;   // the first three rows (the 3-4-row launch) against the 8-row one
+    for (int s = 0; s < S; ++s) three.q8[s] = zeros<uint8_t>((size_t) 3 * E / 32 * 36);
+    three.norm_out = zeros<float>((size_t) 3 * E);
+    controllers(three, S, 3, nullptr);
+    same_bits("  three rows", host(three.norm_out, (size_t) 3 * E).data(), got.data(), (size_t) 3 * E * 4);
     std::printf("  %.1f us a call (1 row, 3 streams)\n", time_us([&] { controllers(one, S, 1, nullptr); }));
     std::printf("  %.1f us a call (%d rows, 3 streams)\n", time_us([&] { controllers(a, S, R, nullptr); }), R);
 }
