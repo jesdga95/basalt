@@ -1,6 +1,7 @@
-"""Inkling 2 tool calls that reach the reply in a form other than the one the template shows (#540, #553): the native
-call with no name in its header, with no header, in a block left open, or cut before its end. Each is a call whole and
-streamed, in every chunking, through the OpenAI and Anthropic routes."""
+"""Inkling 2 tool calls that reach the reply in a form other than the one in the template (#540, #553): the native
+call with no name in its header, with no header, or in a block left open, and the call written as XML
+(`<invoke name=...><parameter name=...>`, bare or wrapped in `<tool_call><function_calls>`). Each is a call whole and
+streamed, in every chunking, through the OpenAI and Anthropic routes; text that only talks about the tags stays text."""
 import json
 import unittest
 import urllib.request
@@ -17,6 +18,15 @@ WIDTHS = (None, 1, 2, 3, 5, 11, 64)
 CALL = ("call", "edit_file", ARGS)
 ARGS_TEXT = json.dumps(ARGS, separators=(",", ":"))
 ENVELOPE = TOOL_JSON + '{"name":"edit_file","args":' + json.dumps(ARGS, separators=(",", ":")) + "}"
+
+
+def invoke(args=ARGS, string=False):
+    attr = ' string="true"' if string else ""
+    return '<invoke name="edit_file">' + "".join(f'<parameter name="{k}"{attr}>{v}</parameter>' for k, v in args.items()) + "</invoke>"
+
+
+def wrapped(inner):
+    return "<tool_call><function_calls>" + inner + "</function_calls></tool_call>"
 
 
 def run(text, width=None, tools=TOOLS, stream_tools=True):
@@ -83,6 +93,90 @@ class Native(unittest.TestCase):
             self.assertFalse([e for e in run(reply) if e.kind == "tool_call"], reply)
 
 
+class Xml(unittest.TestCase):
+    FORMS = {"bare": invoke(), "bare with string": invoke(string=True), "wrapped": wrapped(invoke()),
+             "wrapped with string": wrapped(invoke(string=True)),
+             "wrapped with spaces": "<tool_call>\n<function_calls>\n" + invoke() + "\n</function_calls>\n</tool_call>",
+             "function_calls only": "<function_calls>" + invoke() + "</function_calls>"}
+
+    def blocks(self, body):
+        return HEADER + TEXT + body + END
+
+    def test_every_form_is_a_call_whole_and_streamed(self):
+        for name, body in self.FORMS.items():
+            for reply in (self.blocks(body), HEADER + body + END, body, self.blocks(body).replace(END, "")):
+                results = set()
+                for width in WIDTHS:
+                    for stream in (True, False):
+                        got = merged(run(reply, width, TOOLS, stream))
+                        results.add(json.dumps([g for g in got if stream or g[0] != "args"]) if stream else None)
+                        self.assertEqual([g for g in got if g[0] != "args"], [CALL], (name, width, stream, got))
+                self.assertEqual(results - {None}, {json.dumps([["args", ARGS_TEXT], list(CALL)])}, name)
+
+    def test_text_around_the_call_stays(self):
+        body = wrapped(invoke())
+        for reply, want in (("I'll edit it.\n\n" + body, [("content", "I'll edit it."), CALL]),
+                            ("I'll edit it. " + body + "\n\nDone.", [("content", "I'll edit it."), CALL, ("content", "Done.")]),
+                            (body + "\nDone.", [CALL, ("content", "Done.")])):
+            for width in WIDTHS:
+                self.assertEqual([g for g in merged(run(self.blocks(reply), width)) if g[0] != "args"], want, (reply, width))
+
+    def test_parallel_calls(self):
+        second = invoke({"path": "b.py", "old_string": "1", "new_string": "2"})
+        for body in (wrapped(invoke() + second), invoke() + second, wrapped(invoke()) + wrapped(second)):
+            for width in WIDTHS:
+                got = [g for g in merged(run(self.blocks(body), width)) if g[0] != "args"]
+                self.assertEqual(got, [CALL, ("call", "edit_file", {"path": "b.py", "old_string": "1", "new_string": "2"})],
+                                 (body, width))
+
+    def test_typed_parameters(self):
+        body = '<invoke name="edit_file"><parameter name="path">a.py</parameter><parameter name="count">3</parameter>' \
+               '<parameter name="note" string="true">7</parameter><parameter name="flag" string="false">true</parameter></invoke>'
+        want = ("call", "edit_file", {"path": "a.py", "count": 3, "note": "7", "flag": True})
+        for width in WIDTHS:
+            self.assertEqual([g for g in merged(run(body, width)) if g[0] != "args"], [want], width)
+
+    def test_a_close_inside_a_value_is_the_value(self):
+        args = {"path": "a.xml", "old_string": "<a>1</parameter>\nmore", "new_string": "x</invoke> y"}
+        for width in WIDTHS:
+            got = [g for g in merged(run(wrapped(invoke(args)), width)) if g[0] != "args"]
+            self.assertEqual(got, [("call", "edit_file", args)], width)
+
+    def test_talk_about_the_tags_is_text(self):
+        for text in ("Use <invoke name=\"edit_file\"> to call it.",
+                     "Wrap calls in <tool_call> and <function_calls> tags.",
+                     "```xml\n" + wrapped(invoke()) + "\n```\nlike that.",
+                     "Write `" + invoke() + "` for a call.",
+                     "~~~\n" + invoke() + "\n~~~",
+                     invoke().replace("edit_file", "rm_rf"),                    # a tool the request does not have
+                     invoke()[:-len("</invoke>")],                             # never closed
+                     wrapped(invoke())[:30],                                    # cut off
+                     "<invoke name=\"edit_file\">no parameters here, just prose",
+                     "<tool_call>not a call</tool_call>"):
+            for width in WIDTHS:
+                for stream in (True, False):
+                    events = run(self.blocks(text), width, TOOLS, stream)
+                    self.assertFalse([e for e in events if e.kind in ("tool_call", "tool_start")], (text, width))
+                    self.assertEqual("".join(e.text for e in events if e.kind == "content"), text, (text, width))
+
+    def test_without_tools_it_is_text(self):
+        for tools in (None, []):
+            events = run(self.blocks(wrapped(invoke())), 7, tools)
+            self.assertFalse([e for e in events if e.kind == "tool_call"])
+            self.assertEqual("".join(e.text for e in events if e.kind == "content"), wrapped(invoke()))
+
+    def test_reasoning_is_never_a_call(self):
+        events = run(HEADER + THINK + wrapped(invoke()) + END, 5)
+        self.assertFalse([e for e in events if e.kind == "tool_call"])
+        self.assertEqual("".join(e.text for e in events if e.kind == "reasoning"), wrapped(invoke()))
+
+    def test_a_call_then_a_native_call_keep_their_order(self):
+        reply = self.blocks(wrapped(invoke())) + HEADER + "edit_file" + TOOL_JSON + '{"name":"edit_file","args":{"path":"z"}}' + END
+        for width in WIDTHS:
+            self.assertEqual([g for g in merged(run(reply, width)) if g[0] != "args"],
+                             [CALL, ("call", "edit_file", {"path": "z"})], width)
+
+
 class Routes(unittest.TestCase):
     """The same replies through the server: OpenAI and Anthropic, whole and streamed."""
 
@@ -138,16 +232,26 @@ class Routes(unittest.TestCase):
                         calls[-1][1] += e["delta"]["partial_json"]
         return text, [(n, json.loads(a or "{}")) for n, a in calls]
 
-    def test_every_native_form_is_a_call_on_both_routes(self):
+    def test_every_form_is_a_call_on_both_routes(self):
         replies = {"headerless native": HEADER + ENVELOPE + END, "bare marker": ENVELOPE + END,
-                   "no end": HEADER + ENVELOPE, "after an open block": HEADER + TEXT + "On it." + HEADER + ENVELOPE + END}
+                   "bare xml": HEADER + TEXT + invoke() + END,
+                   "wrapped xml": HEADER + TEXT + wrapped(invoke()) + END,
+                   "wrapped xml with string": HEADER + TEXT + wrapped(invoke(string=True)) + END}
         for name, reply in replies.items():
             for route, read in ((self.OPENAI, self.openai), (self.ANTHROPIC, self.anthropic)):
                 for stream in (False, True):
                     with self.subTest(form=name, route=route[0], stream=stream):
                         text, calls = read(self.ask(reply, route, stream), stream)
                         self.assertEqual(calls, [("edit_file", ARGS)])
-                        self.assertEqual(text.strip(), "On it." if "open" in name else "")
+                        self.assertEqual(text.strip(), "")
+
+    def test_a_mention_is_content_on_both_routes(self):
+        talk = "Use <invoke name=\"edit_file\"> for that, inside <tool_call> tags."
+        for route, read in ((self.OPENAI, self.openai), (self.ANTHROPIC, self.anthropic)):
+            for stream in (False, True):
+                with self.subTest(route=route[0], stream=stream):
+                    text, calls = read(self.ask(HEADER + TEXT + talk + END, route, stream), stream)
+                    self.assertEqual((text, calls), (talk, []))
 
 
 if __name__ == "__main__":

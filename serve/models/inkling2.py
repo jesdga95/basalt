@@ -31,8 +31,8 @@ MAX_EFFORT = 0.99
 _NAME = re.compile(r'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")')   # a call object's own name, first key
 
 
-class Inkling2Parser:
-    """Incremental parser of the model's text. `state` is "between" (a block may open), "reasoning", "content",
+class _Blocks:
+    """The block structure of the model's text. `state` is "between" (a block may open), "reasoning", "content",
     "name" (a tool call's name) or "call" (its JSON); text is held back while it may still be the start of a marker."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = True):
@@ -248,6 +248,216 @@ class Inkling2Parser:
             out.append(Event(kind, self.buf[len(HEADER):] if self.buf.startswith(HEADER) else self.buf))
         self.buf = ""
         return out
+
+
+# ------------------------------------------------------------------------------------------------ calls written as XML
+# The model sometimes writes a call in a notation it was not given, inside a text block:
+#   <invoke name="NAME"><parameter name="KEY">VALUE</parameter>...</invoke>
+# bare, or wrapped in <function_calls> and <tool_call>, a parameter with or without string="true". The name and the
+# arguments are right; only the notation is off. Such text is a call when it is outside code (a fence or backticks, as
+# in the frontend), names a tool of the request and is whole; anything else stays text, so a message that talks
+# about these tags is not a call.
+XML_OPENERS = ("<tool_call>", "<function_calls>", "<invoke name=")
+_INVOKE = re.compile(r'<invoke\s+name=(["\'])([^"\'<>]*)\1\s*>')
+_PARAM = re.compile(r'<parameter\s+name=(["\'])([^"\'<>]*)\1(?:\s+string=(["\'])(true|false)\3)?\s*>')
+MORE, NO = "more", "no"                 # parse_xml: the text may still become a call; it cannot
+
+
+def _open_tag(rest: str, pattern, head: str):
+    """(match, None) when `rest` starts with the tag; (None, MORE) while it may still arrive; (None, NO)."""
+    m = pattern.match(rest)
+    if m:
+        return m, None
+    if head.startswith(rest) or (rest.startswith(head) and ">" not in rest and len(rest) < 400):
+        return None, MORE
+    return None, NO
+
+
+def _skip(s: str, pos: int) -> int:
+    """`pos` moved past the whitespace there."""
+    return len(s) - len(s[pos:].lstrip())
+
+
+def parse_xml(s: str, tools: dict, final: bool):
+    """The calls written at the start of `s` (which begins with an opener): ("call", [(name, params)], consumed), (MORE,)
+    when the text may still grow into one, or (NO,). params: [(key, text, string flag or None)]. `final`: no more text
+    follows, so calls that are whole are calls even where more could have followed."""
+    pos, wrap, calls = 0, [], []
+    for tag in ("<tool_call>", "<function_calls>"):     # the wrappers, in this order
+        if s.startswith(tag, pos):
+            wrap.append(tag)
+            pos = _skip(s, pos + len(tag))
+        elif tag.startswith(s[pos:]):
+            return (NO,) if final else (MORE,)
+    while True:
+        m, wait = _open_tag(s[pos:], _INVOKE, "<invoke name=")
+        if m is None:
+            if calls:
+                if wait == MORE and not final:
+                    return (MORE,)
+                break               # the invokes are over: what follows is not one
+            return (NO,) if final else (wait,)
+        if m.group(2) not in tools:
+            return (NO,)
+        name, pos, params = m.group(2), pos + m.end(), []
+        while True:
+            pos = _skip(s, pos)
+            if s.startswith("</invoke>", pos):
+                pos += len("</invoke>")
+                break
+            m, wait = _open_tag(s[pos:], _PARAM, "<parameter name=")
+            if m is None:
+                return (NO,) if final or wait == NO else (MORE,)
+            start = at = pos + m.end()
+            while True:         # a close counts when a parameter or the invoke's end follows it
+                i = s.find("</parameter>", at)
+                if i < 0:
+                    return (NO,) if final else (MORE,)
+                tail = s[_skip(s, i + len("</parameter>")):]
+                if tail.startswith(("<parameter ", "</invoke>")):
+                    break
+                if not tail:
+                    if final:
+                        return (NO,)
+                    return (MORE,)
+                if "<parameter ".startswith(tail) or "</invoke>".startswith(tail):
+                    if final:
+                        return (NO,)
+                    return (MORE,)
+                at = i + 1      # quoted inside the value
+            params.append((m.group(2), s[start:i], m.group(4)))
+            pos = i + len("</parameter>")
+        calls.append((name, params))
+        pos = _skip(s, pos)
+        if pos >= len(s):
+            if not final:
+                return (MORE,)
+            break
+    for tag in reversed(wrap):
+        close = tag.replace("<", "</")
+        rest = s[pos:]
+        if rest.startswith(close):
+            pos = _skip(s, pos + len(close))
+        elif close.startswith(rest) and not final:
+            return (MORE,)
+        # a wrapper left open: the calls inside it are whole, taken as they are
+    return "call", calls, pos
+
+
+class _XmlCalls(frontend.CodeTracker):
+    """Turns the XML-written calls in the answer text into call events; every other text goes on as it came."""
+
+    def __init__(self, tools: dict, stream_tools: bool):
+        self.tools = tools
+        self.stream_tools = stream_tools
+        self.buf = ""
+        self.pend = False               # buf starts (after whitespace) with an opener that begins a call's text
+        self.lead = False               # a call just ended: the whitespace after it is dropped
+        self.fence, self.line, self.ticks = "", "", 0
+
+    def _call(self, name: str, params: list) -> list:
+        props = frontend._tool_properties(self.tools.get(name))
+        args = {}
+        for key, text, flag in params:
+            if flag == "true":
+                args[key] = text
+            elif flag == "false":
+                try:
+                    args[key] = json.loads(text)
+                except ValueError:
+                    args[key] = text
+            else:
+                args[key] = frontend._decode_param(text, props.get(key))
+        call = ToolCall(name=name, arguments=args)
+        out = [Event("tool_start", call=call),
+               Event("tool_args", json.dumps(args, ensure_ascii=False, separators=(",", ":")), call=call)] \
+            if self.stream_tools else []
+        return out + [Event("tool_call", call=call)]
+
+    def push(self, text: str, final: bool = False) -> list:
+        if self.pend and not final and ">" not in text:     # nothing that can end a tag came
+            self.buf += text
+            return []
+        self.buf += text
+        out: list[Event] = []
+
+        def content(t):
+            if t:
+                out.append(Event("content", self._track(t)))
+        while self.buf:
+            if self.lead and not self.pend:
+                self.buf = self.buf.lstrip()
+                self.lead = not self.buf
+                if not self.buf:
+                    break
+            if not self.pend:
+                found = [(i, op) for op in XML_OPENERS if (i := self.buf.find(op)) >= 0]
+                if not found:
+                    keep = len(self.buf[:len(self.buf) - frontend.hold_back(self.buf, XML_OPENERS)].rstrip())   # a call drops the whitespace before it
+                    content(self.buf[:keep])
+                    self.buf = self.buf[keep:]
+                    break
+                i, op = min(found)
+                snap = (self.fence, self.line, self.ticks)
+                self._track(self.buf[:i])
+                quoted = self._in_code()
+                self.fence, self.line, self.ticks = snap
+                if quoted:                      # an example in code (a fence or backticks) is text
+                    content(self.buf[:i + len(op)])
+                    self.buf = self.buf[i + len(op):]
+                    continue
+                cut = len(self.buf[:i].rstrip())
+                content(self.buf[:cut])
+                self.buf, self.pend = self.buf[cut:], True
+            body = self.buf.lstrip()
+            ws = len(self.buf) - len(body)
+            r = parse_xml(body, self.tools, final)
+            if r[0] == MORE:
+                break
+            self.pend = False
+            if r[0] == NO:              # text after all: the whitespace and the opener
+                op = next(o for o in XML_OPENERS if body.startswith(o))
+                content(self.buf[:ws + len(op)])
+                self.buf = self.buf[ws + len(op):]
+                continue
+            for name, params in r[1]:
+                out += self._call(name, params)
+            self.buf, self.lead = body[r[2]:], True
+            self.fence, self.line, self.ticks = "", "", 0
+        if final and self.buf:
+            content(self.buf)
+            self.buf, self.pend = "", False
+        return out
+
+
+class Inkling2Parser(_Blocks):
+    """The block parser, and the XML-written calls of the answer text read as calls (see _XmlCalls) when the request
+    offers tools."""
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = True):
+        super().__init__(thinking=thinking, tools=tools, stream_tools=stream_tools)
+        names = {t.get("name"): t for t in tools or [] if isinstance(t, dict) and t.get("name")}
+        self.xml = _XmlCalls(names, stream_tools) if names else None
+
+    def _through(self, events: list[Event], final: bool = False) -> list[Event]:
+        if self.xml is None:
+            return events
+        out: list[Event] = []
+        for e in events:
+            if e.kind == "content":
+                out += self.xml.push(e.text)
+            else:                       # another kind of event ends the text before it
+                out += self.xml.push("", final=True)
+                out.append(e)
+        if final:
+            out += self.xml.push("", final=True)
+        return out
+
+    def feed(self, delta: str) -> list[Event]:
+        return self._through(super().feed(delta))
+
+    def finish(self) -> list[Event]:
+        return self._through(super().finish(), final=True)
 
 
 class _Renderer:
