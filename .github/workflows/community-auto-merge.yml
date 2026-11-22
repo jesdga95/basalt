@@ -1,0 +1,106 @@
+name: community auto-merge
+
+# A successful community run can only auto-merge a validated, append-only benchmark PR.
+# This privileged workflow never checks out or executes PR code.
+on:
+  workflow_run:
+    workflows: [community]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: community-auto-merge-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  route:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Find the PR for this community workflow run
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          PR_NUMBER="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/pull_requests" --jq '.[0].number // empty')"
+          if [ -z "${PR_NUMBER}" ]; then
+            echo "No associated PR; nothing to route."
+            exit 0
+          fi
+          echo "number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
+
+      - name: Confirm the current PR is eligible
+        id: scope
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          CHECKED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          PR="$(gh pr view "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json state,isDraft,baseRefName,headRefOid)"
+          STATE="$(jq -r .state <<< "${PR}")"
+          DRAFT="$(jq -r .isDraft <<< "${PR}")"
+          BASE="$(jq -r .baseRefName <<< "${PR}")"
+          HEAD="$(jq -r .headRefOid <<< "${PR}")"
+          if [ "${STATE}" != "OPEN" ] || [ "${DRAFT}" != "false" ] || [ "${BASE}" != "main" ] || [ "${HEAD}" != "${CHECKED_SHA}" ]; then
+            echo "PR is closed, draft, targets another branch, or has changed since the community run."
+            exit 1
+          fi
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+            --jq 'map(.filename) | if length == 1 and .[0] == "docs/community/benchmarks.json" then "benchmark-only" else error("PR changes files outside docs/community/benchmarks.json") end'
+
+      - name: Revalidate the PR table and require append-only changes
+        id: validate
+        if: steps.pr.outputs.number != '' && steps.scope.outcome == 'success' && github.event.workflow_run.conclusion == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/contents/docs/community/benchmarks.json?ref=${CHECKED_SHA}" \
+            --jq '.content' | base64 --decode > "${RUNNER_TEMP}/pr-benchmarks.json"
+          python3 tools/check_benchmarks.py "${RUNNER_TEMP}/pr-benchmarks.json"
+          python3 - "${RUNNER_TEMP}/pr-benchmarks.json" docs/community/benchmarks.json <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              proposed = json.load(f)
+          with open(sys.argv[2], encoding="utf-8") as f:
+              current = json.load(f)
+          if proposed.get("preset") != current.get("preset"):
+              raise SystemExit("benchmark preset changed; manual review required")
+          old = current.get("runs", [])
+          new = proposed.get("runs", [])
+          if len(new) <= len(old) or new[:len(old)] != old:
+              raise SystemExit("benchmark rows were edited or removed; manual review required")
+          print(f"append-only benchmark update: {len(new) - len(old)} new rows")
+          PY
+
+      - name: Add the manual-review label when checks or scope fail
+        if: always() && steps.pr.outputs.number != '' && (github.event.workflow_run.conclusion != 'success' || steps.scope.outcome == 'failure' || steps.validate.outcome == 'failure' || steps.queue.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          gh label create benchmark-manual-review --repo "${GITHUB_REPOSITORY}" --color F9D0C4 --description "Benchmark PR requires manual review" --force
+          gh pr edit "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --add-label benchmark-manual-review
+
+      - name: Queue the validated PR for merge
+        id: queue
+        if: steps.pr.outputs.number != '' && steps.scope.outcome == 'success' && steps.validate.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: gh pr merge "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --auto --squash
