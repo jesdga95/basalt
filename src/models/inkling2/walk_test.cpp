@@ -110,9 +110,79 @@ void check(int layers, int block, int passes) {
         expect(buf[(int) w.blocks[j]] == ref_blocks[(size_t) j], "the head's block", -1);
 }
 
+// The split walk over two cards: each card's buffers hold what its own steps wrote and what its segments pulled; every
+// read on a card must find the value the one-card walk reads, and a later pass's messages must be mixed on the card first.
+void check_split(int cut) {
+    Geometry g;
+    g.n_layers = 24;
+    g.block = 6;
+    g.loop_start = 6;
+    g.loop_end = 18;
+    g.loop_passes = 3;
+    g.visits = loop_visits(24, 6, 18, 3);
+    Walk w;
+    std::string err;
+    if (!walk(g, w, err)) return;
+    std::vector<int> card_of(24, 0);
+    for (int l = cut; l < 24; ++l) card_of[(size_t) l] = 1;
+    const std::vector<Segment> segs = split_walk(g, w, card_of);
+    int one[kBufs], two[2][kBufs];
+    for (int b = 0; b < kBufs; ++b) one[b] = two[0][b] = two[1][b] = -2;
+    one[(int) Buf::X0] = two[0][(int) Buf::X0] = kEmb;
+    int mixed[2] = {-1, -1};
+    size_t next = 0;
+    for (size_t k = 0; k < segs.size(); ++k) {
+        const Segment& sg = segs[k];
+        expect(sg.s0 == next && sg.s1 >= sg.s0, "segments in order", (int) k);
+        expect(k + 1 == segs.size() ? sg.head && sg.card == 0 : !sg.head, "the head on the first card, last", (int) k);
+        for (Buf b : sg.pull) two[sg.card][(int) b] = two[1 - sg.card][(int) b];
+        int* mine = two[sg.card];
+        for (size_t i = sg.s0; i < sg.s1; ++i) {
+            const Step& s = w.steps[i];
+            const int vi = (int) i, pass = g.visits[i].pass;
+            expect(card_of[(size_t) g.visits[i].layer] == sg.card, "a step on its layer's card", vi);
+            expect(mine[(int) s.hid] == one[(int) s.hid], "split input", vi);
+            for (int j = 0; j < s.n_blocks; ++j) expect(mine[(int) s.blocks[j]] == one[(int) s.blocks[j]], "split block", vi);
+            if (sg.mix_msgs[i - sg.s0]) {
+                expect(s.msgs, "messages mixed on a step that takes them", vi);
+                expect(mine[(int) s.bank[0]] == one[(int) s.bank[0]] && mine[(int) s.bank[1]] == one[(int) s.bank[1]], "split bank", vi);
+                mixed[sg.card] = pass;
+            }
+            if (s.msgs) expect(mixed[sg.card] == pass, "this pass's messages on the card", vi);
+            one[(int) s.out] = mine[(int) s.out] = vi;
+        }
+        next = sg.s1;
+        if (sg.head) {
+            expect(mine[(int) w.final_hid] == one[(int) w.final_hid], "split head input", -1);
+            for (int j = 0; j < w.n_blocks; ++j) expect(mine[(int) w.blocks[j]] == one[(int) w.blocks[j]], "split head block", -1);
+        }
+    }
+    expect(next == w.steps.size(), "every step in a segment", -1);
+    // one card: one segment; a cut at a loop edge: there and back; inside the loop: three crossings a pass
+    const int h = split_handoffs(g, cut);
+    expect(h == (cut <= 6 || cut >= 18 ? 2 : 6), "hand-offs", cut);
+}
+
 }  // namespace
 
 int main() {
+    for (int cut = 1; cut < 24; ++cut) check_split(cut);
+    {
+        Geometry g;
+        g.n_layers = 24;
+        g.block = 6;
+        g.loop_start = 6;
+        g.loop_end = 18;
+        g.loop_passes = 3;
+        g.visits = loop_visits(24, 6, 18, 3);
+        Walk w;
+        std::string err;
+        walk(g, w, err);
+        const std::vector<Segment> one = split_walk(g, w, std::vector<int>(24, 0));
+        expect(one.size() == 1 && one[0].head && one[0].pull.empty() && split_handoffs(g, 0) == 0, "one card, one segment", -1);
+        for (size_t i = 0; i < w.steps.size(); ++i)   // one card mixes a pass's messages at the loop's first layer, as before
+            expect(one[0].mix_msgs[i] == (w.steps[i].msgs && g.visits[i].layer == g.loop_start), "one card's message mixes", (int) i);
+    }
     check(24, 6, 3);   // Inkling 2 Mini
     check(24, 6, 1);
     check(24, 6, 2);

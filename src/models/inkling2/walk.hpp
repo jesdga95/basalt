@@ -46,6 +46,22 @@ struct Walk {
     Buf blocks[kMaxMix] = {};
 };
 
+/// A run of steps on one card of a layer split, and the row buffers it pulls from the card before it first.
+struct Segment {
+    int card = 0;
+    size_t s0 = 0, s1 = 0;       ///< walk steps [s0, s1)
+    bool head = false;           ///< the head runs after them (always on card 0, the last segment)
+    std::vector<Buf> pull;       ///< buffers its steps (or the head) read whose last write was on the other card
+    std::vector<char> mix_msgs;  ///< [step - s0]: a later pass's first step on this card mixes the pass's messages here
+};
+
+/// The segments of `w` when layer l runs on card `card_of[l]` (0 or 1); the embedding and the head are card 0's. One card:
+/// one segment, the whole walk and the head, the messages mixed at the loop's first layer as before.
+std::vector<Segment> split_walk(const Geometry& g, const Walk& w, const std::vector<int>& card_of);
+
+/// The hand-offs between the cards (segments - 1) of a window whose second card runs layers [cut, n_layers).
+int split_handoffs(const Geometry& g, int cut);
+
 /// The walk of one forward over `g`'s visits. False with `err` for a layout it does not cover: it takes a prelude of one
 /// block, a loop of two blocks and a coda of one block (Inkling 2 Mini's 6 + 12 x passes + 6 layers).
 bool walk(const Geometry& g, Walk& w, std::string& err);
