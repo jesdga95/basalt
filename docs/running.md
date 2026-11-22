@@ -20,12 +20,13 @@ slot's own tokens even when the model wrote it in other pieces than the tokenize
 
 ### Session affinity
 
-With `--parallel`, a request that names its session goes to the slot that session last used, so the next turn continues the K/V already
-there. The session is the first of these headers that is set, then the request body's `session_id`: `x-llm-flow-id`,
+With `--parallel`, a request that names its session goes to the slot that session's conversation sits in, so the next turn continues
+the K/V already there. The session is the first of these headers that is set, then the request body's `session_id`: `x-llm-flow-id`,
 `x-claude-code-session-id`, `x-session-id`, `x-session-affinity`, `x-grok-conv-id`, `x-grok-session-id`. A request with none picks a
-slot by the longest shared prefix, then the least recently used. When the session's slot is busy, the request takes that normal pick
-and the session's slot becomes the new one. Claude Code sends one `x-claude-code-session-id` for a session and its parallel
-subagents, so their overlapping requests spread over slots.
+slot by the longest shared prefix, then the least recently used. A session may hold several slots: a client may send one session id for a
+session and its parallel subagents (Claude Code's `x-claude-code-session-id`, OpenCode's `X-Session-Id` and `x-session-affinity`, which
+name the parent session), and each conversation keeps the slot its K/V is in. A request that continues none of the session's own slots
+takes an unowned one first; with every slot owned, the session's own least recently used one comes before another session's.
 
 ### Prompts beside decoding slots
 
