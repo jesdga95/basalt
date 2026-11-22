@@ -78,6 +78,10 @@ __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long lo
         // reads the Q4_0 pool instead of dereferencing the null v_q (no call site does today; PR review)
         if (value) load8_q4(p, value, row, d0, out);
         else load8_q8(p, value, row, d0, out);
+    } else if constexpr (KV_MODE == 4) {
+        // hybrid K4V8: the mirror - K rotated Q4_0, V unrotated INT8
+        if (value) load8_q8(p, value, row, d0, out);
+        else load8_q4(p, value, row, d0, out);
     } else load8_q4(p, value, row, d0, out);
 }
 
@@ -161,7 +165,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         float v;
         if constexpr (KV_MODE == 0) {
             v = __half2float(__ushort_as_half(p.v_pool[srow[c] * HD + t]));
-        } else if constexpr (KV_MODE == 1) {
+        } else if constexpr (KV_MODE == 1 || KV_MODE == 4) {
             const float sc = __half2float(__ushort_as_half(p.v_scale[srow[c] * (HD / KV_Q8_GROUP) + t / KV_Q8_GROUP]));
             v = (float) p.v_q[srow[c] * HD + t] * sc;
         } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
@@ -219,7 +223,9 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         basalt::log::error("basalt", "qsa_decode_attn_batch: unsupported geometry or missing buffers");
         std::exit(1);
     }
-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
+    const int kv_mode = (pools.k_q4 != nullptr && pools.v_q != nullptr) ? 4
+                        : pools.k_q4 != nullptr ? 2
+                        : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
@@ -230,7 +236,10 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
     cudaStream_t st = (cudaStream_t) stream;
-    if (kv_mode == 3)
+    if (kv_mode == 4)
+        ATTN_CHUNK(4)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+    else if (kv_mode == 3)
         ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else if (kv_mode == 2)
@@ -263,9 +272,12 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
         basalt::log::error("basalt", "qsa_decode_attn: unsupported geometry or missing buffers");
         std::exit(1);
     }
-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
+    const int kv_mode = (pools.k_q4 != nullptr && pools.v_q != nullptr) ? 4
+                        : pools.k_q4 != nullptr ? 2
+                        : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
-    if (kv_mode == 3 ? (!pools.k_scale || !pools.v_q4)
+    if (kv_mode == 4 ? (!pools.v_q || !pools.v_scale)
+                     : kv_mode == 3 ? (!pools.k_scale || !pools.v_q4)
                      : (kv_mode == 2 ? (!pools.v_q4) : (kv_mode == 1 ? (!pools.v_q || !pools.k_scale || !pools.v_scale)
                                                                      : (!pools.k_pool || !pools.v_pool)))) {
         basalt::log::error("basalt", "qsa_decode_attn: incomplete KV pools");
@@ -278,7 +290,10 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
     cudaStream_t st = (cudaStream_t) stream;
-    if (kv_mode == 3)
+    if (kv_mode == 4)
+        ATTN_CHUNK(4)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+    else if (kv_mode == 3)
         ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     else if (kv_mode == 2)

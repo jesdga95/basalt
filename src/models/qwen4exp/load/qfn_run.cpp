@@ -192,6 +192,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     basalt::core::qsa_set_kv_int8(o.kv == "int8");
     basalt::core::qsa_set_kv_q4(o.kv == "q4_0");   // 4-bit codes after a Hadamard rotation (kv_q4.hpp)
     basalt::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
+    basalt::core::qsa_set_kv_k4v8(o.kv == "k4v8");   // K4V8: rotated Q4_0 K + INT8 V, 816 B/cell
     if (const auto code = cli::validate_kv_streaming(o)) return *code;
     basalt::core::qsa_set_kv_resident(o.kv_resident);
     const bool no_spec = cli::normalize_speculation_options(o);

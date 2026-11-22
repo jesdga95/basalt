@@ -1373,6 +1373,11 @@ add_executable(kv_hybrid_parity tests/models/qwen4exp/kernels/kv_hybrid_parity.c
 target_include_directories(kv_hybrid_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(kv_hybrid_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME kv_hybrid_parity COMMAND kv_hybrid_parity)
+# Hybrid K4V8 (q4_0 K + INT8 V) vs host references: appends, decode mode 4, prompt mode 5 (GPU, synthetic).
+add_executable(kv_k4v8_parity tests/models/qwen4exp/kernels/kv_k4v8_parity.cpp)
+target_include_directories(kv_k4v8_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(kv_k4v8_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME kv_k4v8_parity COMMAND kv_k4v8_parity)
 # Q4_0 KV with Walsh-Hadamard rotation vs a host reference (GPU, synthetic, no model).
 add_executable(kv_q4_parity tests/models/qwen4exp/kernels/kv_q4_parity.cpp)
 target_include_directories(kv_q4_parity PRIVATE ${_gpu_include_directories})

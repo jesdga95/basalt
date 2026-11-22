@@ -53,15 +53,18 @@ __device__ __forceinline__ uint32_t pack_h2(float lo_k, float hi_k) {   // eleme
 // This template serves the Q4_0 forms; int8 and fp16 KV are `prompt_attn_warp_kernel`'s.
 // KV_MODE 3 (hybrid K8V4): K as int8 codes with an fp16 scale per 64 values, V from q4_0 blocks dequantized to fp16 at
 // gather; the caller un-rotates the output.
+// KV_MODE 5 (hybrid K4V8): K from q4_0 blocks (int8 codes, a scale per 32), V as the int8 pool's codes with a scale
+// per 64; the caller rotates q and K but not the output.
 // KV_MODE 4 (Q4_0 K and V, `--kv q4_0`): a scale per 32 values - each q4_0 block's codes enter as exact int8
 // (code - 8) and its fp16 scale is applied in FP32; the caller rotates q and un-rotates the output (kv_q4.hpp).
 template <int KV_MODE>
 struct Smem {
     using KElem = int8_t;
-    using VElem = typename std::conditional<KV_MODE == 4, int8_t, __half>::type;
+    static constexpr bool I8V = KV_MODE == 4 || KV_MODE == 5;   // 5: hybrid K4V8 - int8 K codes from q4_0, int8 V
+    using VElem = typename std::conditional<I8V, int8_t, __half>::type;
     static constexpr int KROW = HD + 16;   // elements; 16-byte aligned rows, banks spread
-    static constexpr int VROW = KV_MODE == 4 ? HD + 16 : HD + 8;
-    static constexpr int NG = KV_MODE == 4 ? HD / QK4_0 : 4;      // scale groups per row (q4_0: 8 of 32, else 4 of 64)
+    static constexpr int VROW = I8V ? HD + 16 : HD + 8;
+    static constexpr int NG = I8V ? HD / QK4_0 : 4;      // scale groups per row (q4_0 and K4V8: 8 of 32, else 4 of 64)
     __half qh[16][QS];
     __half ql[16][QS];
     KElem k[CH][KROW];
@@ -132,7 +135,50 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
         __syncthreads();   // rows ready; the previous chunk's p.v is done with k, v, s
         // gather the chunk's K and V rows (16-byte pieces; K8V4's V as q4_0 blocks dequantized to fp16)
         // and their scales
-        if constexpr (KV_MODE == 4) {
+        if constexpr (KV_MODE == 5) {
+            // hybrid K4V8: K as q4_0 blocks (exact int8 codes + a scale per 32, like mode 4's K half), V as the
+            // int8 pool's own codes with its fp16 scale per 64 broadcast over both 32-halves
+            constexpr int BLKS = HD / QK4_0;
+            constexpr int BYTES = BLKS * (int) sizeof(block_q4_0);
+            for (int i = t; i < CH * BLKS; i += THREADS) {
+                const int c = i / BLKS, b = i % BLKS;
+                const long long r = S.row[c];
+                uint4 lo = make_uint4(0, 0, 0, 0), hi = make_uint4(0, 0, 0, 0);
+                float d = 0.0f;
+                if (r >= 0) {
+                    const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.k_q4 + r * BYTES) + b;
+                    d = __half2float(__ushort_as_half(__ldg(&blk->d)));
+                    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(blk->qs);
+                    uint32_t w[4];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        w[j] = (uint32_t) __ldg(q16 + 2 * j) | ((uint32_t) __ldg(q16 + 2 * j + 1) << 16);
+                    lo = make_uint4(__vsub4(w[0] & 0x0F0F0F0Fu, 0x08080808u), __vsub4(w[1] & 0x0F0F0F0Fu, 0x08080808u),
+                                    __vsub4(w[2] & 0x0F0F0F0Fu, 0x08080808u), __vsub4(w[3] & 0x0F0F0F0Fu, 0x08080808u));
+                    hi = make_uint4(__vsub4((w[0] >> 4) & 0x0F0F0F0Fu, 0x08080808u),
+                                    __vsub4((w[1] >> 4) & 0x0F0F0F0Fu, 0x08080808u),
+                                    __vsub4((w[2] >> 4) & 0x0F0F0F0Fu, 0x08080808u),
+                                    __vsub4((w[3] >> 4) & 0x0F0F0F0Fu, 0x08080808u));
+                }
+                int8_t* dst = &S.k[c][b * QK4_0];
+                reinterpret_cast<uint4*>(dst)[0] = lo;
+                reinterpret_cast<uint4*>(dst)[1] = hi;
+                S.ks[c][b] = d;
+            }
+            constexpr int VPIECES = HD / 16;   // V rows as raw int8 codes
+            for (int i = t; i < CH * VPIECES; i += THREADS) {
+                const int c = i / VPIECES, pc = i % VPIECES;
+                const long long r = S.row[c];
+                uint4 vx = make_uint4(0, 0, 0, 0);
+                if (r >= 0) vx = __ldg(reinterpret_cast<const uint4*>(p.v_q + r * HD) + pc);
+                *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(&S.v[c][0]) + pc * 16) = vx;
+            }
+            for (int i = t; i < CH * (HD / QK4_0); i += THREADS) {
+                const int c = i / (HD / QK4_0), g = i % (HD / QK4_0);
+                const long long r = S.row[c];
+                S.vs[c][g] = r >= 0 ? __half2float(__ushort_as_half(p.v_scale[r * (HD / KV_Q8_GROUP) + g / 2])) : 0.0f;
+            }
+        } else if constexpr (KV_MODE == 4) {
             // q4_0 K and V: one (K or V, cell, block) per item - the block's 16 code bytes (2-byte aligned: eight
             // 16-bit loads) become 32 exact int8 codes (element j in the low nibble of byte j, j + 16 in the high
             // one), its fp16 scale goes to ks/vs
@@ -323,7 +369,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                     const int j = gi * JPG + jj;
                     const int d = warp * 64 + j * 8 + gid;
                     uint32_t b[2];
-                    if constexpr (KV_MODE == 4) {
+                    if constexpr (KV_MODE == 4 || KV_MODE == 5) {
                         const uint32_t x0 = (uint8_t) S.v[cA][d] | ((uint32_t) (uint8_t) S.v[cA + 1][d] << 8);
                         const uint32_t x1 = (uint8_t) S.v[cB][d] | ((uint32_t) (uint8_t) S.v[cB + 1][d] << 8);
                         b[0] = i8x2_to_h2(x0);
@@ -895,6 +941,10 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
     cudaStream_t st = (cudaStream_t) stream;
+    if (pools.k_q4 != nullptr && pools.v_q4 == nullptr) {   // hybrid K4V8: q4_0 K + int8 V
+        if (!pools.v_q || !pools.v_scale) return false;
+        return launch<5>(q, pools, ids, steps, cap, s, attn, n_q, st);
+    }
     if (pools.k_q4 != nullptr) {   // Q4_0 K and V (--kv q4_0): mode 4
         if (pools.v_q4 == nullptr) return false;
         return launch<4>(q, pools, ids, steps, cap, s, attn, n_q, st);

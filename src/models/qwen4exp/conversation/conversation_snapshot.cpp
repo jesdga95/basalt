@@ -31,6 +31,10 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
         error = "conversation snapshot: hybrid K8V4 requires an identity layout and distinct format flags";
         return false;
     }
+    if (st.kv_k4v8) {
+        error = "conversation snapshot: hybrid K4V8 has no snapshot layout yet";
+        return false;   // the caller skips parking and keeps serving
+    }
     const auto s = basalt::kernels::qsa_real_shapes();
     const bool int8_keys = st.kv_int8 || st.kv_hybrid;
     if (g.n_head_kv <= 0 || g.head_dim <= 0 || g.head_dim > INT32_MAX || g.idx_key_dim <= 0 ||

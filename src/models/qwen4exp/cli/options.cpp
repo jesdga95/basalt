@@ -82,8 +82,8 @@ std::optional<int> prepare_input_options(Options& o) {
     }
     if (o.kv.empty()) o.kv = "fp16";
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        basalt::log::error("basalt generate", "--kv must be fp16, int8, q4_0 or k8v4");
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "k4v8") {
+        basalt::log::error("basalt generate", "--kv must be fp16, int8, q4_0, k8v4 or k4v8");
         return 2;
     }
     return std::nullopt;
@@ -147,8 +147,8 @@ std::optional<int> validate_kv_streaming(const Options& o) {
         basalt::log::error("basalt generate", "--kv-resident must be >= 0");
         return 2;
     }
-    if (o.kv == "k8v4" && o.kv_resident > 0) {
-        basalt::log::error("basalt generate", "--kv k8v4 does not support --kv-resident streaming (yet)");
+    if ((o.kv == "k8v4" || o.kv == "k4v8") && o.kv_resident > 0) {
+        basalt::log::error("basalt generate", "--kv %s does not support --kv-resident streaming (yet)", o.kv.c_str());
         return 2;
     }
     return std::nullopt;
