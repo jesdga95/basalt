@@ -732,7 +732,9 @@ __global__ void __launch_bounds__(THREADS) attn_merge_v2(AttnArgs a) {
 
 bool a16(const void* p) { return ((uintptr_t) p & 15) == 0; }
 int kv_mode_of(const QsaAttnPools& p) {
-    if (p.k_q4 != nullptr || p.v_q4 != nullptr) return -1;
+    if (p.k_q4 != nullptr || p.v_q4 != nullptr)   // --kv q4_0: packed blocks, staged into the int8 rows (mode 5)
+        return (p.k_q4 != nullptr && p.v_q4 != nullptr && a16(p.k_q4) && a16(p.v_q4) &&
+                ((uintptr_t) p.k_q4 & 7) == 0) ? 5 : -1;
     if (p.k_q != nullptr)
         return (p.v_q != nullptr && p.k_scale != nullptr && p.v_scale != nullptr && a16(p.k_q) && a16(p.v_q) &&
                 ((uintptr_t) p.k_scale & 7) == 0 && ((uintptr_t) p.v_scale & 7) == 0) ? 1 : -1;
@@ -777,7 +779,12 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
     cudaStream_t st = (cudaStream_t) stream;
     a.xq = a.attn_gated != nullptr ? xq : nullptr;
     const dim3 grid((unsigned) a.n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
-    if (mode == 1 && n_q == 1 && cap >= 8192) {   // the draft layer's wide window (verify's cap is a few thousand cells)
+    if (mode == 5) {   // --kv q4_0: packed Q4_0 pools, staged into the int8 rows (the draft layer never takes it: its
+                       // call sites are gated on !kv_rot, and q4_0 always stores rotated keys)
+        constexpr size_t bytes = sizeof(ChunkSmem<5>);
+        opt_in<5>(attn_chunk_v2<5, false>, bytes);
+        launch_pdl(attn_chunk_v2<5, false>, grid, dim3(THREADS), bytes, st, a);
+    } else if (mode == 1 && n_q == 1 && cap >= 8192) {   // the draft layer's wide window (verify's cap is a few thousand cells)
         a.chunk = 0;
         constexpr size_t bytes = sizeof(DSmem);
         static std::atomic<bool> done[64];
