@@ -56,4 +56,13 @@ void prompt_rows(int32_t* pos, int64_t pos0, int rows, int32_t* bounds, void* st
 void stage_to_ring(const void* k_stage, const void* v_stage, int64_t stage_cap, void* k_ring, void* v_ring, int64_t ring_cap,
                    int64_t pos0, int rows, int keep, int elem, void* stream);
 
+/// Fused prompt loop controller down projection: RMS-normalizes dest and msg independently and computes
+/// hid[r][o] = w_down[o][0..kWidth) . rms(dest[r]) + w_down[o][kWidth..2*kWidth) . rms(msg[r]).
+void ctrl_down_prompt(const float* dest, const float* msg, const uint16_t* w_down, int rows, int rank, float* hid, void* stream);
+
+/// Fused prompt loop controller up projection + blend (out may alias dest):
+/// out[r][c] = (1 - tanh(w_forget[c] . hid[r])) * dest[r][c] + tanh(w_gain[c] . hid[r]) * msg[r][c].
+void ctrl_up_blend_prompt(const float* dest, const float* msg, const float* hid, const uint16_t* w_gf, int rows, int rank,
+                          float* out, void* stream);
+
 }  // namespace basalt::models::inkling2

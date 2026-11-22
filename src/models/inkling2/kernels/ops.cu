@@ -54,30 +54,72 @@ __device__ __forceinline__ float sigmoidf_(float v) { return 1.f / (1.f + expf(-
 
 // ---- block residuals ---------------------------------------------------------------------------------------------------
 
+constexpr int kMixThreads = 192;
+constexpr int kMixVecs = kWidth / (4 * kMixThreads);   // 3 float4s (12 floats) per thread
+static_assert(kWidth == 4 * kMixThreads * kMixVecs, "kWidth splits into float4s over kMixThreads");
+
+template <int N>
+__device__ __forceinline__ void block_sums_mix(float (&v)[N], float* red) {
+    constexpr int kW = kMixThreads / 32;
+#pragma unroll
+    for (int i = 0; i < N; ++i) v[i] = warp_sum(v[i]);
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (lane == 0)
+#pragma unroll
+        for (int i = 0; i < N; ++i) red[i * kW + w] = v[i];
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        float s = 0.f;
+#pragma unroll
+        for (int j = 0; j < kW; ++j) s += red[i * kW + j];
+        v[i] = s;
+    }
+    __syncthreads();
+}
+
 template <int NQ>
-__global__ void __launch_bounds__(kThreads) attnres_mix_kernel(MixStates st, const float* __restrict__ queries, float eps,
-                                                               float* __restrict__ out, int64_t out_stride) {
-    __shared__ float red[kMaxMix * (NQ + 1) * (kThreads / 32)];
+__global__ void __launch_bounds__(kMixThreads) attnres_mix_kernel(MixStates st, const float* __restrict__ queries, float eps,
+                                                                  float* __restrict__ out, int64_t out_stride) {
+    __shared__ float red[kMaxMix * (NQ + 1) * (kMixThreads / 32)];
     const int r = blockIdx.x, n = st.n;
-    float v[kMaxMix][kPerThread];
+    float4 qv[NQ][kMixVecs];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+        const float4* qp = reinterpret_cast<const float4*>(queries + (size_t) q * kWidth);
+#pragma unroll
+        for (int j = 0; j < kMixVecs; ++j) qv[q][j] = qp[threadIdx.x + j * kMixThreads];
+    }
+    float4 v[kMaxMix][kMixVecs];
     float part[kMaxMix * (NQ + 1)];
 #pragma unroll
     for (int i = 0; i < kMaxMix * (NQ + 1); ++i) part[i] = 0.f;
 #pragma unroll
     for (int i = 0; i < kMaxMix; ++i) {
         if (i >= n) break;
-        const float* s = st.s[i] + (size_t) r * kWidth;
+        const float4* sp = reinterpret_cast<const float4*>(st.s[i] + (size_t) r * kWidth);
 #pragma unroll
-        for (int j = 0; j < kPerThread; ++j) {
-            const int c = threadIdx.x + j * kThreads;
-            const float x = s[c];
+        for (int j = 0; j < kMixVecs; ++j) {
+            const float4 x = sp[threadIdx.x + j * kMixThreads];
             v[i][j] = x;
-            part[i * (NQ + 1)] = fmaf(x, x, part[i * (NQ + 1)]);
+            float s = part[i * (NQ + 1)];
+            s = fmaf(x.x, x.x, s);
+            s = fmaf(x.y, x.y, s);
+            s = fmaf(x.z, x.z, s);
+            s = fmaf(x.w, x.w, s);
+            part[i * (NQ + 1)] = s;
 #pragma unroll
-            for (int q = 0; q < NQ; ++q) part[i * (NQ + 1) + 1 + q] = fmaf(queries[q * kWidth + c], x, part[i * (NQ + 1) + 1 + q]);
+            for (int q = 0; q < NQ; ++q) {
+                float d = part[i * (NQ + 1) + 1 + q];
+                d = fmaf(qv[q][j].x, x.x, d);
+                d = fmaf(qv[q][j].y, x.y, d);
+                d = fmaf(qv[q][j].z, x.z, d);
+                d = fmaf(qv[q][j].w, x.w, d);
+                part[i * (NQ + 1) + 1 + q] = d;
+            }
         }
     }
-    block_sums<kMaxMix * (NQ + 1)>(part, red);
+    block_sums_mix<kMaxMix * (NQ + 1)>(part, red);
     float inv[kMaxMix];
 #pragma unroll
     for (int i = 0; i < kMaxMix; ++i) inv[i] = i < n ? rsqrtf(part[i * (NQ + 1)] / (float) kWidth + eps) : 0.f;
@@ -96,14 +138,23 @@ __global__ void __launch_bounds__(kThreads) attnres_mix_kernel(MixStates st, con
             sc[i] = i < n ? expf(sc[i] - m) : 0.f;
             den += sc[i];
         }
-        float* o = out + (size_t) q * out_stride + (size_t) r * kWidth;
+        const float inv_den = 1.f / den;
+        float w[kMaxMix];
 #pragma unroll
-        for (int j = 0; j < kPerThread; ++j) {
-            float acc = 0.f;
+        for (int i = 0; i < kMaxMix; ++i) w[i] = i < n ? (sc[i] * inv_den) * inv[i] : 0.f;
+        float4* o = reinterpret_cast<float4*>(out + (size_t) q * out_stride + (size_t) r * kWidth);
+#pragma unroll
+        for (int j = 0; j < kMixVecs; ++j) {
+            float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
             for (int i = 0; i < kMaxMix; ++i)
-                if (i < n) acc = fmaf(sc[i] / den, v[i][j] * inv[i], acc);
-            o[threadIdx.x + j * kThreads] = acc;
+                if (i < n) {
+                    acc.x = fmaf(w[i], v[i][j].x, acc.x);
+                    acc.y = fmaf(w[i], v[i][j].y, acc.y);
+                    acc.z = fmaf(w[i], v[i][j].z, acc.z);
+                    acc.w = fmaf(w[i], v[i][j].w, acc.w);
+                }
+            o[threadIdx.x + j * kMixThreads] = acc;
         }
     }
 }
@@ -449,9 +500,9 @@ void attnres_mix(const MixStates& st, const float* queries, int n_q, int rows, f
     if (st.n < 1 || st.n > kMaxMix) throw std::runtime_error("inkling2 attnres_mix: state count");
     cudaStream_t s = (cudaStream_t) stream;
     switch (n_q) {
-        case 1: attnres_mix_kernel<1><<<rows, kThreads, 0, s>>>(st, queries, eps, out, out_stride); break;
-        case 3: attnres_mix_kernel<3><<<rows, kThreads, 0, s>>>(st, queries, eps, out, out_stride); break;
-        case 4: attnres_mix_kernel<4><<<rows, kThreads, 0, s>>>(st, queries, eps, out, out_stride); break;
+        case 1: attnres_mix_kernel<1><<<rows, kMixThreads, 0, s>>>(st, queries, eps, out, out_stride); break;
+        case 3: attnres_mix_kernel<3><<<rows, kMixThreads, 0, s>>>(st, queries, eps, out, out_stride); break;
+        case 4: attnres_mix_kernel<4><<<rows, kMixThreads, 0, s>>>(st, queries, eps, out, out_stride); break;
         default: throw std::runtime_error("inkling2 attnres_mix: query count");
     }
     check("attnres_mix");

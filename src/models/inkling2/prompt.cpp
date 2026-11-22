@@ -54,7 +54,7 @@ struct Carve {
 struct Bufs {
     float* role[kBufs] = {};
     float* resid = nullptr;
-    float *msg = nullptr, *mix = nullptr, *pair = nullptr, *hid = nullptr, *nrm = nullptr;
+    float *msg = nullptr, *mix = nullptr, *hid = nullptr, *nrm = nullptr;
     float *yq = nullptr, *yk = nullptr, *yv = nullptr, *q = nullptr, *r = nullptr, *sink = nullptr, *attn = nullptr, *o = nullptr;
     void* xq = nullptr;          // the experts' q8_1 rows (their input, then H)
     void *a4h = nullptr, *a4x = nullptr;   // NVFP4 experts (inside xq): H's FP4 tiles, the input's FP4 token planes
@@ -76,9 +76,8 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     b.resid = c.take<float>(R * E);
     // the attention's buffers
     const size_t arena = c.at;
-    b.msg = c.take<float>(R * E);
+    b.msg = c.take<float>(4 * R * E);
     b.mix = c.take<float>(3 * R * E);
-    b.pair = c.take<float>(2 * R * E);
     b.hid = c.take<float>(R * (size_t) g.gate_rank);
     b.nrm = c.take<float>(3 * R * E);
     b.yq = c.take<float>(R * kProjQ);
@@ -292,19 +291,17 @@ private:
 
     // A loop controller over the chunk: out = blend(dest, msg) of stream `st` (out may be dest).
     void controller(const LayerWeights& w, int st, const float* dest, const float* msg, int rows, float* out) {
-        const int E = g_.n_embd, rank = g_.gate_rank;
-        ctrl_pair_norm(dest, msg, rows, b_.pair, stream_);
-        bk::bf16_rows_dot(b_.pair, w.ctrl_down[st], b_.hid, rows, rank, 2 * E, stream_);
-        bk::bf16_rows_dot(b_.hid, w.ctrl_gf[st], b_.pair, rows, 2 * E, rank, stream_);
-        ctrl_blend(dest, msg, b_.pair, rows, out, stream_);
+        const int rank = g_.gate_rank;
+        ctrl_down_prompt(dest, msg, w.ctrl_down[st], rows, rank, b_.hid, stream_);
+        ctrl_up_blend_prompt(dest, msg, b_.hid, w.ctrl_gf[st], rows, rank, out, stream_);
     }
 
-    // The previous pass's message of stream `j` into msg (the same bits as the decode forward's four at once).
-    void message(const Step& s, const LayerWeights& w, int j, int rows) {
+    // All four streams' messages of the previous pass into b_.msg[0..3] in one read of bank[0..1].
+    void messages(const Step& s, const LayerWeights& w, int rows) {
         MixStates st;
         st.s[st.n++] = buf(s.bank[0]);
         st.s[st.n++] = buf(s.bank[1]);
-        attnres_mix(st, w.msg_query + (size_t) j * g_.n_embd, 1, rows, 1e-6f, b_.msg, (int64_t) rows * g_.n_embd, stream_);
+        attnres_mix(st, w.msg_query, 4, rows, 1e-6f, b_.msg, (int64_t) rows * g_.n_embd, stream_);
     }
 
     void layer(const Step& s, int rows, int64_t pos0) {
@@ -329,12 +326,10 @@ private:
             for (int j = 0; j < 3; ++j) in[j] = b_.mix + (full ? j : 0) * RE;
         }
         if (s.msgs) {
+            messages(s, w, rows);
             // controller j writes mix slot j; a sliding-window layer's one input feeds all three, so slot 0 goes last
-            for (const int j : {1, 2, 0}) {
-                message(s, w, j, rows);
-                controller(w, j, in[j], b_.msg, rows, b_.mix + j * RE);
-            }
-            for (int j = 0; j < 3; ++j) in[j] = b_.mix + j * RE;
+            for (const int j : {1, 2, 0}) controller(w, j, in[j], b_.msg + (size_t) j * RE, rows, b_.mix + (size_t) j * RE);
+            for (int j = 0; j < 3; ++j) in[j] = b_.mix + (size_t) j * RE;
         }
         const bool one = !full && in[0] == in[1] && in[1] == in[2];
         if (one) {
@@ -407,10 +402,7 @@ private:
         if (boundary) st.s[st.n++] = hid;
         st.s[st.n++] = b_.resid;
         attnres_mix(st, w.ffn_query, 1, rows, 1e-6f, b_.mix, (int64_t) RE, stream_);
-        if (s.msgs) {
-            message(s, w, 3, rows);
-            controller(w, 3, b_.mix, b_.msg, rows, b_.mix);
-        }
+        if (s.msgs) controller(w, 3, b_.mix, b_.msg + 3 * RE, rows, b_.mix);
         bk::rms_norm_rows(b_.mix, w.ffn_norm, rows, E, g_.rms_eps, b_.nrm, stream_);
         experts(w, l, rows);
         post_conv(b_.moe, b_.pos, w.ffn_post_conv, c.m_ring, b_.resid, rows, out, stream_);

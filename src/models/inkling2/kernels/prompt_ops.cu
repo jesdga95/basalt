@@ -159,4 +159,223 @@ void stage_to_ring(const void* k_stage, const void* v_stage, int64_t stage_cap, 
     check("stage_to_ring");
 }
 
+
+namespace {
+
+__device__ __forceinline__ unsigned tf32_of(float f) {
+    unsigned r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(f));
+    return r;
+}
+
+__device__ __forceinline__ void cp16_cg(void* dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src));
+}
+
+__device__ __forceinline__ void mma_tf32_2(float (&acc)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                           unsigned l0, unsigned l1, unsigned l2, unsigned l3, unsigned wv) {
+    const unsigned b0 = wv << 16, b1 = wv & 0xFFFF0000u;
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                 : "r"(l0), "r"(l1), "r"(l2), "r"(l3), "r"(b0), "r"(b1));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ float quad_sum_f(float v) {
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    return v + __shfl_xor_sync(0xffffffffu, v, 2);
+}
+
+// 16 rows x 64 outputs per block (4 warps, each 16 rows x 16 outputs), K=kWidth in 64-wide double-buffered stages.
+constexpr int kCdT = 16, kCdN = 64, kCdK = 64, kCdW = 4;
+constexpr int kCdXS = kCdK + 4, kCdWS = kCdK + 8;
+static_assert(kWidth % kCdK == 0, "kWidth must be a multiple of kCdK");
+
+__global__ void __launch_bounds__(32 * kCdW) ctrl_down_prompt_kernel(const float* __restrict__ dest,
+                                                                     const float* __restrict__ msg,
+                                                                     const uint16_t* __restrict__ w_down,
+                                                                     float* __restrict__ hid, int rows, int rank) {
+    __shared__ __align__(16) float xs[2][kCdT][kCdXS];
+    __shared__ __align__(16) uint16_t ws[2][kCdN][kCdWS];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    const int t0 = (int) blockIdx.x * kCdT, nb = (int) blockIdx.y * kCdN, n0 = nb + wid * 16;
+    const int nkc = kWidth / kCdK;
+    const int64_t w_ld = (int64_t) 2 * kWidth;
+
+    const auto load_stage = [&](int buf, const float* xsrc, int w_col0, int kc) {
+        const int k0 = kc * kCdK;
+        for (int q = tid; q < kCdT * kCdK / 4; q += 32 * kCdW) {
+            const int r = q / (kCdK / 4), k4 = (q % (kCdK / 4)) * 4;
+            cp16_cg(&xs[buf][r][k4], xsrc + (size_t) min(t0 + r, rows - 1) * kWidth + k0 + k4);
+        }
+        for (int q = tid; q < kCdN * kCdK / 8; q += 32 * kCdW) {
+            const int r = q / (kCdK / 8), k8 = (q % (kCdK / 8)) * 8;
+            cp16_cg(&ws[buf][r][k8], w_down + (size_t) min(nb + r, rank - 1) * w_ld + w_col0 + k0 + k8);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+
+    float acc_d[2][4] = {}, acc_m[2][4] = {};
+    float ss_da = 0.f, ss_db = 0.f, ss_ma = 0.f, ss_mb = 0.f;
+
+    const auto run_half = [&](const float* xsrc, int w_col0, float (&acc)[2][4], float& ss_a, float& ss_b) {
+        load_stage(0, xsrc, w_col0, 0);
+        for (int kc = 0; kc < nkc; ++kc) {
+            if (kc + 1 < nkc) {
+                load_stage((kc + 1) & 1, xsrc, w_col0, kc + 1);
+                asm volatile("cp.async.wait_group 1;\n" ::);
+            } else {
+                asm volatile("cp.async.wait_group 0;\n" ::);
+            }
+            __syncthreads();
+            const int buf = kc & 1;
+            const float* xa = &xs[buf][g][2 * c];
+            const float* xb = &xs[buf][g + 8][2 * c];
+            const uint16_t* w0 = &ws[buf][wid * 16 + g][2 * c];
+            const uint16_t* w1 = &ws[buf][wid * 16 + 8 + g][2 * c];
+#pragma unroll
+            for (int k = 0; k < kCdK; k += 8) {
+                const float2 fa = *reinterpret_cast<const float2*>(xa + k);
+                const float2 fb = *reinterpret_cast<const float2*>(xb + k);
+                ss_a = fmaf(fa.y, fa.y, fmaf(fa.x, fa.x, ss_a));
+                ss_b = fmaf(fb.y, fb.y, fmaf(fb.x, fb.x, ss_b));
+                const unsigned a0 = tf32_of(fa.x), a1 = tf32_of(fb.x), a2 = tf32_of(fa.y), a3 = tf32_of(fb.y);
+                const unsigned l0 = tf32_of(fa.x - __uint_as_float(a0)), l1 = tf32_of(fb.x - __uint_as_float(a1));
+                const unsigned l2 = tf32_of(fa.y - __uint_as_float(a2)), l3 = tf32_of(fb.y - __uint_as_float(a3));
+                const unsigned wv0 = *reinterpret_cast<const unsigned*>(w0 + k);
+                const unsigned wv1 = *reinterpret_cast<const unsigned*>(w1 + k);
+                mma_tf32_2(acc[0], a0, a1, a2, a3, l0, l1, l2, l3, wv0);
+                mma_tf32_2(acc[1], a0, a1, a2, a3, l0, l1, l2, l3, wv1);
+            }
+            __syncthreads();
+        }
+    };
+
+    run_half(dest, 0, acc_d, ss_da, ss_db);
+    run_half(msg, kWidth, acc_m, ss_ma, ss_mb);
+
+    const float inv_da = rsqrtf(quad_sum_f(ss_da) / (float) kWidth + 1e-6f);
+    const float inv_db = rsqrtf(quad_sum_f(ss_db) / (float) kWidth + 1e-6f);
+    const float inv_ma = rsqrtf(quad_sum_f(ss_ma) / (float) kWidth + 1e-6f);
+    const float inv_mb = rsqrtf(quad_sum_f(ss_mb) / (float) kWidth + 1e-6f);
+
+    const int ta = t0 + g, tb = t0 + g + 8;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int col = n0 + j * 8 + 2 * c;
+        if (col + 1 < rank) {
+            if (ta < rows) {
+                *reinterpret_cast<float2*>(hid + (size_t) ta * rank + col) =
+                    make_float2(acc_d[j][0] * inv_da + acc_m[j][0] * inv_ma,
+                                acc_d[j][1] * inv_da + acc_m[j][1] * inv_ma);
+            }
+            if (tb < rows) {
+                *reinterpret_cast<float2*>(hid + (size_t) tb * rank + col) =
+                    make_float2(acc_d[j][2] * inv_db + acc_m[j][2] * inv_mb,
+                                acc_d[j][3] * inv_db + acc_m[j][3] * inv_mb);
+            }
+        }
+    }
+}
+
+// 64 rows x 32 channels per block (4 warps, each 16 rows x 32 channels gain+forget).
+constexpr int kCuT = 64, kCuC = 32, kCuK = 64, kCuW = 4;
+constexpr int kCuHS = kCuK + 4, kCuWS = kCuK + 8;
+static_assert(kWidth % kCuC == 0, "kWidth must be a multiple of kCuC");
+
+__global__ void __launch_bounds__(32 * kCuW) ctrl_up_blend_prompt_kernel(const float* __restrict__ dest,
+                                                                         const float* __restrict__ msg,
+                                                                         const float* __restrict__ hid,
+                                                                         const uint16_t* __restrict__ w_gf,
+                                                                         float* __restrict__ out, int rows, int rank) {
+    __shared__ __align__(16) float hs[kCuT][kCuHS];
+    __shared__ __align__(16) uint16_t wg[kCuC][kCuWS];
+    __shared__ __align__(16) uint16_t wf[kCuC][kCuWS];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    const int t0 = (int) blockIdx.x * kCuT, c0 = (int) blockIdx.y * kCuC;
+
+    float acc_g[4][4] = {}, acc_f[4][4] = {};
+    for (int k0 = 0; k0 < rank; k0 += kCuK) {
+        const int kend = min(kCuK, rank - k0);
+        for (int q = tid; q < kCuT * (kCuK / 4); q += 32 * kCuW) {
+            const int r = q / (kCuK / 4), k4 = (q % (kCuK / 4)) * 4;
+            *reinterpret_cast<float4*>(&hs[r][k4]) =
+                k4 < kend ? *reinterpret_cast<const float4*>(hid + (size_t) min(t0 + r, rows - 1) * rank + k0 + k4)
+                          : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        for (int q = tid; q < kCuC * (kCuK / 8); q += 32 * kCuW) {
+            const int r = q / (kCuK / 8), k8 = (q % (kCuK / 8)) * 8;
+            *reinterpret_cast<uint4*>(&wg[r][k8]) =
+                k8 < kend ? *reinterpret_cast<const uint4*>(w_gf + (size_t) (c0 + r) * rank + k0 + k8)
+                          : make_uint4(0u, 0u, 0u, 0u);
+            *reinterpret_cast<uint4*>(&wf[r][k8]) =
+                k8 < kend ? *reinterpret_cast<const uint4*>(w_gf + (size_t) (kWidth + c0 + r) * rank + k0 + k8)
+                          : make_uint4(0u, 0u, 0u, 0u);
+        }
+        __syncthreads();
+        const float* ha = &hs[wid * 16 + g][2 * c];
+        const float* hb = &hs[wid * 16 + 8 + g][2 * c];
+#pragma unroll
+        for (int k = 0; k < kCuK; k += 8) {
+            if (k >= kend) break;
+            const float2 fa = *reinterpret_cast<const float2*>(ha + k);
+            const float2 fb = *reinterpret_cast<const float2*>(hb + k);
+            const unsigned a0 = tf32_of(fa.x), a1 = tf32_of(fb.x), a2 = tf32_of(fa.y), a3 = tf32_of(fb.y);
+            const unsigned l0 = tf32_of(fa.x - __uint_as_float(a0)), l1 = tf32_of(fb.x - __uint_as_float(a1));
+            const unsigned l2 = tf32_of(fa.y - __uint_as_float(a2)), l3 = tf32_of(fb.y - __uint_as_float(a3));
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const unsigned vg = *reinterpret_cast<const unsigned*>(&wg[j * 8 + g][k + 2 * c]);
+                const unsigned vf = *reinterpret_cast<const unsigned*>(&wf[j * 8 + g][k + 2 * c]);
+                mma_tf32_2(acc_g[j], a0, a1, a2, a3, l0, l1, l2, l3, vg);
+                mma_tf32_2(acc_f[j], a0, a1, a2, a3, l0, l1, l2, l3, vf);
+            }
+        }
+        __syncthreads();
+    }
+
+    const int ta = t0 + wid * 16 + g, tb = ta + 8;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int col = c0 + j * 8 + 2 * c;
+        if (ta < rows) {
+            const size_t off = (size_t) ta * kWidth + col;
+            const float2 d = *reinterpret_cast<const float2*>(dest + off);
+            const float2 m = *reinterpret_cast<const float2*>(msg + off);
+            *reinterpret_cast<float2*>(out + off) =
+                make_float2((1.f - tanhf(acc_f[j][0])) * d.x + tanhf(acc_g[j][0]) * m.x,
+                            (1.f - tanhf(acc_f[j][1])) * d.y + tanhf(acc_g[j][1]) * m.y);
+        }
+        if (tb < rows) {
+            const size_t off = (size_t) tb * kWidth + col;
+            const float2 d = *reinterpret_cast<const float2*>(dest + off);
+            const float2 m = *reinterpret_cast<const float2*>(msg + off);
+            *reinterpret_cast<float2*>(out + off) =
+                make_float2((1.f - tanhf(acc_f[j][2])) * d.x + tanhf(acc_g[j][2]) * m.x,
+                            (1.f - tanhf(acc_f[j][3])) * d.y + tanhf(acc_g[j][3]) * m.y);
+        }
+    }
+}
+
+}  // namespace
+
+void ctrl_down_prompt(const float* dest, const float* msg, const uint16_t* w_down, int rows, int rank, float* hid, void* stream) {
+    if (rows <= 0) return;
+    if (rank <= 0 || rank % 16 != 0) throw std::runtime_error("inkling2 ctrl_down_prompt: rank");
+    const dim3 grid((unsigned) ((rows + kCdT - 1) / kCdT), (unsigned) ((rank + kCdN - 1) / kCdN));
+    ctrl_down_prompt_kernel<<<grid, 32 * kCdW, 0, (cudaStream_t) stream>>>(dest, msg, w_down, hid, rows, rank);
+    check("ctrl_down_prompt");
+}
+
+void ctrl_up_blend_prompt(const float* dest, const float* msg, const float* hid, const uint16_t* w_gf, int rows, int rank,
+                          float* out, void* stream) {
+    if (rows <= 0) return;
+    if (rank <= 0 || rank % 8 != 0) throw std::runtime_error("inkling2 ctrl_up_blend_prompt: rank");
+    const dim3 grid((unsigned) ((rows + kCuT - 1) / kCuT), (unsigned) (kWidth / kCuC));
+    ctrl_up_blend_prompt_kernel<<<grid, 32 * kCuW, 0, (cudaStream_t) stream>>>(dest, msg, hid, w_gf, out, rows, rank);
+    check("ctrl_up_blend_prompt");
+}
+
 }  // namespace basalt::models::inkling2

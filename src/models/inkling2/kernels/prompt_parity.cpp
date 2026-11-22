@@ -961,6 +961,66 @@ void test_dense() {
             std::printf("  controller down at %d rows: tiles %.1f us, one warp %.1f us\n", R, t_tiles, t_warp);
             cudaFree(h3);
         }
+        {   // fused ctrl_down_prompt + ctrl_up_blend_prompt vs unfused (ctrl_pair_norm + bf16_rows_dot + ctrl_blend) and CPU
+            const int Rc = 2048;
+            const std::vector<float> hd = randn((size_t) Rc * E, 1.0f), hm = randn((size_t) Rc * E, 1.0f);
+            float *d_dest = dev(hd), *d_msg = dev(hm), *d_pair = zeros<float>((size_t) Rc * K2);
+            float *d_h_ref = zeros<float>((size_t) Rc * rank), *d_h_new = zeros<float>((size_t) Rc * rank);
+            float *d_o_ref = zeros<float>((size_t) Rc * E), *d_o_new = zeros<float>((size_t) Rc * E);
+            ctrl_pair_norm(d_dest, d_msg, Rc, d_pair, S);
+            bk::bf16_rows_dot(d_pair, ddn, d_h_ref, Rc, rank, K2, S);
+            bk::bf16_rows_dot(d_h_ref, dup, d_pair, Rc, K2, rank, S);
+            ctrl_blend(d_dest, d_msg, d_pair, Rc, d_o_ref, S);
+            ctrl_down_prompt(d_dest, d_msg, ddn, Rc, rank, d_h_new, S);
+            ctrl_up_blend_prompt(d_dest, d_msg, d_h_new, dup, Rc, rank, d_o_new, S);
+            report("ctrl_down_prompt vs unfused", host(d_h_new, (size_t) Rc * rank), host(d_h_ref, (size_t) Rc * rank), 5e-5);
+            report("ctrl_up_blend_prompt vs unfused", host(d_o_new, (size_t) Rc * E), host(d_o_ref, (size_t) Rc * E), 5e-5);
+            // Position invariance: slice rows [37..100) alone must give identical bits
+            const int off_r = 37, sub_r = 64;
+            float *d_h_sub = zeros<float>((size_t) sub_r * rank), *d_o_sub = zeros<float>((size_t) sub_r * E);
+            ctrl_down_prompt(d_dest + (size_t) off_r * E, d_msg + (size_t) off_r * E, ddn, sub_r, rank, d_h_sub, S);
+            ctrl_up_blend_prompt(d_dest + (size_t) off_r * E, d_msg + (size_t) off_r * E, d_h_sub, dup, sub_r, rank, d_o_sub, S);
+            const auto full_o = host(d_o_new, (size_t) Rc * E), sub_o = host(d_o_sub, (size_t) sub_r * E);
+            same_bits("ctrl_prompt rows 37..100 alone", full_o.data() + (size_t) off_r * E, sub_o.data(), sub_o.size() * 4);
+            // CPU double reference on first 8 rows
+            std::vector<double> ref_o((size_t) 8 * E);
+            for (int r = 0; r < 8; ++r) {
+                double sd = 0, sm = 0;
+                for (int c = 0; c < E; ++c) { sd += (double) hd[(size_t) r * E + c] * hd[(size_t) r * E + c]; sm += (double) hm[(size_t) r * E + c] * hm[(size_t) r * E + c]; }
+                const double id = 1.0 / std::sqrt(sd / E + 1e-6), im = 1.0 / std::sqrt(sm / E + 1e-6);
+                std::vector<double> hrow(rank, 0.0);
+                auto bf2d = [](uint16_t u) { uint32_t v = (uint32_t) u << 16; float f; std::memcpy(&f, &v, 4); return (double) f; };
+                for (int o = 0; o < rank; ++o) {
+                    double s = 0;
+                    for (int c = 0; c < E; ++c) s += bf2d(wdn[(size_t) o * K2 + c]) * hd[(size_t) r * E + c] * id;
+                    for (int c = 0; c < E; ++c) s += bf2d(wdn[(size_t) o * K2 + E + c]) * hm[(size_t) r * E + c] * im;
+                    hrow[o] = s;
+                }
+                for (int c = 0; c < E; ++c) {
+                    double sg = 0, sf = 0;
+                    for (int o = 0; o < rank; ++o) {
+                        sg += bf2d(wup[(size_t) c * rank + o]) * hrow[o];
+                        sf += bf2d(wup[(size_t) (E + c) * rank + o]) * hrow[o];
+                    }
+                    ref_o[(size_t) r * E + c] = (1.0 - std::tanh(sf)) * hd[(size_t) r * E + c] + std::tanh(sg) * hm[(size_t) r * E + c];
+                }
+            }
+            report("ctrl_prompt vs CPU double (8 rows)", host(d_o_new, (size_t) 8 * E), ref_o, 5e-5);
+            const double t_old = time_us([&] {
+                ctrl_pair_norm(d_dest, d_msg, Rc, d_pair, S);
+                bk::bf16_rows_dot(d_pair, ddn, d_h_ref, Rc, rank, K2, S);
+                bk::bf16_rows_dot(d_h_ref, dup, d_pair, Rc, K2, rank, S);
+                ctrl_blend(d_dest, d_msg, d_pair, Rc, d_o_ref, S);
+            });
+            const double t_new = time_us([&] {
+                ctrl_down_prompt(d_dest, d_msg, ddn, Rc, rank, d_h_new, S);
+                ctrl_up_blend_prompt(d_dest, d_msg, d_h_new, dup, Rc, rank, d_o_new, S);
+            });
+            std::printf("  controller fused at %d rows: %.1f us vs unfused %.1f us (%.2fx)\n", Rc, t_new, t_old, t_old / t_new);
+            cudaFree(d_dest); cudaFree(d_msg); cudaFree(d_pair);
+            cudaFree(d_h_ref); cudaFree(d_h_new); cudaFree(d_o_ref); cudaFree(d_o_new);
+            cudaFree(d_h_sub); cudaFree(d_o_sub);
+        }
         cudaFree(ddn);
         cudaFree(dup);
         cudaFree(dx);
