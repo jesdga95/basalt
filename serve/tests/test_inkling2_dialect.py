@@ -101,6 +101,11 @@ class Controls(unittest.TestCase):
         for level, text in (("low", "0.2"), ("medium", "0.7"), ("high", "0.9"), ("max", "0.99")):
             self.assertEqual(self.prompt(reasoning_effort=level), EFFORT.format(text) + self.tail, level)
 
+    def test_minimal_is_the_templates(self):
+        self.assertEqual(self.prompt(reasoning_effort="minimal"), EFFORT.format("0.1") + self.tail)
+        msgs, tools, kwargs = openai_to_messages({"messages": self.msgs, "reasoning_effort": "minimal"})
+        self.assertEqual(self.svc.thinking_kwargs(kwargs), {"reasoning_effort": "minimal"})
+
     def test_the_grammar_hears_when_thinking_is_off(self):
         for thinking, want in ((False, {"kind": "json_object", "think": False}), (True, {"kind": "json_object"})):
             svc = service(HEADER + TEXT + "{}" + END)
