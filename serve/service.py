@@ -286,6 +286,12 @@ class Service:
                 subprocess.run(cmd, shell=isinstance(cmd, str), timeout=120, stdin=subprocess.DEVNULL)
             except (OSError, subprocess.SubprocessError) as e:
                 print(f"[server] warning: before_load command failed ({e}), loading anyway", flush=True)
+        reap = getattr(self.engine, "reap", None)
+        if callable(reap):
+            # an engine that ended (retired on an encode timeout, silent, crashed) may still have a child
+            # releasing GPU/RAM: reap it now, or the free-VRAM check below would blame "another program" and
+            # keep rejecting the very restart that cleans it up
+            reap()   # EngineStuck here means it is genuinely still exiting: the honest answer
         if self.min_free_vram_mib:
             free = self.free_vram_mib()
             deadline = time.time() + 15                 # memory just released elsewhere may take a moment

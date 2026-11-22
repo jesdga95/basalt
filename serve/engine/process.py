@@ -552,14 +552,21 @@ class ProcessEngine:
         try:
             with open(self.log_path, "rb") as f:
                 f.seek(0, 2)
-                f.seek(max(0, f.tell() - 4096))
-                tail = f.read().decode("utf-8", "replace")
+                size = f.tell()
+                start = getattr(self, "log_start", None)
+                if isinstance(start, bool) or not isinstance(start, int):
+                    start = max(0, size - 4096)      # no boundary recorded: the bounded tail
+                if 0 <= start <= size:               # a boundary outside the file is not this run's: nothing to attribute
+                    f.seek(max(start, size - 4096))
+                    tail = f.read(4096).decode("utf-8", "replace")
         except (OSError, TypeError):
             pass
         for line in reversed(tail.splitlines()):
             if "issue #29" in line:
                 return "the engine's watchdog stopped it: " + line.strip()
         proc = self.proc                                 # None between restart's close and start
+        if proc is None:
+            proc = getattr(self, "_reaped", None)        # a reaped child keeps its exit status
         rc = proc.poll() if proc is not None else None
         status = self._format_exit_status(rc)
         if rc is not None and rc >= 0 and self.last_err:  # its last stdout words
@@ -755,6 +762,20 @@ class ProcessEngine:
         `OK <groups> <nx> <ny> <ms> <time,...>` line. As encode_images otherwise."""
         return self._encode(f"ENCV {video} {out} {words}".rstrip(), 1, "video", timeout)[0]
 
+    def _retire(self, why: str) -> None:
+        """End the engine after an encode timeout: a late reply leaves the command stream unsafe to
+        reuse, so the next request restarts a fresh one; the child is stopped now, not left holding
+        the VRAM the restart needs."""
+        self.ended = True
+        proc = self.proc
+        if proc is not None and proc.poll() is None and not self.silent_note:   # a live child: retirement is the cause
+            self.silent_note = why + "; the engine was retired"
+            try:
+                proc.kill()
+                proc.wait(timeout=20)                   # restart()/close() handles one still exiting
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
     def _encode(self, command: str, replies: int, what: str, timeout: float | None) -> list[str]:
         if not self.alive():
             raise EngineDied("the engine is not running")
@@ -769,12 +790,13 @@ class ProcessEngine:
                 have_ctl = True
         try:
             self._send(command)
-            deadline = time.time() + timeout
+            deadline = time.monotonic() + timeout
             got: list[str] = []
             while len(got) < replies:
                 try:
-                    line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+                    line = self.lines.get(timeout=max(0.1, deadline - time.monotonic()))
                 except queue.Empty:
+                    self._retire(f"the {what} command timed out")
                     raise EngineDied(f"the engine did not answer the {what} command") from None
                 if line is None:
                     raise EngineDied("the engine ended")
@@ -783,7 +805,8 @@ class ProcessEngine:
                     raise ValueError(f"the {what} could not be read: " + (line[8:].strip() or "the engine refused it"))
                 if line.startswith("ENC OK "):
                     got.append(line[4:])
-                elif time.time() > deadline:
+                elif time.monotonic() > deadline:
+                    self._retire(f"the {what} command timed out")
                     raise EngineDied(f"the engine did not answer the {what} command")
             return got
         finally:
@@ -1750,6 +1773,15 @@ class ProcessEngine:
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
         return EngineSilent(f"{what}; the server ended the engine")
+
+    def reap(self) -> None:
+        """Close the child of an engine that already ended (a retirement, a stall, a crash): it may still be
+        releasing GPU/RAM, and the load path's free-VRAM check would otherwise blame another program and
+        keep rejecting the restart that cleans it up. The child is kept for death_note: close() clears
+        self.proc, which would turn a crash's exit status into "no exit status"."""
+        if getattr(self, "proc", None) is not None and not self.alive():
+            self._reaped = self.proc                     # its returncode survives the close
+            self.close()   # EngineStuck here means it is genuinely still exiting: the honest answer
 
     def close(self):
         """End the engine: QUIT, then terminate, then kill, 20 s each; EngineStuck if it still runs."""
