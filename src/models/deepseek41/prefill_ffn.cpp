@@ -123,7 +123,7 @@ public:
         all = routed;
         const int64_t nf = (int64_t) g_.n_ff_exp * std::max(g_.n_shared, 1);
         const std::pair<const char*, int64_t> shexp[] = {{"ffn_gate_shexp.weight", nf}, {"ffn_up_shexp.weight", nf},
-                                                         {"ffn_down_shexp.weight", g_.n_embd}};
+                                                         {"ffn_down_shexp.weight", g_.n_embd}, {"engram_kv.weight", 5 * g_.n_embd}};
         for (int il = 0; il < g_.n_layers; ++il)
             for (const auto& [name, rows] : shexp)
                 if (const DevTensor* t = m_.tensor(il, name); t && mmq::fits(t->type, rows)) add(all, t->type, rows);
@@ -318,6 +318,33 @@ public:
             swiglu_clamped(sg, su, nf * nc, g_.clamp_shexp[(size_t) il], h_, stream);
             mmq::quantize(h_, nullptr, xq2_, dn->type, nf, nf, nc, stream);
             dense(dn, n, nf, xq2_, nc, out + (size_t) t0 * n, stream);
+        }
+        return true;
+    }
+
+    bool dense_rows(const void* w, int type, int rows, int cols, const float* x, int T, float* out, void* stream) override {
+        namespace mmq = basalt::prefill::mmq;
+        if (!mmq::fits(type, rows) || mmq::q8_bytes(kSharedRows, cols) > mmq::q8_bytes(max_rows_, g_.n_embd)) return false;
+        for (int t0 = 0; t0 < T; t0 += kSharedRows) {
+            const int nc = std::min(kSharedRows, T - t0);
+            const int32_t b[2] = {0, nc};
+            cudaMemcpyAsync(sbnd_, b, sizeof b, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+            mmq::quantize(x + (size_t) t0 * cols, nullptr, xq1_, type, cols, cols, nc, stream);
+            basalt::prefill::mmq::Product p;
+            p.w = w;
+            p.type = type;
+            p.w_rows = rows;
+            p.w_cols = cols;
+            p.expert_bytes = mmq::matrix_bytes(type, rows, cols);
+            p.n = 1;
+            p.xq = xq1_;
+            p.bounds = sbnd_;
+            p.ids = ident_;
+            p.total_rows = nc;
+            p.max_rows = nc;
+            p.dst = out + (size_t) t0 * rows;
+            p.ld_dst = rows;
+            ctx_.run(p, stream);
         }
         return true;
     }
