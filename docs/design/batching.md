@@ -95,11 +95,15 @@ times the slots plus the shared scratch once, so more slots cost only their cach
 
 ## Flash-Next and 27B
 
-- **Qwen3.8-27B** (the dense stack, `src/dense`) has its own `decode_batch`: it packs segments (`BatchSeg`) into one window
-  of up to 16 rows, attention through `gqa_decode_attn_segs`, GDN through `dec_gdn_rec_seg_split`, one graph per composition
-  (`Model::batch_graphs`). On the driver its `BatchSeg` packing becomes `batch_stage`, the layer walk `batch_forward` (its
-  kernels already read segments), the logits and MTP or DFlash taps per segment `batch_take`, its sampler `batch_draw`;
-  `Model::batch_graphs` goes for `BatchShared`. Its sessions already share the stack's buffers.
+- **Qwen3.8-27B** (the dense stack, `src/dense`) is on the driver. A window holds up to 16 rows (`kBatch`); its kernels read
+  their own segment tables (the attention's `GqaSeg` per segment, GDN's `BatchTable` through `dec_gdn_rec_seg_split`), which
+  carry each segment's cache and recurrent-state addresses beside its rows. `batch_reserve` settles a session (the last
+  window's GDN commit on its side stream; the driver readies every session before it waits on any, so the commits run side by
+  side) and prepares its draw; `batch_stage` packs the rows' tokens, rope positions (each session's offset) and the segment
+  table (`stage_batch`); `batch_forward` is the layer walk and the head over every row, each segment's logits and block-drafter
+  or MTP rows into its session (`batch_body`); `batch_take` its bookkeeping, `batch_draw` its sampler. The window scratch is the
+  model's, shared by every session. A layer split runs its two cards' graphs itself (`batch_captured` false: `forward_batch`
+  keeps each card's in its model's `BatchShared`). The block drafter's batched pass (`draft_batch`) stays the model's.
 - **Qwen3.8-Flash-Next** (`src/models/qwen4exp`) has its own runtime (`serve::Runtime`) and verifier: `Verifier::stage_batch`
   takes per-row slot ids and lengths over its elastic KV arena. It is the most tuned path in the engine and already batches
   slots x drafts in one pass. It does not migrate: a rewrite onto the shared runtime gains nothing measurable and risks its
