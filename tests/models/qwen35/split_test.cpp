@@ -111,11 +111,13 @@ Out run(const model::ModelAdapter& a, const std::string& pack, const Setup& su) 
         req.peer_devices = {1};
         req.diag_split_at = su.cut;
     }
-    std::unique_ptr<model::LoadedModel> loaded;
-    if (const model::Result e = a.load(req, loaded); !e.ok()) die("load", e.message);
-    std::unique_ptr<model::ModelSession> s, s2;
-    if (const model::Result e = loaded->make_session(s); !e.ok() || !s->prepare().ok()) die("session", e.message);
-    if (const model::Result e = loaded->make_session(s2); !e.ok() || !s2->prepare().ok()) die("session", e.message);
+    req.sessions = 2;
+    model::Started started;
+    if (const model::Result e = a.start(req, started); !e.ok()) die("start", e.message);
+    std::unique_ptr<model::ModelSession>& s = started.sessions[0];
+    std::unique_ptr<model::ModelSession>& s2 = started.sessions[1];
+    if (const model::Result e = s->prepare(); !e.ok()) die("session", e.message);
+    if (const model::Result e = s2->prepare(); !e.ok()) die("session", e.message);
     std::vector<int32_t> prompt((size_t) su.prompt);
     uint32_t x = 12345;
     for (int32_t& t : prompt) {
@@ -203,10 +205,10 @@ std::vector<uint64_t> vision_run(const model::ModelAdapter& a, const std::string
         req.peer_devices = {1};
         req.diag_split_at = cut;
     }
-    std::unique_ptr<model::LoadedModel> loaded;
-    if (const model::Result e = a.load(req, loaded); !e.ok()) die("load", e.message);
-    std::unique_ptr<model::ModelSession> s;
-    if (const model::Result e = loaded->make_session(s); !e.ok() || !s->prepare().ok()) die("session", e.message);
+    model::Started started;
+    if (const model::Result e = a.start(req, started); !e.ok()) die("start", e.message);
+    std::unique_ptr<model::ModelSession>& s = started.sessions.front();
+    if (const model::Result e = s->prepare(); !e.ok()) die("session", e.message);
     std::vector<int32_t> text(64);
     for (size_t i = 0; i < text.size(); ++i) text[i] = 1000 + (int32_t) (i * 37 % 20000);
     model::PrefillRequest p;

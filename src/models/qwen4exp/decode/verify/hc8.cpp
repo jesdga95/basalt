@@ -1,5 +1,5 @@
 #include "common.hpp"
-#include "basalt/core/load_progress.hpp"
+#include "basalt/core/loader.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/decode/gdn_head_split.hpp"
@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -20,10 +21,26 @@ using namespace verify_detail;
 
 bool hc8_table_has(const std::string& name, int rows, int cols) { return basalt::core::hc8_find(name, rows, cols) != nullptr; }
 
-const void* hc8_table_adopt(const std::string& name, const uint16_t* w, int rows, int cols) {
+const void* hc8_table_adopt(const std::string& name, const uint16_t* w, int rows, int cols, LoadPlan& reads) {
     const Hc8Copy* c = hc8_find(name, rows, cols);
     if (c == nullptr) return nullptr;
-    return basalt::kernels::hc8_upload(w, c->q(), c->s(), rows, cols);
+    int8_t* q = nullptr;
+    uint16_t* s = nullptr;
+    const void* key = basalt::kernels::hc8_register(w, rows, cols, &q, &s);
+    if (key == nullptr || q == nullptr) return key;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const uint64_t nq = (uint64_t) rows * cols, ns = (uint64_t) rows * c->srow * 2;
+    for (const auto& [from, to, n] : {std::make_tuple((const uint8_t*) c->q(), (void*) q, nq),
+                                      std::make_tuple((const uint8_t*) c->s(), (void*) s, ns)}) {
+        LoadItem it;   // from the table in RAM, in the start's pass
+        it.from = from;
+        it.bytes = n;
+        it.dev = to;
+        it.device = dev;
+        reads.add(it);
+    }
+    return key;
 }
 
 namespace {
@@ -57,23 +74,17 @@ uint64_t Verifier::hc8_plan_bytes(const std::function<bool(const std::string&)>&
     return total;
 }
 
-bool Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g, std::string& err) {
+bool Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g, LoadPlan& reads, std::string& err) {
     if (!basalt::kernels::hc8_enabled()) return true;
     const std::vector<Hc8Tensor> tensors = hc8_tensors(g);
-    const uint64_t total = hc8_plan_bytes([&](const std::string& n) { return wt.find(n) != nullptr; }, g);
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
-    LoadProgress progress(LoadProgress::cuda(dev), total);
     for (const Hc8Tensor& t : tensors) {
         const WeightRef* r = wt.find(t.name);
         if (r == nullptr || r->data == nullptr) continue;   // not held on this device
-        if (hc8_table_adopt(t.name, (const uint16_t*) r->data, t.rows, t.cols) == nullptr) {
+        if (hc8_table_adopt(t.name, (const uint16_t*) r->data, t.rows, t.cols, reads) == nullptr) {
             err = "hc8: no 8-bit copy of " + t.name;
             return false;
         }
-        progress.add(hc8_copy_bytes(t));
     }
-    progress.finish();
     basalt::log::info("basalt hc8", "8-bit hyper-connection copies, %.0f MiB of VRAM",
                  (double) basalt::kernels::hc8_bytes() / 1048576.0);
     return true;

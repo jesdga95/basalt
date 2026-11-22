@@ -73,8 +73,8 @@ int decode(Context& context) {
         vh.slot_off = xcache.slot_offsets();   // the device plan's pointers
         vh.n_slots = xcache.slots();
         ver.set_cpu_warm(drive.d.pool, drive.d.src);
-        ver.set_route_tail_skip(o.route_tail_skip);
-        ver.set_route_prior(o.route_prior);
+        ver.set_route_tail_skip(o.route.tail_skip);
+        ver.set_route_prior(o.route.prior);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             return fatal_start_error(err);
         }
@@ -203,7 +203,7 @@ int decode(Context& context) {
             return 1;
         }
         basalt::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
-        basalt::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
+        basalt::spec::DraftPolicy policy(o.spec, 0.03, false);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         if (o.suffix_draft > 0) {

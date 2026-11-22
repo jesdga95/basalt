@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jinja2
+from jinja2 import nodes
+from jinja2.ext import Extension
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from serve.api.documents import expand_documents, has_document
@@ -24,6 +26,21 @@ from serve.api.documents import expand_documents, has_document
 # ------------------------------------------------------------------------------------------------ template
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
     """The template refused the messages; a ValueError so the client gets a 400 with its message."""
+
+
+class _Generation(Extension):
+    """transformers' `{% generation %}` block (it marks the assistant's tokens for training masks): its body renders as
+    it is."""
+
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return nodes.CallBlock(self.call_method("_body"), [], [], body).set_lineno(lineno)
+
+    def _body(self, caller):
+        return caller()
 
 
 class ChatTemplate:
@@ -40,7 +57,8 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
+                                            extensions=["jinja2.ext.loopcontrols", _Generation])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = source
@@ -67,7 +85,7 @@ VIDEO_PARTS = ("video_url", "input_video", "video")
 VIDEO_OPTIONS = ("fps", "max_frames")         # a video part's own sampling, as vLLM takes them
 
 # client spellings of a thinking level -> low, medium, high, max or none; a dialect says what its template takes for each
-EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
+EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None, "no_think": None,
           "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 
 
@@ -476,13 +494,16 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     _order_chat_tool_results(messages)
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
-    # Thinking, strongest first: off from any field (enable_thinking false, an effort of none, reasoning_budget 0),
-    # then chat_template_kwargs.reasoning_effort, "reasoning_effort" or Responses-style "reasoning": {"effort": ...},
-    # and last the level a reasoning_budget implies (-1: the highest, N: as Anthropic's budget_tokens)
+    # Thinking, strongest first: off from any field (enable_thinking false, an effort of none, reasoning_budget 0,
+    # a "reasoning": {"enabled": false}), then chat_template_kwargs.reasoning_effort, "reasoning_effort" or
+    # Responses-style "reasoning": {"effort": ...}, and last the level a reasoning_budget implies
+    # (-1: the highest, N: as Anthropic's budget_tokens)
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
     template_kw = req.get("chat_template_kwargs") or {}
     kwargs = {**llama_budget(req.get("reasoning_budget")),
               **effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort"))}
+    if reasoning.get("enabled") is False:                 # the generic off switch; true is the route's default
+        kwargs["enable_thinking"] = False
     if "reasoning_effort" in template_kw:
         kwargs.update(effort_kwargs(template_kw["reasoning_effort"]))
     if "enable_thinking" in template_kw and not template_kw["enable_thinking"]:
@@ -585,6 +606,8 @@ class Event:
 
 
 THINK_END = "</think>"
+# How far back the quote of an escaped mention ("`\n</think>\n\n`") can sit from the tag.
+THINK_QUOTE_WINDOW = 4
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
 
@@ -838,6 +861,17 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     return ToolCall(name=name, arguments=args)
 
 
+def hold_back(text: str, tags: tuple[str, ...]) -> int:
+    """Length of the longest suffix of `text` that is a proper prefix of one of `tags`: what a streaming parser holds
+    back until it knows whether a tag follows."""
+    best = 0
+    for tag in tags:
+        for n in range(1, len(tag)):
+            if text.endswith(tag[:n]):
+                best = max(best, n)
+    return best
+
+
 class OutputParser:
     """Incremental parser of model text: feed deltas, get events; a split tag is held until complete."""
 
@@ -845,7 +879,7 @@ class OutputParser:
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
-        self.rtail = ""              # last reasoning character sent
+        self.rtail = ""              # the last reasoning characters sent (the mention check's context)
         self.schemas = {t.get("name"): t for t in tools or []}
         # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
         self.stream_tools = stream_tools
@@ -990,30 +1024,37 @@ class OutputParser:
         return out
 
     def _reasoning(self, text: str) -> Event:
-        """A reasoning event for text going out; remembers its last character for the quote check."""
-        self.rtail = text[-1:] or self.rtail
+        """A reasoning event for text going out; remembers its last characters for the mention check."""
+        self.rtail = (self.rtail + text)[-THINK_QUOTE_WINDOW:] if text else self.rtail
         return Event("reasoning", text)
 
     def _quoted_think_end(self, i: int) -> bool | None:
-        """Whether the `</think>` at self.buf[i] is the model quoting the tag while it thinks: written right after a
-        quote or backtick and followed by anything but a line break. None while the character after it has not
-        arrived."""
-        before = self.buf[i - 1] if i else self.rtail
+        """Whether the `</think>` at self.buf[i] is the model mentioning the tag while it thinks: inside a pair of
+        quotes, right after a quote that opens a quotation, or after a typed `\\n` with a quote just before it, where
+        the model writes about the tag and the real end is elsewhere. A quote that closes a sentence precedes the
+        real end. None while the character after it has not arrived."""
+        context = self.buf[:i] if i >= 2 else self.rtail + self.buf[:i]
+        before = context[-1:]
         if before not in ('"', "'", "`"):
+            # a real end is followed by a line break, never by a typed escape
+            if context[-2:] == "\\n" and any(c in ('"', "'", "`")
+                                             for c in context[-THINK_QUOTE_WINDOW:]):
+                after = self.buf[i + len(THINK_END):]
+                if not after:
+                    return None
+                return after[0] not in "\r\n"
             return False
         after = self.buf[i + len(THINK_END):]
         if not after:
             return None
-        return after[0] not in "\r\n"
+        if after[0] == before:                    # the tag inside a pair of quotes
+            return True
+        # only a quote that opens a quotation quotes the tag; one that closes a sentence precedes the real end
+        opens = context[-2:-1] in ("", " ", "\t", "\n", "(", "[", "{", ":")
+        return opens and after[0] not in "\r\n"
 
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
-        """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
-        best = 0
-        for tag in tags:
-            for n in range(1, len(tag)):
-                if text.endswith(tag[:n]):
-                    best = max(best, n)
-        return best
+        return hold_back(text, tags)
 
     def feed(self, delta: str, *, final: bool = False) -> list[Event]:
         self.buf += delta

@@ -29,7 +29,8 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     if (bias != logit_bias_host_ && !bias.empty()) {
         const size_t bytes = bias.size() * sizeof(float);
         if ((!logit_bias_device_ && cudaMalloc((void**) &logit_bias_device_, bytes) != cudaSuccess) ||
-            cudaMemcpy(logit_bias_device_, bias.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            // on cs_, the stream the draws run on: a plain cudaMemcpy does not order against it
+            cudaMemcpyAsync(logit_bias_device_, bias.data(), bytes, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
             err = "logit_bias: the upload failed";
             return false;
         }

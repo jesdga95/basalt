@@ -11,11 +11,12 @@ One setting picks the cards: `gpu`. It means the same in the server (`"gpu"` in 
 | --- | --- | --- |
 | not set | GPU 0 alone; one warning at start names the other visible cards | GPU 0 |
 | `"0,1"`, `"1,0"`, ... | exactly these, in this order | the first one listed |
-| `"auto"` | every visible Blackwell (sm_120) card; any other card is skipped with one line naming it | the one with the most memory bandwidth, then the most VRAM |
+| `"auto"` | every visible Blackwell (sm_120) card, and when built with `-DPEER_ADA=ON`, every sm_89 card as an expert tier; any other card is skipped with one line naming it | the one with the most memory bandwidth, then the most VRAM |
 
 Cards are numbered as `nvidia-smi` numbers them. When `CUDA_VISIBLE_DEVICES` is set, the numbers count within its list
 (`CUDA_VISIBLE_DEVICES=1,0` makes `gpu 0` the card `nvidia-smi` calls 1), and its numbers are read as `nvidia-smi`'s
-too. A number past the visible cards, a card listed twice or a card that is not Blackwell stops the start with an error.
+too. A number past the visible cards, a card listed twice, a first card that is not sm_120, or a later card that is
+neither sm_120 nor (when built with `-DPEER_ADA=ON`) sm_89 stops the start with an error.
 
 The main card holds the dense weights, the KV cache, the drafter and its own expert cache. The engine decides what the
 other cards do and prints one line at start, for example `gpus: RTX 5090 (nvidia-smi 0) main, RTX 5060 Ti (nvidia-smi 1)
@@ -31,7 +32,9 @@ expert tier`:
   2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
   When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
   each; see [the GDN split](../precision/qwen38-flash-next.md#gdn-split-across-two-cards)).
-- **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle.
+- **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle. So does a card that would hold no
+  expert: when the main card holds every expert, or a card has no room for one, the start says `no expert tier` for that
+  card and runs without it.
 
 Three or more cards are community-tested: the path is checked here on two cards, with two expert tiers sharing the
 second one. Reports from machines with three or four cards are welcome (see [community](../community.md)).
@@ -39,9 +42,9 @@ second one. Reports from machines with three or four cards are welcome (see [com
 ## What several cards do together
 
 A dense model (Qwen3.8-27B) decodes on the main card alone when the model, its context and its slots fit there: it reads every weight
-every token, so a split would put part of each token on the slower card. A second card (the start line calls it the `prompt line`) then
+every token, so a split would put part of each token on the slower card. A second card (the start line calls it the `prompt split`) then
 reads the last layers of long prompts as a pipeline beside the main card ([Qwen3.8-27B](../models/qwen38-27b.md#long-prompts-on-two-cards));
-the line is off with `kv-resident`. When they do not fit, the second card is a `layer stage`: it holds the later layers with their KV cache
+the split is off with `kv-resident`. When they do not fit, the second card is a `layer stage`: it holds the later layers with their KV cache
 and recurrent state and runs them in every decode window and prompt chunk, and the output is the main card's alone to the bit
 ([Qwen3.8-27B](../models/qwen38-27b.md#two-cards-when-it-does-not-fit-one)). Later cards idle. `"auto"` gives the 27B both cards when two
 Blackwell cards are visible; without room on the second card the start says why and the model runs on the main card alone.
@@ -110,3 +113,23 @@ room for the buffers of that share (about 200 MiB, the size is computed, not a s
 `prefill peer: the peer's buffers do not fit`, raise `peer-reserve-mib` (the card shows a display or another program using
 its VRAM) and the second card's experts shrink by the same amount. The start line `peer GPU 1: N experts` says how many
 it holds.
+
+## An older peer card
+
+One older architecture can be built for the peer's kernels: sm_89 (Ada), beside an sm_120 main card, enabled with the
+`-DPEER_ADA=ON` build flag (off by default to keep build times fast for users without a hybrid setup). Without this flag,
+or for a card of any other pre-Blackwell architecture, the card is refused at the start rather than failing at its first
+kernel. What such a peer does and does not do:
+
+- It holds experts and computes their rows in every decode window, with the standard-CUDA kernels (Q8_1/Q2_0 and the
+  GGUF i-quant rows, dp4a arithmetic) compiled for its own architecture. Where an expert sits does not change its rows.
+- It reads its experts' share of a prompt chunk, under the slower-card rule above (chunks up to 2,559 rows).
+- It does not run the main card's work: the dense weights, the KV cache, the drafter, TMA and the FP4 tensor-core
+  expert kernels stay on the Blackwell card. An NVFP4 pack's FP4 experts are main-card only.
+- DeepSeek does not take an older peer: its peer-tier kernels are built for sm_120 only, and the start says so.
+- Layer split, overlapped windows and tensor parallel need matched Blackwell cards; an unlike pair always uses the
+  expert tier, as before.
+
+The mixed pair is priced like any other: on an RTX 5080 with an RTX 4060 Ti the start prints
+`multi-gpu: 2 cards unlike; ms per window: expert tier 13.0, layer split 19.8, tensor parallel 13.5 (not built); picked
+expert tier`.

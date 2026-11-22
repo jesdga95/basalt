@@ -1,0 +1,59 @@
+// include/basalt/models/inkling2/prompt_kernels.hpp - the kernels of Inkling 2's prompt path (chunks of many rows): the
+// prompt attention with each query's relative bias and sink, the experts' plan by expert, and the sliding-window keys a
+// chunk staged moved into the window rings.
+//
+// Activations are fp32 rows, every pointer is device memory, `stream` may be null. A chunk's rows sit at consecutive
+// positions pos0, pos0 + 1, ...
+#pragma once
+
+#include "basalt/models/inkling2/kernels.hpp"
+
+#include <cstddef>
+#include <cstdint>
+
+namespace basalt::models::inkling2 {
+
+/// What one prompt attention call reads.
+struct AttnPromptArgs {
+    const float* q = nullptr;          ///< [rows][kHeads][kHeadDim], as attn_prepare writes them
+    const float* r = nullptr;          ///< [rows][kHeads][kRel]
+    const float* sink = nullptr;       ///< [rows][kHeads]
+    const float* rel_table = nullptr;  ///< [kRel][kExtent]: bias(d) = r . table[:, d] for 0 <= d < kExtent
+    int64_t pos0 = 0;                  ///< row i at position pos0 + i
+    const void* k_cache = nullptr;     ///< keys before pos0: [cap][kKvHeads][kHeadDim], position p in cell p % cap
+    const void* v_cache = nullptr;
+    int64_t cap = 0;
+    const void* k_chunk = nullptr;     ///< keys from pos0 on: [chunk_cap][kKvHeads][kHeadDim], position p in cell p % chunk_cap
+    const void* v_chunk = nullptr;     ///< (a full layer passes its cache again; a sliding-window layer the chunk's stage)
+    int64_t chunk_cap = 0;
+    bool fp8 = false;                  ///< unit-scale E4M3 codes instead of fp16
+    int window = 0;                    ///< > 0: keys at distance < window only
+    float scale = 0.08838834764831845f;
+};
+
+/// out[i][h] = sum_j softmax_j(scale q.k_j + bias(p_i - p_j)) v_j over the keys at positions p_j <= p_i (and within the
+/// window), exp(sink[i][h]) beside them in the denominator: attention_decode's result for each row, on the tensor cores
+/// (q, the relative states and the bias table rounded to fp16 for the products, fp32 accumulation and softmax).
+void attention_prompt(const AttnPromptArgs& a, int rows, float* out, void* stream);
+
+/// Bytes of scratch moe_sort needs for `pairs` (row, slot) pairs.
+size_t moe_sort_scratch(int pairs, int n_expert);
+/// The pairs of `rows` rows' top-k choices ids [rows][k] sorted by expert, in pair order within an expert: bounds
+/// [n_expert + 1] (device), and for sorted entry i its token row tok[i], its pair dst[i] = row * k + slot and its expert
+/// exp[i]. The same order at any launch shape.
+void moe_sort(const int32_t* ids, int rows, int k, int n_expert, void* scratch, int32_t* bounds, int32_t* tok, int32_t* dst,
+              int32_t* exp, void* stream);
+
+/// ids[i] = map[ids[i]] for `n` entries: a spilled layer's experts by their slot (spill.hpp).
+void remap_ids(int32_t* ids, int n, const int32_t* map, void* stream);
+
+/// pos[i] = pos0 + i for a chunk's `rows` rows, and bounds = {0, rows} (the one-matrix products' row bounds).
+void prompt_rows(int32_t* pos, int64_t pos0, int rows, int32_t* bounds, void* stream);
+
+/// The last positions of a chunk's staged sliding-window keys and values (position p in cell p % stage_cap) into the ring
+/// (cell p % ring_cap): positions max(pos0, end - keep) .. end - 1, end = pos0 + rows. A cell is [kKvHeads][kHeadDim] of
+/// `elem` bytes a value (fp16 or E4M3).
+void stage_to_ring(const void* k_stage, const void* v_stage, int64_t stage_cap, void* k_ring, void* v_ring, int64_t ring_cap,
+                   int64_t pos0, int rows, int keep, int elem, void* stream);
+
+}  // namespace basalt::models::inkling2

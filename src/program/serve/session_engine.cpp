@@ -41,15 +41,14 @@ struct Block {
 
 class SessionRuntime final : public Runtime {
 public:
-    SessionRuntime(CommonOptions& options, basalt::core::ModelFile& file, std::string& error, basalt::model::LoadedModel& model)
-        : Runtime(options, file, error, model.desc().n_vocab, vocab_), model_(model) {}
+    SessionRuntime(CommonOptions& options, basalt::core::ModelFile& file, std::string& error, basalt::model::Started& started)
+        : Runtime(options, file, error, started.model->desc().n_vocab, vocab_), model_(*started.model),
+          sessions_(std::move(started.sessions)) {}
 
     int init_before_input() override {
-        const int slots = std::max(o.batch, 1);
-        sessions_.resize((size_t) slots);
-        for (auto& s : sessions_) {
-            const basalt::model::Result r = model_.make_session(s);
-            if (!r.ok()) { basalt::log::error("basalt serve", "%s", r.message.c_str()); return 1; }
+        if (sessions_.size() != (size_t) std::max(o.batch, 1)) {   // the start makes one per slot
+            basalt::log::error("basalt serve", "the model has %zu sessions for %d slots", sessions_.size(), std::max(o.batch, 1));
+            return 1;
         }
         // one policy for the solo windows and one for the batch windows, whose rounds cost differently
         policy.emplace(session().max_window());
@@ -106,8 +105,9 @@ public:
             std::string bus;
             if (basalt::core::device_pci_bus_id(d, bus)) ids += (ids.empty() ? "" : ",") + bus;
         }
-        return "quant=" + basalt::program::pack_quant_label(nm != nullptr && nm->is_string() ? nm->s : std::string()) +
-               " gpus=" + ids + " ";
+        std::string quant = basalt::program::pack_quant_label(nm != nullptr && nm->is_string() ? nm->s : std::string());
+        if (quant == "unknown" && !o.community_quant.empty()) quant = o.community_quant;   // the model names it when the pack's name does not
+        return "quant=" + quant + " gpus=" + ids + " ";
     }
     int init_after_input() override {
         reserve_checkpoints();
@@ -120,6 +120,7 @@ public:
         // whether the in-engine encoder reads video: FFmpeg found, for a model that reads the shared patches
         if (o.vision_in_engine && sessions_[0]->reads_patches()) std::printf("%s\n", basalt::vision::video_line().c_str());
         std::printf("INFO %s\n", (identity_words() + sessions_[0]->info_words()).c_str());
+        kv_ceiling_note();
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);
         return 0;
@@ -228,6 +229,32 @@ public:
         return written;
     }
     bool park_idle_engine(std::string&) override { return false; }
+    // a model with an elastic KV: its ceiling as an INFO line whenever it moves (the server reports it in /v1/status)
+    int64_t kv_ceiling_sent_ = -1;
+    void kv_ceiling_note() override {
+        const int64_t n = sessions_[0]->kv_ceiling();
+        if (n < 0 || n == kv_ceiling_sent_) return;
+        kv_ceiling_sent_ = n;
+        std::printf("INFO elastic_kv_ceiling=%lld\n", (long long) n);
+        std::fflush(stdout);
+    }
+    LookupCounts lookup_counts() override {
+        const basalt::model::ModelSession::ExpertCounts c = sessions_[0]->expert_counts();
+        return {c.hits, c.lookups, c.offloaded, c.files};
+    }
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        return sessions_[0]->expert_map(total, homes, routed);
+    }
+    std::vector<CardFacts> card_facts() override {
+        std::vector<CardFacts> out;
+        for (const basalt::model::ModelSession::CardExperts& c : sessions_[0]->experts_by_card())
+            out.push_back({c.device, c.slots, 0.0, c.bytes, out.empty() ? -1 : 0});
+        // every session's KV is on the main card; a second card holds experts only
+        int64_t kv = 0;
+        for (const auto& s : sessions_) kv = kv < 0 || s->kv_bytes() < 0 ? -1 : kv + s->kv_bytes();
+        if (!out.empty()) out[0].kv_bytes = kv;
+        return out;
+    }
     bool capture_admit(uint64_t need, uint64_t floor) override {
         return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
                basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
@@ -519,8 +546,10 @@ public:
             return false;
         }
         after_launch();
-        // room for every draft the session makes (a block drafter may make more than asked, the policy picks)
-        if (basalt::model::Result r = rt_.session().draft_end(drafts_.data(), conf_.data(), max_window() - 1, n_draft_); !r.ok()) {
+        // room for every draft the session makes (a block drafter may make more than asked, the policy picks); a draft
+        // no window can hold need not be made, but a lookup proposal is matched against the first
+        const auto need = [this](const float* c, int j, int m) { return (j == 0 && rt_.sfx) || rt_.policy->may_verify(c, j, m); };
+        if (basalt::model::Result r = rt_.session().draft_end(drafts_.data(), conf_.data(), max_window() - 1, n_draft_, need); !r.ok()) {
             runtime_.err = r.message;
             return false;
         }
@@ -710,8 +739,8 @@ bool SessionRuntime::slot_window_finish(int b, SlotWin& w) {
 
 // The window's accepted drafts, grammar, logprobs and tokens; whether drafts follow (w.want).
 bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
-    std::vector<float> grammar_bias;
     std::vector<float> lp_rows;   // a logprobs slot's kept rows (row_logprobs)
+    bool grammar_dead = false;    // the grammar allowed no token: the slot ends as an error after this window
     const auto failed = [&](const std::string& m) {
         std::printf("ERR %s\n", m.c_str());
         set_active(0);
@@ -725,21 +754,38 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
     int a = 0;
     while (a < T - 1 && win_[(size_t) a + 1] == out_[(size_t) a]) ++a;
     if (sl.guard != nullptr && sl.guard->on()) {
-        // the first pick the grammar refuses is drawn again under its mask, and the window ends there
-        const int miss = sl.guard->scan(out_.data(), a + 1);
+        // the first pick the grammar refuses is drawn again under its mask, and the window ends there; with no token
+        // allowed at all the slot ends after it, as an error
+        const int miss = sl.guard->scan(out_.data(), a + 1, 0);
         if (miss >= 0) {
-            sl.guard->mask_bias({}, grammar_bias);
             int32_t y = -1;
-            if (const basalt::model::Result r = session().resample_row(miss, grammar_bias.data(), y); !r.ok()) return failed(r.message);
-            out_[(size_t) miss] = y;
+            std::string why;
+            const basalt::program::grammar::Redraw verdict = sl.guard->redraw(
+                {},
+                [&](const std::vector<float>& bias, int32_t& t) {
+                    const basalt::model::Result r = session().resample_row(miss, bias.data(), t);
+                    if (!r.ok()) why = r.message;
+                    return r.ok();
+                },
+                [&](std::vector<float>& lg) {
+                    lg.resize((size_t) n_vocab);
+                    const basalt::model::Result r = session().copy_logits(miss, lg.data());
+                    if (!r.ok()) why = r.message;
+                    return r.ok();
+                },
+                y);
+            if (verdict == basalt::program::grammar::Redraw::failed) return failed(why.empty() ? "the masked draw failed" : why);
+            if (verdict == basalt::program::grammar::Redraw::dead) grammar_dead = true;
+            else out_[(size_t) miss] = y;
             a = miss;
-            if (!sl.guard->take(y)) basalt::log::info("basalt grammar", "slot %d: the masked draw was token %d", b, (int) y);
         }
     }
     sl.drafts_offered += T - 1;
     sl.drafts_accepted += a;
+    ++sl.windows;
     std::string line = "BT " + std::to_string(b);
     const char* fin = nullptr;
+    const int64_t sent0 = sl.produced;
     if (sl.lp_top >= 0) {   // the kept rows' logprobs, read before the drafts touch the head
         lp_rows.resize((size_t) (a + 1) * basalt::kernels::kLogprobStride);
         if (const basalt::model::Result r = session().row_logprobs(0, a + 1, out_.data(), sl.lp_top, lp_rows.data()); !r.ok())
@@ -759,6 +805,8 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
         const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
         fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
     }
+    if (grammar_dead) fin = "error";
+    stats_window(b, T - 1, a, (int) (sl.produced - sent0));
     sl.n_dr = 0;
     w.a = a;
     w.line = line;
@@ -783,15 +831,16 @@ bool SessionRuntime::slot_window_end(int b, SlotWin& w) {
     basalt::core::progress_beat();
     if (w.drafting) {
         const int max_n = std::min(session().max_window() - 1, (int) std::size(sl.dr));
-        if (const basalt::model::Result r = session().draft_end(sl.dr, sl.dprob, max_n, sl.n_dr); !r.ok()) return failed(r.message);
+        const auto need = [&](const float* c, int j, int m) { return (j == 0 && sl.sfx) || bpolicy->may_verify(c, j, m); };
+        if (const basalt::model::Result r = session().draft_end(sl.dr, sl.dprob, max_n, sl.n_dr, need); !r.ok()) return failed(r.message);
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
         if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
         else bpolicy->observe_window(w.chance, T, a, ms);
     }
     if (fin != nullptr) {
-        std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin,
+        std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin,
                     std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
-                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
         sl.active = false;
         sl.cached = o.prompt_cache > 0;
         sl.idle_busy = busy_now();
@@ -822,8 +871,10 @@ bool SessionRuntime::next_batch_window() {
             set_active(b);
             w.round0 = Clock::now();
             slot_window_begin(b, w, 1 << 20);
+            stats_lookups_begin();
             if (const basalt::model::Result r = session().decode_window(w.d); !r.ok()) return failed(r.message);
             if (!slot_window_finish(b, w)) return false;
+            stats_lookups_end();
         }
         set_active(0);
         return true;
@@ -838,6 +889,7 @@ bool SessionRuntime::next_batch_window() {
     }
     for (const std::vector<size_t>& group : batch_groups(rows, cap)) {
         const Clock::time_point t0 = Clock::now();
+        stats_lookups_begin();
         if (group.size() == 1) {
             if (const basalt::model::Result r = sessions_[(size_t) act[group[0]]]->decode_window(wins[group[0]].d); !r.ok()) return failed(r.message);
         } else {
@@ -870,6 +922,7 @@ bool SessionRuntime::next_batch_window() {
             if (!r.ok() && r.status != basalt::model::Status::NotImplemented) return failed(r.message);
             for (const size_t i : group) wins[i].drafting = r.ok() && wins[i].want > 0;
         }
+        stats_lookups_end();
         for (const size_t i : group)
             if (!slot_window_end(act[i], wins[i])) return false;
     }
@@ -954,6 +1007,12 @@ Flow SessionRequest::read_to(int64_t to) {
             pr.stop = [this] { return runtime_.halted(); };
             r = rt_.session().prefill_chunk(pr);
             at = end;
+        }
+        if (r.status == basalt::model::Status::Refused) {   // no room for this prompt: the engine serves on
+            basalt::log::warn("basalt serve", "%s", r.message.c_str());
+            rt_.session().end_prompt();
+            std::printf("ERR %s\n", r.message.c_str());
+            return Flow::next;
         }
         if (!r.ok()) {
             basalt::log::error("basalt serve", "%s", r.message.c_str());
@@ -1046,9 +1105,9 @@ void SessionRuntime::enc_command(const std::string& cmd) {
 }  // namespace
 
 int run_session(CommonOptions& o, basalt::core::ModelFile& file, const basalt::model::ModelAdapter& adapter,
-                basalt::model::LoadedModel& model) {
+                basalt::model::Started& started) {
     std::string err;
-    SessionRuntime runtime(o, file, err, model);
+    SessionRuntime runtime(o, file, err, started);
     runtime.pre_ = adapter.pretokenizer();
     return runtime.execute();
 }

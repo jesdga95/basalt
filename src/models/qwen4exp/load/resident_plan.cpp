@@ -72,23 +72,26 @@ int resident_plan(Context& context) {
     const int64_t kMaxAutoChunk = basalt::kernels::cpu::expert_layout().max_blob > (3u << 19) ? 32768 : 16384;
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
     if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
-    // The peer tier's fill.  `exclusive` (--peer-exclusive): done before the RAM complement, which then leaves the
+    // The peer tier's fill.  With --peer-exclusive it is done before the RAM complement, which then leaves the
     // peer's experts out, so they are read from the file here and held only on the peer.
-    auto open_peer = [&](bool exclusive) -> bool {
-        const auto tp0 = Clock::now();
+    auto open_peer = [&]() -> bool {
         // the GDN mixer split loads the peer's key heads after its tier is filled
         int d0 = 0;
         cudaGetDevice(&d0);
-        const int peer_reserve = o.peer_reserve_mib + (int) ((peer_split_bytes(d0) + peer_prompt_bytes() + (1 << 20) - 1) >> 20);
+        // the RAM copy, when it is registered after the start's pass, maps itself on this card then
+        const uint64_t pin_map = basalt::core::pin_mapping_bytes(context.src->pin_pending());
+        const int peer_reserve =
+            o.peer_reserve_mib + (int) ((peer_split_bytes(d0) + peer_prompt_bytes() + pin_map + (1 << 20) - 1) >> 20);
         if (o.peer_devices.size() <= 1) {
             if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, g.n_embd, g.n_ff, peer_reserve, o.peer_slots,
-                           err, exclusive)) {
+                           *context.reads, err)) {
                 basalt::log::error("basalt generate", "%s", err.c_str());
                 return false;
             }
-            basalt::log::info("basalt generate", "peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s); with the primary's "
-                                 "%lld that is %lld of %lld on the GPUs", o.peer_device, (long long) peer.resident(), peer.gib(),
-                         std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
+            context.after->push_back([&peer](std::string& e) { return peer.verify_fill(e); });
+            basalt::log::info("basalt generate", "peer GPU %d: %lld experts, %.2f GiB (read in the start's pass); with the "
+                                 "primary's %lld that is %lld of %lld on the GPUs", o.peer_device, (long long) peer.resident(), peer.gib(),
+                         (long long) xcache.slots(),
                          (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
             return true;
         }
@@ -111,7 +114,7 @@ int resident_plan(Context& context) {
                 const basalt::core::OnDevice on(dev);
                 cudaMemGetInfo(&fb, &tb);
             }
-            const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
+            const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) + pin_map +
                                      (dev == o.peer_device ? (uint64_t) peer_split_bytes(d0) + peer_prompt_bytes() : 0);
             const uint64_t share = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
             rooms[i].bytes = fb > reserve ? ((uint64_t) fb - reserve) / share : 0;
@@ -130,17 +133,17 @@ int resident_plan(Context& context) {
             std::vector<std::pair<int32_t, int32_t>> pick;
             for (size_t j = 0; j < ranked.size(); ++j)
                 if (owner[j] == (int) i) pick.push_back(ranked[j]);
-            if (!tier(i).fill(pick, err)) {
+            if (!tier(i).fill(pick, *context.reads, err)) {
                 basalt::log::error("basalt generate", "%s", err.c_str());
                 return false;
             }
+            context.after->push_back([&t = tier(i)](std::string& e) { return t.verify_fill(e); });
             held += tier(i).resident();
             basalt::log::info("basalt generate", "peer GPU %d: %lld experts, %.2f GiB (tier %zu of %zu)", o.peer_devices[i],
                               (long long) tier(i).resident(), tier(i).gib(), i + 1, np);
         }
-        basalt::log::info("basalt generate", "%zu peer tiers filled in %.1f s; with the primary's %lld that is %lld of %lld "
-                             "on the GPUs", np, std::chrono::duration<double>(Clock::now() - tp0).count(),
-                          (long long) xcache.slots(), (long long) held, (long long) (g.n_layers * g.n_expert));
+        basalt::log::info("basalt generate", "%zu peer tiers, read in the start's pass; with the primary's %lld that is %lld "
+                             "of %lld on the GPUs", np, (long long) xcache.slots(), (long long) held, (long long) (g.n_layers * g.n_expert));
         return true;
     };
     // what experts left in the file read through the OS file cache: every expert of the largest layer, and one prompt
@@ -296,7 +299,7 @@ int resident_plan(Context& context) {
     std::vector<std::pair<int32_t, int32_t>> peer_only;   // experts only the peer holds (--peer-exclusive)
     uint64_t peer_only_bytes = 0;
     if (o.resident_cpu_experts && o.peer_exclusive && o.peer_device >= 1) {
-        if (!open_peer(true)) return 1;
+        if (!open_peer()) return 1;
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e)
                 if (peer.has(l, e)) {

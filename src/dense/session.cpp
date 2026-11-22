@@ -289,7 +289,7 @@ public:
         return {};
     }
 
-    Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
+    Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
         if (block_) {
             n = std::min(n_draft_, max_n);
             if (cudaMemcpyAsync(ids, st_.dids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
@@ -408,9 +408,9 @@ public:
             if (!split_read(m_, st_, r.tokens, r.n_tokens, r.pos, r.progress, r.stop, err)) return fail(err);
             return {};
         }
-        if (m_.line) {   // a long prompt across the cards (the prompt line)
+        if (m_.prompt_split) {   // a long prompt across the cards (the prompt split)
             std::string err;
-            if (prompt_line_read(*m_.line, m_, st_, r.tokens, r.n_tokens, r.pos, r.progress, r.stop, err)) return {};
+            if (prompt_split_read(*m_.prompt_split, m_, st_, r.tokens, r.n_tokens, r.pos, r.progress, r.stop, err)) return {};
             if (!err.empty()) return fail(err);
         }
         std::vector<int32_t> pos3;
@@ -789,7 +789,8 @@ private:
             owned_.emplace_back(v);
             dev = (float*) v;
         }
-        if (cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
+        // on the sampling stream itself: a plain cudaMemcpy does not order against it, so a draw could read the previous bias
+        if (cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, st_.stream) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
         return true;
     }
 

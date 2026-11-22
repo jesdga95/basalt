@@ -201,6 +201,90 @@ class CheckpointDenseTest(unittest.TestCase):
             C.CheckpointDense(C.Checkpoint(self.d), require_complete=False)
 
 
+class QuantizedSourceTest(unittest.TestCase):
+    """Dense tensors that the checkpoint stores as MXFP8 or NVFP4 (NVIDIA's quantization-aware distillation export):
+    the values decode as the codes say, and the engine forms are quantized once from those values."""
+
+    H = 256
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        rng = np.random.default_rng(7)
+        H = self.H
+        L = "model.language_model.layers.0."
+        self.mx = {}
+        self.nv = {}
+        tens = {}
+
+        def mxfp8(name, rows, cols):
+            codes = rng.integers(0, 0x7F, size=(rows, cols), dtype=np.uint8)
+            scales = rng.integers(120, 134, size=(rows, cols // 32), dtype=np.uint8)
+            self.mx[name] = (codes, scales)
+            tens[name + ".weight"] = ("F8_E4M3", (rows, cols), codes.tobytes())
+            tens[name + ".weight_scale"] = ("U8", (rows, cols // 32), scales.tobytes())
+
+        def nvfp4(name, rows, cols, scale2=0.5):
+            codes = rng.integers(0, 256, size=(rows, cols // 2), dtype=np.uint8)
+            scales = rng.integers(120, 0x7F, size=(rows, cols // 16), dtype=np.uint8)
+            self.nv[name] = (codes, scales, scale2)
+            tens[name + ".weight"] = ("U8", (rows, cols // 2), codes.tobytes())
+            tens[name + ".weight_scale"] = ("F8_E4M3", (rows, cols // 16), scales.tobytes())
+            tens[name + ".weight_scale_2"] = ("F32", (), np.float32(scale2).tobytes())
+
+        mxfp8(L + "linear_attn.in_proj_a", 48, H)          # a BF16 target
+        mxfp8(L + "linear_attn.in_proj_z", 48 * S.GDN_HEAD, H)    # a Q6_K target, zrows (real geometry)
+        nvfp4(L + "linear_attn.out_proj", H, 48 * S.GDN_HEAD)     # a Q6_K target, vcols
+        small_checkpoint(self.d, tens)
+        self.L = L
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def decode_mx(self, name):
+        codes, scales = self.mx[name]
+        return S.fp8_e4m3_table()[codes] * np.repeat(np.exp2(scales.astype(np.float32) - np.float32(127)), 32, axis=1)
+
+    def decode_nv(self, name):
+        codes, scales, scale2 = self.nv[name]
+        v = np.empty((codes.shape[0], codes.shape[1] * 2), np.float32)
+        v[:, 0::2] = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], np.float32)[codes & 15]
+        v[:, 1::2] = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], np.float32)[codes >> 4]
+        return v * np.repeat(S.fp8_e4m3_table()[scales] * np.float32(scale2), 16, axis=1)
+
+    def test_mxfp8_decodes_and_rounds_once(self):
+        import multiprocessing
+        dn = C.CheckpointDense(C.Checkpoint(self.d), q6k=True, require_complete=False)
+        L = self.L
+        # a BF16 target: E4M3 codes times a power of two are exactly BF16, so the bytes must be exact
+        self.assertEqual(dn.bytes("blk.0.ssm_alpha.weight").tobytes(),
+                         bf16(self.decode_mx(L + "linear_attn.in_proj_a")[S.gdn_block_source()]).tobytes())
+        with multiprocessing.Pool(2) as pool:
+            got = b"".join(dn.chunks("blk.0.attn_gate.weight", pool))
+        want = self.decode_mx(L + "linear_attn.in_proj_z")[S.gdn_index(48 * S.GDN_HEAD, 0)]
+        self.assertEqual(got, S.q6_k(want.reshape(-1)))
+
+    def test_nvfp4_decodes_and_rounds_once(self):
+        import multiprocessing
+        dn = C.CheckpointDense(C.Checkpoint(self.d), q6k=True, require_complete=False)
+        with multiprocessing.Pool(2) as pool:
+            got = b"".join(dn.chunks("blk.0.ssm_out.weight", pool))
+        want = np.ascontiguousarray(self.decode_nv(self.L + "linear_attn.out_proj")[:, S.gdn_index(48 * S.GDN_HEAD, 0)])
+        self.assertEqual(got, S.q6_k(want.reshape(-1)))
+
+    def test_a_wrong_scale_shape_is_refused(self):
+        p = self.d / "model-00001-of-00001.safetensors"
+        head, base = S.read_safetensors_header(p)
+        tens = {k: (h["dtype"], h["shape"], p.read_bytes()[base + h["data_offsets"][0]:base + h["data_offsets"][1]])
+                for k, h in head.items()}
+        k = self.L + "linear_attn.in_proj_a.weight_scale"
+        dt, shape, raw = tens[k]
+        tens[k] = (dt, (24, 8), raw)
+        write_safetensors(p, tens)
+        with self.assertRaisesRegex(S.ConvertError, "weight_scale"):
+            C.CheckpointDense(C.Checkpoint(self.d), require_complete=False)
+
+
 GDN_CFG = {"text_config": {"linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_key_head_dim": 128,
                            "linear_value_head_dim": 128, "indexer_n_heads": 4, "indexer_head_dim": 128}}
 
@@ -382,5 +466,256 @@ class TokenizerKvTest(unittest.TestCase):
                 C.tokenizer_kv(C.Checkpoint(d))
 
 
+def csf_encode(scales: np.ndarray):
+    """The CSF stream pair of scale bytes [rows, cols]: a row's base is the start of its fullest 16-wide window (at
+    most 240); a byte outside base..base+15 becomes an exception word."""
+    rows, cols = scales.shape
+    base = np.zeros(rows, np.int16)
+    for r in range(rows):
+        v = scales[r].astype(np.int16)
+        counts = [int(((v >= b) & (v <= b + 15)).sum()) for b in range(int(v.min()), int(v.max()) + 1)]
+        base[r] = min(int(v.min()) + int(np.argmax(counts)), 240)
+    code = scales.astype(np.int16) - base[:, None]
+    exc = (code < 0) | (code > 15)
+    code = np.where(exc, 0, code).astype(np.uint8)
+    packed = code[:, 0::2] | (code[:, 1::2] << 4)
+    fixed = np.concatenate([base.reshape(-1, 16).astype(np.uint8), packed.reshape(rows // 16, -1)], axis=1)
+    pos = np.flatnonzero(exc)
+    return fixed, (pos | scales.reshape(-1)[pos].astype(np.int64) << 24).astype(np.uint32)
+
+
+class CsfTest(unittest.TestCase):
+    def test_round_trip(self):
+        rng = np.random.default_rng(3)
+        scales = (rng.integers(0, 16, size=(48, 40)) + rng.integers(20, 90, size=(48, 1))).astype(np.uint8)
+        for r, c, b in ((5, 7, 0), (30, 0, 126), (47, 39, 1)):         # outside their rows' windows
+            scales[r, c] = b
+        fixed, exc = csf_encode(scales)
+        self.assertEqual((fixed.shape, exc.size), ((3, 16 + 8 * 40), 3))
+        np.testing.assert_array_equal(C.csf_decode(fixed, exc), scales)
+
+    def test_by_hand(self):
+        fixed = np.zeros((1, 32), np.uint8)                            # 16 rows of 2 scales
+        fixed[0, :16] = 40                                             # every row's base
+        fixed[0, 16] = 0x21                                            # row 0: codes 1, 2
+        fixed[0, 17] = 0xF0                                            # row 1: codes 0, 15
+        got = C.csf_decode(fixed, np.array([3 | 7 << 24], np.uint32))  # row 1, column 1 holds 7
+        self.assertEqual(got[:2].tolist(), [[41, 42], [40, 7]])
+        self.assertTrue((got[2:] == 40).all())
+
+    def test_bad_streams_are_refused(self):
+        fixed, exc = csf_encode(np.full((16, 4), 50, np.uint8))
+        high = fixed.copy()
+        high[0, 3] = 241
+        for f, x, want in ((high, exc, "above 240"), (fixed, np.array([16 * 4], np.uint32), "past the end"),
+                           (fixed[:, :-8], exc, "shape"), (fixed.reshape(-1), exc, "shape")):
+            with self.subTest(want=want), self.assertRaisesRegex(S.ConvertError, want):
+                C.csf_decode(f, x)
+
+
+def csf_expert_tensors(l, e, rng, h=128, ff=64):
+    """One expert's tensors twice: with plain scales, and with each scale matrix as a CSF stream pair."""
+    plain, csf = {}, {}
+    for r, (rows, cols) in {"gate_proj": (ff, h), "up_proj": (ff, h), "down_proj": (h, ff)}.items():
+        p = f"model.language_model.layers.{l}.mlp.experts.{e}.{r}."
+        w = rng.integers(0, 256, size=(rows, cols // 2), dtype=np.uint8)
+        s = (rng.integers(0, 16, size=(rows, cols // 16)) + 30).astype(np.uint8)
+        s[0, 0] = 0x7E                                                 # an exception
+        fixed, exc = csf_encode(s)
+        for t in (plain, csf):
+            t[p + "weight"] = ("U8", w.shape, w.tobytes())
+            t[p + "weight_scale_2"] = ("F32", (), np.float32(0.25 + e).tobytes())
+            t[p + "input_scale"] = ("F32", (), np.float32(1).tobytes())
+        plain[p + "weight_scale"] = ("F8_E4M3", s.shape, s.tobytes())
+        csf[p + "weight_scale" + C.CSF_FIXED] = ("U8", fixed.shape, fixed.tobytes())
+        csf[p + "weight_scale" + C.CSF_EXC] = ("U32", exc.shape, exc.tobytes())
+    return plain, csf
+
+
+class CsfExpertTest(unittest.TestCase):
+    """Experts whose scales are CSF stream pairs, with the shards in a `tensors/` folder."""
+
+    def setUp(self):
+        rng = np.random.default_rng(4)
+        self.plain, self.csf = {}, {}
+        for e in range(2):
+            p, c = csf_expert_tensors(0, e, rng)
+            self.plain.update(p)
+            self.csf.update(c)
+
+    def experts(self, files):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        (d / "tensors").mkdir()
+        for name, tens in files.items():
+            write_safetensors(d / "tensors" / name, tens)
+        (d / "config.json").write_text(json.dumps(UnexpectedTensorTest.CFG))
+        return C.CheckpointExperts(C.Checkpoint(d))
+
+    def test_same_blob_as_plain_scales(self):
+        plain = self.experts({"model-00001-of-00001.safetensors": self.plain})
+        exc = {k: v for k, v in self.csf.items() if k.endswith(C.CSF_EXC)}
+        rest = {k: v for k, v in self.csf.items() if k not in exc}
+        csf = self.experts({"model-00001-of-00002.safetensors": rest, "model-00002-of-00002.safetensors": exc})
+        self.assertEqual((plain.csf, csf.csf), (False, True))
+        self.assertEqual(C._expert_job(next(csf.jobs(32))), C._expert_job(next(plain.jobs(32))))
+
+    def test_bad_stream_is_reported(self):
+        k = "model.language_model.layers.0.mlp.experts.1.down_proj.weight_scale" + C.CSF_FIXED
+        dt, shape, raw = self.csf[k]
+        ex = self.experts({"model-00001-of-00001.safetensors": {**self.csf, k: (dt, shape, b"\xfa" + raw[1:])}})
+        self.assertRegex(C._expert_job(next(ex.jobs(32))), "above 240")
+
+    def test_wrong_shape_or_missing_exceptions_are_refused(self):
+        k = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale"
+        dt, shape, raw = self.csf[k + C.CSF_FIXED]
+        with self.assertRaisesRegex(S.ConvertError, "nvfp4_csf_fixed is U8"):
+            self.experts({"model-00001-of-00001.safetensors": {**self.csf, k + C.CSF_FIXED: (dt, (8, 40), raw)}})
+        with self.assertRaisesRegex(S.ConvertError, "no .*nvfp4_csf_exceptions"):
+            self.experts({"model-00001-of-00001.safetensors": {n: v for n, v in self.csf.items() if n != k + C.CSF_EXC}})
+
+
+def e4m3(code: int) -> float:
+    """An E4M3 byte's value by the format's definition (bias 7, no infinities); the two NaN codes are NaN."""
+    sign, e, m = -1.0 if code >> 7 else 1.0, (code >> 3) & 15, code & 7
+    if e == 15 and m == 7:
+        return float("nan")
+    return sign * (m / 8 * 2.0 ** -6 if e == 0 else (1 + m / 8) * 2.0 ** (e - 7))
+
+
+
+def mxfp8(rng, rows, cols):
+    """Random MXFP8 rows (no NaN code) and the float32 values they hold, decoded by the format's definition."""
+    codes = rng.integers(0, 256, size=(rows, cols), dtype=np.uint8)
+    codes[(codes & 0x7F) == 0x7F] = 0x38
+    scales = rng.integers(118, 124, size=(rows, cols // 32), dtype=np.uint8)
+    table = np.array([e4m3(c) for c in range(256)])
+    return codes, scales, (table[codes] * np.exp2(scales - 127.0).repeat(32, axis=1)).astype(np.float32)
+
+
+class Mxfp8DenseTest(unittest.TestCase):
+    """CheckpointDenseTest's layer with MXFP8 projections and an F32 norm, as the FP4-Local layout stores them."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.d, self.L, H = Path(tmp.name), "model.language_model.layers.0.", 256
+        rng = np.random.default_rng(5)
+        self.v, tens = {}, {}
+        for name, shape in {"linear_attn.in_proj_a.weight": (48, H), "linear_attn.in_proj_z.weight": (48 * 128, H),
+                            "linear_attn.out_proj.weight": (H, 48 * 128), "mlp.shared_expert.down_proj.weight": (H, 640),
+                            "self_attn.indexer.index_qk_proj.weight": (640, H)}.items():
+            codes, scales, self.v[name] = mxfp8(rng, *shape)
+            tens[self.L + name] = ("F8_E4M3", codes.shape, codes.tobytes())
+            tens[self.L + name + "_scale"] = ("U8", scales.shape, scales.tobytes())
+        self.v["norm"] = (rng.integers(-64, 64, size=(H,)) / 64).astype(np.float32)
+        tens[self.L + "attn_hyper_connection.hc_norm.weight"] = ("F32", (H,), self.v["norm"].tobytes())
+        self.tens = tens
+        small_checkpoint(self.d, tens)
+
+    def dense(self):
+        return C.CheckpointDense(C.Checkpoint(self.d), q6k=True, require_complete=False)
+
+    def test_values_widen_exactly(self):
+        dn, v = self.dense(), self.v
+        self.assertEqual(dn.bytes("blk.0.ssm_alpha.weight").tobytes(),
+                         bf16(v["linear_attn.in_proj_a.weight"][S.gdn_block_source()]).tobytes())
+        self.assertEqual(dn.bytes("blk.0.indexer.k_proj.weight").tobytes(),
+                         bf16(v["self_attn.indexer.index_qk_proj.weight"][512:]).tobytes())
+        np.testing.assert_array_equal(dn.bytes("blk.0.hc_attn_norm.weight").view("<f4"), v["norm"] + 1)
+
+    def test_quantized_streams(self):
+        import multiprocessing
+        dn, v = self.dense(), self.v
+        with multiprocessing.Pool(2) as pool:
+            z = b"".join(dn.chunks("blk.0.attn_gate.weight", pool))
+            o = b"".join(dn.chunks("blk.0.ssm_out.weight", pool))
+            dw = b"".join(dn.chunks("blk.0.ffn_down_shexp.weight", pool))
+        self.assertEqual(z, S.q6_k(v["linear_attn.in_proj_z.weight"][S.gdn_index(6144, 0)].reshape(-1)))
+        o_want = v["linear_attn.out_proj.weight"][:, S.gdn_index(6144, 0)]     # scales apply before the columns move
+        self.assertEqual(o, S.q6_k(np.ascontiguousarray(o_want).reshape(-1)))
+        self.assertEqual(dw, S.q8_0(v["mlp.shared_expert.down_proj.weight"].reshape(-1)))
+
+    def test_nan_scale_is_refused(self):
+        for name in ("linear_attn.in_proj_a.weight_scale", "linear_attn.in_proj_z.weight_scale"):
+            dt, shape, raw = self.tens[self.L + name]
+            self.tens[self.L + name] = (dt, shape, b"\xff" + raw[1:])
+        small_checkpoint(self.d, self.tens)
+        dn = self.dense()
+        with self.assertRaisesRegex(S.ConvertError, "non-finite"):
+            dn.bytes("blk.0.ssm_alpha.weight")
+        self.assertIn("a non-finite value", [C._mat_job(j) for j in dn.jobs("blk.0.attn_gate.weight")])
+
+    def test_missing_scale_and_f32_projection_are_refused(self):
+        del self.tens[self.L + "linear_attn.out_proj.weight_scale"]
+        small_checkpoint(self.d, self.tens)
+        with self.assertRaisesRegex(S.ConvertError, "out_proj\\.weight is F8_E4M3 and has no weight_scale"):
+            self.dense()
+        self.tens[self.L + "linear_attn.out_proj.weight"] = ("F32", (2, 32), bytes(256))
+        small_checkpoint(self.d, self.tens)
+        with self.assertRaisesRegex(S.ConvertError, "out_proj\\.weight is F32"):
+            self.dense()
+
+
+class PleNvfp4Test(unittest.TestCase):
+    """The NVFP4 n-gram table as Q8_0 rows, its two shards in two files."""
+    STEM = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.d = Path(tmp.name)
+        rng = np.random.default_rng(6)
+        self.codes = [rng.integers(0, 256, size=(r, S.PLE_DIM // 2), dtype=np.uint8) for r in (3, 5)]
+        self.scales = [rng.integers(0x20, 0x50, size=(r, S.PLE_DIM // 16), dtype=np.uint8) for r in (3, 5)]
+        self.s2 = np.float32(0.0123)
+        files = [{}, {}]
+        for i in range(2):
+            files[i][f"{self.STEM}shard_{i}.weight"] = ("U8", self.codes[i].shape, self.codes[i].tobytes())
+            files[i][f"{self.STEM}shard_{i}.weight_scale"] = ("F8_E4M3", self.scales[i].shape, self.scales[i].tobytes())
+        files[1][self.STEM + "weight_scale_2"] = ("F32", (1,), self.s2.tobytes())
+        for i, t in enumerate(files):
+            write_safetensors(self.d / f"model-0000{i + 1}-of-00002.safetensors", t)
+        (self.d / "config.json").write_text("{}")
+
+    def test_rows_from_both_files(self):
+        ple = C.ple_table(C.Checkpoint(self.d))
+        self.assertIsInstance(ple, C.PleNvfp4)
+        self.assertEqual((ple.rows, ple.nbytes), (8, 8 * 170))
+        self.assertEqual([p.name for p in ple.paths], ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"])
+        want = []
+        for codes, scales in zip(self.codes, self.scales):
+            nib = np.empty((codes.shape[0], S.PLE_DIM), np.uint8)
+            nib[:, 0::2], nib[:, 1::2] = codes & 15, codes >> 4
+            mag = np.array(E2M1, np.float32)[nib & 7] * np.where(nib & 8, -1, 1).astype(np.float32)
+            sc = np.vectorize(ue4m3)(scales).astype(np.float32)
+            want.append(S.q8_0(mag * np.repeat(sc, 16, axis=1) * self.s2))
+        ple.chunk_rows = 2
+        self.assertEqual(b"".join(C._ple_nvfp4_job(j) for j in ple.jobs()), b"".join(want))
+
+    def test_sign_bit_scale_is_refused(self):
+        p = self.d / "model-00002-of-00002.safetensors"
+        head, base = S.read_safetensors_header(p)
+        raw = bytearray(p.read_bytes())
+        raw[base + head[self.STEM + "shard_1.weight_scale"]["data_offsets"][0]] |= 0x80
+        p.write_bytes(bytes(raw))
+        ple = C.ple_table(C.Checkpoint(self.d))
+        with self.assertRaisesRegex(S.ConvertError, "sign bit"):
+            for j in ple.jobs():
+                C._ple_nvfp4_job(j)
+
+    def test_fp8_table_keeps_its_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            small_checkpoint(d, {self.STEM + "weight_scale": ("BF16", (1,), np.array([0x3C23], "<u2").tobytes()),
+                                 self.STEM + "shard_0.weight": ("F8_E4M3", (2, S.PLE_DIM), bytes(2 * S.PLE_DIM))})
+            ple = C.ple_table(C.Checkpoint(d))
+            self.assertIsInstance(ple, S.PleFp8)
+            self.assertEqual(ple.paths, [d / "model-00001-of-00001.safetensors"])
+            self.assertEqual(ple.conversion["src_type"], "F8_E4M3")
+
+
 if __name__ == "__main__":
     unittest.main()
+

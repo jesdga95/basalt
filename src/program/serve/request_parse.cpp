@@ -154,7 +154,7 @@ Flow Request::parse() {
             if (!gguard->begin(req_grammar_text, ids.data(), gp, gerr)) gguard.reset();
             else if (gp < ids.size() && gguard->on()) {
                 const std::vector<int32_t> done(ids.begin() + (std::ptrdiff_t) gp, ids.end());
-                if (gguard->scan(done.data(), (int) done.size()) >= 0) {
+                if (gguard->scan(done.data(), (int) done.size(), 0) >= 0) {
                     gerr = "the tokens already generated do not satisfy the grammar";
                     gguard.reset();
                 }
@@ -167,6 +167,7 @@ Flow Request::parse() {
     }
 
     grammar_resamples = 0;
+    grammar_dead = false;
     runtime_.req_imgs.clear();
     if (geni && !runtime_.o.vision) { std::printf("ERR this engine was started without --vision or --vision-external\n"); return Flow::next; }
 

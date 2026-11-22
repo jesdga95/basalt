@@ -441,8 +441,47 @@ static void test_boolean_schemas() {
           err.find("false") != std::string::npos);
 }
 
+// A form with JSON arguments, each call its own block opened by a header that a text block shares.
+static void test_json_args() {
+    ToolForm f;
+    f.call_open = "<|m|>";
+    f.fn_mid = "<|j|>{\"name\":{name},\"args\":";
+    f.fn_close = "}";
+    f.call_close = "<|e|>";
+    f.json_args = true;
+    f.trigger_pattern = "<\\|m\\|>[^<]";
+    const ToolForm saved = tool_form();
+    set_tool_form(f);
+    std::string err;
+    const char* tools = R"([{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city"]}},{"name":"ping"}])";
+    auto g = Grammar::parse(tool_call_gbnf(tools, ToolGrammarOptions{}, err), err);
+    CHECK(g);
+    if (g) {
+        const std::string head = "<|m|>get_weather<|j|>{\"name\":\"get_weather\",\"args\":";
+        CHECK(call_ok(g, head + "{\"city\":\"Paris\"}}<|e|>"));
+        CHECK(call_ok(g, head + "{\"city\":\"Paris\",\"days\":3}}<|e|>"));
+        CHECK(!pre(g, head + "{\"days\":3}"));                                  // city is required
+        CHECK(!pre(g, head + "{\"city\":3"));                                   // a string
+        CHECK(!pre(g, "<|m|>get_weather<|j|>{\"name\":\"ping\""));              // the name repeats the call's
+        CHECK(call_ok(g, "<|m|>ping<|j|>{\"name\":\"ping\",\"args\":{}}<|e|>"));
+        CHECK(call_ok(g, head + "{\"city\":\"Oslo\"}}<|e|><|m|>ping<|j|>{\"name\":\"ping\",\"args\":{\"x\":[1]}}<|e|>"));
+    }
+    auto r = grammar_from_request(R"({"kind":"tools","tool_choice":"auto","tools":[{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}}]})", err);
+    CHECK(r.grammar && r.triggers.patterns.size() == 1 && r.triggers.words.empty());
+    if (r.grammar) {
+        GrammarState s(r.grammar, r.triggers);
+        CHECK(s.accept("<|m|>") && s.accept("<|t|>Let me check.<|e|>") && !s.active());   // a text block: no call
+        CHECK(s.accept("<|m|>") && s.accept("ping") && s.active());
+        CHECK(s.accept("<|j|>{\"name\":\"ping\",\"args\":{\"n\":5}}<|e|>") && s.accepting());
+        GrammarState t(r.grammar, r.triggers);
+        CHECK(t.accept("<|m|>") && !t.allows("pong<|j|>"));
+    }
+    set_tool_form(saved);
+}
+
 int main() {
     set_test_tool_form();
+    test_json_args();
     test_request();
     test_scalars();
     test_enum_const();

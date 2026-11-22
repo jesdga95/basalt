@@ -1,12 +1,16 @@
 // src/platform/process.cpp - see include/basalt/platform/process.hpp.
 #include "basalt/platform/process.hpp"
 
+#include "basalt/core/progress.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/system.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -15,6 +19,7 @@
 #include <fcntl.h>   // _O_BINARY, _O_WRONLY, _O_RDONLY
 #include <io.h>      // _open_osfhandle, _read, _write, _close
 #else
+#include <execinfo.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
@@ -284,6 +289,224 @@ void install_child_stop_signals() {
 void ignore_broken_pipe() {
 #if !defined(_WIN32)
     (void) std::signal(SIGPIPE, SIG_IGN);
+#endif
+}
+
+namespace {
+std::atomic<bool> g_crash_logged{false};
+
+struct CrashBuf {
+    char data[512];
+    size_t n = 0;
+
+    void putc(char c) noexcept {
+        if (n + 1 < sizeof data) data[n++] = c;
+    }
+    void puts(const char* s) noexcept {
+        if (s == nullptr) return;
+        for (; *s != '\0' && n + 1 < sizeof data; ++s) data[n++] = *s;
+    }
+    void put_u64(uint64_t v) noexcept {
+        char tmp[24];
+        int k = 0;
+        do {
+            tmp[k++] = (char) ('0' + (v % 10));
+            v /= 10;
+        } while (v != 0);
+        while (k > 0) putc(tmp[--k]);
+    }
+    void put_i64(int64_t v) noexcept {
+        if (v < 0) {
+            putc('-');
+            put_u64((uint64_t) (-(v + 1)) + 1u);
+        } else {
+            put_u64((uint64_t) v);
+        }
+    }
+    void put_hex(uint64_t v, int min_digits = 1) noexcept {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        char tmp[16];
+        int k = 0;
+        do {
+            tmp[k++] = kHex[v & 0xf];
+            v >>= 4;
+        } while (v != 0 || k < min_digits);
+        puts("0x");
+        while (k > 0) putc(tmp[--k]);
+    }
+};
+
+// `with_memory` is false in a POSIX signal handler: the Linux reading opens and parses /proc files, which is not
+// async-signal-safe.
+void append_crash_stage(CrashBuf& b, bool with_memory) noexcept {
+    const auto& p = basalt::core::progress();
+    const char* where = p.where.load(std::memory_order_relaxed);
+    const int64_t detail = p.detail.load(std::memory_order_relaxed);
+    const int64_t chunk = p.chunk.load(std::memory_order_relaxed);
+    b.puts(" in ");
+    b.puts(where != nullptr ? where : "unknown");
+    if (detail >= 0) {
+        b.puts(" (");
+        b.put_i64(detail);
+        b.putc(')');
+    }
+    if (chunk >= 0) {
+        b.puts(" chunk ");
+        b.put_i64(chunk);
+    }
+    if (!with_memory) return;
+    const ProcessMemory pm = process_memory();
+    if (pm.rss_mib > 0 || pm.avail_mib > 0) {
+        b.puts(", ");
+        b.put_u64(pm.rss_mib);
+        b.puts(" MiB RSS, ");
+        b.put_u64(pm.avail_mib);
+        b.puts(" MiB RAM free");
+    }
+}
+
+void write_crash_line(const CrashBuf& b) noexcept {
+#if defined(_WIN32)
+    const HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    if (h != nullptr && h != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        (void) WriteFile(h, b.data, (DWORD) b.n, &written, nullptr);
+    }
+#else
+    const ssize_t r = ::write(STDERR_FILENO, b.data, b.n);
+    (void) r;
+#endif
+}
+
+void write_crash_backtrace() noexcept {
+    void* frames[24]{};
+#if defined(_WIN32)
+    const USHORT n = CaptureStackBackTrace(0, 24, frames, nullptr);
+    if (n > 0) {
+        CrashBuf b;
+        b.puts("basalt crash: error: backtrace:");
+        for (USHORT i = 0; i < n; ++i) {
+            b.putc(' ');
+            b.put_hex((uintptr_t) frames[i]);
+        }
+        b.putc('\n');
+        write_crash_line(b);
+    }
+#else
+    const int n = ::backtrace(frames, 24);
+    if (n > 0) ::backtrace_symbols_fd(frames, n, STDERR_FILENO);
+#endif
+}
+
+void on_terminate() noexcept {
+    if (!g_crash_logged.exchange(true, std::memory_order_relaxed)) {
+        const char* what = "unknown exception";
+        try {
+            if (const std::exception_ptr ep = std::current_exception()) std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            what = e.what();
+        } catch (...) {
+        }
+        CrashBuf b;
+        b.puts("basalt crash: error: unhandled exception (");
+        b.puts(what);
+        b.putc(')');
+        append_crash_stage(b, true);
+        b.putc('\n');
+        write_crash_line(b);
+        write_crash_backtrace();
+    }
+    std::abort();
+}
+
+#if defined(_WIN32)
+const char* win_exception_name(DWORD code) noexcept {
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION: return "EXCEPTION_ACCESS_VIOLATION";
+        case EXCEPTION_IN_PAGE_ERROR: return "EXCEPTION_IN_PAGE_ERROR";
+        case EXCEPTION_STACK_OVERFLOW: return "EXCEPTION_STACK_OVERFLOW";
+        case EXCEPTION_ILLEGAL_INSTRUCTION: return "EXCEPTION_ILLEGAL_INSTRUCTION";
+        case EXCEPTION_INT_DIVIDE_BY_ZERO: return "EXCEPTION_INT_DIVIDE_BY_ZERO";
+        case 0xC0000374u: return "STATUS_HEAP_CORRUPTION";
+        case 0xC0000409u: return "STATUS_STACK_BUFFER_OVERRUN";
+        case 0xE06D7363u: return "unhandled SEH exception";
+        default: return "unhandled exception";
+    }
+}
+
+LONG WINAPI on_win_exception(EXCEPTION_POINTERS* ep) noexcept {
+    if (!g_crash_logged.exchange(true, std::memory_order_relaxed) && ep != nullptr && ep->ExceptionRecord != nullptr) {
+        const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+        CrashBuf b;
+        b.puts("basalt crash: error: ");
+        b.puts(win_exception_name(r->ExceptionCode));
+        b.puts(" (");
+        b.put_hex((uint32_t) r->ExceptionCode, 8);
+        b.puts(") at ");
+        b.put_hex((uintptr_t) r->ExceptionAddress);
+        if ((r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+            r->NumberParameters >= 2) {
+            const ULONG_PTR op = r->ExceptionInformation[0];
+            b.puts(op == 0 ? " (read from " : op == 1 ? " (write to " : op == 8 ? " (execute at " : " (address ");
+            b.put_hex((uint64_t) r->ExceptionInformation[1]);
+            b.putc(')');
+        }
+        append_crash_stage(b, true);
+        b.putc('\n');
+        write_crash_line(b);
+        write_crash_backtrace();
+    }
+    return EXCEPTION_CONTINUE_SEARCH;   // the system's own crash handling and the exit status stay as they were
+}
+#else
+const char* posix_signal_name(int sig) noexcept {
+    switch (sig) {
+        case SIGSEGV: return "SIGSEGV";
+        case SIGBUS: return "SIGBUS";
+        case SIGILL: return "SIGILL";
+        case SIGFPE: return "SIGFPE";
+        default: return "signal";
+    }
+}
+
+void on_crash_signal(int sig, siginfo_t* info, void*) noexcept {
+    if (!g_crash_logged.exchange(true, std::memory_order_relaxed)) {
+        CrashBuf b;
+        b.puts("basalt crash: error: ");
+        b.puts(posix_signal_name(sig));
+        if (info != nullptr && info->si_code > 0 && info->si_addr != nullptr) {   // a fault, not a sent signal
+            b.puts(" at ");
+            b.put_hex((uintptr_t) info->si_addr);
+        }
+        append_crash_stage(b, false);
+        b.putc('\n');
+        write_crash_line(b);
+        write_crash_backtrace();
+    }
+    (void) ::raise(sig);   // blocked until this returns, then the default action (SA_RESETHAND) ends the process
+}
+#endif
+}  // namespace
+
+void install_crash_handler() {
+    (void) std::set_terminate(on_terminate);
+#if defined(_WIN32)
+    (void) SetUnhandledExceptionFilter(on_win_exception);
+#else
+    // backtrace() loads its unwinder on first use, which allocates: do it now, not in the handler
+    void* warm[1];
+    (void) ::backtrace(warm, 1);
+    // a stack overflow of the calling thread faults with no stack left to run a handler on
+    static char alt_stack[64 * 1024];
+    stack_t ss{};
+    ss.ss_sp = alt_stack;
+    ss.ss_size = sizeof alt_stack;
+    (void) ::sigaltstack(&ss, nullptr);
+    struct sigaction sa{};
+    sa.sa_sigaction = on_crash_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
+    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) (void) sigaction(sig, &sa, nullptr);
 #endif
 }
 

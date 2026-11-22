@@ -2,6 +2,7 @@
 #pragma once
 
 #include "../cli/tokens.hpp"
+#include "console_stats.hpp"
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/conversation_memory.hpp"
@@ -137,6 +138,36 @@ public:
     virtual size_t spill_to_disk(bool at_exit, size_t limit) = 0;
     virtual bool park_idle_engine(std::string& e) = 0;
     virtual void kv_ceiling_note() {}   // a model with an elastic KV sends its ceiling again when it moves
+    // ---- the console's figures (console_stats.hpp), once the server sends STATS
+    ConsoleStats stats{};
+    /// The model's expert counts so far (none for a dense model).
+    virtual LookupCounts lookup_counts() { return {}; }
+    /// The expert map's sample: the pairs of all, each one's home and its lookups since the last call. False for a model
+    /// without routed experts. The first call starts the counting.
+    virtual bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+        (void) total; (void) homes; (void) routed;
+        return false;
+    }
+    /// Per card (CUDA ordinal): the experts it holds and the VRAM their slots take, the KV cache's VRAM (-1: not known), and
+    /// the host-to-device bandwidth as the start measured it (0: not measured). Sent as
+    /// `INFO cards=<bus id>/<expert slots>/<GB/s or ->/<expert MiB>/<KV MiB or ->;...` whenever it changes.
+    struct CardFacts {
+        int device = 0;
+        int64_t expert_slots = 0;
+        double h2d_gbps = 0;
+        uint64_t expert_bytes = 0;
+        int64_t kv_bytes = -1;
+    };
+    virtual std::vector<CardFacts> card_facts() { return {}; }
+    std::string cards_sent_{};
+    /// A decode window of `slot` (see ConsoleStats::window); around a window or a batch round, its lookups.
+    void stats_window(int slot, int offered, int accepted, int tokens) {
+        if (stats.on) stats.window(slot, offered, accepted, tokens);
+    }
+    void stats_lookups_begin() { if (stats.on) stats.lookups_begin(lookup_counts()); }
+    void stats_lookups_end() { if (stats.on) stats.lookups_end(lookup_counts()); }
+    /// Writes the XSLOT and XMAP lines when due (`force`: now, as a request ends).
+    void stats_tick(bool force = false);
     basalt::program::CommonOptions& o;
     basalt::core::ModelFile& model_file;
     std::string& err;
@@ -207,7 +238,7 @@ public:
     /// The tokens an idle slot's conversation holds for its next turn; null when it holds none (or is decoding).
     const std::vector<int32_t>* idle_ids(int b) const;
     struct SlotMeet {
-        int64_t match = 0;   ///< the tokens of the prompt the slot's conversation covers, the same ones the request would reuse from it
+        int64_t match = 0;   ///< the tokens of the prompt the slot's conversation continues (another conversation sharing a head: 0)
         int64_t held = 0;    ///< the tokens it holds
     };
     std::vector<SlotMeet> slot_meets(const std::vector<int32_t>& prompt, bool media) const;
@@ -278,7 +309,7 @@ public:
         bool from_sfx = false;
         double acc = 0.6;          ///< drafts accepted per offered, smoothed: who gets the free rows
         int64_t since_draft = 0;   ///< windows since the slot last drafted
-        int64_t windows = 0;
+        int64_t windows = 0;   ///< the request's windows in this slot, for BDONE
         int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
     };
     std::vector<BSlot> bs{};

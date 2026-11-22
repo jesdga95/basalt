@@ -172,7 +172,7 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
     for (int b = 0; b < NB; ++b) {
         peer.admit(0, b, b);
         std::memcpy(stage, blob[(size_t) b].data(), L.bytes);
-        check(peer.fill_slot(b, stage, L.bytes), "fill");
+        check(cudaMemcpy(peer.slot_ptr(b), stage, L.bytes, cudaMemcpyHostToDevice) == cudaSuccess, "fill");
     }
     kg::NativeExpertLayout Lp = L;
     Lp.swiglu_limit = kLimit;

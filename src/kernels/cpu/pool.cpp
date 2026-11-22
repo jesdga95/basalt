@@ -24,6 +24,22 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity) {
     return detect_cpu_topology(skip_first, affinity).worker_cores;
 }
 
+int auto_pool_workers(int worker_cores, int p_cores, int e_cores, bool hybrid, double cpu_quota, PoolAffinity affinity) {
+    int n = worker_cores;
+    if (hybrid && affinity != PoolAffinity::All) {
+        // The P-cores but the host's.  The auto affinity adds half the E-cores: they run the expert kernels slower, but a
+        // layer's CPU share is split into many small tasks, so each one still shortens it.
+        n = std::max(1, p_cores - 1);
+        if (affinity == PoolAffinity::Auto) n += e_cores / 2;
+    }
+    // A CPU quota throttles the whole group once spent: the workers and the host thread together must fit it.
+    if (cpu_quota > 0) {
+        const int fit = std::max(1, (int) cpu_quota - 1);
+        if (fit < n) n = fit;
+    }
+    return std::max(1, n);
+}
+
 namespace {
 /// The clock of one wait: the time is read every 1024 spins, and `progress` (any number that changes when the wait is
 /// getting somewhere) restarts it.  `expired` is true once ExpertPool::kStall has passed without any.  It is armed by its

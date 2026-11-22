@@ -8,7 +8,7 @@ quality: [precision](../precision/deepseek41.md).
 Packs on [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt), built from Unsloth's GGUFs:
 `DeepSeek-V4.1-Flash-1017-UD-IQ1_M` (about 260 GB) and `-UD-IQ2_XXS` (about 285 GB, closer to BF16, slower when experts spill to disk). Its layout and the DSpark section: [model file](../model-file.md#deepseek-pack).
 
-A test pack, `DeepSeek-V4.1-Flash-1017-NVFP4-test` (about 428 GB), is built from NVIDIA's NVFP4 checkpoint: NVFP4 routed
+An NVFP4 pack, `DeepSeek-V4.1-Flash-1017-NVFP4` (about 428 GB), is built from NVIDIA's NVFP4 checkpoint: NVFP4 routed
 experts, the FP8 projections as Q8_0, the MXFP4 Engram table ([how](../model-file.md#deepseek-nvfp4-pack)). It is meant for
 machines whose RAM holds most of its experts (about 320 GB or more); with less, most experts are read from the SSD and decode
 is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W + 180 W).
@@ -38,8 +38,11 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
 - **Context:** `--max-context` from 1,024 up to the pack's 1,048,576, default 8,192. Caches grow with position (a short chat maps
   a few MiB, a 1M context about 0.97 GiB) into the memory the tier leaves free. A value past the maximum, or whose caches need more
   than half the free memory, is refused; a quarter or more gives a warning.
-- **VRAM:** `--expert-cache` caps the slots; `--vram-reserve-mib` or `POST /v1/vram` sets what stays free. The caches, prompts and
-  images take the tier's copies first (homes stay) and halve their chunks to fit above the reserve.
+- **VRAM:** the tier is sized once, at the start, and its size does not change while serving: a prompt borrows slots inside that
+  total and gives the same number back. `--expert-cache` is a count per all layers (divided by the layer count): honoured exactly,
+  or the start is refused with one line (what fits, the free VRAM, the reserve); `auto` takes what fits. `--vram-reserve-mib` or
+  `POST /v1/vram` sets what stays free and plans the size again once, from the free memory then. The caches, prompts and images
+  take the tier's copies first (homes stay) and halve their chunks to fit above the reserve.
 - **Cache precision:** `--kv fp8` (default) stores the caches as the model's reference rounds them, 920 bytes per position;
   `--kv fp16` keeps the unrounded values, 3,200 bytes per position (a 1M context about 3.2 GiB). [precision](../precision/deepseek41.md#where-each-stage-rounds)
 - **Refused flags:** `--rope-*`, `--yarn-*` (YaRN is part of the model).
@@ -47,8 +50,9 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
 ## Long prompts
 
 - Chunks are 16,384 tokens, halved down to 256 to fit memory.
-- A read of more than 2,048 tokens gives back the copies the main card grew into its spare memory; from 4,096 tokens, a main card
-  without homes gives back all its slots. Afterwards the grown copies reopen from routing order, the other slots empty.
+- A read of more than 2,048 tokens gives back the copies the main card holds beside the short-prompt workspaces; from 4,096 tokens,
+  a main card without homes gives back all its slots. Afterwards the same number of slots reopens, empty, and refills from routing
+  order; if the card can no longer hold them, that is an error, not a smaller tier.
 - With a second card, each layer of a chunk splits its experts: the card holding that layer computes its own and a share of the
   RAM ones, read over its own PCIe link, while the main card computes the rest; the share is priced from each card's link and SM
   clock. Each second card's prompt buffers come out of its own memory before its slots are sized.
@@ -97,8 +101,10 @@ alone in its slot gives the same greedy tokens as with `--parallel 1` (tiers pin
 
 ## Lossy flags
 
-None. Output depends on which experts are resident, so a different RAM tier size can change the text
-([precision](../precision/deepseek41.md#experts-and-placement)).
+Off by default. `--route-prior` and `--route-tail-skip` change output, and each is named in one start warning. What they do on
+every MoE model: [quality](../precision/quality.md#lossy-routing-flags); what they cost and gain here:
+[precision](../precision/deepseek41.md#lossy-routing-flags). Without them, output still depends on which experts are resident, so a
+different RAM tier size can change the text ([precision](../precision/deepseek41.md#experts-and-placement)).
 
 ## Limits
 

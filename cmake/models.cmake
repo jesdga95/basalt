@@ -3,19 +3,30 @@
 # `if(BASALT_MODEL_<ARCH>)`. A model left out is not compiled, not linked and not registered.
 
 # Every model that ships: the architecture ids, as `general.architecture` names them.
-set(BASALT_BUILTIN_MODELS qwen4exp deepseek41 qwen35)
+set(BASALT_BUILTIN_MODELS qwen4exp deepseek41 qwen35 hy4flash inkling2)
 
-set(BASALT_MODELS "${BASALT_BUILTIN_MODELS}" CACHE STRING
-    "Semicolon list of the models to build, from: ${BASALT_BUILTIN_MODELS}")
+# "all" (the default) follows BASALT_BUILTIN_MODELS, so a build folder picks up a model added later. The cache keeps the
+# word, not the list: a list written as the default would stay in the folder and leave every newer model out.
+set(BASALT_MODELS "all" CACHE STRING
+    "Models to build: all, or a semicolon list from: ${BASALT_BUILTIN_MODELS}")
+# A folder configured before "all" holds the list that was then the default (0.4.x): it meant every model.
+if(BASALT_MODELS STREQUAL "qwen4exp;deepseek41;qwen35")
+  message(STATUS "basalt: BASALT_MODELS held 0.4's default list (every model then); it is now 'all'")
+  set(BASALT_MODELS "all" CACHE STRING "Models to build: all, or a semicolon list from: ${BASALT_BUILTIN_MODELS}" FORCE)
+endif()
+# The resolved list, as a normal variable over the cache entry for the rest of the configure.
+if(BASALT_MODELS STREQUAL "all")
+  set(BASALT_MODELS ${BASALT_BUILTIN_MODELS})
+endif()
 
 list(REMOVE_DUPLICATES BASALT_MODELS)
 string(REPLACE ";" ", " _basalt_valid "${BASALT_BUILTIN_MODELS}")
 if(NOT BASALT_MODELS)
-  message(FATAL_ERROR "BASALT_MODELS is empty: name at least one of ${_basalt_valid}")
+  message(FATAL_ERROR "BASALT_MODELS is empty: say all or name at least one of ${_basalt_valid}")
 endif()
 foreach(_m IN LISTS BASALT_MODELS)
   if(NOT _m IN_LIST BASALT_BUILTIN_MODELS)
-    message(FATAL_ERROR "BASALT_MODELS names '${_m}', which is not a Basalt model. Valid: ${_basalt_valid}")
+    message(FATAL_ERROR "BASALT_MODELS names '${_m}', which is not a Basalt model. Valid: all, ${_basalt_valid}")
   endif()
 endforeach()
 

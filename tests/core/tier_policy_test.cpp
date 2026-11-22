@@ -1,0 +1,509 @@
+// tests/core/tier_policy_test.cpp - the tier admission and placement rules on synthetic id streams.
+#include "basalt/core/tier_policy.hpp"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <functional>
+#include <vector>
+
+using namespace basalt::core::policy;
+
+static int g_fail = 0;
+#define CHECK(c)                                                          \
+    do {                                                                  \
+        if (!(c)) {                                                       \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); \
+            ++g_fail;                                                     \
+        }                                                                 \
+    } while (0)
+
+int main() {
+    // admission window: only a repeat inside the window counts, the first miss never does
+    CHECK(!repeat_miss(0, 100, kPromoteWindow));
+    CHECK(repeat_miss(10 + 1, 10 + kPromoteWindow, kPromoteWindow));
+    CHECK(!repeat_miss(10 + 1, 10 + kPromoteWindow + 1, kPromoteWindow));
+
+    // ghost reset: a stream where one expert misses every 40 tokens is admitted on its second miss, one every 100 never
+    for (int period : {40, 100}) {
+        uint64_t last = 0;
+        int admitted = 0;
+        for (uint64_t t = 1; t < 1000; t += (uint64_t) period) {
+            if (repeat_miss(last, t, kPromoteWindow)) ++admitted;
+            last = t + 1;
+        }
+        CHECK(period == 40 ? admitted > 0 : admitted == 0);
+    }
+
+    // CPU-first split: the CPU keeps half (rounded up), the file-backed misses stay with it
+    CHECK(bus_count(0, 0) == 0);
+    CHECK(bus_count(1, 0) == 0);
+    CHECK(bus_count(2, 0) == 1);
+    CHECK(bus_count(3, 0) == 1);
+    CHECK(bus_count(4, 0) == 2);
+    CHECK(bus_count(2, 1) == 1);
+    CHECK(bus_count(1, 2) == 1);
+    CHECK(bus_count(3, 3) == 3);
+    for (int p = 0; p <= 6; ++p)
+        for (int f = 0; f <= 6 - p; ++f) {
+            const int b = bus_count(p, f);
+            CHECK(b >= 0 && b <= p);
+            CHECK(p + f - b >= f);   // the CPU always takes every file-backed miss
+        }
+
+    // the second card's link: half the bus's misses, rounded down, when the bus has as many as the CPU
+    CHECK(peer_bus_count(1, 0) == 0);
+    CHECK(peer_bus_count(2, 0) == 0);
+    CHECK(peer_bus_count(3, 0) == 0);
+    CHECK(peer_bus_count(4, 0) == 1);
+    CHECK(peer_bus_count(5, 0) == 0);
+    CHECK(peer_bus_count(6, 0) == 1);
+    CHECK(peer_bus_count(8, 0) == 2);
+    CHECK(peer_bus_count(3, 1) == 1);   // the file-backed miss and a pinned one on the CPU, two pinned on the bus
+    CHECK(peer_bus_count(1, 3) == 0);
+    for (int p = 0; p <= 16; ++p)
+        for (int f = 0; f <= 16 - p; ++f) {
+            const int n = peer_bus_count(p, f);
+            CHECK(n >= 0 && n <= bus_count(p, f) - n);   // the main card's link keeps at least as many
+        }
+
+    // slots by layer weight: the uniform total, within the bounds, deterministic; no weights or equal ones: uniform
+    {
+        CHECK(layer_slots(141, {}, 16, 512).empty());
+        CHECK(layer_slots(10, {1, 1, 1, 1}, 0, 512) == std::vector<int64_t>({10, 10, 10, 10}));
+        CHECK(layer_slots(10, {3, 1}, 0, 512) == std::vector<int64_t>({15, 5}));
+        CHECK(layer_slots(10, {1, 1, 1}, 0, 512) == std::vector<int64_t>({10, 10, 10}));
+        CHECK(layer_slots(1, {1, 1, 1}, 0, 512) == std::vector<int64_t>({1, 1, 1}));
+        CHECK(layer_slots(2, {1, 1, 1, 0}, 0, 512) == std::vector<int64_t>({3, 3, 2, 0}));   // the leftover to the lowest layer first
+        CHECK(layer_slots(10, {9, 1}, 4, 512) == std::vector<int64_t>({16, 4}));              // the floor holds
+        CHECK(layer_slots(10, {9, 1}, 0, 12) == std::vector<int64_t>({12, 8}));               // the ceiling holds
+        CHECK(layer_slots(10, {1, 1}, 0, 6) == std::vector<int64_t>({6, 6}));                 // bounds below the total: all they allow
+        CHECK(layer_slots(0, {2, 1}, 0, 512) == std::vector<int64_t>({0, 0}));
+        const std::vector<float> w = {1.76f, 1.84f, 0.45f, 0.62f, 1.13f};
+        for (int64_t pl : {16, 64, 135, 141, 300}) {
+            const std::vector<int64_t> n = layer_slots(pl, w, std::min<int64_t>(pl, 16), 512);
+            int64_t sum = 0;
+            for (int64_t x : n) {
+                CHECK(x >= std::min<int64_t>(pl, 16) && x <= 512);
+                sum += x;
+            }
+            CHECK(sum == pl * 5);
+            CHECK(n == layer_slots(pl, w, std::min<int64_t>(pl, 16), 512));
+        }
+    }
+
+    // homes: a RAM shortfall puts homes on the main card, with or without a second card; RAM that takes the rest leaves
+    // the main card all copies
+    {
+        Homes h = plan_homes(384, 34, 0, 305, -1);
+        CHECK(h.main == 34 && h.peer == 0 && h.ram == 305 && h.file == 45);
+        h = plan_homes(384, 34, 0, 384, -1);
+        CHECK(h.main == 0 && h.peer == 0 && h.ram == 384 && h.file == 0);
+        h = plan_homes(384, 34, 46, 320, -1);
+        CHECK(h.main == 34 && h.peer == 46 && h.ram == 304 && h.file == 0);
+        h = plan_homes(384, 34, 46, 420, -1);
+        CHECK(h.main == 0 && h.peer == 46 && h.ram == 338 && h.file == 0);
+        h = plan_homes(384, 34, 46, 220, -1);
+        CHECK(h.main == 34 && h.peer == 46 && h.ram == 220 && h.file == 84);
+        h = plan_homes(384, 34, 500, 10, -1);
+        CHECK(h.main == 0 && h.peer == 384 && h.ram == 0 && h.file == 0);
+        // a shortfall of n places puts n experts in the file, never more
+        for (int n : {1, 2, 13}) {
+            h = plan_homes(384, 34, 46, 304 - n, -1);
+            CHECK(h.main == 34 && h.ram == 304 - n && h.file == n);
+            h = plan_homes(384, 34, 0, 350 - n, -1);
+            CHECK(h.main == 34 && h.file == n);
+        }
+        for (int mp : {0, 10, 80})
+            for (int pp : {0, 7, 46})
+                for (int rp : {0, 100, 384}) {
+                    h = plan_homes(384, mp, pp, rp, -1);
+                    CHECK(h.main + h.peer + h.ram + h.file == 384);
+                    CHECK(h.main >= 0 && h.peer >= 0 && h.ram >= 0 && h.file >= 0);
+                    // every rank has one place and the places hold what the plan says
+                    int n[4] = {0, 0, 0, 0};
+                    for (int r = 0; r < 384; ++r) ++n[(int) place_of_rank(h, 59, r)];
+                    CHECK(n[(int) Place::Main] == h.main && n[(int) Place::Peer] == h.peer &&
+                          n[(int) Place::Ram] == h.ram && n[(int) Place::File] == h.file);
+                }
+        // one card: the main card's homes head the order, then RAM and the file; RAM that takes all is the head when the
+        // main card holds copies; two cards: the copies' head stays in RAM ahead of the second card
+        h = plan_homes(384, 34, 0, 305, -1);
+        CHECK(place_of_rank(h, 59, 33) == Place::Main && place_of_rank(h, 59, 34) == Place::Ram && place_of_rank(h, 59, 338) == Place::Ram &&
+              place_of_rank(h, 59, 339) == Place::File);
+        h = plan_homes(384, 34, 0, 384, -1);
+        CHECK(place_of_rank(h, 59, 0) == Place::Ram && place_of_rank(h, 59, 383) == Place::Ram);
+        h = plan_homes(384, 34, 46, 420, -1);
+        CHECK(place_of_rank(h, 59, 58) == Place::Ram && place_of_rank(h, 59, 59) == Place::Peer && place_of_rank(h, 59, 105) == Place::Ram);
+        h = plan_homes(384, 34, 46, 320, -1);
+        CHECK(place_of_rank(h, 59, 33) == Place::Main && place_of_rank(h, 59, 34) == Place::Peer && place_of_rank(h, 59, 80) == Place::Ram);
+    }
+
+    // the machine's capacity decides homes against copies-only: the same live free RAM, different results
+    {
+        Homes h = plan_homes(384, 22, 46, 338, 345);   // fits, but not twice over: homes, the live room fills the rest
+        CHECK(h.main == 22 && h.ram == 316 && h.file == 0);
+        h = plan_homes(384, 22, 46, 330, 345);         // the live room moves RAM and the file, never the placement
+        CHECK(h.main == 22 && h.ram == 316 && h.file == 0);
+        h = plan_homes(384, 22, 46, 310, 345);
+        CHECK(h.main == 22 && h.ram == 310 && h.file == 6);
+        h = plan_homes(384, 22, 46, 338, 360);         // room for the second card's rest and the homes again: copies only
+        CHECK(h.main == 0 && h.ram == 338 && h.file == 0);
+        h = plan_homes(384, 22, 46, 330, 1000);        // other programs hold RAM now: a short tier, not homes
+        CHECK(h.main == 0 && h.ram == 330 && h.file == 8);
+        h = plan_homes(384, 34, 0, 384, 400);          // one card
+        CHECK(h.main == 34 && h.ram == 350 && h.file == 0);
+        h = plan_homes(384, 34, 0, 384, 418);
+        CHECK(h.main == 0 && h.ram == 384);
+    }
+
+    // promotion budget: copies come in pieces of at most kPieceBytes
+    CHECK(pieces(7'300'000) == 7);
+    CHECK(pieces(kPieceBytes) == 1);
+    CHECK(pieces(kPieceBytes + 1) == 2);
+
+    // victim choice: least recently used pinned expert, ties to the lowest id, unpinned and busy ones skipped
+    int32_t idx[6] = {0, -1, 2, 3, -1, 5};
+    uint64_t st[6] = {50, 1, 20, 20, 0, 90};
+    CHECK(pick_victim(idx, st, 6, nullptr, 0) == 2);
+    int busy[1] = {2};
+    CHECK(pick_victim(idx, st, 6, busy, 1) == 3);
+    int32_t none[3] = {-1, -1, -1};
+    CHECK(pick_victim(none, st, 3, nullptr, 0) == -1);
+
+    // swap-slot accounting on a model of one layer: a spare slot, a victim and a candidate per swap; the slot set
+    // stays a permutation and exactly one expert changes sides each time
+    const int n = 8, cover = 5;
+    std::vector<int32_t> ri(n, -1);
+    for (int e = 0; e < cover; ++e) ri[(size_t) e] = e;
+    int spare = cover;
+    std::vector<uint64_t> stamp(n, 0);
+    for (int step = 0; step < 50; ++step) {
+        const int cand = cover + step % (n - cover);   // cycles through file-backed ids
+        if (ri[(size_t) cand] >= 0) continue;
+        const int v = pick_victim(ri.data(), stamp.data(), n, nullptr, 0);
+        CHECK(v >= 0);
+        const int32_t vs = ri[(size_t) v];
+        ri[(size_t) cand] = spare;
+        ri[(size_t) v] = -1;
+        spare = vs;
+        stamp[(size_t) cand] = (uint64_t) step + 1;
+        std::vector<int> seen(cover + 1, 0);
+        int pinned = 0;
+        for (int e = 0; e < n; ++e)
+            if (ri[(size_t) e] >= 0) {
+                ++seen[(size_t) ri[(size_t) e]];
+                ++pinned;
+            }
+        ++seen[(size_t) spare];
+        CHECK(pinned == cover);
+        for (int s : seen) CHECK(s == 1);
+    }
+
+    // the slot cap and the reserve hold when the tier grows and when it opens again
+    {
+        constexpr uint64_t one = 100, room = 1000;
+        CHECK(slots_beside(500, 600, one, 8) == 0);
+        CHECK(slots_beside(1000, 600, one, 2) == 2);
+        CHECK(grow_slots(3000, room, 0, one, 4, 384, -1) == 20);
+        CHECK(grow_slots(3000, room, 500, one, 4, 384, -1) == 15);
+        CHECK(grow_slots(3000, room, 0, one, 4, 384, 10) == 6);
+        CHECK(grow_slots(3000, room, 0, one, 10, 384, 10) == 0);
+        CHECK(grow_slots(3000, room, 0, one, 12, 384, 10) == 0);
+        CHECK(grow_slots(100000, room, 0, one, 4, 16, -1) == 12);
+        CHECK(reclaim_slots(3000, room, 0, one, 8) == 8);
+        CHECK(reclaim_slots(3000, room, 2300, one, 8) == 0);
+        CHECK(reclaim_slots(3000, room, 2200, one, 8) == 8);
+        CHECK(reclaim_slots(3000, room, 1500, one, 30) == 5);
+        CHECK(reclaim_slots(3000, room, 2500, one, 30) == 0);
+        // the plan's size is fixed: what grow plans at the start is what a prompt's shrink and grow open again, and an
+        // exact count the card cannot hold (base + ext below it) is refused while one it holds, or auto, is not
+        const int64_t ext = grow_slots(3000, room, 0, one, 4, 384, 10);   // capped at 10 per layer: 6 beside 4
+        CHECK(holds_exact(10, 4, ext));
+        CHECK(holds_exact(0, 4, 0));
+        CHECK(holds_exact(-1, 0, 0));
+        CHECK(!holds_exact(12, 4, grow_slots(1000, room, 0, one, 4, 384, 12)));   // room for none: 4 of the 12
+        CHECK(holds_exact(12, 4, grow_slots(3000, room, 0, one, 4, 384, 12)));    // room for 8: all 12
+        CHECK(holds_exact(5, 8, 0));                                              // base alone above the count
+    }
+
+    // the admission threshold is a parameter: k uses admit, and the count starts over
+    for (int k : {1, 2, 3}) {
+        uint16_t uses = 0;
+        for (int round = 0; round < 3; ++round) {
+            for (int i = 1; i < k; ++i) CHECK(!count_use(uses, k));
+            CHECK(count_use(uses, k));
+            CHECK(uses == 0);
+        }
+    }
+
+    // promotion by CPU uses: the kPromoteUses-th use earns it and the count starts over; the counts halve once per
+    // kUseHalfLife tokens, however the tokens come in windows
+    {
+        uint16_t uses = 0;
+        for (int i = 1; i < kPromoteUses; ++i) CHECK(!count_use(uses));
+        CHECK(count_use(uses));
+        CHECK(uses == 0);
+        CHECK(!count_use(uses));
+        int halvings = 0;
+        for (uint64_t t = 0; t < 10 * kUseHalfLife; t += 3) halvings += use_half_life(t, 3);
+        CHECK(halvings == 10);
+        CHECK(!use_half_life(0, kUseHalfLife - 1));
+        CHECK(use_half_life(kUseHalfLife - 1, 1));
+    }
+
+    // victims by use: the counts saturate and halve once per period however the tokens come in windows; fewer lookups give
+    // way first, the one used longest ago among equals
+    {
+        uint16_t looks = 0;
+        for (int i = 0; i < 3 * kLookCap; ++i) count_look(looks);
+        CHECK(looks == kLookCap);
+        int halvings = 0;
+        for (uint64_t t = 0; t < 10 * 256; t += 3) halvings += crosses(t, 3, 256);
+        CHECK(halvings == 10);
+        CHECK(!crosses(5, 1000, 0));
+        CHECK(yields_before(1, 100, 2, 50));   // fewer lookups first, however recent
+        CHECK(yields_before(3, 40, 3, 50));    // the older among equals
+        CHECK(!yields_before(3, 50, 3, 50));
+        // 4 slots; expert 0 comes every 6th token and every other token brings a new expert: oldest-first always evicts expert 0
+        // before it returns, by use it keeps the slot its second visit takes
+        for (bool by_use : {false, true}) {
+            std::vector<int> slot(4, -1);
+            std::vector<uint64_t> stamp(400, 0);
+            std::vector<uint16_t> lk(400, 0);
+            int hits0 = 0, visits0 = 0, next = 1;
+            for (uint64_t t = 1; t <= 300; ++t) {
+                if (crosses(t - 1, 1, 64))
+                    for (uint16_t& x : lk) x >>= 1;
+                const int e = t % 6 == 0 ? 0 : next++;
+                visits0 += e == 0;
+                stamp[(size_t) e] = t;
+                count_look(lk[(size_t) e]);
+                if (std::find(slot.begin(), slot.end(), e) != slot.end()) {
+                    hits0 += e == 0;
+                    continue;
+                }
+                int v = -1;
+                for (int s = 0; s < 4 && (v < 0 || slot[(size_t) v] >= 0); ++s) {
+                    const int a = slot[(size_t) s];
+                    if (v < 0 || a < 0) {
+                        v = s;
+                        continue;
+                    }
+                    const int b = slot[(size_t) v];
+                    if (by_use ? yields_before(lk[(size_t) a], stamp[(size_t) a], lk[(size_t) b], stamp[(size_t) b])
+                               : stamp[(size_t) a] < stamp[(size_t) b])
+                        v = s;
+                }
+                slot[(size_t) v] = e;
+            }
+            CHECK(visits0 == 50);
+            CHECK(by_use ? hits0 == visits0 - 2 : hits0 == 0);
+        }
+    }
+
+    // several second cards: each owns a contiguous block of layers, larger blocks first
+    {
+        const PeerBlocks b3 = split_layers(40, 3);
+        CHECK((b3.lo == std::vector<int>{0, 14, 27}) && (b3.hi == std::vector<int>{14, 27, 40}));
+        const PeerBlocks b1 = split_layers(40, 1);
+        CHECK((b1.lo == std::vector<int>{0}) && (b1.hi == std::vector<int>{40}));
+        const PeerBlocks bb = split_layers(3, 3);
+        CHECK((bb.lo == std::vector<int>{0, 1, 2}) && (bb.hi == std::vector<int>{1, 2, 3}));
+        const PeerBlocks b2 = split_layers(40, 2);
+        CHECK((b2.lo == std::vector<int>{0, 20}) && (b2.hi == std::vector<int>{20, 40}));
+        const PeerBlocks b4 = split_layers(40, 4);
+        CHECK((b4.lo == std::vector<int>{0, 10, 20, 30}) && (b4.hi == std::vector<int>{10, 20, 30, 40}));
+
+        const int layers[] = {0, 13, 14, 26, 27, 39}, owners[] = {0, 0, 1, 1, 2, 2};
+        for (int i = 0; i < 6; ++i) CHECK(owner_of(b3, layers[i]) == owners[i]);
+
+        // the uniform per-layer count is the smallest any card holds for ITS block, never card 0's alone
+        const uint64_t blob = (6430000ull + 255) / 256 * 256, reserve = 600ull << 20;
+        const std::vector<uint64_t> rooms{15000000000ull, 15000000000ull, 12000000000ull};   // the last card binds, not card 0
+        const std::vector<uint64_t> blocks{14 * blob, 13 * blob, 13 * blob};
+        uint64_t want = ~0ull;
+        for (size_t c = 0; c < rooms.size(); ++c) want = std::min<uint64_t>(want, (rooms[c] - reserve) / blocks[c]);
+        CHECK(uniform_peer_slots(rooms, blocks, reserve, 384) == (int) std::min<uint64_t>(want, 384));
+        CHECK(want < (rooms[0] - reserve) / blocks[0]);   // so a card-0-only sizing would be caught here
+        CHECK(uniform_peer_slots({15000000000ull, reserve, 14000000000ull}, blocks, reserve, 384) == 0);
+        CHECK(uniform_peer_slots(rooms, {blob, blob, blob}, reserve, 384) == 384);   // capped at the layer's experts
+
+        // one card holding every layer is the single second card's count: min((room - reserve) / one_each, n_expert), 0 at or under the reserve
+        const uint64_t one_each = 40 * blob, R = 15405465600ull;
+        CHECK(uniform_peer_slots({R}, {one_each}, reserve, 384) == (int) std::min<uint64_t>((R - reserve) / one_each, 384));
+        CHECK(uniform_peer_slots({reserve}, {one_each}, reserve, 384) == 0);
+
+        // a card's local slots are dense and distinct; their sum is the global slot count (n_layers * homes_peer)
+        for (const PeerBlocks* b : {&b1, &b2, &b3, &b4}) {
+            const int hp = 7;
+            int total = 0;
+            for (size_t c = 0; c < b->lo.size(); ++c) {
+                const int span = (b->hi[c] - b->lo[c]) * hp;
+                std::vector<int> seen((size_t) span, 0);
+                for (int l = b->lo[c]; l < b->hi[c]; ++l)
+                    for (int n = 0; n < hp; ++n) {
+                        const int32_t s = local_slot(*b, hp, l, n);
+                        CHECK(s >= 0 && s < span);
+                        if (s >= 0 && s < span) ++seen[(size_t) s];
+                    }
+                for (int v : seen) CHECK(v == 1);
+                total += span;
+            }
+            CHECK(total == 40 * hp);
+        }
+    }
+
+    // blocks sized to each card's room (split_by_bytes): the uniform homes a contiguous split can give, at its best
+    {
+        auto rnd = [](uint64_t b) { return (b + 255) / 256 * 256; };
+        auto block_bytes = [](const std::vector<uint64_t>& lb, const PeerBlocks& b) {
+            std::vector<uint64_t> out;
+            for (size_t c = 0; c < b.lo.size(); ++c) {
+                uint64_t s = 0;
+                for (int l = b.lo[c]; l < b.hi[c]; ++l) s += lb[(size_t) l];
+                out.push_back(s);
+            }
+            return out;
+        };
+        // the best uniform homes over EVERY contiguous split into n non-empty blocks (brute force, small cases)
+        auto best = [&](const std::vector<uint64_t>& lb, const std::vector<uint64_t>& room, uint64_t res, int ne) {
+            const int L = (int) lb.size(), n = (int) room.size();
+            int top = 0;
+            std::vector<int> cut((size_t) n + 1, 0);
+            cut[(size_t) n] = L;
+            std::function<void(int, int)> rec = [&](int c, int at) {
+                if (c == n - 1) {
+                    if (L - at < 1) return;
+                    cut[(size_t) c] = at;
+                    PeerBlocks b;
+                    for (int k = 0; k < n; ++k) { b.lo.push_back(cut[(size_t) k]); b.hi.push_back(cut[(size_t) k + 1]); }
+                    top = std::max(top, uniform_peer_slots(room, block_bytes(lb, b), res, ne));
+                    return;
+                }
+                cut[(size_t) c] = at;
+                for (int nx = at + 1; nx <= L - (n - 1 - c); ++nx) {
+                    cut[(size_t) c + 1] = nx;
+                    rec(c + 1, nx);
+                }
+            };
+            if (n == 1) {
+                PeerBlocks b{{0}, {L}};
+                return uniform_peer_slots(room, block_bytes(lb, b), res, ne);
+            }
+            rec(0, 0);
+            return top;
+        };
+        auto valid = [](const PeerBlocks& b, int L) {
+            bool ok = !b.lo.empty() && b.lo[0] == 0 && b.hi.back() == L;
+            for (size_t c = 0; c < b.lo.size(); ++c) ok = ok && b.hi[c] > b.lo[c] && (c == 0 || b.lo[c] == b.hi[c - 1]);
+            return ok;
+        };
+        const uint64_t reserve = 600ull << 20, card = 15405465600ull;   // one card's room after its buffers
+
+        // (a) equal layers, equal cards: as good as the best contiguous split, every card used
+        {
+            const std::vector<uint64_t> lb(12, rnd(9000000));
+            const std::vector<uint64_t> room(3, card);
+            int h = -1;
+            const PeerBlocks b = split_by_bytes(lb, room, reserve, 384, h);
+            CHECK(valid(b, 12) && b.lo.size() == 3);
+            CHECK(h == best(lb, room, reserve, 384));
+            CHECK(uniform_peer_slots(room, block_bytes(lb, b), reserve, 384) == h);   // (g)
+        }
+        // (b) the UD-IQ2_XXS pack's layer sizes (its experts.layout): beats the count split, and the
+        //     card holding the late (bigger) layers takes fewer of them than the first card
+        {
+            const uint64_t ud[40] = {8478720, 8017920, 7649280, 7649280, 7649280, 8017920, 8017920, 8017920, 8017920, 8017920,
+                                     9861120, 9861120, 9861120, 9861120, 9861120, 9861120, 9861120, 9861120, 9861120, 9861120,
+                                     10598400, 10598400, 10598400, 10598400, 10598400, 12072960, 12072960, 12072960, 12072960, 12072960,
+                                     12072960, 12072960, 12072960, 12072960, 12072960, 11335680, 11335680, 11335680, 11335680, 11335680};
+            std::vector<uint64_t> lb;
+            for (uint64_t v : ud) lb.push_back(rnd(v));
+            const std::vector<uint64_t> room(3, card);
+            int h = -1;
+            const PeerBlocks b = split_by_bytes(lb, room, reserve, 384, h);
+            const PeerBlocks bc = split_layers(40, 3);
+            const int hc = uniform_peer_slots(room, block_bytes(lb, bc), reserve, 384);
+            CHECK(valid(b, 40) && b.lo.size() == 3);
+            CHECK(h > hc);
+            CHECK(b.hi[2] - b.lo[2] < b.hi[0] - b.lo[0]);
+            CHECK(uniform_peer_slots(room, block_bytes(lb, b), reserve, 384) == h);
+            std::printf("  UD-IQ2_XXS on 3 equal cards: count split %d homes, byte split %d (blocks %d/%d/%d)\n", hc, h,
+                        b.hi[0] - b.lo[0], b.hi[1] - b.lo[1], b.hi[2] - b.lo[2]);
+        }
+        // (c) a small card among big ones gets fewer layers
+        {
+            const std::vector<uint64_t> lb(20, rnd(9000000));
+            const std::vector<uint64_t> room{card, 8000000000ull, card};
+            int h = -1;
+            const PeerBlocks b = split_by_bytes(lb, room, reserve, 384, h);
+            CHECK(valid(b, 20));
+            CHECK(b.hi[1] - b.lo[1] < b.hi[0] - b.lo[0] && b.hi[1] - b.lo[1] < b.hi[2] - b.lo[2]);
+            CHECK(h == best(lb, room, reserve, 384));
+        }
+        // (d) one card holding every layer is the single second card's slots_in
+        {
+            const std::vector<uint64_t> lb(40, rnd(9861120));
+            uint64_t one_each = 0;
+            for (uint64_t v : lb) one_each += v;
+            int h = -1;
+            const PeerBlocks b = split_by_bytes(lb, {card}, reserve, 384, h);
+            CHECK(valid(b, 40) && b.lo.size() == 1);
+            CHECK(h == (int) std::min<uint64_t>((card - reserve) / one_each, 384));
+        }
+        // (e) a card at or under its reserve: no homes; and more cards than layers: no homes
+        {
+            int h = -1;
+            split_by_bytes(std::vector<uint64_t>(10, rnd(9000000)), {card, reserve, card}, reserve, 384, h);
+            CHECK(h == 0);
+            h = -1;
+            split_by_bytes(std::vector<uint64_t>(2, rnd(9000000)), {card, card, card}, reserve, 384, h);
+            CHECK(h == 0);
+        }
+        // (f) optimal against brute force on seeded small cases
+        {
+            uint64_t seed = 12345;
+            auto next = [&seed] { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+            for (int it = 0; it < 200; ++it) {
+                const int L = 4 + (int) (next() % 7), n = 2 + (int) (next() % 3);
+                if (n > L) continue;
+                std::vector<uint64_t> lb, room;
+                for (int l = 0; l < L; ++l) lb.push_back(rnd(5000000 + next() % 9000000));
+                for (int c = 0; c < n; ++c) room.push_back(reserve + 2000000000ull + (uint64_t) (next() % 14000000000ull));
+                int h = -1;
+                const PeerBlocks b = split_by_bytes(lb, room, reserve, 384, h);
+                const int want = best(lb, room, reserve, 384);
+                CHECK(h == want);
+                CHECK(h == 0 || (valid(b, L) && uniform_peer_slots(room, block_bytes(lb, b), reserve, 384) == h));
+            }
+        }
+    }
+
+    // 41 layers of 512 experts of 4.59 MB over one to three second cards of 14.4 GB with RAM for every expert: the blocks cover
+    // every layer once and the homes follow the room
+    {
+        const uint64_t blob = (4591616 + 255) / 256 * 256, reserve = 600ull << 20, room = 14400ull << 20;
+        const std::vector<uint64_t> lb(41, blob);
+        int prev = 0;
+        for (int cards = 1; cards <= 3; ++cards) {
+            int h = 0;
+            const PeerBlocks b = split_by_bytes(lb, std::vector<uint64_t>((size_t) cards, room), reserve, 512, h);
+            CHECK(b.lo.size() == (size_t) cards && b.lo[0] == 0 && b.hi.back() == 41);
+            for (int c = 1; c < cards; ++c) CHECK(b.lo[(size_t) c] == b.hi[(size_t) c - 1]);
+            CHECK(h > prev);   // each card adds second-card homes
+            prev = h;
+            const Homes hm = plan_homes(512, 0, h, 512, -1);
+            CHECK(hm.main == 0 && hm.peer == h && hm.peer + hm.ram + hm.file == 512 && hm.file == 0);
+        }
+        const Homes full = plan_homes(512, 0, 512, 512, -1);
+        CHECK(full.peer == 512 && full.ram == 0);
+        // admission at k = 2 on a miss stream: the second miss of an expert admits it
+        uint16_t u = 0;
+        CHECK(!count_use(u, 2) && count_use(u, 2));
+    }
+
+    if (g_fail) return 1;
+    std::printf("tier_policy_test: ok\n");
+    return 0;
+}

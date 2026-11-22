@@ -16,6 +16,7 @@
 #include "basalt/platform/win.hpp"
 #include <fcntl.h>   // _O_BINARY
 #include <io.h>      // _fileno, _setmode
+#include <psapi.h>   // K32GetProcessMemoryInfo
 #else
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -112,7 +113,20 @@ std::string meminfo_path() { return std::string(); }
 std::string self_cgroup_path() { return std::string(); }
 std::string cgroup_root() { return std::string(); }
 
-ProcessMemory process_memory() { return ProcessMemory{}; }   // the stall report names the Linux readings only
+ProcessMemory process_memory() {
+    ProcessMemory m;
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) m.avail_mib = ms.ullAvailPhys >> 20;
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof pmc;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof pmc)) {
+        m.faults = pmc.PageFaultCount;
+        m.rss_mib = pmc.WorkingSetSize >> 20;
+        m.commit_mib = pmc.PrivateUsage > pmc.WorkingSetSize ? (pmc.PrivateUsage - pmc.WorkingSetSize) >> 20 : 0;
+    }
+    return m;
+}
 
 int disk_rotational(const std::string&, std::string&) {
     return -1;   // sysfs names the queue on Linux; unknown means the caller does not warn

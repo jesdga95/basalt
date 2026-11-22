@@ -103,6 +103,34 @@ void unit_tests() {
         const int n = d.propose(6, out);
         check(n >= 3 && out[0] == 1 && out[1] == 2 && out[2] == 3, "periodic continuation");
     }
+    {   // an old source survives later repeats of a common trigram: the longer key still finds it
+        SuffixDrafter d;
+        std::vector<int32_t> doc;
+        for (int i = 0; i < 20; ++i) doc.push_back(1000 + i);                       // the source
+        for (int r = 0; r < 8; ++r) {                                               // later repeats of the trigram the quote ends on
+            for (int i = 0; i < 4; ++i) doc.push_back(2000 + r * 10 + i);
+            for (int i = 9; i < 12; ++i) doc.push_back(1000 + i);
+            doc.push_back(3000 + r);
+        }
+        for (int i = 0; i < 12; ++i) doc.push_back(1000 + i);                       // quoting the source again
+        d.append(doc.data(), doc.size());
+        int32_t out[4];
+        const int n = d.propose(4, out);
+        check(n == 4 && out[0] == 1012 && out[3] == 1015, "an old source behind a common trigram is found");
+        check(d.last_match() >= 12, "its match is the whole quoted stretch");
+    }
+    {   // a reset forgets the whole history
+        SuffixDrafter d;
+        std::vector<int32_t> doc;
+        for (int i = 0; i < 40; ++i) doc.push_back(500 + i);
+        d.append(doc.data(), doc.size());
+        d.reset();
+        d.append(doc.data(), 12);
+        int32_t out[4];
+        check(d.propose(4, out) == 0 && d.size() == 12, "after a reset an earlier history is not proposed from");
+        d.append(&doc[0], 3);   // the first 3 of it again: only the new history is searched
+        check(d.propose(4, out) == 4 && out[0] == 503, "the history since the reset is");
+    }
     {   // bounded memory: appending beyond the nominal capacity does not crash and still works
         SuffixDrafter d(3, 32, 1024);
         std::vector<int32_t> doc;

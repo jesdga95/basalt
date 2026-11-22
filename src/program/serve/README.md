@@ -19,6 +19,7 @@ pays no indirect call. `Flow::next` returns to command dispatch; `Flow::error` e
 | The window's order | `decode_loop.hpp`, `reply_rows.hpp` |
 | Completion, slot admission and reports | `request_finish.cpp` |
 | A model that offers only sessions | `session_engine.cpp` |
+| The console's figures once the server sends `STATS` (XSLOT, XMAP, INFO cards=) | `console_stats.hpp`, `commands.cpp` |
 
 A model with its own serving derives from both classes in its own folder; see `src/models/qwen4exp/serve/`.
 

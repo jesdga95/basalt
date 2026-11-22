@@ -98,13 +98,15 @@ def reply(ids):            # the rest of the reply after what the prompt already
     return R[k:]
 active = {}          # slot -> [tokens left, max_new, produced, the prompt's ids, every token it will answer]
 held_slot = {}       # slot -> the ids its idle conversation holds
-def match(b, ids):   # what a slot's idle conversation covers of a prompt: its whole stream when that starts the prompt
+def match(b, ids):   # what a slot's idle conversation continues of a prompt: its whole stream when that starts the
+    # prompt, else 0 - a shared head alone is another conversation, as the engine reports it
     h = held_slot.get(b, [])
     return len(h) if h and len(h) < len(ids) and ids[:len(h)] == h else 0
 lp_top = {}          # slot (None: solo) -> the request's logprobs=K
 def lp_fields(t, k):
     return f"{t} -0.25" + "".join(f" {t if i == 0 else 32 + i}:{-0.25 - 2 * i}" for i in range(k))
 stopped = set()      # BSTOPped slots: they end "cancel"
+wins = {}            # slot -> its windows so far (--windows: BDONE and DONE say how many windows the run took)
 def window():        # one batch window: every active slot one token
     if fail and len(active) >= 2:     # as the engine: the reason on stdout, then exit code 1
         print("ERR verify batch: layer 34 never rang (graph finished)", flush=True)
@@ -123,12 +125,16 @@ def window():        # one batch window: every active slot one token
             for t2 in got:
                 print(f"BP {b} " + lp_fields(t2, lp_top[b]), flush=True)
         print(f"BT {b} " + " ".join(map(str, got)), flush=True)
+        wins[b] = wins.get(b, 0) + 1
         if t == 257 or produced >= max_new:
             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
             stopped.discard(b)
             counts = f" {b + 3} {10 * (b + 1)}" if "--bdone-drafts" in args else ""   # accepted, offered
             if "--draft-counts" in args:      # as the engine: the slot's own windows (not the admission's token)
                 counts = f" {produced - 1} {2 * (produced - 1)}"
+            if "--windows" in args:
+                counts = (counts or " 0 0") + f" {wins.get(b, 0)}"
+            wins.pop(b, None)
             print(f"BDONE {b} {produced} {fin} 1.0{counts}", flush=True)
             held_slot[b] = active[b][3] + active[b][4][:produced][:-1]
             del active[b]
@@ -144,6 +150,8 @@ while True:
         break
     if line.startswith("BYIELD "):
         continue                              # too late: the read it was for has ended
+    if line == "STATS":
+        continue                              # the console's figures: this stub sends none
     if line.startswith("BSTOP "):
         b = int(line.split()[1])
         if b in active:
@@ -238,7 +246,8 @@ while True:
         mine_ids = [int(x) for x in ids]
         pm = (0.4 if any(mine_ids[:len(h)] == h for h in seen) else 500.0) if pms else 5.0
         seen.append(mine_ids)
-        print(f"DONE {out} {len(ids)} {pm} {out * STEP * 1000:.1f} {fin} {dc} {reused}", flush=True)
+        win = f" 0 0 0 0 0.0 {len(ids) - reused} 0 {-(-out // MULTI)}" if "--windows" in args else ""   # a solo window keeps MULTI
+        print(f"DONE {out} {len(ids)} {pm} {out * STEP * 1000:.1f} {fin} {dc} {reused}{win}", flush=True)
         if slot is not None and bslot is None:         # a solo run in a slot keeps its conversation there
             held_slot[slot] = [int(x) for x in ids] + toks[:out][:-1]
         if s0:
@@ -273,7 +282,6 @@ class PickSlot(unittest.TestCase):
         e.slot_used = [0.0] * n
         e.slot_epoch = [0] * n
         e.slot_owner = {}
-        e.session_slot = {}
         e.slot_thread = [None] * n
         return e
 
@@ -305,7 +313,7 @@ class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
-              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False):
+              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False, windows=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -323,6 +331,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--slot0solo"] if slot0_solo else []
         extra += ["--soloany"] if solo_any else []
         extra += ["--pms"] if pms else []
+        extra += ["--windows"] if windows else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -687,6 +696,60 @@ class ParallelService(unittest.TestCase):
         got = self.slot_drafts()
         self.assertEqual(got, {0: (3, 10), 1: (4, 20)})
 
+    def done_lines(self, texts, gap=0.05):
+        """The server's done line of each request, the texts sent `gap` s apart (all at once when 0 is not wanted)."""
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            threads = [threading.Thread(target=lambda t=t: self.chat(t, max_tokens=200)) for t in texts]
+            for th in threads:
+                th.start()
+                time.sleep(gap)
+            for th in threads:
+                th.join(30)
+            time.sleep(0.2)
+        return [l for l in out.getvalue().splitlines() if " done " in l]
+
+    def test_dl_is_the_engines_windows_alone(self):
+        # a request alone runs solo: DONE's last field is its windows, MULTI tokens each: 55 tokens in 19 windows
+        self.start(2, multi=3, counts=True, windows=True)
+        lines = self.done_lines(["only LONGREPLY"])
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("tg=55", lines[0])
+        self.assertIn(" dl=2.9 ", lines[0])
+        self.assertEqual(self.svc.history[-1]["draft_len"], 2.89)
+
+    def test_dl_is_the_engines_windows_in_the_slots(self):
+        # two requests decoding together: each one's windows are its own, over its solo and slot runs
+        self.start(2, multi=3, counts=True, windows=True)
+        lines = self.done_lines(["first LONGREPLY", "second LONGREPLY"])
+        self.assertEqual(len(lines), 2, lines)
+        for l in lines:
+            self.assertIn("tg=55", l)
+            dl = float(l.split(" dl=")[1].split()[0])
+            self.assertTrue(2.5 <= dl <= 3.5, l)       # 3 tokens a window, the odd ones out at a run's ends
+        self.assertTrue(all(2.5 <= h["draft_len"] <= 3.5 for h in self.svc.history), self.svc.history)
+
+    def test_no_windows_from_the_engine_no_dl(self):
+        self.start(2, multi=3, counts=True)
+        lines = self.done_lines(["first LONGREPLY", "second LONGREPLY"])
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(all(" dl=" not in l and " acc=" in l for l in lines), lines)
+
+    def test_windows_of_a_request_in_several_runs_add_up(self):
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.batch = 2
+        carry = [0, 0, 0]
+        e._parse_done("DONE 1 10 1.0 2.0 length 0 0 0 0 0 0 0 0.0 10 0 1")          # the admission: one window
+        e._carry_drafts(carry, False)
+        e._bdone_last("BDONE 0 30 stop 9.0 20 40 6".split())                         # the slot: six windows
+        e._carry_drafts(carry, True)
+        self.assertEqual(e.last["windows"], 7)
+        self.assertEqual((e.last["drafts_accepted"], e.last["drafts_offered"]), (20, 40))
+        e._bdone_last("BDONE 0 30 stop 9.0 20 40".split())                           # an older engine: no windows
+        self.assertNotIn("windows", e.last)
+
     def timed_chats(self, texts, gap=0.05, max_tokens=200):
         """Each text as a streamed request started `gap` s after the previous; the `timings` of every reply."""
         out = [None] * len(texts)
@@ -765,12 +828,12 @@ class ParallelService(unittest.TestCase):
         u = got[0]
         self.assertLessEqual(u["prompt_tokens_details"]["cached_tokens"], u["prompt_tokens"], u)
 
-    def convo(self, msgs, text):
+    def convo(self, msgs, text, headers=None):
         """One more turn of the conversation `msgs`: its usage; the reply is added to `msgs`."""
         msgs.append({"role": "user", "content": text})
         body = {"model": "basalt", "messages": msgs, "max_tokens": 16, "reasoning_effort": "none"}
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json", **(headers or {})})
         with urllib.request.urlopen(req, timeout=120) as r:
             j = json.loads(r.read().decode())
         msgs.append({"role": "assistant", "content": j["choices"][0]["message"]["content"]})
@@ -880,20 +943,24 @@ class ParallelService(unittest.TestCase):
         self.assertEqual(errors, [])
         return out
 
+    def slots_of(self, session):
+        """The slots the engine has bound to `session`."""
+        return {b for b, o in self.engine.slot_owner.items() if o == session}
+
     def test_the_same_session_lands_in_the_same_slot(self):
-        self.start(3)
-        self.together([lambda: self.chat_session("alpha " * 10, {"x-session-id": "s1"}),
-                       lambda: self.chat_session("beta " * 14, {"x-session-id": "s2"})])
-        first = dict(self.engine.session_slot)
-        self.assertEqual(set(first), {"s1", "s2"})                  # the headers reached the engine
-        self.assertNotEqual(first["s1"], first["s2"])               # two conversations, two slots
-        # the next turn of each session, with a prompt of its own: both land in the slot their K/V sits in, although
-        # the engine has a third, unowned slot free (which is what admission would otherwise prefer)
-        self.together([lambda: self.chat_session("gamma " * 9, {"x-session-id": "s1"}),
-                       lambda: self.chat_session("delta " * 12, {"x-session-id": "s2"})])
-        self.assertEqual(self.engine.session_slot, first)
-        self.assertEqual(sorted(self.engine.slot_owner.items(), key=lambda kv: kv[0]),
-                         sorted(((s, k) for k, s in first.items())))
+        """A session's next turn, continuing its conversation, lands in the slot its K/V sits in, although a third,
+        unowned slot is free (which admission would otherwise prefer)."""
+        self.start(3, reuse=True, slot_cache=True, slot0_solo=True, solo_any=True, ready=200000)
+        a = [{"role": "user", "content": "alpha " * 40}, {"role": "assistant", "content": "ok, done."}]
+        b = [{"role": "user", "content": "beta " * 30}, {"role": "assistant", "content": "ok, done."}]
+        self.convo(a, "first", {"x-session-id": "s1"})
+        self.convo(b, "first", {"x-session-id": "s2"})
+        first = {"s1": self.slots_of("s1"), "s2": self.slots_of("s2")}
+        self.assertEqual([len(v) for v in first.values()], [1, 1])   # the headers reached the engine: one slot each
+        self.assertNotEqual(first["s1"], first["s2"])                # two conversations, two slots
+        self.together([lambda: self.convo(a, "second", {"x-session-id": "s1"}),
+                       lambda: self.convo(b, "second", {"x-session-id": "s2"})])
+        self.assertEqual({"s1": self.slots_of("s1"), "s2": self.slots_of("s2")}, first)   # each kept its own
         self.assertFalse(any(self.engine.slot_busy))
 
     def test_a_per_request_id_is_not_a_session(self):
@@ -901,19 +968,21 @@ class ParallelService(unittest.TestCase):
         self.start(3)
         self.together([lambda: self.chat_session("epsilon " * 10, {"x-client-request-id": "req-1"}),
                        lambda: self.chat_session("zeta " * 11, {"x-client-request-id": "req-2"})])
-        self.assertEqual(self.engine.session_slot, {})
         self.assertEqual(self.engine.slot_owner, {})
 
     def test_the_session_headers_a_load_balancer_sends_all_count(self):
-        self.start(4)
+        self.start(6)
         self.together([(lambda h=h, n=n: self.chat_session("turn " * n, {h: "s-" + h}))
                        for n, h in enumerate(("x-llm-flow-id", "x-claude-code-session-id", "x-session-id",
-                                              "x-session-affinity"))])
-        for h in ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity"):
-            self.assertIn("s-" + h, self.engine.session_slot, h)
+                                              "x-session-affinity", "x-grok-conv-id", "x-grok-session-id"))])
+        owners = set(self.engine.slot_owner.values())
+        for h in ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity",
+                  "x-grok-conv-id", "x-grok-session-id"):
+            self.assertIn("s-" + h, owners, h)
 
     def test_overlapping_requests_of_one_session_spread_over_slots(self):
-        """A session's slot is busy with its first request: the second takes the normal pick and owns the slot after."""
+        """A session's slot is busy with its first request: the second takes a free slot of its own, without giving
+        the first one up (the next turn of each conversation finds its K/V)."""
         self.start(3)
         out = self.together([lambda: self.chat_session("alpha " * 10, {"x-claude-code-session-id": "s1"}),
                              lambda: self.chat_session("beta " * 14, {"x-claude-code-session-id": "s1"})])
@@ -922,12 +991,58 @@ class ParallelService(unittest.TestCase):
             self.assertEqual(r["choices"][0]["message"]["content"], "ok, done.")
         slots = [int(x.split()[1]) for x in self.log.read_text().splitlines() if x.startswith(("BGEN", "SGEN"))]
         self.assertEqual(len(set(slots)), 2, slots)                  # two slots, not one request queued behind the other
-        self.assertEqual(list(self.engine.session_slot), ["s1"])     # one slot owned by the session, the later claim
-        self.assertEqual(self.engine.slot_owner, {self.engine.session_slot["s1"]: "s1"})
+        self.assertEqual(self.slots_of("s1"), set(slots))            # both conversations kept a slot of the session
         self.assertFalse(any(self.engine.slot_busy))                 # nothing is left held
-        # the next turn goes back to the slot it owns
-        self.chat_session("gamma " * 9, {"x-claude-code-session-id": "s1"})
-        self.assertEqual(len(self.engine.session_slot), 1)
+        # another turn of the session does not change what it holds (this one runs solo: no slot is picked)
+        self.chat_session("alpha " * 10 + " more", {"x-claude-code-session-id": "s1"})
+        self.assertEqual(self.slots_of("s1"), set(slots))
+
+    def test_two_agents_of_one_session_keep_their_slots_with_sequential_turns(self):
+        """The two agents' turns do not overlap (an agent's tool call runs between turns): the second agent's first
+        prompt shares only the template head with the first's slot, which must not look like its conversation."""
+        self.start(2, reuse=True, slot_cache=True, slot0_solo=True, solo_any=True, ready=200000)
+        a = [{"role": "user", "content": "agent A " + "a" * 8000}, {"role": "assistant", "content": "ok, done."}]
+        b = [{"role": "user", "content": "agent B " + "b" * 6000}, {"role": "assistant", "content": "ok, done."}]
+        h = {"x-claude-code-session-id": "s1"}
+        sizes = {"a": self.convo(a, "first", h)["prompt_tokens"], "b": self.convo(b, "first", h)["prompt_tokens"]}
+        for turn in range(3):
+            for name, msgs in (("a", a), ("b", b)):
+                u = self.convo(msgs, f"turn {turn} {name}", h)
+                self.assertTrue(self.kept(u, sizes[name]), (name, turn, u, sizes[name]))
+                sizes[name] = u["prompt_tokens"]
+        self.assertEqual(self.slots_of("s1"), {0, 1})
+
+    def test_two_agents_of_one_session_keep_their_own_slots(self):
+        """Two subagents of one session send the same session id (Claude Code's x-claude-code-session-id, OpenCode's
+        X-Session-Id/x-session-affinity, which name the parent), each with its own conversation.  Every turn continues
+        the K/V its own slot holds, rather than the two swapping slots and re-reading."""
+        self.start(2, reuse=True, slot_cache=True, slot0_solo=True, solo_any=True, ready=200000)
+        a = [{"role": "user", "content": "agent A " + "a" * 8000}, {"role": "assistant", "content": "ok, done."}]
+        b = [{"role": "user", "content": "agent B " + "b" * 6000}, {"role": "assistant", "content": "ok, done."}]
+        h = {"x-claude-code-session-id": "s1"}
+        sizes = {"a": self.convo(a, "first", h)["prompt_tokens"],
+                 "b": self.convo(b, "first", h)["prompt_tokens"]}
+        for turn in range(3):
+            out, errors = {}, []
+
+            def go(name, msgs):
+                try:
+                    out[name] = self.convo(msgs, f"turn {turn} {name}", h)
+                except Exception as e:   # noqa: BLE001 - reported below
+                    errors.append((name, e))
+            threads = [threading.Thread(target=go, args=(n, m)) for n, m in (("a", a), ("b", b))]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(120)
+            self.assertEqual(errors, [])
+            self.assertEqual(set(out), {"a", "b"})
+            for name in ("a", "b"):
+                u = out[name]
+                self.assertTrue(self.kept(u, sizes[name]), (name, turn, u, sizes[name]))
+                sizes[name] = u["prompt_tokens"]
+        # both conversations kept a slot of the session's own
+        self.assertEqual({b for b, o in self.engine.slot_owner.items() if o == "s1"}, {0, 1})
 
     def test_timings_of_a_solo_request_carry_its_draft_counts(self):
         self.start(2, counts=True)
@@ -996,14 +1111,27 @@ class SessionAffinity(PickSlot):
 
     def test_a_repeated_session_takes_its_own_slot(self):
         e = self.engine(3)
-        self.hold(e, [[1, 2, 3, 4], [9, 9], [1, 2]])
+        self.hold(e, [[1, 2, 3, 4], [1, 2], [9, 9]])
         e.slot_used = [0.0, 1.0, 2.0]
         # the longest held prefix would be slot 0; the session owns slot 1 and that wins
         self.assertEqual(self.pick(e, [1, 2, 3, 4, 5], session="s1"), 0)
         e.claim_slot(1, "s1")
         self.assertEqual(self.pick(e, [1, 2, 3, 4, 5], session="s1"), 1)
-        self.assertEqual(e.session_slot, {"s1": 1})
         self.assertEqual(e.slot_owner, {1: "s1"})
+
+    def test_a_prompt_the_sessions_slots_hold_none_of_takes_an_unowned_slot(self):
+        """A second conversation of the session (a subagent's) must not overwrite the one its slot holds: with no
+        slot of its own holding the start of the prompt, an unowned one is taken first."""
+        e = self.engine(3)
+        self.hold(e, [[1, 2, 3, 4], [7, 8], []])
+        e.claim_slot(0, "s1")
+        self.assertEqual(self.pick(e, [5, 6, 7], session="s1"), 2)   # no match anywhere: an empty slot
+        e.claim_slot(2, "s1")
+        self.assertEqual(e.slot_owner, {0: "s1", 2: "s1"})
+        e.claim_slot(1, "s2")
+        self.hold(e, [[1, 2, 3, 4], [7, 8], [3, 4]])
+        e.slot_used = [5.0, 0.0, 1.0]
+        self.assertEqual(self.pick(e, [5, 6, 7], session="s1"), 2)   # nothing unowned: its own least recently used
 
     def test_another_sessions_slot_is_taken_only_when_no_unowned_one_is_free(self):
         e = self.engine(3)
@@ -1020,15 +1148,27 @@ class SessionAffinity(PickSlot):
         self.assertEqual(self.pick(e, [7], session="s3"), 1)   # slot 1 is the least recently used of {0, 1}
         e.claim_slot(1, "s3")
         # s2 lost its slot and s3 owns it now; one slot, one owner
-        self.assertNotIn("s2", e.session_slot)
+        self.assertNotIn("s2", set(e.slot_owner.values()))
         self.assertEqual(e.slot_owner, {0: "s1", 1: "s3"})
 
-    def test_claiming_frees_the_sessions_previous_slot(self):
+    def test_a_session_keeps_every_slot_its_conversations_took(self):
+        """A session may run several conversations at once (parallel agents, a retry): each keeps its slot, so the
+        second one does not free the first (whose K/V the next turn of that conversation continues)."""
         e = self.engine(3)
         e.claim_slot(0, "s1")
-        e.claim_slot(2, "s1")            # the same session moved
-        self.assertEqual(e.session_slot, {"s1": 2})
-        self.assertEqual(e.slot_owner, {2: "s1"})   # slot 0 is free of the stale claim
+        e.claim_slot(2, "s1")
+        self.assertEqual(e.slot_owner, {0: "s1", 2: "s1"})
+
+    def test_a_sessions_own_slots_are_picked_by_the_held_prefix(self):
+        e = self.engine(3)
+        self.hold(e, [[1, 2, 3, 4], [1, 2], []])
+        e.claim_slot(0, "s1")
+        e.claim_slot(1, "s1")
+        e.claim_slot(2, "s2")
+        self.assertEqual(self.pick(e, [1, 2, 3, 4, 5], session="s1"), 0)   # the slot holding the longer start
+        self.assertEqual(self.pick(e, [1, 2, 9], session="s1"), 1)
+        e.slot_used = [5.0, 1.0, 0.0]
+        self.assertEqual(self.pick(e, [7, 8], session="s1"), 1)            # no match: its least recently used
 
     def test_no_session_behaves_exactly_as_before(self):
         e = self.engine(3)
@@ -1037,7 +1177,6 @@ class SessionAffinity(PickSlot):
         before = [self.pick(e, p) for p in ([1, 2, 3, 4, 5, 6], [1, 2, 3, 9], [7, 8], [1, 2, 3])]
         e.claim_slot(0, None)            # a claim with no session is a no-op
         self.assertEqual(e.slot_owner, {})
-        self.assertEqual(e.session_slot, {})
         after = [self.pick(e, p, None) for p in ([1, 2, 3, 4, 5, 6], [1, 2, 3, 9], [7, 8], [1, 2, 3])]
         self.assertEqual(before, after)
 

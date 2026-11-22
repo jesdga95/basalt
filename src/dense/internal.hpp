@@ -102,7 +102,7 @@ struct ChunkScratch {
 };
 
 struct SessionState;
-/// A second card that holds the model's last layers and reads them for the main card: the prompt line reads a long prompt's
+/// A second card that holds the model's last layers and reads them for the main card: the prompt split reads a long prompt's
 /// chunks through them while the main card reads the next chunk's first layers (stage.cpp).
 class Stage;
 struct StageDeleter {
@@ -155,9 +155,11 @@ public:
     std::unique_ptr<vision::CudaEncoder> encoder;
     BlockDrafter bd_dec;                         // the block drafter as decode windows run it (its products in Q8 planes)
     std::vector<void*> owned;                    // device buffers the model allocated (Q8 plane copies, a wider workspace)
+    std::vector<std::function<bool(void*)>> drafter_steps;   // bd_dec's forms, made once the weights have landed (attach_drafter)
+    size_t drafter_tmp = 0;                      // the scratch they go through
     void* enc_arena = nullptr;
     size_t enc_bytes = 0;
-    StagePtr line;                               // the prompt line: a second card reading long prompts' last layers (null: none)
+    StagePtr prompt_split;                       // the prompt split: a second card reading long prompts' last layers (null: none)
     StagePtr split;                              // the layer split's second card: layers [le, n) (null: none)
     SplitHand* hand = nullptr;                   // the layer split's decode hand-off, on both cards' models (null: none)
     Model* split_model = nullptr;                // the split's second card's model, and its CUDA device
@@ -235,7 +237,7 @@ void free_state(SessionState& st);
 /// The layer split's second card's state of the session `st` of model `m` (st.peer).
 bool split_session(Model& m, SessionState& st, std::string& err);
 /// Tokens [pos, pos + n) of the session `st` across the layer split's cards, the chunks pipelined (the second card reads a
-/// chunk's later layers while the main card reads the next one's first layers); `progress` and `stop` as prompt_line_read's.
+/// chunk's later layers while the main card reads the next one's first layers); `progress` and `stop` as prompt_split_read's.
 /// A session with an MTP drafter reads its prompt chunk by chunk (split_chunk): that drafter reads every chunk's last rows.
 bool split_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_t pos, const std::function<void(int)>& progress,
                 const std::function<bool()>& stop, std::string& err);
@@ -274,14 +276,14 @@ bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& e
 /// The block drafter's context cells at positions pos .. pos + n - 1 from n rows of features `dacc` (device).
 void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64_t pos);
 
-/// The line on CUDA device `dev` with layers [l_min, n_layers) of `w` (their weights already on `dev`, the other layers
-/// empty); both cards' prompt rates are timed here.
-StagePtr make_prompt_line(Model& main, int dev, int l_min, const Weights& w, std::string& err);
+/// The stage on CUDA device `dev` with layers [l_min, n_layers) of `w` (their weights on `dev`, the other layers empty):
+/// its memory, before the weights land (attach_prompt_split times both cards' rates once they have).
+StagePtr make_prompt_split(Model& main, int dev, int l_min, const Weights& w, std::string& err);
 /// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards when the rates price that cheaper,
 /// true; false with empty `err` when it does not (the caller reads them on the main card).
 /// `stop` is asked between chunks on both cards: true ends the read where it is (the session then holds a part of the prompt
 /// only, as after a stopped read on the main card), true returned.
-bool prompt_line_read(Stage& line, Model& main, SessionState& st, const int32_t* tokens, int n, int64_t pos,
+bool prompt_split_read(Stage& stage, Model& main, SessionState& st, const int32_t* tokens, int n, int64_t pos,
                       const std::function<void(int)>& progress, const std::function<bool()>& stop, std::string& err);
 
 /// The commit of the last window's first n rows into the recurrent state.

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 int main() {
@@ -47,12 +48,25 @@ int main() {
 #else
     expect("qwen35", false);
 #endif
+#ifdef BASALT_MODEL_HY4FLASH
+    expect("hy4flash", true);
+    // and under the architecture its test pack (made from the AngelSlim GGUF) carries
+    check(model::find_adapter("hy_v4_flash") != nullptr, "hy4flash also answers to hy_v4_flash");
+    ++built;
+#else
+    expect("hy4flash", false);
+#endif
+#ifdef BASALT_MODEL_INKLING2
+    expect("inkling2", true);
+#else
+    expect("inkling2", false);
+#endif
     check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
-        std::unique_ptr<model::LoadedModel> loaded;
-        check(ds->load({}, loaded).status == model::Status::Error, "deepseek41 load without a path is an error");
+        model::Started started;
+        check(ds->start({}, started).status == model::Status::Error, "deepseek41 start without a path is an error");
         const auto o = ds->make_options();
-        check(!ds->finish_flags(*o) && o->lossy.empty(), "deepseek41 has no lossy flag");
+        check(!ds->finish_flags(*o) && o->lossy.empty(), "deepseek41 with no flag is not lossy");
     }
     // the flags as the command line gives them, through the model's own parser and finish_flags
     const auto lossy_of = [](const model::ModelAdapter& a, std::vector<std::string> words) {
@@ -78,6 +92,31 @@ int main() {
         check(all.size() == 3 && all[0].flag == "--relaxed-drafting" && all[1].effect == "--route-prior 1.5 changes expert routing" &&
                   all[2].effect == "--route-tail-skip 9 drops low-ranked missed experts",
               "qwen4exp: every lossy flag, bare ones at their defaults, in the warning order");
+    }
+    // the routing flags of every mixture-of-experts model: the bare prior is the model's own; the tail skip needs the pack's
+    // experts per token, so without a pack it is refused
+    for (const auto& [arch, bare] : {std::pair<const char*, const char*>{"deepseek41", "0.1"}, {"hy4flash", "0.01"}}) {
+        const model::ModelAdapter* m = model::find_adapter(arch);
+        if (m == nullptr) continue;
+        const auto p = lossy_of(*m, {"--route-prior"});
+        check(p.size() == 1 && p[0].effect == std::string("--route-prior ") + bare + " changes expert routing", "the bare --route-prior is the model's");
+        const auto o = m->make_options();
+        std::vector<std::string> words = {"basalt", "--route-tail-skip", "3"};
+        std::vector<char*> argv;
+        for (auto& w : words) argv.push_back(w.data());
+        int i = 1, code = 0;
+        model::FlagArgs args((int) argv.size(), argv.data(), i);
+        check(m->parse_flag(argv[1], args, *o, code) && code == 0 && o->route.tail_skip == 3, "--route-tail-skip 3 is taken");
+        check(m->finish_flags(*o).value_or(0) == 2, "--route-tail-skip without the pack's experts per token is refused");
+    }
+    if (const model::ModelAdapter* d = model::find_adapter("qwen35")) {
+        const auto o = d->make_options();
+        std::vector<std::string> words = {"basalt", "--route-prior"};
+        std::vector<char*> argv;
+        for (auto& w : words) argv.push_back(w.data());
+        int i = 1, code = 0;
+        model::FlagArgs args((int) argv.size(), argv.data(), i);
+        check(!d->parse_flag(argv[1], args, *o, code), "a dense model does not take the routing flags");
     }
     return failures ? 1 : 0;
 }

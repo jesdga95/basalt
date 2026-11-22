@@ -163,22 +163,23 @@ bool decode_drafter(Model& m, std::string& err) {
     m.bd_dec = m.w.dflash;
     BlockDrafter& bd = m.bd_dec;
     if (!bd.present || m.o.drafter != Drafter::Block) return true;
-    void* tmp = nullptr;
-    size_t tmp_bytes = 0;
+    // the memory and the new forms now (later sizing sees them); the kernels that make them once the weights have landed
+    // (attach_drafter), in this order, through one scratch buffer of the largest matrix
+    std::vector<std::function<bool(void*)>>& steps = m.drafter_steps;
+    size_t& tmp_bytes = m.drafter_tmp;
     auto q8 = [](const Linear& l) { return l.type == 8 && l.cols % 256 == 0 && l.rows > 0; };
     auto bytes = [](const Linear& l) { return (size_t) l.rows * (size_t) l.cols / 32 * 34; };
     auto in_place = [&](Linear& l) -> bool {
         if (!q8(l)) return true;
         const size_t n = bytes(l);
-        if (n > tmp_bytes) {
-            if (tmp) cudaFree(tmp);
-            tmp = nullptr;
-            if (cudaMalloc(&tmp, n) != cudaSuccess) return false;
-            tmp_bytes = n;
-        }
-        if (cudaMemcpy(tmp, l.w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
-        kernels::wgemm::q8_planes(tmp, l.rows, l.cols, const_cast<void*>(l.w), nullptr);
-        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+        tmp_bytes = std::max(tmp_bytes, n);
+        void* w = const_cast<void*>(l.w);
+        const int rows = l.rows, cols = l.cols;
+        steps.push_back([=](void* tmp) {
+            if (cudaMemcpy(tmp, w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
+            kernels::wgemm::q8_planes(tmp, rows, cols, w, nullptr);
+            return cudaDeviceSynchronize() == cudaSuccess;
+        });
         l.type = kTypeQ8P;
         return true;
     };
@@ -187,7 +188,12 @@ bool decode_drafter(Model& m, std::string& err) {
         void* p = nullptr;
         if (cudaMalloc(&p, bytes(l)) != cudaSuccess) return false;
         m.owned.push_back(p);
-        kernels::wgemm::q8_planes(l.w, l.rows, l.cols, p, nullptr);
+        const void* w = l.w;
+        const int rows = l.rows, cols = l.cols;
+        steps.push_back([=](void*) {
+            kernels::wgemm::q8_planes(w, rows, cols, p, nullptr);
+            return true;
+        });
         l.w = p;
         l.type = kTypeQ8P;
         return true;
@@ -197,17 +203,17 @@ bool decode_drafter(Model& m, std::string& err) {
     auto to_fp4 = [&](Linear& l) -> bool {
         if (!q8(l) || !kernels::nvfp4p::fits(l.rows, l.cols)) return in_place(l);
         const size_t n = bytes(l);
-        if (n > tmp_bytes) {
-            if (tmp) cudaFree(tmp);
-            tmp = nullptr;
-            if (cudaMalloc(&tmp, n) != cudaSuccess) return false;
-            tmp_bytes = n;
-        }
+        tmp_bytes = std::max(tmp_bytes, n);
         void* sc = nullptr;
-        if (cudaMemcpy(tmp, l.w, n, cudaMemcpyDeviceToDevice) != cudaSuccess || cudaMalloc(&sc, 16) != cudaSuccess) return false;
+        if (cudaMalloc(&sc, 16) != cudaSuccess) return false;
         m.owned.push_back(sc);
-        kernels::nvfp4p::from_q8(tmp, l.rows, l.cols, const_cast<void*>(l.w), (float*) sc, nullptr);
-        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+        void* w = const_cast<void*>(l.w);
+        const int rows = l.rows, cols = l.cols;
+        steps.push_back([=](void* tmp) {
+            if (cudaMemcpy(tmp, w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
+            kernels::nvfp4p::from_q8(tmp, rows, cols, w, (float*) sc, nullptr);
+            return cudaDeviceSynchronize() == cudaSuccess;
+        });
         l.scale = (const float*) sc;
         l.type = kTypeNvfp4Planes;
         return true;
@@ -228,7 +234,12 @@ bool decode_drafter(Model& m, std::string& err) {
                 }
                 m.owned.push_back(p);
                 m.owned.push_back(sc);
-                kernels::nvfp4p::from_q8(l->w, l->rows, l->cols, p, (float*) sc, nullptr);
+                const void* w = l->w;
+                const int rows = l->rows, cols = l->cols;
+                steps.push_back([=](void*) {
+                    kernels::nvfp4p::from_q8(w, rows, cols, p, (float*) sc, nullptr);
+                    return true;
+                });
                 l->w = p;
                 l->scale = (const float*) sc;
                 l->type = kTypeNvfp4Planes;
@@ -238,8 +249,7 @@ bool decode_drafter(Model& m, std::string& err) {
         }
     }
     for (Linear& l : bd.fc) ok = ok && copy(l);
-    if (tmp) cudaFree(tmp);
-    if (!ok || cudaDeviceSynchronize() != cudaSuccess) {
+    if (!ok) {
         err = m.o.arch + ": laying out the block drafter for decode windows failed";
         return false;
     }
@@ -287,6 +297,20 @@ bool decode_drafter(Model& m, std::string& err) {
 }
 
 }  // namespace
+
+bool attach_drafter(Model& m, std::string& err) {
+    if (m.drafter_steps.empty()) return true;
+    void* tmp = nullptr;
+    bool ok = m.drafter_tmp == 0 || cudaMalloc(&tmp, m.drafter_tmp) == cudaSuccess;
+    for (const auto& step : m.drafter_steps) ok = ok && step(tmp);
+    if (tmp) cudaFree(tmp);
+    m.drafter_steps.clear();
+    if (!ok || cudaDeviceSynchronize() != cudaSuccess) {
+        err = m.o.arch + ": laying out the block drafter for decode windows failed";
+        return false;
+    }
+    return true;
+}
 
 namespace {
 // a cell of one attention layer, K and V: fp16, or int8 codes with their fp16 scales

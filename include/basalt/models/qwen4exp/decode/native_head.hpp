@@ -6,6 +6,7 @@
 #include <vector>
 
 namespace basalt::core {
+class LoadPlan;
 
 /// Opt-in native output projection. Uploads unchanged GGUF blocks once at startup and owns its
 /// activation scratch. The normal canonical head remains available for numerical A/B comparisons.
@@ -19,7 +20,11 @@ public:
     NativeHead(const NativeHead&) = delete;
     NativeHead& operator=(const NativeHead&) = delete;
 
-    bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err);
+    /// Allocates the head and queues its rows' read in `reads` (the caller's pass places them).
+    bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, LoadPlan& reads, std::string& err);
+    /// Once the rows have landed: the forms some kernels read are made from them (a Q8_0 head's bit planes, a Q6_K
+    /// head's 2-bit copy).
+    bool finish(std::string& err);
     /// The bytes `load` uploads for `output.weight`, from the GGUF headers only.
     static bool plan_bytes(const std::vector<std::string>& shards, uint64_t& out, std::string& err);
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
@@ -57,7 +62,8 @@ public:
     ~NativeEmbed();
     NativeEmbed(const NativeEmbed&) = delete;
     NativeEmbed& operator=(const NativeEmbed&) = delete;
-    bool load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err);
+    /// The table in pinned host memory (or VRAM) and its hot rows' copy, read in the caller's pass (`reads`).
+    bool load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, LoadPlan& reads, std::string& err);
     /// Rows for device token ids.
     void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
     /// One row for a host token id.

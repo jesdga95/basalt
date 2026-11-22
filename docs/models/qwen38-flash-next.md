@@ -26,6 +26,7 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
   is held: the PLE rows at the largest chunk, a layer split's hand-offs, and the prompt split's weights, hand-offs and staging.
   Each buffer takes its held RAM when it is made; what none takes goes back before the top-up. The copy then leaves
   `--ram-reserve-mib` free beside the driver's page tracking (`RAM floor X GiB of N GiB free` when experts stay on the SSD).
+  The start's pass fills the main card first; the copy takes its RAM as the pass reads into it and is page-locked once read.
 - **Cards:** every card after the main one is an expert tier, up to three. Matched cards may split the layers instead
   ([GPUs](../configuration/gpus.md)).
 - **Elastic KV:** with `--max-context` above 32,768 (and not with `--kv-resident`, `--vram-elastic` or a layer split), each session
@@ -62,7 +63,8 @@ machine; frames decode on the GPU with NVDEC ([video](../running.md#video)).
 ## Lossy flags
 
 Off by default. `--relaxed-drafting`, `--route-prior` and `--route-tail-skip` each change output, and each is named in one start
-warning. What they do and what they cost: [precision](../precision/qwen38-flash-next.md#relaxed-drafting).
+warning. What they do and what they cost: [precision](../precision/qwen38-flash-next.md#relaxed-drafting); the two routing flags
+work the same on every MoE model ([quality](../precision/quality.md#lossy-routing-flags)).
 
 ## Limits
 

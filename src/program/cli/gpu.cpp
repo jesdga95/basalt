@@ -1,6 +1,7 @@
 #include "gpu.hpp"
 
 #include "basalt/log.hpp"
+#include "basalt/platform/system.hpp"
 #include "basalt/program/options.hpp"
 
 #include <algorithm>
@@ -9,7 +10,7 @@
 
 namespace basalt::program::cli {
 
-std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers, bool prompt_line,
+std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers, bool prompt_split,
                                const std::function<bool(double, double)>& layer_stage) {
     namespace bp = basalt::program;
     bp::GpuSpec spec;
@@ -31,7 +32,7 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
         std::string lossy;
         for (const auto& f : o.lossy) lossy += (lossy.empty() ? "" : ",") + f.flag;
         std::printf("%s\n", bp::gpu_plan_json(visible, choice, o.arch, o.quality_flags, o.quality_window, o.plan_spec, o.max_context,
-                                             o.model_name, lossy).c_str());
+                                             o.model_name, lossy, o.community_kv).c_str());
         return choice.error.empty() ? 0 : 2;
     }
     if (!choice.error.empty()) { basalt::log::error("basalt", "%s", choice.error.c_str()); return 2; }
@@ -47,24 +48,30 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     bp::RoleInputs ri;
     for (int i : choice.cards) ri.cards.push_back((size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{});
     ri.max_expert_tiers = max_expert_tiers;   // the device-planned tail's peer windows
-    ri.prompt_line = prompt_line;
-    ri.layer_stage = prompt_line && ri.cards.size() > 1 && layer_stage && layer_stage(ri.cards[0].mem_gbps, ri.cards[1].mem_gbps);
+    ri.prompt_split = prompt_split;
+    ri.layer_stage = prompt_split && ri.cards.size() > 1 && layer_stage && layer_stage(ri.cards[0].mem_gbps, ri.cards[1].mem_gbps);
     const std::vector<bp::GpuRole> roles = bp::choose_roles(ri);
     std::string line;
     for (size_t d = 0; d < roles.size(); ++d) {
         const bp::GpuCard& c = ri.cards[d];
         line += std::string(d ? ", " : "") + (c.name.empty() ? "GPU" : c.name) +
                 (c.smi >= 0 ? " (nvidia-smi " + std::to_string(c.smi) + ")" : "") + " " + bp::gpu_role_name(roles[d]);
-        if (roles[d] == bp::GpuRole::ExpertTier || roles[d] == bp::GpuRole::PromptLine || roles[d] == bp::GpuRole::LayerStage) {
+        if (roles[d] == bp::GpuRole::ExpertTier || roles[d] == bp::GpuRole::PromptSplit || roles[d] == bp::GpuRole::LayerStage) {
             o.peer_devices.push_back((int) d);
             o.peer_gbps.push_back(c.mem_gbps);
         }
     }
+    int drv = 0, rt = 0;
+    (void) cudaDriverGetVersion(&drv);
+    (void) cudaRuntimeGetVersion(&rt);
+    basalt::log::info("basalt", "system: %s, CUDA driver %d.%d / runtime %d.%d",
+                      basalt::platform::host_os_name().c_str(),
+                      drv / 1000, (drv % 1000) / 10, rt / 1000, (rt % 1000) / 10);
     basalt::log::info("basalt", "gpus: %s", line.c_str());
     if (std::count(roles.begin(), roles.end(), bp::GpuRole::Idle) > 0)
         basalt::log::warn("basalt", "%s",
                           (ri.layer_stage ? std::string("one card runs the later layers beside the main card; later cards idle")
-                           : prompt_line  ? std::string("one card reads prompts beside the main card; later cards idle")
+                           : prompt_split  ? std::string("one card reads prompts beside the main card; later cards idle")
                                        : "expert tiers max " + std::to_string(ri.max_expert_tiers) + "; later cards idle").c_str());
     if (!o.peer_devices.empty()) o.peer_device = o.peer_devices[0];
     if (!ri.cards.empty()) o.main_gbps = ri.cards[0].mem_gbps;

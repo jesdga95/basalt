@@ -75,13 +75,13 @@ void round_trip(const model::ModelAdapter& a, const std::string& pack, bool draf
     req.max_context = 4096;
     req.draft = draft;
     req.spec = draft ? 16 : 0;
-    std::unique_ptr<model::LoadedModel> loaded;
-    if (const model::Result e = a.load(req, loaded); !e.ok()) {
-        std::fprintf(stderr, "load: %s\n", e.message.c_str());
+    model::Started started;
+    if (const model::Result e = a.start(req, started); !e.ok()) {
+        std::fprintf(stderr, "start: %s\n", e.message.c_str());
         std::exit(1);
     }
-    std::unique_ptr<model::ModelSession> s;
-    if (const model::Result e = loaded->make_session(s); !e.ok() || !s->prepare().ok()) {
+    std::unique_ptr<model::ModelSession>& s = started.sessions.front();
+    if (const model::Result e = s->prepare(); !e.ok()) {
         std::fprintf(stderr, "session: %s\n", e.message.c_str());
         std::exit(1);
     }

@@ -27,6 +27,7 @@
 #include <functional>
 #include <cstddef>
 #include <condition_variable>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -42,6 +43,7 @@ struct ExpertLayout;
 namespace basalt::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
+class LoadPlan;
 
 namespace detail {
 
@@ -172,21 +174,13 @@ public:
     virtual bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
         (void) pairs; (void) n; return false;
     }
-
-    /// Reader threads `read_blobs` runs; a sink is told which one it is called on.
-    static constexpr int kBlobReaders = 6;
-    /// Receives pair `index`'s blob from reader `worker`; the bytes are valid only during the call.
-    using BlobSink = std::function<bool(int64_t index, int worker, const uint8_t* blob, std::string& err)>;
-    /// Hands every pair's blob to `sink`, from up to `kBlobReaders` threads.  The default reads one blob after another
-    /// through `blob()`, asking the OS for the following ones ahead.
-    virtual bool read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink, std::string& err);
 };
 
-/// Copies the pairs' blobs into the cache's slots (`slots[i]` for `pairs[i]`) on `device`, reading through
-/// `src.read_blobs` and overlapping the reads with the host-to-device copies.  `on_bytes` is told each blob's size as
-/// it lands (from several threads).  The copies are complete when this returns.
-bool fill_cache_slots(ExpertSource& src, ExpertCache& cache, int device, const std::pair<int32_t, int32_t>* pairs,
-                      const int32_t* slots, int64_t n, const std::function<void(uint64_t)>& on_bytes, std::string& err);
+/// Queues in `reads` the copies of the pairs' blobs into the cache's slots (`slots[i]` for `pairs[i]`) on `device`: a
+/// blob the source holds in the file is read with the pass, one held in RAM is copied from there after the pass's reads.
+/// The cache counts the slots as filled.
+bool plan_cache_slots(LoadPlan& reads, ExpertSource& src, ExpertCache& cache, int device, const std::pair<int32_t, int32_t>* pairs,
+                      const int32_t* slots, int64_t n, std::string& err);
 
 /// What the GPU computes in a verify window's layer, written by the pool (mapped host memory) right after the ring
 /// and published before the CPU starts its own share.  Groups of entries that share a blob; the blob is a VRAM slot or
@@ -269,6 +263,19 @@ public:
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+    /// pin_cache_complement in two steps, for a start's one pass: the copy is allocated and laid out and its reads are
+    /// queued in `reads` (complement_ready() is true, blob() points at where each expert lands); a step of `reads` pins
+    /// it once they have landed, before the pass copies from it, and finish_complement() reports it (`unbuffered`: the
+    /// pass read around the file cache).
+    bool plan_cache_complement(
+        LoadPlan& reads, const ExpertCache& cache, std::string& err, bool pin = true,
+        const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
+        uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
+        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+    bool finish_complement(bool unbuffered, std::string& err);
+    /// The bytes of a planned copy its step registers with the driver once its reads have landed (0 when there is none
+    /// or it is registered): a tier sized before then leaves their mapping free (pin_mapping_bytes).
+    uint64_t pin_pending() const;
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -381,11 +388,6 @@ public:
     uint64_t places_generation() const override { return places_gen_; }
     bool pcie_layer(int64_t layer) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
-    /// Overlaps block-aligned unbuffered reads through small pinned stages.  A blob whose read comes back short or
-    /// failed, and a file system without unbuffered reads, take the mapped copy instead, whose pages are given back
-    /// once the sink has them so a full fill does not leave the pack resident.  A sink that fails stops the read.
-    bool read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink, std::string& err) override;
-
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
     /// interesting once Phase 3 makes it not so.
     int64_t reads() const override { return reads_; }
@@ -445,6 +447,26 @@ private:
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
+    /// What finish_complement needs of plan_cache_complement's choices once the reads have landed.
+    struct PendingComplement {
+        double reg_s = 0;
+        bool pinned_ok = false;
+        std::string note;
+        bool pin = false;
+        std::chrono::steady_clock::time_point pin_t0{};
+        double alloc_s = 0;
+        uint64_t read_bytes = 0;
+        bool lend = false;
+        int64_t n_slots = 0, lend_from_slot = -1;
+        size_t additional_gpu = 0;
+        bool pin_after_reads = false;   ///< pinned or locked once the reads have landed
+        bool register_arena = false;    ///< by a registration with the driver (else a working-set lock)
+        std::vector<uint64_t> bounds;   ///< where a refused registration may be cut
+    } pending_complement_;
+    /// Pins the landed copy: registered (mapped) where the driver takes it, the rest locked in the working set.
+    void pin_landed_complement();
+    /// Frees a copy whose reads failed.
+    void release_complement();
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;

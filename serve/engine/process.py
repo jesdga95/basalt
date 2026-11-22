@@ -3,7 +3,7 @@
 Protocol (one line each):
   * start: stdout `INFO k=v ...` lines, then `READY <ctx> [stop]` (stop: STOP is honoured mid-request).
   * solo: `GEN <max_new> [k=v ...] <ids>` (GENI with embeddings) -> `T <id>`, `PP <read> <total> ...`,
-    `RESUME <n>`, then `DONE ...`; `STOP` ends it early. With `logprobs=K` each `T` line follows its
+    `RESUME <n>`, then `DONE ...` (its last field: the run's decode windows); `STOP` ends it early. With `logprobs=K` each `T` line follows its
     `P <id> <lp> [<id>:<lp> ...]` line (the pick's log probability and the K likeliest tokens). `ERR ...` is a failure; a prompt that does not fit the
     context is `ERR <context_overflow|context_no_room> prompt=N [max_new=N] context=N [slot=N]: <message>`.
   * any time after READY: `CONV parked=N bytes=N evictions=N [restored=N restored_ms=X]`, the conversation cache's
@@ -14,11 +14,12 @@ Protocol (one line each):
     The slot and batch forms are SGENT and BGENT; the server uses only GENT.
   * held prompts (--batch): `PROMPT <nbytes> [plain=a:b,...]` + text (the engine tokenizes) or `PROMPTI [img] <ids>` ->
     `PROMPT <handle> <n>` at once, even while a request runs (or `PROMPT ERR <why>`). `PMATCH <handle>` -> `PMATCH
-    <handle> <match>:<held> ...`, one pair per slot: the tokens of the prompt the slot's idle conversation covers (the
-    engine's own matching: an exact prefix, or the model's own pieces for the same bytes) and the tokens it holds.
+    <handle> <match>:<held> ...`, one pair per slot: the tokens of the prompt the slot's idle conversation continues
+    (its reply the client sent back, cut into other pieces, still counts; another conversation sharing a head does not)
+    and the tokens it holds.
     `BGEN`/`SGEN` then name the prompt where the ids go: `#<handle>[+<id>,...]` (the ids a request that ran in several
     engine runs adds after it); `PFREE <handle>` drops it.
-  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> ...`; with
+  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> <n> <finish> <ms> [<drafts accepted> <drafts offered> [<windows>]]`; with
     `logprobs=K`, one `BP <slot> <id> <lp> [...]` line per kept pick ahead of its `BT` line;
     `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`).
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
@@ -48,10 +49,12 @@ from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, engine_key as logprobs_key, parse_line as logprob_line, \
     token as logprob_token
 from serve.engine import lifeline, suspend
+from serve.engine.console import LINES as CONSOLE_LINES, ConsoleLines
 from serve.engine.flags import flag_value
-from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, split_err
+from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, WakeBlocked, split_err
 from serve.engine.slots import AdmissionQueue
 from serve.prompt import PromptText
+from serve.util import vram
 from serve.util.console import tagged
 from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
 
@@ -120,7 +123,7 @@ def relay_auto_flags(line: str) -> bool:
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
 PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
-                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ")
+                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ") + CONSOLE_LINES
 
 
 def log_unparsed(line: str, log) -> None:
@@ -206,8 +209,9 @@ class ProcessEngine:
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
-    # Windows of the request in progress on this thread: (windows, tokens in them), counted from the batch slot's
-    # `BT` lines.
+    # The batch windows of the engine run in progress on this thread: (windows, tokens in them), counted from its
+    # `BT` lines. Only the live figure of the status page; a finished request's windows are the engine's own (`windows`
+    # on DONE and BDONE), which also cover its solo runs and every pass.
     def window_stats(self) -> tuple[int, int]:
         tl = self.__dict__.setdefault("_wtl", threading.local())
         return getattr(tl, "windows", 0), getattr(tl, "tokens", 0)
@@ -233,6 +237,35 @@ class ProcessEngine:
         if self.batch:
             self.__dict__.setdefault("_tl", threading.local()).read_ms = value
 
+    # The prompt read of the request in progress on this thread (`progress` is the last line of any request):
+    # {"read", "total", "ms"} from its PP/PL lines and "cache" from its RESUME line.
+    def prompt_progress(self) -> dict:
+        return dict(getattr(self.__dict__.setdefault("_ptl", threading.local()), "state", None) or {})
+
+    def _note_read(self, f: list[str]) -> None:
+        """A `PP`/`PL <position> <total> <ms> <tok/s>` line: this thread's read, as well as `progress`."""
+        self.progress = (int(f[1]), int(f[2]))
+        tl = self.__dict__.setdefault("_ptl", threading.local())
+        state = dict(getattr(tl, "state", None) or {})
+        state.update(read=int(f[1]), total=int(f[2]))
+        try:
+            state["ms"] = float(f[3])
+        except (IndexError, ValueError):
+            pass
+        tl.state = state
+
+    def _note_resume(self, line: str) -> None:
+        """A `RESUME <n>` line: the prompt tokens this request does not read again."""
+        try:
+            n = int(line.split()[1])
+        except (IndexError, ValueError):
+            return
+        tl = self.__dict__.setdefault("_ptl", threading.local())
+        tl.state = {**(getattr(tl, "state", None) or {}), "cache": n}
+
+    def _reset_read(self) -> None:
+        self.__dict__.setdefault("_ptl", threading.local()).state = None
+
     def __init__(self, engine_bin: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
         self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again
@@ -248,6 +281,7 @@ class ProcessEngine:
         if "loading" not in self.__dict__:               # restart() holds these across its __init__ calls
             self.loading, self.load_status = False, {}
         self.asleep = False              # its GPU state suspended by the driver (sleep/wake)
+        self.parked = None               # the VRAM that state held on each card ({gpu: MiB}) from NVML at the sleep; None: unknown
         self.restore_s = 0.0             # the driver's part of the last wake
         self.max_context = int(flag_value(args, "--max-context") or 0)   # the engine's own at READY
         self.can_stop = False            # READY <ctx> stop
@@ -267,6 +301,8 @@ class ProcessEngine:
         if lazy:
             return
         self.unloaded = False            # `ended` stays True until READY
+        if log:
+            self._rotate_log(log)
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: stops the narrator
         log_start = os.path.getsize(log) if log else 0  # where this start's log lines begin
@@ -322,6 +358,10 @@ class ProcessEngine:
         loading.set()
         if log:
             narrator.join(2)                            # its lines precede what follows READY
+            try:
+                self.log_ready_pos = os.path.getsize(log)
+            except OSError:
+                self.log_ready_pos = 0
         if self.max_context <= 0:
             if timed_out:                               # still loading, or hung: end it so the turn is not held
                 try:
@@ -364,10 +404,11 @@ class ProcessEngine:
         self.slot_held: list[int] = [0] * self.batch
         self.slot_used = [0.0] * self.batch
         self.slot_epoch = [0] * self.batch
-        # session identity (a load-balancer header) -> its slot: a conversation stays in one slot, so its next
-        # turn continues the K/V that is already there instead of being admitted wherever and copied in
+        # session identity (a load-balancer header) -> the slots its conversations run in, one owner per slot: a
+        # conversation stays in the slot where its K/V sits, so its next turn continues it instead of being admitted
+        # wherever and copied in.  A session may hold several slots: parallel agents of one session (a subagent
+        # sends its parent's header), a retry while the first request runs.
         self.slot_owner: dict[int, str] = {}
-        self.session_slot: dict[str, int] = {}
         # the request thread that last took each slot: the slot table shows a running request on its own slot
         self.slot_thread: list[int | None] = [None] * self.batch
         # admission state outlives engine processes: restart() re-runs this while requests wait on it
@@ -382,8 +423,15 @@ class ProcessEngine:
         self._yielded = None                            # (slot, tokens read) of a read that gave way
         self._ctl_erred = False                         # the control lines ended on an ERR
         self.wlock = threading.Lock()                   # serializes stdin writes
+        self.console = ConsoleLines()                   # this process's XSLOT and XMAP figures
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+        with self.wlock:                                # the console's figures from now on
+            try:
+                self.proc.stdin.write("STATS\n")
+                self.proc.stdin.flush()
+            except OSError:
+                pass
 
     def _note_load(self, status: dict) -> None:
         self.load_status = status
@@ -419,6 +467,10 @@ class ProcessEngine:
                 if self.proc is proc:
                     self.info.update(info_facts(line))
                 continue
+            if line.startswith(CONSOLE_LINES):          # the console's figures (STATS); never a reply line
+                if self.proc is proc:
+                    self.console.feed(line)
+                continue
             if line.startswith("CONV "):                # the conversation cache's figures; never a reply line
                 if self.proc is proc:
                     self.conversation = {**self.conversation, **conversation_facts(line)}
@@ -451,6 +503,47 @@ class ProcessEngine:
         for q in slot_q:
             q.put(None)
 
+    _NT_CRASH_CODES = {
+        0x40000015: "STATUS_FATAL_APP_EXIT",
+        0xC0000005: "STATUS_ACCESS_VIOLATION",
+        0xC0000006: "STATUS_IN_PAGE_ERROR",
+        0xC000001D: "STATUS_ILLEGAL_INSTRUCTION",
+        0xC0000094: "STATUS_INTEGER_DIVIDE_BY_ZERO",
+        0xC00000FD: "STATUS_STACK_OVERFLOW",
+        0xC0000135: "STATUS_DLL_NOT_FOUND",
+        0xC000013A: "STATUS_CONTROL_C_EXIT",
+        0xC0000374: "STATUS_HEAP_CORRUPTION",
+        0xC0000409: "STATUS_STACK_BUFFER_OVERRUN",
+        0xE06D7363: "C++ exception",
+    }
+
+    @staticmethod
+    def _rotate_log(path: str, max_bytes: int = 10 << 20) -> None:
+        try:
+            if os.path.getsize(path) >= max_bytes:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+
+    @classmethod
+    def _format_exit_status(cls, rc: int | None) -> str:
+        """Human-readable exit status, decoding POSIX signals and Windows NTSTATUS crash codes."""
+        if rc is None:
+            return "the engine ended (no exit status)"
+        if rc < 0:
+            try:
+                return f"the engine was killed by {signal.Signals(-rc).name}"
+            except ValueError:
+                return f"the engine was killed by signal {-rc}"
+        if rc in cls._NT_CRASH_CODES:
+            return f"the engine crashed (0x{rc:08X} {cls._NT_CRASH_CODES[rc]})"
+        if rc >= 0x80000000:
+            return f"the engine crashed (0x{rc:08X})"
+        return f"the engine exited (code {rc})"
+
+    def _died(self) -> EngineDied:
+        return EngineDied(self.death_note())
+
     def death_note(self) -> str:
         """What is known of why the engine ended: its exit code or signal and its last error line, never a guess."""
         if getattr(self, "silent_note", None):          # the server ended it
@@ -468,21 +561,21 @@ class ProcessEngine:
                 return "the engine's watchdog stopped it: " + line.strip()
         proc = self.proc                                 # None between restart's close and start
         rc = proc.poll() if proc is not None else None
-        if rc is None:
-            status = "the engine ended (no exit status)"
-        elif rc < 0:
-            try:
-                status = f"the engine was killed by {signal.Signals(-rc).name}"
-            except ValueError:
-                status = f"the engine was killed by signal {-rc}"
-        else:
-            status = f"the engine exited (code {rc})"
+        status = self._format_exit_status(rc)
         if rc is not None and rc >= 0 and self.last_err:  # its last stdout words
             return f"{status} after it reported: {self.last_err}"
-        lines = [x.strip() for x in tail.splitlines()]
-        err = next((x for x in reversed(lines) if ": error: " in x or x.startswith("ERR")), "")
-        if err:
-            return f"{status}, last error in its log: {err}"
+        raw_lines = tail.splitlines()
+        err_idx = next((i for i in range(len(raw_lines) - 1, -1, -1)
+                        if ": error: " in raw_lines[i] or raw_lines[i].lstrip().startswith("ERR")), None)
+        if err_idx is not None:
+            block = [raw_lines[err_idx].strip()]
+            for nxt in raw_lines[err_idx + 1:]:
+                if nxt.startswith(("  ", "\t")) and nxt.strip():
+                    block.append(nxt.strip())
+                else:
+                    break
+            return f"{status}, last error in its log: {' | '.join(block)}"
+        lines = [x.strip() for x in raw_lines]
         last = next((x for x in reversed(lines) if x.startswith("basalt")), "")
         return f"{status}, last log line: {last}" if last else f"{status}, nothing in its log"
 
@@ -552,6 +645,8 @@ class ProcessEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+        if len(f) >= 17:                                  # decode windows of this run
+            self.last.update(windows=int(f[16]))
         if REQUEST_LINES:
             self._echo_request()
 
@@ -581,18 +676,26 @@ class ProcessEngine:
         with self.sleep_lock:
             out = self._vram_command("SLEEP", timeout)
             why = ram_check() if ram_check is not None else None
+            held = None
             if why is None:
+                held = vram.process_by_gpu(self.proc.pid)   # what the driver is about to move out of VRAM, per card
                 why = suspend.suspend(self.proc.pid)
             if why is not None:
                 self._vram_command("WAKE", timeout)
                 raise ValueError(why)
+            self.parked = held
             self.asleep = True
             return out
 
-    def wake(self, timeout: float = 120.0) -> dict:
-        """The driver puts the GPU state back, then WAKE refills the expert cache from RAM. EngineDied when the GPU
-        state cannot come back (the engine is ended so the next request starts it again)."""
+    def wake(self, timeout: float = 120.0, vram_check=None) -> dict:
+        """The driver puts the GPU state back, then WAKE refills the expert cache from RAM. `vram_check(parked)`,
+        asked first, says why the VRAM the state needs is not free (None: it is); WakeBlocked then, the engine untouched
+        and still asleep. EngineDied when the GPU state cannot come back (the engine is ended so the next request
+        starts it again)."""
         with self.sleep_lock:
+            why = vram_check(self.parked) if vram_check is not None else None
+            if why is not None:
+                raise WakeBlocked(why)
             t = time.time()
             why = suspend.resume(self.proc.pid)
             self.restore_s = time.time() - t
@@ -745,7 +848,7 @@ class ProcessEngine:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
         except (OSError, AttributeError):                # the pipe is gone
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            raise self._died() from None
 
     def _control(self, cancel, on_token, stop_when=None, idle=None, stop_soon=None):
         """Read the control lines of a GEN/BGEN, yielding None as heartbeat and False per token (on_token gets the id).
@@ -774,7 +877,7 @@ class ProcessEngine:
                 continue
             beat = time.monotonic()
             if line is None:
-                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                raise self._died()
             if line.startswith("P "):
                 lp = logprob_line(line.split()[1:])
                 continue
@@ -788,7 +891,7 @@ class ProcessEngine:
             elif line.startswith("PP "):
                 f = line.split()
                 if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                    self.progress = (int(f[1]), int(f[2]))
+                    self._note_read(f)
                     self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                 if not stopped and cancel.is_set():
                     # stop during the prompt read, not after the first token
@@ -801,6 +904,8 @@ class ProcessEngine:
                     self._send("STOP")
                     stopped = True
                 yield None
+            elif line.startswith("RESUME "):
+                self._note_resume(line)
             elif line.startswith("DONE"):
                 self._parse_done(line)
                 self._last_done = line
@@ -893,37 +998,45 @@ class ProcessEngine:
         self.slot_drafts[slot] = (int(f[5]) if known else None, int(f[6]) if known else None, time.time())
 
     def _bdone_last(self, f: list[str]):
-        """This thread's `last` after a BDONE: finish, decode ms and the request's own draft counts (optional trailing
-        accepted, offered; without them they are unknown, never an earlier request's)."""
+        """This thread's `last` after a BDONE: finish, decode ms and the request's own draft counts and windows
+        (optional trailing accepted, offered, windows; without them they are unknown, never an earlier run's)."""
         if len(f) < 5 or not isinstance(self.last, dict):
             return
-        prev = {k: v for k, v in self.last.items() if k not in ("drafts_accepted", "drafts_offered")}
+        prev = {k: v for k, v in self.last.items() if k not in ("drafts_accepted", "drafts_offered", "windows")}
         counts = {"drafts_accepted": int(f[5]), "drafts_offered": int(f[6])} \
             if len(f) >= 7 and f[5].isdigit() and f[6].isdigit() else {}
+        if len(f) >= 8 and f[7].isdigit():
+            counts["windows"] = int(f[7])
         self.last = {**prev, **counts, "finish": f[3], "decode_ms": float(f[4]),
                      "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
 
     def _carry_drafts(self, carry: list[int], final: bool):
-        """Draft counts of a request that ran in several engine runs (solo, then a slot, ...): the run just read adds
-        to `carry`; at the request's last run `carry` joins its counts."""
+        """Draft counts and windows of a request that ran in several engine runs (solo, then a slot, ...): the run
+        just read adds to `carry`; at the request's last run `carry` joins its counts."""
         last = self.last
-        if not isinstance(last, dict) or last.get("drafts_offered") is None or last.get("drafts_accepted") is None:
-            if final:
-                carry[:] = [0, 0]
-            return
+        if not isinstance(last, dict):
+            last = {}
+        drafts = last.get("drafts_offered") is not None and last.get("drafts_accepted") is not None
+        windows = last.get("windows") is not None
         if final:
-            last["drafts_accepted"] += carry[0]
-            last["drafts_offered"] += carry[1]
-            carry[:] = [0, 0]
+            if drafts:
+                last["drafts_accepted"] += carry[0]
+                last["drafts_offered"] += carry[1]
+            if windows:
+                last["windows"] += carry[2]
+            carry[:] = [0, 0, 0]
         else:
-            carry[0] += last["drafts_accepted"]
-            carry[1] += last["drafts_offered"]
+            if drafts:
+                carry[0] += last["drafts_accepted"]
+                carry[1] += last["drafts_offered"]
+            if windows:
+                carry[2] += last["windows"]
 
     def _note_live(self, line: str):
         """A `PL <position> <total> <ms> <tok/s>` line: the display's position and speed inside a chunk."""
         f = line.split()
         if len(f) >= 5 and f[1].isdigit() and f[2].isdigit():
-            self.progress = (int(f[1]), int(f[2]))
+            self._note_read(f)
             try:
                 self.prefill_tok_s_mean = float(f[4])
             except ValueError:
@@ -1020,6 +1133,7 @@ class ProcessEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress = None
+        self._reset_read()
         self._reset_windows()
         handle, n = self._hold_prompt(ids, embeddings)
         held = {"handle": handle, "gen": self.gen}      # the prompt on this engine process (a restart loses it)
@@ -1077,7 +1191,7 @@ class ProcessEngine:
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
         yields, solo_again = 0, 0
-        carry = [0, 0]            # draft counts (accepted, offered) of the runs before the current one
+        carry = [0, 0, 0]         # draft counts (accepted, offered) and windows of the runs before the current one
         first, last0 = [], self.last   # reused prefix of the first run; `last` before this request's first DONE
         self.read_ms = 0.0             # the prompt-read time of every run this request makes
         try:
@@ -1159,7 +1273,7 @@ class ProcessEngine:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
                         soft = stop_soon is not None and stop_soon.is_set()
-                        if cancel.is_set() or soft or left <= 0 or finish in ("stop", "length") or (out and out[-1] in self.eos_ids()):
+                        if cancel.is_set() or soft or left <= 0 or finish in ("stop", "length", "error") or (out and out[-1] in self.eos_ids()):
                             self._carry_run(carry, first, last0, True)
                             return
                         self._carry_run(carry, first, last0, False)
@@ -1266,7 +1380,7 @@ class ProcessEngine:
                         continue
                     if line is None:
                         phase = "none"
-                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                        raise self._died()
                     if line.startswith("BP "):                  # a kept pick's logprobs, ahead of its BT line
                         slot_lp.append(logprob_line(line.split()[2:]))
                         continue
@@ -1347,9 +1461,9 @@ class ProcessEngine:
                         self._carry_run(carry, first, last0, True)
                     elif isinstance(self.last, dict):
                         # the BDONE is still to come: the counts of the DONE before it are not this request's
-                        for k in ("drafts_accepted", "drafts_offered"):
+                        for k in ("drafts_accepted", "drafts_offered", "windows"):
                             self.last.pop(k, None)
-                        carry[:] = [0, 0]
+                        carry[:] = [0, 0, 0]
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
@@ -1434,39 +1548,39 @@ class ProcessEngine:
 
     def pick_slot(self, meet: list[int], size: int, session: str | None = None) -> int | None:
         """A free slot for a prompt of `size` tokens (caller holds slot_cv; `meet`: the tokens of it each slot's idle
-        conversation covers, as the engine matched them): this session's own slot first (a conversation stays
-        where its K/V sits), then the longest held prefix, else an empty one, then the least recently used; None
-        when none is free.  A slot owned by another session is taken only when no unowned one is free: the owner
-        lost its conversation either way, and the least recently used goes first.  Read-only: `claim_slot` records
-        the choice."""
+        conversation covers, as the engine matched them): one of this session's own slots whose conversation this
+        prompt continues first (the longest held prefix - a conversation stays where its K/V sits), then an unowned
+        slot (the longest held prefix, else an empty one, then the least recently used), then the session's other
+        own slot, and only then another session's: that owner lost its conversation.  None when none is free.
+        Read-only: `claim_slot` records the choice."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
-        own = self.session_slot.get(session) if session is not None else None
-        if own is not None and own in free:
-            return own
 
         def held_prefix(b):
             return meet[b] if 0 < meet[b] < size else 0
-        pool = [b for b in free if b not in self.slot_owner] or free   # slot_owner is keyed by slot
-        best = max(pool, key=held_prefix)
-        return best if held_prefix(best) > 0 else min(pool, key=lambda b: (self.slot_held[b] > 0, self.slot_used[b]))
+
+        def best(pool: list[int]) -> int:
+            top = max(pool, key=held_prefix)
+            return top if held_prefix(top) > 0 else min(pool, key=lambda b: (self.slot_held[b] > 0, self.slot_used[b]))
+
+        mine = [b for b in free if session is not None and self.slot_owner.get(b) == session]
+        if mine:
+            top = best(mine)
+            if held_prefix(top) > 0:
+                return top
+        unowned = [b for b in free if b not in self.slot_owner]   # slot_owner is keyed by slot
+        if unowned:
+            return best(unowned)
+        return best(mine or free)
 
     def claim_slot(self, slot: int, session: str | None) -> None:
-        """Bind `slot` to `session` (caller holds slot_cv), dropping whoever held it and the session's own previous
-        slot: two owners of one slot, or one session in two slots, would both be lies the next turn acts on."""
+        """Bind `slot` to `session` (caller holds slot_cv), dropping whoever held it: one slot, one owner.  A session
+        keeps every slot it took: its agents' conversations may run in several at once."""
         self.slot_thread[slot] = threading.get_ident()
         if session is None:
             return
-        for s, o in list(self.session_slot.items()):    # anyone else owning this slot loses it
-            if o == slot:
-                del self.session_slot[s]
-                self.slot_owner.pop(slot, None)
-        old = self.session_slot.get(session)           # the session's previous slot, replaced
-        if old is not None and old != slot and self.slot_owner.get(old) == session:
-            del self.slot_owner[old]
         self.slot_owner[slot] = session
-        self.session_slot[session] = slot
 
     def slot_view(self) -> list[dict]:
         """Per batch slot: the thread whose request runs in it (None when idle) and the tokens it holds for the
@@ -1492,6 +1606,7 @@ class ProcessEngine:
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, session, stop_soon)
             return
         self.progress = None
+        self._reset_read()
         self.prefill_tok_s_mean = None
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -1507,7 +1622,7 @@ class ProcessEngine:
                 self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            raise self._died() from None
         done = False
         # silence allowance: silence_s plus the first chunk's read time; each PP line resets it to its chunk's time
         silence = float(self.silence_s or 0)
@@ -1547,7 +1662,7 @@ class ProcessEngine:
                     continue
                 if line is None:
                     done = True
-                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                    raise self._died()
                 heard = time.monotonic()                  # any line counts as output
                 beat = heard
                 if line.startswith("P "):
@@ -1568,7 +1683,7 @@ class ProcessEngine:
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                        self.progress = (int(f[1]), int(f[2]))
+                        self._note_read(f)
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                         rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
                         read_to = int(f[1])
@@ -1583,6 +1698,7 @@ class ProcessEngine:
                         return
                     yield None
                 elif line.startswith("RESUME "):          # reused tokens: the first chunk starts after them
+                    self._note_resume(line)
                     try:
                         read_to = int(line.split()[1])
                     except (IndexError, ValueError):
@@ -1642,7 +1758,12 @@ class ProcessEngine:
         with self.sleep_lock:                        # a sleep in progress ends first
             if self.asleep:                          # its GPU state back first: QUIT runs CUDA calls
                 self.asleep = False
-                suspend.resume(self.proc.pid)
+                if suspend.resume(self.proc.pid) is not None:   # it cannot run, so QUIT would never be answered
+                    try:
+                        self.proc.kill()
+                        self.proc.wait(timeout=20)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
         try:
             if self.proc.poll() is None:
                 try:

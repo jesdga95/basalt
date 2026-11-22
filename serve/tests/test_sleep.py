@@ -1,10 +1,13 @@
 """Idle sleep: the engine sleeps between requests (its VRAM released, its process kept) and the next request wakes it."""
 import json
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+from serve.engine.errors import WakeBlocked
 from serve.engine.mock import MockEngine
 from serve.engine.process import ProcessEngine
 from serve.frontend import ChatTemplate
@@ -21,6 +24,7 @@ class SleepyEngine(ProcessEngine):
         self.max_context, self.info, self.last = 4096, {}, {}
         self.asleep, self.unloaded, self.progress, self.restore_s = False, False, None, 0.0
         self.sleeps, self.wakes, self.closes = 0, 0, 0
+        self.parked = None
 
     def alive(self):
         return True
@@ -36,7 +40,10 @@ class SleepyEngine(ProcessEngine):
         self.sleeps += 1
         return {}
 
-    def wake(self, timeout=120.0):
+    def wake(self, timeout=120.0, vram_check=None):
+        why = vram_check(self.parked) if vram_check is not None else None
+        if why is not None:
+            raise WakeBlocked(why)
         self.asleep = False
         self.wakes += 1
         return {}
@@ -90,11 +97,63 @@ class IdleSleep(unittest.TestCase):
         self.assertEqual(self.engine.sleeps, 0)
         self.assertFalse(self.engine.asleep)
 
-    def test_unload_wakes_it_first(self):
+    def test_a_wake_into_a_card_someone_else_filled_names_the_holder_and_leaves_it_asleep(self):
+        self.engine.parked = {0: 30000}
         with mock.patch.object(self.svc, "_sleep_fits", return_value=None):
             self.assertEqual(self.svc.sleep(), "asleep")
-        self.assertEqual(self.svc.unload(), "unloaded")
-        self.assertEqual((self.engine.wakes, self.engine.closes), (1, 1))
+        self.svc.WAKE_VRAM_WAIT_S = 0.0
+        with mock.patch("serve.service.vram.free_mib", return_value=1000), \
+                mock.patch("serve.service.vram.holders", return_value="pid 7 (some-program) 25.0 GiB on GPU 0"):
+            body = {"model": self.svc.model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
+            req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(req, timeout=10)
+            text = caught.exception.read().decode()
+        self.assertEqual(caught.exception.code, 503)
+        self.assertIn("pid 7 (some-program)", text)
+        self.assertIn("GPU 0 needs 30000 MiB and has 1000 MiB free", text)
+        self.assertEqual(self.engine.wakes, 0)                           # nothing was restored into a full card
+        self.assertTrue(self.engine.asleep)                              # and it wakes once the memory is free
+        with mock.patch("serve.service.vram.free_mib", return_value=40000):
+            self.assertIn(self.chat()["choices"][0]["finish_reason"], ("stop", "length"))
+        self.assertEqual(self.engine.wakes, 1)
+
+    def test_the_wake_check_is_per_card(self):
+        self.svc.WAKE_VRAM_WAIT_S = 0.0
+        free = {0: 1000, 1: 60000}                                       # a idle second card must not hide a full main one
+        with mock.patch("serve.service.vram.free_mib", side_effect=lambda g: free[g]), \
+                mock.patch("serve.service.vram.holders", return_value="pid 9 (x) 28.0 GiB on GPU 0"):
+            why = self.svc._wake_vram_check({0: 30000, 1: 5000})
+            self.assertIn("GPU 0 needs 30000 MiB and has 1000 MiB free", why)
+            self.assertNotIn("GPU 1", why)
+            free[0] = 31000
+            self.assertIsNone(self.svc._wake_vram_check({0: 30000, 1: 5000}))
+            self.assertIsNone(self.svc._wake_vram_check(None))           # nothing known: nothing refused
+
+    def test_an_unlisted_engine_falls_back_to_the_cards_used_memory(self):
+        self.engine.proc = SimpleNamespace(pid=4242)
+        with mock.patch("serve.service.vram.process_mib", return_value=None), \
+                mock.patch.object(self.svc, "used_vram_mib", return_value=40000), \
+                mock.patch("serve.service.available_ram_mib", return_value=44000):
+            self.assertEqual(self.svc.sleep(), "no ram")                 # NVML cannot see the pid: not taken for 0 MiB
+        self.assertEqual(self.engine.sleeps, 0)
+
+    def test_the_ram_check_counts_the_engines_own_memory(self):
+        self.engine.proc = SimpleNamespace(pid=4242)
+        with mock.patch("serve.service.vram.process_mib", return_value=20000) as own, \
+                mock.patch.object(self.svc, "used_vram_mib", return_value=90000), \
+                mock.patch("serve.service.available_ram_mib", return_value=30000):
+            self.assertEqual(self.svc.sleep(), "asleep")                 # another program's 70000 MiB are not the engine's
+        own.assert_called_with(4242)
+
+    def test_unload_does_not_wake_it(self):
+        with mock.patch.object(self.svc, "_sleep_fits", return_value=None):
+            self.assertEqual(self.svc.sleep(), "asleep")
+        self.svc.WAKE_VRAM_WAIT_S = 0.0
+        with mock.patch("serve.service.vram.free_mib", return_value=1000):   # a card that could not take a wake
+            self.assertEqual(self.svc.unload(), "unloaded")
+        self.assertEqual((self.engine.wakes, self.engine.closes), (0, 1))   # close() resumes or kills it itself
 
     def test_no_sleep_once_the_server_is_stopping(self):
         self.svc.stop()

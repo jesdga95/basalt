@@ -20,13 +20,15 @@ SuffixDrafter::SuffixDrafter(int min_match, int max_match, size_t capacity_token
     size_t cap = 1;
     while (cap < capacity_tokens * 2) cap <<= 1;          // load factor <= 0.5 at the nominal capacity
     table_.assign(cap, Slot{});
+    long_.assign(cap, Slot{});
     mask_ = cap - 1;
     hist_.reserve(capacity_tokens);
 }
 
 void SuffixDrafter::reset() {
     hist_.clear();
-    std::fill(table_.begin(), table_.end(), Slot{});
+    for (const uint32_t d : dirty_) (d & kLongBit ? long_ : table_)[d & ~kLongBit] = Slot{};   // only what was filled
+    dirty_.clear();
     last_match_ = 0;
 }
 
@@ -35,13 +37,20 @@ uint64_t SuffixDrafter::key_at(size_t end) const {
     return mix(a * 0x9E3779B97F4A7C15ull ^ mix(b + 0x632BE59BD9B4E019ull) ^ (c << 1)) | 1ull;   // never 0
 }
 
-SuffixDrafter::Slot* SuffixDrafter::find_slot(uint64_t key, bool insert) {
+uint64_t SuffixDrafter::long_key_at(size_t end) const {
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < LONG_ORDER; ++i) h = mix(h ^ (uint32_t) hist_[end - (size_t) i]) + (uint64_t) i;
+    return h | 1ull;   // never 0
+}
+
+SuffixDrafter::Slot* SuffixDrafter::find_slot(std::vector<Slot>& table, uint64_t key, bool insert) {
     for (size_t i = key & mask_, probes = 0; probes <= mask_; i = (i + 1) & mask_, ++probes) {
-        Slot& s = table_[i];
+        Slot& s = table[i];
         if (s.key == key) return &s;
         if (s.key == 0) {
             if (!insert) return nullptr;
             s.key = key;
+            dirty_.push_back((uint32_t) i | (&table == &long_ ? kLongBit : 0u));
             return &s;
         }
     }
@@ -53,12 +62,16 @@ void SuffixDrafter::append(const int32_t* tokens, size_t n) {
         hist_.push_back(tokens[i]);
         const size_t end = hist_.size() - 1;
         if (end < 2) continue;
-        Slot* s = find_slot(key_at(end), true);
-        if (s == nullptr) continue;
-        for (int w = WAYS - 1; w > 0; --w) s->pos[w] = s->pos[w - 1];
-        s->pos[0] = (uint32_t) end;
-        if (s->n < WAYS) ++s->n;
+        push(find_slot(table_, key_at(end), true), end);
+        if (end >= (size_t) LONG_ORDER - 1) push(find_slot(long_, long_key_at(end), true), end);
     }
+}
+
+void SuffixDrafter::push(Slot* s, size_t end) {
+    if (s == nullptr) return;
+    for (int w = WAYS - 1; w > 0; --w) s->pos[w] = s->pos[w - 1];
+    s->pos[0] = (uint32_t) end;
+    if (s->n < WAYS) ++s->n;
 }
 
 int SuffixDrafter::propose(int max_k, int32_t* out) {
@@ -66,16 +79,21 @@ int SuffixDrafter::propose(int max_k, int32_t* out) {
     const size_t n = hist_.size();
     if (n < 4 || max_k <= 0) return 0;
     const size_t cur = n - 1;
-    const Slot* s = find_slot(key_at(cur), false);
-    if (s == nullptr) return 0;
+    // The trigram slot holds only the newest repeats of a common trigram; the long slot keeps the repeats of the last
+    // LONG_ORDER tokens, so an older source of a quoted stretch survives there. Longest match wins, the long slot's first.
+    const Slot* slots[2] = {n >= (size_t) LONG_ORDER ? find_slot(long_, long_key_at(cur), false) : nullptr,
+                            find_slot(table_, key_at(cur), false)};
     size_t best_end = 0;
     int best_len = 0;
-    for (int w = 0; w < s->n; ++w) {
-        const size_t p = s->pos[w];
-        if (p >= cur) continue;                             // the current suffix itself
-        int len = 0;
-        while (len < max_match_ && len <= (int) p && hist_[p - len] == hist_[cur - len]) ++len;
-        if (len > best_len) { best_len = len; best_end = p; }   // most recent first, so ties keep the newer
+    for (const Slot* s : slots) {
+        if (s == nullptr) continue;
+        for (int w = 0; w < s->n; ++w) {
+            const size_t p = s->pos[w];
+            if (p >= cur) continue;                         // the current suffix itself
+            int len = 0;
+            while (len < max_match_ && len <= (int) p && hist_[p - len] == hist_[cur - len]) ++len;
+            if (len > best_len) { best_len = len; best_end = p; }   // most recent first, so ties keep the newer
+        }
     }
     if (best_len < min_match_) return 0;
     last_match_ = best_len;

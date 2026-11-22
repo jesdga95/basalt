@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
 #include <dxgi1_4.h>
@@ -399,17 +400,17 @@ std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_b
     const unsigned long long mib = (unsigned long long) (avail >> 20);
     char buf[384];
     if (!resident) {
-        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); use "
+        std::snprintf(buf, sizeof buf, "RAM ran out loading (%llu MiB free); use "
                                        "--resident-experts or --mmap-experts", mib);
     } else if (copy_bytes < (1ull << 30)) {
         // a budget of 1 GiB or more would not shrink a copy this small, so it is not offered
-        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); the resident copy is only "
+        std::snprintf(buf, sizeof buf, "RAM ran out loading (%llu MiB free); the resident copy is only "
                                        "%llu MiB, so something else is holding the memory (other programs, or file "
                                        "pages read while loading)", mib, (unsigned long long) (copy_bytes >> 20));
     } else {
         // the copy shrunk by what the reserve is short of leaves the reserve free again
         const uint64_t keep = copy_bytes - std::min(copy_bytes, reserve > avail ? reserve - avail : 0);
-        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); use --resident-budget-gib %llu",
+        std::snprintf(buf, sizeof buf, "RAM ran out loading (%llu MiB free); use --resident-budget-gib %llu",
                       mib, (unsigned long long) std::max<uint64_t>(1, keep >> 30));
     }
     return buf;
@@ -655,6 +656,8 @@ void ram_guard_pause(bool paused) {
 #if defined(_WIN32)
 namespace {
 constexpr uint64_t kPrefetchStep = 128ull << 10;
+// Windows of one prefetch ask: bounded so a batch holds at most this much memory ahead of the access.
+constexpr size_t kMaxPrefetchEntries = 512;
 
 /// The page size, so a prefetch window starts on a page boundary.
 uintptr_t page_bytes() {
@@ -670,19 +673,36 @@ uintptr_t page_bytes() {
 bool read_ahead_enabled() { return true; }
 
 void advise_willneed(const void* p, uint64_t bytes) {
-    if (p == nullptr || bytes == 0 || !read_ahead_enabled()) return;
-    // A view of a file mapping takes its pages one fault at a time as they are touched, so asking for the range
-    // ahead of the access replaces those faults with large background reads.  The hint is best effort: a range the
-    // system will not serve is skipped without an error, and pages already in memory cost nothing.  The range is
-    // asked for in bounded windows, which keeps the reads in flight - and the memory they hold - bounded instead of
-    // asking for a whole layer at once.
-    const uintptr_t pg = page_bytes(), end = (uintptr_t) p + bytes;
-    for (uintptr_t a = (uintptr_t) p & ~(pg - 1); a < end; a += kPrefetchStep) {
-        WIN32_MEMORY_RANGE_ENTRY entry{};
-        entry.VirtualAddress = (PVOID) a;
-        entry.NumberOfBytes = (SIZE_T) std::min<uintptr_t>(kPrefetchStep, end - a);
-        (void) PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+    if (p == nullptr || bytes == 0) return;
+    advise_willneed(&p, &bytes, 1);
+}
+
+void advise_willneed(const void* const* addrs, const uint64_t* sizes, size_t n) {
+    if (addrs == nullptr || sizes == nullptr || n == 0 || !read_ahead_enabled()) return;
+    // A view of a file mapping takes its pages one fault at a time as they are touched, so asking for the ranges
+    // ahead of the access replaces those faults with large background reads. The entries of one PrefetchVirtualMemory
+    // call are read side by side; a call per window would serialize them, so the windows of every range gather into
+    // one ask, flushed in bounded batches to keep the reads in flight - and the memory they hold - bounded.
+    const uintptr_t pg = page_bytes();
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t* p = (const uint8_t*) addrs[i];
+        const uint64_t bytes = sizes[i];
+        if (p == nullptr || bytes == 0) continue;
+        const uintptr_t end = (uintptr_t) p + bytes;
+        for (uintptr_t a = (uintptr_t) p & ~(pg - 1); a < end; a += kPrefetchStep) {
+            WIN32_MEMORY_RANGE_ENTRY entry{};
+            entry.VirtualAddress = (PVOID) a;
+            entry.NumberOfBytes = (SIZE_T) std::min<uintptr_t>(kPrefetchStep, end - a);
+            entries.push_back(entry);
+            if (entries.size() >= kMaxPrefetchEntries) {
+                (void) PrefetchVirtualMemory(GetCurrentProcess(), (ULONG) entries.size(), entries.data(), 0);
+                entries.clear();
+            }
+        }
     }
+    if (!entries.empty())
+        (void) PrefetchVirtualMemory(GetCurrentProcess(), (ULONG) entries.size(), entries.data(), 0);
 }
 
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
@@ -706,6 +726,11 @@ void advise_willneed(const void* p, uint64_t bytes) {
     const uintptr_t pg = ps > 0 ? (uintptr_t) ps : 4096, end = (uintptr_t) p + bytes;
     for (uintptr_t a = (uintptr_t) p & ~(pg - 1); a < end; a += kAdviseStep)
         (void) madvise((void*) a, (size_t) std::min<uintptr_t>(kAdviseStep, end - a), MADV_WILLNEED);
+}
+
+void advise_willneed(const void* const* addrs, const uint64_t* sizes, size_t n) {
+    if (addrs == nullptr || sizes == nullptr || n == 0 || !read_ahead_enabled()) return;
+    for (size_t i = 0; i < n; ++i) advise_willneed(addrs[i], sizes[i]);
 }
 
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {

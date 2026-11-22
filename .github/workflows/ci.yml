@@ -1,17 +1,19 @@
 name: ci
 
-# Pull requests run the same jobs as main. Fork pull requests get a read-only token and no secrets (none are used).
+# Pull requests run the same jobs as main. Changes that only touch docs/ or Markdown files skip CI (community.yml checks the community rows). Fork pull requests get a read-only token and no secrets (none are used).
 # No GPU is available: the engine is compiled for sm_120 and only the `cpu`-labelled tests run.
 on:
   pull_request:
     paths-ignore:
-      - "docs/community/**"
+      - "docs/**"
+      - "**.md"
       - "tools/check_benchmarks.py"
       - ".github/workflows/community.yml"
   push:
     branches: [main]
     paths-ignore:
-      - "docs/community/**"
+      - "docs/**"
+      - "**.md"
       - "tools/check_benchmarks.py"
       - ".github/workflows/community.yml"
   workflow_dispatch:
@@ -142,7 +144,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        model: [qwen4exp, deepseek41, qwen35]
+        model: [qwen4exp, deepseek41, qwen35, hy4flash, inkling2]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:

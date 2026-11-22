@@ -5,6 +5,7 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include "basalt/core/pinned.hpp"
+#include "basalt/core/loader.hpp"
 #include "basalt/core/ram_load.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/direct_file.hpp"
@@ -260,7 +261,7 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     auto view_map = platform::MappedFile::open_ro(path, &map_err, mo);
     if (!view_map) { err = "FileExpertSource: " + map_err; return false; }
     // A plain descriptor for the prompt path's positional reads: the view stays read-only for the compute.  The
-    // bulk fills open the same path unbuffered themselves (read_blobs).  A failure here is not fatal - the caller
+    // bulk fills read it unbuffered through the loader.  A failure here is not fatal - the caller
     // falls back to copying from the view.
     fd_ = platform::open_fd_utf8(path);
     path_ = path;
@@ -376,155 +377,37 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     return true;
 }
 
-bool ExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink,
-                              std::string& err) {
-    constexpr int64_t kAhead = 256;
-    const bool advise = advise_pairs(pairs, std::min<int64_t>(kAhead, n));
-    for (int64_t i = 0; i < n; ++i) {
-        if (advise && i + kAhead < n) (void) advise_pairs(pairs + i + kAhead, 1);
-        const uint8_t* b = blob(pairs[i].first, pairs[i].second);
-        if (b == nullptr) {
-            err = "expert blob " + std::to_string(pairs[i].first) + "/" + std::to_string(pairs[i].second) +
-                  " is not readable";
-            return false;
-        }
-        if (!sink(i, 0, b, err)) return false;
-    }
-    return true;
-}
-
-bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n,
-                                 const BlobSink& sink, std::string& err) {
-    // A blob copied out of the mapping leaves its pages in this process, so each one goes back to the OS as soon as
-    // the sink has it: a fill of every expert must not leave the whole pack resident.
-    const BlobSink drop_after = [&](int64_t i, int w, const uint8_t* blob, std::string& e) {
-        if (!sink(i, w, blob, e)) return false;
-        if (blob >= base_ && blob < base_ + mapped_bytes_)
-            (void) basalt::platform::drop_mapped_view(base_, mapped_bytes_, (uint64_t) (blob - base_),
-                                                      layer_blob_bytes_[(size_t) pairs[i].first]);
-        return true;
-    };
-    // With the compact RAM copy ready the experts are not read from the file, so there is nothing to give back.
-    const bool give_back = n > 0 && !complement_ready_ && base_ != nullptr;
-    const BlobSink mapped_sink = give_back ? drop_after : sink;
-    auto mapped_read = [&] { return ExpertSource::read_blobs(pairs, n, mapped_sink, err); };
-    if (complement_ready_ || !base_ || path_.empty() || n <= 0) return mapped_read();
-
-    uint64_t max_blob = 0;
+bool plan_cache_slots(LoadPlan& plan, ExpertSource& src, ExpertCache& cache, int device, const std::pair<int32_t, int32_t>* pairs,
+                      const int32_t* slots, int64_t n, std::string& err) {
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     for (int64_t i = 0; i < n; ++i) {
         const auto [layer, expert] = pairs[i];
-        if (!mapped_blob(layer, expert)) {
-            err = "read_blobs: invalid expert";
+        uint8_t* dst = cache.device_slot(slots[i]);
+        if (dst == nullptr) {
+            err = "ExpertCache::fill_slot: slot " + std::to_string(slots[i]) + " is outside the arena";
             return false;
         }
-        max_blob = std::max(max_blob, layer_blob_bytes_[(size_t) layer]);
-    }
-    constexpr uint64_t alignment = platform::DirectFile::alignment();
-    if (max_blob > UINT32_MAX - 2 * alignment) return mapped_read();
-    const uint64_t stage_bytes = (max_blob + 2 * (alignment - 1)) & ~(alignment - 1);
-    const int readers = (int) std::min<int64_t>(kBlobReaders, n);
-    struct Stage {
-        uint8_t* alloc = nullptr;   // what cudaHostAlloc returned
-        uint8_t* data = nullptr;    // `alloc` rounded up to the read alignment
-        int64_t index = -1;
-        uint32_t prefix = 0, required = 0;
-        ~Stage() { if (alloc) cudaFreeHost(alloc); }
-    } stages[kBlobReaders];
-    // The file drains outstanding writes before the staging buffers are released.  A pack on a file system without
-    // unbuffered reads, or one that cannot be reopened, is read through the mapping.
-    platform::DirectFile file;
-    std::string direct_err;
-    if (!file.open(path_, direct_err, readers)) return mapped_read();
-    for (int i = 0; i < readers; ++i) {
-        // Portable: the fill writes the peer card's slots straight from these buffers.  A small pinned allocation
-        // can be carved from a shared block at less than the read alignment, so each buffer has one alignment of
-        // slack and starts at the next aligned address inside it.
-        if (cudaHostAlloc((void**) &stages[i].alloc, (size_t) (stage_bytes + alignment), cudaHostAllocPortable) !=
-            cudaSuccess) {
-            stages[i].alloc = nullptr;
-            (void) cudaGetLastError();
-            file.close();
-            return mapped_read();
-        }
-        const uintptr_t at = (uintptr_t) stages[i].alloc;
-        stages[i].data = stages[i].alloc + (((at + alignment - 1) & ~(uintptr_t) (alignment - 1)) - at);
-    }
-
-    auto submit = [&](int slot, int64_t index) {
-        const auto [layer, expert] = pairs[index];
-        const uint8_t* mapped = mapped_blob(layer, expert);
-        const uint64_t pos = file_off_ + (uint64_t) (mapped - base_);
-        Stage& stage = stages[slot];
-        stage.index = index;
-        stage.prefix = (uint32_t) (pos & (alignment - 1));
-        stage.required = stage.prefix + (uint32_t) layer_blob_bytes_[(size_t) layer];
-        const uint32_t length = (uint32_t) (((uint64_t) stage.required + alignment - 1) & ~(alignment - 1));
-        return file.submit(pos - stage.prefix, stage.data, length, (uint64_t) slot, err);
-    };
-    int64_t next = 0;
-    for (int slot = 0; slot < readers; ++slot)
-        if (!submit(slot, next++)) return false;
-    int64_t finished = 0;
-    platform::Completion completions[kBlobReaders];
-    while (finished < n) {
-        const int count = file.wait(completions, readers, -1);
-        if (count <= 0) {
-            err = "read_blobs: direct read completion failed";
-            return false;
-        }
-        for (int j = 0; j < count; ++j) {
-            const auto& done = completions[j];
-            if (done.tag == platform::DirectFile::WAKE_TAG) continue;
-            if (done.tag >= (uint64_t) readers || stages[done.tag].index < 0) {
-                err = "read_blobs: invalid direct read completion";
+        LoadItem it;
+        it.bytes = lay.blob_bytes(layer);
+        it.dev = dst;
+        it.device = device;
+        int fd = -1;
+        uint64_t off = 0;
+        if (src.file_extent(layer, expert, fd, off)) {
+            it.file = plan.file_fd(fd);
+            it.off = off;
+        } else {   // held in RAM already: copied to the card, counted where it was read
+            it.from = src.blob(layer, expert);
+            it.count = 0;
+            if (it.from == nullptr) {
+                err = "expert blob " + std::to_string(layer) + "/" + std::to_string(expert) + " is not readable";
                 return false;
             }
-            Stage& stage = stages[done.tag];
-            // A read that came back short or failed (a truncated pack, a drive that refused it) hands over this
-            // blob's mapped copy, and the fill carries on with the rest.
-            const uint8_t* data = done.ok && done.bytes >= stage.required
-                                      ? stage.data + stage.prefix
-                                      : mapped_blob(pairs[stage.index].first, pairs[stage.index].second);
-            if (!drop_after(stage.index, (int) done.tag, data, err)) return false;
-            stage.index = -1;
-            ++finished;
-            if (next < n && !submit((int) done.tag, next++)) return false;
         }
+        plan.add(it);
     }
+    cache.note_filled(n);
     return true;
-}
-
-bool fill_cache_slots(ExpertSource& src, ExpertCache& cache, int device, const std::pair<int32_t, int32_t>* pairs,
-                      const int32_t* slots, int64_t n, const std::function<void(uint64_t)>& on_bytes, std::string& err) {
-    std::vector<cudaStream_t> streams((size_t) ExpertSource::kBlobReaders, nullptr);
-    struct Destroy {
-        std::vector<cudaStream_t>& v;
-        ~Destroy() { for (cudaStream_t s : v) if (s) cudaStreamDestroy(s); }
-    } destroy{streams};
-    int prev = 0;
-    cudaGetDevice(&prev);
-    if (cudaSetDevice(device) != cudaSuccess) { err = "cannot select the device for the cache fill"; return false; }
-    // the cache's arena was zeroed on the legacy stream, which the non-blocking streams below are not ordered against
-    bool ok = cudaDeviceSynchronize() == cudaSuccess;
-    for (cudaStream_t& s : streams)
-        ok = ok && cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess;
-    if (!ok) {
-        err = "cannot create the streams for the cache fill";
-        cudaSetDevice(prev);
-        return false;
-    }
-    const auto& lay = basalt::kernels::cpu::expert_layout();
-    const bool done = src.read_blobs(pairs, n, [&](int64_t i, int w, const uint8_t* blob, std::string& e) {
-        if (cudaSetDevice(device) != cudaSuccess) { e = "cannot select the device for the cache fill"; return false; }
-        const int64_t bytes = (int64_t) lay.blob_bytes(pairs[i].first);
-        if (!cache.fill_slot(slots[i], blob, streams[(size_t) w], e, bytes)) return false;
-        const cudaError_t sync = cudaStreamSynchronize(streams[(size_t) w]);   // the staging buffer is reused next
-        if (sync != cudaSuccess) { e = std::string("cache fill: ") + cudaGetErrorString(sync); return false; }
-        if (on_bytes) on_bytes((uint64_t) bytes);
-        return true;
-    }, err);
-    cudaSetDevice(prev);
-    return done;
 }
 
 bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
@@ -596,6 +479,21 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
 
 bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
+    const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
+    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
+    LoadPlan reads;
+    if (!plan_cache_complement(reads, cache, err, pin, additional_gpu_pairs, lend_from_slot, headroom_bytes, budget_bytes, rank))
+        return false;
+    Loader loader;
+    if (!loader.run(reads, err)) {
+        release_complement();
+        return false;
+    }
+    return finish_complement(loader.unbuffered(), err);
+}
+
+bool FileExpertSource::plan_cache_complement(
+    LoadPlan& load_plan, const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
     uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
     err.clear();
@@ -771,33 +669,19 @@ bool FileExpertSource::pin_cache_complement(
         basalt::platform::advise_dontneed(fd_, file_off_, mapped_bytes_);
     }
 
+    // The copy is allocated here and given its pages by the reads that fill it; it is pinned once they have landed
+    // (pin_landed_complement), so the RAM it holds grows with the pass instead of being held for the whole of it.
     RamAllocation allocation;
     void* arena = nullptr;
     const uint8_t* host = nullptr;
-    const uint8_t* device = nullptr;
-    bool pinned_ok = false;
-    uint64_t locked = 0;
-    uint64_t partial_pin = 0;   ///< a registered prefix of the arena (all of it once registered after the read)
-    std::vector<uint64_t> slice_at;
-    std::vector<const uint8_t*> slice_dev;
-    bool register_after = false;   ///< the arena is registered with the driver after it is filled
-    uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
+    bool register_arena = false;   ///< ordinary memory registered with the driver after its reads
     std::string note;
     // One alignment for both arena paths, so one call releases it whichever way it was chosen.
     constexpr size_t kArenaAlign = 2ull << 20;
-    auto release = [&]() {
+    auto release = [&]() {   // nothing is pinned or locked before the reads
         if (arena == nullptr) return;
-        if (allocation.allocation_pinned()) allocation.reset();
-        else if (pinned_ok) (void) cudaFreeHost(arena);
-        else {
-            if (partial_pin > 0) {
-                if (slice_at.empty()) (void) cudaHostUnregister(arena);
-                else for (uint64_t off : slice_at) (void) cudaHostUnregister((uint8_t*) arena + off);
-            }
-            if (locked > 0) basalt::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
-            if (allocation.data()) allocation.reset();
-            else basalt::platform::free_aligned(arena);
-        }
+        if (allocation.data()) allocation.reset();
+        else basalt::platform::free_aligned(arena);
         arena = nullptr;
     };
     if (bytes > 0) {
@@ -807,7 +691,7 @@ bool FileExpertSource::pin_cache_complement(
             // Allocation-backed pins need no portable registration. Ordinary spans are registered after the read.
             if (allocation.allocate(bytes)) arena = allocation.data();
             if (arena != nullptr) {
-                register_after = true;
+                register_arena = true;
             } else {
                 note = "no aligned memory for registration";
             }
@@ -818,26 +702,11 @@ bool FileExpertSource::pin_cache_complement(
                 err = "FileExpertSource: pageable resident complement allocation failed";
                 return false;
             }
-            if (pin) {
-                // CS-T, a RAM budget: its bytes are in profile order, hottest first, so the driver is asked to
-                // register the largest prefix it takes (from the cap down in 2 GiB steps).  Those experts can be
-                // read by the GPU over PCIe (the PCIe share) and copied by DMA; only the rest is locked in the working
-                // set (the registered prefix is page-locked by the driver already - locking it twice made the next
-                // device allocation fail).
-                lock_off = partial_pin;
-                const basalt::platform::LockResult lr =
-                    basalt::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
-                locked = lr.locked_bytes;
-                note += (note.empty() ? "" : "; ") + lr.note;
-            }
         }
         host = (const uint8_t*) arena;
     }
 
     const double alloc_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_t0).count();
-    // Progress counts the experts the GPU cache does not hold (those it holds, kept here for the prompt path's
-    // loan, are already counted by its fill); experts left on the file are not placed at all.
-    uint64_t progress_total = 0;
     for (int64_t layer = 0; layer < n_layers_; ++layer)
         for (int64_t expert = 0; expert < n_expert_; ++expert) {
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -848,78 +717,81 @@ bool FileExpertSource::pin_cache_complement(
                 release();
                 return false;
             }
-            if (!on_gpu[index]) progress_total += blob_bytes;
         }
-    // experts another GPU holds alone are placed by that tier's own phase
-    uint64_t extra_gpu_bytes = 0;
-    for (const auto& pr : additional_gpu_pairs) extra_gpu_bytes += layer_blob_bytes_[(size_t) pr.first];
-    const uint64_t all_experts = expert_bytes();
-    if (all_experts > gpu_bytes + extra_gpu_bytes + progress_total)
-        LoadProgress::skipped(all_experts - gpu_bytes - extra_gpu_bytes - progress_total);
-    LoadProgress::plan("ram", progress_total);
-    LoadProgress progress("ram", progress_total);
+    std::vector<uint64_t> bounds;   // where a registration the driver refuses whole may be cut: blob starts
+    if (register_arena && platform::kBoundHostRegistration && !allocation.allocation_pinned()) {
+        std::vector<uint64_t> starts;
+        for (uint64_t off : offsets) if (off != kNoComplement) starts.push_back(off);
+        uint64_t at = spare_at;
+        for (const auto& [blob, count] : spare_sizes)
+            for (int64_t i = 0; i < count; ++i, at += blob) starts.push_back(at);
+        bounds = ram_pin_slices(std::move(starts), ram_padded(bytes), platform::system_page_size(), 1ull << 30);
+    }
     // Experts are read straight into the arena with unbuffered reads, so the file cache neither copies them nor
     // evicts anything; ranges that are not block-aligned, or a file system without unbuffered reads, take the mapped copy.
-    RamGrid grid;
-    grid.n_layers = n_layers_;
-    grid.n_expert = n_expert_;
-    grid.file_base = file_off_;
-    grid.layer_offset.assign(layer_offsets_.begin(), layer_offsets_.end());
-    grid.blob_bytes.assign(layer_blob_bytes_.begin(), layer_blob_bytes_.end());
-    const auto copy_t0 = std::chrono::steady_clock::now();
-    RamLoad load;
-    load.fd = fd_;
-    load.unbuffered = bytes > 0;
-    load.threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
-    load.progress = &progress;
-    load.groups = ram_arena_runs(grid, (uint8_t*) host, offsets, kNoComplement, on_gpu);
-    load.read_ahead = [&](int64_t layer, const std::vector<RamRun>& runs) {
-        std::vector<std::pair<int32_t, int32_t>> ahead;
-        for (const RamRun& r : runs)
-            for (int64_t k = 0; k < r.count; ++k) ahead.emplace_back((int32_t) layer, (int32_t) (r.first + k));
-        (void) advise_pairs(ahead.data(), (int64_t) ahead.size());
-    };
-    load.fallback = [&](int64_t layer, const RamRun& r, uint64_t done, std::string& e) {
-        for (int64_t k = (int64_t) (done / r.blob_bytes); k < r.count; ++k)
-            if (!copy_from_files(layer, r.first + k, r.dst + (size_t) k * (size_t) r.blob_bytes)) {
-                e = "FileExpertSource: invalid blob bounds while building the cache complement";
-                return false;
-            }
-        return true;
-    };
-    load.after_group = [&](int64_t layer, int64_t done, uint64_t copied, bool mapped_used, std::string& e) {
-        if (mapped_used) {   // the layer's pages are not kept in the file cache once copied
-            const uint64_t layer_offset = layer_offsets_[(size_t) layer];
-            const uint64_t layer_bytes = layer_blob_bytes_[(size_t) layer] * (uint64_t) n_expert_;
-            if (!basalt::platform::drop_mapped_view(base_, mapped_bytes_, layer_offset, layer_bytes)) {
-                e = "FileExpertSource: could not release mapped expert layer " + std::to_string(layer);
-                return false;
-            }
-            basalt::platform::advise_dontneed(fd_, file_off_ + layer_offset, layer_bytes);
+    // The GPU cache's experts kept here for the prompt path's loan are counted by its fill; experts left on the file are
+    // not placed at all.
+    const int load_file = fd_ >= 0 ? load_plan.file_fd(fd_) : load_plan.file(path_);   // the path when the descriptor did not open
+    uint64_t read_bytes = 0;
+    for (int64_t layer = 0; layer < n_layers_; ++layer)
+        for (int64_t expert = 0; expert < n_expert_; ++expert) {
+            const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+            if (offsets[index] == kNoComplement) continue;
+            LoadItem it;
+            it.file = load_file;
+            it.off = file_off_ + layer_offsets_[(size_t) layer] + (uint64_t) expert * layer_blob_bytes_[(size_t) layer];
+            it.bytes = layer_blob_bytes_[(size_t) layer];
+            it.host = (uint8_t*) host + offsets[index];
+            it.count = on_gpu[index] ? 0 : it.bytes;
+            read_bytes += it.bytes;
+            load_plan.add(it);
         }
-        if (done % 8 == 0 || done == n_layers_)
-            basalt::log::info("basalt", "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)",
-                         (long long) done, (long long) n_layers_, (double) copied / 1073741824.0,
-                         std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count());
-        return true;
-    };
-    RamLoadStats read;
-    if (!read_ram_runs(load, read, err)) {
-        release();
-        return false;
+    pending_complement_ = PendingComplement{0, false, note, pin, pin_t0, alloc_s, read_bytes, lend, n_slots,
+                                            lend_from_slot, additional_gpu_pairs.size(), arena != nullptr && pin,
+                                            register_arena, std::move(bounds)};
+    load_plan.after_reads([this](std::string&) { pin_landed_complement(); return true; });
+    complement_arena_ = arena;
+    complement_allocation_ = std::move(allocation);
+    complement_host_ = host;
+    complement_device_ = nullptr;
+    complement_slice_at_.clear();
+    complement_slice_dev_.clear();
+    complement_bytes_ = bytes;
+    complement_offsets_ = std::move(offsets);
+    ++places_gen_;
+    complement_pinned_ = false;
+    complement_pin_limit_ = 0;
+    complement_partial_ = false;
+    complement_locked_ = 0;
+    complement_lock_off_ = 0;
+    complement_lent_slots_ = lend ? n_slots - keep_from : 0;
+    spare_free_.clear();
+    {
+        uint64_t at = spare_at;
+        for (const auto& [b, n] : spare_sizes)
+            for (int64_t i = 0; i < n; ++i, at += b) spare_free_.emplace_back(at, b);
+        if (!spare_sizes.empty())
+            basalt::log::info("basalt", "FileExpertSource: %lld free places for the adaptive swaps (%zu blob sizes, %.0f MiB)",
+                         (long long) spare_free_.size(), spare_sizes.size(), (double) (at - spare_at) / 1048576.0);
     }
-    const double read_done_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
-    if (register_after) {
-        std::vector<uint64_t> bounds;
-        if (platform::kBoundHostRegistration && !allocation.allocation_pinned()) {
-            std::vector<uint64_t> starts;
-            for (uint64_t off : offsets) if (off != kNoComplement) starts.push_back(off);
-            uint64_t at = spare_at;
-            for (const auto& [blob, count] : spare_sizes)
-                for (int64_t i = 0; i < count; ++i, at += blob) starts.push_back(at);
-            bounds = ram_pin_slices(std::move(starts), ram_padded(bytes), platform::system_page_size(), 1ull << 30);
-        }
-        const RamPin rp = pin_ram(allocation, bounds, /*mapped=*/true, &device);
+    complement_ready_ = true;
+    return true;
+}
+
+void FileExpertSource::pin_landed_complement() {
+    PendingComplement& pc = pending_complement_;
+    if (!pc.pin_after_reads) return;
+    pc.pin_after_reads = false;
+    void* arena = complement_arena_;
+    const uint64_t bytes = complement_bytes_;
+    const uint8_t* device = nullptr;
+    uint64_t partial_pin = 0, locked = 0, lock_off = 0;
+    std::vector<uint64_t> slice_at;
+    std::vector<const uint8_t*> slice_dev;
+    std::string& note = pc.note;
+    const auto reg_t0 = std::chrono::steady_clock::now();
+    if (pc.register_arena) {
+        const RamPin rp = pin_ram(complement_allocation_, pc.bounds, /*mapped=*/true, &device);
         if (rp.allocation_backed) {
             partial_pin = bytes;
             note = "CUDA-pinned through host VMM";
@@ -942,57 +814,74 @@ bool FileExpertSource::pin_cache_complement(
             locked = rp.locked_bytes;
             note += "; " + rp.lock_note;
         }
+    } else {
+        // no memory the driver could register: the copy is locked in the working set instead
+        const basalt::platform::LockResult lr = basalt::platform::lock_resident((uint8_t*) arena, bytes);
+        locked = lr.locked_bytes;
+        note += (note.empty() ? "" : "; ") + lr.note;
     }
-    progress.finish();
-    {
-        const double read_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
-        basalt::log::info("basalt", "FileExpertSource: cache complement: allocation %.1f s, read %.1f s (%.2f GB/s, %.1f%% unbuffered), registration %.1f s",
-                     alloc_s, read_done_s, read_done_s > 0 ? (double) read.copied / 1e9 / read_done_s : 0.0,
-                     read.copied > 0 ? 100.0 * (double) read.unbuffered / (double) read.copied : 0.0,
-                     read_s - read_done_s);
-    }
-
-    complement_arena_ = arena;
-    complement_allocation_ = std::move(allocation);
-    complement_host_ = host;
+    pc.register_arena = false;
+    pc.reg_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - reg_t0).count();
     complement_device_ = device;
     complement_slice_at_ = std::move(slice_at);
     complement_slice_dev_ = std::move(slice_dev);
-    complement_bytes_ = bytes;
-    complement_offsets_ = std::move(offsets);
-    ++places_gen_;
-    complement_pinned_ = (pinned_ok || partial_pin > 0) && bytes > 0;
-    complement_pin_limit_ = pinned_ok ? bytes : partial_pin;
-    complement_partial_ = !pinned_ok && partial_pin > 0;
+    complement_pinned_ = partial_pin > 0 && bytes > 0;
+    complement_pin_limit_ = partial_pin;
+    complement_partial_ = partial_pin > 0;
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
-    complement_lent_slots_ = lend ? n_slots - keep_from : 0;
-    spare_free_.clear();
-    {
-        uint64_t at = spare_at;
-        for (const auto& [b, n] : spare_sizes)
-            for (int64_t i = 0; i < n; ++i, at += b) spare_free_.emplace_back(at, b);
-        if (!spare_sizes.empty())
-            basalt::log::info("basalt", "FileExpertSource: %lld free places for the adaptive swaps (%zu blob sizes, %.0f MiB)",
-                         (long long) spare_free_.size(), spare_sizes.size(), (double) (at - spare_at) / 1048576.0);
+}
+
+uint64_t FileExpertSource::pin_pending() const {
+    const PendingComplement& pc = pending_complement_;
+    return pc.pin_after_reads && pc.register_arena && !complement_allocation_.allocation_pinned()
+               ? complement_allocation_.capacity() : 0;
+}
+
+void FileExpertSource::release_complement() {
+    if (complement_arena_ == nullptr) return;
+    if (complement_allocation_.allocation_pinned()) complement_allocation_.reset();
+    else if (pending_complement_.pinned_ok) (void) cudaFreeHost(complement_arena_);
+    else {
+        if (complement_pin_limit_ > 0) {   // registered after the reads
+            if (complement_slice_at_.empty()) (void) cudaHostUnregister(complement_arena_);
+            else for (uint64_t off : complement_slice_at_) (void) cudaHostUnregister((uint8_t*) complement_arena_ + off);
+        }
+        if (complement_locked_ > 0) basalt::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+        if (complement_allocation_.data()) complement_allocation_.reset();
+        else basalt::platform::free_aligned(complement_arena_);
     }
-    complement_ready_ = true;
+    complement_arena_ = nullptr;
+    complement_host_ = nullptr;
+    complement_ready_ = false;
+}
+
+bool FileExpertSource::finish_complement(bool unbuffered, std::string& err) {
+    err.clear();
+    const PendingComplement& pc = pending_complement_;
+    const std::string& note = pc.note;
+    const bool pin = pc.pin;
+    const bool lend = pc.lend;
+    const int64_t n_slots = pc.n_slots, lend_from_slot = pc.lend_from_slot;
+    if (!unbuffered) basalt::platform::advise_dontneed(fd_, file_off_, mapped_bytes_);
+    basalt::log::info("basalt", "FileExpertSource: cache complement: allocation %.1f s, registration %.1f s, %.2f GB read in "
+                 "the start's pass (%s)", pc.alloc_s, pc.reg_s, (double) pc.read_bytes / 1e9, unbuffered ? "unbuffered" : "buffered");
     // The GPU cache's experts are not in the complement: refilling a lent slot reads them through the view again.
     basalt::platform::ram_guard_reclaim_view(base_, mapped_bytes_);
     basalt::log::info("basalt", "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
                  (double) resident_bytes() / 1073741824.0, (double) pinned_bytes() / 1073741824.0,
-                 std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_t0).count(),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - pc.pin_t0).count(),
                  note.empty() ? "" : "; ", note.c_str());
     if (lend)
         basalt::log::info("basalt", "FileExpertSource: %lld of the prompt path's %lld lendable slots keep their experts in RAM "
                              "too%s", (long long) complement_lent_slots_, (long long) (n_slots - lend_from_slot),
                      complement_lent_slots_ < n_slots - lend_from_slot
                          ? " (the others are read from the file when lent: not enough RAM for them)" : "");
-    if (!additional_gpu_pairs.empty()) {
+    if (pc.additional_gpu > 0) {
         basalt::log::info("basalt", "FileExpertSource: %zu experts held only by another GPU are not kept here (read from the "
                              "file when needed)",
-                     additional_gpu_pairs.size());
+                     pc.additional_gpu);
     }
     return true;
 }
@@ -1227,21 +1116,21 @@ uint64_t FileExpertSource::top_up(const std::vector<std::pair<int32_t, int32_t>>
         if (arena == nullptr) return 0;
         if (pin) locked = basalt::platform::lock_resident(arena, total).locked_bytes;
     }
-    RamLoad load;
-    load.fd = fd_;
-    load.unbuffered = false;
-    load.threads = (int) std::min<size_t>(6, pick.size());
-    load.groups.resize(pick.size());
+    LoadPlan top_plan;
+    const int top_file = fd_ >= 0 ? top_plan.file_fd(fd_) : top_plan.file(path_);
     for (size_t k = 0; k < pick.size(); ++k) {
-        const uint64_t b = layer_blob_bytes_[(size_t) pick[k].first];
-        add_ram_blob(load.groups[k], (uint8_t*) arena + (size_t) at[k], 0, b, pick[k].second, 0);
+        LoadItem it;
+        it.file = top_file;
+        it.off = file_off_ + layer_offsets_[(size_t) pick[k].first] +
+                 (uint64_t) pick[k].second * layer_blob_bytes_[(size_t) pick[k].first];
+        it.bytes = layer_blob_bytes_[(size_t) pick[k].first];
+        it.host = (uint8_t*) arena + (size_t) at[k];
+        it.count = 0;
+        top_plan.add(it);
     }
-    load.fallback = [&](int64_t k, const RamRun& r, uint64_t, std::string&) {
-        return copy_from_files(pick[(size_t) k].first, r.first, r.dst);
-    };
-    RamLoadStats read;
+    Loader top_loader;
     std::string read_err;
-    if (!read_ram_runs(load, read, read_err)) {
+    if (!top_loader.run(top_plan, read_err)) {
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
             if (locked > 0) basalt::platform::unlock_resident(arena, locked);
@@ -1777,35 +1666,27 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
         err = "ArenaExpertSource: cannot open " + path;
         return false;
     }
-    constexpr uint64_t kChunk = 8ull << 20;
-    LoadProgress progress("ram", want);
-    RamLoad load;
-    load.fd = fd;
-    load.unbuffered = false;
-    load.threads = std::max(threads, 1);
-    load.chunk = kChunk;
-    load.progress = &progress;
-    load.groups.resize((size_t) n_layers);
-    for (size_t l = 0; l < (size_t) n_layers; ++l)
-        for (uint64_t pos = 0; pos < lbytes[l]; pos += kChunk) {
-            RamRun r;
-            r.dst = a->data() + (size_t) (loff[l] + pos);
-            r.file_pos = files_in.experts.offset + loff[l] + pos;
-            r.bytes = std::min(kChunk, lbytes[l] - pos);
-            r.progress = r.bytes;
-            load.groups[l].push_back(r);
-        }
-    RamLoadStats st;
+    LoadPlan arena_plan;
+    const int arena_file = arena_plan.file_fd(fd);
+    for (size_t l = 0; l < (size_t) n_layers; ++l) {
+        LoadItem it;
+        it.file = arena_file;
+        it.off = files_in.experts.offset + loff[l];
+        it.bytes = lbytes[l];
+        it.host = a->data() + (size_t) loff[l];
+        arena_plan.add(it);
+    }
+    Loader arena_loader(std::max(threads, 1));
+    const auto arena_t0 = std::chrono::steady_clock::now();
     std::string read_err;
-    const bool read_ok = read_ram_runs(load, st, read_err);
+    const bool read_ok = arena_loader.run(arena_plan, read_err);
+    const double arena_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - arena_t0).count();
     basalt::platform::close_fd(fd);
-    basalt::log::info("basalt generate", "expert arena read through the file cache (buffered)");
     if (!read_ok) {
         delete a;
         err = "ArenaExpertSource: the expert load was refused: " + read_err;
         return false;
     }
-    progress.finish();
     arena_ = a;
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;
@@ -1828,7 +1709,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
     n_expert_ = n_expert;
     reads_ = 0;
     note_ = a->note;
-    gib_per_s_ = st.seconds > 0 ? (double) st.copied / 1073741824.0 / st.seconds : 0.0;
+    gib_per_s_ = arena_s > 0 ? (double) want / 1073741824.0 / arena_s : 0.0;
     return true;
 }
 

@@ -35,8 +35,10 @@ struct GpuSpec {
 /// Parses "", "auto" or "A,B,..."; false with `err` naming what is wrong.
 bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err);
 
-/// Whether Basalt runs on the card: compute capability 12.0, or unknown (nothing to check against).
-bool gpu_supported(const GpuCard& c);
+/// Whether the card can be the main card: compute capability 12.0, or unknown (nothing to check against).
+bool gpu_main_supported(const GpuCard& c);
+/// Whether the card can be a second card: as the main card, or 8.9 in a build with -DPEER_ADA=ON.
+bool gpu_peer_supported(const GpuCard& c);
 
 /// "GPU 1 (RTX 5060 Ti)": the visible number the user types, and the name when known.
 std::string gpu_label(const std::vector<GpuCard>& visible, int index);
@@ -54,19 +56,19 @@ struct GpuChoice {
 GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, bool known = true);
 
 /// What a chosen card does.
-enum class GpuRole { Main, ExpertTier, PromptLine, LayerStage, Idle };
+enum class GpuRole { Main, ExpertTier, PromptSplit, LayerStage, Idle };
 const char* gpu_role_name(GpuRole r);
 
 /// The inputs of the role decision: the chosen cards, main first, and what this platform and engine can run.
 struct RoleInputs {
     std::vector<GpuCard> cards;
     int max_expert_tiers = 1;       ///< how many cards the engine can run as expert tiers
-    bool prompt_line = false;       ///< the model puts its one helper card on long prompts (a dense model), not on experts
+    bool prompt_split = false;       ///< the model puts its one helper card on long prompts (a dense model), not on experts
     bool layer_stage = false;       ///< such a model does not fit its main card: the helper card runs its later layers
 };
 
 /// The role of each card, in order: the cards after the main one are expert tiers, as many as the engine runs, and idle
-/// otherwise (PromptLine in place of ExpertTier when `prompt_line`, LayerStage when `layer_stage` too). How a model with
+/// otherwise (PromptSplit in place of ExpertTier when `prompt_split`, LayerStage when `layer_stage` too). How a model with
 /// experts spreads over its tier cards (expert tier or layer split) is priced at its load (multi_gpu_plan.hpp).
 std::vector<GpuRole> choose_roles(const RoleInputs& in);
 
@@ -80,6 +82,10 @@ struct TierRoom {
 /// fewest so far for its bandwidth among those it still fits, so the hot experts split by bandwidth and every tier
 /// fills. A tier closes at the first expert that no longer fits it. Returns each expert's tier, -1 when none takes it.
 std::vector<int> spread_experts(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers);
+
+/// The tiers, ascending, that spread_experts gives at least one expert. A tier left out has nothing to hold (no expert
+/// outside the main card, or no room for one) and takes no part in the expert tier.
+std::vector<size_t> tiers_holding(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers);
 
 /// The visible cards: CUDA_VISIBLE_DEVICES when set (integers read as nvidia-smi numbers), else every card the NVIDIA
 /// management library lists, with what that library says about each. `known` false: neither was available.
@@ -96,7 +102,8 @@ std::string gpu_identity(size_t n);
 /// would run (0: no model given); `lossy` the flags given that change the model's output, comma separated.
 std::string gpu_plan_json(const std::vector<GpuCard>& visible, const GpuChoice& c, const std::string& arch = {},
                           const std::string& quality_flags = {}, int quality_window = 1, int spec = 0, int64_t max_context = 0,
-                          const std::string& model_name = {}, const std::string& lossy = {});
+                          const std::string& model_name = {}, const std::string& lossy = {},
+                          const std::string& community_kv = {});
 
 /// For a launcher (basalt-bench, basalt-probe): resolves `text` ("" = unset), prints its lines under `label`, narrows
 /// the environment the engine inherits, and returns the engine's `gpu` value in `engine_value` and the chosen cards in

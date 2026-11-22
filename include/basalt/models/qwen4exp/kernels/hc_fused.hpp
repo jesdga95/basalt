@@ -65,7 +65,7 @@ struct HcFusedArgs {
     /// pub_ctr[2] once mixed is complete.  Null: no counts.
     unsigned* pub_ctr = nullptr;
     /// 8-bit copies of w_down / w_up / w_inject (int8, one f16 scale per 32 consecutive values of a row); null: found
-    /// from the copies hc8_prepare / hc8_upload registered for the bf16 matrices (every read needs them).
+    /// from the copies hc8_prepare / hc8_register registered for the bf16 matrices (every read needs them).
     const int8_t* q_down = nullptr;
     const uint16_t* s_down = nullptr;   ///< f16 [hc_lr][hc * n_embd / 32]
     const int8_t* q_up = nullptr;
@@ -82,14 +82,15 @@ bool hc_fused_q8_rows_ok();
 /// The arrivals a read adds to HcFusedArgs::pub_ctr[0] (its router items').
 unsigned hc_fused_pub_arrivals();
 /// Quantize the bf16 matrix w [rows][cols] (cols a multiple of 32) to an 8-bit copy on the current device, once per
-/// pointer, outside any stream capture.  The engine loads the model file's copies (hc8_upload); this quantizer is the
+/// pointer, outside any stream capture.  The engine loads the model file's copies (hc8_register); this quantizer is the
 /// tests' and the reference tools/convert/hc8.py matches bit for bit.  A row's scales start every (cols / 32 rounded up to 8) f16; the copy and its
 /// scales are one allocation (one prefetch range).
 void hc8_prepare(const uint16_t* w, int rows, int cols);
-/// Registers a copy made elsewhere (a hc8 table): `q` [rows][cols] int8 and the f16 scales [rows][srow] (the layout
-/// hc8_prepare makes), uploaded to the current device.  Keyed by the bf16 matrix `w` like hc8_prepare, or, with
-/// w == nullptr, by the copy itself like hc8_adopt (the key is returned).  nullptr: no VRAM, or a bad shape.
-const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, int rows, int cols);
+/// Registers a copy made elsewhere (a hc8 table) on the current device: its memory for the [rows][cols] int8 codes
+/// (`*q`) and the f16 scales [rows][srow] (`*s`, the layout hc8_prepare makes), which the caller fills.  Keyed by the
+/// bf16 matrix `w` like hc8_prepare, or, with w == nullptr, by the copy itself like hc8_adopt (the key is returned).
+/// nullptr: no VRAM, or a bad shape; `*q` null with a key: `w` has its copy already.
+const void* hc8_register(const uint16_t* w, int rows, int cols, int8_t** q, uint16_t** s);
 /// The 8-bit copy of w (q, its scales, the bytes of both), or false when there is none.
 bool hc8_lookup(const void* w, const int8_t** q, const uint16_t** s, size_t* bytes = nullptr);
 /// Bytes held by the 8-bit copies.

@@ -10,10 +10,13 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
+#include "basalt/model/route_flags.hpp"
 #include "models/deepseek41/context_policy.hpp"
 #include "models/deepseek41/dspark.hpp"
 #include "models/deepseek41/meta.hpp"
 #include "models/deepseek41/model.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -21,6 +24,8 @@
 
 namespace basalt::models::deepseek41 {
 namespace {
+
+constexpr float kRoutePriorBare = 0.1f;   // --route-prior alone: on the biased score, which runs about 0.5 to 3
 
 class Adapter final : public model::ModelAdapter {
 public:
@@ -36,28 +41,7 @@ public:
         return {key + ".prof", key + "-dspark.prof"};
     }
 
-    model::Result load(const model::LoadRequest& req, std::unique_ptr<model::LoadedModel>& out) const override {
-        if (req.paths.empty()) return {model::Status::Error, "deepseek41: no model path"};
-        auto m = std::make_unique<DsModel>();
-        std::string err;
-        if (!m->load(req.paths.front(), err)) return {model::Status::Error, "deepseek41: " + err};
-        CacheFormat fmt = CacheFormat::Fp8;
-        if (!req.kv.empty() && !ctxp::cache_format(req.kv, fmt)) return {model::Status::Error, "deepseek41: --kv " + req.kv + ": fp8 or fp16"};
-        m->set_cache_format(fmt);
-        if (!m->resolve_context(req.max_context, err)) return {model::Status::Error, err};
-        m->set_diag_dump(req.diag_dump);
-        m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
-        m->set_tiers(req);
-        std::vector<int> peers = req.peer_devices;
-        if (peers.size() > (size_t) kMaxSecondCards) {
-            basalt::log::warn("basalt deepseek41", "%zu second cards given, %d hold experts; later cards idle", peers.size(),
-                              kMaxSecondCards);
-            peers.resize((size_t) kMaxSecondCards);
-        }
-        m->set_peer_devices(std::move(peers));
-        out = std::move(m);
-        return {};
-    }
+    std::unique_ptr<model::LoadedModel> make_model() const override { return std::make_unique<DsModel>(); }
 
     std::vector<model::SideTableSpec> side_tables(const model::ModelDesc&) const override {
         // the Engram table; its row geometry comes from the pack's meta.engram
@@ -88,14 +72,14 @@ public:
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
 
     /// Second cards that hold experts, each a contiguous block of layers.
-    static constexpr int kMaxSecondCards = 4;
     int max_expert_cards() const override { return kMaxSecondCards; }
 
     const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
+    const char* community_kv() const override { return "fp8"; }
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
-        (void) code;
-        if (a == "--no-prompt-skip") o.no_prompt_skip = true;
+        if (model::parse_route_flag(a, args, o.route, code)) {}
+        else if (a == "--no-prompt-skip") o.no_prompt_skip = true;
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
         else if (a == "--kv") o.kv = args.next("--kv");
@@ -135,8 +119,13 @@ public:
             basalt::log::warn("basalt deepseek41", "--spec %d off: the pack has no dspark/gguf section", o.spec);
             o.spec = 0;
         }
-        if (!opened || !file.load_meta(err)) return std::nullopt;
-        const core::Json* kv = file.meta().get("gguf_kv");
+        const bool meta = opened && file.load_meta(err);
+        const core::Json* kv = meta ? file.meta().get("gguf_kv") : nullptr;
+        const core::Json* geo = meta ? file.meta().get("geometry") : nullptr;
+        const core::Json* used = geo ? geo->get("expert_used_count") : nullptr;
+        if (const std::optional<int> c = model::finish_route_flags(o, used ? (int) used->num() : 0, kRoutePriorBare, "basalt deepseek41"))
+            return c;
+        if (!meta) return std::nullopt;
         const core::Json* native = kv ? kv->get("deepseek41.context_length") : nullptr;
         const ctxp::Plan p = ctxp::plan_context(o.max_context, native ? (int64_t) native->u64() : 0, UINT64_MAX, {}, fmt);
         if (p.error.empty()) return std::nullopt;

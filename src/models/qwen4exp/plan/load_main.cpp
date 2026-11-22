@@ -4,9 +4,10 @@
 // load is to measure a smaller one first and project - and because pinning 34 GB evicts every page of page
 // cache on the machine, which is not something a test should do while other work is running.
 #include "basalt/core/pinned.hpp"
-#include "basalt/core/ram_load.hpp"
+#include "basalt/core/loader.hpp"
 #include "basalt/platform/file.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,7 +18,6 @@ int main(int argc, char** argv) {
     std::string path;
     uint64_t layers = 2;
     int threads = 8;
-    uint64_t chunk = 16ull << 20;
     uint64_t blob_bytes = 1382400;      // one expert blob
     uint64_t blobs_per_layer = 512;
     bool pin = true;
@@ -32,11 +32,10 @@ int main(int argc, char** argv) {
         if (a == "--file") path = val();
         else if (a == "--layers") layers = std::strtoull(val(), nullptr, 10);
         else if (a == "--threads") threads = std::atoi(val());
-        else if (a == "--chunk-mb") chunk = std::strtoull(val(), nullptr, 10) << 20;
         else if (a == "--no-pin") pin = false;
         else if (a == "--stream") stream = true;
         else if (a == "--help" || a == "-h") {
-            std::printf("usage: basalt-load --file experts.bin [--layers N] [--threads N] [--chunk-mb N]\n"
+            std::printf("usage: basalt-load --file experts.bin [--layers N] [--threads N]\n"
                         "                   [--no-pin]\n");
             return 0;
         } else {
@@ -65,39 +64,30 @@ int main(int argc, char** argv) {
         std::printf("backing: malloc, NOT pinned (--no-pin)\n");
     }
 
-    const int fd = basalt::platform::open_fd_utf8(path);
-    if (fd < 0) { basalt::log::error("basalt", "cannot open %s", path.c_str()); return 1; }
+    basalt::core::LoadPlan plan;
+    const int file = plan.file(path);
     const uint64_t layer_bytes = blobs_per_layer * blob_bytes;
-    basalt::core::LoadProgress progress("ram", bytes);
-    basalt::core::RamLoad load;
-    load.fd = fd;
-    load.unbuffered = false;
-    load.threads = threads;
-    load.chunk = chunk;
-    load.progress = &progress;
-    load.groups.resize((size_t) layers);
-    for (uint64_t l = 0; l < layers; ++l)
-        for (uint64_t pos = 0; pos < layer_bytes; pos += chunk) {
-            basalt::core::RamRun r;
-            r.dst = dst + (size_t) (l * layer_bytes + pos);
-            r.file_pos = l * layer_bytes + pos;
-            r.bytes = layer_bytes - pos < chunk ? layer_bytes - pos : chunk;
-            r.progress = r.bytes;
-            load.groups[(size_t) l].push_back(r);
-        }
-    basalt::core::RamLoadStats st;
+    for (uint64_t l = 0; l < layers; ++l) {
+        basalt::core::LoadItem it;
+        it.file = file;
+        it.off = l * layer_bytes;
+        it.bytes = layer_bytes;
+        it.host = dst + (size_t) (l * layer_bytes);
+        plan.add(it);
+    }
+    basalt::core::Loader loader(threads);
     std::string err;
-    if (!basalt::core::read_ram_runs(load, st, err)) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!loader.run(plan, err)) {
         basalt::log::error("basalt", "loading the experts failed: %s", err.c_str());
         return 1;
     }
-    progress.finish();
-    basalt::platform::close_fd(fd);
-    const double gib_per_s = st.seconds > 0 ? (double) st.copied / (1024.0 * 1024 * 1024) / st.seconds : 0.0;
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double gib_per_s = seconds > 0 ? (double) bytes / (1024.0 * 1024 * 1024) / seconds : 0.0;
 
     std::printf("loaded %.3f GiB in %.3f s with %d threads and %llu MiB chunks  ->  %.2f GiB/s\n",
-                (double) st.copied / (1024.0 * 1024 * 1024), st.seconds, threads,
-                (unsigned long long) (chunk >> 20), gib_per_s);
+                (double) bytes / (1024.0 * 1024 * 1024), seconds, threads,
+                (unsigned long long) (basalt::core::Loader::kChunk >> 20), gib_per_s);
     std::printf("per-layer checksums (FNV-1a 64):\n");
     for (uint64_t i = 0; i < layers && i < 4; ++i) {
         std::printf("  layer %llu  %016llx\n", (unsigned long long) i,

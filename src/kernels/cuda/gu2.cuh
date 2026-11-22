@@ -438,7 +438,7 @@ native_gu2_kernel(const unsigned long long* __restrict__ grp_ptr,
                   NativeExpertLayout L,
                   float* __restrict__ gate,
                   float* __restrict__ up) {
-    asm volatile("griddepcontrol.launch_dependents;");   // the down kernel may start (it waits for this grid)
+    pdl_launch_dependents();   // the down kernel may start (it waits for this grid; a no-op on a build below sm_90)
     const int ng = *n_groups;
     if ((int) blockIdx.y >= ng) return;
     __shared__ alignas(16) uint32_t s_grid_buf[gu2::Fmt2<TG>::kGridWords];
@@ -466,7 +466,7 @@ __host__ __device__ inline bool gu2_usable(const NativeExpertLayout& L, int kc =
 // letting the next one launch as soon as all its blocks have started: a down block prefetches its weight rows into
 // L2 before it waits for the SwiGLU pass, so the down weights stream while the gate/up rows are still being read.
 // Before its wait a kernel reads only the plan (written before the gate/up kernel) and the weights.
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;"); }
+__device__ __forceinline__ void pdl_trigger() { pdl_launch_dependents(); }   // a no-op on a build below sm_90
 
 __device__ __forceinline__ void prefetch_l2(const uint8_t* p, int bytes, int tid) {
     for (int o = tid * 128; o < bytes; o += 256 * 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(p + o));
