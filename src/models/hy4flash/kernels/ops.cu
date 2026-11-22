@@ -172,7 +172,7 @@ __global__ void engram_kernel(const float* __restrict__ kv, const float* __restr
     ssx = block_sum<kEngramThreads>(ssx, red);
     ssk = block_sum<kEngramThreads>(ssk, red);
     ssv = block_sum<kEngramThreads>(ssv, red);
-    const float rx = rsqrtf(ssx / (float) n + a.gate_eps), rk = rsqrtf(ssk / (float) n + a.gate_eps), rv = rsqrtf(ssv / (float) n + a.eps);
+    const float rx = rsqrtf(ssx / (float) n + a.eps), rk = rsqrtf(ssk / (float) n + a.eps), rv = rsqrtf(ssv / (float) n + a.eps);
     float dot = 0.f;
     for (int j = threadIdx.x; j < n; j += kEngramThreads)
         dot = fmaf((xi[j] * rx) * ((key[j] + kb[j]) * rk), gate_w[(size_t) i * n + j], dot);

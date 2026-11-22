@@ -189,9 +189,7 @@ void fill_streams(const float* e, int n, int n_tok, float* x, void* stream);
 
 struct EngramArgs {
     int n_embd = 3072;
-    float eps = 1.1920929e-07f;      ///< of the value's norm
-    float gate_eps = 0.0078125f;    ///< of the gate's two norms (the stream and the key): bf16's machine epsilon, which the reference's
-                                    ///< unset RMSNorm eps resolves to in bf16
+    float eps = 1.1920929e-07f;   ///< of the gate's two norms (the stream and the key) and the value's: FP32's machine epsilon
 };
 
 /// The Engram step on the four streams x[t][4][n] of n_tok rows, in place. kv: the fused projection [t][5][n] (four keys, one value)
