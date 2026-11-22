@@ -5,6 +5,7 @@ Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quali
 ## Summary
 
 - **Against the reference:** over 100 WikiText-2 chunks, FP16 scores mean KLD 0.00310 and INT8 0.00344, with 97.78% and 97.79% top-1 agreement respectively ([below](#against-the-reference)).
+- **At 256k context:** FP8 saves 4.25 GiB and INT8 saves 3.74 GiB of total VRAM versus FP16 with the same expert placement ([measurements](#vram-at-256k-context)).
 - **The reference is not a true BF16 model.** No BF16 checkpoint exists: the release ships its routed experts in NVFP4 and
   MXFP8. The base is the official release with its experts dequantized to BF16, so its KLD is not comparable with the other
   models' true-BF16 KLDs.
@@ -74,6 +75,27 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | 20 chunks (the earlier quick gate) | 0.00264 | 97.80% | 7.6642 (base 7.6534) |
 
 The FP16 and FP8 quality runs were on an RTX 5090 at 400 W. INT8's 100-chunk quality run and the decode comparison were at 475 W, with the whole model on the card. The fixed-seed ABBA decode comparison (one cold repetition per process) averaged 5.20 / 7.61 / 4.75 ms per window and 192.3 / 131.4 / 210.7 passes/s for INT8 (conv / struct / prose), versus 5.43 / 7.61 / 4.77 ms and 184.3 / 131.4 / 209.6 passes/s for FP16. Completion lengths and draft acceptance varied, so tok/s is not a clean comparison.
+
+A second fixed-context comparison isolates FP8 from FP16: RTX 5090 at 475 W, `--max-context 32768`, `--spec 5`, one cold `conv` fixture per process, fixed seed 1, and `--expert-cache 3072` (3,070 expert slots on the GPU and 2 in RAM for every run). The order was FP16–FP8–FP8–FP16. The prompt and context capacity were identical; cache formats produced different completions, so window time and passes/s are the comparable decode measures.
+
+| KV format | Mean ms/window | Mean passes/s | Mean tok/s | Output tokens |
+| --- | ---: | ---: | ---: | ---: |
+| FP16 | 5.406 | 185.0 | 384.6 | 1,158 |
+| FP8 | 5.524 | 181.1 | 415.5 | 1,200 |
+
+FP8 averaged 2.2% more time per decode window (2.1% fewer passes/s). Its higher tok/s reflects the longer completion: FP16 stopped at 1,158 tokens while FP8 reached the 1,200-token limit. The two FP16 runs measured 5.409 and 5.403 ms/window; FP8 measured 5.615 and 5.433, so the within-format spread is visible in the table's two-run means.
+
+## VRAM at 256k context
+
+Measured after `READY 262144`, before any prompt was submitted, on the same RTX 5090 and model. `--expert-cache 3072` pinned placement to 3,070 GPU expert slots plus 2 in RAM; the cache allocation reserves the full context capacity at startup. `nvidia-smi` idle use was 1,895 MiB, and each format was measured in a fresh process.
+
+| KV format | Total VRAM used | Above idle | Saved vs FP16 |
+| --- | ---: | ---: | ---: |
+| FP16 | 30,192 MiB (29.48 GiB) | 28,297 MiB | — |
+| FP8 | 25,840 MiB (25.23 GiB) | 23,945 MiB | 4,352 MiB (4.25 GiB) |
+| INT8 | 26,366 MiB (25.75 GiB) | 24,471 MiB | 3,826 MiB (3.74 GiB) |
+
+At the same context capacity and expert placement, FP8 used 4.25 GiB less total VRAM than FP16; INT8 used 3.74 GiB less. FP8 used 526 MiB less than INT8 for this model's compressed attention cache.
 
 The INT8 row writer parity test matched the CPU reference for all 257 rows of width 128. Dequantized max absolute error was 0.00559 (FP16 rounding: 0.000485); max relative error for values with |x| >= 0.01 was 0.332 (FP16: 0.000487). Its microbench took 2.81 µs for 4,096 rows at 957 GB/s.
 
