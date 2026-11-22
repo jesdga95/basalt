@@ -39,7 +39,7 @@ BF16 instead of Q8_0 scored 0.00218 for 1.2 GB more reads a token; it was not ta
 
 | Stage | Format | Arithmetic |
 | --- | --- | --- |
-| Routed experts | NVFP4, Q8_0 | decode: q8_1 activations, fp32 sums; prompt chunks: NVFP4 layers on the FP4 block-scaled tensor cores, each activation row as two FP4 terms under one per-row scale (its rounding and the rounding of what that leaves, about 8 bits), fp32 accumulation; Q8_0 layers MMQ (int8 mma); each matrix's FP32 scale applied after |
+| Routed experts | NVFP4, Q8_0 | decode: q8_1 activations, fp32 sums; experts in RAM on the CPU: Q8_0 activations, fp32 sums, the card's softcapped SwiGLU (the sigmoid on the raw gate); prompt chunks: NVFP4 layers on the FP4 block-scaled tensor cores, each activation row as two FP4 terms under one per-row scale (its rounding and the rounding of what that leaves, about 8 bits), fp32 accumulation; Q8_0 layers MMQ (int8 mma); each matrix's FP32 scale applied after |
 | Q8_0 projections, head | Q8_0 | q8_1 activations (decode); MMQ (prompt); fp32 logits, softcap 30 |
 | Router | F32 | fp32 sigmoid, top 8 |
 | Attention-residual mixes, controllers, norms | F32, BF16 weights | fp32 |
@@ -69,8 +69,11 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | --- | ---: | ---: | ---: |
 | 100 chunks, `--kv fp16` | 0.00305 | 97.76% | 7.0695 (base 7.0633 over the scored rows) |
 | 20 chunks (the quick gate) | 0.00264 | 97.80% | 7.6642 (base 7.6534) |
+| 90 chunks, RTX 5060 Ti alone, 1,047 experts in RAM on the CPU | 0.00298 | 97.70% | |
+| the same 90 chunks, the whole model on the card | 0.00304 | 97.76% | |
 
-RTX 5090 at 400 W, the whole model on the card.
+RTX 5090 at 400 W, the whole model on the card, unless the row says otherwise. On the 5060 Ti the CPU computes the experts in
+RAM (a Ryzen 9 9950X, AVX-512).
 
 ## Drafting
 
