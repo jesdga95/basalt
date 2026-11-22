@@ -456,7 +456,11 @@ bool QfnRuntime::park_one(int b, std::string& e) {
             }
             image.checkpoints = std::move(cks);
             bytes = image.bytes();
-            conversations->put_slot(std::move(image), bs.size());
+            if (!conversations->put_slot(std::move(image), bs.size())) {   // the mirrored refusal: an idle image
+                basalt::log::warn("basalt serve", "%s's idle conversation stays in VRAM: it is larger than the "
+                                  "whole RAM cache", who.c_str());          // over the whole budget parks nowhere
+                return false;
+            }
             for (auto& sc : conversations->take_spilled())
                 if (!disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec)) disk.put(std::move(sc), kDiskQueueCap);
         } catch (const std::bad_alloc&) {
@@ -507,6 +511,7 @@ int QfnRuntime::init_conversations() {
     conversations.emplace(
         o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
         (size_t) o.conversation_cache_slots);
+    conversations->set_slot_pin(o.conversation_cache_slot_pin);
 
     disk_floor = 0;                              // the RAM a capture or a read leaves free (set below)
 
