@@ -8,6 +8,7 @@ from 0 to 0.99 and writes it in a system message; it adds no generation prompt, 
 from __future__ import annotations
 
 import json
+import re
 
 from serve import frontend
 from serve.frontend import Event, ToolCall
@@ -27,6 +28,7 @@ OWN_TOKENS = ("<|endoftext|>", "<|message_user|>", HEADER, "<|message_system|>",
               END_TURN, THINK, END, TOOL_ERROR, "<|content_xml|>", "<|begin_of_text|>", TOOL_JSON, TOOL_TEXT, IMAGE_PAD)
 MARK0 = 0xF2400                         # the marks of the dialect's own tokens while a message is rendered
 MAX_EFFORT = 0.99
+_NAME = re.compile(r'"name"\s*:\s*("(?:[^"\\]|\\.)*")')
 
 
 class Inkling2Parser:
@@ -41,16 +43,24 @@ class Inkling2Parser:
         self.head = ""                  # the call's `{"name":...,"args":` prefix, once read
         self.raw = ""                   # the call's JSON so far
         self.streamed = 0               # characters of its arguments already streamed
+        self.started = False            # its "tool_start" sent (a bare call waits for the name in its JSON)
 
     # ------------------------------------------------------------------ a block's text
     def _text(self, out: list, kind: str) -> bool:
         end = self.buf.find(END)
+        # the model opened the next block (or wrote a call's JSON marker) without closing this one: it ends here
+        cut = min((i for i in (self.buf.find(HEADER), self.buf.find(TOOL_JSON)) if i >= 0), default=-1)
+        if cut >= 0 and (end < 0 or cut < end):
+            if cut:
+                out.append(Event(kind, self.buf[:cut]))
+            self.buf, self.state = self.buf[cut:], "between"
+            return True
         if end >= 0:
             if end:
                 out.append(Event(kind, self.buf[:end]))
             self.buf, self.state = self.buf[end + len(END):], "between"
             return True
-        keep = frontend.hold_back(self.buf, (END,))
+        keep = frontend.hold_back(self.buf, (END, HEADER, TOOL_JSON))
         if len(self.buf) > keep:
             out.append(Event(kind, self.buf[:len(self.buf) - keep]))
             self.buf = self.buf[len(self.buf) - keep:]
@@ -59,12 +69,16 @@ class Inkling2Parser:
     def _between(self, out: list) -> bool:
         if not self.buf:
             return False
+        if self.buf.startswith(TOOL_JSON):     # a call with no header and no name: the name is in its JSON
+            self._open_call(out, "")
+            self.buf = self.buf[len(TOOL_JSON):]
+            return True
         if not self.buf.startswith(HEADER):
-            if HEADER.startswith(self.buf):
-                return False            # a header still arriving
-            stray = self.buf.find(HEADER)
+            if HEADER.startswith(self.buf) or TOOL_JSON.startswith(self.buf):
+                return False            # a header or a call marker still arriving
+            stray = min((i for i in (self.buf.find(HEADER), self.buf.find(TOOL_JSON)) if i >= 0), default=-1)
             text = self.buf if stray < 0 else self.buf[:stray]
-            keep = 0 if stray >= 0 else frontend.hold_back(text, (HEADER,))
+            keep = 0 if stray >= 0 else frontend.hold_back(text, (HEADER, TOOL_JSON))
             if len(text) > keep:        # text outside a block: shown as it is
                 out.append(Event("content", text[:len(text) - keep]))
             self.buf = self.buf[len(text) - keep:]
@@ -94,11 +108,29 @@ class Inkling2Parser:
                 self.buf, self.state = self.buf[end + len(END):], "between"
                 return True
             return False
-        self.call = ToolCall(name=self.buf[:at].strip(), arguments={})
-        self.buf, self.state, self.head, self.raw, self.streamed = self.buf[at + len(TOOL_JSON):], "call", "", "", 0
-        if self.stream_tools:
-            out.append(Event("tool_start", call=self.call))
+        self._open_call(out, self.buf[:at].strip())
+        self.buf = self.buf[at + len(TOOL_JSON):]
         return True
+
+    def _open_call(self, out: list, name: str) -> None:
+        self.call = ToolCall(name=name, arguments={})
+        self.state, self.head, self.raw, self.streamed, self.started = "call", "", "", 0, False
+        self._start(out)
+
+    def _start(self, out: list) -> None:
+        """Sends "tool_start" once the call has a name: its header's, or the JSON's for a bare call."""
+        if self.started or not self.stream_tools:
+            return
+        if not self.call.name:
+            m = _NAME.search(self.raw)
+            if not m:
+                return
+            try:
+                self.call.name = json.loads(m.group(1))
+            except ValueError:
+                return
+        self.started = True
+        out.append(Event("tool_start", call=self.call))
 
     def _args_text(self) -> str | None:
         """The arguments' JSON text read so far, once the `{"name":...,"args":` prefix has passed."""
@@ -115,8 +147,9 @@ class Inkling2Parser:
         take = self.buf[:end] if end >= 0 else self.buf[:len(self.buf) - keep]
         self.raw += take
         self.buf = self.buf[end + len(END):] if end >= 0 else self.buf[len(self.buf) - keep:]
+        self._start(out)
         args = self._args_text()
-        if args is not None and self.stream_tools:
+        if args is not None and self.stream_tools and self.started:
             # the last character may be the call object's own closing brace: streamed once the block ends
             upto = len(args) if end >= 0 else max(self.streamed, len(args) - 1)
             if end >= 0 and args.rstrip().endswith("}"):
@@ -139,8 +172,23 @@ class Inkling2Parser:
             args, name = {}, self.call.name
         if not isinstance(args, dict):
             args = {}
+        if not (name or self.call.name):        # a bare call whose JSON names nothing: its text, not a call
+            out.append(Event("content", TOOL_JSON + self.raw))
+            self.call = None
+            return
         out.append(Event("tool_call", call=ToolCall(name=name or self.call.name, arguments=args, id=self.call.id)))
         self.call = None
+
+    def _whole(self) -> str | None:
+        """The call's name when its JSON parses whole (a name and an object of arguments), else None."""
+        try:
+            obj = json.loads(self.raw)
+        except ValueError:
+            return None
+        if not isinstance(obj, dict) or not isinstance(obj.get("args", {}), dict):
+            return None
+        name = obj.get("name") if isinstance(obj.get("name"), str) else self.call.name if self.call else ""
+        return name or None
 
     # ------------------------------------------------------------------ interface
     def feed(self, delta: str) -> list[Event]:
@@ -163,10 +211,20 @@ class Inkling2Parser:
         was only the start of a marker is text."""
         out: list[Event] = []
         if self.state == "call":
-            if self.stream_tools and self.call is not None:
+            whole = self._whole()
+            if whole and self.stream_tools and not self.started:
+                self.call.name = self.call.name or whole
+                self._start(out)
+            if self.stream_tools and self.call is not None and self.started:
                 args = self._args_text()
-                if args is not None and len(args) > self.streamed:
-                    out.append(Event("tool_args", args[self.streamed:], call=self.call))
+                if args is not None:
+                    upto = len(args)
+                    if whole and args.rstrip().endswith("}"):     # the call object's own closing brace, as in _call
+                        upto = len(args.rstrip()) - 1
+                    if upto > self.streamed:
+                        out.append(Event("tool_args", args[self.streamed:upto], call=self.call))
+            if whole:                   # the JSON is whole, only the block's end is missing: still a call
+                self._end_call(out)
             self.call = None
         elif self.state == "name":
             if self.buf.strip():

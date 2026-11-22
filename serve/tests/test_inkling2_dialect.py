@@ -142,6 +142,41 @@ class Parse(unittest.TestCase):
         reply = HEADER + "search" + TOOL_JSON + '{"name":"search","args":{"q":"o'
         self.assertFalse([e for e in parse(reply) if e.kind == "tool_call"])
 
+    def test_a_bare_call_is_a_call(self):
+        # the model writes the call's marker with no header and no name: the name comes from its JSON (#540)
+        body = TOOL_JSON + '{"name":"edit_file","args":{"path":"a.py","old_string":"x","new_string":"y"}}'
+        want = ("call", "edit_file", {"path": "a.py", "old_string": "x", "new_string": "y"})
+        for reply in (body + END, body, HEADER + TEXT + "Done." + END + body + END):
+            whole = merged(parse(reply))
+            self.assertEqual(whole[-1], want, reply)
+            for chunk in (1, 2, 5, 11):
+                self.assertEqual(merged(parse(reply, chunk)), whole, (reply, chunk))
+        starts = [e.call.name for e in parse(body + END, 3) if e.kind == "tool_start"]
+        self.assertEqual(starts, ["edit_file"])
+
+    def test_a_header_closes_a_block_left_open(self):
+        call = HEADER + "edit_file" + TOOL_JSON + '{"name":"edit_file","args":{"path":"a"}}' + END
+        for opened in (TEXT + "On it.", THINK + "Edit it."):
+            reply = HEADER + opened + call
+            kind = "content" if opened.startswith(TEXT) else "reasoning"
+            want = [(kind, opened[len(TEXT if kind == "content" else THINK):]), ("args", '{"path":"a"}'),
+                    ("call", "edit_file", {"path": "a"})]
+            self.assertEqual(merged(parse(reply)), want)
+            for chunk in (1, 3, 7):
+                self.assertEqual(merged(parse(reply, chunk)), want, chunk)
+
+    def test_a_whole_call_without_its_end_is_a_call(self):
+        # the streamed argument text is the arguments' JSON alone, without the call object's closing brace
+        for reply in (HEADER + "search" + TOOL_JSON + '{"name":"search","args":{"q":"one"}}',
+                      TOOL_JSON + '{"name":"search","args":{"q":"one"}}'):
+            for chunk in (None, 1, 4):
+                self.assertEqual(merged(parse(reply, chunk))[-2:], [("args", '{"q":"one"}'), ("call", "search", {"q": "one"})],
+                                 (reply, chunk))
+
+    def test_a_bare_marker_with_no_name_is_text(self):
+        reply = TOOL_JSON + '{"args":{"q":"one"}}' + END
+        self.assertFalse([e for e in parse(reply) if e.kind == "tool_call"])
+
     def test_the_reply_ends_the_turn(self):
         svc = service(HEADER + TEXT + "done" + END)
         self.assertEqual(svc.dialect.stop_texts, (END_TURN,))
