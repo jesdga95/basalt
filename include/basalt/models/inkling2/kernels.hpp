@@ -131,7 +131,7 @@ size_t attention_decode_scratch(int rows, int64_t max_keys);
 void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream);
 
 /// out[r] = attn[r] * sigmoid(yq[r][kOffGate..]), the attention output gated by its own row's gate projection.
-void attn_gate(const float* attn, const float* yq, int rows, float* out, void* stream);
+void attn_gate(const float* attn, const float* yq, int rows, float* out, void* stream, int64_t yq_ld = kProjQ);
 
 // ---- the sublayers' output convolutions --------------------------------------------------------------------------------
 

@@ -25,7 +25,8 @@ constexpr int kACodeBytes = kTileTokens * kKTile / 2;   // 4096
 constexpr int kAScaleBytes = kTileTokens * kKTile / 16; // 512
 constexpr int kAStage = kACodeBytes + kAScaleBytes;     // 4608
 constexpr int kBRowBytes = kKTile / 64 * 36;            // 72
-constexpr int kBStage = kRowsPerBlock * kBRowBytes;     // 9216
+constexpr int kBRowStride = 80;                         // 16B-aligned row stride in smem (allows 8B alignment shift, conflict-free)
+constexpr int kBStage = kRowsPerBlock * kBRowStride;    // 10240
 constexpr int kBlockTiles = 2;                          // 64-token tiles per GEMM block
 // TWO: a stage holds both activation terms of its 128 columns and the weights once, three stages (99 KB a block at most)
 template <int TM> __host__ __device__ constexpr int stages() { return TM == 1 ? kStages : 3; }
@@ -270,6 +271,78 @@ __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __re
 
 // ----------------------------------------------------------------------------------------------- GEMM
 
+// Single-pass fp16 -> two-term FP4 quantizer for small NBL (e.g. cols = 1152 -> NBL = 3): loads each 16-value sub-block
+// once as two uint4s (32 B) into registers, finds row amax, then quantizes both FP4 terms without re-reading global memory.
+template <int NBL>
+__global__ void quantize_f16_kernel(const uint16_t* __restrict__ x, const int32_t* __restrict__ bounds,
+                                    const int32_t* __restrict__ tile_off, int n, uint8_t* __restrict__ a4,
+                                    float* __restrict__ gs, int cols, int64_t ld, int64_t rows) {
+    const int lane = threadIdx.x & 31;
+    const int64_t r = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (r >= rows) return;
+    int lo = 0, hi = n;
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) >> 1;
+        if (bounds[mid] <= r) lo = mid; else hi = mid;
+    }
+    const int64_t pos = (int64_t) tile_off[lo] * kTileTokens + (r - bounds[lo]);
+    const int64_t tile = pos / kTileTokens;
+    const int rr = (int) (pos % kTileTokens);
+    const int nkt = cols / kKTile * 2, nb = cols / 16;
+    const uint16_t* xr = x + r * ld;
+
+    float xv[NBL][16];
+    float bm[NBL];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NBL; ++i) {
+        const int b = lane + 32 * i;
+        float m = 0.0f;
+        if (b < nb) {
+            const uint4* p = (const uint4*) (xr + 16 * b);
+            const uint4 u0 = p[0], u1 = p[1];
+            const uint32_t words[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const float2 fv = __half22float2(*reinterpret_cast<const __half2*>(&words[q]));
+                xv[i][2 * q] = fv.x;
+                xv[i][2 * q + 1] = fv.y;
+                m = fmaxf(m, fmaxf(fabsf(fv.x), fabsf(fv.y)));
+            }
+        }
+        bm[i] = m;
+        amax = fmaxf(amax, m);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float g = amax * (1.0f / (6.0f * 448.0f));
+    if (lane == 0) gs[pos] = g;
+    const float inv_g = amax > 0.0f ? 1.0f / g : 0.0f;
+    uint8_t* tbase = a4 + tile * ((int64_t) nkt * kAStage);
+#pragma unroll
+    for (int i = 0; i < NBL; ++i) {
+        const int b = lane + 32 * i;
+        if (b >= nb) continue;
+        const __nv_fp8_storage_t sb = __nv_cvt_float_to_fp8(bm[i] * inv_g * (1.0f / 6.0f), __NV_SATFINITE, __NV_E4M3);
+        const float sd = __half2float(__half(__nv_cvt_fp8_to_halfraw(sb, __NV_E4M3)));
+        const float inv = sd > 0.0f ? 1.0f / (sd * g) : 0.0f;
+        uint32_t w[2] = {0, 0};
+        e2m1_block(xv[i], inv, w);
+        const float m2 = e2m1_residual(xv[i], w, sd * g);
+        const __nv_fp8_storage_t sb2 = __nv_cvt_float_to_fp8(m2 * inv_g * (1.0f / 6.0f), __NV_SATFINITE, __NV_E4M3);
+        const float sd2 = __half2float(__half(__nv_cvt_fp8_to_halfraw(sb2, __NV_E4M3)));
+        uint32_t w2[2];
+        e2m1_block(xv[i], sd2 > 0.0f ? 1.0f / (sd2 * g) : 0.0f, w2);
+        const int lb = (b % 8) * 8;
+        uint8_t* k1 = tbase + (int64_t) (2 * (b / 8)) * kAStage;
+        uint8_t* k2 = k1 + kAStage;
+        *(uint2*) (k1 + rr * 64 + swz(rr, lb)) = make_uint2(w[0], w[1]);
+        k1[kACodeBytes + rr * 8 + (b % 8)] = (uint8_t) sb;
+        *(uint2*) (k2 + rr * 64 + swz(rr, lb)) = make_uint2(w2[0], w2[1]);
+        k2[kACodeBytes + rr * 8 + (b % 8)] = (uint8_t) sb2;
+    }
+}
+
 struct GemmArgs {
     const uint8_t* blob[kMaxExperts];
     size_t w_off;
@@ -281,6 +354,7 @@ struct GemmArgs {
     const int32_t* tile_off;
     const int32_t* ids;       // GATHER: row -> token
     float* dst;
+    uint16_t* dst_f16;
     int64_t ld_dst;
     size_t tail_off;          // SWIGLU: the blob's {s_gate, s_up, s_down, -}
     const uint8_t* base;      // FLAT: expert j's blob at base + j * stride, its blocks from blk_off
@@ -352,10 +426,31 @@ __device__ __forceinline__ void load_stage(int stage, int kt, uint8_t* smem, con
             }
         }
     }
-    for (int i = threadIdx.x; i < kRowsPerBlock * (kBRowBytes / 8); i += kThreads) {
-        const int row = i / (kBRowBytes / 8), c = i % (kBRowBytes / 8);
-        cp_async8(bs + row * kBRowBytes + 8 * c,
-                  w_src + (size_t) b_row<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes + 8 * c);
+    // 256 threads cover 128 B rows (2 threads per row): 4x cp_async16 (.cg) + 1x cp_async8, shifted by 8B in smem when src is 8 mod 16
+    {
+        const int row = (int) threadIdx.x >> 1, part = (int) threadIdx.x & 1;
+        const uint8_t* src = w_src + (size_t) b_row<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes;
+        const int odd = (int) (((uintptr_t) src >> 3) & 1u);
+        uint8_t* dst = bs + row * kBRowStride;
+        if (!odd) {
+            if (part == 0) {
+                cp_async16(dst + 0, src + 0);
+                cp_async16(dst + 16, src + 16);
+                cp_async16(dst + 32, src + 32);
+            } else {
+                cp_async16(dst + 48, src + 48);
+                cp_async8(dst + 64, src + 64);
+            }
+        } else {
+            if (part == 0) {
+                cp_async8(dst + 8, src + 0);
+                cp_async16(dst + 16, src + 8);
+                cp_async16(dst + 32, src + 24);
+            } else {
+                cp_async16(dst + 48, src + 40);
+                cp_async16(dst + 64, src + 56);
+            }
+        }
     }
 }
 
@@ -449,7 +544,9 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
             unsigned b0[4], b1[4], sb[4];
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const uint8_t* p = bs + (b_tile_row<SWIGLU>(warp_n, r) + group) * kBRowBytes + s * 36;
+                const int sr = b_tile_row<SWIGLU>(warp_n, r) + group;
+                const int odd = (int) (((uintptr_t) (w_src + (size_t) b_row<SWIGLU>(rb, sr, a.half) * row_bytes + (size_t) kt * kBRowBytes) >> 3) & 1u);
+                const uint8_t* p = bs + sr * kBRowStride + (odd << 3) + s * 36;
                 b0[r] = *(const uint32_t*) (p + 4 + 4 * tig);
                 b1[r] = *(const uint32_t*) (p + 20 + 4 * tig);
                 // scale bytes: bit 7 ignored, 0x7F (NaN in hardware) as 0
@@ -517,6 +614,218 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
         }
 }
 
+// 256 weight rows x 128 tokens (2 tiles), 2 activation terms, 2 pipeline stages (76 KiB smem): halves activation
+// loads across N-blocks and doubles MMA density per stage (8 warps, each 64 tokens x 64 rows = 4x8 MMA tiles).
+constexpr int kRows256 = 256;
+constexpr int kBStage256 = kRows256 * kBRowStride;                 // 20480
+constexpr int kSmem256 = 2 * (2 * kBlockTiles * kAStage + kBStage256); // 77824
+
+template <bool SWIGLU> __device__ __forceinline__ int64_t b_row256(int rb, int sr, int half) {
+    if (!SWIGLU) return (int64_t) rb * kRows256 + sr;
+    return sr < 128 ? (int64_t) rb * 128 + sr : (int64_t) half + rb * 128 + (sr - 128);
+}
+template <bool SWIGLU> __device__ __forceinline__ int b_tile_row256(int warp_n, int r) {
+    if (!SWIGLU) return warp_n * 64 + r * 8;
+    return r < 4 ? warp_n * 32 + r * 8 : 128 + warp_n * 32 + (r - 4) * 8;
+}
+
+template <bool GATHER, bool SWIGLU>
+__device__ __forceinline__ void load_stage256(int stage, int kt, uint8_t* smem, const uint8_t* a_src, size_t tile_stride,
+                                              int ntiles, const uint8_t* const* a_code, const int* a_dst,
+                                              const uint8_t* a_scale, int s_dst, const uint8_t* w_src, size_t row_bytes,
+                                              int rb, int half) {
+    uint8_t* as0 = smem + stage * 2 * kBlockTiles * kAStage;
+    uint8_t* bs = smem + 2 * 2 * kBlockTiles * kAStage + stage * kBStage256;
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+        uint8_t* as = as0 + u * kBlockTiles * kAStage;
+        const int ka = 2 * kt + u;
+        if (GATHER) {
+#pragma unroll
+            for (int i = 0; i < kBlockTiles * kTileTokens * 4 / kThreads; ++i)
+                if (i < ntiles) cp_async16(as + a_dst[i], a_code[i] + (size_t) ka * 64);
+            if ((int) threadIdx.x < ntiles * kTileTokens) cp_async8(as + s_dst, a_scale + (size_t) ka * 8);
+        } else {
+            for (int i = threadIdx.x; i < ntiles * (kAStage / 16); i += kThreads) {
+                const int t = i / (kAStage / 16), c = i % (kAStage / 16);
+                cp_async16(as + t * kAStage + 16 * c, a_src + t * tile_stride + (size_t) ka * kAStage + 16 * c);
+            }
+        }
+    }
+    // 256 threads cover 256 B rows: exactly 1 row per thread (4x cp_async16 .cg + 1x cp_async8)
+    const int row = (int) threadIdx.x;
+    const uint8_t* src = w_src + (size_t) b_row256<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes;
+    const int odd = (int) (((uintptr_t) src >> 3) & 1u);
+    uint8_t* dst = bs + row * kBRowStride;
+    if (!odd) {
+        cp_async16(dst + 0, src + 0);
+        cp_async16(dst + 16, src + 16);
+        cp_async16(dst + 32, src + 32);
+        cp_async16(dst + 48, src + 48);
+        cp_async8(dst + 64, src + 64);
+    } else {
+        cp_async8(dst + 8, src + 0);
+        cp_async16(dst + 16, src + 8);
+        cp_async16(dst + 32, src + 24);
+        cp_async16(dst + 48, src + 40);
+        cp_async16(dst + 64, src + 56);
+    }
+}
+
+template <bool GATHER, bool SWIGLU>
+__global__ __launch_bounds__(kThreads, 1) void gemm_kernel_256(const GemmArgs a) {
+    extern __shared__ __align__(1024) uint8_t smem[];
+    __shared__ int32_t tok_s[kBlockTiles * kTileTokens];
+    const int rb = blockIdx.x, y = blockIdx.y;
+    if (y >= a.blk_off[a.n]) return;
+    int lo = 0, hi = a.n;
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) >> 1;
+        if (a.blk_off[mid] <= y) lo = mid; else hi = mid;
+    }
+    const int j = lo, tp = y - a.blk_off[lo];
+    const int cnt = a.bounds[j + 1] - a.bounds[j];
+    const int first = tp * kBlockTiles * kTileTokens;
+    if (first >= cnt) return;
+    const int ntiles = first + kTileTokens < cnt ? 2 : 1;
+    const int nkt = a.w_cols / kKTile;
+    const size_t row_bytes = (size_t) (a.w_cols / 64) * 36;
+    const size_t tile_stride = (size_t) 2 * nkt * kAStage;
+    const uint8_t* blob = a.base + (size_t) j * a.stride;
+    const uint8_t* w_src = blob + a.w_off;
+    const int64_t tile0 = GATHER ? 0 : a.tile_off[j] + kBlockTiles * tp;
+    const uint8_t* a_src = GATHER ? nullptr : a.a4 + tile0 * (int64_t) tile_stride;
+    const int64_t brow0 = a.bounds[j] + first;
+    const uint8_t* a_code[kBlockTiles * kTileTokens * 4 / kThreads] = {};
+    int a_dst[kBlockTiles * kTileTokens * 4 / kThreads] = {};
+    const uint8_t* a_scale = nullptr;
+    int s_dst = 0;
+    if (GATHER) {
+        if (threadIdx.x < kBlockTiles * kTileTokens)
+            tok_s[threadIdx.x] = a.ids[brow0 + (first + (int) threadIdx.x < cnt ? (int) threadIdx.x : 0)];
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < kBlockTiles * kTileTokens * 4 / kThreads; ++i) {
+            const int c = (int) threadIdx.x + i * kThreads, r = c >> 2, q = c & 3, rr = r % kTileTokens;
+            a_code[i] = a.a4 + (size_t) tok_s[r] * (size_t) (2 * a.w_cols / 2) + 16 * q;
+            a_dst[i] = (r / kTileTokens) * kAStage + rr * 64 + ((q ^ ((rr >> 1) & 3)) << 4);
+        }
+        if (threadIdx.x < kBlockTiles * kTileTokens) {
+            const int r = threadIdx.x;
+            a_scale = a.a4s + (size_t) tok_s[r] * (size_t) (2 * a.w_cols / 16);
+            s_dst = (r / kTileTokens) * kAStage + kACodeBytes + (r % kTileTokens) * 8;
+        }
+    }
+
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int warp_m = warp >> 2, warp_n = warp & 3;
+    const bool live = warp_m < ntiles;
+    const int group = lane >> 2, tig = lane & 3;
+    const int a_row = (lane & 7) + (((lane >> 3) & 1) << 3);
+    const int a_col = (lane >> 4) * 16;
+    const int sfa_row = ((lane & 1) << 3) | (lane >> 2);
+
+    float acc[4][8][4] = {};
+    load_stage256<GATHER, SWIGLU>(0, 0, smem, a_src, tile_stride, ntiles, a_code, a_dst, a_scale, s_dst, w_src, row_bytes, rb,
+                                  a.half);
+    cp_commit();
+    for (int kt = 0; kt < nkt; ++kt) {
+        const bool has_next = kt + 1 < nkt;
+        if (has_next) {
+            load_stage256<GATHER, SWIGLU>((kt + 1) & 1, kt + 1, smem, a_src, tile_stride, ntiles, a_code, a_dst, a_scale, s_dst,
+                                          w_src, row_bytes, rb, a.half);
+            cp_commit();
+            cp_wait<1>();
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();
+        if (live) {
+            const int stage = kt & 1;
+            const uint8_t* as0 = smem + stage * 2 * kBlockTiles * kAStage + warp_m * kAStage;
+            const uint8_t* bs = smem + 2 * 2 * kBlockTiles * kAStage + stage * kBStage256;
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                unsigned b0[8], b1[8], sb[8];
+                const int w_odd = (int) ((((uintptr_t) w_src >> 3) ^ (uintptr_t) kt) & 1u);
+                const int rb_odd = (int) ((row_bytes >> 3) & 1u);
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    const int sr = b_tile_row256<SWIGLU>(warp_n, r) + group;
+                    const int odd = w_odd ^ (rb_odd & (int) b_row256<SWIGLU>(rb, sr, a.half));
+                    const uint8_t* p = bs + sr * kBRowStride + (odd << 3) + s * 36;
+                    b0[r] = *(const uint32_t*) (p + 4 + 4 * tig);
+                    b1[r] = *(const uint32_t*) (p + 20 + 4 * tig);
+                    unsigned v = *(const uint32_t*) p & 0x7f7f7f7fu;
+                    sb[r] = v & ~__vcmpeq4(v, 0x7f7f7f7fu);
+                }
+#pragma unroll
+                for (int u = 0; u < 2; ++u) {
+                    const uint8_t* as = as0 + u * kBlockTiles * kAStage;
+                    unsigned af[4][4], asc[4];
+#pragma unroll
+                    for (int mt = 0; mt < 4; ++mt) {
+                        const int row = mt * 16 + a_row;
+                        ldmatrix_x4(af[mt][0], af[mt][1], af[mt][2], af[mt][3],
+                                    smem_addr(as + row * 64 + swz(row, s * 32 + a_col)));
+                        asc[mt] = *(const uint32_t*) (as + kACodeBytes + (mt * 16 + sfa_row) * 8 + 4 * s);
+                    }
+#pragma unroll
+                    for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+                        for (int r = 0; r < 8; ++r) mma_fp4(acc[mt][r], af[mt], b0[r], b1[r], asc[mt], sb[r]);
+                }
+            }
+        }
+        if (has_next) __syncthreads();
+    }
+    if (!live) return;
+
+    const int tl = kBlockTiles * tp + warp_m;
+    const int64_t tile = tile0 + warp_m;
+    const int64_t row0 = a.bounds[j] + (int64_t) tl * kTileTokens;
+    float4 tail = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (SWIGLU) tail = *(const float4*) (blob + a.tail_off);
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int t = mt * 16 + group + 8 * h;
+            if (tl * kTileTokens + t >= cnt) continue;
+            const float g = GATHER ? a.gs[tok_s[warp_m * kTileTokens + t]] : a.gs[tile * kTileTokens + t];
+            if (SWIGLU && a.dst_f16) {
+                uint16_t* out = a.dst_f16 + (row0 + t) * a.ld_dst + rb * 128 + warp_n * 32 + 2 * tig;
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    const __half2 h2 = __floats2half2_rn(
+                        swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 4][2 * h] * g, tail, a.cg, a.cu),
+                        swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 4][2 * h + 1] * g, tail, a.cg, a.cu));
+                    *reinterpret_cast<uint32_t*>(out + 8 * r) = *reinterpret_cast<const uint32_t*>(&h2);
+                }
+            } else if (SWIGLU) {
+                float* out = a.dst + (row0 + t) * a.ld_dst + rb * 128 + warp_n * 32 + 2 * tig;
+#pragma unroll
+                for (int r = 0; r < 4; ++r)
+                    *(float2*) (out + 8 * r) =
+                        make_float2(swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 4][2 * h] * g, tail, a.cg, a.cu),
+                                    swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 4][2 * h + 1] * g, tail, a.cg, a.cu));
+            } else if (a.dst_f16) {
+                const int64_t orow = a.dst_ids ? a.dst_ids[row0 + t] : row0 + t;
+                uint16_t* out = a.dst_f16 + orow * a.ld_dst + rb * kRows256 + warp_n * 64 + 2 * tig;
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    const __half2 h2 = __floats2half2_rn(acc[mt][r][2 * h] * g, acc[mt][r][2 * h + 1] * g);
+                    *reinterpret_cast<uint32_t*>(out + 8 * r) = *reinterpret_cast<const uint32_t*>(&h2);
+                }
+            } else {
+                const int64_t orow = a.dst_ids ? a.dst_ids[row0 + t] : row0 + t;
+                float* out = a.dst + orow * a.ld_dst + rb * kRows256 + warp_n * 64 + 2 * tig;
+#pragma unroll
+                for (int r = 0; r < 8; ++r) *(float2*) (out + 8 * r) = make_float2(acc[mt][r][2 * h] * g, acc[mt][r][2 * h + 1] * g);
+            }
+        }
+}
+
 __global__ void tails_kernel(GemmArgs a, size_t off, int n, float* dst) {
     const int j = threadIdx.x;
     if (j < n) ((float4*) dst)[j] = *(const float4*) (a.blob[j] + off);
@@ -563,6 +872,16 @@ void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const i
     ck(cudaGetLastError(), "quantize");
 }
 
+void quantize_f16(const uint16_t* x, const int32_t* bounds, const int32_t* tile_off, int n, void* a4,
+                  float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+    if (rows <= 0) return;
+    const unsigned grid = (unsigned) ((rows + 7) / 8);
+    const cudaStream_t s = (cudaStream_t) stream;
+    if (cols == 1152) quantize_f16_kernel<3><<<grid, 256, 0, s>>>(x, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
+    else { basalt::log::error("basalt", "prefill fp4: %lld fp16 columns", (long long) cols); std::exit(1); }
+    ck(cudaGetLastError(), "quantize_f16");
+}
+
 size_t token_bytes(int64_t tokens, int64_t cols) { return (size_t) tokens * (size_t) (cols / 2 + cols / 16); }
 
 void quantize_tokens(const float* x, int64_t tokens, int64_t cols, int64_t ld, void* a4, float* gs, void* stream,
@@ -600,6 +919,18 @@ template <bool GATHER, bool SWIGLU, bool FLAT = false, bool TWO = false> void la
     gemm_kernel<GATHER, SWIGLU, FLAT, TWO><<<grid, kThreads, smem_bytes<TWO ? 2 : 1>(), s>>>(a);
     ck(cudaGetLastError(), "gemm");
 }
+template <bool GATHER, bool SWIGLU> void launch256(const GemmArgs& a, dim3 grid, cudaStream_t s) {
+    static std::atomic<bool> configured[64];
+    int dev = 0;
+    ck(cudaGetDevice(&dev), "device");
+    if (dev < 0 || dev >= 64) ck(cudaErrorInvalidDevice, "device range");
+    if (!configured[dev].load(std::memory_order_acquire)) {
+        ck(cudaFuncSetAttribute(gemm_kernel_256<GATHER, SWIGLU>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem256), "smem");
+        configured[dev].store(true, std::memory_order_release);
+    }
+    gemm_kernel_256<GATHER, SWIGLU><<<grid, kThreads, kSmem256, s>>>(a);
+    ck(cudaGetLastError(), "gemm256");
+}
 
 void run(const Product& p, void* stream) {
     if (p.base) {   // a layer's experts in one launch
@@ -610,15 +941,21 @@ void run(const Product& p, void* stream) {
         }
         GemmArgs a{};
         a.w_off = p.w_off; a.w_cols = (int) p.w_cols; a.half = (int) (p.w_rows / 2); a.a4 = (const uint8_t*) p.a4;
-        a.gs = p.gs; a.bounds = p.bounds; a.tile_off = p.tile_off; a.ids = p.ids; a.dst = p.dst; a.ld_dst = p.ld_dst;
+        a.gs = p.gs; a.bounds = p.bounds; a.tile_off = p.tile_off; a.ids = p.ids; a.dst = p.dst; a.dst_f16 = p.dst_f16; a.ld_dst = p.ld_dst;
         a.tail_off = p.tail_off;
         a.a4s = p.ids ? (const uint8_t*) p.a4 + (size_t) p.tokens * (size_t) ((p.two ? 2 : 1) * p.w_cols / 2) : nullptr;
         a.base = p.base; a.stride = p.stride; a.blk_off = p.blk_off; a.n = p.n; a.dst_ids = p.dst_ids;
         a.cg = p.gate_softcap; a.cu = p.up_softcap;
         const dim3 grid((unsigned) (p.w_rows / kRowsPerBlock), (unsigned) p.blocks, 1);
         if (p.two) {
-            if (p.swiglu) launch<true, true, true, true>(a, grid, (cudaStream_t) stream);
-            else launch<false, false, true, true>(a, grid, (cudaStream_t) stream);
+            if (p.w_rows % kRows256 == 0) {
+                const dim3 grid256((unsigned) (p.w_rows / kRows256), (unsigned) p.blocks, 1);
+                if (p.swiglu) launch256<true, true>(a, grid256, (cudaStream_t) stream);
+                else launch256<false, false>(a, grid256, (cudaStream_t) stream);
+            } else {
+                if (p.swiglu) launch<true, true, true, true>(a, grid, (cudaStream_t) stream);
+                else launch<false, false, true, true>(a, grid, (cudaStream_t) stream);
+            }
         } else if (p.swiglu) launch<true, true, true>(a, grid, (cudaStream_t) stream);
         else launch<false, false, true>(a, grid, (cudaStream_t) stream);
         return;
