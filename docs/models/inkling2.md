@@ -5,7 +5,7 @@ supports next to the others: [models](index.md). Rounding and quality: [precisio
 
 ## Pack
 
-One file, `Inkling-2-Mini-NVFP4-q8.basalt` (19.7 GB), built from the official release with its vision encoder and DSpark
+One file, `Inkling-2-Mini-NVFP4-DQ8.basalt` (19.7 GB), built from the official release with its vision encoder and DSpark
 drafter:
 
 - Routed experts, layers 0 to 19: the release's NVFP4 codes and scales, bit for bit (14.7 GiB for all 24 layers).
