@@ -199,21 +199,29 @@ __device__ __forceinline__ float tau_of(int p, float floor_, float alpha) {
     return 1.f + alpha * logf(fmaxf((float) (p + 1) / floor_, 1.f));
 }
 
-// The convolution input of channel c at position pos[r] - j: a row of the window, the ring, or zero before position 0.
-__device__ __forceinline__ float conv_in(const float* __restrict__ y, int ld, int off, const float* __restrict__ ring,
-                                         int ring_w, const int32_t* __restrict__ pos, int r, int j, int c) {
-    if (r - j >= 0) return y[(size_t) (r - j) * ld + off + c];
+// Four contiguous convolution input channels c..c+3 at position pos[r] - j: window row, ring, or zero before 0.
+__device__ __forceinline__ float4 conv_in4(const float* __restrict__ y, int ld, const float* __restrict__ ring,
+                                           int ring_w, const int32_t* __restrict__ pos, int r, int j, int c) {
+    if (r - j >= 0) return *reinterpret_cast<const float4*>(y + (size_t) (r - j) * ld + c);
     const int p = pos[r] - j;
-    if (p < 0) return 0.f;
-    return ring[(size_t) (p % kConvRing) * ring_w + c];
+    if (p < 0) return make_float4(0.f, 0.f, 0.f, 0.f);
+    return *reinterpret_cast<const float4*>(ring + (size_t) (p % kConvRing) * ring_w + c);
 }
 
-__device__ __forceinline__ void store_kv(void* cache, bool fp8, size_t idx, float v) {
+__device__ __forceinline__ void store_kv4(void* cache, bool fp8, size_t idx, float v0, float v1, float v2, float v3) {
     if (fp8) {
-        __nv_fp8_e4m3 q(v);
-        static_cast<uint8_t*>(cache)[idx] = *reinterpret_cast<uint8_t*>(&q);
+        __nv_fp8_e4m3 q0(v0), q1(v1), q2(v2), q3(v3);
+        const uint32_t packed = (uint32_t) *reinterpret_cast<uint8_t*>(&q0) |
+                                ((uint32_t) *reinterpret_cast<uint8_t*>(&q1) << 8) |
+                                ((uint32_t) *reinterpret_cast<uint8_t*>(&q2) << 16) |
+                                ((uint32_t) *reinterpret_cast<uint8_t*>(&q3) << 24);
+        *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(cache) + idx) = packed;
     } else {
-        static_cast<__half*>(cache)[idx] = __float2half_rn(v);
+        const __half2 h0 = __floats2half2_rn(v0, v1), h1 = __floats2half2_rn(v2, v3);
+        uint2 u;
+        u.x = *reinterpret_cast<const uint32_t*>(&h0);
+        u.y = *reinterpret_cast<const uint32_t*>(&h1);
+        *reinterpret_cast<uint2*>(static_cast<__half*>(cache) + idx) = u;
     }
 }
 
@@ -233,43 +241,54 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         const float* y = yall + (size_t) r * ld;
         const float* taps = which ? a.v_conv : a.k_conv;
         const float* ring = which ? a.v_ring : a.k_ring;
-        float val[4], ss = 0.f;
-#pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            const int c = w * kHeadDim + lane * 4 + u;
-            float acc = 0.f, x0 = 0.f;
-#pragma unroll
-            for (int j = 0; j < kConv; ++j) {
-                const float x = conv_in(yall, (int) ld, 0, ring, kKvHeads * kHeadDim, a.pos, r, j, c);
-                if (j == 0) x0 = x;
-                float t = taps[c * kConv + (kConv - 1 - j)];
-                if (a.full) t += y[kOffTaps + w * kConv + j];
-                acc = fmaf(t, x, acc);
-            }
-            val[u] = (acc + x0) * inv_k;
-            ss = fmaf(val[u], val[u], ss);
-        }
+        const int c0 = w * kHeadDim + lane * 4;
+        const float4 tp0 = *reinterpret_cast<const float4*>(taps + (c0 + 0) * kConv);
+        const float4 tp1 = *reinterpret_cast<const float4*>(taps + (c0 + 1) * kConv);
+        const float4 tp2 = *reinterpret_cast<const float4*>(taps + (c0 + 2) * kConv);
+        const float4 tp3 = *reinterpret_cast<const float4*>(taps + (c0 + 3) * kConv);
+        const float4 dt = a.full ? *reinterpret_cast<const float4*>(y + kOffTaps + w * kConv)
+                                 : make_float4(0.f, 0.f, 0.f, 0.f);
+        const float4 x0 = conv_in4(yall, (int) ld, ring, kKvHeads * kHeadDim, a.pos, r, 0, c0);
+        const float4 x1 = conv_in4(yall, (int) ld, ring, kKvHeads * kHeadDim, a.pos, r, 1, c0);
+        const float4 x2 = conv_in4(yall, (int) ld, ring, kKvHeads * kHeadDim, a.pos, r, 2, c0);
+        const float4 x3 = conv_in4(yall, (int) ld, ring, kKvHeads * kHeadDim, a.pos, r, 3, c0);
+        auto eval = [&](const float4& tp, float a0, float a1, float a2, float a3) {
+            float acc = 0.f;
+            acc = fmaf(a.full ? tp.w + dt.x : tp.w, a0, acc);
+            acc = fmaf(a.full ? tp.z + dt.y : tp.z, a1, acc);
+            acc = fmaf(a.full ? tp.y + dt.z : tp.y, a2, acc);
+            acc = fmaf(a.full ? tp.x + dt.w : tp.x, a3, acc);
+            return (acc + a0) * inv_k;
+        };
+        const float val0 = eval(tp0, x0.x, x1.x, x2.x, x3.x);
+        const float val1 = eval(tp1, x0.y, x1.y, x2.y, x3.y);
+        const float val2 = eval(tp2, x0.z, x1.z, x2.z, x3.z);
+        const float val3 = eval(tp3, x0.w, x1.w, x2.w, x3.w);
+        float ss = fmaf(val0, val0, 0.f);
+        ss = fmaf(val1, val1, ss);
+        ss = fmaf(val2, val2, ss);
+        ss = fmaf(val3, val3, ss);
         ss = warp_sum(ss);
         const float f = which == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
         const int64_t cell = p % a.cap;
         void* cache = which ? a.v_cache : a.k_cache;
-#pragma unroll
-        for (int u = 0; u < 4; ++u)
-            store_kv(cache, a.fp8, ((size_t) cell * kKvHeads + w) * kHeadDim + lane * 4 + u, val[u] * f);
+        store_kv4(cache, a.fp8, ((size_t) cell * kKvHeads + w) * kHeadDim + lane * 4,
+                  val0 * f, val1 * f, val2 * f, val3 * f);
     }
     // queries: warp w takes heads 3w .. 3w + 2
     for (int h = w * 3; h < w * 3 + 3; ++h) {
-        float q[4], ss = 0.f;
-#pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            const int i = lane * 4 + u;
-            q[u] = yq[kOffQ + h * kHeadDim + i] * a.q_scale[h * kHeadDim + i];
-            ss = fmaf(q[u], q[u], ss);
-        }
+        const int i = lane * 4;
+        const float4 yv = *reinterpret_cast<const float4*>(yq + kOffQ + h * kHeadDim + i);
+        const float4 sv = *reinterpret_cast<const float4*>(a.q_scale + h * kHeadDim + i);
+        const float q0 = yv.x * sv.x, q1 = yv.y * sv.y, q2 = yv.z * sv.z, q3 = yv.w * sv.w;
+        float ss = fmaf(q0, q0, 0.f);
+        ss = fmaf(q1, q1, ss);
+        ss = fmaf(q2, q2, ss);
+        ss = fmaf(q3, q3, ss);
         ss = warp_sum(ss);
         const float f = fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) * tau;
-#pragma unroll
-        for (int u = 0; u < 4; ++u) a.q[((size_t) r * kHeads + h) * kHeadDim + lane * 4 + u] = q[u] * f;
+        *reinterpret_cast<float4*>(a.q + ((size_t) r * kHeads + h) * kHeadDim + i) =
+            make_float4(q0 * f, q1 * f, q2 * f, q3 * f);
         // the relative state: 16 values, lanes 0..15
         const float rv = lane < kRel ? yq[kOffR + h * kRel + lane] * a.r_scale[h * kRel + lane] : 0.f;
         const float rs = warp_sum(rv * rv);
@@ -295,27 +314,74 @@ void ring_store(const float* x, int ld, int off, int width, const int32_t* pos, 
     ring_store_kernel<<<dim3((unsigned) ((width + 255) / 256), (unsigned) n), 256, 0, s>>>(x, ld, off, width, pos, rows, ring);
 }
 
-__global__ void attn_gate_kernel(const float* __restrict__ attn, const float* __restrict__ yq, int n, float* __restrict__ out) {
+__global__ void attn_gate_kernel(const float* __restrict__ attn, const float* __restrict__ yq, int n4, float* __restrict__ out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const int r = i / (kHeads * kHeadDim), c = i - r * kHeads * kHeadDim;
-    out[i] = attn[i] * sigmoidf_(yq[(size_t) r * kProjQ + kOffGate + c]);
+    if (i >= n4) return;
+    constexpr int kOut4 = (kHeads * kHeadDim) / 4;
+    const int r = i / kOut4, c4 = i - r * kOut4;
+    const float4 a = reinterpret_cast<const float4*>(attn)[i];
+    const float4 g = *reinterpret_cast<const float4*>(yq + (size_t) r * kProjQ + kOffGate + c4 * 4);
+    reinterpret_cast<float4*>(out)[i] =
+        make_float4(a.x * sigmoidf_(g.x), a.y * sigmoidf_(g.y), a.z * sigmoidf_(g.z), a.w * sigmoidf_(g.w));
 }
 
-__global__ void post_conv_kernel(const float* __restrict__ x, const int32_t* __restrict__ pos, const float* __restrict__ taps,
-                                 const float* __restrict__ ring, const float* __restrict__ add, int rows, float* __restrict__ out) {
-    const int r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= kWidth) return;
-    float acc = 0.f, x0 = 0.f;
-#pragma unroll
-    for (int j = 0; j < kConv; ++j) {
-        const float v = conv_in(x, kWidth, 0, ring, kWidth, pos, r, j, c);
-        if (j == 0) x0 = v;
-        acc = fmaf(taps[c * kConv + (kConv - 1 - j)], v, acc);
+constexpr int kPostConvThreads = 192;
+constexpr int kPostConvTile = 32;
+static_assert(kWidth % (4 * kPostConvThreads) == 0, "kWidth splits into float4 blocks for post_conv");
+
+__global__ void __launch_bounds__(kPostConvThreads)
+    post_conv_kernel(const float* __restrict__ x, const int32_t* __restrict__ pos, const float* __restrict__ taps,
+                     const float* __restrict__ ring, const float* __restrict__ add, int rows, float* __restrict__ out) {
+    const int c = (blockIdx.x * kPostConvThreads + threadIdx.x) * 4;
+    const int r0 = blockIdx.y * kPostConvTile;
+    const int r1 = min(r0 + kPostConvTile, rows);
+    const float inv = rsqrtf((float) kConv + 1.f);
+    const float4 tp0 = *reinterpret_cast<const float4*>(taps + (c + 0) * kConv);
+    const float4 tp1 = *reinterpret_cast<const float4*>(taps + (c + 1) * kConv);
+    const float4 tp2 = *reinterpret_cast<const float4*>(taps + (c + 2) * kConv);
+    const float4 tp3 = *reinterpret_cast<const float4*>(taps + (c + 3) * kConv);
+
+    auto emit = [&](int r, const float4& v0, const float4& v1, const float4& v2, const float4& v3) {
+        auto one = [&](const float4& tp, float a0, float a1, float a2, float a3) {
+            float acc = 0.f;
+            acc = fmaf(tp.w, a0, acc);
+            acc = fmaf(tp.z, a1, acc);
+            acc = fmaf(tp.y, a2, acc);
+            acc = fmaf(tp.x, a3, acc);
+            return __fmul_rn(acc + a0, inv);
+        };
+        float4 res = make_float4(one(tp0, v0.x, v1.x, v2.x, v3.x), one(tp1, v0.y, v1.y, v2.y, v3.y),
+                                 one(tp2, v0.z, v1.z, v2.z, v3.z), one(tp3, v0.w, v1.w, v2.w, v3.w));
+        const size_t off = (size_t) r * kWidth + c;
+        if (add) {
+            const float4 ad = *reinterpret_cast<const float4*>(add + off);
+            res.x += ad.x;
+            res.y += ad.y;
+            res.z += ad.z;
+            res.w += ad.w;
+        }
+        *reinterpret_cast<float4*>(out + off) = res;
+    };
+
+    int r = r0;
+    for (; r < min(r1, kConv - 1); ++r) {
+        const float4 v0 = conv_in4(x, kWidth, ring, kWidth, pos, r, 0, c);
+        const float4 v1 = conv_in4(x, kWidth, ring, kWidth, pos, r, 1, c);
+        const float4 v2 = conv_in4(x, kWidth, ring, kWidth, pos, r, 2, c);
+        const float4 v3 = conv_in4(x, kWidth, ring, kWidth, pos, r, 3, c);
+        emit(r, v0, v1, v2, v3);
     }
-    const float conv = (acc + x0) * rsqrtf((float) kConv + 1.f);
-    const size_t i = (size_t) r * kWidth + c;
-    out[i] = add ? conv + add[i] : conv;
+    if (r >= r1) return;
+    float4 v1 = *reinterpret_cast<const float4*>(x + (size_t) (r - 1) * kWidth + c);
+    float4 v2 = *reinterpret_cast<const float4*>(x + (size_t) (r - 2) * kWidth + c);
+    float4 v3 = *reinterpret_cast<const float4*>(x + (size_t) (r - 3) * kWidth + c);
+    for (; r < r1; ++r) {
+        const float4 v0 = *reinterpret_cast<const float4*>(x + (size_t) r * kWidth + c);
+        emit(r, v0, v1, v2, v3);
+        v3 = v2;
+        v2 = v1;
+        v1 = v0;
+    }
 }
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
@@ -532,9 +598,9 @@ void attn_prepare(const AttnPrep& a, int rows, void* stream) {
 }
 
 void attn_gate(const float* attn, const float* yq, int rows, float* out, void* stream) {
-    const int n = rows * kHeads * kHeadDim;
-    if (n <= 0) return;
-    attn_gate_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(attn, yq, n, out);
+    const int n4 = rows * (kHeads * kHeadDim / 4);
+    if (n4 <= 0) return;
+    attn_gate_kernel<<<(n4 + 255) / 256, 256, 0, (cudaStream_t) stream>>>(attn, yq, n4, out);
     check("attn_gate");
 }
 
@@ -542,7 +608,8 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
                void* stream) {
     if (rows <= 0) return;
     cudaStream_t s = (cudaStream_t) stream;
-    post_conv_kernel<<<dim3((kWidth + 255) / 256, (unsigned) rows), 256, 0, s>>>(x, pos, taps, ring, add, rows, out);
+    post_conv_kernel<<<dim3(kWidth / (4 * kPostConvThreads), (unsigned) ((rows + kPostConvTile - 1) / kPostConvTile)),
+                       kPostConvThreads, 0, s>>>(x, pos, taps, ring, add, rows, out);
     check("post_conv");
     ring_store(x, kWidth, 0, kWidth, pos, rows, ring, s);
     check("post_conv/ring");
