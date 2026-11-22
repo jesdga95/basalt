@@ -353,6 +353,17 @@ __global__ void __launch_bounds__(kPlanThreads) moe_plan_kernel(const int32_t* _
     }
 }
 
+constexpr int kMergeThreads = 256;
+__global__ void __launch_bounds__(kMergeThreads) moe_cpu_merge_kernel(const int32_t* __restrict__ ids,
+                                                                      const unsigned long long* __restrict__ blobs,
+                                                                      const float* __restrict__ cpu, float* __restrict__ output,
+                                                                      uint32_t* __restrict__ tally) {
+    const int p = blockIdx.x, e = ids[p];
+    if (blobs[e]) return;
+    for (int c = threadIdx.x; c < kWidth; c += kMergeThreads) output[(size_t) p * kWidth + c] = cpu[(size_t) p * kWidth + c];
+    if (threadIdx.x == 0 && tally) atomicAdd(tally + e, 1u);
+}
+
 constexpr int kAheadBlocks = 32;
 constexpr uint64_t kAheadStep = 128 << 10;
 // Block b requests steps b, b + blocks, ... of the blobs' first `bytes` laid end to end, 32 KiB at a time, then reads the
@@ -391,7 +402,7 @@ __global__ void __launch_bounds__(kPrefetchThreads) expert_prefetch_kernel(const
         for (int i = 0; i < n; ++i) {
             bool seen = false;
             for (int j = 0; j < i; ++j) seen |= ids[j] == ids[i];
-            if (!seen) addr[m++] = blobs[ids[i]];
+            if (!seen && blobs[ids[i]]) addr[m++] = blobs[ids[i]];   // 0: in RAM, the CPU's
         }
         nu = m;
     }
@@ -484,6 +495,13 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
     check("post_conv");
     ring_store(x, kWidth, 0, kWidth, pos, rows, ring, s);
     check("post_conv/ring");
+}
+
+void moe_cpu_merge(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* cpu, float* output,
+                   uint32_t* tally, void* stream) {
+    if (rows <= 0) return;
+    moe_cpu_merge_kernel<<<rows * k, kMergeThreads, 0, (cudaStream_t) stream>>>(ids, blobs, cpu, output, tally);
+    check("moe_cpu_merge");
 }
 
 void expert_read_ahead(const unsigned long long* blobs, const int32_t* n, uint64_t bytes, void* stream) {

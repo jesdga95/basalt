@@ -7,8 +7,9 @@
 // partial sum; in the loop's later passes they also take a message read from the previous pass through gated controllers.
 // A row's result does not depend on the other rows of its call: the products take 8 rows at most per launch with the
 // single-row reduction order, the attention and the glue run a block per row (or row and head), the experts per (row,
-// slot) entry. Nothing in a window's forward after its inputs are staged depends on the host: the positions and tokens
-// are read on the card, and the attention's launch bound (a power of two of keys) only sizes its grid.
+// slot) entry. The positions and tokens are read on the card, and the attention's launch bound (a power of two of keys)
+// only sizes its grid. With a spill, the experts in RAM run on the CPU beside the card's (cpu_experts.hpp): the layers that
+// have any are part of a window's shape, and the window's captured graph queues their CPU work too.
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/elastic_array.hpp"
 #include "basalt/core/elastic_kv.hpp"
@@ -25,6 +26,7 @@
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/program/expert_spill.hpp"
 #include "models/inkling2/caches.hpp"
+#include "models/inkling2/cpu_experts.hpp"
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
 #include "models/inkling2/expert_map.hpp"
 #include "models/inkling2/model.hpp"
@@ -39,6 +41,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace basalt::models::inkling2 {
@@ -79,16 +82,18 @@ struct Scratch {
     static constexpr int kGuessRows = 2;        // the widest window guessed (wider ones keep the read-ahead)
 };
 
-// What the sessions of one model share: the forward scratch, the prompt path, the drafter's tap and the batch windows'
-// graphs. Made by the first session; the model keeps a weak reference (InklingModel::shared()).
+// What the sessions of one model share: the forward scratch, the prompt path, the drafter's tap, the CPU experts and the
+// batch windows' graphs. Made by the first session; the model keeps a weak reference (InklingModel::shared()).
 struct Shared {
     Scratch x;
     std::unique_ptr<PromptRunner> prompt;   // PROMPT HOOK
+    std::unique_ptr<CpuExperts> cpu;        // with a spill: the RAM experts' rows
     float* tap = nullptr;                   // DSPARK HOOK: the drafter's features of a call's rows (dspark_tap_bytes)
     model::BatchShared batch;
     std::vector<void*> bufs;
     ~Shared() {
         prompt.reset();
+        cpu.reset();
         for (void* p : bufs) cudaFree(p);
     }
     bool init(InklingModel& m, cudaStream_t stream, std::string& err) {
@@ -144,6 +149,7 @@ struct Shared {
             err = "out of device memory for the sessions' scratch";
             return false;
         }
+        if (!(cpu = CpuExperts::make(m, err)) && !err.empty()) return false;
         prompt = make_prompt(m, stream, err);   // PROMPT HOOK
         return prompt != nullptr || err.empty();
     }
@@ -159,7 +165,7 @@ public:
             if (cudaMemcpy(t.data(), ex_tally_, t.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
                 const CardShare sh = card_share(t, g_.n_expert, [&](int l, int e) { return m_.on_card(l, e); });
                 const uint64_t all = sh.all, card = sh.card;
-                basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu read from RAM",
+                basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu on the CPU",
                                   (unsigned long long) all, all ? 100.0 * (double) card / (double) all : 100.0,
                                   (unsigned long long) (all - card));
             }
@@ -294,6 +300,7 @@ protected:
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
+        key.push_back(cpu_ = cpu_layers());
         return check(err);
     }
     bool batch_forward(const model::BatchView& v, std::string&) override {
@@ -840,12 +847,15 @@ private:
         }
         moe_plan(ids_, rows, g_.n_used, g_.n_expert, w.blob_table, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, stream_,
                  ex_tally_ + (size_t) l * g_.n_expert, rec_blobs_ + (size_t) vi * kAheadExperts, rec_n_ + vi);
+        const bool on_cpu = cpu_ >> l & 1;   // the RAM experts' pairs on the CPU, beside the card's
+        if (on_cpu) sh_->cpu->start(l, rows, nrm, ids_, stream_);
         bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
         L.gate_softcap = g_.gate_softcap;
         L.up_softcap = g_.up_softcap;
         const int pairs = rows * g_.n_used;
         bk::native_expert_grouped(L, ex_ptr_, ex_start_, ex_ng_, ex_dst_, ex_tok_, std::min(pairs, g_.n_expert), pairs, xq_[0], ex_scr_,
                                   ex_rows_, stream_);
+        if (on_cpu) sh_->cpu->finish(l, rows, ids_, ex_rows_, ex_tally_ + (size_t) l * g_.n_expert, stream_);
         MoeFinish mf;
         mf.rows = ex_rows_;
         mf.w = rw_;
@@ -877,6 +887,7 @@ private:
     // The forward of `rows` rows at positions pos0.. (tokens, or host embedding rows when `emb` is set, which must stay
     // as they are until the window's sync); then the head over the last `head` rows (0: none).
     bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err) {
+        cpu_ = cpu_layers();
         if (!layers(rows, head, stage(tokens, emb, rows, pos0, nullptr), err) || !check(err)) return false;
         dspark_.note(pos0, rows);   // DSPARK HOOK: the host's record of the rows the drafter took
         return true;
@@ -916,10 +927,13 @@ private:
         return full_keys_of(last);
     }
 
+    // The layers with experts on the CPU (bit l: layer l) for the next window: part of its shape.
+    uint64_t cpu_layers() const { return sh_->cpu ? m_.cpu_layers() : 0; }
+
     // The layers and the head of a window of `rows` rows: replayed from its shape's graph, captured on the shape's second
     // window (its first runs direct, outside a capture).
     bool layers(int rows, int head, int64_t full_keys, std::string& err) {
-        const uint64_t key = ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows;
+        const Shape key{cpu_, ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows};
         auto it = graphs_.find(key);
         if (it != graphs_.end()) return it->second.launch(stream_, err);
         if (direct_.insert(key).second) {
@@ -1089,8 +1103,11 @@ private:
     std::shared_ptr<Shared> sh_;             // the scratch, the prompt path and the batch graphs every session shares
     DsparkHook dspark_;                      // DSPARK HOOK
     Walk walk_;
-    std::map<uint64_t, core::CapturedGraph> graphs_;   // by window shape: rows, head rows, the full visits' launch bound
-    std::set<uint64_t> direct_;                        // the shapes whose first window has run
+    // a window's shape: the layers with experts on the CPU; rows, head rows and the full visits' launch bound
+    using Shape = std::pair<uint64_t, uint64_t>;
+    std::map<Shape, core::CapturedGraph> graphs_;      // by window shape
+    std::set<Shape> direct_;                           // the shapes whose first window has run
+    uint64_t cpu_ = 0;                                 // the window in flight's layers with experts on the CPU
     const model::BatchView* view_ = nullptr;           // the batch window in flight, while batch_forward runs it
     float* logits_ = nullptr;                // the last window's head rows (row_logprobs, copy_logits, resample_row)
     uint32_t* ex_tally_ = nullptr;           // [layer][expert] the card's running count of each expert's lookups

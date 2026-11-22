@@ -977,6 +977,15 @@ void test_expert_prefetch() {
     std::printf("%-34s %s\n", "expert_prefetch: runs", ok ? "ok" : "FAIL");
     failures += !ok;
     std::printf("  %.1f us a call (8 blobs of 64 KiB)\n", time_us([&] { expert_prefetch(dids, (int) ids.size(), dtab, blob, sink, nullptr); }));
+    // experts in RAM (0 in the table, the CPU's) are skipped: some of them, then all
+    for (int all : {0, 1}) {
+        for (int e = 0; e < NE; ++e) tab[e] = all || e % 2 ? 0ull : (unsigned long long) (blobs + (size_t) e * blob);
+        cudaMemcpy(dtab, tab.data(), NE * sizeof(tab[0]), cudaMemcpyHostToDevice);
+        expert_prefetch(dids, (int) ids.size(), dtab, blob, sink, nullptr);
+        const bool skip_ok = cudaDeviceSynchronize() == cudaSuccess;
+        std::printf("%-34s %s\n", all ? "expert_prefetch: every one in RAM" : "expert_prefetch: some in RAM", skip_ok ? "ok" : "FAIL");
+        failures += !skip_ok;
+    }
 }
 
 void test_moe_finish() {
@@ -1005,6 +1014,79 @@ void test_moe_finish() {
     MoeFinish one = a;
     one.rows = a.rows + (size_t) 3 * K * E; one.w = a.w + 3 * K; one.pos = a.pos + 3; one.resid = a.resid + 3 * E; one.out = zeros<float>(E);
     std::printf("  %.1f us a call (1 row)\n", time_us([&] { moe_finish(one, 1, nullptr); }));
+}
+
+// The CPU experts' rows into the experts' output (moe_cpu_merge): from mapped host memory a host function filled, in a
+// captured graph replayed twice; the pairs whose expert is in RAM (0 in the table) take their rows and their lookups, the
+// card's pairs keep theirs. Every expert on the card, none, and every other one, for 1 to 8 rows.
+void test_cpu_merge() {
+    struct Fill {
+        float* data = nullptr;
+        size_t n = 0;
+        const float* src = nullptr;
+        int replay = 0;
+        static void CUDART_CB run(void* p) {
+            const Fill& f = *static_cast<const Fill*>(p);
+            for (size_t i = 0; i < f.n; ++i) f.data[i] = f.src[i] + (float) f.replay * 0.125f;
+        }
+    };
+    const int K = 8, NE = 128;
+    bool ok = true;
+    for (int rows = 1; rows <= kDecodeRows; ++rows)
+        for (int mode : {0, 1, 2}) {
+            const int pairs = rows * K;
+            std::vector<int32_t> ids((size_t) pairs);
+            for (int p = 0; p < pairs; ++p) ids[(size_t) p] = (p % K * 7 + p / K) % NE;
+            std::vector<unsigned long long> tab(NE);
+            for (int e = 0; e < NE; ++e) tab[(size_t) e] = mode == 0 ? 1 : mode == 1 ? 0 : e % 2;
+            const std::vector<float> before((size_t) pairs * E, -17.f), src = randn((size_t) pairs * E);
+            int32_t* di = dev(ids);
+            unsigned long long* dt = dev(tab);
+            float* dy = dev(before);
+            uint32_t* tally = zeros<uint32_t>(NE);
+            Fill fill;
+            fill.n = (size_t) pairs * E;
+            fill.src = src.data();
+            float* mapped = nullptr;
+            cudaHostAlloc((void**) &fill.data, fill.n * 4, cudaHostAllocMapped);
+            cudaHostGetDevicePointer((void**) &mapped, fill.data, 0);
+            cudaStream_t st;
+            cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+            cudaGraph_t graph;
+            cudaGraphExec_t exec;
+            cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+            cudaLaunchHostFunc(st, Fill::run, &fill);
+            moe_cpu_merge(di, rows, K, dt, mapped, dy, tally, st);
+            cudaStreamEndCapture(st, &graph);
+            cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+            for (int replay = 1; replay <= 2; ++replay) {
+                fill.replay = replay;
+                cudaGraphLaunch(exec, st);
+                ok &= cudaStreamSynchronize(st) == cudaSuccess;
+                const std::vector<float> y = host(dy, (size_t) pairs * E);
+                const std::vector<uint32_t> counts = host(tally, NE);
+                std::vector<uint32_t> want(NE, 0);
+                for (int p = 0; p < pairs; ++p) {
+                    const bool ram = !tab[(size_t) ids[(size_t) p]];
+                    if (ram) want[(size_t) ids[(size_t) p]] += replay;
+                    for (int c = 0; c < E; ++c) {
+                        const size_t i = (size_t) p * E + c;
+                        const float ref = ram ? src[i] + (float) replay * 0.125f : -17.f;
+                        ok &= std::memcmp(&y[i], &ref, 4) == 0;
+                    }
+                }
+                ok &= counts == want;
+            }
+            if (mode == 1 && rows == kDecodeRows)
+                std::printf("  %.1f us a call (%d rows from mapped memory)\n",
+                            time_us([&] { moe_cpu_merge(di, rows, K, dt, mapped, dy, nullptr, nullptr); }), rows);
+            cudaGraphExecDestroy(exec);
+            cudaGraphDestroy(graph);
+            cudaStreamDestroy(st);
+            cudaFreeHost(fill.data);
+        }
+    std::printf("%-34s %s\n", "moe_cpu_merge: graph, mapped rows", ok ? "ok" : "FAIL");
+    failures += !ok;
 }
 
 // A batch window (several conversations' rows in one call, docs/design/batching.md) against each conversation's own call:
@@ -1195,6 +1277,7 @@ int main() {
     test_post_attn();
     test_expert_prefetch();
     test_moe_finish();
+    test_cpu_merge();
     test_batch_window();
     std::printf("inkling2_kernels_parity: %d failures\n", failures);
     return failures ? 1 : 0;
