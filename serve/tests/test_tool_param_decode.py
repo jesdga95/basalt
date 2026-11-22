@@ -89,6 +89,55 @@ class StreamedCall(unittest.TestCase):
         self.check("count", "null", None)
 
 
+DUP = {"name": "edit", "parameters": {"type": "object", "properties": {
+    "path": {"type": "string"},
+    "text": {"type": "string"},
+    "replace_all": {"type": "boolean"},
+}}}
+
+
+class DuplicateParameters(unittest.TestCase):
+    """#523: a reopened parameter must not turn its previous typed value into a string."""
+
+    def test_duplicate_parameter_keeps_first_typed_value(self):
+        body = ("<function=edit>\n<parameter=path>\na.txt\n</parameter>\n"
+                "<parameter=replace_all>\nfalse\n</parameter>\n"
+                "<parameter=replace_all>\ntrue\n</parameter>\n</function>")
+        self.assertEqual(parse_tool_call(body, DUP).arguments,
+                         {"path": "a.txt", "replace_all": False})
+
+    def test_three_duplicate_parameters_keep_first_typed_value(self):
+        body = ("<function=edit>\n<parameter=replace_all>\nfalse\n</parameter>\n"
+                "<parameter=replace_all>\ntrue\n</parameter>\n"
+                "<parameter=replace_all>\ntrue\n</parameter>\n</function>")
+        self.assertEqual(parse_tool_call(body, DUP).arguments, {"replace_all": False})
+
+    def test_duplicate_string_parameter_keeps_reopened_value(self):
+        # #429 still requires string values to be able to contain parameter tags; only non-text parameters close early.
+        body = ("<function=edit>\n<parameter=text>\na\n</parameter>\n"
+                "<parameter=text>\nb\n</parameter>\n</function>")
+        self.assertEqual(parse_tool_call(body, DUP).arguments["text"],
+                         "a\n</parameter>\n<parameter=text>\nb")
+
+    def test_streamed_duplicate_parameter_is_valid_json(self):
+        text = ("<tool_call>\n<function=edit>\n<parameter=path>\na.txt\n</parameter>\n"
+                "<parameter=replace_all>\nfalse\n</parameter>\n"
+                "<parameter=replace_all>\ntrue\n</parameter>\n"
+                "</function>\n</tool_call>")
+        for step in (1, 7, len(text)):
+            p = OutputParser(thinking=False, tools=[DUP], stream_tools=True)
+            pieces, calls = [], []
+            for i in range(0, len(text), step):
+                events = p.feed(text[i:i + step])
+                pieces += [e.text for e in events if e.kind == "tool_args"]
+                calls += [e.call for e in events if e.kind == "tool_call"]
+            events = p.finish()
+            pieces += [e.text for e in events if e.kind == "tool_args"]
+            calls += [e.call for e in events if e.kind == "tool_call"]
+            self.assertEqual(json.loads("".join(pieces)), {"path": "a.txt", "replace_all": False}, step)
+            self.assertEqual(calls[-1].arguments, {"path": "a.txt", "replace_all": False}, step)
+
+
 UNION = {"name": "automation", "parameters": {"type": "object", "properties": {},
     "oneOf": [{"$ref": "#/$defs/view"}, {"$ref": "#/$defs/write"}],
     "$defs": {

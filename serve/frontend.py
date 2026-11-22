@@ -619,8 +619,12 @@ FUNC_START = "<function="
 _QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 
 
-def param_end(text: str, final: bool = False, name: str | None = None) -> int:
-    """Find a structural parameter close, keeping quoted calls and a reopened parameter inside its value.
+def param_end(text: str, final: bool = False, name: str | None = None, close_reopened: bool = False) -> int:
+    """Find a structural parameter close, keeping quoted calls out.
+
+    #523: non-text parameters (boolean/integer/array/free JSON) cannot safely contain a reopened same-name block;
+    close at the first structural `</parameter>` and let the caller keep the first value. String parameters keep the
+    old reopened-value behavior because #429-style content may intentionally contain parameter tags.
     -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural close."""
     at = text.find(PARAM_END)
     fallback = -1
@@ -631,7 +635,7 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
             gt = after.find(">")
             if gt < 0:
                 candidate = at if final else -2
-            elif name is None or after[len(PARAM_START):gt].strip() != name:
+            elif name is None or close_reopened or after[len(PARAM_START):gt].strip() != name:
                 candidate = at
         elif after.startswith(FUNC_END):
             candidate = at
@@ -647,7 +651,7 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
     return fallback if final else (-2 if fallback >= 0 else -1)
 
 
-def call_end(text: str, final: bool = False) -> int:
+def call_end(text: str, final: bool = False, props: dict | None = None) -> int:
     """Where a call body ends: the `</tool_call>` after its own `</function>` (found via param_end); -1: incomplete.
     A body not in the call format ends at the first `</tool_call>`."""
     s = text.lstrip()
@@ -666,7 +670,10 @@ def call_end(text: str, final: bool = False) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:], final=final, name=text[pos:gt].split("=", 1)[1].strip())
+            pname = text[pos:gt].split("=", 1)[1].strip()
+            prop = (props or {}).get(pname)
+            close_reopened = prop is not None and not _text_kinds(prop)[0]
+            end = param_end(text[gt + 1:], final=final, name=pname, close_reopened=close_reopened)
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -846,18 +853,25 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     rest = body[body.index(">") + 1:]
     props = _tool_properties(schema)
     args = {}
+    seen = set()
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
+        key = pname.strip()
         rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True, name=pname.strip())
+        prop = props.get(key)
+        close_reopened = prop is not None and not _text_kinds(prop)[0]
+        end = param_end(rest, final=True, name=key, close_reopened=close_reopened)
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        args[pname] = _decode_param(value, props.get(pname))
+        if key in seen:
+            continue
+        seen.add(key)
+        args[key] = _decode_param(value, props.get(key))
     return ToolCall(name=name, arguments=args)
 
 
@@ -920,6 +934,8 @@ class OutputParser:
         self.sdeclared = {}
         self.spname = ""
         self.svstart = 0
+        self.sseen_params: set[str] = set()
+        self.sclose_reopened = False
 
     def _scan(self, final: bool = False) -> list[Event]:
         """Advance the streaming view of the call body."""
@@ -950,11 +966,16 @@ class OutputParser:
                     if b < 0:
                         return out
                     pname = stripped[11:b]
-                    args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
-                    self.sfirst = False
                     self.sp += b + 1
                     self.spname = pname
                     text, null = _text_kinds(self.sdeclared.get(pname))
+                    self.sclose_reopened = not text
+                    if pname.strip() in self.sseen_params:
+                        self.ss = "skip"
+                        continue
+                    self.sseen_params.add(pname.strip())
+                    args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
+                    self.sfirst = False
                     if text and not null:
                         args('"')
                         self.ss, self.sval_started = "str", False
@@ -975,7 +996,8 @@ class OutputParser:
                         rest = rest[1:]
                     self.sval_started = True
                     self.svstart = self.sp
-                end = param_end(self.buf[self.svstart:], final=final, name=self.spname) if PARAM_END in rest else -1
+                end = param_end(self.buf[self.svstart:], final=final, name=self.spname,
+                                close_reopened=self.sclose_reopened) if PARAM_END in rest else -1
                 end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
@@ -994,7 +1016,7 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, final=final, name=self.spname)
+                end = param_end(rest, final=final, name=self.spname, close_reopened=self.sclose_reopened)
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -1003,6 +1025,12 @@ class OutputParser:
                 if value.endswith("\n"):
                     value = value[:-1]
                 args(json.dumps(_decode_param(value, self.sdeclared.get(self.spname)), ensure_ascii=False))
+                self.sp += end + len(PARAM_END)
+                self.ss = "between"
+            elif self.ss == "skip":
+                end = param_end(rest, final=final, name=self.spname.strip(), close_reopened=self.sclose_reopened)
+                if end < 0:
+                    return out
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
             else:
@@ -1114,7 +1142,9 @@ class OutputParser:
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
             else:
-                i = call_end(self.buf, final=final)
+                body = self.buf.strip()
+                name = body[len("<function="):].split(">", 1)[0] if body.startswith("<function=") else ""
+                i = call_end(self.buf, final=final, props=_tool_properties(self.schemas.get(name)))
                 if self.stream_tools:
                     if i >= 0:
                         whole, self.buf = self.buf, self.buf[:i]     # scan only the body
