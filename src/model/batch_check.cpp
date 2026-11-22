@@ -76,7 +76,7 @@ Result check_batch(ModelSession* const* ss, int n, const std::vector<int32_t>& p
                 w.tokens.push_back(s.back());
                 for (int j = 1; j < rows[k]; ++j) w.tokens.push_back(prompt[(size_t) (round * 5 + j * 3 + (int) k) % prompt.size()]);
                 w.picks.assign((size_t) rows[k], -1);
-                w.logits.assign((size_t) n_vocab, 0.f);
+                w.logits.assign((size_t) rows[k] * (size_t) n_vocab, 0.f);   // room for every row: a model may write them all
                 batch[k] = w;
                 DecodeRequest r = w.req();
                 r.pos = (int64_t) s.size() - 1;
