@@ -4,7 +4,7 @@ Where Hy4-flash rounds and how its output compares. Method: [quality](quality.md
 
 ## Summary
 
-- **Against BF16:** the published pack scores mean KLD 0.201 and top-1 86.09% ([below](#against-the-bf16-reference)).
+- **Against BF16:** the published pack scores mean KLD 0.209 and top-1 86.14% ([below](#against-the-bf16-reference)).
 - **Placement decides rounding.** A GPU expert and a CPU expert round their activations differently, so a different tier size
   can change the text. With the tiers pinned, a fixed prompt repeats exactly.
 - **Drafting does not change output.** With the tiers pinned, drafted decoding gives plain decoding's tokens.
@@ -36,7 +36,7 @@ down on 19 layers).
 | Routed experts | NVFP4 | q8_1 activations on the GPU, Q8_0 on the CPU; prompt chunks MMQ (int8 mma) with each matrix's FP32 scale applied after |
 | Q8_0 projections | Q8_0 | q8_1 activations (decode); MMQ (prompt) |
 | Output head | Q8_0 | q8_1 activations, fp32 logits |
-| Engram rows | E4M3 | decoded to fp32; the per-head norms and everything after in fp32 |
+| Engram rows | E4M3 | decoded to fp32; the per-head norms and everything after in fp32, every norm with FP32's machine epsilon ([below](#the-engram-gates-epsilon)) |
 | Norms, router, hyper-connections | F32 | fp32 |
 | Sparse layers' rows | fp16 (`--kv fp8`: FP8 row, [below](#attention-caches)) | decode: fp32 scores, softmax and accumulation; prompt: fp16 tensor cores, fp32 accumulation |
 | Window layers' rings | fp16 | as the sparse layers' rows |
@@ -59,8 +59,8 @@ A decode row's arithmetic does not depend on how many rows share its window.
   25,500 rows). The default's fp16 rows score mean KLD 0.2003, top-1 85.87% and PPL 17.4934 on the same tier size, so the
   format costs 0.0043 KLD and a heavier tail (p99 3.21 against 3.01, max 23.3 against 20.8) while top-1 and PPL do not move
   beyond their spread. It halves the cache: 8.6 KB a position against 14.6, and 8.4 GiB against 14.3 at 256K. The default stays
-  fp16, the format the BF16 reference kept; `--kv fp8` is the memory choice. The summary's 0.201 mean KLD for the pack was
-  measured before this comparison and without a pinned tier; the fp16 rows here land within 0.001 of it.
+  fp16, the format the BF16 reference kept; `--kv fp8` is the memory choice. Both rows are against the first base
+  ([above](#against-the-bf16-reference)); the 0.5.0 engine's unpinned 0.201 against it lands within 0.001 of the fp16 row.
 - Needles in a 253,410-token prompt are found with both formats.
 - Pin the tier when comparing formats: this model declares no `quality_flags` for the gate, so pass `--expert-cache N` (and the
   same count) to both runs. Without it the freer VRAM of fp8 moves experts onto the card and the two runs are not comparable: an
@@ -90,11 +90,32 @@ rows with `--kv fp8`) changes only which drafts are accepted.
 
 ## Against the BF16 reference
 
-Reference: [quality](quality.md#the-bf16-reference), `hy4flash-bf16-base.kld` (base PPL 18.572). 100 chunks, 25,500 rows:
+Reference: [quality](quality.md#the-bf16-reference), `hy4flash-bf16-base.kld` (base PPL 18.416). 100 chunks, 25,500 rows, RTX 5090,
+`--expert-cache 4800`, T 1:
 
-| Pack | KLD mean | Top-1 |
-|---|---:|---:|
-| NVFP4 (the published pack; the 0.5.0 engine, BF16 head) | 0.201 | 86.09% |
+| Engine | PPL | KLD mean | Top-1 |
+|---|---:|---:|---:|
+| FP32 epsilon in the Engram gate (0.5.6) | 17.484 | 0.209 | 86.14% |
+| bf16 epsilon (before #556) | 17.565 | 0.782 | 76.77% |
+
+The base was rebuilt for 0.5.6 with FP32's epsilon in the llama.cpp port's Engram gate ([below](#the-engram-gates-epsilon)). The
+first base (sha abab2c9f…, base PPL 18.572) kept bf16's; against it the 0.5.0 engine scored 0.201 and 86.09%. The tables further
+down that predate 0.5.6 (`--kv fp8`, the output head, the lossy routing flags) were measured against the first base with the bf16
+epsilon: their rows compare with each other, not with the table above.
+
+### The Engram gate's epsilon
+
+The gate norms the stream and the key with FP32's machine epsilon, as Maya and Strata do. Before #556 it used bf16's
+(0.0078125), which is what an unset `nn.RMSNorm` eps resolves to in vLLM's bf16 forward and what the first base kept. That
+epsilon swamps small keys. After a line end sampled as `},` `\n` ` ` instead of `},\n` ` `, the next row put 77 to 94% on
+`...\n`, with byte tokens, `\x7f` and U+FEFF behind it. With FP32's epsilon the same prefix gives ` {"` at p 1.000.
+
+Against the first base, which kept bf16's epsilon, the FP32 epsilon looked far off (20 chunks: KLD 0.2498 before, 1.0072
+after) while predicting the text better (PPL 18.854 to 16.353). Against the rebuilt base the fix scores as the old engine did
+against the old base, and the old engine is the one far off ([above](#against-the-bf16-reference)).
+
+The #556 harness (JSON, SEO tags and a JS sitemap at temperature 0.9 and top_p 1.0) went from 3 to 4 stray answers in 48 to
+0 in 48.
 
 ### The output head
 
