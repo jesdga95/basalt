@@ -9,6 +9,7 @@
 #include "models/inkling2/spill.hpp"
 #include "models/inkling2/vision_encoder.hpp"   // [vision]
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -92,6 +93,16 @@ public:
     /// `stream`, which is waited for before the copies are freed). Bytes freed.
     uint64_t demote(uint64_t bytes, void* stream);
     int64_t promoted() const { return n_copy_; }
+    /// The free VRAM the session holds the card at from now on (VRAM / POST /v1/vram; 0: its own spare only): a grow of
+    /// the caches and a promote keep at least this much free. `lend(true)` gives every card copy back for a sleep and holds them off (nothing promotes)
+    /// until `lend(false)`.
+    uint64_t reserve() const { return reserve_; }
+    bool lent() const { return lent_; }
+    uint64_t held_free(uint64_t base) const { return std::max(base, reserve_); }
+    /// Resizes the card's copies so that `free_bytes` are free: copies go back to RAM when short, return while there is
+    /// room. False when even no copy at all leaves that much.
+    bool resize_reserve(uint64_t free_bytes, void* stream);
+    void lend(bool low, void* stream);
     /// A prompt chunk's staging of layer l's RAM experts from their card copies, when every one has a copy (false: none
     /// issued; the caller copies them from RAM).
     bool stage_from_card(int l, void* stream) const;
@@ -135,6 +146,8 @@ private:
     uint8_t* spill_host_ = nullptr;
     // the elastic spill: the RAM experts the most routed first, each one's card copy (null: none) and mapped RAM address
     bool elastic_ = false;
+    uint64_t reserve_ = 0;
+    bool lent_ = false;
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
     std::vector<unsigned long long> host_addr_;

@@ -514,7 +514,7 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
     for (auto& s : sessions)
         if (model::Result r = s->prepare(); !r.ok()) return r;
     if (elastic_) {   // the caches back only their base yet: the RAM experts come back while the card has room
-        const uint64_t moved = promote(kCardSpare);
+        const uint64_t moved = promote(held_free(kCardSpare));
         basalt::log::info("basalt inkling2", "elastic spill: %lld of %lld RAM experts copied back to the card (%.2f GiB); they go back "
                           "to RAM, the least routed first, as a conversation's caches grow",
                           (long long) n_copy_, (long long) spill_.spilled, (double) moved / (double) kGiB);
@@ -551,6 +551,28 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
         moved += w.expert_stride;
     }
     return moved;
+}
+
+bool InklingModel::resize_reserve(uint64_t free_bytes, void* stream) {
+    reserve_ = free_bytes;
+    if (lent_) return true;   // the wake takes the copies back against this reserve
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    const uint64_t want = held_free(kCardSpare);
+    if (free_b < want) demote(want - free_b, stream);
+    else promote(want);
+    cudaMemGetInfo(&free_b, &total_b);
+    return free_b >= want;
+}
+
+void InklingModel::lend(bool low, void* stream) {
+    if (low) {
+        demote(~0ull, stream);
+        lent_ = true;
+    } else {
+        lent_ = false;
+        promote(held_free(kCardSpare));
+    }
 }
 
 bool InklingModel::stage_from_card(int l, void* stream) const {
