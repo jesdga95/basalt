@@ -36,11 +36,14 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 | KV cache | fp16 (default), int8 (fp16 scale per 64), q4_0, k8v4 | K/V dequantized to fp32; scores and softmax fp32 |
 | GDN state and conv history | fp32 | fp32 |
 
-`q4_0` runs the same fused decode paths as `int8`: its K/V post (norm, RoPE, the Hadamard rotation and the Q4_0 pack)
-and its attention chunks happen inside the launches `int8` uses, with the codes staged out of the packed blocks into
-int8 rows. It produces the same tokens as before the change (checked with the greedy identity test against the previous
-build), and the fused attention reads half the bytes `int8` does, so `q4_0`'s decode is now at or below `int8`'s
-attention stage. A streamed `q4_0` cache (`--kv-resident`) keeps the per-token path, which also writes the host copy.
+`q4_0` fuses K/V post-processing (norm, RoPE, the Hadamard rotation and the Q4_0 pack) and uses the same decode
+attention launches as `int8`. Attention copies packed rows directly into shared memory, then unpacks in registers
+for the FP32 dot products and value accumulation. It reads 576 bytes per selected cell across both KV heads,
+compared with 1,056 for `int8`. A streamed cache (`--kv-resident`) uses the per-token path and also writes the host copy.
+
+On an RTX 5090 at 475 W, `q4_attn_bench` at 2,048 selected cells measured 9.2 → 8.2 µs per Q4_0 attention call
+(129 → 144 GB/s effective pool bandwidth). Int8 measured 8.8 µs. Random Q4_0 attention outputs matched the GPU
+reference bit for bit, with a maximum absolute error of 1.8e-8 against the double-precision CPU reference.
 
 Decode activations are int8 (q8_1) into every quantized matmul. The hc read stays fp32 (llama.cpp quantizes it to Q8_0).
 

@@ -1,8 +1,7 @@
 // tests/models/qwen4exp/kernels/q4_attn_bench.cpp - the fused decode attention on a q4_0 cache against int8.
 //
-// `--kv q4_0` stages packed Q4_0 blocks into the same int8 rows an int8 cache uses, so the two must cost about the
-// same arithmetic and differ only in the bytes they read: 144 B per cell and head against 256. This prints, for a
-// window at the selection cap, microseconds per call and the achieved GB/s over the bytes that must be moved.
+// At the selection cap this reports the time per call and effective bandwidth over the K/V pool bytes.
+// Each Q4_0 row reads 144 B per head and cell. Each int8 row reads 264 B, including scales.
 //
 //   ./q4_attn_bench [cells] [iterations]
 

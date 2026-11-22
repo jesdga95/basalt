@@ -88,11 +88,11 @@ __device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
 }
 __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::); }
 
-// shared memory of one chunk block; KV_MODE 0: fp16 rows, 1: int8 rows + fp16 scales per 64, 5: the same int8 rows
-// staged out of packed Q4_0 blocks, whose scale comes per 32 values
+// Shared chunk rows hold the pool's fp16, int8 or packed Q4_0 data. Only int8 stages separate scales.
 template <int KV_MODE> struct ChunkSmem {
-    static constexpr int ROW = KV_MODE == 0 ? HD * 2 : HD;   // bytes of one cell's K (or V) row
-    static constexpr int NS = KV_MODE == 5 ? HD / QK4_0 : NSC;   // scales per row
+    static constexpr int Q4_ROW = (HD / QK4_0) * sizeof(block_q4_0);
+    static constexpr int ROW = KV_MODE == 0 ? HD * 2 : KV_MODE == 5 ? Q4_ROW : HD;
+    static constexpr int NS = KV_MODE == 5 ? 1 : NSC;
     alignas(16) unsigned char k[CHUNK][ROW];
     alignas(16) unsigned char v[CHUNK][ROW];
     alignas(16) uint16_t ks[CHUNK][NS];
@@ -131,20 +131,23 @@ __device__ __forceinline__ void k8_from(const ChunkSmem<KV_MODE>& sm, int c, int
             out[2 * j] = f.x;
             out[2 * j + 1] = f.y;
         }
+    } else if constexpr (KV_MODE == 5) {
+        const auto* block = sm.k[c] + (d0 / QK4_0) * sizeof(block_q4_0);
+        const float sc = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(block)));
+        const auto* code = reinterpret_cast<const uint16_t*>(block + sizeof(uint16_t) + (d0 & 15));
+        const int shift = d0 & (QK4_0 / 2) ? 4 : 0;
+        const uint32_t lo = ((uint32_t) code[0] | ((uint32_t) code[1] << 16)) >> shift;
+        const uint32_t hi = ((uint32_t) code[2] | ((uint32_t) code[3] << 16)) >> shift;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int nibble = ((j < 4 ? lo : hi) >> (8 * (j & 3))) & 15;
+            out[j] = (float) (nibble - 8) * sc;
+        }
     } else {
-        const float sc = __half2float(__ushort_as_half(sm.ks[c][d0 / (KV_MODE == 5 ? QK4_0 : KV_Q8_GROUP)]));
+        const float sc = __half2float(__ushort_as_half(sm.ks[c][d0 / KV_Q8_GROUP]));
         const uint2 raw = *reinterpret_cast<const uint2*>(&sm.k[c][d0]);
 #pragma unroll
         for (int j = 0; j < 8; ++j) out[j] = (float) packed_s8(j < 4 ? raw.x : raw.y, j & 3) * sc;
-    }
-}
-template <int KV_MODE>
-__device__ __forceinline__ float v1_from(const ChunkSmem<KV_MODE>& sm, int c, int d) {
-    if constexpr (KV_MODE == 0) {
-        return __half2float(*reinterpret_cast<const __half*>(&sm.v[c][d * 2]));
-    } else {
-        const float sc = __half2float(__ushort_as_half(sm.vs[c][d / (KV_MODE == 5 ? QK4_0 : KV_Q8_GROUP)]));
-        return (float) (int8_t) sm.v[c][d] * sc;
     }
 }
 
@@ -193,40 +196,6 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
         const unsigned char* vb = KV_MODE == 0 ? (const unsigned char*) pools.v_pool
                                : KV_MODE == 5 ? (const unsigned char*) pools.v_q4
                                               : (const unsigned char*) pools.v_q;
-        if constexpr (KV_MODE == 5) {
-            // packed Q4_0: a pool row is BLKS blocks of {fp16 d, 16 code bytes}, and byte j of a block holds element
-            // j in its low nibble and element j + 16 in its high one. The codes widen to int8 exactly (they are
-            // [-8, 7]) and the block's scale fills the per-32 slot, so every reader above works unchanged.
-            constexpr int BLKS = HD / QK4_0, BYTES = BLKS * (int) sizeof(block_q4_0);
-            for (int i = t; i < 2 * CHUNK * BLKS; i += THREADS) {
-                const int plane = i / (CHUNK * BLKS), rem = i % (CHUNK * BLKS), c = rem / BLKS, b = rem % BLKS;
-                unsigned char* dst = plane == 0 ? &sm.k[c][b * QK4_0] : &sm.v[c][b * QK4_0];
-                uint16_t* sc = plane == 0 ? &sm.ks[c][b] : &sm.vs[c][b];
-                if (sm.row[c] < 0) {   // masked or missing: zero, as the fp16 and int8 paths make it
-                    *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
-                    *reinterpret_cast<uint4*>(dst + 16) = make_uint4(0, 0, 0, 0);
-                    *sc = 0;
-                    continue;
-                }
-                const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(
-                    (plane == 0 ? kb : vb) + sm.row[c] * (long long) BYTES) + b;
-                // qs sits 2 bytes into an 18-byte block, so read it two bytes at a time
-                uint16_t code[8];
-#pragma unroll
-                for (int m = 0; m < 8; ++m) code[m] = __ldg(reinterpret_cast<const uint16_t*>(blk->qs) + m);
-#pragma unroll
-                for (int m = 0; m < 8; ++m) {
-                    const uint8_t lo = (uint8_t) (code[m] & 0xff), hi = (uint8_t) (code[m] >> 8);
-                    dst[2 * m] = (unsigned char) (int8_t) ((int) (lo & 0x0F) - 8);
-                    dst[16 + 2 * m] = (unsigned char) (int8_t) ((int) (lo >> 4) - 8);
-                    dst[2 * m + 1] = (unsigned char) (int8_t) ((int) (hi & 0x0F) - 8);
-                    dst[16 + 2 * m + 1] = (unsigned char) (int8_t) ((int) (hi >> 4) - 8);
-                }
-                uint16_t d;
-                d = __ldg(&blk->d);
-                *sc = d;
-            }
-        } else {
         for (int i = t; i < CHUNK * PER; i += THREADS) {
             const int c = i / PER, j = i % PER;
             const long long r = sm.row[c];
@@ -248,7 +217,6 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
                     *reinterpret_cast<uint2*>(&sm.vs[c][0]) = make_uint2(0, 0);
                 }
             }
-        }
         }
     }
     cp_async_wait_all();
@@ -320,9 +288,11 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
         }
     }
     __syncthreads();
-    // values: thread t < 128 owns dimensions 2t, 2t+1 of all 12 heads; cells folded in ascending order.  A masked or
-    // missing cell has weight 0 and value 0, which leaves every accumulator unchanged (none is ever -0).
+    // Each thread owns two dimensions of all heads and folds cells in ascending order.
+    // A Q4_0 thread reads both nibbles of the same byte.
     if (t >= HD / 2) return;
+    constexpr int Q4_BYTES = QK4_0 / 2;
+    const int d = KV_MODE == 5 ? (t / Q4_BYTES) * QK4_0 + t % Q4_BYTES : 2 * t;
     float acc[G][2];
 #pragma unroll
     for (int i = 0; i < G; ++i) acc[i][0] = acc[i][1] = 0.0f;
@@ -332,9 +302,14 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
         if constexpr (KV_MODE == 0) {
             const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&sm.v[c][t * 4]));
             v0 = f.x; v1 = f.y;
+        } else if constexpr (KV_MODE == 5) {
+            const auto* block = sm.v[c] + (t / Q4_BYTES) * sizeof(block_q4_0);
+            const float sc = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(block)));
+            const uint8_t bits = block[sizeof(uint16_t) + t % Q4_BYTES];
+            v0 = (float) ((int) (bits & 15) - 8) * sc;
+            v1 = (float) ((int) (bits >> 4) - 8) * sc;
         } else {
-            const float sc = __half2float(
-                __ushort_as_half(sm.vs[c][t / (KV_MODE == 5 ? QK4_0 / 2 : KV_Q8_GROUP / 2)]));
+            const float sc = __half2float(__ushort_as_half(sm.vs[c][t / (KV_Q8_GROUP / 2)]));
             const ushort raw = *reinterpret_cast<const ushort*>(&sm.v[c][t * 2]);
             v0 = (float) (int8_t) (raw & 0xff) * sc;
             v1 = (float) (int8_t) (raw >> 8) * sc;
@@ -350,8 +325,15 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
         }
     }
 #pragma unroll
-    for (int i = 0; i < G; ++i)
-        *reinterpret_cast<float2*>(&part_acc[((size_t) slot * G + i) * HD + 2 * t]) = make_float2(acc[i][0], acc[i][1]);
+    for (int i = 0; i < G; ++i) {
+        float* out = &part_acc[((size_t) slot * G + i) * HD + d];
+        if constexpr (KV_MODE == 5) {
+            out[0] = acc[i][0];
+            out[Q4_BYTES] = acc[i][1];
+        } else {
+            *reinterpret_cast<float2*>(out) = make_float2(acc[i][0], acc[i][1]);
+        }
+    }
 }
 
 // sigmoid gate with the fast-math sequence native_qsa_gate_apply compiles to
@@ -786,8 +768,7 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
     cudaStream_t st = (cudaStream_t) stream;
     a.xq = a.attn_gated != nullptr ? xq : nullptr;
     const dim3 grid((unsigned) a.n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
-    if (mode == 5) {   // --kv q4_0: packed Q4_0 pools, staged into the int8 rows (the draft layer never takes it: its
-                       // call sites are gated on !kv_rot, and q4_0 always stores rotated keys)
+    if (mode == 5) {   // Q4_0 stores rotated keys, so the unrotated draft path never uses it.
         constexpr size_t bytes = sizeof(ChunkSmem<5>);
         opt_in<5>(attn_chunk_v2<5, false>, bytes);
         launch_pdl(attn_chunk_v2<5, false>, grid, dim3(THREADS), bytes, st, a);
