@@ -29,7 +29,9 @@ Result check_batch(ModelSession* const* ss, int n, const std::vector<int32_t>& p
     if (cap <= 0) return {Status::Error, "this model's sessions do not batch (batch_rows 0)"};
     const int skip = 7;
     if ((int64_t) prompt.size() < (int64_t) skip * n + 8) return {Status::Error, "the batch check needs a longer prompt"};
-    // each session's prompt, from its own start
+    // every session ready to run, as the serve engine readies its slots, then each session's prompt from its own start
+    for (int i = 0; i < n; ++i)
+        if (Result r = ss[i]->prepare(); !r.ok()) return r;
     std::vector<std::vector<int32_t>> seq((size_t) n);
     for (int i = 0; i < n; ++i) {
         std::vector<int32_t>& s = seq[(size_t) i];
