@@ -499,11 +499,12 @@ private:
         gu.tail_off = L.bytes - 16;
         gu.gate_softcap = g_.gate_softcap;
         gu.up_softcap = g_.up_softcap;
-        gu.dst = b_.h;
+        auto* h16 = reinterpret_cast<uint16_t*>(b_.h);
+        gu.dst_f16 = h16;
         gu.ld_dst = F;
         gu.two = true;
         fp4::run(gu, stream_);
-        fp4::quantize(b_.h, nullptr, b_.bounds, b_.tile_off, n, b_.a4h, b_.gsh, F, F, pairs, stream_, true);
+        fp4::quantize_f16(h16, b_.bounds, b_.tile_off, n, b_.a4h, b_.gsh, F, F, pairs, stream_);
         fp4::Product d = gu;
         d.swiglu = false;
         d.ids = nullptr;
@@ -513,12 +514,14 @@ private:
         d.a4 = b_.a4h;
         d.gs = b_.gsh;
         d.tile_off = b_.tile_off;
-        d.dst = b_.gu;
+        auto* gu16 = reinterpret_cast<uint16_t*>(b_.gu);
+        d.dst = nullptr;
+        d.dst_f16 = gu16;
         d.dst_ids = b_.dst;
         d.two = true;
         d.ld_dst = E;
         fp4::run(d, stream_);
-        moe_combine(b_.gu, b_.rw, rows, g_.n_used, b_.moe, stream_);
+        moe_combine_f16(gu16, b_.rw, rows, g_.n_used, b_.moe, stream_);
     }
 
     InklingModel& m_;

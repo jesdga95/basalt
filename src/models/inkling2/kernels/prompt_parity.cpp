@@ -833,6 +833,43 @@ void test_experts_fp4() {
     run(100, dids, dx, dw, y2, true);
     const std::vector<float> g2 = host(y2, (size_t) 100 * E);
     same_bits("  rows 0..99 as a chunk of their own", g2.data(), got.data(), g2.size() * 4);
+    // deterministic fp16 intermediate pipeline matches fp32 down + moe_combine and CPU double
+    {
+        float* yf = zeros<float>((size_t) R * E);
+        moe_sort(dids, R, K, NE, scr, bounds, tok, dst, rexp, S);
+        fp4::plan_blocks(bounds, NE, toff, boff, S);
+        fp4::quantize_tokens(dx, R, E, E, a4x, gsx, S, true);
+        fp4::Product gu;
+        gu.base = blobs; gu.stride = ex.stride; gu.blk_off = boff; gu.blocks = fp4::max_blocks(R * K, NE); gu.n = NE;
+        gu.w_rows = 2 * F; gu.w_cols = E; gu.a4 = a4x; gu.gs = gsx; gu.bounds = bounds; gu.ids = tok; gu.tokens = R;
+        auto* h16 = reinterpret_cast<uint16_t*>(h);
+        gu.swiglu = true; gu.tail_off = ex.L.bytes - 16; gu.gate_softcap = 4.f; gu.up_softcap = 25.f; gu.dst_f16 = h16; gu.ld_dst = F; gu.two = true;
+        fp4::run(gu, S);
+        fp4::quantize_f16(h16, bounds, toff, NE, a4h, gsh, F, F, R * K, S);
+        fp4::Product d = gu;
+        d.swiglu = false; d.ids = nullptr; d.w_off = ex.L.down_off; d.w_rows = E; d.w_cols = F;
+        auto* o16 = reinterpret_cast<uint16_t*>(o);
+        d.a4 = a4h; d.gs = gsh; d.tile_off = toff; d.dst = nullptr; d.dst_f16 = o16; d.dst_ids = dst; d.ld_dst = E;
+        fp4::run(d, S);
+        moe_combine_f16(o16, dw, R, K, yf, S);
+        const std::vector<float> gf = host(yf, (size_t) R * E);
+        report("  fp16 H + fp16 down + combine_f16 vs fp32", gf, std::vector<double>(got.begin(), got.end()), 5e-3);
+        report("  fp16 H + fp16 down + combine_f16 vs CPU", std::vector<float>(gf.begin(), gf.begin() + 8 * E), ref, 2e-2);
+        // Chunk invariance of the fp16 pipeline: rows 0..99 alone must be bitwise identical
+        float* yf2 = zeros<float>((size_t) 100 * E);
+        moe_sort(dids, 100, K, NE, scr, bounds, tok, dst, rexp, S);
+        fp4::plan_blocks(bounds, NE, toff, boff, S);
+        fp4::quantize_tokens(dx, 100, E, E, a4x, gsx, S, true);
+        gu.blocks = fp4::max_blocks(100 * K, NE); gu.tokens = 100;
+        fp4::run(gu, S);
+        fp4::quantize_f16(h16, bounds, toff, NE, a4h, gsh, F, F, 100 * K, S);
+        d.blocks = gu.blocks; d.tokens = 100;
+        fp4::run(d, S);
+        moe_combine_f16(o16, dw, 100, K, yf2, S);
+        same_bits("  fp16 pipeline rows 0..99 alone", host(yf2, (size_t) 100 * E).data(), gf.data(), (size_t) 100 * E * 4);
+        cudaFree(yf2);
+        cudaFree(yf);
+    }
     // timing at a 2,048-row chunk's shape: 16,384 pairs over the 128 experts
     {
         std::vector<int32_t> big((size_t) PMAX);

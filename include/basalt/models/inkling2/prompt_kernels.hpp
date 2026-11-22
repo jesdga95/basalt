@@ -71,4 +71,7 @@ void rms_norm_q8_1_prompt(const float* x, const float* w, int rows, float eps, v
 /// Fused attention sigmoid gate + MMQ Q8_1 quantization (D4 layout) for kHeads * kHeadDim-wide rows directly into xq.
 void attn_gate_q8_1_prompt(const float* attn, const float* yq, int64_t yq_ld, int rows, void* xq, void* stream);
 
+/// Deterministic vectorized weighted sum of k fp16 expert outputs per row into fp32 y[rows][kWidth].
+void moe_combine_f16(const uint16_t* out, const float* w, int rows, int k, float* y, void* stream);
+
 }  // namespace basalt::models::inkling2

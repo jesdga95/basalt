@@ -2,6 +2,7 @@
 // of a chunk's (row, slot) pairs by expert, and the staged sliding-window keys moved into the window rings.
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -476,6 +477,45 @@ void attn_gate_q8_1_prompt(const float* attn, const float* yq, int64_t yq_ld, in
     attn_gate_q8_1_prompt_kernel<<<grid, kGateQ8Threads, 0, (cudaStream_t) stream>>>(
         attn, yq, yq_ld, rows, static_cast<Q81MmqBlock*>(xq));
     check("attn_gate_q8_1_prompt");
+}
+
+namespace {
+
+constexpr int kCombF16Threads = kWidth / 8;   // 288 threads: each owns 8 channels (1 uint4 fp16 -> 2 float4 fp32)
+static_assert(kWidth % 8 == 0 && kCombF16Threads <= 1024, "kWidth splits into 8-half uint4s");
+
+__global__ void __launch_bounds__(kCombF16Threads)
+    moe_combine_f16_kernel(const uint16_t* __restrict__ out, const float* __restrict__ w, int k, float* __restrict__ y) {
+    __shared__ float sw[32];
+    const int r = (int) blockIdx.x, tid = (int) threadIdx.x;
+    if (tid < k) sw[tid] = w[(size_t) r * k + tid];
+    __syncthreads();
+    const uint4* out8 = reinterpret_cast<const uint4*>(out);
+    float4 a0 = make_float4(0.f, 0.f, 0.f, 0.f), a1 = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int s = 0; s < k; ++s) {
+        const float ws = sw[s];
+        const uint4 u = out8[((size_t) r * k + s) * kCombF16Threads + tid];
+        const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+        const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+        const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&u.z));
+        const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&u.w));
+        a0.x = fmaf(ws, f0.x, a0.x); a0.y = fmaf(ws, f0.y, a0.y);
+        a0.z = fmaf(ws, f1.x, a0.z); a0.w = fmaf(ws, f1.y, a0.w);
+        a1.x = fmaf(ws, f2.x, a1.x); a1.y = fmaf(ws, f2.y, a1.y);
+        a1.z = fmaf(ws, f3.x, a1.z); a1.w = fmaf(ws, f3.y, a1.w);
+    }
+    float4* y4 = reinterpret_cast<float4*>(y + (size_t) r * kWidth);
+    y4[2 * tid] = a0;
+    y4[2 * tid + 1] = a1;
+}
+
+}  // namespace
+
+void moe_combine_f16(const uint16_t* out, const float* w, int rows, int k, float* y, void* stream) {
+    if (rows <= 0) return;
+    if (k <= 0 || k > 32) throw std::runtime_error("inkling2 moe_combine_f16: k");
+    moe_combine_f16_kernel<<<(unsigned) rows, kCombF16Threads, 0, (cudaStream_t) stream>>>(out, w, k, y);
+    check("moe_combine_f16");
 }
 
 }  // namespace basalt::models::inkling2
