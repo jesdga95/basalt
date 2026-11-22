@@ -315,9 +315,10 @@ public:
         b.steps = (R + A - 1) / A;
         b.meta_h = (int32_t*) pin((int64_t) g_.n_layers * b.steps * 4 * A);
         // gate/up products of the dense layer (A rows of n_ff), of the shared expert (R rows of the expert width) and of a prompt
-        // launch (kLaunchRows rows of twice the expert width); the SwiGLU outputs likewise
-        const int64_t gu_n = std::max<int64_t>({2 * (int64_t) A * g_.n_ff, 2 * (int64_t) R * g_.n_ff_exp, 2 * (int64_t) kLaunchRows * g_.n_ff_exp});
-        const int64_t h_n = std::max<int64_t>({(int64_t) A * g_.n_ff, (int64_t) R * g_.n_ff_exp, (int64_t) kLaunchRows * g_.n_ff_exp});
+        // launch (up to kLaunchRows, never more than R * n_used pairs in this chunk); the SwiGLU outputs likewise
+        const int64_t launch_rows = std::min<int64_t>(kLaunchRows, (int64_t) R * g_.n_used);
+        const int64_t gu_n = std::max<int64_t>({2 * (int64_t) A * g_.n_ff, 2 * (int64_t) R * g_.n_ff_exp, 2 * launch_rows * g_.n_ff_exp});
+        const int64_t h_n = std::max<int64_t>({(int64_t) A * g_.n_ff, (int64_t) R * g_.n_ff_exp, launch_rows * g_.n_ff_exp});
         b.gu = f(gu_n); b.h = f(h_n);
         b.rlog = f((int64_t) R * g_.n_expert); b.rw = f((int64_t) R * 16); b.ids = (int32_t*) f((int64_t) R * 16);
         b.xlat = f((int64_t) R * g_.n_latent); b.lat_out = f((int64_t) R * g_.n_latent); b.moe_out = f((int64_t) R * E); b.sh = f((int64_t) R * E);
@@ -387,12 +388,21 @@ public:
         t_eng_read_ms_ = t_eng_norm_ms_ = 0;
         t_ring_ms_ = 0;
         if (tier_ && total < kRingRows) {
-            int want = kMaxWindow;
-            while (want < total && want < kShortChunk) want *= 2;
+            const int want = std::max(kMaxWindow, std::min(total, kShortChunk));
             std::string e;
+            // Try the full short chunk first (free VRAM, then spare slots beside the base arena). With partial_lend()
+            // available, fall through to a small bounded lend instead of halving R into tiny chunks that re-stream
+            // the RAM experts many times over PCIe.
             for (int pass = 0; pass < 2; ++pass) {
                 if (pass == 1) tier_->shrink();
-                for (int R = want; R >= std::min(want, 2 * kMaxWindow); R /= 2)
+                if (make_bufs(big_, want, e)) {
+                    use(big_);
+                    lent_ = false;
+                    return true;
+                }
+            }
+            if (!tier_->partial_lend()) {
+                for (int R = want / 2; R >= std::min(want, 2 * kMaxWindow); R /= 2)
                     if (make_bufs(big_, R, e)) {
                         use(big_);
                         lent_ = false;
@@ -402,8 +412,12 @@ public:
         }
         lent_ = true;
         int want = kMaxWindow;
-        while (want < total && want < kMaxChunk) want *= 2;
-        want = std::min(want, kMaxChunk);
+        if (total < kRingRows) {
+            want = std::max(kMaxWindow, total);
+        } else {
+            while (want < total && want < kMaxChunk) want *= 2;
+            want = std::min(want, kMaxChunk);
+        }
         const bool ringed = total >= kRingRows && tier_ && !ring_;
         // a bounded lend: the tier gives up only the slots the chunk's buffers and the ring need, and the rest keep their experts
         // (the ring stages those card to card, and the first turn after the prompt finds them); all of them when that is not enough
@@ -413,7 +427,8 @@ public:
             std::string e;
             make_bufs(probe, want, e, &need);
             if (ringed) need += expert_ring_bytes();
-            if (tier_->lend(need) && make_bufs(big_, want, e)) {
+            if ((tier_->lend(need) && make_bufs(big_, want, e)) ||
+                (tier_->lend(need + kExpertLendSegment) && make_bufs(big_, want, e))) {
                 if (!ringed || ring_open() ||
                     (tier_->lend(expert_ring_bytes() + kExpertLendSegment) && ring_open())) {
                     use(big_);
@@ -1228,7 +1243,7 @@ private:
     // A prompt chunk of kRingRows rows or more routes to every expert of every layer, so the next layer's experts do not wait for
     // its router: all of a layer's experts are copied into one of two slots of the ring while the layer before it computes.
     static constexpr int kRingRows = 1024;
-    static constexpr int kShortChunk = 512;   // the largest chunk of a short prompt, which keeps the card's expert slots
+    static constexpr int kShortChunk = 1024;  // the largest chunk of a short prompt, which keeps the card's expert slots
     bool lent_ = false;                       // the open prompt lent the tier's slots
     uint8_t* ring_ = nullptr;
     cudaEvent_t ring_copied_[2] = {nullptr, nullptr}, ring_done_[2] = {nullptr, nullptr};
