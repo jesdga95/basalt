@@ -54,7 +54,7 @@ struct Carve {
 struct Bufs {
     float* role[kBufs] = {};
     float* resid = nullptr;
-    float *msg = nullptr, *mix = nullptr, *pair = nullptr, *hid = nullptr, *nrm = nullptr;
+    float *msg = nullptr, *mix = nullptr, *hid = nullptr, *nrm = nullptr;
     float *yq = nullptr, *yk = nullptr, *yv = nullptr, *q = nullptr, *r = nullptr, *sink = nullptr, *attn = nullptr, *o = nullptr;
     void* xq = nullptr;          // the experts' q8_1 rows (their input, then H)
     void *a4h = nullptr, *a4x = nullptr;   // NVFP4 experts (inside xq): H's FP4 tiles, the input's FP4 token planes
@@ -76,9 +76,8 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     b.resid = c.take<float>(R * E);
     // the attention's buffers
     const size_t arena = c.at;
-    b.msg = c.take<float>(R * E);
+    b.msg = c.take<float>(4 * R * E);
     b.mix = c.take<float>(3 * R * E);
-    b.pair = c.take<float>(2 * R * E);
     b.hid = c.take<float>(R * (size_t) g.gate_rank);
     b.nrm = c.take<float>(3 * R * E);
     b.yq = c.take<float>(R * kProjQ);
@@ -165,7 +164,7 @@ public:
             mmq::load(type, rows);
             return true;
         };
-        if (!ready(8, kProjQ) || !ready(8, kProjKV) || !ready(8, E)) return false;
+        if (!ready(8, kProj) || !ready(8, kProjQ) || !ready(8, kProjKV) || !ready(8, kKvHeads * kHeadDim) || !ready(8, E)) return false;
         for (int l = 0; l < g_.n_layers; ++l) {
             const LayerWeights& w = m_.layer(l);
             if (!ready(w.gu_type, 2 * (int64_t) F) || !ready(w.d_type, E)) return false;
@@ -251,7 +250,15 @@ private:
             st.s[st.n++] = buf(walk_.final_hid);
             attnres_mix(st, m_.output_query(), 1, rows, 1e-6f, b_.mix, (int64_t) rows * E, stream_);
             bk::rms_norm_rows(b_.mix, m_.output_norm(), rows, E, g_.rms_eps, ds_->tap(kDsTargets - 1), stream_);
-            ds_->commit(b_.pos, rows, stream_);
+            DsparkHook::PromptScratch ps;
+            ps.mix = b_.mix;
+            ps.kb = b_.yk;
+            ps.vb = b_.yv;
+            ps.xq = b_.xqd;
+            ps.pos3 = reinterpret_cast<int32_t*>(b_.rlog);
+            ps.bounds = b_.dbounds;
+            ps.ident = b_.ident;
+            ds_->commit_prompt(b_.pos, rows, mmq_, ps, stream_);
         }
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) {
@@ -284,19 +291,17 @@ private:
 
     // A loop controller over the chunk: out = blend(dest, msg) of stream `st` (out may be dest).
     void controller(const LayerWeights& w, int st, const float* dest, const float* msg, int rows, float* out) {
-        const int E = g_.n_embd, rank = g_.gate_rank;
-        ctrl_pair_norm(dest, msg, rows, b_.pair, stream_);
-        bk::bf16_rows_dot(b_.pair, w.ctrl_down[st], b_.hid, rows, rank, 2 * E, stream_);
-        bk::bf16_rows_dot(b_.hid, w.ctrl_gf[st], b_.pair, rows, 2 * E, rank, stream_);
-        ctrl_blend(dest, msg, b_.pair, rows, out, stream_);
+        const int rank = g_.gate_rank;
+        ctrl_down_prompt(dest, msg, w.ctrl_down[st], rows, rank, b_.hid, stream_);
+        ctrl_up_blend_prompt(dest, msg, b_.hid, w.ctrl_gf[st], rows, rank, out, stream_);
     }
 
-    // The previous pass's message of stream `j` into msg (the same bits as the decode forward's four at once).
-    void message(const Step& s, const LayerWeights& w, int j, int rows) {
+    // All four streams' messages of the previous pass into b_.msg[0..3] in one read of bank[0..1].
+    void messages(const Step& s, const LayerWeights& w, int rows) {
         MixStates st;
         st.s[st.n++] = buf(s.bank[0]);
         st.s[st.n++] = buf(s.bank[1]);
-        attnres_mix(st, w.msg_query + (size_t) j * g_.n_embd, 1, rows, 1e-6f, b_.msg, (int64_t) rows * g_.n_embd, stream_);
+        attnres_mix(st, w.msg_query, 4, rows, 1e-6f, b_.msg, (int64_t) rows * g_.n_embd, stream_);
     }
 
     void layer(const Step& s, int rows, int64_t pos0) {
@@ -321,34 +326,33 @@ private:
             for (int j = 0; j < 3; ++j) in[j] = b_.mix + (full ? j : 0) * RE;
         }
         if (s.msgs) {
+            messages(s, w, rows);
             // controller j writes mix slot j; a sliding-window layer's one input feeds all three, so slot 0 goes last
-            for (const int j : {1, 2, 0}) {
-                message(s, w, j, rows);
-                controller(w, j, in[j], b_.msg, rows, b_.mix + j * RE);
-            }
-            for (int j = 0; j < 3; ++j) in[j] = b_.mix + j * RE;
+            for (const int j : {1, 2, 0}) controller(w, j, in[j], b_.msg + (size_t) j * RE, rows, b_.mix + (size_t) j * RE);
+            for (int j = 0; j < 3; ++j) in[j] = b_.mix + (size_t) j * RE;
         }
         const bool one = !full && in[0] == in[1] && in[1] == in[2];
+        // the projections: fused RMSNorm + Q8_1 quantization directly into b_.xqd, and fused Q+K+V when streams are shared
+        const size_t row_bytes = (size_t) E / 32 * 34;
         if (one) {
-            bk::rms_norm_rows(in[0], w.attn_norm, rows, E, g_.rms_eps, b_.nrm, stream_);
+            rms_norm_q8_1_prompt(in[0], w.attn_norm, rows, g_.rms_eps, b_.xqd, stream_);
+            product(w.proj, kProj, E, rows, b_.yq);
         } else {
             const float* wn[3] = {full ? w.q_norm : w.attn_norm, full ? w.k_norm : w.attn_norm, full ? w.v_norm : w.attn_norm};
-            for (int j = 0; j < 3; ++j) bk::rms_norm_rows(in[j], wn[j], rows, E, g_.rms_eps, b_.nrm + j * RE, stream_);
+            rms_norm_q8_1_prompt(in[0], wn[0], rows, g_.rms_eps, b_.xqd, stream_);
+            product(w.proj, kProjQ, E, rows, b_.yq);
+            rms_norm_q8_1_prompt(in[1], wn[1], rows, g_.rms_eps, b_.xqd, stream_);
+            product(w.proj + (size_t) kRowK * row_bytes, kProjKV, E, rows, b_.yk);
+            rms_norm_q8_1_prompt(in[2], wn[2], rows, g_.rms_eps, b_.xqd, stream_);
+            product(w.proj + (size_t) kRowV * row_bytes, kProjKV, E, rows, b_.yv);
         }
-        // the projections: the query input's rows, then the key's, then the value's
-        const size_t row_bytes = (size_t) E / 32 * 34;
-        quant(b_.nrm, E, rows, 8);
-        product(w.proj, kProjQ, E, rows, b_.yq);
-        if (!one) quant(b_.nrm + RE, E, rows, 8);
-        product(w.proj + (size_t) kRowK * row_bytes, kProjKV, E, rows, b_.yk);
-        if (!one) quant(b_.nrm + 2 * RE, E, rows, 8);
-        product(w.proj + (size_t) kRowV * row_bytes, kProjKV, E, rows, b_.yv);
         // convolutions, clips and the keys: a sliding-window visit stages the chunk's own, a full visit writes its cells
         const bool fp8 = m_.cache_fp8();
         AttnPrep ap;
         ap.yq = b_.yq;
-        ap.yk = b_.yk;
-        ap.yv = b_.yv;
+        ap.yk = one ? b_.yq + kProjQ : b_.yk;
+        ap.yv = one ? b_.yq + kProjQ + kProjKV : b_.yv;
+        if (one) ap.ldq = ap.ldk = ap.ldv = kProj;
         ap.pos = b_.pos;
         ap.full = full;
         ap.k_conv = w.k_conv;
@@ -387,8 +391,7 @@ private:
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b_.attn, stream_);
         if (c.ring) stage_to_ring(b_.k_stage, b_.v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window, fp8 ? 1 : 2, stream_);
-        attn_gate(b_.attn, b_.yq, rows, b_.q, stream_);   // the queries are spent: the gated rows go there
-        quant(b_.q, kOut, rows, 8);
+        attn_gate_q8_1_prompt(b_.attn, b_.yq, one ? kProj : kProjQ, rows, b_.xqd, stream_);
         product(w.out, E, kOut, rows, b_.o);
         // the attention's convolution and the residual: a block's first layer starts a new sum
         const bool boundary = g_.boundary(l);
@@ -399,10 +402,7 @@ private:
         if (boundary) st.s[st.n++] = hid;
         st.s[st.n++] = b_.resid;
         attnres_mix(st, w.ffn_query, 1, rows, 1e-6f, b_.mix, (int64_t) RE, stream_);
-        if (s.msgs) {
-            message(s, w, 3, rows);
-            controller(w, 3, b_.mix, b_.msg, rows, b_.mix);
-        }
+        if (s.msgs) controller(w, 3, b_.mix, b_.msg + 3 * RE, rows, b_.mix);
         bk::rms_norm_rows(b_.mix, w.ffn_norm, rows, E, g_.rms_eps, b_.nrm, stream_);
         experts(w, l, rows);
         post_conv(b_.moe, b_.pos, w.ffn_post_conv, c.m_ring, b_.resid, rows, out, stream_);
@@ -499,11 +499,12 @@ private:
         gu.tail_off = L.bytes - 16;
         gu.gate_softcap = g_.gate_softcap;
         gu.up_softcap = g_.up_softcap;
-        gu.dst = b_.h;
+        auto* h16 = reinterpret_cast<uint16_t*>(b_.h);
+        gu.dst_f16 = h16;
         gu.ld_dst = F;
         gu.two = true;
         fp4::run(gu, stream_);
-        fp4::quantize(b_.h, nullptr, b_.bounds, b_.tile_off, n, b_.a4h, b_.gsh, F, F, pairs, stream_, true);
+        fp4::quantize_f16(h16, b_.bounds, b_.tile_off, n, b_.a4h, b_.gsh, F, F, pairs, stream_);
         fp4::Product d = gu;
         d.swiglu = false;
         d.ids = nullptr;
@@ -513,12 +514,14 @@ private:
         d.a4 = b_.a4h;
         d.gs = b_.gsh;
         d.tile_off = b_.tile_off;
-        d.dst = b_.gu;
+        auto* gu16 = reinterpret_cast<uint16_t*>(b_.gu);
+        d.dst = nullptr;
+        d.dst_f16 = gu16;
         d.dst_ids = b_.dst;
         d.two = true;
         d.ld_dst = E;
         fp4::run(d, stream_);
-        moe_combine(b_.gu, b_.rw, rows, g_.n_used, b_.moe, stream_);
+        moe_combine_f16(gu16, b_.rw, rows, g_.n_used, b_.moe, stream_);
     }
 
     InklingModel& m_;

@@ -39,7 +39,7 @@ BF16 instead of Q8_0 scored 0.00218 for 1.2 GB more reads a token; it was not ta
 
 | Stage | Format | Arithmetic |
 | --- | --- | --- |
-| Routed experts | NVFP4, Q8_0 | decode: q8_1 activations, fp32 sums; experts in RAM on the CPU: Q8_0 activations, fp32 sums, the card's softcapped SwiGLU (the sigmoid on the raw gate); prompt chunks: NVFP4 layers on the FP4 block-scaled tensor cores, each activation row as two FP4 terms under one per-row scale (its rounding and the rounding of what that leaves, about 8 bits), fp32 accumulation; Q8_0 layers MMQ (int8 mma); each matrix's FP32 scale applied after |
+| Routed experts | NVFP4, Q8_0 | decode: q8_1 activations, fp32 sums; experts in RAM on the CPU: Q8_0 activations, fp32 sums, the card's softcapped SwiGLU (the sigmoid on the raw gate); prompt chunks: NVFP4 layers on the FP4 block-scaled tensor cores, each activation row as two FP4 terms under one per-row scale (its rounding and the rounding of what that leaves, about 8 bits), fp32 accumulation with fp16 SwiGLU and down intermediates before fp32 weighted combine; Q8_0 layers MMQ (int8 mma); each matrix's FP32 scale applied after |
 | Q8_0 projections, head | Q8_0 | q8_1 activations (decode); MMQ (prompt); fp32 logits, softcap 30 |
 | Router | F32 | fp32 sigmoid, top 8 |
 | Attention-residual mixes, controllers, norms | F32, BF16 weights | fp32 |

@@ -49,6 +49,10 @@
 #include <string>
 #include <vector>
 
+namespace basalt::prefill::mmq {
+class Context;
+}
+
 namespace basalt::models::inkling2 {
 
 constexpr int kDsMaxLayers = 4;
@@ -125,10 +129,22 @@ public:
     int slot_of_visit(int visit) const;
     /// Slot k's rows (fp32, kWidth each, contiguous): slots 0..2 the visits' inputs, slot 3 the final normed state.
     float* tap(int slot) const { return tap_ + (size_t) slot * tap_rows_ * kWidth; }
+    /// Caller-owned chunk buffers reused by commit_prompt() (no extra device allocation).
+    struct PromptScratch {
+        float* mix = nullptr;         ///< [3][rows][kWidth]
+        float* kb = nullptr;          ///< [rows][kKvHeads * kHeadDim]
+        float* vb = nullptr;          ///< [rows][kKvHeads * kHeadDim]
+        void* xq = nullptr;           ///< MMQ q8_1 rows for [rows][kWidth]
+        int32_t* pos3 = nullptr;      ///< [rows][3]
+        const int32_t* bounds = nullptr;  ///< {0, rows}
+        const int32_t* ident = nullptr;   ///< 0..rows-1
+    };
     /// Enqueues the context keys and values of the forward's `rows` rows (positions pos_d[0..rows), contiguous, on the
     /// device) from the tap. Only fixed addresses: a captured forward may hold it.
     /// The context of `rows` rows from the tap's rows row0.. (a batch window's segment starts past row 0).
     void commit(const int32_t* pos_d, int rows, void* stream, int row0 = 0);
+    /// Batched commit for prompt chunks: runs dspark_mix once and projects k_ctx / v_ctx through MMQ.
+    void commit_prompt(const int32_t* pos_d, int rows, basalt::prefill::mmq::Context& mmq, const PromptScratch& s, void* stream);
     /// The host's record of the same rows (outside a captured forward).
     void note(int64_t pos0, int rows);
     model::Result draft_begin(int32_t anchor, int64_t pos, int n, void* stream);
@@ -161,6 +177,7 @@ private:
     float* mix_ = nullptr;                  ///< [3][8][width]
     float* fr_ = nullptr;                   ///< the Markov head's context by position: [kFrRing][width]
     int32_t* pos3_ = nullptr;               ///< [8][3]
+    int32_t* ring_bounds_ = nullptr;        ///< {0, ring_cells} for batched sliding-window commits
     float *kb_ = nullptr, *vb_ = nullptr;   ///< [8][1024]
     void* act_ = nullptr;                   ///< q8_1 rows
     // block

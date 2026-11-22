@@ -21,6 +21,7 @@
 #include "basalt/model/flags.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 
 #include <cuda_runtime.h>
 
@@ -353,6 +354,11 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     mix_ = f(3 * kSlice * E);
     fr_ = f(kFrRing * E);
     pos3_ = (int32_t*) dev(kSlice * 3 * 4, ok);
+    ring_bounds_ = (int32_t*) dev(2 * 4, ok);
+    if (ok) {
+        const int32_t rb[2] = {0, (int32_t) ring_cells(d)};
+        if (cudaMemcpy(ring_bounds_, rb, sizeof(rb), cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
+    }
     kb_ = f(kSlice * kKV);
     vb_ = f(kSlice * kKV);
     act_ = dev(bk::native_q8_1_bytes(kE, kSlice), ok);
@@ -443,6 +449,53 @@ void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream, int row0) 
             bk::attn_qk_prepare(nullptr, kb_, vb_, nullptr, L.k_ctx_norm, d.rms_eps, rope, pos3_, n, 0, kKvHeads, nullptr, c.k, c.v,
                                 0, stream, kHeadDim, false, c.cap, pos_d + r0);
         }
+    }
+}
+
+void DsparkHook::commit_prompt(const int32_t* pos_d, int rows, basalt::prefill::mmq::Context& mmq, const PromptScratch& s,
+                               void* stream) {
+    if (!w_ || rows <= 0) return;
+    if (rows <= kSlice) {
+        commit(pos_d, rows, stream);
+        return;
+    }
+    namespace pm = basalt::prefill::mmq;
+    const DsparkGeometry& d = w_->geo;
+    DsMixArgs ma;
+    ma.alpha = w_->alpha;
+    for (int l = 0; l < d.n_layers; ++l) ma.norm[l] = w_->layer[(size_t) l].dflare_norm;
+    ma.norm[kDsMixes - 1] = w_->markov_norm;
+    ma.eps = d.rms_eps;
+    const bk::RopeSpec rope = rope_of(d);
+    dspark_mix(tap_, (int64_t) tap_rows_ * kE, rows, ma, s.mix, (int64_t) rows * kE, pos_d, fr_, kFrRing, s.pos3, stream);
+    for (int l = 0; l < d.n_layers; ++l) {
+        const DsparkLayer& L = w_->layer[(size_t) l];
+        const Cache& c = cache_[(size_t) l];
+        // A sliding-window layer only keeps its last c.cap cells; older rows of the chunk would be overwritten.
+        const int keep = c.ring ? (int) std::min<int64_t>(rows, c.cap) : rows;
+        const int r0 = rows - keep;
+        const float* mix_l = s.mix + ((size_t) l * rows + r0) * kE;
+        pm::quantize(mix_l, nullptr, s.xq, 8, kE, kE, keep, stream);
+        pm::Product p;
+        p.type = 8;
+        p.w_rows = kKV;
+        p.w_cols = kE;
+        p.expert_bytes = pm::matrix_bytes(8, kKV, kE);
+        p.n = 1;
+        p.xq = s.xq;
+        p.bounds = keep == rows ? s.bounds : ring_bounds_;
+        p.ids = s.ident;
+        p.total_rows = keep;
+        p.max_rows = keep;
+        p.ld_dst = kKV;
+        p.w = static_cast<const uint8_t*>(L.k_ctx);
+        p.dst = s.kb;
+        mmq.run(p, stream);
+        p.w = static_cast<const uint8_t*>(L.v_ctx);
+        p.dst = s.vb;
+        mmq.run(p, stream);
+        bk::attn_qk_prepare(nullptr, s.kb, s.vb, nullptr, L.k_ctx_norm, d.rms_eps, rope, s.pos3 + (size_t) r0 * 3, keep, 0,
+                            kKvHeads, nullptr, c.k, c.v, 0, stream, kHeadDim, false, c.cap, pos_d + r0);
     }
 }
 
