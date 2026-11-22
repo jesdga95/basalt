@@ -210,14 +210,21 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
                 }
                 const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(
                     (plane == 0 ? kb : vb) + sm.row[c] * (long long) BYTES) + b;
-                uint8_t code[16];
-                *reinterpret_cast<uint4*>(code) = *reinterpret_cast<const uint4*>(blk->qs);
+                // qs sits 2 bytes into an 18-byte block, so read it two bytes at a time
+                uint16_t code[8];
 #pragma unroll
-                for (int j = 0; j < 16; ++j) {
-                    dst[j] = (unsigned char) (int8_t) ((int) (code[j] & 0x0F) - 8);
-                    dst[16 + j] = (unsigned char) (int8_t) ((int) (code[j] >> 4) - 8);
+                for (int m = 0; m < 8; ++m) code[m] = __ldg(reinterpret_cast<const uint16_t*>(blk->qs) + m);
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    const uint8_t lo = (uint8_t) (code[m] & 0xff), hi = (uint8_t) (code[m] >> 8);
+                    dst[2 * m] = (unsigned char) (int8_t) ((int) (lo & 0x0F) - 8);
+                    dst[16 + 2 * m] = (unsigned char) (int8_t) ((int) (lo >> 4) - 8);
+                    dst[2 * m + 1] = (unsigned char) (int8_t) ((int) (hi & 0x0F) - 8);
+                    dst[16 + 2 * m + 1] = (unsigned char) (int8_t) ((int) (hi >> 4) - 8);
                 }
-                *sc = __ldg(&blk->d);
+                uint16_t d;
+                d = __ldg(&blk->d);
+                *sc = d;
             }
         } else {
         for (int i = t; i < CHUNK * PER; i += THREADS) {

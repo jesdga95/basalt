@@ -251,6 +251,8 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     }
     stamp(l, 10);
     bool fused_gate = false;
+    bool gated_merge = false;   // the fused chunks and their merge both run, and the merge applies the gate
+    bool chunk_attn = false;    // the fused chunks run (the gate, if any, is the caller's)
     bool attn_q8 = false;   // the merge wrote the q8_1 rows
     if (v_.batch_rec_) {   // each row selects and attends over its own slot's K/V, from the layer's table
         qsa_block_scores_seg(seg_tab, v_.qidx_, v_.step_, n, v_.max_blocks_, s, v_.scores_, cs, true);
@@ -279,23 +281,27 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     qsa_kv_resolve(st, *v_.g_, v_.sel_, v_.step_, n, v_.cap_, cs);
     stamp(l, 12);
     const QsaAttnPools pools = qsa_attn_pools(st);
-    // staged chunks and the gate in the merge, the same bits
-    fused_gate = !st.kv_rot && !st.kv_hybrid &&
-                 qsa_dec_attn_supported(pools, s);
-    attn_q8 = fused_gate && !st.kv_rot && !st.kv_hybrid;
+    // staged chunks and the gate in the merge, the same bits. A `--kv q4_0` cache has rotated keys, so its merge
+    // cannot gate: the merge reads the attention output in the rotated domain, and the gate is a function of the
+    // un-rotated one. It takes the same chunks and the caller gates after the rotation.
+    gated_merge = !st.kv_rot && !st.kv_hybrid && qsa_dec_attn_supported(pools, s);
+    chunk_attn = gated_merge || (fused_q4 && qsa_dec_attn_supported(pools, s));
+    fused_gate = gated_merge;
+    attn_q8 = gated_merge;
     PdlScope pa(pdl);   // the chunks after the top-k, the merge after them
-    if (fused_gate)
+    if (chunk_attn)
         qsa_dec_attn(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_, s,
                      v_.attn_scratch_, v_.attn_, n, cs,
-                     v_.qfull_, v_.attn32_, attn_q8 ? v_.xq_ : nullptr, qhalf ? (void*) v_.qev_[1] : nullptr);
+                     gated_merge ? v_.qfull_ : nullptr, gated_merge ? v_.attn32_ : nullptr,
+                     attn_q8 ? v_.xq_ : nullptr, qhalf ? (void*) v_.qev_[1] : nullptr);
     else
     qsa_decode_attn_batch(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_,
                           s, v_.attn_scratch_, v_.attn_, n, cs);
     }
     stamp(l, 13);
     if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(v_.attn_, (int64_t) n * NH, cs);   // back: H^-1 = H
-    if (qhalf && !fused_gate) cudaStreamWaitEvent(cs, v_.qev_[1], 0);
-    if (fused_gate) {}   // the merge wrote attn32_
+    if (qhalf && !chunk_attn) cudaStreamWaitEvent(cs, v_.qev_[1], 0);
+    if (gated_merge) {}   // the merge wrote attn32_
     else if (qb) native_qsa_gate_apply(v_.attn_, v_.qfull_, v_.attn32_,
                                   (int) (n * NH), (int) HD, cs);
     else
