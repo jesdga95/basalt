@@ -274,6 +274,7 @@ __device__ __forceinline__ void q_post_dev(const QsaDecQPost& a, int n, int n_he
         row[d] = scale * x * a.q_norm[d];
         __syncthreads();
         rope_row<TAB>(row, a.pos_q[b], d, ra);
+        if (a.rot) fwht_row_smem(row, d);   // <Hq, Hk> = <q, k> for a rotated q4_0 cache
         a.qcur[(size_t) b * HD + d] = row[d];
         return;
     }

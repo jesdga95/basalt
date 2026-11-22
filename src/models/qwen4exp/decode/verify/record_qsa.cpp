@@ -78,11 +78,12 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         qp.q_full = v_.qfull_; qp.qcur = v_.qcur_; qp.pos_q = v_.pos_;
         qp.q_norm = (const float*) wqn->data; qp.q_idx = v_.qidx_; qp.pos_i = pos_i;
         qp.idx_q_norm = (const float*) wiqn->data; qp.eps = EPS;
+        qp.rot = fused_q4;   // q4_0 stores rotated keys, so the query rotates with them
         return qp;
     };
     // K, V and the indexer key/query each on a branch of their own, beside the query (one row: the
     // multi-row GEMV is the one-row one)
-    const bool qsaf_wide = fused_pre && (qb || n == 1) && v_.qs_[0] != nullptr;
+    const bool qsaf_wide = ((fused_pre && (qb || n == 1)) || fused_q4) && v_.qs_[0] != nullptr;
     // the query projection's query rows first; its gate rows, which only the merge reads, beside the selection and the
     // attention chunks
     const bool qhalf = qsaf_wide && !v_.batch_rec_ && N == 2560 &&
@@ -209,12 +210,12 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         PdlScope pq(pdl2 && fused_pre && qb);   // PDL2: after the K/V post kernel
         dense_proj(8, wq->native_type, wq->native_data, v_.xq_, v_.qfull_, (int) N,
                    (int) (NH * 2 * HD), n, cs);
-        if (fused_pre && qb)
+        if ((fused_pre || fused_q4) && (qb || fused_q4))
             bf16_gemv_fp32_mmvf_multi(v_.mixed_, N, (const uint16_t*) wiq->data, v_.qidx_,
                                       IQ * ID, N, IQ * ID, n, cs);
     }
-    if (fused_pre) {   // the query split, norms and RoPEs in one launch
-        if (qb) {}   // the indexer query projection ran above
+    if (fused_pre || fused_q4) {   // the query split, norms, RoPEs (and the rotation, for q4_0) in one launch
+        if (qb || fused_q4) {}   // the indexer query projection ran above
         else for (int t = 0; t < T; ++t)
             bf16_gemv_fp32_mmvf(v_.mixed_ + t * N, (const uint16_t*) wiq->data, v_.qidx_ + t * IQ * ID, (int) N,
                                 (int) (IQ * ID), cs);

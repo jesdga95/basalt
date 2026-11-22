@@ -50,6 +50,8 @@ struct QsaDecQPost {
     const int32_t* pos_i = nullptr;     ///< [n][idx_n_head]
     const float* idx_q_norm = nullptr;  ///< [idx_dim]
     float eps = 1e-6f;
+    /// Rotate the attention query after its RoPE, for a `--kv q4_0` cache whose keys are stored rotated
+    bool rot = false;
 };
 
 bool qsa_dec_fused_supported(const QsaShapes& s);
