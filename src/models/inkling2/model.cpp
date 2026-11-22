@@ -15,7 +15,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 
 namespace basalt::models::inkling2 {
 namespace {
@@ -292,13 +295,22 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     if (req.spec >= 2)
         if (model::Result r = dspark_plan(pack_, reads, file, device_, dspark_); !r.ok()) return r;
 
-    // [vision] the image encoder staged before the context is sized, the room of its largest region kept free
-    uint64_t vision_room = 0;
+    // [vision] the image encoder staged before the context is sized; it keeps none of the card: a request's pictures borrow
+    // their region from the experts (lend_room) and give it back (refill). What staging leaves on the card (the encoder's
+    // kernels, stream and product handle) comes out of the card's spare, which is there for the kernels' modules.
+    uint64_t vision_modules = 0;
     if (req.vision) {
+        size_t before = 0, after = 0, total_b = 0;
+        cudaMemGetInfo(&before, &total_b);
         if (!vis_.stage(pack_.vision, g.n_embd, err)) return fail("vision: " + err);
-        vision_room = vis_.region_bytes();
-        basalt::log::info("basalt inkling2", "image encoder: %.2f GiB staged in page-locked RAM, %.2f GiB of the card kept for it",
-                          (double) vis_.weights_bytes() / (double) kGiB, (double) vision_room / (double) kGiB);
+        cudaMemGetInfo(&after, &total_b);
+        vision_modules = std::min<uint64_t>(before > after ? before - after : 0, kCardSpare / 4);
+        vis_.set_lender({[this](uint64_t bytes, std::string& e) { return lend_room(bytes, e); }, [this] { refill(); }});
+        basalt::log::info("basalt inkling2", "image encoder: %.2f GiB staged in page-locked RAM, 0 GiB of the card kept for it (its "
+                          "kernels' %.0f MiB inside the card's spare; a request's pictures borrow up to %.2f GiB of expert memory "
+                          "and give it back)",
+                          (double) vis_.weights_bytes() / (double) kGiB, (double) vision_modules / (double) kMiB,
+                          (double) vis_.region_bytes() / (double) kGiB);
     }
 
     // the context: what the weights leave, less the card's spare
@@ -306,7 +318,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
         if (want < 1024 || (g.context_length > 0 && want > g.context_length))
             return fail("--max-context " + std::to_string(want) + " is outside 1,024 .. " + std::to_string(g.context_length));
-        const uint64_t spare = kCardSpare + vision_room;   // [vision]
+        const uint64_t spare = kCardSpare - vision_modules;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
             return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
@@ -425,7 +437,7 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
             // the prompt path reads the last expert's down rows (n_ff 1152 columns) on to a multiple of 256 values: zeros there
             const uint64_t past = std::max(prefill::mmq::read_past_bytes(el.gu_type, g.n_embd),
                                            prefill::mmq::read_past_bytes(el.d_type, g.n_ff_exp));
-            if (core::vmm::supported()) {   // a range of its own, as a spilled layer's: its backing can leave and return at the same addresses
+            if (core::vmm::supported()) {   // a range of its own, so that a picture can borrow its memory (lend_room)
                 const uint64_t vg = core::vmm::granularity();
                 Range r;
                 r.bytes = r.own = (eb + past + vg - 1) / vg * vg;
@@ -618,6 +630,74 @@ uint64_t InklingModel::demote(uint64_t bytes, void* stream) {
         --layer_copies_[i / (size_t) ne];
     }
     return freed;
+}
+
+// [vision] ENC runs between requests and windows: once every stream is idle, nothing reads the experts until refill.
+bool InklingModel::lend_room(uint64_t bytes, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = "the card failed before the image encoder";
+        return false;
+    }
+    // the region beside the card's spare and the reserve the card holds now (a reserve it could not meet stays unmet)
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    const uint64_t want = bytes + std::min<uint64_t>(held_free(kCardSpare), std::max<uint64_t>(free_b, kCardSpare));
+    if (free_b < want && n_copy_ > 0) {
+        const int64_t before = n_copy_;
+        demote(want - free_b, nullptr);
+        lend_copies_ += before - n_copy_;
+        cudaMemGetInfo(&free_b, &total_b);
+    }
+    for (size_t i = ranges_.size(); i-- > 0 && free_b < want;) {
+        Range& r = ranges_[i];
+        if (!r.handle) continue;
+        std::unique_ptr<uint8_t[]> keep(new (std::nothrow) uint8_t[r.own]);
+        if (!keep || cudaMemcpy(keep.get(), r.va, r.own, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = "no RAM for the experts the image encoder borrows from";
+            break;
+        }
+        if (!core::vmm::unmap(r.va, r.own, r.handle)) {
+            err = "cannot lend expert memory to the image encoder";
+            break;
+        }
+        r.handle = 0;
+        lent_ranges_.push_back({i, std::move(keep)});
+        cudaMemGetInfo(&free_b, &total_b);
+    }
+    lend_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (free_b >= want) return true;
+    refill();
+    if (err.empty())
+        err = "no device memory for the image encoder (" + std::to_string((unsigned long long) (bytes >> 20)) +
+              " MiB) even with the experts' memory lent";
+    return false;
+}
+
+void InklingModel::refill() {
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t back = 0;
+    for (auto it = lent_ranges_.rbegin(); it != lent_ranges_.rend(); ++it) {
+        Range& r = ranges_[it->range];
+        if (!(r.handle = core::vmm::map(r.va, r.own)) ||
+            cudaMemcpy(r.va, it->bytes.get(), r.own, cudaMemcpyHostToDevice) != cudaSuccess) {
+            // nothing may run on these experts now: the card is out of memory it just had
+            basalt::log::error("basalt inkling2", "the experts lent to the image encoder cannot come back to the card");
+            std::abort();
+        }
+        back += r.own;
+    }
+    const size_t layers = lent_ranges_.size();
+    lent_ranges_.clear();
+    const int64_t copies = n_copy_;
+    if (elastic_ && !lent_) promote(held_free(kCardSpare));
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (layers > 0 || lend_copies_ > 0)
+        basalt::log::info("basalt inkling2", "image encoder: borrowed %lld expert copies and %zu layers' experts (%.2f GiB) in %.0f ms, "
+                          "back in %.0f ms (%lld copies)",
+                          (long long) lend_copies_, layers, (double) back / (double) kGiB, lend_ms_, ms, (long long) (n_copy_ - copies));
+    lend_ms_ = 0;
+    lend_copies_ = 0;
 }
 
 }  // namespace basalt::models::inkling2
