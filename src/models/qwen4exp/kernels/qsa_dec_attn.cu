@@ -326,7 +326,8 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
             const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&sm.v[c][t * 4]));
             v0 = f.x; v1 = f.y;
         } else {
-            const float sc = __half2float(__ushort_as_half(sm.vs[c][t / (KV_Q8_GROUP / 2)]));
+            const float sc = __half2float(
+                __ushort_as_half(sm.vs[c][t / (KV_MODE == 5 ? QK4_0 / 2 : KV_Q8_GROUP / 2)]));
             const ushort raw = *reinterpret_cast<const ushort*>(&sm.v[c][t * 2]);
             v0 = (float) (int8_t) (raw & 0xff) * sc;
             v1 = (float) (int8_t) (raw >> 8) * sc;
