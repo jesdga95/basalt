@@ -59,12 +59,17 @@ class Inkling2Parser:
     def _between(self, out: list) -> bool:
         if not self.buf:
             return False
+        if self.buf.startswith(TOOL_JSON):
+            # Some replies begin with the native call marker and put the name in its JSON envelope.
+            self.call = ToolCall(name="", arguments={})
+            self.buf, self.state, self.head, self.raw, self.streamed = self.buf[len(TOOL_JSON):], "call", "", "", 0
+            return True
         if not self.buf.startswith(HEADER):
             if HEADER.startswith(self.buf):
                 return False            # a header still arriving
             stray = self.buf.find(HEADER)
             text = self.buf if stray < 0 else self.buf[:stray]
-            keep = 0 if stray >= 0 else frontend.hold_back(text, (HEADER,))
+            keep = 0 if stray >= 0 else frontend.hold_back(text, (HEADER, TOOL_JSON))
             if len(text) > keep:        # text outside a block: shown as it is
                 out.append(Event("content", text[:len(text) - keep]))
             self.buf = self.buf[len(text) - keep:]
@@ -116,8 +121,8 @@ class Inkling2Parser:
         self.raw += take
         self.buf = self.buf[end + len(END):] if end >= 0 else self.buf[len(self.buf) - keep:]
         args = self._args_text()
-        if args is not None and self.stream_tools:
-            # the last character may be the call object's own closing brace: streamed once the block ends
+        if args is not None and self.stream_tools and self.call.name:
+            # The last character may be the call object's own closing brace: stream it once the block ends.
             upto = len(args) if end >= 0 else max(self.streamed, len(args) - 1)
             if end >= 0 and args.rstrip().endswith("}"):
                 upto = len(args.rstrip()) - 1
@@ -163,10 +168,15 @@ class Inkling2Parser:
         was only the start of a marker is text."""
         out: list[Event] = []
         if self.state == "call":
-            if self.stream_tools and self.call is not None:
-                args = self._args_text()
-                if args is not None and len(args) > self.streamed:
-                    out.append(Event("tool_args", args[self.streamed:], call=self.call))
+            keep = frontend.hold_back(self.buf, (END,))
+            self.raw += self.buf[:len(self.buf) - keep]
+            self.buf = ""
+            try:
+                obj = json.loads(self.raw)
+            except ValueError:
+                obj = None
+            if isinstance(obj, dict) and isinstance(obj.get("name"), str) and isinstance(obj.get("args"), dict):
+                self._end_call(out)
             self.call = None
         elif self.state == "name":
             if self.buf.strip():

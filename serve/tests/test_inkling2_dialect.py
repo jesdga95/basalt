@@ -127,6 +127,17 @@ class Parse(unittest.TestCase):
                 ("args", '{"q":"two"}'), ("call", "search", {"q": "two"})]
         self.assertEqual(merged(parse(reply)), want)
 
+    def test_native_call_without_header_or_end_marker(self):
+        reply = TOOL_JSON + '{"name":"edit_file","args":{"path":"a","old_string":"b","new_string":"c"}}'
+        want = [("call", "edit_file", {"path": "a", "old_string": "b", "new_string": "c"})]
+        self.assertEqual(merged(parse(reply)), want)
+        for chunk in (1, 2, 7, 13):
+            self.assertEqual(merged(parse(reply, chunk)), want, chunk)
+
+    def test_named_native_call_without_end_marker(self):
+        reply = HEADER + "edit_file" + TOOL_JSON + '{"name":"edit_file","args":{"path":"a"}}'
+        self.assertEqual(merged(parse(reply)), [("args", '{"path":"a"}'), ("call", "edit_file", {"path": "a"})])
+
     def test_every_split_gives_the_same_events(self):
         reply = (HEADER + THINK + "a<b" + END + HEADER + TEXT + "x <|end y" + END + HEADER + "get_weather" + TOOL_JSON +
                  '{"name":"get_weather","args":{"city":"Paris","n":[1,2]}}' + END)
