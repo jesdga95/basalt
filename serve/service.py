@@ -927,6 +927,7 @@ class Service:
     def render_prompt(self, messages, tools, kwargs) -> str:
         """Render the template. With `effort_end`, a non-default effort is rendered as the default up to the answer
         (same prefix, cache kept) and follows as a short system turn right before it."""
+        kwargs = self.minimal_off(kwargs)
         if kwargs.get("reasoning_effort") not in (None, ""):
             kwargs = dict(kwargs, reasoning_effort=self.dialect.effort_level(kwargs["reasoning_effort"]))
         kwargs = self.dialect.template_kwargs(kwargs)
@@ -952,9 +953,16 @@ class Service:
             return prompt, []
         return unmark_think_literals(prompt, self.literals)
 
+    def minimal_off(self, kwargs: dict) -> dict:
+        """`minimal` as thinking off, for a template without that level."""
+        if kwargs.get("reasoning_effort") != "minimal" or self.dialect.minimal_effort:
+            return kwargs
+        return {**{k: v for k, v in kwargs.items() if k != "reasoning_effort"}, "enable_thinking": False}
+
     def thinking_kwargs(self, kwargs: dict) -> dict:
         """The request's template kwargs, with the server's default effort when it names no effort and no thinking
-        switch (a request's budget already named a level)."""
+        switch (a request's budget already named a level); `minimal` is thinking off for a template without that level."""
+        kwargs = self.minimal_off(kwargs)
         if self.reasoning_effort is None or "reasoning_effort" in kwargs or "enable_thinking" in kwargs:
             return kwargs
         return {**kwargs, **effort_kwargs(self.reasoning_effort)}

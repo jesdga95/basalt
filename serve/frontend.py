@@ -84,8 +84,9 @@ IMAGE_PARTS = ("image_url", "input_image", "image")
 VIDEO_PARTS = ("video_url", "input_video", "video")
 VIDEO_OPTIONS = ("fps", "max_frames")         # a video part's own sampling, as vLLM takes them
 
-# client spellings of a thinking level -> low, medium, high, max or none; a dialect says what its template takes for each
-EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None, "no_think": None,
+# client spellings of a thinking level -> minimal, low, medium, high, max or none; a dialect says what its template takes
+# for each (minimal is thinking off for a template with no such level: Service.thinking_kwargs)
+EFFORT = {"none": None, "off": None, "minimal": "minimal", "disabled": None, "false": None, "no_think": None,
           "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 
 

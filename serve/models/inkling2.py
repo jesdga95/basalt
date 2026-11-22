@@ -497,6 +497,7 @@ class Inkling2(Dialect):
     image_start = IMAGE
     in_engine_vision = True             # the engine's encoder reads the picture at its own size: no sidecar
     thinks_in_blocks = True             # the grammar guard lets its thinking blocks through, unless thinking is off
+    minimal_effort = True               # the template's effort map has minimal (0.1)
     # chat_template.jinja: tools and several calls per turn, an effort level or number, system messages, and every
     # assistant message's reasoning_content kept in the prompt
     caps = {"supports_tool_calls": True, "supports_parallel_tool_calls": True, "supports_reasoning_effort": True,
