@@ -105,6 +105,11 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
   hundredths (at most 0.99). There is no hard switch: at `none` the model still writes a short thinking block (a few hundred
   tokens), so leave room in `max_tokens`.
 - **Tools:** the model writes `<|content_invoke_tool_json|>{"name": ..., "args": {...}}`; several calls per turn are supported.
+  The server also reads the forms the model drifts into: a call whose header has no name, or has no header at all (the name
+  is in its JSON), a call written after a block it left open or cut off before its end, and a call written as XML
+  (`<invoke name="..."><parameter name="...">...</parameter></invoke>`, bare or inside `<tool_call><function_calls>`, with
+  or without `string="true"`) when it names one of the request's tools. Tags quoted in code, or naming no tool of the
+  request, stay text.
 
 ## Limits
 

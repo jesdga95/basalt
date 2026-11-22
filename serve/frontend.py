@@ -909,19 +909,11 @@ def hold_back(text: str, tags: tuple[str, ...]) -> int:
     return best
 
 
-class OutputParser:
-    """Incremental parser of model text: feed deltas, get events; a split tag is held until complete."""
+class CodeTracker:
+    """What the answer text that has gone out leaves open: a code fence, the current line, the backticks of the current
+    paragraph. A tag opening inside code is a quoted example, text."""
 
-    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
-        self.state = "reasoning" if thinking else "content"
-        self.buf = ""
-        self.lead = False
-        self.rtail = ""              # the last reasoning characters sent (the mention check's context)
-        self.schemas = {t.get("name"): t for t in tools or []}
-        # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
-        self.stream_tools = stream_tools
-        self.fence, self.line, self.ticks = "", "", 0     # code fence, current line and backticks of the answer so far
-        self._reset_scan()
+    fence, line, ticks = "", "", 0
 
     def _track(self, text: str) -> str:
         """Follow the answer text that has gone out: the open code fence (``` or ~~~), the current line, and the
@@ -947,6 +939,21 @@ class OutputParser:
     def _in_code(self) -> bool:
         """The text so far leaves the next character inside a code fence or inline code."""
         return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
+
+
+class OutputParser(CodeTracker):
+    """Incremental parser of model text: feed deltas, get events; a split tag is held until complete."""
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
+        self.state = "reasoning" if thinking else "content"
+        self.buf = ""
+        self.lead = False
+        self.rtail = ""              # the last reasoning characters sent (the mention check's context)
+        self.schemas = {t.get("name"): t for t in tools or []}
+        # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
+        self.stream_tools = stream_tools
+        self.fence, self.line, self.ticks = "", "", 0     # code fence, current line and backticks of the answer so far
+        self._reset_scan()
 
     def _reset_scan(self):
         self.sp = 0                  # consumed part of self.buf (the call body)
