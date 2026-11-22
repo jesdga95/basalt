@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
     w.scale = {0.4f, 0.3f, 0.5f};
     w.base = randn(24, 12, 0.5f);
     DevW dw(w);
-    const int Tmax = 9;
+    const int Tmax = 68;   // 64 tokens is where hc_partial_tok_kernel takes over; 65 leaves a tail block of one
     auto x_h = randn((size_t) Tmax * FLAT, 13, 1.5f);
     auto f_h = randn((size_t) Tmax * D, 14);
     std::vector<float> coef = run_coef(dw, x_h, Tmax, a);
@@ -161,9 +161,9 @@ int main(int argc, char** argv) {
     v.expect(pre_e < 1e-4 * pre_n, "hc_pre error");
     v.expect(post_e < 1e-4 * post_n, "hc_post error");
 
-    // ---- window width and position independence (bitwise)
+    // ---- window width and position independence (bitwise), across the width where the token-blocked partials start (64)
     bool bitwise = true;
-    for (int T : {1, 2, 3, 4})
+    for (int T : {1, 2, 3, 4, 64, 65})
         for (int start : {0, 2, 5}) {
             if (start + T > Tmax) continue;
             std::vector<float> xs(x_h.begin() + (size_t) start * FLAT, x_h.begin() + (size_t)(start + T) * FLAT);
@@ -197,8 +197,8 @@ int main(int argc, char** argv) {
         v.expect(e.rms_rel < 1e-6, "rms norm at tiny eps");
     }
 
-    // ---- microbench
-    for (int T : {1, 4}) {
+    // ---- microbench (68 crosses the width where the token-blocked partials start, 64)
+    for (int T : {1, 4, 68}) {
         std::vector<float> xs(x_h.begin(), x_h.begin() + (size_t) T * FLAT), fs(f_h.begin(), f_h.begin() + (size_t) T * D);
         Dev<float> dx(xs), df(fs), ws(hc_mixes_workspace_floats(T)), dc((size_t) T * 24), o1((size_t) T * D), o2((size_t) T * FLAT);
         char name[64];
