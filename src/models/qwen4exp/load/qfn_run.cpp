@@ -80,7 +80,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     }
     // the peer card takes expert rows of a long prompt chunk only when it is as fast as the main one: a slower card costs the
     // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps
-    const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
+    bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
     // the prompt-time layer split over the expert tier cards (PromptStage), and the most stages it may use, the main
     // card's included: every card on two cards or on three or more alike ones, none on three or more unlike cards
     // until measured on such a set.  With --batch a read splits only while no slot decodes.
@@ -286,6 +286,9 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
             l = e + 1;
         }
     }
+    // an alike card computes a share of a streamed chunk only with NVFP4 experts on every layer
+    peer_streamed_share = peer_streamed_share && basalt::prefill::Prefill::fp4_experts();
+    set_stream_all_min();
     // The PCIe share of the missed experts.  The GPU's SMs read that share over the link (the copy kernel), so on a
     // slower link it must shrink or the window waits for it.  The real H2D bandwidth is probed once; from 20 GB/s up
     // the default stays.

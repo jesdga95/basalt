@@ -90,6 +90,8 @@ public:
     /// computes the rows of its own); before init, which sizes the buffers by it.
     static constexpr int64_t kStreamAllMinDefault = 6144;
     static void set_stream_all_min(int64_t tokens);
+    /// Every layer's experts run on the FP4 path (once the expert layout is loaded).
+    static bool fp4_experts();
 
     /// The streamed ring's depth for the layouts made from now on (`relayout`, `bytes_needed`, `ring_slots_for`); at
     /// most the one `init` laid out.  A shallower ring takes fewer of the lent cache slots.

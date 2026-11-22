@@ -28,8 +28,9 @@ expert tier`:
   card at least as fast as the main one also takes a share of the hottest experts, so both compute routed experts in
   every layer; a slower second card takes the experts after the main card's. Every tier computes its experts with the
   main card's kernels, so where an expert sits does not change its rows. The second card also
-  computes its experts' share of each prompt chunk: of any chunk when it is as fast as the main card, of chunks up to
-  2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
+  computes its experts' share of each prompt chunk: of any chunk when it is as fast as the main card and every layer's
+  experts are NVFP4, of chunks up to 2,559 rows otherwise (a slower card costs a longer chunk more than the experts it
+  saves the main card's link, and without FP4 experts a streamed chunk has no share for an alike card).
   When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
   each; see [the GDN split](../precision/qwen38-flash-next.md#gdn-split-across-two-cards)).
 - **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle. So does a card that would hold no
