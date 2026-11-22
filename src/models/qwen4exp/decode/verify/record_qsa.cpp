@@ -49,11 +49,17 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     // one launch, the same bits
     const bool fused_pre = st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
                            qsa_dec_fused_supported(s);
+    // --kv q4_0 in the same prelude: the rotation and the Q4_0 pack live in that launch, so the layer stops paying
+    // the per-token norm/rope, two FWHT launches, T appends and T indexer appends. Mode 0 only; a streamed q4_0
+    // cache keeps the per-token path, which writes the host copy.
+    const bool fused_q4 = !fused_pre && st.kv_q4 && st.kv_rot && st.kv_mode == 0 && st.host.k_q4 == nullptr &&
+                          qsa_dec_fused_supported(s);
     auto kv_post_args = [&] {
         QsaDecKvPost kp;
         kp.kcur = v_.kcur_; kp.vcur = v_.vcur_; kp.pos_k = pos_k;
         kp.k_norm = (const float*) wkn->data; kp.steps = v_.step_;
         kp.k_q = st.k_q; kp.v_q = st.v_q; kp.k_scale = st.k_scale; kp.v_scale = st.v_scale;
+        if (st.kv_q4) { kp.k_q4 = st.k_q4; kp.v_q4 = st.v_q4; }
         kp.page_table = st.page_table; kp.host = st.host;
         kp.idx_raw = idx_raw; kp.idx_k_norm = (const float*) wikn->data;
         kp.tail = st.idx_tail; kp.dead = st.idx_dead; kp.pooled = st.idx_pooled; kp.block_pos = st.idx_block_pos;
@@ -159,9 +165,10 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         dense_proj(32, wk->native_type, wk->native_data, v_.xq_, v_.kcur_, (int) N, (int) (NKV * HD), n, cs);
         dense_proj(32, wv->native_type, wv->native_data, v_.xq_, v_.vcur_, (int) N, (int) (NKV * HD), n, cs);
     }
-    if (fused_pre) {
+    if (fused_pre || fused_q4) {
         kv_post(kv_post_args(), cs);
         stamp(l, 8);
+        stamp(l, 9);
     } else {
         if (qb) norm_rope(v_.kcur_, wkn, (int) (n * NKV), (int) HD, pos_k);
         else for (int t = 0; t < T; ++t) norm_rope(v_.kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, v_.pos_ + t * NH);

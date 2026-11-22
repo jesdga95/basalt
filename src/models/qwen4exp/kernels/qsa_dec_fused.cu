@@ -6,6 +6,7 @@
 #include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/f16_bits.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/models/qwen4exp/kernels/mrope.hpp"
 
@@ -162,6 +163,59 @@ __device__ __forceinline__ void indexer_append_row(const float* raw, int pos, co
 
 // blocks [0, n * n_kv): row t = b / n_kv, KV head b % n_kv - K norm + RoPE, K and V appends; block n * n_kv: the
 // indexer tail snapshot and the n indexer appends in row order
+// kv_q4.cu's fwht256_kernel, done in shared memory because here the 256 values of a row live one per thread
+// instead of 8 per lane. Same quantity, same order: every element is scaled by 1/16 first, then the index bits are
+// cleared from low to high (1, 2, 4, 8, 16), then the high three (32, 64, 128), each pass pairing a with a + h and
+// subtracting in the order the shuffle version does, so the bits match.
+__device__ __forceinline__ void fwht_row_smem(float* row, int d) {
+    row[d] *= 1.0f / 16.0f;
+    __syncthreads();
+    for (int h = 1; h < HD; h <<= 1) {
+        const float self = row[d];
+        const float partner = row[d ^ h];
+        __syncthreads();
+        row[d] = (d & h) ? __fsub_rn(partner, self) : __fadd_rn(self, partner);
+        __syncthreads();
+    }
+}
+
+// kv_q4.cu's q4_group for one 32-value group (one warp: lane = element within the group), packed straight into the
+// pool. The codes are quantized against the UNROUNDED scale and only the stored fp16 scale is rounded, exactly as
+// that kernel does; ties in |x| resolve to the larger value, so every lane agrees on the scale.
+__device__ __forceinline__ void append_q4_row(float x, int d, long long pos, int h, int n_kv_heads, int page_size,
+                                              const int32_t* table, uint8_t* pool, uint8_t* host_pool) {
+    const int lane = d & 31, b = d >> 5;
+    float amax = abs_ieee(x), mval = x;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float a = __shfl_xor_sync(0xffffffffu, amax, o);
+        const float v = __shfl_xor_sync(0xffffffffu, mval, o);
+        if (a > amax || (a == amax && v > mval)) { amax = a; mval = v; }
+    }
+    const float scale = div_ieee(mval, -8.0f);
+    const float inv = scale != 0.0f ? div_ieee(1.0f, scale) : 0.0f;
+    int q = __float2int_rz(__fmaf_rn(x, inv, 8.5f));
+    q = q < 0 ? 0 : (q > 15 ? 15 : q);
+    const int qhi = __shfl_down_sync(0xffffffffu, q, 16);
+    const uint8_t byte = (uint8_t) (q | (qhi << 4));
+    const uint16_t sbits = f16_from_f32(scale);
+    constexpr int blocks = HD / QK4_0;
+    constexpr int bytes = blocks * (int) sizeof(block_q4_0);
+    const long long page = (long long) table[pos / page_size];
+    if (page >= 0) {
+        const long long row = (page * n_kv_heads + h) * page_size + (pos % page_size);
+        block_q4_0* blk = reinterpret_cast<block_q4_0*>(pool + row * bytes) + b;
+        if (lane == 0) blk->d = sbits;
+        if (lane < 16) blk->qs[lane] = byte;
+    }
+    if (host_pool != nullptr) {
+        const long long row = ((pos / page_size) * n_kv_heads + h) * page_size + (pos % page_size);
+        block_q4_0* blk = reinterpret_cast<block_q4_0*>(host_pool + row * bytes) + b;
+        if (lane == 0) blk->d = sbits;
+        if (lane < 16) blk->qs[lane] = byte;
+    }
+}
+
 template <bool TAB>
 __device__ __forceinline__ void kv_post_dev(const QsaDecKvPost& a, int n, int n_kv, int page_size, const RopeArgs& ra,
                                             int b) {
@@ -179,9 +233,20 @@ __device__ __forceinline__ void kv_post_dev(const QsaDecKvPost& a, int n, int n_
         rope_row<TAB>(row, a.pos_k[t * (a.pos_stride > 0 ? a.pos_stride : n_kv) + h], d, ra);
         const float y = row[d];
         kp[d] = y;
+        if (a.k_q4 != nullptr) {
+            // --kv q4_0 in the fused prelude: rotate K in the row buffer, pack it into Q4_0 blocks
+            fwht_row_smem(row, d);
+            kp[d] = row[d];
+            append_q4_row(row[d], d, pos, h, n_kv, page_size, a.page_table, a.k_q4, a.host.k_q4);
+            row[d] = a.vcur[((size_t) t * n_kv + h) * HD + d];
+            __syncthreads();
+            fwht_row_smem(row, d);
+            append_q4_row(row[d], d, pos, h, n_kv, page_size, a.page_table, a.v_q4, a.host.v_q4);
+        } else {
         append_q8_row(y, d, pos, h, n_kv, page_size, a.page_table, a.k_q, a.k_scale, a.host.k_q, a.host.k_scale, sums);
         const float v = a.vcur[((size_t) t * n_kv + h) * HD + d];
         append_q8_row(v, d, pos, h, n_kv, page_size, a.page_table, a.v_q, a.v_scale, a.host.v_q, a.host.v_scale, sums);
+        }
         return;
     }
     if (a.tail_snap != nullptr)
