@@ -23,6 +23,11 @@ struct HeldMeet {
     bool respelled() const { return held > 0 && !exact; }
 };
 
+/// Whether a respelled held prefix ends before the first image (`-1` means no image).
+inline bool respell_before_media(const HeldMeet& meet, int64_t media_start) {
+    return meet.respelled() && (media_start < 0 || meet.resume <= media_start);
+}
+
 /// The held ids past the common prefix that may be respelled: a reply's worth.
 constexpr int64_t kRespellMax = 1 << 17;
 

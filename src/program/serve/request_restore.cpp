@@ -18,9 +18,9 @@ bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<Img
 // can continue (the live one, or an idle slot's) holds ids that spell exactly the bytes of the prompt's next tokens,
 // ending on a prompt token boundary, the held ids stand for those tokens: the request continues them instead of
 // reading the reply again from a checkpoint (and leaving a copy of the conversation behind in another slot).
-// Not with pictures, when a token has no bytes, or when the longer prompt would leave no room for max_new.
+// Pictures inside the respelled span cannot be matched; ones after its end stay in the prompt tail.
 void Request::respell_prompt() {
-    if (geni || !runtime_.req_imgs.empty() || !runtime_.text_tokenizer_note.empty()) return;
+    if (geni || !runtime_.text_tokenizer_note.empty()) return;
     const auto bytes = [this](int32_t id) { return runtime_.token_bytes(id); };
     const std::vector<int32_t>* best = nullptr;
     HeldMeet meet;
@@ -40,7 +40,9 @@ void Request::respell_prompt() {
             const BSlot& sl = runtime_.bs[(size_t) b];
             if (b != own_slot && !sl.active && sl.cached && sl.cvec == want_cvec && sl.imgs.empty()) offer(sl.ids, b);
         }
-    if (best == nullptr || !meet.respelled()) return;
+    if (best == nullptr) return;
+    const int64_t first_image = runtime_.req_imgs.empty() ? -1 : runtime_.req_imgs.front().start;
+    if (!respell_before_media(meet, first_image)) return;
     const int64_t grown = meet.held + n - meet.resume;
     const int64_t ctx = runtime_.admit_slot >= 0 ? runtime_.slot_context(runtime_.admit_slot) : runtime_.o.max_context;
     if (!respell_fits(grown, n, runtime_.admit_slot >= 0 ? runtime_.admit_max_new : (long long) max_new, ctx)) return;
