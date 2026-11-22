@@ -2259,6 +2259,336 @@ void native_q8_0_mmvq_segments(const void* weights, const Q80Segments& seg, int 
     launch_check();
 }
 
+// ============================ Q8_0 in planes (aligned codes [rows][n_in], fp16 scales [rows][n_in/32]) ============================
+
+namespace {
+
+struct Q8Planes {
+    const int8_t* codes;
+    const half* scales;
+};
+
+__host__ __device__ __forceinline__ Q8Planes q8p_offset(Q8Planes p, int row0, int n_in) {
+    return {p.codes + std::size_t(row0) * n_in, p.scales + std::size_t(row0) * (n_in / 32)};
+}
+
+template<bool SmallK, int NCOLS, int NPRE>
+__device__ __forceinline__ void small_q8p_body(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                                               int n_in, int n_out, int bx) {
+    static_assert(NCOLS == 1 || !SmallK, "columns take the one-row layout");
+    constexpr int Qi = 8;
+    constexpr int ROWS = SmallK ? WARPS : 1;
+    constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * bx;
+    const int blocks_per_row = n_in / 32;
+    const int x_stride = blocks_per_row;
+    const int kbx0 = tid / (Qi / 2);
+    const int kqs = 2 * (tid % (Qi / 2));
+    float tmp[NCOLS][ROWS] = {};
+    if constexpr (NPRE > 0) {
+        float d0[ROWS][NPRE];
+        int v0[ROWS][NPRE], v1[ROWS][NPRE];
+#pragma unroll
+        for (int p = 0; p < NPRE; ++p) {
+            const int kbx = kbx0 + p * BLOCKS_PER_ITER;
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (kbx < blocks_per_row && row0 + i < n_out) {
+                    const int2 q2 = __ldg(reinterpret_cast<const int2*>(w.codes + std::size_t(row0 + i) * n_in + kbx * 32) + (kqs >> 1));
+                    v0[i][p] = q2.x;
+                    v1[i][p] = q2.y;
+                    d0[i][p] = __half2float(__ldg(w.scales + std::size_t(row0 + i) * blocks_per_row + kbx));
+                }
+            }
+        }
+        pdl_launch_dependents();
+        pdl_wait();
+#pragma unroll
+        for (int p = 0; p < NPRE; ++p) {
+            const int kbx = kbx0 + p * BLOCKS_PER_ITER;
+            if (kbx < blocks_per_row) {
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    const Q81Block* xj = x + std::size_t(j) * x_stride + kbx;
+                    const int* u = reinterpret_cast<const int*>(xj->qs);
+                    const float d1 = __low2float(xj->ds);
+#pragma unroll
+                    for (int i = 0; i < ROWS; ++i) {
+                        if (row0 + i < n_out) {
+                            int sumi = 0;
+                            sumi = DP4A(v0[i][p], u[kqs], sumi);
+                            sumi = DP4A(v1[i][p], u[kqs + 1], sumi);
+                            tmp[j][i] += d0[i][p] * d1 * float(sumi);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        pdl_wait();
+    }
+    for (int kbx = kbx0 + NPRE * BLOCKS_PER_ITER; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const int2 q2 = __ldg(reinterpret_cast<const int2*>(w.codes + std::size_t(row0 + i) * n_in + kbx * 32) + (kqs >> 1));
+                const float d = __half2float(__ldg(w.scales + std::size_t(row0 + i) * blocks_per_row + kbx));
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    const Q81Block* xj = x + std::size_t(j) * x_stride + kbx;
+                    const int* u = reinterpret_cast<const int*>(xj->qs);
+                    int sumi = 0;
+                    sumi = DP4A(q2.x, u[kqs], sumi);
+                    sumi = DP4A(q2.y, u[kqs + 1], sumi);
+                    tmp[j][i] += d * __low2float(xj->ds) * float(sumi);
+                }
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][NCOLS][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < WARPS - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
+    }
+}
+
+template<bool SmallK, int NCOLS, int NPRE>
+__launch_bounds__(WARPS * WARP, NCOLS > 1 ? (NPRE > 0 ? 8 : 4) : 1)
+__global__ void native_q8p_kernel(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y, int n_in, int n_out) {
+    small_q8p_body<SmallK, NCOLS, NPRE>(w, x, y, n_in, n_out, int(blockIdx.x));
+}
+
+template<int NCOLS, int NPRE>
+__launch_bounds__(WARPS * WARP, NCOLS > 1 ? (NPRE > 0 ? 8 : 4) : 1)
+__global__ void native_q8p_seg_kernel(Q8Planes w, SegArgs a, int n_in) {
+    const SegPick p = seg_pick(a);
+    small_q8p_body<false, NCOLS, NPRE>(q8p_offset(w, p.row0, n_in), p.x, p.y, n_in, p.n_out, p.bx);
+}
+
+__device__ __forceinline__ void q8p_mma_body(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                                             int n_in, int n_out, int ncols, int bx) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ float s_part[8 * 16 * 33];
+    const int wp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int row0 = bx * 16, nb = n_in / 32;
+    const int ra = min(row0 + g, n_out - 1), rb = min(row0 + g + 8, n_out - 1);
+    const int8_t* ca = w.codes + (size_t) ra * n_in;
+    const int8_t* cb = w.codes + (size_t) rb * n_in;
+    const half* sa = w.scales + (size_t) ra * nb;
+    const half* sb = w.scales + (size_t) rb * nb;
+    auto load_a = [&](int kbx) {
+        QmA r;
+        const int* qa = reinterpret_cast<const int*>(ca + (size_t) kbx * 32);
+        const int* qb = reinterpret_cast<const int*>(cb + (size_t) kbx * 32);
+        r.a0 = __ldg(qa + t);
+        r.a2 = __ldg(qa + 4 + t);
+        r.a1 = __ldg(qb + t);
+        r.a3 = __ldg(qb + 4 + t);
+        r.da = __half2float(__ldg(sa + kbx));
+        r.db = __half2float(__ldg(sb + kbx));
+        return r;
+    };
+    QmA pre[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j)
+        if (wp + 32 * j < nb) pre[j] = load_a(wp + 32 * j);
+    pdl_launch_dependents();
+    pdl_wait();
+    const Q81Block* xg = x + (size_t) min(g, ncols - 1) * nb;
+    const Q81Block* xc0 = x + (size_t) min(2 * t, ncols - 1) * nb;
+    const Q81Block* xc1 = x + (size_t) min(2 * t + 1, ncols - 1) * nb;
+    float v[4][4];
+    const bool lo = t < 2;
+    auto block = [&](const QmA& A, int kbx, float (&acc)[4][4]) {
+        const uint32_t b0 = g < ncols ? (uint32_t) reinterpret_cast<const int*>(xg[kbx].qs)[t] : 0u;
+        const uint32_t b1 = g < ncols ? (uint32_t) reinterpret_cast<const int*>(xg[kbx].qs)[4 + t] : 0u;
+        const float dx0 = __low2float(xc0[kbx].ds), dx1 = __low2float(xc1[kbx].ds);
+#pragma unroll
+        for (int grp = 0; grp < 4; ++grp) {
+            const bool mine = (grp & 1) ? !lo : lo, hi = grp >= 2;
+            const uint32_t m0 = mine && !hi ? (uint32_t) A.a0 : 0u, m1 = mine && !hi ? (uint32_t) A.a1 : 0u;
+            const uint32_t m2 = mine && hi ? (uint32_t) A.a2 : 0u, m3 = mine && hi ? (uint32_t) A.a3 : 0u;
+            int si[4];
+            qm_mma(si, m0, m1, m2, m3, b0, b1);
+            acc[grp][0] += A.da * dx0 * float(si[0]);
+            acc[grp][1] += A.da * dx1 * float(si[1]);
+            acc[grp][2] += A.db * dx0 * float(si[2]);
+            acc[grp][3] += A.db * dx1 * float(si[3]);
+        }
+    };
+#pragma unroll
+    for (int yy = 0; yy < 4; ++yy) {
+        float acc[4][4];
+#pragma unroll
+        for (int a = 0; a < 4; ++a)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[a][q] = 0.0f;
+        const int c = 8 * yy + wp;
+        if (yy == 0) {
+#pragma unroll
+            for (int j = 0; j < 3; ++j)
+                if (c + 32 * j < nb) block(pre[j], c + 32 * j, acc);
+            for (int kbx = c + 96; kbx < nb; kbx += 32) block(load_a(kbx), kbx, acc);
+        } else {
+            for (int kbx = c; kbx < nb; kbx += 32) block(load_a(kbx), kbx, acc);
+        }
+#pragma unroll
+        for (int a = 0; a < 4; ++a)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) v[a][q] = yy == 0 ? acc[a][q] : v[a][q] + acc[a][q];
+    }
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int row = 8 * (q >> 1) + g, col = 2 * t + (q & 1);
+#pragma unroll
+        for (int a = 0; a < 4; ++a) s_part[(col * 16 + row) * 33 + 4 * wp + a] = v[a][q];
+    }
+    __syncthreads();
+    const int tid = wp * 32 + lane;
+    if (tid < ncols * 16) {
+        const int row = tid & 15, col = tid >> 4;
+        const float* p = s_part + (col * 16 + row) * 33;
+        float r16[16];
+#pragma unroll
+        for (int L = 0; L < 16; ++L) r16[L] = p[L] + p[L + 16];
+        float r8[8];
+#pragma unroll
+        for (int L = 0; L < 8; ++L) r8[L] = r16[L] + r16[L + 8];
+        float r4[4];
+#pragma unroll
+        for (int L = 0; L < 4; ++L) r4[L] = r8[L] + r8[L + 4];
+        const float r2a = r4[0] + r4[2], r2b = r4[1] + r4[3];
+        if (row0 + row < n_out) y[(size_t) col * n_out + row0 + row] = r2a + r2b;
+    }
+#elif defined(__CUDA_ARCH__)
+    __trap();
+#endif
+}
+
+__global__ void __launch_bounds__(256) native_q8p_mma_kernel(Q8Planes w, const Q81Block* __restrict__ x,
+                                                             float* __restrict__ y, int n_in, int n_out, int ncols) {
+    q8p_mma_body(w, x, y, n_in, n_out, ncols, int(blockIdx.x));
+}
+
+__global__ void __launch_bounds__(256) native_q8p_mma_seg_kernel(Q8Planes w, SegArgs a, int n_in, int ncols) {
+    const SegPick p = seg_pick(a);
+    q8p_mma_body(q8p_offset(w, p.row0, n_in), p.x, p.y, n_in, p.n_out, ncols, p.bx);
+}
+
+void launch_q8p(Q8Planes w, const Q81Block* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    const dim3 threads(WARP, WARPS);
+    constexpr int BPI = 2 * WARPS * WARP / 8;
+    const bool small_k = (n_in / 32) < BPI;
+    if (ncols == 1) {
+        if (small_k) launch_pdl(native_q8p_kernel<true, 1, 3>, dim3(unsigned((n_out + WARPS - 1) / WARPS)), threads, 0, s, w, x, y, n_in, n_out);
+        else launch_pdl(native_q8p_kernel<false, 1, 3>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out);
+        return;
+    }
+    if (!small_k && mmvq_mma_sms() != 0 && ((n_out >= 65536 && ncols >= 4) || (n_out >= 4096 && ncols >= 7))) {
+        launch_pdl(native_q8p_mma_kernel, dim3(unsigned((n_out + 15) / 16)), dim3(256), 0, s, w, x, y, n_in, n_out, ncols);
+        return;
+    }
+    const dim3 grid{unsigned(n_out)};
+    switch (ncols) {
+    case 2: launch_pdl(native_q8p_kernel<false, 2, 3>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 3: launch_pdl(native_q8p_kernel<false, 3, 3>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 4: launch_pdl(native_q8p_kernel<false, 4, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 5: launch_pdl(native_q8p_kernel<false, 5, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 6: launch_pdl(native_q8p_kernel<false, 6, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 7: launch_pdl(native_q8p_kernel<false, 7, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    default: launch_pdl(native_q8p_kernel<false, 8, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    }
+}
+
+}  // namespace
+
+void native_q8_planes_mmvq(const void* planes, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                           void* stream) {
+    validate_shape(n_in, ncols, 32);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(planes);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto* codes = static_cast<const int8_t*>(planes);
+    const auto* scales = reinterpret_cast<const half*>(codes + std::size_t(n_out) * n_in);
+    launch_q8p({codes, scales}, static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out, ncols,
+               static_cast<cudaStream_t>(stream));
+    launch_check();
+}
+
+void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q80Segments& seg, int n_in, int ncols,
+                                    void* stream) {
+    if (seg.n < 1 || seg.n > 3) throw std::invalid_argument("native_q8_planes_mmvq_segments takes 1 to 3 segments");
+    validate_shape(n_in, ncols, 32);
+    validate_pointer(planes);
+    validate_stream(stream);
+    const auto* codes = static_cast<const int8_t*>(planes);
+    const auto* scales = reinterpret_cast<const half*>(codes + std::size_t(total_rows) * n_in);
+    const Q8Planes w{codes, scales};
+    const auto s = static_cast<cudaStream_t>(stream);
+    constexpr int BPI = 2 * WARPS * WARP / 8;
+    for (int i = 0; i < seg.n; ++i) {
+        validate_pointer(seg.x[i]);
+        validate_pointer(seg.y[i]);
+        if (seg.n_out[i] <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    }
+    if (n_in / 32 < BPI) {
+        for (int j = 0; j < seg.n; ++j)
+            launch_q8p(q8p_offset(w, seg.row0[j], n_in), static_cast<const Q81Block*>(seg.x[j]), seg.y[j], n_in,
+                       seg.n_out[j], ncols, s);
+        launch_check();
+        return;
+    }
+    int sum_rows = 0;
+    for (int i = 0; i < seg.n; ++i) sum_rows += seg.n_out[i];
+    const bool mma = mmvq_mma_sms() != 0 && ((sum_rows >= 65536 && ncols >= 4) || (sum_rows >= 4096 && ncols >= 7));
+    const int rows_a_block = mma ? 16 : 1;
+    SegArgs a{};
+    int end = 0;
+    for (int i = 0; i < 3; ++i) {
+        const int k = i < seg.n ? i : seg.n - 1;
+        if (i < seg.n) end += (seg.n_out[i] + rows_a_block - 1) / rows_a_block;
+        a.end[i] = end;
+        a.row0[i] = seg.row0[k];
+        a.n_out[i] = seg.n_out[k];
+        a.x[i] = static_cast<const Q81Block*>(seg.x[k]);
+        a.y[i] = seg.y[k];
+    }
+    const dim3 grid{unsigned(end)}, threads(WARP, WARPS);
+    if (mma) {
+        launch_pdl(native_q8p_mma_seg_kernel, grid, dim3(256), 0, s, w, a, n_in, ncols);
+        launch_check();
+        return;
+    }
+    switch (ncols) {
+    case 1: launch_pdl(native_q8p_seg_kernel<1, 3>, grid, threads, 0, s, w, a, n_in); break;
+    case 2: launch_pdl(native_q8p_seg_kernel<2, 3>, grid, threads, 0, s, w, a, n_in); break;
+    case 3: launch_pdl(native_q8p_seg_kernel<3, 3>, grid, threads, 0, s, w, a, n_in); break;
+    case 4: launch_pdl(native_q8p_seg_kernel<4, 0>, grid, threads, 0, s, w, a, n_in); break;
+    case 5: launch_pdl(native_q8p_seg_kernel<5, 0>, grid, threads, 0, s, w, a, n_in); break;
+    case 6: launch_pdl(native_q8p_seg_kernel<6, 0>, grid, threads, 0, s, w, a, n_in); break;
+    case 7: launch_pdl(native_q8p_seg_kernel<7, 0>, grid, threads, 0, s, w, a, n_in); break;
+    default: launch_pdl(native_q8p_seg_kernel<8, 0>, grid, threads, 0, s, w, a, n_in); break;
+    }
+    launch_check();
+}
+
 void native_q8_0_mmvq_stream(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, void* stream) {
     validate_shape(n_in, 1, 32);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");

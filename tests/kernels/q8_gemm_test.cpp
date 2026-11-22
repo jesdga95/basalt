@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "basalt/prefill/moe_mmq.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 
 namespace {
@@ -277,6 +278,79 @@ void test_invariance_and_segmented(std::mt19937& rng) {
     w2.destroy();
 }
 
+void test_q8_planes_mmvq_parity(std::mt19937& rng) {
+    namespace bk = basalt::kernels;
+    cudaStream_t st = nullptr;
+    ck(cudaStreamCreate(&st), "stream");
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    struct Sh { const char* name; int M, K; };
+    const Sh shs[] = {{"w.proj [8664x2304]", 8664, 2304}, {"w.out [2304x3072]", 2304, 3072}};
+    for (const auto& s : shs) {
+        std::vector<float> wf((size_t) s.M * s.K);
+        for (float& v : wf) v = dist(rng);
+        std::vector<block_q8_0> wb;
+        make_q8_0(wf, s.M, s.K, wb);
+        const size_t bytes = wb.size() * sizeof(block_q8_0);
+        std::vector<float> hx((size_t) 8 * s.K);
+        for (float& v : hx) v = dist(rng);
+        void *draw = nullptr, *dpl = nullptr, *dxq = nullptr;
+        float *dx = nullptr, *y0 = nullptr, *y1 = nullptr;
+        ck(cudaMalloc(&draw, bytes), "raw");
+        ck(cudaMemcpy(draw, wb.data(), bytes, cudaMemcpyHostToDevice), "cpy raw");
+        ck(cudaMalloc(&dpl, bytes), "pl");
+        bk::wgemm::q8_planes(draw, s.M, s.K, dpl, st);
+        ck(cudaMalloc(&dx, hx.size() * sizeof(float)), "dx");
+        ck(cudaMemcpy(dx, hx.data(), hx.size() * sizeof(float), cudaMemcpyHostToDevice), "cpy dx");
+        ck(cudaMalloc(&dxq, bk::native_q8_1_bytes(s.K, 8)), "dxq");
+        bk::native_quantize_q8_1(dx, dxq, s.K, 8, st);
+        ck(cudaMalloc(&y0, (size_t) 8 * s.M * sizeof(float)), "y0");
+        ck(cudaMalloc(&y1, (size_t) 8 * s.M * sizeof(float)), "y1");
+        for (int T = 1; T <= 8; ++T) {
+            bk::native_q8_0_mmvq(draw, dxq, y0, s.K, s.M, T, st);
+            bk::native_q8_planes_mmvq(dpl, dxq, y1, s.K, s.M, T, st);
+            ck(cudaStreamSynchronize(st), "sync mmvq");
+            std::vector<uint32_t> a((size_t) T * s.M), b((size_t) T * s.M);
+            ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "d2h a");
+            ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "d2h b");
+            for (size_t i = 0; i < a.size(); ++i) {
+                if (a[i] != b[i]) {
+                    std::printf("FAIL native_q8_planes_mmvq %s T=%d at %zu\n", s.name, T, i);
+                    std::exit(1);
+                }
+            }
+        }
+        std::printf("PASS native_q8_planes_mmvq %s T=1..8: bitwise equal to native_q8_0_mmvq\n", s.name);
+        if (s.M == 8664) {
+            bk::Q80Segments sg0, sg1;
+            sg0.n = sg1.n = 3;
+            sg0.row0[0] = sg1.row0[0] = 0;    sg0.n_out[0] = sg1.n_out[0] = 6552;
+            sg0.row0[1] = sg1.row0[1] = 6552; sg0.n_out[1] = sg1.n_out[1] = 1056;
+            sg0.row0[2] = sg1.row0[2] = 7608; sg0.n_out[2] = sg1.n_out[2] = 1056;
+            for (int k = 0; k < 3; ++k) sg0.x[k] = sg1.x[k] = dxq;
+            sg0.y[0] = y0; sg0.y[1] = y0 + 8 * 6552; sg0.y[2] = y0 + 8 * 7608;
+            sg1.y[0] = y1; sg1.y[1] = y1 + 8 * 6552; sg1.y[2] = y1 + 8 * 7608;
+            for (int T = 1; T <= 8; ++T) {
+                bk::native_q8_0_mmvq_segments(draw, sg0, s.K, T, st);
+                bk::native_q8_planes_mmvq_segments(dpl, s.M, sg1, s.K, T, st);
+                ck(cudaStreamSynchronize(st), "sync seg");
+                std::vector<uint32_t> a((size_t) 8 * s.M), b((size_t) 8 * s.M);
+                ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "d2h sa");
+                ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "d2h sb");
+                for (int i = 0; i < T * 6552; ++i)
+                    if (a[i] != b[i]) { std::printf("FAIL seg Q T=%d\n", T); std::exit(1); }
+                for (int i = 0; i < T * 1056; ++i)
+                    if (a[8 * 6552 + i] != b[8 * 6552 + i] || a[8 * 7608 + i] != b[8 * 7608 + i]) {
+                        std::printf("FAIL seg KV T=%d\n", T);
+                        std::exit(1);
+                    }
+            }
+            std::printf("PASS native_q8_planes_mmvq_segments [6552,1056,1056]x2304 T=1..8: bitwise equal\n");
+        }
+        cudaFree(draw); cudaFree(dpl); cudaFree(dx); cudaFree(dxq); cudaFree(y0); cudaFree(y1);
+    }
+    cudaStreamDestroy(st);
+}
+
 void run_bench(std::mt19937& rng) {
     struct Shape {
         const char* name;
@@ -410,6 +484,7 @@ int main(int argc, char** argv) {
     test_case(rng, 130, 2304, 3072, true);
     test_case(rng, 257, 6552, 2304, false);
     test_invariance_and_segmented(rng);
+    test_q8_planes_mmvq_parity(rng);
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) run_bench(rng);
     }

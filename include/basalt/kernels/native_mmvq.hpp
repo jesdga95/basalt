@@ -65,6 +65,13 @@ struct Q80Segments {
 };
 void native_q8_0_mmvq_segments(const void* weights, const Q80Segments& seg, int n_in, int ncols, void* stream);
 
+// Bitwise-identical Q8_0 MMVQ over plane-separated weights (wgemm::q8_planes: int8 codes [total_rows][n_in], then
+// fp16 scales [total_rows][n_in / 32]). Aligned code loads; shares the code plane zero-copy with prefill::q8.
+void native_q8_planes_mmvq(const void* planes, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                           void* stream);
+void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q80Segments& seg, int n_in, int ncols,
+                                    void* stream);
+
 // native_q8_0_mmvq at one column with the weights read cache-streaming (first in line for L2 eviction): for a
 // matrix read once per use, so it does not push out what the kernels around it read again. The same bits.
 void native_q8_0_mmvq_stream(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, void* stream);
