@@ -314,13 +314,14 @@ void ring_store(const float* x, int ld, int off, int width, const int32_t* pos, 
     ring_store_kernel<<<dim3((unsigned) ((width + 255) / 256), (unsigned) n), 256, 0, s>>>(x, ld, off, width, pos, rows, ring);
 }
 
-__global__ void attn_gate_kernel(const float* __restrict__ attn, const float* __restrict__ yq, int n4, float* __restrict__ out) {
+__global__ void attn_gate_kernel(const float* __restrict__ attn, const float* __restrict__ yq, int64_t yq_ld, int n4,
+                                 float* __restrict__ out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n4) return;
     constexpr int kOut4 = (kHeads * kHeadDim) / 4;
     const int r = i / kOut4, c4 = i - r * kOut4;
     const float4 a = reinterpret_cast<const float4*>(attn)[i];
-    const float4 g = *reinterpret_cast<const float4*>(yq + (size_t) r * kProjQ + kOffGate + c4 * 4);
+    const float4 g = *reinterpret_cast<const float4*>(yq + (size_t) r * yq_ld + kOffGate + c4 * 4);
     reinterpret_cast<float4*>(out)[i] =
         make_float4(a.x * sigmoidf_(g.x), a.y * sigmoidf_(g.y), a.z * sigmoidf_(g.z), a.w * sigmoidf_(g.w));
 }
@@ -597,10 +598,10 @@ void attn_prepare(const AttnPrep& a, int rows, void* stream) {
     check("attn_prepare/rings");
 }
 
-void attn_gate(const float* attn, const float* yq, int rows, float* out, void* stream) {
+void attn_gate(const float* attn, const float* yq, int rows, float* out, void* stream, int64_t yq_ld) {
     const int n4 = rows * (kHeads * kHeadDim / 4);
     if (n4 <= 0) return;
-    attn_gate_kernel<<<(n4 + 255) / 256, 256, 0, (cudaStream_t) stream>>>(attn, yq, n4, out);
+    attn_gate_kernel<<<(n4 + 255) / 256, 256, 0, (cudaStream_t) stream>>>(attn, yq, yq_ld, n4, out);
     check("attn_gate");
 }
 

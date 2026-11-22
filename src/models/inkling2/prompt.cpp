@@ -164,7 +164,7 @@ public:
             mmq::load(type, rows);
             return true;
         };
-        if (!ready(8, kProjQ) || !ready(8, kProjKV) || !ready(8, kKvHeads * kHeadDim) || !ready(8, E)) return false;
+        if (!ready(8, kProj) || !ready(8, kProjQ) || !ready(8, kProjKV) || !ready(8, kKvHeads * kHeadDim) || !ready(8, E)) return false;
         for (int l = 0; l < g_.n_layers; ++l) {
             const LayerWeights& w = m_.layer(l);
             if (!ready(w.gu_type, 2 * (int64_t) F) || !ready(w.d_type, E)) return false;
@@ -338,20 +338,25 @@ private:
             const float* wn[3] = {full ? w.q_norm : w.attn_norm, full ? w.k_norm : w.attn_norm, full ? w.v_norm : w.attn_norm};
             for (int j = 0; j < 3; ++j) bk::rms_norm_rows(in[j], wn[j], rows, E, g_.rms_eps, b_.nrm + j * RE, stream_);
         }
-        // the projections: the query input's rows, then the key's, then the value's
+        // the projections: fused Q+K+V when all three share the same normed input, else separate per stream
         const size_t row_bytes = (size_t) E / 32 * 34;
         quant(b_.nrm, E, rows, 8);
-        product(w.proj, kProjQ, E, rows, b_.yq);
-        if (!one) quant(b_.nrm + RE, E, rows, 8);
-        product(w.proj + (size_t) kRowK * row_bytes, kProjKV, E, rows, b_.yk);
-        if (!one) quant(b_.nrm + 2 * RE, E, rows, 8);
-        product(w.proj + (size_t) kRowV * row_bytes, kProjKV, E, rows, b_.yv);
+        if (one) {
+            product(w.proj, kProj, E, rows, b_.yq);
+        } else {
+            product(w.proj, kProjQ, E, rows, b_.yq);
+            quant(b_.nrm + RE, E, rows, 8);
+            product(w.proj + (size_t) kRowK * row_bytes, kProjKV, E, rows, b_.yk);
+            quant(b_.nrm + 2 * RE, E, rows, 8);
+            product(w.proj + (size_t) kRowV * row_bytes, kProjKV, E, rows, b_.yv);
+        }
         // convolutions, clips and the keys: a sliding-window visit stages the chunk's own, a full visit writes its cells
         const bool fp8 = m_.cache_fp8();
         AttnPrep ap;
         ap.yq = b_.yq;
-        ap.yk = b_.yk;
-        ap.yv = b_.yv;
+        ap.yk = one ? b_.yq + kProjQ : b_.yk;
+        ap.yv = one ? b_.yq + kProjQ + kProjKV : b_.yv;
+        if (one) ap.ldq = ap.ldk = ap.ldv = kProj;
         ap.pos = b_.pos;
         ap.full = full;
         ap.k_conv = w.k_conv;
@@ -390,7 +395,7 @@ private:
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b_.attn, stream_);
         if (c.ring) stage_to_ring(b_.k_stage, b_.v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window, fp8 ? 1 : 2, stream_);
-        attn_gate(b_.attn, b_.yq, rows, b_.q, stream_);   // the queries are spent: the gated rows go there
+        attn_gate(b_.attn, b_.yq, rows, b_.q, stream_, one ? kProj : kProjQ);   // the queries are spent: the gated rows go there
         quant(b_.q, kOut, rows, 8);
         product(w.out, E, kOut, rows, b_.o);
         // the attention's convolution and the residual: a block's first layer starts a new sum
