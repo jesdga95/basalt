@@ -112,12 +112,35 @@ struct Bufs {
     }
 };
 
+// The forward scratch every session of a model shares (docs/design/batching.md, "Per-slot state and shared scratch"): the row
+// buffers of a decode window, the experts' staging and the products' workspaces. The engine runs one call at a time and each call
+// syncs its stream before it returns, so one set serves every session; only a conversation's own state is per session.
+struct Scratch {
+    Bufs dec;
+    std::vector<void*> dev, pinned;
+    float *iscore = nullptr, *ex_rows = nullptr;
+    int32_t *iidx_meta = nullptr, *pos_d = nullptr, *pos_h = nullptr, *heads_ids = nullptr, *heads_bounds = nullptr, *bounds_tab = nullptr;
+    void *attw = nullptr, *q8 = nullptr, *xq_n = nullptr, *ex_xq = nullptr, *ex_scr = nullptr, *ex_plan = nullptr, *ex_plan2 = nullptr;
+    void *xq1 = nullptr, *xq2 = nullptr;
+    struct Staged {
+        uint8_t* blobs = nullptr;
+        int32_t *tok = nullptr, *bounds = nullptr;
+    } stage[2];
+    const float** rowptr_d = nullptr;
+    const float** h_rowptr = nullptr;
+    void* h_plan = nullptr;
+    ~Scratch() {
+        dec.release();
+        for (void* p : dev) cudaFree(p);
+        for (void* p : pinned) cudaFreeHost(p);
+    }
+};
+
 class Session final : public model::BatchSession {
 public:
     explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
         settle_early();
-        dec_.release();
         big_.release();
         platform::free_aligned(cpu_act_);
         std::string e;
@@ -166,47 +189,13 @@ public:
         };
         fin_ = f(kMaxWindow * E);
         const int64_t pools = ctx / g_.idx_pool + 1;
-        iscore_ = f(pools * kIdxRows);
-        iidx_meta_ = (int32_t*) alloc((size_t) kIdxRows * 3 * 4, ok);
-        pos_d_ = (int32_t*) alloc(16, ok);
-        if (ok && cudaMallocHost((void**) &pos_h_, 16) == cudaSuccess) pinned_.push_back(pos_h_);
-        else ok = false;
         ra_mark_ = (uint32_t*) alloc(8, ok);
         if (ok) cudaMemset(ra_mark_, 0, 8);
         cells_stride_ = g_.idx_top_k + 2 * g_.idx_pool;
         max_heads_ = max_heads;
-        size_t attw = 0;   // the chunked attention's workspace: the largest a layer needs; zero from the start
-        for (int l = 0; l < g_.n_layers; ++l) attw = std::max(attw, mla_attend_work_bytes(g_.heads[(size_t) l], max_cells(l), kMaxWindow));
-        attw_ = alloc(attw, ok);
-        if (ok) cudaMemset(attw_, 0, attw);
         logits_ = f((int64_t) kMaxWindow * g_.n_vocab); pick_ = (int32_t*) alloc(4 * 32, ok);
         pick_h_ = (int32_t*) pin(kMaxWindow);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxWindow, (int) g_.n_vocab) + (int64_t) kMaxWindow * (bk::kLogprobStride + 1));
-        q8_ = alloc(std::max<size_t>(bk::native_q8_1_bytes(16384, kMaxWindow), 1 << 16), ok);
-        xq_n_ = alloc(bk::native_q8_1_bytes(g_.n_embd, kMaxWindow), ok);
-        ex_xq_ = alloc(bk::native_q8_1_bytes(g_.n_latent, kMaxWindow), ok);
-        ex_scr_ = alloc(bk::native_expert_scratch_bytes(kLookupK, g_.n_ff_exp), ok);
-        ex_rows_ = f((int64_t) kLookupK * g_.n_latent);
-        ex_plan_ = alloc(sizeof(WindowPut), ok);
-        ex_plan2_ = alloc(sizeof(WindowPlan), ok);
-        // the prompt path's experts: two staged launches (blobs, rows and bounds), the pairs' outputs, and the quantised rows
-        {
-            namespace mmq = basalt::prefill::mmq;
-            stride_ = m_.expert_stride();
-            for (Stage& b : stage_) {
-                b.blobs = (uint8_t*) alloc(stride_ * kStageExperts, ok);
-                b.tok = (int32_t*) alloc((size_t) kLaunchRows * 4, ok);
-                b.bounds = (int32_t*) alloc((kStageExperts + 1) * 4, ok);
-                if (cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) != cudaSuccess) ok = false;
-            }
-            if (cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) ok = false;
-            xq1_ = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
-            xq2_ = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
-        }
-        heads_ids_ = (int32_t*) alloc((size_t) max_heads * kAttRows * 4, ok);
-        heads_bounds_ = (int32_t*) alloc((size_t) (max_heads + 1) * 4, ok);
-        rowptr_d_ = (const float**) alloc(kLookupK * sizeof(void*), ok);
-        h_rowptr_ = (const float**) pin(kLookupK * 2);
         // the router's ids reach the host through mapped memory behind a sequence word; the weighted sum waits for a word the
         // host writes once the CPU's and the second card's rows landed
         {
@@ -228,16 +217,22 @@ public:
                 if (cudaHostGetDevicePointer((void**) &stage_d_, stage_h_, 0) != cudaSuccess) ok = false;
             }
         }
-        // MMQ's row bounds {0, n} of a product of n rows, for every n of an attention step
-        bounds_tab_ = (int32_t*) alloc((size_t) 2 * (kAttRows + 1) * 4, ok);
-        if (ok) {
-            std::vector<int32_t> tab((size_t) 2 * (kAttRows + 1));
-            for (int n = 0; n <= kAttRows; ++n) tab[(size_t) 2 * n + 1] = n;
-            cudaMemcpy(bounds_tab_, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
-        }
         rope_dev_ = (int32_t*) alloc((size_t) ctx * 12, ok);   // [vision] the 3-D rotary position of every cell
-        if (cudaHostAlloc((void**) &h_plan_, sizeof(WindowPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
-        else pinned_.push_back(h_plan_);
+        stride_ = m_.expert_stride();
+        for (Stage& b : stage_)
+            if (cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) != cudaSuccess) ok = false;
+        if (cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) ok = false;
+        // the forward scratch: the first session allocates it, the rest share it
+        if (ok) {
+            std::shared_ptr<void>& slot = m_.forward_scratch();
+            if (!slot) {
+                auto sc = std::make_shared<Scratch>();
+                if (!build_scratch(*sc, err)) return false;
+                slot = sc;
+            }
+            sc_ = std::static_pointer_cast<Scratch>(slot);
+            adopt(*sc_);
+        }
         cache_.assign((size_t) g_.n_layers, nullptr);
         ival_.assign((size_t) g_.n_layers, nullptr);
         igate_.assign((size_t) g_.n_layers, nullptr);
@@ -262,13 +257,85 @@ public:
             return false;
         }
         if (!ensure_positions(kv_base(), err)) return false;   // the elastic KV's base; the rest comes from the expert tier
-        if (!make_bufs(dec_, kMaxWindow, err)) return false;
-        use(dec_);
+        use(sc_->dec);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
         if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
             return false;
         dfly_.on_row([this](int j, int32_t tok) { early_draft_row(j, tok); });
         return true;
+    }
+
+    // The shared forward scratch, allocated once (alloc and pin put it in `sc`, which frees it with the last session).
+    bool build_scratch(Scratch& sc, std::string& err) {
+        const int64_t ctx = m_.context();
+        namespace mmq = basalt::prefill::mmq;
+        bool ok = true;
+        alloc_to_ = &sc.dev;
+        pin_to_ = &sc.pinned;
+        auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
+        const int64_t pools = ctx / g_.idx_pool + 1;
+        sc.iscore = f(pools * kIdxRows);
+        sc.iidx_meta = (int32_t*) alloc((size_t) kIdxRows * 3 * 4, ok);
+        sc.pos_d = (int32_t*) alloc(16, ok);
+        if (ok && cudaMallocHost((void**) &sc.pos_h, 16) == cudaSuccess) sc.pinned.push_back(sc.pos_h);
+        else ok = false;
+        size_t attw = 0;   // the chunked attention's workspace: the largest a layer needs; zero from the start
+        for (int l = 0; l < g_.n_layers; ++l) attw = std::max(attw, mla_attend_work_bytes(g_.heads[(size_t) l], max_cells(l), kMaxWindow));
+        sc.attw = alloc(attw, ok);
+        if (ok) cudaMemset(sc.attw, 0, attw);
+        sc.q8 = alloc(std::max<size_t>(bk::native_q8_1_bytes(16384, kMaxWindow), 1 << 16), ok);
+        sc.xq_n = alloc(bk::native_q8_1_bytes(g_.n_embd, kMaxWindow), ok);
+        sc.ex_xq = alloc(bk::native_q8_1_bytes(g_.n_latent, kMaxWindow), ok);
+        sc.ex_scr = alloc(bk::native_expert_scratch_bytes(kLookupK, g_.n_ff_exp), ok);
+        sc.ex_rows = f((int64_t) kLookupK * g_.n_latent);
+        sc.ex_plan = alloc(sizeof(WindowPut), ok);
+        sc.ex_plan2 = alloc(sizeof(WindowPlan), ok);
+        // the prompt path's experts: two staged launches (blobs, rows and bounds), the pairs' outputs, and the quantised rows
+        const size_t stride = m_.expert_stride();
+        for (Scratch::Staged& b : sc.stage) {
+            b.blobs = (uint8_t*) alloc(stride * kStageExperts, ok);
+            b.tok = (int32_t*) alloc((size_t) kLaunchRows * 4, ok);
+            b.bounds = (int32_t*) alloc((kStageExperts + 1) * 4, ok);
+        }
+        sc.xq1 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
+        sc.xq2 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
+        sc.heads_ids = (int32_t*) alloc((size_t) max_heads_ * kAttRows * 4, ok);
+        sc.heads_bounds = (int32_t*) alloc((size_t) (max_heads_ + 1) * 4, ok);
+        sc.rowptr_d = (const float**) alloc(kLookupK * sizeof(void*), ok);
+        {
+            void* q = nullptr;
+            if (ok && cudaMallocHost(&q, kLookupK * 2 * 4) == cudaSuccess) { sc.pinned.push_back(q); sc.h_rowptr = (const float**) q; }
+            else ok = false;
+        }
+        // MMQ's row bounds {0, n} of a product of n rows, for every n of an attention step
+        sc.bounds_tab = (int32_t*) alloc((size_t) 2 * (kAttRows + 1) * 4, ok);
+        if (ok) {
+            std::vector<int32_t> tab((size_t) 2 * (kAttRows + 1));
+            for (int n = 0; n <= kAttRows; ++n) tab[(size_t) 2 * n + 1] = n;
+            cudaMemcpy(sc.bounds_tab, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
+        }
+        if (cudaHostAlloc(&sc.h_plan, sizeof(WindowPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
+        else sc.pinned.push_back(sc.h_plan);
+        alloc_to_ = &bufs_;
+        pin_to_ = &pinned_;
+        if (!ok) {
+            err = "out of device memory for the forward scratch";
+            return false;
+        }
+        return make_bufs(sc.dec, kMaxWindow, err);
+    }
+
+    // The session's pointers into the shared scratch.
+    void adopt(Scratch& sc) {
+        iscore_ = sc.iscore; iidx_meta_ = sc.iidx_meta; pos_d_ = sc.pos_d; pos_h_ = sc.pos_h; attw_ = sc.attw; q8_ = sc.q8;
+        xq_n_ = sc.xq_n; ex_xq_ = sc.ex_xq; ex_scr_ = sc.ex_scr; ex_rows_ = sc.ex_rows; ex_plan_ = sc.ex_plan; ex_plan2_ = sc.ex_plan2;
+        for (int i = 0; i < 2; ++i) {
+            stage_[i].blobs = sc.stage[i].blobs;
+            stage_[i].tok = sc.stage[i].tok;
+            stage_[i].bounds = sc.stage[i].bounds;
+        }
+        xq1_ = sc.xq1; xq2_ = sc.xq2; heads_ids_ = sc.heads_ids; heads_bounds_ = sc.heads_bounds; rowptr_d_ = sc.rowptr_d;
+        h_rowptr_ = sc.h_rowptr; bounds_tab_ = sc.bounds_tab; h_plan_ = (WindowPlan*) sc.h_plan;
     }
 
     // The buffers for `R` rows; false (with nothing left allocated) when the card has no room. With `count` it allocates nothing and
@@ -458,7 +525,7 @@ public:
                           t_att_ms_, t_ffn_ms_, t_ring_ms_.load(), (long long) n_peer_rows_, (long long) n_cpu_rows_);
         basalt::log::info("basalt hy4flash", "prompt experts: staged from the card %lld, from RAM over the bus %lld, from the second card %lld, on the CPU %lld (its thread %.0f ms, waited for %.0f ms), second card's share waited for %.0f ms, the stream after the launches %.0f ms",
                           (long long) n_stage_dev_, (long long) n_stage_bus_, (long long) n_stage_peer_, (long long) n_cpu_exp_, t_cpu_run_ms_.load(), t_cpu_wait_ms_, t_peer_wait_ms_, t_gpu_wait_ms_);
-        use(dec_);
+        use(sc_->dec);
         ring_close();
         big_.release();
         if (tier_) {
@@ -946,7 +1013,7 @@ private:
             ok = false;
             return nullptr;
         }
-        bufs_.push_back(p);
+        alloc_to_->push_back(p);
         return p;
     }
 
@@ -2856,6 +2923,9 @@ private:
     cudaStream_t stream_ = nullptr;
     cudaEvent_t ev_ = nullptr, eng_ev_ = nullptr;
     std::vector<void*> bufs_, pinned_;
+    std::vector<void*>* alloc_to_ = &bufs_;   // where alloc keeps what it gives: the session's, or the shared scratch's while that is built
+    std::vector<void*>* pin_to_ = &pinned_;
+    std::shared_ptr<Scratch> sc_;
     float *X_ = nullptr, *Xn_ = nullptr, *coef_ = nullptr, *hcws_ = nullptr;
     float *e_ = nullptr, *cur_ = nullptr, *xn_ = nullptr, *attn_ = nullptr, *attn_raw_ = nullptr, *mlp_ = nullptr, *mlp2_ = nullptr, *fin_ = nullptr;
     float *qa_ = nullptr, *qan_ = nullptr, *q_ = nullptr, *kvraw_ = nullptr, *qabs_ = nullptr, *qcur_ = nullptr, *olat_ = nullptr, *vout_ = nullptr, *gate_ = nullptr;
@@ -2868,7 +2938,7 @@ private:
     static constexpr size_t kStageInts = (size_t) 4 << 20;   // the mapped staging of a prompt's small inputs
     int32_t *stage_h_ = nullptr, *stage_d_ = nullptr, *bounds_tab_ = nullptr;
     size_t stage_at_ = 0;
-    Bufs dec_, big_;   // a window's row buffers, and a prompt chunk's while one runs
+    Bufs big_;   // a window's row buffers, and a prompt chunk's while one runs
     float *gu_ = nullptr, *h_ = nullptr, *rlog_ = nullptr, *rw_ = nullptr;
     int32_t* ids_ = nullptr;
     float *xlat_ = nullptr, *lat_out_ = nullptr, *moe_out_ = nullptr, *sh_ = nullptr, *logits_ = nullptr, *lp_ = nullptr, *erows_ = nullptr, *ekv_ = nullptr, *evalid_ = nullptr;
