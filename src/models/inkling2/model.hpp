@@ -71,7 +71,8 @@ public:
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     const model::LoadRequest& flags() const { return flags_; }
     bool cache_fp8() const { return fp8_; }
-    /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests.
+    /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests
+    /// and windows, so nothing reads the experts while it holds their memory (lend_room).
     ImageEncoder& encoder() const { return vis_; }
     /// What the sessions share (session.cpp's Shared): made by the first, gone with the last.
     std::weak_ptr<void>& shared() { return shared_; }
@@ -107,6 +108,13 @@ public:
     /// issued; the caller copies them from RAM).
     bool stage_from_card(int l, void* stream) const;
     const SpillPlan& spill() const { return spill_; }
+    /// [vision] Leaves at least `bytes` free above the card's spare for the image encoder's region: the experts' card copies
+    /// go back to RAM first (demote), then whole layers' expert memory goes to RAM, the last layers first, its addresses kept
+    /// (the range stays reserved). Every stream is idle on return. False with `err` when even all of it is short (nothing
+    /// lent then).
+    bool lend_room(uint64_t bytes, std::string& err);
+    /// [vision] The lent layers' memory comes back at the same addresses with the same bytes, then the copies (promote).
+    void refill();
 
 private:
     float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err,
@@ -139,7 +147,7 @@ private:
     struct Range {
         uint8_t* va = nullptr;
         uint64_t bytes = 0, own = 0;
-        unsigned long long handle = 0;
+        unsigned long long handle = 0;   ///< the own backing; 0 while lent (lend_room)
     };
     SpillPlan spill_;
     std::vector<Range> ranges_;
@@ -154,6 +162,14 @@ private:
     std::vector<unsigned long long> host_addr_;
     int64_t n_copy_ = 0;
     std::vector<int> layer_copies_;   ///< [layer] RAM experts with a card copy
+    // [vision] the experts' memory lent to the image encoder: each lent range's bytes, in RAM until refill
+    struct LentRange {
+        size_t range = 0;
+        std::unique_ptr<uint8_t[]> bytes;
+    };
+    std::vector<LentRange> lent_ranges_;
+    int64_t lend_copies_ = 0;   ///< card copies demoted for the encoder
+    double lend_ms_ = 0;
 };
 
 /// A session over `model`; null with `err` set.

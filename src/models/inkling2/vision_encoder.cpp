@@ -15,7 +15,7 @@ int region_cells(const ImagePlan& plan) { return std::min(std::max(plan.cells(),
 }  // namespace
 
 ImageEncoder::ImageEncoder() = default;
-ImageEncoder::~ImageEncoder() { release(); }
+ImageEncoder::~ImageEncoder() { drop(); }
 
 size_t ImageEncoder::weights_bytes() const { return enc_ ? enc_->weights_bytes() : 0; }
 size_t ImageEncoder::region_bytes() const { return enc_ ? enc_->arena_bytes(kMaxCells) : 0; }
@@ -35,14 +35,18 @@ bool ImageEncoder::stage(const core::FileRange& section, int n_embd, std::string
     ImagePlan plan;
     std::vector<float> rows;
     const bool ok = plan_image(gray.w, gray.h, plan, err) && run(gray, {}, plan, rows, err);
-    release();
+    drop();
     if (!ok) enc_.reset();
     return ok;
 }
 
 bool ImageEncoder::reserve(int cells, std::string& err) {
-    release();
+    drop();
     const size_t bytes = enc_->arena_bytes(cells);
+    if (lender_.room) {
+        lent_ = true;   // a larger picture after a smaller one: the lender adds to what it lent
+        if (!lender_.room(bytes, err)) return false;
+    }
     if (cudaMalloc(&region_, bytes) != cudaSuccess) {
         cudaGetLastError();
         region_ = nullptr;
@@ -50,19 +54,26 @@ bool ImageEncoder::reserve(int cells, std::string& err) {
         return false;
     }
     if (!enc_->attach(region_, bytes, cells, err)) {
-        release();
+        drop();
         return false;
     }
     cells_ = cells;
     return true;
 }
 
-void ImageEncoder::release() {
+void ImageEncoder::drop() {
     if (!region_) return;
     enc_->detach();
     cudaFree(region_);
     region_ = nullptr;
     cells_ = 0;
+}
+
+void ImageEncoder::release() {
+    drop();
+    if (!lent_) return;
+    lent_ = false;
+    lender_.give_back();
 }
 
 bool ImageEncoder::run(const vision::Image& src, const std::vector<uint8_t>& alpha, const ImagePlan& plan,
