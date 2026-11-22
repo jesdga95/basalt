@@ -143,6 +143,12 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
 
+/// The CPU's rows of a window's experts (cpu_experts.hpp): pair p = r * k + slot whose expert is not on the card (blobs[e]
+/// 0) takes row p of `cpu` (mapped host memory, the pool's output) into row p of `output`, and adds its lookup to tally[e]
+/// when `tally` is set; the card's pairs are left as they are.
+void moe_cpu_merge(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* cpu, float* output,
+                   uint32_t* tally, void* stream);
+
 /// The grouped expert kernel's plan from the router's choices: group g is an expert on the card (its blob at blobs[e], a
 /// device address; 0 when it is not on the card) and its entries are the (row, slot) pairs that chose it, in row order;
 /// an entry writes row r * k + slot of the output. A pair whose expert is not on the card is left out (the caller
@@ -156,7 +162,7 @@ constexpr int kAheadExperts = 8;   ///< the groups of a visit moe_plan records (
 /// 128 KiB step in flight: run on a side stream while the glue before the experts runs; reads only.
 void expert_read_ahead(const unsigned long long* blobs, const int32_t* n, uint64_t bytes, void* stream);
 /// Requests into L2 the first `bytes` of the blobs of the distinct experts among ids[0..n) (blobs[e]: expert e's device
-/// address; a guess at a visit's experts), by 16-byte loads over every block: run on a side stream while the attention and the glue
+/// address, 0 when it is not on the card: skipped; a guess at a visit's experts), by 16-byte loads over every block: run on a side stream while the attention and the glue
 /// before the experts run. Reads only; `sink` (4 bytes) is written on a 2^-32 chance so the loads are kept.
 void expert_prefetch(const int32_t* ids, int n, const unsigned long long* blobs, uint64_t bytes, uint32_t* sink, void* stream);
 /// y[r] = sum_slot w[r][slot] * out[r * k + slot] in slot order (fp32).

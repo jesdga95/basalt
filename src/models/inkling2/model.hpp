@@ -38,10 +38,10 @@ struct LayerWeights {
     int gu_type = 0, d_type = 0;
     size_t blob_bytes = 0;
     size_t expert_stride = 0;                ///< blob_bytes rounded up to whole blocks of its type and 16 bytes
-    unsigned long long* blob_table = nullptr;   ///< device [n_expert]: each expert's blob address (its RAM copy's when it spilled)
+    unsigned long long* blob_table = nullptr;   ///< device [n_expert]: each expert's blob address on the card (its copy's), 0: in RAM
     int n_spill = 0;                         ///< experts in RAM (spill.hpp): the layer's last slots
     const int32_t* slot_map = nullptr;       ///< device [n_expert]: each expert's slot in `experts`; null: the expert's own
-    const uint8_t* spill_host = nullptr;     ///< the RAM experts' blobs in slot order (pinned, mapped), null without a spill
+    const uint8_t* spill_host = nullptr;     ///< the RAM experts' blobs in slot order (pinned), null without a spill
     const float* msg_query = nullptr;        ///< core layers: [kStreams][n_embd]
     const uint16_t* ctrl_down[kStreams] = {};   ///< BF16 [gate_rank][2 n_embd]
     const uint16_t* ctrl_gf[kStreams] = {};     ///< BF16 [2 n_embd][gate_rank]: the gain rows, then the forget rows
@@ -90,8 +90,8 @@ public:
     /// Copies RAM experts to the card, the most routed first, while `keep_free` bytes stay free; their blob table entries
     /// point at the copies (decode reads them there; a prompt chunk's staging is unchanged). Bytes copied.
     uint64_t promote(uint64_t keep_free);
-    /// Sends copies back, the least routed first, until at least `bytes` are freed: their entries point at RAM again (on
-    /// `stream`, which is waited for before the copies are freed). Bytes freed.
+    /// Sends copies back, the least routed first, until at least `bytes` are freed: their entries go back to 0, the CPU
+    /// computes them again (on `stream`, which is waited for before the copies are freed). Bytes freed.
     uint64_t demote(uint64_t bytes, void* stream);
     int64_t promoted() const { return n_copy_; }
     /// The free VRAM the session holds the card at from now on (VRAM / POST /v1/vram; 0: its own spare only): a grow of
@@ -108,6 +108,11 @@ public:
     /// issued; the caller copies them from RAM).
     bool stage_from_card(int l, void* stream) const;
     const SpillPlan& spill() const { return spill_; }
+    /// Expert e of layer l's blob in RAM when the CPU computes it (it spilled and has no card copy; its blob table entry is
+    /// 0), else null (cpu_experts.hpp).
+    const uint8_t* ram_blob(int l, int e) const;
+    /// The layers with an expert the CPU computes, bit l for layer l: what a window's launches depend on.
+    uint64_t cpu_layers() const;
     /// [vision] Leaves at least `bytes` free above the card's spare for the image encoder's region: the experts' card copies
     /// go back to RAM first (demote), then whole layers' expert memory goes to RAM, the last layers first, its addresses kept
     /// (the range stays reserved). Every stream is idle on return. False with `err` when even all of it is short (nothing
@@ -153,13 +158,12 @@ private:
     std::vector<Range> ranges_;
     std::vector<unsigned long long> staging_;   ///< granule-sized pieces (the driver maps whole allocations only)
     uint8_t* spill_host_ = nullptr;
-    // the elastic spill: the RAM experts the most routed first, each one's card copy (null: none) and mapped RAM address
+    // the elastic spill: the RAM experts the most routed first, each one's card copy (null: none)
     bool elastic_ = false;
     uint64_t reserve_ = 0;
     bool lent_ = false;
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
-    std::vector<unsigned long long> host_addr_;
     int64_t n_copy_ = 0;
     std::vector<int> layer_copies_;   ///< [layer] RAM experts with a card copy
     // [vision] the experts' memory lent to the image encoder: each lent range's bytes, in RAM until refill

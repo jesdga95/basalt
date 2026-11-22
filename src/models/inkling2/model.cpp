@@ -408,7 +408,6 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
     if (spill_.any()) {
         copy_.assign((size_t) g.n_layers * g.n_expert, nullptr);
         layer_copies_.assign((size_t) g.n_layers, 0);
-        host_addr_.assign((size_t) g.n_layers * g.n_expert, 0);
     }
     // the RAM copies, every spilled layer's in slot order, and the staging their ranges share
     std::vector<uint64_t> host_at((size_t) g.n_layers, 0);
@@ -418,7 +417,7 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
             host_at[(size_t) l] = host;
             host += (uint64_t) spill_.n_spill[(size_t) l] * layers_[(size_t) l].expert_stride;
         }
-        if (cudaHostAlloc((void**) &spill_host_, host, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess)
+        if (cudaHostAlloc((void**) &spill_host_, host, cudaHostAllocPortable) != cudaSuccess)
             return fail("cannot pin " + std::to_string(host >> 20) + " MiB of RAM for the experts that leave the card");
         std::memset(spill_host_, 0, host);
         for (uint64_t at = 0; at < spill_.staging; at += gran) {
@@ -498,8 +497,6 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
             w.n_spill = spill_.n_spill[(size_t) l];
             uint8_t* host = spill_host_ + host_at[(size_t) l];
             w.spill_host = host;
-            unsigned long long host_dev = 0;
-            if (cudaHostGetDevicePointer((void**) &host_dev, host, 0) != cudaSuccess) return fail("cannot map the experts' RAM copies");
             if (w.expert_stride != el.blob_bytes && r.own) cudaMemset(w.experts, 0, r.own);
             for (int e = 0; e < g.n_expert; ++e) {
                 const int s = slot[(size_t) e];
@@ -513,8 +510,7 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
                     table[(size_t) e] = (unsigned long long) it.dev;
                 } else {
                     it.host = host + (uint64_t) (s - keep) * w.expert_stride;
-                    table[(size_t) e] = host_dev + (uint64_t) (s - keep) * w.expert_stride;
-                    host_addr_[(size_t) l * g.n_expert + e] = table[(size_t) e];
+                    table[(size_t) e] = 0;   // the CPU computes it (cpu_experts.hpp)
                 }
                 reads.add(it);
             }
@@ -599,6 +595,20 @@ void InklingModel::lend(bool low, void* stream) {
     }
 }
 
+const uint8_t* InklingModel::ram_blob(int l, int e) const {
+    const LayerWeights& w = layers_[(size_t) l];
+    if (w.n_spill == 0 || copy_[(size_t) l * geo().n_expert + e]) return nullptr;
+    const int slot = spill_.slot[(size_t) l][(size_t) e] - (geo().n_expert - w.n_spill);
+    return slot < 0 ? nullptr : w.spill_host + (uint64_t) slot * w.expert_stride;
+}
+
+uint64_t InklingModel::cpu_layers() const {
+    uint64_t mask = 0;
+    for (size_t l = 0; l < layers_.size(); ++l)
+        if (layers_[l].n_spill > (layer_copies_.empty() ? 0 : layer_copies_[l])) mask |= 1ull << l;
+    return mask;
+}
+
 bool InklingModel::stage_from_card(int l, void* stream) const {
     const LayerWeights& w = layers_[(size_t) l];
     if (copy_.empty() || w.n_spill == 0 || layer_copies_[(size_t) l] < w.n_spill) return false;
@@ -617,7 +627,7 @@ uint64_t InklingModel::demote(uint64_t bytes, void* stream) {
     for (auto it = spill_order_.rbegin(); it != spill_order_.rend() && freed < bytes; ++it) {
         const size_t i = (size_t) it->first * ne + it->second;
         if (!copy_[i]) continue;
-        cudaMemcpyAsync(layers_[(size_t) it->first].blob_table + it->second, &host_addr_[i], 8, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+        cudaMemsetAsync(layers_[(size_t) it->first].blob_table + it->second, 0, 8, (cudaStream_t) stream);
         out.push_back(i);
         freed += layers_[(size_t) it->first].expert_stride;
     }
