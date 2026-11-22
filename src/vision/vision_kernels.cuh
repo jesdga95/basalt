@@ -51,9 +51,12 @@ void launch_bias_copy_lines(const float* g, const float* bias, const float* newl
 
 // The ViT with a class token: 20-pixel patches of a picture on whole 40-pixel cells, a learned
 // position table resampled per grid, a class token in front, 2D rotary positions on interleaved pairs, layer scale.
-/// The picture's per-channel normalisation: v' = (v - mean) / std on the 0-255 scale.
+/// The picture's per-channel normalisation as the reference makes its bf16 pixels: CLIP-normalised and rounded to bf16,
+/// x = bf16((v / 255 - clip_mean) / clip_std), then back to the 0-1 scale with the bf16 CLIP mean and std and normalised
+/// again, v' = bf16((x bf16(clip_std) + bf16(clip_mean) - mean) / std). One affine step from v cannot give its roundings.
 struct PixelNorm {
-    float mean[3], std[3];
+    float clip_mean[3], clip_std[3];   // the processor's CLIP mean and std, 0-1 scale
+    float mean[3], std[3];             // the encoder's own, 0-1 scale
 };
 /// rows[r] (bf16 [count][3 * patch * patch]: channel, row, column) for the patches r0 .. r0 + count of a gx-wide grid in merge
 /// order, from the w x h picture `rgb` (interleaved u8) at the canvas' top left; a pixel past it is -1 before normalising.

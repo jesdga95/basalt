@@ -60,8 +60,13 @@ void patchify(const std::vector<float>& planar, Size canvas, const Geometry& g, 
 /// The canvas of whole merge groups (patch * merge pixels a side) holding a w x h picture at its top left.
 Size padded_canvas(int w, int h, const Geometry& g);
 
+/// The CLIP normalisation (OpenAI's mean and std, 0-1 scale) a processor applies before the encoder's own.
+inline constexpr float kClipMean[3] = {0.48145466f, 0.4578275f, 0.40821073f};
+inline constexpr float kClipStd[3] = {0.26862954f, 0.2613026f, 0.2757771f};
+
 /// Patch rows as `patchify` gives them for the picture at the top left of its padded_canvas, every pixel past the picture
-/// -1 on the 0-255 scale: each value (v - 255 mean[c]) / (255 std[c]) in single precision.
+/// -1 on the 0-255 scale, as the class-token tower's reference makes its bf16 pixels: x = bf16((v / 255 - kClipMean[c]) /
+/// kClipStd[c]), then bf16((x bf16(kClipStd[c]) + bf16(kClipMean[c]) - mean[c]) / std[c]) (mean, std: the encoder's).
 void patchify_padded(const Image& img, const Geometry& g, const float mean[3], const float std[3], std::vector<float>& out);
 
 }  // namespace basalt::vision

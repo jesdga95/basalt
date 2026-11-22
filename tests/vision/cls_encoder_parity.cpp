@@ -193,7 +193,7 @@ void check_patch_rows(int w, int h) {
     cudaMalloc(&d_img, img.rgb.size());
     cudaMalloc(&d_rows, (size_t) n * vals * 2);
     cudaMemcpy(d_img, img.rgb.data(), img.rgb.size(), cudaMemcpyHostToDevice);
-    const PixelNorm nm{{127.5f, 127.5f, 127.5f}, {127.5f, 127.5f, 127.5f}};
+    const PixelNorm nm{{kClipMean[0], kClipMean[1], kClipMean[2]}, {kClipStd[0], kClipStd[1], kClipStd[2]}, {0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}};
     // two launches of parts of the rows, as the encoder's chunks make them
     const int half = n / 2;
     launch_patch_rows(d_img, w, h, gx, P, nm, d_rows, 0, half, nullptr);
@@ -396,7 +396,7 @@ void bench() {
     cudaMemset(vec, 0, (size_t) 3 * E * 4);
     cudaMemset(pos, 0, (size_t) EDGE * EDGE * E * 4);
     launch_rope_axial(tab, T, gx, nullptr);
-    const PixelNorm nm{{127.5f, 127.5f, 127.5f}, {127.5f, 127.5f, 127.5f}};
+    const PixelNorm nm{{kClipMean[0], kClipMean[1], kClipMean[2]}, {kClipStd[0], kClipStd[1], kClipStd[2]}, {0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}};
     auto line = [](const char* what, double us, double bytes) {
         std::printf("  bench %-34s %9.1f us/call  %6.0f GB/s\n", what, us, bytes / (us * 1e-6) / 1e9);
     };
