@@ -33,7 +33,7 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 | Token embedding | GGUF type; one row dequantized to fp32 per token | fp32 |
 | Output head | Q8_0 (NVFP4 pack) or Q6_K (IQ3_S pack) | two-stage in verify, see [head](#two-stage-verify-head) |
 | Drafter | Q8_0 and BF16 dense; Q2_0 experts in VRAM | proposes only; verify decides |
-| KV cache | fp16 (default), int8 (fp16 scale per 64), q4_0, k8v4 | K/V dequantized to fp32; scores and softmax fp32 |
+| KV cache | fp16 (default), int8 (fp16 scale per 64), q4_0, k8v4, k4v8 | K/V dequantized to fp32; scores and softmax fp32 |
 | GDN state and conv history | fp32 | fp32 |
 
 Decode activations are int8 (q8_1) into every quantized matmul. The hc read stays fp32 (llama.cpp quantizes it to Q8_0).
@@ -126,6 +126,48 @@ a uniform layer's rows): PPL 3.4049, KLD 0.2676, top-1 82.76% (100 chunks, T 3, 
 The Q5_0 rows: KLD 0.0943 against 0.0948 on UD-Q3_K_XL, 0.1520 against 0.1517 on UD-Q2_K_XL, tiers auto-sized. The
 device-planned tail runs only when every layer's expert formats are in it, so on these packs the decode rounding moves as well as
 the prompt's.
+
+## K4V8
+
+K4V8 is K8V4 with the planes swapped: K as Q4_0 blocks after the Walsh-Hadamard rotation, V as INT8 codes with an fp16
+scale per 64 values, unrotated. Both are 816 B per cell; the question is which plane the eight bits belong on.
+
+**Setup.** One RTX 5090 at 475 W, no peer card, NVFP4-DQ6_K pack, `--spec 5`, `--adapt-swaps 0 --peer-adapt-swaps 0`
+(the expert tiers pinned to one placement, as an A/B needs), 100 chunks of wikitext-2 against `flashnext-bf16-base.kld`,
+25,500 scored rows per run. The four arms ran back to back in one session, and the `k8v4`/`k4v8` pair three sessions
+with the order reversed between them. Decode and prefill are `basalt-bench` with the same pinned placement.
+
+| Two planes, one KV budget | KV bytes/cell | KLD mean | Paired dKLD against `int8` [95% CI] | Same top-1 |
+|---|---|---:|---|---:|
+| `int8` (reference) | 1056 | 0.06195 | — | 91.72% |
+| **`k4v8`** (8 bits on V) | **816** | **0.06547** | **+0.0036 [+0.0024, +0.0049]** | 91.50% |
+| `k8v4` (8 bits on K) | 816 | 0.06754 | +0.0053 [+0.0040, +0.0066] | 91.25% |
+| `q4_0` (both at 4 bits) | 576 | 0.06940 | +0.0075 [+0.0056, +0.0093] | 91.09% |
+
+`k4v8` against `k8v4`, same bytes: **-0.0021 [-0.0033, -0.0009]** KLD, +0.25 top-1 points — lower in all three sessions
+(-0.0015, -0.0031, -0.0017). The plane decomposition says the same thing: V quantized with K exact costs +0.0053
+[+0.0040, +0.0066], K quantized with V exact +0.0036 [+0.0024, +0.0049], and the two together +0.0075 — so V carries
+about 70% of `q4_0`'s loss and the eight bits belong on V.
+
+**Speed: no difference beyond this box's noise.** Eight runs per arm, both nesting orders, `--adapt-swaps 0`:
+
+| Measurement | `k8v4` | `k4v8` | Change |
+|---|---:|---:|---:|
+| decode, conv (tok/s) | 155.5 ± 5.8 | 149.5 ± 7.3 | -3.9% |
+| decode, struct (tok/s) | 95.8 ± 0.5 | 95.5 ± 0.6 | -0.3% |
+| decode, prose (tok/s) | 146.0 ± 3.4 | 142.5 ± 2.7 | -2.4% |
+| decode (ms/token) | 6.43 ± 0.24 | 6.69 ± 0.34 | +4.1% |
+| prefill 16K (tok/s) | 7701 ± 32 | 7921 ± 280 | +2.9% |
+| prefill 64K (tok/s) | 8780 ± 171 | 9029 ± 273 | +2.8% |
+
+Every difference is inside the run-to-run spread (the prefill figure is not settled: `k4v8`'s 16K runs split into two
+clusters, 7678 and 8164, and one nesting order reads as -0.3%). Read it as **throughput-neutral at the same memory**,
+with a suggestion that V's INT8 codes cost a little on decode (V is the plane the PV loop walks) and that the prompt
+kernel's int8 V copy is cheaper than mode 3's q4-to-fp16 expansion.
+
+These are pinned-placement numbers, not the numbers a user sees with adaptation on: `struct` decodes at 96 tok/s here
+against 462 in the table above because `--adapt-swaps 0` freezes a placement `struct` benefits from adapting. Only the
+ratios are claims.
 
 ## 6-bit dense projections
 
