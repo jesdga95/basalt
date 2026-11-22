@@ -2,7 +2,9 @@
 // BatchSession and writes the hooks below: its rows' inputs to the card, the forward of a window of segments, each session's
 // logits back and its draws. The driver does the rest: the checks, the segments, each session's head rows, the graph of each
 // composition (direct on its first window, captured on its second, the most recently used kept), the order of the streams
-// and one sync for the whole batch.
+// and one sync for the whole batch. A model whose host steers its forward between launches (experts placed by the host
+// between per-layer graphs) runs its forward directly every window and keeps its own graphs (batch_captured false); a
+// session that cannot batch for now (batch_ready false) has the batch's windows run in turn.
 #pragma once
 
 #include "basalt/core/graph.hpp"
@@ -54,6 +56,11 @@ public:
             ss.push_back(s);
         }
         if (ss[0] != this) return {Status::Error, who + ": a batch runs on its first session"};
+        if (std::any_of(ss.begin(), ss.end(), [](const BatchSession* s) { return !s->batch_ready(); })) {
+            for (int i = 0; i < n; ++i)
+                if (Result r = peers[i]->decode_window(reqs[i]); !r.ok()) return r;
+            return {};
+        }
         BatchWindow w;
         std::string err;
         if (!w.build(reqs, n, batch_rows(), batch_context(), err)) return {Status::Error, who + ": " + err};
@@ -75,14 +82,25 @@ public:
         for (int i = 0; i < n; ++i)
             key.insert(key.end(), {(uint64_t) (uintptr_t) ss[(size_t) i], (uint64_t) w.segs[(size_t) i].rows, (uint64_t) head[(size_t) i]});
         BatchShared& sh = batch_shared();
-        if (core::CapturedGraph* g = sh.graphs.find(key)) {
+        if (!batch_captured()) {
+            if (!batch_forward(v, err)) {
+                cudaStreamSynchronize(st);
+                return {Status::Error, who + ": " + err};
+            }
+        } else if (core::CapturedGraph* g = sh.graphs.find(key)) {
             if (!g->launch(st, err)) return {Status::Error, who + ": " + err};
         } else if (sh.direct.insert(key).second) {
-            batch_forward(v);
+            if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
         } else {
             core::CapturedGraph g;
             if (!g.begin(st, err)) return {Status::Error, who + ": " + err};
-            batch_forward(v);
+            if (!batch_forward(v, err)) {
+                cudaGraph_t dropped = nullptr;
+                cudaStreamEndCapture(st, &dropped);
+                if (dropped) cudaGraphDestroy(dropped);
+                cudaGetLastError();
+                return {Status::Error, who + ": " + err};
+            }
             if (!g.end(st, err) || !sh.graphs.insert(std::move(key), std::move(g)).launch(st, err)) return {Status::Error, who + ": " + err};
         }
         if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) return {Status::Error, who + ": CUDA: " + cudaGetErrorString(e)};
@@ -120,10 +138,17 @@ protected:
     /// On the leader: every row's token and position to the card, outside the graph (v.w.tokens, v.w.positions). `key`
     /// takes whatever else the forward's launches depend on (a launch bound); the driver adds the composition.
     virtual bool batch_stage(const BatchView& v, GraphLru<core::CapturedGraph>::Key& key, std::string& err) = 0;
-    /// On the leader, launches only (it may be captured): every row through the layers on the shared scratch, each
-    /// segment's stateful kernels reading and writing v.ss[i]'s state, then the head over at least each segment's head
-    /// rows, and whatever per-segment state the window leaves (a drafter's context).
-    virtual void batch_forward(const BatchView& v) = 0;
+    /// On the leader: every row through the layers on the shared scratch, each segment's stateful kernels reading and
+    /// writing v.ss[i]'s state, then the head over at least each segment's head rows, and whatever per-segment state the
+    /// window leaves (a drafter's context). Launches only while batch_captured() (it may be captured). False with `err`:
+    /// the window failed (the driver drains the stream and reports it).
+    virtual bool batch_forward(const BatchView& v, std::string& err) = 0;
+    /// True: batch_forward only launches and the driver captures a graph per composition. False: the host steers the
+    /// forward (it reads results between launches), so the driver runs it directly every window and the model keeps its
+    /// own graphs of the stretches between.
+    virtual bool batch_captured() const { return true; }
+    /// False while this session holds state its batch path does not cover: the batch's windows run in turn.
+    virtual bool batch_ready() const { return true; }
     /// On session i, queued on v.stream: segment i's head rows into its own logits (what row_logprobs, copy_logits and
     /// resample_row read next), its r.logits, and its host bookkeeping (history).
     virtual void batch_take(const BatchView& v, int i) = 0;

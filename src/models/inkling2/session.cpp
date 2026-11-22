@@ -296,10 +296,11 @@ protected:
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
         return check(err);
     }
-    void batch_forward(const model::BatchView& v) override {
+    bool batch_forward(const model::BatchView& v, std::string&) override {
         view_ = &v;
         body(v.w.rows, v.w.rows, full_keys_of(v.w.max_pos));
         view_ = nullptr;
+        return true;
     }
     void batch_take(const model::BatchView& v, int i) override {
         const model::DecodeRequest& r = v.reqs[i];
