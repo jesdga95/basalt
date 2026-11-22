@@ -132,10 +132,11 @@ the prompt's.
 K4V8 is K8V4 with the planes swapped: K as Q4_0 blocks after the Walsh-Hadamard rotation, V as INT8 codes with an fp16
 scale per 64 values, unrotated. Both are 816 B per cell; the question is which plane the eight bits belong on.
 
-**Setup.** One RTX 5090 at 475 W, no peer card, NVFP4-DQ6_K pack, `--spec 5`, `--adapt-swaps 0 --peer-adapt-swaps 0`
-(the expert tiers pinned to one placement, as an A/B needs), 100 chunks of wikitext-2 against `flashnext-bf16-base.kld`,
-25,500 scored rows per run. The four arms ran back to back in one session, and the `k8v4`/`k4v8` pair three sessions
-with the order reversed between them. Decode and prefill are `basalt-bench` with the same pinned placement.
+**Setup.** A different box state from the table above: one RTX 5090 at 475 W, no peer card, NVFP4-DQ6_K pack, `--spec 5`,
+`--adapt-swaps 0 --peer-adapt-swaps 0` (the expert tiers pinned to one placement, as an A/B needs), 100 chunks of
+wikitext-2 against `flashnext-bf16-base.kld`, 25,500 scored rows per run. The four arms ran back to back in one session,
+and the `k8v4`/`k4v8` pair three sessions with the order reversed between them. Decode and prefill are `basalt-bench`
+with the same pinned placement.
 
 | Two planes, one KV budget | KV bytes/cell | KLD mean | Paired dKLD against `int8` [95% CI] | Same top-1 |
 |---|---|---:|---|---:|
