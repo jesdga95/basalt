@@ -24,10 +24,12 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   the main card fills the rest of its memory with copies, down to what a short prompt needs. The start line
   `expert homes of 384 per layer: ...` gives the split.
 - **RAM:** the checkpoint blocks (`--prompt-cache` + 1 per slot, about 3 MB each) are allocated page-locked at start, with a
-  spare VRAM buffer of the same size, before the RAM tier is sized. The prompt path's and the images' host buffers are allocated at
+  spare VRAM buffer of the same size, before the RAM tier is sized. The prompt path's host buffers are allocated at
   start, before the RAM tier: the pinned ring of file
   reads (only when experts may stay in the file, at most 240 experts), the staging of a short read, the second card's prompt
-  rows, a chunk's Engram reads, and each slot's largest image. The tier then leaves `--ram-reserve-mib` free beside the driver's tracking of its
+  rows, and a chunk's Engram reads. A picture's decoded pixels and patch rows are ordinary memory that grows while a request's pictures are read and
+  is freed after them (the largest picture takes a few hundred MiB); with `--vision dynamic` nothing is held for pictures at rest, so the RAM tier,
+  the homes and the copies are planned exactly as with `--vision off`. The tier then leaves `--ram-reserve-mib` free beside the driver's tracking of its
   pinned pages (`RAM floor X GiB of N GiB free`). N places short puts N experts of every layer in the file, with a warning naming
   the RAM to free.
 - **Slots follow routing:** an expert that keeps missing takes the slot used longest ago, on either card.
@@ -43,6 +45,10 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   or the start is refused with one line (what fits, the free VRAM, the reserve); `auto` takes what fits. `--vram-reserve-mib` or
   `POST /v1/vram` sets what stays free and plans the size again once, from the free memory then. The caches, prompts and images
   take the tier's copies first (homes stay) and halve their chunks to fit above the reserve.
+  `--vision dynamic` has no card memory at rest: a request's pictures borrow the encoder's weights and work buffers from the tier's copies
+  beside the homes (all the copies when those do not hold them), and the tier takes them back and refills them when the pictures are read.
+  The homes keep 1.5 GiB free beside them when the pack carries a projector, with vision on or off, so the plan is the same either way. Before this the images' buffers (6 GiB of pinned host memory for the slots' largest pictures) took the RAM the tier needed, and on two cards
+  with a 1M context that moved 18 experts a layer onto the main card as homes in place of its 60 copies (5.77 against 19.24 GiB of tier). Two cards, drafted, conv / struct / prose tok/s with `--vision dynamic`: before 99 / 249 / 101 and 97 / 246 / 100, after 99 / 252 / 104 and 99 / 255 / 104; with vision off 97 / 256 / 101.
 - **Cache precision:** `--kv fp8` (default) stores the caches as the model's reference rounds them, 920 bytes per position;
   `--kv fp16` keeps the unrounded values, 3,200 bytes per position (a 1M context about 3.2 GiB). [precision](../precision/deepseek41.md#where-each-stage-rounds)
 - **Refused flags:** `--rope-*`, `--yarn-*` (YaRN is part of the model).
