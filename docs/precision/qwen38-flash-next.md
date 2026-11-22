@@ -138,15 +138,21 @@ wikitext-2 against `flashnext-bf16-base.kld`, 25,500 scored rows per run. The fo
 and the `k8v4`/`k4v8` pair three sessions with the order reversed between them. Decode and prefill are `basalt-bench`
 with the same pinned placement.
 
+All four arms in one session, so every row and interval below is comparable within it:
+
 | Two planes, one KV budget | KV bytes/cell | KLD mean | Paired dKLD against `int8` [95% CI] | Same top-1 |
 |---|---|---:|---|---:|
 | `int8` (reference) | 1056 | 0.06195 | — | 91.72% |
-| **`k4v8`** (8 bits on V) | **816** | **0.06547** | **+0.0036 [+0.0024, +0.0049]** | 91.50% |
-| `k8v4` (8 bits on K) | 816 | 0.06754 | +0.0053 [+0.0040, +0.0066] | 91.25% |
+| **`k4v8`** (8 bits on V) | **816** | **0.06558** | **+0.0036 [+0.0024, +0.0049]** | 91.50% |
+| `k8v4` (8 bits on K) | 816 | 0.06726 | +0.0053 [+0.0040, +0.0066] | 91.25% |
 | `q4_0` (both at 4 bits) | 576 | 0.06940 | +0.0075 [+0.0056, +0.0093] | 91.09% |
 
-`k4v8` against `k8v4`, same bytes: **-0.0021 [-0.0033, -0.0009]** KLD, +0.25 top-1 points — lower in all three sessions
-(-0.0015, -0.0031, -0.0017). The plane decomposition says the same thing: V quantized with K exact costs +0.0053
+Two further sessions ran the `k8v4`/`k4v8` pair alone, with the order reversed, and `k4v8` won both: over the three
+pairings the means are 0.06547 against 0.06754, **-0.0021 [-0.0033, -0.0009]** KLD and +0.25 top-1 points, with
+per-session deltas of -0.0015, -0.0031 and -0.0017. Per-run KLD spread is about 0.001, which is why the pair needs
+three sessions to settle and the four-arm table is quoted from one.
+
+The plane decomposition says the same thing: V quantized with K exact costs +0.0053
 [+0.0040, +0.0066], K quantized with V exact +0.0036 [+0.0024, +0.0049], and the two together +0.0075 — so V carries
 about 70% of `q4_0`'s loss and the eight bits belong on V.
 
