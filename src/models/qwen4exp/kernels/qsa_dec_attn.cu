@@ -187,8 +187,39 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
     }
     __syncthreads();
     {
-        const unsigned char* kb = KV_MODE == 0 ? (const unsigned char*) pools.k_pool : (const unsigned char*) pools.k_q;
-        const unsigned char* vb = KV_MODE == 0 ? (const unsigned char*) pools.v_pool : (const unsigned char*) pools.v_q;
+        const unsigned char* kb = KV_MODE == 0 ? (const unsigned char*) pools.k_pool
+                               : KV_MODE == 5 ? (const unsigned char*) pools.k_q4
+                                              : (const unsigned char*) pools.k_q;
+        const unsigned char* vb = KV_MODE == 0 ? (const unsigned char*) pools.v_pool
+                               : KV_MODE == 5 ? (const unsigned char*) pools.v_q4
+                                              : (const unsigned char*) pools.v_q;
+        if constexpr (KV_MODE == 5) {
+            // packed Q4_0: a pool row is BLKS blocks of {fp16 d, 16 code bytes}, and byte j of a block holds element
+            // j in its low nibble and element j + 16 in its high one. The codes widen to int8 exactly (they are
+            // [-8, 7]) and the block's scale fills the per-32 slot, so every reader above works unchanged.
+            constexpr int BLKS = HD / QK4_0, BYTES = BLKS * (int) sizeof(block_q4_0);
+            for (int i = t; i < 2 * CHUNK * BLKS; i += THREADS) {
+                const int plane = i / (CHUNK * BLKS), rem = i % (CHUNK * BLKS), c = rem / BLKS, b = rem % BLKS;
+                unsigned char* dst = plane == 0 ? &sm.k[c][b * QK4_0] : &sm.v[c][b * QK4_0];
+                uint16_t* sc = plane == 0 ? &sm.ks[c][b] : &sm.vs[c][b];
+                if (sm.row[c] < 0) {   // masked or missing: zero, as the fp16 and int8 paths make it
+                    *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4*>(dst + 16) = make_uint4(0, 0, 0, 0);
+                    *sc = 0;
+                    continue;
+                }
+                const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(
+                    (plane == 0 ? kb : vb) + sm.row[c] * (long long) BYTES) + b;
+                uint8_t code[16];
+                *reinterpret_cast<uint4*>(code) = *reinterpret_cast<const uint4*>(blk->qs);
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    dst[j] = (unsigned char) (int8_t) ((int) (code[j] & 0x0F) - 8);
+                    dst[16 + j] = (unsigned char) (int8_t) ((int) (code[j] >> 4) - 8);
+                }
+                *sc = __ldg(&blk->d);
+            }
+        } else {
         for (int i = t; i < CHUNK * PER; i += THREADS) {
             const int c = i / PER, j = i % PER;
             const long long r = sm.row[c];
@@ -210,6 +241,7 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
                     *reinterpret_cast<uint2*>(&sm.vs[c][0]) = make_uint2(0, 0);
                 }
             }
+        }
         }
     }
     cp_async_wait_all();
