@@ -138,6 +138,48 @@ class Parse(unittest.TestCase):
         reply = HEADER + "edit_file" + TOOL_JSON + '{"name":"edit_file","args":{"path":"a"}}'
         self.assertEqual(merged(parse(reply)), [("args", '{"path":"a"}'), ("call", "edit_file", {"path": "a"})])
 
+    def test_native_call_after_previous_end_and_model_header(self):
+        body = TOOL_JSON + '{"name":"edit_file","args":{"path":"a"}}'
+        reply = END + HEADER + body + END
+        want = [("call", "edit_file", {"path": "a"})]
+        self.assertEqual(merged(parse(reply)), want)
+        for chunk in (1, 2, 7, 13):
+            self.assertEqual(merged(parse(reply, chunk)), want, chunk)
+
+    def test_preamble_before_bare_call_is_chunk_invariant(self):
+        reply = 'Sure.' + TOOL_JSON + '{"name":"search","args":{"q":"one"}}' + END
+        want = [("content", "Sure."), ("call", "search", {"q": "one"})]
+        for split in range(len(reply) + 1):
+            parser = Inkling2Parser()
+            events = parser.feed(reply[:split]) + parser.feed(reply[split:]) + parser.finish()
+            self.assertEqual(merged(events), want, split)
+
+    def test_headerless_invalid_calls_stay_text(self):
+        cases = (
+            ('{"args":{"q":"one"}}', END),
+            ('{"name":"search","args":', END),
+            ('{"args":{"q":"one"}}', ''),
+        )
+        for body, end in cases:
+            with self.subTest(body=body, end=end):
+                self.assertEqual(merged(parse(TOOL_JSON + body + end)), [("content", TOOL_JSON + body)])
+
+    def test_streamed_args_hold_the_envelope_brace_across_whitespace(self):
+        body = '{"name":"search","args":{"q":"one"}}'
+        for end in ('', END):
+            with self.subTest(end=end):
+                parser = Inkling2Parser()
+                events = parser.feed(HEADER + 'search' + TOOL_JSON)
+                events += parser.feed(body)
+                events += parser.feed('\n')
+                if end:
+                    events += parser.feed(end)
+                events += parser.finish()
+                args = ''.join(e.text for e in events if e.kind == "tool_args")
+                self.assertEqual(args, '{"q":"one"}')
+                calls = [e.call.arguments for e in events if e.kind == "tool_call"]
+                self.assertEqual(calls, [{"q": "one"}])
+
     def test_every_split_gives_the_same_events(self):
         reply = (HEADER + THINK + "a<b" + END + HEADER + TEXT + "x <|end y" + END + HEADER + "get_weather" + TOOL_JSON +
                  '{"name":"get_weather","args":{"city":"Paris","n":[1,2]}}' + END)

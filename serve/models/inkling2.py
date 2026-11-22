@@ -56,25 +56,35 @@ class Inkling2Parser:
             self.buf = self.buf[len(self.buf) - keep:]
         return False
 
+    def _open_bare_call(self, text: str) -> None:
+        self.call = ToolCall(name="", arguments={})
+        self.buf, self.state, self.head, self.raw, self.streamed = text[len(TOOL_JSON):], "call", "", "", 0
+
     def _between(self, out: list) -> bool:
         if not self.buf:
             return False
+        if self.buf.startswith(END):            # a previous block can end before the model opens this one
+            self.buf = self.buf[len(END):]
+            return True
         if self.buf.startswith(TOOL_JSON):
             # Some replies begin with the native call marker and put the name in its JSON envelope.
-            self.call = ToolCall(name="", arguments={})
-            self.buf, self.state, self.head, self.raw, self.streamed = self.buf[len(TOOL_JSON):], "call", "", "", 0
+            self._open_bare_call(self.buf)
             return True
         if not self.buf.startswith(HEADER):
-            if HEADER.startswith(self.buf):
-                return False            # a header still arriving
-            stray = self.buf.find(HEADER)
+            if HEADER.startswith(self.buf) or TOOL_JSON.startswith(self.buf) or END.startswith(self.buf):
+                return False            # a header, call marker or previous end marker still arriving
+            starts = [i for marker in (HEADER, TOOL_JSON, END) if (i := self.buf.find(marker)) >= 0]
+            stray = min(starts, default=-1)
             text = self.buf if stray < 0 else self.buf[:stray]
-            keep = 0 if stray >= 0 else frontend.hold_back(text, (HEADER, TOOL_JSON))
+            keep = 0 if stray >= 0 else frontend.hold_back(text, (HEADER, TOOL_JSON, END))
             if len(text) > keep:        # text outside a block: shown as it is
                 out.append(Event("content", text[:len(text) - keep]))
             self.buf = self.buf[len(text) - keep:]
             return stray >= 0
         rest = self.buf[len(HEADER):]
+        if rest.startswith(TOOL_JSON):
+            self._open_bare_call(rest)
+            return True
         for tag, state in ((THINK, "reasoning"), (TEXT, "content"), (TOOL_ERROR, "content"), (TOOL_TEXT, "content")):
             if rest.startswith(tag):
                 self.buf, self.state = rest[len(tag):], state
@@ -122,10 +132,10 @@ class Inkling2Parser:
         self.buf = self.buf[end + len(END):] if end >= 0 else self.buf[len(self.buf) - keep:]
         args = self._args_text()
         if args is not None and self.stream_tools and self.call.name:
-            # The last character may be the call object's own closing brace: stream it once the block ends.
-            upto = len(args) if end >= 0 else max(self.streamed, len(args) - 1)
-            if end >= 0 and args.rstrip().endswith("}"):
-                upto = len(args.rstrip()) - 1
+            trimmed = args.rstrip()
+            # Keep the envelope's final brace and trailing whitespace out of streamed arguments.
+            upto = len(trimmed) - 1 if trimmed.endswith("}") else len(trimmed)
+            upto = max(self.streamed, upto)
             if upto > self.streamed:
                 out.append(Event("tool_args", args[self.streamed:upto], call=self.call))
                 self.streamed = upto
@@ -144,6 +154,10 @@ class Inkling2Parser:
             args, name = {}, self.call.name
         if not isinstance(args, dict):
             args = {}
+        if not (name or self.call.name):
+            out.append(Event("content", TOOL_JSON + self.raw))
+            self.call = None
+            return
         out.append(Event("tool_call", call=ToolCall(name=name or self.call.name, arguments=args, id=self.call.id)))
         self.call = None
 
@@ -168,15 +182,19 @@ class Inkling2Parser:
         was only the start of a marker is text."""
         out: list[Event] = []
         if self.state == "call":
-            keep = frontend.hold_back(self.buf, (END,))
-            self.raw += self.buf[:len(self.buf) - keep]
+            pending = self.buf
+            keep = frontend.hold_back(pending, (END,))
+            self.raw += pending[:len(pending) - keep]
             self.buf = ""
             try:
                 obj = json.loads(self.raw)
             except ValueError:
                 obj = None
-            if isinstance(obj, dict) and isinstance(obj.get("name"), str) and isinstance(obj.get("args"), dict):
+            whole = isinstance(obj, dict) and isinstance(obj.get("name"), str) and isinstance(obj.get("args"), dict)
+            if whole:
                 self._end_call(out)
+            elif not self.call.name:
+                out.append(Event("content", TOOL_JSON + self.raw + pending[len(pending) - keep:]))
             self.call = None
         elif self.state == "name":
             if self.buf.strip():
