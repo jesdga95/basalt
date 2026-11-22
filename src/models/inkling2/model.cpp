@@ -1,5 +1,5 @@
-// src/models/inkling2/model.cpp - loads an Inkling 2 pack: every weight to the main card, the embedding to mapped host
-// memory, then the context sized from what the weights leave.
+// src/models/inkling2/model.cpp - loads an Inkling 2 pack: every weight to the main card (with the layer split the later
+// layers' to the second), the embedding to mapped host memory, then the context sized from what the weights leave.
 #include "models/inkling2/model.hpp"
 
 #include "basalt/core/elastic_kv.hpp"
@@ -10,7 +10,9 @@
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
+#include "basalt/program/multi_gpu_plan.hpp"
 #include "models/inkling2/prompt.hpp"
+#include "models/inkling2/walk.hpp"
 
 #include <cuda_runtime.h>
 
@@ -35,6 +37,13 @@ constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 ro
 constexpr uint64_t kSharedFixed = 768 * kMiB;
 constexpr uint64_t kSessionFixed = 96 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
+// The multi-GPU price of a decode window (multi_gpu_plan.hpp): what one moves at the kernels' rate (3.57 ms a token on an
+// RTX 5090), what the experts no card holds add when the CPU computes them all, how the hottest share x of the experts
+// serves x^kHitExponent of the lookups, and one hand-off of a window's rows from card to card through page-locked RAM
+constexpr double kWindowGB = 6.4;
+constexpr double kMissMs = 130.0;
+constexpr double kHitExponent = 0.55;
+constexpr double kHandoffMs = 0.1;
 
 // The fused projection rows of a layer: tensor suffix, first row, rows, needed on a full layer only.
 struct ProjPart {
@@ -63,14 +72,19 @@ uint64_t expert_stride(int type, uint64_t blob) {
 }
 }  // namespace
 
-uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8) {
-    int global = 0, swa = 0;
-    for (const Visit& v : g.visits) (g.swa[(size_t) v.layer] ? swa : global) += 1;
-    const uint64_t elem = fp8 ? 1 : 2;
-    const uint64_t per_pos = 2ull * kKvHeads * kHeadDim * elem;
-    const uint64_t ring = (uint64_t) g.window + kDecodeRows;
-    return (uint64_t) global * per_pos * (uint64_t) context + (uint64_t) swa * per_pos * ring + kSessionFixed +
-           (uint64_t) kDecodeRows * (uint64_t) g.n_vocab * 4;
+namespace {
+// The cached keys and values of one visit of layer `layer` for `context` positions (a sliding-window layer: its ring).
+uint64_t visit_cache_bytes(const Geometry& g, int layer, int64_t context, bool fp8) {
+    const uint64_t per_pos = 2ull * kKvHeads * kHeadDim * (fp8 ? 1 : 2);
+    return per_pos * (g.swa[(size_t) layer] ? (uint64_t) g.window + kDecodeRows : (uint64_t) context);
+}
+}  // namespace
+
+uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, int cut, int card) {
+    uint64_t caches = 0;
+    for (const Visit& v : g.visits)
+        if ((cut > 0 && v.layer >= cut ? 1 : 0) == card) caches += visit_cache_bytes(g, v.layer, context, fp8);
+    return caches + kSessionFixed + (uint64_t) kDecodeRows * (uint64_t) g.n_vocab * 4;
 }
 
 uint64_t shared_bytes(const Geometry& g, bool drafter) {
@@ -114,7 +128,7 @@ float* InklingModel::small(const std::string& name, uint64_t floats, core::LoadP
     it.off = t->offset;
     it.bytes = t->bytes;
     it.dev = p;
-    it.device = device_;
+    it.device = ldev_;
     reads.add(it);
     return static_cast<float*>(p);
 }
@@ -139,7 +153,7 @@ uint16_t* InklingModel::small_bf16(const std::string& name, uint64_t values, cor
     it.off = t->offset;
     it.bytes = t->bytes;
     it.dev = p;
-    it.device = device_;
+    it.device = ldev_;
     reads.add(it);
     return static_cast<uint16_t*>(p);
 }
@@ -152,6 +166,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     if (!open_pack(path, pack_, err)) return {model::Status::Error, "inkling2: " + err};
     flags_ = req;
     cudaGetDevice(&device_);
+    ldev_ = device_;
+    fp8_ = req.kv == "fp8";
     const Geometry& g = pack_.geo;
     desc_.arch = "inkling2";
     desc_.n_layers = g.n_layers;
@@ -212,12 +228,25 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
 
     uint64_t dense = n_vocab * kQ8Row, experts = 0;
     layers_.assign((size_t) g.n_layers, LayerWeights{});
-    // the loop's message queries of every core layer in one array: a pass's messages are one launch
+    // two cards: what they do together, priced (multi_gpu_plan.hpp); the layer split's cut
+    if (req.diag_split_at > 0 && req.peer_devices.empty()) return fail("--diag-split-at needs a second card (--gpu 0,1)");
+    if (!req.peer_devices.empty())
+        if (model::Result r = plan_cards(req); !r.ok()) return r;
+    // the loop's message queries of every core layer in one array on each card that runs a core layer: a pass's messages
+    // are one launch
     const uint64_t msg_floats = (uint64_t) kStreams * n_embd;
-    if (!(msg_queries_ = reinterpret_cast<float*>(device_buf((uint64_t) (g.loop_end - g.loop_start) * msg_floats * 4))))
-        return fail("out of device memory loading the loop's message queries");
+    for (int c = 0; c < cards(); ++c) {
+        bool runs = false;
+        for (int l = g.loop_start; l < g.loop_end; ++l) runs = runs || card_of(l) == c;
+        if (!runs) continue;
+        cudaSetDevice(card_device(c));
+        if (!(msg_queries_[c] = reinterpret_cast<float*>(device_buf((uint64_t) (g.loop_end - g.loop_start) * msg_floats * 4))))
+            return fail("out of device memory loading the loop's message queries");
+    }
     for (int l = 0; l < g.n_layers; ++l) {
         LayerWeights& w = layers_[(size_t) l];
+        ldev_ = card_device(card_of(l));   // the layer's weights on its card
+        cudaSetDevice(ldev_);
         const bool full = !g.swa[(size_t) l];
         const std::string b = "blk." + std::to_string(l) + ".";
         // the fused projection
@@ -233,7 +262,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             it.off = t->offset;
             it.bytes = t->bytes;
             it.dev = w.proj + (uint64_t) part.row0 * kQ8Row;
-            it.device = device_;
+            it.device = ldev_;
             reads.add(it);
         }
         {
@@ -246,7 +275,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             it.off = t->offset;
             it.bytes = t->bytes;
             it.dev = w.out;
-            it.device = device_;
+            it.device = ldev_;
             reads.add(it);
         }
         dense += (uint64_t) kProj * kQ8Row + n_embd * (3072 / 32 * 34);
@@ -268,8 +297,15 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             return fail(err);
         if (l > 0 && !(w.attn_query = S("attn_res_query.weight", (full ? 3 : 1) * n_embd))) return fail(err);
         if (g.looped(l)) {
+            for (int c = 0; c < cards(); ++c) {   // into the other card's array too, when it runs a core layer
+                if (c == card_of(l) || !msg_queries_[c]) continue;
+                ldev_ = card_device(c);
+                if (!small(b + "loop_msg_query.weight", msg_floats, reads, file, err, msg_queries_[c] + (uint64_t) (l - g.loop_start) * msg_floats))
+                    return fail(err);
+            }
+            ldev_ = card_device(card_of(l));
             if (!(w.msg_query = small(b + "loop_msg_query.weight", msg_floats, reads, file, err,
-                                      msg_queries_ + (uint64_t) (l - g.loop_start) * msg_floats)))
+                                      msg_queries_[card_of(l)] + (uint64_t) (l - g.loop_start) * msg_floats)))
                 return fail(err);
             const uint64_t rank = (uint64_t) g.gate_rank;
             for (int s = 0; s < kStreams; ++s) {
@@ -290,7 +326,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         w.blob_bytes = el.blob_bytes;
         w.expert_stride = expert_stride(el.gu_type, el.blob_bytes);
     }
-    fp8_ = req.kv == "fp8";
+    ldev_ = device_;
+    cudaSetDevice(device_);
     // DSPARK HOOK: the drafter's weights (none with --spec 1), before the context is sized from what the weights leave
     if (req.spec >= 2)
         if (model::Result r = dspark_plan(pack_, reads, file, device_, dspark_); !r.ok()) return r;
@@ -324,6 +361,26 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
         };
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
+        if (cut_ > 0) {   // the layer split: each card holds its layers' experts (no spill), checked once they are placed
+            if (req.expert_cache > 0) return fail("--expert-cache takes one card; the layer split keeps every expert on its card");
+            if (model::Result r = load_experts(reads, file, experts); !r.ok()) return r;
+            for (int c = 0; c < 2; ++c) {
+                cudaSetDevice(card_device(c));
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                const uint64_t need = (session_bytes(g, want, fp8_, cut_, c) +
+                                       (c == 0 && dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess +
+                                      (c == 0 ? shared + spare : shared_bytes(g, false) + kCardSpare);
+                if (need > fb) {
+                    cudaSetDevice(device_);
+                    return fail("the layer split at layer " + std::to_string(cut_) + ": card " + std::to_string(card_device(c)) +
+                                " needs " + std::to_string(need >> 20) + " MiB beside its weights for --max-context " + std::to_string(want) +
+                                ", " + std::to_string(fb >> 20) + " MiB are free (a smaller --max-context, --kv fp8, or one card)");
+                }
+            }
+            cudaSetDevice(device_);
+            ctx_ = want;
+        } else {
         // the experts: all on the card when they fit beside the asked context; else the least routed go to RAM, just enough
         // (spill.hpp). --expert-cache N keeps at most N on the card (a diagnostic).
         {
@@ -382,6 +439,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                                               " positions fit" + (fp8_ ? "" : " (--kv fp8 halves a position's bytes)")};
         }
         ctx_ = want;
+        }
     }
     basalt::log::info("basalt inkling2", "weights on the GPU: dense %.2f GiB, experts %.2f GiB; the embedding in host memory (%.2f GiB)",
                       (double) dense / (double) kGiB, (double) experts / (double) kGiB,
@@ -432,11 +490,13 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
         const uint64_t eb = (uint64_t) g.n_expert * w.expert_stride;
         std::vector<unsigned long long> table((size_t) g.n_expert);
         const std::vector<int32_t>& slot = spill_.slot.empty() ? std::vector<int32_t>() : spill_.slot[(size_t) l];
+        const int dev = card_device(card_of(l));   // the layer's card (a spill runs on one card only)
+        cudaSetDevice(dev);
         if (slot.empty()) {
             // the prompt path reads the last expert's down rows (n_ff 1152 columns) on to a multiple of 256 values: zeros there
             const uint64_t past = std::max(prefill::mmq::read_past_bytes(el.gu_type, g.n_embd),
                                            prefill::mmq::read_past_bytes(el.d_type, g.n_ff_exp));
-            if (core::vmm::supported()) {   // a range of its own, so that a picture can borrow its memory (lend_room)
+            if (core::vmm::supported() && card_of(l) == 0) {   // a range of its own, so that a picture can borrow its memory (lend_room)
                 const uint64_t vg = core::vmm::granularity();
                 Range r;
                 r.bytes = r.own = (eb + past + vg - 1) / vg * vg;
@@ -457,7 +517,7 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
                 it.off = pack_.experts_range.offset + el.offset;
                 it.bytes = eb;
                 it.dev = w.experts;
-                it.device = device_;
+                it.device = dev;
                 reads.add(it);
             } else {
                 cudaMemset(w.experts, 0, eb);
@@ -467,7 +527,7 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
                     it.off = pack_.experts_range.offset + el.offset + (uint64_t) e * el.blob_bytes;
                     it.bytes = el.blob_bytes;
                     it.dev = w.experts + (uint64_t) e * w.expert_stride;
-                    it.device = device_;
+                    it.device = dev;
                     reads.add(it);
                 }
             }
@@ -524,6 +584,67 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
             cudaMemcpy(w.blob_table, table.data(), table.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess)
             return fail("out of device memory loading layer " + std::to_string(l) + "'s expert table");
     }
+    cudaSetDevice(device_);
+    return {};
+}
+
+model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
+    const Geometry& g = pack_.geo;
+    std::vector<program::GpuCard> cards;
+    const int devs[2] = {device_, req.peer_devices[0]};
+    for (int i = 0; i < 2; ++i) {
+        cudaDeviceProp p{};
+        cudaGetDeviceProperties(&p, devs[i]);
+        program::GpuCard c;
+        c.name = p.name;
+        c.cc_major = p.major;
+        c.cc_minor = p.minor;
+        // what the card has free before the weights (a desktop, another process): the head is already on the first
+        size_t free_b = 0, total_b = 0;
+        cudaSetDevice(devs[i]);
+        c.vram = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? free_b + (i == 0 ? (uint64_t) g.n_vocab * kQ8Row : 0) : p.totalGlobalMem;
+        c.mem_gbps = (size_t) i < req.card_gbps.size() ? req.card_gbps[(size_t) i] : 0;
+        cards.push_back(c);
+    }
+    cudaSetDevice(device_);
+    program::MgModel mm;
+    mm.layers = g.n_layers;
+    mm.pairs = (int64_t) g.n_layers * g.n_expert;
+    mm.window_gb = kWindowGB;
+    mm.miss_ms = kMissMs;
+    mm.hit_exponent = kHitExponent;
+    mm.tier_built = false;
+    mm.handoff_ms = kHandoffMs;
+    mm.split_spills = false;   // a split card holds every expert of its layers
+    mm.split_unlike = true;    // and the split beats the CPU's experts on unlike cards too (an RTX 5090 with 16 GB free)
+    uint64_t experts = 0, dense = (uint64_t) g.n_vocab * kQ8Row;
+    std::vector<int> visits((size_t) g.n_layers, 0);
+    for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
+    const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
+    const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
+    for (int l = 0; l < g.n_layers; ++l) {
+        const ExpertLayer& el = pack_.experts[(size_t) l];
+        mm.layer_bytes.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes));
+        experts += mm.layer_bytes.back();
+        mm.layer_caches.push_back((uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, req.kv == "fp8") * n_sess);
+        mm.layer_share.push_back((double) visits[(size_t) l] / (double) g.visits.size());
+        dense += (uint64_t) kProj * kQ8Row + (uint64_t) g.n_embd * (3072 / 32 * 34);
+    }
+    for (int c = 0; c <= g.n_layers; ++c) mm.split_handoffs.push_back(split_handoffs(g, c));
+    mm.blob_bytes = experts / (uint64_t) mm.pairs;
+    mm.peer_overhead = kCardSpare + shared_bytes(g, false);
+    mm.main_overhead = kCardSpare + shared_bytes(g, req.spec >= 2) + dense + session_bytes(g, want, req.kv == "fp8") * n_sess +
+                       (1000ull << 20);   // the drafter, as multi_gpu_plan counts it on the first card
+    const program::MgPlan mp = program::plan_multi_gpu(cards, mm);
+    basalt::log::info("basalt inkling2", "%s", mp.line.c_str());
+    cut_ = req.diag_split_at > 0 ? std::min(req.diag_split_at, g.n_layers - 1) : mp.pick == program::Mechanism::LayerSplit ? mp.cut : 0;
+    second_ = devs[1];
+    if (cut_ > 0)
+        basalt::log::info("basalt inkling2", "layer split%s: layers 0..%d on CUDA%d, %d..%d on CUDA%d, %d hand-offs a window",
+                          req.diag_split_at > 0 ? " (--diag-split-at)" : "", cut_ - 1, devs[0], cut_, g.n_layers - 1, devs[1],
+                          split_handoffs(g, cut_));
+    else
+        basalt::log::info("basalt inkling2", "CUDA%d idles: CUDA%d runs alone", devs[1], devs[0]);
     return {};
 }
 

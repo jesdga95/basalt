@@ -10,6 +10,8 @@
 #include "models/inkling2/meta.hpp"
 #include "models/inkling2/model.hpp"
 
+#include <cstdlib>
+
 namespace basalt::models::inkling2 {
 namespace {
 
@@ -43,7 +45,7 @@ public:
         return f;
     }
     PreTokenizer pretokenizer() const override { return {"inkling2", pretok_inkling2, kIgnoreMerges}; }
-    int max_expert_cards() const override { return 0; }
+    int max_expert_cards() const override { return 1; }   // the second card: the layer split (model.hpp card_of)
     const char* model_name() const override { return "Inkling-2-Mini"; }
     const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, Q8_0 dense
 
@@ -51,6 +53,10 @@ public:
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
         if (a == "--kv") {
             o.kv = args.next("--kv");
+            return true;
+        }
+        if (a == "--diag-split-at") {   // diagnostic: the layer split forced, the second card from this layer on
+            o.diag_split_at = std::atoi(args.next("--diag-split-at"));
             return true;
         }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK

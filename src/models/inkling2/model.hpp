@@ -1,6 +1,7 @@
 // src/models/inkling2/model.hpp - a loaded Inkling 2 pack: every weight on the main card (the projections of a layer fused
 // into one Q8_0 matrix, the experts of a layer in one run of blobs at a stride of whole blocks in a reserved address range,
-// the head rounded to Q8_0 as it loads), the token embedding in mapped host memory.
+// the head rounded to Q8_0 as it loads), the token embedding in mapped host memory. With the layer split the second card
+// holds the later layers' weights, experts and caches instead (cards(), card_of()).
 #pragma once
 
 #include "basalt/model/adapter.hpp"
@@ -65,9 +66,16 @@ public:
     const float* embed_norm() const { return embed_norm_; }
     const float* output_norm() const { return output_norm_; }
     const float* output_query() const { return output_query_; }
-    /// [core layers][kStreams][n_embd]: every core layer's message queries, layer loop_start first
-    const float* msg_queries() const { return msg_queries_; }
+    /// [core layers][kStreams][n_embd]: every core layer's message queries, layer loop_start first, on card `card` (null on
+    /// a card that runs no core layer)
+    const float* msg_queries(int card = 0) const { return msg_queries_[card]; }
     int device() const { return device_; }
+    /// The layer split (docs/configuration/gpus.md): with two cards the second runs layers [cut, n_layers) with their
+    /// weights, experts and caches; the first runs the rest, the embedding, the head and the drafter. One card: card 0.
+    int cards() const { return cut_ > 0 ? 2 : 1; }
+    int card_of(int layer) const { return cut_ > 0 && layer >= cut_ ? 1 : 0; }
+    int card_device(int card) const { return card == 0 ? device_ : second_; }
+    int split_cut() const { return cut_; }
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     const model::LoadRequest& flags() const { return flags_; }
     bool cache_fp8() const { return fp8_; }
@@ -128,6 +136,8 @@ private:
                          uint16_t* dst = nullptr);
     /// Every layer's experts, the ones `spill_` sends to RAM there; their bytes on the card into `experts`.
     model::Result load_experts(core::LoadPlan& reads, int file, uint64_t& experts);
+    /// Two cards: prices what they do together and sets the layer split's cut (0: the first card runs alone).
+    model::Result plan_cards(const model::LoadRequest& req);
 
     Pack pack_;
     model::ModelDesc desc_;
@@ -139,9 +149,11 @@ private:
     const float* embed_norm_ = nullptr;
     const float* output_norm_ = nullptr;
     const float* output_query_ = nullptr;
-    float* msg_queries_ = nullptr;
+    float* msg_queries_[2] = {};
+    int cut_ = 0, second_ = -1;              ///< the layer split's cut (0: none) and the second card's device
     model::LoadRequest flags_;
     int device_ = 0, fd_ = -1;
+    int ldev_ = 0;                           ///< the card the weights being planned load to
     bool fp8_ = false;
     int64_t ctx_ = kDefaultContext;
     mutable ImageEncoder vis_;   // [vision]
@@ -179,9 +191,11 @@ private:
 /// A session over `model`; null with `err` set.
 std::unique_ptr<model::ModelSession> make_session(InklingModel& model, std::string& err);
 
-/// The device bytes a session takes for `context` positions (fp8: one byte a cached value), its drafter aside.
-uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8);
-/// The device bytes every session shares once: the forward's scratch, the prompt path, the drafter's tap.
+/// The device bytes a session takes for `context` positions (fp8: one byte a cached value), its drafter aside, on card
+/// `card` of a split at `cut` (0: one card, every visit).
+uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, int cut = 0, int card = 0);
+/// The device bytes every session shares once on a card: the forward's scratch, the prompt path, the drafter's tap (the
+/// first card's).
 uint64_t shared_bytes(const Geometry& g, bool drafter);
 
 }  // namespace basalt::models::inkling2
