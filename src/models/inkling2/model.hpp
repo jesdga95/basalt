@@ -1,6 +1,6 @@
 // src/models/inkling2/model.hpp - a loaded Inkling 2 pack: every weight on the main card (the projections of a layer fused
-// into one Q8_0 matrix, the experts of a layer in one run of blobs at a stride of whole blocks, the head rounded to Q8_0 as
-// it loads), the token embedding in mapped host memory.
+// into one Q8_0 matrix, the experts of a layer in one run of blobs at a stride of whole blocks in a reserved address range,
+// the head rounded to Q8_0 as it loads), the token embedding in mapped host memory.
 #pragma once
 
 #include "basalt/model/adapter.hpp"
@@ -134,7 +134,8 @@ private:
     mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DsparkWeights> dspark_;   // DSPARK HOOK
     std::weak_ptr<void> shared_;
-    // the spill (spill.hpp): each spilled layer's reserved range and its own backing, the staging they share, the RAM copies
+    // each layer's experts in a reserved range with its own backing (a spilled layer's RAM slots over the staging they share,
+    // spill.hpp; without virtual memory management a layer that keeps every expert has a plain allocation), the RAM copies
     struct Range {
         uint8_t* va = nullptr;
         uint64_t bytes = 0, own = 0;
