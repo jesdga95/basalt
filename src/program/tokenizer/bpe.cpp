@@ -71,6 +71,7 @@ inline size_t pair_slot(uint64_t key, uint64_t mask) { return (size_t) (((key * 
 bool Tokenizer::load(std::string_view vocab_json, std::string_view merges_txt, std::string_view types_json,
                      std::string& err) {
     raw_.clear();
+    whole_.clear();
     merges_.clear();
     memo_.clear();
     memo_used_ = 0;
@@ -137,6 +138,12 @@ bool Tokenizer::load(std::string_view vocab_json, std::string_view merges_txt, s
         auto it = by_bytes.find(std::string_view(&c, 1));
         if (it != by_bytes.end()) byte_id_[b] = it->second;
     }
+    // ignore_merges: the entries a piece can be (a literal is split off before the pieces)
+    if (ignore_merges_)
+        for (const auto& [bytes_of, id] : by_bytes) {
+            const int ty = (size_t) id < types.size() ? types[(size_t) id] : -1;
+            if (have[(size_t) id] == 2 && ty != 3 && ty != 4) whole_.emplace(bytes_of, id);
+        }
 
     // merges.txt -> open-addressed table; a repeated pair keeps its last rank
     size_t n_merges = 0;
@@ -214,6 +221,10 @@ int32_t Tokenizer::find_merge(int32_t left, int32_t right, uint32_t& rank) const
 }
 
 bool Tokenizer::merge_piece(const uint8_t* p, size_t n, std::vector<int32_t>& out, std::string& err) {
+    if (!whole_.empty()) {   // ignore_merges: a piece that is an entry is that token
+        const auto it = whole_.find(std::string_view((const char*) p, n));
+        if (it != whole_.end()) { out.push_back(it->second); return true; }
+    }
     sym_.resize(n);
     for (size_t i = 0; i < n; ++i) {
         const int32_t id = byte_id_[p[i]];

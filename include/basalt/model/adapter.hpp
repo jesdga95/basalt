@@ -354,10 +354,13 @@ public:
         return false;
     }
     virtual TokenNames token_names() const = 0;
-    /// The pre-tokenizer's name in the pack's tokenizer.json and its rule.
+    /// The pre-tokenizer's name in the pack's tokenizer.json and its rule. `ignore_merges`: a piece that is itself a
+    /// vocabulary entry is that token, not merged from its bytes (Hugging Face BPE's ignore_merges; llama.cpp ties it to
+    /// the pre-tokenizer too).
     struct PreTokenizer {
         const char* name = "";
         void (*split)(const char* text, size_t size, std::vector<size_t>& ends) = nullptr;
+        bool ignore_merges = false;
     };
     virtual PreTokenizer pretokenizer() const = 0;
     virtual program::grammar::ToolForm tool_form() const = 0;
