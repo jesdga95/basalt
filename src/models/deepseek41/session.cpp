@@ -496,7 +496,7 @@ public:
 
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid&) override {
         std::string err;
-        if (!image_) {   // this slot's image buffers, allocated with the tier
+        if (!image_) {   // this slot's image buffers, filled per request
             core::ExpertTier* tier = ops_ ? ops_->expert_tier(err) : nullptr;
             image_ = tier ? m_.prompt_host().take_image() : nullptr;
             if (!image_) return {model::Status::Error, err.empty() ? "deepseek41: no image buffers for this slot" : err};
@@ -554,6 +554,10 @@ public:
     }
 
     void images_done() override {
+        if (image_) {   // the picture's decode and patch rows leave with the request
+            std::vector<uint8_t>().swap(image_->picture.rgb);
+            std::vector<float>().swap(image_->patches);
+        }
         if (!vis_borrowed_) return;
         vis_borrowed_ = false;
         cudaStreamSynchronize(stream_);
@@ -1480,7 +1484,7 @@ private:
     int dwin_ = 0;               // this session's window in the drafter
     DsparkDraft held_;           // the drafts of a draft_batch, which draft_end returns
     bool holding_ = false;
-    PromptHost::Image* image_ = nullptr;   ///< this slot's image buffers
+    PromptHost::Image* image_ = nullptr;   ///< this slot's image buffers, filled per request
     float* dfeat_ = nullptr;     // [rows][target layers][n_embd]
     float* h_dfeat_ = nullptr;
     int64_t feat_pos0_ = 0;      // the first position of the rows in dfeat_ that await the drafter, and how many
