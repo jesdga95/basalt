@@ -355,12 +355,12 @@ void attention_prompt(const AttnPromptArgs& a, int rows, float* out, void* strea
     if (rows <= 0) return;
     const dim3 grid((unsigned) ((rows + kPos - 1) / kPos), kKvHeads);
     cudaStream_t s = (cudaStream_t) stream;
-    static const bool sized = [] {
+    static bool sized[kOptInDevices] = {};   // the opt-in is per device
+    if (bool& z = sized[opt_in_device()]; !z) {
         cudaFuncSetAttribute(attn_prompt_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         cudaFuncSetAttribute(attn_prompt_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
-        return true;
-    }();
-    (void) sized;
+        z = true;
+    }
     if (a.fp8) attn_prompt_kernel<true><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
     else attn_prompt_kernel<false><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
     check("attention_prompt");

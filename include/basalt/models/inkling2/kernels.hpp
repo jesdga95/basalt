@@ -123,6 +123,11 @@ struct AttnArgs {
     void* q8 = nullptr;                ///< set: the (gated) output also as q8_1 blocks, [rows][kHeads * kHeadDim / 32]
     Segments seg;                      ///< a batch window's: each segment's caches
 };
+/// The kernels' shared-memory opt-ins are per device (a layer split runs them on two cards): the current device's index
+/// into their flags, below kOptInDevices.
+constexpr int kOptInDevices = 64;
+int opt_in_device();
+
 /// Bytes of scratch attention_decode needs for `rows` rows over at most `max_keys` keys.
 size_t attention_decode_scratch(int rows, int64_t max_keys);
 /// out[r][h] = sum_j softmax_j(scale q.k_j + bias(pos_r - pos_j)) v_j over the keys at positions <= pos_r (and within the
