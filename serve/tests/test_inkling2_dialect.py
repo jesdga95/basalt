@@ -173,6 +173,16 @@ class Parse(unittest.TestCase):
                 self.assertEqual(merged(parse(reply, chunk))[-2:], [("args", '{"q":"one"}'), ("call", "search", {"q": "one"})],
                                  (reply, chunk))
 
+    def test_whitespace_after_the_call_does_not_stream_its_brace(self):
+        # the JSON, then whitespace in its own piece, then the block's end: the envelope's brace stays out
+        for head in (HEADER + "search" + TOOL_JSON, TOOL_JSON):
+            p = Inkling2Parser()
+            events = []
+            for piece in (head + '{"name":"search","args":{"q":"one"}}', "\n ", END):
+                events += p.feed(piece)
+            events += p.finish()
+            self.assertEqual(merged(events)[-2:], [("args", '{"q":"one"}'), ("call", "search", {"q": "one"})], head)
+
     def test_a_bare_marker_with_no_name_is_text(self):
         reply = TOOL_JSON + '{"args":{"q":"one"}}' + END
         self.assertFalse([e for e in parse(reply) if e.kind == "tool_call"])

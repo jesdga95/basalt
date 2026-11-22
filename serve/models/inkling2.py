@@ -151,7 +151,8 @@ class Inkling2Parser:
         args = self._args_text()
         if args is not None and self.stream_tools and self.started:
             # the last character may be the call object's own closing brace: streamed once the block ends
-            upto = len(args) if end >= 0 else max(self.streamed, len(args) - 1)
+            # trailing whitespace and the last character may be the call object's own closing brace: held back
+            upto = len(args) if end >= 0 else max(self.streamed, len(args.rstrip()) - 1)
             if end >= 0 and args.rstrip().endswith("}"):
                 upto = len(args.rstrip()) - 1
             if upto > self.streamed:
