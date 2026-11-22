@@ -5,6 +5,7 @@ Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quali
 ## Summary
 
 - **Against the reference:** over 100 WikiText-2 chunks, FP16 scores mean KLD 0.00310 and INT8 0.00344, with 97.78% and 97.79% top-1 agreement respectively ([below](#against-the-reference)).
+- **At 256k context:** FP8 saves 4.25 GiB and INT8 saves 3.74 GiB of total VRAM versus FP16 with the same expert placement ([measurements](#vram-at-256k-context)).
 - **The reference is not a true BF16 model.** No BF16 checkpoint exists: the release ships its routed experts in NVFP4 and
   MXFP8. The base is the official release with its experts dequantized to BF16, so its KLD is not comparable with the other
   models' true-BF16 KLDs.
@@ -75,8 +76,28 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | the same 90 chunks, the whole model on the card | 0.00304 | 97.76% | |
 | 100 chunks, layer split: 0 to 11 on the RTX 5090, 12 to 23 on an RTX 5060 Ti | 0.00304 | 97.70% | 7.0718 (base 7.0633) |
 
-RTX 5090 at 400 W, the whole model on the card, unless the row says otherwise. On the 5060 Ti the CPU computes the experts in
-RAM (a Ryzen 9 9950X, AVX-512). The FP8 and INT8 rows were measured before the current rebase and need revalidation against this build.
+RTX 5090 at 400 W, the whole model on the card, unless a row says otherwise. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512). The FP8 and INT8 values below, including the decode and VRAM measurements, predate this rebase and need revalidation on the rebased build.
+
+The earlier INT8–FP16 decode ABBA (one cold process per measurement) averaged 5.20 / 7.61 / 4.75 ms per window and 192.3 / 131.4 / 210.7 passes/s for INT8 (conv / struct / prose), versus 5.43 / 7.61 / 4.77 ms and 184.3 / 131.4 / 209.6 passes/s for FP16. Completion lengths and draft acceptance varied, so tok/s was not directly comparable.
+
+An earlier FP16–FP8 ABBA used the same `conv` prompt and `--max-context 32768`, `--spec 5`, fixed seed 1, and `--expert-cache 3072` (3,070 expert slots on the GPU and 2 in RAM). It averaged 5.406 vs 5.524 ms/window and 185.0 vs 181.1 passes/s. FP16 stopped at 1,158 tokens; FP8 reached the 1,200-token fixture limit, so tok/s differed with completion length.
+
+| KV format | Mean ms/window | Mean passes/s | Mean tok/s | Output tokens |
+| --- | ---: | ---: | ---: | ---: |
+| FP16 | 5.406 | 185.0 | 384.6 | 1,158 |
+| FP8 | 5.524 | 181.1 | 415.5 | 1,200 |
+
+## Earlier VRAM use at 256k context
+
+Measured after `READY 262144`, before a prompt, on an RTX 5090. The full context capacity was allocated at startup; expert placement used `--expert-cache 3072` (3,070 GPU slots and 2 in RAM). Idle `nvidia-smi` use was 1,895 MiB.
+
+| KV format | Total VRAM used | Above idle | Saved vs FP16 |
+| --- | ---: | ---: | ---: |
+| FP16 | 30,192 MiB (29.48 GiB) | 28,297 MiB | — |
+| FP8 | 25,840 MiB (25.23 GiB) | 23,945 MiB | 4,352 MiB (4.25 GiB) |
+| INT8 | 26,366 MiB (25.75 GiB) | 24,471 MiB | 3,826 MiB (3.74 GiB) |
+
+The previous INT8 row-writer parity matched the CPU reference for 257 rows of width 128. Dequantized max absolute error was 0.00559; the microbench took 2.81 µs for 4,096 rows at 957 GB/s.
 
 ## Drafting
 
