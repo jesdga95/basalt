@@ -253,6 +253,8 @@ struct VisionEncoder::Impl {
     void drop_work() {
         for (void* p : work) cudaFree(p);
         work.clear();
+        d_rows = x = g = g2 = q = k = v = ao = S = y = aout = dout = nullptr;
+        act = mrg = h1 = nullptr;
         cap = ng_cap = tok_cap = 0;
     }
 
