@@ -1,0 +1,165 @@
+name: rebase needed
+
+# The mergeable state decides this label, not someone's memory: a head that no longer
+# merges cleanly into main gets rebase-needed, and the rebased head loses it again on the
+# push that carries the rebase. Rebasing is local here because the Update branch button is
+# off, and most conflicts appear when main moves, which fires no pull request event - hence
+# the scheduled sweep for the add side. Removal needs no sweep: it hangs off synchronize.
+# This privileged workflow never checks out or runs pull request code.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: rebase-needed-${{ github.event.pull_request.number || 'sweep' }}
+  cancel-in-progress: true
+
+env:
+  LABEL: rebase-needed
+  COLOR: d93f0b
+  DESCRIPTION: "Conflicts with main: rebase onto main before this can merge."
+
+jobs:
+  one:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Match the label to this pull request's mergeable state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+
+          pull="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          state="$(jq -r .state <<< "${pull}")"
+          base="$(jq -r .base.ref <<< "${pull}")"
+
+          if [ "${state}" != "open" ]; then
+            echo "The pull request is ${state}: nothing to label."
+            exit 0
+          fi
+          if [ "${base}" != "${default_branch}" ]; then
+            echo "The pull request targets ${base}, not ${default_branch}: nothing to label."
+            exit 0
+          fi
+
+          mergeable="$(jq -r '.mergeable | tostring' <<< "${pull}")"
+          for attempt in $(seq 1 10); do
+            if [ "${mergeable}" != "null" ]; then
+              break
+            fi
+            echo "GitHub has not computed mergeability yet (attempt ${attempt}); waiting"
+            sleep 3
+            mergeable="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.mergeable | tostring')"
+          done
+
+          if [ "${mergeable}" = "null" ]; then
+            echo "GitHub did not report mergeability, so the label is left as it is."
+            exit 0
+          fi
+
+          labels="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels")"
+          labelled="$(jq --arg label "${LABEL}" 'any(.[]; .name == $label)' <<< "${labels}")"
+
+          if [ "${mergeable}" = "false" ] && [ "${labelled}" != "true" ]; then
+            gh label create "${LABEL}" --repo "${GITHUB_REPOSITORY}" --color "${COLOR}" --description "${DESCRIPTION}" --force
+            gh pr edit "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --add-label "${LABEL}"
+            echo "Added ${LABEL}: the head does not merge cleanly into ${base}."
+          elif [ "${mergeable}" = "true" ] && [ "${labelled}" = "true" ]; then
+            gh pr edit "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --remove-label "${LABEL}"
+            echo "Removed ${LABEL}: the head merges cleanly into ${base} again."
+          else
+            echo "No change needed (mergeable=${mergeable}, labelled=${labelled})."
+          fi
+
+  sweep:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Match the label across every open pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+          owner="${GITHUB_REPOSITORY%%/*}"
+          name="${GITHUB_REPOSITORY##*/}"
+
+          gh api graphql --paginate -F owner="${owner}" -F name="${name}" -f query='
+            query($owner: String!, $name: String!, $endCursor: String) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(states: OPEN, first: 50, after: $endCursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes {
+                    number
+                    baseRefName
+                    mergeable
+                    isDraft
+                    labels(first: 50) { nodes { name } }
+                  }
+                }
+              }
+            }' --jq '.data.repository.pullRequests.nodes[]' > "${RUNNER_TEMP}/open-prs.jsonl"
+
+          total="$(wc -l < "${RUNNER_TEMP}/open-prs.jsonl")"
+          echo "Checking ${total} open pull requests against ${default_branch}."
+
+          while IFS= read -r node; do
+            number="$(jq -r .number <<< "${node}")"
+            base="$(jq -r .baseRefName <<< "${node}")"
+            mergeable="$(jq -r .mergeable <<< "${node}")"
+            labelled="$(jq --arg label "${LABEL}" 'any(.labels.nodes[]; .name == $label)' <<< "${node}")"
+
+            if [ "${base}" != "${default_branch}" ]; then
+              continue
+            fi
+
+            if [ "${mergeable}" = "UNKNOWN" ]; then
+              for attempt in $(seq 1 5); do
+                raw="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" --jq '.mergeable | tostring')"
+                if [ "${raw}" = "true" ]; then
+                  mergeable="MERGEABLE"
+                  break
+                fi
+                if [ "${raw}" = "false" ]; then
+                  mergeable="CONFLICTING"
+                  break
+                fi
+                echo "#${number}: mergeability not computed yet (attempt ${attempt}); waiting"
+                sleep 2
+              done
+            fi
+
+            case "${mergeable}" in
+              CONFLICTING)
+                if [ "${labelled}" != "true" ]; then
+                  gh label create "${LABEL}" --repo "${GITHUB_REPOSITORY}" --color "${COLOR}" --description "${DESCRIPTION}" --force
+                  gh pr edit "${number}" --repo "${GITHUB_REPOSITORY}" --add-label "${LABEL}"
+                  echo "Added ${LABEL} to #${number}."
+                fi
+                ;;
+              MERGEABLE)
+                if [ "${labelled}" = "true" ]; then
+                  gh pr edit "${number}" --repo "${GITHUB_REPOSITORY}" --remove-label "${LABEL}"
+                  echo "Removed ${LABEL} from #${number}."
+                fi
+                ;;
+              *)
+                echo "#${number}: mergeability ${mergeable}, so the label is left as it is."
+                ;;
+            esac
+          done < "${RUNNER_TEMP}/open-prs.jsonl"
