@@ -82,9 +82,13 @@ times the slots plus the shared scratch once, so more slots cost only their cach
    parity test: several conversations in one call bitwise equal to each alone.
 3. Derive the session from `model::BatchSession` and write its hooks: `batch_rows` (the widest row-invariant window),
    `batch_name`, `batch_context`, `batch_shared`, `batch_stream`, `batch_reserve` (room for positions), `batch_stage` (rows'
-   tokens and positions to the card, the launch bounds into the graph key), `batch_forward` (launches only: the layers over
-   the segments and the head), `batch_take` (a segment's logits rows into its session, its history) and `batch_draw` (its
-   draws, queued).
+   tokens and positions to the card, the launch bounds into the graph key), `batch_forward` (the layers over the segments and
+   the head; false with an error when the window fails), `batch_take` (a segment's logits rows into its session, its
+   history) and `batch_draw` (its draws, queued). A model whose forward only launches is captured by the driver, a graph per
+   composition. A model whose host steers its forward between launches (Hy4 places its experts between per-layer graphs)
+   returns false from `batch_captured`: the driver runs its forward directly every window and the model replays its own
+   graphs of the stretches between. A session whose state the batch path does not cover yet returns false from
+   `batch_ready`, and the batch's windows run in turn.
 4. Run the checks: `basalt --model FILE --batch 4 --tokens-file PROMPT --diag-batch-check` (every row of every composition
    bitwise its solo window), then `tools/batch_identity.py ENGINE --model FILE --slots 1,2,4,8` (every slot's tokens, alone
    and together, equal to a one-slot engine's).
@@ -124,15 +128,25 @@ Every model below runs `--parallel N` today as N sessions whose windows run one 
   with the session's own sampler into its pinned picks.
 - **Shared:** the forward's row buffers and expert scratch, the prompt path (its chunk buffers) and the drafter's tap.
 
-### Hy4-flash
+### Hy4-flash (second)
 
 - **State:** MLA latent rows per sparse layer and the indexer's pooled keys (one per 4 positions), sliding-window rings, the
-  Engram rows (looked up from the conversation's own preceding tokens), the DFly2 drafter's context. Hyper-connections are
-  stateless.
-- **Kernels:** the latent cache write and the sparse attention take per-segment caches; the indexer's pooled key of a partial
-  group of 4 is per-segment state; Engram hashing reads each row's own history (per-segment token ring).
+  indexer's rows of the last positions, the Engram history (the conversation's own tokens), the DFly2 drafter's tap, the
+  sampler and the logits. Hyper-connections are stateless.
+- **Kernels:** they already take a position per row (`mla_query`, the row spans of `mla_attend`); only a cache's base is per
+  conversation. The batch runs each segment's cache write, attention and indexer (ring rows, pooled keys, selection) as one
+  launch of its rows over its own state; every other launch takes every row. The Engram's lookups read each row's own
+  history on the host.
+- **On the driver:** `batch_captured` is false: the host waits for the router's ids and places each layer's experts between
+  three graphs a layer. The graphs hold no session state (the per-segment launches run between them), so they are keyed by
+  the row count only. `batch_ready` is false for a session holding a picture's rotary table.
+- **Cap:** 8 rows, the experts' group. With frozen tiers every row's pick and logits equal its solo window's.
+- **Checks:** both with the tier frozen and its size pinned (`--diag-tier-frozen --expert-cache N`): each session costs
+  VRAM, so an unpinned tier holds fewer experts at more slots. The serve check runs on one card: with a second card a
+  prompt's experts split between the cards by measured rates, so two engine starts can differ (in turn as well); together
+  equals alone on two cards too.
 - **Experts:** one tier shared by every session. Most decode time goes to experts on the bus and in RAM, so the MoE caveat
-  below decides its cap.
+  below decides whether more rows pay.
 
 ### DeepSeek-V4.1-Flash
 
