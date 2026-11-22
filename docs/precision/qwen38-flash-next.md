@@ -45,6 +45,10 @@ On an RTX 5090 at 475 W, `q4_attn_bench` at 2,048 selected cells measured 9.2 �
 (129 → 144 GB/s effective pool bandwidth). Int8 measured 8.8 µs. Random Q4_0 attention outputs matched the GPU
 reference bit for bit, with a maximum absolute error of 1.8e-8 against the double-precision CPU reference.
 
+The fused Q4_0 prelude uses warp shuffles to rotate Q, K and V and exchanges K and V together across warps. In
+`qsa_dec_fused_parity` on the same GPU at 475 W, the fused stages averaged 4.92 → 4.15 µs for one token and
+7.33 → 6.98 µs for eight. Rotated Q/K and the packed K/V blocks matched the separate kernels bit for bit.
+
 Decode activations are int8 (q8_1) into every quantized matmul. The hc read stays fp32 (llama.cpp quantizes it to Q8_0).
 
 ### Expert tiers

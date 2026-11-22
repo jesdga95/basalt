@@ -1329,6 +1329,8 @@ add_executable(qsa_dec_fused_parity tests/models/qwen4exp/kernels/qsa_dec_fused_
 target_include_directories(qsa_dec_fused_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(qsa_dec_fused_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME qsa_dec_fused_parity COMMAND qsa_dec_fused_parity 20)
+basalt_gpu_test(NAME qsa_dec_fused_q4_parity COMMAND qsa_dec_fused_parity 20 0 1)
+basalt_gpu_test(NAME qsa_dec_fused_q4_split_parity COMMAND qsa_dec_fused_parity 20 1 1)
 add_executable(qsa_seg_parity tests/models/qwen4exp/kernels/qsa_seg_parity.cpp)
 target_include_directories(qsa_seg_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(qsa_seg_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
