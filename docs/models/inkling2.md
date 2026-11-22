@@ -86,8 +86,12 @@ same greedy tokens as with `--parallel 1`, and requests decoding together each g
 
 ## Images
 
-`--vision dynamic` ([vision](../running.md#vision---vision)). The engine's own encoder reads a picture at its size, padded to
-multiples of 40 pixels, one token per 40 x 40 cell: a 640 x 488 picture takes 208 tokens. A picture of more than 10,609 cells
+`--vision dynamic` ([vision](../running.md#vision---vision)) keeps no card memory, so the context that keeps every expert on
+the card is the same as without it. A request's pictures borrow the encoder's region (up to 1.37 GiB) from the experts: the
+card copies of RAM experts go back first, then whole layers' experts are copied to RAM and come back byte for byte at the
+same addresses after the pictures (one layer, about 0.3 s a request on an RTX 5090 with every expert on the card). The
+engine's own encoder reads a picture at its size, padded to multiples of 40 pixels, one token per 40 x 40 cell: a 640 x 488
+picture takes 208 tokens. A picture of more than 10,609 cells
 (about 4,120 x 4,120) is scaled down to fit (bicubic). Transparent pixels are laid over the reference processor's grey
 checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the model tends to call such a background black.
 
