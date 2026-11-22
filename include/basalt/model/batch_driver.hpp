@@ -1,7 +1,7 @@
 // include/basalt/model/batch_driver.hpp - decode_batch for any model (docs/design/batching.md). A model's session derives
 // BatchSession and writes the hooks below: its rows' inputs to the card, the forward of a window of segments, each session's
 // logits back and its draws. The driver does the rest: the checks, the segments, each session's head rows, the graph of each
-// composition (direct on its first window, captured on its second, the most recently used kept), the order of the streams
+// composition (its first window direct, then captured behind it; the most recently used kept), the order of the streams
 // and one sync for the whole batch. A model whose host steers its forward between launches (experts placed by the host
 // between per-layer graphs) runs its forward directly every window and keeps its own graphs (batch_captured false); a
 // session that cannot batch for now (batch_ready false) has the batch's windows run in turn.
@@ -15,7 +15,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -40,7 +39,6 @@ struct BatchView {
 struct BatchShared {
     static constexpr size_t kGraphs = 64;
     GraphLru<core::CapturedGraph> graphs{kGraphs};
-    std::set<GraphLru<core::CapturedGraph>::Key> direct;   ///< the compositions whose first window has run
 };
 
 class BatchSession : public ModelSession {
@@ -89,11 +87,12 @@ public:
             }
         } else if (core::CapturedGraph* g = sh.graphs.find(key)) {
             if (!g->launch(st, err)) return {Status::Error, who + ": " + err};
-        } else if (sh.direct.insert(key).second) {
-            if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
         } else {
-            core::CapturedGraph g;
-            if (!g.begin(st, err)) return {Status::Error, who + ": " + err};
+            // a composition's first window runs as launched, then is captured for the next ones: the graph is built while
+            // the card runs the window
+            if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
+            core::CapturedGraph fresh;
+            if (!fresh.begin(st, err)) return {Status::Error, who + ": " + err};
             if (!batch_forward(v, err)) {
                 cudaGraph_t dropped = nullptr;
                 cudaStreamEndCapture(st, &dropped);
@@ -101,7 +100,8 @@ public:
                 cudaGetLastError();
                 return {Status::Error, who + ": " + err};
             }
-            if (!g.end(st, err) || !sh.graphs.insert(std::move(key), std::move(g)).launch(st, err)) return {Status::Error, who + ": " + err};
+            if (!fresh.end(st, err)) return {Status::Error, who + ": " + err};
+            sh.graphs.insert(std::move(key), std::move(fresh));
         }
         if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) return {Status::Error, who + ": CUDA: " + cudaGetErrorString(e)};
         // each session its rows back, then its draws, all queued; one sync, then the picks
@@ -142,8 +142,9 @@ protected:
     virtual bool batch_stage(const BatchView& v, GraphLru<core::CapturedGraph>::Key& key, std::string& err) = 0;
     /// On the leader: every row through the layers on the shared scratch, each segment's stateful kernels reading and
     /// writing v.ss[i]'s state, then the head over at least each segment's head rows, and whatever per-segment state the
-    /// window leaves (a drafter's context). Launches only while batch_captured() (it may be captured). False with `err`:
-    /// the window failed (the driver drains the stream and reports it).
+    /// window leaves (a drafter's context). Launches only while batch_captured(): a composition's first window runs it
+    /// twice, as launched and then captured. False with `err`: the window failed (the driver drains the stream and reports
+    /// it).
     virtual bool batch_forward(const BatchView& v, std::string& err) = 0;
     /// True: batch_forward only launches and the driver captures a graph per composition. False: the host steers the
     /// forward (it reads results between launches), so the driver runs it directly every window and the model keeps its
