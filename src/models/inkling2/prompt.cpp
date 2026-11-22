@@ -115,7 +115,7 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     b.dst = c.take<int32_t>(P);
     b.exp = c.take<int32_t>(P);
     b.sort_scr = c.take<uint8_t>(moe_sort_scratch((int) P, g.n_expert));
-    const size_t stage = (size_t) kKvHeads * R * kHeadDim * 2;   // fp16 at most
+    const size_t stage = (size_t) kKvHeads * R * kv_cache_row_bytes(false, true);   // the widest cache row
     b.k_stage = c.take<uint8_t>(stage);
     b.v_stage = c.take<uint8_t>(stage);
     b.pos = c.take<int32_t>(R);
@@ -338,6 +338,7 @@ private:
         product(w.proj + (size_t) kRowV * row_bytes, kProjKV, E, rows, b_.yv);
         // convolutions, clips and the keys: a sliding-window visit stages the chunk's own, a full visit writes its cells
         const bool fp8 = m_.cache_fp8();
+        const bool int8 = m_.cache_int8();
         AttnPrep ap;
         ap.yq = b_.yq;
         ap.yk = b_.yk;
@@ -359,6 +360,7 @@ private:
         ap.v_cache = c.ring ? b_.v_stage : c.v;
         ap.cap = c.ring ? kChunk : c.cap;
         ap.fp8 = fp8;
+        ap.int8 = int8;
         ap.q = b_.q;
         ap.r = b_.r;
         ap.sink = b_.sink;
@@ -376,10 +378,12 @@ private:
         aa.v_chunk = ap.v_cache;
         aa.chunk_cap = ap.cap;
         aa.fp8 = fp8;
+        aa.int8 = int8;
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b_.attn, stream_);
-        if (c.ring) stage_to_ring(b_.k_stage, b_.v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window, fp8 ? 1 : 2, stream_);
+        if (c.ring) stage_to_ring(b_.k_stage, b_.v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window,
+                                  kv_cache_row_bytes(fp8, int8), stream_);
         attn_gate(b_.attn, b_.yq, rows, b_.q, stream_);   // the queries are spent: the gated rows go there
         quant(b_.q, kOut, rows, 8);
         product(w.out, E, kOut, rows, b_.o);

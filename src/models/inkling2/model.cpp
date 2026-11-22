@@ -58,11 +58,10 @@ uint64_t expert_stride(int type, uint64_t blob) {
 }
 }  // namespace
 
-uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8) {
+uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8) {
     int global = 0, swa = 0;
     for (const Visit& v : g.visits) (g.swa[(size_t) v.layer] ? swa : global) += 1;
-    const uint64_t elem = fp8 ? 1 : 2;
-    const uint64_t per_pos = 2ull * kKvHeads * kHeadDim * elem;
+    const uint64_t per_pos = 2ull * kKvHeads * kv_cache_row_bytes(fp8, int8);
     const uint64_t ring = (uint64_t) g.window + kDecodeRows;
     return (uint64_t) global * per_pos * (uint64_t) context + (uint64_t) swa * per_pos * ring + kSessionFixed +
            prompt_bytes(g);   // PROMPT HOOK
@@ -282,6 +281,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         w.expert_stride = expert_stride(el.gu_type, el.blob_bytes);
     }
     fp8_ = req.kv == "fp8";
+    int8_ = req.kv == "int8";
     // DSPARK HOOK: the drafter's weights (none with --spec 1), before the context is sized from what the weights leave
     if (req.spec >= 2)
         if (model::Result r = dspark_plan(pack_, reads, file, device_, dspark_); !r.ok()) return r;
@@ -303,7 +303,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t spare = kCardSpare + vision_room;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c, std::max(kDecodeRows, kPromptChunk)) : 0);
+            return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c, std::max(kDecodeRows, kPromptChunk)) : 0);
         };
         // the experts: all on the card when they fit beside the asked context; else the least routed go to RAM, just enough
         // (spill.hpp). --expert-cache N keeps at most N on the card (a diagnostic).
@@ -360,7 +360,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             const int64_t fits = avail > base ? (int64_t) ((avail - base) / per) : 0;
             return {model::Status::Error, "inkling2: --max-context " + std::to_string(want) + " needs " +
                                               std::to_string(need / kMiB) + " MiB a session; about " + std::to_string(fits) +
-                                              " positions fit" + (fp8_ ? "" : " (--kv fp8 halves a position's bytes)")};
+                                              " positions fit" + (fp8_ || int8_ ? "" : " (--kv fp8 halves a position's bytes)")};
         }
         ctx_ = want;
     }
