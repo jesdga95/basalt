@@ -30,6 +30,7 @@ constexpr int kTypeF32 = 0;
 constexpr int kTypeQ8_0 = 8;
 constexpr int kTypeBF16 = 30;
 constexpr int kTypeNvfp4 = 40;
+constexpr int kTypeMxfp8 = 46;
 constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 row of the hidden width
 // what the sessions share once (the forward's row buffers and expert scratch, the batch windows' logits), what each one
 // needs beside its caches (its logits, its windows' graphs) and what the card keeps free for the kernels' modules and the
@@ -60,7 +61,7 @@ constexpr ProjPart kProjParts[] = {
 const char* const kStreamNames[kStreams] = {"q", "k", "v", "ffn"};
 // A blob's stride on the card: whole blocks of its type and 16 bytes, so a kernel can read each expert's blocks in place.
 uint64_t expert_stride(int type, uint64_t blob) {
-    const uint64_t block = type == kTypeQ8_0 ? 34 : type == kTypeNvfp4 ? 36 : 1;
+    const uint64_t block = type == kTypeQ8_0 ? 34 : type == kTypeNvfp4 ? 36 : type == kTypeMxfp8 ? 132 : 1;
     uint64_t a = block, b = 16;
     while (b) {
         const uint64_t t = a % b;
@@ -494,8 +495,9 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
         cudaSetDevice(dev);
         if (slot.empty()) {
             // the prompt path reads the last expert's down rows (n_ff 1152 columns) on to a multiple of 256 values: zeros there
-            const uint64_t past = std::max(prefill::mmq::read_past_bytes(el.gu_type, g.n_embd),
-                                           prefill::mmq::read_past_bytes(el.d_type, g.n_ff_exp));
+            const uint64_t past = std::max<uint64_t>(
+                16, std::max(prefill::mmq::read_past_bytes(el.gu_type, g.n_embd),
+                             prefill::mmq::read_past_bytes(el.d_type, g.n_ff_exp)));
             if (core::vmm::supported() && card_of(l) == 0) {   // a range of its own, so that a picture can borrow its memory (lend_room)
                 const uint64_t vg = core::vmm::granularity();
                 Range r;

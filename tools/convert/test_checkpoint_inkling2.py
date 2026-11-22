@@ -23,7 +23,7 @@ from gguf_reader import GGUFFile  # noqa: E402
 from model_file import ModelFile  # noqa: E402
 from test_checkpoint import basalt_values, modelopt_values, write_safetensors  # noqa: E402
 
-H, NH, NKV, HD, DREL, FF, NE = 128, 2, 1, 32, 16, 64, 4
+H, NH, NKV, HD, DREL, FF, NE = 128, 2, 1, 32, 16, 128, 4
 LAYERS, LOCAL, CORE = 3, [0, 2], (1, 2)
 VH, VPATCH, VGRID = 64, 20, 2
 MH, MFF, MRANK = 128, 64, 8
@@ -262,7 +262,7 @@ class ConvertTest(unittest.TestCase):
 
     def test_the_nvfp4_experts_move_bit_for_bit(self):
         lay = [l.split() for l in self.mf.read("experts.layout").decode().splitlines() if l and l[0] != "#"]
-        self.assertEqual([int(x[1]) for x in lay], [40, 40, 8])
+        self.assertEqual([int(x[1]) for x in lay], [40, 40, 46])
         experts = self.mf.read("experts")
         l, _, _, off, blob = map(int, lay[1])
         codes, scales, amax, den = self.fx.nv[f"model.llm.layers.{l}.mlp.experts.w13"]
@@ -277,17 +277,22 @@ class ConvertTest(unittest.TestCase):
             tail = np.frombuffer(b[blob - 16:].tobytes(), "<f4")
             self.assertEqual(tail.tolist(), [np.float32(amax[e]) / np.float32(den[0])] * 2 + [np.float32(amax2[e]) / np.float32(den2[0]), 0.0])
 
-    def test_the_mxfp8_experts_are_q8_0_of_their_values(self):
+    def test_the_mxfp8_experts_are_native_mxfp8_blocks(self):
         lay = [l.split() for l in self.mf.read("experts.layout").decode().splitlines() if l and l[0] != "#"]
-        l, _, _, off, blob = map(int, lay[2])
+        l, gu, dt, off, blob = map(int, lay[2])
+        self.assertEqual((gu, dt), (46, 46))
         experts = self.mf.read("experts")
         codes, scales = self.fx.mx[f"model.llm.layers.{l}.mlp.experts.w13"]
+        c2, s2 = self.fx.mx[f"model.llm.layers.{l}.mlp.experts.w2"]
         e = 1
-        vals = (E4M3[codes[e]].reshape(2 * FF, -1, 32) * np.ldexp(1.0, scales[e].astype(np.int32) - 127)[..., None]).reshape(2 * FF, H)
+        def pack(c, s):
+            nb = c.shape[1] // 128
+            return np.concatenate([s.reshape(c.shape[0], nb, 4), c.reshape(c.shape[0], nb, 128)], axis=2).tobytes()
         b = experts[off + e * blob:off + (e + 1) * blob]
-        n = FF * H // 32 * 34
-        self.assertEqual(b[:n], S.q8_0(vals[0::2].astype(np.float32)))          # gate: the even rows, ggml's rounding
-        self.assertEqual(b[n:2 * n], S.q8_0(vals[1::2].astype(np.float32)))
+        n = FF * (H // 128) * 132
+        self.assertEqual(b[:n], pack(codes[e, 0::2], scales[e, 0::2]))
+        self.assertEqual(b[n:2 * n], pack(codes[e, 1::2], scales[e, 1::2]))
+        self.assertEqual(b[2 * n:], pack(c2[e], s2[e]))
 
     def test_the_metadata(self):
         kv = self.meta["gguf_kv"]

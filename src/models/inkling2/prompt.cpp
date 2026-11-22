@@ -14,6 +14,7 @@
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
+#include "basalt/prefill/moe_mxfp8.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "models/inkling2/dspark.hpp"
 #include "models/inkling2/walk.hpp"
@@ -30,10 +31,12 @@ namespace {
 namespace bk = basalt::kernels;
 namespace mmq = basalt::prefill::mmq;
 namespace fp4 = basalt::prefill::fp4;
+namespace mxfp8 = basalt::prefill::mxfp8;
 
 constexpr int kChunk = kPromptChunk;       // rows of one chunk forward
 constexpr int kTypeBF16 = 30;
 constexpr int kTypeNvfp4 = 40;
+constexpr int kTypeMxfp8 = 46;
 constexpr int kOut = kHeads * kHeadDim;    // the attention output's width
 constexpr uint64_t kMmqSpare = 32ull << 20;   // MMQ's stream-k fixup pool
 
@@ -219,7 +222,9 @@ public:
         if (!ready(8, kProj) || !ready(8, kProjQ) || !ready(8, kProjKV) || !ready(8, kKvHeads * kHeadDim) || !ready(8, E)) return false;
         for (int l = 0; l < g_.n_layers; ++l) {
             const LayerWeights& w = m_.layer(l);
-            if (m_.card_of(l) == cur_ && (!ready(w.gu_type, 2 * (int64_t) F) || !ready(w.d_type, E))) return false;
+            if (m_.card_of(l) != cur_) continue;
+            if (w.gu_type == kTypeMxfp8 && w.d_type == kTypeMxfp8 && mxfp8_shape()) continue;
+            if (!ready(w.gu_type, 2 * (int64_t) F) || !ready(w.d_type, E)) return false;
         }
         if (cudaStreamSynchronize(strm()) != cudaSuccess) {
             err = "the prompt path's setup failed";
@@ -533,6 +538,10 @@ private:
             experts_fp4(w, rows);
             return;
         }
+        if (w.gu_type == kTypeMxfp8 && w.d_type == kTypeMxfp8 && mxfp8_shape()) {
+            experts_mxfp8(w, rows);
+            return;
+        }
         mmq::quantize(b().nrm, b().tok, b().xq, w.gu_type, E, E, pairs, strm());
         mmq::Product p;
         p.w = w.experts;
@@ -578,6 +587,49 @@ private:
     // one FP4 term costs KLD 0.0025 -> 0.0041), both through each weight fragment on one fp32 chain. Gate/up from the token
     // planes into H as the softcapped SwiGLU, H rounded per expert tile, then down into the pairs' rows.
     bool fp4_shape() const { return g_.n_embd == 2304 && g_.n_ff_exp == 1152 && g_.n_expert <= 1024; }
+    bool mxfp8_shape() const { return g_.n_embd % 128 == 0 && g_.n_ff_exp % 128 == 0 && g_.n_expert <= 1024; }
+    void experts_mxfp8(const LayerWeights& w, int rows) {
+        const int E = g_.n_embd, F = g_.n_ff_exp, n = g_.n_expert, pairs = rows * g_.n_used;
+        const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, F);
+        mxfp8::plan_blocks(b().bounds, n, b().blk_off, strm());
+        mxfp8::quantize_tokens(b().nrm, rows, E, E, b().xq, strm());
+        mxfp8::Product gu{};
+        gu.base = w.experts;
+        gu.stride = w.expert_stride;
+        gu.w_off = 0;
+        gu.w_rows = 2 * F;
+        gu.w_cols = E;
+        gu.n = n;
+        gu.act = b().xq;
+        gu.act_rows = rows;
+        gu.bounds = b().bounds;
+        gu.blk_off = b().blk_off;
+        gu.blocks = mxfp8::max_blocks(pairs, n);
+        gu.ids = b().tok;
+        auto* h16 = reinterpret_cast<uint16_t*>(b().h);
+        gu.dst_f16 = h16;
+        gu.ld_dst = F;
+        gu.swiglu = true;
+        gu.gate_softcap = g_.gate_softcap;
+        gu.up_softcap = g_.up_softcap;
+        mxfp8::run(gu, strm());
+        mxfp8::quantize_f16(h16, pairs, F, F, b().xq, strm());
+        mxfp8::Product d = gu;
+        d.swiglu = false;
+        d.ids = nullptr;
+        d.w_off = L.down_off;
+        d.w_rows = E;
+        d.w_cols = F;
+        d.act = b().xq;
+        d.act_rows = pairs;
+        auto* gu16 = reinterpret_cast<uint16_t*>(b().gu);
+        d.dst = nullptr;
+        d.dst_f16 = gu16;
+        d.dst_ids = b().dst;
+        d.ld_dst = E;
+        mxfp8::run(d, strm());
+        moe_combine_f16(gu16, b().rw, rows, g_.n_used, b().moe, strm());
+    }
     void experts_fp4(const LayerWeights& w, int rows) {
         const int E = g_.n_embd, F = g_.n_ff_exp, n = g_.n_expert, pairs = rows * g_.n_used;
         const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, F);
