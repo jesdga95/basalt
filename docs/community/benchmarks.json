@@ -4628,6 +4628,42 @@
       "draft_len_struct": 6.8,
       "draft_len_prose": 1.9,
       "engine_args": "--gpu 0,1 --max-context 66661 --kv int8"
+    },
+    {
+      "submitter": "TriDefender",
+      "date": "2026-11-22",
+      "commit": "966f654f0b",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 4060 Ti",
+          "vram_gib": 16,
+          "power_w": 175,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 13.4
+        }
+      ],
+      "ram_gib": 96,
+      "cpu": "AMD Ryzen 9 9900X, 12 cores",
+      "ram_gbps": 47.1,
+      "os": "Windows",
+      "quant": "IQ3_S",
+      "kv": "int8",
+      "prefill_16k_tps": 1398.9,
+      "prefill_64k_tps": 586.8,
+      "decode_tps": 82.5,
+      "decode_conv_tps": 57.5,
+      "decode_struct_tps": 97.6,
+      "decode_prose_tps": 53.6,
+      "accept_conv_pct": 73.5,
+      "accept_struct_pct": 97.6,
+      "accept_prose_pct": 65.3,
+      "draft_len_conv": 2.5,
+      "draft_len_struct": 7.0,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+      "notes": "basalt_ada fork_4090 (sm_89) 0.5.0+58; pack from GSQ-RCO-IQ3_S GGUF + Qwen MTP tensors via convert.py; no vision; zero SSD spill"
     }
   ]
 }
