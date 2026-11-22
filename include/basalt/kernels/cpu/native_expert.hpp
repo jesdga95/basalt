@@ -34,6 +34,7 @@ struct NativeFmt {
     size_t tail = 0;                    ///< NVFP4: the blob's last 16 bytes, FP32 {s_gate, s_up, s_down, 0}
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
     float swiglu_limit = 0.f;           ///< > 0: gate capped at it and up clamped to +-it before the product
+    float gate_softcap = 0.f, up_softcap = 0.f;   ///< > 0: the softcapped SwiGLU (swiglu.hpp); the caller sets them
 };
 
 /// Fills `f` for a layer (`swiglu_limit`: the model's SwiGLU limit, 0 for none; `up_type`: the up rows' type, -1 for
@@ -49,8 +50,8 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 /// NVFP4 blobs end in FP32 {s_gate, s_up, s_down, 0}: the scale tail's byte count.
 inline constexpr size_t kNvfp4Tail = 16;
 
-/// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]) for rows r in [r0, r1), `nt` tokens (NVFP4: gate and up times
-/// s_gate and s_up first).
+/// ff[t][r] = swiglu(gate_r . a[t], up_r . a[t]) for rows r in [r0, r1), `nt` tokens, the layer's SwiGLU (swiglu.hpp;
+/// NVFP4: gate and up times s_gate and s_up first).
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1);
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1) (NVFP4: times s_down).
