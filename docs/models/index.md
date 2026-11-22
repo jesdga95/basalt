@@ -20,7 +20,7 @@ file and picks the chat format, tool syntax and thinking switch. Several models 
 | Parallel slots | yes; each slot drafts | yes; each slot drafts | yes; each slot drafts | not measured | not measured |
 | Lossy flags | `--relaxed-drafting`, `--route-prior`, `--route-tail-skip` (off) | none | none | none | none |
 | Prompt skip | no | yes (`--no-prompt-skip` turns it off) | no | no | no |
-| Idle sleep, wake | yes (Linux) | yes (Linux); a second-card sleep may be refused | no | yes (Linux) | no |
+| Idle sleep, wake | yes (Linux) | yes (Linux); a second-card sleep may be refused | no | yes (Linux) | yes (Linux) |
 | `basalt-bench --quality` | yes | yes, one row per window | yes | yes | yes |
 | Guide | [guide](qwen38-flash-next.md) | [guide](deepseek41.md) | [guide](qwen38-27b.md) | [guide](hy4-flash.md) | [guide](inkling2.md) |
 | Precision | [precision](../precision/qwen38-flash-next.md) | [precision](../precision/deepseek41.md) | [precision](../precision/qwen38-27b.md) | [precision](../precision/hy4-flash.md) | [precision](../precision/inkling2.md) |

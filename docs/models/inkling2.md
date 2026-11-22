@@ -47,6 +47,14 @@ the text model.
   need them, and the experts planned into RAM are copied back to the card while the caches leave room, the least routed
   giving way first when they grow. A short chat at `--max-context 1048576 --kv fp8` keeps every expert on the card. On a
   smaller card the spill is static: what does not fit stays in RAM. Nothing changes when everything fits.
+- **Sleep and lending:** `--idle-sleep` and `POST /v1/vram` ([running](../running.md#sleep---idle-sleep)) use the same copies.
+  At a sleep the card's copies of the RAM experts go back to RAM (decode reads them there) and the driver moves the rest
+  of the GPU state to host memory; the wake takes the copies back while the card has room. `reserve_mib` resizes them the
+  same way: copies go back when the card has less than that free, return when it has more. Only the copies are lendable:
+  the experts a pack keeps on the card have no RAM copy, so a reserve above what the copies free is refused (`400`), and an
+  engine with every expert on the card gives nothing back before the driver moves it. No `--vram-elastic` (Flash-Next's
+  segmented cache) is needed or accepted. At `--max-context 1048576 --kv fp8` on an RTX 5090 with images on the card holds
+  28.4 GB awake and 20 MiB asleep; the wake takes about 2 s and every token after it equals the one before.
 
 ## Long prompts
 

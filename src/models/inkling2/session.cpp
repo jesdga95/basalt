@@ -405,6 +405,29 @@ public:
         return {};
     }
 
+    // SLEEP / WAKE: the card's copies of the RAM experts go back to RAM (decode reads them there) and return at the wake; the
+    // driver moves the rest. A model that kept every expert on the card has nothing to lend: ok, no slots, SLEEP goes on.
+    model::Result set_low_memory(bool low, int64_t& expert_slots) override {
+        if (!m_.elastic()) return {};
+        cudaStreamSynchronize(stream_);
+        const int64_t before = m_.promoted();
+        m_.lend(low, stream_);
+        basalt::log::info("basalt inkling2", low ? "sleep: %lld expert copies go back to RAM (decode reads them there)" : "wake: %lld expert copies return to the card",
+                          (long long) (low ? before : m_.promoted()));
+        expert_slots = expert_pairs() - m_.spill().spilled + m_.promoted();
+        return {};
+    }
+
+    // VRAM: the copies resize to leave `mib` free (< 0: the start's --vram-reserve-mib). A static spill or none has no
+    // copies to resize: refused unless the card already leaves that much.
+    model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
+        cudaStreamSynchronize(stream_);
+        const bool fits = m_.resize_reserve((uint64_t) (mib < 0 ? std::max(m_.flags().vram_reserve_mib, 0) : mib) << 20, stream_);
+        expert_slots = m_.elastic() ? expert_pairs() - m_.spill().spilled + m_.promoted() : -1;
+        if (!fits) return {model::Status::Error, "inkling2: the card cannot leave " + std::to_string(mib) + " MiB free: the experts it holds are not copies"};
+        return {};
+    }
+
     model::Result copy_logits(int row, float* out) override {
         if (row < 0 || row >= head_rows_) return {model::Status::Error, "inkling2: no logits for that row"};
         if (cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
@@ -444,8 +467,9 @@ public:
         const uint64_t grow = (uint64_t) elastic_.size() * (bytes - std::min<uint64_t>(bytes, elastic_[0]->backed())) + (64ull << 20);
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        if (free_b < grow + kElasticKeep) {
-            const uint64_t freed = m_.demote(grow + kElasticKeep - free_b, stream_);
+        const uint64_t keep_free = m_.held_free(kElasticKeep);
+        if (free_b < grow + keep_free) {
+            const uint64_t freed = m_.demote(grow + keep_free - free_b, stream_);
             basalt::log::info("basalt inkling2", "elastic spill: the caches grow to %lld positions; %.2f GiB of expert copies go back to RAM "
                               "(%lld stay on the card)", (long long) target, (double) freed / (double) (1ull << 30), (long long) m_.promoted());
         }
@@ -467,9 +491,9 @@ public:
             for (auto& a : elastic_) a->trim(cell_bytes() * (uint64_t) keep);
             backed_ = std::min<int64_t>(backed_, (int64_t) (elastic_[0]->backed() / cell_bytes()));
         }
-        if (m_.promoted() < m_.spill().spilled) {
+        if (m_.promoted() < m_.spill().spilled && !m_.lent()) {
             cudaStreamSynchronize(stream_);
-            m_.promote(kElasticKeep + (uint64_t) elastic_.size() * cell_bytes() * (uint64_t) std::max<int64_t>(0, keep - backed_));
+            m_.promote(m_.held_free(kElasticKeep) + (uint64_t) elastic_.size() * cell_bytes() * (uint64_t) std::max<int64_t>(0, keep - backed_));
         }
     }
     size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * kHeadDim * elem(); }
