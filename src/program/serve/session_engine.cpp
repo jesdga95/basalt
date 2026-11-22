@@ -59,6 +59,7 @@ public:
             slot_sampling_.resize((size_t) o.batch);
         }
         conversations.emplace((size_t) o.conversation_cache_mib << 20, (size_t) o.conversation_cache_slots);
+        conversations->set_slot_pin(o.conversation_cache_slot_pin);
         if (o.conversation_cache_disk_mib > 0) {
             const auto t0 = Clock::now();
             std::string text = "basalt conversation state " + model_.desc().arch + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");

@@ -106,6 +106,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             else if (a == "--ram-reserve-mib") o.ram_reserve_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
+        else if (a == "--conversation-cache-slot-pin") o.conversation_cache_slot_pin = true;
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") { o.turn_token = std::atoll(next("--turn-token")); o.turn_token_given = true; }
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));

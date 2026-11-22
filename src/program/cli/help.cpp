@@ -84,6 +84,8 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --conversation-cache-slot-pin  --serve: the idle batch slots' parked conversations count against\n"
+                 "                       those two caps too, the longest parked of either kind leaving first (default off)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
                  "  --ram-reserve-mib N  RAM left free for the rest of the system (default 2048); the expert tiers leave\n"
                  "                       it and the --serve RAM guard holds it (0 = keep nothing, guard off)\n"

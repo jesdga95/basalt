@@ -133,6 +133,10 @@ struct CommonOptions {
     int prompt_cache = 6;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
+    /// --serve (--conversation-cache-slot-pin): the idle batch slots' parked conversations count against BOTH caps
+    /// above like the budgeted ones, the longest parked of either kind leaving first; off (default) the idle kind
+    /// stays outside the byte budget, capped by its caller's count (the split of f63e3e21).
+    bool conversation_cache_slot_pin = false;
     int64_t conversation_cache_min_free_mib = 2560;
     int conversation_cache_min_tokens = 0;   ///< --serve: park only conversations of at least N tokens (0 = park every one)
     /// --serve: the folder of the disk tier (the server names one inside the model cache folder): a conversation
