@@ -425,8 +425,20 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
             // the prompt path reads the last expert's down rows (n_ff 1152 columns) on to a multiple of 256 values: zeros there
             const uint64_t past = std::max(prefill::mmq::read_past_bytes(el.gu_type, g.n_embd),
                                            prefill::mmq::read_past_bytes(el.d_type, g.n_ff_exp));
-            if (!(w.experts = device_buf(eb + past)))
+            if (core::vmm::supported()) {   // a range of its own, as a spilled layer's: its backing can leave and return at the same addresses
+                const uint64_t vg = core::vmm::granularity();
+                Range r;
+                r.bytes = r.own = (eb + past + vg - 1) / vg * vg;
+                if (!(r.va = core::vmm::reserve(r.bytes))) return fail("cannot reserve the address range of layer " + std::to_string(l) + "'s experts");
+                if (!(r.handle = core::vmm::map(r.va, r.own))) {
+                    core::vmm::release_range(r.va, r.bytes);
+                    return fail("out of device memory loading layer " + std::to_string(l) + "'s experts");
+                }
+                ranges_.push_back(r);
+                w.experts = r.va;
+            } else if (!(w.experts = device_buf(eb + past))) {
                 return fail("out of device memory loading layer " + std::to_string(l) + "'s experts");
+            }
             if (past) cudaMemset(w.experts + eb, 0, past);
             if (w.expert_stride == el.blob_bytes) {
                 core::LoadItem it;
