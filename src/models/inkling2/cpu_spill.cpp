@@ -31,6 +31,7 @@ struct CpuSpill::Impl {
     const InklingModel* model = nullptr;
     std::unique_ptr<cpu::ExpertPool> pool;
     std::vector<cpu::NativeFmt> formats;
+    std::vector<int> group;
     cudaStream_t stream = nullptr;
     cudaEvent_t ready = nullptr, done = nullptr;
     float* input = nullptr;
@@ -61,8 +62,8 @@ struct CpuSpill::Impl {
     void open(const InklingModel& m, int workers, cpu::PoolAffinity affinity) {
         model = &m;
         const auto& g = m.geo();
-        if (g.n_used != kUsed) throw std::runtime_error("unsupported CPU expert count");
         pool = std::make_unique<cpu::ExpertPool>(workers, affinity);
+        group.resize(g.n_expert);
         formats.resize(g.n_layers);
         for (int l = 0; l < g.n_layers; ++l) {
             const auto& w = m.layer(l);
@@ -88,8 +89,7 @@ struct CpuSpill::Impl {
     }
 
     void run(int layer, int rows) {
-        std::array<int, 128> group;
-        group.fill(-1);
+        std::fill(group.begin(), group.end(), -1);
         std::array<bool, kDecodeRows> quantize{};
         int n = 0;
         for (int p = 0; p < rows * kUsed; ++p) {
@@ -135,7 +135,7 @@ CpuSpill::~CpuSpill() = default;
 std::unique_ptr<CpuSpill> CpuSpill::make(const InklingModel& model, std::string& err) {
     // Unknown or wider links keep the card's mapped-RAM path.
     const double link = core::device_rates(model.device()).link_bytes;
-    if (!model.spill().any() || !(link > 0 && link <= 8e9)) return nullptr;
+    if (!model.spill().any() || model.geo().n_used != kUsed || !(link > 0 && link <= 8e9)) return nullptr;
     const auto& flags = model.flags();
     const auto affinity = flags.pool_affinity_given ? flags.pool_affinity : cpu::PoolAffinity::All;
     int workers = flags.pool_workers;
