@@ -4,8 +4,7 @@ Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quali
 
 ## Summary
 
-- **Against the reference:** the pack scores mean KLD 0.00305 and top-1 97.76% over 100 chunks
-  ([below](#against-the-reference)).
+- **Against the reference:** over 100 WikiText-2 chunks, FP16 scores mean KLD 0.00310 and INT8 0.00344, with 97.78% and 97.79% top-1 agreement respectively ([below](#against-the-reference)).
 - **The reference is not a true BF16 model.** No BF16 checkpoint exists: the release ships its routed experts in NVFP4 and
   MXFP8. The base is the official release with its experts dequantized to BF16, so its KLD is not comparable with the other
   models' true-BF16 KLDs.
@@ -43,7 +42,7 @@ BF16 instead of Q8_0 scored 0.00218 for 1.2 GB more reads a token; it was not ta
 | Q8_0 projections, head | Q8_0 | q8_1 activations (decode); MMQ (prompt); fp32 logits, softcap 30 |
 | Router | F32 | fp32 sigmoid, top 8 |
 | Attention-residual mixes, controllers, norms | F32, BF16 weights | fp32 |
-| Attention caches | fp16 (`--kv fp8`: E4M3, unit scale) | decode: fp32 scores and softmax; prompt: fp16 tensor cores, fp32 accumulation |
+| Attention caches | fp16, int8 (`--kv int8`: signed codes with an FP16 scale per 64 channels), or fp8 (E4M3, unit scale) | decode: fp32 scores and softmax; prompt: values dequantized to fp16 tiles, fp32 accumulation |
 | Short-convolution state | fp32 | fp32 |
 
 A decode row's arithmetic does not depend on how many rows share its window. Prompt chunks round differently from decoded rows.
@@ -56,7 +55,9 @@ as fast as through MMQ.
 
 - **`--kv fp16` (default):** keys and values as fp16.
 - **`--kv fp8`:** E4M3 codes with a unit scale. Keys are L2-clipped and values RMS-normed by construction, so they fit E4M3's
-  range without a scale. It halves a position's bytes.
+  range without a scale. A row uses 128 bytes.
+- **`--kv int8`:** signed INT8 codes, with an FP16 scale for each 64-channel group. A row uses 144 bytes, about 44% less than
+  FP16's 256 bytes and 12.5% more than FP8.
 
 ## Against the reference
 
@@ -67,10 +68,14 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 
 | Run | Mean KLD | Top-1 | PPL |
 | --- | ---: | ---: | ---: |
-| 100 chunks, `--kv fp16` | 0.00305 | 97.76% | 7.0695 (base 7.0633 over the scored rows) |
-| 20 chunks (the quick gate) | 0.00264 | 97.80% | 7.6642 (base 7.6534) |
+| 100 chunks, `--kv fp16` | 0.00310 | 97.78% | 7.0695 (base 7.0644 over the scored rows) |
+| 100 chunks, `--kv fp8` | 0.00443 | 97.29% | 7.0702 (base 7.0644) |
+| 100 chunks, `--kv int8` | 0.00344 | 97.79% | 7.0762 (base 7.0644) |
+| 20 chunks (the earlier quick gate) | 0.00264 | 97.80% | 7.6642 (base 7.6534) |
 
-RTX 5090 at 400 W, the whole model on the card.
+The FP16 and FP8 quality runs were on an RTX 5090 at 400 W. INT8's 100-chunk quality run and the decode comparison were at 475 W, with the whole model on the card. The fixed-seed ABBA decode comparison (one cold repetition per process) averaged 5.20 / 7.61 / 4.75 ms per window and 192.3 / 131.4 / 210.7 passes/s for INT8 (conv / struct / prose), versus 5.43 / 7.61 / 4.77 ms and 184.3 / 131.4 / 209.6 passes/s for FP16. Completion lengths and draft acceptance varied, so tok/s is not a clean comparison.
+
+The INT8 row writer parity test matched the CPU reference for all 257 rows of width 128. Dequantized max absolute error was 0.00559 (FP16 rounding: 0.000485); max relative error for values with |x| >= 0.01 was 0.332 (FP16: 0.000487). Its microbench took 2.81 µs for 4,096 rows at 957 GB/s.
 
 ## Drafting
 
