@@ -104,12 +104,15 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
   `low` (0.2), `medium` (0.7), `high` (0.9, the template's default), `xhigh` and `max` (0.99), or a number from 1 to 100 as
   hundredths (at most 0.99). There is no hard switch: at `none` the model still writes a short thinking block (a few hundred
   tokens), so leave room in `max_tokens`.
+- **Structured output:** under a JSON schema or `json_object` the model thinks first, as its effort asks, and the grammar
+  holds only the answer block; the answer cannot end before its value is whole. At `none` it answers at once.
 - **Tools:** the model writes `<|content_invoke_tool_json|>{"name": ..., "args": {...}}`; several calls per turn are supported.
   The server also reads the forms the model drifts into: a call whose header has no name, or has no header at all (the name
   is in its JSON), a call written after a block it left open or cut off before its end, and a call written as XML
   (`<invoke name="..."><parameter name="...">...</parameter></invoke>`, bare or inside `<tool_call><function_calls>`, with
   or without `string="true"`) when it names one of the request's tools. Tags quoted in code, or naming no tool of the
-  request, stay text.
+  request, stay text. A call cut off by `max_tokens` is not a call (the finish is `length`), but the arguments it streamed
+  are closed into valid JSON.
 
 ## Limits
 
