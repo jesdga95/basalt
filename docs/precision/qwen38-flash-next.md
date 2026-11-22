@@ -147,10 +147,12 @@ All four arms in one session, so every row and interval below is comparable with
 | `k8v4` (8 bits on K) | 816 | 0.06726 | +0.0053 [+0.0040, +0.0066] | 91.25% |
 | `q4_0` (both at 4 bits) | 576 | 0.06940 | +0.0075 [+0.0056, +0.0093] | 91.09% |
 
-Two further sessions ran the `k8v4`/`k4v8` pair alone, with the order reversed, and `k4v8` won both: over the three
-pairings the means are 0.06547 against 0.06754, **-0.0021 [-0.0033, -0.0009]** KLD and +0.25 top-1 points, with
-per-session deltas of -0.0015, -0.0031 and -0.0017. Per-run KLD spread is about 0.001, which is why the pair needs
-three sessions to settle and the four-arm table is quoted from one.
+Two further sessions ran the `k8v4`/`k4v8` pair alone, with the order reversed, and `k4v8` won both. Over the three
+pairings the means are 0.06547 against 0.06754 and +0.25 top-1 points, with per-session deltas of -0.0015, -0.0031 and
+-0.0017 — the same sign every time. How tight that is depends on the unit: pairing the 25,500 rows gives
+**-0.0021 [-0.0033, -0.0009]**, while treating each session as one sample gives -0.0021 [-0.0042, +0.0001], because a
+session's own spread is about 0.001 and three of them is little to go on. **The direction is settled; the size is
++-0.002.** The four-arm table above is quoted from a single session for the same reason.
 
 The plane decomposition says the same thing: V quantized with K exact costs +0.0053
 [+0.0040, +0.0066], K quantized with V exact +0.0036 [+0.0024, +0.0049], and the two together +0.0075 — so V carries
