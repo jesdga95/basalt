@@ -9,7 +9,9 @@
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/kernels/window_gemm.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
+#include "basalt/prefill/q8_gemm.hpp"
 #include "basalt/program/multi_gpu_plan.hpp"
 #include "models/inkling2/prompt.hpp"
 #include "models/inkling2/walk.hpp"
@@ -279,7 +281,15 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             it.device = ldev_;
             reads.add(it);
         }
-        dense += (uint64_t) kProj * kQ8Row + n_embd * (3072 / 32 * 34);
+        const uint64_t q_sc_b = prefill::q8::scale_plane_bytes(kProjQ, (int64_t) n_embd);
+        const uint64_t kv_sc_b = prefill::q8::scale_plane_bytes(kProjKV, (int64_t) n_embd);
+        const uint64_t o_sc_b = prefill::q8::scale_plane_bytes((int64_t) n_embd, 3072);
+        if (!(w.proj_q_sc_t = reinterpret_cast<uint16_t*>(device_buf(q_sc_b))) ||
+            !(w.proj_k_sc_t = reinterpret_cast<uint16_t*>(device_buf(kv_sc_b))) ||
+            !(w.proj_v_sc_t = reinterpret_cast<uint16_t*>(device_buf(kv_sc_b))) ||
+            !(w.out_sc_t = reinterpret_cast<uint16_t*>(device_buf(o_sc_b))))
+            return fail("out of device memory loading layer " + std::to_string(l) + " scale planes");
+        dense += (uint64_t) kProj * kQ8Row + n_embd * (3072 / 32 * 34) + q_sc_b + 2 * kv_sc_b + o_sc_b;
         auto S = [&](const char* suffix, uint64_t floats) { return small(b + suffix, floats, reads, file, err); };
         if (full) {
             if (!(w.q_norm = S("attn_q_inp_norm.weight", n_embd)) || !(w.k_norm = S("attn_k_inp_norm.weight", n_embd)) ||
@@ -630,7 +640,10 @@ model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
         experts += mm.layer_bytes.back();
         mm.layer_caches.push_back((uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, req.kv == "fp8") * n_sess);
         mm.layer_share.push_back((double) visits[(size_t) l] / (double) g.visits.size());
-        dense += (uint64_t) kProj * kQ8Row + (uint64_t) g.n_embd * (3072 / 32 * 34);
+        dense += (uint64_t) kProj * kQ8Row + (uint64_t) g.n_embd * (3072 / 32 * 34) +
+                 prefill::q8::scale_plane_bytes(kProjQ, (int64_t) g.n_embd) +
+                 2 * prefill::q8::scale_plane_bytes(kProjKV, (int64_t) g.n_embd) +
+                 prefill::q8::scale_plane_bytes((int64_t) g.n_embd, 3072);
     }
     for (int c = 0; c <= g.n_layers; ++c) mm.split_handoffs.push_back(split_handoffs(g, c));
     mm.blob_bytes = experts / (uint64_t) mm.pairs;
@@ -652,6 +665,37 @@ model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
 
 
 model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
+    {   // Convert loaded Q8_0 w.proj and w.out blocks in-place to wgemm::q8_planes + coalesced prefill scale planes.
+        const int64_t E = pack_.geo.n_embd;
+        const size_t proj_b = (size_t) kProj * (size_t) (E / 32 * 34);
+        const size_t out_b = (size_t) E * (size_t) (3072 / 32 * 34);
+        const int64_t nb_e = E / 32;
+        for (int c = 0; c < cards(); ++c) {
+            cudaSetDevice(card_device(c));
+            void* tmp = nullptr;
+            if (cudaMalloc(&tmp, std::max(proj_b, out_b)) != cudaSuccess) {
+                cudaSetDevice(device_);
+                return {model::Status::Error, "inkling2: out of device memory converting Q8_0 projections to planes"};
+            }
+            for (int l = 0; l < pack_.geo.n_layers; ++l) {
+                if (card_of(l) != c) continue;
+                LayerWeights& w = layers_[(size_t) l];
+                kernels::wgemm::q8_planes(w.proj, kProj, E, tmp, nullptr);
+                cudaMemcpy(w.proj, tmp, proj_b, cudaMemcpyDeviceToDevice);
+                kernels::wgemm::q8_planes(w.out, E, 3072, tmp, nullptr);
+                cudaMemcpy(w.out, tmp, out_b, cudaMemcpyDeviceToDevice);
+                const uint16_t* proj_sc = reinterpret_cast<const uint16_t*>(w.proj + (size_t) kProj * (size_t) E);
+                prefill::q8::transpose_scales(proj_sc, kProjQ, E, w.proj_q_sc_t, nullptr);
+                prefill::q8::transpose_scales(proj_sc + (size_t) kRowK * nb_e, kProjKV, E, w.proj_k_sc_t, nullptr);
+                prefill::q8::transpose_scales(proj_sc + (size_t) kRowV * nb_e, kProjKV, E, w.proj_v_sc_t, nullptr);
+                const uint16_t* out_sc = reinterpret_cast<const uint16_t*>(w.out + (size_t) E * 3072);
+                prefill::q8::transpose_scales(out_sc, E, 3072, w.out_sc_t, nullptr);
+            }
+            cudaDeviceSynchronize();
+            cudaFree(tmp);
+        }
+        cudaSetDevice(device_);
+    }
     if (dspark_)   // DSPARK HOOK: the drafter's head folds, once the reads have landed
         if (model::Result r = dspark_->finish(head_, embd_dev_, embed_norm_, nullptr); !r.ok()) return r;
     for (auto& s : sessions)

@@ -840,7 +840,7 @@ private:
         // the projections: one product over every row of the fused matrix when the three inputs are one
         AttnPrep ap;
         if (!full && !msgs) {
-            bk::native_q8_0_mmvq(w.proj, x.xq_[0], x.y_, E, kProj, rows, k.stream);
+            bk::native_q8_planes_mmvq(w.proj, x.xq_[0], x.y_, E, kProj, rows, k.stream);
             ap.yq = x.y_;
             ap.yk = x.y_ + kProjQ;
             ap.yv = x.y_ + kProjQ + kProjKV;
@@ -855,7 +855,7 @@ private:
             sg.n_out[0] = kProjQ, sg.n_out[1] = sg.n_out[2] = kProjKV;
             sg.x[0] = x.xq_[0], sg.x[1] = x.xq_[1], sg.x[2] = x.xq_[2];
             sg.y[0] = x.y_, sg.y[1] = yk, sg.y[2] = yv;
-            bk::native_q8_0_mmvq_segments(w.proj, sg, E, rows, k.stream);
+            bk::native_q8_planes_mmvq_segments(w.proj, kProj, sg, E, rows, k.stream);
             ap.yq = x.y_;
             ap.yk = yk;
             ap.yv = yv;
@@ -916,7 +916,7 @@ private:
         const Segments seg = segments(v.slot);   // a batch window's: each conversation's caches of this visit
         ap.seg = aa.seg = seg;
         attention_window(ap, aa, rows, c.ring ? (int64_t) g_.window : full_keys, x.att_scr_, k.stream);
-        bk::native_q8_0_mmvq(w.out, x.xo_, x.o_, kOutRows, E, rows, k.stream);
+        bk::native_q8_planes_mmvq(w.out, x.xo_, x.o_, kOutRows, E, rows, k.stream);
         // a wider window: the experts this visit took in the window before into L2 on the side stream, while the glue
         // before the experts runs (it starts once the output projection is done)
         if (!guess) {

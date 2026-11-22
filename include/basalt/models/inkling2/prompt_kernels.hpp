@@ -65,11 +65,11 @@ void ctrl_down_prompt(const float* dest, const float* msg, const uint16_t* w_dow
 void ctrl_up_blend_prompt(const float* dest, const float* msg, const float* hid, const uint16_t* w_gf, int rows, int rank,
                           float* out, void* stream);
 
-/// Fused RMSNorm + MMQ Q8_1 quantization (D4 layout) for kWidth-wide rows directly into xq.
-void rms_norm_q8_1_prompt(const float* x, const float* w, int rows, float eps, void* xq, void* stream);
+/// Fused RMSNorm + Q8 planes quantization of [rows][kWidth] directly into prefill::q8's codes + coalesced scales.
+void rms_norm_q8_planes_prompt(const float* x, const float* w, int rows, float eps, void* act, void* stream);
 
-/// Fused attention sigmoid gate + MMQ Q8_1 quantization (D4 layout) for kHeads * kHeadDim-wide rows directly into xq.
-void attn_gate_q8_1_prompt(const float* attn, const float* yq, int64_t yq_ld, int rows, void* xq, void* stream);
+/// Fused attention sigmoid gate + Q8 planes quantization of [rows][kHeads * kHeadDim] directly into prefill::q8's layout.
+void attn_gate_q8_planes_prompt(const float* attn, const float* yq, int64_t yq_ld, int rows, void* act, void* stream);
 
 /// Deterministic vectorized weighted sum of k fp16 expert outputs per row into fp32 y[rows][kWidth].
 void moe_combine_f16(const uint16_t* out, const float* w, int rows, int k, float* y, void* stream);

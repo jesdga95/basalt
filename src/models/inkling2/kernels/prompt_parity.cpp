@@ -14,7 +14,9 @@
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
+#include "basalt/kernels/window_gemm.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
+#include "basalt/prefill/q8_gemm.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -998,17 +1000,20 @@ void test_dense() {
             std::printf("  controller down at %d rows: tiles %.1f us, one warp %.1f us\n", R, t_tiles, t_warp);
             cudaFree(h3);
         }
-        {   // fused rms_norm_q8_1_prompt and attn_gate_q8_1_prompt vs unfused (rms_norm/attn_gate + mmq::quantize) through Q8_0 MMQ
+        {   // fused rms_norm_q8_planes_prompt and attn_gate_q8_planes_prompt vs unfused through prefill::q8
+            namespace q8 = basalt::prefill::q8;
             const int Rq = 2048;
+            constexpr int OCols = kHeads * kHeadDim;
             const std::vector<float> hx = randn((size_t) Rq * E, 1.0f), hw = randn(E, 0.2f, 1.0f);
-            const std::vector<float> ha = randn((size_t) Rq * kHeads * kHeadDim, 1.0f), hyq = randn((size_t) Rq * kProj, 1.0f);
+            const std::vector<float> ha = randn((size_t) Rq * OCols, 1.0f), hyq = randn((size_t) Rq * kProj, 1.0f);
             float *dx2 = dev(hx), *dw2 = dev(hw), *dn = zeros<float>((size_t) Rq * E);
-            float *da2 = dev(ha), *dyq2 = dev(hyq), *dg2 = zeros<float>((size_t) Rq * kHeads * kHeadDim);
-            void *xq_ref = zeros<uint8_t>(mmq::q8_bytes(Rq, kHeads * kHeadDim));
-            void *xq_new = zeros<uint8_t>(mmq::q8_bytes(Rq, kHeads * kHeadDim));
+            float *da2 = dev(ha), *dyq2 = dev(hyq), *dg2 = zeros<float>((size_t) Rq * OCols);
+            void *act_ref = zeros<uint8_t>(q8::act_bytes(Rq, OCols));
+            void *act_new = zeros<uint8_t>(q8::act_bytes(Rq, OCols));
             const int n_out = 256;
             const auto* tr2 = ggml_get_type_traits(GGML_TYPE_Q8_0);
-            const auto make_q8 = [&](int cols, std::vector<float>& w_deq) {
+            struct Q8Mat { uint8_t* planes; uint16_t* sc_t; };
+            const auto make_q8 = [&](int cols, std::vector<float>& w_deq) -> Q8Mat {
                 const size_t rb = (size_t) cols / 32 * 34;
                 std::vector<uint8_t> wq((size_t) n_out * rb);
                 const std::vector<float> wf = randn((size_t) n_out * cols, 0.03f);
@@ -1017,27 +1022,26 @@ void test_dense() {
                     tr2->from_float_ref(&wf[(size_t) r * cols], &wq[(size_t) r * rb], cols);
                     tr2->to_float(&wq[(size_t) r * rb], &w_deq[(size_t) r * cols], cols);
                 }
-                return dev(wq);
+                uint8_t* raw = dev(wq);
+                uint8_t* pl = zeros<uint8_t>(wq.size());
+                uint16_t* sc_t = zeros<uint16_t>(q8::scale_plane_bytes(n_out, cols) / 2);
+                bk::wgemm::q8_planes(raw, n_out, cols, pl, S);
+                q8::transpose_scales(reinterpret_cast<const uint16_t*>(pl + (size_t) n_out * cols), n_out, cols, sc_t, S);
+                cudaStreamSynchronize(S);
+                cudaFree(raw);
+                return {pl, sc_t};
             };
             std::vector<float> wE_deq, wO_deq;
-            uint8_t *wE = make_q8(E, wE_deq), *wO = make_q8(kHeads * kHeadDim, wO_deq);
-            int32_t *bnds = dev(std::vector<int32_t>{0, Rq}), *id = zeros<int32_t>(Rq);
-            mmq::iota(id, Rq, S);
-            mmq::Context ctx2;
+            Q8Mat wE = make_q8(E, wE_deq), wO = make_q8(OCols, wO_deq);
             float *yref = zeros<float>((size_t) Rq * n_out), *ynew = zeros<float>((size_t) Rq * n_out);
-            auto run_mmq = [&](const uint8_t* wm, void* xq, int cols, float* dst) {
-                mmq::Product p;
-                p.w = wm; p.type = 8; p.w_rows = n_out; p.w_cols = cols; p.expert_bytes = mmq::matrix_bytes(8, n_out, cols);
-                p.n = 1; p.xq = xq; p.bounds = bnds; p.ids = id; p.total_rows = Rq; p.max_rows = Rq; p.dst = dst; p.ld_dst = n_out;
-                ctx2.run(p, S);
-            };
+
             bk::rms_norm_rows(dx2, dw2, dn, Rq, E, 1e-6f, S);
-            mmq::quantize(dn, nullptr, xq_ref, 8, E, E, Rq, S);
-            run_mmq(wE, xq_ref, E, yref);
-            rms_norm_q8_1_prompt(dx2, dw2, Rq, 1e-6f, xq_new, S);
-            run_mmq(wE, xq_new, E, ynew);
+            q8::quantize(dn, Rq, E, E, act_ref, S);
+            q8::gemm(reinterpret_cast<const int8_t*>(wE.planes), wE.sc_t, n_out, E, act_ref, Rq, yref, n_out, q8::Epilogue::Store, S);
+            rms_norm_q8_planes_prompt(dx2, dw2, Rq, 1e-6f, act_new, S);
+            q8::gemm(reinterpret_cast<const int8_t*>(wE.planes), wE.sc_t, n_out, E, act_new, Rq, ynew, n_out, q8::Epilogue::Store, S);
             const auto yn_host = host(ynew, (size_t) Rq * n_out);
-            report("rms_norm_q8_1_prompt vs unfused (via MMQ)", yn_host, host(yref, (size_t) Rq * n_out), 2e-3);
+            report("rms_norm_q8_planes_prompt vs unfused (via q8::gemm)", yn_host, host(yref, (size_t) Rq * n_out), 2e-3);
             {   // CPU double reference (8 rows) + position invariance (rows 37..100 alone)
                 std::vector<double> ref_n((size_t) 8 * n_out, 0.0);
                 for (int r = 0; r < 8; ++r) {
@@ -1050,32 +1054,29 @@ void test_dense() {
                         ref_n[(size_t) r * n_out + o] = acc;
                     }
                 }
-                report("rms_norm_q8_1_prompt vs CPU double (8 rows)", std::vector<float>(yn_host.begin(), yn_host.begin() + 8 * n_out), ref_n, 2e-2);
-                const int off_r = 37, sub_r = 64, nkb = E / 128;
-                void* xq_sub = zeros<uint8_t>(mmq::q8_bytes(sub_r, E));
-                rms_norm_q8_1_prompt(dx2 + (size_t) off_r * E, dw2, sub_r, 1e-6f, xq_sub, S);
-                const auto full_q = host(static_cast<const uint8_t*>(xq_new), (size_t) nkb * Rq * 144);
-                const auto sub_q = host(static_cast<const uint8_t*>(xq_sub), (size_t) nkb * sub_r * 144);
-                std::vector<uint8_t> slice_q((size_t) nkb * sub_r * 144);
-                for (int kb = 0; kb < nkb; ++kb)
-                    std::memcpy(slice_q.data() + (size_t) kb * sub_r * 144,
-                                full_q.data() + ((size_t) kb * Rq + off_r) * 144, (size_t) sub_r * 144);
-                same_bits("  rms_norm_q8_1 rows 37..100 alone", slice_q.data(), sub_q.data(), sub_q.size());
-                cudaFree(xq_sub);
+                report("rms_norm_q8_planes_prompt vs CPU double (8 rows)", std::vector<float>(yn_host.begin(), yn_host.begin() + 8 * n_out), ref_n, 2e-2);
+                const int off_r = 37, sub_r = 64;
+                void* act_sub = zeros<uint8_t>(q8::act_bytes(sub_r, E));
+                float* ysub = zeros<float>((size_t) sub_r * n_out);
+                rms_norm_q8_planes_prompt(dx2 + (size_t) off_r * E, dw2, sub_r, 1e-6f, act_sub, S);
+                q8::gemm(reinterpret_cast<const int8_t*>(wE.planes), wE.sc_t, n_out, E, act_sub, sub_r, ysub, n_out, q8::Epilogue::Store, S);
+                same_bits("  rms_norm_q8_planes rows 37..100 alone", yn_host.data() + (size_t) off_r * n_out,
+                          host(ysub, (size_t) sub_r * n_out).data(), (size_t) sub_r * n_out * 4);
+                cudaFree(act_sub);
+                cudaFree(ysub);
             }
-            const double t_n_old = time_us([&] { bk::rms_norm_rows(dx2, dw2, dn, Rq, E, 1e-6f, S); mmq::quantize(dn, nullptr, xq_ref, 8, E, E, Rq, S); });
-            const double t_n_new = time_us([&] { rms_norm_q8_1_prompt(dx2, dw2, Rq, 1e-6f, xq_new, S); });
-            std::printf("  rms_norm_q8_1_prompt %d rows: %.1f us vs unfused %.1f us (%.2fx)\n", Rq, t_n_new, t_n_old, t_n_old / t_n_new);
+            const double t_n_old = time_us([&] { bk::rms_norm_rows(dx2, dw2, dn, Rq, E, 1e-6f, S); q8::quantize(dn, Rq, E, E, act_ref, S); });
+            const double t_n_new = time_us([&] { rms_norm_q8_planes_prompt(dx2, dw2, Rq, 1e-6f, act_new, S); });
+            std::printf("  rms_norm_q8_planes_prompt %d rows: %.1f us vs unfused %.1f us (%.2fx)\n", Rq, t_n_new, t_n_old, t_n_old / t_n_new);
 
             attn_gate(da2, dyq2, Rq, dg2, S, kProj);
-            mmq::quantize(dg2, nullptr, xq_ref, 8, kHeads * kHeadDim, kHeads * kHeadDim, Rq, S);
-            run_mmq(wO, xq_ref, kHeads * kHeadDim, yref);
-            attn_gate_q8_1_prompt(da2, dyq2, kProj, Rq, xq_new, S);
-            run_mmq(wO, xq_new, kHeads * kHeadDim, ynew);
+            q8::quantize(dg2, Rq, OCols, OCols, act_ref, S);
+            q8::gemm(reinterpret_cast<const int8_t*>(wO.planes), wO.sc_t, n_out, OCols, act_ref, Rq, yref, n_out, q8::Epilogue::Store, S);
+            attn_gate_q8_planes_prompt(da2, dyq2, kProj, Rq, act_new, S);
+            q8::gemm(reinterpret_cast<const int8_t*>(wO.planes), wO.sc_t, n_out, OCols, act_new, Rq, ynew, n_out, q8::Epilogue::Store, S);
             const auto yg_host = host(ynew, (size_t) Rq * n_out);
-            report("attn_gate_q8_1_prompt vs unfused (via MMQ)", yg_host, host(yref, (size_t) Rq * n_out), 2e-3);
+            report("attn_gate_q8_planes_prompt vs unfused (via q8::gemm)", yg_host, host(yref, (size_t) Rq * n_out), 2e-3);
             {   // CPU double reference (8 rows) + position invariance (rows 37..100 alone)
-                constexpr int OCols = kHeads * kHeadDim;
                 std::vector<double> ref_g((size_t) 8 * n_out, 0.0);
                 for (int r = 0; r < 8; ++r) {
                     for (int o = 0; o < n_out; ++o) {
@@ -1087,25 +1088,24 @@ void test_dense() {
                         ref_g[(size_t) r * n_out + o] = acc;
                     }
                 }
-                report("attn_gate_q8_1_prompt vs CPU double (8 rows)", std::vector<float>(yg_host.begin(), yg_host.begin() + 8 * n_out), ref_g, 2e-2);
-                const int off_r = 37, sub_r = 64, nkb = OCols / 128;
-                void* xq_sub = zeros<uint8_t>(mmq::q8_bytes(sub_r, OCols));
-                attn_gate_q8_1_prompt(da2 + (size_t) off_r * OCols, dyq2 + (size_t) off_r * kProj, kProj, sub_r, xq_sub, S);
-                const auto full_q = host(static_cast<const uint8_t*>(xq_new), (size_t) nkb * Rq * 144);
-                const auto sub_q = host(static_cast<const uint8_t*>(xq_sub), (size_t) nkb * sub_r * 144);
-                std::vector<uint8_t> slice_q((size_t) nkb * sub_r * 144);
-                for (int kb = 0; kb < nkb; ++kb)
-                    std::memcpy(slice_q.data() + (size_t) kb * sub_r * 144,
-                                full_q.data() + ((size_t) kb * Rq + off_r) * 144, (size_t) sub_r * 144);
-                same_bits("  attn_gate_q8_1 rows 37..100 alone", slice_q.data(), sub_q.data(), sub_q.size());
-                cudaFree(xq_sub);
+                report("attn_gate_q8_planes_prompt vs CPU double (8 rows)", std::vector<float>(yg_host.begin(), yg_host.begin() + 8 * n_out), ref_g, 2e-2);
+                const int off_r = 37, sub_r = 64;
+                void* act_sub = zeros<uint8_t>(q8::act_bytes(sub_r, OCols));
+                float* ysub = zeros<float>((size_t) sub_r * n_out);
+                attn_gate_q8_planes_prompt(da2 + (size_t) off_r * OCols, dyq2 + (size_t) off_r * kProj, kProj, sub_r, act_sub, S);
+                q8::gemm(reinterpret_cast<const int8_t*>(wO.planes), wO.sc_t, n_out, OCols, act_sub, sub_r, ysub, n_out, q8::Epilogue::Store, S);
+                same_bits("  attn_gate_q8_planes rows 37..100 alone", yg_host.data() + (size_t) off_r * n_out,
+                          host(ysub, (size_t) sub_r * n_out).data(), (size_t) sub_r * n_out * 4);
+                cudaFree(act_sub);
+                cudaFree(ysub);
             }
-            const double t_g_old = time_us([&] { attn_gate(da2, dyq2, Rq, dg2, S, kProj); mmq::quantize(dg2, nullptr, xq_ref, 8, kHeads * kHeadDim, kHeads * kHeadDim, Rq, S); });
-            const double t_g_new = time_us([&] { attn_gate_q8_1_prompt(da2, dyq2, kProj, Rq, xq_new, S); });
-            std::printf("  attn_gate_q8_1_prompt %d rows: %.1f us vs unfused %.1f us (%.2fx)\n", Rq, t_g_new, t_g_old, t_g_old / t_g_new);
+            const double t_g_old = time_us([&] { attn_gate(da2, dyq2, Rq, dg2, S, kProj); q8::quantize(dg2, Rq, OCols, OCols, act_ref, S); });
+            const double t_g_new = time_us([&] { attn_gate_q8_planes_prompt(da2, dyq2, kProj, Rq, act_new, S); });
+            std::printf("  attn_gate_q8_planes_prompt %d rows: %.1f us vs unfused %.1f us (%.2fx)\n", Rq, t_g_new, t_g_old, t_g_old / t_g_new);
 
             for (void* q : {(void*) dx2, (void*) dw2, (void*) dn, (void*) da2, (void*) dyq2, (void*) dg2,
-                            xq_ref, xq_new, (void*) wE, (void*) wO, (void*) bnds, (void*) id, (void*) yref, (void*) ynew})
+                            act_ref, act_new, (void*) wE.planes, (void*) wE.sc_t, (void*) wO.planes, (void*) wO.sc_t,
+                            (void*) yref, (void*) ynew})
                 cudaFree(q);
         }
         {   // fused ctrl_down_prompt + ctrl_up_blend_prompt vs unfused (ctrl_pair_norm + bf16_rows_dot + ctrl_blend) and CPU

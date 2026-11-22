@@ -15,6 +15,7 @@
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/moe_mxfp8.hpp"
+#include "basalt/prefill/q8_gemm.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "models/inkling2/dspark.hpp"
 #include "models/inkling2/walk.hpp"
@@ -32,6 +33,7 @@ namespace bk = basalt::kernels;
 namespace mmq = basalt::prefill::mmq;
 namespace fp4 = basalt::prefill::fp4;
 namespace mxfp8 = basalt::prefill::mxfp8;
+namespace q8 = basalt::prefill::q8;
 
 constexpr int kChunk = kPromptChunk;       // rows of one chunk forward
 constexpr int kTypeBF16 = 30;
@@ -108,7 +110,7 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     if (c.base && (uint8_t*) b.xq + mmq::q8_bytes((int64_t) P, (int64_t) E) > (uint8_t*) b.nrm)
         throw std::logic_error("inkling2 prompt: the experts' input rows overlap the MLP's normed rows");
     c.at = std::max(end_a, x.at);
-    b.xqd = c.take<uint8_t>(mmq::q8_bytes((int64_t) R, std::max<int64_t>((int64_t) E, kOut)));
+    b.xqd = c.take<uint8_t>(std::max(mmq::q8_bytes((int64_t) R, std::max<int64_t>((int64_t) E, kOut)), q8::act_bytes((int64_t) R, std::max<int64_t>((int64_t) E, kOut))));
     b.rlog = c.take<float>(R * (size_t) g.n_expert);
     b.rw = c.take<float>(P);
     b.ids = c.take<int32_t>(P);
@@ -219,7 +221,6 @@ public:
             mmq::load(type, rows);
             return true;
         };
-        if (!ready(8, kProj) || !ready(8, kProjQ) || !ready(8, kProjKV) || !ready(8, kKvHeads * kHeadDim) || !ready(8, E)) return false;
         for (int l = 0; l < g_.n_layers; ++l) {
             const LayerWeights& w = m_.layer(l);
             if (m_.card_of(l) != cur_) continue;
@@ -376,24 +377,6 @@ private:
 
     // x (rows of `cols` values) as MMQ's q8_1 rows for products of `type`
     void quant(const float* x, int cols, int rows, int type) { mmq::quantize(x, nullptr, b().xqd, type, cols, cols, rows, strm()); }
-    // y[rows][n_out] = W x for the rows quant() rounded: one Q8_0 matrix [n_out][cols] at w
-    void product(const uint8_t* w, int n_out, int cols, int rows, float* y) {
-        mmq::Product p;
-        p.w = w;
-        p.type = 8;
-        p.w_rows = n_out;
-        p.w_cols = cols;
-        p.expert_bytes = mmq::matrix_bytes(8, n_out, cols);
-        p.n = 1;
-        p.xq = b().xqd;
-        p.bounds = b().dbounds;
-        p.ids = b().ident;
-        p.total_rows = rows;
-        p.max_rows = rows;
-        p.dst = y;
-        p.ld_dst = n_out;
-        lane().mmq.run(p, strm());
-    }
 
     // A loop controller over the chunk: out = blend(dest, msg) of stream `st` (out may be dest).
     void controller(const LayerWeights& w, int st, const float* dest, const float* msg, int rows, float* out) {
@@ -438,19 +421,26 @@ private:
             for (int j = 0; j < 3; ++j) in[j] = b().mix + (size_t) j * RE;
         }
         const bool one = !full && in[0] == in[1] && in[1] == in[2];
-        // the projections: fused RMSNorm + Q8_1 quantization directly into b().xqd, and fused Q+K+V when streams are shared
-        const size_t row_bytes = (size_t) E / 32 * 34;
+        // the projections: fused RMSNorm + Q8 planes quantization into b().xqd, then 2-CTA TMA prefill::q8 GEMM
+        const int8_t* proj_c = reinterpret_cast<const int8_t*>(w.proj);
         if (one) {
-            rms_norm_q8_1_prompt(in[0], w.attn_norm, rows, g_.rms_eps, b().xqd, strm());
-            product(w.proj, kProj, E, rows, b().yq);
+            rms_norm_q8_planes_prompt(in[0], w.attn_norm, rows, g_.rms_eps, b().xqd, strm());
+            const q8::Segment segs[3] = {
+                {proj_c, kProjQ, w.proj_q_sc_t, b().yq, kProj},
+                {proj_c + (size_t) kRowK * (size_t) E, kProjKV, w.proj_k_sc_t, b().yq + kProjQ, kProj},
+                {proj_c + (size_t) kRowV * (size_t) E, kProjKV, w.proj_v_sc_t, b().yq + kProjQ + kProjKV, kProj},
+            };
+            q8::gemm_segmented(segs, 3, E, b().xqd, rows, q8::Epilogue::Store, strm());
         } else {
             const float* wn[3] = {full ? w.q_norm : w.attn_norm, full ? w.k_norm : w.attn_norm, full ? w.v_norm : w.attn_norm};
-            rms_norm_q8_1_prompt(in[0], wn[0], rows, g_.rms_eps, b().xqd, strm());
-            product(w.proj, kProjQ, E, rows, b().yq);
-            rms_norm_q8_1_prompt(in[1], wn[1], rows, g_.rms_eps, b().xqd, strm());
-            product(w.proj + (size_t) kRowK * row_bytes, kProjKV, E, rows, b().yk);
-            rms_norm_q8_1_prompt(in[2], wn[2], rows, g_.rms_eps, b().xqd, strm());
-            product(w.proj + (size_t) kRowV * row_bytes, kProjKV, E, rows, b().yv);
+            rms_norm_q8_planes_prompt(in[0], wn[0], rows, g_.rms_eps, b().xqd, strm());
+            q8::gemm(proj_c, w.proj_q_sc_t, kProjQ, E, b().xqd, rows, b().yq, kProjQ, q8::Epilogue::Store, strm());
+            rms_norm_q8_planes_prompt(in[1], wn[1], rows, g_.rms_eps, b().xqd, strm());
+            q8::gemm(proj_c + (size_t) kRowK * (size_t) E, w.proj_k_sc_t, kProjKV, E, b().xqd, rows, b().yk, kProjKV,
+                     q8::Epilogue::Store, strm());
+            rms_norm_q8_planes_prompt(in[2], wn[2], rows, g_.rms_eps, b().xqd, strm());
+            q8::gemm(proj_c + (size_t) kRowV * (size_t) E, w.proj_v_sc_t, kProjKV, E, b().xqd, rows, b().yv, kProjKV,
+                     q8::Epilogue::Store, strm());
         }
         // convolutions, clips and the keys: a sliding-window visit stages the chunk's own, a full visit writes its cells
         const bool fp8 = m_.cache_fp8();
@@ -497,8 +487,9 @@ private:
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b().attn, strm());
         if (c.ring) stage_to_ring(b().k_stage, b().v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window, fp8 ? 1 : 2, strm());
-        attn_gate_q8_1_prompt(b().attn, b().yq, one ? kProj : kProjQ, rows, b().xqd, strm());
-        product(w.out, E, kOut, rows, b().o);
+        attn_gate_q8_planes_prompt(b().attn, b().yq, one ? kProj : kProjQ, rows, b().xqd, strm());
+        q8::gemm(reinterpret_cast<const int8_t*>(w.out), w.out_sc_t, E, kOut, b().xqd, rows, b().o, E,
+                 q8::Epilogue::Store, strm());
         // the attention's convolution and the residual: a block's first layer starts a new sum
         const bool boundary = g_.boundary(l);
         post_conv(b().o, b().pos, w.attn_post_conv, c.a_ring, boundary ? nullptr : hid, rows, b().resid, strm());
