@@ -4,8 +4,7 @@ Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quali
 
 ## Summary
 
-- **Against the reference:** the pack scores mean KLD 0.00305 and top-1 97.76% over 100 chunks
-  ([below](#against-the-reference)).
+- **Against the reference:** over 100 WikiText-2 chunks, FP16 scores mean KLD 0.00310 and INT8 0.00344, with 97.78% and 97.79% top-1 agreement respectively ([below](#against-the-reference)).
 - **The reference is not a true BF16 model.** No BF16 checkpoint exists: the release ships its routed experts in NVFP4 and
   MXFP8. The base is the official release with its experts dequantized to BF16, so its KLD is not comparable with the other
   models' true-BF16 KLDs.
@@ -42,7 +41,7 @@ Formats measured for layers 20 to 23 over 20 chunks: native MXFP8 0.00265 KLD (1
 | Q8_0 projections (`w.proj`, `w.out`), head | Q8_0 (loaded into `q8_planes` for `w.proj`/`w.out`) | q8_1 activations via `native_q8_planes_mmvq` (decode, bitwise `native_q8_0_mmvq`); block-32 Q8_0 2-CTA TMA int8 tensor cores (`prefill::q8`, prompt); fp32 logits, softcap 30 |
 | Router | F32 | fp32 sigmoid, top 8 |
 | Attention-residual mixes, controllers, norms | F32, BF16 weights | fp32 |
-| Attention caches | fp16 (`--kv fp8`: E4M3, unit scale) | decode: fp32 scores and softmax; prompt: fp16 tensor cores, fp32 accumulation |
+| Attention caches | fp16, int8 (`--kv int8`: signed codes with an FP16 scale per 64 channels), or fp8 (E4M3, unit scale) | decode: fp32 scores and softmax; prompt: values dequantized to fp16 tiles, fp32 accumulation |
 | Short-convolution state | fp32 | fp32 |
 
 A decode row's arithmetic does not depend on how many rows share its window. Prompt chunks round differently from decoded rows.
@@ -55,7 +54,9 @@ as fast as through MMQ.
 
 - **`--kv fp16` (default):** keys and values as fp16.
 - **`--kv fp8`:** E4M3 codes with a unit scale. Keys are L2-clipped and values RMS-normed by construction, so they fit E4M3's
-  range without a scale. It halves a position's bytes.
+  range without a scale. A row uses 128 bytes.
+- **`--kv int8`:** signed INT8 codes, with an FP16 scale for each 64-channel group. A row uses 144 bytes, about 44% less than
+  FP16's 256 bytes and 12.5% more than FP8.
 
 ## Against the reference
 
@@ -67,13 +68,15 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | Run | Mean KLD | Top-1 | PPL |
 | --- | ---: | ---: | ---: |
 | 100 chunks, `--kv fp16` | 0.00305 | 97.76% | 7.0695 (base 7.0633 over the scored rows) |
+| 100 chunks, `--kv fp8` (pre-rebase result) | 0.00443 | 97.29% | 7.0702 (base 7.0644) |
+| 100 chunks, `--kv int8` (pre-rebase result) | 0.00344 | 97.79% | 7.0762 (base 7.0644) |
 | 20 chunks (the quick gate) | 0.00264 | 97.80% | 7.6642 (base 7.6534) |
 | 90 chunks, RTX 5060 Ti alone, 1,047 experts in RAM on the CPU | 0.00298 | 97.70% | |
 | the same 90 chunks, the whole model on the card | 0.00304 | 97.76% | |
 | 100 chunks, layer split: 0 to 11 on the RTX 5090, 12 to 23 on an RTX 5060 Ti | 0.00304 | 97.70% | 7.0718 (base 7.0633) |
 
 RTX 5090 at 400 W, the whole model on the card, unless the row says otherwise. On the 5060 Ti the CPU computes the experts in
-RAM (a Ryzen 9 9950X, AVX-512).
+RAM (a Ryzen 9 9950X, AVX-512). The FP8 and INT8 rows were measured before the current rebase and need revalidation against this build.
 
 ## Drafting
 

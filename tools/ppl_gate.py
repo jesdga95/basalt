@@ -108,8 +108,11 @@ def set_args(args: list[str], extra: list[str]) -> list[str]:
 def run(a) -> int:
     n_ctx, n_vocab, n_chunk, chunks = read_base(a.base)
     first = n_ctx // 2
-    args = ["--model", str(Path(a.model).resolve()), "--spec", "5",
-            "--adapt-swaps", "0", "--peer-adapt-swaps", "0", "--max-context", "4096"]
+    model_path = Path(a.model)
+    args = ["--model", str(model_path.resolve()), "--spec", "5"]
+    if "qwen4exp" in model_path.name.lower():
+        args += ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
+    args += ["--max-context", "4096"]
     if gpu_count() > 1:
         args += ["--gpu", "0,1"]
     args = set_args(args, a.engine_args + ["--ppl-base", str(Path(a.base).resolve())])

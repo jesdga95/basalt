@@ -18,6 +18,8 @@ constexpr int kWidth = 2304;        ///< the hidden width the kernels are built 
 constexpr int kHeads = 24;          ///< query heads
 constexpr int kKvHeads = 8;         ///< key/value heads
 constexpr int kHeadDim = 128;
+constexpr int kKvInt8RowBytes = (kHeadDim + 2 + 15) & ~15;   ///< INT8 values and two fp16 scales, padded to 16 bytes
+constexpr int kv_cache_row_bytes(bool fp8, bool int8) { return fp8 ? kHeadDim : int8 ? kKvInt8RowBytes : 2 * kHeadDim; }
 constexpr int kRel = 16;            ///< relative state per head
 constexpr int kExtent = 1024;       ///< distances the relative bias covers (also the window)
 constexpr int kConv = 4;            ///< short convolution taps
@@ -95,6 +97,7 @@ struct AttnPrep {
     void* v_cache = nullptr;
     int64_t cap = 0;
     bool fp8 = false;                  ///< unit-scale E4M3 codes (keys are clipped and values normed, so they fit)
+    bool int8 = false;                 ///< symmetric INT8 codes with two per-row FP16 scales
     float* q = nullptr;                ///< out: the clipped (and scaled) queries [rows][kHeads][kHeadDim]
     float* r = nullptr;                ///< out: the relative states [rows][kHeads][kRel]
     float* sink = nullptr;             ///< out: [rows][kHeads]
@@ -116,6 +119,7 @@ struct AttnArgs {
     const void* v_cache = nullptr;
     int64_t cap = 0;                   ///< the cache's cells (a ring when window is set)
     bool fp8 = false;
+    bool int8 = false;
     int window = 0;                    ///< > 0: keys at distance < window only (the cache is then a ring of cap >= window + rows)
     float scale = 0.08838834764831845f;
     const float* gate = nullptr;       ///< set: the output is gated by sigmoid(gate[r * gate_ld + h * kHeadDim + d])
