@@ -1,6 +1,7 @@
 // src/models/qwen4exp/kernels/qsa_dec_attn.cu - see include/basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp.
 #include "basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -87,13 +88,15 @@ __device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
 }
 __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::); }
 
-// shared memory of one chunk block; KV_MODE 0: fp16 rows, 1: int8 rows + fp16 scales
+// shared memory of one chunk block; KV_MODE 0: fp16 rows, 1: int8 rows + fp16 scales per 64, 5: the same int8 rows
+// staged out of packed Q4_0 blocks, whose scale comes per 32 values
 template <int KV_MODE> struct ChunkSmem {
     static constexpr int ROW = KV_MODE == 0 ? HD * 2 : HD;   // bytes of one cell's K (or V) row
+    static constexpr int NS = KV_MODE == 5 ? HD / QK4_0 : NSC;   // scales per row
     alignas(16) unsigned char k[CHUNK][ROW];
     alignas(16) unsigned char v[CHUNK][ROW];
-    alignas(16) uint16_t ks[CHUNK][NSC];
-    alignas(16) uint16_t vs[CHUNK][NSC];
+    alignas(16) uint16_t ks[CHUNK][NS];
+    alignas(16) uint16_t vs[CHUNK][NS];
     float sp[G][CHUNK];        // scores
     alignas(16) float spt[CHUNK][G];   // probabilities, cell-major
     long long row[CHUNK];      // pool row of each cell, -1 masked or past the width
@@ -129,7 +132,7 @@ __device__ __forceinline__ void k8_from(const ChunkSmem<KV_MODE>& sm, int c, int
             out[2 * j + 1] = f.y;
         }
     } else {
-        const float sc = __half2float(__ushort_as_half(sm.ks[c][d0 / KV_Q8_GROUP]));
+        const float sc = __half2float(__ushort_as_half(sm.ks[c][d0 / (KV_MODE == 5 ? QK4_0 : KV_Q8_GROUP)]));
         const uint2 raw = *reinterpret_cast<const uint2*>(&sm.k[c][d0]);
 #pragma unroll
         for (int j = 0; j < 8; ++j) out[j] = (float) packed_s8(j < 4 ? raw.x : raw.y, j & 3) * sc;
@@ -140,7 +143,7 @@ __device__ __forceinline__ float v1_from(const ChunkSmem<KV_MODE>& sm, int c, in
     if constexpr (KV_MODE == 0) {
         return __half2float(*reinterpret_cast<const __half*>(&sm.v[c][d * 2]));
     } else {
-        const float sc = __half2float(__ushort_as_half(sm.vs[c][d / KV_Q8_GROUP]));
+        const float sc = __half2float(__ushort_as_half(sm.vs[c][d / (KV_MODE == 5 ? QK4_0 : KV_Q8_GROUP)]));
         return (float) (int8_t) sm.v[c][d] * sc;
     }
 }
