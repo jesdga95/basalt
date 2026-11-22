@@ -95,9 +95,22 @@ Measured on the UD-IQ1_M pack, 400 W + 180 W, 121 GiB of RAM, `--pool-workers 8`
 
 ## Parallel slots
 
-Slots share one decode stream: a batch window runs each busy slot's window in turn. Each slot drafts as a single stream does, from
-the drafter's window rows of its own conversation. The slots share one drafter, so `--parallel` adds no drafter memory. A request
-alone in its slot gives the same greedy tokens as with `--parallel 1` (tiers pinned).
+Slots share one decode stream through the shared batch driver ([batching](../design/batching.md)), as on every model: a round
+runs the busy slots' windows as one batch of up to 8 rows. Each slot drafts as a single stream does, from the drafter's window
+rows of its own conversation. The slots share one drafter, so `--parallel` adds no drafter memory. A request alone in its slot
+gives the same greedy tokens as with `--parallel 1` (tiers pinned), and a batch's rows give bitwise their solo windows' picks and
+logits (`--diag-batch-check`, frozen tier).
+
+With experts in RAM a batch's rows reach a wider union of experts than one slot's window, and the 8-row cap trims each slot's
+drafts (about 2 rows a slot at four slots, against 6-row windows alone), so on two cards batching is slower than running each
+slot's window in turn, as main did. Aggregate tok/s, two cards (400 W + 180 W), drafted, tiers unfrozen, 256 tokens a slot, ABBA:
+
+| Slots | Main, in turn (A1 / A2) | Batched (B1 / B2) | Change |
+| --- | --- | --- | --- |
+| 1 | 89.3 / 87.0 | 87.0 / 92.8 | none: one slot runs its solo window, the same code |
+| 2 | 85.0 / 82.7 | 85.4 / 80.4 | -1.1% |
+| 4 | 71.5 / 70.0 | 63.8 / 62.1 | -11.0% |
+| 8 | 76.9 / 77.2 | 54.6 / 51.1 | -31.4% |
 
 ## Lossy flags
 
