@@ -909,6 +909,132 @@ def hold_back(text: str, tags: tuple[str, ...]) -> int:
     return best
 
 
+class JsonPrefix:
+    """A JSON value read as it streams. `safe` is the length of the longest prefix read so far that text appended after
+    it closes into valid JSON without inventing a key or a value, and `closer` is that text: a point inside a string
+    (not inside an escape), after a whole value, or right after an opening bracket. A dangling key, colon or comma and a
+    number or literal not yet ended are not such points, so a value cut off there loses them (vLLM #53739). The value's
+    own end is the last point: what follows it is not the value's."""
+
+    _PLAIN = re.compile(r'[^"\\]*')
+    _WORD = re.compile(r"[0-9A-Za-z.+-]*")
+
+    def __init__(self):
+        self.stack: list[str] = []      # the open containers, "{" or "["
+        self.state = "value"            # value, first_key, first_value, key, colon, after, string, escape, unicode, end, bad
+        self.key = False                # the string read is a key
+        self.word = ""                  # a number or literal read so far
+        self.hex = 0                    # digits of a \u escape read
+        self.pos = 0                    # characters read
+        self.safe = 0
+        self.closer = ""
+
+    def _mark(self, at: int, open_string: bool = False) -> None:
+        self.safe = at
+        self.closer = ('"' if open_string else "") + "".join("}" if c == "{" else "]" for c in reversed(self.stack))
+
+    def _after_value(self, at: int) -> None:
+        self.state = "after" if self.stack else "end"
+        self._mark(at)
+
+    def feed(self, text: str) -> None:
+        base, i, n = self.pos, 0, len(text)
+        self.pos += n
+        while i < n and self.state not in ("end", "bad"):
+            c, st = text[i], self.state
+            if st == "string":
+                j = self._PLAIN.match(text, i).end()
+                if j > i:
+                    i = j
+                    if not self.key:
+                        self._mark(base + i, True)
+                elif c == '"':
+                    i += 1
+                    if self.key:
+                        self.state = "colon"
+                    else:
+                        self._after_value(base + i)
+                else:
+                    self.state, i = "escape", i + 1
+                continue
+            if st == "escape":
+                i += 1
+                if c == "u":
+                    self.state, self.hex = "unicode", 0
+                    continue
+                if c not in '"\\/bfnrt':
+                    self.state = "bad"
+                    continue
+                self.state = "string"
+                if not self.key:
+                    self._mark(base + i, True)
+                continue
+            if st == "unicode":
+                if c not in "0123456789abcdefABCDEF":
+                    self.state = "bad"
+                    continue
+                i += 1
+                self.hex += 1
+                if self.hex == 4:
+                    self.state = "string"
+                    if not self.key:
+                        self._mark(base + i, True)
+                continue
+            if st == "word":
+                j = self._WORD.match(text, i).end()
+                self.word += text[i:j]
+                i = j
+                if i < n:               # the word ended: a whole number or literal is a value
+                    try:
+                        json.loads(self.word)
+                        self._after_value(base + i)
+                    except ValueError:
+                        self.state = "bad"
+                continue
+            if c in " \t\r\n":
+                i += 1
+                continue
+            if st in ("value", "first_value"):
+                if st == "first_value" and c == "]":
+                    self.stack.pop()
+                    self._after_value(base + i + 1)
+                elif c in "{[":
+                    self.stack.append(c)
+                    self.state = "first_key" if c == "{" else "first_value"
+                    self._mark(base + i + 1)
+                elif c == '"':
+                    self.state, self.key = "string", False
+                    self._mark(base + i + 1, True)
+                elif c in "-0123456789tfn":
+                    self.state, self.word = "word", ""
+                    continue
+                else:
+                    self.state = "bad"
+                i += 1
+            elif st in ("first_key", "key"):
+                if st == "first_key" and c == "}":
+                    self.stack.pop()
+                    self._after_value(base + i + 1)
+                elif c == '"':
+                    self.state, self.key = "string", True
+                else:
+                    self.state = "bad"
+                i += 1
+            elif st == "colon":
+                self.state = "value" if c == ":" else "bad"
+                i += 1
+            else:                       # after a value
+                top = self.stack[-1]
+                if c == ",":
+                    self.state = "key" if top == "{" else "value"
+                elif c == ("}" if top == "{" else "]"):
+                    self.stack.pop()
+                    self._after_value(base + i + 1)
+                else:
+                    self.state = "bad"
+                i += 1
+
+
 class CodeTracker:
     """What the answer text that has gone out leaves open: a code fence, the current line, the backticks of the current
     paragraph. A tag opening inside code is a quoted example, text."""

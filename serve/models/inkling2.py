@@ -43,6 +43,8 @@ class _Blocks:
         self.head = ""                  # the call's `{"name":...,"args":` prefix, once read
         self.raw = ""                   # the call's JSON so far
         self.streamed = 0               # characters of its arguments already streamed
+        self.json = frontend.JsonPrefix()   # the arguments read: up to where they can be closed
+        self.fed = 0                    # characters of the arguments fed to it
         self.started = False            # its "tool_start" sent (a call with no name in its header waits for its JSON's)
 
     # ------------------------------------------------------------------ a block's text
@@ -123,6 +125,7 @@ class _Blocks:
     def _open_call(self, out: list, name: str) -> None:
         self.call = ToolCall(name=name, arguments={})
         self.state, self.head, self.raw, self.streamed, self.started = "call", "", "", 0, False
+        self.json, self.fed = frontend.JsonPrefix(), 0
         self._start(out)
 
     def _start(self, out: list) -> None:
@@ -149,6 +152,18 @@ class _Blocks:
             self.head = self.raw[:i + len('"args":')]
         return self.raw[len(self.head):]
 
+    def _stream_args(self, out: list) -> None:
+        """Streams the arguments up to where they can be closed into valid JSON (the call object's own closing brace
+        and the whitespace around the arguments stay out)."""
+        args = self._args_text()
+        if args is None:
+            return
+        self.json.feed(args[self.fed:])
+        self.fed = len(args)
+        if self.started and self.json.safe > self.streamed:
+            out.append(Event("tool_args", args[self.streamed:self.json.safe], call=self.call))
+            self.streamed = self.json.safe
+
     def _call(self, out: list) -> bool:
         end = self.buf.find(END)
         keep = 0 if end >= 0 else frontend.hold_back(self.buf, (END,))
@@ -156,15 +171,7 @@ class _Blocks:
         self.raw += take
         self.buf = self.buf[end + len(END):] if end >= 0 else self.buf[len(self.buf) - keep:]
         self._start(out)
-        args = self._args_text()
-        if args is not None and self.started:
-            trimmed = args.rstrip()
-            # the call object's own closing brace, and the whitespace after it, stay out of the arguments' text
-            upto = len(trimmed) - 1 if trimmed.endswith("}") else len(trimmed)
-            upto = max(self.streamed, upto)
-            if upto > self.streamed:
-                out.append(Event("tool_args", args[self.streamed:upto], call=self.call))
-                self.streamed = upto
+        self._stream_args(out)
         if end < 0:
             return False
         self._end_call(out)
@@ -219,24 +226,21 @@ class _Blocks:
                 return out
 
     def finish(self) -> list[Event]:
-        """End of generation: flush what is held. A call cut off mid-way is closed without a "tool_call"; text that
-        was only the start of a marker is text."""
+        """End of generation: flush what is held. A call cut off mid-way gets no "tool_call", and the arguments it
+        streamed are closed into valid JSON (a dangling key, separator or partial literal dropped); text that was only
+        the start of a marker is text."""
         out: list[Event] = []
         if self.state == "call":
             pending, self.buf = self.buf, ""    # at most the start of an end marker: not the call's
             if self._whole():           # the JSON is whole, only the block's end is missing: still a call
                 self._start(out)
-                args = self._args_text()
-                if self.started and args is not None:
-                    trimmed = args.rstrip()
-                    upto = len(trimmed) - 1 if trimmed.endswith("}") else len(trimmed)
-                    if upto > self.streamed:
-                        out.append(Event("tool_args", args[self.streamed:upto], call=self.call))
+                self._stream_args(out)
                 self._end_call(out)
             elif self.stream_tools and self.call is not None and self.started:
-                args = self._args_text()
-                if args is not None and len(args) > self.streamed:
-                    out.append(Event("tool_args", args[self.streamed:], call=self.call))
+                self._stream_args(out)
+                close = self.json.closer if self.streamed else "{}"
+                if close:
+                    out.append(Event("tool_args", close, call=self.call))
             elif not self.call.name and not self.started:
                 out.append(Event("content", TOOL_JSON + self.raw + pending))
             self.call = None
