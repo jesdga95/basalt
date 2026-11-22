@@ -71,6 +71,7 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | 20 chunks (the quick gate) | 0.00264 | 97.80% | 7.6642 (base 7.6534) |
 | 90 chunks, RTX 5060 Ti alone, 1,047 experts in RAM on the CPU | 0.00298 | 97.70% | |
 | the same 90 chunks, the whole model on the card | 0.00304 | 97.76% | |
+| 100 chunks, layer split: 0 to 11 on the RTX 5090, 12 to 23 on an RTX 5060 Ti | 0.00304 | 97.70% | 7.0718 (base 7.0633) |
 
 RTX 5090 at 400 W, the whole model on the card, unless the row says otherwise. On the 5060 Ti the CPU computes the experts in
 RAM (a Ryzen 9 9950X, AVX-512).
