@@ -60,8 +60,13 @@ class Engine:
 
 
 def ram_experts(log: Path) -> int:
-    """The experts the engine's start put in RAM (its "experts: N of M in RAM" line; none: every one on the card)."""
-    m = re.search(r"experts: (\d+) of \d+ in RAM", log.read_text(errors="replace"))
+    """The experts the engine's start put in RAM: its "experts: N of M in RAM" line, or the expert tier's "expert homes of
+    N per layer: ... RAM R" line (R, a layer's); none: every one on the card."""
+    text = log.read_text(errors="replace")
+    m = re.search(r"experts: (\d+) of \d+ in RAM", text)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"expert homes of \d+ per layer: .*?RAM (\d+)", text)
     return int(m.group(1)) if m else 0
 
 
