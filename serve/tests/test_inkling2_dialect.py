@@ -149,6 +149,28 @@ class Parse(unittest.TestCase):
         reply = HEADER + "search" + TOOL_JSON + '{"name":"search","args":{"q":"o'
         self.assertFalse([e for e in parse(reply) if e.kind == "tool_call"])
 
+    def test_a_cut_off_call_streams_valid_json(self):
+        # what was streamed is closed: a value cut inside a string keeps its text, a dangling key, separator, literal or
+        # escape is dropped, nothing is invented (vLLM #53739)
+        head = HEADER + "f" + TOOL_JSON + '{"name":"f","args":'
+        for cut, want in (('{"s": "hel', {"s": "hel"}), ('{"s": "hello", ', {"s": "hello"}), ('{"n": 42, ', {"n": 42}),
+                          ('{"s": "a", "n": tr', {"s": "a"}), ('{"s": "a", "k', {"s": "a"}), ('{"s": "a", "k":', {"s": "a"}),
+                          ('{"s": "a\\', {"s": "a"}), ('{"s": "\\u00e', {"s": ""}), ('{"l": [1, 2', {"l": [1]}),
+                          ('{"o": {"p": [{"q": null}', {"o": {"p": [{"q": None}]}}), ('{"n": 4', {}), (' ', {}), ('', {})):
+            for chunk in (None, 1, 3):
+                events = parse(head + cut, chunk)
+                args = "".join(e.text for e in events if e.kind == "tool_args")
+                self.assertEqual(json.loads(args), want, (cut, chunk))
+                self.assertFalse([e for e in events if e.kind == "tool_call"], cut)
+
+    def test_a_whole_call_streams_its_arguments_alone(self):
+        reply = HEADER + "f" + TOOL_JSON + '{"name":"f","args": {"a": [1, "x\\"y"], "b": {"c": true}} }' + END
+        for chunk in (None, 1, 2, 5):
+            events = parse(reply, chunk)
+            args = "".join(e.text for e in events if e.kind == "tool_args")
+            self.assertEqual(args.strip(), '{"a": [1, "x\\"y"], "b": {"c": true}}', chunk)
+            self.assertEqual([e.call.arguments for e in events if e.kind == "tool_call"], [{"a": [1, 'x"y'], "b": {"c": True}}])
+
     def test_the_reply_ends_the_turn(self):
         svc = service(HEADER + TEXT + "done" + END)
         self.assertEqual(svc.dialect.stop_texts, (END_TURN,))
