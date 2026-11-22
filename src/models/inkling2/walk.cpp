@@ -53,4 +53,50 @@ bool walk(const Geometry& g, Walk& w, std::string& err) {
     return true;
 }
 
+std::vector<Segment> split_walk(const Geometry& g, const Walk& w, const std::vector<int>& card_of) {
+    std::vector<Segment> segs;
+    uint8_t valid[kBufs] = {};   // the cards holding each buffer's last write
+    valid[(int) Buf::X0] = 1;    // the embedding, on the first card
+    int msg_pass[2] = {-1, -1};  // the pass each card's messages were last mixed for
+    auto need = [&](Segment& sg, Buf b) {
+        if (!(valid[(int) b] & (1u << sg.card))) {
+            sg.pull.push_back(b);
+            valid[(int) b] |= (uint8_t) (1u << sg.card);
+        }
+    };
+    for (size_t si = 0; si < w.steps.size(); ++si) {
+        const Step& s = w.steps[si];
+        const Visit& v = g.visits[(size_t) s.visit];
+        const int card = card_of[(size_t) v.layer];
+        if (segs.empty() || segs.back().card != card) segs.push_back(Segment{card, si, si, false, {}, {}});
+        Segment& sg = segs.back();
+        const bool mix = s.msgs && msg_pass[card] != v.pass;
+        if (mix) {
+            msg_pass[card] = v.pass;
+            need(sg, s.bank[0]);
+            need(sg, s.bank[1]);
+        }
+        need(sg, s.hid);
+        for (int i = 0; i < s.n_blocks; ++i) need(sg, s.blocks[i]);
+        sg.mix_msgs.push_back(mix ? 1 : 0);
+        sg.s1 = si + 1;
+        valid[(int) s.out] = (uint8_t) (1u << card);
+    }
+    if (segs.empty() || segs.back().card != 0) segs.push_back(Segment{0, w.steps.size(), w.steps.size(), false, {}, {}});
+    Segment& hs = segs.back();
+    hs.head = true;
+    for (int i = 0; i < w.n_blocks; ++i) need(hs, w.blocks[i]);
+    need(hs, w.final_hid);
+    return segs;
+}
+
+int split_handoffs(const Geometry& g, int cut) {
+    Walk w;
+    std::string err;
+    if (!walk(g, w, err)) return 0;
+    std::vector<int> card_of((size_t) g.n_layers, 0);
+    for (int l = cut > 0 ? cut : g.n_layers; l < g.n_layers; ++l) card_of[(size_t) l] = 1;
+    return (int) split_walk(g, w, card_of).size() - 1;
+}
+
 }  // namespace basalt::models::inkling2
