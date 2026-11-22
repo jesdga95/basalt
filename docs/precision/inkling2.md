@@ -82,6 +82,8 @@ The earlier INT8–FP16 decode ABBA (one cold process per measurement) averaged 
 
 An earlier FP16–FP8 ABBA used the same `conv` prompt and `--max-context 32768`, `--spec 5`, fixed seed 1, and `--expert-cache 3072` (3,070 expert slots on the GPU and 2 in RAM). It averaged 5.406 vs 5.524 ms/window and 185.0 vs 181.1 passes/s. FP16 stopped at 1,158 tokens; FP8 reached the 1,200-token fixture limit, so tok/s differed with completion length.
 
+The fixture is the standard short `conv` prompt, so this compares decode at the same 32k capacity and prompt, not decode after filling 32k tokens. Attempts to run a 16k active-context WikiText prompt or the 16k prefill fixture exited with `f32_rows_dot: an illegal memory access was encountered`; those runs were excluded.
+
 | KV format | Mean ms/window | Mean passes/s | Mean tok/s | Output tokens |
 | --- | ---: | ---: | ---: | ---: |
 | FP16 | 5.406 | 185.0 | 384.6 | 1,158 |
