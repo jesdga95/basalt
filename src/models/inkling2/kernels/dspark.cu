@@ -93,6 +93,7 @@ __global__ void __launch_bounds__(kThreads) mix_kernel(const float* __restrict__
                                                        float* __restrict__ out, int64_t out_stride,
                                                        const int32_t* __restrict__ pos, float* __restrict__ fr, int fr_cap,
                                                        int32_t* __restrict__ pos3) {
+    if ((int) blockIdx.y == kDsMixes - 1 && (int) blockIdx.x + fr_cap < (int) gridDim.x) return;
     __shared__ float red[kThreads / 32];
     mix_stage((int) blockIdx.x, (int) blockIdx.y, tap, tap_stride, a, out, out_stride, pos, fr, fr_cap, pos3, red);
 }

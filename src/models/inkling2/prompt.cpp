@@ -165,7 +165,7 @@ public:
             mmq::load(type, rows);
             return true;
         };
-        if (!ready(8, kProjQ) || !ready(8, kProjKV) || !ready(8, E)) return false;
+        if (!ready(8, kProjQ) || !ready(8, kProjKV) || !ready(8, kKvHeads * kHeadDim) || !ready(8, E)) return false;
         for (int l = 0; l < g_.n_layers; ++l) {
             const LayerWeights& w = m_.layer(l);
             if (!ready(w.gu_type, 2 * (int64_t) F) || !ready(w.d_type, E)) return false;
@@ -251,7 +251,15 @@ private:
             st.s[st.n++] = buf(walk_.final_hid);
             attnres_mix(st, m_.output_query(), 1, rows, 1e-6f, b_.mix, (int64_t) rows * E, stream_);
             bk::rms_norm_rows(b_.mix, m_.output_norm(), rows, E, g_.rms_eps, ds_->tap(kDsTargets - 1), stream_);
-            ds_->commit(b_.pos, rows, stream_);
+            DsparkHook::PromptScratch ps;
+            ps.mix = b_.mix;
+            ps.kb = b_.yk;
+            ps.vb = b_.yv;
+            ps.xq = b_.xqd;
+            ps.pos3 = reinterpret_cast<int32_t*>(b_.rlog);
+            ps.bounds = b_.dbounds;
+            ps.ident = b_.ident;
+            ds_->commit_prompt(b_.pos, rows, mmq_, ps, stream_);
         }
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) {
