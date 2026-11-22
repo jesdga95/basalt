@@ -961,6 +961,116 @@ void test_dense() {
             std::printf("  controller down at %d rows: tiles %.1f us, one warp %.1f us\n", R, t_tiles, t_warp);
             cudaFree(h3);
         }
+        {   // fused rms_norm_q8_1_prompt and attn_gate_q8_1_prompt vs unfused (rms_norm/attn_gate + mmq::quantize) through Q8_0 MMQ
+            const int Rq = 2048;
+            const std::vector<float> hx = randn((size_t) Rq * E, 1.0f), hw = randn(E, 0.2f, 1.0f);
+            const std::vector<float> ha = randn((size_t) Rq * kHeads * kHeadDim, 1.0f), hyq = randn((size_t) Rq * kProj, 1.0f);
+            float *dx2 = dev(hx), *dw2 = dev(hw), *dn = zeros<float>((size_t) Rq * E);
+            float *da2 = dev(ha), *dyq2 = dev(hyq), *dg2 = zeros<float>((size_t) Rq * kHeads * kHeadDim);
+            void *xq_ref = zeros<uint8_t>(mmq::q8_bytes(Rq, kHeads * kHeadDim));
+            void *xq_new = zeros<uint8_t>(mmq::q8_bytes(Rq, kHeads * kHeadDim));
+            const int n_out = 256;
+            const auto* tr2 = ggml_get_type_traits(GGML_TYPE_Q8_0);
+            const auto make_q8 = [&](int cols, std::vector<float>& w_deq) {
+                const size_t rb = (size_t) cols / 32 * 34;
+                std::vector<uint8_t> wq((size_t) n_out * rb);
+                const std::vector<float> wf = randn((size_t) n_out * cols, 0.03f);
+                w_deq.resize((size_t) n_out * cols);
+                for (int r = 0; r < n_out; ++r) {
+                    tr2->from_float_ref(&wf[(size_t) r * cols], &wq[(size_t) r * rb], cols);
+                    tr2->to_float(&wq[(size_t) r * rb], &w_deq[(size_t) r * cols], cols);
+                }
+                return dev(wq);
+            };
+            std::vector<float> wE_deq, wO_deq;
+            uint8_t *wE = make_q8(E, wE_deq), *wO = make_q8(kHeads * kHeadDim, wO_deq);
+            int32_t *bnds = dev(std::vector<int32_t>{0, Rq}), *id = zeros<int32_t>(Rq);
+            mmq::iota(id, Rq, S);
+            mmq::Context ctx2;
+            float *yref = zeros<float>((size_t) Rq * n_out), *ynew = zeros<float>((size_t) Rq * n_out);
+            auto run_mmq = [&](const uint8_t* wm, void* xq, int cols, float* dst) {
+                mmq::Product p;
+                p.w = wm; p.type = 8; p.w_rows = n_out; p.w_cols = cols; p.expert_bytes = mmq::matrix_bytes(8, n_out, cols);
+                p.n = 1; p.xq = xq; p.bounds = bnds; p.ids = id; p.total_rows = Rq; p.max_rows = Rq; p.dst = dst; p.ld_dst = n_out;
+                ctx2.run(p, S);
+            };
+            bk::rms_norm_rows(dx2, dw2, dn, Rq, E, 1e-6f, S);
+            mmq::quantize(dn, nullptr, xq_ref, 8, E, E, Rq, S);
+            run_mmq(wE, xq_ref, E, yref);
+            rms_norm_q8_1_prompt(dx2, dw2, Rq, 1e-6f, xq_new, S);
+            run_mmq(wE, xq_new, E, ynew);
+            const auto yn_host = host(ynew, (size_t) Rq * n_out);
+            report("rms_norm_q8_1_prompt vs unfused (via MMQ)", yn_host, host(yref, (size_t) Rq * n_out), 2e-3);
+            {   // CPU double reference (8 rows) + position invariance (rows 37..100 alone)
+                std::vector<double> ref_n((size_t) 8 * n_out, 0.0);
+                for (int r = 0; r < 8; ++r) {
+                    double ss = 0.0;
+                    for (int c = 0; c < E; ++c) ss += (double) hx[(size_t) r * E + c] * hx[(size_t) r * E + c];
+                    const double inv = 1.0 / std::sqrt(ss / E + 1e-6);
+                    for (int o = 0; o < n_out; ++o) {
+                        double acc = 0.0;
+                        for (int c = 0; c < E; ++c) acc += (double) hx[(size_t) r * E + c] * inv * hw[c] * wE_deq[(size_t) o * E + c];
+                        ref_n[(size_t) r * n_out + o] = acc;
+                    }
+                }
+                report("rms_norm_q8_1_prompt vs CPU double (8 rows)", std::vector<float>(yn_host.begin(), yn_host.begin() + 8 * n_out), ref_n, 2e-2);
+                const int off_r = 37, sub_r = 64, nkb = E / 128;
+                void* xq_sub = zeros<uint8_t>(mmq::q8_bytes(sub_r, E));
+                rms_norm_q8_1_prompt(dx2 + (size_t) off_r * E, dw2, sub_r, 1e-6f, xq_sub, S);
+                const auto full_q = host(static_cast<const uint8_t*>(xq_new), (size_t) nkb * Rq * 144);
+                const auto sub_q = host(static_cast<const uint8_t*>(xq_sub), (size_t) nkb * sub_r * 144);
+                std::vector<uint8_t> slice_q((size_t) nkb * sub_r * 144);
+                for (int kb = 0; kb < nkb; ++kb)
+                    std::memcpy(slice_q.data() + (size_t) kb * sub_r * 144,
+                                full_q.data() + ((size_t) kb * Rq + off_r) * 144, (size_t) sub_r * 144);
+                same_bits("  rms_norm_q8_1 rows 37..100 alone", slice_q.data(), sub_q.data(), sub_q.size());
+                cudaFree(xq_sub);
+            }
+            const double t_n_old = time_us([&] { bk::rms_norm_rows(dx2, dw2, dn, Rq, E, 1e-6f, S); mmq::quantize(dn, nullptr, xq_ref, 8, E, E, Rq, S); });
+            const double t_n_new = time_us([&] { rms_norm_q8_1_prompt(dx2, dw2, Rq, 1e-6f, xq_new, S); });
+            std::printf("  rms_norm_q8_1_prompt %d rows: %.1f us vs unfused %.1f us (%.2fx)\n", Rq, t_n_new, t_n_old, t_n_old / t_n_new);
+
+            attn_gate(da2, dyq2, Rq, dg2, S, kProj);
+            mmq::quantize(dg2, nullptr, xq_ref, 8, kHeads * kHeadDim, kHeads * kHeadDim, Rq, S);
+            run_mmq(wO, xq_ref, kHeads * kHeadDim, yref);
+            attn_gate_q8_1_prompt(da2, dyq2, kProj, Rq, xq_new, S);
+            run_mmq(wO, xq_new, kHeads * kHeadDim, ynew);
+            const auto yg_host = host(ynew, (size_t) Rq * n_out);
+            report("attn_gate_q8_1_prompt vs unfused (via MMQ)", yg_host, host(yref, (size_t) Rq * n_out), 2e-3);
+            {   // CPU double reference (8 rows) + position invariance (rows 37..100 alone)
+                constexpr int OCols = kHeads * kHeadDim;
+                std::vector<double> ref_g((size_t) 8 * n_out, 0.0);
+                for (int r = 0; r < 8; ++r) {
+                    for (int o = 0; o < n_out; ++o) {
+                        double acc = 0.0;
+                        for (int c = 0; c < OCols; ++c) {
+                            const double gv = 1.0 / (1.0 + std::exp(-(double) hyq[(size_t) r * kProj + kOffGate + c]));
+                            acc += (double) ha[(size_t) r * OCols + c] * gv * wO_deq[(size_t) o * OCols + c];
+                        }
+                        ref_g[(size_t) r * n_out + o] = acc;
+                    }
+                }
+                report("attn_gate_q8_1_prompt vs CPU double (8 rows)", std::vector<float>(yg_host.begin(), yg_host.begin() + 8 * n_out), ref_g, 2e-2);
+                const int off_r = 37, sub_r = 64, nkb = OCols / 128;
+                void* xq_sub = zeros<uint8_t>(mmq::q8_bytes(sub_r, OCols));
+                attn_gate_q8_1_prompt(da2 + (size_t) off_r * OCols, dyq2 + (size_t) off_r * kProj, kProj, sub_r, xq_sub, S);
+                const auto full_q = host(static_cast<const uint8_t*>(xq_new), (size_t) nkb * Rq * 144);
+                const auto sub_q = host(static_cast<const uint8_t*>(xq_sub), (size_t) nkb * sub_r * 144);
+                std::vector<uint8_t> slice_q((size_t) nkb * sub_r * 144);
+                for (int kb = 0; kb < nkb; ++kb)
+                    std::memcpy(slice_q.data() + (size_t) kb * sub_r * 144,
+                                full_q.data() + ((size_t) kb * Rq + off_r) * 144, (size_t) sub_r * 144);
+                same_bits("  attn_gate_q8_1 rows 37..100 alone", slice_q.data(), sub_q.data(), sub_q.size());
+                cudaFree(xq_sub);
+            }
+            const double t_g_old = time_us([&] { attn_gate(da2, dyq2, Rq, dg2, S, kProj); mmq::quantize(dg2, nullptr, xq_ref, 8, kHeads * kHeadDim, kHeads * kHeadDim, Rq, S); });
+            const double t_g_new = time_us([&] { attn_gate_q8_1_prompt(da2, dyq2, kProj, Rq, xq_new, S); });
+            std::printf("  attn_gate_q8_1_prompt %d rows: %.1f us vs unfused %.1f us (%.2fx)\n", Rq, t_g_new, t_g_old, t_g_old / t_g_new);
+
+            for (void* q : {(void*) dx2, (void*) dw2, (void*) dn, (void*) da2, (void*) dyq2, (void*) dg2,
+                            xq_ref, xq_new, (void*) wE, (void*) wO, (void*) bnds, (void*) id, (void*) yref, (void*) ynew})
+                cudaFree(q);
+        }
         {   // fused ctrl_down_prompt + ctrl_up_blend_prompt vs unfused (ctrl_pair_norm + bf16_rows_dot + ctrl_blend) and CPU
             const int Rc = 2048;
             const std::vector<float> hd = randn((size_t) Rc * E, 1.0f), hm = randn((size_t) Rc * E, 1.0f);

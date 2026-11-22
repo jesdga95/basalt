@@ -378,4 +378,104 @@ void ctrl_up_blend_prompt(const float* dest, const float* msg, const float* hid,
     check("ctrl_up_blend_prompt");
 }
 
+namespace {
+
+// Matches block_q8_1_mmq (MMQ_Q8_1_DS_LAYOUT_D4): 4 float scales + 128 int8 codes = 144 bytes per 128 values.
+struct Q81MmqBlock {
+    float d4[4];
+    int8_t qs[128];
+};
+static_assert(sizeof(Q81MmqBlock) == 144, "Q81MmqBlock layout must match block_q8_1_mmq");
+
+__device__ __forceinline__ void emit_q8_1_sub32(float4 v, int col, int row, int rows, Q81MmqBlock* __restrict__ xq) {
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    const float d_inv = amax > 0.f ? (127.f / amax) : 0.f;
+    char4 q;
+    q.x = (signed char) rintf(v.x * d_inv);
+    q.y = (signed char) rintf(v.y * d_inv);
+    q.z = (signed char) rintf(v.z * d_inv);
+    q.w = (signed char) rintf(v.w * d_inv);
+    const int k_block = col >> 7;
+    const int iqs = col & 127;
+    Q81MmqBlock& blk = xq[(int64_t) k_block * rows + row];
+    reinterpret_cast<char4*>(blk.qs)[iqs >> 2] = q;
+    if ((iqs & 31) == 0) blk.d4[iqs >> 5] = amax > 0.f ? (amax * (1.f / 127.f)) : 0.f;
+}
+
+constexpr int kNormQ8Threads = 192;
+constexpr int kNormQ8Vecs = kWidth / (4 * kNormQ8Threads);   // 3 float4s per thread
+static_assert(kWidth == 4 * kNormQ8Threads * kNormQ8Vecs, "kWidth splits into float4s over kNormQ8Threads");
+
+__global__ void __launch_bounds__(kNormQ8Threads)
+    rms_norm_q8_1_prompt_kernel(const float* __restrict__ x, const float* __restrict__ w, int rows, float eps,
+                                Q81MmqBlock* __restrict__ xq) {
+    __shared__ float red[kNormQ8Threads / 32];
+    const int r = (int) blockIdx.x, tid = (int) threadIdx.x;
+    const float4* x4 = reinterpret_cast<const float4*>(x + (size_t) r * kWidth);
+    const float4* w4 = reinterpret_cast<const float4*>(w);
+    float4 xv[kNormQ8Vecs];
+    float ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < kNormQ8Vecs; ++j) {
+        const float4 v = x4[j * kNormQ8Threads + tid];
+        xv[j] = v;
+        ss = fmaf(v.x, v.x, ss);
+        ss = fmaf(v.y, v.y, ss);
+        ss = fmaf(v.z, v.z, ss);
+        ss = fmaf(v.w, v.w, ss);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((tid & 31) == 0) red[tid >> 5] = ss;
+    __syncthreads();
+    float tot = 0.f;
+#pragma unroll
+    for (int i = 0; i < kNormQ8Threads / 32; ++i) tot += red[i];
+    const float inv = rsqrtf(tot / (float) kWidth + eps);
+#pragma unroll
+    for (int j = 0; j < kNormQ8Vecs; ++j) {
+        const int c4 = j * kNormQ8Threads + tid;
+        const float4 wv = w4[c4];
+        const float4 nv = make_float4(xv[j].x * inv * wv.x, xv[j].y * inv * wv.y,
+                                      xv[j].z * inv * wv.z, xv[j].w * inv * wv.w);
+        emit_q8_1_sub32(nv, c4 * 4, r, rows, xq);
+    }
+}
+
+constexpr int kGateQ8Threads = 256;
+static_assert((kHeads * kHeadDim) % (4 * kGateQ8Threads) == 0, "kHeads * kHeadDim splits into float4 blocks");
+
+__global__ void __launch_bounds__(kGateQ8Threads)
+    attn_gate_q8_1_prompt_kernel(const float* __restrict__ attn, const float* __restrict__ yq, int64_t yq_ld, int rows,
+                                 Q81MmqBlock* __restrict__ xq) {
+    const int r = (int) blockIdx.x;
+    const int c4 = (int) blockIdx.y * kGateQ8Threads + (int) threadIdx.x;
+    const int col = c4 * 4;
+    const float4 a = *reinterpret_cast<const float4*>(attn + (size_t) r * (kHeads * kHeadDim) + col);
+    const float4 g = *reinterpret_cast<const float4*>(yq + (size_t) r * yq_ld + kOffGate + col);
+    const float4 v = make_float4(a.x / (1.f + expf(-g.x)), a.y / (1.f + expf(-g.y)),
+                                 a.z / (1.f + expf(-g.z)), a.w / (1.f + expf(-g.w)));
+    emit_q8_1_sub32(v, col, r, rows, xq);
+}
+
+}  // namespace
+
+void rms_norm_q8_1_prompt(const float* x, const float* w, int rows, float eps, void* xq, void* stream) {
+    if (rows <= 0) return;
+    rms_norm_q8_1_prompt_kernel<<<(unsigned) rows, kNormQ8Threads, 0, (cudaStream_t) stream>>>(
+        x, w, rows, eps, static_cast<Q81MmqBlock*>(xq));
+    check("rms_norm_q8_1_prompt");
+}
+
+void attn_gate_q8_1_prompt(const float* attn, const float* yq, int64_t yq_ld, int rows, void* xq, void* stream) {
+    if (rows <= 0) return;
+    const dim3 grid((unsigned) rows, (unsigned) ((kHeads * kHeadDim) / (4 * kGateQ8Threads)));
+    attn_gate_q8_1_prompt_kernel<<<grid, kGateQ8Threads, 0, (cudaStream_t) stream>>>(
+        attn, yq, yq_ld, rows, static_cast<Q81MmqBlock*>(xq));
+    check("attn_gate_q8_1_prompt");
+}
+
 }  // namespace basalt::models::inkling2

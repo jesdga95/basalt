@@ -332,22 +332,18 @@ private:
             for (int j = 0; j < 3; ++j) in[j] = b_.mix + (size_t) j * RE;
         }
         const bool one = !full && in[0] == in[1] && in[1] == in[2];
-        if (one) {
-            bk::rms_norm_rows(in[0], w.attn_norm, rows, E, g_.rms_eps, b_.nrm, stream_);
-        } else {
-            const float* wn[3] = {full ? w.q_norm : w.attn_norm, full ? w.k_norm : w.attn_norm, full ? w.v_norm : w.attn_norm};
-            for (int j = 0; j < 3; ++j) bk::rms_norm_rows(in[j], wn[j], rows, E, g_.rms_eps, b_.nrm + j * RE, stream_);
-        }
-        // the projections: fused Q+K+V when all three share the same normed input, else separate per stream
+        // the projections: fused RMSNorm + Q8_1 quantization directly into b_.xqd, and fused Q+K+V when streams are shared
         const size_t row_bytes = (size_t) E / 32 * 34;
-        quant(b_.nrm, E, rows, 8);
         if (one) {
+            rms_norm_q8_1_prompt(in[0], w.attn_norm, rows, g_.rms_eps, b_.xqd, stream_);
             product(w.proj, kProj, E, rows, b_.yq);
         } else {
+            const float* wn[3] = {full ? w.q_norm : w.attn_norm, full ? w.k_norm : w.attn_norm, full ? w.v_norm : w.attn_norm};
+            rms_norm_q8_1_prompt(in[0], wn[0], rows, g_.rms_eps, b_.xqd, stream_);
             product(w.proj, kProjQ, E, rows, b_.yq);
-            quant(b_.nrm + RE, E, rows, 8);
+            rms_norm_q8_1_prompt(in[1], wn[1], rows, g_.rms_eps, b_.xqd, stream_);
             product(w.proj + (size_t) kRowK * row_bytes, kProjKV, E, rows, b_.yk);
-            quant(b_.nrm + 2 * RE, E, rows, 8);
+            rms_norm_q8_1_prompt(in[2], wn[2], rows, g_.rms_eps, b_.xqd, stream_);
             product(w.proj + (size_t) kRowV * row_bytes, kProjKV, E, rows, b_.yv);
         }
         // convolutions, clips and the keys: a sliding-window visit stages the chunk's own, a full visit writes its cells
@@ -395,8 +391,7 @@ private:
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b_.attn, stream_);
         if (c.ring) stage_to_ring(b_.k_stage, b_.v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window, fp8 ? 1 : 2, stream_);
-        attn_gate(b_.attn, b_.yq, rows, b_.q, stream_, one ? kProj : kProjQ);   // the queries are spent: the gated rows go there
-        quant(b_.q, kOut, rows, 8);
+        attn_gate_q8_1_prompt(b_.attn, b_.yq, one ? kProj : kProjQ, rows, b_.xqd, stream_);
         product(w.out, E, kOut, rows, b_.o);
         // the attention's convolution and the residual: a block's first layer starts a new sum
         const bool boundary = g_.boundary(l);

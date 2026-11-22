@@ -65,4 +65,10 @@ void ctrl_down_prompt(const float* dest, const float* msg, const uint16_t* w_dow
 void ctrl_up_blend_prompt(const float* dest, const float* msg, const float* hid, const uint16_t* w_gf, int rows, int rank,
                           float* out, void* stream);
 
+/// Fused RMSNorm + MMQ Q8_1 quantization (D4 layout) for kWidth-wide rows directly into xq.
+void rms_norm_q8_1_prompt(const float* x, const float* w, int rows, float eps, void* xq, void* stream);
+
+/// Fused attention sigmoid gate + MMQ Q8_1 quantization (D4 layout) for kHeads * kHeadDim-wide rows directly into xq.
+void attn_gate_q8_1_prompt(const float* attn, const float* yq, int64_t yq_ld, int rows, void* xq, void* stream);
+
 }  // namespace basalt::models::inkling2
