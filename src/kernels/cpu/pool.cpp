@@ -1,6 +1,7 @@
 // src/kernels/cpu/pool.cpp - the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/core/progress.hpp"
+#include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
@@ -38,6 +39,15 @@ int auto_pool_workers(int worker_cores, int p_cores, int e_cores, bool hybrid, d
         if (fit < n) n = fit;
     }
     return std::max(1, n);
+}
+
+int start_pool_workers(int given, bool affinity_given, PoolAffinity affinity) {
+    if (given > 0) return given;
+    const CpuTopology topo = detect_cpu_topology(true);
+    const PoolAffinity pick = !affinity_given || affinity == PoolAffinity::Auto ? PoolAffinity::Auto
+                              : affinity == PoolAffinity::PCores               ? PoolAffinity::PCores
+                                                                               : PoolAffinity::All;
+    return auto_pool_workers((int) topo.worker_cores.size(), topo.p_cores, topo.e_cores, topo.is_hybrid, cgroup_cpu_quota(), pick);
 }
 
 namespace {
