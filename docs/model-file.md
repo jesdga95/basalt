@@ -216,7 +216,7 @@ python3 tools/convert/convert.py --verify Hy4-flash-Q4_K_M-test.basalt --gguf Hy
 
 ## Inkling 2 Mini pack
 
-The pack (`Inkling-2-Mini-NVFP4-q8.basalt`, 19.7 GB) comes from Thinking Machines Lab's official release alone
+The pack (`Inkling-2-Mini-NVFP4-DQ8.basalt`, 19.7 GB) comes from Thinking Machines Lab's official release alone
 ([thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), Apache-2.0): both safetensors files
 (`model` and the DSpark drafter `mtp`), `config.json`, `hf_quant_config.json`, the tokenizer files and the chat template. No other
 input. [checkpoint_inkling2.py](../tools/convert/checkpoint_inkling2.py) is what `convert.py --checkpoint` runs on a checkpoint of
@@ -224,7 +224,7 @@ model type `inkling2_loop`; `--drafter` and `--head` do not apply (the drafter i
 
 ```sh
 hf download thinkingmachines/Inkling-2-Mini --local-dir Inkling-2-Mini
-python3 tools/convert/convert.py --checkpoint Inkling-2-Mini --out Inkling-2-Mini-NVFP4-q8.basalt --name "Inkling 2 Mini"
+python3 tools/convert/convert.py --checkpoint Inkling-2-Mini --out Inkling-2-Mini-NVFP4-DQ8.basalt --name "Inkling 2 Mini"
 ```
 
 - `experts` and `experts.layout`: the routed experts of each of the 24 layers, 128 to a layer, one blob per expert in the order
