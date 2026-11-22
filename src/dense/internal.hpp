@@ -3,6 +3,7 @@
 
 #include "basalt/dense/model.hpp"
 #include "basalt/kernels/window_gemm.hpp"
+#include "basalt/model/batch_driver.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
 #include <cuda_runtime.h>
@@ -138,16 +139,9 @@ public:
     int lb = 0, le = 0;                          // the layers this card runs: [lb, le)
     int n_gdn = 0, n_attn = 0;                   // the GDN and attention layers among them
     std::vector<int> gdn_index, attn_index;      // per layer: its index among the card's GDN or attention layers (-1)
-    // the batch windows' graphs, one per composition (the sessions in the window and their rows), the least recently used out
-    using BatchKey = std::vector<std::pair<const SessionState*, int>>;
-    struct BatchGraph {
-        BatchKey key;
-        cudaGraphExec_t exec = nullptr;
-        uint64_t used = 0;
-    };
-    static constexpr size_t kBatchGraphs = 64;
-    std::vector<BatchGraph> batch_graphs;
-    uint64_t batch_clock = 0;
+    // the batch windows' graphs, one per composition (model/batch_driver.hpp captures them on one card; a layer split's
+    // forward_batch keeps each card's here itself)
+    model::BatchShared batch;
     // a batch window's GDN gates run on gate_side beside the qkv/z product, from gate_fork to gate_join
     cudaStream_t gate_side = nullptr;
     cudaEvent_t gate_fork = nullptr, gate_join = nullptr;
@@ -250,13 +244,17 @@ bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float*
 bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3,
                     std::string& err);
 /// One window of S sessions as one batch: segment k is segs[k].T rows (tokens and pos3 [row][3] packed in segment order, at
-/// most kWindow rows in all) at cells segs[k].pos.. of its session.  Each session is left as after its own forward_window
-/// (logits, the GDN rows for its commit, the drafter's rows); runs on the first session's stream.
+/// most kBatch rows in all) at cells segs[k].pos.. of its session.  Each session is left as after its own forward_window
+/// (logits, the GDN rows for its commit, the drafter's rows); runs on the first session's stream.  stage_batch puts the rows'
+/// inputs and the segment table on the card, batch_body launches the window from them (capturable: a composition's graph
+/// replays at any positions); forward_batch is both on a layer split's two cards, each card's graphs in its model's batch.
 struct BatchSeg {
     SessionState* st = nullptr;
     int T = 0;
     int64_t pos = 0;
 };
+void stage_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3);
+void batch_body(Model& m, const BatchSeg* segs, int S);
 bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err);
 /// Runs a prompt chunk; rows are token embeddings, or `rows` (fp32 [T][n_embd]) when given.  `pos3` [T][3].
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
