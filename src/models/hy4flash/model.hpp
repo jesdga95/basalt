@@ -4,6 +4,7 @@
 
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/model/batch_driver.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "models/hy4flash/dfly.hpp"   // DFLY HOOK
 #include "models/hy4flash/pack.hpp"
@@ -60,6 +61,8 @@ public:
         float* h_rows = nullptr;
     };
     SharedTier& shared_tier() const { return shared_tier_; }
+    /// What every session's batch windows share (model/batch_driver.hpp).
+    model::BatchShared& batch_shared() const { return batch_; }
     const std::vector<int>& peer_devices() const { return peer_devices_; }
     const model::LoadRequest& flags() const { return flags_; }
     const std::string& path() const { return path_; }
@@ -84,6 +87,7 @@ private:
     std::map<std::string, DevTensor> dev_;
     core::LoadPlan* planning_ = nullptr;
     mutable SharedTier shared_tier_;
+    mutable model::BatchShared batch_;
     std::vector<int> peer_devices_;
     model::LoadRequest flags_;
     std::string path_;
