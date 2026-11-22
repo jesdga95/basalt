@@ -158,6 +158,8 @@ class Parse(unittest.TestCase):
         cases = (
             ('{"args":{"q":"one"}}', END),
             ('{"name":"search","args":', END),
+            ('{"name":"search"}', END),
+            ('{"name":"search","args":[]}', END),
             ('{"args":{"q":"one"}}', ''),
         )
         for body, end in cases:

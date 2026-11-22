@@ -146,6 +146,7 @@ class Inkling2Parser:
         return True
 
     def _end_call(self, out: list) -> None:
+        obj = None
         try:
             obj = json.loads(self.raw)
             args = obj.get("args", {}) if isinstance(obj, dict) else {}
@@ -154,7 +155,10 @@ class Inkling2Parser:
             args, name = {}, self.call.name
         if not isinstance(args, dict):
             args = {}
-        if not (name or self.call.name):
+        if not self.call.name and not (
+            isinstance(obj, dict) and isinstance(obj.get("name"), str) and obj["name"].strip()
+            and isinstance(obj.get("args"), dict)
+        ):
             out.append(Event("content", TOOL_JSON + self.raw))
             self.call = None
             return
