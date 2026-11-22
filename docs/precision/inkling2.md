@@ -75,25 +75,20 @@ RTX 5090 at 400 W, the whole model on the card.
 
 ## Experts in RAM
 
-On narrow host links the RAM tier uses the shared native CPU pool ([selection](../models/inkling2.md#memory)).
-It keeps the pack's expert weights and uses Q8_0 activations for both products, with FP32 sums and the same
-softcapped SwiGLU. Resident experts and prompt chunks keep their GPU arithmetic. CPU rows match their single-token
-dot products bit for bit across window widths, token positions and row slices; CPU and GPU rounding differ.
+RAM experts use Q8_0 activations, FP32 sums and softcapped SwiGLU in the shared CPU pool
+([selection](../models/inkling2.md#memory)). CPU and GPU rounding differ; resident experts and prompt chunks keep GPU arithmetic.
 
-The paired 100-chunk decode gate uses an RTX 5060 Ti at 180 W, Core Ultra 9 285HX, 12 CPU workers and 64K FP16
-context, with actual placement pinned to the same 1,612 resident experts in both runs. The base is a fresh CPU reference from the same
-llama.cpp commit above, 512-token chunks, batch/ubatch 8192 and 12 threads; its PPL is 7.0629 over the 25,500
-scored rows. The native quality driver forces one-token windows. Separate kernel and greedy-identity checks cover wider windows.
+100 chunks, 25,500 scored rows: RTX 5060 Ti at 180 W, Core Ultra 9 285HX, 12 workers, 64K FP16 context and the same
+1,612 resident experts. The CPU reference uses the llama.cpp commit above, 512-token chunks, batch/ubatch 8192 and 12 threads;
+scored base PPL 7.0629. Native quality windows are one token; wider windows have separate parity and identity checks.
 
 | RAM expert execution | Mean KLD | P99 KLD | Top-1 | PPL |
 | --- | ---: | ---: | ---: | ---: |
 | GPU mapped reads | 0.00299 | 0.02915 | 97.80% | 7.0713 |
 | CPU pool | 0.00383 | 0.03492 | 97.35% | 7.0694 |
 
-The paired PPL change is -0.027% (95% chunk-bootstrap interval -0.138% to +0.085%, 10,000 resamples,
-seed 123), within the sampling uncertainty. CPU rounding moves farther from the reference distribution: mean KLD increases
-by 0.00084 and top-1 agreement falls by 0.45 percentage points. Maximum KLD is
-0.35587 for mapped reads and 0.58311 for the CPU pool. These numerical differences accompany the throughput gain.
+Paired PPL change: -0.027%, 95% chunk-bootstrap interval -0.138% to +0.085% (10,000 resamples, seed 123).
+Maximum KLD: mapped GPU 0.35587, CPU 0.58311.
 
 ## Drafting
 
