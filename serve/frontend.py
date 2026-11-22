@@ -619,9 +619,36 @@ FUNC_START = "<function="
 _QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 
 
+def _full_close_end(text: str, at: int) -> int:
+    """For the `</parameter>` at `at`: the index just past the `</function>` and `</tool_call>` that follow it
+    (whitespace between), or -1 when the three are not all there."""
+    s = text[at + len(PARAM_END):].lstrip()
+    if not s.startswith(FUNC_END):
+        return -1
+    s = s[len(FUNC_END):].lstrip()
+    return len(text) - len(s) + len(CALL_END) if s.startswith(CALL_END) else -1
+
+
+def _closes_again(rest: str, final: bool) -> bool | None:
+    """The output after a whole `</parameter></function></tool_call>`: True when it reaches another whole close
+    before any `<tool_call>` opens. The first close was then text inside the value: a string that holds the three
+    tags on their own lines, whose real end comes later. False for a real end (output that ends, prose that never
+    closes, a next call that opens first); None while the output so far cannot tell."""
+    if not rest.strip():
+        return False if final else None
+    opener = rest.find(CALL_START)
+    at = rest.find(PARAM_END)
+    while at >= 0 and (opener < 0 or at < opener):
+        if _full_close_end(rest, at) >= 0:
+            return True
+        at = rest.find(PARAM_END, at + 1)
+    return False if final or opener >= 0 else None
+
+
 def param_end(text: str, final: bool = False, name: str | None = None) -> int:
-    """Find a structural parameter close, keeping quoted calls and a reopened parameter inside its value.
-    -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural close."""
+    """Find a structural parameter close, keeping quoted calls, a reopened parameter and a quoted whole call close
+    inside its value. -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural
+    close."""
     at = text.find(PARAM_END)
     fallback = -1
     while at >= 0:
@@ -634,7 +661,14 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
             elif name is None or after[len(PARAM_START):gt].strip() != name:
                 candidate = at
         elif after.startswith(FUNC_END):
-            candidate = at
+            end = _full_close_end(text, at)
+            if end >= 0:
+                again = _closes_again(text[end:], final)
+                candidate = -2 if again is None else (-1 if again else at)
+            else:
+                tail = after[len(FUNC_END):].lstrip()
+                # the </tool_call> may still be arriving: what follows it decides
+                candidate = -2 if not final and (not tail or CALL_END.startswith(tail)) else at
         elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after):
             candidate = at if final else -2
         if candidate != -1:
@@ -850,7 +884,10 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True, name=pname.strip())
+        # the body stops before its </tool_call>: put it back, so a quoted whole close inside a value is told from
+        # the real one the same way as in the output
+        end = param_end(rest + "\n" + CALL_END, final=True, name=pname.strip())
+        end = end if end < len(rest) else -1
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
@@ -1117,8 +1154,9 @@ class OutputParser:
                 i = call_end(self.buf, final=final)
                 if self.stream_tools:
                     if i >= 0:
-                        whole, self.buf = self.buf, self.buf[:i]     # scan only the body
-                        out += self._scan(final=final)
+                        # scan only the call, closed: its </tool_call> tells a quoted close inside a value
+                        whole, self.buf = self.buf, self.buf[:i + len(CALL_END)]
+                        out += self._scan(final=True)
                         out += self._close_scan()
                         self.buf = whole
                     else:
