@@ -65,12 +65,12 @@ public:
         std::string err;
         if (!w.build(reqs, n, batch_rows(), batch_context(), err)) return {Status::Error, who + ": " + err};
         const cudaStream_t st = batch_stream();
-        for (int i = 0; i < n; ++i) {
+        // every session readies first (what each queues on its own stream runs side by side), then the shared scratch and
+        // the caches are the leader's stream's: whatever another session queued has run
+        for (int i = 0; i < n; ++i)
             if (!ss[(size_t) i]->batch_reserve(reqs[i], err)) return {Status::Refused, who + ": " + err};
-            // the shared scratch and the caches are this stream's now: whatever another session queued has run
-            if (ss[(size_t) i] != this && cudaStreamSynchronize(ss[(size_t) i]->batch_stream()) != cudaSuccess)
-                return {Status::Error, who + ": a session's stream failed"};
-        }
+        for (int i = 1; i < n; ++i)
+            if (cudaStreamSynchronize(ss[(size_t) i]->batch_stream()) != cudaSuccess) return {Status::Error, who + ": a session's stream failed"};
         std::vector<int> head((size_t) n, 0);
         for (int i = 0; i < n; ++i) {
             const DecodeRequest& r = reqs[i];
@@ -133,7 +133,9 @@ protected:
     virtual BatchShared& batch_shared() = 0;
     /// The stream this session's work runs on; a batch runs on its leader's.
     virtual cudaStream_t batch_stream() const = 0;
-    /// Room for the request's positions in this session's caches (false: the batch is refused, nothing ran).
+    /// Room for the request's positions in this session's caches, and whatever the session queues on its own stream before
+    /// a window (the last window's commit); every session's runs before the driver waits on any (false: the batch is
+    /// refused).
     virtual bool batch_reserve(const DecodeRequest& r, std::string& err) = 0;
     /// On the leader: every row's token and position to the card, outside the graph (v.w.tokens, v.w.positions). `key`
     /// takes whatever else the forward's launches depend on (a launch bound); the driver adds the composition.
