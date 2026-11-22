@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "basalt/vision/preprocess.hpp"
 #include "hy4_weights.hpp"
 #include "vision_kernels.cuh"
 
@@ -178,7 +179,12 @@ struct CudaEncoder::Impl {
         cls = m.find("v.class_embd") != nullptr;
         if (cls) {
             E = 1024; F = 4096; D = 64; DP = 64; patch = 20; PV = 3 * 20 * 20;
-            for (int c = 0; c < 3; ++c) { norm.mean[c] = h.mean[c] * 255.0f; norm.std[c] = h.std[c] * 255.0f; }
+            for (int c = 0; c < 3; ++c) {
+                norm.clip_mean[c] = vision::kClipMean[c];
+                norm.clip_std[c] = vision::kClipStd[c];
+                norm.mean[c] = h.mean[c];
+                norm.std[c] = h.std[c];
+            }
         }
         if (h.embd != E || h.heads != H || h.ffn != F || h.patch != patch || h.merge != 2 || h.layers < 1) {
             e = "unexpected projector hyper-parameters";

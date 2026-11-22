@@ -340,7 +340,8 @@ __global__ void bias_copy_lines_k(const float* g, const float* bias, const float
 constexpr int CE = 1024, CD = 64, CPAIRS = 32;   // its width, head width and rotated pairs a head
 
 // One block a patch row: the 3 x patch x patch values (channel, row, column) of patch r0 + blockIdx.x (merge order), from the
-// picture at the canvas' top left, -1 past it, normalised and rounded to bf16 as the reference casts its pixels.
+// picture at the canvas' top left, -1 past it, normalised and rounded to bf16 as the reference makes its pixels (PixelNorm;
+// no contracted multiply-add, so the roundings are the host's).
 __global__ void patch_rows_k(const uint8_t* rgb, int w, int h, int gx, int patch, PixelNorm nm, __nv_bfloat16* rows, int r0) {
     const int t = r0 + blockIdx.x, pp = patch * patch, vals = 3 * pp;
     int py, px;
@@ -349,7 +350,9 @@ __global__ void patch_rows_k(const uint8_t* rgb, int w, int h, int gx, int patch
     for (int j = threadIdx.x; j < vals; j += blockDim.x) {
         const int c = j / pp, rem = j % pp, X = px * patch + rem % patch, Y = py * patch + rem / patch;
         const float v = X < w && Y < h ? (float) rgb[((size_t) Y * w + X) * 3 + c] : -1.0f;
-        dst[j] = __float2bfloat16_rn((v - nm.mean[c]) / nm.std[c]);
+        const float x = __bfloat162float(__float2bfloat16_rn(__fdiv_rn(__fsub_rn(__fdiv_rn(v, 255.0f), nm.clip_mean[c]), nm.clip_std[c])));
+        const float sd = __bfloat162float(__float2bfloat16_rn(nm.clip_std[c])), mn = __bfloat162float(__float2bfloat16_rn(nm.clip_mean[c]));
+        dst[j] = __float2bfloat16_rn(__fdiv_rn(__fsub_rn(__fadd_rn(__fmul_rn(x, sd), mn), nm.mean[c]), nm.std[c]));
     }
 }
 
