@@ -167,6 +167,8 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | `conversation-cache-min-tokens` | engine | tokens | 0 | Park only conversations of at least this many tokens. |
 | `conversation-cache-disk-mib` | engine | MiB | 0 (off) | Disk budget for parked conversations. [running](../running.md#conversations-on-disk---conversation-cache-disk-mib) |
 | `conversation-cache-dir` | engine | directory | model cache folder | Another folder for the disk tier. |
+| `conversation-cache-slot-identity` | engine | header names | the server's own order | Headers the session is read from, ahead of that order and in this order (comma-separated, case-insensitive). It orders the read and filters nothing. [running](../running.md#session-affinity) |
+| `conversation-cache-slot-pin` | engine | switch | off | A session keeps the slot it owns: with that slot busy its request waits there instead of taking another one. [running](../running.md#session-affinity) |
 
 ## Vision
 
