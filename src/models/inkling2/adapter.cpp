@@ -32,6 +32,16 @@ public:
         f.trigger_pattern = "<\\|message_model\\|>[^<]";
         return f;
     }
+    // A reply is a list of blocks, each opened by <|message_model|> and ended by <|end_message|>: thinking blocks
+    // (<|content_thinking|>), then the answer (<|content_text|>, or text right after the header).
+    program::grammar::ReplyForm reply_form() const override {
+        program::grammar::ReplyForm f;
+        f.header = "<|message_model|>";
+        f.think_open = "<|content_thinking|>";
+        f.think_close = "<|end_message|>";
+        f.answer_open = "<|content_text|>";
+        return f;
+    }
     PreTokenizer pretokenizer() const override { return {"inkling2", pretok_inkling2, kIgnoreMerges}; }
     int max_expert_cards() const override { return 0; }
     const char* model_name() const override { return "Inkling-2-Mini"; }

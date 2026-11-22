@@ -2,6 +2,7 @@
 effort and thinking switches mapped to the template's, and the reply's blocks parsed into reasoning, content and tool
 calls, whole and streamed. Text only: no engine, no pack."""
 import json
+import threading
 import unittest
 from pathlib import Path
 
@@ -99,6 +100,12 @@ class Controls(unittest.TestCase):
     def test_the_levels_are_the_templates(self):
         for level, text in (("low", "0.2"), ("medium", "0.7"), ("high", "0.9"), ("max", "0.99")):
             self.assertEqual(self.prompt(reasoning_effort=level), EFFORT.format(text) + self.tail, level)
+
+    def test_the_grammar_hears_when_thinking_is_off(self):
+        for thinking, want in ((False, {"kind": "json_object", "think": False}), (True, {"kind": "json_object"})):
+            svc = service(HEADER + TEXT + "{}" + END)
+            list(svc.run(svc.tok.encode("x"), thinking, None, 16, {"_grammar": {"kind": "json_object"}}, threading.Event()))
+            self.assertEqual(svc.engine.requests[-1][1]["_grammar"], want, thinking)
 
     def test_off_is_the_lowest_effort(self):
         self.assertEqual(self.prompt(enable_thinking=False), EFFORT.format("0") + self.tail)
