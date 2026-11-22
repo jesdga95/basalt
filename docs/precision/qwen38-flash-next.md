@@ -159,7 +159,21 @@ The plane decomposition says the same thing: V quantized with K exact costs +0.0
 [+0.0040, +0.0066], K quantized with V exact +0.0036 [+0.0024, +0.0049], and the two together +0.0075 — so V carries
 about 70% of `q4_0`'s loss and the eight bits belong on V.
 
-**Speed: no difference beyond this box's noise.** Eight runs per arm, both nesting orders, `--adapt-swaps 0`:
+**Speed against `q4_0`.** Two runs per arm at 475 W, `--adapt-swaps 0`, ordered `q4_0`, `k8v4`, `k4v8`, `q4_0`, `k8v4`,
+`k4v8` so each arm held an early and a late slot. Decode is milliseconds per token (window time over tokens produced, so
+drafting luck does not move it); prefill is `basalt-bench`'s 16K and 64K depths:
+
+| | bytes/cell | decode ms/token | vs `q4_0` | prefill 16K | prefill 64K |
+|---|---:|---:|---:|---:|---:|
+| `q4_0` | 576 | 7.287 ± 0.210 | — | 7731 | 8669 |
+| `k8v4` | 816 | **6.589 ± 0.032** | **-9.6%** | 7700 (-0.4%) | 8788 (+1.4%) |
+| `k4v8` | 816 | **6.881 ± 0.026** | **-5.6%** | 7986 (+3.3%) | 8944 (+3.2%) |
+
+Both hybrids decode faster than `q4_0` — by 9.6% and 5.6% of the time per token, a gap several times either arm's own
+spread, and it is the fetch-and-fuse penalty documented above. Prefill is a different story: `k8v4` is level with `q4_0`
+and `k4v8` a little ahead, but `q4_0`'s own two runs span 4.4% at 16K and 9.5% at 64K, so neither gap is resolved.
+
+**Between the two hybrids**, eight runs per arm in both nesting orders, likewise at 475 W with `--adapt-swaps 0`:
 
 | Measurement | `k8v4` | `k4v8` | Change |
 |---|---:|---:|---:|
