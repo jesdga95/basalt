@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -81,7 +82,7 @@ public:
             BatchSession& s;
             bool open = true;
             ~End() {
-                if (open) s.batch_end(false);
+                if (open) s.batch_end(std::nullopt);
             }
         } end{*this};
         for (int i = 0; i < n; ++i)
@@ -100,11 +101,21 @@ public:
             if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
             core::CapturedGraph fresh;
             if (!fresh.begin(st, err)) return {Status::Error, who + ": " + err};
-            if (!batch_forward(v, err)) {
+            const auto drop = [&] {   // the stream leaves the capture before the window's end syncs it
                 cudaGraph_t dropped = nullptr;
                 cudaStreamEndCapture(st, &dropped);
                 if (dropped) cudaGraphDestroy(dropped);
                 cudaGetLastError();
+            };
+            bool ok = false;
+            try {
+                ok = batch_forward(v, err);
+            } catch (...) {
+                drop();
+                throw;
+            }
+            if (!ok) {
+                drop();
                 return {Status::Error, who + ": " + err};
             }
             if (!fresh.end(st, err)) return {Status::Error, who + ": " + err};
@@ -118,10 +129,10 @@ public:
             if (head[(size_t) i] > 0 && (picks[(size_t) i] = ss[(size_t) i]->batch_draw(v, i, err)) == nullptr)
                 return {Status::Error, who + ": " + err};
         }
-        const bool synced = cudaStreamSynchronize(st) == cudaSuccess;
+        const cudaError_t synced = cudaStreamSynchronize(st);
         end.open = false;
-        if (!batch_end(synced) || !synced)
-            return {Status::Error, who + (synced ? ": the window was stopped" : ": the batch window failed")};
+        if (!batch_end(synced) || synced != cudaSuccess)
+            return {Status::Error, who + (synced == cudaSuccess ? ": the window was stopped" : ": the batch window failed")};
         for (int i = 0; i < n; ++i) {
             const DecodeRequest& r = reqs[i];
             const int h = head[(size_t) i];
@@ -168,10 +179,10 @@ protected:
     /// On session i, queued on v.stream: its draws of its head rows with its own sampler; the host array of the picks it
     /// returns is read after the batch's sync (null with `err`: the draw failed).
     virtual const int32_t* batch_draw(const BatchView& v, int i, std::string& err) = 0;
-    /// On the leader, once on every exit after a successful batch_stage: `synced` when the batch's stream synchronized
-    /// after every take and draw (false: an earlier exit, or the sync failed). False: the window was stopped and nothing
-    /// of it is taken.
-    virtual bool batch_end(bool synced) { return synced; }
+    /// On the leader, once on every exit after a successful batch_stage: `synced` holds the status of the batch's stream
+    /// sync after every take and draw, and is empty on an earlier exit. False: the window was stopped and nothing of it
+    /// is taken.
+    virtual bool batch_end(std::optional<cudaError_t> synced) { return synced == cudaSuccess; }
 };
 
 }  // namespace basalt::model

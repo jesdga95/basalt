@@ -98,7 +98,7 @@ times the slots plus the shared scratch once, so more slots cost only their cach
    returns false from `batch_captured`: the driver runs its forward directly every window and the model replays its own
    graphs of the stretches between. A session whose state the batch path does not cover yet returns false from
    `batch_ready`, and the batch's windows run in turn. `batch_end` (optional) runs once on every exit after `batch_stage`,
-   told whether the stream synced after every draw; false withholds the window's results.
+   with the status of the stream's sync after every draw (none on an earlier exit); false withholds the window's results.
 4. Run the checks: `basalt --model FILE --batch 4 --tokens-file PROMPT --diag-batch-check` (every row of every composition
    bitwise its solo window), then `tools/batch_identity.py ENGINE --model FILE --slots 1,2,4,8` (every slot's tokens, alone
    and together, equal to a one-slot engine's).

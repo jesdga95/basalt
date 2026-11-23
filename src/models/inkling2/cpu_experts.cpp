@@ -88,12 +88,6 @@ struct CpuExperts::Impl {
         gate.drain(kDrainMs);
     }
 
-    // must() for a fork's and join's calls: a failure can leave the doorbell's stream outside the window's sync.
-    void need(cudaError_t e, const char* what) {
-        if (e != cudaSuccess) gate.fail(e);
-        must(e, what);
-    }
-
     ~Impl() {
         {   // no hook can reach this object past here
             std::lock_guard<std::mutex> lk(g_live_mu);
@@ -251,23 +245,23 @@ std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string&
 
 void CpuExperts::start(int l, int rows, const float* input, const int32_t* ids, cudaStream_t stream) {
     Impl& p = *impl_;
-    p.need(cudaEventRecord(p.ready, stream), "fork");
-    p.need(cudaStreamWaitEvent(p.stream, p.ready, 0), "fork wait");
+    must(cudaEventRecord(p.ready, stream), "fork");
+    must(cudaStreamWaitEvent(p.stream, p.ready, 0), "fork wait");
     moe_cpu_ring(ids, rows, p.k, p.model->layer(l).blob_table, input, l, p.input_dev, p.ids_dev, p.bell_dev, p.seq, p.stream);
-    p.need(cudaEventRecord(p.done, p.stream), "join");
+    must(cudaEventRecord(p.done, p.stream), "join");
 }
 
 void CpuExperts::finish(int l, int rows, const int32_t* ids, float* out, uint32_t* tally, cudaStream_t stream) {
     Impl& p = *impl_;
-    p.need(cudaStreamWaitEvent(stream, p.done, 0), "join wait");   // the ring has advanced `seq` before the merge reads it
+    must(cudaStreamWaitEvent(stream, p.done, 0), "join wait");   // the ring has advanced `seq` before the merge reads it
     moe_cpu_merge(ids, rows, p.k, p.model->layer(l).blob_table, p.out_dev, out, tally, stream, p.bell_dev, p.seq);
 }
 
 bool CpuExperts::enter() { return impl_->gate.enter(); }
-bool CpuExperts::leave(cudaError_t synced) {
+bool CpuExperts::leave(cudaError_t synced, bool joined) {
     // the bell's abort word too: a merge the abort released was let go through that word
     const bool released = std::atomic_ref<uint32_t>(impl_->bell->abort).load(std::memory_order_acquire) != 0;
-    return impl_->gate.leave(synced) && !released;
+    return impl_->gate.leave(synced, joined) && !released;
 }
 bool CpuExperts::stopped() { return impl_->gate.closed(); }
 

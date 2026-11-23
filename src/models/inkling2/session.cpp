@@ -43,6 +43,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -407,16 +408,17 @@ protected:
     cudaStream_t batch_stream() const override { return stream_; }
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
-        if (!admit(err)) return false;   // held until batch_end
+        if (!admit(err)) return false;
+        Admitted held{*this};   // passed to the driver (batch_end) once the stage succeeds
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
         key.push_back(cpu_ = cpu_layers());
         if (cpu_) sh_->cpu->wake();
-        if (check(err)) return true;
-        release();
-        return false;
+        if (!check(err)) return false;
+        held.passed = true;
+        return true;
     }
-    bool batch_end(bool synced) override {
-        if (synced) return complete(cudaSuccess);
+    bool batch_end(std::optional<cudaError_t> synced) override {
+        if (synced) return complete(*synced);
         release();
         return false;
     }
@@ -993,14 +995,20 @@ private:
         moe_plan(x.ids_, rows, g_.n_used, g_.n_expert, w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
                  k.ex_tally + (size_t) l * g_.n_expert, k.rec_blobs + (size_t) vi * kAheadExperts, k.rec_n + vi);
         const bool on_cpu = cpu_ >> l & 1;   // the RAM experts' pairs on the CPU, beside the card's
-        if (on_cpu) sh_->cpu->start(l, rows, nrm, x.ids_, k.stream);
+        if (on_cpu) {   // open until finish has queued the join: a throw between leaves the fork outside the call's sync
+            fork_open_ = true;
+            sh_->cpu->start(l, rows, nrm, x.ids_, k.stream);
+        }
         bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
         L.gate_softcap = g_.gate_softcap;
         L.up_softcap = g_.up_softcap;
         const int pairs = rows * g_.n_used;
         bk::native_expert_grouped(L, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, std::min(pairs, g_.n_expert), pairs, x.xq_[0], x.ex_scr_,
                                   x.ex_rows_, k.stream);
-        if (on_cpu) sh_->cpu->finish(l, rows, x.ids_, x.ex_rows_, k.ex_tally + (size_t) l * g_.n_expert, k.stream);
+        if (on_cpu) {
+            sh_->cpu->finish(l, rows, x.ids_, x.ex_rows_, k.ex_tally + (size_t) l * g_.n_expert, k.stream);
+            fork_open_ = false;
+        }
         MoeFinish mf;
         mf.rows = x.ex_rows_;
         mf.w = x.rw_;
@@ -1101,7 +1109,15 @@ private:
         }
         core::CapturedGraph g;
         if (!g.begin(stream_, err)) return false;
-        body(rows, head, full_keys);
+        try {
+            body(rows, head, full_keys);
+        } catch (...) {   // the stream leaves the capture before the call's cleanup syncs it
+            cudaGraph_t dropped = nullptr;
+            cudaStreamEndCapture(stream_, &dropped);
+            if (dropped) cudaGraphDestroy(dropped);
+            cudaGetLastError();
+            throw;
+        }
         if (!g.end(stream_, err)) return false;
         return graphs_.emplace(key, std::move(g)).first->second.launch(stream_, err);
     }
@@ -1248,7 +1264,9 @@ private:
         if (!admitted_) return synced == cudaSuccess;
         admitted_ = false;
         if (synced == cudaSuccess && lane_[1].stream) synced = cudaStreamSynchronize(lane_[1].stream);
-        return sh_->cpu->leave(synced) && synced == cudaSuccess;
+        const bool joined = !fork_open_;
+        fork_open_ = false;
+        return sh_->cpu->leave(synced, joined) && synced == cudaSuccess && joined;
     }
     // An exit before that sync: the window stream is synchronized first.
     void release() {
@@ -1262,10 +1280,13 @@ private:
         if (!kept) return {model::Status::Error, "inkling2: the CPU experts were stopped"};
         return {};
     }
-    // Gives admission up on every return of a call that took it.
+    // Gives admission up on every return of a call that took it, unless passed on.
     struct Admitted {
         Session& s;
-        ~Admitted() { s.release(); }
+        bool passed = false;
+        ~Admitted() {
+            if (!passed) s.release();
+        }
     };
 
     bool check(std::string& err) {
@@ -1358,6 +1379,7 @@ private:
     std::set<Shape> direct_;                           // the shapes whose first window has run
     uint64_t cpu_ = 0;                                 // the window in flight's layers with experts on the CPU
     bool admitted_ = false;                            // holds admission to the CPU experts' windows (admit)
+    bool fork_open_ = false;                           // a start whose finish has not queued its join
     const model::BatchView* view_ = nullptr;           // the batch window in flight, while batch_forward runs it
     float* logits_ = nullptr;                // the last window's head rows (row_logprobs, copy_logits, resample_row)
     uint32_t* ex_tally_ = nullptr;           // [layer][expert] the card's running count of each expert's lookups

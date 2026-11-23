@@ -34,9 +34,9 @@ public:
     void wake();
     /// Before a call's first window that calls start: false once the abort hook ran (the call submits nothing).
     bool enter();
-    /// After the call's window streams are synchronized (`synced`: that status): false once the abort hook ran, and the
-    /// call's results are discarded.
-    bool leave(cudaError_t synced);
+    /// After the call's closing sync (`synced`: its status; `joined`: no start of the call is left without its finish):
+    /// false once the abort hook ran, and the call's results are discarded.
+    bool leave(cudaError_t synced, bool joined);
     /// Whether the abort hook ran: a call in flight starts no further window.
     bool stopped();
 

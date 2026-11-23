@@ -1463,10 +1463,11 @@ void test_cpu_abort() {
     std::printf("%-34s %s\n", "moe_cpu_ring + merge: late done", late_ok ? "ok" : "FAIL");
     failures += !late_ok;
 
-    // The abort through the admission gate CpuExperts keeps: a drain started while a call holds admission behind a merge
-    // waiting for an unserved visit waits until the bell's release lets the call sync and leave, the call's results are
-    // discarded, and no call enters after the close; a call still in flight at the bound, one whose sync failed, or a
-    // fork left unjoined leaves completion unconfirmed.
+    // The abort through the admission gate CpuExperts keeps: a drain in its wait while a call holds admission behind a
+    // merge waiting for an unserved visit returns only after the bell's release lets the call sync and leave (a drain
+    // that returned earlier would report the call in flight), the call's results are discarded, and no call enters after
+    // the close; a call still in flight at the bound, one whose sync failed, or one that left a fork unjoined leaves
+    // completion unconfirmed.
     auto& unconfirmed = basalt::core::gpu_left_running();
     const bool previous = unconfirmed.exchange(false);
     bool gate_ok = true;
@@ -1480,7 +1481,7 @@ void test_cpu_abort() {
         bool kept = true;
         std::thread call([&] {
             const cudaError_t synced = cudaStreamSynchronize(st);   // the merge waits until the bell is aborted
-            kept = gate.leave(synced);
+            kept = gate.leave(synced, true);
         });
         std::atomic<bool> drained{false};
         std::thread drain([&] {
@@ -1488,8 +1489,7 @@ void test_cpu_abort() {
             gate.drain(5000);
             drained.store(true);
         });
-        while (!gate.closed()) std::this_thread::yield();
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        while (!gate.draining()) std::this_thread::yield();
         const bool waited = !drained.load();   // the call cannot leave before the release below
         abort_bell();
         drain.join();
@@ -1502,22 +1502,21 @@ void test_cpu_abort() {
         gate.close();
         gate.drain(20);
         gate_ok &= unconfirmed.exchange(false);
-        gate.leave(cudaSuccess);
+        gate.leave(cudaSuccess, true);
     }
     {
         WindowGate gate;
         gate_ok &= gate.enter();
         gate.close();
-        gate.leave(cudaErrorLaunchFailure);
+        gate.leave(cudaErrorLaunchFailure, true);
         gate.drain(20);
         gate_ok &= unconfirmed.exchange(false);
     }
     {
         WindowGate gate;
         gate_ok &= gate.enter();
-        gate.fail(cudaErrorLaunchFailure);
-        gate.leave(cudaSuccess);
         gate.close();
+        gate.leave(cudaSuccess, false);
         gate.drain(20);
         gate_ok &= unconfirmed.exchange(false);
     }
