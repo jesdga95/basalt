@@ -1,6 +1,8 @@
 name: ci
 
-# Pull requests run the same jobs as main. Changes that only touch docs/ or Markdown files skip CI (community.yml checks the community rows). Fork pull requests get a read-only token and no secrets (none are used).
+# Pull requests run the same jobs as main. Changes that only touch docs/ or Markdown files skip CI (community.yml checks the community rows). A pull
+# request that changes no native code (only the Python server, Python tools, requirements or Markdown) runs lint alone: the builds need a
+# C++/CUDA/CMake file, a test, a tool a CPU test runs, or the CI files themselves. Fork pull requests get a read-only token and no secrets (none are used).
 # No GPU is available: the engine is compiled for sm_120 and only the `cpu`-labelled tests run.
 on:
   pull_request:
@@ -31,6 +33,36 @@ env:
   CUDA_VERSION: "13.0.2"
 
 jobs:
+  # native=true when the builds must run: always outside pull requests, else when a changed file is not one of the Python-only paths below
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      native: ${{ steps.files.outputs.native }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: files
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != pull_request ]; then echo native=true >> "$GITHUB_OUTPUT"; exit 0; fi
+          native=false
+          while IFS= read -r f; do
+            case "$f" in
+              tools/tokenizer.py|tools/check_benchmarks.py|tools/iq_fixture.py) native=true ;;   # CPU tests run these
+              serve/*|tools/*.py|tools/convert/*|tools/migrations/*|requirements*.txt|*.md|docs/*) ;;
+              .github/workflows/review.yml|.github/workflows/community*.yml) ;;
+              *) native=true ;;
+            esac
+          done < <(git diff --name-only "$BASE...$HEAD")
+          echo "native=$native" | tee -a "$GITHUB_OUTPUT"
+
   lint:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -61,6 +93,8 @@ jobs:
         run: python -m unittest discover -s tools/migrations -p "test_*.py"
 
   build-test:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -141,6 +175,8 @@ jobs:
 
   # A build of one model compiles and tests none of the others (-DBASALT_MODELS).
   build-single-model:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     strategy:
       fail-fast: false
       matrix:
