@@ -16,7 +16,7 @@ enum class RouterGate : int { SqrtSoftplus = 0, Sigmoid = 1 };
 struct RouterArgs {
     int n_expert = 384;               ///< multiple of 32, at most 512
     int n_embd = 5120;                ///< multiple of 128
-    int k = 6;                        ///< at most 16
+    int k = 6;                        ///< at most 32
     float weight_scale = 1.5f;        ///< multiplies the normalised weights
     RouterGate gate = RouterGate::SqrtSoftplus;
     /// --route-prior (opt-in, changes the output): above 0, an expert `held` holds is chosen on s + bias + `prior`; the
