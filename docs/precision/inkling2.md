@@ -99,17 +99,18 @@ FP8 was 1.6% faster in this short-context decode ABBA.
 
 ## 16K prefill memory check
 
-The standard prefill fixture requested with `-p 16384` contains 15,810 tokens. Each run used `--max-context 32768`, `--max-new 1`, and `--spec 0`; all current runs completed without an illegal memory access. The PR's initial FP16 run exited because prompt staging was sized for the 144-byte INT8 row instead of FP16's 256-byte row; sizing now uses the widest format.
+The standard prefill fixture requested with `-p 16384` contains 15,810 tokens. Each run used `--max-context 32768`, `--max-new 1`, and `--spec 0`. The FP16 illegal access reproduced on the PR before the fix; current main and the fixed PR both pass FP16.
 
 | Revision | KV format | Prefill tok/s | Result |
 | --- | --- | ---: | --- |
-| Current main (`8667cc8abd`) | FP8 | 18,258 | Pass |
+| Main at tested revision (`8667cc8abd`) | FP16 | 17,653 | Pass |
+| Main at tested revision (`8667cc8abd`) | FP8 | 18,258 | Pass |
 | Rebased PR, before staging fix | FP16 | — | Failed during request |
-| Rebased PR, after staging fix | FP16 | 17,907 | Pass |
-| Rebased PR | FP8 | 18,183 | Pass |
-| Rebased PR | INT8 | 17,756 | Pass |
+| Rebased PR, final head (`df17c5807b`) | FP16 | 17,639 | Pass |
+| Rebased PR, final head (`df17c5807b`) | FP8 | 17,647 | Pass |
+| Rebased PR, final head (`df17c5807b`) | INT8 | 17,118 | Pass |
 
-The originally reported illegal access reproduced on the PR branch with FP16, not with FP8/INT8. After correcting the staging allocation, the same FP16 fixture passes.
+The regression was specific to the PR branch's FP16 staging allocation: it used the 144-byte INT8 row size instead of FP16's 256-byte row size. Sizing staging for the widest format fixes it.
 
 ## Fully resident context
 
