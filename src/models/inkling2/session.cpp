@@ -205,11 +205,12 @@ class Session final : public model::BatchSession, private Scratch {
 public:
     explicit Session(InklingModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
-        if (stream_) cudaStreamSynchronize(stream_);
-        if (lane_[1].stream) cudaStreamSynchronize(lane_[1].stream);
-        if (sh_ && sh_->cpu)   // the streams' merges have run: the abort's drain stops watching them before they go
-            for (const Lane& k : lane_)
-                if (k.stream) sh_->cpu->forget_stream(k.stream);
+        const cudaError_t synced = stream_ ? cudaStreamSynchronize(stream_) : cudaSuccess;
+        const cudaError_t synced1 = lane_[1].stream ? cudaStreamSynchronize(lane_[1].stream) : cudaSuccess;
+        if (sh_ && sh_->cpu) {   // the abort's drain stops watching the streams before they go
+            if (lane_[0].stream) sh_->cpu->forget_stream(lane_[0].stream, synced);
+            if (lane_[1].stream) sh_->cpu->forget_stream(lane_[1].stream, synced1);
+        }
         if (m_.spill().any() && ex_tally_) {   // how decode's lookups fell between the card and RAM
             std::vector<uint32_t> t;
             if (read_tally(t)) {

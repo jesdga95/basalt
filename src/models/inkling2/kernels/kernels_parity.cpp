@@ -1464,63 +1464,90 @@ void test_cpu_abort() {
     failures += !late_ok;
 
     // The drain after an abort, through the merge list CpuExperts keeps: a retired stream (forgotten, then destroyed) is
-    // never queried, the live ones are, a query error on one leaves completion unconfirmed, a forget waits for a drain
-    // that is querying, and a live stream with queued work is waited on until it finishes.
+    // never queried, the live ones are, a query error on one or a failed retirement leaves completion unconfirmed, a
+    // forget waits for a drain that is querying, and a live stream with queued work is waited on until it finishes.
     auto& unconfirmed = basalt::core::gpu_left_running();
     const bool previous = unconfirmed.exchange(false);
     cudaStream_t own = nullptr, live = nullptr, retired = nullptr;
-    for (cudaStream_t* s : {&own, &live, &retired}) cudaStreamCreateWithFlags(s, cudaStreamNonBlocking);
+    bool made = true;
+    for (cudaStream_t* s : {&own, &live, &retired})
+        made = made && cudaStreamCreateWithFlags(s, cudaStreamNonBlocking) == cudaSuccess;
     MergeStreams merges;
-    for (cudaStream_t s : {st, retired, live, st}) merges.note(s);
-    cudaStreamSynchronize(retired);
-    merges.forget(retired);
-    cudaStreamDestroy(retired);
+    bool retire_ok = made, saw_retired = false;
     std::vector<cudaStream_t> asked;
-    auto recorded = [&](cudaStream_t s) {
+    // every query of the cases below: the retired handle is recorded as a failure and never reaches CUDA
+    auto ask = [&](cudaStream_t s) {
+        if (s == retired) {
+            saw_retired = true;
+            return cudaErrorInvalidResourceHandle;
+        }
         asked.push_back(s);
         return cudaStreamQuery(s);
     };
-    merges.drain(cudaSuccess, own, recorded);
-    bool retire_ok = asked == std::vector<cudaStream_t>{own, st, live} && !unconfirmed.exchange(false);
-    merges.drain(cudaSuccess, own,
-                 [&](cudaStream_t s) { return s == live ? cudaErrorLaunchFailure : cudaStreamQuery(s); });
-    retire_ok &= unconfirmed.exchange(false);
-    std::atomic<bool> forgotten{false};
-    std::thread forgetter;
-    bool held = true;
-    merges.drain(cudaSuccess, own, [&](cudaStream_t s) {
-        if (s == live && !forgetter.joinable()) {
-            forgetter = std::thread([&] {
-                merges.forget(live);
-                forgotten.store(true);
-            });
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            held = !forgotten.load();
-        }
-        return cudaStreamQuery(s);
-    });
-    if (forgetter.joinable()) forgetter.join();
-    asked.clear();
-    merges.drain(cudaSuccess, own, recorded);
-    retire_ok &= held && forgotten.load() && asked == std::vector<cudaStream_t>{own, st};
+    if (made) {
+        for (cudaStream_t s : {st, retired, live, st}) merges.note(s);
+        const cudaError_t synced = cudaStreamSynchronize(retired);
+        merges.forget(retired, synced);
+        retire_ok &= synced == cudaSuccess && cudaStreamDestroy(retired) == cudaSuccess;
+        merges.drain(cudaSuccess, own, ask);
+        retire_ok &= asked == std::vector<cudaStream_t>{own, st, live};
+        retire_ok &= !unconfirmed.exchange(false);
+        merges.drain(cudaSuccess, own, [&](cudaStream_t s) { return s == live ? cudaErrorLaunchFailure : ask(s); });
+        retire_ok &= unconfirmed.exchange(false);
+        std::atomic<bool> started{false}, forgotten{false};
+        std::thread forgetter;
+        bool held = true;
+        merges.drain(cudaSuccess, own, [&](cudaStream_t s) {
+            if (s == live && !forgetter.joinable()) {
+                forgetter = std::thread([&] {
+                    started.store(true);
+                    merges.forget(live, cudaSuccess);
+                    forgotten.store(true);
+                });
+                while (!started.load()) std::this_thread::yield();
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                held = !forgotten.load();
+            }
+            return ask(s);
+        });
+        if (forgetter.joinable()) forgetter.join();
+        asked.clear();
+        merges.drain(cudaSuccess, own, ask);
+        retire_ok &= held && forgotten.load() && asked == std::vector<cudaStream_t>{own, st};
+        retire_ok &= !unconfirmed.exchange(false);
+        MergeStreams failed;   // a retirement whose synchronize failed
+        failed.note(live);
+        failed.forget(live, cudaErrorLaunchFailure);
+        failed.drain(cudaSuccess, own, ask);
+        retire_ok &= unconfirmed.exchange(false);
+    }
+    retire_ok &= !saw_retired;
     std::printf("%-34s %s\n", "CPU abort drain: retired stream", retire_ok ? "ok" : "FAIL");
     failures += !retire_ok;
 
     // queued work: the graph's first merge waits for a visit nobody serves until the drain has seen it pending
-    reset();
-    cudaGraphLaunch(exec, st);
-    bool queued_ok = wait_for_ring();
-    int pending = 0;
-    merges.drain(cudaSuccess, own, [&](cudaStream_t s) {
-        const cudaError_t status = cudaStreamQuery(s);
-        if (s == st && status == cudaErrorNotReady && ++pending == 3) abort_bell();
-        return status;
-    });
-    queued_ok &= pending >= 3 && cudaStreamQuery(st) == cudaSuccess && !unconfirmed.exchange(previous);
-    require_drain("the drained queue");
+    bool queued_ok = made;
+    if (made) {
+        reset();
+        cudaGraphLaunch(exec, st);
+        queued_ok &= wait_for_ring();
+        int pending = 0;
+        merges.drain(cudaSuccess, own, [&](cudaStream_t s) {
+            const cudaError_t status = ask(s);
+            if (s == st && status == cudaErrorNotReady && ++pending == 3) abort_bell();
+            return status;
+        });
+        queued_ok &= pending >= 3 && cudaStreamQuery(st) == cudaSuccess;
+        queued_ok &= !unconfirmed.exchange(false);
+        abort_bell();   // a drain that left early must not leave the merge waiting
+        require_drain("the drained queue");
+    }
+    queued_ok &= !saw_retired;
+    unconfirmed.store(previous);
     std::printf("%-34s %s\n", "CPU abort drain: queued work", queued_ok ? "ok" : "FAIL");
     failures += !queued_ok;
-    for (cudaStream_t s : {own, live}) cudaStreamDestroy(s);
+    for (cudaStream_t s : {own, live})
+        if (s) cudaStreamDestroy(s);
     cudaGraphExecDestroy(ordered_exec);
     cudaGraphDestroy(ordered_graph);
     cudaGraphExecDestroy(single_exec);

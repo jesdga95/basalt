@@ -256,7 +256,7 @@ void CpuExperts::finish(int l, int rows, const int32_t* ids, float* out, uint32_
     moe_cpu_merge(ids, rows, p.k, p.model->layer(l).blob_table, p.out_dev, out, tally, stream, p.bell_dev, p.seq);
 }
 
-void CpuExperts::forget_stream(cudaStream_t stream) { impl_->merges.forget(stream); }
+void CpuExperts::forget_stream(cudaStream_t stream, cudaError_t synced) { impl_->merges.forget(stream, synced); }
 
 void CpuExperts::wake() {
     Impl& p = *impl_;
