@@ -1547,6 +1547,22 @@ bool ConversationStore::write(const ConversationSource& src, std::string& error,
     if (ok) {
         superseded = superseded_locked(*fresh);
         entries_.reserve(entries_.size() + 1);
+        // what the budget keeps once it has evicted every other conversation: this one's files and the queued images
+        std::vector<std::string> held = job.held;
+        std::sort(held.begin(), held.end());
+        held.erase(std::unique(held.begin(), held.end()), held.end());
+        uint64_t kept = file_bytes;
+        for (const std::string& name : held)
+            if (auto it = parts_.find(name); it != parts_.end()) kept += it->second.bytes;
+        for (const auto& e : entries_)
+            if (e->job && std::find(superseded.begin(), superseded.end(), e.get()) == superseded.end()) kept += e->bytes;
+        if (kept > budget_) {   // its eviction would follow every other one's
+            char text[160];
+            std::snprintf(text, sizeof text, "its files and the queued images, %.2f GiB, do not fit the %.2f GiB budget",
+                          (double) kept / 1073741824.0, (double) budget_ / 1073741824.0);
+            ok = false;
+            why = text;
+        }
     }
     if (ok && !basalt::platform::rename_replace(staged, dir_ + "/" + job.name)) {
         ok = false;

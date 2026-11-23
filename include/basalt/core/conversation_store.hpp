@@ -104,7 +104,8 @@ public:
     /// thread and before the queued ones: the files put() writes of its image.  Until it has succeeded the index and
     /// the files it names stay as they were; an entry indexed or dropped during the write refuses it too.  False with
     /// `error` when the conversation is not stored once this returns: not written (one larger than the budget is not
-    /// begun), or evicted by the budget at once.  `progress` is called while it waits for the writer thread, about
+    /// begun, and one whose files and the queued images do not fit it together is not put in place, so it evicts
+    /// nothing), or evicted by the budget at once.  `progress` is called while it waits for the writer thread, about
     /// once a second, and for every piece it copies from `src`.
     bool write(const ConversationSource& src, std::string& error, const std::function<void()>& progress = {});
     /// The RAM a write() of `tokens` tokens takes beside its source.

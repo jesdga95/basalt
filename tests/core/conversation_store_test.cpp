@@ -553,8 +553,8 @@ void index_before_name(const std::string& dir, uint64_t id) {
 }
 
 // A write from a source against the budget: a conversation larger than it is not begun, one its files exceed is
-// written, evicted and reported, and the files of a dropped conversation that a read still holds open do not push the
-// one just written out.
+// written but not put in place, so it evicts nothing, and the files of a dropped conversation that a read still holds
+// open do not push the one just written out.
 void written_within_budget(const std::string& dir, uint64_t id) {
     std::string err;
     std::vector<int32_t> ids, other(9001);
@@ -574,8 +574,15 @@ void written_within_budget(const std::string& dir, uint64_t id) {
         CHECK(st.open(dir, id, state + 4096, err));   // its state, not the files' tables beside it
         CHECK(!st.write(source(x), err));
         const auto s = st.stats();
-        CHECK(s.files == 0 && s.written == 1 && s.evicted == 1 && dir_bytes(dir) == 0);
+        CHECK(s.files == 0 && s.written == 0 && s.evicted == 0 && dir_bytes(dir) == 0);
+        // what the budget held before it stays
+        std::vector<int32_t> small(300);
+        for (size_t i = 0; i < small.size(); ++i) small[i] = (int32_t) (i * 7 + 3);
+        CHECK(st.write(source(image(small, {})), err));
+        CHECK(!st.write(source(x), err));
+        CHECK(st.stats().files == 1 && st.stats().evicted == 0 && st.holds(small, {}, true));
     }
+    remove_dir(dir);
     uint64_t one = 0;
     {
         Store st;
