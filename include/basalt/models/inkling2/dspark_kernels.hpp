@@ -59,6 +59,7 @@ struct DsHead {
     const void* fold_sc = nullptr;
     int64_t n_vocab = 0;
     float cap = 30.f;
+    bool head_planes = false;
 };
 
 /// The 2-bit copy of `n_rows` Q8_0 rows of n_in (kWidth or kDsRank) values, packed from the rows. The copy holds the rows
