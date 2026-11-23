@@ -84,9 +84,6 @@ struct Options : CommonOptions {
     /// between the tool-call tags, so tool calls are sampled exactly.
     int64_t relax_special_from = 248044;
     int64_t relax_call_open = 248058, relax_call_close = 248059;
-    /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k
-    /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
-    int batch_groups = 1;
     int spec_corrupt = 0;         // --spec-corrupt N > 0 replaces every Nth draft with a wrong token
     /// Names the model's draft layer when it has one (the file); empty means no drafter.
     std::string mtp;

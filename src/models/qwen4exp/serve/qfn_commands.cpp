@@ -72,10 +72,7 @@ bool QfnRuntime::expert_map(int64_t& total, std::vector<uint8_t>& homes, std::ve
     return true;
 }
 
-bool QfnRuntime::windows_in_flight() { return piped && pipe_inflight(); }
-bool QfnRuntime::next_batch_window() { return piped ? pump(true) : batch_step(); }
-// a request reads its prompt through every stage: the groups in flight finish first
-bool QfnRuntime::drain_windows() { return !piped || pipe_drain(); }
+bool QfnRuntime::next_batch_window() { return batch_step(); }
 
 void QfnRuntime::script_command(const std::string& line) {
     char* e1 = nullptr;

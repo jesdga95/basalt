@@ -279,11 +279,6 @@ int sessions(Context& context) {
             return 1;
         }
     }
-    if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
-        basalt::log::warn("basalt generate", "--batch-groups %d needs a layer split and to divide --batch %d; "
-                             "one group", o.batch_groups, o.batch);
-        o.batch_groups = 1;
-    }
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
         slot_cap.assign((size_t) o.batch, o.max_context);
@@ -350,7 +345,6 @@ int sessions(Context& context) {
                         sb + basalt::core::session_kv_bytes_for(u, u.max_cells));
                 }
             slot_cap.resize((size_t) fit);
-            if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
             // the sessions' VRAM is the expert cache's: say what it costs (the slots carved on CUDA0 may be fewer than
             // were first carved when a later stage ran out)
             uint64_t kept = 0;

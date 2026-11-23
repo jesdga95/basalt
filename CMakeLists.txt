@@ -163,7 +163,6 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/load/prefill.cpp
   src/models/qwen4exp/load/decode.cpp
   src/models/qwen4exp/serve/batch.cpp
-  src/models/qwen4exp/serve/batch_pipeline.cpp
   src/models/qwen4exp/serve/qfn_commands.cpp
   src/models/qwen4exp/serve/qfn_restore.cpp
   src/models/qwen4exp/serve/qfn_image.cpp

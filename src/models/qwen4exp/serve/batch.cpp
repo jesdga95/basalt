@@ -510,16 +510,6 @@ int QfnRuntime::init_batch() {
     // a prompt read on its own thread beside the slots' windows: the tier stays as it is meanwhile
     ov_active = false;
     ov_post_done = false;
-
-    // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
-    n_pipe = (int) stages.size() + 1;
-    piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1;
-    GS = piped ? o.batch / o.batch_groups : o.batch;
-
-    pg = std::vector<PGroup>((size_t) (piped ? o.batch_groups : 0));
-    stage_group = std::vector<int>((size_t) n_pipe, -1);
-    pipe_tick = 0;
-    rr = 0;
     return 0;
 }
 
