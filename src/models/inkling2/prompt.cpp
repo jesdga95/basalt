@@ -119,7 +119,9 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     b.dst = c.take<int32_t>(P);
     b.exp = c.take<int32_t>(P);
     b.sort_scr = c.take<uint8_t>(moe_sort_scratch((int) P, g.n_expert));
-    const size_t stage = (size_t) kKvHeads * R * kv_cache_row_bytes(false, true);   // the widest cache row
+    const size_t row_bytes = (size_t) std::max(kv_cache_row_bytes(false, false),
+                                               std::max(kv_cache_row_bytes(true, false), kv_cache_row_bytes(false, true)));
+    const size_t stage = (size_t) kKvHeads * R * row_bytes;   // staging must fit the widest cache format
     b.k_stage = c.take<uint8_t>(stage);
     b.v_stage = c.take<uint8_t>(stage);
     b.pos = c.take<int32_t>(R);

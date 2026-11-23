@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
     if (!check_cuda(cudaMalloc(&di, input.size() * sizeof(float)), "allocate input") ||
         !check_cuda(cudaMalloc(&dout, (size_t) rows * row_bytes), "allocate rows") ||
         !check_cuda(cudaMemcpy(di, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice), "copy input") ||
-        !check_cuda(cudaMemset(dout, 0, (size_t) rows * row_bytes), "clear rows")) return 1;
+        !check_cuda(cudaMemset(dout, 0xa5, (size_t) rows * row_bytes), "poison rows")) return 1;
 
     encode_rows<<<rows, 32>>>(di, dout, rows);
     if (!check_cuda(cudaGetLastError(), "launch") || !check_cuda(cudaDeviceSynchronize(), "synchronize")) return 1;

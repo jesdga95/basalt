@@ -164,6 +164,10 @@ __device__ __forceinline__ void store_kv(void* row, bool fp8, bool int8, size_t 
         static_cast<int8_t*>(row)[idx] = (int8_t) q;
         if (lane == group * 16)
             reinterpret_cast<__half*>(static_cast<uint8_t*>(row) + kHeadDim)[group] = __float2half_rn(s);
+        if (idx == 0) {
+            uint32_t* padding = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(row) + kHeadDim + 2 * sizeof(__half));
+            padding[0] = padding[1] = padding[2] = 0;
+        }
     } else if (fp8) {
         __nv_fp8_e4m3 q(v);
         static_cast<uint8_t*>(row)[idx] = *reinterpret_cast<uint8_t*>(&q);
