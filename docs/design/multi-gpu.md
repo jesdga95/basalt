@@ -52,9 +52,10 @@ gpu-mode split: GPU 1 (RTX 4060 Ti) is sm_89; split and tensor run on sm_120 car
 gpu 1,0: GPU 1 (RTX 4060 Ti) is sm_89; the main card must be sm_120
 ```
 
-The number checks stay (past the visible cards, listed twice). In the config `gpu` and `gpu-share` may be a number, a list or
-a string (`serve/engine/vision.py` `check_gpu`, `gpu_text`); the server forwards `--gpu-mode` and `--gpu-share` beside the
-narrowed `--gpu` (`serve/server.py:171-180`).
+`gpu` in a text is the setting as written (`gpu "all"`, `gpu "0"` when unset), the model its adapter's `model_name()`; "(not built)"
+marks a mode no model runs (tensor at 0.5.7). The checks that need the shares (nothing to hold, does not fit) are the shared
+deal's. The number checks stay (past the visible cards, listed twice). In the config `gpu` and `gpu-share` may be a number, a
+list or a string (`check_gpu`, `gpu_text`); the server forwards `--gpu-mode` and `--gpu-share` beside the narrowed `--gpu`.
 
 ### The start line
 
@@ -84,7 +85,7 @@ The shares are normalized to sum to 1 and stay fixed for the run. What a share d
 
 | Piece | Where |
 | --- | --- |
-| Parsing `gpu`, `gpu-mode`, `gpu-share`; card table; `CUDA_VISIBLE_DEVICES` narrowing; `--gpu-plan` JSON with mode and shares | `program/gpu_select.hpp` (kept, trimmed) |
+| Parsing `gpu`, `gpu-mode`, `gpu-share`; `GpuMode`, `GpuModes` and their refusals; card table; `CUDA_VISIBLE_DEVICES` narrowing; `--gpu-plan` JSON with mode and shares | `program/gpu_select.hpp` (kept, trimmed) |
 | The card set a model receives, mode support, refusals, shares, start lines | `model/multi_gpu.hpp` (new) |
 | Expert deal by share, layer cuts by share and bytes, prompt-stage cuts | `model/multi_gpu.cpp` (from `gpu_select.cpp:266-300`, `dense/split_plan.cpp`) |
 | Transfers: peer access for every pair, device-to-device or host-staged copies, link probes | `core/card_link.hpp` (from `cli/gpu.cpp:76-97` and Flash-Next's `probe_pcie_h2d_gbps`) |
@@ -92,15 +93,13 @@ The shares are normalized to sum to 1 and stay fixed for the run. What a share d
 | The conformance check | `model/gpu_check.hpp`, `--diag-gpu-check`, `tools/gpu_identity.py` |
 
 ```cpp
-// include/basalt/model/multi_gpu.hpp (sketch)
-enum class GpuMode { One, Peer, Split, Tensor };
+// include/basalt/model/multi_gpu.hpp (sketch; GpuMode and GpuModes live in program/gpu_select.hpp, the parser needs them)
 struct GpuCards {                                   // what the load request carries, main first
     struct Card { int device; program::GpuCard info; uint64_t free; double share; };
     GpuMode mode = GpuMode::One;
     std::vector<Card> cards;
     const char* share_from = "";                    // "gpu-share", "free VRAM", "bandwidth"
 };
-struct GpuModes { int peer = 0, split = 0, tensor = 0; };   // what a model runs: the most cards per mode, 0 = not run
 struct PeerHooks {                                  // peer: the main card runs every layer
     virtual std::vector<PeerUnit> peer_units() = 0;           // experts outside the main card, hottest first, with bytes
     virtual StageSpec peer_stages() const = 0;                // layers a stage may read, their bytes, a chunk's rows
@@ -117,8 +116,8 @@ struct TensorHooks {                                // tensor: reserved
     virtual Result tensor_open(const GpuCards&) = 0;
     virtual std::string tensor_report(int card) const = 0;
 };
-// ModelAdapter, in place of max_expert_cards, second_card_reads_prompts, second_card_runs_layers:
-virtual GpuModes gpu_modes() const { return {}; }
+// ModelAdapter, in place of max_expert_cards, second_card_reads_prompts, second_card_runs_layers; every model states it
+virtual program::GpuModes gpu_modes() const = 0;   // the most cards per mode, 0 = not run
 // LoadedModel: each mode's hooks, null for a mode the model does not run
 virtual PeerHooks* peer() { return nullptr; }  virtual SplitHooks* split() { return nullptr; }  virtual TensorHooks* tensor() { return nullptr; }
 ```
@@ -266,8 +265,9 @@ upstream). It reports 1.5x decode and 1.2x prefill over the layer split on 2x RT
 7. **Diagnostic cut. DEFAULT, Jay to confirm:** one shared `--diag-gpu-cut L` replaces each model's `--diag-split-at`.
 8. **A peer with nothing to hold. DEFAULT, Jay to confirm:** refused with the reason (today it idles).
 9. **More cards than a mode takes. DEFAULT, Jay to confirm:** refused with the maximum (today the extra cards idle).
-10. **`all` and older cards. DEFAULT, Jay to confirm:** `all` takes every visible sm_120 card; in a `-DPEER_ADA=ON` build peer
-    mode also takes sm_89 cards as peers, split and tensor refuse them; a first card that is not sm_120 is an error.
+10. **`all` and older cards. DEFAULT, Jay to confirm:** `all` takes every visible card in order and skips none; a card the mode
+    cannot use is refused with its reason (peer takes sm_89 only in a `-DPEER_ADA=ON` build, split and tensor never; the main
+    card must be sm_120), so a machine with an older card names the cards it wants.
 11. **Community bench rows. DEFAULT, Jay to confirm:** `basalt-bench --community` takes the user's `gpu` and `gpu-mode` and
     records both in the row (it forces `auto` today).
 12. **Open PRs this touches. DEFAULT, Jay to confirm:** superseded, closed once the rework lands: #212, #352, #564. Rebased
