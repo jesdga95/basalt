@@ -661,23 +661,24 @@ __device__ __forceinline__ void load_stage256(int stage, int kt, uint8_t* smem, 
             }
         }
     }
-    // 256 threads cover 256 B rows: exactly 1 row per thread (4x cp_async16 .cg + 1x cp_async8)
-    const int row = (int) threadIdx.x;
-    const uint8_t* src = w_src + (size_t) b_row256<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes;
-    const int odd = (int) (((uintptr_t) src >> 3) & 1u);
-    uint8_t* dst = bs + row * kBRowStride;
-    if (!odd) {
-        cp_async16(dst + 0, src + 0);
-        cp_async16(dst + 16, src + 16);
-        cp_async16(dst + 32, src + 32);
-        cp_async16(dst + 48, src + 48);
-        cp_async8(dst + 64, src + 64);
-    } else {
-        cp_async8(dst + 8, src + 0);
-        cp_async16(dst + 16, src + 8);
-        cp_async16(dst + 32, src + 24);
-        cp_async16(dst + 48, src + 40);
-        cp_async16(dst + 64, src + 56);
+    // Coalesced 4-lane-per-row cp_async16 (.cg): 4 consecutive lanes read 64 contiguous bytes of each B row
+    // (2 full 32B L2 sectors, branchless odd offset), plus 1 pass of cp_async8 for the 8-byte edge.
+    const int r_base = (int) (threadIdx.x >> 2);
+    const int c16 = (int) (threadIdx.x & 3) * 16;
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const int row = p * 64 + r_base;
+        const uint8_t* src = w_src + (size_t) b_row256<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes;
+        const int odd = (int) (((uintptr_t) src >> 3) & 1u);
+        uint8_t* dst = bs + row * kBRowStride;
+        cp_async16(dst + (odd ? 16 : 0) + c16, src + (odd ? 8 : 0) + c16);
+    }
+    {
+        const int row = (int) threadIdx.x;
+        const uint8_t* src = w_src + (size_t) b_row256<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes;
+        const int odd = (int) (((uintptr_t) src >> 3) & 1u);
+        uint8_t* dst = bs + row * kBRowStride;
+        cp_async8(dst + (odd ? 8 : 64), src + (odd ? 0 : 64));
     }
 }
 
