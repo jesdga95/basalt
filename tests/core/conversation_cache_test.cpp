@@ -252,11 +252,11 @@ int main() {
     }
     {   // an idle slot's conversation: outside the byte budget, at most `keep` of them, the longest parked leaving
         ConversationCache off(0, 4);
-        off.put_slot(image({1, 2, 3}), 2);
+        off.put_slot(image({1, 2, 3}), 2, -1);
         check(off.size() == 1 && off.slot_size() == 1 && off.best(a, {}, true).tokens == 3,
               "a cache without a budget keeps an idle slot's conversation");
-        off.put_slot(image({9, 8, 7}), 2);
-        off.put_slot(image({5, 6, 7}), 2);
+        off.put_slot(image({9, 8, 7}), 2, -1);
+        off.put_slot(image({5, 6, 7}), 2, -1);
         check(off.slot_size() == 2 && off.best(a, {}, true).tokens == 0 && off.best(b, {}, true).tokens == 3,
               "past `keep` the longest parked one leaves");
         auto taken = off.take(off.best(b, {}, true).index);
@@ -269,13 +269,13 @@ int main() {
     {   // beside a budget: the idle slots' conversations neither count against it nor leave for it
         const size_t one = image({1, 2, 3}).bytes();
         ConversationCache cache(one, 1);
-        cache.put_slot(image({9, 8, 7}), 4);
+        cache.put_slot(image({9, 8, 7}), 4, -1);
         check(cache.put(image({1, 2, 3})), "a budgeted park fits beside an idle slot's conversation");
         check(cache.put(image({5, 6})) && cache.size() == 2 && cache.slot_size() == 1 &&
                   cache.best(b, {}, true).tokens == 3 && cache.best(a, {}, true).tokens == 0,
               "the budget's evictions leave the idle slot's conversation");
         cache.set_spill(true);
-        cache.put_slot(image({4, 4, 4}), 1);
+        cache.put_slot(image({4, 4, 4}), 1, -1);
         const auto spilled = cache.take_spilled();
         check(spilled.size() == 1 && spilled[0].live.ids == std::vector<int32_t>({9, 8, 7}) &&
                   cache.slot_size() == 1 && cache.size() == 2,
@@ -286,8 +286,8 @@ int main() {
         turn.checkpoints.push_back(cp);
         SavedConversation older = image({4, 4, 4, 1});
         older.checkpoints.push_back(cp);
-        cache.put_slot(std::move(older), 4);
-        cache.put_slot(std::move(turn), 4);
+        cache.put_slot(std::move(older), 4, -1);
+        cache.put_slot(std::move(turn), 4, -1);
         check(cache.superseded() == 1 && cache.slot_size() == 2, "a later turn of the same conversation supersedes its copy");
     }
     {   // slot-pin on: the idle slots' conversations count against the byte budget too, and a byte-pressure
@@ -295,7 +295,7 @@ int main() {
         const size_t one = image({1, 2, 3}).bytes();
         ConversationCache cache(one * 3, 8);   // the byte cap holds three; the count cap never bites here
         cache.set_slot_pin(true);
-        cache.put_slot(image({9, 8, 7}), 4);   // parked longest: first out
+        cache.put_slot(image({9, 8, 7}), 4, -1);   // parked longest: first out
         cache.put(image({1, 2, 3}));
         cache.put(image({5, 6, 7}));
         check(cache.size() == 3 && cache.slot_size() == 1 && cache.bytes() == one * 3,
@@ -312,7 +312,7 @@ int main() {
         const size_t one = image({1, 2, 3}).bytes();
         ConversationCache cache(one * 8, 2);   // the count cap bites first
         cache.set_slot_pin(true);
-        cache.put_slot(image({9, 8, 7}), 4);   // an idle entry takes one of the two counted places
+        cache.put_slot(image({9, 8, 7}), 4, -1);   // an idle entry takes one of the two counted places
         check(cache.put(image({1, 2, 3})), "pin on: the second place holds an idle and a budgeted entry");
         check(cache.size() == 2 && cache.slot_size() == 1, "pin on: the idle entry counts against the cap");
         check(cache.put(image({5, 6, 7})), "pin on: the count cap evicts the oldest of either kind");
@@ -325,11 +325,11 @@ int main() {
         ConversationCache cache(one * 3, 8);
         cache.set_slot_pin(true);
         cache.put(image({1, 2, 3}));
-        cache.put_slot(image({9, 8, 7}), 1);   // keep=1: the old cap would already evict the first idle entry
-        cache.put_slot(image({5, 6, 7}), 1);
+        cache.put_slot(image({9, 8, 7}), 1, -1);   // keep=1: the old cap would already evict the first idle entry
+        cache.put_slot(image({5, 6, 7}), 1, -1);
         check(cache.size() == 3 && cache.slot_size() == 2 && cache.bytes() == one * 3 && cache.evictions() == 0,
               "pin on: `keep` no longer evicts while both caps hold");
-        cache.put_slot(image({4, 4, 4}), 1);   // over the byte cap: the longest parked leaves, a budgeted one
+        cache.put_slot(image({4, 4, 4}), 1, -1);   // over the byte cap: the longest parked leaves, a budgeted one
         check(cache.size() == 3 && cache.slot_size() == 3 && cache.bytes() == one * 3 && cache.evictions() == 1 &&
                   cache.best(a, {}, true).tokens == 0 && cache.best(b, {}, true).tokens == 3,
               "pin on: the byte cap evicts the oldest parked of either kind, not by the caller's count");
@@ -338,7 +338,7 @@ int main() {
         const size_t one = image({1, 2, 3}).bytes();
         ConversationCache cache(one * 2, 8);
         cache.set_slot_pin(false);
-        cache.put_slot(image({9, 8, 7}), 4);
+        cache.put_slot(image({9, 8, 7}), 4, -1);
         check(cache.put(image({1, 2, 3})) && cache.put(image({5, 6, 7})),
               "pin off: the budgeted parks fit beside the budget-exempt idle entry");
         check(cache.put(image({7, 7, 7})) && cache.size() == 3 && cache.slot_size() == 1 &&
@@ -354,7 +354,7 @@ int main() {
         cache.put(image({1, 2, 3}));
         cache.retain(kv(one), one);   // optional buffers near the cap: an idle park must count them
         check(cache.retained_bytes() > 0 && cache.bytes() < one * 6, "pin on: retained buffers fit under the cap");
-        cache.put_slot(image({9, 8, 7}), 4);
+        cache.put_slot(image({9, 8, 7}), 4, -1);
         check(cache.retained_bytes() == 0 && cache.slot_size() == 1 && cache.size() == 2 &&
                   cache.bytes() <= one * 6,
               "pin on: an idle park counts the retained buffers and drops them as its first relief");
@@ -367,12 +367,12 @@ int main() {
         const size_t before = cache.evictions();
         auto huge = image({5, 6, 7});
         huge.live.state_a.resize(one * 3);        // over the whole budget on its own
-        check(!cache.put_slot(std::move(huge), 1), "pin on: the oversized idle park answers put()'s refusal");
+        check(!cache.put_slot(std::move(huge), 1, -1), "pin on: the oversized idle park answers put()'s refusal");
         check(cache.size() == 1 && cache.slot_size() == 0 && cache.evictions() == before &&
                   cache.best(a, {}, true).tokens == 3 &&
                   cache.best(std::vector<int64_t>{5, 6, 7, 8}, {}, true).tokens == 0,
               "pin on: the oversized idle park is refused and the cache stays put");
-        check(cache.put_slot(image({9, 8, 7}), 1) && cache.slot_size() == 1,
+        check(cache.put_slot(image({9, 8, 7}), 1, -1) && cache.slot_size() == 1,
               "pin on: an idle park that fits answers true");
     }
     {   // pin on: with the retained K/V in place and the count cap biting, the eviction loop stays a count
@@ -384,10 +384,10 @@ int main() {
         cache.put(image({1, 2, 3}));
         cache.retain(kv(8), 8);
         check(cache.retained_bytes() > 0, "pin on: the retained K/V fits beside the parked entry");
-        cache.put_slot(image({9, 8, 7}), 4);
+        cache.put_slot(image({9, 8, 7}), 4, -1);
         check(cache.size() == 2 && cache.evictions() == 0 && cache.retained_bytes() > 0,
               "pin on: an idle park that fits keeps the retained K/V");
-        cache.put_slot(image({5, 6, 7}), 4);    // the count cap: the oldest leaves, of either kind
+        cache.put_slot(image({5, 6, 7}), 4, -1);    // the count cap: the oldest leaves, of either kind
         check(cache.size() == 2 && cache.slot_size() == 2 && cache.evictions() == 1 &&
                   cache.retained_bytes() > 0 && cache.best(a, {}, true).tokens == 0,
               "pin on: the count cap evicts alone while the bytes fit - the retained K/V stays");
@@ -406,7 +406,7 @@ int main() {
               "pin on: parked and retained together still fit");
         auto park = image({4, 4, 4});
         park.live.state_a.resize(480);          // 492 in all: over the cap with both parked, under it with one evicted
-        cache.put_slot(std::move(park), 4);
+        cache.put_slot(std::move(park), 4, -1);
         check(cache.retained_bytes() == 0 && cache.size() == 2 && cache.slot_size() == 1 &&
                   cache.evictions() == 1 && cache.best(a, {}, true).tokens == 0 &&
                   cache.best(b, {}, true).tokens == 3 && cache.bytes() <= one * 8,
@@ -416,7 +416,7 @@ int main() {
         const size_t one = image({1, 2, 3}).bytes();
         ConversationCache cache(one * 3, 8);
         cache.set_slot_pin(true);
-        cache.put_slot(image({9, 8, 7}), 4);
+        cache.put_slot(image({9, 8, 7}), 4, -1);
         cache.put(image({1, 2, 3}));
         check(cache.bytes() == one * 2 && cache.slot_size() == 1, "toggle: both kinds charged while the pin is on");
         cache.set_slot_pin(false);
@@ -424,7 +424,7 @@ int main() {
         check(cache.size() == 4 && cache.slot_size() == 1 && cache.bytes() == one * 4 &&
                   cache.best(b, {}, true).tokens == 3,
               "toggle off: the idle entry left the budget again and pressure spared it while the total passed the cap");
-        cache.put_slot(image({4, 4, 4}), 1);   // the caller's count caps the idle kind again
+        cache.put_slot(image({4, 4, 4}), 1, -1);   // the caller's count caps the idle kind again
         check(cache.slot_size() == 1 && cache.size() == 4 && cache.best(b, {}, true).tokens == 0,
               "toggle off: keep is back in force and the oldest idle entry leaves");
     }
@@ -434,7 +434,7 @@ int main() {
         ConversationCache cache(one * 4, 2);
         cache.set_slot_pin(true);
         cache.set_spill(true);
-        cache.put_slot(image({9, 8, 7}), 4);
+        cache.put_slot(image({9, 8, 7}), 4, -1);
         cache.put(image({1, 2, 3}));
         const auto taken_ids = cache.best(a, {}, true).index;
         auto taken = cache.take(taken_ids);   // the budgeted one leaves shared accounting
@@ -451,6 +451,65 @@ int main() {
                   cache.slot_size() == 0 && cache.slot_bytes() == 0,
               "pin on: clear gives every kind's counters back");
         check(cache.take_spilled().size() == 2, "pin on: the cleared conversations join the tier below");
+    }
+    {   // pin on: a parked slot copy is ONE per slot - the slot's next turn replaces its copy (the freshest wins),
+        // and a session's own turns cannot crowd another session's parked copy out of the tier
+        // a parked conversation matches a prompt that goes past it (conversation_prefix), so every read below asks
+        // with the conversation plus one token of what would come after it
+        const std::vector<int32_t> p1 = {1, 2, 0}, p2 = {1, 2, 3, 0}, p3 = {1, 2, 3, 4, 0};
+        const std::vector<int32_t> po = {9, 8, 7, 0}, pt = {5, 6, 7, 0};
+        ConversationCache cache(image({1, 2, 3, 4}).bytes() * 8, 3);   // the byte cap holds eight: only the count cap can bite
+        cache.set_slot_pin(true);
+        cache.put_slot(image({1, 2}), 4, 0);
+        cache.put_slot(image({1, 2, 3}), 4, 0);
+        check(cache.slot_size() == 1 && cache.size() == 1 && cache.best(p2, {}, true).tokens == 3 &&
+                  cache.best(p1, {}, true).tokens == 0,
+              "pin on: slot 0's next park REPLACES its copy - the newest contents are there, the older ones gone");
+        cache.put_slot(image({9, 8, 7}), 4, 1);
+        cache.put_slot(image({1, 2, 3, 4}), 4, 0);   // slot 0's turn after that: still its one copy, and the newest one
+        check(cache.slot_size() == 2 && cache.best(p3, {}, true).tokens == 4 && cache.best(p2, {}, true).tokens == 0 &&
+                  cache.best(po, {}, true).tokens == 3,
+              "pin on: every turn of a parked slot keeps that slot's single copy");
+        cache.put_slot(image({5, 6, 7}), 4, 2);   // a third session arrives at the count cap
+        check(cache.slot_size() == 3 && cache.evictions() == 0 && cache.best(pt, {}, true).tokens == 3 &&
+                  cache.best(po, {}, true).tokens == 3 && cache.best(p3, {}, true).tokens == 4,
+              "pin on: the cap counts DISTINCT slots, so the parked turns never relieved anything");
+    }
+    {   // pin on, a FULL tier: the slot's own copy leaves before the caps are counted, so the re-park relieves
+        // nobody - and nothing of it reaches the tier below, which a relieved copy would have spilled
+        const size_t one = image({1, 2, 3}).bytes();
+        ConversationCache cache(one * 8, 2);
+        cache.set_slot_pin(true);
+        cache.set_spill(true);
+        cache.put_slot(image({9, 8, 7}), 4, 0);
+        cache.put_slot(image({5, 6, 7}), 4, 1);
+        const size_t evicted = cache.evictions();
+        cache.put_slot(image({9, 8, 7, 4}), 4, 0);   // full by count: its own copy pays, no other slot's
+        check(cache.evictions() == evicted && cache.slot_size() == 2 && cache.take_spilled().empty() &&
+                  cache.best(std::vector<int32_t>({9, 8, 7, 4, 0}), {}, true).tokens == 4 &&
+                  cache.best(std::vector<int32_t>({5, 6, 7, 0}), {}, true).tokens == 3,
+              "pin on: a same-slot re-park at a full tier evicts nothing - the replace runs before the caps");
+    }
+    {   // the negative control, pin off: the slot identity is inert, the caller's `keep` still caps the parked
+        // kind, and one slot's turns still park as several entries - the upstream behaviour, unchanged
+        const std::vector<int32_t> p2 = {1, 2, 3, 0}, pt = {5, 6, 7, 0};
+        ConversationCache off(0, 4);
+        off.put_slot(image({1, 2}), 4, 0);
+        off.put_slot(image({1, 2, 3}), 4, 0);
+        check(off.slot_size() == 2 && off.size() == 2, "pin off: a slot's turns still park as two entries");
+        off.put_slot(image({5, 6, 7}), 2, 1);   // keep=2: the oldest of the three leaves, identity asked for nothing
+        check(off.slot_size() == 2 && off.best(p2, {}, true).tokens == 3 && off.best(pt, {}, true).tokens == 3,
+              "pin off: the caller's keep rule is unchanged");
+    }
+    {   // pin ON for a park that names no slot (the solo conversation's path): the identity is not asked for, so the
+        // copies of one conversation still pile up - the tier above is all that decides their count
+        const std::vector<int32_t> p2 = {1, 2, 3, 0};
+        ConversationCache cache(image({1, 2, 3, 4}).bytes() * 8, 3);
+        cache.set_slot_pin(true);
+        cache.put_slot(image({1, 2}), 4, -1);
+        cache.put_slot(image({1, 2, 3}), 4, -1);
+        check(cache.slot_size() == 2 && cache.size() == 2 && cache.best(p2, {}, true).tokens == 3,
+              "pin on, no slot named: both copies stay, the identity replaces nothing");
     }
     {
         // layer-split parking: checkpoints moved apart into stage parts and put back, no running state copied

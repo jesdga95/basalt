@@ -211,7 +211,10 @@ Flow Request::restore() {
             // line says it is gone - and the live one stays as it is (a batch slot's request ends in its prompt
             // read, which hands the slot back)
             if ((runtime_.stop_req.load() || runtime_.stdin_lost.load()) && !in_slot && runtime_.admit_slot < 0) {
-                if (incoming && incoming->from_slot && !runtime_.conversations->put_slot(std::move(*incoming), runtime_.bs.size()))
+                // the conversation was taken out of a batch slot: with the pin on, that slot's parked copy is
+                // replaced by this one instead of joining the queue behind it
+                const int back_to = incoming ? incoming->slot : -1;
+                if (incoming && incoming->from_slot && !runtime_.conversations->put_slot(std::move(*incoming), runtime_.bs.size(), back_to))
                     basalt::log::warn("basalt serve", "the stopped request's idle conversation is larger than the "
                                                       "whole RAM cache: it goes back to neither tier");
                 else if (incoming) (void) runtime_.conversations->put(std::move(*incoming));

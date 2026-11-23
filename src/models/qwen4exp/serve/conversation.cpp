@@ -456,7 +456,7 @@ bool QfnRuntime::park_one(int b, std::string& e) {
             }
             image.checkpoints = std::move(cks);
             bytes = image.bytes();
-            if (!conversations->put_slot(std::move(image), bs.size())) {   // the mirrored refusal: an idle image
+            if (!conversations->put_slot(std::move(image), bs.size(), b)) {   // the mirrored refusal: an idle image
                 basalt::log::warn("basalt serve", "%s's idle conversation stays in VRAM: it is larger than the "
                                   "whole RAM cache", who.c_str());          // over the whole budget parks nowhere
                 return false;

@@ -284,6 +284,9 @@ struct SavedConversation {
     bool cvec = true;
     /// an idle batch slot's conversation moved out of VRAM (ConversationCache::put_slot): outside the byte budget
     bool from_slot = false;
+    /// the batch slot this image was parked FROM (put_slot's `slot`), or -1: not a slot park, or parked by `put()`.
+    /// With slot-pin on it is what makes a parked copy one-per-slot: a newer park of the same slot replaces it.
+    int slot = -1;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
 
@@ -419,14 +422,32 @@ public:
     }
 
     /// An idle batch slot's conversation, out of VRAM: kept whatever the byte budget (the caller has admitted its
-    /// RAM), at most `keep` of them; the longest parked leaves first (to the tier below when spilling).
-    /// With slot-pin on (and a budgeted cache) the caller's `keep` is superseded by the two real caps: the park
-    /// takes the longest parked conversations of either kind with it until the count and the bytes fit again -
-    /// the retained K/V counts against the bytes like make_room counts it, and goes first as its first relief.
+    /// RAM), at most `keep` of them, oldest parked first out.  `slot` is the batch slot it comes from, named by every
+    /// caller: -1 when the park comes from no batch slot (the solo conversation's path), and it then joins the parked
+    /// kind without an identity of its own.
+    /// With slot-pin on (and a budgeted cache) the caller's `keep` is superseded by the two real caps, and the slot
+    /// identity rules: this slot's parked copy, if it has one, is REPLACED here - dropped before the caps are
+    /// counted, so a conversation's next turn takes its own copy's place instead of adding to the queue, and a
+    /// re-park of an already full tier relieves nothing.  The park then takes the oldest parked conversations of
+    /// either kind with it until the count and the bytes fit again - the retained K/V counts against the bytes like
+    /// make_room counts it, and goes first as its first relief.
     /// An image over the whole budget is refused the way put() refuses one: the cache stays as it was.
     /// The answer is put()'s channel too: false is that refusal, observable by the caller; true is the parked image.
-    bool put_slot(SavedConversation&& image, size_t keep) {
+    bool put_slot(SavedConversation&& image, size_t keep, int slot) {
         if (slot_pin_ && enabled() && image.bytes() > budget_) return false;   // put()'s refusal, mirrored: nothing evicts to fit
+        if (slot_pin_ && enabled() && slot >= 0) {
+            // One parked copy per slot: THIS slot's copy leaves here, before the caps below are counted, so a
+            // conversation's next turn takes its own copy's place and a full tier relieves no other slot for it.
+            // Like drop_superseded's replacements, and unlike an eviction, the copy it removes is not spilled to the
+            // tier below: the fresher one of the same slot is already in hand.  It counts as neither an eviction nor
+            // a superseded() content match - nothing was relieved, and nothing was matched by content.
+            for (size_t i = 0; i < entries_.size();)
+                if (entries_[i].from_slot && entries_[i].slot == slot) {
+                    SavedConversation gone = std::move(entries_[i]);
+                    entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+                    forget(gone);
+                } else ++i;
+        }
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (slot_pin_ && enabled()) {
             const size_t n = image.bytes();
@@ -437,6 +458,7 @@ public:
                 if (!evict_oldest(true)) break;
         } else while (slot_count_ > 0 && slot_count_ >= keep && evict_oldest(true)) {}
         image.from_slot = true;
+        image.slot = slot;
         const size_t n = image.bytes();
         entries_.push_back(std::move(image));
         bytes_ += n;
@@ -505,6 +527,7 @@ public:
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
         image.from_slot = false;
+        image.slot = -1;   // a budgeted park carries no slot identity, even one taken out of a slot and put back
         entries_.push_back(std::move(image));
         bytes_ += n;
         return true;
@@ -522,7 +545,7 @@ private:
         if (e.from_slot) { slot_bytes_ -= n; --slot_count_; }
     }
     // the oldest entry of one kind (an idle slot's or a budgeted one) leaves; false when there is none.
-    // With slot-pin on the kind is ignored: the longest parked conversation leaves, of either kind.
+    // With slot-pin on the kind is ignored: the oldest parked conversation leaves, of either kind.
     bool evict_oldest(bool from_slot) {
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (!slot_pin_ && entries_[i].from_slot != from_slot) continue;
