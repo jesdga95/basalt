@@ -107,8 +107,9 @@ __device__ __forceinline__ void unpack16_int8(const uint4 u, float scale, float 
         for (int j = 0; j < 4; ++j)
             f[4 * i + j] = (__uint_as_float(__byte_perm(w[i], 0x4b000000u, 0x7650u | j)) - 8388736.f) * scale;
 }
-// 16 INT8 codes times their fp16 scale, rounded to fp16 pairs: the same bits as the fp32 product rounded (the product of a
-// code and an fp16 scale is exact before the one rounding). A code's half is its biased byte under 1024's exponent, less 1152.
+// A code's exact half is its biased byte under 1024's exponent, less 1152. When scaled, the fp16 product has the same
+// bits as the exact fp32 product rounded to fp16.
+template <bool Scaled = true>
 __device__ __forceinline__ void unpack16_int8_h2(const uint4 u, __half2 scale, uint32_t (&h)[8]) {
     const uint32_t w[4] = {u.x ^ 0x80808080u, u.y ^ 0x80808080u, u.z ^ 0x80808080u, u.w ^ 0x80808080u};
     const __half2 bias = __half2half2(__ushort_as_half(0x6480u));   // 1152
@@ -117,7 +118,8 @@ __device__ __forceinline__ void unpack16_int8_h2(const uint4 u, __half2 scale, u
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
             const uint32_t b = __byte_perm(w[i], 0x64646464u, j ? 0x7362u : 0x5140u);
-            const __half2 v = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&b), bias), scale);
+            __half2 v = __hsub2(*reinterpret_cast<const __half2*>(&b), bias);
+            if constexpr (Scaled) v = __hmul2(v, scale);
             h[2 * i + j] = *reinterpret_cast<const uint32_t*>(&v);
         }
 }
@@ -321,6 +323,7 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
 constexpr int kMmaRows = 16;
 constexpr int kMmaLd = kHeadDim + 8;
 constexpr int kMmaPanel = kHeadDim / kWarps;
+constexpr float kMmaProbabilityScale = 0x1p15f;
 
 struct MmaVTile {
     __half row[kTile][kMmaLd];
@@ -376,25 +379,35 @@ constexpr int kMmaKeysPerPass = kWarps * 32 / kMmaPieces;
 constexpr int kMmaPasses = kTile / kMmaKeysPerPass;
 static_assert(kTile % kMmaKeysPerPass == 0);
 
-__device__ __forceinline__ void mma_store_piece(uint4 code, unsigned scales, __half* dst, int piece) {
-    scales = __shfl_sync(0xffffffffu, scales, 0, kMmaPieces);
-    const __half scale = __ushort_as_half((uint16_t) (scales >> (16 * (piece / 4))));
-    uint32_t halves[8];
-    unpack16_int8_h2(code, __half2half2(scale), halves);
+__device__ __forceinline__ void mma_store_halves(__half* dst, const uint32_t (&halves)[8]) {
     *reinterpret_cast<uint4*>(dst) = make_uint4(halves[0], halves[1], halves[2], halves[3]);
     *reinterpret_cast<uint4*>(dst + 8) = make_uint4(halves[4], halves[5], halves[6], halves[7]);
 }
 
-__device__ __forceinline__ void mma_expand(const MmaRawTile& raw, __half (&k)[kTile][kMmaLd], MmaVTile& v, int tid) {
+__device__ __forceinline__ void mma_store_key_piece(uint4 code, uint32_t scales, __half* dst, __half2& ksc, int piece) {
+    uint32_t halves[8];
+    unpack16_int8_h2<false>(code, __half2{}, halves);
+    mma_store_halves(dst, halves);
+    if (piece == 0) ksc = *reinterpret_cast<const __half2*>(&scales);
+}
+
+__device__ __forceinline__ void mma_store_value_piece(uint4 code, unsigned scales, __half* dst, int piece) {
+    scales = __shfl_sync(0xffffffffu, scales, 0, kMmaPieces);
+    const __half scale = __ushort_as_half((uint16_t) (scales >> (16 * (piece / 4))));
+    uint32_t halves[8];
+    unpack16_int8_h2(code, __half2half2(scale), halves);
+    mma_store_halves(dst, halves);
+}
+
+__device__ __forceinline__ void mma_expand(const MmaRawTile& raw, __half (&k)[kTile][kMmaLd], __half2 (&ksc)[kTile],
+                                           MmaVTile& v, int tid) {
     const int piece = tid % kMmaPieces;
 #pragma unroll
-    for (int value = 0; value < 2; ++value) {
-#pragma unroll
-        for (int j = tid / kMmaPieces; j < kTile; j += kMmaKeysPerPass) {
-            const unsigned scales = piece == 0 ? raw.scale[value][j] : 0u;
-            __half* dst = value ? &v.row[j][piece * 16] : &k[j][piece * 16];
-            mma_store_piece(raw.code[value][j][piece], scales, dst, piece);
-        }
+    for (int j = tid / kMmaPieces; j < kTile; j += kMmaKeysPerPass) {
+        const uint32_t key_scales = piece == 0 ? raw.scale[0][j] : 0u;
+        const uint32_t value_scales = piece == 0 ? raw.scale[1][j] : 0u;
+        mma_store_key_piece(raw.code[0][j][piece], key_scales, &k[j][piece * 16], ksc[j], piece);
+        mma_store_value_piece(raw.code[1][j][piece], value_scales, &v.row[j][piece * 16], piece);
     }
 }
 
@@ -426,16 +439,14 @@ __device__ __forceinline__ MmaRegisterTile mma_load_register_tile(const uint8_t*
     return result;
 }
 
-__device__ __forceinline__ void mma_expand(const MmaRegisterTile& raw, __half (&k)[kTile][kMmaLd], MmaVTile& v, int tid) {
+__device__ __forceinline__ void mma_expand(const MmaRegisterTile& raw, __half (&k)[kTile][kMmaLd], __half2 (&ksc)[kTile],
+                                           MmaVTile& v, int tid) {
     const int piece = tid % kMmaPieces;
 #pragma unroll
-    for (int value = 0; value < 2; ++value) {
-#pragma unroll
-        for (int pass = 0; pass < kMmaPasses; ++pass) {
-            const int j = tid / kMmaPieces + pass * kMmaKeysPerPass;
-            __half* dst = value ? &v.row[j][piece * 16] : &k[j][piece * 16];
-            mma_store_piece(raw.code[value][pass], raw.scale[value][pass], dst, piece);
-        }
+    for (int pass = 0; pass < kMmaPasses; ++pass) {
+        const int j = tid / kMmaPieces + pass * kMmaKeysPerPass;
+        mma_store_key_piece(raw.code[0][pass], raw.scale[0][pass], &k[j][piece * 16], ksc[j], piece);
+        mma_store_value_piece(raw.code[1][pass], raw.scale[1][pass], &v.row[j][piece * 16], piece);
     }
 }
 
@@ -443,6 +454,7 @@ template <int Slabs>
 struct alignas(16) MmaSmem {
     __half k[kTile][kMmaLd];
     MmaVTile v;
+    __half2 ksc[kTile];
     float score[Slabs * kMmaRows][kTile + 2];
     __half prob[Slabs * kMmaRows][kTile + 8];
     float m[Slabs * kMmaRows], l[Slabs * kMmaRows], corr[Slabs * kMmaRows];
@@ -503,18 +515,19 @@ __device__ __forceinline__ void attn_mma_slice(const AttnArgs& a, int first, int
         if constexpr (Direct) {
             const MmaRegisterTile current_tile = next;
             if (tile + kTile < hi) next = mma_load_register_tile(kc, vc, tile + kTile, hi, g, a.cap, tid);
-            mma_expand(current_tile, sm.k, v, tid);
+            mma_expand(current_tile, sm.k, sm.ksc, v, tid);
         } else {
             if (!primed || stages > 1 || tile != lo)
                 mma_prefetch(raw[future], kc, vc, tile + (stages - 1) * kTile, hi, g, a.cap, tid);
             mma_wait(stages - 1);
-            // Each thread consumes its own copies; the scale's copying lane broadcasts inside its warp.
-            mma_expand(raw[current], sm.k, v, tid);
+            // Each thread consumes its own copies; the value scale's copying lane broadcasts inside its warp.
+            mma_expand(raw[current], sm.k, sm.ksc, v, tid);
         }
         __syncthreads();
 
-        // QK: one warp owns one or two eight-key columns of its M slab.
-        float scores[n_fragments][4] = {};
+        // Keep QK partials separate for each key's scale groups; combine them in fp32.
+        constexpr int scale_group = kHeadDim / 2;
+        float scores[2][n_fragments][4] = {};
 #pragma unroll
         for (int d = 0; d < kHeadDim; d += 16) {
             const auto& q = q_frag[d / 16];
@@ -522,14 +535,19 @@ __device__ __forceinline__ void attn_mma_slice(const AttnArgs& a, int first, int
             for (int n = 0; n < n_fragments; ++n) {
                 unsigned b0, b1;
                 ldsm_x2(b0, b1, &sm.k[score_n + 8 * n + (lane & 7)][d + ((lane >> 3) & 1) * 8]);
-                mma16816(scores[n], q[0], q[1], q[2], q[3], b0, b1);
+                mma16816(scores[d / scale_group][n], q[0], q[1], q[2], q[3], b0, b1);
             }
         }
 #pragma unroll
         for (int n = 0; n < n_fragments; ++n) {
             const int col = score_n + 8 * n + lane_pair;
-            *reinterpret_cast<float2*>(&sm.score[score_m + lane_row][col]) = make_float2(scores[n][0], scores[n][1]);
-            *reinterpret_cast<float2*>(&sm.score[score_m + lane_row + 8][col]) = make_float2(scores[n][2], scores[n][3]);
+            const float2 key0 = __half22float2(sm.ksc[col]), key1 = __half22float2(sm.ksc[col + 1]);
+            const auto& s0 = scores[0][n];
+            const auto& s1 = scores[1][n];
+            *reinterpret_cast<float2*>(&sm.score[score_m + lane_row][col]) =
+                make_float2(fmaf(s1[0], key0.y, s0[0] * key0.x), fmaf(s1[1], key1.y, s0[1] * key1.x));
+            *reinterpret_cast<float2*>(&sm.score[score_m + lane_row + 8][col]) =
+                make_float2(fmaf(s1[2], key0.y, s0[2] * key0.x), fmaf(s1[3], key1.y, s0[3] * key1.x));
         }
         __syncthreads();
 
@@ -562,7 +580,7 @@ __device__ __forceinline__ void attn_mma_slice(const AttnArgs& a, int first, int
 #pragma unroll
             for (int j = 0; j < kTile / 4; ++j) {
                 const float p = weights[j] == -INFINITY ? 0.f : expf(weights[j] - m);
-                sm.prob[quad][4 * j + member] = __float2half_rn(p);
+                sm.prob[quad][4 * j + member] = __float2half_rn(p * kMmaProbabilityScale);
                 sum += p;
             }
             sum += __shfl_xor_sync(quad_mask, sum, 1);
@@ -618,6 +636,8 @@ __device__ __forceinline__ void attn_mma_slice(const AttnArgs& a, int first, int
     }
     if constexpr (!Direct) mma_wait(0);
 
+    // Undo the PV operand's scale before the shared split merge sees the numerator.
+    constexpr float inv_prob_scale = 1.f / kMmaProbabilityScale;
 #pragma unroll
     for (int slab = 0; slab < Slabs; ++slab)
 #pragma unroll
@@ -630,7 +650,8 @@ __device__ __forceinline__ void attn_mma_slice(const AttnArgs& a, int first, int
             for (int n = 0; n < kMmaPanel / 8; ++n) {
                 const int col = warp * kMmaPanel + n * 8 + lane_pair;
                 *reinterpret_cast<float2*>(part_acc + slot * kHeadDim + col) =
-                    make_float2(acc[slab][n][2 * pair], acc[slab][n][2 * pair + 1]);
+                    make_float2(acc[slab][n][2 * pair] * inv_prob_scale,
+                                acc[slab][n][2 * pair + 1] * inv_prob_scale);
             }
             if (warp == 0 && lane_pair == 0) {
                 part_ml[slot * 2] = sm.m[m];
