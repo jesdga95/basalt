@@ -9,7 +9,6 @@ int dispatch(Context& context) {
     auto& ppl_base = *context.ppl_base;
     auto& ppl_out = *context.ppl_out;
     auto& model_file = *context.model_file;
-    auto& peer_streamed_share = *context.peer_streamed_share;
     auto& split_at = *context.split_at;
     auto& split_devs = *context.split_devs;
     auto& split_same = *context.split_same;
@@ -69,9 +68,9 @@ int dispatch(Context& context) {
     auto& split_hand_rows = *context.split_hand_rows;
     auto& split_chunk_cap = *context.split_chunk_cap;
     auto& split_peer_rows = *context.split_peer_rows;
-    auto& split_price = context.split_price;
+    auto& split_part = context.split_part;
     auto& split_layers_text = context.split_layers_text;
-    auto& split_stages_text = context.split_stages_text;
+    auto& split_cuts = *context.split_cuts;
     auto& split_stages = *context.split_stages;
 
     // Where the routed experts live, fastest tier first, and a warning when any of them is only in the file (decode
@@ -116,10 +115,38 @@ int dispatch(Context& context) {
                      pct(b_ram + b_top), (double) b_file / kGiB, pct(b_file), total / kGiB);
         std::string levers = ", or a smaller quant";
         if (!o.resident_cpu_experts) levers += ", --resident-experts";
-        if (o.peer_device < 1) levers += ", --gpu 0,1";
+        if (o.peer_device < 1) levers += ", gpu 0,1 with gpu-mode peer";
         if (o.batch > 1) levers += ", fewer --parallel slots";
         basalt::program::warn_spill(tier_spill, levers);
     };
+    if (o.gpus.cards.size() > 1) {   // the start line after the load: each card's part
+        std::vector<std::string> parts(o.gpus.cards.size());
+        auto experts = [&](int64_t n, double gib) {
+            char b[64];
+            std::snprintf(b, sizeof b, "%lld experts (%.1f GiB)", (long long) n, gib);
+            return std::string(b);
+        };
+        if (multi_gpu) {
+            parts[0] = "layers 0-" + std::to_string(split_at.empty() ? g.n_layers - 1 : split_at[0] - 1) + ", " +
+                       experts(xcache.slots(), xcache.gib());
+            for (const auto& st : stages)
+                for (size_t c = 1; c < o.gpus.cards.size(); ++c)
+                    if (o.gpus.cards[c].device == st->dev)
+                        parts[c] = "layers " + std::to_string(st->lb) + "-" + std::to_string(st->le - 1) + ", " +
+                                   experts(st->cache.slots(), st->cache.gib());
+        } else {
+            parts[0] = "dense, KV, " + experts(xcache.slots(), xcache.gib());
+            for (size_t i = 0; i < o.peer_devices.size(); ++i) {
+                const basalt::core::PeerExperts& t = i == 0 ? peer : *xpeers[i - 1];
+                std::string part = t.valid() ? experts(t.resident(), t.gib()) : "no experts";
+                for (const auto& st : pstages)
+                    if (split_stages > 0 && st->tier_at == i)
+                        part += ", prompt layers " + std::to_string(st->lo) + "-" + std::to_string(st->hi - 1);
+                parts[i + 1] = part;
+            }
+        }
+        basalt::log::info("basalt", "%s", basalt::model::gpu_parts_line(o.gpus, parts).c_str());
+    }
     if (!o.serve) report_expert_tiers();
     if (o.serve) {
         basalt::models::qwen4exp::serve::Context context{
@@ -127,7 +154,6 @@ int dispatch(Context& context) {
             .ppl_base = ppl_base,
             .ppl_out = ppl_out,
             .model_file = model_file,
-            .peer_streamed_share = peer_streamed_share,
             .split_at = split_at,
             .split_devs = split_devs,
             .split_same = split_same,
@@ -186,9 +212,9 @@ int dispatch(Context& context) {
             .split_hand_rows = split_hand_rows,
             .split_chunk_cap = split_chunk_cap,
             .split_peer_rows = split_peer_rows,
-            .split_price = split_price,
+            .split_part = split_part,
             .split_layers_text = split_layers_text,
-            .split_stages_text = split_stages_text,
+            .split_cuts = split_cuts,
             .split_stages = split_stages,
             .tier_spill = tier_spill,
             .report_expert_tiers = report_expert_tiers,

@@ -1,6 +1,8 @@
 #include "gpu.hpp"
 
+#include "basalt/core/card_link.hpp"
 #include "basalt/log.hpp"
+#include "basalt/model/multi_gpu.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/program/options.hpp"
@@ -46,21 +48,22 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
                            seen, choice.cards.size());
         return 2;
     }
-    o.card_mode = choice.mode;
-    bp::RoleInputs ri;
-    for (int i : choice.cards) ri.cards.push_back((size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{});
-    ri.mode = choice.mode;
-    ri.prompt_split = adapter != nullptr && adapter->second_card_reads_prompts();
-    const std::vector<bp::GpuRole> roles = bp::choose_roles(ri);
-    std::string line;
-    for (size_t d = 0; d < roles.size(); ++d) {
-        const bp::GpuCard& c = ri.cards[d];
-        line += std::string(d ? ", " : "") + (c.name.empty() ? "GPU" : c.name) +
-                (c.smi >= 0 ? " (nvidia-smi " + std::to_string(c.smi) + ")" : "") + " " + bp::gpu_role_name(roles[d]);
-        if (roles[d] != bp::GpuRole::Main) {
-            o.peer_devices.push_back((int) d);
-            o.peer_gbps.push_back(c.mem_gbps);
-        }
+    // the cards the load receives: with several, each one's free memory before anything is loaded; the shares as given
+    basalt::model::GpuCards& gc = o.gpus;
+    gc = {};
+    gc.mode = choice.mode;
+    gc.given = choice.shares;
+    gc.diag_cut = o.diag_gpu_cut;
+    for (size_t d = 0; d < choice.cards.size(); ++d) {
+        const int i = choice.cards[d];
+        basalt::model::GpuCards::Card c;
+        c.device = (int) d;
+        c.info = (size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{};
+        c.index = i;
+        c.label = bp::gpu_label(visible, i);
+        if (choice.cards.size() > 1) c.free = basalt::core::card_free_bytes((int) d);   // (one card: no context made here)
+        gc.cards.push_back(c);
+        chosen_cards.push_back(c.info);
     }
     int drv = 0, rt = 0;
     (void) cudaDriverGetVersion(&drv);
@@ -68,30 +71,12 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     basalt::log::info("basalt", "system: %s, CUDA driver %d.%d / runtime %d.%d",
                       basalt::platform::host_os_name().c_str(),
                       drv / 1000, (drv % 1000) / 10, rt / 1000, (rt % 1000) / 10);
-    basalt::log::info("basalt", "gpus: %s", line.c_str());
-    if (!o.peer_devices.empty()) o.peer_device = o.peer_devices[0];
-    if (!ri.cards.empty()) o.main_gbps = ri.cards[0].mem_gbps;
-    chosen_cards = ri.cards;
-    // The split hands a window's activations from one card to the next, and a tier card reads its experts d2d: both
-    // want peer access, which every pair must opt into once per process.  A pair the driver refuses is left alone and
-    // the copy goes the long way.
-    if (chosen_cards.size() > 1) {
-        int pairs = 0, tried = 0, prev = 0;
-        cudaGetDevice(&prev);
-        for (int a = 0; a < (int) chosen_cards.size(); ++a)
-            for (int b = 0; b < (int) chosen_cards.size(); ++b) {
-                int can = 0;
-                if (a == b || cudaDeviceCanAccessPeer(&can, a, b) != cudaSuccess || !can) {
-                    (void) cudaGetLastError();
-                    continue;
-                }
-                ++tried;
-                if (cudaSetDevice(a) != cudaSuccess) { (void) cudaGetLastError(); continue; }
-                const cudaError_t e = cudaDeviceEnablePeerAccess(b, 0);
-                if (e == cudaSuccess || e == cudaErrorPeerAccessAlreadyEnabled) ++pairs;
-                (void) cudaGetLastError();
-            }
-        (void) cudaSetDevice(prev);
+    basalt::log::info("basalt", "%s", basalt::model::gpu_start_line(gc).c_str());
+    // a split hands a window's activations from one card to the next and a peer reads its experts device to device: both
+    // want peer access, which every pair opts into once per process
+    if (gc.cards.size() > 1) {
+        int tried = 0;
+        const int pairs = basalt::core::enable_peer_access((int) gc.cards.size(), tried);
         if (tried > 0) basalt::log::info("basalt", "peer access: %d of %d ordered pairs enabled", pairs, tried);
     }
     return std::nullopt;

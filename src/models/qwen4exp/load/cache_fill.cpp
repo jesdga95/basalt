@@ -74,8 +74,8 @@ int cache_fill(Context& context) {
         return room;
     };
     // each tier's room for experts: its card's, shared by the tiers the card holds
-    auto peer_tier_rooms = [&]() -> std::vector<basalt::program::TierRoom> {
-        std::vector<basalt::program::TierRoom> rooms(o.peer_devices.size());
+    auto peer_tier_rooms = [&]() -> std::vector<uint64_t> {
+        std::vector<uint64_t> rooms(o.peer_devices.size(), 0);
         int cur = 0, count = 0;
         if (cudaGetDevice(&cur) != cudaSuccess || cudaGetDeviceCount(&count) != cudaSuccess) {
             (void) cudaGetLastError();
@@ -84,8 +84,7 @@ int cache_fill(Context& context) {
         for (size_t i = 0; i < rooms.size(); ++i) {
             const int dev = o.peer_devices[i];
             const uint64_t share = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
-            rooms[i].bytes = dev < count ? card_room(dev, cur) / share : 0;
-            rooms[i].gbps = i < o.peer_gbps.size() ? o.peer_gbps[i] : 0;
+            rooms[i] = dev < count ? card_room(dev, cur) / share : 0;
         }
         (void) cudaSetDevice(cur);
         (void) cudaGetLastError();

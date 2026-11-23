@@ -8,6 +8,7 @@
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/model/multi_gpu.hpp"
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/model/route_flags.hpp"
 #include "basalt/program/gpu_select.hpp"
@@ -82,8 +83,7 @@ struct LoadRequest {
     std::string diag_dump;            ///< diagnostic: directory for per-layer tensor dumps (empty = off)
     int diag_tier_ram = -1;           ///< diagnostic: fixed RAM-tier experts per layer (-1 = sized from free memory)
     int diag_tier_vram = -1;          ///< diagnostic: fixed VRAM-tier experts per layer (-1 = sized from free memory)
-    std::vector<int> peer_devices;    ///< CUDA devices of the expert tier cards after the main one
-    program::GpuMode gpu_mode = program::GpuMode::One;   ///< what the cards do together (--gpu-mode)
+    GpuCards gpus;                    ///< the cards, main first, their mode and shares (multi_gpu.hpp)
     int64_t max_context = 0;          ///< --max-context, or the default every model shares
     int sessions = 1;                 ///< sessions the model will be asked for (--batch)
     bool vision = false;              ///< --vision: requests may carry images (each slot keeps buffers for one)
@@ -106,9 +106,7 @@ struct LoadRequest {
     RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
     RouteFlags route;                 ///< the lossy routing flags, for a model that takes them (route_flags.hpp)
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
-    std::vector<double> card_gbps;    ///< memory bandwidth of the main card, then of each peer device (GB/s, 0: unknown)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
-    int diag_split_at = 0;            ///< diagnostic: a model's layers split at this one across two cards (0: off)
 };
 
 struct DecodeRequest {
@@ -300,6 +298,9 @@ public:
     /// Once every queued byte has landed: the model connects what the reads filled (prompt stages, copies made from the
     /// weights, checks of what was placed) and makes its sessions if plan() did not; they are then ready to run.
     virtual Result attach(const LoadRequest& req, std::vector<std::unique_ptr<ModelSession>>& sessions) = 0;
+    /// Card `card`'s part of a several-card run once loaded (0 = the main card), for the start line after the load
+    /// (model/multi_gpu.hpp gpu_parts_line); empty: nothing to say.
+    virtual std::string gpu_report(int card) const { (void) card; return {}; }
 };
 
 /// A started model and its sessions.
@@ -359,8 +360,6 @@ public:
     virtual int quality_window() const { return 1; }
     /// What the model runs with several cards: the most cards each mode takes, 0 for a mode it does not run.
     virtual program::GpuModes gpu_modes() const = 0;
-    /// A model with no experts to put on a second card reads long prompts there instead (a one-stage prompt split, not an expert tier).
-    virtual bool second_card_reads_prompts() const { return false; }
     virtual TokenNames token_names() const = 0;
     /// The pre-tokenizer's name in the pack's tokenizer.json and its rule. `ignore_merges`: a piece that is itself a
     /// vocabulary entry is that token, not merged from its bytes (Hugging Face BPE's ignore_merges; llama.cpp ties it to

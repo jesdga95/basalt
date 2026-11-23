@@ -132,7 +132,7 @@ int sessions(Context& context) {
         st.pcie_frac = o.pcie_frac;
         {
             std::string bursts;
-            const double bw = probe_pcie_h2d_gbps(&bursts);
+            const double bw = basalt::core::probe_h2d_gbps(&bursts);
             if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
             basalt::log::info("basalt generate", "layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
                                  "%.2f", st.dev, bw, bursts.c_str(), st.pcie_frac);

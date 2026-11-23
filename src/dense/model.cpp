@@ -359,25 +359,23 @@ uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd) {
            64 * 256;
 }
 
-SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
-                         uint64_t main_weights, SplitCard main_card, SplitCard peer_card) {
-    SplitInputs in;
+model::SplitSpec split_spec(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
+                            uint64_t main_weights) {
+    model::SplitSpec s;
     const bool mtp = o.drafter == Drafter::Mtp;
-    in.layer = layer_weights;
-    in.slots = std::max(o.sessions, 1);
+    const uint64_t slots = (uint64_t) std::max(o.sessions, 1);
     uint64_t layers = 0;
     for (int il = 0; il < g.n_layers; ++il) {
-        in.per_slot.push_back(session_layer_bytes(g, il, o.max_context, o.kv_format(), o.kv_resident));
-        layers += in.per_slot.back();
+        const uint64_t per_slot = session_layer_bytes(g, il, o.max_context, o.kv_format(), o.kv_resident);
+        s.layer.push_back((il < (int) layer_weights.size() ? layer_weights[(size_t) il] : 0) + slots * per_slot);
+        layers += per_slot;
     }
     const uint64_t slot_rest = session_bytes(g, o.max_context, mtp, o.kv_format(), o.kv_resident) - layers +
                                (o.drafter == Drafter::Block ? block_session_bytes(g, bd) : 0);
     const uint64_t scratch = shared_bytes(g, o.max_context, o.kv_format(), o.kv_resident);
-    in.main_fixed = main_weights + scratch + (uint64_t) in.slots * slot_rest + stage_main_bytes(g, bd);
-    in.peer_fixed = scratch + 2ull * kChunk * g.n_embd * 2;   // its own scratch and the landing residuals
-    in.main = main_card;
-    in.peer = peer_card;
-    return in;
+    s.fixed = {main_weights + scratch + slots * slot_rest + stage_main_bytes(g, bd),
+               scratch + 2ull * kChunk * g.n_embd * 2};   // the second card: its own scratch and the landing residuals
+    return s;
 }
 
 Model::~Model() {

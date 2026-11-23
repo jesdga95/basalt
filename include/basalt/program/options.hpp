@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/model/multi_gpu.hpp"
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/model/route_flags.hpp"
 #include "basalt/platform/memory.hpp"
@@ -41,14 +42,7 @@ struct CommonOptions {
     /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
     /// CPU pool (the model's hit kernel).
     int expert_cache = 0;
-    /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
-    /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
-    /// (-1 = adapt_swaps).
-    int peer_device = -1;
-    /// every expert tier's device, the first one peer_device, and each card's memory bandwidth (GB/s, 0 unknown)
-    std::vector<int> peer_devices;
-    std::vector<double> peer_gbps;
-    double main_gbps = 0;         ///< the main card's memory bandwidth (GB/s, 0 unknown)
+    /// Multi-GPU: the VRAM a card after the main one leaves free
     int peer_reserve_mib = 600;
     bool no_prompt_skip = false;  ///< --no-prompt-skip: every prompt row through every layer
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
@@ -59,9 +53,9 @@ struct CommonOptions {
     /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
     /// VRAM), for the models that take it
     int64_t kv_resident = 0;
-    /// --diag-split-at N: diagnostic, a model split across two cards at layer N whatever the start would pick (0: off)
     int diag_rows = 0;
-    int diag_split_at = 0;
+    /// --diag-gpu-cut N: diagnostic, a two-card split's second card from layer N on, whatever the shares give (0: off)
+    int diag_gpu_cut = 0;
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
     /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.
@@ -88,7 +82,7 @@ struct CommonOptions {
     /// --gpu, --gpu-mode, --gpu-share: the cards this run uses, what they do together and their shares (gpu_select.hpp);
     /// empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
     std::string gpu, gpu_mode, gpu_share;
-    GpuMode card_mode = GpuMode::One;   ///< the mode the run's cards were chosen for, set with them
+    basalt::model::GpuCards gpus;      ///< the cards chosen, main first, with their mode and shares (set by cli::select_gpus)
     bool gpu_plan = false;
     std::string arch;                  ///< the --model file's architecture
     std::string ppl_base, ppl_out;     ///< --ppl-base, --ppl-out

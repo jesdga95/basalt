@@ -54,16 +54,6 @@ static std::string cards(const GpuChoice& c) {
     return s;
 }
 
-static std::string roles(const std::vector<GpuCard>& v, const GpuChoice& c, bool prompt_split = false) {
-    RoleInputs in;
-    for (int i : c.cards) in.cards.push_back(v[(size_t) i]);
-    in.mode = c.mode;
-    in.prompt_split = prompt_split;
-    std::string s;
-    for (GpuRole r : choose_roles(in)) s += (s.empty() ? "" : ",") + std::string(gpu_role_name(r));
-    return s;
-}
-
 int main() {
     // Parsing: a number, a list, all; any other word (the removed "auto" too) gets the one error.
     {
@@ -102,10 +92,6 @@ int main() {
         c = pick("0,1", v, "peer");
         CHECK_STR(cards(c), "0,1");
         CHECK(c.warning.empty() && c.error.empty() && c.mode == GpuMode::Peer && c.shares.empty());
-        CHECK_STR(roles(v, c), "main,expert tier");
-        CHECK_STR(roles(v, c, true), "main,prompt split");
-        CHECK_STR(roles(v, pick("0,1", v, "split")), "main,layer stage");
-        CHECK_STR(roles(v, pick("0,1", v, "split"), true), "main,layer stage");
         CHECK_STR(cards(pick("1,0", v, "split")), "1,0");
         CHECK_STR(cards(pick("0,1", v, "tensor")), "0,1");
         CHECK_STR(cards(pick("1", v)), "1");
@@ -284,42 +270,6 @@ int main() {
         CHECK(visible_gpus(known).empty() && known);
     }
     CHECK_STR(gpu_identity(3), "0,1,2");
-    // Expert placement over several tiers: equal cards alternate; bandwidth sets the share of the hot experts; a
-    // smaller card closes first and the others take the rest; a single tier takes the ranking in order.
-    {
-        const std::vector<uint64_t> eq(8, 10);
-        auto owners = [](const std::vector<int>& o) {
-            std::string s;
-            for (int x : o) s += x < 0 ? std::string("-") : std::to_string(x);
-            return s;
-        };
-        CHECK_STR(owners(spread_experts(eq, {{40, 448}, {40, 448}})), "01010101");
-        CHECK_STR(owners(spread_experts(eq, {{80, 1792}, {80, 896}})), "01001001");
-        CHECK_STR(owners(spread_experts(eq, {{20, 1792}, {100, 448}})), "01011111");
-        CHECK_STR(owners(spread_experts(eq, {{30, 448}})), "000-----");
-        CHECK_STR(owners(spread_experts(eq, {{0, 448}, {30, 448}})), "111-----");
-        // three and four tiers of mixed sizes and bandwidths: every expert placed while room lasts, none twice
-        const std::vector<uint64_t> mixed = {12, 12, 12, 8, 8, 8, 8, 8, 8, 8, 8, 8};
-        const std::vector<int> o3 = spread_experts(mixed, {{30, 1792}, {20, 896}, {60, 448}});
-        CHECK_STR(owners(o3), "012001222222");
-        const std::vector<int> o4 = spread_experts(mixed, {{16, 448}, {16, 448}, {16, 448}, {200, 1792}});
-        CHECK_STR(owners(o4), "012333333333");
-        CHECK_STR(owners(spread_experts(eq, {{0, 1}, {0, 1}, {0, 1}})), "--------");
-        // the tiers that hold something: none when no expert is outside the main card or no tier has room, and a tier
-        // without room is left out beside tiers that have it
-        auto holding = [](const std::vector<size_t>& v) {
-            std::string s;
-            for (size_t x : v) s += std::to_string(x);
-            return s.empty() ? std::string("-") : s;
-        };
-        CHECK_STR(holding(tiers_holding({}, {{40, 448}})), "-");
-        CHECK_STR(holding(tiers_holding({}, {{40, 448}, {40, 448}, {40, 448}})), "-");
-        CHECK_STR(holding(tiers_holding(eq, {{5, 448}})), "-");
-        CHECK_STR(holding(tiers_holding(eq, {{40, 448}})), "0");
-        CHECK_STR(holding(tiers_holding(eq, {{40, 448}, {0, 448}, {40, 448}})), "02");
-        CHECK_STR(holding(tiers_holding(eq, {{0, 448}, {0, 448}})), "-");
-        CHECK_STR(holding(tiers_holding(eq, {{10, 448}, {40, 448}})), "01");
-    }
     if (g_fail) { std::printf("gpu_select_test: %d failures\n", g_fail); return 1; }
     std::printf("gpu_select_test: ok\n");
     return 0;

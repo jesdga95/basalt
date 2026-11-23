@@ -60,37 +60,18 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     const basalt::core::PackFiles pack_files = basalt::core::PackFiles::from(srcs);
     const basalt::core::ExpertFiles expert_files = basalt::core::ExpertFiles::from(srcs);
     // ---- two or more cards: what they do together is the user's gpu-mode (one card: nothing to choose, and no other card is
-    // touched). Peer keeps the expert tier the cards were given; split runs the layer split over them instead.
-    if (chosen_cards.size() >= 2 && o.card_mode == basalt::program::GpuMode::Split) {
-        if (o.layer_split.empty()) o.layer_split = "auto";
-        o.peer_devices.clear();
-        o.peer_device = -1;
+    // touched). Peer: the cards after the main one hold the expert tier and read prompt stages; split: they run the later
+    // layers, cut by the shares once the weights' sizes are known (layer_plan).
+    const bool split_mode = o.gpus.mode == basalt::program::GpuMode::Split;
+    if (o.gpus.mode == basalt::program::GpuMode::Peer) {
+        o.peer_devices = o.gpus.peers();
+        o.peer_device = o.peer_devices.front();
     }
-    // the peer card takes expert rows of a long prompt chunk only when it is as fast as the main one: a slower card costs the
-    // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps
-    const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
-    // the prompt-time layer split over the expert tier cards (PromptStage), and the most stages it may use, the main
-    // card's included: every card on two cards or on three or more alike ones, none on three or more unlike cards
-    // until measured on such a set.  With --batch a read splits only while no slot decodes.
+    // the prompt-time layer split over the expert tier cards (PromptStage), every card a stage; with --batch a read splits
+    // only while no slot decodes
     bool split_want = o.serve && o.peer_device >= 1;
-    bool split_alike = true;
-    for (size_t i = 1; i < chosen_cards.size(); ++i)
-        split_alike = split_alike && basalt::program::cards_alike(chosen_cards[0], chosen_cards[i]);
-    int split_cap = 0;
-    auto set_split_cap = [&]() { split_cap = o.peer_devices.size() <= 1 ? 2 : split_alike ? (int) o.peer_devices.size() + 1 : 1; };
-    set_split_cap();
     basalt::core::PeerExperts::set_min_scratch((size_t) basalt::kernels::moe_hit_grouped_scratch_bytes(basalt::kernels::cpu::MAXT * 10, basalt::kernels::cpu::H, basalt::kernels::cpu::FF));
-    basalt::core::set_peer_portable(o.peer_device >= 1 || !o.layer_split.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
-    // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
-    // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
-    // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
-    // peer-only experts, staged through the host, so streaming loses until later.
-    auto set_stream_all_min = [&]() {
-        basalt::prefill::Prefill::set_stream_all_min(
-            o.serve && o.peer_device >= 1 && !o.no_peer_prefill && peer_streamed_share
-                ? (o.peer_exclusive ? 4096 : 2560) : basalt::prefill::Prefill::kStreamAllMinDefault);
-    };
-    set_stream_all_min();
+    basalt::core::set_peer_portable(o.peer_device >= 1 || split_mode);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     if (o.serve && o.conversation_cache_disk_mib > 0 && o.conversation_cache_dir.empty()) {
         basalt::log::error("basalt", "--conversation-cache-disk-mib needs --conversation-cache-dir");
         return 2;
@@ -98,62 +79,19 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         basalt::log::warn("basalt serve", "conversation caching is disabled by %s",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
-    // parking with --layer-split saves every stage (SavedConversation::stage_images)
-    // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
-    // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
-    // streaming and images (the server's GPU encoder) run across a split, also with parking and --batch.  Across
-    // GPUs, not supported: lending cache slots to the prompt path (each stage's prompt path has its own buffers).
+    // Layer split (gpu-mode split): the later stages run layers [K_i, K_i+1) on the cards after the main one, the K cut by the
+    // shares once the weights are sized (layer_plan).  KV streaming and images (the server's GPU encoder) run across a split,
+    // also with parking and --batch.  Across GPUs, not supported: lending cache slots to the prompt path (each stage's prompt
+    // path has its own buffers).  Parking saves every stage (SavedConversation::stage_images).
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
-    bool split_auto = false, split_same = false;
-    if (!o.layer_split.empty()) {
-        int n_dev = 1;
-        if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) n_dev = 1;
-        cudaGetLastError();
-        auto ints = [](const std::string& str, auto& out) -> bool {
-            using V = typename std::decay_t<decltype(out)>::value_type;
-            size_t a = 0;
-            while (a < str.size()) {
-                size_t b = str.find(',', a);
-                if (b == std::string::npos) b = str.size();
-                const std::string t = str.substr(a, b - a);
-                if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos) return false;
-                out.push_back((V) std::atoll(t.c_str()));
-                a = b + 1;
-            }
-            return !out.empty();
-        };
-        split_auto = o.layer_split == "auto";
-        bool ok = o.serve && (split_auto || ints(o.layer_split, split_at));
-        if (ok && !o.split_device.empty()) ok = ints(o.split_device, split_devs);
-        else if (ok)
-            for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d) split_devs.push_back(d);
-        if (ok && !split_auto && split_devs.empty() && split_at.size() == 1) split_devs.push_back(0);   // one GPU
-        split_same = ok && split_devs.size() == 1 && split_devs[0] == 0 && !split_auto;
-        if (split_same && o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0) {
-            basalt::log::error("basalt serve", "conversation parking does not support a layer split on one GPU "
-                                 "(--split-device 0); disable parking with --conversation-cache-mib 0");
+    bool split_same = false;   // both stages on one GPU, sharing everything: the hand-off's bit-exact A/B (no flag sets it)
+    if (split_mode) {
+        if (!o.serve) {
+            basalt::log::error("basalt generate", "gpu-mode split runs Qwen3.8-Flash-Next with --serve");
             return 2;
         }
-        if (ok && split_auto && split_devs.empty()) {
-            basalt::log::info("basalt generate", "--layer-split auto: one GPU visible, so no split");
-            o.layer_split.clear();
-            split_auto = false;
-        } else if (ok) {
-            ok = (split_auto || split_at.size() == split_devs.size()) && split_devs.size() < (size_t) SplitDrive::kMax;
-            for (size_t i = 0; ok && i < split_at.size(); ++i) ok = split_at[i] >= 2 && (i == 0 || split_at[i] > split_at[i - 1]);
-            for (size_t i = 0; ok && !split_same && i < split_devs.size(); ++i) {
-                ok = split_devs[i] > 0 && split_devs[i] < n_dev;
-                for (size_t j = 0; ok && j < i; ++j) ok = split_devs[i] != split_devs[j];
-            }
-        }
-        if (!ok) {
-            basalt::log::error("basalt generate", "--layer-split K[,K2..]|auto needs --serve, rising K from 2, and one "
-                                 "distinct GPU per K in --split-device (1..%d; or 0 with one K: the same GPU). K is the "
-                                 "FIRST LAYER of each later GPU, not a count of layers per card: \"24,36,42\" for 4 "
-                                 "GPUs, not \"24,12,6,6\" (got \"%s\")", n_dev - 1, o.layer_split.c_str());
-            return 2;
-        }
+        split_devs = o.gpus.peers();
     }
     bool multi_gpu = !split_devs.empty() && !split_same;
     // two stages with the drafter and one conversation at a time pipeline their windows: a second chain of verifiers over
@@ -173,8 +111,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
         // costs a stage nothing permanent.
         std::string devs;
         for (const int d : split_devs) devs += (devs.empty() ? "" : ",") + std::to_string(d);
-        basalt::log::info("basalt generate", "layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)",
-                     split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
+        basalt::log::info("basalt generate", "layer split across %zu GPUs: CUDA0, then CUDA%s", split_devs.size() + 1, devs.c_str());
     }
     if (const auto code = cli::prepare_input_options(o)) return *code;
     basalt::core::qsa_set_kv_int8(o.kv == "int8");
@@ -277,11 +214,11 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // The PCIe share of the missed experts.  The GPU's SMs read that share over the link (the copy kernel), so on a
     // slower link it must shrink or the window waits for it.  The real H2D bandwidth is probed once; from 20 GB/s up
     // the default stays.
-    double main_link_gbps = 0;   // the probed host->device bandwidth (the prompt-time split's price reads it)
+    double main_link_gbps = 0;   // the probed host->device bandwidth
     if (o.pcie_frac < 0.0) {
         const double base = 0.55;
         std::string bursts;
-        const double bw = probe_pcie_h2d_gbps(&bursts);
+        const double bw = basalt::core::probe_h2d_gbps(&bursts);
         main_link_gbps = bw;
         if (bw > 0.0) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
@@ -305,14 +242,9 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     context.model_file = &model_file;
     context.pack_files = &pack_files;
     context.expert_files = &expert_files;
-    context.peer_streamed_share = &peer_streamed_share;
     context.split_want = &split_want;
-    context.split_cap = &split_cap;
-    context.set_split_cap = set_split_cap;
-    context.set_stream_all_min = set_stream_all_min;
     context.split_at = &split_at;
     context.split_devs = &split_devs;
-    context.split_auto = &split_auto;
     context.split_same = &split_same;
     context.multi_gpu = &multi_gpu;
     context.pipe_want = &pipe_want;

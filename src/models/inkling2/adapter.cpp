@@ -55,10 +55,6 @@ public:
             o.kv = args.next("--kv");
             return true;
         }
-        if (a == "--diag-split-at") {   // diagnostic: the layer split forced, the second card from this layer on
-            o.diag_split_at = std::atoi(args.next("--diag-split-at"));
-            return true;
-        }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK
     }
 

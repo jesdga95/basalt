@@ -38,6 +38,7 @@ public:
     model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override;
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_; }
+    std::string gpu_report(int card) const override;
 
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }
@@ -93,6 +94,7 @@ private:
     mutable model::BatchShared batch_;
     mutable std::shared_ptr<void> scratch_;
     std::vector<int> peer_devices_;
+    model::GpuCards gpus_;                    ///< the cards the load received
     model::LoadRequest flags_;
     std::string path_;
     std::vector<uint8_t> embd_;

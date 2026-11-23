@@ -40,7 +40,6 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/program/image_loan.hpp"
-#include "basalt/program/multi_gpu_plan.hpp"
 #include "basalt/program/tokenizer.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/kernels/ngram.hpp"

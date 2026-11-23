@@ -1,4 +1,5 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
+#include "basalt/model/multi_gpu.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/expert_tier.hpp"
@@ -131,6 +132,8 @@ core::ExpertTierSpec DsModel::tier_spec() const {
     s.fd = experts_fd();
     s.range = pack_.experts_range;
     s.peer_devices = peer_devices_;
+    if (!gpus_.given.empty()) s.peer_shares = model::peer_shares(gpus_, model::ShareUse::Experts);
+    s.refuse_peer = [g = gpus_](size_t card, const std::string& why) { return model::peer_holds_nothing(g, card, why); };
     s.diag_tier_ram = diag_tier_ram_;
     s.diag_tier_vram = diag_tier_vram_;
     s.diag_tier_frozen = tiers_.diag_tier_frozen;
@@ -255,7 +258,8 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
     set_diag_dump(req.diag_dump);
     set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
     set_tiers(req);
-    std::vector<int> peers = req.peer_devices;
+    gpus_ = req.gpus;
+    std::vector<int> peers = req.gpus.peers();
     // The peer-tier kernels of this architecture are built for sm_120 only: refuse an older
     // peer card here rather than failing at its first launch with 'no kernel image'.
     for (int dev : peers) {
@@ -283,6 +287,10 @@ model::Result DsModel::attach(const model::LoadRequest&, std::vector<std::unique
     std::string err;
     if (shared_tier_.tier && !shared_tier_.tier->attach(err)) return {model::Status::Error, err};
     return {};
+}
+
+std::string DsModel::gpu_report(int card) const {
+    return shared_tier_.tier ? shared_tier_.tier->card_report((size_t) card) : std::string();
 }
 
 }  // namespace basalt::models::deepseek41
