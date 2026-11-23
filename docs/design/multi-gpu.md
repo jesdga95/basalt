@@ -137,7 +137,7 @@ refused with its numbers); `*_open`; both start lines. `GpuCards` replaced `Load
 | DeepSeek-V4.1-Flash | yes, up to 5 cards (`kMaxSecondCards` 4): experts by layer block | refused | refused |
 | Hy4-flash | yes, up to 4 cards (`kMaxSecondCards` 3): experts by layer block | refused | refused |
 | Qwen3.8-27B | yes, 2 cards: one prompt stage | yes, 2 cards (#388 widens it) | refused until the tensor PR lands |
-| Inkling 2 Mini | yes, 2 cards: spilled experts on the peer (new) | yes, 2 cards | refused |
+| Inkling 2 Mini | yes, 2 cards: spilled experts on the peer (step 9) | yes, 2 cards | refused |
 
 ## Today's code, and what happens to it
 
@@ -182,7 +182,7 @@ D = deleted. H = moves behind a hook. K = kept as a mechanic inside its mode.
 | DeepSeek | its peer card must be sm_120, checked in its plan | `deepseek41/model.cpp` | | D (step 4): `GpuModes::peer_ada` false, refused before the load |
 | 27B | `plan_split` (alike/unlike), `second_card_runs_layers`, the stage priced per read (`kPriceMargin` 0.95), the stage off under `--kv-resident` | `dense/split_plan.cpp:46-58`, `dense/stage.cpp:177`, `qwen35/adapter.cpp:319-345` | the mode, the cut, on/off per read | D (steps 2, 7): `split_spec` + `split_cut`, `stage_cuts` within the last 20 layers; `--kv-resident` is a peer refusal |
 | 27B, Inkling | `--diag-split-at` | `qwen35/adapter.cpp:653`, `inkling2/adapter.cpp:58` | | D (step 2): one shared `--diag-gpu-cut L` (decision 7) |
-| Inkling | `plan_cards`: `plan_multi_gpu`, "CUDA1 idles" | `inkling2/model.cpp:234-237`, `:603-664` | split vs main alone | H (step 8): `SplitHooks`, cut by share; peer is new |
+| Inkling | `plan_cards`: `plan_multi_gpu`, "CUDA1 idles" | `inkling2/model.cpp:234-237`, `:603-664` | split vs main alone | H (steps 8, 9): `SplitHooks`, cut by share; `PeerHooks` |
 | Inkling | `max_expert_cards` 1 | `inkling2/adapter.cpp:48` | | D: `gpu_modes()` |
 
 Docs that describe the auto logic go with it: `docs/configuration/gpus.md` (rewritten), `configuration/index.md:86-87`,
@@ -217,11 +217,11 @@ Docs that describe the auto logic go with it: `docs/configuration/gpus.md` (rewr
 - **Inkling, split (built, step 8):** `InklingModel` derives `SplitHooks`: `split_spec` is the old `plan_cards` byte accounting (per layer
   its experts, dense rows and visits' caches; per card the head, scratch and drafter), `split_place` takes the cut and devices, the cut
   follows the shares. Bitwise against one card (tokens and logit rows after a 75K prompt; no cuBLAS, so no `--diag-main-card-bits`); speed equal to step 7.
-- **Inkling, peer (new):** spilled experts move from RAM to the peer's VRAM. `CpuExperts` (`inkling2/cpu_experts.hpp`, #536)
-  already sends a layer's rows and choices off the card after the router and merges them before the combine. Peer mode keeps
-  that shape: `start` copies rows and ids to the peer (device to device through `card_link`), the peer computes its pairs with
-  the main card's expert kernels, `finish` adds them into `out`. Experts that fit neither card stay on the CPU path. Gate: it
-  helps prefill and does not hurt decode.
+- **Inkling, peer (built, step 9):** the hottest experts that spilled from the main card go to the peer's VRAM (`PeerSpec` `Experts`; room
+  = free less one prompt lane and 1 GiB; no RAM copy). Decode: `CpuExperts`' doorbell thread has `core::PeerExperts` compute those pairs
+  (`launch_layout`, rows straight into the pool's) beside the pool; the merge is unchanged. Prompt: per layer the rows with a pair on the peer
+  (`peer_rows_plan`, gather) go to a second `Lane`, the peer's partial sums come back (`peer_rows_add`); main drops those pairs (id -1). The
+  elastic spill copies peer experts to the main card too; a layer whose spilled experts are all copied runs on the main card alone (bitwise).
 - **Tensor:** every model refuses; the hooks are declared.
 
 ## Conformance
@@ -244,7 +244,7 @@ card runs its cuBLAS algorithm (`gemm.cu`); a normal run keeps each card's own, 
 | peer, prompt stages, Flash-Next normal run | one card | KLD and top-1 the same or better (100 chunks) |
 | peer, experts (Flash-Next, DeepSeek, Hy4) | per expert: its rows on the main card | bitwise rows (kernel parity test per expert format) |
 | peer, experts, whole model | v0.5.6 in the same mode, tier frozen (`--diag-tier-frozen`); a single card is not bitwise: its spill runs on the CPU | greedy identical to v0.5.6; decode-path KLD vs the BF16 base and top-1 the same or better |
-| peer, Inkling | single card (CPU experts) | KLD and top-1 the same or better; peer rows bitwise equal to main-card rows |
+| peer, Inkling | single card (CPU experts) | BF16 KLD (decode path) and top-1 the same or better; a peer's rows equal the main card's for the same experts (bitwise); every spilled expert copied back: bitwise vs one card |
 | split, every model | single card where the model fits at the check's context; otherwise the same split with both stages on one GPU (`split_same`) | bitwise: KLD 0, greedy identical |
 | tensor | single card | KLD and top-1 the same or better within the gate's noise; not bitwise (partial sums meet with one BF16 rounding) |
 
@@ -293,7 +293,7 @@ Everything happens on the unpushed box branch `mgpu`, one agent at a time. Every
 | 6 | Flash-Next split on the hooks (done) | bitwise vs `split_same`; it runs on 5090 + 5060 Ti, numbers reported |
 | 7 | Qwen3.8-27B peer and split on the hooks (done) | both modes greedy identical to one card; 64K prefill in peer mode gains over one card, decode no worse; split's cells on the second card |
 | 8 | Inkling split on the hooks (from `inksplit`) | bitwise vs single card at a context it fits (done) |
-| 9 | Inkling peer: spilled experts on the peer through the `CpuExperts` shape | prefill gains and decode doesn't lose vs single card at 524,288 fp8; KLD and top-1 same or better; peer rows bitwise |
+| 9 | Inkling peer: spilled experts on the peer through the `CpuExperts` shape (done) | pp16384 and decode gain vs one card at `--expert-cache` 1500 and 2400 (64K equal at 2400); KLD and top-1 same or better; a peer is refused when nothing spills |
 | 10 | Docs: `configuration/gpus.md` rewritten, index rows, model pages, `adding-a-model.md` (a "Several GPUs" step like batching's), 0.5.7 changelog's breaking note | docs under 300 lines each; serve tests; no-GPU ctest |
 
 After the docs land, Jay's config (his call) becomes `"gpu": "all", "gpu-mode": "peer"` for Flash-Next, DeepSeek and Hy4, `"gpu": "0"`
