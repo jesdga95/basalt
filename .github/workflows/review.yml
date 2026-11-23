@@ -1,7 +1,8 @@
 name: review
 
 # `/review [effort=low|medium|high] [model=M] [focus]` in a pull request comment by the owner: a model review of the diff, posted as one comment.
-# The diff is read through the API as data; nothing from the pull request is checked out or run.
+# The diff, the description and the changed files' whole text are read through the API as data; nothing from the
+# pull request is checked out or run.
 on:
   issue_comment:
     types: [created]
@@ -64,6 +65,8 @@ jobs:
             echo "diff_failed=true" >> "${GITHUB_ENV}"
           fi
           cat AGENTS.md CONTRIBUTING.md > "${RUNNER_TEMP}/rules.md"
+          gh pr view "${PR}" --repo "${GITHUB_REPOSITORY}" --json title,body --jq '"# " + .title + "\n\n" + (.body // "")' > "${RUNNER_TEMP}/pr.md" || : > "${RUNNER_TEMP}/pr.md"
+          python3 tools/code_review.py --fetch "${GITHUB_REPOSITORY}" "${PR}" "${RUNNER_TEMP}/files.json" || echo '{}' > "${RUNNER_TEMP}/files.json"
 
       - name: Review
         if: steps.cmd.outputs.go == 'true'
@@ -78,7 +81,7 @@ jobs:
           if [ "${diff_failed:-}" = true ]; then
             printf '<!-- basalt-code-review -->\nThe diff could not be fetched (it may be over the API limit).' > "${RUNNER_TEMP}/review.md"
           else
-            python3 tools/code_review.py "${RUNNER_TEMP}/pr.diff" "${RUNNER_TEMP}/rules.md" "${RUNNER_TEMP}/review.md" "$(cat "${RUNNER_TEMP}/focus.txt")"
+            python3 tools/code_review.py "${RUNNER_TEMP}/pr.diff" "${RUNNER_TEMP}/rules.md" "${RUNNER_TEMP}/review.md" "$(cat "${RUNNER_TEMP}/focus.txt")" "${RUNNER_TEMP}/pr.md" "${RUNNER_TEMP}/files.json"
           fi
 
       - name: Post the review
