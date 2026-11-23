@@ -10,7 +10,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--tokens`, `--tokens-file` | CLI | required | The prompt as token ids. |
 | `--max-new` | CLI | 16 | Tokens to generate. |
 | `--greedy` | CLI | on | Argmax decoding. |
-| `--seed` | CLI | | Sample with this seed under `--top-k` 20, `--top-p` 0.95, `--temperature` 1.0. |
+| `--seed` | CLI | | Sample with this seed under `--top-k` 20, `--top-p` 0.95, `--temperature` 1.0; the same seed gives the same text on every model, and `--temperature 0` stays greedy. |
 | `--stop-eos` | CLI | off | Stop at an end-of-turn token. |
 | `--eos-ids` | engine | the pack's | The end-of-turn tokens. |
 | `--gpu-plan` | engine | | Print the `--gpu` choice as JSON and exit. |
