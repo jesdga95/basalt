@@ -73,6 +73,16 @@ void same_bits(const char* what, const void* a, const void* b, size_t bytes) {
     std::printf("%-34s %s\n", what, ok ? "bitwise" : "FAIL");
     failures += !ok;
 }
+// An FNV-1a hash of a result's bytes: a change meant to keep the bits keeps it.
+void print_hash(const char* what, const std::vector<uint8_t>& b) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint8_t x : b) h = (h ^ x) * 1099511628211ull;
+    std::printf("  %s hash %016llx\n", what, (unsigned long long) h);
+}
+template <class T> std::vector<uint8_t> bytes_of(const std::vector<T>& v) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(v.data());
+    return std::vector<uint8_t>(p, p + v.size() * sizeof(T));
+}
 // microseconds a call, averaged over `n` calls after one warm-up
 double time_us(const std::function<void()>& f, int n = 50) {
     f();
@@ -504,6 +514,7 @@ void test_attention() {
         char tag[64];
         std::snprintf(tag, sizeof tag, "attention (%s%s)", window ? "window ring" : "full, 3k keys", kv_tag(kv));
         report(tag, got, ref, 2e-3);
+        print_hash("output", bytes_of(got));
         // row 2 alone, and under a launch bound of a million keys
         AttnArgs one = a;
         one.q = dq + 2 * kHeads * kHeadDim; one.r = drs + 2 * kHeads * kRel; one.sink = dsink + 2 * kHeads; one.pos = dpos + 2;
@@ -972,6 +983,12 @@ void test_attention_window() {
             std::snprintf(tag, sizeof tag, "attention_window (%s%s, %d rows at %d)", k.window ? "window" : "full", kv_tag(kv), R, k.p0);
             std::printf("%-46s %s\n", tag, same ? "bitwise = prepare + attention" : "FAIL");
             failures += !same;
+            std::vector<uint8_t> all = host((uint8_t*) aa[1].q8, q8b);
+            for (const void* c : {pa[1].k_cache, pa[1].v_cache}) {
+                const std::vector<uint8_t> b = host((const uint8_t*) c, kvb);
+                all.insert(all.end(), b.begin(), b.end());
+            }
+            print_hash("q8_1 output and caches", all);
             if (k.window && R == 1) {
                 std::printf("  %.1f us a call (1 row, 1 key, fused)  %.1f us (prepare + attention)%s\n",
                             time_us([&] { attention_window(pa[1], aa[1], 1, max_keys, scr, nullptr); }),
@@ -1267,6 +1284,7 @@ void test_batch_window() {
             std::snprintf(tag, sizeof tag, "batch window: attention (%s%s)", window ? "window" : "full", kv_tag(kv));
             std::printf("%-46s %s\n", tag, same ? "bitwise = each conversation alone" : "FAIL");
             failures += !same;
+            print_hash("q8_1 output", q8b);
         }
     // post_attn and moe_finish: each conversation's ring and its own rows before it
     const int nb = 2, K = 8;

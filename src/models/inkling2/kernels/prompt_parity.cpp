@@ -298,6 +298,12 @@ void test_attention_prompt() {
                 const std::vector<float> dec = host(dout, (size_t) R * kHeads * kHeadDim);
                 std::snprintf(name, sizeof name, "  vs attention_decode (all %d rows)", R);
                 report(name, got, dec, 4e-3);
+                {
+                    uint64_t h = 1469598103934665603ull;
+                    const uint8_t* b = reinterpret_cast<const uint8_t*>(dec.data());
+                    for (size_t i = 0; i < dec.size() * 4; ++i) h = (h ^ b[i]) * 1099511628211ull;
+                    std::printf("  attention_decode output hash %016llx\n", (unsigned long long) h);
+                }
                 cudaFree(ddk);
                 cudaFree(ddv);
                 cudaFree(dpos);
