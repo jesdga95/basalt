@@ -58,13 +58,16 @@ the text model.
   from the start and the RAM experts are copied back while the card has room. Either way the copies leave the card's spare
   free: 1 GiB at the start and 512 MiB after a cache grow, or `--vram-reserve-mib N` for both (at least 128, 256 where the
   driver pages GPU memory); with the flag they also leave 256 MiB for what loads after them (kernels at their first launch,
-  the windows' graphs) until that has loaded. The spare is where the copies stop, not a floor: a cache grow with no copy left
-  to send back, or another program, can take it. The 256 MiB is judged from the card's total use (anything that allocates
-  counts as loaded). The copies lie back to back in one address range; a demote packs the survivors together so whole pages
-  go back. A window whose graph finds no device memory runs direct, and windows of its shape keep running without a graph
-  (no copy moves); a batched window's graph has no such fallback. A VRAM resize the copies cannot meet is refused before any
-  copy moves. A copy table update or a cache's backing that cannot be confirmed (a CUDA failure) stops the engine: every
-  later request is refused. Nothing changes when everything fits.
+  the windows' graphs). The spare is where the copies stop, not a floor: a cache grow with no copy left to send back, or
+  another program, can take it. Placement counts the card's free memory itself: it reads it when the copies are first
+  placed, at a VRAM resize and at a wake, and counts every map and release of the copies and the caches after that (what
+  loads later comes out of the spare and the 256 MiB). A cache grow that finds less memory than counted is refused (the
+  request gets an error) and the caches stay as they were; no copy moves for it. The copies lie back to back in one address
+  range; a demote packs the survivors together so whole pages go back. A window whose graph finds no device memory runs
+  direct, and windows of its shape keep running without a graph (no copy moves); a batched window's graph has no such
+  fallback. A VRAM resize the copies cannot meet is refused before any copy moves. A copy table update or a cache's
+  backing that cannot be confirmed (a CUDA failure) stops the engine: every later request is refused. Nothing changes when
+  everything fits.
 - **Which experts get a copy:** the profile's order until the session has looked experts up, then the lookups of the rows its
   windows keep (rejected drafts do not count), decayed over 320 kept rows. The least looked up give way first when the caches
   grow. With one session and an elastic spill, at a request's start and every 256 decode positions after it, up to 64 copies

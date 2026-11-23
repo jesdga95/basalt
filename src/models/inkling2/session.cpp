@@ -745,19 +745,13 @@ public:
         const uint64_t bytes = cell_bytes() * (uint64_t) target;
         const uint64_t grow = grow_bytes(target);
         const uint64_t keep_free = m_.held_free(kElasticKeep);
-        // the copies go back until the grow leaves the reserve free (the caches take the reserve itself only once no copy
-        // is left: the reserve is the copies' target, not a floor the caches stop at)
+        // the copies go back until the grow leaves the reserve free by the counted room (the caches take the reserve itself
+        // only once no copy is left: the reserve is the copies' target, not a floor the caches stop at)
         const int64_t before = m_.card_copies();
         bool room_ok = true;
-        for (size_t free_b = 0, total_b = 0; m_.promoted() > 0;) {
-            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-                err = "the caches cannot grow: the card's free memory is unknown";
-                room_ok = false;
-                break;
-            }
-            if (free_b >= grow + keep_free) break;
+        while (m_.promoted() > 0 && m_.room() < grow + keep_free) {
             uint64_t freed = 0;
-            if (!feed_heat() || !m_.demote(grow + keep_free - free_b, freed)) {
+            if (!feed_heat() || !m_.demote(grow + keep_free - m_.room(), freed)) {
                 err = "the caches cannot grow: the expert copies could not go back to RAM";
                 room_ok = false;
                 break;
@@ -765,24 +759,41 @@ public:
             if (freed == 0) break;
         }
         if (m_.card_copies() != before || m_.wedged()) {
-            const std::string event = (room_ok ? "cache grow to " : "cache grow failed for ") + std::to_string(target) + " positions";
+            const std::string event = (room_ok ? "cache grow to " : "cache grow failed for ") + std::to_string(target) +
+                                      " positions at " + std::to_string(backed_);
             m_.log_copy_change(event.c_str(), before, grow);
         }
         if (!room_ok) return false;
-        for (auto& a : elastic_)
-            if (!a->ensure(bytes, 0, err)) {
-                err = "the caches cannot grow to " + std::to_string(target) + " positions: " + err;
-                caches_usable();
-                return false;
-            }
-        if (!dspark_.ensure(target, err)) {   // DSPARK HOOK
-            caches_usable();
+        const uint64_t backing0 = backing_bytes();
+        std::vector<uint64_t> was;
+        for (const auto& a : elastic_) was.push_back(a->backed());
+        const int64_t drafter_was = dspark_.backed_cells() - kDsBlock;
+        bool mapped = true;
+        for (auto& a : elastic_) mapped = mapped && a->ensure(bytes, 0, err);
+        mapped = mapped && dspark_.ensure(target, err);   // DSPARK HOOK
+        if (!mapped) {
+            // the card has less free memory than placement counted (something past the spare took it): the request is
+            // refused and the caches go back to what they backed, so the counted room and the placement stay as they were
+            if (!caches_usable()) return false;
+            for (size_t i = 0; i < elastic_.size(); ++i) elastic_[i]->trim(was[i]);
+            if (dspark_.on()) dspark_.trim(drafter_was);
+            count_backed();
+            if (!caches_usable()) return false;
+            err = "the caches cannot grow to " + std::to_string(target) + " positions: the card has less free memory than "
+                  "counted (" + err + ")";
             return false;
         }
+        m_.account((int64_t) backing_bytes() - (int64_t) backing0);
         count_backed();
         if (positions <= backed_) return true;
         err = "the caches do not back the requested positions";
         return false;
+    }
+    // The device bytes the elastic caches (the visits' and the drafter's) back now.
+    uint64_t backing_bytes() const {
+        uint64_t n = dspark_.backing_bytes();   // DSPARK HOOK
+        for (const auto& a : elastic_) n += a->backed();
+        return n;
     }
     // The device bytes the caches map to back `positions` positions (ensure_positions), the allocation rounding included.
     uint64_t grow_bytes(int64_t positions) const {
@@ -902,8 +913,10 @@ public:
         const int64_t keep = std::min(m_.context(),
             std::max<int64_t>(core::kElasticKvBase, (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep));
         if (keep < backed_) {
+            const uint64_t backing0 = backing_bytes();
             for (auto& a : elastic_) a->trim(cell_bytes() * (uint64_t) keep);
             dspark_.trim(keep);
+            m_.account((int64_t) backing_bytes() - (int64_t) backing0);
             count_backed();
             if (!caches_usable()) return false;
         }

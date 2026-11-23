@@ -730,7 +730,7 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
                       // come back while the card has room beyond its spare
         size_t was_b = 0, free_b = 0, total_b = 0;
         cudaMemGetInfo(&was_b, &total_b);
-        used0_ = (uint64_t) (total_b - was_b);
+        sync_room();
         const int64_t before = card_copies();
         const uint64_t moved = promote(held_free(kCardSpare));
         if (wedged()) {
@@ -778,17 +778,16 @@ bool InklingModel::trim_copies() {
             return false;
         }
         copy_maps_.pop_back();
+        room_ += (int64_t) gran;
     }
     return true;
 }
 
-uint64_t InklingModel::late_room() const {
-    if (!spare_ || !used0_) return 0;
+uint64_t InklingModel::late_room() const { return spare_ ? kLateRoom : 0; }
+
+void InklingModel::sync_room() {
     size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
-    const uint64_t used = (uint64_t) (total_b - free_b), copies = (uint64_t) copy_maps_.size() * copy_lay_.gran;
-    const uint64_t loaded = used > copies + used0_ ? used - copies - used0_ : 0;
-    return loaded < kLateRoom ? kLateRoom - loaded : 0;
+    room_ = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? (int64_t) free_b : 0;
 }
 
 std::vector<size_t> InklingModel::copy_candidates() const {
@@ -843,13 +842,16 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
         const uint64_t start = copy_lay_.end.empty() ? 0 : CopyLayout::aligned(copy_lay_.end.back());
         const uint64_t mapped = (uint64_t) copy_maps_.size() * gran, end = start + stride;
         const uint64_t grow = end > mapped ? (end - mapped + gran - 1) / gran * gran : 0;
-        size_t free_b = 0, total_b = 0;
-        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b < keep_free + grow) break;
+        if (room() < keep_free + grow) break;
         bool mapped_ok = true;
         for (uint64_t g = 0; g < grow && mapped_ok; g += gran) {
             const unsigned long long h = core::vmm::map(copies_va_ + mapped + g, gran);
-            if (h) copy_maps_.push_back(h);
-            else mapped_ok = false;
+            if (h) {
+                copy_maps_.push_back(h);
+                room_ -= (int64_t) gran;
+            } else {
+                mapped_ok = false;
+            }
         }
         if (!mapped_ok) break;
         uint8_t* ptr = copies_va_ + start;
@@ -923,6 +925,7 @@ bool InklingModel::lend(bool low) {
         lent_ = true;
     } else {
         lent_ = false;
+        sync_room();   // the driver brought the rest back: the card as it is now
         promote(held_free(kCardSpare));
     }
     log_copy_change(low ? "sleep" : "wake", before);
@@ -1247,14 +1250,16 @@ bool InklingModel::lend_room(uint64_t bytes, std::string& err) {
         return false;
     }
     // the region beside the card's spare and the reserve the card holds now (a reserve it could not meet stays unmet)
+    // (the copies go by the counted room, the layers below by the card's own free memory: those come back byte for byte)
+    const uint64_t room0 = room();
+    const uint64_t want = bytes + std::min<uint64_t>(held_free(kCardSpare), std::max<uint64_t>(room0, kCardSpare));
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
-    const uint64_t want = bytes + std::min<uint64_t>(held_free(kCardSpare), std::max<uint64_t>(free_b, kCardSpare));
-    if (has_spill_ && free_b < want && promoted() > 0) {
+    if (has_spill_ && room0 < want && promoted() > 0) {
         const int64_t before = promoted();
         const int64_t before_total = card_copies();
         uint64_t freed = 0;
-        const bool ok = demote(want - free_b, freed);
+        const bool ok = demote(want - room0, freed);
         lend_copies_ += before - promoted();
         log_copy_change("image encoder lend", before_total, bytes);
         if (!ok) {

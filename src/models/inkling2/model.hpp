@@ -141,6 +141,13 @@ public:
     }
     bool wedged() const { return wedged_; }
     uint64_t held_free(uint64_t base) const { return std::max(spare_ ? spare_ : base, reserve_); }
+    /// The card's free bytes as placement counts them: read when the copies are first placed, at a VRAM resize and at a
+    /// wake, and moved by every map and release of the copies and the sessions' caches (account). What else allocates
+    /// (kernels, graphs) is left to the spare and the late room. Placement reads this, never a fresh query, so it follows
+    /// the requests alone.
+    uint64_t room() const { return room_ > 0 ? (uint64_t) room_ : 0; }
+    void account(int64_t mapped) { room_ -= mapped; }
+    void sync_room();
     /// Resizes the card's copies so that `free_bytes` are free: copies go back to RAM when short, return while there is
     /// room. False, with nothing moved, when even no copy at all leaves that much; false when the copies could not go back.
     bool resize_reserve(uint64_t free_bytes);
@@ -239,10 +246,10 @@ private:
     // one handle each from the range's start
     bool copy_range();
     bool trim_copies();
-    /// With --vram-reserve-mib: the part of kLateRoom not loaded yet (what the engine allocated beyond the copies since
-    /// they were first placed counts as loaded); 0 without it.
+    /// With --vram-reserve-mib: kLateRoom, the room the copies leave for what loads after them (room() does not see it
+    /// load); 0 without it.
     uint64_t late_room() const;
-    uint64_t used0_ = 0;   ///< device bytes in use when the copies were first placed
+    int64_t room_ = 0;   ///< room(): may run below 0 when the caches grow past what placement counted
     uint8_t* copies_va_ = nullptr;
     CopyLayout copy_lay_;
     uint64_t copy_reserved_ = 0;
