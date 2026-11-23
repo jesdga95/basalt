@@ -910,6 +910,25 @@ $("#auth").onsubmit = e => {
 };
 
 /* ---- pricing dialog ---- */
+/* ---- support: the footer heart opens a quiet dialog of links; it never opens by itself ---- */
+function openSupport() {
+  let d = $("#support-dlg");
+  if (!d) {
+    d = document.createElement("dialog"); d.id = "support-dlg"; d.className = "price";
+    const out = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    const link = (href, name, note) => `<a class="support-link" href="${href}" target="_blank" rel="noopener noreferrer"><b>${name}</b><span>${note}</span>${out}</a>`;
+    d.innerHTML = `<form method="dialog">
+<div class="price-head"><h3>Support Basalt</h3><p>Basalt is free and MIT licensed. Sponsorship pays for the tokens behind its development and for time on more hardware to test on.</p></div>
+<div class="support-links">${link("https://github.com/sponsors/jesdga95", "GitHub Sponsors", "monthly or one-time")}${link("https://ko-fi.com/jesdga", "Ko-fi", "one-time")}${link("https://paypal.me/jesdga", "PayPal", "one-time")}</div>
+<p class="support-alt">No money needed to help: a <a href="https://github.com/jesdga95/basalt/blob/main/docs/community.md" target="_blank" rel="noopener noreferrer">community benchmark run</a> from your hardware helps too.</p>
+<div class="price-foot"><span class="grow"></span><button type="submit" class="price-ghost">Close</button></div></form>`;
+    document.body.append(d);
+    d.onclick = e => { if (e.target === d) d.close(); };
+  }
+  d.showModal();
+}
+$("#support").onclick = openSupport;
+
 let lastTotals = null;
 const priceVal = id => { const v = $(id).value.trim(); return v === "" ? null : Math.max(0, parseFloat(v) || 0); };
 // the dialog's live figure: the same formula as serve/totals.py, from the counts and the rates as typed

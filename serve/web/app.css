@@ -472,7 +472,7 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
   #log > div { grid-template-columns: 62px minmax(0, 1fr); }
   #log u { display: none; }
   #log { font-size: 12px; }
-  .tot { display: none; }
+  .tot, .heart { display: none; }
   .key { flex-wrap: wrap; white-space: normal; }
 }
 
@@ -519,3 +519,18 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
 /* the landing page's .btn, as the header's Unload */
 .price-save { min-height: 34px; padding: 0 16px; border: 1px solid var(--accent-line); border-radius: 8px; font: 500 13px/1 var(--font-sans); color: var(--accent); }
 .price-save:hover { filter: brightness(1.1); background: rgba(255, 122, 61, .06); }
+
+/* ---------- support: the footer heart and its dialog ---------- */
+.heart { flex: none; display: inline-flex; align-items: center; padding: 4px; margin-right: -4px; border-radius: 6px; color: var(--fg-3); transition: color .15s; }
+.heart:hover { color: var(--accent); }
+.support-links { display: flex; flex-direction: column; gap: 8px; padding: 18px 24px 0; }
+.support-link { display: flex; align-items: center; gap: 12px; min-height: 44px; padding: 0 14px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--bg); color: var(--fg); text-decoration: none; transition: border-color .12s, background .12s; }
+.support-link:hover { border-color: var(--accent-line); background: rgba(255, 122, 61, .04); }
+.support-link b { font: 500 14px/1 var(--font-sans); }
+.support-link span { font: 400 12px/1 var(--font-sans); color: var(--fg-3); }
+.support-link svg { flex: none; color: var(--fg-3); margin-left: auto; }
+.support-link:hover svg { color: var(--accent); }
+.support-alt { padding: 16px 24px 0; font: 400 13px/1.5 var(--font-sans); color: var(--fg-3); }
+.support-alt a { color: var(--fg-2); text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
+.support-alt a:hover { color: var(--accent); text-decoration-color: var(--accent-line); }
