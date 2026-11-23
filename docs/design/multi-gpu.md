@@ -234,8 +234,8 @@ another build), Flash-Next's only check. `--diag-gpu-same` with `gpu-mode split`
 | split, every model | single card where the model fits at the check's context; otherwise the same split with both stages on one GPU (`split_same`) | bitwise: KLD 0, greedy identical |
 | tensor | single card | KLD and top-1 the same or better within the gate's noise; not bitwise (partial sums meet with one BF16 rounding) |
 
-KLD runs use `/mnt/nvme/kld/*-bf16-base.kld` through the decode path (rule 5); traces go in a scratch directory. Step 3: the 27B stage
-and Inkling's split are bitwise vs one card; DeepSeek's experts on a card vs the CPU differ at KLD 9+ (no peer), so it is held to v0.5.6.
+KLD runs use `/mnt/nvme/kld/*-bf16-base.kld` through the decode path (rule 5); traces go in a scratch directory. Step 3: the 27B stage and
+Inkling's split are bitwise vs one card; DeepSeek's peer vs one card is its CPU vs GPU expert rounding (KLD 0.01; BF16 gate 0.2805, 0.2794).
 
 ## Tensor (reserved)
 
