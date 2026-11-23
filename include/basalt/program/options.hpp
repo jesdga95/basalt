@@ -147,6 +147,10 @@ struct CommonOptions {
     /// read back when a prompt starts with it, after a restart too (conversation_store.hpp)
     std::string conversation_cache_dir;
     int64_t conversation_cache_disk_mib = 0;   ///< byte budget of the disk tier, least recently used first; above 0 turns it on
+    /// --serve (--conversation-cache-disk-fifo): over that budget the disk tier drops the conversation it took first
+    /// instead of the least recently used one - the copy a harness parked first leaves first, a freshly spilled one
+    /// survives.  Off (default): least recently used, as before.
+    bool conversation_cache_disk_fifo = false;
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;

@@ -98,6 +98,8 @@ void usage() {
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens (default 0 = park every one)\n"
                  "  --conversation-cache-disk-mib N  --serve: park conversations on disk, at most N MiB, and read them back\n"
                  "                       when a prompt starts with one, also after a restart (default 0 = off)\n"
+                 "  --conversation-cache-disk-fifo  --serve: over that budget the disk tier drops the conversation it\n"
+                 "                       wrote first instead of the one it read least recently (default off)\n"
                  "  --conversation-cache-dir DIR  --serve: the disk tier's folder (required with a budget unless the\n"
                  "                       server starts the engine, which uses the model cache folder)\n"
                  "  --vram-elastic       --serve (opt-in): the expert cache in segments (--vram-segment-mib,\n"

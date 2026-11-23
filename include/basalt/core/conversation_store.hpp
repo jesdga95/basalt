@@ -12,7 +12,7 @@
 // are removed.  Every name carries the identity it was written under (the model file and every setting
 // that changes the state's bytes).  Reads are fail-closed: header, section table and every 1 MiB block of payload carry
 // hashes, a shared file must match its name, and any mismatch drops the conversation.  The directory keeps to a byte
-// budget, least recently used conversations first.
+// budget, least recently used conversations first - or, with `--conversation-cache-disk-fifo`, the one it added first.
 #pragma once
 
 #include "basalt/core/conversation_cache.hpp"
@@ -41,6 +41,12 @@ class ConversationStore {
 public:
     /// Cells behind one pooled row of a K/V layer's index (before open).
     void set_row_cells(int64_t cells) { row_cells_ = cells; }
+    /// `--conversation-cache-disk-fifo`: over its budget the directory drops the conversation it took first instead
+    /// of the least recently used one: the copy a harness parked first is then the first to go, and one written
+    /// again a turn on is the newest again.  After a restart the order among the files it finds is their write time
+    /// - a filesystem second, the file name deciding the ones written in the same second.  Set it before `open()`:
+    /// the start's own eviction uses it.  Off (default): least recently used, as before.
+    void set_fifo(bool on) { fifo_ = on; }
     struct Match {
         size_t index = 0;
         int64_t tokens = 0;
@@ -109,7 +115,7 @@ private:
     std::string dir_;
     mutable std::atomic<bool> full_said_{false};   ///< fits() said the volume is full, once until it has room again
     uint64_t identity_ = 0, budget_ = 0;
-    bool open_ = false;
+    bool open_ = false, fifo_ = false;
     mutable std::mutex mu_;
     std::condition_variable cv_, idle_;
     std::vector<std::unique_ptr<Entry>> entries_;

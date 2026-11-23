@@ -3,7 +3,8 @@
 // restart; inside a K/V block, on a block's edge and in the tail), refused when a payload byte of a shared block changed
 // or the identity differs, written again a turn on with only its new state, stored as of its last checkpoint when its
 // live end is a reply past it, the directory kept to its budget, and only a chat's root and last three turn-end states
-// written (a cut at a state not written goes back to the nearest one before it, refcounts of a shared root kept).
+// written (a cut at a state not written goes back to the nearest one before it, refcounts of a shared root kept), and
+// which conversation that budget takes first: the least recently used one, or with the disk fifo the one added first.
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/platform/file.hpp"
@@ -158,6 +159,13 @@ void remove_dir(const std::string& dir) {
         for (const auto& f : left) basalt::platform::remove_file(dir + "/" + f.name);
     basalt::platform::remove_file(dir);
 }
+
+// `n` tokens of one chat, unlike another chat's from the first one: no chain supersedes it and it shares no file
+std::vector<int32_t> chat_ids(size_t n, int mult, int add) {
+    std::vector<int32_t> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = (int32_t) (i * mult + add);
+    return v;
+}
 }  // namespace
 
 // A model with compressed caches: its layers hold rows of `page_size` cells, no scales or pooled rows, and only one
@@ -300,6 +308,71 @@ void fp16_pooled_rows(const std::string& dir) {
     CHECK(st.load(m, got, err));
     check_at(got, 5003, src.checkpoints[1]);
     CHECK(st.stats().files == 1);
+}
+
+// The disk budget's two clocks.  A chat written by an earlier process, a second one put here, a read of the FIRST
+// (which leaves the second as the least recently used of the two), and a third chat that goes over the budget.  The
+// default clock drops the second chat, the one a serial harness has just parked; `conversation-cache-disk-fifo`
+// drops the chat that was added first and keeps the freshly parked one.
+void eviction_clock(const std::string& dir, uint64_t id, bool fifo) {
+    const std::vector<int32_t> ia = chat_ids(4000, 7, 3), ib = chat_ids(4000, 11, 5), ic = chat_ids(4000, 13, 11);
+    std::string err;
+    uint64_t each = 0;
+    {   // what one such chat costs the directory: its own file with the block and state files it holds
+        ConversationStore probe;
+        probe.set_row_cells(4);
+        CHECK(probe.open(dir, id, 1ull << 30, err));
+        CHECK(probe.put(image(ia, {}), 1ull << 30));
+        probe.flush();
+        CHECK(probe.stats().written == 1);
+        each = dir_bytes(dir);
+        CHECK(each > 0);
+    }
+    ConversationStore st;
+    st.set_row_cells(4);
+    if (fifo) st.set_fifo(true);   // the default leg never calls it: what every run without the flag does
+    CHECK(st.open(dir, id, each * 2 + each / 2, err));
+    CHECK(st.stats().files == 1 && st.stats().evicted == 0);   // the first chat fits
+    CHECK(st.put(image(ib, {}), 1ull << 30));
+    st.flush();
+    CHECK(st.stats().files == 2 && st.stats().evicted == 0);   // and so does the second
+    // the first chat read back: its last use is now the later of the two
+    std::vector<int32_t> p = ia;
+    p.push_back(-5);
+    const auto ma = st.best(p.data(), p.size(), {}, true);
+    CHECK(ma.tokens == 4000);
+    SavedConversation got;
+    CHECK(st.load(ma, got, err));
+    // the third chat goes over the budget: which of the two older ones pays for it?
+    CHECK(st.put(image(ic, {}), 1ull << 30));
+    st.flush();
+    const auto s = st.stats();
+    CHECK(s.files == 2 && s.evicted == 1);
+    std::vector<int32_t> q = ic;
+    q.push_back(-5);
+    CHECK(st.best(q.data(), q.size(), {}, true).tokens == 4000);   // the newest chat always stays
+    q = ib;
+    q.push_back(-5);
+    const int64_t held = st.best(q.data(), q.size(), {}, true).tokens;   // the freshly parked one:
+    CHECK(held == (fifo ? 4000 : 0));   // fifo keeps it and drops the oldest added; least used drops it
+    // the eviction the START does: reopen under what the two chats left cost - the open itself drops one of them,
+    // ordered by the write times it reads back (a filesystem second, so which one is the directory's own order)
+    {
+        ConversationStore again;
+        again.set_row_cells(4);
+        if (fifo) again.set_fifo(true);
+        CHECK(again.open(dir, id, each + each / 2, err));
+        CHECK(again.stats().evicted == 1 && again.stats().files == 1);
+        const auto stored = [&](const std::vector<int32_t>& ids) {
+            std::vector<int32_t> w = ids;
+            w.push_back(-5);
+            return again.best(w.data(), w.size(), {}, true).tokens == 4000;
+        };
+        // exactly one of the two it indexed stayed; which one is the write-time order the directory reads back
+        // (both were written within a filesystem second, so the index's own order decides, not the test)
+        CHECK(fifo ? (stored(ib) != stored(ic)) : (stored(ia) != stored(ic)));
+    }
+    remove_dir(dir);
 }
 
 int main() {
@@ -504,6 +577,11 @@ int main() {
         p = ids3;
         p.push_back(0);
         CHECK(st.best(p.data(), p.size(), {}, true).tokens == 10000);   // as of its checkpoint, 300 tokens back
+    }
+    {
+        // the clock the budget evicts by: least used (the default) and, with the disk fifo, insertion order
+        eviction_clock(dir + "-clock-lru", id, false);
+        eviction_clock(dir + "-clock-fifo", id, true);
     }
     {
         // only the root and the last three turn ends are written; strides and older turn ends are not

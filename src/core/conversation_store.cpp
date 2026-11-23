@@ -335,7 +335,8 @@ struct ConversationStore::Job {
 struct ConversationStore::Entry {
     uint64_t id = 0;                          ///< monotonic entry identity (stable across vector erasures)
     std::string name;                         ///< file name in the directory
-    uint64_t key = 0, bytes = 0, used = 0;
+    uint64_t key = 0, bytes = 0, used = 0;    ///< used: the last read or write, what the budget evicts by
+    uint64_t added = 0;                       ///< when the store took it, what it evicts by with the disk fifo on
     bool mine = true;                         ///< written under this identity (others count for the budget only)
     bool cvec = true;
     std::vector<int32_t> ids;                 ///< live tokens
@@ -524,6 +525,24 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
     std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.mtime < b.mtime; });
     const int64_t now = basalt::platform::file_time_now();
     const std::string prefix = hex16(identity_) + "-";
+    // With the disk FIFO on, before anything is read: the order it will evict the INDEXED files in - each
+    // conversation file's own mtime, which is a filesystem second, so the file name decides the ones written in the
+    // same second or on a filesystem that reports no time (the sort above leaves ties where it found them, and the
+    // FIFO must name the same victim every time).  The ranks share clock_'s domain: a conversation written later
+    // takes ++clock_, which stays above them all (see the max below).
+    std::map<std::string, uint64_t> added_of;
+    uint64_t rank = 0;
+    if (fifo_) {
+        std::vector<const basalt::platform::DirFile*> added_order;
+        for (const auto& f : files)
+            if (f.name.size() > 4 && f.name.compare(f.name.size() - 4, 4, kExt) == 0 &&
+                name_kind(f.name, prefix) != NameKind::kBlock && name_kind(f.name, prefix) != NameKind::kState)
+                added_order.push_back(&f);
+        std::sort(added_order.begin(), added_order.end(),
+                  [](const basalt::platform::DirFile* a, const basalt::platform::DirFile* b) {
+                      return a->mtime != b->mtime ? a->mtime < b->mtime : a->name < b->name; });
+        for (const auto* f : added_order) added_of[f->name] = ++rank;
+    }
     for (const auto& f : files) {
         const std::string path = dir_ + "/" + f.name;
         if (f.name.size() > 4 && f.name.compare(f.name.size() - 4, 4, ".tmp") == 0) {
@@ -544,6 +563,7 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
         e->name = f.name;
         e->bytes = f.bytes;
         e->used = ++clock_;
+        if (fifo_) e->added = added_of[f.name];   // its mtime's rank among this directory's conversations
         e->mine = nk == NameKind::kConversation;
         if (e->mine) {
             std::string why;
@@ -623,6 +643,7 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
     open_ = true;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        clock_ = std::max(clock_, rank);   // a file the checks above dropped took a rank but no stamp: keep later stamps above every rank
         gc_locked(kOrphanAge);
         evict_locked();
     }
@@ -1130,6 +1151,7 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     e->key = job->key;
     e->bytes = bytes;
     e->used = ++clock_;
+    e->added = e->used;   // taken now - a conversation written again is a new entry, so it is the newest again
     e->cvec = job->image.cvec;
     e->ids = job->image.live.ids;
     e->imgs = job->image.live.imgs;
@@ -1187,6 +1209,11 @@ void ConversationStore::evict_locked() {
         return t;
     };
     uint64_t have = total();
+    // which of two conversations leaves first: the least recently used one, or with --conversation-cache-disk-fifo
+    // the one the store took first (two taken together: the file name decides, so the answer is one answer)
+    const auto first_out = [&](const Entry& a, const Entry& b) {
+        return fifo_ ? (a.added != b.added ? a.added < b.added : a.name < b.name) : a.used < b.used;
+    };
     if (have > budget_) {   // what nobody uses goes first
         gc_locked(0);
         have = total();
@@ -1194,7 +1221,7 @@ void ConversationStore::evict_locked() {
     while (have > budget_) {
         size_t victim = SIZE_MAX;
         for (size_t i = 0; i < entries_.size(); ++i)
-            if (!entries_[i]->job && (victim == SIZE_MAX || entries_[i]->used < entries_[victim]->used)) victim = i;
+            if (!entries_[i]->job && (victim == SIZE_MAX || first_out(*entries_[i], *entries_[victim]))) victim = i;
         if (victim == SIZE_MAX) break;
         drop_locked(victim);
         gc_locked(0);

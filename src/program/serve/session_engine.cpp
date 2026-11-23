@@ -64,6 +64,7 @@ public:
                 o.model, basalt::core::conversation_store_hash(text.data(), text.size(), 1));
             std::string de;
             disk.set_row_cells(session().disk_row_cells());
+            disk.set_fifo(o.conversation_cache_disk_fifo);   // before the open: the start's own eviction uses it
             if (o.prompt_cache <= 0) {
                 basalt::log::warn("basalt serve", "conversation cache on disk off: --prompt-cache 0");
             } else if (!disk.open(o.conversation_cache_dir, identity, (uint64_t) o.conversation_cache_disk_mib << 20, de)) {

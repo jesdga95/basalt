@@ -519,6 +519,7 @@ int QfnRuntime::init_conversations() {
         std::string de;
         const auto t0 = Clock::now();
         disk.set_row_cells(basalt::kernels::qsa_real_shapes().idx_block);
+        disk.set_fifo(o.conversation_cache_disk_fifo);   // before the open: the start's own eviction uses it
         if (o.prompt_cache <= 0 || !stages.empty()) {
             basalt::log::warn("basalt serve", "conversation cache on disk off: %s",
                               o.prompt_cache <= 0 ? "--prompt-cache 0" : "a layer split");
