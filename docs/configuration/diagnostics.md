@@ -41,6 +41,8 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--prefill-until P` | CLI | Batch the first P prompt positions; run the rest teacher-forced. |
 | `--spec-corrupt N` | CLI | Replace every Nth draft with a wrong token, to test rejection. |
 | `--diag-batch-check` | CLI | With `--batch N` (2 or more) and a prompt: every session's windows alone against the same windows batched, bitwise ([batched decoding](../design/batching.md)). |
+| `--diag-gpu-check` | CLI | With `--tokens-file`, `--max-new N` and two or more cards: the prompt and N greedy steps, each step's logits recorded (`--diag-gpu-trace FILE`) or compared with a reference run's (`--diag-gpu-ref FILE`): bitwise steps, greedy identity, KLD, top-1 ([several GPUs](../design/multi-gpu.md)). |
+| `--diag-gpu-same` | serve | Flash-Next with `gpu-mode split` and `--diag-gpu-cut L`: both stages of the split on GPU 0, the split's reference. |
 | `--diag-teacher` | CLI | DeepSeek with `--spec-oracle`: teacher-forces the file's tokens and counts differing picks. |
 | `--diag-tier-frozen` | CLI, serve | DeepSeek: fixed placement (no copies or promotion). |
 | `--diag-drafter-gpu DEV` | CLI, serve | DeepSeek: the card the drafter runs on. |
