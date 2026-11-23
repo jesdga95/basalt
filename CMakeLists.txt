@@ -618,7 +618,7 @@ target_link_libraries(tiers PUBLIC core kernels kernels_cpu ${_gpu_runtime_targe
 # the routed-expert tier: slots, per-layer LRU, RAM tier with CPU compute, file reads, second cards
 add_library(expert_tier STATIC src/core/expert_tier.cpp)
 target_include_directories(expert_tier PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
-target_link_libraries(expert_tier PUBLIC tiers peer_share mmq core kernels kernels_cpu platform ${_gpu_runtime_target})
+target_link_libraries(expert_tier PUBLIC model tiers peer_share mmq core kernels kernels_cpu platform ${_gpu_runtime_target})
 if(BASALT_MODEL_QWEN4EXP)
 include(src/models/qwen4exp/qwen4exp.cmake)
 endif()

@@ -105,45 +105,14 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
         main_homes = (int) std::min<int64_t>(main_homes, cap_per_layer_);
     }
 
-    // The second cards: each owns a block of layers and holds that block's second-card homes, so every layer has one.
-    // They open here, before the prompt buffers and the RAM reading below, so the RAM tier sees their host buffers.
-    int peer_slots = 0;
+    // The second cards (model::PeerHooks): each owns a block of layers and holds that block's second-card homes, so every
+    // layer has one. They open here, before the prompt buffers and the RAM reading below, so the RAM tier sees their host
+    // buffers; a card that would hold nothing is refused there, not left idle.
     layer_card_.assign((size_t) n_layers_, 0);
-    if (!s_.peer_devices.empty()) {
-        const std::vector<int>& devs = s_.peer_devices;
-        std::string pe;
-        bool ok = true;
-        for (size_t c = 0; c < devs.size() && ok; ++c) {
-            auto p = std::make_unique<core::PeerExperts>();
-            ok = p->open_plain(devs[c], n_layers_, n_expert_, s_.n_embd, s_.n_ff, h_rows, pe);
-            if (ok) {
-                peers_.push_back(std::move(p));
-                ok = open_share(c, pe);
-            }
-        }
-        if (ok) {
-            // every card is open with its share's buffers, so its room is what its slots will get: the blocks are sized
-            // to the rooms (bigger late layers go to more cards), or with gpu-share to each card's share of them (never past
-            // its room), then each block's prompt-share prices are set
-            std::vector<uint64_t> rooms, layer_bytes;   // one slot of each layer, as one_each counts them
-            for (const auto& p : peers_) rooms.push_back(p->room());
-            if (s_.peer_shares.size() == rooms.size() && rooms.size() > 1) {
-                uint64_t all = 0;
-                for (uint64_t r : rooms) all += r;
-                for (size_t c = 0; c < rooms.size(); ++c)
-                    rooms[c] = std::min<uint64_t>(rooms[c], (uint64_t) (s_.peer_shares[c] * (double) all));
-            }
-            for (int l = 0; l < n_layers_; ++l) layer_bytes.push_back((s_.layers[(size_t) l].blob_bytes + 255) / 256 * 256);
-            const uint64_t reserve_peer = (uint64_t) s_.peer_reserve_mib << 20;
-            blocks_ = core::policy::split_by_bytes(layer_bytes, rooms, reserve_peer, n_expert_, peer_slots);
-            for (size_t c = 0; c < blocks_.lo.size(); ++c)
-                for (int l = blocks_.lo[c]; l < blocks_.hi[c]; ++l) layer_card_[(size_t) l] = (int) c;
-            fill_share_rates();
-        } else {
-            err = s_.name + ": a second card cannot open: " + pe;
-            return false;
-        }
-    }
+    peer_rows_ = h_rows;
+    main_homes_ = main_homes;
+    if (!peer_open(s_.gpus, err)) return false;
+    const int peer_slots = peers_.empty() ? 0 : peer_placement().homes;
 
     // The prompt and image buffers first, so the free memory the tier reads already lacks them. The ring of file reads
     // comes only when experts may stay in the file.
@@ -189,21 +158,6 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     }
     const uint64_t ram_floor =
         tier_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
-    if (!peers_.empty() && homes_.peer == 0) {   // a second card that would hold nothing is refused, not left idle
-        size_t card = 0;   // the first card whose block does not take one home a layer (the first card when none)
-        if (homes_.main < n_expert_) {
-            const uint64_t reserve_peer = (uint64_t) s_.peer_reserve_mib << 20;
-            for (size_t c = peers_.size(); c-- > 0;) {
-                uint64_t one = 0;
-                for (int l = blocks_.lo[c]; l < blocks_.hi[c]; ++l) one += (s_.layers[(size_t) l].blob_bytes + 255) / 256 * 256;
-                if (peers_[c]->room() < reserve_peer + one) card = c;
-            }
-        }
-        const std::string why = homes_.main >= n_expert_ ? "the main card holds every expert" : "no room for an expert";
-        err = s_.refuse_peer ? s_.refuse_peer(card + 1, why) : s_.name + ": a second card would hold nothing: " + why;
-        return false;
-    }
-
     // the base arena (homes, or copies a long prompt borrows) leaves its reserve free; plan_ext() sizes what fills it
     // beside a short prompt
     reserve_ = reserve.beside_homes;
@@ -301,17 +255,59 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     return true;
 }
 
-std::string ExpertTier::card_report(size_t card) const {
-    char b[160];
-    if (card == 0) {
-        std::snprintf(b, sizeof b, "dense, KV, %lld of %d experts per layer (%.1f GiB)", (long long) per_layer_, n_expert_, cache_.gib());
-        return b;
+// Second card `card` (1 = the first): its plain slots, then its prompt share's buffers, before the slots are sized.
+bool ExpertTier::peer_card(size_t card, int device, std::string& err) {
+    std::string pe;
+    auto p = std::make_unique<core::PeerExperts>();
+    bool ok = p->open_plain(device, n_layers_, n_expert_, s_.n_embd, s_.n_ff, peer_rows_, pe);
+    if (ok) {
+        peers_.push_back(std::move(p));
+        ok = open_share(card - 1, pe);
     }
-    const size_t c = card - 1;
-    if (c >= peers_.size()) return {};
-    const int nl = blocks_.hi[c] - blocks_.lo[c];
-    std::snprintf(b, sizeof b, "%lld experts, layers %d-%d", (long long) nl * homes_.peer, blocks_.lo[c], blocks_.hi[c] - 1);
+    if (!ok) err = s_.name + ": a second card cannot open: " + pe;
+    return ok;
+}
+
+// Every card is open with its share's buffers, so its room is what its slots will get.
+uint64_t ExpertTier::peer_room(size_t card) const { return peers_[card - 1]->room(); }
+
+// The blocks of layers, one slot of each layer as one_each counts them (bigger late layers go to more cards).
+model::PeerSpec ExpertTier::peer_spec() const {
+    model::PeerSpec s;
+    s.deal = model::PeerDeal::Blocks;
+    for (int l = 0; l < n_layers_; ++l) s.unit.push_back((s_.layers[(size_t) l].blob_bytes + 255) / 256 * 256);
+    s.block_most = n_expert_;
+    s.reserve = (uint64_t) s_.peer_reserve_mib << 20;
+    s.main_holds_all = main_homes_ >= n_expert_;
+    return s;
+}
+
+// Each card's block, then each block's prompt-share prices.
+bool ExpertTier::peer_place(const model::PeerPlacement& p, std::string&) {
+    blocks_ = {};
+    for (size_t c = 1; c < p.first.size(); ++c) {
+        blocks_.lo.push_back(p.first[c]);
+        blocks_.hi.push_back(p.end[c]);
+        for (int l = p.first[c]; l < p.end[c]; ++l) layer_card_[(size_t) l] = (int) c - 1;
+    }
+    fill_share_rates();
+    return true;
+}
+
+std::string ExpertTier::peer_main() const {
+    char b[160];
+    std::snprintf(b, sizeof b, "dense, KV, %lld of %d experts per layer (%.1f GiB)", (long long) per_layer_, n_expert_, cache_.gib());
     return b;
+}
+
+int ExpertTier::peer_take(int layer, const std::vector<int64_t>& ram_rows, int64_t main_rows, double main_bytes, int64_t peer_rows,
+                          int tokens, double pre_route_cycles) const {
+    if (rates_.empty()) return 0;
+    const prefill::ShareRates& r = rates_[(size_t) layer];
+    const double lead = r.sm_hz0 > 0 ? (double) tokens * pre_route_cycles / r.sm_hz0 : 0;
+    return prefill::peer_take(r, ram_rows, main_rows, main_bytes, peer_rows, (double) s_.layers[(size_t) layer].blob_bytes,
+                              (double) (prefill::mmq::q8_bytes(2, s_.n_embd) - prefill::mmq::q8_bytes(1, s_.n_embd)),
+                              4.0 * (double) s_.n_embd, lead);
 }
 
 // Second card `card`'s prompt share takes its buffers before the card's slots are sized, and the prices of its layers.

@@ -2,7 +2,6 @@
 // the routed experts to RAM.
 #include "models/hy4flash/model.hpp"
 
-#include "basalt/model/multi_gpu.hpp"
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/loader.hpp"
@@ -92,9 +91,7 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.path = path_;
     s.fd = fd_;
     s.range = pack_.experts_range;
-    s.peer_devices = peer_devices_;
-    if (!gpus_.given.empty()) s.peer_shares = model::peer_shares(gpus_, model::ShareUse::Experts);
-    s.refuse_peer = [g = gpus_](size_t card, const std::string& why) { return model::peer_holds_nothing(g, card, why); };
+    s.gpus = gpus_;
     s.diag_tier_ram = flags_.diag_tier_ram;
     s.diag_tier_vram = flags_.diag_tier_vram;
     s.diag_tier_frozen = flags_.diag_tier_frozen;
@@ -224,8 +221,6 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     flags_ = req;
     path_ = path;
     gpus_ = req.gpus;
-    std::vector<int> peers = req.gpus.peers();
-    peer_devices_ = std::move(peers);
     planning_ = &reads;
     model::Result r;
     for (int i = 0; r.ok() && i < std::max(req.sessions, 1); ++i) {
@@ -248,8 +243,6 @@ model::Result Hy4Model::attach(const model::LoadRequest&, std::vector<std::uniqu
     return {};
 }
 
-std::string Hy4Model::gpu_report(int card) const {
-    return shared_tier_.tier ? shared_tier_.tier->card_report((size_t) card) : std::string();
-}
+model::PeerHooks* Hy4Model::peer() const { return shared_tier_.tier.get(); }
 
 }  // namespace basalt::models::hy4flash

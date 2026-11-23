@@ -1,5 +1,4 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
-#include "basalt/model/multi_gpu.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/expert_tier.hpp"
@@ -131,9 +130,7 @@ core::ExpertTierSpec DsModel::tier_spec() const {
     s.path = path_;
     s.fd = experts_fd();
     s.range = pack_.experts_range;
-    s.peer_devices = peer_devices_;
-    if (!gpus_.given.empty()) s.peer_shares = model::peer_shares(gpus_, model::ShareUse::Experts);
-    s.refuse_peer = [g = gpus_](size_t card, const std::string& why) { return model::peer_holds_nothing(g, card, why); };
+    s.gpus = gpus_;
     s.diag_tier_ram = diag_tier_ram_;
     s.diag_tier_vram = diag_tier_vram_;
     s.diag_tier_frozen = tiers_.diag_tier_frozen;
@@ -259,16 +256,6 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
     set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
     set_tiers(req);
     gpus_ = req.gpus;
-    std::vector<int> peers = req.gpus.peers();
-    // The peer-tier kernels of this architecture are built for sm_120 only: refuse an older
-    // peer card here rather than failing at its first launch with 'no kernel image'.
-    for (int dev : peers) {
-        cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.major != 0 && !(prop.major == 12 && prop.minor == 0))
-            return {model::Status::Error, "deepseek41: GPU " + std::to_string(dev) + " (" + prop.name +
-                                              ") is not sm_120: the DeepSeek peer-tier kernels are built for Blackwell only"};
-    }
-    set_peer_devices(std::move(peers));
     // the sessions first (the drafter takes its memory with the first), then the expert tier, sized from what they leave,
     // opened by the first session; what those share queues its reads in the start's plan
     planning_ = &reads;
@@ -289,8 +276,6 @@ model::Result DsModel::attach(const model::LoadRequest&, std::vector<std::unique
     return {};
 }
 
-std::string DsModel::gpu_report(int card) const {
-    return shared_tier_.tier ? shared_tier_.tier->card_report((size_t) card) : std::string();
-}
+model::PeerHooks* DsModel::peer() const { return shared_tier_.tier.get(); }
 
 }  // namespace basalt::models::deepseek41
