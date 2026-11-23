@@ -1,5 +1,5 @@
 """The logits of a Nemotron-H NVFP4 checkpoint (Model Optimizer's export: FP8 and NVFP4 weights dequantized to their
-exact values) in float64, token by token, with NVIDIA's fast path: dt = softplus(dt_raw + dt_bias) unclamped, the
+exact values) in float64, layer by layer over the tokens, with NVIDIA's fast path: dt = softplus(dt_raw + dt_bias) unclamped, the
 norm after the gate, a sigmoid router with a selection bias, squared-ReLU experts in a latent, no positional encoding.
 The engine's end-to-end parity test (model_parity.cpp) compares its logits with these.
 
@@ -72,76 +72,76 @@ def softplus(x):
 
 
 def run(W: Weights, tokens) -> np.ndarray:
+    """Layer by layer over all the tokens (each matrix dequantized once); the recurrence and the attention in order."""
     g, p = W.g, W.p
     eps = g.eps
-    emb = W.f(p + "embeddings.weight")
+    n = len(tokens)
+    x = W.f(p + "embeddings.weight")[np.array(tokens)]      # [n][h]
     hpg = g.m_heads // g.n_groups
     G = g.d_inner // g.n_groups
-    state = {}
-    kv = {}
-    out = []
-    for tok in tokens:
-        x = emb[tok].copy()
-        for l, kind in enumerate(g.kinds):
-            b = f"{p}layers.{l}."
-            h = rms(x, W.f(b + "norm.weight"), eps)
-            m = b + "mixer."
-            if kind == "mamba":
-                if l not in state:
-                    state[l] = (np.zeros((g.m_heads, g.m_head_dim, g.d_state)), np.zeros((g.conv_dim, g.d_conv - 1)))
-                S_, hist = state[l]
-                zxbcdt = W.mat(m + "in_proj") @ h
-                z, xbc_raw, dtr = zxbcdt[:g.d_inner], zxbcdt[g.d_inner:g.d_inner + g.conv_dim], zxbcdt[g.d_inner + g.conv_dim:]
-                cw = W.f(m + "conv1d.weight")[:, 0, :]
-                taps = np.concatenate([hist, xbc_raw[:, None]], axis=1)
-                xbc = silu((cw * taps).sum(axis=1) + W.f(m + "conv1d.bias"))
-                hist[:] = taps[:, 1:]
-                xs = xbc[:g.d_inner].reshape(g.m_heads, g.m_head_dim)
-                Bm = xbc[g.d_inner:g.d_inner + g.n_groups * g.d_state].reshape(g.n_groups, g.d_state)
-                Cm = xbc[g.d_inner + g.n_groups * g.d_state:].reshape(g.n_groups, g.d_state)
-                dt = softplus(dtr + W.f(m + "dt_bias"))
-                A = -np.exp(W.f(m + "A_log"))
-                dA = np.exp(dt * A)
-                gi = np.arange(g.m_heads) // hpg
-                S_[:] = S_ * dA[:, None, None] + (dt[:, None] * xs)[:, :, None] * Bm[gi][:, None, :]
-                y = np.einsum("hpn,hn->hp", S_, Cm[gi]) + W.f(m + "D")[:, None] * xs
-                v = y.reshape(-1) * silu(z)
-                v = v.reshape(g.n_groups, G)
-                v = v / np.sqrt(np.mean(v * v, axis=1, keepdims=True) + eps)
-                v = v.reshape(-1) * W.f(m + "norm.weight")
-                o = W.mat(m + "out_proj") @ v
-            elif kind == "attention":
-                q = (W.mat(m + "q_proj") @ h).reshape(g.n_head, g.head_dim)
-                k = (W.mat(m + "k_proj") @ h).reshape(g.n_kv, g.head_dim)
-                vv = (W.mat(m + "v_proj") @ h).reshape(g.n_kv, g.head_dim)
-                kv.setdefault(l, ([], []))
-                kv[l][0].append(k)
-                kv[l][1].append(vv)
-                Ks, Vs = np.stack(kv[l][0]), np.stack(kv[l][1])      # [cells][n_kv][hd]
-                att = np.empty((g.n_head, g.head_dim))
-                for hh in range(g.n_head):
-                    kh = hh // (g.n_head // g.n_kv)
-                    s = Ks[:, kh, :] @ q[hh] / np.sqrt(g.head_dim)
-                    s = np.exp(s - s.max())
-                    att[hh] = (s / s.sum()) @ Vs[:, kh, :]
-                o = W.mat(m + "o_proj") @ att.reshape(-1)
-            else:
-                logits = W.f(m + "gate.weight") @ h
-                sc = 1.0 / (1.0 + np.exp(-logits))
-                choice = sc + W.f(m + "gate.e_score_correction_bias")
-                ids = np.argsort(-choice, kind="stable")[:g.top_k]
-                wts = sc[ids] / (sc[ids].sum() + 1e-20) * g.scale
-                lat = W.mat(m + "fc1_latent_proj") @ h if g.has_latent else h
-                acc = np.zeros_like(lat)
-                for e, wt in zip(ids, wts):
-                    u = W.mat(m + f"experts.{e}.up_proj") @ lat
-                    acc += wt * (W.mat(m + f"experts.{e}.down_proj") @ np.maximum(u, 0.0) ** 2)
-                o = W.mat(m + "fc2_latent_proj") @ acc if g.has_latent else acc
-                su = W.mat(m + "shared_experts.up_proj") @ h
-                o = o + W.mat(m + "shared_experts.down_proj") @ np.maximum(su, 0.0) ** 2
-            x = x + o
-        out.append(W.mat(W.head) @ rms(x, W.f(p + "norm_f.weight"), eps))
-    return np.stack(out)
+    for l, kind in enumerate(g.kinds):
+        b = f"{p}layers.{l}."
+        h = np.stack([rms(r, W.f(b + "norm.weight"), eps) for r in x])
+        m = b + "mixer."
+        if kind == "mamba":
+            zxbcdt = h @ W.mat(m + "in_proj").T                  # [n][pw]
+            z = zxbcdt[:, :g.d_inner]
+            xbc_raw = zxbcdt[:, g.d_inner:g.d_inner + g.conv_dim]
+            dtr = zxbcdt[:, g.d_inner + g.conv_dim:]
+            cw = W.f(m + "conv1d.weight")[:, 0, :]               # [c][k], tap k-1 the current token
+            padded = np.concatenate([np.zeros((g.d_conv - 1, g.conv_dim)), xbc_raw], axis=0)
+            conv = sum(cw[:, k] * padded[k:k + n] for k in range(g.d_conv)) + W.f(m + "conv1d.bias")
+            xbc = silu(conv)
+            dt = softplus(dtr + W.f(m + "dt_bias"))              # [n][heads]
+            A = -np.exp(W.f(m + "A_log"))
+            D = W.f(m + "D")
+            gi = np.arange(g.m_heads) // hpg
+            S_ = np.zeros((g.m_heads, g.m_head_dim, g.d_state))
+            ys = np.empty((n, g.d_inner))
+            for t in range(n):
+                xs = xbc[t, :g.d_inner].reshape(g.m_heads, g.m_head_dim)
+                Bm = xbc[t, g.d_inner:g.d_inner + g.n_groups * g.d_state].reshape(g.n_groups, g.d_state)[gi]
+                Cm = xbc[t, g.d_inner + g.n_groups * g.d_state:].reshape(g.n_groups, g.d_state)[gi]
+                dA = np.exp(dt[t] * A)
+                S_ = S_ * dA[:, None, None] + (dt[t][:, None] * xs)[:, :, None] * Bm[:, None, :]
+                ys[t] = (np.einsum("hpn,hn->hp", S_, Cm) + D[:, None] * xs).reshape(-1)
+            v = (ys * silu(z)).reshape(n, g.n_groups, G)
+            v = v / np.sqrt(np.mean(v * v, axis=2, keepdims=True) + eps)
+            v = v.reshape(n, -1) * W.f(m + "norm.weight")
+            o = v @ W.mat(m + "out_proj").T
+        elif kind == "attention":
+            q = (h @ W.mat(m + "q_proj").T).reshape(n, g.n_head, g.head_dim)
+            k = (h @ W.mat(m + "k_proj").T).reshape(n, g.n_kv, g.head_dim)
+            vv = (h @ W.mat(m + "v_proj").T).reshape(n, g.n_kv, g.head_dim)
+            att = np.empty((n, g.n_head, g.head_dim))
+            causal = np.triu(np.full((n, n), -np.inf), 1)
+            for hh in range(g.n_head):
+                kh = hh // (g.n_head // g.n_kv)
+                s = q[:, hh, :] @ k[:, kh, :].T / np.sqrt(g.head_dim) + causal
+                s = np.exp(s - s.max(axis=1, keepdims=True))
+                att[:, hh, :] = (s / s.sum(axis=1, keepdims=True)) @ vv[:, kh, :]
+            o = att.reshape(n, -1) @ W.mat(m + "o_proj").T
+        else:
+            logits = h @ W.f(m + "gate.weight").T
+            sc = 1.0 / (1.0 + np.exp(-logits))
+            choice = sc + W.f(m + "gate.e_score_correction_bias")
+            lat = h @ W.mat(m + "fc1_latent_proj").T if g.has_latent else h
+            acc = np.zeros_like(lat)
+            ids = np.argsort(-choice, axis=1, kind="stable")[:, :g.top_k]
+            for e in np.unique(ids):
+                rows, slot = np.nonzero(ids == e)
+                wt = sc[rows, e] / (np.take_along_axis(sc, ids, 1)[rows].sum(axis=1) + 1e-20) * g.scale
+                u = lat[rows] @ W.mat(m + f"experts.{e}.up_proj").T
+                acc[rows] += wt[:, None] * (np.maximum(u, 0.0) ** 2 @ W.mat(m + f"experts.{e}.down_proj").T)
+                W.cache.pop(m + f"experts.{e}.up_proj", None)
+                W.cache.pop(m + f"experts.{e}.down_proj", None)
+            o = acc @ W.mat(m + "fc2_latent_proj").T if g.has_latent else acc
+            su = h @ W.mat(m + "shared_experts.up_proj").T
+            o = o + np.maximum(su, 0.0) ** 2 @ W.mat(m + "shared_experts.down_proj").T
+        x = x + o
+        W.cache.clear()
+    hn = np.stack([rms(r, W.f(p + "norm_f.weight"), eps) for r in x])
+    return hn @ W.mat(W.head).T
 
 
 def main():
