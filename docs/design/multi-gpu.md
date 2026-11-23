@@ -182,7 +182,7 @@ D = deleted. H = moves behind a hook. K = kept as a mechanic inside its mode.
 | DeepSeek | its peer card must be sm_120, checked in its plan | `deepseek41/model.cpp` | | D (step 4): `GpuModes::peer_ada` false, refused before the load |
 | 27B | `plan_split` (alike/unlike), `second_card_runs_layers`, the stage priced per read (`kPriceMargin` 0.95), the stage off under `--kv-resident` | `dense/split_plan.cpp:46-58`, `dense/stage.cpp:177`, `qwen35/adapter.cpp:319-345` | the mode, the cut, on/off per read | D (steps 2, 7): `split_spec` + `split_cut`, `stage_cuts` within the last 20 layers; `--kv-resident` is a peer refusal |
 | 27B, Inkling | `--diag-split-at` | `qwen35/adapter.cpp:653`, `inkling2/adapter.cpp:58` | | D (step 2): one shared `--diag-gpu-cut L` (decision 7) |
-| Inkling | `plan_cards`: `plan_multi_gpu`, "CUDA1 idles" | `inkling2/model.cpp:234-237`, `:603-664` | split vs main alone | H: split cut by share (step 2); peer is new |
+| Inkling | `plan_cards`: `plan_multi_gpu`, "CUDA1 idles" | `inkling2/model.cpp:234-237`, `:603-664` | split vs main alone | H (step 8): `SplitHooks`, cut by share; peer is new |
 | Inkling | `max_expert_cards` 1 | `inkling2/adapter.cpp:48` | | D: `gpu_modes()` |
 
 Docs that describe the auto logic go with it: `docs/configuration/gpus.md` (rewritten), `configuration/index.md:86-87`,
@@ -214,9 +214,9 @@ Docs that describe the auto logic go with it: `docs/configuration/gpus.md` (rewr
   it, 51 at the default bandwidth shares), decoding stays on the main card; a peer that would read nothing (`--kv-resident`, no prompt
   to read at the context, no room for its layers) is refused. Split cuts the bytes per layer plus cells and state by the shares (41
   at the default free-VRAM shares), each layer's cells and state on its card; `batch_captured` stays false. Both greedy identical.
-- **Inkling, split:** `plan_cards` keeps its byte accounting (`mm.layer_bytes`, `layer_caches`, `split_handoffs`) as
-  `split_spec`; the cut comes from the share. The placement code (branch `inksplit`) stays separable and becomes the hook. A
-  split card still holds every expert of its layers.
+- **Inkling, split (built, step 8):** `InklingModel` derives `SplitHooks`: `split_spec` is the old `plan_cards` byte accounting (per layer
+  its experts, dense rows and visits' caches; per card the head, scratch and drafter), `split_place` takes the cut and devices, the cut
+  follows the shares. Bitwise against one card (tokens and logit rows after a 75K prompt; no cuBLAS, so no `--diag-main-card-bits`); speed equal to step 7.
 - **Inkling, peer (new):** spilled experts move from RAM to the peer's VRAM. `CpuExperts` (`inkling2/cpu_experts.hpp`, #536)
   already sends a layer's rows and choices off the card after the router and merges them before the combine. Peer mode keeps
   that shape: `start` copies rows and ids to the peer (device to device through `card_link`), the peer computes its pairs with
@@ -292,7 +292,7 @@ Everything happens on the unpushed box branch `mgpu`, one agent at a time. Every
 | 5 | Flash-Next peer on the hooks; the FP4 streamed share measured or deleted (done) | no speed loss vs v0.5.6 with Jay's config (see below); greedy identical; prompt stages bitwise |
 | 6 | Flash-Next split on the hooks (done) | bitwise vs `split_same`; it runs on 5090 + 5060 Ti, numbers reported |
 | 7 | Qwen3.8-27B peer and split on the hooks (done) | both modes greedy identical to one card; 64K prefill in peer mode gains over one card, decode no worse; split's cells on the second card |
-| 8 | Inkling split on the hooks (from `inksplit`) | bitwise vs single card at a context it fits |
+| 8 | Inkling split on the hooks (from `inksplit`) | bitwise vs single card at a context it fits (done) |
 | 9 | Inkling peer: spilled experts on the peer through the `CpuExperts` shape | prefill gains and decode doesn't lose vs single card at 524,288 fp8; KLD and top-1 same or better; peer rows bitwise |
 | 10 | Docs: `configuration/gpus.md` rewritten, index rows, model pages, `adding-a-model.md` (a "Several GPUs" step like batching's), 0.5.7 changelog's breaking note | docs under 300 lines each; serve tests; no-GPU ctest |
 
