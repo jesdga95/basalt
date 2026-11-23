@@ -213,10 +213,38 @@ class Tokens(unittest.TestCase):
     def test_the_markers(self):
         d = Inkling2()
         self.assertEqual(d.reasoning_close, END)
+        self.assertEqual(d.answer_lead, HEADER + TEXT)
         self.assertEqual((d.image_start, d.image_pad), (IMAGE, IMAGE_PAD))
         self.assertTrue(d.in_engine_vision)
         self.assertEqual(d.forced_opening("f"), HEADER + "f" + TOOL_JSON + '{"name":"f","args":')
         self.assertEqual(d.forced_opening(None), HEADER)
+
+    def test_thinking_budget_wrap_opens_answer_block(self):
+        # Regression for #588: after reasoning_close (<|end_message|>), Inkling 2 opens an answer block
+        # (<|message_model|><|content_text|>) unless a tool call is forced, so it cannot reopen thinking.
+        import threading
+        svc = service()
+        tok = svc.tok
+        answer_lead_ids = tok.encode(HEADER + TEXT, parse_special=True)
+        thought_ids = tok.encode(HEADER + THINK + "pondering " * 30, parse_special=True)
+        reopen_ids = tok.encode(HEADER + THINK + "still pondering " * 30, parse_special=True)
+        answer_ids = tok.encode("the answer" + END + END_TURN, parse_special=True)
+        prompts = []
+
+        def scripted(ids, max_new, sampling, cancel, embeddings=None, session=None):
+            prompts.append(list(ids))
+            seq = thought_ids if len(prompts) == 1 else (
+                answer_ids if list(ids)[-len(answer_lead_ids):] == answer_lead_ids else reopen_ids)
+            for t in seq[:int(max_new)]:
+                yield t
+
+        svc.engine.generate = scripted
+        ids = svc.encode_prompt([{"role": "user", "content": "hi"}], None, {})
+        evs = [x for k, x in svc.run(ids, True, None, 200, {"reasoning_budget_tokens": 10}, threading.Event())
+               if k == "event"]
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(prompts[1][-len(answer_lead_ids):], answer_lead_ids)
+        self.assertIn(("content", "the answer"), merged(evs))
 
     def test_message_text_cannot_write_the_models_tokens(self):
         svc = service()

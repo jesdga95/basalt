@@ -9,6 +9,7 @@ class Dialect:
     name = ""
     stop_texts: tuple[str, ...] = ()        # texts that end the model's turn
     reasoning_close = ""                    # closes thinking the model left open, or that reached its budget or repeats one token
+    answer_lead = ""                        # opens the answer block after reasoning_close when no tool call is forced
     forced_call_ends_reply = False          # a named tool_choice ends the reply after its one call
     nothink_lead = ""                       # text between a no-thinking prompt and a forced call's opening
     call_newlines = 2                       # newlines the model writes between its thinking and a call

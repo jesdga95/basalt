@@ -1684,7 +1684,7 @@ class Service:
                         # one, so the engine keeps its prefix
                         if ended_thinking:
                             closed_early = True
-                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
+                            extra = self.tok.encode(self.dialect.reasoning_close + (force or self.dialect.answer_lead), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 finish = "stop"
@@ -1692,7 +1692,7 @@ class Service:
                             print("[server] the model ended while thinking, closing it for an answer", flush=True)
                         elif wrap:
                             budget = None
-                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
+                            extra = self.tok.encode(self.dialect.reasoning_close + (force or self.dialect.answer_lead), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 break                   # no room to answer: "length"
