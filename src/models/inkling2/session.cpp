@@ -554,7 +554,9 @@ public:
         if (!m_.copies()) return {};
         cudaStreamSynchronize(stream_);
         const int64_t before = m_.promoted();
-        if (!m_.lend(low, stream_)) return {model::Status::Error, "inkling2: the expert copies could not go back to RAM"};
+        if (!m_.lend(low, stream_))
+            return {model::Status::Error, low ? "inkling2: the expert copies could not go back to RAM"
+                                              : "inkling2: the expert copies could not come back to the card"};
         basalt::log::info("basalt inkling2", low ? "sleep: %lld expert copies go back to RAM (decode reads them there)" : "wake: %lld expert copies return to the card",
                           (long long) (low ? before : m_.promoted()));
         expert_slots = expert_pairs() - m_.spill().spilled + m_.promoted();

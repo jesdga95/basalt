@@ -718,6 +718,7 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
         cudaMemGetInfo(&was_b, &total_b);
         used0_ = (uint64_t) (total_b - was_b);
         const uint64_t moved = promote(held_free(kCardSpare));
+        if (wedged_) return {model::Status::Error, "inkling2: the expert copies could not be placed"};
         cudaMemGetInfo(&free_b, &total_b);
         if (elastic_)
             basalt::log::info("basalt inkling2", "elastic spill: %lld of %lld RAM experts copied back to the card (%.2f GiB), %.0f -> %.0f MiB "
@@ -846,7 +847,7 @@ bool InklingModel::lend(bool low, void* stream) {
         lent_ = false;
         promote(held_free(kCardSpare));
     }
-    return true;
+    return !wedged_;
 }
 
 const uint8_t* InklingModel::ram_blob(int l, int e) const {
