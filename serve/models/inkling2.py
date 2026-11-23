@@ -39,6 +39,7 @@ class _Blocks:
         self.state = "between"
         self.buf = ""
         self.stream_tools = stream_tools
+        self.calls = bool(tools)        # no tools offered (none in the request, or tool_choice "none"): no calls
         self.call: ToolCall | None = None
         self.head = ""                  # the call's `{"name":...,"args":` prefix, once read
         self.raw = ""                   # the call's JSON so far
@@ -105,7 +106,7 @@ class _Blocks:
                 return False
             self.buf, self.state = rest, "content"
             return True
-        self.buf, self.state = rest, "name"
+        self.buf, self.state = rest, "name" if self.calls else "content"
         return True
 
     # ------------------------------------------------------------------ a tool call
@@ -123,6 +124,10 @@ class _Blocks:
         return True
 
     def _open_call(self, out: list, name: str) -> None:
+        if not self.calls:              # the request offers no tools: the call is text, its marker and JSON as written
+            out.append(Event("content", TOOL_JSON))
+            self.state = "literal_call"
+            return
         self.call = ToolCall(name=name, arguments={})
         self.state, self.head, self.raw, self.streamed, self.started = "call", "", "", 0, False
         self.json, self.fed = frontend.JsonPrefix(), 0
@@ -168,8 +173,14 @@ class _Blocks:
         end = self.buf.find(END)
         keep = 0 if end >= 0 else frontend.hold_back(self.buf, (END,))
         take = self.buf[:end] if end >= 0 else self.buf[:len(self.buf) - keep]
-        self.raw += take
         self.buf = self.buf[end + len(END):] if end >= 0 else self.buf[len(self.buf) - keep:]
+        if self.state == "literal_call":
+            if take:
+                out.append(Event("content", take))
+            if end >= 0:
+                self.state = "between"
+            return end >= 0
+        self.raw += take
         self._start(out)
         self._stream_args(out)
         if end < 0:
@@ -436,7 +447,8 @@ class _XmlCalls(frontend.CodeTracker):
 
 class Inkling2Parser(_Blocks):
     """The block parser, and the XML-written calls of the answer text read as calls (see _XmlCalls) when the request
-    offers tools."""
+    offers tools. A request that offers none (tool_choice "none" offers none) gets no calls in either notation: what
+    the model writes as one is text."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = True):
         super().__init__(thinking=thinking, tools=tools, stream_tools=stream_tools)
