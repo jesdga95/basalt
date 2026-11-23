@@ -84,6 +84,5 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 `--exp NAME=VALUE[,...]` sets experiment switches. They carry no stability promise and go away with their experiment.
 
 - `concur9_logit_hash=1`: print a hash of each accepted row's head logits on stderr.
-- `concur5_digest=1`: batch slots print a state digest per window.
 - `spec_log=1`: with `--draft-log`, also write each row's target distribution.
 - `host_ev=1`: print GPU time per window's verify, commit and draft, and the idle gap.

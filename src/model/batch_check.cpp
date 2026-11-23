@@ -89,6 +89,8 @@ Result check_batch(ModelSession* const* ss, int n, const std::vector<int32_t>& p
                 reqs.push_back(r);
             }
             if (Result e = peers[0]->decode_batch(peers.data(), reqs.data(), (int) peers.size()); !e.ok()) return e;
+            const std::vector<int> ones(peers.size(), 1);   // each keeps its first row
+            if (Result e = peers[0]->decode_kept(peers.data(), ones.data(), (int) peers.size()); !e.ok()) return e;
             std::string line = "round " + std::to_string(round) + ", session x rows:";
             int bad = 0;
             for (size_t k = 0; k < rows.size(); ++k) {

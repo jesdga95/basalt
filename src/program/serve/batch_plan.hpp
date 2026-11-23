@@ -1,11 +1,17 @@
 // src/program/serve/batch_plan.hpp - how a round's windows share a batch's rows (header-only, no GPU).
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <utility>
 #include <vector>
 
 namespace basalt::program::serve {
+
+/// The drafts to ask for the next window: up to one more than the window just verified used (at least 2), so a chained
+/// drafter's long window grows a row at a time where its drafts pay.  A block drafter makes its whole block in one pass and
+/// offers every draft of it; the drafts read back are as many as the session made.
+inline int drafts_ahead(int T, int most) { return std::clamp(std::max(T, 2), 1, most - 1); }
 
 /// The most rows each active slot's window may take in a batch of `cap` rows. joint[i][k] is the chance slot i's drafts
 /// 0..k are all kept. With no more slots than rows, one pass serves them all: each slot takes one row, then each further

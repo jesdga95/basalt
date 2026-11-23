@@ -95,10 +95,6 @@ Flow Runtime::dispatch() {
         if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
         return Flow::next;
     }
-    if (line.rfind("BSCRIPT ", 0) == 0) {   // BSCRIPT <slot> <seed> <id,id,...>: before the slot's BGEN
-        script_command(line);
-        return Flow::next;
-    }
     if (line.rfind("BYIELD", 0) == 0) return Flow::next;   // for a prompt read that has ended meanwhile
     if (line.rfind("ENC ", 0) == 0 || line.rfind("ENCV ", 0) == 0) {   // the in-engine encoder, between requests and windows
         enc_command(line);
