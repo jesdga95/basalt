@@ -103,7 +103,7 @@ struct PeerPlacement { std::vector<int> first, end; int homes; std::vector<int> 
                        std::vector<uint64_t> bytes; std::vector<int> stage_first; };   // per card, 0 = the main card
 class PeerHooks {
 public:   // peer_card on every peer, peer_room, deal_peers (refuses a peer with nothing), peer_place; then the parts line
-    bool peer_open(const GpuCards&, std::string& err);  std::string peer_report(size_t card) const;
+    bool peer_open(const GpuCards&, std::string& err);  std::string peer_report(size_t card) const;  void peer_drop_stages();
 protected:
     virtual bool peer_card(size_t card, int device, std::string& err) = 0;  // its own buffers, whatever it is dealt
     virtual uint64_t peer_room(size_t card) const = 0;        // what is left for the deal, once every peer is open
@@ -156,17 +156,17 @@ D = deleted. H = moves behind a hook. K = kept as a mechanic inside its mode.
 | What | Where | Auto decision | Fate |
 | --- | --- | --- | --- |
 | `plan_multi_gpu` call, sets `layer_split = "auto"` | `load/qfn_run.cpp:58-79` | tier vs split | D: mode decides |
-| `peer_streamed_share` (alike cards share long chunks) | `qfn_run.cpp:83`, `:98-104` | alike/unlike | D (step 2): every peer takes the routed-only chunks' rows up to `kPeerSlowRows`, the unlike path Jay's cards run; the FP4 streamed share (`T_fp4`) is left unreached for step 5 to measure or delete |
+| `peer_streamed_share` (alike cards share long chunks) | `qfn_run.cpp:83`, `:98-104` | alike/unlike | D (step 2): every peer takes the routed-only chunks' rows up to `kPeerSlowRows`; the FP4 streamed share deleted in step 5 (its 5120-token cap sat below `stream_all_min` 6144, so no chunk reached it; rows past 2559 lose on a slower peer, ledger QP-124) |
 | `split_alike`, `split_cap` (prompt split off on 3+ unlike cards) | `qfn_run.cpp:87-93` | alike/unlike | D |
 | `layer_split` string parsing, `split_auto`, `split_same` | `qfn_run.cpp:111-170` | split on one GPU when one visible | D (the string); `split_same` stays as a diagnostic |
 | Layer-split placement priced by SMs x clock | `load/layer_plan.cpp:63-170` | the cut | D (step 2): `split_cut` over dense weights + sessions per layer |
 | Peer hot share 0.45 if the peer is not slower | `load/model.cpp:121-136`, `engine_local.cpp:76` | alike/slower | H: only with `gpu-share` given |
-| A tier holding nothing idles | `load/token_path.cpp:36-60` | idle card | D (step 2): refused |
+| A tier holding nothing idles | `load/token_path.cpp:36-60` | idle card | D: refused by the shared driver (step 5) |
 | Prompt split pricing at start and per part | `load/prompt_split.cpp:130-330`, `serve/prompt_split.cpp:9-51` | on/off, stages, cuts, "context too short" | D (step 2): fixed cuts from the Stages shares over layers 2..n; a part longer than a chunk splits while no other slot decodes (chunk floor 4096, routed-only rows and the draft layer's room kept) |
 | `--peer-exclusive` picked by RAM (`choose_auto`) | `load/resident_plan.cpp:251-273` | RAM fit, not a mode | K |
 | Head split by bandwidth, GDN split if the peer is faster | `decode/verify/head_split.cpp:24-50`, `gdn_split.cpp:26` | per-op proportion | K (open point 6) |
 | Overlapped split windows | `decode/verify/pipeline.cpp`, `qfn_run.cpp:173` | none | K |
-| `--no-peer-prefill` | `flags.cpp:113` | | D: peer mode helps prompts; use `gpu 0` |
+| `--no-peer-prefill` | `flags.cpp:113` | | D (step 5): peer mode helps prompts; use `gpu 0` |
 | `--peer-adapt-swaps`, `--peer-reserve-mib`, `--peer-exclusive` | `flags.cpp:111-112`, `cli/arguments.cpp:118` | | K: peer-mode tuning |
 
 ### The other models
@@ -190,9 +190,13 @@ Docs that describe the auto logic go with it: `docs/configuration/gpus.md` (rewr
 
 ## Migration per model
 
-- **Flash-Next, peer** (today's expert tier): the main card fills first; the peers' deal follows the shares, and the default (free
-  VRAM) gives one peer exactly what it holds today. Prompt stages take a fixed cut from the bandwidth share, no pricing.
-  `PeerHooks` wraps `resident_plan.cpp`'s `peer.open` and the stage set-up of `load/prompt_split.cpp`.
+- **Flash-Next, peer (built, step 5):** `TierPeers` (`load/peers.hpp`) is its `PeerHooks`: `peer_card` prepares a card's tier,
+  `peer_room` is its free memory less its prompt buffers and splits, `peer_spec` deals `Experts` (the ranked pairs the main card
+  lacks, hottest first; stages over layers 2..n), `peer_place` fills each tier, `peer_main` the main card's part; one path for
+  one peer or several; `peer_drop_stages` when the stages' buffers do not fit. Gate: no loss (64K 9,823 vs 9,835 tok/s). Greedy
+  identical to step 3 everywhere, to v0.5.6 once the peer holds its experts (the cut-38 stage image leaves room for one more).
+  Open since step 2: one session (no `--batch`) staging a 50K prompt at cut 37-39 differs at token 29 from v0.5.6, `--batch 4`
+  and cuts 36 and 40, also at `--spec 1`.
 - **Flash-Next, split** (today's auto layer split, now chosen): `split_spec` reports the per-layer bytes the placement already
   computes (`pool_bytes_by_layer`, `plan_bytes_by_layer`, `hc8_plan_bytes`, `session_bytes`, `layer_plan.cpp:84-100`); the
   shared cut replaces `predict`.
@@ -200,8 +204,7 @@ Docs that describe the auto logic go with it: `docs/configuration/gpus.md` (rewr
   prompt share, `peer_room` is what they leave, `peer_spec` deals `Blocks` (one 256-rounded slot per layer, the reserve
   `--peer-reserve-mib`), `peer_place` sets the blocks and the prompt-share prices, `peer_main` the main card's part. The models
   pass `GpuCards` in `ExpertTierSpec::gpus` and return the tier from `peer()`; `ExpertTier::peer_take` holds their one prompt
-  share pricing. Jay's flags: the 15K check bitwise vs the step-3 build; greedy identical to v0.5.6 on two cards and one with
-  the tier frozen (unfrozen, DeepSeek's conv and prose differ v0.5.6 against itself); two-card decode ABBA no loss.
+  share pricing. Gate: the 15K check bitwise vs step 3; greedy identical to v0.5.6 with the tier frozen; decode no loss.
 - **Qwen3.8-27B:** peer is the one prompt stage, its cut from the share in place of `price()`; decoding stays on the main card.
   Split is the layer stage, its cut from `plan_split` without the alike/unlike branches. With `gpu 0` a model that does not
   fit is refused and pointed at `gpu 0,1` with `gpu-mode split`. The split's batch path (`batch_captured` false) stays.
@@ -284,17 +287,14 @@ Everything happens on the unpushed box branch `mgpu`, one agent at a time. Every
 | 2 | Shared layer: `model/multi_gpu.hpp`, refusals, shares, start lines, `core/card_link`; every pricing and auto pick deleted (`plan_multi_gpu`, `price_prompt_split`, `plan_split`, the alike gates, the 27B stage's pricing, Flash-Next's `predict`, `choose_roles`); every model takes `GpuCards` and the shared cut, deal and stage cuts | builds; cut, deal and refusal tests; single-card identity on three models; two-card starts per mode |
 | 3 | Conformance: `model/gpu_check.hpp`, `--diag-gpu-check`, `tools/gpu_identity.py` | the check passes on the 27B prompt stage (bitwise) before any migration |
 | 4 | DeepSeek and Hy4 peer on the hooks (done) | greedy identical to v0.5.6 on two cards; two-card decode ABBA x1 no loss (DeepSeek is judged on two cards) |
-| 5 | Flash-Next peer on the hooks; the FP4 streamed share measured or deleted | no speed loss vs v0.5.6 with Jay's config (see below); greedy identical; prompt stages bitwise |
+| 5 | Flash-Next peer on the hooks; the FP4 streamed share measured or deleted (done) | no speed loss vs v0.5.6 with Jay's config (see below); greedy identical; prompt stages bitwise |
 | 6 | Flash-Next split on the hooks; `split_same` set by `--diag-gpu-check` | bitwise vs `split_same`; it runs on 5090 + 5060 Ti, numbers reported |
 | 7 | Qwen3.8-27B peer and split on the hooks; `second_card_runs_layers` gone | both modes bitwise vs single card; 64K prefill in peer mode no loss vs v0.5.6 on two cards |
 | 8 | Inkling split on the hooks (from `inksplit`) | bitwise vs single card at a context it fits |
 | 9 | Inkling peer: spilled experts on the peer through the `CpuExperts` shape | prefill gains and decode doesn't lose vs single card at 524,288 fp8; KLD and top-1 same or better; peer rows bitwise |
 | 10 | Docs: `configuration/gpus.md` rewritten, index rows, model pages, `adding-a-model.md` (a "Several GPUs" step like batching's), 0.5.7 changelog's breaking note | docs under 300 lines each; serve tests; no-GPU ctest |
 
-The Flash-Next gate (step 5): the "Qwen 3.8 FN" entry of `/mnt/nvme/models/basalt_config.json` (read only: `kv int8`,
-`parallel 4`, `max-context 262144`, `pool-workers 8`), v0.5.6 with `gpu auto` against `mgpu` with `gpu all` and `gpu-mode peer`,
-all else equal. `bench.sh` x2 (the second counts), `~/tools/prefill-any.sh 64k` and a 16K prompt (the fixed stage cut), pinned
-ABBA x1, 400 W + 180 W. Any loss outside noise stops the step.
+The Flash-Next gate (step 5, passed): Jay's "Qwen 3.8 FN" entry, v0.5.6 `gpu auto` against `gpu all` + peer, ABBA, 400 W + 180 W.
 
 After the docs land, Jay's config becomes `"gpu": "all", "gpu-mode": "peer"` for Flash-Next, DeepSeek and Hy4, and `"gpu": "0"`
 for the 27B and Inkling. That edit is Jay's call. Every entry says `"gpu": "auto"` today, so the old config stops loading on `mgpu`.
