@@ -145,6 +145,7 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
 }
 
 std::optional<int> finish_flags(Options& o) {
+    if (o.diag_batch_check) o.serve = true;   // the batch slots exist in the serving engine, which runs the check
     if (o.resident_budget_given) {   // the resident mode with a RAM budget
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
         o.resident_headroom = 0;
