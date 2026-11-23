@@ -57,13 +57,16 @@ as fast as through MMQ.
 - **`--kv fp16` (default):** keys and values as fp16.
 - **`--kv fp8`:** E4M3 codes with a unit scale. Keys are L2-clipped and values RMS-normed by construction, so they fit E4M3's
   range without a scale. A row uses 128 bytes.
-- **`--kv int8`:** signed INT8 codes, with an FP16 scale for each 64-channel group. A row uses 144 bytes, about 44% less than
-  FP16's 256 bytes and 12.5% more than FP8. Decode rows of a full-attention cache at 32,768 keys and more read it on the
-  tensor cores: the key codes are staged to fp16 exactly and each 64-channel group's fp32 QK partial takes its scale after
-  the accumulation; queries and the dequantized values round to fp16; the probabilities are scaled by 2^15 before they
-  round to fp16 for the value product, and the fp32 numerator drops that scale before the split merge, while the softmax
-  denominator sums the unscaled fp32 probabilities. A row's arithmetic is the same alone and in a verify window at the same
-  key count, but not bit-identical to the scalar reader, which shallower rows and the sliding-window layers keep.
+- **`--kv int8`:** signed INT8 codes, with an FP16 scale for each 64-channel group: the scale is the group's largest
+  magnitude over 127 rounded to fp16, a code the value over it rounded to nearest even and clamped to ±127. A row uses 144
+  bytes (128 codes, 2 scales, 12 zero bytes), about 44% less than FP16's 256 bytes and 12.5% more than FP8. Decode scores
+  keys in fp32 from code × scale (exact), values go to fp16 tiles rounded once from the same product. Decode rows of a
+  full-attention cache at 32,768 keys and more read it on the tensor cores instead: the key codes are staged to fp16
+  exactly and each 64-channel group's fp32 QK partial takes its scale after the accumulation; queries and the dequantized
+  values round to fp16; the probabilities are scaled by 2^15 before they round to fp16 for the value product, and the fp32
+  numerator drops that scale before the split merge, while the softmax denominator sums the unscaled fp32 probabilities. A
+  row's arithmetic is the same alone and in a verify window at the same key count, but not bit-identical to the scalar
+  reader, which shallower rows and the sliding-window layers keep.
 
 ## Against the reference
 
@@ -84,6 +87,9 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | MX8 pack, 100 chunks, the whole model on the card | 0.00297 | 97.83% | |
 | MX8 pack, 20 chunks | 0.00265 | | |
 | MX8 pack, 100 chunks, experts in RAM on the CPU | 0.00303 | 97.72% | |
+| 100 chunks, `--kv int8` (#552's build) | 0.00344 | 97.79% | 7.0762 (base 7.0644) |
+| 100 chunks, `--kv fp8` (#552's build) | 0.00443 | 97.29% | 7.0702 (base 7.0644) |
+| 100 chunks, `--kv fp16` (#552's build), the same set of runs as the two rows above | 0.00310 | 97.78% | 7.0695 (base 7.0644) |
 
 RTX 5090 at 475 W, the whole model on the card, unless a row says otherwise. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512). The FP8 and INT8 quality/KLD values above predate this rebase; KLD was not rerun because the reference corpus is unavailable.
 
