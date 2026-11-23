@@ -28,7 +28,7 @@ int token_path(Context& context) {
     std::vector<std::unique_ptr<basalt::core::PeerExperts>> xpeers;
     TierPeers peers(peer, xpeers);
     if (o.peer_device >= 1 && (profile.empty() || srcp == nullptr || o.expert_cache <= 0)) {
-        basalt::log::error("basalt generate", "a second GPU as expert tier needs an expert profile and the expert cache; run on one GPU (--gpu 0)");
+        basalt::log::error("basalt generate", "a peer card (gpu-mode peer) needs an expert profile and the expert cache; run on one GPU (--gpu 0)");
         return 1;
     }
 

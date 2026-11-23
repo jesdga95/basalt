@@ -240,7 +240,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     }
     basalt::log::info(s_.area.c_str(), "expert homes of %d per layer: main card %d, second card %d, RAM %d, file %d; main card copies %lld",
                  n_expert_, homes_.main, homes_.peer, homes_.ram, homes_.file, (long long) (per_layer_ + ext_per_layer_ - homes_.main));
-    program::warn_spill(spill(), peers_.empty() ? ", or --gpu 0,1" : "");
+    program::warn_spill(spill(), peers_.empty() ? ", or --gpu 0,1 --gpu-mode peer" : "");
     basalt::log::info(s_.area.c_str(), "VRAM expert tier %.2f GiB, %lld of %d experts per layer (%.0f%%); CPU pool %d workers",
                  cache_.gib(), (long long) per_layer_, n_expert_, 100.0 * (double) per_layer_ / n_expert_, pool_->workers());
     bool uniform = true;
