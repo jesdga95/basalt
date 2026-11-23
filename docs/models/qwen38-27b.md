@@ -32,8 +32,12 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
   (up to 262,144 x F; [configuration](../configuration/index.md#context-and-kv-cache)), which also changes short prompts'
   output, so leave it off below 262,144 ([precision](../precision/qwen38-27b.md#context-past-262144)). The KV cache is allocated at start for every slot:
   `--kv fp16` (default) takes 64 KiB per position over the 16 attention layers, `--kv int8` 33 KiB (int8 codes with an fp16
-  scale per 64 values; [precision](../precision/qwen38-27b.md)). On a 32 GB card one slot holds about 190K positions in fp16
-  and the full 262,144 in int8. The start refuses a context that does not fit and names the free memory.
+  scale per 64 values), `--kv nvfp4` 18 KiB (E2M1 codes with an E4M3 scale per 16 values, keys turned by a Hadamard
+  transform; [precision](../precision/qwen38-27b.md)). On a 32 GB card one slot holds about 190K positions in fp16 and the
+  full 262,144 in int8. `--kv nvfp4` adds one int8 copy of a layer's positions that prompt chunks read (2 KiB per position
+  of `--max-context`), runs on one card (`gpu auto` leaves the others idle, a list of several is refused) and not with
+  `--kv-resident`. The start refuses a context that does not fit and
+  names the free memory.
 - **K/V streaming:** `--kv-resident N` (default 0, off) keeps each attention layer's first N positions on the card and the
   rest in page-locked RAM, so a context or `--parallel` whose cache does not fit the card still starts. Attention reads every
   position for every token, so each decoded token reads all positions past N over the bus: decode slows with every position

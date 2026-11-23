@@ -14,7 +14,7 @@ file and picks the chat format, tool syntax and thinking switch. Several models 
 | Reasoning effort | `none`, `low`, `medium`, `high`, `max` (`high` = `max`); a number is refused | `none`, `low` (50), `medium` and `high` (75), `max` (100), or 1 to 100 | as Flash-Next | `none`, `low`, `medium`, `high`, `max` (all but `none` and `max` are `high`); a number is refused | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or 1 to 100 |
 | Images | `--vision dynamic`, a GPU number or `cpu` | `--vision dynamic` only | `--vision dynamic` | `--vision dynamic` only | `--vision dynamic` only |
 | Video | with images, and FFmpeg on the machine ([video](../running.md#video)) | no | with images, and FFmpeg on the machine | no | no |
-| `--kv` | fp16 (default), int8, q4_0, k8v4 | fp8 (default: FP8 window, FP4 compressed rows), fp16 | fp16 (default), int8 | fp16 (default), fp8 | fp16 (default), fp8 |
+| `--kv` | fp16 (default), int8, q4_0, k8v4 | fp8 (default: FP8 window, FP4 compressed rows), fp16 | fp16 (default), int8, nvfp4 | fp16 (default), fp8 | fp16 (default), fp8 |
 | Cards | main card plus up to three expert-tier cards | main card plus one expert-tier card | main card only | main card plus up to three expert-tier cards | main card, experts in RAM when the context needs their room; or two cards as a layer split |
 | Layer split | yes, matched cards, priced at start | no | no | no | yes, matched cards, priced at start |
 | Parallel slots | yes; each slot drafts | yes; each slot drafts | yes; each slot drafts | not measured | not measured |

@@ -3,7 +3,7 @@
 // (24 query heads, 4 KV heads, 256 wide, 64 rotated dims, interleaved M-RoPE sections 11/11/10), unscaled and under YaRN.
 //
 // Checks: each kernel's max absolute and relative error to the reference (the int8 prompt kernel's narrow, split and
-// 8-warp launches); a decode row's output is bitwise the same
+// 8-warp launches; writes to and reads from int8 and NVFP4 caches); a decode row's output is bitwise the same
 // whatever the window width or the row's place in it; the prompt kernel's rows agree with decode's within fp16 rounding.
 // Exit 77 without a GPU.  Prints one line per check and a microbench line for the decode and prompt kernels.
 #include "basalt/kernels/dense_ops.hpp"
@@ -69,6 +69,105 @@ struct Err {
         rel = std::max(rel, std::fabs(got - want) / std::max(std::fabs(want), 1e-2));
     }
 };
+
+// NVFP4 cells as the cache stores them (KvInt8::fp4): an E4M3 scale byte per 16 values, E2M1 codes two to a byte (value 2i
+// in byte i's low nibble)
+float e4m3_value(uint8_t b) {
+    const int e = (b >> 3) & 15, m = b & 7;
+    return e ? std::ldexp(1.0f + m / 8.0f, e - 7) : std::ldexp(m / 8.0f, -6);
+}
+
+// the nearest finite positive E4M3 code, ties to the even code, saturated at 448
+uint8_t e4m3_code(float v) {
+    uint8_t best = 0;
+    float bd = INFINITY;
+    for (int b = 0; b <= 0x7e; ++b) {
+        const float d = std::fabs(v - e4m3_value((uint8_t) b));
+        if (d < bd || (d == bd && !(b & 1))) {
+            bd = d;
+            best = (uint8_t) b;
+        }
+    }
+    return best;
+}
+
+const float kE2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+// the nearest E2M1 code, ties to even, bit 3 the sign
+uint8_t e2m1_code(float v) {
+    const float a = std::fabs(v);
+    const int m = a <= 0.25f ? 0 : a < 0.75f ? 1 : a <= 1.25f ? 2 : a < 1.75f ? 3 : a <= 2.5f ? 4 : a < 3.5f ? 5 : a <= 5.0f ? 6 : 7;
+    return (uint8_t) (m | (std::signbit(v) ? 8 : 0));
+}
+
+float e2m1_value(uint8_t c) { return (c & 8 ? -1.0f : 1.0f) * kE2m1[c & 7]; }
+
+// The write rule: per 16 values the scale amax / 6 (floored so an all-zero group's is finite), each value the nearest
+// code against the decoded scale.  `deq`: each value as the decode kernel reads it (code x scale, rounded to fp16).
+void quant4(const std::vector<float>& x, std::vector<uint8_t>& codes, std::vector<uint8_t>& scales, std::vector<uint16_t>& deq) {
+    codes.assign(x.size() / 2, 0);
+    scales.assign(x.size() / 16, 0);
+    deq.assign(x.size(), 0);
+    for (size_t g = 0; g < x.size() / 16; ++g) {
+        float amax = 0;
+        for (int i = 0; i < 16; ++i) amax = std::max(amax, std::fabs(x[g * 16 + i]));
+        scales[g] = e4m3_code(std::max(amax, 6.0f * 0.001953125f) / 6.0f);
+        const float s = e4m3_value(scales[g]);
+        for (int i = 0; i < 16; ++i) {
+            const size_t at = g * 16 + i;
+            const uint8_t c = e2m1_code(std::min(std::max(x[at] / s, -6.0f), 6.0f));
+            codes[at / 2] |= (uint8_t) (c << (4 * (at & 1)));
+            deq[at] = basalt::kernels::f16_from_f32(e2m1_value(c) * s);
+        }
+    }
+}
+
+uint8_t code_at(const std::vector<uint8_t>& codes, size_t at) { return (uint8_t) ((codes[at / 2] >> (4 * (at & 1))) & 15); }
+
+// device NVFP4 buffers for `values` cache values (K and V each)
+basalt::kernels::KvInt8 alloc4(size_t values) {
+    basalt::kernels::KvInt8 f;
+    f.fp4 = true;
+    ck(cudaMalloc(&f.k, values / 2), "malloc");
+    ck(cudaMalloc(&f.v, values / 2), "malloc");
+    ck(cudaMalloc(&f.ks, values / 16), "malloc");
+    ck(cudaMalloc(&f.vs, values / 16), "malloc");
+    return f;
+}
+
+void free4(const basalt::kernels::KvInt8& f) {
+    cudaFree(f.k);
+    cudaFree(f.v);
+    cudaFree(f.ks);
+    cudaFree(f.vs);
+}
+
+// the normalized 256-point Hadamard transform (Sylvester order) of one head's values
+void hadamard256(const double* y, double* out) {
+    for (int i = 0; i < 256; ++i) {
+        double a = 0;
+        for (int j = 0; j < 256; ++j) {
+            int bits = 0;
+            for (unsigned m = (unsigned) (i & j); m; m &= m - 1) ++bits;
+            a += (bits & 1) ? -y[j] : y[j];
+        }
+        out[i] = a / 16.0;
+    }
+}
+
+uint16_t bf16_from_f32(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+
+float f32_from_bf16(uint16_t h) {
+    const uint32_t u = (uint32_t) h << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
 
 }  // namespace
 
@@ -164,6 +263,178 @@ int main(int argc, char** argv) {
         std::printf("attn_qk_prepare%s: q max abs %.3g rel %.3g; k (fp16 cache) max abs %.3g rel %.3g\n", yarn ? " (YaRN x2)" : "",
                     eq.abs, eq.rel, ek.abs, ek.rel);
         if (eq.abs > 1e-3 || ek.rel > 2e-3) ++fails;
+    }
+
+    // ---- attn_qk_prepare into an NVFP4 cache: the queries and keys turned by the Hadamard transform, the keys' and values'
+    // codes and scales by the write rule; the BF16 form writes the same cells bit for bit
+    {
+        std::mt19937 wr(11);   // its own draws, so the checks after it see the same inputs as before it
+        const int T = 3;
+        const int64_t cell0 = 10;
+        const size_t cellv = (size_t) (cell0 + T) * NKV * HD;
+        std::vector<float> qf((size_t) T * NH * 2 * HD), k((size_t) T * NKV * HD), v(k.size()), qn(HD), kn(HD);
+        // bf16-representable inputs, so the two forms read the same values
+        const auto bfr = [](float x) { return f32_from_bf16(bf16_from_f32(x)); };
+        for (auto& x : qf) x = bfr(nd(wr));
+        for (auto& x : k) x = bfr(nd(wr));
+        for (auto& x : v) x = bfr(nd(wr));
+        for (auto& x : qn) x = 1.0f + 0.1f * nd(wr);
+        for (auto& x : kn) x = 1.0f + 0.1f * nd(wr);
+        const std::vector<int32_t> pos = {5, 5, 5, 6, 9, 11, 7, 7, 7};
+        basalt::kernels::RopeSpec rope;
+        rope.rot = ROT;
+        rope.theta = 1e7f;
+        for (int i = 0; i < ROT / 2; ++i) rope.axis[i] = (int8_t) (i % 3 == 1 && i < 33 ? 1 : i % 3 == 2 && i < 30 ? 2 : 0);
+        float *d_qf = dev<float>(qf.size()), *d_k = dev<float>(k.size()), *d_v = dev<float>(v.size()), *d_qn = dev<float>(HD),
+              *d_kn = dev<float>(HD), *d_qo = dev<float>((size_t) T * NH * HD);
+        int32_t* d_pos = dev<int32_t>(pos.size());
+        ck(cudaMemcpy(d_qf, qf.data(), qf.size() * 4, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(d_k, k.data(), k.size() * 4, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(d_v, v.data(), v.size() * 4, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(d_qn, qn.data(), HD * 4, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(d_kn, kn.data(), HD * 4, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(d_pos, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice), "copy");
+        const basalt::kernels::KvInt8 f4 = alloc4(cellv), b4 = alloc4(cellv);
+        for (const auto& f : {f4, b4}) {
+            ck(cudaMemset(f.k, 0, cellv / 2), "memset");
+            ck(cudaMemset(f.v, 0, cellv / 2), "memset");
+            ck(cudaMemset(f.ks, 0, cellv / 16), "memset");
+            ck(cudaMemset(f.vs, 0, cellv / 16), "memset");
+        }
+        basalt::kernels::attn_qk_prepare(d_qf, d_k, d_v, d_qn, d_kn, 1e-6f, rope, d_pos, T, NH, NKV, d_qo, nullptr, nullptr, cell0,
+                                         nullptr, 256, true, 0, nullptr, f4);
+        std::vector<float> qo((size_t) T * NH * HD);
+        std::vector<uint8_t> kc4(cellv / 2), vc4(cellv / 2), ks4(cellv / 16), vs4(cellv / 16);
+        ck(cudaMemcpy(qo.data(), d_qo, qo.size() * 4, cudaMemcpyDeviceToHost), "copy");
+        ck(cudaMemcpy(kc4.data(), f4.k, kc4.size(), cudaMemcpyDeviceToHost), "copy");
+        ck(cudaMemcpy(vc4.data(), f4.v, vc4.size(), cudaMemcpyDeviceToHost), "copy");
+        ck(cudaMemcpy(ks4.data(), f4.ks, ks4.size(), cudaMemcpyDeviceToHost), "copy");
+        ck(cudaMemcpy(vs4.data(), f4.vs, vs4.size(), cudaMemcpyDeviceToHost), "copy");
+        std::vector<double> inv_freq(ROT / 2);
+        for (int i = 0; i < ROT / 2; ++i) inv_freq[(size_t) i] = std::pow(1e7, -2.0 * i / ROT);
+        Err eq;
+        size_t k_scale_off = 0, k_code_off = 0, k_far = 0, v_diff = 0;
+        for (int t = 0; t < T; ++t)
+            for (int j = 0; j < NH + NKV; ++j) {
+                const bool isq = j < NH;
+                const float* x = isq ? &qf[((size_t) t * NH + j) * 2 * HD] : &k[((size_t) t * NKV + (j - NH)) * HD];
+                const float* w = isq ? qn.data() : kn.data();
+                double ss = 0;
+                for (int i = 0; i < HD; ++i) ss += (double) x[i] * x[i];
+                const double inv = 1.0 / std::sqrt(ss / HD + 1e-6);
+                std::vector<double> y(HD), r(HD), h(HD);
+                for (int i = 0; i < HD; ++i) y[(size_t) i] = x[i] * inv * w[i];
+                r = y;
+                for (int i = 0; i < ROT / 2; ++i) {
+                    const double f = inv_freq[(size_t) i] * pos[(size_t) t * 3 + rope.axis[i]];
+                    r[(size_t) i] = y[(size_t) i] * std::cos(f) - y[(size_t) i + ROT / 2] * std::sin(f);
+                    r[(size_t) i + ROT / 2] = y[(size_t) i + ROT / 2] * std::cos(f) + y[(size_t) i] * std::sin(f);
+                }
+                hadamard256(r.data(), h.data());
+                if (isq) {
+                    for (int i = 0; i < HD; ++i) eq.add(qo[((size_t) t * NH + j) * HD + i], h[(size_t) i]);
+                    continue;
+                }
+                // the kernel rounds its own fp32 key, which can sit across a rounding edge from the double reference: the
+                // codes are counted against the rule and held to the bound the format allows
+                const size_t row = ((size_t) cell0 + t) * NKV + (size_t) (j - NH);
+                for (int gi = 0; gi < HD / 16; ++gi) {
+                    float amax = 0;
+                    for (int i = 0; i < 16; ++i) amax = std::max(amax, (float) std::fabs(h[(size_t) gi * 16 + i]));
+                    const uint8_t want = e4m3_code(std::max(amax, 6.0f * 0.001953125f) / 6.0f), got = ks4[row * 16 + (size_t) gi];
+                    k_scale_off += want != got;
+                    const float s = e4m3_value(got);
+                    for (int i = 0; i < 16; ++i) {
+                        const size_t d = (size_t) gi * 16 + i;
+                        const uint8_t c = code_at(kc4, row * HD + d);
+                        k_code_off += c != e2m1_code(std::min(std::max((float) h[d] / s, -6.0f), 6.0f));
+                        const double a = std::fabs(h[d]) / s, half = a < 2 ? 0.25 : a < 4 ? 0.5 : 1.0;
+                        if (std::fabs(e2m1_value(c) * s - h[d]) > (std::max(half, a - 6.0) + 1e-4) * s) ++k_far;
+                    }
+                }
+            }
+        // values: no transform, so the rule on the same fp32 inputs, bit for bit
+        for (int t = 0; t < T; ++t)
+            for (int j = 0; j < NKV; ++j) {
+                const float* x0 = &v[((size_t) t * NKV + j) * HD];
+                const std::vector<float> x(x0, x0 + HD);
+                std::vector<uint8_t> c, sc;
+                std::vector<uint16_t> dq;
+                quant4(x, c, sc, dq);
+                const size_t row = ((size_t) cell0 + t) * NKV + (size_t) j;
+                v_diff += std::memcmp(c.data(), &vc4[row * HD / 2], HD / 2) != 0;
+                v_diff += std::memcmp(sc.data(), &vs4[row * HD / 16], HD / 16) != 0;
+            }
+        std::printf("attn_qk_prepare (nvfp4 cache): q (Hadamard-turned) max abs %.3g rel %.3g; k: %zu of %d scales and %zu of %d "
+                    "codes off the rule on the double reference, %zu codes past the format's bound; v rows off the rule: %zu\n",
+                    eq.abs, eq.rel, k_scale_off, T * NKV * HD / 16, k_code_off, T * NKV * HD, k_far, v_diff);
+        if (eq.abs > 1e-3 || k_far || v_diff) ++fails;
+        // a row's turned queries, codes and scales are its own: every window [s, s + w) of the rows, written into a fresh
+        // cache from cell s (not the full launch's cells), gives each row the full launch's bits, alone, first or last
+        {
+            const basalt::kernels::KvInt8 w4 = alloc4(cellv);
+            float* d_qw = dev<float>((size_t) T * NH * HD);
+            const size_t qrow = (size_t) NH * HD, crow = (size_t) NKV * HD;
+            std::vector<float> qw((size_t) T * NH * HD);
+            std::vector<uint8_t> kw(cellv / 2), vw(cellv / 2), ksw(cellv / 16), vsw(cellv / 16);
+            bool rows_same = true;
+            int windows = 0;
+            for (int s = 0; s < T; ++s)
+                for (int w = 1; s + w <= T; ++w) {
+                    if (s == 0 && w == T) continue;   // the full launch itself
+                    ck(cudaMemset(w4.k, 0xab, cellv / 2), "memset");   // a cell the launch left unwritten cannot match
+                    ck(cudaMemset(w4.v, 0xab, cellv / 2), "memset");
+                    ck(cudaMemset(w4.ks, 0xab, cellv / 16), "memset");
+                    ck(cudaMemset(w4.vs, 0xab, cellv / 16), "memset");
+                    basalt::kernels::attn_qk_prepare(d_qf + (size_t) s * NH * 2 * HD, d_k + (size_t) s * crow, d_v + (size_t) s * crow,
+                                                     d_qn, d_kn, 1e-6f, rope, d_pos + (size_t) s * 3, w, NH, NKV, d_qw, nullptr,
+                                                     nullptr, s, nullptr, 256, true, 0, nullptr, w4);
+                    ck(cudaMemcpy(qw.data(), d_qw, (size_t) w * qrow * 4, cudaMemcpyDeviceToHost), "copy");
+                    ck(cudaMemcpy(kw.data(), w4.k, kw.size(), cudaMemcpyDeviceToHost), "copy");
+                    ck(cudaMemcpy(vw.data(), w4.v, vw.size(), cudaMemcpyDeviceToHost), "copy");
+                    ck(cudaMemcpy(ksw.data(), w4.ks, ksw.size(), cudaMemcpyDeviceToHost), "copy");
+                    ck(cudaMemcpy(vsw.data(), w4.vs, vsw.size(), cudaMemcpyDeviceToHost), "copy");
+                    const size_t at = (size_t) s * crow, full = ((size_t) cell0 + s) * crow, n = (size_t) w * crow;
+                    rows_same = rows_same && std::memcmp(qw.data(), &qo[(size_t) s * qrow], (size_t) w * qrow * 4) == 0 &&
+                                std::memcmp(&kw[at / 2], &kc4[full / 2], n / 2) == 0 &&
+                                std::memcmp(&vw[at / 2], &vc4[full / 2], n / 2) == 0 &&
+                                std::memcmp(&ksw[at / 16], &ks4[full / 16], n / 16) == 0 &&
+                                std::memcmp(&vsw[at / 16], &vs4[full / 16], n / 16) == 0;
+                    ++windows;
+                }
+            std::printf("attn_qk_prepare (nvfp4 cache): each row's q, codes and scales bitwise the full launch's in %d windows "
+                        "of 1-%d rows at other cells: %s\n", windows, T - 1, rows_same ? "yes" : "NO");
+            if (!rows_same) ++fails;
+            free4(w4);
+            cudaFree(d_qw);
+        }
+        // the BF16 form on the same values
+        std::vector<uint16_t> qb(qf.size()), kb(k.size()), vb(v.size());
+        for (size_t i = 0; i < qf.size(); ++i) qb[i] = bf16_from_f32(qf[i]);
+        for (size_t i = 0; i < k.size(); ++i) kb[i] = bf16_from_f32(k[i]);
+        for (size_t i = 0; i < v.size(); ++i) vb[i] = bf16_from_f32(v[i]);
+        uint16_t *d_qb = dev<uint16_t>(qb.size()), *d_kb = dev<uint16_t>(kb.size()), *d_vb = dev<uint16_t>(vb.size()),
+                 *d_qob = dev<uint16_t>((size_t) T * NH * HD);
+        ck(cudaMemcpy(d_qb, qb.data(), qb.size() * 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(d_kb, kb.data(), kb.size() * 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(d_vb, vb.data(), vb.size() * 2, cudaMemcpyHostToDevice), "copy");
+        basalt::kernels::attn_qk_prepare_bf16(d_qb, d_kb, d_vb, d_qn, d_kn, 1e-6f, rope, d_pos, T, NH, NKV, d_qob, cell0, nullptr, b4,
+                                              nullptr, nullptr);
+        std::vector<uint8_t> a(cellv / 2 + cellv / 16), bb(a.size());
+        bool same = true;
+        for (int t = 0; t < 2; ++t) {
+            ck(cudaMemcpy(a.data(), t ? f4.v : f4.k, cellv / 2, cudaMemcpyDeviceToHost), "copy");
+            ck(cudaMemcpy(a.data() + cellv / 2, t ? f4.vs : f4.ks, cellv / 16, cudaMemcpyDeviceToHost), "copy");
+            ck(cudaMemcpy(bb.data(), t ? b4.v : b4.k, cellv / 2, cudaMemcpyDeviceToHost), "copy");
+            ck(cudaMemcpy(bb.data() + cellv / 2, t ? b4.vs : b4.ks, cellv / 16, cudaMemcpyDeviceToHost), "copy");
+            same = same && a == bb;
+        }
+        std::printf("attn_qk_prepare_bf16 (nvfp4 cache): the same codes and scales as the fp32 form: %s\n", same ? "yes" : "NO");
+        if (!same) ++fails;
+        free4(f4);
+        free4(b4);
+        cudaFree(d_qf); cudaFree(d_k); cudaFree(d_v); cudaFree(d_qn); cudaFree(d_kn); cudaFree(d_qo); cudaFree(d_pos);
+        cudaFree(d_qb); cudaFree(d_kb); cudaFree(d_vb); cudaFree(d_qob);
     }
 
     // ---- attention: a cache of L cells, decode windows and a prompt chunk
@@ -382,6 +653,90 @@ int main(int argc, char** argv) {
         cudaFree(d_split);
     }
 
+    // ---- NVFP4 cache: the same cells as codes and per-16 scales (the write rule), the decode kernel against the reference
+    // on the decoded cells, a row's bits the same at every window width and beside another window in one launch; a prompt
+    // chunk through the int8 copy (kv4_to_int8) and the int8 kernel
+    {
+        const size_t n = (size_t) max_cells * NKV * HD;
+        std::vector<uint8_t> c4[2], s4[2];
+        std::vector<uint16_t> d4[2];
+        for (int t = 0; t < 2; ++t) {
+            std::vector<float> x(n);
+            for (size_t i = 0; i < n; ++i) x[i] = h2f((t ? vc : kc)[i]);
+            quant4(x, c4[t], s4[t], d4[t]);
+        }
+        const basalt::kernels::KvInt8 f4 = alloc4(n);
+        ck(cudaMemcpy(f4.k, c4[0].data(), n / 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(f4.v, c4[1].data(), n / 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(f4.ks, s4[0].data(), n / 16, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(f4.vs, s4[1].data(), n / 16, cudaMemcpyHostToDevice), "copy");
+        std::vector<double> w4((size_t) NH * HD);
+        ref_attn(&q[(size_t) (TP - 1) * NH * HD], d4[0], d4[1], p0 + TP, w4.data());
+        std::vector<float> one((size_t) NH * HD), win((size_t) TW * NH * HD);
+        bool same = true;
+        Err e4;
+        for (int T = 1; T <= TW; ++T) {
+            basalt::kernels::gqa_decode_attn(d_q + (size_t) (TP - T) * NH * HD, nullptr, nullptr, NH, NKV, p0 + TP - T, T, d_scr,
+                                             max_cells, d_out, nullptr, nullptr, f4);
+            ck(cudaMemcpy(win.data(), d_out, (size_t) T * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
+            const float* last = &win[(size_t) (T - 1) * NH * HD];
+            if (T == 1) {
+                std::memcpy(one.data(), last, one.size() * 4);
+                for (int j = 0; j < NH * HD; ++j) e4.add(one[(size_t) j], w4[(size_t) j]);
+            } else if (std::memcmp(one.data(), last, one.size() * 4) != 0) {
+                same = false;
+            }
+        }
+        std::printf("nvfp4 cache: decode max abs %.3g rel %.3g vs double on the decoded cells; the last row bitwise equal across "
+                    "widths 1-%d: %s\n", e4.abs, e4.rel, TW, same ? "yes" : "NO");
+        if (e4.abs > 1e-3 || !same) ++fails;
+        {
+            const int TA = 5, TB = 7;
+            std::vector<float> solo((size_t) (TA + TB) * NH * HD), seg(solo.size());
+            basalt::kernels::gqa_decode_attn(d_q, nullptr, nullptr, NH, NKV, 1000, TA, d_scr, max_cells, d_out, nullptr, nullptr, f4);
+            ck(cudaMemcpy(solo.data(), d_out, (size_t) TA * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
+            basalt::kernels::gqa_decode_attn(d_q + (size_t) TA * NH * HD, nullptr, nullptr, NH, NKV, 2500, TB, d_scr, max_cells, d_out,
+                                             nullptr, nullptr, f4);
+            ck(cudaMemcpy(solo.data() + (size_t) TA * NH * HD, d_out, (size_t) TB * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
+            basalt::kernels::GqaSeg sg[2];
+            sg[0].T = TA;
+            sg[0].pos0 = 1000;
+            sg[0].q8 = f4;
+            sg[1] = sg[0];
+            sg[1].T = TB;
+            sg[1].pos0 = 2500;
+            basalt::kernels::gqa_decode_attn_segs(d_q, NH, NKV, sg, 2, d_scr, max_cells, d_out, nullptr);
+            ck(cudaMemcpy(seg.data(), d_out, seg.size() * 4, cudaMemcpyDeviceToHost), "copy");
+            const bool same_seg = std::memcmp(solo.data(), seg.data(), seg.size() * 4) == 0;
+            std::printf("nvfp4 cache: windows of %d and %d rows in one launch bitwise their own launches: %s\n", TA, TB,
+                        same_seg ? "yes" : "NO");
+            if (!same_seg) ++fails;
+        }
+        {
+            basalt::kernels::KvInt8 c8;
+            ck(cudaMalloc(&c8.k, n), "malloc");
+            ck(cudaMalloc(&c8.v, n), "malloc");
+            ck(cudaMalloc(&c8.ks, n / 64 * 2), "malloc");
+            ck(cudaMalloc(&c8.vs, n / 64 * 2), "malloc");
+            basalt::kernels::kv4_to_int8(f4, c8, L, NKV, nullptr);
+            basalt::kernels::gqa_prompt_attn(d_q, nullptr, nullptr, NH, NKV, p0, TP, d_out, nullptr, c8);
+            std::vector<float> po(q.size());
+            ck(cudaMemcpy(po.data(), d_out, po.size() * 4, cudaMemcpyDeviceToHost), "copy");
+            Err p4;
+            std::vector<double> wr((size_t) NH * HD);
+            for (const int r : {0, 1, 57, 63, 64, 65, 127, 128, 255, TP - 2, TP - 1}) {
+                ref_attn(&q[(size_t) r * NH * HD], d4[0], d4[1], p0 + r + 1, wr.data());
+                for (int j = 0; j < NH * HD; ++j) p4.add(po[(size_t) r * NH * HD + j], wr[(size_t) j]);
+            }
+            std::printf("nvfp4 cache: prompt 300 rows through the int8 copy max abs %.3g rel %.3g vs double on the decoded cells\n",
+                        p4.abs, p4.rel);
+            // the int8 prompt kernel's own rounding (int8 queries, u8 probabilities) on top of the copy's int8 rounding
+            if (p4.abs > 3e-2) ++fails;
+            cudaFree(c8.k); cudaFree(c8.v); cudaFree(c8.ks); cudaFree(c8.vs);
+        }
+        free4(f4);
+    }
+
     // ---- microbench: one decode row at 3000 cells, and the 300-row chunk
     cudaEvent_t a, b;
     cudaEventCreate(&a);
@@ -444,6 +799,112 @@ int main(int argc, char** argv) {
             cudaFree(bs);
             cudaFree(bk); cudaFree(bv); cudaFree(bq); cudaFree(bo); cudaFree(b8.k); cudaFree(b8.v); cudaFree(b8.ks); cudaFree(b8.vs);
         }
+    }
+    // ---- an NVFP4 cache's int8 copy (kv4_to_int8): random codes and scales, every code and scale bit for bit the int8
+    // write rule on the decoded values
+    {
+        std::mt19937 fr(5);
+        const int64_t cells = 1000;
+        const size_t n = (size_t) cells * NKV * HD;
+        std::vector<uint8_t> c4[2] = {std::vector<uint8_t>(n / 2), std::vector<uint8_t>(n / 2)};
+        std::vector<uint8_t> s4[2] = {std::vector<uint8_t>(n / 16), std::vector<uint8_t>(n / 16)};
+        for (int t = 0; t < 2; ++t) {
+            for (auto& x : c4[t]) x = (uint8_t) fr();
+            for (auto& x : s4[t]) x = (uint8_t) (fr() % 0x7f);   // finite E4M3, sign clear, subnormals and zero included
+        }
+        const auto e4m3 = [](uint8_t b) {
+            const int e = (b >> 3) & 15, m = b & 7;
+            return e ? std::ldexp(1.0f + m / 8.0f, e - 7) : std::ldexp(m / 8.0f, -6);
+        };
+        static const float e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+        basalt::kernels::KvInt8 f4, o8;
+        f4.fp4 = true;
+        ck(cudaMalloc(&f4.k, n / 2), "malloc");
+        ck(cudaMalloc(&f4.v, n / 2), "malloc");
+        ck(cudaMalloc(&f4.ks, n / 16), "malloc");
+        ck(cudaMalloc(&f4.vs, n / 16), "malloc");
+        ck(cudaMalloc(&o8.k, n), "malloc");
+        ck(cudaMalloc(&o8.v, n), "malloc");
+        ck(cudaMalloc(&o8.ks, n / 64 * 2), "malloc");
+        ck(cudaMalloc(&o8.vs, n / 64 * 2), "malloc");
+        ck(cudaMemcpy(f4.k, c4[0].data(), n / 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(f4.v, c4[1].data(), n / 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(f4.ks, s4[0].data(), n / 16, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(f4.vs, s4[1].data(), n / 16, cudaMemcpyHostToDevice), "copy");
+        basalt::kernels::kv4_to_int8(f4, o8, cells, NKV, nullptr);
+        std::vector<int8_t> g8(n);
+        std::vector<uint16_t> gs(n / 64);
+        size_t bad = 0;
+        for (int t = 0; t < 2; ++t) {
+            ck(cudaMemcpy(g8.data(), t ? o8.v : o8.k, n, cudaMemcpyDeviceToHost), "copy");
+            ck(cudaMemcpy(gs.data(), t ? o8.vs : o8.ks, n / 64 * 2, cudaMemcpyDeviceToHost), "copy");
+            for (size_t g = 0; g < n / 64; ++g) {
+                float x[64], amax = 0;
+                for (int i = 0; i < 64; ++i) {
+                    const size_t at = g * 64 + i;
+                    const uint8_t nib = (uint8_t) ((c4[t][at / 2] >> (4 * (at & 1))) & 15);
+                    x[i] = (nib & 8 ? -1.0f : 1.0f) * e2m1[nib & 7] * e4m3(s4[t][at / 16]);
+                    amax = std::max(amax, std::fabs(x[i]));
+                }
+                const uint16_t h = basalt::kernels::f16_from_f32(amax / 127.0f);
+                const float sc = h2f(h);
+                bad += gs[g] != h;
+                for (int i = 0; i < 64; ++i) {
+                    const float r = sc > 0 ? std::max(-127.0f, std::min(127.0f, std::nearbyint(x[i] / sc))) : 0.0f;
+                    bad += g8[g * 64 + i] != (int8_t) r;
+                }
+            }
+        }
+        std::printf("kv4_to_int8: %zu of %zu codes and scales differ from the int8 rule on the decoded values\n", bad,
+                    2 * (n + n / 64));
+        if (bad) ++fails;
+        if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {   // a 172K-cell layer's copy
+            const int64_t big = 172 * 1024;
+            basalt::kernels::KvInt8 b4, b8;
+            b4.fp4 = true;
+            const size_t nb = (size_t) big * NKV * HD;
+            cudaMalloc(&b4.k, nb / 2); cudaMalloc(&b4.v, nb / 2); cudaMalloc(&b4.ks, nb / 16); cudaMalloc(&b4.vs, nb / 16);
+            cudaMalloc(&b8.k, nb); cudaMalloc(&b8.v, nb); cudaMalloc(&b8.ks, nb / 32); cudaMalloc(&b8.vs, nb / 32);
+            cudaMemset(b4.k, 0x35, nb / 2); cudaMemset(b4.v, 0x35, nb / 2); cudaMemset(b4.ks, 0x30, nb / 16); cudaMemset(b4.vs, 0x30, nb / 16);
+            basalt::kernels::kv4_to_int8(b4, b8, big, NKV, nullptr);
+            cudaEvent_t a2, b2;
+            cudaEventCreate(&a2);
+            cudaEventCreate(&b2);
+            cudaEventRecord(a2);
+            for (int i = 0; i < 10; ++i) basalt::kernels::kv4_to_int8(b4, b8, big, NKV, nullptr);
+            cudaEventRecord(b2);
+            cudaEventSynchronize(b2);
+            float ms2 = 0;
+            cudaEventElapsedTime(&ms2, a2, b2);
+            const double bytes2 = (double) nb * 2 * (0.5 + 1.0 / 16 + 1.0 + 1.0 / 32);
+            std::printf("bench: kv4_to_int8 %lld cells: %.3f ms (%.0f GB/s)\n", (long long) big, ms2 / 10, bytes2 / (ms2 / 10) / 1e6);
+            // decode windows at the end of the same cells, int8 against NVFP4
+            constexpr int TWB = basalt::kernels::kGqaMaxWindow;
+            float* dsb = dev<float>(basalt::kernels::gqa_decode_scratch_floats(big, TWB, NH));
+            float *dqb = dev<float>((size_t) TWB * NH * HD), *dob = dev<float>((size_t) TWB * NH * HD);
+            cudaMemset(dqb, 0x3C, (size_t) TWB * NH * HD * 4);
+            for (int T : {1, 16})
+                for (int fmt = 0; fmt < 2; ++fmt) {
+                    const basalt::kernels::KvInt8 kv = fmt ? b4 : b8;
+                    const auto run = [&] {
+                        basalt::kernels::gqa_decode_attn(dqb, nullptr, nullptr, NH, NKV, big - T, T, dsb, big, dob, nullptr, nullptr, kv);
+                    };
+                    for (int i = 0; i < 3; ++i) run();
+                    cudaEventRecord(a2);
+                    for (int i = 0; i < 50; ++i) run();
+                    cudaEventRecord(b2);
+                    cudaEventSynchronize(b2);
+                    cudaEventElapsedTime(&ms2, a2, b2);
+                    const double kvb = (double) big * NKV * HD * 2 * (fmt ? 0.5 + 1.0 / 16 : 1.0 + 1.0 / 32);
+                    std::printf("bench: decode %d rows x %lld cells, %s cache: %.1f us (%.0f GB/s of K/V)\n", T, (long long) big,
+                                fmt ? "nvfp4" : "int8", 1000.0 * ms2 / 50, kvb / (ms2 / 50) / 1e6);
+                }
+            cudaFree(dsb); cudaFree(dqb); cudaFree(dob);
+            cudaFree(b4.k); cudaFree(b4.v); cudaFree(b4.ks); cudaFree(b4.vs);
+            cudaFree(b8.k); cudaFree(b8.v); cudaFree(b8.ks); cudaFree(b8.vs);
+        }
+        cudaFree(f4.k); cudaFree(f4.v); cudaFree(f4.ks); cudaFree(f4.vs);
+        cudaFree(o8.k); cudaFree(o8.v); cudaFree(o8.ks); cudaFree(o8.vs);
     }
     // ---- the decode kernel's bits are frozen: random fp16 and int8 caches, many (pos0, T), a device pos0, two windows in one launch.
     // The hashes below are those of the kernel before its next-chunk fetch; a change that must not move a bit leaves them as they are.
