@@ -86,7 +86,7 @@ class Client(unittest.TestCase):
     def test_review_footer_names_the_model(self):
         body = cr.review("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", "", "",
                          chat_fn=lambda cfg, m, max_tokens=0, effort=None: '{"findings": []}', cfg={"model": "gpt-6-luna"})
-        self.assertIn("made automatically by an LLM (gpt-6-luna)", body)
+        self.assertIn("made automatically by an LLM (gpt-6-luna, medium effort)", body)
 
     def test_bad_answers_are_needs_human(self):
         bad = ["not json", "```json\n{}\n```", '{"verdict": "merge", "reason": "x"}', '{"verdict": "auto_merge"}',
@@ -189,3 +189,36 @@ class CodeReview(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Command(unittest.TestCase):
+    def test_defaults(self):
+        self.assertEqual(cr.parse_command("", "gpt-6-luna", ""), ("medium", "gpt-6-luna", "", None))
+
+    def test_settings_then_focus_with_newlines(self):
+        e, m, f, err = cr.parse_command(" effort=high model=gpt-6.2-sol check the locks\nand the abort path", "gpt-6-luna",
+                                        "gpt-6.1-terra, gpt-6.2-sol")
+        self.assertEqual((e, m, err), ("high", "gpt-6.2-sol", None))
+        self.assertEqual(f, "check the locks\nand the abort path")
+
+    def test_settings_stop_at_the_first_other_word(self):
+        self.assertEqual(cr.parse_command("check that x=5 effort=high", "gpt-6-luna", ""),
+                         ("medium", "gpt-6-luna", "check that x=5 effort=high", None))
+
+    def test_refusals(self):
+        self.assertIn("Unknown effort", cr.parse_command("effort=max", "gpt-6-luna", "")[3])
+        self.assertIn("not allowed", cr.parse_command("model=gpt-6-astra", "gpt-6-luna", "gpt-6.2-sol")[3])
+        self.assertIn("twice", cr.parse_command("effort=low effort=high", "gpt-6-luna", "")[3])
+
+    def test_effort_reaches_the_call_and_the_footer(self):
+        calls = []
+        body = cr.review("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", "", "",
+                         chat_fn=lambda c, m, max_tokens, effort=None: calls.append((max_tokens, effort)) or '{"findings": []}',
+                         cfg={"model": "gpt-6.2-sol"}, effort="high")
+        self.assertEqual(calls, [(64000, "high")])
+        self.assertIn("(gpt-6.2-sol, high effort)", body)
+
+    def test_default_effort_comes_from_the_variable(self):
+        self.assertEqual(cr.parse_command("", "gpt-6-luna", "", "low")[0], "low")
+        self.assertEqual(cr.parse_command("effort=high", "gpt-6-luna", "", "low")[0], "high")
+        self.assertIn("LLM_REVIEW_EFFORT", cr.parse_command("", "gpt-6-luna", "", "max")[3])

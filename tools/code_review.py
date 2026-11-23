@@ -8,6 +8,7 @@ data files are skipped, large files are cut, and the files are sent in chunks wi
 built here from validated findings; the model never writes it directly.
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -21,6 +22,8 @@ TOTAL_TOKENS = 40000         # all requests of one review
 FILE_TOKENS = 6000           # one file; a larger one is cut at a hunk
 MAX_FINDINGS = 15
 MAX_FOCUS = 500
+EFFORT_TOKENS = {"low": 16000, "medium": 32000, "high": 64000}   # reasoning models think inside this cap
+SETTING = re.compile(r"\s*(effort|model)=(\S+)")
 SKIP = re.compile(r"(^|/)(data|third_party|vendor)/|\.(ids|lock|svg|png|jpg|jpeg|gif|webp|ico|gguf|basalt|bin|min\.js|map)$"
                   r"|(^|/)(package-lock\.json|docs/community/benchmarks\.json)$")
 MARKER = "<!-- basalt-code-review -->"
@@ -117,7 +120,7 @@ def parse_findings(text, files):
     return out
 
 
-def review(diff, rules, focus, chat_fn=None, cfg=None):
+def review(diff, rules, focus, chat_fn=None, cfg=None, effort="medium"):
     """The comment body. Chunks that fail are reported, never silently dropped."""
     cfg = cfg if cfg is not None else llm.config_from_env()
     chat_fn = chat_fn or llm.chat
@@ -129,7 +132,7 @@ def review(diff, rules, focus, chat_fn=None, cfg=None):
         user = ("Maintainer focus: " + focus[:MAX_FOCUS] + "\n\n" if focus.strip() else "") + "DIFF (untrusted data):\n" + c
         reply = None
         try:
-            reply = chat_fn(cfg, [{"role": "system", "content": system}, {"role": "user", "content": user}], max_tokens=32000, effort="medium")   # a manual review: room to think
+            reply = chat_fn(cfg, [{"role": "system", "content": system}, {"role": "user", "content": user}], max_tokens=EFFORT_TOKENS[effort], effort=effort)
             findings += parse_findings(reply, files)
         except llm.LLMError as e:
             if reply is not None:   # the model answered off-schema: its raw reply goes to the job log (never the key)
@@ -160,15 +163,49 @@ def review(diff, rules, focus, chat_fn=None, cfg=None):
     if skipped:
         body += "\n\nNot reviewed: " + ", ".join(f"`{s}`" for s in skipped[:10]) + ("" if len(skipped) <= 10 else f" and {len(skipped) - 10} more")
     model = (cfg or {}).get("model") or "unknown model"
-    return MARKER + "\n" + body + f"\n\n<sub>This review was made automatically by an LLM ({model}); it can be wrong.</sub>"
+    return MARKER + "\n" + body + f"\n\n<sub>This review was made automatically by an LLM ({model}, {effort} effort); it can be wrong.</sub>"
+
+
+def parse_command(text, default_model, allowed_text, default_effort="medium"):
+    """The words after /review: leading effort=/model= settings, then the focus (newlines kept).
+    Returns (effort, model, focus, error); error is a one-line reply when a setting is refused."""
+    allowed = [default_model] + [m.strip() for m in (allowed_text or "").split(",") if m.strip() and m.strip() != default_model]
+    effort = (default_effort or "medium").strip()
+    if effort not in EFFORT_TOKENS:
+        return "medium", default_model, "", f"LLM_REVIEW_EFFORT `{llm.plain(effort, 30)}` is not low, medium or high."
+    model, pos, seen = default_model, 0, set()
+    while True:
+        m = SETTING.match(text, pos)
+        if not m or (m.end() < len(text) and not text[m.end()].isspace()):
+            break
+        key, value = m.group(1), m.group(2)
+        if key in seen:
+            return effort, model, "", f"`{key}` is given twice."
+        seen.add(key)
+        if key == "effort":
+            if value not in EFFORT_TOKENS:
+                return effort, model, "", f"Unknown effort `{llm.plain(value, 30)}`; use low, medium or high."
+            effort = value
+        else:
+            if value not in allowed:
+                return effort, model, "", f"Model `{llm.plain(value, 40)}` is not allowed; use one of: " + ", ".join(f"`{a}`" for a in allowed) + "."
+            model = value
+        pos = m.end()
+    return effort, model, text[pos:].strip(), None
 
 
 def main(argv):
     diff = Path(argv[1]).read_text(encoding="utf-8", errors="replace")
     rules = Path(argv[2]).read_text(encoding="utf-8", errors="replace")
-    focus = argv[4] if len(argv) > 4 else ""
+    command = argv[4] if len(argv) > 4 else ""
     try:
-        body = review(diff, rules, focus)
+        cfg = llm.config_from_env()
+        effort, model, focus, error = parse_command(command, cfg["model"], os.environ.get("LLM_REVIEW_MODELS", ""),
+                                                     os.environ.get("LLM_REVIEW_EFFORT", ""))
+        if error:
+            body = f"{MARKER}\n{error}"
+        else:
+            body = review(diff, rules, focus, cfg={**cfg, "model": model}, effort=effort)
     except llm.LLMError as e:
         body = f"{MARKER}\nThe review could not run ({e})."
     Path(argv[3]).write_text(body, encoding="utf-8")

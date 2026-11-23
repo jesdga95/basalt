@@ -37,7 +37,15 @@ Security model: the review runs from base code with secrets only in the one mode
 
 ## /review
 
-A comment on a pull request that starts with `/review` and is written by `jesdga95` with author association OWNER runs `review.yml`. Text after the command is passed to the model as focus instructions. The workflow reacts with 👀 while it runs, reads the diff with `gh pr diff` (data; no checkout of the pull request), and posts one comment.
+A comment on a pull request that starts with `/review` and is written by `jesdga95` with author association OWNER runs `review.yml`. The command takes optional settings before the focus text:
+
+```
+/review                                    the defaults: LLM_REVIEW_EFFORT (medium if unset) and LLM_MODEL (gpt-6-luna)
+/review effort=high                        low | medium | high (16k, 32k, 64k output tokens, reasoning included)
+/review effort=low model=gpt-6.2-sol check the locking in cpu_experts.cpp
+```
+
+`model` must be `LLM_MODEL` or listed in the variable `LLM_REVIEW_MODELS` (comma-separated, such as `gpt-6.1-terra,gpt-6.2-sol`); an unknown effort or model is answered with a one-line comment and no model call. Settings stop at the first word that is not one, so `check that x=5` stays focus text. The rest of the comment, newlines kept, is the focus. The footer names the model and the effort. The workflow reacts with 👀 while it runs, reads the diff with `gh pr diff` (data; no checkout of the pull request), and posts one comment.
 
 `tools/code_review.py` splits the diff per file, skips generated, data and binary files (`data/`, `*.ids`, lock files, images, the community table), numbers the new-file lines, cuts a file past about 6k tokens at a hunk, sends chunks of about 7k tokens within a 40k token budget, and tells the model the rules of `AGENTS.md` and `CONTRIBUTING.md`. Replies must match the findings schema; the comment is built from validated findings, ranked high to low with `file:line`, or says `No findings.` Parts that failed or were skipped are named.
 
