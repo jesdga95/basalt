@@ -596,14 +596,10 @@ bool FileExpertSource::plan_cache_complement(
         int64_t held = 0;
         // The places have to fit in the RAM the budget may reach: pack the experts to the budget, but never past what
         // leaves the places room beside it.  A budget with room to spare beside it keeps its experts whole.
-        uint64_t pack_bytes = budget_bytes;
-        if (spare_bytes > 0) {
-            uint64_t max_spare_blob = 0;
-            for (const auto& [b, n] : spare_sizes) max_spare_blob = std::max(max_spare_blob, b);
-            const uint64_t ram = budget_physical > 0 ? ram_tier_room(budget_physical, headroom_bytes, pin) : budget_bytes;
-            const uint64_t fits = ram > spare_bytes + max_spare_blob ? ram - spare_bytes : 0;
-            pack_bytes = std::min(pack_bytes, fits);
-        }
+        uint64_t max_spare_blob = 0;
+        for (const auto& [b, n] : spare_sizes) max_spare_blob = std::max(max_spare_blob, b);
+        const uint64_t pack_bytes = ram_tier_pack_bytes(
+            budget_bytes, ram_tier_room(budget_physical, headroom_bytes, pin), spare_bytes, max_spare_blob);
         if (rank != nullptr)
             for (const auto& pr : *rank) {
                 if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;

@@ -660,6 +660,10 @@ if(BUILD_TESTING)
   add_executable(conversation_cache_test tests/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   basalt_cpu_test(NAME conversation_cache_test COMMAND conversation_cache_test)
+  # the RAM copy's pack bound beside the adaptive swaps' free places (header-only sizing, no GPU, no file)
+  add_executable(resident_pack_room_test tests/core/resident_pack_room_test.cpp)
+  target_include_directories(resident_pack_room_test PRIVATE include)
+  basalt_cpu_test(NAME resident_pack_room_test COMMAND resident_pack_room_test)
   # conversation_memory.cpp asks the platform layer for the free RAM, so the probe comes along; it needs the system
   # allocator and the OS memory query, and nothing from the GPU runtime.
   add_executable(conversation_memory_test tests/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
