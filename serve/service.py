@@ -142,6 +142,11 @@ class Service:
         self.history = collections.deque(maxlen=500)    # finished requests, newest last
         self.requests_done = 0                           # finished requests since start
         self.totals = {"prompt": 0, "reused": 0, "written": 0, "prompt_ms": 0.0, "decode_ms": 0.0}   # their sums
+        self.totals_path = None                          # persistent counters file (None: this start only)
+        self.cost_input_per_million = 0.0                # what a million input tokens costs (US dollars)
+        self.cost_output_per_million = 0.0               # what a million output tokens costs
+        self.cost_cache_write_per_million = None          # cache write rate (None: use input rate)
+        self.cost_cache_hit_per_million = None             # cache hit rate (None: use input rate)
         self.last_timings = None                         # last request's timings
         self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
@@ -163,6 +168,58 @@ class Service:
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
+
+    _totals_broken = False   # disk errors: print once then stop trying
+
+    def load_totals(self, pricing_cli: set[str] | None = None) -> None:
+        """Read saved lifetime counters and pricing on startup.  Called once from server.py after
+        totals_path and cost_* fields are set.  CLI flags win over the file: a pricing field is
+        restored from the file only when the CLI did not explicitly set it."""
+        if not self.totals_path:
+            return
+        from serve.totals import totals_load_file, totals_add_saved
+        saved = totals_load_file(self.totals_path)
+        if saved:
+            with self.status_lock:
+                snap = {"since": int(self.started_at), "requests": self.requests_done, **self.totals}
+                merged = totals_add_saved(snap, saved)
+                for k in ("prompt", "reused", "written", "prompt_ms", "decode_ms"):
+                    if k in merged:
+                        self.totals[k] = merged[k]
+                if "requests" in merged:
+                    self.requests_done = merged["requests"]
+                if "since" in merged:
+                    self.started_at = merged["since"]
+            cli_set = pricing_cli or set()
+            field_to_cli = {"cost_input_per_million": "cost_in",
+                            "cost_output_per_million": "cost_out",
+                            "cost_cache_write_per_million": "cost_cache_write",
+                            "cost_cache_hit_per_million": "cost_cache_hit"}
+            for field, cli_name in field_to_cli.items():
+                if cli_name in cli_set:
+                    continue
+                file_val = saved.get(field)
+                if file_val is not None and isinstance(file_val, (int, float)):
+                    setattr(self, field, float(file_val))
+
+    def _save_totals(self) -> None:
+        """Write the lifetime counters to disk after a request finishes.  Call with status_lock held."""
+        if not self.totals_path or self._totals_broken:
+            return
+        from serve.totals import totals_write_file, totals_with_cost
+        try:
+            snap = {"since": int(self.started_at), "requests": self.requests_done, **self.totals}
+            totals_with_cost(snap, self.cost_input_per_million, self.cost_output_per_million,
+                             self.cost_cache_write_per_million, self.cost_cache_hit_per_million)
+            # Save the raw cache rates, not the resolved ones: a None rate stays null in the
+            # file so it does not override "same as input" on reload.
+            snap["cost_cache_write_per_million"] = self.cost_cache_write_per_million
+            snap["cost_cache_hit_per_million"] = self.cost_cache_hit_per_million
+            totals_write_file(self.totals_path, snap)
+        except OSError as e:
+            if not self._totals_broken:
+                self._totals_broken = True
+                print(f"[server] warning: could not write totals to {self.totals_path}: {e}", flush=True)
 
     def reasoning_budget(self, req, *, use_default: bool = True) -> int | None:
         """The request's thinking budget in tokens, or None (0 or less: none); ValueError for a non-integer.
@@ -378,6 +435,9 @@ class Service:
             if not self.loaded():
                 self.vram_reserve = reserve_mib
                 out = {"status": "not loaded", "reserve_mib": reserve_mib, "note": "applied when the model loads"}
+            elif getattr(self.engine, "asleep", False) is True:   # its process is suspended: a command would never be read
+                self.vram_reserve = reserve_mib
+                out = {"status": "asleep", "reserve_mib": reserve_mib, "note": "applied when the model wakes"}
             else:
                 got = self.engine.vram(reserve_mib)
                 self.vram_reserve = reserve_mib
@@ -497,6 +557,11 @@ class Service:
             return
         print(f"[server] model awake in {time.time() - t:.1f} s (driver restore {self.engine.restore_s:.1f} s)",
               flush=True)
+        if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # a POST /v1/vram that came while it slept
+            try:
+                self.engine.vram(self.vram_reserve)
+            except (ValueError, EngineDied) as e:
+                print(f"[server] warning: VRAM reserve of {self.vram_reserve} MiB not applied ({e})", flush=True)
 
     WAKE_VRAM_WAIT_S = 15.0                              # for memory just released elsewhere
 
@@ -816,6 +881,9 @@ class Service:
             decoding = any(st.get("first_token") is not None for st, _ in self.live_reqs.values())
             hist = list(self.history)
             totals = {"since": int(self.started_at), "requests": self.requests_done, **self.totals}
+            from serve.totals import totals_with_cost
+            totals_with_cost(totals, self.cost_input_per_million, self.cost_output_per_million,
+                             self.cost_cache_write_per_million, self.cost_cache_hit_per_million)
         busy = bool(s.get("busy"))
         if self.loading:
             state = "loading"
@@ -1680,6 +1748,7 @@ class Service:
                                              ("prompt_ms", last.get("prompt_ms") or 0.0),
                                              ("decode_ms", last.get("decode_ms") or 0.0)):
                                 self.totals[key] += add
+                            self._save_totals()
                             if st.get("slot") is not None:
                                 self.slot_last[st["slot"]] = {"ctx": seen + n, "offered": last.get("drafts_offered"),
                                                               "accepted": last.get("drafts_accepted"), "at": time.time()}

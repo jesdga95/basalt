@@ -1,4 +1,5 @@
-"""A request must name the served model; unknown or missing is a 404 in the API's own shape (mock engine)."""
+"""A request names the model it wants. With one model configured, a request may name none and gets that model; with
+several, no name is a 404. A name that serves nothing is a 404 in the API's own shape either way (mock engines)."""
 from __future__ import annotations
 
 import http.client
@@ -11,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.handler import serve  # noqa: E402
+from serve.router import Router  # noqa: E402
 from serve.service import Service  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
 
@@ -23,13 +25,18 @@ PATHS = {"/v1/chat/completions": {"messages": MSGS, "max_tokens": 8},
          "/v1/responses": {"input": "hi", "max_output_tokens": 8}}
 
 
-class ModelName(unittest.TestCase):
+class Base(unittest.TestCase):
+    """One server per subclass: the models it serves are `MODELS`, one entry per model file."""
+    MODELS = ((ALIAS, FILE),)
+
     def setUp(self):
         tok = ByteTokenizer()
-        engine = MockEngine(tok, ["Hello."], max_context=4096)
-        engine.model_path = "/packs/" + FILE
-        self.httpd = serve(Service(engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), model_name=ALIAS),
-                           port=0)
+        svcs = []
+        for alias, file in self.MODELS:
+            engine = MockEngine(tok, ["Hello."], max_context=4096)
+            engine.model_path = "/packs/" + file
+            svcs.append(Service(engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), model_name=alias))
+        self.httpd = serve(svcs[0] if len(svcs) == 1 else Router(svcs), port=0)
         self.port = self.httpd.server_address[1]
 
     def tearDown(self):
@@ -46,6 +53,31 @@ class ModelName(unittest.TestCase):
         finally:
             c.close()
 
+    def assert_name_404(self, path, name):
+        """A name of its own that serves nothing: the 404 in the shape of the API called."""
+        status, raw = self.post(path, {"model": name, **PATHS[path]})
+        self.assertEqual(status, 404, raw)
+        want = f"model: {name}" if path.startswith("/v1/messages") else f"The model '{name}' does not exist"
+        err = json.loads(raw)
+        if path.startswith("/v1/messages"):
+            self.assertEqual(err, {"type": "error", "error": {"type": "not_found_error", "message": want}})
+        else:
+            self.assertEqual(err, {"error": {"message": want, "type": "invalid_request_error",
+                                             "param": "model", "code": "model_not_found"}})
+
+    def assert_no_name_404(self, path, body):
+        """No name of any kind: the request says which model it wants, and here it does not."""
+        status, raw = self.post(path, {**body, **PATHS[path]})
+        self.assertEqual(status, 404, raw)
+        err = json.loads(raw)
+        if path.startswith("/v1/messages"):
+            self.assertEqual(err["error"], {"type": "not_found_error", "message": "model: required"})
+        else:
+            self.assertEqual(err["error"]["message"], "model is required")
+            self.assertEqual(err["error"]["param"], "model")
+
+
+class ModelName(Base):
     def test_the_listed_name_and_the_file_name_are_served(self):
         for path, body in PATHS.items():
             for name in (ALIAS, FILE):
@@ -54,30 +86,23 @@ class ModelName(unittest.TestCase):
                     self.assertEqual(status, 200)
 
     def test_unknown_is_404_in_the_api_shape(self):
-        for path, body in PATHS.items():
+        for path in PATHS:
             with self.subTest(path=path):
-                status, raw = self.post(path, {"model": "gpt-x", **body})
-                self.assertEqual(status, 404)
-                if path.startswith("/v1/messages"):
-                    self.assertEqual(json.loads(raw), {"type": "error", "error": {
-                        "type": "not_found_error", "message": "model: gpt-x"}})
-                else:
-                    self.assertEqual(json.loads(raw), {"error": {
-                        "message": "The model 'gpt-x' does not exist", "type": "invalid_request_error",
-                        "param": "model", "code": "model_not_found"}})
+                self.assert_name_404(path, "gpt-x")
 
-    def test_missing_or_null_is_404(self):
+    def test_an_empty_name_is_not_a_name(self):
+        for path in PATHS:
+            with self.subTest(path=path):
+                self.assert_name_404(path, "")
+
+    def test_no_name_or_a_null_one_goes_to_the_only_model(self):
         for path, body in PATHS.items():
             for extra in ({}, {"model": None}):
                 with self.subTest(path=path, extra=extra):
                     status, raw = self.post(path, {**extra, **body})
-                    self.assertEqual(status, 404)
-                    err = json.loads(raw)
-                    if path.startswith("/v1/messages"):
-                        self.assertEqual(err["error"], {"type": "not_found_error", "message": "model: required"})
-                    else:
-                        self.assertEqual(err["error"]["message"], "model is required")
-                        self.assertEqual(err["error"]["param"], "model")
+                    self.assertEqual(status, 200, raw)
+                    if path != "/v1/messages/count_tokens":     # it answers a count, not a message
+                        self.assertIn(f'"model": "{ALIAS}"', raw)
 
     def test_the_response_names_the_served_model(self):
         for stream in (False, True):
@@ -90,6 +115,28 @@ class ModelName(unittest.TestCase):
             _, raw = self.post("/v1/responses", {"model": FILE, "stream": stream, **PATHS["/v1/responses"]})
             self.assertIn(f'"model": "{ALIAS}"', raw)
             self.assertNotIn(FILE, raw)
+
+
+class SeveralModels(Base):
+    MODELS = (("First", "first.basalt"), ("Second", "second.basalt"))
+
+    def test_every_name_still_routes(self):
+        for path, body in PATHS.items():
+            for name in ("First", "second.basalt"):
+                with self.subTest(path=path, name=name):
+                    status, raw = self.post(path, {"model": name, **body})
+                    self.assertEqual(status, 200, raw)
+
+    def test_missing_or_null_is_404(self):
+        for path in PATHS:
+            for body in ({}, {"model": None}):
+                with self.subTest(path=path, body=body):
+                    self.assert_no_name_404(path, body)
+
+    def test_an_empty_name_is_not_a_name(self):
+        for path in PATHS:
+            with self.subTest(path=path):
+                self.assert_name_404(path, "")
 
 
 if __name__ == "__main__":

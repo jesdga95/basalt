@@ -163,7 +163,6 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/load/prefill.cpp
   src/models/qwen4exp/load/decode.cpp
   src/models/qwen4exp/serve/batch.cpp
-  src/models/qwen4exp/serve/batch_pipeline.cpp
   src/models/qwen4exp/serve/qfn_commands.cpp
   src/models/qwen4exp/serve/qfn_restore.cpp
   src/models/qwen4exp/serve/qfn_image.cpp
@@ -179,6 +178,7 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/serve/prompt_split.cpp
   src/models/qwen4exp/serve/prompt_windows.cpp
   src/models/qwen4exp/serve/qfn_decode.cpp
+  src/models/qwen4exp/serve/slot_session.cpp
   src/models/qwen4exp/serve/slots.cpp
   src/models/qwen4exp/serve/tier_profile.cpp
   src/models/qwen4exp/serve/tiers.cpp
@@ -745,6 +745,7 @@ endif()
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
 
 add_library(serve_shared STATIC src/program/serve/commands.cpp
+            src/program/serve/batch_round.cpp
             src/program/probe_rates.cpp
             src/program/serve/protocol.cpp
             src/program/serve/runtime.cpp
@@ -1264,6 +1265,13 @@ target_include_directories(elementwise_parity PRIVATE ${_gpu_include_directories
 target_link_libraries(elementwise_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME elementwise_parity COMMAND elementwise_parity --selftest)
 
+if(BUILD_TESTING)
+  add_executable(doorbell_abort_test tests/kernels/doorbell_abort_test.cu)
+  target_link_libraries(doorbell_abort_test PRIVATE kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME doorbell_abort_test COMMAND doorbell_abort_test)
+  set_tests_properties(doorbell_abort_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()
+
 add_executable(bf16_gemv_parity tests/kernels/bf16_gemv_parity.cpp)
 target_include_directories(bf16_gemv_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(bf16_gemv_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -1713,7 +1721,10 @@ foreach(_isa avx2 avx512)
   add_library(ggml_dots_${_isa} OBJECT src/kernels/cpu/ggml/ggml_cpu_dots.c)
   target_include_directories(ggml_dots_${_isa} PRIVATE include src/kernels/cpu/ggml)
   target_compile_options(ggml_dots_${_isa} PRIVATE ${_ggml_dots_${_isa}_flags})
-  target_compile_definitions(ggml_dots_${_isa} PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_${_isa})
+  target_compile_definitions(ggml_dots_${_isa} PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_${_isa}
+                             ggml_vec_dot_mxfp8_q8_0_scalar=ggml_vec_dot_mxfp8_q8_0_scalar_${_isa}
+                             ggml_mxfp8_q8_0_prep=ggml_mxfp8_q8_0_prep_${_isa}
+                             ggml_mxfp8_q8_0_rows=ggml_mxfp8_q8_0_rows_${_isa})
   set_target_properties(ggml_dots_${_isa} PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
 endforeach()
 # part of kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
@@ -1870,6 +1881,9 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME peer_share_parity COMMAND peer_share_parity)
   set_tests_properties(peer_share_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   if(BASALT_MODEL_QWEN4EXP)
+  add_executable(prefill_pinned_copy_test tests/models/qwen4exp/prefill/prefill_pinned_copy_test.cpp)
+  target_include_directories(prefill_pinned_copy_test PRIVATE src)
+  basalt_cpu_test(NAME prefill_pinned_copy_test COMMAND prefill_pinned_copy_test)
   # the prompt path's routed-entry histogram against a host count
   add_executable(prefill_route_count_test tests/models/qwen4exp/prefill/prefill_route_count_test.cpp)
   target_link_libraries(prefill_route_count_test PRIVATE model_qwen4exp_prefill ${_gpu_runtime_target})
@@ -2032,6 +2046,12 @@ if(BUILD_TESTING)
   target_link_libraries(nvfp4_cpu_rows_test PRIVATE kernels_cpu)
   basalt_cpu_test(NAME nvfp4_cpu_rows_test COMMAND nvfp4_cpu_rows_test)
   set_tests_properties(nvfp4_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
+
+  # the MXFP8 CPU dot on each instruction set, bit for bit against the scalar row (the AVX-512 rows run where the host has them)
+  add_executable(mxfp8_cpu_rows_test tests/kernels/cpu/mxfp8_cpu_rows_test.cpp)
+  target_link_libraries(mxfp8_cpu_rows_test PRIVATE kernels_cpu)
+  basalt_cpu_test(NAME mxfp8_cpu_rows_test COMMAND mxfp8_cpu_rows_test)
+  set_tests_properties(mxfp8_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
 
   # Both tests run on a synthetic expert fixture by default; --file experts.bin (the pack's experts section) checks real blobs.
 

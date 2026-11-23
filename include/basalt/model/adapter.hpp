@@ -162,6 +162,14 @@ public:
             if (Result r = sessions[i]->decode_window(reqs[i]); !r.ok()) return r;
         return {};
     }
+    /// After the batch rounds' last decode_batch over sessions[0..n) (this one first; a lone decode_window, n = 1) and before
+    /// any of them drafts: the rows each window keeps (its accepted drafts and the pick after them, fewer where its request
+    /// ended). A model that settles a window's state at once (a verifier that rolls the rejected rows back) does it here;
+    /// the default leaves it to the next window's position.
+    virtual Result decode_kept(ModelSession* const* sessions, const int* kept, int n) {
+        (void) sessions; (void) kept; (void) n;
+        return {};
+    }
     /// Takes the memory the session will hold (expert tiers), so the first request does not wait for it.
     virtual Result prepare() { return {}; }
     /// The prompt is read: workspaces a part kept with `more` go back.
@@ -172,6 +180,10 @@ public:
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
+    /// For a drafter that sets its windows' length itself (a stop rule in its chain): the rows of the next window over its
+    /// drafts `chance[0..n)` (one plus the drafts it keeps); the draft policy then only weighs a lookup proposal against
+    /// them. 0: the policy picks the length from the drafts' stated chances.
+    virtual int own_window(const float* chance, int n) const { (void) chance; (void) n; return 0; }
     /// Whether the engine may fill a window with prompt-lookup drafts (CommonOptions::suffix_draft) in place of the
     /// drafter's: any window's rows are verified the same way, so only speed changes.
     virtual bool copy_drafts() const { return false; }
