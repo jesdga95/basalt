@@ -1,0 +1,46 @@
+# Community benchmark auto-merge and /review
+
+Two workflows (community auto-merge and the `/review` comment) use one cheap OpenAI-compatible model through `tools/llm_review.py` (urllib, no dependencies).
+
+## Community auto-merge
+
+`community.yml` (on `pull_request`, no secrets) keeps validating the table. `community-review.yml` (on `pull_request_target`) decides what happens to a pull request that touches `docs/community/`. It checks out only the base commit and reads the pull request's file through the API as data; nothing from the head is run.
+
+Order, enforced by the workflow and by `llm_review.decide`:
+
+1. **Gate** (`tools/community_gate.py`, no secrets). Any failure stops here: no model call, label `community: needs changes` and a comment with the reasons.
+   - only `docs/community/benchmarks.json` changed, modified, with rows only appended (the old rows byte for byte), 1 to 12 of them, in the house format and valid for `check_benchmarks.py`;
+   - `preset` is `community-1` (the `submitter` is a display name and may differ from the PR author; the model review rejects an abusive one);
+   - free text (submitter, notes, cpu, quant, GPU names, engine_args) has no link, domain, `@`, markup characters or invisible/direction characters, stays within its length cap, and never says LOSSY;
+   - `engine_args` holds only `--gpu`, `--max-context` and `--kv` with valid values (the preset's own arguments; `basalt-bench --community` refuses any other flag);
+   - `commit` is an ancestor of `origin/main`, so it is a build of this repository;
+   - numbers: `decode_tps` and `prefill_16k_tps` within 2.5x outside the lowest and highest earlier row of the same model, GPU name and GPU count (one card's quants spread about 4.5x in the table); decode at most 2000 and prefill at most 40000 tok/s; `prefill_64k_tps / prefill_16k_tps` between 0.3 and 6 (the table spans 0.70 to 4.06). A card or model with no earlier row has nothing to compare with, so it goes to a person without a model call.
+2. **Model review** (only after a pass, `tools/llm_review.py`). It sees the added rows and the check results, temperature 0, with the rows declared untrusted data. It answers `{"verdict": "auto_merge" | "needs_human" | "reject", "reason": "..."}`; anything else, a timeout, an API error or a missing key is `needs_human`. It can only downgrade: the one merge needs a passing gate and `auto_merge`.
+3. **Act** (`community_apply.py`, job `act`).
+   - `auto_merge`: squash-merge, pinned to the reviewed head commit (`--match-head-commit`), with the App token.
+   - `needs_human`: label `community: needs review` and a review request to jesdga95.
+   - `reject`: label `community: rejected` and one neutral comment. The pull request is never closed.
+
+`COMMUNITY_AUTOMERGE`: only the exact value `live` merges. Unset, `shadow`, `test` or a typo is shadow: labels, review requests and comments only (a row that would merge gets `community: would auto-merge` and a comment). Every comment names the mode that ran.
+
+Security model: the review runs from base code with secrets only in the one model step; a fork pull request cannot change what runs. Jobs have minimal `permissions` (the deciding job is read-only; the acting job has no `contents: write`); the merge token is a GitHub App token minted only in a merge run; the comments use a second App token scoped to pull requests only. Model output only selects a label. Reasons shown in comments are stripped of links, mentions and markup. Actions are pinned by SHA.
+
+### Setup (once, on GitHub)
+
+1. Secret `LLM_API_KEY` (repository secrets). Variables `LLM_BASE_URL` (the API root, such as `https://host/v1`; a secret of the same name is the fallback) and `LLM_MODEL` (`gpt-6-luna`).
+2. Variable `COMMUNITY_AUTOMERGE` = `test` (shadow). The workflow creates the labels itself.
+3. GitHub App (`basalt-code-review-bot`), which merges and also posts the community and `/review` comments (they fall back to `github-actions` while it is not configured): Settings, Developer settings, GitHub Apps, New. Name it such as `basalt-code-review-bot`, no webhook, repository permissions Contents: read and write, Pull requests: read and write, installable on this account only. Generate a private key. Install it on `jesdga95/basalt` only.
+4. Repository variable `BASALT_REVIEW_APP_CLIENT_ID` (the App's client ID) and secret `BASALT_REVIEW_APP_PRIVATE_KEY` (the whole `.pem`).
+5. Ruleset `main` (Settings, Rules, Rulesets): Bypass list, Add bypass, choose the App, mode "Always". The ruleset requires a pull request, which the merge API call would otherwise fail; the bypass lets the App's squash merge through while everyone else still needs a pull request. No status checks are required.
+6. Run `python3 tools/community_calibrate.py --review` with the three `LLM_*` values in the environment and look at the table.
+7. After shadow runs on real pull requests look right, set `COMMUNITY_AUTOMERGE` to `live`. Setting anything else turns merging off again.
+
+## /review
+
+A comment on a pull request that starts with `/review` and is written by `jesdga95` with author association OWNER runs `review.yml`. Text after the command is passed to the model as focus instructions. The workflow reacts with 👀 while it runs, reads the diff with `gh pr diff` (data; no checkout of the pull request), and posts one comment.
+
+`tools/code_review.py` splits the diff per file, skips generated, data and binary files (`data/`, `*.ids`, lock files, images, the community table), numbers the new-file lines, cuts a file past about 6k tokens at a hunk, sends chunks of about 7k tokens within a 40k token budget, and tells the model the rules of `AGENTS.md` and `CONTRIBUTING.md`. Replies must match the findings schema; the comment is built from validated findings, ranked high to low with `file:line`, or says `No findings.` Parts that failed or were skipped are named.
+
+## Tests
+
+`tools/test_community_gate.py` (gate with fixture rows, the mode rule, workflow structure) and `tools/test_llm_review.py` (client against a local HTTP server, verdict parsing, review chunking) run in the CI lint job.
