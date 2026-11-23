@@ -9,6 +9,7 @@
 // Both paths merge a row's slices with its sink, gate the heads and round to the output projection's q8_1 blocks.
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
+#include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "attn_mma.cuh"
 #include "prep.cuh"
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 namespace basalt::models::inkling2 {
 namespace {
@@ -1061,6 +1063,7 @@ struct MmaLaunch {
 struct MmaDevice {
     int sms = 0, l2 = 0;
     MmaLaunch plans[3][2];  // narrow, one slab, two slabs; L2-resident/streaming
+    MmaLaunch two_stage_ring, three_stage_ring, one_stage_ping_pong;
     MmaLaunch singleton;
 };
 
@@ -1075,36 +1078,41 @@ int mma_attribute(int dev, cudaDeviceAttr attr) {
 }
 
 template <int Slabs, bool Narrow>
-void mma_probe_plans(MmaLaunch (&plans)[2], int per_block, int per_sm, int reserved) {
+void mma_probe_plans(MmaDevice& device, int per_block, int per_sm, int reserved) {
     const auto kernel = attn_mma_split_kernel<Slabs, Narrow>;
     check_mma_probe(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, per_block));
     if constexpr (!Narrow)
         check_mma_probe(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
     const size_t compact_budget = (size_t) std::max(0, std::min(per_block / 2, per_sm / 2 - reserved));
-    for (int streaming = 0; streaming < 2; ++streaming) {
-        MmaLaunch best;
-        bool best_compact = false;
-        // Prefer two resident CTAs, then an alternating V tile, then more copies in flight.
-        for (const bool ping_pong : {true, false}) {
-            for (int stages = streaming ? 3 : 2; stages >= 1; --stages) {
-                const size_t shared = sizeof(MmaSmem<Slabs>) + (ping_pong ? sizeof(MmaVTile) : 0) + stages * sizeof(MmaRawTile);
-                if (shared > (size_t) per_block) continue;
-                int resident = 0;
-                check_mma_probe(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, kWarps * 32, shared));
-                resident = std::min({resident, 2, per_sm / ((int) shared + reserved)});
-                const bool compact = !Narrow || shared <= compact_budget;
-                if (resident > 0 && (best.resident == 0 || compact > best_compact ||
-                                     (compact == best_compact && resident > best.resident))) {
-                    best = {shared, stages, resident, ping_pong};
-                    best_compact = compact;
-                }
-                if (best_compact && best.resident == 2) break;
+    auto& plans = device.plans[Narrow ? 0 : Slabs];
+    const auto rank = [compact_budget](const MmaLaunch& plan) {
+        // Wide windows take two copy stages at equal residency (a third is no faster), then deeper pipelines.
+        if constexpr (Slabs == 2) return std::make_tuple(plan.resident, plan.stages == 2, plan.stages, plan.ping_pong);
+        else return std::make_tuple(!Narrow || plan.shared <= compact_budget, plan.resident, plan.ping_pong, plan.stages);
+    };
+    for (const bool ping_pong : {true, false}) {
+        for (int stages = 1; stages <= 3; ++stages) {
+            const size_t shared = sizeof(MmaSmem<Slabs>) + (ping_pong ? sizeof(MmaVTile) : 0) + stages * sizeof(MmaRawTile);
+            if (shared > (size_t) per_block) continue;
+            int resident = 0;
+            check_mma_probe(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, kWarps * 32, shared));
+            resident = std::min(resident, per_sm / ((int) shared + reserved));
+            if constexpr (Slabs != 2) resident = std::min(resident, 2);
+            if (resident == 0) continue;
+            const MmaLaunch candidate{shared, stages, resident, ping_pong};
+            if constexpr (Slabs == 2) {
+                if (!ping_pong && stages == 2) device.two_stage_ring = candidate;
+                if (!ping_pong && stages == 3) device.three_stage_ring = candidate;
+                if (ping_pong && stages == 1) device.one_stage_ping_pong = candidate;
             }
-            if (best_compact && best.resident == 2) break;
+            for (int streaming = stages == 3; streaming < 2; ++streaming) {
+                auto& best = plans[streaming];
+                if (best.resident == 0 || rank(candidate) > rank(best)) best = candidate;
+            }
         }
-        if (best.resident == 0) throw std::runtime_error("inkling2: no resident attention MMA block");
-        plans[streaming] = best;
     }
+    if (plans[0].resident == 0 || plans[1].resident == 0)
+        throw std::runtime_error("inkling2: no resident attention MMA block");
 }
 
 const MmaDevice& mma_device(int dev) {
@@ -1117,9 +1125,9 @@ const MmaDevice& mma_device(int dev) {
         const int per_block = mma_attribute(dev, cudaDevAttrMaxSharedMemoryPerBlockOptin);
         const int per_sm = mma_attribute(dev, cudaDevAttrMaxSharedMemoryPerMultiprocessor);
         const int reserved = mma_attribute(dev, cudaDevAttrReservedSharedMemoryPerBlock);
-        mma_probe_plans<1, true>(d.plans[0], per_block, per_sm, reserved);
-        mma_probe_plans<1, false>(d.plans[1], per_block, per_sm, reserved);
-        mma_probe_plans<2, false>(d.plans[2], per_block, per_sm, reserved);
+        mma_probe_plans<1, true>(d, per_block, per_sm, reserved);
+        mma_probe_plans<1, false>(d, per_block, per_sm, reserved);
+        mma_probe_plans<2, false>(d, per_block, per_sm, reserved);
         constexpr int shared = sizeof(MmaSmem<1>) + sizeof(MmaVTile);
         if (shared <= per_block) {
             int resident = 0;
@@ -1128,21 +1136,162 @@ const MmaDevice& mma_device(int dev) {
             resident = std::min({resident, per_sm / (shared + reserved), 3});
             d.singleton = {shared, 0, resident, true};
         }
+        const auto log_plan = [&](const char* geometry, const char* regime, const MmaLaunch& plan) {
+            const char* name = plan.stages == 0 ? "direct" : plan.ping_pong ? "ping-pong-ring" : "ring";
+            basalt::log::info("basalt inkling2", "INT8 MMA CUDA%d %s/%s plan=%s stages=%d shared=%zuB resident=%d CTAs/SM slots=%d",
+                              dev, geometry, regime, name, plan.stages, plan.shared, plan.resident, d.sms * plan.resident);
+        };
+        if (d.singleton.resident > 0) log_plan("singleton", "all", d.singleton);
+        const char* geometries[] = {"narrow", "one-slab", "two-slab"};
+        for (int g = 0; g < 3; ++g) {
+            log_plan(geometries[g], "L2", d.plans[g][0]);
+            log_plan(geometries[g], "streaming", d.plans[g][1]);
+        }
     });
     return devices[dev];
 }
 
+// A row's slices as the shard model sees them: their count and the last one's share of a full slice's keys.
+struct SliceShape {
+    int splits = 0;
+    double last = 0.;
+};
+
+SliceShape slice_shape(int64_t n) {
+    const int span = span_of((int) n), splits = (int) ((n + span - 1) / span);
+    return {splits, (double) (n - (int64_t) (splits - 1) * span) / span};
+}
+
+// Slice times until the launch's last block ends in a heuristic model of it: equal slots, no per-block setup, a full
+// slice taking one unit. Shard z's blocks (a head and segment each) take the row's slices z, z + shards, ...; a shard past
+// the row's slices ends at once. Blocks start in launch order on the slots that free first.
+double mma_makespan(int shards, SliceShape row, int blocks_per_shard, int slots) {
+    struct Run {
+        double end;
+        int slots;
+    };
+    const auto by_end = [](const Run& x, const Run& y) { return x.end < y.end; };
+    // The slots by the time they free, earliest first. A shard leaves at most one run partly taken, so the runs stay
+    // within one more than the shards.
+    Run free[kMaxSplits + 2];
+    int runs = 1;
+    free[0] = {0., slots};
+    double end = 0.;
+    for (int z = 0; z < std::min({shards, row.splits, kMaxSplits}); ++z) {
+        const int behind = row.splits - 1 - z;   // the row's slices from this shard's first to its last
+        const double work = behind / shards + (behind % shards == 0 ? row.last : 1.);
+        for (int left = blocks_per_shard; left > 0;) {
+            const Run start = free[0];
+            const int k = std::min(left, start.slots);
+            left -= k;
+            if (k == start.slots) {
+                std::copy(free + 1, free + runs, free);
+                --runs;
+            } else {
+                free[0].slots -= k;
+            }
+            const Run done{start.end + work, k};
+            end = std::max(end, done.end);
+            Run* at = std::upper_bound(free, free + runs, done, by_end);
+            std::copy_backward(at, free + runs, free + runs + 1);
+            *at = done;
+            ++runs;
+        }
+    }
+    return end;
+}
+
+// The fewest slices a row of `fewest` keys or more can have, below a larger slice size: within one slice size the count
+// grows with the keys, and the first count of each larger size grows with it.
+int least_splits(int64_t fewest) {
+    const int64_t size = (int64_t) kUnit * kMaxSplits;
+    return std::min(slice_shape(fewest).splits, slice_shape((fewest + size - 1) / size * size + 1).splits);
+}
+
+// The shard count for rows of `fewest` to `widest` keys. Another count replaces `previous` only where the model rates it
+// no slower on every shape the rows can take and faster on one; where the model cannot tell, `previous` stays. The model
+// is a heuristic: the device can rank two counts it ties, or even orders, the other way.
+int mma_shards(int z, int64_t fewest, int64_t widest, int blocks_per_shard, int slots, int previous) {
+    // Rows of one slice size take the widest row's shape. A range across slice sizes (a padded launch bound, the graph
+    // bucket's, where only the bound is known) holds rows of any slice count from its fewest up to z, each taken as full.
+    SliceShape shapes[kMaxSplits];
+    int count = 0;
+    if (span_of((int) fewest) == span_of((int) widest)) {
+        shapes[count++] = slice_shape(widest);
+    } else {
+        for (int splits = least_splits(fewest); splits <= z; ++splits) shapes[count++] = {splits, 1.};
+    }
+    constexpr double kEps = 1e-6;
+    double base[kMaxSplits];
+    double best_total = 0.;
+    for (int i = 0; i < count; ++i) best_total += base[i] = mma_makespan(previous, shapes[i], blocks_per_shard, slots);
+    int best = previous;
+    for (int shards = 1; shards <= z; ++shards) {
+        if (z % shards != 0 || shards == previous) continue;
+        bool no_slower = true, faster = false;
+        double total = 0.;
+        for (int i = 0; i < count && no_slower; ++i) {
+            const double t = mma_makespan(shards, shapes[i], blocks_per_shard, slots);
+            no_slower = t <= base[i] + kEps;
+            faster |= t < base[i] - kEps;
+            total += t;
+        }
+        // Of the counts that beat `previous`, the shortest total time, then the fewer blocks.
+        if (no_slower && faster && (total < best_total - kEps || (total <= best_total + kEps && shards < best))) {
+            best = shards;
+            best_total = total;
+        }
+    }
+    return best;
+}
+
+// mma_shards for a launch: computed once per distinct input and then only looked up. Rows of one slice size are keyed by
+// the widest row, a range across slice sizes by its fewest slice count (with z, the shapes it spans).
+int mma_shards_cached(int z, int64_t fewest, int64_t widest, int blocks_per_shard, int slots, int previous) {
+    struct Entry {
+        int z, blocks, slots, previous;
+        int64_t shape;
+        int shards;
+    };
+    static std::mutex lock;
+    static Entry entries[64];
+    static int used = 0, next = 0;
+    const int64_t shape = span_of((int) fewest) == span_of((int) widest) ? widest : -(int64_t) least_splits(fewest);
+    std::lock_guard<std::mutex> hold(lock);
+    for (int i = 0; i < used; ++i) {
+        const Entry& e = entries[i];
+        if (e.z == z && e.blocks == blocks_per_shard && e.slots == slots && e.previous == previous && e.shape == shape)
+            return e.shards;
+    }
+    const int shards = mma_shards(z, fewest, widest, blocks_per_shard, slots, previous);
+    entries[next] = {z, blocks_per_shard, slots, previous, shape, shards};
+    next = (next + 1) % 64;
+    used = std::max(used, next == 0 ? 64 : next);
+    return shards;
+}
+
 template <int Slabs, bool Narrow = false, bool Direct = false>
 void launch_mma(const AttnArgs& a, int rows, int min_keys, int64_t max_keys, int z, float* part_ml,
-                float* part_acc, cudaStream_t stream, const MmaDevice& device) {
+                float* part_acc, cudaStream_t stream, const MmaDevice& device, const MmaLaunch* forced,
+                Int8MmaPlanInfo* info, Int8MmaShards shard_rule, int shard_count) {
     const int segments = std::max(a.seg.at.n, 1);
     const int64_t bytes_per_segment = max_keys * (2 * kKvHeads * kKvInt8RowBytes);
-    const auto& plan = Direct ? device.singleton : device.plans[Narrow ? 0 : Slabs][bytes_per_segment > device.l2 / segments];
-    // Longer slices need more waves around concurrent side streams. Short singleton slices can
-    // share a block while keeping the logical split order and filling the device.
-    const int wave_floor = device.sms * plan.resident * (Narrow && !Direct ? 2 : 1);
-    int shards = z;
-    while (shards % 2 == 0 && shards / 2 * segments * kKvHeads >= wave_floor) shards /= 2;
+    const auto& plan = forced ? *forced : Direct ? device.singleton :
+                       device.plans[Narrow ? 0 : Slabs][bytes_per_segment > device.l2 / segments];
+    const int slots = device.sms * plan.resident;
+    const int blocks_per_shard = segments * kKvHeads;
+    // The halving rule: fewer, longer shards while the launch still fills its floor of slots.
+    int previous = z;
+    const int wave_floor = slots * (Narrow && !Direct ? 2 : 1);
+    while (previous % 2 == 0 && previous / 2 * blocks_per_shard >= wave_floor) previous /= 2;
+    const int64_t fewest = std::min(max_keys, std::max({a.min_full_keys, (int64_t) min_keys, (int64_t) 1}));
+    const int shards = shard_count > 0 ? std::min(shard_count, z) : shard_rule == Int8MmaShards::Previous ? previous :
+                       mma_shards_cached(z, fewest, max_keys, blocks_per_shard, slots, previous);
+    if (info) {
+        const SliceShape widest = slice_shape(max_keys);
+        *info = {plan.shared, plan.stages, plan.resident, plan.ping_pong, shards, shards * blocks_per_shard, slots,
+                 std::min(shards, widest.splits) * blocks_per_shard, mma_makespan(shards, widest, blocks_per_shard, slots)};
+    }
     const auto& pdl = bk::pdl_state();
     const int prime_span = Narrow && !Direct && pdl.on && pdl.plain == 0 && a.seg.at.n == 0 &&
                            a.min_full_keys >= min_keys && max_keys <= a.cap ? span_of((int) a.min_full_keys) : 0;
@@ -1153,14 +1302,18 @@ void launch_mma(const AttnArgs& a, int rows, int min_keys, int64_t max_keys, int
 
 }  // namespace
 
+void attention_decode_int8_init() { (void) mma_device(opt_in_device()); }
+
 // Only full-cache INT8 has an MMA reader. Its cutoff is a property of the row, not the padded launch bound.
 static bool mma_decode(const AttnArgs& a, int rows, int64_t max_keys) {
     return a.int8 && a.window == 0 && rows <= kDecodeRows && (kMmaSingleton || rows >= 2) && max_keys >= kMmaMinKeys;
 }
 
-static void launch_attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream,
-                                    bool mma, int mma_min_keys, bool scalar_prefix) {
-    if (rows <= 0) return;
+static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream,
+                                    bool mma, int mma_min_keys, bool scalar_prefix, Int8MmaPlan plan = Int8MmaPlan::Auto,
+                                    Int8MmaPlanInfo* info = nullptr, Int8MmaShards shards = Int8MmaShards::Auto,
+                                    int shard_count = 0) {
+    if (rows <= 0) return true;
     cudaStream_t s = (cudaStream_t) stream;
     const int z = launch_splits(max_keys);
     float* part_ml = static_cast<float*>(scratch);
@@ -1182,17 +1335,31 @@ static void launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
             check("attention_decode/shallow");
         }
         const MmaDevice& device = mma_device(dev);
-        if (rows == 1 && max_keys <= kMmaSingletonShallowKeys && device.singleton.resident > 0)
-            launch_mma<1, true, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device);
-        else if (rows <= 2) launch_mma<1, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device);
-        else if (rows * kGroup <= kMmaRows) launch_mma<1>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device);
-        else launch_mma<2>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device);
+        if (plan == Int8MmaPlan::Direct && device.singleton.resident == 0) return false;
+        if (rows == 1 && plan != Int8MmaPlan::NarrowRing && device.singleton.resident > 0)
+            launch_mma<1, true, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device, nullptr, info, shards,
+                                      shard_count);
+        else if (rows <= 2)
+            launch_mma<1, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device, nullptr, info, shards,
+                                shard_count);
+        else if (rows * kGroup <= kMmaRows)
+            launch_mma<1>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device, nullptr, info, shards,
+                          shard_count);
+        else {
+            const MmaLaunch* forced = nullptr;
+            if (plan == Int8MmaPlan::TwoStageRing) forced = &device.two_stage_ring;
+            if (plan == Int8MmaPlan::ThreeStageRing) forced = &device.three_stage_ring;
+            if (plan == Int8MmaPlan::OneStagePingPong) forced = &device.one_stage_ping_pong;
+            if (forced && forced->resident == 0) return false;
+            launch_mma<2>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device, forced, info, shards, shard_count);
+        }
     } else if (a.int8) bk::launch_pdl(attn_split_kernel<false, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
     else if (a.fp8) bk::launch_pdl(attn_split_kernel<true, false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
     else bk::launch_pdl(attn_split_kernel<false, false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
     check("attention_decode");
     bk::launch_pdl(attn_combine_kernel, dim3((unsigned) rows, kHeads), dim3(kHeadDim), 0, s, a, z, (const float*) part_ml, (const float*) part_acc, out);
     check("attention_decode/combine");
+    return true;
 }
 
 void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream) {
@@ -1200,11 +1367,22 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
                             a.min_full_keys < kMmaMinKeys);
 }
 
-void attention_decode_int8_test(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream, bool mma) {
+bool attention_decode_int8_test(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream,
+                                bool mma, Int8MmaPlan plan, Int8MmaPlanInfo* info, Int8MmaShards shards, int shard_count) {
     if (!a.int8 || a.window != 0 || rows < 1 || rows > kDecodeRows)
         throw std::invalid_argument("inkling2: test needs a full-cache INT8 decode window");
-    launch_attention_decode(a, rows, max_keys, scratch, out, stream, mma, 1, false);
+    if (plan != Int8MmaPlan::Auto) {
+        const bool singleton_plan = plan == Int8MmaPlan::NarrowRing || plan == Int8MmaPlan::Direct;
+        if (!mma || (singleton_plan ? rows != 1 : rows * kGroup <= kMmaRows))
+            throw std::invalid_argument("inkling2: forced MMA plan does not match the test window");
+    }
+    if (!mma && (shards != Int8MmaShards::Auto || shard_count != 0))
+        throw std::invalid_argument("inkling2: shard override needs the MMA reader");
+    if (shard_count < 0) throw std::invalid_argument("inkling2: negative shard count");
+    return launch_attention_decode(a, rows, max_keys, scratch, out, stream, mma, 1, false, plan, info, shards, shard_count);
 }
+
+int attention_decode_int8_test_min_keys() { return kMmaMinKeys; }
 
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;

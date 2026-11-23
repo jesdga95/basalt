@@ -10,10 +10,29 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <random>
 #include <vector>
 
 namespace ink = basalt::models::inkling2;
+constexpr int kKeys100Ki = 100 * 1024;
+constexpr int kKeysPartTail = 128 * 1024 - 1000;   // a deep row whose last slice is partly filled
+
+static const char* mma_ring_name(const ink::Int8MmaPlanInfo& info) {
+    return info.stages == 0 ? "direct" : info.ping_pong ? "ping-pong-ring" : "ring";
+}
+
+static const char* mma_plan_name(ink::Int8MmaPlan plan) {
+    switch (plan) {
+        case ink::Int8MmaPlan::Auto: return "auto";
+        case ink::Int8MmaPlan::TwoStageRing: return "two-stage-ring";
+        case ink::Int8MmaPlan::ThreeStageRing: return "three-stage-ring";
+        case ink::Int8MmaPlan::OneStagePingPong: return "one-stage-ping-pong";
+        case ink::Int8MmaPlan::NarrowRing: return "narrow-ring";
+        case ink::Int8MmaPlan::Direct: return "direct";
+    }
+    return "unknown";
+}
 
 __global__ void encode_rows(const float* input, uint8_t* output, int rows) {
     const int row = blockIdx.x;
@@ -42,8 +61,8 @@ static bool check_cuda(cudaError_t e, const char* what) {
 static bool bench_attention() {
     struct Fmt { const char* name; bool fp8, int8; };
     const Fmt fmts[] = {{"fp16", false, false}, {"e4m3", true, false}, {"int8", false, true}};
-    const int64_t depths[] = {0, 8192, 32768, 65536, ink::kMmaSingletonShallowKeys, 131072, 262144};
-    const int widths[] = {1, 2, 3, 5, 8};
+    const int64_t depths[] = {0, 8192, 32768, 65536, 98304, kKeys100Ki, 120000, kKeysPartTail, 131072, 196608, 250000, 262144};
+    const int widths[] = {1, 2, 3, 5, 6, 7, 8};
     int dev = 0;
     cudaDeviceProp prop{};
     if (!check_cuda(cudaGetDevice(&dev), "bench device") ||
@@ -70,7 +89,7 @@ static bool bench_attention() {
     ok = ok && check_cuda(cudaEventCreate(&t0), "event") && check_cuda(cudaEventCreate(&t1), "event");
     for (const Fmt& f : fmts)
         for (const int64_t depth : depths) {
-            if ((depth == 32768 || depth == ink::kMmaSingletonShallowKeys) && !f.int8) continue;
+            if (!f.int8 && depth != 0 && depth != 8192 && depth != 65536 && depth != 131072 && depth != 262144) continue;
             const bool window = depth == 0;
             const int64_t cap = window ? ink::kExtent + ink::kDecodeRows : depth;
             const size_t row_bytes = (size_t) ink::kv_cache_row_bytes(f.fp8, f.int8), cache = (size_t) cap * ink::kKvHeads * row_bytes;
@@ -83,7 +102,7 @@ static bool bench_attention() {
             cudaMemset(vc, 0x11, cache);
             for (const int rows : widths) {
                 const bool compare = f.int8 && depth >= 32768;
-                if ((rows == 2 || rows == 5) && !compare) continue;
+                if (!compare && rows != 1 && rows != 3 && rows != 8) continue;
                 const int64_t p0 = (window ? 8192 : depth) - rows;
                 std::vector<int32_t> hp(rows);
                 for (int i = 0; i < rows; ++i) hp[i] = (int32_t) (p0 + i);
@@ -110,14 +129,19 @@ static bool bench_attention() {
                 std::printf("kv bench: %s %-7s %d rows: %8.1f us a window's attention, %6.0f GB/s of one row's K and V\n",
                             window ? "window ring" : "full cache ", f.name, rows, us, kv / us / 1000.);
                 if (window) continue;
-                const auto read_us = [&](bool mma, bool prepared_pdl = false) {
-                    const auto launch = [&] {
+                const auto read_us = [&](bool mma, bool prepared_pdl = false, ink::Int8MmaPlan plan = ink::Int8MmaPlan::Auto,
+                                         ink::Int8MmaPlanInfo* info = nullptr, ink::Int8MmaShards shards = ink::Int8MmaShards::Auto,
+                                         const ink::AttnArgs* args = nullptr, int64_t bound = 0) {
+                    const auto launch = [&](ink::Int8MmaPlanInfo* selected = nullptr) {
                         basalt::kernels::PdlScope pdl(prepared_pdl, true);
                         if (prepared_pdl) ink::decode_prepare(pa, rows, nullptr);
-                        if (compare) ink::attention_decode_int8_test(aa, rows, keys, scr, nullptr, nullptr, mma);
-                        else ink::attention_decode(aa, rows, keys, scr, nullptr, nullptr);
+                        if (compare)
+                            return ink::attention_decode_int8_test(args ? *args : aa, rows, bound ? bound : keys, scr, nullptr,
+                                                                   nullptr, mma, plan, selected, shards);
+                        ink::attention_decode(aa, rows, keys, scr, nullptr, nullptr);
+                        return true;
                     };
-                    launch();
+                    if (!launch(info)) return 0.;
                     cudaEventRecord(t0);
                     for (int i = 0; i < reps; ++i) launch();
                     cudaEventRecord(t1);
@@ -128,15 +152,87 @@ static bool bench_attention() {
                 };
                 double us2 = read_us(false);
                 if (compare) {
-                    const double first = read_us(true);
+                    ink::Int8MmaPlanInfo chosen;
+                    const double first = read_us(true, false, ink::Int8MmaPlan::Auto, &chosen);
                     const double second = read_us(true);
                     us2 = (us2 + read_us(false)) / 2.;
                     const double mma_us = (first + second) / 2.;
-                    std::printf("kv bench: depth %-6lld int8    %d rows: %8.1f us MMA read alone, %6.0f GB/s of one row's K and V\n",
-                                (long long) depth, rows, mma_us, kv / mma_us / 1000.);
+                    std::printf("kv bench: depth %-6lld int8    %d rows: %8.1f us MMA read alone, %6.0f GB/s of one row's K and V "
+                                "shards=%d waves=%.3f\n", (long long) depth, rows, mma_us, kv / mma_us / 1000.,
+                                chosen.shards, (double) chosen.blocks / chosen.slots);
+                    // The shard rule against the halving rule it falls back to, interleaved: at the cell's own bound, then at
+                    // the serving graph's bucket bound with its proven lower bound (session.cpp's full_keys_of and its use).
+                    using Shards = ink::Int8MmaShards;
+                    const auto pair = [&](const ink::AttnArgs* args, int64_t bound, ink::Int8MmaPlanInfo& automatic,
+                                          ink::Int8MmaPlanInfo& previous, double& auto_us, double& previous_us) {
+                        const double a1 = read_us(true, false, ink::Int8MmaPlan::Auto, &automatic, Shards::Auto, args, bound);
+                        const double b1 = read_us(true, false, ink::Int8MmaPlan::Auto, &previous, Shards::Previous, args, bound);
+                        const double b2 = read_us(true, false, ink::Int8MmaPlan::Auto, nullptr, Shards::Previous, args, bound);
+                        const double a2 = read_us(true, false, ink::Int8MmaPlan::Auto, nullptr, Shards::Auto, args, bound);
+                        auto_us = (a1 + a2) / 2.;
+                        previous_us = (b1 + b2) / 2.;
+                    };
+                    ink::Int8MmaPlanInfo ca, cp, ba, bp;
+                    double ca_us = 0., cp_us = 0., ba_us = 0., bp_us = 0.;
+                    pair(nullptr, 0, ca, cp, ca_us, cp_us);
+                    std::printf("kv MMA cell: depth=%lld T=%d plan=%s stages=%d resident=%d slots=%d auto=%.1f us shards=%d "
+                                "waves=%.3f busy=%.3f units=%.2f previous=%.1f us shards=%d waves=%.3f busy=%.3f units=%.2f "
+                                "(%+.1f%%)\n", (long long) depth, rows, mma_ring_name(ca), ca.stages, ca.resident, ca.slots,
+                                ca_us, ca.shards, (double) ca.blocks / ca.slots, (double) ca.busy / ca.slots, ca.units, cp_us,
+                                cp.shards, (double) cp.blocks / cp.slots, (double) cp.busy / cp.slots, cp.units,
+                                100. * (ca_us / cp_us - 1.));
+                    int64_t bucket = 1024;
+                    while (bucket < depth) bucket <<= 1;
+                    int64_t below = bucket / 2;
+                    if (rows == 1 && bucket == ink::kMmaDeepMinKeys) {
+                        bucket *= 2;
+                        below = ink::kMmaDeepMinKeys - 1;
+                    }
+                    ink::AttnArgs served = aa;
+                    served.min_full_keys = below + 2 - rows;
+                    served.cap = bucket;   // a context of at least the bucket; the rows read only the cache's first depth cells
+                    pair(&served, bucket, ba, bp, ba_us, bp_us);
+                    std::printf("kv MMA bucket: depth=%lld T=%d bound=%lld fewest=%lld auto=%.1f us shards=%d waves=%.3f "
+                                "previous=%.1f us shards=%d waves=%.3f (%+.1f%%)\n", (long long) depth, rows,
+                                (long long) bucket, (long long) served.min_full_keys, ba_us, ba.shards,
+                                (double) ba.blocks / ba.slots, bp_us, bp.shards, (double) bp.blocks / bp.slots,
+                                100. * (ba_us / bp_us - 1.));
                 }
                 std::printf("kv bench: depth %-6lld %-7s %d rows: %8.1f us the read alone,    %6.0f GB/s of one row's K and V\n",
                             (long long) depth, f.name, rows, us2, kv / us2 / 1000.);
+                const auto bench_plans = [&](std::initializer_list<ink::Int8MmaPlan> plans) {
+                    struct Sample {
+                        ink::Int8MmaPlan plan;
+                        ink::Int8MmaPlanInfo info;
+                        double us;
+                    };
+                    std::vector<Sample> samples;
+                    for (auto plan : plans) {
+                        ink::Int8MmaPlanInfo info;
+                        const double us = read_us(true, false, plan, &info);
+                        samples.push_back({plan, info, us});
+                    }
+                    for (auto it = samples.rbegin(); it != samples.rend(); ++it)
+                        if (it->info.resident != 0)
+                            it->us = (it->us + read_us(true, false, it->plan)) / 2.;
+                    for (const auto& sample : samples) {
+                        const auto& info = sample.info;
+                        const char* name = mma_plan_name(sample.plan);
+                        if (info.resident == 0)
+                            std::printf("kv MMA plan: depth=%lld T=%d %s unavailable\n", (long long) depth, rows, name);
+                        else
+                            std::printf("kv MMA plan: depth=%lld T=%d %s %.1f us %.0f GB/s stages=%d ping_pong=%d shared=%zu "
+                                        "resident=%d slots=%d shards=%d waves=%.3f busy=%.3f units=%.2f\n", (long long) depth,
+                                        rows, name, sample.us, kv / sample.us / 1000., info.stages, info.ping_pong, info.shared,
+                                        info.resident, info.slots, info.shards, (double) info.blocks / info.slots,
+                                        (double) info.busy / info.slots, info.units);
+                    }
+                };
+                using Plan = ink::Int8MmaPlan;
+                if (compare && rows >= 6 && depth >= kKeysPartTail)
+                    bench_plans({Plan::Auto, Plan::TwoStageRing, Plan::ThreeStageRing, Plan::OneStagePingPong});
+                if (compare && rows == 1 && depth >= 65536)
+                    bench_plans({Plan::NarrowRing, Plan::Direct});
                 if (compare && rows <= 2) {
                     const double scalar_a = read_us(false, true);
                     const double mma_b = read_us(true, true);
@@ -278,7 +374,13 @@ static bool check_attention_mma() {
               upload_cache(&dk, kp) && upload_cache(&dv, vp) && alloc(&dp, rows * sizeof(int32_t)) &&
               alloc(&dout, rows * kOutput * sizeof(float)) && alloc(&dq8, rows * kOutputQ8) &&
               alloc(&scratch, ink::attention_decode_scratch(rows, cap));
-    for (const int depth : {4096, 32768, 65536, (int) ink::kMmaSingletonShallowKeys, 131072, 262144}) {
+    const int mma_min_keys = ink::attention_decode_int8_test_min_keys();
+    std::vector<int> depths{4096};
+    for (const int boundary : {32768, 65536, kKeys100Ki, 131072, 196608, 262144})
+        depths.insert(depths.end(), {boundary - 1, boundary, boundary + 1});
+    bool schedules_ok = true;
+    bool reported[static_cast<int>(ink::Int8MmaPlan::Direct) + 1] = {};
+    for (const int depth : depths) {
         if (!ok) break;
         int32_t pos[rows];
         for (int j = 0; j < rows; ++j) pos[j] = depth - 4 + j;
@@ -286,7 +388,9 @@ static bool check_attention_mma() {
         if (!ok) break;
         enum class Reader { Auto, Scalar, Mma };
         const auto run = [&](int first, int width, Reader reader, DecodeResult& dst,
-                             bool batch = false, bool swap_kv = false, int key_bound = 0) {
+                             bool batch = false, bool swap_kv = false, int key_bound = 0,
+                             ink::Int8MmaPlan plan = ink::Int8MmaPlan::Auto, ink::Int8MmaPlanInfo* info = nullptr,
+                             ink::Int8MmaShards shards = ink::Int8MmaShards::Auto, int shard_count = 0) {
             ink::AttnArgs a;
             a.int8 = true;
             a.q = dq + first * kOutput;
@@ -308,40 +412,77 @@ static bool check_attention_mma() {
                 a.seg.c[0].v = a.seg.c[1].k = dv;
                 a.k_cache = a.v_cache = nullptr;
             } else a.min_full_keys = pos[first] + 1;
-            const int keys = key_bound ? key_bound : depth + 4;
-            if (reader == Reader::Auto) ink::attention_decode(a, width, keys, scratch, dout, nullptr);
-            else ink::attention_decode_int8_test(a, width, keys, scratch, dout, nullptr, reader == Reader::Mma);
+            const int keys = key_bound ? key_bound : pos[first + width - 1] + 1;
+            if (reader == Reader::Auto) {
+                ink::attention_decode(a, width, keys, scratch, dout, nullptr);
+            } else if (!ink::attention_decode_int8_test(a, width, keys, scratch, dout, nullptr, reader == Reader::Mma, plan, info,
+                                                        shards, shard_count)) {
+                return false;
+            }
             return check_cuda(cudaMemcpy(dst.fp32.data(), dout, width * kOutput * sizeof(float), cudaMemcpyDeviceToHost),
                               "attention FP32 output") &&
                    check_cuda(cudaMemcpy(dst.q8.data(), dq8, width * kOutputQ8, cudaMemcpyDeviceToHost), "attention q8_1 output");
         };
+        const auto matches_plan = [&](int first, int width, ink::Int8MmaPlan plan, int bound, const DecodeResult& expected,
+                                      ink::Int8MmaShards shards = ink::Int8MmaShards::Auto, int shard_count = 0) {
+            DecodeResult got;
+            ink::Int8MmaPlanInfo info;
+            const bool ran = run(first, width, Reader::Mma, got, false, false, bound, plan, &info, shards, shard_count);
+            bool& printed = reported[static_cast<int>(plan)];
+            if (plan != ink::Int8MmaPlan::Auto && !printed) {
+                std::printf("kv MMA parity arm: %s available=%d\n", mma_plan_name(plan), info.resident != 0);
+                printed = true;
+            }
+            if (!ran) return false;
+            for (int j = 0; j < width; ++j)
+                if (!same_output(got, j, expected, j)) return false;
+            return true;
+        };
         std::vector<double> ref(rows * kOutput);
         DecodeResult singleton[rows];
+        bool singleton_schedule[rows] = {};
         for (int j = 0; j < rows && ok; ++j) {
             cpu_attention(pos[j], q.data() + j * kOutput, r.data() + j * ink::kHeads * ink::kRel,
                           sink.data() + j * ink::kHeads, gate.data() + j * kOutput, table.data(), hk, hv,
                           ink::AttnArgs{}.scale, ref.data() + j * kOutput);
-            // Also vary the launch bound, which can change both the pipeline plan and CTA grouping.
             ok = run(j, 1, Reader::Mma, singleton[j], false, false, cap);
-            if (ok && pos[j] + 1 >= ink::kMmaDeepMinKeys && pos[j] + 1 <= ink::kMmaSingletonShallowKeys) {
-                DecodeResult short_bound;
-                ok = run(j, 1, Reader::Mma, short_bound, false, false, pos[j] + 1) &&
-                     same_output(short_bound, 0, singleton[j], 0);
-                if (!ok) std::printf("kv MMA parity: singleton schedule mismatch keys=%d\n", pos[j] + 1);
+            // Compare the singleton schedules under tight and padded launch bounds.
+            singleton_schedule[j] = ok;
+            if (!ok) break;
+            for (const int bound : {0, cap}) {
+                singleton_schedule[j] &= matches_plan(j, 1, ink::Int8MmaPlan::NarrowRing, bound, singleton[j]);
+                singleton_schedule[j] &= matches_plan(j, 1, ink::Int8MmaPlan::Direct, bound, singleton[j]);
             }
         }
-        for (const int width : {2, 3, 5, 8}) {
+        for (const int width : {1, 2, 3, 5, 6, 7, 8}) {
             if (!ok) break;
             const int first = 3 - (width - 1) / 2;
-            DecodeResult scalar, mma, automatic, segmented, separate;
+            DecodeResult scalar, mma, padded, automatic, auto_padded, segmented, separate;
             ok = run(first, width, Reader::Scalar, scalar) && run(first, width, Reader::Mma, mma) &&
-                 run(first, width, Reader::Auto, automatic);
+                 run(first, width, Reader::Mma, padded, false, false, cap) &&
+                 run(first, width, Reader::Auto, automatic) && run(first, width, Reader::Auto, auto_padded, false, false, cap);
+            bool schedule = true, shard_invariant = true;
+            if (ok) {
+                for (const int bound : {0, cap}) {
+                    shard_invariant &= matches_plan(first, width, ink::Int8MmaPlan::Auto, bound, mma, ink::Int8MmaShards::Previous);
+                    // Every count the rule can take, and uneven ones, assign whole slices to blocks only.
+                    for (const int count : {1, 2, 3, 4, 8, 16, 21, 32, 64})
+                        shard_invariant &= matches_plan(first, width, ink::Int8MmaPlan::Auto, bound, mma,
+                                                        ink::Int8MmaShards::Auto, count);
+                    if (width >= 6) {
+                        schedule &= matches_plan(first, width, ink::Int8MmaPlan::TwoStageRing, bound, mma);
+                        schedule &= matches_plan(first, width, ink::Int8MmaPlan::ThreeStageRing, bound, mma);
+                        schedule &= matches_plan(first, width, ink::Int8MmaPlan::OneStagePingPong, bound, mma);
+                    }
+                }
+            }
             if (ok && width == rows)
                 ok = run(first, width, Reader::Auto, segmented, true) &&
                      run(first + 5, width - 5, Reader::Auto, separate, false, true);
             if (!ok) break;
             for (int j = 0; j < width; ++j) {
-                double abs[3] = {}, rel[3] = {};
+                double abs[3] = {}, rel[3] = {}, rel_sq[3] = {};
+                int rel_count[3] = {};
                 bool finite = true;
                 for (int d = 0; d < kOutput; ++d) {
                     const double ref_out = ref[(first + j) * kOutput + d];
@@ -352,17 +493,30 @@ static bool check_attention_mma() {
                     for (int k = 0; k < 3; ++k) {
                         const double error = std::abs(actual[k] - want[k]);
                         abs[k] = std::max(abs[k], error);
-                        if (std::abs(want[k]) >= 1e-2) rel[k] = std::max(rel[k], error / std::abs(want[k]));
+                        if (std::abs(want[k]) >= 1e-2) {
+                            const double fraction = error / std::abs(want[k]);
+                            rel[k] = std::max(rel[k], fraction);
+                            rel_sq[k] += fraction * fraction;
+                            ++rel_count[k];
+                        }
                     }
                 }
-                const bool invariant = same_output(mma, j, singleton[first + j], 0);
-                const bool dispatched = same_output(automatic, j, pos[first + j] + 1 >= 32768 ? mma : scalar, j);
+                double rms_rel[3];
+                for (int k = 0; k < 3; ++k)
+                    rms_rel[k] = rel_count[k] ? std::sqrt(rel_sq[k] / rel_count[k]) : 0.;
+                const bool invariant = same_output(mma, j, singleton[first + j], 0) && same_output(mma, j, padded, j);
+                const auto& expected = pos[first + j] + 1 >= mma_min_keys ? mma : scalar;
+                const bool dispatched = same_output(automatic, j, expected, j) && same_output(auto_padded, j, expected, j);
                 const bool batch_invariant = width != rows ||
                     (j < 5 ? same_output(automatic, j, segmented, j) : same_output(separate, j - 5, segmented, j));
+                const bool schedule_invariant = schedule && singleton_schedule[first + j];
                 std::printf("kv MMA parity: depth=%d T=%d row=%d keys=%d max_abs[mma/scalar,mma/cpu,scalar/cpu]=%.7g/%.7g/%.7g "
-                            "max_rel(|ref|>=1e-2)=%.7g/%.7g/%.7g finite=%d invariant=%d dispatch=%d batch=%d hash=%016llx\n",
+                            "max_rel(|ref|>=1e-2)=%.7g/%.7g/%.7g rms_rel(|ref|>=1e-2)=%.7g/%.7g/%.7g "
+                            "finite=%d invariant=%d dispatch=%d batch=%d schedule=%d shard_invariant=%d hash=%016llx\n",
                             depth, width, j, pos[first + j] + 1, abs[0], abs[1], abs[2], rel[0], rel[1], rel[2],
-                            finite, invariant, dispatched, batch_invariant, (unsigned long long) output_hash(mma, j));
+                            rms_rel[0], rms_rel[1], rms_rel[2], finite, invariant, dispatched, batch_invariant, schedule_invariant,
+                            shard_invariant, (unsigned long long) output_hash(mma, j));
+                schedules_ok &= schedule_invariant && shard_invariant;
                 ok &= finite && invariant && dispatched && batch_invariant &&
                       *std::max_element(abs, abs + 3) < 0.002 && *std::max_element(rel, rel + 3) < 0.05;
             }
@@ -371,7 +525,7 @@ static bool check_attention_mma() {
     for (void* p : {(void*) dp, (void*) dq, (void*) dr, (void*) ds, (void*) dg, (void*) dt, (void*) dout, (void*) dq8,
                     (void*) dk, (void*) dv, scratch})
         if (p) cudaFree(p);
-    return ok;
+    return ok && schedules_ok;
 }
 
 int main(int argc, char** argv) {

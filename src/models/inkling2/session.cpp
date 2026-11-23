@@ -921,10 +921,8 @@ private:
         // The previous graph bucket bounds the first consecutive row from below.
         if (seg.at.n == 0 && full_keys > 1024) {
             int64_t previous = full_keys / 2;
-            if (rows == 1 && m_.cache_int8()) {
-                if (full_keys == 2 * kMmaDeepMinKeys) previous = kMmaDeepMinKeys - 1;
-                if (full_keys == kMmaSingletonShallowKeys) previous = 2 * kMmaDeepMinKeys;
-            }
+            if (rows == 1 && m_.cache_int8() && full_keys == 2 * kMmaDeepMinKeys)
+                previous = kMmaDeepMinKeys - 1;
             aa.min_full_keys = previous + 2 - rows;
         }
         attention_window(ap, aa, rows, c.ring ? (int64_t) g_.window : full_keys, x.att_scr_, k.stream);
@@ -1038,16 +1036,12 @@ private:
         return true;
     }
 
-    // Full-cache launch bounds use powers of two, with a bucket for shallow INT8 singletons.
+    // Separate the scalar and MMA singleton buckets at the INT8 cutoff.
     int64_t full_keys_of(int64_t last, int rows) const {
         int64_t full_keys = 1024;
         while (full_keys < last + 1) full_keys <<= 1;
-        if (rows == 1 && m_.cache_int8()) {
-            if (full_keys == kMmaDeepMinKeys)
-                return last + 1 < kMmaDeepMinKeys ? kMmaDeepMinKeys - 1 : 2 * kMmaDeepMinKeys;
-            if (last + 1 > 2 * kMmaDeepMinKeys && last + 1 <= kMmaSingletonShallowKeys)
-                return kMmaSingletonShallowKeys;
-        }
+        if (rows == 1 && m_.cache_int8() && full_keys == kMmaDeepMinKeys)
+            return last + 1 < kMmaDeepMinKeys ? kMmaDeepMinKeys - 1 : 2 * kMmaDeepMinKeys;
         return full_keys;
     }
 
