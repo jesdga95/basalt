@@ -5,7 +5,7 @@ Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quali
 ## Summary
 
 - **Against the reference:** the default pack (`NVFP4-MX8`, the release's MXFP8 experts native) scores mean KLD 0.00297 and top-1 97.83% over 100 chunks, and 0.00303 and 97.72% with its RAM experts on the CPU; the `NVFP4-DQ8` pack 0.00305 and 97.76% ([below](#against-the-reference)).
-- **INT8 KV:** on the DQ8 pack, the original 100-chunk result scored mean KLD 0.00344 with 97.79% top-1; its row is 144 bytes versus 256 for FP16.
+- **INT8 KV:** on the DQ8 pack, the final rebased 100-chunk run scored mean KLD 0.00343 with 97.47% top-1; its row is 144 bytes versus 256 for FP16.
 - **At 256k context:** FP8 saves 4.25 GiB and INT8 saves 3.74 GiB of total VRAM versus FP16 with the same expert placement ([measurements](#earlier-vram-use-at-256k-context)).
 - **The reference is not a true BF16 model.** No BF16 checkpoint exists: the release ships its routed experts in NVFP4 and
   MXFP8. The base is the official release with its experts dequantized to BF16, so its KLD is not comparable with the other
@@ -71,7 +71,9 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 
 | Run | Mean KLD | Top-1 | PPL |
 | --- | ---: | ---: | ---: |
-| DQ8 pack, 100 chunks, `--kv fp16` | 0.00305 | 97.76% | 7.0695 (base 7.0633 over the scored rows) |
+| DQ8 pack, 100 chunks, `--kv fp16` (final rebased build, 475 W) | 0.00304 | 97.81% | 7.0737 (base 7.0644 on these rows) |
+| DQ8 pack, 100 chunks, `--kv fp8` (final rebased build, 475 W) | 0.00452 | 97.04% | 7.0766 (base 7.0644 on these rows) |
+| DQ8 pack, 100 chunks, `--kv int8` (final rebased build, 475 W) | 0.00343 | 97.47% | 7.0788 (base 7.0644 on these rows) |
 | DQ8 pack, 100 chunks, `--kv fp8` (pre-rebase result) | 0.00443 | 97.29% | 7.0702 (base 7.0644) |
 | DQ8 pack, 100 chunks, `--kv int8` (pre-rebase result) | 0.00344 | 97.79% | 7.0762 (base 7.0644) |
 | DQ8 pack, 20 chunks (the quick gate) | 0.00264 | 97.80% | 7.6642 (base 7.6534) |
@@ -85,7 +87,7 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | 100 chunks, `--kv fp8` (#552's build) | 0.00443 | 97.29% | 7.0702 (base 7.0644) |
 | 100 chunks, `--kv fp16` (#552's build), the same set of runs as the two rows above | 0.00310 | 97.78% | 7.0695 (base 7.0644) |
 
-The pre-rebase quality rows and 256K VRAM readings were measured on an RTX 5090 at 400 W unless a row says otherwise. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512). The FP8 and INT8 quality/KLD values above predate this rebase; the BF16 reference corpus is unavailable, so these results do not validate the final build.
+The final rebased quality rows above use the DQ8 pack `/mnt/storage/Projects/basalt/models/Inkling-2-Mini-NVFP4-q8.basalt` and the BF16-derived reference `/mnt/storage/kld/inkling2-q6cr-eval/inkling2-bf16-base.kld`, with the same 100 wikitext-2 chunks (25,500 scored rows), T=3, and RTX 5090 power limit 475 W. The scored-row base PPL was 7.0644 for each run. Earlier quality rows and 256K VRAM readings were measured at 400 W unless noted. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512).
 
 ## Rebased decode: INT8 vs FP8
 
@@ -102,7 +104,17 @@ RTX 5090 at 475 W. One cold process per measurement, same standard `conv` prompt
 
 FP8 was 1.6% faster in this short-context decode ABBA.
 
-A kernel-only timing from `inkling2_kernels_parity`, one row and 2,998 keys on an RTX 5090 at 475 W: FP16 12.5 µs, FP8 10.1 µs, INT8 11.7 µs. This is one test run, not full decode-window latency or passes/s.
+## Pinned-placement decode windows
+
+Three `basalt-bench -t conv -r 3` repetitions per format, same q8 pack, seed 20261122, 32K context, speculative depth 5, and 3,070 expert slots on the RTX 5090 at 475 W. Every run reported 99.9998% VRAM expert hits. These are end-to-end verify-window measurements; draft acceptance differed across formats, so they do not isolate KV kernel cost.
+
+| KV format | Mean tok/s | Mean ms/window | Mean passes/s | Mean acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| FP16 | 402.9 | 5.53 | 181.0 | 70.2% |
+| FP8 | 386.4 | 5.40 | 185.4 | 64.6% |
+| INT8 | 387.9 | 5.26 | 190.3 | 67.6% |
+
+A kernel-only timing from `inkling2_kernels_parity`, one row and 2,998 keys on the same RTX 5090 at 475 W: FP16 12.5 µs, FP8 10.1 µs, INT8 11.7 µs. CUDA 13.3 `nvcc --time` phase durations for the changed translation units are listed below.
 
 ## 16K prefill memory check
 
