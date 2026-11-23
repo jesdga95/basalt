@@ -151,25 +151,29 @@ __device__ __forceinline__ void ldsm_x2_t(unsigned& r0, unsigned& r1, const void
 }
 
 // ---------------------------------------------------------------- decode on the tensor cores
-// Block (split b, KV head, 16 query rows): the rows are the window's (row, head) pairs of the KV group, m = t G + h.  Its
-// chunks b, b + gx, ... of CHUNK cells: K and V decoded to fp16 in shared memory, S = Q K^T on mma m16n8k16 (fp16 in,
-// fp32 accumulate), an online softmax per row over its cells, O = O alpha + P V (P in fp16) on mma; the rows' partials
-// {max, sum, O} go to the merge.  Every row's arithmetic is its own (mma columns and rows never meet), the chunks follow
-// positions and the splits the capacity, so a row's bits are the same at any window width.
-template <int HD, bool I8, bool F4 = false>
-// (launched through launch_pdl: q and the cache come from the kernels before, read after pdl_wait, so not __restrict__)
+// Block (split b, KV head, NTL tiles of 16 query rows): the rows are the window's (row, head) pairs of the KV group,
+// m = t G + h.  Its chunks b, b + gx, ... of CHUNK cells: K and V decoded to fp16 in shared memory once for every tile,
+// S = Q K^T on mma m16n8k16 (fp16 in, fp32 accumulate), an online softmax per row over its cells, O = O alpha + P V (P in
+// fp16) on mma; the rows' partials {max, sum, O} go to the merge.  A tile stops at its own rows' last chunk.  Every row's
+// arithmetic is its own (mma columns and rows never meet, a row keeps its place in its tile), the chunks follow positions
+// and the splits the capacity, so a row's bits are the same at any window width and any NTL.
+template <int HD, bool I8, bool F4, int NTL>
+// (launched through launch_pdl: q and the cache come from the kernels before, read after pdl_wait, so not __restrict__;
+// two tiles keep one tile's three blocks an SM)
 // F4 (with I8): the quantized cache is NVFP4 (KvInt8::fp4), each 8 values from 4 code bytes and their group's scale byte
-__global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int n_head, int n_kv, const DecSegs segs, int n_chunks,
-                                                         float scale, float* part_all) {
+__global__ void __launch_bounds__(128, NTL == 2 ? 3 : 1)
+    decode_mma_kernel(const float* q_all, int n_head, int n_kv, const DecSegs segs, int n_chunks, float scale, float* part_all) {
     constexpr int LD = HD + 8;          // padded rows (halves): ldmatrix without bank conflicts
     constexpr int NT = HD / 32;         // P V: a warp's 8-dim tiles
-    __shared__ __align__(16) __half qs[16][LD];
+    constexpr int R = 16 * NTL;         // the block's rows
+    constexpr int SL = CHUNK + 4;       // a score row (floats, 16-byte aligned); its fp16 probabilities overwrite its front
+    __shared__ __align__(16) __half qs[R][LD];
     __shared__ __align__(16) __half ks[CHUNK][LD];
     __shared__ __align__(16) __half vs[CHUNK][LD];
-    __shared__ float ss[16][CHUNK + 1];
-    __shared__ __align__(16) __half ps[16][CHUNK + 8];
-    __shared__ float rm[16], rl[16], ra[16];
-    __shared__ int64_t rlo[16], rhi[16];
+    __shared__ __align__(16) float ss[R][SL];
+    __half(*ps)[2 * SL] = reinterpret_cast<__half(*)[2 * SL]>(ss);   // a row's warp reads its scores before it writes them
+    __shared__ float rm[R], rl[R], ra[R];
+    __shared__ int64_t rlo[R], rhi[R];
     pdl_launch_dependents();
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
     const int kvh = blockIdx.y, gx = gridDim.x, G = n_head / n_kv;
@@ -181,7 +185,7 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
     const KvFar fr = segs.far_kv[sk];
     const float* q = q_all + (int64_t) row0 * n_head * HD;
     float* part = part_all + (int64_t) row0 * n_head * gx * (HD + 2);
-    const int M = T * G, m0 = ((int) blockIdx.z - segs.tile0[sk]) * 16;
+    const int M = T * G, m0 = ((int) blockIdx.z - segs.tile0[sk]) * R;
     // the chunk's cells [from, to) of K and V as fp16 (int8: code x scale), zero past the last row's cells
     const auto load_kv = [&](int64_t c0, int64_t hi_max, int from, int to) {
         const int64_t cell0 = c0 % r.cap;
@@ -299,7 +303,7 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
     bool staged = false;
     // before the wait: the rows' ranges (positions come from the host) and, of the block's first chunk, the cells below
     // the window's first position, which earlier windows wrote; the window's own cells and the queries come after it
-    if (tid < 16) {
+    if (tid < R) {
         const int m = m0 + tid;
         rlo[tid] = m < M ? row_lo(r, m / G) : 0;
         rhi[tid] = m < M ? row_hi(r, m / G) : 0;
@@ -307,22 +311,29 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
         rl[tid] = 0.0f;
     }
     __syncthreads();
-    int64_t hi_max = 0;
+    int64_t hi_max = 0, tile_hi[NTL];   // past every row's cells, past each tile's
 #pragma unroll
-    for (int i = 0; i < 16; ++i) hi_max = max(hi_max, rhi[i]);
+    for (int j = 0; j < NTL; ++j) {
+        tile_hi[j] = 0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) tile_hi[j] = max(tile_hi[j], rhi[16 * j + i]);
+        hi_max = max(hi_max, tile_hi[j]);
+    }
     const int64_t first_c0 = (int64_t) (r.base + blockIdx.x) * CHUNK;
     const int64_t own = row_pos0(r);   // cells from the window's first position on are this window's (written just before)
     const int pre = (int) max((int64_t) 0, min((int64_t) CHUNK, own - first_c0));
     if ((int) blockIdx.x < n_chunks && first_c0 < hi_max && pre > 0) load_kv(first_c0, hi_max, 0, pre);
     pdl_wait();
-    for (int idx = tid; idx < 16 * HD; idx += 128) {
+    for (int idx = tid; idx < R * HD; idx += 128) {
         const int i = idx / HD, d = idx - i * HD, m = m0 + i;
         const float v = m < M ? q[((int64_t) (m / G) * n_head + kvh * G + m % G) * HD + d] * scale : 0.0f;
         qs[i][d] = __float2half_rn(v);
     }
-    float acc[NT][4];
+    float acc[NTL][NT][4];
 #pragma unroll
-    for (int n = 0; n < NT; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+    for (int j = 0; j < NTL; ++j)
+#pragma unroll
+        for (int n = 0; n < NT; ++n) acc[j][n][0] = acc[j][n][1] = acc[j][n][2] = acc[j][n][3] = 0.0f;
     for (int chunk = blockIdx.x; chunk < n_chunks; chunk += gx) {
         const int64_t c0 = (int64_t) (r.base + chunk) * CHUNK;
         if (c0 >= hi_max) break;   // past every row's cells
@@ -337,24 +348,28 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
                 staged = true;
             }
         }
-        // S = Q K^T: warp w the cells 8w .. 8w + 7
-        for (int nc = warp; nc < CHUNK / 8; nc += 4) {
+        // S = Q K^T: warp w the cells 8w .. 8w + 7 of each tile
+#pragma unroll
+        for (int job = warp; job < NTL * (CHUNK / 8); job += 4) {
+            const int j = job / (CHUNK / 8), nc = job - j * (CHUNK / 8);
+            if (c0 >= tile_hi[j]) continue;
             float s4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
             for (int k = 0; k < HD; k += 16) {
                 unsigned a0, a1, a2, a3, b0, b1;
-                ldsm_x4(a0, a1, a2, a3, &qs[lane & 15][k + (lane >> 4) * 8]);
+                ldsm_x4(a0, a1, a2, a3, &qs[16 * j + (lane & 15)][k + (lane >> 4) * 8]);
                 ldsm_x2(b0, b1, &ks[nc * 8 + (lane & 7)][k + ((lane >> 3) & 1) * 8]);
                 mma16816(s4, a0, a1, a2, a3, b0, b1);
             }
-            ss[g][nc * 8 + 2 * c] = s4[0];
-            ss[g][nc * 8 + 2 * c + 1] = s4[1];
-            ss[g + 8][nc * 8 + 2 * c] = s4[2];
-            ss[g + 8][nc * 8 + 2 * c + 1] = s4[3];
+            ss[16 * j + g][nc * 8 + 2 * c] = s4[0];
+            ss[16 * j + g][nc * 8 + 2 * c + 1] = s4[1];
+            ss[16 * j + g + 8][nc * 8 + 2 * c] = s4[2];
+            ss[16 * j + g + 8][nc * 8 + 2 * c + 1] = s4[3];
         }
         __syncthreads();
         // each row: the chunk's max over its cells, p = exp2(s - max') there (0 elsewhere), the running {max, sum}
-        for (int i = warp; i < 16; i += 4) {
+        for (int i = warp; i < R; i += 4) {
+            if (c0 >= tile_hi[i / 16]) continue;
             float pv[CHUNK / 32], mx = kNeg;
 #pragma unroll
             for (int u = 0; u < CHUNK / 32; ++u) {
@@ -382,61 +397,93 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
             }
         }
         __syncthreads();
-        // O = O alpha + P V: warp w the dims w HD / 4 ..
+        // O = O alpha + P V: warp w the dims w HD / 4 .. of each tile, a V fragment loaded once for every tile
         {
-            const float ag = ra[g], ag8 = ra[g + 8];
+            bool on[NTL];
 #pragma unroll
-            for (int n = 0; n < NT; ++n) {
-                acc[n][0] *= ag;
-                acc[n][1] *= ag;
-                acc[n][2] *= ag8;
-                acc[n][3] *= ag8;
+            for (int j = 0; j < NTL; ++j) {
+                on[j] = c0 < tile_hi[j];
+                if (!on[j]) continue;
+                const float ag = ra[16 * j + g], ag8 = ra[16 * j + g + 8];
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    acc[j][n][0] *= ag;
+                    acc[j][n][1] *= ag;
+                    acc[j][n][2] *= ag8;
+                    acc[j][n][3] *= ag8;
+                }
             }
 #pragma unroll
             for (int kk = 0; kk < CHUNK; kk += 16) {
-                unsigned a0, a1, a2, a3;
-                ldsm_x4(a0, a1, a2, a3, &ps[lane & 15][kk + (lane >> 4) * 8]);
+                unsigned a[NTL][4];
+#pragma unroll
+                for (int j = 0; j < NTL; ++j)
+                    if (on[j]) ldsm_x4(a[j][0], a[j][1], a[j][2], a[j][3], &ps[16 * j + (lane & 15)][kk + (lane >> 4) * 8]);
 #pragma unroll
                 for (int n = 0; n < NT; ++n) {
                     unsigned b0, b1;
                     ldsm_x2_t(b0, b1, &vs[kk + (lane & 15)][warp * (HD / 4) + n * 8]);
-                    mma16816(acc[n], a0, a1, a2, a3, b0, b1);
+#pragma unroll
+                    for (int j = 0; j < NTL; ++j)
+                        if (on[j]) mma16816(acc[j][n], a[j][0], a[j][1], a[j][2], a[j][3], b0, b1);
                 }
             }
         }
         __syncthreads();   // the shared tiles are free for the next chunk
     }
 #pragma unroll
-    for (int hr = 0; hr < 2; ++hr) {
-        const int i = g + 8 * hr, m = m0 + i;
-        if (m >= M) continue;
-        float* out = part + (((int64_t) (m / G) * n_head + (int64_t) kvh * G + m % G) * gx + blockIdx.x) * (HD + 2);
-        if (warp == 0 && c == 0) {
-            out[0] = rm[i];
-            out[1] = rl[i];
-        }
+    for (int j = 0; j < NTL; ++j)
 #pragma unroll
-        for (int n = 0; n < NT; ++n) {
-            const int d = warp * (HD / 4) + n * 8 + 2 * c;
-            out[2 + d] = acc[n][2 * hr];
-            out[3 + d] = acc[n][2 * hr + 1];
+        for (int hr = 0; hr < 2; ++hr) {
+            const int i = 16 * j + g + 8 * hr, m = m0 + i;
+            if (m >= M) continue;
+            float* out = part + (((int64_t) (m / G) * n_head + (int64_t) kvh * G + m % G) * gx + blockIdx.x) * (HD + 2);
+            if (warp == 0 && c == 0) {
+                out[0] = rm[i];
+                out[1] = rl[i];
+            }
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                const int d = warp * (HD / 4) + n * 8 + 2 * c;
+                out[2 + d] = acc[j][n][2 * hr];
+                out[3 + d] = acc[j][n][2 * hr + 1];
+            }
         }
-    }
 }
 
-// segs.n and segs.row0 set: the tiles from the rows, then both kernels over every segment
+// segs.n and segs.row0 set: the blocks' tiles from the rows, then both kernels over every segment.  At head width 128 a
+// block takes two tiles of a segment (K and V staged once for 32 rows) when its split holds at least 4 chunks: below
+// that the second tile's latency costs more than the reads it saves.  At 256 one tile (the static shared-memory budget).
 template <int HD>
 void launch_segs(const float* q, int n_head, int n_kv, DecSegs& segs, float* scratch, int n_chunks, float* out, cudaStream_t s,
                  const float* gate_q = nullptr, uint16_t* gated16 = nullptr) {
     const float scale = 1.4426950408889634f / sqrtf((float) HD);
     const int gx = decode_splits(n_chunks);
+    int tiles_max = 0;
     for (int k = 0; k < segs.n; ++k)
-        segs.tile0[k + 1] = segs.tile0[k] + ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16;
+        tiles_max = std::max(tiles_max, ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16);
+    const int ntl = HD == 128 && tiles_max > 1 && n_chunks >= 4 * gx ? 2 : 1;
+    for (int k = 0; k < segs.n; ++k) {
+        const int tiles = ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16;
+        segs.tile0[k + 1] = segs.tile0[k] + (tiles + ntl - 1) / ntl;
+    }
     const dim3 grid((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]);
-    if (segs.q8[0].k && segs.q8[0].fp4)
-        launch_pdl(decode_mma_kernel<HD, true, true>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
-    else if (segs.q8[0].k) launch_pdl(decode_mma_kernel<HD, true>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
-    else launch_pdl(decode_mma_kernel<HD, false>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+    const auto run = [&](auto kernel) {
+        launch_pdl(kernel, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+    };
+    const bool i8 = segs.q8[0].k != nullptr, f4 = i8 && segs.q8[0].fp4;
+    if constexpr (HD == 128) {
+        if (ntl == 2) {
+            if (f4) run(decode_mma_kernel<HD, true, true, 2>);
+            else if (i8) run(decode_mma_kernel<HD, true, false, 2>);
+            else run(decode_mma_kernel<HD, false, false, 2>);
+        }
+    }
+    if (ntl == 1) {
+        if (f4) run(decode_mma_kernel<HD, true, true, 1>);
+        else if (i8) run(decode_mma_kernel<HD, true, false, 1>);
+        else run(decode_mma_kernel<HD, false, false, 1>);
+    }
     check("gqa decode attention");
     launch_pdl(decode_merge_kernel<HD>, dim3((unsigned) n_head, (unsigned) segs.row0[segs.n]), dim3(HD), 0, s,
                (const float*) scratch, n_head, gx, out, gate_q, gated16, segs);
