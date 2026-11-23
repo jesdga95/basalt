@@ -1,8 +1,10 @@
-// include/basalt/kernels/gqa_attn.hpp - causal grouped-query attention over an fp16 KV cache, head width 256.
+// include/basalt/kernels/gqa_attn.hpp - causal grouped-query attention over an fp16 KV cache, head width 256 (or 128
+// where `head_dim` says so: the decode window and the fp16 prompt kernel).
 //
-// The cache holds one layer's cells as [cell][n_kv][256] fp16, K and V apart; query heads h and h + 1 ... share KV
-// head h / (n_head / n_kv). Row t of a window or chunk sits at cell pos0 + t and sees cells 0 .. pos0 + t.  q is fp32
-// [T][n_head][256], already normed and rotated; out fp32 [T][n_head][256]; scale 1/16.
+// The cache holds one layer's cells as [cell][n_kv][head_dim] fp16, K and V apart; query heads h and h + 1 ... share KV
+// head h / (n_head / n_kv), up to 16 query heads per KV head. Row t of a window or chunk sits at cell pos0 + t and sees
+// cells 0 .. pos0 + t.  q is fp32 [T][n_head][head_dim], already normed and rotated; out fp32 [T][n_head][head_dim];
+// scale 1/sqrt(head_dim).  The int8 cache's kernels take head width 256 only.
 //
 //   gqa_decode_attn   a decode window (T <= 8): cells split in chunks over the grid, fp32 dot products, the chunks'
 //                     partial softmax sums merged by a second kernel.  A row's output does not depend on T.
@@ -50,7 +52,7 @@ size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_
 void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int T, float* scratch, int64_t max_cells, float* out, void* stream,
                      const int32_t* pos_dev = nullptr, KvInt8 q8 = {}, const float* gate_q = nullptr,
-                     uint16_t* gated16 = nullptr, KvFar far_kv = {});
+                     uint16_t* gated16 = nullptr, KvFar far_kv = {}, int head_dim = 256);
 /// (gate_q, gated16: also each head's output times sigmoid of its gate, q_full [T][n_head][512]'s second half, as bf16
 /// rows [T][n_head * 256] into gated16 (bitwise attn_gate, then rounded); `out` may then be null.)
 /// One window of each of several sequences (a batch window's segments) in one launch: segment k's rows follow segment
@@ -67,7 +69,7 @@ struct GqaSeg {
 };
 void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* segs, int n_seg, float* scratch,
                           int64_t max_cells, float* out, void* stream, const float* gate_q = nullptr,
-                          uint16_t* gated16 = nullptr);
+                          uint16_t* gated16 = nullptr, int head_dim = 256);
 /// gqa_decode_attn for a block drafter's rows: head width 128 or 256, row t at position pos0 + t sees positions
 /// [pos0 + t - window + 1, hi) (not causal), position p in cache cell p % cap. `block`: every row sees the first row's
 /// window, [pos0 - window + 1, hi) (a drafter whose block shares its anchor's window).
@@ -82,7 +84,7 @@ size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits);
 /// `split_scratch` (optional, `split_floats` floats): lets an int8-cache launch split its cells over more blocks.
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8 = {}, float* split_scratch = nullptr,
-                     size_t split_floats = 0, KvFar far_kv = {});
+                     size_t split_floats = 0, KvFar far_kv = {}, int head_dim = 256);
 /// The prompt chunk's form on an int8 cache: BF16 queries and BF16 output rows (the same arithmetic; the output rounded once).
 void gqa_prompt_attn_bf16(const uint16_t* q, int n_head, int n_kv, int64_t pos0, int64_t T, uint16_t* out, void* stream,
                           KvInt8 q8, float* split_scratch = nullptr, size_t split_floats = 0, KvFar far_kv = {});
