@@ -156,11 +156,10 @@ public:
     virtual int batch_rows() const { return 0; }
     /// The windows reqs[0..n) of the distinct sessions[0..n) (sessions of one model, this one among them) as one batch, the
     /// model's weights read once: each session ends as after its own decode_window(reqs[i]). The windows' rows total at most
-    /// batch_rows(). Refused: no window of the batch ran.
+    /// batch_rows().
     virtual Result decode_batch(ModelSession* const* sessions, const DecodeRequest* reqs, int n) {
         for (int i = 0; i < n; ++i)
-            if (Result r = sessions[i]->decode_window(reqs[i]); !r.ok())
-                return i == 0 || r.status != Status::Refused ? r : Result{Status::Error, r.message};
+            if (Result r = sessions[i]->decode_window(reqs[i]); !r.ok()) return r;
         return {};
     }
     /// After the batch rounds' last decode_batch over sessions[0..n) (this one first; a lone decode_window, n = 1) and before

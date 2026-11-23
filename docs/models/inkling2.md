@@ -69,8 +69,8 @@ the text model.
   graph finds no device memory runs direct, and windows of its shape keep running without a graph (no copy moves); a
   batched window's graph has no such fallback. A VRAM resize the copies cannot meet is refused before any copy moves. A
   copy table update, a copy's upload, or a map or cache backing that fails for any reason but a clean lack of memory (a
-  CUDA failure) stops the engine: every later request is refused. A refused decode window ends its request with an error
-  and the engine serves the next. Nothing changes when everything fits.
+  CUDA failure) stops the engine: every later request is refused. With one session, a refused decode window ends its
+  request with an error and the engine serves the next. Nothing changes when everything fits.
 - **Which experts get a copy:** the profile's order until the session has looked experts up, then the lookups of the rows its
   windows keep (rejected drafts do not count), decayed over 320 kept rows. The least looked up give way first when the caches
   grow. With one session and an elastic spill, at a request's start and every 256 decode positions after it, up to 64 copies
@@ -82,10 +82,10 @@ the text model.
   card's own reached first. A prompt read through the staging takes the memory
   back first; a read through the decode path leaves the loan in place. Loaned copies use the card's arithmetic
   ([precision](../precision/inkling2.md)).
-- **Same tokens on every run:** with one session and no device map failing, placement only changes at positions the requests
-  fix (a request's start, the rebalances, the loan, a cache grow) and by counted memory, and a decode window never crosses
-  such a position, so the same greedy requests give the same tokens run to run whatever the windows' widths. A memory
-  shortage logs where placement left that rule. The log's `copy set` names the copied
+- **Same tokens on every run:** with one session, placement follows the token stream and the start state unless the log
+  shows `placement changed by a memory shortage`: it only changes at positions the requests fix (a request's start, the
+  rebalances, the loan, a cache grow) and by counted memory, and a decode window never crosses such a position, so the
+  same greedy requests give the same tokens run to run whatever the windows' widths. The log's `copy set` names the copied
   experts after each change. A different free VRAM at start, a VRAM command, a sleep, a conversation restored from the
   parked store or several sessions decoding together can give a different placement.
 - **Sleep and lending:** `--idle-sleep` and `POST /v1/vram` ([running](../running.md#sleep---idle-sleep)) use the same copies.

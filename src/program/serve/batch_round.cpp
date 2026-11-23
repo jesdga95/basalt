@@ -196,27 +196,17 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
         if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
         else bpolicy->observe_window(w.chance, T, a, ms);
     }
-    if (fin != nullptr) slot_done(b, fin);
+    if (fin != nullptr) {
+        std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin,
+                    std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
+                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
+        sl.active = false;
+        sl.cached = o.prompt_cache > 0;
+        sl.idle_busy = busy_now();
+        sl.guard.reset();
+    }
     std::fflush(stdout);
     return true;
-}
-
-void Runtime::slot_done(int b, const char* fin) {
-    BSlot& sl = bs[(size_t) b];
-    std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin,
-                std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
-                (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
-    sl.active = false;
-    sl.cached = o.prompt_cache > 0;
-    sl.idle_busy = busy_now();
-    sl.guard.reset();
-}
-
-// A window the model refused (no room for its positions): the slot ends as an error, holding what it held.
-void Runtime::slot_refused(int b, const std::string& why) {
-    basalt::log::warn("basalt serve", "%s", why.c_str());
-    slot_done(b, "error");
-    std::fflush(stdout);
 }
 
 // One window of every ready active slot.  A model that does not batch decodes them one session at a time: the slot's drafts
@@ -240,11 +230,7 @@ bool Runtime::batch_round() {
             w.round0 = Clock::now();
             slot_window_begin(b, w, 1 << 20);
             stats_lookups_begin();
-            if (const basalt::model::Result r = slot_session(b).decode_window(w.d); !r.ok()) {
-                if (r.status != basalt::model::Status::Refused) return failed(r.message);
-                slot_refused(b, r.message);
-                continue;
-            }
+            if (const basalt::model::Result r = slot_session(b).decode_window(w.d); !r.ok()) return failed(r.message);
             if (!slot_window_finish(b, w)) return false;
             stats_lookups_end();
         }
@@ -281,29 +267,18 @@ bool Runtime::batch_round() {
             rows[(size_t) i] = wins[(size_t) i].T;
         }
     }
-    // a refused group ran nothing: its windows run again one by one, and the one refused alone ends its slot
-    std::vector<std::vector<size_t>> groups = batch_groups(rows, cap);
-    for (size_t g = 0; g < groups.size(); ++g) {
-        const std::vector<size_t> group = groups[g];
+    for (const std::vector<size_t>& group : batch_groups(rows, cap)) {
         const Clock::time_point t0 = Clock::now();
         stats_lookups_begin();
         std::vector<basalt::model::ModelSession*> ss;
         for (const size_t i : group) ss.push_back(&slot_session(act[i]));
-        basalt::model::Result r;
         if (group.size() == 1) {
-            r = ss[0]->decode_window(wins[group[0]].d);
+            if (const basalt::model::Result r = ss[0]->decode_window(wins[group[0]].d); !r.ok()) return failed(r.message);
         } else {
             std::vector<basalt::model::DecodeRequest> rq;
             for (const size_t i : group) rq.push_back(wins[i].d);
-            r = ss[0]->decode_batch(ss.data(), rq.data(), (int) group.size());
+            if (const basalt::model::Result r = ss[0]->decode_batch(ss.data(), rq.data(), (int) group.size()); !r.ok()) return failed(r.message);
         }
-        if (r.status == basalt::model::Status::Refused) {
-            if (group.size() == 1) slot_refused(act[group[0]], r.message);
-            else
-                for (const size_t i : group) groups.push_back({i});
-            continue;
-        }
-        if (!r.ok()) return failed(r.message);
         // every slot's tokens and the rows each keeps, then the group's drafts as one pass, then each slot's tokens out
         // and drafts read
         std::vector<int> kept;

@@ -65,6 +65,7 @@ uint64_t ElasticArray::to_back(uint64_t bytes) const {
 }
 
 bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
+    out_of_memory_ = false;
     if (unusable_) {
         err = "the array's backing is uncertain";
         return false;
@@ -87,17 +88,16 @@ bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) 
             return false;
         }
     }
-    bool out_of_memory = false;
-    const unsigned long long h = vmm::map(base_ + backed_, n, &out_of_memory);
+    const unsigned long long h = vmm::map(base_ + backed_, n, &out_of_memory_);
     if (!h) {   // any failure but a clean out-of-memory may leave the range mapped untracked
-        unusable_ = !out_of_memory;
-        err = out_of_memory ? "out of device memory for the array" : "the array's new backing could not be mapped";
+        unusable_ = !out_of_memory_;
+        err = out_of_memory_ ? "out of device memory for the array" : "the array's new backing could not be mapped";
         return false;
     }
     bool idle = false;
-    if (!clear_extent(base_ + backed_, n, idle)) {
-        if (!idle) extents_.push_back({backed_, n, h});
-        unusable_ = !idle || !vmm::unmap(base_ + backed_, n, h);
+    if (!clear_extent(base_ + backed_, n, idle)) {   // a CUDA failure: the extent stays tracked, the array is not used again
+        extents_.push_back({backed_, n, h});
+        unusable_ = true;
         err = "cannot initialize the array's new backing";
         return false;
     }

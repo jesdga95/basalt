@@ -27,6 +27,8 @@ public:
     void trim(uint64_t bytes);
     /// False once a new extent's map, clear or release could not be confirmed: the array is not grown or trimmed again.
     bool usable() const { return !unusable_; }
+    /// The last ensure failed only because the device lacked the memory (nothing was mapped).
+    bool out_of_memory() const { return out_of_memory_; }
     uint8_t* data() const { return base_; }
     uint64_t backed() const { return backed_; }
     uint64_t capacity() const { return reserved_; }
@@ -38,7 +40,8 @@ private:
     };
     uint8_t* base_ = nullptr;
     uint64_t reserved_ = 0, backed_ = 0, gran_ = 0;
-    bool unusable_ = false;   // a clear or a release could not be confirmed: the range's backing is not known
+    bool unusable_ = false;   // a map, clear or release could not be confirmed: the range's backing is not known
+    bool out_of_memory_ = false;
     bool plain_ = false;   // one cudaMalloc, no virtual memory
     std::vector<Extent> extents_;
 };

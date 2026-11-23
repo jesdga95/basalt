@@ -167,6 +167,12 @@ public:
             if (!a->usable()) return false;
         return true;
     }
+    /// The last ensure failed only because the device lacked the memory.
+    bool out_of_memory() const {
+        for (const auto& a : full_)
+            if (a->out_of_memory()) return true;
+        return false;
+    }
     uint64_t backing_bytes() const {
         uint64_t n = 0;
         for (const auto& a : full_) n += a->backed();

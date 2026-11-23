@@ -784,13 +784,19 @@ public:
             return false;
         }
         uint64_t backing0 = backing_bytes();
+        bool out_of_memory = false;   // the failure was the device lacking the memory, nothing left half done
         const auto map = [&] {
-            bool ok = true;
-            for (auto& a : elastic_) ok = ok && a->ensure(bytes, 0, err);
-            return ok && dspark_.ensure(target, err);   // DSPARK HOOK
+            for (auto& a : elastic_)
+                if (!a->ensure(bytes, 0, err)) {
+                    out_of_memory = a->out_of_memory();
+                    return false;
+                }
+            if (dspark_.ensure(target, err)) return true;   // DSPARK HOOK
+            out_of_memory = dspark_.out_of_memory();
+            return false;
         };
         bool mapped = map();
-        if (!mapped && caches_usable()) {
+        if (!mapped && out_of_memory && caches_usable()) {
             // The card has less free memory than placement counted (another program, or graphs and modules past the spare
             // took it). As without the count: read the card again, send copies back for the grow and try once more. From
             // here placement depends on that reading, which the line says.
