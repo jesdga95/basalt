@@ -64,6 +64,16 @@ static PeerShare::Dims share_dims(int64_t Tp, int64_t G, int64_t tf, const MmqPl
     d.bufs = 2;
     return d;
 }
+// The FP4 share runs the primary's FP4 kernels (fp4::quantize_tokens and the products in peer_experts.cpp),
+// which are built for sm_120 only.  An older peer takes the MMQ share of an NVFP4 pack instead, through the
+// same int8 kernels as any other format, rather than failing at its first launch with 'no kernel image'.
+static bool fp4_peer(int dev) {
+    int major = 0, minor = 0;
+    return cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+           cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess && major == 12 &&
+           minor == 0;
+}
+
 template <class Take>
 static void fp4_layout(PeerPrefill& pp, int64_t Tp, Take&& take) {
     const int64_t Gr = pp.G;
@@ -122,12 +132,13 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t tf, std::u
     return true;
 }
 
-uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share) {
+uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, int peer_dev) {
     if (!mmq_plan().any) return 0;
     PeerPrefill pp;
     pp.T_max = std::min<int64_t>(chunk, streamed_share ? stream_all_min() - 1 : kPeerSlowRows);
     pp.G = pp.T_max;
-    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
+    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() ||
+                                  stream_all_min() < FP4_MIN_TOKENS || !fp4_peer(peer_dev)
                               ? 0 : std::min<int64_t>(chunk, kPeerFp4Tokens);
     const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;
     const int64_t Tp = std::max(pp.T_max, tf);
@@ -143,7 +154,8 @@ bool Prefill::set_peer(core::PeerExperts* peer, bool streamed_share, std::string
     // result rows cross through host staging (cudaMemcpyPeerAsync) and the streamed ring stays off.  It also takes
     // those of a streamed chunk of up to kPeerFp4Tokens (PeerPrefill::T_fp4) where those buffers fit too.
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
-    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
+    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() ||
+                                  stream_all_min() < FP4_MIN_TOKENS || !fp4_peer(peer->device())
                               ? 0 : std::min<int64_t>(m.T_max, kPeerFp4Tokens);
     std::unique_ptr<PeerPrefill> pp;
     const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);

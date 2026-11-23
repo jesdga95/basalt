@@ -19,6 +19,7 @@ option(WERROR "Treat compiler warnings as errors" OFF)
 # Optional peer architectures: building the peer-tier kernels for sm_89 (Ada) in addition to sm_120
 # allows a non-Blackwell card to serve as the expert tier, but adds build time.
 option(PEER_ADA "Compile peer kernels for sm_89 (Ada) in addition to sm_120" OFF)
+option(PEER_AMPERE "Compile peer kernels for sm_86 and sm_80 (Ampere) in addition to sm_120" OFF)
 if(BUILD_TESTING)
   enable_testing()
 endif()
@@ -500,10 +501,20 @@ target_link_libraries(basalt-load PRIVATE core kernels)
 endif()
 
 # Peer-tier compilation: the expert-window decode kernels, the peer prefill mmq/iota kernels and the
-# small utility kernels that run on the peer card additionally compile for sm_89 (Ada), so a non-Blackwell
-# card can serve as the expert tier. Must be set BEFORE the targets that compile these files are defined.
+# small utility kernels that run on the peer card additionally compile for sm_89 (Ada) or sm_86/sm_80 (Ampere),
+# so a non-Blackwell card can serve as the expert tier. Both options may be on at once. Must be set
+# BEFORE the targets that compile these files are defined.
+set(BASALT_PEER_ARCH_FLAGS "")
 if(PEER_ADA)
   add_compile_definitions(BASALT_PEER_ADA=1)
+  list(APPEND BASALT_PEER_ARCH_FLAGS "--generate-code=arch=compute_89,code=sm_89")
+endif()
+if(PEER_AMPERE)
+  add_compile_definitions(BASALT_PEER_AMPERE=1)
+  list(APPEND BASALT_PEER_ARCH_FLAGS "--generate-code=arch=compute_86,code=sm_86")
+  list(APPEND BASALT_PEER_ARCH_FLAGS "--generate-code=arch=compute_80,code=sm_80")
+endif()
+if(BASALT_PEER_ARCH_FLAGS)
   set_source_files_properties(
     src/models/qwen4exp/kernels/dec_moe.cu
     src/models/qwen4exp/kernels/dec_moe_peer_q0_m0.cu
@@ -522,6 +533,7 @@ if(PEER_ADA)
     src/prefill/mmq/instances/mmq_iq3_xxs.cu
     src/prefill/mmq/instances/mmq_iq3_s.cu
     src/prefill/mmq/instances/mmq_iq4_nl.cu
+    src/prefill/mmq/instances/mmq_nvfp4.cu
     src/prefill/mmq/instances/mmq_iq4_xs.cu
     src/prefill/mmq/instances/mmq_q8_0.cu
     src/prefill/mmq/instances/mmq_q5_0.cu
@@ -536,7 +548,7 @@ if(PEER_ADA)
     src/kernels/cuda/wait_abort.cu
     src/kernels/cuda/sampler.cu
     src/kernels/cuda/elementwise.cu
-    PROPERTIES COMPILE_OPTIONS "--generate-code=arch=compute_89,code=sm_89")
+    PROPERTIES COMPILE_OPTIONS "${BASALT_PEER_ARCH_FLAGS}")
 endif()
 
 # ---- kernels ----
@@ -605,6 +617,20 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
     src/models/qwen4exp/kernels/q80_proxy.cu
     src/models/qwen4exp/kernels/q80_vhead.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+
+# The peer serves its share of the LM head: with two cards the head is split by vocabulary
+# (src/models/qwen4exp/decode/verify/head_split.cpp) whenever the peer bandwidth earns a share - in the
+# expert-tier mechanism too, not only a layer split - so these kernels need the peer architecture as
+# well.  APPEND, and after the block above: COMPILE_OPTIONS is a single property, and a second
+# set_source_files_properties on the same source replaces whatever the first one set.
+if(BASALT_PEER_ARCH_FLAGS)
+  set_property(SOURCE
+      src/models/qwen4exp/kernels/q5k_head.cu
+      src/models/qwen4exp/kernels/q80_vhead.cu
+      src/models/qwen4exp/kernels/cvec.cu
+      src/kernels/cuda/native_mmvq.cu
+      APPEND PROPERTY COMPILE_OPTIONS ${BASALT_PEER_ARCH_FLAGS})
+endif()
 
 # ---- engine -----------------------------------------------------
 # The COMPOSED layer lives here and not in `core`, because it calls kernels and `kernels`

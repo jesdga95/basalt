@@ -160,6 +160,17 @@ int main() {
         const std::vector<GpuCard> v = {card(0, "RTX 5070 Ti", 12, 0, 896, 16), card(1, "RTX 3090", 8, 6, 936, 24),
                                         card(2, "RTX 5090", 12, 0, 1792, 32), card(3, "RTX 5060 Ti", 12, 0, 448, 16)};
         GpuChoice c = pick("auto", v);
+#if defined(BASALT_PEER_AMPERE)
+        // the sm_86 card joins as an expert-tier peer, last, in a -DPEER_AMPERE=ON build
+        CHECK_STR(cards(c), "2,0,3,1");
+        CHECK(c.notes.size() == 1);
+        if (c.notes.size() == 1)
+            CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 3090) is not sm_120, using it as an expert-tier peer only");
+        CHECK_STR(roles(v, c, 1), "main,expert tier,idle,idle");
+        CHECK_STR(roles(v, c, 3), "main,expert tier,expert tier,expert tier");
+        CHECK_STR(roles(v, c, 1, true), "main,prompt split,idle,idle");
+        CHECK_STR(roles(v, c, 1, true, true), "main,layer stage,idle,idle");
+#else
         CHECK_STR(cards(c), "2,0,3");
         CHECK(c.notes.size() == 1);
         if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 3090) skipped, not sm_120");
@@ -167,9 +178,15 @@ int main() {
         CHECK_STR(roles(v, c, 3), "main,expert tier,expert tier");
         CHECK_STR(roles(v, c, 1, true), "main,prompt split,idle");
         CHECK_STR(roles(v, c, 1, true, true), "main,layer stage,idle");
+#endif
         c = pick("", v);
         CHECK_STR(cards(c), "0");
+#if defined(BASALT_PEER_AMPERE)
+        CHECK_STR(c.warning,
+                  "GPU 1 (RTX 3090), GPU 2 (RTX 5090), GPU 3 (RTX 5060 Ti) unused; use gpu 0,1,2,3 or gpu auto");
+#else
         CHECK_STR(c.warning, "GPU 2 (RTX 5090), GPU 3 (RTX 5060 Ti) unused; use gpu 0,2,3 or gpu auto");
+#endif
         CHECK_STR(pick("1", v).error, "gpu: GPU 1 (RTX 3090) is sm_86, not sm_120");
         CHECK_STR(cards(pick("3,2,0", v)), "3,2,0");
     }
@@ -186,6 +203,19 @@ int main() {
         CHECK_STR(cards(c), "0");
         CHECK(c.notes.size() == 1);
         if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 4060 Ti) skipped, not sm_120");
+#endif
+    }
+    // A data-centre Ampere card (sm_80): the Ampere option covers the line, not only sm_86
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, 0, 1792, 32), card(1, "A100-PCIE-40GB", 8, 0, 1555, 40)};
+        CHECK_STR(pick("1,0", v).error, "gpu: GPU 1 (A100-PCIE-40GB) is sm_80, not sm_120");
+#if defined(BASALT_PEER_AMPERE)
+        CHECK_STR(cards(pick("0,1", v)), "0,1");
+        CHECK_STR(cards(pick("auto", v)), "0,1");
+#else
+        CHECK_STR(pick("0,1", v).error,
+                  "gpu: GPU 1 (A100-PCIE-40GB) is sm_80 (rebuild with -DPEER_AMPERE=ON to enable sm_80 peer support)");
+        CHECK_STR(cards(pick("auto", v)), "0");
 #endif
     }
     // A laptop's own card beside a desktop card in an enclosure: the desktop card's bandwidth makes it main; the
