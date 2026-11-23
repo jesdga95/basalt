@@ -52,20 +52,26 @@ the text model.
   those experts need to mapped memory, then rings the CPU coordinator. The CPU pool (`--pool-workers`) runs those pairs
   while the card runs the rest. The card takes the CPU's rows only when the completion ticket matches the visit. Visits
   with no RAM pairs skip the hand-off, and the watchdog can release a stalled wait. The
-  full visits' caches and the drafter's full layer then back their first 32,768 positions and grow as prompts
-  need them, and the experts planned into RAM are copied back to the card while the caches leave room, the least routed
-  giving way first when they grow. A short chat at `--max-context 1048576 --kv fp8` keeps every expert on the card. On a
-  smaller card the spill is static: the caches are whole from the start and the RAM experts are copied back while the card
-  has room. Either way the copies leave the card's spare free: 1 GiB at the start and 512 MiB after a cache grow, or
-  `--vram-reserve-mib N` for both (at least 128, 256 where the driver pages GPU memory); with the flag they also leave
-  256 MiB for what loads after them (kernels at their first launch, the windows' graphs) until that has loaded. The spare
-  is where the copies stop, not a floor: a cache grow with no copy left to send back, or another program, can take it.
-  The 256 MiB is judged from the card's total use (anything that allocates counts as loaded). The copies lie back to back
-  in one address range, the least routed last, so the ones a grow sends back free whole pages. A window whose graph finds
-  no device memory runs direct, and windows of its shape keep running without a graph (no copy moves); a batched window's
-  graph has no such fallback. A VRAM resize the copies cannot meet is refused before any copy moves. A copy table update or a
-  cache's backing that cannot be confirmed (a CUDA failure) stops the engine: every later request is refused. Nothing
-  changes when everything fits.
+  full visits' caches and the drafter's full layer then back their first 32,768 positions and grow as prompts need them, and
+  the experts planned into RAM are copied back to the card while the caches leave room. A short chat at
+  `--max-context 1048576 --kv fp8` keeps every expert on the card. On a smaller card the spill is static: the caches are whole
+  from the start and the RAM experts are copied back while the card has room. Either way the copies leave the card's spare
+  free: 1 GiB at the start and 512 MiB after a cache grow, or `--vram-reserve-mib N` for both (at least 128, 256 where the
+  driver pages GPU memory); with the flag they also leave 256 MiB for what loads after them (kernels at their first launch,
+  the windows' graphs) until that has loaded. The spare is where the copies stop, not a floor: a cache grow with no copy left
+  to send back, or another program, can take it. The 256 MiB is judged from the card's total use (anything that allocates
+  counts as loaded). The copies lie back to back in one address range; a demote packs the survivors together so whole pages
+  go back. A window whose graph finds no device memory runs direct, and windows of its shape keep running without a graph
+  (no copy moves); a batched window's graph has no such fallback. A VRAM resize the copies cannot meet is refused before any
+  copy moves. A copy table update or a cache's backing that cannot be confirmed (a CUDA failure) stops the engine: every
+  later request is refused. Nothing changes when everything fits.
+- **Which experts get a copy:** the profile's order until the session has looked experts up, then the lookups of the rows its
+  windows keep (rejected drafts do not count), decayed over 320 kept rows. The least looked up give way first when the caches
+  grow. With one session and an elastic spill, at a request's start and every 256 decode positions after it, up to 64 copies
+  move to clearly hotter RAM experts of the same size.
+- **Same tokens on every run:** placement only changes at positions the requests fix (a request's start, the rebalances, a
+  cache grow), and a decode window never crosses one, so a greedy request gives the same tokens run to run whatever
+  the windows' widths. A different free VRAM at start, a VRAM command or a sleep can give a different placement.
 - **Sleep and lending:** `--idle-sleep` and `POST /v1/vram` ([running](../running.md#sleep---idle-sleep)) use the same copies.
   At a sleep the card's copies of the RAM experts go back to RAM (the CPU computes them) and the driver moves the rest
   of the GPU state to host memory; the wake takes the copies back while the card has room. `reserve_mib` resizes them the

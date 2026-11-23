@@ -4,7 +4,9 @@
 // holds the later layers' weights, experts and caches instead (cards(), card_of()).
 #pragma once
 
+#include "basalt/core/progress.hpp"
 #include "basalt/model/adapter.hpp"
+#include "models/inkling2/copy_heat.hpp"
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
 #include "models/inkling2/pack.hpp"
 #include "models/inkling2/spill.hpp"
@@ -98,20 +100,28 @@ public:
     /// The elastic spill: the experts the asked context sent to RAM come back to the card as copies while its caches back
     /// only the positions in use. On with a spill the context made (not --expert-cache) and a context above the elastic
     /// KV's base (core/elastic_kv.hpp).
+    bool has_spill() const { return has_spill_; }
     bool elastic() const { return elastic_; }
     /// Whether the RAM experts come back to the card as copies while it has room beyond its spare: any spill the context
     /// made (not --expert-cache), static or elastic.
-    bool copies() const { return spill_.any() && flags_.expert_cache <= 0; }
-    /// Copies RAM experts to the card, the most routed first, while `keep_free` bytes stay free; their blob table entries
-    /// point at the copies (decode reads them there; a prompt chunk's staging is unchanged). Bytes copied.
+    bool copies() const { return has_spill_ && flags_.expert_cache <= 0; }
+    /// Copies RAM experts to the card, the highest ranked first (copy_heat.hpp), while `keep_free` bytes stay free; their
+    /// blob table entries point at the copies. Bytes copied.
     uint64_t promote(uint64_t keep_free);
-    /// Sends copies back, the least routed first, until at least `bytes` are freed: their entries go back to 0, the CPU
-    /// computes them again (on `stream`, which is waited for before the copies are freed). `freed`: the bytes given back.
-    /// False when a CUDA step failed: every copy is then either still on the card with its entry or in RAM without one, and
-    /// the granules of the copies that went stay mapped (a granule that cannot be unmapped also stops any later promote).
-    bool demote(uint64_t bytes, void* stream, uint64_t& freed);
-    int64_t promoted() const { return n_copy_; }
-    /// Counts the demotes: an address a session saved from the blob tables (the decode read-ahead's) is stale once it moves.
+    /// Sends the lowest-ranked copies back until at least `bytes` are freed (their entries go back to 0, the CPU computes
+    /// them again), packs the rest to the front and returns whole granules. `freed`: the bytes given back. False when a
+    /// table or copy update could not be confirmed: the placement is then wedged.
+    bool demote(uint64_t bytes, uint64_t& freed);
+    /// Adds a sample of lookups (each pair's, since the last) that covers `rows` kept rows to the copies' ranking.
+    void learn(const std::vector<uint32_t>& lookups, int64_t rows);
+    /// Swaps up to `max_swaps` copies for hotter RAM experts of the same size, between windows; joins every reader of the
+    /// tables first. The swaps made.
+    int rebalance(int max_swaps);
+    int64_t promoted() const { return (int64_t) copy_slots_.size(); }
+    int64_t card_copies() const { return promoted(); }
+    /// One line on the copies after a placement event (their count, free VRAM, the range's backing).
+    void log_copy_change(const char* event, int64_t before, uint64_t to_map = 0, bool always = false, bool warning = false) const;
+    /// Advances when an address a session saved from the blob tables (the decode read-ahead's) may no longer hold that expert.
     uint64_t placement_epoch() const { return epoch_; }
     /// The free VRAM the session holds the card at from now on (VRAM / POST /v1/vram; 0: its own spare only): a grow of
     /// the caches and a promote keep at least this much free. `held_free(base)`: the free VRAM a step keeps, `base` its own
@@ -121,14 +131,17 @@ public:
     bool lent() const { return lent_; }
     /// Device work or placement that could not be confirmed: every later request is refused and the engine ends without
     /// the CUDA teardown.
-    void wedge();
+    void wedge() {
+        wedged_ = true;
+        core::gpu_left_running().store(true);
+    }
     bool wedged() const { return wedged_; }
     uint64_t held_free(uint64_t base) const { return std::max(spare_ ? spare_ : base, reserve_); }
     /// Resizes the card's copies so that `free_bytes` are free: copies go back to RAM when short, return while there is
-    /// room. False when even no copy at all leaves that much, or when the copies could not go back.
-    bool resize_reserve(uint64_t free_bytes, void* stream);
+    /// room. False, with nothing moved, when even no copy at all leaves that much; false when the copies could not go back.
+    bool resize_reserve(uint64_t free_bytes);
     /// False when the copies could not all go back (a low `lend` then does not hold them off).
-    bool lend(bool low, void* stream);
+    bool lend(bool low);
     /// A prompt chunk's staging of layer l's RAM experts from their card copies, when every one has a copy (false: none
     /// issued; the caller copies them from RAM).
     bool stage_from_card(int l, void* stream) const;
@@ -188,6 +201,7 @@ private:
     std::vector<unsigned long long> staging_;   ///< granule-sized pieces (the driver maps whole allocations only)
     uint8_t* spill_host_ = nullptr;
     // the elastic spill: the RAM experts the most routed first, each one's card copy (null: none)
+    bool has_spill_ = false;
     bool elastic_ = false;
     uint64_t reserve_ = 0;
     uint64_t spare_ = 0;   ///< --vram-reserve-mib: the free VRAM the copies leave (0: each step's own default)
@@ -195,7 +209,13 @@ private:
     bool wedged_ = false;
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
-    int64_t n_copy_ = 0;
+    CopyHeat heat_;
+    std::vector<size_t> copy_slots_;   ///< the paid copies' pairs in range order
+    std::vector<size_t> copy_candidates() const;
+    bool join_placement();
+    uint64_t copy_stride(size_t pair) const;
+    const uint8_t* copy_source(size_t pair) const;
+    bool publish_copy(size_t pair, const void* ptr);
     // the copies back to back in one reserved range (spill.hpp CopyLayout); its granules are mapped while a copy uses them,
     // one handle each from the range's start
     bool copy_range();
@@ -206,8 +226,9 @@ private:
     uint64_t used0_ = 0;   ///< device bytes in use when the copies were first placed
     uint8_t* copies_va_ = nullptr;
     CopyLayout copy_lay_;
+    uint64_t copy_reserved_ = 0;
     std::vector<unsigned long long> copy_maps_;
-    uint64_t epoch_ = 0;   ///< demotes so far
+    uint64_t epoch_ = 0;   ///< address invalidations
     bool copies_retired_ = false;   ///< a granule of the range could not be unmapped: no promote copies into it again
     std::vector<int> layer_copies_;   ///< [layer] RAM experts with a card copy
     // [vision] the experts' memory lent to the image encoder: each lent range's bytes, in RAM until refill

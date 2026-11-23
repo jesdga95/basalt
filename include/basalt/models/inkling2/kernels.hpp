@@ -181,6 +181,10 @@ void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned 
               int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream, uint32_t* tally = nullptr,
               unsigned long long* rec_blobs = nullptr, int32_t* rec_n = nullptr);
 constexpr int kAheadExperts = 8;   ///< the groups of a visit moe_plan records (rec_blobs, rec_n) for the next window
+/// The lookups of a window's first `rows` rows (the rows it keeps): for each of `visits` visits, ids[v][r][j] (row r of at
+/// most `row_stride`, k choices) adds 1 to tally[layer[v] * n_expert + id]. One block a visit.
+void heat_fold(const int32_t* ids, const int32_t* layer, int visits, int row_stride, int rows, int k, int n_expert,
+               uint32_t* tally, void* stream);
 /// Requests into L2 the first `bytes` of each of the *n blobs (moe_plan's record of a visit), 32 blocks each keeping one
 /// 128 KiB step in flight: run on a side stream while the glue before the experts runs; reads only.
 void expert_read_ahead(const unsigned long long* blobs, const int32_t* n, uint64_t bytes, void* stream);

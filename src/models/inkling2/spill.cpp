@@ -87,12 +87,7 @@ bool plan_spill(int n_layers, int n_expert, const std::vector<uint64_t>& stride,
 CopyLayout copy_layout(const std::vector<uint64_t>& strides, uint64_t gran) {
     CopyLayout c;
     c.gran = gran;
-    uint64_t at = 0;
-    for (uint64_t s : strides) {
-        c.at.push_back(at);
-        c.end.push_back(at + s);
-        at += (s + 255) / 256 * 256;
-    }
+    for (uint64_t stride : strides) c.append(stride);
     return c;
 }
 

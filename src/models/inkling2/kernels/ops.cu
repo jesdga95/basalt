@@ -665,6 +665,21 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
     check("post_conv/ring");
 }
 
+__global__ void heat_fold_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ layer, int row_stride, int rows,
+                                 int k, int n_expert, uint32_t* __restrict__ tally) {
+    const int v = blockIdx.x;
+    const int32_t* vid = ids + (size_t) v * row_stride * k;
+    uint32_t* t = tally + (size_t) layer[v] * n_expert;
+    for (int i = threadIdx.x; i < rows * k; i += blockDim.x) atomicAdd(t + vid[i], 1u);
+}
+
+void heat_fold(const int32_t* ids, const int32_t* layer, int visits, int row_stride, int rows, int k, int n_expert,
+               uint32_t* tally, void* stream) {
+    if (visits <= 0 || rows <= 0) return;
+    heat_fold_kernel<<<visits, 64, 0, (cudaStream_t) stream>>>(ids, layer, row_stride, rows, k, n_expert, tally);
+    check("heat_fold");
+}
+
 void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* x, int layer, float* x_m,
                   int32_t* ids_m, CpuBell* bell, uint32_t* seq, void* stream) {
     if (rows <= 0) return;

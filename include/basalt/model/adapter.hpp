@@ -180,6 +180,9 @@ public:
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
+    /// The most rows a decode window starting at `pos` may hold, so that it ends at a position where the session changes
+    /// state between windows (0: no limit). Only drafted windows are shortened; a row gives the same bits in any window.
+    virtual int window_limit(int64_t pos) const { (void) pos; return 0; }
     /// For a drafter that sets its windows' length itself (a stop rule in its chain): the rows of the next window over its
     /// drafts `chance[0..n)` (one plus the drafts it keeps); the draft policy then only weighs a lookup proposal against
     /// them. 0: the policy picks the length from the drafts' stated chances.
