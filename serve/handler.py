@@ -78,6 +78,7 @@ def make_handler(target: Service | Router):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
         timeout = HTTP_BODY_S                               # StreamRequestHandler.setup puts it on the connection:
         # every header, body read and write carries the deadline, so no half-open client holds a thread forever
+        disable_nagle_algorithm = True                      # streamed events go at once: no waiting for a coalesced segment
 
         watch_done = None                                   # stops this request's disconnect watcher
         cancel = None                                       # set when the client left

@@ -1321,21 +1321,23 @@ class Service:
         return "[server] live | " + " | ".join(parts) + f" | total {total:.0f}t/s"
 
     def _progress(self, last_print, every=1.0, st=None):
-        """Print progress while a request runs: its prompt read, then the shared live line."""
+        """Print progress while a request runs: its prompt read, then the shared live line. The common case, nothing
+        due, takes no lock and copies nothing: the two fields that decide it are plain scalar reads."""
         now = time.time()
-        with self.status_lock:
-            s = dict(self.status if st is None else st)
+        s = self.status if st is None else st
         if now - last_print < (READ_PRINT_EVERY if s.get("first_token") is None else every):
             return last_print
         if s.get("first_token") is None:
+            with self.status_lock:
+                cur = st if st is not None else self.status
+                slot = self._slot_of(cur)
+                prompt_tokens, started = cur.get("prompt_tokens", 0), cur.get("started", now)
             pr = getattr(self.engine, "progress", None)   # (position, prompt tokens); a reused prefix counts as read
-            done = f"{pr[0]}/{pr[1]}" if pr and pr[1] else f"{s.get('prompt_tokens', 0)}"   # as read
+            done = f"{pr[0]}/{pr[1]}" if pr and pr[1] else f"{prompt_tokens}"   # as read
             # the engine's average over the tokens it read for this request (a reused prefix is not in it)
             pp = getattr(self.engine, "prefill_tok_s_mean", None) if pr and pr[1] else None
             speed = f" {pp:.0f}t/s" if pp and pp > 0 else ""
-            with self.status_lock:
-                slot = self._slot_of(st if st is not None else self.status)
-            print(f"[server] {slot_tag(slot)} read  pp={done}{speed} {now - s.get('started', now):.0f}s", flush=True)
+            print(f"[server] {slot_tag(slot)} read  pp={done}{speed} {now - started:.0f}s", flush=True)
         else:
             with self.live_lock:
                 due = now - self.live_at >= LIVE_EVERY_S
