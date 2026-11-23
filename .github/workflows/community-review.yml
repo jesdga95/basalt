@@ -41,7 +41,10 @@ jobs:
           gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[] | [.filename, .status]' | jq -s . > "${RUNNER_TEMP}/changed.json"
           gh api "repos/${GITHUB_REPOSITORY}/contents/docs/community/benchmarks.json?ref=${HEAD_SHA}" \
             -H "Accept: application/vnd.github.raw+json" > "${RUNNER_TEMP}/head.json"
-          git show "${BASE_SHA}:docs/community/benchmarks.json" > "${RUNNER_TEMP}/base.json"
+          # Compare against the commit the branch started from, not main's tip: a branch made before
+          # newer rows landed would otherwise look like it removes or edits them.
+          MERGE_BASE=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}" --jq .merge_base_commit.sha)
+          git show "${MERGE_BASE}:docs/community/benchmarks.json" > "${RUNNER_TEMP}/base.json"
 
       - name: Gate (deterministic checks, no secrets)
         id: gate

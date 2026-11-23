@@ -1,15 +1,28 @@
 // src/models/inkling2/cpu_experts.cpp - see the header.
 #include "models/inkling2/cpu_experts.hpp"
 
+#include "models/inkling2/cpu_expert_drain.hpp"
+
+#include "basalt/core/progress.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "models/inkling2/model.hpp"
 
+#include <immintrin.h>
+
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <functional>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace basalt::models::inkling2 {
@@ -17,37 +30,91 @@ namespace cpu = kernels::cpu;
 
 static_assert(kDecodeRows <= cpu::MAXT, "a RAM expert takes every row of a window in one job");
 
+namespace {
+// The doorbell's thread spins this long after its last visit or wake, then naps a step at a time until the next.
+constexpr std::chrono::milliseconds kSpin{20}, kNap{1};
+// How long a path that ends the engine waits for the calls in flight to finish after it aborts the bell.
+constexpr int kDrainMs = 5000;
+
+// A CUDA call that must not fail: a visit that cannot be queued is an error, as a kernel that cannot launch is.
+void must(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        throw std::runtime_error(std::string("inkling2 cpu experts: ") + what + ": " + cudaGetErrorString(e));
+    }
+}
+
+// The live doorbell, for an engine that ends while the card's merge may be waiting on it. The mutex ties the object's life
+// to the hook that is using it: ~Impl takes it before anything is freed.
+std::mutex g_live_mu;
+std::function<void()> g_abort;
+const void* g_owner = nullptr;
+}  // namespace
+
 struct CpuExperts::Impl {
     const InklingModel* model = nullptr;
     int n_expert = 0, k = 0;
     std::unique_ptr<cpu::ExpertPool> pool;
     std::vector<cpu::NativeFmt> fmt;               // [layer]
-    cudaStream_t stream = nullptr;                 // the copies to RAM and the pool's turn, beside the card's experts
+    cudaStream_t stream = nullptr;                 // the doorbell, beside the card's experts
     cudaEvent_t ready = nullptr, done = nullptr;
-    float* input = nullptr;                        // pinned [kDecodeRows][kWidth]
-    int32_t* ids = nullptr;                        // pinned [kDecodeRows][k]
-    float* out = nullptr;                          // pinned and mapped [kDecodeRows * k][kWidth]: a pair's row
-    float* out_dev = nullptr;                      // its device address
+    // mapped: the bell, a visit's rows [kDecodeRows][kWidth] and choices [kDecodeRows][k], a pair's row
+    // [kDecodeRows * k][kWidth] from the pool; each with its device address
+    CpuBell* bell = nullptr;
+    CpuBell* bell_dev = nullptr;
+    uint32_t* seq = nullptr;   // the device-side ticket counter
+    float* input = nullptr;
+    float* input_dev = nullptr;
+    int32_t* ids = nullptr;
+    int32_t* ids_dev = nullptr;
+    float* out = nullptr;
+    float* out_dev = nullptr;
     alignas(64) std::array<std::array<uint8_t, cpu::kNativeActBytes>, kDecodeRows> acts;
     std::vector<cpu::ExpertJobMulti> jobs;         // [kDecodeRows * k]
     std::vector<int> job_of;                       // [n_expert]: the expert's job in this call, -1: none
-    struct Call {
-        Impl* p;
-        int layer, rows;
-    };
-    std::vector<Call> calls;                       // [layer][rows - 1]: the host function's argument, fixed for the graphs
+    std::thread server;                            // the doorbell's thread
+    std::atomic<bool> stop{false}, napping{false};
+    std::atomic<uint32_t> wakes{0};
+    std::mutex nap_mu;
+    std::condition_variable nap_cv;
+    WindowGate gate;                               // the calls whose windows may wait on `done`
+
+    // No call is admitted after this (a call already in holds admission until its sync); abort the bell permanently,
+    // then give the calls in flight a bounded time to finish. If that cannot be confirmed, skip CUDA teardown on the
+    // error path. Runs under g_live_mu, which is taken before the gate's lock.
+    void abort_and_drain() {
+        gate.close();
+        std::atomic_ref<uint32_t>(bell->abort).store(1, std::memory_order_release);
+        gate.drain(kDrainMs);
+    }
 
     ~Impl() {
+        {   // no hook can reach this object past here
+            std::lock_guard<std::mutex> lk(g_live_mu);
+            if (g_owner == this) {
+                g_abort = nullptr;
+                g_owner = nullptr;
+            }
+        }
         if (stream) cudaStreamSynchronize(stream);
+        if (server.joinable()) {
+            stop.store(true, std::memory_order_seq_cst);
+            {
+                std::lock_guard<std::mutex> lk(nap_mu);
+                nap_cv.notify_all();
+            }
+            server.join();
+        }
         pool.reset();
-        for (void* q : {(void*) input, (void*) ids, (void*) out})
+        if (seq) cudaFree(seq);
+        for (void* q : {(void*) bell, (void*) input, (void*) ids, (void*) out})
             if (q) cudaFreeHost(q);
         if (ready) cudaEventDestroy(ready);
         if (done) cudaEventDestroy(done);
         if (stream) cudaStreamDestroy(stream);
     }
 
-    // On the host function's thread: the window's RAM pairs, every row of an expert in one job, on the pool.
+    // On the doorbell's thread: the visit's RAM pairs, every row of an expert in one job, on the pool.
     void run(int layer, int rows) {
         std::fill(job_of.begin(), job_of.end(), -1);
         bool quant[kDecodeRows] = {};
@@ -71,11 +138,48 @@ struct CpuExperts::Impl {
             if (quant[r]) cpu::native_quant_act(fmt[(size_t) layer], input + (size_t) r * kWidth, acts[(size_t) r].data());
         if (n) pool->run_split_multi_native(fmt[(size_t) layer], jobs.data(), n);
     }
-    static void CUDART_CB execute(void* arg) noexcept {
-        const Call& c = *static_cast<const Call*>(arg);
-        c.p->run(c.layer, c.rows);
+    // The doorbell's thread: a raised bell is taken (cleared), its visit computed, then `done` set for the card's merge.
+    // It spins while visits come, naps once none has come for kSpin, and wake() ends a nap.
+    void serve() {
+        std::atomic_ref<uint32_t> ring(bell->ring), ticket(bell->ticket), fin(bell->done);
+        auto busy = std::chrono::steady_clock::now();
+        uint32_t seen = wakes.load(std::memory_order_relaxed), spins = 0;
+        for (;;) {
+            if (const uint32_t w = ring.load(std::memory_order_acquire)) {
+                const uint32_t visit = ticket.load(std::memory_order_relaxed);
+                ring.store(0, std::memory_order_relaxed);
+                run((int) (w >> 8 & 0xffu), (int) (w >> 16));
+                fin.store(visit, std::memory_order_release);
+                busy = std::chrono::steady_clock::now();
+                continue;
+            }
+            if (stop.load(std::memory_order_relaxed)) return;
+            _mm_pause();
+            if ((++spins & 63u) != 0) continue;
+            const auto now = std::chrono::steady_clock::now();
+            if (const uint32_t wk = wakes.load(std::memory_order_acquire); wk != seen) {
+                seen = wk;
+                busy = now;
+            }
+            if (now - busy < kSpin) continue;
+            // seq_cst against wake(): it sees `napping` or this sees its count, so a wake is never slept through
+            std::unique_lock<std::mutex> lk(nap_mu);
+            napping.store(true, std::memory_order_seq_cst);
+            nap_cv.wait_for(lk, kNap, [&] {
+                return wakes.load(std::memory_order_seq_cst) != seen || stop.load(std::memory_order_relaxed) ||
+                       ring.load(std::memory_order_acquire) != 0;
+            });
+            napping.store(false, std::memory_order_relaxed);
+        }
     }
 };
+
+namespace {
+void release_bell(std::FILE*) {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    if (g_abort) g_abort();
+}
+}  // namespace
 
 CpuExperts::CpuExperts() : impl_(std::make_unique<Impl>()) {}
 CpuExperts::~CpuExperts() = default;
@@ -103,7 +207,6 @@ std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string&
         f.gate_softcap = g.gate_softcap;
         f.up_softcap = g.up_softcap;
         p.fmt.push_back(f);
-        for (int rows = 1; rows <= kDecodeRows; ++rows) p.calls.push_back({&p, l, rows});
     }
     p.jobs.resize((size_t) kDecodeRows * g.n_used);
     p.job_of.assign((size_t) g.n_expert, -1);
@@ -111,10 +214,16 @@ std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string&
     if (cudaStreamCreateWithFlags(&p.stream, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&p.ready, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&p.done, cudaEventDisableTiming) != cudaSuccess ||
-        cudaMallocHost((void**) &p.input, (size_t) kDecodeRows * kWidth * 4) != cudaSuccess ||
-        cudaMallocHost((void**) &p.ids, pairs * 4) != cudaSuccess ||
+        cudaHostAlloc((void**) &p.bell, sizeof(CpuBell), cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &p.bell_dev, p.bell, 0) != cudaSuccess ||
+        cudaHostAlloc((void**) &p.input, (size_t) kDecodeRows * kWidth * 4, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &p.input_dev, p.input, 0) != cudaSuccess ||
+        cudaHostAlloc((void**) &p.ids, pairs * 4, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &p.ids_dev, p.ids, 0) != cudaSuccess ||
         cudaHostAlloc((void**) &p.out, pairs * kWidth * 4, cudaHostAllocMapped) != cudaSuccess ||
-        cudaHostGetDevicePointer((void**) &p.out_dev, p.out, 0) != cudaSuccess) {
+        cudaHostGetDevicePointer((void**) &p.out_dev, p.out, 0) != cudaSuccess ||
+        cudaMalloc(&p.seq, sizeof(*p.seq)) != cudaSuccess ||
+        cudaMemsetAsync(p.seq, 0, sizeof(*p.seq), p.stream) != cudaSuccess) {
         cudaGetLastError();
         err = "cannot set up the CPU experts' buffers";
         return nullptr;
@@ -122,23 +231,47 @@ std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string&
     const model::LoadRequest& fl = m.flags();
     const cpu::PoolAffinity affinity = fl.pool_affinity_given ? fl.pool_affinity : cpu::PoolAffinity::All;
     p.pool = std::make_unique<cpu::ExpertPool>(cpu::start_pool_workers(fl.pool_workers, fl.pool_affinity_given, affinity), affinity);
+    *p.bell = CpuBell{};
+    p.server = std::thread([&p] { p.serve(); });
+    {   // published once everything it touches is live
+        std::lock_guard<std::mutex> lk(g_live_mu);
+        g_owner = &p;
+        g_abort = [&p] { p.abort_and_drain(); };
+    }
+    basalt::core::release_gpu_fn().store(&release_bell);
     basalt::log::info("basalt inkling2", "experts in RAM run on the CPU: %d pool workers", p.pool->workers());
     return out;
 }
 
 void CpuExperts::start(int l, int rows, const float* input, const int32_t* ids, cudaStream_t stream) {
     Impl& p = *impl_;
-    cudaEventRecord(p.ready, stream);
-    cudaStreamWaitEvent(p.stream, p.ready, 0);
-    cudaMemcpyAsync(p.input, input, (size_t) rows * kWidth * 4, cudaMemcpyDeviceToHost, p.stream);
-    cudaMemcpyAsync(p.ids, ids, (size_t) rows * p.k * 4, cudaMemcpyDeviceToHost, p.stream);
-    cudaLaunchHostFunc(p.stream, Impl::execute, &p.calls[(size_t) l * kDecodeRows + (size_t) rows - 1]);
-    cudaEventRecord(p.done, p.stream);
+    must(cudaEventRecord(p.ready, stream), "fork");
+    must(cudaStreamWaitEvent(p.stream, p.ready, 0), "fork wait");
+    moe_cpu_ring(ids, rows, p.k, p.model->layer(l).blob_table, input, l, p.input_dev, p.ids_dev, p.bell_dev, p.seq, p.stream);
+    must(cudaEventRecord(p.done, p.stream), "join");
 }
 
 void CpuExperts::finish(int l, int rows, const int32_t* ids, float* out, uint32_t* tally, cudaStream_t stream) {
-    cudaStreamWaitEvent(stream, impl_->done, 0);
-    moe_cpu_merge(ids, rows, impl_->k, impl_->model->layer(l).blob_table, impl_->out_dev, out, tally, stream);
+    Impl& p = *impl_;
+    must(cudaStreamWaitEvent(stream, p.done, 0), "join wait");   // the ring has advanced `seq` before the merge reads it
+    moe_cpu_merge(ids, rows, p.k, p.model->layer(l).blob_table, p.out_dev, out, tally, stream, p.bell_dev, p.seq);
+}
+
+bool CpuExperts::enter() { return impl_->gate.enter(); }
+bool CpuExperts::leave(cudaError_t synced, bool joined) {
+    // the bell's abort word too: a merge the abort released was let go through that word
+    const bool released = std::atomic_ref<uint32_t>(impl_->bell->abort).load(std::memory_order_acquire) != 0;
+    return impl_->gate.leave(synced, joined) && !released;
+}
+bool CpuExperts::stopped() { return impl_->gate.closed(); }
+
+void CpuExperts::wake() {
+    Impl& p = *impl_;
+    p.wakes.fetch_add(1, std::memory_order_seq_cst);
+    if (p.napping.load(std::memory_order_seq_cst)) {
+        std::lock_guard<std::mutex> lk(p.nap_mu);
+        p.nap_cv.notify_one();
+    }
 }
 
 }  // namespace basalt::models::inkling2

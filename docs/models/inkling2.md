@@ -48,8 +48,10 @@ the text model.
   drafter's full layer; the window layers' rings do not grow.
 - **Experts in RAM when the context needs the room:** when the asked context does not fit beside every expert, the least
   routed experts (by the shipped profile `data/profiles/inkling2-24x128.prof`) are planned into page-locked RAM, just enough,
-  and decode computes them on the CPU: after a layer's router its rows go to RAM, the CPU pool (`--pool-workers`) runs the
-  pairs whose expert is in RAM while the card runs the rest, and the card takes their rows before it combines them. The
+  and decode computes them on the CPU. After routing, a visit with RAM experts publishes its choices and the input rows
+  those experts need to mapped memory, then rings the CPU coordinator. The CPU pool (`--pool-workers`) runs those pairs
+  while the card runs the rest. The card takes the CPU's rows only when the completion ticket matches the visit. Visits
+  with no RAM pairs skip the hand-off, and the watchdog can release a stalled wait. The
   full visits' caches then back their first 32,768 positions and grow as prompts
   need them, and the experts planned into RAM are copied back to the card while the caches leave room, the least routed
   giving way first when they grow. A short chat at `--max-context 1048576 --kv fp8` keeps every expert on the card. On a

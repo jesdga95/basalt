@@ -140,6 +140,7 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
                         one.logits = row_logits.data();
                     }
                     r = sess.decode_window(one);
+                    if (!r.ok()) break;
                     if (g_diag_logits) std::fwrite(row_logits.data(), sizeof(float), row_logits.size(), g_diag_logits);
                     std::printf("R %lld %d\n", (long long) (pos + t), row_next);
                 }
@@ -181,7 +182,7 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
         }
         dr.logits = logits;
         r = sess.decode_window(dr);
-        if (g_diag_logits) std::fwrite(logits, sizeof(float), (size_t) g_n_vocab, g_diag_logits);
+        if (r.ok() && g_diag_logits) std::fwrite(logits, sizeof(float), (size_t) g_n_vocab, g_diag_logits);
         ++pos;
     }
     tm.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();

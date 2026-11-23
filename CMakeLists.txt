@@ -1265,6 +1265,13 @@ target_include_directories(elementwise_parity PRIVATE ${_gpu_include_directories
 target_link_libraries(elementwise_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME elementwise_parity COMMAND elementwise_parity --selftest)
 
+if(BUILD_TESTING)
+  add_executable(doorbell_abort_test tests/kernels/doorbell_abort_test.cu)
+  target_link_libraries(doorbell_abort_test PRIVATE kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME doorbell_abort_test COMMAND doorbell_abort_test)
+  set_tests_properties(doorbell_abort_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()
+
 add_executable(bf16_gemv_parity tests/kernels/bf16_gemv_parity.cpp)
 target_include_directories(bf16_gemv_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(bf16_gemv_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -1874,6 +1881,9 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME peer_share_parity COMMAND peer_share_parity)
   set_tests_properties(peer_share_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   if(BASALT_MODEL_QWEN4EXP)
+  add_executable(prefill_pinned_copy_test tests/models/qwen4exp/prefill/prefill_pinned_copy_test.cpp)
+  target_include_directories(prefill_pinned_copy_test PRIVATE src)
+  basalt_cpu_test(NAME prefill_pinned_copy_test COMMAND prefill_pinned_copy_test)
   # the prompt path's routed-entry histogram against a host count
   add_executable(prefill_route_count_test tests/models/qwen4exp/prefill/prefill_route_count_test.cpp)
   target_link_libraries(prefill_route_count_test PRIVATE model_qwen4exp_prefill ${_gpu_runtime_target})

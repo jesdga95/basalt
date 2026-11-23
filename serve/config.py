@@ -269,6 +269,11 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str], server_argv=(), 
     a.skipped = []
     a.sampling_launch = {k: getattr(a, k) for k in SAMPLING_KEYS if getattr(a, k) is not None}
     a.sampling_cli = {k for k in a.sampling_launch if getattr(a_cli, k) is not None}
+    a.pricing_cli = set()
+    for flag, attr in (("--cost-in", "cost_in"), ("--cost-out", "cost_out"),
+                       ("--cost-cache-write", "cost_cache_write"), ("--cost-cache-hit", "cost_cache_hit")):
+        if any(w == flag or w.startswith(flag + "=") for w in cli):
+            a.pricing_cli.add(attr)
     if a.vision == "":                                     # a bare --vision
         ap.error(VISION_USAGE)
     for act in ap._actions:                                # a repeatable command-line option replaces the file's
@@ -521,6 +526,17 @@ def answer_room(text: str) -> str | int:
     return n
 
 
+def cost_rate(text: str) -> float:
+    """argparse type: a per-million-token price in USD, a finite number >= 0."""
+    try:
+        v = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, not {text!r}") from None
+    if not math.isfinite(v) or v < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, not {text!r}")
+    return v
+
+
 def video_tokens(text: str) -> int:
     """argparse type: a video's token budget, a whole number from 64 to 65536."""
     try:
@@ -641,4 +657,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="output tokens kept for closing the thinking and the answer: auto (a quarter of the cap, at "
                          "least 512, at most half) or a whole number of tokens (0 = none); an explicit request budget "
                          "of 0 opts out")
+    ap.add_argument("--totals-file", default="", metavar="PATH",
+                    help="file for persistent token counts (default: <config>.totals.json next to the config; "
+                         "'none' disables)")
+    ap.add_argument("--totals-reset", action="store_true",
+                    help="reset the persistent counters: move the current file to .prev.json and start fresh")
+    ap.add_argument("--cost-in", type=cost_rate, default=0, metavar="USD",
+                    help="price per million input tokens in US dollars (default 0)")
+    ap.add_argument("--cost-out", type=cost_rate, default=0, metavar="USD",
+                    help="price per million output tokens in US dollars (default 0)")
+    ap.add_argument("--cost-cache-write", type=cost_rate, default=None, metavar="USD",
+                    help="price per million new (cache-write) input tokens (default: same as --cost-in)")
+    ap.add_argument("--cost-cache-hit", type=cost_rate, default=None, metavar="USD",
+                    help="price per million reused (cache-hit) input tokens (default: same as --cost-in)")
     return ap
