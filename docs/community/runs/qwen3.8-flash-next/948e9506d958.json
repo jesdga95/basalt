@@ -1,0 +1,22 @@
+{
+  "submitter": "lindworm-hermes2026",
+  "date": "2026-10-22",
+  "commit": "57909606c2",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5080",
+      "vram_gib": 16,
+      "power_w": 360
+    }
+  ],
+  "ram_gib": 88,
+  "os": "WSL2",
+  "quant": "Q4_K_XL",
+  "kv": "int8",
+  "prefill_16k_tps": 2834.8,
+  "prefill_64k_tps": 3608.2,
+  "decode_tps": 77.5,
+  "notes": "single RTX 5080 16GB, WSL2/Docker; 72.3 GiB experts all in an 88 GiB VM (0 SSD spill) - the community gate passes on a 16GB card"
+}

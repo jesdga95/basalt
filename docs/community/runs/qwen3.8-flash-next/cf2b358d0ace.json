@@ -1,0 +1,57 @@
+{
+  "submitter": "sean-248",
+  "date": "2026-11-20",
+  "commit": "899e820af7",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "4.0 x8",
+      "h2d_gbps": 13.9
+    },
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "4.0 x8",
+      "h2d_gbps": 13.9
+    },
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "4.0 x8",
+      "h2d_gbps": 13.9
+    },
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "4.0 x8",
+      "h2d_gbps": 13.9
+    }
+  ],
+  "ram_gib": 123,
+  "cpu": "AMD EPYC 7452, 32 cores",
+  "ram_gbps": 97.6,
+  "os": "Linux",
+  "quant": "Q4_K_XL",
+  "kv": "int8",
+  "prefill_16k_tps": 2234.6,
+  "prefill_64k_tps": 3632.6,
+  "decode_tps": 169.0,
+  "decode_conv_tps": 106.5,
+  "decode_struct_tps": 210.1,
+  "decode_prose_tps": 102.3,
+  "accept_conv_pct": 65.2,
+  "accept_struct_pct": 97.2,
+  "accept_prose_pct": 60.6,
+  "draft_len_conv": 2.4,
+  "draft_len_struct": 7.0,
+  "draft_len_prose": 2.0,
+  "engine_args": "--gpu 0,1,2,3 --max-context 66661 --kv int8",
+  "notes": "4x RTX 5060 Ti 16GB, PCIe 4.0 x8, P2P on all 12 pairs (NODE; patched driver, 12.2 GB/s all-reduce); EPYC 7452, 123 GiB; expert tier; NVMe copy for the run. OC core +350, mem +6000."
+}

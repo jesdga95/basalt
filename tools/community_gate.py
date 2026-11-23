@@ -2,8 +2,9 @@
 """The deterministic gate for community benchmark pull requests (stdlib only).
 
 A pull request may be merged without a human only if this gate passes; the model review that follows can only
-downgrade a pass. Everything here is a pure function of the base file, the head file, the PR author and the list of
-changed files, so the same code runs in CI and in the tests. The head file is data: nothing in it is executed.
+downgrade a pass. Everything here is a pure function of the run files at the base, the run files the pull request adds
+or modifies, the PR author and the list of changed files, so the same code runs in CI and in the tests. The head files are
+data: nothing in them is executed.
 
 Status: "pass" (every check holds and the row has comparable rows to be judged against), "fail" (a check failed, the
 reasons say which), "human" (every check holds but nothing comparable exists, e.g. a card with no earlier row, so only
@@ -19,7 +20,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_benchmarks as cb  # noqa: E402
 
-FILE = "docs/community/benchmarks.json"
+RUNS_PREFIX = "docs/community/runs/"
+LEGACY_FILE = "docs/community/benchmarks.json"
+PATH_RE = re.compile(re.escape(RUNS_PREFIX) + r"[^/]+/[0-9a-f]{%d}\.json" % cb.ID_LEN)
 MAX_NEW_ROWS = 12
 PRESET = "community-1"
 # The engine arguments the community preset passes (bench_main.cpp): anything else is a lossy or off-preset run.
@@ -130,72 +133,99 @@ def plausible(row, earlier, label, gate):
     gate.notes.append(f"{label}: compared with {len(peers)} earlier row(s) of the same model and card")
 
 
-def run_gate(base_text, head_text, author, changed, known_commit):
-    """base_text/head_text: the file before and after; author: the PR author's login; changed: [(filename, status)];
+def parse_run(text):
+    """The row of a run file's text, or None when it is not a JSON object."""
+    try:
+        row = json.loads(text)
+    except ValueError:
+        return None
+    return row if isinstance(row, dict) else None
+
+
+def run_gate(base_files, head_files, author, changed, known_commit):
+    """base_files: {path: text} of every run file at the commit the branch started from; head_files: {path: text} of the
+    added and modified run files in the pull request; author: the PR author's login; changed: [(filename, status)];
     known_commit(sha) -> bool: the commit is a build of this repository."""
     g = Gate()
-    if [c[0] for c in changed] != [FILE]:
-        g.fail(f"the pull request must change only {FILE} (changes: {', '.join(c[0] for c in changed) or 'none'})")
+    if not changed:
+        g.fail("the pull request changes no file")
         return g
-    if changed[0][1] != "modified":
-        g.fail(f"{FILE} must be modified, not {changed[0][1]}")
-        return g
-    try:
-        base, head = json.loads(base_text), json.loads(head_text)
-    except ValueError as e:
-        g.fail(f"the file is not valid JSON: {e}")
-        return g
-    for p in cb.validate(head):
-        g.fail(p)
-    try:
-        if cb.canonical(head) != head_text:
-            g.fail(f"not in the canonical format; run: {cb.FIX_HINT}")
-    except Exception:
-        g.fail("the file is not in the canonical format")
+    for name, status in changed:
+        if name == LEGACY_FILE:
+            g.fail(f"{LEGACY_FILE} is no longer used: add your run as its own file under {RUNS_PREFIX}")
+        elif not PATH_RE.fullmatch(name):
+            g.fail(f"{name} is not a run file: a community pull request may only add or modify {RUNS_PREFIX}MODEL/ID.json files")
+        elif status not in ("added", "modified", "removed"):
+            g.fail(f"{name} is {status}; a run file can only be added, modified or removed")
     if g.status == "fail":
         return g
-    old, new = base["runs"], head["runs"]
-    if head.get("preset") != base.get("preset"):
-        g.fail("the top-level preset changed")
-    # Rows are matched by setup (submitter, model, quant and hardware), not by position: a row whose setup is in the
-    # base file is an update of that run (the validator asks for exactly that: "update your run instead").
-    def find(rows, r):
-        return next((x for x in rows if cb.same_setup(x, r)), None)
-    added, updated, removed = [], [], []
-    for r in new:
-        before = find(old, r)
-        if before is None:
-            added.append(r)
-        elif before != r:
-            updated.append((before, r))
-    for r in old:
-        if find(new, r) is None:
-            removed.append(r)
-    for r in removed:
-        human(g, f"the row of {r.get('submitter')} ({r.get('model')}) was removed; only a person can approve a removal")
-    changed_rows = added + [r for _, r in updated]
-    if not changed_rows and not removed:
-        g.fail("no row was added or updated")
-    if len(changed_rows) > MAX_NEW_ROWS:
-        g.fail(f"{len(changed_rows)} rows added or updated; at most {MAX_NEW_ROWS} per pull request")
+    added = [n for n, st in changed if st == "added"]
+    modified = [n for n, st in changed if st == "modified"]
+    removed = [n for n, st in changed if st == "removed"]
+    if len(added) + len(modified) > MAX_NEW_ROWS:
+        g.fail(f"{len(added) + len(modified)} run files added or modified; at most {MAX_NEW_ROWS} per pull request")
+        return g
+    base_rows = {}
+    for path, text in base_files.items():
+        row = parse_run(text)
+        if row is not None:
+            base_rows[path] = row
+    # every changed file is checked as a file: it parses, is valid, in the house format and named by its content
+    head_rows = {}
+    for path in added + modified:
+        label = f"{'new' if path in added else 'modified'} file {path.rsplit('/', 1)[-1]}"
+        text = head_files.get(path)
+        if text is None:
+            g.fail(f"{label}: the file could not be read")
+            continue
+        row = parse_run(text)
+        if row is None:
+            g.fail(f"{label}: not a JSON object")
+            continue
+        problems = []
+        cb.check_row(row, problems.append)
+        for p in problems:
+            g.fail(f"{label}: {p}")
+        if problems:
+            continue
+        if RUNS_PREFIX + cb.run_path(row) != path:
+            g.fail(f"{label}: the file belongs at {RUNS_PREFIX}{cb.run_path(row)} (the model's folder and the id of its setup)")
+        if cb.canonical_row(row) != text:
+            g.fail(f"{label}: not in the house format; run: {cb.FIX_HINT}")
+        head_rows[path] = row
     if g.status == "fail":
         return g
-    g.new_rows = changed_rows
-    others = [r for r in old if find(changed_rows, r) is None]
-    for i, r in enumerate(changed_rows):
-        is_update = i >= len(added)
+    # one run per setup: no other file at the base (not removed, not changed here) or in this pull request has this setup
+    untouched = {p: r for p, r in base_rows.items() if p not in removed and p not in head_rows}
+    for path, row in head_rows.items():
+        clash = next((p for p, r in {**untouched, **{q: x for q, x in head_rows.items() if q != path}}.items() if cb.same_setup(r, row)), None)
+        if clash is not None:
+            g.fail(f"{path}: same submitter, model, quant and hardware as {clash}: one run per setup, update that file instead")
+    if g.status == "fail":
+        return g
+    for path in removed:
+        old = base_rows.get(path, {})
+        human(g, f"{path} ({old.get('submitter')}, {old.get('model')}) was deleted; only a person can approve a deletion")
+    g.new_rows = [head_rows[p] for p in added + modified]
+    earlier = [r for p, r in base_rows.items() if p not in head_rows and p not in removed]
+    for i, path in enumerate(added + modified):
+        r = head_rows[path]
+        is_update = path in modified
         label = f"{'updated' if is_update else 'new'} row {i + 1} ({r['submitter']})"
         check_text(r, label, g)
         check_engine_args(r, label, g)
         if not known_commit(r["commit"]):
             g.fail(f"{label}: commit {r['commit']} is not a build of this repository's main branch")
+        before = base_rows.get(path) if is_update else None
         if is_update:
-            g.notes.append(f"{label}: updates the existing run of the same submitter, model, quant and hardware")
-            if r["submitter"].lower() != author.lower():
-                human(g, f"{label}: updates the run of '{r['submitter']}', which is not the pull request author "
+            g.notes.append(f"{label}: modifies the run file of the same submitter, model, quant and hardware")
+            owners = {r["submitter"].lower(), str((before or {}).get("submitter")).lower()}
+            if before is None:
+                human(g, f"{label}: the earlier file could not be read; only a person can approve this change")
+            elif owners != {author.lower()}:
+                human(g, f"{label}: modifies the run of '{before.get('submitter')}', which is not the pull request author "
                          f"'{author}'; only a person can approve changing someone else's numbers")
-        before = [b for b, x in updated if x is r]
-        plausible(r, others + before + changed_rows[:i], label, g)
+        plausible(r, earlier + ([before] if before else []) + [head_rows[p] for p in (added + modified)[:i]], label, g)
     return g
 
 
@@ -217,11 +247,28 @@ def git_known_commit(repo="."):
     return known
 
 
+def read_tree(base, rel):
+    """{repo path: text} of every file under base/<rel>; nothing when it does not exist."""
+    out = {}
+    top = Path(base) / rel
+    for f in sorted(top.rglob("*.json")) if top.is_dir() else []:
+        out[f.relative_to(base).as_posix()] = f.read_text(encoding="utf-8")
+    return out
+
+
 def main(argv):
-    """community_gate.py BASE.json HEAD.json AUTHOR CHANGED.json OUT.json  (CHANGED: [[filename, status], ...])"""
+    """community_gate.py BASE_DIR HEAD_DIR AUTHOR CHANGED.json OUT.json
+
+    BASE_DIR holds docs/community/runs as it was at the commit the branch started from, HEAD_DIR the pull request's added
+    and modified run files at the same paths; CHANGED: [[filename, status], ...]."""
     base, head, author, changed, out = argv[1:6]
-    g = run_gate(Path(base).read_text(encoding="utf-8"), Path(head).read_text(encoding="utf-8"), author,
-                 [tuple(c) for c in json.loads(Path(changed).read_text())], git_known_commit())
+    changed = [tuple(c) for c in json.loads(Path(changed).read_text())]
+    head_files = {}
+    for name, status in changed:
+        f = Path(head) / name
+        if status in ("added", "modified") and PATH_RE.fullmatch(name) and f.is_file():
+            head_files[name] = f.read_text(encoding="utf-8")
+    g = run_gate(read_tree(base, RUNS_PREFIX.rstrip("/")), head_files, author, changed, git_known_commit())
     Path(out).write_text(json.dumps(g.to_json()))
     print(g.status)
     for r in g.reasons:
