@@ -231,8 +231,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
 
     uint64_t dense = n_vocab * kQ8Row, experts = 0;
     layers_.assign((size_t) g.n_layers, LayerWeights{});
-    // two cards: what they do together, priced (multi_gpu_plan.hpp); the layer split's cut
-    if (req.diag_split_at > 0 && req.peer_devices.empty()) return fail("--diag-split-at needs a second card (--gpu 0,1)");
+    // two cards (gpu-mode split): the layer split's cut, priced (multi_gpu_plan.hpp)
+    if (req.diag_split_at > 0 && req.peer_devices.empty()) return fail("--diag-split-at needs a second card (--gpu 0,1 --gpu-mode split)");
     if (!req.peer_devices.empty())
         if (model::Result r = plan_cards(req); !r.ok()) return r;
     // the loop's message queries of every core layer in one array on each card that runs a core layer: a pass's messages
@@ -654,14 +654,13 @@ model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
                        (1000ull << 20);   // the drafter, as multi_gpu_plan counts it on the first card
     const program::MgPlan mp = program::plan_multi_gpu(cards, mm);
     basalt::log::info("basalt inkling2", "%s", mp.line.c_str());
-    cut_ = req.diag_split_at > 0 ? std::min(req.diag_split_at, g.n_layers - 1) : mp.pick == program::Mechanism::LayerSplit ? mp.cut : 0;
+    cut_ = req.diag_split_at > 0 ? std::min(req.diag_split_at, g.n_layers - 1) : mp.best_cut;
+    if (cut_ <= 0)
+        return {model::Status::Error, "gpu-mode split: no cut of the layers fits both cards; lower --max-context or --parallel"};
     second_ = devs[1];
-    if (cut_ > 0)
-        basalt::log::info("basalt inkling2", "layer split%s: layers 0..%d on CUDA%d, %d..%d on CUDA%d, %d hand-offs a window",
-                          req.diag_split_at > 0 ? " (--diag-split-at)" : "", cut_ - 1, devs[0], cut_, g.n_layers - 1, devs[1],
-                          split_handoffs(g, cut_));
-    else
-        basalt::log::info("basalt inkling2", "CUDA%d idles: CUDA%d runs alone", devs[1], devs[0]);
+    basalt::log::info("basalt inkling2", "layer split%s: layers 0..%d on CUDA%d, %d..%d on CUDA%d, %d hand-offs a window",
+                      req.diag_split_at > 0 ? " (--diag-split-at)" : "", cut_ - 1, devs[0], cut_, g.n_layers - 1, devs[1],
+                      split_handoffs(g, cut_));
     return {};
 }
 

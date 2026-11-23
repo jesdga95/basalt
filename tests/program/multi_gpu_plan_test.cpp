@@ -98,7 +98,7 @@ int main() {
             GpuSpec s;
             std::string err;
             CHECK(parse_gpu_spec(text, s, err));
-            const GpuChoice c = choose_gpus(s, v, true);
+            const GpuChoice c = choose_gpus(s, GpuMode::One, "", v, true);
             CHECK(c.error.empty() && c.cards.size() == 1);
             RoleInputs in;
             for (int i : c.cards) in.cards.push_back(v[(size_t) i]);
@@ -108,11 +108,11 @@ int main() {
             const char* env = std::getenv("CUDA_VISIBLE_DEVICES");
             CHECK(env != nullptr && std::string(env) == v[(size_t) c.cards[0]].token);   // the other cards are hidden
         }
-        // two cards named: both are used, the first is main
+        // two cards named with a mode: both are used, the first is main
         GpuSpec s;
         std::string err;
         CHECK(parse_gpu_spec("2,1", s, err));
-        const GpuChoice c = choose_gpus(s, v, true);
+        const GpuChoice c = choose_gpus(s, GpuMode::Peer, "", v, true);
         CHECK(c.cards.size() == 2 && c.cards[0] == 2 && c.cards[1] == 1);
     }
     // the prompt-time split: a main card and tier cards, the experts each streams per chunk spread evenly over layers

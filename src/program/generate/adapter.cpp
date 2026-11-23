@@ -368,6 +368,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.diag_tier_ram = o.diag_tier_ram;
         lreq.diag_tier_vram = o.diag_tier_vram;
         lreq.peer_devices = o.peer_devices;
+        lreq.gpu_mode = o.card_mode;
         lreq.max_context = o.max_context;
         lreq.sessions = std::max(o.batch, 1);
         lreq.vision = o.vision;

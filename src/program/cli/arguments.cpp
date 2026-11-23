@@ -71,6 +71,8 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
         }
         else if (a == "--gpu") o.gpu = next("--gpu");
+        else if (a == "--gpu-mode") o.gpu_mode = next("--gpu-mode");
+        else if (a == "--gpu-share") o.gpu_share = next("--gpu-share");
         else if (a == "--gpu-plan") o.gpu_plan = true;
         else if (a == "--ppl-base") o.ppl_base = next("--ppl-base");
         else if (a == "--ppl-out") o.ppl_out = next("--ppl-out");

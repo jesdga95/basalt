@@ -45,7 +45,7 @@ public:
         return f;
     }
     PreTokenizer pretokenizer() const override { return {"inkling2", pretok_inkling2, kIgnoreMerges}; }
-    int max_expert_cards() const override { return 1; }   // the second card: the layer split (model.hpp card_of)
+    program::GpuModes gpu_modes() const override { return {0, 2, 0}; }   // split: the second card runs the later layers (model.hpp card_of)
     const char* model_name() const override { return "Inkling-2-Mini"; }
     const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, Q8_0 dense
 
