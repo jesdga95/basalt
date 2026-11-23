@@ -357,6 +357,9 @@ public:
         lane_[0] = Lane{m_.device(), &sh_->x, stream_, ra_st_, pf_st_, ra_ev_, ra_join_, gs_ev_, pf_ev_, pf_join_, hand0_, ex_tally_,
                         rec_blobs_, rec_n_};
         lane_[1].x = &sh_->x1;
+        if (sh_->cpu)   // the window streams the CPU experts' merges wait on, for the abort's drain
+            for (const Lane& k : lane_)
+                if (k.stream) sh_->cpu->watch_stream(k.stream);
         for (const VisitCache& c : vc_) {
             if (slot_card_[(size_t) (&c - vc_.data())] != 0) continue;
             cudaMemsetAsync(c.k_ring, 0, (size_t) kConvRing * kKvHeads * kHeadDim * 4, stream_);

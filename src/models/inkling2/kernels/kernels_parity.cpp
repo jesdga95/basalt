@@ -1543,9 +1543,57 @@ void test_cpu_abort() {
         require_drain("the drained queue");
     }
     queued_ok &= !saw_retired;
-    unconfirmed.store(previous);
     std::printf("%-34s %s\n", "CPU abort drain: queued work", queued_ok ? "ok" : "FAIL");
     failures += !queued_ok;
+
+    // a capture on a watched stream, behind a merge waiting for an unserved visit: the drain does not query the stream
+    // while its owner captures, and once the capture ends it waits for the work queued before it
+    bool capture_ok = made;
+    if (made) {
+        reset();
+        cudaStreamSynchronize(st);   // the reset is queued on st
+        cudaGraphLaunch(exec, live);
+        capture_ok &= wait_for_ring();
+        merges.note(live);
+        std::atomic<bool> begun{false};
+        cudaError_t ended = cudaErrorUnknown;
+        cudaGraph_t captured = nullptr;
+        std::thread owner([&] {
+            if (cudaStreamBeginCapture(live, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+                begun.store(true);
+                return;
+            }
+            begun.store(true);
+            cudaMemsetAsync(tally, 0, NE * 4, live);
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            ended = cudaStreamEndCapture(live, &captured);
+        });
+        while (!begun.load()) std::this_thread::yield();
+        int pending = 0;
+        bool mid_capture = false;
+        merges.drain(cudaSuccess, own, [&](cudaStream_t s) {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            if (s == live &&
+                (cudaStreamIsCapturing(s, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone)) {
+                mid_capture = true;   // asked while capturing: answer without touching the capture
+                return cudaErrorStreamCaptureUnsupported;
+            }
+            const cudaError_t status = ask(s);
+            if (s == live && status == cudaErrorNotReady && ++pending == 3) abort_bell();
+            return status;
+        });
+        owner.join();
+        capture_ok &= !mid_capture && pending >= 3 && cudaStreamQuery(live) == cudaSuccess;
+        capture_ok &= ended == cudaSuccess && captured != nullptr && !unconfirmed.exchange(false);
+        if (captured) cudaGraphDestroy(captured);
+        abort_bell();   // a drain that left early must not leave the merge waiting
+        capture_ok &= cudaStreamSynchronize(live) == cudaSuccess;
+        merges.forget(live, cudaSuccess);
+    }
+    capture_ok &= !saw_retired;
+    unconfirmed.store(previous);
+    std::printf("%-34s %s\n", "CPU abort drain: capturing stream", capture_ok ? "ok" : "FAIL");
+    failures += !capture_ok;
     for (cudaStream_t s : {own, live})
         if (s) cudaStreamDestroy(s);
     cudaGraphExecDestroy(ordered_exec);

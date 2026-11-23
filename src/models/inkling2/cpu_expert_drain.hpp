@@ -15,10 +15,10 @@
 
 namespace basalt::models::inkling2 {
 
-// The streams whose windows wait on the CPU experts' completion, watched by the drain after an abort. An owner forgets
-// its stream after synchronizing it and before destroying it. The drain holds the list across its queries, so a
-// forgotten stream is never queried and a watched one is not destroyed while it is. A forgotten stream whose
-// synchronize failed may still hold work: every later drain reports completion unconfirmed.
+// The streams whose windows wait on the CPU experts' completion, watched by the drain after an abort. An owner notes
+// its stream before its first window, and forgets it after synchronizing it and before destroying it. The drain holds
+// the list across its queries, so a forgotten stream is never queried and a watched one is not destroyed while it is.
+// A forgotten stream whose synchronize failed may still hold work: every later drain reports completion unconfirmed.
 class MergeStreams {
 public:
     void note(cudaStream_t s) {
@@ -49,12 +49,22 @@ public:
                 last_bad = retired_;
                 std::snprintf(where, sizeof where, "a retired stream");
             }
+            // A stream in a capture is not queried, which would break its owner's capture: it is polled until the
+            // capture ends, then what was queued on it before the capture is waited on as any other work.
+            const auto poll = [&](cudaStream_t s) {
+                cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+                if (const cudaError_t e = cudaStreamIsCapturing(s, &capture); e != cudaSuccess) return e;
+                return capture == cudaStreamCaptureStatusNone ? query(s) : cudaErrorStreamCaptureUnsupported;
+            };
+            const auto waiting = [](cudaError_t e) {
+                return e == cudaErrorNotReady || e == cudaErrorStreamCaptureUnsupported;
+            };
             for (std::size_t i = 0; i <= streams_.size(); ++i) {
                 const cudaStream_t s = i ? streams_[i - 1] : own;
-                cudaError_t status = query(s);
-                while (status == cudaErrorNotReady && elapsed_ms() < kDrainMs) {
+                cudaError_t status = poll(s);
+                while (waiting(status) && elapsed_ms() < kDrainMs) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    status = query(s);
+                    status = poll(s);
                 }
                 if (status != cudaSuccess) {
                     last_bad = status;

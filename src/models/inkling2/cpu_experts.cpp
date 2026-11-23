@@ -251,10 +251,11 @@ void CpuExperts::start(int l, int rows, const float* input, const int32_t* ids, 
 
 void CpuExperts::finish(int l, int rows, const int32_t* ids, float* out, uint32_t* tally, cudaStream_t stream) {
     Impl& p = *impl_;
-    p.merges.note(stream);
     must(cudaStreamWaitEvent(stream, p.done, 0), "join wait");   // the ring has advanced `seq` before the merge reads it
     moe_cpu_merge(ids, rows, p.k, p.model->layer(l).blob_table, p.out_dev, out, tally, stream, p.bell_dev, p.seq);
 }
+
+void CpuExperts::watch_stream(cudaStream_t stream) { impl_->merges.note(stream); }
 
 void CpuExperts::forget_stream(cudaStream_t stream, cudaError_t synced) { impl_->merges.forget(stream, synced); }
 
