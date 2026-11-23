@@ -73,14 +73,17 @@ the text model.
   grow. With one session and an elastic spill, at a request's start and every 256 decode positions after it, up to 64 copies
   move to clearly hotter RAM experts of the same size.
 - **Prompt loan:** with an elastic spill, one session and one card, the prompt path's device memory that decode leaves idle (the
-  chunk buffers' arena and the experts' prompt staging) holds copies of the next highest-ranked RAM experts. Their uploads run
-  beside the turn's first decode windows, a bounded part after each, and the copies are used from 32 positions after the
-  turn's first window (that window waits for an upload still running). A prompt read through the staging takes the memory
+  chunk buffers' arena and the experts' prompt staging) holds copies of the next highest-ranked RAM experts, chosen after the
+  turn's first decode window. Their uploads run beside the next windows, a bounded part after each, and the copies are used
+  from 32 positions after that first window (that window waits for an upload still running), except those a copy of the
+  card's own reached first. A prompt read through the staging takes the memory
   back first; a read through the decode path leaves the loan in place. Loaned copies use the card's arithmetic
   ([precision](../precision/inkling2.md)).
-- **Same tokens on every run:** placement only changes at positions the requests fix (a request's start, the rebalances, the
-  loan, a cache grow), and a decode window never crosses one, so a greedy request gives the same tokens run to run whatever
-  the windows' widths. A different free VRAM at start, a VRAM command or a sleep can give a different placement.
+- **Same tokens on every run:** with one session, placement only changes at positions the requests fix (a request's start,
+  the rebalances, the loan, a cache grow) and by counted memory, and a decode window never crosses such a position, so the
+  same greedy requests give the same tokens run to run whatever the windows' widths. The log's `copy set` names the copied
+  experts after each change. A different free VRAM at start, a VRAM command, a sleep, a conversation restored from the
+  parked store or several sessions decoding together can give a different placement.
 - **Sleep and lending:** `--idle-sleep` and `POST /v1/vram` ([running](../running.md#sleep---idle-sleep)) use the same copies.
   At a sleep the card's copies of the RAM experts go back to RAM (the CPU computes them) and the driver moves the rest
   of the GPU state to host memory; the wake takes the copies back while the card has room. `reserve_mib` resizes them the

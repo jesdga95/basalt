@@ -4,6 +4,7 @@
 
 #include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/progress.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/vmm.hpp"
 #include "basalt/log.hpp"
@@ -104,7 +105,8 @@ uint64_t shared_bytes(const Geometry& g, bool drafter) {
 InklingModel::InklingModel() = default;
 
 InklingModel::~InklingModel() {
-    drain_loan_upload();
+    // an upload that may still run keeps everything it reads or writes (and the stream it runs on)
+    if (!drain_loan_upload()) return;
     if (loan_event_) cudaEventDestroy((cudaEvent_t) loan_event_);
     if (loan_stream_) cudaStreamDestroy((cudaStream_t) loan_stream_);
     for (void* p : dev_) cudaFree(p);
@@ -874,15 +876,20 @@ void InklingModel::log_copy_change(const char* event, int64_t before, uint64_t t
     const std::string free_mib = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess
         ? std::to_string(free_b / kMiB) : "unknown";
     const auto log = warning || wedged() ? basalt::log::warn : basalt::log::info;
+    // which experts have a copy, paid or loaned, as one number: equal runs log equal sets
+    uint64_t set = 1469598103934665603ull;
+    for (size_t pair = 0; pair < copy_.size(); ++pair)
+        if (copy_[pair]) set = (set ^ (pair * 2 + (loan_flag_.empty() ? 0 : loan_flag_[pair]))) * 1099511628211ull;
     log("basalt inkling2", "elastic spill: %s; expert copies %lld -> %lld%s (%lld loaned after); "
-        "%s MiB free, %.2f MiB paid mapped, %.2f MiB to map",
+        "%s MiB free, %.2f MiB paid mapped, %.2f MiB to map; copy set %016llx",
         event, (long long) before, (long long) after, wedged() ? " (tracked; placement unconfirmed)" : "",
-        (long long) loaned(), free_mib.c_str(), (double) copy_maps_.size() * copy_lay_.gran / kMiB, (double) to_map / kMiB);
+        (long long) loaned(), free_mib.c_str(), (double) copy_maps_.size() * copy_lay_.gran / kMiB, (double) to_map / kMiB,
+        (unsigned long long) set);
 }
 
 bool InklingModel::resize_reserve(uint64_t free_bytes) {
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+    sync_room();   // a resize is an order to look at the card again
+    const uint64_t free_b = room();
     const uint64_t want = std::max(spare_ ? spare_ : kCardSpare, free_bytes);
     if (!has_spill_) {
         if (free_b < want || wedged()) return false;
@@ -1043,16 +1050,20 @@ int InklingModel::rebalance(int max_swaps) {
     return done;
 }
 
-void InklingModel::set_prompt_arena(uint8_t* base, uint64_t bytes) {
+bool InklingModel::set_prompt_arena(uint8_t* base, uint64_t bytes) {
     if (!base) {
-        if (!drain_loan_upload() || !recall_loan(nullptr)) basalt::log::error("basalt inkling2", "the prompt arena goes while expert copies are still loaned in it");
+        const bool idle = drain_loan_upload();
+        if (!idle || !recall_loan(nullptr))
+            basalt::log::error("basalt inkling2", "the prompt arena goes while expert copies are still loaned in it");
+        if (!idle) return false;
         loan_arena_ = nullptr;
         loan_arena_bytes_ = 0;
-        return;
+        return true;
     }
     loan_arena_ = base;
     loan_arena_bytes_ = bytes;
     loan_due_ = loan_ready();
+    return true;
 }
 
 // The shared staging's granules mapped a second time, at an address range of their own: the layers' ranges (the prompt
@@ -1099,27 +1110,16 @@ bool InklingModel::loan_ready() {
 }
 
 
-// Queues the next RAM experts of the loan's queue on the copy stream, `budget` bytes of them (at least one); none is
-// visible before publish_loan.
+// Queues the plan's next uploads on the copy stream, `budget` bytes of them (at least one). An upload is queued whether or
+// not its expert has a paid copy by then: which ones publish is decided at publication, from the placement there.
 bool InklingModel::queue_loan(uint64_t budget) {
-    const std::array regions{loan_arena_bytes_, loan_stage_bytes_};
     const cudaStream_t copy = (cudaStream_t) loan_stream_;
     uint64_t bytes = 0;
-    while (loan_next_ < loan_queue_.size()) {
-        const size_t pair = loan_queue_[loan_next_];
-        if (copy_[pair]) {
-            ++loan_next_;
-            continue;
-        }
+    while (loan_next_ < loan_plan_.size()) {
+        const auto& [pair, ptr] = loan_plan_[loan_next_];
         const uint64_t stride = copy_stride(pair);
         if (bytes && (bytes >= budget || stride > budget - bytes)) break;
-        const auto slot = next_loan_slot(stride, regions, loan_offsets_);
-        if (!slot) {
-            loan_next_ = loan_queue_.size();
-            break;
-        }
-        uint8_t* ptr = (slot->region == 0 ? loan_arena_ : loan_stage_) + slot->offset;
-        loan_upload_.push_back({pair, ptr});   // tracked before queuing, so a failed queue is drained too
+        loan_inflight_ = true;
         if (cudaMemcpyAsync(ptr, copy_source(pair), stride, cudaMemcpyHostToDevice, copy) != cudaSuccess) {
             wedge();
             basalt::log::error("basalt inkling2", "a prompt loan upload could not be queued; restart the engine");
@@ -1139,15 +1139,20 @@ bool InklingModel::queue_loan(uint64_t budget) {
 bool InklingModel::submit_loan(int64_t publish_at) {
     if (wedged()) return false;
     if (lent_) return true;
-    if (loan_due_) {
+    if (loan_due_) {   // the plan: the highest-ranked RAM experts without a copy now, packed into the regions in rank order
         loan_due_ = false;
         if (loan_state_ != 1 || !loan_arena_) return true;
-        loan_queue_ = by_score_desc(heat_, copy_candidates());
+        const std::array regions{loan_arena_bytes_, loan_stage_bytes_};
+        std::array<uint64_t, 2> at{};
+        loan_plan_.clear();
         loan_next_ = 0;
-        loan_offsets_ = {};
-        loan_list_.reserve(loan_queue_.size());
-        loan_upload_.reserve(loan_queue_.size());
-        if (!loan_queue_.empty()) loan_publish_at_ = publish_at;
+        for (const size_t pair : by_score_desc(heat_, copy_candidates())) {
+            const auto slot = next_loan_slot(copy_stride(pair), regions, at);
+            if (!slot) break;
+            loan_plan_.push_back({pair, (slot->region == 0 ? loan_arena_ : loan_stage_) + slot->offset});
+        }
+        loan_list_.reserve(loan_plan_.size());
+        if (!loan_plan_.empty()) loan_publish_at_ = publish_at;
     }
     return !loan_pending() || queue_loan(kLoanBytesPerWindow);
 }
@@ -1157,16 +1162,17 @@ bool InklingModel::publish_loan(void* stream) {
     if (!loan_pending()) return true;
     loan_publish_at_ = -1;
     if (!queue_loan(~0ull)) return false;
-    // the whole loan becomes visible here, at a position the token stream fixes, however long its uploads took
-    if (!loan_upload_.empty() && cudaEventSynchronize((cudaEvent_t) loan_event_) != cudaSuccess) {
+    // the whole plan becomes visible here, at a position the token stream fixes, however long its uploads took
+    if (loan_inflight_ && cudaEventSynchronize((cudaEvent_t) loan_event_) != cudaSuccess) {
         wedge();
         basalt::log::error("basalt inkling2", "a prompt loan upload failed; restart the engine");
         return false;
     }
+    loan_inflight_ = false;
     const int64_t before = card_copies();
     const size_t ne = geo().n_expert;
-    for (const auto& [pair, ptr] : loan_upload_) {
-        if (copy_[pair]) continue;   // a paid copy of it came after the upload was queued
+    for (const auto& [pair, ptr] : loan_plan_) {
+        if (copy_[pair]) continue;   // a paid copy came after the plan: its place stays unused
         const size_t l = pair / ne, e = pair % ne;
         auto& addr = loan_addr_[loan_list_.size()];
         addr = (unsigned long long) ptr;
@@ -1182,17 +1188,23 @@ bool InklingModel::publish_loan(void* stream) {
         loan_list_.push_back(pair);
         ++layer_copies_[l];
     }
-    loan_upload_.clear();
+    loan_plan_.clear();
     if (before != card_copies()) ++epoch_;
     log_copy_change("prompt loan", before);
     return true;
 }
 
+// The copy stream is idle again, or the uploads stay on record as running: their source and destination are then never
+// released (the engine ends without the CUDA teardown).
 bool InklingModel::drain_loan_upload() {
-    if (loan_upload_.empty()) return true;
-    const bool drained = cudaStreamSynchronize((cudaStream_t) loan_stream_) == cudaSuccess;
-    loan_upload_.clear();
-    if (drained) return true;
+    if (loan_stuck_) return false;
+    if (!loan_inflight_) return true;
+    if (cudaStreamSynchronize((cudaStream_t) loan_stream_) == cudaSuccess) {
+        loan_inflight_ = false;
+        return true;
+    }
+    loan_stuck_ = true;
+    core::gpu_left_running().store(true);
     wedge();
     basalt::log::error("basalt inkling2", "a prompt loan upload could not be drained; restart the engine");
     return false;
@@ -1200,7 +1212,7 @@ bool InklingModel::drain_loan_upload() {
 
 bool InklingModel::recall_loan(void* stream) {
     if (wedged() || !drain_loan_upload()) return false;
-    loan_queue_.clear();
+    loan_plan_.clear();
     loan_next_ = 0;
     loan_publish_at_ = -1;
     loan_due_ = true;

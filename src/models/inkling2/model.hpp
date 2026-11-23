@@ -13,7 +13,6 @@
 #include "models/inkling2/vision_encoder.hpp"   // [vision]
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -156,7 +155,9 @@ public:
     /// The prompt loan: with an elastic spill, one card and one session, the prompt path's idle device memory (its chunk
     /// arena and the experts' staging) holds copies of the next highest-ranked RAM experts while decode runs. They count
     /// for decode but take no slot or page of the paid copies.
-    void set_prompt_arena(uint8_t* base, uint64_t bytes);
+    /// Null `base`: the arena goes; false when a loan upload into it could not be confirmed finished (its memory must not be
+    /// freed then).
+    bool set_prompt_arena(uint8_t* base, uint64_t bytes);
     /// After a decode window: starts the loan's uploads when one is due (`publish_at`: the position its copies become
     /// visible at) and queues their next bounded part. Never makes a copy visible.
     bool submit_loan(int64_t publish_at);
@@ -264,7 +265,10 @@ private:
     struct LoanUpload { size_t pair; uint8_t* ptr; };
     void* loan_stream_ = nullptr;
     void* loan_event_ = nullptr;
-    std::vector<LoanUpload> loan_upload_;
+    std::vector<LoanUpload> loan_plan_;   ///< the loan fixed at its start: each pair and its place, in rank order
+    size_t loan_next_ = 0;                ///< the plan's uploads queued so far
+    bool loan_inflight_ = false;          ///< uploads queued since the copy stream was last confirmed idle
+    bool loan_stuck_ = false;             ///< an upload could not be confirmed finished: its memory is never released
     uint8_t* loan_arena_ = nullptr;
     uint64_t loan_arena_bytes_ = 0;
     uint8_t* loan_stage_ = nullptr;   ///< the shared staging's second address range
@@ -275,9 +279,6 @@ private:
     int loan_state_ = 0;              ///< 0: not set up, 1: ready, -1: not available
     bool loan_due_ = true;            ///< the next decode window starts a new ranked fill
     int64_t loan_publish_at_ = -1;    ///< the position the queued uploads are published at (-1: none queued)
-    std::vector<size_t> loan_queue_;
-    size_t loan_next_ = 0;
-    std::array<uint64_t, 2> loan_offsets_{};
     // [vision] the experts' memory lent to the image encoder: each lent range's bytes, in RAM until refill
     struct LentRange {
         size_t range = 0;

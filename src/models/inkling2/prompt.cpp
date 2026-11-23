@@ -146,7 +146,8 @@ class Prompt final : public PromptRunner {
 public:
     Prompt(InklingModel& m, cudaStream_t s) : m_(m), g_(m.geo()) { lane_[0].stream = s; }
     ~Prompt() override {   // every read synced its streams before it returned
-        if (m_.has_spill() && m_.cards() == 1) m_.set_prompt_arena(nullptr, 0);   // the copies decode keeps there go back to RAM
+        // the copies decode keeps in the arena go back to RAM; an upload into it that may still run keeps the arena
+        if (m_.has_spill() && m_.cards() == 1 && !m_.set_prompt_arena(nullptr, 0)) return;
         for (cudaEvent_t& e : done_)
             if (e) cudaEventDestroy(e);
         for (int i = m_.cards() - 1; i >= 0; --i) {
