@@ -216,11 +216,15 @@ public:
         if (!m_.wedged() && m_.has_spill() && ex_tally_) {   // how decode's lookups fell between the card and RAM
             std::vector<uint32_t> t;
             if (read_tally(t)) {
-                const CardShare sh = card_share(t, g_.n_expert, [&](int l, int e) { return m_.on_card(l, e); });
+                uint64_t loan = 0;
+                const CardShare sh = lookup_share(t, loan);
                 const uint64_t all = sh.all, card = sh.card;
                 basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu on the CPU",
                                   (unsigned long long) all, all ? 100.0 * (double) card / (double) all : 100.0,
                                   (unsigned long long) (all - card));
+                if (loan > 0)
+                    basalt::log::info("basalt inkling2", "experts: %llu of the card's decode lookups went to loaned copies",
+                                      (unsigned long long) loan);
             }
         }
         for (auto [d, p] : bufs_) {
@@ -394,10 +398,12 @@ public:
         if (m_.wedged()) return wedged();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the window runs past the context"};
         std::string err;
+        const int64_t loaned_before = m_.loaned();
         if (heat_tally_) settle_window(r.pos);
         if (!ensure_positions(r.pos + r.n_tokens, err)) return {model::Status::Refused, "inkling2: " + err};
         if (heat_tally_) {   // the placement changes due at this position, before any row at or past it runs
             if (rebalances() && next_rebalance_ >= 0 && r.pos >= next_rebalance_) rebalance_copies(r.pos, false);
+            if (m_.loan_pending() && r.pos >= m_.loan_publish_at() && !publish_loan()) return wedged();
             if (m_.wedged()) return wedged();
         }
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
@@ -409,7 +415,13 @@ public:
             const bool want = r.row_tokens || (last && (r.next_token || r.logits));
             const int head = !want ? 0 : r.row_tokens ? n : 1;
             if (t0 > 0) fold_rows(win_rows_);   // a window wider than one call: the rows before its last call are prompt rows
-            if (!forward(r.tokens + t0, nullptr, n, r.pos + t0, head, err)) return {model::Status::Error, "inkling2: " + err};
+            if (!forward(r.tokens + t0, nullptr, n, r.pos + t0, head, err)) {
+                if (!m_.wedged() && m_.loaned() != loaned_before) {
+                    m_.wedge();
+                    basalt::log::error("basalt inkling2", "a window failed after publishing prompt loan copies; restart the engine");
+                }
+                return {model::Status::Error, "inkling2: " + err};
+            }
             if (heat_tally_) {
                 win_pos_ = r.pos;
                 win_off_ = t0;
@@ -426,7 +438,9 @@ public:
             if (last && r.logits)
                 cudaMemcpyAsync(r.logits, logits_ + (size_t) (head - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
         }
-        return end_call("the window failed");
+        if (const model::Result done = end_call("the window failed"); !done.ok()) return done;
+        if (heat_tally_ && !m_.submit_loan(r.pos + kLoanLagRows)) return wedged();
+        return {};
     }
 
     // The rows the last window keeps rank the copies; rejected drafts never count, so the ranking follows the token stream.
@@ -438,7 +452,8 @@ public:
         return {};
     }
 
-    // A window never crosses a position where the placement changes (a rebalance, a cache grow that can send copies back), so every row runs under the placement its position fixes, whatever the windows' widths.
+    // A window never crosses a position where the placement changes (a rebalance, the loan's publication, a cache grow that
+    // can send copies back), so every row runs under the placement its position fixes, whatever the windows' widths.
     int window_limit(int64_t pos) const override {
         if (!heat_tally_ || sh_.use_count() > 1) return 0;
         int64_t room = INT64_MAX;
@@ -446,6 +461,7 @@ public:
             if (at > pos) room = std::min(room, at - pos);
         };
         if (rebalances() && next_rebalance_ >= 0) bound(next_rebalance_after(pos));
+        if (m_.loan_pending()) bound(m_.loan_publish_at());
         if (!elastic_.empty() && m_.promoted() > 0 && backed_ < m_.context())
             bound(backed_ > pos ? backed_ : (pos / kElasticKvStep + 1) * kElasticKvStep);
         return room == INT64_MAX ? 0 : (int) std::min<int64_t>(room, kMaxRows);
@@ -513,12 +529,19 @@ public:
         if (heat_tally_) settle_window(r.pos);
         if (r.pos == 0 && !restart_positions(r.n_tokens)) return wedged();
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return {model::Status::Refused, "inkling2: " + e};
-        // a request's start: the copies follow the lookups so far
-        if (heat_tally_) rebalance_copies(r.pos + r.n_tokens, true);
+        // a request's start: the copies follow the lookups so far (a staged read takes the loan's memory back first)
+        if (heat_tally_ && !staged) rebalance_copies(r.pos + r.n_tokens, true);
         if (m_.wedged()) return wedged();
         hist_.resize((size_t) r.pos);
         if (staged) {   // PROMPT HOOK; a failed read's rows are no prefix to go on from
-            const model::Result res = sh_->prompt->read(r, hist_, vc_, dspark_, stream_);
+            PromptRunner::Prepare prepare;
+            if (heat_tally_)
+                prepare = [&] {
+                    if (!recall_loan()) return false;
+                    rebalance_copies(r.pos + r.n_tokens, true);
+                    return !m_.wedged();
+                };
+            const model::Result res = sh_->prompt->read(r, hist_, vc_, dspark_, stream_, prepare);
             if (!res.ok()) hist_.resize((size_t) r.pos);
             return res;
         }
@@ -560,7 +583,9 @@ public:
         if (std::string e; !ensure_positions(pos + n_rows, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) pos);
         if (sh_->prompt && n_rows > 16) {
-            const model::Result res = sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_);
+            PromptRunner::Prepare prepare;
+            if (heat_tally_) prepare = [&] { return recall_loan(); };
+            const model::Result res = sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_, prepare);
             if (!res.ok()) hist_.resize((size_t) pos);
             return res;
         }
@@ -619,6 +644,7 @@ public:
         if (m_.wedged()) return wedged();
         if (!m_.copies()) return {};
         if (cudaStreamSynchronize(stream_) != cudaSuccess || !feed_heat()) return wedged();
+        if (low && !recall_loan()) return wedged();
         if (!m_.lend(low)) return {model::Status::Error, "inkling2: the expert copies could not go back to RAM"};
         expert_slots = expert_pairs() - m_.spill().spilled + m_.promoted();
         return {};
@@ -694,9 +720,11 @@ public:
     static constexpr int64_t kElasticKvStep = 8192;
     static constexpr uint64_t kElasticKeep = 512ull << 20;   // free bytes a grow leaves (the driver, the graphs)
     // The copies' placement changes at positions the token stream fixes (window_limit): a rebalance every kRebalanceRows
-    // positions of a turn.
+    // positions of a turn, the prompt loan kLoanLagRows positions after the turn's first window (its uploads overlap the
+    // windows before).
     static constexpr int kRebalanceSwaps = 64;
     static constexpr int64_t kRebalanceRows = 256;
+    static constexpr int64_t kLoanLagRows = 32;
 
     // The decode read-ahead's saved expert addresses (rec_blobs_, written by the window before) are dropped once a copy has
     // moved or gone since: their memory may hold another expert or be unmapped. The epoch counts as seen once the drop is
@@ -818,8 +846,53 @@ public:
         next_rebalance_ = request ? at + kRebalanceRows : next_rebalance_after(at);
         if (!rebalances() || !feed_heat()) return;
         const int64_t before = m_.card_copies();
-        const int n = m_.rebalance(kRebalanceSwaps);
+        const int n = m_.rebalance(kRebalanceSwaps);   // paid copies only; the loan stays
         if (n > 0 || m_.wedged()) m_.log_copy_change(("rebalance (" + std::to_string(n) + " swaps)").c_str(), before, 0, true);
+    }
+    bool publish_loan() {
+        const size_t before = m_.loaned_pairs().size();
+        if (!m_.publish_loan(stream_)) return false;
+        const auto& pairs = m_.loaned_pairs();
+        if (pairs.size() == before) return true;
+        std::vector<uint32_t> counts;   // the lookup counts the loaned copies' hits start from
+        if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(counts)) {
+            m_.wedge();
+            basalt::log::error("basalt inkling2", "the prompt loan lookup baseline could not be read; restart the engine");
+            return false;
+        }
+        loan_start_.resize(counts.size());
+        for (size_t i = before; i < pairs.size(); ++i) loan_start_[pairs[i]] = counts[pairs[i]];
+        return true;
+    }
+    bool recall_loan() {
+        if (m_.wedged()) return false;
+        if (m_.loaned() > 0) {
+            std::vector<uint32_t> t;
+            if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(t)) {
+                m_.wedge();
+                basalt::log::error("basalt inkling2", "the prompt loan lookup counters could not be read; restart the engine");
+                return false;
+            }
+            loan_hits_.resize(t.size());
+            for (size_t pair : m_.loaned_pairs()) loan_hits_[pair] += t[pair] - loan_start_[pair];
+            loan_start_.clear();
+        }
+        return m_.recall_loan(stream_);
+    }
+    // How the lookups fell between the card and RAM; a loaned copy's hits count for the card while it held the copy.
+    CardShare lookup_share(const std::vector<uint32_t>& t, uint64_t& loan) const {
+        CardShare sh{};
+        const size_t ne = g_.n_expert;
+        for (size_t pair = 0; pair < t.size(); ++pair) {
+            const int l = (int) (pair / ne), e = (int) (pair % ne);
+            const uint64_t past = loan_hits_.empty() ? 0 : loan_hits_[pair];
+            const uint64_t active = !loan_start_.empty() && m_.on_loan(l, e) ? t[pair] - loan_start_[pair] : 0;
+            const uint64_t hits = std::min<uint64_t>(t[pair], past + active);
+            loan += hits;
+            sh.all += t[pair];
+            sh.card += m_.on_card(l, e) ? t[pair] : hits;
+        }
+        return sh;
     }
     // A conversation starts over (a prompt at position 0): the caches give back the cells past what it needs (never below
     // the base), and the RAM experts come back to the card while it has room.
@@ -958,7 +1031,8 @@ public:
         if (!m_.has_spill() || !ex_tally_) return {lookups_, lookups_, 0, 0};
         std::vector<uint32_t> t;
         if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(t)) return {lookups_, lookups_, 0, 0};
-        const CardShare sh = card_share(t, g_.n_expert, [&](int l, int e) { return m_.on_card(l, e); });
+        uint64_t loan = 0;
+        const CardShare sh = lookup_share(t, loan);
         return {(int64_t) sh.card, (int64_t) sh.all, 0, 0};
     }
     std::vector<CardExperts> experts_by_card() const override {
@@ -1636,6 +1710,8 @@ private:
     std::vector<uint32_t> heat_last_;
     int64_t heat_rows_ = 0;
     int64_t next_rebalance_ = -1;               // the position of the next rebalance between windows (-1: before a request)
+    std::vector<uint32_t> loan_start_;          // the lookup counts when the loaned copies were published
+    std::vector<uint64_t> loan_hits_;           // the loaned copies' hits, banked at each recall
     ResidentExpertMap map_;
     int64_t lookups_ = 0;                    // decode's routed lookups so far
     // the elastic KV (model.hpp elastic()): the full visits' caches back their first backed_ cells

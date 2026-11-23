@@ -69,8 +69,14 @@ the text model.
   windows keep (rejected drafts do not count), decayed over 320 kept rows. The least looked up give way first when the caches
   grow. With one session and an elastic spill, at a request's start and every 256 decode positions after it, up to 64 copies
   move to clearly hotter RAM experts of the same size.
-- **Same tokens on every run:** placement only changes at positions the requests fix (a request's start, the rebalances, a
-  cache grow), and a decode window never crosses one, so a greedy request gives the same tokens run to run whatever
+- **Prompt loan:** with an elastic spill, one session and one card, the prompt path's device memory that decode leaves idle (the
+  chunk buffers' arena and the experts' prompt staging) holds copies of the next highest-ranked RAM experts. Their uploads run
+  beside the turn's first decode windows, a bounded part after each, and the copies are used from 32 positions after the
+  turn's first window (that window waits for an upload still running). A prompt read through the staging takes the memory
+  back first; a read through the decode path leaves the loan in place. Loaned copies use the card's arithmetic
+  ([precision](../precision/inkling2.md)).
+- **Same tokens on every run:** placement only changes at positions the requests fix (a request's start, the rebalances, the
+  loan, a cache grow), and a decode window never crosses one, so a greedy request gives the same tokens run to run whatever
   the windows' widths. A different free VRAM at start, a VRAM command or a sleep can give a different placement.
 - **Sleep and lending:** `--idle-sleep` and `POST /v1/vram` ([running](../running.md#sleep---idle-sleep)) use the same copies.
   At a sleep the card's copies of the RAM experts go back to RAM (the CPU computes them) and the driver moves the rest

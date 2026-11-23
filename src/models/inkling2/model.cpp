@@ -14,6 +14,7 @@
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/prefill/q8_gemm.hpp"
 #include "basalt/program/multi_gpu_plan.hpp"
+#include "models/inkling2/loan_layout.hpp"
 #include "models/inkling2/prompt.hpp"
 #include "models/inkling2/walk.hpp"
 
@@ -29,6 +30,8 @@ namespace basalt::models::inkling2 {
 namespace {
 constexpr uint64_t kGiB = 1ull << 30;
 constexpr uint64_t kMiB = 1ull << 20;
+// The loan's uploads queued after one decode window: well under a window's time on the bus, so they overlap decode.
+constexpr uint64_t kLoanBytesPerWindow = 192 * kMiB;
 constexpr int kTypeF32 = 0;
 constexpr int kTypeQ8_0 = 8;
 constexpr int kTypeBF16 = 30;
@@ -101,9 +104,17 @@ uint64_t shared_bytes(const Geometry& g, bool drafter) {
 InklingModel::InklingModel() = default;
 
 InklingModel::~InklingModel() {
+    drain_loan_upload();
+    if (loan_event_) cudaEventDestroy((cudaEvent_t) loan_event_);
+    if (loan_stream_) cudaStreamDestroy((cudaStream_t) loan_stream_);
     for (void* p : dev_) cudaFree(p);
     for (size_t g = 0; g < copy_maps_.size(); ++g) core::vmm::unmap(copies_va_ + g * copy_lay_.gran, copy_lay_.gran, copy_maps_[g]);
     if (copies_va_) core::vmm::release_range(copies_va_, copy_reserved_);
+    if (loan_stage_) {
+        core::vmm::unmap_only(loan_stage_, loan_stage_bytes_);
+        core::vmm::release_range(loan_stage_, loan_stage_bytes_);
+    }
+    if (loan_addr_) cudaFreeHost(loan_addr_);
     for (const Range& r : ranges_) {
         if (r.handle) core::vmm::unmap(r.va, r.own, r.handle);
         core::vmm::unmap_only(r.va + r.own, r.bytes - r.own);
@@ -805,7 +816,7 @@ const uint8_t* InklingModel::copy_source(size_t pair) const {
 
 bool InklingModel::join_placement() {
     if (wedged()) return false;
-    // every reader of the tables and copies (the sessions' streams, the CPU experts' merge) is done
+    // every reader of the tables and copies (the sessions' streams, the CPU experts' merge, the loan's uploads) is done
     if (cudaDeviceSynchronize() == cudaSuccess) return true;
     wedge();
     basalt::log::error("basalt inkling2", "expert copy placement could not be confirmed; restart the engine");
@@ -861,8 +872,10 @@ void InklingModel::log_copy_change(const char* event, int64_t before, uint64_t t
     const std::string free_mib = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess
         ? std::to_string(free_b / kMiB) : "unknown";
     const auto log = warning || wedged() ? basalt::log::warn : basalt::log::info;
-    log("basalt inkling2", "elastic spill: %s; expert copies %lld -> %lld%s; %s MiB free, %.2f MiB mapped, %.2f MiB to map",
-        event, (long long) before, (long long) after, wedged() ? " (tracked; placement unconfirmed)" : "", free_mib.c_str(), (double) copy_maps_.size() * copy_lay_.gran / kMiB, (double) to_map / kMiB);
+    log("basalt inkling2", "elastic spill: %s; expert copies %lld -> %lld%s (%lld loaned after); "
+        "%s MiB free, %.2f MiB paid mapped, %.2f MiB to map",
+        event, (long long) before, (long long) after, wedged() ? " (tracked; placement unconfirmed)" : "",
+        (long long) loaned(), free_mib.c_str(), (double) copy_maps_.size() * copy_lay_.gran / kMiB, (double) to_map / kMiB);
 }
 
 bool InklingModel::resize_reserve(uint64_t free_bytes) {
@@ -901,6 +914,7 @@ bool InklingModel::resize_reserve(uint64_t free_bytes) {
 bool InklingModel::lend(bool low) {
     const int64_t before = card_copies();
     if (low) {
+        if (loaned() > 0) return false;
         uint64_t freed = 0;
         if (!demote(~0ull, freed)) {
             log_copy_change("sleep failed", before);
@@ -931,7 +945,7 @@ uint64_t InklingModel::cpu_layers() const {
 
 bool InklingModel::stage_from_card(int l, void* stream) const {
     const LayerWeights& w = layers_[(size_t) l];
-    if (wedged() || copy_.empty() || w.n_spill == 0 || layer_copies_[(size_t) l] < w.n_spill) return false;
+    if (wedged() || loaned() > 0 || copy_.empty() || w.n_spill == 0 || layer_copies_[(size_t) l] < w.n_spill) return false;
     const int ne = geo().n_expert;
     for (int e = 0; e < ne; ++e)
         if (const void* c = copy_[(size_t) l * ne + e])
@@ -1024,6 +1038,205 @@ int InklingModel::rebalance(int max_swaps) {
     if (done > 0) ++epoch_;
     join_placement();
     return done;
+}
+
+void InklingModel::set_prompt_arena(uint8_t* base, uint64_t bytes) {
+    if (!base) {
+        if (!drain_loan_upload() || !recall_loan(nullptr)) basalt::log::error("basalt inkling2", "the prompt arena goes while expert copies are still loaned in it");
+        loan_arena_ = nullptr;
+        loan_arena_bytes_ = 0;
+        return;
+    }
+    loan_arena_ = base;
+    loan_arena_bytes_ = bytes;
+    loan_due_ = loan_ready();
+}
+
+// The shared staging's granules mapped a second time, at an address range of their own: the layers' ranges (the prompt
+// path's view of the staging) stay as they are.
+bool InklingModel::loan_ready() {
+    if (loan_state_ != 0) return loan_state_ > 0;
+    if (!elastic_ || sessions() != 1 || cards() != 1 || !loan_arena_ || spill_order_.empty() || !core::vmm::supported()) return false;
+    loan_state_ = -1;
+    if (cudaHostAlloc((void**) &loan_addr_, spill_order_.size() * sizeof(unsigned long long), cudaHostAllocPortable) != cudaSuccess) {
+        cudaGetLastError();
+        loan_addr_ = nullptr;
+        return false;
+    }
+    cudaStream_t copy = nullptr;
+    cudaEvent_t uploaded = nullptr;
+    if (cudaStreamCreateWithFlags(&copy, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&uploaded, cudaEventDisableTiming) != cudaSuccess) {
+        if (copy) cudaStreamDestroy(copy);
+        cudaFreeHost(loan_addr_);
+        loan_addr_ = nullptr;
+        cudaGetLastError();
+        return false;
+    }
+    loan_stream_ = copy;
+    loan_event_ = uploaded;
+    const uint64_t gran = core::vmm::granularity();
+    if (!staging_.empty() && gran) {
+        const uint64_t bytes = (uint64_t) staging_.size() * gran;
+        if (uint8_t* va = core::vmm::reserve(bytes)) {
+            size_t done = 0;
+            while (done < staging_.size() && core::vmm::map_handle(va + done * gran, gran, staging_[done])) ++done;
+            if (done == staging_.size()) {
+                loan_stage_ = va;
+                loan_stage_bytes_ = bytes;
+            } else {
+                core::vmm::unmap_only(va, done * gran);
+                core::vmm::release_range(va, bytes);
+            }
+        }
+    }
+    loan_flag_.assign(copy_.size(), 0);
+    loan_state_ = 1;
+    return true;
+}
+
+
+// Queues the next RAM experts of the loan's queue on the copy stream, `budget` bytes of them (at least one); none is
+// visible before publish_loan.
+bool InklingModel::queue_loan(uint64_t budget) {
+    const std::array regions{loan_arena_bytes_, loan_stage_bytes_};
+    const cudaStream_t copy = (cudaStream_t) loan_stream_;
+    uint64_t bytes = 0;
+    while (loan_next_ < loan_queue_.size()) {
+        const size_t pair = loan_queue_[loan_next_];
+        if (copy_[pair]) {
+            ++loan_next_;
+            continue;
+        }
+        const uint64_t stride = copy_stride(pair);
+        if (bytes && (bytes >= budget || stride > budget - bytes)) break;
+        const auto slot = next_loan_slot(stride, regions, loan_offsets_);
+        if (!slot) {
+            loan_next_ = loan_queue_.size();
+            break;
+        }
+        uint8_t* ptr = (slot->region == 0 ? loan_arena_ : loan_stage_) + slot->offset;
+        loan_upload_.push_back({pair, ptr});   // tracked before queuing, so a failed queue is drained too
+        if (cudaMemcpyAsync(ptr, copy_source(pair), stride, cudaMemcpyHostToDevice, copy) != cudaSuccess) {
+            wedge();
+            basalt::log::error("basalt inkling2", "a prompt loan upload could not be queued; restart the engine");
+            return false;
+        }
+        ++loan_next_;
+        bytes += stride;
+    }
+    if (bytes > 0 && cudaEventRecord((cudaEvent_t) loan_event_, copy) != cudaSuccess) {
+        wedge();
+        basalt::log::error("basalt inkling2", "a prompt loan completion event could not be queued; restart the engine");
+        return false;
+    }
+    return true;
+}
+
+bool InklingModel::submit_loan(int64_t publish_at) {
+    if (wedged()) return false;
+    if (lent_) return true;
+    if (loan_due_) {
+        loan_due_ = false;
+        if (loan_state_ != 1 || !loan_arena_) return true;
+        loan_queue_ = by_score_desc(heat_, copy_candidates());
+        loan_next_ = 0;
+        loan_offsets_ = {};
+        loan_list_.reserve(loan_queue_.size());
+        loan_upload_.reserve(loan_queue_.size());
+        if (!loan_queue_.empty()) loan_publish_at_ = publish_at;
+    }
+    return !loan_pending() || queue_loan(kLoanBytesPerWindow);
+}
+
+bool InklingModel::publish_loan(void* stream) {
+    if (wedged()) return false;
+    if (!loan_pending()) return true;
+    loan_publish_at_ = -1;
+    if (!queue_loan(~0ull)) return false;
+    // the whole loan becomes visible here, at a position the token stream fixes, however long its uploads took
+    if (!loan_upload_.empty() && cudaEventSynchronize((cudaEvent_t) loan_event_) != cudaSuccess) {
+        wedge();
+        basalt::log::error("basalt inkling2", "a prompt loan upload failed; restart the engine");
+        return false;
+    }
+    const int64_t before = card_copies();
+    const size_t ne = geo().n_expert;
+    for (const auto& [pair, ptr] : loan_upload_) {
+        if (copy_[pair]) continue;   // a paid copy of it came after the upload was queued
+        const size_t l = pair / ne, e = pair % ne;
+        auto& addr = loan_addr_[loan_list_.size()];
+        addr = (unsigned long long) ptr;
+        // every reader of the tables runs on the decode stream or forks from it
+        if (cudaMemcpyAsync(layers_[l].blob_table + e, &addr, sizeof(addr), cudaMemcpyHostToDevice,
+                            (cudaStream_t) stream) != cudaSuccess) {
+            wedge();
+            log_copy_change("prompt loan failed", before);
+            return false;
+        }
+        copy_[pair] = ptr;
+        loan_flag_[pair] = 1;
+        loan_list_.push_back(pair);
+        ++layer_copies_[l];
+    }
+    loan_upload_.clear();
+    if (before != card_copies()) ++epoch_;
+    log_copy_change("prompt loan", before);
+    return true;
+}
+
+bool InklingModel::drain_loan_upload() {
+    if (loan_upload_.empty()) return true;
+    const bool drained = cudaStreamSynchronize((cudaStream_t) loan_stream_) == cudaSuccess;
+    loan_upload_.clear();
+    if (drained) return true;
+    wedge();
+    basalt::log::error("basalt inkling2", "a prompt loan upload could not be drained; restart the engine");
+    return false;
+}
+
+bool InklingModel::recall_loan(void* stream) {
+    if (wedged() || !drain_loan_upload()) return false;
+    loan_queue_.clear();
+    loan_next_ = 0;
+    loan_publish_at_ = -1;
+    loan_due_ = true;
+    if (loaned() == 0) return true;
+    const int64_t before = card_copies();
+    const int ne = geo().n_expert;
+    cudaStream_t st = (cudaStream_t) stream;
+    if (!join_placement()) return false;
+    // the entries go back to 0 (the CPU computes them again) before any loaned byte can be overwritten
+    size_t queued = 0;
+    for (auto it = loan_list_.rbegin(); it != loan_list_.rend(); ++it, ++queued) {
+        const size_t i = *it;
+        if (cudaMemsetAsync(layers_[i / (size_t) ne].blob_table + i % (size_t) ne, 0, 8, st) != cudaSuccess) {
+            cudaGetLastError();
+            break;
+        }
+    }
+    if (cudaStreamSynchronize(st) != cudaSuccess) {
+        wedge();
+        basalt::log::error("basalt inkling2", "the prompt loan's copies could not be recalled");
+        log_copy_change("prompt loan recall failed", before);
+        return false;
+    }
+    for (size_t k = 0; k < queued; ++k) {
+        const size_t i = loan_list_.back();
+        loan_list_.pop_back();
+        copy_[i] = nullptr;
+        loan_flag_[i] = 0;
+        --layer_copies_[i / (size_t) ne];
+    }
+    if (queued > 0) ++epoch_;
+    if (loaned() > 0) {
+        wedge();
+        basalt::log::error("basalt inkling2", "%lld prompt loan copies could not be recalled", (long long) loaned());
+        log_copy_change("prompt loan recall failed", before);
+        return false;
+    }
+    log_copy_change("prompt loan recall", before);
+    return true;
 }
 
 // [vision] ENC runs between requests and windows: once every stream is idle, nothing reads the experts until refill.

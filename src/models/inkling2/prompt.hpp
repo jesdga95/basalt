@@ -7,6 +7,7 @@
 #include "models/inkling2/model.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -21,13 +22,17 @@ constexpr int kPromptChunk = 4096;
 class PromptRunner {
 public:
     virtual ~PromptRunner() = default;
+    /// Runs before the first chunk, once the read is known not to be stopped: what the caller must do before the chunks
+    /// reuse the path's memory (false fails the read).
+    using Prepare = std::function<bool()>;
     /// Reads r.tokens at r.pos.. into a session's caches and drafter, on its stream; `hist` takes each token read.
     virtual model::Result read(const model::PrefillRequest& r, std::vector<int32_t>& hist, const std::vector<VisitCache>& caches,
-                               DsparkHook& dspark, void* stream) = 0;
+                               DsparkHook& dspark, void* stream, const Prepare& prepare) = 0;
     /// Reads `n` embedding rows (host fp32 [n][n_embd], taken as they are: no embedding norm) at pos..; `hist` takes `pad`
     /// for each row.
     virtual model::Result read_rows(const float* rows, int n, int64_t pos, int32_t pad, std::vector<int32_t>& hist,
-                                    const std::vector<VisitCache>& caches, DsparkHook& dspark, void* stream) = 0;
+                                    const std::vector<VisitCache>& caches, DsparkHook& dspark, void* stream,
+                                    const Prepare& prepare) = 0;
 };
 
 /// The prompt path every session of the model shares (one read at a time; each read syncs before it returns), set up on
