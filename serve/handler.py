@@ -574,6 +574,11 @@ def make_handler(target: Service | Router):
                 # llama.cpp's tokenizer routes name no model: the shown one's tokenizer, as /props describes it
                 self.svc = router.shown() if requested is None and path in ("/tokenize", "/detokenize") else \
                     router.service_for(requested)
+                if self.svc is None and not router.multi and isinstance(requested, str) and requested.strip():
+                    # One model loaded: the name cannot route anywhere else, so an unknown one is still served by it,
+                    # as Strata and llama.cpp's single-model servers do (#456). The reply names the served model, never
+                    # the requested one (below). A missing or blank name stays a 404: a conversation must name its model.
+                    self.svc = router.shown()
                 if self.svc is None:
                     self._unknown_model(path, requested)
                     return
