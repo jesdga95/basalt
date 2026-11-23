@@ -11,6 +11,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/row_norm.hpp"
+#include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
@@ -333,7 +334,6 @@ private:
     // which reports a chunk once the card has run it.
     model::Result run(const int32_t* tokens, const float* emb, int n, int64_t pos, const model::PrefillRequest& r,
                       std::vector<int32_t>& hist, int32_t pad) {
-        if (broken_) return {model::Status::Error, "inkling2: an earlier prompt read failed and its work could not be drained"};
         const int chunks = (n + kChunk - 1) / kChunk;
         const int per = (n + chunks - 1) / chunks;
         std::string err;
@@ -348,11 +348,12 @@ private:
             ds_->note(pos + t0, rows);
             if (tokens) hist.insert(hist.end(), tokens + t0, tokens + t0 + rows);
             else hist.insert(hist.end(), (size_t) rows, pad);
-            cudaEventRecord(done_[k % 2], strm());
-            if (k > 0) {   // the chunk before this one has run
-                cudaEventSynchronize(done_[(k - 1) % 2]);
-                if (r.progress) r.progress(reported);
+            if (!ok(cudaEventRecord(done_[k % 2], strm())) || (k > 0 && !ok(cudaEventSynchronize(done_[(k - 1) % 2])))) {
+                drain();
+                return {model::Status::Error, std::string("inkling2: a prompt chunk's completion could not be waited for: ") +
+                                                  cudaGetErrorString(fail_)};
             }
+            if (k > 0 && r.progress) r.progress(reported);   // the chunk before this one has run
             reported = t0 + rows;
         }
         if (cudaStreamSynchronize(strm()) != cudaSuccess) {
@@ -363,17 +364,30 @@ private:
         return {};
     }
     // A failed read: every stream it queued work on runs out before the staging, the chunk buffers or a card copy it reads
-    // can be used again; when one cannot, the runner refuses every later read.
+    // can be used again; when one cannot, the model refuses every later request (InklingModel::wedge).
     void drain() {
+        bool out = true;
         for (int i = m_.cards() - 1; i >= 0; --i) {
             Lane& k = lane_[i];
-            cudaSetDevice(k.device);
-            if (k.copy && cudaStreamSynchronize(k.copy) != cudaSuccess) broken_ = true;
-            if (cudaStreamSynchronize(k.stream) != cudaSuccess) broken_ = true;
+            if (cudaSetDevice(k.device) != cudaSuccess) {
+                out = false;
+                continue;
+            }
+            if (k.copy && cudaStreamSynchronize(k.copy) != cudaSuccess) out = false;
+            if (cudaStreamSynchronize(k.stream) != cudaSuccess) out = false;
         }
         cur_ = 0;
-        cudaSetDevice(lane_[0].device);
+        if (cudaSetDevice(lane_[0].device) != cudaSuccess) out = false;
         cudaGetLastError();
+        if (!out) {
+            m_.wedge();
+            basalt::log::error("basalt inkling2", "a failed prompt read's work could not be run out: every later request is refused");
+        }
+    }
+    // The first failing call's status of the read (staging_failed), for its error.
+    bool ok(cudaError_t e) {
+        if (e != cudaSuccess && fail_ == cudaSuccess) fail_ = e;
+        return e == cudaSuccess;
     }
 
     // One chunk of `rows` rows at pos0..: the embedding, the visits, the caches.
@@ -387,6 +401,7 @@ private:
         // a long chunk stages every RAM expert of a spilled layer: the copies need no routing, so they run ahead on the copy
         // stream, each layer's once the spilled visit before it has read the staging
         ahead_ = rows > kRoutedRows && first_spill_ >= 0;
+        fail_ = cudaSuccess;
         if (ahead_ && !stage_ahead(first_spill_)) {
             err = staging_failed();
             return false;
@@ -586,12 +601,12 @@ private:
         if (w.slot_map) {   // a layer with experts in RAM (spill.hpp): its pairs by slot, its RAM experts copied into the staging
             remap_ids(b().ids, pairs, w.slot_map, strm());
             if (ahead_) {   // the copy stream staged it (stage_ahead)
-                if (cudaStreamWaitEvent(strm(), lane().staged, 0) != cudaSuccess) return false;
+                if (!ok(cudaStreamWaitEvent(strm(), lane().staged, 0))) return false;
             } else {
                 const uint8_t* want = nullptr;
                 if (rows <= kRoutedRows && !(want = routed(pairs))) return false;
                 if (!m_.stage(l, want, strm()) ||
-                    cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm()) != cudaSuccess)
+                    !ok(cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm())))
                     return false;   // the guard after the last slot: spill.hpp
             }
         }
@@ -651,15 +666,14 @@ private:
         Lane& k = lane();
         const int l = g_.visits[(size_t) walk_.steps[(size_t) si].visit].layer;
         const LayerWeights& w = m_.layer(l);
-        return cudaEventRecord(k.freed, k.stream) == cudaSuccess && cudaStreamWaitEvent(k.copy, k.freed, 0) == cudaSuccess &&
-               m_.stage(l, nullptr, k.copy) &&
-               cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, k.copy) == cudaSuccess &&
-               cudaEventRecord(k.staged, k.copy) == cudaSuccess;
+        return ok(cudaEventRecord(k.freed, k.stream)) && ok(cudaStreamWaitEvent(k.copy, k.freed, 0)) && m_.stage(l, nullptr, k.copy) &&
+               ok(cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, k.copy)) &&
+               ok(cudaEventRecord(k.staged, k.copy));
     }
     // A spilled visit's products are queued over the staging: the chunk's next spilled visit's copies may start.
     bool staging_read() { return !ahead_ || next_spill_[(size_t) step_] < 0 || stage_ahead(next_spill_[(size_t) step_]); }
     std::string staging_failed() {
-        const cudaError_t e = cudaGetLastError();
+        const cudaError_t e = fail_ != cudaSuccess ? fail_ : cudaGetLastError();
         return std::string("staging a layer's RAM experts failed") + (e != cudaSuccess ? std::string(": ") + cudaGetErrorString(e) : "");
     }
 
@@ -791,7 +805,7 @@ private:
     int first_spill_ = -1;            // the first such step
     int step_ = 0;                    // the step being queued
     bool ahead_ = false;              // this chunk stages on the copy stream (stage_ahead)
-    bool broken_ = false;             // a failed read's work could not be drained (drain)
+    cudaError_t fail_ = cudaSuccess;  // the read's first failing call (ok)
 };
 
 }  // namespace

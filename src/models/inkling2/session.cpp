@@ -368,6 +368,7 @@ public:
 
     model::Result decode_window(const model::DecodeRequest& r) override {
         if (r.n_tokens < 1) return {model::Status::Error, "inkling2: an empty window"};
+        if (m_.wedged()) return wedged();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the window runs past the context"};
         std::string err;
         if (!ensure_positions(r.pos + r.n_tokens, err)) return {model::Status::Refused, "inkling2: " + err};
@@ -404,7 +405,13 @@ protected:
     int64_t batch_context() const override { return m_.context(); }
     model::BatchShared& batch_shared() override { return sh_->batch; }
     cudaStream_t batch_stream() const override { return stream_; }
-    bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
+    bool batch_reserve(const model::DecodeRequest& r, std::string& err) override {
+        if (m_.wedged()) {
+            err = wedged().message;
+            return false;
+        }
+        return ensure_positions(r.pos + r.n_tokens, err);
+    }
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
         key.push_back(cpu_ = cpu_layers());
@@ -436,11 +443,16 @@ protected:
 
 public:
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
+        if (m_.wedged()) return wedged();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
         if (r.pos == 0) restart_positions(r.n_tokens);
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) r.pos);
-        if (sh_->prompt && r.n_tokens > 16) return sh_->prompt->read(r, hist_, vc_, dspark_, stream_);   // PROMPT HOOK
+        if (sh_->prompt && r.n_tokens > 16) {   // PROMPT HOOK; a failed read's rows are no prefix to go on from
+            const model::Result res = sh_->prompt->read(r, hist_, vc_, dspark_, stream_);
+            if (!res.ok()) hist_.resize((size_t) r.pos);
+            return res;
+        }
         std::string err;
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
             if (r.stop && r.stop()) break;
@@ -459,6 +471,7 @@ public:
     // ---- [vision] images (vision.hpp, vision_encoder.hpp): a picture's rows stand in for its pad tokens' embeddings, taken
     // as they are (no embedding norm); the history holds the pad token at their positions.
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid& grid) override {
+        if (m_.wedged()) return wedged();
         ImageEncoder& enc = m_.encoder();
         if (!enc.staged()) return {model::Status::NotImplemented, "inkling2: started without --vision"};
         std::string err;
@@ -469,10 +482,15 @@ public:
     }
     void images_done() override { m_.encoder().release(); }
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
+        if (m_.wedged()) return wedged();
         if (pos + n_rows > m_.context()) return {model::Status::Refused, "inkling2: the picture runs past the context"};
         if (std::string e; !ensure_positions(pos + n_rows, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) pos);
-        if (sh_->prompt && n_rows > 16) return sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_);
+        if (sh_->prompt && n_rows > 16) {
+            const model::Result res = sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_);
+            if (!res.ok()) hist_.resize((size_t) pos);
+            return res;
+        }
         std::string err;
         for (int at = 0; at < n_rows; at += kMaxRows) {
             const int n = std::min(kMaxRows, n_rows - at);
@@ -523,6 +541,7 @@ public:
     // SLEEP / WAKE: the card's copies of the RAM experts go back to RAM (decode reads them there) and return at the wake; the
     // driver moves the rest. A model that kept every expert on the card has nothing to lend: ok, no slots, SLEEP goes on.
     model::Result set_low_memory(bool low, int64_t& expert_slots) override {
+        if (m_.wedged()) return wedged();
         if (!m_.elastic()) return {};
         cudaStreamSynchronize(stream_);
         const int64_t before = m_.promoted();
@@ -536,6 +555,7 @@ public:
     // VRAM: the copies resize to leave `mib` free (< 0: the start's --vram-reserve-mib). A static spill or none has no
     // copies to resize: refused unless the card already leaves that much.
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
+        if (m_.wedged()) return wedged();
         cudaStreamSynchronize(stream_);
         const bool fits = m_.resize_reserve((uint64_t) (mib < 0 ? std::max(m_.flags().vram_reserve_mib, 0) : mib) << 20, stream_);
         expert_slots = m_.elastic() ? expert_pairs() - m_.spill().spilled + m_.promoted() : -1;
@@ -568,6 +588,7 @@ public:
     // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kMaxRows
     // rows past it.
     size_t elem() const { return m_.cache_fp8() ? 1 : 2; }
+    static model::Result wedged() { return {model::Status::Error, "inkling2: a failed prompt read's work could not be run out; restart the engine"}; }
     uint64_t cell_bytes() const { return (uint64_t) kKvHeads * kHeadDim * elem(); }
 
     // The elastic KV: before a run reaches `positions`, the full visits' caches back them (in steps of kElasticKvStep cells),
@@ -689,6 +710,7 @@ public:
     }
 
     model::Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
+        if (m_.wedged()) return wedged();
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         if (std::string e; !ensure_positions(positions, e)) return {model::Status::Refused, "inkling2: " + e};
         cudaStreamSynchronize(stream_);
