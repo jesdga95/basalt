@@ -37,6 +37,15 @@ int main() {
     CHECK(cache_bytes(1000000, ratios, F16) > 3ull * 640 * 1000000 + 1280ull * 1000000 - 16384);
     CHECK(cache_bytes(1000000, ratios, F16) < 3ull * 640 * 1000000 + 1280ull * 1000000 + 16384);
     CHECK(cache_bytes(0, {}, F8) == 0);
+    // --kv-resident: later latents in RAM, index keys on the card
+    CHECK(resident_positions(1000000, 0) == 1000000 && resident_positions(1000000, 1000000) == 1000000 &&
+          resident_positions(1000000, 65536) == 65536);
+    CHECK(cache_bytes(1000000, ratios, F8, 1000000) == cache_bytes(1000000, ratios, F8) &&
+          host_cache_bytes(1000000, ratios, F8, 0) == 0);
+    CHECK(cache_bytes(1000000, ratios, F8, 65536) + host_cache_bytes(1000000, ratios, F8, 65536) == cache_bytes(1000000, ratios, F8));
+    CHECK(host_cache_bytes(1000000, ratios, F8, 65536) == (3 * (500001 - 32769) + (1000001 - 65537)) * 288ull);
+    CHECK(prompt_stage_bytes(1000000, ratios, F8, 0) == 0 && prompt_stage_bytes(1000000, ratios, F8, 65536) == 1000001ull * 288);
+    CHECK(context_bytes(1000000, ratios, F8, 65536) == cache_bytes(1000000, ratios, F8, 65536) + workspace_bytes(1000000));
     CHECK(cell_format(F8) == 1 && cell_format(F16) == 0);
     CacheFormat f = F16;
     CHECK(cache_format("fp8", f) && f == F8 && cache_format("fp16", f) && f == F16 && !cache_format("int8", f) &&

@@ -5,6 +5,7 @@
 
 #include "basalt/models/deepseek41/attn_index.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -34,20 +35,46 @@ inline bool owns_cache(int layer, int ratio) { return ratio != 0 && (layer == 2 
 /// Rows a cache holds for `positions` positions at a compression ratio.
 inline uint64_t cache_rows(int64_t positions, int ratio) { return (uint64_t) positions / (uint64_t) ratio + 1; }
 
-/// Device bytes of the compressed latents and index keys of every kv-source layer at `positions`.
-inline uint64_t cache_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f) {
+/// Positions whose latents stay on the card with --kv-resident N.
+inline int64_t resident_positions(int64_t positions, int64_t kv_resident) {
+    return kv_resident > 0 && kv_resident < positions ? kv_resident : positions;
+}
+
+/// Device bytes of the compressed latents and index keys of every kv-source layer at `positions`. With --kv-resident
+/// the later latents are in RAM; the index keys stay on the card.
+inline uint64_t cache_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident = 0) {
+    const int64_t kept = resident_positions(positions, kv_resident);
     uint64_t b = 0;
     for (int r : ratios)
-        if (r > 0) b += cache_rows(positions, r) * (latent_row_bytes(f) + index_row_bytes(f));
+        if (r > 0) b += cache_rows(kept, r) * latent_row_bytes(f) + cache_rows(positions, r) * index_row_bytes(f);
+    return b;
+}
+
+/// Pinned host bytes of the latents --kv-resident keeps in RAM.
+inline uint64_t host_cache_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident) {
+    const int64_t kept = resident_positions(positions, kv_resident);
+    uint64_t b = 0;
+    for (int r : ratios)
+        if (r > 0) b += (cache_rows(positions, r) - cache_rows(kept, r)) * latent_row_bytes(f);
     return b;
 }
 
 /// Device bytes of the decode indexer's score workspace (scores, block scores, block flags) at `positions`.
 inline uint64_t workspace_bytes(int64_t positions) { return (uint64_t) kDecodeTokens * ((uint64_t) positions + 1) * 9; }
 
-/// Everything that grows with the context.
-inline uint64_t context_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f) {
-    return cache_bytes(positions, ratios, f) + workspace_bytes(positions);
+/// Device bytes of the prompt path's VRAM copy of one kv-source layer's latents, for chunks that reach the ones in
+/// RAM (0 without --kv-resident).
+inline uint64_t prompt_stage_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident) {
+    if (resident_positions(positions, kv_resident) >= positions) return 0;
+    uint64_t b = 0;
+    for (int r : ratios)
+        if (r > 0) b = std::max(b, cache_rows(positions, r) * latent_row_bytes(f));
+    return b;
+}
+
+/// Device bytes that grow with the context.
+inline uint64_t context_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident = 0) {
+    return cache_bytes(positions, ratios, f, kv_resident) + workspace_bytes(positions);
 }
 
 struct Plan {

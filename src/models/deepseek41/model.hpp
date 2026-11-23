@@ -111,6 +111,8 @@ public:
     prefillp::Dims prompt_dims() const;
     /// Device bytes of the compressed caches of a full context.
     uint64_t context_bytes() const;
+    /// Device bytes of the prompt path's copy of one cache's latents with --kv-resident (0 without).
+    uint64_t prompt_stage_bytes() const;
     /// Positions a new sequence keeps backed of `backed` (prefill_plan.hpp's keep_positions with this model's caches).
     int64_t keep_positions(int64_t backed) const;
     /// Opens the image projector: the diagnostic standalone file when set, else the pack's vision section.

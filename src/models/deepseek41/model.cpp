@@ -106,7 +106,13 @@ static std::vector<int> cache_ratios(const Geometry& g) {
     return ratios;
 }
 
-uint64_t DsModel::context_bytes() const { return ctxp::context_bytes(context(), cache_ratios(pack_.geo), cache_format_); }
+uint64_t DsModel::context_bytes() const {
+    return ctxp::context_bytes(context(), cache_ratios(pack_.geo), cache_format_, tiers_.kv_resident);
+}
+
+uint64_t DsModel::prompt_stage_bytes() const {
+    return ctxp::prompt_stage_bytes(context(), cache_ratios(pack_.geo), cache_format_, tiers_.kv_resident);
+}
 
 int64_t DsModel::keep_positions(int64_t backed) const {
     return prefillp::keep_positions(backed, cache_ratios(pack_.geo), cache_format_);
@@ -169,7 +175,7 @@ prefillp::Dims DsModel::prompt_dims() const {
     for (const ExpertLayer& e : pack_.experts) {
         d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
     }
-    d.attn_fixed_bytes = attn_batch_fixed_bytes(cache_format_);
+    d.attn_fixed_bytes = attn_batch_fixed_bytes(cache_format_) + prompt_stage_bytes();
     d.attn_token_bytes = attn_batch_token_bytes();
     return d;
 }
@@ -255,6 +261,10 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
     set_diag_dump(req.diag_dump);
     set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
     set_tiers(req);
+    if (const uint64_t host_b = ctxp::host_cache_bytes(ctx_, cache_ratios(pack_.geo), cache_format_, req.kv_resident))
+        basalt::log::info("basalt deepseek41", "K/V streaming: the compressed latents of %lld of %lld positions in VRAM, "
+                          "%.2f GiB in page-locked RAM per slot", (long long) ctxp::resident_positions(ctx_, req.kv_resident),
+                          (long long) ctx_, (double) host_b / 1073741824.0);
     std::vector<int> peers = req.peer_devices;
     if (peers.size() > (size_t) kMaxSecondCards) {
         basalt::log::warn("basalt deepseek41", "%zu second cards given, %d hold experts; later cards idle", peers.size(),

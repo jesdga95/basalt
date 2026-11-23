@@ -86,7 +86,8 @@ public:
                   alloc(&mws_, z.mws) && alloc(&cws_, z.cws) && alloc(&iws_, z.iws) &&
                   alloc(&d_pos_, C * 4) && alloc(&d_start_, C * 4) && alloc(&d_n_, C * 4) && alloc(&d_lim_[0], C * 4) &&
                   alloc(&d_lim_[1], C * 4) && alloc(&ids_, C * kTopK * 4) && alloc(&idn_, C * 4) &&
-                  alloc(&cand_, C * kMaxCandBlocks * 4) && alloc(&cand_n_, C * 4);
+                  alloc(&cand_, C * kMaxCandBlocks * 4) && alloc(&cand_n_, C * 4) &&
+                  (!c_.stage_bytes || alloc(&comp_stage_, c_.stage_bytes));
         // layer-independent index arrays of the full and the tail sub-chunk, uploaded once from pinned memory
         for (Fixed& f : fixed_) {
             f.dev = nullptr;
@@ -130,6 +131,24 @@ public:
     }
 
 private:
+    // Compressed rows [0, rows) of kv-source layer ks: the cache while they are all on the card, else the VRAM stage,
+    // topped up with the rows written since (a written row is final).
+    const uint8_t* comp_rows(int ks, int64_t rows, cudaStream_t st) {
+        uint8_t* src = (*c_.comp_kv)[(size_t) ks];
+        if (!comp_stage_ || rows <= (*c_.host_rows)[(size_t) ks]) return src;
+        if (stage_ks_ != ks) {
+            stage_ks_ = ks;
+            stage_rows_ = 0;
+        }
+        if (rows > stage_rows_) {
+            const size_t rb = (size_t) comp_row_bytes(c_.format);
+            cudaMemcpyAsync(comp_stage_ + stage_rows_ * rb, src + stage_rows_ * rb, (size_t) (rows - stage_rows_) * rb,
+                            cudaMemcpyDefault, st);
+            stage_rows_ = rows;
+        }
+        return comp_stage_;
+    }
+
     // positions, window bounds and visible compressed rows of the whole chunk
     void upload_positions(int64_t pos0, int T, cudaStream_t st) {
         std::vector<int32_t> pos((size_t) T), start((size_t) T), n((size_t) T), l1((size_t) T), l2((size_t) T);
@@ -148,6 +167,7 @@ private:
         cudaMemcpyAsync(d_lim_[1], l2.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
         chunk_pos0_ = pos0;
         chunk_n_ = T;
+        stage_ks_ = -1;   // a chunk refills the stage
     }
 
     struct Fixed {
@@ -343,7 +363,7 @@ private:
             a.win_start = d_start + l0;
             a.win_n = d_n + l0;
             if (ratio) {
-                a.comp = (*c_.comp_kv)[(size_t) kv_source(il)];
+                a.comp = comp_rows(kv_source(il), (p0 + S) / ratio, (cudaStream_t) stream);
                 a.comp_type = c_.format == CacheFormat::Fp8 ? LatentType::Fp4 : LatentType::F16;
                 a.sel = ids_ + (size_t) (s0 + l0) * kTopK;
                 a.n_sel = sel;
@@ -376,6 +396,9 @@ private:
     int chunk_n_ = 0;
     Fixed fixed_[2];
     void* stage_ = nullptr;
+    uint8_t* comp_stage_ = nullptr;   // see comp_rows
+    int stage_ks_ = -1;
+    int64_t stage_rows_ = 0;
     std::vector<void*> allocs_;
     void *xq_ = nullptr, *cws_ = nullptr, *iws_ = nullptr;
     float *kvraw_ = nullptr, *qr_ = nullptr, *q_ = nullptr, *attn_ = nullptr, *oa_ = nullptr, *mws_ = nullptr;
