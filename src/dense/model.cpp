@@ -523,6 +523,13 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         err = o.arch + ": " + e;
         return nullptr;
     }
+    // the adapter refuses these at its flags; a caller of this stack that skips them gets the reason here, not cells
+    // misread: the write's Hadamard transform and kv4_to_int8 take a head as one transform's width, the format lives in
+    // the int8 buffers, and streamed cells are only ever read as int8
+    if (o.kv_fp4 && (g.head_dim != 256 || !o.kv_int8 || o.kv_resident > 0)) {
+        err = o.arch + ": --kv nvfp4 needs 256-wide heads, the int8 buffers (kv_int8) and every cell on the card (no --kv-resident)";
+        return nullptr;
+    }
     m->lb = o.layer_begin;
     m->le = o.layer_end > 0 ? o.layer_end : g.n_layers;
     if (m->lb < 0 || m->lb >= m->le || m->le > g.n_layers) {
