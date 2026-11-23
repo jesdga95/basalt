@@ -126,16 +126,17 @@ int dispatch(Context& context) {
             std::snprintf(b, sizeof b, "%lld experts (%.1f GiB)", (long long) n, gib);
             return std::string(b);
         };
-        if (!multi_gpu) {
-            for (size_t c = 0; c < parts.size(); ++c) parts[c] = context.peers->peer_report(c);
+        if (o.gpus.mode == basalt::program::GpuMode::Split) {
+            // each card's expert cache beside its layers (both stages share CUDA0's under --diag-gpu-same)
+            context.split->part = [&](size_t c) {
+                if (c == 0) return experts(xcache.slots(), xcache.gib());
+                return multi_gpu && c - 1 < stages.size() ? experts(stages[c - 1]->cache.slots(), stages[c - 1]->cache.gib())
+                                                          : std::string();
+            };
+            for (size_t c = 0; c < parts.size(); ++c) parts[c] = context.split->split_report(c);
+            context.split->part = nullptr;   // (its captures end with this block)
         } else {
-            parts[0] = "layers 0-" + std::to_string(split_at.empty() ? g.n_layers - 1 : split_at[0] - 1) + ", " +
-                       experts(xcache.slots(), xcache.gib());
-            for (const auto& st : stages)
-                for (size_t c = 1; c < o.gpus.cards.size(); ++c)
-                    if (o.gpus.cards[c].device == st->dev)
-                        parts[c] = "layers " + std::to_string(st->lb) + "-" + std::to_string(st->le - 1) + ", " +
-                                   experts(st->cache.slots(), st->cache.gib());
+            for (size_t c = 0; c < parts.size(); ++c) parts[c] = context.peers->peer_report(c);
         }
         const std::string line = basalt::model::gpu_parts_line(o.gpus, parts);
         if (!line.empty()) basalt::log::info("basalt", "%s", line.c_str());

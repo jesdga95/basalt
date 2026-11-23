@@ -146,6 +146,7 @@ if(BASALT_MODEL_QWEN4EXP)
 add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp
   src/models/qwen4exp/load/engine_local.cpp
   src/models/qwen4exp/load/peers.cpp
+  src/models/qwen4exp/load/split.cpp
   src/models/qwen4exp/serve/probe_peer.cpp
   src/models/qwen4exp/load/helpers.cpp
   src/models/qwen4exp/load/model.cpp

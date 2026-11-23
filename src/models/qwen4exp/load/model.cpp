@@ -46,8 +46,9 @@ int model(Context& context) {
     basalt::core::Loader loader;
     {   // its copy streams on the cards whose weights are read before their caches are sized (the main card, a layer
         // split's stages), before anything is sized there; a tier card's come with its experts, after its slots are sized
-        std::vector<int> devices = {0};
-        if (context.split_devs != nullptr) devices.insert(devices.end(), context.split_devs->begin(), context.split_devs->end());
+        std::vector<int> devices;
+        if (*context.multi_gpu) devices = o.gpus.peers();   // (the cut comes later; every card runs a stage)
+        devices.push_back(0);
         std::sort(devices.begin(), devices.end());
         devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
         if (!loader.prepare(devices, err)) return fatal_start_error(err);

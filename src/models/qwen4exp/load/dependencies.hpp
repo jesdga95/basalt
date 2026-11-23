@@ -2,6 +2,7 @@
 
 #include "engine_local.hpp"
 #include "peers.hpp"
+#include "split.hpp"
 #include "../serve/qfn_runtime.hpp"
 #include "../../../program/cli/startup.hpp"
 #include "../cli/options.hpp"

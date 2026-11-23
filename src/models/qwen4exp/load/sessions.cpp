@@ -144,12 +144,6 @@ int sessions(Context& context) {
     }
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
 
-    for (size_t i = 0; i < split_at.size(); ++i)
-        if (split_at[i] >= g.n_layers) {
-            basalt::log::error("basalt generate", "--layer-split: layer %lld is past the last (%lld)",
-                         (long long) split_at[i], (long long) (g.n_layers - 1));
-            return 2;
-        }
     // the stage that runs a layer (0: CUDA0's)
     auto stage_of = [&](int64_t l) -> int {
         int st = 0;

@@ -79,14 +79,15 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         basalt::log::warn("basalt serve", "conversation caching is disabled by %s",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
-    // Layer split (gpu-mode split): the later stages run layers [K_i, K_i+1) on the cards after the main one, the K cut by the
-    // shares once the weights are sized (layer_plan).  KV streaming and images (the server's GPU encoder) run across a split,
-    // also with parking and --batch.  Across GPUs, not supported: lending cache slots to the prompt path (each stage's prompt
+    // Layer split (gpu-mode split): the later stages run layers [K_i, K_i+1) on the cards after the main one, cut by the shared
+    // driver (LayerSplit, model::SplitHooks) once the weights are sized (layer_plan), which also gives their devices.  KV
+    // streaming and images (the server's GPU encoder) run across a split, also with parking and --batch.  Across GPUs, not supported: lending cache slots to the prompt path (each stage's prompt
     // path has its own buffers).  Parking saves every stage (SavedConversation::stage_images).
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
+    LayerSplit split;
     bool split_same = false;   // both stages on one GPU, sharing everything: the hand-off's bit-exact A/B (--diag-gpu-same)
-    if (o.diag_gpu_same && !split_mode) {
+    if (o.gpus.diag_same && !split_mode) {
         basalt::log::error("basalt generate", "--diag-gpu-same needs gpu-mode split (and --diag-gpu-cut L, the layer the second stage starts at)");
         return 2;
     }
@@ -95,8 +96,8 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
             basalt::log::error("basalt generate", "gpu-mode split runs Qwen3.8-Flash-Next with --serve");
             return 2;
         }
-        if (o.diag_gpu_same) {   // the split's reference: the same cut, the second stage on CUDA0 too, the second card untouched
-            if (o.diag_gpu_cut < 2) {
+        if (o.gpus.diag_same) {   // the split's reference: the same cut, the second stage on CUDA0 too, the second card untouched
+            if (o.gpus.diag_cut < 2) {
                 basalt::log::error("basalt generate", "--diag-gpu-same takes its cut from --diag-gpu-cut L, a layer from 2");
                 return 2;
             }
@@ -106,16 +107,12 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
                 return 2;
             }
             split_same = true;
-            split_devs = {0};
-            split_at = {o.diag_gpu_cut};
-        } else {
-            split_devs = o.gpus.peers();
         }
     }
-    bool multi_gpu = !split_devs.empty() && !split_same;
+    bool multi_gpu = split_mode && !split_same;
     // two stages with the drafter and one conversation at a time pipeline their windows: a second chain of verifiers over
     // the same sessions (a window's buffers on each card) and, on the first card, the snapshot a rolled-back guess needs
-    const bool pipe_want = multi_gpu && split_devs.size() == 1 && !o.mtp.empty() && o.serve && o.batch <= 0;
+    const bool pipe_want = multi_gpu && o.gpus.cards.size() == 2 && !o.mtp.empty() && o.serve && o.batch <= 0;
     constexpr int kPairMib0 = 280, kPairMibLater = 160;
     if (pipe_want) o.vram_reserve_mib += kPairMib0;
     if (const auto code = cli::resolve_model_options(o, multi_gpu)) return *code;
@@ -128,9 +125,6 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
         // A stage's prompt path borrows from that stage's own expert cache: the loan is the tail of the stage's own
         // cache (see `PfPart` in the serve block), and outside the prompt that tail is expert cache, so a large chunk
         // costs a stage nothing permanent.
-        std::string devs;
-        for (const int d : split_devs) devs += (devs.empty() ? "" : ",") + std::to_string(d);
-        basalt::log::info("basalt generate", "layer split across %zu GPUs: CUDA0, then CUDA%s", split_devs.size() + 1, devs.c_str());
     }
     if (const auto code = cli::prepare_input_options(o)) return *code;
     basalt::core::qsa_set_kv_int8(o.kv == "int8");
@@ -265,6 +259,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     context.split_at = &split_at;
     context.split_devs = &split_devs;
     context.split_same = &split_same;
+    context.split = &split;
     context.multi_gpu = &multi_gpu;
     context.pipe_want = &pipe_want;
     context.kPairMibLater = &kPairMibLater;
