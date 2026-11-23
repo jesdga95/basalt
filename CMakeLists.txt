@@ -1803,7 +1803,7 @@ target_compile_options(mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda 
 if(MSVC)
   target_compile_options(mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
 endif()
-target_link_libraries(mmq PUBLIC ggml_quants ${_gpu_runtime_target})
+target_link_libraries(mmq PUBLIC ggml_quants core ${_gpu_runtime_target})
 # multi-GPU: a second card's share of a prompt chunk's routed experts, on the MMQ products
 add_library(peer_share STATIC src/prefill/peer_share.cpp)
 target_include_directories(peer_share PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
