@@ -1,11 +1,13 @@
 // src/models/inkling2/kernels/kv_int8_parity.cu - INT8 KV writer and scalar/MMA reader parity against CPU references.
-// With --bench, also time decode window attention over every cache format at the model's depths.
+// With --bench, also time decode window attention over every cache format at the model's depths. With --reduced, check only
+// a short list of MMA cases (for a race checker).
 #include "prep.cuh"
 #include "basalt/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -339,7 +341,42 @@ static uint64_t output_hash(const DecodeResult& a, int row) {
     return hash;
 }
 
-static bool check_attention_mma() {
+// The --reduced MMA cases, for a race checker that serialises shared memory: few depths and widths, but every plan, both
+// launch bounds and the extreme shard counts. A case's lines and hashes are the full run's for the same depth, width and row.
+struct MmaVariant {
+    ink::Int8MmaPlan plan;
+    bool padded;   // the launch bound: the cache's cells, else the window's own keys
+    int shards;    // 0: the rule's count; else forced (at most the launch's splits)
+};
+struct MmaCase {
+    int depth, width;
+    std::vector<MmaVariant> variants;
+};
+
+static std::vector<MmaCase> reduced_mma_cases() {
+    using P = ink::Int8MmaPlan;
+    const MmaVariant padded{P::Auto, true, 0}, fewest{P::Auto, false, 1}, most{P::Auto, false, 64};
+    return {
+        {4096, 1, {{P::Direct, true, 0}, fewest, most, {P::NarrowRing, false, 0}, {P::NarrowRing, true, 0}}},
+        {4096, 2, {padded, fewest, most}},
+        {4096, 3, {padded, fewest, most}},
+        {4096, 6, {padded, fewest, most, {P::TwoStageRing, true, 0}, {P::ThreeStageRing, false, 0},
+                   {P::OneStagePingPong, false, 0}}},
+        {4096, 8, {padded, fewest, most, {P::ThreeStageRing, true, 0}}},
+        {32768, 1, {padded, {P::NarrowRing, false, 0}}},
+        {32768, 8, {fewest, {P::ThreeStageRing, false, 0}}},
+        {32769, 2, {padded, fewest}},
+        {32769, 6, {most, {P::ThreeStageRing, false, 0}}},
+        {65537, 3, {padded, fewest}},
+        {kKeys100Ki, 1, {{P::NarrowRing, false, 0}}},
+        {kKeys100Ki + 1, 1, {{P::NarrowRing, false, 0}}},
+        {131072, 2, {padded}},
+    };
+}
+
+static const char* flag(int f) { return f < 0 ? "-" : f ? "1" : "0"; }
+
+static bool check_attention_mma(bool reduced) {
     constexpr int rows = ink::kDecodeRows, cap = 262144 + rows;
     std::mt19937 rng(0x4b323062);
     std::normal_distribution<float> normal(0.f, 0.4f);
@@ -375,9 +412,16 @@ static bool check_attention_mma() {
               alloc(&dout, rows * kOutput * sizeof(float)) && alloc(&dq8, rows * kOutputQ8) &&
               alloc(&scratch, ink::attention_decode_scratch(rows, cap));
     const int mma_min_keys = ink::attention_decode_int8_test_min_keys();
-    std::vector<int> depths{4096};
-    for (const int boundary : {32768, 65536, kKeys100Ki, 131072, 196608, 262144})
-        depths.insert(depths.end(), {boundary - 1, boundary, boundary + 1});
+    const std::vector<MmaCase> cases = reduced ? reduced_mma_cases() : std::vector<MmaCase>{};
+    std::vector<int> depths;
+    if (reduced) {
+        for (const MmaCase& c : cases)
+            if (depths.empty() || depths.back() != c.depth) depths.push_back(c.depth);
+    } else {
+        depths.push_back(4096);
+        for (const int boundary : {32768, 65536, kKeys100Ki, 131072, 196608, 262144})
+            depths.insert(depths.end(), {boundary - 1, boundary, boundary + 1});
+    }
     bool schedules_ok = true;
     bool reported[static_cast<int>(ink::Int8MmaPlan::Direct) + 1] = {};
     for (const int depth : depths) {
@@ -439,12 +483,75 @@ static bool check_attention_mma() {
             return true;
         };
         std::vector<double> ref(rows * kOutput);
-        DecodeResult singleton[rows];
-        bool singleton_schedule[rows] = {};
-        for (int j = 0; j < rows && ok; ++j) {
+        for (int j = 0; j < rows; ++j)
             cpu_attention(pos[j], q.data() + j * kOutput, r.data() + j * ink::kHeads * ink::kRel,
                           sink.data() + j * ink::kHeads, gate.data() + j * kOutput, table.data(), hk, hv,
                           ink::AttnArgs{}.scale, ref.data() + j * kOutput);
+        // A window row's accuracy against the scalar reader and the CPU, its flags (-1: not checked) and its hash.
+        const auto report = [&](int width, int first, int j, const DecodeResult& scalar, const DecodeResult& mma, int invariant,
+                                int dispatched, int batch_invariant, int schedule_invariant, int shard_invariant) {
+            double abs[3] = {}, rel[3] = {}, rel_sq[3] = {};
+            int rel_count[3] = {};
+            bool finite = true;
+            for (int d = 0; d < kOutput; ++d) {
+                const double ref_out = ref[(first + j) * kOutput + d];
+                const double old_out = scalar.fp32[j * kOutput + d], mma_out = mma.fp32[j * kOutput + d];
+                finite &= std::isfinite(old_out) && std::isfinite(mma_out);
+                const double actual[] = {mma_out, mma_out, old_out};
+                const double want[] = {old_out, ref_out, ref_out};
+                for (int k = 0; k < 3; ++k) {
+                    const double error = std::abs(actual[k] - want[k]);
+                    abs[k] = std::max(abs[k], error);
+                    if (std::abs(want[k]) >= 1e-2) {
+                        const double fraction = error / std::abs(want[k]);
+                        rel[k] = std::max(rel[k], fraction);
+                        rel_sq[k] += fraction * fraction;
+                        ++rel_count[k];
+                    }
+                }
+            }
+            double rms_rel[3];
+            for (int k = 0; k < 3; ++k)
+                rms_rel[k] = rel_count[k] ? std::sqrt(rel_sq[k] / rel_count[k]) : 0.;
+            std::printf("kv MMA parity: depth=%d T=%d row=%d keys=%d max_abs[mma/scalar,mma/cpu,scalar/cpu]=%.7g/%.7g/%.7g "
+                        "max_rel(|ref|>=1e-2)=%.7g/%.7g/%.7g rms_rel(|ref|>=1e-2)=%.7g/%.7g/%.7g "
+                        "finite=%d invariant=%s dispatch=%s batch=%s schedule=%s shard_invariant=%s hash=%016llx\n",
+                        depth, width, j, pos[first + j] + 1, abs[0], abs[1], abs[2], rel[0], rel[1], rel[2],
+                        rms_rel[0], rms_rel[1], rms_rel[2], finite, flag(invariant), flag(dispatched), flag(batch_invariant),
+                        flag(schedule_invariant), flag(shard_invariant), (unsigned long long) output_hash(mma, j));
+            schedules_ok &= schedule_invariant != 0 && shard_invariant != 0;
+            ok &= finite && invariant != 0 && dispatched != 0 && batch_invariant != 0 &&
+                  *std::max_element(abs, abs + 3) < 0.002 && *std::max_element(rel, rel + 3) < 0.05;
+        };
+        if (reduced) {
+            for (const MmaCase& c : cases) {
+                if (c.depth != depth || !ok) continue;
+                const auto start = std::chrono::steady_clock::now();
+                const int first = 3 - (c.width - 1) / 2;
+                DecodeResult scalar, mma;
+                ok = run(first, c.width, Reader::Scalar, scalar) && run(first, c.width, Reader::Mma, mma);
+                int invariant = -1, schedule = -1, shard_invariant = -1;
+                for (const MmaVariant& v : c.variants) {
+                    if (!ok) break;
+                    const int same = matches_plan(first, c.width, v.plan, v.padded ? cap : 0, mma, ink::Int8MmaShards::Auto,
+                                                  v.shards);
+                    int& checked = v.plan != ink::Int8MmaPlan::Auto ? schedule : v.shards ? shard_invariant : invariant;
+                    checked = checked != 0 && same;
+                    if (v.padded) invariant = invariant != 0 && same;
+                }
+                if (!ok) break;
+                // The first and the last row of the window: its fewest and most keys.
+                report(c.width, first, 0, scalar, mma, invariant, -1, -1, schedule, shard_invariant);
+                if (c.width > 1) report(c.width, first, c.width - 1, scalar, mma, invariant, -1, -1, schedule, shard_invariant);
+                const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                std::printf("kv MMA reduced case: depth=%d T=%d launches=%zu %.1f s\n", depth, c.width, 2 + c.variants.size(),
+                            seconds);
+            }
+            continue;
+        }
+        DecodeResult singleton[rows];
+        bool singleton_schedule[rows] = {};
+        for (int j = 0; j < rows && ok; ++j) {
             ok = run(j, 1, Reader::Mma, singleton[j], false, false, cap);
             // Compare the singleton schedules under tight and padded launch bounds.
             singleton_schedule[j] = ok;
@@ -481,47 +588,17 @@ static bool check_attention_mma() {
                      run(first + 5, width - 5, Reader::Auto, separate, false, true);
             if (!ok) break;
             for (int j = 0; j < width; ++j) {
-                double abs[3] = {}, rel[3] = {}, rel_sq[3] = {};
-                int rel_count[3] = {};
-                bool finite = true;
-                for (int d = 0; d < kOutput; ++d) {
-                    const double ref_out = ref[(first + j) * kOutput + d];
-                    const double old_out = scalar.fp32[j * kOutput + d], mma_out = mma.fp32[j * kOutput + d];
-                    finite &= std::isfinite(old_out) && std::isfinite(mma_out);
-                    const double actual[] = {mma_out, mma_out, old_out};
-                    const double want[] = {old_out, ref_out, ref_out};
-                    for (int k = 0; k < 3; ++k) {
-                        const double error = std::abs(actual[k] - want[k]);
-                        abs[k] = std::max(abs[k], error);
-                        if (std::abs(want[k]) >= 1e-2) {
-                            const double fraction = error / std::abs(want[k]);
-                            rel[k] = std::max(rel[k], fraction);
-                            rel_sq[k] += fraction * fraction;
-                            ++rel_count[k];
-                        }
-                    }
-                }
-                double rms_rel[3];
-                for (int k = 0; k < 3; ++k)
-                    rms_rel[k] = rel_count[k] ? std::sqrt(rel_sq[k] / rel_count[k]) : 0.;
                 const bool invariant = same_output(mma, j, singleton[first + j], 0) && same_output(mma, j, padded, j);
                 const auto& expected = pos[first + j] + 1 >= mma_min_keys ? mma : scalar;
                 const bool dispatched = same_output(automatic, j, expected, j) && same_output(auto_padded, j, expected, j);
                 const bool batch_invariant = width != rows ||
                     (j < 5 ? same_output(automatic, j, segmented, j) : same_output(separate, j - 5, segmented, j));
-                const bool schedule_invariant = schedule && singleton_schedule[first + j];
-                std::printf("kv MMA parity: depth=%d T=%d row=%d keys=%d max_abs[mma/scalar,mma/cpu,scalar/cpu]=%.7g/%.7g/%.7g "
-                            "max_rel(|ref|>=1e-2)=%.7g/%.7g/%.7g rms_rel(|ref|>=1e-2)=%.7g/%.7g/%.7g "
-                            "finite=%d invariant=%d dispatch=%d batch=%d schedule=%d shard_invariant=%d hash=%016llx\n",
-                            depth, width, j, pos[first + j] + 1, abs[0], abs[1], abs[2], rel[0], rel[1], rel[2],
-                            rms_rel[0], rms_rel[1], rms_rel[2], finite, invariant, dispatched, batch_invariant, schedule_invariant,
-                            shard_invariant, (unsigned long long) output_hash(mma, j));
-                schedules_ok &= schedule_invariant && shard_invariant;
-                ok &= finite && invariant && dispatched && batch_invariant &&
-                      *std::max_element(abs, abs + 3) < 0.002 && *std::max_element(rel, rel + 3) < 0.05;
+                report(width, first, j, scalar, mma, invariant, dispatched, batch_invariant,
+                       schedule && singleton_schedule[first + j], shard_invariant);
             }
         }
     }
+    if (reduced) std::printf("reduced case list: %zu cases\n", cases.size());
     for (void* p : {(void*) dp, (void*) dq, (void*) dr, (void*) ds, (void*) dg, (void*) dt, (void*) dout, (void*) dq8,
                     (void*) dk, (void*) dv, scratch})
         if (p) cudaFree(p);
@@ -530,8 +607,9 @@ static bool check_attention_mma() {
 
 int main(int argc, char** argv) {
     const bool bench = argc == 2 && std::strcmp(argv[1], "--bench") == 0;
-    if (argc > 2 || (argc == 2 && !bench)) {
-        std::fprintf(stderr, "usage: inkling2_kv_int8_parity [--bench]\n");
+    const bool reduced = argc == 2 && std::strcmp(argv[1], "--reduced") == 0;
+    if (argc > 2 || (argc == 2 && !bench && !reduced)) {
+        std::fprintf(stderr, "usage: inkling2_kv_int8_parity [--bench | --reduced]\n");
         return 2;
     }
 
@@ -594,7 +672,7 @@ int main(int argc, char** argv) {
     std::printf("kv_int8_parity: rows=%d width=%d row_bytes=%zu mismatches=%d max_abs=%.7g max_rel(|x|>=1e-2)=%.7g fp16_max_abs=%.7g fp16_max_rel(|x|>=1e-2)=%.7g\n",
                 rows, ink::kHeadDim, row_bytes, mismatches, max_abs, max_rel, fp16_max_abs, fp16_max_rel);
 
-    bool ok = mismatches == 0 && check_attention_mma();
+    bool ok = mismatches == 0 && check_attention_mma(reduced);
     if (bench) {
         constexpr int bench_rows = 4096;
         constexpr int reps = 200;
