@@ -104,7 +104,7 @@ def text_config(cfg: dict) -> dict:
 
 
 def layer_kinds(tc: dict) -> list[str]:
-    n = int(tc["num_hidden_layers"])
+    """The layer kinds; the count is num_hidden_layers where the config states it (the VL export's does not)."""
     if "layers_block_type" in tc:
         kinds = [str(k) for k in tc["layers_block_type"]]
     elif "hybrid_override_pattern" in tc:
@@ -114,6 +114,7 @@ def layer_kinds(tc: dict) -> list[str]:
         kinds = [PATTERN[c] for c in pat]
     else:
         raise S.ConvertError("config.json: neither layers_block_type nor hybrid_override_pattern")
+    n = int(tc.get("num_hidden_layers", len(kinds)))
     if len(kinds) != n or any(k not in KIND for k in kinds):
         raise S.ConvertError(f"config.json: {len(kinds)} layer kinds for {n} layers, or a kind other than mamba, "
                              "attention and moe")

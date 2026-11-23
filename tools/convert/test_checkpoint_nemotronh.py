@@ -261,6 +261,13 @@ class RefusalTest(unittest.TestCase):
         with self.assertRaisesRegex(S.ConvertError, "mlp_hidden_act"):
             N.Geometry(llm_config(mlp_hidden_act="silu"))
 
+    def test_the_layer_count_may_come_from_the_kinds(self):
+        tc = llm_config()
+        del tc["num_hidden_layers"]   # as the VL export's llm_config
+        self.assertEqual(N.Geometry(tc).n_layers, len(KINDS))
+        with self.assertRaises(S.ConvertError):
+            N.layer_kinds(llm_config(num_hidden_layers=4))
+
     def test_the_pattern_string_is_read(self):
         self.assertEqual(N.layer_kinds({"num_hidden_layers": 4, "hybrid_override_pattern": "ME*E"}),
                          ["mamba", "moe", "attention", "moe"])
