@@ -76,18 +76,43 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | the same 90 chunks, the whole model on the card | 0.00304 | 97.76% | |
 | 100 chunks, layer split: 0 to 11 on the RTX 5090, 12 to 23 on an RTX 5060 Ti | 0.00304 | 97.70% | 7.0718 (base 7.0633) |
 
-RTX 5090 at 400 W, the whole model on the card, unless a row says otherwise. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512). The FP8 and INT8 values below, including the decode and VRAM measurements, predate this rebase and need revalidation on the rebased build.
+RTX 5090 at 475 W, the whole model on the card, unless a row says otherwise. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512). The FP8 and INT8 quality/KLD values above predate this rebase; KLD was not rerun because the reference corpus is unavailable.
 
-The earlier INT8–FP16 decode ABBA (one cold process per measurement) averaged 5.20 / 7.61 / 4.75 ms per window and 192.3 / 131.4 / 210.7 passes/s for INT8 (conv / struct / prose), versus 5.43 / 7.61 / 4.77 ms and 184.3 / 131.4 / 209.6 passes/s for FP16. Completion lengths and draft acceptance varied, so tok/s was not directly comparable.
+## Rebased decode: INT8 vs FP8
 
-An earlier FP16–FP8 ABBA used the same `conv` prompt and `--max-context 32768`, `--spec 5`, fixed seed 1, and `--expert-cache 3072` (3,070 expert slots on the GPU and 2 in RAM). It averaged 5.406 vs 5.524 ms/window and 185.0 vs 181.1 passes/s. FP16 stopped at 1,158 tokens; FP8 reached the 1,200-token fixture limit, so tok/s differed with completion length.
+One cold process per measurement, same standard `conv` prompt, fixed seed 20261122, `--max-context 32768`, `--spec 5`, and `--expert-cache 3072`; each run generated 1,200 tokens. ABBA order was INT8, FP8, FP8, INT8. Throughput is end-to-end generation throughput; acceptance varied between runs, so this is not an isolated KV-kernel comparison.
 
-The fixture is the standard short `conv` prompt, so this compares decode at the same 32k capacity and prompt, not decode after filling 32k tokens. Attempts to run a 16k active-context WikiText prompt or the 16k prefill fixture exited with `f32_rows_dot: an illegal memory access was encountered`; those runs were excluded.
+| Run | KV format | tok/s | Accept % | Draft len |
+| --- | --- | ---: | ---: | ---: |
+| A1 | INT8 | 381.8 | 67.2% | 1.48 |
+| B1 | FP8 | 388.6 | 62.4% | 1.77 |
+| B2 | FP8 | 388.9 | 63.1% | 1.75 |
+| A2 | INT8 | 383.8 | 67.2% | 1.54 |
+| Mean | INT8 | 382.8 | — | — |
+| Mean | FP8 | 388.8 | — | — |
 
-| KV format | Mean ms/window | Mean passes/s | Mean tok/s | Output tokens |
-| --- | ---: | ---: | ---: | ---: |
-| FP16 | 5.406 | 185.0 | 384.6 | 1,158 |
-| FP8 | 5.524 | 181.1 | 415.5 | 1,200 |
+FP8 was 1.6% faster in this short-context decode ABBA.
+
+## 16K prefill memory check
+
+The standard prefill fixture requested with `-p 16384` contains 15,810 tokens. Each run used `--max-context 32768`, `--max-new 1`, and `--spec 0`; all completed without an illegal memory access.
+
+| Revision | KV format | Prefill tok/s | Result |
+| --- | --- | ---: | --- |
+| Current main (`8667cc8abd`) | FP8 | 18,258 | Pass |
+| Rebased PR | FP8 | 18,183 | Pass |
+| Rebased PR | INT8 | 17,756 | Pass |
+
+The previously reported 16K illegal access did not reproduce on current main or the rebased PR with this fixture.
+
+## Fully resident context
+
+Both KV formats reached the model's full native 512K context (`--max-context 524288`) with the same q8 model and `--expert-cache 3072`; `--kv-resident` was left at its default, so KV remained fully resident. Each generated the 1,200-token fixture without an allocation error.
+
+| KV format | Decode tok/s | Accept % | Draft len | Result |
+| --- | ---: | ---: | ---: | --- |
+| FP8 | 353.8 | 60.9% | 1.93 | Pass |
+| INT8 | 313.0 | 67.2% | 1.51 | Pass |
 
 ## Earlier VRAM use at 256k context
 

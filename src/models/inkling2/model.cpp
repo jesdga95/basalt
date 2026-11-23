@@ -640,7 +640,7 @@ model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
         const ExpertLayer& el = pack_.experts[(size_t) l];
         mm.layer_bytes.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes));
         experts += mm.layer_bytes.back();
-        mm.layer_caches.push_back((uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, req.kv == "fp8") * n_sess);
+        mm.layer_caches.push_back((uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, req.kv == "fp8", req.kv == "int8") * n_sess);
         mm.layer_share.push_back((double) visits[(size_t) l] / (double) g.visits.size());
         dense += (uint64_t) kProj * kQ8Row + (uint64_t) g.n_embd * (3072 / 32 * 34) +
                  prefill::q8::scale_plane_bytes(kProjQ, (int64_t) g.n_embd) +
