@@ -4,8 +4,8 @@ official checkpoint, for tools/convert/convert.py.
   experts             the routed experts per layer, [gate | up | down] (the checkpoint's w13 rows alternate gate and up):
                         NVFP4 layers: type 40 blocks, the E2M1 codes and E4M3 scales as stored (nibbles moved into
                           64-value blocks), then the FP32 tail {s, s, s_down, 0}, s = amax / outer_scale_denominator
-                        MXFP8 layers: Q8_0 of their exact values (E4M3 code x 2^(UE8M0 - 127)), ggml's reference
-                          rounding; one Q8_0 block is one MXFP8 block
+                        MXFP8 layers: type 46 blocks, the E4M3 codes and UE8M0 scales as stored (four 32-value
+                          sub-blocks per 132-byte block: 4 UE8M0 scales then 128 E4M3 codes)
   experts.layout      one `layer gu_type d_type offset blob_bytes` line per layer
   gguf                every other text tensor in llama.cpp-style names: the attention projections Q8_0 (ggml's
                         reference rounding of the BF16 values), the token embedding and the output head BF16 as stored
@@ -40,8 +40,9 @@ from gguf_writer import GGUFWriter  # noqa: E402
 from model_file import TENSOR_ALIGN, ModelWriter, Stream  # noqa: E402
 
 ARCH = "inkling2"
-TYPE_ID = {"F32": 0, "Q8_0": 8, "BF16": 30, "NVFP4": 40}
+TYPE_ID = {"F32": 0, "Q8_0": 8, "BF16": 30, "NVFP4": 40, "MXFP8": 46}
 Q8_0 = 8
+MXFP8 = 46
 ROWS_PER_JOB = 1 << 22
 EXPERTS_PER_JOB = 16
 E4M3 = S.fp8_e4m3_table()
@@ -206,8 +207,10 @@ class Experts:
                 for w in ("w13", "w2"):
                     if p + w + "_weight_amax" in ck.t or p + w + "_weight_outer_scale_denominator" in ck.t:
                         raise S.ConvertError(f"layer {l}: MXFP8 experts with NVFP4 companions")
-                blob = 2 * ff * (h // 32 * 34) + h * (ff // 32 * 34)
-                kind, gu = "q8_0", Q8_0
+                if h % 128 or ff % 128:
+                    raise S.ConvertError(f"layer {l}: MXFP8 experts require hidden_size and intermediate_size multiples of 128")
+                blob = 2 * ff * (h // 128 * 132) + h * (ff // 128 * 132)
+                kind, gu = "mxfp8", MXFP8
             self.layers.append((l, kind, gu, offset, blob))
             offset += blob * E
         self.total = offset
@@ -264,17 +267,16 @@ def _expert_blobs(kind, src, h, ff, e0, n) -> bytes:
     if (s13 == 255).any() or (s2 == 255).any():
         return f"experts {e0}..: a UE8M0 scale byte of 255 (NaN)"
 
-    def values(c, s):   # E4M3 code x 2^(scale - 127), exact in float32
-        v = E4M3[c].reshape(c.shape[0], -1, 32) * np.ldexp(np.float32(1), s.astype(np.int32) - 127)[..., None]
-        return v.reshape(c.shape[0], -1)
+    def pack_mxfp8(c, s):   # 128-value blocks: 4 UE8M0 scales then 128 E4M3 codes (132 bytes)
+        nb = c.shape[1] // 128
+        return np.concatenate([s.reshape(c.shape[0], nb, 4), c.reshape(c.shape[0], nb, 128)], axis=2).tobytes()
 
     for e in range(n):
         if ((c13[e] & 0x7F) == 0x7F).any() or ((c2[e] & 0x7F) == 0x7F).any():
             return f"expert {e0 + e}: an E4M3 NaN code"
-        gu = values(c13[e], s13[e])
-        out.append(S.q8_0(gu[0::2]))
-        out.append(S.q8_0(gu[1::2]))
-        out.append(S.q8_0(values(c2[e], s2[e])))
+        out.append(pack_mxfp8(c13[e, 0::2], s13[e, 0::2]))   # gate: the even rows of w13
+        out.append(pack_mxfp8(c13[e, 1::2], s13[e, 1::2]))   # up: the odd rows
+        out.append(pack_mxfp8(c2[e], s2[e]))
     return b"".join(out)
 
 
@@ -642,8 +644,8 @@ def build(a, Job, fingerprint, die) -> None:
                     "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
                     "experts_nvfp4": "w13 / w2 E2M1 codes and E4M3 block scales as stored (gate the even rows of w13, up "
                                      "the odd), FP32 tail amax / outer_scale_denominator (rounded once)",
-                    **({"experts_mxfp8": "layers " + ", ".join(map(str, mx)) + ": Q8_0 of E4M3 code x 2^(UE8M0 - 127) "
-                                         "(ggml reference rounding, one Q8_0 block per MXFP8 block)"} if mx else {}),
+                    **({"experts_mxfp8": "layers " + ", ".join(map(str, mx)) + ": native MXFP8 (type 46: 4 UE8M0 scales + "
+                                         "128 E4M3 codes per 132-byte block, codes and scales as stored)"} if mx else {}),
                     "bf16_projections": "Q8_0 (ggml reference rounding)",
                     "transforms": {k: METHODS[k] for k in sorted({t_.how for t_ in plan.tensors.values()})}},
             }

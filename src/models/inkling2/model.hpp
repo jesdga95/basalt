@@ -24,8 +24,12 @@ constexpr int64_t kDefaultContext = 8192;
 constexpr int kStreams = 4;
 
 struct LayerWeights {
-    uint8_t* proj = nullptr;                 ///< Q8_0 [kProj][n_embd]: q, r, gate, sink, k, k taps, v, v taps
-    uint8_t* out = nullptr;                  ///< Q8_0 [n_embd][3072]
+    uint8_t* proj = nullptr;                 ///< Q8_0 planes [kProj][n_embd] codes then fp16 scales (wgemm::q8_planes)
+    uint8_t* out = nullptr;                  ///< Q8_0 planes [n_embd][3072] codes then fp16 scales (wgemm::q8_planes)
+    uint16_t* proj_q_sc_t = nullptr;         ///< coalesced [n_embd/32][ld(kProjQ)] fp16 scales for prefill::q8
+    uint16_t* proj_k_sc_t = nullptr;         ///< coalesced [n_embd/32][ld(kProjKV)] fp16 scales for prefill::q8
+    uint16_t* proj_v_sc_t = nullptr;         ///< coalesced [n_embd/32][ld(kProjKV)] fp16 scales for prefill::q8
+    uint16_t* out_sc_t = nullptr;            ///< coalesced [3072/32][ld(n_embd)] fp16 scales for prefill::q8
     const float* attn_norm = nullptr;        ///< sliding-window layers
     const float* q_norm = nullptr, *k_norm = nullptr, *v_norm = nullptr;   ///< full layers
     const float* q_clip = nullptr, *r_clip = nullptr, *rel_table = nullptr;

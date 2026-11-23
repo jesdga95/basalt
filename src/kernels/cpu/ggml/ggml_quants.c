@@ -1475,6 +1475,90 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
     }
 }
 
+static inline float ggml_ue8m0_to_fp32(uint8_t u) {
+    if (u == 0xFFu) return 0.0f;
+    const uint32_t bits = u == 0u ? 0x00400000u : ((uint32_t) u << 23);
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+static inline float ggml_e4m3_to_fp32(uint8_t b) {
+    const uint32_t sign = (uint32_t) (b >> 7);
+    const int e = (b >> 3) & 0xF;
+    const int m = b & 0x7;
+    if (e == 15 && m == 7) return 0.0f;
+    const float v = e == 0 ? ldexpf((float) m, -9) : ldexpf(1.0f + (float) m * 0.125f, e - 7);
+    return sign ? -v : v;
+}
+
+void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP8 == 0);
+    const int64_t nb = k / QK_MXFP8;
+    for (int64_t i = 0; i < nb; i++) {
+        for (int s = 0; s < QK_MXFP8 / QK_MXFP8_SUB; s++) {
+            const float d = ggml_ue8m0_to_fp32(x[i].d[s]);
+            const uint8_t * qs = x[i].qs + s * QK_MXFP8_SUB;
+            float * yb = y + i * QK_MXFP8 + s * QK_MXFP8_SUB;
+            for (int j = 0; j < QK_MXFP8_SUB; ++j) yb[j] = ggml_e4m3_to_fp32(qs[j]) * d;
+        }
+    }
+}
+
+void ggml_vec_dot_mxfp8_q8_0_ref(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx,
+                                 const void * GGML_RESTRICT vy) {
+    assert(n % QK_MXFP8 == 0);
+    const block_mxfp8 * x = vx;
+    const block_q8_0 * y = vy;
+    float sumf = 0.0f;
+    for (int ib = 0; ib < n / QK_MXFP8; ++ib) {
+        for (int sb = 0; sb < QK_MXFP8 / QK_MXFP8_SUB; ++sb) {
+            const block_q8_0 * yb = y + 4 * ib + sb;
+            const uint8_t * q = x[ib].qs + sb * QK_MXFP8_SUB;
+            float dot = 0.0f;
+            for (int j = 0; j < QK_MXFP8_SUB; ++j) dot += ggml_e4m3_to_fp32(q[j]) * (float) yb->qs[j];
+            sumf += GGML_FP16_TO_FP32(yb->d) * ggml_ue8m0_to_fp32(x[ib].d[sb]) * dot;
+        }
+    }
+    *s = sumf;
+}
+
+void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP8 == 0);
+    float e4m3_pos[127];
+    for (int c = 0; c < 127; ++c) e4m3_pos[c] = ggml_e4m3_to_fp32((uint8_t) c);
+    const int64_t nb = k / QK_MXFP8;
+    for (int64_t i = 0; i < nb; i++) {
+        for (int s = 0; s < QK_MXFP8 / QK_MXFP8_SUB; s++) {
+            const float * xb = x + i * QK_MXFP8 + s * QK_MXFP8_SUB;
+            float amax = 0.0f;
+            for (int j = 0; j < QK_MXFP8_SUB; j++) amax = fmaxf(amax, fabsf(xb[j]));
+            int exp_i = 0;
+            if (amax > 0.0f) {
+                const float ratio = amax / 448.0f;
+                int e = (int) ceilf(log2f(ratio));
+                if (e < -127) e = -127;
+                if (e > 127) e = 127;
+                exp_i = e + 127;
+            }
+            y[i].d[s] = (uint8_t) exp_i;
+            const float inv = 1.0f / ggml_ue8m0_to_fp32((uint8_t) exp_i);
+            uint8_t * qs = y[i].qs + s * QK_MXFP8_SUB;
+            for (int j = 0; j < QK_MXFP8_SUB; j++) {
+                const float v = xb[j] * inv;
+                const float av = fabsf(v);
+                int best = 0;
+                float best_err = INFINITY;
+                for (int c = 0; c < 127; ++c) {
+                    const float err = fabsf(e4m3_pos[c] - av);
+                    if (err < best_err) { best_err = err; best = c; }
+                }
+                qs[j] = (uint8_t) (best | (v < 0.0f ? 0x80 : 0));
+            }
+        }
+    }
+}
+
 float ggml_fp16_to_fp32(ggml_fp16_t x) { return GGML_FP16_TO_FP32(x); }
 
 ggml_fp16_t ggml_fp32_to_fp16(float x) { return GGML_FP32_TO_FP16(x); }
@@ -1503,6 +1587,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     TYPE(GGML_TYPE_IQ1_S, "iq1_s", QK_K, block_iq1_s, dequantize_row_iq1_s, NULL),
     TYPE(GGML_TYPE_IQ1_M, "iq1_m", QK_K, block_iq1_m, dequantize_row_iq1_m, NULL),
     TYPE(GGML_TYPE_NVFP4, "nvfp4", QK_NVFP4, block_nvfp4, dequantize_row_nvfp4, quantize_row_nvfp4_ref),
+    TYPE(GGML_TYPE_MXFP8, "mxfp8", QK_MXFP8, block_mxfp8, dequantize_row_mxfp8, quantize_row_mxfp8_ref),
 #undef TYPE
 };
 
