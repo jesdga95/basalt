@@ -16,7 +16,9 @@ public:
     ElasticArray& operator=(const ElasticArray&) = delete;
 
     /// Reserves `bytes` of address space. Without virtual memory management the whole array is allocated at once.
-    bool open(uint64_t bytes, std::string& err);
+    /// With `host_from` below `bytes`, the bytes from there on are pinned host memory, mapped at once; only the bytes
+    /// before it grow on the device.
+    bool open(uint64_t bytes, std::string& err, uint64_t host_from = UINT64_MAX);
     /// Backs at least the first `bytes` bytes (rounded up to the allocation granularity; the new bytes are zeroed).
     /// False with `err` when the device has no memory for them with `keep_free` left; what was backed stays.
     bool ensure(uint64_t bytes, uint64_t keep_free, std::string& err);
@@ -25,16 +27,20 @@ public:
     uint8_t* data() const { return base_; }
     uint64_t backed() const { return backed_; }
     uint64_t capacity() const { return reserved_; }
+    /// Bytes backed by host memory.
+    uint64_t host_bytes() const { return reserved_ - host_from_; }
 
 private:
+    bool map_host_tail(std::string& err);
     struct Extent {
         uint64_t off, bytes;
         unsigned long long handle;
     };
     uint8_t* base_ = nullptr;
-    uint64_t reserved_ = 0, backed_ = 0, gran_ = 0;
+    uint64_t reserved_ = 0, backed_ = 0, gran_ = 0, host_from_ = 0;
     bool plain_ = false;   // one cudaMalloc, no virtual memory
     std::vector<Extent> extents_;
+    std::vector<Extent> host_extents_;   // [host_from_, reserved_)
 };
 
 }  // namespace basalt::core

@@ -198,6 +198,28 @@ unsigned long long map(uint8_t* va, uint64_t bytes) {
     return (unsigned long long) h;
 }
 
+unsigned long long map_host(uint8_t* va, uint64_t bytes) {
+    const Fns& v = fns();
+    CUmemAllocationProp prop{};
+    size_t g = 0;
+    if (!host_prop(prop, g)) return 0;
+    const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
+    CUmemGenericAllocationHandle h = 0;
+    if (v.create(&h, (size_t) bytes, &prop, 0) != CUDA_SUCCESS) return 0;
+    if (v.map(p, (size_t) bytes, 0, h, 0) != CUDA_SUCCESS) {
+        v.release(h);
+        return 0;
+    }
+    CUmemAccessDesc a[] = {{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE},
+                           {{CU_MEM_LOCATION_TYPE_DEVICE, current_device()}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}};
+    if (v.set_access(p, (size_t) bytes, a, 2) != CUDA_SUCCESS) {
+        v.unmap(p, (size_t) bytes);
+        v.release(h);
+        return 0;
+    }
+    return (unsigned long long) h;
+}
+
 bool unmap(uint8_t* va, uint64_t bytes, unsigned long long handle) {
     const Fns& v = fns();
     if (!v.ok || handle == 0) return false;

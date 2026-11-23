@@ -26,7 +26,10 @@ void release_range(uint8_t* va, uint64_t bytes);
 /// Backs `[va, va + bytes)` with a new physical allocation on the current device, readable and writable by it.
 /// Returns the handle (0 on failure: nothing is left mapped).
 unsigned long long map(uint8_t* va, uint64_t bytes);
-/// Unmaps what `map` mapped there and frees its physical memory.  The caller has made sure no work reads it.
+/// Backs `[va, va + bytes)` with a new pinned host allocation, readable and writable by the current device.
+/// Returns the handle (0 on failure: nothing is left mapped).
+unsigned long long map_host(uint8_t* va, uint64_t bytes);
+/// Unmaps what `map` or `map_host` mapped there and frees its physical memory.  The caller has made sure no work reads it.
 bool unmap(uint8_t* va, uint64_t bytes, unsigned long long handle);
 /// A physical allocation of `bytes` on the current device, mapped nowhere yet (0 on failure): one backing that
 /// `map_handle` can put under several ranges at once, so they share its bytes.  `release` drops the caller's reference;
