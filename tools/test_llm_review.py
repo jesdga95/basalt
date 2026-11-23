@@ -116,13 +116,13 @@ class Client(unittest.TestCase):
     def test_missing_key_is_needs_human_without_a_request(self):
         with Server() as s:
             with self.assertRaises(llm.LLMError):
-                llm.config_from_env({"LLM_BASE_URL": s.cfg["base"], "LLM_MODEL": "m"})
+                llm.config_from_env({"LLM_BASE_URL": s.cfg["base"], "LLM_DEFAULT_MODEL": "m"})
             self.assertEqual(Handler.seen, [])
         self.assertEqual(llm.community_review([], [], cfg=None, chat_fn=None)["verdict"], "needs_human")  # no env here
 
     def test_http_base_must_be_https(self):
         with self.assertRaises(llm.LLMError):
-            llm.config_from_env({"LLM_API_KEY": "k", "LLM_BASE_URL": "http://example.com/v1", "LLM_MODEL": "m"})
+            llm.config_from_env({"LLM_API_KEY": "k", "LLM_BASE_URL": "http://example.com/v1", "LLM_DEFAULT_MODEL": "m"})
 
     def test_injection_text_is_data(self):
         with Server() as s:

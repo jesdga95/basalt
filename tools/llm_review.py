@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A small OpenAI-compatible chat completions client (stdlib only) and the community-row review built on it.
 
-Configuration comes from the environment: LLM_API_KEY, LLM_BASE_URL (the API root, e.g. https://host/v1) and LLM_MODEL.
+Configuration comes from the environment: LLM_API_KEY, LLM_BASE_URL (the API root, e.g. https://host/v1) and LLM_DEFAULT_MODEL.
 The community review can only choose a label: every failure of the call or of its answer is "needs_human".
 """
 import json
@@ -23,8 +23,8 @@ class LLMError(Exception):
 
 def config_from_env(env=None):
     env = os.environ if env is None else env
-    cfg = {k: (env.get(v) or "").strip() for k, v in (("key", "LLM_API_KEY"), ("base", "LLM_BASE_URL"), ("model", "LLM_MODEL"))}
-    missing = [v for k, v in (("key", "LLM_API_KEY"), ("base", "LLM_BASE_URL"), ("model", "LLM_MODEL")) if not cfg[k]]
+    cfg = {k: (env.get(v) or "").strip() for k, v in (("key", "LLM_API_KEY"), ("base", "LLM_BASE_URL"), ("model", "LLM_DEFAULT_MODEL"))}
+    missing = [v for k, v in (("key", "LLM_API_KEY"), ("base", "LLM_BASE_URL"), ("model", "LLM_DEFAULT_MODEL")) if not cfg[k]]
     if missing:
         raise LLMError("missing " + ", ".join(missing))
     if not cfg["base"].startswith("https://") and not cfg["base"].startswith("http://127.0.0.1") and not cfg["base"].startswith("http://localhost"):
